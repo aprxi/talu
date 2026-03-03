@@ -128,13 +128,7 @@ fn compileOneInstruction(
     reg_map: *RegisterMap,
 ) !runtime_contract.Instruction {
     const opcode = opcode_map.opcodeForLayerOp(op);
-    const state_block_id = switch (mode) {
-        .vision_encode, .scatter => switch (opcode) {
-            .multihead_attention, .mla_attention => null,
-            else => runtime_contract.stateBlockIdForOpcode(opcode),
-        },
-        else => runtime_contract.stateBlockIdForOpcode(opcode),
-    };
+    const state_block_id = runtime_contract.stateBlockIdForExecutionMode(opcode, mode);
     return switch (op) {
         .kernel => |kernel_op| blk: {
             const slots = kernelWeightSlots(opcode);
@@ -495,6 +489,7 @@ fn buildLivenessMap(
 fn buildStateDescriptors(
     allocator: std.mem.Allocator,
     instructions: []const runtime_contract.Instruction,
+    descriptor_entry: ?registry.Entry,
 ) ![]runtime_contract.StateDescriptor {
     var seen: [256]bool = [_]bool{false} ** 256;
     var count: usize = 0;
@@ -513,7 +508,10 @@ fn buildStateDescriptors(
         const state_id = insn.state_block_id orelse continue;
         if (!seen[state_id]) continue;
         seen[state_id] = false;
-        descriptors[idx] = runtime_contract.descriptorForStateId(state_id);
+        descriptors[idx] = if (descriptor_entry) |entry|
+            registry.stateDescriptorForId(entry, state_id)
+        else
+            runtime_contract.descriptorForStateId(state_id);
         idx += 1;
     }
     return descriptors;
@@ -705,6 +703,10 @@ pub const CompileOptions = struct {
     /// least this value. Backends should consume plan specs exactly; any
     /// model-dimension floor must be provided here, not post-hoc.
     size_floor: usize = 1,
+    /// Optional architecture registry entry that owns state descriptor metadata.
+    /// When provided, compiler emits state descriptors from architecture metadata
+    /// rather than runtime-contract built-in defaults.
+    state_descriptor_entry: ?registry.Entry = null,
 };
 
 pub fn compileLayerProgram(
@@ -774,7 +776,7 @@ pub fn compileLayerProgram(
         allocator.free(weight_binding_slice);
     }
 
-    const state_descs = try buildStateDescriptors(allocator, instruction_slice);
+    const state_descs = try buildStateDescriptors(allocator, instruction_slice, options.state_descriptor_entry);
     errdefer if (state_descs.len > 0) allocator.free(state_descs);
     const register_buffer_specs = try buildRegisterBufferSpecs(
         allocator,
@@ -815,7 +817,11 @@ pub fn compileProgramForArchitecture(
     const entry = registry.detectByArchitectureId(architecture_id) orelse return error.UnknownArchitecture;
     const program = registry.blockProgramFor(entry, block_kind) orelse return error.MissingBlockProgram;
     try validateProgramBlockKindStateCompatibility(program, block_kind);
-    return compileLayerProgram(allocator, program, mode, options);
+    var resolved_options = options;
+    if (resolved_options.state_descriptor_entry == null) {
+        resolved_options.state_descriptor_entry = entry;
+    }
+    return compileLayerProgram(allocator, program, mode, resolved_options);
 }
 
 pub fn deinitCompiledPlan(allocator: std.mem.Allocator, compiled: *runtime_contract.CompiledPlan) void {
@@ -1174,10 +1180,30 @@ test "buildStateDescriptors accepts unknown state ids" {
             .state_block_id = 77,
         },
     };
-    const descriptors = try buildStateDescriptors(allocator, instructions[0..]);
+    const descriptors = try buildStateDescriptors(allocator, instructions[0..], null);
     defer if (descriptors.len > 0) allocator.free(descriptors);
     try std.testing.expectEqual(@as(usize, 1), descriptors.len);
     try std.testing.expectEqual(@as(u8, 77), descriptors[0].id);
+    try std.testing.expectEqual(runtime_contract.StateLifecycle.request_scoped, descriptors[0].lifecycle);
+}
+
+test "buildStateDescriptors uses architecture metadata when entry is provided" {
+    const allocator = std.testing.allocator;
+    const entry = registry.detectByArchitectureId("llama3") orelse return error.TestUnexpectedResult;
+    const instructions = [_]runtime_contract.Instruction{
+        .{
+            .opcode = .residual_add,
+            .inputs = &.{},
+            .outputs = &.{},
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = runtime_contract.kv_cache_state_id,
+        },
+    };
+    const descriptors = try buildStateDescriptors(allocator, instructions[0..], entry);
+    defer if (descriptors.len > 0) allocator.free(descriptors);
+    try std.testing.expectEqual(@as(usize, 1), descriptors.len);
+    try std.testing.expectEqual(runtime_contract.kv_cache_state_id, descriptors[0].id);
     try std.testing.expectEqual(runtime_contract.StateLifecycle.slot_persistent, descriptors[0].lifecycle);
 }
 
@@ -1194,8 +1220,20 @@ test "compileLayerProgram emits structured kernel weight refs for macro attentio
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     const insn = compiled.plan.instructions[0];
-    try std.testing.expectEqual(@as(usize, 4), insn.weights.len);
-    const expected_slots = [_][]const u8{ "q_proj", "k_proj", "v_proj", "o_proj" };
+    try std.testing.expectEqual(@as(usize, 11), insn.weights.len);
+    const expected_slots = [_][]const u8{
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "q_norm",
+        "k_norm",
+        "q_bias",
+        "k_bias",
+        "v_bias",
+        "o_bias",
+        "attn_sinks",
+    };
     for (expected_slots, 0..) |slot_name, idx| {
         const binding_name = try runtime_contract.instructionWeightBindingName(&compiled, 0, idx);
         const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);

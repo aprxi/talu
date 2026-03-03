@@ -260,6 +260,7 @@ pub const LocalEngine = struct {
     fn appendProgramStateDescriptors(
         storage: []runtime_contract.StateDescriptor,
         count: *u8,
+        entry: models.registry.Entry,
         program: []const models.layer_ops.LayerOp,
     ) !void {
         for (program) |op| {
@@ -268,7 +269,7 @@ pub const LocalEngine = struct {
             try runtime_contract.appendUniqueStateDescriptor(
                 storage,
                 count,
-                runtime_contract.descriptorForStateId(state_id),
+                models.registry.stateDescriptorForId(entry, state_id),
             );
         }
     }
@@ -284,10 +285,10 @@ pub const LocalEngine = struct {
 
         for (loaded_model.blocks) |layer| {
             const program = models.registry.blockProgramFor(entry, layer.block_type) orelse continue;
-            try appendProgramStateDescriptors(storage[0..], &count, program);
+            try appendProgramStateDescriptors(storage[0..], &count, entry, program);
         }
         if (models.registry.visionProgramByArchitectureId(entry.id)) |program| {
-            try appendProgramStateDescriptors(storage[0..], &count, program);
+            try appendProgramStateDescriptors(storage[0..], &count, entry, program);
         }
         if (count == 0) return &.{};
 
@@ -1315,61 +1316,6 @@ pub const LocalEngine = struct {
         return self.runWithScheduler(prompt, config);
     }
 
-    fn prefillWithTemporarySlot0StateBinding(
-        self: *LocalEngine,
-        tokens: []const u32,
-        logits_out: []f32,
-    ) !void {
-        if (self.scheduler_state_descriptors.len == 0) {
-            try self.backend.prefill(tokens, logits_out);
-            return;
-        }
-
-        const TempStateStorage = struct { bytes: []align(64) u8 };
-        const descriptors = self.scheduler_state_descriptors;
-        const state_blocks = try self.allocator.alloc(runtime_contract.StateBlockHandle, descriptors.len);
-        defer self.allocator.free(state_blocks);
-        const state_storage = try self.allocator.alloc(TempStateStorage, descriptors.len);
-        defer self.allocator.free(state_storage);
-
-        var initialized: usize = 0;
-        errdefer {
-            for (state_storage[0..initialized]) |entry| self.allocator.free(entry.bytes);
-        }
-
-        for (descriptors, 0..) |descriptor, idx| {
-            if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) {
-                return error.InvalidStateDescriptorBinding;
-            }
-            const size_bytes = std.math.cast(usize, descriptor.size_bytes) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            if (size_bytes == 0) return error.InvalidStateDescriptorBinding;
-            const bytes = try self.allocator.alignedAlloc(u8, .@"64", size_bytes);
-            state_storage[idx] = .{ .bytes = bytes };
-            initialized += 1;
-
-            const should_zero = runtime_contract.shouldZeroStateForLifecycleAction(&descriptor, .alloc) catch |err| switch (err) {
-                error.InvalidStateLifecycleAction => false,
-                else => return err,
-            };
-            if (should_zero) @memset(bytes, 0);
-            state_blocks[idx] = .{
-                .id = descriptor.id,
-                .ptr = @ptrCast(bytes.ptr),
-                .size = @intCast(bytes.len),
-                .align_bytes = descriptor.align_bytes,
-            };
-        }
-        defer {
-            for (state_storage) |entry| self.allocator.free(entry.bytes);
-        }
-
-        try self.backend.bindSlotStateBlocks(0, state_blocks);
-        defer self.backend.unbindSlotStateBlocks(0);
-        try self.backend.prefill(tokens, logits_out);
-    }
-
     /// Run inference using Scheduler (continuous batching path).
     fn runWithScheduler(
         self: *LocalEngine,
@@ -1432,6 +1378,7 @@ pub const LocalEngine = struct {
             .callback_data = if (config.token_callback != null) @ptrCast(&callback_wrapper) else null,
             .sampling = config.sampling,
             .stop_flag = config.stop_flag,
+            .return_final_logits = true,
         });
         errdefer result.deinit(self.allocator);
 
@@ -1455,10 +1402,11 @@ pub const LocalEngine = struct {
         @memcpy(all_tokens[0..prompt_len], prompt_tokens);
         @memcpy(all_tokens[prompt_len..], result.tokens);
 
-        // Preserve run() behavior: return logits for the final sequence position.
-        const final_logits = try self.allocator.alloc(f32, self.backend.vocabSize());
-        errdefer self.allocator.free(final_logits);
-        try self.prefillWithTemporarySlot0StateBinding(all_tokens, final_logits);
+        if (result.final_logits.len != self.backend.vocabSize()) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        const final_logits = result.final_logits;
+        result.final_logits = &.{};
 
         // Free scheduler result tokens (we've copied them)
         result.deinit(self.allocator);
@@ -1495,6 +1443,73 @@ pub const LocalEngine = struct {
         return BackendScheduler.init(self.allocator, &self.backend, merged_config);
     }
 
+    const TemporaryStateBindings = struct {
+        const StateBlockStorage = struct {
+            bytes: []align(64) u8 = &.{},
+        };
+
+        handles: []runtime_contract.StateBlockHandle = &.{},
+        storage: []StateBlockStorage = &.{},
+
+        fn deinit(self: *TemporaryStateBindings, allocator: std.mem.Allocator) void {
+            for (self.storage) |entry| {
+                if (entry.bytes.len > 0) allocator.free(entry.bytes);
+            }
+            if (self.storage.len > 0) allocator.free(self.storage);
+            if (self.handles.len > 0) allocator.free(self.handles);
+            self.* = .{};
+        }
+    };
+
+    fn allocateTemporaryStateBindingsForDescriptors(
+        allocator: std.mem.Allocator,
+        descriptors: []const runtime_contract.StateDescriptor,
+    ) !TemporaryStateBindings {
+        if (descriptors.len == 0) return .{};
+
+        var bindings = TemporaryStateBindings{};
+        bindings.handles = try allocator.alloc(runtime_contract.StateBlockHandle, descriptors.len);
+        errdefer allocator.free(bindings.handles);
+        bindings.storage = try allocator.alloc(TemporaryStateBindings.StateBlockStorage, descriptors.len);
+        errdefer allocator.free(bindings.storage);
+        for (bindings.storage) |*entry| entry.* = .{};
+
+        var initialized: usize = 0;
+        errdefer {
+            for (bindings.storage[0..initialized]) |entry| {
+                allocator.free(entry.bytes);
+            }
+        }
+
+        for (descriptors, 0..) |descriptor, idx| {
+            if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) {
+                return error.InvalidStateDescriptorBinding;
+            }
+            const size_bytes = std.math.cast(usize, descriptor.size_bytes) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            if (size_bytes == 0) return error.InvalidStateDescriptorBinding;
+
+            const bytes = try allocator.alignedAlloc(u8, .@"64", size_bytes);
+            const should_zero = runtime_contract.shouldZeroStateForLifecycleAction(&descriptor, .alloc) catch |err| switch (err) {
+                error.InvalidStateLifecycleAction => false,
+                else => return err,
+            };
+            if (should_zero) @memset(bytes, 0);
+
+            bindings.storage[idx] = .{ .bytes = bytes };
+            bindings.handles[idx] = .{
+                .id = descriptor.id,
+                .ptr = bytes.ptr,
+                .size = @intCast(bytes.len),
+                .align_bytes = descriptor.align_bytes,
+            };
+            initialized += 1;
+        }
+
+        return bindings;
+    }
+
     /// Extract embeddings from text.
     ///
     /// Runs the full transformer forward pass and returns pooled hidden states
@@ -1517,8 +1532,7 @@ pub const LocalEngine = struct {
         const tokens = try self.tok.encode(text);
         defer self.allocator.free(tokens);
 
-        // Run embedding extraction via backend
-        try self.backend.embed(tokens, pooling, normalize, embedding_out);
+        try self.embedTokens(tokens, pooling, normalize, embedding_out);
     }
 
     /// Extract embeddings from pre-tokenized input.
@@ -1531,6 +1545,17 @@ pub const LocalEngine = struct {
         normalize: bool,
         embedding_out: []f32,
     ) !void {
+        var temp_bindings = try allocateTemporaryStateBindingsForDescriptors(
+            self.allocator,
+            self.scheduler_state_descriptors,
+        );
+        defer temp_bindings.deinit(self.allocator);
+
+        if (temp_bindings.handles.len > 0) {
+            try self.backend.bindSlotStateBlocks(0, temp_bindings.handles);
+            defer self.backend.unbindSlotStateBlocks(0);
+        }
+
         try self.backend.embed(tokens, pooling, normalize, embedding_out);
     }
 
@@ -1766,6 +1791,63 @@ test "GenerationResult struct empty" {
 
     try std.testing.expectEqual(@as(usize, 0), result.text.len);
     try std.testing.expectEqual(@as(usize, 0), result.tokens.len);
+}
+
+test "allocateTemporaryStateBindingsForDescriptors allocates aligned descriptor blocks" {
+    const descriptors = [_]runtime_contract.StateDescriptor{
+        .{
+            .id = 11,
+            .size_bytes = 64,
+            .align_bytes = 64,
+            .zero_init = true,
+            .lifecycle = .slot_persistent,
+        },
+        .{
+            .id = 12,
+            .size_bytes = 32,
+            .align_bytes = 16,
+            .zero_init = false,
+            .lifecycle = .request_scoped,
+        },
+    };
+
+    var bindings = try LocalEngine.allocateTemporaryStateBindingsForDescriptors(
+        std.testing.allocator,
+        descriptors[0..],
+    );
+    defer bindings.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), bindings.handles.len);
+
+    for (descriptors, 0..) |descriptor, idx| {
+        const handle = bindings.handles[idx];
+        try std.testing.expectEqual(descriptor.id, handle.id);
+        try std.testing.expectEqual(descriptor.size_bytes, handle.size);
+        try std.testing.expectEqual(descriptor.align_bytes, handle.align_bytes);
+        try std.testing.expectEqual(@as(usize, 0), @intFromPtr(handle.ptr) % 64);
+    }
+
+    for (bindings.storage) |entry| {
+        for (entry.bytes) |byte| {
+            try std.testing.expectEqual(@as(u8, 0), byte);
+        }
+    }
+}
+
+test "allocateTemporaryStateBindingsForDescriptors rejects zero-sized descriptor" {
+    const descriptors = [_]runtime_contract.StateDescriptor{
+        .{
+            .id = 99,
+            .size_bytes = 0,
+            .align_bytes = 64,
+            .zero_init = true,
+            .lifecycle = .slot_persistent,
+        },
+    };
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        LocalEngine.allocateTemporaryStateBindingsForDescriptors(std.testing.allocator, descriptors[0..]),
+    );
 }
 
 test "decodeImageDataUrl decodes base64 image payload" {

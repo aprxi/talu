@@ -280,6 +280,10 @@ void mlx_state_space_cache_free(void* cache_ptr) {
     for (auto& layer : cache_state->layers) {
         delete layer.conv_state;
         delete layer.ssm_state;
+        delete layer.in_proj_rhs;
+        delete layer.out_proj_rhs;
+        delete layer.gate_up_rhs;
+        delete layer.down_proj_rhs;
     }
     delete cache_state;
 }

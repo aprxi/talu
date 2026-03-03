@@ -370,6 +370,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             return grammarIsComplete(grammar_sampler);
         }
 
+        fn captureFinalLogits(self: *Self, enabled: bool, logits: []const f32) ![]f32 {
+            if (!enabled) return &.{};
+            return try self.allocator.dupe(f32, logits);
+        }
+
         /// Submit a new generation request.
         ///
         /// Returns a request ID that can be used to track progress or cancel.
@@ -436,6 +441,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             /// Optional backend-specific vision prefill payload.
             /// For FusedCpuBackend this is `*const PrefillVisionInput`.
             vision_input: ?*const anyopaque = null,
+            /// Capture final-step logits in generateSync result.
+            return_final_logits: bool = false,
         };
 
         /// Cancel a request.
@@ -711,6 +718,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     grammar_sampler,
                     vision_input,
                     stop_flag,
+                    submit_config.return_final_logits,
                 );
             }
 
@@ -768,12 +776,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             grammar_sampler: ?*validate.sampler.ConstrainedSampler,
             vision_input: ?*const anyopaque,
             stop_flag: ?*const std.atomic.Value(bool),
+            return_final_logits: bool,
         ) !GenerateSyncResult {
             // Check stop flag early - if already cancelled, return immediately
             if (stop_flag) |flag| {
                 if (flag.load(.acquire)) {
                     return GenerateSyncResult{
                         .tokens = &[_]u32{},
+                        .final_logits = &.{},
                         .finish_reason = .cancelled,
                         .prefill_ns = 0,
                         .decode_ns = 0,
@@ -842,8 +852,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 grammar_sampler,
                 vision_input != null,
             );
+            const chosen_decode_tail_route: DecodeTailRoute = if (return_final_logits and decode_tail_route == .backend_decode_streaming)
+                .decode_batch
+            else
+                decode_tail_route;
             log.debug("scheduler", "Scheduler decode tail route selected", .{
-                .route = @tagName(decode_tail_route),
+                .route = @tagName(chosen_decode_tail_route),
                 .sampling_strategy = @as(u8, @intCast(@intFromEnum(effective_sampling_config.strategy))),
                 .has_stop_sequences = @as(u8, @intFromBool(stop_sequences.len != 0)),
                 .has_grammar = @as(u8, @intFromBool(grammar_sampler != null)),
@@ -862,6 +876,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (callback) |cb| cb(0, current_token, true, callback_data);
                 return GenerateSyncResult{
                     .tokens = try generated.toOwnedSlice(self.allocator),
+                    .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
                     .finish_reason = .stop_sequence,
                     .prefill_ns = prefill_ns,
                     .decode_ns = 0,
@@ -874,6 +889,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     if (callback) |cb| cb(0, current_token, true, callback_data);
                     return GenerateSyncResult{
                         .tokens = try generated.toOwnedSlice(self.allocator),
+                        .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
                         .finish_reason = if (grammarCompleteOnEos(grammar_sampler)) .stop_sequence else .eos_token,
                         .prefill_ns = prefill_ns,
                         .decode_ns = 0,
@@ -888,6 +904,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     generated.shrinkRetainingCapacity(generated.items.len - stop_len);
                     return GenerateSyncResult{
                         .tokens = try generated.toOwnedSlice(self.allocator),
+                        .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
                         .finish_reason = .stop_sequence,
                         .prefill_ns = prefill_ns,
                         .decode_ns = 0,
@@ -901,13 +918,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             if (max_tokens <= 1) {
                 return GenerateSyncResult{
                     .tokens = try generated.toOwnedSlice(self.allocator),
+                    .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
                     .finish_reason = .length,
                     .prefill_ns = prefill_ns,
                     .decode_ns = 0,
                 };
             }
 
-            if (decode_tail_route == .backend_decode_streaming) {
+            if (chosen_decode_tail_route == .backend_decode_streaming) {
                 const remaining_token_budget = max_tokens - generated.items.len;
                 const generated_tail = try self.allocator.alloc(u32, remaining_token_budget);
                 defer self.allocator.free(generated_tail);
@@ -918,6 +936,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     if (flag.load(.acquire)) {
                         return GenerateSyncResult{
                             .tokens = try generated.toOwnedSlice(self.allocator),
+                            .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
                             .finish_reason = .cancelled,
                             .prefill_ns = prefill_ns,
                             .decode_ns = 0,
@@ -957,6 +976,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }, @src());
                 return GenerateSyncResult{
                     .tokens = try generated.toOwnedSlice(self.allocator),
+                    .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
                     .finish_reason = finish_reason,
                     .prefill_ns = prefill_ns,
                     .decode_ns = decode_ns,
@@ -966,6 +986,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Decode loop via decodeBatch.
             var decode_timer = std.time.Timer.start() catch unreachable;
             var tokens_generated: usize = 1; // Already have first token from prefill
+            var last_step_logits: []const f32 = self.logits_buffer;
 
             while (generated.items.len < max_tokens) {
                 // Check stop flag (allows external cancellation)
@@ -978,6 +999,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                         }, @src());
                         return GenerateSyncResult{
                             .tokens = try generated.toOwnedSlice(self.allocator),
+                            .final_logits = try self.captureFinalLogits(return_final_logits, last_step_logits),
                             .finish_reason = .cancelled,
                             .prefill_ns = prefill_ns,
                             .decode_ns = decode_ns,
@@ -994,6 +1016,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .token = current_token,
                 };
                 try self.backend.decodeBatch(self.decode_requests[0..1], self.decode_results[0..1]);
+                last_step_logits = self.decode_results[0].logits;
 
                 // Sample next token
                 const next_token = self.sampleToken(self.decode_results[0].logits, effective_sampling_config, grammar_sampler) catch 0;
@@ -1013,6 +1036,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     if (callback) |cb| cb(0, next_token, true, callback_data);
                     return GenerateSyncResult{
                         .tokens = try generated.toOwnedSlice(self.allocator),
+                        .final_logits = try self.captureFinalLogits(return_final_logits, last_step_logits),
                         .finish_reason = .stop_sequence,
                         .prefill_ns = prefill_ns,
                         .decode_ns = decode_ns,
@@ -1033,6 +1057,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                         if (callback) |cb| cb(0, next_token, true, callback_data);
                         return GenerateSyncResult{
                             .tokens = try generated.toOwnedSlice(self.allocator),
+                            .final_logits = try self.captureFinalLogits(return_final_logits, last_step_logits),
                             .finish_reason = if (grammarCompleteOnEos(grammar_sampler)) .stop_sequence else .eos_token,
                             .prefill_ns = prefill_ns,
                             .decode_ns = decode_ns,
@@ -1056,6 +1081,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                         if (callback) |cb| cb(0, next_token, true, callback_data);
                         return GenerateSyncResult{
                             .tokens = try generated.toOwnedSlice(self.allocator),
+                            .final_logits = try self.captureFinalLogits(return_final_logits, last_step_logits),
                             .finish_reason = .stop_sequence,
                             .prefill_ns = prefill_ns,
                             .decode_ns = decode_ns,
@@ -1079,6 +1105,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             return GenerateSyncResult{
                 .tokens = try generated.toOwnedSlice(self.allocator),
+                .final_logits = try self.captureFinalLogits(return_final_logits, last_step_logits),
                 .finish_reason = .length,
                 .prefill_ns = prefill_ns,
                 .decode_ns = decode_ns,
@@ -1089,6 +1116,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         pub const GenerateSyncResult = struct {
             /// Generated tokens (owned, caller must free).
             tokens: []u32,
+            /// Final-step logits (owned when non-empty).
+            final_logits: []f32 = &.{},
             /// Reason generation stopped.
             finish_reason: FinishReason,
             /// Prefill time in nanoseconds.
@@ -1098,6 +1127,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             pub fn deinit(self: *GenerateSyncResult, allocator: std.mem.Allocator) void {
                 allocator.free(self.tokens);
+                if (self.final_logits.len > 0) allocator.free(self.final_logits);
                 self.* = undefined;
             }
         };

@@ -373,17 +373,41 @@ pub const FusedCpuBackend = struct {
                 plan,
             );
 
-            if (layer_idx >= cpu_block_set.len) return error.InvalidStateDescriptorBinding;
-            const block = &cpu_block_set[layer_idx];
-            const attention_kernel_present = block.getAttention() != null;
-            const mla_kernel_present = block.getMLAAttention() != null;
-            const mamba_kernel_present = block.getMambaKernel() != null;
-            const shortconv_kernel_present = block.getShortConvKernel() != null;
+            var attention_kernel_present = false;
+            for (layer.instruction_attention_bindings) |maybe_binding| {
+                if (maybe_binding != null) {
+                    attention_kernel_present = true;
+                    break;
+                }
+            }
+
+            var mla_kernel_present = false;
+            for (layer.instruction_mla_attention_refs) |maybe_binding| {
+                if (maybe_binding != null) {
+                    mla_kernel_present = true;
+                    break;
+                }
+            }
+
+            var mamba_kernel_present = false;
+            for (layer.instruction_mamba_bindings) |maybe_binding| {
+                if (maybe_binding != null) {
+                    mamba_kernel_present = true;
+                    break;
+                }
+            }
+
+            var shortconv_kernel_present = false;
+            for (layer.instruction_shortconv_bindings) |maybe_binding| {
+                if (maybe_binding != null) {
+                    shortconv_kernel_present = true;
+                    break;
+                }
+            }
 
             if (attention_kernel_present and mla_kernel_present) return error.InvalidStateDescriptorBinding;
-            if (attention_kernel_present or mla_kernel_present) {
-                if (mla_kernel_present) try mla_layer_indices.append(allocator, layer_idx) else try attention_layer_indices.append(allocator, layer_idx);
-            }
+            if (attention_kernel_present) try attention_layer_indices.append(allocator, layer_idx);
+            if (mla_kernel_present) try mla_layer_indices.append(allocator, layer_idx);
             if (mamba_kernel_present) try mamba_layer_indices.append(allocator, layer_idx);
             if (shortconv_kernel_present) try shortconv_layer_indices.append(allocator, layer_idx);
         }
@@ -393,9 +417,15 @@ pub const FusedCpuBackend = struct {
 
         if (mamba_layer_indices.items.len > 0) {
             const first_layer_idx = mamba_layer_indices.items[0];
-            if (first_layer_idx >= cpu_block_set.len) return error.InvalidStateDescriptorBinding;
-            const mamba_kernel = cpu_block_set[first_layer_idx].getMambaKernel() orelse return error.InvalidStateDescriptorBinding;
-            try scratch.initMamba(mamba_layer_indices.items, mamba_kernel.config);
+            if (first_layer_idx >= model.layers.len) return error.InvalidStateDescriptorBinding;
+            var mamba_config: ?kernels.MambaConfig = null;
+            for (model.layers[first_layer_idx].instruction_mamba_bindings) |maybe_binding| {
+                if (maybe_binding) |binding| {
+                    mamba_config = binding.config;
+                    break;
+                }
+            }
+            try scratch.initMamba(mamba_layer_indices.items, mamba_config orelse return error.InvalidStateDescriptorBinding);
             log.info("inference", "Heterogeneous model detected", .{
                 .mamba_layers = mamba_layer_indices.items.len,
                 .attention_layers = @as(usize, layer_total) - mamba_layer_indices.items.len,
@@ -404,9 +434,15 @@ pub const FusedCpuBackend = struct {
 
         if (shortconv_layer_indices.items.len > 0) {
             const first_layer_idx = shortconv_layer_indices.items[0];
-            if (first_layer_idx >= cpu_block_set.len) return error.InvalidStateDescriptorBinding;
-            const shortconv_kernel = cpu_block_set[first_layer_idx].getShortConvKernel() orelse return error.InvalidStateDescriptorBinding;
-            try scratch.initShortConv(shortconv_layer_indices.items, shortconv_kernel.config);
+            if (first_layer_idx >= model.layers.len) return error.InvalidStateDescriptorBinding;
+            var shortconv_config: ?kernels.ShortConvConfig = null;
+            for (model.layers[first_layer_idx].instruction_shortconv_bindings) |maybe_binding| {
+                if (maybe_binding) |binding| {
+                    shortconv_config = binding.config;
+                    break;
+                }
+            }
+            try scratch.initShortConv(shortconv_layer_indices.items, shortconv_config orelse return error.InvalidStateDescriptorBinding);
             log.info("inference", "ShortConv heterogeneous model detected", .{
                 .shortconv_layers = shortconv_layer_indices.items.len,
                 .attention_layers = @as(usize, layer_total) - shortconv_layer_indices.items.len,
@@ -588,8 +624,6 @@ pub const FusedCpuBackend = struct {
         var binding = &self.slot_state_bindings[slot_index];
         const descriptors = self.stateDescriptors();
         if (state_blocks.len != descriptors.len) return error.InvalidStateDescriptorBinding;
-        const shortconv_scratch = self.scratch.getShortConvScratch();
-        const mamba_scratch = self.scratch.getMambaScratch();
         for (state_blocks, 0..) |state_block, idx| {
             const descriptor_index = runtime_contract.stateDescriptorIndex(descriptors, state_block.id) orelse {
                 return error.UnknownStateDescriptorId;
@@ -597,18 +631,21 @@ pub const FusedCpuBackend = struct {
             const descriptor = descriptors[descriptor_index];
             const state_ptr: ?*anyopaque = switch (descriptor.id) {
                 runtime_contract.kv_cache_state_id => @ptrCast(&self.kv_cache),
-                runtime_contract.shortconv_state_id => if (shortconv_scratch) |scratch| @ptrCast(scratch) else null,
-                runtime_contract.mamba_state_id => if (mamba_scratch) |scratch| @ptrCast(scratch) else null,
+                // CPU recurrent kernels resolve their layer-local state and scratch
+                // from ScratchBuffer; binding the scratch owner keeps descriptor
+                // payloads as the execution truth.
+                runtime_contract.shortconv_state_id, runtime_contract.mamba_state_id => @ptrCast(&self.scratch),
                 else => null,
             };
+            var bound = state_block;
             if (state_ptr) |ptr| {
-                try runtime_contract.writeStatePointerToBlock(&state_block, ptr);
+                try runtime_contract.writeStatePointerToBlock(&bound, ptr);
             }
             binding.handles[idx] = .{
-                .id = state_block.id,
-                .ptr = state_block.ptr,
-                .size = state_block.size,
-                .align_bytes = state_block.align_bytes,
+                .id = bound.id,
+                .ptr = bound.ptr,
+                .size = bound.size,
+                .align_bytes = bound.align_bytes,
             };
         }
         binding.count = @intCast(state_blocks.len);

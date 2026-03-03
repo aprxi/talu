@@ -13,6 +13,8 @@ struct ProjectedQkv {
 };
 
 static constexpr size_t kAttentionFusedQkvCacheMaxEntries = 2048;
+static constexpr size_t kAttentionFusedQkvHotSlots = 128;
+static constexpr size_t kFfnQuantizedGateUpHotSlots = 64;
 
 struct AttentionFusedQkvCacheKey {
     const void* q_weight = nullptr;
@@ -49,8 +51,23 @@ static inline std::unordered_map<AttentionFusedQkvCacheKey, array, AttentionFuse
     return cache;
 }
 
+struct AttentionFusedQkvHotSlot {
+    bool valid = false;
+    AttentionFusedQkvCacheKey key;
+    array value = array(0.0f);
+};
+
+static inline AttentionFusedQkvHotSlot* attention_fused_qkv_hot_slots_store() {
+    static thread_local AttentionFusedQkvHotSlot slots[kAttentionFusedQkvHotSlots];
+    return slots;
+}
+
 static inline void attention_fused_qkv_cache_clear() {
     attention_fused_qkv_cache_store().clear();
+    auto* hot_slots = attention_fused_qkv_hot_slots_store();
+    for (size_t i = 0; i < kAttentionFusedQkvHotSlots; ++i) {
+        hot_slots[i].valid = false;
+    }
 }
 
 struct FfnQuantizedGateUpCacheValue {
@@ -97,8 +114,28 @@ static inline std::unordered_map<FfnQuantizedGateUpCacheKey, FfnQuantizedGateUpC
     return cache;
 }
 
+struct FfnQuantizedGateUpHotSlot {
+    bool valid = false;
+    FfnQuantizedGateUpCacheKey key;
+    FfnQuantizedGateUpCacheValue value{
+        array(0.0f),
+        array(0.0f),
+        array(0.0f),
+        0,
+    };
+};
+
+static inline FfnQuantizedGateUpHotSlot* ffn_quantized_gate_up_hot_slots_store() {
+    static thread_local FfnQuantizedGateUpHotSlot slots[kFfnQuantizedGateUpHotSlots];
+    return slots;
+}
+
 static inline void ffn_quantized_gate_up_cache_clear() {
     ffn_quantized_gate_up_cache_store().clear();
+    auto* hot_slots = ffn_quantized_gate_up_hot_slots_store();
+    for (size_t i = 0; i < kFfnQuantizedGateUpHotSlots; ++i) {
+        hot_slots[i].valid = false;
+    }
 }
 
 static inline const FfnQuantizedGateUpCacheValue& ffn_quantized_gate_up_cached(
@@ -143,11 +180,6 @@ static inline const FfnQuantizedGateUpCacheValue& ffn_quantized_gate_up_cached(
         return *scratch;
     }
 
-    auto& cache = ffn_quantized_gate_up_cache_store();
-    if (cache.size() >= kFfnQuantizedGateUpCacheMaxEntries) {
-        cache.clear();
-    }
-
     FfnQuantizedGateUpCacheKey key{
         gate_w,
         gate_s,
@@ -156,8 +188,26 @@ static inline const FfnQuantizedGateUpCacheValue& ffn_quantized_gate_up_cached(
         up_s,
         up_b,
     };
+    auto* hot_slots = ffn_quantized_gate_up_hot_slots_store();
+    const size_t hot_index = FfnQuantizedGateUpCacheKeyHash{}(key) & (kFfnQuantizedGateUpHotSlots - 1);
+    auto& hot_slot = hot_slots[hot_index];
+    if (hot_slot.valid && hot_slot.key == key) {
+        return hot_slot.value;
+    }
+
+    auto& cache = ffn_quantized_gate_up_cache_store();
+    if (cache.size() >= kFfnQuantizedGateUpCacheMaxEntries) {
+        cache.clear();
+        for (size_t i = 0; i < kFfnQuantizedGateUpHotSlots; ++i) {
+            hot_slots[i].valid = false;
+        }
+    }
+
     auto it = cache.find(key);
     if (it != cache.end()) {
+        hot_slot.valid = true;
+        hot_slot.key = key;
+        hot_slot.value = it->second;
         return it->second;
     }
 
@@ -172,6 +222,9 @@ static inline const FfnQuantizedGateUpCacheValue& ffn_quantized_gate_up_cached(
     eval(fused.scales);
     eval(fused.biases);
     auto [inserted, _] = cache.emplace(key, std::move(fused));
+    hot_slot.valid = true;
+    hot_slot.key = key;
+    hot_slot.value = inserted->second;
     return inserted->second;
 }
 
@@ -193,11 +246,6 @@ static inline array attention_fused_qkv_rhs_cached(
         return contiguous(concatenate({q_wt, k_wt, v_wt}, 1));
     }
 
-    auto& cache = attention_fused_qkv_cache_store();
-    if (cache.size() >= kAttentionFusedQkvCacheMaxEntries) {
-        cache.clear();
-    }
-
     AttentionFusedQkvCacheKey key{
         q_w,
         k_w,
@@ -206,8 +254,26 @@ static inline array attention_fused_qkv_rhs_cached(
         q_out,
         kv_out,
     };
+    auto* hot_slots = attention_fused_qkv_hot_slots_store();
+    const size_t hot_index = AttentionFusedQkvCacheKeyHash{}(key) & (kAttentionFusedQkvHotSlots - 1);
+    auto& hot_slot = hot_slots[hot_index];
+    if (hot_slot.valid && hot_slot.key == key) {
+        return hot_slot.value;
+    }
+
+    auto& cache = attention_fused_qkv_cache_store();
+    if (cache.size() >= kAttentionFusedQkvCacheMaxEntries) {
+        cache.clear();
+        for (size_t i = 0; i < kAttentionFusedQkvHotSlots; ++i) {
+            hot_slots[i].valid = false;
+        }
+    }
+
     auto it = cache.find(key);
     if (it != cache.end()) {
+        hot_slot.valid = true;
+        hot_slot.key = key;
+        hot_slot.value = it->second;
         return it->second;
     }
 
@@ -218,6 +284,9 @@ static inline array attention_fused_qkv_rhs_cached(
     // Materialize once so cached fused projection weights remain concrete.
     eval(fused);
     auto [inserted, _] = cache.emplace(key, std::move(fused));
+    hot_slot.valid = true;
+    hot_slot.key = key;
+    hot_slot.value = inserted->second;
     return inserted->second;
 }
 
@@ -313,6 +382,14 @@ static void reshape_qkv_to_attention_layout(
     if (q == nullptr || k == nullptr || v == nullptr) {
         throw std::invalid_argument("[attention] null qkv tensor");
     }
+    if (batch_size == 1 && seq_len == 1) {
+        // Decode fast path: reshape directly to attention layout and avoid
+        // no-op transpose nodes on singleton sequence dimensions.
+        *q = reshape(*q, {1, n_heads, 1, head_dim});
+        *k = reshape(*k, {1, n_kv_heads, 1, head_dim});
+        *v = reshape(*v, {1, n_kv_heads, 1, head_dim});
+        return;
+    }
     *q = reshape(*q, {batch_size, seq_len, n_heads, head_dim});
     *k = reshape(*k, {batch_size, seq_len, n_kv_heads, head_dim});
     *v = reshape(*v, {batch_size, seq_len, n_kv_heads, head_dim});
@@ -357,6 +434,11 @@ static void apply_attention_rope(
     bool use_runtime_rope = runtime_rope_cos != nullptr && runtime_rope_sin != nullptr;
     const int rope_dim = static_cast<int>(runtime_rope_dim);
     if (use_runtime_rope && (rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0)) {
+        use_runtime_rope = false;
+    }
+    // Decode fast path: for single-token steps, dispatch the dedicated rope
+    // kernel instead of building a runtime-table slice/mul graph.
+    if (seq_len == 1) {
         use_runtime_rope = false;
     }
     if (use_runtime_rope) {

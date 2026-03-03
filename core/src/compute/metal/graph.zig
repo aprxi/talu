@@ -208,6 +208,36 @@ pub extern fn mlx_lazy_fused_attention(
     attention_multiplier: f32,
 ) ArrayHandle;
 
+/// Fused BF16/FP16 dense attention block:
+/// QKV projections + optional norm/rope + KV cache update + SDPA + output proj.
+pub extern fn mlx_lazy_fused_attention_bf16(
+    input: ArrayHandle,
+    q_w: ArrayHandle,
+    k_w: ArrayHandle,
+    v_w: ArrayHandle,
+    o_w: ArrayHandle,
+    q_norm_w: ArrayHandle,
+    k_norm_w: ArrayHandle,
+    q_bias: ArrayHandle,
+    k_bias: ArrayHandle,
+    v_bias: ArrayHandle,
+    o_bias: ArrayHandle,
+    attn_sinks: ArrayHandle,
+    cache_ptr: CacheHandle,
+    layer_idx: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    pos_offset: usize,
+    rope_theta: f32,
+    runtime_rope_cos: ArrayHandle,
+    runtime_rope_sin: ArrayHandle,
+    runtime_rope_dim: usize,
+    rms_eps: f32,
+    query_pre_attn_scalar: f32,
+    attention_multiplier: f32,
+) ArrayHandle;
+
 /// Dequantize - >>> Lazy: dequantize
 pub extern fn mlx_lazy_dequantize(
     weights: ArrayHandle,
@@ -411,6 +441,12 @@ pub extern fn mlx_causal_conv_cache_free(cache: CausalConvCacheHandle) void;
 /// KV cache lifecycle for fused attention.
 pub extern fn mlx_cache_create(n_layers: usize, max_seq_len: usize) CacheHandle;
 pub extern fn mlx_cache_reset(cache: CacheHandle) void;
+pub extern fn mlx_cache_set_full_bfloat16(
+    cache: CacheHandle,
+    layer_idx: usize,
+    k_full: ArrayHandle,
+    v_full: ArrayHandle,
+) void;
 pub extern fn mlx_cache_free(cache: CacheHandle) void;
 
 /// Fused state-space block (dense/bfloat16 path)

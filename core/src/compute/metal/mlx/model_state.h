@@ -52,6 +52,20 @@ struct StateSpaceLayer {
     array* conv_state = nullptr;
     // SSM state layout: [1, n_heads, d_head, d_state]
     array* ssm_state = nullptr;
+
+    // Decode hot-path cached dense RHS tensors for this layer.
+    // These are derived from immutable model weights and reused across tokens.
+    array* in_proj_rhs = nullptr;
+    array* out_proj_rhs = nullptr;
+    array* gate_up_rhs = nullptr;
+    array* down_proj_rhs = nullptr;
+    const void* in_proj_handle = nullptr;
+    const void* out_proj_handle = nullptr;
+    const void* gate_up_handle = nullptr;
+    const void* down_proj_handle = nullptr;
+    int hidden_dim = 0;
+    int d_inner = 0;
+    int d_ff = 0;
 };
 
 struct MLXStateSpaceCache {

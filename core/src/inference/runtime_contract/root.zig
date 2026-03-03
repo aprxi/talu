@@ -59,6 +59,7 @@ pub const validateExecutionPlanForBlockKind = types.validateExecutionPlanForBloc
 pub const validateCompiledPlan = types.validateCompiledPlan;
 pub const planFinalOutputRegister = types.planFinalOutputRegister;
 pub const stateBlockIdForOpcode = types.stateBlockIdForOpcode;
+pub const stateBlockIdForExecutionMode = types.stateBlockIdForExecutionMode;
 pub const requiredStateBlockIdForOpcode = types.requiredStateBlockIdForOpcode;
 pub const expectedKernelWeightSlots = types.expectedKernelWeightSlots;
 pub const expectedWeightRefCount = types.expectedWeightRefCount;

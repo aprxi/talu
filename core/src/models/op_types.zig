@@ -46,6 +46,63 @@ pub const OpType = enum {
     scatter,
 };
 
+/// Lifecycle policy used by architecture metadata to describe state ownership.
+pub const StateLifecycle = enum(u8) {
+    slot_persistent = 0,
+    request_scoped = 1,
+    step_scoped = 2,
+};
+
+/// Model-owned descriptor metadata emitted into runtime `StateDescriptor`s.
+pub const StateDescriptorSpec = struct {
+    id: u8,
+    size_bytes: u64,
+    align_bytes: u16,
+    zero_init: bool,
+    lifecycle: StateLifecycle,
+};
+
+/// Compatibility payload size for pointer-carried state descriptors.
+pub const compatibility_state_block_bytes: u64 = @sizeOf(?*anyopaque);
+pub const kv_cache_state_id: u8 = 0;
+pub const shortconv_state_id: u8 = 1;
+pub const mamba_state_id: u8 = 2;
+
+/// Default architecture-level state descriptors for baseline models.
+pub const default_state_descriptors = [_]StateDescriptorSpec{
+    .{
+        .id = kv_cache_state_id,
+        .size_bytes = compatibility_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+    },
+    .{
+        .id = shortconv_state_id,
+        .size_bytes = compatibility_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = true,
+        .lifecycle = .slot_persistent,
+    },
+    .{
+        .id = mamba_state_id,
+        .size_bytes = compatibility_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = true,
+        .lifecycle = .slot_persistent,
+    },
+};
+
+/// Default descriptor contract for unknown state ids.
+/// Use request-scoped lifecycle to avoid pinning unknown state indefinitely.
+pub const default_unknown_state_descriptor = StateDescriptorSpec{
+    .id = 0,
+    .size_bytes = compatibility_state_block_bytes,
+    .align_bytes = 64,
+    .zero_init = true,
+    .lifecycle = .request_scoped,
+};
+
 pub const MLAConfig = struct {
     q_lora_rank: u32 = 0,
     kv_lora_rank: u32 = 0,
@@ -249,6 +306,10 @@ pub const Architecture = struct {
     model_types: []const []const u8,
     kernel_meta: KernelMeta = .{},
     parse_config_hook: ?ConfigParseHook = null,
+    /// Per-architecture state descriptor specs keyed by state id.
+    state_descriptors: []const StateDescriptorSpec = default_state_descriptors[0..],
+    /// Fallback used when a state id is not listed in `state_descriptors`.
+    unknown_state_descriptor: StateDescriptorSpec = default_unknown_state_descriptor,
 
     // Heterogeneous model support (e.g., Granite Hybrid with Mamba + Attention)
     // If block_variants is non-null, this is a heterogeneous model
@@ -349,5 +410,14 @@ pub const Architecture = struct {
             }
         }
         return null;
+    }
+
+    pub fn stateDescriptorForId(self: *const Architecture, state_id: u8) StateDescriptorSpec {
+        for (self.state_descriptors) |spec| {
+            if (spec.id == state_id) return spec;
+        }
+        var fallback = self.unknown_state_descriptor;
+        fallback.id = state_id;
+        return fallback;
     }
 };

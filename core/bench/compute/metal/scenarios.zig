@@ -1019,20 +1019,57 @@ pub fn runAttentionDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scen
     try expectMetalReady();
 
     const dims = profileAttentionDecodeDims(cfg.profile);
-    // Keep attention samples long enough in bw profile so results are stable
-    // and representative under sustained load (less sub-ms timing noise).
+    const hidden = dims.heads * dims.head_dim;
+    // Keep decode samples long enough to amortize overhead while preserving
+    // realistic token-step cache updates on the fused attention method path.
     const repeats: usize = switch (cfg.profile) {
-        .ci => profileMethodRepeats(cfg.profile),
-        .bw => 16,
+        .ci => 4,
+        .bw => 12,
     };
-    const q_shape = [_]i64{ 1, @intCast(dims.heads), 1, @intCast(dims.head_dim) };
+    const token_shape = [_]i64{ 1, 1, @intCast(hidden) };
     const kv_shape = [_]i64{ 1, @intCast(dims.heads), @intCast(dims.kv_len), @intCast(dims.head_dim) };
-    var q = try OwnedF16.initShape(allocator, &q_shape, 0x7101);
-    defer q.deinit(allocator);
-    var k = try OwnedF16.initShape(allocator, &kv_shape, 0x7102);
-    defer k.deinit(allocator);
-    var v = try OwnedF16.initShape(allocator, &kv_shape, 0x7103);
-    defer v.deinit(allocator);
+    var x = try OwnedF16.initShape(allocator, &token_shape, 0x7101);
+    defer x.deinit(allocator);
+
+    const AttnProj = struct {
+        q_w: OwnedF16,
+        k_w: OwnedF16,
+        v_w: OwnedF16,
+        o_w: OwnedF16,
+
+        fn init(alloc: std.mem.Allocator, h: usize, seed: u64) !@This() {
+            return .{
+                .q_w = try OwnedF16.init2D(alloc, h, h, seed +% 1),
+                .k_w = try OwnedF16.init2D(alloc, h, h, seed +% 2),
+                .v_w = try OwnedF16.init2D(alloc, h, h, seed +% 3),
+                .o_w = try OwnedF16.init2D(alloc, h, h, seed +% 4),
+            };
+        }
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            self.q_w.deinit(alloc);
+            self.k_w.deinit(alloc);
+            self.v_w.deinit(alloc);
+            self.o_w.deinit(alloc);
+        }
+    };
+
+    var proj_layers = try allocator.alloc(AttnProj, repeats);
+    defer allocator.free(proj_layers);
+    var proj_initialized: usize = 0;
+    errdefer for (proj_layers[0..proj_initialized]) |*layer| layer.deinit(allocator);
+    for (proj_layers, 0..) |*layer, idx| {
+        layer.* = try AttnProj.init(allocator, hidden, 0x7102 +% @as(u64, @intCast(idx)) *% 29);
+        proj_initialized += 1;
+    }
+    defer for (proj_layers) |*layer| layer.deinit(allocator);
+
+    var k_full = try OwnedF16.initShape(allocator, &kv_shape, 0x7106);
+    defer k_full.deinit(allocator);
+    var v_full = try OwnedF16.initShape(allocator, &kv_shape, 0x7107);
+    defer v_full.deinit(allocator);
+    const cache = graph.mlx_cache_create(1, dims.kv_len + repeats + 8);
+    defer graph.mlx_cache_free(cache);
 
     const samples = try allocator.alloc(harness.Sample, cfg.iters);
     errdefer allocator.free(samples);
@@ -1042,14 +1079,42 @@ pub fn runAttentionDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scen
     var iter: usize = 0;
     var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
     graph.mlx_clear_memory_cache();
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dims.head_dim)));
     while (iter < total_iters) : (iter += 1) {
+        graph.mlx_cache_reset(cache);
+        graph.mlx_cache_set_full_bfloat16(cache, 0, k_full.handle, v_full.handle);
         graph.beginForwardGraphBuild();
         const t0 = std.time.nanoTimestamp();
-        var out = graph.mlx_lazy_attention(q.handle, k.handle, v.handle, scale, true);
-        var rep: usize = 1;
+        var out: graph.ArrayHandle = x.handle;
+        var rep: usize = 0;
         while (rep < repeats) : (rep += 1) {
-            out = graph.mlx_lazy_attention(out, k.handle, v.handle, scale, true);
+            const layer = &proj_layers[rep];
+            out = graph.mlx_lazy_fused_attention_bf16(
+                out,
+                layer.q_w.handle,
+                layer.k_w.handle,
+                layer.v_w.handle,
+                layer.o_w.handle,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                cache,
+                0,
+                dims.heads,
+                dims.heads,
+                dims.head_dim,
+                dims.kv_len + rep,
+                10_000.0,
+                null,
+                null,
+                0,
+                1.0e-5,
+                0.0,
+                0.0,
+            );
         }
         const t1 = std.time.nanoTimestamp();
         var handles = [_]graph.ArrayHandle{out};
@@ -1060,8 +1125,15 @@ pub fn runAttentionDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scen
         recordSample(&cold_first, samples, &sample_idx, iter, cfg.warmup, t0, t1, t2, t3);
     }
 
-    const flops = toU64Saturating(@as(u128, 4) * dims.heads * dims.kv_len * dims.head_dim * repeats);
-    const bytes = toU64Saturating(@as(u128, 4) * dims.heads * dims.kv_len * dims.head_dim * repeats);
+    const proj_flops_per_step = @as(u128, 8) * hidden * hidden;
+    const attn_flops_per_step = @as(u128, 4) * dims.heads * dims.kv_len * dims.head_dim;
+    const flops = toU64Saturating((proj_flops_per_step + attn_flops_per_step) * repeats);
+
+    const proj_weight_bytes_per_step = @as(u128, 4) * hidden * hidden * 2;
+    const kv_read_bytes_per_step = @as(u128, 2) * dims.heads * dims.kv_len * dims.head_dim * 2;
+    const kv_write_bytes_per_step = @as(u128, 2) * dims.heads * dims.head_dim * 2;
+    const io_bytes_per_step = @as(u128, 2) * hidden * 2;
+    const bytes = toU64Saturating((proj_weight_bytes_per_step + kv_read_bytes_per_step + kv_write_bytes_per_step + io_bytes_per_step) * repeats);
 
     return .{
         .name = "p1_attn",
@@ -1070,7 +1142,7 @@ pub fn runAttentionDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scen
         .cold_first = cold_first,
         .flops_per_iter = flops,
         .bytes_per_iter = bytes,
-        .note = "decode attention method with KV-cache style shapes (sustained bw repeats)",
+        .note = "fused dense attention decode method with prefilled KV cache",
     };
 }
 

@@ -4,6 +4,10 @@ const std = @import("std");
 const log = @import("../../../log.zig");
 
 pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
+    }
     if (tokens.len == 0) {
         log.warn("inference", "CUDA prefill invalid args", .{
             .reason = "empty_tokens",
@@ -136,6 +140,8 @@ const MockBackend = struct {
     slot_logits_storage: [8]f32 = [_]f32{0.0} ** 8,
     slot_logits: []f32 = undefined,
     ensure_kv_capacity_calls: usize = 0,
+    ensure_state_binding_calls: usize = 0,
+    slot_state_bound: bool = true,
     compute_calls: usize = 0,
     timing_calls: usize = 0,
 
@@ -148,6 +154,12 @@ const MockBackend = struct {
     fn ensureKvCapacity(self: *MockBackend, required_tokens: usize) !void {
         _ = required_tokens;
         self.ensure_kv_capacity_calls += 1;
+    }
+
+    fn ensureSlotStateBlocksBoundForScheduler(self: *MockBackend, slot_index: usize) !void {
+        self.ensure_state_binding_calls += 1;
+        if (slot_index != 0) return error.InvalidArgument;
+        if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
     }
 
     fn shouldDownloadPrefillLogitsImpl(self: *const MockBackend, token_index: usize, token_count: usize) bool {
@@ -201,6 +213,7 @@ test "prefill executes token-wise prefill path" {
     try prefill(&backend, tokens[0..], logits_out[0..]);
 
     try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
+    try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(tokens.len, backend.compute_calls);
     try testing.expectEqual(tokens.len, backend.slot_position);
 }
@@ -213,6 +226,21 @@ test "prefillSlot executes token-wise prefill path" {
     try prefillSlot(&backend, 0, tokens[0..], logits_out[0..]);
 
     try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
+    try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(tokens.len, backend.compute_calls);
     try testing.expectEqual(tokens.len, backend.slot_position);
+}
+
+test "prefill fails when slot state blocks are unbound" {
+    var backend = MockBackend.init();
+    backend.slot_state_bound = false;
+    const tokens = [_]u32{1};
+    var logits_out: [8]f32 = undefined;
+
+    try testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        prefill(&backend, tokens[0..], logits_out[0..]),
+    );
+    try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
+    try testing.expectEqual(@as(usize, 0), backend.compute_calls);
 }

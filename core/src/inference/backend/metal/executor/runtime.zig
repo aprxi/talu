@@ -100,6 +100,31 @@ pub fn transformerForwardLazyWithEmbeddingOverride(
     );
 }
 
+pub fn transformerForwardHiddenLazyWithEmbeddingOverride(
+    allocator: std.mem.Allocator,
+    weight_handles: *const WeightHandles,
+    input_ids: []const u32,
+    state_blocks: []const runtime_contract.StateBlockHandle,
+    config: anytype,
+    pos_offset: usize,
+    embedding_override: ?[]const f32,
+    deepstack: ?DeepstackAdditions,
+    runtime_rope: ?RuntimeRoPEOverride,
+) !ArrayHandle {
+    beginGraphBuild();
+    return model_executor.Model.forwardHiddenWithEmbeddingOverride(
+        allocator,
+        weight_handles,
+        input_ids,
+        state_blocks,
+        config,
+        pos_offset,
+        embedding_override,
+        deepstack,
+        runtime_rope,
+    );
+}
+
 pub fn transformerForwardFromGPUToken(
     allocator: std.mem.Allocator,
     weight_handles: *const WeightHandles,
@@ -137,6 +162,13 @@ test "transformerForwardLazyWithEmbeddingOverride exposes stable callable signat
     const fn_info = @typeInfo(@TypeOf(transformerForwardLazyWithEmbeddingOverride)).@"fn";
     try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
     const f = transformerForwardLazyWithEmbeddingOverride;
+    _ = f;
+}
+
+test "transformerForwardHiddenLazyWithEmbeddingOverride exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(transformerForwardHiddenLazyWithEmbeddingOverride)).@"fn";
+    try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
+    const f = transformerForwardHiddenLazyWithEmbeddingOverride;
     _ = f;
 }
 

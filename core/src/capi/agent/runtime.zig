@@ -77,10 +77,7 @@ pub fn talu_agent_runtime_validate_strict(
 
     sandbox.landlock.validateAvailability() catch |err| {
         capi_error.setError(err, "strict runtime support check failed", .{});
-        return switch (err) {
-            error.StrictUnavailable => @intFromEnum(error_codes.ErrorCode.policy_strict_unavailable),
-            else => @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed),
-        };
+        return @intFromEnum(error_codes.ErrorCode.policy_strict_unavailable);
     };
 
     return 0;

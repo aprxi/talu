@@ -250,19 +250,17 @@ pub const StatePointerPayload = extern struct {
 /// Compatibility descriptor allocation footprint for pointer payload blocks.
 pub const compatibility_state_block_bytes: u64 = @sizeOf(StatePointerPayload);
 
-pub fn writeStatePointerToBlock(
-    state_block: *const StateBlockHandle,
-    ptr: ?*anyopaque,
-) !void {
-    if (state_block.align_bytes < @alignOf(StatePointerPayload)) return error.InvalidStateDescriptorBinding;
-    if (state_block.size < @sizeOf(StatePointerPayload)) return error.InvalidStateDescriptorBinding;
-    const payload: *StatePointerPayload = @ptrCast(@alignCast(state_block.ptr));
+pub fn writeStatePointerToBlock(state_block: *StateBlockHandle, ptr: ?*anyopaque) !void {
+    if (state_block.align_bytes == 0 or state_block.size == 0) return error.InvalidStateDescriptorBinding;
+    const payload = stateValueFromBlock(*StatePointerPayload, state_block) orelse {
+        return error.InvalidStateDescriptorBinding;
+    };
     payload.* = .{ .ptr = ptr };
 }
 
 pub fn statePointerFromBlock(state_block: *const StateBlockHandle) ?*anyopaque {
-    const payload = stateValueFromBlock(*const StatePointerPayload, state_block) orelse return null;
-    return payload.ptr;
+    const payload = stateValueFromBlock(*const StatePointerPayload, state_block) orelse return @ptrCast(state_block.ptr);
+    return payload.ptr orelse @ptrCast(state_block.ptr);
 }
 
 pub fn statePointerForId(
@@ -465,6 +463,16 @@ pub fn stateBlockIdForOpcode(opcode: Opcode) ?u8 {
     };
 }
 
+pub fn stateBlockIdForExecutionMode(opcode: Opcode, mode: ExecutionMode) ?u8 {
+    return switch (mode) {
+        .vision_encode, .scatter => switch (opcode) {
+            .multihead_attention, .mla_attention => null,
+            else => stateBlockIdForOpcode(opcode),
+        },
+        else => stateBlockIdForOpcode(opcode),
+    };
+}
+
 pub fn requiredStateBlockIdForOpcode(opcode: Opcode) ?u8 {
     return switch (opcode) {
         .shortconv => @intFromEnum(StateBlockId.shortconv),
@@ -476,11 +484,50 @@ pub fn requiredStateBlockIdForOpcode(opcode: Opcode) ?u8 {
 pub fn expectedKernelWeightSlots(opcode: Opcode) []const []const u8 {
     return switch (opcode) {
         .rmsnorm => &.{"norm_weight"},
-        .multihead_attention => &.{ "q_proj", "k_proj", "v_proj", "o_proj" },
+        .multihead_attention => &.{
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "q_norm",
+            "k_norm",
+            "q_bias",
+            "k_bias",
+            "v_bias",
+            "o_bias",
+            "attn_sinks",
+        },
         .swiglu => &.{ "w1", "w3", "w2" },
-        .moe => &.{ "router", "up_proj", "down_proj" },
-        .mamba_mixer => &.{ "in_proj", "conv_weight", "a_log", "d_skip", "out_proj" },
-        .shortconv => &.{ "in_proj", "conv_weight", "out_proj" },
+        .moe => &.{
+            "router",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "router_bias",
+            "gate_scales",
+            "up_scales",
+            "down_scales",
+            "gate_bias",
+            "up_bias",
+            "down_bias",
+            "router_scales",
+            "router_quant_bias",
+        },
+        .mamba_mixer => &.{
+            "in_proj",
+            "conv_weight",
+            "a_log",
+            "d_skip",
+            "out_proj",
+            "conv_bias",
+            "dt_bias",
+            "norm_weight",
+            "ln1_weight",
+            "ln2_weight",
+            "gate_up",
+            "down_proj",
+        },
+        .shortconv => &.{ "in_proj", "conv_weight", "out_proj", "conv_bias" },
         .mla_attention => &.{ "q_a_proj", "q_a_norm", "q_b_proj", "kv_a_proj", "kv_a_norm", "kv_b_proj", "o_proj" },
         .embedding => &.{"embedding"},
         else => &.{},
@@ -592,7 +639,7 @@ pub fn defaultOpaqueStateDescriptor(state_id: u8) StateDescriptor {
         .size_bytes = compatibility_state_block_bytes,
         .align_bytes = 64,
         .zero_init = true,
-        .lifecycle = .slot_persistent,
+        .lifecycle = .request_scoped,
     };
 }
 
@@ -1957,6 +2004,36 @@ test "validateStateBlocksForDescriptors enforces descriptor coverage and constra
     );
 }
 
+test "writeStatePointerToBlock updates pointer payload" {
+    var backing: [64]u8 align(64) = [_]u8{0} ** 64;
+    var target_value: u32 = 42;
+    var block = StateBlockHandle{
+        .id = 1,
+        .ptr = &backing,
+        .size = compatibility_state_block_bytes,
+        .align_bytes = 64,
+    };
+
+    try writeStatePointerToBlock(&block, @ptrCast(&target_value));
+    const resolved = statePointerFromBlock(&block) orelse return error.InvalidStateDescriptorBinding;
+    const typed: *u32 = @ptrCast(@alignCast(resolved));
+    try std.testing.expectEqual(@as(u32, 42), typed.*);
+}
+
+test "writeStatePointerToBlock rejects undersized block" {
+    var backing: [64]u8 align(64) = [_]u8{0} ** 64;
+    var block = StateBlockHandle{
+        .id = 1,
+        .ptr = &backing,
+        .size = 4,
+        .align_bytes = 64,
+    };
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        writeStatePointerToBlock(&block, null),
+    );
+}
+
 test "validateExecutionPlan rejects missing state binding for stateful opcode" {
     const insn = Instruction{
         .opcode = .shortconv,
@@ -2293,14 +2370,13 @@ test "instructionSingleWeightBindingName rejects non-single weight arity" {
 
 test "instructionKernelWeightBinding validates slot contract" {
     const insn = Instruction{
-        .opcode = .multihead_attention,
+        .opcode = .swiglu,
         .inputs = &.{registerFromIndex(0)},
         .outputs = &.{registerFromIndex(1)},
         .weights = &.{
             .{ .index = 0 },
             .{ .index = 1 },
             .{ .index = 2 },
-            .{ .index = 3 },
         },
         .param_block_id = null,
         .state_block_id = null,
@@ -2313,10 +2389,9 @@ test "instructionKernelWeightBinding validates slot contract" {
         },
         .param_blocks = &.{},
         .weight_bindings = &.{
-            .{ .index = 0, .name = "__kernel_weight::7::q_proj::0" },
-            .{ .index = 1, .name = "__kernel_weight::7::k_proj::0" },
-            .{ .index = 2, .name = "__kernel_weight::7::v_proj::0" },
-            .{ .index = 3, .name = "__kernel_weight::7::o_proj::0" },
+            .{ .index = 0, .name = "__kernel_weight::7::w1::0" },
+            .{ .index = 1, .name = "__kernel_weight::7::w3::0" },
+            .{ .index = 2, .name = "__kernel_weight::7::w2::0" },
         },
         .liveness = .{
             .register_last_read = &.{ 0, 0 },
@@ -2325,9 +2400,9 @@ test "instructionKernelWeightBinding validates slot contract" {
         .peak_registers = 1,
         .diagnostics = &.{},
     };
-    const parsed = try instructionKernelWeightBinding(&compiled, 0, .multihead_attention, 2);
+    const parsed = try instructionKernelWeightBinding(&compiled, 0, .swiglu, 2);
     try std.testing.expectEqual(@as(u32, 7), parsed.kernel_id);
-    try std.testing.expectEqualStrings("v_proj", parsed.slot_name);
+    try std.testing.expectEqualStrings("w2", parsed.slot_name);
 }
 
 test "instructionKernelBindingId enforces consistent kernel id across slots" {
@@ -2379,12 +2454,12 @@ test "parseKernelWeightBindingName rejects malformed names" {
 }
 
 test "expectedWeightRefCount returns macro-op arities" {
-    try std.testing.expectEqual(@as(usize, 4), expectedWeightRefCount(.multihead_attention));
+    try std.testing.expectEqual(@as(usize, 11), expectedWeightRefCount(.multihead_attention));
     try std.testing.expectEqual(@as(usize, 7), expectedWeightRefCount(.mla_attention));
     try std.testing.expectEqual(@as(usize, 3), expectedWeightRefCount(.swiglu));
-    try std.testing.expectEqual(@as(usize, 3), expectedWeightRefCount(.moe));
-    try std.testing.expectEqual(@as(usize, 5), expectedWeightRefCount(.mamba_mixer));
-    try std.testing.expectEqual(@as(usize, 3), expectedWeightRefCount(.shortconv));
+    try std.testing.expectEqual(@as(usize, 13), expectedWeightRefCount(.moe));
+    try std.testing.expectEqual(@as(usize, 12), expectedWeightRefCount(.mamba_mixer));
+    try std.testing.expectEqual(@as(usize, 4), expectedWeightRefCount(.shortconv));
 }
 
 test "AdapterTable keeps 256 opcode slots" {

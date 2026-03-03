@@ -857,7 +857,7 @@ pub const Transformer = struct {
         for (blocks, 0..) |*block, layer_idx| {
             const block_kind = block.block_type;
             const layer_program = try resolveLayerProgram(static_entry, block_kind);
-            block_layers[layer_idx] = try buildBlock(allocator, block, model_config, layer_idx, layer_program);
+            block_layers[layer_idx] = try buildBlock(allocator, block, model_config, layer_idx, layer_program, static_entry);
             built_layers = layer_idx + 1;
             try block_layers[layer_idx].validate();
         }
@@ -911,14 +911,18 @@ pub const Transformer = struct {
         model_config: ModelConfig,
         layer_idx: usize,
         program: []const LayerOp,
+        static_entry: ?models.ModelDescriptor,
     ) !Block {
-        return Block.initWithProgram(
+        return Block.initWithProgramOptions(
             allocator,
             block,
             layer_idx,
             @intCast(model_config.d_model),
             program,
             .decode,
+            .{
+                .state_descriptor_entry = static_entry,
+            },
         );
     }
 

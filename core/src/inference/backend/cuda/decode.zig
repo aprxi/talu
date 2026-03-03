@@ -5,6 +5,10 @@ const common_mrope = @import("../../vision_mrope.zig");
 const log = @import("../../../log.zig");
 
 pub fn decode(self: anytype, token: u32, position: usize, logits_out: []f32) !void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
+    }
     if (logits_out.len != self.vocab_size) {
         log.warn("inference", "CUDA decode invalid args", .{
             .reason = "logits_len_mismatch",
@@ -73,6 +77,10 @@ pub fn decodeStreaming(
     callback: ?*const fn (u32, ?*anyopaque) void,
     callback_data: ?*anyopaque,
 ) !usize {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
+    }
     if (max_tokens == 0 or output_tokens.len == 0) return 0;
     if (!self.slot_in_use) {
         self.slot_in_use = true;
@@ -147,4 +155,116 @@ pub fn resetSlot(self: anytype, slot_index: usize) void {
 pub fn getPosition(self: anytype, slot_index: usize) usize {
     if (slot_index != 0) return 0;
     return self.slot_position;
+}
+
+const std = @import("std");
+const testing = std.testing;
+
+const MockDecodeBackend = struct {
+    const MockBlockRuntime = struct {
+        blocks: [1]u8 = .{0},
+    };
+
+    vocab_size: usize = 8,
+    slot_rope_position_delta: isize = 0,
+    slot_position: usize = 0,
+    slot_in_use: bool = true,
+    block_runtime: MockBlockRuntime = .{},
+    slot_logits_storage: [8]f32 = [_]f32{0.0} ** 8,
+    slot_logits: []f32 = undefined,
+    ensure_state_binding_calls: usize = 0,
+    slot_state_bound: bool = true,
+    compute_calls: usize = 0,
+    next_token: u32 = 7,
+
+    fn init() MockDecodeBackend {
+        var backend = MockDecodeBackend{};
+        backend.slot_logits = backend.slot_logits_storage[0..];
+        return backend;
+    }
+
+    fn ensureSlotStateBlocksBoundForScheduler(self: *MockDecodeBackend, slot_index: usize) !void {
+        self.ensure_state_binding_calls += 1;
+        if (slot_index != 0) return error.InvalidArgument;
+        if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
+    }
+
+    fn computeGpuPrototypeLogits(
+        self: *MockDecodeBackend,
+        token: u32,
+        position: usize,
+        logits_out: []f32,
+    ) !void {
+        _ = token;
+        _ = position;
+        self.compute_calls += 1;
+        for (logits_out, 0..) |*value, idx| {
+            value.* = @floatFromInt(idx);
+        }
+    }
+
+    fn computeGpuPrototypeLogitsWithLayerLimit(
+        self: *MockDecodeBackend,
+        token: u32,
+        position: usize,
+        logits_out_opt: ?[]f32,
+        layer_limit: usize,
+        compute_logits: bool,
+        download_logits: bool,
+        ensure_kv_capacity: bool,
+        hidden_override: ?[]const f32,
+        deepstack_layer_features_opt: ?[]const []const f32,
+        deepstack_feature_index_opt: ?usize,
+    ) !void {
+        _ = token;
+        _ = position;
+        _ = logits_out_opt;
+        _ = layer_limit;
+        _ = compute_logits;
+        _ = download_logits;
+        _ = ensure_kv_capacity;
+        _ = hidden_override;
+        _ = deepstack_layer_features_opt;
+        _ = deepstack_feature_index_opt;
+        self.compute_calls += 1;
+    }
+
+    fn selectNextTokenFromDeviceLogitsImpl(self: *MockDecodeBackend) !u32 {
+        return self.next_token;
+    }
+};
+
+test "decode enforces state binding guard" {
+    var backend = MockDecodeBackend.init();
+    backend.slot_state_bound = false;
+    var logits_out: [8]f32 = undefined;
+
+    try testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        decode(&backend, 1, 0, logits_out[0..]),
+    );
+    try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
+    try testing.expectEqual(@as(usize, 0), backend.compute_calls);
+}
+
+test "decodeStreaming enforces state binding guard" {
+    var backend = MockDecodeBackend.init();
+    backend.slot_state_bound = false;
+    var output_tokens: [4]u32 = undefined;
+
+    try testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        decodeStreaming(
+            &backend,
+            1,
+            0,
+            output_tokens.len,
+            &[_]u32{2},
+            output_tokens[0..],
+            null,
+            null,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
+    try testing.expectEqual(@as(usize, 0), backend.compute_calls);
 }

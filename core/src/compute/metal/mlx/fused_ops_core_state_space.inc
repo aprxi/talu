@@ -62,6 +62,7 @@ static array orient_matmul_rhs(
 }
 
 static constexpr size_t kOrientedRhsCacheMaxEntries = 2048;
+static constexpr size_t kOrientedRhsHotSlots = 512;
 static constexpr size_t kStateSpaceConvKernelCacheMaxEntries = 512;
 static constexpr size_t kCausalConvKernelCacheMaxEntries = 512;
 static constexpr size_t kCausalConvBiasCacheMaxEntries = 512;
@@ -96,14 +97,42 @@ static inline std::unordered_map<OrientedRhsCacheKey, array, OrientedRhsCacheKey
     return cache;
 }
 
+struct OrientedRhsHotSlot {
+    bool valid = false;
+    OrientedRhsCacheKey key;
+    array rhs = array(0.0f);
+};
+
+static inline OrientedRhsHotSlot* oriented_rhs_hot_slots_store() {
+    static thread_local OrientedRhsHotSlot slots[kOrientedRhsHotSlots];
+    return slots;
+}
+
+struct OrientedRhsLastHit {
+    bool valid = false;
+    OrientedRhsCacheKey key;
+    array rhs = array(0.0f);
+};
+
+static inline OrientedRhsLastHit& oriented_rhs_last_hit_store() {
+    static thread_local OrientedRhsLastHit last_hit;
+    return last_hit;
+}
+
 static inline void oriented_rhs_cache_clear() {
     oriented_rhs_cache_store().clear();
+    auto* slots = oriented_rhs_hot_slots_store();
+    for (size_t i = 0; i < kOrientedRhsHotSlots; ++i) {
+        slots[i].valid = false;
+    }
+    oriented_rhs_last_hit_store().valid = false;
 }
 
 // Defined in fused_ops_attention.inc and fused_ops_ffn_expert_mix.inc.
 static inline void attention_fused_qkv_cache_clear();
 static inline void ffn_quantized_gate_up_cache_clear();
 static inline void ffn_fused_gate_up_cache_clear();
+static inline void ffn_fused_dense_rhs_cache_clear();
 
 struct StateSpaceConvKernelCacheKey {
     const void* weight_handle = nullptr;
@@ -139,11 +168,13 @@ struct CausalConvKernelCacheKey {
     const void* weight_handle = nullptr;
     int d_conv = 0;
     int conv_dim = 0;
+    int target_dtype = 0;
 
     bool operator==(const CausalConvKernelCacheKey& other) const {
         return weight_handle == other.weight_handle &&
                d_conv == other.d_conv &&
-               conv_dim == other.conv_dim;
+               conv_dim == other.conv_dim &&
+               target_dtype == other.target_dtype;
     }
 };
 
@@ -152,6 +183,7 @@ struct CausalConvKernelCacheKeyHash {
         size_t h = std::hash<const void*>{}(key.weight_handle);
         h ^= std::hash<int>{}(key.d_conv) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(key.conv_dim) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.target_dtype) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -168,10 +200,12 @@ static inline void causal_conv_kernel_cache_clear() {
 struct CausalConvBiasCacheKey {
     const void* bias_handle = nullptr;
     int conv_dim = 0;
+    int target_dtype = 0;
 
     bool operator==(const CausalConvBiasCacheKey& other) const {
         return bias_handle == other.bias_handle &&
-               conv_dim == other.conv_dim;
+               conv_dim == other.conv_dim &&
+               target_dtype == other.target_dtype;
     }
 };
 
@@ -179,6 +213,7 @@ struct CausalConvBiasCacheKeyHash {
     size_t operator()(const CausalConvBiasCacheKey& key) const {
         size_t h = std::hash<const void*>{}(key.bias_handle);
         h ^= std::hash<int>{}(key.conv_dim) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.target_dtype) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -239,6 +274,7 @@ struct QuantParamCastCacheKeyHash {
 
 static constexpr size_t kQuantParamCastCacheMaxEntries = 4096;
 static constexpr size_t kStateSpaceStaticCacheMaxEntries = 1024;
+static constexpr size_t kStateSpaceRowCacheMaxEntries = 1024;
 
 static inline std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash>& quant_param_cast_cache_store() {
     static thread_local std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash> cache;
@@ -285,6 +321,39 @@ static inline std::unordered_map<StateSpaceStaticCacheKey, StateSpaceStaticTerms
 
 static inline void state_space_static_cache_clear() {
     state_space_static_cache_store().clear();
+}
+
+struct StateSpaceRowCacheKey {
+    const void* handle = nullptr;
+    int length = 0;
+    int target_dtype = 0;
+    uint8_t kind = 0; // 0 = conv_bias_row, 1 = dt_bias_row
+
+    bool operator==(const StateSpaceRowCacheKey& other) const {
+        return handle == other.handle &&
+               length == other.length &&
+               target_dtype == other.target_dtype &&
+               kind == other.kind;
+    }
+};
+
+struct StateSpaceRowCacheKeyHash {
+    size_t operator()(const StateSpaceRowCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.handle);
+        h ^= std::hash<int>{}(key.length) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.target_dtype) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint8_t>{}(key.kind) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static inline std::unordered_map<StateSpaceRowCacheKey, array, StateSpaceRowCacheKeyHash>& state_space_row_cache_store() {
+    static thread_local std::unordered_map<StateSpaceRowCacheKey, array, StateSpaceRowCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void state_space_row_cache_clear() {
+    state_space_row_cache_store().clear();
 }
 
 static inline array cast_tensor_cached(
@@ -361,6 +430,46 @@ static inline StateSpaceStaticTerms resolve_state_space_static_terms(
     return inserted->second;
 }
 
+static inline array resolve_state_space_row_cached(
+    const void* handle,
+    const array& param,
+    int length,
+    Dtype target_dtype,
+    uint8_t kind
+) {
+    const auto uncached = [&]() -> array {
+        const array casted = (param.dtype() == target_dtype) ? param : astype(param, target_dtype);
+        if (casted.ndim() == 2 && casted.shape(0) == 1 && casted.shape(1) == length) {
+            return casted;
+        }
+        return reshape(casted, {1, length});
+    };
+
+    if (handle == nullptr) {
+        return uncached();
+    }
+
+    auto& cache = state_space_row_cache_store();
+    if (cache.size() >= kStateSpaceRowCacheMaxEntries) {
+        cache.clear();
+    }
+
+    StateSpaceRowCacheKey key;
+    key.handle = handle;
+    key.length = length;
+    key.target_dtype = static_cast<int>(target_dtype.val());
+    key.kind = kind;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    array row = uncached();
+    eval(row);
+    auto [inserted, _] = cache.emplace(key, std::move(row));
+    return inserted->second;
+}
+
 static inline array orient_matmul_rhs_cached(
     const void* weight_handle,
     const array& weight,
@@ -372,18 +481,44 @@ static inline array orient_matmul_rhs_cached(
         return orient_matmul_rhs(weight, in_features, out_features, transpose_when_ambiguous);
     }
 
-    auto& cache = oriented_rhs_cache_store();
-    if (cache.size() >= kOrientedRhsCacheMaxEntries) {
-        cache.clear();
-    }
-
     OrientedRhsCacheKey key;
     key.weight_handle = weight_handle;
     key.in_features = in_features;
     key.out_features = out_features.has_value() ? out_features.value() : -1;
     key.transpose_when_ambiguous = transpose_when_ambiguous;
+
+    auto* hot_slots = oriented_rhs_hot_slots_store();
+    const size_t hot_index = OrientedRhsCacheKeyHash{}(key) & (kOrientedRhsHotSlots - 1);
+    auto& hot_slot = hot_slots[hot_index];
+    if (hot_slot.valid && hot_slot.key == key) {
+        return hot_slot.rhs;
+    }
+
+    auto& last_hit = oriented_rhs_last_hit_store();
+    if (last_hit.valid && last_hit.key == key) {
+        hot_slot.valid = true;
+        hot_slot.key = key;
+        hot_slot.rhs = last_hit.rhs;
+        return last_hit.rhs;
+    }
+
+    auto& cache = oriented_rhs_cache_store();
+    if (cache.size() >= kOrientedRhsCacheMaxEntries) {
+        cache.clear();
+        for (size_t i = 0; i < kOrientedRhsHotSlots; ++i) {
+            hot_slots[i].valid = false;
+        }
+        last_hit.valid = false;
+    }
+
     auto it = cache.find(key);
     if (it != cache.end()) {
+        hot_slot.valid = true;
+        hot_slot.key = key;
+        hot_slot.rhs = it->second;
+        last_hit.valid = true;
+        last_hit.key = key;
+        last_hit.rhs = it->second;
         return it->second;
     }
 
@@ -409,6 +544,12 @@ static inline array orient_matmul_rhs_cached(
     // Materialize once so cached transforms do not get re-lowered per decode token.
     eval(rhs);
     auto [inserted_it, _] = cache.emplace(key, rhs);
+    hot_slot.valid = true;
+    hot_slot.key = key;
+    hot_slot.rhs = inserted_it->second;
+    last_hit.valid = true;
+    last_hit.key = key;
+    last_hit.rhs = inserted_it->second;
     return inserted_it->second;
 }
 
@@ -420,9 +561,11 @@ void mlx_weight_transform_cache_clear() {
     bias_cast_cache_clear();
     quant_param_cast_cache_clear();
     state_space_static_cache_clear();
+    state_space_row_cache_clear();
     attention_fused_qkv_cache_clear();
     ffn_quantized_gate_up_cache_clear();
     ffn_fused_gate_up_cache_clear();
+    ffn_fused_dense_rhs_cache_clear();
 }
 
 static array gelu_approx(const array& x) {
@@ -480,6 +623,14 @@ static array matmul_lastdim(
     int rows = 1;
     for (int axis = 0; axis < input_for_matmul.ndim() - 1; ++axis) {
         rows *= input_for_matmul.shape(axis);
+    }
+
+    // Decode hot path: [1, 1, D] @ [D, O]. Prefer vector matmul dispatch to
+    // reduce launch overhead versus generic flattened GEMM.
+    if (rows == 1) {
+        auto input_vec = reshape(input_for_matmul, {in_features});
+        auto out_vec = matmul(input_vec, rhs);
+        return reshape(out_vec, out_shape);
     }
 
     auto input_2d = reshape(input_for_matmul, {rows, in_features});
@@ -689,7 +840,8 @@ static array resolve_causal_conv_kernel(
     const void* conv_weight_handle,
     const array& conv_weight,
     int d_conv,
-    int conv_dim
+    int conv_dim,
+    Dtype target_dtype
 ) {
     const auto uncached = [&]() -> array {
         array kernel = conv_weight;
@@ -697,7 +849,8 @@ static array resolve_causal_conv_kernel(
             kernel.shape(0) == 1 &&
             kernel.shape(1) == d_conv &&
             kernel.shape(2) == conv_dim) {
-            return ensure_float32(kernel);
+            const array casted = (kernel.dtype() == target_dtype) ? kernel : astype(kernel, target_dtype);
+            return contiguous(casted);
         }
         if (kernel.ndim() == 3) {
             // [conv_dim, 1, d_conv] -> [conv_dim, d_conv]
@@ -711,8 +864,8 @@ static array resolve_causal_conv_kernel(
         } else if (!(kernel.shape(0) == d_conv and kernel.shape(1) == conv_dim)) {
             throw std::invalid_argument("[causal_conv] conv weight shape incompatible with d_conv/conv_dim");
         }
-        kernel = ensure_float32(kernel);
-        return reshape(kernel, {1, d_conv, conv_dim});
+        kernel = (kernel.dtype() == target_dtype) ? kernel : astype(kernel, target_dtype);
+        return contiguous(reshape(kernel, {1, d_conv, conv_dim}));
     };
 
     if (conv_weight_handle == nullptr) {
@@ -728,6 +881,7 @@ static array resolve_causal_conv_kernel(
     key.weight_handle = conv_weight_handle;
     key.d_conv = d_conv;
     key.conv_dim = conv_dim;
+    key.target_dtype = static_cast<int>(target_dtype.val());
     auto it = cache.find(key);
     if (it != cache.end()) {
         return it->second;
@@ -742,18 +896,20 @@ static array resolve_causal_conv_kernel(
 static std::optional<array> resolve_causal_conv_bias_row(
     const void* conv_bias_handle,
     const array* conv_bias_arr,
-    int conv_dim
+    int conv_dim,
+    Dtype target_dtype
 ) {
     if (conv_bias_arr == nullptr) {
         return std::nullopt;
     }
 
     const auto uncached = [&]() -> array {
-        const array conv_bias_f32 = ensure_float32(*conv_bias_arr);
-        if (conv_bias_f32.ndim() == 2 && conv_bias_f32.shape(0) == 1 && conv_bias_f32.shape(1) == conv_dim) {
-            return conv_bias_f32;
+        const array conv_bias_cast =
+            (conv_bias_arr->dtype() == target_dtype) ? *conv_bias_arr : astype(*conv_bias_arr, target_dtype);
+        if (conv_bias_cast.ndim() == 2 && conv_bias_cast.shape(0) == 1 && conv_bias_cast.shape(1) == conv_dim) {
+            return contiguous(conv_bias_cast);
         }
-        return reshape(conv_bias_f32, {1, conv_dim});
+        return contiguous(reshape(conv_bias_cast, {1, conv_dim}));
     };
 
     if (conv_bias_handle == nullptr) {
@@ -768,6 +924,7 @@ static std::optional<array> resolve_causal_conv_bias_row(
     CausalConvBiasCacheKey key;
     key.bias_handle = conv_bias_handle;
     key.conv_dim = conv_dim;
+    key.target_dtype = static_cast<int>(target_dtype.val());
     auto it = cache.find(key);
     if (it != cache.end()) {
         return std::optional<array>(it->second);
@@ -810,20 +967,67 @@ static array cast_bias_cached(
     return inserted_it->second;
 }
 
+struct StateSpaceCallable {
+    array (*fn)(const array&, const void*) = nullptr;
+    const void* ctx = nullptr;
+};
+
+static inline array state_space_call(const StateSpaceCallable& callable, const array& x) {
+    if (callable.fn == nullptr) {
+        throw std::invalid_argument("[state_space] missing callable");
+    }
+    return callable.fn(x, callable.ctx);
+}
+
+static array state_space_apply_matmul_rhs(const array& x, const void* ctx) {
+    const auto* rhs = static_cast<const array*>(ctx);
+    if (rhs == nullptr) {
+        throw std::invalid_argument("[state_space] missing matmul rhs");
+    }
+    return matmul_lastdim(x, *rhs);
+}
+
+struct StateSpaceQuantLinearCtx {
+    const array* w = nullptr;
+    const array* s = nullptr;
+    const array* b = nullptr;
+    const void* s_handle = nullptr;
+    const void* b_handle = nullptr;
+    int group_size = 0;
+    int bits = 0;
+};
+
+static array state_space_apply_quantized_linear(const array& x, const void* ctx_ptr) {
+    const auto* ctx = static_cast<const StateSpaceQuantLinearCtx*>(ctx_ptr);
+    if (ctx == nullptr || ctx->w == nullptr || ctx->s == nullptr || ctx->b == nullptr) {
+        throw std::invalid_argument("[state_space] missing quantized linear params");
+    }
+    return quantized_linear_no_bias(
+        x,
+        *ctx->w,
+        *ctx->s,
+        *ctx->b,
+        ctx->group_size,
+        ctx->bits,
+        ctx->s_handle,
+        ctx->b_handle
+    );
+}
+
 static array state_space_forward_core(
     const array& input, // [1, L, d_model]
     const array& ln1_weight,
-    const std::function<array(const array&)>& in_proj_fn,
+    const StateSpaceCallable& in_proj_fn,
     const array& conv_kernel_broadcast, // [1, d_conv, xbc_len]
     const std::optional<array>& conv_bias_row, // [1, xbc_len]
     const array& a_log_exp_group, // [1, n_groups, heads_per_group, 1, 1]
     const array& d_skip_group, // [1, n_groups, heads_per_group, 1]
     const std::optional<array>& dt_bias_row, // [1, n_heads]
     const std::optional<array>& norm_weight, // [d_inner]
-    const std::function<array(const array&)>& out_proj_fn,
+    const StateSpaceCallable& out_proj_fn,
     const std::optional<array>& ln2_weight,
-    const std::function<array(const array&)>& gate_up_fn,
-    const std::function<array(const array&)>& down_proj_fn,
+    const StateSpaceCallable& gate_up_fn,
+    const StateSpaceCallable& down_proj_fn,
     bool has_ffn,
     bool use_gelu,
     float residual_multiplier,
@@ -853,7 +1057,7 @@ static array state_space_forward_core(
 
     // Hoist token-independent preprocessing out of the recurrent loop.
     const array norm_all = fast::rms_norm(input, ln1_weight, norm_eps);
-    const array proj_all = in_proj_fn(norm_all);
+    const array proj_all = state_space_call(in_proj_fn, norm_all);
     const int proj_dim = proj_all.shape(2);
     if (proj_dim < min_proj_dim) {
         throw std::invalid_argument("[state_space] in_proj output too small");
@@ -872,25 +1076,28 @@ static array state_space_forward_core(
     dt_all = log(1.0f + exp(dt_all));
 
     // Vectorized depthwise conv over [state, sequence] for xbc stream.
-    const array conv_history = concatenate({conv_state, xbc_all}, 1);
-    const array conv_weight = transpose(conv_kernel_broadcast, {2, 1, 0}); // [xbc_len, d_conv, 1]
-    array conv_seq = conv1d(conv_history, conv_weight, 1, 0, 1, xbc_len);
-    conv_seq = slice(conv_seq, {0, 1, 0}, {1, seq_len + 1, xbc_len});
+    array conv_seq = causal_conv_run_sequence(
+        &conv_state,
+        xbc_all,
+        conv_kernel_broadcast,
+        seq_len,
+        d_conv,
+        xbc_len
+    );
     if (conv_bias_row) {
         conv_seq = conv_seq + reshape(*conv_bias_row, {1, 1, xbc_len});
     }
     const array xbc_conv_all = conv_seq * sigmoid(conv_seq);
-    conv_state = slice(conv_history, {0, seq_len, 0}, {1, seq_len + d_conv, xbc_len});
 
     // FP32 allowlist starts here for recurrent-state-sensitive math.
-    const array xbc_conv_f32_all = ensure_float32(xbc_conv_all);
-    const array x_conv_all = slice(xbc_conv_f32_all, {0, 0, 0}, {1, seq_len, d_inner});
+    // Keep x in model dtype; upcast only recurrent B/C streams.
+    const array x_conv_all = slice(xbc_conv_all, {0, 0, 0}, {1, seq_len, d_inner});
     const array b_groups_all = reshape(
-        slice(xbc_conv_f32_all, {0, 0, d_inner}, {1, seq_len, d_inner + bc_len}),
+        ensure_float32(slice(xbc_conv_all, {0, 0, d_inner}, {1, seq_len, d_inner + bc_len})),
         {seq_len, n_groups, d_state}
     );
     const array c_groups_all = reshape(
-        slice(xbc_conv_f32_all, {0, 0, d_inner + bc_len}, {1, seq_len, d_inner + 2 * bc_len}),
+        ensure_float32(slice(xbc_conv_all, {0, 0, d_inner + bc_len}, {1, seq_len, d_inner + 2 * bc_len})),
         {seq_len, n_groups, d_state}
     );
 
@@ -944,7 +1151,7 @@ static array state_space_forward_core(
     // FP32 allowlist ends at recurrent-state math; projections stay in model
     // dtype to use bf16/f16 tensor-core kernels.
     const array ssm_out_proj_in = (ssm_out.dtype() == model_dtype) ? ssm_out : astype(ssm_out, model_dtype);
-    const array mixer_out = out_proj_fn(ssm_out_proj_in);
+    const array mixer_out = state_space_call(out_proj_fn, ssm_out_proj_in);
     array hidden_1 = input + mixer_out * residual_multiplier;
 
     if (!has_ffn) {
@@ -956,7 +1163,7 @@ static array state_space_forward_core(
 
     const array norm2 = fast::rms_norm(hidden_1, *ln2_weight, norm_eps);
     const array norm2_proj_in = (norm2.dtype() == model_dtype) ? norm2 : astype(norm2, model_dtype);
-    const array gate_up = gate_up_fn(norm2_proj_in);
+    const array gate_up = state_space_call(gate_up_fn, norm2_proj_in);
     const int gate_up_dim = gate_up.shape(2);
     if ((gate_up_dim % 2) != 0) {
         throw std::invalid_argument("[state_space] fused gate_up must have even width");
@@ -985,7 +1192,7 @@ static array state_space_forward_core(
     }();
 
     const array mid_proj_in = (mid.dtype() == model_dtype) ? mid : astype(mid, model_dtype);
-    const array ffn_out = down_proj_fn(mid_proj_in);
+    const array ffn_out = state_space_call(down_proj_fn, mid_proj_in);
     return hidden_1 + ffn_out * residual_multiplier;
 }
 
@@ -1049,13 +1256,10 @@ void* mlx_lazy_state_space_block_bf16(
 
     const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, xbc_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
-        ? std::optional<array>(
-            (conv_b->ndim() == 2 && conv_b->shape(0) == 1 && conv_b->shape(1) == xbc_len)
-                ? *conv_b
-                : reshape(*conv_b, {1, xbc_len}))
+        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, xbc_len, input_arr.dtype(), 0))
         : std::nullopt;
     const std::optional<array> dt_bias_row = (dt_b != nullptr)
-        ? std::optional<array>(reshape(cast_tensor_cached(dt_b, *dt_b, float32), {1, n_heads_i}))
+        ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
         : std::nullopt;
     const std::optional<array> norm_weight_arr = (norm_w != nullptr)
         ? std::optional<array>(*norm_w)
@@ -1102,19 +1306,124 @@ void* mlx_lazy_state_space_block_bf16(
         ssm_state = zeros({1, n_heads_i, d_head_i, d_state_i}, float32);
     }
 
-    const auto in_proj_fn = [&in_proj_w, in_proj](const array& x) -> array {
-        return dense_linear_no_bias(x, in_proj_w, std::nullopt, in_proj);
-    };
-    const auto out_proj_fn = [&out_proj_w, out_proj](const array& x) -> array {
-        return dense_linear_no_bias(x, out_proj_w, std::nullopt, out_proj);
-    };
+    const int hidden_dim = input_arr.shape(2);
+    const int d_inner_i = n_heads_i * d_head_i;
+
+    array in_proj_rhs(0.0f, input_arr.dtype());
+    array out_proj_rhs(0.0f, input_arr.dtype());
+
     const bool has_ffn = gate_up_w != nullptr && down_proj_w != nullptr && ln2_w != nullptr;
-    const auto gate_up_fn = [&gate_up_w, gate_up](const array& x) -> array {
-        return dense_linear_no_bias(x, *gate_up_w, std::nullopt, gate_up);
+    std::optional<array> gate_up_rhs = std::nullopt;
+    std::optional<array> down_proj_rhs = std::nullopt;
+
+    if (layer_state != nullptr) {
+        const bool need_proj_rhs_refresh =
+            layer_state->in_proj_rhs == nullptr ||
+            layer_state->out_proj_rhs == nullptr ||
+            layer_state->in_proj_handle != in_proj ||
+            layer_state->out_proj_handle != out_proj ||
+            layer_state->hidden_dim != hidden_dim ||
+            layer_state->d_inner != d_inner_i;
+        if (need_proj_rhs_refresh) {
+            in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
+            out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner_i, hidden_dim, true);
+            delete layer_state->in_proj_rhs;
+            delete layer_state->out_proj_rhs;
+            layer_state->in_proj_rhs = new array(in_proj_rhs);
+            layer_state->out_proj_rhs = new array(out_proj_rhs);
+            layer_state->in_proj_handle = in_proj;
+            layer_state->out_proj_handle = out_proj;
+            layer_state->hidden_dim = hidden_dim;
+            layer_state->d_inner = d_inner_i;
+        } else {
+            in_proj_rhs = *layer_state->in_proj_rhs;
+            out_proj_rhs = *layer_state->out_proj_rhs;
+        }
+    } else {
+        in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
+        out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner_i, hidden_dim, true);
+    }
+
+    if (has_ffn) {
+        array gate_rhs(0.0f, input_arr.dtype());
+        if (layer_state != nullptr) {
+            const bool need_ffn_rhs_refresh =
+                layer_state->gate_up_rhs == nullptr ||
+                layer_state->down_proj_rhs == nullptr ||
+                layer_state->gate_up_handle != gate_up ||
+                layer_state->down_proj_handle != down_proj ||
+                layer_state->hidden_dim != hidden_dim;
+            if (!need_ffn_rhs_refresh) {
+                gate_rhs = *layer_state->gate_up_rhs;
+            } else {
+                gate_rhs = orient_matmul_rhs_cached(gate_up, *gate_up_w, hidden_dim, std::nullopt, true);
+                const int gate_width = gate_rhs.shape(1);
+                if ((gate_width % 2) != 0) {
+                    throw std::invalid_argument("[state_space] gate_up output width must be even");
+                }
+                const int d_ff = gate_width / 2;
+                const array down_rhs = orient_matmul_rhs_cached(down_proj, *down_proj_w, d_ff, hidden_dim, true);
+                delete layer_state->gate_up_rhs;
+                delete layer_state->down_proj_rhs;
+                layer_state->gate_up_rhs = new array(gate_rhs);
+                layer_state->down_proj_rhs = new array(down_rhs);
+                layer_state->gate_up_handle = gate_up;
+                layer_state->down_proj_handle = down_proj;
+                layer_state->d_ff = d_ff;
+            }
+            if (layer_state->gate_up_rhs != nullptr) {
+                gate_up_rhs = *layer_state->gate_up_rhs;
+            }
+            if (layer_state->down_proj_rhs != nullptr) {
+                down_proj_rhs = *layer_state->down_proj_rhs;
+            }
+        } else {
+            gate_rhs = orient_matmul_rhs_cached(gate_up, *gate_up_w, hidden_dim, std::nullopt, true);
+            const int gate_width = gate_rhs.shape(1);
+            if ((gate_width % 2) != 0) {
+                throw std::invalid_argument("[state_space] gate_up output width must be even");
+            }
+            const int d_ff = gate_width / 2;
+            const array down_rhs = orient_matmul_rhs_cached(down_proj, *down_proj_w, d_ff, hidden_dim, true);
+            gate_up_rhs = gate_rhs;
+            down_proj_rhs = down_rhs;
+        }
+    } else if (layer_state != nullptr) {
+        delete layer_state->gate_up_rhs;
+        delete layer_state->down_proj_rhs;
+        layer_state->gate_up_rhs = nullptr;
+        layer_state->down_proj_rhs = nullptr;
+        layer_state->gate_up_handle = nullptr;
+        layer_state->down_proj_handle = nullptr;
+        layer_state->d_ff = 0;
+    }
+
+    StateSpaceCallable in_proj_fn{
+        .fn = state_space_apply_matmul_rhs,
+        .ctx = &in_proj_rhs,
     };
-    const auto down_proj_fn = [&down_proj_w, down_proj](const array& x) -> array {
-        return dense_linear_no_bias(x, *down_proj_w, std::nullopt, down_proj);
+    StateSpaceCallable out_proj_fn{
+        .fn = state_space_apply_matmul_rhs,
+        .ctx = &out_proj_rhs,
     };
+    StateSpaceCallable gate_up_fn{};
+    StateSpaceCallable down_proj_fn{};
+    if (has_ffn) {
+        if (!gate_up_rhs.has_value()) {
+            throw std::invalid_argument("[state_space] missing gate_up rhs");
+        }
+        if (!down_proj_rhs.has_value()) {
+            throw std::invalid_argument("[state_space] missing down_proj rhs");
+        }
+        gate_up_fn = StateSpaceCallable{
+            .fn = state_space_apply_matmul_rhs,
+            .ctx = &gate_up_rhs.value(),
+        };
+        down_proj_fn = StateSpaceCallable{
+            .fn = state_space_apply_matmul_rhs,
+            .ctx = &down_proj_rhs.value(),
+        };
+    }
 
     array out = state_space_forward_core(
         input_arr,
@@ -1232,13 +1541,10 @@ void* mlx_lazy_state_space_block_quantized(
 
     const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, xbc_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
-        ? std::optional<array>(
-            (conv_b->ndim() == 2 && conv_b->shape(0) == 1 && conv_b->shape(1) == xbc_len)
-                ? *conv_b
-                : reshape(*conv_b, {1, xbc_len}))
+        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, xbc_len, input_arr.dtype(), 0))
         : std::nullopt;
     const std::optional<array> dt_bias_row = (dt_b != nullptr)
-        ? std::optional<array>(reshape(cast_tensor_cached(dt_b, *dt_b, float32), {1, n_heads_i}))
+        ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
         : std::nullopt;
     const std::optional<array> norm_weight_arr = (norm_w != nullptr)
         ? std::optional<array>(*norm_w)
@@ -1285,22 +1591,66 @@ void* mlx_lazy_state_space_block_quantized(
         ssm_state = zeros({1, n_heads_i, d_head_i, d_state_i}, float32);
     }
 
-    const auto in_proj_fn = [&in_proj_w, &in_proj_s, &in_proj_b, in_s, in_b, group_size_i, bits_i](const array& x) -> array {
-        return quantized_linear_no_bias(x, in_proj_w, in_proj_s, in_proj_b, group_size_i, bits_i, in_s, in_b);
+    StateSpaceQuantLinearCtx in_proj_ctx{
+        .w = &in_proj_w,
+        .s = &in_proj_s,
+        .b = &in_proj_b,
+        .s_handle = in_s,
+        .b_handle = in_b,
+        .group_size = group_size_i,
+        .bits = bits_i,
     };
-    const auto out_proj_fn = [&out_proj_w, &out_proj_s, &out_proj_b, out_s, out_b, group_size_i, bits_i](const array& x) -> array {
-        return quantized_linear_no_bias(x, out_proj_w, out_proj_s, out_proj_b, group_size_i, bits_i, out_s, out_b);
+    StateSpaceQuantLinearCtx out_proj_ctx{
+        .w = &out_proj_w,
+        .s = &out_proj_s,
+        .b = &out_proj_b,
+        .s_handle = out_s,
+        .b_handle = out_b,
+        .group_size = group_size_i,
+        .bits = bits_i,
+    };
+    StateSpaceCallable in_proj_fn{
+        .fn = state_space_apply_quantized_linear,
+        .ctx = &in_proj_ctx,
+    };
+    StateSpaceCallable out_proj_fn{
+        .fn = state_space_apply_quantized_linear,
+        .ctx = &out_proj_ctx,
     };
     const bool has_ffn =
         gate_up_w_arr != nullptr && gate_up_s_arr != nullptr && gate_up_b_arr != nullptr &&
         down_w_arr != nullptr && down_s_arr != nullptr && down_b_arr != nullptr &&
         ln2_w != nullptr;
-    const auto gate_up_fn = [&gate_up_w_arr, &gate_up_s_arr, &gate_up_b_arr, gate_up_s, gate_up_b, group_size_i, bits_i](const array& x) -> array {
-        return quantized_linear_no_bias(x, *gate_up_w_arr, *gate_up_s_arr, *gate_up_b_arr, group_size_i, bits_i, gate_up_s, gate_up_b);
+    StateSpaceCallable gate_up_fn{};
+    StateSpaceCallable down_proj_fn{};
+    StateSpaceQuantLinearCtx gate_up_ctx{
+        .w = gate_up_w_arr,
+        .s = gate_up_s_arr,
+        .b = gate_up_b_arr,
+        .s_handle = gate_up_s,
+        .b_handle = gate_up_b,
+        .group_size = group_size_i,
+        .bits = bits_i,
     };
-    const auto down_proj_fn = [&down_w_arr, &down_s_arr, &down_b_arr, down_s, down_b, group_size_i, bits_i](const array& x) -> array {
-        return quantized_linear_no_bias(x, *down_w_arr, *down_s_arr, *down_b_arr, group_size_i, bits_i, down_s, down_b);
+    StateSpaceQuantLinearCtx down_proj_ctx{
+        .w = down_w_arr,
+        .s = down_s_arr,
+        .b = down_b_arr,
+        .s_handle = down_s,
+        .b_handle = down_b,
+        .group_size = group_size_i,
+        .bits = bits_i,
     };
+    if (has_ffn) {
+        gate_up_fn = StateSpaceCallable{
+            .fn = state_space_apply_quantized_linear,
+            .ctx = &gate_up_ctx,
+        };
+        down_proj_fn = StateSpaceCallable{
+            .fn = state_space_apply_quantized_linear,
+            .ctx = &down_proj_ctx,
+        };
+    }
 
     array out = state_space_forward_core(
         input_arr,

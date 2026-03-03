@@ -6,6 +6,7 @@ const std = @import("std");
 const common_types = @import("common/types.zig");
 const layer_ops = @import("layer_ops.zig");
 const op_types = @import("op_types.zig");
+const runtime_contract = @import("../inference/runtime_contract/root.zig");
 const runtime_architectures = @import("runtime_architectures.zig");
 const minilm = @import("bert/minilm.zig");
 const gemma3 = @import("gemma/gemma3.zig");
@@ -208,6 +209,26 @@ pub fn runtimeArchitectureById(arch_id: []const u8) ?*const op_types.Architectur
 
 pub fn runtimeArchitectureByModelType(model_type: []const u8) ?*const op_types.Architecture {
     return runtime_architectures.detectByModelType(model_type);
+}
+
+fn runtimeLifecycleFromSpec(lifecycle: op_types.StateLifecycle) runtime_contract.StateLifecycle {
+    return switch (lifecycle) {
+        .slot_persistent => .slot_persistent,
+        .request_scoped => .request_scoped,
+        .step_scoped => .step_scoped,
+    };
+}
+
+pub fn stateDescriptorForId(entry: Entry, state_id: u8) runtime_contract.StateDescriptor {
+    const arch = runtimeArchitectureById(entry.id) orelse return runtime_contract.descriptorForStateId(state_id);
+    const spec = arch.stateDescriptorForId(state_id);
+    return .{
+        .id = spec.id,
+        .size_bytes = spec.size_bytes,
+        .align_bytes = spec.align_bytes,
+        .zero_init = spec.zero_init,
+        .lifecycle = runtimeLifecycleFromSpec(spec.lifecycle),
+    };
 }
 
 pub fn configParseHookFor(entry: Entry) ?op_types.ConfigParseHook {
