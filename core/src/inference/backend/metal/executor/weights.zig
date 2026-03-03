@@ -179,93 +179,19 @@ fn buildMetalLayerProgramRegisterSlotMap(
     return register_to_slot;
 }
 
-fn layerProgramWeightBindingKeyFor(
-    opcode: runtime_contract.Opcode,
-    slot_name: []const u8,
-) !WeightHandles.LayerProgramWeightBindingKey {
-    return switch (opcode) {
-        .rmsnorm => if (std.mem.eql(u8, slot_name, "norm_weight")) .norm_weight else error.InvalidWeightBindingName,
-        .multihead_attention => if (std.mem.eql(u8, slot_name, "q_proj"))
-            .attention_q_proj
-        else if (std.mem.eql(u8, slot_name, "k_proj"))
-            .attention_k_proj
-        else if (std.mem.eql(u8, slot_name, "v_proj"))
-            .attention_v_proj
-        else if (std.mem.eql(u8, slot_name, "o_proj"))
-            .attention_o_proj
-        else
-            error.InvalidWeightBindingName,
-        .mla_attention => if (std.mem.eql(u8, slot_name, "mla_weights")) .mla_weights else error.InvalidWeightBindingName,
-        .swiglu => if (std.mem.eql(u8, slot_name, "w1"))
-            .swiglu_w1
-        else if (std.mem.eql(u8, slot_name, "w3"))
-            .swiglu_w3
-        else if (std.mem.eql(u8, slot_name, "w2"))
-            .swiglu_w2
-        else
-            error.InvalidWeightBindingName,
-        .moe => if (std.mem.eql(u8, slot_name, "router")) .moe_router else error.InvalidWeightBindingName,
-        .mamba_mixer => if (std.mem.eql(u8, slot_name, "in_proj"))
-            .mamba_in_proj
-        else if (std.mem.eql(u8, slot_name, "out_proj"))
-            .mamba_out_proj
-        else
-            error.InvalidWeightBindingName,
-        .shortconv => if (std.mem.eql(u8, slot_name, "in_proj"))
-            .shortconv_in_proj
-        else if (std.mem.eql(u8, slot_name, "conv_weight"))
-            .shortconv_conv_weight
-        else if (std.mem.eql(u8, slot_name, "out_proj"))
-            .shortconv_out_proj
-        else
-            error.InvalidWeightBindingName,
-        else => error.InvalidInstructionPayload,
-    };
-}
-
-fn buildLayerProgramWeightBindingKeys(
-    allocator: std.mem.Allocator,
+fn instructionKernelIdFromWeightBindings(
     compiled: *const runtime_contract.CompiledPlan,
-) ![]WeightHandles.LayerProgramWeightBindingKey {
-    if (compiled.weight_bindings.len == 0) return &.{};
-    const keys = try allocator.alloc(WeightHandles.LayerProgramWeightBindingKey, compiled.weight_bindings.len);
-    @memset(keys, .invalid);
-    errdefer allocator.free(keys);
-
-    for (compiled.plan.instructions, 0..) |insn, op_index| {
-        const expected_slots = runtime_contract.expectedKernelWeightSlots(insn.opcode);
-        if (expected_slots.len == 0) continue;
-        if (insn.weights.len != expected_slots.len) return error.InvalidWeightRefCount;
-        var kernel_id: ?u32 = null;
-        for (insn.weights, 0..) |weight_ref, slot_idx| {
-            const binding_name = try runtime_contract.instructionWeightBindingName(compiled, op_index, slot_idx);
-            const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
-            if (!std.mem.eql(u8, parsed.slot_name, expected_slots[slot_idx])) return error.InvalidWeightBindingName;
-            if (kernel_id == null) {
-                kernel_id = parsed.kernel_id;
-            } else if (kernel_id.? != parsed.kernel_id) {
-                return error.InvalidWeightBindingName;
-            }
-            if (weight_ref.index >= keys.len) return error.InvalidWeightRefIndex;
-            const key = try layerProgramWeightBindingKeyFor(insn.opcode, parsed.slot_name);
-            if (keys[weight_ref.index] == .invalid) {
-                keys[weight_ref.index] = key;
-            } else if (keys[weight_ref.index] != key) {
-                return error.InvalidWeightBindingName;
-            }
-        }
-    }
-    return keys;
+    op_index: usize,
+    opcode: runtime_contract.Opcode,
+) !u32 {
+    return runtime_contract.instructionKernelBindingId(compiled, op_index, opcode);
 }
 
-fn tensorViewDescForMetalArray() runtime_contract.TensorViewDesc {
-    return .{
-        .dtype = .f32,
-        .rank = 0,
-        .shape = .{ 0, 0, 0, 0 },
-        .stride_elems = .{ 0, 0, 0, 0 },
-        .layout = .backend_native,
-    };
+fn validateKernelWeightBindings(compiled: *const runtime_contract.CompiledPlan) !void {
+    for (compiled.plan.instructions, 0..) |insn, op_index| {
+        if (runtime_contract.expectedKernelWeightSlots(insn.opcode).len == 0) continue;
+        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
+    }
 }
 
 fn compileLayerProgramContract(
@@ -276,10 +202,16 @@ fn compileLayerProgramContract(
 ) !void {
     layer.compiled_plan = null;
     layer.register_to_slot_map = &.{};
-    layer.weight_binding_keys = &.{};
     layer.slot_scratch = &.{};
     layer.instruction_handle_scratch = &.{};
     layer.instruction_view_scratch = &.{};
+    layer.instruction_weight_offsets = &.{};
+    layer.instruction_weight_ptrs = &.{};
+    layer.instruction_attention_templates = &.{};
+    layer.instruction_shortconv_templates = &.{};
+    layer.instruction_mamba_templates = &.{};
+    layer.instruction_swiglu_templates = &.{};
+    layer.instruction_moe_templates = &.{};
     const entry = static_entry orelse return error.NotImplemented;
     const program = models_registry.blockProgramFor(entry, block_kind) orelse return error.NotImplemented;
 
@@ -288,11 +220,7 @@ fn compileLayerProgramContract(
         plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
         layer.compiled_plan = null;
     };
-    layer.weight_binding_keys = try buildLayerProgramWeightBindingKeys(allocator, &layer.compiled_plan.?);
-    errdefer if (layer.weight_binding_keys.len > 0) {
-        allocator.free(layer.weight_binding_keys);
-        layer.weight_binding_keys = &.{};
-    };
+    try validateKernelWeightBindings(&layer.compiled_plan.?);
     const register_map = try buildMetalLayerProgramRegisterSlotMap(
         allocator,
         &layer.compiled_plan.?,
@@ -329,9 +257,6 @@ fn compileLayerProgramContract(
             allocator.free(handle_scratch);
             return err;
         };
-        for (view_scratch) |*view| {
-            view.* = tensorViewDescForMetalArray();
-        }
         layer.instruction_handle_scratch = handle_scratch;
         layer.instruction_view_scratch = view_scratch;
         errdefer {
@@ -341,6 +266,353 @@ fn compileLayerProgramContract(
             layer.instruction_view_scratch = &.{};
         }
     }
+}
+
+fn resolveLayerInstructionWeightPtrForSlot(
+    layer: *const WeightHandles.LayerWeights,
+    opcode: runtime_contract.Opcode,
+    slot_idx: usize,
+    norm_index: *usize,
+) !*anyopaque {
+    switch (opcode) {
+        .rmsnorm => {
+            const norm_weight = switch (norm_index.*) {
+                0 => layer.getLn1(),
+                1 => layer.getLn2(),
+                2 => layer.getPreFfnNorm() orelse layer.getPostFfnNorm() orelse return error.MissingField,
+                3 => layer.getPostFfnNorm() orelse return error.MissingField,
+                else => return error.InvalidInstructionBinding,
+            };
+            if (slot_idx != 0) return error.InvalidWeightRefCount;
+            norm_index.* += 1;
+            return @ptrCast(@constCast(&norm_weight));
+        },
+        .multihead_attention => {
+            if (layer.isMLA()) {
+                if (slot_idx != 0) return error.InvalidWeightRefCount;
+                if (layer.o_proj) |*weight| return @ptrCast(weight);
+                if (layer.o_proj_bf16) |*weight| return @ptrCast(weight);
+                return error.MissingWeight;
+            }
+            return switch (slot_idx) {
+                0 => if (layer.q_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.q_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                1 => if (layer.k_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.k_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                2 => if (layer.v_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.v_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                3 => if (layer.o_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.o_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                else => error.InvalidWeightRefCount,
+            };
+        },
+        .shortconv => {
+            return switch (slot_idx) {
+                0 => if (layer.shortconv_in_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.shortconv_in_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                1 => if (layer.shortconv_conv_weight) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                2 => if (layer.shortconv_out_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.shortconv_out_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                else => error.InvalidWeightRefCount,
+            };
+        },
+        .swiglu => {
+            return switch (slot_idx) {
+                0 => if (layer.w1) |*weight|
+                    @ptrCast(weight)
+                else if (layer.w1_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                1 => if (layer.w3) |*weight|
+                    @ptrCast(weight)
+                else if (layer.w3_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                2 => if (layer.w2) |*weight|
+                    @ptrCast(weight)
+                else if (layer.w2_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                else => error.InvalidWeightRefCount,
+            };
+        },
+        .moe => {
+            const moe_ptr = layer.moe_runtime_template orelse return error.MissingWeight;
+            return switch (slot_idx) {
+                0 => @ptrCast(@constCast(&moe_ptr.router_w)),
+                1 => @ptrCast(@constCast(&moe_ptr.up_w)),
+                2 => @ptrCast(@constCast(&moe_ptr.down_w)),
+                else => error.InvalidWeightRefCount,
+            };
+        },
+        .mamba_mixer => {
+            return switch (slot_idx) {
+                0 => if (layer.mamba_in_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.mamba_in_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                1 => if (layer.mamba_conv_weight) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                2 => if (layer.mamba_a_log) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                3 => if (layer.mamba_d_skip) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                4 => if (layer.mamba_out_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.mamba_out_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                else => error.InvalidWeightRefCount,
+            };
+        },
+        .mla_attention => {
+            return switch (slot_idx) {
+                0 => if (layer.mla_q_a_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.mla_q_a_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                1 => if (layer.mla_q_a_norm) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                2 => if (layer.mla_q_b_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.mla_q_b_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                3 => if (layer.mla_kv_a_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.mla_kv_a_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                4 => if (layer.mla_kv_a_norm) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                5 => if (layer.mla_kv_b_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.mla_kv_b_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                6 => if (layer.o_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.o_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    error.MissingWeight,
+                else => error.InvalidWeightRefCount,
+            };
+        },
+        else => return error.InvalidInstructionBinding,
+    }
+}
+
+fn resolveLayerInstructionWeightPtr(
+    layer: *const WeightHandles.LayerWeights,
+    opcode: runtime_contract.Opcode,
+    slot_name: []const u8,
+    slot_idx: usize,
+    norm_index: *usize,
+) !*anyopaque {
+    const expected_slots = runtime_contract.expectedKernelWeightSlots(opcode);
+    if (slot_idx >= expected_slots.len) return error.InvalidWeightRefCount;
+    if (!std.mem.eql(u8, expected_slots[slot_idx], slot_name)) return error.InvalidWeightBindingName;
+    return resolveLayerInstructionWeightPtrForSlot(layer, opcode, slot_idx, norm_index);
+}
+
+fn buildLayerInstructionWeightTable(
+    allocator: std.mem.Allocator,
+    layer: *WeightHandles.LayerWeights,
+) !void {
+    const compiled = layer.compiled_plan orelse return;
+    const insn_len = compiled.plan.instructions.len;
+    if (insn_len == 0) return;
+
+    var total_slots: usize = 0;
+    for (compiled.plan.instructions) |insn| total_slots += insn.weights.len;
+
+    const offsets = try allocator.alloc(u32, insn_len + 1);
+    errdefer allocator.free(offsets);
+    const ptrs = try allocator.alloc(?*anyopaque, total_slots);
+    errdefer allocator.free(ptrs);
+    @memset(ptrs, null);
+
+    var cursor: usize = 0;
+    var norm_index: usize = 0;
+    for (compiled.plan.instructions, 0..) |insn, op_index| {
+        offsets[op_index] = @intCast(cursor);
+        const expected_slots = runtime_contract.expectedKernelWeightSlots(insn.opcode);
+        if (insn.weights.len != expected_slots.len) return error.InvalidWeightRefCount;
+        for (insn.weights, 0..) |_, slot_idx| {
+            const parsed = try runtime_contract.instructionKernelWeightBinding(&compiled, op_index, insn.opcode, slot_idx);
+            const ptr = try resolveLayerInstructionWeightPtr(layer, insn.opcode, parsed.slot_name, slot_idx, &norm_index);
+            ptrs[cursor] = ptr;
+            cursor += 1;
+        }
+    }
+    offsets[insn_len] = @intCast(cursor);
+
+    layer.instruction_weight_offsets = offsets;
+    layer.instruction_weight_ptrs = ptrs;
+}
+
+fn buildLayerInstructionRuntimeTemplates(
+    allocator: std.mem.Allocator,
+    layer: *WeightHandles.LayerWeights,
+) !void {
+    const compiled = layer.compiled_plan orelse return;
+    const insn_len = compiled.plan.instructions.len;
+    if (insn_len == 0) return;
+
+    const attention_templates = try allocator.alloc(?WeightHandles.LayerWeights.AttentionRuntimeTemplate, insn_len);
+    errdefer allocator.free(attention_templates);
+    const shortconv_templates = try allocator.alloc(?WeightHandles.LayerWeights.ShortConvRuntimeTemplate, insn_len);
+    errdefer allocator.free(shortconv_templates);
+    const mamba_templates = try allocator.alloc(?WeightHandles.LayerWeights.MambaRuntimeTemplate, insn_len);
+    errdefer allocator.free(mamba_templates);
+    const swiglu_templates = try allocator.alloc(?WeightHandles.LayerWeights.SwiGluRuntimeTemplate, insn_len);
+    errdefer allocator.free(swiglu_templates);
+    const moe_templates = try allocator.alloc(?WeightHandles.LayerWeights.MoeRuntimeTemplate, insn_len);
+    errdefer allocator.free(moe_templates);
+    @memset(attention_templates, null);
+    @memset(shortconv_templates, null);
+    @memset(mamba_templates, null);
+    @memset(swiglu_templates, null);
+    @memset(moe_templates, null);
+
+    for (compiled.plan.instructions, 0..) |insn, op_index| {
+        switch (insn.opcode) {
+            .multihead_attention => {
+                if (layer.isMLA()) {
+                    const storage_kind = layer.mlaStorageKind();
+                    if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
+                    const mla_cfg = layer.mla_config orelse return error.MissingField;
+                    attention_templates[op_index] = .{ .mla = .{
+                        .storage_kind = storage_kind,
+                        .config = mla_cfg,
+                        .q_a_proj = layer.mla_q_a_proj,
+                        .q_b_proj = layer.mla_q_b_proj,
+                        .kv_a_proj = layer.mla_kv_a_proj,
+                        .kv_b_proj = layer.mla_kv_b_proj,
+                        .q_a_proj_bf16 = layer.mla_q_a_proj_bf16,
+                        .q_b_proj_bf16 = layer.mla_q_b_proj_bf16,
+                        .kv_a_proj_bf16 = layer.mla_kv_a_proj_bf16,
+                        .kv_b_proj_bf16 = layer.mla_kv_b_proj_bf16,
+                        .q_a_norm = layer.mla_q_a_norm,
+                        .kv_a_norm = layer.mla_kv_a_norm,
+                    } };
+                } else {
+                    const storage_kind = layer.attentionStorageKind();
+                    if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
+                    attention_templates[op_index] = .{ .mha = .{
+                        .storage_kind = storage_kind,
+                        .q_norm = layer.q_norm,
+                        .k_norm = layer.k_norm,
+                        .q_bias = layer.q_bias,
+                        .k_bias = layer.k_bias,
+                        .v_bias = layer.v_bias,
+                        .o_bias = layer.o_bias,
+                        .attn_sinks = layer.attn_sinks,
+                    } };
+                }
+            },
+            .shortconv => {
+                const storage_kind = layer.shortconvStorageKind();
+                if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
+                shortconv_templates[op_index] = .{
+                    .storage_kind = storage_kind,
+                    .conv_bias = layer.shortconv_conv_bias,
+                    .d_conv = layer.shortconv_d_conv,
+                    .conv_dim = layer.shortconv_conv_dim,
+                };
+            },
+            .mamba_mixer => {
+                const storage_kind = layer.mambaStorageKind();
+                if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
+                mamba_templates[op_index] = .{
+                    .storage_kind = storage_kind,
+                    .d_state = layer.mamba_d_state,
+                    .d_conv = layer.mamba_d_conv,
+                    .n_heads = layer.mamba_n_heads,
+                    .d_head = layer.mamba_d_head,
+                    .n_groups = layer.mamba_n_groups,
+                    .gate_up_layout = @intFromEnum(layer.mamba_gate_up_layout),
+                    .ln1_weight = layer.getLn1(),
+                    .conv_weight = layer.mamba_conv_weight orelse return error.MissingField,
+                    .conv_bias = layer.mamba_conv_bias,
+                    .a_log = layer.mamba_a_log orelse return error.MissingField,
+                    .d_skip = layer.mamba_d_skip orelse return error.MissingField,
+                    .dt_bias = layer.mamba_dt_bias,
+                    .norm_weight = layer.mamba_norm_weight,
+                    .ln2_weight = layer.getLn2(),
+                    .gate_up = layer.mamba_gate_up,
+                    .gate_up_bf16 = layer.mamba_gate_up_bf16,
+                    .down_proj = layer.mamba_down_proj,
+                    .down_proj_bf16 = layer.mamba_down_proj_bf16,
+                };
+            },
+            .swiglu => {
+                const storage_kind = layer.ffnStorageKind();
+                if (storage_kind != .quantized and storage_kind != .dense) return error.InvalidInstructionBinding;
+                swiglu_templates[op_index] = .{ .storage_kind = storage_kind };
+            },
+            .moe => {
+                const moe_ptr = layer.moe_runtime_template orelse return error.MissingField;
+                moe_templates[op_index] = .{ .template_ptr = moe_ptr };
+            },
+            else => {},
+        }
+    }
+
+    layer.instruction_attention_templates = attention_templates;
+    layer.instruction_shortconv_templates = shortconv_templates;
+    layer.instruction_mamba_templates = mamba_templates;
+    layer.instruction_swiglu_templates = swiglu_templates;
+    layer.instruction_moe_templates = moe_templates;
 }
 
 /// Load model weights as MLX array handles on GPU.
@@ -451,7 +723,6 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
     for (weight_handles.layers) |*layer| {
         layer.* = std.mem.zeroes(WeightHandles.LayerWeights);
         layer.register_to_slot_map = &.{};
-        layer.weight_binding_keys = &.{};
     }
 
     for (loaded.blocks, 0..) |*layer, layer_idx| {
@@ -656,8 +927,8 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.layers[layer_idx].post_ffn_norm = null;
                 }
 
-                // Initialize MoE weights to null (will be loaded separately for MoE models)
-                weight_handles.layers[layer_idx].moe = null;
+                // Initialize MoE runtime template to null (loaded separately for MoE models).
+                weight_handles.layers[layer_idx].moe_runtime_template = null;
             },
             .mamba => |mamba_block| {
                 weight_handles.layers[layer_idx].kind = .mamba;
@@ -796,7 +1067,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     }
                 }
 
-                weight_handles.layers[layer_idx].moe = null;
+                weight_handles.layers[layer_idx].moe_runtime_template = null;
             },
         }
     }
@@ -999,8 +1270,14 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 moe_weights.down_bias = mlx_graph.createArrayF32(bias_f32_ptr[0 .. down_bias.len * num_experts], &bias_shape_i64);
             }
 
-            weight_handles.layers[layer_idx].moe = moe_weights;
+            weight_handles.layers[layer_idx].moe_runtime_template = moe_weights;
         }
+    }
+
+    for (weight_handles.layers) |*layer| {
+        if (layer.compiled_plan == null) continue;
+        try buildLayerInstructionRuntimeTemplates(allocator, layer);
+        try buildLayerInstructionWeightTable(allocator, layer);
     }
 
     // Load final layer norm - in native dtype (bf16, f16, or f32)
@@ -1095,10 +1372,16 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
             layer.compiled_plan = null;
         }
         if (layer.register_to_slot_map.len > 0) allocator.free(layer.register_to_slot_map);
-        if (layer.weight_binding_keys.len > 0) allocator.free(layer.weight_binding_keys);
         if (layer.slot_scratch.len > 0) allocator.free(layer.slot_scratch);
         if (layer.instruction_handle_scratch.len > 0) allocator.free(layer.instruction_handle_scratch);
         if (layer.instruction_view_scratch.len > 0) allocator.free(layer.instruction_view_scratch);
+        if (layer.instruction_weight_offsets.len > 0) allocator.free(layer.instruction_weight_offsets);
+        if (layer.instruction_weight_ptrs.len > 0) allocator.free(layer.instruction_weight_ptrs);
+        if (layer.instruction_attention_templates.len > 0) allocator.free(layer.instruction_attention_templates);
+        if (layer.instruction_shortconv_templates.len > 0) allocator.free(layer.instruction_shortconv_templates);
+        if (layer.instruction_mamba_templates.len > 0) allocator.free(layer.instruction_mamba_templates);
+        if (layer.instruction_swiglu_templates.len > 0) allocator.free(layer.instruction_swiglu_templates);
+        if (layer.instruction_moe_templates.len > 0) allocator.free(layer.instruction_moe_templates);
         if (layer.ln1_weight) |h| mlx_graph.freeArray(h);
         if (layer.ln2_weight) |h| mlx_graph.freeArray(h);
 
@@ -1210,18 +1493,17 @@ fn loadQuantizedWeight(tensor: *const Tensor, bits: usize) !WeightHandles.Quanti
     const scales_ptr = @as([*]align(1) const u16, @ptrCast(gaffine_meta.scales.ptr));
     const scales_shape = [_]usize{ row_count, group_count };
 
-    // Keep quantized affine params on compute-native f16 at load time.
-    // This removes first-use BF16->F16 cast work from prefill/decode hot paths.
+    // Use correct dtype (F16 or BF16) based on model
     const scales = if (gaffine_meta.scales_dtype == .f16)
         mlx_graph.mlx_array_from_float16(scales_ptr, &scales_shape, 2)
     else
-        mlx_graph.mlx_array_from_bfloat16_dense_weight(scales_ptr, &scales_shape, 2);
+        mlx_graph.mlx_array_from_bfloat16(scales_ptr, &scales_shape, 2);
 
     const biases_ptr = @as([*]align(1) const u16, @ptrCast(gaffine_meta.biases.ptr));
     const biases = if (gaffine_meta.scales_dtype == .f16)
         mlx_graph.mlx_array_from_float16(biases_ptr, &scales_shape, 2)
     else
-        mlx_graph.mlx_array_from_bfloat16_dense_weight(biases_ptr, &scales_shape, 2);
+        mlx_graph.mlx_array_from_bfloat16(biases_ptr, &scales_shape, 2);
 
     return .{
         .weights = packed_weights,
@@ -1318,25 +1600,6 @@ pub const WeightHandles = struct {
         rope_interleave: bool,
     };
 
-    pub const LayerProgramWeightBindingKey = enum(u8) {
-        invalid = 0,
-        norm_weight,
-        attention_q_proj,
-        attention_k_proj,
-        attention_v_proj,
-        attention_o_proj,
-        swiglu_w1,
-        swiglu_w3,
-        swiglu_w2,
-        moe_router,
-        mamba_in_proj,
-        mamba_out_proj,
-        shortconv_in_proj,
-        shortconv_conv_weight,
-        shortconv_out_proj,
-        mla_weights,
-    };
-
     pub const LayerWeights = struct {
         pub const invalid_slot: u8 = std.math.maxInt(u8);
 
@@ -1374,17 +1637,97 @@ pub const WeightHandles = struct {
             invalid,
         };
 
+        pub const MhaAttentionRuntimeTemplate = struct {
+            storage_kind: AttentionStorageKind,
+            q_norm: ?ArrayHandle,
+            k_norm: ?ArrayHandle,
+            q_bias: ?ArrayHandle,
+            k_bias: ?ArrayHandle,
+            v_bias: ?ArrayHandle,
+            o_bias: ?ArrayHandle,
+            attn_sinks: ?ArrayHandle,
+        };
+
+        pub const MlaAttentionRuntimeTemplate = struct {
+            storage_kind: MLAStorageKind,
+            config: MLAConfig,
+            q_a_proj: ?QuantizedWeight,
+            q_b_proj: ?QuantizedWeight,
+            kv_a_proj: ?QuantizedWeight,
+            kv_b_proj: ?QuantizedWeight,
+            q_a_proj_bf16: ?ArrayHandle,
+            q_b_proj_bf16: ?ArrayHandle,
+            kv_a_proj_bf16: ?ArrayHandle,
+            kv_b_proj_bf16: ?ArrayHandle,
+            q_a_norm: ?ArrayHandle,
+            kv_a_norm: ?ArrayHandle,
+        };
+
+        pub const AttentionRuntimeTemplate = union(enum) {
+            mha: MhaAttentionRuntimeTemplate,
+            mla: MlaAttentionRuntimeTemplate,
+        };
+
+        pub const ShortConvRuntimeTemplate = struct {
+            storage_kind: ShortConvStorageKind,
+            conv_bias: ?ArrayHandle,
+            d_conv: usize,
+            conv_dim: usize,
+        };
+
+        pub const MambaRuntimeTemplate = struct {
+            storage_kind: MambaStorageKind,
+            d_state: usize,
+            d_conv: usize,
+            n_heads: usize,
+            d_head: usize,
+            n_groups: usize,
+            gate_up_layout: u8,
+            ln1_weight: ArrayHandle,
+            conv_weight: ArrayHandle,
+            conv_bias: ?ArrayHandle,
+            a_log: ArrayHandle,
+            d_skip: ArrayHandle,
+            dt_bias: ?ArrayHandle,
+            norm_weight: ?ArrayHandle,
+            ln2_weight: ?ArrayHandle,
+            gate_up: ?QuantizedWeight,
+            gate_up_bf16: ?ArrayHandle,
+            down_proj: ?QuantizedWeight,
+            down_proj_bf16: ?ArrayHandle,
+        };
+
+        pub const SwiGluRuntimeTemplate = struct {
+            storage_kind: FfnStorageKind,
+        };
+
+        pub const MoeRuntimeTemplate = struct {
+            template_ptr: *MoEWeights,
+        };
+
         kind: LayerKind = .attention_mlp,
         compiled_plan: ?runtime_contract.CompiledPlan = null,
         register_to_slot_map: []const u8 = &.{},
-        /// Precomputed compiled-plan weight binding keys (indexed by WeightRef.index).
-        weight_binding_keys: []const LayerProgramWeightBindingKey = &.{},
         /// Pre-allocated scratch for slot buffer handles during execution.
         slot_scratch: []mlx_graph.ArrayHandle = &.{},
         /// Pre-allocated per-instruction tensor handle scratch.
         instruction_handle_scratch: []runtime_contract.TensorHandle = &.{},
         /// Pre-allocated per-instruction tensor view scratch.
         instruction_view_scratch: []runtime_contract.TensorViewDesc = &.{},
+        /// Per-instruction prefix offsets into `instruction_weight_ptrs`.
+        instruction_weight_offsets: []const u32 = &.{},
+        /// Flattened instruction-local weight pointers resolved at load time.
+        instruction_weight_ptrs: []const ?*anyopaque = &.{},
+        /// Per-instruction static runtime templates for attention opcodes.
+        instruction_attention_templates: []const ?AttentionRuntimeTemplate = &.{},
+        /// Per-instruction static runtime templates for shortconv opcodes.
+        instruction_shortconv_templates: []const ?ShortConvRuntimeTemplate = &.{},
+        /// Per-instruction static runtime templates for mamba opcodes.
+        instruction_mamba_templates: []const ?MambaRuntimeTemplate = &.{},
+        /// Per-instruction static runtime templates for swiglu opcodes.
+        instruction_swiglu_templates: []const ?SwiGluRuntimeTemplate = &.{},
+        /// Per-instruction static runtime templates for moe opcodes.
+        instruction_moe_templates: []const ?MoeRuntimeTemplate = &.{},
         ln1_weight: ArrayHandle,
         ln2_weight: ArrayHandle,
 
@@ -1444,8 +1787,9 @@ pub const WeightHandles = struct {
         post_ffn_norm: ?ArrayHandle = null,
         // Track if this layer is quantized
         is_quantized: bool = true,
-        // MoE weights (for MoE models, replaces w1/w2/w3)
-        moe: ?*MoEWeights = null,
+        // Load-time template pointer used by runtime adapter to avoid
+        // per-dispatch reach-back into raw layer MoE pointer storage.
+        moe_runtime_template: ?*MoEWeights = null,
         // Mamba weights/config (used when kind == .mamba)
         mamba_d_state: usize = 0,
         mamba_d_conv: usize = 0,
@@ -1651,7 +1995,7 @@ pub const WeightHandles = struct {
             const dense_ffn_complete = self.w1 == null and self.w2 == null and self.w3 == null and
                 self.w1_bf16 != null and self.w2_bf16 != null and self.w3_bf16 != null;
 
-            if (self.moe != null) {
+            if (self.moe_runtime_template != null) {
                 if (quantized_ffn_complete or dense_ffn_complete) return .invalid;
                 return .moe;
             }
@@ -1777,7 +2121,7 @@ test "LayerWeights storage helpers classify moe ffn path" {
     const layer = WeightHandles.LayerWeights{
         .ln1_weight = testHandle(10),
         .ln2_weight = testHandle(11),
-        .moe = &moe,
+        .moe_runtime_template = &moe,
     };
     try testing.expectEqual(WeightHandles.LayerWeights.FfnStorageKind.moe, layer.ffnStorageKind());
 }
@@ -2213,58 +2557,4 @@ test "buildMetalLayerProgramRegisterSlotMap reuses temp slots from liveness" {
     try testing.expect(map[3] < 2);
     try testing.expectEqual(map[1], map[3]);
     try testing.expect(map[2] != map[1]);
-}
-
-test "buildLayerProgramWeightBindingKeys resolves multihead slots to keys" {
-    const inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
-    const outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
-    const weight_refs = [_]runtime_contract.WeightRef{
-        .{ .index = 0 },
-        .{ .index = 1 },
-        .{ .index = 2 },
-        .{ .index = 3 },
-    };
-    const instructions = [_]runtime_contract.Instruction{
-        .{
-            .opcode = .multihead_attention,
-            .inputs = inputs[0..],
-            .outputs = outputs[0..],
-            .weights = weight_refs[0..],
-            .param_block_id = null,
-            .state_block_id = null,
-        },
-    };
-    const kill0 = [_]u64{0b0011};
-    const compiled = runtime_contract.CompiledPlan{
-        .plan = .{
-            .instructions = instructions[0..],
-            .register_count = 2,
-            .state_descs = &.{},
-        },
-        .param_blocks = &.{},
-        .weight_bindings = &.{
-            .{ .index = 0, .name = "__kernel_weight::1::q_proj::0" },
-            .{ .index = 1, .name = "__kernel_weight::1::k_proj::0" },
-            .{ .index = 2, .name = "__kernel_weight::1::v_proj::0" },
-            .{ .index = 3, .name = "__kernel_weight::1::o_proj::0" },
-        },
-        .register_buffer_specs = &.{
-            .{ .size = 1, .@"align" = 4 },
-            .{ .size = 1, .@"align" = 4 },
-        },
-        .liveness = .{
-            .register_last_read = &.{ 0, 0 },
-            .kill_after_instruction = &.{kill0[0..]},
-        },
-        .peak_registers = 1,
-        .diagnostics = &.{},
-    };
-
-    const keys = try buildLayerProgramWeightBindingKeys(testing.allocator, &compiled);
-    defer if (keys.len > 0) testing.allocator.free(keys);
-    try testing.expectEqual(@as(usize, 4), keys.len);
-    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_q_proj, keys[0]);
-    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_k_proj, keys[1]);
-    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_v_proj, keys[2]);
-    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_o_proj, keys[3]);
 }

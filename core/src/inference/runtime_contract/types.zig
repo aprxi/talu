@@ -478,10 +478,10 @@ pub fn expectedKernelWeightSlots(opcode: Opcode) []const []const u8 {
         .rmsnorm => &.{"norm_weight"},
         .multihead_attention => &.{ "q_proj", "k_proj", "v_proj", "o_proj" },
         .swiglu => &.{ "w1", "w3", "w2" },
-        .moe => &.{"router"},
-        .mamba_mixer => &.{ "in_proj", "out_proj" },
+        .moe => &.{ "router", "up_proj", "down_proj" },
+        .mamba_mixer => &.{ "in_proj", "conv_weight", "a_log", "d_skip", "out_proj" },
         .shortconv => &.{ "in_proj", "conv_weight", "out_proj" },
-        .mla_attention => &.{"mla_weights"},
+        .mla_attention => &.{ "q_a_proj", "q_a_norm", "q_b_proj", "kv_a_proj", "kv_a_norm", "kv_b_proj", "o_proj" },
         .embedding => &.{"embedding"},
         else => &.{},
     };
@@ -2380,8 +2380,10 @@ test "parseKernelWeightBindingName rejects malformed names" {
 
 test "expectedWeightRefCount returns macro-op arities" {
     try std.testing.expectEqual(@as(usize, 4), expectedWeightRefCount(.multihead_attention));
+    try std.testing.expectEqual(@as(usize, 7), expectedWeightRefCount(.mla_attention));
     try std.testing.expectEqual(@as(usize, 3), expectedWeightRefCount(.swiglu));
-    try std.testing.expectEqual(@as(usize, 2), expectedWeightRefCount(.mamba_mixer));
+    try std.testing.expectEqual(@as(usize, 3), expectedWeightRefCount(.moe));
+    try std.testing.expectEqual(@as(usize, 5), expectedWeightRefCount(.mamba_mixer));
     try std.testing.expectEqual(@as(usize, 3), expectedWeightRefCount(.shortconv));
 }
 
