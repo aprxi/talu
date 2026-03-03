@@ -587,10 +587,21 @@ const LayerAttentionExecConfig = struct {
     kv_dim: usize,
     sliding_window: usize,
     is_causal: bool,
+    q_proj: ?*const LinearWeight = null,
+    k_proj: ?*const LinearWeight = null,
+    v_proj: ?*const LinearWeight = null,
+    o_proj: ?*const LinearWeight = null,
     q_norm_weight: ?*const DeviceTensor = null,
     k_norm_weight: ?*const DeviceTensor = null,
     k_cache: *const compute.cuda.Buffer,
     v_cache: *const compute.cuda.Buffer,
+};
+
+const AttentionWeightRefs = struct {
+    q_proj: ?*const LinearWeight = null,
+    k_proj: ?*const LinearWeight = null,
+    v_proj: ?*const LinearWeight = null,
+    o_proj: ?*const LinearWeight = null,
 };
 
 const ShortConvBlockRuntime = struct {
@@ -625,47 +636,42 @@ const ShortConvBlockRuntime = struct {
 const ShortConvExecConfig = struct {
     conv_dim: usize,
     d_conv: usize,
+    in_proj: ?*const LinearWeight = null,
+    conv_weight: ?*const DeviceTensor = null,
+    out_proj: ?*const LinearWeight = null,
     conv_bias: ?*const DeviceTensor = null,
     conv_state: *compute.cuda.Buffer,
+};
+
+const ShortConvWeightRefs = struct {
+    in_proj: ?*const LinearWeight = null,
+    conv_weight: ?*const DeviceTensor = null,
+    out_proj: ?*const LinearWeight = null,
+};
+
+const SwiGluExecConfig = struct {
+    w1: ?*const LinearWeight = null,
+    w3: ?*const LinearWeight = null,
+    w2: ?*const LinearWeight = null,
+};
+
+const MoeExecConfig = struct {
+    router: ?*const LinearWeight = null,
+    up: ?*const LinearWeight = null,
+    down: ?*const LinearWeight = null,
 };
 
 const BlockRuntimeLayer = struct {
     const invalid_slot = std.math.maxInt(u8);
     const MaxNormWeights = 4;
 
-    const MoeExecConfig = struct {
-        router: *const LinearWeight,
-        up: *const LinearWeight,
-        down: *const LinearWeight,
-        d_ff: u32,
-    };
-
-    const FfnExecConfig = struct {
-        w1: *const LinearWeight,
-        w3: *const LinearWeight,
-        w2: *const LinearWeight,
-    };
-
-    const AttentionWeightRefs = struct {
-        q_proj: *const LinearWeight,
-        k_proj: *const LinearWeight,
-        v_proj: *const LinearWeight,
-        o_proj: *const LinearWeight,
-    };
-
-    const ShortConvWeightRefs = struct {
-        in_proj: *const LinearWeight,
-        conv_weight: *const DeviceTensor,
-        out_proj: *const LinearWeight,
-    };
-
     compiled_plan: ?runtime_contract.CompiledPlan = null,
     instruction_norm_weight_refs: []?*const DeviceTensor = &.{},
     instruction_attention_refs: []?LayerAttentionExecConfig = &.{},
-    instruction_shortconv_refs: []?ShortConvExecConfig = &.{},
     instruction_attention_weight_refs: []?AttentionWeightRefs = &.{},
+    instruction_shortconv_refs: []?ShortConvExecConfig = &.{},
     instruction_shortconv_weight_refs: []?ShortConvWeightRefs = &.{},
-    instruction_swiglu_refs: []?FfnExecConfig = &.{},
+    instruction_swiglu_refs: []?SwiGluExecConfig = &.{},
     instruction_moe_refs: []?MoeExecConfig = &.{},
     instruction_weight_offsets: []u32 = &.{},
     instruction_weight_ptrs: []?*anyopaque = &.{},
@@ -730,6 +736,10 @@ const BlockRuntimeLayer = struct {
             .kv_dim = binding.kv_dim,
             .sliding_window = binding.sliding_window,
             .is_causal = binding.is_causal,
+            .q_proj = &binding.q_proj,
+            .k_proj = &binding.k_proj,
+            .v_proj = &binding.v_proj,
+            .o_proj = &binding.o_proj,
             .q_norm_weight = if (binding.q_norm_weight) |*weight| weight else null,
             .k_norm_weight = if (binding.k_norm_weight) |*weight| weight else null,
             .k_cache = &binding.k_cache,
@@ -755,6 +765,9 @@ const BlockRuntimeLayer = struct {
         self.instruction_shortconv_refs[op_index] = .{
             .conv_dim = binding.conv_dim,
             .d_conv = binding.d_conv,
+            .in_proj = &binding.in_proj,
+            .conv_weight = &binding.conv_weight_time_major,
+            .out_proj = &binding.out_proj,
             .conv_bias = if (binding.conv_bias) |*weight| weight else null,
             .conv_state = &binding.conv_state,
         };
@@ -765,17 +778,6 @@ const BlockRuntimeLayer = struct {
         };
     }
 
-    fn bindInstructionMoe(
-        self: *BlockRuntimeLayer,
-        compiled: *const runtime_contract.CompiledPlan,
-        op_index: usize,
-        insn: *const runtime_contract.Instruction,
-        _: *usize,
-    ) !void {
-        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
-        self.instruction_moe_refs[op_index] = try self.resolveMoeExecConfig();
-    }
-
     fn bindInstructionSwiGlu(
         self: *BlockRuntimeLayer,
         compiled: *const runtime_contract.CompiledPlan,
@@ -784,50 +786,48 @@ const BlockRuntimeLayer = struct {
         _: *usize,
     ) !void {
         _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
-        self.instruction_swiglu_refs[op_index] = try self.resolveFfnExecConfig();
-    }
-
-    fn resolveMoeExecConfig(self: *const BlockRuntimeLayer) !MoeExecConfig {
         if (self.attention_binding) |binding| {
-            return .{
-                .router = &binding.w1,
-                .up = &binding.w3,
-                .down = &binding.w2,
-                .d_ff = @intCast(binding.d_ff),
-            };
-        }
-        if (self.shortconv_binding) |binding| {
-            const router = if (binding.ffn_w1) |*w| w else return error.UnsupportedModel;
-            const up = if (binding.ffn_w3) |*w| w else return error.UnsupportedModel;
-            const down = if (binding.ffn_w2) |*w| w else return error.UnsupportedModel;
-            if (binding.d_ff == 0) return error.UnsupportedModel;
-            return .{
-                .router = router,
-                .up = up,
-                .down = down,
-                .d_ff = @intCast(binding.d_ff),
-            };
-        }
-        return error.UnsupportedModel;
-    }
-
-    fn resolveFfnExecConfig(self: *const BlockRuntimeLayer) !FfnExecConfig {
-        if (self.attention_binding) |binding| {
-            return .{
+            self.instruction_swiglu_refs[op_index] = .{
                 .w1 = &binding.w1,
                 .w3 = &binding.w3,
                 .w2 = &binding.w2,
             };
+            return;
         }
         if (self.shortconv_binding) |binding| {
-            const w1 = if (binding.ffn_w1) |*w| w else return error.MissingWeight;
-            const w3 = if (binding.ffn_w3) |*w| w else return error.MissingWeight;
-            const w2 = if (binding.ffn_w2) |*w| w else return error.MissingWeight;
-            return .{
-                .w1 = w1,
-                .w3 = w3,
-                .w2 = w2,
+            self.instruction_swiglu_refs[op_index] = .{
+                .w1 = if (binding.ffn_w1) |*w| w else null,
+                .w3 = if (binding.ffn_w3) |*w| w else null,
+                .w2 = if (binding.ffn_w2) |*w| w else null,
             };
+            return;
+        }
+        return error.UnsupportedModel;
+    }
+
+    fn bindInstructionMoe(
+        self: *BlockRuntimeLayer,
+        compiled: *const runtime_contract.CompiledPlan,
+        op_index: usize,
+        insn: *const runtime_contract.Instruction,
+        _: *usize,
+    ) !void {
+        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
+        if (self.attention_binding) |binding| {
+            self.instruction_moe_refs[op_index] = .{
+                .router = &binding.w1,
+                .up = &binding.w3,
+                .down = &binding.w2,
+            };
+            return;
+        }
+        if (self.shortconv_binding) |binding| {
+            self.instruction_moe_refs[op_index] = .{
+                .router = if (binding.ffn_w1) |*w| w else null,
+                .up = if (binding.ffn_w3) |*w| w else null,
+                .down = if (binding.ffn_w2) |*w| w else null,
+            };
+            return;
         }
         return error.UnsupportedModel;
     }
@@ -852,13 +852,13 @@ const BlockRuntimeLayer = struct {
             allocator.free(self.instruction_attention_refs);
             self.instruction_attention_refs = &.{};
         }
-        if (self.instruction_shortconv_refs.len != 0) {
-            allocator.free(self.instruction_shortconv_refs);
-            self.instruction_shortconv_refs = &.{};
-        }
         if (self.instruction_attention_weight_refs.len != 0) {
             allocator.free(self.instruction_attention_weight_refs);
             self.instruction_attention_weight_refs = &.{};
+        }
+        if (self.instruction_shortconv_refs.len != 0) {
+            allocator.free(self.instruction_shortconv_refs);
+            self.instruction_shortconv_refs = &.{};
         }
         if (self.instruction_shortconv_weight_refs.len != 0) {
             allocator.free(self.instruction_shortconv_weight_refs);
@@ -885,15 +885,15 @@ const BlockRuntimeLayer = struct {
         const len = compiled.plan.instructions.len;
         self.instruction_norm_weight_refs = try allocator.alloc(?*const DeviceTensor, len);
         self.instruction_attention_refs = try allocator.alloc(?LayerAttentionExecConfig, len);
-        self.instruction_shortconv_refs = try allocator.alloc(?ShortConvExecConfig, len);
         self.instruction_attention_weight_refs = try allocator.alloc(?AttentionWeightRefs, len);
+        self.instruction_shortconv_refs = try allocator.alloc(?ShortConvExecConfig, len);
         self.instruction_shortconv_weight_refs = try allocator.alloc(?ShortConvWeightRefs, len);
-        self.instruction_swiglu_refs = try allocator.alloc(?FfnExecConfig, len);
+        self.instruction_swiglu_refs = try allocator.alloc(?SwiGluExecConfig, len);
         self.instruction_moe_refs = try allocator.alloc(?MoeExecConfig, len);
         @memset(self.instruction_norm_weight_refs, null);
         @memset(self.instruction_attention_refs, null);
-        @memset(self.instruction_shortconv_refs, null);
         @memset(self.instruction_attention_weight_refs, null);
+        @memset(self.instruction_shortconv_refs, null);
         @memset(self.instruction_shortconv_weight_refs, null);
         @memset(self.instruction_swiglu_refs, null);
         @memset(self.instruction_moe_refs, null);
@@ -919,40 +919,46 @@ const BlockRuntimeLayer = struct {
                 return @ptrCast(@constCast(weight));
             },
             .multihead_attention => {
-                const binding = try self.instructionAttentionWeightRef(op_index);
+                if (op_index >= self.instruction_attention_weight_refs.len) return error.InvalidInstructionIndex;
+                const binding = self.instruction_attention_weight_refs[op_index] orelse return error.UnsupportedModel;
                 return switch (slot_idx) {
-                    0 => @ptrCast(@constCast(binding.q_proj)),
-                    1 => @ptrCast(@constCast(binding.k_proj)),
-                    2 => @ptrCast(@constCast(binding.v_proj)),
-                    3 => @ptrCast(@constCast(binding.o_proj)),
+                    0 => @ptrCast(@constCast(binding.q_proj orelse return error.MissingWeight)),
+                    1 => @ptrCast(@constCast(binding.k_proj orelse return error.MissingWeight)),
+                    2 => @ptrCast(@constCast(binding.v_proj orelse return error.MissingWeight)),
+                    3 => @ptrCast(@constCast(binding.o_proj orelse return error.MissingWeight)),
                     else => error.InvalidWeightRefCount,
                 };
             },
             .mla_attention => {
-                if (slot_idx != 0) return error.InvalidWeightRefCount;
-                const binding = try self.instructionAttentionWeightRef(op_index);
-                return @ptrCast(@constCast(binding.o_proj));
+                return error.UnsupportedModel;
             },
             .swiglu => {
-                const binding = try self.instructionSwiGluRef(op_index);
+                if (op_index >= self.instruction_swiglu_refs.len) return error.InvalidInstructionIndex;
+                const binding = self.instruction_swiglu_refs[op_index] orelse return error.UnsupportedModel;
                 return switch (slot_idx) {
-                    0 => @ptrCast(@constCast(binding.w1)),
-                    1 => @ptrCast(@constCast(binding.w3)),
-                    2 => @ptrCast(@constCast(binding.w2)),
+                    0 => @ptrCast(@constCast(binding.w1 orelse return error.MissingWeight)),
+                    1 => @ptrCast(@constCast(binding.w3 orelse return error.MissingWeight)),
+                    2 => @ptrCast(@constCast(binding.w2 orelse return error.MissingWeight)),
                     else => error.InvalidWeightRefCount,
                 };
             },
             .moe => {
-                if (slot_idx != 0) return error.InvalidWeightRefCount;
-                const binding = try self.instructionMoeRef(op_index);
-                return @ptrCast(@constCast(binding.router));
+                if (op_index >= self.instruction_moe_refs.len) return error.InvalidInstructionIndex;
+                const binding = self.instruction_moe_refs[op_index] orelse return error.UnsupportedModel;
+                return switch (slot_idx) {
+                    0 => @ptrCast(@constCast(binding.router orelse return error.MissingWeight)),
+                    1 => @ptrCast(@constCast(binding.up orelse return error.MissingWeight)),
+                    2 => @ptrCast(@constCast(binding.down orelse return error.MissingWeight)),
+                    else => error.InvalidWeightRefCount,
+                };
             },
             .shortconv => {
-                const binding = try self.instructionShortConvWeightRef(op_index);
+                if (op_index >= self.instruction_shortconv_weight_refs.len) return error.InvalidInstructionIndex;
+                const binding = self.instruction_shortconv_weight_refs[op_index] orelse return error.UnsupportedModel;
                 return switch (slot_idx) {
-                    0 => @ptrCast(@constCast(binding.in_proj)),
-                    1 => @ptrCast(@constCast(binding.conv_weight)),
-                    2 => @ptrCast(@constCast(binding.out_proj)),
+                    0 => @ptrCast(@constCast(binding.in_proj orelse return error.MissingWeight)),
+                    1 => @ptrCast(@constCast(binding.conv_weight orelse return error.MissingWeight)),
+                    2 => @ptrCast(@constCast(binding.out_proj orelse return error.MissingWeight)),
                     else => error.InvalidWeightRefCount,
                 };
             },
@@ -1027,33 +1033,13 @@ const BlockRuntimeLayer = struct {
         return error.UnsupportedModel;
     }
 
-    fn instructionAttentionWeightRef(self: *const BlockRuntimeLayer, op_index: usize) !AttentionWeightRefs {
-        if (op_index >= self.instruction_attention_weight_refs.len) return error.InvalidInstructionIndex;
-        return self.instruction_attention_weight_refs[op_index] orelse return error.UnsupportedModel;
-    }
-
-    fn instructionShortConvWeightRef(self: *const BlockRuntimeLayer, op_index: usize) !ShortConvWeightRefs {
-        if (op_index >= self.instruction_shortconv_weight_refs.len) return error.InvalidInstructionIndex;
-        return self.instruction_shortconv_weight_refs[op_index] orelse return error.UnsupportedModel;
-    }
-
-    fn instructionMoeRef(self: *const BlockRuntimeLayer, op_index: usize) !MoeExecConfig {
-        if (op_index >= self.instruction_moe_refs.len) return error.InvalidInstructionIndex;
-        return self.instruction_moe_refs[op_index] orelse return error.UnsupportedModel;
-    }
-
-    fn instructionSwiGluRef(self: *const BlockRuntimeLayer, op_index: usize) !FfnExecConfig {
-        if (op_index >= self.instruction_swiglu_refs.len) return error.InvalidInstructionIndex;
-        return self.instruction_swiglu_refs[op_index] orelse return error.UnsupportedModel;
-    }
-
     fn deinit(self: *BlockRuntimeLayer, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
         if (self.register_to_slot_map.len != 0) allocator.free(self.register_to_slot_map);
         if (self.slot_width_hints.len != 0) allocator.free(self.slot_width_hints);
         if (self.instruction_norm_weight_refs.len != 0) allocator.free(self.instruction_norm_weight_refs);
         if (self.instruction_attention_refs.len != 0) allocator.free(self.instruction_attention_refs);
-        if (self.instruction_shortconv_refs.len != 0) allocator.free(self.instruction_shortconv_refs);
         if (self.instruction_attention_weight_refs.len != 0) allocator.free(self.instruction_attention_weight_refs);
+        if (self.instruction_shortconv_refs.len != 0) allocator.free(self.instruction_shortconv_refs);
         if (self.instruction_shortconv_weight_refs.len != 0) allocator.free(self.instruction_shortconv_weight_refs);
         if (self.instruction_swiglu_refs.len != 0) allocator.free(self.instruction_swiglu_refs);
         if (self.instruction_moe_refs.len != 0) allocator.free(self.instruction_moe_refs);
@@ -2445,7 +2431,6 @@ pub const CudaBackend = struct {
             });
             return error.InvalidStateDescriptorBinding;
         }
-        const runtime_ptr: *anyopaque = @ptrCast(&self.block_runtime);
         for (self.stateDescriptors(), 0..) |descriptor, idx| {
             const incoming = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
                 log.warn("inference", "CUDA bindSlotStateBlocks missing descriptor state id", .{
@@ -2454,23 +2439,6 @@ pub const CudaBackend = struct {
                 });
                 return error.InvalidStateDescriptorBinding;
             };
-            const should_bind_runtime_ptr = switch (descriptor.id) {
-                runtime_contract.kv_cache_state_id,
-                runtime_contract.shortconv_state_id,
-                runtime_contract.mamba_state_id,
-                => true,
-                else => false,
-            };
-            if (should_bind_runtime_ptr) {
-                runtime_contract.writeStatePointerToBlock(incoming, runtime_ptr) catch |err| {
-                    log.warn("inference", "CUDA bindSlotStateBlocks state view write failed", .{
-                        .slot_index = slot_index,
-                        .state_id = descriptor.id,
-                        .reason = @errorName(err),
-                    });
-                    return err;
-                };
-            }
             self.slot_state_blocks[idx] = .{
                 .id = descriptor.id,
                 .ptr = incoming.ptr,
@@ -3847,12 +3815,10 @@ pub const CudaBackend = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !*BlockRuntimeLayer {
         const state_id = insn.state_block_id orelse return ctx.layer;
-        const raw_runtime = runtime_contract.statePointerForId(state_blocks, state_id) orelse {
+        if (runtime_contract.findStateBlock(state_blocks, state_id) == null) {
             return error.InvalidStateDescriptorBinding;
-        };
-        const runtime_ptr: *BlockRuntime = @ptrCast(@alignCast(raw_runtime));
-        if (ctx.layer_index >= runtime_ptr.blocks.len) return error.InvalidStateDescriptorBinding;
-        return &runtime_ptr.blocks[ctx.layer_index];
+        }
+        return ctx.layer;
     }
 
     fn instructionParams(
@@ -4115,21 +4081,25 @@ pub const CudaBackend = struct {
 
     fn layerProgramMoeAdapter(
         self: *CudaBackend,
-        layer: *BlockRuntimeLayer,
+        _: *BlockRuntimeLayer,
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
         ctx: *LayerProgramExecutionContext,
     ) !void {
+        _ = ctx;
         const io = try instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         const input = bufferFromTensorHandle(io.inputs[0]);
         const output = bufferFromTensorHandle(io.outputs[0]);
         const weight_handles = try instructionWeightSlice(insn, registers);
-        if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+        if (weight_handles.len != 3) return error.InvalidWeightRefCount;
         const router_weight = linearWeightFromWeightHandle(weight_handles[0]);
-        const binding = try layer.instructionMoeRef(ctx.op_index);
-        if (router_weight.cols() != @as(usize, binding.d_ff)) return error.InvalidInstructionBinding;
-        try self.runFfnStep(input, router_weight, binding.up, binding.down, binding.d_ff, output);
+        const up_weight = linearWeightFromWeightHandle(weight_handles[1]);
+        const down_weight = linearWeightFromWeightHandle(weight_handles[2]);
+        const d_ff = router_weight.cols();
+        if (up_weight.cols() != d_ff) return error.InvalidInstructionBinding;
+        if (down_weight.rows() != d_ff) return error.InvalidInstructionBinding;
+        try self.runFfnStep(input, router_weight, up_weight, down_weight, @intCast(d_ff), output);
     }
 
     fn layerProgramResidualAddAdapter(
@@ -7045,11 +7015,9 @@ test "BlockRuntimeLayer.rebuildInstructionRefs binds per-op runtime refs" {
     defer {
         if (layer.instruction_norm_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_norm_weight_refs);
         if (layer.instruction_attention_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_refs);
-        if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
         if (layer.instruction_attention_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_weight_refs);
+        if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
         if (layer.instruction_shortconv_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_weight_refs);
-        if (layer.instruction_swiglu_refs.len > 0) std.testing.allocator.free(layer.instruction_swiglu_refs);
-        if (layer.instruction_moe_refs.len > 0) std.testing.allocator.free(layer.instruction_moe_refs);
         if (layer.instruction_weight_offsets.len > 0) std.testing.allocator.free(layer.instruction_weight_offsets);
         if (layer.instruction_weight_ptrs.len > 0) std.testing.allocator.free(layer.instruction_weight_ptrs);
         if (layer.compiled_plan) |*compiled| {
@@ -7131,25 +7099,19 @@ test "BlockRuntimeLayer.rebuildInstructionRefs binds per-op runtime refs" {
     try layer.rebuildInstructionRefs(std.testing.allocator);
 
     try std.testing.expect(layer.instruction_norm_weight_refs[0].? == &norm0);
-    try std.testing.expect(layer.instruction_attention_refs[1] != null);
-    try std.testing.expect(layer.instruction_attention_weight_refs[1] != null);
-    try std.testing.expect(layer.instruction_attention_refs[1].?.k_cache == &attention_runtime.k_cache);
-    try std.testing.expect(layer.instruction_attention_refs[1].?.v_cache == &attention_runtime.v_cache);
-    try std.testing.expect(layer.instruction_attention_weight_refs[1].?.q_proj == &attention_runtime.q_proj);
-    try std.testing.expect(layer.instruction_attention_weight_refs[1].?.k_proj == &attention_runtime.k_proj);
-    try std.testing.expect(layer.instruction_attention_weight_refs[1].?.v_proj == &attention_runtime.v_proj);
-    try std.testing.expect(layer.instruction_attention_weight_refs[1].?.o_proj == &attention_runtime.o_proj);
-    try std.testing.expect(layer.instruction_shortconv_refs[2] != null);
-    try std.testing.expect(layer.instruction_shortconv_weight_refs[2] != null);
-    try std.testing.expect(layer.instruction_shortconv_refs[2].?.conv_state == &shortconv_runtime.conv_state);
-    try std.testing.expect(layer.instruction_shortconv_weight_refs[2].?.in_proj == &shortconv_runtime.in_proj);
-    try std.testing.expect(layer.instruction_shortconv_weight_refs[2].?.conv_weight == &shortconv_runtime.conv_weight_time_major);
-    try std.testing.expect(layer.instruction_shortconv_weight_refs[2].?.out_proj == &shortconv_runtime.out_proj);
-    try std.testing.expect(layer.instruction_swiglu_refs[3] != null);
-    try std.testing.expect(layer.instruction_moe_refs[3] == null);
     try std.testing.expect(layer.instruction_norm_weight_refs[4].? == &norm1);
     try std.testing.expectEqual(@as(usize, ops.len + 1), layer.instruction_weight_offsets.len);
     try std.testing.expect(layer.instruction_weight_ptrs.len != 0);
+    // Instruction weight pointers are flattened and directly sourced from layer bindings.
+    const attn_start = layer.instruction_weight_offsets[1];
+    try std.testing.expectEqual(@intFromPtr(layer.instruction_weight_ptrs[attn_start + 0].?), @intFromPtr(&attention_runtime.q_proj));
+    try std.testing.expectEqual(@intFromPtr(layer.instruction_weight_ptrs[attn_start + 1].?), @intFromPtr(&attention_runtime.k_proj));
+    try std.testing.expectEqual(@intFromPtr(layer.instruction_weight_ptrs[attn_start + 2].?), @intFromPtr(&attention_runtime.v_proj));
+    try std.testing.expectEqual(@intFromPtr(layer.instruction_weight_ptrs[attn_start + 3].?), @intFromPtr(&attention_runtime.o_proj));
+    const shortconv_start = layer.instruction_weight_offsets[2];
+    try std.testing.expectEqual(@intFromPtr(layer.instruction_weight_ptrs[shortconv_start + 0].?), @intFromPtr(&shortconv_runtime.in_proj));
+    try std.testing.expectEqual(@intFromPtr(layer.instruction_weight_ptrs[shortconv_start + 1].?), @intFromPtr(&shortconv_runtime.conv_weight_time_major));
+    try std.testing.expectEqual(@intFromPtr(layer.instruction_weight_ptrs[shortconv_start + 2].?), @intFromPtr(&shortconv_runtime.out_proj));
 }
 
 test "BlockRuntimeLayer.rebuildInstructionRefs rejects norm op without bound norm weights" {
@@ -7157,11 +7119,9 @@ test "BlockRuntimeLayer.rebuildInstructionRefs rejects norm op without bound nor
     defer {
         if (layer.instruction_norm_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_norm_weight_refs);
         if (layer.instruction_attention_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_refs);
-        if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
         if (layer.instruction_attention_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_weight_refs);
+        if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
         if (layer.instruction_shortconv_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_weight_refs);
-        if (layer.instruction_swiglu_refs.len > 0) std.testing.allocator.free(layer.instruction_swiglu_refs);
-        if (layer.instruction_moe_refs.len > 0) std.testing.allocator.free(layer.instruction_moe_refs);
         if (layer.instruction_weight_offsets.len > 0) std.testing.allocator.free(layer.instruction_weight_offsets);
         if (layer.instruction_weight_ptrs.len > 0) std.testing.allocator.free(layer.instruction_weight_ptrs);
         if (layer.compiled_plan) |*compiled| {
@@ -7183,11 +7143,9 @@ test "BlockRuntimeLayer.rebuildInstructionRefs binds moe instruction typed refs"
     defer {
         if (layer.instruction_norm_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_norm_weight_refs);
         if (layer.instruction_attention_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_refs);
-        if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
         if (layer.instruction_attention_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_weight_refs);
+        if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
         if (layer.instruction_shortconv_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_weight_refs);
-        if (layer.instruction_swiglu_refs.len > 0) std.testing.allocator.free(layer.instruction_swiglu_refs);
-        if (layer.instruction_moe_refs.len > 0) std.testing.allocator.free(layer.instruction_moe_refs);
         if (layer.instruction_weight_offsets.len > 0) std.testing.allocator.free(layer.instruction_weight_offsets);
         if (layer.instruction_weight_ptrs.len > 0) std.testing.allocator.free(layer.instruction_weight_ptrs);
         if (layer.compiled_plan) |*compiled| {
@@ -7242,13 +7200,12 @@ test "BlockRuntimeLayer.rebuildInstructionRefs binds moe instruction typed refs"
 
     try layer.rebuildInstructionRefs(std.testing.allocator);
 
-    const moe_ref = layer.instruction_moe_refs[0] orelse return error.UnsupportedModel;
-    try std.testing.expect(moe_ref.router == &attention_runtime.w1);
-    try std.testing.expect(moe_ref.up == &attention_runtime.w3);
-    try std.testing.expect(moe_ref.down == &attention_runtime.w2);
-    try std.testing.expectEqual(@as(u32, 64), moe_ref.d_ff);
     try std.testing.expectEqual(@as(usize, 2), layer.instruction_weight_offsets.len);
-    try std.testing.expectEqual(@as(usize, 1), layer.instruction_weight_ptrs.len);
+    try std.testing.expectEqual(@as(usize, 3), layer.instruction_weight_ptrs.len);
     const router_ptr = layer.instruction_weight_ptrs[0] orelse return error.MissingWeight;
+    const up_ptr = layer.instruction_weight_ptrs[1] orelse return error.MissingWeight;
+    const down_ptr = layer.instruction_weight_ptrs[2] orelse return error.MissingWeight;
     try std.testing.expectEqual(@intFromPtr(router_ptr), @intFromPtr(&attention_runtime.w1));
+    try std.testing.expectEqual(@intFromPtr(up_ptr), @intFromPtr(&attention_runtime.w3));
+    try std.testing.expectEqual(@intFromPtr(down_ptr), @intFromPtr(&attention_runtime.w2));
 }

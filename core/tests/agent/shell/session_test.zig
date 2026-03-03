@@ -12,7 +12,7 @@ test "ShellSession open write read exit" {
     const cwd = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
-    var session = try shell.session.ShellSession.open(allocator, 80, 24, cwd, 64 * 1024);
+    var session = try shell.session.ShellSession.open(allocator, 80, 24, cwd, 64 * 1024, .host);
     defer session.close();
 
     _ = try session.write("echo hello\n");

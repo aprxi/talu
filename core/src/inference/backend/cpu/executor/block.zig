@@ -510,8 +510,16 @@ pub const Block = struct {
             },
             .mla_attention => {
                 const mla_binding = typed_kernel_refs.mla_attention[op_index] orelse return error.InvalidInstructionBinding;
-                if (slot_idx != 0) return error.InvalidWeightRefCount;
-                return @ptrCast(@constCast(mla_binding.o_proj));
+                return switch (slot_idx) {
+                    0 => @ptrCast(@constCast(mla_binding.q_a_proj)),
+                    1 => @ptrCast(@constCast(mla_binding.q_a_norm)),
+                    2 => @ptrCast(@constCast(mla_binding.q_b_proj)),
+                    3 => @ptrCast(@constCast(mla_binding.kv_a_proj)),
+                    4 => @ptrCast(@constCast(mla_binding.kv_a_norm)),
+                    5 => @ptrCast(@constCast(mla_binding.kv_b_proj)),
+                    6 => @ptrCast(@constCast(mla_binding.o_proj)),
+                    else => error.InvalidWeightRefCount,
+                };
             },
             .swiglu => {
                 const ffn_binding = typed_kernel_refs.swiglu[op_index] orelse return error.InvalidInstructionBinding;
@@ -533,14 +541,31 @@ pub const Block = struct {
             },
             .moe => {
                 const moe_binding = typed_kernel_refs.moe[op_index] orelse return error.InvalidInstructionBinding;
-                if (slot_idx != 0) return error.InvalidWeightRefCount;
-                return @ptrCast(@constCast(&moe_binding.router_weight));
+                return switch (slot_idx) {
+                    0 => @ptrCast(@constCast(&moe_binding.router_weight)),
+                    1 => blk: {
+                        if (moe_binding.experts.len == 0) return error.MissingWeight;
+                        const expert = &moe_binding.experts[0];
+                        if (expert.up_proj) |*up_proj| break :blk @ptrCast(@constCast(up_proj));
+                        if (expert.gate_up_proj) |*gate_up_proj| break :blk @ptrCast(@constCast(gate_up_proj));
+                        return error.MissingWeight;
+                    },
+                    2 => blk: {
+                        if (moe_binding.experts.len == 0) return error.MissingWeight;
+                        const expert = &moe_binding.experts[0];
+                        break :blk @ptrCast(@constCast(&expert.down_proj));
+                    },
+                    else => error.InvalidWeightRefCount,
+                };
             },
             .mamba_mixer => {
                 const mamba_binding = typed_kernel_refs.mamba[op_index] orelse return error.InvalidInstructionBinding;
                 return switch (slot_idx) {
                     0 => @ptrCast(@constCast(mamba_binding.weights.in_proj)),
-                    1 => @ptrCast(@constCast(mamba_binding.weights.out_proj)),
+                    1 => @ptrCast(@constCast(mamba_binding.weights.conv1d_weight)),
+                    2 => @ptrCast(@constCast(mamba_binding.weights.A_log)),
+                    3 => @ptrCast(@constCast(mamba_binding.weights.D)),
+                    4 => @ptrCast(@constCast(mamba_binding.weights.out_proj)),
                     else => error.InvalidWeightRefCount,
                 };
             },
@@ -1269,11 +1294,17 @@ pub const Block = struct {
                 return;
             },
             .mla_attention => {
-                if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+                if (weight_handles.len != 7) return error.InvalidWeightRefCount;
                 if (state.op_index >= state.block.instruction_mla_attention_refs.len) return error.InvalidInstructionIndex;
                 const bound = state.block.instruction_mla_attention_refs[state.op_index] orelse return error.MissingKernelBinding;
                 var mla_local = bound.*;
-                mla_local.o_proj = tensorFromWeightHandle(weight_handles[0]);
+                mla_local.q_a_proj = tensorFromWeightHandle(weight_handles[0]);
+                mla_local.q_a_norm = tensorFromWeightHandle(weight_handles[1]);
+                mla_local.q_b_proj = tensorFromWeightHandle(weight_handles[2]);
+                mla_local.kv_a_proj = tensorFromWeightHandle(weight_handles[3]);
+                mla_local.kv_a_norm = tensorFromWeightHandle(weight_handles[4]);
+                mla_local.kv_b_proj = tensorFromWeightHandle(weight_handles[5]);
+                mla_local.o_proj = tensorFromWeightHandle(weight_handles[6]);
                 try dispatchMlaAttentionWithMode(state, insn, state_blocks, input, output, &mla_local);
                 return;
             },
@@ -1297,21 +1328,34 @@ pub const Block = struct {
                 return;
             },
             .moe => {
-                if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+                if (weight_handles.len != 3) return error.InvalidWeightRefCount;
                 if (state.op_index >= state.block.instruction_moe_refs.len) return error.InvalidInstructionIndex;
                 const bound = state.block.instruction_moe_refs[state.op_index] orelse return error.MissingKernelBinding;
                 var moe_local = bound.*;
                 moe_local.router_weight = tensorFromWeightHandle(weight_handles[0]).*;
+                if (moe_local.experts.len == 1) {
+                    var expert = &moe_local.experts[0];
+                    const up_weight = tensorFromWeightHandle(weight_handles[1]).*;
+                    if (expert.gate_up_proj != null) {
+                        expert.gate_up_proj = up_weight;
+                    } else if (expert.up_proj != null) {
+                        expert.up_proj = up_weight;
+                    }
+                    expert.down_proj = tensorFromWeightHandle(weight_handles[2]).*;
+                }
                 try dispatchMoeWithMode(state, input, output, &moe_local);
                 return;
             },
             .mamba_mixer => {
-                if (weight_handles.len != 2) return error.InvalidWeightRefCount;
+                if (weight_handles.len != 5) return error.InvalidWeightRefCount;
                 if (state.op_index >= state.block.instruction_mamba_refs.len) return error.InvalidInstructionIndex;
                 const bound = state.block.instruction_mamba_refs[state.op_index] orelse return error.MissingKernelBinding;
                 var mamba_local = bound.*;
                 mamba_local.weights.in_proj = tensorFromWeightHandle(weight_handles[0]);
-                mamba_local.weights.out_proj = tensorFromWeightHandle(weight_handles[1]);
+                mamba_local.weights.conv1d_weight = tensorFromWeightHandle(weight_handles[1]);
+                mamba_local.weights.A_log = tensorFromWeightHandle(weight_handles[2]);
+                mamba_local.weights.D = tensorFromWeightHandle(weight_handles[3]);
+                mamba_local.weights.out_proj = tensorFromWeightHandle(weight_handles[4]);
                 try dispatchMambaWithMode(state, insn, state_blocks, input, output, &mamba_local);
                 return;
             },
@@ -1346,44 +1390,50 @@ pub const Block = struct {
         output: *Tensor,
         kernel: *const attn_kernel.MultiHeadAttention,
     ) !void {
-        if (state.use_batched_dispatch) {
-            try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
-            const shared_state = state.slot_ctx.sharedState();
-            switch (state.mode) {
-                .single_slot => try kernel.forwardWithBatchedCache(
-                    input,
-                    output,
-                    shared_state.batched_cache orelse return runtime.SlotContextError.MissingBatchedCache,
-                    state.slot_index,
-                    &state.scratch.attn_scratch,
-                    &state.scratch.matmul_scratch,
-                    state.slot_ctx.use_cache,
-                ),
-                .slot_batch => try kernel.forwardWithBatchedCacheSlots(
-                    input,
-                    output,
-                    shared_state.batched_cache orelse return runtime.SlotContextError.MissingBatchedCache,
-                    state.slot_indices,
-                    &state.scratch.attn_scratch,
-                    &state.scratch.matmul_scratch,
-                    state.slot_ctx.use_cache,
-                ),
-            }
-            return;
+        try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
+        const instruction_state_id = if (insn.state_block_id) |state_id|
+            @as(?u8, state_id)
+        else
+            runtime_contract.requiredStateBlockIdForOpcode(insn.opcode);
+        const shared_state = state.slot_ctx.sharedState();
+        if (instruction_state_id != null and shared_state.batched_cache == null) {
+            return runtime.SlotContextError.MissingBatchedCache;
         }
-        const slot_state = state.slot_ctx.slotState();
-        if (slot_state.attn_cache) |*attn_cache| {
-            try kernel.forward(
+        if (instruction_state_id == null and shared_state.batched_cache == null) {
+            const slot_state = state.slot_ctx.slotState();
+            if (slot_state.attn_cache) |*attn_cache| {
+                try kernel.forward(
+                    input,
+                    output,
+                    attn_cache,
+                    &state.scratch.attn_scratch,
+                    &state.scratch.matmul_scratch,
+                    state.slot_ctx.use_cache,
+                );
+                return;
+            }
+            return runtime.SlotContextError.MissingAttentionCache;
+        }
+        switch (state.mode) {
+            .single_slot => try kernel.forwardWithBatchedCache(
                 input,
                 output,
-                attn_cache,
+                shared_state.batched_cache orelse return runtime.SlotContextError.MissingBatchedCache,
+                state.slot_index,
                 &state.scratch.attn_scratch,
                 &state.scratch.matmul_scratch,
                 state.slot_ctx.use_cache,
-            );
-            return;
+            ),
+            .slot_batch => try kernel.forwardWithBatchedCacheSlots(
+                input,
+                output,
+                shared_state.batched_cache orelse return runtime.SlotContextError.MissingBatchedCache,
+                state.slot_indices,
+                &state.scratch.attn_scratch,
+                &state.scratch.matmul_scratch,
+                state.slot_ctx.use_cache,
+            ),
         }
-        return runtime.SlotContextError.MissingAttentionCache;
     }
 
     fn dispatchMlaAttentionWithMode(
@@ -1394,10 +1444,9 @@ pub const Block = struct {
         output: *Tensor,
         kernel: *const mla_kernel.MLAttention,
     ) !void {
-        if (state.use_batched_dispatch) {
-            try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
-            if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
-        }
+        if (!state.use_batched_dispatch) return error.InvalidStateDescriptorBinding;
+        try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
+        if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
         const slot_state = state.slot_ctx.slotState();
         const shared_state = state.slot_ctx.sharedState();
         if (slot_state.mla_cache) |*mla_cache| {
@@ -1448,10 +1497,9 @@ pub const Block = struct {
         output: *Tensor,
         kernel: *const mamba_kernel.MambaKernel,
     ) !void {
-        if (state.use_batched_dispatch) {
-            try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
-            if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
-        }
+        if (!state.use_batched_dispatch) return error.InvalidStateDescriptorBinding;
+        try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
+        if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
         const slot_state = state.slot_ctx.slotState();
         const shared_state = state.slot_ctx.sharedState();
         if (slot_state.mamba_state) |*mamba_state| {
@@ -1475,10 +1523,9 @@ pub const Block = struct {
         output: *Tensor,
         kernel: *const shortconv_kernel.ShortConvKernel,
     ) !void {
-        if (state.use_batched_dispatch) {
-            try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
-            if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
-        }
+        if (!state.use_batched_dispatch) return error.InvalidStateDescriptorBinding;
+        try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
+        if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
         const slot_state = state.slot_ctx.slotState();
         const shared_state = state.slot_ctx.sharedState();
         if (slot_state.shortconv_state) |*shortconv_state| {
