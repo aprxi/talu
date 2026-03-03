@@ -20,23 +20,20 @@ void* mlx_lazy_causal_conv_mixer_bf16(
     const int d_conv_i = static_cast<int>(d_conv);
     const int conv_dim_i = static_cast<int>(conv_dim);
     const int hidden_dim = input_arr.shape(2);
+    const Dtype conv_dtype = input_arr.dtype();
 
     const array in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_arr, hidden_dim, 3 * conv_dim_i, true);
     const array bcx = matmul_lastdim(input_arr, in_proj_rhs);
-    // Keep recurrence update in FP32, but preserve model dtype for gating/output
-    // to avoid unnecessary FP32 residency and per-token recasts in dense decode.
     array b_gate = slice(bcx, {0, 0, 0}, {1, seq_len, conv_dim_i});
     const array c_gate = slice(bcx, {0, 0, conv_dim_i}, {1, seq_len, 2 * conv_dim_i});
     array x_proj = slice(bcx, {0, 0, 2 * conv_dim_i}, {1, seq_len, 3 * conv_dim_i});
-    if (b_gate.dtype() != float32) b_gate = astype(b_gate, float32);
-    if (x_proj.dtype() != float32) x_proj = astype(x_proj, float32);
-    // FP32 allowlist: causal_conv recurrence is stateful; keep conv stream update
-    // in FP32 while preserving bf16/f16 for output projection.
     array bx = b_gate * x_proj;
 
-    array conv_kernel_broadcast = resolve_causal_conv_kernel(conv_weight, conv_weight_arr, d_conv_i, conv_dim_i);
+    array conv_kernel_broadcast =
+        resolve_causal_conv_kernel(conv_weight, conv_weight_arr, d_conv_i, conv_dim_i, conv_dtype);
 
-    std::optional<array> conv_bias_row = resolve_causal_conv_bias_row(conv_bias, conv_bias_arr, conv_dim_i);
+    std::optional<array> conv_bias_row =
+        resolve_causal_conv_bias_row(conv_bias, conv_bias_arr, conv_dim_i, conv_dtype);
 
     auto* state_cache = static_cast<MLXCausalConvCache*>(causal_conv_cache_ptr);
     CausalConvLayer* layer_state = nullptr;
@@ -44,20 +41,20 @@ void* mlx_lazy_causal_conv_mixer_bf16(
         layer_state = &state_cache->layers[layer_idx];
     }
 
-    // FP32 allowlist: recurrent causal_conv state accumulation.
-    array conv_state(0.0f, float32);
+    array conv_state(0.0f, conv_dtype);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
-            layer_state->conv_state->shape(2) != conv_dim_i;
+            layer_state->conv_state->shape(2) != conv_dim_i ||
+            layer_state->conv_state->dtype() != conv_dtype;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, conv_dim_i}, float32));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, conv_dim_i}, conv_dtype));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, conv_dim_i}, float32);
+        conv_state = zeros({1, d_conv_i, conv_dim_i}, conv_dtype);
     }
 
     array conv_seq = causal_conv_run_sequence(
@@ -72,8 +69,7 @@ void* mlx_lazy_causal_conv_mixer_bf16(
         conv_seq = conv_seq + reshape(*conv_bias_row, {1, 1, conv_dim_i});
     }
 
-    const array conv_seq_model = (conv_seq.dtype() == c_gate.dtype()) ? conv_seq : astype(conv_seq, c_gate.dtype());
-    const array gated = conv_seq_model * c_gate;
+    const array gated = conv_seq * c_gate;
     const array out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_arr, conv_dim_i, hidden_dim, true);
     const array out = matmul_lastdim(gated, out_proj_rhs);
 
@@ -137,9 +133,20 @@ void* mlx_lazy_causal_conv_mixer_quantized(
     array x_proj = slice(bcx, {0, 0, 2 * conv_dim_i}, {1, seq_len, 3 * conv_dim_i});
     array bx = b_gate * x_proj;
 
-    array conv_kernel_broadcast = resolve_causal_conv_kernel(conv_weight, conv_weight_arr, d_conv_i, conv_dim_i);
+    array conv_kernel_broadcast = resolve_causal_conv_kernel(
+        conv_weight,
+        conv_weight_arr,
+        d_conv_i,
+        conv_dim_i,
+        float32
+    );
 
-    std::optional<array> conv_bias_row = resolve_causal_conv_bias_row(conv_bias, conv_bias_arr, conv_dim_i);
+    std::optional<array> conv_bias_row = resolve_causal_conv_bias_row(
+        conv_bias,
+        conv_bias_arr,
+        conv_dim_i,
+        float32
+    );
 
     auto* state_cache = static_cast<MLXCausalConvCache*>(causal_conv_cache_ptr);
     CausalConvLayer* layer_state = nullptr;

@@ -41,13 +41,6 @@ pub const TransformerBlock = struct {
         ptr: *anyopaque,
     };
 
-    fn planUsesOpcode(plan: *const runtime_contract.ExecutionPlan, opcode: opcode_map.Opcode) bool {
-        for (plan.instructions) |insn| {
-            if (insn.opcode == opcode) return true;
-        }
-        return false;
-    }
-
     const AttentionRuntimeBinding = union(enum) {
         mla: mla_kernel.MLAttention,
         multihead: attention_kernel.MultiHeadAttention,
@@ -88,6 +81,7 @@ pub const TransformerBlock = struct {
         instruction_views: []runtime_contract.TensorViewDesc,
         norm_index: *usize,
         bindings: LayerProgramRuntimeBindings,
+        resolved_weight_ptrs: []?*anyopaque,
         state_bindings: [MaxLayerProgramStateBindings]?LayerProgramStateBinding = [_]?LayerProgramStateBinding{null} ** MaxLayerProgramStateBindings,
         state_binding_count: usize = 0,
     };
@@ -217,18 +211,20 @@ pub const TransformerBlock = struct {
         var blocks = LayerProgramInstructionStateBlocks{};
         const state_id = insn.state_block_id orelse return blocks;
         const binding = layerProgramStateBinding(ctx, state_id) orelse return error.InvalidStateDescriptorBinding;
-        const descriptor = runtime_contract.findStateDescriptor(&ctx.compiled_plan.plan, state_id) orelse {
-            return error.UnknownStateDescriptorId;
-        };
         const state_block = binding.handle;
-        if (state_block.align_bytes < descriptor.align_bytes) return error.InvalidStateDescriptorBinding;
-        if (descriptor.size_bytes > 0 and state_block.size < descriptor.size_bytes) return error.InvalidStateDescriptorBinding;
+        if (comptime std.debug.runtime_safety) {
+            const descriptor = runtime_contract.findStateDescriptor(&ctx.compiled_plan.plan, state_id) orelse {
+                return error.UnknownStateDescriptorId;
+            };
+            if (state_block.align_bytes < descriptor.align_bytes) return error.InvalidStateDescriptorBinding;
+            if (descriptor.size_bytes > 0 and state_block.size < descriptor.size_bytes) return error.InvalidStateDescriptorBinding;
+        }
         blocks.handles[0] = state_block;
         blocks.len = 1;
         return blocks;
     }
 
-    fn validateCompiledLayerProgram(lw: *const LayerWeights, layer_idx: usize) !void {
+    pub fn validateCompiledLayerProgram(lw: *const LayerWeights, layer_idx: usize) !void {
         const compiled_plan = lw.compiled_plan orelse return error.NotImplemented;
         runtime_contract.validateExecutionPlanForBlockKind(&compiled_plan.plan, lw.kind) catch |err| {
             log.warn("inference", "Metal compiled layer plan fails block-kind validation", .{
@@ -257,9 +253,13 @@ pub const TransformerBlock = struct {
     ) !*mlx_graph.ArrayHandle {
         const reg_idx = runtime_contract.registerToIndex(reg);
         if (reg_idx == 0) return residual;
-        if (reg_idx >= register_to_slot_map.len) return error.NotImplemented;
+        if (comptime std.debug.runtime_safety) {
+            if (reg_idx >= register_to_slot_map.len) return error.NotImplemented;
+            const slot_idx = register_to_slot_map[reg_idx];
+            if (slot_idx == std.math.maxInt(u8) or slot_idx >= slot_buffers.len) return error.NotImplemented;
+            return &slot_buffers[slot_idx];
+        }
         const slot_idx = register_to_slot_map[reg_idx];
-        if (slot_idx == std.math.maxInt(u8) or slot_idx >= slot_buffers.len) return error.NotImplemented;
         return &slot_buffers[slot_idx];
     }
 
@@ -272,7 +272,9 @@ pub const TransformerBlock = struct {
         registers: []runtime_contract.TensorHandle,
     ) !struct { inputs: []const runtime_contract.TensorHandle, outputs: []const runtime_contract.TensorHandle } {
         const io_count = insn.inputs.len + insn.outputs.len;
-        if (registers.len < io_count) return error.InvalidInstructionBinding;
+        if (comptime std.debug.runtime_safety) {
+            if (registers.len < io_count) return error.InvalidInstructionBinding;
+        }
         return .{
             .inputs = registers[0..insn.inputs.len],
             .outputs = registers[insn.inputs.len..io_count],
@@ -284,9 +286,13 @@ pub const TransformerBlock = struct {
         registers: []runtime_contract.TensorHandle,
     ) ![]const runtime_contract.TensorHandle {
         const io_count = insn.inputs.len + insn.outputs.len;
-        if (registers.len < io_count) return error.InvalidInstructionBinding;
+        if (comptime std.debug.runtime_safety) {
+            if (registers.len < io_count) return error.InvalidInstructionBinding;
+        }
         const weights = registers[io_count..];
-        if (weights.len != insn.weights.len) return error.InvalidWeightRefCount;
+        if (comptime std.debug.runtime_safety) {
+            if (weights.len != insn.weights.len) return error.InvalidWeightRefCount;
+        }
         return weights;
     }
 
@@ -435,17 +441,11 @@ pub const TransformerBlock = struct {
         return error.InvalidWeightBindingName;
     }
 
-    fn layerProgramWeightHandlePtr(
-        insn: *const runtime_contract.Instruction,
+    fn resolveLayerProgramWeightPtrForKey(
         ctx: *LayerProgramExecutionContext,
-        slot_idx: usize,
+        key: LayerProgramWeightBindingKey,
     ) !*anyopaque {
-        if (slot_idx >= insn.weights.len) return error.InvalidWeightRefIndex;
-        const ref_index = insn.weights[slot_idx].index;
-        if (ref_index >= ctx.weight_binding_keys.len) return error.InvalidWeightRefIndex;
-        const key = ctx.weight_binding_keys[ref_index];
         if (key == .invalid) return error.InvalidWeightBindingName;
-
         return switch (key) {
             .norm_weight => resolveLayerProgramNormWeightPtr(ctx),
             .attention_q_proj, .attention_k_proj, .attention_v_proj, .attention_o_proj, .mla_weights => resolveLayerProgramAttentionWeightPtr(ctx, key),
@@ -455,6 +455,33 @@ pub const TransformerBlock = struct {
             .shortconv_in_proj, .shortconv_conv_weight, .shortconv_out_proj => resolveLayerProgramShortconvWeightPtr(ctx, key),
             .invalid => error.InvalidWeightBindingName,
         };
+    }
+
+    fn layerProgramWeightHandlePtr(
+        insn: *const runtime_contract.Instruction,
+        ctx: *LayerProgramExecutionContext,
+        slot_idx: usize,
+    ) !*anyopaque {
+        if (comptime std.debug.runtime_safety) {
+            if (slot_idx >= insn.weights.len) return error.InvalidWeightRefIndex;
+        }
+        const ref_index = insn.weights[slot_idx].index;
+        if (comptime std.debug.runtime_safety) {
+            if (ref_index >= ctx.weight_binding_keys.len) return error.InvalidWeightRefIndex;
+        }
+        const key = ctx.weight_binding_keys[ref_index];
+        if (comptime std.debug.runtime_safety) {
+            if (key == .invalid) return error.InvalidWeightBindingName;
+        }
+        if (key == .norm_weight) return resolveLayerProgramNormWeightPtr(ctx);
+        if (comptime std.debug.runtime_safety) {
+            if (ref_index < ctx.resolved_weight_ptrs.len) {
+                if (ctx.resolved_weight_ptrs[ref_index]) |cached| return cached;
+            }
+        } else {
+            if (ctx.resolved_weight_ptrs[ref_index]) |cached| return cached;
+        }
+        return resolveLayerProgramWeightPtrForKey(ctx, key);
     }
 
     fn instructionParams(
@@ -488,7 +515,9 @@ pub const TransformerBlock = struct {
     ) !BuiltLayerProgramHandles {
         var handle_count: usize = 0;
         for (insn.inputs) |reg| {
-            if (handle_count >= handle_storage.len or handle_count >= view_storage.len) return error.InvalidInstructionBinding;
+            if (comptime std.debug.runtime_safety) {
+                if (handle_count >= handle_storage.len or handle_count >= view_storage.len) return error.InvalidInstructionBinding;
+            }
             const slot = try bufferSlotForRegister(reg, ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
             handle_storage[handle_count] = .{
                 .register = reg,
@@ -497,7 +526,9 @@ pub const TransformerBlock = struct {
             handle_count += 1;
         }
         for (insn.outputs) |reg| {
-            if (handle_count >= handle_storage.len or handle_count >= view_storage.len) return error.InvalidInstructionBinding;
+            if (comptime std.debug.runtime_safety) {
+                if (handle_count >= handle_storage.len or handle_count >= view_storage.len) return error.InvalidInstructionBinding;
+            }
             const slot = try bufferSlotForRegister(reg, ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
             handle_storage[handle_count] = .{
                 .register = reg,
@@ -506,7 +537,9 @@ pub const TransformerBlock = struct {
             handle_count += 1;
         }
         for (insn.weights, 0..) |_, slot_idx| {
-            if (handle_count >= handle_storage.len or handle_count >= view_storage.len) return error.InvalidInstructionBinding;
+            if (comptime std.debug.runtime_safety) {
+                if (handle_count >= handle_storage.len or handle_count >= view_storage.len) return error.InvalidInstructionBinding;
+            }
             const weight_ptr = try layerProgramWeightHandlePtr(insn, ctx, slot_idx);
             handle_storage[handle_count] = .{
                 .register = runtime_contract.registerFromIndex(@intCast(slot_idx)),
@@ -522,7 +555,6 @@ pub const TransformerBlock = struct {
     }
 
     fn buildLayerProgramRuntimeBindings(
-        plan: *const runtime_contract.ExecutionPlan,
         lw: *const LayerWeights,
         config: ModelConfig,
         weight_handles: *const WeightHandles,
@@ -542,7 +574,7 @@ pub const TransformerBlock = struct {
             bindings.norm_weight_count = 4;
         }
 
-        if (planUsesOpcode(plan, .multihead_attention)) {
+        if (lw.opcode_flags.has_attention) {
             if (lw.isMLA()) {
                 const mla_cfg = lw.mla_config orelse return error.MissingField;
                 bindings.attention = .{
@@ -603,7 +635,7 @@ pub const TransformerBlock = struct {
             }
         }
 
-        if (planUsesOpcode(plan, .shortconv)) {
+        if (lw.opcode_flags.has_shortconv) {
             const shortconv_storage = lw.shortconvStorageKind();
             if (shortconv_storage == .invalid) return error.InvalidTensorType;
             if (shortconv_storage == .missing) return error.MissingField;
@@ -620,7 +652,7 @@ pub const TransformerBlock = struct {
             };
         }
 
-        if (planUsesOpcode(plan, .swiglu) or planUsesOpcode(plan, .moe)) {
+        if (lw.opcode_flags.has_ffn) {
             const ffn_storage = lw.ffnStorageKind();
             switch (ffn_storage) {
                 .moe => {
@@ -645,7 +677,7 @@ pub const TransformerBlock = struct {
             }
         }
 
-        if (planUsesOpcode(plan, .mamba_mixer)) {
+        if (lw.opcode_flags.has_mamba) {
             const conv_weight = lw.mamba_conv_weight orelse return error.MissingField;
             const a_log = lw.mamba_a_log orelse return error.MissingField;
             const d_skip = lw.mamba_d_skip orelse return error.MissingField;
@@ -679,6 +711,31 @@ pub const TransformerBlock = struct {
         }
 
         return bindings;
+    }
+
+    pub fn precomputeLayerRuntimeBindings(
+        allocator: std.mem.Allocator,
+        lw: *LayerWeights,
+        config: ModelConfig,
+        weight_handles: *const WeightHandles,
+    ) !void {
+        if (lw.compiled_plan == null) return;
+        if (lw.precomputed_runtime_bindings != null) return;
+        const bindings_ptr = try allocator.create(LayerProgramRuntimeBindings);
+        errdefer allocator.destroy(bindings_ptr);
+        bindings_ptr.* = try buildLayerProgramRuntimeBindings(lw, config, weight_handles);
+        lw.precomputed_runtime_bindings = @ptrCast(bindings_ptr);
+    }
+
+    pub fn releaseLayerRuntimeBindings(
+        allocator: std.mem.Allocator,
+        lw: *LayerWeights,
+    ) void {
+        if (lw.precomputed_runtime_bindings) |raw| {
+            const bindings_ptr: *LayerProgramRuntimeBindings = @ptrCast(@alignCast(raw));
+            allocator.destroy(bindings_ptr);
+            lw.precomputed_runtime_bindings = null;
+        }
     }
 
     fn residualScale(
@@ -843,9 +900,13 @@ pub const TransformerBlock = struct {
         bindings: *const LayerProgramRuntimeBindings,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
-        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        if (comptime std.debug.runtime_safety) {
+            if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        }
         const weight_handles = try instructionWeightSlice(insn, registers);
-        if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+        if (comptime std.debug.runtime_safety) {
+            if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+        }
         const input = arraySlotFromHandle(io.inputs[0]).*;
         var output: mlx_graph.ArrayHandle = undefined;
         const norm = norm_kernel.RMSNorm{
@@ -869,13 +930,17 @@ pub const TransformerBlock = struct {
         runtime_rope_dim: usize,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
-        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        if (comptime std.debug.runtime_safety) {
+            if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        }
         const input = arraySlotFromHandle(io.inputs[0]).*;
         const weight_handles = try instructionWeightSlice(insn, registers);
         var attention_binding = bindings.attention orelse return error.MissingField;
         switch (attention_binding) {
             .multihead => |*multihead| {
-                if (weight_handles.len != 4) return error.InvalidWeightRefCount;
+                if (comptime std.debug.runtime_safety) {
+                    if (weight_handles.len != 4) return error.InvalidWeightRefCount;
+                }
                 if (multihead.q_proj != null) {
                     multihead.q_proj = quantizedWeightFromHandle(weight_handles[0]).*;
                     multihead.k_proj = quantizedWeightFromHandle(weight_handles[1]).*;
@@ -915,9 +980,13 @@ pub const TransformerBlock = struct {
         shortconv_cache: ?ShortConvCache,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
-        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        if (comptime std.debug.runtime_safety) {
+            if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        }
         const weight_handles = try instructionWeightSlice(insn, registers);
-        if (weight_handles.len != 3) return error.InvalidWeightRefCount;
+        if (comptime std.debug.runtime_safety) {
+            if (weight_handles.len != 3) return error.InvalidWeightRefCount;
+        }
         const input = arraySlotFromHandle(io.inputs[0]).*;
         var shortconv_binding = bindings.shortconv orelse return error.MissingField;
         if (shortconv_binding.in_proj != null) {
@@ -938,13 +1007,17 @@ pub const TransformerBlock = struct {
         bindings: *const LayerProgramRuntimeBindings,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
-        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        if (comptime std.debug.runtime_safety) {
+            if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        }
         const input = arraySlotFromHandle(io.inputs[0]).*;
         const weight_handles = try instructionWeightSlice(insn, registers);
         var ffn_binding = bindings.ffn orelse return error.MissingField;
         switch (ffn_binding) {
             .dense => |*dense| {
-                if (weight_handles.len != 3) return error.InvalidWeightRefCount;
+                if (comptime std.debug.runtime_safety) {
+                    if (weight_handles.len != 3) return error.InvalidWeightRefCount;
+                }
                 if (dense.w1 != null) {
                     dense.w1 = quantizedWeightFromHandle(weight_handles[0]).*;
                     dense.w3 = quantizedWeightFromHandle(weight_handles[1]).*;
@@ -956,7 +1029,9 @@ pub const TransformerBlock = struct {
                 }
             },
             .moe => |*moe| {
-                if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+                if (comptime std.debug.runtime_safety) {
+                    if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+                }
                 _ = moe;
                 _ = arrayWeightFromHandle(weight_handles[0]).*;
             },
@@ -973,9 +1048,13 @@ pub const TransformerBlock = struct {
         mamba_cache: ?MambaCache,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
-        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        if (comptime std.debug.runtime_safety) {
+            if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        }
         const weight_handles = try instructionWeightSlice(insn, registers);
-        if (weight_handles.len != 2) return error.InvalidWeightRefCount;
+        if (comptime std.debug.runtime_safety) {
+            if (weight_handles.len != 2) return error.InvalidWeightRefCount;
+        }
         const input = arraySlotFromHandle(io.inputs[0]).*;
         var mamba_binding = bindings.mamba orelse return error.MissingField;
         if (mamba_binding.in_proj != null) {
@@ -1001,7 +1080,9 @@ pub const TransformerBlock = struct {
         bindings: *const LayerProgramRuntimeBindings,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
-        if (io.inputs.len < 2) return error.InvalidInstructionBinding;
+        if (comptime std.debug.runtime_safety) {
+            if (io.inputs.len < 2) return error.InvalidInstructionBinding;
+        }
         const residual_slot = arraySlotFromHandle(io.inputs[0]);
         const branch = arraySlotFromHandle(io.inputs[1]).*;
         const scale = residualScale(scale_kind, bindings.residual_multiplier);
@@ -1145,26 +1226,17 @@ pub const TransformerBlock = struct {
     fn dispatchLayerProgramInstruction(
         insn: *const runtime_contract.Instruction,
         ctx: *LayerProgramExecutionContext,
+        rt_ctx: *runtime_contract.ExecutionContext,
     ) !void {
         const adapter = layer_program_adapter_table[@intFromEnum(insn.opcode)].?;
-        const active_slots: [1]usize = .{0};
-        const sequence_lengths: [1]u32 = .{0};
-        var rt_ctx = runtime_contract.ExecutionContext{
-            .mode = .decode,
-            .active_slots = active_slots[0..],
-            .sequence_lengths = sequence_lengths[0..],
-            .batch_size = 1,
-            .dispatch_counters = if (enable_dispatch_observability) &layer_program_dispatch_counters else null,
-            .workspace = .{ .any = @ptrCast(ctx) },
-        };
+        rt_ctx.workspace.any = @ptrCast(ctx);
         if (comptime std.debug.runtime_safety) {
-            try runtime_contract.validateExecutionContext(&rt_ctx);
             try runtime_contract.validateBatchCapability(
                 layer_program_adapter_capabilities[@intFromEnum(insn.opcode)],
                 rt_ctx.batch_size,
             );
         }
-        runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
+        if (enable_dispatch_observability) runtime_contract.recordExecutionDispatch(rt_ctx, insn.opcode);
         const built_handles = try buildLayerProgramInstructionHandles(
             insn,
             ctx,
@@ -1173,15 +1245,173 @@ pub const TransformerBlock = struct {
         );
         var state_blocks = try layerProgramStateBlocksForInstruction(insn, ctx);
         var param_storage: [1]runtime_contract.ParamBlock = undefined;
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &ctx.compiled_plan.plan, state_blocks.slice());
+        if (comptime std.debug.runtime_safety) {
+            _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &ctx.compiled_plan.plan, state_blocks.slice());
+        }
         try adapter(
-            &rt_ctx,
+            rt_ctx,
             insn,
             built_handles.registers,
             built_handles.views,
             state_blocks.slice(),
             try instructionParams(insn, ctx.compiled_plan, &param_storage),
         );
+    }
+
+    fn requireBoundStateValue(
+        comptime T: type,
+        ctx: *LayerProgramExecutionContext,
+        state_id: u8,
+    ) !T {
+        const binding = layerProgramStateBinding(ctx, state_id) orelse return error.InvalidStateDescriptorBinding;
+        const raw = runtime_contract.statePointerFromBlock(&binding.handle) orelse return error.InvalidStateDescriptorBinding;
+        const ptr: *const T = @ptrCast(@alignCast(raw));
+        return ptr.*;
+    }
+
+    fn dispatchLayerProgramInstructionFast(
+        insn: *const runtime_contract.Instruction,
+        ctx: *LayerProgramExecutionContext,
+        rt_ctx: *runtime_contract.ExecutionContext,
+    ) !void {
+        if (enable_dispatch_observability) runtime_contract.recordExecutionDispatch(rt_ctx, insn.opcode);
+        if (comptime std.debug.runtime_safety) {
+            var state_blocks = try layerProgramStateBlocksForInstruction(insn, ctx);
+            _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &ctx.compiled_plan.plan, state_blocks.slice());
+            try runtime_contract.validateBatchCapability(
+                layer_program_adapter_capabilities[@intFromEnum(insn.opcode)],
+                rt_ctx.batch_size,
+            );
+        }
+
+        switch (insn.opcode) {
+            .rmsnorm => {
+                if (comptime std.debug.runtime_safety) {
+                    if (insn.inputs.len != 1 or insn.outputs.len != 1 or insn.weights.len != 1) {
+                        return error.InvalidInstructionBinding;
+                    }
+                }
+                const input_slot = try bufferSlotForRegister(insn.inputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const output_slot = try bufferSlotForRegister(insn.outputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const norm_weight_ptr = try layerProgramWeightHandlePtr(insn, ctx, 0);
+                const norm = norm_kernel.RMSNorm{
+                    .weight = @as(*const mlx_graph.ArrayHandle, @ptrCast(@alignCast(norm_weight_ptr))).*,
+                    .eps = ctx.bindings.norm_eps,
+                };
+                var norm_out: mlx_graph.ArrayHandle = undefined;
+                norm.forward(input_slot.*, &norm_out);
+                output_slot.* = norm_out;
+                ctx.norm_index.* += 1;
+            },
+            .multihead_attention => {
+                if (comptime std.debug.runtime_safety) {
+                    if (insn.inputs.len != 1 or insn.outputs.len != 1) {
+                        return error.InvalidInstructionBinding;
+                    }
+                }
+                const input_slot = try bufferSlotForRegister(insn.inputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const output_slot = try bufferSlotForRegister(insn.outputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const attention_binding = ctx.bindings.attention orelse return error.MissingField;
+                const cache = try requireBoundStateValue(
+                    Cache,
+                    ctx,
+                    @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+                );
+                output_slot.* = try runAttentionKernel(
+                    input_slot.*,
+                    attention_binding,
+                    ctx.layer_idx,
+                    cache,
+                    ctx.pos_offset,
+                    ctx.runtime_rope_cos_handle,
+                    ctx.runtime_rope_sin_handle,
+                    ctx.runtime_rope_dim,
+                );
+            },
+            .shortconv => {
+                if (comptime std.debug.runtime_safety) {
+                    if (insn.inputs.len != 1 or insn.outputs.len != 1) {
+                        return error.InvalidInstructionBinding;
+                    }
+                    if (insn.weights.len != 3) return error.InvalidWeightRefCount;
+                }
+                const input_slot = try bufferSlotForRegister(insn.inputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const output_slot = try bufferSlotForRegister(insn.outputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const shortconv_binding = ctx.bindings.shortconv orelse return error.MissingField;
+                const shortconv_cache = try requireBoundStateValue(
+                    ShortConvCache,
+                    ctx,
+                    @intFromEnum(runtime_contract.StateBlockId.shortconv),
+                );
+                output_slot.* = try runShortConvKernel(
+                    input_slot.*,
+                    shortconv_binding,
+                    ctx.layer_idx,
+                    shortconv_cache,
+                );
+            },
+            .swiglu, .moe => {
+                if (comptime std.debug.runtime_safety) {
+                    if (insn.inputs.len != 1 or insn.outputs.len != 1) {
+                        return error.InvalidInstructionBinding;
+                    }
+                    const ffn_binding = ctx.bindings.ffn orelse return error.MissingField;
+                    switch (ffn_binding) {
+                        .dense => if (insn.weights.len != 3) return error.InvalidWeightRefCount,
+                        .moe => if (insn.weights.len != 1) return error.InvalidWeightRefCount,
+                    }
+                }
+                const input_slot = try bufferSlotForRegister(insn.inputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const output_slot = try bufferSlotForRegister(insn.outputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const ffn_binding = ctx.bindings.ffn orelse return error.MissingField;
+                output_slot.* = try runFfnKernel(input_slot.*, ffn_binding);
+            },
+            .mamba_mixer => {
+                if (comptime std.debug.runtime_safety) {
+                    if (insn.inputs.len != 1 or insn.outputs.len != 1) {
+                        return error.InvalidInstructionBinding;
+                    }
+                    if (insn.weights.len != 2) return error.InvalidWeightRefCount;
+                }
+                const input_slot = try bufferSlotForRegister(insn.inputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const output_slot = try bufferSlotForRegister(insn.outputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const mamba_binding = ctx.bindings.mamba orelse return error.MissingField;
+                const mamba_cache = try requireBoundStateValue(
+                    MambaCache,
+                    ctx,
+                    @intFromEnum(runtime_contract.StateBlockId.mamba),
+                );
+                output_slot.* = try runMambaKernel(
+                    input_slot.*,
+                    mamba_binding,
+                    ctx.layer_idx,
+                    mamba_cache,
+                );
+            },
+            .residual_add => {
+                if (comptime std.debug.runtime_safety) {
+                    if (insn.inputs.len < 2) return error.InvalidInstructionBinding;
+                }
+                var param_storage: [1]runtime_contract.ParamBlock = undefined;
+                const params = try instructionParams(insn, ctx.compiled_plan, &param_storage);
+                const p = try runtime_contract.paramAs(runtime_contract.ResidualAddParam, params, .residual_add);
+                const scale_kind: layer_ops.ResidualScale = switch (p.scale_tag) {
+                    0 => .one,
+                    1 => .residual_multiplier,
+                    2 => .{ .literal = @bitCast(p.scale_literal) },
+                    else => return error.InvalidParamBlockABI,
+                };
+                const residual_slot = try bufferSlotForRegister(insn.inputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
+                const branch = (try bufferSlotForRegister(insn.inputs[1], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map)).*;
+                const scale = residualScale(scale_kind, ctx.bindings.residual_multiplier);
+                const scaled_branch = if (scale == 1.0)
+                    branch
+                else
+                    mlx_graph.mlx_lazy_multiply_scalar(branch, scale);
+                residual_slot.* = mlx_graph.mlx_lazy_add(residual_slot.*, scaled_branch);
+            },
+            else => try dispatchLayerProgramInstruction(insn, ctx, rt_ctx),
+        }
     }
 
     fn forwardWithProgram(
@@ -1212,6 +1442,19 @@ pub const TransformerBlock = struct {
         }
         const slot_buffers = lw.slot_scratch[0..required_slot_count];
         var norm_index: usize = 0;
+        const active_slots: [1]usize = .{0};
+        const sequence_lengths: [1]u32 = .{0};
+        var rt_ctx = runtime_contract.ExecutionContext{
+            .mode = .decode,
+            .active_slots = active_slots[0..],
+            .sequence_lengths = sequence_lengths[0..],
+            .batch_size = 1,
+            .dispatch_counters = if (enable_dispatch_observability) &layer_program_dispatch_counters else null,
+            .workspace = .{ .any = null },
+        };
+        if (comptime std.debug.runtime_safety) {
+            try runtime_contract.validateExecutionContext(&rt_ctx);
+        }
         var exec_ctx = LayerProgramExecutionContext{
             .compiled_plan = &compiled_plan,
             .layer_idx = layer_idx,
@@ -1226,12 +1469,19 @@ pub const TransformerBlock = struct {
             .instruction_handles = lw.instruction_handle_scratch,
             .instruction_views = lw.instruction_view_scratch,
             .norm_index = &norm_index,
-            .bindings = try buildLayerProgramRuntimeBindings(&compiled_plan.plan, lw, config, weight_handles),
+            .bindings = if (lw.precomputed_runtime_bindings) |raw| blk: {
+                const bindings_ptr: *const LayerProgramRuntimeBindings = @ptrCast(@alignCast(raw));
+                break :blk bindings_ptr.*;
+            } else try buildLayerProgramRuntimeBindings(lw, config, weight_handles),
+            .resolved_weight_ptrs = lw.weight_ptr_scratch,
         };
+        if (exec_ctx.resolved_weight_ptrs.len != exec_ctx.weight_binding_keys.len) {
+            return error.InvalidWeightRefCount;
+        }
         try bindLayerProgramStateDescriptors(&exec_ctx, &compiled_plan.plan, state_blocks);
 
         for (compiled_plan.plan.instructions) |insn| {
-            try dispatchLayerProgramInstruction(&insn, &exec_ctx);
+            try dispatchLayerProgramInstructionFast(&insn, &exec_ctx, &rt_ctx);
         }
 
         const final_register = runtime_contract.planFinalOutputRegister(&compiled_plan.plan);
@@ -1260,7 +1510,6 @@ pub const TransformerBlock = struct {
             });
             return error.UnsupportedModel;
         }
-        try validateCompiledLayerProgram(lw, layer_idx);
         return forwardWithProgram(
             hidden,
             lw,

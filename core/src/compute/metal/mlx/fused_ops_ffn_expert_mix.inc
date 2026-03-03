@@ -3,6 +3,8 @@
 // ============================================================================
 
 static constexpr size_t kFfnFusedGateUpCacheMaxEntries = 2048;
+static constexpr size_t kFfnFusedDenseRhsCacheMaxEntries = 2048;
+static constexpr size_t kFfnFusedDenseRhsHotSlots = 64;
 
 struct FfnFusedGateUpCacheKey {
     const void* gate_weight = nullptr;
@@ -35,6 +37,186 @@ static inline std::unordered_map<FfnFusedGateUpCacheKey, array, FfnFusedGateUpCa
 
 static inline void ffn_fused_gate_up_cache_clear() {
     ffn_fused_gate_up_cache_store().clear();
+}
+
+struct FfnFusedDenseRhsCacheKey {
+    const void* gate_weight = nullptr;
+    const void* up_weight = nullptr;
+    const void* down_weight = nullptr;
+    int in_features = 0;
+
+    bool operator==(const FfnFusedDenseRhsCacheKey& other) const {
+        return gate_weight == other.gate_weight &&
+               up_weight == other.up_weight &&
+               down_weight == other.down_weight &&
+               in_features == other.in_features;
+    }
+};
+
+struct FfnFusedDenseRhsCacheKeyHash {
+    size_t operator()(const FfnFusedDenseRhsCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.gate_weight);
+        h ^= std::hash<const void*>{}(key.up_weight) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<const void*>{}(key.down_weight) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.in_features) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct FfnFusedDenseRhsCacheValue {
+    array gate_up_wt;
+    array down_wt;
+    int d_ff = 0;
+};
+
+static inline std::unordered_map<FfnFusedDenseRhsCacheKey, FfnFusedDenseRhsCacheValue, FfnFusedDenseRhsCacheKeyHash>& ffn_fused_dense_rhs_cache_store() {
+    static thread_local std::unordered_map<FfnFusedDenseRhsCacheKey, FfnFusedDenseRhsCacheValue, FfnFusedDenseRhsCacheKeyHash> cache;
+    return cache;
+}
+
+struct FfnFusedDenseRhsHotSlot {
+    bool valid = false;
+    FfnFusedDenseRhsCacheKey key;
+    FfnFusedDenseRhsCacheValue value{
+        array(0.0f),
+        array(0.0f),
+        0,
+    };
+};
+
+static inline FfnFusedDenseRhsHotSlot* ffn_fused_dense_rhs_hot_slots_store() {
+    static thread_local FfnFusedDenseRhsHotSlot slots[kFfnFusedDenseRhsHotSlots];
+    return slots;
+}
+
+struct FfnFusedDenseRhsLastHit {
+    bool valid = false;
+    FfnFusedDenseRhsCacheKey key;
+    FfnFusedDenseRhsCacheValue value{
+        array(0.0f),
+        array(0.0f),
+        0,
+    };
+};
+
+static inline FfnFusedDenseRhsLastHit& ffn_fused_dense_rhs_last_hit_store() {
+    static thread_local FfnFusedDenseRhsLastHit last_hit;
+    return last_hit;
+}
+
+static inline void ffn_fused_dense_rhs_cache_clear() {
+    ffn_fused_dense_rhs_cache_store().clear();
+    auto* hot_slots = ffn_fused_dense_rhs_hot_slots_store();
+    for (size_t i = 0; i < kFfnFusedDenseRhsHotSlots; ++i) {
+        hot_slots[i].valid = false;
+    }
+    ffn_fused_dense_rhs_last_hit_store().valid = false;
+}
+
+static inline FfnFusedDenseRhsCacheValue ffn_fused_dense_rhs_uncached(
+    const void* gate_w,
+    const void* up_w,
+    const void* down_w,
+    const array& gate_weight,
+    const array& up_weight,
+    const array& down_weight,
+    int in_features
+) {
+    auto gate_wt = orient_matmul_rhs_cached(gate_w, gate_weight, in_features, std::nullopt, true);
+    const int d_ff = gate_wt.shape(1);
+    auto up_wt = orient_matmul_rhs_cached(up_w, up_weight, in_features, d_ff, true);
+    auto down_wt = orient_matmul_rhs_cached(down_w, down_weight, d_ff, in_features, true);
+    return FfnFusedDenseRhsCacheValue{
+        contiguous(concatenate({gate_wt, up_wt}, 1)),
+        down_wt,
+        d_ff,
+    };
+}
+
+static inline const FfnFusedDenseRhsCacheValue& ffn_fused_dense_rhs_cached(
+    const void* gate_w,
+    const void* up_w,
+    const void* down_w,
+    const array& gate_weight,
+    const array& up_weight,
+    const array& down_weight,
+    int in_features
+) {
+    if (gate_w == nullptr || up_w == nullptr || down_w == nullptr) {
+        static thread_local std::optional<FfnFusedDenseRhsCacheValue> scratch;
+        scratch = ffn_fused_dense_rhs_uncached(
+            gate_w,
+            up_w,
+            down_w,
+            gate_weight,
+            up_weight,
+            down_weight,
+            in_features
+        );
+        return *scratch;
+    }
+
+    FfnFusedDenseRhsCacheKey key{
+        gate_w,
+        up_w,
+        down_w,
+        in_features,
+    };
+    auto* hot_slots = ffn_fused_dense_rhs_hot_slots_store();
+    const size_t hot_index = FfnFusedDenseRhsCacheKeyHash{}(key) & (kFfnFusedDenseRhsHotSlots - 1);
+    auto& hot_slot = hot_slots[hot_index];
+    if (hot_slot.valid && hot_slot.key == key) {
+        return hot_slot.value;
+    }
+
+    auto& last_hit = ffn_fused_dense_rhs_last_hit_store();
+    if (last_hit.valid && last_hit.key == key) {
+        hot_slot.valid = true;
+        hot_slot.key = key;
+        hot_slot.value = last_hit.value;
+        return last_hit.value;
+    }
+
+    auto& cache = ffn_fused_dense_rhs_cache_store();
+    if (cache.size() >= kFfnFusedDenseRhsCacheMaxEntries) {
+        cache.clear();
+        for (size_t i = 0; i < kFfnFusedDenseRhsHotSlots; ++i) {
+            hot_slots[i].valid = false;
+        }
+        last_hit.valid = false;
+    }
+
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        hot_slot.valid = true;
+        hot_slot.key = key;
+        hot_slot.value = it->second;
+        last_hit.valid = true;
+        last_hit.key = key;
+        last_hit.value = it->second;
+        return it->second;
+    }
+
+    FfnFusedDenseRhsCacheValue rhs = ffn_fused_dense_rhs_uncached(
+        gate_w,
+        up_w,
+        down_w,
+        gate_weight,
+        up_weight,
+        down_weight,
+        in_features
+    );
+    // Materialize once so dense decode reuses concrete fused rhs tensors.
+    eval(rhs.gate_up_wt);
+    eval(rhs.down_wt);
+    auto [inserted, _] = cache.emplace(key, std::move(rhs));
+    hot_slot.valid = true;
+    hot_slot.key = key;
+    hot_slot.value = inserted->second;
+    last_hit.valid = true;
+    last_hit.key = key;
+    last_hit.value = inserted->second;
+    return inserted->second;
 }
 
 static inline array ffn_fused_gate_up_rhs_cached(
@@ -83,18 +265,24 @@ void* mlx_lazy_fused_ffn_bf16(
 
     const auto& gate_weight = *static_cast<const array*>(gate_w);
     const auto& up_weight = *static_cast<const array*>(up_w);
-    auto gate_wt = orient_matmul_rhs_cached(gate_w, gate_weight, in_features, std::nullopt, true);
-    const int d_ff = gate_wt.shape(1);
-    auto gate_up_wt = ffn_fused_gate_up_rhs_cached(gate_w, up_w, gate_wt, up_weight, in_features, d_ff);
-    auto down_wt = orient_matmul_rhs_cached(down_w, *static_cast<const array*>(down_w), gate_wt.shape(1), in_features, true);
+    const auto& down_weight = *static_cast<const array*>(down_w);
+    const auto& rhs = ffn_fused_dense_rhs_cached(
+        gate_w,
+        up_w,
+        down_w,
+        gate_weight,
+        up_weight,
+        down_weight,
+        in_features
+    );
 
-    auto gate_up = matmul_lastdim(x, gate_up_wt);
+    auto gate_up = matmul_lastdim(x, rhs.gate_up_wt);
     const int batch_size = x.shape(0);
     const int seq_len = x.shape(1);
-    auto gate = slice(gate_up, {0, 0, 0}, {batch_size, seq_len, d_ff});
-    auto up = slice(gate_up, {0, 0, d_ff}, {batch_size, seq_len, 2 * d_ff});
+    auto gate = slice(gate_up, {0, 0, 0}, {batch_size, seq_len, rhs.d_ff});
+    auto up = slice(gate_up, {0, 0, rhs.d_ff}, {batch_size, seq_len, 2 * rhs.d_ff});
     auto mid = (gate * sigmoid(gate)) * up;
-    auto out = matmul_lastdim(mid, down_wt);
+    auto out = matmul_lastdim(mid, rhs.down_wt);
 
     return pool_array(std::move(out));
 }

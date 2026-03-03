@@ -83,7 +83,13 @@ pub const MetalBackend = struct {
     };
 
     const SlotStateBinding = struct {
+        const OwnedStateBlockBytes: usize = 64;
+        const OwnedStateStorage = struct {
+            bytes: [OwnedStateBlockBytes]u8 align(64) = [_]u8{0} ** OwnedStateBlockBytes,
+        };
+
         handles: [MaxStateDescriptors]runtime_contract.StateBlockHandle = undefined,
+        owned_storage: [MaxStateDescriptors]OwnedStateStorage = [_]OwnedStateStorage{.{}} ** MaxStateDescriptors,
         count: u8 = 0,
         bound: bool = false,
 
@@ -136,6 +142,41 @@ pub const MetalBackend = struct {
         const fixed_capacity_limit: usize = 65_536;
         if (config_max_seq_len > fixed_capacity_limit) return 0;
         return config_max_seq_len;
+    }
+
+    fn primeBoundSlotExecutionGraph(self: *MetalBackend, slot_index: usize) !void {
+        if (self.state_descriptor_count == 0) return;
+        const prime_shapes = [_]usize{ 1, 21 };
+        for (prime_shapes) |prime_seq_len| {
+            const prime_tokens = try self.allocator.alloc(u32, prime_seq_len);
+            defer self.allocator.free(prime_tokens);
+            @memset(prime_tokens, 0);
+            if (prime_seq_len == 1) {
+                // Decode warmup: warm the single-token logits path used by decodeSlot.
+                const prime_logits = try runtime_trait.transformerForwardLazy(
+                    self.allocator,
+                    self.weights,
+                    prime_tokens,
+                    try self.slotStateBlocks(slot_index),
+                    self.config,
+                    0,
+                );
+                defer graph.freeArray(prime_logits);
+                graph.eval(&[_]graph.ArrayHandle{prime_logits});
+            } else {
+                // Prefill warmup: warm the hidden prefill graph used by prefill.
+                const prime_hidden = try runtime_trait.transformerForwardHiddenLazy(
+                    self.allocator,
+                    self.weights,
+                    prime_tokens,
+                    try self.slotStateBlocks(slot_index),
+                    self.config,
+                    0,
+                );
+                defer graph.freeArray(prime_hidden);
+                graph.eval(&[_]graph.ArrayHandle{prime_hidden});
+            }
+        }
     }
 
     fn cacheMaxSeqLen(self: *const MetalBackend) usize {
@@ -218,12 +259,7 @@ pub const MetalBackend = struct {
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
-        slot_cache.deinit();
-        slot_cache.* = runtime_graph_mod.Cache.init(
-            @intCast(self.config.n_layers),
-            true,
-            self.cacheMaxSeqLen(),
-        );
+        slot_cache.reset();
         slot_shortconv_cache.reset();
         slot_mamba_cache.reset();
         slot_position.* = 0;
@@ -233,6 +269,8 @@ pub const MetalBackend = struct {
     fn prefillSlotImpl(self: *MetalBackend, slot_index: usize, tokens: []const u32, logits_out: []f32) !void {
         const sequence_len = tokens.len;
         if (sequence_len == 0) return;
+        const trace_prefill_timing = std.posix.getenv("TALU_METAL_PREFILL_TIMING") != null;
+        const t_start_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
         const slot_state = try self.boundSlotState(slot_index);
         const slot_cache = slot_state.cache;
@@ -243,16 +281,12 @@ pub const MetalBackend = struct {
         slot_rope_delta.* = 0;
 
         // Reset cache for new sequence in this scheduler slot.
-        slot_cache.deinit();
-        slot_cache.* = runtime_graph_mod.Cache.init(
-            @intCast(self.config.n_layers),
-            true,
-            self.cacheMaxSeqLen(),
-        );
+        slot_cache.reset();
         slot_shortconv_cache.reset();
         slot_mamba_cache.reset();
+        const t_reset_done_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
-        const logits_handle = try runtime_trait.transformerForwardLazy(
+        const hidden_handle = try runtime_trait.transformerForwardHiddenLazy(
             self.allocator,
             self.weights,
             tokens,
@@ -260,25 +294,68 @@ pub const MetalBackend = struct {
             self.config,
             0, // pos_offset
         );
+        defer graph.freeArray(hidden_handle);
+        var starts: [3]c_int = .{ 0, @intCast(sequence_len - 1), 0 };
+        var ends: [3]c_int = .{ 1, @intCast(sequence_len), @intCast(self.d_model) };
+        const last_hidden_handle = graph.mlx_lazy_slice(hidden_handle, &starts, &ends, 3);
+        defer graph.freeArray(last_hidden_handle);
+        const logits_handle = metal_executor.block.TransformerBlock.projectLogits(
+            last_hidden_handle,
+            self.weights,
+            self.config.norm_eps,
+        );
+        const t_graph_built_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
         graph.eval(&[_]graph.ArrayHandle{logits_handle});
+        const t_eval_done_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
         var shape_buffer: [8]usize = undefined;
         const rank = graph.getShape(logits_handle, &shape_buffer);
-        std.debug.assert(rank == 3);
-        std.debug.assert(shape_buffer[0] == 1);
-        std.debug.assert(shape_buffer[1] == sequence_len);
-        std.debug.assert(shape_buffer[2] == self.vocab_size);
+        std.debug.assert(rank >= 1);
+        std.debug.assert(shape_buffer[rank - 1] == self.vocab_size);
+        if (rank == 2) std.debug.assert(shape_buffer[0] == 1);
+        if (trace_prefill_timing) {
+            std.debug.print(
+                "METAL_PREFILL_LOGITS_SHAPE rank={} d0={} d1={} d2={}\n",
+                .{
+                    rank,
+                    if (rank > 0) shape_buffer[0] else 0,
+                    if (rank > 1) shape_buffer[1] else 0,
+                    if (rank > 2) shape_buffer[2] else 0,
+                },
+            );
+        }
+        graph.copyToHost(logits_handle, logits_out[0..self.vocab_size]);
+        const t_copy_done_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
-        const logits_values = try self.allocator.alloc(f32, sequence_len * self.vocab_size);
-        defer self.allocator.free(logits_values);
-        graph.copyToHost(logits_handle, logits_values);
-
-        const last_token_offset = (sequence_len - 1) * self.vocab_size;
-        @memcpy(logits_out, logits_values[last_token_offset .. last_token_offset + self.vocab_size]);
         graph.freeArray(logits_handle);
+        const t_end_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
         slot_position.* = sequence_len;
+
+        if (trace_prefill_timing) {
+            const reset_ns = t_reset_done_ns - t_start_ns;
+            const graph_build_ns = t_graph_built_ns - t_reset_done_ns;
+            const build_ns = t_graph_built_ns - t_start_ns;
+            const eval_ns = t_eval_done_ns - t_graph_built_ns;
+            const copy_ns = t_copy_done_ns - t_eval_done_ns;
+            const finalize_ns = t_end_ns - t_copy_done_ns;
+            const total_ns = t_end_ns - t_start_ns;
+            std.debug.print(
+                "METAL_PREFILL_TIMING slot={} seq={} reset_us={d:.3} graph_us={d:.3} build_us={d:.3} eval_us={d:.3} copy_us={d:.3} finalize_us={d:.3} total_us={d:.3}\n",
+                .{
+                    slot_index,
+                    sequence_len,
+                    @as(f64, @floatFromInt(reset_ns)) / 1000.0,
+                    @as(f64, @floatFromInt(graph_build_ns)) / 1000.0,
+                    @as(f64, @floatFromInt(build_ns)) / 1000.0,
+                    @as(f64, @floatFromInt(eval_ns)) / 1000.0,
+                    @as(f64, @floatFromInt(copy_ns)) / 1000.0,
+                    @as(f64, @floatFromInt(finalize_ns)) / 1000.0,
+                    @as(f64, @floatFromInt(total_ns)) / 1000.0,
+                },
+            );
+        }
     }
 
     fn decodeSlot(
@@ -328,6 +405,22 @@ pub const MetalBackend = struct {
         // Load weights to GPU
         const weight_handles = try weights_trait.loadWeightsToGPU(allocator, loaded);
         errdefer weights_trait.freeWeights(allocator, weight_handles);
+        errdefer for (weight_handles.layers) |*layer| {
+            metal_executor.block.TransformerBlock.releaseLayerRuntimeBindings(allocator, layer);
+        };
+
+        // Validate compiled layer plans once at backend init so forward path
+        // stays focused on hot execution.
+        for (weight_handles.layers, 0..) |*layer, layer_idx| {
+            if (layer.compiled_plan == null) continue;
+            try metal_executor.block.TransformerBlock.validateCompiledLayerProgram(layer, layer_idx);
+            try metal_executor.block.TransformerBlock.precomputeLayerRuntimeBindings(
+                allocator,
+                layer,
+                loaded.config,
+                weight_handles,
+            );
+        }
 
         // Initialize slot 0 cache (single-sequence compatibility path).
         const layer_count: usize = @intCast(loaded.config.n_layers);
@@ -379,8 +472,7 @@ pub const MetalBackend = struct {
 
         const slot_logits_buffer = try allocator.alloc(f32, max_batch_size * @as(usize, @intCast(loaded.config.vocab_size)));
         errdefer allocator.free(slot_logits_buffer);
-
-        return MetalBackend{
+        var backend = MetalBackend{
             .allocator = allocator,
             .config = loaded.config,
             .weights = weight_handles,
@@ -399,6 +491,27 @@ pub const MetalBackend = struct {
             .state_descriptor_count = state_descriptor_count,
             .current_position = 0,
         };
+        errdefer backend.deinit();
+        if (state_descriptor_count > 0) {
+            const InitPayloadSlot = struct {
+                payload: runtime_contract.StatePointerPayload align(64) = .{ .ptr = null },
+            };
+            var init_payloads: [MaxStateDescriptors]InitPayloadSlot = [_]InitPayloadSlot{.{}} ** MaxStateDescriptors;
+            var init_state_blocks: [MaxStateDescriptors]runtime_contract.StateBlockHandle = undefined;
+            for (backend.stateDescriptors(), 0..) |descriptor, idx| {
+                init_state_blocks[idx] = .{
+                    .id = descriptor.id,
+                    .ptr = @ptrCast(&init_payloads[idx].payload),
+                    .size = @intCast(@sizeOf(runtime_contract.StatePointerPayload)),
+                    .align_bytes = 64,
+                };
+            }
+            try backend.bindSlotStateBlocks(0, init_state_blocks[0..state_descriptor_count]);
+            try backend.primeBoundSlotExecutionGraph(0);
+            try backend.resetSlotState(0);
+        }
+
+        return backend;
     }
 
     pub fn deinit(self: *MetalBackend) void {
@@ -413,6 +526,9 @@ pub const MetalBackend = struct {
         self.cache.deinit();
         self.shortconv_cache.deinit();
         self.mamba_cache.deinit();
+        for (self.weights.layers) |*layer| {
+            metal_executor.block.TransformerBlock.releaseLayerRuntimeBindings(self.allocator, layer);
+        }
         weights_trait.freeWeights(self.allocator, self.weights);
         self.* = undefined;
     }
@@ -554,10 +670,12 @@ pub const MetalBackend = struct {
         if (self.state_descriptor_count == 0) return;
         const binding = try self.slotStateBinding(slot_index);
         if (!binding.bound) return error.InvalidStateDescriptorBinding;
-        try runtime_contract.validateStateBlocksForDescriptors(
-            self.stateDescriptors(),
-            try self.slotStateBlocks(slot_index),
-        );
+        if (comptime std.debug.runtime_safety) {
+            try runtime_contract.validateStateBlocksForDescriptors(
+                self.stateDescriptors(),
+                try self.slotStateBlocks(slot_index),
+            );
+        }
     }
 
     pub fn bindSlotStateBlocks(
@@ -587,12 +705,30 @@ pub const MetalBackend = struct {
             if (state_ptr) |ptr| {
                 try runtime_contract.writeStatePointerToBlock(incoming, ptr);
             }
-            binding.handles[idx] = .{
-                .id = descriptor.id,
-                .ptr = incoming.ptr,
-                .size = incoming.size,
-                .align_bytes = incoming.align_bytes,
-            };
+            const use_owned_storage =
+                descriptor.size_bytes <= SlotStateBinding.OwnedStateBlockBytes and descriptor.align_bytes <= 64;
+            if (use_owned_storage) {
+                const target_size: usize = @intCast(descriptor.size_bytes);
+                if (target_size == 0 or target_size > SlotStateBinding.OwnedStateBlockBytes) {
+                    return error.InvalidStateDescriptorBinding;
+                }
+                const src: [*]const u8 = @ptrCast(incoming.ptr);
+                const dst = binding.owned_storage[idx].bytes[0..target_size];
+                @memcpy(dst, src[0..target_size]);
+                binding.handles[idx] = .{
+                    .id = descriptor.id,
+                    .ptr = @ptrCast(&binding.owned_storage[idx].bytes),
+                    .size = @intCast(target_size),
+                    .align_bytes = 64,
+                };
+            } else {
+                binding.handles[idx] = .{
+                    .id = descriptor.id,
+                    .ptr = incoming.ptr,
+                    .size = incoming.size,
+                    .align_bytes = incoming.align_bytes,
+                };
+            }
         }
         binding.count = @intCast(state_blocks.len);
         binding.bound = true;
@@ -726,16 +862,11 @@ pub const MetalBackend = struct {
         }
 
         // Reset selected slot cache for new sequence.
-        slot_cache.deinit();
-        slot_cache.* = runtime_graph_mod.Cache.init(
-            @intCast(self.config.n_layers),
-            true,
-            self.cacheMaxSeqLen(),
-        );
+        slot_cache.reset();
         slot_shortconv_cache.reset();
         slot_mamba_cache.reset();
 
-        const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
+        const hidden_handle = try runtime_trait.transformerForwardHiddenLazyWithEmbeddingOverride(
             self.allocator,
             self.weights,
             tokens,
@@ -746,23 +877,25 @@ pub const MetalBackend = struct {
             deepstack_ctx,
             runtime_rope_ctx,
         );
+        defer graph.freeArray(hidden_handle);
+        var starts: [3]c_int = .{ 0, @intCast(sequence_len - 1), 0 };
+        var ends: [3]c_int = .{ 1, @intCast(sequence_len), @intCast(self.d_model) };
+        const last_hidden_handle = graph.mlx_lazy_slice(hidden_handle, &starts, &ends, 3);
+        defer graph.freeArray(last_hidden_handle);
+        const logits_handle = metal_executor.block.TransformerBlock.projectLogits(
+            last_hidden_handle,
+            self.weights,
+            self.config.norm_eps,
+        );
         defer graph.freeArray(logits_handle);
-
         graph.eval(&[_]graph.ArrayHandle{logits_handle});
 
         var shape_buffer: [8]usize = undefined;
         const rank = graph.getShape(logits_handle, &shape_buffer);
-        std.debug.assert(rank == 3);
-        std.debug.assert(shape_buffer[0] == 1);
-        std.debug.assert(shape_buffer[1] == sequence_len);
-        std.debug.assert(shape_buffer[2] == self.vocab_size);
-
-        const all_logits = try self.allocator.alloc(f32, sequence_len * self.vocab_size);
-        defer self.allocator.free(all_logits);
-        graph.copyToHost(logits_handle, all_logits);
-
-        const last_token_offset = (sequence_len - 1) * self.vocab_size;
-        @memcpy(logits_out, all_logits[last_token_offset .. last_token_offset + self.vocab_size]);
+        std.debug.assert(rank >= 1);
+        std.debug.assert(shape_buffer[rank - 1] == self.vocab_size);
+        if (rank == 2) std.debug.assert(shape_buffer[0] == 1);
+        graph.copyToHost(logits_handle, logits_out[0..self.vocab_size]);
 
         slot_position.* = sequence_len;
     }

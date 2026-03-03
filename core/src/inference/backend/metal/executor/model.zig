@@ -254,6 +254,7 @@ pub const Model = struct {
         }
 
         const trace = std.posix.getenv("TALU_TRACE_METAL_UNSAFE") != null;
+        const trace_layer_timing = std.posix.getenv("TALU_METAL_LAYER_TIMING") != null;
         const phase: []const u8 = if (input_ids.len == 1) "decode" else "prefill";
 
         const layer_count: usize = @intCast(config.n_layers);
@@ -295,6 +296,7 @@ pub const Model = struct {
         }
 
         for (0..layer_count) |layer_idx| {
+            const layer_start_ns: i128 = if (trace_layer_timing) std.time.nanoTimestamp() else 0;
             hidden = try block_executor.TransformerBlock.forward(
                 hidden,
                 &weight_handles.layers[layer_idx],
@@ -307,6 +309,18 @@ pub const Model = struct {
                 runtime_rope_sin_handle,
                 runtime_rope_dim,
             );
+            if (trace_layer_timing) {
+                const layer_end_ns: i128 = std.time.nanoTimestamp();
+                std.debug.print(
+                    "METAL_LAYER_TIMING phase={s} layer={} kind={s} build_us={d:.3}\n",
+                    .{
+                        phase,
+                        layer_idx,
+                        @tagName(weight_handles.layers[layer_idx].kind),
+                        @as(f64, @floatFromInt(layer_end_ns - layer_start_ns)) / 1000.0,
+                    },
+                );
+            }
             // Deepstack: per-request feature addition between block-level adapter
             // dispatches. Operates outside the per-instruction adapter table — same
             // pattern as embedding lookup and final logit projection.

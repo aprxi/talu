@@ -268,6 +268,89 @@ fn tensorViewDescForMetalArray() runtime_contract.TensorViewDesc {
     };
 }
 
+fn layerProgramStaticWeightPtr(
+    layer: *WeightHandles.LayerWeights,
+    key: WeightHandles.LayerProgramWeightBindingKey,
+) ?*anyopaque {
+    return switch (key) {
+        .invalid, .norm_weight, .mla_weights => null,
+        .attention_q_proj => if (layer.q_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.q_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .attention_k_proj => if (layer.k_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.k_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .attention_v_proj => if (layer.v_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.v_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .attention_o_proj => if (layer.o_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.o_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .swiglu_w1 => if (layer.w1) |*weight|
+            @ptrCast(weight)
+        else if (layer.w1_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .swiglu_w3 => if (layer.w3) |*weight|
+            @ptrCast(weight)
+        else if (layer.w3_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .swiglu_w2 => if (layer.w2) |*weight|
+            @ptrCast(weight)
+        else if (layer.w2_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .moe_router => if (layer.moe) |moe|
+            @ptrCast(@constCast(&moe.router_w))
+        else
+            null,
+        .mamba_in_proj => if (layer.mamba_in_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.mamba_in_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .mamba_out_proj => if (layer.mamba_out_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.mamba_out_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .shortconv_in_proj => if (layer.shortconv_in_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.shortconv_in_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .shortconv_conv_weight => if (layer.shortconv_conv_weight) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .shortconv_out_proj => if (layer.shortconv_out_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.shortconv_out_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+    };
+}
+
 fn compileLayerProgramContract(
     allocator: std.mem.Allocator,
     layer: *WeightHandles.LayerWeights,
@@ -277,6 +360,9 @@ fn compileLayerProgramContract(
     layer.compiled_plan = null;
     layer.register_to_slot_map = &.{};
     layer.weight_binding_keys = &.{};
+    layer.weight_ptr_scratch = &.{};
+    layer.precomputed_runtime_bindings = null;
+    layer.opcode_flags = .{};
     layer.slot_scratch = &.{};
     layer.instruction_handle_scratch = &.{};
     layer.instruction_view_scratch = &.{};
@@ -293,6 +379,16 @@ fn compileLayerProgramContract(
         allocator.free(layer.weight_binding_keys);
         layer.weight_binding_keys = &.{};
     };
+    if (layer.weight_binding_keys.len > 0) {
+        layer.weight_ptr_scratch = try allocator.alloc(?*anyopaque, layer.weight_binding_keys.len);
+        errdefer if (layer.weight_ptr_scratch.len > 0) {
+            allocator.free(layer.weight_ptr_scratch);
+            layer.weight_ptr_scratch = &.{};
+        };
+        for (layer.weight_binding_keys, 0..) |key, idx| {
+            layer.weight_ptr_scratch[idx] = layerProgramStaticWeightPtr(layer, key);
+        }
+    }
     const register_map = try buildMetalLayerProgramRegisterSlotMap(
         allocator,
         &layer.compiled_plan.?,
@@ -339,6 +435,16 @@ fn compileLayerProgramContract(
             allocator.free(layer.instruction_view_scratch);
             layer.instruction_handle_scratch = &.{};
             layer.instruction_view_scratch = &.{};
+        }
+    }
+
+    for (layer.compiled_plan.?.plan.instructions) |insn| {
+        switch (insn.opcode) {
+            .multihead_attention => layer.opcode_flags.has_attention = true,
+            .shortconv => layer.opcode_flags.has_shortconv = true,
+            .swiglu, .moe => layer.opcode_flags.has_ffn = true,
+            .mamba_mixer => layer.opcode_flags.has_mamba = true,
+            else => {},
         }
     }
 }
@@ -1096,6 +1202,7 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
         }
         if (layer.register_to_slot_map.len > 0) allocator.free(layer.register_to_slot_map);
         if (layer.weight_binding_keys.len > 0) allocator.free(layer.weight_binding_keys);
+        if (layer.weight_ptr_scratch.len > 0) allocator.free(layer.weight_ptr_scratch);
         if (layer.slot_scratch.len > 0) allocator.free(layer.slot_scratch);
         if (layer.instruction_handle_scratch.len > 0) allocator.free(layer.instruction_handle_scratch);
         if (layer.instruction_view_scratch.len > 0) allocator.free(layer.instruction_view_scratch);
@@ -1339,6 +1446,13 @@ pub const WeightHandles = struct {
 
     pub const LayerWeights = struct {
         pub const invalid_slot: u8 = std.math.maxInt(u8);
+        pub const LayerProgramOpcodeFlags = packed struct(u8) {
+            has_attention: bool = false,
+            has_shortconv: bool = false,
+            has_ffn: bool = false,
+            has_mamba: bool = false,
+            _reserved: u4 = 0,
+        };
 
         pub const LayerKind = topology.BlockKind;
         pub const AttentionStorageKind = enum {
@@ -1379,6 +1493,11 @@ pub const WeightHandles = struct {
         register_to_slot_map: []const u8 = &.{},
         /// Precomputed compiled-plan weight binding keys (indexed by WeightRef.index).
         weight_binding_keys: []const LayerProgramWeightBindingKey = &.{},
+        /// Pre-allocated per-layer resolved weight pointer scratch.
+        weight_ptr_scratch: []?*anyopaque = &.{},
+        /// Optional block-runtime binding cache owned by executor lifecycle.
+        precomputed_runtime_bindings: ?*anyopaque = null,
+        opcode_flags: LayerProgramOpcodeFlags = .{},
         /// Pre-allocated scratch for slot buffer handles during execution.
         slot_scratch: []mlx_graph.ArrayHandle = &.{},
         /// Pre-allocated per-instruction tensor handle scratch.
