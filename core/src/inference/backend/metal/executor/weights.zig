@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const LoadedModel = models.LoadedModel;
 
 const ArrayHandle = mlx_graph.ArrayHandle;
+pub const missing_array_weight: ArrayHandle = std.mem.zeroes(ArrayHandle);
 
 pub const MLXError = error{
     UnsupportedDType,
@@ -207,11 +208,6 @@ fn compileLayerProgramContract(
     layer.instruction_view_scratch = &.{};
     layer.instruction_weight_offsets = &.{};
     layer.instruction_weight_ptrs = &.{};
-    layer.instruction_attention_templates = &.{};
-    layer.instruction_shortconv_templates = &.{};
-    layer.instruction_mamba_templates = &.{};
-    layer.instruction_swiglu_templates = &.{};
-    layer.instruction_moe_templates = &.{};
     const entry = static_entry orelse return error.NotImplemented;
     const program = models_registry.blockProgramFor(entry, block_kind) orelse return error.NotImplemented;
 
@@ -319,6 +315,13 @@ fn resolveLayerInstructionWeightPtrForSlot(
                     @ptrCast(weight)
                 else
                     error.MissingWeight,
+                4 => if (layer.q_norm) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
+                5 => if (layer.k_norm) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
+                6 => if (layer.q_bias) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
+                7 => if (layer.k_bias) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
+                8 => if (layer.v_bias) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
+                9 => if (layer.o_bias) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
+                10 => if (layer.attn_sinks) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
                 else => error.InvalidWeightRefCount,
             };
         },
@@ -340,6 +343,10 @@ fn resolveLayerInstructionWeightPtrForSlot(
                     @ptrCast(weight)
                 else
                     error.MissingWeight,
+                3 => if (layer.shortconv_conv_bias) |*weight|
+                    @ptrCast(weight)
+                else
+                    @ptrCast(@constCast(&missing_array_weight)),
                 else => error.InvalidWeightRefCount,
             };
         },
@@ -367,11 +374,39 @@ fn resolveLayerInstructionWeightPtrForSlot(
             };
         },
         .moe => {
-            const moe_ptr = layer.moe_runtime_template orelse return error.MissingWeight;
+            const moe_template = layer.moe_runtime_template orelse return error.InvalidInstructionBinding;
             return switch (slot_idx) {
-                0 => @ptrCast(@constCast(&moe_ptr.router_w)),
-                1 => @ptrCast(@constCast(&moe_ptr.up_w)),
-                2 => @ptrCast(@constCast(&moe_ptr.down_w)),
+                0 => @ptrCast(@constCast(&moe_template.router_w)),
+                1 => @ptrCast(@constCast(&moe_template.gate_w)),
+                2 => @ptrCast(@constCast(&moe_template.up_w)),
+                3 => @ptrCast(@constCast(&moe_template.down_w)),
+                4 => if (moe_template.router_bias) |*router_bias|
+                    @ptrCast(router_bias)
+                else
+                    @ptrCast(@constCast(&missing_array_weight)),
+                5 => @ptrCast(@constCast(&moe_template.gate_s)),
+                6 => @ptrCast(@constCast(&moe_template.up_s)),
+                7 => @ptrCast(@constCast(&moe_template.down_s)),
+                8 => if (moe_template.gate_bias) |*gate_bias|
+                    @ptrCast(gate_bias)
+                else
+                    @ptrCast(@constCast(&missing_array_weight)),
+                9 => if (moe_template.up_bias) |*up_bias|
+                    @ptrCast(up_bias)
+                else
+                    @ptrCast(@constCast(&missing_array_weight)),
+                10 => if (moe_template.down_bias) |*down_bias|
+                    @ptrCast(down_bias)
+                else
+                    @ptrCast(@constCast(&missing_array_weight)),
+                11 => if (moe_template.router_s) |*router_s|
+                    @ptrCast(router_s)
+                else
+                    @ptrCast(@constCast(&missing_array_weight)),
+                12 => if (moe_template.router_b) |*router_b|
+                    @ptrCast(router_b)
+                else
+                    @ptrCast(@constCast(&missing_array_weight)),
                 else => error.InvalidWeightRefCount,
             };
         },
@@ -401,6 +436,23 @@ fn resolveLayerInstructionWeightPtrForSlot(
                     @ptrCast(weight)
                 else
                     error.MissingWeight,
+                5 => if (layer.mamba_conv_bias) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
+                6 => if (layer.mamba_dt_bias) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
+                7 => if (layer.mamba_norm_weight) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
+                8 => @ptrCast(@constCast(&layer.ln1_weight.?)),
+                9 => if (layer.ln2_weight) |*weight| @ptrCast(weight) else @ptrCast(@constCast(&missing_array_weight)),
+                10 => if (layer.mamba_gate_up) |*weight|
+                    @ptrCast(weight)
+                else if (layer.mamba_gate_up_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    @ptrCast(@constCast(&missing_array_weight)),
+                11 => if (layer.mamba_down_proj) |*weight|
+                    @ptrCast(weight)
+                else if (layer.mamba_down_proj_bf16) |*weight|
+                    @ptrCast(weight)
+                else
+                    @ptrCast(@constCast(&missing_array_weight)),
                 else => error.InvalidWeightRefCount,
             };
         },
@@ -508,111 +560,84 @@ fn buildLayerInstructionRuntimeTemplates(
     const insn_len = compiled.plan.instructions.len;
     if (insn_len == 0) return;
 
-    const attention_templates = try allocator.alloc(?WeightHandles.LayerWeights.AttentionRuntimeTemplate, insn_len);
-    errdefer allocator.free(attention_templates);
-    const shortconv_templates = try allocator.alloc(?WeightHandles.LayerWeights.ShortConvRuntimeTemplate, insn_len);
-    errdefer allocator.free(shortconv_templates);
-    const mamba_templates = try allocator.alloc(?WeightHandles.LayerWeights.MambaRuntimeTemplate, insn_len);
-    errdefer allocator.free(mamba_templates);
-    const swiglu_templates = try allocator.alloc(?WeightHandles.LayerWeights.SwiGluRuntimeTemplate, insn_len);
-    errdefer allocator.free(swiglu_templates);
-    const moe_templates = try allocator.alloc(?WeightHandles.LayerWeights.MoeRuntimeTemplate, insn_len);
-    errdefer allocator.free(moe_templates);
-    @memset(attention_templates, null);
-    @memset(shortconv_templates, null);
-    @memset(mamba_templates, null);
-    @memset(swiglu_templates, null);
-    @memset(moe_templates, null);
+    const attention_storage_kinds = try allocator.alloc(WeightHandles.LayerWeights.AttentionStorageKind, insn_len);
+    errdefer allocator.free(attention_storage_kinds);
+    @memset(attention_storage_kinds, .missing);
+    const shortconv_storage_kinds = try allocator.alloc(WeightHandles.LayerWeights.ShortConvStorageKind, insn_len);
+    errdefer allocator.free(shortconv_storage_kinds);
+    @memset(shortconv_storage_kinds, .missing);
+    const ffn_storage_kinds = try allocator.alloc(WeightHandles.LayerWeights.FfnStorageKind, insn_len);
+    errdefer allocator.free(ffn_storage_kinds);
+    @memset(ffn_storage_kinds, .missing);
+    const mamba_storage_kinds = try allocator.alloc(WeightHandles.LayerWeights.MambaStorageKind, insn_len);
+    errdefer allocator.free(mamba_storage_kinds);
+    @memset(mamba_storage_kinds, .missing);
+    const attention_uses_mla = try allocator.alloc(bool, insn_len);
+    errdefer allocator.free(attention_uses_mla);
+    @memset(attention_uses_mla, false);
+    const mamba_has_ffn = try allocator.alloc(bool, insn_len);
+    errdefer allocator.free(mamba_has_ffn);
+    @memset(mamba_has_ffn, false);
+    const mamba_gate_up_layouts = try allocator.alloc(u8, insn_len);
+    errdefer allocator.free(mamba_gate_up_layouts);
+    @memset(mamba_gate_up_layouts, 0);
 
     for (compiled.plan.instructions, 0..) |insn, op_index| {
         switch (insn.opcode) {
-            .multihead_attention => {
-                if (layer.isMLA()) {
-                    const storage_kind = layer.mlaStorageKind();
-                    if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
-                    const mla_cfg = layer.mla_config orelse return error.MissingField;
-                    attention_templates[op_index] = .{ .mla = .{
-                        .storage_kind = storage_kind,
-                        .config = mla_cfg,
-                        .q_a_proj = layer.mla_q_a_proj,
-                        .q_b_proj = layer.mla_q_b_proj,
-                        .kv_a_proj = layer.mla_kv_a_proj,
-                        .kv_b_proj = layer.mla_kv_b_proj,
-                        .q_a_proj_bf16 = layer.mla_q_a_proj_bf16,
-                        .q_b_proj_bf16 = layer.mla_q_b_proj_bf16,
-                        .kv_a_proj_bf16 = layer.mla_kv_a_proj_bf16,
-                        .kv_b_proj_bf16 = layer.mla_kv_b_proj_bf16,
-                        .q_a_norm = layer.mla_q_a_norm,
-                        .kv_a_norm = layer.mla_kv_a_norm,
-                    } };
-                } else {
-                    const storage_kind = layer.attentionStorageKind();
-                    if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
-                    attention_templates[op_index] = .{ .mha = .{
-                        .storage_kind = storage_kind,
-                        .q_norm = layer.q_norm,
-                        .k_norm = layer.k_norm,
-                        .q_bias = layer.q_bias,
-                        .k_bias = layer.k_bias,
-                        .v_bias = layer.v_bias,
-                        .o_bias = layer.o_bias,
-                        .attn_sinks = layer.attn_sinks,
-                    } };
-                }
+            .mamba_mixer => {
+                const storage_kind = layer.mambaStorageKind();
+                mamba_storage_kinds[op_index] = storage_kind;
+                if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
+                const quantized_ffn_complete = layer.mamba_gate_up != null and
+                    layer.mamba_down_proj != null and
+                    layer.mamba_gate_up_bf16 == null and
+                    layer.mamba_down_proj_bf16 == null and
+                    layer.ln2_weight != null;
+                const dense_ffn_complete = layer.mamba_gate_up == null and
+                    layer.mamba_down_proj == null and
+                    layer.mamba_gate_up_bf16 != null and
+                    layer.mamba_down_proj_bf16 != null and
+                    layer.ln2_weight != null;
+                mamba_has_ffn[op_index] = quantized_ffn_complete or dense_ffn_complete;
+                mamba_gate_up_layouts[op_index] = @intFromEnum(layer.mamba_gate_up_layout);
+            },
+            .multihead_attention => if (layer.isMLA()) {
+                const storage_kind = layer.mlaStorageKind();
+                if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
+                _ = layer.mla_config orelse return error.MissingField;
+                attention_uses_mla[op_index] = true;
+                attention_storage_kinds[op_index] = switch (storage_kind) {
+                    .quantized => .quantized,
+                    .dense => .dense,
+                    else => .invalid,
+                };
+            } else {
+                const storage_kind = layer.attentionStorageKind();
+                attention_storage_kinds[op_index] = storage_kind;
+                if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
             },
             .shortconv => {
                 const storage_kind = layer.shortconvStorageKind();
+                shortconv_storage_kinds[op_index] = storage_kind;
                 if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
-                shortconv_templates[op_index] = .{
-                    .storage_kind = storage_kind,
-                    .conv_bias = layer.shortconv_conv_bias,
-                    .d_conv = layer.shortconv_d_conv,
-                    .conv_dim = layer.shortconv_conv_dim,
-                };
-            },
-            .mamba_mixer => {
-                const storage_kind = layer.mambaStorageKind();
-                if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
-                mamba_templates[op_index] = .{
-                    .storage_kind = storage_kind,
-                    .d_state = layer.mamba_d_state,
-                    .d_conv = layer.mamba_d_conv,
-                    .n_heads = layer.mamba_n_heads,
-                    .d_head = layer.mamba_d_head,
-                    .n_groups = layer.mamba_n_groups,
-                    .gate_up_layout = @intFromEnum(layer.mamba_gate_up_layout),
-                    .ln1_weight = layer.getLn1(),
-                    .conv_weight = layer.mamba_conv_weight orelse return error.MissingField,
-                    .conv_bias = layer.mamba_conv_bias,
-                    .a_log = layer.mamba_a_log orelse return error.MissingField,
-                    .d_skip = layer.mamba_d_skip orelse return error.MissingField,
-                    .dt_bias = layer.mamba_dt_bias,
-                    .norm_weight = layer.mamba_norm_weight,
-                    .ln2_weight = layer.getLn2(),
-                    .gate_up = layer.mamba_gate_up,
-                    .gate_up_bf16 = layer.mamba_gate_up_bf16,
-                    .down_proj = layer.mamba_down_proj,
-                    .down_proj_bf16 = layer.mamba_down_proj_bf16,
-                };
             },
             .swiglu => {
                 const storage_kind = layer.ffnStorageKind();
+                ffn_storage_kinds[op_index] = storage_kind;
                 if (storage_kind != .quantized and storage_kind != .dense) return error.InvalidInstructionBinding;
-                swiglu_templates[op_index] = .{ .storage_kind = storage_kind };
             },
-            .moe => {
-                const moe_ptr = layer.moe_runtime_template orelse return error.MissingField;
-                moe_templates[op_index] = .{ .template_ptr = moe_ptr };
-            },
+            .moe => {},
             else => {},
         }
     }
 
-    layer.instruction_attention_templates = attention_templates;
-    layer.instruction_shortconv_templates = shortconv_templates;
-    layer.instruction_mamba_templates = mamba_templates;
-    layer.instruction_swiglu_templates = swiglu_templates;
-    layer.instruction_moe_templates = moe_templates;
+    layer.instruction_attention_storage_kinds = attention_storage_kinds;
+    layer.instruction_shortconv_storage_kinds = shortconv_storage_kinds;
+    layer.instruction_ffn_storage_kinds = ffn_storage_kinds;
+    layer.instruction_mamba_storage_kinds = mamba_storage_kinds;
+    layer.instruction_attention_uses_mla = attention_uses_mla;
+    layer.instruction_mamba_has_ffn = mamba_has_ffn;
+    layer.instruction_mamba_gate_up_layouts = mamba_gate_up_layouts;
 }
 
 /// Load model weights as MLX array handles on GPU.
@@ -929,6 +954,10 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
                 // Initialize MoE runtime template to null (loaded separately for MoE models).
                 weight_handles.layers[layer_idx].moe_runtime_template = null;
+                weight_handles.layers[layer_idx].moe_router_group_size = 0;
+                weight_handles.layers[layer_idx].moe_expert_group_size = 0;
+                weight_handles.layers[layer_idx].moe_num_experts = 0;
+                weight_handles.layers[layer_idx].moe_experts_per_token = 0;
             },
             .mamba => |mamba_block| {
                 weight_handles.layers[layer_idx].kind = .mamba;
@@ -1068,6 +1097,10 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 }
 
                 weight_handles.layers[layer_idx].moe_runtime_template = null;
+                weight_handles.layers[layer_idx].moe_router_group_size = 0;
+                weight_handles.layers[layer_idx].moe_expert_group_size = 0;
+                weight_handles.layers[layer_idx].moe_num_experts = 0;
+                weight_handles.layers[layer_idx].moe_experts_per_token = 0;
             },
         }
     }
@@ -1271,6 +1304,10 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
             }
 
             weight_handles.layers[layer_idx].moe_runtime_template = moe_weights;
+            weight_handles.layers[layer_idx].moe_router_group_size = moe_weights.router_group_size;
+            weight_handles.layers[layer_idx].moe_expert_group_size = moe_weights.expert_group_size;
+            weight_handles.layers[layer_idx].moe_num_experts = moe_weights.num_experts;
+            weight_handles.layers[layer_idx].moe_experts_per_token = moe_weights.experts_per_token;
         }
     }
 
@@ -1377,11 +1414,13 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
         if (layer.instruction_view_scratch.len > 0) allocator.free(layer.instruction_view_scratch);
         if (layer.instruction_weight_offsets.len > 0) allocator.free(layer.instruction_weight_offsets);
         if (layer.instruction_weight_ptrs.len > 0) allocator.free(layer.instruction_weight_ptrs);
-        if (layer.instruction_attention_templates.len > 0) allocator.free(layer.instruction_attention_templates);
-        if (layer.instruction_shortconv_templates.len > 0) allocator.free(layer.instruction_shortconv_templates);
-        if (layer.instruction_mamba_templates.len > 0) allocator.free(layer.instruction_mamba_templates);
-        if (layer.instruction_swiglu_templates.len > 0) allocator.free(layer.instruction_swiglu_templates);
-        if (layer.instruction_moe_templates.len > 0) allocator.free(layer.instruction_moe_templates);
+        if (layer.instruction_attention_storage_kinds.len > 0) allocator.free(layer.instruction_attention_storage_kinds);
+        if (layer.instruction_shortconv_storage_kinds.len > 0) allocator.free(layer.instruction_shortconv_storage_kinds);
+        if (layer.instruction_ffn_storage_kinds.len > 0) allocator.free(layer.instruction_ffn_storage_kinds);
+        if (layer.instruction_mamba_storage_kinds.len > 0) allocator.free(layer.instruction_mamba_storage_kinds);
+        if (layer.instruction_attention_uses_mla.len > 0) allocator.free(layer.instruction_attention_uses_mla);
+        if (layer.instruction_mamba_has_ffn.len > 0) allocator.free(layer.instruction_mamba_has_ffn);
+        if (layer.instruction_mamba_gate_up_layouts.len > 0) allocator.free(layer.instruction_mamba_gate_up_layouts);
         if (layer.ln1_weight) |h| mlx_graph.freeArray(h);
         if (layer.ln2_weight) |h| mlx_graph.freeArray(h);
 
@@ -1637,74 +1676,6 @@ pub const WeightHandles = struct {
             invalid,
         };
 
-        pub const MhaAttentionRuntimeTemplate = struct {
-            storage_kind: AttentionStorageKind,
-            q_norm: ?ArrayHandle,
-            k_norm: ?ArrayHandle,
-            q_bias: ?ArrayHandle,
-            k_bias: ?ArrayHandle,
-            v_bias: ?ArrayHandle,
-            o_bias: ?ArrayHandle,
-            attn_sinks: ?ArrayHandle,
-        };
-
-        pub const MlaAttentionRuntimeTemplate = struct {
-            storage_kind: MLAStorageKind,
-            config: MLAConfig,
-            q_a_proj: ?QuantizedWeight,
-            q_b_proj: ?QuantizedWeight,
-            kv_a_proj: ?QuantizedWeight,
-            kv_b_proj: ?QuantizedWeight,
-            q_a_proj_bf16: ?ArrayHandle,
-            q_b_proj_bf16: ?ArrayHandle,
-            kv_a_proj_bf16: ?ArrayHandle,
-            kv_b_proj_bf16: ?ArrayHandle,
-            q_a_norm: ?ArrayHandle,
-            kv_a_norm: ?ArrayHandle,
-        };
-
-        pub const AttentionRuntimeTemplate = union(enum) {
-            mha: MhaAttentionRuntimeTemplate,
-            mla: MlaAttentionRuntimeTemplate,
-        };
-
-        pub const ShortConvRuntimeTemplate = struct {
-            storage_kind: ShortConvStorageKind,
-            conv_bias: ?ArrayHandle,
-            d_conv: usize,
-            conv_dim: usize,
-        };
-
-        pub const MambaRuntimeTemplate = struct {
-            storage_kind: MambaStorageKind,
-            d_state: usize,
-            d_conv: usize,
-            n_heads: usize,
-            d_head: usize,
-            n_groups: usize,
-            gate_up_layout: u8,
-            ln1_weight: ArrayHandle,
-            conv_weight: ArrayHandle,
-            conv_bias: ?ArrayHandle,
-            a_log: ArrayHandle,
-            d_skip: ArrayHandle,
-            dt_bias: ?ArrayHandle,
-            norm_weight: ?ArrayHandle,
-            ln2_weight: ?ArrayHandle,
-            gate_up: ?QuantizedWeight,
-            gate_up_bf16: ?ArrayHandle,
-            down_proj: ?QuantizedWeight,
-            down_proj_bf16: ?ArrayHandle,
-        };
-
-        pub const SwiGluRuntimeTemplate = struct {
-            storage_kind: FfnStorageKind,
-        };
-
-        pub const MoeRuntimeTemplate = struct {
-            template_ptr: *MoEWeights,
-        };
-
         kind: LayerKind = .attention_mlp,
         compiled_plan: ?runtime_contract.CompiledPlan = null,
         register_to_slot_map: []const u8 = &.{},
@@ -1718,16 +1689,14 @@ pub const WeightHandles = struct {
         instruction_weight_offsets: []const u32 = &.{},
         /// Flattened instruction-local weight pointers resolved at load time.
         instruction_weight_ptrs: []const ?*anyopaque = &.{},
-        /// Per-instruction static runtime templates for attention opcodes.
-        instruction_attention_templates: []const ?AttentionRuntimeTemplate = &.{},
-        /// Per-instruction static runtime templates for shortconv opcodes.
-        instruction_shortconv_templates: []const ?ShortConvRuntimeTemplate = &.{},
-        /// Per-instruction static runtime templates for mamba opcodes.
-        instruction_mamba_templates: []const ?MambaRuntimeTemplate = &.{},
-        /// Per-instruction static runtime templates for swiglu opcodes.
-        instruction_swiglu_templates: []const ?SwiGluRuntimeTemplate = &.{},
-        /// Per-instruction static runtime templates for moe opcodes.
-        instruction_moe_templates: []const ?MoeRuntimeTemplate = &.{},
+        /// Precomputed per-instruction storage metadata (non-weight).
+        instruction_attention_storage_kinds: []const AttentionStorageKind = &.{},
+        instruction_shortconv_storage_kinds: []const ShortConvStorageKind = &.{},
+        instruction_ffn_storage_kinds: []const FfnStorageKind = &.{},
+        instruction_mamba_storage_kinds: []const MambaStorageKind = &.{},
+        instruction_attention_uses_mla: []const bool = &.{},
+        instruction_mamba_has_ffn: []const bool = &.{},
+        instruction_mamba_gate_up_layouts: []const u8 = &.{},
         ln1_weight: ArrayHandle,
         ln2_weight: ArrayHandle,
 
@@ -1790,6 +1759,10 @@ pub const WeightHandles = struct {
         // Load-time template pointer used by runtime adapter to avoid
         // per-dispatch reach-back into raw layer MoE pointer storage.
         moe_runtime_template: ?*MoEWeights = null,
+        moe_router_group_size: usize = 0,
+        moe_expert_group_size: usize = 0,
+        moe_num_experts: usize = 0,
+        moe_experts_per_token: usize = 0,
         // Mamba weights/config (used when kind == .mamba)
         mamba_d_state: usize = 0,
         mamba_d_conv: usize = 0,

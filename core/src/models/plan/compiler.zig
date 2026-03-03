@@ -128,13 +128,7 @@ fn compileOneInstruction(
     reg_map: *RegisterMap,
 ) !runtime_contract.Instruction {
     const opcode = opcode_map.opcodeForLayerOp(op);
-    const state_block_id = switch (mode) {
-        .vision_encode, .scatter => switch (opcode) {
-            .multihead_attention, .mla_attention => null,
-            else => runtime_contract.stateBlockIdForOpcode(opcode),
-        },
-        else => runtime_contract.stateBlockIdForOpcode(opcode),
-    };
+    const state_block_id = runtime_contract.stateBlockIdForExecutionMode(opcode, mode);
     return switch (op) {
         .kernel => |kernel_op| blk: {
             const slots = kernelWeightSlots(opcode);
@@ -1194,8 +1188,20 @@ test "compileLayerProgram emits structured kernel weight refs for macro attentio
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     const insn = compiled.plan.instructions[0];
-    try std.testing.expectEqual(@as(usize, 4), insn.weights.len);
-    const expected_slots = [_][]const u8{ "q_proj", "k_proj", "v_proj", "o_proj" };
+    try std.testing.expectEqual(@as(usize, 11), insn.weights.len);
+    const expected_slots = [_][]const u8{
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "q_norm",
+        "k_norm",
+        "q_bias",
+        "k_bias",
+        "v_bias",
+        "o_bias",
+        "attn_sinks",
+    };
     for (expected_slots, 0..) |slot_name, idx| {
         const binding_name = try runtime_contract.instructionWeightBindingName(&compiled, 0, idx);
         const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);

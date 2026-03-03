@@ -584,14 +584,15 @@ pub const MetalBackend = struct {
                 runtime_contract.mamba_state_id => @ptrCast(slot_mamba_cache),
                 else => null,
             };
+            var bound = incoming.*;
             if (state_ptr) |ptr| {
-                try runtime_contract.writeStatePointerToBlock(incoming, ptr);
+                bound.ptr = @ptrFromInt(@intFromPtr(ptr));
             }
             binding.handles[idx] = .{
                 .id = descriptor.id,
-                .ptr = incoming.ptr,
-                .size = incoming.size,
-                .align_bytes = incoming.align_bytes,
+                .ptr = bound.ptr,
+                .size = bound.size,
+                .align_bytes = bound.align_bytes,
             };
         }
         binding.count = @intCast(state_blocks.len);

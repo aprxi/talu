@@ -52,6 +52,20 @@ const SwiGLUKernelBinding = *const ffn_kernel.SwiGLU;
 const MoeKernelBinding = *const moe_kernel.MoEFFN;
 const MambaKernelBinding = *const mamba_kernel.MambaKernel;
 const ShortConvKernelBinding = *const shortconv_kernel.ShortConvKernel;
+const missing_weight_tensor: Tensor = std.mem.zeroes(Tensor);
+var missing_optional_bias_value: f32 = 0.0;
+var missing_optional_scale_value: u8 = 0;
+
+const AttentionProjectionMode = enum(u8) {
+    split_qkv,
+    fused_qkv,
+};
+
+const SwiGluProjectionMode = enum(u8) {
+    split_gate_up,
+    dense_gate_only,
+    fused_gate_up,
+};
 
 const addIntoScaled = cpu_forward.addIntoScaled;
 const copyTensor = cpu_forward.copyTensor;
@@ -207,12 +221,15 @@ pub const Block = struct {
     instruction_weight_refs: []?*const Tensor,
     /// Per-instruction typed kernel refs for macro adapters (load-time resolved).
     instruction_norm_refs: []?NormKernelBinding = &.{},
-    instruction_attention_refs: []?AttentionKernelBinding = &.{},
+    instruction_attention_bindings: []?AttentionKernelBinding = &.{},
     instruction_mla_attention_refs: []?MlaAttentionKernelBinding = &.{},
-    instruction_swiglu_refs: []?SwiGLUKernelBinding = &.{},
-    instruction_moe_refs: []?MoeKernelBinding = &.{},
-    instruction_mamba_refs: []?MambaKernelBinding = &.{},
-    instruction_shortconv_refs: []?ShortConvKernelBinding = &.{},
+    instruction_swiglu_bindings: []?SwiGLUKernelBinding = &.{},
+    instruction_moe_bindings: []?MoeKernelBinding = &.{},
+    instruction_mamba_bindings: []?MambaKernelBinding = &.{},
+    instruction_shortconv_bindings: []?ShortConvKernelBinding = &.{},
+    /// Per-instruction projection routing metadata for hot-path dispatch.
+    instruction_attention_projection_modes: []const AttentionProjectionMode = &.{},
+    instruction_swiglu_projection_modes: []const SwiGluProjectionMode = &.{},
     /// Per-instruction prefix offsets into `instruction_weight_ptrs`.
     instruction_weight_offsets: []u32 = &.{},
     /// Flattened per-instruction weight handles resolved at load time.
@@ -247,6 +264,10 @@ pub const Block = struct {
             block_idx,
             &compiled_plan,
         );
+        const runtime_dispatch_modes = try buildRuntimeDispatchModes(
+            allocator,
+            typed_kernel_refs,
+        );
         const weight_table = try buildInstructionWeightTable(
             allocator,
             block_idx,
@@ -257,6 +278,7 @@ pub const Block = struct {
         errdefer {
             allocator.free(weight_table.offsets);
             allocator.free(weight_table.ptrs);
+            runtime_dispatch_modes.deinit(allocator);
             typed_kernel_refs.deinit(allocator);
             allocator.free(weight_refs);
         }
@@ -267,12 +289,14 @@ pub const Block = struct {
             .hidden_size = hidden_size,
             .instruction_weight_refs = weight_refs,
             .instruction_norm_refs = typed_kernel_refs.norm,
-            .instruction_attention_refs = typed_kernel_refs.attention,
+            .instruction_attention_bindings = typed_kernel_refs.attention,
             .instruction_mla_attention_refs = typed_kernel_refs.mla_attention,
-            .instruction_swiglu_refs = typed_kernel_refs.swiglu,
-            .instruction_moe_refs = typed_kernel_refs.moe,
-            .instruction_mamba_refs = typed_kernel_refs.mamba,
-            .instruction_shortconv_refs = typed_kernel_refs.shortconv,
+            .instruction_swiglu_bindings = typed_kernel_refs.swiglu,
+            .instruction_moe_bindings = typed_kernel_refs.moe,
+            .instruction_mamba_bindings = typed_kernel_refs.mamba,
+            .instruction_shortconv_bindings = typed_kernel_refs.shortconv,
+            .instruction_attention_projection_modes = runtime_dispatch_modes.attention,
+            .instruction_swiglu_projection_modes = runtime_dispatch_modes.swiglu,
             .instruction_weight_offsets = weight_table.offsets,
             .instruction_weight_ptrs = weight_table.ptrs,
             .tmp_register_to_scratch_idx = tmp_layout.map,
@@ -291,12 +315,14 @@ pub const Block = struct {
         if (self.instruction_weight_offsets.len > 0) allocator.free(self.instruction_weight_offsets);
         if (self.instruction_weight_ptrs.len > 0) allocator.free(self.instruction_weight_ptrs);
         if (self.instruction_norm_refs.len > 0) allocator.free(self.instruction_norm_refs);
-        if (self.instruction_attention_refs.len > 0) allocator.free(self.instruction_attention_refs);
+        if (self.instruction_attention_bindings.len > 0) allocator.free(self.instruction_attention_bindings);
         if (self.instruction_mla_attention_refs.len > 0) allocator.free(self.instruction_mla_attention_refs);
-        if (self.instruction_swiglu_refs.len > 0) allocator.free(self.instruction_swiglu_refs);
-        if (self.instruction_moe_refs.len > 0) allocator.free(self.instruction_moe_refs);
-        if (self.instruction_mamba_refs.len > 0) allocator.free(self.instruction_mamba_refs);
-        if (self.instruction_shortconv_refs.len > 0) allocator.free(self.instruction_shortconv_refs);
+        if (self.instruction_swiglu_bindings.len > 0) allocator.free(self.instruction_swiglu_bindings);
+        if (self.instruction_moe_bindings.len > 0) allocator.free(self.instruction_moe_bindings);
+        if (self.instruction_mamba_bindings.len > 0) allocator.free(self.instruction_mamba_bindings);
+        if (self.instruction_shortconv_bindings.len > 0) allocator.free(self.instruction_shortconv_bindings);
+        if (self.instruction_attention_projection_modes.len > 0) allocator.free(self.instruction_attention_projection_modes);
+        if (self.instruction_swiglu_projection_modes.len > 0) allocator.free(self.instruction_swiglu_projection_modes);
         allocator.free(self.instruction_weight_refs);
         plan_compiler.deinitCompiledPlan(allocator, &self.compiled_plan);
         self.* = undefined;
@@ -381,6 +407,49 @@ pub const Block = struct {
         }
     };
 
+    const RuntimeDispatchModes = struct {
+        attention: []AttentionProjectionMode,
+        swiglu: []SwiGluProjectionMode,
+
+        fn deinit(self: RuntimeDispatchModes, allocator: std.mem.Allocator) void {
+            allocator.free(self.attention);
+            allocator.free(self.swiglu);
+        }
+    };
+
+    fn buildRuntimeDispatchModes(
+        allocator: std.mem.Allocator,
+        typed_kernel_refs: TypedInstructionKernelRefs,
+    ) !RuntimeDispatchModes {
+        const len = typed_kernel_refs.norm.len;
+        const attention = try allocator.alloc(AttentionProjectionMode, len);
+        errdefer allocator.free(attention);
+        const swiglu = try allocator.alloc(SwiGluProjectionMode, len);
+        errdefer allocator.free(swiglu);
+
+        @memset(attention, .split_qkv);
+        @memset(swiglu, .split_gate_up);
+
+        for (0..len) |idx| {
+            if (typed_kernel_refs.attention[idx]) |binding| {
+                attention[idx] = if (binding.fused_qkv != null) .fused_qkv else .split_qkv;
+            }
+            if (typed_kernel_refs.swiglu[idx]) |binding| {
+                swiglu[idx] = if (binding.fused_gate_up != null)
+                    .fused_gate_up
+                else if (binding.w3 == null)
+                    .dense_gate_only
+                else
+                    .split_gate_up;
+            }
+        }
+
+        return .{
+            .attention = attention,
+            .swiglu = swiglu,
+        };
+    }
+
     fn buildTypedInstructionKernelRefs(
         allocator: std.mem.Allocator,
         block: *const cpu_forward.TransformerBlock,
@@ -443,7 +512,10 @@ pub const Block = struct {
                     else => return error.InvalidInstructionBinding,
                 },
                 .moe => moe[op_index] = switch (kernel) {
-                    .moe => |binding| binding,
+                    .moe => |binding| blk: {
+                        if (binding.experts.len != 1) return error.UnsupportedModel;
+                        break :blk binding;
+                    },
                     else => return error.InvalidInstructionBinding,
                 },
                 .mamba_mixer => mamba[op_index] = switch (kernel) {
@@ -505,6 +577,34 @@ pub const Block = struct {
                         return error.MissingWeight;
                     },
                     3 => return @ptrCast(@constCast(attn_binding.o_proj)),
+                    4 => if (attn_binding.q_norm) |q_norm|
+                        return @ptrCast(@constCast(q_norm))
+                    else
+                        return @ptrCast(@constCast(&missing_weight_tensor)),
+                    5 => if (attn_binding.k_norm) |k_norm|
+                        return @ptrCast(@constCast(k_norm))
+                    else
+                        return @ptrCast(@constCast(&missing_weight_tensor)),
+                    6 => if (attn_binding.q_bias) |q_bias|
+                        if (q_bias.len != 0) return @ptrCast(@constCast(q_bias.ptr)) else return @ptrCast(&missing_optional_bias_value)
+                    else
+                        return @ptrCast(&missing_optional_bias_value),
+                    7 => if (attn_binding.k_bias) |k_bias|
+                        if (k_bias.len != 0) return @ptrCast(@constCast(k_bias.ptr)) else return @ptrCast(&missing_optional_bias_value)
+                    else
+                        return @ptrCast(&missing_optional_bias_value),
+                    8 => if (attn_binding.v_bias) |v_bias|
+                        if (v_bias.len != 0) return @ptrCast(@constCast(v_bias.ptr)) else return @ptrCast(&missing_optional_bias_value)
+                    else
+                        return @ptrCast(&missing_optional_bias_value),
+                    9 => if (attn_binding.o_bias) |o_bias|
+                        if (o_bias.len != 0) return @ptrCast(@constCast(o_bias.ptr)) else return @ptrCast(&missing_optional_bias_value)
+                    else
+                        return @ptrCast(&missing_optional_bias_value),
+                    10 => if (attn_binding.sinks) |sinks|
+                        if (sinks.len != 0) return @ptrCast(@constCast(sinks.ptr)) else return @ptrCast(&missing_optional_bias_value)
+                    else
+                        return @ptrCast(&missing_optional_bias_value),
                     else => return error.InvalidWeightRefCount,
                 }
             },
@@ -546,6 +646,7 @@ pub const Block = struct {
                     1 => blk: {
                         if (moe_binding.experts.len == 0) return error.MissingWeight;
                         const expert = &moe_binding.experts[0];
+                        if (expert.gate_proj) |*gate_proj| break :blk @ptrCast(@constCast(gate_proj));
                         if (expert.up_proj) |*up_proj| break :blk @ptrCast(@constCast(up_proj));
                         if (expert.gate_up_proj) |*gate_up_proj| break :blk @ptrCast(@constCast(gate_up_proj));
                         return error.MissingWeight;
@@ -553,8 +654,81 @@ pub const Block = struct {
                     2 => blk: {
                         if (moe_binding.experts.len == 0) return error.MissingWeight;
                         const expert = &moe_binding.experts[0];
+                        if (expert.up_proj) |*up_proj| break :blk @ptrCast(@constCast(up_proj));
+                        if (expert.gate_up_proj) |*gate_up_proj| break :blk @ptrCast(@constCast(gate_up_proj));
+                        return error.MissingWeight;
+                    },
+                    3 => blk: {
+                        if (moe_binding.experts.len == 0) return error.MissingWeight;
+                        const expert = &moe_binding.experts[0];
                         break :blk @ptrCast(@constCast(&expert.down_proj));
                     },
+                    4 => if (moe_binding.router_bias) |router_bias|
+                        if (router_bias.len != 0) @ptrCast(@constCast(router_bias.ptr)) else @ptrCast(&missing_optional_bias_value)
+                    else
+                        @ptrCast(&missing_optional_bias_value),
+                    5 => blk: {
+                        if (moe_binding.experts.len == 0) return @ptrCast(&missing_optional_scale_value);
+                        const expert = &moe_binding.experts[0];
+                        if (expert.gate_scales) |gate_scales| {
+                            if (gate_scales.len != 0) break :blk @ptrCast(@constCast(gate_scales.ptr));
+                        }
+                        if (expert.gate_up_scales) |gate_up_scales| {
+                            if (gate_up_scales.len != 0) break :blk @ptrCast(@constCast(gate_up_scales.ptr));
+                        }
+                        break :blk @ptrCast(&missing_optional_scale_value);
+                    },
+                    6 => blk: {
+                        if (moe_binding.experts.len == 0) return @ptrCast(&missing_optional_scale_value);
+                        const expert = &moe_binding.experts[0];
+                        if (expert.up_scales) |up_scales| {
+                            if (up_scales.len != 0) break :blk @ptrCast(@constCast(up_scales.ptr));
+                        }
+                        if (expert.gate_up_scales) |gate_up_scales| {
+                            if (gate_up_scales.len != 0) break :blk @ptrCast(@constCast(gate_up_scales.ptr));
+                        }
+                        break :blk @ptrCast(&missing_optional_scale_value);
+                    },
+                    7 => blk: {
+                        if (moe_binding.experts.len == 0) return @ptrCast(&missing_optional_scale_value);
+                        const expert = &moe_binding.experts[0];
+                        if (expert.down_scales) |down_scales| {
+                            if (down_scales.len != 0) break :blk @ptrCast(@constCast(down_scales.ptr));
+                        }
+                        break :blk @ptrCast(&missing_optional_scale_value);
+                    },
+                    8 => blk: {
+                        if (moe_binding.experts.len == 0) return @ptrCast(&missing_optional_bias_value);
+                        const expert = &moe_binding.experts[0];
+                        if (expert.gate_bias) |gate_bias| {
+                            if (gate_bias.len != 0) break :blk @ptrCast(@constCast(gate_bias.ptr));
+                        }
+                        if (expert.gate_up_bias) |gate_up_bias| {
+                            if (gate_up_bias.len != 0) break :blk @ptrCast(@constCast(gate_up_bias.ptr));
+                        }
+                        break :blk @ptrCast(&missing_optional_bias_value);
+                    },
+                    9 => blk: {
+                        if (moe_binding.experts.len == 0) return @ptrCast(&missing_optional_bias_value);
+                        const expert = &moe_binding.experts[0];
+                        if (expert.up_bias) |up_bias| {
+                            if (up_bias.len != 0) break :blk @ptrCast(@constCast(up_bias.ptr));
+                        }
+                        if (expert.gate_up_bias) |gate_up_bias| {
+                            if (gate_up_bias.len != 0) break :blk @ptrCast(@constCast(gate_up_bias.ptr));
+                        }
+                        break :blk @ptrCast(&missing_optional_bias_value);
+                    },
+                    10 => blk: {
+                        if (moe_binding.experts.len == 0) return @ptrCast(&missing_optional_bias_value);
+                        const expert = &moe_binding.experts[0];
+                        if (expert.down_bias) |down_bias| {
+                            if (down_bias.len != 0) break :blk @ptrCast(@constCast(down_bias.ptr));
+                        }
+                        break :blk @ptrCast(&missing_optional_bias_value);
+                    },
+                    11 => @ptrCast(@constCast(&missing_weight_tensor)),
+                    12 => @ptrCast(@constCast(&missing_weight_tensor)),
                     else => error.InvalidWeightRefCount,
                 };
             },
@@ -566,6 +740,22 @@ pub const Block = struct {
                     2 => @ptrCast(@constCast(mamba_binding.weights.A_log)),
                     3 => @ptrCast(@constCast(mamba_binding.weights.D)),
                     4 => @ptrCast(@constCast(mamba_binding.weights.out_proj)),
+                    5 => if (mamba_binding.weights.conv1d_bias) |conv_bias|
+                        @ptrCast(@constCast(conv_bias))
+                    else
+                        @ptrCast(@constCast(&missing_weight_tensor)),
+                    6 => if (mamba_binding.weights.dt_bias) |dt_bias|
+                        @ptrCast(@constCast(dt_bias))
+                    else
+                        @ptrCast(@constCast(&missing_weight_tensor)),
+                    7 => if (mamba_binding.weights.norm_weight) |norm_weight|
+                        @ptrCast(@constCast(norm_weight))
+                    else
+                        @ptrCast(@constCast(&missing_weight_tensor)),
+                    8 => @ptrCast(@constCast(&missing_weight_tensor)),
+                    9 => @ptrCast(@constCast(&missing_weight_tensor)),
+                    10 => @ptrCast(@constCast(&missing_weight_tensor)),
+                    11 => @ptrCast(@constCast(&missing_weight_tensor)),
                     else => error.InvalidWeightRefCount,
                 };
             },
@@ -575,6 +765,10 @@ pub const Block = struct {
                     0 => @ptrCast(@constCast(shortconv_binding.weights.in_proj)),
                     1 => @ptrCast(@constCast(shortconv_binding.weights.conv1d_weight)),
                     2 => @ptrCast(@constCast(shortconv_binding.weights.out_proj)),
+                    3 => if (shortconv_binding.weights.conv1d_bias) |conv_bias|
+                        @ptrCast(@constCast(conv_bias))
+                    else
+                        @ptrCast(@constCast(&missing_weight_tensor)),
                     else => error.InvalidWeightRefCount,
                 };
             },
@@ -833,6 +1027,26 @@ pub const Block = struct {
         return @ptrCast(@alignCast(handle.ptr));
     }
 
+    fn optionalTensorFromWeightHandle(handle: runtime_contract.TensorHandle) ?*const Tensor {
+        const value: *const Tensor = @ptrCast(@alignCast(handle.ptr));
+        if (value == &missing_weight_tensor) return null;
+        return value;
+    }
+
+    fn optionalBiasSliceFromWeightHandle(handle: runtime_contract.TensorHandle, len: usize) ?[]const f32 {
+        const value: *const f32 = @ptrCast(@alignCast(handle.ptr));
+        if (value == &missing_optional_bias_value) return null;
+        const many: [*]const f32 = @ptrCast(value);
+        return many[0..len];
+    }
+
+    fn optionalScaleSliceFromWeightHandle(handle: runtime_contract.TensorHandle, len: usize) ?[]const u8 {
+        const value: *const u8 = @ptrCast(@alignCast(handle.ptr));
+        if (value == &missing_optional_scale_value) return null;
+        const many: [*]const u8 = @ptrCast(value);
+        return many[0..len];
+    }
+
     fn instructionWeightRef(self: *const Block, op_index: usize) !*const Tensor {
         if (op_index >= self.compiled_plan.plan.instructions.len) return error.InvalidInstructionIndex;
         if (op_index >= self.instruction_weight_refs.len) return error.InvalidInstructionIndex;
@@ -844,12 +1058,12 @@ pub const Block = struct {
     fn hasTypedKernelBinding(self: *const Block, opcode: runtime_contract.Opcode, op_index: usize) bool {
         return switch (opcode) {
             .rmsnorm => op_index < self.instruction_norm_refs.len and self.instruction_norm_refs[op_index] != null,
-            .multihead_attention => op_index < self.instruction_attention_refs.len and self.instruction_attention_refs[op_index] != null,
+            .multihead_attention => op_index < self.instruction_attention_bindings.len and self.instruction_attention_bindings[op_index] != null,
             .mla_attention => op_index < self.instruction_mla_attention_refs.len and self.instruction_mla_attention_refs[op_index] != null,
-            .swiglu => op_index < self.instruction_swiglu_refs.len and self.instruction_swiglu_refs[op_index] != null,
-            .moe => op_index < self.instruction_moe_refs.len and self.instruction_moe_refs[op_index] != null,
-            .mamba_mixer => op_index < self.instruction_mamba_refs.len and self.instruction_mamba_refs[op_index] != null,
-            .shortconv => op_index < self.instruction_shortconv_refs.len and self.instruction_shortconv_refs[op_index] != null,
+            .swiglu => op_index < self.instruction_swiglu_bindings.len and self.instruction_swiglu_bindings[op_index] != null,
+            .moe => op_index < self.instruction_moe_bindings.len and self.instruction_moe_bindings[op_index] != null,
+            .mamba_mixer => op_index < self.instruction_mamba_bindings.len and self.instruction_mamba_bindings[op_index] != null,
+            .shortconv => op_index < self.instruction_shortconv_bindings.len and self.instruction_shortconv_bindings[op_index] != null,
             else => false,
         };
     }
@@ -881,6 +1095,7 @@ pub const Block = struct {
         slot_index: usize,
         slot_indices: []const usize,
         use_batched_dispatch: bool,
+        bound_state_blocks: []const runtime_contract.StateBlockHandle,
         instruction_handles: []runtime_contract.TensorHandle,
         instruction_views: []runtime_contract.TensorViewDesc,
         state_bindings: [MaxStateBindings]?StateBinding = [_]?StateBinding{null} ** MaxStateBindings,
@@ -928,10 +1143,8 @@ pub const Block = struct {
         dispatch_state.state_binding_count = 0;
         dispatch_state.state_bindings = [_]?RuntimeDispatchState.StateBinding{null} ** RuntimeDispatchState.MaxStateBindings;
 
-        const shared_state = dispatch_state.slot_ctx.sharedState();
-        const bound_state_blocks = shared_state.state_blocks;
+        const bound_state_blocks = dispatch_state.bound_state_blocks;
 
-        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
         for (dispatch_state.block.compiled_plan.plan.state_descs) |state_desc| {
             const maybe_state_block = runtime_contract.findStateBlock(bound_state_blocks, state_desc.id);
             if (maybe_state_block == null) {
@@ -946,37 +1159,6 @@ pub const Block = struct {
                 return error.InvalidStateDescriptorBinding;
             }
             try dispatch_state.bindState(normalized_state_block);
-        }
-
-        if (runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, kv_state_id) != null) {
-            const raw_cache = runtime_contract.statePointerForId(bound_state_blocks, kv_state_id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            const layered_cache: *LayeredBatchedKVCache = @ptrCast(@alignCast(raw_cache));
-            if (dispatch_state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
-            shared_state.batched_cache = layered_cache.getLayer(dispatch_state.block.block_idx);
-        } else {
-            shared_state.batched_cache = null;
-        }
-
-        const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
-        if (runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, mamba_state_id) != null) {
-            const raw_scratch = runtime_contract.statePointerForId(bound_state_blocks, mamba_state_id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            shared_state.mamba_scratch = @ptrCast(@alignCast(raw_scratch));
-        } else {
-            shared_state.mamba_scratch = null;
-        }
-
-        const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
-        if (runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, shortconv_state_id) != null) {
-            const raw_scratch = runtime_contract.statePointerForId(bound_state_blocks, shortconv_state_id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            shared_state.shortconv_scratch = @ptrCast(@alignCast(raw_scratch));
-        } else {
-            shared_state.shortconv_scratch = null;
         }
     }
 
@@ -1266,107 +1448,286 @@ pub const Block = struct {
             .rmsnorm => {
                 if (weight_handles.len != 1) return error.InvalidWeightRefCount;
                 if (state.op_index >= state.block.instruction_norm_refs.len) return error.InvalidInstructionIndex;
-                const bound = state.block.instruction_norm_refs[state.op_index] orelse return error.MissingKernelBinding;
-                var norm_local = bound.*;
                 const weight = tensorFromWeightHandle(weight_handles[0]);
-                switch (norm_local) {
-                    .rms => |*rms| rms.weight = weight,
-                    .layer => |*layer| layer.weight = weight,
-                }
+                const template = state.block.instruction_norm_refs[state.op_index] orelse return error.MissingKernelBinding;
+                var norm_local = switch (template.*) {
+                    .rms => |rms| norm_kernel.NormKernel{
+                        .rms = .{
+                            .weight = weight,
+                            .dim = rms.dim,
+                            .eps = rms.eps,
+                            .weight_offset = rms.weight_offset,
+                            .layer_idx = rms.layer_idx,
+                            .trace_point = rms.trace_point,
+                        },
+                    },
+                    .layer => |layer| blk: {
+                        // LayerNorm bias is not part of the Phase-5 flattened
+                        // instruction-weight contract for `.rmsnorm`.
+                        if (layer.bias != null) return error.UnsupportedModel;
+                        break :blk norm_kernel.NormKernel{
+                            .layer = .{
+                                .weight = weight,
+                                .bias = null,
+                                .dim = layer.dim,
+                                .eps = layer.eps,
+                                .layer_idx = layer.layer_idx,
+                                .trace_point = layer.trace_point,
+                            },
+                        };
+                    },
+                };
                 try dispatchNormWithMode(input, output, &norm_local);
                 return;
             },
             .multihead_attention => {
-                if (weight_handles.len != 4) return error.InvalidWeightRefCount;
-                if (state.op_index >= state.block.instruction_attention_refs.len) return error.InvalidInstructionIndex;
-                const bound = state.block.instruction_attention_refs[state.op_index] orelse return error.MissingKernelBinding;
-                var attn_local = bound.*;
-                attn_local.o_proj = tensorFromWeightHandle(weight_handles[3]);
-                if (attn_local.fused_qkv) |_| {
-                    // Fused QKV still binds from instruction-local weight handles.
-                    attn_local.fused_qkv = tensorFromWeightHandle(weight_handles[0]).*;
-                } else {
-                    attn_local.q_proj = tensorFromWeightHandle(weight_handles[0]);
-                    attn_local.k_proj = tensorFromWeightHandle(weight_handles[1]);
-                    attn_local.v_proj = tensorFromWeightHandle(weight_handles[2]);
+                if (weight_handles.len != 11) return error.InvalidWeightRefCount;
+                if (state.op_index >= state.block.instruction_attention_bindings.len) return error.InvalidInstructionIndex;
+                if (state.op_index >= state.block.instruction_attention_projection_modes.len) return error.InvalidInstructionIndex;
+                const template = state.block.instruction_attention_bindings[state.op_index] orelse return error.MissingKernelBinding;
+                var attn_local = attn_kernel.MultiHeadAttention{
+                    .d_model = template.d_model,
+                    .n_heads = template.n_heads,
+                    .n_kv_heads = template.n_kv_heads,
+                    .head_dim = template.head_dim,
+                    .max_seq_len = template.max_seq_len,
+                    .scale = template.scale,
+                    .qk_norm_weight_offset = template.qk_norm_weight_offset,
+                    .sliding_window = template.sliding_window,
+                    .is_causal = template.is_causal,
+                    .layer_idx = template.layer_idx,
+                    .q_proj = null,
+                    .k_proj = null,
+                    .v_proj = null,
+                    .o_proj = tensorFromWeightHandle(weight_handles[3]),
+                    .fused_qkv = null,
+                    .rope = template.rope,
+                    .runtime_rope = template.runtime_rope,
+                    .position_delta = template.position_delta,
+                    .q_norm = null,
+                    .k_norm = null,
+                    .norm_eps = template.norm_eps,
+                    .allocator = template.allocator,
+                    .matmul_qkv = template.matmul_qkv,
+                    .matmul_k = template.matmul_k,
+                    .matmul_v = template.matmul_v,
+                    .matmul_qkv_fused = template.matmul_qkv_fused,
+                    .matmul_o = template.matmul_o,
+                    .kernel_name_qkv = template.kernel_name_qkv,
+                    .kernel_name_k = template.kernel_name_k,
+                    .kernel_name_v = template.kernel_name_v,
+                    .kernel_name_qkv_fused = template.kernel_name_qkv_fused,
+                    .kernel_name_o = template.kernel_name_o,
+                    .q_bias = null,
+                    .k_bias = null,
+                    .v_bias = null,
+                    .o_bias = null,
+                    .sinks = null,
+                    .flash_attention_fn = template.flash_attention_fn,
+                };
+                switch (state.block.instruction_attention_projection_modes[state.op_index]) {
+                    .fused_qkv => {
+                        // Fused QKV still binds from instruction-local weight handles.
+                        attn_local.fused_qkv = tensorFromWeightHandle(weight_handles[0]).*;
+                    },
+                    .split_qkv => {
+                        attn_local.q_proj = tensorFromWeightHandle(weight_handles[0]);
+                        attn_local.k_proj = tensorFromWeightHandle(weight_handles[1]);
+                        attn_local.v_proj = tensorFromWeightHandle(weight_handles[2]);
+                    },
                 }
+                const query_dim: usize = attn_local.n_heads * attn_local.head_dim;
+                const kv_total_dim: usize = attn_local.n_kv_heads * attn_local.head_dim;
+                attn_local.q_norm = optionalTensorFromWeightHandle(weight_handles[4]);
+                attn_local.k_norm = optionalTensorFromWeightHandle(weight_handles[5]);
+                attn_local.q_bias = optionalBiasSliceFromWeightHandle(weight_handles[6], query_dim);
+                attn_local.k_bias = optionalBiasSliceFromWeightHandle(weight_handles[7], kv_total_dim);
+                attn_local.v_bias = optionalBiasSliceFromWeightHandle(weight_handles[8], kv_total_dim);
+                attn_local.o_bias = optionalBiasSliceFromWeightHandle(weight_handles[9], attn_local.d_model);
+                attn_local.sinks = optionalBiasSliceFromWeightHandle(weight_handles[10], attn_local.n_heads);
                 try dispatchAttentionWithMode(state, insn, state_blocks, input, output, &attn_local);
                 return;
             },
             .mla_attention => {
                 if (weight_handles.len != 7) return error.InvalidWeightRefCount;
                 if (state.op_index >= state.block.instruction_mla_attention_refs.len) return error.InvalidInstructionIndex;
-                const bound = state.block.instruction_mla_attention_refs[state.op_index] orelse return error.MissingKernelBinding;
-                var mla_local = bound.*;
-                mla_local.q_a_proj = tensorFromWeightHandle(weight_handles[0]);
-                mla_local.q_a_norm = tensorFromWeightHandle(weight_handles[1]);
-                mla_local.q_b_proj = tensorFromWeightHandle(weight_handles[2]);
-                mla_local.kv_a_proj = tensorFromWeightHandle(weight_handles[3]);
-                mla_local.kv_a_norm = tensorFromWeightHandle(weight_handles[4]);
-                mla_local.kv_b_proj = tensorFromWeightHandle(weight_handles[5]);
-                mla_local.o_proj = tensorFromWeightHandle(weight_handles[6]);
+                const template = state.block.instruction_mla_attention_refs[state.op_index] orelse return error.MissingKernelBinding;
+                var mla_local = mla_kernel.MLAttention{
+                    .d_model = template.d_model,
+                    .n_heads = template.n_heads,
+                    .max_seq_len = template.max_seq_len,
+                    .config = template.config,
+                    .allocator = template.allocator,
+                    .q_a_proj = tensorFromWeightHandle(weight_handles[0]),
+                    .q_a_norm = tensorFromWeightHandle(weight_handles[1]),
+                    .q_b_proj = tensorFromWeightHandle(weight_handles[2]),
+                    .kv_a_proj = tensorFromWeightHandle(weight_handles[3]),
+                    .kv_a_norm = tensorFromWeightHandle(weight_handles[4]),
+                    .kv_b_proj = tensorFromWeightHandle(weight_handles[5]),
+                    .o_proj = tensorFromWeightHandle(weight_handles[6]),
+                    .rope = template.rope,
+                    .norm_eps = template.norm_eps,
+                    .scale = template.scale,
+                    .matmul_fn = template.matmul_fn,
+                    .layer_idx = template.layer_idx,
+                };
                 try dispatchMlaAttentionWithMode(state, insn, state_blocks, input, output, &mla_local);
                 return;
             },
             .swiglu => {
                 if (weight_handles.len != 3) return error.InvalidWeightRefCount;
-                if (state.op_index >= state.block.instruction_swiglu_refs.len) return error.InvalidInstructionIndex;
-                const bound = state.block.instruction_swiglu_refs[state.op_index] orelse return error.MissingKernelBinding;
-                var ffn_local = bound.*;
-                ffn_local.w2 = tensorFromWeightHandle(weight_handles[2]);
-                if (ffn_local.fused_gate_up) |_| {
-                    // Fused gate/up path binds from instruction-local weights.
-                    ffn_local.fused_gate_up = tensorFromWeightHandle(weight_handles[0]).*;
-                } else if (ffn_local.w3 == null) {
-                    // Dense-only GELU FFN path: keep w3 unset and bind only gate + down.
-                    ffn_local.w1 = tensorFromWeightHandle(weight_handles[0]);
-                } else {
-                    ffn_local.w1 = tensorFromWeightHandle(weight_handles[0]);
-                    ffn_local.w3 = tensorFromWeightHandle(weight_handles[1]);
+                if (state.op_index >= state.block.instruction_swiglu_bindings.len) return error.InvalidInstructionIndex;
+                if (state.op_index >= state.block.instruction_swiglu_projection_modes.len) return error.InvalidInstructionIndex;
+                const template = state.block.instruction_swiglu_bindings[state.op_index] orelse return error.MissingKernelBinding;
+                // FFN bias tensors are intentionally not part of `.swiglu` Phase-5
+                // instruction slots; forbid hidden execute-path fallback.
+                if (template.w1_bias != null or template.w2_bias != null) return error.UnsupportedModel;
+                var ffn_local = ffn_kernel.SwiGLU{
+                    .d_model = template.d_model,
+                    .d_ff = template.d_ff,
+                    .use_gelu = template.use_gelu,
+                    .use_swiglu_variant = template.use_swiglu_variant,
+                    .layer_idx = template.layer_idx,
+                    .w1 = null,
+                    .w2 = tensorFromWeightHandle(weight_handles[2]),
+                    .w3 = null,
+                    .w1_bias = null,
+                    .w2_bias = null,
+                    .fused_gate_up = null,
+                    .fused_gate_up_layout = template.fused_gate_up_layout,
+                    .allocator = template.allocator,
+                    .matmul_gate = template.matmul_gate,
+                    .matmul_gate_up = template.matmul_gate_up,
+                    .matmul_down = template.matmul_down,
+                    .kernel_name_gate = template.kernel_name_gate,
+                    .kernel_name_gate_up = template.kernel_name_gate_up,
+                    .kernel_name_down = template.kernel_name_down,
+                };
+                switch (state.block.instruction_swiglu_projection_modes[state.op_index]) {
+                    .fused_gate_up => {
+                        // Fused gate/up path binds from instruction-local weights.
+                        ffn_local.fused_gate_up = tensorFromWeightHandle(weight_handles[0]).*;
+                    },
+                    .dense_gate_only => {
+                        // Dense-only GELU FFN path: bind gate + down only.
+                        ffn_local.w1 = tensorFromWeightHandle(weight_handles[0]);
+                    },
+                    .split_gate_up => {
+                        ffn_local.w1 = tensorFromWeightHandle(weight_handles[0]);
+                        ffn_local.w3 = tensorFromWeightHandle(weight_handles[1]);
+                    },
                 }
                 try dispatchSwiGluWithMode(state, input, output, &ffn_local);
                 return;
             },
             .moe => {
-                if (weight_handles.len != 3) return error.InvalidWeightRefCount;
-                if (state.op_index >= state.block.instruction_moe_refs.len) return error.InvalidInstructionIndex;
-                const bound = state.block.instruction_moe_refs[state.op_index] orelse return error.MissingKernelBinding;
-                var moe_local = bound.*;
-                moe_local.router_weight = tensorFromWeightHandle(weight_handles[0]).*;
-                if (moe_local.experts.len == 1) {
-                    var expert = &moe_local.experts[0];
-                    const up_weight = tensorFromWeightHandle(weight_handles[1]).*;
-                    if (expert.gate_up_proj != null) {
-                        expert.gate_up_proj = up_weight;
-                    } else if (expert.up_proj != null) {
-                        expert.up_proj = up_weight;
-                    }
-                    expert.down_proj = tensorFromWeightHandle(weight_handles[2]).*;
+                if (weight_handles.len != 13) return error.InvalidWeightRefCount;
+                if (state.op_index >= state.block.instruction_moe_bindings.len) return error.InvalidInstructionIndex;
+                const template = state.block.instruction_moe_bindings[state.op_index] orelse return error.MissingKernelBinding;
+                var moe_local = moe_kernel.MoEFFN{
+                    .allocator = template.allocator,
+                    .d_model = template.d_model,
+                    .d_ff = template.d_ff,
+                    .num_experts = template.num_experts,
+                    .experts_per_token = template.experts_per_token,
+                    .router_weight = tensorFromWeightHandle(weight_handles[0]).*,
+                    .router_bias = null,
+                    .experts = template.experts,
+                    .use_mxfp4 = template.use_mxfp4,
+                    .use_swiglu_variant = template.use_swiglu_variant,
+                    .use_transposed_weights = template.use_transposed_weights,
+                    .layer_idx = template.layer_idx,
+                    .kernel_name = template.kernel_name,
+                };
+                if (moe_local.experts.len != 1) return error.UnsupportedModel;
+                const gate_weight = tensorFromWeightHandle(weight_handles[1]).*;
+                const up_weight = tensorFromWeightHandle(weight_handles[2]).*;
+                const down_weight = tensorFromWeightHandle(weight_handles[3]).*;
+                if (moe_local.experts[0].gate_proj != null) {
+                    moe_local.experts[0].gate_proj = gate_weight;
                 }
+                if (moe_local.experts[0].up_proj != null) {
+                    moe_local.experts[0].up_proj = up_weight;
+                } else if (moe_local.experts[0].gate_up_proj != null) {
+                    moe_local.experts[0].gate_up_proj = gate_weight;
+                }
+                moe_local.experts[0].down_proj = down_weight;
+                if (moe_local.experts[0].gate_scales) |gate_scales| {
+                    moe_local.experts[0].gate_scales = optionalScaleSliceFromWeightHandle(weight_handles[5], gate_scales.len);
+                }
+                if (moe_local.experts[0].up_scales) |up_scales| {
+                    moe_local.experts[0].up_scales = optionalScaleSliceFromWeightHandle(weight_handles[6], up_scales.len);
+                }
+                if (moe_local.experts[0].down_scales) |down_scales| {
+                    moe_local.experts[0].down_scales = optionalScaleSliceFromWeightHandle(weight_handles[7], down_scales.len);
+                }
+                if (moe_local.experts[0].gate_bias) |gate_bias| {
+                    moe_local.experts[0].gate_bias = optionalBiasSliceFromWeightHandle(weight_handles[8], gate_bias.len);
+                }
+                if (moe_local.experts[0].up_bias) |up_bias| {
+                    moe_local.experts[0].up_bias = optionalBiasSliceFromWeightHandle(weight_handles[9], up_bias.len);
+                }
+                if (moe_local.experts[0].down_bias) |down_bias| {
+                    moe_local.experts[0].down_bias = optionalBiasSliceFromWeightHandle(weight_handles[10], down_bias.len);
+                }
+                moe_local.router_bias = optionalBiasSliceFromWeightHandle(weight_handles[4], moe_local.num_experts);
+                // Router quant auxiliaries are part of the flattened slot contract.
+                // CPU dense router path does not consume them in this opcode.
+                _ = optionalTensorFromWeightHandle(weight_handles[11]);
+                _ = optionalTensorFromWeightHandle(weight_handles[12]);
                 try dispatchMoeWithMode(state, input, output, &moe_local);
                 return;
             },
             .mamba_mixer => {
-                if (weight_handles.len != 5) return error.InvalidWeightRefCount;
-                if (state.op_index >= state.block.instruction_mamba_refs.len) return error.InvalidInstructionIndex;
-                const bound = state.block.instruction_mamba_refs[state.op_index] orelse return error.MissingKernelBinding;
-                var mamba_local = bound.*;
-                mamba_local.weights.in_proj = tensorFromWeightHandle(weight_handles[0]);
-                mamba_local.weights.conv1d_weight = tensorFromWeightHandle(weight_handles[1]);
-                mamba_local.weights.A_log = tensorFromWeightHandle(weight_handles[2]);
-                mamba_local.weights.D = tensorFromWeightHandle(weight_handles[3]);
-                mamba_local.weights.out_proj = tensorFromWeightHandle(weight_handles[4]);
+                if (weight_handles.len != 12) return error.InvalidWeightRefCount;
+                if (state.op_index >= state.block.instruction_mamba_bindings.len) return error.InvalidInstructionIndex;
+                const template = state.block.instruction_mamba_bindings[state.op_index] orelse return error.MissingKernelBinding;
+                var mamba_local = mamba_kernel.MambaKernel{
+                    .config = template.config,
+                    .weights = .{
+                        .in_proj = tensorFromWeightHandle(weight_handles[0]),
+                        .conv1d_weight = tensorFromWeightHandle(weight_handles[1]),
+                        .conv1d_bias = optionalTensorFromWeightHandle(weight_handles[5]),
+                        .A_log = tensorFromWeightHandle(weight_handles[2]),
+                        .D = tensorFromWeightHandle(weight_handles[3]),
+                        .dt_bias = optionalTensorFromWeightHandle(weight_handles[6]),
+                        .norm_weight = optionalTensorFromWeightHandle(weight_handles[7]),
+                        .out_proj = tensorFromWeightHandle(weight_handles[4]),
+                    },
+                    .matmul_in_proj = template.matmul_in_proj,
+                    .matmul_out_proj = template.matmul_out_proj,
+                    .ssm_scan = template.ssm_scan,
+                    .layer_idx = template.layer_idx,
+                };
+                // Phase-5 slot contract carries these optional/fused follow-on weights.
+                // CPU mamba mixer kernel does not consume them directly in this opcode.
+                _ = tensorFromWeightHandle(weight_handles[8]);
+                _ = optionalTensorFromWeightHandle(weight_handles[9]);
+                _ = optionalTensorFromWeightHandle(weight_handles[10]);
+                _ = optionalTensorFromWeightHandle(weight_handles[11]);
                 try dispatchMambaWithMode(state, insn, state_blocks, input, output, &mamba_local);
                 return;
             },
             .shortconv => {
-                if (weight_handles.len != 3) return error.InvalidWeightRefCount;
-                if (state.op_index >= state.block.instruction_shortconv_refs.len) return error.InvalidInstructionIndex;
-                const bound = state.block.instruction_shortconv_refs[state.op_index] orelse return error.MissingKernelBinding;
-                var shortconv_local = bound.*;
-                shortconv_local.weights.in_proj = tensorFromWeightHandle(weight_handles[0]);
-                shortconv_local.weights.conv1d_weight = tensorFromWeightHandle(weight_handles[1]);
-                shortconv_local.weights.out_proj = tensorFromWeightHandle(weight_handles[2]);
+                if (weight_handles.len != 4) return error.InvalidWeightRefCount;
+                if (state.op_index >= state.block.instruction_shortconv_bindings.len) return error.InvalidInstructionIndex;
+                const template = state.block.instruction_shortconv_bindings[state.op_index] orelse return error.MissingKernelBinding;
+                var shortconv_local = shortconv_kernel.ShortConvKernel{
+                    .config = template.config,
+                    .weights = .{
+                        .in_proj = tensorFromWeightHandle(weight_handles[0]),
+                        .conv1d_weight = tensorFromWeightHandle(weight_handles[1]),
+                        .conv1d_bias = optionalTensorFromWeightHandle(weight_handles[3]),
+                        .out_proj = tensorFromWeightHandle(weight_handles[2]),
+                    },
+                    .matmul_in_proj = template.matmul_in_proj,
+                    .matmul_out_proj = template.matmul_out_proj,
+                    .matmul_in_proj_name = template.matmul_in_proj_name,
+                    .matmul_out_proj_name = template.matmul_out_proj_name,
+                    .layer_idx = template.layer_idx,
+                    .conv_weight_transposed = template.conv_weight_transposed,
+                    .weight_allocator = template.weight_allocator,
+                };
                 try dispatchShortConvWithMode(state, insn, state_blocks, input, output, &shortconv_local);
                 return;
             },
@@ -1390,35 +1751,28 @@ pub const Block = struct {
         output: *Tensor,
         kernel: *const attn_kernel.MultiHeadAttention,
     ) !void {
-        try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
         const instruction_state_id = if (insn.state_block_id) |state_id|
             @as(?u8, state_id)
         else
             runtime_contract.requiredStateBlockIdForOpcode(insn.opcode);
-        const shared_state = state.slot_ctx.sharedState();
-        if (instruction_state_id != null and shared_state.batched_cache == null) {
-            return runtime.SlotContextError.MissingBatchedCache;
+        if (instruction_state_id == null) {
+            var stateless_cache = runtime.AttnCache{};
+            try kernel.forward(
+                input,
+                output,
+                &stateless_cache,
+                &state.scratch.attn_scratch,
+                &state.scratch.matmul_scratch,
+                false,
+            );
+            return;
         }
-        if (instruction_state_id == null and shared_state.batched_cache == null) {
-            const slot_state = state.slot_ctx.slotState();
-            if (slot_state.attn_cache) |*attn_cache| {
-                try kernel.forward(
-                    input,
-                    output,
-                    attn_cache,
-                    &state.scratch.attn_scratch,
-                    &state.scratch.matmul_scratch,
-                    state.slot_ctx.use_cache,
-                );
-                return;
-            }
-            return runtime.SlotContextError.MissingAttentionCache;
-        }
+        const batched_cache = try requireLayerBatchedCacheForInstruction(state, insn, state_blocks);
         switch (state.mode) {
             .single_slot => try kernel.forwardWithBatchedCache(
                 input,
                 output,
-                shared_state.batched_cache orelse return runtime.SlotContextError.MissingBatchedCache,
+                batched_cache,
                 state.slot_index,
                 &state.scratch.attn_scratch,
                 &state.scratch.matmul_scratch,
@@ -1427,7 +1781,7 @@ pub const Block = struct {
             .slot_batch => try kernel.forwardWithBatchedCacheSlots(
                 input,
                 output,
-                shared_state.batched_cache orelse return runtime.SlotContextError.MissingBatchedCache,
+                batched_cache,
                 state.slot_indices,
                 &state.scratch.attn_scratch,
                 &state.scratch.matmul_scratch,
@@ -1445,16 +1799,19 @@ pub const Block = struct {
         kernel: *const mla_kernel.MLAttention,
     ) !void {
         if (!state.use_batched_dispatch) return error.InvalidStateDescriptorBinding;
-        try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
+        _ = insn;
+        _ = state_blocks;
         if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
-        const slot_state = state.slot_ctx.slotState();
-        const shared_state = state.slot_ctx.sharedState();
+        const slot_state = state.scratch.getSlotState(state.block.block_idx) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        const mla_scratch = state.scratch.getMLAScratch() orelse return runtime.SlotContextError.MissingMlaScratch;
         if (slot_state.mla_cache) |*mla_cache| {
             try kernel.forward(
                 input,
                 output,
                 mla_cache,
-                shared_state.mla_scratch orelse return runtime.SlotContextError.MissingMlaScratch,
+                mla_scratch,
                 &state.scratch.matmul_scratch,
                 state.slot_ctx.use_cache,
             );
@@ -1498,21 +1855,19 @@ pub const Block = struct {
         kernel: *const mamba_kernel.MambaKernel,
     ) !void {
         if (!state.use_batched_dispatch) return error.InvalidStateDescriptorBinding;
-        try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
         if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
-        const slot_state = state.slot_ctx.slotState();
-        const shared_state = state.slot_ctx.sharedState();
-        if (slot_state.mamba_state) |*mamba_state| {
-            try kernel.forward(
-                input,
-                output,
-                mamba_state,
-                shared_state.mamba_scratch orelse return runtime.SlotContextError.MissingMambaScratch,
-                &state.scratch.matmul_scratch,
-            );
-            return;
-        }
-        return runtime.SlotContextError.MissingMambaState;
+        const binding = try requireMambaRuntimeBindingForInstruction(
+            insn,
+            state_blocks,
+            state.block.block_idx,
+        );
+        try kernel.forward(
+            input,
+            output,
+            binding.state,
+            binding.scratch,
+            &state.scratch.matmul_scratch,
+        );
     }
 
     fn dispatchShortConvWithMode(
@@ -1524,21 +1879,19 @@ pub const Block = struct {
         kernel: *const shortconv_kernel.ShortConvKernel,
     ) !void {
         if (!state.use_batched_dispatch) return error.InvalidStateDescriptorBinding;
-        try bindKernelSharedStateFromInstruction(state, insn, state_blocks);
         if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
-        const slot_state = state.slot_ctx.slotState();
-        const shared_state = state.slot_ctx.sharedState();
-        if (slot_state.shortconv_state) |*shortconv_state| {
-            try kernel.forward(
-                input,
-                output,
-                shortconv_state,
-                shared_state.shortconv_scratch orelse return runtime.SlotContextError.MissingShortConvScratch,
-                &state.scratch.matmul_scratch,
-            );
-            return;
-        }
-        return runtime.SlotContextError.MissingShortConvState;
+        const binding = try requireShortConvRuntimeBindingForInstruction(
+            insn,
+            state_blocks,
+            state.block.block_idx,
+        );
+        try kernel.forward(
+            input,
+            output,
+            binding.state,
+            binding.scratch,
+            &state.scratch.matmul_scratch,
+        );
     }
 
     fn residualAddRuntimeAdapter(
@@ -2331,7 +2684,9 @@ pub const Block = struct {
             error_context.setContext("block={d}, op={d}", .{ state.block.block_idx, state.op_index });
             return error.MissingRopeConfig;
         };
-        const slot_state = state.slot_ctx.slotState();
+        const slot_state = state.scratch.getSlotState(state.block.block_idx) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
         const pos_offset = if (state.slot_ctx.use_cache and slot_state.attn_cache != null)
             slot_state.attn_cache.?.cache_position
         else
@@ -2475,40 +2830,69 @@ pub const Block = struct {
         );
     }
 
-    fn bindKernelSharedStateFromInstruction(
+    fn requireLayerBatchedCacheForInstruction(
         state: *RuntimeDispatchState,
         insn: *const runtime_contract.Instruction,
         state_blocks: []const runtime_contract.StateBlockHandle,
-    ) !void {
-        const shared_state = state.slot_ctx.sharedState();
-        const state_id = insn.state_block_id orelse return;
+    ) !*kv_cache.BatchedKVCache {
+        const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
         const raw_state = runtime_contract.statePointerForId(state_blocks, state_id) orelse {
             return error.InvalidStateDescriptorBinding;
         };
-        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
-        const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
-        const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
+        const layered_cache: *LayeredBatchedKVCache = @ptrCast(@alignCast(raw_state));
+        if (state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
+        return layered_cache.getLayer(state.block.block_idx);
+    }
 
-        if (state_id == kv_state_id) {
-            const layered_cache: *LayeredBatchedKVCache = @ptrCast(@alignCast(raw_state));
-            if (state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
-            shared_state.batched_cache = layered_cache.getLayer(state.block.block_idx);
-            return;
-        }
-        if (state_id == shortconv_state_id) {
-            const shortconv_scratch: *runtime.ShortConvScratch = @ptrCast(@alignCast(raw_state));
-            shared_state.shortconv_scratch = shortconv_scratch;
-            return;
-        }
-        if (state_id == mamba_state_id) {
-            const mamba_scratch: *runtime.MambaScratch = @ptrCast(@alignCast(raw_state));
-            shared_state.mamba_scratch = mamba_scratch;
-            return;
-        }
-        // Non-builtin descriptor IDs are valid in Phase-4 generic contracts.
-        // CPU shared-state extraction is only defined for builtins; unknown IDs
-        // are carried through descriptor validation and ignored here.
-        return;
+    fn requireScratchOwnerForInstruction(
+        insn: *const runtime_contract.Instruction,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !*ScratchBuffer {
+        const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
+        const raw_state = runtime_contract.statePointerForId(state_blocks, state_id) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        return @ptrCast(@alignCast(raw_state));
+    }
+
+    const MambaRuntimeBinding = struct {
+        state: *runtime.MambaState,
+        scratch: *runtime.MambaScratch,
+    };
+
+    fn requireMambaRuntimeBindingForInstruction(
+        insn: *const runtime_contract.Instruction,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+        block_idx: usize,
+    ) !MambaRuntimeBinding {
+        const scratch_owner = try requireScratchOwnerForInstruction(insn, state_blocks);
+        const slot_state = scratch_owner.getSlotState(block_idx) orelse return error.InvalidStateDescriptorBinding;
+        const mamba_state = if (slot_state.mamba_state) |*state| state else return error.InvalidStateDescriptorBinding;
+        const mamba_scratch = scratch_owner.getMambaScratch() orelse return error.InvalidStateDescriptorBinding;
+        return .{
+            .state = mamba_state,
+            .scratch = mamba_scratch,
+        };
+    }
+
+    const ShortConvRuntimeBinding = struct {
+        state: *runtime.ShortConvState,
+        scratch: *runtime.ShortConvScratch,
+    };
+
+    fn requireShortConvRuntimeBindingForInstruction(
+        insn: *const runtime_contract.Instruction,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+        block_idx: usize,
+    ) !ShortConvRuntimeBinding {
+        const scratch_owner = try requireScratchOwnerForInstruction(insn, state_blocks);
+        const slot_state = scratch_owner.getSlotState(block_idx) orelse return error.InvalidStateDescriptorBinding;
+        const shortconv_state = if (slot_state.shortconv_state) |*state| state else return error.InvalidStateDescriptorBinding;
+        const shortconv_scratch = scratch_owner.getShortConvScratch() orelse return error.InvalidStateDescriptorBinding;
+        return .{
+            .state = shortconv_state,
+            .scratch = shortconv_scratch,
+        };
     }
 
     fn residualScaleValue(self: *const Block, scale: ResidualScale) f32 {
@@ -2591,13 +2975,8 @@ pub const Block = struct {
         copyTensor(x, out);
 
         // Populate shared scratch only for kernels present in this block.
-        const is_mla = self.planUsesOpcode(.mla_attention);
         const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
-        var shared_state = SharedPersistentState{
-            .mla_scratch = if (is_mla) scratch.getMLAScratch() else null,
-            .mamba_scratch = scratch.getMambaScratch(),
-            .shortconv_scratch = scratch.getShortConvScratch(),
-        };
+        var shared_state = SharedPersistentState{};
         const ctx = SlotContext{
             .slot_state_ptr = slot_state,
             .shared_state = &shared_state,
@@ -2625,6 +3004,7 @@ pub const Block = struct {
             .slot_index = 0,
             .slot_indices = &.{},
             .use_batched_dispatch = false,
+            .bound_state_blocks = &.{},
             .instruction_handles = instruction_handles,
             .instruction_views = instruction_views,
         };
@@ -2777,26 +3157,26 @@ pub const Block = struct {
                         .layer => |n| try writer.print("LayerNorm(dim={}, eps={e})", .{ n.dim, n.eps }),
                     }
                 },
-                .multihead_attention => if (self.instruction_attention_refs[op_index]) |a| {
+                .multihead_attention => if (self.instruction_attention_bindings[op_index]) |a| {
                     try writer.print(": Attention(n_heads={}, head_dim={})", .{ a.n_heads, a.head_dim });
                 },
                 .mla_attention => if (self.instruction_mla_attention_refs[op_index]) |a| {
                     try writer.print(": MLA(n_heads={}, head_dim={})", .{ a.n_heads, a.head_dim });
                 },
-                .swiglu => if (self.instruction_swiglu_refs[op_index]) |m| {
+                .swiglu => if (self.instruction_swiglu_bindings[op_index]) |m| {
                     try writer.print(": MLP(d_ff={})", .{m.d_ff});
                 },
-                .moe => if (self.instruction_moe_refs[op_index]) |e| {
+                .moe => if (self.instruction_moe_bindings[op_index]) |e| {
                     try writer.print(": MoE(experts={}, per_tok={})", .{ e.num_experts, e.experts_per_token });
                 },
-                .mamba_mixer => if (self.instruction_mamba_refs[op_index]) |m| {
+                .mamba_mixer => if (self.instruction_mamba_bindings[op_index]) |m| {
                     try writer.print(": Mamba(d_model={}, d_state={}, d_conv={})", .{
                         m.config.d_model,
                         m.config.d_state,
                         m.config.d_conv,
                     });
                 },
-                .shortconv => if (self.instruction_shortconv_refs[op_index]) |s| {
+                .shortconv => if (self.instruction_shortconv_bindings[op_index]) |s| {
                     try writer.print(": ShortConv(d_model={}, d_conv={})", .{ s.config.d_model, s.config.d_conv });
                 },
                 else => {},
@@ -2871,14 +3251,8 @@ pub const Block = struct {
 
         copyTensor(x, out);
 
-        const is_mla = self.planUsesOpcode(.mla_attention);
         const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
-        var shared_state = SharedPersistentState{
-            .mla_scratch = if (is_mla) scratch.getMLAScratch() else null,
-            .mamba_scratch = null,
-            .shortconv_scratch = null,
-            .state_blocks = state_blocks,
-        };
+        var shared_state = SharedPersistentState{};
         const ctx = SlotContext{
             .slot_state_ptr = slot_state,
             .shared_state = &shared_state,
@@ -2906,6 +3280,7 @@ pub const Block = struct {
             .slot_index = slot_index,
             .slot_indices = &.{},
             .use_batched_dispatch = true,
+            .bound_state_blocks = state_blocks,
             .instruction_handles = instruction_handles,
             .instruction_views = instruction_views,
         };
@@ -2956,14 +3331,8 @@ pub const Block = struct {
 
         copyTensor(x, out);
 
-        const is_mla = self.planUsesOpcode(.mla_attention);
         const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
-        var shared_state = SharedPersistentState{
-            .mla_scratch = if (is_mla) scratch.getMLAScratch() else null,
-            .mamba_scratch = null,
-            .shortconv_scratch = null,
-            .state_blocks = state_blocks,
-        };
+        var shared_state = SharedPersistentState{};
         const ctx = SlotContext{
             .slot_state_ptr = slot_state,
             .shared_state = &shared_state,
@@ -2991,6 +3360,7 @@ pub const Block = struct {
             .slot_index = 0,
             .slot_indices = slot_indices,
             .use_batched_dispatch = true,
+            .bound_state_blocks = state_blocks,
             .instruction_handles = instruction_handles,
             .instruction_views = instruction_views,
         };
@@ -3308,9 +3678,9 @@ test "Block caches kernel instruction bindings at init" {
     defer block.deinit(allocator);
 
     try testing.expectEqual(block.compiled_plan.plan.instructions.len, block.instruction_norm_refs.len);
-    try testing.expectEqual(block.compiled_plan.plan.instructions.len, block.instruction_attention_refs.len);
+    try testing.expectEqual(block.compiled_plan.plan.instructions.len, block.instruction_attention_bindings.len);
     try testing.expect(block.instruction_norm_refs[0] != null);
-    try testing.expect(block.instruction_attention_refs[1] != null);
+    try testing.expect(block.instruction_attention_bindings[1] != null);
     try testing.expectEqual(block.compiled_plan.plan.instructions.len + 1, block.instruction_weight_offsets.len);
     try testing.expect(block.instruction_weight_ptrs.len != 0);
     try testing.expect(block.instruction_weight_ptrs[0] != null);

@@ -63,7 +63,6 @@ pub const SharedPersistentState = struct {
     mla_scratch: ?*MLATemp = null,
     mamba_scratch: ?*MambaScratch = null,
     shortconv_scratch: ?*ShortConvScratch = null,
-    state_blocks: []const runtime_contract.StateBlockHandle = &.{},
 };
 
 /// Scratch buffers shared across transformer forward pass.

@@ -1315,61 +1315,6 @@ pub const LocalEngine = struct {
         return self.runWithScheduler(prompt, config);
     }
 
-    fn prefillWithTemporarySlot0StateBinding(
-        self: *LocalEngine,
-        tokens: []const u32,
-        logits_out: []f32,
-    ) !void {
-        if (self.scheduler_state_descriptors.len == 0) {
-            try self.backend.prefill(tokens, logits_out);
-            return;
-        }
-
-        const TempStateStorage = struct { bytes: []align(64) u8 };
-        const descriptors = self.scheduler_state_descriptors;
-        const state_blocks = try self.allocator.alloc(runtime_contract.StateBlockHandle, descriptors.len);
-        defer self.allocator.free(state_blocks);
-        const state_storage = try self.allocator.alloc(TempStateStorage, descriptors.len);
-        defer self.allocator.free(state_storage);
-
-        var initialized: usize = 0;
-        errdefer {
-            for (state_storage[0..initialized]) |entry| self.allocator.free(entry.bytes);
-        }
-
-        for (descriptors, 0..) |descriptor, idx| {
-            if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) {
-                return error.InvalidStateDescriptorBinding;
-            }
-            const size_bytes = std.math.cast(usize, descriptor.size_bytes) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            if (size_bytes == 0) return error.InvalidStateDescriptorBinding;
-            const bytes = try self.allocator.alignedAlloc(u8, .@"64", size_bytes);
-            state_storage[idx] = .{ .bytes = bytes };
-            initialized += 1;
-
-            const should_zero = runtime_contract.shouldZeroStateForLifecycleAction(&descriptor, .alloc) catch |err| switch (err) {
-                error.InvalidStateLifecycleAction => false,
-                else => return err,
-            };
-            if (should_zero) @memset(bytes, 0);
-            state_blocks[idx] = .{
-                .id = descriptor.id,
-                .ptr = @ptrCast(bytes.ptr),
-                .size = @intCast(bytes.len),
-                .align_bytes = descriptor.align_bytes,
-            };
-        }
-        defer {
-            for (state_storage) |entry| self.allocator.free(entry.bytes);
-        }
-
-        try self.backend.bindSlotStateBlocks(0, state_blocks);
-        defer self.backend.unbindSlotStateBlocks(0);
-        try self.backend.prefill(tokens, logits_out);
-    }
-
     /// Run inference using Scheduler (continuous batching path).
     fn runWithScheduler(
         self: *LocalEngine,
@@ -1432,6 +1377,7 @@ pub const LocalEngine = struct {
             .callback_data = if (config.token_callback != null) @ptrCast(&callback_wrapper) else null,
             .sampling = config.sampling,
             .stop_flag = config.stop_flag,
+            .return_final_logits = true,
         });
         errdefer result.deinit(self.allocator);
 
@@ -1455,10 +1401,11 @@ pub const LocalEngine = struct {
         @memcpy(all_tokens[0..prompt_len], prompt_tokens);
         @memcpy(all_tokens[prompt_len..], result.tokens);
 
-        // Preserve run() behavior: return logits for the final sequence position.
-        const final_logits = try self.allocator.alloc(f32, self.backend.vocabSize());
-        errdefer self.allocator.free(final_logits);
-        try self.prefillWithTemporarySlot0StateBinding(all_tokens, final_logits);
+        if (result.final_logits.len != self.backend.vocabSize()) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        const final_logits = result.final_logits;
+        result.final_logits = &.{};
 
         // Free scheduler result tokens (we've copied them)
         result.deinit(self.allocator);

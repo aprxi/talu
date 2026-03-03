@@ -272,6 +272,12 @@ pub const TransformerBlock = struct {
         return @ptrCast(@alignCast(handle.ptr));
     }
 
+    fn optionalArrayWeightFromHandle(handle: runtime_contract.TensorHandle) ?mlx_graph.ArrayHandle {
+        const value = arrayWeightFromHandle(handle);
+        if (value == &weights_mod.missing_array_weight) return null;
+        return value.*;
+    }
+
     fn layerProgramWeightHandlePtr(
         ctx: *const LayerProgramExecutionContext,
         slot_idx: usize,
@@ -545,8 +551,8 @@ pub const TransformerBlock = struct {
     fn layerProgramAttentionAdapter(
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
-        layer: *const LayerWeights,
         op_index: usize,
+        layer: *const LayerWeights,
         config: ModelConfig,
         attention_multiplier: f32,
         layer_idx: usize,
@@ -560,35 +566,39 @@ pub const TransformerBlock = struct {
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         const input = arraySlotFromHandle(io.inputs[0]).*;
         const weight_handles = try instructionWeightSlice(insn, registers);
-        if (op_index >= layer.instruction_attention_templates.len) return error.InvalidInstructionBinding;
-        const template = layer.instruction_attention_templates[op_index] orelse return error.InvalidInstructionBinding;
-        const output = switch (template) {
-            .mla => |mla_template| blk: {
+        if (op_index >= layer.instruction_attention_storage_kinds.len or op_index >= layer.instruction_attention_uses_mla.len) {
+            return error.InvalidInstructionIndex;
+        }
+        const attention_storage_kind = layer.instruction_attention_storage_kinds[op_index];
+        const uses_mla = layer.instruction_attention_uses_mla[op_index];
+        const output = switch (insn.opcode) {
+            .mla_attention => blk: {
                 if (weight_handles.len != 7) return error.InvalidWeightRefCount;
+                const mla_cfg = layer.mla_config orelse return error.InvalidInstructionBinding;
                 var attention = mla_kernel.MLAttention{
                     .n_heads = @intCast(config.n_heads),
                     .rope_theta = config.rope_theta,
                     .norm_eps = config.norm_eps,
-                    .q_lora_rank = mla_template.config.q_lora_rank,
-                    .kv_lora_rank = mla_template.config.kv_lora_rank,
-                    .qk_head_dim = mla_template.config.qk_head_dim,
-                    .qk_rope_head_dim = mla_template.config.qk_rope_head_dim,
-                    .qk_nope_head_dim = mla_template.config.qk_nope_head_dim,
-                    .v_head_dim = mla_template.config.v_head_dim,
-                    .q_a_proj = mla_template.q_a_proj,
-                    .q_b_proj = mla_template.q_b_proj,
-                    .kv_a_proj = mla_template.kv_a_proj,
-                    .kv_b_proj = mla_template.kv_b_proj,
-                    .q_a_proj_bf16 = mla_template.q_a_proj_bf16,
-                    .q_b_proj_bf16 = mla_template.q_b_proj_bf16,
-                    .kv_a_proj_bf16 = mla_template.kv_a_proj_bf16,
-                    .kv_b_proj_bf16 = mla_template.kv_b_proj_bf16,
+                    .q_lora_rank = mla_cfg.q_lora_rank,
+                    .kv_lora_rank = mla_cfg.kv_lora_rank,
+                    .qk_head_dim = mla_cfg.qk_head_dim,
+                    .qk_rope_head_dim = mla_cfg.qk_rope_head_dim,
+                    .qk_nope_head_dim = mla_cfg.qk_nope_head_dim,
+                    .v_head_dim = mla_cfg.v_head_dim,
+                    .q_a_proj = null,
+                    .q_b_proj = null,
+                    .kv_a_proj = null,
+                    .kv_b_proj = null,
+                    .q_a_proj_bf16 = null,
+                    .q_b_proj_bf16 = null,
+                    .kv_a_proj_bf16 = null,
+                    .kv_b_proj_bf16 = null,
                     .q_a_norm = arrayWeightFromHandle(weight_handles[1]).*,
                     .kv_a_norm = arrayWeightFromHandle(weight_handles[4]).*,
                     .o_proj = null,
                     .o_proj_bf16 = null,
                 };
-                switch (mla_template.storage_kind) {
+                switch (attention_storage_kind) {
                     .quantized => {
                         attention.q_a_proj = quantizedWeightFromHandle(weight_handles[0]).*;
                         attention.q_b_proj = quantizedWeightFromHandle(weight_handles[2]).*;
@@ -616,8 +626,11 @@ pub const TransformerBlock = struct {
                     runtime_rope_dim,
                 );
             },
-            .mha => |mha_template| blk: {
-                if (weight_handles.len != 4) return error.InvalidWeightRefCount;
+            .multihead_attention => blk: {
+                if (weight_handles.len != 11) return error.InvalidWeightRefCount;
+                if (uses_mla) {
+                    return error.InvalidInstructionBinding;
+                }
                 var attention = attention_kernel.MultiHeadAttention{
                     .n_heads = @intCast(config.n_heads),
                     .n_kv_heads = @intCast(config.n_kv_groups),
@@ -634,20 +647,20 @@ pub const TransformerBlock = struct {
                     .k_proj_bf16 = null,
                     .v_proj_bf16 = null,
                     .o_proj_bf16 = null,
-                    .q_norm = mha_template.q_norm,
-                    .k_norm = mha_template.k_norm,
-                    .q_bias = mha_template.q_bias,
-                    .k_bias = mha_template.k_bias,
-                    .v_bias = mha_template.v_bias,
-                    .o_bias = mha_template.o_bias,
-                    .attn_sinks = mha_template.attn_sinks,
+                    .q_norm = optionalArrayWeightFromHandle(weight_handles[4]),
+                    .k_norm = optionalArrayWeightFromHandle(weight_handles[5]),
+                    .q_bias = optionalArrayWeightFromHandle(weight_handles[6]),
+                    .k_bias = optionalArrayWeightFromHandle(weight_handles[7]),
+                    .v_bias = optionalArrayWeightFromHandle(weight_handles[8]),
+                    .o_bias = optionalArrayWeightFromHandle(weight_handles[9]),
+                    .attn_sinks = optionalArrayWeightFromHandle(weight_handles[10]),
                 };
-                switch (mha_template.storage_kind) {
+                switch (attention_storage_kind) {
                     .quantized, .mixed_qkv_quantized_o_dense => {
                         attention.q_proj = quantizedWeightFromHandle(weight_handles[0]).*;
                         attention.k_proj = quantizedWeightFromHandle(weight_handles[1]).*;
                         attention.v_proj = quantizedWeightFromHandle(weight_handles[2]).*;
-                        if (mha_template.storage_kind == .quantized) {
+                        if (attention_storage_kind == .quantized) {
                             attention.o_proj = quantizedWeightFromHandle(weight_handles[3]).*;
                         } else {
                             attention.o_proj_bf16 = arrayWeightFromHandle(weight_handles[3]).*;
@@ -672,6 +685,7 @@ pub const TransformerBlock = struct {
                     runtime_rope_dim,
                 );
             },
+            else => return error.InvalidInstructionBinding,
         };
         arraySlotFromHandle(io.outputs[0]).* = output;
     }
@@ -679,17 +693,17 @@ pub const TransformerBlock = struct {
     fn layerProgramShortConvAdapter(
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
-        layer: *const LayerWeights,
         op_index: usize,
+        layer: *const LayerWeights,
         layer_idx: usize,
         shortconv_cache: ?ShortConvCache,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         const weight_handles = try instructionWeightSlice(insn, registers);
-        if (weight_handles.len != 3) return error.InvalidWeightRefCount;
-        if (op_index >= layer.instruction_shortconv_templates.len) return error.InvalidInstructionBinding;
-        const template = layer.instruction_shortconv_templates[op_index] orelse return error.InvalidInstructionBinding;
+        if (weight_handles.len != 4) return error.InvalidWeightRefCount;
+        if (op_index >= layer.instruction_shortconv_storage_kinds.len) return error.InvalidInstructionIndex;
+        const storage_kind = layer.instruction_shortconv_storage_kinds[op_index];
         const input = arraySlotFromHandle(io.inputs[0]).*;
         var shortconv = shortconv_kernel.ShortConvKernel{
             .in_proj = null,
@@ -697,11 +711,11 @@ pub const TransformerBlock = struct {
             .in_proj_bf16 = null,
             .out_proj_bf16 = null,
             .conv_weight = arrayWeightFromHandle(weight_handles[1]).*,
-            .conv_bias = template.conv_bias,
-            .d_conv = template.d_conv,
-            .conv_dim = template.conv_dim,
+            .conv_bias = optionalArrayWeightFromHandle(weight_handles[3]),
+            .d_conv = layer.shortconv_d_conv,
+            .conv_dim = layer.shortconv_conv_dim,
         };
-        switch (template.storage_kind) {
+        switch (storage_kind) {
             .quantized => {
                 shortconv.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
                 shortconv.out_proj = quantizedWeightFromHandle(weight_handles[2]).*;
@@ -719,8 +733,8 @@ pub const TransformerBlock = struct {
     fn layerProgramSwiGluAdapter(
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
-        layer: *const LayerWeights,
         op_index: usize,
+        layer: *const LayerWeights,
         use_gelu: bool,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
@@ -728,9 +742,8 @@ pub const TransformerBlock = struct {
         const input = arraySlotFromHandle(io.inputs[0]).*;
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != 3) return error.InvalidWeightRefCount;
-        if (op_index >= layer.instruction_swiglu_templates.len) return error.InvalidInstructionBinding;
-        const template = layer.instruction_swiglu_templates[op_index] orelse return error.InvalidInstructionBinding;
-        const ffn_storage_kind = template.storage_kind;
+        if (op_index >= layer.instruction_ffn_storage_kinds.len) return error.InvalidInstructionIndex;
+        const ffn_storage_kind = layer.instruction_ffn_storage_kinds[op_index];
         if (ffn_storage_kind != .quantized and ffn_storage_kind != .dense) return error.InvalidInstructionBinding;
         var dense = ffn_kernel.SwiGLU{
             .use_gelu = use_gelu,
@@ -758,21 +771,34 @@ pub const TransformerBlock = struct {
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
         layer: *const LayerWeights,
-        op_index: usize,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
-        const input = arraySlotFromHandle(io.inputs[0]).*;
         const weight_handles = try instructionWeightSlice(insn, registers);
-        if (weight_handles.len != 3) return error.InvalidWeightRefCount;
-        if (op_index >= layer.instruction_moe_templates.len) return error.InvalidInstructionBinding;
-        const template = layer.instruction_moe_templates[op_index] orelse return error.InvalidInstructionBinding;
-        var runtime_moe = template.template_ptr.*;
-        runtime_moe.router_w = arrayWeightFromHandle(weight_handles[0]).*;
-        runtime_moe.up_w = arrayWeightFromHandle(weight_handles[1]).*;
-        runtime_moe.down_w = arrayWeightFromHandle(weight_handles[2]).*;
+        if (weight_handles.len != 13) return error.InvalidWeightRefCount;
+        if (layer.moe_num_experts == 0 or layer.moe_experts_per_token == 0) return error.InvalidInstructionBinding;
+        var runtime_template = weights_mod.WeightHandles.MoEWeights{
+            .router_w = arrayWeightFromHandle(weight_handles[0]).*,
+            .router_s = optionalArrayWeightFromHandle(weight_handles[11]),
+            .router_b = optionalArrayWeightFromHandle(weight_handles[12]),
+            .router_bias = optionalArrayWeightFromHandle(weight_handles[4]),
+            .gate_w = arrayWeightFromHandle(weight_handles[1]).*,
+            .gate_s = arrayWeightFromHandle(weight_handles[5]).*,
+            .up_w = arrayWeightFromHandle(weight_handles[2]).*,
+            .up_s = arrayWeightFromHandle(weight_handles[6]).*,
+            .down_w = arrayWeightFromHandle(weight_handles[3]).*,
+            .down_s = arrayWeightFromHandle(weight_handles[7]).*,
+            .gate_bias = optionalArrayWeightFromHandle(weight_handles[8]),
+            .up_bias = optionalArrayWeightFromHandle(weight_handles[9]),
+            .down_bias = optionalArrayWeightFromHandle(weight_handles[10]),
+            .router_group_size = layer.moe_router_group_size,
+            .expert_group_size = layer.moe_expert_group_size,
+            .num_experts = layer.moe_num_experts,
+            .experts_per_token = layer.moe_experts_per_token,
+        };
+        const input = arraySlotFromHandle(io.inputs[0]).*;
         const kernel = moe_kernel.MoEFFN{
-            .weights = &runtime_moe,
+            .weights = &runtime_template,
         };
         const output = try runMoeFfnKernel(input, kernel);
         arraySlotFromHandle(io.outputs[0]).* = output;
@@ -781,8 +807,8 @@ pub const TransformerBlock = struct {
     fn layerProgramMambaAdapter(
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
-        layer: *const LayerWeights,
         op_index: usize,
+        layer: *const LayerWeights,
         config: ModelConfig,
         use_gelu: bool,
         residual_multiplier: f32,
@@ -792,43 +818,58 @@ pub const TransformerBlock = struct {
         const io = try instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         const weight_handles = try instructionWeightSlice(insn, registers);
-        if (weight_handles.len != 5) return error.InvalidWeightRefCount;
-        if (op_index >= layer.instruction_mamba_templates.len) return error.InvalidInstructionBinding;
-        const template = layer.instruction_mamba_templates[op_index] orelse return error.InvalidInstructionBinding;
+        if (weight_handles.len != 12) return error.InvalidWeightRefCount;
         const input = arraySlotFromHandle(io.inputs[0]).*;
+        if (op_index >= layer.instruction_mamba_storage_kinds.len or
+            op_index >= layer.instruction_mamba_has_ffn.len or
+            op_index >= layer.instruction_mamba_gate_up_layouts.len)
+        {
+            return error.InvalidInstructionIndex;
+        }
+        const storage_kind = layer.instruction_mamba_storage_kinds[op_index];
+        if (storage_kind == .missing or storage_kind == .invalid) return error.InvalidInstructionBinding;
+        const has_ffn = layer.instruction_mamba_has_ffn[op_index];
         var mamba = mamba_kernel.MambaKernel{
-            .d_state = template.d_state,
-            .d_conv = template.d_conv,
-            .n_heads = template.n_heads,
-            .d_head = template.d_head,
-            .n_groups = template.n_groups,
+            .d_state = layer.mamba_d_state,
+            .d_conv = layer.mamba_d_conv,
+            .n_heads = layer.mamba_n_heads,
+            .d_head = layer.mamba_d_head,
+            .n_groups = layer.mamba_n_groups,
             .use_gelu = use_gelu,
             .residual_multiplier = residual_multiplier,
             .norm_eps = config.norm_eps,
-            .gate_up_layout = template.gate_up_layout,
-            .ln1_weight = template.ln1_weight,
+            .gate_up_layout = layer.instruction_mamba_gate_up_layouts[op_index],
+            .ln1_weight = arrayWeightFromHandle(weight_handles[8]).*,
             .in_proj = null,
             .in_proj_bf16 = null,
             .conv_weight = arrayWeightFromHandle(weight_handles[1]).*,
-            .conv_bias = template.conv_bias,
+            .conv_bias = optionalArrayWeightFromHandle(weight_handles[5]),
             .a_log = arrayWeightFromHandle(weight_handles[2]).*,
             .d_skip = arrayWeightFromHandle(weight_handles[3]).*,
-            .dt_bias = template.dt_bias,
-            .norm_weight = template.norm_weight,
+            .dt_bias = optionalArrayWeightFromHandle(weight_handles[6]),
+            .norm_weight = optionalArrayWeightFromHandle(weight_handles[7]),
             .out_proj = null,
             .out_proj_bf16 = null,
-            .ln2_weight = template.ln2_weight,
-            .gate_up = template.gate_up,
-            .gate_up_bf16 = template.gate_up_bf16,
-            .down_proj = template.down_proj,
-            .down_proj_bf16 = template.down_proj_bf16,
+            .ln2_weight = optionalArrayWeightFromHandle(weight_handles[9]),
+            .gate_up = null,
+            .gate_up_bf16 = null,
+            .down_proj = null,
+            .down_proj_bf16 = null,
         };
-        if (template.storage_kind == .quantized) {
+        if (storage_kind == .quantized) {
             mamba.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
             mamba.out_proj = quantizedWeightFromHandle(weight_handles[4]).*;
-        } else if (template.storage_kind == .dense) {
+            if (has_ffn) {
+                mamba.gate_up = quantizedWeightFromHandle(weight_handles[10]).*;
+                mamba.down_proj = quantizedWeightFromHandle(weight_handles[11]).*;
+            }
+        } else if (storage_kind == .dense) {
             mamba.in_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
             mamba.out_proj_bf16 = arrayWeightFromHandle(weight_handles[4]).*;
+            if (has_ffn) {
+                mamba.gate_up_bf16 = arrayWeightFromHandle(weight_handles[10]).*;
+                mamba.down_proj_bf16 = arrayWeightFromHandle(weight_handles[11]).*;
+            }
         } else {
             return error.InvalidInstructionBinding;
         }
@@ -886,16 +927,15 @@ pub const TransformerBlock = struct {
     ) !void {
         const state = try layerProgramExecutionState(ctx);
         _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
-        const cache = try requireStateValue(
-            Cache,
-            state_blocks,
-            @intFromEnum(runtime_contract.StateBlockId.kv_cache),
-        );
+        const cache = if (insn.state_block_id) |state_id|
+            try requireStateValue(Cache, state_blocks, state_id)
+        else
+            null;
         try layerProgramAttentionAdapter(
             insn,
             registers,
-            state.layer,
             state.op_index,
+            state.layer,
             state.config,
             state.attention_multiplier,
             state.layer_idx,
@@ -917,16 +957,17 @@ pub const TransformerBlock = struct {
     ) !void {
         const state = try layerProgramExecutionState(ctx);
         _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
+        const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
         const shortconv_cache = try requireStateValue(
             ShortConvCache,
             state_blocks,
-            @intFromEnum(runtime_contract.StateBlockId.shortconv),
+            state_id,
         );
         try layerProgramShortConvAdapter(
             insn,
             registers,
-            state.layer,
             state.op_index,
+            state.layer,
             state.layer_idx,
             shortconv_cache,
         );
@@ -945,8 +986,8 @@ pub const TransformerBlock = struct {
         try layerProgramSwiGluAdapter(
             insn,
             registers,
-            state.layer,
             state.op_index,
+            state.layer,
             state.use_gelu,
         );
     }
@@ -965,7 +1006,6 @@ pub const TransformerBlock = struct {
             insn,
             registers,
             state.layer,
-            state.op_index,
         );
     }
 
@@ -979,16 +1019,17 @@ pub const TransformerBlock = struct {
     ) !void {
         const state = try layerProgramExecutionState(ctx);
         _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
+        const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
         const mamba_cache = try requireStateValue(
             MambaCache,
             state_blocks,
-            @intFromEnum(runtime_contract.StateBlockId.mamba),
+            state_id,
         );
         try layerProgramMambaAdapter(
             insn,
             registers,
-            state.layer,
             state.op_index,
+            state.layer,
             state.config,
             state.use_gelu,
             state.residual_multiplier,
