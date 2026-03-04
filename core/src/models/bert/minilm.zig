@@ -20,6 +20,7 @@ pub const attention_mlp_program: []const layer_ops.LayerOp = &.{
         .in = .residual,
         .out = .branch_out,
         .debug_type = .multihead_attention,
+        .state_block_id = types.kv_cache_state_id,
     } },
     .{ .add = .{
         .branch = .branch_out,

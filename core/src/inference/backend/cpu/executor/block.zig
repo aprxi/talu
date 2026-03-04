@@ -31,6 +31,7 @@ const moe_kernel = @import("../kernels/moe.zig");
 const mamba_kernel = @import("../kernels/mamba.zig");
 const shortconv_kernel = @import("../kernels/shortconv.zig");
 const vision_adapters = @import("../../../vision_program_adapters.zig");
+const state_bindings = @import("../state_bindings.zig");
 
 const Tensor = tensor.Tensor;
 const Attention = attn_kernel.MultiHeadAttention;
@@ -516,7 +517,8 @@ pub const Block = struct {
                 return error.KernelIndexOutOfBounds;
             }
             const kernel = block.kernels[kernel_idx];
-            switch (insn.opcode) {
+            const opcode = insn.opcode;
+            switch (opcode) {
                 .rmsnorm => norm[op_index] = switch (kernel) {
                     .norm => |binding| binding,
                     else => return error.InvalidInstructionBinding,
@@ -658,6 +660,14 @@ pub const Block = struct {
                         return error.MissingWeight;
                     },
                     2 => return @ptrCast(@constCast(ffn_binding.w2)),
+                    3 => if (ffn_binding.w1_bias) |w1_bias|
+                        if (w1_bias.len != 0) return @ptrCast(@constCast(w1_bias.ptr)) else return @ptrCast(&missing_optional_bias_value)
+                    else
+                        return @ptrCast(&missing_optional_bias_value),
+                    4 => if (ffn_binding.w2_bias) |w2_bias|
+                        if (w2_bias.len != 0) return @ptrCast(@constCast(w2_bias.ptr)) else return @ptrCast(&missing_optional_bias_value)
+                    else
+                        return @ptrCast(&missing_optional_bias_value),
                     else => return error.InvalidWeightRefCount,
                 }
             },
@@ -1618,13 +1628,18 @@ pub const Block = struct {
                     },
                 },
                 .layer => |layer| blk: {
-                    // LayerNorm bias is not part of the Phase-5 flattened
-                    // instruction-weight contract for `.rmsnorm`.
-                    if (layer.bias != null) return error.UnsupportedModel;
+                    // Keep batched/scheduler paths strict: LayerNorm bias is not
+                    // part of the `.rmsnorm` instruction slot contract there.
+                    // Vision encode uses non-batched `forward` and still requires
+                    // LayerNorm bias tensors.
+                    const layer_bias = if (state.use_batched_dispatch) bias: {
+                        if (layer.bias != null) return error.UnsupportedModel;
+                        break :bias null;
+                    } else layer.bias;
                     break :blk norm_kernel.NormKernel{
                         .layer = .{
                             .weight = weight,
-                            .bias = null,
+                            .bias = layer_bias,
                             .dim = layer.dim,
                             .eps = layer.eps,
                             .layer_idx = layer.layer_idx,
@@ -1728,13 +1743,10 @@ pub const Block = struct {
             try dispatchMlaAttentionWithMode(state, insn, state_blocks, input, output, &mla_local);
             return;
         } else if (comptime expected_opcode == .swiglu) {
-            if (weight_handles.len != 3) return error.InvalidWeightRefCount;
+            if (weight_handles.len != 5) return error.InvalidWeightRefCount;
             if (state.op_index >= state.block.instruction_swiglu_bindings.len) return error.InvalidInstructionIndex;
             if (state.op_index >= state.block.instruction_swiglu_projection_modes.len) return error.InvalidInstructionIndex;
             const template = state.block.instruction_swiglu_bindings[state.op_index] orelse return error.MissingKernelBinding;
-            // FFN bias tensors are intentionally not part of `.swiglu` Phase-5
-            // instruction slots; forbid hidden execute-path fallback.
-            if (template.w1_bias != null or template.w2_bias != null) return error.UnsupportedModel;
             var ffn_local = ffn_kernel.SwiGLU{
                 .d_model = template.d_model,
                 .d_ff = template.d_ff,
@@ -1744,8 +1756,8 @@ pub const Block = struct {
                 .w1 = null,
                 .w2 = tensorFromWeightHandle(weight_handles[2]),
                 .w3 = null,
-                .w1_bias = null,
-                .w2_bias = null,
+                .w1_bias = optionalBiasSliceFromWeightHandle(weight_handles[3], template.d_ff),
+                .w2_bias = optionalBiasSliceFromWeightHandle(weight_handles[4], template.d_model),
                 .fused_gate_up = null,
                 .fused_gate_up_layout = template.fused_gate_up_layout,
                 .allocator = template.allocator,
@@ -1900,10 +1912,7 @@ pub const Block = struct {
         output: *Tensor,
         kernel: *const attn_kernel.MultiHeadAttention,
     ) !void {
-        const instruction_state_id = if (insn.state_block_id) |state_id|
-            @as(?u8, state_id)
-        else
-            runtime_contract.requiredStateBlockIdForOpcode(insn.opcode);
+        const instruction_state_id = insn.state_block_id;
         if (instruction_state_id == null) {
             var stateless_cache = runtime.AttnCache{};
             try kernel.forward(
@@ -1948,25 +1957,20 @@ pub const Block = struct {
         kernel: *const mla_kernel.MLAttention,
     ) !void {
         if (!state.use_batched_dispatch) return error.InvalidStateDescriptorBinding;
-        _ = insn;
-        _ = state_blocks;
         if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
-        const slot_state = state.scratch.getSlotState(state.block.block_idx) orelse {
-            return error.InvalidStateDescriptorBinding;
-        };
-        const mla_scratch = state.scratch.getMLAScratch() orelse return runtime.SlotContextError.MissingMlaScratch;
-        if (slot_state.mla_cache) |*mla_cache| {
-            try kernel.forward(
-                input,
-                output,
-                mla_cache,
-                mla_scratch,
-                &state.scratch.matmul_scratch,
-                state.slot_ctx.use_cache,
-            );
-            return;
-        }
-        return runtime.SlotContextError.MissingMlaCache;
+        const binding = try requireMlaRuntimeBindingForInstruction(
+            insn,
+            state_blocks,
+            state.block.block_idx,
+        );
+        try kernel.forward(
+            input,
+            output,
+            binding.cache,
+            binding.scratch,
+            &state.scratch.matmul_scratch,
+            state.slot_ctx.use_cache,
+        );
     }
 
     fn dispatchSwiGluWithMode(
@@ -2833,7 +2837,7 @@ pub const Block = struct {
             error_context.setContext("block={d}, op={d}", .{ state.block.block_idx, state.op_index });
             return error.MissingRopeConfig;
         };
-        const slot_state = state.scratch.getSlotState(state.block.block_idx) orelse {
+        const slot_state = state.scratch.getSlotLayerState(state.slot_index, state.block.block_idx) orelse {
             return error.InvalidStateDescriptorBinding;
         };
         const pos_offset = if (state.slot_ctx.use_cache and slot_state.attn_cache != null)
@@ -2985,23 +2989,48 @@ pub const Block = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !*kv_cache.BatchedKVCache {
         const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
-        const raw_state = runtime_contract.statePointerForId(state_blocks, state_id) orelse {
+        const state_block = runtime_contract.findStateBlock(state_blocks, state_id) orelse {
             return error.InvalidStateDescriptorBinding;
         };
-        const layered_cache: *LayeredBatchedKVCache = @ptrCast(@alignCast(raw_state));
-        if (state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
-        return layered_cache.getLayer(state.block.block_idx);
+        const state_value = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, state_block) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        if (state_value.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        if (state.block.block_idx >= state_value.layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
+        return state_value.layered_cache.getLayer(state.block.block_idx);
     }
 
-    fn requireScratchOwnerForInstruction(
+    const MlaRuntimeBinding = struct {
+        cache: *runtime.MLACache,
+        scratch: *runtime.MLATemp,
+    };
+
+    fn requireMlaRuntimeBindingForInstruction(
         insn: *const runtime_contract.Instruction,
         state_blocks: []const runtime_contract.StateBlockHandle,
-    ) !*ScratchBuffer {
+        block_idx: usize,
+    ) !MlaRuntimeBinding {
         const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
-        const raw_state = runtime_contract.statePointerForId(state_blocks, state_id) orelse {
+        const state_block = runtime_contract.findStateBlock(state_blocks, state_id) orelse {
             return error.InvalidStateDescriptorBinding;
         };
-        return @ptrCast(@alignCast(raw_state));
+        const state_value = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, state_block) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        if (state_value.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        const slot_state = state_value.scratch.getSlotLayerState(state_value.slot_index, block_idx) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        const mla_cache = if (slot_state.mla_cache) |*cache| cache else return runtime.SlotContextError.MissingMlaCache;
+        const mla_scratch = state_value.scratch.getMLAScratch() orelse return runtime.SlotContextError.MissingMlaScratch;
+        return .{
+            .cache = mla_cache,
+            .scratch = mla_scratch,
+        };
     }
 
     const MambaRuntimeBinding = struct {
@@ -3014,10 +3043,21 @@ pub const Block = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
         block_idx: usize,
     ) !MambaRuntimeBinding {
-        const scratch_owner = try requireScratchOwnerForInstruction(insn, state_blocks);
-        const slot_state = scratch_owner.getSlotState(block_idx) orelse return error.InvalidStateDescriptorBinding;
+        const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
+        const state_block = runtime_contract.findStateBlock(state_blocks, state_id) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        const recurrent_state = runtime_contract.stateValueFromBlock(*state_bindings.RecurrentRuntimeState, state_block) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        if (recurrent_state.runtime_kind != runtime_contract.state_runtime_kind_mamba_cache) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        const slot_state = recurrent_state.scratch.getSlotLayerState(recurrent_state.slot_index, block_idx) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
         const mamba_state = if (slot_state.mamba_state) |*state| state else return error.InvalidStateDescriptorBinding;
-        const mamba_scratch = scratch_owner.getMambaScratch() orelse return error.InvalidStateDescriptorBinding;
+        const mamba_scratch = recurrent_state.scratch.getMambaScratch() orelse return error.InvalidStateDescriptorBinding;
         return .{
             .state = mamba_state,
             .scratch = mamba_scratch,
@@ -3034,10 +3074,21 @@ pub const Block = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
         block_idx: usize,
     ) !ShortConvRuntimeBinding {
-        const scratch_owner = try requireScratchOwnerForInstruction(insn, state_blocks);
-        const slot_state = scratch_owner.getSlotState(block_idx) orelse return error.InvalidStateDescriptorBinding;
+        const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
+        const state_block = runtime_contract.findStateBlock(state_blocks, state_id) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        const recurrent_state = runtime_contract.stateValueFromBlock(*state_bindings.RecurrentRuntimeState, state_block) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        if (recurrent_state.runtime_kind != runtime_contract.state_runtime_kind_shortconv_cache) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        const slot_state = recurrent_state.scratch.getSlotLayerState(recurrent_state.slot_index, block_idx) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
         const shortconv_state = if (slot_state.shortconv_state) |*state| state else return error.InvalidStateDescriptorBinding;
-        const shortconv_scratch = scratch_owner.getShortConvScratch() orelse return error.InvalidStateDescriptorBinding;
+        const shortconv_scratch = recurrent_state.scratch.getShortConvScratch() orelse return error.InvalidStateDescriptorBinding;
         return .{
             .state = shortconv_state,
             .scratch = shortconv_scratch,
@@ -3124,7 +3175,7 @@ pub const Block = struct {
         copyTensor(x, out);
 
         // Populate shared scratch only for kernels present in this block.
-        const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
+        const slot_state = scratch.getSlotLayerState(0, self.block_idx) orelse return error.InvalidState;
         var shared_state = SharedPersistentState{};
         const ctx = SlotContext{
             .slot_state_ptr = slot_state,
@@ -3297,7 +3348,8 @@ pub const Block = struct {
         for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
             try writer.writeByteNTimes(' ', indent + 2);
             try writer.print("[{}] {s}", .{ op_index, @tagName(insn.opcode) });
-            switch (insn.opcode) {
+            const opcode = insn.opcode;
+            switch (opcode) {
                 .rmsnorm => if (self.instruction_norm_refs[op_index]) |binding| {
                     try writer.writeAll(": ");
                     const norm = binding.*;
@@ -3400,7 +3452,7 @@ pub const Block = struct {
 
         copyTensor(x, out);
 
-        const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
+        const slot_state = scratch.getSlotLayerState(slot_index, self.block_idx) orelse return error.InvalidState;
         var shared_state = SharedPersistentState{};
         const ctx = SlotContext{
             .slot_state_ptr = slot_state,
@@ -3683,7 +3735,7 @@ test "Block.getHiddenSize returns correct hidden size" {
 
     const program = [_]LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
-        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention, .state_block_id = runtime_contract.kv_cache_state_id } },
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
     };
 
@@ -3723,7 +3775,7 @@ test "Block.getAttention returns valid attention reference" {
     defer transformer_block.deinit(allocator);
 
     const program = [_]LayerOp{
-        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention, .state_block_id = runtime_contract.kv_cache_state_id } },
     };
 
     var block = try createTestBlock(allocator, &transformer_block, 128, &program);
@@ -3771,7 +3823,7 @@ test "Block.validate accepts valid program with all required weights" {
 
     const program = [_]LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
-        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention, .state_block_id = runtime_contract.kv_cache_state_id } },
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
         .{ .kernel = .{ .id = 2, .in = .residual, .out = .norm_out, .debug_type = .norm } },
         .{ .kernel = .{ .id = 3, .in = .norm_out, .out = .branch_out, .debug_type = .mlp } },
@@ -3820,7 +3872,7 @@ test "Block caches kernel instruction bindings at init" {
 
     const program = [_]LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
-        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention, .state_block_id = runtime_contract.kv_cache_state_id } },
     };
 
     var block = try createTestBlock(allocator, &transformer_block, 128, &program);
@@ -3912,7 +3964,7 @@ test "Block.validate rejects stateful opcode incompatible with block kind" {
     defer transformer_block.deinit(allocator);
 
     const program = [_]LayerOp{
-        .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .shortconv } },
+        .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .shortconv, .state_block_id = runtime_contract.shortconv_state_id } },
     };
 
     try testing.expectError(error.InvalidInstructionBinding, createTestBlock(allocator, &transformer_block, 128, &program));
@@ -3937,7 +3989,7 @@ test "Block.validate rejects unexpected state descriptor binding on stateless op
     const insn_mut = @constCast(block.compiled_plan.plan.instructions.ptr);
     insn_mut[0].state_block_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
 
-    try testing.expectError(error.InvalidStateDescriptorBinding, block.validate());
+    try testing.expectError(error.UnknownStateDescriptorId, block.validate());
 }
 
 test "Block.validate detects split with invalid num_outputs" {
@@ -3991,7 +4043,7 @@ test "Block.forward executes simple norm-attn-add program" {
 
     const program = [_]LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
-        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention, .state_block_id = runtime_contract.kv_cache_state_id } },
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
     };
 
@@ -4019,17 +4071,23 @@ test "Block.forward executes simple norm-attn-add program" {
 
     var layered_cache = try LayeredBatchedKVCache.init(allocator, 1, 4, 2, 32, 2048);
     defer layered_cache.deinit();
-    var state_payload align(64) = runtime_contract.StatePointerPayload{
-        .ptr = @ptrCast(&layered_cache),
+    var state_storage align(64) = [_]u8{0} ** @intCast(runtime_contract.builtin_state_block_bytes);
+    var state_block = runtime_contract.StateBlockHandle{
+        .id = @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+        .ptr = @ptrCast(&state_storage),
+        .size = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
     };
-    const state_blocks = [_]runtime_contract.StateBlockHandle{
-        .{
-            .id = @intFromEnum(runtime_contract.StateBlockId.kv_cache),
-            .ptr = @ptrCast(&state_payload),
-            .size = @sizeOf(runtime_contract.StatePointerPayload),
-            .align_bytes = 64,
-        },
+    const state_value0 = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, &state_block) orelse {
+        return error.TestUnexpectedResult;
     };
+    state_value0.* = .{
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+        .layered_cache = &layered_cache,
+        .scratch = &scratch,
+        .slot_index = 0,
+    };
+    const state_blocks = [_]runtime_contract.StateBlockHandle{state_block};
 
     // Execute forward pass
     try block.forwardWithBatchedCache(&input, &output, &scratch, state_blocks[0..], 0, false);
@@ -4056,7 +4114,7 @@ test "Block.forward executes full norm-attn-norm-ffn-add program" {
 
     const program = [_]LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
-        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention, .state_block_id = runtime_contract.kv_cache_state_id } },
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
         .{ .kernel = .{ .id = 2, .in = .residual, .out = .norm_out, .debug_type = .norm } },
         .{ .kernel = .{ .id = 3, .in = .norm_out, .out = .branch_out, .debug_type = .mlp } },
@@ -4087,17 +4145,23 @@ test "Block.forward executes full norm-attn-norm-ffn-add program" {
 
     var layered_cache = try LayeredBatchedKVCache.init(allocator, 1, 4, 2, 32, 2048);
     defer layered_cache.deinit();
-    var state_payload align(64) = runtime_contract.StatePointerPayload{
-        .ptr = @ptrCast(&layered_cache),
+    var state_storage align(64) = [_]u8{0} ** @intCast(runtime_contract.builtin_state_block_bytes);
+    var state_block = runtime_contract.StateBlockHandle{
+        .id = @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+        .ptr = @ptrCast(&state_storage),
+        .size = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
     };
-    const state_blocks = [_]runtime_contract.StateBlockHandle{
-        .{
-            .id = @intFromEnum(runtime_contract.StateBlockId.kv_cache),
-            .ptr = @ptrCast(&state_payload),
-            .size = @sizeOf(runtime_contract.StatePointerPayload),
-            .align_bytes = 64,
-        },
+    const state_value1 = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, &state_block) orelse {
+        return error.TestUnexpectedResult;
     };
+    state_value1.* = .{
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+        .layered_cache = &layered_cache,
+        .scratch = &scratch,
+        .slot_index = 0,
+    };
+    const state_blocks = [_]runtime_contract.StateBlockHandle{state_block};
 
     // Execute forward pass
     try block.forwardWithBatchedCache(&input, &output, &scratch, state_blocks[0..], 0, false);
@@ -4167,7 +4231,7 @@ test "Block.forwardWithBatchedCache executes with batched cache" {
 
     const program = [_]LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
-        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention, .state_block_id = runtime_contract.kv_cache_state_id } },
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
     };
 
@@ -4195,17 +4259,23 @@ test "Block.forwardWithBatchedCache executes with batched cache" {
     // Create layered KV cache state descriptor binding for block 0.
     var layered_cache = try LayeredBatchedKVCache.init(allocator, 1, 4, 2, 32, 2048);
     defer layered_cache.deinit();
-    var state_payload align(64) = runtime_contract.StatePointerPayload{
-        .ptr = @ptrCast(&layered_cache),
+    var state_storage align(64) = [_]u8{0} ** @intCast(runtime_contract.builtin_state_block_bytes);
+    var state_block = runtime_contract.StateBlockHandle{
+        .id = @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+        .ptr = @ptrCast(&state_storage),
+        .size = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
     };
-    const state_blocks = [_]runtime_contract.StateBlockHandle{
-        .{
-            .id = @intFromEnum(runtime_contract.StateBlockId.kv_cache),
-            .ptr = @ptrCast(&state_payload),
-            .size = @sizeOf(runtime_contract.StatePointerPayload),
-            .align_bytes = 64,
-        },
+    const state_value2 = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, &state_block) orelse {
+        return error.TestUnexpectedResult;
     };
+    state_value2.* = .{
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+        .layered_cache = &layered_cache,
+        .scratch = &scratch,
+        .slot_index = 0,
+    };
+    const state_blocks = [_]runtime_contract.StateBlockHandle{state_block};
 
     // Execute forward pass with batched cache
     try block.forwardWithBatchedCache(&input, &output, &scratch, state_blocks[0..], 0, false);
@@ -4270,7 +4340,7 @@ test "Block.forwardWithBatchedCache rejects missing descriptor state blocks for 
 
     const program = [_]LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
-        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention, .state_block_id = runtime_contract.kv_cache_state_id } },
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
     };
 

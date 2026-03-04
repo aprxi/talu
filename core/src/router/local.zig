@@ -42,6 +42,7 @@ const image_mod = @import("../image/root.zig");
 const gen_config_mod = @import("../inference/config/generation.zig");
 const preproc_mod = @import("../inference/config/preprocessor.zig");
 const validate_mod = @import("../validate/root.zig");
+const error_context = @import("../error_context.zig");
 const ConstrainedSampler = validate_mod.sampler.ConstrainedSampler;
 const GrammarConfig = validate_mod.sampler.GrammarConfig;
 const tool_schema_mod = @import("tool_schema.zig");
@@ -49,7 +50,6 @@ const reasoning_parser_mod = responses_mod.reasoning_parser;
 const commit_mod = @import("commit.zig");
 const progress_mod = @import("../capi/progress.zig");
 const runtime_contract = inference.runtime_contract;
-const opcode_map = models.plan.opcode_map;
 
 pub const ResolutionConfig = io.repository.ResolutionConfig;
 pub const BackendInitOptions = backend_root.InitOptions;
@@ -264,8 +264,10 @@ pub const LocalEngine = struct {
         program: []const models.layer_ops.LayerOp,
     ) !void {
         for (program) |op| {
-            const opcode = opcode_map.opcodeForLayerOp(op);
-            const state_id = runtime_contract.stateBlockIdForOpcode(opcode) orelse continue;
+            const state_id = switch (op) {
+                .kernel => |kernel_op| kernel_op.state_block_id orelse continue,
+                else => continue,
+            };
             try runtime_contract.appendUniqueStateDescriptor(
                 storage,
                 count,
@@ -453,8 +455,31 @@ pub const LocalEngine = struct {
             timing_start_ns = now;
         }
 
-        // Warmup: full single-token forward pass to load all weights into memory
-        try compute_backend.warmup();
+        // Warmup: full single-token forward pass to load all weights into memory.
+        // Direct backend entrypoints require explicit descriptor bindings.
+        var warmup_bindings = try allocateTemporaryStateBindingsForDescriptors(
+            allocator,
+            scheduler_state_descriptors,
+        );
+        defer warmup_bindings.deinit(allocator);
+        var warmup_slot_bound = false;
+        defer if (warmup_slot_bound) compute_backend.unbindSlotStateBlocks(0);
+        if (warmup_bindings.handles.len > 0) {
+            compute_backend.bindSlotStateBlocks(0, warmup_bindings.handles) catch |err| {
+                log.warn("inference", "Warmup state bind failed", .{
+                    .reason = @errorName(err),
+                    .state_blocks = warmup_bindings.handles.len,
+                });
+                return err;
+            };
+            warmup_slot_bound = true;
+        }
+        compute_backend.warmup() catch |err| {
+            log.warn("inference", "Backend warmup failed", .{
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         progress.completeLine(1);
 
         {
@@ -825,9 +850,11 @@ pub const LocalEngine = struct {
             .stop_flag = opts.stop_flag,
             .vision_input = vision_input_ptr,
         }) catch |err| {
+            const err_ctx = error_context.consumeContext();
             log.warn("inference", "Scheduler generation failed", .{
                 .err = @errorName(err),
                 .has_vision_input = @as(u8, @intFromBool(vision_input_ptr != null)),
+                .context = if (err_ctx) |ctx| ctx else "",
             });
             return err;
         };
@@ -1461,6 +1488,15 @@ pub const LocalEngine = struct {
         }
     };
 
+    fn allocateTemporaryStateBytes(
+        allocator: std.mem.Allocator,
+        align_bytes: u16,
+        size_bytes: usize,
+    ) ![]align(64) u8 {
+        if (align_bytes == 0 or align_bytes > 64) return error.InvalidStateDescriptorBinding;
+        return try allocator.alignedAlloc(u8, .@"64", size_bytes);
+    }
+
     fn allocateTemporaryStateBindingsForDescriptors(
         allocator: std.mem.Allocator,
         descriptors: []const runtime_contract.StateDescriptor,
@@ -1482,15 +1518,13 @@ pub const LocalEngine = struct {
         }
 
         for (descriptors, 0..) |descriptor, idx| {
-            if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) {
-                return error.InvalidStateDescriptorBinding;
-            }
-            const size_bytes = std.math.cast(usize, descriptor.size_bytes) orelse {
+            const requested_size = std.math.cast(usize, descriptor.size_bytes) orelse {
                 return error.InvalidStateDescriptorBinding;
             };
-            if (size_bytes == 0) return error.InvalidStateDescriptorBinding;
+            const size_bytes = @max(requested_size, @sizeOf(runtime_contract.StatePointerPayload));
+            const align_bytes: u16 = if (descriptor.align_bytes == 0) 64 else descriptor.align_bytes;
 
-            const bytes = try allocator.alignedAlloc(u8, .@"64", size_bytes);
+            const bytes = try allocateTemporaryStateBytes(allocator, align_bytes, size_bytes);
             const should_zero = runtime_contract.shouldZeroStateForLifecycleAction(&descriptor, .alloc) catch |err| switch (err) {
                 error.InvalidStateLifecycleAction => false,
                 else => return err,
@@ -1502,7 +1536,7 @@ pub const LocalEngine = struct {
                 .id = descriptor.id,
                 .ptr = bytes.ptr,
                 .size = @intCast(bytes.len),
-                .align_bytes = descriptor.align_bytes,
+                .align_bytes = align_bytes,
             };
             initialized += 1;
         }

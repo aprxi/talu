@@ -3,6 +3,13 @@
 const std = @import("std");
 const log = @import("../../../log.zig");
 
+fn slotIndexSupported(self: anytype, slot_index: usize) bool {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasDecl(SelfType, "slotIndexSupported")) return self.slotIndexSupported(slot_index);
+    if (comptime @hasField(SelfType, "max_batch_size")) return slot_index < self.max_batch_size;
+    return slot_index == 0;
+}
+
 pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     const SelfType = @TypeOf(self.*);
     if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
@@ -33,6 +40,7 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
         self.computeGpuPrototypeLogitsWithLayerLimit(
             tokens[i],
             i,
+            0,
             if (download_logits) self.slot_logits else null,
             self.block_runtime.blocks.len,
             download_logits,
@@ -82,7 +90,7 @@ pub fn prefillSlot(
         });
         return error.InvalidArgument;
     }
-    if (!self.slot_in_use or slot_index != 0) {
+    if (!self.slot_in_use or !slotIndexSupported(self, slot_index)) {
         log.warn("inference", "CUDA prefillSlot invalid args", .{
             .reason = "slot_state",
             .slot_index = slot_index,
@@ -100,6 +108,7 @@ pub fn prefillSlot(
         self.computeGpuPrototypeLogitsWithLayerLimit(
             tokens[i],
             i,
+            slot_index,
             if (download_logits) self.slot_logits else null,
             self.block_runtime.blocks.len,
             download_logits,
@@ -158,7 +167,7 @@ const MockBackend = struct {
 
     fn ensureSlotStateBlocksBoundForScheduler(self: *MockBackend, slot_index: usize) !void {
         self.ensure_state_binding_calls += 1;
-        if (slot_index != 0) return error.InvalidArgument;
+        if (!slotIndexSupported(self, slot_index)) return error.InvalidArgument;
         if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
     }
 
@@ -171,6 +180,7 @@ const MockBackend = struct {
         self: *MockBackend,
         token: u32,
         position: usize,
+        slot_index: usize,
         logits_out_opt: ?[]f32,
         layer_limit: usize,
         compute_logits: bool,
@@ -182,6 +192,7 @@ const MockBackend = struct {
     ) !void {
         _ = token;
         _ = position;
+        _ = slot_index;
         _ = layer_limit;
         _ = compute_logits;
         _ = download_logits;

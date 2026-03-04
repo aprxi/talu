@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const tensor = @import("../tensor.zig");
+const runtime_contract = @import("../inference/runtime_contract/root.zig");
 
 /// Operation types that can appear in model block metadata.
 /// High-level ops (norm, multihead_attention, mlp) are preferred.
@@ -60,10 +61,12 @@ pub const StateDescriptorSpec = struct {
     align_bytes: u16,
     zero_init: bool,
     lifecycle: StateLifecycle,
+    runtime_kind: u8 = runtime_contract.state_runtime_kind_none,
 };
 
 /// Compatibility payload size for pointer-carried state descriptors.
 pub const compatibility_state_block_bytes: u64 = @sizeOf(?*anyopaque);
+pub const builtin_state_block_bytes: u64 = 64;
 pub const kv_cache_state_id: u8 = 0;
 pub const shortconv_state_id: u8 = 1;
 pub const mamba_state_id: u8 = 2;
@@ -72,24 +75,27 @@ pub const mamba_state_id: u8 = 2;
 pub const default_state_descriptors = [_]StateDescriptorSpec{
     .{
         .id = kv_cache_state_id,
-        .size_bytes = compatibility_state_block_bytes,
+        .size_bytes = builtin_state_block_bytes,
         .align_bytes = 64,
         .zero_init = false,
         .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
     },
     .{
         .id = shortconv_state_id,
-        .size_bytes = compatibility_state_block_bytes,
+        .size_bytes = builtin_state_block_bytes,
         .align_bytes = 64,
         .zero_init = true,
         .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_shortconv_cache,
     },
     .{
         .id = mamba_state_id,
-        .size_bytes = compatibility_state_block_bytes,
+        .size_bytes = builtin_state_block_bytes,
         .align_bytes = 64,
         .zero_init = true,
         .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_mamba_cache,
     },
 };
 
@@ -101,6 +107,7 @@ pub const default_unknown_state_descriptor = StateDescriptorSpec{
     .align_bytes = 64,
     .zero_init = true,
     .lifecycle = .request_scoped,
+    .runtime_kind = runtime_contract.state_runtime_kind_none,
 };
 
 pub const MLAConfig = struct {

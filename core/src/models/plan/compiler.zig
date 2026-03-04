@@ -122,13 +122,11 @@ fn kernelWeightSlots(opcode: runtime_contract.Opcode) []const []const u8 {
 fn compileOneInstruction(
     allocator: std.mem.Allocator,
     op: layer_ops.LayerOp,
-    mode: CompileMode,
     param_block_id: u16,
     weight_bindings: *std.ArrayListUnmanaged(runtime_contract.WeightBinding),
     reg_map: *RegisterMap,
 ) !runtime_contract.Instruction {
     const opcode = opcode_map.opcodeForLayerOp(op);
-    const state_block_id = runtime_contract.stateBlockIdForExecutionMode(opcode, mode);
     return switch (op) {
         .kernel => |kernel_op| blk: {
             const slots = kernelWeightSlots(opcode);
@@ -156,7 +154,7 @@ fn compileOneInstruction(
                 .outputs = try reg_map.allocRegisters(allocator, &.{kernel_op.out}),
                 .weights = refs,
                 .param_block_id = param_block_id,
-                .state_block_id = state_block_id,
+                .state_block_id = kernel_op.state_block_id,
             };
         },
         .add => |add_op| .{
@@ -165,7 +163,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{.residual}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .linear => |linear_op| .{
             .opcode = opcode,
@@ -175,7 +173,7 @@ fn compileOneInstruction(
                 .index = try ensureWeightBindingIndex(allocator, weight_bindings, linear_op.weight_name),
             }}),
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .matmul => |matmul_op| .{
             .opcode = opcode,
@@ -183,7 +181,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{matmul_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .split => |split_op| .{
             .opcode = opcode,
@@ -191,7 +189,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocSequential(allocator, split_op.out_start, split_op.num_outputs),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .softmax => |softmax_op| .{
             .opcode = opcode,
@@ -199,7 +197,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{softmax_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .silu => |silu_op| .{
             .opcode = opcode,
@@ -207,7 +205,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{silu_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .gelu => |gelu_op| .{
             .opcode = opcode,
@@ -215,7 +213,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{gelu_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .mul => |mul_op| .{
             .opcode = opcode,
@@ -223,7 +221,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{mul_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .add_tensor => |add_tensor_op| .{
             .opcode = opcode,
@@ -231,7 +229,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{add_tensor_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .add_scalar => |add_scalar_op| .{
             .opcode = opcode,
@@ -239,7 +237,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{add_scalar_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .mul_scalar => |mul_scalar_op| .{
             .opcode = opcode,
@@ -247,7 +245,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{mul_scalar_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .mean => |mean_op| .{
             .opcode = opcode,
@@ -255,7 +253,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{mean_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .pow => |pow_op| .{
             .opcode = opcode,
@@ -263,7 +261,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{pow_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .rsqrt => |rsqrt_op| .{
             .opcode = opcode,
@@ -271,7 +269,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{rsqrt_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .add_param => |add_param_op| .{
             .opcode = opcode,
@@ -281,7 +279,7 @@ fn compileOneInstruction(
                 .index = try ensureWeightBindingIndex(allocator, weight_bindings, add_param_op.param_name),
             }}),
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .add_param_scalar => |add_param_scalar_op| .{
             .opcode = opcode,
@@ -291,7 +289,7 @@ fn compileOneInstruction(
                 .index = try ensureWeightBindingIndex(allocator, weight_bindings, add_param_scalar_op.param_name),
             }}),
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .mul_param => |mul_param_op| .{
             .opcode = opcode,
@@ -301,7 +299,7 @@ fn compileOneInstruction(
                 .index = try ensureWeightBindingIndex(allocator, weight_bindings, mul_param_op.param_name),
             }}),
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .reshape => |reshape_op| .{
             .opcode = opcode,
@@ -309,7 +307,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{reshape_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .transpose => |transpose_op| .{
             .opcode = opcode,
@@ -317,7 +315,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{transpose_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .rope => |rope_op| .{
             .opcode = opcode,
@@ -325,7 +323,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{rope_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .triu => |triu_op| .{
             .opcode = opcode,
@@ -333,7 +331,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{triu_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .sdpa => |sdpa_op| .{
             .opcode = opcode,
@@ -341,7 +339,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{sdpa_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .patch_embed => |patch_op| .{
             .opcode = opcode,
@@ -349,7 +347,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{patch_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .spatial_merge => |spatial_op| .{
             .opcode = opcode,
@@ -357,7 +355,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{spatial_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .deepstack_extract => |deepstack_op| .{
             .opcode = opcode,
@@ -365,7 +363,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{deepstack_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
         .scatter => |scatter_op| .{
             .opcode = opcode,
@@ -373,7 +371,7 @@ fn compileOneInstruction(
             .outputs = try reg_map.allocRegisters(allocator, &.{scatter_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+            .state_block_id = null,
         },
     };
 }
@@ -511,7 +509,7 @@ fn buildStateDescriptors(
         descriptors[idx] = if (descriptor_entry) |entry|
             registry.stateDescriptorForId(entry, state_id)
         else
-            runtime_contract.descriptorForStateId(state_id);
+            registry.defaultStateDescriptorForId(state_id);
         idx += 1;
     }
     return descriptors;
@@ -691,9 +689,8 @@ fn validateProgramBlockKindStateCompatibility(
     program: []const layer_ops.LayerOp,
     block_kind: op_types.BlockKind,
 ) !void {
-    if (runtime_contract.firstLayerProgramStateMismatch(program, block_kind) != null) {
-        return error.InvalidStateDescriptorBinding;
-    }
+    _ = program;
+    _ = block_kind;
 }
 
 /// Options for plan compilation.
@@ -736,7 +733,7 @@ pub fn compileLayerProgram(
         const opcode = opcode_map.opcodeForLayerOp(op);
         const param_block_id: u16 = @intCast(param_blocks.items.len);
         try param_blocks.append(allocator, try serializeLayerOpParam(allocator, opcode, op));
-        const insn = try compileOneInstruction(allocator, op, mode, param_block_id, &weight_bindings, &reg_map);
+        const insn = try compileOneInstruction(allocator, op, param_block_id, &weight_bindings, &reg_map);
         if (insn.weights.len != runtime_contract.expectedWeightRefCount(insn.opcode)) {
             return error.InvalidWeightRefCount;
         }
@@ -1119,7 +1116,25 @@ test "compileLayerProgram emits KV state descriptor and attention state referenc
     try std.testing.expect(saw_attention);
 }
 
-test "compileLayerProgram omits attention state in vision mode" {
+test "compileLayerProgram preserves explicit state metadata in vision mode" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .norm_out,
+            .debug_type = .multihead_attention,
+            .state_block_id = runtime_contract.kv_cache_state_id,
+        } },
+    };
+
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .vision_encode, .{});
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    try std.testing.expectEqual(@as(usize, 1), compiled.plan.state_descs.len);
+    try std.testing.expectEqual(@as(?u8, runtime_contract.kv_cache_state_id), compiled.plan.instructions[0].state_block_id);
+}
+
+test "compileLayerProgram keeps attention stateless when state metadata is omitted" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{
             .id = 0,
@@ -1159,6 +1174,7 @@ test "compileLayerProgram emits shortconv state descriptor when shortconv op is 
             .in = .residual,
             .out = .branch_out,
             .debug_type = .shortconv,
+            .state_block_id = runtime_contract.shortconv_state_id,
         } },
     };
     var compiled = try compileLayerProgram(std.testing.allocator, &shortconv_program, .decode, .{});
@@ -1185,6 +1201,26 @@ test "buildStateDescriptors accepts unknown state ids" {
     try std.testing.expectEqual(@as(usize, 1), descriptors.len);
     try std.testing.expectEqual(@as(u8, 77), descriptors[0].id);
     try std.testing.expectEqual(runtime_contract.StateLifecycle.request_scoped, descriptors[0].lifecycle);
+}
+
+test "buildStateDescriptors preserves builtin descriptor for builtin state ids without metadata entry" {
+    const allocator = std.testing.allocator;
+    const instructions = [_]runtime_contract.Instruction{
+        .{
+            .opcode = .multihead_attention,
+            .inputs = &.{},
+            .outputs = &.{},
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = runtime_contract.kv_cache_state_id,
+        },
+    };
+    const descriptors = try buildStateDescriptors(allocator, instructions[0..], null);
+    defer if (descriptors.len > 0) allocator.free(descriptors);
+    try std.testing.expectEqual(@as(usize, 1), descriptors.len);
+    try std.testing.expectEqual(runtime_contract.kv_cache_state_id, descriptors[0].id);
+    try std.testing.expectEqual(runtime_contract.StateLifecycle.slot_persistent, descriptors[0].lifecycle);
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, descriptors[0].runtime_kind);
 }
 
 test "buildStateDescriptors uses architecture metadata when entry is provided" {
@@ -1214,6 +1250,7 @@ test "compileLayerProgram emits structured kernel weight refs for macro attentio
             .in = .residual,
             .out = .branch_out,
             .debug_type = .multihead_attention,
+            .state_block_id = runtime_contract.kv_cache_state_id,
         } },
     };
     var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode, .{});
@@ -1541,17 +1578,15 @@ test "dead output is killed at producer for immediate physical reclaim" {
     try std.testing.expect((kill1[branch_reg / 64] & (@as(u64, 1) << @intCast(branch_reg % 64))) == 0);
 }
 
-test "validateProgramBlockKindStateCompatibility rejects mismatched stateful opcode" {
+test "validateProgramBlockKindStateCompatibility does not enforce builtin topology" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{
             .id = 0,
             .in = .residual,
             .out = .branch_out,
             .debug_type = .shortconv,
+            .state_block_id = runtime_contract.shortconv_state_id,
         } },
     };
-    try std.testing.expectError(
-        error.InvalidStateDescriptorBinding,
-        validateProgramBlockKindStateCompatibility(&program, .attention_mlp),
-    );
+    try validateProgramBlockKindStateCompatibility(&program, .attention_mlp);
 }

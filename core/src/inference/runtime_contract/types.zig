@@ -127,6 +127,7 @@ pub const StateDescriptor = struct {
     align_bytes: u16,
     zero_init: bool,
     lifecycle: StateLifecycle,
+    runtime_kind: u8 = state_runtime_kind_none,
 };
 
 pub const StateBlockId = enum(u8) {
@@ -138,6 +139,11 @@ pub const StateBlockId = enum(u8) {
 pub const kv_cache_state_id: u8 = @intFromEnum(StateBlockId.kv_cache);
 pub const shortconv_state_id: u8 = @intFromEnum(StateBlockId.shortconv);
 pub const mamba_state_id: u8 = @intFromEnum(StateBlockId.mamba);
+
+pub const state_runtime_kind_none: u8 = 0;
+pub const state_runtime_kind_kv_cache: u8 = 1;
+pub const state_runtime_kind_shortconv_cache: u8 = 2;
+pub const state_runtime_kind_mamba_cache: u8 = 3;
 
 pub const Instruction = struct {
     opcode: Opcode,
@@ -249,6 +255,7 @@ pub const StatePointerPayload = extern struct {
 
 /// Compatibility descriptor allocation footprint for pointer payload blocks.
 pub const compatibility_state_block_bytes: u64 = @sizeOf(StatePointerPayload);
+pub const builtin_state_block_bytes: u64 = 64;
 
 pub fn writeStatePointerToBlock(state_block: *StateBlockHandle, ptr: ?*anyopaque) !void {
     if (state_block.align_bytes == 0 or state_block.size == 0) return error.InvalidStateDescriptorBinding;
@@ -259,8 +266,16 @@ pub fn writeStatePointerToBlock(state_block: *StateBlockHandle, ptr: ?*anyopaque
 }
 
 pub fn statePointerFromBlock(state_block: *const StateBlockHandle) ?*anyopaque {
-    const payload = stateValueFromBlock(*const StatePointerPayload, state_block) orelse return @ptrCast(state_block.ptr);
-    return payload.ptr orelse @ptrCast(state_block.ptr);
+    if (state_block.size == compatibility_state_block_bytes) {
+        const payload = stateValueFromBlock(*const StatePointerPayload, state_block) orelse return null;
+        return payload.ptr;
+    }
+    return @ptrCast(state_block.ptr);
+}
+
+pub fn statePointerPayloadFromBlock(state_block: *const StateBlockHandle) ?*anyopaque {
+    const payload = stateValueFromBlock(*const StatePointerPayload, state_block) orelse return null;
+    return payload.ptr;
 }
 
 pub fn statePointerForId(
@@ -268,7 +283,7 @@ pub fn statePointerForId(
     state_id: u8,
 ) ?*anyopaque {
     const state_block = findStateBlock(state_blocks, state_id) orelse return null;
-    return statePointerFromBlock(state_block);
+    return statePointerPayloadFromBlock(state_block);
 }
 
 pub const ParamBlock = struct {
@@ -454,33 +469,6 @@ pub fn firstLayerProgramCompatibilityIssue(
     return null;
 }
 
-pub fn stateBlockIdForOpcode(opcode: Opcode) ?u8 {
-    return switch (opcode) {
-        .multihead_attention, .mla_attention => @intFromEnum(StateBlockId.kv_cache),
-        .shortconv => @intFromEnum(StateBlockId.shortconv),
-        .mamba_mixer => @intFromEnum(StateBlockId.mamba),
-        else => null,
-    };
-}
-
-pub fn stateBlockIdForExecutionMode(opcode: Opcode, mode: ExecutionMode) ?u8 {
-    return switch (mode) {
-        .vision_encode, .scatter => switch (opcode) {
-            .multihead_attention, .mla_attention => null,
-            else => stateBlockIdForOpcode(opcode),
-        },
-        else => stateBlockIdForOpcode(opcode),
-    };
-}
-
-pub fn requiredStateBlockIdForOpcode(opcode: Opcode) ?u8 {
-    return switch (opcode) {
-        .shortconv => @intFromEnum(StateBlockId.shortconv),
-        .mamba_mixer => @intFromEnum(StateBlockId.mamba),
-        else => null,
-    };
-}
-
 pub fn expectedKernelWeightSlots(opcode: Opcode) []const []const u8 {
     return switch (opcode) {
         .rmsnorm => &.{"norm_weight"},
@@ -497,7 +485,7 @@ pub fn expectedKernelWeightSlots(opcode: Opcode) []const []const u8 {
             "o_bias",
             "attn_sinks",
         },
-        .swiglu => &.{ "w1", "w3", "w2" },
+        .swiglu => &.{ "w1", "w3", "w2", "w1_bias", "w2_bias" },
         .moe => &.{
             "router",
             "gate_proj",
@@ -572,16 +560,9 @@ pub fn parseKernelWeightBindingName(name: []const u8) !KernelWeightBindingName {
 }
 
 pub fn blockKindSupportsState(kind: op_types.BlockKind, state_id: u8) bool {
-    return switch (kind) {
-        .attention_mlp => state_id == @intFromEnum(StateBlockId.kv_cache),
-        .shortconv => state_id == @intFromEnum(StateBlockId.shortconv),
-        .mamba => state_id == @intFromEnum(StateBlockId.mamba),
-    };
-}
-
-pub fn opcodeStateCompatibleWithBlockKind(opcode: Opcode, kind: op_types.BlockKind) bool {
-    const state_id = stateBlockIdForOpcode(opcode) orelse return true;
-    return blockKindSupportsState(kind, state_id);
+    _ = kind;
+    _ = state_id;
+    return true;
 }
 
 pub const LayerProgramStateMismatch = struct {
@@ -594,16 +575,8 @@ pub fn firstLayerProgramStateMismatch(
     program: []const layer_ops.LayerOp,
     kind: op_types.BlockKind,
 ) ?LayerProgramStateMismatch {
-    for (program, 0..) |op, op_index| {
-        const opcode = opcode_map.opcodeForLayerOp(op);
-        if (!opcodeStateCompatibleWithBlockKind(opcode, kind)) {
-            return .{
-                .op_index = op_index,
-                .opcode = opcode,
-                .state_id = stateBlockIdForOpcode(opcode).?,
-            };
-        }
-    }
+    _ = program;
+    _ = kind;
     return null;
 }
 
@@ -611,24 +584,27 @@ pub fn defaultStateDescriptor(state_id: StateBlockId) StateDescriptor {
     return switch (state_id) {
         .kv_cache => .{
             .id = @intFromEnum(StateBlockId.kv_cache),
-            .size_bytes = compatibility_state_block_bytes,
+            .size_bytes = builtin_state_block_bytes,
             .align_bytes = 64,
             .zero_init = false,
             .lifecycle = .slot_persistent,
+            .runtime_kind = state_runtime_kind_kv_cache,
         },
         .shortconv => .{
             .id = @intFromEnum(StateBlockId.shortconv),
-            .size_bytes = compatibility_state_block_bytes,
+            .size_bytes = builtin_state_block_bytes,
             .align_bytes = 64,
             .zero_init = true,
             .lifecycle = .slot_persistent,
+            .runtime_kind = state_runtime_kind_shortconv_cache,
         },
         .mamba => .{
             .id = @intFromEnum(StateBlockId.mamba),
-            .size_bytes = compatibility_state_block_bytes,
+            .size_bytes = builtin_state_block_bytes,
             .align_bytes = 64,
             .zero_init = true,
             .lifecycle = .slot_persistent,
+            .runtime_kind = state_runtime_kind_mamba_cache,
         },
     };
 }
@@ -640,15 +616,7 @@ pub fn defaultOpaqueStateDescriptor(state_id: u8) StateDescriptor {
         .align_bytes = 64,
         .zero_init = true,
         .lifecycle = .request_scoped,
-    };
-}
-
-pub fn descriptorForStateId(state_id: u8) StateDescriptor {
-    return switch (state_id) {
-        @intFromEnum(StateBlockId.kv_cache) => defaultStateDescriptor(.kv_cache),
-        @intFromEnum(StateBlockId.shortconv) => defaultStateDescriptor(.shortconv),
-        @intFromEnum(StateBlockId.mamba) => defaultStateDescriptor(.mamba),
-        else => defaultOpaqueStateDescriptor(state_id),
+        .runtime_kind = state_runtime_kind_none,
     };
 }
 
@@ -671,7 +639,8 @@ pub fn stateDescriptorSlicesEqual(a: StateDescriptor, b: StateDescriptor) bool {
         a.size_bytes == b.size_bytes and
         a.align_bytes == b.align_bytes and
         a.zero_init == b.zero_init and
-        a.lifecycle == b.lifecycle;
+        a.lifecycle == b.lifecycle and
+        a.runtime_kind == b.runtime_kind;
 }
 
 pub fn appendUniqueStateDescriptor(
@@ -711,10 +680,10 @@ pub const BuiltinStateFlags = struct {
 pub fn collectBuiltinStateFlags(plan: *const ExecutionPlan) BuiltinStateFlags {
     var flags = BuiltinStateFlags{};
     for (plan.state_descs) |state_desc| {
-        switch (state_desc.id) {
-            @intFromEnum(StateBlockId.kv_cache) => flags.has_kv = true,
-            @intFromEnum(StateBlockId.shortconv) => flags.has_shortconv = true,
-            @intFromEnum(StateBlockId.mamba) => flags.has_mamba = true,
+        switch (state_desc.runtime_kind) {
+            state_runtime_kind_kv_cache => flags.has_kv = true,
+            state_runtime_kind_shortconv_cache => flags.has_shortconv = true,
+            state_runtime_kind_mamba_cache => flags.has_mamba = true,
             else => {},
         }
     }
@@ -1592,15 +1561,6 @@ pub fn validateExecutionPlan(plan: *const ExecutionPlan) !void {
     }
 
     for (plan.instructions) |insn| {
-        const allowed_state_id = stateBlockIdForOpcode(insn.opcode);
-        if (insn.state_block_id) |state_id| {
-            if (allowed_state_id == null or allowed_state_id.? != state_id) {
-                return error.InvalidStateDescriptorBinding;
-            }
-        } else if (requiredStateBlockIdForOpcode(insn.opcode) != null) {
-            return error.InvalidStateDescriptorBinding;
-        }
-
         for (insn.inputs) |register| {
             if (registerToIndex(register) >= plan.register_count) return error.InvalidInstructionRegisterRef;
         }
@@ -1614,11 +1574,8 @@ pub fn validateExecutionPlan(plan: *const ExecutionPlan) !void {
 }
 
 pub fn validateExecutionPlanForBlockKind(plan: *const ExecutionPlan, kind: op_types.BlockKind) !void {
-    for (plan.instructions) |insn| {
-        if (!opcodeStateCompatibleWithBlockKind(insn.opcode, kind)) {
-            return error.InvalidStateDescriptorBinding;
-        }
-    }
+    _ = kind;
+    try validateExecutionPlan(plan);
 }
 
 fn layerOpInputCount(op: layer_ops.LayerOp) usize {
@@ -2020,6 +1977,17 @@ test "writeStatePointerToBlock updates pointer payload" {
     try std.testing.expectEqual(@as(u32, 42), typed.*);
 }
 
+test "statePointerPayloadFromBlock returns null when payload is unset" {
+    var backing: [64]u8 align(64) = [_]u8{0} ** 64;
+    var block = StateBlockHandle{
+        .id = 1,
+        .ptr = &backing,
+        .size = compatibility_state_block_bytes,
+        .align_bytes = 64,
+    };
+    try std.testing.expect(statePointerPayloadFromBlock(&block) == null);
+}
+
 test "writeStatePointerToBlock rejects undersized block" {
     var backing: [64]u8 align(64) = [_]u8{0} ** 64;
     var block = StateBlockHandle{
@@ -2034,7 +2002,19 @@ test "writeStatePointerToBlock rejects undersized block" {
     );
 }
 
-test "validateExecutionPlan rejects missing state binding for stateful opcode" {
+test "statePointerFromBlock treats non-compatibility blocks as direct storage" {
+    var backing: [128]u8 align(64) = [_]u8{0} ** 128;
+    var block = StateBlockHandle{
+        .id = 7,
+        .ptr = backing[0..].ptr,
+        .size = backing.len,
+        .align_bytes = 64,
+    };
+    const resolved = statePointerFromBlock(&block) orelse return error.InvalidStateDescriptorBinding;
+    try std.testing.expectEqual(@intFromPtr(block.ptr), @intFromPtr(@as([*]u8, @ptrCast(resolved))));
+}
+
+test "validateExecutionPlan allows missing state binding when state metadata is omitted" {
     const insn = Instruction{
         .opcode = .shortconv,
         .inputs = &.{registerFromIndex(0)},
@@ -2048,7 +2028,7 @@ test "validateExecutionPlan rejects missing state binding for stateful opcode" {
         .register_count = 2,
         .state_descs = &.{defaultStateDescriptor(.kv_cache)},
     };
-    try std.testing.expectError(error.InvalidStateDescriptorBinding, validateExecutionPlan(&plan));
+    try validateExecutionPlan(&plan);
 }
 
 test "validateExecutionPlan allows optional attention state binding" {
@@ -2068,7 +2048,7 @@ test "validateExecutionPlan allows optional attention state binding" {
     try validateExecutionPlan(&plan);
 }
 
-test "validateExecutionPlan rejects mismatched state binding for opcode" {
+test "validateExecutionPlan allows opcode-independent state binding when descriptor exists" {
     const insn = Instruction{
         .opcode = .multihead_attention,
         .inputs = &.{registerFromIndex(0)},
@@ -2085,10 +2065,10 @@ test "validateExecutionPlan rejects mismatched state binding for opcode" {
             defaultStateDescriptor(.shortconv),
         },
     };
-    try std.testing.expectError(error.InvalidStateDescriptorBinding, validateExecutionPlan(&plan));
+    try validateExecutionPlan(&plan);
 }
 
-test "validateExecutionPlan rejects unexpected state binding for stateless opcode" {
+test "validateExecutionPlan allows explicit state binding when descriptor exists" {
     const insn = Instruction{
         .opcode = .residual_add,
         .inputs = &.{ registerFromIndex(0), registerFromIndex(1) },
@@ -2102,10 +2082,10 @@ test "validateExecutionPlan rejects unexpected state binding for stateless opcod
         .register_count = 2,
         .state_descs = &.{defaultStateDescriptor(.kv_cache)},
     };
-    try std.testing.expectError(error.InvalidStateDescriptorBinding, validateExecutionPlan(&plan));
+    try validateExecutionPlan(&plan);
 }
 
-test "validateExecutionPlanForBlockKind rejects incompatible stateful opcode for block kind" {
+test "validateExecutionPlanForBlockKind is descriptor-driven and block-kind agnostic" {
     const insn = Instruction{
         .opcode = .shortconv,
         .inputs = &.{registerFromIndex(0)},
@@ -2119,10 +2099,7 @@ test "validateExecutionPlanForBlockKind rejects incompatible stateful opcode for
         .register_count = 2,
         .state_descs = &.{defaultStateDescriptor(.shortconv)},
     };
-    try std.testing.expectError(
-        error.InvalidStateDescriptorBinding,
-        validateExecutionPlanForBlockKind(&plan, .attention_mlp),
-    );
+    try validateExecutionPlanForBlockKind(&plan, .attention_mlp);
 }
 
 test "planFinalOutputRegister returns residual register for empty plan" {
@@ -2377,6 +2354,8 @@ test "instructionKernelWeightBinding validates slot contract" {
             .{ .index = 0 },
             .{ .index = 1 },
             .{ .index = 2 },
+            .{ .index = 3 },
+            .{ .index = 4 },
         },
         .param_block_id = null,
         .state_block_id = null,
@@ -2392,6 +2371,8 @@ test "instructionKernelWeightBinding validates slot contract" {
             .{ .index = 0, .name = "__kernel_weight::7::w1::0" },
             .{ .index = 1, .name = "__kernel_weight::7::w3::0" },
             .{ .index = 2, .name = "__kernel_weight::7::w2::0" },
+            .{ .index = 3, .name = "__kernel_weight::7::w1_bias::0" },
+            .{ .index = 4, .name = "__kernel_weight::7::w2_bias::0" },
         },
         .liveness = .{
             .register_last_read = &.{ 0, 0 },
@@ -2414,6 +2395,8 @@ test "instructionKernelBindingId enforces consistent kernel id across slots" {
             .{ .index = 0 },
             .{ .index = 1 },
             .{ .index = 2 },
+            .{ .index = 3 },
+            .{ .index = 4 },
         },
         .param_block_id = null,
         .state_block_id = null,
@@ -2428,7 +2411,9 @@ test "instructionKernelBindingId enforces consistent kernel id across slots" {
         .weight_bindings = &.{
             .{ .index = 0, .name = "__kernel_weight::4::w1::0" },
             .{ .index = 1, .name = "__kernel_weight::4::w3::0" },
-            .{ .index = 2, .name = "__kernel_weight::9::w2::0" },
+            .{ .index = 2, .name = "__kernel_weight::4::w2::0" },
+            .{ .index = 3, .name = "__kernel_weight::4::w1_bias::0" },
+            .{ .index = 4, .name = "__kernel_weight::9::w2_bias::0" },
         },
         .liveness = .{
             .register_last_read = &.{ 0, 0 },
@@ -2456,7 +2441,7 @@ test "parseKernelWeightBindingName rejects malformed names" {
 test "expectedWeightRefCount returns macro-op arities" {
     try std.testing.expectEqual(@as(usize, 11), expectedWeightRefCount(.multihead_attention));
     try std.testing.expectEqual(@as(usize, 7), expectedWeightRefCount(.mla_attention));
-    try std.testing.expectEqual(@as(usize, 3), expectedWeightRefCount(.swiglu));
+    try std.testing.expectEqual(@as(usize, 5), expectedWeightRefCount(.swiglu));
     try std.testing.expectEqual(@as(usize, 13), expectedWeightRefCount(.moe));
     try std.testing.expectEqual(@as(usize, 12), expectedWeightRefCount(.mamba_mixer));
     try std.testing.expectEqual(@as(usize, 4), expectedWeightRefCount(.shortconv));
@@ -2464,35 +2449,6 @@ test "expectedWeightRefCount returns macro-op arities" {
 
 test "AdapterTable keeps 256 opcode slots" {
     try std.testing.expectEqual(@as(usize, 256), @typeInfo(AdapterTable).array.len);
-}
-
-test "stateBlockIdForOpcode maps stateful macro ops" {
-    try std.testing.expectEqual(
-        @as(?u8, @intFromEnum(StateBlockId.kv_cache)),
-        stateBlockIdForOpcode(.multihead_attention),
-    );
-    try std.testing.expectEqual(
-        @as(?u8, @intFromEnum(StateBlockId.shortconv)),
-        stateBlockIdForOpcode(.shortconv),
-    );
-    try std.testing.expectEqual(
-        @as(?u8, @intFromEnum(StateBlockId.mamba)),
-        stateBlockIdForOpcode(.mamba_mixer),
-    );
-    try std.testing.expectEqual(@as(?u8, null), stateBlockIdForOpcode(.residual_add));
-}
-
-test "requiredStateBlockIdForOpcode only requires recurrent state ops" {
-    try std.testing.expectEqual(@as(?u8, null), requiredStateBlockIdForOpcode(.multihead_attention));
-    try std.testing.expectEqual(
-        @as(?u8, @intFromEnum(StateBlockId.shortconv)),
-        requiredStateBlockIdForOpcode(.shortconv),
-    );
-    try std.testing.expectEqual(
-        @as(?u8, @intFromEnum(StateBlockId.mamba)),
-        requiredStateBlockIdForOpcode(.mamba_mixer),
-    );
-    try std.testing.expectEqual(@as(?u8, null), requiredStateBlockIdForOpcode(.residual_add));
 }
 
 test "defaultStateDescriptor uses stable v1 compatibility defaults" {
@@ -2658,6 +2614,35 @@ test "collectBuiltinStateFlags ignores unknown descriptor ids" {
     try std.testing.expect(!flags.has_mamba);
 }
 
+test "collectBuiltinStateFlags uses runtime kind instead of descriptor id" {
+    const plan = ExecutionPlan{
+        .instructions = &.{},
+        .register_count = 1,
+        .state_descs = &.{
+            .{
+                .id = 200,
+                .size_bytes = compatibility_state_block_bytes,
+                .align_bytes = 64,
+                .zero_init = true,
+                .lifecycle = .request_scoped,
+                .runtime_kind = state_runtime_kind_kv_cache,
+            },
+            .{
+                .id = 201,
+                .size_bytes = compatibility_state_block_bytes,
+                .align_bytes = 64,
+                .zero_init = true,
+                .lifecycle = .request_scoped,
+                .runtime_kind = state_runtime_kind_mamba_cache,
+            },
+        },
+    };
+    const flags = collectBuiltinStateFlags(&plan);
+    try std.testing.expect(flags.has_kv);
+    try std.testing.expect(!flags.has_shortconv);
+    try std.testing.expect(flags.has_mamba);
+}
+
 test "decodeInstructionLayerOp validates param block abi version" {
     const op: layer_ops.LayerOp = .{
         .add = .{
@@ -2786,32 +2771,25 @@ test "encodeLayerOpParam round-trips split metadata including explicit split siz
     }
 }
 
-test "blockKindSupportsState maps canonical block-state compatibility" {
+test "blockKindSupportsState does not gate descriptor ids" {
     try std.testing.expect(blockKindSupportsState(.attention_mlp, @intFromEnum(StateBlockId.kv_cache)));
-    try std.testing.expect(blockKindSupportsState(.shortconv, @intFromEnum(StateBlockId.shortconv)));
-    try std.testing.expect(blockKindSupportsState(.mamba, @intFromEnum(StateBlockId.mamba)));
-    try std.testing.expect(!blockKindSupportsState(.attention_mlp, @intFromEnum(StateBlockId.shortconv)));
-    try std.testing.expect(!blockKindSupportsState(.shortconv, @intFromEnum(StateBlockId.kv_cache)));
-    try std.testing.expect(!blockKindSupportsState(.mamba, @intFromEnum(StateBlockId.kv_cache)));
+    try std.testing.expect(blockKindSupportsState(.attention_mlp, @intFromEnum(StateBlockId.shortconv)));
+    try std.testing.expect(blockKindSupportsState(.shortconv, @intFromEnum(StateBlockId.mamba)));
+    try std.testing.expect(blockKindSupportsState(.mamba, 255));
 }
 
-test "opcodeStateCompatibleWithBlockKind enforces stateful opcode topology compatibility" {
-    try std.testing.expect(opcodeStateCompatibleWithBlockKind(.residual_add, .attention_mlp));
-    try std.testing.expect(opcodeStateCompatibleWithBlockKind(.multihead_attention, .attention_mlp));
-    try std.testing.expect(!opcodeStateCompatibleWithBlockKind(.multihead_attention, .shortconv));
-    try std.testing.expect(opcodeStateCompatibleWithBlockKind(.shortconv, .shortconv));
-    try std.testing.expect(!opcodeStateCompatibleWithBlockKind(.shortconv, .mamba));
-}
-
-test "firstLayerProgramStateMismatch returns first mismatched stateful opcode" {
+test "firstLayerProgramStateMismatch does not enforce builtin topology" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
-        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .shortconv } },
+        .{ .kernel = .{
+            .id = 1,
+            .in = .norm_out,
+            .out = .branch_out,
+            .debug_type = .shortconv,
+            .state_block_id = @intFromEnum(StateBlockId.shortconv),
+        } },
     };
-    const mismatch = firstLayerProgramStateMismatch(&program, .attention_mlp) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 1), mismatch.op_index);
-    try std.testing.expectEqual(Opcode.shortconv, mismatch.opcode);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StateBlockId.shortconv)), mismatch.state_id);
+    try std.testing.expect(firstLayerProgramStateMismatch(&program, .attention_mlp) == null);
 }
 
 test "firstUnsupportedLayerProgramOpcode returns first unsupported opcode in program" {
@@ -2895,7 +2873,7 @@ test "firstLayerProgramCompatibilityIssue reports unsupported opcode first" {
     }
 }
 
-test "firstLayerProgramCompatibilityIssue reports state mismatch when opcodes are supported" {
+test "firstLayerProgramCompatibilityIssue ignores block-kind state topology when opcodes are supported" {
     var table = [_]?u8{null} ** 256;
     table[@intFromEnum(Opcode.shortconv)] = 1;
     const program = [_]layer_ops.LayerOp{
@@ -2904,17 +2882,10 @@ test "firstLayerProgramCompatibilityIssue reports state mismatch when opcodes ar
             .in = .residual,
             .out = .branch_out,
             .debug_type = .shortconv,
+            .state_block_id = @intFromEnum(StateBlockId.shortconv),
         } },
     };
-    const issue = firstLayerProgramCompatibilityIssue(&program, .attention_mlp, table) orelse return error.TestUnexpectedResult;
-    switch (issue) {
-        .state_mismatch => |mismatch| {
-            try std.testing.expectEqual(@as(usize, 0), mismatch.op_index);
-            try std.testing.expectEqual(Opcode.shortconv, mismatch.opcode);
-            try std.testing.expectEqual(@as(u8, @intFromEnum(StateBlockId.shortconv)), mismatch.state_id);
-        },
-        else => return error.TestUnexpectedResult,
-    }
+    try std.testing.expect(firstLayerProgramCompatibilityIssue(&program, .attention_mlp, table) == null);
 }
 
 test "paramAs round-trip with encodeLayerOpParam" {

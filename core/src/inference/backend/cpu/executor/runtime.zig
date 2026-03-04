@@ -71,6 +71,8 @@ pub const ScratchBuffer = struct {
     allocator: std.mem.Allocator,
     d_model: usize,
     d_ff: usize,
+    layer_count: usize,
+    slot_count: usize,
 
     /// Temporary buffer array, dynamically sized. Slot 0 is layer_tmp
     /// (Model.forward alternating buffer), slots 1+ are register-mapped
@@ -108,7 +110,19 @@ pub const ScratchBuffer = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, d_model: usize, d_ff: usize, n_layers: usize) !ScratchBuffer {
-        const slot_state_buffer = try allocator.alloc(SlotPersistentState, n_layers);
+        return initWithSlots(allocator, d_model, d_ff, n_layers, 1);
+    }
+
+    pub fn initWithSlots(
+        allocator: std.mem.Allocator,
+        d_model: usize,
+        d_ff: usize,
+        n_layers: usize,
+        slot_count: usize,
+    ) !ScratchBuffer {
+        const effective_slot_count = @max(slot_count, 1);
+        const slot_state_count = std.math.mul(usize, n_layers, effective_slot_count) catch return error.OutOfMemory;
+        const slot_state_buffer = try allocator.alloc(SlotPersistentState, slot_state_count);
         errdefer allocator.free(slot_state_buffer);
         for (slot_state_buffer) |*slot_state| {
             slot_state.* = .{};
@@ -134,6 +148,8 @@ pub const ScratchBuffer = struct {
             .allocator = allocator,
             .d_model = d_model,
             .d_ff = d_ff,
+            .layer_count = n_layers,
+            .slot_count = effective_slot_count,
             .tmp = tmp,
             .tmp_slot_width_hints = width_hints,
             .tmp_slot_active = active,
@@ -142,12 +158,22 @@ pub const ScratchBuffer = struct {
         };
     }
 
+    fn slotLayerIndex(self: *const ScratchBuffer, slot_index: usize, layer_idx: usize) ?usize {
+        if (slot_index >= self.slot_count) return null;
+        if (layer_idx >= self.layer_count) return null;
+        const base = std.math.mul(usize, slot_index, self.layer_count) catch return null;
+        return base + layer_idx;
+    }
+
     /// Initialize attention cache state for descriptor-selected layers.
     pub fn initAttention(self: *ScratchBuffer, layer_indices: []const usize) !void {
         for (layer_indices) |layer_idx| {
-            if (layer_idx >= self.slot_states.len) return error.InvalidLayerIndex;
-            if (self.slot_states[layer_idx].attn_cache != null) return error.AlreadyInitialized;
-            self.slot_states[layer_idx].attn_cache = .{};
+            if (layer_idx >= self.layer_count) return error.InvalidLayerIndex;
+            for (0..self.slot_count) |slot_index| {
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse return error.InvalidLayerIndex;
+                if (self.slot_states[idx].attn_cache != null) return error.AlreadyInitialized;
+                self.slot_states[idx].attn_cache = .{};
+            }
         }
     }
 
@@ -286,22 +312,32 @@ pub const ScratchBuffer = struct {
         if (layer_indices.len == 0) return;
 
         for (layer_indices) |layer_idx| {
-            if (layer_idx >= self.slot_states.len) return error.InvalidLayerIndex;
-            if (self.slot_states[layer_idx].mamba_state != null) return error.AlreadyInitialized;
+            if (layer_idx >= self.layer_count) return error.InvalidLayerIndex;
+            for (0..self.slot_count) |slot_index| {
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse return error.InvalidLayerIndex;
+                if (self.slot_states[idx].mamba_state != null) return error.AlreadyInitialized;
+            }
         }
-        var initialized: usize = 0;
+        var initialized_slots: usize = 0;
         errdefer {
-            for (0..initialized) |idx| {
-                const layer_idx = layer_indices[idx];
-                if (self.slot_states[layer_idx].mamba_state) |*state| {
+            const initialized_total = initialized_slots;
+            for (0..initialized_total) |flat_idx| {
+                const layer_offset = flat_idx % layer_indices.len;
+                const slot_index = flat_idx / layer_indices.len;
+                const layer_idx = layer_indices[layer_offset];
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse continue;
+                if (self.slot_states[idx].mamba_state) |*state| {
                     state.deinit();
-                    self.slot_states[layer_idx].mamba_state = null;
+                    self.slot_states[idx].mamba_state = null;
                 }
             }
         }
-        for (layer_indices) |layer_idx| {
-            self.slot_states[layer_idx].mamba_state = try mamba.MambaState.init(self.allocator, 1, config);
-            initialized += 1;
+        for (0..self.slot_count) |slot_index| {
+            for (layer_indices) |layer_idx| {
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse return error.InvalidLayerIndex;
+                self.slot_states[idx].mamba_state = try mamba.MambaState.init(self.allocator, 1, config);
+                initialized_slots += 1;
+            }
         }
 
         // Allocate shared scratch buffer (same config for all layers)
@@ -320,22 +356,32 @@ pub const ScratchBuffer = struct {
         if (layer_indices.len == 0) return;
 
         for (layer_indices) |layer_idx| {
-            if (layer_idx >= self.slot_states.len) return error.InvalidLayerIndex;
-            if (self.slot_states[layer_idx].shortconv_state != null) return error.AlreadyInitialized;
+            if (layer_idx >= self.layer_count) return error.InvalidLayerIndex;
+            for (0..self.slot_count) |slot_index| {
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse return error.InvalidLayerIndex;
+                if (self.slot_states[idx].shortconv_state != null) return error.AlreadyInitialized;
+            }
         }
-        var initialized: usize = 0;
+        var initialized_slots: usize = 0;
         errdefer {
-            for (0..initialized) |idx| {
-                const layer_idx = layer_indices[idx];
-                if (self.slot_states[layer_idx].shortconv_state) |*state| {
+            const initialized_total = initialized_slots;
+            for (0..initialized_total) |flat_idx| {
+                const layer_offset = flat_idx % layer_indices.len;
+                const slot_index = flat_idx / layer_indices.len;
+                const layer_idx = layer_indices[layer_offset];
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse continue;
+                if (self.slot_states[idx].shortconv_state) |*state| {
                     state.deinit();
-                    self.slot_states[layer_idx].shortconv_state = null;
+                    self.slot_states[idx].shortconv_state = null;
                 }
             }
         }
-        for (layer_indices) |layer_idx| {
-            self.slot_states[layer_idx].shortconv_state = try shortconv.ShortConvState.init(self.allocator, 1, config);
-            initialized += 1;
+        for (0..self.slot_count) |slot_index| {
+            for (layer_indices) |layer_idx| {
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse return error.InvalidLayerIndex;
+                self.slot_states[idx].shortconv_state = try shortconv.ShortConvState.init(self.allocator, 1, config);
+                initialized_slots += 1;
+            }
         }
 
         // Allocate shared scratch buffer (same config for all layers)
@@ -376,9 +422,12 @@ pub const ScratchBuffer = struct {
         if (layer_indices.len == 0) return;
 
         for (layer_indices) |layer_idx| {
-            if (layer_idx >= self.slot_states.len) return error.InvalidLayerIndex;
-            if (self.slot_states[layer_idx].mla_cache != null) return error.AlreadyInitialized;
-            self.slot_states[layer_idx].mla_cache = .{};
+            if (layer_idx >= self.layer_count) return error.InvalidLayerIndex;
+            for (0..self.slot_count) |slot_index| {
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse return error.InvalidLayerIndex;
+                if (self.slot_states[idx].mla_cache != null) return error.AlreadyInitialized;
+                self.slot_states[idx].mla_cache = .{};
+            }
         }
 
         // Allocate shared scratch buffer (initialized lazily in ensureTemp)
@@ -387,8 +436,13 @@ pub const ScratchBuffer = struct {
 
     /// Get mutable persistent slot state for a specific global layer index.
     pub fn getSlotState(self: *ScratchBuffer, layer_idx: usize) ?*SlotPersistentState {
-        if (layer_idx < self.slot_states.len) return &self.slot_states[layer_idx];
-        return null;
+        return self.getSlotLayerState(0, layer_idx);
+    }
+
+    /// Get mutable persistent state for a scheduler slot + global layer index.
+    pub fn getSlotLayerState(self: *ScratchBuffer, slot_index: usize, layer_idx: usize) ?*SlotPersistentState {
+        const idx = self.slotLayerIndex(slot_index, layer_idx) orelse return null;
+        return &self.slot_states[idx];
     }
 
     /// Get shared MLA scratch buffer.

@@ -4,6 +4,13 @@ const contract = @import("../contract.zig");
 const common_mrope = @import("../../vision_mrope.zig");
 const log = @import("../../../log.zig");
 
+fn slotIndexSupported(self: anytype, slot_index: usize) bool {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasDecl(SelfType, "slotIndexSupported")) return self.slotIndexSupported(slot_index);
+    if (comptime @hasField(SelfType, "max_batch_size")) return slot_index < self.max_batch_size;
+    return slot_index == 0;
+}
+
 pub fn decode(self: anytype, token: u32, position: usize, logits_out: []f32) !void {
     const SelfType = @TypeOf(self.*);
     if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
@@ -49,7 +56,7 @@ pub fn decodeBatch(
     if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
         try self.ensureSlotStateBlocksBoundForScheduler(req.slot_index);
     }
-    if (!self.slot_in_use or req.slot_index != 0) {
+    if (!self.slot_in_use or !slotIndexSupported(self, req.slot_index)) {
         log.warn("inference", "CUDA decodeBatch invalid args", .{
             .reason = "slot_state",
             .slot_index = req.slot_index,
@@ -59,7 +66,19 @@ pub fn decodeBatch(
     }
 
     const effective_position = try common_mrope.applyPositionDelta(self.slot_position, self.slot_rope_position_delta);
-    try self.computeGpuPrototypeLogits(req.token, effective_position, self.slot_logits);
+    try self.computeGpuPrototypeLogitsWithLayerLimit(
+        req.token,
+        effective_position,
+        req.slot_index,
+        self.slot_logits,
+        self.block_runtime.blocks.len,
+        true,
+        true,
+        true,
+        null,
+        null,
+        null,
+    );
     results[0] = .{
         .slot_index = req.slot_index,
         .logits = self.slot_logits,
@@ -96,6 +115,7 @@ pub fn decodeStreaming(
         try self.computeGpuPrototypeLogitsWithLayerLimit(
             current_token,
             effective_position,
+            0,
             null,
             self.block_runtime.blocks.len,
             true,
@@ -136,7 +156,7 @@ pub fn allocSlot(self: anytype) ?usize {
 
 pub fn freeSlot(self: anytype, slot_index: usize) void {
     const SelfType = @TypeOf(self.*);
-    if (slot_index != 0) return;
+    if (!slotIndexSupported(self, slot_index)) return;
     self.slot_in_use = false;
     self.slot_position = 0;
     self.slot_rope_position_delta = 0;
@@ -147,13 +167,13 @@ pub fn freeSlot(self: anytype, slot_index: usize) void {
 }
 
 pub fn resetSlot(self: anytype, slot_index: usize) void {
-    if (slot_index != 0) return;
+    if (!slotIndexSupported(self, slot_index)) return;
     self.slot_position = 0;
     self.slot_rope_position_delta = 0;
 }
 
 pub fn getPosition(self: anytype, slot_index: usize) usize {
-    if (slot_index != 0) return 0;
+    if (!slotIndexSupported(self, slot_index)) return 0;
     return self.slot_position;
 }
 
@@ -185,7 +205,7 @@ const MockDecodeBackend = struct {
 
     fn ensureSlotStateBlocksBoundForScheduler(self: *MockDecodeBackend, slot_index: usize) !void {
         self.ensure_state_binding_calls += 1;
-        if (slot_index != 0) return error.InvalidArgument;
+        if (!slotIndexSupported(self, slot_index)) return error.InvalidArgument;
         if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
     }
 
@@ -207,6 +227,7 @@ const MockDecodeBackend = struct {
         self: *MockDecodeBackend,
         token: u32,
         position: usize,
+        slot_index: usize,
         logits_out_opt: ?[]f32,
         layer_limit: usize,
         compute_logits: bool,
@@ -218,6 +239,7 @@ const MockDecodeBackend = struct {
     ) !void {
         _ = token;
         _ = position;
+        _ = slot_index;
         _ = logits_out_opt;
         _ = layer_limit;
         _ = compute_logits;

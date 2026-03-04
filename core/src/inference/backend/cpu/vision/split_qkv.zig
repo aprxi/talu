@@ -950,7 +950,7 @@ pub fn scatterVisionEmbeddings(
 
 const vision_block_program = [_]layer_ops.LayerOp{
     .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
-    .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+    .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention, .state_block_id = null } },
     .{ .add = .{ .branch = .branch_out, .scale = .one } },
     .{ .kernel = .{ .id = 2, .in = .residual, .out = .norm_out, .debug_type = .norm } },
     .{ .kernel = .{ .id = 3, .in = .norm_out, .out = .branch_out, .debug_type = .mlp } },
@@ -1123,4 +1123,8 @@ test "initVisionScratch initializes attention cache for every vision layer" {
         const slot_state = scratch.getSlotState(layer_idx) orelse return error.TestUnexpectedResult;
         try std.testing.expect(slot_state.attn_cache != null);
     }
+}
+
+test "vision_block_program attention is stateless for vision encode path" {
+    try std.testing.expectEqual(@as(?u8, null), vision_block_program[1].kernel.state_block_id);
 }

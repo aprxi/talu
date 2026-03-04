@@ -219,16 +219,37 @@ fn runtimeLifecycleFromSpec(lifecycle: op_types.StateLifecycle) runtime_contract
     };
 }
 
-pub fn stateDescriptorForId(entry: Entry, state_id: u8) runtime_contract.StateDescriptor {
-    const arch = runtimeArchitectureById(entry.id) orelse return runtime_contract.descriptorForStateId(state_id);
-    const spec = arch.stateDescriptorForId(state_id);
+fn runtimeDescriptorFromSpec(spec: op_types.StateDescriptorSpec) runtime_contract.StateDescriptor {
     return .{
         .id = spec.id,
         .size_bytes = spec.size_bytes,
         .align_bytes = spec.align_bytes,
         .zero_init = spec.zero_init,
         .lifecycle = runtimeLifecycleFromSpec(spec.lifecycle),
+        .runtime_kind = spec.runtime_kind,
     };
+}
+
+pub fn defaultStateDescriptorForId(state_id: u8) runtime_contract.StateDescriptor {
+    for (op_types.default_state_descriptors) |spec| {
+        if (spec.id == state_id) return runtimeDescriptorFromSpec(spec);
+    }
+    var fallback = op_types.default_unknown_state_descriptor;
+    fallback.id = state_id;
+    return runtimeDescriptorFromSpec(fallback);
+}
+
+pub fn stateDescriptorForId(entry: Entry, state_id: u8) runtime_contract.StateDescriptor {
+    const fallback = defaultStateDescriptorForId(state_id);
+    const arch = runtimeArchitectureById(entry.id) orelse {
+        return fallback;
+    };
+    const spec = arch.stateDescriptorForId(state_id);
+    var descriptor = runtimeDescriptorFromSpec(spec);
+    if (descriptor.runtime_kind == runtime_contract.state_runtime_kind_none) {
+        descriptor.runtime_kind = fallback.runtime_kind;
+    }
+    return descriptor;
 }
 
 pub fn configParseHookFor(entry: Entry) ?op_types.ConfigParseHook {

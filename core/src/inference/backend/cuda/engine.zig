@@ -645,6 +645,8 @@ const SwiGluWeightRefs = struct {
     w1: ?*const LinearWeight = null,
     w3: ?*const LinearWeight = null,
     w2: ?*const LinearWeight = null,
+    w1_bias: ?*const DeviceTensor = null,
+    w2_bias: ?*const DeviceTensor = null,
 };
 
 const MoeWeightRefs = struct {
@@ -783,6 +785,8 @@ const BlockRuntimeLayer = struct {
                 .w1 = &binding.w1,
                 .w3 = &binding.w3,
                 .w2 = &binding.w2,
+                .w1_bias = null,
+                .w2_bias = null,
             };
             return;
         }
@@ -791,6 +795,8 @@ const BlockRuntimeLayer = struct {
                 .w1 = if (binding.ffn_w1) |*w| w else null,
                 .w3 = if (binding.ffn_w3) |*w| w else null,
                 .w2 = if (binding.ffn_w2) |*w| w else null,
+                .w1_bias = null,
+                .w2_bias = null,
             };
             return;
         }
@@ -967,6 +973,14 @@ const BlockRuntimeLayer = struct {
                     0 => @ptrCast(@constCast(binding.w1 orelse return error.MissingWeight)),
                     1 => @ptrCast(@constCast(binding.w3 orelse return error.MissingWeight)),
                     2 => @ptrCast(@constCast(binding.w2 orelse return error.MissingWeight)),
+                    3 => if (binding.w1_bias) |w1_bias|
+                        @ptrCast(@constCast(w1_bias))
+                    else
+                        @ptrCast(@constCast(&missing_device_tensor)),
+                    4 => if (binding.w2_bias) |w2_bias|
+                        @ptrCast(@constCast(w2_bias))
+                    else
+                        @ptrCast(@constCast(&missing_device_tensor)),
                     else => error.InvalidWeightRefCount,
                 };
             },
@@ -1341,15 +1355,6 @@ const BlockRuntime = struct {
                         },
                     );
                     try validateCompiledLayerPlanForCuda(&blocks[layer_idx].compiled_plan.?, layer_idx, .attention_mlp);
-                    if (runtime_contract.stateDescriptorIndex(
-                        blocks[layer_idx].compiled_plan.?.plan.state_descs,
-                        runtime_contract.kv_cache_state_id,
-                    ) == null) {
-                        log.warn("inference", "CUDA attention block plan missing KV cache state descriptor", .{
-                            .layer = layer_idx,
-                        });
-                        return error.InvalidStateDescriptorBinding;
-                    }
                     errdefer if (blocks[layer_idx].compiled_plan) |*compiled_plan| {
                         plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
                         blocks[layer_idx].compiled_plan = null;
@@ -1704,15 +1709,6 @@ const BlockRuntime = struct {
                         },
                     );
                     try validateCompiledLayerPlanForCuda(&blocks[layer_idx].compiled_plan.?, layer_idx, .shortconv);
-                    if (runtime_contract.stateDescriptorIndex(
-                        blocks[layer_idx].compiled_plan.?.plan.state_descs,
-                        runtime_contract.shortconv_state_id,
-                    ) == null) {
-                        log.warn("inference", "CUDA shortconv block plan missing shortconv state descriptor", .{
-                            .layer = layer_idx,
-                        });
-                        return error.InvalidStateDescriptorBinding;
-                    }
                     errdefer if (blocks[layer_idx].compiled_plan) |*compiled_plan| {
                         plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
                         blocks[layer_idx].compiled_plan = null;
@@ -1996,17 +1992,16 @@ const BlockRuntime = struct {
     }
 };
 
-const KvRuntimeState = struct {
+const RuntimeState = extern struct {
+    runtime_kind: u8,
+    _pad: [7]u8 = [_]u8{0} ** 7,
     block_runtime: *BlockRuntime,
+    slot_index: usize,
 };
 
-const ShortConvRuntimeState = struct {
-    block_runtime: *BlockRuntime,
-};
-
-const MambaRuntimeState = struct {
-    block_runtime: *BlockRuntime,
-};
+const KvRuntimeState = RuntimeState;
+const ShortConvRuntimeState = RuntimeState;
+const MambaRuntimeState = RuntimeState;
 
 pub const CudaBackend = struct {
     pub const capabilities: contract.Capabilities = .{
@@ -2102,9 +2097,6 @@ pub const CudaBackend = struct {
     blas: compute.cuda.Blas,
     prototype: PrototypeRuntime,
     block_runtime: BlockRuntime,
-    kv_runtime_state: KvRuntimeState,
-    shortconv_runtime_state: ShortConvRuntimeState,
-    mamba_runtime_state: MambaRuntimeState,
     d_model: usize,
     vocab_size: usize,
     n_heads: usize,
@@ -2121,15 +2113,26 @@ pub const CudaBackend = struct {
     slot_logits: []f32,
     state_descriptors_storage: [runtime_contract.max_state_descriptors]runtime_contract.StateDescriptor = undefined,
     state_descriptor_count: u8 = 0,
-    slot_state_blocks: [runtime_contract.max_state_descriptors]runtime_contract.StateBlockHandle = undefined,
-    slot_state_block_count: u8 = 0,
-    slot_state_bound: bool = false,
+    slot_state_bindings: []SlotStateBinding = &.{},
     runtime_dispatch_counters: runtime_contract.DispatchCounters = .{},
     layer_program_dispatch_total: [256]u64 = [_]u64{0} ** 256,
     prefill_dispatch_window_start: [256]u64 = [_]u64{0} ** 256,
     layer_program_slot_buffers: []compute.cuda.Buffer = &.{},
     layer_program_slot_ptrs: []*compute.cuda.Buffer = &.{},
     argmax_index_dev: compute.cuda.Buffer,
+
+    const max_state_bindings_per_slot: usize = runtime_contract.max_state_descriptors;
+
+    const SlotStateBinding = struct {
+        handles: [max_state_bindings_per_slot]runtime_contract.StateBlockHandle = undefined,
+        count: u8 = 0,
+        bound: bool = false,
+
+        fn reset(self: *SlotStateBinding) void {
+            self.count = 0;
+            self.bound = false;
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel) !CudaBackend {
         var device = try compute.cuda.Device.init();
@@ -2147,9 +2150,6 @@ pub const CudaBackend = struct {
             .blas = undefined,
             .prototype = undefined,
             .block_runtime = undefined,
-            .kv_runtime_state = undefined,
-            .shortconv_runtime_state = undefined,
-            .mamba_runtime_state = undefined,
             .d_model = @intCast(loaded.config.d_model),
             .vocab_size = @intCast(loaded.config.vocab_size),
             .n_heads = @intCast(loaded.config.n_heads),
@@ -2162,9 +2162,7 @@ pub const CudaBackend = struct {
             .slot_logits = undefined,
             .state_descriptors_storage = undefined,
             .state_descriptor_count = 0,
-            .slot_state_blocks = undefined,
-            .slot_state_block_count = 0,
-            .slot_state_bound = false,
+            .slot_state_bindings = &.{},
             .runtime_dispatch_counters = .{},
             .layer_program_dispatch_total = [_]u64{0} ** 256,
             .prefill_dispatch_window_start = [_]u64{0} ** 256,
@@ -2203,13 +2201,13 @@ pub const CudaBackend = struct {
         errdefer backend.kernel_registry.deinit();
         backend.slot_logits = try allocator.alloc(f32, backend.vocab_size);
         errdefer allocator.free(backend.slot_logits);
+        backend.slot_state_bindings = try allocator.alloc(SlotStateBinding, backend.max_batch_size);
+        errdefer allocator.free(backend.slot_state_bindings);
+        for (backend.slot_state_bindings) |*binding| binding.* = .{};
         backend.argmax_index_dev = try backend.device.allocBuffer(@sizeOf(u32));
         errdefer backend.argmax_index_dev.deinit(&backend.device);
         backend.block_runtime = try BlockRuntime.init(allocator, &backend.device, loaded);
         errdefer backend.block_runtime.deinit(allocator, &backend.device);
-        backend.kv_runtime_state = .{ .block_runtime = &backend.block_runtime };
-        backend.shortconv_runtime_state = .{ .block_runtime = &backend.block_runtime };
-        backend.mamba_runtime_state = .{ .block_runtime = &backend.block_runtime };
         for (backend.block_runtime.blocks) |*layer| {
             if (layer.compiled_plan) |*compiled_plan| {
                 try runtime_contract.appendUniquePlanStateDescriptors(
@@ -2374,6 +2372,7 @@ pub const CudaBackend = struct {
             self.compute_stream = null;
         }
         self.argmax_index_dev.deinit(&self.device);
+        if (self.slot_state_bindings.len > 0) self.allocator.free(self.slot_state_bindings);
         self.allocator.free(self.slot_logits);
         self.deinitLayerProgramSlotBuffers();
         self.block_runtime.deinit(self.allocator, &self.device);
@@ -2477,6 +2476,7 @@ pub const CudaBackend = struct {
     }
 
     pub fn decode(self: *CudaBackend, token: u32, position: usize, logits_out: []f32) !void {
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
         return decode_mod.decode(self, token, position, logits_out);
     }
 
@@ -2490,6 +2490,7 @@ pub const CudaBackend = struct {
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
     ) !usize {
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
         return decode_mod.decodeStreaming(
             self,
             first_token,
@@ -2503,11 +2504,14 @@ pub const CudaBackend = struct {
     }
 
     pub fn allocSlot(self: *CudaBackend) ?usize {
-        return decode_mod.allocSlot(self);
+        const slot_index = decode_mod.allocSlot(self) orelse return null;
+        self.unbindSlotStateBlocks(slot_index);
+        return slot_index;
     }
 
     pub fn freeSlot(self: *CudaBackend, slot_index: usize) void {
         decode_mod.freeSlot(self, slot_index);
+        self.unbindSlotStateBlocks(slot_index);
     }
 
     pub fn resetSlot(self: *CudaBackend, slot_index: usize) void {
@@ -2522,12 +2526,35 @@ pub const CudaBackend = struct {
         return self.state_descriptors_storage[0..self.state_descriptor_count];
     }
 
+    fn bindRuntimeState(
+        self: *CudaBackend,
+        slot_index: usize,
+        runtime_kind: u8,
+        state_block: *runtime_contract.StateBlockHandle,
+    ) !void {
+        switch (runtime_kind) {
+            runtime_contract.state_runtime_kind_kv_cache,
+            runtime_contract.state_runtime_kind_shortconv_cache,
+            runtime_contract.state_runtime_kind_mamba_cache,
+            => {},
+            else => return error.InvalidStateDescriptorBinding,
+        }
+        const state_value = runtime_contract.stateValueFromBlock(*RuntimeState, state_block) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        state_value.* = .{
+            .runtime_kind = runtime_kind,
+            .block_runtime = &self.block_runtime,
+            .slot_index = slot_index,
+        };
+    }
+
     pub fn bindSlotStateBlocks(
         self: *CudaBackend,
         slot_index: usize,
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !void {
-        if (slot_index != 0) return error.InvalidArgument;
+        if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
         runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks) catch |err| {
             log.warn("inference", "CUDA bindSlotStateBlocks descriptor validation failed", .{
                 .slot_index = slot_index,
@@ -2537,11 +2564,12 @@ pub const CudaBackend = struct {
             });
             return err;
         };
-        if (state_blocks.len > self.slot_state_blocks.len) {
+        var binding = &self.slot_state_bindings[slot_index];
+        if (state_blocks.len > binding.handles.len) {
             log.warn("inference", "CUDA bindSlotStateBlocks too many state blocks", .{
                 .slot_index = slot_index,
                 .state_blocks = state_blocks.len,
-                .capacity = self.slot_state_blocks.len,
+                .capacity = binding.handles.len,
             });
             return error.InvalidStateDescriptorBinding;
         }
@@ -2553,44 +2581,40 @@ pub const CudaBackend = struct {
                 });
                 return error.InvalidStateDescriptorBinding;
             };
-            const state_ptr: ?*anyopaque = switch (descriptor.id) {
-                runtime_contract.kv_cache_state_id => @ptrCast(&self.kv_runtime_state),
-                runtime_contract.shortconv_state_id => @ptrCast(&self.shortconv_runtime_state),
-                runtime_contract.mamba_state_id => @ptrCast(&self.mamba_runtime_state),
-                else => null,
-            };
             var bound = incoming.*;
-            if (state_ptr) |ptr| {
-                try runtime_contract.writeStatePointerToBlock(&bound, ptr);
-            }
-            self.slot_state_blocks[idx] = .{
+            try bindRuntimeState(self, slot_index, descriptor.runtime_kind, &bound);
+            binding.handles[idx] = .{
                 .id = descriptor.id,
                 .ptr = bound.ptr,
                 .size = bound.size,
                 .align_bytes = bound.align_bytes,
             };
         }
-        self.slot_state_block_count = @intCast(state_blocks.len);
-        self.slot_state_bound = true;
+        binding.count = @intCast(state_blocks.len);
+        binding.bound = true;
     }
 
     pub fn unbindSlotStateBlocks(self: *CudaBackend, slot_index: usize) void {
-        if (slot_index != 0) return;
-        self.slot_state_block_count = 0;
-        self.slot_state_bound = false;
+        if (!self.slotIndexSupported(slot_index)) return;
+        self.slot_state_bindings[slot_index].reset();
     }
 
-    fn slotStateBlocks(self: *const CudaBackend) []const runtime_contract.StateBlockHandle {
-        return self.slot_state_blocks[0..self.slot_state_block_count];
+    fn slotStateBlocks(self: *const CudaBackend, slot_index: usize) []const runtime_contract.StateBlockHandle {
+        const binding = &self.slot_state_bindings[slot_index];
+        return binding.handles[0..binding.count];
+    }
+
+    inline fn slotIndexSupported(self: *const CudaBackend, slot_index: usize) bool {
+        return slot_index < self.max_batch_size;
     }
 
     pub fn ensureSlotStateBlocksBoundForScheduler(self: *CudaBackend, slot_index: usize) !void {
-        if (slot_index != 0) return error.InvalidArgument;
+        if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
         if (self.state_descriptor_count == 0) return;
-        if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
+        if (!self.slot_state_bindings[slot_index].bound) return error.InvalidStateDescriptorBinding;
         try runtime_contract.validateStateBlocksForDescriptors(
             self.stateDescriptors(),
-            self.slotStateBlocks(),
+            self.slotStateBlocks(slot_index),
         );
     }
 
@@ -2629,7 +2653,7 @@ pub const CudaBackend = struct {
             });
             return error.InvalidArgument;
         }
-        if (!self.slot_in_use or slot_index != 0) {
+        if (!self.slot_in_use or !self.slotIndexSupported(slot_index)) {
             log.warn("inference", "CUDA prefillSlotWithVision invalid args", .{
                 .reason = "slot_state",
                 .slot_index = slot_index,
@@ -2735,6 +2759,7 @@ pub const CudaBackend = struct {
             self.computeGpuPrototypeLogitsWithLayerLimit(
                 tokens[i],
                 i,
+                slot_index,
                 if (download_logits) self.slot_logits else null,
                 self.block_runtime.blocks.len,
                 download_logits,
@@ -2816,6 +2841,7 @@ pub const CudaBackend = struct {
         return self.computeGpuPrototypeLogitsWithLayerLimit(
             token,
             position,
+            0,
             logits_out,
             self.block_runtime.blocks.len,
             true,
@@ -2831,6 +2857,7 @@ pub const CudaBackend = struct {
         self: *CudaBackend,
         token: u32,
         position: usize,
+        slot_index: usize,
         logits_out_opt: ?[]f32,
         layer_limit: usize,
         compute_logits: bool,
@@ -2842,13 +2869,14 @@ pub const CudaBackend = struct {
     ) !void {
         if (!compute_logits and download_logits) return error.InvalidArgument;
         if (deepstack_feature_index_opt != null and deepstack_layer_features_opt == null) return error.InvalidArgument;
+        if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
         if (download_logits) {
             const logits_out = logits_out_opt orelse return error.InvalidArgument;
             if (logits_out.len != self.vocab_size) return error.InvalidArgument;
         }
         if (position >= self.max_seq_len) return error.InvalidArgument;
         if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
-        if (position == 0 and runtime_contract.stateDescriptorIndex(self.stateDescriptors(), runtime_contract.shortconv_state_id) != null) {
+        if (position == 0) {
             try self.resetShortConvStates();
         }
         if (ensure_kv_capacity) {
@@ -3048,6 +3076,7 @@ pub const CudaBackend = struct {
             };
             try self.tryExecuteLayerProgram(
                 layer,
+                slot_index,
                 layer_idx,
                 d_model_u32,
                 head_dim_u32,
@@ -3765,23 +3794,56 @@ pub const CudaBackend = struct {
         try self.linearForward(&self.prototype.shortconv_conv_dev, out_proj, output);
     }
 
+    fn applyBiasF32(
+        self: *CudaBackend,
+        target: *compute.cuda.Buffer,
+        bias: *const DeviceTensor,
+        count: u32,
+    ) !void {
+        const element_count = std.math.mul(usize, bias.rows, bias.cols) catch return error.InvalidArgument;
+        const count_usize: usize = @intCast(count);
+        if (element_count != count_usize) return error.InvalidInstructionBinding;
+        const expected_bytes = std.math.mul(usize, @as(usize, count), @sizeOf(f32)) catch return error.InvalidArgument;
+        if (bias.buffer.size != expected_bytes) return error.InvalidInstructionBinding;
+        const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
+        try compute.cuda.vector_add.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            vector_add_function,
+            target,
+            &bias.buffer,
+            target,
+            count,
+        );
+    }
+
     fn runFfnStep(
         self: *CudaBackend,
         input: *const compute.cuda.Buffer,
         gate_weight: *const LinearWeight,
         up_weight: *const LinearWeight,
         down_weight: *const LinearWeight,
+        gate_bias: ?*const DeviceTensor,
+        down_bias: ?*const DeviceTensor,
         d_ff: u32,
         output: *compute.cuda.Buffer,
     ) !void {
         _ = try self.runGateUpProjectionWithWeights(input, gate_weight, up_weight);
+        if (gate_bias) |bias| {
+            try self.applyBiasF32(&self.prototype.ffn_gate_dev, bias, d_ff);
+        }
         try self.runFfnActivationMul(d_ff);
         try self.linearForward(&self.prototype.ffn_mul_dev, down_weight, output);
+        if (down_bias) |bias| {
+            const d_model = std.math.cast(u32, down_weight.cols()) orelse return error.InvalidArgument;
+            try self.applyBiasF32(output, bias, d_model);
+        }
     }
 
     const LayerProgramExecutionContext = struct {
         backend: *CudaBackend,
         layer: *BlockRuntimeLayer,
+        slot_index: usize,
         layer_index: usize,
         op_index: usize,
         d_model_u32: u32,
@@ -3824,11 +3886,8 @@ pub const CudaBackend = struct {
     const layer_program_required_opcodes = [_]opcode_map.Opcode{
         .rmsnorm,
         .multihead_attention,
-        .mla_attention,
         .shortconv,
         .swiglu,
-        .moe,
-        .mamba_mixer,
         .residual_add,
     };
 
@@ -3836,11 +3895,8 @@ pub const CudaBackend = struct {
         var table: runtime_contract.AdapterTable = [_]?runtime_contract.KernelAdapterFn{null} ** 256;
         table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = layerProgramNormRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = layerProgramAttentionRuntimeAdapter;
-        table[@intFromEnum(opcode_map.Opcode.mla_attention)] = layerProgramMlaAttentionRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.shortconv)] = layerProgramShortConvRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.swiglu)] = layerProgramSwiGluRuntimeAdapter;
-        table[@intFromEnum(opcode_map.Opcode.moe)] = layerProgramMoeRuntimeAdapter;
-        table[@intFromEnum(opcode_map.Opcode.mamba_mixer)] = layerProgramMambaRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.residual_add)] = layerProgramResidualAddRuntimeAdapter;
         break :blk table;
     };
@@ -3883,7 +3939,10 @@ pub const CudaBackend = struct {
         const descriptor = runtime_contract.findStateDescriptor(&ctx.layer.compiled_plan.?.plan, state_id) orelse {
             return error.UnknownStateDescriptorId;
         };
-        const slot_block = runtime_contract.findStateBlock(ctx.backend.slotStateBlocks(), state_id) orelse return error.InvalidStateDescriptorBinding;
+        const slot_block = runtime_contract.findStateBlock(
+            ctx.backend.slotStateBlocks(ctx.slot_index),
+            state_id,
+        ) orelse return error.InvalidStateDescriptorBinding;
         if (slot_block.align_bytes < descriptor.align_bytes) return error.InvalidStateDescriptorBinding;
         if (descriptor.size_bytes > 0 and slot_block.size < descriptor.size_bytes) return error.InvalidStateDescriptorBinding;
         blocks.handles[0] = slot_block.*;
@@ -3971,10 +4030,10 @@ pub const CudaBackend = struct {
         const block = runtime_contract.findStateBlock(state_blocks, state_id) orelse {
             return error.InvalidStateDescriptorBinding;
         };
-        const raw = runtime_contract.statePointerFromBlock(block) orelse {
+        const value = runtime_contract.stateValueFromBlock(*T, block) orelse {
             return error.InvalidStateDescriptorBinding;
         };
-        return @ptrCast(@alignCast(raw));
+        return value;
     }
 
     fn instructionParams(
@@ -4153,6 +4212,10 @@ pub const CudaBackend = struct {
         if (k_proj.cols() != cfg.kv_dim or v_proj.cols() != cfg.kv_dim) return error.InvalidInstructionBinding;
         const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
         const kv_state = try requireStateValue(KvRuntimeState, state_blocks, state_id);
+        if (kv_state.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        if (!self.slotIndexSupported(kv_state.slot_index)) return error.InvalidStateDescriptorBinding;
         if (ctx.layer_index >= kv_state.block_runtime.blocks.len) return error.InvalidStateDescriptorBinding;
         const runtime_layer = &kv_state.block_runtime.blocks[ctx.layer_index];
         const attention_binding = runtime_layer.attention_binding orelse return error.InvalidStateDescriptorBinding;
@@ -4210,6 +4273,10 @@ pub const CudaBackend = struct {
         if (out_proj.cols() != self.d_model) return error.InvalidInstructionBinding;
         const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
         const shortconv_state = try requireStateValue(ShortConvRuntimeState, state_blocks, state_id);
+        if (shortconv_state.runtime_kind != runtime_contract.state_runtime_kind_shortconv_cache) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        if (!self.slotIndexSupported(shortconv_state.slot_index)) return error.InvalidStateDescriptorBinding;
         if (ctx.layer_index >= shortconv_state.block_runtime.blocks.len) return error.InvalidStateDescriptorBinding;
         const runtime_layer = &shortconv_state.block_runtime.blocks[ctx.layer_index];
         const shortconv_binding = runtime_layer.shortconv_binding orelse return error.InvalidStateDescriptorBinding;
@@ -4238,10 +4305,12 @@ pub const CudaBackend = struct {
         const input = bufferFromTensorHandle(io.inputs[0]);
         const output = bufferFromTensorHandle(io.outputs[0]);
         const weight_handles = try instructionWeightSlice(insn, registers);
-        if (weight_handles.len != 3) return error.InvalidWeightRefCount;
+        if (weight_handles.len != 5) return error.InvalidWeightRefCount;
         const gate_weight = linearWeightFromWeightHandle(weight_handles[0]);
         const up_weight = linearWeightFromWeightHandle(weight_handles[1]);
         const down_weight = linearWeightFromWeightHandle(weight_handles[2]);
+        const gate_bias = optionalDeviceTensorFromWeightHandle(weight_handles[3]);
+        const down_bias = optionalDeviceTensorFromWeightHandle(weight_handles[4]);
         const d_ff = gate_weight.cols();
         if (up_weight.cols() != d_ff) return error.InvalidInstructionBinding;
         if (down_weight.rows() != d_ff) return error.InvalidInstructionBinding;
@@ -4251,6 +4320,8 @@ pub const CudaBackend = struct {
             gate_weight,
             up_weight,
             down_weight,
+            gate_bias,
+            down_bias,
             d_ff_u32,
             output,
         );
@@ -4475,6 +4546,7 @@ pub const CudaBackend = struct {
     fn tryExecuteLayerProgram(
         self: *CudaBackend,
         layer: *BlockRuntimeLayer,
+        slot_index: usize,
         layer_index: usize,
         d_model_u32: u32,
         head_dim_u32: u32,
@@ -4513,6 +4585,7 @@ pub const CudaBackend = struct {
         var exec_ctx = LayerProgramExecutionContext{
             .backend = self,
             .layer = layer,
+            .slot_index = slot_index,
             .layer_index = layer_index,
             .op_index = 0,
             .d_model_u32 = d_model_u32,
@@ -6497,6 +6570,7 @@ test "finalOutputBuffer returns residual when program ends with add" {
             .in = .residual,
             .out = .branch_out,
             .debug_type = .multihead_attention,
+            .state_block_id = runtime_contract.kv_cache_state_id,
         } },
         .{ .add = .{
             .branch = .branch_out,
@@ -6551,7 +6625,6 @@ test "layer_program_adapter_table covers CUDA LayerOp execution subset" {
         .rmsnorm,
         .multihead_attention,
         .swiglu,
-        .moe,
         .shortconv,
         .residual_add,
     };
@@ -6559,6 +6632,9 @@ test "layer_program_adapter_table covers CUDA LayerOp execution subset" {
         try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode)] != null);
     }
 
+    try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.mla_attention)] == null);
+    try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.moe)] == null);
+    try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.mamba_mixer)] == null);
     try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.mul_scalar)] == null);
     try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.vision_patch_embed)] == null);
 }
@@ -6582,17 +6658,14 @@ test "layer program compatibility rejects unsupported primitive ops" {
     }
 }
 
-test "layer program compatibility rejects stateful opcode bound to wrong block kind" {
+test "layer program compatibility rejects CUDA-unsupported macro opcodes at load time" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{
             .id = 0,
             .in = .residual,
             .out = .branch_out,
-            .debug_type = .shortconv,
-        } },
-        .{ .add = .{
-            .branch = .branch_out,
-            .scale = .one,
+            .debug_type = .mamba_mixer,
+            .state_block_id = runtime_contract.mamba_state_id,
         } },
     };
     const issue = runtime_contract.firstLayerProgramCompatibilityIssue(
@@ -6601,9 +6674,32 @@ test "layer program compatibility rejects stateful opcode bound to wrong block k
         CudaBackend.layer_program_adapter_table,
     ) orelse return error.TestUnexpectedResult;
     switch (issue) {
-        .state_mismatch => |mismatch| try std.testing.expectEqual(opcode_map.Opcode.shortconv, mismatch.opcode),
+        .unsupported_opcode => |unsupported| try std.testing.expectEqual(opcode_map.Opcode.mamba_mixer, unsupported.opcode),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "layer program compatibility is block-kind agnostic for state descriptors" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .branch_out,
+            .debug_type = .shortconv,
+            .state_block_id = runtime_contract.shortconv_state_id,
+        } },
+        .{ .add = .{
+            .branch = .branch_out,
+            .scale = .one,
+        } },
+    };
+    try std.testing.expect(
+        runtime_contract.firstLayerProgramCompatibilityIssue(
+            &program,
+            .attention_mlp,
+            CudaBackend.layer_program_adapter_table,
+        ) == null,
+    );
 }
 
 test "buildCudaLayerProgramRegisterSlotMap reuses temp slots from liveness" {
@@ -7292,8 +7388,8 @@ test "BlockRuntimeLayer.rebuildInstructionRefs binds per-op runtime refs" {
 
     const ops = [_]layer_ops.LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
-        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
-        .{ .kernel = .{ .id = 2, .in = .branch_out, .out = .tmp3, .debug_type = .shortconv } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention, .state_block_id = runtime_contract.kv_cache_state_id } },
+        .{ .kernel = .{ .id = 2, .in = .branch_out, .out = .tmp3, .debug_type = .shortconv, .state_block_id = runtime_contract.shortconv_state_id } },
         .{ .kernel = .{ .id = 3, .in = .tmp3, .out = .branch_out, .debug_type = .mlp } },
         .{ .kernel = .{ .id = 4, .in = .residual, .out = .norm_out, .debug_type = .norm } },
     };
@@ -7431,4 +7527,182 @@ test "BlockRuntimeLayer.rebuildInstructionRefs binds moe instruction typed refs"
     try std.testing.expectEqual(@intFromPtr(down_bias_ptr), @intFromPtr(&missing_device_tensor));
     try std.testing.expectEqual(@intFromPtr(router_scales_ptr), @intFromPtr(&missing_device_tensor));
     try std.testing.expectEqual(@intFromPtr(router_quant_bias_ptr), @intFromPtr(&missing_device_tensor));
+}
+
+test "bindSlotStateBlocks stores typed runtime states by runtime_kind" {
+    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+    var backend: CudaBackend = undefined;
+    backend.max_batch_size = 1;
+    backend.block_runtime = undefined;
+    backend.state_descriptor_count = 3;
+    backend.state_descriptors_storage[0] = .{
+        .id = 91,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+    };
+    backend.state_descriptors_storage[1] = .{
+        .id = 92,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_shortconv_cache,
+    };
+    backend.state_descriptors_storage[2] = .{
+        .id = 93,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_mamba_cache,
+    };
+    var slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    backend.slot_state_bindings = slot_state_bindings[0..];
+
+    var kv_block_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    var shortconv_block_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    var mamba_block_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    const state_blocks = [_]runtime_contract.StateBlockHandle{
+        .{
+            .id = 91,
+            .ptr = kv_block_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+        .{
+            .id = 92,
+            .ptr = shortconv_block_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+        .{
+            .id = 93,
+            .ptr = mamba_block_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+    };
+
+    try backend.bindSlotStateBlocks(0, state_blocks[0..]);
+    defer backend.unbindSlotStateBlocks(0);
+    const bound = backend.slotStateBlocks(0);
+    const kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, &bound[0]) orelse return error.TestUnexpectedResult;
+    const shortconv_state = runtime_contract.stateValueFromBlock(*ShortConvRuntimeState, &bound[1]) orelse return error.TestUnexpectedResult;
+    const mamba_state = runtime_contract.stateValueFromBlock(*MambaRuntimeState, &bound[2]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(kv_state.block_runtime));
+    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(shortconv_state.block_runtime));
+    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(mamba_state.block_runtime));
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_shortconv_cache, shortconv_state.runtime_kind);
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_mamba_cache, mamba_state.runtime_kind);
+    try std.testing.expectEqual(@as(usize, 0), kv_state.slot_index);
+    try std.testing.expectEqual(@as(usize, 0), shortconv_state.slot_index);
+    try std.testing.expectEqual(@as(usize, 0), mamba_state.slot_index);
+}
+
+test "bindSlotStateBlocks preserves bound slot index in runtime states" {
+    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+    var backend: CudaBackend = undefined;
+    backend.max_batch_size = 2;
+    backend.block_runtime = undefined;
+    backend.state_descriptor_count = 3;
+    backend.state_descriptors_storage[0] = .{
+        .id = 101,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+    };
+    backend.state_descriptors_storage[1] = .{
+        .id = 102,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_shortconv_cache,
+    };
+    backend.state_descriptors_storage[2] = .{
+        .id = 103,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_mamba_cache,
+    };
+    var slot_state_bindings: [2]CudaBackend.SlotStateBinding = .{ .{}, .{} };
+    backend.slot_state_bindings = slot_state_bindings[0..];
+
+    var kv_block_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    var shortconv_block_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    var mamba_block_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    const state_blocks = [_]runtime_contract.StateBlockHandle{
+        .{
+            .id = 101,
+            .ptr = kv_block_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+        .{
+            .id = 102,
+            .ptr = shortconv_block_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+        .{
+            .id = 103,
+            .ptr = mamba_block_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+    };
+
+    try backend.bindSlotStateBlocks(1, state_blocks[0..]);
+    defer backend.unbindSlotStateBlocks(1);
+    const bound = backend.slotStateBlocks(1);
+    const kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, &bound[0]) orelse return error.TestUnexpectedResult;
+    const shortconv_state = runtime_contract.stateValueFromBlock(*ShortConvRuntimeState, &bound[1]) orelse return error.TestUnexpectedResult;
+    const mamba_state = runtime_contract.stateValueFromBlock(*MambaRuntimeState, &bound[2]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_shortconv_cache, shortconv_state.runtime_kind);
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_mamba_cache, mamba_state.runtime_kind);
+    try std.testing.expectEqual(@as(usize, 1), kv_state.slot_index);
+    try std.testing.expectEqual(@as(usize, 1), shortconv_state.slot_index);
+    try std.testing.expectEqual(@as(usize, 1), mamba_state.slot_index);
+}
+
+test "bindSlotStateBlocks rejects descriptor with runtime_kind none" {
+    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+    var backend: CudaBackend = undefined;
+    backend.max_batch_size = 1;
+    backend.block_runtime = undefined;
+    backend.state_descriptor_count = 1;
+    backend.state_descriptors_storage[0] = .{
+        .id = 111,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_none,
+    };
+    var slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    backend.slot_state_bindings = slot_state_bindings[0..];
+
+    var state_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    const state_blocks = [_]runtime_contract.StateBlockHandle{
+        .{
+            .id = 111,
+            .ptr = state_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+    };
+
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        backend.bindSlotStateBlocks(0, state_blocks[0..]),
+    );
 }

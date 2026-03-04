@@ -99,6 +99,9 @@ pub const LayerOp = union(enum) {
         /// Expected operation type (debug validation only).
         /// Set by compiler, checked by executor in debug builds.
         debug_type: op_types.OpType = .norm,
+        /// Optional state descriptor id for this kernel op.
+        /// When null, the op is stateless in the compiled plan.
+        state_block_id: ?u8 = null,
     },
 
     /// residual += branch * scale

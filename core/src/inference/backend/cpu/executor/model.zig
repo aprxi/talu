@@ -19,6 +19,7 @@ const kernel_info = inspect.kernel_info;
 const perf_estimate = inspect.perf_estimate;
 const trace = @import("../../../../xray/trace.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
+const state_bindings = @import("../state_bindings.zig");
 const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capture.zig") else struct {
     pub fn recordGlobal(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) void {}
 };
@@ -259,6 +260,17 @@ pub const Transformer = struct {
         layer_features: []const []const f32,
     };
 
+    fn resolveLayeredCache(
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) ?*LayeredBatchedKVCache {
+        for (state_blocks) |*state_block| {
+            const state_value = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, state_block) orelse continue;
+            if (state_value.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) continue;
+            return state_value.layered_cache;
+        }
+        return null;
+    }
+
     /// Forward pass through transformer layers only (not embedding or final norm).
     /// This is the core transformer body: hidden_states -> layers -> hidden_states
     pub fn forward(
@@ -370,11 +382,7 @@ pub const Transformer = struct {
         use_cache: bool,
         deepstack: ?*const DeepstackAdditions,
     ) !void {
-        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
-        const layered_cache = if (runtime_contract.statePointerForId(state_blocks, kv_state_id)) |raw_cache|
-            @as(*LayeredBatchedKVCache, @ptrCast(@alignCast(raw_cache)))
-        else
-            null;
+        const layered_cache = resolveLayeredCache(state_blocks);
         if (!use_cache) {
             if (layered_cache) |cache| cache.resetSlot(slot_index);
         }
@@ -468,11 +476,7 @@ pub const Transformer = struct {
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1);
         std.debug.assert(@as(usize, @intCast(input_tensor.shape[1])) == slot_indices.len);
         std.debug.assert(@as(usize, @intCast(output_tensor.shape[1])) == slot_indices.len);
-        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
-        const layered_cache = if (runtime_contract.statePointerForId(state_blocks, kv_state_id)) |raw_cache|
-            @as(*LayeredBatchedKVCache, @ptrCast(@alignCast(raw_cache)))
-        else
-            null;
+        const layered_cache = resolveLayeredCache(state_blocks);
         if (!use_cache) {
             if (layered_cache) |cache| {
                 for (slot_indices) |slot_index| cache.resetSlot(slot_index);
@@ -1116,4 +1120,61 @@ test "estimateWeightMemory bytesPerParam dtypes" {
 
     model.weight_dtype = .grouped_affine_u8;
     try expect(model.bytesPerParam() == 1);
+}
+
+test "Transformer.resolveLayeredCache resolves typed runtime state without builtin id routing" {
+    var layered_cache = try LayeredBatchedKVCache.init(std.testing.allocator, 1, 1, 1, 1, 8);
+    defer layered_cache.deinit();
+    var scratch = try ScratchBuffer.initWithSlots(std.testing.allocator, 8, 16, 1, 1);
+    defer scratch.deinit();
+
+    var storage: [@sizeOf(state_bindings.KvRuntimeState)]u8 align(64) =
+        [_]u8{0} ** @sizeOf(state_bindings.KvRuntimeState);
+    var state_block = runtime_contract.StateBlockHandle{
+        .id = 77,
+        .ptr = @ptrCast(storage[0..].ptr),
+        .size = @sizeOf(state_bindings.KvRuntimeState),
+        .align_bytes = 64,
+    };
+    const runtime_state = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, &state_block) orelse {
+        return error.TestUnexpectedResult;
+    };
+    runtime_state.* = .{
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+        .layered_cache = &layered_cache,
+        .scratch = &scratch,
+        .slot_index = 0,
+    };
+
+    const resolved = Transformer.resolveLayeredCache(&.{state_block}) orelse {
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqual(@intFromPtr(&layered_cache), @intFromPtr(resolved));
+}
+
+test "Transformer.resolveLayeredCache ignores non-kv runtime state blocks" {
+    var layered_cache = try LayeredBatchedKVCache.init(std.testing.allocator, 1, 1, 1, 1, 8);
+    defer layered_cache.deinit();
+    var scratch = try ScratchBuffer.initWithSlots(std.testing.allocator, 8, 16, 1, 1);
+    defer scratch.deinit();
+
+    var storage: [@sizeOf(state_bindings.KvRuntimeState)]u8 align(64) =
+        [_]u8{0} ** @sizeOf(state_bindings.KvRuntimeState);
+    var state_block = runtime_contract.StateBlockHandle{
+        .id = 78,
+        .ptr = @ptrCast(storage[0..].ptr),
+        .size = @sizeOf(state_bindings.KvRuntimeState),
+        .align_bytes = 64,
+    };
+    const runtime_state = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, &state_block) orelse {
+        return error.TestUnexpectedResult;
+    };
+    runtime_state.* = .{
+        .runtime_kind = runtime_contract.state_runtime_kind_shortconv_cache,
+        .layered_cache = &layered_cache,
+        .scratch = &scratch,
+        .slot_index = 0,
+    };
+
+    try std.testing.expect(Transformer.resolveLayeredCache(&.{state_block}) == null);
 }
