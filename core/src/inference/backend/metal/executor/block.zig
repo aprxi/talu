@@ -1295,20 +1295,10 @@ pub const TransformerBlock = struct {
         return try requireInstructionStateValue(T, ctx, insn, state_blocks.slice());
     }
 
-    fn dispatchLayerProgramInstructionFast(
-        insn: *const runtime_contract.Instruction,
-        ctx: *LayerProgramExecutionContext,
-        rt_ctx: *runtime_contract.ExecutionContext,
-    ) !void {
-        return dispatchLayerProgramInstruction(insn, ctx, rt_ctx);
-    }
-
     fn forwardWithProgram(
         hidden: mlx_graph.ArrayHandle,
         lw: *const LayerWeights,
         layer_idx: usize,
-        config: ModelConfig,
-        weight_handles: *const WeightHandles,
         state_blocks: []const runtime_contract.StateBlockHandle,
         pos_offset: usize,
         runtime_rope_cos_handle: mlx_graph.ArrayHandle,
@@ -1344,6 +1334,10 @@ pub const TransformerBlock = struct {
         if (comptime std.debug.runtime_safety) {
             try runtime_contract.validateExecutionContext(&rt_ctx);
         }
+        const precomputed_runtime_bindings = lw.precomputed_runtime_bindings orelse {
+            return error.InvalidInstructionBinding;
+        };
+        const bindings_ptr: *const LayerProgramRuntimeBindings = @ptrCast(@alignCast(precomputed_runtime_bindings));
         var exec_ctx = LayerProgramExecutionContext{
             .compiled_plan = &compiled_plan,
             .layer_idx = layer_idx,
@@ -1358,10 +1352,7 @@ pub const TransformerBlock = struct {
             .instruction_handles = lw.instruction_handle_scratch,
             .instruction_views = lw.instruction_view_scratch,
             .norm_index = &norm_index,
-            .bindings = if (lw.precomputed_runtime_bindings) |raw| blk: {
-                const bindings_ptr: *const LayerProgramRuntimeBindings = @ptrCast(@alignCast(raw));
-                break :blk bindings_ptr.*;
-            } else try buildLayerProgramRuntimeBindings(lw, config, weight_handles),
+            .bindings = bindings_ptr.*,
             .resolved_weight_ptrs = lw.weight_ptr_scratch,
         };
         if (exec_ctx.resolved_weight_ptrs.len != exec_ctx.weight_binding_keys.len) {
@@ -1370,7 +1361,7 @@ pub const TransformerBlock = struct {
         try bindLayerProgramStateDescriptors(&exec_ctx, &compiled_plan.plan, state_blocks);
 
         for (compiled_plan.plan.instructions) |insn| {
-            try dispatchLayerProgramInstructionFast(&insn, &exec_ctx, &rt_ctx);
+            try dispatchLayerProgramInstruction(&insn, &exec_ctx, &rt_ctx);
         }
 
         const final_register = runtime_contract.planFinalOutputRegister(&compiled_plan.plan);
@@ -1390,6 +1381,8 @@ pub const TransformerBlock = struct {
         runtime_rope_sin_handle: mlx_graph.ArrayHandle,
         runtime_rope_dim: usize,
     ) !mlx_graph.ArrayHandle {
+        _ = config;
+        _ = weight_handles;
         const lw = layer_weights;
 
         if (lw.compiled_plan == null) {
@@ -1403,8 +1396,6 @@ pub const TransformerBlock = struct {
             hidden,
             lw,
             layer_idx,
-            config,
-            weight_handles,
             state_blocks,
             pos_offset,
             runtime_rope_cos_handle,

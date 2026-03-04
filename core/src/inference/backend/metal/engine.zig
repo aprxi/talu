@@ -64,6 +64,7 @@ pub const MetalBackend = struct {
     vision_runtime: ?vision_runtime_mod.VisionRuntime = null,
     slot_rope_position_delta: isize,
     state_descriptors_storage: [MaxStateDescriptors]runtime_contract.StateDescriptor,
+    state_runtime_roles: [MaxStateDescriptors]StateRuntimeRole,
     state_descriptor_count: u8,
     slot0_state_binding: SlotStateBinding = .{},
     slot0_bootstrap_bindings: InitStateBindings = .{},
@@ -269,6 +270,47 @@ pub const MetalBackend = struct {
         return runtime_contract.stateValueFromBlock(*T, state_block) orelse error.InvalidStateDescriptorBinding;
     }
 
+    const StateRuntimeRole = enum(u8) {
+        none = 0,
+        kv_cache = 1,
+        shortconv_cache = 2,
+        mamba_cache = 3,
+    };
+
+    fn runtimeRoleForOpcode(opcode: runtime_contract.Opcode) StateRuntimeRole {
+        return switch (opcode) {
+            .multihead_attention, .mla_attention => .kv_cache,
+            .shortconv => .shortconv_cache,
+            .mamba_mixer => .mamba_cache,
+            else => .none,
+        };
+    }
+
+    fn deriveStateRuntimeRoles(
+        descriptors: []const runtime_contract.StateDescriptor,
+        weight_handles: *weights_trait.WeightHandles,
+    ) ![MaxStateDescriptors]StateRuntimeRole {
+        var roles = [_]StateRuntimeRole{.none} ** MaxStateDescriptors;
+        for (weight_handles.layers) |*layer| {
+            const compiled_plan = layer.compiled_plan orelse continue;
+            for (compiled_plan.plan.instructions) |insn| {
+                const state_id = insn.state_block_id orelse continue;
+                const descriptor_idx = runtime_contract.stateDescriptorIndex(descriptors, state_id) orelse {
+                    return error.InvalidStateDescriptorBinding;
+                };
+                const inferred_role = runtimeRoleForOpcode(insn.opcode);
+                if (inferred_role == .none) continue;
+                const current_role = roles[descriptor_idx];
+                if (current_role == .none) {
+                    roles[descriptor_idx] = inferred_role;
+                } else if (current_role != inferred_role) {
+                    return error.InvalidStateDescriptorBinding;
+                }
+            }
+        }
+        return roles;
+    }
+
     const StateRuntimeOps = struct {
         init: *const fn (self: *MetalBackend, state_block: *const runtime_contract.StateBlockHandle) anyerror!bool,
         reset: *const fn (state_block: *const runtime_contract.StateBlockHandle) anyerror!void,
@@ -331,24 +373,24 @@ pub const MetalBackend = struct {
         mamba.* = runtime_graph_mod.MambaCache.disabled();
     }
 
-    const state_runtime_ops: [256]?StateRuntimeOps = blk: {
-        var table: [256]?StateRuntimeOps = [_]?StateRuntimeOps{null} ** 256;
-        table[runtime_contract.state_runtime_kind_none] = .{
+    const state_runtime_ops: [@typeInfo(StateRuntimeRole).@"enum".fields.len]StateRuntimeOps = blk: {
+        var table: [@typeInfo(StateRuntimeRole).@"enum".fields.len]StateRuntimeOps = undefined;
+        table[@intFromEnum(StateRuntimeRole.none)] = .{
             .init = initNoopState,
             .reset = resetNoopState,
             .deinit = deinitNoopState,
         };
-        table[runtime_contract.state_runtime_kind_kv_cache] = .{
+        table[@intFromEnum(StateRuntimeRole.kv_cache)] = .{
             .init = initKvCacheState,
             .reset = resetKvCacheState,
             .deinit = deinitKvCacheState,
         };
-        table[runtime_contract.state_runtime_kind_shortconv_cache] = .{
+        table[@intFromEnum(StateRuntimeRole.shortconv_cache)] = .{
             .init = initShortConvState,
             .reset = resetShortConvState,
             .deinit = deinitShortConvState,
         };
-        table[runtime_contract.state_runtime_kind_mamba_cache] = .{
+        table[@intFromEnum(StateRuntimeRole.mamba_cache)] = .{
             .init = initMambaState,
             .reset = resetMambaState,
             .deinit = deinitMambaState,
@@ -356,41 +398,40 @@ pub const MetalBackend = struct {
         break :blk table;
     };
 
-    fn runtimeStateOps(runtime_kind: u8) ?StateRuntimeOps {
-        return state_runtime_ops[runtime_kind];
+    fn runtimeStateOps(role: StateRuntimeRole) StateRuntimeOps {
+        return state_runtime_ops[@intFromEnum(role)];
     }
 
     fn initStateObjectForDescriptor(
         self: *MetalBackend,
-        descriptor: *const runtime_contract.StateDescriptor,
+        role: StateRuntimeRole,
         state_block: *const runtime_contract.StateBlockHandle,
     ) !bool {
-        const ops = runtimeStateOps(descriptor.runtime_kind) orelse return false;
+        const ops = runtimeStateOps(role);
         return try ops.init(self, state_block);
     }
 
     fn resetStateObjectForDescriptor(
-        descriptor: *const runtime_contract.StateDescriptor,
+        role: StateRuntimeRole,
         state_block: *const runtime_contract.StateBlockHandle,
     ) !void {
-        const ops = runtimeStateOps(descriptor.runtime_kind) orelse return;
+        const ops = runtimeStateOps(role);
         try ops.reset(state_block);
     }
 
     fn deinitStateObjectForDescriptor(
-        descriptor: *const runtime_contract.StateDescriptor,
+        role: StateRuntimeRole,
         state_block: *const runtime_contract.StateBlockHandle,
     ) !void {
-        const ops = runtimeStateOps(descriptor.runtime_kind) orelse return;
+        const ops = runtimeStateOps(role);
         try ops.deinit(state_block);
     }
 
     fn deinitSlotBindingStateObjects(self: *MetalBackend, binding: *SlotStateBinding) void {
-        const descriptors = self.stateDescriptors();
-        const count = @min(@as(usize, @intCast(binding.count)), descriptors.len);
+        const count = @min(@as(usize, @intCast(binding.count)), @as(usize, self.state_descriptor_count));
         for (0..count) |idx| {
             if (!binding.initialized[idx]) continue;
-            deinitStateObjectForDescriptor(&descriptors[idx], &binding.handles[idx]) catch {};
+            deinitStateObjectForDescriptor(self.state_runtime_roles[idx], &binding.handles[idx]) catch {};
             binding.initialized[idx] = false;
         }
     }
@@ -401,7 +442,7 @@ pub const MetalBackend = struct {
         for (0..count) |idx| {
             if (!binding.initialized[idx]) continue;
             if (descriptors[idx].lifecycle == .slot_persistent) continue;
-            deinitStateObjectForDescriptor(&descriptors[idx], &binding.handles[idx]) catch {};
+            deinitStateObjectForDescriptor(self.state_runtime_roles[idx], &binding.handles[idx]) catch {};
             binding.initialized[idx] = false;
         }
     }
@@ -418,7 +459,7 @@ pub const MetalBackend = struct {
         const count = @min(@as(usize, @intCast(binding.count)), descriptors.len);
         for (0..count) |idx| {
             if (!binding.initialized[idx]) continue;
-            try resetStateObjectForDescriptor(&descriptors[idx], &binding.handles[idx]);
+            try resetStateObjectForDescriptor(self.state_runtime_roles[idx], &binding.handles[idx]);
         }
     }
 
@@ -591,6 +632,10 @@ pub const MetalBackend = struct {
                 );
             }
         }
+        const state_runtime_roles = try deriveStateRuntimeRoles(
+            state_descriptors_storage[0..state_descriptor_count],
+            weight_handles,
+        );
         var vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
         errdefer if (vision_runtime) |*rt| rt.deinit();
 
@@ -624,6 +669,7 @@ pub const MetalBackend = struct {
             .vision_runtime = vision_runtime,
             .slot_rope_position_delta = 0,
             .state_descriptors_storage = state_descriptors_storage,
+            .state_runtime_roles = state_runtime_roles,
             .state_descriptor_count = state_descriptor_count,
             .current_position = 0,
         };
@@ -826,7 +872,7 @@ pub const MetalBackend = struct {
                     existing.size == incoming.size and
                     existing.align_bytes == incoming.align_bytes;
                 if (!same_block) {
-                    try deinitStateObjectForDescriptor(&descriptor, &binding.handles[idx]);
+                    try deinitStateObjectForDescriptor(self.state_runtime_roles[idx], &binding.handles[idx]);
                     binding.initialized[idx] = false;
                 }
             }
@@ -837,7 +883,10 @@ pub const MetalBackend = struct {
                 .align_bytes = incoming.align_bytes,
             };
             if (!binding.initialized[idx]) {
-                binding.initialized[idx] = try self.initStateObjectForDescriptor(&descriptor, &binding.handles[idx]);
+                binding.initialized[idx] = try self.initStateObjectForDescriptor(
+                    self.state_runtime_roles[idx],
+                    &binding.handles[idx],
+                );
             }
         }
         binding.bound = true;
