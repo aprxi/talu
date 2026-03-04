@@ -56,6 +56,7 @@ pub const treesitter = @import("code.zig");
 
 pub const router = @import("router.zig");
 pub const agent = @import("agent/root.zig");
+pub const train = @import("train.zig");
 
 // Re-export Chat/session lifecycle APIs.
 pub const talu_chat_set_ttl_ts = responses.talu_chat_set_ttl_ts;
@@ -805,6 +806,22 @@ pub const talu_treesitter_extract_call_sites = treesitter.talu_treesitter_extrac
 pub const TreeSitterParserHandle = treesitter.TreeSitterParserHandle;
 pub const TreeSitterTreeHandle = treesitter.TreeSitterTreeHandle;
 pub const TreeSitterQueryHandle = treesitter.TreeSitterQueryHandle;
+
+// Re-export Training C API functions (LoRA fine-tuning sessions).
+pub const talu_train_create = train.talu_train_create;
+pub const talu_train_destroy = train.talu_train_destroy;
+pub const talu_train_load_model = train.talu_train_load_model;
+pub const talu_train_configure = train.talu_train_configure;
+pub const talu_train_load_data = train.talu_train_load_data;
+pub const talu_train_run = train.talu_train_run;
+pub const talu_train_save_checkpoint = train.talu_train_save_checkpoint;
+pub const talu_train_get_info = train.talu_train_get_info;
+pub const TaluTrainSession = train.TaluTrainSession;
+pub const CLoraConfig = train.CLoraConfig;
+pub const CTrainingConfig = train.CTrainingConfig;
+pub const CStepMetrics = train.CStepMetrics;
+pub const CTrainingInfo = train.CTrainingInfo;
+pub const CStepCallback = train.CStepCallback;
 
 // ABI validation - comptime assertions ensure struct sizes match expected values.
 // When struct layouts change, update abi.zig and bindings/python/talu/_abi.py.

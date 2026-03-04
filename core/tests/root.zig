@@ -122,6 +122,9 @@ pub const sandbox = @import("agent/sandbox/root.zig");
 // image (decode/convert/model_input/encode/capi)
 pub const image = @import("image/root.zig");
 
+// train (training, fine-tuning, LoRA adapters)
+pub const train = @import("train/root.zig");
+
 // root exports
 pub const device = @import("device_test.zig");
 

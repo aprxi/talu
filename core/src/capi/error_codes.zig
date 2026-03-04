@@ -90,6 +90,19 @@ pub const ErrorCode = enum(i32) {
     unsupported_abi_version = 904,
     resource_exhausted = 905,
     internal_error = 999,
+
+    // Training errors (1000-1099)
+    train_invalid_state = 1000,
+    train_model_load_failed = 1001,
+    train_adapter_config_invalid = 1002,
+    train_data_load_failed = 1003,
+    train_data_invalid_format = 1004,
+    train_not_configured = 1005,
+    train_already_running = 1006,
+    train_checkpoint_save_failed = 1007,
+    train_checkpoint_load_failed = 1008,
+    train_step_failed = 1009,
+    train_cancelled = 1010,
 };
 
 /// Map a Zig error to a stable ErrorCode.
@@ -181,6 +194,10 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.WebpHeaderFailed,
         error.WebpDecodeFailed,
         => .invalid_argument,
+        // Training errors
+        error.InvalidState => .train_invalid_state,
+        error.InvalidDataFormat => .train_data_invalid_format,
+        error.Cancelled => .train_cancelled,
         else => .internal_error,
     };
 }
@@ -195,4 +212,12 @@ test "ErrorCode: error codes are stable" {
     try std.testing.expectEqual(@as(i32, 813), @intFromEnum(ErrorCode.sandbox_detect_failed));
     try std.testing.expectEqual(@as(i32, 814), @intFromEnum(ErrorCode.sandbox_probe_failed));
     try std.testing.expectEqual(@as(i32, 815), @intFromEnum(ErrorCode.sandbox_cgroup_unavailable));
+    try std.testing.expectEqual(@as(i32, 1000), @intFromEnum(ErrorCode.train_invalid_state));
+    try std.testing.expectEqual(@as(i32, 1010), @intFromEnum(ErrorCode.train_cancelled));
+}
+
+test "ErrorCode: training error mappings" {
+    try std.testing.expectEqual(ErrorCode.train_invalid_state, errorToCode(error.InvalidState));
+    try std.testing.expectEqual(ErrorCode.train_data_invalid_format, errorToCode(error.InvalidDataFormat));
+    try std.testing.expectEqual(ErrorCode.train_cancelled, errorToCode(error.Cancelled));
 }

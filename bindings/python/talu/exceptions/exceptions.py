@@ -67,6 +67,8 @@ __all__ = [
     "StateError",
     # Storage
     "StorageError",
+    # Training
+    "TrainingError",
     # Validation
     "ValidationError",
     # Structured Output
@@ -537,6 +539,33 @@ class StorageError(TaluError, RuntimeError):
         original_code: int | None = None,
     ):
         super().__init__(message, code, details, original_code or 700)
+
+
+# =============================================================================
+# Training Errors
+# =============================================================================
+
+
+class TrainingError(TaluError, RuntimeError):
+    """
+    Error during model training.
+
+    Raised when training operations fail. Common causes:
+    - Model loading or adapter configuration failures
+    - Invalid training hyperparameters
+    - Data loading or format errors
+    - Training loop failures or cancellation
+    - Checkpoint save/load failures
+    """
+
+    def __init__(
+        self,
+        message: str,
+        code: str = "TRAINING_ERROR",
+        details: dict[str, Any] | None = None,
+        original_code: int | None = None,
+    ):
+        super().__init__(message, code, details, original_code or 1000)
 
 
 # =============================================================================

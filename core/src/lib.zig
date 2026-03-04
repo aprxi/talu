@@ -53,6 +53,7 @@ pub const db = @import("db/root.zig");
 pub const policy = @import("agent/policy/root.zig");
 pub const dump = @import("xray/dump/root.zig");
 pub const agent = @import("agent/root.zig");
+pub const train = @import("train/root.zig");
 
 // Force the linker to export these symbols by referencing them in a comptime block
 comptime {
@@ -498,4 +499,14 @@ comptime {
     _ = &capi.talu_agent_bus_deliver;
     _ = &capi.talu_agent_bus_broadcast;
     _ = &capi.talu_agent_bus_pending;
+
+    // Training API
+    _ = &capi.talu_train_create;
+    _ = &capi.talu_train_destroy;
+    _ = &capi.talu_train_load_model;
+    _ = &capi.talu_train_configure;
+    _ = &capi.talu_train_load_data;
+    _ = &capi.talu_train_run;
+    _ = &capi.talu_train_save_checkpoint;
+    _ = &capi.talu_train_get_info;
 }

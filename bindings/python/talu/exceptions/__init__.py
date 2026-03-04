@@ -19,6 +19,7 @@ This module defines the exception hierarchy for talu:
     ├── InteropError - DLPack/NumPy interop errors
     ├── StateError - Invalid object state errors
     ├── StorageError - Storage backend failures (items in memory only)
+    ├── TrainingError - Errors during model training
     └── ValidationError - Invalid parameter value
 """
 
@@ -44,6 +45,7 @@ from .exceptions import (
     TemplateSyntaxError,
     TemplateUndefinedError,
     TokenizerError,
+    TrainingError,
     ValidationError,
 )
 
@@ -78,6 +80,8 @@ __all__ = [
     "StateError",
     # Storage
     "StorageError",
+    # Training
+    "TrainingError",
     # Validation
     "ValidationError",
     # Structured Output

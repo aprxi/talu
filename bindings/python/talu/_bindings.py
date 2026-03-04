@@ -28,6 +28,7 @@ from .exceptions import (
     TemplateSyntaxError,
     TemplateUndefinedError,
     TokenizerError,
+    TrainingError,
     ValidationError,
 )
 
@@ -297,6 +298,18 @@ ERROR_MAP: dict[int, tuple[type[TaluError], str]] = {
     904: (ValidationError, "UNSUPPORTED_ABI_VERSION"),
     905: (ResourceError, "RESOURCE_EXHAUSTED"),
     999: (TaluError, "INTERNAL_ERROR"),
+    # Training errors (1000-1099)
+    1000: (TrainingError, "TRAIN_INVALID_STATE"),
+    1001: (TrainingError, "TRAIN_MODEL_LOAD_FAILED"),
+    1002: (TrainingError, "TRAIN_ADAPTER_CONFIG_INVALID"),
+    1003: (TrainingError, "TRAIN_DATA_LOAD_FAILED"),
+    1004: (TrainingError, "TRAIN_DATA_INVALID_FORMAT"),
+    1005: (TrainingError, "TRAIN_NOT_CONFIGURED"),
+    1006: (TrainingError, "TRAIN_ALREADY_RUNNING"),
+    1007: (TrainingError, "TRAIN_CHECKPOINT_SAVE_FAILED"),
+    1008: (TrainingError, "TRAIN_CHECKPOINT_LOAD_FAILED"),
+    1009: (TrainingError, "TRAIN_STEP_FAILED"),
+    1010: (TrainingError, "TRAIN_CANCELLED"),
 }
 
 

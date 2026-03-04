@@ -220,8 +220,14 @@ from talu.exceptions import (
     TokenizerError as TokenizerError,
 )
 from talu.exceptions import (
+    TrainingError as TrainingError,
+)
+from talu.exceptions import (
     ValidationError as ValidationError,
 )
+
+# Training
+from talu.train import TrainingSession
 
 # Configuration / Model Specification
 from talu.router import (
@@ -326,6 +332,8 @@ __all__ = [
     "ask",
     "Profile",
     "list_sessions",
+    # Training
+    "TrainingSession",
     # Tokenizer
     "Tokenizer",
     # Template
