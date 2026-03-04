@@ -39,7 +39,7 @@ from ._bindings import (
 from .batch import BatchEncoding
 from .special_tokens import SpecialTokensMixin
 from .template import ChatTemplate
-from .token_array import TokenArray, TokenOffset
+from .token_array import TokenArray, TokenOffset, _LazyOffsets
 
 logger = scoped_logger("tokenizer")
 
@@ -541,15 +541,16 @@ class Tokenizer(SpecialTokensMixin):
 
         # Handle empty result
         if result.num_tokens == 0:
-            return TokenArray(None, 0, _offsets=[])
+            return TokenArray(None, 0, _offsets=_LazyOffsets(None, 0))
 
         num_tokens = result.num_tokens
 
-        # Extract offsets into Python objects
-        offsets = [
-            TokenOffset(result.offsets[i].start, result.offsets[i].end)
-            for i in range(num_tokens)
-        ]
+        # Copy raw offset data (fast memcpy) instead of creating N Python objects
+        import ctypes
+
+        raw_offsets = (ctypes.c_uint32 * (num_tokens * 2))()
+        ctypes.memmove(raw_offsets, result.offsets, num_tokens * 8)
+        offsets = _LazyOffsets(raw_offsets, num_tokens)
 
         # Transfer ids ownership to SharedBuffer
         buffer_handle = call_buffer_create_from_owned(result.ids, num_tokens)

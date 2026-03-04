@@ -1158,6 +1158,40 @@ pub fn build(b: *std.Build) void {
     }
 
     // ==========================================================================
+    // Tokenizer benchmark harness (core/bench/tokenizer/)
+    // ==========================================================================
+    const bench_tokenizer_path = "core/bench/tokenizer/root.zig";
+    if (std.fs.cwd().access(bench_tokenizer_path, .{})) |_| {
+        const host_target_tok = b.resolveTargetQuery(.{});
+        const bench_tokenizer_mod = b.createModule(.{
+            .root_source_file = b.path(bench_tokenizer_path),
+            .target = host_target_tok,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "main", .module = integration_main_mod },
+            },
+        });
+        const bench_tokenizer_exe = b.addExecutable(.{
+            .name = "bench-tokenizer",
+            .root_module = bench_tokenizer_mod,
+        });
+        linkCDependencies(b, bench_tokenizer_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        b.installArtifact(bench_tokenizer_exe);
+
+        const run_bench_tokenizer = b.addRunArtifact(bench_tokenizer_exe);
+        if (b.args) |args| {
+            for (args) |arg| {
+                run_bench_tokenizer.addArg(arg);
+            }
+        }
+        const bench_tokenizer_step = b.step("bench-tokenizer", "Run tokenizer benchmark harness");
+        bench_tokenizer_step.dependOn(&run_bench_tokenizer.step);
+    } else |_| {
+        // tokenizer benchmark harness not present - skip
+    }
+
+    // ==========================================================================
     // Python Binding Generator (core/tests/helpers/gen_bindings.zig)
     // ==========================================================================
     // Python bindings generator

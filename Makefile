@@ -51,7 +51,7 @@ all: build
 deps:
 	# macOS: requires `brew install cmake` (Xcode Command Line Tools for Metal)
 	@test -d deps/utf8proc || git clone --branch v2.11.2 --depth 1 https://github.com/JuliaStrings/utf8proc.git deps/utf8proc
-	@test -d deps/pcre2 || git clone --branch pcre2-10.47 --depth 1 https://github.com/PCRE2Project/pcre2.git deps/pcre2
+	@test -d deps/pcre2 || git clone --branch pcre2-10.47 --depth 1 --recurse-submodules https://github.com/PCRE2Project/pcre2.git deps/pcre2
 	@test -d deps/curl || git clone --branch curl-8_17_0 --depth 1 https://github.com/curl/curl.git deps/curl
 	@test -d deps/mbedtls || (git clone --branch v3.6.2 --depth 1 --recurse-submodules https://github.com/Mbed-TLS/mbedtls.git deps/mbedtls)
 	@test -d deps/miniz || git clone --branch 3.1.1 --depth 1 https://github.com/richgel999/miniz.git deps/miniz

@@ -38,11 +38,18 @@ pub const Token = struct {
 pub const PretokenizeResult = struct {
     tokens: std.ArrayListUnmanaged(Token),
     ranges: std.ArrayListUnmanaged(Range),
+    arena: std.heap.ArenaAllocator,
+
+    pub fn init() PretokenizeResult {
+        return .{
+            .tokens = .{},
+            .ranges = .{},
+            .arena = std.heap.ArenaAllocator.init(Allocator),
+        };
+    }
 
     pub fn deinit(self: *PretokenizeResult) void {
-        for (self.tokens.items) |token| {
-            Allocator.free(token.ptr[0 .. token.len + 1]); // +1 for null terminator we still add
-        }
+        self.arena.deinit();
         self.tokens.deinit(Allocator);
         self.ranges.deinit(Allocator);
     }
@@ -76,18 +83,16 @@ test "Normalized deinit frees resources" {
 }
 
 test "PretokenizeResult deinit frees token memory" {
-    var result = PretokenizeResult{
-        .tokens = .{},
-        .ranges = .{},
-    };
+    var result = PretokenizeResult.init();
 
-    // Add a token with null terminator
-    const token_data = try Allocator.alloc(u8, 6);
+    // Add a token with null terminator via arena
+    const arena_alloc = result.arena.allocator();
+    const token_data = try arena_alloc.alloc(u8, 6);
     @memcpy(token_data, "hello\x00");
     try result.tokens.append(Allocator, .{ .ptr = token_data.ptr, .len = 5 });
     try result.ranges.append(Allocator, .{ .start = 0, .end = 5 });
 
-    // Deinit should free the token data
+    // Deinit frees the arena (all token data) and containers
     result.deinit();
 }
 

@@ -22,7 +22,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .SUPPORT_PCRE2_16 = false,
             .SUPPORT_PCRE2_32 = false,
             .SUPPORT_UNICODE = true,
-            .SUPPORT_JIT = false,
+            .SUPPORT_JIT = true,
             .PCRE2_EXPORT = null,
             .PCRE2_LINK_SIZE = 2,
             .PCRE2_HEAP_LIMIT = 20000000,
