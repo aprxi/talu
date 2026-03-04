@@ -419,6 +419,32 @@ pub const MetalBackend = struct {
         try ops.reset(state_block);
     }
 
+    fn runtimeHandleLooksValid(handle: ?*anyopaque) bool {
+        if (handle == null) return true;
+        return @intFromPtr(handle.?) >= 4096;
+    }
+
+    fn stateObjectLooksValid(
+        role: StateRuntimeRole,
+        state_block: *const runtime_contract.StateBlockHandle,
+    ) bool {
+        return switch (role) {
+            .none => true,
+            .kv_cache => blk: {
+                const cache = stateObjectPtr(runtime_graph_mod.Cache, state_block) catch break :blk false;
+                break :blk runtimeHandleLooksValid(cache.handle);
+            },
+            .shortconv_cache => blk: {
+                const cache = stateObjectPtr(runtime_graph_mod.ShortConvCache, state_block) catch break :blk false;
+                break :blk runtimeHandleLooksValid(cache.handle);
+            },
+            .mamba_cache => blk: {
+                const cache = stateObjectPtr(runtime_graph_mod.MambaCache, state_block) catch break :blk false;
+                break :blk runtimeHandleLooksValid(cache.handle);
+            },
+        };
+    }
+
     fn deinitStateObjectForDescriptor(
         role: StateRuntimeRole,
         state_block: *const runtime_contract.StateBlockHandle,
@@ -459,7 +485,11 @@ pub const MetalBackend = struct {
         const count = @min(@as(usize, @intCast(binding.count)), descriptors.len);
         for (0..count) |idx| {
             if (!binding.initialized[idx]) continue;
-            try resetStateObjectForDescriptor(self.state_runtime_roles[idx], &binding.handles[idx]);
+            const role = self.state_runtime_roles[idx];
+            if (!stateObjectLooksValid(role, &binding.handles[idx])) {
+                binding.initialized[idx] = try self.initStateObjectForDescriptor(role, &binding.handles[idx]);
+            }
+            try resetStateObjectForDescriptor(role, &binding.handles[idx]);
         }
     }
 
@@ -674,23 +704,19 @@ pub const MetalBackend = struct {
             .current_position = 0,
         };
         errdefer backend.deinit();
-        if (state_descriptor_count > 0) {
-            backend.slot0_bootstrap_bindings = try allocateInitStateBindings(allocator, backend.stateDescriptors());
-            errdefer backend.slot0_bootstrap_bindings.deinit(allocator);
-            try backend.bindSlotStateBlocks(0, backend.slot0_bootstrap_bindings.handles);
-            try backend.primeBoundSlotExecutionGraph(0);
-            try backend.resetSlotState(0);
-        }
-
         return backend;
     }
 
     pub fn deinit(self: *MetalBackend) void {
         if (self.vision_runtime) |*rt| rt.deinit();
-        self.deinitSlotBindingStateObjects(&self.slot0_state_binding);
+        if (self.slot0_state_binding.bound) {
+            self.deinitSlotBindingStateObjects(&self.slot0_state_binding);
+        }
         self.slot0_state_binding.clear();
         for (self.extra_slots) |*slot| {
-            self.deinitSlotBindingStateObjects(&slot.state_binding);
+            if (slot.state_binding.bound) {
+                self.deinitSlotBindingStateObjects(&slot.state_binding);
+            }
             slot.state_binding.clear();
         }
         if (self.slot0_bootstrap_bindings.handles.len > 0) {
@@ -798,14 +824,14 @@ pub const MetalBackend = struct {
     /// Release scheduler slot.
     pub fn freeSlot(self: *MetalBackend, slot_index: usize) void {
         if (slot_index == 0) {
-            self.slot_in_use = false;
             self.unbindSlotStateBlocks(0);
+            self.slot_in_use = false;
             self.resetSlotState(0) catch {};
             return;
         }
         const extra_idx = self.toExtraSlotIndex(slot_index) catch return;
-        self.extra_slots[extra_idx].in_use = false;
         self.unbindSlotStateBlocks(slot_index);
+        self.extra_slots[extra_idx].in_use = false;
         self.resetSlotState(slot_index) catch {};
     }
 
@@ -829,6 +855,12 @@ pub const MetalBackend = struct {
         if (slot_index == 0) return &self.slot0_state_binding;
         const extra_idx = try self.toExtraSlotIndex(slot_index);
         return &self.extra_slots[extra_idx].state_binding;
+    }
+
+    fn slotInUse(self: *const MetalBackend, slot_index: usize) !bool {
+        if (slot_index == 0) return self.slot_in_use;
+        const extra_idx = try self.toExtraSlotIndex(slot_index);
+        return self.extra_slots[extra_idx].in_use;
     }
 
     fn slotStateBlocks(self: *MetalBackend, slot_index: usize) ![]const runtime_contract.StateBlockHandle {
@@ -894,8 +926,15 @@ pub const MetalBackend = struct {
 
     pub fn unbindSlotStateBlocks(self: *MetalBackend, slot_index: usize) void {
         const binding = self.slotStateBinding(slot_index) catch return;
-        self.releaseNonPersistentStateObjects(binding);
-        binding.detach();
+        if (!binding.bound) return;
+        const slot_in_use = self.slotInUse(slot_index) catch false;
+        if (slot_in_use) {
+            self.releaseNonPersistentStateObjects(binding);
+            binding.detach();
+            return;
+        }
+        self.deinitSlotBindingStateObjects(binding);
+        binding.clear();
     }
 
     /// Scheduler prefill entrypoint.

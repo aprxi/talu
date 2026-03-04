@@ -233,6 +233,10 @@ fn layerProgramWeightBindingKeyFor(
             .swiglu_w3
         else if (std.mem.eql(u8, slot_name, "w2"))
             .swiglu_w2
+        else if (std.mem.eql(u8, slot_name, "w1_bias"))
+            .swiglu_w1
+        else if (std.mem.eql(u8, slot_name, "w2_bias"))
+            .swiglu_w2
         else
             error.InvalidWeightBindingName,
         .moe => if (std.mem.eql(u8, slot_name, "router"))
