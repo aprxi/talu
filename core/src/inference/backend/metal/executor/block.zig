@@ -495,16 +495,31 @@ pub const TransformerBlock = struct {
         return param_storage[0..1];
     }
 
-    fn requireStateValue(
+    fn requireInstructionStateValue(
         comptime T: type,
+        state: *LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
         state_blocks: []const runtime_contract.StateBlockHandle,
-        state_id: u8,
     ) !T {
-        const raw = runtime_contract.statePointerForId(state_blocks, state_id) orelse {
+        const state_block = (try runtime_contract.requireInstructionStateBlockForPlan(
+            insn,
+            &state.compiled_plan.plan,
+            state_blocks,
+        )) orelse return error.InvalidStateDescriptorBinding;
+        const direct_ptr: *const T = runtime_contract.stateValueFromBlock(*const T, state_block) orelse {
             return error.InvalidStateDescriptorBinding;
         };
-        const ptr: *const T = @ptrCast(@alignCast(raw));
-        return ptr.*;
+        return direct_ptr.*;
+    }
+
+    fn instructionStateValueOrNull(
+        comptime T: type,
+        state: *LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !?T {
+        if (insn.state_block_id == null) return null;
+        return try requireInstructionStateValue(T, state, insn, state_blocks);
     }
 
     fn buildLayerProgramInstructionHandles(
@@ -1119,10 +1134,11 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
-        const cache = try requireStateValue(
+        const cache = try instructionStateValueOrNull(
             Cache,
+            state,
+            insn,
             state_blocks,
-            @intFromEnum(runtime_contract.StateBlockId.kv_cache),
         );
         try layerProgramAttentionAdapter(
             insn,
@@ -1146,10 +1162,11 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
-        const shortconv_cache = try requireStateValue(
+        const shortconv_cache = try requireInstructionStateValue(
             ShortConvCache,
+            state,
+            insn,
             state_blocks,
-            @intFromEnum(runtime_contract.StateBlockId.shortconv),
         );
         try layerProgramShortConvAdapter(
             insn,
@@ -1185,10 +1202,11 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
-        const mamba_cache = try requireStateValue(
+        const mamba_cache = try requireInstructionStateValue(
             MambaCache,
+            state,
+            insn,
             state_blocks,
-            @intFromEnum(runtime_contract.StateBlockId.mamba),
         );
         try layerProgramMambaAdapter(
             insn,
@@ -1258,15 +1276,23 @@ pub const TransformerBlock = struct {
         );
     }
 
-    fn requireBoundStateValue(
+    fn requireBoundInstructionStateValue(
         comptime T: type,
         ctx: *LayerProgramExecutionContext,
-        state_id: u8,
+        insn: *const runtime_contract.Instruction,
     ) !T {
-        const binding = layerProgramStateBinding(ctx, state_id) orelse return error.InvalidStateDescriptorBinding;
-        const raw = runtime_contract.statePointerFromBlock(&binding.handle) orelse return error.InvalidStateDescriptorBinding;
-        const ptr: *const T = @ptrCast(@alignCast(raw));
-        return ptr.*;
+        var state_blocks = try layerProgramStateBlocksForInstruction(insn, ctx);
+        return requireInstructionStateValue(T, ctx, insn, state_blocks.slice());
+    }
+
+    fn boundInstructionStateValueOrNull(
+        comptime T: type,
+        ctx: *LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
+    ) !?T {
+        if (insn.state_block_id == null) return null;
+        var state_blocks = try layerProgramStateBlocksForInstruction(insn, ctx);
+        return try requireInstructionStateValue(T, ctx, insn, state_blocks.slice());
     }
 
     fn dispatchLayerProgramInstructionFast(
@@ -1312,10 +1338,10 @@ pub const TransformerBlock = struct {
                 const input_slot = try bufferSlotForRegister(insn.inputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
                 const output_slot = try bufferSlotForRegister(insn.outputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
                 const attention_binding = ctx.bindings.attention orelse return error.MissingField;
-                const cache = try requireBoundStateValue(
+                const cache = try boundInstructionStateValueOrNull(
                     Cache,
                     ctx,
-                    @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+                    insn,
                 );
                 output_slot.* = try runAttentionKernel(
                     input_slot.*,
@@ -1338,10 +1364,10 @@ pub const TransformerBlock = struct {
                 const input_slot = try bufferSlotForRegister(insn.inputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
                 const output_slot = try bufferSlotForRegister(insn.outputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
                 const shortconv_binding = ctx.bindings.shortconv orelse return error.MissingField;
-                const shortconv_cache = try requireBoundStateValue(
+                const shortconv_cache = try requireBoundInstructionStateValue(
                     ShortConvCache,
                     ctx,
-                    @intFromEnum(runtime_contract.StateBlockId.shortconv),
+                    insn,
                 );
                 output_slot.* = try runShortConvKernel(
                     input_slot.*,
@@ -1376,10 +1402,10 @@ pub const TransformerBlock = struct {
                 const input_slot = try bufferSlotForRegister(insn.inputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
                 const output_slot = try bufferSlotForRegister(insn.outputs[0], ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
                 const mamba_binding = ctx.bindings.mamba orelse return error.MissingField;
-                const mamba_cache = try requireBoundStateValue(
+                const mamba_cache = try requireBoundInstructionStateValue(
                     MambaCache,
                     ctx,
-                    @intFromEnum(runtime_contract.StateBlockId.mamba),
+                    insn,
                 );
                 output_slot.* = try runMambaKernel(
                     input_slot.*,
