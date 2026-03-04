@@ -48,6 +48,7 @@ extern fn pcre2_match_8(
     mcontext: ?*anyopaque,
 ) callconv(.c) c_int;
 extern fn pcre2_get_ovector_pointer_8(match_data: ?*anyopaque) callconv(.c) [*]c.PCRE2_SIZE;
+extern fn pcre2_jit_compile_8(code: ?*anyopaque, options: u32) callconv(.c) c_int;
 
 fn pcre2_compile(
     pattern: [*c]const u8,
@@ -73,17 +74,26 @@ fn pcre2_match_data_free(match_data: ?*anyopaque) void {
 }
 
 fn pcre2_match(code: ?*anyopaque, subject: [*c]const u8, length: c.PCRE2_SIZE, startoffset: c.PCRE2_SIZE, match_data: ?*anyopaque) c_int {
-    return pcre2_match_8(code, subject, length, startoffset, 0, match_data, null);
+    // PCRE2_NO_UTF_CHECK: skip UTF-8 re-validation of the entire subject on each call.
+    // The input was already validated when first received; re-checking on every match
+    // in the loop is O(n) per call × O(n) calls = O(n²) total.
+    return pcre2_match_8(code, subject, length, startoffset, PCRE2_NO_UTF_CHECK, match_data, null);
 }
 
 fn pcre2_get_ovector_pointer(match_data: ?*anyopaque) [*]c.PCRE2_SIZE {
     return pcre2_get_ovector_pointer_8(match_data);
 }
 
+fn pcre2_jit_compile(code: ?*anyopaque) void {
+    _ = pcre2_jit_compile_8(code, PCRE2_JIT_COMPLETE);
+}
+
 // PCRE2 constants - can't translate macros
 const PCRE2_ZERO_TERMINATED: c.PCRE2_SIZE = @bitCast(@as(isize, -1));
 const PCRE2_UTF: u32 = 0x00080000;
 const PCRE2_UCP: u32 = 0x00020000;
+const PCRE2_NO_UTF_CHECK: u32 = 0x40000000;
+const PCRE2_JIT_COMPLETE: u32 = 0x00000001;
 
 fn isPunctuation(ch: u8) bool {
     return switch (ch) {
@@ -124,6 +134,7 @@ pub fn tokenizer_pretokenizer_set(pretokenizer: *ct.PreTokenizer, pattern_opt: ?
     var error_offset: c.PCRE2_SIZE = 0;
     const regex_code = pcre2_compile(@ptrCast(pattern_ptr), PCRE2_ZERO_TERMINATED, PCRE2_UTF | PCRE2_UCP, &error_code, &error_offset, null);
     if (regex_code == null) return -1;
+    pcre2_jit_compile(regex_code);
     const pattern_copy = strings.tokenizer_strdup(pattern_ptr) orelse {
         pcre2_code_free(regex_code);
         return -1;
@@ -169,7 +180,7 @@ fn pretokenize_single(pretokenizer: ?*const ct.PreTokenizer, input: []const u8, 
 
 /// Internal implementation using error handling for cleaner code
 fn pretokenize_single_impl(pretokenizer: ?*const ct.PreTokenizer, input: []const u8, base_offset: usize) PretokenizeError!PretokenizeResult {
-    var result = PretokenizeResult{ .tokens = .{}, .ranges = .{} };
+    var result = PretokenizeResult.init();
     errdefer result.deinit();
 
     if (pretokenizer) |p| {
@@ -207,6 +218,11 @@ fn pretokenize_single_impl(pretokenizer: ?*const ct.PreTokenizer, input: []const
 fn splitByRegex(result: *PretokenizeResult, input: []const u8, base_offset: usize, regex_code: *anyopaque, split_matches: bool, invert_matches: bool) !void {
     const match_data = pcre2_match_data_create_from_pattern(regex_code) orelse return error.OutOfMemory;
     defer pcre2_match_data_free(match_data);
+
+    // Pre-size token/range arrays to reduce growth reallocations
+    const estimated_tokens = @max(input.len / 5, 16);
+    try result.tokens.ensureTotalCapacity(Allocator, result.tokens.items.len + estimated_tokens);
+    try result.ranges.ensureTotalCapacity(Allocator, result.ranges.items.len + estimated_tokens);
 
     // Determine what to emit:
     // - split=true,  invert=false: emit gaps only (MergedWith*, Removed)
@@ -339,9 +355,8 @@ fn splitMetaspace(result: *PretokenizeResult, input: []const u8, base_offset: us
 
 /// Append a token string to result
 fn appendToken(result: *PretokenizeResult, token_bytes: []const u8, range_start: usize) !void {
-    // Allocate with +1 for null terminator (C API convention)
-    const token_buf = Allocator.alloc(u8, token_bytes.len + 1) catch return error.OutOfMemory;
-    errdefer Allocator.free(token_buf);
+    const arena_alloc = result.arena.allocator();
+    const token_buf = arena_alloc.alloc(u8, token_bytes.len + 1) catch return error.OutOfMemory;
     @memcpy(token_buf[0..token_bytes.len], token_bytes);
     token_buf[token_bytes.len] = 0; // null terminator for C API
     try result.tokens.append(Allocator, .{ .ptr = token_buf.ptr, .len = token_bytes.len });
@@ -350,16 +365,17 @@ fn appendToken(result: *PretokenizeResult, token_bytes: []const u8, range_start:
 
 /// Append a single character token
 fn appendTokenChar(result: *PretokenizeResult, byte_value: u8, position: usize) !void {
-    const char_buf = try Allocator.alloc(u8, 2);
+    const arena_alloc = result.arena.allocator();
+    const char_buf = arena_alloc.alloc(u8, 2) catch return error.OutOfMemory;
     char_buf[0] = byte_value;
     char_buf[1] = 0;
-    errdefer Allocator.free(char_buf);
     try result.tokens.append(Allocator, .{ .ptr = char_buf.ptr, .len = 1 });
     try result.ranges.append(Allocator, .{ .start = position, .end = position + 1 });
 }
 
 /// Apply GPT-2 byte-level encoding to all tokens
 fn applyByteLevel(result: *PretokenizeResult) !void {
+    const arena_alloc = result.arena.allocator();
     for (result.tokens.items) |*token_ptr| {
         const token_bytes = token_ptr.sliceConst();
         log.trace("tokenizer", "Byte-level encode", .{ .input_len = token_bytes.len }, @src());
@@ -376,12 +392,10 @@ fn applyByteLevel(result: *PretokenizeResult) !void {
 
         log.trace("tokenizer", "Byte-level result", .{ .output_len = encoded_bytes.items.len }, @src());
 
-        const new_token = try Allocator.alloc(u8, encoded_bytes.items.len + 1);
+        const new_token = try arena_alloc.alloc(u8, encoded_bytes.items.len + 1);
         @memcpy(new_token[0..encoded_bytes.items.len], encoded_bytes.items);
         new_token[encoded_bytes.items.len] = 0;
-        // Free old token data
-        Allocator.free(token_ptr.ptr[0 .. token_ptr.len + 1]);
-        // Update token
+        // Old token data stays in arena; freed when arena is deinited
         token_ptr.ptr = new_token.ptr;
         token_ptr.len = encoded_bytes.items.len;
     }
@@ -396,7 +410,7 @@ pub fn pretokenize(pretokenizer: ?*const ct.PreTokenizer, input: []const u8, inp
 
 /// Handle sequence pretokenizers
 fn pretokenize_sequence(pretokenizer: *const ct.PreTokenizer, input: []const u8, input_range: Range) PretokenizeError!PretokenizeResult {
-    var current = PretokenizeResult{ .tokens = .{}, .ranges = .{} };
+    var current = PretokenizeResult.init();
     errdefer current.deinit();
 
     // Start with input as single token
@@ -404,26 +418,21 @@ fn pretokenize_sequence(pretokenizer: *const ct.PreTokenizer, input: []const u8,
 
     const seq_slice: [*]ct.PreTokenizer = @ptrCast(pretokenizer.seq.?);
     for (0..pretokenizer.seq_count) |sequence_index| {
-        var next_result = PretokenizeResult{ .tokens = .{}, .ranges = .{} };
+        var next_result = PretokenizeResult.init();
         errdefer next_result.deinit();
 
         for (current.tokens.items, current.ranges.items) |token_item, token_range| {
-            const token_bytes = token_item.sliceConst();
-            var segment_result = try pretokenize_single(&seq_slice[sequence_index], token_bytes, token_range.start);
+            var segment_result = try pretokenize_single(&seq_slice[sequence_index], token_item.sliceConst(), token_range.start);
+            defer segment_result.deinit();
 
-            // Transfer tokens (don't free them, just move to next)
+            // Copy tokens to next_result's arena
             for (segment_result.tokens.items, segment_result.ranges.items) |segment_token, segment_range| {
-                try next_result.tokens.append(Allocator, segment_token);
-                try next_result.ranges.append(Allocator, segment_range);
+                try appendToken(&next_result, segment_token.sliceConst(), segment_range.start);
             }
-            // Just deinit containers, not the tokens themselves
-            segment_result.tokens.deinit(Allocator);
-            segment_result.ranges.deinit(Allocator);
         }
 
         current.deinit();
         current = next_result;
-        next_result = .{ .tokens = .{}, .ranges = .{} }; // prevent errdefer from double-freeing
     }
 
     return current;
@@ -450,7 +459,7 @@ test "isPunctuation recognizes punctuation chars" {
 }
 
 test "pretokenize splitByWhitespace spaces" {
-    var result = PretokenizeResult{ .tokens = .{}, .ranges = .{} };
+    var result = PretokenizeResult.init();
     defer result.deinit();
 
     try splitByWhitespace(&result, "hello world", 0, true, false);
@@ -461,7 +470,7 @@ test "pretokenize splitByWhitespace spaces" {
 }
 
 test "pretokenize splitByWhitespace punctuation" {
-    var result = PretokenizeResult{ .tokens = .{}, .ranges = .{} };
+    var result = PretokenizeResult.init();
     defer result.deinit();
 
     try splitByWhitespace(&result, "hello,world", 0, false, true);
@@ -509,7 +518,7 @@ test "tokenizer_apply_pretokenizer_spec sets options" {
 }
 
 test "pretokenize appendToken allocates" {
-    var result = PretokenizeResult{ .tokens = .{}, .ranges = .{} };
+    var result = PretokenizeResult.init();
     defer result.deinit();
 
     try appendToken(&result, "hello", 0);
@@ -523,7 +532,7 @@ test "pretokenize appendToken allocates" {
 }
 
 test "pretokenize appendTokenChar single-char" {
-    var result = PretokenizeResult{ .tokens = .{}, .ranges = .{} };
+    var result = PretokenizeResult.init();
     defer result.deinit();
 
     try appendTokenChar(&result, ',', 5);

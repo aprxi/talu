@@ -16,6 +16,7 @@ Slicing:
 - `__dlpack__` is zero-copy for a TokenArray instance
 """
 
+import ctypes
 from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any, overload
 
@@ -156,6 +157,72 @@ class TokenOffset:
         yield self.end
 
 
+class _LazyOffsets(Sequence[TokenOffset]):
+    """Lazy offset sequence backed by raw uint32 pairs.
+
+    Creates TokenOffset objects on demand instead of eagerly allocating
+    one Python object per token. For large token counts (100K+), this
+    avoids millions of Python object allocations.
+    """
+
+    __slots__ = ("_data", "_len")
+
+    def __init__(self, raw_data: Any, length: int) -> None:
+        self._data = raw_data  # ctypes array of uint32 pairs, or None
+        self._len = length
+
+    def __len__(self) -> int:
+        return self._len
+
+    @overload
+    def __getitem__(self, index: int) -> TokenOffset: ...
+    @overload
+    def __getitem__(self, index: slice) -> list[TokenOffset]: ...
+
+    def __getitem__(self, index: int | slice) -> TokenOffset | list[TokenOffset]:
+        if isinstance(index, int):
+            if index < 0:
+                index += self._len
+            if index < 0 or index >= self._len:
+                raise IndexError("offset index out of range")
+            i = index * 2
+            return TokenOffset(self._data[i], self._data[i + 1])
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(self._len))]
+        raise TypeError(
+            f"indices must be integers or slices, not {type(index).__name__}"
+        )
+
+    def __iter__(self) -> Iterator[TokenOffset]:
+        data = self._data
+        for i in range(self._len):
+            j = i * 2
+            yield TokenOffset(data[j], data[j + 1])
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _LazyOffsets):
+            if self._len != other._len:
+                return False
+            for i in range(self._len * 2):
+                if self._data[i] != other._data[i]:
+                    return False
+            return True
+        if isinstance(other, list):
+            if self._len != len(other):
+                return False
+            for i, item in enumerate(other):
+                if self[i] != item:
+                    return False
+            return True
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        items = [repr(self[i]) for i in range(min(self._len, 10))]
+        if self._len > 10:
+            items.append(f"... ({self._len} total)")
+        return f"[{', '.join(items)}]"
+
+
 class TokenArray(Sequence[int]):
     """
     Sequence of token IDs with zero-copy NumPy and DLPack support.
@@ -236,7 +303,7 @@ class TokenArray(Sequence[int]):
         tokens_ptr: Any,
         num_tokens: int,
         *,
-        _offsets: list[TokenOffset] | None = None,
+        _offsets: "list[TokenOffset] | _LazyOffsets | None" = None,
         _buffer_handle: Any = None,
     ) -> None:
         """
@@ -509,7 +576,7 @@ class TokenArray(Sequence[int]):
         return self.__mul__(n)
 
     @property
-    def offsets(self) -> list[TokenOffset]:
+    def offsets(self) -> "Sequence[TokenOffset]":
         """
         Byte offsets mapping tokens back to source text.
 

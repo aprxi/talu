@@ -13,6 +13,7 @@ const strings = @import("strings.zig");
 const errors = @import("errors.zig");
 const types = @import("types.zig");
 const log = @import("../log.zig");
+const parallel = @import("../system/parallel.zig");
 
 const Allocator = types.Allocator;
 const Token = types.Token;
@@ -310,7 +311,20 @@ fn freeNullTerminatedTokenList(token_list: *std.ArrayListUnmanaged([*:0]u8)) voi
     token_list.deinit(Allocator);
 }
 
-/// Accumulator for building token encoding results
+/// Look up an added token's content string by ID (for buildOutput fallback).
+fn findAddedTokenContentById(tokenizer: *ct.Tokenizer, id: i32) ?[]const u8 {
+    var added_iter = tokenizer.added;
+    while (added_iter) |at| : (added_iter = at.next) {
+        if (at.id == id) {
+            if (at.content) |content_ptr| {
+                return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(content_ptr)), 0);
+            }
+        }
+    }
+    return null;
+}
+
+/// Accumulator for building token encoding results.
 const EncodeAccum = struct {
     ids: std.ArrayListUnmanaged(i32) = .{},
     tokens: std.ArrayListUnmanaged([*:0]u8) = .{},
@@ -318,8 +332,8 @@ const EncodeAccum = struct {
 
     fn deinit(self: *EncodeAccum) void {
         freeNullTerminatedTokenList(&self.tokens);
-        self.ids.deinit(Allocator);
         self.special.deinit(Allocator);
+        self.ids.deinit(Allocator);
     }
 
     fn appendAdded(self: *EncodeAccum, added_token: *const ct.AddedToken) !void {
@@ -328,6 +342,20 @@ const EncodeAccum = struct {
         errdefer Allocator.free(std.mem.span(token_copy));
         try self.tokens.append(Allocator, token_copy);
         try self.special.append(Allocator, added_token.special);
+    }
+
+    /// Append tokens from cached IDs (word cache hit path).
+    /// Resolves token strings from the model vocabulary, avoiding BPE recomputation.
+    fn appendCachedIds(self: *EncodeAccum, cached_ids: []const i32, tokenizer: *ct.Tokenizer) !void {
+        for (cached_ids) |id| {
+            try self.ids.append(Allocator, id);
+            const tok_str = tokenizer.idToToken(id) orelse
+                findAddedTokenContentById(tokenizer, id) orelse "";
+            const token_copy = strings.dupTokenString(tok_str) orelse return error.OutOfMemory;
+            errdefer Allocator.free(std.mem.span(token_copy));
+            try self.tokens.append(Allocator, token_copy);
+            try self.special.append(Allocator, checkSpecial(tokenizer.added, id));
+        }
     }
 
     fn appendEncoding(self: *EncodeAccum, encoding: *const ct.TokenizerEncoding, added_head: ?*ct.AddedToken) !void {
@@ -344,7 +372,6 @@ const EncodeAccum = struct {
                     errdefer Allocator.free(std.mem.span(token_copy));
                     try self.tokens.append(Allocator, token_copy);
                 } else {
-                    // Allocate sentinel-terminated empty string so free() accounts for the sentinel byte.
                     const empty_token = Allocator.allocSentinel(u8, 0, 0) catch return error.OutOfMemory;
                     try self.tokens.append(Allocator, @ptrCast(empty_token.ptr));
                 }
@@ -548,65 +575,391 @@ fn encodeSegmentMaybePrepended(
 }
 
 fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usize, accumulator: *EncodeAccum) !void {
-    var pretokenized = try pretokenize.pretokenize(&tokenizer.pretokenizer, segment, .{ .start = base_offset, .end = base_offset + segment.len });
-    defer pretokenized.deinit();
-
     const is_sentencepiece_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.regex_split != 0 and tokenizer.pretokenizer.byte_level == 0;
     const is_byte_level_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.byte_level != 0;
     const is_metaspace = tokenizer.pretokenizer.metaspace != 0;
+    const per_word_encode = is_sentencepiece_bpe or is_byte_level_bpe or is_metaspace;
 
-    if (is_sentencepiece_bpe or is_byte_level_bpe or is_metaspace) {
-        // Encode words separately — Metaspace tokens already contain ▁ from
-        // splitMetaspace; SentencePiece/byte-level BPE words need per-word encoding.
+    // Overlapping-chunk parallelism: split text, parallelize both regex + BPE,
+    // deduplicate at merge using word offsets vs midpoints.
+    if (per_word_encode and segment.len >= chunk_parallel_threshold) {
+        const pool = parallel.global();
+        if (pool.n_threads > 1) {
+            return encodeSegmentOverlapped(tokenizer, segment, base_offset, accumulator, pool, is_sentencepiece_bpe, is_metaspace);
+        }
+    }
+
+    // Sequential path
+    var pretokenized = try pretokenize.pretokenize(&tokenizer.pretokenizer, segment, .{ .start = base_offset, .end = base_offset + segment.len });
+    defer pretokenized.deinit();
+
+    if (per_word_encode) {
+        // Per-segment word cache (avoids redundant BPE/model merges for repeated words)
+        var word_cache = WordCache.init();
+        defer word_cache.deinit();
+
         for (pretokenized.tokens.items, 0..) |token_item, token_index| {
-            // SentencePiece BPE: ▁ prefix on non-first words (first gets it from normalizer prepend).
-            // Metaspace (any model): tokens from splitMetaspace already have ▁
-            // embedded. No additional ▁ prefix needed.
             const add_sp_prefix = if (is_metaspace)
                 false
             else
                 (is_sentencepiece_bpe and token_index > 0);
-            try encodeWord(tokenizer, token_item.sliceConst(), add_sp_prefix, accumulator);
+            try encodeWord(tokenizer, token_item.sliceConst(), add_sp_prefix, accumulator, &word_cache);
         }
     } else {
-        // Combine and encode together
         try encodeCombined(tokenizer, pretokenized.tokens.items, accumulator);
     }
 }
 
-fn encodeWord(tokenizer: *ct.Tokenizer, word_bytes: []const u8, add_sentencepiece_prefix: bool, accumulator: *EncodeAccum) !void {
-    var token_bytes = std.ArrayListUnmanaged(u8){};
-    defer token_bytes.deinit(Allocator);
+// ============================================================================
+// WORD BPE CACHE
+// ============================================================================
 
-    if (add_sentencepiece_prefix) try token_bytes.appendSlice(Allocator, "\xE2\x96\x81"); // ▁
-    try token_bytes.appendSlice(Allocator, word_bytes);
-    // Don't add null terminator - use slice-based encoding to support embedded nulls
+/// Per-chunk word BPE cache. Maps pretokenized word bytes to their BPE token IDs.
+/// Thread-safe by construction: each chunk/segment has its own cache instance.
+const WordCache = struct {
+    map: std.StringHashMapUnmanaged([]const i32) = .{},
+    arena: std.heap.ArenaAllocator,
+
+    fn init() WordCache {
+        return .{
+            .map = .{},
+            .arena = std.heap.ArenaAllocator.init(Allocator),
+        };
+    }
+
+    fn deinit(self: *WordCache) void {
+        self.map.deinit(Allocator);
+        self.arena.deinit();
+    }
+
+    fn get(self: *const WordCache, word: []const u8) ?[]const i32 {
+        return self.map.get(word);
+    }
+
+    fn put(self: *WordCache, word: []const u8, ids: []const i32) void {
+        if (self.map.contains(word)) return;
+        const arena_alloc = self.arena.allocator();
+        const key_copy = arena_alloc.dupe(u8, word) catch return;
+        const ids_copy = arena_alloc.dupe(i32, ids) catch return;
+        self.map.put(Allocator, key_copy, ids_copy) catch return;
+    }
+};
+
+// ============================================================================
+// OVERLAPPING-CHUNK PARALLEL ENCODING
+// ============================================================================
+
+// Minimum segment size (bytes) to justify parallel dispatch.
+const chunk_parallel_threshold: usize = 4096;
+// Overlap per side between adjacent chunks. Must exceed the longest possible
+// regex match so that words spanning a split point are fully captured by at
+// least one chunk. 256 bytes is generous for all common tokenizer patterns.
+const overlap_bytes: usize = 256;
+// Minimum useful chunk size (excluding overlap).
+const min_chunk_bytes: usize = 512;
+// Must match parallel.zig FLOATS_PER_CACHE_LINE.
+const CACHE_LINE_ITEMS: usize = 16;
+// Stack limit for chunk metadata arrays (supports up to 64 threads).
+const MAX_CHUNKS: usize = 64;
+
+/// Per-chunk encoding result with word boundary tracking for selective merge.
+const ChunkResult = struct {
+    accum: EncodeAccum = .{},
+    /// Number of tokens produced by each word (parallel to word_offsets).
+    word_token_counts: std.ArrayListUnmanaged(u32) = .{},
+    /// Start offset of each word in segment-relative coordinates.
+    word_offsets: std.ArrayListUnmanaged(usize) = .{},
+
+    fn deinit(self: *ChunkResult) void {
+        self.accum.deinit();
+        self.word_token_counts.deinit(Allocator);
+        self.word_offsets.deinit(Allocator);
+    }
+};
+
+const ChunkContext = struct {
+    tokenizer: *ct.Tokenizer,
+    segment: []const u8,
+    base_offset: usize,
+    // Per-chunk byte ranges (segment-relative). Length = n_chunks.
+    chunk_starts: []const usize,
+    chunk_ends: []const usize,
+    // Per-chunk owned ranges for midpoint deduplication. Length = n_chunks.
+    own_starts: []const usize,
+    own_ends: []const usize,
+    results: []ChunkResult,
+    n_chunks: usize,
+    is_sentencepiece_bpe: bool,
+    is_metaspace: bool,
+    had_error: std.atomic.Value(bool),
+};
+
+fn chunkWorker(start: usize, end: usize, ctx: *ChunkContext) void {
+    // Map virtual items to chunk indices (CACHE_LINE_ITEMS virtual items per chunk)
+    const first_chunk = start / CACHE_LINE_ITEMS;
+    const last_chunk = @min((end + CACHE_LINE_ITEMS - 1) / CACHE_LINE_ITEMS, ctx.n_chunks);
+
+    for (first_chunk..last_chunk) |chunk_idx| {
+        if (ctx.had_error.load(.monotonic)) return;
+        processChunk(ctx, chunk_idx);
+    }
+}
+
+fn processChunk(ctx: *ChunkContext, chunk_idx: usize) void {
+    const chunk_start = ctx.chunk_starts[chunk_idx];
+    const chunk_end = ctx.chunk_ends[chunk_idx];
+    const chunk = ctx.segment[chunk_start..chunk_end];
+    if (chunk.len == 0) return;
+
+    const chunk_base = ctx.base_offset + chunk_start;
+    var pretokenized = pretokenize.pretokenize(
+        &ctx.tokenizer.pretokenizer,
+        chunk,
+        .{ .start = chunk_base, .end = chunk_base + chunk.len },
+    ) catch {
+        ctx.had_error.store(true, .release);
+        return;
+    };
+    defer pretokenized.deinit();
+
+    const result = &ctx.results[chunk_idx];
+    const words = pretokenized.tokens.items;
+    const ranges = pretokenized.ranges.items;
+
+    for (words, ranges, 0..) |token_item, range, token_index| {
+        const tokens_before: u32 = @intCast(result.accum.ids.items.len);
+
+        const add_sp_prefix = if (ctx.is_metaspace)
+            false
+        else
+            (ctx.is_sentencepiece_bpe and token_index > 0);
+
+        encodeWord(ctx.tokenizer, token_item.sliceConst(), add_sp_prefix, &result.accum, null) catch {
+            ctx.had_error.store(true, .release);
+            return;
+        };
+
+        const tokens_after: u32 = @intCast(result.accum.ids.items.len);
+        // Segment-relative word offset
+        const word_offset = range.start - ctx.base_offset;
+
+        result.word_token_counts.append(Allocator, tokens_after - tokens_before) catch {
+            ctx.had_error.store(true, .release);
+            return;
+        };
+        result.word_offsets.append(Allocator, word_offset) catch {
+            ctx.had_error.store(true, .release);
+            return;
+        };
+    }
+}
+
+fn encodeSegmentOverlapped(
+    tokenizer: *ct.Tokenizer,
+    segment: []const u8,
+    base_offset: usize,
+    accumulator: *EncodeAccum,
+    pool: *parallel.ThreadPool,
+    is_sentencepiece_bpe: bool,
+    is_metaspace: bool,
+) !void {
+    const n_threads = pool.n_threads;
+    const n_chunks = @min(n_threads, @max(1, segment.len / min_chunk_bytes));
+
+    if (n_chunks <= 1) {
+        // Fall back to sequential
+        var pretokenized = try pretokenize.pretokenize(&tokenizer.pretokenizer, segment, .{ .start = base_offset, .end = base_offset + segment.len });
+        defer pretokenized.deinit();
+        var word_cache = WordCache.init();
+        defer word_cache.deinit();
+        for (pretokenized.tokens.items, 0..) |token_item, token_index| {
+            const add_sp_prefix = if (is_metaspace) false else (is_sentencepiece_bpe and token_index > 0);
+            try encodeWord(tokenizer, token_item.sliceConst(), add_sp_prefix, accumulator, &word_cache);
+        }
+        return;
+    }
+
+    // Compute split points, chunk byte ranges (with overlap), and owned ranges
+    var chunk_starts_buf: [MAX_CHUNKS]usize = undefined;
+    var chunk_ends_buf: [MAX_CHUNKS]usize = undefined;
+    var own_starts_buf: [MAX_CHUNKS]usize = undefined;
+    var own_ends_buf: [MAX_CHUNKS]usize = undefined;
+
+    for (0..n_chunks) |i| {
+        // Owned range: [split[i], split[i+1])
+        const own_start = segment.len * i / n_chunks;
+        const own_end = segment.len * (i + 1) / n_chunks;
+        own_starts_buf[i] = own_start;
+        own_ends_buf[i] = own_end;
+        // Byte range with overlap on both sides
+        chunk_starts_buf[i] = if (own_start > overlap_bytes) own_start - overlap_bytes else 0;
+        chunk_ends_buf[i] = @min(own_end + overlap_bytes, segment.len);
+    }
+
+    const results = try Allocator.alloc(ChunkResult, n_chunks);
+    defer Allocator.free(results);
+    for (results) |*r| r.* = .{};
+    errdefer for (results) |*r| r.deinit();
+
+    var ctx = ChunkContext{
+        .tokenizer = tokenizer,
+        .segment = segment,
+        .base_offset = base_offset,
+        .chunk_starts = chunk_starts_buf[0..n_chunks],
+        .chunk_ends = chunk_ends_buf[0..n_chunks],
+        .own_starts = own_starts_buf[0..n_chunks],
+        .own_ends = own_ends_buf[0..n_chunks],
+        .results = results,
+        .n_chunks = n_chunks,
+        .is_sentencepiece_bpe = is_sentencepiece_bpe,
+        .is_metaspace = is_metaspace,
+        .had_error = std.atomic.Value(bool).init(false),
+    };
+
+    pool.parallelFor(n_chunks * CACHE_LINE_ITEMS, chunkWorker, &ctx);
+
+    if (ctx.had_error.load(.acquire)) return error.OutOfMemory;
+
+    // Selective merge: only include tokens from words owned by each chunk
+    try mergeChunkResults(results, own_starts_buf[0..n_chunks], own_ends_buf[0..n_chunks], accumulator);
+}
+
+fn mergeChunkResults(
+    results: []ChunkResult,
+    own_starts: []const usize,
+    own_ends: []const usize,
+    accumulator: *EncodeAccum,
+) !void {
+    // Count total owned tokens across all chunks
+    var total_owned: usize = 0;
+    for (results, own_starts, own_ends) |*r, own_start, own_end| {
+        var token_pos: usize = 0;
+        for (r.word_offsets.items, r.word_token_counts.items) |offset, count| {
+            if (offset >= own_start and offset < own_end) {
+                total_owned += count;
+            }
+            token_pos += count;
+        }
+    }
+
+    try accumulator.ids.ensureTotalCapacity(Allocator, accumulator.ids.items.len + total_owned);
+    try accumulator.tokens.ensureTotalCapacity(Allocator, accumulator.tokens.items.len + total_owned);
+    try accumulator.special.ensureTotalCapacity(Allocator, accumulator.special.items.len + total_owned);
+
+    // Merge owned tokens, free disowned token strings
+    for (results, own_starts, own_ends) |*r, own_start, own_end| {
+        var token_pos: usize = 0;
+        for (r.word_offsets.items, r.word_token_counts.items) |offset, count| {
+            if (offset >= own_start and offset < own_end) {
+                // Owned — transfer tokens to accumulator
+                const start_idx = token_pos;
+                const end_idx = token_pos + count;
+                accumulator.ids.appendSliceAssumeCapacity(r.accum.ids.items[start_idx..end_idx]);
+                accumulator.tokens.appendSliceAssumeCapacity(r.accum.tokens.items[start_idx..end_idx]);
+                accumulator.special.appendSliceAssumeCapacity(r.accum.special.items[start_idx..end_idx]);
+            } else {
+                // Disowned — free token strings
+                const start_idx = token_pos;
+                const end_idx = token_pos + count;
+                for (r.accum.tokens.items[start_idx..end_idx]) |token_ptr| {
+                    Allocator.free(std.mem.span(token_ptr));
+                }
+            }
+            token_pos += count;
+        }
+        // Free containers
+        r.accum.ids.deinit(Allocator);
+        r.accum.tokens.deinit(Allocator);
+        r.accum.special.deinit(Allocator);
+        r.accum = .{};
+        r.word_token_counts.deinit(Allocator);
+        r.word_offsets.deinit(Allocator);
+        r.* = .{};
+    }
+}
+
+fn encodeWord(tokenizer: *ct.Tokenizer, word_bytes: []const u8, add_sentencepiece_prefix: bool, accumulator: *EncodeAccum, cache: ?*WordCache) !void {
+    // Stack buffer for word bytes (avoids heap allocation for typical words)
+    var stack_buf: [1024]u8 = undefined;
+    var heap_buf: ?[]u8 = null;
+    defer if (heap_buf) |hb| Allocator.free(hb);
+
+    const prefix_len: usize = if (add_sentencepiece_prefix) 3 else 0; // ▁ = 3 bytes
+    const total_len = prefix_len + word_bytes.len;
+    const buf = if (total_len <= stack_buf.len)
+        stack_buf[0..total_len]
+    else blk: {
+        heap_buf = Allocator.alloc(u8, total_len) catch return error.OutOfMemory;
+        break :blk heap_buf.?;
+    };
+
+    if (add_sentencepiece_prefix) @memcpy(buf[0..3], "\xE2\x96\x81");
+    @memcpy(buf[prefix_len..], word_bytes);
+
+    const word = buf[0..total_len];
+
+    // Word cache lookup: skip BPE on repeated words
+    if (cache) |wc| {
+        if (wc.get(word)) |cached_ids| {
+            try accumulator.appendCachedIds(cached_ids, tokenizer);
+            return;
+        }
+    }
 
     var encoding = std.mem.zeroes(ct.TokenizerEncoding);
     defer tokenizer_encoding_free_struct(&encoding);
 
-    const rc = tokenizer.encodeSlice(token_bytes.items, &encoding);
+    const rc = tokenizer.encodeSlice(word, &encoding);
     if (rc != 0) return error.OutOfMemory;
 
     try accumulator.appendEncoding(&encoding, tokenizer.added);
+
+    // Cache miss: store IDs for future hits
+    if (cache) |wc| {
+        if (encoding.ids) |ids_ptr| {
+            const ids_slice: [*]const i32 = @ptrCast(ids_ptr);
+            wc.put(word, ids_slice[0..encoding.ids_len]);
+        }
+    }
 }
 
 fn encodeCombined(tokenizer: *ct.Tokenizer, token_items: []Token, accumulator: *EncodeAccum) !void {
     if (token_items.len == 0) return;
 
-    var token_bytes = std.ArrayListUnmanaged(u8){};
-    defer token_bytes.deinit(Allocator);
-
+    // Compute total size needed
+    var total_len: usize = 0;
     for (token_items, 0..) |token_item, token_index| {
-        if (tokenizer.type != ct.ModelType.bpe and token_index > 0) try token_bytes.append(Allocator, ' ');
-        try token_bytes.appendSlice(Allocator, token_item.sliceConst());
+        if (tokenizer.type != ct.ModelType.bpe and token_index > 0) total_len += 1; // space
+        total_len += token_item.len;
     }
-    // Don't add null terminator - use slice-based encoding to support embedded nulls
+
+    // Stack buffer with heap fallback
+    var stack_buf: [4096]u8 = undefined;
+    var heap_buf: ?[]u8 = null;
+    defer if (heap_buf) |hb| Allocator.free(hb);
+
+    const buf = if (total_len <= stack_buf.len)
+        stack_buf[0..total_len]
+    else blk: {
+        heap_buf = Allocator.alloc(u8, total_len) catch return error.OutOfMemory;
+        break :blk heap_buf.?;
+    };
+
+    var pos: usize = 0;
+    for (token_items, 0..) |token_item, token_index| {
+        if (tokenizer.type != ct.ModelType.bpe and token_index > 0) {
+            buf[pos] = ' ';
+            pos += 1;
+        }
+        const slice = token_item.sliceConst();
+        @memcpy(buf[pos..][0..slice.len], slice);
+        pos += slice.len;
+    }
 
     var encoding = std.mem.zeroes(ct.TokenizerEncoding);
     defer tokenizer_encoding_free_struct(&encoding);
 
-    const rc = tokenizer.encodeSlice(token_bytes.items, &encoding);
+    const rc = tokenizer.encodeSlice(buf[0..pos], &encoding);
     if (rc != 0) return error.OutOfMemory;
 
     try accumulator.appendEncoding(&encoding, tokenizer.added);

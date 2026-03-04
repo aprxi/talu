@@ -150,32 +150,13 @@ pub const Tokenizer = struct {
 
     /// Encode text to token IDs. Accepts sentinel-terminated slice to avoid allocation.
     pub fn encodeZ(self: *Tokenizer, text: [:0]const u8) ![]u32 {
-        var needed_count: usize = 0;
-        if (pipeline_impl.tokenizer_encode_ids(self.tokenizer_handle, text.ptr, null, &needed_count) != 0) {
-            return TokenizerError.EncodeFailed;
-        }
-
-        // Empty input returns empty output (0 tokens is valid)
-        if (needed_count == 0) {
-            return &[_]u32{};
-        }
-
-        var output_ids = try self.allocator.alloc(u32, @intCast(needed_count));
-        var output_len = needed_count;
-        if (pipeline_impl.tokenizer_encode_ids(self.tokenizer_handle, text.ptr, @ptrCast(output_ids.ptr), &output_len) != 0) {
-            self.allocator.free(output_ids);
-            return TokenizerError.EncodeFailed;
-        }
-        if (output_len != needed_count) output_ids = output_ids[0..@intCast(output_len)];
-        return output_ids;
+        return self.encodeSliceWithOptions(text, .{});
     }
 
     /// Encode text to token IDs (allocates to add null terminator).
     /// Note: This version doesn't support null bytes in text. Use encodeSlice for that.
     pub fn encode(self: *Tokenizer, text: []const u8) ![]u32 {
-        const text_z = try self.allocator.dupeZ(u8, text);
-        defer self.allocator.free(text_z);
-        return self.encodeZ(text_z);
+        return self.encodeSliceWithOptions(text, .{});
     }
 
     /// Encode options for the Tokenizer API.
@@ -192,37 +173,33 @@ pub const Tokenizer = struct {
 
     /// Encode text to token IDs with options (thread-safe).
     pub fn encodeSliceWithOptions(self: *Tokenizer, text: []const u8, options: EncodeOptions) ![]u32 {
-        var needed_count: usize = 0;
-        // First call to get the count
-        if (pipeline_impl.tokenizer_encode_ids_slice_with_options(
+        const encode_mod = pipeline_impl.encode;
+        const enc_options = encode_mod.EncodeOptions{ .add_special_tokens = options.add_special_tokens };
+
+        // Single encode pass: encode once, extract IDs, free encoding.
+        var encoding = std.mem.zeroes(ct.TokenizerEncoding);
+        if (encode_mod.tokenizer_encode_struct_with_options(
             self.tokenizer_handle,
             text,
-            null,
-            &needed_count,
-            options.add_special_tokens,
+            &encoding,
+            enc_options,
         ) != 0) {
             return TokenizerError.EncodeFailed;
         }
+        defer encode_mod.tokenizer_encoding_free_struct(&encoding);
 
-        // Empty input returns empty output (0 tokens is valid)
-        if (needed_count == 0) {
+        if (encoding.ids_len == 0) return &[_]u32{};
+
+        var output_ids = try self.allocator.alloc(u32, encoding.ids_len);
+        if (encoding.ids) |ids_ptr| {
+            const src: [*]const i32 = @ptrCast(ids_ptr);
+            for (0..encoding.ids_len) |i| {
+                output_ids[i] = @intCast(src[i]);
+            }
+        } else {
+            self.allocator.free(output_ids);
             return &[_]u32{};
         }
-
-        var output_ids = try self.allocator.alloc(u32, @intCast(needed_count));
-        var output_len = needed_count;
-        // Second call to fill the buffer
-        if (pipeline_impl.tokenizer_encode_ids_slice_with_options(
-            self.tokenizer_handle,
-            text,
-            @ptrCast(output_ids.ptr),
-            &output_len,
-            options.add_special_tokens,
-        ) != 0) {
-            self.allocator.free(output_ids);
-            return TokenizerError.EncodeFailed;
-        }
-        if (output_len != needed_count) output_ids = output_ids[0..@intCast(output_len)];
         return output_ids;
     }
 
