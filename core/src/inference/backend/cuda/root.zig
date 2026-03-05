@@ -1,7 +1,7 @@
 //! CUDA backend module root.
 //!
 //! This module exports the backend contract surface and CUDA-specific
-//! orchestration modules. Contract-compatibility aliases remain explicit here
+//! orchestration modules. Contract aliasing remains explicit here
 //! so `contract.zig` layout checks stay deterministic.
 
 const engine_mod = @import("engine.zig");

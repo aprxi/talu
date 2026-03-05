@@ -184,6 +184,9 @@ const ShortConvRuntimeMetadata = struct {
     matmul_out_proj: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).matmul_out_proj),
     matmul_in_proj_name: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).matmul_in_proj_name),
     matmul_out_proj_name: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).matmul_out_proj_name),
+    // Flattened runtime handle for pre-transposed conv weights (time-major).
+    // When present, adapter slot 1 resolves to this tensor and keeps SIMD path hot.
+    conv_weight_time_major: ?Tensor = null,
     layer_idx: u16,
 };
 
@@ -330,8 +333,6 @@ pub const Block = struct {
 
     /// Hidden size (d_model)
     hidden_size: usize,
-    /// Per-instruction resolved weight pointer for opcodes with single-weight arity.
-    instruction_weight_refs: []?*const Tensor,
     /// Per-instruction typed kernel refs for macro adapters (load-time resolved).
     instruction_norm_refs: []?NormKernelBinding = &.{},
     instruction_attention_bindings: []?AttentionKernelBinding = &.{},
@@ -397,7 +398,6 @@ pub const Block = struct {
         var compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, mode, resolved_options);
         errdefer plan_compiler.deinitCompiledPlan(allocator, &compiled_plan);
         const tmp_layout = try buildTmpRegisterScratchMap(allocator, &compiled_plan);
-        const weight_refs = try buildInstructionWeightRefs(allocator, block, block_idx, &compiled_plan);
         const typed_kernel_refs = try buildTypedInstructionKernelRefs(
             allocator,
             block,
@@ -410,24 +410,23 @@ pub const Block = struct {
         );
         const weight_table = try buildInstructionWeightTable(
             allocator,
+            block,
             block_idx,
             &compiled_plan,
-            weight_refs,
             typed_kernel_refs,
+            &runtime_metadata,
         );
         errdefer {
             allocator.free(weight_table.offsets);
             allocator.free(weight_table.ptrs);
             runtime_metadata.deinit(allocator);
             typed_kernel_refs.deinit(allocator);
-            allocator.free(weight_refs);
         }
         return .{
             .compiled_plan = compiled_plan,
             .block = block,
             .block_idx = block_idx,
             .hidden_size = hidden_size,
-            .instruction_weight_refs = weight_refs,
             .instruction_norm_refs = typed_kernel_refs.norm,
             .instruction_attention_bindings = typed_kernel_refs.attention,
             .instruction_mla_attention_refs = typed_kernel_refs.mla_attention,
@@ -473,7 +472,6 @@ pub const Block = struct {
         if (self.instruction_moe_runtime_metadata.len > 0) allocator.free(self.instruction_moe_runtime_metadata);
         if (self.instruction_mamba_runtime_metadata.len > 0) allocator.free(self.instruction_mamba_runtime_metadata);
         if (self.instruction_shortconv_runtime_metadata.len > 0) allocator.free(self.instruction_shortconv_runtime_metadata);
-        allocator.free(self.instruction_weight_refs);
         plan_compiler.deinitCompiledPlan(allocator, &self.compiled_plan);
         self.* = undefined;
     }
@@ -483,45 +481,6 @@ pub const Block = struct {
     /// before taking long-lived views into `scratch.tmp[0]`.
     pub fn registerScratchLayout(self: *const Block, scratch: *ScratchBuffer) !void {
         try scratch.registerTmpLayout(self.tmp_slot_width_hints, self.tmp_slot_active);
-    }
-
-    fn buildInstructionWeightRefs(
-        allocator: std.mem.Allocator,
-        block: *const cpu_forward.TransformerBlock,
-        block_idx: usize,
-        compiled_plan: *const runtime_contract.CompiledPlan,
-    ) ![]?*const Tensor {
-        const refs = try allocator.alloc(?*const Tensor, compiled_plan.plan.instructions.len);
-        errdefer allocator.free(refs);
-        @memset(refs, null);
-
-        for (compiled_plan.plan.instructions, 0..) |insn, op_index| {
-            if (insn.weights.len == 0) continue;
-            if (runtime_contract.expectedKernelWeightSlots(insn.opcode).len != 0) {
-                // Macro-op kernel bindings are resolved through typed per-op
-                // refs and flattened instruction tables (load-time only).
-                continue;
-            }
-            if (insn.weights.len != 1) return error.InvalidWeightRefCount;
-            const weight_name = runtime_contract.instructionSingleWeightBindingName(compiled_plan, op_index) catch |err| {
-                error_context.setContext("block={d}, op={d}, bind_error={s}", .{
-                    block_idx,
-                    op_index,
-                    @errorName(err),
-                });
-                return err;
-            };
-            const weight = block.weight_registry.get(weight_name) orelse {
-                error_context.setContext("block={d}, op={d}, weight={s}", .{
-                    block_idx,
-                    op_index,
-                    weight_name,
-                });
-                return error.MissingWeight;
-            };
-            refs[op_index] = weight;
-        }
-        return refs;
     }
 
     fn instructionKernelIdFromWeightBindings(
@@ -755,6 +714,18 @@ pub const Block = struct {
                     .matmul_out_proj = binding.matmul_out_proj,
                     .matmul_in_proj_name = binding.matmul_in_proj_name,
                     .matmul_out_proj_name = binding.matmul_out_proj_name,
+                    .conv_weight_time_major = if (binding.conv_weight_transposed) |weight_t|
+                        Tensor.view(
+                            @ptrCast(std.mem.sliceAsBytes(weight_t).ptr),
+                            &.{
+                                @as(usize, @intCast(binding.config.d_conv)),
+                                @as(usize, @intCast(binding.config.conv_dim)),
+                            },
+                            .f32,
+                            null,
+                        )
+                    else
+                        null,
                     .layer_idx = binding.layer_idx,
                 };
             }
@@ -1140,10 +1111,11 @@ pub const Block = struct {
 
     fn buildInstructionWeightTable(
         allocator: std.mem.Allocator,
+        block: *const cpu_forward.TransformerBlock,
         block_idx: usize,
         compiled_plan: *const runtime_contract.CompiledPlan,
-        instruction_weight_refs: []const ?*const Tensor,
         typed_kernel_refs: TypedInstructionKernelRefs,
+        runtime_metadata: *const RuntimeMetadata,
     ) !InstructionWeightTable {
         const insn_len = compiled_plan.plan.instructions.len;
         const offsets = try allocator.alloc(u32, insn_len + 1);
@@ -1166,14 +1138,23 @@ pub const Block = struct {
             if (expected_slots.len == 0) {
                 if (insn.weights.len == 0) continue;
                 if (insn.weights.len != 1) return error.InvalidWeightRefCount;
-                const weight_ref = instruction_weight_refs[op_index] orelse {
-                    error_context.setContext("block={d}, op={d}, weight_ref=MissingWeight", .{
+                const weight_name = runtime_contract.instructionSingleWeightBindingName(compiled_plan, op_index) catch |err| {
+                    error_context.setContext("block={d}, op={d}, bind_error={s}", .{
                         block_idx,
                         op_index,
+                        @errorName(err),
+                    });
+                    return err;
+                };
+                const weight = block.weight_registry.get(weight_name) orelse {
+                    error_context.setContext("block={d}, op={d}, weight={s}", .{
+                        block_idx,
+                        op_index,
+                        weight_name,
                     });
                     return error.MissingWeight;
                 };
-                ptrs[cursor] = @ptrCast(@constCast(weight_ref));
+                ptrs[cursor] = @ptrCast(@constCast(weight));
                 cursor += 1;
                 continue;
             }
@@ -1185,6 +1166,11 @@ pub const Block = struct {
                     insn.opcode,
                     slot_idx,
                 );
+                if (shortConvTimeMajorWeightPtr(runtime_metadata, insn.opcode, op_index, slot_idx)) |time_major_ptr| {
+                    ptrs[cursor] = time_major_ptr;
+                    cursor += 1;
+                    continue;
+                }
                 const ptr = try resolveKernelWeightPtr(
                     block_idx,
                     op_index,
@@ -1199,6 +1185,22 @@ pub const Block = struct {
         }
         offsets[insn_len] = @intCast(cursor);
         return .{ .offsets = offsets, .ptrs = ptrs };
+    }
+
+    fn shortConvTimeMajorWeightPtr(
+        runtime_metadata: *const RuntimeMetadata,
+        opcode: runtime_contract.Opcode,
+        op_index: usize,
+        slot_idx: usize,
+    ) ?*anyopaque {
+        if (opcode != .shortconv or slot_idx != 1) return null;
+        if (op_index >= runtime_metadata.shortconv.len) return null;
+        if (runtime_metadata.shortconv[op_index]) |*meta| {
+            if (meta.conv_weight_time_major) |*tensor_view| {
+                return @ptrCast(@constCast(tensor_view));
+            }
+        }
+        return null;
     }
 
     fn tensorViewDescFromTensor(value: *const Tensor) runtime_contract.TensorViewDesc {
@@ -1393,10 +1395,16 @@ pub const Block = struct {
 
     fn instructionWeightRef(self: *const Block, op_index: usize) !*const Tensor {
         if (op_index >= self.compiled_plan.plan.instructions.len) return error.InvalidInstructionIndex;
-        if (op_index >= self.instruction_weight_refs.len) return error.InvalidInstructionIndex;
+        if (op_index + 1 >= self.instruction_weight_offsets.len) return error.InvalidInstructionIndex;
         const insn = self.compiled_plan.plan.instructions[op_index];
         if (insn.weights.len != 1) return error.InvalidWeightRefCount;
-        return self.instruction_weight_refs[op_index] orelse error.MissingWeight;
+        const start: usize = self.instruction_weight_offsets[op_index];
+        const end: usize = self.instruction_weight_offsets[op_index + 1];
+        if (end < start) return error.InvalidInstructionBinding;
+        if (end - start != 1) return error.InvalidWeightRefCount;
+        if (start >= self.instruction_weight_ptrs.len) return error.InvalidInstructionBinding;
+        const ptr = self.instruction_weight_ptrs[start] orelse return error.MissingWeight;
+        return @ptrCast(@alignCast(ptr));
     }
 
     fn hasTypedKernelBinding(self: *const Block, opcode: runtime_contract.Opcode, op_index: usize) bool {
@@ -1410,13 +1418,6 @@ pub const Block = struct {
             .shortconv => op_index < self.instruction_shortconv_runtime_metadata.len and self.instruction_shortconv_runtime_metadata[op_index] != null,
             else => false,
         };
-    }
-
-    fn planUsesOpcode(self: *const Block, opcode: runtime_contract.Opcode) bool {
-        for (self.compiled_plan.plan.instructions) |insn| {
-            if (insn.opcode == opcode) return true;
-        }
-        return false;
     }
 
     const BatchedDispatchMode = enum {
@@ -2167,11 +2168,12 @@ pub const Block = struct {
             if (weight_handles.len != 4) return error.InvalidWeightRefCount;
             if (state.op_index >= state.block.instruction_shortconv_runtime_metadata.len) return error.InvalidInstructionIndex;
             const meta = state.block.instruction_shortconv_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
+            const conv_weight = tensorFromWeightHandle(weight_handles[1]);
             var shortconv_local = shortconv_kernel.ShortConvKernel{
                 .config = meta.config,
                 .weights = .{
                     .in_proj = tensorFromWeightHandle(weight_handles[0]),
-                    .conv1d_weight = tensorFromWeightHandle(weight_handles[1]),
+                    .conv1d_weight = conv_weight,
                     .conv1d_bias = optionalTensorFromWeightHandle(weight_handles[3]),
                     .out_proj = tensorFromWeightHandle(weight_handles[2]),
                 },
@@ -2180,7 +2182,7 @@ pub const Block = struct {
                 .matmul_in_proj_name = meta.matmul_in_proj_name,
                 .matmul_out_proj_name = meta.matmul_out_proj_name,
                 .layer_idx = meta.layer_idx,
-                .conv_weight_transposed = null,
+                .conv_weight_transposed = if (meta.conv_weight_time_major != null) conv_weight.asSlice(f32) else null,
                 .weight_allocator = null,
             };
             try dispatchShortConvWithMode(state, insn, state_blocks, input, output, &shortconv_local);
@@ -4178,15 +4180,13 @@ test "Block caches primitive linear weight bindings at init" {
     defer block.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 1), block.compiled_plan.weight_bindings.len);
-    try testing.expectEqual(block.compiled_plan.plan.instructions.len, block.instruction_weight_refs.len);
-    try testing.expect(block.instruction_weight_refs[0] != null);
     try testing.expectEqual(block.compiled_plan.plan.instructions.len + 1, block.instruction_weight_offsets.len);
     try testing.expectEqual(@as(usize, 1), block.instruction_weight_ptrs.len);
     try testing.expect(block.instruction_weight_ptrs[0] != null);
     try block.validate();
 }
 
-test "Block.forward linear uses instruction handles not primitive weight ref cache" {
+test "Block.forward linear fails when flattened weight table entry is missing" {
     const allocator = testing.allocator;
 
     var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
@@ -4202,9 +4202,8 @@ test "Block.forward linear uses instruction handles not primitive weight ref cac
     var block = try createTestBlock(allocator, &transformer_block, 128, &program);
     defer block.deinit(allocator);
 
-    // Regression guard: primitive execution must use instruction handles built
-    // from flattened instruction bindings, not this legacy ref cache.
-    block.instruction_weight_refs[0] = null;
+    // Flattened runtime weight pointers are the single execution source.
+    block.instruction_weight_ptrs[0] = null;
 
     const seq_len = 2;
     const hidden = 128;
@@ -4223,16 +4222,7 @@ test "Block.forward linear uses instruction handles not primitive weight ref cac
     var scratch = try ScratchBuffer.init(allocator, hidden, 512, 1);
     defer scratch.deinit();
 
-    try block.forward(&input, &output, &scratch, false);
-
-    var has_nonzero = false;
-    for (output_data) |val| {
-        if (val != 0.0) {
-            has_nonzero = true;
-            break;
-        }
-    }
-    try testing.expect(has_nonzero);
+    try testing.expectError(error.MissingWeight, block.forward(&input, &output, &scratch, false));
 }
 
 test "Block caches kernel instruction bindings at init" {
@@ -4305,6 +4295,104 @@ test "resolveKernelWeightPtrForSlot emits missing sentinels for fused attention 
         @intFromPtr(&missing_weight_tensor),
         @intFromPtr(@as(*const Tensor, @ptrCast(@alignCast(v_ptr)))),
     );
+}
+
+test "buildRuntimeMetadata preserves shortconv time-major weight tensor view" {
+    const dk = try cpu_linalg.matmulKernel(.f32);
+    const in_proj = zeroTensor();
+    const conv_weight = zeroTensor();
+    const out_proj = zeroTensor();
+    var conv_weight_time_major_storage = [_]f32{ 1, 2, 3, 4, 5, 6 };
+
+    var shortconv_binding = shortconv_kernel.ShortConvKernel{
+        .config = .{
+            .d_model = 4,
+            .d_conv = 3,
+            .conv_dim = 2,
+            .conv_dim_out = 4,
+            .has_bias = false,
+        },
+        .weights = .{
+            .in_proj = &in_proj,
+            .conv1d_weight = &conv_weight,
+            .conv1d_bias = null,
+            .out_proj = &out_proj,
+        },
+        .matmul_in_proj = dk.func,
+        .matmul_out_proj = dk.func,
+        .matmul_in_proj_name = dk.name,
+        .matmul_out_proj_name = dk.name,
+        .layer_idx = 0,
+        .conv_weight_transposed = conv_weight_time_major_storage[0..],
+        .weight_allocator = null,
+    };
+
+    var norm = [_]?NormKernelBinding{null};
+    var attention = [_]?AttentionKernelBinding{null};
+    var mla = [_]?MlaAttentionKernelBinding{null};
+    var swiglu = [_]?SwiGLUKernelBinding{null};
+    var moe = [_]?MoeKernelBinding{null};
+    var mamba = [_]?MambaKernelBinding{null};
+    var shortconv = [_]?ShortConvKernelBinding{&shortconv_binding};
+    const typed = Block.TypedInstructionKernelRefs{
+        .norm = norm[0..],
+        .attention = attention[0..],
+        .mla_attention = mla[0..],
+        .swiglu = swiglu[0..],
+        .moe = moe[0..],
+        .mamba = mamba[0..],
+        .shortconv = shortconv[0..],
+    };
+
+    var runtime_meta = try Block.buildRuntimeMetadata(testing.allocator, typed);
+    defer runtime_meta.deinit(testing.allocator);
+    const shortconv_meta = runtime_meta.shortconv[0] orelse return error.TestUnexpectedResult;
+    const time_major_tensor = shortconv_meta.conv_weight_time_major orelse return error.TestUnexpectedResult;
+    const time_major_slice = time_major_tensor.asSlice(f32);
+    try testing.expectEqual(conv_weight_time_major_storage.len, time_major_slice.len);
+    try testing.expectEqual(@intFromPtr(conv_weight_time_major_storage[0..].ptr), @intFromPtr(time_major_slice.ptr));
+}
+
+test "shortConvTimeMajorWeightPtr returns pointer only for shortconv slot 1" {
+    var conv_weight_time_major_storage = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const time_major_tensor = Tensor.view(
+        @ptrCast(std.mem.sliceAsBytes(conv_weight_time_major_storage[0..]).ptr),
+        &.{ 3, 2 },
+        .f32,
+        null,
+    );
+
+    var shortconv_entry: ShortConvRuntimeMetadata = undefined;
+    shortconv_entry.conv_weight_time_major = time_major_tensor;
+    var shortconv = [_]?ShortConvRuntimeMetadata{shortconv_entry};
+    var norm = [_]?NormRuntimeMetadata{null};
+    var attention = [_]?AttentionRuntimeMetadata{null};
+    var mla = [_]?MlaRuntimeMetadata{null};
+    var swiglu = [_]?SwiGluRuntimeMetadata{null};
+    var moe = [_]?MoeRuntimeMetadata{null};
+    var mamba = [_]?MambaRuntimeMetadata{null};
+    const runtime_meta = Block.RuntimeMetadata{
+        .norm = norm[0..],
+        .attention = attention[0..],
+        .mla = mla[0..],
+        .swiglu = swiglu[0..],
+        .moe = moe[0..],
+        .mamba = mamba[0..],
+        .shortconv = shortconv[0..],
+    };
+
+    const ptr = Block.shortConvTimeMajorWeightPtr(&runtime_meta, .shortconv, 0, 1) orelse {
+        return error.TestUnexpectedResult;
+    };
+    const expected_ptr = blk: {
+        if (shortconv[0]) |*meta| {
+            if (meta.conv_weight_time_major) |*tensor_view| break :blk @intFromPtr(tensor_view);
+        }
+        return error.TestUnexpectedResult;
+    };
+    try testing.expectEqual(expected_ptr, @intFromPtr(@as(*const Tensor, @ptrCast(@alignCast(ptr)))));
+    try testing.expect(Block.shortConvTimeMajorWeightPtr(&runtime_meta, .shortconv, 0, 0) == null);
+    try testing.expect(Block.shortConvTimeMajorWeightPtr(&runtime_meta, .multihead_attention, 0, 1) == null);
 }
 
 test "resolveKernelWeightPtrForSlot routes layernorm bias via norm_bias slot" {
@@ -4474,7 +4562,7 @@ test "cpu adapter table rejects moe opcode at load-time validation" {
     try testing.expectEqual(runtime_contract.Opcode.moe, unsupported.?.opcode);
 }
 
-test "Block.validate rejects missing cached primitive weight binding" {
+test "Block.validate rejects missing flattened primitive weight binding" {
     const allocator = testing.allocator;
 
     var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
@@ -4490,8 +4578,8 @@ test "Block.validate rejects missing cached primitive weight binding" {
     var block = try createTestBlock(allocator, &transformer_block, 128, &program);
     defer block.deinit(allocator);
 
-    const refs_mut = @constCast(block.instruction_weight_refs.ptr);
-    refs_mut[0] = null;
+    const ptrs_mut = @constCast(block.instruction_weight_ptrs.ptr);
+    ptrs_mut[0] = null;
 
     try testing.expectError(error.MissingWeight, block.validate());
 }
@@ -4518,7 +4606,7 @@ test "Block.validate rejects instructions without param block payload" {
     try testing.expectError(error.MissingParamBlock, block.validate());
 }
 
-test "Block.validate rejects stateful opcode incompatible with block kind" {
+test "Block.validate rejects stateful opcode for wrong block kind" {
     const allocator = testing.allocator;
 
     var weights = try TestWeights.init(allocator, 128, 512, 2, 32);

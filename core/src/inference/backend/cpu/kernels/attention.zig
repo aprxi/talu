@@ -148,7 +148,7 @@ pub const MultiHeadAttention = struct {
     o_bias: ?[]const f32 = null,
     // Attention sinks - per-head extra logit prepended to the score vector before softmax.
     sinks: ?[]const f32 = null,
-    /// Optional Flash Attention kernel (set at model load time if compatible).
+    /// Optional Flash Attention kernel (set at model load time if eligible).
     flash_attention_fn: ?FlashAttentionFn = null,
 
     fn shouldUseFlash(

@@ -1627,7 +1627,7 @@ fn runMatvecU16Smoke(
         if (@abs(want - got) > 0.01) return error.CudaKernelSmokeMismatch;
     }
 
-    // Exercise non-vectorized fallback path with intentionally unaligned input/weight pointers.
+    // Exercise non-vectorized scalar path with intentionally unaligned input/weight pointers.
     const input_bytes = input.len * @sizeOf(f32);
     const weight_bytes = weights_bf16.len * @sizeOf(u16);
     const input_pad: usize = 4;
@@ -1905,7 +1905,7 @@ fn runMatvecU16GateUpSmoke(
         if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
     }
 
-    // Exercise non-vectorized fallback path with intentionally unaligned pointers.
+    // Exercise non-vectorized scalar path with intentionally unaligned pointers.
     const input_bytes = input.len * @sizeOf(f32);
     const gate_weight_bytes = gate_weights_bf16.len * @sizeOf(u16);
     const up_weight_bytes = up_weights_bf16.len * @sizeOf(u16);
@@ -2136,7 +2136,7 @@ fn runMatvecU16QkvSmoke(
         if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
     }
 
-    // Exercise non-vectorized fallback path with intentionally unaligned pointers.
+    // Exercise non-vectorized scalar path with intentionally unaligned pointers.
     const input_bytes = input.len * @sizeOf(f32);
     const q_weight_bytes = q_weights_bf16.len * @sizeOf(u16);
     const k_weight_bytes = k_weights_bf16.len * @sizeOf(u16);

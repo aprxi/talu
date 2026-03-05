@@ -12,8 +12,8 @@
 //! - decodeBatch() accepts multiple sequences per call
 //! - Batched embedding lookup + batched LM-head logits matmul in decodeBatch()
 //!
-//! Transformer layer decode is batched for slot-compatible block programs, with
-//! explicit slot-wise fallback for unsupported kernel topologies.
+//! Transformer layer decode is batched for slot-batched block programs, with
+//! explicit slot-wise execution for unsupported kernel topologies.
 //!
 //! This backend is the sole CPU inference path.
 //!
@@ -741,12 +741,12 @@ pub const FusedCpuBackend = struct {
     }
 
     // =========================================================================
-    // Single-Sequence API (uses slot 0, compatible with Backend interface)
+    // Single-sequence API (uses slot 0, aligned with Backend interface)
     // =========================================================================
 
     /// Prefill: process all prompt tokens, return logits for last position.
     /// This resets the KV cache and processes the full prompt.
-    /// Uses slot 0 for single-sequence compatibility.
+    /// Uses slot 0 for single-sequence operation.
     pub fn prefill(self: *FusedCpuBackend, tokens: []const u32, logits_out: []f32) !void {
         // Always use slot 0 for single-sequence mode.
         self.ensureSlotStateBlocksBound(0) catch |err| {
@@ -766,7 +766,7 @@ pub const FusedCpuBackend = struct {
 
     /// Decode: generate logits for a single token using KV cache.
     /// Returns logits for the next token prediction.
-    /// Uses the graph-based model.forwardWithBatchedCache for architecture compatibility.
+    /// Uses graph-based model.forwardWithBatchedCache for architecture coverage.
     pub fn decode(self: *FusedCpuBackend, token: u32, position: usize, logits_out: []f32) !void {
         try self.ensureSlotStateBlocksBound(0);
         try self.scratch.ensureForMode(.decode, 1);
@@ -809,7 +809,7 @@ pub const FusedCpuBackend = struct {
     }
 
     /// Streaming token generation with callback support.
-    /// Uses the graph-based model.forwardWithBatchedCache for architecture compatibility.
+    /// Uses graph-based model.forwardWithBatchedCache for architecture coverage.
     pub fn decodeStreaming(
         self: *FusedCpuBackend,
         first_token: u32,
@@ -1363,10 +1363,10 @@ pub const FusedCpuBackend = struct {
     ///
     /// Embedding gather, transformer execution, and LM-head logits are batched
     /// when the loaded block topology supports slot-batched decode.
-    /// Unsupported topologies use a slot-wise fallback for correctness.
+    /// Unsupported topologies use slot-wise execution for correctness.
     ///
     /// Uses graph-based execution via model.forwardWithBatchedCache() for
-    /// architecture compatibility across all model types.
+    /// architecture coverage across all model types.
     pub fn decodeBatch(
         self: *FusedCpuBackend,
         requests: []const DecodeRequest,
