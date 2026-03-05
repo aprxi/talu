@@ -194,19 +194,19 @@ fn layerProgramWeightBindingKeyFor(
         else if (std.mem.eql(u8, slot_name, "o_proj"))
             .attention_o_proj
         else if (std.mem.eql(u8, slot_name, "q_norm"))
-            .attention_o_proj
+            .attention_q_norm
         else if (std.mem.eql(u8, slot_name, "k_norm"))
-            .attention_o_proj
+            .attention_k_norm
         else if (std.mem.eql(u8, slot_name, "q_bias"))
-            .attention_o_proj
+            .attention_q_bias
         else if (std.mem.eql(u8, slot_name, "k_bias"))
-            .attention_o_proj
+            .attention_k_bias
         else if (std.mem.eql(u8, slot_name, "v_bias"))
-            .attention_o_proj
+            .attention_v_bias
         else if (std.mem.eql(u8, slot_name, "o_bias"))
-            .attention_o_proj
+            .attention_o_bias
         else if (std.mem.eql(u8, slot_name, "attn_sinks"))
-            .attention_o_proj
+            .attention_attn_sinks
         else
             error.InvalidWeightBindingName,
         .mla_attention => if (std.mem.eql(u8, slot_name, "mla_weights"))
@@ -234,63 +234,63 @@ fn layerProgramWeightBindingKeyFor(
         else if (std.mem.eql(u8, slot_name, "w2"))
             .swiglu_w2
         else if (std.mem.eql(u8, slot_name, "w1_bias"))
-            .swiglu_w1
+            .swiglu_w1_bias
         else if (std.mem.eql(u8, slot_name, "w2_bias"))
-            .swiglu_w2
+            .swiglu_w2_bias
         else
             error.InvalidWeightBindingName,
         .moe => if (std.mem.eql(u8, slot_name, "router"))
             .moe_router
         else if (std.mem.eql(u8, slot_name, "gate_proj"))
-            .moe_router
+            .moe_gate_proj
         else if (std.mem.eql(u8, slot_name, "up_proj"))
-            .moe_router
+            .moe_up_proj
         else if (std.mem.eql(u8, slot_name, "down_proj"))
-            .moe_router
+            .moe_down_proj
         else if (std.mem.eql(u8, slot_name, "router_bias"))
-            .moe_router
+            .moe_router_bias
         else if (std.mem.eql(u8, slot_name, "gate_scales"))
-            .moe_router
+            .moe_gate_scales
         else if (std.mem.eql(u8, slot_name, "up_scales"))
-            .moe_router
+            .moe_up_scales
         else if (std.mem.eql(u8, slot_name, "down_scales"))
-            .moe_router
+            .moe_down_scales
         else if (std.mem.eql(u8, slot_name, "gate_bias"))
-            .moe_router
+            .moe_gate_bias
         else if (std.mem.eql(u8, slot_name, "up_bias"))
-            .moe_router
+            .moe_up_bias
         else if (std.mem.eql(u8, slot_name, "down_bias"))
-            .moe_router
+            .moe_down_bias
         else if (std.mem.eql(u8, slot_name, "router_scales"))
-            .moe_router
+            .moe_router_scales
         else if (std.mem.eql(u8, slot_name, "router_quant_bias"))
-            .moe_router
+            .moe_router_quant_bias
         else
             error.InvalidWeightBindingName,
         .mamba_mixer => if (std.mem.eql(u8, slot_name, "in_proj"))
             .mamba_in_proj
+        else if (std.mem.eql(u8, slot_name, "conv_weight"))
+            .mamba_conv_weight
+        else if (std.mem.eql(u8, slot_name, "a_log"))
+            .mamba_a_log
+        else if (std.mem.eql(u8, slot_name, "d_skip"))
+            .mamba_d_skip
         else if (std.mem.eql(u8, slot_name, "out_proj"))
             .mamba_out_proj
-        else if (std.mem.eql(u8, slot_name, "conv_weight"))
-            .mamba_out_proj
-        else if (std.mem.eql(u8, slot_name, "a_log"))
-            .mamba_out_proj
-        else if (std.mem.eql(u8, slot_name, "d_skip"))
-            .mamba_out_proj
         else if (std.mem.eql(u8, slot_name, "conv_bias"))
-            .mamba_out_proj
+            .mamba_conv_bias
         else if (std.mem.eql(u8, slot_name, "dt_bias"))
-            .mamba_out_proj
+            .mamba_dt_bias
         else if (std.mem.eql(u8, slot_name, "norm_weight"))
-            .mamba_out_proj
+            .mamba_norm_weight
         else if (std.mem.eql(u8, slot_name, "ln1_weight"))
-            .mamba_out_proj
+            .mamba_ln1_weight
         else if (std.mem.eql(u8, slot_name, "ln2_weight"))
-            .mamba_out_proj
+            .mamba_ln2_weight
         else if (std.mem.eql(u8, slot_name, "gate_up"))
-            .mamba_out_proj
+            .mamba_gate_up
         else if (std.mem.eql(u8, slot_name, "down_proj"))
-            .mamba_out_proj
+            .mamba_down_proj
         else
             error.InvalidWeightBindingName,
         .shortconv => if (std.mem.eql(u8, slot_name, "in_proj"))
@@ -300,7 +300,7 @@ fn layerProgramWeightBindingKeyFor(
         else if (std.mem.eql(u8, slot_name, "out_proj"))
             .shortconv_out_proj
         else if (std.mem.eql(u8, slot_name, "conv_bias"))
-            .shortconv_conv_weight
+            .shortconv_conv_bias
         else
             error.InvalidWeightBindingName,
         else => error.InvalidInstructionPayload,
@@ -382,6 +382,13 @@ fn layerProgramStaticWeightPtr(
             @ptrCast(weight)
         else
             null,
+        .attention_q_norm => if (layer.q_norm) |*weight| @ptrCast(weight) else null,
+        .attention_k_norm => if (layer.k_norm) |*weight| @ptrCast(weight) else null,
+        .attention_q_bias => if (layer.q_bias) |*weight| @ptrCast(weight) else null,
+        .attention_k_bias => if (layer.k_bias) |*weight| @ptrCast(weight) else null,
+        .attention_v_bias => if (layer.v_bias) |*weight| @ptrCast(weight) else null,
+        .attention_o_bias => if (layer.o_bias) |*weight| @ptrCast(weight) else null,
+        .attention_attn_sinks => if (layer.attn_sinks) |*weight| @ptrCast(weight) else null,
         .swiglu_w1 => if (layer.w1) |*weight|
             @ptrCast(weight)
         else if (layer.w1_bf16) |*weight|
@@ -400,19 +407,53 @@ fn layerProgramStaticWeightPtr(
             @ptrCast(weight)
         else
             null,
+        .swiglu_w1_bias => null,
+        .swiglu_w2_bias => null,
         .moe_router => if (layer.moe) |moe|
             @ptrCast(@constCast(&moe.router_w))
         else
             null,
+        .moe_gate_proj => if (layer.moe) |moe| @ptrCast(@constCast(&moe.gate_w)) else null,
+        .moe_up_proj => if (layer.moe) |moe| @ptrCast(@constCast(&moe.up_w)) else null,
+        .moe_down_proj => if (layer.moe) |moe| @ptrCast(@constCast(&moe.down_w)) else null,
+        .moe_router_bias => if (layer.moe) |moe| if (moe.router_bias) |*w| @ptrCast(w) else null else null,
+        .moe_gate_scales => if (layer.moe) |moe| @ptrCast(@constCast(&moe.gate_s)) else null,
+        .moe_up_scales => if (layer.moe) |moe| @ptrCast(@constCast(&moe.up_s)) else null,
+        .moe_down_scales => if (layer.moe) |moe| @ptrCast(@constCast(&moe.down_s)) else null,
+        .moe_gate_bias => if (layer.moe) |moe| if (moe.gate_bias) |*w| @ptrCast(w) else null else null,
+        .moe_up_bias => if (layer.moe) |moe| if (moe.up_bias) |*w| @ptrCast(w) else null else null,
+        .moe_down_bias => if (layer.moe) |moe| if (moe.down_bias) |*w| @ptrCast(w) else null else null,
+        .moe_router_scales => if (layer.moe) |moe| if (moe.router_s) |*w| @ptrCast(w) else null else null,
+        .moe_router_quant_bias => if (layer.moe) |moe| if (moe.router_b) |*w| @ptrCast(w) else null else null,
         .mamba_in_proj => if (layer.mamba_in_proj) |*weight|
             @ptrCast(weight)
         else if (layer.mamba_in_proj_bf16) |*weight|
             @ptrCast(weight)
         else
             null,
+        .mamba_conv_weight => if (layer.mamba_conv_weight) |*weight| @ptrCast(weight) else null,
+        .mamba_a_log => if (layer.mamba_a_log) |*weight| @ptrCast(weight) else null,
+        .mamba_d_skip => if (layer.mamba_d_skip) |*weight| @ptrCast(weight) else null,
         .mamba_out_proj => if (layer.mamba_out_proj) |*weight|
             @ptrCast(weight)
         else if (layer.mamba_out_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .mamba_conv_bias => if (layer.mamba_conv_bias) |*weight| @ptrCast(weight) else null,
+        .mamba_dt_bias => if (layer.mamba_dt_bias) |*weight| @ptrCast(weight) else null,
+        .mamba_norm_weight => if (layer.mamba_norm_weight) |*weight| @ptrCast(weight) else null,
+        .mamba_ln1_weight => @ptrCast(&layer.ln1_weight),
+        .mamba_ln2_weight => @ptrCast(&layer.ln2_weight),
+        .mamba_gate_up => if (layer.mamba_gate_up) |*weight|
+            @ptrCast(weight)
+        else if (layer.mamba_gate_up_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .mamba_down_proj => if (layer.mamba_down_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.mamba_down_proj_bf16) |*weight|
             @ptrCast(weight)
         else
             null,
@@ -432,6 +473,7 @@ fn layerProgramStaticWeightPtr(
             @ptrCast(weight)
         else
             null,
+        .shortconv_conv_bias => if (layer.shortconv_conv_bias) |*weight| @ptrCast(weight) else null,
     };
 }
 
@@ -445,7 +487,6 @@ fn compileLayerProgramContract(
     layer.register_to_slot_map = &.{};
     layer.weight_binding_keys = &.{};
     layer.weight_ptr_scratch = &.{};
-    layer.precomputed_runtime_bindings = null;
     layer.opcode_flags = .{};
     layer.slot_scratch = &.{};
     layer.instruction_handle_scratch = &.{};
@@ -1518,15 +1559,47 @@ pub const WeightHandles = struct {
         attention_k_proj,
         attention_v_proj,
         attention_o_proj,
+        attention_q_norm,
+        attention_k_norm,
+        attention_q_bias,
+        attention_k_bias,
+        attention_v_bias,
+        attention_o_bias,
+        attention_attn_sinks,
         swiglu_w1,
         swiglu_w3,
         swiglu_w2,
+        swiglu_w1_bias,
+        swiglu_w2_bias,
         moe_router,
+        moe_gate_proj,
+        moe_up_proj,
+        moe_down_proj,
+        moe_router_bias,
+        moe_gate_scales,
+        moe_up_scales,
+        moe_down_scales,
+        moe_gate_bias,
+        moe_up_bias,
+        moe_down_bias,
+        moe_router_scales,
+        moe_router_quant_bias,
         mamba_in_proj,
+        mamba_conv_weight,
+        mamba_a_log,
+        mamba_d_skip,
         mamba_out_proj,
+        mamba_conv_bias,
+        mamba_dt_bias,
+        mamba_norm_weight,
+        mamba_ln1_weight,
+        mamba_ln2_weight,
+        mamba_gate_up,
+        mamba_down_proj,
         shortconv_in_proj,
         shortconv_conv_weight,
         shortconv_out_proj,
+        shortconv_conv_bias,
         mla_weights,
     };
 
@@ -1581,8 +1654,6 @@ pub const WeightHandles = struct {
         weight_binding_keys: []const LayerProgramWeightBindingKey = &.{},
         /// Pre-allocated per-layer resolved weight pointer scratch.
         weight_ptr_scratch: []?*anyopaque = &.{},
-        /// Optional block-runtime binding cache owned by executor lifecycle.
-        precomputed_runtime_bindings: ?*anyopaque = null,
         opcode_flags: LayerProgramOpcodeFlags = .{},
         /// Pre-allocated scratch for slot buffer handles during execution.
         slot_scratch: []mlx_graph.ArrayHandle = &.{},

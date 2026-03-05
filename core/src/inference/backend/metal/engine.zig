@@ -67,7 +67,6 @@ pub const MetalBackend = struct {
     state_runtime_roles: [MaxStateDescriptors]StateRuntimeRole,
     state_descriptor_count: u8,
     slot0_state_binding: SlotStateBinding = .{},
-    slot0_bootstrap_bindings: InitStateBindings = .{},
 
     // Track position for decode
     current_position: usize,
@@ -95,70 +94,6 @@ pub const MetalBackend = struct {
             self.bound = false;
         }
     };
-
-    const InitStateBindings = struct {
-        const StateBlockStorage = struct {
-            bytes: []align(64) u8 = &.{},
-        };
-
-        handles: []runtime_contract.StateBlockHandle = &.{},
-        storage: []StateBlockStorage = &.{},
-
-        fn deinit(self: *InitStateBindings, allocator: std.mem.Allocator) void {
-            if (self.storage.len != 0) {
-                for (self.storage) |entry| {
-                    if (entry.bytes.len != 0) allocator.free(entry.bytes);
-                }
-                allocator.free(self.storage);
-            }
-            if (self.handles.len != 0) allocator.free(self.handles);
-            self.* = .{};
-        }
-    };
-
-    fn allocateInitStateBindings(
-        allocator: std.mem.Allocator,
-        descriptors: []const runtime_contract.StateDescriptor,
-    ) !InitStateBindings {
-        if (descriptors.len == 0) return .{};
-
-        var bindings = InitStateBindings{};
-        bindings.handles = try allocator.alloc(runtime_contract.StateBlockHandle, descriptors.len);
-        errdefer allocator.free(bindings.handles);
-        bindings.storage = try allocator.alloc(InitStateBindings.StateBlockStorage, descriptors.len);
-        errdefer allocator.free(bindings.storage);
-        for (bindings.storage) |*entry| entry.* = .{};
-
-        var initialized: usize = 0;
-        errdefer {
-            for (bindings.storage[0..initialized]) |entry| {
-                allocator.free(entry.bytes);
-            }
-        }
-
-        for (descriptors, 0..) |descriptor, idx| {
-            if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) {
-                return error.InvalidStateDescriptorBinding;
-            }
-            const size_bytes: usize = std.math.cast(usize, descriptor.size_bytes) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            if (size_bytes == 0) return error.InvalidStateDescriptorBinding;
-
-            const bytes = try allocator.alignedAlloc(u8, .@"64", size_bytes);
-            @memset(bytes, 0);
-            bindings.storage[idx] = .{ .bytes = bytes };
-            bindings.handles[idx] = .{
-                .id = descriptor.id,
-                .ptr = bytes.ptr,
-                .size = @intCast(bytes.len),
-                .align_bytes = descriptor.align_bytes,
-            };
-            initialized += 1;
-        }
-
-        return bindings;
-    }
 
     fn argmaxHost(values: []const f32) u32 {
         var best_idx: usize = 0;
@@ -626,21 +561,12 @@ pub const MetalBackend = struct {
         // Load weights to GPU
         const weight_handles = try weights_trait.loadWeightsToGPU(allocator, loaded);
         errdefer weights_trait.freeWeights(allocator, weight_handles);
-        errdefer for (weight_handles.layers) |*layer| {
-            metal_executor.block.TransformerBlock.releaseLayerRuntimeBindings(allocator, layer);
-        };
 
         // Validate compiled layer plans once at backend init so forward path
         // stays focused on hot execution.
         for (weight_handles.layers, 0..) |*layer, layer_idx| {
             if (layer.compiled_plan == null) continue;
             try metal_executor.block.TransformerBlock.validateCompiledLayerProgram(layer, layer_idx);
-            try metal_executor.block.TransformerBlock.precomputeLayerRuntimeBindings(
-                allocator,
-                layer,
-                loaded.config,
-                weight_handles,
-            );
         }
 
         const layer_count: usize = @intCast(loaded.config.n_layers);
@@ -719,14 +645,8 @@ pub const MetalBackend = struct {
             }
             slot.state_binding.clear();
         }
-        if (self.slot0_bootstrap_bindings.handles.len > 0) {
-            self.slot0_bootstrap_bindings.deinit(self.allocator);
-        }
         self.allocator.free(self.slot_logits_buffer);
         self.allocator.free(self.extra_slots);
-        for (self.weights.layers) |*layer| {
-            metal_executor.block.TransformerBlock.releaseLayerRuntimeBindings(self.allocator, layer);
-        }
         weights_trait.freeWeights(self.allocator, self.weights);
         self.* = undefined;
     }

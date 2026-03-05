@@ -37,18 +37,11 @@ const LayerProgramWeightBindingKey = WeightHandles.LayerProgramWeightBindingKey;
 
 pub const TransformerBlock = struct {
     const MaxLayerProgramStateBindings = 256;
-    const StateRef = struct {
-        ptr: *anyopaque,
-    };
+    var missing_optional_array_handle: mlx_graph.ArrayHandle = null;
 
     const AttentionRuntimeBinding = union(enum) {
         mla: mla_kernel.MLAttention,
         multihead: attention_kernel.MultiHeadAttention,
-    };
-
-    const FfnRuntimeBinding = union(enum) {
-        moe: moe_kernel.MoEFFN,
-        dense: ffn_kernel.SwiGLU,
     };
 
     const LayerProgramStateBinding = struct {
@@ -154,8 +147,8 @@ pub const TransformerBlock = struct {
         table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = layerProgramNormRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = layerProgramAttentionRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.shortconv)] = layerProgramShortConvRuntimeAdapter;
-        table[@intFromEnum(opcode_map.Opcode.swiglu)] = layerProgramFfnRuntimeAdapter;
-        table[@intFromEnum(opcode_map.Opcode.moe)] = layerProgramFfnRuntimeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.swiglu)] = layerProgramSwiGluRuntimeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.moe)] = layerProgramMoeRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.mamba_mixer)] = layerProgramMambaRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.residual_add)] = layerProgramResidualAddRuntimeAdapter;
 
@@ -287,6 +280,12 @@ pub const TransformerBlock = struct {
         return @ptrCast(@alignCast(handle.ptr));
     }
 
+    fn optionalArrayWeightFromHandle(handle: runtime_contract.TensorHandle) ?mlx_graph.ArrayHandle {
+        const value = arrayWeightFromHandle(handle).*;
+        if (value == null) return null;
+        return value;
+    }
+
     fn resolveLayerProgramNormWeightPtr(ctx: *LayerProgramExecutionContext) !*anyopaque {
         const idx = ctx.norm_index.*;
         const lw = ctx.layer_weights;
@@ -337,6 +336,34 @@ pub const TransformerBlock = struct {
             if (lw.o_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
             return error.MissingWeight;
         }
+        if (key == .attention_q_norm) {
+            if (lw.q_norm) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
+        if (key == .attention_k_norm) {
+            if (lw.k_norm) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
+        if (key == .attention_q_bias) {
+            if (lw.q_bias) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
+        if (key == .attention_k_bias) {
+            if (lw.k_bias) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
+        if (key == .attention_v_bias) {
+            if (lw.v_bias) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
+        if (key == .attention_o_bias) {
+            if (lw.o_bias) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
+        if (key == .attention_attn_sinks) {
+            if (lw.attn_sinks) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
         return error.InvalidWeightBindingName;
     }
 
@@ -358,6 +385,10 @@ pub const TransformerBlock = struct {
             if (lw.shortconv_out_proj) |*weight| return @ptrCast(@constCast(weight));
             if (lw.shortconv_out_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
             return error.MissingWeight;
+        }
+        if (key == .shortconv_conv_bias) {
+            if (lw.shortconv_conv_bias) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
         }
         return error.InvalidWeightBindingName;
     }
@@ -383,6 +414,9 @@ pub const TransformerBlock = struct {
             if (lw.w2_bf16) |*weight| return @ptrCast(@constCast(weight));
             return error.MissingWeight;
         }
+        if (key == .swiglu_w1_bias or key == .swiglu_w2_bias) {
+            return @ptrCast(&missing_optional_array_handle);
+        }
         return error.InvalidWeightBindingName;
     }
 
@@ -390,9 +424,23 @@ pub const TransformerBlock = struct {
         ctx: *LayerProgramExecutionContext,
         key: LayerProgramWeightBindingKey,
     ) !*anyopaque {
-        if (key != .moe_router) return error.InvalidWeightBindingName;
         const moe = ctx.layer_weights.moe orelse return error.MissingField;
-        return @ptrCast(@constCast(&moe.router_w));
+        return switch (key) {
+            .moe_router => @ptrCast(@constCast(&moe.router_w)),
+            .moe_gate_proj => @ptrCast(@constCast(&moe.gate_w)),
+            .moe_up_proj => @ptrCast(@constCast(&moe.up_w)),
+            .moe_down_proj => @ptrCast(@constCast(&moe.down_w)),
+            .moe_router_bias => if (moe.router_bias) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
+            .moe_gate_scales => @ptrCast(@constCast(&moe.gate_s)),
+            .moe_up_scales => @ptrCast(@constCast(&moe.up_s)),
+            .moe_down_scales => @ptrCast(@constCast(&moe.down_s)),
+            .moe_gate_bias => if (moe.gate_bias) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
+            .moe_up_bias => if (moe.up_bias) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
+            .moe_down_bias => if (moe.down_bias) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
+            .moe_router_scales => if (moe.router_s) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
+            .moe_router_quant_bias => if (moe.router_b) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
+            else => error.InvalidWeightBindingName,
+        };
     }
 
     fn resolveLayerProgramMambaWeightPtr(
@@ -410,6 +458,42 @@ pub const TransformerBlock = struct {
             if (lw.mamba_out_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
             return error.MissingWeight;
         }
+        if (key == .mamba_conv_weight) {
+            if (lw.mamba_conv_weight) |*weight| return @ptrCast(@constCast(weight));
+            return error.MissingWeight;
+        }
+        if (key == .mamba_a_log) {
+            if (lw.mamba_a_log) |*weight| return @ptrCast(@constCast(weight));
+            return error.MissingWeight;
+        }
+        if (key == .mamba_d_skip) {
+            if (lw.mamba_d_skip) |*weight| return @ptrCast(@constCast(weight));
+            return error.MissingWeight;
+        }
+        if (key == .mamba_conv_bias) {
+            if (lw.mamba_conv_bias) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
+        if (key == .mamba_dt_bias) {
+            if (lw.mamba_dt_bias) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
+        if (key == .mamba_norm_weight) {
+            if (lw.mamba_norm_weight) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
+        if (key == .mamba_ln1_weight) return @ptrCast(@constCast(&lw.ln1_weight));
+        if (key == .mamba_ln2_weight) return @ptrCast(@constCast(&lw.ln2_weight));
+        if (key == .mamba_gate_up) {
+            if (lw.mamba_gate_up) |*weight| return @ptrCast(@constCast(weight));
+            if (lw.mamba_gate_up_bf16) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
+        if (key == .mamba_down_proj) {
+            if (lw.mamba_down_proj) |*weight| return @ptrCast(@constCast(weight));
+            if (lw.mamba_down_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
+            return @ptrCast(&missing_optional_array_handle);
+        }
         return error.InvalidWeightBindingName;
     }
 
@@ -420,11 +504,11 @@ pub const TransformerBlock = struct {
         if (key == .invalid) return error.InvalidWeightBindingName;
         return switch (key) {
             .norm_weight => resolveLayerProgramNormWeightPtr(ctx),
-            .attention_q_proj, .attention_k_proj, .attention_v_proj, .attention_o_proj, .mla_weights => resolveLayerProgramAttentionWeightPtr(ctx, key),
-            .swiglu_w1, .swiglu_w3, .swiglu_w2 => resolveLayerProgramSwiGluWeightPtr(ctx, key),
-            .moe_router => resolveLayerProgramMoeWeightPtr(ctx, key),
-            .mamba_in_proj, .mamba_out_proj => resolveLayerProgramMambaWeightPtr(ctx, key),
-            .shortconv_in_proj, .shortconv_conv_weight, .shortconv_out_proj => resolveLayerProgramShortconvWeightPtr(ctx, key),
+            .attention_q_proj, .attention_k_proj, .attention_v_proj, .attention_o_proj, .attention_q_norm, .attention_k_norm, .attention_q_bias, .attention_k_bias, .attention_v_bias, .attention_o_bias, .attention_attn_sinks, .mla_weights => resolveLayerProgramAttentionWeightPtr(ctx, key),
+            .swiglu_w1, .swiglu_w3, .swiglu_w2, .swiglu_w1_bias, .swiglu_w2_bias => resolveLayerProgramSwiGluWeightPtr(ctx, key),
+            .moe_router, .moe_gate_proj, .moe_up_proj, .moe_down_proj, .moe_router_bias, .moe_gate_scales, .moe_up_scales, .moe_down_scales, .moe_gate_bias, .moe_up_bias, .moe_down_bias, .moe_router_scales, .moe_router_quant_bias => resolveLayerProgramMoeWeightPtr(ctx, key),
+            .mamba_in_proj, .mamba_conv_weight, .mamba_a_log, .mamba_d_skip, .mamba_out_proj, .mamba_conv_bias, .mamba_dt_bias, .mamba_norm_weight, .mamba_ln1_weight, .mamba_ln2_weight, .mamba_gate_up, .mamba_down_proj => resolveLayerProgramMambaWeightPtr(ctx, key),
+            .shortconv_in_proj, .shortconv_conv_weight, .shortconv_out_proj, .shortconv_conv_bias => resolveLayerProgramShortconvWeightPtr(ctx, key),
             .invalid => error.InvalidWeightBindingName,
         };
     }
@@ -522,26 +606,6 @@ pub const TransformerBlock = struct {
             .registers = handle_storage[0..handle_count],
             .views = view_storage[0..handle_count],
         };
-    }
-
-    pub fn precomputeLayerRuntimeBindings(
-        allocator: std.mem.Allocator,
-        lw: *LayerWeights,
-        config: ModelConfig,
-        weight_handles: *const WeightHandles,
-    ) !void {
-        _ = allocator;
-        _ = config;
-        _ = weight_handles;
-        lw.precomputed_runtime_bindings = null;
-    }
-
-    pub fn releaseLayerRuntimeBindings(
-        allocator: std.mem.Allocator,
-        lw: *LayerWeights,
-    ) void {
-        _ = allocator;
-        lw.precomputed_runtime_bindings = null;
     }
 
     fn residualScale(
@@ -665,38 +729,38 @@ pub const TransformerBlock = struct {
         return m_out;
     }
 
-    fn runFfnKernel(
+    fn runSwiGluKernel(
         input: mlx_graph.ArrayHandle,
-        binding: FfnRuntimeBinding,
+        swiglu: ffn_kernel.SwiGLU,
     ) !mlx_graph.ArrayHandle {
-        return switch (binding) {
-            .moe => |ffn_moe| blk: {
-                var ffn = ffn_moe;
-                var moe_scratch = moe_kernel.MoEScratch{};
-                var moe_matmul_scratch = moe_kernel.MatmulScratch{};
-                var moe_out: mlx_graph.ArrayHandle = undefined;
-                try ffn.forward(
-                    input,
-                    &moe_out,
-                    &moe_scratch,
-                    &moe_matmul_scratch,
-                );
-                break :blk moe_out;
-            },
-            .dense => |swiglu| blk: {
-                var ffn = swiglu;
-                var ffn_scratch = ffn_kernel.FfnScratch{};
-                var ffn_matmul_scratch = ffn_kernel.MatmulScratch{};
-                var ffn_result: mlx_graph.ArrayHandle = undefined;
-                try ffn.forward(
-                    input,
-                    &ffn_result,
-                    &ffn_scratch,
-                    &ffn_matmul_scratch,
-                );
-                break :blk ffn_result;
-            },
-        };
+        var ffn = swiglu;
+        var ffn_scratch = ffn_kernel.FfnScratch{};
+        var ffn_matmul_scratch = ffn_kernel.MatmulScratch{};
+        var ffn_result: mlx_graph.ArrayHandle = undefined;
+        try ffn.forward(
+            input,
+            &ffn_result,
+            &ffn_scratch,
+            &ffn_matmul_scratch,
+        );
+        return ffn_result;
+    }
+
+    fn runMoeKernel(
+        input: mlx_graph.ArrayHandle,
+        moe_binding: moe_kernel.MoEFFN,
+    ) !mlx_graph.ArrayHandle {
+        var ffn = moe_binding;
+        var moe_scratch = moe_kernel.MoEScratch{};
+        var moe_matmul_scratch = moe_kernel.MatmulScratch{};
+        var moe_out: mlx_graph.ArrayHandle = undefined;
+        try ffn.forward(
+            input,
+            &moe_out,
+            &moe_scratch,
+            &moe_matmul_scratch,
+        );
+        return moe_out;
     }
 
     fn layerProgramNormAdapter(
@@ -808,6 +872,13 @@ pub const TransformerBlock = struct {
                     multihead.v_proj_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
                     multihead.o_proj_bf16 = arrayWeightFromHandle(weight_handles[3]).*;
                 }
+                multihead.q_norm = optionalArrayWeightFromHandle(weight_handles[4]);
+                multihead.k_norm = optionalArrayWeightFromHandle(weight_handles[5]);
+                multihead.q_bias = optionalArrayWeightFromHandle(weight_handles[6]);
+                multihead.k_bias = optionalArrayWeightFromHandle(weight_handles[7]);
+                multihead.v_bias = optionalArrayWeightFromHandle(weight_handles[8]);
+                multihead.o_bias = optionalArrayWeightFromHandle(weight_handles[9]);
+                multihead.attn_sinks = optionalArrayWeightFromHandle(weight_handles[10]);
             },
             .mla => {},
         }
@@ -857,11 +928,12 @@ pub const TransformerBlock = struct {
             shortconv_binding.out_proj_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
         }
         shortconv_binding.conv_weight = arrayWeightFromHandle(weight_handles[1]).*;
+        shortconv_binding.conv_bias = optionalArrayWeightFromHandle(weight_handles[3]);
         const output = try runShortConvKernel(input, shortconv_binding, state.layer_idx, shortconv_cache);
         arraySlotFromHandle(io.outputs[0]).* = output;
     }
 
-    fn layerProgramFfnAdapter(
+    fn layerProgramSwiGluAdapter(
         state: *LayerProgramExecutionContext,
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
@@ -874,40 +946,61 @@ pub const TransformerBlock = struct {
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
         const lw = state.layer_weights;
-        var ffn_binding: FfnRuntimeBinding = blk: {
-            if (lw.ffnStorageKind() == .moe) {
-                break :blk .{ .moe = .{ .weights = lw.moe orelse return error.MissingField } };
-            }
-            break :blk .{
-                .dense = .{
-                    .use_gelu = state.use_gelu,
-                    .w1 = lw.w1,
-                    .w2 = lw.w2,
-                    .w3 = lw.w3,
-                    .w1_bf16 = lw.w1_bf16,
-                    .w2_bf16 = lw.w2_bf16,
-                    .w3_bf16 = lw.w3_bf16,
-                },
-            };
+        var swiglu_binding = ffn_kernel.SwiGLU{
+            .use_gelu = state.use_gelu,
+            .w1 = lw.w1,
+            .w2 = lw.w2,
+            .w3 = lw.w3,
+            .w1_bf16 = lw.w1_bf16,
+            .w2_bf16 = lw.w2_bf16,
+            .w3_bf16 = lw.w3_bf16,
         };
-        switch (ffn_binding) {
-            .dense => |*dense| {
-                if (dense.w1 != null) {
-                    dense.w1 = quantizedWeightFromHandle(weight_handles[0]).*;
-                    dense.w3 = quantizedWeightFromHandle(weight_handles[1]).*;
-                    dense.w2 = quantizedWeightFromHandle(weight_handles[2]).*;
-                } else {
-                    dense.w1_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
-                    dense.w3_bf16 = arrayWeightFromHandle(weight_handles[1]).*;
-                    dense.w2_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
-                }
-            },
-            .moe => |*moe| {
-                _ = moe;
-                _ = arrayWeightFromHandle(weight_handles[0]).*;
-            },
+        if (swiglu_binding.w1 != null) {
+            swiglu_binding.w1 = quantizedWeightFromHandle(weight_handles[0]).*;
+            swiglu_binding.w3 = quantizedWeightFromHandle(weight_handles[1]).*;
+            swiglu_binding.w2 = quantizedWeightFromHandle(weight_handles[2]).*;
+        } else {
+            swiglu_binding.w1_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
+            swiglu_binding.w3_bf16 = arrayWeightFromHandle(weight_handles[1]).*;
+            swiglu_binding.w2_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
         }
-        const output = try runFfnKernel(input, ffn_binding);
+        const output = try runSwiGluKernel(input, swiglu_binding);
+        arraySlotFromHandle(io.outputs[0]).* = output;
+    }
+
+    fn layerProgramMoeAdapter(
+        state: *LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+    ) !void {
+        const io = try instructionIoSlices(insn, registers);
+        if (comptime std.debug.runtime_safety) {
+            if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        }
+        const input = arraySlotFromHandle(io.inputs[0]).*;
+        const weight_handles = try instructionWeightSlice(insn, registers);
+        if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
+        const moe = state.layer_weights.moe orelse return error.MissingField;
+        var runtime_moe = WeightHandles.MoEWeights{
+            .router_w = arrayWeightFromHandle(weight_handles[0]).*,
+            .router_s = optionalArrayWeightFromHandle(weight_handles[11]),
+            .router_b = optionalArrayWeightFromHandle(weight_handles[12]),
+            .router_bias = optionalArrayWeightFromHandle(weight_handles[4]),
+            .gate_w = arrayWeightFromHandle(weight_handles[1]).*,
+            .gate_s = arrayWeightFromHandle(weight_handles[5]).*,
+            .up_w = arrayWeightFromHandle(weight_handles[2]).*,
+            .up_s = arrayWeightFromHandle(weight_handles[6]).*,
+            .down_w = arrayWeightFromHandle(weight_handles[3]).*,
+            .down_s = arrayWeightFromHandle(weight_handles[7]).*,
+            .gate_bias = optionalArrayWeightFromHandle(weight_handles[8]),
+            .up_bias = optionalArrayWeightFromHandle(weight_handles[9]),
+            .down_bias = optionalArrayWeightFromHandle(weight_handles[10]),
+            .router_group_size = moe.router_group_size,
+            .expert_group_size = moe.expert_group_size,
+            .num_experts = moe.num_experts,
+            .experts_per_token = moe.experts_per_token,
+        };
+        const output = try runMoeKernel(input, .{ .weights = &runtime_moe });
         arraySlotFromHandle(io.outputs[0]).* = output;
     }
 
@@ -957,10 +1050,28 @@ pub const TransformerBlock = struct {
         };
         if (mamba_binding.in_proj != null) {
             mamba_binding.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
-            mamba_binding.out_proj = quantizedWeightFromHandle(weight_handles[1]).*;
+            mamba_binding.out_proj = quantizedWeightFromHandle(weight_handles[4]).*;
         } else {
             mamba_binding.in_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
-            mamba_binding.out_proj_bf16 = arrayWeightFromHandle(weight_handles[1]).*;
+            mamba_binding.out_proj_bf16 = arrayWeightFromHandle(weight_handles[4]).*;
+        }
+        mamba_binding.conv_weight = arrayWeightFromHandle(weight_handles[1]).*;
+        mamba_binding.a_log = arrayWeightFromHandle(weight_handles[2]).*;
+        mamba_binding.d_skip = arrayWeightFromHandle(weight_handles[3]).*;
+        mamba_binding.ln1_weight = arrayWeightFromHandle(weight_handles[8]).*;
+        mamba_binding.ln2_weight = arrayWeightFromHandle(weight_handles[9]).*;
+        mamba_binding.conv_bias = optionalArrayWeightFromHandle(weight_handles[5]);
+        mamba_binding.dt_bias = optionalArrayWeightFromHandle(weight_handles[6]);
+        mamba_binding.norm_weight = optionalArrayWeightFromHandle(weight_handles[7]);
+        if (mamba_binding.gate_up != null) {
+            mamba_binding.gate_up = quantizedWeightFromHandle(weight_handles[10]).*;
+        } else {
+            mamba_binding.gate_up_bf16 = optionalArrayWeightFromHandle(weight_handles[10]);
+        }
+        if (mamba_binding.down_proj != null) {
+            mamba_binding.down_proj = quantizedWeightFromHandle(weight_handles[11]).*;
+        } else {
+            mamba_binding.down_proj_bf16 = optionalArrayWeightFromHandle(weight_handles[11]);
         }
         const output = try runMambaKernel(
             input,
@@ -1053,7 +1164,7 @@ pub const TransformerBlock = struct {
         );
     }
 
-    fn layerProgramFfnRuntimeAdapter(
+    fn layerProgramSwiGluRuntimeAdapter(
         ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
@@ -1062,7 +1173,23 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
-        try layerProgramFfnAdapter(
+        try layerProgramSwiGluAdapter(
+            state,
+            insn,
+            registers,
+        );
+    }
+
+    fn layerProgramMoeRuntimeAdapter(
+        ctx: *runtime_contract.ExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        _: []const runtime_contract.TensorViewDesc,
+        _: []runtime_contract.StateBlockHandle,
+        _: []const runtime_contract.ParamBlock,
+    ) !void {
+        const state = try layerProgramExecutionState(ctx);
+        try layerProgramMoeAdapter(
             state,
             insn,
             registers,
