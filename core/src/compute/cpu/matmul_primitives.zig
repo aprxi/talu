@@ -136,45 +136,78 @@ pub fn matmulF32(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Mat
     };
     var context = MatmulF32Ctx{ .a = a_data, .b = b_data, .c = c_data, .m_rows = m_rows, .n_cols = n_cols, .k_dim = k_dim };
 
+    // Outer product algorithm for M > 1: iterates over K in the inner loop,
+    // reading B rows sequentially instead of gathering B columns with stride N.
+    // ROW_TILE=4 register blocking: 4 output rows share each B vector load.
+    const ROW_TILE = 4;
+    const VEC = simd.f32_vec_len;
+    const VecF32 = @Vector(VEC, f32);
+
     const row_tiles_task = struct {
         fn runRowTiles(start: usize, end: usize, task_ctx: *MatmulF32Ctx) void {
-            const k_len = task_ctx.k_dim;
-            const n_len = task_ctx.n_cols;
+            const k = task_ctx.k_dim;
+            const n = task_ctx.n_cols;
+            const vec_end = n - (n % VEC);
 
-            const vec_len = simd.f32_vec_len;
-            const accum_chunks = 4;
-            for (start..end) |row_idx| {
-                const a_row = task_ctx.a[row_idx * k_len ..][0..k_len];
-                const out_row = task_ctx.c[row_idx * n_len ..][0..n_len];
+            var row = start;
 
-                for (0..n_len) |col_idx| {
-                    var acc: [accum_chunks]@Vector(vec_len, f32) = .{@as(@Vector(vec_len, f32), @splat(0))} ** accum_chunks;
-                    var k_idx: usize = 0;
+            // ROW_TILE rows at a time: 4 accumulators share each B load
+            while (row + ROW_TILE <= end) : (row += ROW_TILE) {
+                // Process VEC columns at a time, keeping C tile in registers
+                var col: usize = 0;
+                while (col < vec_end) : (col += VEC) {
+                    var acc: [ROW_TILE]VecF32 = .{@as(VecF32, @splat(0))} ** ROW_TILE;
 
-                    while (k_idx + accum_chunks * vec_len - 1 < k_len) : (k_idx += accum_chunks * vec_len) {
-                        inline for (0..accum_chunks) |u| {
-                            const off = k_idx + u * vec_len;
-                            const a_vec: @Vector(vec_len, f32) = a_row[off..][0..vec_len].*;
-                            var b_vec: @Vector(vec_len, f32) = undefined;
-                            inline for (0..vec_len) |e| b_vec[e] = task_ctx.b[(off + e) * n_len + col_idx];
-                            acc[u] = @mulAdd(@Vector(vec_len, f32), a_vec, b_vec, acc[u]);
+                    for (0..k) |ki| {
+                        const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
+                        inline for (0..ROW_TILE) |r| {
+                            const a_val: VecF32 = @splat(task_ctx.a[(row + r) * k + ki]);
+                            acc[r] = @mulAdd(VecF32, a_val, b_vec, acc[r]);
                         }
                     }
 
-                    var total: @Vector(vec_len, f32) = @splat(0);
-                    inline for (0..accum_chunks) |u| total += acc[u];
-                    var sum = @reduce(.Add, total);
-
-                    while (k_idx < k_len) : (k_idx += 1) {
-                        sum += a_row[k_idx] * task_ctx.b[k_idx * n_len + col_idx];
+                    inline for (0..ROW_TILE) |r| {
+                        task_ctx.c[(row + r) * n + col ..][0..VEC].* = acc[r];
                     }
-                    out_row[col_idx] = sum;
+                }
+
+                // Scalar tail
+                if (col < n) {
+                    inline for (0..ROW_TILE) |r| {
+                        for (col..n) |c_idx| {
+                            var sum: f32 = 0;
+                            for (0..k) |ki| {
+                                sum = @mulAdd(f32, task_ctx.a[(row + r) * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                            }
+                            task_ctx.c[(row + r) * n + c_idx] = sum;
+                        }
+                    }
+                }
+            }
+
+            // Remaining rows (< ROW_TILE)
+            while (row < end) : (row += 1) {
+                var col: usize = 0;
+                while (col < vec_end) : (col += VEC) {
+                    var acc: VecF32 = @as(VecF32, @splat(0));
+                    for (0..k) |ki| {
+                        const a_val: VecF32 = @splat(task_ctx.a[row * k + ki]);
+                        const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
+                        acc = @mulAdd(VecF32, a_val, b_vec, acc);
+                    }
+                    task_ctx.c[row * n + col ..][0..VEC].* = acc;
+                }
+                for (col..n) |c_idx| {
+                    var sum: f32 = 0;
+                    for (0..k) |ki| {
+                        sum = @mulAdd(f32, task_ctx.a[row * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                    }
+                    task_ctx.c[row * n + c_idx] = sum;
                 }
             }
         }
     }.runRowTiles;
 
-    // Tiled parallelization for better load balancing
     if (m_rows >= TILE_THRESHOLD) {
         parallel.global().parallelFor(m_rows, row_tiles_task, &context);
     } else if (m_rows == 1) {
@@ -205,63 +238,11 @@ pub fn matmulF32(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Mat
         }.runDecodeCols;
         parallel.global().parallelFor(n_cols, decode_task, &context);
     } else {
-        // Small batch: tile across rows AND columns
-        const tiles_per_row = (n_cols + COL_TILE_SIZE - 1) / COL_TILE_SIZE;
-        const total_tiles = m_rows * tiles_per_row;
-
-        const MatmulF32TileCtx = struct {
-            a: []const f32,
-            b: []const f32,
-            c: []f32,
-            m_rows: usize,
-            n_cols: usize,
-            k_dim: usize,
-            tiles_per_row: usize,
-        };
-        var tiled_ctx = MatmulF32TileCtx{
-            .a = a_data,
-            .b = b_data,
-            .c = c_data,
-            .m_rows = m_rows,
-            .n_cols = n_cols,
-            .k_dim = k_dim,
-            .tiles_per_row = tiles_per_row,
-        };
-
-        const tiled_task = struct {
-            fn runRowColTiles(start: usize, end: usize, task_ctx: *MatmulF32TileCtx) void {
-                const k_len = task_ctx.k_dim;
-                const n_len = task_ctx.n_cols;
-                const VEC = simd.f32_vec_len;
-
-                for (start..end) |tile_idx| {
-                    const row = tile_idx / task_ctx.tiles_per_row;
-                    const col_tile = tile_idx % task_ctx.tiles_per_row;
-                    const col_start = col_tile * COL_TILE_SIZE;
-                    const col_end = @min(col_start + COL_TILE_SIZE, n_len);
-
-                    const a_row = task_ctx.a[row * k_len ..][0..k_len];
-                    const out_row = task_ctx.c[row * n_len ..][0..n_len];
-
-                    for (col_start..col_end) |col_idx| {
-                        var acc: @Vector(VEC, f32) = @splat(0);
-                        var k_idx: usize = 0;
-                        while (k_idx + VEC - 1 < k_len) : (k_idx += VEC) {
-                            const a_vec: @Vector(VEC, f32) = a_row[k_idx..][0..VEC].*;
-                            var b_vec: @Vector(VEC, f32) = undefined;
-                            inline for (0..VEC) |lane| b_vec[lane] = task_ctx.b[(k_idx + lane) * n_len + col_idx];
-                            acc = @mulAdd(@Vector(VEC, f32), a_vec, b_vec, acc);
-                        }
-                        var sum = @reduce(.Add, acc);
-                        while (k_idx < k_len) : (k_idx += 1) {
-                            sum += a_row[k_idx] * task_ctx.b[k_idx * n_len + col_idx];
-                        }
-                        out_row[col_idx] = sum;
-                    }
-                }
-            }
-        }.runRowColTiles;
-        parallel.global().parallelFor(total_tiles, tiled_task, &tiled_ctx);
+        // Small batch (1 < M < TILE_THRESHOLD): parallelize over rows with
+        // the same outer product algorithm as the large batch path.
+        // Few rows means little parallelism, but each row still benefits
+        // from sequential B access.
+        row_tiles_task(0, m_rows, &context);
     }
 }
 
