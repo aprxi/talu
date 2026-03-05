@@ -500,7 +500,7 @@ comptime {
     _ = &capi.talu_agent_bus_broadcast;
     _ = &capi.talu_agent_bus_pending;
 
-    // Training API
+    // Training API (LoRA)
     _ = &capi.talu_train_create;
     _ = &capi.talu_train_destroy;
     _ = &capi.talu_train_load_model;
@@ -509,4 +509,15 @@ comptime {
     _ = &capi.talu_train_run;
     _ = &capi.talu_train_save_checkpoint;
     _ = &capi.talu_train_get_info;
+
+    // Training API (full / from-scratch)
+    _ = &capi.talu_train_full_create;
+    _ = &capi.talu_train_full_destroy;
+    _ = &capi.talu_train_full_init_model;
+    _ = &capi.talu_train_full_configure;
+    _ = &capi.talu_train_full_set_data;
+    _ = &capi.talu_train_full_load_data;
+    _ = &capi.talu_train_full_step;
+    _ = &capi.talu_train_full_run;
+    _ = &capi.talu_train_full_get_info;
 }

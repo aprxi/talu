@@ -803,6 +803,7 @@ fn generatePythonBindings(
         \\    Structure,
         \\    c_bool,
         \\    c_char_p,
+        \\    c_double,
         \\    c_float,
         \\    c_int32,
         \\    c_int64,

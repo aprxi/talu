@@ -1521,7 +1521,8 @@ pub const LocalEngine = struct {
             const requested_size = std.math.cast(usize, descriptor.size_bytes) orelse {
                 return error.InvalidStateDescriptorBinding;
             };
-            const size_bytes = @max(requested_size, @sizeOf(runtime_contract.StatePointerPayload));
+            if (requested_size == 0) return error.InvalidStateDescriptorBinding;
+            const size_bytes = requested_size;
             const align_bytes: u16 = if (descriptor.align_bytes == 0) 64 else descriptor.align_bytes;
 
             const bytes = try allocateTemporaryStateBytes(allocator, align_bytes, size_bytes);

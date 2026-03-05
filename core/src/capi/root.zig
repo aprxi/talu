@@ -57,6 +57,7 @@ pub const treesitter = @import("code.zig");
 pub const router = @import("router.zig");
 pub const agent = @import("agent/root.zig");
 pub const train = @import("train.zig");
+pub const train_full = @import("train_full.zig");
 
 // Re-export Chat/session lifecycle APIs.
 pub const talu_chat_set_ttl_ts = responses.talu_chat_set_ttl_ts;
@@ -822,6 +823,21 @@ pub const CTrainingConfig = train.CTrainingConfig;
 pub const CStepMetrics = train.CStepMetrics;
 pub const CTrainingInfo = train.CTrainingInfo;
 pub const CStepCallback = train.CStepCallback;
+
+// Re-export Full Training C API functions (from-scratch training sessions).
+pub const talu_train_full_create = train_full.talu_train_full_create;
+pub const talu_train_full_destroy = train_full.talu_train_full_destroy;
+pub const talu_train_full_init_model = train_full.talu_train_full_init_model;
+pub const talu_train_full_configure = train_full.talu_train_full_configure;
+pub const talu_train_full_set_data = train_full.talu_train_full_set_data;
+pub const talu_train_full_load_data = train_full.talu_train_full_load_data;
+pub const talu_train_full_step = train_full.talu_train_full_step;
+pub const talu_train_full_run = train_full.talu_train_full_run;
+pub const talu_train_full_get_info = train_full.talu_train_full_get_info;
+pub const TaluTrainFullSession = train_full.TaluTrainFullSession;
+pub const CTransformerConfig = train_full.CTransformerConfig;
+pub const CFullSessionConfig = train_full.CFullSessionConfig;
+pub const CFullSessionInfo = train_full.CFullSessionInfo;
 
 // ABI validation - comptime assertions ensure struct sizes match expected values.
 // When struct layouts change, update abi.zig and bindings/python/talu/_abi.py.

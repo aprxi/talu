@@ -1,0 +1,690 @@
+//! Backward pass orchestration for decoder-only transformers.
+//!
+//! Reverses the forward pass defined in forward.zig, calling existing backward
+//! kernels from backward/ in the correct order. All gradients are accumulated
+//! into the ModelWeights gradient buffers (which must be zeroed before calling).
+//!
+//! Order:
+//!   1. Cross-entropy backward → grad_logits
+//!   2. LM head backward → grad_hidden, grad_lm_head
+//!   3. Final RMSNorm backward → grad_hidden, grad_final_norm
+//!   4. Per-layer (reverse):
+//!      a. FFN: down_proj → swiglu → gate/up_proj → ffn_norm → residual add
+//!      b. Attn: o_proj → attention (per-position) → rope → q/k/v_proj → attn_norm → residual add
+//!   5. Embedding backward → grad_token_embedding
+
+const std = @import("std");
+const compute = @import("../compute/root.zig");
+const model_config = @import("model_config.zig");
+const model_weights_mod = @import("model_weights.zig");
+const activations_mod = @import("activations.zig");
+
+// Backward kernels
+const cross_entropy = @import("backward/cross_entropy.zig");
+const linear = @import("backward/linear.zig");
+const rmsnorm_bw = @import("backward/rmsnorm.zig");
+const activation_bw = @import("backward/activation.zig");
+const rope_bw = @import("backward/rope.zig");
+const embedding_bw = @import("backward/embedding.zig");
+const attention_bw = @import("backward/attention.zig");
+
+const MatmulScratch = compute.cpu.linalg.MatmulScratch;
+const TransformerConfig = model_config.TransformerConfig;
+const ModelWeights = model_weights_mod.ModelWeights;
+const LayerWeights = model_weights_mod.LayerWeights;
+const ActivationCache = activations_mod.ActivationCache;
+const LayerActivations = activations_mod.LayerActivations;
+
+/// Run the full backward pass, computing gradients for all model weights.
+///
+/// Assumes forward() has already been called and cache contains saved activations.
+/// Gradients are accumulated into weights.grad_* buffers (must be zeroed beforehand).
+///
+/// tokens:  [batch_size * seq_len] — input token IDs (for embedding backward)
+/// targets: [batch_size * seq_len] — target token IDs (for cross-entropy backward)
+pub fn backward(
+    weights: *ModelWeights,
+    cache: *ActivationCache,
+    tokens: []const u32,
+    targets: []const u32,
+    scratch: *MatmulScratch,
+) void {
+    const config = weights.config;
+    const b: usize = cache.batch_size;
+    const s: usize = config.seq_len;
+    const d: usize = config.d_model;
+    const v: usize = config.vocab_size;
+    const bs = b * s;
+
+    // --- 1. Cross-entropy backward → grad_logits (stored in cache.scratch) ---
+    // We reuse cache.logits as grad_logits since we no longer need the logits.
+    // crossEntropyBackward overwrites grad_logits with softmax(logits) - one_hot(target).
+    // But we need logits as input too, so we must use a separate buffer.
+    // Use cache.scratch[0..bs*v] for grad_logits.
+    const grad_logits = cache.scratch[0 .. bs * v];
+    cross_entropy.crossEntropyBackward(
+        grad_logits,
+        cache.logits,
+        targets,
+        bs,
+        v,
+    );
+
+    // --- 2. LM head backward ---
+    // Forward was: logits = final_normed @ lm_head^T
+    // grad_lm_head += grad_logits^T @ final_normed  (accumulated)
+    // grad_hidden = grad_logits @ lm_head            (overwritten)
+    linear.gradWeight(
+        weights.grad_lm_head.asSliceMut(),
+        grad_logits,
+        cache.final_normed,
+        bs,
+        v,
+        d,
+        scratch,
+    );
+    linear.gradInput(
+        cache.grad_hidden,
+        grad_logits,
+        weights.lm_head.asSlice(f32),
+        bs,
+        v,
+        d,
+        scratch,
+    );
+
+    // --- 3. Final RMSNorm backward ---
+    // Forward was: final_normed = rmsnorm(hidden, final_norm_weight)
+    // grad_hidden is overwritten, grad_final_norm is accumulated.
+    // Input to final rmsnorm was cache.hidden (the post-layer hidden state).
+    // Copy grad_hidden to scratch to avoid aliasing grad_input/grad_output
+    // (the kernel reads grad_output after writing grad_input on the same row).
+    const grad_output_copy = cache.scratch[0 .. bs * d];
+    @memcpy(grad_output_copy, cache.grad_hidden[0 .. bs * d]);
+    rmsnorm_bw.rmsnormBackward(
+        cache.grad_hidden,
+        weights.grad_final_norm.asSliceMut(),
+        grad_output_copy,
+        cache.hidden, // input to rmsnorm (saved as final hidden state)
+        cache.final_inv_rms,
+        weights.final_norm.asSlice(f32),
+        bs,
+        d,
+        0.0, // weight_offset
+    );
+
+    // --- 4. Per-layer backward (reverse order) ---
+    const num_layers = config.num_layers;
+    var layer_idx: usize = num_layers;
+    while (layer_idx > 0) {
+        layer_idx -= 1;
+        layerBackward(
+            cache.grad_hidden,
+            &cache.layers[layer_idx],
+            &weights.layers[layer_idx],
+            config,
+            bs,
+            cache.scratch,
+            scratch,
+        );
+    }
+
+    // --- 5. Embedding backward ---
+    // Forward was: hidden[i] = embedding[tokens[i]]
+    // grad_token_embedding[token] += grad_hidden[i] (accumulated)
+    embedding_bw.embeddingBackward(
+        weights.grad_token_embedding.asSliceMut(),
+        cache.grad_hidden,
+        tokens,
+        bs,
+        d,
+    );
+}
+
+/// Backward pass for a single transformer layer.
+///
+/// grad_hidden: [bs * d] — gradient flowing backward through layers.
+///              On entry: gradient from the layer above (or final norm).
+///              On exit: gradient to pass to the layer below.
+fn layerBackward(
+    grad_hidden: []f32,
+    la: *const LayerActivations,
+    lw: *LayerWeights,
+    config: TransformerConfig,
+    bs: usize,
+    global_scratch: []f32,
+    scratch: *MatmulScratch,
+) void {
+    const d: usize = config.d_model;
+    const nh: usize = config.num_heads;
+    const nkv: usize = config.num_kv_heads;
+    const hd: usize = config.headDim();
+    const ff: usize = config.d_ff;
+    const s: usize = config.seq_len;
+    const b: usize = bs / s;
+
+    // =====================================================================
+    // FFN backward
+    // =====================================================================
+    // Forward was:
+    //   residual_pre_ffn = hidden (after attn block)
+    //   normed_ffn = rmsnorm(hidden, ffn_norm)
+    //   gate = normed_ffn @ gate_proj^T
+    //   up = normed_ffn @ up_proj^T
+    //   swiglu_out = silu(gate) * up
+    //   hidden = down_proj(swiglu_out) + residual_pre_ffn
+
+    // The grad_hidden we received is d(loss)/d(hidden_after_ffn_residual).
+    // Save a copy for the residual path.
+    // We'll use global_scratch[0..bs*d] for grad_residual_ffn.
+    const grad_residual_ffn = global_scratch[0 .. bs * d];
+    @memcpy(grad_residual_ffn, grad_hidden[0 .. bs * d]);
+
+    // Down projection backward:
+    // Forward: hidden_before_residual = swiglu_out @ down_proj^T
+    // grad_down_proj += grad_hidden^T @ swiglu_out
+    // grad_swiglu_out = grad_hidden @ down_proj
+
+    // We need swiglu_out, which was computed as silu(gate)*up but not saved.
+    // Recompute it into a scratch area. We need bs*ff space.
+    const grad_swiglu = global_scratch[bs * d .. bs * d + bs * ff];
+    recomputeSwiglu(grad_swiglu, la.gate, la.up, bs * ff);
+
+    // Now grad_swiglu temporarily holds the forward swiglu output (for gradWeight).
+    linear.gradWeight(
+        lw.grad_down_proj.asSliceMut(),
+        grad_hidden,
+        grad_swiglu, // input to down_proj was swiglu_out
+        bs,
+        d,
+        ff,
+        scratch,
+    );
+
+    // grad_swiglu_out = grad_hidden @ down_proj (overwritten)
+    linear.gradInput(
+        grad_swiglu,
+        grad_hidden,
+        lw.down_proj.asSlice(f32),
+        bs,
+        d,
+        ff,
+        scratch,
+    );
+
+    // SwiGLU backward:
+    // grad_gate and grad_up from swiglu backward (both overwritten)
+    // We need separate buffers for grad_gate and grad_up.
+    // Use two regions of global_scratch after grad_residual_ffn.
+    const grad_gate = global_scratch[bs * d + bs * ff .. bs * d + 2 * bs * ff];
+    const grad_up = global_scratch[bs * d + 2 * bs * ff .. bs * d + 3 * bs * ff];
+    activation_bw.swigluBackward(
+        grad_gate,
+        grad_up,
+        grad_swiglu,
+        la.gate,
+        la.up,
+    );
+
+    // Gate projection backward:
+    // Forward: gate = normed_ffn @ gate_proj^T
+    linear.gradWeight(
+        lw.grad_gate_proj.asSliceMut(),
+        grad_gate,
+        la.normed_ffn,
+        bs,
+        ff,
+        d,
+        scratch,
+    );
+    // grad_normed_ffn from gate path = grad_gate @ gate_proj (overwritten into grad_hidden)
+    linear.gradInput(
+        grad_hidden,
+        grad_gate,
+        lw.gate_proj.asSlice(f32),
+        bs,
+        ff,
+        d,
+        scratch,
+    );
+
+    // Up projection backward:
+    // Forward: up = normed_ffn @ up_proj^T
+    linear.gradWeight(
+        lw.grad_up_proj.asSliceMut(),
+        grad_up,
+        la.normed_ffn,
+        bs,
+        ff,
+        d,
+        scratch,
+    );
+    // grad_normed_ffn from up path = grad_up @ up_proj
+    // Accumulate into grad_hidden (which already has gate path contribution).
+    // gradInput overwrites, so we need a temp buffer then add.
+    const grad_temp = grad_swiglu[0 .. bs * d]; // reuse grad_swiglu (only need bs*d)
+    linear.gradInput(
+        grad_temp,
+        grad_up,
+        lw.up_proj.asSlice(f32),
+        bs,
+        ff,
+        d,
+        scratch,
+    );
+    // Accumulate up path into grad_hidden
+    for (grad_hidden[0 .. bs * d], grad_temp) |*gh, gt| {
+        gh.* += gt;
+    }
+
+    // FFN RMSNorm backward:
+    // Forward: normed_ffn = rmsnorm(residual_pre_ffn, ffn_norm)
+    // Copy grad_hidden to avoid aliasing grad_input/grad_output.
+    const ffn_norm_grad_out = grad_swiglu[0 .. bs * d]; // reuse scratch region
+    @memcpy(ffn_norm_grad_out, grad_hidden[0 .. bs * d]);
+    rmsnorm_bw.rmsnormBackward(
+        grad_hidden,
+        lw.grad_ffn_norm.asSliceMut(),
+        ffn_norm_grad_out,
+        la.residual_pre_ffn, // input to this rmsnorm
+        la.inv_rms_ffn,
+        lw.ffn_norm.asSlice(f32),
+        bs,
+        d,
+        0.0,
+    );
+
+    // Add FFN residual gradient
+    for (grad_hidden[0 .. bs * d], grad_residual_ffn) |*gh, gr| {
+        gh.* += gr;
+    }
+
+    // =====================================================================
+    // Attention backward
+    // =====================================================================
+    // Forward was:
+    //   residual_pre_attn = hidden (input to this layer)
+    //   normed_attn = rmsnorm(hidden, attn_norm)
+    //   q = normed_attn @ q_proj^T, then RoPE
+    //   k = normed_attn @ k_proj^T, then RoPE
+    //   v = normed_attn @ v_proj^T
+    //   attn_output = attention(q, k, v)
+    //   hidden = attn_output @ o_proj^T + residual_pre_attn
+
+    // Save residual gradient for attention block.
+    // Place at start of scratch; attention temporaries go after it.
+    const grad_residual_attn = global_scratch[0 .. bs * d];
+    @memcpy(grad_residual_attn, grad_hidden[0 .. bs * d]);
+
+    // Output projection backward:
+    // Forward: o_proj_out = attn_output @ o_proj^T
+    linear.gradWeight(
+        lw.grad_o_proj.asSliceMut(),
+        grad_hidden,
+        la.attn_output,
+        bs,
+        d,
+        nh * hd,
+        scratch,
+    );
+    // grad_attn_output = grad_hidden @ o_proj (overwritten)
+    // Place after grad_residual_attn to avoid overlap.
+    const grad_attn_output = global_scratch[bs * d .. bs * d + bs * nh * hd];
+    linear.gradInput(
+        grad_attn_output,
+        grad_hidden,
+        lw.o_proj.asSlice(f32),
+        bs,
+        d,
+        nh * hd,
+        scratch,
+    );
+
+    // Attention backward (per-position, per-batch):
+    // The existing kernel processes one query position at a time.
+    // grad_q: overwritten per position, grad_k/grad_v: accumulated across positions.
+    // Layout: [grad_residual_attn: bs*d] [grad_attn_output: bs*nh*hd] [grad_q: bs*nh*hd] [grad_k: bs*nkv*hd] [grad_v: bs*nkv*hd]
+    const qkv_base = bs * d + bs * nh * hd;
+    const grad_q = global_scratch[qkv_base .. qkv_base + bs * nh * hd];
+    const grad_k = global_scratch[qkv_base + bs * nh * hd .. qkv_base + bs * nh * hd + bs * nkv * hd];
+    const grad_v = global_scratch[qkv_base + bs * nh * hd + bs * nkv * hd .. qkv_base + bs * nh * hd + 2 * bs * nkv * hd];
+    @memset(grad_k, 0.0);
+    @memset(grad_v, 0.0);
+
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+
+    for (0..b) |bi| {
+        for (0..s) |pos| {
+            const token_idx = bi * s + pos;
+            const q_offset = token_idx * nh * hd;
+            const kv_offset = bi * s * nkv * hd; // start of this batch's K/V
+
+            // Per-position grad_q is overwritten by the kernel
+            const pos_grad_q = grad_q[q_offset..][0 .. nh * hd];
+
+            // The attention backward kernel expects:
+            //   probs: [n_heads * seq_len] for this position
+            //   key_cache: [seq_len * n_kv_heads * head_dim] for this batch
+            //   value_cache: [seq_len * n_kv_heads * head_dim] for this batch
+            //   grad_k: [seq_len * n_kv_heads * head_dim] accumulated
+            //   grad_v: [seq_len * n_kv_heads * head_dim] accumulated
+
+            // Build probs slice for this position: [n_heads * seq_len]
+            // In cache, probs are [batch * n_heads * seq * seq]
+            // For batch bi, head h, query pos qi: offset = (bi * nh + h) * s * s + qi * s
+            // We need contiguous [nh * s] slice, but storage is not contiguous across heads.
+            // We need to gather per-head prob rows into a contiguous buffer.
+            var prob_buf: [4096]f32 = undefined;
+            const prob_slice = prob_buf[0 .. nh * s];
+            for (0..nh) |h| {
+                const src_offset = (bi * nh + h) * s * s + pos * s;
+                const dst_offset = h * s;
+                @memcpy(prob_slice[dst_offset..][0..s], la.attn_probs[src_offset..][0..s]);
+            }
+
+            attention_bw.attentionBackward(
+                pos_grad_q,
+                grad_k[kv_offset..][0 .. s * nkv * hd],
+                grad_v[kv_offset..][0 .. s * nkv * hd],
+                grad_attn_output[q_offset..][0 .. nh * hd],
+                la.q[q_offset..][0 .. nh * hd],
+                la.k[kv_offset..][0 .. s * nkv * hd],
+                la.v[kv_offset..][0 .. s * nkv * hd],
+                prob_slice,
+                nh,
+                nkv,
+                hd,
+                s,
+                scale,
+            );
+        }
+    }
+
+    // RoPE backward on grad_q and grad_k (in-place inverse rotation)
+    for (0..b) |bi| {
+        for (0..s) |pos| {
+            const token_idx = bi * s + pos;
+            rope_bw.ropeBackward(
+                grad_q[token_idx * nh * hd ..][0 .. nh * hd],
+                nh,
+                hd,
+                hd,
+                pos,
+                config.rope_theta,
+            );
+            rope_bw.ropeBackward(
+                grad_k[token_idx * nkv * hd ..][0 .. nkv * hd],
+                nkv,
+                hd,
+                hd,
+                pos,
+                config.rope_theta,
+            );
+        }
+    }
+
+    // Q projection backward:
+    // Forward: q_pre_rope = normed_attn @ q_proj^T
+    linear.gradWeight(
+        lw.grad_q_proj.asSliceMut(),
+        grad_q,
+        la.normed_attn,
+        bs,
+        nh * hd,
+        d,
+        scratch,
+    );
+    // grad_normed_attn from Q path → write into grad_hidden
+    linear.gradInput(
+        grad_hidden,
+        grad_q,
+        lw.q_proj.asSlice(f32),
+        bs,
+        nh * hd,
+        d,
+        scratch,
+    );
+
+    // K projection backward:
+    linear.gradWeight(
+        lw.grad_k_proj.asSliceMut(),
+        grad_k,
+        la.normed_attn,
+        bs,
+        nkv * hd,
+        d,
+        scratch,
+    );
+    // grad_normed_attn from K path → accumulate
+    // Reuse grad_attn_output region (no longer needed after attention loop)
+    const grad_temp_attn = global_scratch[bs * d .. bs * d + bs * d];
+    linear.gradInput(
+        grad_temp_attn,
+        grad_k,
+        lw.k_proj.asSlice(f32),
+        bs,
+        nkv * hd,
+        d,
+        scratch,
+    );
+    for (grad_hidden[0 .. bs * d], grad_temp_attn) |*gh, gt| {
+        gh.* += gt;
+    }
+
+    // V projection backward:
+    linear.gradWeight(
+        lw.grad_v_proj.asSliceMut(),
+        grad_v,
+        la.normed_attn,
+        bs,
+        nkv * hd,
+        d,
+        scratch,
+    );
+    // grad_normed_attn from V path → accumulate
+    linear.gradInput(
+        grad_temp_attn,
+        grad_v,
+        lw.v_proj.asSlice(f32),
+        bs,
+        nkv * hd,
+        d,
+        scratch,
+    );
+    for (grad_hidden[0 .. bs * d], grad_temp_attn) |*gh, gt| {
+        gh.* += gt;
+    }
+
+    // Attention RMSNorm backward:
+    // Forward: normed_attn = rmsnorm(residual_pre_attn, attn_norm)
+    // Copy grad_hidden to avoid aliasing grad_input/grad_output.
+    const attn_norm_grad_out = global_scratch[bs * d .. 2 * bs * d];
+    @memcpy(attn_norm_grad_out, grad_hidden[0 .. bs * d]);
+    rmsnorm_bw.rmsnormBackward(
+        grad_hidden,
+        lw.grad_attn_norm.asSliceMut(),
+        attn_norm_grad_out,
+        la.residual_pre_attn,
+        la.inv_rms_attn,
+        lw.attn_norm.asSlice(f32),
+        bs,
+        d,
+        0.0,
+    );
+
+    // Add attention residual gradient
+    for (grad_hidden[0 .. bs * d], grad_residual_attn) |*gh, gr| {
+        gh.* += gr;
+    }
+}
+
+/// Recompute silu(gate) * up (SwiGLU forward) for use in down_proj gradWeight.
+/// We didn't save this intermediate in the forward pass, so recompute it here.
+fn recomputeSwiglu(output: []f32, gate: []const f32, up: []const f32, len: usize) void {
+    for (0..len) |i| {
+        const x = gate[i];
+        const sigmoid = 1.0 / (1.0 + @exp(-x));
+        output[i] = x * sigmoid * up[i];
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+const testing = std.testing;
+const forward_mod = @import("forward.zig");
+
+fn testConfig() TransformerConfig {
+    return .{
+        .vocab_size = 8,
+        .d_model = 4,
+        .num_layers = 1,
+        .num_heads = 1,
+        .num_kv_heads = 1,
+        .d_ff = 8,
+        .seq_len = 2,
+    };
+}
+
+test "backward produces non-zero gradients" {
+    const config = testConfig();
+    var weights = try ModelWeights.init(testing.allocator, config);
+    defer weights.deinit();
+    weights.initRandom(42);
+
+    var cache = try ActivationCache.init(testing.allocator, config, 1);
+    defer cache.deinit();
+
+    var mm_scratch = try MatmulScratch.init(testing.allocator);
+    defer mm_scratch.deinit();
+
+    const tokens = [_]u32{ 1, 3 };
+    const targets = [_]u32{ 3, 5 };
+
+    // Forward pass
+    _ = forward_mod.forward(&weights, &cache, &tokens, &targets, &mm_scratch);
+
+    // Zero grads then backward
+    weights.zeroGrads();
+    backward(&weights, &cache, &tokens, &targets, &mm_scratch);
+
+    // Check that at least some gradients are non-zero
+    var has_nonzero = false;
+    for (weights.grad_lm_head.asSlice()) |v| {
+        if (v != 0.0) {
+            has_nonzero = true;
+            break;
+        }
+    }
+    try testing.expect(has_nonzero);
+
+    has_nonzero = false;
+    for (weights.grad_token_embedding.asSlice()) |v| {
+        if (v != 0.0) {
+            has_nonzero = true;
+            break;
+        }
+    }
+    try testing.expect(has_nonzero);
+
+    has_nonzero = false;
+    for (weights.layers[0].grad_q_proj.asSlice()) |v| {
+        if (v != 0.0) {
+            has_nonzero = true;
+            break;
+        }
+    }
+    try testing.expect(has_nonzero);
+}
+
+test "backward gradient finite check" {
+    const config = testConfig();
+    var weights = try ModelWeights.init(testing.allocator, config);
+    defer weights.deinit();
+    weights.initRandom(123);
+
+    var cache = try ActivationCache.init(testing.allocator, config, 1);
+    defer cache.deinit();
+
+    var mm_scratch = try MatmulScratch.init(testing.allocator);
+    defer mm_scratch.deinit();
+
+    const tokens = [_]u32{ 0, 2 };
+    const targets = [_]u32{ 2, 4 };
+
+    _ = forward_mod.forward(&weights, &cache, &tokens, &targets, &mm_scratch);
+    weights.zeroGrads();
+    backward(&weights, &cache, &tokens, &targets, &mm_scratch);
+
+    // All gradients should be finite (not NaN or Inf)
+    for (weights.grad_lm_head.asSlice()) |v| {
+        try testing.expect(!std.math.isNan(v));
+        try testing.expect(!std.math.isInf(v));
+    }
+    for (weights.grad_final_norm.asSlice()) |v| {
+        try testing.expect(!std.math.isNan(v));
+        try testing.expect(!std.math.isInf(v));
+    }
+    for (weights.grad_token_embedding.asSlice()) |v| {
+        try testing.expect(!std.math.isNan(v));
+        try testing.expect(!std.math.isInf(v));
+    }
+    for (weights.layers[0].grad_q_proj.asSlice()) |v| {
+        try testing.expect(!std.math.isNan(v));
+        try testing.expect(!std.math.isInf(v));
+    }
+    for (weights.layers[0].grad_o_proj.asSlice()) |v| {
+        try testing.expect(!std.math.isNan(v));
+        try testing.expect(!std.math.isInf(v));
+    }
+    for (weights.layers[0].grad_gate_proj.asSlice()) |v| {
+        try testing.expect(!std.math.isNan(v));
+        try testing.expect(!std.math.isInf(v));
+    }
+    for (weights.layers[0].grad_down_proj.asSlice()) |v| {
+        try testing.expect(!std.math.isNan(v));
+        try testing.expect(!std.math.isInf(v));
+    }
+}
+
+test "backward with two layers produces non-zero gradients in both" {
+    const config: TransformerConfig = .{
+        .vocab_size = 8,
+        .d_model = 4,
+        .num_layers = 2,
+        .num_heads = 1,
+        .num_kv_heads = 1,
+        .d_ff = 8,
+        .seq_len = 2,
+    };
+
+    var weights = try ModelWeights.init(testing.allocator, config);
+    defer weights.deinit();
+    weights.initRandom(99);
+
+    var cache = try ActivationCache.init(testing.allocator, config, 1);
+    defer cache.deinit();
+
+    var mm_scratch = try MatmulScratch.init(testing.allocator);
+    defer mm_scratch.deinit();
+
+    const tokens = [_]u32{ 0, 1 };
+    const targets = [_]u32{ 1, 2 };
+
+    _ = forward_mod.forward(&weights, &cache, &tokens, &targets, &mm_scratch);
+    weights.zeroGrads();
+    backward(&weights, &cache, &tokens, &targets, &mm_scratch);
+
+    // Both layers should have non-zero gradients
+    for (0..2) |layer_idx| {
+        var has_nonzero = false;
+        for (weights.layers[layer_idx].grad_q_proj.asSlice()) |v| {
+            if (v != 0.0) {
+                has_nonzero = true;
+                break;
+            }
+        }
+        try testing.expect(has_nonzero);
+    }
+}

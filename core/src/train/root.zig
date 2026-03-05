@@ -34,6 +34,13 @@ pub const loop = @import("loop.zig");
 pub const session = @import("session.zig");
 pub const capi_bridge = @import("capi_bridge.zig");
 
+pub const model_config = @import("model_config.zig");
+pub const model_weights = @import("model_weights.zig");
+pub const activations = @import("activations.zig");
+pub const forward = @import("forward.zig");
+pub const backward_pass = @import("backward_pass.zig");
+pub const full_session = @import("full_session.zig");
+
 // =============================================================================
 // Re-exported types
 // =============================================================================
@@ -59,6 +66,13 @@ pub const clipGradNorm = loop.clipGradNorm;
 pub const TrainingSession = session.TrainingSession;
 pub const SessionConfig = session.SessionConfig;
 pub const SessionInfo = session.SessionInfo;
+pub const TransformerConfig = model_config.TransformerConfig;
+pub const ModelWeights = model_weights.ModelWeights;
+pub const LayerWeights = model_weights.LayerWeights;
+pub const ActivationCache = activations.ActivationCache;
+pub const FullTrainingSession = full_session.FullTrainingSession;
+pub const FullSessionConfig = full_session.FullSessionConfig;
+pub const FullSessionInfo = full_session.FullSessionInfo;
 
 test {
     _ = grad;
@@ -73,4 +87,10 @@ test {
     _ = loop;
     _ = session;
     _ = capi_bridge;
+    _ = model_config;
+    _ = model_weights;
+    _ = activations;
+    _ = forward;
+    _ = backward_pass;
+    _ = full_session;
 }
