@@ -557,6 +557,15 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
     const is_metaspace = tokenizer.pretokenizer.metaspace != 0;
     const per_word_encode = is_sentencepiece_bpe or is_byte_level_bpe or is_metaspace;
 
+    // Skip byte-level encoding in pretokenize when the BPE model can handle
+    // raw bytes directly via orig_byte_vocab_ids. This eliminates the
+    // applyByteLevel pass (arena allocs + UTF-8 encoding per byte).
+    const skip_byte_level = is_byte_level_bpe and tokenizer.pretokenizer.is_sequence == 0 and
+        if (tokenizer.model) |model_ptr| blk: {
+        const model: *bpe.BpeModel = @ptrCast(@alignCast(model_ptr));
+        break :blk model.use_raw_byte_init;
+    } else false;
+
     // Overlapping-chunk parallelism: split text, parallelize both regex + BPE,
     // deduplicate at merge using word offsets vs midpoints.
     // Skip parallelism when the segment has no whitespace: without word
@@ -567,12 +576,12 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
     {
         const pool = parallel.global();
         if (pool.n_threads > 1) {
-            return encodeSegmentOverlapped(tokenizer, segment, base_offset, accumulator, pool, is_sentencepiece_bpe, is_metaspace);
+            return encodeSegmentOverlapped(tokenizer, segment, base_offset, accumulator, pool, is_sentencepiece_bpe, is_metaspace, skip_byte_level);
         }
     }
 
     // Sequential path
-    var pretokenized = try pretokenize.pretokenize(&tokenizer.pretokenizer, segment, .{ .start = base_offset, .end = base_offset + segment.len });
+    var pretokenized = try pretokenize.pretokenize(&tokenizer.pretokenizer, segment, .{ .start = base_offset, .end = base_offset + segment.len }, skip_byte_level);
     defer pretokenized.deinit();
 
     if (per_word_encode) {
@@ -673,6 +682,7 @@ const ChunkContext = struct {
     n_chunks: usize,
     is_sentencepiece_bpe: bool,
     is_metaspace: bool,
+    skip_byte_level: bool,
     had_error: std.atomic.Value(bool),
 };
 
@@ -698,6 +708,7 @@ fn processChunk(ctx: *ChunkContext, chunk_idx: usize) void {
         &ctx.tokenizer.pretokenizer,
         chunk,
         .{ .start = chunk_base, .end = chunk_base + chunk.len },
+        ctx.skip_byte_level,
     ) catch {
         ctx.had_error.store(true, .release);
         return;
@@ -747,13 +758,14 @@ fn encodeSegmentOverlapped(
     pool: *parallel.ThreadPool,
     is_sentencepiece_bpe: bool,
     is_metaspace: bool,
+    skip_byte_level: bool,
 ) !void {
     const n_threads = pool.n_threads;
     const n_chunks = @min(n_threads, @max(1, segment.len / min_chunk_bytes));
 
     if (n_chunks <= 1) {
         // Fall back to sequential
-        var pretokenized = try pretokenize.pretokenize(&tokenizer.pretokenizer, segment, .{ .start = base_offset, .end = base_offset + segment.len });
+        var pretokenized = try pretokenize.pretokenize(&tokenizer.pretokenizer, segment, .{ .start = base_offset, .end = base_offset + segment.len }, skip_byte_level);
         defer pretokenized.deinit();
         var word_cache = WordCache.init();
         defer word_cache.deinit();
@@ -798,6 +810,7 @@ fn encodeSegmentOverlapped(
         .n_chunks = n_chunks,
         .is_sentencepiece_bpe = is_sentencepiece_bpe,
         .is_metaspace = is_metaspace,
+        .skip_byte_level = skip_byte_level,
         .had_error = std.atomic.Value(bool).init(false),
     };
 

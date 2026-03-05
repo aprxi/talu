@@ -438,6 +438,7 @@ pub fn runPretok(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: usi
             &tok.tokenizer_handle.pretokenizer,
             normalized.text,
             .{ .start = 0, .end = normalized.text.len },
+            false,
         );
         const t1 = std.time.nanoTimestamp();
         last_word_count = pretokenized.tokens.items.len;
@@ -480,6 +481,7 @@ pub fn runBpe(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: usize,
         &tok.tokenizer_handle.pretokenizer,
         normalized.text,
         .{ .start = 0, .end = normalized.text.len },
+        false,
     );
     defer pretokenized.deinit();
 
@@ -553,6 +555,7 @@ pub fn runBpeVocab(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: u
         &tok.tokenizer_handle.pretokenizer,
         normalized.text,
         .{ .start = 0, .end = normalized.text.len },
+        false,
     );
     defer pretokenized.deinit();
 
@@ -627,6 +630,7 @@ pub fn runBpeMerge(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: u
         &tok.tokenizer_handle.pretokenizer,
         normalized.text,
         .{ .start = 0, .end = normalized.text.len },
+        false,
     );
     defer pretokenized.deinit();
 
@@ -719,6 +723,7 @@ pub fn runBpeCollect(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes:
         &tok.tokenizer_handle.pretokenizer,
         normalized.text,
         .{ .start = 0, .end = normalized.text.len },
+        false,
     );
     defer pretokenized.deinit();
 

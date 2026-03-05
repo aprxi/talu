@@ -89,6 +89,16 @@ pub const BpeModel = struct {
     // Avoids hash lookup in symbol init for the 95%+ of chars that are single-byte.
     byte_vocab_ids: [256]i32,
 
+    // Direct byte→vocab-ID for byte-level BPE (pre-byte-level-encoding).
+    // Maps original byte value → vocab ID of its byte_to_unicode representation.
+    // Eliminates both applyByteLevel and all hash lookups in symbol init.
+    orig_byte_vocab_ids: [256]i32,
+
+    // True when all 256 orig_byte_vocab_ids entries are valid (>= 0).
+    // When set, callers can skip applyByteLevel and pass raw bytes to BPE,
+    // which uses orig_byte_vocab_ids for O(1) symbol init per byte.
+    use_raw_byte_init: bool,
+
     // Config
     unk_token: [16]u8,
     unk_id: i32,
@@ -156,6 +166,8 @@ fn create(allocator: std.mem.Allocator, json_buffer: []const u8, json_owned: boo
         .unicode_to_byte = [_]i32{-1} ** 65536,
         .byte_fallback_ids = [_]i32{-1} ** 256,
         .byte_vocab_ids = [_]i32{-1} ** 256,
+        .orig_byte_vocab_ids = [_]i32{-1} ** 256,
+        .use_raw_byte_init = false,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,
@@ -309,6 +321,9 @@ fn parseVocabAndMerges(model: *BpeModel) !void {
 
     // Build direct byte lookup table for single-byte vocab tokens
     initByteVocabIds(model);
+
+    // Build direct raw-byte→vocab-ID for byte-level BPE
+    initOrigByteVocabIds(model);
 
     // Parse merges if present (SentencePiece/Unigram models don't have merges)
     if (merges_start) |m_start| {
@@ -547,6 +562,27 @@ fn initByteVocabIds(model: *BpeModel) void {
     }
 }
 
+/// Build direct byte→vocab-ID for byte-level BPE (raw byte → vocab ID).
+/// Maps each original byte value to the vocab ID of its byte_to_unicode
+/// representation. This enables symbol init to use a single array lookup
+/// per byte instead of UTF-8 parsing + hash lookup.
+/// Sets use_raw_byte_init=true when all 256 byte_to_unicode mappings exist.
+/// Missing vocab entries (id=-1) are safe: the byte-level collect path emits
+/// unk_id for id=-1 symbols — same behavior as applyByteLevel + hash lookup.
+fn initOrigByteVocabIds(model: *BpeModel) void {
+    var all_mapped = true;
+    for (0..256) |byte_val| {
+        const encoded = model.byte_to_unicode[byte_val];
+        if (encoded.len > 0) {
+            model.orig_byte_vocab_ids[byte_val] = model.vocab_hash.get(encoded) orelse -1;
+        } else {
+            model.orig_byte_vocab_ids[byte_val] = -1;
+            all_mapped = false;
+        }
+    }
+    model.use_raw_byte_init = all_mapped;
+}
+
 fn initByteMap(model: *BpeModel) !void {
     var byte_values = [_]i32{0} ** 512;
     var codepoints = [_]i32{0} ** 512;
@@ -663,25 +699,48 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
     defer if (heap_syms) |hs| allocator.free(hs);
 
     var n_syms: usize = 0;
+    var used_raw_byte_init = false;
 
     var syms: []Symbol = &stack_syms;
-    if (word.len > MAX_WORD_SYMBOLS) {
-        // Count UTF-8 characters for exact heap sizing (rare path)
-        var n_chars: usize = 0;
-        var bi: usize = 0;
-        while (bi < word.len) {
-            const cl = utf8CharLen(word[bi]);
-            if (bi + cl > word.len) return error.InvalidUtf8;
-            bi += cl;
-            n_chars += 1;
-        }
-        if (n_chars > MAX_WORD_SYMBOLS) {
-            heap_syms = try allocator.alloc(Symbol, n_chars);
+
+    if (is_byte_level and model.use_raw_byte_init and tok.pretokenizer.is_sequence == 0) {
+        // Byte-level BPE with raw byte init: each byte maps directly to a
+        // vocab token via orig_byte_vocab_ids. No UTF-8 parsing or hash
+        // lookups needed. Requires applyByteLevel to be skipped (non-sequence
+        // pretokenizer) so words contain raw bytes.
+        if (word.len > MAX_WORD_SYMBOLS) {
+            heap_syms = try allocator.alloc(Symbol, word.len);
             syms = heap_syms.?;
         }
-    }
+        for (word, 0..) |byte, i| {
+            syms[n_syms] = .{
+                .id = model.orig_byte_vocab_ids[byte],
+                .start = @intCast(i),
+                .len = 1,
+                .prev = if (n_syms > 0) @as(i32, @intCast(n_syms - 1)) else -1,
+                .next = -1,
+            };
+            if (n_syms > 0) syms[n_syms - 1].next = @intCast(n_syms);
+            n_syms += 1;
+        }
+        used_raw_byte_init = true;
+    } else {
+        // Non-byte-level: split by UTF-8 characters and look up each in vocab.
+        if (word.len > MAX_WORD_SYMBOLS) {
+            var n_chars: usize = 0;
+            var bi: usize = 0;
+            while (bi < word.len) {
+                const cl = utf8CharLen(word[bi]);
+                if (bi + cl > word.len) return error.InvalidUtf8;
+                bi += cl;
+                n_chars += 1;
+            }
+            if (n_chars > MAX_WORD_SYMBOLS) {
+                heap_syms = try allocator.alloc(Symbol, n_chars);
+                syms = heap_syms.?;
+            }
+        }
 
-    {
         var byte_idx: usize = 0;
         while (byte_idx < word.len) {
             const char_len = utf8CharLen(word[byte_idx]);
@@ -753,18 +812,59 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
         return;
     }
 
-    // 2. Merge loop: cached-pair approach.
-    //    Phase 1 builds a cache of all valid merge pairs (one full scan).
-    //    Phase 2 repeatedly picks the lowest-rank pair from the cache,
-    //    applies the merge, and updates only the 1-2 affected neighbors.
-    //    This reduces pair_merges hash lookups from O(n_pairs × n_passes)
-    //    to O(n_pairs + 2 × n_merges).
-    if (n_syms >= 2 and model.pair_merges.count() > 0) {
+    // 2. Merge loop.
+    //    For short words (3-5 symbols), use simple re-scan: find best pair
+    //    by scanning all pairs each iteration. Avoids pair cache setup
+    //    (1KB pos_to_cache fill, Phase 1/2 bookkeeping) for the common case.
+    if (n_syms >= 3 and n_syms <= 5 and model.pair_merges.count() > 0) {
+        while (true) {
+            var best_rank: i32 = std.math.maxInt(i32);
+            var best_pos: i32 = -1;
+            var best_new_id: i32 = -1;
+
+            var si: i32 = 0;
+            while (si >= 0) {
+                const sym = &syms[@intCast(si)];
+                if (sym.next >= 0 and sym.id >= 0) {
+                    const right = &syms[@intCast(sym.next)];
+                    if (right.id >= 0) {
+                        if (model.pair_merges.get(.{ .left = sym.id, .right = right.id })) |info| {
+                            if (info.rank < best_rank or
+                                (info.rank == best_rank and si < best_pos))
+                            {
+                                best_rank = info.rank;
+                                best_pos = si;
+                                best_new_id = info.new_id;
+                            }
+                        }
+                    }
+                }
+                si = sym.next;
+            }
+            if (best_pos < 0) break;
+
+            const left = &syms[@intCast(best_pos)];
+            const right_idx = left.next;
+            const right = &syms[@intCast(right_idx)];
+            left.id = best_new_id;
+            left.len += right.len;
+            left.next = right.next;
+            if (right.next >= 0) syms[@intCast(right.next)].prev = best_pos;
+            right.id = -2;
+        }
+    } else if (n_syms >= 6 and model.pair_merges.count() > 0) {
+        // Cached-pair approach for longer words.
+        // Phase 1 builds a cache of all valid merge pairs (one full scan).
+        // Phase 2 repeatedly picks the lowest-rank pair from the cache,
+        // applies the merge, and updates only the 1-2 affected neighbors.
+        // This reduces pair_merges hash lookups from O(n_pairs × n_passes)
+        // to O(n_pairs + 2 × n_merges).
         const CachedPair = struct { pos: i32, rank: i32, new_id: i32 };
         var pair_cache: [MAX_WORD_SYMBOLS]CachedPair = undefined;
         var n_cached: usize = 0;
         // Position-to-cache-index tracking for O(1) stale entry removal.
-        var pos_to_cache: [MAX_WORD_SYMBOLS]i16 = [_]i16{-1} ** MAX_WORD_SYMBOLS;
+        var pos_to_cache: [MAX_WORD_SYMBOLS]i16 = undefined;
+        @memset(pos_to_cache[0..n_syms], @as(i16, -1));
 
         // Phase 1: Build pair cache (single scan, one hash lookup per pair)
         {
@@ -881,9 +981,26 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
             si = syms[@intCast(si)].next;
         }
         if (!all_known) {
-            if (model.vocab_hash.get(word)) |id| {
-                try out_ids.append(allocator, id);
-                return;
+            if (used_raw_byte_init) {
+                // Raw byte init path: word contains original bytes, but vocab_hash
+                // keys are byte-level encoded. Convert through byte_to_unicode.
+                var enc_buf: [MAX_WORD_SYMBOLS * 4]u8 = undefined;
+                var enc_len: usize = 0;
+                for (word) |byte| {
+                    const encoded = model.byte_to_unicode[byte];
+                    if (encoded.len == 0 or enc_len + encoded.len > enc_buf.len) break;
+                    @memcpy(enc_buf[enc_len..][0..encoded.len], encoded);
+                    enc_len += encoded.len;
+                }
+                if (model.vocab_hash.get(enc_buf[0..enc_len])) |id| {
+                    try out_ids.append(allocator, id);
+                    return;
+                }
+            } else {
+                if (model.vocab_hash.get(word)) |id| {
+                    try out_ids.append(allocator, id);
+                    return;
+                }
             }
         }
     }
@@ -1311,6 +1428,8 @@ fn createFromSpec(allocator: std.mem.Allocator, spec: *const ct.BpeModelSpec) !*
         .unicode_to_byte = [_]i32{-1} ** 65536,
         .byte_fallback_ids = [_]i32{-1} ** 256,
         .byte_vocab_ids = [_]i32{-1} ** 256,
+        .orig_byte_vocab_ids = [_]i32{-1} ** 256,
+        .use_raw_byte_init = false,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,
@@ -1345,6 +1464,9 @@ fn createFromSpec(allocator: std.mem.Allocator, spec: *const ct.BpeModelSpec) !*
 
     // Build direct byte lookup table for single-byte vocab tokens
     initByteVocabIds(model);
+
+    // Build direct raw-byte→vocab-ID for byte-level BPE
+    initOrigByteVocabIds(model);
 
     // Build merges
     const merge_buffer = try allocator.alloc(u8, 8 * 1024 * 1024);
@@ -1764,6 +1886,8 @@ test "tokenizer_bpe_create_from_spec: initByteMap creates valid mappings" {
         .unicode_to_byte = [_]i32{-1} ** 65536,
         .byte_fallback_ids = [_]i32{-1} ** 256,
         .byte_vocab_ids = [_]i32{-1} ** 256,
+        .orig_byte_vocab_ids = [_]i32{-1} ** 256,
+        .use_raw_byte_init = false,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,
@@ -1843,6 +1967,8 @@ test "tokenizer_bpe_create_from_spec: initByteMap handles control characters wit
         .unicode_to_byte = [_]i32{-1} ** 65536,
         .byte_fallback_ids = [_]i32{-1} ** 256,
         .byte_vocab_ids = [_]i32{-1} ** 256,
+        .orig_byte_vocab_ids = [_]i32{-1} ** 256,
+        .use_raw_byte_init = false,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,

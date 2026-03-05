@@ -175,11 +175,11 @@ fn utf8EncodeU32(cp: u32, out: *[4]u8) usize {
 }
 
 fn pretokenize_single(pretokenizer: ?*const ct.PreTokenizer, input: []const u8, base_offset: usize) PretokenizeError!PretokenizeResult {
-    return try pretokenize_single_impl(pretokenizer, input, base_offset);
+    return try pretokenize_single_impl(pretokenizer, input, base_offset, false);
 }
 
 /// Internal implementation using error handling for cleaner code
-fn pretokenize_single_impl(pretokenizer: ?*const ct.PreTokenizer, input: []const u8, base_offset: usize) PretokenizeError!PretokenizeResult {
+fn pretokenize_single_impl(pretokenizer: ?*const ct.PreTokenizer, input: []const u8, base_offset: usize, skip_byte_level: bool) PretokenizeError!PretokenizeResult {
     var result = PretokenizeResult.init();
     errdefer result.deinit();
 
@@ -204,8 +204,10 @@ fn pretokenize_single_impl(pretokenizer: ?*const ct.PreTokenizer, input: []const
             try splitByWhitespace(&result, input, base_offset, p.whitespace != 0, p.punctuation != 0);
         }
 
-        // Apply byte_level encoding if set
-        if (p.byte_level != 0) {
+        // Apply byte_level encoding if set.
+        // skip_byte_level: BPE models with orig_byte_vocab_ids handle raw bytes
+        // directly in encodeWordCore, so byte-level encoding is unnecessary.
+        if (p.byte_level != 0 and !skip_byte_level) {
             try applyByteLevel(&result);
         }
     } else {
@@ -557,10 +559,12 @@ fn applyByteLevel(result: *PretokenizeResult) !void {
     }
 }
 
-pub fn pretokenize(pretokenizer: ?*const ct.PreTokenizer, input: []const u8, input_range: Range) PretokenizeError!PretokenizeResult {
+pub fn pretokenize(pretokenizer: ?*const ct.PreTokenizer, input: []const u8, input_range: Range, skip_byte_level: bool) PretokenizeError!PretokenizeResult {
     if (pretokenizer == null or pretokenizer.?.is_sequence == 0) {
-        return pretokenize_single(pretokenizer, input, input_range.start);
+        return pretokenize_single_impl(pretokenizer, input, input_range.start, skip_byte_level);
     }
+    // Sequence pretokenizers: each step handles its own byte_level internally.
+    // Never skip byte-level for sequence steps.
     return try pretokenize_sequence(pretokenizer.?, input, input_range);
 }
 
