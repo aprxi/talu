@@ -185,26 +185,28 @@ pub fn tokenizer_decode_with_options(
 /// out_tokens: array to receive token string pointers (caller must free each with tokenizer_string_free)
 /// out_len: receives number of tokens
 pub fn tokenizer_tokenize(tokenizer_handle: ?*ct.Tokenizer, text: []const u8, out_tokens: ?[*][*:0]u8, out_len: *usize) c_int {
-    const encoding = tokenizer_encode_slice(tokenizer_handle, text) orelse return -1;
+    const tok = tokenizer_handle orelse return -1;
+    const encoding = tokenizer_encode_slice(tok, text) orelse return -1;
     defer tokenizer_encoding_free(encoding);
 
-    out_len.* = encoding.tokens_len;
+    out_len.* = encoding.ids_len;
 
     if (out_tokens) |out_ptr| {
-        if (encoding.tokens) |tokens_ptr| {
-            const token_ptrs: [*][*c]u8 = @ptrCast(tokens_ptr);
-            const copy_len = @min(out_len.*, encoding.tokens_len);
+        const ids_ptr: [*]i32 = if (encoding.ids) |ids| @ptrCast(ids) else return 0;
+        const token_ptrs: ?[*][*c]u8 = if (encoding.tokens) |t| @ptrCast(t) else null;
 
-            // Duplicate each token string (caller owns these)
-            for (0..copy_len) |token_idx| {
-                if (token_ptrs[token_idx]) |token_ptr| {
-                    const token_bytes = std.mem.span(@as([*:0]u8, @ptrCast(token_ptr)));
-                    out_ptr[token_idx] = strings.dupTokenString(token_bytes) orelse return -1;
-                } else {
-                    // Empty token
-                    out_ptr[token_idx] = strings.dupTokenString("") orelse return -1;
+        for (0..encoding.ids_len) |token_idx| {
+            // Try encoding.tokens first, fall back to vocab lookup by ID
+            const token_bytes: []const u8 = blk: {
+                if (token_ptrs) |ts| {
+                    if (ts[token_idx]) |token_ptr| {
+                        break :blk std.mem.span(@as([*:0]u8, @ptrCast(token_ptr)));
+                    }
                 }
-            }
+                break :blk tok.idToToken(ids_ptr[token_idx]) orelse
+                    encode.findAddedTokenContentById(tok, ids_ptr[token_idx]) orelse "";
+            };
+            out_ptr[token_idx] = strings.dupTokenString(token_bytes) orelse return -1;
         }
     }
     return 0;

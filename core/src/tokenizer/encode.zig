@@ -9,7 +9,6 @@ const pretokenize = @import("pretokenize.zig");
 const normalize = @import("normalize.zig");
 const postprocess = @import("postprocess.zig");
 const buffers = @import("encoding_buffers.zig");
-const strings = @import("strings.zig");
 const errors = @import("errors.zig");
 const types = @import("types.zig");
 const log = @import("../log.zig");
@@ -303,16 +302,8 @@ pub fn tokenizer_encoding_free_struct(encoding: *ct.TokenizerEncoding) void {
     encoding.* = std.mem.zeroes(ct.TokenizerEncoding);
 }
 
-/// Free null-terminated token list (for EncodeAccum)
-fn freeNullTerminatedTokenList(token_list: *std.ArrayListUnmanaged([*:0]u8)) void {
-    for (token_list.items) |token_ptr| {
-        Allocator.free(std.mem.span(token_ptr));
-    }
-    token_list.deinit(Allocator);
-}
-
-/// Look up an added token's content string by ID (for buildOutput fallback).
-fn findAddedTokenContentById(tokenizer: *ct.Tokenizer, id: i32) ?[]const u8 {
+/// Look up an added token's content string by ID.
+pub fn findAddedTokenContentById(tokenizer: *ct.Tokenizer, id: i32) ?[]const u8 {
     var added_iter = tokenizer.added;
     while (added_iter) |at| : (added_iter = at.next) {
         if (at.id == id) {
@@ -325,35 +316,26 @@ fn findAddedTokenContentById(tokenizer: *ct.Tokenizer, id: i32) ?[]const u8 {
 }
 
 /// Accumulator for building token encoding results.
+/// Token strings are not tracked here — they are resolved lazily from IDs
+/// by consumers that need them (e.g. offset computation via idToToken).
 const EncodeAccum = struct {
     ids: std.ArrayListUnmanaged(i32) = .{},
-    tokens: std.ArrayListUnmanaged([*:0]u8) = .{},
     special: std.ArrayListUnmanaged(i32) = .{},
 
     fn deinit(self: *EncodeAccum) void {
-        freeNullTerminatedTokenList(&self.tokens);
         self.special.deinit(Allocator);
         self.ids.deinit(Allocator);
     }
 
     fn appendAdded(self: *EncodeAccum, added_token: *const ct.AddedToken) !void {
         try self.ids.append(Allocator, added_token.id);
-        const token_copy = strings.tokenizer_strdup(@ptrCast(added_token.content.?)) orelse return error.OutOfMemory;
-        errdefer Allocator.free(std.mem.span(token_copy));
-        try self.tokens.append(Allocator, token_copy);
         try self.special.append(Allocator, added_token.special);
     }
 
     /// Append tokens from cached IDs (word cache hit path).
-    /// Resolves token strings from the model vocabulary, avoiding BPE recomputation.
     fn appendCachedIds(self: *EncodeAccum, cached_ids: []const i32, tokenizer: *ct.Tokenizer) !void {
         for (cached_ids) |id| {
             try self.ids.append(Allocator, id);
-            const tok_str = tokenizer.idToToken(id) orelse
-                findAddedTokenContentById(tokenizer, id) orelse "";
-            const token_copy = strings.dupTokenString(tok_str) orelse return error.OutOfMemory;
-            errdefer Allocator.free(std.mem.span(token_copy));
-            try self.tokens.append(Allocator, token_copy);
             try self.special.append(Allocator, checkSpecial(tokenizer.added, id));
         }
     }
@@ -361,22 +343,9 @@ const EncodeAccum = struct {
     fn appendEncoding(self: *EncodeAccum, encoding: *const ct.TokenizerEncoding, added_head: ?*ct.AddedToken) !void {
         if (encoding.ids == null) return;
         const ids_ptr: [*]i32 = @ptrCast(encoding.ids.?);
-        const tokens_ptrs: ?[*][*c]u8 = if (encoding.tokens) |t| @ptrCast(t) else null;
 
         for (0..encoding.ids_len) |id_index| {
             try self.ids.append(Allocator, ids_ptr[id_index]);
-
-            if (tokens_ptrs) |ts| {
-                if (ts[id_index]) |token_ptr| {
-                    const token_copy = strings.tokenizer_strdup(@ptrCast(token_ptr)) orelse return error.OutOfMemory;
-                    errdefer Allocator.free(std.mem.span(token_copy));
-                    try self.tokens.append(Allocator, token_copy);
-                } else {
-                    const empty_token = Allocator.allocSentinel(u8, 0, 0) catch return error.OutOfMemory;
-                    try self.tokens.append(Allocator, @ptrCast(empty_token.ptr));
-                }
-            }
-
             try self.special.append(Allocator, checkSpecial(added_head, ids_ptr[id_index]));
         }
     }
@@ -402,7 +371,6 @@ const EncodeAccum = struct {
         @memcpy(buffers_out.ids, self.ids.items);
         @memcpy(buffers_out.special, self.special.items);
         for (0..token_count) |token_idx| {
-            buffers_out.tokens[token_idx] = @ptrCast(self.tokens.items[token_idx]);
             buffers_out.attention_mask[token_idx] = 1;
             buffers_out.type_ids[token_idx] = 0;
             buffers_out.offsets[token_idx] = .{ .start = 0, .end = 0 };
@@ -412,7 +380,6 @@ const EncodeAccum = struct {
 
         // Ownership transferred - just free containers
         self.ids.deinit(Allocator);
-        self.tokens.deinit(Allocator);
         self.special.deinit(Allocator);
         self.* = .{};
     }
@@ -851,33 +818,23 @@ fn mergeChunkResults(
     }
 
     try accumulator.ids.ensureTotalCapacity(Allocator, accumulator.ids.items.len + total_owned);
-    try accumulator.tokens.ensureTotalCapacity(Allocator, accumulator.tokens.items.len + total_owned);
     try accumulator.special.ensureTotalCapacity(Allocator, accumulator.special.items.len + total_owned);
 
-    // Merge owned tokens, free disowned token strings
+    // Merge owned tokens
     for (results, own_starts, own_ends) |*r, own_start, own_end| {
         var token_pos: usize = 0;
         for (r.word_offsets.items, r.word_token_counts.items) |offset, count| {
             if (offset >= own_start and offset < own_end) {
-                // Owned — transfer tokens to accumulator
+                // Owned — transfer IDs to accumulator
                 const start_idx = token_pos;
                 const end_idx = token_pos + count;
                 accumulator.ids.appendSliceAssumeCapacity(r.accum.ids.items[start_idx..end_idx]);
-                accumulator.tokens.appendSliceAssumeCapacity(r.accum.tokens.items[start_idx..end_idx]);
                 accumulator.special.appendSliceAssumeCapacity(r.accum.special.items[start_idx..end_idx]);
-            } else {
-                // Disowned — free token strings
-                const start_idx = token_pos;
-                const end_idx = token_pos + count;
-                for (r.accum.tokens.items[start_idx..end_idx]) |token_ptr| {
-                    Allocator.free(std.mem.span(token_ptr));
-                }
             }
             token_pos += count;
         }
         // Free containers
         r.accum.ids.deinit(Allocator);
-        r.accum.tokens.deinit(Allocator);
         r.accum.special.deinit(Allocator);
         r.accum = .{};
         r.word_token_counts.deinit(Allocator);

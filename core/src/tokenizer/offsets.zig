@@ -31,21 +31,46 @@ pub fn computeOffsetsFromEncoding(
 
     var text_offset: u32 = 0;
 
+    const enc_ids: [*]i32 = if (encoding.ids) |ids| @ptrCast(ids) else {
+        @memset(offsets, .{ .start = 0, .end = 0 });
+        return offsets;
+    };
+    const token_cstrs: ?[*][*c]u8 = if (encoding.tokens) |toks| @ptrCast(toks) else null;
+    const is_byte_level = tokenizer_handle.pretokenizer.byte_level != 0;
+    const unk_id = tokenizer_handle.getUnkId();
+
     for (0..token_count) |token_idx| {
-        const token_cstrs: [*][*c]u8 = if (encoding.tokens) |toks|
-            @ptrCast(toks)
-        else {
-            offsets[token_idx] = .{ .start = 0, .end = 0 };
-            continue;
+        const token_id = enc_ids[token_idx];
+
+        // Resolve token text: from encoding.tokens if available, otherwise from vocab by ID.
+        const token_text: []const u8 = blk: {
+            if (token_cstrs) |ts| {
+                const token_ptr: [*c]u8 = ts[token_idx];
+                if (token_ptr != null) break :blk std.mem.sliceTo(token_ptr, 0);
+            }
+            // Fall back to vocabulary lookup by ID.
+            // For unk tokens, idToToken returns "<unk>" which won't match source text.
+            // In byte-level mode each unk represents exactly 1 source byte, handled below.
+            if (is_byte_level and token_id == unk_id) break :blk "";
+            break :blk tokenizer_handle.idToToken(token_id) orelse
+                tok_encode.findAddedTokenContentById(tokenizer_handle, token_id) orelse "";
         };
 
-        const token_ptr: [*c]u8 = token_cstrs[token_idx];
-        if (token_ptr == null) {
-            offsets[token_idx] = .{ .start = 0, .end = 0 };
+        // Byte-level unk: each unk token represents 1 source byte
+        if (token_text.len == 0 and is_byte_level and token_id == unk_id) {
+            if (text_offset < text.len) {
+                offsets[token_idx] = .{ .start = text_offset, .end = text_offset + 1 };
+                text_offset += 1;
+            } else {
+                offsets[token_idx] = .{ .start = 0, .end = 0 };
+            }
             continue;
         }
 
-        const token_text = std.mem.sliceTo(token_ptr, 0);
+        if (token_text.len == 0) {
+            offsets[token_idx] = .{ .start = 0, .end = 0 };
+            continue;
+        }
         const token_byte_sequence = decodeTokenToBytes(alloc, token_text, tokenizer_handle) catch {
             offsets[token_idx] = .{ .start = 0, .end = 0 };
             continue;

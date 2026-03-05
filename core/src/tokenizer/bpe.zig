@@ -572,7 +572,6 @@ fn initByteMap(model: *BpeModel) !void {
 
 const EncodedWord = struct {
     ids: []i32,
-    tokens: [][*:0]u8,
 };
 
 fn findBestPair(
@@ -610,26 +609,16 @@ fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWo
         word_z_buf[word.len] = 0;
         if (tok_fns.tokenizer_added_token_find(tok, &word_z_buf)) |added| {
             const ids = try allocator.alloc(i32, 1);
-            errdefer allocator.free(ids);
-            const toks = try allocator.alloc([*:0]u8, 1);
-            errdefer allocator.free(toks);
             ids[0] = added.*.id;
-            const dup_tok = try allocator.dupeZ(u8, word);
-            toks[0] = dup_tok.ptr;
-            return EncodedWord{ .ids = ids, .tokens = toks };
+            return EncodedWord{ .ids = ids };
         }
     } else {
         const word_z = try allocator.dupeZ(u8, word);
         defer allocator.free(word_z);
         if (tok_fns.tokenizer_added_token_find(tok, word_z.ptr)) |added| {
             const ids = try allocator.alloc(i32, 1);
-            errdefer allocator.free(ids);
-            const toks = try allocator.alloc([*:0]u8, 1);
-            errdefer allocator.free(toks);
             ids[0] = added.*.id;
-            const dup_tok = try allocator.dupeZ(u8, word);
-            toks[0] = dup_tok.ptr;
-            return EncodedWord{ .ids = ids, .tokens = toks };
+            return EncodedWord{ .ids = ids };
         }
     }
 
@@ -805,77 +794,41 @@ fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWo
         if (!all_known) {
             if (model.vocab_hash.get(word)) |id| {
                 const ids = try allocator.alloc(i32, 1);
-                errdefer allocator.free(ids);
-                const toks = try allocator.alloc([*:0]u8, 1);
-                errdefer allocator.free(toks);
                 ids[0] = id;
-                const dup_tok = try allocator.dupeZ(u8, word);
-                toks[0] = dup_tok.ptr;
-                return EncodedWord{ .ids = ids, .tokens = toks };
+                return EncodedWord{ .ids = ids };
             }
         }
     }
 
-    // 4. Collect results from linked list
+    // 4. Collect IDs from linked list
     var result_ids = std.ArrayListUnmanaged(i32){};
     errdefer result_ids.deinit(allocator);
-    var result_tokens_list = std.ArrayListUnmanaged([*:0]u8){};
-    errdefer {
-        for (result_tokens_list.items) |t| allocator.free(std.mem.sliceTo(t, 0));
-        result_tokens_list.deinit(allocator);
-    }
 
     var si: i32 = 0;
     while (si >= 0) {
         const sym = &syms[@intCast(si)];
-        const token_bytes = word[sym.start .. sym.start + sym.len];
 
         if (sym.id >= 0) {
-            // Token has a valid vocab ID
             try result_ids.append(allocator, sym.id);
-            const dup = try allocator.dupeZ(u8, token_bytes);
-            try result_tokens_list.append(allocator, dup.ptr);
         } else if (!is_byte_level) {
             // SentencePiece: use byte fallback for unknown tokens
+            const token_bytes = word[sym.start .. sym.start + sym.len];
             for (token_bytes) |byte_val| {
                 const fallback_id = model.byte_fallback_ids[byte_val];
-                if (fallback_id >= 0) {
-                    try result_ids.append(allocator, fallback_id);
-                    var tok_str: [7]u8 = undefined;
-                    tok_str[0] = '<';
-                    tok_str[1] = '0';
-                    tok_str[2] = 'x';
-                    const hex_chars = "0123456789ABCDEF";
-                    tok_str[3] = hex_chars[byte_val >> 4];
-                    tok_str[4] = hex_chars[byte_val & 0x0F];
-                    tok_str[5] = '>';
-                    tok_str[6] = 0;
-                    const dup = try allocator.dupeZ(u8, tok_str[0..6]);
-                    try result_tokens_list.append(allocator, dup.ptr);
-                } else {
-                    try result_ids.append(allocator, model.unk_id);
-                    const dup = try allocator.dupeZ(u8, token_bytes);
-                    try result_tokens_list.append(allocator, dup.ptr);
-                }
+                try result_ids.append(allocator, if (fallback_id >= 0) fallback_id else model.unk_id);
             }
         } else {
-            // Byte-level BPE: use UNK for unknown tokens
             try result_ids.append(allocator, model.unk_id);
-            const dup = try allocator.dupeZ(u8, token_bytes);
-            try result_tokens_list.append(allocator, dup.ptr);
         }
         si = sym.next;
     }
 
     return EncodedWord{
         .ids = try result_ids.toOwnedSlice(allocator),
-        .tokens = try result_tokens_list.toOwnedSlice(allocator),
     };
 }
 
 fn freeEncodedWord(allocator: std.mem.Allocator, encoded: EncodedWord) void {
-    for (encoded.tokens) |tok_ptr| allocator.free(std.mem.sliceTo(tok_ptr, 0));
-    allocator.free(encoded.tokens);
     allocator.free(encoded.ids);
 }
 
@@ -895,9 +848,9 @@ fn bpe_encode(tok: *ct.Tokenizer, input: [*c]const u8, enc: *ct.TokenizerEncodin
     };
 
     enc.ids_len = encoded.ids.len;
-    enc.tokens_len = encoded.tokens.len;
+    enc.tokens_len = encoded.ids.len;
     enc.ids = @ptrCast(encoded.ids);
-    enc.tokens = @ptrCast(encoded.tokens);
+    // tokens left as null — strings resolved lazily by consumers that need them
     return 0;
 }
 
@@ -912,9 +865,8 @@ fn bpe_encode_slice_impl(model: *BpeModel, tok: *ct.Tokenizer, text: []const u8,
     };
 
     enc.ids_len = encoded.ids.len;
-    enc.tokens_len = encoded.tokens.len;
+    enc.tokens_len = encoded.ids.len;
     enc.ids = @ptrCast(encoded.ids);
-    enc.tokens = @ptrCast(encoded.tokens);
     return 0;
 }
 

@@ -730,10 +730,10 @@ pub fn tokenizeToBytes(
     }
     defer encode.tokenizer_encoding_free_struct(&token_encoding);
 
-    const token_count = token_encoding.tokens_len;
+    const token_count = token_encoding.ids_len;
 
     // Handle empty result
-    if (token_count == 0 or token_encoding.tokens == null) {
+    if (token_count == 0 or token_encoding.ids == null) {
         const offsets = try allocator.alloc(usize, 1);
         offsets[0] = 0;
         return TokenizeBytesResult{
@@ -743,14 +743,24 @@ pub fn tokenizeToBytes(
         };
     }
 
-    const token_cstrs: [*][*c]u8 = @ptrCast(token_encoding.tokens.?);
+    const ids_ptr: [*]i32 = @ptrCast(token_encoding.ids.?);
+    const token_cstrs: ?[*][*c]u8 = if (token_encoding.tokens) |t| @ptrCast(t) else null;
+
+    // Resolve token string: from encoding.tokens if available, otherwise from vocab by ID.
+    const resolveToken = struct {
+        fn resolve(cstrs: ?[*][*c]u8, ids: [*]i32, idx: usize, tok_handle: *ct.Tokenizer) []const u8 {
+            if (cstrs) |ts| {
+                if (ts[idx]) |ptr| return std.mem.span(@as([*:0]u8, @ptrCast(ptr)));
+            }
+            return tok_handle.idToToken(ids[idx]) orelse
+                @import("encode.zig").findAddedTokenContentById(tok_handle, ids[idx]) orelse "";
+        }
+    }.resolve;
 
     // Calculate total bytes needed
     var total_bytes: usize = 0;
     for (0..token_count) |i| {
-        if (token_cstrs[i]) |ptr| {
-            total_bytes += std.mem.len(@as([*:0]u8, @ptrCast(ptr)));
-        }
+        total_bytes += resolveToken(token_cstrs, ids_ptr, i, tokenizer_handle).len;
     }
 
     // Allocate output buffers
@@ -767,13 +777,11 @@ pub fn tokenizeToBytes(
     var write_pos: usize = 0;
     for (0..token_count) |i| {
         offsets[i] = write_pos;
-        if (token_cstrs[i]) |ptr| {
-            const token_bytes = std.mem.span(@as([*:0]u8, @ptrCast(ptr)));
-            if (data.len > 0) {
-                @memcpy(data[write_pos..][0..token_bytes.len], token_bytes);
-            }
-            write_pos += token_bytes.len;
+        const token_bytes = resolveToken(token_cstrs, ids_ptr, i, tokenizer_handle);
+        if (data.len > 0 and token_bytes.len > 0) {
+            @memcpy(data[write_pos..][0..token_bytes.len], token_bytes);
         }
+        write_pos += token_bytes.len;
     }
     offsets[token_count] = write_pos;
 
