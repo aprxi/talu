@@ -362,18 +362,9 @@ fn layerBackward(
             // Per-position grad_q is overwritten by the kernel
             const pos_grad_q = grad_q[q_offset..][0 .. nh * hd];
 
-            // The attention backward kernel expects:
-            //   probs: [n_heads * seq_len] for this position
-            //   key_cache: [seq_len * n_kv_heads * head_dim] for this batch
-            //   value_cache: [seq_len * n_kv_heads * head_dim] for this batch
-            //   grad_k: [seq_len * n_kv_heads * head_dim] accumulated
-            //   grad_v: [seq_len * n_kv_heads * head_dim] accumulated
-
-            // Build probs slice for this position: [n_heads * seq_len]
-            // In cache, probs are [batch * n_heads * seq * seq]
-            // For batch bi, head h, query pos qi: offset = (bi * nh + h) * s * s + qi * s
-            // We need contiguous [nh * s] slice, but storage is not contiguous across heads.
-            // We need to gather per-head prob rows into a contiguous buffer.
+            // Gather prob rows for all heads at this position.
+            // probs layout: [batch * n_heads * seq * seq]
+            // For (bi, h, pos): offset = (bi * nh + h) * s * s + pos * s
             var prob_buf: [4096]f32 = undefined;
             const prob_slice = prob_buf[0 .. nh * s];
             for (0..nh) |h| {

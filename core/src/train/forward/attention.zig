@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const compute = @import("../../compute/root.zig");
+const parallel = @import("../../system/parallel.zig");
 
 const simd = compute.cpu.simd.arch;
 const VEC = simd.f32_vec_len;
@@ -49,6 +50,89 @@ fn simdScaleAdd(out: []f32, v: []const f32, scale: f32) void {
     }
 }
 
+/// Context for threaded attention forward.
+const AttnCtx = struct {
+    output: []f32,
+    probs_out: []f32,
+    q: []const f32,
+    k: []const f32,
+    v: []const f32,
+    seq_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    kv_groups: usize,
+    heads_x_seq: usize,
+};
+
+/// Process attention for a range of (batch, head, query_position) triples.
+/// Items are ordered as: item = bi * n_heads * seq_len + h * seq_len + qi
+/// so consecutive items share the same (bi, h) for cache locality.
+fn attnTask(start: usize, end: usize, ctx: *AttnCtx) void {
+    const seq_len = ctx.seq_len;
+    const n_heads = ctx.n_heads;
+    const n_kv_heads = ctx.n_kv_heads;
+    const head_dim = ctx.head_dim;
+    const scale = ctx.scale;
+    const kv_groups = ctx.kv_groups;
+    const heads_x_seq = ctx.heads_x_seq;
+
+    for (start..end) |item| {
+        const bi = item / heads_x_seq;
+        const remainder = item % heads_x_seq;
+        const h = remainder / seq_len;
+        const qi = remainder % seq_len;
+        const kv_h = h / kv_groups;
+
+        const q_offset = (bi * seq_len + qi) * n_heads * head_dim + h * head_dim;
+        const q_vec = ctx.q[q_offset..][0..head_dim];
+        const prob_offset = (bi * n_heads + h) * seq_len * seq_len + qi * seq_len;
+        const prob_row = ctx.probs_out[prob_offset..][0..seq_len];
+
+        // Compute scores with causal mask
+        var max_score: f32 = -std.math.inf(f32);
+        for (0..seq_len) |ki| {
+            if (ki > qi) {
+                prob_row[ki] = -std.math.inf(f32);
+            } else {
+                const k_offset = (bi * seq_len + ki) * n_kv_heads * head_dim + kv_h * head_dim;
+                const k_vec = ctx.k[k_offset..][0..head_dim];
+                const dot = simdDot(q_vec, k_vec);
+                prob_row[ki] = dot * scale;
+                max_score = @max(max_score, prob_row[ki]);
+            }
+        }
+
+        // Softmax over valid positions [0..qi+1]
+        var sum_exp: f32 = 0.0;
+        for (0..seq_len) |ki| {
+            if (ki > qi) {
+                prob_row[ki] = 0.0;
+            } else {
+                const e = @exp(prob_row[ki] - max_score);
+                prob_row[ki] = e;
+                sum_exp += e;
+            }
+        }
+        const inv_sum = if (sum_exp > 0.0) 1.0 / sum_exp else 0.0;
+        for (0..seq_len) |ki| {
+            prob_row[ki] *= inv_sum;
+        }
+
+        // Weighted sum of values
+        const out_offset = (bi * seq_len + qi) * n_heads * head_dim + h * head_dim;
+        const out_vec = ctx.output[out_offset..][0..head_dim];
+        @memset(out_vec, 0.0);
+        for (0..seq_len) |ki| {
+            if (prob_row[ki] == 0.0) continue;
+            const v_offset = (bi * seq_len + ki) * n_kv_heads * head_dim + kv_h * head_dim;
+            const v_vec = ctx.v[v_offset..][0..head_dim];
+            simdScaleAdd(out_vec, v_vec, prob_row[ki]);
+        }
+    }
+}
+
 /// Scaled dot-product attention with causal masking (full sequence, training mode).
 ///
 /// Q: [batch * seq * n_heads * head_dim]  (stored as [bs, n_heads * head_dim])
@@ -70,62 +154,24 @@ pub fn attentionForward(
 ) void {
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     const kv_groups = n_heads / n_kv_heads;
+    const total_items = batch * n_heads * seq_len;
 
-    for (0..batch) |bi| {
-        for (0..n_heads) |h| {
-            const kv_h = h / kv_groups;
+    var ctx = AttnCtx{
+        .output = output,
+        .probs_out = probs_out,
+        .q = q,
+        .k = k,
+        .v = v,
+        .seq_len = seq_len,
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .scale = scale,
+        .kv_groups = kv_groups,
+        .heads_x_seq = n_heads * seq_len,
+    };
 
-            // Compute attention scores: scores[qi, ki] = Q[qi] . K[ki] * scale
-            // Then apply causal mask and softmax
-            for (0..seq_len) |qi| {
-                const q_offset = (bi * seq_len + qi) * n_heads * head_dim + h * head_dim;
-                const q_vec = q[q_offset..][0..head_dim];
-                const prob_offset = (bi * n_heads + h) * seq_len * seq_len + qi * seq_len;
-                const prob_row = probs_out[prob_offset..][0..seq_len];
-
-                // Compute scores with causal mask
-                var max_score: f32 = -std.math.inf(f32);
-                for (0..seq_len) |ki| {
-                    if (ki > qi) {
-                        prob_row[ki] = -std.math.inf(f32);
-                    } else {
-                        const k_offset = (bi * seq_len + ki) * n_kv_heads * head_dim + kv_h * head_dim;
-                        const k_vec = k[k_offset..][0..head_dim];
-                        const dot = simdDot(q_vec, k_vec);
-                        prob_row[ki] = dot * scale;
-                        max_score = @max(max_score, prob_row[ki]);
-                    }
-                }
-
-                // Softmax over valid positions [0..qi+1]
-                var sum_exp: f32 = 0.0;
-                for (0..seq_len) |ki| {
-                    if (ki > qi) {
-                        prob_row[ki] = 0.0;
-                    } else {
-                        const e = @exp(prob_row[ki] - max_score);
-                        prob_row[ki] = e;
-                        sum_exp += e;
-                    }
-                }
-                const inv_sum = if (sum_exp > 0.0) 1.0 / sum_exp else 0.0;
-                for (0..seq_len) |ki| {
-                    prob_row[ki] *= inv_sum;
-                }
-
-                // Weighted sum of values: output[qi, h] = sum_ki(probs[qi, ki] * V[ki])
-                const out_offset = (bi * seq_len + qi) * n_heads * head_dim + h * head_dim;
-                const out_vec = output[out_offset..][0..head_dim];
-                @memset(out_vec, 0.0);
-                for (0..seq_len) |ki| {
-                    if (prob_row[ki] == 0.0) continue;
-                    const v_offset = (bi * seq_len + ki) * n_kv_heads * head_dim + kv_h * head_dim;
-                    const v_vec = v[v_offset..][0..head_dim];
-                    simdScaleAdd(out_vec, v_vec, prob_row[ki]);
-                }
-            }
-        }
-    }
+    parallel.global().parallelFor(total_items, attnTask, &ctx);
 }
 
 // =============================================================================
