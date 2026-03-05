@@ -485,6 +485,8 @@ pub fn runBpe(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: usize,
         words[i] = token.sliceConst();
     }
 
+    const model: *bpe_mod.BpeModel = @ptrCast(@alignCast(tok.tokenizer_handle.model.?));
+
     const total_iters = cfg.warmup + cfg.iters;
     const samples = try allocator.alloc(harness.Sample, cfg.iters);
     errdefer allocator.free(samples);
@@ -494,16 +496,15 @@ pub fn runBpe(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: usize,
 
     var iter: usize = 0;
     while (iter < total_iters) : (iter += 1) {
-        var token_count: u64 = 0;
+        // Direct BPE path: shared IdList across all words (matches production)
+        var shared_ids = bpe_mod.IdList{};
+        defer shared_ids.deinit(model.allocator);
         const t0 = std.time.nanoTimestamp();
         for (words) |word| {
-            var encoding = std.mem.zeroes(ct.TokenizerEncoding);
-            const rc = tok.tokenizer_handle.encodeSlice(word, &encoding);
-            if (rc == 0) token_count += encoding.ids_len;
-            encode_mod.tokenizer_encoding_free_struct(&encoding);
+            model.encodeWordDirect(tok.tokenizer_handle, word, &shared_ids) catch continue;
         }
         const t1 = std.time.nanoTimestamp();
-        last_token_count = token_count;
+        last_token_count = shared_ids.items.len;
 
         const sample = harness.Sample{ .encode_ns = elapsedNs(t0, t1) };
         if (iter == 0) cold_first = sample;
@@ -520,7 +521,7 @@ pub fn runBpe(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: usize,
         .cold_first = cold_first,
         .input_bytes = target_bytes,
         .output_tokens = last_token_count,
-        .note = "BPE per-word only",
+        .note = "BPE per-word (direct path)",
     };
 }
 
@@ -766,32 +767,19 @@ pub fn runBpeCollect(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes:
     var iter: usize = 0;
     while (iter < total_iters) : (iter += 1) {
         var token_count: u64 = 0;
+        // Shared IdList across all words (matches production direct path)
+        var shared_ids = bpe_mod.IdList{};
+        defer shared_ids.deinit(bpe_allocator);
         const t0 = std.time.nanoTimestamp();
         for (0..word_count) |wi| {
             const cs = collect_offsets[wi];
             const ce = collect_offsets[wi + 1];
-            const word = words[wi];
-
-            // Real result collection pattern from bpe.zig:737-766
-            var result_ids = std.ArrayListUnmanaged(i32){};
-            var result_tokens = std.ArrayListUnmanaged([*:0]u8){};
 
             for (all_collect.items[cs..ce]) |csym| {
-                const token_bytes = word[csym.start .. csym.start + csym.len];
-                result_ids.append(bpe_allocator, csym.id) catch continue;
-                const dup = bpe_allocator.dupeZ(u8, token_bytes) catch continue;
-                result_tokens.append(bpe_allocator, dup.ptr) catch continue;
+                shared_ids.append(bpe_allocator, csym.id) catch continue;
             }
 
-            const owned_ids = result_ids.toOwnedSlice(bpe_allocator) catch &[_]i32{};
-            const owned_toks = result_tokens.toOwnedSlice(bpe_allocator) catch &[_][*:0]u8{};
-
             token_count += ce - cs;
-
-            // Free everything (matches real BPE cleanup)
-            for (owned_toks) |t| bpe_allocator.free(std.mem.sliceTo(t, 0));
-            if (owned_toks.len > 0) bpe_allocator.free(owned_toks);
-            if (owned_ids.len > 0) bpe_allocator.free(owned_ids);
         }
         const t1 = std.time.nanoTimestamp();
         last_token_count = token_count;

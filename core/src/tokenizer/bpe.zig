@@ -102,6 +102,13 @@ pub const BpeModel = struct {
         return bpe_encode_slice_impl(self, tok, input, enc);
     }
 
+    /// Encode a word and append IDs directly to the caller's list.
+    /// Bypasses the TokenizerEncoding intermediary — no per-word allocation.
+    /// Skips the added-token check (caller must pre-separate added tokens).
+    pub fn encodeWordDirect(self: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_ids: *IdList) !void {
+        return encodeWordCore(self, tok, word, out_ids);
+    }
+
     /// Decode token IDs to text
     pub fn decode(self: *BpeModel, tok: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
         return bpe_decode_impl(self, tok, ids, ids_len, out, out_len);
@@ -570,9 +577,7 @@ fn initByteMap(model: *BpeModel) !void {
 }
 
 
-const EncodedWord = struct {
-    ids: []i32,
-};
+pub const IdList = std.ArrayListUnmanaged(i32);
 
 fn findBestPair(
     tokens: []const []const u8,
@@ -599,45 +604,50 @@ fn findBestPair(
     return null;
 }
 
-fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWord {
-    const allocator = model.allocator;
-
-    // Fast path: check if entire word is an added token
+/// Encode a word with added-token check (for C API vtable path).
+fn encodeWordAppend(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_ids: *IdList) !void {
+    // Check if entire word is an added token
     if (word.len < 128) {
         var word_z_buf: [128:0]u8 = undefined;
         @memcpy(word_z_buf[0..word.len], word);
         word_z_buf[word.len] = 0;
         if (tok_fns.tokenizer_added_token_find(tok, &word_z_buf)) |added| {
-            const ids = try allocator.alloc(i32, 1);
-            ids[0] = added.*.id;
-            return EncodedWord{ .ids = ids };
+            try out_ids.append(model.allocator, added.*.id);
+            return;
         }
     } else {
-        const word_z = try allocator.dupeZ(u8, word);
-        defer allocator.free(word_z);
+        const word_z = try model.allocator.dupeZ(u8, word);
+        defer model.allocator.free(word_z);
         if (tok_fns.tokenizer_added_token_find(tok, word_z.ptr)) |added| {
-            const ids = try allocator.alloc(i32, 1);
-            ids[0] = added.*.id;
-            return EncodedWord{ .ids = ids };
+            try out_ids.append(model.allocator, added.*.id);
+            return;
         }
     }
+    return encodeWordCore(model, tok, word, out_ids);
+}
 
+/// Core BPE encode: symbol init → merge loop → collect. No added-token check.
+/// Used by the direct encode path where added tokens are pre-separated.
+fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_ids: *IdList) !void {
+    const allocator = model.allocator;
     const is_byte_level = tok.pretokenizer.byte_level != 0;
 
     // --- Linked-list BPE merge with integer pair lookups ---
 
     // 1. Split word into UTF-8 characters → Symbol array.
-    //    Stack-allocated for small words; heap fallback for words exceeding
-    //    MAX_WORD_SYMBOLS to handle arbitrarily long regex-matched words.
+    //    Stack-allocated for small words (word.len is an upper bound on char
+    //    count since each UTF-8 char is >= 1 byte); heap fallback for words
+    //    exceeding MAX_WORD_SYMBOLS bytes.
     var stack_syms: [MAX_WORD_SYMBOLS]Symbol = undefined;
     var heap_syms: ?[]Symbol = null;
     defer if (heap_syms) |hs| allocator.free(hs);
 
     var n_syms: usize = 0;
 
-    // Count UTF-8 characters to determine if heap allocation is needed.
-    var n_chars: usize = 0;
-    {
+    var syms: []Symbol = &stack_syms;
+    if (word.len > MAX_WORD_SYMBOLS) {
+        // Count UTF-8 characters for exact heap sizing (rare path)
+        var n_chars: usize = 0;
         var bi: usize = 0;
         while (bi < word.len) {
             const cl = utf8CharLen(word[bi]);
@@ -645,14 +655,11 @@ fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWo
             bi += cl;
             n_chars += 1;
         }
+        if (n_chars > MAX_WORD_SYMBOLS) {
+            heap_syms = try allocator.alloc(Symbol, n_chars);
+            syms = heap_syms.?;
+        }
     }
-
-    const syms: []Symbol = if (n_chars <= MAX_WORD_SYMBOLS)
-        &stack_syms
-    else blk: {
-        heap_syms = try allocator.alloc(Symbol, n_chars);
-        break :blk heap_syms.?;
-    };
 
     {
         var byte_idx: usize = 0;
@@ -660,8 +667,7 @@ fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWo
             const char_len = utf8CharLen(word[byte_idx]);
             if (byte_idx + char_len > word.len) return error.InvalidUtf8;
 
-            const char_slice = word[byte_idx .. byte_idx + char_len];
-            const id = model.vocab_hash.get(char_slice) orelse -1;
+            const id: i32 = model.vocab_hash.get(word[byte_idx .. byte_idx + char_len]) orelse -1;
 
             syms[n_syms] = .{
                 .id = id,
@@ -674,6 +680,23 @@ fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWo
             byte_idx += char_len;
             n_syms += 1;
         }
+    }
+
+    // Fast path: single-symbol words skip merge loop and collect entirely.
+    if (n_syms == 1) {
+        const sym = &syms[0];
+        if (sym.id >= 0) {
+            try out_ids.append(allocator, sym.id);
+        } else if (!is_byte_level) {
+            const token_bytes = word[sym.start .. sym.start + sym.len];
+            for (token_bytes) |byte_val| {
+                const fallback_id = model.byte_fallback_ids[byte_val];
+                try out_ids.append(allocator, if (fallback_id >= 0) fallback_id else model.unk_id);
+            }
+        } else {
+            try out_ids.append(allocator, model.unk_id);
+        }
+        return;
     }
 
     // 2. Merge loop: cached-pair approach.
@@ -793,46 +816,74 @@ fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWo
         }
         if (!all_known) {
             if (model.vocab_hash.get(word)) |id| {
-                const ids = try allocator.alloc(i32, 1);
-                ids[0] = id;
-                return EncodedWord{ .ids = ids };
+                try out_ids.append(allocator, id);
+                return;
             }
         }
     }
 
-    // 4. Collect IDs from linked list
-    var result_ids = std.ArrayListUnmanaged(i32){};
-    errdefer result_ids.deinit(allocator);
+    // 4. Collect IDs from linked list directly into output.
+    //    Pre-count surviving symbols to reserve capacity, then append without
+    //    per-token capacity checks.
+    {
+        var n_output: usize = 0;
+        var ci: i32 = 0;
+        while (ci >= 0) {
+            const csym = &syms[@intCast(ci)];
+            if (csym.id >= 0) {
+                n_output += 1;
+            } else if (!is_byte_level) {
+                n_output += csym.len; // byte fallback: one ID per byte
+            } else {
+                n_output += 1;
+            }
+            ci = csym.next;
+        }
+        try out_ids.ensureUnusedCapacity(allocator, n_output);
+    }
 
     var si: i32 = 0;
     while (si >= 0) {
         const sym = &syms[@intCast(si)];
 
         if (sym.id >= 0) {
-            try result_ids.append(allocator, sym.id);
+            out_ids.appendAssumeCapacity(sym.id);
         } else if (!is_byte_level) {
             // SentencePiece: use byte fallback for unknown tokens
             const token_bytes = word[sym.start .. sym.start + sym.len];
             for (token_bytes) |byte_val| {
                 const fallback_id = model.byte_fallback_ids[byte_val];
-                try result_ids.append(allocator, if (fallback_id >= 0) fallback_id else model.unk_id);
+                out_ids.appendAssumeCapacity(if (fallback_id >= 0) fallback_id else model.unk_id);
             }
         } else {
-            try result_ids.append(allocator, model.unk_id);
+            out_ids.appendAssumeCapacity(model.unk_id);
         }
         si = sym.next;
     }
-
-    return EncodedWord{
-        .ids = try result_ids.toOwnedSlice(allocator),
-    };
-}
-
-fn freeEncodedWord(allocator: std.mem.Allocator, encoded: EncodedWord) void {
-    allocator.free(encoded.ids);
 }
 
 // ============= C API callbacks =============
+
+/// Encode a word via the C API path (vtable). Allocates IDs for the encoding struct.
+fn bpe_encode_via_encoding(model: *BpeModel, tok: *ct.Tokenizer, text: []const u8, enc: *ct.TokenizerEncoding) c_int {
+    var ids_list = IdList{};
+    encodeWordAppend(model, tok, text, &ids_list) catch |err| {
+        log.trace("tokenizer", "encodeWord failed", .{ .err = @errorName(err) }, @src());
+        tok_fns.tokenizer_set_error(tok, "BPE encode failed");
+        ids_list.deinit(model.allocator);
+        return -1;
+    };
+
+    // Transfer ownership: toOwnedSlice gives exact-sized allocation
+    const owned = ids_list.toOwnedSlice(model.allocator) catch {
+        ids_list.deinit(model.allocator);
+        return -1;
+    };
+    enc.ids_len = owned.len;
+    enc.tokens_len = owned.len;
+    enc.ids = @ptrCast(owned.ptr);
+    return 0;
+}
 
 fn bpe_encode(tok: *ct.Tokenizer, input: [*c]const u8, enc: *ct.TokenizerEncoding) c_int {
     if (tok.model == null) return -1;
@@ -840,34 +891,13 @@ fn bpe_encode(tok: *ct.Tokenizer, input: [*c]const u8, enc: *ct.TokenizerEncodin
     const text = std.mem.sliceTo(input, 0);
 
     log.trace("tokenizer", "bpe_encode", .{ .text_len = text.len, .vocab_size = model.vocab_hash.count() }, @src());
-
-    const encoded = encodeWord(model, tok, text) catch |err| {
-        log.trace("tokenizer", "encodeWord failed", .{ .err = @errorName(err) }, @src());
-        tok_fns.tokenizer_set_error(tok, "BPE encode failed");
-        return -1;
-    };
-
-    enc.ids_len = encoded.ids.len;
-    enc.tokens_len = encoded.ids.len;
-    enc.ids = @ptrCast(encoded.ids);
-    // tokens left as null — strings resolved lazily by consumers that need them
-    return 0;
+    return bpe_encode_via_encoding(model, tok, text, enc);
 }
 
 /// Encode with explicit length (supports embedded null bytes) - implementation
 fn bpe_encode_slice_impl(model: *BpeModel, tok: *ct.Tokenizer, text: []const u8, enc: *ct.TokenizerEncoding) c_int {
     log.trace("tokenizer", "bpe_encode_slice", .{ .text_len = text.len, .vocab_size = model.vocab_hash.count() }, @src());
-
-    const encoded = encodeWord(model, tok, text) catch |err| {
-        log.trace("tokenizer", "encodeWord failed", .{ .err = @errorName(err) }, @src());
-        tok_fns.tokenizer_set_error(tok, "BPE encode failed");
-        return -1;
-    };
-
-    enc.ids_len = encoded.ids.len;
-    enc.tokens_len = encoded.ids.len;
-    enc.ids = @ptrCast(encoded.ids);
-    return 0;
+    return bpe_encode_via_encoding(model, tok, text, enc);
 }
 
 /// C API vtable adapter: extracts model from tokenizer and calls impl

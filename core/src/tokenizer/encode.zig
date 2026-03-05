@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const ct = @import("c_types.zig");
+const bpe = @import("bpe.zig");
 const pretokenize = @import("pretokenize.zig");
 const normalize = @import("normalize.zig");
 const postprocess = @import("postprocess.zig");
@@ -333,11 +334,9 @@ const EncodeAccum = struct {
     }
 
     /// Append tokens from cached IDs (word cache hit path).
-    fn appendCachedIds(self: *EncodeAccum, cached_ids: []const i32, tokenizer: *ct.Tokenizer) !void {
-        for (cached_ids) |id| {
-            try self.ids.append(Allocator, id);
-            try self.special.append(Allocator, checkSpecial(tokenizer.added, id));
-        }
+    fn appendCachedIds(self: *EncodeAccum, cached_ids: []const i32) !void {
+        try self.ids.appendSlice(Allocator, cached_ids);
+        try self.special.appendNTimes(Allocator, 0, cached_ids.len);
     }
 
     fn appendEncoding(self: *EncodeAccum, encoding: *const ct.TokenizerEncoding, added_head: ?*ct.AddedToken) !void {
@@ -866,11 +865,32 @@ fn encodeWord(tokenizer: *ct.Tokenizer, word_bytes: []const u8, add_sentencepiec
     // Word cache lookup: skip BPE on repeated words
     if (cache) |wc| {
         if (wc.get(word)) |cached_ids| {
-            try accumulator.appendCachedIds(cached_ids, tokenizer);
+            try accumulator.appendCachedIds(cached_ids);
             return;
         }
     }
 
+    // Direct BPE path: append IDs to accumulator without per-word allocation.
+    // This bypasses the TokenizerEncoding intermediary entirely.
+    if (tokenizer.type == .bpe) {
+        if (tokenizer.model) |model_ptr| {
+            const model: *bpe.BpeModel = @ptrCast(@alignCast(model_ptr));
+            const old_len = accumulator.ids.items.len;
+            try model.encodeWordDirect(tokenizer, word, &accumulator.ids);
+            const new_count = accumulator.ids.items.len - old_len;
+            // BPE-produced tokens from regular words are never special
+            // (special/added tokens are handled separately by encodeNormalized)
+            try accumulator.special.appendNTimes(Allocator, 0, new_count);
+
+            // Cache miss: store IDs for future hits
+            if (cache) |wc| {
+                wc.put(word, accumulator.ids.items[old_len..]);
+            }
+            return;
+        }
+    }
+
+    // Fallback for non-BPE models: go through TokenizerEncoding
     var encoding = std.mem.zeroes(ct.TokenizerEncoding);
     defer tokenizer_encoding_free_struct(&encoding);
 
