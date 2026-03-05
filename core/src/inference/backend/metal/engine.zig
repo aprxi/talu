@@ -212,36 +212,22 @@ pub const MetalBackend = struct {
         mamba_cache = 3,
     };
 
-    fn runtimeRoleForOpcode(opcode: runtime_contract.Opcode) StateRuntimeRole {
-        return switch (opcode) {
-            .multihead_attention, .mla_attention => .kv_cache,
-            .shortconv => .shortconv_cache,
-            .mamba_mixer => .mamba_cache,
-            else => .none,
+    fn runtimeRoleForRuntimeKind(runtime_kind: u8) !StateRuntimeRole {
+        return switch (runtime_kind) {
+            runtime_contract.state_runtime_kind_none => .none,
+            runtime_contract.state_runtime_kind_kv_cache => .kv_cache,
+            runtime_contract.state_runtime_kind_shortconv_cache => .shortconv_cache,
+            runtime_contract.state_runtime_kind_mamba_cache => .mamba_cache,
+            else => error.InvalidStateDescriptorBinding,
         };
     }
 
     fn deriveStateRuntimeRoles(
         descriptors: []const runtime_contract.StateDescriptor,
-        weight_handles: *weights_trait.WeightHandles,
     ) ![MaxStateDescriptors]StateRuntimeRole {
         var roles = [_]StateRuntimeRole{.none} ** MaxStateDescriptors;
-        for (weight_handles.layers) |*layer| {
-            const compiled_plan = layer.compiled_plan orelse continue;
-            for (compiled_plan.plan.instructions) |insn| {
-                const state_id = insn.state_block_id orelse continue;
-                const descriptor_idx = runtime_contract.stateDescriptorIndex(descriptors, state_id) orelse {
-                    return error.InvalidStateDescriptorBinding;
-                };
-                const inferred_role = runtimeRoleForOpcode(insn.opcode);
-                if (inferred_role == .none) continue;
-                const current_role = roles[descriptor_idx];
-                if (current_role == .none) {
-                    roles[descriptor_idx] = inferred_role;
-                } else if (current_role != inferred_role) {
-                    return error.InvalidStateDescriptorBinding;
-                }
-            }
+        for (descriptors, 0..) |descriptor, idx| {
+            roles[idx] = try runtimeRoleForRuntimeKind(descriptor.runtime_kind);
         }
         return roles;
     }
@@ -588,10 +574,7 @@ pub const MetalBackend = struct {
                 );
             }
         }
-        const state_runtime_roles = try deriveStateRuntimeRoles(
-            state_descriptors_storage[0..state_descriptor_count],
-            weight_handles,
-        );
+        const state_runtime_roles = try deriveStateRuntimeRoles(state_descriptors_storage[0..state_descriptor_count]);
         var vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
         errdefer if (vision_runtime) |*rt| rt.deinit();
 
@@ -1244,6 +1227,58 @@ test "resolveCacheMaxSeqLen uses dynamic growth for very large contexts" {
 test "applyPositionDelta rejects negative resulting positions" {
     try std.testing.expectError(error.InvalidShape, common_mrope.applyPositionDelta(2, -3));
     try std.testing.expectEqual(@as(usize, 7), try common_mrope.applyPositionDelta(4, 3));
+}
+
+test "deriveStateRuntimeRoles maps descriptor runtime_kind values" {
+    const descriptors = [_]runtime_contract.StateDescriptor{
+        .{
+            .id = runtime_contract.kv_cache_state_id,
+            .size_bytes = @sizeOf(runtime_graph_mod.Cache),
+            .align_bytes = @alignOf(runtime_graph_mod.Cache),
+            .zero_init = false,
+            .lifecycle = .slot_persistent,
+            .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+        },
+        .{
+            .id = runtime_contract.shortconv_state_id,
+            .size_bytes = @sizeOf(runtime_graph_mod.ShortConvCache),
+            .align_bytes = @alignOf(runtime_graph_mod.ShortConvCache),
+            .zero_init = false,
+            .lifecycle = .slot_persistent,
+            .runtime_kind = runtime_contract.state_runtime_kind_shortconv_cache,
+        },
+        .{
+            .id = runtime_contract.mamba_state_id,
+            .size_bytes = @sizeOf(runtime_graph_mod.MambaCache),
+            .align_bytes = @alignOf(runtime_graph_mod.MambaCache),
+            .zero_init = false,
+            .lifecycle = .slot_persistent,
+            .runtime_kind = runtime_contract.state_runtime_kind_mamba_cache,
+        },
+    };
+
+    const roles = try MetalBackend.deriveStateRuntimeRoles(descriptors[0..]);
+    try std.testing.expectEqual(MetalBackend.StateRuntimeRole.kv_cache, roles[0]);
+    try std.testing.expectEqual(MetalBackend.StateRuntimeRole.shortconv_cache, roles[1]);
+    try std.testing.expectEqual(MetalBackend.StateRuntimeRole.mamba_cache, roles[2]);
+}
+
+test "deriveStateRuntimeRoles rejects unsupported runtime_kind" {
+    const descriptors = [_]runtime_contract.StateDescriptor{
+        .{
+            .id = 77,
+            .size_bytes = 64,
+            .align_bytes = 8,
+            .zero_init = false,
+            .lifecycle = .request_scoped,
+            .runtime_kind = 255,
+        },
+    };
+
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        MetalBackend.deriveStateRuntimeRoles(descriptors[0..]),
+    );
 }
 
 test "buildMultimodalMropeTables computes multimodal decode position_delta" {
