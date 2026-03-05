@@ -636,7 +636,7 @@ pub const MetalBackend = struct {
 
     /// Prefill: process all prompt tokens, return logits for last position
     pub fn prefill(self: *MetalBackend, tokens: []const u32, logits_out: []f32) !void {
-        // Single-sequence compatibility path always uses slot 0.
+        // Single-sequence entrypoint uses slot 0.
         try self.ensureSlotStateBlocksBoundForScheduler(0);
         self.slot_in_use = true;
         try self.prefillSlotImpl(0, tokens, logits_out);
@@ -1030,7 +1030,7 @@ pub const MetalBackend = struct {
 
     /// Decode: generate logits for a single token using KV cache
     pub fn decode(self: *MetalBackend, token: u32, position: usize, logits_out: []f32) !void {
-        // Single-sequence compatibility path uses slot 0.
+        // Single-sequence entrypoint uses slot 0.
         try self.ensureSlotStateBlocksBoundForScheduler(0);
         self.slot_in_use = true;
         try self.decodeSlot(0, token, position, logits_out);

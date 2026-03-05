@@ -235,14 +235,14 @@ pub const TransformerBlock = struct {
     }
 
     pub fn validateCompiledLayerProgram(lw: *const LayerWeights, layer_idx: usize) !void {
-        const compiled_plan = lw.compiled_plan orelse return error.NotImplemented;
+        const compiled_plan = lw.compiled_plan orelse return error.UnsupportedModel;
         runtime_contract.validateExecutionPlanForBlockKind(&compiled_plan.plan, lw.kind) catch |err| {
             log.warn("inference", "Metal compiled layer plan fails block-kind validation", .{
                 .layer = layer_idx,
                 .kind = @intFromEnum(lw.kind),
                 .reason = @errorName(err),
             });
-            return error.NotImplemented;
+            return error.UnsupportedModel;
         };
         if (runtime_contract.firstUnsupportedInstructionOpcode(&compiled_plan.plan, layer_program_adapter_table)) |unsupported| {
             log.warn("inference", "Metal compiled layer plan contains unsupported opcode", .{
@@ -251,7 +251,7 @@ pub const TransformerBlock = struct {
                 .kind = @intFromEnum(lw.kind),
                 .opcode = @intFromEnum(unsupported.opcode),
             });
-            return error.NotImplemented;
+            return error.UnsupportedModel;
         }
     }
 
@@ -1376,25 +1376,6 @@ pub const TransformerBlock = struct {
         );
     }
 
-    fn requireBoundInstructionStateValue(
-        comptime T: type,
-        ctx: *LayerProgramExecutionContext,
-        insn: *const runtime_contract.Instruction,
-    ) !T {
-        var state_blocks = try layerProgramStateBlocksForInstruction(insn, ctx);
-        return requireInstructionStateValue(T, ctx, insn, state_blocks.slice());
-    }
-
-    fn boundInstructionStateValueOrNull(
-        comptime T: type,
-        ctx: *LayerProgramExecutionContext,
-        insn: *const runtime_contract.Instruction,
-    ) !?T {
-        if (insn.state_block_id == null) return null;
-        var state_blocks = try layerProgramStateBlocksForInstruction(insn, ctx);
-        return try requireInstructionStateValue(T, ctx, insn, state_blocks.slice());
-    }
-
     fn forwardWithProgram(
         hidden: mlx_graph.ArrayHandle,
         lw: *const LayerWeights,
@@ -1594,7 +1575,7 @@ test "finalOutputBuffer returns kernel output buffer for post-norm endings" {
     try std.testing.expectEqual(layer_ops.BufferId.norm_out, layer_ops.finalOutputBuffer(&program));
 }
 
-test "layer program compatibility accepts kernel-add programs" {
+test "layer program contract accepts kernel-add programs" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{
             .id = 0,
@@ -1645,7 +1626,7 @@ test "layer_program_adapter_table covers Metal LayerOp execution subset" {
     try std.testing.expect(TransformerBlock.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.mul_scalar)] == null);
 }
 
-test "layer program compatibility rejects unsupported primitive ops" {
+test "layer program contract rejects unsupported primitive ops" {
     const program = [_]layer_ops.LayerOp{
         .{ .mul_scalar = .{
             .in = .residual,
@@ -1664,7 +1645,7 @@ test "layer program compatibility rejects unsupported primitive ops" {
     }
 }
 
-test "layer program compatibility rejects stateful opcode bound to wrong block kind" {
+test "layer program contract rejects stateful opcode bound to wrong block kind" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{
             .id = 0,

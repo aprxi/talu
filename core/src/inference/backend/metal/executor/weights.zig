@@ -522,7 +522,6 @@ fn compileLayerProgramContract(
     layer.register_to_slot_map = &.{};
     layer.weight_binding_keys = &.{};
     layer.weight_ptr_scratch = &.{};
-    layer.opcode_flags = .{};
     layer.slot_scratch = &.{};
     layer.instruction_handle_scratch = &.{};
     layer.instruction_view_scratch = &.{};
@@ -600,15 +599,6 @@ fn compileLayerProgramContract(
         }
     }
 
-    for (layer.compiled_plan.?.plan.instructions) |insn| {
-        switch (insn.opcode) {
-            .multihead_attention => layer.opcode_flags.has_attention = true,
-            .shortconv => layer.opcode_flags.has_shortconv = true,
-            .swiglu, .moe => layer.opcode_flags.has_ffn = true,
-            .mamba_mixer => layer.opcode_flags.has_mamba = true,
-            else => {},
-        }
-    }
 }
 
 /// Load model weights as MLX array handles on GPU.
@@ -1323,7 +1313,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 else => return error.InvalidTensorType,
             }
 
-            // Keep logits projection on one fast path by pre-orienting lm_head
+            // Pre-orient lm_head once at load time to avoid per-token transpose work.
             // once at load time instead of transposing on every decode token.
             if (lm_head_needs_transpose) {
                 const transpose_axes = [_]usize{ 1, 0 };
@@ -1332,16 +1322,6 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 weight_handles.lm_head = lm_head_t;
             }
         }
-    }
-
-    weight_handles.state_flags = .{};
-    for (weight_handles.layers) |layer| {
-        if (layer.compiled_plan == null) continue;
-        const plan = &layer.compiled_plan.?.plan;
-        const state_flags = runtime_contract.collectBuiltinStateFlags(plan);
-        if (state_flags.has_kv) weight_handles.state_flags.has_kv = true;
-        if (state_flags.has_shortconv) weight_handles.state_flags.has_shortconv = true;
-        if (state_flags.has_mamba) weight_handles.state_flags.has_mamba = true;
     }
 
     return weight_handles;
@@ -1526,7 +1506,6 @@ pub const WeightHandles = struct {
 
     // MoE configuration
     is_moe: bool = false,
-    state_flags: runtime_contract.BuiltinStateFlags = .{},
     num_experts: usize = 0,
     experts_per_token: usize = 0,
 
@@ -1647,14 +1626,6 @@ pub const WeightHandles = struct {
 
     pub const LayerWeights = struct {
         pub const invalid_slot: u8 = std.math.maxInt(u8);
-        pub const LayerProgramOpcodeFlags = packed struct(u8) {
-            has_attention: bool = false,
-            has_shortconv: bool = false,
-            has_ffn: bool = false,
-            has_mamba: bool = false,
-            _reserved: u4 = 0,
-        };
-
         pub const LayerKind = topology.BlockKind;
         pub const AttentionStorageKind = enum {
             quantized,
@@ -1696,7 +1667,6 @@ pub const WeightHandles = struct {
         weight_binding_keys: []const LayerProgramWeightBindingKey = &.{},
         /// Pre-allocated per-layer resolved weight pointer scratch.
         weight_ptr_scratch: []?*anyopaque = &.{},
-        opcode_flags: LayerProgramOpcodeFlags = .{},
         /// Pre-allocated scratch for slot buffer handles during execution.
         slot_scratch: []mlx_graph.ArrayHandle = &.{},
         /// Pre-allocated per-instruction tensor handle scratch.
