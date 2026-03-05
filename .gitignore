@@ -19,6 +19,7 @@
 !/core/POLICY.md
 !/bindings/python/POLICY.md
 !AUDIT.md
+!ADR.md
 # every .md under docs/ and examples/ is allowed
 !docs/**/*.md
 !examples/**/*.md
