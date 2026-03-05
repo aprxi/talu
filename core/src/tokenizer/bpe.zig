@@ -687,13 +687,19 @@ fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWo
         }
     }
 
-    // 2. Merge loop: find best pair via linked-list walk, merge with O(1) unlink
+    // 2. Merge loop: cached-pair approach.
+    //    Phase 1 builds a cache of all valid merge pairs (one full scan).
+    //    Phase 2 repeatedly picks the lowest-rank pair from the cache,
+    //    applies the merge, and updates only the 1-2 affected neighbors.
+    //    This reduces pair_merges hash lookups from O(n_pairs × n_passes)
+    //    to O(n_pairs + 2 × n_merges).
     if (n_syms >= 2 and model.pair_merges.count() > 0) {
-        while (true) {
-            var best_rank: i32 = std.math.maxInt(i32);
-            var best_pos: i32 = -1;
+        const CachedPair = struct { pos: i32, rank: i32, new_id: i32 };
+        var pair_cache: [MAX_WORD_SYMBOLS]CachedPair = undefined;
+        var n_cached: usize = 0;
 
-            // Walk linked list to find best merge
+        // Phase 1: Build pair cache (single scan, one hash lookup per pair)
+        {
             var si: i32 = 0;
             while (si >= 0) {
                 const sym = &syms[@intCast(si)];
@@ -701,32 +707,86 @@ fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWo
                     const right_sym = &syms[@intCast(sym.next)];
                     if (right_sym.id >= 0) {
                         if (model.pair_merges.get(.{ .left = sym.id, .right = right_sym.id })) |info| {
-                            if (info.rank < best_rank) {
-                                best_rank = info.rank;
-                                best_pos = si;
-                            }
+                            pair_cache[n_cached] = .{ .pos = si, .rank = info.rank, .new_id = info.new_id };
+                            n_cached += 1;
                         }
                     }
                 }
                 si = sym.next;
             }
+        }
 
-            if (best_pos < 0) break;
+        // Phase 2: Process merges from cache
+        while (n_cached > 0) {
+            // Find entry with minimum rank; leftmost position breaks ties
+            // (matches original left-to-right scan behavior)
+            var best_idx: usize = 0;
+            for (1..n_cached) |i| {
+                if (pair_cache[i].rank < pair_cache[best_idx].rank or
+                    (pair_cache[i].rank == pair_cache[best_idx].rank and
+                    pair_cache[i].pos < pair_cache[best_idx].pos))
+                {
+                    best_idx = i;
+                }
+            }
+            const best = pair_cache[best_idx];
 
-            // Merge: extend left symbol, unlink right
-            const left = &syms[@intCast(best_pos)];
+            // Swap-remove best entry from cache
+            n_cached -= 1;
+            if (best_idx < n_cached) pair_cache[best_idx] = pair_cache[n_cached];
+
+            // Validate: symbols may have been invalidated by an earlier merge
+            const left = &syms[@intCast(best.pos)];
+            if (left.id < 0 or left.next < 0) continue;
             const right_idx = left.next;
             const right = &syms[@intCast(right_idx)];
+            if (right.id < 0) continue;
 
-            const info = model.pair_merges.get(.{ .left = left.id, .right = right.id }).?;
-            left.id = info.new_id;
+            // Apply merge: extend left symbol, unlink right
+            left.id = best.new_id;
             left.len += right.len;
             left.next = right.next;
             if (right.next >= 0) {
-                syms[@intCast(right.next)].prev = best_pos;
+                syms[@intCast(right.next)].prev = best.pos;
             }
-            // Mark right as removed
             right.id = -2;
+
+            // Remove stale cache entries and add new neighbor pairs.
+            // After merging at pos P (right R removed):
+            //   - Entry at pos==R is invalid (R is dead)
+            //   - Entry at pos==P.prev is stale (P's id changed)
+            {
+                var ci: usize = 0;
+                while (ci < n_cached) {
+                    if (pair_cache[ci].pos == right_idx or pair_cache[ci].pos == left.prev) {
+                        n_cached -= 1;
+                        if (ci < n_cached) pair_cache[ci] = pair_cache[n_cached];
+                    } else {
+                        ci += 1;
+                    }
+                }
+            }
+
+            // Add new pair: (left_neighbor, merged)
+            if (left.prev >= 0) {
+                const ln = &syms[@intCast(left.prev)];
+                if (ln.id >= 0) {
+                    if (model.pair_merges.get(.{ .left = ln.id, .right = left.id })) |info| {
+                        pair_cache[n_cached] = .{ .pos = left.prev, .rank = info.rank, .new_id = info.new_id };
+                        n_cached += 1;
+                    }
+                }
+            }
+            // Add new pair: (merged, right_neighbor)
+            if (left.next >= 0) {
+                const rn = &syms[@intCast(left.next)];
+                if (rn.id >= 0) {
+                    if (model.pair_merges.get(.{ .left = left.id, .right = rn.id })) |info| {
+                        pair_cache[n_cached] = .{ .pos = best.pos, .rank = info.rank, .new_id = info.new_id };
+                        n_cached += 1;
+                    }
+                }
+            }
         }
     }
 

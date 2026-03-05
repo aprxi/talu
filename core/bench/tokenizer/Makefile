@@ -5,9 +5,10 @@ PROFILE ?= bw
 WARMUP ?= 4
 ITERS ?= 10
 FORMAT ?= table
+SIZE ?= 1m
 
-.PHONY: help encode_1k encode_100k encode_1m load all quick \
-        normalize_1m pretok_1m bpe_1m bpe_merge_1m bpe_vocab_1m bpe_alloc_1m \
+.PHONY: help encode_1k encode_100k encode_1m load all quick breakdown \
+        normalize_1m pretok_1m bpe_1m bpe_merge_1m bpe_vocab_1m bpe_collect_1m \
         encode_1k-csv encode_100k-csv encode_1m-csv load-csv all-csv \
         encode_1k-table encode_100k-table encode_1m-table load-table all-table
 
@@ -15,16 +16,28 @@ help:
 	@echo "Tokenizer benchmark helpers"
 	@echo ""
 	@echo "Targets:"
+	@echo "  make -C core/bench/tokenizer breakdown   TOK=<path> [SIZE=100k]"
 	@echo "  make -C core/bench/tokenizer encode_1k   TOK=<path>"
 	@echo "  make -C core/bench/tokenizer encode_100k TOK=<path>"
 	@echo "  make -C core/bench/tokenizer encode_1m   TOK=<path>"
-	@echo "  make -C core/bench/tokenizer load        TOK=<path>"
 	@echo "  make -C core/bench/tokenizer all         TOK=<path>"
 	@echo "  make -C core/bench/tokenizer quick       TOK=<path>"
 	@echo ""
 	@echo "Overrides:"
 	@echo "  TOK=<path/to/tokenizer.json>  (required)"
+	@echo "  SIZE=1k|10k|100k|1m  (for breakdown, default: 1m)"
 	@echo "  PROFILE=ci|bw FORMAT=table|csv|tsv WARMUP=<N> ITERS=<N>"
+
+breakdown:
+	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
+	@cd "$(ROOT_DIR)" && \
+	zig build bench-tokenizer -Drelease -- \
+		--scenario breakdown \
+		--tokenizer "$(TOK)" \
+		--size "$(SIZE)" \
+		--profile "$(PROFILE)" \
+		--warmup "$(WARMUP)" \
+		--iters "$(ITERS)"
 
 encode_1k:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -136,11 +149,11 @@ bpe_vocab_1m:
 		--warmup "$(WARMUP)" \
 		--iters "$(ITERS)"
 
-bpe_alloc_1m:
+bpe_collect_1m:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
 	@cd "$(ROOT_DIR)" && \
 	zig build bench-tokenizer -Drelease -- \
-		--scenario bpe_alloc_1m \
+		--scenario bpe_collect_1m \
 		--tokenizer "$(TOK)" \
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
