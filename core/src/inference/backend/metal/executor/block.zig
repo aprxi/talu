@@ -33,11 +33,9 @@ pub const MambaCache = runtime_graph.MambaCache;
 const ModelConfig = tensor.ModelConfig;
 const WeightHandles = weights_mod.WeightHandles;
 const LayerWeights = WeightHandles.LayerWeights;
-const LayerProgramWeightBindingKey = WeightHandles.LayerProgramWeightBindingKey;
 
 pub const TransformerBlock = struct {
     const MaxLayerProgramStateBindings = 256;
-    var missing_optional_array_handle: mlx_graph.ArrayHandle = null;
 
     const AttentionRuntimeBinding = union(enum) {
         mla: mla_kernel.MLAttention,
@@ -83,13 +81,10 @@ pub const TransformerBlock = struct {
         residual: *mlx_graph.ArrayHandle,
         slot_buffers: []mlx_graph.ArrayHandle,
         register_to_slot_map: []const u8,
-        weight_binding_keys: []const LayerProgramWeightBindingKey,
         instruction_handles: []runtime_contract.TensorHandle,
         instruction_views: []runtime_contract.TensorViewDesc,
-        norm_index: *usize,
-        layer_weights: *const LayerWeights,
         runtime_meta: LayerRuntimeMetadata,
-        resolved_weight_ptrs: []?*anyopaque,
+        resolved_weight_ptrs: []const ?*anyopaque,
         state_bindings: [MaxLayerProgramStateBindings]?LayerProgramStateBinding = [_]?LayerProgramStateBinding{null} ** MaxLayerProgramStateBindings,
         state_binding_count: usize = 0,
     };
@@ -310,271 +305,6 @@ pub const TransformerBlock = struct {
         return value;
     }
 
-    fn resolveLayerProgramNormWeightPtr(ctx: *LayerProgramExecutionContext) !*anyopaque {
-        const idx = ctx.norm_index.*;
-        const lw = ctx.layer_weights;
-        switch (idx) {
-            0 => return @ptrCast(@constCast(&lw.ln1_weight)),
-            1 => return @ptrCast(@constCast(&lw.ln2_weight)),
-            2 => {
-                if (lw.pre_ffn_norm) |*w| return @ptrCast(@constCast(w));
-                if (lw.post_ffn_norm) |*w| return @ptrCast(@constCast(w));
-                return error.InvalidInstructionBinding;
-            },
-            3 => {
-                if (lw.post_ffn_norm) |*w| return @ptrCast(@constCast(w));
-                return error.InvalidInstructionBinding;
-            },
-            else => return error.InvalidInstructionBinding,
-        }
-    }
-
-    fn resolveLayerProgramAttentionWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        key: LayerProgramWeightBindingKey,
-    ) !*anyopaque {
-        const lw = ctx.layer_weights;
-        if (lw.isMLA()) {
-            return switch (key) {
-                .mla_q_a_proj, .attention_q_proj => if (lw.mla_q_a_proj) |*weight|
-                    @ptrCast(@constCast(weight))
-                else if (lw.mla_q_a_proj_bf16) |*weight|
-                    @ptrCast(@constCast(weight))
-                else
-                    error.MissingWeight,
-                .mla_q_a_norm, .attention_k_proj => if (lw.mla_q_a_norm) |*weight|
-                    @ptrCast(@constCast(weight))
-                else
-                    error.MissingWeight,
-                .mla_q_b_proj, .attention_v_proj => if (lw.mla_q_b_proj) |*weight|
-                    @ptrCast(@constCast(weight))
-                else if (lw.mla_q_b_proj_bf16) |*weight|
-                    @ptrCast(@constCast(weight))
-                else
-                    error.MissingWeight,
-                .mla_kv_a_proj, .attention_o_proj => if (lw.mla_kv_a_proj) |*weight|
-                    @ptrCast(@constCast(weight))
-                else if (lw.mla_kv_a_proj_bf16) |*weight|
-                    @ptrCast(@constCast(weight))
-                else
-                    error.MissingWeight,
-                .mla_kv_a_norm, .attention_q_norm => if (lw.mla_kv_a_norm) |*weight|
-                    @ptrCast(@constCast(weight))
-                else
-                    error.MissingWeight,
-                .mla_kv_b_proj, .attention_k_norm => if (lw.mla_kv_b_proj) |*weight|
-                    @ptrCast(@constCast(weight))
-                else if (lw.mla_kv_b_proj_bf16) |*weight|
-                    @ptrCast(@constCast(weight))
-                else
-                    error.MissingWeight,
-                .mla_o_proj, .attention_q_bias => if (lw.o_proj) |*weight|
-                    @ptrCast(@constCast(weight))
-                else if (lw.o_proj_bf16) |*weight|
-                    @ptrCast(@constCast(weight))
-                else
-                    error.MissingWeight,
-                .attention_k_bias, .attention_v_bias, .attention_o_bias, .attention_attn_sinks => @ptrCast(&missing_optional_array_handle),
-                else => error.InvalidWeightBindingName,
-            };
-        }
-        if (key == .attention_q_proj) {
-            if (lw.q_proj) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.q_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .attention_k_proj) {
-            if (lw.k_proj) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.k_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .attention_v_proj) {
-            if (lw.v_proj) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.v_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .attention_o_proj) {
-            if (lw.o_proj) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.o_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .attention_q_norm) {
-            if (lw.q_norm) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        if (key == .attention_k_norm) {
-            if (lw.k_norm) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        if (key == .attention_q_bias) {
-            if (lw.q_bias) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        if (key == .attention_k_bias) {
-            if (lw.k_bias) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        if (key == .attention_v_bias) {
-            if (lw.v_bias) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        if (key == .attention_o_bias) {
-            if (lw.o_bias) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        if (key == .attention_attn_sinks) {
-            if (lw.attn_sinks) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        return error.InvalidWeightBindingName;
-    }
-
-    fn resolveLayerProgramShortconvWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        key: LayerProgramWeightBindingKey,
-    ) !*anyopaque {
-        const lw = ctx.layer_weights;
-        if (key == .shortconv_in_proj) {
-            if (lw.shortconv_in_proj) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.shortconv_in_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .shortconv_conv_weight) {
-            if (lw.shortconv_conv_weight) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .shortconv_out_proj) {
-            if (lw.shortconv_out_proj) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.shortconv_out_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .shortconv_conv_bias) {
-            if (lw.shortconv_conv_bias) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        return error.InvalidWeightBindingName;
-    }
-
-    fn resolveLayerProgramSwiGluWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        key: LayerProgramWeightBindingKey,
-    ) !*anyopaque {
-        const lw = ctx.layer_weights;
-        if (key == .swiglu_w1) {
-            if (lw.w1) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.w1_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .swiglu_w3) {
-            if (lw.w3) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.w3_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .swiglu_w2) {
-            if (lw.w2) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.w2_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .swiglu_w1_bias or key == .swiglu_w2_bias) {
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        return error.InvalidWeightBindingName;
-    }
-
-    fn resolveLayerProgramMoeWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        key: LayerProgramWeightBindingKey,
-    ) !*anyopaque {
-        const moe = ctx.layer_weights.moe orelse return error.MissingField;
-        return switch (key) {
-            .moe_router => @ptrCast(@constCast(&moe.router_w)),
-            .moe_gate_proj => @ptrCast(@constCast(&moe.gate_w)),
-            .moe_up_proj => @ptrCast(@constCast(&moe.up_w)),
-            .moe_down_proj => @ptrCast(@constCast(&moe.down_w)),
-            .moe_router_bias => if (moe.router_bias) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
-            .moe_gate_scales => @ptrCast(@constCast(&moe.gate_s)),
-            .moe_up_scales => @ptrCast(@constCast(&moe.up_s)),
-            .moe_down_scales => @ptrCast(@constCast(&moe.down_s)),
-            .moe_gate_bias => if (moe.gate_bias) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
-            .moe_up_bias => if (moe.up_bias) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
-            .moe_down_bias => if (moe.down_bias) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
-            .moe_router_scales => if (moe.router_s) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
-            .moe_router_quant_bias => if (moe.router_b) |*weight| @ptrCast(weight) else @ptrCast(&missing_optional_array_handle),
-            else => error.InvalidWeightBindingName,
-        };
-    }
-
-    fn resolveLayerProgramMambaWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        key: LayerProgramWeightBindingKey,
-    ) !*anyopaque {
-        const lw = ctx.layer_weights;
-        if (key == .mamba_in_proj) {
-            if (lw.mamba_in_proj) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.mamba_in_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .mamba_out_proj) {
-            if (lw.mamba_out_proj) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.mamba_out_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .mamba_conv_weight) {
-            if (lw.mamba_conv_weight) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .mamba_a_log) {
-            if (lw.mamba_a_log) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .mamba_d_skip) {
-            if (lw.mamba_d_skip) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
-        }
-        if (key == .mamba_conv_bias) {
-            if (lw.mamba_conv_bias) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        if (key == .mamba_dt_bias) {
-            if (lw.mamba_dt_bias) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        if (key == .mamba_norm_weight) {
-            if (lw.mamba_norm_weight) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        if (key == .mamba_ln1_weight) return @ptrCast(@constCast(&lw.ln1_weight));
-        if (key == .mamba_ln2_weight) return @ptrCast(@constCast(&lw.ln2_weight));
-        if (key == .mamba_gate_up) {
-            if (lw.mamba_gate_up) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.mamba_gate_up_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        if (key == .mamba_down_proj) {
-            if (lw.mamba_down_proj) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.mamba_down_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return @ptrCast(&missing_optional_array_handle);
-        }
-        return error.InvalidWeightBindingName;
-    }
-
-    fn resolveLayerProgramWeightPtrForKey(
-        ctx: *LayerProgramExecutionContext,
-        key: LayerProgramWeightBindingKey,
-    ) !*anyopaque {
-        if (key == .invalid) return error.InvalidWeightBindingName;
-        return switch (key) {
-            .norm_weight => resolveLayerProgramNormWeightPtr(ctx),
-            .norm_bias => @ptrCast(&missing_optional_array_handle),
-            .attention_q_proj, .attention_k_proj, .attention_v_proj, .attention_o_proj, .attention_q_norm, .attention_k_norm, .attention_q_bias, .attention_k_bias, .attention_v_bias, .attention_o_bias, .attention_attn_sinks, .mla_q_a_proj, .mla_q_a_norm, .mla_q_b_proj, .mla_kv_a_proj, .mla_kv_a_norm, .mla_kv_b_proj, .mla_o_proj => resolveLayerProgramAttentionWeightPtr(ctx, key),
-            .swiglu_w1, .swiglu_w3, .swiglu_w2, .swiglu_w1_bias, .swiglu_w2_bias => resolveLayerProgramSwiGluWeightPtr(ctx, key),
-            .moe_router, .moe_gate_proj, .moe_up_proj, .moe_down_proj, .moe_router_bias, .moe_gate_scales, .moe_up_scales, .moe_down_scales, .moe_gate_bias, .moe_up_bias, .moe_down_bias, .moe_router_scales, .moe_router_quant_bias => resolveLayerProgramMoeWeightPtr(ctx, key),
-            .mamba_in_proj, .mamba_conv_weight, .mamba_a_log, .mamba_d_skip, .mamba_out_proj, .mamba_conv_bias, .mamba_dt_bias, .mamba_norm_weight, .mamba_ln1_weight, .mamba_ln2_weight, .mamba_gate_up, .mamba_down_proj => resolveLayerProgramMambaWeightPtr(ctx, key),
-            .shortconv_in_proj, .shortconv_conv_weight, .shortconv_out_proj, .shortconv_conv_bias => resolveLayerProgramShortconvWeightPtr(ctx, key),
-            .invalid => error.InvalidWeightBindingName,
-        };
-    }
-
     fn layerProgramWeightHandlePtr(
         insn: *const runtime_contract.Instruction,
         ctx: *LayerProgramExecutionContext,
@@ -582,16 +312,12 @@ pub const TransformerBlock = struct {
     ) !*anyopaque {
         if (slot_idx >= insn.weights.len) return error.InvalidWeightRefIndex;
         const ref_index = insn.weights[slot_idx].index;
-        if (ref_index >= ctx.weight_binding_keys.len) return error.InvalidWeightRefIndex;
-        const key = ctx.weight_binding_keys[ref_index];
-        if (key == .invalid) return error.InvalidWeightBindingName;
-        if (key == .norm_weight) return resolveLayerProgramNormWeightPtr(ctx);
-        if (key == .norm_bias) return @ptrCast(&missing_optional_array_handle);
         if (ref_index >= ctx.resolved_weight_ptrs.len) return error.InvalidWeightRefIndex;
-        if (ctx.resolved_weight_ptrs[ref_index]) |cached| return cached;
-        const resolved = try resolveLayerProgramWeightPtrForKey(ctx, key);
-        ctx.resolved_weight_ptrs[ref_index] = resolved;
-        return resolved;
+        return ctx.resolved_weight_ptrs[ref_index] orelse error.InvalidWeightBindingName;
+    }
+
+    fn isMissingOptionalWeightHandle(handle: runtime_contract.TensorHandle) bool {
+        return handle.ptr == weights_mod.missingOptionalWeightPtr();
     }
 
     fn instructionParams(
@@ -847,7 +573,6 @@ pub const TransformerBlock = struct {
         };
         norm.forward(input, &output);
         arraySlotFromHandle(io.outputs[0]).* = output;
-        state.norm_index.* += 1;
     }
 
     fn layerProgramAttentionAdapter(
@@ -1157,14 +882,14 @@ pub const TransformerBlock = struct {
         mamba_binding.conv_bias = optionalArrayWeightFromHandle(weight_handles[5]);
         mamba_binding.dt_bias = optionalArrayWeightFromHandle(weight_handles[6]);
         mamba_binding.norm_weight = optionalArrayWeightFromHandle(weight_handles[7]);
-        if (optionalArrayWeightFromHandle(weight_handles[10]) != null) {
+        if (!isMissingOptionalWeightHandle(weight_handles[10])) {
             switch (state.runtime_meta.mamba_storage_kind) {
                 .quantized => mamba_binding.gate_up = quantizedWeightFromHandle(weight_handles[10]).*,
                 .dense => mamba_binding.gate_up_bf16 = optionalArrayWeightFromHandle(weight_handles[10]),
                 else => return error.InvalidTensorType,
             }
         }
-        if (optionalArrayWeightFromHandle(weight_handles[11]) != null) {
+        if (!isMissingOptionalWeightHandle(weight_handles[11])) {
             switch (state.runtime_meta.mamba_storage_kind) {
                 .quantized => mamba_binding.down_proj = quantizedWeightFromHandle(weight_handles[11]).*,
                 .dense => mamba_binding.down_proj_bf16 = optionalArrayWeightFromHandle(weight_handles[11]),
@@ -1403,7 +1128,6 @@ pub const TransformerBlock = struct {
             slot.* = hidden;
         }
         const slot_buffers = lw.slot_scratch[0..required_slot_count];
-        var norm_index: usize = 0;
         const active_slots: [1]usize = .{0};
         const sequence_lengths: [1]u32 = .{0};
         var rt_ctx = runtime_contract.ExecutionContext{
@@ -1427,11 +1151,8 @@ pub const TransformerBlock = struct {
             .residual = &residual,
             .slot_buffers = slot_buffers,
             .register_to_slot_map = lw.register_to_slot_map,
-            .weight_binding_keys = lw.weight_binding_keys,
             .instruction_handles = lw.instruction_handle_scratch,
             .instruction_views = lw.instruction_view_scratch,
-            .norm_index = &norm_index,
-            .layer_weights = lw,
             .runtime_meta = .{
                 .model_config = config,
                 .residual_multiplier = weight_handles.residual_multiplier,
@@ -1458,7 +1179,7 @@ pub const TransformerBlock = struct {
             },
             .resolved_weight_ptrs = lw.weight_ptr_scratch,
         };
-        if (exec_ctx.resolved_weight_ptrs.len != exec_ctx.weight_binding_keys.len) {
+        if (exec_ctx.resolved_weight_ptrs.len != lw.weight_binding_keys.len) {
             return error.InvalidWeightRefCount;
         }
         try bindLayerProgramStateDescriptors(&exec_ctx, &compiled_plan.plan, state_blocks);

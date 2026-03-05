@@ -355,6 +355,16 @@ fn tensorViewDescForMetalArray() runtime_contract.TensorViewDesc {
     };
 }
 
+var missing_optional_array_handle: mlx_graph.ArrayHandle = null;
+
+fn missingOptionalWeightPtrInternal() *anyopaque {
+    return @ptrCast(&missing_optional_array_handle);
+}
+
+pub fn missingOptionalWeightPtr() *anyopaque {
+    return missingOptionalWeightPtrInternal();
+}
+
 fn layerProgramStaticWeightPtr(
     layer: *WeightHandles.LayerWeights,
     key: WeightHandles.LayerProgramWeightBindingKey,
@@ -512,6 +522,106 @@ fn layerProgramStaticWeightPtr(
     };
 }
 
+fn resolveLayerProgramNormWeightPtr(
+    layer: *WeightHandles.LayerWeights,
+    norm_weight_index: usize,
+) !*anyopaque {
+    return switch (norm_weight_index) {
+        0 => @ptrCast(&layer.ln1_weight),
+        1 => @ptrCast(&layer.ln2_weight),
+        2 => if (layer.pre_ffn_norm) |*w|
+            @ptrCast(w)
+        else if (layer.post_ffn_norm) |*w|
+            @ptrCast(w)
+        else
+            error.MissingWeight,
+        3 => if (layer.post_ffn_norm) |*w|
+            @ptrCast(w)
+        else
+            error.MissingWeight,
+        else => error.MissingWeight,
+    };
+}
+
+fn layerProgramWeightPtrForKey(
+    layer: *WeightHandles.LayerWeights,
+    key: WeightHandles.LayerProgramWeightBindingKey,
+    norm_weight_index: usize,
+) !*anyopaque {
+    if (key == .invalid) return error.InvalidWeightBindingName;
+    if (key == .norm_weight) return try resolveLayerProgramNormWeightPtr(layer, norm_weight_index);
+    if (key == .norm_bias) return missingOptionalWeightPtrInternal();
+    if (layerProgramStaticWeightPtr(layer, key)) |ptr| return ptr;
+
+    return switch (key) {
+        .attention_q_norm,
+        .attention_k_norm,
+        .attention_q_bias,
+        .attention_k_bias,
+        .attention_v_bias,
+        .attention_o_bias,
+        .attention_attn_sinks,
+        .swiglu_w1_bias,
+        .swiglu_w2_bias,
+        .moe_router_bias,
+        .moe_gate_bias,
+        .moe_up_bias,
+        .moe_down_bias,
+        .moe_router_scales,
+        .moe_router_quant_bias,
+        .mamba_conv_bias,
+        .mamba_dt_bias,
+        .mamba_norm_weight,
+        .mamba_gate_up,
+        .mamba_down_proj,
+        .shortconv_conv_bias,
+        => missingOptionalWeightPtrInternal(),
+        else => error.MissingWeight,
+    };
+}
+
+fn finalizeLayerProgramWeightPointers(layer: *WeightHandles.LayerWeights) !void {
+    const compiled = layer.compiled_plan orelse return;
+    if (layer.weight_binding_keys.len != compiled.weight_bindings.len) return error.InvalidWeightRefCount;
+    if (layer.weight_ptr_scratch.len != compiled.weight_bindings.len) return error.InvalidWeightRefCount;
+    @memset(layer.weight_ptr_scratch, null);
+
+    var norm_weight_index: usize = 0;
+    for (compiled.plan.instructions, 0..) |insn, op_index| {
+        const expected_slots = runtime_contract.expectedKernelWeightSlots(insn.opcode);
+        if (expected_slots.len == 0) continue;
+        if (insn.weights.len != expected_slots.len) return error.InvalidWeightRefCount;
+
+        var kernel_id: ?u32 = null;
+        for (insn.weights, 0..) |weight_ref, slot_idx| {
+            const binding_name = try runtime_contract.instructionWeightBindingName(&compiled, op_index, slot_idx);
+            const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
+            if (!std.mem.eql(u8, parsed.slot_name, expected_slots[slot_idx])) return error.InvalidWeightBindingName;
+            if (kernel_id == null) {
+                kernel_id = parsed.kernel_id;
+            } else if (kernel_id.? != parsed.kernel_id) {
+                return error.InvalidWeightBindingName;
+            }
+            if (weight_ref.index >= layer.weight_binding_keys.len) return error.InvalidWeightRefIndex;
+
+            const key = try layerProgramWeightBindingKeyFor(insn.opcode, parsed.slot_name);
+            if (layer.weight_binding_keys[weight_ref.index] != key) return error.InvalidWeightBindingName;
+            const ptr = try layerProgramWeightPtrForKey(layer, key, norm_weight_index);
+            if (layer.weight_ptr_scratch[weight_ref.index]) |existing| {
+                if (existing != ptr) return error.InvalidWeightBindingName;
+            } else {
+                layer.weight_ptr_scratch[weight_ref.index] = ptr;
+            }
+        }
+
+        if (insn.opcode == .rmsnorm) norm_weight_index += 1;
+    }
+
+    for (layer.weight_ptr_scratch) |ptr| {
+        if (ptr == null) return error.MissingWeight;
+    }
+}
+
 fn compileLayerProgramContract(
     allocator: std.mem.Allocator,
     layer: *WeightHandles.LayerWeights,
@@ -546,9 +656,7 @@ fn compileLayerProgramContract(
             allocator.free(layer.weight_ptr_scratch);
             layer.weight_ptr_scratch = &.{};
         };
-        for (layer.weight_binding_keys, 0..) |key, idx| {
-            layer.weight_ptr_scratch[idx] = layerProgramStaticWeightPtr(layer, key);
-        }
+        @memset(layer.weight_ptr_scratch, null);
     }
     const register_map = try buildMetalLayerProgramRegisterSlotMap(
         allocator,
@@ -598,7 +706,6 @@ fn compileLayerProgramContract(
             layer.instruction_view_scratch = &.{};
         }
     }
-
 }
 
 /// Load model weights as MLX array handles on GPU.
@@ -1259,6 +1366,10 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
             weight_handles.layers[layer_idx].moe = moe_weights;
         }
+    }
+
+    for (weight_handles.layers) |*layer| {
+        try finalizeLayerProgramWeightPointers(layer);
     }
 
     // Load final layer norm - in native dtype (bf16, f16, or f32)
