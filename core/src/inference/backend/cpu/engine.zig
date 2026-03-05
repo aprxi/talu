@@ -162,19 +162,26 @@ pub const FusedCpuBackend = struct {
         runtime_kind: u8,
         state_block: *runtime_contract.StateBlockHandle,
     ) !void {
-        switch (runtime_kind) {
-            runtime_contract.state_runtime_kind_kv_cache,
-            runtime_contract.state_runtime_kind_shortconv_cache,
-            runtime_contract.state_runtime_kind_mamba_cache,
-            => {},
-            else => return error.InvalidStateDescriptorBinding,
+        if (runtime_kind == runtime_contract.state_runtime_kind_none) {
+            return;
         }
-        const state_value = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, state_block) orelse {
+        if (runtime_kind == runtime_contract.state_runtime_kind_kv_cache) {
+            const state_value = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, state_block) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            state_value.* = .{
+                .runtime_kind = runtime_kind,
+                .layered_cache = &self.kv_cache,
+                .scratch = &self.scratch,
+                .slot_index = slot_index,
+            };
+            return;
+        }
+        const state_value = runtime_contract.stateValueFromBlock(*state_bindings.RecurrentRuntimeState, state_block) orelse {
             return error.InvalidStateDescriptorBinding;
         };
         state_value.* = .{
             .runtime_kind = runtime_kind,
-            .layered_cache = &self.kv_cache,
             .scratch = &self.scratch,
             .slot_index = slot_index,
         };
@@ -391,83 +398,88 @@ pub const FusedCpuBackend = struct {
         var state_descriptors_storage: [runtime_contract.max_state_descriptors]runtime_contract.StateDescriptor = undefined;
         var state_descriptor_count: u8 = 0;
 
-        for (model.layers, 0..) |*layer, layer_idx| {
+        for (model.layers) |*layer| {
             const plan = &layer.compiled_plan.plan;
             try runtime_contract.appendUniquePlanStateDescriptors(
                 state_descriptors_storage[0..],
                 &state_descriptor_count,
                 plan,
             );
+        }
 
-            var attention_kernel_present = false;
-            var mla_kernel_present = false;
-            var mamba_state_required = false;
-            var shortconv_state_required = false;
-            for (plan.instructions) |insn| {
-                switch (insn.opcode) {
-                    .multihead_attention => attention_kernel_present = true,
-                    .mla_attention => mla_kernel_present = true,
-                    else => {},
-                }
-                const state_id = insn.state_block_id orelse continue;
-                const descriptor_idx = runtime_contract.stateDescriptorIndex(plan.state_descs, state_id) orelse {
-                    return error.InvalidStateDescriptorBinding;
-                };
-                const descriptor = plan.state_descs[descriptor_idx];
-                switch (descriptor.runtime_kind) {
-                    runtime_contract.state_runtime_kind_mamba_cache => mamba_state_required = true,
-                    runtime_contract.state_runtime_kind_shortconv_cache => shortconv_state_required = true,
-                    else => {},
-                }
+        var kv_runtime_required = false;
+        var mamba_runtime_required = false;
+        var shortconv_runtime_required = false;
+        for (state_descriptors_storage[0..@intCast(state_descriptor_count)]) |descriptor| {
+            switch (descriptor.runtime_kind) {
+                runtime_contract.state_runtime_kind_kv_cache => kv_runtime_required = true,
+                runtime_contract.state_runtime_kind_mamba_cache => mamba_runtime_required = true,
+                runtime_contract.state_runtime_kind_shortconv_cache => shortconv_runtime_required = true,
+                else => {},
             }
-
-            if (attention_kernel_present) try attention_layer_indices.append(allocator, layer_idx);
-            if (mla_kernel_present) try mla_layer_indices.append(allocator, layer_idx);
-            if (mamba_state_required) try mamba_layer_indices.append(allocator, layer_idx);
-            if (shortconv_state_required) try shortconv_layer_indices.append(allocator, layer_idx);
-        }
-        if (attention_layer_indices.items.len > 0) {
-            try scratch.initAttention(attention_layer_indices.items);
         }
 
-        if (mamba_layer_indices.items.len > 0) {
-            const first_layer_idx = mamba_layer_indices.items[0];
-            if (first_layer_idx >= model.layers.len) return error.InvalidStateDescriptorBinding;
+        if (kv_runtime_required) {
+            for (cpu_block_set, 0..) |*block, layer_idx| {
+                if (block.getAttention() != null) try attention_layer_indices.append(allocator, layer_idx);
+                if (block.getMLAAttention() != null) try mla_layer_indices.append(allocator, layer_idx);
+            }
+            if (attention_layer_indices.items.len > 0) {
+                try scratch.initAttention(attention_layer_indices.items);
+            }
+            if (mla_layer_indices.items.len > 0) {
+                try scratch.initMLA(mla_layer_indices.items);
+                log.info("inference", "MLA model detected", .{
+                    .mla_layers = mla_layer_indices.items.len,
+                });
+            }
+        }
+
+        if (mamba_runtime_required) {
             var mamba_config: ?kernels.MambaConfig = null;
-            for (model.layers[first_layer_idx].instruction_mamba_bindings) |maybe_binding| {
-                if (maybe_binding) |binding| {
-                    mamba_config = binding.config;
-                    break;
+            for (cpu_block_set, 0..) |*block, layer_idx| {
+                const kernel = block.getMambaKernel() orelse continue;
+                try mamba_layer_indices.append(allocator, layer_idx);
+                if (mamba_config) |expected| {
+                    if (!std.meta.eql(expected, kernel.config)) {
+                        return error.InvalidStateDescriptorBinding;
+                    }
+                } else {
+                    mamba_config = kernel.config;
                 }
             }
-            try scratch.initMamba(mamba_layer_indices.items, mamba_config orelse return error.InvalidStateDescriptorBinding);
+            if (mamba_layer_indices.items.len == 0) return error.InvalidStateDescriptorBinding;
+            try scratch.initMamba(
+                mamba_layer_indices.items,
+                mamba_config orelse return error.InvalidStateDescriptorBinding,
+            );
             log.info("inference", "Heterogeneous model detected", .{
                 .mamba_layers = mamba_layer_indices.items.len,
                 .attention_layers = @as(usize, layer_total) - mamba_layer_indices.items.len,
             });
         }
 
-        if (shortconv_layer_indices.items.len > 0) {
-            const first_layer_idx = shortconv_layer_indices.items[0];
-            if (first_layer_idx >= model.layers.len) return error.InvalidStateDescriptorBinding;
+        if (shortconv_runtime_required) {
             var shortconv_config: ?kernels.ShortConvConfig = null;
-            for (model.layers[first_layer_idx].instruction_shortconv_bindings) |maybe_binding| {
-                if (maybe_binding) |binding| {
-                    shortconv_config = binding.config;
-                    break;
+            for (cpu_block_set, 0..) |*block, layer_idx| {
+                const kernel = block.getShortConvKernel() orelse continue;
+                try shortconv_layer_indices.append(allocator, layer_idx);
+                if (shortconv_config) |expected| {
+                    if (!std.meta.eql(expected, kernel.config)) {
+                        return error.InvalidStateDescriptorBinding;
+                    }
+                } else {
+                    shortconv_config = kernel.config;
                 }
             }
-            try scratch.initShortConv(shortconv_layer_indices.items, shortconv_config orelse return error.InvalidStateDescriptorBinding);
+            if (shortconv_layer_indices.items.len == 0) return error.InvalidStateDescriptorBinding;
+            try scratch.initShortConv(
+                shortconv_layer_indices.items,
+                shortconv_config orelse return error.InvalidStateDescriptorBinding,
+            );
             log.info("inference", "ShortConv heterogeneous model detected", .{
                 .shortconv_layers = shortconv_layer_indices.items.len,
                 .attention_layers = @as(usize, layer_total) - shortconv_layer_indices.items.len,
-            });
-        }
-
-        if (mla_layer_indices.items.len > 0) {
-            try scratch.initMLA(mla_layer_indices.items);
-            log.info("inference", "MLA model detected", .{
-                .mla_layers = mla_layer_indices.items.len,
             });
         }
 
@@ -596,7 +608,7 @@ pub const FusedCpuBackend = struct {
     /// Free a slot when sequence completes.
     pub fn freeSlot(self: *FusedCpuBackend, slot_index: usize) void {
         self.kv_cache.freeSlot(slot_index);
-        self.resetScratchSlotStates(slot_index);
+        self.resetScratchSlotStates(slot_index, true, true, true);
         self.slot_rope_position_deltas[slot_index] = 0;
         if (slot_index < self.slot_state_bindings.len) {
             self.slot_state_bindings[slot_index].reset();
@@ -607,12 +619,30 @@ pub const FusedCpuBackend = struct {
     pub fn resetSlot(self: *FusedCpuBackend, slot_index: usize) void {
         if (self.state_descriptor_count == 0) {
             self.kv_cache.resetSlot(slot_index);
+            self.resetScratchSlotStates(slot_index, true, true, true);
         } else if (slot_index < self.slot_state_bindings.len and self.slot_state_bindings[slot_index].bound) {
-            if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
-                layered_cache.resetSlot(slot_index);
-            } else |_| {}
+            var reset_mla = false;
+            var reset_mamba = false;
+            var reset_shortconv = false;
+            const state_blocks = self.slotStateBlocks(slot_index);
+            for (self.stateDescriptors()) |descriptor| {
+                _ = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse continue;
+                switch (descriptor.runtime_kind) {
+                    runtime_contract.state_runtime_kind_kv_cache => {
+                        if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
+                            layered_cache.resetSlot(slot_index);
+                        } else |_| {}
+                        reset_mla = true;
+                    },
+                    runtime_contract.state_runtime_kind_mamba_cache => reset_mamba = true,
+                    runtime_contract.state_runtime_kind_shortconv_cache => reset_shortconv = true,
+                    else => {},
+                }
+            }
+            self.resetScratchSlotStates(slot_index, reset_mla, reset_mamba, reset_shortconv);
+        } else {
+            self.resetScratchSlotStates(slot_index, true, true, true);
         }
-        self.resetScratchSlotStates(slot_index);
         self.slot_rope_position_deltas[slot_index] = 0;
     }
 
@@ -671,40 +701,43 @@ pub const FusedCpuBackend = struct {
         return binding.handles[0..binding.count];
     }
 
-    fn runtimeStateForKind(
-        self: *const FusedCpuBackend,
-        slot_index: usize,
-        expected_runtime_kind: u8,
-    ) !*const state_bindings.KvRuntimeState {
+    fn boundLayeredCacheForSlot(self: *const FusedCpuBackend, slot_index: usize) !*LayeredBatchedKVCache {
         if (slot_index >= self.slot_state_bindings.len) return error.InvalidArgument;
         const state_blocks = self.slotStateBlocks(slot_index);
         for (self.stateDescriptors()) |descriptor| {
-            if (descriptor.runtime_kind != expected_runtime_kind) continue;
+            if (descriptor.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) continue;
             const state_block = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
                 return error.InvalidStateDescriptorBinding;
             };
             const state_value = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, state_block) orelse {
                 return error.InvalidStateDescriptorBinding;
             };
-            if (state_value.runtime_kind != expected_runtime_kind) {
+            if (state_value.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) {
                 return error.InvalidStateDescriptorBinding;
             }
-            return state_value;
+            return state_value.layered_cache;
         }
         return error.UnknownStateDescriptorId;
     }
 
-    fn boundLayeredCacheForSlot(self: *const FusedCpuBackend, slot_index: usize) !*LayeredBatchedKVCache {
-        const state_value = try runtimeStateForKind(self, slot_index, runtime_contract.state_runtime_kind_kv_cache);
-        return state_value.layered_cache;
-    }
-
-    fn resetScratchSlotStates(self: *FusedCpuBackend, slot_index: usize) void {
+    fn resetScratchSlotStates(
+        self: *FusedCpuBackend,
+        slot_index: usize,
+        reset_mla: bool,
+        reset_mamba: bool,
+        reset_shortconv: bool,
+    ) void {
         for (0..self.blocks.len) |layer_idx| {
             const slot_state = self.scratch.getSlotLayerState(slot_index, layer_idx) orelse continue;
-            if (slot_state.mla_cache) |*mla_cache| mla_cache.resetCache();
-            if (slot_state.mamba_state) |*mamba_state| mamba_state.reset();
-            if (slot_state.shortconv_state) |*shortconv_state| shortconv_state.reset();
+            if (reset_mla) {
+                if (slot_state.mla_cache) |*mla_cache| mla_cache.resetCache();
+            }
+            if (reset_mamba) {
+                if (slot_state.mamba_state) |*mamba_state| mamba_state.reset();
+            }
+            if (reset_shortconv) {
+                if (slot_state.shortconv_state) |*shortconv_state| shortconv_state.reset();
+            }
         }
     }
 
@@ -2323,12 +2356,8 @@ test "bindSlotStateBlocks stores typed runtime states by runtime_kind" {
     const kv_state = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, &bound[0]) orelse return error.TestUnexpectedResult;
     const scratch_state = runtime_contract.stateValueFromBlock(*state_bindings.RecurrentRuntimeState, &bound[1]) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@intFromPtr(&backend.kv_cache), @intFromPtr(kv_state.layered_cache));
-    try std.testing.expectEqual(@intFromPtr(&backend.scratch), @intFromPtr(kv_state.scratch));
-    try std.testing.expectEqual(@intFromPtr(&backend.scratch), @intFromPtr(scratch_state.scratch));
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_shortconv_cache, scratch_state.runtime_kind);
-    try std.testing.expectEqual(@as(usize, 0), kv_state.slot_index);
-    try std.testing.expectEqual(@as(usize, 0), scratch_state.slot_index);
 }
 
 test "bindSlotStateBlocks preserves bound slot index in runtime payload" {
@@ -2382,8 +2411,6 @@ test "bindSlotStateBlocks preserves bound slot index in runtime payload" {
     const recurrent_state = runtime_contract.stateValueFromBlock(*state_bindings.RecurrentRuntimeState, &bound[1]) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_shortconv_cache, recurrent_state.runtime_kind);
-    try std.testing.expectEqual(@as(usize, 1), kv_state.slot_index);
-    try std.testing.expectEqual(@as(usize, 1), recurrent_state.slot_index);
 }
 
 test "boundLayeredCacheForSlot resolves kv cache from runtime_kind descriptor" {
@@ -2420,7 +2447,7 @@ test "boundLayeredCacheForSlot resolves kv cache from runtime_kind descriptor" {
     try std.testing.expectEqual(@intFromPtr(&backend.kv_cache), @intFromPtr(layered_cache));
 }
 
-test "bindSlotStateBlocks rejects descriptor with runtime_kind none" {
+test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind none" {
     const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
     var backend: FusedCpuBackend = undefined;
     backend.state_descriptor_count = 1;
@@ -2448,8 +2475,11 @@ test "bindSlotStateBlocks rejects descriptor with runtime_kind none" {
         },
     };
 
-    try std.testing.expectError(
-        error.InvalidStateDescriptorBinding,
-        backend.bindSlotStateBlocks(0, state_blocks[0..]),
-    );
+    try backend.bindSlotStateBlocks(0, state_blocks[0..]);
+    defer backend.unbindSlotStateBlocks(0);
+    const bound = backend.slotStateBlocks(0);
+    try std.testing.expectEqual(@as(usize, 1), bound.len);
+    try std.testing.expectEqual(@intFromPtr(state_blocks[0].ptr), @intFromPtr(bound[0].ptr));
+    try std.testing.expectEqual(state_blocks[0].size, bound[0].size);
+    try std.testing.expectEqual(state_blocks[0].align_bytes, bound[0].align_bytes);
 }

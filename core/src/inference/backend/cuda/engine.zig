@@ -649,22 +649,6 @@ const SwiGluWeightRefs = struct {
     w2_bias: ?*const DeviceTensor = null,
 };
 
-const MoeWeightRefs = struct {
-    router: ?*const LinearWeight = null,
-    gate: ?*const LinearWeight = null,
-    up: ?*const LinearWeight = null,
-    down: ?*const LinearWeight = null,
-    router_bias: ?*const DeviceTensor = null,
-    gate_scales: ?*const DeviceTensor = null,
-    up_scales: ?*const DeviceTensor = null,
-    down_scales: ?*const DeviceTensor = null,
-    gate_bias: ?*const DeviceTensor = null,
-    up_bias: ?*const DeviceTensor = null,
-    down_bias: ?*const DeviceTensor = null,
-    router_scales: ?*const DeviceTensor = null,
-    router_quant_bias: ?*const DeviceTensor = null,
-};
-
 const BlockRuntimeLayer = struct {
     const invalid_slot = std.math.maxInt(u8);
     const MaxNormWeights = 4;
@@ -676,7 +660,6 @@ const BlockRuntimeLayer = struct {
     instruction_shortconv_refs: []?ShortConvExecConfig = &.{},
     instruction_shortconv_weight_refs: []?ShortConvWeightRefs = &.{},
     instruction_swiglu_weight_refs: []?SwiGluWeightRefs = &.{},
-    instruction_moe_weight_refs: []?MoeWeightRefs = &.{},
     instruction_weight_offsets: []u32 = &.{},
     instruction_weight_ptrs: []?*anyopaque = &.{},
     register_to_slot_map: []const u8 = &.{},
@@ -803,53 +786,6 @@ const BlockRuntimeLayer = struct {
         return error.UnsupportedModel;
     }
 
-    fn bindInstructionMoe(
-        self: *BlockRuntimeLayer,
-        compiled: *const runtime_contract.CompiledPlan,
-        op_index: usize,
-        insn: *const runtime_contract.Instruction,
-        _: *usize,
-    ) !void {
-        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
-        if (self.attention_binding) |binding| {
-            self.instruction_moe_weight_refs[op_index] = .{
-                .router = &binding.w1,
-                .gate = &binding.w1,
-                .up = &binding.w3,
-                .down = &binding.w2,
-                .router_bias = null,
-                .gate_scales = null,
-                .up_scales = null,
-                .down_scales = null,
-                .gate_bias = null,
-                .up_bias = null,
-                .down_bias = null,
-                .router_scales = null,
-                .router_quant_bias = null,
-            };
-            return;
-        }
-        if (self.shortconv_binding) |binding| {
-            self.instruction_moe_weight_refs[op_index] = .{
-                .router = if (binding.ffn_w1) |*w| w else null,
-                .gate = if (binding.ffn_w1) |*w| w else null,
-                .up = if (binding.ffn_w3) |*w| w else null,
-                .down = if (binding.ffn_w2) |*w| w else null,
-                .router_bias = null,
-                .gate_scales = null,
-                .up_scales = null,
-                .down_scales = null,
-                .gate_bias = null,
-                .up_bias = null,
-                .down_bias = null,
-                .router_scales = null,
-                .router_quant_bias = null,
-            };
-            return;
-        }
-        return error.UnsupportedModel;
-    }
-
     const instruction_ref_binder_table: [256]?InstructionRefBinderFn = blk: {
         var table: [256]?InstructionRefBinderFn = [_]?InstructionRefBinderFn{bindInstructionNoop} ** 256;
         table[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = bindInstructionRmsNorm;
@@ -857,7 +793,6 @@ const BlockRuntimeLayer = struct {
         table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = bindInstructionAttention;
         table[@intFromEnum(runtime_contract.Opcode.shortconv)] = bindInstructionShortConv;
         table[@intFromEnum(runtime_contract.Opcode.swiglu)] = bindInstructionSwiGlu;
-        table[@intFromEnum(runtime_contract.Opcode.moe)] = bindInstructionMoe;
         break :blk table;
     };
 
@@ -886,10 +821,6 @@ const BlockRuntimeLayer = struct {
             allocator.free(self.instruction_swiglu_weight_refs);
             self.instruction_swiglu_weight_refs = &.{};
         }
-        if (self.instruction_moe_weight_refs.len != 0) {
-            allocator.free(self.instruction_moe_weight_refs);
-            self.instruction_moe_weight_refs = &.{};
-        }
         if (self.instruction_weight_offsets.len != 0) {
             allocator.free(self.instruction_weight_offsets);
             self.instruction_weight_offsets = &.{};
@@ -907,14 +838,12 @@ const BlockRuntimeLayer = struct {
         self.instruction_shortconv_refs = try allocator.alloc(?ShortConvExecConfig, len);
         self.instruction_shortconv_weight_refs = try allocator.alloc(?ShortConvWeightRefs, len);
         self.instruction_swiglu_weight_refs = try allocator.alloc(?SwiGluWeightRefs, len);
-        self.instruction_moe_weight_refs = try allocator.alloc(?MoeWeightRefs, len);
         @memset(self.instruction_norm_weight_refs, null);
         @memset(self.instruction_attention_refs, null);
         @memset(self.instruction_attention_weight_refs, null);
         @memset(self.instruction_shortconv_refs, null);
         @memset(self.instruction_shortconv_weight_refs, null);
         @memset(self.instruction_swiglu_weight_refs, null);
-        @memset(self.instruction_moe_weight_refs, null);
 
         var norm_index: usize = 0;
         for (compiled.plan.instructions, 0..) |insn, op_index| {
@@ -985,51 +914,7 @@ const BlockRuntimeLayer = struct {
                 };
             },
             .moe => {
-                if (op_index >= self.instruction_moe_weight_refs.len) return error.InvalidInstructionIndex;
-                const binding = self.instruction_moe_weight_refs[op_index] orelse return error.UnsupportedModel;
-                return switch (slot_idx) {
-                    0 => @ptrCast(@constCast(binding.router orelse return error.MissingWeight)),
-                    1 => @ptrCast(@constCast(binding.gate orelse return error.MissingWeight)),
-                    2 => @ptrCast(@constCast(binding.up orelse return error.MissingWeight)),
-                    3 => @ptrCast(@constCast(binding.down orelse return error.MissingWeight)),
-                    4 => if (binding.router_bias) |router_bias|
-                        @ptrCast(@constCast(router_bias))
-                    else
-                        @ptrCast(@constCast(&missing_device_tensor)),
-                    5 => if (binding.gate_scales) |gate_scales|
-                        @ptrCast(@constCast(gate_scales))
-                    else
-                        @ptrCast(@constCast(&missing_device_tensor)),
-                    6 => if (binding.up_scales) |up_scales|
-                        @ptrCast(@constCast(up_scales))
-                    else
-                        @ptrCast(@constCast(&missing_device_tensor)),
-                    7 => if (binding.down_scales) |down_scales|
-                        @ptrCast(@constCast(down_scales))
-                    else
-                        @ptrCast(@constCast(&missing_device_tensor)),
-                    8 => if (binding.gate_bias) |gate_bias|
-                        @ptrCast(@constCast(gate_bias))
-                    else
-                        @ptrCast(@constCast(&missing_device_tensor)),
-                    9 => if (binding.up_bias) |up_bias|
-                        @ptrCast(@constCast(up_bias))
-                    else
-                        @ptrCast(@constCast(&missing_device_tensor)),
-                    10 => if (binding.down_bias) |down_bias|
-                        @ptrCast(@constCast(down_bias))
-                    else
-                        @ptrCast(@constCast(&missing_device_tensor)),
-                    11 => if (binding.router_scales) |router_scales|
-                        @ptrCast(@constCast(router_scales))
-                    else
-                        @ptrCast(@constCast(&missing_device_tensor)),
-                    12 => if (binding.router_quant_bias) |router_quant_bias|
-                        @ptrCast(@constCast(router_quant_bias))
-                    else
-                        @ptrCast(@constCast(&missing_device_tensor)),
-                    else => error.InvalidWeightRefCount,
-                };
+                return error.UnsupportedModel;
             },
             .shortconv => {
                 if (op_index >= self.instruction_shortconv_weight_refs.len) return error.InvalidInstructionIndex;
@@ -1125,7 +1010,6 @@ const BlockRuntimeLayer = struct {
         if (self.instruction_shortconv_refs.len != 0) allocator.free(self.instruction_shortconv_refs);
         if (self.instruction_shortconv_weight_refs.len != 0) allocator.free(self.instruction_shortconv_weight_refs);
         if (self.instruction_swiglu_weight_refs.len != 0) allocator.free(self.instruction_swiglu_weight_refs);
-        if (self.instruction_moe_weight_refs.len != 0) allocator.free(self.instruction_moe_weight_refs);
         if (self.instruction_weight_offsets.len != 0) allocator.free(self.instruction_weight_offsets);
         if (self.instruction_weight_ptrs.len != 0) allocator.free(self.instruction_weight_ptrs);
         if (self.compiled_plan) |*compiled_plan| {
@@ -1995,8 +1879,6 @@ const BlockRuntime = struct {
 const RuntimeState = extern struct {
     runtime_kind: u8,
     _pad: [7]u8 = [_]u8{0} ** 7,
-    block_runtime: *BlockRuntime,
-    slot_index: usize,
 };
 
 const KvRuntimeState = RuntimeState;
@@ -2516,6 +2398,20 @@ pub const CudaBackend = struct {
 
     pub fn resetSlot(self: *CudaBackend, slot_index: usize) void {
         decode_mod.resetSlot(self, slot_index);
+        if (self.state_descriptor_count == 0) return;
+        if (!self.slotIndexSupported(slot_index)) return;
+        if (!self.slot_state_bindings[slot_index].bound) return;
+
+        for (self.stateDescriptors()) |descriptor| {
+            if (descriptor.runtime_kind != runtime_contract.state_runtime_kind_shortconv_cache) continue;
+            self.resetShortConvStates() catch |err| {
+                log.warn("inference", "CUDA resetSlot shortconv reset failed", .{
+                    .slot_index = slot_index,
+                    .reason = @errorName(err),
+                });
+            };
+            break;
+        }
     }
 
     pub fn getPosition(self: *const CudaBackend, slot_index: usize) usize {
@@ -2532,20 +2428,16 @@ pub const CudaBackend = struct {
         runtime_kind: u8,
         state_block: *runtime_contract.StateBlockHandle,
     ) !void {
-        switch (runtime_kind) {
-            runtime_contract.state_runtime_kind_kv_cache,
-            runtime_contract.state_runtime_kind_shortconv_cache,
-            runtime_contract.state_runtime_kind_mamba_cache,
-            => {},
-            else => return error.InvalidStateDescriptorBinding,
+        _ = self;
+        _ = slot_index;
+        if (runtime_kind == runtime_contract.state_runtime_kind_none) {
+            return;
         }
         const state_value = runtime_contract.stateValueFromBlock(*RuntimeState, state_block) orelse {
             return error.InvalidStateDescriptorBinding;
         };
         state_value.* = .{
             .runtime_kind = runtime_kind,
-            .block_runtime = &self.block_runtime,
-            .slot_index = slot_index,
         };
     }
 
@@ -4215,10 +4107,7 @@ pub const CudaBackend = struct {
         if (kv_state.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) {
             return error.InvalidStateDescriptorBinding;
         }
-        if (!self.slotIndexSupported(kv_state.slot_index)) return error.InvalidStateDescriptorBinding;
-        if (ctx.layer_index >= kv_state.block_runtime.blocks.len) return error.InvalidStateDescriptorBinding;
-        const runtime_layer = &kv_state.block_runtime.blocks[ctx.layer_index];
-        const attention_binding = runtime_layer.attention_binding orelse return error.InvalidStateDescriptorBinding;
+        const attention_binding = layer.attention_binding orelse return error.InvalidStateDescriptorBinding;
         try self.runAttentionMixerStep(
             cfg,
             &attention_binding.k_cache,
@@ -4276,10 +4165,7 @@ pub const CudaBackend = struct {
         if (shortconv_state.runtime_kind != runtime_contract.state_runtime_kind_shortconv_cache) {
             return error.InvalidStateDescriptorBinding;
         }
-        if (!self.slotIndexSupported(shortconv_state.slot_index)) return error.InvalidStateDescriptorBinding;
-        if (ctx.layer_index >= shortconv_state.block_runtime.blocks.len) return error.InvalidStateDescriptorBinding;
-        const runtime_layer = &shortconv_state.block_runtime.blocks[ctx.layer_index];
-        const shortconv_binding = runtime_layer.shortconv_binding orelse return error.InvalidStateDescriptorBinding;
+        const shortconv_binding = layer.shortconv_binding orelse return error.InvalidStateDescriptorBinding;
         try self.runShortConvMixerStep(
             cfg,
             &shortconv_binding.conv_state,
@@ -4325,22 +4211,6 @@ pub const CudaBackend = struct {
             d_ff_u32,
             output,
         );
-    }
-
-    fn layerProgramMoeAdapter(
-        self: *CudaBackend,
-        _: *BlockRuntimeLayer,
-        insn: *const runtime_contract.Instruction,
-        registers: []runtime_contract.TensorHandle,
-        ctx: *LayerProgramExecutionContext,
-    ) !void {
-        _ = self;
-        _ = insn;
-        _ = registers;
-        _ = ctx;
-        // CUDA MoE requires sparse expert routing kernels; reject rather than
-        // silently running dense FFN semantics.
-        return error.UnsupportedModel;
     }
 
     fn layerProgramResidualAddAdapter(
@@ -4427,54 +4297,6 @@ pub const CudaBackend = struct {
         );
         const layer = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
         try exec_ctx.backend.layerProgramSwiGluAdapter(layer, insn, registers, exec_ctx);
-    }
-
-    fn layerProgramMlaAttentionRuntimeAdapter(
-        rt_ctx: *runtime_contract.ExecutionContext,
-        insn: *const runtime_contract.Instruction,
-        registers: []runtime_contract.TensorHandle,
-        _: []const runtime_contract.TensorViewDesc,
-        state_blocks: []runtime_contract.StateBlockHandle,
-        _: []const runtime_contract.ParamBlock,
-    ) !void {
-        _ = rt_ctx;
-        _ = insn;
-        _ = registers;
-        _ = state_blocks;
-        return error.UnsupportedModel;
-    }
-
-    fn layerProgramMoeRuntimeAdapter(
-        rt_ctx: *runtime_contract.ExecutionContext,
-        insn: *const runtime_contract.Instruction,
-        registers: []runtime_contract.TensorHandle,
-        _: []const runtime_contract.TensorViewDesc,
-        state_blocks: []runtime_contract.StateBlockHandle,
-        _: []const runtime_contract.ParamBlock,
-    ) !void {
-        const exec_ctx = try layerProgramExecutionState(rt_ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(
-            insn,
-            &exec_ctx.layer.compiled_plan.?.plan,
-            state_blocks,
-        );
-        const layer = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
-        try exec_ctx.backend.layerProgramMoeAdapter(layer, insn, registers, exec_ctx);
-    }
-
-    fn layerProgramMambaRuntimeAdapter(
-        rt_ctx: *runtime_contract.ExecutionContext,
-        insn: *const runtime_contract.Instruction,
-        registers: []runtime_contract.TensorHandle,
-        _: []const runtime_contract.TensorViewDesc,
-        state_blocks: []runtime_contract.StateBlockHandle,
-        _: []const runtime_contract.ParamBlock,
-    ) !void {
-        _ = rt_ctx;
-        _ = insn;
-        _ = registers;
-        _ = state_blocks;
-        return error.UnsupportedModel;
     }
 
     fn layerProgramResidualAddRuntimeAdapter(
@@ -7437,98 +7259,6 @@ test "BlockRuntimeLayer.rebuildInstructionRefs rejects norm op without bound nor
     try std.testing.expectError(error.UnsupportedModel, layer.rebuildInstructionRefs(std.testing.allocator));
 }
 
-test "BlockRuntimeLayer.rebuildInstructionRefs binds moe instruction typed refs" {
-    var layer: BlockRuntimeLayer = .{};
-    defer {
-        if (layer.instruction_norm_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_norm_weight_refs);
-        if (layer.instruction_attention_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_refs);
-        if (layer.instruction_attention_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_weight_refs);
-        if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
-        if (layer.instruction_shortconv_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_weight_refs);
-        if (layer.instruction_weight_offsets.len > 0) std.testing.allocator.free(layer.instruction_weight_offsets);
-        if (layer.instruction_weight_ptrs.len > 0) std.testing.allocator.free(layer.instruction_weight_ptrs);
-        if (layer.compiled_plan) |*compiled| {
-            plan_compiler.deinitCompiledPlan(std.testing.allocator, compiled);
-            layer.compiled_plan = null;
-        }
-    }
-
-    const zero_buffer = std.mem.zeroes(compute.cuda.Buffer);
-    const zero_tensor = DeviceTensor{
-        .rows = 0,
-        .cols = 0,
-        .buffer = zero_buffer,
-    };
-    const zero_weight = LinearWeight{ .dense_f32 = zero_tensor };
-    var attention_runtime: LayerAttentionRuntime = .{
-        .q_dim = 0,
-        .kv_dim = 0,
-        .d_ff = 0,
-        .sliding_window = 0,
-        .is_causal = true,
-        .ln1_weight = zero_tensor,
-        .ln2_weight = zero_tensor,
-        .pre_ffn_norm_weight = null,
-        .post_ffn_norm_weight = null,
-        .q_norm_weight = null,
-        .k_norm_weight = null,
-        .q_proj = zero_weight,
-        .k_proj = zero_weight,
-        .v_proj = zero_weight,
-        .o_proj = zero_weight,
-        .w1 = zero_weight,
-        .w2 = zero_weight,
-        .w3 = zero_weight,
-        .k_cache = zero_buffer,
-        .v_cache = zero_buffer,
-        .kv_capacity = 0,
-    };
-    const router_weight: LinearWeight = zero_weight;
-    const up_weight: LinearWeight = zero_weight;
-    const down_weight: LinearWeight = zero_weight;
-    attention_runtime.w1 = router_weight;
-    attention_runtime.w3 = up_weight;
-    attention_runtime.w2 = down_weight;
-    attention_runtime.d_ff = 64;
-    layer.attention_binding = &attention_runtime;
-
-    const ops = [_]layer_ops.LayerOp{
-        .{ .kernel = .{ .id = 7, .in = .residual, .out = .branch_out, .debug_type = .moe } },
-    };
-    layer.compiled_plan = try plan_compiler.compileLayerProgram(std.testing.allocator, ops[0..], .decode, .{});
-
-    try layer.rebuildInstructionRefs(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), layer.instruction_weight_offsets.len);
-    try std.testing.expectEqual(@as(usize, 13), layer.instruction_weight_ptrs.len);
-    const router_ptr = layer.instruction_weight_ptrs[0] orelse return error.MissingWeight;
-    const gate_ptr = layer.instruction_weight_ptrs[1] orelse return error.MissingWeight;
-    const up_ptr = layer.instruction_weight_ptrs[2] orelse return error.MissingWeight;
-    const down_ptr = layer.instruction_weight_ptrs[3] orelse return error.MissingWeight;
-    const router_bias_ptr = layer.instruction_weight_ptrs[4] orelse return error.MissingWeight;
-    const gate_scales_ptr = layer.instruction_weight_ptrs[5] orelse return error.MissingWeight;
-    const up_scales_ptr = layer.instruction_weight_ptrs[6] orelse return error.MissingWeight;
-    const down_scales_ptr = layer.instruction_weight_ptrs[7] orelse return error.MissingWeight;
-    const gate_bias_ptr = layer.instruction_weight_ptrs[8] orelse return error.MissingWeight;
-    const up_bias_ptr = layer.instruction_weight_ptrs[9] orelse return error.MissingWeight;
-    const down_bias_ptr = layer.instruction_weight_ptrs[10] orelse return error.MissingWeight;
-    const router_scales_ptr = layer.instruction_weight_ptrs[11] orelse return error.MissingWeight;
-    const router_quant_bias_ptr = layer.instruction_weight_ptrs[12] orelse return error.MissingWeight;
-    try std.testing.expectEqual(@intFromPtr(router_ptr), @intFromPtr(&attention_runtime.w1));
-    try std.testing.expectEqual(@intFromPtr(gate_ptr), @intFromPtr(&attention_runtime.w1));
-    try std.testing.expectEqual(@intFromPtr(up_ptr), @intFromPtr(&attention_runtime.w3));
-    try std.testing.expectEqual(@intFromPtr(down_ptr), @intFromPtr(&attention_runtime.w2));
-    try std.testing.expectEqual(@intFromPtr(router_bias_ptr), @intFromPtr(&missing_device_tensor));
-    try std.testing.expectEqual(@intFromPtr(gate_scales_ptr), @intFromPtr(&missing_device_tensor));
-    try std.testing.expectEqual(@intFromPtr(up_scales_ptr), @intFromPtr(&missing_device_tensor));
-    try std.testing.expectEqual(@intFromPtr(down_scales_ptr), @intFromPtr(&missing_device_tensor));
-    try std.testing.expectEqual(@intFromPtr(gate_bias_ptr), @intFromPtr(&missing_device_tensor));
-    try std.testing.expectEqual(@intFromPtr(up_bias_ptr), @intFromPtr(&missing_device_tensor));
-    try std.testing.expectEqual(@intFromPtr(down_bias_ptr), @intFromPtr(&missing_device_tensor));
-    try std.testing.expectEqual(@intFromPtr(router_scales_ptr), @intFromPtr(&missing_device_tensor));
-    try std.testing.expectEqual(@intFromPtr(router_quant_bias_ptr), @intFromPtr(&missing_device_tensor));
-}
-
 test "bindSlotStateBlocks stores typed runtime states by runtime_kind" {
     const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
     var backend: CudaBackend = undefined;
@@ -7592,15 +7322,9 @@ test "bindSlotStateBlocks stores typed runtime states by runtime_kind" {
     const kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, &bound[0]) orelse return error.TestUnexpectedResult;
     const shortconv_state = runtime_contract.stateValueFromBlock(*ShortConvRuntimeState, &bound[1]) orelse return error.TestUnexpectedResult;
     const mamba_state = runtime_contract.stateValueFromBlock(*MambaRuntimeState, &bound[2]) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(kv_state.block_runtime));
-    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(shortconv_state.block_runtime));
-    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(mamba_state.block_runtime));
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_shortconv_cache, shortconv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_mamba_cache, mamba_state.runtime_kind);
-    try std.testing.expectEqual(@as(usize, 0), kv_state.slot_index);
-    try std.testing.expectEqual(@as(usize, 0), shortconv_state.slot_index);
-    try std.testing.expectEqual(@as(usize, 0), mamba_state.slot_index);
 }
 
 test "bindSlotStateBlocks preserves bound slot index in runtime states" {
@@ -7669,12 +7393,9 @@ test "bindSlotStateBlocks preserves bound slot index in runtime states" {
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_shortconv_cache, shortconv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_mamba_cache, mamba_state.runtime_kind);
-    try std.testing.expectEqual(@as(usize, 1), kv_state.slot_index);
-    try std.testing.expectEqual(@as(usize, 1), shortconv_state.slot_index);
-    try std.testing.expectEqual(@as(usize, 1), mamba_state.slot_index);
 }
 
-test "bindSlotStateBlocks rejects descriptor with runtime_kind none" {
+test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind none" {
     const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
     var backend: CudaBackend = undefined;
     backend.max_batch_size = 1;
@@ -7701,8 +7422,11 @@ test "bindSlotStateBlocks rejects descriptor with runtime_kind none" {
         },
     };
 
-    try std.testing.expectError(
-        error.InvalidStateDescriptorBinding,
-        backend.bindSlotStateBlocks(0, state_blocks[0..]),
-    );
+    try backend.bindSlotStateBlocks(0, state_blocks[0..]);
+    defer backend.unbindSlotStateBlocks(0);
+    const bound = backend.slotStateBlocks(0);
+    try std.testing.expectEqual(@as(usize, 1), bound.len);
+    try std.testing.expectEqual(@intFromPtr(state_blocks[0].ptr), @intFromPtr(bound[0].ptr));
+    try std.testing.expectEqual(state_blocks[0].size, bound[0].size);
+    try std.testing.expectEqual(state_blocks[0].align_bytes, bound[0].align_bytes);
 }

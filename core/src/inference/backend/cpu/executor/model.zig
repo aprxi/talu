@@ -1125,9 +1125,7 @@ test "estimateWeightMemory bytesPerParam dtypes" {
 test "Transformer.resolveLayeredCache resolves typed runtime state without builtin id routing" {
     var layered_cache = try LayeredBatchedKVCache.init(std.testing.allocator, 1, 1, 1, 1, 8);
     defer layered_cache.deinit();
-    var scratch = try ScratchBuffer.initWithSlots(std.testing.allocator, 8, 16, 1, 1);
-    defer scratch.deinit();
-
+    var scratch: ScratchBuffer = undefined;
     var storage: [@sizeOf(state_bindings.KvRuntimeState)]u8 align(64) =
         [_]u8{0} ** @sizeOf(state_bindings.KvRuntimeState);
     var state_block = runtime_contract.StateBlockHandle{
@@ -1155,9 +1153,7 @@ test "Transformer.resolveLayeredCache resolves typed runtime state without built
 test "Transformer.resolveLayeredCache ignores non-kv runtime state blocks" {
     var layered_cache = try LayeredBatchedKVCache.init(std.testing.allocator, 1, 1, 1, 1, 8);
     defer layered_cache.deinit();
-    var scratch = try ScratchBuffer.initWithSlots(std.testing.allocator, 8, 16, 1, 1);
-    defer scratch.deinit();
-
+    var scratch: ScratchBuffer = undefined;
     var storage: [@sizeOf(state_bindings.KvRuntimeState)]u8 align(64) =
         [_]u8{0} ** @sizeOf(state_bindings.KvRuntimeState);
     var state_block = runtime_contract.StateBlockHandle{
