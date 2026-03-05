@@ -17,6 +17,7 @@ pub const RunConfig = struct {
     iters: usize = 10,
     profile: Profile = .bw,
     tokenizer_json_path: []const u8 = "",
+    text_file: []const u8 = "", // optional: read text from file instead of generating
 };
 
 pub const Scenario = enum {
@@ -82,6 +83,20 @@ fn generateText(allocator: std.mem.Allocator, target_bytes: usize) ![]u8 {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Load input text: from file if text_file is set, otherwise generate synthetic text.
+fn loadInputText(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: usize) ![]u8 {
+    if (cfg.text_file.len > 0) {
+        const raw = try readTokenizerJson(allocator, cfg.text_file);
+        if (raw.len <= target_bytes) return raw;
+        // Truncate to target_bytes
+        const result = try allocator.alloc(u8, target_bytes);
+        @memcpy(result, raw[0..target_bytes]);
+        allocator.free(raw);
+        return result;
+    }
+    return generateText(allocator, target_bytes);
+}
 
 fn readTokenizerJson(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const file = try std.fs.cwd().openFile(path, .{});
@@ -255,7 +270,7 @@ pub fn runEncode(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: usi
     var tok = try loadTokenizer(allocator, json);
     defer tok.deinit();
 
-    const text = try generateText(allocator, target_bytes);
+    const text = try loadInputText(allocator, cfg, target_bytes);
     defer allocator.free(text);
 
     const total_iters = cfg.warmup + cfg.iters;
@@ -355,7 +370,7 @@ pub fn runNormalize(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: 
     defer allocator.free(json);
     var tok = try loadTokenizer(allocator, json);
     defer tok.deinit();
-    const text = try generateText(allocator, target_bytes);
+    const text = try loadInputText(allocator, cfg, target_bytes);
     defer allocator.free(text);
 
     const total_iters = cfg.warmup + cfg.iters;
@@ -399,7 +414,7 @@ pub fn runPretok(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: usi
     defer allocator.free(json);
     var tok = try loadTokenizer(allocator, json);
     defer tok.deinit();
-    const text = try generateText(allocator, target_bytes);
+    const text = try loadInputText(allocator, cfg, target_bytes);
     defer allocator.free(text);
 
     var normalized = try norm_mod.normalize_text(&tok.tokenizer_handle.normalizer, text);
@@ -452,7 +467,7 @@ pub fn runBpe(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: usize,
     defer allocator.free(json);
     var tok = try loadTokenizer(allocator, json);
     defer tok.deinit();
-    const text = try generateText(allocator, target_bytes);
+    const text = try loadInputText(allocator, cfg, target_bytes);
     defer allocator.free(text);
 
     var normalized = try norm_mod.normalize_text(&tok.tokenizer_handle.normalizer, text);
@@ -524,7 +539,7 @@ pub fn runBpeVocab(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: u
     defer allocator.free(json);
     var tok = try loadTokenizer(allocator, json);
     defer tok.deinit();
-    const text = try generateText(allocator, target_bytes);
+    const text = try loadInputText(allocator, cfg, target_bytes);
     defer allocator.free(text);
 
     var normalized = try norm_mod.normalize_text(&tok.tokenizer_handle.normalizer, text);
@@ -598,7 +613,7 @@ pub fn runBpeMerge(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: u
     defer allocator.free(json);
     var tok = try loadTokenizer(allocator, json);
     defer tok.deinit();
-    const text = try generateText(allocator, target_bytes);
+    const text = try loadInputText(allocator, cfg, target_bytes);
     defer allocator.free(text);
 
     var normalized = try norm_mod.normalize_text(&tok.tokenizer_handle.normalizer, text);
@@ -690,7 +705,7 @@ pub fn runBpeCollect(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes:
     defer allocator.free(json);
     var tok = try loadTokenizer(allocator, json);
     defer tok.deinit();
-    const text = try generateText(allocator, target_bytes);
+    const text = try loadInputText(allocator, cfg, target_bytes);
     defer allocator.free(text);
 
     var normalized = try norm_mod.normalize_text(&tok.tokenizer_handle.normalizer, text);

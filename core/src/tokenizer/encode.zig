@@ -731,6 +731,9 @@ fn processChunk(ctx: *ChunkContext, chunk_idx: usize) void {
     const words = pretokenized.tokens.items;
     const ranges = pretokenized.ranges.items;
 
+    var word_cache = WordCache.init();
+    defer word_cache.deinit();
+
     for (words, ranges, 0..) |token_item, range, token_index| {
         const tokens_before: u32 = @intCast(result.accum.ids.items.len);
 
@@ -739,7 +742,7 @@ fn processChunk(ctx: *ChunkContext, chunk_idx: usize) void {
         else
             (ctx.is_sentencepiece_bpe and token_index > 0);
 
-        encodeWord(ctx.tokenizer, token_item.sliceConst(), add_sp_prefix, &result.accum, null) catch {
+        encodeWord(ctx.tokenizer, token_item.sliceConst(), add_sp_prefix, &result.accum, &word_cache) catch {
             ctx.had_error.store(true, .release);
             return;
         };

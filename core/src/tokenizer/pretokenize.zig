@@ -195,7 +195,11 @@ fn pretokenize_single_impl(pretokenizer: ?*const ct.PreTokenizer, input: []const
             // Metaspace: replace spaces with ▁, then split on word boundaries
             try splitMetaspace(&result, input, base_offset, p.add_prefix_space != 0);
         } else if (p.re) |re| {
-            try splitByRegex(&result, input, base_offset, re, p.regex_split != 0, p.regex_invert != 0);
+            if (isGpt2FastPath(p)) {
+                try splitByGpt2Fast(&result, input, base_offset, re);
+            } else {
+                try splitByRegex(&result, input, base_offset, re, p.regex_split != 0, p.regex_invert != 0);
+            }
         } else {
             try splitByWhitespace(&result, input, base_offset, p.whitespace != 0, p.punctuation != 0);
         }
@@ -261,6 +265,156 @@ fn splitByRegex(result: *PretokenizeResult, input: []const u8, base_offset: usiz
         }
 
         cursor = match_end;
+    }
+}
+
+// GPT-2 pattern constant for fast-path detection
+const GPT2_PATTERN: [:0]const u8 = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
+
+/// Check if pretokenizer is eligible for the fast GPT-2 path.
+/// Requires the exact GPT-2 regex pattern with standard match mode (not split/invert).
+fn isGpt2FastPath(p: *const ct.PreTokenizer) bool {
+    if (p.regex_split != 0 or p.regex_invert != 0) return false;
+    const pat = p.pattern orelse return false;
+    const slice = std.mem.span(@as([*:0]const u8, @ptrCast(pat)));
+    return std.mem.eql(u8, slice, GPT2_PATTERN);
+}
+
+/// Check if input[pos] starts a GPT-2 contraction suffix ('s, 't, 're, 've, 'm, 'll, 'd).
+/// Returns the contraction length (2 or 3) or 0 if no match.
+fn matchContraction(input: []const u8, pos: usize) usize {
+    if (pos + 1 >= input.len) return 0;
+    return switch (input[pos + 1]) {
+        's', 't', 'm', 'd' => 2,
+        'r' => if (pos + 2 < input.len and input[pos + 2] == 'e') 3 else 0,
+        'v' => if (pos + 2 < input.len and input[pos + 2] == 'e') 3 else 0,
+        'l' => if (pos + 2 < input.len and input[pos + 2] == 'l') 3 else 0,
+        else => 0,
+    };
+}
+
+/// Fast GPT-2 pretokenizer for ASCII text.
+/// Replicates the GPT-2 regex behavior using direct byte dispatch.
+/// Falls back to PCRE2 per-match for non-ASCII bytes.
+fn splitByGpt2Fast(result: *PretokenizeResult, input: []const u8, base_offset: usize, regex_code: *anyopaque) !void {
+    // Pre-size token/range arrays
+    const estimated_tokens = @max(input.len / 5, 16);
+    try result.tokens.ensureTotalCapacity(Allocator, result.tokens.items.len + estimated_tokens);
+    try result.ranges.ensureTotalCapacity(Allocator, result.ranges.items.len + estimated_tokens);
+
+    // Lazily create PCRE2 match data only when non-ASCII is encountered
+    var match_data: ?*anyopaque = null;
+    defer if (match_data) |md| pcre2_match_data_free(md);
+
+    var cursor: usize = 0;
+    while (cursor < input.len) {
+        const ch = input[cursor];
+
+        // Non-ASCII: fall back to PCRE2 for one match
+        if (ch >= 0x80) {
+            if (match_data == null) {
+                match_data = pcre2_match_data_create_from_pattern(regex_code) orelse return error.OutOfMemory;
+            }
+            const rc = pcre2_match(regex_code, @ptrCast(input.ptr), input.len, cursor, match_data.?);
+            if (rc > 0) {
+                const ovector = pcre2_get_ovector_pointer(match_data.?);
+                const match_start: usize = @intCast(ovector[0]);
+                const match_end: usize = @intCast(ovector[1]);
+                if (match_end > match_start) {
+                    try appendToken(result, input[match_start..match_end], base_offset + match_start);
+                    cursor = match_end;
+                    continue;
+                }
+            }
+            cursor += 1;
+            continue;
+        }
+
+        // Alt 1: Contraction suffixes ('s, 't, 're, 've, 'm, 'll, 'd)
+        if (ch == '\'') {
+            const clen = matchContraction(input, cursor);
+            if (clen > 0) {
+                try appendToken(result, input[cursor .. cursor + clen], base_offset + cursor);
+                cursor += clen;
+                continue;
+            }
+            // Apostrophe without contraction: falls through to alt 4 (other chars)
+        }
+
+        // Alt 2/3/4 with optional leading space
+        if (ch == ' ' and cursor + 1 < input.len and input[cursor + 1] < 0x80) {
+            const next = input[cursor + 1];
+
+            // Alt 2: Space + letters
+            if (std.ascii.isAlphabetic(next)) {
+                var end = cursor + 2;
+                while (end < input.len and input[end] < 0x80 and std.ascii.isAlphabetic(input[end])) : (end += 1) {}
+                try appendToken(result, input[cursor..end], base_offset + cursor);
+                cursor = end;
+                continue;
+            }
+
+            // Alt 3: Space + digits
+            if (std.ascii.isDigit(next)) {
+                var end = cursor + 2;
+                while (end < input.len and input[end] < 0x80 and std.ascii.isDigit(input[end])) : (end += 1) {}
+                try appendToken(result, input[cursor..end], base_offset + cursor);
+                cursor = end;
+                continue;
+            }
+
+            // Alt 4: Space + other (not ws/letter/digit)
+            if (!std.ascii.isWhitespace(next) and !std.ascii.isAlphabetic(next) and !std.ascii.isDigit(next)) {
+                var end = cursor + 2;
+                while (end < input.len and input[end] < 0x80 and !std.ascii.isWhitespace(input[end]) and !std.ascii.isAlphabetic(input[end]) and !std.ascii.isDigit(input[end])) : (end += 1) {}
+                try appendToken(result, input[cursor..end], base_offset + cursor);
+                cursor = end;
+                continue;
+            }
+
+            // Space followed by space/end: fall through to whitespace
+        }
+
+        // Alt 2: Letters (no leading space)
+        if (std.ascii.isAlphabetic(ch)) {
+            var end = cursor + 1;
+            while (end < input.len and input[end] < 0x80 and std.ascii.isAlphabetic(input[end])) : (end += 1) {}
+            try appendToken(result, input[cursor..end], base_offset + cursor);
+            cursor = end;
+            continue;
+        }
+
+        // Alt 3: Digits (no leading space)
+        if (std.ascii.isDigit(ch)) {
+            var end = cursor + 1;
+            while (end < input.len and input[end] < 0x80 and std.ascii.isDigit(input[end])) : (end += 1) {}
+            try appendToken(result, input[cursor..end], base_offset + cursor);
+            cursor = end;
+            continue;
+        }
+
+        // Alt 4: Other chars (not ws/letter/digit) — includes apostrophe without contraction
+        if (!std.ascii.isWhitespace(ch)) {
+            var end = cursor + 1;
+            while (end < input.len and input[end] < 0x80 and !std.ascii.isWhitespace(input[end]) and !std.ascii.isAlphabetic(input[end]) and !std.ascii.isDigit(input[end])) : (end += 1) {}
+            try appendToken(result, input[cursor..end], base_offset + cursor);
+            cursor = end;
+            continue;
+        }
+
+        // Alt 5/6: Whitespace run
+        // \s+(?!\S)|\s+ semantics: if the run is 2+ chars and followed by
+        // non-whitespace, leave the last whitespace char unconsumed so it
+        // becomes the leading space of the next ` ?\p{L}+` etc. match.
+        {
+            var end = cursor + 1;
+            while (end < input.len and input[end] < 0x80 and std.ascii.isWhitespace(input[end])) : (end += 1) {}
+            if (end < input.len and end - cursor > 1) {
+                end -= 1;
+            }
+            try appendToken(result, input[cursor..end], base_offset + cursor);
+            cursor = end;
+        }
     }
 }
 
@@ -578,4 +732,187 @@ test "pretokenize requires integration testing 2" {
     // GPT-4 regex \p{N}{1,3} is greedy: "2025" → "202" + "5" in PCRE2.
     // HuggingFace fancy-regex produces "20" + "25" (possibly different semantics).
     // This difference is tracked as a known issue for granite-4.0-h-1B.
+}
+
+test "matchContraction matches valid suffixes" {
+    try std.testing.expectEqual(@as(usize, 2), matchContraction("'s end", 0));
+    try std.testing.expectEqual(@as(usize, 2), matchContraction("'t end", 0));
+    try std.testing.expectEqual(@as(usize, 2), matchContraction("'m end", 0));
+    try std.testing.expectEqual(@as(usize, 2), matchContraction("'d end", 0));
+    try std.testing.expectEqual(@as(usize, 3), matchContraction("'re end", 0));
+    try std.testing.expectEqual(@as(usize, 3), matchContraction("'ve end", 0));
+    try std.testing.expectEqual(@as(usize, 3), matchContraction("'ll end", 0));
+    try std.testing.expectEqual(@as(usize, 0), matchContraction("'x end", 0));
+    try std.testing.expectEqual(@as(usize, 0), matchContraction("'", 0));
+}
+
+test "isGpt2FastPath detects pattern" {
+    var pretok = std.mem.zeroes(ct.PreTokenizer);
+    defer tokenizer_pretokenizer_free(&pretok);
+
+    // Set GPT-2 pattern
+    const rc = tokenizer_pretokenizer_set(&pretok, GPT2_PATTERN.ptr);
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    try std.testing.expect(isGpt2FastPath(&pretok));
+
+    // Different split mode disqualifies
+    pretok.regex_split = 1;
+    try std.testing.expect(!isGpt2FastPath(&pretok));
+    pretok.regex_split = 0;
+
+    // Invert disqualifies
+    pretok.regex_invert = 1;
+    try std.testing.expect(!isGpt2FastPath(&pretok));
+}
+
+test "splitByGpt2Fast basic words" {
+    var pretok = std.mem.zeroes(ct.PreTokenizer);
+    defer tokenizer_pretokenizer_free(&pretok);
+    _ = tokenizer_pretokenizer_set(&pretok, GPT2_PATTERN.ptr);
+
+    var result = PretokenizeResult.init();
+    defer result.deinit();
+    try splitByGpt2Fast(&result, "Hello world", 0, pretok.re.?);
+
+    try std.testing.expectEqual(@as(usize, 2), result.tokens.items.len);
+    try std.testing.expectEqualStrings("Hello", result.tokens.items[0].sliceConst());
+    try std.testing.expectEqualStrings(" world", result.tokens.items[1].sliceConst());
+}
+
+test "splitByGpt2Fast contractions" {
+    var pretok = std.mem.zeroes(ct.PreTokenizer);
+    defer tokenizer_pretokenizer_free(&pretok);
+    _ = tokenizer_pretokenizer_set(&pretok, GPT2_PATTERN.ptr);
+
+    var result = PretokenizeResult.init();
+    defer result.deinit();
+    try splitByGpt2Fast(&result, "don't", 0, pretok.re.?);
+
+    try std.testing.expectEqual(@as(usize, 2), result.tokens.items.len);
+    try std.testing.expectEqualStrings("don", result.tokens.items[0].sliceConst());
+    try std.testing.expectEqualStrings("'t", result.tokens.items[1].sliceConst());
+}
+
+test "splitByGpt2Fast punctuation" {
+    var pretok = std.mem.zeroes(ct.PreTokenizer);
+    defer tokenizer_pretokenizer_free(&pretok);
+    _ = tokenizer_pretokenizer_set(&pretok, GPT2_PATTERN.ptr);
+
+    var result = PretokenizeResult.init();
+    defer result.deinit();
+    try splitByGpt2Fast(&result, "Hello, world!", 0, pretok.re.?);
+
+    try std.testing.expectEqual(@as(usize, 4), result.tokens.items.len);
+    try std.testing.expectEqualStrings("Hello", result.tokens.items[0].sliceConst());
+    try std.testing.expectEqualStrings(",", result.tokens.items[1].sliceConst());
+    try std.testing.expectEqualStrings(" world", result.tokens.items[2].sliceConst());
+    try std.testing.expectEqualStrings("!", result.tokens.items[3].sliceConst());
+}
+
+test "splitByGpt2Fast numbers" {
+    var pretok = std.mem.zeroes(ct.PreTokenizer);
+    defer tokenizer_pretokenizer_free(&pretok);
+    _ = tokenizer_pretokenizer_set(&pretok, GPT2_PATTERN.ptr);
+
+    var result = PretokenizeResult.init();
+    defer result.deinit();
+    try splitByGpt2Fast(&result, "test 123", 0, pretok.re.?);
+
+    try std.testing.expectEqual(@as(usize, 2), result.tokens.items.len);
+    try std.testing.expectEqualStrings("test", result.tokens.items[0].sliceConst());
+    try std.testing.expectEqualStrings(" 123", result.tokens.items[1].sliceConst());
+}
+
+test "splitByGpt2Fast whitespace leaves trailing space for next token" {
+    var pretok = std.mem.zeroes(ct.PreTokenizer);
+    defer tokenizer_pretokenizer_free(&pretok);
+    _ = tokenizer_pretokenizer_set(&pretok, GPT2_PATTERN.ptr);
+
+    var result = PretokenizeResult.init();
+    defer result.deinit();
+    try splitByGpt2Fast(&result, "a  b", 0, pretok.re.?);
+
+    // \s+(?!\S) matches first space only (next char is also space),
+    // then " b" matches ` ?\p{L}+`
+    try std.testing.expectEqual(@as(usize, 3), result.tokens.items.len);
+    try std.testing.expectEqualStrings("a", result.tokens.items[0].sliceConst());
+    try std.testing.expectEqualStrings(" ", result.tokens.items[1].sliceConst());
+    try std.testing.expectEqualStrings(" b", result.tokens.items[2].sliceConst());
+}
+
+test "splitByGpt2Fast mixed" {
+    var pretok = std.mem.zeroes(ct.PreTokenizer);
+    defer tokenizer_pretokenizer_free(&pretok);
+    _ = tokenizer_pretokenizer_set(&pretok, GPT2_PATTERN.ptr);
+
+    var result = PretokenizeResult.init();
+    defer result.deinit();
+    try splitByGpt2Fast(&result, "I'm 25!", 0, pretok.re.?);
+
+    try std.testing.expectEqual(@as(usize, 4), result.tokens.items.len);
+    try std.testing.expectEqualStrings("I", result.tokens.items[0].sliceConst());
+    try std.testing.expectEqualStrings("'m", result.tokens.items[1].sliceConst());
+    try std.testing.expectEqualStrings(" 25", result.tokens.items[2].sliceConst());
+    try std.testing.expectEqualStrings("!", result.tokens.items[3].sliceConst());
+}
+
+test "splitByGpt2Fast matches splitByRegex on varied input" {
+    var pretok = std.mem.zeroes(ct.PreTokenizer);
+    defer tokenizer_pretokenizer_free(&pretok);
+    _ = tokenizer_pretokenizer_set(&pretok, GPT2_PATTERN.ptr);
+
+    const test_inputs = [_][]const u8{
+        "Hello world",
+        "don't won't I'm he'd they're we've she'll",
+        "Hello, world! How's it going?",
+        "test 123 foo456 789bar",
+        "  hello  world  ",
+        "\nhello\n\nworld\n",
+        "a--b==c**d",
+        " 's end",
+        "word\t\tword",
+        "'Tis the season",
+        "price: $100.00!",
+        "a  \t  b",
+        "foo...bar!!!baz",
+        " \n \n ",
+        "  ",
+        "x",
+        "",
+        "I'm 25! Don't stop. We're here--finally.",
+    };
+
+    for (test_inputs) |input| {
+        var fast_result = PretokenizeResult.init();
+        defer fast_result.deinit();
+        try splitByGpt2Fast(&fast_result, input, 0, pretok.re.?);
+
+        var regex_result = PretokenizeResult.init();
+        defer regex_result.deinit();
+        try splitByRegex(&regex_result, input, 0, pretok.re.?, false, false);
+
+        // Compare token counts
+        if (regex_result.tokens.items.len != fast_result.tokens.items.len) {
+            std.debug.print("\nMISMATCH on input: \"{s}\" (len={d})\n", .{ input, input.len });
+            std.debug.print("  regex tokens ({d}):", .{regex_result.tokens.items.len});
+            for (regex_result.tokens.items) |tok| {
+                std.debug.print(" \"{s}\"", .{tok.sliceConst()});
+            }
+            std.debug.print("\n  fast tokens ({d}):", .{fast_result.tokens.items.len});
+            for (fast_result.tokens.items) |tok| {
+                std.debug.print(" \"{s}\"", .{tok.sliceConst()});
+            }
+            std.debug.print("\n", .{});
+            return error.TestUnexpectedResult;
+        }
+
+        // Compare each token
+        for (fast_result.tokens.items, regex_result.tokens.items, 0..) |fast_tok, regex_tok, i| {
+            if (!std.mem.eql(u8, fast_tok.sliceConst(), regex_tok.sliceConst())) {
+                std.debug.print("\nTOKEN MISMATCH on input: \"{s}\" at index {d}\n", .{ input, i });
+                std.debug.print("  regex: \"{s}\"\n  fast:  \"{s}\"\n", .{ regex_tok.sliceConst(), fast_tok.sliceConst() });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
 }

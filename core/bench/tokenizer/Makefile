@@ -6,6 +6,9 @@ WARMUP ?= 4
 ITERS ?= 10
 FORMAT ?= table
 SIZE ?= 1m
+TEXT_FILE ?=
+
+TEXT_FILE_FLAG := $(if $(TEXT_FILE),--text-file "$(TEXT_FILE)",)
 
 .PHONY: help encode_1k encode_100k encode_1m load all quick breakdown \
         normalize_1m pretok_1m bpe_1m bpe_merge_1m bpe_vocab_1m bpe_collect_1m \
@@ -37,7 +40,8 @@ breakdown:
 		--size "$(SIZE)" \
 		--profile "$(PROFILE)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 encode_1k:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -48,7 +52,8 @@ encode_1k:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 encode_100k:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -59,7 +64,8 @@ encode_100k:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 encode_1m:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -70,7 +76,8 @@ encode_1m:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 load:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -81,7 +88,8 @@ load:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 all:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -92,7 +100,8 @@ all:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 normalize_1m:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -103,7 +112,8 @@ normalize_1m:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 pretok_1m:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -114,7 +124,8 @@ pretok_1m:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 bpe_1m:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -125,7 +136,8 @@ bpe_1m:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 bpe_merge_1m:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -136,7 +148,8 @@ bpe_merge_1m:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 bpe_vocab_1m:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -147,7 +160,8 @@ bpe_vocab_1m:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 bpe_collect_1m:
 	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
@@ -158,7 +172,8 @@ bpe_collect_1m:
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \
 		--warmup "$(WARMUP)" \
-		--iters "$(ITERS)"
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
 
 quick:
 	@$(MAKE) all PROFILE=ci FORMAT=table WARMUP=2 ITERS=3

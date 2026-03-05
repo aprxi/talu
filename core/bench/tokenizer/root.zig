@@ -102,6 +102,7 @@ fn printUsage(writer: anytype) !void {
         \\  --scenario <all|breakdown|1k|100k|1m|load|norm|pretok|bpe|bpe_merge|bpe_vocab|bpe_collect>
         \\  --tokenizer <path/to/tokenizer.json>  required
         \\  --size <1k|10k|100k|1m>               default: 1m (for breakdown)
+        \\  --text-file <path>                    use real text instead of synthetic
         \\  --profile <ci|bw>                     default: bw
         \\  --format <table|csv|tsv>              default: table
         \\  --warmup <N>                          default: 4
@@ -130,6 +131,10 @@ fn parseArgs(args: [][:0]u8) !CliConfig {
             idx += 1;
             if (idx >= args.len) return error.InvalidArgument;
             cfg.size = try parseSize(args[idx]);
+        } else if (std.mem.eql(u8, arg, "--text-file")) {
+            idx += 1;
+            if (idx >= args.len) return error.InvalidArgument;
+            cfg.run.text_file = args[idx];
         } else if (std.mem.eql(u8, arg, "--profile")) {
             idx += 1;
             if (idx >= args.len) return error.InvalidArgument;
