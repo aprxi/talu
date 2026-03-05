@@ -4,6 +4,50 @@
 //! KV-cache style (inference mode). Saves attention probabilities for backward.
 
 const std = @import("std");
+const compute = @import("../../compute/root.zig");
+
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
+
+/// SIMD-vectorized dot product over `len` elements.
+fn simdDot(a: []const f32, b: []const f32) f32 {
+    @setFloatMode(.optimized);
+    const len = a.len;
+    std.debug.assert(b.len >= len);
+
+    var acc: F32Vec = @splat(0);
+    var i: usize = 0;
+    while (i + VEC <= len) : (i += VEC) {
+        const av: F32Vec = a[i..][0..VEC].*;
+        const bv: F32Vec = b[i..][0..VEC].*;
+        acc = @mulAdd(F32Vec, av, bv, acc);
+    }
+    var result = @reduce(.Add, acc);
+    while (i < len) : (i += 1) {
+        result += a[i] * b[i];
+    }
+    return result;
+}
+
+/// SIMD-vectorized out[j] += scale * v[j] for `len` elements.
+fn simdScaleAdd(out: []f32, v: []const f32, scale: f32) void {
+    @setFloatMode(.optimized);
+    const len = out.len;
+    std.debug.assert(v.len >= len);
+
+    const s: F32Vec = @splat(scale);
+    var i: usize = 0;
+    while (i + VEC <= len) : (i += VEC) {
+        var o: F32Vec = out[i..][0..VEC].*;
+        const vi: F32Vec = v[i..][0..VEC].*;
+        o = @mulAdd(F32Vec, s, vi, o);
+        out[i..][0..VEC].* = o;
+    }
+    while (i < len) : (i += 1) {
+        out[i] += scale * v[i];
+    }
+}
 
 /// Scaled dot-product attention with causal masking (full sequence, training mode).
 ///
@@ -47,10 +91,7 @@ pub fn attentionForward(
                     } else {
                         const k_offset = (bi * seq_len + ki) * n_kv_heads * head_dim + kv_h * head_dim;
                         const k_vec = k[k_offset..][0..head_dim];
-                        var dot: f32 = 0.0;
-                        for (q_vec, k_vec) |qv, kv| {
-                            dot += qv * kv;
-                        }
+                        const dot = simdDot(q_vec, k_vec);
                         prob_row[ki] = dot * scale;
                         max_score = @max(max_score, prob_row[ki]);
                     }
@@ -80,10 +121,7 @@ pub fn attentionForward(
                     if (prob_row[ki] == 0.0) continue;
                     const v_offset = (bi * seq_len + ki) * n_kv_heads * head_dim + kv_h * head_dim;
                     const v_vec = v[v_offset..][0..head_dim];
-                    const p = prob_row[ki];
-                    for (out_vec, v_vec) |*o, vv| {
-                        o.* += p * vv;
-                    }
+                    simdScaleAdd(out_vec, v_vec, prob_row[ki]);
                 }
             }
         }
@@ -99,13 +137,13 @@ const testing = std.testing;
 test "attentionForward causal masking works" {
     // batch=1, seq=2, n_heads=1, n_kv_heads=1, head_dim=2
     // Q: [[1,0], [0,1]], K: [[1,0], [0,1]], V: [[1,2], [3,4]]
-    const q = [_]f32{ 1, 0, 0, 1 }; // [2, 1*2]
-    const k = [_]f32{ 1, 0, 0, 1 };
+    const q_data = [_]f32{ 1, 0, 0, 1 }; // [2, 1*2]
+    const k_data = [_]f32{ 1, 0, 0, 1 };
     const v_data = [_]f32{ 1, 2, 3, 4 };
     var output: [4]f32 = undefined;
     var probs: [4]f32 = undefined; // [1, 1, 2, 2]
 
-    attentionForward(&output, &probs, &q, &k, &v_data, 1, 2, 1, 1, 2);
+    attentionForward(&output, &probs, &q_data, &k_data, &v_data, 1, 2, 1, 1, 2);
 
     // Position 0 can only attend to position 0
     // probs[0, :] should be [1.0, 0.0] (causal mask)

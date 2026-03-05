@@ -122,14 +122,9 @@ fn layerForward(
     linear_fwd.linearForward(la.k, la.normed_attn, lw.k_proj.asSlice(f32), bs, d, nkv * hd, scratch);
     linear_fwd.linearForward(la.v, la.normed_attn, lw.v_proj.asSlice(f32), bs, d, nkv * hd, scratch);
 
-    // Apply RoPE to Q and K per position
-    for (0..b) |bi| {
-        for (0..s) |pos| {
-            const token_idx = bi * s + pos;
-            rope_fwd.ropeForward(la.q[token_idx * nh * hd ..][0 .. nh * hd], nh, hd, hd, pos, config.rope_theta);
-            rope_fwd.ropeForward(la.k[token_idx * nkv * hd ..][0 .. nkv * hd], nkv, hd, hd, pos, config.rope_theta);
-        }
-    }
+    // Apply RoPE to Q and K (batch version precomputes inv_freq once)
+    rope_fwd.ropeForwardBatch(la.q[0 .. bs * nh * hd], b, s, nh, hd, hd, config.rope_theta);
+    rope_fwd.ropeForwardBatch(la.k[0 .. bs * nkv * hd], b, s, nkv, hd, hd, config.rope_theta);
 
     // Scaled dot-product attention
     attention_fwd.attentionForward(la.attn_output, la.attn_probs, la.q, la.k, la.v, b, s, nh, nkv, hd);

@@ -400,28 +400,9 @@ fn layerBackward(
         }
     }
 
-    // RoPE backward on grad_q and grad_k (in-place inverse rotation)
-    for (0..b) |bi| {
-        for (0..s) |pos| {
-            const token_idx = bi * s + pos;
-            rope_bw.ropeBackward(
-                grad_q[token_idx * nh * hd ..][0 .. nh * hd],
-                nh,
-                hd,
-                hd,
-                pos,
-                config.rope_theta,
-            );
-            rope_bw.ropeBackward(
-                grad_k[token_idx * nkv * hd ..][0 .. nkv * hd],
-                nkv,
-                hd,
-                hd,
-                pos,
-                config.rope_theta,
-            );
-        }
-    }
+    // RoPE backward on grad_q and grad_k (batch version precomputes inv_freq once)
+    rope_bw.ropeBackwardBatch(grad_q[0 .. bs * nh * hd], b, s, nh, hd, hd, config.rope_theta);
+    rope_bw.ropeBackwardBatch(grad_k[0 .. bs * nkv * hd], b, s, nkv, hd, hd, config.rope_theta);
 
     // Q projection backward:
     // Forward: q_pre_rope = normed_attn @ q_proj^T
@@ -521,9 +502,24 @@ fn layerBackward(
 /// Recompute silu(gate) * up (SwiGLU forward) for use in down_proj gradWeight.
 /// We didn't save this intermediate in the forward pass, so recompute it here.
 fn recomputeSwiglu(output: []f32, gate: []const f32, up: []const f32, len: usize) void {
-    for (0..len) |i| {
+    @setFloatMode(.optimized);
+    const simd_arch = @import("../../compute/root.zig").cpu.simd.arch;
+    const VEC = simd_arch.f32_vec_len;
+    const F32Vec = simd_arch.F32Vec;
+    const fast = @import("../../compute/cpu/math_fast.zig");
+
+    const one: F32Vec = @splat(1.0);
+    var i: usize = 0;
+    while (i + VEC <= len) : (i += VEC) {
+        const x: F32Vec = gate[i..][0..VEC].*;
+        const exp_neg = fast.fastExp(-x);
+        const sig = one / (one + exp_neg);
+        const u: F32Vec = up[i..][0..VEC].*;
+        output[i..][0..VEC].* = x * sig * u;
+    }
+    while (i < len) : (i += 1) {
         const x = gate[i];
-        const sigmoid = 1.0 / (1.0 + @exp(-x));
+        const sigmoid = 1.0 / (1.0 + fast.fastExpScalar(-x));
         output[i] = x * sigmoid * up[i];
     }
 }

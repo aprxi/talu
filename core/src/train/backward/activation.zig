@@ -5,6 +5,14 @@
 //! SwiGLU:  y = silu(gate) * up
 
 const std = @import("std");
+const compute = @import("../../compute/root.zig");
+
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
+const math_fast = @import("../../compute/cpu/math_fast.zig");
+const fastExp = math_fast.fastExp;
+const fastExpScalar = math_fast.fastExpScalar;
 
 /// Abramowitz & Stegun polynomial approximation of erf(x).
 /// Max error < 1.5e-7 for all x.
@@ -32,12 +40,23 @@ pub fn siluBackward(
     grad_output: []const f32,
     input: []const f32,
 ) void {
+    @setFloatMode(.optimized);
     std.debug.assert(grad_input.len == grad_output.len);
     std.debug.assert(grad_input.len == input.len);
 
-    for (grad_input, grad_output, input) |*dx, dy, x| {
-        const sig = 1.0 / (1.0 + @exp(-x));
-        dx.* = dy * sig * (1.0 + x * (1.0 - sig));
+    const one: F32Vec = @splat(1.0);
+    const count = grad_input.len;
+    var i: usize = 0;
+    while (i + VEC <= count) : (i += VEC) {
+        const x: F32Vec = input[i..][0..VEC].*;
+        const dy: F32Vec = grad_output[i..][0..VEC].*;
+        const sig = one / (one + fastExp(-x));
+        grad_input[i..][0..VEC].* = dy * sig * (one + x * (one - sig));
+    }
+    while (i < count) : (i += 1) {
+        const x = input[i];
+        const sig = 1.0 / (1.0 + fastExpScalar(-x));
+        grad_input[i] = grad_output[i] * sig * (1.0 + x * (1.0 - sig));
     }
 }
 
@@ -82,18 +101,34 @@ pub fn swigluBackward(
     gate: []const f32,
     up: []const f32,
 ) void {
+    @setFloatMode(.optimized);
     std.debug.assert(grad_gate.len == grad_output.len);
     std.debug.assert(grad_up.len == grad_output.len);
     std.debug.assert(gate.len == grad_output.len);
     std.debug.assert(up.len == grad_output.len);
 
-    for (grad_gate, grad_up, grad_output, gate, up) |*dg, *du, dy, g, u| {
-        const sig = 1.0 / (1.0 + @exp(-g));
+    const one: F32Vec = @splat(1.0);
+    const count = grad_gate.len;
+    var i: usize = 0;
+    while (i + VEC <= count) : (i += VEC) {
+        const g: F32Vec = gate[i..][0..VEC].*;
+        const u: F32Vec = up[i..][0..VEC].*;
+        const dy: F32Vec = grad_output[i..][0..VEC].*;
+        const sig = one / (one + fastExp(-g));
+        const silu_g = g * sig;
+        const silu_grad = sig * (one + g * (one - sig));
+        grad_gate[i..][0..VEC].* = dy * u * silu_grad;
+        grad_up[i..][0..VEC].* = dy * silu_g;
+    }
+    while (i < count) : (i += 1) {
+        const g = gate[i];
+        const u = up[i];
+        const dy = grad_output[i];
+        const sig = 1.0 / (1.0 + fastExpScalar(-g));
         const silu_g = g * sig;
         const silu_grad = sig * (1.0 + g * (1.0 - sig));
-
-        dg.* = dy * u * silu_grad;
-        du.* = dy * silu_g;
+        grad_gate[i] = dy * u * silu_grad;
+        grad_up[i] = dy * silu_g;
     }
 }
 
@@ -120,7 +155,7 @@ test "siluBackward scales with grad_output" {
     siluBackward(&grad_1, &[_]f32{1.0}, &input);
     siluBackward(&grad_2, &[_]f32{2.0}, &input);
 
-    try std.testing.expectApproxEqAbs(grad_1[0] * 2.0, grad_2[0], 1e-5);
+    try std.testing.expectApproxEqAbs(grad_1[0] * 2.0, grad_2[0], 1e-4);
 }
 
 test "geluBackward at x=0 gives 0.5" {
@@ -146,7 +181,7 @@ test "swigluBackward decomposes correctly" {
 
     swigluBackward(&dg, &du, &dy, &gate, &up_val);
 
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), dg[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), dg[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), du[0], 1e-5);
 }
 
@@ -164,6 +199,6 @@ test "swigluBackward with non-zero gate" {
 
     const sig: f32 = 1.0 / (1.0 + @exp(@as(f32, -2.0)));
     const silu_2 = 2.0 * sig;
-    try std.testing.expectApproxEqAbs(silu_2, du[0], 1e-4);
+    try std.testing.expectApproxEqAbs(silu_2, du[0], 1e-3);
     try std.testing.expect(dg[0] > 0.0);
 }

@@ -16,6 +16,50 @@
 //! are accumulated across query heads.
 
 const std = @import("std");
+const compute = @import("../../compute/root.zig");
+
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
+
+/// SIMD-vectorized dot product.
+fn simdDot(a: []const f32, b: []const f32) f32 {
+    @setFloatMode(.optimized);
+    const len = a.len;
+    std.debug.assert(b.len >= len);
+
+    var acc: F32Vec = @splat(0);
+    var i: usize = 0;
+    while (i + VEC <= len) : (i += VEC) {
+        const av: F32Vec = a[i..][0..VEC].*;
+        const bv: F32Vec = b[i..][0..VEC].*;
+        acc = @mulAdd(F32Vec, av, bv, acc);
+    }
+    var result = @reduce(.Add, acc);
+    while (i < len) : (i += 1) {
+        result += a[i] * b[i];
+    }
+    return result;
+}
+
+/// SIMD-vectorized out[j] += scale * v[j].
+fn simdScaleAdd(out: []f32, v: []const f32, scale: f32) void {
+    @setFloatMode(.optimized);
+    const len = out.len;
+    std.debug.assert(v.len >= len);
+
+    const s: F32Vec = @splat(scale);
+    var i: usize = 0;
+    while (i + VEC <= len) : (i += VEC) {
+        var o: F32Vec = out[i..][0..VEC].*;
+        const vi: F32Vec = v[i..][0..VEC].*;
+        o = @mulAdd(F32Vec, s, vi, o);
+        out[i..][0..VEC].* = o;
+    }
+    while (i < len) : (i += 1) {
+        out[i] += scale * v[i];
+    }
+}
 
 /// Compute attention backward for a single token position (training step).
 ///
@@ -80,10 +124,7 @@ pub fn attentionBackward(
         var prob_dot_dprob: f32 = 0.0;
         for (0..seq_len) |t| {
             const v_row = value_cache[(t * n_kv_heads + kv_h) * head_dim ..][0..head_dim];
-            var dot_val: f32 = 0.0;
-            for (d_out, v_row) |d, v| {
-                dot_val += d * v;
-            }
+            const dot_val = simdDot(d_out, v_row);
             d_probs[t] = dot_val;
             prob_dot_dprob += prob_row[t] * dot_val;
         }
@@ -102,21 +143,15 @@ pub fn attentionBackward(
             const k_row = key_cache[(t * n_kv_heads + kv_h) * head_dim ..][0..head_dim];
 
             // d_Q += d_score * K[t]
-            for (dq, k_row) |*dqi, ki| {
-                dqi.* += d_score * ki;
-            }
+            simdScaleAdd(dq, k_row, d_score);
 
             // d_K[t] += d_score * Q  (accumulated across GQA heads)
             const dk_row = grad_k[(t * n_kv_heads + kv_h) * head_dim ..][0..head_dim];
-            for (dk_row, q_row) |*dki, qi| {
-                dki.* += d_score * qi;
-            }
+            simdScaleAdd(dk_row, q_row, d_score);
 
             // d_V[t] += probs[t] * d_output  (accumulated across GQA heads)
             const dv_row = grad_v[(t * n_kv_heads + kv_h) * head_dim ..][0..head_dim];
-            for (dv_row, d_out) |*dvi, di| {
-                dvi.* += prob_row[t] * di;
-            }
+            simdScaleAdd(dv_row, d_out, prob_row[t]);
         }
     }
 }
