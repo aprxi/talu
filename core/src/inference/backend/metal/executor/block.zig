@@ -135,6 +135,7 @@ pub const TransformerBlock = struct {
     const layer_program_required_opcodes = [_]opcode_map.Opcode{
         .rmsnorm,
         .multihead_attention,
+        .mla_attention,
         .shortconv,
         .swiglu,
         .moe,
@@ -146,6 +147,7 @@ pub const TransformerBlock = struct {
         var table: runtime_contract.AdapterTable = [_]?runtime_contract.KernelAdapterFn{null} ** 256;
         table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = layerProgramNormRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = layerProgramAttentionRuntimeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.mla_attention)] = layerProgramAttentionRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.shortconv)] = layerProgramShortConvRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.swiglu)] = layerProgramSwiGluRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.moe)] = layerProgramMoeRuntimeAdapter;
@@ -311,10 +313,48 @@ pub const TransformerBlock = struct {
     ) !*anyopaque {
         const lw = ctx.layer_weights;
         if (lw.isMLA()) {
-            if (key != .mla_weights) return error.InvalidWeightBindingName;
-            if (lw.o_proj) |*weight| return @ptrCast(@constCast(weight));
-            if (lw.o_proj_bf16) |*weight| return @ptrCast(@constCast(weight));
-            return error.MissingWeight;
+            return switch (key) {
+                .mla_q_a_proj, .attention_q_proj => if (lw.mla_q_a_proj) |*weight|
+                    @ptrCast(@constCast(weight))
+                else if (lw.mla_q_a_proj_bf16) |*weight|
+                    @ptrCast(@constCast(weight))
+                else
+                    error.MissingWeight,
+                .mla_q_a_norm, .attention_k_proj => if (lw.mla_q_a_norm) |*weight|
+                    @ptrCast(@constCast(weight))
+                else
+                    error.MissingWeight,
+                .mla_q_b_proj, .attention_v_proj => if (lw.mla_q_b_proj) |*weight|
+                    @ptrCast(@constCast(weight))
+                else if (lw.mla_q_b_proj_bf16) |*weight|
+                    @ptrCast(@constCast(weight))
+                else
+                    error.MissingWeight,
+                .mla_kv_a_proj, .attention_o_proj => if (lw.mla_kv_a_proj) |*weight|
+                    @ptrCast(@constCast(weight))
+                else if (lw.mla_kv_a_proj_bf16) |*weight|
+                    @ptrCast(@constCast(weight))
+                else
+                    error.MissingWeight,
+                .mla_kv_a_norm, .attention_q_norm => if (lw.mla_kv_a_norm) |*weight|
+                    @ptrCast(@constCast(weight))
+                else
+                    error.MissingWeight,
+                .mla_kv_b_proj, .attention_k_norm => if (lw.mla_kv_b_proj) |*weight|
+                    @ptrCast(@constCast(weight))
+                else if (lw.mla_kv_b_proj_bf16) |*weight|
+                    @ptrCast(@constCast(weight))
+                else
+                    error.MissingWeight,
+                .mla_o_proj, .attention_q_bias => if (lw.o_proj) |*weight|
+                    @ptrCast(@constCast(weight))
+                else if (lw.o_proj_bf16) |*weight|
+                    @ptrCast(@constCast(weight))
+                else
+                    error.MissingWeight,
+                .attention_k_bias, .attention_v_bias, .attention_o_bias, .attention_attn_sinks => @ptrCast(&missing_optional_array_handle),
+                else => error.InvalidWeightBindingName,
+            };
         }
         if (key == .attention_q_proj) {
             if (lw.q_proj) |*weight| return @ptrCast(@constCast(weight));
@@ -504,7 +544,7 @@ pub const TransformerBlock = struct {
         if (key == .invalid) return error.InvalidWeightBindingName;
         return switch (key) {
             .norm_weight => resolveLayerProgramNormWeightPtr(ctx),
-            .attention_q_proj, .attention_k_proj, .attention_v_proj, .attention_o_proj, .attention_q_norm, .attention_k_norm, .attention_q_bias, .attention_k_bias, .attention_v_bias, .attention_o_bias, .attention_attn_sinks, .mla_weights => resolveLayerProgramAttentionWeightPtr(ctx, key),
+            .attention_q_proj, .attention_k_proj, .attention_v_proj, .attention_o_proj, .attention_q_norm, .attention_k_norm, .attention_q_bias, .attention_k_bias, .attention_v_bias, .attention_o_bias, .attention_attn_sinks, .mla_q_a_proj, .mla_q_a_norm, .mla_q_b_proj, .mla_kv_a_proj, .mla_kv_a_norm, .mla_kv_b_proj, .mla_o_proj => resolveLayerProgramAttentionWeightPtr(ctx, key),
             .swiglu_w1, .swiglu_w3, .swiglu_w2, .swiglu_w1_bias, .swiglu_w2_bias => resolveLayerProgramSwiGluWeightPtr(ctx, key),
             .moe_router, .moe_gate_proj, .moe_up_proj, .moe_down_proj, .moe_router_bias, .moe_gate_scales, .moe_up_scales, .moe_down_scales, .moe_gate_bias, .moe_up_bias, .moe_down_bias, .moe_router_scales, .moe_router_quant_bias => resolveLayerProgramMoeWeightPtr(ctx, key),
             .mamba_in_proj, .mamba_conv_weight, .mamba_a_log, .mamba_d_skip, .mamba_out_proj, .mamba_conv_bias, .mamba_dt_bias, .mamba_norm_weight, .mamba_ln1_weight, .mamba_ln2_weight, .mamba_gate_up, .mamba_down_proj => resolveLayerProgramMambaWeightPtr(ctx, key),
@@ -880,7 +920,27 @@ pub const TransformerBlock = struct {
                 multihead.o_bias = optionalArrayWeightFromHandle(weight_handles[9]);
                 multihead.attn_sinks = optionalArrayWeightFromHandle(weight_handles[10]);
             },
-            .mla => {},
+            .mla => |*mla| {
+                if (mla.q_a_proj != null) {
+                    mla.q_a_proj = quantizedWeightFromHandle(weight_handles[0]).*;
+                    mla.q_b_proj = quantizedWeightFromHandle(weight_handles[2]).*;
+                    mla.kv_a_proj = quantizedWeightFromHandle(weight_handles[3]).*;
+                    mla.kv_b_proj = quantizedWeightFromHandle(weight_handles[5]).*;
+                    if (mla.o_proj != null) {
+                        mla.o_proj = quantizedWeightFromHandle(weight_handles[6]).*;
+                    } else {
+                        mla.o_proj_bf16 = arrayWeightFromHandle(weight_handles[6]).*;
+                    }
+                } else {
+                    mla.q_a_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
+                    mla.q_b_proj_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
+                    mla.kv_a_proj_bf16 = arrayWeightFromHandle(weight_handles[3]).*;
+                    mla.kv_b_proj_bf16 = arrayWeightFromHandle(weight_handles[5]).*;
+                    mla.o_proj_bf16 = arrayWeightFromHandle(weight_handles[6]).*;
+                }
+                mla.q_a_norm = optionalArrayWeightFromHandle(weight_handles[1]) orelse return error.MissingField;
+                mla.kv_a_norm = optionalArrayWeightFromHandle(weight_handles[4]) orelse return error.MissingField;
+            },
         }
         const output = try runAttentionKernel(
             input,
@@ -1508,6 +1568,7 @@ test "layer_program_adapter_table covers Metal LayerOp execution subset" {
     const supported = [_]opcode_map.Opcode{
         .rmsnorm,
         .multihead_attention,
+        .mla_attention,
         .swiglu,
         .moe,
         .mamba_mixer,

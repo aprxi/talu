@@ -209,22 +209,20 @@ fn layerProgramWeightBindingKeyFor(
             .attention_attn_sinks
         else
             error.InvalidWeightBindingName,
-        .mla_attention => if (std.mem.eql(u8, slot_name, "mla_weights"))
-            .mla_weights
-        else if (std.mem.eql(u8, slot_name, "q_a_proj"))
-            .mla_weights
+        .mla_attention => if (std.mem.eql(u8, slot_name, "q_a_proj"))
+            .mla_q_a_proj
         else if (std.mem.eql(u8, slot_name, "q_a_norm"))
-            .mla_weights
+            .mla_q_a_norm
         else if (std.mem.eql(u8, slot_name, "q_b_proj"))
-            .mla_weights
+            .mla_q_b_proj
         else if (std.mem.eql(u8, slot_name, "kv_a_proj"))
-            .mla_weights
+            .mla_kv_a_proj
         else if (std.mem.eql(u8, slot_name, "kv_a_norm"))
-            .mla_weights
+            .mla_kv_a_norm
         else if (std.mem.eql(u8, slot_name, "kv_b_proj"))
-            .mla_weights
+            .mla_kv_b_proj
         else if (std.mem.eql(u8, slot_name, "o_proj"))
-            .mla_weights
+            .mla_o_proj
         else
             error.InvalidWeightBindingName,
         .swiglu => if (std.mem.eql(u8, slot_name, "w1"))
@@ -357,7 +355,7 @@ fn layerProgramStaticWeightPtr(
     key: WeightHandles.LayerProgramWeightBindingKey,
 ) ?*anyopaque {
     return switch (key) {
-        .invalid, .norm_weight, .mla_weights => null,
+        .invalid, .norm_weight => null,
         .attention_q_proj => if (layer.q_proj) |*weight|
             @ptrCast(weight)
         else if (layer.q_proj_bf16) |*weight|
@@ -474,6 +472,38 @@ fn layerProgramStaticWeightPtr(
         else
             null,
         .shortconv_conv_bias => if (layer.shortconv_conv_bias) |*weight| @ptrCast(weight) else null,
+        .mla_q_a_proj => if (layer.mla_q_a_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.mla_q_a_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .mla_q_a_norm => if (layer.mla_q_a_norm) |*weight| @ptrCast(weight) else null,
+        .mla_q_b_proj => if (layer.mla_q_b_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.mla_q_b_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .mla_kv_a_proj => if (layer.mla_kv_a_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.mla_kv_a_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .mla_kv_a_norm => if (layer.mla_kv_a_norm) |*weight| @ptrCast(weight) else null,
+        .mla_kv_b_proj => if (layer.mla_kv_b_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.mla_kv_b_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .mla_o_proj => if (layer.o_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.o_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
     };
 }
 
@@ -1600,7 +1630,13 @@ pub const WeightHandles = struct {
         shortconv_conv_weight,
         shortconv_out_proj,
         shortconv_conv_bias,
-        mla_weights,
+        mla_q_a_proj,
+        mla_q_a_norm,
+        mla_q_b_proj,
+        mla_kv_a_proj,
+        mla_kv_a_norm,
+        mla_kv_b_proj,
+        mla_o_proj,
     };
 
     pub const LayerWeights = struct {
