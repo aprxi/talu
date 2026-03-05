@@ -184,7 +184,12 @@ fn layerProgramWeightBindingKeyFor(
     slot_name: []const u8,
 ) !WeightHandles.LayerProgramWeightBindingKey {
     return switch (opcode) {
-        .rmsnorm => if (std.mem.eql(u8, slot_name, "norm_weight")) .norm_weight else error.InvalidWeightBindingName,
+        .rmsnorm => if (std.mem.eql(u8, slot_name, "norm_weight"))
+            .norm_weight
+        else if (std.mem.eql(u8, slot_name, "norm_bias"))
+            .norm_bias
+        else
+            error.InvalidWeightBindingName,
         .multihead_attention => if (std.mem.eql(u8, slot_name, "q_proj"))
             .attention_q_proj
         else if (std.mem.eql(u8, slot_name, "k_proj"))
@@ -355,7 +360,7 @@ fn layerProgramStaticWeightPtr(
     key: WeightHandles.LayerProgramWeightBindingKey,
 ) ?*anyopaque {
     return switch (key) {
-        .invalid, .norm_weight => null,
+        .invalid, .norm_weight, .norm_bias => null,
         .attention_q_proj => if (layer.q_proj) |*weight|
             @ptrCast(weight)
         else if (layer.q_proj_bf16) |*weight|
@@ -1585,6 +1590,7 @@ pub const WeightHandles = struct {
     pub const LayerProgramWeightBindingKey = enum(u8) {
         invalid = 0,
         norm_weight,
+        norm_bias,
         attention_q_proj,
         attention_k_proj,
         attention_v_proj,
@@ -2579,4 +2585,52 @@ test "buildLayerProgramWeightBindingKeys resolves multihead slots to keys" {
     try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_k_proj, keys[1]);
     try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_v_proj, keys[2]);
     try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_o_proj, keys[3]);
+}
+
+test "buildLayerProgramWeightBindingKeys resolves rmsnorm weight and bias slots" {
+    const inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+    const outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const weight_refs = [_]runtime_contract.WeightRef{
+        .{ .index = 0 },
+        .{ .index = 1 },
+    };
+    const instructions = [_]runtime_contract.Instruction{
+        .{
+            .opcode = .rmsnorm,
+            .inputs = inputs[0..],
+            .outputs = outputs[0..],
+            .weights = weight_refs[0..],
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+    };
+    const kill0 = [_]u64{0b0011};
+    const compiled = runtime_contract.CompiledPlan{
+        .plan = .{
+            .instructions = instructions[0..],
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .weight_bindings = &.{
+            .{ .index = 0, .name = "__kernel_weight::1::norm_weight::0" },
+            .{ .index = 1, .name = "__kernel_weight::1::norm_bias::0" },
+        },
+        .register_buffer_specs = &.{
+            .{ .size = 1, .@"align" = 4 },
+            .{ .size = 1, .@"align" = 4 },
+        },
+        .liveness = .{
+            .register_last_read = &.{ 0, 0 },
+            .kill_after_instruction = &.{kill0[0..]},
+        },
+        .peak_registers = 1,
+        .diagnostics = &.{},
+    };
+
+    const keys = try buildLayerProgramWeightBindingKeys(testing.allocator, &compiled);
+    defer if (keys.len > 0) testing.allocator.free(keys);
+    try testing.expectEqual(@as(usize, 2), keys.len);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.norm_weight, keys[0]);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.norm_bias, keys[1]);
 }

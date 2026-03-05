@@ -48,21 +48,7 @@ pub const TransformerBlock = struct {
         handle: runtime_contract.StateBlockHandle,
     };
 
-    const LayerProgramExecutionContext = struct {
-        compiled_plan: *const runtime_contract.CompiledPlan,
-        layer_idx: usize,
-        pos_offset: usize,
-        runtime_rope_cos_handle: mlx_graph.ArrayHandle,
-        runtime_rope_sin_handle: mlx_graph.ArrayHandle,
-        runtime_rope_dim: usize,
-        residual: *mlx_graph.ArrayHandle,
-        slot_buffers: []mlx_graph.ArrayHandle,
-        register_to_slot_map: []const u8,
-        weight_binding_keys: []const LayerProgramWeightBindingKey,
-        instruction_handles: []runtime_contract.TensorHandle,
-        instruction_views: []runtime_contract.TensorViewDesc,
-        norm_index: *usize,
-        layer_weights: *const LayerWeights,
+    const LayerRuntimeMetadata = struct {
         model_config: ModelConfig,
         residual_multiplier: f32,
         use_gelu: bool,
@@ -85,6 +71,24 @@ pub const TransformerBlock = struct {
         mamba_d_head: usize,
         mamba_n_groups: usize,
         mamba_gate_up_layout: u8,
+    };
+
+    const LayerProgramExecutionContext = struct {
+        compiled_plan: *const runtime_contract.CompiledPlan,
+        layer_idx: usize,
+        pos_offset: usize,
+        runtime_rope_cos_handle: mlx_graph.ArrayHandle,
+        runtime_rope_sin_handle: mlx_graph.ArrayHandle,
+        runtime_rope_dim: usize,
+        residual: *mlx_graph.ArrayHandle,
+        slot_buffers: []mlx_graph.ArrayHandle,
+        register_to_slot_map: []const u8,
+        weight_binding_keys: []const LayerProgramWeightBindingKey,
+        instruction_handles: []runtime_contract.TensorHandle,
+        instruction_views: []runtime_contract.TensorViewDesc,
+        norm_index: *usize,
+        layer_weights: *const LayerWeights,
+        runtime_meta: LayerRuntimeMetadata,
         resolved_weight_ptrs: []?*anyopaque,
         state_bindings: [MaxLayerProgramStateBindings]?LayerProgramStateBinding = [_]?LayerProgramStateBinding{null} ** MaxLayerProgramStateBindings,
         state_binding_count: usize = 0,
@@ -561,6 +565,7 @@ pub const TransformerBlock = struct {
         if (key == .invalid) return error.InvalidWeightBindingName;
         return switch (key) {
             .norm_weight => resolveLayerProgramNormWeightPtr(ctx),
+            .norm_bias => @ptrCast(&missing_optional_array_handle),
             .attention_q_proj, .attention_k_proj, .attention_v_proj, .attention_o_proj, .attention_q_norm, .attention_k_norm, .attention_q_bias, .attention_k_bias, .attention_v_bias, .attention_o_bias, .attention_attn_sinks, .mla_q_a_proj, .mla_q_a_norm, .mla_q_b_proj, .mla_kv_a_proj, .mla_kv_a_norm, .mla_kv_b_proj, .mla_o_proj => resolveLayerProgramAttentionWeightPtr(ctx, key),
             .swiglu_w1, .swiglu_w3, .swiglu_w2, .swiglu_w1_bias, .swiglu_w2_bias => resolveLayerProgramSwiGluWeightPtr(ctx, key),
             .moe_router, .moe_gate_proj, .moe_up_proj, .moe_down_proj, .moe_router_bias, .moe_gate_scales, .moe_up_scales, .moe_down_scales, .moe_gate_bias, .moe_up_bias, .moe_down_bias, .moe_router_scales, .moe_router_quant_bias => resolveLayerProgramMoeWeightPtr(ctx, key),
@@ -581,6 +586,7 @@ pub const TransformerBlock = struct {
         const key = ctx.weight_binding_keys[ref_index];
         if (key == .invalid) return error.InvalidWeightBindingName;
         if (key == .norm_weight) return resolveLayerProgramNormWeightPtr(ctx);
+        if (key == .norm_bias) return @ptrCast(&missing_optional_array_handle);
         if (ref_index >= ctx.resolved_weight_ptrs.len) return error.InvalidWeightRefIndex;
         if (ctx.resolved_weight_ptrs[ref_index]) |cached| return cached;
         const resolved = try resolveLayerProgramWeightPtrForKey(ctx, key);
@@ -837,7 +843,7 @@ pub const TransformerBlock = struct {
         var output: mlx_graph.ArrayHandle = undefined;
         const norm = norm_kernel.RMSNorm{
             .weight = arrayWeightFromHandle(weight_handles[0]).*,
-            .eps = state.model_config.norm_eps,
+            .eps = state.runtime_meta.model_config.norm_eps,
         };
         norm.forward(input, &output);
         arraySlotFromHandle(io.outputs[0]).* = output;
@@ -858,13 +864,13 @@ pub const TransformerBlock = struct {
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
         var attention_binding: AttentionRuntimeBinding = blk: {
-            if (state.mla_storage_kind != .missing) {
-                const mla_cfg = state.mla_config orelse return error.MissingField;
+            if (state.runtime_meta.mla_storage_kind != .missing) {
+                const mla_cfg = state.runtime_meta.mla_config orelse return error.MissingField;
                 break :blk .{
                     .mla = .{
-                        .n_heads = @intCast(state.model_config.n_heads),
-                        .rope_theta = state.model_config.rope_theta,
-                        .norm_eps = state.model_config.norm_eps,
+                        .n_heads = @intCast(state.runtime_meta.model_config.n_heads),
+                        .rope_theta = state.runtime_meta.model_config.rope_theta,
+                        .norm_eps = state.runtime_meta.model_config.norm_eps,
                         .q_lora_rank = mla_cfg.q_lora_rank,
                         .kv_lora_rank = mla_cfg.kv_lora_rank,
                         .qk_head_dim = mla_cfg.qk_head_dim,
@@ -888,13 +894,13 @@ pub const TransformerBlock = struct {
             }
             break :blk .{
                 .multihead = .{
-                    .n_heads = @intCast(state.model_config.n_heads),
-                    .n_kv_heads = @intCast(state.model_config.n_kv_groups),
-                    .head_dim = @intCast(state.model_config.head_dim),
-                    .rope_theta = state.model_config.rope_theta,
-                    .norm_eps = state.model_config.norm_eps,
-                    .query_pre_attn_scalar = state.model_config.query_pre_attn_scalar,
-                    .attention_multiplier = state.attention_multiplier,
+                    .n_heads = @intCast(state.runtime_meta.model_config.n_heads),
+                    .n_kv_heads = @intCast(state.runtime_meta.model_config.n_kv_groups),
+                    .head_dim = @intCast(state.runtime_meta.model_config.head_dim),
+                    .rope_theta = state.runtime_meta.model_config.rope_theta,
+                    .norm_eps = state.runtime_meta.model_config.norm_eps,
+                    .query_pre_attn_scalar = state.runtime_meta.model_config.query_pre_attn_scalar,
+                    .attention_multiplier = state.runtime_meta.attention_multiplier,
                     .q_proj = null,
                     .k_proj = null,
                     .v_proj = null,
@@ -915,7 +921,7 @@ pub const TransformerBlock = struct {
         };
         switch (attention_binding) {
             .multihead => |*multihead| {
-                switch (state.attention_storage_kind) {
+                switch (state.runtime_meta.attention_storage_kind) {
                     .quantized => {
                         multihead.q_proj = quantizedWeightFromHandle(weight_handles[0]).*;
                         multihead.k_proj = quantizedWeightFromHandle(weight_handles[1]).*;
@@ -945,7 +951,7 @@ pub const TransformerBlock = struct {
                 multihead.attn_sinks = optionalArrayWeightFromHandle(weight_handles[10]);
             },
             .mla => |*mla| {
-                switch (state.mla_storage_kind) {
+                switch (state.runtime_meta.mla_storage_kind) {
                     .quantized => {
                         mla.q_a_proj = quantizedWeightFromHandle(weight_handles[0]).*;
                         mla.q_b_proj = quantizedWeightFromHandle(weight_handles[2]).*;
@@ -999,10 +1005,10 @@ pub const TransformerBlock = struct {
             .out_proj_bf16 = null,
             .conv_weight = null,
             .conv_bias = null,
-            .d_conv = state.shortconv_d_conv,
-            .conv_dim = state.shortconv_conv_dim,
+            .d_conv = state.runtime_meta.shortconv_d_conv,
+            .conv_dim = state.runtime_meta.shortconv_conv_dim,
         };
-        switch (state.shortconv_storage_kind) {
+        switch (state.runtime_meta.shortconv_storage_kind) {
             .quantized => {
                 shortconv_binding.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
                 shortconv_binding.out_proj = quantizedWeightFromHandle(weight_handles[2]).*;
@@ -1032,7 +1038,7 @@ pub const TransformerBlock = struct {
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
         var swiglu_binding = ffn_kernel.SwiGLU{
-            .use_gelu = state.use_gelu,
+            .use_gelu = state.runtime_meta.use_gelu,
             .w1 = null,
             .w2 = null,
             .w3 = null,
@@ -1040,7 +1046,7 @@ pub const TransformerBlock = struct {
             .w2_bf16 = null,
             .w3_bf16 = null,
         };
-        switch (state.ffn_storage_kind) {
+        switch (state.runtime_meta.ffn_storage_kind) {
             .quantized => {
                 swiglu_binding.w1 = quantizedWeightFromHandle(weight_handles[0]).*;
                 swiglu_binding.w3 = quantizedWeightFromHandle(weight_handles[1]).*;
@@ -1083,10 +1089,10 @@ pub const TransformerBlock = struct {
             .gate_bias = optionalArrayWeightFromHandle(weight_handles[8]),
             .up_bias = optionalArrayWeightFromHandle(weight_handles[9]),
             .down_bias = optionalArrayWeightFromHandle(weight_handles[10]),
-            .router_group_size = state.moe_router_group_size,
-            .expert_group_size = state.moe_expert_group_size,
-            .num_experts = state.moe_num_experts,
-            .experts_per_token = state.moe_experts_per_token,
+            .router_group_size = state.runtime_meta.moe_router_group_size,
+            .expert_group_size = state.runtime_meta.moe_expert_group_size,
+            .num_experts = state.runtime_meta.moe_num_experts,
+            .experts_per_token = state.runtime_meta.moe_experts_per_token,
         };
         const output = try runMoeKernel(input, .{ .weights = &runtime_moe });
         arraySlotFromHandle(io.outputs[0]).* = output;
@@ -1106,15 +1112,15 @@ pub const TransformerBlock = struct {
         if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
         const input = arraySlotFromHandle(io.inputs[0]).*;
         var mamba_binding = mamba_kernel.MambaKernel{
-            .d_state = state.mamba_d_state,
-            .d_conv = state.mamba_d_conv,
-            .n_heads = state.mamba_n_heads,
-            .d_head = state.mamba_d_head,
-            .n_groups = state.mamba_n_groups,
-            .use_gelu = state.use_gelu,
-            .residual_multiplier = state.residual_multiplier,
-            .norm_eps = state.model_config.norm_eps,
-            .gate_up_layout = state.mamba_gate_up_layout,
+            .d_state = state.runtime_meta.mamba_d_state,
+            .d_conv = state.runtime_meta.mamba_d_conv,
+            .n_heads = state.runtime_meta.mamba_n_heads,
+            .d_head = state.runtime_meta.mamba_d_head,
+            .n_groups = state.runtime_meta.mamba_n_groups,
+            .use_gelu = state.runtime_meta.use_gelu,
+            .residual_multiplier = state.runtime_meta.residual_multiplier,
+            .norm_eps = state.runtime_meta.model_config.norm_eps,
+            .gate_up_layout = state.runtime_meta.mamba_gate_up_layout,
             .ln1_weight = null,
             .in_proj = null,
             .in_proj_bf16 = null,
@@ -1132,7 +1138,7 @@ pub const TransformerBlock = struct {
             .down_proj = null,
             .down_proj_bf16 = null,
         };
-        switch (state.mamba_storage_kind) {
+        switch (state.runtime_meta.mamba_storage_kind) {
             .quantized => {
                 mamba_binding.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
                 mamba_binding.out_proj = quantizedWeightFromHandle(weight_handles[4]).*;
@@ -1152,14 +1158,14 @@ pub const TransformerBlock = struct {
         mamba_binding.dt_bias = optionalArrayWeightFromHandle(weight_handles[6]);
         mamba_binding.norm_weight = optionalArrayWeightFromHandle(weight_handles[7]);
         if (optionalArrayWeightFromHandle(weight_handles[10]) != null) {
-            switch (state.mamba_storage_kind) {
+            switch (state.runtime_meta.mamba_storage_kind) {
                 .quantized => mamba_binding.gate_up = quantizedWeightFromHandle(weight_handles[10]).*,
                 .dense => mamba_binding.gate_up_bf16 = optionalArrayWeightFromHandle(weight_handles[10]),
                 else => return error.InvalidTensorType,
             }
         }
         if (optionalArrayWeightFromHandle(weight_handles[11]) != null) {
-            switch (state.mamba_storage_kind) {
+            switch (state.runtime_meta.mamba_storage_kind) {
                 .quantized => mamba_binding.down_proj = quantizedWeightFromHandle(weight_handles[11]).*,
                 .dense => mamba_binding.down_proj_bf16 = optionalArrayWeightFromHandle(weight_handles[11]),
                 else => return error.InvalidTensorType,
@@ -1186,7 +1192,7 @@ pub const TransformerBlock = struct {
         }
         const residual_slot = arraySlotFromHandle(io.inputs[0]);
         const branch = arraySlotFromHandle(io.inputs[1]).*;
-        const scale = residualScale(scale_kind, state.residual_multiplier);
+        const scale = residualScale(scale_kind, state.runtime_meta.residual_multiplier);
         const scaled_branch = if (scale == 1.0)
             branch
         else
@@ -1445,28 +1451,30 @@ pub const TransformerBlock = struct {
             .instruction_views = lw.instruction_view_scratch,
             .norm_index = &norm_index,
             .layer_weights = lw,
-            .model_config = config,
-            .residual_multiplier = weight_handles.residual_multiplier,
-            .use_gelu = weight_handles.use_gelu,
-            .attention_multiplier = weight_handles.attention_multiplier,
-            .attention_storage_kind = lw.attentionStorageKind(),
-            .shortconv_storage_kind = lw.shortconvStorageKind(),
-            .ffn_storage_kind = lw.ffnStorageKind(),
-            .mla_storage_kind = lw.mlaStorageKind(),
-            .mamba_storage_kind = lw.mambaStorageKind(),
-            .mla_config = lw.mla_config,
-            .shortconv_d_conv = lw.shortconv_d_conv,
-            .shortconv_conv_dim = lw.shortconv_conv_dim,
-            .moe_router_group_size = if (lw.moe) |moe| moe.router_group_size else 0,
-            .moe_expert_group_size = if (lw.moe) |moe| moe.expert_group_size else 0,
-            .moe_num_experts = if (lw.moe) |moe| moe.num_experts else 0,
-            .moe_experts_per_token = if (lw.moe) |moe| moe.experts_per_token else 0,
-            .mamba_d_state = lw.mamba_d_state,
-            .mamba_d_conv = lw.mamba_d_conv,
-            .mamba_n_heads = lw.mamba_n_heads,
-            .mamba_d_head = lw.mamba_d_head,
-            .mamba_n_groups = lw.mamba_n_groups,
-            .mamba_gate_up_layout = @intFromEnum(lw.mamba_gate_up_layout),
+            .runtime_meta = .{
+                .model_config = config,
+                .residual_multiplier = weight_handles.residual_multiplier,
+                .use_gelu = weight_handles.use_gelu,
+                .attention_multiplier = weight_handles.attention_multiplier,
+                .attention_storage_kind = lw.attentionStorageKind(),
+                .shortconv_storage_kind = lw.shortconvStorageKind(),
+                .ffn_storage_kind = lw.ffnStorageKind(),
+                .mla_storage_kind = lw.mlaStorageKind(),
+                .mamba_storage_kind = lw.mambaStorageKind(),
+                .mla_config = lw.mla_config,
+                .shortconv_d_conv = lw.shortconv_d_conv,
+                .shortconv_conv_dim = lw.shortconv_conv_dim,
+                .moe_router_group_size = if (lw.moe) |moe| moe.router_group_size else 0,
+                .moe_expert_group_size = if (lw.moe) |moe| moe.expert_group_size else 0,
+                .moe_num_experts = if (lw.moe) |moe| moe.num_experts else 0,
+                .moe_experts_per_token = if (lw.moe) |moe| moe.experts_per_token else 0,
+                .mamba_d_state = lw.mamba_d_state,
+                .mamba_d_conv = lw.mamba_d_conv,
+                .mamba_n_heads = lw.mamba_n_heads,
+                .mamba_d_head = lw.mamba_d_head,
+                .mamba_n_groups = lw.mamba_n_groups,
+                .mamba_gate_up_layout = @intFromEnum(lw.mamba_gate_up_layout),
+            },
             .resolved_weight_ptrs = lw.weight_ptr_scratch,
         };
         if (exec_ctx.resolved_weight_ptrs.len != exec_ctx.weight_binding_keys.len) {
