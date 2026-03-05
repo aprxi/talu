@@ -53,7 +53,16 @@ const SwiGLUKernelBinding = *const ffn_kernel.SwiGLU;
 const MoeKernelBinding = *const moe_kernel.MoEFFN;
 const MambaKernelBinding = *const mamba_kernel.MambaKernel;
 const ShortConvKernelBinding = *const shortconv_kernel.ShortConvKernel;
-const missing_weight_tensor: Tensor = std.mem.zeroes(Tensor);
+fn zeroTensor() Tensor {
+    return .{
+        .dtype = .f32,
+        .n_dims = 0,
+        .shape = [_]i64{0} ** tensor.MAX_NDIM,
+        .data_ptr = null,
+        .data_size = 0,
+    };
+}
+const missing_weight_tensor: Tensor = zeroTensor();
 var missing_optional_bias_value: f32 = 0.0;
 var missing_optional_scale_value: u8 = 0;
 
@@ -93,6 +102,34 @@ const AttentionRuntimeMetadata = struct {
     flash_attention_fn: @TypeOf(@as(attn_kernel.MultiHeadAttention, undefined).flash_attention_fn),
 };
 
+const NormRuntimeKind = enum {
+    rms,
+    layer,
+};
+
+const NormRuntimeMetadata = struct {
+    kind: NormRuntimeKind,
+    dim: usize,
+    eps: f32,
+    weight_offset: f32,
+    layer_idx: u16,
+    trace_point: @TypeOf(@as(norm_kernel.RMSNorm, undefined).trace_point),
+    has_bias: bool,
+};
+
+const MlaRuntimeMetadata = struct {
+    d_model: usize,
+    n_heads: usize,
+    max_seq_len: usize,
+    config: @TypeOf(@as(mla_kernel.MLAttention, undefined).config),
+    allocator: std.mem.Allocator,
+    rope: @TypeOf(@as(mla_kernel.MLAttention, undefined).rope),
+    norm_eps: f32,
+    scale: f32,
+    matmul_fn: @TypeOf(@as(mla_kernel.MLAttention, undefined).matmul_fn),
+    layer_idx: u16,
+};
+
 const SwiGluRuntimeMetadata = struct {
     d_model: usize,
     d_ff: usize,
@@ -107,6 +144,48 @@ const SwiGluRuntimeMetadata = struct {
     kernel_name_gate: @TypeOf(@as(ffn_kernel.SwiGLU, undefined).kernel_name_gate),
     kernel_name_gate_up: @TypeOf(@as(ffn_kernel.SwiGLU, undefined).kernel_name_gate_up),
     kernel_name_down: @TypeOf(@as(ffn_kernel.SwiGLU, undefined).kernel_name_down),
+};
+
+const MoeRuntimeMetadata = struct {
+    allocator: std.mem.Allocator,
+    d_model: usize,
+    d_ff: usize,
+    num_experts: usize,
+    experts_per_token: usize,
+    use_mxfp4: bool,
+    use_swiglu_variant: bool,
+    use_transposed_weights: bool,
+    layer_idx: u16,
+    kernel_name: ?[]const u8,
+    has_gate_proj: bool,
+    has_up_proj: bool,
+    has_gate_up_proj: bool,
+    gate_scales_len: usize,
+    up_scales_len: usize,
+    gate_up_scales_len: usize,
+    down_scales_len: usize,
+    gate_bias_len: usize,
+    up_bias_len: usize,
+    gate_up_bias_len: usize,
+    down_bias_len: usize,
+};
+
+const MambaRuntimeMetadata = struct {
+    config: @TypeOf(@as(mamba_kernel.MambaKernel, undefined).config),
+    matmul_in_proj: @TypeOf(@as(mamba_kernel.MambaKernel, undefined).matmul_in_proj),
+    matmul_out_proj: @TypeOf(@as(mamba_kernel.MambaKernel, undefined).matmul_out_proj),
+    ssm_scan: @TypeOf(@as(mamba_kernel.MambaKernel, undefined).ssm_scan),
+    layer_idx: u16,
+};
+
+const ShortConvRuntimeMetadata = struct {
+    config: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).config),
+    matmul_in_proj: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).matmul_in_proj),
+    matmul_out_proj: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).matmul_out_proj),
+    matmul_in_proj_name: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).matmul_in_proj_name),
+    matmul_out_proj_name: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).matmul_out_proj_name),
+    layer_idx: u16,
+    conv_weight_transposed: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).conv_weight_transposed),
 };
 
 const TmpRegisterLayout = struct {
@@ -263,8 +342,13 @@ pub const Block = struct {
     instruction_mamba_bindings: []?MambaKernelBinding = &.{},
     instruction_shortconv_bindings: []?ShortConvKernelBinding = &.{},
     /// Execute-path non-weight metadata derived at load time.
+    instruction_norm_runtime_metadata: []?NormRuntimeMetadata = &.{},
     instruction_attention_runtime_metadata: []?AttentionRuntimeMetadata = &.{},
+    instruction_mla_runtime_metadata: []?MlaRuntimeMetadata = &.{},
     instruction_swiglu_runtime_metadata: []?SwiGluRuntimeMetadata = &.{},
+    instruction_moe_runtime_metadata: []?MoeRuntimeMetadata = &.{},
+    instruction_mamba_runtime_metadata: []?MambaRuntimeMetadata = &.{},
+    instruction_shortconv_runtime_metadata: []?ShortConvRuntimeMetadata = &.{},
     /// Per-instruction prefix offsets into `instruction_weight_ptrs`.
     instruction_weight_offsets: []u32 = &.{},
     /// Flattened per-instruction weight handles resolved at load time.
@@ -352,8 +436,13 @@ pub const Block = struct {
             .instruction_moe_bindings = typed_kernel_refs.moe,
             .instruction_mamba_bindings = typed_kernel_refs.mamba,
             .instruction_shortconv_bindings = typed_kernel_refs.shortconv,
+            .instruction_norm_runtime_metadata = runtime_metadata.norm,
             .instruction_attention_runtime_metadata = runtime_metadata.attention,
+            .instruction_mla_runtime_metadata = runtime_metadata.mla,
             .instruction_swiglu_runtime_metadata = runtime_metadata.swiglu,
+            .instruction_moe_runtime_metadata = runtime_metadata.moe,
+            .instruction_mamba_runtime_metadata = runtime_metadata.mamba,
+            .instruction_shortconv_runtime_metadata = runtime_metadata.shortconv,
             .instruction_weight_offsets = weight_table.offsets,
             .instruction_weight_ptrs = weight_table.ptrs,
             .tmp_register_to_scratch_idx = tmp_layout.map,
@@ -378,8 +467,13 @@ pub const Block = struct {
         if (self.instruction_moe_bindings.len > 0) allocator.free(self.instruction_moe_bindings);
         if (self.instruction_mamba_bindings.len > 0) allocator.free(self.instruction_mamba_bindings);
         if (self.instruction_shortconv_bindings.len > 0) allocator.free(self.instruction_shortconv_bindings);
+        if (self.instruction_norm_runtime_metadata.len > 0) allocator.free(self.instruction_norm_runtime_metadata);
         if (self.instruction_attention_runtime_metadata.len > 0) allocator.free(self.instruction_attention_runtime_metadata);
+        if (self.instruction_mla_runtime_metadata.len > 0) allocator.free(self.instruction_mla_runtime_metadata);
         if (self.instruction_swiglu_runtime_metadata.len > 0) allocator.free(self.instruction_swiglu_runtime_metadata);
+        if (self.instruction_moe_runtime_metadata.len > 0) allocator.free(self.instruction_moe_runtime_metadata);
+        if (self.instruction_mamba_runtime_metadata.len > 0) allocator.free(self.instruction_mamba_runtime_metadata);
+        if (self.instruction_shortconv_runtime_metadata.len > 0) allocator.free(self.instruction_shortconv_runtime_metadata);
         allocator.free(self.instruction_weight_refs);
         plan_compiler.deinitCompiledPlan(allocator, &self.compiled_plan);
         self.* = undefined;
@@ -465,12 +559,22 @@ pub const Block = struct {
     };
 
     const RuntimeMetadata = struct {
+        norm: []?NormRuntimeMetadata,
         attention: []?AttentionRuntimeMetadata,
+        mla: []?MlaRuntimeMetadata,
         swiglu: []?SwiGluRuntimeMetadata,
+        moe: []?MoeRuntimeMetadata,
+        mamba: []?MambaRuntimeMetadata,
+        shortconv: []?ShortConvRuntimeMetadata,
 
         fn deinit(self: RuntimeMetadata, allocator: std.mem.Allocator) void {
+            allocator.free(self.norm);
             allocator.free(self.attention);
+            allocator.free(self.mla);
             allocator.free(self.swiglu);
+            allocator.free(self.moe);
+            allocator.free(self.mamba);
+            allocator.free(self.shortconv);
         }
     };
 
@@ -479,14 +583,51 @@ pub const Block = struct {
         typed_kernel_refs: TypedInstructionKernelRefs,
     ) !RuntimeMetadata {
         const len = typed_kernel_refs.norm.len;
+        const norm = try allocator.alloc(?NormRuntimeMetadata, len);
+        errdefer allocator.free(norm);
         const attention = try allocator.alloc(?AttentionRuntimeMetadata, len);
         errdefer allocator.free(attention);
+        const mla = try allocator.alloc(?MlaRuntimeMetadata, len);
+        errdefer allocator.free(mla);
         const swiglu = try allocator.alloc(?SwiGluRuntimeMetadata, len);
         errdefer allocator.free(swiglu);
+        const moe = try allocator.alloc(?MoeRuntimeMetadata, len);
+        errdefer allocator.free(moe);
+        const mamba = try allocator.alloc(?MambaRuntimeMetadata, len);
+        errdefer allocator.free(mamba);
+        const shortconv = try allocator.alloc(?ShortConvRuntimeMetadata, len);
+        errdefer allocator.free(shortconv);
+        @memset(norm, null);
         @memset(attention, null);
+        @memset(mla, null);
         @memset(swiglu, null);
+        @memset(moe, null);
+        @memset(mamba, null);
+        @memset(shortconv, null);
 
         for (0..len) |idx| {
+            if (typed_kernel_refs.norm[idx]) |binding| {
+                norm[idx] = switch (binding.*) {
+                    .rms => |rms| .{
+                        .kind = .rms,
+                        .dim = rms.dim,
+                        .eps = rms.eps,
+                        .weight_offset = rms.weight_offset,
+                        .layer_idx = rms.layer_idx,
+                        .trace_point = rms.trace_point,
+                        .has_bias = false,
+                    },
+                    .layer => |layer| .{
+                        .kind = .layer,
+                        .dim = layer.dim,
+                        .eps = layer.eps,
+                        .weight_offset = 0.0,
+                        .layer_idx = layer.layer_idx,
+                        .trace_point = layer.trace_point,
+                        .has_bias = layer.bias != null,
+                    },
+                };
+            }
             if (typed_kernel_refs.attention[idx]) |binding| {
                 attention[idx] = .{
                     .d_model = binding.d_model,
@@ -517,6 +658,20 @@ pub const Block = struct {
                     .flash_attention_fn = binding.flash_attention_fn,
                 };
             }
+            if (typed_kernel_refs.mla_attention[idx]) |binding| {
+                mla[idx] = .{
+                    .d_model = binding.d_model,
+                    .n_heads = binding.n_heads,
+                    .max_seq_len = binding.max_seq_len,
+                    .config = binding.config,
+                    .allocator = binding.allocator,
+                    .rope = binding.rope,
+                    .norm_eps = binding.norm_eps,
+                    .scale = binding.scale,
+                    .matmul_fn = binding.matmul_fn,
+                    .layer_idx = binding.layer_idx,
+                };
+            }
             if (typed_kernel_refs.swiglu[idx]) |binding| {
                 swiglu[idx] = .{
                     .d_model = binding.d_model,
@@ -534,11 +689,87 @@ pub const Block = struct {
                     .kernel_name_down = binding.kernel_name_down,
                 };
             }
+            if (typed_kernel_refs.moe[idx]) |binding| {
+                if (binding.experts.len != 1) return error.UnsupportedModel;
+                const expert = binding.experts[0];
+                const gate_scales_len = if (expert.gate_scales) |gate_scales|
+                    gate_scales.len
+                else if (expert.gate_up_scales) |gate_up_scales|
+                    gate_up_scales.len
+                else
+                    0;
+                const up_scales_len = if (expert.up_scales) |up_scales|
+                    up_scales.len
+                else if (expert.gate_up_scales) |gate_up_scales|
+                    gate_up_scales.len
+                else
+                    0;
+                const gate_bias_len = if (expert.gate_bias) |gate_bias|
+                    gate_bias.len
+                else if (expert.gate_up_bias) |gate_up_bias|
+                    gate_up_bias.len
+                else
+                    0;
+                const up_bias_len = if (expert.up_bias) |up_bias|
+                    up_bias.len
+                else if (expert.gate_up_bias) |gate_up_bias|
+                    gate_up_bias.len
+                else
+                    0;
+                moe[idx] = .{
+                    .allocator = binding.allocator,
+                    .d_model = binding.d_model,
+                    .d_ff = binding.d_ff,
+                    .num_experts = binding.num_experts,
+                    .experts_per_token = binding.experts_per_token,
+                    .use_mxfp4 = binding.use_mxfp4,
+                    .use_swiglu_variant = binding.use_swiglu_variant,
+                    .use_transposed_weights = binding.use_transposed_weights,
+                    .layer_idx = binding.layer_idx,
+                    .kernel_name = binding.kernel_name,
+                    .has_gate_proj = expert.gate_proj != null,
+                    .has_up_proj = expert.up_proj != null,
+                    .has_gate_up_proj = expert.gate_up_proj != null,
+                    .gate_scales_len = gate_scales_len,
+                    .up_scales_len = up_scales_len,
+                    .gate_up_scales_len = if (expert.gate_up_scales) |gate_up_scales| gate_up_scales.len else 0,
+                    .down_scales_len = if (expert.down_scales) |down_scales| down_scales.len else 0,
+                    .gate_bias_len = gate_bias_len,
+                    .up_bias_len = up_bias_len,
+                    .gate_up_bias_len = if (expert.gate_up_bias) |gate_up_bias| gate_up_bias.len else 0,
+                    .down_bias_len = if (expert.down_bias) |down_bias| down_bias.len else 0,
+                };
+            }
+            if (typed_kernel_refs.mamba[idx]) |binding| {
+                mamba[idx] = .{
+                    .config = binding.config,
+                    .matmul_in_proj = binding.matmul_in_proj,
+                    .matmul_out_proj = binding.matmul_out_proj,
+                    .ssm_scan = binding.ssm_scan,
+                    .layer_idx = binding.layer_idx,
+                };
+            }
+            if (typed_kernel_refs.shortconv[idx]) |binding| {
+                shortconv[idx] = .{
+                    .config = binding.config,
+                    .matmul_in_proj = binding.matmul_in_proj,
+                    .matmul_out_proj = binding.matmul_out_proj,
+                    .matmul_in_proj_name = binding.matmul_in_proj_name,
+                    .matmul_out_proj_name = binding.matmul_out_proj_name,
+                    .layer_idx = binding.layer_idx,
+                    .conv_weight_transposed = binding.conv_weight_transposed,
+                };
+            }
         }
 
         return .{
+            .norm = norm,
             .attention = attention,
+            .mla = mla,
             .swiglu = swiglu,
+            .moe = moe,
+            .mamba = mamba,
+            .shortconv = shortconv,
         };
     }
 
@@ -647,7 +878,10 @@ pub const Block = struct {
                 if (slot_idx != 0) return error.InvalidWeightRefCount;
                 const weight = switch (norm_binding.*) {
                     .rms => |rms| rms.weight,
-                    .layer => |layer| layer.weight,
+                    .layer => |layer| blk: {
+                        if (layer.bias != null) return error.UnsupportedModel;
+                        break :blk layer.weight;
+                    },
                 };
                 return @ptrCast(@constCast(weight));
             },
@@ -1161,13 +1395,13 @@ pub const Block = struct {
 
     fn hasTypedKernelBinding(self: *const Block, opcode: runtime_contract.Opcode, op_index: usize) bool {
         return switch (opcode) {
-            .rmsnorm => op_index < self.instruction_norm_refs.len and self.instruction_norm_refs[op_index] != null,
+            .rmsnorm => op_index < self.instruction_norm_runtime_metadata.len and self.instruction_norm_runtime_metadata[op_index] != null,
             .multihead_attention => op_index < self.instruction_attention_runtime_metadata.len and self.instruction_attention_runtime_metadata[op_index] != null,
-            .mla_attention => op_index < self.instruction_mla_attention_refs.len and self.instruction_mla_attention_refs[op_index] != null,
+            .mla_attention => op_index < self.instruction_mla_runtime_metadata.len and self.instruction_mla_runtime_metadata[op_index] != null,
             .swiglu => op_index < self.instruction_swiglu_runtime_metadata.len and self.instruction_swiglu_runtime_metadata[op_index] != null,
-            .moe => op_index < self.instruction_moe_bindings.len and self.instruction_moe_bindings[op_index] != null,
-            .mamba_mixer => op_index < self.instruction_mamba_bindings.len and self.instruction_mamba_bindings[op_index] != null,
-            .shortconv => op_index < self.instruction_shortconv_bindings.len and self.instruction_shortconv_bindings[op_index] != null,
+            .moe => op_index < self.instruction_moe_runtime_metadata.len and self.instruction_moe_runtime_metadata[op_index] != null,
+            .mamba_mixer => op_index < self.instruction_mamba_runtime_metadata.len and self.instruction_mamba_runtime_metadata[op_index] != null,
+            .shortconv => op_index < self.instruction_shortconv_runtime_metadata.len and self.instruction_shortconv_runtime_metadata[op_index] != null,
             else => false,
         };
     }
@@ -1298,7 +1532,6 @@ pub const Block = struct {
         .rmsnorm,
         .multihead_attention,
         .swiglu,
-        .moe,
         .mamba_mixer,
         .shortconv,
         .mla_attention,
@@ -1333,7 +1566,6 @@ pub const Block = struct {
         table[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = rmsNormKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = multiheadAttentionKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.swiglu)] = swiGluKernelRuntimeAdapter;
-        table[@intFromEnum(runtime_contract.Opcode.moe)] = moeKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = mambaMixerKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.shortconv)] = shortConvKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = mlaAttentionKernelRuntimeAdapter;
@@ -1381,7 +1613,6 @@ pub const Block = struct {
         caps[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.swiglu)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
-        caps[@intFromEnum(runtime_contract.Opcode.moe)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.shortconv)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.mla_attention)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
@@ -1438,7 +1669,6 @@ pub const Block = struct {
         table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = true;
         table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = true;
         table[@intFromEnum(runtime_contract.Opcode.swiglu)] = true;
-        table[@intFromEnum(runtime_contract.Opcode.moe)] = true;
         table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = true;
         table[@intFromEnum(runtime_contract.Opcode.shortconv)] = true;
         break :blk table;
@@ -1685,39 +1915,30 @@ pub const Block = struct {
 
         if (comptime expected_opcode == .rmsnorm) {
             if (weight_handles.len != 1) return error.InvalidWeightRefCount;
-            if (state.op_index >= state.block.instruction_norm_refs.len) return error.InvalidInstructionIndex;
+            if (state.op_index >= state.block.instruction_norm_runtime_metadata.len) return error.InvalidInstructionIndex;
             const weight = tensorFromWeightHandle(weight_handles[0]);
-            const template = state.block.instruction_norm_refs[state.op_index] orelse return error.MissingKernelBinding;
-            var norm_local = switch (template.*) {
-                .rms => |rms| norm_kernel.NormKernel{
+            const meta = state.block.instruction_norm_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
+            if (meta.has_bias) return error.UnsupportedModel;
+            var norm_local = switch (meta.kind) {
+                .rms => norm_kernel.NormKernel{
                     .rms = .{
                         .weight = weight,
-                        .dim = rms.dim,
-                        .eps = rms.eps,
-                        .weight_offset = rms.weight_offset,
-                        .layer_idx = rms.layer_idx,
-                        .trace_point = rms.trace_point,
+                        .dim = meta.dim,
+                        .eps = meta.eps,
+                        .weight_offset = meta.weight_offset,
+                        .layer_idx = meta.layer_idx,
+                        .trace_point = meta.trace_point,
                     },
                 },
-                .layer => |layer| blk: {
-                    // Keep batched/scheduler paths strict: LayerNorm bias is not
-                    // part of the `.rmsnorm` instruction slot contract there.
-                    // Vision encode uses non-batched `forward` and still requires
-                    // LayerNorm bias tensors.
-                    const layer_bias = if (state.use_batched_dispatch) bias: {
-                        if (layer.bias != null) return error.UnsupportedModel;
-                        break :bias null;
-                    } else layer.bias;
-                    break :blk norm_kernel.NormKernel{
-                        .layer = .{
-                            .weight = weight,
-                            .bias = layer_bias,
-                            .dim = layer.dim,
-                            .eps = layer.eps,
-                            .layer_idx = layer.layer_idx,
-                            .trace_point = layer.trace_point,
-                        },
-                    };
+                .layer => norm_kernel.NormKernel{
+                    .layer = .{
+                        .weight = weight,
+                        .bias = null,
+                        .dim = meta.dim,
+                        .eps = meta.eps,
+                        .layer_idx = meta.layer_idx,
+                        .trace_point = meta.trace_point,
+                    },
                 },
             };
             try dispatchNormWithMode(input, output, &norm_local);
@@ -1793,14 +2014,14 @@ pub const Block = struct {
             return;
         } else if (comptime expected_opcode == .mla_attention) {
             if (weight_handles.len != 7) return error.InvalidWeightRefCount;
-            if (state.op_index >= state.block.instruction_mla_attention_refs.len) return error.InvalidInstructionIndex;
-            const template = state.block.instruction_mla_attention_refs[state.op_index] orelse return error.MissingKernelBinding;
+            if (state.op_index >= state.block.instruction_mla_runtime_metadata.len) return error.InvalidInstructionIndex;
+            const meta = state.block.instruction_mla_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
             var mla_local = mla_kernel.MLAttention{
-                .d_model = template.d_model,
-                .n_heads = template.n_heads,
-                .max_seq_len = template.max_seq_len,
-                .config = template.config,
-                .allocator = template.allocator,
+                .d_model = meta.d_model,
+                .n_heads = meta.n_heads,
+                .max_seq_len = meta.max_seq_len,
+                .config = meta.config,
+                .allocator = meta.allocator,
                 .q_a_proj = tensorFromWeightHandle(weight_handles[0]),
                 .q_a_norm = tensorFromWeightHandle(weight_handles[1]),
                 .q_b_proj = tensorFromWeightHandle(weight_handles[2]),
@@ -1808,11 +2029,11 @@ pub const Block = struct {
                 .kv_a_norm = tensorFromWeightHandle(weight_handles[4]),
                 .kv_b_proj = tensorFromWeightHandle(weight_handles[5]),
                 .o_proj = tensorFromWeightHandle(weight_handles[6]),
-                .rope = template.rope,
-                .norm_eps = template.norm_eps,
-                .scale = template.scale,
-                .matmul_fn = template.matmul_fn,
-                .layer_idx = template.layer_idx,
+                .rope = meta.rope,
+                .norm_eps = meta.norm_eps,
+                .scale = meta.scale,
+                .matmul_fn = meta.matmul_fn,
+                .layer_idx = meta.layer_idx,
             };
             try dispatchMlaAttentionWithMode(state, insn, state_blocks, input, output, &mla_local);
             return;
@@ -1858,54 +2079,49 @@ pub const Block = struct {
             return;
         } else if (comptime expected_opcode == .moe) {
             if (weight_handles.len != 13) return error.InvalidWeightRefCount;
-            if (state.op_index >= state.block.instruction_moe_bindings.len) return error.InvalidInstructionIndex;
-            const template = state.block.instruction_moe_bindings[state.op_index] orelse return error.MissingKernelBinding;
-            if (template.experts.len != 1) return error.UnsupportedModel;
+            if (state.op_index >= state.block.instruction_moe_runtime_metadata.len) return error.InvalidInstructionIndex;
+            const meta = state.block.instruction_moe_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
+            if (meta.num_experts != 1) return error.UnsupportedModel;
+            var expert = moe_kernel.ExpertWeights{
+                .gate_proj = null,
+                .up_proj = null,
+                .gate_up_proj = null,
+                .down_proj = tensorFromWeightHandle(weight_handles[3]).*,
+                .gate_scales = if (meta.gate_scales_len != 0) optionalScaleSliceFromWeightHandle(weight_handles[5], meta.gate_scales_len) else null,
+                .up_scales = if (meta.up_scales_len != 0) optionalScaleSliceFromWeightHandle(weight_handles[6], meta.up_scales_len) else null,
+                .gate_up_scales = null,
+                .down_scales = if (meta.down_scales_len != 0) optionalScaleSliceFromWeightHandle(weight_handles[7], meta.down_scales_len) else null,
+                .gate_bias = if (meta.gate_bias_len != 0) optionalBiasSliceFromWeightHandle(weight_handles[8], meta.gate_bias_len) else null,
+                .up_bias = if (meta.up_bias_len != 0) optionalBiasSliceFromWeightHandle(weight_handles[9], meta.up_bias_len) else null,
+                .gate_up_bias = null,
+                .down_bias = if (meta.down_bias_len != 0) optionalBiasSliceFromWeightHandle(weight_handles[10], meta.down_bias_len) else null,
+            };
+            const gate_or_fused = tensorFromWeightHandle(weight_handles[1]).*;
+            const up_or_fused = tensorFromWeightHandle(weight_handles[2]).*;
+            if (meta.has_gate_up_proj) {
+                expert.gate_up_proj = gate_or_fused;
+                expert.gate_up_scales = if (meta.gate_up_scales_len != 0) optionalScaleSliceFromWeightHandle(weight_handles[5], meta.gate_up_scales_len) else null;
+                expert.gate_up_bias = if (meta.gate_up_bias_len != 0) optionalBiasSliceFromWeightHandle(weight_handles[8], meta.gate_up_bias_len) else null;
+            } else {
+                if (meta.has_gate_proj) expert.gate_proj = gate_or_fused;
+                if (meta.has_up_proj) expert.up_proj = up_or_fused;
+            }
+            var experts = [_]moe_kernel.ExpertWeights{expert};
             var moe_local = moe_kernel.MoEFFN{
-                .allocator = template.allocator,
-                .d_model = template.d_model,
-                .d_ff = template.d_ff,
-                .num_experts = template.num_experts,
-                .experts_per_token = template.experts_per_token,
+                .allocator = meta.allocator,
+                .d_model = meta.d_model,
+                .d_ff = meta.d_ff,
+                .num_experts = meta.num_experts,
+                .experts_per_token = meta.experts_per_token,
                 .router_weight = tensorFromWeightHandle(weight_handles[0]).*,
                 .router_bias = null,
-                .experts = template.experts,
-                .use_mxfp4 = template.use_mxfp4,
-                .use_swiglu_variant = template.use_swiglu_variant,
-                .use_transposed_weights = template.use_transposed_weights,
-                .layer_idx = template.layer_idx,
-                .kernel_name = template.kernel_name,
+                .experts = experts[0..],
+                .use_mxfp4 = meta.use_mxfp4,
+                .use_swiglu_variant = meta.use_swiglu_variant,
+                .use_transposed_weights = meta.use_transposed_weights,
+                .layer_idx = meta.layer_idx,
+                .kernel_name = meta.kernel_name,
             };
-            const gate_weight = tensorFromWeightHandle(weight_handles[1]).*;
-            const up_weight = tensorFromWeightHandle(weight_handles[2]).*;
-            const down_weight = tensorFromWeightHandle(weight_handles[3]).*;
-            if (moe_local.experts[0].gate_proj != null) {
-                moe_local.experts[0].gate_proj = gate_weight;
-            }
-            if (moe_local.experts[0].up_proj != null) {
-                moe_local.experts[0].up_proj = up_weight;
-            } else if (moe_local.experts[0].gate_up_proj != null) {
-                moe_local.experts[0].gate_up_proj = gate_weight;
-            }
-            moe_local.experts[0].down_proj = down_weight;
-            if (moe_local.experts[0].gate_scales) |gate_scales| {
-                moe_local.experts[0].gate_scales = optionalScaleSliceFromWeightHandle(weight_handles[5], gate_scales.len);
-            }
-            if (moe_local.experts[0].up_scales) |up_scales| {
-                moe_local.experts[0].up_scales = optionalScaleSliceFromWeightHandle(weight_handles[6], up_scales.len);
-            }
-            if (moe_local.experts[0].down_scales) |down_scales| {
-                moe_local.experts[0].down_scales = optionalScaleSliceFromWeightHandle(weight_handles[7], down_scales.len);
-            }
-            if (moe_local.experts[0].gate_bias) |gate_bias| {
-                moe_local.experts[0].gate_bias = optionalBiasSliceFromWeightHandle(weight_handles[8], gate_bias.len);
-            }
-            if (moe_local.experts[0].up_bias) |up_bias| {
-                moe_local.experts[0].up_bias = optionalBiasSliceFromWeightHandle(weight_handles[9], up_bias.len);
-            }
-            if (moe_local.experts[0].down_bias) |down_bias| {
-                moe_local.experts[0].down_bias = optionalBiasSliceFromWeightHandle(weight_handles[10], down_bias.len);
-            }
             moe_local.router_bias = optionalBiasSliceFromWeightHandle(weight_handles[4], moe_local.num_experts);
             // Router quant auxiliaries are part of the flattened slot contract.
             // CPU dense router path does not consume them in this opcode.
@@ -1915,10 +2131,10 @@ pub const Block = struct {
             return;
         } else if (comptime expected_opcode == .mamba_mixer) {
             if (weight_handles.len != 12) return error.InvalidWeightRefCount;
-            if (state.op_index >= state.block.instruction_mamba_bindings.len) return error.InvalidInstructionIndex;
-            const template = state.block.instruction_mamba_bindings[state.op_index] orelse return error.MissingKernelBinding;
+            if (state.op_index >= state.block.instruction_mamba_runtime_metadata.len) return error.InvalidInstructionIndex;
+            const meta = state.block.instruction_mamba_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
             var mamba_local = mamba_kernel.MambaKernel{
-                .config = template.config,
+                .config = meta.config,
                 .weights = .{
                     .in_proj = tensorFromWeightHandle(weight_handles[0]),
                     .conv1d_weight = tensorFromWeightHandle(weight_handles[1]),
@@ -1929,10 +2145,10 @@ pub const Block = struct {
                     .norm_weight = optionalTensorFromWeightHandle(weight_handles[7]),
                     .out_proj = tensorFromWeightHandle(weight_handles[4]),
                 },
-                .matmul_in_proj = template.matmul_in_proj,
-                .matmul_out_proj = template.matmul_out_proj,
-                .ssm_scan = template.ssm_scan,
-                .layer_idx = template.layer_idx,
+                .matmul_in_proj = meta.matmul_in_proj,
+                .matmul_out_proj = meta.matmul_out_proj,
+                .ssm_scan = meta.ssm_scan,
+                .layer_idx = meta.layer_idx,
             };
             // Phase-5 slot contract carries these optional/fused follow-on weights.
             // CPU mamba mixer kernel does not consume them directly in this opcode.
@@ -1944,22 +2160,22 @@ pub const Block = struct {
             return;
         } else if (comptime expected_opcode == .shortconv) {
             if (weight_handles.len != 4) return error.InvalidWeightRefCount;
-            if (state.op_index >= state.block.instruction_shortconv_bindings.len) return error.InvalidInstructionIndex;
-            const template = state.block.instruction_shortconv_bindings[state.op_index] orelse return error.MissingKernelBinding;
+            if (state.op_index >= state.block.instruction_shortconv_runtime_metadata.len) return error.InvalidInstructionIndex;
+            const meta = state.block.instruction_shortconv_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
             var shortconv_local = shortconv_kernel.ShortConvKernel{
-                .config = template.config,
+                .config = meta.config,
                 .weights = .{
                     .in_proj = tensorFromWeightHandle(weight_handles[0]),
                     .conv1d_weight = tensorFromWeightHandle(weight_handles[1]),
                     .conv1d_bias = optionalTensorFromWeightHandle(weight_handles[3]),
                     .out_proj = tensorFromWeightHandle(weight_handles[2]),
                 },
-                .matmul_in_proj = template.matmul_in_proj,
-                .matmul_out_proj = template.matmul_out_proj,
-                .matmul_in_proj_name = template.matmul_in_proj_name,
-                .matmul_out_proj_name = template.matmul_out_proj_name,
-                .layer_idx = template.layer_idx,
-                .conv_weight_transposed = null,
+                .matmul_in_proj = meta.matmul_in_proj,
+                .matmul_out_proj = meta.matmul_out_proj,
+                .matmul_in_proj_name = meta.matmul_in_proj_name,
+                .matmul_out_proj_name = meta.matmul_out_proj_name,
+                .layer_idx = meta.layer_idx,
+                .conv_weight_transposed = meta.conv_weight_transposed,
                 .weight_allocator = null,
             };
             try dispatchShortConvWithMode(state, insn, state_blocks, input, output, &shortconv_local);
@@ -3981,7 +4197,7 @@ test "Block caches kernel instruction bindings at init" {
 }
 
 test "resolveKernelWeightPtrForSlot emits missing sentinels for fused attention split slots" {
-    const fused_qkv = std.mem.zeroes(Tensor);
+    const fused_qkv = zeroTensor();
     var attention_binding: attn_kernel.MultiHeadAttention = undefined;
     attention_binding.q_proj = null;
     attention_binding.k_proj = null;
@@ -4025,9 +4241,44 @@ test "resolveKernelWeightPtrForSlot emits missing sentinels for fused attention 
     );
 }
 
+test "resolveKernelWeightPtrForSlot rejects layernorm bias backdoor for rmsnorm opcode" {
+    const norm_weight = zeroTensor();
+    const norm_bias = zeroTensor();
+    var layer_norm = norm_kernel.NormKernel{
+        .layer = .{
+            .weight = &norm_weight,
+            .bias = &norm_bias,
+            .dim = 16,
+            .eps = 1e-5,
+        },
+    };
+
+    var norm = [_]?NormKernelBinding{&layer_norm};
+    var attention = [_]?AttentionKernelBinding{null};
+    var mla = [_]?MlaAttentionKernelBinding{null};
+    var swiglu = [_]?SwiGLUKernelBinding{null};
+    var moe = [_]?MoeKernelBinding{null};
+    var mamba = [_]?MambaKernelBinding{null};
+    var shortconv = [_]?ShortConvKernelBinding{null};
+    const typed = Block.TypedInstructionKernelRefs{
+        .norm = norm[0..],
+        .attention = attention[0..],
+        .mla_attention = mla[0..],
+        .swiglu = swiglu[0..],
+        .moe = moe[0..],
+        .mamba = mamba[0..],
+        .shortconv = shortconv[0..],
+    };
+
+    try testing.expectError(
+        error.UnsupportedModel,
+        Block.resolveKernelWeightPtrForSlot(0, 0, .rmsnorm, typed, 0),
+    );
+}
+
 test "resolveKernelWeightPtrForSlot emits missing sentinel for dense swiglu up slot" {
-    const gate = std.mem.zeroes(Tensor);
-    const down = std.mem.zeroes(Tensor);
+    const gate = zeroTensor();
+    const down = zeroTensor();
     var swiglu_binding: ffn_kernel.SwiGLU = undefined;
     swiglu_binding.w1 = &gate;
     swiglu_binding.w2 = &down;
@@ -4067,13 +4318,13 @@ test "resolveKernelWeightPtrForSlot emits missing sentinel for dense swiglu up s
 }
 
 test "resolveKernelWeightPtrForSlot rejects multi-expert moe bindings" {
-    const router = std.mem.zeroes(Tensor);
-    const gate0 = std.mem.zeroes(Tensor);
-    const up0 = std.mem.zeroes(Tensor);
-    const down0 = std.mem.zeroes(Tensor);
-    const gate1 = std.mem.zeroes(Tensor);
-    const up1 = std.mem.zeroes(Tensor);
-    const down1 = std.mem.zeroes(Tensor);
+    const router = zeroTensor();
+    const gate0 = zeroTensor();
+    const up0 = zeroTensor();
+    const down0 = zeroTensor();
+    const gate1 = zeroTensor();
+    const up1 = zeroTensor();
+    const down1 = zeroTensor();
     var experts = [_]moe_kernel.ExpertWeights{
         .{ .gate_proj = gate0, .up_proj = up0, .down_proj = down0 },
         .{ .gate_proj = gate1, .up_proj = up1, .down_proj = down1 },
@@ -4130,8 +4381,31 @@ test "Block.validate rejects missing cached kernel binding" {
 
     const refs_mut = @constCast(block.instruction_norm_refs.ptr);
     refs_mut[0] = null;
+    const metadata_mut = @constCast(block.instruction_norm_runtime_metadata.ptr);
+    metadata_mut[0] = null;
 
     try testing.expectError(error.KernelIndexOutOfBounds, block.validate());
+}
+
+test "cpu adapter table rejects moe opcode at load-time validation" {
+    const plan = runtime_contract.ExecutionPlan{
+        .instructions = &.{
+            .{
+                .opcode = .moe,
+                .inputs = &.{},
+                .outputs = &.{},
+                .weights = &.{},
+                .param_block_id = null,
+                .state_block_id = null,
+            },
+        },
+        .register_count = 0,
+        .state_descs = &.{},
+    };
+    const unsupported = runtime_contract.firstUnsupportedInstructionOpcode(&plan, Block.adapter_table);
+    try testing.expect(unsupported != null);
+    try testing.expectEqual(@as(usize, 0), unsupported.?.instruction_index);
+    try testing.expectEqual(runtime_contract.Opcode.moe, unsupported.?.opcode);
 }
 
 test "Block.validate rejects missing cached primitive weight binding" {

@@ -20,6 +20,7 @@ pub const attention = @import("attention.zig");
 pub const moe = @import("moe.zig");
 pub const ssm = @import("ssm.zig");
 pub const conv1d = @import("conv1d.zig");
+pub const pass = @import("pass.zig");
 
 test {
     _ = linear;
@@ -32,4 +33,5 @@ test {
     _ = moe;
     _ = ssm;
     _ = conv1d;
+    _ = pass;
 }

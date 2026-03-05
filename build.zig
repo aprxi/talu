@@ -1192,6 +1192,40 @@ pub fn build(b: *std.Build) void {
     }
 
     // ==========================================================================
+    // Training benchmark harness (core/bench/train/)
+    // ==========================================================================
+    const bench_train_path = "core/bench/train/root.zig";
+    if (std.fs.cwd().access(bench_train_path, .{})) |_| {
+        const host_target_train = b.resolveTargetQuery(.{});
+        const bench_train_mod = b.createModule(.{
+            .root_source_file = b.path(bench_train_path),
+            .target = host_target_train,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "main", .module = integration_main_mod },
+            },
+        });
+        const bench_train_exe = b.addExecutable(.{
+            .name = "bench-train",
+            .root_module = bench_train_mod,
+        });
+        linkCDependencies(b, bench_train_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        b.installArtifact(bench_train_exe);
+
+        const run_bench_train = b.addRunArtifact(bench_train_exe);
+        if (b.args) |args| {
+            for (args) |arg| {
+                run_bench_train.addArg(arg);
+            }
+        }
+        const bench_train_step = b.step("bench-train", "Run training benchmark harness");
+        bench_train_step.dependOn(&run_bench_train.step);
+    } else |_| {
+        // training benchmark harness not present - skip
+    }
+
+    // ==========================================================================
     // Python Binding Generator (core/tests/helpers/gen_bindings.zig)
     // ==========================================================================
     // Python bindings generator

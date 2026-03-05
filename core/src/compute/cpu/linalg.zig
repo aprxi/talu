@@ -1,6 +1,7 @@
 //! Linear algebra primitive namespace for CPU compute.
 
 pub const matmul = @import("matmul_primitives.zig");
+pub const matmul_accum = @import("matmul_accum.zig");
 pub const multi_row = @import("matmul_prefill.zig");
 pub const matvec = @import("matvec.zig");
 pub const dot = @import("dot_product.zig");
@@ -15,3 +16,4 @@ pub const matmulKernel = matmul.matmulKernel;
 pub const matmulAuto = matmul.matmulAuto;
 pub const matmulF32 = matmul.matmulF32;
 pub const matmulGaffineU4 = matmul.matmulGaffineU4;
+pub const matmulTransposeAccumF32 = matmul_accum.matmulTransposeAccumF32;

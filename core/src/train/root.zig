@@ -37,8 +37,8 @@ pub const capi_bridge = @import("capi_bridge.zig");
 pub const model_config = @import("model_config.zig");
 pub const model_weights = @import("model_weights.zig");
 pub const activations = @import("activations.zig");
-pub const forward = @import("forward.zig");
-pub const backward_pass = @import("backward_pass.zig");
+pub const forward = @import("forward/root.zig");
+pub const backward_pass = @import("backward/pass.zig");
 pub const full_session = @import("full_session.zig");
 
 // =============================================================================

@@ -6,7 +6,7 @@
 //!   grad_bias   += sum(grad_output, dim=0)  -> [out_dim]
 //!
 //! All functions accumulate into gradient buffers (do NOT zero first).
-//! Reuses matmulF32 from compute/cpu for SIMD-optimized matmul.
+//! Uses SIMD-optimized matmul primitives from compute/cpu.
 
 const std = @import("std");
 const tensor_mod = @import("../../tensor.zig");
@@ -15,6 +15,7 @@ const compute = @import("../../compute/root.zig");
 const Tensor = tensor_mod.Tensor;
 const MatmulScratch = compute.cpu.linalg.MatmulScratch;
 const matmulF32 = compute.cpu.linalg.matmulF32;
+const matmulTransposeAccumF32 = compute.cpu.linalg.matmulTransposeAccumF32;
 
 /// Compute gradient w.r.t. weight: dW += grad_out^T @ input.
 ///
@@ -30,32 +31,15 @@ pub fn gradWeight(
     in_dim: usize,
     scratch: *MatmulScratch,
 ) void {
-    _ = scratch;
     std.debug.assert(grad_weight.len == out_dim * in_dim);
     std.debug.assert(grad_output.len == batch_size * out_dim);
     std.debug.assert(input.len == batch_size * in_dim);
 
-    // dW = grad_out^T @ input
-    // grad_out^T: [out_dim, batch], input: [batch, in_dim] -> [out_dim, in_dim]
-    //
-    // matmulF32 expects: a[M,K] @ b[K,N] -> out[M,N]
-    // We need: grad_out^T[out_dim, batch] @ input[batch, in_dim] -> [out_dim, in_dim]
-    //
-    // For accumulation, we compute into a temporary and add.
-    // Direct approach: iterate and accumulate.
-
-    // Simple row-wise accumulation: for each output row o,
-    // dW[o, :] += sum over batch b of grad_output[b, o] * input[b, :]
-    for (0..out_dim) |o| {
-        const dw_row = grad_weight[o * in_dim ..][0..in_dim];
-        for (0..batch_size) |b| {
-            const g = grad_output[b * out_dim + o];
-            const in_row = input[b * in_dim ..][0..in_dim];
-            for (dw_row, in_row) |*dw, inp| {
-                dw.* += g * inp;
-            }
-        }
-    }
+    // C[out_dim, in_dim] += A[batch, out_dim]^T @ B[batch, in_dim]
+    var a = Tensor.view2DSlice(@constCast(grad_output[0 .. batch_size * out_dim]), batch_size, out_dim);
+    var b = Tensor.view2DSlice(@constCast(input[0 .. batch_size * in_dim]), batch_size, in_dim);
+    var c = Tensor.view2DSlice(grad_weight[0 .. out_dim * in_dim], out_dim, in_dim);
+    matmulTransposeAccumF32(&a, &b, &c, scratch);
 }
 
 /// Compute gradient w.r.t. input: dX = grad_out @ W.
