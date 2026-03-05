@@ -67,6 +67,24 @@ pub const TransformerBlock = struct {
         residual_multiplier: f32,
         use_gelu: bool,
         attention_multiplier: f32,
+        attention_storage_kind: LayerWeights.AttentionStorageKind,
+        shortconv_storage_kind: LayerWeights.ShortConvStorageKind,
+        ffn_storage_kind: LayerWeights.FfnStorageKind,
+        mla_storage_kind: LayerWeights.MLAStorageKind,
+        mamba_storage_kind: LayerWeights.MambaStorageKind,
+        mla_config: ?WeightHandles.MLAConfig,
+        shortconv_d_conv: usize,
+        shortconv_conv_dim: usize,
+        moe_router_group_size: usize,
+        moe_expert_group_size: usize,
+        moe_num_experts: usize,
+        moe_experts_per_token: usize,
+        mamba_d_state: usize,
+        mamba_d_conv: usize,
+        mamba_n_heads: usize,
+        mamba_d_head: usize,
+        mamba_n_groups: usize,
+        mamba_gate_up_layout: u8,
         resolved_weight_ptrs: []?*anyopaque,
         state_bindings: [MaxLayerProgramStateBindings]?LayerProgramStateBinding = [_]?LayerProgramStateBinding{null} ** MaxLayerProgramStateBindings,
         state_binding_count: usize = 0,
@@ -438,7 +456,6 @@ pub const TransformerBlock = struct {
         key: LayerProgramWeightBindingKey,
     ) !*anyopaque {
         const lw = ctx.layer_weights;
-        if (lw.ffnStorageKind() == .moe) return error.InvalidWeightBindingName;
         if (key == .swiglu_w1) {
             if (lw.w1) |*weight| return @ptrCast(@constCast(weight));
             if (lw.w1_bf16) |*weight| return @ptrCast(@constCast(weight));
@@ -566,7 +583,9 @@ pub const TransformerBlock = struct {
         if (key == .norm_weight) return resolveLayerProgramNormWeightPtr(ctx);
         if (ref_index >= ctx.resolved_weight_ptrs.len) return error.InvalidWeightRefIndex;
         if (ctx.resolved_weight_ptrs[ref_index]) |cached| return cached;
-        return resolveLayerProgramWeightPtrForKey(ctx, key);
+        const resolved = try resolveLayerProgramWeightPtrForKey(ctx, key);
+        ctx.resolved_weight_ptrs[ref_index] = resolved;
+        return resolved;
     }
 
     fn instructionParams(
@@ -838,10 +857,9 @@ pub const TransformerBlock = struct {
         const input = arraySlotFromHandle(io.inputs[0]).*;
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
-        const lw = state.layer_weights;
         var attention_binding: AttentionRuntimeBinding = blk: {
-            if (lw.isMLA()) {
-                const mla_cfg = lw.mla_config orelse return error.MissingField;
+            if (state.mla_storage_kind != .missing) {
+                const mla_cfg = state.mla_config orelse return error.MissingField;
                 break :blk .{
                     .mla = .{
                         .n_heads = @intCast(state.model_config.n_heads),
@@ -853,18 +871,18 @@ pub const TransformerBlock = struct {
                         .qk_rope_head_dim = mla_cfg.qk_rope_head_dim,
                         .qk_nope_head_dim = mla_cfg.qk_nope_head_dim,
                         .v_head_dim = mla_cfg.v_head_dim,
-                        .q_a_proj = lw.mla_q_a_proj,
-                        .q_b_proj = lw.mla_q_b_proj,
-                        .kv_a_proj = lw.mla_kv_a_proj,
-                        .kv_b_proj = lw.mla_kv_b_proj,
-                        .q_a_proj_bf16 = lw.mla_q_a_proj_bf16,
-                        .q_b_proj_bf16 = lw.mla_q_b_proj_bf16,
-                        .kv_a_proj_bf16 = lw.mla_kv_a_proj_bf16,
-                        .kv_b_proj_bf16 = lw.mla_kv_b_proj_bf16,
-                        .q_a_norm = lw.mla_q_a_norm,
-                        .kv_a_norm = lw.mla_kv_a_norm,
-                        .o_proj = lw.o_proj,
-                        .o_proj_bf16 = lw.o_proj_bf16,
+                        .q_a_proj = null,
+                        .q_b_proj = null,
+                        .kv_a_proj = null,
+                        .kv_b_proj = null,
+                        .q_a_proj_bf16 = null,
+                        .q_b_proj_bf16 = null,
+                        .kv_a_proj_bf16 = null,
+                        .kv_b_proj_bf16 = null,
+                        .q_a_norm = null,
+                        .kv_a_norm = null,
+                        .o_proj = null,
+                        .o_proj_bf16 = null,
                     },
                 };
             }
@@ -877,40 +895,46 @@ pub const TransformerBlock = struct {
                     .norm_eps = state.model_config.norm_eps,
                     .query_pre_attn_scalar = state.model_config.query_pre_attn_scalar,
                     .attention_multiplier = state.attention_multiplier,
-                    .q_proj = lw.q_proj,
-                    .k_proj = lw.k_proj,
-                    .v_proj = lw.v_proj,
-                    .o_proj = lw.o_proj,
-                    .q_proj_bf16 = lw.q_proj_bf16,
-                    .k_proj_bf16 = lw.k_proj_bf16,
-                    .v_proj_bf16 = lw.v_proj_bf16,
-                    .o_proj_bf16 = lw.o_proj_bf16,
-                    .q_norm = lw.q_norm,
-                    .k_norm = lw.k_norm,
-                    .q_bias = lw.q_bias,
-                    .k_bias = lw.k_bias,
-                    .v_bias = lw.v_bias,
-                    .o_bias = lw.o_bias,
-                    .attn_sinks = lw.attn_sinks,
+                    .q_proj = null,
+                    .k_proj = null,
+                    .v_proj = null,
+                    .o_proj = null,
+                    .q_proj_bf16 = null,
+                    .k_proj_bf16 = null,
+                    .v_proj_bf16 = null,
+                    .o_proj_bf16 = null,
+                    .q_norm = null,
+                    .k_norm = null,
+                    .q_bias = null,
+                    .k_bias = null,
+                    .v_bias = null,
+                    .o_bias = null,
+                    .attn_sinks = null,
                 },
             };
         };
         switch (attention_binding) {
             .multihead => |*multihead| {
-                if (multihead.q_proj != null) {
-                    multihead.q_proj = quantizedWeightFromHandle(weight_handles[0]).*;
-                    multihead.k_proj = quantizedWeightFromHandle(weight_handles[1]).*;
-                    multihead.v_proj = quantizedWeightFromHandle(weight_handles[2]).*;
-                    if (multihead.o_proj != null) {
+                switch (state.attention_storage_kind) {
+                    .quantized => {
+                        multihead.q_proj = quantizedWeightFromHandle(weight_handles[0]).*;
+                        multihead.k_proj = quantizedWeightFromHandle(weight_handles[1]).*;
+                        multihead.v_proj = quantizedWeightFromHandle(weight_handles[2]).*;
                         multihead.o_proj = quantizedWeightFromHandle(weight_handles[3]).*;
-                    } else {
+                    },
+                    .mixed_qkv_quantized_o_dense => {
+                        multihead.q_proj = quantizedWeightFromHandle(weight_handles[0]).*;
+                        multihead.k_proj = quantizedWeightFromHandle(weight_handles[1]).*;
+                        multihead.v_proj = quantizedWeightFromHandle(weight_handles[2]).*;
                         multihead.o_proj_bf16 = arrayWeightFromHandle(weight_handles[3]).*;
-                    }
-                } else {
-                    multihead.q_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
-                    multihead.k_proj_bf16 = arrayWeightFromHandle(weight_handles[1]).*;
-                    multihead.v_proj_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
-                    multihead.o_proj_bf16 = arrayWeightFromHandle(weight_handles[3]).*;
+                    },
+                    .dense => {
+                        multihead.q_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
+                        multihead.k_proj_bf16 = arrayWeightFromHandle(weight_handles[1]).*;
+                        multihead.v_proj_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
+                        multihead.o_proj_bf16 = arrayWeightFromHandle(weight_handles[3]).*;
+                    },
+                    else => return error.InvalidTensorType,
                 }
                 multihead.q_norm = optionalArrayWeightFromHandle(weight_handles[4]);
                 multihead.k_norm = optionalArrayWeightFromHandle(weight_handles[5]);
@@ -921,22 +945,22 @@ pub const TransformerBlock = struct {
                 multihead.attn_sinks = optionalArrayWeightFromHandle(weight_handles[10]);
             },
             .mla => |*mla| {
-                if (mla.q_a_proj != null) {
-                    mla.q_a_proj = quantizedWeightFromHandle(weight_handles[0]).*;
-                    mla.q_b_proj = quantizedWeightFromHandle(weight_handles[2]).*;
-                    mla.kv_a_proj = quantizedWeightFromHandle(weight_handles[3]).*;
-                    mla.kv_b_proj = quantizedWeightFromHandle(weight_handles[5]).*;
-                    if (mla.o_proj != null) {
+                switch (state.mla_storage_kind) {
+                    .quantized => {
+                        mla.q_a_proj = quantizedWeightFromHandle(weight_handles[0]).*;
+                        mla.q_b_proj = quantizedWeightFromHandle(weight_handles[2]).*;
+                        mla.kv_a_proj = quantizedWeightFromHandle(weight_handles[3]).*;
+                        mla.kv_b_proj = quantizedWeightFromHandle(weight_handles[5]).*;
                         mla.o_proj = quantizedWeightFromHandle(weight_handles[6]).*;
-                    } else {
+                    },
+                    .dense => {
+                        mla.q_a_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
+                        mla.q_b_proj_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
+                        mla.kv_a_proj_bf16 = arrayWeightFromHandle(weight_handles[3]).*;
+                        mla.kv_b_proj_bf16 = arrayWeightFromHandle(weight_handles[5]).*;
                         mla.o_proj_bf16 = arrayWeightFromHandle(weight_handles[6]).*;
-                    }
-                } else {
-                    mla.q_a_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
-                    mla.q_b_proj_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
-                    mla.kv_a_proj_bf16 = arrayWeightFromHandle(weight_handles[3]).*;
-                    mla.kv_b_proj_bf16 = arrayWeightFromHandle(weight_handles[5]).*;
-                    mla.o_proj_bf16 = arrayWeightFromHandle(weight_handles[6]).*;
+                    },
+                    else => return error.InvalidTensorType,
                 }
                 mla.q_a_norm = optionalArrayWeightFromHandle(weight_handles[1]) orelse return error.MissingField;
                 mla.kv_a_norm = optionalArrayWeightFromHandle(weight_handles[4]) orelse return error.MissingField;
@@ -968,24 +992,26 @@ pub const TransformerBlock = struct {
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
         const input = arraySlotFromHandle(io.inputs[0]).*;
-        const lw = state.layer_weights;
-        const conv_weight = lw.shortconv_conv_weight orelse return error.MissingField;
         var shortconv_binding = shortconv_kernel.ShortConvKernel{
-            .in_proj = lw.shortconv_in_proj,
-            .out_proj = lw.shortconv_out_proj,
-            .in_proj_bf16 = lw.shortconv_in_proj_bf16,
-            .out_proj_bf16 = lw.shortconv_out_proj_bf16,
-            .conv_weight = conv_weight,
-            .conv_bias = lw.shortconv_conv_bias,
-            .d_conv = lw.shortconv_d_conv,
-            .conv_dim = lw.shortconv_conv_dim,
+            .in_proj = null,
+            .out_proj = null,
+            .in_proj_bf16 = null,
+            .out_proj_bf16 = null,
+            .conv_weight = null,
+            .conv_bias = null,
+            .d_conv = state.shortconv_d_conv,
+            .conv_dim = state.shortconv_conv_dim,
         };
-        if (shortconv_binding.in_proj != null) {
-            shortconv_binding.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
-            shortconv_binding.out_proj = quantizedWeightFromHandle(weight_handles[2]).*;
-        } else {
-            shortconv_binding.in_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
-            shortconv_binding.out_proj_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
+        switch (state.shortconv_storage_kind) {
+            .quantized => {
+                shortconv_binding.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
+                shortconv_binding.out_proj = quantizedWeightFromHandle(weight_handles[2]).*;
+            },
+            .dense => {
+                shortconv_binding.in_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
+                shortconv_binding.out_proj_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
+            },
+            else => return error.InvalidTensorType,
         }
         shortconv_binding.conv_weight = arrayWeightFromHandle(weight_handles[1]).*;
         shortconv_binding.conv_bias = optionalArrayWeightFromHandle(weight_handles[3]);
@@ -1005,24 +1031,27 @@ pub const TransformerBlock = struct {
         const input = arraySlotFromHandle(io.inputs[0]).*;
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
-        const lw = state.layer_weights;
         var swiglu_binding = ffn_kernel.SwiGLU{
             .use_gelu = state.use_gelu,
-            .w1 = lw.w1,
-            .w2 = lw.w2,
-            .w3 = lw.w3,
-            .w1_bf16 = lw.w1_bf16,
-            .w2_bf16 = lw.w2_bf16,
-            .w3_bf16 = lw.w3_bf16,
+            .w1 = null,
+            .w2 = null,
+            .w3 = null,
+            .w1_bf16 = null,
+            .w2_bf16 = null,
+            .w3_bf16 = null,
         };
-        if (swiglu_binding.w1 != null) {
-            swiglu_binding.w1 = quantizedWeightFromHandle(weight_handles[0]).*;
-            swiglu_binding.w3 = quantizedWeightFromHandle(weight_handles[1]).*;
-            swiglu_binding.w2 = quantizedWeightFromHandle(weight_handles[2]).*;
-        } else {
-            swiglu_binding.w1_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
-            swiglu_binding.w3_bf16 = arrayWeightFromHandle(weight_handles[1]).*;
-            swiglu_binding.w2_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
+        switch (state.ffn_storage_kind) {
+            .quantized => {
+                swiglu_binding.w1 = quantizedWeightFromHandle(weight_handles[0]).*;
+                swiglu_binding.w3 = quantizedWeightFromHandle(weight_handles[1]).*;
+                swiglu_binding.w2 = quantizedWeightFromHandle(weight_handles[2]).*;
+            },
+            .dense => {
+                swiglu_binding.w1_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
+                swiglu_binding.w3_bf16 = arrayWeightFromHandle(weight_handles[1]).*;
+                swiglu_binding.w2_bf16 = arrayWeightFromHandle(weight_handles[2]).*;
+            },
+            else => return error.InvalidTensorType,
         }
         const output = try runSwiGluKernel(input, swiglu_binding);
         arraySlotFromHandle(io.outputs[0]).* = output;
@@ -1040,7 +1069,6 @@ pub const TransformerBlock = struct {
         const input = arraySlotFromHandle(io.inputs[0]).*;
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
-        const moe = state.layer_weights.moe orelse return error.MissingField;
         var runtime_moe = WeightHandles.MoEWeights{
             .router_w = arrayWeightFromHandle(weight_handles[0]).*,
             .router_s = optionalArrayWeightFromHandle(weight_handles[11]),
@@ -1055,10 +1083,10 @@ pub const TransformerBlock = struct {
             .gate_bias = optionalArrayWeightFromHandle(weight_handles[8]),
             .up_bias = optionalArrayWeightFromHandle(weight_handles[9]),
             .down_bias = optionalArrayWeightFromHandle(weight_handles[10]),
-            .router_group_size = moe.router_group_size,
-            .expert_group_size = moe.expert_group_size,
-            .num_experts = moe.num_experts,
-            .experts_per_token = moe.experts_per_token,
+            .router_group_size = state.moe_router_group_size,
+            .expert_group_size = state.moe_expert_group_size,
+            .num_experts = state.moe_num_experts,
+            .experts_per_token = state.moe_experts_per_token,
         };
         const output = try runMoeKernel(input, .{ .weights = &runtime_moe });
         arraySlotFromHandle(io.outputs[0]).* = output;
@@ -1077,43 +1105,43 @@ pub const TransformerBlock = struct {
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
         const input = arraySlotFromHandle(io.inputs[0]).*;
-        const lw = state.layer_weights;
-        const conv_weight = lw.mamba_conv_weight orelse return error.MissingField;
-        const a_log = lw.mamba_a_log orelse return error.MissingField;
-        const d_skip = lw.mamba_d_skip orelse return error.MissingField;
         var mamba_binding = mamba_kernel.MambaKernel{
-            .d_state = lw.mamba_d_state,
-            .d_conv = lw.mamba_d_conv,
-            .n_heads = lw.mamba_n_heads,
-            .d_head = lw.mamba_d_head,
-            .n_groups = lw.mamba_n_groups,
+            .d_state = state.mamba_d_state,
+            .d_conv = state.mamba_d_conv,
+            .n_heads = state.mamba_n_heads,
+            .d_head = state.mamba_d_head,
+            .n_groups = state.mamba_n_groups,
             .use_gelu = state.use_gelu,
             .residual_multiplier = state.residual_multiplier,
             .norm_eps = state.model_config.norm_eps,
-            .gate_up_layout = @intFromEnum(lw.mamba_gate_up_layout),
-            .ln1_weight = lw.getLn1(),
-            .in_proj = lw.mamba_in_proj,
-            .in_proj_bf16 = lw.mamba_in_proj_bf16,
-            .conv_weight = conv_weight,
-            .conv_bias = lw.mamba_conv_bias,
-            .a_log = a_log,
-            .d_skip = d_skip,
-            .dt_bias = lw.mamba_dt_bias,
-            .norm_weight = lw.mamba_norm_weight,
-            .out_proj = lw.mamba_out_proj,
-            .out_proj_bf16 = lw.mamba_out_proj_bf16,
-            .ln2_weight = lw.getLn2(),
-            .gate_up = lw.mamba_gate_up,
-            .gate_up_bf16 = lw.mamba_gate_up_bf16,
-            .down_proj = lw.mamba_down_proj,
-            .down_proj_bf16 = lw.mamba_down_proj_bf16,
+            .gate_up_layout = state.mamba_gate_up_layout,
+            .ln1_weight = null,
+            .in_proj = null,
+            .in_proj_bf16 = null,
+            .conv_weight = null,
+            .conv_bias = null,
+            .a_log = null,
+            .d_skip = null,
+            .dt_bias = null,
+            .norm_weight = null,
+            .out_proj = null,
+            .out_proj_bf16 = null,
+            .ln2_weight = null,
+            .gate_up = null,
+            .gate_up_bf16 = null,
+            .down_proj = null,
+            .down_proj_bf16 = null,
         };
-        if (mamba_binding.in_proj != null) {
-            mamba_binding.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
-            mamba_binding.out_proj = quantizedWeightFromHandle(weight_handles[4]).*;
-        } else {
-            mamba_binding.in_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
-            mamba_binding.out_proj_bf16 = arrayWeightFromHandle(weight_handles[4]).*;
+        switch (state.mamba_storage_kind) {
+            .quantized => {
+                mamba_binding.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
+                mamba_binding.out_proj = quantizedWeightFromHandle(weight_handles[4]).*;
+            },
+            .dense => {
+                mamba_binding.in_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
+                mamba_binding.out_proj_bf16 = arrayWeightFromHandle(weight_handles[4]).*;
+            },
+            else => return error.InvalidTensorType,
         }
         mamba_binding.conv_weight = arrayWeightFromHandle(weight_handles[1]).*;
         mamba_binding.a_log = arrayWeightFromHandle(weight_handles[2]).*;
@@ -1123,15 +1151,19 @@ pub const TransformerBlock = struct {
         mamba_binding.conv_bias = optionalArrayWeightFromHandle(weight_handles[5]);
         mamba_binding.dt_bias = optionalArrayWeightFromHandle(weight_handles[6]);
         mamba_binding.norm_weight = optionalArrayWeightFromHandle(weight_handles[7]);
-        if (mamba_binding.gate_up != null) {
-            mamba_binding.gate_up = quantizedWeightFromHandle(weight_handles[10]).*;
-        } else {
-            mamba_binding.gate_up_bf16 = optionalArrayWeightFromHandle(weight_handles[10]);
+        if (optionalArrayWeightFromHandle(weight_handles[10]) != null) {
+            switch (state.mamba_storage_kind) {
+                .quantized => mamba_binding.gate_up = quantizedWeightFromHandle(weight_handles[10]).*,
+                .dense => mamba_binding.gate_up_bf16 = optionalArrayWeightFromHandle(weight_handles[10]),
+                else => return error.InvalidTensorType,
+            }
         }
-        if (mamba_binding.down_proj != null) {
-            mamba_binding.down_proj = quantizedWeightFromHandle(weight_handles[11]).*;
-        } else {
-            mamba_binding.down_proj_bf16 = optionalArrayWeightFromHandle(weight_handles[11]);
+        if (optionalArrayWeightFromHandle(weight_handles[11]) != null) {
+            switch (state.mamba_storage_kind) {
+                .quantized => mamba_binding.down_proj = quantizedWeightFromHandle(weight_handles[11]).*,
+                .dense => mamba_binding.down_proj_bf16 = optionalArrayWeightFromHandle(weight_handles[11]),
+                else => return error.InvalidTensorType,
+            }
         }
         const output = try runMambaKernel(
             input,
@@ -1417,6 +1449,24 @@ pub const TransformerBlock = struct {
             .residual_multiplier = weight_handles.residual_multiplier,
             .use_gelu = weight_handles.use_gelu,
             .attention_multiplier = weight_handles.attention_multiplier,
+            .attention_storage_kind = lw.attentionStorageKind(),
+            .shortconv_storage_kind = lw.shortconvStorageKind(),
+            .ffn_storage_kind = lw.ffnStorageKind(),
+            .mla_storage_kind = lw.mlaStorageKind(),
+            .mamba_storage_kind = lw.mambaStorageKind(),
+            .mla_config = lw.mla_config,
+            .shortconv_d_conv = lw.shortconv_d_conv,
+            .shortconv_conv_dim = lw.shortconv_conv_dim,
+            .moe_router_group_size = if (lw.moe) |moe| moe.router_group_size else 0,
+            .moe_expert_group_size = if (lw.moe) |moe| moe.expert_group_size else 0,
+            .moe_num_experts = if (lw.moe) |moe| moe.num_experts else 0,
+            .moe_experts_per_token = if (lw.moe) |moe| moe.experts_per_token else 0,
+            .mamba_d_state = lw.mamba_d_state,
+            .mamba_d_conv = lw.mamba_d_conv,
+            .mamba_n_heads = lw.mamba_n_heads,
+            .mamba_d_head = lw.mamba_d_head,
+            .mamba_n_groups = lw.mamba_n_groups,
+            .mamba_gate_up_layout = @intFromEnum(lw.mamba_gate_up_layout),
             .resolved_weight_ptrs = lw.weight_ptr_scratch,
         };
         if (exec_ctx.resolved_weight_ptrs.len != exec_ctx.weight_binding_keys.len) {
