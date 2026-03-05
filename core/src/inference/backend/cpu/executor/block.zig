@@ -2435,7 +2435,7 @@ pub const Block = struct {
     fn sequentialLinearRuntimeAdapter(
         ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         views: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
         _: []const runtime_contract.ParamBlock,
@@ -2443,16 +2443,19 @@ pub const Block = struct {
         const state = try runtimeDispatchState(ctx);
         try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
+        const weight_handles = try instructionWeightSlice(insn, registers);
+        if (weight_handles.len != 1) return error.InvalidWeightRefCount;
         const input_view = views[0];
         const input_buf = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
-        const weight = state.block.instructionWeightRef(state.op_index) catch |err| {
+        const weight = tensorFromWeightHandle(weight_handles[0]);
+        if (isMissingWeightTensor(weight)) {
             error_context.setContext("block={d}, op={d}, weight_ref={s}", .{
                 state.block.block_idx,
                 state.op_index,
-                @errorName(err),
+                "missing_weight_tensor",
             });
-            return err;
-        };
+            return error.MissingWeight;
+        }
         const seq_len: usize = input_view.shape[1];
         const output_features: usize = if (weight.dtype == .f32)
             @intCast(weight.shape[1])
@@ -2873,7 +2876,7 @@ pub const Block = struct {
     fn sequentialAddParamRuntimeAdapter(
         ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         views: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
         _: []const runtime_contract.ParamBlock,
@@ -2881,17 +2884,20 @@ pub const Block = struct {
         const state = try runtimeDispatchState(ctx);
         try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
+        const weight_handles = try instructionWeightSlice(insn, registers);
+        if (weight_handles.len != 1) return error.InvalidWeightRefCount;
         const input_view = views[0];
         const input_numel = viewNumel(input_view);
         const input_tensor = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
-        const param = state.block.instructionWeightRef(state.op_index) catch |err| {
+        const param = tensorFromWeightHandle(weight_handles[0]);
+        if (isMissingWeightTensor(param)) {
             error_context.setContext("block={d}, op={d}, param_ref={s}", .{
                 state.block.block_idx,
                 state.op_index,
-                @errorName(err),
+                "missing_weight_tensor",
             });
-            return err;
-        };
+            return error.MissingWeight;
+        }
         const output_len = @max(input_numel, param.numel);
         const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
@@ -2911,21 +2917,24 @@ pub const Block = struct {
     fn sequentialAddParamScalarRuntimeAdapter(
         ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
         try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
-        const param = state.block.instructionWeightRef(state.op_index) catch |err| {
+        const weight_handles = try instructionWeightSlice(insn, registers);
+        if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+        const param = tensorFromWeightHandle(weight_handles[0]);
+        if (isMissingWeightTensor(param)) {
             error_context.setContext("block={d}, op={d}, param_ref={s}", .{
                 state.block.block_idx,
                 state.op_index,
-                @errorName(err),
+                "missing_weight_tensor",
             });
-            return err;
-        };
+            return error.MissingWeight;
+        }
         const p_len = param.numel;
         const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
@@ -2946,7 +2955,7 @@ pub const Block = struct {
     fn sequentialMulParamRuntimeAdapter(
         ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         views: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
         _: []const runtime_contract.ParamBlock,
@@ -2954,17 +2963,20 @@ pub const Block = struct {
         const state = try runtimeDispatchState(ctx);
         try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
+        const weight_handles = try instructionWeightSlice(insn, registers);
+        if (weight_handles.len != 1) return error.InvalidWeightRefCount;
         const input_view = views[0];
         const input_numel = viewNumel(input_view);
         const input_tensor = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
-        const param = state.block.instructionWeightRef(state.op_index) catch |err| {
+        const param = tensorFromWeightHandle(weight_handles[0]);
+        if (isMissingWeightTensor(param)) {
             error_context.setContext("block={d}, op={d}, param_ref={s}", .{
                 state.block.block_idx,
                 state.op_index,
-                @errorName(err),
+                "missing_weight_tensor",
             });
-            return err;
-        };
+            return error.MissingWeight;
+        }
         const output_len = @max(input_numel, param.numel);
         const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
@@ -4172,6 +4184,55 @@ test "Block caches primitive linear weight bindings at init" {
     try testing.expectEqual(@as(usize, 1), block.instruction_weight_ptrs.len);
     try testing.expect(block.instruction_weight_ptrs[0] != null);
     try block.validate();
+}
+
+test "Block.forward linear uses instruction handles not primitive weight ref cache" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .linear = .{ .in = .residual, .out = .norm_out, .weight_name = "q_proj" } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    // Regression guard: primitive execution must use instruction handles built
+    // from flattened instruction bindings, not this legacy ref cache.
+    block.instruction_weight_refs[0] = null;
+
+    const seq_len = 2;
+    const hidden = 128;
+    const input_data = try allocator.alloc(f32, 1 * seq_len * hidden);
+    defer allocator.free(input_data);
+    for (input_data, 0..) |*val, i| {
+        val.* = @as(f32, @floatFromInt(i % 17)) * 0.05;
+    }
+    const input = Tensor.view(@ptrCast(input_data.ptr), &.{ 1, seq_len, hidden }, .f32, null);
+
+    const output_data = try allocator.alloc(f32, 1 * seq_len * hidden);
+    defer allocator.free(output_data);
+    @memset(output_data, 0.0);
+    var output = Tensor.view(@ptrCast(output_data.ptr), &.{ 1, seq_len, hidden }, .f32, null);
+
+    var scratch = try ScratchBuffer.init(allocator, hidden, 512, 1);
+    defer scratch.deinit();
+
+    try block.forward(&input, &output, &scratch, false);
+
+    var has_nonzero = false;
+    for (output_data) |val| {
+        if (val != 0.0) {
+            has_nonzero = true;
+            break;
+        }
+    }
+    try testing.expect(has_nonzero);
 }
 
 test "Block caches kernel instruction bindings at init" {

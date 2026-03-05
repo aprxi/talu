@@ -1886,9 +1886,22 @@ const RuntimeState = extern struct {
     _pad: [7]u8 = [_]u8{0} ** 7,
 };
 
-const KvRuntimeState = RuntimeState;
-const ShortConvRuntimeState = RuntimeState;
-const MambaRuntimeState = RuntimeState;
+const KvRuntimeState = extern struct {
+    runtime_kind: u8,
+    _pad: [7]u8 = [_]u8{0} ** 7,
+    block_runtime: *BlockRuntime,
+    slot_index: usize,
+};
+
+const RecurrentRuntimeState = extern struct {
+    runtime_kind: u8,
+    _pad: [7]u8 = [_]u8{0} ** 7,
+    block_runtime: *BlockRuntime,
+    slot_index: usize,
+};
+
+const ShortConvRuntimeState = RecurrentRuntimeState;
+const MambaRuntimeState = RecurrentRuntimeState;
 
 pub const CudaBackend = struct {
     pub const capabilities: contract.Capabilities = .{
@@ -2406,17 +2419,12 @@ pub const CudaBackend = struct {
         if (self.state_descriptor_count == 0) return;
         if (!self.slotIndexSupported(slot_index)) return;
         if (!self.slot_state_bindings[slot_index].bound) return;
-
-        for (self.stateDescriptors()) |descriptor| {
-            if (descriptor.runtime_kind != runtime_contract.state_runtime_kind_shortconv_cache) continue;
-            self.resetShortConvStates() catch |err| {
-                log.warn("inference", "CUDA resetSlot shortconv reset failed", .{
-                    .slot_index = slot_index,
-                    .reason = @errorName(err),
-                });
-            };
-            break;
-        }
+        self.resetShortConvStates() catch |err| {
+            log.warn("inference", "CUDA resetSlot shortconv reset failed", .{
+                .slot_index = slot_index,
+                .reason = @errorName(err),
+            });
+        };
     }
 
     pub fn getPosition(self: *const CudaBackend, slot_index: usize) usize {
@@ -2433,16 +2441,27 @@ pub const CudaBackend = struct {
         runtime_kind: u8,
         state_block: *runtime_contract.StateBlockHandle,
     ) !void {
-        _ = self;
-        _ = slot_index;
         if (runtime_kind == runtime_contract.state_runtime_kind_none) {
             return;
         }
-        const state_value = runtime_contract.stateValueFromBlock(*RuntimeState, state_block) orelse {
+        if (runtime_kind == runtime_contract.state_runtime_kind_kv_cache) {
+            const state_value = runtime_contract.stateValueFromBlock(*KvRuntimeState, state_block) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            state_value.* = .{
+                .runtime_kind = runtime_kind,
+                .block_runtime = &self.block_runtime,
+                .slot_index = slot_index,
+            };
+            return;
+        }
+        const state_value = runtime_contract.stateValueFromBlock(*RecurrentRuntimeState, state_block) orelse {
             return error.InvalidStateDescriptorBinding;
         };
         state_value.* = .{
             .runtime_kind = runtime_kind,
+            .block_runtime = &self.block_runtime,
+            .slot_index = slot_index,
         };
     }
 
@@ -3933,6 +3952,16 @@ pub const CudaBackend = struct {
         return value;
     }
 
+    fn requireAttentionRuntimeBinding(state: *const KvRuntimeState, layer_index: usize) !*LayerAttentionRuntime {
+        if (layer_index >= state.block_runtime.blocks.len) return error.InvalidInstructionIndex;
+        return state.block_runtime.blocks[layer_index].attention_binding orelse error.InvalidStateDescriptorBinding;
+    }
+
+    fn requireShortConvRuntimeBinding(state: *const ShortConvRuntimeState, layer_index: usize) !*ShortConvBlockRuntime {
+        if (layer_index >= state.block_runtime.blocks.len) return error.InvalidInstructionIndex;
+        return state.block_runtime.blocks[layer_index].shortconv_binding orelse error.InvalidStateDescriptorBinding;
+    }
+
     fn instructionParams(
         insn: *const runtime_contract.Instruction,
         compiled: *const runtime_contract.CompiledPlan,
@@ -4112,7 +4141,7 @@ pub const CudaBackend = struct {
         if (kv_state.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) {
             return error.InvalidStateDescriptorBinding;
         }
-        const attention_binding = layer.attention_binding orelse return error.InvalidStateDescriptorBinding;
+        const attention_binding = try requireAttentionRuntimeBinding(kv_state, ctx.layer_index);
         try self.runAttentionMixerStep(
             cfg,
             &attention_binding.k_cache,
@@ -4170,7 +4199,7 @@ pub const CudaBackend = struct {
         if (shortconv_state.runtime_kind != runtime_contract.state_runtime_kind_shortconv_cache) {
             return error.InvalidStateDescriptorBinding;
         }
-        const shortconv_binding = layer.shortconv_binding orelse return error.InvalidStateDescriptorBinding;
+        const shortconv_binding = try requireShortConvRuntimeBinding(shortconv_state, ctx.layer_index);
         try self.runShortConvMixerStep(
             cfg,
             &shortconv_binding.conv_state,
@@ -7330,6 +7359,12 @@ test "bindSlotStateBlocks stores typed runtime states by runtime_kind" {
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_shortconv_cache, shortconv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_mamba_cache, mamba_state.runtime_kind);
+    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(kv_state.block_runtime));
+    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(shortconv_state.block_runtime));
+    try std.testing.expectEqual(@intFromPtr(&backend.block_runtime), @intFromPtr(mamba_state.block_runtime));
+    try std.testing.expectEqual(@as(usize, 0), kv_state.slot_index);
+    try std.testing.expectEqual(@as(usize, 0), shortconv_state.slot_index);
+    try std.testing.expectEqual(@as(usize, 0), mamba_state.slot_index);
 }
 
 test "bindSlotStateBlocks preserves bound slot index in runtime states" {
@@ -7398,6 +7433,9 @@ test "bindSlotStateBlocks preserves bound slot index in runtime states" {
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_shortconv_cache, shortconv_state.runtime_kind);
     try std.testing.expectEqual(runtime_contract.state_runtime_kind_mamba_cache, mamba_state.runtime_kind);
+    try std.testing.expectEqual(@as(usize, 1), kv_state.slot_index);
+    try std.testing.expectEqual(@as(usize, 1), shortconv_state.slot_index);
+    try std.testing.expectEqual(@as(usize, 1), mamba_state.slot_index);
 }
 
 test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind none" {

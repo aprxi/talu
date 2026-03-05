@@ -14,7 +14,7 @@ pub const support = .{
     .kv_cache = false,
     .mamba = false,
     .mla_attention = false,
-    .moe = true,
+    .moe = false,
     .norm = true,
     .rope = false,
     .shortconv = true,
@@ -203,7 +203,14 @@ pub const mla_attention = struct {
 };
 
 pub const moe = struct {
-    pub const supported = true;
+    pub const supported = false;
+    pub const UnsupportedError = error{UnsupportedKernel};
+    pub fn unsupported() UnsupportedError {
+        return error.UnsupportedKernel;
+    }
+    pub fn requireImplemented() UnsupportedError {
+        return error.UnsupportedKernel;
+    }
 
     pub const MoEFFN = struct {
         pub const ForwardParams = struct {
@@ -342,6 +349,7 @@ test "unsupported kernel modules expose typed UnsupportedKernel errors" {
     try std.testing.expectEqual(error.UnsupportedKernel, kv_cache.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, mamba.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, mla_attention.unsupported());
+    try std.testing.expectEqual(error.UnsupportedKernel, moe.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, rope.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, weights.unsupported());
 }

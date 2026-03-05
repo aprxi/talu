@@ -407,48 +407,33 @@ pub const FusedCpuBackend = struct {
             );
         }
 
-        var kv_runtime_required = false;
-        var mamba_runtime_required = false;
-        var shortconv_runtime_required = false;
-        for (state_descriptors_storage[0..@intCast(state_descriptor_count)]) |descriptor| {
-            switch (descriptor.runtime_kind) {
-                runtime_contract.state_runtime_kind_kv_cache => kv_runtime_required = true,
-                runtime_contract.state_runtime_kind_mamba_cache => mamba_runtime_required = true,
-                runtime_contract.state_runtime_kind_shortconv_cache => shortconv_runtime_required = true,
-                else => {},
-            }
+        for (cpu_block_set, 0..) |*block, layer_idx| {
+            if (block.getAttention() != null) try attention_layer_indices.append(allocator, layer_idx);
+            if (block.getMLAAttention() != null) try mla_layer_indices.append(allocator, layer_idx);
+        }
+        if (attention_layer_indices.items.len > 0) {
+            try scratch.initAttention(attention_layer_indices.items);
+        }
+        if (mla_layer_indices.items.len > 0) {
+            try scratch.initMLA(mla_layer_indices.items);
+            log.info("inference", "MLA model detected", .{
+                .mla_layers = mla_layer_indices.items.len,
+            });
         }
 
-        if (kv_runtime_required) {
-            for (cpu_block_set, 0..) |*block, layer_idx| {
-                if (block.getAttention() != null) try attention_layer_indices.append(allocator, layer_idx);
-                if (block.getMLAAttention() != null) try mla_layer_indices.append(allocator, layer_idx);
-            }
-            if (attention_layer_indices.items.len > 0) {
-                try scratch.initAttention(attention_layer_indices.items);
-            }
-            if (mla_layer_indices.items.len > 0) {
-                try scratch.initMLA(mla_layer_indices.items);
-                log.info("inference", "MLA model detected", .{
-                    .mla_layers = mla_layer_indices.items.len,
-                });
-            }
-        }
-
-        if (mamba_runtime_required) {
-            var mamba_config: ?kernels.MambaConfig = null;
-            for (cpu_block_set, 0..) |*block, layer_idx| {
-                const kernel = block.getMambaKernel() orelse continue;
-                try mamba_layer_indices.append(allocator, layer_idx);
-                if (mamba_config) |expected| {
-                    if (!std.meta.eql(expected, kernel.config)) {
-                        return error.InvalidStateDescriptorBinding;
-                    }
-                } else {
-                    mamba_config = kernel.config;
+        var mamba_config: ?kernels.MambaConfig = null;
+        for (cpu_block_set, 0..) |*block, layer_idx| {
+            const kernel = block.getMambaKernel() orelse continue;
+            try mamba_layer_indices.append(allocator, layer_idx);
+            if (mamba_config) |expected| {
+                if (!std.meta.eql(expected, kernel.config)) {
+                    return error.InvalidStateDescriptorBinding;
                 }
+            } else {
+                mamba_config = kernel.config;
             }
-            if (mamba_layer_indices.items.len == 0) return error.InvalidStateDescriptorBinding;
+        }
+        if (mamba_layer_indices.items.len > 0) {
             try scratch.initMamba(
                 mamba_layer_indices.items,
                 mamba_config orelse return error.InvalidStateDescriptorBinding,
@@ -459,20 +444,19 @@ pub const FusedCpuBackend = struct {
             });
         }
 
-        if (shortconv_runtime_required) {
-            var shortconv_config: ?kernels.ShortConvConfig = null;
-            for (cpu_block_set, 0..) |*block, layer_idx| {
-                const kernel = block.getShortConvKernel() orelse continue;
-                try shortconv_layer_indices.append(allocator, layer_idx);
-                if (shortconv_config) |expected| {
-                    if (!std.meta.eql(expected, kernel.config)) {
-                        return error.InvalidStateDescriptorBinding;
-                    }
-                } else {
-                    shortconv_config = kernel.config;
+        var shortconv_config: ?kernels.ShortConvConfig = null;
+        for (cpu_block_set, 0..) |*block, layer_idx| {
+            const kernel = block.getShortConvKernel() orelse continue;
+            try shortconv_layer_indices.append(allocator, layer_idx);
+            if (shortconv_config) |expected| {
+                if (!std.meta.eql(expected, kernel.config)) {
+                    return error.InvalidStateDescriptorBinding;
                 }
+            } else {
+                shortconv_config = kernel.config;
             }
-            if (shortconv_layer_indices.items.len == 0) return error.InvalidStateDescriptorBinding;
+        }
+        if (shortconv_layer_indices.items.len > 0) {
             try scratch.initShortConv(
                 shortconv_layer_indices.items,
                 shortconv_config orelse return error.InvalidStateDescriptorBinding,
@@ -619,30 +603,12 @@ pub const FusedCpuBackend = struct {
     pub fn resetSlot(self: *FusedCpuBackend, slot_index: usize) void {
         if (self.state_descriptor_count == 0) {
             self.kv_cache.resetSlot(slot_index);
-            self.resetScratchSlotStates(slot_index, true, true, true);
         } else if (slot_index < self.slot_state_bindings.len and self.slot_state_bindings[slot_index].bound) {
-            var reset_mla = false;
-            var reset_mamba = false;
-            var reset_shortconv = false;
-            const state_blocks = self.slotStateBlocks(slot_index);
-            for (self.stateDescriptors()) |descriptor| {
-                _ = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse continue;
-                switch (descriptor.runtime_kind) {
-                    runtime_contract.state_runtime_kind_kv_cache => {
-                        if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
-                            layered_cache.resetSlot(slot_index);
-                        } else |_| {}
-                        reset_mla = true;
-                    },
-                    runtime_contract.state_runtime_kind_mamba_cache => reset_mamba = true,
-                    runtime_contract.state_runtime_kind_shortconv_cache => reset_shortconv = true,
-                    else => {},
-                }
-            }
-            self.resetScratchSlotStates(slot_index, reset_mla, reset_mamba, reset_shortconv);
-        } else {
-            self.resetScratchSlotStates(slot_index, true, true, true);
+            if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
+                layered_cache.resetSlot(slot_index);
+            } else |_| {}
         }
+        self.resetScratchSlotStates(slot_index, true, true, true);
         self.slot_rope_position_deltas[slot_index] = 0;
     }
 
@@ -704,16 +670,12 @@ pub const FusedCpuBackend = struct {
     fn boundLayeredCacheForSlot(self: *const FusedCpuBackend, slot_index: usize) !*LayeredBatchedKVCache {
         if (slot_index >= self.slot_state_bindings.len) return error.InvalidArgument;
         const state_blocks = self.slotStateBlocks(slot_index);
-        for (self.stateDescriptors()) |descriptor| {
-            if (descriptor.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) continue;
-            const state_block = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
+        for (state_blocks) |*state_block| {
             const state_value = runtime_contract.stateValueFromBlock(*state_bindings.KvRuntimeState, state_block) orelse {
-                return error.InvalidStateDescriptorBinding;
+                continue;
             };
             if (state_value.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) {
-                return error.InvalidStateDescriptorBinding;
+                continue;
             }
             return state_value.layered_cache;
         }
