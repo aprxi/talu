@@ -8,34 +8,21 @@ const compute = @import("../../compute/root.zig");
 
 const Tensor = tensor_mod.Tensor;
 const MatmulScratch = compute.cpu.linalg.MatmulScratch;
-const matmulF32 = compute.cpu.linalg.matmulF32;
+const matmulF32TransB = compute.cpu.linalg.matmulF32TransB;
 
 /// Linear layer forward: output = input @ weight^T
 /// input: [rows, in_dim], weight: [out_dim, in_dim] → output: [rows, out_dim]
 pub fn linearForward(output: []f32, input: []const f32, weight: []const f32, rows: usize, in_dim: usize, out_dim: usize, scratch: *MatmulScratch) void {
-    // output[i, j] = sum_k(input[i, k] * weight[j, k])
-    // This is: output = input @ weight^T
-    // matmulF32 does: out = a @ b where a[m,k] @ b[k,n] → out[m,n]
-    // So we need: a = input[rows, in_dim], b = weight^T[in_dim, out_dim]
-    // Transpose weight into a temporary buffer, then call matmulF32.
     std.debug.assert(output.len >= rows * out_dim);
     std.debug.assert(input.len >= rows * in_dim);
     std.debug.assert(weight.len >= out_dim * in_dim);
 
-    // Transpose weight [out_dim, in_dim] → weight_t [in_dim, out_dim]
-    const weight_t = scratch.allocator.alloc(f32, in_dim * out_dim) catch unreachable;
-    defer scratch.allocator.free(weight_t);
-
-    for (0..out_dim) |j| {
-        for (0..in_dim) |k| {
-            weight_t[k * out_dim + j] = weight[j * in_dim + k];
-        }
-    }
-
+    // C = A @ B^T where A=[rows, in_dim], B=[out_dim, in_dim] → C=[rows, out_dim]
+    // Weight is already stored [out_dim, in_dim] — no transpose needed.
     var a = Tensor.view2DSlice(@constCast(input[0 .. rows * in_dim]), rows, in_dim);
-    var b = Tensor.view2DSlice(weight_t, in_dim, out_dim);
+    var b = Tensor.view2DSlice(@constCast(weight[0 .. out_dim * in_dim]), out_dim, in_dim);
     var out = Tensor.view2DSlice(output[0 .. rows * out_dim], rows, out_dim);
-    matmulF32(&a, &b, &out, scratch);
+    matmulF32TransB(&a, &b, &out, scratch);
 }
 
 /// LM head forward: logits[i, v] = sum_d(input[i, d] * weight[v, d])
