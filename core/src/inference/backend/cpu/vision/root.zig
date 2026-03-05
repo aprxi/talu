@@ -70,31 +70,49 @@ pub const VisionRuntime = struct {
 
         switch (detected_layout) {
             .fused_qkv => {
-                if (try fused_qkv_runtime.VisionRuntime.init(allocator, loaded)) |rt| {
+                if ((fused_qkv_runtime.VisionRuntime.init(allocator, loaded) catch |err| switch (err) {
+                    error.UnsupportedModel => null,
+                    else => return err,
+                })) |rt| {
                     log.debug("inference", "Vision runtime selected", .{ .layout = "fused_qkv" }, @src());
                     return .{ .allocator = allocator, .impl = .{ .fused_qkv = rt } };
                 }
-                if (try split_qkv_runtime.VisionRuntime.init(allocator, loaded)) |rt| {
+                if ((split_qkv_runtime.VisionRuntime.init(allocator, loaded) catch |err| switch (err) {
+                    error.UnsupportedModel => null,
+                    else => return err,
+                })) |rt| {
                     log.debug("inference", "Vision runtime selected", .{ .layout = "split_qkv" }, @src());
                     return .{ .allocator = allocator, .impl = .{ .split_qkv = rt } };
                 }
             },
             .split_qkv => {
-                if (try split_qkv_runtime.VisionRuntime.init(allocator, loaded)) |rt| {
+                if ((split_qkv_runtime.VisionRuntime.init(allocator, loaded) catch |err| switch (err) {
+                    error.UnsupportedModel => null,
+                    else => return err,
+                })) |rt| {
                     log.debug("inference", "Vision runtime selected", .{ .layout = "split_qkv" }, @src());
                     return .{ .allocator = allocator, .impl = .{ .split_qkv = rt } };
                 }
-                if (try fused_qkv_runtime.VisionRuntime.init(allocator, loaded)) |rt| {
+                if ((fused_qkv_runtime.VisionRuntime.init(allocator, loaded) catch |err| switch (err) {
+                    error.UnsupportedModel => null,
+                    else => return err,
+                })) |rt| {
                     log.debug("inference", "Vision runtime selected", .{ .layout = "fused_qkv" }, @src());
                     return .{ .allocator = allocator, .impl = .{ .fused_qkv = rt } };
                 }
             },
             .unknown => {
-                if (try fused_qkv_runtime.VisionRuntime.init(allocator, loaded)) |rt| {
+                if ((fused_qkv_runtime.VisionRuntime.init(allocator, loaded) catch |err| switch (err) {
+                    error.UnsupportedModel => null,
+                    else => return err,
+                })) |rt| {
                     log.debug("inference", "Vision runtime selected", .{ .layout = "fused_qkv" }, @src());
                     return .{ .allocator = allocator, .impl = .{ .fused_qkv = rt } };
                 }
-                if (try split_qkv_runtime.VisionRuntime.init(allocator, loaded)) |rt| {
+                if ((split_qkv_runtime.VisionRuntime.init(allocator, loaded) catch |err| switch (err) {
+                    error.UnsupportedModel => null,
+                    else => return err,
+                })) |rt| {
                     log.debug("inference", "Vision runtime selected", .{ .layout = "split_qkv" }, @src());
                     return .{ .allocator = allocator, .impl = .{ .split_qkv = rt } };
                 }

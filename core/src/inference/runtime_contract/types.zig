@@ -471,7 +471,7 @@ pub fn firstLayerProgramCompatibilityIssue(
 
 pub fn expectedKernelWeightSlots(opcode: Opcode) []const []const u8 {
     return switch (opcode) {
-        .rmsnorm => &.{"norm_weight"},
+        .rmsnorm => &.{ "norm_weight", "norm_bias" },
         .multihead_attention => &.{
             "q_proj",
             "k_proj",
@@ -2194,7 +2194,7 @@ test "validateCompiledPlan enforces liveness dimensions" {
         .opcode = .rmsnorm,
         .inputs = &.{registerFromIndex(0)},
         .outputs = &.{registerFromIndex(1)},
-        .weights = &.{.{ .index = 0 }},
+        .weights = &.{ .{ .index = 0 }, .{ .index = 1 } },
         .param_block_id = null,
         .state_block_id = null,
     };
@@ -2210,7 +2210,10 @@ test "validateCompiledPlan enforces liveness dimensions" {
     const compiled = CompiledPlan{
         .plan = plan,
         .param_blocks = &.{},
-        .weight_bindings = &.{.{ .index = 0, .name = "norm_w" }},
+        .weight_bindings = &.{
+            .{ .index = 0, .name = "norm_w" },
+            .{ .index = 1, .name = "norm_b" },
+        },
         .register_buffer_specs = &.{
             .{ .size = 1, .@"align" = 64 },
             .{ .size = 1, .@"align" = 64 },

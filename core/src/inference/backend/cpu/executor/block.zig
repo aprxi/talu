@@ -185,7 +185,6 @@ const ShortConvRuntimeMetadata = struct {
     matmul_in_proj_name: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).matmul_in_proj_name),
     matmul_out_proj_name: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).matmul_out_proj_name),
     layer_idx: u16,
-    conv_weight_transposed: @TypeOf(@as(shortconv_kernel.ShortConvKernel, undefined).conv_weight_transposed),
 };
 
 const TmpRegisterLayout = struct {
@@ -757,7 +756,6 @@ pub const Block = struct {
                     .matmul_in_proj_name = binding.matmul_in_proj_name,
                     .matmul_out_proj_name = binding.matmul_out_proj_name,
                     .layer_idx = binding.layer_idx,
-                    .conv_weight_transposed = binding.conv_weight_transposed,
                 };
             }
         }
@@ -875,15 +873,23 @@ pub const Block = struct {
         switch (opcode) {
             .rmsnorm => {
                 const norm_binding = typed_kernel_refs.norm[op_index] orelse return error.InvalidInstructionBinding;
-                if (slot_idx != 0) return error.InvalidWeightRefCount;
-                const weight = switch (norm_binding.*) {
-                    .rms => |rms| rms.weight,
-                    .layer => |layer| blk: {
-                        if (layer.bias != null) return error.UnsupportedModel;
-                        break :blk layer.weight;
+                return switch (slot_idx) {
+                    0 => blk: {
+                        const weight = switch (norm_binding.*) {
+                            .rms => |rms| rms.weight,
+                            .layer => |layer| layer.weight,
+                        };
+                        break :blk @ptrCast(@constCast(weight));
                     },
+                    1 => switch (norm_binding.*) {
+                        .rms => @ptrCast(@constCast(&missing_weight_tensor)),
+                        .layer => |layer| if (layer.bias) |bias|
+                            @ptrCast(@constCast(bias))
+                        else
+                            @ptrCast(@constCast(&missing_weight_tensor)),
+                    },
+                    else => error.InvalidWeightRefCount,
                 };
-                return @ptrCast(@constCast(weight));
             },
             .multihead_attention => {
                 const attn_binding = typed_kernel_refs.attention[op_index] orelse return error.InvalidInstructionBinding;
@@ -1914,11 +1920,10 @@ pub const Block = struct {
         const output = &state.buffer_views[runtime_contract.registerToIndex(insn.outputs[0])];
 
         if (comptime expected_opcode == .rmsnorm) {
-            if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+            if (weight_handles.len != 2) return error.InvalidWeightRefCount;
             if (state.op_index >= state.block.instruction_norm_runtime_metadata.len) return error.InvalidInstructionIndex;
             const weight = tensorFromWeightHandle(weight_handles[0]);
             const meta = state.block.instruction_norm_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
-            if (meta.has_bias) return error.UnsupportedModel;
             var norm_local = switch (meta.kind) {
                 .rms => norm_kernel.NormKernel{
                     .rms = .{
@@ -1933,7 +1938,7 @@ pub const Block = struct {
                 .layer => norm_kernel.NormKernel{
                     .layer = .{
                         .weight = weight,
-                        .bias = null,
+                        .bias = if (meta.has_bias) optionalTensorFromWeightHandle(weight_handles[1]) else null,
                         .dim = meta.dim,
                         .eps = meta.eps,
                         .layer_idx = meta.layer_idx,
@@ -2175,7 +2180,7 @@ pub const Block = struct {
                 .matmul_in_proj_name = meta.matmul_in_proj_name,
                 .matmul_out_proj_name = meta.matmul_out_proj_name,
                 .layer_idx = meta.layer_idx,
-                .conv_weight_transposed = meta.conv_weight_transposed,
+                .conv_weight_transposed = null,
                 .weight_allocator = null,
             };
             try dispatchShortConvWithMode(state, insn, state_blocks, input, output, &shortconv_local);
@@ -4241,7 +4246,7 @@ test "resolveKernelWeightPtrForSlot emits missing sentinels for fused attention 
     );
 }
 
-test "resolveKernelWeightPtrForSlot rejects layernorm bias backdoor for rmsnorm opcode" {
+test "resolveKernelWeightPtrForSlot routes layernorm bias via norm_bias slot" {
     const norm_weight = zeroTensor();
     const norm_bias = zeroTensor();
     var layer_norm = norm_kernel.NormKernel{
@@ -4270,10 +4275,10 @@ test "resolveKernelWeightPtrForSlot rejects layernorm bias backdoor for rmsnorm 
         .shortconv = shortconv[0..],
     };
 
-    try testing.expectError(
-        error.UnsupportedModel,
-        Block.resolveKernelWeightPtrForSlot(0, 0, .rmsnorm, typed, 0),
-    );
+    const weight_ptr = try Block.resolveKernelWeightPtrForSlot(0, 0, .rmsnorm, typed, 0);
+    try testing.expectEqual(@intFromPtr(&norm_weight), @intFromPtr(@as(*const Tensor, @ptrCast(@alignCast(weight_ptr)))));
+    const bias_ptr = try Block.resolveKernelWeightPtrForSlot(0, 0, .rmsnorm, typed, 1);
+    try testing.expectEqual(@intFromPtr(&norm_bias), @intFromPtr(@as(*const Tensor, @ptrCast(@alignCast(bias_ptr)))));
 }
 
 test "resolveKernelWeightPtrForSlot emits missing sentinel for dense swiglu up slot" {

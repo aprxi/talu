@@ -861,9 +861,14 @@ const BlockRuntimeLayer = struct {
     ) !*anyopaque {
         switch (opcode) {
             .rmsnorm => {
-                if (slot_idx != 0) return error.InvalidWeightRefCount;
-                const weight = try self.instructionNormWeightRef(op_index);
-                return @ptrCast(@constCast(weight));
+                return switch (slot_idx) {
+                    0 => blk: {
+                        const weight = try self.instructionNormWeightRef(op_index);
+                        break :blk @ptrCast(@constCast(weight));
+                    },
+                    1 => @ptrCast(@constCast(&missing_device_tensor)),
+                    else => error.InvalidWeightRefCount,
+                };
             },
             .multihead_attention => {
                 if (op_index >= self.instruction_attention_weight_refs.len) return error.InvalidInstructionIndex;
@@ -4044,7 +4049,7 @@ pub const CudaBackend = struct {
         const io = try instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         const weight_handles = try instructionWeightSlice(insn, registers);
-        if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+        if (weight_handles.len != 2) return error.InvalidWeightRefCount;
         const input = bufferFromTensorHandle(io.inputs[0]);
         const output = bufferFromTensorHandle(io.outputs[0]);
         const weight = deviceTensorFromWeightHandle(weight_handles[0]);
