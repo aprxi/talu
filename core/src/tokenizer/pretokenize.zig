@@ -527,31 +527,33 @@ fn appendTokenChar(result: *PretokenizeResult, byte_value: u8, position: usize) 
     try result.ranges.append(Allocator, .{ .start = position, .end = position + 1 });
 }
 
-/// Apply GPT-2 byte-level encoding to all tokens
+/// Apply GPT-2 byte-level encoding to all tokens.
+/// Pre-computes encoded length to allocate exactly once per token,
+/// avoiding the per-token ArrayList alloc/realloc/free cycle.
 fn applyByteLevel(result: *PretokenizeResult) !void {
     const arena_alloc = result.arena.allocator();
     for (result.tokens.items) |*token_ptr| {
         const token_bytes = token_ptr.sliceConst();
-        log.trace("tokenizer", "Byte-level encode", .{ .input_len = token_bytes.len }, @src());
 
-        var encoded_bytes = std.ArrayListUnmanaged(u8){};
-        defer encoded_bytes.deinit(Allocator);
-
+        // Pre-compute encoded length (avoids ArrayList entirely)
+        var encoded_len: usize = 0;
         for (token_bytes) |byte| {
-            const codepoint = byteToUnicodeCodepoint(byte);
-            var utf8_buf: [4]u8 = undefined;
-            const encoded_len = utf8EncodeU32(codepoint, &utf8_buf);
-            try encoded_bytes.appendSlice(Allocator, utf8_buf[0..encoded_len]);
+            const cp = byteToUnicodeCodepoint(byte);
+            encoded_len += if (cp < 0x80) @as(usize, 1) else if (cp < 0x800) @as(usize, 2) else @as(usize, 3);
         }
 
-        log.trace("tokenizer", "Byte-level result", .{ .output_len = encoded_bytes.items.len }, @src());
-
-        const new_token = try arena_alloc.alloc(u8, encoded_bytes.items.len + 1);
-        @memcpy(new_token[0..encoded_bytes.items.len], encoded_bytes.items);
-        new_token[encoded_bytes.items.len] = 0;
+        const new_token = try arena_alloc.alloc(u8, encoded_len + 1);
+        var pos: usize = 0;
+        for (token_bytes) |byte| {
+            var utf8_buf: [4]u8 = undefined;
+            const len = utf8EncodeU32(byteToUnicodeCodepoint(byte), &utf8_buf);
+            @memcpy(new_token[pos..][0..len], utf8_buf[0..len]);
+            pos += len;
+        }
+        new_token[encoded_len] = 0;
         // Old token data stays in arena; freed when arena is deinited
         token_ptr.ptr = new_token.ptr;
-        token_ptr.len = encoded_bytes.items.len;
+        token_ptr.len = encoded_len;
     }
 }
 

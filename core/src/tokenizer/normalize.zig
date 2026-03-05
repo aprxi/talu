@@ -154,6 +154,30 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
     }
     defer if (nfkd_bytes) |owned| Allocator.free(owned);
 
+    // Fast path: when no per-codepoint transforms are enabled, skip utf8proc
+    // iteration entirely. Just copy text and build position map directly.
+    const is_passthrough = normalizer.clean_text == 0 and
+        normalizer.handle_chinese_chars == 0 and
+        normalizer.lowercase == 0 and
+        normalizer.strip_accents == 0 and
+        normalizer.strip_left == 0 and
+        normalizer.strip_right == 0;
+
+    if (is_passthrough) {
+        const text_copy = try Allocator.alloc(u8, normalized_bytes.len);
+        errdefer Allocator.free(text_copy);
+        const map_copy = try Allocator.alloc(i32, normalized_bytes.len);
+        @memcpy(text_copy, normalized_bytes);
+        if (sentencepiece.map) |sp_map| {
+            const copy_len = @min(sp_map.len, normalized_bytes.len);
+            @memcpy(map_copy[0..copy_len], sp_map[0..copy_len]);
+            for (copy_len..normalized_bytes.len) |i| map_copy[i] = @intCast(i);
+        } else {
+            for (0..normalized_bytes.len) |i| map_copy[i] = @intCast(i);
+        }
+        return Normalized{ .text = text_copy, .map = map_copy };
+    }
+
     const normalized_capacity = normalized_bytes.len * 4 + 8;
     var normalized_buf = try Allocator.alloc(u8, normalized_capacity);
     var position_map = Allocator.alloc(i32, normalized_capacity) catch {

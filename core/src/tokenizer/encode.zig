@@ -50,6 +50,12 @@ fn matches_added_token_boundaries(added_token: *const ct.AddedToken, input_bytes
 }
 
 fn collect_added_spans(tokenizer: *ct.Tokenizer, normalized: []const u8, normalized_map: []const i32, original_input: []const u8) ?std.ArrayListUnmanaged(AddedSpan) {
+    // Fast path: no added tokens → no spans possible.
+    // Skips the O(normalized.len × n_added) byte-by-byte walk.
+    if (tokenizer.added == null) {
+        return std.ArrayListUnmanaged(AddedSpan){};
+    }
+
     var spans = std.ArrayListUnmanaged(AddedSpan){};
 
     log.trace("tokenizer", "collect_added_spans", .{
@@ -467,6 +473,11 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
     // Step 3: Encode segments
     var accum = EncodeAccum{};
     errdefer accum.deinit();
+
+    // Pre-allocate: ~4 bytes per token is typical for BPE
+    const estimated_tokens = normalized.text.len / 4;
+    try accum.ids.ensureTotalCapacity(Allocator, estimated_tokens);
+    try accum.special.ensureTotalCapacity(Allocator, estimated_tokens);
 
     var cursor: usize = 0;
     var span_index: usize = 0;

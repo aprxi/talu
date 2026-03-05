@@ -84,6 +84,11 @@ pub const BpeModel = struct {
     // Used when a character can't be found in vocab (e.g., control chars like \n)
     byte_fallback_ids: [256]i32,
 
+    // Direct lookup table for single-byte vocab tokens.
+    // byte_vocab_ids[b] = vocab ID for the 1-byte token {b}, or -1 if not in vocab.
+    // Avoids hash lookup in symbol init for the 95%+ of chars that are single-byte.
+    byte_vocab_ids: [256]i32,
+
     // Config
     unk_token: [16]u8,
     unk_id: i32,
@@ -150,6 +155,7 @@ fn create(allocator: std.mem.Allocator, json_buffer: []const u8, json_owned: boo
         .byte_to_unicode = undefined,
         .unicode_to_byte = [_]i32{-1} ** 65536,
         .byte_fallback_ids = [_]i32{-1} ** 256,
+        .byte_vocab_ids = [_]i32{-1} ** 256,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,
@@ -300,6 +306,9 @@ fn parseVocabAndMerges(model: *BpeModel) !void {
 
     // Build byte fallback table for SentencePiece (looks for <0xNN> tokens)
     initByteFallback(model);
+
+    // Build direct byte lookup table for single-byte vocab tokens
+    initByteVocabIds(model);
 
     // Parse merges if present (SentencePiece/Unigram models don't have merges)
     if (merges_start) |m_start| {
@@ -527,6 +536,17 @@ fn initByteFallback(model: *BpeModel) void {
     log.trace("tokenizer", "Byte fallback init", .{ .found_count = found_count, .vocab_size = model.vocab_hash.count() }, @src());
 }
 
+/// Build direct byte→vocab-ID lookup for single-byte tokens.
+/// Avoids hash lookup in symbol init for the common case (ASCII).
+fn initByteVocabIds(model: *BpeModel) void {
+    for (0..256) |byte_val| {
+        const single = [1]u8{@intCast(byte_val)};
+        if (model.vocab_hash.get(&single)) |id| {
+            model.byte_vocab_ids[byte_val] = id;
+        }
+    }
+}
+
 fn initByteMap(model: *BpeModel) !void {
     var byte_values = [_]i32{0} ** 512;
     var codepoints = [_]i32{0} ** 512;
@@ -667,7 +687,10 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
             const char_len = utf8CharLen(word[byte_idx]);
             if (byte_idx + char_len > word.len) return error.InvalidUtf8;
 
-            const id: i32 = model.vocab_hash.get(word[byte_idx .. byte_idx + char_len]) orelse -1;
+            const id: i32 = if (char_len == 1)
+                model.byte_vocab_ids[word[byte_idx]]
+            else
+                model.vocab_hash.get(word[byte_idx .. byte_idx + char_len]) orelse -1;
 
             syms[n_syms] = .{
                 .id = id,
@@ -699,6 +722,37 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
         return;
     }
 
+    // Fast path: two-symbol words need at most one merge lookup.
+    // Skips pair cache setup (pos_to_cache zeroing, Phase 1/2 loops).
+    if (n_syms == 2) {
+        const s0 = &syms[0];
+        const s1 = &syms[1];
+        if (s0.id >= 0 and s1.id >= 0) {
+            if (model.pair_merges.get(.{ .left = s0.id, .right = s1.id })) |info| {
+                try out_ids.append(allocator, info.new_id);
+            } else {
+                try out_ids.ensureUnusedCapacity(allocator, 2);
+                out_ids.appendAssumeCapacity(s0.id);
+                out_ids.appendAssumeCapacity(s1.id);
+            }
+        } else {
+            for ([2]*const Symbol{ s0, s1 }) |sym| {
+                if (sym.id >= 0) {
+                    try out_ids.append(allocator, sym.id);
+                } else if (!is_byte_level) {
+                    const token_bytes = word[sym.start .. sym.start + sym.len];
+                    for (token_bytes) |byte_val| {
+                        const fallback_id = model.byte_fallback_ids[byte_val];
+                        try out_ids.append(allocator, if (fallback_id >= 0) fallback_id else model.unk_id);
+                    }
+                } else {
+                    try out_ids.append(allocator, model.unk_id);
+                }
+            }
+        }
+        return;
+    }
+
     // 2. Merge loop: cached-pair approach.
     //    Phase 1 builds a cache of all valid merge pairs (one full scan).
     //    Phase 2 repeatedly picks the lowest-rank pair from the cache,
@@ -709,6 +763,8 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
         const CachedPair = struct { pos: i32, rank: i32, new_id: i32 };
         var pair_cache: [MAX_WORD_SYMBOLS]CachedPair = undefined;
         var n_cached: usize = 0;
+        // Position-to-cache-index tracking for O(1) stale entry removal.
+        var pos_to_cache: [MAX_WORD_SYMBOLS]i16 = [_]i16{-1} ** MAX_WORD_SYMBOLS;
 
         // Phase 1: Build pair cache (single scan, one hash lookup per pair)
         {
@@ -719,6 +775,7 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
                     const right_sym = &syms[@intCast(sym.next)];
                     if (right_sym.id >= 0) {
                         if (model.pair_merges.get(.{ .left = sym.id, .right = right_sym.id })) |info| {
+                            pos_to_cache[@intCast(si)] = @intCast(n_cached);
                             pair_cache[n_cached] = .{ .pos = si, .rank = info.rank, .new_id = info.new_id };
                             n_cached += 1;
                         }
@@ -743,9 +800,13 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
             }
             const best = pair_cache[best_idx];
 
-            // Swap-remove best entry from cache
+            // Swap-remove best entry from cache; update index for moved entry
             n_cached -= 1;
-            if (best_idx < n_cached) pair_cache[best_idx] = pair_cache[n_cached];
+            if (best_idx < n_cached) {
+                pair_cache[best_idx] = pair_cache[n_cached];
+                pos_to_cache[@intCast(pair_cache[best_idx].pos)] = @intCast(best_idx);
+            }
+            pos_to_cache[@intCast(best.pos)] = -1;
 
             // Validate: symbols may have been invalidated by an earlier merge
             const left = &syms[@intCast(best.pos)];
@@ -763,18 +824,21 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
             }
             right.id = -2;
 
-            // Remove stale cache entries and add new neighbor pairs.
+            // Remove stale cache entries via position index (O(1) per entry).
             // After merging at pos P (right R removed):
             //   - Entry at pos==R is invalid (R is dead)
             //   - Entry at pos==P.prev is stale (P's id changed)
-            {
-                var ci: usize = 0;
-                while (ci < n_cached) {
-                    if (pair_cache[ci].pos == right_idx or pair_cache[ci].pos == left.prev) {
+            for ([_]i32{ right_idx, left.prev }) |stale_pos| {
+                if (stale_pos >= 0) {
+                    const ci = pos_to_cache[@intCast(stale_pos)];
+                    if (ci >= 0 and @as(usize, @intCast(ci)) < n_cached) {
+                        const cui: usize = @intCast(ci);
                         n_cached -= 1;
-                        if (ci < n_cached) pair_cache[ci] = pair_cache[n_cached];
-                    } else {
-                        ci += 1;
+                        if (cui < n_cached) {
+                            pair_cache[cui] = pair_cache[n_cached];
+                            pos_to_cache[@intCast(pair_cache[cui].pos)] = ci;
+                        }
+                        pos_to_cache[@intCast(stale_pos)] = -1;
                     }
                 }
             }
@@ -784,6 +848,7 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
                 const ln = &syms[@intCast(left.prev)];
                 if (ln.id >= 0) {
                     if (model.pair_merges.get(.{ .left = ln.id, .right = left.id })) |info| {
+                        pos_to_cache[@intCast(left.prev)] = @intCast(n_cached);
                         pair_cache[n_cached] = .{ .pos = left.prev, .rank = info.rank, .new_id = info.new_id };
                         n_cached += 1;
                     }
@@ -794,6 +859,7 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
                 const rn = &syms[@intCast(left.next)];
                 if (rn.id >= 0) {
                     if (model.pair_merges.get(.{ .left = left.id, .right = rn.id })) |info| {
+                        pos_to_cache[@intCast(best.pos)] = @intCast(n_cached);
                         pair_cache[n_cached] = .{ .pos = best.pos, .rank = info.rank, .new_id = info.new_id };
                         n_cached += 1;
                     }
@@ -1244,6 +1310,7 @@ fn createFromSpec(allocator: std.mem.Allocator, spec: *const ct.BpeModelSpec) !*
         .byte_to_unicode = undefined,
         .unicode_to_byte = [_]i32{-1} ** 65536,
         .byte_fallback_ids = [_]i32{-1} ** 256,
+        .byte_vocab_ids = [_]i32{-1} ** 256,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,
@@ -1275,6 +1342,9 @@ fn createFromSpec(allocator: std.mem.Allocator, spec: *const ct.BpeModelSpec) !*
 
     // Build byte fallback table for SentencePiece (looks for <0xNN> tokens)
     initByteFallback(model);
+
+    // Build direct byte lookup table for single-byte vocab tokens
+    initByteVocabIds(model);
 
     // Build merges
     const merge_buffer = try allocator.alloc(u8, 8 * 1024 * 1024);
@@ -1693,6 +1763,7 @@ test "tokenizer_bpe_create_from_spec: initByteMap creates valid mappings" {
         .byte_to_unicode = undefined,
         .unicode_to_byte = [_]i32{-1} ** 65536,
         .byte_fallback_ids = [_]i32{-1} ** 256,
+        .byte_vocab_ids = [_]i32{-1} ** 256,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,
@@ -1771,6 +1842,7 @@ test "tokenizer_bpe_create_from_spec: initByteMap handles control characters wit
         .byte_to_unicode = undefined,
         .unicode_to_byte = [_]i32{-1} ** 65536,
         .byte_fallback_ids = [_]i32{-1} ** 256,
+        .byte_vocab_ids = [_]i32{-1} ** 256,
         .unk_token = undefined,
         .unk_id = 0,
         .bos_id = -1,

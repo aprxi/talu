@@ -148,7 +148,11 @@ fn initSymbols(model: *bpe_mod.BpeModel, word: []const u8, syms: *[BENCH_MAX_SYM
         if (n_syms >= BENCH_MAX_SYMS) break;
         const char_len = std.unicode.utf8ByteSequenceLength(word[byte_idx]) catch 1;
         const end = @min(byte_idx + char_len, word.len);
-        const id = model.vocab_hash.get(word[byte_idx..end]) orelse -1;
+        const char_len_local = end - byte_idx;
+        const id = if (char_len_local == 1)
+            model.byte_vocab_ids[word[byte_idx]]
+        else
+            model.vocab_hash.get(word[byte_idx..end]) orelse -1;
         syms[n_syms] = .{
             .id = id,
             .start = @intCast(byte_idx),
