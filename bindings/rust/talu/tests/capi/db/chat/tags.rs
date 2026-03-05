@@ -1,4 +1,4 @@
-//! C API tests for talu_db_table_session_list tag filtering.
+//! C API tests for talu_db_session_list tag filtering.
 //!
 //! Tests the tags_filter and tags_filter_any parameters added to the C API.
 
@@ -49,7 +49,7 @@ fn seed_session_with_tags(ctx: &TestContext, session_id: &str, title: &str, tags
 
         // Create tag (ignore error if already exists).
         unsafe {
-            talu_sys::talu_db_table_tag_create(
+            talu_sys::talu_db_tag_create(
                 c_db_path.as_ptr(),
                 c_tag_id.as_ptr(),
                 c_name.as_ptr(),
@@ -61,7 +61,7 @@ fn seed_session_with_tags(ctx: &TestContext, session_id: &str, title: &str, tags
 
         // Associate tag with session.
         let rc = unsafe {
-            talu_sys::talu_db_table_session_add_tag(
+            talu_sys::talu_db_session_add_tag(
                 c_db_path.as_ptr(),
                 c_session_id.as_ptr(),
                 c_tag_id.as_ptr(),
@@ -84,7 +84,7 @@ fn list_sessions_with_tags(
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_db_table_session_list(
+        talu_sys::talu_db_session_list(
             c_db_path.as_ptr(),
             0,           // no limit
             0,           // no cursor
@@ -101,7 +101,7 @@ fn list_sessions_with_tags(
         )
     };
 
-    assert_eq!(result, 0, "talu_db_table_session_list failed");
+    assert_eq!(result, 0, "talu_db_session_list failed");
 
     let mut ids = Vec::new();
     if !c_list.is_null() {
@@ -117,7 +117,7 @@ fn list_sessions_with_tags(
                 }
             }
         }
-        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
+        unsafe { talu_sys::talu_db_session_free_list(c_list) };
     }
 
     ids
@@ -262,7 +262,7 @@ fn capi_null_filters_return_all() {
 // ---------------------------------------------------------------------------
 
 /// Stress test for list_tags and get_session_tags.
-/// Exercises talu_db_table_tag_free_list and talu_db_table_free_relation_string_list
+/// Exercises talu_db_tag_free_list and talu_db_blob_free_string_list
 /// through many alloc/free cycles to detect memory corruption.
 /// This is a regression test for the fix where these free functions
 /// were incorrectly taking struct by value instead of pointer.
@@ -305,7 +305,7 @@ fn capi_tags_stress_alloc_free() {
 
     // Rapid list_tags/get_session_tags cycles
     for iteration in 0..100 {
-        // list_tags exercises talu_db_table_tag_free_list
+        // list_tags exercises talu_db_tag_free_list
         let tags = storage.list_tags(None).expect("list_tags failed");
         assert!(
             !tags.is_empty(),
@@ -313,7 +313,7 @@ fn capi_tags_stress_alloc_free() {
             iteration
         );
 
-        // get_session_tags exercises talu_db_table_free_relation_string_list
+        // get_session_tags exercises talu_db_blob_free_string_list
         let conv_tags = storage
             .get_session_tags("stress-sess-0")
             .expect("get_session_tags failed");
@@ -323,7 +323,7 @@ fn capi_tags_stress_alloc_free() {
             iteration
         );
 
-        // get_tag_sessions also exercises talu_db_table_free_relation_string_list
+        // get_tag_sessions also exercises talu_db_blob_free_string_list
         let sessions = storage
             .get_tag_sessions("rust")
             .expect("get_tag_sessions failed");

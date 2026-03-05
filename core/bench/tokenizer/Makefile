@@ -7,6 +7,7 @@ ITERS ?= 10
 FORMAT ?= table
 
 .PHONY: help encode_1k encode_100k encode_1m load all quick \
+        normalize_1m pretok_1m bpe_1m bpe_merge_1m bpe_vocab_1m bpe_alloc_1m \
         encode_1k-csv encode_100k-csv encode_1m-csv load-csv all-csv \
         encode_1k-table encode_100k-table encode_1m-table load-table all-table
 
@@ -74,6 +75,72 @@ all:
 	@cd "$(ROOT_DIR)" && \
 	zig build bench-tokenizer -Drelease -- \
 		--scenario all \
+		--tokenizer "$(TOK)" \
+		--profile "$(PROFILE)" \
+		--format "$(FORMAT)" \
+		--warmup "$(WARMUP)" \
+		--iters "$(ITERS)"
+
+normalize_1m:
+	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
+	@cd "$(ROOT_DIR)" && \
+	zig build bench-tokenizer -Drelease -- \
+		--scenario normalize_1m \
+		--tokenizer "$(TOK)" \
+		--profile "$(PROFILE)" \
+		--format "$(FORMAT)" \
+		--warmup "$(WARMUP)" \
+		--iters "$(ITERS)"
+
+pretok_1m:
+	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
+	@cd "$(ROOT_DIR)" && \
+	zig build bench-tokenizer -Drelease -- \
+		--scenario pretok_1m \
+		--tokenizer "$(TOK)" \
+		--profile "$(PROFILE)" \
+		--format "$(FORMAT)" \
+		--warmup "$(WARMUP)" \
+		--iters "$(ITERS)"
+
+bpe_1m:
+	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
+	@cd "$(ROOT_DIR)" && \
+	zig build bench-tokenizer -Drelease -- \
+		--scenario bpe_1m \
+		--tokenizer "$(TOK)" \
+		--profile "$(PROFILE)" \
+		--format "$(FORMAT)" \
+		--warmup "$(WARMUP)" \
+		--iters "$(ITERS)"
+
+bpe_merge_1m:
+	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
+	@cd "$(ROOT_DIR)" && \
+	zig build bench-tokenizer -Drelease -- \
+		--scenario bpe_merge_1m \
+		--tokenizer "$(TOK)" \
+		--profile "$(PROFILE)" \
+		--format "$(FORMAT)" \
+		--warmup "$(WARMUP)" \
+		--iters "$(ITERS)"
+
+bpe_vocab_1m:
+	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
+	@cd "$(ROOT_DIR)" && \
+	zig build bench-tokenizer -Drelease -- \
+		--scenario bpe_vocab_1m \
+		--tokenizer "$(TOK)" \
+		--profile "$(PROFILE)" \
+		--format "$(FORMAT)" \
+		--warmup "$(WARMUP)" \
+		--iters "$(ITERS)"
+
+bpe_alloc_1m:
+	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
+	@cd "$(ROOT_DIR)" && \
+	zig build bench-tokenizer -Drelease -- \
+		--scenario bpe_alloc_1m \
 		--tokenizer "$(TOK)" \
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \

@@ -629,7 +629,7 @@ impl Default for ConvertOptions {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TokenizeResult {
-    pub tokens: *const *const c_char,
+    pub tokens: *mut *mut c_char,
     pub num_tokens: usize,
     pub error_msg: *const c_char,
 }
@@ -637,7 +637,7 @@ pub struct TokenizeResult {
 impl Default for TokenizeResult {
     fn default() -> Self {
         Self {
-            tokens: std::ptr::null(),
+            tokens: std::ptr::null_mut(),
             num_tokens: 0,
             error_msg: std::ptr::null(),
         }
@@ -1887,7 +1887,7 @@ impl Default for CColumnFilter {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct DecodeResult {
-    pub text: *const u8,
+    pub text: *mut u8,
     pub text_len: usize,
     pub error_msg: *const c_char,
 }
@@ -1895,7 +1895,7 @@ pub struct DecodeResult {
 impl Default for DecodeResult {
     fn default() -> Self {
         Self {
-            text: std::ptr::null(),
+            text: std::ptr::null_mut(),
             text_len: 0,
             error_msg: std::ptr::null(),
         }
@@ -2233,7 +2233,7 @@ impl Default for CSessionList {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TokenizeBytesResult {
-    pub data: *const u8,
+    pub data: *mut u8,
     pub data_len: usize,
     pub offsets: *mut usize,
     pub num_tokens: usize,
@@ -2243,7 +2243,7 @@ pub struct TokenizeBytesResult {
 impl Default for TokenizeBytesResult {
     fn default() -> Self {
         Self {
-            data: std::ptr::null(),
+            data: std::ptr::null_mut(),
             data_len: 0,
             offsets: std::ptr::null_mut(),
             num_tokens: 0,
@@ -3219,7 +3219,7 @@ impl Default for CRemoteModelInfo {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct VocabResult {
-    pub tokens: *const *const c_char,
+    pub tokens: *mut *mut c_char,
     pub lengths: *mut u32,
     pub num_entries: usize,
     pub ids: *mut u32,
@@ -3229,7 +3229,7 @@ pub struct VocabResult {
 impl Default for VocabResult {
     fn default() -> Self {
         Self {
-            tokens: std::ptr::null(),
+            tokens: std::ptr::null_mut(),
             lengths: std::ptr::null_mut(),
             num_entries: 0,
             ids: std::ptr::null_mut(),
@@ -5758,7 +5758,7 @@ extern "C" {
         num_tokens: usize,
     );
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenize_result_free(tokens: *const *const c_char, num_tokens: usize);
+    pub fn talu_tokenize_result_free(tokens: *mut *mut c_char, num_tokens: usize);
     // core/src/capi/tokenizer.zig
     pub fn talu_tokenizer_create(model_path: *const c_char, out_tokenizer: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
@@ -6042,7 +6042,7 @@ extern "C" {
     ) -> c_int;
     // core/src/capi/tokenizer.zig
     pub fn talu_vocab_result_free(
-        tokens: *const *const c_char,
+        tokens: *mut *mut c_char,
         lengths: *mut u32,
         ids: *mut u32,
         num_entries: usize,

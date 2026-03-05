@@ -17,8 +17,10 @@ const OutputFormat = enum {
 
 const RowMetrics = struct {
     name: []const u8,
+    p50_ms: f64,
     mbps: f64,
     mtok: f64,
+    output_tokens: u64,
 };
 
 const PeakStats = struct {
@@ -60,6 +62,12 @@ fn parseScenario(value: []const u8) !scenarios.Scenario {
     if (std.mem.eql(u8, value, "encode_100k") or std.mem.eql(u8, value, "100k")) return .encode_100k;
     if (std.mem.eql(u8, value, "encode_1m") or std.mem.eql(u8, value, "1m")) return .encode_1m;
     if (std.mem.eql(u8, value, "load_json") or std.mem.eql(u8, value, "load")) return .load_json;
+    if (std.mem.eql(u8, value, "normalize_1m") or std.mem.eql(u8, value, "norm")) return .normalize_1m;
+    if (std.mem.eql(u8, value, "pretok_1m") or std.mem.eql(u8, value, "pretok")) return .pretok_1m;
+    if (std.mem.eql(u8, value, "bpe_1m") or std.mem.eql(u8, value, "bpe")) return .bpe_1m;
+    if (std.mem.eql(u8, value, "bpe_merge_1m") or std.mem.eql(u8, value, "bpe_merge")) return .bpe_merge_1m;
+    if (std.mem.eql(u8, value, "bpe_vocab_1m") or std.mem.eql(u8, value, "bpe_vocab")) return .bpe_vocab_1m;
+    if (std.mem.eql(u8, value, "bpe_alloc_1m") or std.mem.eql(u8, value, "bpe_alloc")) return .bpe_alloc_1m;
     return error.InvalidArgument;
 }
 
@@ -80,7 +88,7 @@ fn printUsage(writer: anytype) !void {
         \\  zig build bench-tokenizer -Drelease -- [options]
         \\
         \\Options:
-        \\  --scenario <all|1k|100k|1m|load>     default: all
+        \\  --scenario <all|1k|100k|1m|load|norm|pretok|bpe|bpe_merge|bpe_vocab|bpe_alloc>  default: all
         \\  --tokenizer <path/to/tokenizer.json>  required
         \\  --profile <ci|bw>                     default: bw
         \\  --format <table|csv|tsv>              default: table
@@ -255,6 +263,12 @@ fn runScenario(
         .encode_100k => try scenarios.runEncode100k(allocator, cfg),
         .encode_1m => try scenarios.runEncode1m(allocator, cfg),
         .load_json => try scenarios.runLoadJson(allocator, cfg),
+        .normalize_1m => try scenarios.runNormalize1m(allocator, cfg),
+        .pretok_1m => try scenarios.runPretok1m(allocator, cfg),
+        .bpe_1m => try scenarios.runBpe1m(allocator, cfg),
+        .bpe_merge_1m => try scenarios.runBpeMerge1m(allocator, cfg),
+        .bpe_vocab_1m => try scenarios.runBpeVocab1m(allocator, cfg),
+        .bpe_alloc_1m => try scenarios.runBpeAlloc1m(allocator, cfg),
         .all => return error.InvalidArgument,
     };
 }
@@ -296,8 +310,10 @@ fn runOne(
     const cold_ms = coldGapMs(cold_total_p50_ns, summary.p50_ns);
     const row = RowMetrics{
         .name = result.name,
+        .p50_ms = @as(f64, @floatFromInt(summary.p50_ns)) / 1_000_000.0,
         .mbps = metrics.mbps(result.input_bytes, summary.p50_ns),
         .mtok = metrics.mtok_per_sec(result.output_tokens, summary.p50_ns),
+        .output_tokens = result.output_tokens,
     };
     switch (format) {
         .table => try printResultTable(writer, cfg, &result, summary, cold_ms),
@@ -358,11 +374,45 @@ pub fn main() !void {
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .encode_100k));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .encode_1m));
             _ = try runOne(stdout, allocator, cfg.run, cfg.format, .load_json);
+            const r_norm = try runOne(stdout, allocator, cfg.run, cfg.format, .normalize_1m);
+            const r_pretok = try runOne(stdout, allocator, cfg.run, cfg.format, .pretok_1m);
+            const r_bpe = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_1m);
+            const r_merge = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_merge_1m);
+            const r_vocab = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_vocab_1m);
+            const r_alloc = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_alloc_1m);
+
+            if (cfg.format == .table) {
+                const word_count = r_pretok.output_tokens;
+                const token_count = r_bpe.output_tokens;
+                const merge_count = r_merge.output_tokens;
+                const char_count = r_vocab.output_tokens;
+                const alloc_gap = r_bpe.p50_ms - r_merge.p50_ms;
+                const merge_only = r_merge.p50_ms - r_vocab.p50_ms;
+                const tok_per_word = if (word_count > 0) @as(f64, @floatFromInt(token_count)) / @as(f64, @floatFromInt(word_count)) else 0.0;
+                const merges_per_word = if (word_count > 0) @as(f64, @floatFromInt(merge_count)) / @as(f64, @floatFromInt(word_count)) else 0.0;
+                const chars_per_word = if (word_count > 0) @as(f64, @floatFromInt(char_count)) / @as(f64, @floatFromInt(word_count)) else 0.0;
+
+                try stdout.writeAll("\nPipeline breakdown (1 MB input):\n");
+                try stdout.print("  normalize:       {d: >7.2} ms\n", .{r_norm.p50_ms});
+                try stdout.print("  pretokenize:     {d: >7.2} ms  ({} words)\n", .{ r_pretok.p50_ms, word_count });
+                try stdout.print("  bpe total:       {d: >7.2} ms  ({} tokens, {d:.1} tok/word)\n", .{ r_bpe.p50_ms, token_count, tok_per_word });
+                try stdout.writeAll("\n  BPE phase detail:\n");
+                try stdout.print("    vocab lookups: {d: >7.2} ms  ({} chars, {d:.1} chars/word)\n", .{ r_vocab.p50_ms, char_count, chars_per_word });
+                try stdout.print("    merge loop:    {d: >7.2} ms  ({} merges, {d:.1} merges/word)\n", .{ merge_only, merge_count, merges_per_word });
+                try stdout.print("    result alloc:  {d: >7.2} ms  (~{} alloc+free cycles)\n", .{ alloc_gap, token_count * 2 });
+                try stdout.print("    alloc baseline:{d: >7.2} ms  (1 dupeZ+free per word)\n", .{r_alloc.p50_ms});
+            }
         },
         .encode_1k => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .encode_1k)),
         .encode_100k => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .encode_100k)),
         .encode_1m => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .encode_1m)),
         .load_json => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .load_json),
+        .normalize_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .normalize_1m),
+        .pretok_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .pretok_1m),
+        .bpe_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_1m),
+        .bpe_merge_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_merge_1m),
+        .bpe_vocab_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_vocab_1m),
+        .bpe_alloc_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_alloc_1m),
     }
 
     if (cfg.format == .table) {
@@ -382,5 +432,11 @@ test "parseScenario accepts short and full names" {
     try std.testing.expectEqual(scenarios.Scenario.encode_100k, try parseScenario("100k"));
     try std.testing.expectEqual(scenarios.Scenario.encode_1m, try parseScenario("1m"));
     try std.testing.expectEqual(scenarios.Scenario.load_json, try parseScenario("load"));
+    try std.testing.expectEqual(scenarios.Scenario.normalize_1m, try parseScenario("norm"));
+    try std.testing.expectEqual(scenarios.Scenario.pretok_1m, try parseScenario("pretok"));
+    try std.testing.expectEqual(scenarios.Scenario.bpe_1m, try parseScenario("bpe"));
+    try std.testing.expectEqual(scenarios.Scenario.bpe_merge_1m, try parseScenario("bpe_merge"));
+    try std.testing.expectEqual(scenarios.Scenario.bpe_vocab_1m, try parseScenario("bpe_vocab"));
+    try std.testing.expectEqual(scenarios.Scenario.bpe_alloc_1m, try parseScenario("bpe_alloc"));
     try std.testing.expectEqual(scenarios.Scenario.all, try parseScenario("all"));
 }

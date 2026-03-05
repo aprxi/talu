@@ -224,31 +224,31 @@ fn token_to_id_null_handle_returns_error() {
 /// Freeing null tokens is a no-op.
 #[test]
 fn tokens_free_null_is_noop() {
-    unsafe { talu_sys::talu_tokens_free(ptr::null(), 0) };
+    unsafe { talu_sys::talu_tokens_free(ptr::null_mut(), 0) };
 }
 
 /// Freeing null decode result is a no-op.
 #[test]
 fn decode_result_free_null_is_noop() {
-    unsafe { talu_sys::talu_decode_result_free(ptr::null(), 0) };
+    unsafe { talu_sys::talu_decode_result_free(ptr::null_mut(), 0) };
 }
 
 /// Freeing null tokenize result is a no-op.
 #[test]
 fn tokenize_result_free_null_is_noop() {
-    unsafe { talu_sys::talu_tokenize_result_free(ptr::null(), 0) };
+    unsafe { talu_sys::talu_tokenize_result_free(ptr::null_mut(), 0) };
 }
 
 /// Freeing null tokenize bytes result is a no-op.
 #[test]
 fn tokenize_bytes_result_free_null_is_noop() {
-    unsafe { talu_sys::talu_tokenize_bytes_result_free(ptr::null(), 0, ptr::null(), 0) };
+    unsafe { talu_sys::talu_tokenize_bytes_result_free(ptr::null_mut(), 0, ptr::null_mut(), 0) };
 }
 
 /// Freeing null batch encode result is a no-op.
 #[test]
 fn batch_encode_result_free_null_is_noop() {
-    unsafe { talu_sys::talu_batch_encode_result_free(ptr::null(), ptr::null(), 0, 0) };
+    unsafe { talu_sys::talu_batch_encode_result_free(ptr::null_mut(), ptr::null_mut(), 0, 0) };
 }
 
 /// Freeing zeroed encode result is a no-op.
@@ -261,11 +261,11 @@ fn encode_result_free_zeroed_is_noop() {
 /// Freeing null padded tensor result is a no-op.
 #[test]
 fn padded_tensor_result_free_null_is_noop() {
-    unsafe { talu_sys::talu_padded_tensor_result_free(ptr::null(), ptr::null(), 0, 0) };
+    unsafe { talu_sys::talu_padded_tensor_result_free(ptr::null_mut(), ptr::null_mut(), 0, 0) };
 }
 
 /// Freeing null vocab result is a no-op.
 #[test]
 fn vocab_result_free_null_is_noop() {
-    unsafe { talu_sys::talu_vocab_result_free(ptr::null(), ptr::null(), ptr::null(), 0) };
+    unsafe { talu_sys::talu_vocab_result_free(ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0) };
 }

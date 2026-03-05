@@ -23,7 +23,7 @@ fn null_db_path_returns_error() {
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_db_table_session_list(
+        talu_sys::talu_db_session_list(
             ptr::null(), // null db_path
             0,
             0,
@@ -49,7 +49,7 @@ fn null_output_returns_error() {
     let c_db_path = CString::new(ctx.db_path()).expect("db_path cstr");
 
     let result = unsafe {
-        talu_sys::talu_db_table_session_list(
+        talu_sys::talu_db_session_list(
             c_db_path.as_ptr(),
             0,
             0,
@@ -73,7 +73,7 @@ fn null_output_returns_error() {
 fn free_null_session_list_is_noop() {
     // Should not crash
     unsafe {
-        talu_sys::talu_db_table_session_free_list(ptr::null_mut());
+        talu_sys::talu_db_session_free_list(ptr::null_mut());
     }
 }
 
@@ -101,7 +101,7 @@ fn double_free_session_list_does_not_crash() {
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_db_table_session_list(
+        talu_sys::talu_db_session_list(
             c_db_path.as_ptr(),
             0,
             0,
@@ -119,7 +119,7 @@ fn double_free_session_list_does_not_crash() {
 
     if !c_list.is_null() {
         // First free - normal
-        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
+        unsafe { talu_sys::talu_db_session_free_list(c_list) };
 
         // Note: We don't actually do a second free here because it would be UB.
         // This test documents that the first free should work correctly.
@@ -218,7 +218,7 @@ fn very_long_search_query_handled_safely() {
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_db_table_session_list(
+        talu_sys::talu_db_session_list(
             c_db_path.as_ptr(),
             0,
             0,
@@ -235,7 +235,7 @@ fn very_long_search_query_handled_safely() {
 
     // Should either succeed with 0 results or return error, not crash
     if result == 0 && !c_list.is_null() {
-        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
+        unsafe { talu_sys::talu_db_session_free_list(c_list) };
         eprintln!("Long search query accepted");
     } else {
         eprintln!("Long search query returned code: {}", result);
@@ -271,7 +271,7 @@ fn nonexistent_db_path_returns_error() {
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_db_table_session_list(
+        talu_sys::talu_db_session_list(
             c_db_path.as_ptr(),
             0,
             0,
@@ -291,7 +291,7 @@ fn nonexistent_db_path_returns_error() {
         if !c_list.is_null() {
             let list = unsafe { &*c_list };
             eprintln!("Non-existent path returned {} sessions", list.count);
-            unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
+            unsafe { talu_sys::talu_db_session_free_list(c_list) };
         }
     } else {
         eprintln!("Non-existent path returned error code: {}", result);
@@ -337,7 +337,7 @@ fn concurrent_operations_with_errors() {
                     let mut c_list: *mut CSessionList = ptr::null_mut();
 
                     let result = unsafe {
-                        talu_sys::talu_db_table_session_list(
+                        talu_sys::talu_db_session_list(
                             c_db_path.as_ptr(),
                             0,
                             0,
@@ -353,7 +353,7 @@ fn concurrent_operations_with_errors() {
                     };
 
                     if result == 0 && !c_list.is_null() {
-                        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
+                        unsafe { talu_sys::talu_db_session_free_list(c_list) };
                     }
                 } else if (thread_id + i) % 3 == 1 {
                     // Search with empty query
@@ -362,7 +362,7 @@ fn concurrent_operations_with_errors() {
                     let mut c_list: *mut CSessionList = ptr::null_mut();
 
                     let result = unsafe {
-                        talu_sys::talu_db_table_session_list(
+                        talu_sys::talu_db_session_list(
                             c_db_path.as_ptr(),
                             0,
                             0,
@@ -378,7 +378,7 @@ fn concurrent_operations_with_errors() {
                     };
 
                     if result == 0 && !c_list.is_null() {
-                        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
+                        unsafe { talu_sys::talu_db_session_free_list(c_list) };
                     }
                 } else {
                     // Search with no-match query
@@ -387,7 +387,7 @@ fn concurrent_operations_with_errors() {
                     let mut c_list: *mut CSessionList = ptr::null_mut();
 
                     let result = unsafe {
-                        talu_sys::talu_db_table_session_list(
+                        talu_sys::talu_db_session_list(
                             c_db_path.as_ptr(),
                             0,
                             0,
@@ -403,7 +403,7 @@ fn concurrent_operations_with_errors() {
                     };
 
                     if result == 0 && !c_list.is_null() {
-                        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
+                        unsafe { talu_sys::talu_db_session_free_list(c_list) };
                     }
                 }
             }
@@ -423,7 +423,7 @@ fn concurrent_operations_with_errors() {
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_db_table_session_list(
+        talu_sys::talu_db_session_list(
             c_db_path.as_ptr(),
             0,
             0,
@@ -442,7 +442,7 @@ fn concurrent_operations_with_errors() {
     if !c_list.is_null() {
         let list = unsafe { &*c_list };
         assert_eq!(list.count, 1, "Should still have 1 valid session");
-        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
+        unsafe { talu_sys::talu_db_session_free_list(c_list) };
     }
 
     eprintln!(

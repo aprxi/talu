@@ -582,7 +582,12 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
 
     // Overlapping-chunk parallelism: split text, parallelize both regex + BPE,
     // deduplicate at merge using word offsets vs midpoints.
-    if (per_word_encode and segment.len >= chunk_parallel_threshold) {
+    // Skip parallelism when the segment has no whitespace: without word
+    // boundaries, the pretokenizer produces one word per chunk and the
+    // overlap-based ownership deduplication silently drops all non-first chunks.
+    if (per_word_encode and segment.len >= chunk_parallel_threshold and
+        std.mem.indexOfScalar(u8, segment, ' ') != null)
+    {
         const pool = parallel.global();
         if (pool.n_threads > 1) {
             return encodeSegmentOverlapped(tokenizer, segment, base_offset, accumulator, pool, is_sentencepiece_bpe, is_metaspace);
