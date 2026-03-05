@@ -3,6 +3,14 @@
 //! Cross-entropy loss with numerically stable log-softmax.
 
 const std = @import("std");
+const compute = @import("../compute/root.zig");
+
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
+const math_fast = @import("../compute/cpu/math_fast.zig");
+const fastExp = math_fast.fastExp;
+const fastExpScalar = math_fast.fastExpScalar;
 
 /// Compute mean cross-entropy loss over a batch.
 ///
@@ -21,21 +29,36 @@ pub fn crossEntropyLoss(
     std.debug.assert(logits.len == batch_size * vocab_size);
     std.debug.assert(targets.len == batch_size);
 
+    @setFloatMode(.optimized);
     var total_loss: f32 = 0.0;
 
     for (0..batch_size) |b| {
         const row = logits[b * vocab_size ..][0..vocab_size];
         const target = targets[b];
 
-        // log_softmax = logit[target] - log(sum(exp(logits - max)))
-        var max_val: f32 = row[0];
-        for (row[1..]) |v| {
-            if (v > max_val) max_val = v;
+        // SIMD max reduction
+        var max_vec: F32Vec = @splat(-std.math.inf(f32));
+        var i: usize = 0;
+        while (i + VEC <= vocab_size) : (i += VEC) {
+            const v: F32Vec = row[i..][0..VEC].*;
+            max_vec = @max(max_vec, v);
+        }
+        var max_val = @reduce(.Max, max_vec);
+        while (i < vocab_size) : (i += 1) {
+            max_val = @max(max_val, row[i]);
         }
 
-        var sum_exp: f32 = 0.0;
-        for (row) |v| {
-            sum_exp += @exp(v - max_val);
+        // SIMD sum-exp with fastExp
+        const max_v: F32Vec = @splat(max_val);
+        var sum_vec: F32Vec = @splat(0.0);
+        i = 0;
+        while (i + VEC <= vocab_size) : (i += VEC) {
+            const v: F32Vec = row[i..][0..VEC].*;
+            sum_vec += fastExp(v - max_v);
+        }
+        var sum_exp = @reduce(.Add, sum_vec);
+        while (i < vocab_size) : (i += 1) {
+            sum_exp += fastExpScalar(row[i] - max_val);
         }
 
         const log_sum_exp = max_val + @log(sum_exp);

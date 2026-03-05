@@ -7,6 +7,14 @@
 //! For a batch, processes each row independently.
 
 const std = @import("std");
+const compute = @import("../../compute/root.zig");
+
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
+const math_fast = @import("../../compute/cpu/math_fast.zig");
+const fastExp = math_fast.fastExp;
+const fastExpScalar = math_fast.fastExpScalar;
 
 /// Compute cross-entropy gradient in-place.
 ///
@@ -29,6 +37,7 @@ pub fn crossEntropyBackward(
     std.debug.assert(logits.len == batch_size * vocab_size);
     std.debug.assert(targets.len == batch_size);
 
+    @setFloatMode(.optimized);
     const scale = 1.0 / @as(f32, @floatFromInt(batch_size));
 
     for (0..batch_size) |b| {
@@ -37,23 +46,46 @@ pub fn crossEntropyBackward(
         const grad_row = grad_logits[offset..][0..vocab_size];
         const target = targets[b];
 
-        // Compute softmax for this row (numerically stable: subtract max first)
-        var max_val: f32 = row[0];
-        for (row[1..]) |v| {
-            if (v > max_val) max_val = v;
+        // SIMD max reduction
+        var max_vec: F32Vec = @splat(-std.math.inf(f32));
+        var i: usize = 0;
+        while (i + VEC <= vocab_size) : (i += VEC) {
+            const v: F32Vec = row[i..][0..VEC].*;
+            max_vec = @max(max_vec, v);
+        }
+        var max_val = @reduce(.Max, max_vec);
+        while (i < vocab_size) : (i += 1) {
+            max_val = @max(max_val, row[i]);
         }
 
-        var sum_exp: f32 = 0.0;
-        for (row, grad_row) |v, *g| {
-            const exp_v = @exp(v - max_val);
-            g.* = exp_v;
+        // SIMD exp + store + accumulate
+        const max_v: F32Vec = @splat(max_val);
+        var sum_vec: F32Vec = @splat(0.0);
+        i = 0;
+        while (i + VEC <= vocab_size) : (i += VEC) {
+            const v: F32Vec = row[i..][0..VEC].*;
+            const exp_v = fastExp(v - max_v);
+            grad_row[i..][0..VEC].* = exp_v;
+            sum_vec += exp_v;
+        }
+        var sum_exp = @reduce(.Add, sum_vec);
+        while (i < vocab_size) : (i += 1) {
+            const exp_v = fastExpScalar(row[i] - max_val);
+            grad_row[i] = exp_v;
             sum_exp += exp_v;
         }
 
-        // Normalize to get softmax, then subtract 1 at target index
-        const inv_sum = 1.0 / sum_exp;
-        for (grad_row) |*g| {
-            g.* *= inv_sum * scale;
+        // SIMD normalize: softmax = exp / sum * scale
+        const norm: F32Vec = @splat(1.0 / sum_exp * scale);
+        i = 0;
+        while (i + VEC <= vocab_size) : (i += VEC) {
+            var g: F32Vec = grad_row[i..][0..VEC].*;
+            g *= norm;
+            grad_row[i..][0..VEC].* = g;
+        }
+        const norm_scalar = 1.0 / sum_exp * scale;
+        while (i < vocab_size) : (i += 1) {
+            grad_row[i] *= norm_scalar;
         }
 
         // Subtract 1/batch_size at the target index

@@ -28,6 +28,10 @@ const rope_bw = @import("rope.zig");
 const embedding_bw = @import("embedding.zig");
 const attention_bw = @import("attention.zig");
 
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
+
 const MatmulScratch = compute.cpu.linalg.MatmulScratch;
 const TransformerConfig = model_config.TransformerConfig;
 const ModelWeights = model_weights_mod.ModelWeights;
@@ -273,9 +277,7 @@ fn layerBackward(
         scratch,
     );
     // Accumulate up path into grad_hidden
-    for (grad_hidden[0 .. bs * d], grad_temp) |*gh, gt| {
-        gh.* += gt;
-    }
+    simdAccum(grad_hidden[0 .. bs * d], grad_temp);
 
     // FFN RMSNorm backward:
     // Forward: normed_ffn = rmsnorm(residual_pre_ffn, ffn_norm)
@@ -295,9 +297,7 @@ fn layerBackward(
     );
 
     // Add FFN residual gradient
-    for (grad_hidden[0 .. bs * d], grad_residual_ffn) |*gh, gr| {
-        gh.* += gr;
-    }
+    simdAccum(grad_hidden[0 .. bs * d], grad_residual_ffn);
 
     // =====================================================================
     // Attention backward
@@ -340,56 +340,36 @@ fn layerBackward(
         scratch,
     );
 
-    // Attention backward (per-position, per-batch):
-    // The existing kernel processes one query position at a time.
-    // grad_q: overwritten per position, grad_k/grad_v: accumulated across positions.
-    // Layout: [grad_residual_attn: bs*d] [grad_attn_output: bs*nh*hd] [grad_q: bs*nh*hd] [grad_k: bs*nkv*hd] [grad_v: bs*nkv*hd]
+    // Attention backward (threaded batch version):
+    // Phase 1: d_scores + d_Q (threaded over batch × n_heads × seq_len)
+    // Phase 2: d_K + d_V (threaded over batch × n_kv_heads × seq_len)
+    // Layout: [grad_residual_attn: bs*d] [grad_attn_output: bs*nh*hd] [grad_q: bs*nh*hd] [grad_k: bs*nkv*hd] [grad_v: bs*nkv*hd] [d_scores: b*nh*s*s]
     const qkv_base = bs * d + bs * nh * hd;
     const grad_q = global_scratch[qkv_base .. qkv_base + bs * nh * hd];
     const grad_k = global_scratch[qkv_base + bs * nh * hd .. qkv_base + bs * nh * hd + bs * nkv * hd];
     const grad_v = global_scratch[qkv_base + bs * nh * hd + bs * nkv * hd .. qkv_base + bs * nh * hd + 2 * bs * nkv * hd];
-    @memset(grad_k, 0.0);
-    @memset(grad_v, 0.0);
+    const d_scores_base = qkv_base + bs * nh * hd + 2 * bs * nkv * hd;
+    const d_scores = global_scratch[d_scores_base .. d_scores_base + b * nh * s * s];
 
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
-    for (0..b) |bi| {
-        for (0..s) |pos| {
-            const token_idx = bi * s + pos;
-            const q_offset = token_idx * nh * hd;
-            const kv_offset = bi * s * nkv * hd; // start of this batch's K/V
-
-            // Per-position grad_q is overwritten by the kernel
-            const pos_grad_q = grad_q[q_offset..][0 .. nh * hd];
-
-            // Gather prob rows for all heads at this position.
-            // probs layout: [batch * n_heads * seq * seq]
-            // For (bi, h, pos): offset = (bi * nh + h) * s * s + pos * s
-            var prob_buf: [4096]f32 = undefined;
-            const prob_slice = prob_buf[0 .. nh * s];
-            for (0..nh) |h| {
-                const src_offset = (bi * nh + h) * s * s + pos * s;
-                const dst_offset = h * s;
-                @memcpy(prob_slice[dst_offset..][0..s], la.attn_probs[src_offset..][0..s]);
-            }
-
-            attention_bw.attentionBackward(
-                pos_grad_q,
-                grad_k[kv_offset..][0 .. s * nkv * hd],
-                grad_v[kv_offset..][0 .. s * nkv * hd],
-                grad_attn_output[q_offset..][0 .. nh * hd],
-                la.q[q_offset..][0 .. nh * hd],
-                la.k[kv_offset..][0 .. s * nkv * hd],
-                la.v[kv_offset..][0 .. s * nkv * hd],
-                prob_slice,
-                nh,
-                nkv,
-                hd,
-                s,
-                scale,
-            );
-        }
-    }
+    attention_bw.attentionBackwardBatch(
+        grad_q,
+        grad_k,
+        grad_v,
+        grad_attn_output,
+        la.q,
+        la.k,
+        la.v,
+        la.attn_probs,
+        d_scores,
+        b,
+        s,
+        nh,
+        nkv,
+        hd,
+        scale,
+    );
 
     // RoPE backward on grad_q and grad_k (batch version precomputes inv_freq once)
     rope_bw.ropeBackwardBatch(grad_q[0 .. bs * nh * hd], b, s, nh, hd, hd, config.rope_theta);
@@ -439,9 +419,7 @@ fn layerBackward(
         d,
         scratch,
     );
-    for (grad_hidden[0 .. bs * d], grad_temp_attn) |*gh, gt| {
-        gh.* += gt;
-    }
+    simdAccum(grad_hidden[0 .. bs * d], grad_temp_attn);
 
     // V projection backward:
     linear.gradWeight(
@@ -463,9 +441,7 @@ fn layerBackward(
         d,
         scratch,
     );
-    for (grad_hidden[0 .. bs * d], grad_temp_attn) |*gh, gt| {
-        gh.* += gt;
-    }
+    simdAccum(grad_hidden[0 .. bs * d], grad_temp_attn);
 
     // Attention RMSNorm backward:
     // Forward: normed_attn = rmsnorm(residual_pre_attn, attn_norm)
@@ -485,8 +461,23 @@ fn layerBackward(
     );
 
     // Add attention residual gradient
-    for (grad_hidden[0 .. bs * d], grad_residual_attn) |*gh, gr| {
-        gh.* += gr;
+    simdAccum(grad_hidden[0 .. bs * d], grad_residual_attn);
+}
+
+/// SIMD element-wise accumulate: dst[i] += src[i].
+fn simdAccum(dst: []f32, src: []const f32) void {
+    @setFloatMode(.optimized);
+    std.debug.assert(dst.len == src.len);
+    const len = dst.len;
+    var i: usize = 0;
+    while (i + VEC <= len) : (i += VEC) {
+        var d: F32Vec = dst[i..][0..VEC].*;
+        const s: F32Vec = src[i..][0..VEC].*;
+        d += s;
+        dst[i..][0..VEC].* = d;
+    }
+    while (i < len) : (i += 1) {
+        dst[i] += src[i];
     }
 }
 
@@ -494,9 +485,6 @@ fn layerBackward(
 /// We didn't save this intermediate in the forward pass, so recompute it here.
 fn recomputeSwiglu(output: []f32, gate: []const f32, up: []const f32, len: usize) void {
     @setFloatMode(.optimized);
-    const simd_arch = @import("../../compute/root.zig").cpu.simd.arch;
-    const VEC = simd_arch.f32_vec_len;
-    const F32Vec = simd_arch.F32Vec;
     const fast = @import("../../compute/cpu/math_fast.zig");
 
     const one: F32Vec = @splat(1.0);

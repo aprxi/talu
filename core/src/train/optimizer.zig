@@ -8,6 +8,11 @@
 //!   param -= lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * param)
 
 const std = @import("std");
+const compute = @import("../compute/root.zig");
+
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
 
 pub const AdamWConfig = struct {
     lr: f32 = 1e-4,
@@ -56,6 +61,7 @@ pub const AdamW = struct {
     /// state:  per-parameter optimizer state (m, v)
     /// lr:     learning rate (allows external scheduling)
     pub fn step(self: *AdamW, params: []f32, grads: []const f32, state: *ParamState, lr: f32) void {
+        @setFloatMode(.optimized);
         std.debug.assert(params.len == grads.len);
         std.debug.assert(params.len == state.m.len);
         std.debug.assert(params.len == state.v.len);
@@ -71,18 +77,62 @@ pub const AdamW = struct {
         // Bias correction
         const bc1 = 1.0 - std.math.pow(f32, beta1, @floatFromInt(t));
         const bc2 = 1.0 - std.math.pow(f32, beta2, @floatFromInt(t));
+        const inv_bc1 = 1.0 / bc1;
+        const inv_bc2 = 1.0 / bc2;
 
-        for (params, grads, state.m, state.v) |*p, g, *m, *v| {
-            // Update moments
-            m.* = beta1 * m.* + (1.0 - beta1) * g;
-            v.* = beta2 * v.* + (1.0 - beta2) * g * g;
+        const n = params.len;
 
-            // Bias-corrected estimates
-            const m_hat = m.* / bc1;
-            const v_hat = v.* / bc2;
+        // SIMD path
+        const b1_v: F32Vec = @splat(beta1);
+        const b2_v: F32Vec = @splat(beta2);
+        const one_minus_b1_v: F32Vec = @splat(1.0 - beta1);
+        const one_minus_b2_v: F32Vec = @splat(1.0 - beta2);
+        const inv_bc1_v: F32Vec = @splat(inv_bc1);
+        const inv_bc2_v: F32Vec = @splat(inv_bc2);
+        const eps_v: F32Vec = @splat(eps);
+        const lr_v: F32Vec = @splat(lr);
+        const wd_v: F32Vec = @splat(wd);
 
-            // AdamW update: decoupled weight decay
-            p.* -= lr * (m_hat / (@sqrt(v_hat) + eps) + wd * p.*);
+        var i: usize = 0;
+        while (i + VEC <= n) : (i += VEC) {
+            var m_vec: F32Vec = state.m[i..][0..VEC].*;
+            var v_vec: F32Vec = state.v[i..][0..VEC].*;
+            const g_vec: F32Vec = grads[i..][0..VEC].*;
+            var p_vec: F32Vec = params[i..][0..VEC].*;
+
+            // m = beta1 * m + (1-beta1) * g
+            m_vec = @mulAdd(F32Vec, b1_v, m_vec, one_minus_b1_v * g_vec);
+            // v = beta2 * v + (1-beta2) * g^2
+            v_vec = @mulAdd(F32Vec, b2_v, v_vec, one_minus_b2_v * g_vec * g_vec);
+
+            state.m[i..][0..VEC].* = m_vec;
+            state.v[i..][0..VEC].* = v_vec;
+
+            // Bias-corrected: m_hat / (sqrt(v_hat) + eps)
+            const m_hat = m_vec * inv_bc1_v;
+            const v_hat = v_vec * inv_bc2_v;
+            const update = m_hat / (@sqrt(v_hat) + eps_v) + wd_v * p_vec;
+            p_vec -= lr_v * update;
+
+            params[i..][0..VEC].* = p_vec;
+        }
+
+        // Scalar tail
+        while (i < n) : (i += 1) {
+            var m = state.m[i];
+            var v = state.v[i];
+            const g = grads[i];
+
+            m = beta1 * m + (1.0 - beta1) * g;
+            v = beta2 * v + (1.0 - beta2) * g * g;
+
+            state.m[i] = m;
+            state.v[i] = v;
+
+            const m_hat = m * inv_bc1;
+            const v_hat = v * inv_bc2;
+
+            params[i] -= lr * (m_hat / (@sqrt(v_hat) + eps) + wd * params[i]);
         }
     }
 };

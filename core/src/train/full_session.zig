@@ -457,14 +457,37 @@ pub const FullTrainingSession = struct {
     }
 };
 
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
+
 fn normSq(data: []const f32) f32 {
-    var sum: f32 = 0.0;
-    for (data) |v| sum += v * v;
+    @setFloatMode(.optimized);
+    var acc: F32Vec = @splat(0.0);
+    var i: usize = 0;
+    while (i + VEC <= data.len) : (i += VEC) {
+        const v: F32Vec = data[i..][0..VEC].*;
+        acc = @mulAdd(F32Vec, v, v, acc);
+    }
+    var sum = @reduce(.Add, acc);
+    while (i < data.len) : (i += 1) {
+        sum += data[i] * data[i];
+    }
     return sum;
 }
 
 fn scaleGrad(data: []f32, factor: f32) void {
-    for (data) |*v| v.* *= factor;
+    @setFloatMode(.optimized);
+    const f: F32Vec = @splat(factor);
+    var i: usize = 0;
+    while (i + VEC <= data.len) : (i += VEC) {
+        var v: F32Vec = data[i..][0..VEC].*;
+        v *= f;
+        data[i..][0..VEC].* = v;
+    }
+    while (i < data.len) : (i += 1) {
+        data[i] *= factor;
+    }
 }
 
 // =============================================================================

@@ -9,6 +9,14 @@
 //!   dx_hi = -dy_lo * sin + dy_hi * cos
 
 const std = @import("std");
+const compute = @import("../../compute/root.zig");
+
+const simd_arch = compute.cpu.simd.arch;
+const VEC = simd_arch.f32_vec_len;
+const F32Vec = simd_arch.F32Vec;
+const math_fast = @import("../../compute/cpu/math_fast.zig");
+const fastSinCos = math_fast.fastSinCos;
+const fastSinCosScalar = math_fast.fastSinCosScalar;
 
 /// Apply inverse RoPE rotation to gradients.
 ///
@@ -92,23 +100,36 @@ pub fn ropeBackwardBatch(
     for (0..batch) |bi| {
         for (0..seq_len) |pos| {
             const pos_f: f32 = @floatFromInt(pos);
+            const pos_v: F32Vec = @splat(pos_f);
             const token_base = (bi * seq_len + pos) * stride;
 
             for (0..n_heads) |head| {
                 const base = token_base + head * head_dim;
-                for (0..half) |pair| {
+
+                // SIMD path: process VEC pairs at once
+                var pair: usize = 0;
+                while (pair + VEC <= half) : (pair += VEC) {
+                    const inv_f: F32Vec = inv_freq[pair..][0..VEC].*;
+                    const angles = pos_v * inv_f;
+                    const sc = fastSinCos(angles);
+
+                    const dy_lo: F32Vec = grad_io[base + pair ..][0..VEC].*;
+                    const dy_hi: F32Vec = grad_io[base + half + pair ..][0..VEC].*;
+
+                    // Inverse rotation (transpose)
+                    grad_io[base + pair ..][0..VEC].* = dy_lo * sc.cos + dy_hi * sc.sin;
+                    grad_io[base + half + pair ..][0..VEC].* = dy_hi * sc.cos - dy_lo * sc.sin;
+                }
+                // Scalar tail
+                while (pair < half) : (pair += 1) {
                     const angle = pos_f * inv_freq[pair];
-                    const cos_a = @cos(angle);
-                    const sin_a = @sin(angle);
+                    const sc = fastSinCosScalar(angle);
 
-                    const lo_idx = base + pair;
-                    const hi_idx = base + half + pair;
+                    const dy_lo = grad_io[base + pair];
+                    const dy_hi = grad_io[base + half + pair];
 
-                    const dy_lo = grad_io[lo_idx];
-                    const dy_hi = grad_io[hi_idx];
-
-                    grad_io[lo_idx] = dy_lo * cos_a + dy_hi * sin_a;
-                    grad_io[hi_idx] = -dy_lo * sin_a + dy_hi * cos_a;
+                    grad_io[base + pair] = dy_lo * sc.cos + dy_hi * sc.sin;
+                    grad_io[base + half + pair] = dy_hi * sc.cos - dy_lo * sc.sin;
                 }
             }
         }

@@ -10,6 +10,9 @@ const parallel = @import("../../system/parallel.zig");
 const simd = compute.cpu.simd.arch;
 const VEC = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;
+const math_fast = @import("../../compute/cpu/math_fast.zig");
+const fastExp = math_fast.fastExp;
+const fastExpScalar = math_fast.fastExpScalar;
 
 /// SIMD-vectorized dot product over `len` elements.
 fn simdDot(a: []const f32, b: []const f32) f32 {
@@ -104,19 +107,37 @@ fn attnTask(start: usize, end: usize, ctx: *AttnCtx) void {
             }
         }
 
-        // Softmax over valid positions [0..qi+1]
-        var sum_exp: f32 = 0.0;
-        for (0..seq_len) |ki| {
-            if (ki > qi) {
-                prob_row[ki] = 0.0;
-            } else {
-                const e = @exp(prob_row[ki] - max_score);
-                prob_row[ki] = e;
-                sum_exp += e;
-            }
+        // SIMD softmax over valid positions [0..qi+1]
+        const valid = qi + 1;
+        const max_v: F32Vec = @splat(max_score);
+        var sum_vec: F32Vec = @splat(0.0);
+        var ki: usize = 0;
+        while (ki + VEC <= valid) : (ki += VEC) {
+            const v: F32Vec = prob_row[ki..][0..VEC].*;
+            const e = fastExp(v - max_v);
+            prob_row[ki..][0..VEC].* = e;
+            sum_vec += e;
         }
+        var sum_exp = @reduce(.Add, sum_vec);
+        while (ki < valid) : (ki += 1) {
+            const e = fastExpScalar(prob_row[ki] - max_score);
+            prob_row[ki] = e;
+            sum_exp += e;
+        }
+        // Zero masked positions
+        for (valid..seq_len) |k| {
+            prob_row[k] = 0.0;
+        }
+        // SIMD normalize
         const inv_sum = if (sum_exp > 0.0) 1.0 / sum_exp else 0.0;
-        for (0..seq_len) |ki| {
+        const inv_v: F32Vec = @splat(inv_sum);
+        ki = 0;
+        while (ki + VEC <= valid) : (ki += VEC) {
+            var v: F32Vec = prob_row[ki..][0..VEC].*;
+            v *= inv_v;
+            prob_row[ki..][0..VEC].* = v;
+        }
+        while (ki < valid) : (ki += 1) {
             prob_row[ki] *= inv_sum;
         }
 
@@ -124,11 +145,11 @@ fn attnTask(start: usize, end: usize, ctx: *AttnCtx) void {
         const out_offset = (bi * seq_len + qi) * n_heads * head_dim + h * head_dim;
         const out_vec = ctx.output[out_offset..][0..head_dim];
         @memset(out_vec, 0.0);
-        for (0..seq_len) |ki| {
-            if (prob_row[ki] == 0.0) continue;
-            const v_offset = (bi * seq_len + ki) * n_kv_heads * head_dim + kv_h * head_dim;
+        for (0..seq_len) |vi| {
+            if (prob_row[vi] == 0.0) continue;
+            const v_offset = (bi * seq_len + vi) * n_kv_heads * head_dim + kv_h * head_dim;
             const v_vec = ctx.v[v_offset..][0..head_dim];
-            simdScaleAdd(out_vec, v_vec, prob_row[ki]);
+            simdScaleAdd(out_vec, v_vec, prob_row[vi]);
         }
     }
 }

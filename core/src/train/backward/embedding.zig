@@ -5,6 +5,11 @@
 //! of the embedding table gradient.
 
 const std = @import("std");
+const compute = @import("../../compute/root.zig");
+
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
 
 /// Scatter-add grad_output into grad_embedding at indices given by token_ids.
 ///
@@ -21,6 +26,7 @@ pub fn embeddingBackward(
     batch_size: usize,
     d_model: usize,
 ) void {
+    @setFloatMode(.optimized);
     std.debug.assert(grad_output.len == batch_size * d_model);
     std.debug.assert(token_ids.len == batch_size);
 
@@ -29,8 +35,15 @@ pub fn embeddingBackward(
         const emb_row = grad_embedding[token_id * d_model ..][0..d_model];
         const grad_row = grad_output[b * d_model ..][0..d_model];
 
-        for (emb_row, grad_row) |*e, g| {
-            e.* += g;
+        var i: usize = 0;
+        while (i + VEC <= d_model) : (i += VEC) {
+            var e: F32Vec = emb_row[i..][0..VEC].*;
+            const g: F32Vec = grad_row[i..][0..VEC].*;
+            e += g;
+            emb_row[i..][0..VEC].* = e;
+        }
+        while (i < d_model) : (i += 1) {
+            emb_row[i] += grad_row[i];
         }
     }
 }

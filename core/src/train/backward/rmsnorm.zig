@@ -8,6 +8,11 @@
 //!   grad_weight: [cols]
 
 const std = @import("std");
+const compute = @import("../../compute/root.zig");
+
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
 
 /// Compute gradients for RMSNorm.
 ///
@@ -32,6 +37,7 @@ pub fn rmsnormBackward(
     cols: usize,
     weight_offset: f32,
 ) void {
+    @setFloatMode(.optimized);
     std.debug.assert(grad_input.len == rows * cols);
     std.debug.assert(grad_weight.len == cols);
     std.debug.assert(grad_output.len == rows * cols);
@@ -40,6 +46,7 @@ pub fn rmsnormBackward(
     std.debug.assert(weight.len == cols);
 
     const cols_f: f32 = @floatFromInt(cols);
+    const wo_v: F32Vec = @splat(weight_offset);
 
     for (0..rows) |i| {
         const x_row = input[i * cols ..][0..cols];
@@ -47,21 +54,45 @@ pub fn rmsnormBackward(
         const dx_row = grad_input[i * cols ..][0..cols];
         const rms_inv = inv_rms[i];
 
-        // Compute: sum_j( dy[j] * x[j] * (w[j] + offset) ) * inv_rms
-        var dot_dy_xw: f32 = 0.0;
-        for (0..cols) |j| {
+        // SIMD dot product: sum(dy * x * (w + offset))
+        var dot_vec: F32Vec = @splat(0.0);
+        var j: usize = 0;
+        while (j + VEC <= cols) : (j += VEC) {
+            const dy: F32Vec = dy_row[j..][0..VEC].*;
+            const x: F32Vec = x_row[j..][0..VEC].*;
+            const w: F32Vec = weight[j..][0..VEC].*;
+            dot_vec = @mulAdd(F32Vec, dy * x, w + wo_v, dot_vec);
+        }
+        var dot_dy_xw = @reduce(.Add, dot_vec);
+        while (j < cols) : (j += 1) {
             dot_dy_xw += dy_row[j] * x_row[j] * (weight[j] + weight_offset);
         }
 
-        // dx[j] = inv_rms * (w[j] + offset) * dy[j]
-        //        - inv_rms^3 / cols * x[j] * dot(dy * x * w)
+        // SIMD grad_input: dx = irms * (w + offset) * dy - coeff * x
         const coeff = rms_inv * rms_inv * rms_inv / cols_f * dot_dy_xw;
-        for (0..cols) |j| {
+        const irms_v: F32Vec = @splat(rms_inv);
+        const coeff_v: F32Vec = @splat(coeff);
+        j = 0;
+        while (j + VEC <= cols) : (j += VEC) {
+            const dy: F32Vec = dy_row[j..][0..VEC].*;
+            const x: F32Vec = x_row[j..][0..VEC].*;
+            const w: F32Vec = weight[j..][0..VEC].*;
+            dx_row[j..][0..VEC].* = irms_v * (w + wo_v) * dy - coeff_v * x;
+        }
+        while (j < cols) : (j += 1) {
             dx_row[j] = rms_inv * (weight[j] + weight_offset) * dy_row[j] - coeff * x_row[j];
         }
 
-        // dw[j] += dy[j] * x[j] * inv_rms
-        for (0..cols) |j| {
+        // SIMD grad_weight: dw += dy * x * irms
+        j = 0;
+        while (j + VEC <= cols) : (j += VEC) {
+            const dy: F32Vec = dy_row[j..][0..VEC].*;
+            const x: F32Vec = x_row[j..][0..VEC].*;
+            var dw: F32Vec = grad_weight[j..][0..VEC].*;
+            dw = @mulAdd(F32Vec, dy * x, irms_v, dw);
+            grad_weight[j..][0..VEC].* = dw;
+        }
+        while (j < cols) : (j += 1) {
             grad_weight[j] += dy_row[j] * x_row[j] * rms_inv;
         }
     }

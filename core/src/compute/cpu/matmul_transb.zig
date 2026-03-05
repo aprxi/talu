@@ -150,6 +150,7 @@ pub fn matmulF32TransB(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch
 /// 4-column unrolling shares the A row load across 4 B rows for better ILP.
 /// Both A and B accesses are sequential (cache-friendly).
 fn dotCols(b_data: []const f32, a_row: []const f32, out_row: []f32, k: usize, col_start: usize, col_end: usize) void {
+    @setFloatMode(.optimized);
     var col = col_start;
 
     // 4-column unrolling: share A row load across 4 B rows

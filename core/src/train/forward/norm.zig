@@ -1,6 +1,11 @@
 //! RMSNorm forward pass for training, with saved statistics for backward.
 
 const std = @import("std");
+const compute = @import("../../compute/root.zig");
+
+const simd = compute.cpu.simd.arch;
+const VEC = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
 
 /// RMSNorm forward that saves inv_rms for the backward pass.
 ///
@@ -15,6 +20,7 @@ pub fn rmsnormForwardSave(
     rows: usize,
     cols: usize,
 ) void {
+    @setFloatMode(.optimized);
     std.debug.assert(output.len >= rows * cols);
     std.debug.assert(input.len >= rows * cols);
     std.debug.assert(inv_rms.len >= rows);
@@ -26,18 +32,32 @@ pub fn rmsnormForwardSave(
         const in_row = input[row * cols ..][0..cols];
         const out_row = output[row * cols ..][0..cols];
 
-        // Compute mean squared value
-        var sum_sq: f32 = 0.0;
-        for (in_row) |v| {
-            sum_sq += v * v;
+        // SIMD sum-of-squares
+        var sum_vec: F32Vec = @splat(0.0);
+        var i: usize = 0;
+        while (i + VEC <= cols) : (i += VEC) {
+            const v: F32Vec = in_row[i..][0..VEC].*;
+            sum_vec = @mulAdd(F32Vec, v, v, sum_vec);
         }
+        var sum_sq = @reduce(.Add, sum_vec);
+        while (i < cols) : (i += 1) {
+            sum_sq += in_row[i] * in_row[i];
+        }
+
         const rms = @sqrt(sum_sq / cols_f + eps);
         const irms = 1.0 / rms;
         inv_rms[row] = irms;
 
-        // Apply normalization and scale
-        for (out_row, in_row, weight) |*o, x, w| {
-            o.* = x * irms * w;
+        // SIMD normalization and scale: out = x * irms * weight
+        const irms_v: F32Vec = @splat(irms);
+        i = 0;
+        while (i + VEC <= cols) : (i += VEC) {
+            const x: F32Vec = in_row[i..][0..VEC].*;
+            const w: F32Vec = weight[i..][0..VEC].*;
+            out_row[i..][0..VEC].* = x * irms_v * w;
+        }
+        while (i < cols) : (i += 1) {
+            out_row[i] = in_row[i] * irms * weight[i];
         }
     }
 }

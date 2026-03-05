@@ -28,6 +28,12 @@ pub const MatmulScratch = matmul_primitives.MatmulScratch;
 /// headroom for g broadcasts and compiler temporaries.
 const ROW_TILE: usize = 4;
 
+/// K-loop tile size for cache blocking.
+/// Tiling the reduction dimension keeps the B chunk (K_TILE × N × 4 bytes)
+/// in L2 cache across column iterations. With K_TILE=256 and N≤1024:
+/// chunk ≤ 1MB (fits L2 on most modern CPUs).
+const K_TILE: usize = 256;
+
 const VEC: usize = simd.f32_vec_len;
 const VecF32 = @Vector(VEC, f32);
 
@@ -78,6 +84,7 @@ pub fn matmulTransposeAccumF32(a: *const Tensor, b: *const Tensor, c: *Tensor, s
 
     const task = struct {
         fn run(start: usize, end: usize, task_ctx: *Ctx) void {
+            @setFloatMode(.optimized);
             const k = task_ctx.k_dim;
             const m = task_ctx.m_rows;
             const n = task_ctx.n_cols;
@@ -87,36 +94,44 @@ pub fn matmulTransposeAccumF32(a: *const Tensor, b: *const Tensor, c: *Tensor, s
 
             // ── ROW_TILE rows at a time: 4 accumulators share each B load ──
             while (row + ROW_TILE <= end) : (row += ROW_TILE) {
-                // Vectorized columns
-                var col: usize = 0;
-                while (col < vec_end) : (col += VEC) {
-                    var acc: [ROW_TILE]VecF32 = undefined;
-                    inline for (0..ROW_TILE) |r| {
-                        acc[r] = task_ctx.c[(row + r) * n + col ..][0..VEC].*;
-                    }
+                // K-loop tiling: process K_TILE elements of the reduction
+                // dimension at a time, iterating all columns for each chunk.
+                // Keeps B chunk (K_TILE × N × 4 bytes) in L2 across column tiles.
+                var k_start: usize = 0;
+                while (k_start < k) : (k_start += K_TILE) {
+                    const k_end = @min(k_start + K_TILE, k);
 
-                    for (0..k) |bi| {
-                        const b_vec: VecF32 = task_ctx.b[bi * n + col ..][0..VEC].*;
+                    // Vectorized columns
+                    var col: usize = 0;
+                    while (col < vec_end) : (col += VEC) {
+                        var acc: [ROW_TILE]VecF32 = undefined;
                         inline for (0..ROW_TILE) |r| {
-                            const g: VecF32 = @splat(task_ctx.a[bi * m + (row + r)]);
-                            acc[r] = @mulAdd(VecF32, g, b_vec, acc[r]);
+                            acc[r] = task_ctx.c[(row + r) * n + col ..][0..VEC].*;
+                        }
+
+                        for (k_start..k_end) |bi| {
+                            const b_vec: VecF32 = task_ctx.b[bi * n + col ..][0..VEC].*;
+                            inline for (0..ROW_TILE) |r| {
+                                const g: VecF32 = @splat(task_ctx.a[bi * m + (row + r)]);
+                                acc[r] = @mulAdd(VecF32, g, b_vec, acc[r]);
+                            }
+                        }
+
+                        inline for (0..ROW_TILE) |r| {
+                            task_ctx.c[(row + r) * n + col ..][0..VEC].* = acc[r];
                         }
                     }
 
-                    inline for (0..ROW_TILE) |r| {
-                        task_ctx.c[(row + r) * n + col ..][0..VEC].* = acc[r];
-                    }
-                }
-
-                // Scalar tail
-                if (col < n) {
-                    inline for (0..ROW_TILE) |r| {
-                        for (col..n) |c_idx| {
-                            var sum = task_ctx.c[(row + r) * n + c_idx];
-                            for (0..k) |bi| {
-                                sum = @mulAdd(f32, task_ctx.a[bi * m + (row + r)], task_ctx.b[bi * n + c_idx], sum);
+                    // Scalar tail
+                    if (col < n) {
+                        inline for (0..ROW_TILE) |r| {
+                            for (col..n) |c_idx| {
+                                var sum = task_ctx.c[(row + r) * n + c_idx];
+                                for (k_start..k_end) |bi| {
+                                    sum = @mulAdd(f32, task_ctx.a[bi * m + (row + r)], task_ctx.b[bi * n + c_idx], sum);
+                                }
+                                task_ctx.c[(row + r) * n + c_idx] = sum;
                             }
-                            task_ctx.c[(row + r) * n + c_idx] = sum;
                         }
                     }
                 }
@@ -124,22 +139,27 @@ pub fn matmulTransposeAccumF32(a: *const Tensor, b: *const Tensor, c: *Tensor, s
 
             // ── Remaining rows (< ROW_TILE) ──
             while (row < end) : (row += 1) {
-                var col: usize = 0;
-                while (col < vec_end) : (col += VEC) {
-                    var acc: VecF32 = task_ctx.c[row * n + col ..][0..VEC].*;
-                    for (0..k) |bi| {
-                        const g: VecF32 = @splat(task_ctx.a[bi * m + row]);
-                        const b_vec: VecF32 = task_ctx.b[bi * n + col ..][0..VEC].*;
-                        acc = @mulAdd(VecF32, g, b_vec, acc);
+                var k_start: usize = 0;
+                while (k_start < k) : (k_start += K_TILE) {
+                    const k_end = @min(k_start + K_TILE, k);
+
+                    var col: usize = 0;
+                    while (col < vec_end) : (col += VEC) {
+                        var acc: VecF32 = task_ctx.c[row * n + col ..][0..VEC].*;
+                        for (k_start..k_end) |bi| {
+                            const g: VecF32 = @splat(task_ctx.a[bi * m + row]);
+                            const b_vec: VecF32 = task_ctx.b[bi * n + col ..][0..VEC].*;
+                            acc = @mulAdd(VecF32, g, b_vec, acc);
+                        }
+                        task_ctx.c[row * n + col ..][0..VEC].* = acc;
                     }
-                    task_ctx.c[row * n + col ..][0..VEC].* = acc;
-                }
-                for (col..n) |c_idx| {
-                    var sum = task_ctx.c[row * n + c_idx];
-                    for (0..k) |bi| {
-                        sum = @mulAdd(f32, task_ctx.a[bi * m + row], task_ctx.b[bi * n + c_idx], sum);
+                    for (col..n) |c_idx| {
+                        var sum = task_ctx.c[row * n + c_idx];
+                        for (k_start..k_end) |bi| {
+                            sum = @mulAdd(f32, task_ctx.a[bi * m + row], task_ctx.b[bi * n + c_idx], sum);
+                        }
+                        task_ctx.c[row * n + c_idx] = sum;
                     }
-                    task_ctx.c[row * n + c_idx] = sum;
                 }
             }
         }

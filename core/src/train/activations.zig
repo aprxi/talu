@@ -135,10 +135,10 @@ pub const ActivationCache = struct {
 
         // Scratch sized for backward pass peak usage:
         //   FFN backward:  d + 3*ff  (residual + swiglu recompute + grad_gate + grad_up)
-        //   Attn backward: d + 2*nh*hd + 2*nkv*hd  (residual + attn_output + grad_q + grad_k + grad_v)
+        //   Attn backward: d + 2*nh*hd + 2*nkv*hd + nh*s  (residual + attn_output + grad_q + grad_k + grad_v + d_scores)
         //   CE backward:   v  (grad_logits)
         const ffn_scratch = d + 3 * ff;
-        const attn_scratch = d + 2 * nh * hd + 2 * nkv * hd;
+        const attn_scratch = d + 2 * nh * hd + 2 * nkv * hd + nh * s;
         const max_dim = @max(v, @max(ffn_scratch, attn_scratch));
         self.scratch = try allocator.alloc(f32, bs * max_dim);
         errdefer allocator.free(self.scratch);
