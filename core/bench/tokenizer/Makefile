@@ -11,7 +11,7 @@ TEXT_FILE ?=
 TEXT_FILE_FLAG := $(if $(TEXT_FILE),--text-file "$(TEXT_FILE)",)
 
 .PHONY: help encode_1k encode_100k encode_1m load all quick breakdown \
-        normalize_1m pretok_1m bpe_1m bpe_merge_1m bpe_vocab_1m bpe_collect_1m \
+        normalize_1m pretok_1m bpe_1m bpe_merge_1m bpe_merge_select_1m bpe_vocab_1m bpe_collect_1m \
         encode_1k-csv encode_100k-csv encode_1m-csv load-csv all-csv \
         encode_1k-table encode_100k-table encode_1m-table load-table all-table
 
@@ -23,6 +23,7 @@ help:
 	@echo "  make -C core/bench/tokenizer encode_1k   TOK=<path>"
 	@echo "  make -C core/bench/tokenizer encode_100k TOK=<path>"
 	@echo "  make -C core/bench/tokenizer encode_1m   TOK=<path>"
+	@echo "  make -C core/bench/tokenizer bpe_merge_select_1m TOK=<path>"
 	@echo "  make -C core/bench/tokenizer all         TOK=<path>"
 	@echo "  make -C core/bench/tokenizer quick       TOK=<path>"
 	@echo ""
@@ -144,6 +145,18 @@ bpe_merge_1m:
 	@cd "$(ROOT_DIR)" && \
 	zig build bench-tokenizer -Drelease -- \
 		--scenario bpe_merge_1m \
+		--tokenizer "$(TOK)" \
+		--profile "$(PROFILE)" \
+		--format "$(FORMAT)" \
+		--warmup "$(WARMUP)" \
+		--iters "$(ITERS)" \
+		$(TEXT_FILE_FLAG)
+
+bpe_merge_select_1m:
+	@test -n "$(TOK)" || { echo "error: TOK=<path/to/tokenizer.json> is required"; exit 1; }
+	@cd "$(ROOT_DIR)" && \
+	zig build bench-tokenizer -Drelease -- \
+		--scenario bpe_merge_select_1m \
 		--tokenizer "$(TOK)" \
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \

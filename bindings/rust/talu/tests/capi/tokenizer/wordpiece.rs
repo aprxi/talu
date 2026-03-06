@@ -796,6 +796,122 @@ fn handle_chinese_chars_detects_cjk_extension_a() {
 // into known subwords. Emoji characters (4-byte UTF-8) not in the vocab
 // must produce a single [UNK] token, not be silently dropped.
 
+/// Multiple subword splits: "goings" → ["go", "##ing", "##s"].
+#[test]
+fn encode_multiple_subword_splits() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    // "goings" → "go" + "##ing" + "##s"
+    assert_eq!(
+        ctx.encode("goings"),
+        vec![6, 9, 12],
+        "'goings' must split into [go, ##ing, ##s]"
+    );
+}
+
+/// Greedy longest match: "good" matched as whole word, not "go"+"##od".
+#[test]
+fn encode_greedy_longest_match() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    // "good" is in vocab as whole word → single token
+    assert_eq!(
+        ctx.encode("good"),
+        vec![7],
+        "'good' must match as whole word, not 'go'+'##od'"
+    );
+}
+
+/// Consecutive unknown words each produce [UNK].
+#[test]
+fn encode_consecutive_unknown_words() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    // "xyz abc" → ["xyz", "abc"] → each unknown → [UNK, UNK]
+    let tokens = ctx.encode("xyz abc");
+    assert_eq!(
+        tokens,
+        vec![0, 0],
+        "each unknown word should produce [UNK], got: {tokens:?}"
+    );
+}
+
+/// Roundtrip encode→decode with subword tokens.
+#[test]
+fn roundtrip_subword() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    // "going" → [go, ##ing] → decode → "going"
+    let ids = ctx.encode("going");
+    let decoded = ctx.decode(&ids);
+    assert_eq!(decoded, "going", "subword roundtrip failed");
+}
+
+/// Roundtrip for sentence with mixed known, subword, and punctuation.
+#[test]
+fn roundtrip_mixed_sentence() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    let text = "good morning!";
+    let ids = ctx.encode(text);
+    let decoded = ctx.decode(&ids);
+    assert_eq!(decoded, text, "mixed sentence roundtrip failed");
+}
+
+/// Consecutive subword tokens decode correctly.
+///
+/// "go" + "##ing" + "##ed" → "goinged" (artificial but tests decoder).
+#[test]
+fn decode_consecutive_subwords() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    let decoded = ctx.decode(&[6, 9, 10]);
+    assert_eq!(
+        decoded, "goinged",
+        "consecutive subwords: go+##ing+##ed → 'goinged', got: {decoded:?}"
+    );
+}
+
+/// Exactly max_input_chars_per_word chars encodes normally (boundary).
+#[test]
+fn wordpiece_exactly_at_max_input_chars() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 5,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, "a": 4, "##a": 5
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "hello" (5 chars) == max_input_chars_per_word → should encode normally
+    let tokens = ctx.encode_with("hello", &opts);
+    assert_eq!(
+        tokens,
+        vec![3],
+        "word at exactly max_input_chars_per_word must encode normally, got: {tokens:?}"
+    );
+    // "aaaaaa" (6 chars) > max_input_chars_per_word → [UNK]
+    let tokens = ctx.encode_with("aaaaaa", &opts);
+    assert_eq!(
+        tokens,
+        vec![0],
+        "word exceeding max_input_chars_per_word must produce [UNK], got: {tokens:?}"
+    );
+}
+
 /// Emoji character (🌍 U+1F30D) must produce [UNK], not be silently dropped.
 #[test]
 fn encode_emoji_produces_unk_not_dropped() {

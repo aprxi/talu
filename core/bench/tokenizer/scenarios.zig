@@ -29,6 +29,7 @@ pub const Scenario = enum {
     pretok_1m,
     bpe_1m,
     bpe_merge_1m,
+    bpe_merge_select_1m,
     bpe_vocab_1m,
     bpe_collect_1m,
     breakdown,
@@ -140,6 +141,12 @@ const CollectSym = struct {
     len: u32,
 };
 
+const BenchCachedPair = struct {
+    pos: i16,
+    rank: i32,
+    new_id: i32,
+};
+
 /// Initialize symbols for a word (UTF-8 split + vocab_hash lookup).
 fn initSymbols(model: *bpe_mod.BpeModel, word: []const u8, syms: *[BENCH_MAX_SYMS]BenchSymbol) usize {
     var n_syms: usize = 0;
@@ -201,7 +208,7 @@ fn runMergeLoop(model: *bpe_mod.BpeModel, syms: *[BENCH_MAX_SYMS]BenchSymbol, n_
         for (1..n_cached) |i| {
             if (pair_cache[i].rank < pair_cache[best_idx].rank or
                 (pair_cache[i].rank == pair_cache[best_idx].rank and
-                pair_cache[i].pos < pair_cache[best_idx].pos))
+                    pair_cache[i].pos < pair_cache[best_idx].pos))
             {
                 best_idx = i;
             }
@@ -261,6 +268,56 @@ fn runMergeLoop(model: *bpe_mod.BpeModel, syms: *[BENCH_MAX_SYMS]BenchSymbol, n_
         }
     }
     return merge_count;
+}
+
+fn buildPairCache(
+    model: *bpe_mod.BpeModel,
+    syms: *[BENCH_MAX_SYMS]BenchSymbol,
+    n_syms: usize,
+    pair_cache: *[BENCH_MAX_SYMS]BenchCachedPair,
+) usize {
+    if (n_syms < 2) return 0;
+    var n_cached: usize = 0;
+
+    var si: i16 = 0;
+    while (si >= 0) {
+        const sym = &syms[@intCast(si)];
+        if (sym.next >= 0 and sym.id >= 0) {
+            const right_sym = &syms[@intCast(sym.next)];
+            if (right_sym.id >= 0) {
+                if (model.pair_merges.get(.{ .left = sym.id, .right = right_sym.id })) |info| {
+                    pair_cache[n_cached] = .{
+                        .pos = si,
+                        .rank = info.rank,
+                        .new_id = info.new_id,
+                    };
+                    n_cached += 1;
+                }
+            }
+        }
+        si = sym.next;
+    }
+    return n_cached;
+}
+
+fn consumeBestPairsLinear(pair_cache: *[BENCH_MAX_SYMS]BenchCachedPair, n_cached_init: usize) u64 {
+    var n_cached = n_cached_init;
+    var picks: u64 = 0;
+    while (n_cached > 0) {
+        var best_idx: usize = 0;
+        for (1..n_cached) |i| {
+            if (pair_cache[i].rank < pair_cache[best_idx].rank or
+                (pair_cache[i].rank == pair_cache[best_idx].rank and
+                    pair_cache[i].pos < pair_cache[best_idx].pos))
+            {
+                best_idx = i;
+            }
+        }
+        n_cached -= 1;
+        if (best_idx < n_cached) pair_cache[best_idx] = pair_cache[n_cached];
+        picks += 1;
+    }
+    return picks;
 }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +761,99 @@ pub fn runBpeMerge(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: u
 
 pub fn runBpeMerge1m(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
     return runBpeMerge(allocator, cfg, 1024 * 1024, "bpe_merge_1m");
+}
+
+/// Best-pair selection only (linear scan over pair cache).
+/// Isolates the historical O(n_cached) "pick best merge" step.
+pub fn runBpeMergeSelect(allocator: std.mem.Allocator, cfg: RunConfig, target_bytes: usize, name: []const u8) !ScenarioResult {
+    const json = try readTokenizerJson(allocator, cfg.tokenizer_json_path);
+    defer allocator.free(json);
+    var tok = try loadTokenizer(allocator, json);
+    defer tok.deinit();
+    const text = try loadInputText(allocator, cfg, target_bytes);
+    defer allocator.free(text);
+
+    var normalized = try norm_mod.normalize_text(&tok.tokenizer_handle.normalizer, text);
+    defer normalized.deinit();
+    var pretokenized = try pretok_mod.pretokenize(
+        &tok.tokenizer_handle.pretokenizer,
+        normalized.text,
+        .{ .start = 0, .end = normalized.text.len },
+        false,
+    );
+    defer pretokenized.deinit();
+
+    const word_count = pretokenized.tokens.items.len;
+    const words = try allocator.alloc([]const u8, word_count);
+    defer allocator.free(words);
+    for (pretokenized.tokens.items, 0..) |token, i| {
+        words[i] = token.sliceConst();
+    }
+
+    const model: *bpe_mod.BpeModel = @ptrCast(@alignCast(tok.tokenizer_handle.model.?));
+
+    // Pre-compute initial pair caches for each word (outside timed section).
+    var all_pairs = std.ArrayListUnmanaged(BenchCachedPair){};
+    defer all_pairs.deinit(allocator);
+    var pair_offsets = try allocator.alloc(usize, word_count + 1);
+    defer allocator.free(pair_offsets);
+
+    for (words, 0..) |word, wi| {
+        pair_offsets[wi] = all_pairs.items.len;
+
+        var syms: [BENCH_MAX_SYMS]BenchSymbol = undefined;
+        const n_syms = initSymbols(model, word, &syms);
+        var cache: [BENCH_MAX_SYMS]BenchCachedPair = undefined;
+        const n_cached = buildPairCache(model, &syms, n_syms, &cache);
+        try all_pairs.appendSlice(allocator, cache[0..n_cached]);
+    }
+    pair_offsets[word_count] = all_pairs.items.len;
+
+    const total_iters = cfg.warmup + cfg.iters;
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+    var cold_first: harness.Sample = .{ .encode_ns = 0 };
+    var sample_idx: usize = 0;
+    var last_pick_count: u64 = 0;
+
+    var iter: usize = 0;
+    while (iter < total_iters) : (iter += 1) {
+        var pick_count: u64 = 0;
+        const t0 = std.time.nanoTimestamp();
+        for (0..word_count) |wi| {
+            const start = pair_offsets[wi];
+            const end = pair_offsets[wi + 1];
+            const n_cached = end - start;
+            if (n_cached == 0) continue;
+
+            var cache: [BENCH_MAX_SYMS]BenchCachedPair = undefined;
+            @memcpy(cache[0..n_cached], all_pairs.items[start..end]);
+            pick_count += consumeBestPairsLinear(&cache, n_cached);
+        }
+        const t1 = std.time.nanoTimestamp();
+        last_pick_count = pick_count;
+
+        const sample = harness.Sample{ .encode_ns = elapsedNs(t0, t1) };
+        if (iter == 0) cold_first = sample;
+        if (iter >= cfg.warmup and sample_idx < samples.len) {
+            samples[sample_idx] = sample;
+            sample_idx += 1;
+        }
+    }
+
+    return .{
+        .name = name,
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_first = cold_first,
+        .input_bytes = target_bytes,
+        .output_tokens = last_pick_count,
+        .note = "best-pair selection only (linear scan)",
+    };
+}
+
+pub fn runBpeMergeSelect1m(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runBpeMergeSelect(allocator, cfg, 1024 * 1024, "bpe_merge_select_1m");
 }
 
 /// Real result collection — ArrayList + dupeZ + toOwnedSlice + free.

@@ -68,6 +68,7 @@ fn parseScenario(value: []const u8) !scenarios.Scenario {
     if (std.mem.eql(u8, value, "pretok_1m") or std.mem.eql(u8, value, "pretok")) return .pretok_1m;
     if (std.mem.eql(u8, value, "bpe_1m") or std.mem.eql(u8, value, "bpe")) return .bpe_1m;
     if (std.mem.eql(u8, value, "bpe_merge_1m") or std.mem.eql(u8, value, "bpe_merge")) return .bpe_merge_1m;
+    if (std.mem.eql(u8, value, "bpe_merge_select_1m") or std.mem.eql(u8, value, "bpe_merge_select")) return .bpe_merge_select_1m;
     if (std.mem.eql(u8, value, "bpe_vocab_1m") or std.mem.eql(u8, value, "bpe_vocab")) return .bpe_vocab_1m;
     if (std.mem.eql(u8, value, "bpe_collect_1m") or std.mem.eql(u8, value, "bpe_collect")) return .bpe_collect_1m;
     return error.InvalidArgument;
@@ -99,7 +100,7 @@ fn printUsage(writer: anytype) !void {
         \\  zig build bench-tokenizer -Drelease -- [options]
         \\
         \\Options:
-        \\  --scenario <all|breakdown|1k|100k|1m|load|norm|pretok|bpe|bpe_merge|bpe_vocab|bpe_collect>
+        \\  --scenario <all|breakdown|1k|100k|1m|load|norm|pretok|bpe|bpe_merge|bpe_merge_select|bpe_vocab|bpe_collect>
         \\  --tokenizer <path/to/tokenizer.json>  required
         \\  --size <1k|10k|100k|1m>               default: 1m (for breakdown)
         \\  --text-file <path>                    use real text instead of synthetic
@@ -288,6 +289,7 @@ fn runScenario(
         .pretok_1m => try scenarios.runPretok1m(allocator, cfg),
         .bpe_1m => try scenarios.runBpe1m(allocator, cfg),
         .bpe_merge_1m => try scenarios.runBpeMerge1m(allocator, cfg),
+        .bpe_merge_select_1m => try scenarios.runBpeMergeSelect1m(allocator, cfg),
         .bpe_vocab_1m => try scenarios.runBpeVocab1m(allocator, cfg),
         .bpe_collect_1m => try scenarios.runBpeCollect1m(allocator, cfg),
         .breakdown, .all => return error.InvalidArgument,
@@ -495,6 +497,7 @@ pub fn main() !void {
             _ = try runOne(stdout, allocator, cfg.run, cfg.format, .pretok_1m);
             _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_1m);
             _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_merge_1m);
+            _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_merge_select_1m);
             _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_vocab_1m);
             _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_collect_1m);
         },
@@ -506,6 +509,7 @@ pub fn main() !void {
         .pretok_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .pretok_1m),
         .bpe_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_1m),
         .bpe_merge_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_merge_1m),
+        .bpe_merge_select_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_merge_select_1m),
         .bpe_vocab_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_vocab_1m),
         .bpe_collect_1m => _ = try runOne(stdout, allocator, cfg.run, cfg.format, .bpe_collect_1m),
         .breakdown => unreachable,
@@ -532,6 +536,7 @@ test "parseScenario accepts short and full names" {
     try std.testing.expectEqual(scenarios.Scenario.pretok_1m, try parseScenario("pretok"));
     try std.testing.expectEqual(scenarios.Scenario.bpe_1m, try parseScenario("bpe"));
     try std.testing.expectEqual(scenarios.Scenario.bpe_merge_1m, try parseScenario("bpe_merge"));
+    try std.testing.expectEqual(scenarios.Scenario.bpe_merge_select_1m, try parseScenario("bpe_merge_select"));
     try std.testing.expectEqual(scenarios.Scenario.bpe_vocab_1m, try parseScenario("bpe_vocab"));
     try std.testing.expectEqual(scenarios.Scenario.bpe_collect_1m, try parseScenario("bpe_collect"));
     try std.testing.expectEqual(scenarios.Scenario.breakdown, try parseScenario("breakdown"));

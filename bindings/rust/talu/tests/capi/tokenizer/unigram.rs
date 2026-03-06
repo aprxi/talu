@@ -171,3 +171,226 @@ fn unigram_encode_multiword() {
         "Unigram multi-word encoding with Metaspace must produce [▁hello, ▁world], got: {tokens:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Character-level fallback
+// ---------------------------------------------------------------------------
+
+/// Shared Unigram fixture with character-level fallback tokens.
+///
+/// Vocab has whole-word tokens with high scores and single-char tokens
+/// with low scores. Words not in vocab fall back to character-level.
+const UNIGRAM_FALLBACK_JSON: &str = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581", -1.0],
+      ["\u2581hello", -5.0],
+      ["\u2581world", -5.0],
+      ["h", -10.0],
+      ["e", -10.0],
+      ["l", -10.0],
+      ["o", -10.0],
+      ["w", -10.0],
+      ["r", -10.0],
+      ["d", -10.0],
+      ["a", -10.0],
+      ["b", -10.0],
+      ["c", -10.0],
+      ["\u2581he", -6.0],
+      ["\u2581hel", -7.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null,
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true }
+}"#;
+
+/// Word not in vocab falls back to character-level tokens.
+///
+/// "abc" is not a whole-word token. Viterbi segments it as [a, b, c]
+/// using single-character fallback tokens.
+#[test]
+fn unigram_char_fallback_for_unknown_word() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "abc" → Metaspace → "▁abc"
+    // No whole-word "▁abc", falls back to char-level: [▁, a, b, c]
+    let tokens = ctx.encode_with("abc", &opts);
+    assert!(
+        tokens.len() > 1,
+        "unknown word must fall back to subword/char tokens, got: {tokens:?}"
+    );
+    // Should not produce unk token (all chars are in vocab)
+    assert!(
+        !tokens.contains(&0),
+        "all chars are in vocab, no unk expected, got: {tokens:?}"
+    );
+}
+
+/// Viterbi prefers longer tokens when they have better total score.
+///
+/// "hello" → "▁hello" (score -5.0) is better than "▁he"+"l"+"l"+"o"
+/// (score -6.0 + -10.0 + -10.0 + -10.0 = -36.0). Viterbi must choose
+/// the whole word.
+#[test]
+fn unigram_viterbi_prefers_whole_word() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("hello", &opts);
+    // Should be a single token [▁hello=2], not multiple subwords
+    assert_eq!(
+        tokens,
+        vec![2],
+        "Viterbi must prefer whole-word '▁hello' over subword split, got: {tokens:?}"
+    );
+}
+
+/// Empty input produces empty output.
+#[test]
+fn unigram_encode_empty() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("", &opts);
+    assert_eq!(tokens, Vec::<u32>::new(), "empty input must produce empty output");
+}
+
+/// Encode→decode roundtrip preserves text.
+#[test]
+fn unigram_roundtrip() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    for text in ["hello", "hello world", "abc"] {
+        let tokens = ctx.encode_with(text, &opts);
+        let decoded = ctx.decode(&tokens);
+        assert_eq!(decoded, text, "Unigram roundtrip failed for {text:?}");
+    }
+}
+
+/// Single character input encodes to character token.
+#[test]
+fn unigram_single_char() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "a" → Metaspace → "▁a" → Unigram → [▁, a] or similar subword split
+    let tokens = ctx.encode_with("a", &opts);
+    assert!(
+        !tokens.is_empty(),
+        "single char must produce at least one token"
+    );
+    assert!(
+        !tokens.contains(&0),
+        "'a' is in vocab, no unk expected, got: {tokens:?}"
+    );
+}
+
+/// Viterbi selects subword split when no whole-word match exists.
+///
+/// "hel" → Metaspace → "▁hel" → "▁hel" (score -7.0) is better than
+/// "▁he"+"l" (score -6.0 + -10.0 = -16.0). Viterbi should pick "▁hel".
+#[test]
+fn unigram_viterbi_subword_selection() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("hel", &opts);
+    // "▁hel" (score -7.0) is a single token and better than multi-token
+    assert_eq!(
+        tokens.len(),
+        1,
+        "Viterbi should prefer '▁hel' as single token, got: {tokens:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unigram with unk_id: unknown chars produce unk token
+// ---------------------------------------------------------------------------
+
+/// Characters not in vocab produce the unk token.
+#[test]
+fn unigram_unknown_char_produces_unk() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["a", -1.0],
+      ["b", -1.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "z" is not in vocab → should produce unk token
+    let tokens = ctx.encode_with("z", &opts);
+    assert!(
+        tokens.contains(&0),
+        "unknown char 'z' must produce unk token (0), got: {tokens:?}"
+    );
+}
+
+/// Mixed known and unknown chars: known chars encode, unknown → unk.
+#[test]
+fn unigram_mixed_known_unknown() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["a", -1.0],
+      ["b", -1.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "azb" → [a=1, unk=0, b=2]
+    let tokens = ctx.encode_with("azb", &opts);
+    assert_eq!(
+        tokens,
+        vec![1, 0, 2],
+        "known chars encode, unknown → unk: 'azb' → [a, unk, b], got: {tokens:?}"
+    );
+}

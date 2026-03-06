@@ -1201,3 +1201,219 @@ fn split_string_pattern_is_literal_not_regex() {
         "Expected [Hello=0, Ġworld=1] — Split(String) is no-op, ByteLevel splits. Got: {tokens:?}"
     );
 }
+
+// ===========================================================================
+// Truncation + post-processor interaction
+// ===========================================================================
+
+/// Right truncation to max_length=3 on a 5-token input.
+#[test]
+fn truncation_right_keeps_first_n() {
+    let ctx = TokenizerTestContext::new();
+    let opts = talu_sys::EncodeOptions {
+        truncation: 1,
+        truncation_side: 0, // right: keep first
+        max_length: 3,
+        ..Default::default()
+    };
+    // "hello" → [h=76, e=73, l=80, l=80, o=83] → truncate to 3 → [h, e, l]
+    let tokens = ctx.encode_with("hello", &opts);
+    assert_eq!(
+        tokens,
+        vec![76, 73, 80],
+        "right truncation to 3: keep first 3 tokens, got: {tokens:?}"
+    );
+}
+
+/// Left truncation to max_length=3 on a 5-token input.
+#[test]
+fn truncation_left_keeps_last_n() {
+    let ctx = TokenizerTestContext::new();
+    let opts = talu_sys::EncodeOptions {
+        truncation: 1,
+        truncation_side: 1, // left: keep last
+        max_length: 3,
+        ..Default::default()
+    };
+    // "hello" → [h=76, e=73, l=80, l=80, o=83] → left-truncate to 3 → [l, l, o]
+    let tokens = ctx.encode_with("hello", &opts);
+    assert_eq!(
+        tokens,
+        vec![80, 80, 83],
+        "left truncation to 3: keep last 3 tokens, got: {tokens:?}"
+    );
+}
+
+/// Truncation max_length=1: only first token survives.
+#[test]
+fn truncation_max_length_1() {
+    let ctx = TokenizerTestContext::new();
+    let opts = talu_sys::EncodeOptions {
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 1,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("hello", &opts);
+    assert_eq!(
+        tokens,
+        vec![76],
+        "max_length=1: only first token, got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// TemplateProcessing + truncation interaction
+// ===========================================================================
+
+/// TemplateProcessing adds CLS+SEP, then truncation caps total length.
+///
+/// Template: [CLS] $A [SEP] → adds 2 special tokens.
+/// "hello" → 5 tokens + CLS + SEP = 7.
+/// With max_length=4: should be [CLS, h, e, SEP] or similar —
+/// the question is whether truncation happens BEFORE or AFTER
+/// post-processing.
+#[test]
+fn template_processing_with_truncation() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      " ": 4, "!": 5, "\"": 6, "#": 7, "$": 8, "%": 9,
+      "&": 10, "'": 11, "(": 12, ")": 13, "*": 14, "+": 15,
+      ",": 16, "-": 17, ".": 18, "/": 19,
+      "0": 20, "1": 21, "2": 22, "3": 23, "4": 24,
+      "5": 25, "6": 26, "7": 27, "8": 28, "9": 29,
+      ":": 30, ";": 31, "<": 32, "=": 33, ">": 34, "?": 35, "@": 36,
+      "A": 37, "B": 38, "C": 39, "D": 40, "E": 41, "F": 42,
+      "G": 43, "H": 44, "I": 45, "J": 46, "K": 47, "L": 48,
+      "M": 49, "N": 50, "O": 51, "P": 52, "Q": 53, "R": 54,
+      "S": 55, "T": 56, "U": 57, "V": 58, "W": 59, "X": 60,
+      "Y": 61, "Z": 62, "[": 63, "\\": 64, "]": 65, "^": 66,
+      "_": 67, "`": 68,
+      "a": 69, "b": 70, "c": 71, "d": 72, "e": 73, "f": 74,
+      "g": 75, "h": 76, "i": 77, "j": 78, "k": 79, "l": 80,
+      "m": 81, "n": 82, "o": 83, "p": 84, "q": 85, "r": 86,
+      "s": 87, "t": 88, "u": 89, "v": 90, "w": 91, "x": 92,
+      "y": 93, "z": 94, "{": 95, "|": 96, "}": 97, "~": 98
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "</s>", "type_id": 0}}],
+    "pair": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": "</s>", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}, {"SpecialToken": {"id": "</s>", "type_id": 1}}],
+    "special_tokens": {"<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]}, "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]}}
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 4,
+        ..Default::default()
+    };
+    // "hello" → 5 byte-level tokens. Post-processor adds <s> and </s>.
+    // Without truncation: [<s>, h, e, l, l, o, </s>] = 7 tokens.
+    // With max_length=4: truncated to 4 tokens.
+    let tokens = ctx.encode_with("hello", &opts);
+    assert_eq!(
+        tokens.len(),
+        4,
+        "template + truncation: must be exactly 4 tokens, got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// Encode with all tokens being added (special) tokens
+// ===========================================================================
+
+/// Input consists entirely of a special token literal — tests that
+/// the added token matcher handles the case where the entire input
+/// is consumed by a single added token match.
+#[test]
+fn input_is_single_special_token() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "a": 3
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "[MASK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("[MASK]", &opts);
+    assert_eq!(
+        tokens,
+        vec![100],
+        "input is single special token: got: {tokens:?}"
+    );
+}
+
+/// Input is multiple special tokens concatenated with no separator.
+#[test]
+fn input_is_concatenated_specials() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "a": 3
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "[A]", "special": true},
+    {"id": 101, "content": "[B]", "special": true},
+    {"id": 102, "content": "[C]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("[A][B][C][A][B]", &opts);
+    assert_eq!(
+        tokens,
+        vec![100, 101, 102, 100, 101],
+        "5 concatenated specials: got: {tokens:?}"
+    );
+}

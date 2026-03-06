@@ -658,6 +658,141 @@ fn sentencepiece_prepend_rearms_after_second_special_token() {
 // " 're" → "'re". It also removes space before standalone apostrophe when
 // surrounded by spaces: " ' " → "'".
 
+/// Cleanup removes space before question mark.
+///
+/// WordPiece decoder with cleanup must remove space before "?".
+#[test]
+fn cleanup_removes_space_before_question() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, "?": 4, "!": 5, ".": 6
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    // "hello" + "?" → cleanup removes space before ? → "hello?"
+    let decoded = ctx.decode(&[3, 4]);
+    assert_eq!(
+        decoded, "hello?",
+        "cleanup must remove space before ?, got: {decoded:?}"
+    );
+}
+
+/// Cleanup removes space before exclamation mark.
+#[test]
+fn cleanup_removes_space_before_exclamation() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, "!": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let decoded = ctx.decode(&[3, 4]);
+    assert_eq!(
+        decoded, "hello!",
+        "cleanup must remove space before !, got: {decoded:?}"
+    );
+}
+
+/// Cleanup removes space before period.
+#[test]
+fn cleanup_removes_space_before_period() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, ".": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let decoded = ctx.decode(&[3, 4]);
+    assert_eq!(
+        decoded, "hello.",
+        "cleanup must remove space before period, got: {decoded:?}"
+    );
+}
+
+/// Multiple consecutive special tokens all stripped with skip=1.
+#[test]
+fn skip_special_multiple_consecutive() {
+    let ctx = TokenizerTestContext::with_special_tokens();
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    // [BOS=1, BOS=1, PAD=0, H=44, i=77, EOS=2, EOS=2]
+    let decoded = ctx.decode_with(&[1, 1, 0, 44, 77, 2, 2], &skip);
+    assert_eq!(
+        decoded, "Hi",
+        "multiple consecutive special tokens must all be stripped, got: {decoded:?}"
+    );
+}
+
+/// Interleaved special and regular tokens with skip=1: only specials removed.
+#[test]
+fn skip_special_interleaved() {
+    let ctx = TokenizerTestContext::with_special_tokens();
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    // [H=44, BOS=1, i=77, EOS=2, 37=A]
+    let decoded = ctx.decode_with(&[44, 1, 77, 2, 37], &skip);
+    assert_eq!(
+        decoded, "HiA",
+        "interleaved specials must be removed, regular preserved, got: {decoded:?}"
+    );
+}
+
 /// Cleanup removes space before apostrophe contractions.
 ///
 /// Contractions n't, 's, 'm must have space before apostrophe removed.

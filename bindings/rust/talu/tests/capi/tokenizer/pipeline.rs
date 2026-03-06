@@ -634,3 +634,226 @@ fn normalizer_nfkd_fullwidth() {
         "NFKD should decompose fullwidth A to ASCII A"
     );
 }
+
+// ===========================================================================
+// Replace normalizer
+// ===========================================================================
+
+/// Replace normalizer with String pattern replaces literal matches.
+#[test]
+fn normalizer_replace_string_pattern() {
+    let json = byte_level_with_normalizer(
+        r#"{"type": "Replace", "pattern": {"String": "hello"}, "content": "world"}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    let replaced = ctx.encode_with("hello", &opts);
+    let expected = ctx_raw.encode_with("world", &opts);
+    assert_eq!(
+        replaced, expected,
+        "Replace normalizer must replace 'hello' → 'world'"
+    );
+}
+
+/// Replace normalizer: non-matching text is unchanged.
+#[test]
+fn normalizer_replace_no_match() {
+    let json = byte_level_with_normalizer(
+        r#"{"type": "Replace", "pattern": {"String": "xyz"}, "content": "abc"}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    let result = ctx.encode_with("hello", &opts);
+    let expected = ctx_raw.encode_with("hello", &opts);
+    assert_eq!(result, expected, "non-matching text must be unchanged");
+}
+
+// ===========================================================================
+// Prepend normalizer
+// ===========================================================================
+
+/// Prepend normalizer adds a prefix string to the input.
+#[test]
+fn normalizer_prepend() {
+    let json = byte_level_with_normalizer(
+        r#"{"type": "Prepend", "prepend": "X"}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    let prepended = ctx.encode_with("hello", &opts);
+    let expected = ctx_raw.encode_with("Xhello", &opts);
+    assert_eq!(
+        prepended, expected,
+        "Prepend normalizer must add 'X' prefix"
+    );
+}
+
+/// Prepend normalizer on empty input must still produce the prefix.
+///
+/// Prepend("X") on "" should produce "X" → tokens for "X".
+#[test]
+fn normalizer_prepend_empty_input() {
+    let json = byte_level_with_normalizer(
+        r#"{"type": "Prepend", "prepend": "X"}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    let prepended = ctx.encode_with("", &opts);
+    let expected = ctx_raw.encode_with("X", &opts);
+    assert_eq!(
+        prepended, expected,
+        "Prepend on empty input must produce just the prefix, got: {prepended:?}"
+    );
+}
+
+// ===========================================================================
+// BertNormalizer with explicit flags
+// ===========================================================================
+
+/// BertNormalizer with clean_text=true replaces tab characters with spaces.
+#[test]
+fn bert_normalizer_clean_text_replaces_tab() {
+    let json = byte_level_with_normalizer(
+        r#"{"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": false, "strip_accents": false, "lowercase": false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // "a\tb" → clean_text → "a b"
+    let cleaned = ctx.encode_with("a\tb", &opts);
+    let expected = ctx_raw.encode_with("a b", &opts);
+    assert_eq!(
+        cleaned, expected,
+        "BertNormalizer clean_text must replace tab with space"
+    );
+}
+
+/// BertNormalizer with handle_chinese_chars=false does NOT add CJK spaces.
+#[test]
+fn bert_normalizer_no_cjk_spacing_when_disabled() {
+    let json = byte_level_with_normalizer(
+        r#"{"type": "BertNormalizer", "clean_text": false, "handle_chinese_chars": false, "strip_accents": false, "lowercase": false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // "日" with handle_chinese_chars=false → no added spaces
+    let bert_tokens = ctx.encode_with("日", &opts);
+    let raw_tokens = ctx_raw.encode_with("日", &opts);
+    assert_eq!(
+        bert_tokens, raw_tokens,
+        "handle_chinese_chars=false must not add spaces around CJK"
+    );
+}
+
+/// BertNormalizer with strip_accents=false does NOT strip accents.
+#[test]
+fn bert_normalizer_no_strip_when_disabled() {
+    let json = byte_level_with_normalizer(
+        r#"{"type": "BertNormalizer", "clean_text": false, "handle_chinese_chars": false, "strip_accents": false, "lowercase": false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // "café" with strip_accents=false → accent preserved
+    let bert_tokens = ctx.encode_with("café", &opts);
+    let raw_tokens = ctx_raw.encode_with("café", &opts);
+    assert_eq!(
+        bert_tokens, raw_tokens,
+        "strip_accents=false must preserve accents"
+    );
+}
+
+/// BertNormalizer with lowercase=false does NOT lowercase.
+#[test]
+fn bert_normalizer_no_lowercase_when_disabled() {
+    let json = byte_level_with_normalizer(
+        r#"{"type": "BertNormalizer", "clean_text": false, "handle_chinese_chars": false, "strip_accents": false, "lowercase": false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // "HELLO" with lowercase=false → not lowercased
+    let bert_tokens = ctx.encode_with("HELLO", &opts);
+    let raw_tokens = ctx_raw.encode_with("HELLO", &opts);
+    assert_eq!(
+        bert_tokens, raw_tokens,
+        "lowercase=false must preserve case"
+    );
+}
+
+// ===========================================================================
+// Metaspace pretokenizer edge cases
+// ===========================================================================
+
+/// Metaspace with add_prefix_space=false does not prepend ▁.
+#[test]
+fn pretokenizer_metaspace_no_prefix_space() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "\u2581": 1, "\u2581hello": 2, "hello": 3,
+      "h": 4, "e": 5, "l": 6, "o": 7
+    },
+    "merges": ["h e", "he l", "hel l", "hell o"]
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = no_bos();
+    // "hello" with add_prefix_space=false → no ▁ prefix → "hello" (not "▁hello")
+    let tokens = ctx.encode_with("hello", &opts);
+    // Token 2 is ▁hello. If no prefix, it should NOT match.
+    // Instead should match "hello"=3 if available, or char fallback.
+    assert!(
+        !tokens.is_empty(),
+        "encode must produce tokens"
+    );
+    // With add_prefix_space=false, should NOT produce ▁hello (id=2) as first token
+    if tokens[0] == 2 {
+        // This would mean ▁ was incorrectly prepended
+        panic!("add_prefix_space=false must NOT prepend ▁, got ▁hello as first token");
+    }
+}
+
+// ===========================================================================
+// Sequence normalizer with three stages
+// ===========================================================================
+
+/// Three-stage sequence normalizer: Lowercase + StripAccents + NFC.
+#[test]
+fn normalizer_sequence_three_stages() {
+    let json = byte_level_with_normalizer(
+        r#"{"type": "Sequence", "normalizers": [{"type": "Lowercase"}, {"type": "StripAccents"}, {"type": "NFC"}]}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // "CAFÉ" → Lowercase → "café" → StripAccents → "cafe" → NFC → "cafe"
+    let tokens = ctx.encode_with("CAFÉ", &opts);
+    let expected = ctx_raw.encode_with("cafe", &opts);
+    assert_eq!(
+        tokens, expected,
+        "Sequence(Lowercase, StripAccents, NFC): 'CAFÉ' → 'cafe'"
+    );
+}
