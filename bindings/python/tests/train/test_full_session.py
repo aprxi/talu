@@ -7,7 +7,7 @@ import pickle
 
 import pytest
 
-from talu.exceptions import StateError
+from talu.exceptions import StateError, TrainingError
 from talu.train import (
     FullSessionConfig,
     FullSessionInfo,
@@ -295,3 +295,125 @@ class TestFullTrainingSessionLifecycle:
             assert info.state is FullSessionState.CREATED
             assert info.current_step == 0
             assert info.total_params == 0
+
+class TestFullTrainingSessionWeightExport:
+    """FullTrainingSession can export flat model weights for checkpointing."""
+
+    def test_export_weights_matches_parameter_count(self):
+        config = TransformerConfig(
+            vocab_size=32,
+            d_model=16,
+            num_layers=1,
+            num_heads=2,
+            d_ff=32,
+            seq_len=8,
+        )
+        with FullTrainingSession() as session:
+            session.init_model(config, seed=123)
+
+            weights = session.export_weights_f32()
+            assert len(weights) == session.info.total_params
+            assert any(value != 0.0 for value in weights)
+
+            token_embedding_size = config.vocab_size * config.d_model
+            assert weights[token_embedding_size] == pytest.approx(1.0)
+
+    def test_export_weights_before_init_raises_training_error(self):
+        with FullTrainingSession() as session:
+            with pytest.raises(TrainingError) as exc_info:
+                session.export_weights_f32()
+        assert exc_info.value.code == "TRAIN_INVALID_STATE"
+
+    def test_import_weights_restores_exported_values_and_step(self):
+        config = TransformerConfig(
+            vocab_size=32,
+            d_model=16,
+            num_layers=1,
+            num_heads=2,
+            d_ff=32,
+            seq_len=8,
+        )
+        with FullTrainingSession() as source:
+            source.init_model(config, seed=123)
+            exported = source.export_weights_f32()
+
+        with FullTrainingSession() as restored:
+            restored.init_model(config, seed=999)
+            restored.import_weights_f32(exported, step=17)
+            roundtrip = restored.export_weights_f32()
+            assert list(roundtrip) == list(exported)
+            assert restored.info.current_step == 17
+
+    def test_import_optimizer_state_restores_exported_values(self):
+        config = TransformerConfig(
+            vocab_size=32,
+            d_model=16,
+            num_layers=1,
+            num_heads=2,
+            d_ff=32,
+            seq_len=8,
+        )
+        training = FullSessionConfig(total_steps=4, batch_size=1)
+        tokens = [0, 1, 2, 3, 4, 5, 6, 7, 0]
+
+        with FullTrainingSession() as source:
+            source.init_model(config, seed=123)
+            source.configure(training)
+            source.set_data(tokens)
+            source.step()
+            exported_weights = source.export_weights_f32()
+            exported_opt = source.export_optimizer_state_f32()
+
+        with FullTrainingSession() as restored:
+            restored.init_model(config, seed=999)
+            restored.configure(training)
+            restored.set_data(tokens)
+            restored.import_weights_f32(exported_weights, step=1)
+            restored.import_optimizer_state_f32(exported_opt)
+            assert list(restored.export_optimizer_state_f32()) == list(exported_opt)
+
+    def test_resume_next_step_matches_uninterrupted_training(self):
+        config = TransformerConfig(
+            vocab_size=32,
+            d_model=16,
+            num_layers=1,
+            num_heads=2,
+            d_ff=32,
+            seq_len=4,
+        )
+        training = FullSessionConfig(total_steps=6, batch_size=1)
+        tokens = [
+            0, 1, 2, 3, 4,
+            5, 6, 7, 8, 9,
+            10, 11, 12, 13, 14,
+            15, 16, 17, 18, 19,
+            20, 21, 22, 23, 24,
+        ]
+
+        with FullTrainingSession() as uninterrupted:
+            uninterrupted.init_model(config, seed=123)
+            uninterrupted.configure(training)
+            uninterrupted.set_data(tokens)
+            uninterrupted.step()
+            exported_weights = uninterrupted.export_weights_f32()
+            exported_opt = uninterrupted.export_optimizer_state_f32()
+            second_live = uninterrupted.step()
+            final_weights_live = uninterrupted.export_weights_f32()
+            final_opt_live = uninterrupted.export_optimizer_state_f32()
+
+        with FullTrainingSession() as resumed:
+            resumed.init_model(config, seed=999)
+            resumed.configure(training)
+            resumed.set_data(tokens)
+            resumed.import_weights_f32(exported_weights, step=1)
+            resumed.import_optimizer_state_f32(exported_opt)
+            second_resumed = resumed.step()
+            final_weights_resumed = resumed.export_weights_f32()
+            final_opt_resumed = resumed.export_optimizer_state_f32()
+
+        assert second_resumed.step == second_live.step
+        assert second_resumed.loss == pytest.approx(second_live.loss, abs=0.0)
+        assert second_resumed.learning_rate == pytest.approx(second_live.learning_rate, abs=0.0)
+        assert second_resumed.grad_norm == pytest.approx(second_live.grad_norm, abs=0.0)
+        assert list(final_weights_resumed) == list(final_weights_live)
+        assert list(final_opt_resumed) == list(final_opt_live)

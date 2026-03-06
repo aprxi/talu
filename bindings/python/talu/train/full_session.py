@@ -5,6 +5,8 @@ Provides the FullTrainingSession class for training small transformer
 models from scratch using talu's Zig training engine.
 """
 
+import array
+
 from collections.abc import Callable
 from typing import Any
 
@@ -15,7 +17,11 @@ from ._full_bindings import (
     FullSessionConfig,
     FullSessionInfo,
     TransformerConfig,
+    call_train_full_copy_optimizer_state_f32,
+    call_train_full_copy_weights_f32,
     call_train_full_configure,
+    call_train_full_load_optimizer_state_f32,
+    call_train_full_load_weights_f32,
     call_train_full_create,
     call_train_full_destroy,
     call_train_full_get_info,
@@ -54,13 +60,14 @@ class FullTrainingSession:
         ...     session.run(callback=lambda m: print(f"step {m.step}: loss={m.loss:.4f}"))
     """
 
-    __slots__ = ("_ptr", "_callback_ref")
+    __slots__ = ("_ptr", "_callback_ref", "_data_ref")
 
     def __init__(self) -> None:
         code, ptr = call_train_full_create()
         check(code)
         self._ptr: int | None = ptr
         self._callback_ref: Any = None
+        self._data_ref: Any = None
 
     @property
     def _handle(self) -> int:
@@ -79,6 +86,7 @@ class FullTrainingSession:
             call_train_full_destroy(self._ptr)
             self._ptr = None
             self._callback_ref = None
+            self._data_ref = None
 
     def __enter__(self) -> "FullTrainingSession":
         return self
@@ -160,8 +168,8 @@ class FullTrainingSession:
     def set_data(self, tokens: list[int]) -> None:
         """Set tokenized training data from a list of token IDs.
 
-        The tokens are copied to native memory. Must be called after
-        ``configure()``.
+        The session retains a native-compatible copy of the token buffer for
+        the lifetime of the loaded dataset. Must be called after ``configure()``.
 
         Args:
             tokens: List of token IDs (u32 values).
@@ -173,8 +181,9 @@ class FullTrainingSession:
         Example:
             >>> session.set_data([0, 1, 2, 3, 4, 5, 6, 7])
         """
-        code = call_train_full_set_data(self._handle, tokens)
+        code, retained = call_train_full_set_data(self._handle, tokens)
         check(code)
+        self._data_ref = retained
 
     def load_data(self, data_path: str) -> None:
         """Load tokenized training data from a flat binary file.
@@ -196,6 +205,7 @@ class FullTrainingSession:
             self._handle, data_path.encode("utf-8")
         )
         check(code)
+        self._data_ref = None
 
     # =========================================================================
     # Training
@@ -252,6 +262,49 @@ class FullTrainingSession:
             check(code)
         finally:
             self._callback_ref = None
+
+    def export_weights_f32(self) -> array.array:
+        """Export current model weights as a flat ``array('f')``.
+
+        The flat order matches TinyLLM's training checkpoint layout:
+        token embedding, final norm, lm head, then per-layer attention and
+        FFN tensors.
+
+        Returns:
+            Flat ``array('f')`` containing all trainable weights.
+
+        Raises:
+            TaluError: If the session has no initialized model.
+            StateError: If the session is closed.
+        """
+        info = self.info
+        code, weights = call_train_full_copy_weights_f32(
+            self._handle, info.total_params
+        )
+        check(code)
+        assert weights is not None
+        return weights
+
+    def import_weights_f32(self, weights: array.array | list[float], *, step: int = 0) -> None:
+        """Import flat model weights and restore the training step counter."""
+        code = call_train_full_load_weights_f32(self._handle, weights, step)
+        check(code)
+
+    def export_optimizer_state_f32(self) -> array.array:
+        """Export Adam optimizer moments as a flat ``array('f')``."""
+        info = self.info
+        code, state = call_train_full_copy_optimizer_state_f32(
+            self._handle, info.total_params * 2
+        )
+        check(code)
+        assert state is not None
+        return state
+
+    def import_optimizer_state_f32(self, state: array.array | list[float]) -> None:
+        """Import Adam optimizer moments from a flat ``array('f')``."""
+        code = call_train_full_load_optimizer_state_f32(self._handle, state)
+        check(code)
+
 
     # =========================================================================
     # Info

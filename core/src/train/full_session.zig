@@ -238,6 +238,7 @@ pub const FullTrainingSession = struct {
             @intCast(self.training_config.batch_size),
             @intCast(mc.seq_len),
         );
+        self.syncDataLoaderCursor();
 
         self.state = .data_loaded;
     }
@@ -271,6 +272,7 @@ pub const FullTrainingSession = struct {
             @intCast(self.training_config.batch_size),
             @intCast(mc.seq_len),
         );
+        self.syncDataLoaderCursor();
 
         self.state = .data_loaded;
     }
@@ -316,12 +318,10 @@ pub const FullTrainingSession = struct {
 
         // Optimizer step
         const lr = sched.getLr(self.current_step);
-        // Set optimizer step_count for correct bias correction.
-        // All params should use the same step count.
-        opt.step_count = self.current_step;
         self.stepAllParams(opt, lr);
 
         self.current_step += 1;
+        opt.step_count = self.current_step;
         if (self.state == .data_loaded) self.state = .training;
 
         return .{
@@ -362,6 +362,78 @@ pub const FullTrainingSession = struct {
             .total_params = if (self.weights) |*w| w.totalParams() else 0,
             .batch_size = self.training_config.batch_size,
         };
+    }
+
+    /// Copy current model weights into a caller-provided flat f32 buffer.
+    pub fn copyWeightsF32(self: *const FullTrainingSession, out: []f32) !void {
+        if (self.weights == null) return error.InvalidState;
+        const weights = &self.weights.?;
+        weights.copyFlatF32(out);
+    }
+
+    /// Restore model weights and step counter from a flat checkpoint buffer.
+    pub fn loadWeightsF32(self: *FullTrainingSession, flat: []const f32, step: u64) !void {
+        if (self.weights == null) return error.InvalidState;
+        const weights = &self.weights.?;
+        weights.loadFlatF32(flat);
+        self.current_step = step;
+        self.syncResumeState();
+    }
+
+    /// Total number of f32 elements needed to serialize optimizer state.
+    pub fn optimizerStateLen(self: *const FullTrainingSession) !usize {
+        if (self.weights == null or self.opt_states == null) return error.InvalidState;
+        return @as(usize, @intCast(self.weights.?.totalParams())) * 2;
+    }
+
+    /// Copy Adam first/second moments into a flat f32 buffer.
+    /// Layout per tensor: m values, then v values, in ModelWeights parameter order.
+    pub fn copyOptimizerStateF32(self: *const FullTrainingSession, out: []f32) !void {
+        const expected_len = try self.optimizerStateLen();
+        if (out.len != expected_len) return error.InvalidState;
+
+        const states = self.opt_states.?;
+        var cursor: usize = 0;
+        for (states) |*state| {
+            cursor += copyOptSlice(out[cursor..], state.m);
+            cursor += copyOptSlice(out[cursor..], state.v);
+        }
+        std.debug.assert(cursor == out.len);
+    }
+
+    /// Restore Adam first/second moments from a flat f32 buffer.
+    pub fn loadOptimizerStateF32(self: *FullTrainingSession, flat: []const f32) !void {
+        const expected_len = try self.optimizerStateLen();
+        if (flat.len != expected_len) return error.InvalidState;
+
+        const states = self.opt_states.?;
+        var cursor: usize = 0;
+        for (states) |*state| {
+            cursor += loadOptSlice(state.m, flat[cursor..]);
+            cursor += loadOptSlice(state.v, flat[cursor..]);
+        }
+        std.debug.assert(cursor == flat.len);
+        self.syncResumeState();
+    }
+
+
+    fn syncResumeState(self: *FullTrainingSession) void {
+        self.syncDataLoaderCursor();
+        if (self.optimizer) |*opt| opt.step_count = self.current_step;
+    }
+
+    fn syncDataLoaderCursor(self: *FullTrainingSession) void {
+        if (self.data_loader) |*dl| {
+            const batches_per_epoch = dl.numBatches();
+            if (batches_per_epoch == 0) {
+                dl.cursor = 0;
+                return;
+            }
+
+            const step_mod = @as(usize, @intCast(self.current_step % batches_per_epoch));
+            const batch_stride = dl.batch_size * (dl.seq_len + 1);
+            dl.cursor = step_mod * batch_stride;
+        }
     }
 
     /// Free all resources.
@@ -435,24 +507,25 @@ pub const FullTrainingSession = struct {
     fn stepAllParams(self: *FullTrainingSession, opt: *AdamW, lr: f32) void {
         var weights = &self.weights.?;
         const states = self.opt_states.?;
+        const step_index = self.current_step + 1;
 
         // Global weights
-        opt.step(weights.token_embedding.asSlice(f32), weights.grad_token_embedding.asSlice(), &states[0], lr);
-        opt.step(weights.final_norm.asSlice(f32), weights.grad_final_norm.asSlice(), &states[1], lr);
-        opt.step(weights.lm_head.asSlice(f32), weights.grad_lm_head.asSlice(), &states[2], lr);
+        opt.stepAt(weights.token_embedding.asSlice(f32), weights.grad_token_embedding.asSlice(), &states[0], lr, step_index);
+        opt.stepAt(weights.final_norm.asSlice(f32), weights.grad_final_norm.asSlice(), &states[1], lr, step_index);
+        opt.stepAt(weights.lm_head.asSlice(f32), weights.grad_lm_head.asSlice(), &states[2], lr, step_index);
 
         // Per-layer weights
         for (weights.layers, 0..) |*layer, li| {
             const base = GLOBAL_PARAMS + li * PARAMS_PER_LAYER;
-            opt.step(layer.attn_norm.asSlice(f32), layer.grad_attn_norm.asSlice(), &states[base + 0], lr);
-            opt.step(layer.q_proj.asSlice(f32), layer.grad_q_proj.asSlice(), &states[base + 1], lr);
-            opt.step(layer.k_proj.asSlice(f32), layer.grad_k_proj.asSlice(), &states[base + 2], lr);
-            opt.step(layer.v_proj.asSlice(f32), layer.grad_v_proj.asSlice(), &states[base + 3], lr);
-            opt.step(layer.o_proj.asSlice(f32), layer.grad_o_proj.asSlice(), &states[base + 4], lr);
-            opt.step(layer.ffn_norm.asSlice(f32), layer.grad_ffn_norm.asSlice(), &states[base + 5], lr);
-            opt.step(layer.gate_proj.asSlice(f32), layer.grad_gate_proj.asSlice(), &states[base + 6], lr);
-            opt.step(layer.up_proj.asSlice(f32), layer.grad_up_proj.asSlice(), &states[base + 7], lr);
-            opt.step(layer.down_proj.asSlice(f32), layer.grad_down_proj.asSlice(), &states[base + 8], lr);
+            opt.stepAt(layer.attn_norm.asSlice(f32), layer.grad_attn_norm.asSlice(), &states[base + 0], lr, step_index);
+            opt.stepAt(layer.q_proj.asSlice(f32), layer.grad_q_proj.asSlice(), &states[base + 1], lr, step_index);
+            opt.stepAt(layer.k_proj.asSlice(f32), layer.grad_k_proj.asSlice(), &states[base + 2], lr, step_index);
+            opt.stepAt(layer.v_proj.asSlice(f32), layer.grad_v_proj.asSlice(), &states[base + 3], lr, step_index);
+            opt.stepAt(layer.o_proj.asSlice(f32), layer.grad_o_proj.asSlice(), &states[base + 4], lr, step_index);
+            opt.stepAt(layer.ffn_norm.asSlice(f32), layer.grad_ffn_norm.asSlice(), &states[base + 5], lr, step_index);
+            opt.stepAt(layer.gate_proj.asSlice(f32), layer.grad_gate_proj.asSlice(), &states[base + 6], lr, step_index);
+            opt.stepAt(layer.up_proj.asSlice(f32), layer.grad_up_proj.asSlice(), &states[base + 7], lr, step_index);
+            opt.stepAt(layer.down_proj.asSlice(f32), layer.grad_down_proj.asSlice(), &states[base + 8], lr, step_index);
 
             // Sync fused QKV weight buffer after q/k/v weights updated.
             layer.syncQkvBuf();
@@ -491,6 +564,18 @@ fn scaleGrad(data: []f32, factor: f32) void {
     while (i < data.len) : (i += 1) {
         data[i] *= factor;
     }
+}
+
+fn copyOptSlice(dst: []f32, src: []const f32) usize {
+    std.debug.assert(dst.len >= src.len);
+    @memcpy(dst[0..src.len], src);
+    return src.len;
+}
+
+fn loadOptSlice(dst: []f32, src: []const f32) usize {
+    std.debug.assert(src.len >= dst.len);
+    @memcpy(dst, src[0..dst.len]);
+    return dst.len;
 }
 
 // =============================================================================

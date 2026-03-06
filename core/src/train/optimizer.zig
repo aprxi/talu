@@ -61,13 +61,27 @@ pub const AdamW = struct {
     /// state:  per-parameter optimizer state (m, v)
     /// lr:     learning rate (allows external scheduling)
     pub fn step(self: *AdamW, params: []f32, grads: []const f32, state: *ParamState, lr: f32) void {
+        const t = self.step_count + 1;
+        self.stepAt(params, grads, state, lr, t);
+        self.step_count = t;
+    }
+
+    /// Perform one optimization step using an explicit logical step index.
+    ///
+    /// This is used by FullTrainingSession so all parameter tensors in the
+    /// model use the same Adam bias-correction step within a training step.
+    pub fn stepAt(
+        self: *const AdamW,
+        params: []f32,
+        grads: []const f32,
+        state: *ParamState,
+        lr: f32,
+        t: u64,
+    ) void {
         @setFloatMode(.optimized);
         std.debug.assert(params.len == grads.len);
         std.debug.assert(params.len == state.m.len);
         std.debug.assert(params.len == state.v.len);
-
-        self.step_count += 1;
-        const t = self.step_count;
 
         const beta1 = self.config.beta1;
         const beta2 = self.config.beta2;
@@ -170,6 +184,19 @@ test "AdamW step count increments" {
 
     optimizer.step(&params, &grads, &state, 1e-3);
     try std.testing.expectEqual(@as(u64, 2), optimizer.step_count);
+}
+
+test "AdamW stepAt does not mutate step_count" {
+    const allocator = std.testing.allocator;
+    var optimizer = AdamW.init(.{});
+
+    var params = [_]f32{1.0};
+    const grads = [_]f32{0.1};
+    var state = try ParamState.init(allocator, 1);
+    defer state.deinit();
+
+    optimizer.stepAt(&params, &grads, &state, 1e-3, 4);
+    try std.testing.expectEqual(@as(u64, 0), optimizer.step_count);
 }
 
 test "AdamW weight decay shrinks parameters" {

@@ -3,7 +3,9 @@
 //! Exports C-callable functions for the full training session lifecycle:
 //!   talu_train_full_create, talu_train_full_destroy, talu_train_full_init_model,
 //!   talu_train_full_configure, talu_train_full_set_data, talu_train_full_load_data,
-//!   talu_train_full_step, talu_train_full_run, talu_train_full_get_info
+//!   talu_train_full_step, talu_train_full_run, talu_train_full_get_info,
+//!   talu_train_full_copy_weights_f32, talu_train_full_load_weights_f32,
+//!   talu_train_full_copy_optimizer_state_f32, talu_train_full_load_optimizer_state_f32
 //!
 //! Each function: clearError → validate → delegate → catch → setError → return code.
 
@@ -381,6 +383,162 @@ pub export fn talu_train_full_get_info(
     };
 
     out.* = toCFullSessionInfo(session.getInfo());
+    return 0;
+}
+
+/// Copy current model weights into a caller-provided flat f32 buffer.
+///
+/// The buffer length must equal `talu_train_full_get_info(...).total_params`.
+/// Returns 0 on success, non-zero error code on failure.
+pub export fn talu_train_full_copy_weights_f32(
+    handle: ?*TaluTrainFullSession,
+    out_weights: ?[*]f32,
+    out_len: usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const session: *FullTrainingSession = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    }));
+
+    const expected_len: usize = @intCast(session.getInfo().total_params);
+    if (out_len != expected_len) {
+        capi_error.setErrorWithCode(.invalid_argument, "out_len does not match total_params", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    }
+
+    if (out_len == 0) {
+        const empty = [_]f32{};
+        session.copyWeightsF32(empty[0..]) catch |err| {
+            capi_error.setError(err, "copy_weights_f32 failed", .{});
+            return @intFromEnum(error_codes.errorToCode(err));
+        };
+        return 0;
+    }
+
+    const out_ptr = out_weights orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_weights is null", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    };
+
+    session.copyWeightsF32(out_ptr[0..out_len]) catch |err| {
+        capi_error.setError(err, "copy_weights_f32 failed", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    return 0;
+}
+
+/// Load model weights and step counter from a flat f32 buffer.
+pub export fn talu_train_full_load_weights_f32(
+    handle: ?*TaluTrainFullSession,
+    in_weights: ?[*]const f32,
+    in_len: usize,
+    step: u64,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const session: *FullTrainingSession = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    }));
+
+    const expected_len: usize = @intCast(session.getInfo().total_params);
+    if (in_len != expected_len) {
+        capi_error.setErrorWithCode(.invalid_argument, "in_len does not match total_params", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    }
+
+    if (in_len == 0) {
+        const empty = [_]f32{};
+        session.loadWeightsF32(empty[0..], step) catch |err| {
+            capi_error.setError(err, "load_weights_f32 failed", .{});
+            return @intFromEnum(error_codes.errorToCode(err));
+        };
+        return 0;
+    }
+
+    const in_ptr = in_weights orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "in_weights is null", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    };
+
+    session.loadWeightsF32(in_ptr[0..in_len], step) catch |err| {
+        capi_error.setError(err, "load_weights_f32 failed", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    return 0;
+}
+
+/// Copy Adam optimizer state into a caller-provided flat f32 buffer.
+pub export fn talu_train_full_copy_optimizer_state_f32(
+    handle: ?*TaluTrainFullSession,
+    out_state: ?[*]f32,
+    out_len: usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const session: *FullTrainingSession = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    }));
+
+    const expected_len = session.optimizerStateLen() catch |err| {
+        capi_error.setError(err, "copy_optimizer_state_f32 failed", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    if (out_len != expected_len) {
+        capi_error.setErrorWithCode(.invalid_argument, "out_len does not match optimizer state size", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    }
+
+    if (out_len == 0) return 0;
+
+    const out_ptr = out_state orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_state is null", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    };
+
+    session.copyOptimizerStateF32(out_ptr[0..out_len]) catch |err| {
+        capi_error.setError(err, "copy_optimizer_state_f32 failed", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    return 0;
+}
+
+/// Load Adam optimizer state from a flat f32 buffer.
+pub export fn talu_train_full_load_optimizer_state_f32(
+    handle: ?*TaluTrainFullSession,
+    in_state: ?[*]const f32,
+    in_len: usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const session: *FullTrainingSession = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    }));
+
+    const expected_len = session.optimizerStateLen() catch |err| {
+        capi_error.setError(err, "load_optimizer_state_f32 failed", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    if (in_len != expected_len) {
+        capi_error.setErrorWithCode(.invalid_argument, "in_len does not match optimizer state size", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    }
+
+    if (in_len == 0) return 0;
+
+    const in_ptr = in_state orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "in_state is null", .{});
+        return @intFromEnum(ErrorCode.invalid_argument);
+    };
+
+    session.loadOptimizerStateF32(in_ptr[0..in_len]) catch |err| {
+        capi_error.setError(err, "load_optimizer_state_f32 failed", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
     return 0;
 }
 

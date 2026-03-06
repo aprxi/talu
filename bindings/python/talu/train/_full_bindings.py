@@ -8,6 +8,7 @@ wrappers for talu_train_full_* C API functions.
 Reuses CStepMetrics and CStepCallback from _bindings.py.
 """
 
+import array
 import ctypes
 import enum
 from dataclasses import dataclass
@@ -298,14 +299,14 @@ def call_train_full_configure(ptr: int, config: FullSessionConfig) -> int:
     return _lib.talu_train_full_configure(ptr, ctypes.byref(c_config))
 
 
-def call_train_full_set_data(ptr: int, tokens: list[int]) -> int:
+def call_train_full_set_data(ptr: int, tokens: list[int]) -> tuple[int, Any]:
     """Set tokenized training data from a list of token IDs.
 
     Returns:
-        Error code (0 = success).
+        Tuple of (error_code, retained_buffer).
     """
     arr = (ctypes.c_uint32 * len(tokens))(*tokens)
-    return _lib.talu_train_full_set_data(ptr, arr, len(tokens))
+    return (_lib.talu_train_full_set_data(ptr, arr, len(tokens)), arr)
 
 
 def call_train_full_load_data(ptr: int, data_path: bytes) -> int:
@@ -354,3 +355,78 @@ def call_train_full_get_info(ptr: int) -> tuple[int, FullSessionInfo | None]:
     if code != 0:
         return (code, None)
     return (0, from_c_full_session_info(c_info))
+
+
+def call_train_full_copy_weights_f32(
+    ptr: int, count: int
+) -> tuple[int, array.array | None]:
+    """Copy flat f32 model weights from a full training session.
+
+    Returns:
+        Tuple of (error_code, array('f')). Weights are None on failure.
+    """
+    if count == 0:
+        code = _lib.talu_train_full_copy_weights_f32(ptr, None, 0)
+        if code != 0:
+            return (code, None)
+        return (0, array.array("f"))
+
+    weights = array.array("f", [0.0]) * count
+    c_weights = (ctypes.c_float * count).from_buffer(weights)
+    code = _lib.talu_train_full_copy_weights_f32(ptr, c_weights, count)
+    if code != 0:
+        return (code, None)
+    return (0, weights)
+
+
+def call_train_full_copy_optimizer_state_f32(
+    ptr: int, count: int
+) -> tuple[int, array.array | None]:
+    """Copy flat f32 optimizer state from a full training session."""
+    if count == 0:
+        code = _lib.talu_train_full_copy_optimizer_state_f32(ptr, None, 0)
+        if code != 0:
+            return (code, None)
+        return (0, array.array("f"))
+
+    state = array.array("f", [0.0]) * count
+    c_state = (ctypes.c_float * count).from_buffer(state)
+    code = _lib.talu_train_full_copy_optimizer_state_f32(ptr, c_state, count)
+    if code != 0:
+        return (code, None)
+    return (0, state)
+
+
+def call_train_full_load_weights_f32(
+    ptr: int, weights: array.array | list[float], step: int
+) -> int:
+    """Load flat f32 model weights into a full training session."""
+    if isinstance(weights, array.array):
+        data = weights
+    else:
+        data = array.array("f", weights)
+
+    if len(data) == 0:
+        return _lib.talu_train_full_load_weights_f32(ptr, None, 0, ctypes.c_uint64(step))
+
+    c_weights = (ctypes.c_float * len(data)).from_buffer(data)
+    return _lib.talu_train_full_load_weights_f32(
+        ptr, c_weights, len(data), ctypes.c_uint64(step)
+    )
+
+
+def call_train_full_load_optimizer_state_f32(
+    ptr: int, state: array.array | list[float]
+) -> int:
+    """Load flat f32 optimizer state into a full training session."""
+    if isinstance(state, array.array):
+        data = state
+    else:
+        data = array.array("f", state)
+
+    if len(data) == 0:
+        return _lib.talu_train_full_load_optimizer_state_f32(ptr, None, 0)
+
+    c_state = (ctypes.c_float * len(data)).from_buffer(data)
+    return _lib.talu_train_full_load_optimizer_state_f32(ptr, c_state, len(data))
+

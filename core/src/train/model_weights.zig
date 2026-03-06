@@ -288,6 +288,61 @@ pub const ModelWeights = struct {
         }
     }
 
+    /// Copy all trainable weights into a flat f32 buffer in TinyLLM checkpoint order.
+    /// Order:
+    ///   token_embedding, final_norm, lm_head,
+    ///   for each layer: attn_norm, q_proj, k_proj, v_proj, o_proj,
+    ///                   ffn_norm, gate_proj, up_proj, down_proj.
+    pub fn copyFlatF32(self: *const ModelWeights, out: []f32) void {
+        std.debug.assert(out.len == @as(usize, @intCast(self.totalParams())));
+
+        var cursor: usize = 0;
+
+        cursor += copySlice(out[cursor..], self.token_embedding.asSlice(f32));
+        cursor += copySlice(out[cursor..], self.final_norm.asSlice(f32));
+        cursor += copySlice(out[cursor..], self.lm_head.asSlice(f32));
+
+        for (self.layers) |*layer| {
+            cursor += copySlice(out[cursor..], layer.attn_norm.asSlice(f32));
+            cursor += copySlice(out[cursor..], layer.q_proj.asSlice(f32));
+            cursor += copySlice(out[cursor..], layer.k_proj.asSlice(f32));
+            cursor += copySlice(out[cursor..], layer.v_proj.asSlice(f32));
+            cursor += copySlice(out[cursor..], layer.o_proj.asSlice(f32));
+            cursor += copySlice(out[cursor..], layer.ffn_norm.asSlice(f32));
+            cursor += copySlice(out[cursor..], layer.gate_proj.asSlice(f32));
+            cursor += copySlice(out[cursor..], layer.up_proj.asSlice(f32));
+            cursor += copySlice(out[cursor..], layer.down_proj.asSlice(f32));
+        }
+
+        std.debug.assert(cursor == out.len);
+    }
+
+    /// Load all trainable weights from a flat f32 buffer in TinyLLM checkpoint order.
+    pub fn loadFlatF32(self: *ModelWeights, flat: []const f32) void {
+        std.debug.assert(flat.len == @as(usize, @intCast(self.totalParams())));
+
+        var cursor: usize = 0;
+
+        cursor += loadSlice(self.token_embedding.asSlice(f32), flat[cursor..]);
+        cursor += loadSlice(self.final_norm.asSlice(f32), flat[cursor..]);
+        cursor += loadSlice(self.lm_head.asSlice(f32), flat[cursor..]);
+
+        for (self.layers) |*layer| {
+            cursor += loadSlice(layer.attn_norm.asSlice(f32), flat[cursor..]);
+            cursor += loadSlice(layer.q_proj.asSlice(f32), flat[cursor..]);
+            cursor += loadSlice(layer.k_proj.asSlice(f32), flat[cursor..]);
+            cursor += loadSlice(layer.v_proj.asSlice(f32), flat[cursor..]);
+            cursor += loadSlice(layer.o_proj.asSlice(f32), flat[cursor..]);
+            cursor += loadSlice(layer.ffn_norm.asSlice(f32), flat[cursor..]);
+            cursor += loadSlice(layer.gate_proj.asSlice(f32), flat[cursor..]);
+            cursor += loadSlice(layer.up_proj.asSlice(f32), flat[cursor..]);
+            cursor += loadSlice(layer.down_proj.asSlice(f32), flat[cursor..]);
+            layer.syncQkvBuf();
+        }
+
+        std.debug.assert(cursor == flat.len);
+    }
+
     /// Total number of trainable parameters.
     pub fn totalParams(self: *const ModelWeights) u64 {
         var total: u64 = 0;
@@ -345,6 +400,18 @@ fn fillOnes(data: []f32) void {
     for (data) |*v| {
         v.* = 1.0;
     }
+}
+
+fn copySlice(dst: []f32, src: []const f32) usize {
+    std.debug.assert(dst.len >= src.len);
+    @memcpy(dst[0..src.len], src);
+    return src.len;
+}
+
+fn loadSlice(dst: []f32, src: []const f32) usize {
+    std.debug.assert(src.len >= dst.len);
+    @memcpy(dst, src[0..dst.len]);
+    return dst.len;
 }
 
 // =============================================================================
@@ -517,5 +584,76 @@ test "ModelWeights initRandom values within Xavier bounds" {
     const limit = @sqrt(6.0 / 32.0);
     for (weights.layers[0].q_proj.asSlice(f32)) |v| {
         try testing.expect(v >= -limit and v <= limit);
+    }
+}
+
+test "ModelWeights copyFlatF32 preserves tensor order" {
+    var config = testConfig();
+    config.num_layers = 1;
+    var weights = try ModelWeights.init(testing.allocator, config);
+    defer weights.deinit();
+
+    @memset(weights.token_embedding.asSliceMut(f32), 1.0);
+    @memset(weights.final_norm.asSliceMut(f32), 2.0);
+    @memset(weights.lm_head.asSliceMut(f32), 3.0);
+
+    const layer0 = &weights.layers[0];
+    @memset(layer0.attn_norm.asSliceMut(f32), 4.0);
+    @memset(layer0.q_proj.asSliceMut(f32), 5.0);
+    @memset(layer0.k_proj.asSliceMut(f32), 6.0);
+    @memset(layer0.v_proj.asSliceMut(f32), 7.0);
+    @memset(layer0.o_proj.asSliceMut(f32), 8.0);
+    @memset(layer0.ffn_norm.asSliceMut(f32), 9.0);
+    @memset(layer0.gate_proj.asSliceMut(f32), 10.0);
+    @memset(layer0.up_proj.asSliceMut(f32), 11.0);
+    @memset(layer0.down_proj.asSliceMut(f32), 12.0);
+
+    var flat = try testing.allocator.alloc(f32, @intCast(weights.totalParams()));
+    defer testing.allocator.free(flat);
+    weights.copyFlatF32(flat);
+
+    var cursor: usize = 0;
+    inline for (.{
+        .{ @as(f32, 1.0), weights.token_embedding.numElements() },
+        .{ @as(f32, 2.0), weights.final_norm.numElements() },
+        .{ @as(f32, 3.0), weights.lm_head.numElements() },
+        .{ @as(f32, 4.0), layer0.attn_norm.numElements() },
+        .{ @as(f32, 5.0), layer0.q_proj.numElements() },
+        .{ @as(f32, 6.0), layer0.k_proj.numElements() },
+        .{ @as(f32, 7.0), layer0.v_proj.numElements() },
+        .{ @as(f32, 8.0), layer0.o_proj.numElements() },
+        .{ @as(f32, 9.0), layer0.ffn_norm.numElements() },
+        .{ @as(f32, 10.0), layer0.gate_proj.numElements() },
+        .{ @as(f32, 11.0), layer0.up_proj.numElements() },
+        .{ @as(f32, 12.0), layer0.down_proj.numElements() },
+    }) |section| {
+        for (flat[cursor .. cursor + section[1]]) |v| {
+            try testing.expectEqual(section[0], v);
+        }
+        cursor += section[1];
+    }
+    try testing.expectEqual(flat.len, cursor);
+}
+
+test "ModelWeights loadFlatF32 roundtrips copyFlatF32" {
+    const config = testConfig();
+    var source = try ModelWeights.init(testing.allocator, config);
+    defer source.deinit();
+    source.initRandom(123);
+
+    const flat = try testing.allocator.alloc(f32, @intCast(source.totalParams()));
+    defer testing.allocator.free(flat);
+    source.copyFlatF32(flat);
+
+    var restored = try ModelWeights.init(testing.allocator, config);
+    defer restored.deinit();
+    restored.loadFlatF32(flat);
+
+    const restored_flat = try testing.allocator.alloc(f32, @intCast(restored.totalParams()));
+    defer testing.allocator.free(restored_flat);
+    restored.copyFlatF32(restored_flat);
+
+    for (flat, restored_flat) |expected, actual| {
+        try testing.expectEqual(expected, actual);
     }
 }

@@ -520,4 +520,8 @@ comptime {
     _ = &capi.talu_train_full_step;
     _ = &capi.talu_train_full_run;
     _ = &capi.talu_train_full_get_info;
+    _ = &capi.talu_train_full_copy_weights_f32;
+    _ = &capi.talu_train_full_load_weights_f32;
+    _ = &capi.talu_train_full_copy_optimizer_state_f32;
+    _ = &capi.talu_train_full_load_optimizer_state_f32;
 }

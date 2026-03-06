@@ -93,6 +93,39 @@ pub fn applyRuntimeTablesToPair(
     }
 }
 
+pub fn applyRuntimeTablesToPairInterleaved(
+    query_values: []f32,
+    key_values: []f32,
+    sequence_len: usize,
+    query_group_count: usize,
+    source_group_count: usize,
+    feature_width: usize,
+    query_row_width: usize,
+    source_row_width: usize,
+    pos_offset: usize,
+    cos: []const f32,
+    sin: []const f32,
+    rope_dim: usize,
+) !void {
+    if (rope_dim == 0 or rope_dim > feature_width or (rope_dim % 2) != 0) return error.InvalidShape;
+    for (0..sequence_len) |position_idx| {
+        const pos = pos_offset + position_idx;
+        const base = pos * rope_dim;
+        if (base + rope_dim > cos.len or base + rope_dim > sin.len) return error.InvalidShape;
+        const cos_row = cos[base .. base + rope_dim];
+        const sin_row = sin[base .. base + rope_dim];
+
+        for (0..query_group_count) |group_idx| {
+            const off = position_idx * query_row_width + group_idx * feature_width;
+            applyInterleavedFromCosSin(query_values[off .. off + rope_dim], cos_row, sin_row);
+        }
+        for (0..source_group_count) |group_idx| {
+            const off = position_idx * source_row_width + group_idx * feature_width;
+            applyInterleavedFromCosSin(key_values[off .. off + rope_dim], cos_row, sin_row);
+        }
+    }
+}
+
 /// Apply static rotation in-place for paired buffers.
 ///
 /// `rope` must expose:
@@ -122,6 +155,34 @@ pub fn applyStaticTablesToPair(
         for (0..source_group_count) |group_idx| {
             const off = position_idx * source_row_width + group_idx * feature_width;
             rope.applyInPlace(key_values[off .. off + rope_dim], pos);
+        }
+    }
+}
+
+pub fn applyStaticTablesToPairInterleaved(
+    query_values: []f32,
+    key_values: []f32,
+    sequence_len: usize,
+    query_group_count: usize,
+    source_group_count: usize,
+    feature_width: usize,
+    query_row_width: usize,
+    source_row_width: usize,
+    pos_offset: usize,
+    position_delta: isize,
+    rope: anytype,
+) !void {
+    const rope_dim = rope.dim;
+    if (rope_dim == 0 or rope_dim > feature_width) return error.InvalidShape;
+    for (0..sequence_len) |position_idx| {
+        const pos = try indexing.offsetSigned(pos_offset + position_idx, position_delta);
+        for (0..query_group_count) |group_idx| {
+            const off = position_idx * query_row_width + group_idx * feature_width;
+            rope.applyInterleavedInPlace(query_values[off .. off + rope_dim], pos);
+        }
+        for (0..source_group_count) |group_idx| {
+            const off = position_idx * source_row_width + group_idx * feature_width;
+            rope.applyInterleavedInPlace(key_values[off .. off + rope_dim], pos);
         }
     }
 }
@@ -278,6 +339,16 @@ fn applyFromCosSin(vec: []f32, cos: []const f32, sin: []const f32) void {
     }
 }
 
+fn applyInterleavedFromCosSin(vec: []f32, cos: []const f32, sin: []const f32) void {
+    const half = vec.len / 2;
+    for (0..half) |idx| {
+        const x0 = vec[idx * 2];
+        const x1 = vec[idx * 2 + 1];
+        vec[idx * 2] = x0 * cos[idx] - x1 * sin[idx];
+        vec[idx * 2 + 1] = x1 * cos[idx] + x0 * sin[idx];
+    }
+}
+
 test "buildCosSinTablesFromAxisTriples fills duplicated halves" {
     const head_dim: usize = 4;
     const seq_len: usize = 2;
@@ -339,6 +410,37 @@ test "applyStaticTablesToPair applies position offset to each head slice" {
     var k = [_]f32{ 5, 6, 7, 8 };
 
     try applyStaticTablesToPair(&q, &k, 1, 2, 2, 2, 4, 4, 3, 0, &rope);
+
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 4, 5, 6, 7 }, &q);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 8, 9, 10, 11 }, &k);
+}
+
+test "applyRuntimeTablesToPairInterleaved rotates interleaved pairs" {
+    var q = [_]f32{ 1, 2, 3, 4 };
+    var k = [_]f32{ 5, 6, 7, 8 };
+    const cos = [_]f32{ 0, 1, 0, 1 };
+    const sin = [_]f32{ 1, 0, 1, 0 };
+
+    try applyRuntimeTablesToPairInterleaved(&q, &k, 1, 1, 1, 4, 4, 4, 0, &cos, &sin, 4);
+
+    try std.testing.expectEqualSlices(f32, &[_]f32{ -2, 1, -4, 3 }, &q);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ -6, 5, -8, 7 }, &k);
+}
+
+test "applyStaticTablesToPairInterleaved delegates to interleaved rope" {
+    const MockRope = struct {
+        dim: usize = 2,
+        pub fn applyInterleavedInPlace(_: *@This(), vec: []f32, pos: usize) void {
+            const pos_f: f32 = @floatFromInt(pos);
+            for (vec) |*v| v.* += pos_f;
+        }
+    };
+
+    var rope = MockRope{};
+    var q = [_]f32{ 1, 2, 3, 4 };
+    var k = [_]f32{ 5, 6, 7, 8 };
+
+    try applyStaticTablesToPairInterleaved(&q, &k, 1, 2, 2, 2, 4, 4, 3, 0, &rope);
 
     try std.testing.expectEqualSlices(f32, &[_]f32{ 4, 5, 6, 7 }, &q);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 8, 9, 10, 11 }, &k);
