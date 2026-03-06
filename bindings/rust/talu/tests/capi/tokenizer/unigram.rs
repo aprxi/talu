@@ -225,14 +225,10 @@ fn unigram_char_fallback_for_unknown_word() {
     // "abc" → Metaspace → "▁abc"
     // No whole-word "▁abc", falls back to char-level: [▁, a, b, c]
     let tokens = ctx.encode_with("abc", &opts);
-    assert!(
-        tokens.len() > 1,
-        "unknown word must fall back to subword/char tokens, got: {tokens:?}"
-    );
-    // Should not produce unk token (all chars are in vocab)
-    assert!(
-        !tokens.contains(&0),
-        "all chars are in vocab, no unk expected, got: {tokens:?}"
+    assert_eq!(
+        tokens,
+        vec![1, 11, 12, 13],
+        "unknown word must fall back to exact char sequence [▁,a,b,c]"
     );
 }
 
@@ -294,14 +290,7 @@ fn unigram_single_char() {
     };
     // "a" → Metaspace → "▁a" → Unigram → [▁, a] or similar subword split
     let tokens = ctx.encode_with("a", &opts);
-    assert!(
-        !tokens.is_empty(),
-        "single char must produce at least one token"
-    );
-    assert!(
-        !tokens.contains(&0),
-        "'a' is in vocab, no unk expected, got: {tokens:?}"
-    );
+    assert_eq!(tokens, vec![1, 11], "single char should split as [▁, a]");
 }
 
 /// Viterbi selects subword split when no whole-word match exists.
@@ -316,11 +305,10 @@ fn unigram_viterbi_subword_selection() {
         ..Default::default()
     };
     let tokens = ctx.encode_with("hel", &opts);
-    // "▁hel" (score -7.0) is a single token and better than multi-token
     assert_eq!(
-        tokens.len(),
-        1,
-        "Viterbi should prefer '▁hel' as single token, got: {tokens:?}"
+        tokens,
+        vec![15],
+        "Viterbi should prefer exact token ▁hel (id=15), got: {tokens:?}"
     );
 }
 
@@ -355,9 +343,24 @@ fn unigram_unknown_char_produces_unk() {
     };
     // "z" is not in vocab → should produce unk token
     let tokens = ctx.encode_with("z", &opts);
+    assert_eq!(tokens, vec![0], "unknown char 'z' must produce [unk]");
+}
+
+/// Long unbroken input should complete deterministically without panics.
+#[test]
+fn unigram_long_unbroken_input_deterministic() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let input = "a".repeat(20_000);
+    let first = ctx.encode_with(&input, &opts);
+    let second = ctx.encode_with(&input, &opts);
+    assert_eq!(first, second, "long unigram input must be deterministic");
     assert!(
-        tokens.contains(&0),
-        "unknown char 'z' must produce unk token (0), got: {tokens:?}"
+        !first.is_empty(),
+        "long unigram input should produce at least one token"
     );
 }
 

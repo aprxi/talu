@@ -33,6 +33,103 @@ fn decode_empty() {
     assert_eq!(ctx.decode(&[]), "");
 }
 
+/// Decoding an out-of-range token ID must return a typed C-API error.
+#[test]
+fn decode_invalid_token_id_out_of_vocab_errors() {
+    let ctx = TokenizerTestContext::new();
+    let opts = talu_sys::DecodeOptionsC::default();
+    let result = unsafe { super::common::decode_raw(ctx.handle(), &[999_999], &opts) };
+    assert!(
+        !result.error_msg.is_null(),
+        "out-of-range token ID must return non-null error_msg"
+    );
+    assert!(result.text.is_null(), "text pointer must be null on decode error");
+    assert_eq!(result.text_len, 0, "text_len must be 0 on decode error");
+}
+
+/// Decoding u32::MAX must be rejected as invalid token ID.
+#[test]
+fn decode_invalid_token_id_u32_max_errors() {
+    let ctx = TokenizerTestContext::new();
+    let opts = talu_sys::DecodeOptionsC::default();
+    let result = unsafe { super::common::decode_raw(ctx.handle(), &[u32::MAX], &opts) };
+    assert!(
+        !result.error_msg.is_null(),
+        "u32::MAX token ID must return non-null error_msg"
+    );
+    assert!(result.text.is_null(), "text pointer must be null on decode error");
+    assert_eq!(result.text_len, 0, "text_len must be 0 on decode error");
+}
+
+/// decode with null options pointer must use C-API default skip_special_tokens=true.
+#[test]
+fn decode_null_options_defaults_to_skip_special_tokens() {
+    let ctx = TokenizerTestContext::with_special_tokens();
+    let result = unsafe { super::common::decode_raw_null_options(ctx.handle(), &[1, 44, 77, 2]) };
+    assert!(
+        result.error_msg.is_null(),
+        "decode with null options should succeed"
+    );
+    let text = unsafe {
+        let slice = std::slice::from_raw_parts(result.text, result.text_len);
+        std::str::from_utf8(slice).expect("decode must return valid UTF-8")
+    };
+    assert_eq!(
+        text, "Hi",
+        "null decode options must default to skip_special_tokens=true"
+    );
+    unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
+}
+
+/// encode with null options pointer must use C-API default add_special_tokens=true.
+#[test]
+fn encode_null_options_defaults_to_add_special_tokens() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"H": 4, "i": 5},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 1}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "special_tokens": {
+      "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+      "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]}
+    }
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw_null_options(ctx.handle(), b"Hi") };
+    assert!(result.error_msg.is_null(), "encode with null options should succeed");
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(
+        ids,
+        &[1, 4, 5, 2],
+        "null encode options must default to add_special_tokens=true"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
 /// In the base fixture, special tokens are in both `model.vocab` and
 /// `added_tokens`. The BPE decoder checks `id_to_token` first (which
 /// always sets `is_special=false`), so `skip_special_tokens` has no
@@ -793,6 +890,30 @@ fn skip_special_interleaved() {
     );
 }
 
+/// Invariant: skip_special output equals retained output with special literals removed.
+#[test]
+fn skip_special_invariant_matches_manual_filtering() {
+    let ctx = TokenizerTestContext::with_special_tokens();
+    let keep = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    let ids = [1, 44, 77, 2, 44, 1, 77, 2, 0, 44];
+    let retained = ctx.decode_with(&ids, &keep);
+    let skipped = ctx.decode_with(&ids, &skip);
+    let manual = retained
+        .replace("<s>", "")
+        .replace("</s>", "")
+        .replace("<pad>", "")
+        .replace("<unk>", "");
+    assert_eq!(
+        skipped, manual,
+        "skip_special output must equal retained output with special tokens removed"
+    );
+}
+
 /// Cleanup removes space before apostrophe contractions.
 ///
 /// Contractions n't, 's, 'm must have space before apostrophe removed.
@@ -829,5 +950,74 @@ fn cleanup_removes_contraction_space() {
     assert_eq!(
         decoded, "i don't",
         "cleanup must remove space before n't contraction, got: {decoded:?}"
+    );
+}
+
+/// Cleanup must apply multiple contraction rules in one output string.
+#[test]
+fn cleanup_applies_multiple_contractions_in_sequence() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "i": 3, "'m": 4, "we": 5, "'re": 6, "they": 7, "'ve": 8, "?": 9
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    // Before cleanup: "i 'm we 're they 've ?"
+    // After cleanup:  "i'm we're they've?"
+    let decoded = ctx.decode(&[3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(
+        decoded, "i'm we're they've?",
+        "cleanup must handle overlapping contraction + punctuation rules, got: {decoded:?}"
+    );
+}
+
+/// With cleanup disabled, spacing before punctuation/contractions must remain.
+#[test]
+fn cleanup_disabled_preserves_spaces() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "i": 3, "'m": 4, "sure": 5, "?": 6
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let decoded = ctx.decode(&[3, 4, 5, 6]);
+    assert_eq!(
+        decoded, "i 'm sure ?",
+        "cleanup=false must preserve intermediate spaces, got: {decoded:?}"
     );
 }

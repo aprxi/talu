@@ -267,7 +267,9 @@ impl TokenizerTestContext {
         }
         let text = unsafe {
             let slice = std::slice::from_raw_parts(result.text, result.text_len);
-            String::from_utf8_lossy(slice).to_string()
+            std::str::from_utf8(slice)
+                .expect("decode returned invalid UTF-8 bytes")
+                .to_owned()
         };
         unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
         text
@@ -570,6 +572,14 @@ pub unsafe fn encode_raw(
     talu_tokenizer_encode(handle, text.as_ptr(), text.len(), options as *const _)
 }
 
+/// Encode text via the correctly-typed FFI with null options pointer.
+///
+/// # Safety
+/// `handle` must be a valid tokenizer handle.
+pub unsafe fn encode_raw_null_options(handle: *mut c_void, text: &[u8]) -> talu_sys::EncodeResult {
+    talu_tokenizer_encode(handle, text.as_ptr(), text.len(), std::ptr::null())
+}
+
 /// Decode tokens via the correctly-typed FFI, returning the raw result.
 ///
 /// # Safety
@@ -580,4 +590,62 @@ pub unsafe fn decode_raw(
     options: &talu_sys::DecodeOptionsC,
 ) -> talu_sys::DecodeResult {
     talu_tokenizer_decode(handle, tokens.as_ptr(), tokens.len(), options as *const _)
+}
+
+/// Decode token IDs via the correctly-typed FFI with null options pointer.
+///
+/// # Safety
+/// `handle` must be a valid tokenizer handle.
+pub unsafe fn decode_raw_null_options(handle: *mut c_void, tokens: &[u32]) -> talu_sys::DecodeResult {
+    talu_tokenizer_decode(handle, tokens.as_ptr(), tokens.len(), std::ptr::null())
+}
+
+/// Batch encode texts via the correctly-typed FFI.
+///
+/// # Safety
+/// `handle` must be a valid tokenizer handle.
+pub unsafe fn encode_batch_raw(
+    handle: *mut c_void,
+    texts: &[*const u8],
+    lengths: &[usize],
+    options: &talu_sys::EncodeOptions,
+) -> talu_sys::BatchEncodeResult {
+    talu_tokenizer_encode_batch(
+        handle,
+        texts.as_ptr(),
+        lengths.as_ptr(),
+        texts.len(),
+        options as *const _,
+    )
+}
+
+/// Batch encode texts via the correctly-typed FFI with null options pointer.
+///
+/// # Safety
+/// `handle` must be a valid tokenizer handle.
+pub unsafe fn encode_batch_raw_null_options(
+    handle: *mut c_void,
+    texts: &[*const u8],
+    lengths: &[usize],
+) -> talu_sys::BatchEncodeResult {
+    talu_tokenizer_encode_batch(
+        handle,
+        texts.as_ptr(),
+        lengths.as_ptr(),
+        texts.len(),
+        std::ptr::null(),
+    )
+}
+
+/// Convert flattened batch ids/offsets to a padded tensor via the correctly-typed FFI.
+///
+/// # Safety
+/// `ids`/`offsets` must follow C-API layout contracts for `num_sequences`.
+pub unsafe fn batch_to_padded_tensor_raw(
+    ids: *const u32,
+    offsets: *const usize,
+    num_sequences: usize,
+    options: &talu_sys::PaddedTensorOptions,
+) -> talu_sys::PaddedTensorResult {
+    talu_batch_to_padded_tensor(ids, offsets, num_sequences, options as *const _)
 }

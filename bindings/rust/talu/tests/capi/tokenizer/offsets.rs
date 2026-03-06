@@ -686,3 +686,387 @@ fn truncation_noop_all_fields_intact() {
 
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
+
+/// Offsets must map normalized lowercase+accent-stripped output back to original bytes.
+#[test]
+fn offsets_with_lowercase_and_strip_accents_map_to_original_bytes() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "c": 1, "a": 2, "f": 3, "e": 4
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": {"type": "Sequence", "normalizers": [{"type": "Lowercase"}, {"type": "StripAccents"}]},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), "CAFÉ".as_bytes(), &opts) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 4, "CAFÉ should normalize to c a f e");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 2, 3, 4], "expected normalized token IDs for c a f e");
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
+    assert_eq!((offsets[2].start, offsets[2].end), (2, 3));
+    assert_eq!(
+        (offsets[3].start, offsets[3].end),
+        (3, 5),
+        "accent-stripped e must map to original É byte span"
+    );
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// NFC normalization composing e + combining-acute into é must preserve source span.
+#[test]
+fn offsets_with_nfc_composition_map_to_decomposed_source_span() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "\u00E9": 1},
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": {"type": "NFC"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let input = "e\u{0301}";
+    assert_eq!(input.len(), 3, "decomposed e+acute must be 3 UTF-8 bytes");
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &opts) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 1, "NFC should compose to one token");
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 3),
+        "composed token must map to full decomposed source span"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Template post-processing must set masks and offsets consistently.
+#[test]
+fn postprocessor_masks_and_offsets_are_exact() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"H": 4, "i": 5},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 1}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "special_tokens": {
+      "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+      "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]}
+    }
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"Hi", &opts) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 4);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 4, 5, 2]);
+    let attn = unsafe { std::slice::from_raw_parts(result.attention_mask, result.num_tokens) };
+    assert_eq!(attn, &[1, 1, 1, 1]);
+    let special = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    assert_eq!(special, &[1, 0, 0, 1]);
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 0));
+    assert_eq!((offsets[1].start, offsets[1].end), (0, 1));
+    assert_eq!((offsets[2].start, offsets[2].end), (1, 2));
+    assert_eq!((offsets[3].start, offsets[3].end), (0, 0));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Empty input with template post-processing should still produce exact masks and offsets.
+#[test]
+fn postprocessor_masks_and_offsets_empty_input() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"H": 4, "i": 5},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 1}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "special_tokens": {
+      "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+      "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]}
+    }
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"", &opts) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 2);
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 2]);
+    let special = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    assert_eq!(special, &[1, 1]);
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 0));
+    assert_eq!((offsets[1].start, offsets[1].end), (0, 0));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Replace normalizer expansion (& -> and) should map all expanded tokens to source span.
+#[test]
+fn offsets_replace_expansion_maps_to_single_source_span() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "a": 1, "n": 2, "d": 3},
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": {"type": "Replace", "pattern": {"String": "&"}, "content": "and"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"&", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 3);
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 2, 3]);
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    for off in offsets {
+        assert_eq!(
+            (off.start, off.end),
+            (0, 1),
+            "all expanded chars should map to original '&' source byte span"
+        );
+    }
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Replace normalizer shrinking text (remove apostrophe) must preserve original byte mapping.
+#[test]
+fn offsets_replace_shrink_preserves_original_positions() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "c": 1, "a": 2, "n": 3, "t": 4},
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": {"type": "Replace", "pattern": {"String": "'"}, "content": ""},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"can't", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 4);
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 2, 3, 4]);
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
+    assert_eq!((offsets[2].start, offsets[2].end), (2, 3));
+    assert_eq!(
+        (offsets[3].start, offsets[3].end),
+        (4, 5),
+        "token 't' should map after removed apostrophe"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Repeated merged subsequences should never produce zero offsets.
+#[test]
+fn offsets_repeated_merged_subsequences_no_zero_spans() {
+    let ctx = TokenizerTestContext::with_merges();
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"hellohello", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(result.num_tokens, 2, "hellohello should merge into two hello tokens");
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
+    assert_eq!((offsets[1].start, offsets[1].end), (5, 10));
+}
+
+/// Right truncation after postprocessing must preserve mask/offset semantics.
+#[test]
+fn postprocessor_truncation_right_preserves_masks_and_offsets() {
+    let json = r####"{
+  "version": "1.0",
+  "model": { "type": "BPE", "vocab": {"H": 4, "i": 5}, "merges": [] },
+  "added_tokens": [
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 1}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "special_tokens": {
+      "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+      "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]}
+    }
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 3,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"Hi", &opts) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 3);
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let special = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[1, 4, 5]);
+    assert_eq!(special, &[1, 0, 0]);
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 0));
+    assert_eq!((offsets[1].start, offsets[1].end), (0, 1));
+    assert_eq!((offsets[2].start, offsets[2].end), (1, 2));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Left truncation after postprocessing must preserve mask/offset semantics.
+#[test]
+fn postprocessor_truncation_left_preserves_masks_and_offsets() {
+    let json = r####"{
+  "version": "1.0",
+  "model": { "type": "BPE", "vocab": {"H": 4, "i": 5}, "merges": [] },
+  "added_tokens": [
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 1}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "special_tokens": {
+      "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+      "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]}
+    }
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        truncation: 1,
+        truncation_side: 1,
+        max_length: 3,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"Hi", &opts) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 3);
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let special = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[4, 5, 2]);
+    assert_eq!(special, &[0, 0, 1]);
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
+    assert_eq!((offsets[2].start, offsets[2].end), (0, 0));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}

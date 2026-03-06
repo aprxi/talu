@@ -126,11 +126,12 @@ fn single_word_true_matches_with_spaces() {
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
 
-    // "a cat b" → "a" + " " + "cat"(100) + " " + "b"
+    // Whitespace pre-tokenizer drops spaces, so output should be a + cat + b.
     let tokens = ctx.encode_with("a cat b", &no_bos());
-    assert!(
-        tokens.contains(&100),
-        "single_word=true: 'cat' surrounded by spaces should match, got: {tokens:?}"
+    assert_eq!(
+        tokens,
+        vec![3, 15, 100, 15, 4],
+        "single_word=true: surrounding spaces should remain and cat should match exactly once"
     );
 }
 
@@ -283,14 +284,9 @@ fn rstrip_false_preserves_trailing_whitespace() {
 
     let tokens = ctx.encode_with("[SEP] a", &no_bos());
     assert_eq!(
-        tokens[0], 100,
-        "rstrip=false: first token should be [SEP]=100, got: {tokens:?}"
-    );
-    // The number of tokens should be more than with rstrip=true
-    // because the space is preserved as a separate token/part of word
-    assert!(
-        tokens.len() >= 2,
-        "rstrip=false: space should not be consumed, got: {tokens:?}"
+        tokens,
+        vec![100, 10, 3],
+        "rstrip=false must preserve trailing whitespace as an explicit space token"
     );
 }
 
@@ -325,13 +321,12 @@ fn lstrip_consumes_leading_whitespace() {
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
 
-    // "hello [CLS]" with lstrip=true: space before [CLS] consumed
+    // Whitespace pre-tokenizer drops spaces; lock down exact output.
     let tokens = ctx.encode_with("hello [CLS]", &no_bos());
-    // [CLS] should be the last token
     assert_eq!(
-        *tokens.last().unwrap(),
-        100,
-        "lstrip: last token should be [CLS]=100, got: {tokens:?}"
+        tokens,
+        vec![6, 7, 8, 8, 9, 100],
+        "lstrip fixture should produce exact IDs"
     );
 }
 
@@ -407,8 +402,9 @@ fn shorter_match_when_longer_unavailable() {
     // "abd" → "ab"(100) + "d"(6)
     let tokens = ctx.encode_with("abd", &no_bos());
     assert_eq!(
-        tokens[0], 100,
-        "shorter match: 'ab' should match ID 100 when 'abc' doesn't apply, got: {tokens:?}"
+        tokens,
+        vec![100, 6],
+        "shorter match: 'ab' should match ID 100 when 'abc' doesn't apply"
     );
 }
 
@@ -447,13 +443,9 @@ fn multiple_added_tokens_in_text() {
     // "[A]hello[B]" → [A]=100, "hello" tokens, [B]=101
     let tokens = ctx.encode_with("[A]hello[B]", &no_bos());
     assert_eq!(
-        tokens[0], 100,
-        "first added token should be [A]=100, got: {tokens:?}"
-    );
-    assert_eq!(
-        *tokens.last().unwrap(),
-        101,
-        "last added token should be [B]=101, got: {tokens:?}"
+        tokens,
+        vec![100, 9, 7, 10, 10, 11, 101],
+        "multiple added tokens should be matched with exact surrounding text tokens"
     );
 }
 
@@ -529,13 +521,9 @@ fn skip_special_preserves_non_special_added() {
     // Decode [SPECIAL]=100, a=3, [NORMAL]=101, b=4
     // skip_special_tokens should remove [SPECIAL] but keep [NORMAL]
     let decoded = ctx.decode_with(&[100, 3, 101, 4], &skip);
-    assert!(
-        !decoded.contains("[SPECIAL]"),
-        "skip_special should remove [SPECIAL], got: {decoded:?}"
-    );
-    assert!(
-        decoded.contains("[NORMAL]"),
-        "skip_special should keep non-special [NORMAL], got: {decoded:?}"
+    assert_eq!(
+        decoded, "a[NORMAL]b",
+        "skip_special should remove special added tokens but retain non-special ones"
     );
 }
 
@@ -798,17 +786,268 @@ fn skip_special_strips_special_tokens_in_vocab() {
     // IDs 1,2 are in BOTH vocab AND added_tokens with special=true.
     // skip_special_tokens SHOULD strip them.
     let decoded = ctx.decode_with(&[1, 3, 4, 2], &skip);
-    assert!(
-        !decoded.contains("<s>"),
-        "skip_special must remove <s> even when in vocab, got: {decoded:?}"
-    );
-    assert!(
-        !decoded.contains("</s>"),
-        "skip_special must remove </s> even when in vocab, got: {decoded:?}"
-    );
     assert_eq!(
         decoded, "ab",
         "only non-special tokens should remain, got: {decoded:?}"
+    );
+}
+
+/// single_word=true should treat punctuation as valid boundaries.
+#[test]
+fn single_word_true_matches_with_punctuation_boundaries() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "c": 3, "a": 4, "t": 5, ".": 6, ",": 7, "\"": 8, "(": 9, ")": 10, "x": 11
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("cat.", &no_bos()), vec![100, 6]);
+    assert_eq!(ctx.encode_with("\"cat\"", &no_bos()), vec![8, 100, 8]);
+    assert_eq!(ctx.encode_with("(cat),", &no_bos()), vec![9, 100, 10, 7]);
+}
+
+/// single_word=true must NOT match when embedded in alphanumeric neighbors.
+#[test]
+fn single_word_true_does_not_match_inside_word() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "c": 3, "a": 4, "t": 5, "x": 6
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(ctx.encode_with("xcat", &no_bos()), vec![6, 3, 4, 5]);
+    assert_eq!(ctx.encode_with("catx", &no_bos()), vec![3, 4, 5, 6]);
+    assert_eq!(ctx.encode_with("xcatx", &no_bos()), vec![6, 3, 4, 5, 6]);
+}
+
+/// lstrip=true must consume leading ASCII whitespace classes before added token.
+#[test]
+fn lstrip_consumes_space_tab_and_newline() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "a": 3, "b": 4, " ": 5, "\t": 6, "\n": 7
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "[MID]", "special": false, "lstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(ctx.encode_with("a [MID]b", &no_bos()), vec![3, 100, 4]);
+    assert_eq!(ctx.encode_with("a\t[MID]b", &no_bos()), vec![3, 100, 4]);
+    assert_eq!(ctx.encode_with("a\n[MID]b", &no_bos()), vec![3, 100, 4]);
+}
+
+/// rstrip=true must consume trailing ASCII whitespace classes after added token.
+#[test]
+fn rstrip_consumes_space_tab_and_newline() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "a": 3, "b": 4, " ": 5, "\t": 6, "\n": 7
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "[MID]", "special": false, "rstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(ctx.encode_with("a[MID] b", &no_bos()), vec![3, 100, 4]);
+    assert_eq!(ctx.encode_with("a[MID]\tb", &no_bos()), vec![3, 100, 4]);
+    assert_eq!(ctx.encode_with("a[MID]\nb", &no_bos()), vec![3, 100, 4]);
+}
+
+/// single_word=true punctuation boundary matrix should match around punctuation.
+#[test]
+fn single_word_true_matches_all_common_punctuation_boundaries() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "c": 3, "a": 4, "t": 5,
+      ".": 6, ",": 7, "!": 8, "?": 9, ":": 10, ";": 11,
+      "(": 12, ")": 13, "[": 14, "]": 15, "{": 16, "}": 17,
+      "\"": 18, "'": 19
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    for text in [
+        "cat.",
+        ",cat,",
+        "!cat!",
+        "?cat?",
+        ":cat;",
+        "(cat)",
+        "[cat]",
+        "{cat}",
+        "\"cat\"",
+        "'cat'",
+    ] {
+        let tokens = ctx.encode_with(text, &no_bos());
+        assert!(
+            tokens.contains(&100),
+            "single_word must match at punctuation boundaries for input {text:?}, got {tokens:?}"
+        );
+    }
+}
+
+/// single_word=true should not match when adjacent to digits/underscore.
+#[test]
+fn single_word_true_does_not_match_digit_or_underscore_boundaries() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "c": 3, "a": 4, "t": 5, "1": 6, "_": 7
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    for text in ["1cat", "cat1", "_cat", "cat_", "_cat_"] {
+        let tokens = ctx.encode_with(text, &no_bos());
+        assert!(
+            !tokens.contains(&100),
+            "single_word should not match when adjacent to digit/underscore for {text:?}"
+        );
+    }
+}
+
+/// normalized=true matches against normalized text, not raw original.
+#[test]
+fn added_token_normalized_true_matches_after_lowercase() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "h": 3, "e": 4, "l": 5, "o": 6},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "hello", "special": false, "normalized": true}
+  ],
+  "normalizer": {"type": "Lowercase"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("HELLO", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![100],
+        "normalized=true added token should match lowercased normalized input"
+    );
+}
+
+/// normalized=false should match only original text, not normalized form.
+#[test]
+fn added_token_normalized_false_does_not_match_after_lowercase() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "h": 3, "e": 4, "l": 5, "o": 6},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "hello", "special": false, "normalized": false}
+  ],
+  "normalizer": {"type": "Lowercase"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("HELLO", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![3, 4, 5, 5, 6],
+        "normalized=false added token should not match raw uppercase input"
     );
 }
 

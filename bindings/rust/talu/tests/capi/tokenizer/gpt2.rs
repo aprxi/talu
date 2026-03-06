@@ -217,18 +217,45 @@ fn use_regex_prevents_cross_space_merge() {
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
     let tokens = ctx.encode_with("hello world", &no_bos());
-    // GPT-2 regex: "hello world" → ["hello", " world"]
-    // byte_to_unicode: ["hello", "Ġworld"]
-    // o+Ġ merge can't fire → 11 tokens
     assert_eq!(
-        tokens.len(),
-        11,
-        "use_regex must prevent o+Ġ merge: 'hello'(5) + 'Ġworld'(6) = 11, got: {tokens:?}"
+        tokens,
+        vec![4, 5, 6, 6, 7, 11, 8, 7, 9, 6, 10],
+        "use_regex=true must keep o and Ġ separated across the regex boundary"
     );
-    // Verify no oĠ merge token appears
-    assert!(
-        !tokens.contains(&12),
-        "oĠ merge token (12) must not appear, got: {tokens:?}"
+}
+
+/// With use_regex=false, cross-space merge o+Ġ should be allowed.
+#[test]
+fn use_regex_false_allows_cross_space_merge() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "h": 4, "e": 5, "l": 6, "o": 7, "w": 8, "r": 9, "d": 10,
+      "\u0120": 11,
+      "o\u0120": 12
+    },
+    "merges": ["o \u0120"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("hello world", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![4, 5, 6, 6, 12, 8, 7, 9, 6, 10],
+        "use_regex=false should allow o+Ġ merge within one chunk"
     );
 }
 

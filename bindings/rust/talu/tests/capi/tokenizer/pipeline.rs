@@ -312,18 +312,11 @@ fn pretokenizer_whitespace_splits_words() {
     let opts = no_bos();
 
     let tokens = ctx.encode_with("hello world", &opts);
-    // "hello" = [h,e,l,l,o] = [76,73,80,80,83], "world" = [w,o,r,l,d] = [91,83,86,80,72]
-    // Whitespace pre-tokenizer splits on whitespace; each word tokenized independently.
-    // Space itself may or may not appear depending on behavior.
-    assert!(
-        tokens.len() >= 10,
-        "should have at least 10 tokens for two 5-letter words, got {}",
-        tokens.len()
+    assert_eq!(
+        tokens,
+        vec![76, 73, 80, 80, 83, 91, 83, 86, 80, 72],
+        "Whitespace pre-tokenizer should drop spaces and emit only word chars"
     );
-    // Should NOT contain unk (3) for ASCII text.
-    for (i, &t) in tokens.iter().enumerate() {
-        assert_ne!(t, 3, "token {i} should not be unk");
-    }
 }
 
 /// Whitespace pre-tokenizer: single word has no split.
@@ -349,16 +342,11 @@ fn pretokenizer_punctuation_splits() {
     let opts = no_bos();
 
     let tokens = ctx.encode_with("hello,world", &opts);
-    // "hello" (5) + "," (1) + "world" (5) = 11 tokens minimum.
-    assert!(
-        tokens.len() >= 11,
-        "should tokenize all chars, got {} tokens",
-        tokens.len()
+    assert_eq!(
+        tokens,
+        vec![76, 73, 80, 80, 83, 16, 91, 83, 86, 80, 72],
+        "Punctuation pre-tokenizer should isolate comma as its own token"
     );
-    // No unk tokens for ASCII input.
-    for (i, &t) in tokens.iter().enumerate() {
-        assert_ne!(t, 3, "token {i} should not be unk");
-    }
 }
 
 // ===========================================================================
@@ -373,15 +361,10 @@ fn pretokenizer_bert_splits_both() {
     let opts = no_bos();
 
     let tokens = ctx.encode_with("hello, world!", &opts);
-    // "hello" + "," + " " + "world" + "!" — all ASCII, no unk.
-    for (i, &t) in tokens.iter().enumerate() {
-        assert_ne!(t, 3, "token {i} should not be unk");
-    }
-    // Should have tokens for all characters.
-    assert!(
-        tokens.len() >= 11,
-        "should tokenize all chars, got {}",
-        tokens.len()
+    assert_eq!(
+        tokens,
+        vec![76, 73, 80, 80, 83, 16, 91, 83, 86, 80, 72, 5],
+        "BertPreTokenizer should drop whitespace and isolate punctuation"
     );
 }
 
@@ -514,12 +497,83 @@ fn normalizer_type_bert_cjk_spacing() {
 
     // With BertNormalizer, CJK gets surrounding spaces: " 日 " = space + 3 bytes + space
     let bert_tokens = ctx.encode_with("日", &opts);
-    assert!(
-        bert_tokens.len() > raw_tokens.len(),
-        "BertNormalizer should add spaces around CJK, got {} tokens (expected > {})",
+    assert_eq!(
         bert_tokens.len(),
-        raw_tokens.len()
+        raw_tokens.len() + 2,
+        "BertNormalizer should add exactly one ASCII space on each side of a CJK char"
     );
+}
+
+/// Split pre-tokenizer regex that can match empty strings must not loop forever.
+#[test]
+fn pretokenizer_split_regex_empty_match_completes() {
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"^|\\b"},"behavior":"Removed","invert":false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let opts = no_bos();
+    let text = "hello world";
+    let first = ctx.encode_with(text, &opts);
+    let second = ctx.encode_with(text, &opts);
+    assert_eq!(first, second, "empty-match regex pretokenization must be deterministic");
+}
+
+/// Split behavior Removed should drop regex matches and keep non-matching gaps.
+#[test]
+fn pretokenizer_split_removed_drops_matches() {
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"\\s+"},"behavior":"Removed","invert":false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let tokens = ctx.encode_with("a b", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![69, 70],
+        "Split(Removed) should remove whitespace matches entirely"
+    );
+}
+
+/// Split behavior Isolated should keep both matches and non-matching gaps.
+#[test]
+fn pretokenizer_split_isolated_keeps_matches_and_gaps() {
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"\\s+"},"behavior":"Isolated","invert":false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let tokens = ctx.encode_with("a b", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![69, 4, 70],
+        "Split(Isolated) should preserve space token as isolated match"
+    );
+}
+
+/// Split invert=true should emit only regex matches.
+#[test]
+fn pretokenizer_split_invert_true_keeps_only_matches() {
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"\\d+"},"behavior":"Removed","invert":true}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let tokens = ctx.encode_with("a12b34", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![21, 22, 23, 24],
+        "Split(invert=true) should keep only digit matches"
+    );
+}
+
+/// Pathological regex patterns must complete deterministically.
+#[test]
+fn pretokenizer_split_pathological_regex_deterministic() {
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"(a+)+b"},"behavior":"Isolated","invert":false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let text = format!("{}b", "a".repeat(160));
+    let first = ctx.encode_with(&text, &no_bos());
+    let second = ctx.encode_with(&text, &no_bos());
+    assert_eq!(first, second, "pathological regex must be deterministic");
 }
 
 /// Sequence containing {"type": "Lowercase"} works correctly.

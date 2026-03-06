@@ -38,6 +38,22 @@ fn ascii_string(n: usize) -> String {
         .collect()
 }
 
+fn lcg_next(state: &mut u64) -> u64 {
+    // Numerical Recipes LCG constants; deterministic test data only.
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+    *state
+}
+
+fn seeded_ascii_non_space(seed: u64, len: usize) -> String {
+    let mut state = seed;
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        let v = (lcg_next(&mut state) % 94) as u8; // 0x21..=0x7E
+        out.push((0x21 + v) as char);
+    }
+    out
+}
+
 /// Default encode options (no BOS).
 fn no_bos() -> talu_sys::EncodeOptions {
     talu_sys::EncodeOptions {
@@ -561,6 +577,85 @@ fn roundtrip_all_printable_ascii() {
     assert_eq!(decoded, input);
 }
 
+/// Seeded property test: ASCII non-space roundtrips exactly.
+#[test]
+fn seeded_property_roundtrip_ascii_non_space() {
+    let ctx = TokenizerTestContext::new();
+    let opts = no_bos();
+    let mut seed = 0xDEADBEEFCAFEBABEu64;
+    for case_idx in 0..200 {
+        let len = ((lcg_next(&mut seed) % 128) + 1) as usize;
+        let input = seeded_ascii_non_space(seed ^ case_idx as u64, len);
+        let tokens = ctx.encode_with(&input, &opts);
+        let decoded = ctx.decode(&tokens);
+        assert_eq!(decoded, input, "seeded roundtrip failed for case {case_idx}");
+    }
+}
+
+/// Seeded property test: offsets are monotonic, in-bounds, and contiguous for base fixture.
+#[test]
+fn seeded_property_offsets_invariants() {
+    let ctx = TokenizerTestContext::new();
+    let opts = no_bos();
+    let mut seed = 0x1234_5678_9ABC_DEF0u64;
+    for case_idx in 0..120 {
+        let len = ((lcg_next(&mut seed) % 96) + 1) as usize;
+        let input = seeded_ascii_non_space(seed ^ case_idx as u64, len);
+        let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &opts) };
+        assert!(result.error_msg.is_null());
+        assert_eq!(result.num_tokens, input.len());
+        let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+        if !offsets.is_empty() {
+            assert_eq!(offsets[0].start, 0);
+            assert_eq!(offsets.last().unwrap().end as usize, input.len());
+            for window in offsets.windows(2) {
+                assert!(
+                    window[0].start <= window[0].end && window[1].start <= window[1].end,
+                    "offset spans must satisfy start<=end"
+                );
+                assert_eq!(window[0].end, window[1].start, "offsets must be contiguous");
+            }
+        }
+        unsafe { talu_sys::talu_encode_result_free(result) };
+    }
+}
+
+/// Seeded property test: left/right truncation must equal suffix/prefix of full encode.
+#[test]
+fn seeded_property_truncation_invariants() {
+    let ctx = TokenizerTestContext::new();
+    let mut seed = 0x0F0F_F0F0_A5A5_5A5Au64;
+    for case_idx in 0..150 {
+        let len = ((lcg_next(&mut seed) % 80) + 4) as usize;
+        let input = seeded_ascii_non_space(seed ^ case_idx as u64, len);
+        let full = ctx.encode_with(&input, &no_bos());
+        let keep = ((lcg_next(&mut seed) % (full.len() as u64 - 1)) + 1) as usize;
+
+        let right_opts = talu_sys::EncodeOptions {
+            add_bos: 0,
+            truncation: 1,
+            truncation_side: 0,
+            max_length: keep,
+            ..Default::default()
+        };
+        let left_opts = talu_sys::EncodeOptions {
+            add_bos: 0,
+            truncation: 1,
+            truncation_side: 1,
+            max_length: keep,
+            ..Default::default()
+        };
+        let right = ctx.encode_with(&input, &right_opts);
+        let left = ctx.encode_with(&input, &left_opts);
+        assert_eq!(right, full[..keep], "right truncation mismatch at case {case_idx}");
+        assert_eq!(
+            left,
+            full[full.len() - keep..],
+            "left truncation mismatch at case {case_idx}"
+        );
+    }
+}
+
 // ===========================================================================
 // Byte-level fixture concurrency
 // ===========================================================================
@@ -630,10 +725,11 @@ fn concurrent_byte_level_roundtrip_8_threads() {
                     };
                     assert!(dec_result.error_msg.is_null());
                     let decoded = unsafe {
-                        std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                        std::str::from_utf8(std::slice::from_raw_parts(
                             dec_result.text as *const u8,
                             dec_result.text_len,
                         ))
+                        .expect("decode must return valid UTF-8")
                     };
                     assert_eq!(decoded, text, "roundtrip mismatch");
 
@@ -648,5 +744,68 @@ fn concurrent_byte_level_roundtrip_8_threads() {
 
     for t in threads {
         t.join().expect("thread panicked");
+    }
+}
+
+/// High-contention mixed workload on one shared tokenizer handle.
+#[test]
+fn concurrent_mixed_workload_high_contention() {
+    let ctx = TokenizerTestContext::new();
+    let shared = Arc::new(SharedHandle(ctx.handle()));
+    let encode_opts = no_bos();
+    let decode_opts = talu_sys::DecodeOptionsC::default();
+    let num_threads = 32;
+    let iterations = 300;
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for thread_id in 0..num_threads {
+        let shared = Arc::clone(&shared);
+        let h = thread::spawn(move || {
+            for i in 0..iterations {
+                let case = (thread_id + i) % 4;
+                match case {
+                    0 => {
+                        let enc = unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &encode_opts) };
+                        assert!(enc.error_msg.is_null());
+                        let ids = unsafe { std::slice::from_raw_parts(enc.ids, enc.num_tokens) };
+                        assert_eq!(ids, &[44, 73, 80, 80, 83]);
+                        unsafe { talu_sys::talu_encode_result_free(enc) };
+                    }
+                    1 => {
+                        let dec = unsafe { super::common::decode_raw(shared.ptr(), &[44, 77], &decode_opts) };
+                        assert!(dec.error_msg.is_null());
+                        let text = unsafe {
+                            std::str::from_utf8(std::slice::from_raw_parts(dec.text, dec.text_len))
+                                .expect("decode must return valid UTF-8")
+                        };
+                        assert_eq!(text, "Hi");
+                        unsafe { talu_sys::talu_decode_result_free(dec.text, dec.text_len) };
+                    }
+                    2 => {
+                        let mut token: *mut i8 = std::ptr::null_mut();
+                        let rc = unsafe {
+                            talu_sys::talu_tokenizer_id_to_token(
+                                shared.ptr(),
+                                44,
+                                &mut token as *mut _ as *mut std::ffi::c_void,
+                            )
+                        };
+                        assert_eq!(rc, 0);
+                        let text = unsafe { std::ffi::CStr::from_ptr(token) }.to_string_lossy();
+                        assert_eq!(text, "H");
+                        unsafe { talu_sys::talu_text_free(token) };
+                    }
+                    _ => {
+                        let size = unsafe { talu_sys::talu_tokenizer_get_vocab_size(shared.ptr()) };
+                        assert!(size >= 99);
+                    }
+                }
+            }
+        });
+        handles.push(h);
+    }
+
+    for h in handles {
+        h.join().expect("thread panicked");
     }
 }

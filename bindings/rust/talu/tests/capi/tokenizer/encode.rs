@@ -138,6 +138,27 @@ fn encode_truncation_noop_when_under_limit() {
     assert_eq!(ctx.encode_with("Hi", &opts), [44, 77]);
 }
 
+/// Invalid truncation_side values outside {0,1} must be rejected.
+#[test]
+fn encode_rejects_invalid_truncation_side() {
+    let ctx = TokenizerTestContext::new();
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 1,
+        truncation_side: 2,
+        max_length: 2,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"Hello", &opts) };
+    assert!(
+        !result.error_msg.is_null(),
+        "invalid truncation_side must return an error"
+    );
+    if result.error_msg.is_null() {
+        unsafe { talu_sys::talu_encode_result_free(result) };
+    }
+}
+
 /// Repeated pattern with spaces: "abc123 " × 50.
 /// Spaces become unk (3), ASCII chars encode normally.
 #[test]
@@ -341,6 +362,40 @@ fn encode_template_postproc_default_opts_no_special() {
         tokens,
         vec![4, 5],
         "default encode must not add BOS/EOS, got: {tokens:?}"
+    );
+}
+
+/// add_bos=1 + add_eos=0 must prepend BOS without appending EOS.
+#[test]
+fn encode_template_postproc_add_bos_without_eos() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        add_eos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("Hi", &opts);
+    assert_eq!(
+        tokens,
+        vec![1, 4, 5],
+        "add_bos=1/add_eos=0 must produce [BOS, tokens], got: {tokens:?}"
+    );
+}
+
+/// add_bos=0 + add_eos=1 must append EOS without prepending BOS.
+#[test]
+fn encode_template_postproc_add_eos_without_bos() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        add_eos: 1,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("Hi", &opts);
+    assert_eq!(
+        tokens,
+        vec![4, 5, 2],
+        "add_bos=0/add_eos=1 must produce [tokens, EOS], got: {tokens:?}"
     );
 }
 

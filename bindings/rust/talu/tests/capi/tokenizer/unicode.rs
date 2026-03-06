@@ -162,14 +162,9 @@ fn decode_mixed_ascii_unk() {
     let ctx = TokenizerTestContext::new();
     let tokens = ctx.encode_with("café", &no_bos());
     let decoded = ctx.decode(&tokens);
-    // First 3 chars decode to "caf", last 2 tokens are <unk> substitutions.
-    assert!(
-        decoded.starts_with("caf"),
-        "should start with ASCII portion"
-    );
-    assert!(
-        decoded.len() > 3,
-        "should have unk substitutions after 'caf'"
+    assert_eq!(
+        decoded, "caf<unk><unk>",
+        "non-ASCII bytes should decode as <unk> tokens in base fixture"
     );
 }
 
@@ -201,6 +196,8 @@ fn tokenize_strings_multibyte() {
     assert_eq!(&tokens[0], "c");
     assert_eq!(&tokens[1], "a");
     assert_eq!(&tokens[2], "f");
+    assert_eq!(&tokens[3], "<unk>");
+    assert_eq!(&tokens[4], "<unk>");
 
     unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
 }
@@ -216,6 +213,25 @@ fn tokenize_strings_emoji() {
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 4);
     unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
+}
+
+/// Stress Unicode normalization/tokenization with dense combining marks.
+#[test]
+fn encode_zalgo_combining_marks_is_deterministic() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+    let combining = "\u{0301}".repeat(200);
+    let input = format!("a{combining}");
+    let first = ctx.encode_with(&input, &opts);
+    let second = ctx.encode_with(&input, &opts);
+    assert_eq!(first, second, "combining-mark heavy input must be deterministic");
+    assert_eq!(
+        first.len(),
+        input.len(),
+        "byte-level fixture should produce one token per byte"
+    );
+    let decoded = ctx.decode(&first);
+    assert_eq!(decoded, input, "combining-mark heavy input must roundtrip");
 }
 
 // ===========================================================================

@@ -83,6 +83,18 @@ fn id_to_token_out_of_range() {
     assert!(out.is_null());
 }
 
+/// id_to_token for negative IDs must return error and null output.
+#[test]
+fn id_to_token_negative_id_errors() {
+    let ctx = TokenizerTestContext::new();
+    let mut out: *mut i8 = ptr::null_mut();
+    let rc = unsafe {
+        talu_sys::talu_tokenizer_id_to_token(ctx.handle(), -1, &mut out as *mut _ as *mut c_void)
+    };
+    assert_ne!(rc, 0, "negative token ID must be rejected");
+    assert!(out.is_null(), "output must remain null for negative token ID");
+}
+
 /// token_to_id for special tokens returns exact IDs.
 #[test]
 fn token_to_id_special_tokens() {
@@ -109,6 +121,26 @@ fn token_to_id_unknown() {
         talu_sys::talu_tokenizer_token_to_id(ctx.handle(), b"nonexistent_xyz".as_ptr(), 15)
     };
     assert_eq!(id, -1);
+}
+
+/// token_to_id must use exact byte length; superstrings must not prefix-match.
+#[test]
+fn token_to_id_requires_exact_length() {
+    let ctx = TokenizerTestContext::new();
+
+    // Valid token bytes with trailing junk and embedded null must not match.
+    let with_suffix = b"<s>xyz";
+    let with_null_suffix = b"<s>\x00xyz";
+    let id_suffix =
+        unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), with_suffix.as_ptr(), 6) };
+    let id_null_suffix = unsafe {
+        talu_sys::talu_tokenizer_token_to_id(ctx.handle(), with_null_suffix.as_ptr(), 7)
+    };
+    assert_eq!(id_suffix, -1, "token_to_id must not prefix-match '<s>'");
+    assert_eq!(
+        id_null_suffix, -1,
+        "token_to_id must respect explicit length and reject '<s>\\0xyz'"
+    );
 }
 
 /// token_to_id for known regular ASCII tokens returns correct IDs.
@@ -178,6 +210,37 @@ fn byte_level_vocab_entries() {
     sorted_ids.sort();
     let expected: Vec<u32> = (0..260).collect();
     assert_eq!(sorted_ids, expected, "IDs should be contiguous 0..260");
+
+    unsafe {
+        talu_sys::talu_vocab_result_free(
+            result.tokens,
+            result.lengths,
+            result.ids,
+            result.num_entries,
+        )
+    };
+}
+
+/// get_vocab lengths must equal token byte lengths for every entry.
+#[test]
+fn get_vocab_lengths_match_returned_strings() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let result = unsafe { talu_sys::talu_tokenizer_get_vocab(ctx.handle()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_entries, 260);
+
+    let tokens =
+        unsafe { std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_entries) };
+    let lengths = unsafe { std::slice::from_raw_parts(result.lengths, result.num_entries) };
+
+    for i in 0..result.num_entries {
+        let c = unsafe { std::ffi::CStr::from_ptr(tokens[i]) };
+        assert_eq!(
+            lengths[i] as usize,
+            c.to_bytes().len(),
+            "vocab length mismatch at index {i}"
+        );
+    }
 
     unsafe {
         talu_sys::talu_vocab_result_free(

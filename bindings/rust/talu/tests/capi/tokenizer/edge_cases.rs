@@ -70,6 +70,93 @@ fn encode_mixed_whitespace() {
     assert_eq!(ctx.encode_with("a\tb\nc", &no_bos()), [69, 3, 70, 3, 71]);
 }
 
+/// Invalid UTF-8 byte sequences on encode path must be deterministic and non-crashing.
+#[test]
+fn encode_invalid_utf8_bytes_is_deterministic() {
+    let ctx = TokenizerTestContext::new();
+    let opts = no_bos();
+    let bytes: &[u8] = &[0xF0, 0x9F, 0x8E]; // truncated 4-byte UTF-8 sequence
+
+    let first = unsafe { super::common::encode_raw(ctx.handle(), bytes, &opts) };
+    let second = unsafe { super::common::encode_raw(ctx.handle(), bytes, &opts) };
+    assert_eq!(
+        first.error_msg.is_null(),
+        second.error_msg.is_null(),
+        "invalid UTF-8 encode should have deterministic success/failure status"
+    );
+
+    if first.error_msg.is_null() {
+        let ids_a = unsafe { std::slice::from_raw_parts(first.ids, first.num_tokens) };
+        let ids_b = unsafe { std::slice::from_raw_parts(second.ids, second.num_tokens) };
+        assert_eq!(ids_a, ids_b, "invalid UTF-8 encode output must be deterministic");
+    } else {
+        assert!(first.ids.is_null());
+        assert!(second.ids.is_null());
+    }
+
+    unsafe {
+        talu_sys::talu_encode_result_free(first);
+        talu_sys::talu_encode_result_free(second);
+    }
+}
+
+/// Invalid UTF-8 byte sequences on tokenize path must be deterministic and non-crashing.
+#[test]
+fn tokenize_invalid_utf8_bytes_is_deterministic() {
+    let ctx = TokenizerTestContext::new();
+    let bytes: &[u8] = &[0xED, 0xA0, 0x80]; // surrogate-like invalid UTF-8 sequence
+
+    let first = unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    let second = unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    assert_eq!(
+        first.error_msg.is_null(),
+        second.error_msg.is_null(),
+        "invalid UTF-8 tokenize should have deterministic success/failure status"
+    );
+    if first.error_msg.is_null() {
+        assert_eq!(first.num_tokens, second.num_tokens);
+    }
+    unsafe {
+        talu_sys::talu_tokenize_result_free(first.tokens, first.num_tokens);
+        talu_sys::talu_tokenize_result_free(second.tokens, second.num_tokens);
+    }
+}
+
+/// Invalid UTF-8 byte sequences on tokenize_bytes path must be deterministic.
+#[test]
+fn tokenize_bytes_invalid_utf8_is_deterministic() {
+    let ctx = TokenizerTestContext::new();
+    let bytes: &[u8] = &[0xE2, 0x82]; // truncated 3-byte UTF-8 sequence
+
+    let first =
+        unsafe { talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    let second =
+        unsafe { talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    assert_eq!(
+        first.error_msg.is_null(),
+        second.error_msg.is_null(),
+        "invalid UTF-8 tokenize_bytes should be deterministic"
+    );
+    if first.error_msg.is_null() {
+        assert_eq!(first.num_tokens, second.num_tokens);
+        assert_eq!(first.data_len, second.data_len);
+    }
+    unsafe {
+        talu_sys::talu_tokenize_bytes_result_free(
+            first.data,
+            first.data_len,
+            first.offsets,
+            first.num_tokens,
+        );
+        talu_sys::talu_tokenize_bytes_result_free(
+            second.data,
+            second.data_len,
+            second.offsets,
+            second.num_tokens,
+        );
+    }
+}
+
 // ===========================================================================
 // Special token strings as literal text
 // ===========================================================================
