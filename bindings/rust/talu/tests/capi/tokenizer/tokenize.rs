@@ -255,6 +255,69 @@ fn tokenize_bytes_partial_merge() {
     };
 }
 
+/// tokenize (string tokens) and tokenize_bytes (byte slices) must produce the same token boundaries.
+#[test]
+fn tokenize_and_tokenize_bytes_match_tokens_across_cases() {
+    let ctx = TokenizerTestContext::with_merges();
+    let cases = ["hello", "helo", "abc", "Hi", "hellohello", ""];
+
+    for (case_idx, text) in cases.iter().enumerate() {
+        let string_result = unsafe {
+            talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+        };
+        assert!(
+            string_result.error_msg.is_null(),
+            "case {case_idx}: tokenize failed"
+        );
+        let byte_result = unsafe {
+            talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+        };
+        assert!(
+            byte_result.error_msg.is_null(),
+            "case {case_idx}: tokenize_bytes failed"
+        );
+
+        let string_tokens = if string_result.num_tokens == 0 || string_result.tokens.is_null() {
+            Vec::<Vec<u8>>::new()
+        } else {
+            let ptrs = unsafe {
+                std::slice::from_raw_parts(
+                    string_result.tokens as *const *const i8,
+                    string_result.num_tokens,
+                )
+            };
+            (0..string_result.num_tokens)
+                .map(|i| unsafe { std::ffi::CStr::from_ptr(ptrs[i]).to_bytes().to_vec() })
+                .collect::<Vec<Vec<u8>>>()
+        };
+
+        let byte_tokens = if byte_result.num_tokens == 0 {
+            Vec::<Vec<u8>>::new()
+        } else {
+            let offsets = unsafe { std::slice::from_raw_parts(byte_result.offsets, byte_result.num_tokens + 1) };
+            let data = unsafe { std::slice::from_raw_parts(byte_result.data, byte_result.data_len) };
+            (0..byte_result.num_tokens)
+                .map(|i| data[offsets[i]..offsets[i + 1]].to_vec())
+                .collect::<Vec<Vec<u8>>>()
+        };
+
+        unsafe {
+            talu_sys::talu_tokenize_result_free(string_result.tokens, string_result.num_tokens);
+            talu_sys::talu_tokenize_bytes_result_free(
+                byte_result.data,
+                byte_result.data_len,
+                byte_result.offsets,
+                byte_result.num_tokens,
+            );
+        }
+
+        assert_eq!(
+            string_tokens, byte_tokens,
+            "case {case_idx}: tokenize and tokenize_bytes token streams must match"
+        );
+    }
+}
+
 // ===========================================================================
 // Encode offsets with merged tokens
 // ===========================================================================

@@ -303,8 +303,11 @@ const TEMPLATE_POSTPROC_JSON: &str = r####"{
 #[test]
 fn encode_template_postproc_adds_bos_and_eos() {
     let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
+    // Rust zeroes FFI structs for Default, so add_eos must be explicit even
+    // though the Zig extern struct declares a default of 1.
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     // "Hi" → [H=4, i=5], with BOS/EOS → [<s>=1, H=4, i=5, </s>=2]
@@ -322,6 +325,7 @@ fn encode_template_postproc_empty_string() {
     let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     let tokens = ctx.encode_with("", &opts);
@@ -396,6 +400,40 @@ fn encode_template_postproc_add_eos_without_bos() {
         tokens,
         vec![4, 5, 2],
         "add_bos=0/add_eos=1 must produce [tokens, EOS], got: {tokens:?}"
+    );
+}
+
+/// add_bos=1 + add_eos=0 on empty input should produce only BOS.
+#[test]
+fn encode_template_postproc_empty_add_bos_without_eos() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        add_eos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("", &opts);
+    assert_eq!(
+        tokens,
+        vec![1],
+        "empty input with add_bos=1/add_eos=0 must produce [BOS], got: {tokens:?}"
+    );
+}
+
+/// add_bos=0 + add_eos=1 on empty input should produce only EOS.
+#[test]
+fn encode_template_postproc_empty_add_eos_without_bos() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        add_eos: 1,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("", &opts);
+    assert_eq!(
+        tokens,
+        vec![2],
+        "empty input with add_bos=0/add_eos=1 must produce [EOS], got: {tokens:?}"
     );
 }
 
@@ -779,6 +817,7 @@ fn encode_eos_only_template_appends_eos() {
     let ctx = TokenizerTestContext::from_json(EOS_ONLY_TEMPLATE_JSON);
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     let tokens = ctx.encode_with("Hi", &opts);
@@ -795,6 +834,7 @@ fn encode_eos_only_template_empty_string() {
     let ctx = TokenizerTestContext::from_json(EOS_ONLY_TEMPLATE_JSON);
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     let tokens = ctx.encode_with("", &opts);
@@ -1036,6 +1076,7 @@ fn template_processing_correct_sep_token() {
     let ctx = TokenizerTestContext::from_json(json);
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     // encode_with adds CLS/SEP from post-processor when add_bos=1.
@@ -1097,6 +1138,7 @@ fn template_processing_empty_input_gets_cls_sep() {
     let ctx = TokenizerTestContext::from_json(json);
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     // Empty input should produce just [CLS, SEP]

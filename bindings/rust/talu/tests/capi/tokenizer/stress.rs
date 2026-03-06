@@ -3,10 +3,12 @@
 //! These tests exercise buffer handling, resource lifecycle, and thread safety
 //! at scale — matching the depth of the db/chat stress tests.
 
-use crate::capi::tokenizer::common::{byte_token_id, TokenizerTestContext, TOKENIZER_JSON};
+use crate::capi::tokenizer::common::{
+    byte_token_id, OwnedDecodeResult, OwnedEncodeResult, TokenizerTestContext, TOKENIZER_JSON,
+};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 // ---------------------------------------------------------------------------
@@ -371,6 +373,234 @@ fn concurrent_roundtrip_8_threads() {
     for (i, result) in results.into_iter().enumerate() {
         result.unwrap_or_else(|_| panic!("Thread {i} panicked"));
     }
+}
+
+/// A barrier-backed high-contention encode workload must remain correct under
+/// real scheduling overlap on a single shared handle.
+#[test]
+fn concurrent_encode_barrier_high_contention() {
+    let ctx = TokenizerTestContext::new();
+    let shared = Arc::new(SharedHandle(ctx.handle()));
+    let barrier = Arc::new(Barrier::new(16));
+    let iterations = 1_000;
+    let mut handles = Vec::new();
+
+    for thread_id in 0..16 {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        let handle = thread::spawn(move || {
+            let texts: &[&[u8]] = &[b"Hi", b"Hello", b"abc", b"012", b"A"];
+            let expected: &[&[u32]] = &[
+                &[44, 77],
+                &[44, 73, 80, 80, 83],
+                &[69, 70, 71],
+                &[20, 21, 22],
+                &[37],
+            ];
+            let opts = no_bos();
+
+            barrier.wait();
+            for i in 0..iterations {
+                let idx = (thread_id + i) % texts.len();
+                let result =
+                    OwnedEncodeResult::new(unsafe { super::common::encode_raw(shared.ptr(), texts[idx], &opts) });
+                assert!(result.error_msg().is_null(), "thread {thread_id} iter {i}: encode failed");
+                let tokens = result.ids();
+                assert_eq!(tokens, expected[idx], "thread {thread_id} iter {i}: wrong tokens");
+            }
+        });
+        handles.push(handle);
+    }
+
+    for (i, handle) in handles.into_iter().enumerate() {
+        handle.join().unwrap_or_else(|_| panic!("Thread {i} panicked"));
+    }
+}
+
+/// Error state must be thread-isolated: an error on one thread must not leak
+/// into `talu_last_error_code()` reads on another thread using the same handle.
+#[test]
+fn concurrent_last_error_code_is_thread_isolated() {
+    let ctx = TokenizerTestContext::new();
+    let shared = Arc::new(SharedHandle(ctx.handle()));
+    let barrier = Arc::new(Barrier::new(2));
+
+    let ok_handle = {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let opts = no_bos();
+            barrier.wait();
+            for i in 0..500 {
+                let result =
+                    OwnedEncodeResult::new(unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &opts) });
+                assert!(result.error_msg().is_null(), "success thread iter {i}: encode failed");
+                assert_eq!(
+                    unsafe { talu_sys::talu_last_error_code() },
+                    talu_sys::ErrorCode::Ok as i32,
+                    "success thread iter {i}: error code leaked from another thread"
+                );
+            }
+        })
+    };
+
+    let err_handle = {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let opts = talu_sys::DecodeOptionsC::default();
+            barrier.wait();
+            for i in 0..500 {
+                let result =
+                    OwnedDecodeResult::new(unsafe { super::common::decode_raw(shared.ptr(), &[u32::MAX], &opts) });
+                assert!(
+                    !result.error_msg().is_null(),
+                    "error thread iter {i}: invalid-token decode must fail"
+                );
+                assert_eq!(
+                    unsafe { talu_sys::talu_last_error_code() },
+                    talu_sys::ErrorCode::TokenizerInvalidTokenId as i32,
+                    "error thread iter {i}: wrong error code"
+                );
+            }
+        })
+    };
+
+    ok_handle.join().expect("success thread panicked");
+    err_handle.join().expect("error thread panicked");
+}
+
+/// A barrier-backed mixed workload must remain correct under real overlap
+/// across encode, decode, id lookup, and vocab-size queries.
+#[test]
+fn concurrent_mixed_workload_barrier_high_contention() {
+    let ctx = TokenizerTestContext::new();
+    let shared = Arc::new(SharedHandle(ctx.handle()));
+    let barrier = Arc::new(Barrier::new(24));
+    let encode_opts = no_bos();
+    let decode_opts = talu_sys::DecodeOptionsC::default();
+    let mut handles = Vec::new();
+
+    for thread_id in 0..24 {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        let h = thread::spawn(move || {
+            barrier.wait();
+            for i in 0..500 {
+                match (thread_id + i) % 4 {
+                    0 => {
+                        let enc =
+                            OwnedEncodeResult::new(unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &encode_opts) });
+                        assert!(enc.error_msg().is_null(), "thread {thread_id} iter {i}: encode failed");
+                        let ids = enc.ids();
+                        assert_eq!(ids, &[44, 73, 80, 80, 83]);
+                    }
+                    1 => {
+                        let dec =
+                            OwnedDecodeResult::new(unsafe { super::common::decode_raw(shared.ptr(), &[44, 77], &decode_opts) });
+                        assert!(dec.error_msg().is_null(), "thread {thread_id} iter {i}: decode failed");
+                        assert_eq!(dec.text(), "Hi");
+                    }
+                    2 => {
+                        let mut token: *mut i8 = std::ptr::null_mut();
+                        let rc = unsafe {
+                            talu_sys::talu_tokenizer_id_to_token(
+                                shared.ptr(),
+                                44,
+                                &mut token as *mut _ as *mut std::ffi::c_void,
+                            )
+                        };
+                        assert_eq!(rc, 0, "thread {thread_id} iter {i}: id_to_token failed");
+                        let text = unsafe { std::ffi::CStr::from_ptr(token) }.to_string_lossy();
+                        assert_eq!(text, "H");
+                        unsafe { talu_sys::talu_text_free(token) };
+                    }
+                    _ => {
+                        let size = unsafe { talu_sys::talu_tokenizer_get_vocab_size(shared.ptr()) };
+                        assert!(size >= 99, "thread {thread_id} iter {i}: bad vocab size");
+                    }
+                }
+            }
+        });
+        handles.push(h);
+    }
+
+    for (i, h) in handles.into_iter().enumerate() {
+        h.join().unwrap_or_else(|_| panic!("Thread {i} panicked"));
+    }
+}
+
+/// `talu_take_last_error` must also be thread-isolated: one thread consuming an
+/// error must not observe or clear another thread's clean state.
+#[test]
+fn concurrent_take_last_error_is_thread_isolated() {
+    let ctx = TokenizerTestContext::new();
+    let shared = Arc::new(SharedHandle(ctx.handle()));
+    let barrier = Arc::new(Barrier::new(2));
+
+    let ok_handle = {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let opts = no_bos();
+            barrier.wait();
+            for i in 0..400 {
+                let result = unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &opts) };
+                assert!(result.error_msg.is_null(), "success thread iter {i}: encode failed");
+                let mut code = -1;
+                let required = unsafe {
+                    talu_sys::talu_take_last_error(
+                        std::ptr::null_mut(),
+                        0,
+                        &mut code as *mut _ as *mut std::ffi::c_void,
+                    )
+                };
+                assert_eq!(required, 0, "success thread iter {i}: take_last_error should be empty");
+                assert_eq!(
+                    code,
+                    talu_sys::ErrorCode::Ok as i32,
+                    "success thread iter {i}: take_last_error code leaked from another thread"
+                );
+                unsafe { talu_sys::talu_encode_result_free(result) };
+            }
+        })
+    };
+
+    let err_handle = {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let opts = talu_sys::DecodeOptionsC::default();
+            barrier.wait();
+            for i in 0..400 {
+                let result = unsafe { super::common::decode_raw(shared.ptr(), &[u32::MAX], &opts) };
+                assert!(
+                    !result.error_msg.is_null(),
+                    "error thread iter {i}: invalid-token decode must fail"
+                );
+                let mut code = 0;
+                let required = unsafe {
+                    talu_sys::talu_take_last_error(
+                        std::ptr::null_mut(),
+                        0,
+                        &mut code as *mut _ as *mut std::ffi::c_void,
+                    )
+                };
+                assert!(
+                    required > 0,
+                    "error thread iter {i}: take_last_error query must report a message"
+                );
+                assert_eq!(
+                    code,
+                    talu_sys::ErrorCode::TokenizerInvalidTokenId as i32,
+                    "error thread iter {i}: take_last_error must report the decode error"
+                );
+            }
+        })
+    };
+
+    ok_handle.join().expect("success thread panicked");
+    err_handle.join().expect("error thread panicked");
 }
 
 // ===========================================================================

@@ -1198,8 +1198,8 @@ fn bpe_decode_with_options_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]c
             const use_byte_map = tok.pretokenizer.byte_level != 0;
             while (idx < token.slice.len) {
                 const codepoint = utf8Decode(token.slice, &idx);
-                // SentencePiece: U+2581 (▁) represents word boundary, convert to space
-                if (codepoint == 0x2581) {
+                // Only a configured Metaspace decoder should map ▁ back to space.
+                if (codepoint == 0x2581 and tok.decoder.metaspace != 0) {
                     result.append(allocator, ' ') catch return -1;
                 } else if (use_byte_map and codepoint >= 0 and codepoint < model.unicode_to_byte.len and model.unicode_to_byte[@as(usize, @intCast(codepoint))] >= 0) {
                     // GPT-2 byte-level: map Unicode codepoint back to original byte

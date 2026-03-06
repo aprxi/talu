@@ -79,8 +79,12 @@ fn id_to_token_out_of_range() {
     let rc = unsafe {
         talu_sys::talu_tokenizer_id_to_token(ctx.handle(), 9999, &mut out as *mut _ as *mut c_void)
     };
-    assert_ne!(rc, 0);
-    assert!(out.is_null());
+    assert_eq!(
+        rc,
+        talu_sys::ErrorCode::InvalidArgument as i32,
+        "out-of-range token ID must return InvalidArgument"
+    );
+    assert!(out.is_null(), "output must remain null for out-of-range token ID");
 }
 
 /// id_to_token for negative IDs must return error and null output.
@@ -91,8 +95,31 @@ fn id_to_token_negative_id_errors() {
     let rc = unsafe {
         talu_sys::talu_tokenizer_id_to_token(ctx.handle(), -1, &mut out as *mut _ as *mut c_void)
     };
-    assert_ne!(rc, 0, "negative token ID must be rejected");
+    assert_eq!(
+        rc,
+        talu_sys::ErrorCode::InvalidArgument as i32,
+        "negative token ID must return InvalidArgument"
+    );
     assert!(out.is_null(), "output must remain null for negative token ID");
+}
+
+/// id_to_token must clear a stale output pointer on error.
+#[test]
+fn id_to_token_out_of_range_clears_stale_output() {
+    let ctx = TokenizerTestContext::new();
+    let mut out = std::ptr::dangling_mut::<i8>();
+    let rc = unsafe {
+        talu_sys::talu_tokenizer_id_to_token(ctx.handle(), 9999, &mut out as *mut _ as *mut c_void)
+    };
+    assert_eq!(
+        rc,
+        talu_sys::ErrorCode::InvalidArgument as i32,
+        "out-of-range token ID must return InvalidArgument"
+    );
+    assert!(
+        out.is_null(),
+        "id_to_token must null out a stale output pointer on error"
+    );
 }
 
 /// token_to_id for special tokens returns exact IDs.
@@ -141,6 +168,16 @@ fn token_to_id_requires_exact_length() {
         id_null_suffix, -1,
         "token_to_id must respect explicit length and reject '<s>\\0xyz'"
     );
+}
+
+/// token_to_id with invalid UTF-8 byte sequences must be deterministic.
+#[test]
+fn token_to_id_invalid_utf8_bytes_deterministic() {
+    let ctx = TokenizerTestContext::new();
+    let bad: &[u8] = &[0xED, 0xA0, 0x80]; // surrogate-like invalid UTF-8
+    let a = unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), bad.as_ptr(), bad.len()) };
+    let b = unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), bad.as_ptr(), bad.len()) };
+    assert_eq!(a, b, "token_to_id invalid UTF-8 behavior must be deterministic");
 }
 
 /// token_to_id for known regular ASCII tokens returns correct IDs.

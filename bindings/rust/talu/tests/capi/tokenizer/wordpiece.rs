@@ -6,6 +6,51 @@
 
 use crate::capi::tokenizer::common::TokenizerTestContext;
 
+fn no_bos() -> talu_sys::EncodeOptions {
+    talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    }
+}
+
+fn tokenize_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
+    let result =
+        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len()) };
+    assert!(result.error_msg.is_null(), "tokenize failed");
+    let tokens = if result.tokens.is_null() || result.num_tokens == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.tokens, result.num_tokens) }
+            .iter()
+            .map(|ptr| unsafe { std::ffi::CStr::from_ptr(*ptr) }.to_str().unwrap().to_owned())
+            .collect()
+    };
+    unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
+    tokens
+}
+
+fn tokenize_bytes_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
+    let result = unsafe {
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+    };
+    assert!(result.error_msg.is_null(), "tokenize_bytes failed");
+    let data = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens + 1) };
+    let tokens: Vec<String> = offsets
+        .windows(2)
+        .map(|w| std::str::from_utf8(&data[w[0]..w[1]]).unwrap().to_owned())
+        .collect();
+    unsafe {
+        talu_sys::talu_tokenize_bytes_result_free(
+            result.data,
+            result.data_len,
+            result.offsets,
+            result.num_tokens,
+        )
+    };
+    tokens
+}
+
 /// Minimal WordPiece tokenizer with BertPreTokenizer and `##` prefix.
 const WORDPIECE_JSON: &str = r####"{
   "version": "1.0",
@@ -87,6 +132,337 @@ fn encode_whitespace_only() {
 fn encode_empty() {
     let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
     assert_eq!(ctx.encode(""), Vec::<u32>::new());
+}
+
+/// Tokenization surfaces must expose the `##` continuation prefix for a
+/// subword split exactly as the model vocabulary stores it.
+#[test]
+fn tokenize_surfaces_expose_continuing_subword_prefix() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    assert_eq!(tokenize_strings(&ctx, "going"), vec!["go", "##ing"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "going"), vec!["go", "##ing"]);
+}
+
+/// Raw encode offsets for a WordPiece split must map each subword back to its
+/// exact byte range within the original word.
+#[test]
+fn offsets_for_subword_split_follow_original_word_boundaries() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"going", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 2);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[6, 9]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 2));
+    assert_eq!((offsets[1].start, offsets[1].end), (2, 5));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// BertPreTokenizer punctuation splitting must be visible on both tokenization
+/// surfaces, not only on the ID encode path.
+#[test]
+fn tokenize_surfaces_show_consecutive_punctuation_split() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    assert_eq!(
+        tokenize_strings(&ctx, "hello..."),
+        vec!["hello", ".", ".", "."]
+    );
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "hello..."),
+        vec!["hello", ".", ".", "."]
+    );
+}
+
+/// Consecutive punctuation offsets must remain exact after BertPreTokenizer
+/// splitting, with no dropped or merged punctuation spans.
+#[test]
+fn offsets_for_consecutive_punctuation_are_exact() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"hello...", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 4);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[4, 15, 15, 15]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
+    assert_eq!((offsets[1].start, offsets[1].end), (5, 6));
+    assert_eq!((offsets[2].start, offsets[2].end), (6, 7));
+    assert_eq!((offsets[3].start, offsets[3].end), (7, 8));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Batch WordPiece encoding must slice into the same per-sequence IDs as
+/// individual encoding for mixed subword and punctuation-heavy inputs.
+#[test]
+fn batch_matches_individual_for_subword_and_punctuation_cases() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    let batch = ctx.encode_batch(&["going", "hello...", "xyz"], &no_bos());
+    assert_eq!(batch.num_sequences, 3);
+    assert_eq!(batch.offsets, vec![0, 2, 6, 7]);
+
+    assert_eq!(batch.ids[batch.offsets[0]..batch.offsets[1]], ctx.encode_with("going", &no_bos()));
+    assert_eq!(
+        batch.ids[batch.offsets[1]..batch.offsets[2]],
+        ctx.encode_with("hello...", &no_bos())
+    );
+    assert_eq!(batch.ids[batch.offsets[2]..batch.offsets[3]], ctx.encode_with("xyz", &no_bos()));
+}
+
+/// Unknown WordPiece words must surface as a single `[UNK]` token on both
+/// tokenization APIs, not as dropped text or per-character fallbacks.
+#[test]
+fn tokenize_surfaces_emit_single_unk_for_unknown_word() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    assert_eq!(tokenize_strings(&ctx, "xyz"), vec!["[UNK]"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "xyz"), vec!["[UNK]"]);
+}
+
+/// A whole unknown word must keep ownership of its entire source span in the
+/// encode offsets, even though it collapses to one `[UNK]` token.
+#[test]
+fn offsets_unknown_word_cover_full_word_span() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"xyz", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 1);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[0]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 3));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// An unknown word in the middle of a sentence must own only its middle source
+/// span, not collapse to zero or steal neighboring word spans.
+#[test]
+fn offsets_unknown_middle_word_keep_neighbor_boundaries() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "hello": 1, "world": 2
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"hello xyz world", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 3);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 0, 2]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
+    assert_eq!((offsets[1].start, offsets[1].end), (6, 9));
+    assert_eq!((offsets[2].start, offsets[2].end), (10, 15));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// When skip_special_tokens removes a leading special token, the first
+/// remaining WordPiece subword must still decode as position 0 and preserve its
+/// `##` prefix.
+#[test]
+fn skip_special_then_leading_subword_preserves_prefix() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    assert_eq!(ctx.decode_with(&[1, 9, 2], &skip), "##ing");
+}
+
+/// The max-input-chars guard is a separate path from ordinary unknown lookup;
+/// it must still surface as a single `[UNK]` token on both tokenization APIs.
+#[test]
+fn tokenize_surfaces_emit_single_unk_for_over_limit_word() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 5,
+    "vocab": {
+      "[UNK]": 0, "hello": 1, "a": 2, "##a": 3
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(tokenize_strings(&ctx, "aaaaaa"), vec!["[UNK]"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "aaaaaa"), vec!["[UNK]"]);
+}
+
+/// The max-input-chars `[UNK]` path must also preserve the original word span
+/// in encode offsets.
+#[test]
+fn offsets_over_limit_word_cover_full_word_span() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 5,
+    "vocab": {
+      "[UNK]": 0, "hello": 1, "a": 2, "##a": 3
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"aaaaaa", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 1);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[0]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 6));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// A multibyte unknown codepoint in the middle of a sentence must still own its
+/// exact UTF-8 byte span when collapsed to `[UNK]`.
+#[test]
+fn offsets_multibyte_unknown_middle_word_keep_exact_span() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "hello": 1, "world": 2
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "hello 🌍 world";
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 3);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 0, 2]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
+    assert_eq!((offsets[1].start, offsets[1].end), (6, 10));
+    assert_eq!((offsets[2].start, offsets[2].end), (11, 16));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// The max-input-chars guard must preserve neighboring word spans when the
+/// over-limit word appears in the middle of a sentence.
+#[test]
+fn offsets_over_limit_middle_word_keep_neighbor_boundaries() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 5,
+    "vocab": {
+      "[UNK]": 0, "hello": 1, "world": 2, "a": 3, "##a": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"hello aaaaaa world", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 3);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 0, 2]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
+    assert_eq!((offsets[1].start, offsets[1].end), (6, 12));
+    assert_eq!((offsets[2].start, offsets[2].end), (13, 18));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// The tokenization APIs must still expose a single `[UNK]` token for a
+/// multibyte unknown word, not drop it or split its UTF-8 bytes.
+#[test]
+fn tokenize_surfaces_emit_single_unk_for_multibyte_unknown_word() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "hello": 1, "world": 2
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(tokenize_strings(&ctx, "🌍"), vec!["[UNK]"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "🌍"), vec!["[UNK]"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +569,68 @@ fn cleanup_preserves_space_before_closing_paren_and_colon() {
     assert_eq!(
         decoded, "hello :",
         "cleanup must not remove space before :, got: {decoded:?}"
+    );
+}
+
+/// cleanup=false must preserve spaces before punctuation that cleanup=true would strip.
+#[test]
+fn cleanup_false_preserves_space_before_comma_and_question() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, ",": 4, "world": 5, "?": 6
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let decoded = ctx.decode(&[3, 4, 5, 6]);
+    assert_eq!(
+        decoded, "hello , world ?",
+        "cleanup=false must preserve spaces before comma/question, got: {decoded:?}"
+    );
+}
+
+/// cleanup=false must preserve contraction spacing.
+#[test]
+fn cleanup_false_preserves_contraction_spacing() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "i": 3, "'m": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let decoded = ctx.decode(&[3, 4]);
+    assert_eq!(
+        decoded, "i 'm",
+        "cleanup=false must preserve space before apostrophe contraction, got: {decoded:?}"
     );
 }
 
@@ -314,8 +752,11 @@ fn bert_normalizer_lowercases_multiword() {
 #[test]
 fn encode_bert_postproc_adds_cls_sep() {
     let ctx = TokenizerTestContext::from_json(BERT_POSTPROC_JSON);
+    // Rust Default zeroes the FFI struct, so add_eos must be explicit for
+    // BertProcessing tests that expect [SEP].
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     // "hello" → [hello=4], with CLS/SEP → [CLS=1, hello=4, SEP=2]
@@ -332,6 +773,7 @@ fn encode_bert_postproc_empty_produces_cls_sep() {
     let ctx = TokenizerTestContext::from_json(BERT_POSTPROC_JSON);
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     assert_eq!(
@@ -664,6 +1106,7 @@ fn bert_postproc_uses_configured_cls_sep_not_defaults() {
     let ctx = TokenizerTestContext::from_json(json);
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     // With BertProcessing cls=<s>(3) sep=</s>(4):

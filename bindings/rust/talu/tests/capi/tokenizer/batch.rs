@@ -2,7 +2,9 @@
 //!
 //! Validates encode_batch offset arithmetic and padded tensor layout.
 
-use crate::capi::tokenizer::common::TokenizerTestContext;
+use crate::capi::tokenizer::common::{
+    build_byte_level_tokenizer_json, byte_token_id, TokenizerTestContext,
+};
 
 /// Default encode options (no BOS).
 fn no_bos() -> talu_sys::EncodeOptions {
@@ -81,6 +83,312 @@ fn batch_zero_texts() {
     assert_eq!(batch.num_sequences, 0);
     assert!(batch.ids.is_empty());
     assert!(batch.offsets.is_empty());
+}
+
+/// ByteLevel `add_prefix_space` increases each non-space-prefixed sequence by
+/// one token in batch mode.
+#[test]
+fn batch_encode_byte_level_add_prefix_space_shifts_sequence_lengths() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+
+    let batch = ctx.encode_batch(&["Hello", "Hi"], &no_bos());
+    assert_eq!(batch.num_sequences, 2);
+    assert_eq!(batch.offsets, vec![0, 6, 9]);
+    assert_eq!(
+        &batch.ids[0..6],
+        &[
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'e'),
+            byte_token_id(b'l'),
+            byte_token_id(b'l'),
+            byte_token_id(b'o')
+        ]
+    );
+    assert_eq!(
+        &batch.ids[6..9],
+        &[byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'i')]
+    );
+}
+
+/// Empty sequences must remain empty in batch mode even when ByteLevel
+/// `add_prefix_space` is enabled.
+#[test]
+fn batch_encode_byte_level_add_prefix_space_empty_sequence_stays_empty() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+
+    let batch = ctx.encode_batch(&["", "Hi"], &no_bos());
+    assert_eq!(batch.num_sequences, 2);
+    assert_eq!(batch.offsets, vec![0, 0, 3]);
+    assert_eq!(
+        batch.ids,
+        vec![byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'i')]
+    );
+}
+
+/// Batch slicing must preserve the original ID stream for sequences that
+/// already begin with a real space, even when `add_prefix_space` is enabled.
+#[test]
+fn batch_encode_byte_level_add_prefix_space_roundtrip_preserves_real_leading_space() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+
+    let batch = ctx.encode_batch(&[" Hello", "Hi"], &no_bos());
+    assert_eq!(batch.num_sequences, 2);
+
+    let seq0 = &batch.ids[batch.offsets[0]..batch.offsets[1]];
+    let seq1 = &batch.ids[batch.offsets[1]..batch.offsets[2]];
+    let expected0: Vec<u32> = " Hello".as_bytes().iter().map(|&b| byte_token_id(b)).collect();
+    let expected1 = vec![
+        byte_token_id(b' '),
+        byte_token_id(b'H'),
+        byte_token_id(b'i'),
+    ];
+    assert_eq!(seq0, expected0);
+    assert_eq!(seq1, expected1);
+}
+
+/// Batch slices must match individual encodes even when the batch mixes empty,
+/// real-leading-space, and synthetic-prefix-space cases.
+#[test]
+fn batch_encode_byte_level_add_prefix_space_matches_individual_mixed_sequences() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+
+    let texts = ["", " Hello", "Hi"];
+    let batch = ctx.encode_batch(&texts, &no_bos());
+    assert_eq!(batch.num_sequences, 3);
+
+    for (i, text) in texts.iter().enumerate() {
+        let start = batch.offsets[i];
+        let end = batch.offsets[i + 1];
+        let expected = ctx.encode_with(text, &no_bos());
+        assert_eq!(
+            &batch.ids[start..end],
+            expected.as_slice(),
+            "batch slice must equal individual encode for sequence {i}: {text:?}"
+        );
+    }
+}
+
+/// Under right truncation, each batch slice must still equal the individual
+/// encode result for that same sequence and option set.
+#[test]
+fn batch_encode_byte_level_add_prefix_space_truncation_right_matches_individual_sequences() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let texts = ["", " Hello", "World"];
+    let opts = talu_sys::EncodeOptions {
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 3,
+        ..Default::default()
+    };
+
+    let batch = ctx.encode_batch(&texts, &opts);
+    assert_eq!(batch.num_sequences, 3);
+
+    for (i, text) in texts.iter().enumerate() {
+        let start = batch.offsets[i];
+        let end = batch.offsets[i + 1];
+        let expected = ctx.encode_with(text, &opts);
+        assert_eq!(
+            &batch.ids[start..end],
+            expected.as_slice(),
+            "right-truncated batch slice must equal individual encode for sequence {i}: {text:?}"
+        );
+    }
+}
+
+/// Under left truncation, each batch slice must still equal the individual
+/// encode result for that same sequence and option set.
+#[test]
+fn batch_encode_byte_level_add_prefix_space_truncation_left_matches_individual_sequences() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let texts = ["", " Hello", "World"];
+    let opts = talu_sys::EncodeOptions {
+        truncation: 1,
+        truncation_side: 1,
+        max_length: 3,
+        ..Default::default()
+    };
+
+    let batch = ctx.encode_batch(&texts, &opts);
+    assert_eq!(batch.num_sequences, 3);
+
+    for (i, text) in texts.iter().enumerate() {
+        let start = batch.offsets[i];
+        let end = batch.offsets[i + 1];
+        let expected = ctx.encode_with(text, &opts);
+        assert_eq!(
+            &batch.ids[start..end],
+            expected.as_slice(),
+            "left-truncated batch slice must equal individual encode for sequence {i}: {text:?}"
+        );
+    }
+}
+
+/// Right truncation must apply after the synthetic prefix-space token has been
+/// inserted for each non-space-prefixed sequence.
+#[test]
+fn batch_encode_byte_level_add_prefix_space_truncation_right_preserves_prefix_token() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let t0 = b"Hello";
+    let t1 = b" Hi";
+    let ptrs = [t0.as_ptr(), t1.as_ptr()];
+    let lengths = [t0.len(), t1.len()];
+    let opts = talu_sys::EncodeOptions {
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 3,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    assert!(result.error_msg.is_null(), "batch truncation should succeed");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) };
+    assert_eq!(
+        ids,
+        &[
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'e'),
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'i')
+        ]
+    );
+    assert_eq!(offsets, &[0, 3, 6]);
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            result.ids,
+            result.offsets,
+            result.total_tokens,
+            result.num_sequences,
+        )
+    };
+}
+
+/// After right truncation, decoding the batch slice should reflect the kept
+/// prefix window, not the original untruncated input.
+#[test]
+fn batch_encode_byte_level_add_prefix_space_truncation_right_decodes_kept_window() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let t0 = b"Hello";
+    let ptrs = [t0.as_ptr()];
+    let lengths = [t0.len()];
+    let opts = talu_sys::EncodeOptions {
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 3,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    assert!(result.error_msg.is_null(), "batch truncation should succeed");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
+    assert_eq!(ctx.decode(ids), "He");
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            result.ids,
+            result.offsets,
+            result.total_tokens,
+            result.num_sequences,
+        )
+    };
+}
+
+/// Left truncation must keep the tail of each sequence after prefix insertion,
+/// so the synthetic prefix token is dropped for longer non-space-prefixed rows.
+#[test]
+fn batch_encode_byte_level_add_prefix_space_truncation_left_drops_prefix_token() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let t0 = b"Hello";
+    let t1 = b" Hi";
+    let ptrs = [t0.as_ptr(), t1.as_ptr()];
+    let lengths = [t0.len(), t1.len()];
+    let opts = talu_sys::EncodeOptions {
+        truncation: 1,
+        truncation_side: 1,
+        max_length: 3,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    assert!(result.error_msg.is_null(), "batch truncation should succeed");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) };
+    assert_eq!(
+        ids,
+        &[
+            byte_token_id(b'l'),
+            byte_token_id(b'l'),
+            byte_token_id(b'o'),
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'i')
+        ]
+    );
+    assert_eq!(offsets, &[0, 3, 6]);
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            result.ids,
+            result.offsets,
+            result.total_tokens,
+            result.num_sequences,
+        )
+    };
+}
+
+/// After left truncation, decoding the batch slice should reflect only the
+/// retained tail window.
+#[test]
+fn batch_encode_byte_level_add_prefix_space_truncation_left_decodes_tail_window() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let t0 = b"Hello";
+    let ptrs = [t0.as_ptr()];
+    let lengths = [t0.len()];
+    let opts = talu_sys::EncodeOptions {
+        truncation: 1,
+        truncation_side: 1,
+        max_length: 3,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    assert!(result.error_msg.is_null(), "batch truncation should succeed");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
+    assert_eq!(ctx.decode(ids), "llo");
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            result.ids,
+            result.offsets,
+            result.total_tokens,
+            result.num_sequences,
+        )
+    };
 }
 
 /// Padded tensor: right-padding aligns "A"(1 token) and "Hello"(5 tokens)
@@ -340,6 +648,143 @@ fn padded_tensor_complex_batch_mask() {
     }
 }
 
+/// Padded tensor layout must include the synthetic prefix-space token in the
+/// encoded lengths before padding is applied.
+#[test]
+fn padded_tensor_byte_level_add_prefix_space_uses_prefixed_lengths() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let pad_opts = talu_sys::PaddedTensorOptions {
+        pad_id: 0,
+        padding_side: 0,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+
+    let result = ctx.batch_to_padded_tensor(&["Hi", "Hello"], &no_bos(), &pad_opts);
+    assert_eq!(result.num_sequences, 2);
+    assert_eq!(result.padded_length, 6);
+
+    assert_eq!(
+        &result.input_ids[0..6],
+        &[
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'i'),
+            0,
+            0,
+            0
+        ]
+    );
+    assert_eq!(&result.attention_mask[0..6], &[1, 1, 1, 0, 0, 0]);
+
+    assert_eq!(
+        &result.input_ids[6..12],
+        &[
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'e'),
+            byte_token_id(b'l'),
+            byte_token_id(b'l'),
+            byte_token_id(b'o')
+        ]
+    );
+    assert_eq!(&result.attention_mask[6..12], &[1, 1, 1, 1, 1, 1]);
+}
+
+/// In padded-tensor conversion, an empty sequence under `add_prefix_space`
+/// must still become an all-padding row rather than a synthetic-prefix row.
+#[test]
+fn padded_tensor_byte_level_add_prefix_space_empty_sequence_is_all_padding() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let pad_opts = talu_sys::PaddedTensorOptions {
+        pad_id: 0,
+        padding_side: 0,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+
+    let result = ctx.batch_to_padded_tensor(&["", "Hi"], &no_bos(), &pad_opts);
+    assert_eq!(result.num_sequences, 2);
+    assert_eq!(result.padded_length, 3);
+
+    assert_eq!(&result.input_ids[0..3], &[0, 0, 0]);
+    assert_eq!(&result.attention_mask[0..3], &[0, 0, 0]);
+
+    assert_eq!(
+        &result.input_ids[3..6],
+        &[byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'i')]
+    );
+    assert_eq!(&result.attention_mask[3..6], &[1, 1, 1]);
+}
+
+/// Left padding must treat real-leading-space and synthetic-prefix-space rows
+/// according to their encoded lengths after ByteLevel prefix handling.
+#[test]
+fn padded_tensor_byte_level_add_prefix_space_left_padding_mixed_real_and_synthetic() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let pad_opts = talu_sys::PaddedTensorOptions {
+        pad_id: 0,
+        padding_side: 1,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+
+    let result = ctx.batch_to_padded_tensor(&[" Hi", "A"], &no_bos(), &pad_opts);
+    assert_eq!(result.num_sequences, 2);
+    assert_eq!(result.padded_length, 3);
+
+    assert_eq!(
+        &result.input_ids[0..3],
+        &[byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'i')]
+    );
+    assert_eq!(&result.attention_mask[0..3], &[1, 1, 1]);
+
+    assert_eq!(
+        &result.input_ids[3..6],
+        &[0, byte_token_id(b' '), byte_token_id(b'A')]
+    );
+    assert_eq!(&result.attention_mask[3..6], &[0, 1, 1]);
+}
+
+/// Right truncation in padded-tensor conversion must keep the prefix token
+/// because truncation is applied after ByteLevel prefix insertion.
+#[test]
+fn padded_tensor_byte_level_add_prefix_space_right_truncation_keeps_prefix() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let pad_opts = talu_sys::PaddedTensorOptions {
+        pad_id: 0,
+        padding_side: 0,
+        max_length: 3,
+        truncate: true,
+        return_attention_mask: true,
+    };
+
+    let result = ctx.batch_to_padded_tensor(&["Hello", " Hi"], &no_bos(), &pad_opts);
+    assert_eq!(result.num_sequences, 2);
+    assert_eq!(result.padded_length, 3);
+
+    assert_eq!(
+        &result.input_ids[0..3],
+        &[byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'e')]
+    );
+    assert_eq!(&result.attention_mask[0..3], &[1, 1, 1]);
+
+    assert_eq!(
+        &result.input_ids[3..6],
+        &[byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'i')]
+    );
+    assert_eq!(&result.attention_mask[3..6], &[1, 1, 1]);
+}
+
+
 // ===========================================================================
 // Token utilities
 // ===========================================================================
@@ -370,6 +815,20 @@ fn tokens_concat_rejects_null_with_nonzero_length() {
     );
     if !result.is_null() {
         unsafe { talu_sys::talu_tokens_free(result, 4) };
+    }
+}
+
+/// tokens_concat must reject null second pointer paired with non-zero length.
+#[test]
+fn tokens_concat_rejects_null_second_with_nonzero_length() {
+    let a = [44u32, 77];
+    let result = unsafe { talu_sys::talu_tokens_concat(a.as_ptr(), a.len(), std::ptr::null(), 1) };
+    assert!(
+        result.is_null(),
+        "null second tokens pointer with non-zero length must be rejected"
+    );
+    if !result.is_null() {
+        unsafe { talu_sys::talu_tokens_free(result, 3) };
     }
 }
 
@@ -435,6 +894,55 @@ fn batch_encode_null_options_defaults_to_add_special_tokens() {
     };
 }
 
+/// batch_to_padded_tensor with null options pointer must use C-API defaults.
+#[test]
+fn padded_tensor_null_options_uses_defaults() {
+    let ctx = TokenizerTestContext::new();
+    let t0 = b"A";
+    let t1 = b"Hi";
+    let ptrs = [t0.as_ptr(), t1.as_ptr()];
+    let lengths = [t0.len(), t1.len()];
+    let batch = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
+    assert!(batch.error_msg.is_null());
+    assert_eq!(batch.num_sequences, 2);
+
+    let tensor = unsafe {
+        super::common::batch_to_padded_tensor_raw_null_options(
+            batch.ids,
+            batch.offsets,
+            batch.num_sequences,
+        )
+    };
+    assert!(tensor.error_msg.is_null());
+    assert_eq!(tensor.num_sequences, 2);
+    assert_eq!(tensor.padded_length, 2);
+    assert!(
+        !tensor.attention_mask.is_null(),
+        "null options must default return_attention_mask=true"
+    );
+
+    let total = tensor.num_sequences * tensor.padded_length;
+    let ids = unsafe { std::slice::from_raw_parts(tensor.input_ids, total) };
+    let mask = unsafe { std::slice::from_raw_parts(tensor.attention_mask, total) };
+    assert_eq!(ids, &[37, 0, 44, 77], "default right padding with pad_id=0");
+    assert_eq!(mask, &[1, 0, 1, 1], "default attention mask values");
+
+    unsafe {
+        talu_sys::talu_padded_tensor_result_free(
+            tensor.input_ids,
+            tensor.attention_mask,
+            tensor.num_sequences,
+            tensor.padded_length,
+        );
+        talu_sys::talu_batch_encode_result_free(
+            batch.ids,
+            batch.offsets,
+            batch.total_tokens,
+            batch.num_sequences,
+        );
+    }
+}
+
 /// Batch encode: add_bos=1 + add_eos=0 must add BOS only.
 #[test]
 fn batch_encode_add_bos_without_eos() {
@@ -487,6 +995,78 @@ fn batch_encode_add_eos_without_bos() {
     assert_eq!(ids, &[4, 5, 2, 4, 2], "add_bos=0/add_eos=1 in batch");
     assert_eq!(offsets, &[0, 3, 5], "offsets for EOS-only batch");
 
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            result.ids,
+            result.offsets,
+            result.total_tokens,
+            result.num_sequences,
+        )
+    };
+}
+
+/// Batch encode: empty input with add_bos=1/add_eos=0 should produce BOS only.
+#[test]
+fn batch_encode_empty_add_bos_without_eos() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_BATCH_JSON);
+    let t0 = b"";
+    let ptrs = [t0.as_ptr()];
+    let lengths = [t0.len()];
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        add_eos: 0,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    assert!(result.error_msg.is_null());
+    let ids = if result.ids.is_null() || result.total_tokens == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) }.to_vec()
+    };
+    let offsets = if result.offsets.is_null() || result.num_sequences == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) }.to_vec()
+    };
+    assert_eq!(ids, &[1], "empty batch item should produce BOS only");
+    assert_eq!(offsets, &[0, 1], "offsets for single BOS-only sequence");
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            result.ids,
+            result.offsets,
+            result.total_tokens,
+            result.num_sequences,
+        )
+    };
+}
+
+/// Batch encode: empty input with add_bos=0/add_eos=1 should produce EOS only.
+#[test]
+fn batch_encode_empty_add_eos_without_bos() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_BATCH_JSON);
+    let t0 = b"";
+    let ptrs = [t0.as_ptr()];
+    let lengths = [t0.len()];
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        add_eos: 1,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    assert!(result.error_msg.is_null());
+    let ids = if result.ids.is_null() || result.total_tokens == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) }.to_vec()
+    };
+    let offsets = if result.offsets.is_null() || result.num_sequences == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) }.to_vec()
+    };
+    assert_eq!(ids, &[2], "empty batch item should produce EOS only");
+    assert_eq!(offsets, &[0, 1], "offsets for single EOS-only sequence");
     unsafe {
         talu_sys::talu_batch_encode_result_free(
             result.ids,
@@ -551,6 +1131,40 @@ fn padded_tensor_rejects_offsets_not_starting_at_zero() {
             )
         };
     }
+}
+
+/// Padded tensor consumes exactly the prefix described by `offsets[num_sequences]`.
+///
+/// The C ABI does not include a separate `ids_len`, so memory beyond the last
+/// declared offset is outside the contract and must be ignored by the callee.
+#[test]
+fn padded_tensor_ignores_memory_beyond_last_declared_offset() {
+    let ids = [44u32, 77u32, 69u32];
+    let offsets = [0usize, 1usize, 1usize];
+    let result = unsafe {
+        super::common::batch_to_padded_tensor_raw_null_options(ids.as_ptr(), offsets.as_ptr(), 2)
+    };
+    assert!(
+        result.error_msg.is_null(),
+        "ids beyond offsets[num_sequences] are not part of the ABI contract"
+    );
+
+    let total = result.num_sequences * result.padded_length;
+    let input_ids = unsafe { std::slice::from_raw_parts(result.input_ids, total) };
+    let attention_mask = unsafe { std::slice::from_raw_parts(result.attention_mask, total) };
+    assert_eq!(result.num_sequences, 2);
+    assert_eq!(result.padded_length, 1);
+    assert_eq!(input_ids, &[44, 0], "only the declared prefix should be consumed");
+    assert_eq!(attention_mask, &[1, 0]);
+
+    unsafe {
+        talu_sys::talu_padded_tensor_result_free(
+            result.input_ids,
+            result.attention_mask,
+            result.num_sequences,
+            result.padded_length,
+        )
+    };
 }
 
 /// Left and right padding with truncation must produce exact matrices on mixed empty/content batch.
@@ -651,6 +1265,152 @@ fn tokenize_bytes_offsets_seeded_invariants() {
                 result.data_len,
                 result.offsets,
                 result.num_tokens,
+            )
+        };
+    }
+}
+
+/// Batch encode with right truncation must truncate each sequence independently.
+#[test]
+fn batch_encode_truncation_right_applies_per_sequence() {
+    let ctx = TokenizerTestContext::new();
+    let t0 = b"Hello";
+    let t1 = b"abc";
+    let ptrs = [t0.as_ptr(), t1.as_ptr()];
+    let lengths = [t0.len(), t1.len()];
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 1,
+        truncation_side: 0, // right
+        max_length: 2,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    assert!(result.error_msg.is_null(), "batch right truncation should succeed");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) };
+    assert_eq!(
+        ids,
+        &[44, 73, 69, 70],
+        "right truncation must keep first 2 tokens of each sequence"
+    );
+    assert_eq!(offsets, &[0, 2, 4], "offsets must reflect truncated lengths");
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            result.ids,
+            result.offsets,
+            result.total_tokens,
+            result.num_sequences,
+        )
+    };
+}
+
+/// Batch encode with left truncation must keep the last N tokens per sequence.
+#[test]
+fn batch_encode_truncation_left_applies_per_sequence() {
+    let ctx = TokenizerTestContext::new();
+    let t0 = b"Hello";
+    let t1 = b"abc";
+    let ptrs = [t0.as_ptr(), t1.as_ptr()];
+    let lengths = [t0.len(), t1.len()];
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 1,
+        truncation_side: 1, // left
+        max_length: 2,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    assert!(result.error_msg.is_null(), "batch left truncation should succeed");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) };
+    assert_eq!(
+        ids,
+        &[80, 83, 70, 71],
+        "left truncation must keep last 2 tokens of each sequence"
+    );
+    assert_eq!(offsets, &[0, 2, 4], "offsets must reflect truncated lengths");
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            result.ids,
+            result.offsets,
+            result.total_tokens,
+            result.num_sequences,
+        )
+    };
+}
+
+/// Batch encode with template postprocessor + truncation must cap total sequence length.
+#[test]
+fn batch_encode_template_truncation_caps_total_length() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_BATCH_JSON);
+    let t0 = b"Hi";
+    let t1 = b"H";
+    let ptrs = [t0.as_ptr(), t1.as_ptr()];
+    let lengths = [t0.len(), t1.len()];
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        add_eos: 1,
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 3,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    assert!(
+        result.error_msg.is_null(),
+        "batch template truncation should succeed"
+    );
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) };
+    assert_eq!(
+        ids,
+        &[1, 4, 5, 1, 4, 2],
+        "max_length=3 must cap each sequence after post-processing"
+    );
+    assert_eq!(offsets, &[0, 3, 6], "offsets must reflect capped sequence lengths");
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            result.ids,
+            result.offsets,
+            result.total_tokens,
+            result.num_sequences,
+        )
+    };
+}
+
+/// Batch encode must reject truncation_side values outside {0,1}.
+#[test]
+fn batch_encode_rejects_invalid_truncation_side() {
+    let ctx = TokenizerTestContext::new();
+    let t0 = b"Hello";
+    let ptrs = [t0.as_ptr()];
+    let lengths = [t0.len()];
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 1,
+        truncation_side: 2,
+        max_length: 2,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    assert!(
+        !result.error_msg.is_null(),
+        "invalid truncation_side must return an error in batch encode"
+    );
+    if result.error_msg.is_null() {
+        unsafe {
+            talu_sys::talu_batch_encode_result_free(
+                result.ids,
+                result.offsets,
+                result.total_tokens,
+                result.num_sequences,
             )
         };
     }

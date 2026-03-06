@@ -330,6 +330,32 @@ fn pretokenizer_whitespace_single_word() {
     assert_eq!(tokens.len(), 5, "5 chars should produce 5 tokens");
 }
 
+/// Whitespace pre-tokenizer should drop tab/newline separators as boundaries.
+#[test]
+fn pretokenizer_whitespace_drops_tab_and_newline() {
+    let json = ascii_with_pretokenizer(r#"{"type": "Whitespace"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let tokens = ctx.encode_with("a\tb\nc", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![69, 70, 71],
+        "Whitespace pre-tokenizer should emit only word chars across tab/newline boundaries"
+    );
+}
+
+/// Whitespace pre-tokenizer should drop leading/trailing spaces around words.
+#[test]
+fn pretokenizer_whitespace_drops_leading_and_trailing_spaces() {
+    let json = ascii_with_pretokenizer(r#"{"type": "Whitespace"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let tokens = ctx.encode_with("  a  ", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![69],
+        "Whitespace pre-tokenizer should not emit separator space tokens"
+    );
+}
+
 // ===========================================================================
 // Punctuation pre-tokenizer
 // ===========================================================================
@@ -533,6 +559,21 @@ fn pretokenizer_split_removed_drops_matches() {
     );
 }
 
+/// Split(Removed) should remove punctuation matches and keep only non-matching text.
+#[test]
+fn pretokenizer_split_removed_drops_punctuation_matches() {
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"[,!.]+"},"behavior":"Removed","invert":false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let tokens = ctx.encode_with("a,b!c.", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![69, 70, 71],
+        "Split(Removed) should drop punctuation matches"
+    );
+}
+
 /// Split behavior Isolated should keep both matches and non-matching gaps.
 #[test]
 fn pretokenizer_split_isolated_keeps_matches_and_gaps() {
@@ -560,6 +601,21 @@ fn pretokenizer_split_invert_true_keeps_only_matches() {
         tokens,
         vec![21, 22, 23, 24],
         "Split(invert=true) should keep only digit matches"
+    );
+}
+
+/// Split(invert=true) with punctuation regex should keep only punctuation matches.
+#[test]
+fn pretokenizer_split_invert_true_keeps_only_punctuation() {
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"[,!.]+"},"behavior":"Removed","invert":true}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let tokens = ctx.encode_with("a,b!c.", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![16, 5, 18],
+        "Split(invert=true) should keep only punctuation matches"
     );
 }
 

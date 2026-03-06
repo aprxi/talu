@@ -354,9 +354,9 @@ fn encode_determinism_50_repetitions() {
     }
 }
 
-/// Batch encode ignores truncation options (truncation is single-encode only).
+/// Batch encode truncation must apply per sequence (parity with single encode).
 #[test]
-fn batch_encode_ignores_truncation() {
+fn batch_encode_applies_truncation_per_sequence() {
     let ctx = TokenizerTestContext::new();
     let opts = talu_sys::EncodeOptions {
         add_bos: 0,
@@ -365,12 +365,112 @@ fn batch_encode_ignores_truncation() {
         max_length: 2,
         ..Default::default()
     };
-    // Batch encode does not truncate: "Hello" stays 5 tokens, "ab" stays 2.
+    // "Hello" -> [44,73], "ab" -> [69,70] with max_length=2.
     let batch = ctx.encode_batch(&["Hello", "ab"], &opts);
 
     assert_eq!(batch.num_sequences, 2);
-    assert_eq!(batch.offsets, [0, 5, 7]);
-    assert_eq!(batch.ids, [44, 73, 80, 80, 83, 69, 70]);
+    assert_eq!(batch.offsets, [0, 2, 4]);
+    assert_eq!(batch.ids, [44, 73, 69, 70]);
+}
+
+/// Batch encode with invalid UTF-8 byte slices must be deterministic.
+#[test]
+fn batch_encode_invalid_utf8_bytes_is_deterministic() {
+    let ctx = TokenizerTestContext::new();
+    let opts = no_bos();
+
+    let bad0: &[u8] = &[0xF0, 0x9F, 0x8E]; // truncated 4-byte sequence
+    let bad1: &[u8] = &[0xED, 0xA0, 0x80]; // surrogate-like sequence
+    let ptrs = [bad0.as_ptr(), bad1.as_ptr()];
+    let lengths = [bad0.len(), bad1.len()];
+
+    let first = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+    let second = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
+
+    assert_eq!(
+        first.error_msg.is_null(),
+        second.error_msg.is_null(),
+        "invalid UTF-8 batch encode should have deterministic success/failure status"
+    );
+
+    if first.error_msg.is_null() {
+        let ids_a = if first.ids.is_null() || first.total_tokens == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(first.ids, first.total_tokens) }.to_vec()
+        };
+        let ids_b = if second.ids.is_null() || second.total_tokens == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(second.ids, second.total_tokens) }.to_vec()
+        };
+        let off_a = if first.offsets.is_null() || first.num_sequences == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(first.offsets, first.num_sequences + 1) }.to_vec()
+        };
+        let off_b = if second.offsets.is_null() || second.num_sequences == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(second.offsets, second.num_sequences + 1) }.to_vec()
+        };
+        assert_eq!(ids_a, ids_b, "invalid UTF-8 batch IDs must be deterministic");
+        assert_eq!(off_a, off_b, "invalid UTF-8 batch offsets must be deterministic");
+    }
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            first.ids,
+            first.offsets,
+            first.total_tokens,
+            first.num_sequences,
+        );
+        talu_sys::talu_batch_encode_result_free(
+            second.ids,
+            second.offsets,
+            second.total_tokens,
+            second.num_sequences,
+        );
+    }
+}
+
+/// tokenize invalid UTF-8 should produce deterministic token strings when successful.
+#[test]
+fn tokenize_invalid_utf8_token_strings_are_deterministic() {
+    let ctx = TokenizerTestContext::new();
+    let bytes: &[u8] = &[0xF0, 0x9F, 0x8E]; // truncated sequence
+
+    let first = unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    let second = unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    assert_eq!(
+        first.error_msg.is_null(),
+        second.error_msg.is_null(),
+        "invalid UTF-8 tokenize should have deterministic success/failure status"
+    );
+
+    if first.error_msg.is_null() {
+        let ptrs_a =
+            unsafe { std::slice::from_raw_parts(first.tokens as *const *const i8, first.num_tokens) };
+        let ptrs_b =
+            unsafe { std::slice::from_raw_parts(second.tokens as *const *const i8, second.num_tokens) };
+        let toks_a: Vec<String> = ptrs_a
+            .iter()
+            .map(|p| unsafe { std::ffi::CStr::from_ptr(*p) }.to_string_lossy().to_string())
+            .collect();
+        let toks_b: Vec<String> = ptrs_b
+            .iter()
+            .map(|p| unsafe { std::ffi::CStr::from_ptr(*p) }.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            toks_a, toks_b,
+            "invalid UTF-8 tokenize token strings must be deterministic"
+        );
+    }
+
+    unsafe {
+        talu_sys::talu_tokenize_result_free(first.tokens, first.num_tokens);
+        talu_sys::talu_tokenize_result_free(second.tokens, second.num_tokens);
+    }
 }
 
 /// Decode is deterministic over repeated calls.

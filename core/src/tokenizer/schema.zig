@@ -38,6 +38,7 @@ pub const Normalizer = struct {
     nfc: bool = false,
     nfd: bool = false,
     nfkc: bool = false,
+    nfkd: bool = false,
     clean_text: bool = false,
     handle_chinese_chars: bool = false,
     // SentencePiece-style normalizers
@@ -80,6 +81,8 @@ pub const Decoder = struct {
     strip_stop: i32 = 0,
     /// Metaspace decoder: strip leading space added during encode
     add_prefix_space: bool = false,
+    /// Metaspace decoder is active and should convert ▁ back to space.
+    metaspace: bool = false,
 };
 
 pub const TokenizerRoot = struct {

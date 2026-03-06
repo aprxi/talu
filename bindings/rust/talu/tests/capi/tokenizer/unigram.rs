@@ -6,6 +6,51 @@
 
 use crate::capi::tokenizer::common::TokenizerTestContext;
 
+fn no_bos() -> talu_sys::EncodeOptions {
+    talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    }
+}
+
+fn tokenize_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
+    let result =
+        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len()) };
+    assert!(result.error_msg.is_null(), "tokenize failed");
+    let tokens = if result.tokens.is_null() || result.num_tokens == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.tokens, result.num_tokens) }
+            .iter()
+            .map(|ptr| unsafe { std::ffi::CStr::from_ptr(*ptr) }.to_str().unwrap().to_owned())
+            .collect()
+    };
+    unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
+    tokens
+}
+
+fn tokenize_bytes_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
+    let result = unsafe {
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+    };
+    assert!(result.error_msg.is_null(), "tokenize_bytes failed");
+    let data = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens + 1) };
+    let tokens: Vec<String> = offsets
+        .windows(2)
+        .map(|w| std::str::from_utf8(&data[w[0]..w[1]]).unwrap().to_owned())
+        .collect();
+    unsafe {
+        talu_sys::talu_tokenize_bytes_result_free(
+            result.data,
+            result.data_len,
+            result.offsets,
+            result.num_tokens,
+        )
+    };
+    tokens
+}
+
 // ---------------------------------------------------------------------------
 // Loading: Unigram JSON fails to load
 // ---------------------------------------------------------------------------
@@ -74,6 +119,195 @@ fn metaspace_decode_strips_prefix_space() {
     );
 }
 
+/// With explicit `skip_special_tokens=1`, Unigram decode must remove special
+/// tokens before applying metaspace cleanup.
+#[test]
+fn unigram_decode_skips_special_tokens_when_requested() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581hello", -2.0],
+      ["\u2581world", -3.0]
+    ]
+  },
+  "added_tokens": [
+    {"id": 3, "content": "<s>", "special": true},
+    {"id": 4, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    assert_eq!(ctx.decode_with(&[3, 1, 2, 4], &skip), "hello world");
+}
+
+/// Unigram special-token skipping should match the oracle of manually removing
+/// special IDs before decode.
+#[test]
+fn unigram_decode_skip_special_matches_manual_filtering() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581hello", -2.0],
+      ["\u2581world", -3.0]
+    ]
+  },
+  "added_tokens": [
+    {"id": 3, "content": "<s>", "special": true},
+    {"id": 4, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    let manual = ctx.decode(&[1, 2]);
+    let skipped = ctx.decode_with(&[3, 1, 2, 4], &skip);
+    assert_eq!(skipped, manual);
+}
+
+/// With special-token skipping disabled, Unigram decode must retain the
+/// special token text in order around metaspace-decoded tokens.
+#[test]
+fn unigram_decode_retains_special_tokens_when_requested() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581hello", -2.0],
+      ["\u2581world", -3.0]
+    ]
+  },
+  "added_tokens": [
+    {"id": 3, "content": "<s>", "special": true},
+    {"id": 4, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let keep = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    assert_eq!(ctx.decode_with(&[3, 1, 2, 4], &keep), "<s> hello world</s>");
+}
+
+/// A single added special token should decode to its literal content in
+/// retain mode rather than producing a decoder error.
+#[test]
+fn unigram_decode_single_special_token_retained() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581hello", -2.0]
+    ]
+  },
+  "added_tokens": [
+    {"id": 2, "content": "<s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let keep = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    assert_eq!(ctx.decode_with(&[2], &keep), "<s>");
+}
+
+/// A single added special token should decode to empty output in skip mode
+/// rather than producing a decoder error.
+#[test]
+fn unigram_decode_single_special_token_skipped() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581hello", -2.0]
+    ]
+  },
+  "added_tokens": [
+    {"id": 2, "content": "<s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    assert_eq!(ctx.decode_with(&[2], &skip), "");
+}
+
+/// Null decode options must use the C-API default `skip_special_tokens=true`
+/// for Unigram too, not error out on added special IDs.
+#[test]
+fn unigram_decode_null_options_skip_special_defaults_true() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581hello", -2.0]
+    ]
+  },
+  "added_tokens": [
+    {"id": 2, "content": "<s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::decode_raw_null_options(ctx.handle(), &[2, 1]) };
+    assert!(
+        result.error_msg.is_null(),
+        "null decode options should succeed for unigram special tokens"
+    );
+    let text = unsafe {
+        let slice = std::slice::from_raw_parts(result.text, result.text_len);
+        std::str::from_utf8(slice).expect("decode must return valid UTF-8")
+    };
+    assert_eq!(text, "hello");
+    unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
+}
+
 // ---------------------------------------------------------------------------
 // Unigram encode: basic encoding must produce correct tokens
 // ---------------------------------------------------------------------------
@@ -126,6 +360,99 @@ fn unigram_encode_produces_correct_tokens() {
         vec![2],
         "Unigram must use Viterbi to match '▁hello' (score -5.0) over char fallback, got: {tokens:?}"
     );
+}
+
+/// The tokenization APIs must expose the raw SentencePiece token string with
+/// the leading metaspace marker intact.
+#[test]
+fn unigram_tokenize_surfaces_expose_metaspace_prefixed_token() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581", -1.0],
+      ["\u2581hello", -5.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null,
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true }
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(tokenize_strings(&ctx, "hello"), vec!["▁hello"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "hello"), vec!["▁hello"]);
+}
+
+/// A metaspace-prefixed whole-word token should map back to the real source
+/// word span, not claim a synthetic leading byte.
+#[test]
+fn unigram_offsets_whole_word_ignore_synthetic_prefix_space() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581", -1.0],
+      ["\u2581hello", -5.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null,
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true }
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"hello", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 1);
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Multiword metaspace whole-word encoding must preserve the real source spans
+/// of each word rather than collapsing both tokens to zero-width.
+#[test]
+fn unigram_offsets_multiword_whole_tokens_map_to_each_word() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581", -1.0],
+      ["\u2581hello", -5.0],
+      ["\u2581world", -5.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null,
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true }
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"hello world", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 2);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[2, 3]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
+    assert_eq!((offsets[1].start, offsets[1].end), (6, 11));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 /// Unigram encoder handles multi-word input with Metaspace.
@@ -230,6 +557,45 @@ fn unigram_char_fallback_for_unknown_word() {
         vec![1, 11, 12, 13],
         "unknown word must fall back to exact char sequence [▁,a,b,c]"
     );
+}
+
+/// Character fallback must remain visible on both tokenization APIs, including
+/// the standalone metaspace marker inserted for the word boundary.
+#[test]
+fn unigram_tokenize_surfaces_expose_char_fallback_sequence() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    assert_eq!(tokenize_strings(&ctx, "abc"), vec!["▁", "a", "b", "c"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "abc"), vec!["▁", "a", "b", "c"]);
+}
+
+/// The tokenization surfaces must show distinct metaspace-prefixed tokens for
+/// multiword whole-word matches, not collapse the word boundary.
+#[test]
+fn unigram_tokenize_surfaces_expose_multiword_whole_tokens() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    assert_eq!(tokenize_strings(&ctx, "hello world"), vec!["▁hello", "▁world"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "hello world"),
+        vec!["▁hello", "▁world"]
+    );
+}
+
+/// For a single-word char fallback path, the synthetic metaspace token must be
+/// zero-width and the remaining characters must map exactly to source bytes.
+#[test]
+fn unigram_offsets_char_fallback_keep_synthetic_prefix_zero_width() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"abc", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 4);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 0));
+    assert_eq!((offsets[1].start, offsets[1].end), (0, 1));
+    assert_eq!((offsets[2].start, offsets[2].end), (1, 2));
+    assert_eq!((offsets[3].start, offsets[3].end), (2, 3));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 /// Viterbi prefers longer tokens when they have better total score.
@@ -396,4 +762,78 @@ fn unigram_mixed_known_unknown() {
         vec![1, 0, 2],
         "known chars encode, unknown → unk: 'azb' → [a, unk, b], got: {tokens:?}"
     );
+}
+
+/// Without a pre-tokenizer, unknown characters should still be visible as
+/// `<unk>` on both tokenization surfaces rather than disappearing.
+#[test]
+fn unigram_tokenize_surfaces_expose_unknown_char_without_pretokenizer() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["a", -1.0],
+      ["b", -1.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(tokenize_strings(&ctx, "z"), vec!["<unk>"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "z"), vec!["<unk>"]);
+}
+
+/// Unknown characters without a pre-tokenizer must keep ownership of their
+/// original byte span in encode offsets.
+#[test]
+fn unigram_offsets_unknown_char_without_pretokenizer_cover_source_span() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["a", -1.0],
+      ["b", -1.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"z", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 1);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[0]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Batch Unigram encoding must slice into the same per-sequence IDs as
+/// individual encoding for both whole-word and char-fallback cases.
+#[test]
+fn unigram_batch_matches_individual_wholeword_and_charfallback() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    let batch = ctx.encode_batch(&["hello", "abc", ""], &no_bos());
+    assert_eq!(batch.num_sequences, 3);
+    assert_eq!(batch.offsets, vec![0, 1, 5, 5]);
+    assert_eq!(batch.ids[batch.offsets[0]..batch.offsets[1]], ctx.encode_with("hello", &no_bos()));
+    assert_eq!(batch.ids[batch.offsets[1]..batch.offsets[2]], ctx.encode_with("abc", &no_bos()));
+    assert_eq!(batch.ids[batch.offsets[2]..batch.offsets[3]], ctx.encode_with("", &no_bos()));
 }

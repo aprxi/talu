@@ -154,6 +154,8 @@ pub const Decoder = extern struct {
     strip_stop: c_int,
     /// Metaspace decoder: strip leading space added during encode
     add_prefix_space: c_int,
+    /// Metaspace decoder is active and should map ▁ back to space.
+    metaspace: c_int,
 };
 
 pub const Tokenizer = extern struct {
@@ -170,7 +172,7 @@ pub const Tokenizer = extern struct {
 
     /// Encode with explicit length (supports text with embedded null bytes)
     pub fn encodeSlice(self: *Tokenizer, input: []const u8, enc: *TokenizerEncoding) c_int {
-        if (input.len == 0) {
+        if (input.len == 0 and self.normalizer.prepend == null and self.normalizer.replace_pattern == null) {
             enc.* = std.mem.zeroes(TokenizerEncoding);
             return 0;
         }
@@ -369,6 +371,7 @@ pub const NormalizerSpec = extern struct {
     nfc: c_int,
     nfd: c_int,
     nfkc: c_int,
+    nfkd: c_int,
     clean_text: c_int,
     handle_chinese_chars: c_int,
     // SentencePiece-style normalizers

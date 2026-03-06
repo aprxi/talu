@@ -35,12 +35,21 @@ pub const BatchEncodeResult = struct {
     }
 };
 
+/// Per-sequence batch encode options mirroring the C API surface.
+pub const BatchEncodeOptions = struct {
+    add_bos: bool = true,
+    add_eos: bool = true,
+    truncation: bool = false,
+    truncation_left: bool = false,
+    max_length: usize = 0,
+};
+
 /// Context for parallel batch encoding.
 pub const BatchEncodeContext = struct {
     tokenizer: *api_mod.Tokenizer,
     text_ptrs: [*]const [*]const u8,
     text_lengths: [*]const usize,
-    add_special_tokens: bool,
+    options: BatchEncodeOptions,
     encoded_batches: [][]u32,
     had_error_flag: std.atomic.Value(bool),
 
@@ -50,7 +59,7 @@ pub const BatchEncodeContext = struct {
         text_ptrs: [*]const [*]const u8,
         text_lengths: [*]const usize,
         num_texts: usize,
-        add_special_tokens: bool,
+        options: BatchEncodeOptions,
     ) !*BatchEncodeContext {
         const context = try allocator.create(BatchEncodeContext);
         errdefer allocator.destroy(context);
@@ -59,7 +68,7 @@ pub const BatchEncodeContext = struct {
             .tokenizer = tokenizer,
             .text_ptrs = text_ptrs,
             .text_lengths = text_lengths,
-            .add_special_tokens = add_special_tokens,
+            .options = options,
             .encoded_batches = encoded_batches,
             .had_error_flag = std.atomic.Value(bool).init(false),
         };
@@ -80,15 +89,77 @@ pub const BatchEncodeContext = struct {
     }
 };
 
-/// Worker function for parallel batch encoding.
-pub fn batchEncodeWorker(start: usize, end: usize, ctx: *BatchEncodeContext) void {
-    const encode_opts = api_mod.Tokenizer.EncodeOptions{
-        .add_special_tokens = ctx.add_special_tokens,
+fn truncateIds(allocator: std.mem.Allocator, ids: []u32, options: BatchEncodeOptions) ![]u32 {
+    if (!options.truncation or options.max_length == 0 or ids.len <= options.max_length) {
+        return ids;
+    }
+
+    const start = if (options.truncation_left) ids.len - options.max_length else 0;
+    const out = try allocator.alloc(u32, options.max_length);
+    errdefer allocator.free(out);
+    @memcpy(out, ids[start..][0..options.max_length]);
+
+    if (ids.len > 0) allocator.free(ids);
+    return out;
+}
+
+fn applySelectiveSpecialTokens(
+    allocator: std.mem.Allocator,
+    tokenizer: *api_mod.Tokenizer,
+    ids: []u32,
+    add_bos: bool,
+    add_eos: bool,
+) ![]u32 {
+    const postproc = tokenizer.tokenizer_handle.postproc;
+    const include_bos = add_bos and postproc.cls_id >= 0;
+    const include_eos = add_eos and postproc.sep_id >= 0;
+    if (!include_bos and !include_eos) {
+        return ids;
+    }
+
+    const extra: usize = @intFromBool(include_bos) + @intFromBool(include_eos);
+    const out = try allocator.alloc(u32, ids.len + extra);
+    errdefer allocator.free(out);
+
+    var write_idx: usize = 0;
+    if (include_bos) {
+        out[write_idx] = @intCast(postproc.cls_id);
+        write_idx += 1;
+    }
+    if (ids.len > 0) {
+        @memcpy(out[write_idx..][0..ids.len], ids);
+        write_idx += ids.len;
+    }
+    if (include_eos) {
+        out[write_idx] = @intCast(postproc.sep_id);
+    }
+
+    if (ids.len > 0) allocator.free(ids);
+    return out;
+}
+
+fn encodeOne(
+    allocator: std.mem.Allocator,
+    tokenizer: *api_mod.Tokenizer,
+    text_bytes: []const u8,
+    options: BatchEncodeOptions,
+) ![]u32 {
+    var ids = if (options.add_bos == options.add_eos)
+        try tokenizer.encodeSliceWithOptions(text_bytes, .{ .add_special_tokens = options.add_bos })
+    else blk: {
+        const raw_ids = try tokenizer.encodeSliceWithOptions(text_bytes, .{ .add_special_tokens = false });
+        break :blk try applySelectiveSpecialTokens(allocator, tokenizer, raw_ids, options.add_bos, options.add_eos);
     };
 
+    ids = try truncateIds(allocator, ids, options);
+    return ids;
+}
+
+/// Worker function for parallel batch encoding.
+pub fn batchEncodeWorker(start: usize, end: usize, ctx: *BatchEncodeContext) void {
     for (start..end) |seq_idx| {
         const text_bytes = ctx.text_ptrs[seq_idx][0..ctx.text_lengths[seq_idx]];
-        const encoded_ids = ctx.tokenizer.encodeSliceWithOptions(text_bytes, encode_opts) catch {
+        const encoded_ids = encodeOne(ctx.tokenizer.allocator, ctx.tokenizer, text_bytes, ctx.options) catch {
             ctx.had_error_flag.store(true, .release);
             return;
         };
@@ -103,7 +174,7 @@ pub fn encodeBatch(
     text_ptrs: [*]const [*]const u8,
     text_lengths: [*]const usize,
     num_texts: usize,
-    add_special_tokens: bool,
+    options: BatchEncodeOptions,
 ) !BatchEncodeResult {
     if (num_texts == 0) {
         return BatchEncodeResult{
@@ -121,7 +192,7 @@ pub fn encodeBatch(
         text_ptrs,
         text_lengths,
         num_texts,
-        add_special_tokens,
+        options,
     );
     defer batch_context.deinit(allocator);
 

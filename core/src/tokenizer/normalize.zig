@@ -21,6 +21,11 @@ pub const NormalizeError = error{
 
 const UnicodeNormForm = enum { nfc, nfd, nfkc, nfkd };
 
+const SourceSpan = struct {
+    start: i32,
+    end: i32,
+};
+
 /// Dispatch to the correct utf8proc normalization function.
 fn applyUnicodeNorm(input: [*c]const c.utf8proc_uint8_t, form: UnicodeNormForm) ?[*:0]c.utf8proc_uint8_t {
     return switch (form) {
@@ -49,6 +54,7 @@ pub fn tokenizer_apply_normalizer_spec(tok: ?*ct.Tokenizer, spec: ?*const ct.Nor
     tokenizer.normalizer.nfc = normalizer_spec.nfc;
     tokenizer.normalizer.nfd = normalizer_spec.nfd;
     tokenizer.normalizer.nfkc = normalizer_spec.nfkc;
+    tokenizer.normalizer.nfkd = normalizer_spec.nfkd;
     tokenizer.normalizer.clean_text = normalizer_spec.clean_text;
     tokenizer.normalizer.handle_chinese_chars = normalizer_spec.handle_chinese_chars;
     // SentencePiece-style normalizers
@@ -116,43 +122,173 @@ fn applyNormWithNullBytes(input_bytes: []const u8, form: UnicodeNormForm) Normal
     return try output_bytes.toOwnedSlice(Allocator);
 }
 
+fn codepointLenAt(bytes: []const u8, index: usize) usize {
+    var codepoint: c.utf8proc_int32_t = 0;
+    const consumed = c.utf8proc_iterate(@ptrCast(bytes.ptr + index), @intCast(bytes.len - index), &codepoint);
+    if (consumed <= 0) return 1;
+    return @intCast(consumed);
+}
+
+fn fillCodepointSourceSpans(starts: []i32, ends: []i32, bytes: []const u8) void {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const cp_len = codepointLenAt(bytes, index);
+        const span_start: i32 = @intCast(index);
+        const span_end: i32 = @intCast(index + cp_len);
+        for (0..cp_len) |delta| {
+            starts[index + delta] = span_start;
+            ends[index + delta] = span_end;
+        }
+        index += cp_len;
+    }
+}
+
+fn spanForRange(starts: []const i32, ends: []const i32, start: usize, end: usize) SourceSpan {
+    var span_start: i32 = -1;
+    var span_end: i32 = -1;
+    for (start..end) |idx| {
+        const mapped_start = starts[idx];
+        const mapped_end = ends[idx];
+        if (mapped_start >= 0 and (span_start < 0 or mapped_start < span_start)) {
+            span_start = mapped_start;
+        }
+        if (mapped_end > span_end) {
+            span_end = mapped_end;
+        }
+    }
+    if (span_start < 0 or span_end < 0) return .{ .start = -1, .end = -1 };
+    return .{ .start = span_start, .end = span_end };
+}
+
+fn isCombiningMark(codepoint: c.utf8proc_int32_t) bool {
+    return switch (c.utf8proc_category(codepoint)) {
+        c.UTF8PROC_CATEGORY_MN,
+        c.UTF8PROC_CATEGORY_MC,
+        c.UTF8PROC_CATEGORY_ME,
+        => true,
+        else => false,
+    };
+}
+
+const NormWithMap = struct {
+    text: []u8,
+    map: []i32,
+    map_end: []i32,
+};
+
+fn applyNormPreservingMap(
+    input_bytes: []const u8,
+    input_map: []const i32,
+    input_map_end: []const i32,
+    form: UnicodeNormForm,
+) NormalizeError!NormWithMap {
+    var output_bytes = std.ArrayListUnmanaged(u8){};
+    errdefer output_bytes.deinit(Allocator);
+    var output_map = std.ArrayListUnmanaged(i32){};
+    errdefer output_map.deinit(Allocator);
+    var output_map_end = std.ArrayListUnmanaged(i32){};
+    errdefer output_map_end.deinit(Allocator);
+
+    var cursor: usize = 0;
+    while (cursor < input_bytes.len) {
+        if (input_bytes[cursor] == 0) {
+            try output_bytes.append(Allocator, 0);
+            try output_map.append(Allocator, input_map[cursor]);
+            try output_map_end.append(Allocator, input_map_end[cursor]);
+            cursor += 1;
+            continue;
+        }
+
+        var codepoint: c.utf8proc_int32_t = 0;
+        const first_len = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + cursor), @intCast(input_bytes.len - cursor), &codepoint);
+        const consumed_first: usize = if (first_len <= 0) 1 else @intCast(first_len);
+        var cluster_end = cursor + consumed_first;
+
+        while (cluster_end < input_bytes.len and input_bytes[cluster_end] != 0) {
+            var next_codepoint: c.utf8proc_int32_t = 0;
+            const next_len = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + cluster_end), @intCast(input_bytes.len - cluster_end), &next_codepoint);
+            if (next_len <= 0 or !isCombiningMark(next_codepoint)) break;
+            cluster_end += @intCast(next_len);
+        }
+
+        const cluster_span = spanForRange(input_map, input_map_end, cursor, cluster_end);
+        const normalized_cluster = try applyNormWithNullBytes(input_bytes[cursor..cluster_end], form);
+        defer Allocator.free(normalized_cluster);
+        try output_bytes.appendSlice(Allocator, normalized_cluster);
+        for (normalized_cluster) |_| {
+            try output_map.append(Allocator, cluster_span.start);
+            try output_map_end.append(Allocator, cluster_span.end);
+        }
+        cursor = cluster_end;
+    }
+
+    return .{
+        .text = try output_bytes.toOwnedSlice(Allocator),
+        .map = try output_map.toOwnedSlice(Allocator),
+        .map_end = try output_map_end.toOwnedSlice(Allocator),
+    };
+}
+
 pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8) NormalizeError!Normalized {
     const sentencepiece = try applySentencePieceTransforms(normalizer, input_bytes);
     defer if (sentencepiece.owned_text) |owned_text| Allocator.free(owned_text);
-    defer if (sentencepiece.map) |map_values| Allocator.free(map_values);
 
     var normalized_bytes = sentencepiece.text;
+    var start_map: ?[]i32 = sentencepiece.map;
+    var end_map: ?[]i32 = sentencepiece.map_end;
+
+    if (start_map == null) {
+        const base_starts = try Allocator.alloc(i32, normalized_bytes.len);
+        errdefer Allocator.free(base_starts);
+        const base_ends = try Allocator.alloc(i32, normalized_bytes.len);
+        errdefer Allocator.free(base_ends);
+        fillCodepointSourceSpans(base_starts, base_ends, normalized_bytes);
+        start_map = base_starts;
+        end_map = base_ends;
+    }
 
     // Apply Unicode normalization forms if enabled.
-    // utf8proc functions expect null-terminated input and stop at embedded nulls.
-    // applyNormWithNullBytes handles this by splitting at nulls and reassembling.
-    var nfc_bytes: ?[]u8 = null;
     if (normalizer.nfc != 0) {
-        nfc_bytes = try applyNormWithNullBytes(normalized_bytes, .nfc);
-        normalized_bytes = nfc_bytes.?;
+        const next = try applyNormPreservingMap(normalized_bytes, start_map.?, end_map.?, .nfc);
+        if (normalized_bytes.ptr != sentencepiece.text.ptr) Allocator.free(normalized_bytes);
+        Allocator.free(start_map.?);
+        Allocator.free(end_map.?);
+        normalized_bytes = next.text;
+        start_map = next.map;
+        end_map = next.map_end;
     }
-    defer if (nfc_bytes) |owned| Allocator.free(owned);
-
-    var nfd_bytes: ?[]u8 = null;
     if (normalizer.nfd != 0) {
-        nfd_bytes = try applyNormWithNullBytes(normalized_bytes, .nfd);
-        normalized_bytes = nfd_bytes.?;
+        const next = try applyNormPreservingMap(normalized_bytes, start_map.?, end_map.?, .nfd);
+        if (normalized_bytes.ptr != sentencepiece.text.ptr) Allocator.free(normalized_bytes);
+        Allocator.free(start_map.?);
+        Allocator.free(end_map.?);
+        normalized_bytes = next.text;
+        start_map = next.map;
+        end_map = next.map_end;
     }
-    defer if (nfd_bytes) |owned| Allocator.free(owned);
-
-    var nfkc_bytes: ?[]u8 = null;
     if (normalizer.nfkc != 0) {
-        nfkc_bytes = try applyNormWithNullBytes(normalized_bytes, .nfkc);
-        normalized_bytes = nfkc_bytes.?;
+        const next = try applyNormPreservingMap(normalized_bytes, start_map.?, end_map.?, .nfkc);
+        if (normalized_bytes.ptr != sentencepiece.text.ptr) Allocator.free(normalized_bytes);
+        Allocator.free(start_map.?);
+        Allocator.free(end_map.?);
+        normalized_bytes = next.text;
+        start_map = next.map;
+        end_map = next.map_end;
     }
-    defer if (nfkc_bytes) |owned| Allocator.free(owned);
-
-    var nfkd_bytes: ?[]u8 = null;
     if (normalizer.nfkd != 0) {
-        nfkd_bytes = try applyNormWithNullBytes(normalized_bytes, .nfkd);
-        normalized_bytes = nfkd_bytes.?;
+        const next = try applyNormPreservingMap(normalized_bytes, start_map.?, end_map.?, .nfkd);
+        if (normalized_bytes.ptr != sentencepiece.text.ptr) Allocator.free(normalized_bytes);
+        Allocator.free(start_map.?);
+        Allocator.free(end_map.?);
+        normalized_bytes = next.text;
+        start_map = next.map;
+        end_map = next.map_end;
     }
-    defer if (nfkd_bytes) |owned| Allocator.free(owned);
+    errdefer {
+        if (normalized_bytes.ptr != sentencepiece.text.ptr) Allocator.free(normalized_bytes);
+        if (start_map) |m| Allocator.free(m);
+        if (end_map) |m| Allocator.free(m);
+    }
 
     // Fast path: when no per-codepoint transforms are enabled, skip utf8proc
     // iteration entirely. Just copy text and build position map directly.
@@ -167,21 +303,27 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
         const text_copy = try Allocator.alloc(u8, normalized_bytes.len);
         errdefer Allocator.free(text_copy);
         const map_copy = try Allocator.alloc(i32, normalized_bytes.len);
+        errdefer Allocator.free(map_copy);
+        const end_copy = try Allocator.alloc(i32, normalized_bytes.len);
+        errdefer Allocator.free(end_copy);
         @memcpy(text_copy, normalized_bytes);
-        if (sentencepiece.map) |sp_map| {
-            const copy_len = @min(sp_map.len, normalized_bytes.len);
-            @memcpy(map_copy[0..copy_len], sp_map[0..copy_len]);
-            for (copy_len..normalized_bytes.len) |i| map_copy[i] = @intCast(i);
-        } else {
-            for (0..normalized_bytes.len) |i| map_copy[i] = @intCast(i);
-        }
-        return Normalized{ .text = text_copy, .map = map_copy };
+        @memcpy(map_copy, start_map.?[0..normalized_bytes.len]);
+        @memcpy(end_copy, end_map.?[0..normalized_bytes.len]);
+        if (normalized_bytes.ptr != sentencepiece.text.ptr) Allocator.free(normalized_bytes);
+        Allocator.free(start_map.?);
+        Allocator.free(end_map.?);
+        return Normalized{ .text = text_copy, .map = map_copy, .map_end = end_copy };
     }
 
     const normalized_capacity = normalized_bytes.len * 4 + 8;
     var normalized_buf = try Allocator.alloc(u8, normalized_capacity);
     var position_map = Allocator.alloc(i32, normalized_capacity) catch {
         Allocator.free(normalized_buf);
+        return error.OutOfMemory;
+    };
+    var position_map_end = Allocator.alloc(i32, normalized_capacity) catch {
+        Allocator.free(normalized_buf);
+        Allocator.free(position_map);
         return error.OutOfMemory;
     };
 
@@ -198,12 +340,7 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
 
         // Map position in normalized_bytes to position in original input.
         // If sp_map exists, use it to get the true original position.
-        const original_pos: i32 = if (sentencepiece.map) |m| blk: {
-            // Normalization (NFD/NFKC) may change string length.
-            // Clamp index to prevent out-of-bounds access if text expanded.
-            if (input_index >= m.len) break :blk -1;
-            break :blk m[input_index];
-        } else @intCast(input_index);
+        const source_span = spanForRange(start_map.?, end_map.?, input_index, input_index + @as(usize, @intCast(consumed_len)));
 
         input_index += @intCast(consumed_len);
 
@@ -247,17 +384,22 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
         // Apply handle_chinese_chars: add spaces around CJK
         if (normalizer.handle_chinese_chars != 0 and is_cjk) {
             normalized_buf[out_index] = ' ';
-            position_map[out_index] = original_pos;
+            position_map[out_index] = source_span.start;
+            position_map_end[out_index] = source_span.end;
             out_index += 1;
         }
 
         @memcpy(normalized_buf[out_index..][0..utf8_len], utf8_bytes[0..utf8_len]);
-        for (0..utf8_len) |byte_idx| position_map[out_index + byte_idx] = original_pos;
+        for (0..utf8_len) |byte_idx| {
+            position_map[out_index + byte_idx] = source_span.start;
+            position_map_end[out_index + byte_idx] = source_span.end;
+        }
         out_index += utf8_len;
 
         if (normalizer.handle_chinese_chars != 0 and is_cjk) {
             normalized_buf[out_index] = ' ';
-            position_map[out_index] = original_pos;
+            position_map[out_index] = source_span.start;
+            position_map_end[out_index] = source_span.end;
             out_index += 1;
         }
     }
@@ -275,11 +417,17 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
     if (trim_start > 0 and trimmed_len > 0) {
         std.mem.copyForwards(u8, normalized_buf[0..trimmed_len], normalized_buf[trim_start..trim_end]);
         std.mem.copyForwards(i32, position_map[0..trimmed_len], position_map[trim_start..trim_end]);
+        std.mem.copyForwards(i32, position_map_end[0..trimmed_len], position_map_end[trim_start..trim_end]);
     }
+
+    if (normalized_bytes.ptr != sentencepiece.text.ptr) Allocator.free(normalized_bytes);
+    Allocator.free(start_map.?);
+    Allocator.free(end_map.?);
 
     return Normalized{
         .text = normalized_buf[0..trimmed_len],
         .map = position_map[0..trimmed_len],
+        .map_end = position_map_end[0..trimmed_len],
     };
 }
 
@@ -287,6 +435,7 @@ const SentencePieceTransform = struct {
     text: []const u8,
     owned_text: ?[]u8,
     map: ?[]i32,
+    map_end: ?[]i32,
 };
 
 fn applySentencePieceTransforms(normalizer: *const ct.Normalizer, input_bytes: []const u8) NormalizeError!SentencePieceTransform {
@@ -295,7 +444,7 @@ fn applySentencePieceTransforms(normalizer: *const ct.Normalizer, input_bytes: [
     const has_prepend = normalizer.prepend != null;
     const has_replace = normalizer.replace_pattern != null and normalizer.replace_content != null;
     if (!has_prepend and !has_replace) {
-        return .{ .text = input_bytes, .owned_text = null, .map = null };
+        return .{ .text = input_bytes, .owned_text = null, .map = null, .map_end = null };
     }
 
     // Calculate required size
@@ -312,15 +461,25 @@ fn applySentencePieceTransforms(normalizer: *const ct.Normalizer, input_bytes: [
     errdefer Allocator.free(sp_buffer);
     const sp_position_map = try Allocator.alloc(i32, estimated_size);
     errdefer Allocator.free(sp_position_map);
+    const sp_position_map_end = try Allocator.alloc(i32, estimated_size);
+    errdefer Allocator.free(sp_position_map_end);
     var sp_out = sp_buffer;
     var sp_pos_map = sp_position_map;
+    var sp_pos_map_end = sp_position_map_end;
     var sp_index: usize = 0;
+
+    const orig_starts = try Allocator.alloc(i32, input_bytes.len);
+    defer Allocator.free(orig_starts);
+    const orig_ends = try Allocator.alloc(i32, input_bytes.len);
+    defer Allocator.free(orig_ends);
+    fillCodepointSourceSpans(orig_starts, orig_ends, input_bytes);
 
     // Apply prepend - these positions map to -1 (no original position)
     if (has_prepend) {
         for (0..prepend_bytes.len) |_| {
             sp_out[sp_index] = prepend_bytes[sp_index];
             sp_pos_map[sp_index] = -1; // No original position for prepended chars
+            sp_pos_map_end[sp_index] = -1;
             sp_index += 1;
         }
     }
@@ -334,13 +493,15 @@ fn applySentencePieceTransforms(normalizer: *const ct.Normalizer, input_bytes: [
                 // Replacement - map first char of replacement to original position
                 for (0..replace_content.len) |replace_index| {
                     sp_out[sp_index] = replace_content[replace_index];
-                    sp_pos_map[sp_index] = if (replace_index == 0) @intCast(original_index) else -1;
+                    sp_pos_map[sp_index] = @intCast(original_index);
+                    sp_pos_map_end[sp_index] = @intCast(original_index + replace_pattern.len);
                     sp_index += 1;
                 }
                 original_index += replace_pattern.len;
             } else {
                 sp_out[sp_index] = input_bytes[original_index];
-                sp_pos_map[sp_index] = @intCast(original_index);
+                sp_pos_map[sp_index] = orig_starts[original_index];
+                sp_pos_map_end[sp_index] = orig_ends[original_index];
                 sp_index += 1;
                 original_index += 1;
             }
@@ -349,7 +510,8 @@ fn applySentencePieceTransforms(normalizer: *const ct.Normalizer, input_bytes: [
         // Just copy input after prepend - map each position to original
         for (0..input_bytes.len) |original_index| {
             sp_out[sp_index] = input_bytes[original_index];
-            sp_pos_map[sp_index] = @intCast(original_index);
+            sp_pos_map[sp_index] = orig_starts[original_index];
+            sp_pos_map_end[sp_index] = orig_ends[original_index];
             sp_index += 1;
         }
     }
@@ -358,6 +520,7 @@ fn applySentencePieceTransforms(normalizer: *const ct.Normalizer, input_bytes: [
         .text = sp_out[0..sp_index],
         .owned_text = sp_buffer,
         .map = sp_position_map,
+        .map_end = sp_position_map_end,
     };
 }
 
@@ -366,17 +529,23 @@ pub fn addPrefixSpace(normalized: *Normalized) !void {
     const prefixed_bytes = try Allocator.alloc(u8, new_len);
     errdefer Allocator.free(prefixed_bytes);
     const prefixed_map = try Allocator.alloc(i32, new_len);
+    errdefer Allocator.free(prefixed_map);
+    const prefixed_map_end = try Allocator.alloc(i32, new_len);
 
     prefixed_bytes[0] = ' ';
     prefixed_map[0] = -1;
+    prefixed_map_end[0] = -1;
     if (normalized.text.len > 0) {
         @memcpy(prefixed_bytes[1..], normalized.text);
         @memcpy(prefixed_map[1..], normalized.map);
+        @memcpy(prefixed_map_end[1..], normalized.map_end);
     }
     Allocator.free(normalized.text);
     Allocator.free(normalized.map);
+    Allocator.free(normalized.map_end);
     normalized.text = prefixed_bytes;
     normalized.map = prefixed_map;
+    normalized.map_end = prefixed_map_end;
 }
 
 // =============================================================================
@@ -392,6 +561,7 @@ test "addPrefixSpace adds space at beginning" {
     var normalized = Normalized{
         .text = try Allocator.dupe(u8, "hello"),
         .map = try Allocator.dupe(i32, &[_]i32{ 0, 1, 2, 3, 4 }),
+        .map_end = try Allocator.dupe(i32, &[_]i32{ 1, 2, 3, 4, 5 }),
     };
 
     try addPrefixSpace(&normalized);
@@ -401,12 +571,15 @@ test "addPrefixSpace adds space at beginning" {
     try std.testing.expectEqualStrings(" hello", normalized.text);
     try std.testing.expectEqual(@as(i32, -1), normalized.map[0]);
     try std.testing.expectEqual(@as(i32, 0), normalized.map[1]);
+    try std.testing.expectEqual(@as(i32, -1), normalized.map_end[0]);
+    try std.testing.expectEqual(@as(i32, 1), normalized.map_end[1]);
 }
 
 test "addPrefixSpace handles empty string" {
     var normalized = Normalized{
         .text = try Allocator.alloc(u8, 0),
         .map = try Allocator.alloc(i32, 0),
+        .map_end = try Allocator.alloc(i32, 0),
     };
 
     try addPrefixSpace(&normalized);
@@ -446,6 +619,7 @@ test "tokenizer_apply_normalizer_spec sets normalization options" {
         .nfc = 1,
         .nfd = 0,
         .nfkc = 0,
+        .nfkd = 0,
         .clean_text = 1,
         .handle_chinese_chars = 0,
         .prepend = null,

@@ -439,10 +439,35 @@ fn encode_internal_impl(tokenizer: *ct.Tokenizer, input: []const u8, out: *ct.To
     // Check if input exactly matches an added token - if so, skip normalization
     // Empty input returns empty output (no tokens), but still apply post-processor
     // so that models with BOS/EOS (BERT, Llama) produce [CLS]+[SEP] or <s>+</s>.
-    if (input.len == 0) {
+    if (input.len == 0 and tokenizer.normalizer.prepend == null and tokenizer.normalizer.replace_pattern == null) {
         out.* = std.mem.zeroes(ct.TokenizerEncoding);
         if (apply_postprocess and tokenizer.postproc.add_special != 0) {
             if (postprocess.postprocess_single(&tokenizer.postproc, out) != 0) {
+                return error.OutOfMemory;
+            }
+        }
+        return 0;
+    }
+
+    // SentencePiece-style prepend/replace can synthesize text from empty input.
+    // There is no original source span to preserve here, so bypass added-token
+    // span collection and encode the normalized segment directly.
+    if (input.len == 0) {
+        var normalized = try normalize.normalize_text(&tokenizer.normalizer, input);
+        defer normalized.deinit();
+
+        if (normalized.text.len == 0) {
+            out.* = std.mem.zeroes(ct.TokenizerEncoding);
+        } else {
+            var accum = EncodeAccum{};
+            errdefer accum.deinit();
+            try encodeSegment(tokenizer, normalized.text, 0, &accum);
+            try accum.buildOutput(out);
+        }
+
+        if (apply_postprocess and tokenizer.postproc.add_special != 0) {
+            if (postprocess.postprocess_single(&tokenizer.postproc, out) != 0) {
+                tokenizer_encoding_free_struct(out);
                 return error.OutOfMemory;
             }
         }
@@ -574,7 +599,10 @@ fn encodeSegmentMaybePrepended(
 }
 
 fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usize, accumulator: *EncodeAccum) !void {
-    const is_sentencepiece_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.regex_split != 0 and tokenizer.pretokenizer.byte_level == 0;
+    const is_sentencepiece_bpe = tokenizer.type == ct.ModelType.bpe and
+        tokenizer.pretokenizer.regex_split != 0 and
+        tokenizer.pretokenizer.byte_level == 0 and
+        tokenizer.normalizer.prepend != null;
     const is_byte_level_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.byte_level != 0;
     const is_metaspace = tokenizer.pretokenizer.metaspace != 0;
     const per_word_encode = is_sentencepiece_bpe or is_byte_level_bpe or is_metaspace;

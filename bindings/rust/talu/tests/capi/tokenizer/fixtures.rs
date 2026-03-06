@@ -164,8 +164,11 @@ impl FixtureTokenizer {
     }
 
     fn encode_special(&self, text: &str) -> Result<Vec<u32>, String> {
+        // This fixture path means "encode with the configured post-processor",
+        // so both BOS and EOS must be explicit on the Rust side.
         let opts = talu_sys::EncodeOptions {
             add_bos: 1,
+            add_eos: 1,
             ..Default::default()
         };
         let result = unsafe {

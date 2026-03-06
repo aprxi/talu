@@ -15,10 +15,12 @@ pub const Range = struct {
 pub const Normalized = struct {
     text: []u8,
     map: []i32, // normalized byte index -> original byte index
+    map_end: []i32, // normalized byte index -> original byte end (exclusive)
 
     pub fn deinit(self: *Normalized) void {
         Allocator.free(self.text);
         Allocator.free(self.map);
+        Allocator.free(self.map_end);
     }
 };
 
@@ -80,6 +82,7 @@ test "Normalized deinit frees resources" {
     var normalized = Normalized{
         .text = try Allocator.alloc(u8, 10),
         .map = try Allocator.alloc(i32, 10),
+        .map_end = try Allocator.alloc(i32, 10),
     };
     // Just ensure deinit doesn't crash - memory leak detection will catch issues
     normalized.deinit();

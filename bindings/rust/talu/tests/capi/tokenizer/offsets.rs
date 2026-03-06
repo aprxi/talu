@@ -3,7 +3,7 @@
 //! Validates encode offsets, tokenize, tokenize_bytes, and the new EncodeResult
 //! fields (attention_mask, special_tokens_mask) with exact assertions.
 
-use crate::capi::tokenizer::common::TokenizerTestContext;
+use crate::capi::tokenizer::common::{build_byte_level_tokenizer_json, TokenizerTestContext};
 
 fn no_bos() -> talu_sys::EncodeOptions {
     talu_sys::EncodeOptions {
@@ -214,14 +214,14 @@ fn attention_mask_all_ones_hello() {
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
-/// attention_mask is empty (null pointer) for empty input.
+/// attention_mask is a sliceable empty sentinel for empty input.
 #[test]
 fn attention_mask_empty_input() {
     let ctx = TokenizerTestContext::new();
     let result = unsafe { super::common::encode_raw(ctx.handle(), &[], &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 0);
-    assert!(result.attention_mask.is_null());
+    assert!(!result.attention_mask.is_null());
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
@@ -281,14 +281,14 @@ fn special_tokens_mask_all_zeros_hello() {
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
-/// special_tokens_mask is null for empty input.
+/// special_tokens_mask is a sliceable empty sentinel for empty input.
 #[test]
 fn special_tokens_mask_empty_input() {
     let ctx = TokenizerTestContext::new();
     let result = unsafe { super::common::encode_raw(ctx.handle(), &[], &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 0);
-    assert!(result.special_tokens_mask.is_null());
+    assert!(!result.special_tokens_mask.is_null());
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
@@ -599,6 +599,58 @@ fn truncation_left_preserves_offsets() {
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
+/// Right truncation after ByteLevel `add_prefix_space` must keep the
+/// zero-width synthetic prefix span followed by the first retained source spans.
+#[test]
+fn truncation_right_with_add_prefix_space_preserves_prefix_offset_contract() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 3,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"Hello", &opts) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 3);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 0));
+    assert_eq!((offsets[1].start, offsets[1].end), (0, 1));
+    assert_eq!((offsets[2].start, offsets[2].end), (1, 2));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Left truncation after ByteLevel `add_prefix_space` must drop the synthetic
+/// prefix and preserve the original tail byte spans.
+#[test]
+fn truncation_left_with_add_prefix_space_preserves_tail_offsets() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 1,
+        truncation_side: 1,
+        max_length: 3,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"Hello", &opts) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 3);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (2, 3));
+    assert_eq!((offsets[1].start, offsets[1].end), (3, 4));
+    assert_eq!((offsets[2].start, offsets[2].end), (4, 5));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
 /// Truncation to 1 token preserves all fields.
 #[test]
 fn truncation_to_one_preserves_all_fields() {
@@ -730,6 +782,67 @@ fn offsets_with_lowercase_and_strip_accents_map_to_original_bytes() {
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
+/// Lowercase-only normalization must map tokens back to original uppercase source bytes.
+#[test]
+fn offsets_with_lowercase_map_to_original_bytes() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "a": 1, "b": 2, "c": 3},
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": {"type": "Lowercase"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"ABC", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 3);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 2, 3]);
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
+    assert_eq!((offsets[2].start, offsets[2].end), (2, 3));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// StripAccents-only normalization must map stripped chars to original accented source bytes.
+#[test]
+fn offsets_with_strip_accents_map_to_original_bytes() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "e": 1},
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": {"type": "StripAccents"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), "é".as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 1);
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1]);
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 2),
+        "stripped e must map to original composed-é byte span"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
 /// NFC normalization composing e + combining-acute into é must preserve source span.
 #[test]
 fn offsets_with_nfc_composition_map_to_decomposed_source_span() {
@@ -763,6 +876,86 @@ fn offsets_with_nfc_composition_map_to_decomposed_source_span() {
         (0, 3),
         "composed token must map to full decomposed source span"
     );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// NFKC normalization (fullwidth -> ASCII) must map back to original source byte spans.
+#[test]
+fn offsets_with_nfkc_fullwidth_map_to_original_bytes() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "A": 1, "B": 2},
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": {"type": "NFKC"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let input = "\u{FF21}\u{FF22}"; // fullwidth A, B (3 bytes each)
+    assert_eq!(input.len(), 6);
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &opts) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 2, "NFKC should normalize to ASCII A,B");
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 2]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 3));
+    assert_eq!((offsets[1].start, offsets[1].end), (3, 6));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// WordPiece offsets must survive BertNormalizer mutations that lowercase and
+/// strip accents, mapping the normalized token back to the original bytes.
+#[test]
+fn offsets_wordpiece_lowercase_strip_accents_map_to_original_bytes() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "cafe": 1
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": false,
+    "strip_accents": true,
+    "lowercase": true
+  },
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "CAFÉ";
+    assert_eq!(input.len(), 5, "É must occupy two UTF-8 bytes here");
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 1, "normalized whole word should stay one token");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
+
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
@@ -804,8 +997,11 @@ fn postprocessor_masks_and_offsets_are_exact() {
   "decoder": {"type": "ByteLevel"}
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
+    // Rust zeroes FFI structs for Default, so add_eos must be explicit when
+    // the test expects the template post-processor to append SEP/EOS.
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     let result = unsafe { super::common::encode_raw(ctx.handle(), b"Hi", &opts) };
@@ -867,6 +1063,7 @@ fn postprocessor_masks_and_offsets_empty_input() {
     let ctx = TokenizerTestContext::from_json(json);
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         ..Default::default()
     };
     let result = unsafe { super::common::encode_raw(ctx.handle(), b"", &opts) };
@@ -915,6 +1112,38 @@ fn offsets_replace_expansion_maps_to_single_source_span() {
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
+/// Replace expansion in middle of text must map expanded chars to the original source byte.
+#[test]
+fn offsets_replace_expansion_in_middle_preserves_neighbor_spans() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "A": 1, "a": 2, "n": 3, "d": 4, "B": 5},
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": {"type": "Replace", "pattern": {"String": "&"}, "content": "and"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"A&B", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 5);
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 2, 3, 4, 5]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1), "A span");
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 2), "expanded a span");
+    assert_eq!((offsets[2].start, offsets[2].end), (1, 2), "expanded n span");
+    assert_eq!((offsets[3].start, offsets[3].end), (1, 2), "expanded d span");
+    assert_eq!((offsets[4].start, offsets[4].end), (2, 3), "B span");
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
 /// Replace normalizer shrinking text (remove apostrophe) must preserve original byte mapping.
 #[test]
 fn offsets_replace_shrink_preserves_original_positions() {
@@ -945,6 +1174,84 @@ fn offsets_replace_shrink_preserves_original_positions() {
         (offsets[3].start, offsets[3].end),
         (4, 5),
         "token 't' should map after removed apostrophe"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Byte fallback emits multiple output tokens for one unknown UTF-8 symbol; all
+/// emitted tokens must map back to that symbol's full source span.
+#[test]
+fn offsets_byte_fallback_multibyte_unknown_map_to_original_span() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {"<unk>": 0, "<0xC3>": 1, "<0xA9>": 2},
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), "é".as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 2);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[1, 2]);
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 2),
+        "first fallback byte must map to the full composed-é span"
+    );
+    assert_eq!(
+        (offsets[1].start, offsets[1].end),
+        (0, 2),
+        "second fallback byte must map to the full composed-é span"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Without byte fallback, per-byte `<unk>` emission for an unknown UTF-8 symbol
+/// must still map every emitted token to the original source span.
+#[test]
+fn offsets_per_byte_unk_multibyte_unknown_map_to_original_span() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {"<unk>": 0},
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), "é".as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 2);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[0, 0]);
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 2),
+        "first per-byte <unk> must map to the full composed-é span"
+    );
+    assert_eq!(
+        (offsets[1].start, offsets[1].end),
+        (0, 2),
+        "second per-byte <unk> must map to the full composed-é span"
     );
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
@@ -997,6 +1304,7 @@ fn postprocessor_truncation_right_preserves_masks_and_offsets() {
     let ctx = TokenizerTestContext::from_json(json);
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         truncation: 1,
         truncation_side: 0,
         max_length: 3,
@@ -1052,6 +1360,7 @@ fn postprocessor_truncation_left_preserves_masks_and_offsets() {
     let ctx = TokenizerTestContext::from_json(json);
     let opts = talu_sys::EncodeOptions {
         add_bos: 1,
+        add_eos: 1,
         truncation: 1,
         truncation_side: 1,
         max_length: 3,
@@ -1068,5 +1377,59 @@ fn postprocessor_truncation_left_preserves_masks_and_offsets() {
     assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
     assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
     assert_eq!((offsets[2].start, offsets[2].end), (0, 0));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// ByteLevel `add_prefix_space` inserts a synthetic leading token that must not
+/// claim any real source span.
+#[test]
+fn byte_level_add_prefix_space_synthetic_prefix_has_zero_width_offset() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"Hello", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 6);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 0),
+        "synthetic prefix token must have zero-width source span"
+    );
+    assert_eq!((offsets[1].start, offsets[1].end), (0, 1));
+    assert_eq!((offsets[2].start, offsets[2].end), (1, 2));
+    assert_eq!((offsets[3].start, offsets[3].end), (2, 3));
+    assert_eq!((offsets[4].start, offsets[4].end), (3, 4));
+    assert_eq!((offsets[5].start, offsets[5].end), (4, 5));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// When the source text already begins with a real space, ByteLevel
+/// `add_prefix_space` must preserve that byte as a normal non-zero-width span.
+#[test]
+fn byte_level_add_prefix_space_real_leading_space_keeps_real_offset() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b" Hello", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 6);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 1),
+        "real leading space must keep a real source span"
+    );
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
+    assert_eq!((offsets[2].start, offsets[2].end), (2, 3));
+    assert_eq!((offsets[3].start, offsets[3].end), (3, 4));
+    assert_eq!((offsets[4].start, offsets[4].end), (4, 5));
+    assert_eq!((offsets[5].start, offsets[5].end), (5, 6));
+
     unsafe { talu_sys::talu_encode_result_free(result) };
 }

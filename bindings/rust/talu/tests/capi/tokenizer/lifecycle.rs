@@ -68,6 +68,25 @@ fn create_from_invalid_json_returns_error() {
     assert!(handle.is_null(), "handle must remain null on error");
 }
 
+/// create_from_json must clear a stale output handle before reporting an error.
+#[test]
+fn create_from_invalid_json_clears_stale_output_handle() {
+    let json = b"not valid json";
+    let mut handle = std::ptr::dangling_mut::<c_void>();
+    let rc = unsafe {
+        talu_sys::talu_tokenizer_create_from_json(
+            json.as_ptr(),
+            json.len(),
+            &mut handle as *mut _ as *mut c_void,
+        )
+    };
+    assert_ne!(rc, 0, "invalid JSON must return an error");
+    assert!(
+        handle.is_null(),
+        "create_from_json must null out a stale output handle on error"
+    );
+}
+
 /// Creating from empty JSON returns error and leaves handle null.
 #[test]
 fn create_from_empty_json_returns_error() {
@@ -80,8 +99,35 @@ fn create_from_empty_json_returns_error() {
             &mut handle as *mut _ as *mut c_void,
         )
     };
-    assert_ne!(rc, 0);
+    assert_eq!(
+        rc,
+        talu_sys::ErrorCode::InvalidArgument as i32,
+        "empty JSON must return InvalidArgument"
+    );
     assert!(handle.is_null(), "handle must remain null on error");
+}
+
+/// Empty JSON must also clear a stale output handle before returning InvalidArgument.
+#[test]
+fn create_from_empty_json_clears_stale_output_handle() {
+    let json = b"";
+    let mut handle = std::ptr::dangling_mut::<c_void>();
+    let rc = unsafe {
+        talu_sys::talu_tokenizer_create_from_json(
+            json.as_ptr(),
+            0,
+            &mut handle as *mut _ as *mut c_void,
+        )
+    };
+    assert_eq!(
+        rc,
+        talu_sys::ErrorCode::InvalidArgument as i32,
+        "empty JSON must return InvalidArgument"
+    );
+    assert!(
+        handle.is_null(),
+        "create_from_json must null out a stale output handle on error"
+    );
 }
 
 /// Two tokenizers from the same JSON operate independently.

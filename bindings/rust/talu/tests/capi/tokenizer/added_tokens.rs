@@ -18,6 +18,44 @@ fn no_bos() -> talu_sys::EncodeOptions {
     }
 }
 
+fn tokenize_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
+    let result =
+        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len()) };
+    assert!(result.error_msg.is_null(), "tokenize failed");
+    let tokens = if result.tokens.is_null() || result.num_tokens == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.tokens, result.num_tokens) }
+            .iter()
+            .map(|ptr| unsafe { std::ffi::CStr::from_ptr(*ptr) }.to_str().unwrap().to_owned())
+            .collect()
+    };
+    unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
+    tokens
+}
+
+fn tokenize_bytes_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
+    let result = unsafe {
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+    };
+    assert!(result.error_msg.is_null(), "tokenize_bytes failed");
+    let data = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens + 1) };
+    let tokens: Vec<String> = offsets
+        .windows(2)
+        .map(|w| std::str::from_utf8(&data[w[0]..w[1]]).unwrap().to_owned())
+        .collect();
+    unsafe {
+        talu_sys::talu_tokenize_bytes_result_free(
+            result.data,
+            result.data_len,
+            result.offsets,
+            result.num_tokens,
+        )
+    };
+    tokens
+}
+
 // ===========================================================================
 // single_word flag
 // ===========================================================================
@@ -485,6 +523,82 @@ fn adjacent_added_tokens() {
     );
 }
 
+/// Multiple added tokens in one input should also appear correctly on tokenize
+/// surfaces, not just through encode IDs.
+#[test]
+fn multiple_added_tokens_visible_on_tokenize_surfaces() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "a": 3, "b": 4, "c": 5, "d": 6, "e": 7,
+      " ": 8, "h": 9, "l": 10, "o": 11
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "[A]", "special": true},
+    {"id": 101, "content": "[B]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("[A]hello[B]", &no_bos()), [100, 9, 7, 10, 10, 11, 101]);
+    assert_eq!(tokenize_strings(&ctx, "[A]hello[B]"), ["[A]", "h", "e", "l", "l", "o", "[B]"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "[A]hello[B]"),
+        ["[A]", "h", "e", "l", "l", "o", "[B]"]
+    );
+}
+
+/// Adjacent added tokens must produce back-to-back source spans with no gap or
+/// overlap in offsets.
+#[test]
+fn adjacent_added_tokens_offsets_are_back_to_back() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "a": 3
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "[X]", "special": true},
+    {"id": 101, "content": "[Y]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"[X][Y]", &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(result.num_tokens, 2);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[100, 101]);
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 3));
+    assert_eq!((offsets[1].start, offsets[1].end), (3, 6));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
 // ===========================================================================
 // Decode with skip_special_tokens and added tokens
 // ===========================================================================
@@ -745,6 +859,48 @@ fn same_added_token_appears_multiple_times() {
         vec![100, 3, 100, 3, 100],
         "triple occurrence: [TOK]x[TOK]x[TOK], got: {tokens:?}"
     );
+}
+
+/// Repeated occurrences of the same added token must preserve exact source
+/// spans for each match independently.
+#[test]
+fn repeated_added_token_offsets_track_each_occurrence() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "x": 3
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "[TOK]", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = b"[TOK]x[TOK]x[TOK]";
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input, &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(result.num_tokens, 5);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[100, 3, 100, 3, 100]);
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
+    assert_eq!((offsets[1].start, offsets[1].end), (5, 6));
+    assert_eq!((offsets[2].start, offsets[2].end), (6, 11));
+    assert_eq!((offsets[3].start, offsets[3].end), (11, 12));
+    assert_eq!((offsets[4].start, offsets[4].end), (12, 17));
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 // ===========================================================================
@@ -1082,4 +1238,699 @@ fn empty_added_token_no_crash() {
         !tokens.is_empty(),
         "encode should produce tokens even with empty added token"
     );
+}
+
+/// single_word matching should also be visible on the tokenize surface when
+/// the token is bounded by punctuation rather than whitespace.
+#[test]
+fn single_word_punctuation_boundary_visible_on_tokenize_and_offsets() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "\"": 1, "c": 2, "a": 3, "t": 4
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+    }"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("\"cat\"", &no_bos()), [1, 100, 1]);
+    assert_eq!(tokenize_strings(&ctx, "\"cat\""), ["\"", "cat", "\""]);
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"\"cat\"", &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(result.num_tokens, 3);
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 4));
+    assert_eq!((offsets[2].start, offsets[2].end), (4, 5));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// normalized=true added tokens must appear as a single tokenize surface token
+/// and map back to the original uppercase source span.
+#[test]
+fn added_token_normalized_true_visible_on_tokenize_and_offsets() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "!": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "hello", "special": false, "normalized": true}
+  ],
+  "normalizer": {"type": "Lowercase"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+    }"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("HELLO!", &no_bos()), [100, 1]);
+    assert_eq!(tokenize_strings(&ctx, "HELLO!"), ["hello", "!"]);
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"HELLO!", &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(result.num_tokens, 2);
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[100, 1]);
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
+    assert_eq!((offsets[1].start, offsets[1].end), (5, 6));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// rstrip should remove trailing whitespace from the tokenize surface, and the
+/// next token must begin after the consumed whitespace span.
+#[test]
+fn rstrip_visible_on_tokenize_and_offsets() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1, " ": 2, "\t": 3, "\n": 4
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "[SEP]", "special": false, "rstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(tokenize_strings(&ctx, "[SEP] \t\nx"), ["[SEP]", "x"]);
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"[SEP] \t\nx", &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(result.num_tokens, 2);
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(
+        (offsets[1].start, offsets[1].end),
+        (8, 9),
+        "next token must start after whitespace consumed by rstrip"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// lstrip should remove leading whitespace from the tokenize surface before the
+/// added token match.
+#[test]
+fn lstrip_visible_on_tokenize_surface() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1, " ": 2, "\t": 3, "\n": 4
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "[MID]", "special": false, "lstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(tokenize_strings(&ctx, " \t\n[MID]x"), ["[MID]", "x"]);
+}
+
+/// normalized=false must also remain visible on the tokenize surface: matching
+/// must use the original text, not the lowercased normalized form.
+#[test]
+fn added_token_normalized_false_visible_on_tokenize_surface() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "h": 3, "e": 4, "l": 5, "o": 6},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "hello", "special": false, "normalized": false}
+  ],
+  "normalizer": {"type": "Lowercase"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("HELLO", &no_bos()), [3, 4, 5, 5, 6]);
+    assert_eq!(tokenize_strings(&ctx, "HELLO"), ["h", "e", "l", "l", "o"]);
+}
+
+/// Batch encoding must agree with individual encode results when added-token
+/// matching depends on normalization.
+#[test]
+fn added_token_normalized_true_batch_matches_individual_sequences() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "!": 1, "?": 2
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "hello", "special": false, "normalized": true}
+  ],
+  "normalizer": {"type": "Lowercase"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let texts = ["HELLO!", "hello?", "!"];
+    let batch = ctx.encode_batch(&texts, &no_bos());
+    assert_eq!(batch.num_sequences, 3);
+
+    for (i, text) in texts.iter().enumerate() {
+        let start = batch.offsets[i];
+        let end = batch.offsets[i + 1];
+        let expected = ctx.encode_with(text, &no_bos());
+        assert_eq!(
+            &batch.ids[start..end],
+            expected.as_slice(),
+            "batch slice must equal individual encode for normalized added-token case {i}: {text:?}"
+        );
+    }
+}
+
+/// normalized=true should also collapse to a single added token on the
+/// tokenize_bytes surface after normalization.
+#[test]
+fn added_token_normalized_true_visible_on_tokenize_bytes_surface() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "!": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "hello", "special": false, "normalized": true}
+  ],
+  "normalizer": {"type": "Lowercase"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("HELLO!", &no_bos()), [100, 1]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "HELLO!"), ["hello", "!"]);
+}
+
+/// rstrip behavior must remain consistent between batch encoding and
+/// individual encoding.
+#[test]
+fn rstrip_batch_matches_individual_sequences() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1, "y": 2, " ": 3, "\t": 4, "\n": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "[SEP]", "special": false, "rstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let texts = ["[SEP] \t\nx", "y[SEP] x"];
+    let batch = ctx.encode_batch(&texts, &no_bos());
+    assert_eq!(batch.num_sequences, 2);
+
+    for (i, text) in texts.iter().enumerate() {
+        let start = batch.offsets[i];
+        let end = batch.offsets[i + 1];
+        let expected = ctx.encode_with(text, &no_bos());
+        assert_eq!(
+            &batch.ids[start..end],
+            expected.as_slice(),
+            "batch slice must equal individual encode for rstrip case {i}: {text:?}"
+        );
+    }
+}
+
+/// lstrip behavior must also match between batch encoding and individual
+/// encoding for each sequence.
+#[test]
+fn lstrip_batch_matches_individual_sequences() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1, "y": 2, " ": 3, "\t": 4, "\n": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "[MID]", "special": false, "lstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let texts = [" \t\n[MID]x", "y [MID]"];
+    let batch = ctx.encode_batch(&texts, &no_bos());
+    assert_eq!(batch.num_sequences, 2);
+
+    for (i, text) in texts.iter().enumerate() {
+        let start = batch.offsets[i];
+        let end = batch.offsets[i + 1];
+        let expected = ctx.encode_with(text, &no_bos());
+        assert_eq!(
+            &batch.ids[start..end],
+            expected.as_slice(),
+            "batch slice must equal individual encode for lstrip case {i}: {text:?}"
+        );
+    }
+}
+
+/// normalized=false must not match batch items solely via normalization.
+#[test]
+fn added_token_normalized_false_batch_uses_original_text() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "h": 3, "e": 4, "l": 5, "o": 6},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "hello", "special": false, "normalized": false}
+  ],
+  "normalizer": {"type": "Lowercase"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let batch = ctx.encode_batch(&["HELLO", "hello"], &no_bos());
+    assert_eq!(batch.num_sequences, 2);
+    assert_eq!(batch.offsets, vec![0, 5, 6]);
+    assert_eq!(&batch.ids[0..5], &[3, 4, 5, 5, 6]);
+    assert_eq!(&batch.ids[5..6], &[100]);
+}
+
+/// single_word=true should also match punctuation-bounded words in batch mode.
+#[test]
+fn single_word_punctuation_boundary_batch_uses_added_token() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "\"": 1, "!": 2, "c": 3, "a": 4, "t": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let batch = ctx.encode_batch(&["\"cat\"", "cat!"], &no_bos());
+    assert_eq!(batch.num_sequences, 2);
+    assert_eq!(batch.offsets, vec![0, 3, 5]);
+    assert_eq!(&batch.ids[0..3], &[1, 100, 1]);
+    assert_eq!(&batch.ids[3..5], &[100, 2]);
+}
+
+/// single_word punctuation-boundary matching must also be visible on the
+/// tokenize_bytes surface.
+#[test]
+fn single_word_punctuation_boundary_visible_on_tokenize_bytes_surface() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "\"": 1, "!": 2, "c": 3, "a": 4, "t": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("\"cat\"!", &no_bos()), [1, 100, 1, 2]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "\"cat\"!"), ["\"", "cat", "\"", "!"]);
+}
+
+/// Longest-match added tokens must claim the full source span of the winning
+/// match, with subsequent raw tokens preserving the tail spans.
+#[test]
+fn longest_match_offsets_cover_winning_source_span() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "d": 3, "e": 4, "f": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "a", "special": false},
+    {"id": 101, "content": "ab", "special": false},
+    {"id": 102, "content": "abc", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"abcdef", &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(result.num_tokens, 4);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[102, 3, 4, 5]);
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 3));
+    assert_eq!((offsets[1].start, offsets[1].end), (3, 4));
+    assert_eq!((offsets[2].start, offsets[2].end), (4, 5));
+    assert_eq!((offsets[3].start, offsets[3].end), (5, 6));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Added-token preemption over BPE merges must also be reflected in source
+/// offsets: the added token owns its span before merged vocab tokens continue.
+#[test]
+fn added_token_preemption_offsets_split_added_and_merged_spans() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "c": 3, "a": 4, "t": 5,
+      "ca": 100
+    },
+    "merges": ["c a"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 200, "content": "cat", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"catca", &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(result.num_tokens, 2);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[200, 100]);
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 3));
+    assert_eq!((offsets[1].start, offsets[1].end), (3, 5));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// normalized=false must also remain visible on the tokenize_bytes surface:
+/// matching must use the original text, not the lowercased normalized form.
+#[test]
+fn added_token_normalized_false_visible_on_tokenize_bytes_surface() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "h": 3, "e": 4, "l": 5, "o": 6},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "hello", "special": false, "normalized": false}
+  ],
+  "normalizer": {"type": "Lowercase"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("HELLO", &no_bos()), [3, 4, 5, 5, 6]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "HELLO"), ["h", "e", "l", "l", "o"]);
+}
+
+/// rstrip should also be reflected on the tokenize_bytes surface.
+#[test]
+fn rstrip_visible_on_tokenize_bytes_surface() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1, " ": 2, "\t": 3, "\n": 4
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "[SEP]", "special": false, "rstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(tokenize_bytes_strings(&ctx, "[SEP] \t\nx"), ["[SEP]", "x"]);
+}
+
+/// lstrip should also remove leading whitespace on the tokenize_bytes surface.
+#[test]
+fn lstrip_visible_on_tokenize_bytes_surface() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1, " ": 2, "\t": 3, "\n": 4
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "[MID]", "special": false, "lstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(tokenize_bytes_strings(&ctx, " \t\n[MID]x"), ["[MID]", "x"]);
+}
+
+/// Longest-match priority must also be reflected on the tokenize surface.
+#[test]
+fn longest_match_visible_on_tokenize_surfaces() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "d": 3, "e": 4, "f": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "a", "special": false},
+    {"id": 101, "content": "ab", "special": false},
+    {"id": 102, "content": "abc", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("abcdef", &no_bos()), [102, 3, 4, 5]);
+    assert_eq!(tokenize_strings(&ctx, "abcdef"), ["abc", "d", "e", "f"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "abcdef"), ["abc", "d", "e", "f"]);
+
+    assert_eq!(ctx.encode_with("abdef", &no_bos()), [101, 3, 4, 5]);
+    assert_eq!(tokenize_strings(&ctx, "abdef"), ["ab", "d", "e", "f"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "abdef"), ["ab", "d", "e", "f"]);
+}
+
+/// Added-token preemption over BPE merges must also be visible on tokenize
+/// surfaces before BPE sees the input.
+#[test]
+fn added_token_preemption_visible_on_tokenize_surfaces() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "c": 3, "a": 4, "t": 5,
+      "ca": 100
+    },
+    "merges": ["c a"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 200, "content": "cat", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("catca", &no_bos()), [200, 100]);
+    assert_eq!(tokenize_strings(&ctx, "catca"), ["cat", "ca"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "catca"), ["cat", "ca"]);
+}
+
+/// Longest-match priority must also hold in batch encoding for each sequence.
+#[test]
+fn longest_match_batch_matches_individual_sequences() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "d": 3, "e": 4, "f": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "a", "special": false},
+    {"id": 101, "content": "ab", "special": false},
+    {"id": 102, "content": "abc", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let texts = ["abcdef", "abdef", "adef"];
+    let batch = ctx.encode_batch(&texts, &no_bos());
+    assert_eq!(batch.num_sequences, 3);
+
+    for (i, text) in texts.iter().enumerate() {
+        let start = batch.offsets[i];
+        let end = batch.offsets[i + 1];
+        let expected = ctx.encode_with(text, &no_bos());
+        assert_eq!(
+            &batch.ids[start..end],
+            expected.as_slice(),
+            "batch slice must equal individual encode for overlap case {i}: {text:?}"
+        );
+    }
+}
+
+/// Added-token preemption over BPE merges must also remain consistent in batch
+/// encoding across sequences with and without trailing mergeable text.
+#[test]
+fn added_token_preemption_batch_matches_individual_sequences() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "c": 3, "a": 4, "t": 5,
+      "ca": 100
+    },
+    "merges": ["c a"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 200, "content": "cat", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let texts = ["cat", "catca", "ca"];
+    let batch = ctx.encode_batch(&texts, &no_bos());
+    assert_eq!(batch.num_sequences, 3);
+
+    for (i, text) in texts.iter().enumerate() {
+        let start = batch.offsets[i];
+        let end = batch.offsets[i + 1];
+        let expected = ctx.encode_with(text, &no_bos());
+        assert_eq!(
+            &batch.ids[start..end],
+            expected.as_slice(),
+            "batch slice must equal individual encode for preemption case {i}: {text:?}"
+        );
+    }
 }

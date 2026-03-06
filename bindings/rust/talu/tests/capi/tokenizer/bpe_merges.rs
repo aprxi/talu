@@ -635,6 +635,660 @@ fn cached_path_aggressive_reduction() {
 }
 
 // ===========================================================================
+// Merge-implied token creation and boundary behavior
+// ===========================================================================
+
+/// BPE must support merge rules whose concatenated token is not present in the
+/// original vocab by auto-creating that token internally.
+#[test]
+fn merge_implied_token_auto_created_when_missing_from_vocab() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5
+    },
+    "merges": ["a b"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("ab", &no_bos());
+    assert_eq!(
+        tokens.len(),
+        1,
+        "merge-implied token should produce one token, got: {tokens:?}"
+    );
+    let decoded = ctx.decode(&tokens);
+    assert_eq!(
+        decoded, "ab",
+        "auto-created merged token must decode back to 'ab'"
+    );
+}
+
+/// Cascaded merges should also work when intermediate merge products are not
+/// explicitly present in the original vocab.
+#[test]
+fn cascade_merges_auto_create_missing_intermediate_tokens() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5, "c": 6, "ab": 7
+    },
+    "merges": ["a b", "ab c"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("abc", &no_bos());
+    assert_eq!(tokens.len(), 1, "cascade should reduce to one token, got: {tokens:?}");
+    let decoded = ctx.decode(&tokens);
+    assert_eq!(
+        decoded, "abc",
+        "cascade token auto-created from 'ab c' must decode back to 'abc'"
+    );
+}
+
+/// With a whitespace pre-tokenizer, merge rules must not cross tokenized word
+/// boundaries (e.g., "a b" should never merge to "ab").
+#[test]
+fn merges_do_not_cross_whitespace_pretokenizer_boundaries() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5, "ab": 6
+    },
+    "merges": ["a b"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let split_tokens = ctx.encode_with("a b", &no_bos());
+    assert_eq!(
+        split_tokens,
+        vec![4, 3, 5],
+        "whitespace-separated input must not collapse to merged token across the boundary"
+    );
+    assert!(
+        !split_tokens.contains(&6),
+        "cross-word merge token 'ab' must not appear for input with whitespace boundary"
+    );
+
+    let merged_tokens = ctx.encode_with("ab", &no_bos());
+    assert_eq!(
+        merged_tokens,
+        vec![6],
+        "same merge rule should still apply within one pretokenized word"
+    );
+}
+
+/// String-form and array-form merge encodings in tokenizer JSON must be
+/// behaviorally equivalent.
+#[test]
+fn merge_string_and_array_formats_are_behaviorally_equivalent() {
+    let json_string_merges = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5, "c": 6, "ab": 7, "abc": 8
+    },
+    "merges": ["a b", "ab c"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let json_array_merges = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5, "c": 6, "ab": 7, "abc": 8
+    },
+    "merges": [["a", "b"], ["ab", "c"]]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let a = TokenizerTestContext::from_json(json_string_merges);
+    let b = TokenizerTestContext::from_json(json_array_merges);
+    let cases = ["abc", "ab", "a", "cab", "abcabc"];
+
+    for text in cases {
+        let ids_a = a.encode_with(text, &no_bos());
+        let ids_b = b.encode_with(text, &no_bos());
+        assert_eq!(
+            ids_a, ids_b,
+            "merge format mismatch for input {text:?}: string={ids_a:?} array={ids_b:?}"
+        );
+    }
+}
+
+/// Auto-created merged tokens must be consistent across encode, tokenize, and
+/// tokenize_bytes surfaces.
+#[test]
+fn auto_created_merge_token_consistent_across_surfaces() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5
+    },
+    "merges": ["a b"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let text = "ab";
+    let ids = ctx.encode_with(text, &no_bos());
+    assert_eq!(ids.len(), 1, "encode must produce one merged token");
+
+    let tok = unsafe {
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+    };
+    assert!(tok.error_msg.is_null(), "tokenize should succeed");
+    assert_eq!(tok.num_tokens, 1, "tokenize must produce one token");
+    let ptrs = unsafe { std::slice::from_raw_parts(tok.tokens as *const *const i8, tok.num_tokens) };
+    let t0 = unsafe { std::ffi::CStr::from_ptr(ptrs[0]) }
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(t0, "ab", "tokenize token text must be merged token");
+    unsafe { talu_sys::talu_tokenize_result_free(tok.tokens, tok.num_tokens) };
+
+    let bytes = unsafe {
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+    };
+    assert!(bytes.error_msg.is_null(), "tokenize_bytes should succeed");
+    assert_eq!(bytes.num_tokens, 1, "tokenize_bytes must produce one token");
+    let offsets = unsafe { std::slice::from_raw_parts(bytes.offsets, bytes.num_tokens + 1) };
+    let data = unsafe { std::slice::from_raw_parts(bytes.data, bytes.data_len) };
+    assert_eq!(std::str::from_utf8(&data[offsets[0]..offsets[1]]).unwrap(), "ab");
+    unsafe {
+        talu_sys::talu_tokenize_bytes_result_free(
+            bytes.data,
+            bytes.data_len,
+            bytes.offsets,
+            bytes.num_tokens,
+        )
+    };
+}
+
+/// Auto-created merged token behavior must be identical between individual and
+/// batch encode paths.
+#[test]
+fn batch_and_individual_agree_for_auto_created_merged_tokens() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5
+    },
+    "merges": ["a b"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let a = ctx.encode_with("ab", &no_bos());
+    let b = ctx.encode_with("ba", &no_bos());
+    let batch = ctx.encode_batch(&["ab", "ba"], &no_bos());
+    assert_eq!(batch.num_sequences, 2);
+    assert_eq!(batch.offsets, vec![0, a.len(), a.len() + b.len()]);
+    assert_eq!(&batch.ids[0..a.len()], a.as_slice(), "batch seq0 mismatch");
+    assert_eq!(
+        &batch.ids[a.len()..a.len() + b.len()],
+        b.as_slice(),
+        "batch seq1 mismatch"
+    );
+}
+
+/// Offsets for an auto-created merged token must span the full source word.
+#[test]
+fn offsets_for_auto_created_merged_token_cover_full_span() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5
+    },
+    "merges": ["a b"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"ab", &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode should succeed");
+    assert_eq!(result.num_tokens, 1, "expected one merged token");
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(offsets[0].start, 0, "merged token start offset");
+    assert_eq!(offsets[0].end, 2, "merged token end offset");
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+// ===========================================================================
+// Unknown-symbol fallback and long-word boundaries
+// ===========================================================================
+
+/// If per-symbol lookup fails but the full word exists in vocab, BPE should
+/// fall back to the full-word token instead of emitting per-symbol UNKs.
+#[test]
+fn unknown_symbols_fallback_to_full_word_vocab_token() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "foobar": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("foobar", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![1],
+        "full-word vocab fallback should return token id 1 for 'foobar'"
+    );
+}
+
+/// SentencePiece-style byte fallback should map unknown single-byte input to
+/// its `<0xNN>` token when available.
+#[test]
+fn byte_fallback_encodes_unknown_ascii_byte() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "<0x61>": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("a", &no_bos());
+    assert_eq!(tokens, vec![1], "unknown 'a' should use <0x61> byte fallback");
+}
+
+/// Multi-byte UTF-8 unknown chars should emit one fallback token per byte when
+/// all `<0xNN>` tokens exist.
+#[test]
+fn byte_fallback_encodes_multibyte_utf8_unknown_char() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "<0xC3>": 1,
+      "<0xA9>": 2
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("é", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![1, 2],
+        "unknown 'é' should emit byte fallback tokens [<0xC3>, <0xA9>]"
+    );
+}
+
+/// If byte fallback is only partially available, missing bytes must degrade to
+/// `<unk>` while available bytes still use `<0xNN>` IDs.
+#[test]
+fn byte_fallback_partial_table_uses_unk_for_missing_bytes() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "<0xC3>": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("é", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![1, 0],
+        "partial byte fallback should emit [<0xC3>, <unk>] for 'é'"
+    );
+}
+
+/// An unknown multi-byte symbol in the middle of a word must not block valid
+/// BPE merges on the known left and right neighbors when byte fallback is used.
+#[test]
+fn byte_fallback_unknown_middle_preserves_neighbor_merges() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "a": 1,
+      "b": 2,
+      "c": 3,
+      "d": 4,
+      "ab": 5,
+      "cd": 6,
+      "<0xC3>": 7,
+      "<0xA9>": 8
+    },
+    "merges": ["a b", "c d"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("abécd", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![5, 7, 8, 6],
+        "unknown middle symbol should use byte fallback while preserving ab/cd merges"
+    );
+}
+
+/// Without byte fallback, the same mixed known/unknown path must still preserve
+/// valid merges on both sides and degrade the unknown symbol to per-byte <unk>.
+#[test]
+fn unknown_middle_without_byte_fallback_preserves_neighbor_merges() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "a": 1,
+      "b": 2,
+      "c": 3,
+      "d": 4,
+      "ab": 5,
+      "cd": 6
+    },
+    "merges": ["a b", "c d"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("abécd", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![5, 0, 0, 6],
+        "unknown middle symbol should degrade to per-byte <unk> while preserving ab/cd merges"
+    );
+}
+
+/// When byte fallback emits multiple tokens for one unknown source symbol, the
+/// surrounding merged tokens and fallback bytes must keep exact source spans.
+#[test]
+fn byte_fallback_unknown_middle_offsets_cover_merged_and_fallback_spans() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "a": 1,
+      "b": 2,
+      "c": 3,
+      "d": 4,
+      "ab": 5,
+      "cd": 6,
+      "<0xC3>": 7,
+      "<0xA9>": 8
+    },
+    "merges": ["a b", "c d"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), "abécd".as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(result.num_tokens, 4);
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[5, 7, 8, 6]);
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 2),
+        "merged ab must span the first two source bytes"
+    );
+    assert_eq!(
+        (offsets[1].start, offsets[1].end),
+        (2, 4),
+        "first fallback byte must map to the full é source span"
+    );
+    assert_eq!(
+        (offsets[2].start, offsets[2].end),
+        (2, 4),
+        "second fallback byte must map to the full é source span"
+    );
+    assert_eq!(
+        (offsets[3].start, offsets[3].end),
+        (4, 6),
+        "merged cd must span the final two source bytes"
+    );
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Words longer than MAX_WORD_SYMBOLS (512) must still be encoded correctly.
+/// With only merge `a+a->aa`, 513 'a' should reduce to 256 'aa' + 1 'a'.
+#[test]
+fn long_word_over_max_word_symbols_encodes_deterministically() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "aa": 5
+    },
+    "merges": ["a a"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "a".repeat(513);
+    let tokens = ctx.encode_with(&input, &no_bos());
+    assert_eq!(
+        tokens.len(),
+        257,
+        "513 'a' with a+a merge must produce 257 tokens (256 'aa' + 1 'a')"
+    );
+    assert!(
+        tokens[..256].iter().all(|&id| id == 5),
+        "first 256 tokens should be 'aa' (id 5)"
+    );
+    assert_eq!(tokens[256], 4, "final odd symbol should be 'a' (id 4)");
+}
+
+/// Very long words must remain deterministic across repeated encodes.
+#[test]
+fn long_word_over_max_word_symbols_is_deterministic() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "aa": 5
+    },
+    "merges": ["a a"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "a".repeat(1025);
+    let first = ctx.encode_with(&input, &no_bos());
+    let second = ctx.encode_with(&input, &no_bos());
+    assert_eq!(first, second, "long-word BPE encoding must be deterministic");
+}
+
+// ===========================================================================
 // Interleaved merge ranks with non-adjacent application
 // ===========================================================================
 
@@ -1048,5 +1702,243 @@ fn seven_repeated_chars_cascade() {
         tokens,
         vec![5, 5, 6],
         "7 repeated cascade: 'aaaaaaa' → [aa, aa, aaa=6], got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// Unknown token handling fast paths (single/two symbol)
+// ===========================================================================
+
+/// Single unknown multi-byte symbol in non-byte-level mode should emit one
+/// fallback/unk token per source byte.
+#[test]
+fn single_unknown_multibyte_non_bytelevel_emits_per_byte_unk() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": { "<unk>": 0 },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("é", &no_bos()); // UTF-8: C3 A9
+    assert_eq!(
+        tokens,
+        vec![0, 0],
+        "single unknown multibyte symbol should map per-byte to <unk>"
+    );
+}
+
+/// Two-symbol fast path: known + unknown multi-byte with byte-fallback should
+/// emit known ID followed by fallback byte IDs.
+#[test]
+fn two_symbol_mixed_known_unknown_with_byte_fallback() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "a": 1,
+      "<0xC3>": 2,
+      "<0xA9>": 3
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("aé", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![1, 2, 3],
+        "known+unknown two-symbol path should emit known token then byte fallback IDs"
+    );
+}
+
+/// Two-symbol fast path without byte-fallback should emit known ID and then
+/// one <unk> per byte of the unknown symbol.
+#[test]
+fn two_symbol_mixed_known_unknown_without_byte_fallback_uses_unk_per_byte() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "a": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("aé", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![1, 0, 0],
+        "without byte-fallback, unknown multi-byte symbol should emit per-byte <unk>"
+    );
+}
+
+/// Byte-level mode with incomplete raw-byte mapping should emit a single <unk>
+/// for unknown single-byte symbols on the single-symbol fast path.
+#[test]
+fn single_unknown_bytelevel_symbol_emits_single_unk() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": { "<unk>": 0 },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("a", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![0],
+        "byte-level unknown single symbol should emit one <unk>, not per-byte expansion"
+    );
+}
+
+// ===========================================================================
+// Non-byte-level large-word boundary (> MAX_WORD_SYMBOLS by char count)
+// ===========================================================================
+
+/// Non-byte-level path with multi-byte UTF-8 chars must handle >512 symbols
+/// without crashing and with correct pair-merge cardinality.
+#[test]
+fn non_bytelevel_multibyte_long_word_over_symbol_limit() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "é": 1,
+      "éé": 2
+    },
+    "merges": ["é é"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "é".repeat(513);
+    let tokens = ctx.encode_with(&input, &no_bos());
+    assert_eq!(
+        tokens.len(),
+        257,
+        "513 UTF-8 symbols with é+é merge should produce 257 tokens"
+    );
+    assert!(
+        tokens[..256].iter().all(|&id| id == 2),
+        "first 256 tokens should be merged 'éé' (id 2)"
+    );
+    assert_eq!(tokens[256], 1, "final odd symbol should be 'é' (id 1)");
+}
+
+/// Exactly MAX_WORD_SYMBOLS (512) non-byte-level UTF-8 symbols should remain
+/// stable and follow expected merge cardinality without heap-overflow issues.
+#[test]
+fn non_bytelevel_multibyte_exact_symbol_limit() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "é": 1,
+      "éé": 2
+    },
+    "merges": ["é é"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "é".repeat(512);
+    let tokens = ctx.encode_with(&input, &no_bos());
+    assert_eq!(tokens.len(), 256, "512 symbols should reduce to 256 merged tokens");
+    assert!(
+        tokens.iter().all(|&id| id == 2),
+        "all tokens at 512 boundary should be merged 'éé' (id 2)"
+    );
+}
+
+/// Repeated encoding of long non-byte-level UTF-8 words should be deterministic.
+#[test]
+fn non_bytelevel_multibyte_long_word_repeated_is_deterministic() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "é": 1,
+      "éé": 2
+    },
+    "merges": ["é é"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "é".repeat(513);
+    let first = ctx.encode_with(&input, &no_bos());
+    let second = ctx.encode_with(&input, &no_bos());
+    assert_eq!(
+        first, second,
+        "repeated long non-byte-level UTF-8 encoding must be deterministic"
     );
 }

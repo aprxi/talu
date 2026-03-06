@@ -416,6 +416,67 @@ pub struct PaddedTensorResult {
     pub padded_length: usize,
 }
 
+/// RAII wrapper for raw C encode results used by tests that need access to
+/// offsets/masks but still want deterministic cleanup on panic.
+pub struct OwnedEncodeResult {
+    raw: talu_sys::EncodeResult,
+}
+
+impl OwnedEncodeResult {
+    pub fn new(raw: talu_sys::EncodeResult) -> Self {
+        Self { raw }
+    }
+
+    pub fn error_msg(&self) -> *const i8 {
+        self.raw.error_msg.cast()
+    }
+
+    pub fn ids(&self) -> &[u32] {
+        if self.raw.ids.is_null() || self.raw.num_tokens == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.raw.ids, self.raw.num_tokens) }
+        }
+    }
+}
+
+impl Drop for OwnedEncodeResult {
+    fn drop(&mut self) {
+        unsafe { talu_sys::talu_encode_result_free(self.raw) };
+    }
+}
+
+/// RAII wrapper for raw C decode results used by tests that need exact text
+/// bytes while ensuring cleanup still happens if assertions panic.
+pub struct OwnedDecodeResult {
+    raw: talu_sys::DecodeResult,
+}
+
+impl OwnedDecodeResult {
+    pub fn new(raw: talu_sys::DecodeResult) -> Self {
+        Self { raw }
+    }
+
+    pub fn error_msg(&self) -> *const i8 {
+        self.raw.error_msg.cast()
+    }
+
+    pub fn text(&self) -> &str {
+        if self.raw.text.is_null() || self.raw.text_len == 0 {
+            ""
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts(self.raw.text, self.raw.text_len) };
+            std::str::from_utf8(slice).expect("decode returned invalid UTF-8 bytes")
+        }
+    }
+}
+
+impl Drop for OwnedDecodeResult {
+    fn drop(&mut self) {
+        unsafe { talu_sys::talu_decode_result_free(self.raw.text, self.raw.text_len) };
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Byte-level BPE fixture (full 256 byte tokens)
 // ---------------------------------------------------------------------------
@@ -641,6 +702,7 @@ pub unsafe fn encode_batch_raw_null_options(
 ///
 /// # Safety
 /// `ids`/`offsets` must follow C-API layout contracts for `num_sequences`.
+/// The consumed ID prefix is determined solely by `offsets[num_sequences]`.
 pub unsafe fn batch_to_padded_tensor_raw(
     ids: *const u32,
     offsets: *const usize,
@@ -648,4 +710,16 @@ pub unsafe fn batch_to_padded_tensor_raw(
     options: &talu_sys::PaddedTensorOptions,
 ) -> talu_sys::PaddedTensorResult {
     talu_batch_to_padded_tensor(ids, offsets, num_sequences, options as *const _)
+}
+
+/// Convert flattened batch ids/offsets to a padded tensor with null options pointer.
+///
+/// # Safety
+/// `ids`/`offsets` must follow C-API layout contracts for `num_sequences`.
+pub unsafe fn batch_to_padded_tensor_raw_null_options(
+    ids: *const u32,
+    offsets: *const usize,
+    num_sequences: usize,
+) -> talu_sys::PaddedTensorResult {
+    talu_batch_to_padded_tensor(ids, offsets, num_sequences, std::ptr::null())
 }

@@ -45,6 +45,12 @@ fn decode_invalid_token_id_out_of_vocab_errors() {
     );
     assert!(result.text.is_null(), "text pointer must be null on decode error");
     assert_eq!(result.text_len, 0, "text_len must be 0 on decode error");
+    let code = unsafe { talu_sys::talu_last_error_code() };
+    assert_eq!(
+        code,
+        talu_sys::ErrorCode::TokenizerInvalidTokenId as i32,
+        "invalid token ID decode must set TokenizerInvalidTokenId"
+    );
 }
 
 /// Decoding u32::MAX must be rejected as invalid token ID.
@@ -59,6 +65,12 @@ fn decode_invalid_token_id_u32_max_errors() {
     );
     assert!(result.text.is_null(), "text pointer must be null on decode error");
     assert_eq!(result.text_len, 0, "text_len must be 0 on decode error");
+    let code = unsafe { talu_sys::talu_last_error_code() };
+    assert_eq!(
+        code,
+        talu_sys::ErrorCode::TokenizerInvalidTokenId as i32,
+        "u32::MAX decode must set TokenizerInvalidTokenId"
+    );
 }
 
 /// decode with null options pointer must use C-API default skip_special_tokens=true.
@@ -131,11 +143,9 @@ fn encode_null_options_defaults_to_add_special_tokens() {
 }
 
 /// In the base fixture, special tokens are in both `model.vocab` and
-/// `added_tokens`. The BPE decoder checks `id_to_token` first (which
-/// always sets `is_special=false`), so `skip_special_tokens` has no
-/// observable effect. This locks down that behavior.
+/// `added_tokens`. `skip_special_tokens=1` must still strip them.
 #[test]
-fn decode_bos_token_base_fixture() {
+fn decode_skip_special_strips_vocab_shadowed_specials() {
     let ctx = TokenizerTestContext::new();
     let skip = talu_sys::DecodeOptionsC {
         skip_special_tokens: 1,
@@ -144,8 +154,36 @@ fn decode_bos_token_base_fixture() {
         skip_special_tokens: 0,
     };
 
-    assert_eq!(ctx.decode_with(&[1], &skip), "<s>");
-    assert_eq!(ctx.decode_with(&[1], &retain), "<s>");
+    assert_eq!(
+        ctx.decode_with(&[1], &skip),
+        "",
+        "skip_special_tokens must strip BOS even when ID exists in vocab"
+    );
+    assert_eq!(
+        ctx.decode_with(&[1], &retain),
+        "<s>",
+        "retain mode must keep BOS token"
+    );
+}
+
+/// Null decode options must default to skip_special_tokens=true even for vocab-shadowed specials.
+#[test]
+fn decode_null_options_strip_vocab_shadowed_specials() {
+    let ctx = TokenizerTestContext::new();
+    let result = unsafe { super::common::decode_raw_null_options(ctx.handle(), &[1, 44, 2]) };
+    assert!(
+        result.error_msg.is_null(),
+        "decode with null options should succeed"
+    );
+    let text = unsafe {
+        let slice = std::slice::from_raw_parts(result.text, result.text_len);
+        std::str::from_utf8(slice).expect("decode must return valid UTF-8")
+    };
+    assert_eq!(
+        text, "H",
+        "null decode options must strip BOS/EOS by default"
+    );
+    unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
 }
 
 /// Roundtrip for multiple known strings.
@@ -989,6 +1027,72 @@ fn cleanup_applies_multiple_contractions_in_sequence() {
     );
 }
 
+/// Cleanup collapses standalone apostrophe spacing: "a ' b" -> "a'b".
+#[test]
+fn cleanup_collapses_standalone_apostrophe_spacing() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "a": 3, "'": 4, "b": 5
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let decoded = ctx.decode(&[3, 4, 5]);
+    assert_eq!(
+        decoded, "a'b",
+        "cleanup must collapse standalone apostrophe spacing, got: {decoded:?}"
+    );
+}
+
+/// With cleanup disabled, standalone apostrophe spacing must be preserved.
+#[test]
+fn cleanup_disabled_preserves_standalone_apostrophe_spacing() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "a": 3, "'": 4, "b": 5
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let decoded = ctx.decode(&[3, 4, 5]);
+    assert_eq!(
+        decoded, "a ' b",
+        "cleanup=false must preserve apostrophe spacing, got: {decoded:?}"
+    );
+}
+
 /// With cleanup disabled, spacing before punctuation/contractions must remain.
 #[test]
 fn cleanup_disabled_preserves_spaces() {
@@ -1019,5 +1123,61 @@ fn cleanup_disabled_preserves_spaces() {
     assert_eq!(
         decoded, "i 'm sure ?",
         "cleanup=false must preserve intermediate spaces, got: {decoded:?}"
+    );
+}
+
+/// Invalid token IDs must error even when mixed with valid IDs.
+#[test]
+fn decode_mixed_valid_and_invalid_token_ids_errors() {
+    let ctx = TokenizerTestContext::new();
+    let opts = talu_sys::DecodeOptionsC::default();
+    let result = unsafe { super::common::decode_raw(ctx.handle(), &[44, 999_999, 77], &opts) };
+    assert!(
+        !result.error_msg.is_null(),
+        "decode must fail when any token ID is invalid"
+    );
+    assert!(result.text.is_null(), "text pointer must be null on decode error");
+    assert_eq!(result.text_len, 0, "text_len must be 0 on decode error");
+}
+
+/// WordPiece decode must reject invalid token IDs consistently with BPE decode.
+#[test]
+fn wordpiece_decode_invalid_token_id_errors() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, "world": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::DecodeOptionsC::default();
+    let result = unsafe { super::common::decode_raw(ctx.handle(), &[3, 999_999, 4], &opts) };
+    assert!(
+        !result.error_msg.is_null(),
+        "WordPiece decode should reject out-of-range token IDs"
+    );
+    assert!(
+        result.text.is_null(),
+        "text pointer must be null for invalid WordPiece decode"
+    );
+    assert_eq!(
+        result.text_len, 0,
+        "text_len must be 0 for invalid WordPiece decode"
     );
 }

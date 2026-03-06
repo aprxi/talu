@@ -7,6 +7,7 @@
 const std = @import("std");
 const ct = @import("c_types.zig");
 const tok_encode = @import("encode.zig");
+const normalize = @import("normalize.zig");
 
 /// Token offset in source text (UTF-8 byte indices).
 pub const TokenOffset = extern struct {
@@ -15,7 +16,8 @@ pub const TokenOffset = extern struct {
 };
 
 /// Compute byte offsets from an already-computed encoding's token strings.
-/// Matches each token's decoded byte representation against the source text.
+/// Matches each token's decoded byte representation against normalized text and
+/// maps the normalized byte span back to the original source byte span.
 /// Caller owns the returned slice.
 pub fn computeOffsetsFromEncoding(
     alloc: std.mem.Allocator,
@@ -29,7 +31,16 @@ pub fn computeOffsetsFromEncoding(
     const offsets = try alloc.alloc(TokenOffset, token_count);
     errdefer alloc.free(offsets);
 
+    var normalized = try normalize.normalize_text(&tokenizer_handle.normalizer, text);
+    defer normalized.deinit();
+    if (tokenizer_handle.pretokenizer.add_prefix_space != 0 and tokenizer_handle.pretokenizer.metaspace == 0 and
+        (normalized.text.len == 0 or normalized.text[0] != ' '))
+    {
+        try normalize.addPrefixSpace(&normalized);
+    }
+
     var text_offset: u32 = 0;
+    var normalized_offset: usize = 0;
 
     const enc_ids: [*]i32 = if (encoding.ids) |ids| @ptrCast(ids) else {
         @memset(offsets, .{ .start = 0, .end = 0 });
@@ -56,6 +67,34 @@ pub fn computeOffsetsFromEncoding(
                 tok_encode.findAddedTokenContentById(tokenizer_handle, token_id) orelse "";
         };
 
+        if (is_byte_level and token_text.len > 0) {
+            const token_byte_sequence = decodeTokenToBytes(alloc, token_text, tokenizer_handle) catch {
+                offsets[token_idx] = .{ .start = 0, .end = 0 };
+                continue;
+            };
+            defer if (token_byte_sequence.ptr != token_text.ptr) alloc.free(token_byte_sequence);
+
+            if (normalized_offset + token_byte_sequence.len > normalized.text.len or
+                !std.mem.eql(u8, normalized.text[normalized_offset..][0..token_byte_sequence.len], token_byte_sequence))
+            {
+                offsets[token_idx] = .{ .start = 0, .end = 0 };
+                continue;
+            }
+
+            const start_offset = normalized_offset;
+            const end_offset = start_offset + token_byte_sequence.len;
+            offsets[token_idx] = if (normalizedSpanIsSynthetic(&normalized, start_offset, end_offset))
+                .{ .start = 0, .end = 0 }
+            else blk: {
+                const start_raw = text_offset;
+                const end_raw = start_raw + @as(u32, @intCast(token_byte_sequence.len));
+                text_offset = end_raw;
+                break :blk .{ .start = start_raw, .end = end_raw };
+            };
+            normalized_offset = end_offset;
+            continue;
+        }
+
         // Byte-level unk: each unk token represents 1 source byte
         if (token_text.len == 0 and is_byte_level and token_id == unk_id) {
             if (text_offset < text.len) {
@@ -64,6 +103,12 @@ pub fn computeOffsetsFromEncoding(
             } else {
                 offsets[token_idx] = .{ .start = 0, .end = 0 };
             }
+            continue;
+        }
+
+        if (!is_byte_level and token_id == unk_id and normalized_offset < normalized.text.len) {
+            offsets[token_idx] = normalizedSpanToSourceOffset(&normalized, normalized_offset, normalized_offset + 1);
+            normalized_offset += 1;
             continue;
         }
 
@@ -77,18 +122,50 @@ pub fn computeOffsetsFromEncoding(
         };
         defer if (token_byte_sequence.ptr != token_text.ptr) alloc.free(token_byte_sequence);
 
-        const remaining_text = text[text_offset..];
+        const remaining_text = normalized.text[normalized_offset..];
         if (findSubsequence(remaining_text, token_byte_sequence)) |match_offset| {
-            const start_offset = text_offset + @as(u32, @intCast(match_offset));
-            const end_offset = start_offset + @as(u32, @intCast(token_byte_sequence.len));
-            offsets[token_idx] = .{ .start = start_offset, .end = end_offset };
-            text_offset = end_offset;
+            const start_offset = normalized_offset + match_offset;
+            const end_offset = start_offset + token_byte_sequence.len;
+            offsets[token_idx] = normalizedSpanToSourceOffset(&normalized, start_offset, end_offset);
+            normalized_offset = end_offset;
         } else {
             offsets[token_idx] = .{ .start = 0, .end = 0 };
         }
     }
 
     return offsets;
+}
+
+fn normalizedSpanIsSynthetic(normalized: *const @import("types.zig").Normalized, start: usize, end: usize) bool {
+    if (start >= end or end > normalized.map.len) return false;
+    for (start..end) |idx| {
+        if (normalized.map[idx] >= 0) return false;
+    }
+    return true;
+}
+
+fn normalizedSpanToSourceOffset(normalized: *const @import("types.zig").Normalized, start: usize, end: usize) TokenOffset {
+    if (start >= end or start >= normalized.map.len or end > normalized.map.len) {
+        return .{ .start = 0, .end = 0 };
+    }
+
+    var source_start: i32 = -1;
+    var source_end: i32 = -1;
+    for (start..end) |idx| {
+        const mapped_start = normalized.map[idx];
+        const mapped_end = normalized.map_end[idx];
+        if (mapped_start >= 0 and (source_start < 0 or mapped_start < source_start)) {
+            source_start = mapped_start;
+        }
+        if (mapped_end > source_end) {
+            source_end = mapped_end;
+        }
+    }
+    if (source_start < 0 or source_end < 0) return .{ .start = 0, .end = 0 };
+    return .{
+        .start = @intCast(source_start),
+        .end = @intCast(source_end),
+    };
 }
 
 /// Combined encoding result with IDs, offsets, and masks.
@@ -132,6 +209,64 @@ pub const Encoding = struct {
         @memcpy(out_offsets, self.offsets[start..][0..count]);
         @memcpy(out_mask, self.attention_mask[start..][0..count]);
         @memcpy(out_special, self.special_tokens_mask[start..][0..count]);
+
+        const saved_alloc = self.allocator;
+        self.deinit();
+        self.* = .{
+            .ids = out_ids,
+            .offsets = out_offsets,
+            .attention_mask = out_mask,
+            .special_tokens_mask = out_special,
+            .allocator = saved_alloc,
+        };
+    }
+
+    pub fn applySelectiveSpecialTokens(
+        self: *Encoding,
+        tokenizer_handle: *ct.Tokenizer,
+        add_bos: bool,
+        add_eos: bool,
+    ) !void {
+        const include_bos = add_bos and tokenizer_handle.postproc.cls_id >= 0;
+        const include_eos = add_eos and tokenizer_handle.postproc.sep_id >= 0;
+        if (!include_bos and !include_eos) return;
+
+        const extra: usize = @intFromBool(include_bos) + @intFromBool(include_eos);
+        const total_len = self.ids.len + extra;
+
+        const alloc = self.allocator;
+        const out_ids = try alloc.alloc(u32, total_len);
+        errdefer alloc.free(out_ids);
+        const out_offsets = try alloc.alloc(TokenOffset, total_len);
+        errdefer alloc.free(out_offsets);
+        const out_mask = try alloc.alloc(u32, total_len);
+        errdefer alloc.free(out_mask);
+        const out_special = try alloc.alloc(u32, total_len);
+        errdefer alloc.free(out_special);
+
+        var write_idx: usize = 0;
+        if (include_bos) {
+            out_ids[write_idx] = @intCast(tokenizer_handle.postproc.cls_id);
+            out_offsets[write_idx] = .{ .start = 0, .end = 0 };
+            out_mask[write_idx] = 1;
+            out_special[write_idx] = 1;
+            write_idx += 1;
+        }
+
+        if (self.ids.len > 0) {
+            @memcpy(out_ids[write_idx..][0..self.ids.len], self.ids);
+            @memcpy(out_offsets[write_idx..][0..self.offsets.len], self.offsets);
+            @memcpy(out_mask[write_idx..][0..self.attention_mask.len], self.attention_mask);
+            @memcpy(out_special[write_idx..][0..self.special_tokens_mask.len], self.special_tokens_mask);
+            write_idx += self.ids.len;
+        }
+
+        if (include_eos) {
+            out_ids[write_idx] = @intCast(tokenizer_handle.postproc.sep_id);
+            out_offsets[write_idx] = .{ .start = 0, .end = 0 };
+            out_mask[write_idx] = 1;
+            out_special[write_idx] = 1;
+        }
 
         const saved_alloc = self.allocator;
         self.deinit();
@@ -215,6 +350,12 @@ pub fn decodeTokenToBytes(allocator: std.mem.Allocator, token_text: []const u8, 
     const is_byte_level = tokenizer_handle.pretokenizer.byte_level != 0;
 
     if (!is_byte_level) {
+        if (token_text.len == 6 and std.mem.startsWith(u8, token_text, "<0x") and token_text[5] == '>') {
+            const value = std.fmt.parseUnsigned(u8, token_text[3..5], 16) catch return token_text;
+            const decoded = try allocator.alloc(u8, 1);
+            decoded[0] = value;
+            return decoded;
+        }
         // SentencePiece: replace leading underscore (▁ = U+2581) with space
         if (std.mem.startsWith(u8, token_text, "\xE2\x96\x81")) {
             const decoded_bytes = try allocator.alloc(u8, token_text.len - 2);

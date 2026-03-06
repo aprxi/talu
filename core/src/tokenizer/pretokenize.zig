@@ -928,3 +928,86 @@ test "splitByGpt2Fast matches splitByRegex on varied input" {
         }
     }
 }
+
+test "tokenizer Split Removed overrides default regex pretokenizer for whitespace" {
+    var tok = ct.Tokenizer{
+        .model = null,
+        .type = .bpe,
+        .normalizer = std.mem.zeroes(ct.Normalizer),
+        .pretokenizer = std.mem.zeroes(ct.PreTokenizer),
+        .postproc = std.mem.zeroes(ct.PostProcessor),
+        .decoder = std.mem.zeroes(ct.Decoder),
+        .padding = std.mem.zeroes(ct.Padding),
+        .truncation = std.mem.zeroes(ct.Truncation),
+        .added = null,
+        .last_error = null,
+    };
+    defer tokenizer_pretokenizer_free(&tok.pretokenizer);
+
+    try std.testing.expectEqual(@as(c_int, 0), tokenizer_pretokenizer_set(&tok.pretokenizer, GPT2_PATTERN.ptr));
+
+    const split_pattern: [:0]const u8 = "\\s+";
+    const spec = ct.PreTokenizerSpec{
+        .type = null,
+        .add_prefix_space = 0,
+        .trim_offsets = 1,
+        .use_regex = 0,
+        .byte_level = 0,
+        .whitespace = 0,
+        .punctuation = 0,
+        .pattern = split_pattern.ptr,
+        .regex_split = 1,
+        .regex_invert = 0,
+        .metaspace = 0,
+    };
+    tokenizer_apply_pretokenizer_spec(&tok, &spec);
+
+    var result = try pretokenize(&tok.pretokenizer, "a b", .{ .start = 0, .end = 3 }, false);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.tokens.items.len);
+    try std.testing.expectEqualStrings("a", result.tokens.items[0].sliceConst());
+    try std.testing.expectEqualStrings("b", result.tokens.items[1].sliceConst());
+}
+
+test "tokenizer Split Removed overrides default regex pretokenizer for punctuation" {
+    var tok = ct.Tokenizer{
+        .model = null,
+        .type = .bpe,
+        .normalizer = std.mem.zeroes(ct.Normalizer),
+        .pretokenizer = std.mem.zeroes(ct.PreTokenizer),
+        .postproc = std.mem.zeroes(ct.PostProcessor),
+        .decoder = std.mem.zeroes(ct.Decoder),
+        .padding = std.mem.zeroes(ct.Padding),
+        .truncation = std.mem.zeroes(ct.Truncation),
+        .added = null,
+        .last_error = null,
+    };
+    defer tokenizer_pretokenizer_free(&tok.pretokenizer);
+
+    try std.testing.expectEqual(@as(c_int, 0), tokenizer_pretokenizer_set(&tok.pretokenizer, GPT2_PATTERN.ptr));
+
+    const split_pattern: [:0]const u8 = "[,!.]+";
+    const spec = ct.PreTokenizerSpec{
+        .type = null,
+        .add_prefix_space = 0,
+        .trim_offsets = 1,
+        .use_regex = 0,
+        .byte_level = 0,
+        .whitespace = 0,
+        .punctuation = 0,
+        .pattern = split_pattern.ptr,
+        .regex_split = 1,
+        .regex_invert = 0,
+        .metaspace = 0,
+    };
+    tokenizer_apply_pretokenizer_spec(&tok, &spec);
+
+    var result = try pretokenize(&tok.pretokenizer, "a,b!c.", .{ .start = 0, .end = 6 }, false);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), result.tokens.items.len);
+    try std.testing.expectEqualStrings("a", result.tokens.items[0].sliceConst());
+    try std.testing.expectEqualStrings("b", result.tokens.items[1].sliceConst());
+    try std.testing.expectEqualStrings("c", result.tokens.items[2].sliceConst());
+}

@@ -317,6 +317,14 @@ fn computeTruncation(ids_len: usize, options: ?*const EncodeOptions) TruncationP
     return .{ .start = start, .count = count };
 }
 
+fn validateEncodeOptions(options: ?*const EncodeOptions) ?[*:0]const u8 {
+    const o = options orelse return null;
+    if (o.truncation != 0 and o.truncation_side > 1) {
+        return "Invalid truncation_side";
+    }
+    return null;
+}
+
 /// Encodes text to token IDs, byte offsets, attention mask, and special tokens mask.
 ///
 /// Runs the full encoding pipeline once and computes all metadata simultaneously.
@@ -328,6 +336,13 @@ pub export fn talu_tokenizer_encode(
     text_len: usize,
     options: ?*const EncodeOptions,
 ) callconv(.c) EncodeResult {
+    capi_error.clearError();
+    if (validateEncodeOptions(options)) |msg| {
+        capi_error.setError(error.InvalidArgument, "{s}", .{msg});
+        var err = std.mem.zeroes(EncodeResult);
+        err.error_msg = msg;
+        return err;
+    }
     const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
         capi_error.setError(error.InvalidHandle, "Invalid handle", .{});
         var err = std.mem.zeroes(EncodeResult);
@@ -347,13 +362,24 @@ pub export fn talu_tokenizer_encode(
         break :blk text_ptr[0..text_len];
     };
 
-    const add_special = if (options) |o| o.add_bos != 0 else true;
+    const add_bos = if (options) |o| o.add_bos != 0 else true;
+    const add_eos = if (options) |o| o.add_eos != 0 else true;
+    const add_special = add_bos == add_eos and add_bos;
     var rich = tok_offsets.encode(allocator, tok.tok.tokenizer_handle, text_slice, add_special) catch |e| {
         capi_error.setError(e, "Encode failed", .{});
         var err = std.mem.zeroes(EncodeResult);
         err.error_msg = "Encode failed";
         return err;
     };
+    if (add_bos != add_eos) {
+        rich.applySelectiveSpecialTokens(tok.tok.tokenizer_handle, add_bos, add_eos) catch {
+            rich.deinit();
+            capi_error.setError(error.OutOfMemory, "Allocation failed", .{});
+            var err = std.mem.zeroes(EncodeResult);
+            err.error_msg = "OutOfMemory";
+            return err;
+        };
+    }
 
     const params = computeTruncation(rich.ids.len, options);
     rich.truncate(params.start, params.count) catch {
@@ -411,6 +437,7 @@ pub export fn talu_tokenizer_tokenize(
     text: [*c]const u8,
     text_len: usize,
 ) callconv(.c) TokenizeResult {
+    capi_error.clearError();
     const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
         capi_error.setError(error.InvalidHandle, "Invalid handle", .{});
         return .{ .tokens = null, .num_tokens = 0, .error_msg = "Invalid handle" };
@@ -470,6 +497,7 @@ pub export fn talu_tokenizer_tokenize_bytes(
     text: [*c]const u8,
     text_len: usize,
 ) callconv(.c) TokenizeBytesResult {
+    capi_error.clearError();
     // Cast opaque handle to TokenizerHandle
     const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
         capi_error.setError(error.InvalidHandle, "Invalid handle", .{});
@@ -524,7 +552,7 @@ pub export fn talu_tokenize_bytes_result_free(
     num_tokens: usize,
 ) callconv(.c) void {
     if (data) |d| if (data_len > 0) allocator.free(d[0..data_len]);
-    if (offsets) |o| allocator.free(o[0 .. num_tokens + 1]);
+    if (offsets) |o| if (num_tokens > 0) allocator.free(o[0 .. num_tokens + 1]);
 }
 
 // =============================================================================
@@ -542,6 +570,7 @@ pub export fn talu_tokenizer_decode(
     num_tokens: usize,
     options: ?*const DecodeOptionsC,
 ) callconv(.c) DecodeResult {
+    capi_error.clearError();
     // Cast opaque handle to TokenizerHandle
     const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
         capi_error.setError(error.InvalidHandle, "Invalid handle", .{});
@@ -603,6 +632,7 @@ pub export fn talu_tokenizer_encode_batch(
     num_texts: usize,
     options: ?*const EncodeOptions,
 ) callconv(.c) BatchEncodeResult {
+    capi_error.clearError();
     // Cast opaque handle to TokenizerHandle
     const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
         capi_error.setError(error.InvalidHandle, "Invalid handle", .{});
@@ -626,10 +656,22 @@ pub export fn talu_tokenizer_encode_batch(
     };
     const batch_text_ptrs: [*]const [*]const u8 = @ptrCast(text_ptrs);
     const batch_length_ptrs: [*]const usize = @ptrCast(length_ptrs);
+    if (validateEncodeOptions(options)) |msg| {
+        capi_error.setError(error.InvalidArgument, "{s}", .{msg});
+        var err_result = std.mem.zeroes(BatchEncodeResult);
+        err_result.error_msg = msg;
+        return err_result;
+    }
 
-    const add_special = if (options) |o| o.add_bos != 0 else true;
+    const batch_options = tok_batch.BatchEncodeOptions{
+        .add_bos = if (options) |o| o.add_bos != 0 else true,
+        .add_eos = if (options) |o| o.add_eos != 0 else true,
+        .truncation = if (options) |o| o.truncation != 0 else false,
+        .truncation_left = if (options) |o| o.truncation_side != 0 else false,
+        .max_length = if (options) |o| o.max_length else 0,
+    };
 
-    var result = tok_batch.encodeBatch(allocator, &tok.tok, batch_text_ptrs, batch_length_ptrs, num_texts, add_special) catch |e| {
+    var result = tok_batch.encodeBatch(allocator, &tok.tok, batch_text_ptrs, batch_length_ptrs, num_texts, batch_options) catch |e| {
         capi_error.setError(e, "Batch encoding failed", .{});
         var err_result = std.mem.zeroes(BatchEncodeResult);
         err_result.error_msg = "Batch encoding failed";
@@ -678,7 +720,7 @@ fn paddedTensorError(msg: [*:0]const u8) PaddedTensorResult {
 
 /// Converts C options to internal options format.
 fn convertPaddedOptions(options: ?*const PaddedTensorOptions) tok_batch.PaddedTensorOptions {
-    const o = options orelse return std.mem.zeroes(tok_batch.PaddedTensorOptions);
+    const o = options orelse return .{};
     var opt = std.mem.zeroes(tok_batch.PaddedTensorOptions);
     opt.pad_id = o.pad_id;
     opt.padding_side = if (o.padding_side == 1) .left else .right;
@@ -691,6 +733,8 @@ fn convertPaddedOptions(options: ?*const PaddedTensorOptions) tok_batch.PaddedTe
 /// Converts batch encoding results to padded tensor format.
 ///
 /// Pads all sequences to the same length for efficient batch processing.
+/// The consumed ID prefix is defined by `offsets[num_sequences]`; callers must
+/// ensure `ids` is valid for at least that many elements.
 /// Caller must free via talu_padded_tensor_result_free().
 pub export fn talu_batch_to_padded_tensor(
     ids: ?[*]const u32,
@@ -701,6 +745,13 @@ pub export fn talu_batch_to_padded_tensor(
     if (num_sequences == 0) return std.mem.zeroes(PaddedTensorResult);
     const ids_ptr = ids orelse return paddedTensorError("Invalid ids");
     const off_ptr = offsets orelse return paddedTensorError("Invalid offsets");
+    if (options) |o| {
+        if (o.padding_side > 1) return paddedTensorError("Invalid padding_side");
+    }
+    if (off_ptr[0] != 0) return paddedTensorError("Invalid offsets");
+    for (1..num_sequences + 1) |idx| {
+        if (off_ptr[idx] < off_ptr[idx - 1]) return paddedTensorError("Invalid offsets");
+    }
 
     var result = tok_batch.batchToPaddedTensor(
         allocator,
@@ -929,6 +980,8 @@ pub export fn talu_tokens_concat(
 ) callconv(.c) ?[*]u32 {
     const total = num_a + num_b;
     if (total == 0) return null;
+    if (num_a > 0 and tokens_a == null) return null;
+    if (num_b > 0 and tokens_b == null) return null;
 
     const out = allocator.alloc(u32, total) catch return null;
     if (tokens_a) |a| @memcpy(out[0..num_a], a[0..num_a]);
@@ -973,29 +1026,54 @@ test "fuzz tokenizer JSON parsing with random input" {
     }.testOne, .{});
 }
 
-test "talu_tokenizer_encode empty input returns sliceable empty buffers" {
-    const json =
-        \\{
-        \\  "version": "1.0",
-        \\  "model": {
-        \\    "type": "BPE",
-        \\    "vocab": {"<unk>": 0, "a": 1},
-        \\    "merges": []
-        \\  },
-        \\  "added_tokens": [
-        \\    {"id": 0, "content": "<unk>", "special": true}
-        \\  ],
-        \\  "normalizer": null,
-        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": true},
-        \\  "post_processor": null,
-        \\  "decoder": {"type": "ByteLevel"}
-        \\}
-    ;
+const regression_test_tokenizer_json =
+    \\{
+    \\  "version": "1.0",
+    \\  "model": {
+    \\    "type": "BPE",
+    \\    "vocab": {"<unk>": 0, "a": 1},
+    \\    "merges": []
+    \\  },
+    \\  "added_tokens": [
+    \\    {"id": 0, "content": "<unk>", "special": true}
+    \\  ],
+    \\  "normalizer": null,
+    \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": true},
+    \\  "post_processor": null,
+    \\  "decoder": {"type": "ByteLevel"}
+    \\}
+;
 
+fn createRegressionTestTokenizerHandle() !*OpaqueTokenizerHandle {
     var handle: ?*OpaqueTokenizerHandle = null;
-    try std.testing.expectEqual(@as(i32, 0), talu_tokenizer_create_from_json(json.ptr, json.len, &handle));
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_tokenizer_create_from_json(
+            regression_test_tokenizer_json.ptr,
+            regression_test_tokenizer_json.len,
+            &handle,
+        ),
+    );
+    return handle.?;
+}
+
+fn expectNoLastError() !void {
+    try std.testing.expectEqual(@as(i32, 0), capi_error.talu_last_error_code());
+    try std.testing.expect(capi_error.talu_last_error() == null);
+}
+
+fn expectLastError(expected_code: error_codes.ErrorCode, expected_message: []const u8) !void {
+    try std.testing.expectEqual(@as(i32, @intFromEnum(expected_code)), capi_error.talu_last_error_code());
+    const message = capi_error.talu_last_error() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(expected_message, std.mem.span(message));
+    capi_error.talu_clear_error();
+}
+
+test "talu_tokenizer_encode empty input returns sliceable empty buffers" {
+    const handle = try createRegressionTestTokenizerHandle();
     defer talu_tokenizer_free(handle);
 
+    capi_error.setError(error.InvalidArgument, "stale error", .{});
     var options = std.mem.zeroes(EncodeOptions);
     const result = talu_tokenizer_encode(handle, "".ptr, 0, &options);
     defer talu_encode_result_free(result);
@@ -1006,68 +1084,114 @@ test "talu_tokenizer_encode empty input returns sliceable empty buffers" {
     try std.testing.expect(result.offsets != null);
     try std.testing.expect(result.attention_mask != null);
     try std.testing.expect(result.special_tokens_mask != null);
+    try expectNoLastError();
 }
 
 test "talu_tokenizer_tokenize empty input returns sliceable empty token array" {
-    const json =
-        \\{
-        \\  "version": "1.0",
-        \\  "model": {
-        \\    "type": "BPE",
-        \\    "vocab": {"<unk>": 0, "a": 1},
-        \\    "merges": []
-        \\  },
-        \\  "added_tokens": [
-        \\    {"id": 0, "content": "<unk>", "special": true}
-        \\  ],
-        \\  "normalizer": null,
-        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": true},
-        \\  "post_processor": null,
-        \\  "decoder": {"type": "ByteLevel"}
-        \\}
-    ;
-
-    var handle: ?*OpaqueTokenizerHandle = null;
-    try std.testing.expectEqual(@as(i32, 0), talu_tokenizer_create_from_json(json.ptr, json.len, &handle));
+    const handle = try createRegressionTestTokenizerHandle();
     defer talu_tokenizer_free(handle);
 
+    capi_error.setError(error.InvalidArgument, "stale error", .{});
     const result = talu_tokenizer_tokenize(handle, "".ptr, 0);
     defer talu_tokenize_result_free(result.tokens, result.num_tokens);
 
     try std.testing.expect(result.error_msg == null);
     try std.testing.expectEqual(@as(usize, 0), result.num_tokens);
     try std.testing.expect(result.tokens != null);
+    try expectNoLastError();
 }
 
 test "talu_tokenizer_tokenize_bytes empty input returns sliceable empty byte buffer" {
-    const json =
-        \\{
-        \\  "version": "1.0",
-        \\  "model": {
-        \\    "type": "BPE",
-        \\    "vocab": {"<unk>": 0, "a": 1},
-        \\    "merges": []
-        \\  },
-        \\  "added_tokens": [
-        \\    {"id": 0, "content": "<unk>", "special": true}
-        \\  ],
-        \\  "normalizer": null,
-        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": true},
-        \\  "post_processor": null,
-        \\  "decoder": {"type": "ByteLevel"}
-        \\}
-    ;
-
-    var handle: ?*OpaqueTokenizerHandle = null;
-    try std.testing.expectEqual(@as(i32, 0), talu_tokenizer_create_from_json(json.ptr, json.len, &handle));
+    const handle = try createRegressionTestTokenizerHandle();
     defer talu_tokenizer_free(handle);
 
+    capi_error.setError(error.InvalidArgument, "stale error", .{});
     const result = talu_tokenizer_tokenize_bytes(handle, "".ptr, 0);
-    defer talu_tokenize_bytes_result_free(result.data, result.data_len, result.offsets, result.num_tokens);
 
     try std.testing.expect(result.error_msg == null);
+    try std.testing.expectEqual(@as(usize, 0), result.data_len);
     try std.testing.expectEqual(@as(usize, 0), result.num_tokens);
     try std.testing.expect(result.data != null);
     try std.testing.expect(result.offsets != null);
     try std.testing.expectEqual(@as(usize, 0), result.offsets.?[0]);
+    try expectNoLastError();
+
+    // Empty byte tokenization returns sentinel pointers; free must treat them as a no-op.
+    talu_tokenize_bytes_result_free(result.data, result.data_len, result.offsets, result.num_tokens);
+}
+
+test "talu_tokenizer_decode null tokens with non-zero length returns error" {
+    const handle = try createRegressionTestTokenizerHandle();
+    defer talu_tokenizer_free(handle);
+
+    const result = talu_tokenizer_decode(handle, null, 3, null);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(result.text == null);
+    try std.testing.expectEqual(@as(usize, 0), result.text_len);
+    try expectLastError(.invalid_argument, "tokens is null with non-zero length");
+}
+
+test "talu_tokenizer_encode null text with non-zero length returns error" {
+    const handle = try createRegressionTestTokenizerHandle();
+    defer talu_tokenizer_free(handle);
+
+    const result = talu_tokenizer_encode(handle, null, 5, null);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(result.ids == null);
+    try std.testing.expect(result.offsets == null);
+    try std.testing.expect(result.attention_mask == null);
+    try std.testing.expect(result.special_tokens_mask == null);
+    try std.testing.expectEqual(@as(usize, 0), result.num_tokens);
+    try expectLastError(.invalid_argument, "text is null with non-zero length");
+}
+
+test "talu_tokenizer_tokenize null text with non-zero length returns error" {
+    const handle = try createRegressionTestTokenizerHandle();
+    defer talu_tokenizer_free(handle);
+
+    const result = talu_tokenizer_tokenize(handle, null, 5);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(result.tokens == null);
+    try std.testing.expectEqual(@as(usize, 0), result.num_tokens);
+    try expectLastError(.invalid_argument, "text is null with non-zero length");
+}
+
+test "talu_tokenizer_tokenize_bytes null text with non-zero length returns error" {
+    const handle = try createRegressionTestTokenizerHandle();
+    defer talu_tokenizer_free(handle);
+
+    const result = talu_tokenizer_tokenize_bytes(handle, null, 5);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(result.data == null);
+    try std.testing.expectEqual(@as(usize, 0), result.data_len);
+    try std.testing.expect(result.offsets == null);
+    try std.testing.expectEqual(@as(usize, 0), result.num_tokens);
+    try expectLastError(.invalid_argument, "text is null with non-zero length");
+}
+
+test "talu_tokenizer_encode_batch null arrays with non-zero count return error" {
+    const handle = try createRegressionTestTokenizerHandle();
+    defer talu_tokenizer_free(handle);
+
+    const null_texts = talu_tokenizer_encode_batch(handle, null, &[_]usize{5}, 1, null);
+    try std.testing.expect(null_texts.error_msg != null);
+    try std.testing.expect(null_texts.ids == null);
+    try std.testing.expect(null_texts.offsets == null);
+    try std.testing.expectEqual(@as(usize, 0), null_texts.total_tokens);
+    try std.testing.expectEqual(@as(usize, 0), null_texts.num_sequences);
+    try expectLastError(.invalid_argument, "texts is null with non-zero count");
+
+    const null_lengths = talu_tokenizer_encode_batch(
+        handle,
+        @ptrCast(&[_][*c]const u8{"hello".ptr}),
+        null,
+        1,
+        null,
+    );
+    try std.testing.expect(null_lengths.error_msg != null);
+    try std.testing.expect(null_lengths.ids == null);
+    try std.testing.expect(null_lengths.offsets == null);
+    try std.testing.expectEqual(@as(usize, 0), null_lengths.total_tokens);
+    try std.testing.expectEqual(@as(usize, 0), null_lengths.num_sequences);
+    try expectLastError(.invalid_argument, "lengths is null with non-zero count");
 }
