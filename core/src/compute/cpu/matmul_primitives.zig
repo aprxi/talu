@@ -138,8 +138,8 @@ pub fn matmulF32(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Mat
 
     // Outer product algorithm for M > 1: iterates over K in the inner loop,
     // reading B rows sequentially instead of gathering B columns with stride N.
-    // ROW_TILE=4 register blocking: 4 output rows share each B vector load.
-    const ROW_TILE = 4;
+    // ROW_TILE=8 register blocking: 8 output rows share each B vector load.
+    const ROW_TILE = 8;
     const VEC = simd.f32_vec_len;
     const VecF32 = @Vector(VEC, f32);
 
@@ -242,6 +242,111 @@ pub fn matmulF32(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Mat
         // the same outer product algorithm as the large batch path.
         // Few rows means little parallelism, but each row still benefits
         // from sequential B access.
+        row_tiles_task(0, m_rows, &context);
+    }
+}
+
+/// Accumulating f32 matmul: C += A @ B.
+///
+/// Same as matmulF32 but accumulates into C instead of overwriting.
+/// Used for backward-pass gradient accumulation.
+pub fn matmulF32Accum(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulScratch) void {
+    _ = scratch;
+    std.debug.assert(a.dtype == .f32 and b.dtype == .f32 and out.dtype == .f32);
+    std.debug.assert(a.n_dims == 2 and b.n_dims == 2 and out.n_dims == 2);
+    const m_rows: usize = @intCast(a.shape[0]);
+    const k_dim: usize = @intCast(a.shape[1]);
+    std.debug.assert(b.shape[0] == a.shape[1]);
+    const n_cols: usize = @intCast(b.shape[1]);
+    std.debug.assert(out.shape[0] == a.shape[0] and out.shape[1] == b.shape[1]);
+
+    const a_data = a.asSlice(f32);
+    const b_data = b.asSlice(f32);
+    const c_data = out.asSlice(f32);
+
+    const MatmulF32Ctx = struct {
+        a: []const f32,
+        b: []const f32,
+        c: []f32,
+        m_rows: usize,
+        n_cols: usize,
+        k_dim: usize,
+    };
+    var context = MatmulF32Ctx{ .a = a_data, .b = b_data, .c = c_data, .m_rows = m_rows, .n_cols = n_cols, .k_dim = k_dim };
+
+    const ROW_TILE = 8;
+    const VEC = simd.f32_vec_len;
+    const VecF32 = @Vector(VEC, f32);
+
+    const row_tiles_task = struct {
+        fn runRowTiles(start: usize, end: usize, task_ctx: *MatmulF32Ctx) void {
+            @setFloatMode(.optimized);
+            const k = task_ctx.k_dim;
+            const n = task_ctx.n_cols;
+            const vec_end = n - (n % VEC);
+
+            var row = start;
+
+            while (row + ROW_TILE <= end) : (row += ROW_TILE) {
+                var col: usize = 0;
+                while (col < vec_end) : (col += VEC) {
+                    // Load existing C values (accumulate, not overwrite)
+                    var acc: [ROW_TILE]VecF32 = undefined;
+                    inline for (0..ROW_TILE) |r| {
+                        acc[r] = task_ctx.c[(row + r) * n + col ..][0..VEC].*;
+                    }
+
+                    for (0..k) |ki| {
+                        const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
+                        inline for (0..ROW_TILE) |r| {
+                            const a_val: VecF32 = @splat(task_ctx.a[(row + r) * k + ki]);
+                            acc[r] = @mulAdd(VecF32, a_val, b_vec, acc[r]);
+                        }
+                    }
+
+                    inline for (0..ROW_TILE) |r| {
+                        task_ctx.c[(row + r) * n + col ..][0..VEC].* = acc[r];
+                    }
+                }
+
+                if (col < n) {
+                    inline for (0..ROW_TILE) |r| {
+                        for (col..n) |c_idx| {
+                            var sum = task_ctx.c[(row + r) * n + c_idx];
+                            for (0..k) |ki| {
+                                sum = @mulAdd(f32, task_ctx.a[(row + r) * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                            }
+                            task_ctx.c[(row + r) * n + c_idx] = sum;
+                        }
+                    }
+                }
+            }
+
+            while (row < end) : (row += 1) {
+                var col: usize = 0;
+                while (col < vec_end) : (col += VEC) {
+                    var acc: VecF32 = task_ctx.c[row * n + col ..][0..VEC].*;
+                    for (0..k) |ki| {
+                        const a_val: VecF32 = @splat(task_ctx.a[row * k + ki]);
+                        const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
+                        acc = @mulAdd(VecF32, a_val, b_vec, acc);
+                    }
+                    task_ctx.c[row * n + col ..][0..VEC].* = acc;
+                }
+                for (col..n) |c_idx| {
+                    var sum = task_ctx.c[row * n + c_idx];
+                    for (0..k) |ki| {
+                        sum = @mulAdd(f32, task_ctx.a[row * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                    }
+                    task_ctx.c[row * n + c_idx] = sum;
+                }
+            }
+        }
+    }.runRowTiles;
+
+    if (m_rows >= TILE_THRESHOLD) {
+        parallel.global().parallelFor(m_rows, row_tiles_task, &context);
+    } else {
         row_tiles_task(0, m_rows, &context);
     }
 }

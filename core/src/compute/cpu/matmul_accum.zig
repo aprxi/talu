@@ -24,9 +24,9 @@ pub const MatmulScratch = matmul_primitives.MatmulScratch;
 /// Output rows processed per register tile.
 /// Sharing each B vector load across ROW_TILE output rows improves
 /// arithmetic intensity by ROW_TILE×.
-/// 4 uses 5 of 16 ymm registers (4 accumulators + 1 B vector), leaving
+/// 8 uses 9 of 16 ymm registers (8 accumulators + 1 B vector), leaving
 /// headroom for g broadcasts and compiler temporaries.
-const ROW_TILE: usize = 4;
+const ROW_TILE: usize = 8;
 
 /// K-loop tile size for cache blocking.
 /// Tiling the reduction dimension keeps the B chunk (K_TILE × N × 4 bytes)

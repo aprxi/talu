@@ -16,6 +16,7 @@ pub const DispatchedKernel = matmul.DispatchedKernel;
 pub const matmulKernel = matmul.matmulKernel;
 pub const matmulAuto = matmul.matmulAuto;
 pub const matmulF32 = matmul.matmulF32;
+pub const matmulF32Accum = matmul.matmulF32Accum;
 pub const matmulGaffineU4 = matmul.matmulGaffineU4;
 pub const matmulTransposeAccumF32 = matmul_accum.matmulTransposeAccumF32;
 pub const matmulF32TransB = matmul_transb.matmulF32TransB;

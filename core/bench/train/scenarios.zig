@@ -616,7 +616,7 @@ fn runBackwardNorm(config: RunConfig, allocator: std.mem.Allocator) !ScenarioRes
     for (0..total) |i| {
         @memset(grad_weight, 0);
         var timer = std.time.Timer.start() catch unreachable;
-        norm_bw.rmsnormBackward(grad_input, grad_weight, grad_output, input, inv_rms, weight, bs, d, 0.0);
+        norm_bw.rmsnormBackward(grad_input, grad_weight, grad_output, input, inv_rms, weight, bs, d, 0.0, null);
         const elapsed = timer.read();
         if (i >= config.warmup) samples[i - config.warmup] = elapsed;
     }

@@ -15,6 +15,7 @@ const compute = @import("../../compute/root.zig");
 const Tensor = tensor_mod.Tensor;
 const MatmulScratch = compute.cpu.linalg.MatmulScratch;
 const matmulF32 = compute.cpu.linalg.matmulF32;
+const matmulF32Accum = compute.cpu.linalg.matmulF32Accum;
 const matmulTransposeAccumF32 = compute.cpu.linalg.matmulTransposeAccumF32;
 
 /// Compute gradient w.r.t. weight: dW += grad_out^T @ input.
@@ -68,6 +69,30 @@ pub fn gradInput(
     var b = Tensor.view2DSlice(@constCast(weight), out_dim, in_dim);
     var out = Tensor.view2DSlice(grad_input, batch_size, in_dim);
     matmulF32(&a, &b, &out, scratch);
+}
+
+/// Compute gradient w.r.t. input, accumulating: dX += grad_out @ W.
+///
+/// grad_input:  [batch, in_dim] — accumulated (not overwritten).
+/// grad_output: [batch, out_dim]
+/// weight:      [out_dim, in_dim]
+pub fn gradInputAccum(
+    grad_input: []f32,
+    grad_output: []const f32,
+    weight: []const f32,
+    batch_size: usize,
+    out_dim: usize,
+    in_dim: usize,
+    scratch: *MatmulScratch,
+) void {
+    std.debug.assert(grad_input.len == batch_size * in_dim);
+    std.debug.assert(grad_output.len == batch_size * out_dim);
+    std.debug.assert(weight.len == out_dim * in_dim);
+
+    var a = Tensor.view2DSlice(@constCast(grad_output), batch_size, out_dim);
+    var b = Tensor.view2DSlice(@constCast(weight), out_dim, in_dim);
+    var out = Tensor.view2DSlice(grad_input, batch_size, in_dim);
+    matmulF32Accum(&a, &b, &out, scratch);
 }
 
 /// Compute gradient w.r.t. bias: dBias += sum(grad_out, dim=0).

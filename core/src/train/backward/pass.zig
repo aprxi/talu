@@ -115,6 +115,7 @@ pub fn backward(
         bs,
         d,
         0.0, // weight_offset
+        null,
     );
 
     // --- 4. Per-layer backward (reverse order) ---
@@ -265,10 +266,8 @@ fn layerBackward(
     );
     // grad_normed_ffn from up path = grad_up @ up_proj
     // Accumulate into grad_hidden (which already has gate path contribution).
-    // gradInput overwrites, so we need a temp buffer then add.
-    const grad_temp = grad_swiglu[0 .. bs * d]; // reuse grad_swiglu (only need bs*d)
-    linear.gradInput(
-        grad_temp,
+    linear.gradInputAccum(
+        grad_hidden,
         grad_up,
         lw.up_proj.asSlice(f32),
         bs,
@@ -276,8 +275,6 @@ fn layerBackward(
         d,
         scratch,
     );
-    // Accumulate up path into grad_hidden
-    simdAccum(grad_hidden[0 .. bs * d], grad_temp);
 
     // FFN RMSNorm backward:
     // Forward: normed_ffn = rmsnorm(residual_pre_ffn, ffn_norm)
@@ -294,10 +291,8 @@ fn layerBackward(
         bs,
         d,
         0.0,
+        grad_residual_ffn, // fused residual add
     );
-
-    // Add FFN residual gradient
-    simdAccum(grad_hidden[0 .. bs * d], grad_residual_ffn);
 
     // =====================================================================
     // Attention backward
@@ -407,11 +402,9 @@ fn layerBackward(
         d,
         scratch,
     );
-    // grad_normed_attn from K path → accumulate
-    // Reuse grad_attn_output region (no longer needed after attention loop)
-    const grad_temp_attn = global_scratch[bs * d .. bs * d + bs * d];
-    linear.gradInput(
-        grad_temp_attn,
+    // grad_normed_attn from K path → accumulate into grad_hidden
+    linear.gradInputAccum(
+        grad_hidden,
         grad_k,
         lw.k_proj.asSlice(f32),
         bs,
@@ -419,7 +412,6 @@ fn layerBackward(
         d,
         scratch,
     );
-    simdAccum(grad_hidden[0 .. bs * d], grad_temp_attn);
 
     // V projection backward:
     linear.gradWeight(
@@ -431,9 +423,9 @@ fn layerBackward(
         d,
         scratch,
     );
-    // grad_normed_attn from V path → accumulate
-    linear.gradInput(
-        grad_temp_attn,
+    // grad_normed_attn from V path → accumulate into grad_hidden
+    linear.gradInputAccum(
+        grad_hidden,
         grad_v,
         lw.v_proj.asSlice(f32),
         bs,
@@ -441,7 +433,6 @@ fn layerBackward(
         d,
         scratch,
     );
-    simdAccum(grad_hidden[0 .. bs * d], grad_temp_attn);
 
     // Attention RMSNorm backward:
     // Forward: normed_attn = rmsnorm(residual_pre_attn, attn_norm)
@@ -458,10 +449,8 @@ fn layerBackward(
         bs,
         d,
         0.0,
+        grad_residual_attn, // fused residual add
     );
-
-    // Add attention residual gradient
-    simdAccum(grad_hidden[0 .. bs * d], grad_residual_attn);
 }
 
 /// SIMD element-wise accumulate: dst[i] += src[i].

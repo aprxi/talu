@@ -111,6 +111,7 @@ pub fn backward(
         bs,
         d,
         0.0, // weight_offset
+        null,
     );
 
     // --- 4. Per-layer backward (reverse order) ---
@@ -292,12 +293,8 @@ fn layerBackward(
         bs,
         d,
         0.0,
+        grad_residual_ffn, // fused residual add
     );
-
-    // Add FFN residual gradient
-    for (grad_hidden[0 .. bs * d], grad_residual_ffn) |*gh, gr| {
-        gh.* += gr;
-    }
 
     // =====================================================================
     // Attention backward
@@ -510,12 +507,8 @@ fn layerBackward(
         bs,
         d,
         0.0,
+        grad_residual_attn, // fused residual add
     );
-
-    // Add attention residual gradient
-    for (grad_hidden[0 .. bs * d], grad_residual_attn) |*gh, gr| {
-        gh.* += gr;
-    }
 }
 
 /// Recompute silu(gate) * up (SwiGLU forward) for use in down_proj gradWeight.
