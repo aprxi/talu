@@ -114,7 +114,7 @@ pub const MultiHeadAttention = struct {
     is_causal: bool = true,
     /// Layer index for trace emissions.
     layer_idx: u16 = trace.TraceEmission.NO_LAYER,
-    /// Apply Qwen3.5-style query gating on top of the standard attention path.
+    /// Apply query gating on top of the standard attention path.
     query_gate: bool = false,
     // Q/K/V projections - optional when using native fused QKV
     q_proj: ?*const Tensor = null,
@@ -131,7 +131,7 @@ pub const MultiHeadAttention = struct {
     /// M-RoPE text positions rather than raw prompt length.
     position_delta: isize = 0,
     /// When true, RoPE rotates consecutive pairs `(x0,x1)`, `(x2,x3)` rather
-    /// than first-half/second-half pairs. Qwen3.5 text attention requires this.
+    /// than first-half/second-half pairs.
     rope_interleaved: bool = false,
     // QKNorm (optional) - applied after Q/K projection, before RoPE
     q_norm: ?*const Tensor = null,

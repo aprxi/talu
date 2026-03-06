@@ -133,6 +133,17 @@ fn requiredLayerWeight(comptime weight_id: []const u8, comptime suffix: []const 
     };
 }
 
+fn optionalLayerWeight(comptime weight_id: []const u8, comptime suffix: []const u8, comptime module_type: []const u8, comptime layout: types.WeightLayout) types.WeightSpec {
+    return .{
+        .id = weight_id,
+        .suffix = suffix,
+        .module_type = module_type,
+        .layout = layout,
+        .dtype = "float32",
+        .required = false,
+    };
+}
+
 const qwen3_5_block_weights = [_]types.WeightSpec{};
 const qwen3_5_layer_map = [_]u8{
     0, 0, 0, 1,
@@ -145,10 +156,11 @@ const qwen3_5_layer_map = [_]u8{
 
 const qwen3_5_linear_attention_weights = [_]types.WeightSpec{
     requiredLayerWeight("input_layernorm.weight", "input_layernorm.weight", "RMSNorm", .none),
-    requiredLayerWeight("linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_qkv.weight", "Linear", .linear),
-    requiredLayerWeight("linear_attn.in_proj_z.weight", "linear_attn.in_proj_z.weight", "Linear", .linear),
-    requiredLayerWeight("linear_attn.in_proj_a.weight", "linear_attn.in_proj_a.weight", "Linear", .linear),
-    requiredLayerWeight("linear_attn.in_proj_b.weight", "linear_attn.in_proj_b.weight", "Linear", .linear),
+    optionalLayerWeight("mixer.in_proj.weight", "mixer.in_proj.weight", "Linear", .linear),
+    optionalLayerWeight("linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_qkv.weight", "Linear", .linear),
+    optionalLayerWeight("linear_attn.in_proj_z.weight", "linear_attn.in_proj_z.weight", "Linear", .linear),
+    optionalLayerWeight("linear_attn.in_proj_a.weight", "linear_attn.in_proj_a.weight", "Linear", .linear),
+    optionalLayerWeight("linear_attn.in_proj_b.weight", "linear_attn.in_proj_b.weight", "Linear", .linear),
     requiredLayerWeight("linear_attn.conv1d.weight", "linear_attn.conv1d.weight", "Conv1d", .conv1d_depthwise),
     .{
         .id = "linear_attn.A_log",
@@ -263,6 +275,22 @@ const qwen3_5_global_weights = [_]types.WeightSpec{
     },
 };
 
+const qwen3_5_conversion_fusions = [_]types.ConversionFusion{
+    .{
+        .kind = .gated_delta_split_in_proj,
+        .trigger_suffix = "linear_attn.in_proj_qkv.weight",
+        .required_input_suffixes = &.{
+            "linear_attn.in_proj_qkv.weight",
+            "linear_attn.in_proj_z.weight",
+            "linear_attn.in_proj_b.weight",
+        },
+        .optional_input_suffixes = &.{
+            "linear_attn.in_proj_a.weight",
+        },
+        .output_suffix = "mixer.in_proj.weight",
+    },
+};
+
 pub var arch: types.Architecture = .{
     .name = "qwen3_5",
     .model_types = &qwen3_5_model_types,
@@ -273,6 +301,7 @@ pub var arch: types.Architecture = .{
     .block_weights = &qwen3_5_block_weights,
     .global_weights = &qwen3_5_global_weights,
     .weight_prefixes = &qwen3_5_weight_prefixes,
+    .conversion_fusions = &qwen3_5_conversion_fusions,
     .d_ff_source_weight_ids = &.{"mlp.gate_proj.weight"},
     .resolve_d_ff_from_weights = true,
     .has_qk_norm = true,

@@ -1460,6 +1460,15 @@ pub const Block = struct {
         return many[0..len];
     }
 
+    fn hiddenWidthFromTensor(tensor_ptr: *const Tensor) !u32 {
+        return switch (tensor_ptr.n_dims) {
+            1 => std.math.cast(u32, tensor_ptr.shape[0]) orelse error.InvalidShape,
+            2 => std.math.cast(u32, tensor_ptr.shape[1]) orelse error.InvalidShape,
+            3 => std.math.cast(u32, tensor_ptr.shape[2]) orelse error.InvalidShape,
+            else => error.InvalidShape,
+        };
+    }
+
     fn instructionWeightRef(self: *const Block, op_index: usize) !*const Tensor {
         if (op_index >= self.compiled_plan.plan.instructions.len) return error.InvalidInstructionIndex;
         if (op_index + 1 >= self.instruction_weight_offsets.len) return error.InvalidInstructionIndex;
@@ -2271,12 +2280,13 @@ pub const Block = struct {
                 params,
                 .gated_delta_net,
             );
-            const d_model = std.math.mul(
+            const d_inner = std.math.mul(
                 u32,
                 gated_delta_param.n_heads,
                 gated_delta_param.d_head,
             ) catch return error.InvalidParamBlockABI;
-            if (gated_delta_param.d_inner != d_model) return error.InvalidParamBlockABI;
+            if (gated_delta_param.d_inner != d_inner) return error.InvalidParamBlockABI;
+            const d_model = try hiddenWidthFromTensor(input);
             var gated_delta_local = gated_delta_kernel.GatedDeltaKernel{
                 .config = .{
                     .d_model = d_model,
@@ -5334,4 +5344,18 @@ test "buildTmpRegisterScratchMap reuses physical tmp slots from liveness" {
     try testing.expectEqual(tmp_map[@intFromEnum(BufferId.tmp3)], tmp_map[@intFromEnum(BufferId.tmp5)]);
     try testing.expect(tmp_map[@intFromEnum(BufferId.tmp4)] != tmp_map[@intFromEnum(BufferId.tmp3)]);
     try testing.expect(tmp_map[@intFromEnum(BufferId.tmp3)] >= 1);
+}
+
+test "hiddenWidthFromTensor returns trailing hidden dimension" {
+    const vec_data = [_]f32{ 0, 0, 0, 0 };
+    const vec = Tensor.view(@ptrCast(@constCast(&vec_data)), &.{4}, .f32, null);
+    try testing.expectEqual(@as(u32, 4), try Block.hiddenWidthFromTensor(&vec));
+
+    const mat_data = [_]f32{0} ** (3 * 5);
+    const mat = Tensor.view(@ptrCast(@constCast(&mat_data)), &.{ 3, 5 }, .f32, null);
+    try testing.expectEqual(@as(u32, 5), try Block.hiddenWidthFromTensor(&mat));
+
+    const batched_data = [_]f32{0} ** (2 * 3 * 7);
+    const batched = Tensor.view(@ptrCast(@constCast(&batched_data)), &.{ 2, 3, 7 }, .f32, null);
+    try testing.expectEqual(@as(u32, 7), try Block.hiddenWidthFromTensor(&batched));
 }

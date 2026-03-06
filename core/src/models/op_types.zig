@@ -195,6 +195,21 @@ pub const WeightTransform = enum {
     dtype_f32,
 };
 
+pub const ConversionFusionKind = enum {
+    gated_delta_split_in_proj,
+};
+
+/// Models-owned converter fusion contract.
+/// The converter expands these suffix templates with layer prefixes and applies
+/// the structural fusion without any model-name branching in converter code.
+pub const ConversionFusion = struct {
+    kind: ConversionFusionKind,
+    trigger_suffix: []const u8,
+    required_input_suffixes: []const []const u8,
+    optional_input_suffixes: []const []const u8 = &.{},
+    output_suffix: []const u8,
+};
+
 /// Declarative weight specification for architecture-driven loading.
 pub const WeightSpec = struct {
     /// Internal ID for lookup (relative path from block).
@@ -362,6 +377,8 @@ pub const Architecture = struct {
     // Common prefixes for block weight names (for candidate generation).
     // E.g., ["model.layers.{d}.", "layers.{d}."] - weights specify suffix only.
     weight_prefixes: []const []const u8 = &.{},
+    // Structural converter fusions expanded from models-owned metadata.
+    conversion_fusions: []const ConversionFusion = &.{},
     // Weight IDs used to infer d_ff from actual loaded tensors when config
     // fields are inconsistent with checkpoint shapes.
     d_ff_source_weight_ids: []const []const u8 = &.{},

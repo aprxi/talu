@@ -148,6 +148,52 @@ pub const WeightLayoutMap = struct {
     }
 };
 
+pub const ConversionFusionPlan = struct {
+    kind: op_types.ConversionFusionKind,
+    required_inputs: []const []const u8,
+    optional_inputs: []const []const u8,
+    output_name: []const u8,
+};
+
+pub const ConversionFusionMap = struct {
+    allocator: std.mem.Allocator,
+    plans: std.StringHashMap(ConversionFusionPlan),
+    consumed_names: std.StringHashMap(void),
+
+    pub fn init(allocator: std.mem.Allocator) ConversionFusionMap {
+        return .{
+            .allocator = allocator,
+            .plans = std.StringHashMap(ConversionFusionPlan).init(allocator),
+            .consumed_names = std.StringHashMap(void).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *ConversionFusionMap) void {
+        var plan_iter = self.plans.iterator();
+        while (plan_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.required_inputs) |name| self.allocator.free(name);
+            self.allocator.free(entry.value_ptr.required_inputs);
+            for (entry.value_ptr.optional_inputs) |name| self.allocator.free(name);
+            self.allocator.free(entry.value_ptr.optional_inputs);
+            self.allocator.free(entry.value_ptr.output_name);
+        }
+        self.plans.deinit();
+
+        var consumed_iter = self.consumed_names.keyIterator();
+        while (consumed_iter.next()) |key| self.allocator.free(key.*);
+        self.consumed_names.deinit();
+    }
+
+    pub fn planForTrigger(self: *const ConversionFusionMap, tensor_name: []const u8) ?*const ConversionFusionPlan {
+        return self.plans.getPtr(tensor_name);
+    }
+
+    pub fn isConsumedNonTrigger(self: *const ConversionFusionMap, tensor_name: []const u8) bool {
+        return self.consumed_names.contains(tensor_name) and !self.plans.contains(tensor_name);
+    }
+};
+
 /// Build a weight layout map from architecture metadata.
 /// This extracts layout information from the architecture's weight specs.
 pub fn buildWeightLayoutMap(
@@ -211,6 +257,84 @@ pub fn buildWeightLayoutMap(
     }
 
     return layout_map;
+}
+
+pub fn buildConversionFusionMap(
+    allocator: std.mem.Allocator,
+    arch: *const op_types.Architecture,
+    num_layers: usize,
+) !ConversionFusionMap {
+    var fusion_map = ConversionFusionMap.init(allocator);
+    errdefer fusion_map.deinit();
+
+    if (arch.conversion_fusions.len == 0) return fusion_map;
+
+    for (0..num_layers) |layer_idx| {
+        if (arch.weight_prefixes.len == 0) {
+            try addConversionFusionsForPrefix(allocator, &fusion_map, arch.conversion_fusions, "", layer_idx);
+            continue;
+        }
+
+        for (arch.weight_prefixes) |prefix_template| {
+            const expanded_prefix = try expandLayerPlaceholder(allocator, prefix_template, layer_idx);
+            defer allocator.free(expanded_prefix);
+            try addConversionFusionsForPrefix(allocator, &fusion_map, arch.conversion_fusions, expanded_prefix, layer_idx);
+        }
+    }
+
+    return fusion_map;
+}
+
+fn addConversionFusionsForPrefix(
+    allocator: std.mem.Allocator,
+    fusion_map: *ConversionFusionMap,
+    fusions: []const op_types.ConversionFusion,
+    prefix: []const u8,
+    layer_idx: usize,
+) !void {
+    _ = layer_idx;
+    for (fusions) |fusion| {
+        const trigger_name = try std.mem.concat(allocator, u8, &.{ prefix, fusion.trigger_suffix });
+        errdefer allocator.free(trigger_name);
+        const output_name = try std.mem.concat(allocator, u8, &.{ prefix, fusion.output_suffix });
+        errdefer allocator.free(output_name);
+
+        const required_inputs = try allocator.alloc([]const u8, fusion.required_input_suffixes.len);
+        errdefer allocator.free(required_inputs);
+        for (fusion.required_input_suffixes, 0..) |suffix, idx| {
+            required_inputs[idx] = try std.mem.concat(allocator, u8, &.{ prefix, suffix });
+        }
+        errdefer {
+            for (required_inputs) |name| allocator.free(name);
+        }
+
+        const optional_inputs = try allocator.alloc([]const u8, fusion.optional_input_suffixes.len);
+        errdefer allocator.free(optional_inputs);
+        for (fusion.optional_input_suffixes, 0..) |suffix, idx| {
+            optional_inputs[idx] = try std.mem.concat(allocator, u8, &.{ prefix, suffix });
+        }
+        errdefer {
+            for (optional_inputs) |name| allocator.free(name);
+        }
+
+        try fusion_map.plans.put(trigger_name, .{
+            .kind = fusion.kind,
+            .required_inputs = required_inputs,
+            .optional_inputs = optional_inputs,
+            .output_name = output_name,
+        });
+
+        for (required_inputs) |name| {
+            if (!std.mem.eql(u8, name, trigger_name)) {
+                try fusion_map.consumed_names.put(try allocator.dupe(u8, name), {});
+            }
+        }
+        for (optional_inputs) |name| {
+            if (!std.mem.eql(u8, name, trigger_name)) {
+                try fusion_map.consumed_names.put(try allocator.dupe(u8, name), {});
+            }
+        }
+    }
 }
 
 /// Get the weight specs for a given layer (handles heterogeneous models).
@@ -614,6 +738,44 @@ test "shouldSkipForTiedEmbeddingsByName uses architecture lm_head aliases" {
     try std.testing.expect(!shouldSkipForTiedEmbeddingsByName(&layout_map, "model.embed_tokens.weight", true));
     try std.testing.expect(!shouldSkipForTiedEmbeddingsByName(&layout_map, lm_head_name, false));
     try std.testing.expect(!shouldSkipForTiedEmbeddingsByName(null, lm_head_name, true));
+}
+
+test "buildConversionFusionMap expands structural fusions per layer prefix" {
+    const allocator = std.testing.allocator;
+
+    const fusions = [_]op_types.ConversionFusion{
+        .{
+            .kind = .gated_delta_split_in_proj,
+            .trigger_suffix = "linear_attn.in_proj_qkv.weight",
+            .required_input_suffixes = &.{
+                "linear_attn.in_proj_qkv.weight",
+                "linear_attn.in_proj_z.weight",
+                "linear_attn.in_proj_b.weight",
+            },
+            .optional_input_suffixes = &.{
+                "linear_attn.in_proj_a.weight",
+            },
+            .output_suffix = "mixer.in_proj.weight",
+        },
+    };
+    const arch = op_types.Architecture{
+        .name = "test_arch",
+        .model_types = &.{"test_arch"},
+        .weight_prefixes = &.{"model.layers.{d}."},
+        .conversion_fusions = &fusions,
+    };
+
+    var map = try buildConversionFusionMap(allocator, &arch, 2);
+    defer map.deinit();
+
+    const trigger = "model.layers.1.linear_attn.in_proj_qkv.weight";
+    const plan = map.planForTrigger(trigger) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(op_types.ConversionFusionKind.gated_delta_split_in_proj, plan.kind);
+    try std.testing.expectEqualStrings("model.layers.1.mixer.in_proj.weight", plan.output_name);
+    try std.testing.expectEqual(@as(usize, 3), plan.required_inputs.len);
+    try std.testing.expectEqualStrings("model.layers.1.linear_attn.in_proj_z.weight", plan.required_inputs[1]);
+    try std.testing.expect(map.isConsumedNonTrigger("model.layers.1.linear_attn.in_proj_a.weight"));
+    try std.testing.expect(!map.isConsumedNonTrigger(trigger));
 }
 
 test "sortTensorNames orders embeddings first" {

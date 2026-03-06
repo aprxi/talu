@@ -151,7 +151,68 @@ fn copyTensorToF32(
     src: *const Tensor,
     expected_in: ?usize,
 ) !*Tensor {
-    if (src.dtype.isQuantized()) return error.UnsupportedDType;
+    if (src.dtype == .grouped_affine_u4 or src.dtype == .grouped_affine_u8) {
+        const gaffine = src.gaffine orelse return error.InvalidShape;
+        const rows: usize = @intCast(src.shape[0]);
+        const cols: usize = @intCast(src.shape[1]);
+        const values_per_word: usize = if (src.dtype == .grouped_affine_u4) 8 else 4;
+        const bits: u5 = if (src.dtype == .grouped_affine_u4) 4 else 8;
+        const mask: u32 = if (src.dtype == .grouped_affine_u4) 0xF else 0xFF;
+        const packed_stride = cols / values_per_word;
+        const group_stride = cols / gaffine.group_size;
+        var packed_owned: ?[]u32 = null;
+        defer if (packed_owned) |owned| allocator.free(owned);
+        const packed_vals = try tensor_bytes_to_u32(allocator, src.data(), &packed_owned);
+        var scales_owned: ?[]u16 = null;
+        defer if (scales_owned) |owned| allocator.free(owned);
+        const scale_values = try tensor_bytes_to_u16(allocator, gaffine.scales, &scales_owned);
+        var biases_owned: ?[]u16 = null;
+        defer if (biases_owned) |owned| allocator.free(owned);
+        const bias_values = try tensor_bytes_to_u16(allocator, gaffine.biases, &biases_owned);
+
+        const out_rows: usize = if (expected_in != null and cols == expected_in.? and rows != expected_in.?) cols else rows;
+        const out_cols: usize = if (expected_in != null and cols == expected_in.? and rows != expected_in.?) rows else cols;
+        const dst = try Tensor.init(allocator, &.{ @intCast(out_rows), @intCast(out_cols) }, .f32, src.device);
+        errdefer dst.deinit(allocator);
+        const dst_data = dst.asSliceMut(f32);
+
+        for (0..rows) |r| {
+            const pack_row = packed_vals[r * packed_stride .. (r + 1) * packed_stride];
+            const scale_row = scale_values[r * group_stride .. (r + 1) * group_stride];
+            const bias_row = bias_values[r * group_stride .. (r + 1) * group_stride];
+            var col_offset: usize = 0;
+            while (col_offset < cols) : (col_offset += values_per_word) {
+                const word = pack_row[col_offset / values_per_word];
+                for (0..values_per_word) |val_idx| {
+                    const col = col_offset + val_idx;
+                    if (col >= cols) break;
+                    const shift: u5 = @intCast(val_idx * bits);
+                    const group_idx = col / gaffine.group_size;
+                    const scale = switch (gaffine.scales_dtype) {
+                        .f16 => dtype.fp16ToF32(scale_row[group_idx]),
+                        .bf16 => dtype.bf16ToF32(scale_row[group_idx]),
+                        else => return error.UnsupportedDType,
+                    };
+                    const bias = switch (gaffine.scales_dtype) {
+                        .f16 => dtype.fp16ToF32(bias_row[group_idx]),
+                        .bf16 => dtype.bf16ToF32(bias_row[group_idx]),
+                        else => return error.UnsupportedDType,
+                    };
+                    const quant = @as(f32, @floatFromInt((word >> shift) & mask));
+                    const value = quant * scale + bias;
+                    if (out_rows == cols and out_cols == rows) {
+                        dst_data[col * rows + r] = value;
+                    } else {
+                        dst_data[r * cols + col] = value;
+                    }
+                }
+            }
+        }
+        return dst;
+    }
+    if (src.dtype.isQuantized()) {
+        return error.UnsupportedDType;
+    }
     const dims: usize = @intCast(src.n_dims);
     if (dims == 0 or dims > tensor.MAX_NDIM) return error.InvalidShape;
 
@@ -221,6 +282,38 @@ fn copyTensorToF32(
         else => return error.UnsupportedDType,
     }
     return dst;
+}
+
+fn tensor_bytes_to_u16(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    owned: *?[]u16,
+) ![]const u16 {
+    if (bytes.len % @sizeOf(u16) != 0) return error.InvalidShape;
+    if (@intFromPtr(bytes.ptr) % @alignOf(u16) == 0) {
+        return @alignCast(std.mem.bytesAsSlice(u16, bytes));
+    }
+    const len = bytes.len / @sizeOf(u16);
+    const aligned = try allocator.alloc(u16, len);
+    @memcpy(std.mem.sliceAsBytes(aligned), bytes);
+    owned.* = aligned;
+    return aligned;
+}
+
+fn tensor_bytes_to_u32(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    owned: *?[]u32,
+) ![]const u32 {
+    if (bytes.len % @sizeOf(u32) != 0) return error.InvalidShape;
+    if (@intFromPtr(bytes.ptr) % @alignOf(u32) == 0) {
+        return @alignCast(std.mem.bytesAsSlice(u32, bytes));
+    }
+    const len = bytes.len / @sizeOf(u32);
+    const aligned = try allocator.alloc(u32, len);
+    @memcpy(std.mem.sliceAsBytes(aligned), bytes);
+    owned.* = aligned;
+    return aligned;
 }
 
 /// Create a heap-allocated NormKernel, choosing LayerNorm when bias is present.
@@ -2668,6 +2761,46 @@ test "copyTensorToF32 converts bf16 matrices" {
     try std.testing.expectApproxEqAbs(@as(f32, -2.0), copied.asSlice(f32)[1], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 3.5), copied.asSlice(f32)[2], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), copied.asSlice(f32)[3], 1e-5);
+}
+
+test "copyTensorToF32 dequantizes grouped-affine tensors and transposes when expected_in matches columns" {
+    const allocator = std.testing.allocator;
+
+    var packed_words = [_]u32{
+        0x04030201,
+        0x08070605,
+        0x0c0b0a09,
+        0x100f0e0d,
+        0x14131211,
+        0x18171615,
+        0x1c1b1a19,
+        0x201f1e1d,
+    };
+    var scales = [_]u16{dtype.f32ToBf16(1.0)} ** 8;
+    var biases = [_]u16{dtype.f32ToBf16(0.0)} ** 8;
+    var src = Tensor.view(
+        @ptrCast(packed_words[0..].ptr),
+        &.{ 8, 4 },
+        .grouped_affine_u8,
+        packed_words.len * @sizeOf(u32),
+    );
+    src.gaffine = .{
+        .scales = std.mem.sliceAsBytes(scales[0..]),
+        .biases = std.mem.sliceAsBytes(biases[0..]),
+        .group_size = 4,
+        .scales_dtype = .bf16,
+    };
+
+    const copied = try copyTensorToF32(allocator, &src, 4);
+    defer copied.deinit(allocator);
+
+    try std.testing.expectEqual(tensor.DType.f32, copied.dtype);
+    try std.testing.expectEqual(@as(i64, 4), copied.shape[0]);
+    try std.testing.expectEqual(@as(i64, 8), copied.shape[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), copied.asSlice(f32)[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), copied.asSlice(f32)[4], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 29.0), copied.asSlice(f32)[7], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 32.0), copied.asSlice(f32)[31], 1e-5);
 }
 
 test "TransformerBlock.init converts gated-delta mamba in_proj to f32" {

@@ -1,6 +1,6 @@
 //! Gated-attention math primitives.
 //!
-//! These helpers keep Qwen3.5-specific gated-query math in the compute layer
+//! These helpers keep gated-query math in the compute layer
 //! rather than inside inference backend orchestration.
 
 const std = @import("std");

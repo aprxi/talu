@@ -1,6 +1,6 @@
 //! Gated DeltaNet CPU Kernel
 //!
-//! Explicit CPU kernel for Qwen3.5 linear attention. This is distinct from
+//! Explicit CPU kernel for gated linear attention. This is distinct from
 //! Mamba and intentionally does not share Mamba execution switches.
 
 pub const supported = true;

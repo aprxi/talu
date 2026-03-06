@@ -14,6 +14,7 @@ const config_loader = @import("../models/config/root.zig");
 const parallel = @import("../system/parallel.zig");
 const convert = @import("root.zig");
 const models_registry = @import("../models/registry.zig");
+const load_transforms = @import("../models/load/transforms.zig");
 
 const Tensor = tensor.Tensor;
 const DType = dtype_mod.DType;
@@ -68,6 +69,39 @@ pub const ConvertOptions = struct {
 };
 
 pub const modelIdFromOutputPath = gaf_paths.modelIdFromOutputPath;
+
+fn maybeWriteFusedTensorForPlan(
+    allocator: std.mem.Allocator,
+    source_tensors: *safetensors.UnifiedSafeTensors,
+    builder: *safetensors.Builder,
+    plan: *const convert.ConversionFusionPlan,
+    quant_config: QuantConfig,
+) !bool {
+    switch (plan.kind) {
+        .gated_delta_split_in_proj => {
+            if (plan.required_inputs.len != 3) return error.InvalidWeightTransform;
+            const qkv = try source_tensors.getTensor(plan.required_inputs[0], null);
+            const z = try source_tensors.getTensor(plan.required_inputs[1], null);
+            const b = try source_tensors.getTensor(plan.required_inputs[2], null);
+            var a = if (plan.optional_inputs.len > 0)
+                source_tensors.getTensor(plan.optional_inputs[0], null) catch null
+            else
+                null;
+
+            const fused = try load_transforms.buildGatedDeltaSplitInProj(
+                allocator,
+                &qkv,
+                &z,
+                &b,
+                if (a) |*t| t else null,
+            );
+            defer @constCast(fused).deinit(allocator);
+
+            try quantizeGroupedAffineTensor(allocator, source_tensors, builder, plan.output_name, fused.*, quant_config);
+            return true;
+        },
+    }
+}
 
 /// Convert a transformer model to grouped-affine weights in MLX format (optionally quantized).
 /// Returns the output path (caller owns the memory).
@@ -151,12 +185,18 @@ pub fn convertToGroupedAffine(
 
     var layout_map: ?convert.WeightLayoutMap = null;
     defer if (layout_map) |*lm| lm.deinit();
+    var fusion_map: ?convert.ConversionFusionMap = null;
+    defer if (fusion_map) |*fm| fm.deinit();
 
     if (model_type) |mt| {
         if (models_registry.detectByModelType(mt)) |entry| {
             if (models_registry.runtimeArchitectureById(entry.id)) |arch| {
                 layout_map = convert.buildWeightLayoutMap(allocator, arch, @intCast(model_config.n_layers)) catch |err| blk: {
                     log.warn("converter", "Failed to build layout map", .{ .err = @errorName(err) });
+                    break :blk null;
+                };
+                fusion_map = convert.buildConversionFusionMap(allocator, arch, @intCast(model_config.n_layers)) catch |err| blk: {
+                    log.warn("converter", "Failed to build fusion map", .{ .err = @errorName(err) });
                     break :blk null;
                 };
             }
@@ -180,6 +220,7 @@ pub fn convertToGroupedAffine(
             output_dir_path,
             options.progress,
             if (layout_map) |*lm| lm else null,
+            if (fusion_map) |*fm| fm else null,
         );
     } else {
         try writeUnquantizedWeights(
@@ -235,6 +276,7 @@ fn writeQuantizedWeights(
     output_dir: []const u8,
     progress: ProgressContext,
     layout_map: ?*const convert.WeightLayoutMap,
+    fusion_map: ?*const convert.ConversionFusionMap,
 ) !void {
     var tensor_builder = safetensors.Builder.init(allocator);
     defer tensor_builder.deinit();
@@ -281,13 +323,24 @@ fn writeQuantizedWeights(
             continue;
         }
 
-        const source_tensor = try source_tensors.getTensor(tensor_name, null);
+        if (fusion_map) |map| {
+            if (map.isConsumedNonTrigger(tensor_name)) continue;
+            if (map.planForTrigger(tensor_name)) |plan| {
+                if (try maybeWriteFusedTensorForPlan(allocator, source_tensors, &tensor_builder, plan, quant_config)) {
+                    continue;
+                }
+            }
+        }
 
-        // Use architecture-driven layout to determine if tensor should be quantized.
-        // Unknown tensors are kept in source precision.
-        if (convert.shouldQuantizeTensorByLayout(layout_map, tensor_name, source_tensor)) {
-            try quantizeGroupedAffineTensor(allocator, source_tensors, &tensor_builder, tensor_name, source_tensor, quant_config);
-        } else {
+        {
+            const source_tensor = try source_tensors.getTensor(tensor_name, null);
+
+            // Use architecture-driven layout to determine if tensor should be quantized.
+            // Unknown tensors are kept in source precision.
+            if (convert.shouldQuantizeTensorByLayout(layout_map, tensor_name, source_tensor)) {
+                try quantizeGroupedAffineTensor(allocator, source_tensors, &tensor_builder, tensor_name, source_tensor, quant_config);
+                continue;
+            }
             try copyTensorUnchanged(allocator, &tensor_builder, tensor_name, source_tensor);
         }
     }

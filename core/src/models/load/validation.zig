@@ -431,7 +431,9 @@ fn legacyBlockToLayer(
         },
         .gated_delta => |block| {
             try map.put(allocator, "input_layernorm.weight", block.ln1_weight);
-            try map.put(allocator, "linear_attn.in_proj_qkv.weight", block.weights.in_proj);
+            // Validation rematerialization emits the already-fused in-proj under
+            // the fused loader name accepted by blockWeightsFromMap.
+            try map.put(allocator, "mixer.in_proj.weight", block.weights.in_proj);
             try map.put(allocator, "linear_attn.conv1d.weight", block.weights.conv1d_weight);
             try map.put(allocator, "linear_attn.A_log", block.weights.A_log);
             try map.put(allocator, "linear_attn.out_proj.weight", block.weights.out_proj);
@@ -1746,6 +1748,57 @@ test "validateCommon: missing q/k/v without fused qkv" {
     // Should fail
     try std.testing.expectError(Error.ValidationFailed, validateCommon(&reporter, &loaded_model));
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "failed to materialize layer 0 block weights for validation") != null);
+}
+
+test "legacyBlockToLayer round-trips fused gated delta block through blockWeightsFromMap" {
+    const allocator = std.testing.allocator;
+
+    var ln1_data = [_]f32{ 1, 1 };
+    var in_proj_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var conv_data = [_]f32{ 0, 1, 2, 3, 4, 5 };
+    var a_log_data = [_]f32{ 0.1, 0.2 };
+    var dt_bias_data = [_]f32{ 0.3, 0.4 };
+    var norm_data = [_]f32{ 1, 1 };
+    var out_proj_data = [_]f32{ 1, 0, 0, 1 };
+
+    var ln1 = tensor.Tensor.view(@ptrCast(ln1_data[0..].ptr), &.{2}, .f32, null);
+    var in_proj = tensor.Tensor.view2DSlice(in_proj_data[0..], 4, 2);
+    var conv = tensor.Tensor.view(@ptrCast(conv_data[0..].ptr), &.{ 6, 1, 1 }, .f32, null);
+    var a_log = tensor.Tensor.view(@ptrCast(a_log_data[0..].ptr), &.{2}, .f32, null);
+    var dt_bias = tensor.Tensor.view(@ptrCast(dt_bias_data[0..].ptr), &.{2}, .f32, null);
+    var norm = tensor.Tensor.view(@ptrCast(norm_data[0..].ptr), &.{2}, .f32, null);
+    var out_proj = tensor.Tensor.view2DSlice(out_proj_data[0..], 2, 2);
+
+    const legacy_block = weights.blocks.BlockWeights{
+        .gated_delta = .{
+            .ln1_weight = &ln1,
+            .config = .{
+                .d_model = 2,
+                .d_conv = 1,
+                .n_heads = 2,
+                .d_head = 1,
+            },
+            .weights = .{
+                .in_proj = &in_proj,
+                .out_proj = &out_proj,
+                .conv1d_weight = &conv,
+                .conv1d_bias = null,
+                .A_log = &a_log,
+                .dt_bias = &dt_bias,
+                .norm_weight = &norm,
+            },
+        },
+    };
+
+    var layer = try legacyBlockToLayer(allocator, legacy_block);
+    defer layer.weight_map.deinit(allocator);
+
+    const rematerialized = try weights.blocks.blockWeightsFromMap(
+        &layer.weight_map,
+        layer.block_type,
+        layer.map_context,
+    );
+    try std.testing.expect(rematerialized == .gated_delta);
 }
 
 test "validateCommon: lm_head not 2D" {
