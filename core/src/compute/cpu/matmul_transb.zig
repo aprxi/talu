@@ -36,6 +36,11 @@ const TILE_THRESHOLD: usize = 64;
 /// With K=256 (typical hidden dim): 32 cols × 256 × 4 bytes = 32KB fits L1.
 const COL_TILE: usize = 32;
 
+/// K-loop tile size for cache blocking in the dot-product kernel.
+/// For 4-column unrolling, each chunk touches one A slice plus 4 B slices,
+/// so K_TILE=256 keeps the active working set comfortably in L1/L2.
+const K_TILE: usize = 256;
+
 /// Matmul with transposed B: C = A @ B^T.
 ///
 /// Shapes (all f32, 2D):
@@ -164,28 +169,37 @@ fn dotCols(b_data: []const f32, a_row: []const f32, out_row: []f32, k: usize, co
         var acc1: VecF32 = @splat(0);
         var acc2: VecF32 = @splat(0);
         var acc3: VecF32 = @splat(0);
+        var tail0: f32 = 0;
+        var tail1: f32 = 0;
+        var tail2: f32 = 0;
+        var tail3: f32 = 0;
 
-        var ki: usize = 0;
-        while (ki + VEC <= k) : (ki += VEC) {
-            const a_vec: VecF32 = a_row[ki..][0..VEC].*;
-            acc0 = @mulAdd(VecF32, a_vec, @as(VecF32, b0[ki..][0..VEC].*), acc0);
-            acc1 = @mulAdd(VecF32, a_vec, @as(VecF32, b1[ki..][0..VEC].*), acc1);
-            acc2 = @mulAdd(VecF32, a_vec, @as(VecF32, b2[ki..][0..VEC].*), acc2);
-            acc3 = @mulAdd(VecF32, a_vec, @as(VecF32, b3[ki..][0..VEC].*), acc3);
+        var k_start: usize = 0;
+        while (k_start < k) : (k_start += K_TILE) {
+            const k_end = @min(k_start + K_TILE, k);
+
+            var ki = k_start;
+            while (ki + VEC <= k_end) : (ki += VEC) {
+                const a_vec: VecF32 = a_row[ki..][0..VEC].*;
+                acc0 = @mulAdd(VecF32, a_vec, @as(VecF32, b0[ki..][0..VEC].*), acc0);
+                acc1 = @mulAdd(VecF32, a_vec, @as(VecF32, b1[ki..][0..VEC].*), acc1);
+                acc2 = @mulAdd(VecF32, a_vec, @as(VecF32, b2[ki..][0..VEC].*), acc2);
+                acc3 = @mulAdd(VecF32, a_vec, @as(VecF32, b3[ki..][0..VEC].*), acc3);
+            }
+
+            while (ki < k_end) : (ki += 1) {
+                const av = a_row[ki];
+                tail0 += av * b0[ki];
+                tail1 += av * b1[ki];
+                tail2 += av * b2[ki];
+                tail3 += av * b3[ki];
+            }
         }
 
-        var s0 = @reduce(.Add, acc0);
-        var s1 = @reduce(.Add, acc1);
-        var s2 = @reduce(.Add, acc2);
-        var s3 = @reduce(.Add, acc3);
-
-        while (ki < k) : (ki += 1) {
-            const av = a_row[ki];
-            s0 += av * b0[ki];
-            s1 += av * b1[ki];
-            s2 += av * b2[ki];
-            s3 += av * b3[ki];
-        }
+        const s0 = @reduce(.Add, acc0) + tail0;
+        const s1 = @reduce(.Add, acc1) + tail1;
+        const s2 = @reduce(.Add, acc2) + tail2;
+        const s3 = @reduce(.Add, acc3) + tail3;
 
         out_row[col] = s0;
         out_row[col + 1] = s1;
@@ -197,15 +211,22 @@ fn dotCols(b_data: []const f32, a_row: []const f32, out_row: []f32, k: usize, co
     while (col < col_end) : (col += 1) {
         const b_row = b_data[col * k ..][0..k];
         var acc: VecF32 = @splat(0);
-        var ki: usize = 0;
-        while (ki + VEC <= k) : (ki += VEC) {
-            const a_vec: VecF32 = a_row[ki..][0..VEC].*;
-            acc = @mulAdd(VecF32, a_vec, @as(VecF32, b_row[ki..][0..VEC].*), acc);
+        var tail: f32 = 0;
+        var k_start: usize = 0;
+        while (k_start < k) : (k_start += K_TILE) {
+            const k_end = @min(k_start + K_TILE, k);
+
+            var ki = k_start;
+            while (ki + VEC <= k_end) : (ki += VEC) {
+                const a_vec: VecF32 = a_row[ki..][0..VEC].*;
+                acc = @mulAdd(VecF32, a_vec, @as(VecF32, b_row[ki..][0..VEC].*), acc);
+            }
+
+            while (ki < k_end) : (ki += 1) {
+                tail += a_row[ki] * b_row[ki];
+            }
         }
-        var sum = @reduce(.Add, acc);
-        while (ki < k) : (ki += 1) {
-            sum += a_row[ki] * b_row[ki];
-        }
+        const sum = @reduce(.Add, acc) + tail;
         out_row[col] = sum;
     }
 }
@@ -362,5 +383,45 @@ test "matmulF32TransB large batch exercises row parallelism" {
     }
     for (0..M * N) |i| {
         try testing.expectApproxEqAbs(expected[i], c_data[i], 1e-3);
+    }
+}
+
+test "matmulF32TransB large K exercises tiled dotCols path" {
+    const M = 2;
+    const K = 300;
+    const N = 7;
+
+    var a_data: [M * K]f32 = undefined;
+    var b_data: [N * K]f32 = undefined;
+    var c_data: [M * N]f32 = undefined;
+
+    for (&a_data, 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 19)) - 9;
+        v.* = @as(f32, @floatFromInt(centered)) * 0.125;
+    }
+    for (&b_data, 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 23)) - 11;
+        v.* = @as(f32, @floatFromInt(centered)) * 0.0625;
+    }
+
+    var a = Tensor.view2DSlice(&a_data, M, K);
+    var b = Tensor.view2DSlice(&b_data, N, K);
+    var out = Tensor.view2DSlice(&c_data, M, N);
+
+    var scratch = try MatmulScratch.init(testing.allocator);
+    defer scratch.deinit();
+
+    matmulF32TransB(&a, &b, &out, &scratch);
+
+    var expected: [M * N]f32 = [_]f32{0} ** (M * N);
+    for (0..M) |m| {
+        for (0..N) |n| {
+            for (0..K) |ki| {
+                expected[m * N + n] += a_data[m * K + ki] * b_data[n * K + ki];
+            }
+        }
+    }
+    for (0..M * N) |i| {
+        try testing.expectApproxEqAbs(expected[i], c_data[i], 1e-4);
     }
 }
