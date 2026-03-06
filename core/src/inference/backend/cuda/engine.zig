@@ -276,7 +276,7 @@ const LinearWeight = union(enum) {
     }
 };
 
-const PrototypeRuntime = struct {
+const RuntimeBuffers = struct {
     projected_vocab: usize,
     max_dff: usize,
     max_attn: usize,
@@ -321,7 +321,7 @@ const PrototypeRuntime = struct {
         max_seq_len: usize,
         n_heads: usize,
         head_dim: usize,
-    ) !PrototypeRuntime {
+    ) !RuntimeBuffers {
         const d_model: usize = @intCast(loaded.config.d_model);
         const vocab_size: usize = @intCast(loaded.config.vocab_size);
         if (d_model == 0 or vocab_size == 0) return error.InvalidArgument;
@@ -483,7 +483,7 @@ const PrototypeRuntime = struct {
         };
     }
 
-    fn deinit(self: *PrototypeRuntime, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
+    fn deinit(self: *RuntimeBuffers, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
         self.logits_dev.deinit(device);
         self.projection_weight.deinit(device);
         if (self.embedding_lookup) |*lookup| lookup.deinit(device);
@@ -508,7 +508,7 @@ const PrototypeRuntime = struct {
         allocator.free(self.hidden_host);
     }
 
-    fn deviceByteSize(self: *const PrototypeRuntime) usize {
+    fn deviceByteSize(self: *const RuntimeBuffers) usize {
         return self.input_dev.size +
             self.norm_weight_dev.size +
             self.norm_out_dev.size +
@@ -531,12 +531,12 @@ const PrototypeRuntime = struct {
             self.projection_weight.byteSize();
     }
 
-    fn requireAttentionScoresDev(self: *PrototypeRuntime) !*compute.cuda.Buffer {
+    fn requireAttentionScoresDev(self: *RuntimeBuffers) !*compute.cuda.Buffer {
         if (self.attn_scores_dev) |*buf| return buf;
         return error.CudaKernelUnavailable;
     }
 
-    fn requireAttentionProbsDev(self: *PrototypeRuntime) !*compute.cuda.Buffer {
+    fn requireAttentionProbsDev(self: *RuntimeBuffers) !*compute.cuda.Buffer {
         if (self.attn_probs_dev) |*buf| return buf;
         return error.CudaKernelUnavailable;
     }
@@ -1040,7 +1040,7 @@ fn buildCudaLayerProgramRegisterSlotMap(
 
     const register_specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, register_count);
     defer allocator.free(register_specs);
-    // Register 0 (residual) uses prototype.input_dev, not a slot buffer.
+    // Register 0 (residual) uses runtime_buffers.input_dev, not a slot buffer.
     register_specs[0] = .{ .size = 0, .@"align" = 0 };
     if (compiled.register_buffer_specs.len != register_count) return error.InvalidRegisterSpecCount;
     // Plan specs already contain floors applied at compile time.
@@ -1990,7 +1990,7 @@ pub const CudaBackend = struct {
     gaffine_sequence_fused_gate_up_supported: bool = false,
     kernel_arg_pack: compute.cuda.ArgPack,
     blas: compute.cuda.Blas,
-    prototype: PrototypeRuntime,
+    runtime_buffers: RuntimeBuffers,
     block_runtime: BlockRuntime,
     d_model: usize,
     vocab_size: usize,
@@ -2043,7 +2043,7 @@ pub const CudaBackend = struct {
             .kernel_registry = undefined,
             .kernel_arg_pack = compute.cuda.ArgPack.init(allocator),
             .blas = undefined,
-            .prototype = undefined,
+            .runtime_buffers = undefined,
             .block_runtime = undefined,
             .d_model = @intCast(loaded.config.d_model),
             .vocab_size = @intCast(loaded.config.vocab_size),
@@ -2131,7 +2131,7 @@ pub const CudaBackend = struct {
         const max_shortconv_dim = backend.block_runtime.maxShortConvDim();
         backend.blas = try compute.cuda.Blas.init(&backend.device);
         errdefer backend.blas.deinit(&backend.device);
-        backend.prototype = try PrototypeRuntime.init(
+        backend.runtime_buffers = try RuntimeBuffers.init(
             allocator,
             &backend.device,
             loaded,
@@ -2143,7 +2143,7 @@ pub const CudaBackend = struct {
             backend.n_heads,
             backend.head_dim,
         );
-        errdefer backend.prototype.deinit(allocator, &backend.device);
+        errdefer backend.runtime_buffers.deinit(allocator, &backend.device);
         try backend.initLayerProgramSlotBuffers();
         errdefer backend.deinitLayerProgramSlotBuffers();
         try backend.initKernelFunctions();
@@ -2177,10 +2177,10 @@ pub const CudaBackend = struct {
         }
         log.info("inference", "CUDA layered decode path ready", .{
             .d_model = backend.d_model,
-            .projected_vocab = backend.prototype.projected_vocab,
-            .max_dff = backend.prototype.max_dff,
-            .max_attn = backend.prototype.max_attn,
-            .max_kv = backend.prototype.max_kv,
+            .projected_vocab = backend.runtime_buffers.projected_vocab,
+            .max_dff = backend.runtime_buffers.max_dff,
+            .max_attn = backend.runtime_buffers.max_attn,
+            .max_kv = backend.runtime_buffers.max_kv,
             .max_seq = backend.max_seq_len,
             .kv_capacity_init = backend.initialKvCapacity(),
             .n_heads = backend.n_heads,
@@ -2213,7 +2213,7 @@ pub const CudaBackend = struct {
             .softmax_rows_kernel = @as(u8, @intFromBool(backend.softmax_rows_function != null)),
             .attn_weighted_sum_heads_f32_kernel = @as(u8, @intFromBool(backend.attn_weighted_sum_heads_f32_function != null)),
             .attn_weighted_sum_heads_f16_kv_kernel = @as(u8, @intFromBool(backend.attn_weighted_sum_heads_f16_kv_function != null)),
-            .attn_score_buffers = @as(u8, @intFromBool(backend.prototype.attn_scores_dev != null and backend.prototype.attn_probs_dev != null)),
+            .attn_score_buffers = @as(u8, @intFromBool(backend.runtime_buffers.attn_scores_dev != null and backend.runtime_buffers.attn_probs_dev != null)),
             .silu_kernel = @as(u8, @intFromBool(backend.silu_function != null)),
             .silu_mul_kernel = @as(u8, @intFromBool(backend.silu_mul_function != null)),
             .gelu_mul_kernel = @as(u8, @intFromBool(backend.gelu_mul_function != null)),
@@ -2238,19 +2238,19 @@ pub const CudaBackend = struct {
             .norm_weight_mib = bytesToMiB(backend.block_runtime.norm_weight_bytes),
             .kv_cache_mib = bytesToMiB(backend.block_runtime.kv_cache_bytes),
             .shortconv_state_mib = bytesToMiB(backend.block_runtime.shortconv_state_bytes),
-            .prototype_mib = bytesToMiB(backend.prototype.deviceByteSize()),
+            .prototype_mib = bytesToMiB(backend.runtime_buffers.deviceByteSize()),
             .slot_logits_mib = bytesToMiB(std.math.mul(usize, backend.slot_logits.len, @sizeOf(f32)) catch 0),
             .stream_token_select = "gpu_argmax",
             .stream_enabled = @as(u8, @intFromBool(backend.compute_stream != null)),
             .device_blocks = backend.block_runtime.blocks.len,
             .attention_blocks = backend.block_runtime.attention_block_count,
             .shortconv_blocks = backend.block_runtime.shortconv_block_count,
-            .model_norm = @as(u8, @intFromBool(backend.prototype.using_model_norm)),
-            .model_projection = @as(u8, @intFromBool(backend.prototype.using_model_projection)),
-            .projection_lm_head = @as(u8, @intFromBool(backend.prototype.projection_from_lm_head)),
+            .model_norm = @as(u8, @intFromBool(backend.runtime_buffers.using_model_norm)),
+            .model_projection = @as(u8, @intFromBool(backend.runtime_buffers.using_model_projection)),
+            .projection_lm_head = @as(u8, @intFromBool(backend.runtime_buffers.projection_from_lm_head)),
             .has_lm_head = @as(u8, @intFromBool(loaded.lm_head != null)),
-            .model_embeddings = @as(u8, @intFromBool(backend.prototype.using_model_embeddings)),
-            .embedding_lookup_device = @as(u8, @intFromBool(backend.prototype.embedding_lookup != null)),
+            .model_embeddings = @as(u8, @intFromBool(backend.runtime_buffers.using_model_embeddings)),
+            .embedding_lookup_device = @as(u8, @intFromBool(backend.runtime_buffers.embedding_lookup != null)),
             .embed_dtype = @tagName(loaded.token_embeddings.dtype),
             .embed_shape_0 = loaded.token_embeddings.shape[0],
             .embed_shape_1 = loaded.token_embeddings.shape[1],
@@ -2271,7 +2271,7 @@ pub const CudaBackend = struct {
         self.allocator.free(self.slot_logits);
         self.deinitLayerProgramSlotBuffers();
         self.block_runtime.deinit(self.allocator, &self.device);
-        self.prototype.deinit(self.allocator, &self.device);
+        self.runtime_buffers.deinit(self.allocator, &self.device);
         self.blas.deinit(&self.device);
         self.kernel_arg_pack.deinit();
         self.kernel_registry.deinit();
@@ -2861,12 +2861,12 @@ pub const CudaBackend = struct {
 
         if (hidden_override) |hidden| {
             if (hidden.len != self.d_model) return error.InvalidArgument;
-            @memcpy(self.prototype.hidden_host, hidden);
-            try self.prototype.input_dev.upload(&self.device, std.mem.sliceAsBytes(self.prototype.hidden_host));
+            @memcpy(self.runtime_buffers.hidden_host, hidden);
+            try self.runtime_buffers.input_dev.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
         } else {
             var used_device_lookup = false;
-            if (enable_device_embedding_lookup and self.prototype.embedding_lookup != null) {
-                const lookup = &self.prototype.embedding_lookup.?;
+            if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
+                const lookup = &self.runtime_buffers.embedding_lookup.?;
                 switch (lookup.kind) {
                     .f32 => {
                         if (embedding_lookup_f32_function) |kernel| {
@@ -2874,7 +2874,7 @@ pub const CudaBackend = struct {
                                 &self.kernel_arg_pack,
                                 &self.device,
                                 kernel,
-                                &self.prototype.input_dev,
+                                &self.runtime_buffers.input_dev,
                                 &lookup.buffer,
                                 lookup.dim0,
                                 lookup.dim1,
@@ -2892,7 +2892,7 @@ pub const CudaBackend = struct {
                                 &self.kernel_arg_pack,
                                 &self.device,
                                 kernel,
-                                &self.prototype.input_dev,
+                                &self.runtime_buffers.input_dev,
                                 &lookup.buffer,
                                 lookup.dim0,
                                 lookup.dim1,
@@ -2911,7 +2911,7 @@ pub const CudaBackend = struct {
                                 &self.kernel_arg_pack,
                                 &self.device,
                                 kernel,
-                                &self.prototype.input_dev,
+                                &self.runtime_buffers.input_dev,
                                 &lookup.buffer,
                                 lookup.dim0,
                                 lookup.dim1,
@@ -2932,7 +2932,7 @@ pub const CudaBackend = struct {
                                         &self.kernel_arg_pack,
                                         &self.device,
                                         kernel,
-                                        &self.prototype.input_dev,
+                                        &self.runtime_buffers.input_dev,
                                         &lookup.buffer,
                                         scales_buf,
                                         biases_buf,
@@ -2951,7 +2951,7 @@ pub const CudaBackend = struct {
                 }
             }
             if (!used_device_lookup) {
-                const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.prototype.hidden_host) catch |err| switch (err) {
+                const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.runtime_buffers.hidden_host) catch |err| switch (err) {
                     error.InvalidArgument => return error.InvalidArgument,
                     else => return err,
                 };
@@ -2966,11 +2966,11 @@ pub const CudaBackend = struct {
                     return error.UnsupportedModel;
                 }
                 if (self.loaded.config.embedding_multiplier != 1.0) {
-                    for (self.prototype.hidden_host) |*v| {
+                    for (self.runtime_buffers.hidden_host) |*v| {
                         v.* *= self.loaded.config.embedding_multiplier;
                     }
                 }
-                try self.prototype.input_dev.upload(&self.device, std.mem.sliceAsBytes(self.prototype.hidden_host));
+                try self.runtime_buffers.input_dev.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
             }
         }
 
@@ -3039,14 +3039,14 @@ pub const CudaBackend = struct {
                             continue;
                         };
                         const feature_row = layer_features[row_start .. row_start + self.d_model];
-                        try self.prototype.deepstack_add_dev.upload(&self.device, std.mem.sliceAsBytes(feature_row));
+                        try self.runtime_buffers.deepstack_add_dev.upload(&self.device, std.mem.sliceAsBytes(feature_row));
                         try compute.cuda.vector_add.runWithFunction(
                             &self.kernel_arg_pack,
                             &self.device,
                             vector_add_function,
-                            &self.prototype.input_dev,
-                            &self.prototype.deepstack_add_dev,
-                            &self.prototype.input_dev,
+                            &self.runtime_buffers.input_dev,
+                            &self.runtime_buffers.deepstack_add_dev,
+                            &self.runtime_buffers.input_dev,
                             d_model_u32,
                         );
                     }
@@ -3060,26 +3060,26 @@ pub const CudaBackend = struct {
             &self.kernel_arg_pack,
             &self.device,
             rmsnorm_function,
-            &self.prototype.input_dev,
-            &self.prototype.norm_weight_dev,
-            &self.prototype.norm_out_dev,
+            &self.runtime_buffers.input_dev,
+            &self.runtime_buffers.norm_weight_dev,
+            &self.runtime_buffers.norm_out_dev,
             1,
             d_model_u32,
             self.norm_eps,
             self.loaded.runtime.weight_offset,
         );
 
-        try self.linearForward(&self.prototype.norm_out_dev, &self.prototype.projection_weight, &self.prototype.logits_dev);
+        try self.linearForward(&self.runtime_buffers.norm_out_dev, &self.runtime_buffers.projection_weight, &self.runtime_buffers.logits_dev);
         if (!download_logits) return;
 
         const logits_out = logits_out_opt.?;
-        try self.prototype.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.prototype.projected_logits_host));
+        try self.runtime_buffers.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host));
 
-        if (self.prototype.projected_vocab == logits_out.len) {
-            @memcpy(logits_out, self.prototype.projected_logits_host);
+        if (self.runtime_buffers.projected_vocab == logits_out.len) {
+            @memcpy(logits_out, self.runtime_buffers.projected_logits_host);
         } else {
             @memset(logits_out, -1.0e9);
-            @memcpy(logits_out[0..self.prototype.projected_vocab], self.prototype.projected_logits_host);
+            @memcpy(logits_out[0..self.runtime_buffers.projected_vocab], self.runtime_buffers.projected_logits_host);
         }
         if (self.loaded.config.logits_scaling != 1.0) {
             for (logits_out) |*v| {
@@ -3302,9 +3302,9 @@ pub const CudaBackend = struct {
     ) !ProjectionPath {
         if (try self.tryFusedQkvForward(input, q_proj, k_proj, v_proj)) return .fused;
 
-        try self.linearForward(input, q_proj, &self.prototype.attn_q_dev);
-        try self.linearForward(input, k_proj, &self.prototype.attn_k_dev);
-        try self.linearForward(input, v_proj, &self.prototype.attn_v_dev);
+        try self.linearForward(input, q_proj, &self.runtime_buffers.attn_q_dev);
+        try self.linearForward(input, k_proj, &self.runtime_buffers.attn_k_dev);
+        try self.linearForward(input, v_proj, &self.runtime_buffers.attn_v_dev);
         return .unfused;
     }
 
@@ -3324,8 +3324,8 @@ pub const CudaBackend = struct {
     ) !ProjectionPath {
         if (try self.tryFusedGateUpForward(input, gate_weight, up_weight)) return .fused;
 
-        try self.linearForward(input, gate_weight, &self.prototype.ffn_gate_dev);
-        try self.linearForward(input, up_weight, &self.prototype.ffn_up_dev);
+        try self.linearForward(input, gate_weight, &self.runtime_buffers.ffn_gate_dev);
+        try self.linearForward(input, up_weight, &self.runtime_buffers.ffn_up_dev);
         return .unfused;
     }
 
@@ -3336,9 +3336,9 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 gelu_mul_function,
-                &self.prototype.ffn_gate_dev,
-                &self.prototype.ffn_up_dev,
-                &self.prototype.ffn_mul_dev,
+                &self.runtime_buffers.ffn_gate_dev,
+                &self.runtime_buffers.ffn_up_dev,
+                &self.runtime_buffers.ffn_mul_dev,
                 count,
             );
             return;
@@ -3349,9 +3349,9 @@ pub const CudaBackend = struct {
             &self.kernel_arg_pack,
             &self.device,
             silu_mul_function,
-            &self.prototype.ffn_gate_dev,
-            &self.prototype.ffn_up_dev,
-            &self.prototype.ffn_mul_dev,
+            &self.runtime_buffers.ffn_gate_dev,
+            &self.runtime_buffers.ffn_up_dev,
+            &self.runtime_buffers.ffn_mul_dev,
             count,
         );
     }
@@ -3439,7 +3439,7 @@ pub const CudaBackend = struct {
     }
 
     fn programBuffer(self: *CudaBackend, reg_idx: usize, ctx: *const LayerProgramExecutionContext) ?*compute.cuda.Buffer {
-        if (reg_idx == 0) return &self.prototype.input_dev;
+        if (reg_idx == 0) return &self.runtime_buffers.input_dev;
         if (reg_idx >= ctx.register_to_slot_map.len) return null;
         const slot_idx = ctx.register_to_slot_map[reg_idx];
         if (slot_idx == BlockRuntimeLayer.invalid_slot or slot_idx >= ctx.slot_buffers.len) return null;
@@ -3511,9 +3511,9 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                &self.prototype.attn_q_dev,
+                &self.runtime_buffers.attn_q_dev,
                 &q_norm_value.buffer,
-                &self.prototype.attn_q_dev,
+                &self.runtime_buffers.attn_q_dev,
                 n_heads_u32,
                 head_dim_u32,
                 self.norm_eps,
@@ -3525,9 +3525,9 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                &self.prototype.attn_k_dev,
+                &self.runtime_buffers.attn_k_dev,
                 &k_norm_value.buffer,
-                &self.prototype.attn_k_dev,
+                &self.runtime_buffers.attn_k_dev,
                 n_kv_heads_u32,
                 head_dim_u32,
                 self.norm_eps,
@@ -3548,7 +3548,7 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 rope_function,
-                &self.prototype.attn_q_dev,
+                &self.runtime_buffers.attn_q_dev,
                 n_heads_u32,
                 head_dim_u32,
                 rope_dim_u32,
@@ -3562,7 +3562,7 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 rope_function,
-                &self.prototype.attn_k_dev,
+                &self.runtime_buffers.attn_k_dev,
                 n_kv_heads_u32,
                 head_dim_u32,
                 rope_dim_u32,
@@ -3582,8 +3582,8 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     kv_write_f16,
-                    &self.prototype.attn_k_dev,
-                    &self.prototype.attn_v_dev,
+                    &self.runtime_buffers.attn_k_dev,
+                    &self.runtime_buffers.attn_v_dev,
                     &k_row,
                     &v_row,
                     n_kv_heads_u32,
@@ -3597,7 +3597,7 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     rope_store_f16,
-                    &self.prototype.attn_k_dev,
+                    &self.runtime_buffers.attn_k_dev,
                     &k_row,
                     n_kv_heads_u32,
                     head_dim_u32,
@@ -3609,7 +3609,7 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                    &self.prototype.attn_v_dev,
+                    &self.runtime_buffers.attn_v_dev,
                     &v_row,
                     @intCast(cfg.kv_dim),
                 );
@@ -3618,7 +3618,7 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                    &self.prototype.attn_k_dev,
+                    &self.runtime_buffers.attn_k_dev,
                     &k_row,
                     @intCast(cfg.kv_dim),
                 );
@@ -3626,7 +3626,7 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                    &self.prototype.attn_v_dev,
+                    &self.runtime_buffers.attn_v_dev,
                     &v_row,
                     @intCast(cfg.kv_dim),
                 );
@@ -3636,7 +3636,7 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 copy_function,
-                &self.prototype.attn_k_dev,
+                &self.runtime_buffers.attn_k_dev,
                 &k_row,
                 @intCast(cfg.kv_dim),
             );
@@ -3644,7 +3644,7 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 copy_function,
-                &self.prototype.attn_v_dev,
+                &self.runtime_buffers.attn_v_dev,
                 &v_row,
                 @intCast(cfg.kv_dim),
             );
@@ -3666,7 +3666,7 @@ pub const CudaBackend = struct {
             position_u32,
             layer_rope_theta,
         );
-        try self.linearForward(&self.prototype.attn_context_dev, o_proj, output);
+        try self.linearForward(&self.runtime_buffers.attn_context_dev, o_proj, output);
         _ = d_model_u32;
     }
 
@@ -3682,11 +3682,11 @@ pub const CudaBackend = struct {
         output: *compute.cuda.Buffer,
         shortconv_step_function: compute.cuda.Function,
     ) !void {
-        try self.linearForward(input, in_proj, &self.prototype.shortconv_proj_dev);
+        try self.linearForward(input, in_proj, &self.runtime_buffers.shortconv_proj_dev);
         const conv_bytes = std.math.mul(usize, cfg.conv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
-        var b_gate = try bufferSlice(&self.prototype.shortconv_proj_dev, 0, conv_bytes);
-        var c_gate = try bufferSlice(&self.prototype.shortconv_proj_dev, conv_bytes, conv_bytes);
-        var x_proj = try bufferSlice(&self.prototype.shortconv_proj_dev, conv_bytes * 2, conv_bytes);
+        var b_gate = try bufferSlice(&self.runtime_buffers.shortconv_proj_dev, 0, conv_bytes);
+        var c_gate = try bufferSlice(&self.runtime_buffers.shortconv_proj_dev, conv_bytes, conv_bytes);
+        var x_proj = try bufferSlice(&self.runtime_buffers.shortconv_proj_dev, conv_bytes * 2, conv_bytes);
 
         try compute.cuda.shortconv_step.runWithFunction(
             &self.kernel_arg_pack,
@@ -3698,11 +3698,11 @@ pub const CudaBackend = struct {
             conv_state,
             &conv_weight_time_major.buffer,
             if (conv_bias) |w| &w.buffer else null,
-            &self.prototype.shortconv_conv_dev,
+            &self.runtime_buffers.shortconv_conv_dev,
             @intCast(cfg.conv_dim),
             @intCast(cfg.d_conv),
         );
-        try self.linearForward(&self.prototype.shortconv_conv_dev, out_proj, output);
+        try self.linearForward(&self.runtime_buffers.shortconv_conv_dev, out_proj, output);
     }
 
     fn applyBiasF32(
@@ -3741,10 +3741,10 @@ pub const CudaBackend = struct {
     ) !void {
         _ = try self.runGateUpProjectionWithWeights(input, gate_weight, up_weight);
         if (gate_bias) |bias| {
-            try self.applyBiasF32(&self.prototype.ffn_gate_dev, bias, d_ff);
+            try self.applyBiasF32(&self.runtime_buffers.ffn_gate_dev, bias, d_ff);
         }
         try self.runFfnActivationMul(d_ff);
-        try self.linearForward(&self.prototype.ffn_mul_dev, down_weight, output);
+        try self.linearForward(&self.runtime_buffers.ffn_mul_dev, down_weight, output);
         if (down_bias) |bias| {
             const d_model = std.math.cast(u32, down_weight.cols()) orelse return error.InvalidArgument;
             try self.applyBiasF32(output, bias, d_model);
@@ -4486,7 +4486,7 @@ pub const CudaBackend = struct {
                 &self.device,
                 copy_function,
                 final_buf,
-                &self.prototype.input_dev,
+                &self.runtime_buffers.input_dev,
                 d_model_u32,
             );
         }
@@ -4536,10 +4536,10 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     kernels.attn_fused_heads_f16_kv_function.?,
-                    &self.prototype.attn_q_dev,
+                    &self.runtime_buffers.attn_q_dev,
                     &k_cache_view,
                     &v_cache_view,
-                    &self.prototype.attn_context_dev,
+                    &self.runtime_buffers.attn_context_dev,
                     @intCast(self.n_heads),
                     effective_seq_len_u32,
                     kv_dim_u32,
@@ -4553,13 +4553,13 @@ pub const CudaBackend = struct {
                 return .fused_heads_f16_kv;
             }
 
-            const attn_scores_dev = try self.prototype.requireAttentionScoresDev();
-            const attn_probs_dev = try self.prototype.requireAttentionProbsDev();
+            const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
+            const attn_probs_dev = try self.runtime_buffers.requireAttentionProbsDev();
             try compute.cuda.attn_scores_heads_f16_kv.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-                &self.prototype.attn_q_dev,
+                &self.runtime_buffers.attn_q_dev,
                 &k_cache_view,
                 attn_scores_dev,
                 @intCast(self.n_heads),
@@ -4584,7 +4584,7 @@ pub const CudaBackend = struct {
                 kernels.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
                 attn_probs_dev,
                 &v_cache_view,
-                &self.prototype.attn_context_dev,
+                &self.runtime_buffers.attn_context_dev,
                 @intCast(self.n_heads),
                 effective_seq_len_u32,
                 kv_dim_u32,
@@ -4596,14 +4596,14 @@ pub const CudaBackend = struct {
 
         const attn_scores_heads_f32_function = kernels.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable;
         const attn_weighted_sum_heads_f32_function = kernels.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable;
-        const attn_scores_dev = try self.prototype.requireAttentionScoresDev();
-        const attn_probs_dev = try self.prototype.requireAttentionProbsDev();
+        const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
+        const attn_probs_dev = try self.runtime_buffers.requireAttentionProbsDev();
 
         try compute.cuda.attn_scores_heads_f32.runWithFunction(
             &self.kernel_arg_pack,
             &self.device,
             attn_scores_heads_f32_function,
-            &self.prototype.attn_q_dev,
+            &self.runtime_buffers.attn_q_dev,
             &k_cache_view,
             attn_scores_dev,
             @intCast(self.n_heads),
@@ -4628,7 +4628,7 @@ pub const CudaBackend = struct {
             attn_weighted_sum_heads_f32_function,
             attn_probs_dev,
             &v_cache_view,
-            &self.prototype.attn_context_dev,
+            &self.runtime_buffers.attn_context_dev,
             @intCast(self.n_heads),
             effective_seq_len_u32,
             kv_dim_u32,
@@ -4679,21 +4679,21 @@ pub const CudaBackend = struct {
             &q.packed_data,
             &q.scales,
             &q.biases,
-            &self.prototype.attn_q_dev,
+            &self.runtime_buffers.attn_q_dev,
             @intCast(q.cols),
             q.group_size,
             q.scales_dtype_tag,
             &k.packed_data,
             &k.scales,
             &k.biases,
-            &self.prototype.attn_k_dev,
+            &self.runtime_buffers.attn_k_dev,
             @intCast(k.cols),
             k.group_size,
             k.scales_dtype_tag,
             &v.packed_data,
             &v.scales,
             &v.biases,
-            &self.prototype.attn_v_dev,
+            &self.runtime_buffers.attn_v_dev,
             @intCast(v.cols),
             v.group_size,
             v.scales_dtype_tag,
@@ -4734,13 +4734,13 @@ pub const CudaBackend = struct {
             fused_kernel,
             input,
             &q.buffer,
-            &self.prototype.attn_q_dev,
+            &self.runtime_buffers.attn_q_dev,
             @intCast(q.cols),
             &k.buffer,
-            &self.prototype.attn_k_dev,
+            &self.runtime_buffers.attn_k_dev,
             @intCast(k.cols),
             &v.buffer,
-            &self.prototype.attn_v_dev,
+            &self.runtime_buffers.attn_v_dev,
             @intCast(v.cols),
             @intCast(q.rows),
         );
@@ -4795,14 +4795,14 @@ pub const CudaBackend = struct {
             &gate.packed_data,
             &gate.scales,
             &gate.biases,
-            &self.prototype.ffn_gate_dev,
+            &self.runtime_buffers.ffn_gate_dev,
             @intCast(gate.cols),
             gate.group_size,
             gate.scales_dtype_tag,
             &up.packed_data,
             &up.scales,
             &up.biases,
-            &self.prototype.ffn_up_dev,
+            &self.runtime_buffers.ffn_up_dev,
             @intCast(up.cols),
             up.group_size,
             up.scales_dtype_tag,
@@ -4845,10 +4845,10 @@ pub const CudaBackend = struct {
             fused_kernel,
             input,
             &gate.buffer,
-            &self.prototype.ffn_gate_dev,
+            &self.runtime_buffers.ffn_gate_dev,
             @intCast(gate.cols),
             &up.buffer,
-            &self.prototype.ffn_up_dev,
+            &self.runtime_buffers.ffn_up_dev,
             @intCast(up.cols),
             @intCast(gate.rows),
         );
@@ -5162,20 +5162,20 @@ fn selectNextTokenFromLogits(self: *CudaBackend, logits: []const f32) !u32 {
 }
 
 fn selectNextTokenFromDeviceLogits(self: *CudaBackend) !u32 {
-    if (self.prototype.projected_vocab == 0) return error.InvalidArgument;
-    if (self.prototype.projected_vocab > std.math.maxInt(u32)) return error.InvalidArgument;
+    if (self.runtime_buffers.projected_vocab == 0) return error.InvalidArgument;
+    if (self.runtime_buffers.projected_vocab > std.math.maxInt(u32)) return error.InvalidArgument;
     if (self.loaded.config.logits_scaling < 0.0) {
-        try self.prototype.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.prototype.projected_logits_host));
-        return argminHost(self.prototype.projected_logits_host);
+        try self.runtime_buffers.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host));
+        return argminHost(self.runtime_buffers.projected_logits_host);
     }
 
     const argmax_function = self.argmax_function orelse return error.CudaKernelUnavailable;
-    const count_u32: u32 = @intCast(self.prototype.projected_vocab);
+    const count_u32: u32 = @intCast(self.runtime_buffers.projected_vocab);
     try compute.cuda.argmax.runWithFunction(
         &self.kernel_arg_pack,
         &self.device,
         argmax_function,
-        &self.prototype.logits_dev,
+        &self.runtime_buffers.logits_dev,
         &self.argmax_index_dev,
         count_u32,
     );

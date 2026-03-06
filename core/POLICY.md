@@ -29,6 +29,7 @@ When this document says "public" without qualification, it means **API-public**.
 5. **Allocators:** Tests MUST use `std.testing.allocator`. Production code MUST accept an allocator argument (no global allocator reliance).
 6. **Defer Safety:** Never `defer free(ptr)` and then `return ptr` (Use-After-Free).
 7. **Atomic Sync:** Changes affecting the C ABI surface MUST update `_native.py` (via `zig build gen-bindings`) in the same PR.
+8. **Inference ADR Contract:** Any change under `core/src/models/**`, `core/src/inference/**`, or `core/src/compute/**` MUST read and comply with `core/src/inference/ADR.md`.
 
 ---
 

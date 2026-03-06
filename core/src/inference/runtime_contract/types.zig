@@ -193,7 +193,16 @@ pub const CompiledPlan = struct {
 
 pub const RegisterLayout = enum(u8) {
     contiguous = 0,
+    vision_row_major = 1,
+    vision_merge_block = 2,
 };
+
+pub fn isVisionRegisterLayout(layout: RegisterLayout) bool {
+    return switch (layout) {
+        .vision_row_major, .vision_merge_block => true,
+        else => false,
+    };
+}
 
 pub const PhysicalBufferSpec = struct {
     size: usize,
@@ -229,7 +238,16 @@ pub const TensorLayout = enum(u8) {
     contiguous = 0,
     strided = 1,
     backend_native = 2,
+    vision_row_major = 3,
+    vision_merge_block = 4,
 };
+
+pub fn isVisionTensorLayout(layout: TensorLayout) bool {
+    return switch (layout) {
+        .vision_row_major, .vision_merge_block => true,
+        else => false,
+    };
+}
 
 pub const TensorViewDesc = struct {
     dtype: dtype.DType,
@@ -606,17 +624,6 @@ pub fn defaultStateDescriptor(state_id: StateBlockId) StateDescriptor {
             .lifecycle = .slot_persistent,
             .runtime_kind = state_runtime_kind_mamba_cache,
         },
-    };
-}
-
-pub fn defaultOpaqueStateDescriptor(state_id: u8) StateDescriptor {
-    return .{
-        .id = state_id,
-        .size_bytes = compatibility_state_block_bytes,
-        .align_bytes = 64,
-        .zero_init = true,
-        .lifecycle = .request_scoped,
-        .runtime_kind = state_runtime_kind_none,
     };
 }
 
@@ -1026,6 +1033,34 @@ pub const ScatterParam = packed struct {
     param_kind: u8,
     image_token_id: u32,
 };
+
+fn assertParamAbiPayloadType(comptime T: type) void {
+    const info = @typeInfo(T);
+    if (info != .@"struct" or info.@"struct".layout != .@"packed") {
+        @compileError("ParamBlock payload types MUST be packed structs");
+    }
+    if ((@bitSizeOf(T) % 8) != 0) {
+        @compileError("ParamBlock payload types MUST have byte-aligned bit size");
+    }
+    if ((@bitSizeOf(T) / 8) > max_param_block_data_bytes_v1) {
+        @compileError("ParamBlock payload type exceeds max_param_block_data_bytes_v1");
+    }
+}
+
+comptime {
+    assertParamAbiPayloadType(ResidualAddParam);
+    assertParamAbiPayloadType(ScalarOpParam);
+    assertParamAbiPayloadType(AddParamScalarParam);
+    assertParamAbiPayloadType(MeanOpParam);
+    assertParamAbiPayloadType(TransposeOpParam);
+    assertParamAbiPayloadType(TriuOpParam);
+    assertParamAbiPayloadType(SdpaOpParam);
+    assertParamAbiPayloadType(ReshapeOpParam);
+    assertParamAbiPayloadType(PatchEmbedParam);
+    assertParamAbiPayloadType(SpatialMergeParam);
+    assertParamAbiPayloadType(DeepstackExtractParam);
+    assertParamAbiPayloadType(ScatterParam);
+}
 
 /// Cast raw `ParamBlock.data` to an ABI-stable packed param struct.
 ///
@@ -2592,7 +2627,14 @@ test "appendUniquePlanStateDescriptors accepts unknown descriptor ids" {
         .register_count = 1,
         .state_descs = &.{
             defaultStateDescriptor(.kv_cache),
-            defaultOpaqueStateDescriptor(99),
+            .{
+                .id = 99,
+                .size_bytes = compatibility_state_block_bytes,
+                .align_bytes = 64,
+                .zero_init = true,
+                .lifecycle = .request_scoped,
+                .runtime_kind = state_runtime_kind_none,
+            },
         },
     };
     try appendUniquePlanStateDescriptors(storage[0..], &count, &plan);
@@ -2607,7 +2649,14 @@ test "collectBuiltinStateFlags ignores unknown descriptor ids" {
         .instructions = &.{},
         .register_count = 1,
         .state_descs = &.{
-            defaultOpaqueStateDescriptor(77),
+            .{
+                .id = 77,
+                .size_bytes = compatibility_state_block_bytes,
+                .align_bytes = 64,
+                .zero_init = true,
+                .lifecycle = .request_scoped,
+                .runtime_kind = state_runtime_kind_none,
+            },
             defaultStateDescriptor(.shortconv),
         },
     };

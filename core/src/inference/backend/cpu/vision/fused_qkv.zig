@@ -172,6 +172,7 @@ pub const VisionRuntime = struct {
         );
         var vision_stage_plans = try vision_program_mod.compileVisionStagePlans(allocator, vision_program);
         errdefer vision_program_mod.deinitVisionStagePlans(allocator, &vision_stage_plans);
+        try vision_program_mod.setVisionStageHandoffLayout(&vision_stage_plans, .vision_row_major);
         spatial_merge_size = parsed_program.spatial_merge_size;
         deepstack_visual_layers = parsed_program.deepstack_visual_layers;
         deepstack_layer_count = parsed_program.deepstack_layer_count;

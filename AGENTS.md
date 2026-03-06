@@ -16,6 +16,7 @@ Before you change anything:
 * Read the nearest area policy for the files you will touch:
   * `bindings/python/` → `bindings/python/POLICY.md`
   * `core/src/` → `core/POLICY.md`
+* If you touch `core/src/models/**`, `core/src/inference/**`, or `core/src/compute/**`, read and comply with `core/src/inference/ADR.md`.
 
 Then:
 1. Confirm scope (Python / Zig / docs) and the correct entrypoints.

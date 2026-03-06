@@ -438,6 +438,11 @@ pub const VisionRuntime = struct {
         if (saw_fused_qkv and saw_split_qkv) return error.InvalidShape;
         const use_vision_rope = saw_fused_qkv;
         const token_order: TokenOrder = if (use_vision_rope) .merge_block else .row_major;
+        const handoff_layout: runtime_contract.RegisterLayout = if (token_order == .row_major)
+            .vision_row_major
+        else
+            .vision_merge_block;
+        try vision_program_mod.setVisionStageHandoffLayout(&vision_stage_plans, handoff_layout);
 
         var scratch = try initVisionScratch(
             allocator,

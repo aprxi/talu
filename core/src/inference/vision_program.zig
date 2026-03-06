@@ -132,9 +132,14 @@ fn validateVisionStageHandoff(
         if (encode_specs[encode_out_idx].dtype != scatter_specs[scatter_in_idx].dtype) {
             return error.InvalidVisionStageHandoff;
         }
-        if (encode_specs[encode_out_idx].layout != scatter_specs[scatter_in_idx].layout) {
+        const encode_layout = encode_specs[encode_out_idx].layout;
+        const scatter_layout = scatter_specs[scatter_in_idx].layout;
+        if (encode_layout != scatter_layout) {
             return error.InvalidVisionStageHandoff;
         }
+        const layout_is_supported =
+            encode_layout == .contiguous or runtime_contract.isVisionRegisterLayout(encode_layout);
+        if (!layout_is_supported) return error.InvalidVisionStageHandoff;
     }
 
     // Scatter output must be register 0 (residual) for decoder handoff.
@@ -142,6 +147,39 @@ fn validateVisionStageHandoff(
     if (runtime_contract.registerToIndex(scatter_insn.outputs[0]) != 0) {
         return error.InvalidVisionStageHandoff;
     }
+}
+
+fn visionStageHandoffRegisters(
+    vision_encode: *const runtime_contract.CompiledPlan,
+    scatter: *const runtime_contract.CompiledPlan,
+) !struct { encode_output: usize, scatter_vision_input: usize } {
+    if (vision_encode.plan.instructions.len == 0) return error.InvalidVisionProgram;
+    if (scatter.plan.instructions.len == 0) return error.InvalidVisionProgram;
+    const encode_output = runtime_contract.planFinalOutputRegister(&vision_encode.plan);
+    const scatter_insn = scatter.plan.instructions[0];
+    if (scatter_insn.inputs.len < 2) return error.InvalidVisionStageHandoff;
+    return .{
+        .encode_output = runtime_contract.registerToIndex(encode_output),
+        .scatter_vision_input = runtime_contract.registerToIndex(scatter_insn.inputs[1]),
+    };
+}
+
+pub fn setVisionStageHandoffLayout(
+    plans: *VisionStagePlans,
+    layout: runtime_contract.RegisterLayout,
+) !void {
+    if (!runtime_contract.isVisionRegisterLayout(layout)) return error.InvalidVisionStageHandoff;
+    var vision_encode = plans.plans.vision_encode orelse return error.InvalidVisionProgram;
+    var scatter = plans.plans.scatter orelse return error.InvalidVisionProgram;
+    const regs = try visionStageHandoffRegisters(&vision_encode, &scatter);
+    if (regs.encode_output >= vision_encode.register_buffer_specs.len) return error.InvalidVisionStageHandoff;
+    if (regs.scatter_vision_input >= scatter.register_buffer_specs.len) return error.InvalidVisionStageHandoff;
+
+    const encode_specs: []runtime_contract.PhysicalBufferSpec = @constCast(vision_encode.register_buffer_specs);
+    const scatter_specs: []runtime_contract.PhysicalBufferSpec = @constCast(scatter.register_buffer_specs);
+    encode_specs[regs.encode_output].layout = layout;
+    scatter_specs[regs.scatter_vision_input].layout = layout;
+    try validateVisionStageHandoff(&vision_encode, &scatter);
 }
 
 /// Compile staged vision plans from a single model-declared vision program.
@@ -306,8 +344,6 @@ test "validateVisionStageHandoff rejects mismatched dtype" {
         .state_block_id = null,
     };
 
-
-
     // Encode output is f32; scatter input is bf16 — mismatch.
     const encode_specs = [_]runtime_contract.PhysicalBufferSpec{
         .{ .size = 1, .@"align" = 64, .dtype = .f32 },
@@ -368,4 +404,32 @@ test "validateVisionStageHandoff rejects mismatched dtype" {
         .diagnostics = &.{},
     };
     try validateVisionStageHandoff(&encode_plan, &scatter_plan_ok);
+}
+
+test "setVisionStageHandoffLayout stamps explicit vision layout on stage boundary" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .patch_embed = .{ .in = .residual, .out = .norm_out } },
+        .{ .spatial_merge = .{ .in = .norm_out, .out = .branch_out, .merge_size = 2 } },
+        .{ .scatter = .{
+            .text_in = .residual,
+            .vision_in = .branch_out,
+            .out = .residual,
+            .image_token_id = 151655,
+        } },
+    };
+    var plans = try compileVisionStagePlans(std.testing.allocator, &program);
+    defer deinitVisionStagePlans(std.testing.allocator, &plans);
+
+    try setVisionStageHandoffLayout(&plans, .vision_merge_block);
+    const encode = plans.vision_encode();
+    const scatter = plans.scatter();
+    const encode_out = runtime_contract.registerToIndex(runtime_contract.planFinalOutputRegister(&encode.plan));
+    const scatter_in = runtime_contract.registerToIndex(scatter.plan.instructions[0].inputs[1]);
+    try std.testing.expectEqual(runtime_contract.RegisterLayout.vision_merge_block, encode.register_buffer_specs[encode_out].layout);
+    try std.testing.expectEqual(runtime_contract.RegisterLayout.vision_merge_block, scatter.register_buffer_specs[scatter_in].layout);
+
+    try std.testing.expectError(
+        error.InvalidVisionStageHandoff,
+        setVisionStageHandoffLayout(&plans, .contiguous),
+    );
 }
