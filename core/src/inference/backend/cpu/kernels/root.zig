@@ -10,6 +10,7 @@ pub const support = .{
     .embedding = true,
     .ffn = true,
     .fused_attention = true,
+    .gated_delta = true,
     .kv_cache = true,
     .mamba = true,
     .mla_attention = true,
@@ -27,6 +28,7 @@ pub const attention = @import("attention.zig");
 pub const describe_fmt = @import("describe_fmt.zig");
 pub const embedding = @import("embedding.zig");
 pub const ffn = @import("ffn.zig");
+pub const gated_delta = @import("gated_delta.zig");
 pub const fused_attention = attention;
 pub const mamba = @import("mamba.zig");
 pub const mla_attention = @import("mla_attention.zig");
@@ -71,6 +73,13 @@ pub const MambaConfig = mamba_kernels.MambaConfig;
 pub const MambaWeights = mamba_kernels.MambaWeights;
 pub const MambaState = mamba_kernels.MambaState;
 pub const MambaScratch = mamba_kernels.MambaScratch;
+
+const gated_delta_kernels = @import("gated_delta.zig");
+pub const GatedDeltaKernel = gated_delta_kernels.GatedDeltaKernel;
+pub const GatedDeltaConfig = gated_delta_kernels.GatedDeltaConfig;
+pub const GatedDeltaWeights = gated_delta_kernels.GatedDeltaWeights;
+pub const GatedDeltaState = gated_delta_kernels.GatedDeltaState;
+pub const GatedDeltaScratch = gated_delta_kernels.GatedDeltaScratch;
 
 // ShortConv kernel exports (for heterogeneous models)
 const shortconv_kernels = @import("shortconv.zig");

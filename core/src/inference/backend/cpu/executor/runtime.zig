@@ -17,6 +17,7 @@ const mla = @import("../kernels/mla_attention.zig");
 const ffn = @import("../kernels/ffn.zig");
 const moe = @import("../kernels/moe.zig");
 const mamba = @import("../kernels/mamba.zig");
+const gated_delta = @import("../kernels/gated_delta.zig");
 const shortconv = @import("../kernels/shortconv.zig");
 const norm = @import("../kernels/norm.zig");
 const kv_cache = @import("../kernels/kv_cache.zig");
@@ -32,6 +33,8 @@ pub const FfnScratch = ffn.FfnScratch;
 pub const MoEScratch = moe.MoEScratch;
 pub const MambaState = mamba.MambaState;
 pub const MambaScratch = mamba.MambaScratch;
+pub const GatedDeltaState = gated_delta.GatedDeltaState;
+pub const GatedDeltaScratch = gated_delta.GatedDeltaScratch;
 pub const ShortConvState = shortconv.ShortConvState;
 pub const ShortConvScratch = shortconv.ShortConvScratch;
 const BatchedKVCache = kv_cache.BatchedKVCache;
@@ -46,6 +49,8 @@ pub const SlotContextError = error{
     MissingMlaScratch,
     MissingMambaState,
     MissingMambaScratch,
+    MissingGatedDeltaState,
+    MissingGatedDeltaScratch,
     MissingShortConvState,
     MissingShortConvScratch,
     MissingBatchedCache,
@@ -55,6 +60,7 @@ pub const SlotPersistentState = struct {
     attn_cache: ?AttnCache = null,
     mla_cache: ?MLACache = null,
     mamba_state: ?MambaState = null,
+    gated_delta_state: ?gated_delta.GatedDeltaState = null,
     shortconv_state: ?ShortConvState = null,
 };
 
@@ -62,6 +68,7 @@ pub const SharedPersistentState = struct {
     batched_cache: ?*BatchedKVCache = null,
     mla_scratch: ?*MLATemp = null,
     mamba_scratch: ?*MambaScratch = null,
+    gated_delta_scratch: ?*gated_delta.GatedDeltaScratch = null,
     shortconv_scratch: ?*ShortConvScratch = null,
 };
 
@@ -95,6 +102,7 @@ pub const ScratchBuffer = struct {
 
     // Shared recurrent scratch for heterogeneous models.
     mamba_scratch: ?mamba.MambaScratch = null,
+    gated_delta_scratch: ?gated_delta.GatedDeltaScratch = null,
 
     shortconv_scratch: ?shortconv.ShortConvScratch = null,
 
@@ -276,6 +284,7 @@ pub const ScratchBuffer = struct {
             if (slot_state.attn_cache) |*cache| cache.deinit(self.allocator);
             if (slot_state.mla_cache) |*cache| cache.deinit(self.allocator);
             if (slot_state.mamba_state) |*state| state.deinit();
+            if (slot_state.gated_delta_state) |*state| state.deinit();
             if (slot_state.shortconv_state) |*state| state.deinit();
         }
         if (self.slot_states.len > 0) {
@@ -291,6 +300,11 @@ pub const ScratchBuffer = struct {
             self.mamba_scratch = null;
         }
 
+        if (self.gated_delta_scratch) |*scratch| {
+            scratch.deinit();
+            self.gated_delta_scratch = null;
+        }
+
         if (self.mla_scratch) |*scratch| {
             scratch.deinit(self.allocator);
             self.mla_scratch = null;
@@ -302,6 +316,7 @@ pub const ScratchBuffer = struct {
             if (slot_state.attn_cache) |*cache| cache.resetCache();
             if (slot_state.mla_cache) |*cache| cache.resetCache();
             if (slot_state.mamba_state) |*state| state.reset();
+            if (slot_state.gated_delta_state) |*state| state.reset();
             if (slot_state.shortconv_state) |*state| state.reset();
         }
     }
@@ -347,6 +362,50 @@ pub const ScratchBuffer = struct {
     /// Get shared Mamba scratch buffer.
     pub fn getMambaScratch(self: *ScratchBuffer) ?*mamba.MambaScratch {
         if (self.mamba_scratch) |*scratch| return scratch;
+        return null;
+    }
+
+    pub fn initGatedDelta(
+        self: *ScratchBuffer,
+        layer_indices: []const usize,
+        config: gated_delta.GatedDeltaConfig,
+    ) !void {
+        if (layer_indices.len == 0) return;
+
+        for (layer_indices) |layer_idx| {
+            if (layer_idx >= self.layer_count) return error.InvalidLayerIndex;
+            for (0..self.slot_count) |slot_index| {
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse return error.InvalidLayerIndex;
+                if (self.slot_states[idx].gated_delta_state != null) return error.AlreadyInitialized;
+            }
+        }
+        var initialized_slots: usize = 0;
+        errdefer {
+            const initialized_total = initialized_slots;
+            for (0..initialized_total) |flat_idx| {
+                const layer_offset = flat_idx % layer_indices.len;
+                const slot_index = flat_idx / layer_indices.len;
+                const layer_idx = layer_indices[layer_offset];
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse continue;
+                if (self.slot_states[idx].gated_delta_state) |*state| {
+                    state.deinit();
+                    self.slot_states[idx].gated_delta_state = null;
+                }
+            }
+        }
+        for (0..self.slot_count) |slot_index| {
+            for (layer_indices) |layer_idx| {
+                const idx = self.slotLayerIndex(slot_index, layer_idx) orelse return error.InvalidLayerIndex;
+                self.slot_states[idx].gated_delta_state = try gated_delta.GatedDeltaState.init(self.allocator, 1, config);
+                initialized_slots += 1;
+            }
+        }
+
+        self.gated_delta_scratch = try gated_delta.GatedDeltaScratch.init(self.allocator, config);
+    }
+
+    pub fn getGatedDeltaScratch(self: *ScratchBuffer) ?*gated_delta.GatedDeltaScratch {
+        if (self.gated_delta_scratch) |*scratch| return scratch;
         return null;
     }
 
@@ -474,6 +533,7 @@ pub const CpuKernel = union(enum) {
     attention: *const attn.MultiHeadAttention,
     mla_attention: *const mla.MLAttention,
     mamba: *const mamba.MambaKernel,
+    gated_delta: *const gated_delta.GatedDeltaKernel,
     shortconv: *const shortconv.ShortConvKernel,
     swiglu: *const ffn.SwiGLU,
     moe: *const moe.MoEFFN,
@@ -483,6 +543,7 @@ pub const CpuKernel = union(enum) {
         return switch (self) {
             .attention, .mla_attention => .multihead_attention,
             .mamba => .mamba_mixer,
+            .gated_delta => .gated_delta_net,
             .shortconv => .shortconv,
             .swiglu => .mlp,
             .moe => .moe,
@@ -505,6 +566,10 @@ pub const CpuKernel = union(enum) {
                 const mamba_scratch = shared_state.mamba_scratch orelse return SlotContextError.MissingMambaScratch;
                 try k.forward(input, output, mamba_state, mamba_scratch, &ctx.scratch.matmul_scratch);
             } else return SlotContextError.MissingMambaState,
+            .gated_delta => |k| if (slot_state.gated_delta_state) |*gated_delta_state| {
+                const gated_delta_scratch = shared_state.gated_delta_scratch orelse return SlotContextError.MissingGatedDeltaScratch;
+                try k.forward(input, output, gated_delta_state, gated_delta_scratch, &ctx.scratch.matmul_scratch);
+            } else return SlotContextError.MissingGatedDeltaState,
             .shortconv => |k| if (slot_state.shortconv_state) |*shortconv_state| {
                 const shortconv_scratch = shared_state.shortconv_scratch orelse return SlotContextError.MissingShortConvScratch;
                 try k.forward(input, output, shortconv_state, shortconv_scratch, &ctx.scratch.matmul_scratch);
@@ -537,6 +602,10 @@ pub const CpuKernel = union(enum) {
                 const mamba_scratch = shared_state.mamba_scratch orelse return SlotContextError.MissingMambaScratch;
                 try k.forward(input, output, mamba_state, mamba_scratch, &ctx.scratch.matmul_scratch);
             } else return SlotContextError.MissingMambaState,
+            .gated_delta => |k| if (slot_state.gated_delta_state) |*gated_delta_state| {
+                const gated_delta_scratch = shared_state.gated_delta_scratch orelse return SlotContextError.MissingGatedDeltaScratch;
+                try k.forward(input, output, gated_delta_state, gated_delta_scratch, &ctx.scratch.matmul_scratch);
+            } else return SlotContextError.MissingGatedDeltaState,
             .shortconv => |k| if (slot_state.shortconv_state) |*shortconv_state| {
                 const shortconv_scratch = shared_state.shortconv_scratch orelse return SlotContextError.MissingShortConvScratch;
                 try k.forward(input, output, shortconv_state, shortconv_scratch, &ctx.scratch.matmul_scratch);
@@ -570,7 +639,7 @@ pub const CpuKernel = union(enum) {
             .swiglu => |k| try k.forward(input, output, &ctx.scratch.ffn_scratch, &ctx.scratch.matmul_scratch),
             .moe => |k| try k.forward(input, output, &ctx.scratch.moe_scratch, &ctx.scratch.matmul_scratch),
             .norm => |k| k.forward(input, output),
-            .mla_attention, .mamba, .shortconv => return BatchedKernelError.UnsupportedBatchedDecodeKernel,
+            .mla_attention, .mamba, .gated_delta, .shortconv => return BatchedKernelError.UnsupportedBatchedDecodeKernel,
         }
     }
 };

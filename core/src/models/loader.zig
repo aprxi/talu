@@ -112,6 +112,7 @@ pub fn applyRuntimeArchitectureMetadata(
     loaded_model.runtime.architecture_id = runtime_architecture.name;
     loaded_model.runtime.has_moe = runtime_architecture.has_moe;
     loaded_model.runtime.has_mamba = runtime_architecture.has_mamba;
+    loaded_model.runtime.has_gated_delta = runtime_architecture.has_gated_delta;
     loaded_model.runtime.has_shortconv = runtime_architecture.has_shortconv;
     loaded_model.runtime.has_mla = runtime_architecture.has_mla;
     loaded_model.runtime.explicit_qk_norm_ops = runtime_architecture.explicit_qk_norm_ops;

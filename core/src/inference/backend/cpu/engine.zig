@@ -393,6 +393,8 @@ pub const FusedCpuBackend = struct {
         defer mla_layer_indices.deinit(allocator);
         var mamba_layer_indices = std.ArrayListUnmanaged(usize){};
         defer mamba_layer_indices.deinit(allocator);
+        var gated_delta_layer_indices = std.ArrayListUnmanaged(usize){};
+        defer gated_delta_layer_indices.deinit(allocator);
         var shortconv_layer_indices = std.ArrayListUnmanaged(usize){};
         defer shortconv_layer_indices.deinit(allocator);
         var state_descriptors_storage: [runtime_contract.max_state_descriptors]runtime_contract.StateDescriptor = undefined;
@@ -442,6 +444,25 @@ pub const FusedCpuBackend = struct {
                 .mamba_layers = mamba_layer_indices.items.len,
                 .attention_layers = @as(usize, layer_total) - mamba_layer_indices.items.len,
             });
+        }
+
+        var gated_delta_config: ?kernels.GatedDeltaConfig = null;
+        for (cpu_block_set, 0..) |*block, layer_idx| {
+            const kernel = block.getGatedDeltaKernel() orelse continue;
+            try gated_delta_layer_indices.append(allocator, layer_idx);
+            if (gated_delta_config) |expected| {
+                if (!std.meta.eql(expected, kernel.config)) {
+                    return error.InvalidStateDescriptorBinding;
+                }
+            } else {
+                gated_delta_config = kernel.config;
+            }
+        }
+        if (gated_delta_layer_indices.items.len > 0) {
+            try scratch.initGatedDelta(
+                gated_delta_layer_indices.items,
+                gated_delta_config orelse return error.InvalidStateDescriptorBinding,
+            );
         }
 
         var shortconv_config: ?kernels.ShortConvConfig = null;
@@ -592,7 +613,7 @@ pub const FusedCpuBackend = struct {
     /// Free a slot when sequence completes.
     pub fn freeSlot(self: *FusedCpuBackend, slot_index: usize) void {
         self.kv_cache.freeSlot(slot_index);
-        self.resetScratchSlotStates(slot_index, true, true, true);
+        self.resetScratchSlotStates(slot_index, true, true, true, true);
         self.slot_rope_position_deltas[slot_index] = 0;
         if (slot_index < self.slot_state_bindings.len) {
             self.slot_state_bindings[slot_index].reset();
@@ -608,7 +629,7 @@ pub const FusedCpuBackend = struct {
                 layered_cache.resetSlot(slot_index);
             } else |_| {}
         }
-        self.resetScratchSlotStates(slot_index, true, true, true);
+        self.resetScratchSlotStates(slot_index, true, true, true, true);
         self.slot_rope_position_deltas[slot_index] = 0;
     }
 
@@ -687,6 +708,7 @@ pub const FusedCpuBackend = struct {
         slot_index: usize,
         reset_mla: bool,
         reset_mamba: bool,
+        reset_gated_delta: bool,
         reset_shortconv: bool,
     ) void {
         for (0..self.blocks.len) |layer_idx| {
@@ -696,6 +718,9 @@ pub const FusedCpuBackend = struct {
             }
             if (reset_mamba) {
                 if (slot_state.mamba_state) |*mamba_state| mamba_state.reset();
+            }
+            if (reset_gated_delta) {
+                if (slot_state.gated_delta_state) |*gated_delta_state| gated_delta_state.reset();
             }
             if (reset_shortconv) {
                 if (slot_state.shortconv_state) |*shortconv_state| shortconv_state.reset();

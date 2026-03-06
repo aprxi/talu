@@ -242,6 +242,115 @@ pub fn maybeConcatGateUpWeights(allocator: std.mem.Allocator, gate: Tensor, up: 
     return tensor.Tensor.view2DSlice(concat_buf, rows, total_cols);
 }
 
+const MatrixShape = struct { rows: usize, cols: usize };
+
+fn requireMatrixShape(weight: *const Tensor) !MatrixShape {
+    if (weight.n_dims != 2) return error.InvalidShape;
+    const rows: usize = @intCast(weight.shape[0]);
+    const cols: usize = @intCast(weight.shape[1]);
+    if (rows == 0 or cols == 0) return error.InvalidShape;
+    return .{ .rows = rows, .cols = cols };
+}
+
+pub fn buildGatedDeltaSplitInProj(
+    allocator: std.mem.Allocator,
+    in_proj_qkv: *const Tensor,
+    in_proj_z: *const Tensor,
+    in_proj_b: *const Tensor,
+    in_proj_a: ?*const Tensor,
+) !*const Tensor {
+    const qkv_shape = try requireMatrixShape(in_proj_qkv);
+    const z_shape = try requireMatrixShape(in_proj_z);
+    const b_shape = try requireMatrixShape(in_proj_b);
+    var a_shape: ?MatrixShape = null;
+    if (in_proj_a) |a| {
+        const s = try requireMatrixShape(a);
+        a_shape = s;
+        if (s.cols != z_shape.cols) return error.InvalidShape;
+        if (s.rows != b_shape.rows) return error.InvalidShape;
+    }
+    if (z_shape.cols != qkv_shape.cols or z_shape.cols != b_shape.cols) return error.InvalidShape;
+    if (in_proj_z.dtype != in_proj_qkv.dtype or in_proj_z.dtype != in_proj_b.dtype) return error.InvalidDType;
+    if (in_proj_a) |a| {
+        if (a.dtype != in_proj_z.dtype) return error.InvalidDType;
+    }
+    const element_bytes = in_proj_z.dtype.elementSize();
+    const qkv_bytes = in_proj_qkv.data();
+    const z_bytes = in_proj_z.data();
+    const b_bytes = in_proj_b.data();
+    const a_bytes = if (in_proj_a) |a| a.data() else &.{};
+
+    const same_rows = qkv_shape.rows == z_shape.rows and qkv_shape.rows == b_shape.rows and
+        (a_shape == null or qkv_shape.rows == a_shape.?.rows);
+    const same_cols = qkv_shape.cols == z_shape.cols and qkv_shape.cols == b_shape.cols and
+        (a_shape == null or qkv_shape.cols == a_shape.?.cols);
+
+    if (!same_rows and !same_cols) return error.InvalidShape;
+
+    if (same_rows) {
+        const rows = qkv_shape.rows;
+        const cols = qkv_shape.cols + z_shape.cols + b_shape.cols + if (a_shape != null) a_shape.?.cols else 0;
+        const qkv_row_bytes = qkv_shape.cols * element_bytes;
+        const z_row_bytes = z_shape.cols * element_bytes;
+        const b_row_bytes = b_shape.cols * element_bytes;
+        const a_row_bytes: usize = if (a_shape != null) a_shape.?.cols * element_bytes else 0;
+        const out_row_bytes = cols * element_bytes;
+
+        if (qkv_bytes.len != rows * qkv_row_bytes or z_bytes.len != rows * z_row_bytes or b_bytes.len != rows * b_row_bytes) {
+            return error.InvalidShape;
+        }
+        if (a_shape != null and a_bytes.len != rows * a_row_bytes) return error.InvalidShape;
+
+        const fused = try Tensor.init(allocator, &.{ @intCast(rows), @intCast(cols) }, in_proj_z.dtype, tensor.Device.cpu());
+        const dst = fused.data();
+        if (dst.len != rows * out_row_bytes) return error.InvalidShape;
+
+        for (0..rows) |row_idx| {
+            const dst_row = dst[row_idx * out_row_bytes ..][0..out_row_bytes];
+            const qkv_row = qkv_bytes[row_idx * qkv_row_bytes ..][0..qkv_row_bytes];
+            const z_row = z_bytes[row_idx * z_row_bytes ..][0..z_row_bytes];
+            const b_row = b_bytes[row_idx * b_row_bytes ..][0..b_row_bytes];
+            const a_row = if (a_row_bytes != 0)
+                a_bytes[row_idx * a_row_bytes ..][0..a_row_bytes]
+            else
+                &.{};
+
+            var offset: usize = 0;
+            @memcpy(dst_row[offset .. offset + qkv_row_bytes], qkv_row);
+            offset += qkv_row_bytes;
+            @memcpy(dst_row[offset .. offset + z_row_bytes], z_row);
+            offset += z_row_bytes;
+            @memcpy(dst_row[offset .. offset + b_row_bytes], b_row);
+            offset += b_row_bytes;
+            if (a_row_bytes != 0) @memcpy(dst_row[offset .. offset + a_row_bytes], a_row);
+        }
+        return fused;
+    }
+
+    const cols = qkv_shape.cols;
+    const rows = qkv_shape.rows + z_shape.rows + b_shape.rows + if (a_shape != null) a_shape.?.rows else 0;
+    const row_bytes = cols * element_bytes;
+
+    if (qkv_bytes.len != qkv_shape.rows * row_bytes or z_bytes.len != z_shape.rows * row_bytes or b_bytes.len != b_shape.rows * row_bytes) {
+        return error.InvalidShape;
+    }
+    if (a_shape != null and a_bytes.len != a_shape.?.rows * row_bytes) return error.InvalidShape;
+
+    const fused = try Tensor.init(allocator, &.{ @intCast(rows), @intCast(cols) }, in_proj_z.dtype, tensor.Device.cpu());
+    const dst = fused.data();
+    if (dst.len != rows * row_bytes) return error.InvalidShape;
+
+    var dst_offset: usize = 0;
+    @memcpy(dst[dst_offset .. dst_offset + qkv_bytes.len], qkv_bytes);
+    dst_offset += qkv_bytes.len;
+    @memcpy(dst[dst_offset .. dst_offset + z_bytes.len], z_bytes);
+    dst_offset += z_bytes.len;
+    @memcpy(dst[dst_offset .. dst_offset + b_bytes.len], b_bytes);
+    dst_offset += b_bytes.len;
+    if (a_bytes.len != 0) @memcpy(dst[dst_offset .. dst_offset + a_bytes.len], a_bytes);
+    return fused;
+}
+
 pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTensors, name: []const u8, expected_in: usize, config: ModelConfig) !Tensor {
     _ = config; // Not used currently - we use expected_in for disambiguation
     var weight_tensor = try st.getTensor(name, null);
@@ -762,6 +871,26 @@ test "maybeConcatGateUpWeights returns null for non-f32" {
 
     const result = maybeConcatGateUpWeights(allocator, gate, up);
     try std.testing.expect(result == null);
+}
+
+test "buildGatedDeltaSplitInProj concatenates z qkv dt rows" {
+    const allocator = std.testing.allocator;
+
+    var z_data = [_]f32{ 1, 2, 3, 4 };
+    var qkv_data = [_]f32{ 5, 6, 7, 8, 9, 10 };
+    var dt_data = [_]f32{ 11, 12 };
+
+    var z = Tensor.view2DSlice(z_data[0..], 2, 2);
+    var qkv = Tensor.view2DSlice(qkv_data[0..], 3, 2);
+    var dt = Tensor.view2DSlice(dt_data[0..], 1, 2);
+
+    const fused = try buildGatedDeltaSplitInProj(allocator, &z, &qkv, &dt, null);
+    defer @constCast(fused).deinit(allocator);
+
+    try std.testing.expectEqual(@as(i32, 2), fused.n_dims);
+    try std.testing.expectEqual(@as(i64, 6), fused.shape[0]);
+    try std.testing.expectEqual(@as(i64, 2), fused.shape[1]);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, fused.asSlice(f32));
 }
 
 test "orientWeightF32 returns 1D tensor unchanged" {

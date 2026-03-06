@@ -103,7 +103,9 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
                 } else {
                     if (block.q_proj == null or block.k_proj == null or block.v_proj == null)
                         return reporter.reportError("layer {} missing q/k/v weights without fused qkv", .{layer_idx});
-                    if (!is2DShapeMatch(block.q_proj.?, d_model, q_out))
+                    const q_proj_matches_standard = is2DShapeMatch(block.q_proj.?, d_model, q_out);
+                    const q_proj_matches_gated = is2DShapeMatch(block.q_proj.?, d_model, q_out * 2);
+                    if (!q_proj_matches_standard and !q_proj_matches_gated)
                         return reporter.reportError("layer {} q_proj shape mismatch (shape=[{},{}], expected=[{},{}])", .{
                             layer_idx, block.q_proj.?.shape[0], block.q_proj.?.shape[1], d_model, q_out,
                         });
@@ -226,6 +228,72 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
                         layer_idx, block.ln1_weight.n_dims, block.ln1_weight.shape[0], d_model,
                     });
             },
+            .gated_delta => |block| {
+                if (!isVectorShape(block.ln1_weight, d_model))
+                    return reporter.reportError("layer {} ln1 shape mismatch (n_dims={}, shape0={}, expected={})", .{
+                        layer_idx, block.ln1_weight.n_dims, block.ln1_weight.shape[0], d_model,
+                    });
+                if (block.ln2_weight) |ln2| {
+                    if (!isVectorShape(ln2, d_model))
+                        return reporter.reportError("layer {} ln2 shape mismatch (n_dims={}, shape0={}, expected={})", .{
+                            layer_idx, ln2.n_dims, ln2.shape[0], d_model,
+                        });
+                }
+
+                const d_inner: usize = @intCast(block.config.n_heads * block.config.d_head);
+                const proj_out = (4 * d_inner) + (2 * @as(usize, @intCast(block.config.n_heads)));
+                const qkv_out = 3 * d_inner;
+                if (!isProjected2DShapeMatch(block.weights.in_proj, d_model, proj_out))
+                    return reporter.reportError("layer {} gated_delta in_proj shape mismatch (shape=[{},{}], expected d_model={} proj_out={})", .{
+                        layer_idx, block.weights.in_proj.shape[0], block.weights.in_proj.shape[1], d_model, proj_out,
+                    });
+                if (!is2DShapeMatch(block.weights.out_proj, d_inner, d_model))
+                    return reporter.reportError("layer {} gated_delta out_proj shape mismatch (shape=[{},{}], expected=[{},{}])", .{
+                        layer_idx, block.weights.out_proj.shape[0], block.weights.out_proj.shape[1], d_inner, d_model,
+                    });
+                if (!isConvWeightShapeMatch(block.weights.conv1d_weight, qkv_out, @intCast(block.config.d_conv)))
+                    return reporter.reportError("layer {} gated_delta conv1d_weight shape mismatch", .{layer_idx});
+                if (block.weights.conv1d_bias) |bias| {
+                    if (!isVectorShape(bias, qkv_out))
+                        return reporter.reportError("layer {} gated_delta conv1d_bias shape mismatch", .{layer_idx});
+                }
+                if (!isVectorShape(block.weights.A_log, @intCast(block.config.n_heads)))
+                    return reporter.reportError("layer {} gated_delta A_log shape mismatch", .{layer_idx});
+                if (block.weights.dt_bias) |dt_bias| {
+                    if (!isVectorShape(dt_bias, @intCast(block.config.n_heads)))
+                        return reporter.reportError("layer {} gated_delta dt_bias shape mismatch", .{layer_idx});
+                }
+                if (block.weights.norm_weight) |norm_weight| {
+                    const n_head_len: usize = @intCast(block.config.d_head);
+                    if (!isVectorShape(norm_weight, d_inner) and !isVectorShape(norm_weight, n_head_len))
+                        return reporter.reportError("layer {} gated_delta norm_weight shape mismatch", .{layer_idx});
+                }
+                if (block.fused_gate_up) |fused| {
+                    if (!is2DShapeMatch(&fused.gate_up.?, d_model, d_ff * 2))
+                        return reporter.reportError("layer {} gate_up shape mismatch (shape=[{},{}], expected=[{},{}])", .{
+                            layer_idx, fused.gate_up.?.shape[0], fused.gate_up.?.shape[1], d_model, d_ff * 2,
+                        });
+                } else {
+                    if (block.w1) |w1| {
+                        if (!is2DShapeMatch(w1, d_model, d_ff))
+                            return reporter.reportError("layer {} w1 shape mismatch (shape=[{},{}], expected=[{},{}])", .{
+                                layer_idx, w1.shape[0], w1.shape[1], d_model, d_ff,
+                            });
+                    }
+                    if (block.w2) |w2| {
+                        if (!is2DShapeMatch(w2, d_ff, d_model))
+                            return reporter.reportError("layer {} w2 shape mismatch (shape=[{},{}], expected=[{},{}])", .{
+                                layer_idx, w2.shape[0], w2.shape[1], d_ff, d_model,
+                            });
+                    }
+                    if (block.w3) |w3| {
+                        if (!is2DShapeMatch(w3, d_model, d_ff))
+                            return reporter.reportError("layer {} w3 shape mismatch (shape=[{},{}], expected=[{},{}])", .{
+                                layer_idx, w3.shape[0], w3.shape[1], d_model, d_ff,
+                            });
+                    }
+                }
+            },
         }
     }
 
@@ -241,6 +309,26 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
 
 fn is2DShapeMatch(tensor_view: *const tensor.Tensor, dim_a: usize, dim_b: usize) bool {
     return tensor_view.n_dims == 2 and ((tensor_view.shape[0] == dim_a and tensor_view.shape[1] == dim_b) or (tensor_view.shape[0] == dim_b and tensor_view.shape[1] == dim_a));
+}
+
+fn isProjected2DShapeMatch(tensor_view: *const tensor.Tensor, d_model: usize, out_dim: usize) bool {
+    return tensor_view.n_dims == 2 and
+        ((tensor_view.shape[0] == d_model and tensor_view.shape[1] == out_dim) or
+            (tensor_view.shape[0] == out_dim and tensor_view.shape[1] == d_model));
+}
+
+fn tensorNumel(tensor_view: *const tensor.Tensor) usize {
+    var total: usize = 1;
+    var idx: usize = 0;
+    while (idx < @as(usize, @intCast(tensor_view.n_dims))) : (idx += 1) {
+        total *= @intCast(tensor_view.shape[idx]);
+    }
+    return total;
+}
+
+fn isConvWeightShapeMatch(tensor_view: *const tensor.Tensor, channels: usize, d_conv: usize) bool {
+    if (tensor_view.n_dims != 2 and tensor_view.n_dims != 3) return false;
+    return tensorNumel(tensor_view) == channels * d_conv;
 }
 
 fn isVectorShape(tensor_view: *const tensor.Tensor, len: usize) bool {
@@ -336,6 +424,29 @@ fn legacyBlockToLayer(
                 .map_context = .{
                     .kernel_meta = .{},
                     .mamba_config = block.config,
+                    .shortconv_config = null,
+                    .allocator = null,
+                },
+            };
+        },
+        .gated_delta => |block| {
+            try map.put(allocator, "input_layernorm.weight", block.ln1_weight);
+            try map.put(allocator, "linear_attn.in_proj_qkv.weight", block.weights.in_proj);
+            try map.put(allocator, "linear_attn.conv1d.weight", block.weights.conv1d_weight);
+            try map.put(allocator, "linear_attn.A_log", block.weights.A_log);
+            try map.put(allocator, "linear_attn.out_proj.weight", block.weights.out_proj);
+            if (block.ln2_weight) |ln2| try map.put(allocator, "post_attention_layernorm.weight", ln2);
+            if (block.weights.conv1d_bias) |b| try map.put(allocator, "linear_attn.conv1d.bias", b);
+            if (block.weights.dt_bias) |b| try map.put(allocator, "linear_attn.dt_bias", b);
+            if (block.weights.norm_weight) |w| try map.put(allocator, "linear_attn.norm.weight", w);
+
+            return .{
+                .block_type = .gated_delta,
+                .weight_map = map,
+                .map_context = .{
+                    .kernel_meta = .{},
+                    .mamba_config = null,
+                    .gated_delta_config = block.config,
                     .shortconv_config = null,
                     .allocator = null,
                 },

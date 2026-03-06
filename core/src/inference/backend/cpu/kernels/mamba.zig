@@ -26,6 +26,7 @@ const log = @import("../../../../log.zig");
 const compute = @import("../../../../compute/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
+const cpu_activation = compute.cpu.activation;
 const cpu_norm = compute.cpu.normalization;
 const cpu_state_space = compute.cpu.recurrence.state_space;
 const ssm_scan_mod = compute.cpu.simd.ssm_scan;
@@ -155,6 +156,17 @@ pub const MambaKernel = struct {
         };
     }
 
+    fn projectionOutputDim(weight: *const Tensor, d_model: usize) !usize {
+        if (weight.n_dims != 2) return error.InvalidShape;
+        const dim0: usize = @intCast(weight.shape[0]);
+        const dim1: usize = @intCast(weight.shape[1]);
+        if (dim0 == 0 or dim1 == 0) return error.InvalidShape;
+        if (dim0 == d_model and dim1 != d_model) return dim1;
+        if (dim1 == d_model and dim0 != d_model) return dim0;
+        if (dim0 == d_model and dim1 == d_model) return d_model;
+        return dim0;
+    }
+
     /// Forward pass for Mamba2 layer (single token, autoregressive).
     ///
     /// This implements the Mamba2 SSD algorithm for single-token inference.
@@ -197,10 +209,13 @@ pub const MambaKernel = struct {
         else
             1;
 
-        // Input projection output size: 2*d_inner + 2*n_groups*d_state + n_heads
-        // Splits into: z (d_inner), xBC (d_inner + 2*n_groups*d_state), dt (n_heads)
+        // Input projection output size:
+        // base: 2*d_inner + 2*n_groups*d_state + n_heads.
         const xBC_len = d_inner + 2 * n_groups * d_state;
-        const proj_len = 2 * d_inner + 2 * n_groups * d_state + n_heads;
+        const base_proj_len = 2 * d_inner + 2 * n_groups * d_state + n_heads;
+        const weight_proj_len = try projectionOutputDim(w.in_proj, d_model);
+        if (weight_proj_len < base_proj_len) return error.InvalidShape;
+        const proj_len = base_proj_len;
 
         // Get scratch buffers (reused for each token)
         const proj_out = scratch.getProjection(proj_len);
@@ -239,6 +254,19 @@ pub const MambaKernel = struct {
             const z = proj_out[0..d_inner];
             const xBC = proj_out[d_inner .. d_inner + xBC_len];
             const dt_raw = proj_out[d_inner + xBC_len ..][0..n_heads];
+            if (trace.isEnabled()) {
+                trace.emit(
+                    .conv_in_proj,
+                    self.layer_idx,
+                    0,
+                    @intCast(t),
+                    @ptrCast(xBC.ptr),
+                    .f32,
+                    .{ 1, 1, @intCast(xBC_len), 0 },
+                    3,
+                    null,
+                );
+            }
 
             // 2. Causal depthwise convolution with state update over xBC in-place.
             try cpu_conv1d.stepDepthwiseState(xBC, conv_state, conv_weight, conv_bias, xBC_len, d_conv);
@@ -336,7 +364,6 @@ pub const MambaScratch = struct {
         const d_state: usize = config.d_state;
         const n_heads: usize = config.n_heads;
 
-        // Projection output: 2*d_inner + 2*n_groups*d_state + n_heads
         const proj_len = 2 * d_inner + 2 * n_groups * d_state + n_heads;
         const conv_len = d_inner;
         const ssm_len = d_inner;

@@ -134,16 +134,19 @@ pub const StateBlockId = enum(u8) {
     kv_cache = 0,
     shortconv = 1,
     mamba = 2,
+    gated_delta = 3,
 };
 
 pub const kv_cache_state_id: u8 = @intFromEnum(StateBlockId.kv_cache);
 pub const shortconv_state_id: u8 = @intFromEnum(StateBlockId.shortconv);
 pub const mamba_state_id: u8 = @intFromEnum(StateBlockId.mamba);
+pub const gated_delta_state_id: u8 = @intFromEnum(StateBlockId.gated_delta);
 
 pub const state_runtime_kind_none: u8 = 0;
 pub const state_runtime_kind_kv_cache: u8 = 1;
 pub const state_runtime_kind_shortconv_cache: u8 = 2;
 pub const state_runtime_kind_mamba_cache: u8 = 3;
+pub const state_runtime_kind_gated_delta_cache: u8 = 4;
 
 pub const Instruction = struct {
     opcode: Opcode,
@@ -533,6 +536,15 @@ pub fn expectedKernelWeightSlots(opcode: Opcode) []const []const u8 {
             "gate_up",
             "down_proj",
         },
+        .gated_delta_net => &.{
+            "in_proj",
+            "conv_weight",
+            "a_log",
+            "out_proj",
+            "conv_bias",
+            "dt_bias",
+            "norm_weight",
+        },
         .shortconv => &.{ "in_proj", "conv_weight", "out_proj", "conv_bias" },
         .mla_attention => &.{ "q_a_proj", "q_a_norm", "q_b_proj", "kv_a_proj", "kv_a_norm", "kv_b_proj", "o_proj" },
         .embedding => &.{"embedding"},
@@ -578,9 +590,12 @@ pub fn parseKernelWeightBindingName(name: []const u8) !KernelWeightBindingName {
 }
 
 pub fn blockKindSupportsState(kind: op_types.BlockKind, state_id: u8) bool {
-    _ = kind;
-    _ = state_id;
-    return true;
+    return switch (kind) {
+        .attention_mlp => state_id == kv_cache_state_id,
+        .shortconv => state_id == shortconv_state_id,
+        .mamba => state_id == mamba_state_id,
+        .gated_delta => state_id == gated_delta_state_id,
+    };
 }
 
 pub const LayerProgramStateMismatch = struct {
@@ -593,8 +608,21 @@ pub fn firstLayerProgramStateMismatch(
     program: []const layer_ops.LayerOp,
     kind: op_types.BlockKind,
 ) ?LayerProgramStateMismatch {
-    _ = program;
-    _ = kind;
+    for (program, 0..) |op, op_index| {
+        switch (op) {
+            .kernel => |kernel_op| {
+                const state_id = kernel_op.state_block_id orelse continue;
+                if (!blockKindSupportsState(kind, state_id)) {
+                    return .{
+                        .op_index = op_index,
+                        .opcode = opcode_map.opcodeForLayerOp(op),
+                        .state_id = state_id,
+                    };
+                }
+            },
+            else => {},
+        }
+    }
     return null;
 }
 
@@ -623,6 +651,14 @@ pub fn defaultStateDescriptor(state_id: StateBlockId) StateDescriptor {
             .zero_init = true,
             .lifecycle = .slot_persistent,
             .runtime_kind = state_runtime_kind_mamba_cache,
+        },
+        .gated_delta => .{
+            .id = @intFromEnum(StateBlockId.gated_delta),
+            .size_bytes = builtin_state_block_bytes,
+            .align_bytes = 64,
+            .zero_init = true,
+            .lifecycle = .slot_persistent,
+            .runtime_kind = state_runtime_kind_gated_delta_cache,
         },
     };
 }
@@ -682,6 +718,7 @@ pub const BuiltinStateFlags = struct {
     has_kv: bool = false,
     has_shortconv: bool = false,
     has_mamba: bool = false,
+    has_gated_delta: bool = false,
 };
 
 pub fn collectBuiltinStateFlags(plan: *const ExecutionPlan) BuiltinStateFlags {
@@ -691,6 +728,7 @@ pub fn collectBuiltinStateFlags(plan: *const ExecutionPlan) BuiltinStateFlags {
             state_runtime_kind_kv_cache => flags.has_kv = true,
             state_runtime_kind_shortconv_cache => flags.has_shortconv = true,
             state_runtime_kind_mamba_cache => flags.has_mamba = true,
+            state_runtime_kind_gated_delta_cache => flags.has_gated_delta = true,
             else => {},
         }
     }
@@ -766,6 +804,7 @@ fn expectedParamKindForOpcode(opcode: Opcode) !ParamKind {
         .swiglu,
         .moe,
         .mamba_mixer,
+        .gated_delta_net,
         .shortconv,
         .mla_attention,
         .embedding,
@@ -807,6 +846,7 @@ fn expectedKernelDebugTypeForOpcode(opcode: Opcode) !op_types.OpType {
         .swiglu => .mlp,
         .moe => .moe,
         .mamba_mixer => .mamba_mixer,
+        .gated_delta_net => .gated_delta_net,
         .shortconv => .shortconv,
         .mla_attention => .multihead_attention,
         .embedding => .embedding,
@@ -1034,6 +1074,23 @@ pub const ScatterParam = packed struct {
     image_token_id: u32,
 };
 
+pub const AttentionKernelParam = packed struct {
+    param_kind: u8,
+    id: u32,
+    debug_type: u8,
+    query_gate: u8,
+};
+
+pub const GatedDeltaKernelParam = packed struct {
+    param_kind: u8,
+    id: u32,
+    debug_type: u8,
+    d_conv: u32,
+    n_heads: u32,
+    d_head: u32,
+    d_inner: u32,
+};
+
 fn assertParamAbiPayloadType(comptime T: type) void {
     const info = @typeInfo(T);
     if (info != .@"struct" or info.@"struct".layout != .@"packed") {
@@ -1060,6 +1117,8 @@ comptime {
     assertParamAbiPayloadType(SpatialMergeParam);
     assertParamAbiPayloadType(DeepstackExtractParam);
     assertParamAbiPayloadType(ScatterParam);
+    assertParamAbiPayloadType(AttentionKernelParam);
+    assertParamAbiPayloadType(GatedDeltaKernelParam);
 }
 
 /// Cast raw `ParamBlock.data` to an ABI-stable packed param struct.
@@ -1094,6 +1153,23 @@ pub fn encodeLayerOpParam(
         .kernel => |kernel_op| {
             try enc.writeU32(allocator, kernel_op.id);
             try enc.writeU8(allocator, @intFromEnum(kernel_op.debug_type));
+            switch (opcode) {
+                .multihead_attention => {
+                    const query_gate: u8 = if (kernel_op.attention_config) |cfg|
+                        @intFromBool(cfg.query_gate)
+                    else
+                        0;
+                    try enc.writeU8(allocator, query_gate);
+                },
+                .gated_delta_net => {
+                    const cfg = kernel_op.gated_delta_config orelse return error.InvalidParamBlockABI;
+                    try enc.writeU32(allocator, cfg.d_conv);
+                    try enc.writeU32(allocator, cfg.n_heads);
+                    try enc.writeU32(allocator, cfg.d_head);
+                    try enc.writeU32(allocator, cfg.d_inner);
+                },
+                else => {},
+            }
         },
         .add => |add_op| {
             switch (add_op.scale) {
@@ -1209,6 +1285,21 @@ fn decodeLayerOpFromParam(opcode: Opcode, data: []const u8) !layer_ops.LayerOp {
                 .in = .residual,
                 .out = .residual,
                 .debug_type = debug_type,
+                .attention_config = switch (opcode) {
+                    .multihead_attention => .{
+                        .query_gate = (try dec.readU8()) != 0,
+                    },
+                    else => null,
+                },
+                .gated_delta_config = switch (opcode) {
+                    .gated_delta_net => .{
+                        .d_conv = try dec.readU32(),
+                        .n_heads = try dec.readU32(),
+                        .d_head = try dec.readU32(),
+                        .d_inner = try dec.readU32(),
+                    },
+                    else => null,
+                },
             } };
         },
         .add => blk: {
@@ -2823,14 +2914,17 @@ test "encodeLayerOpParam round-trips split metadata including explicit split siz
     }
 }
 
-test "blockKindSupportsState does not gate descriptor ids" {
+test "blockKindSupportsState enforces builtin topology" {
     try std.testing.expect(blockKindSupportsState(.attention_mlp, @intFromEnum(StateBlockId.kv_cache)));
-    try std.testing.expect(blockKindSupportsState(.attention_mlp, @intFromEnum(StateBlockId.shortconv)));
-    try std.testing.expect(blockKindSupportsState(.shortconv, @intFromEnum(StateBlockId.mamba)));
-    try std.testing.expect(blockKindSupportsState(.mamba, 255));
+    try std.testing.expect(!blockKindSupportsState(.attention_mlp, @intFromEnum(StateBlockId.shortconv)));
+    try std.testing.expect(blockKindSupportsState(.shortconv, @intFromEnum(StateBlockId.shortconv)));
+    try std.testing.expect(!blockKindSupportsState(.shortconv, @intFromEnum(StateBlockId.mamba)));
+    try std.testing.expect(blockKindSupportsState(.mamba, @intFromEnum(StateBlockId.mamba)));
+    try std.testing.expect(blockKindSupportsState(.gated_delta, @intFromEnum(StateBlockId.gated_delta)));
+    try std.testing.expect(!blockKindSupportsState(.gated_delta, @intFromEnum(StateBlockId.kv_cache)));
 }
 
-test "firstLayerProgramStateMismatch does not enforce builtin topology" {
+test "firstLayerProgramStateMismatch reports incompatible builtin topology" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
         .{ .kernel = .{
@@ -2841,7 +2935,23 @@ test "firstLayerProgramStateMismatch does not enforce builtin topology" {
             .state_block_id = @intFromEnum(StateBlockId.shortconv),
         } },
     };
-    try std.testing.expect(firstLayerProgramStateMismatch(&program, .attention_mlp) == null);
+    const mismatch = firstLayerProgramStateMismatch(&program, .attention_mlp) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), mismatch.op_index);
+    try std.testing.expectEqual(Opcode.shortconv, mismatch.opcode);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(StateBlockId.shortconv)), mismatch.state_id);
+}
+
+test "firstLayerProgramStateMismatch accepts gated delta topology" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .norm_out,
+            .out = .branch_out,
+            .debug_type = .gated_delta_net,
+            .state_block_id = @intFromEnum(StateBlockId.gated_delta),
+        } },
+    };
+    try std.testing.expect(firstLayerProgramStateMismatch(&program, .gated_delta) == null);
 }
 
 test "firstUnsupportedLayerProgramOpcode returns first unsupported opcode in program" {
@@ -2925,7 +3035,7 @@ test "firstLayerProgramCompatibilityIssue reports unsupported opcode first" {
     }
 }
 
-test "firstLayerProgramCompatibilityIssue ignores block-kind state topology when opcodes are supported" {
+test "firstLayerProgramCompatibilityIssue reports block-kind state mismatch when opcodes are supported" {
     var table = [_]?u8{null} ** 256;
     table[@intFromEnum(Opcode.shortconv)] = 1;
     const program = [_]layer_ops.LayerOp{
@@ -2937,7 +3047,15 @@ test "firstLayerProgramCompatibilityIssue ignores block-kind state topology when
             .state_block_id = @intFromEnum(StateBlockId.shortconv),
         } },
     };
-    try std.testing.expect(firstLayerProgramCompatibilityIssue(&program, .attention_mlp, table) == null);
+    const issue = firstLayerProgramCompatibilityIssue(&program, .attention_mlp, table) orelse return error.TestUnexpectedResult;
+    switch (issue) {
+        .state_mismatch => |mismatch| {
+            try std.testing.expectEqual(@as(usize, 0), mismatch.op_index);
+            try std.testing.expectEqual(Opcode.shortconv, mismatch.opcode);
+            try std.testing.expectEqual(@as(u8, @intFromEnum(StateBlockId.shortconv)), mismatch.state_id);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "paramAs round-trip with encodeLayerOpParam" {
@@ -2953,4 +3071,52 @@ test "paramAs round-trip with encodeLayerOpParam" {
     try std.testing.expectEqual(@as(u8, 2), p.scale_tag);
     // f32 1.5 stored as u32 via @bitCast
     try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.5))), p.scale_literal);
+}
+
+test "encodeLayerOpParam serializes attention kernel query gate" {
+    const param_block = try encodeLayerOpParam(
+        std.testing.allocator,
+        .multihead_attention,
+        .{ .kernel = .{
+            .id = 1,
+            .in = .norm_out,
+            .out = .branch_out,
+            .debug_type = .multihead_attention,
+            .state_block_id = kv_cache_state_id,
+            .attention_config = .{ .query_gate = true },
+        } },
+    );
+    defer std.testing.allocator.free(param_block.data);
+
+    const p = try paramAs(AttentionKernelParam, &.{param_block}, .multihead_attention);
+    try std.testing.expectEqual(@as(u32, 1), p.id);
+    try std.testing.expectEqual(@as(u8, 1), p.query_gate);
+}
+
+test "encodeLayerOpParam serializes gated delta kernel config" {
+    const param_block = try encodeLayerOpParam(
+        std.testing.allocator,
+        .gated_delta_net,
+        .{ .kernel = .{
+            .id = 7,
+            .in = .norm_out,
+            .out = .branch_out,
+            .debug_type = .gated_delta_net,
+            .state_block_id = gated_delta_state_id,
+            .gated_delta_config = .{
+                .d_conv = 4,
+                .n_heads = 16,
+                .d_head = 128,
+                .d_inner = 2048,
+            },
+        } },
+    );
+    defer std.testing.allocator.free(param_block.data);
+
+    const p = try paramAs(GatedDeltaKernelParam, &.{param_block}, .gated_delta_net);
+    try std.testing.expectEqual(@as(u32, 7), p.id);
+    try std.testing.expectEqual(@as(u32, 4), p.d_conv);
+    try std.testing.expectEqual(@as(u32, 16), p.n_heads);
+    try std.testing.expectEqual(@as(u32, 128), p.d_head);
+    try std.testing.expectEqual(@as(u32, 2048), p.d_inner);
 }

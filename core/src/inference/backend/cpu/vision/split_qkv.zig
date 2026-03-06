@@ -417,6 +417,7 @@ pub const VisionRuntime = struct {
                 &vision_block_program,
                 1e-6,
                 .{},
+                false,
                 1.0,
                 attention_scale,
                 true,

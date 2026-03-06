@@ -14,6 +14,7 @@ const cpu_linalg = compute.cpu.linalg;
 const flash_attention = compute.cpu.simd.flash_attention;
 const cpu_sdpa = compute.cpu.sdpa_rowwise;
 const cpu_common = compute.cpu.common;
+const cpu_gated_attention = compute.cpu.gated_attention;
 const cpu_layout = compute.cpu.layout;
 const cpu_indexing = compute.cpu.indexing;
 const cpu_norm = compute.cpu.normalization;
@@ -75,6 +76,8 @@ pub const AttnCache = struct {
 
 /// Multi-head attention layer with grouped query attention support.
 pub const MultiHeadAttention = struct {
+    const Self = @This();
+
     pub const RuntimeRoPE = struct {
         /// Flat table [seq_len * dim]
         cos: []const f32,
@@ -111,6 +114,8 @@ pub const MultiHeadAttention = struct {
     is_causal: bool = true,
     /// Layer index for trace emissions.
     layer_idx: u16 = trace.TraceEmission.NO_LAYER,
+    /// Apply Qwen3.5-style query gating on top of the standard attention path.
+    query_gate: bool = false,
     // Q/K/V projections - optional when using native fused QKV
     q_proj: ?*const Tensor = null,
     k_proj: ?*const Tensor = null,
@@ -125,6 +130,9 @@ pub const MultiHeadAttention = struct {
     /// Used for multimodal decode where generated token positions continue from
     /// M-RoPE text positions rather than raw prompt length.
     position_delta: isize = 0,
+    /// When true, RoPE rotates consecutive pairs `(x0,x1)`, `(x2,x3)` rather
+    /// than first-half/second-half pairs. Qwen3.5 text attention requires this.
+    rope_interleaved: bool = false,
     // QKNorm (optional) - applied after Q/K projection, before RoPE
     q_norm: ?*const Tensor = null,
     k_norm: ?*const Tensor = null,
@@ -152,7 +160,7 @@ pub const MultiHeadAttention = struct {
     flash_attention_fn: ?FlashAttentionFn = null,
 
     fn shouldUseFlash(
-        self: *const MultiHeadAttention,
+        self: *const Self,
         use_cache: bool,
         exact_softmax: bool,
         sequence_len: usize,
@@ -166,8 +174,19 @@ pub const MultiHeadAttention = struct {
             sequence_len > FLASH_ATTENTION_THRESHOLD;
     }
 
+    fn projectionOutputDim(self: *const Self, weight: *const Tensor) !usize {
+        if (weight.n_dims != 2) return error.InvalidShape;
+        const dim0: usize = @intCast(weight.shape[0]);
+        const dim1: usize = @intCast(weight.shape[1]);
+        if (dim0 == 0 or dim1 == 0) return error.InvalidShape;
+        if (dim0 == self.d_model and dim1 != self.d_model) return dim1;
+        if (dim1 == self.d_model and dim0 != self.d_model) return dim0;
+        if (dim0 == self.d_model and dim1 == self.d_model) return self.d_model;
+        return dim0;
+    }
+
     pub fn forward(
-        self: *const MultiHeadAttention,
+        self: *const Self,
         input_tensor: *const Tensor, // [1, sequence_len, d_model]
         output_tensor: *Tensor, // [1, sequence_len, d_model]
         cache: *AttnCache,
@@ -176,6 +195,7 @@ pub const MultiHeadAttention = struct {
         use_cache: bool,
     ) !void {
         const exact_softmax = std.process.hasEnvVar(self.allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
+        const query_gate = self.query_gate;
         // Internal invariants: model config must be valid after loading
         std.debug.assert(self.n_heads > 0 and self.n_kv_heads > 0);
         std.debug.assert(self.n_heads % self.n_kv_heads == 0);
@@ -189,17 +209,32 @@ pub const MultiHeadAttention = struct {
         // Use fused QKV when available (required for native fused, optional optimization for others)
         // Weight layout is [out_features, in_features] where out = query_dim + 2*kv_total_dim
         // For quantized weights, shape[1] is packed so we only check output dimension
+        const fused_projection_dim = (if (query_gate) query_dim * 2 else query_dim) + 2 * kv_total_dim;
         const use_fused_projection = if (self.fused_qkv) |fq| blk: {
-            if (fq.dtype == .f32 and fq.shape[1] == query_dim + 2 * kv_total_dim) break :blk true;
-            break :blk fq.shape[0] == query_dim + 2 * kv_total_dim;
+            if (fq.dtype == .f32 and fq.shape[1] == fused_projection_dim) break :blk true;
+            break :blk fq.shape[0] == fused_projection_dim;
         } else false;
-        try self.ensureTemp(scratch, sequence_len, use_cache, query_dim, kv_total_dim, use_fused_projection);
+        const gated_query_projection_dim = if (!use_fused_projection and query_gate) blk: {
+            const query_weights = self.q_proj orelse return error.MissingAttentionWeights;
+            const query_projection_dim = try self.projectionOutputDim(query_weights);
+            if (query_projection_dim != query_dim * 2) return error.InvalidShape;
+            break :blk query_projection_dim;
+        } else null;
+        try self.ensureTemp(
+            scratch,
+            sequence_len,
+            use_cache,
+            query_dim,
+            kv_total_dim,
+            use_fused_projection or query_gate,
+        );
 
         // Flatten batch dimension for matmul
         const input_view = Tensor.view2D(input_tensor.data(), sequence_len, self.d_model);
         var query_view: Tensor = undefined; // Safe: both branches assign before use
         var key_view: Tensor = undefined; // Safe: both branches assign before use
         var value_view: Tensor = undefined; // Safe: both branches assign before use
+        var q_bias_applied = false;
         if (use_fused_projection) {
             const fused_weights = self.fused_qkv.?;
             const fused_kernel = self.matmul_qkv_fused orelse self.matmul_qkv;
@@ -212,24 +247,48 @@ pub const MultiHeadAttention = struct {
             const query_weights = self.q_proj orelse return error.MissingAttentionWeights;
             const key_weights = self.k_proj orelse return error.MissingAttentionWeights;
             const value_weights = self.v_proj orelse return error.MissingAttentionWeights;
+            const query_projection_dim = gated_query_projection_dim orelse query_dim;
+            try cpu_common.ensureF32Slice(self.allocator, &scratch.q, sequence_len * query_projection_dim);
 
-            var query_workspace = Tensor.view2DSlice(scratch.q[0 .. sequence_len * query_dim], sequence_len, query_dim);
+            var query_workspace = Tensor.view2DSlice(scratch.q[0 .. sequence_len * query_projection_dim], sequence_len, query_projection_dim);
             var key_workspace = Tensor.view2DSlice(scratch.k[0 .. sequence_len * kv_total_dim], sequence_len, kv_total_dim);
             var value_workspace = Tensor.view2DSlice(scratch.v[0 .. sequence_len * kv_total_dim], sequence_len, kv_total_dim);
             self.matmul_qkv(&input_view, query_weights, &query_workspace, matmul_scratch);
+            if (self.q_bias) |bias| {
+                if (bias.len == query_projection_dim) {
+                    cpu_common.addBiasRows(query_workspace.asSlice(f32), bias, sequence_len, query_projection_dim);
+                    q_bias_applied = true;
+                }
+            }
+            if (query_gate) {
+                try cpu_gated_attention.compactQueryProjection(
+                    scratch.q[0 .. sequence_len * query_projection_dim],
+                    scratch.qkv[0 .. sequence_len * query_dim],
+                    sequence_len,
+                    query_dim,
+                    query_projection_dim,
+                    self.n_heads,
+                    self.head_dim,
+                );
+            }
             // Use separate matmul for K/V if they have different dtype than Q
             const matmul_kernel_k = self.matmul_k orelse self.matmul_qkv;
             const matmul_kernel_v = self.matmul_v orelse self.matmul_qkv;
             matmul_kernel_k(&input_view, key_weights, &key_workspace, matmul_scratch);
             matmul_kernel_v(&input_view, value_weights, &value_workspace, matmul_scratch);
-            query_view = query_workspace;
+            query_view = if (query_gate)
+                Tensor.view2DSlice(scratch.qkv[0 .. sequence_len * query_dim], sequence_len, query_dim)
+            else
+                Tensor.view2DSlice(scratch.q[0 .. sequence_len * query_dim], sequence_len, query_dim);
             key_view = key_workspace;
             value_view = value_workspace;
         }
 
         // Apply attention biases if present
-        if (self.q_bias) |bias| {
-            cpu_common.addBiasRows(query_view.asSlice(f32), bias, sequence_len, query_dim);
+        if (!q_bias_applied) {
+            if (self.q_bias) |bias| {
+                cpu_common.addBiasRows(query_view.asSlice(f32), bias, sequence_len, query_dim);
+            }
         }
         if (self.k_bias) |bias| {
             cpu_common.addBiasRows(key_view.asSlice(f32), bias, sequence_len, kv_total_dim);
@@ -270,34 +329,67 @@ pub const MultiHeadAttention = struct {
         // pos_offset is the position in the sequence (accounting for cached tokens).
         const pos_offset = if (use_cache) cache.cache_position else 0;
         if (self.runtime_rope) |runtime_rope| {
-            try cpu_rotary.applyRuntimeTablesToPair(
-                query_view.asSlice(f32),
-                key_view.asSlice(f32),
-                sequence_len,
-                self.n_heads,
-                self.n_kv_heads,
-                self.head_dim,
-                query_dim,
-                kv_total_dim,
-                pos_offset,
-                runtime_rope.cos,
-                runtime_rope.sin,
-                runtime_rope.dim,
-            );
+            if (self.rope_interleaved) {
+                try cpu_rotary.applyRuntimeTablesToPairInterleaved(
+                    query_view.asSlice(f32),
+                    key_view.asSlice(f32),
+                    sequence_len,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    pos_offset,
+                    runtime_rope.cos,
+                    runtime_rope.sin,
+                    runtime_rope.dim,
+                );
+            } else {
+                try cpu_rotary.applyRuntimeTablesToPair(
+                    query_view.asSlice(f32),
+                    key_view.asSlice(f32),
+                    sequence_len,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    pos_offset,
+                    runtime_rope.cos,
+                    runtime_rope.sin,
+                    runtime_rope.dim,
+                );
+            }
         } else if (self.rope) |rope| {
-            try cpu_rotary.applyStaticTablesToPair(
-                query_view.asSlice(f32),
-                key_view.asSlice(f32),
-                sequence_len,
-                self.n_heads,
-                self.n_kv_heads,
-                self.head_dim,
-                query_dim,
-                kv_total_dim,
-                pos_offset,
-                self.position_delta,
-                rope,
-            );
+            if (self.rope_interleaved) {
+                try cpu_rotary.applyStaticTablesToPairInterleaved(
+                    query_view.asSlice(f32),
+                    key_view.asSlice(f32),
+                    sequence_len,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    pos_offset,
+                    self.position_delta,
+                    rope,
+                );
+            } else {
+                try cpu_rotary.applyStaticTablesToPair(
+                    query_view.asSlice(f32),
+                    key_view.asSlice(f32),
+                    sequence_len,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    pos_offset,
+                    self.position_delta,
+                    rope,
+                );
+            }
         }
 
         if (trace.isEnabled()) {
@@ -482,6 +574,18 @@ pub const MultiHeadAttention = struct {
 
             // Apply output projection directly from context buffer (already laid out as [sequence_len, query_dim])
             const attn_view = Tensor.view2DSlice(context_values[0 .. sequence_len * query_dim], sequence_len, query_dim);
+            if (query_gate) {
+                const query_projection_dim = gated_query_projection_dim orelse unreachable;
+                try cpu_gated_attention.applyOutputGateInPlace(
+                    context_values[0 .. sequence_len * query_dim],
+                    scratch.q[0 .. sequence_len * query_projection_dim],
+                    sequence_len,
+                    query_dim,
+                    query_projection_dim,
+                    self.n_heads,
+                    self.head_dim,
+                );
+            }
             var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), sequence_len, self.d_model);
             self.matmul_o(&attn_view, self.o_proj, &out_view, matmul_scratch);
             // Apply output bias if present
@@ -572,6 +676,18 @@ pub const MultiHeadAttention = struct {
                 );
             }
 
+            if (query_gate) {
+                const query_projection_dim = gated_query_projection_dim orelse unreachable;
+                try cpu_gated_attention.applyOutputGateInPlace(
+                    context_values[0 .. sequence_len * query_dim],
+                    scratch.q[0 .. sequence_len * query_projection_dim],
+                    sequence_len,
+                    query_dim,
+                    query_projection_dim,
+                    self.n_heads,
+                    self.head_dim,
+                );
+            }
             const attn_view = Tensor.view2DSlice(context_values[0 .. sequence_len * query_dim], sequence_len, query_dim);
             var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), sequence_len, self.d_model);
             self.matmul_o(&attn_view, self.o_proj, &out_view, matmul_scratch);
@@ -663,6 +779,18 @@ pub const MultiHeadAttention = struct {
         }
 
         // Apply output projection directly from context buffer (layout: [sequence_len, heads, head_dim])
+        if (query_gate) {
+            const query_projection_dim = gated_query_projection_dim orelse unreachable;
+            try cpu_gated_attention.applyOutputGateInPlace(
+                context_values[0 .. sequence_len * query_dim],
+                scratch.q[0 .. sequence_len * query_projection_dim],
+                sequence_len,
+                query_dim,
+                query_projection_dim,
+                self.n_heads,
+                self.head_dim,
+            );
+        }
         var attn_view = Tensor.view2DSlice(context_values[0 .. sequence_len * query_dim], sequence_len, query_dim);
         var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), sequence_len, self.d_model);
         self.matmul_o(&attn_view, self.o_proj, &out_view, matmul_scratch);
@@ -690,12 +818,12 @@ pub const MultiHeadAttention = struct {
         }
     }
 
-    pub fn ensureTemp(self: *const MultiHeadAttention, scratch: *AttnTemp, sequence_len: usize, use_cache: bool, query_dim: usize, kv_total_dim: usize, use_fused_projection: bool) !void {
+    pub fn ensureTemp(self: *const Self, scratch: *AttnTemp, sequence_len: usize, use_cache: bool, query_dim: usize, kv_total_dim: usize, needs_qkv_scratch: bool) !void {
         // Always allocate separate Q, K, V buffers
         try cpu_common.ensureF32Slice(self.allocator, &scratch.q, sequence_len * query_dim);
         try cpu_common.ensureF32Slice(self.allocator, &scratch.k, sequence_len * kv_total_dim);
         try cpu_common.ensureF32Slice(self.allocator, &scratch.v, sequence_len * kv_total_dim);
-        if (use_fused_projection) {
+        if (needs_qkv_scratch) {
             // Need buffer for fused matmul output + rearranged result (2x size)
             // First half: final rearranged Q/K/V
             // Second half: temporary matmul output before rearrangement
@@ -707,7 +835,7 @@ pub const MultiHeadAttention = struct {
         try cpu_common.ensureF32Slice(self.allocator, &scratch.context_values, sequence_len * self.n_heads * self.head_dim);
     }
 
-    pub fn ensureKvCapacity(self: *const MultiHeadAttention, cache: *AttnCache, needed_seq: usize, kv_total_dim: usize) !void {
+    pub fn ensureKvCapacity(self: *const Self, cache: *AttnCache, needed_seq: usize, kv_total_dim: usize) !void {
         if (needed_seq <= cache.kv_capacity and cache.key_cache.len > 0 and cache.value_cache.len > 0) return;
 
         const current = cache.kv_capacity;
@@ -756,7 +884,7 @@ pub const MultiHeadAttention = struct {
     /// - matmul_scratch: scratch for matmul operations
     /// - use_cache: false for prefill (populates cache), true for decode (uses cache)
     pub fn forwardWithBatchedCache(
-        self: *const MultiHeadAttention,
+        self: *const Self,
         input_tensor: *const Tensor,
         output_tensor: *Tensor,
         cache: *BatchedKVCache,
@@ -766,6 +894,7 @@ pub const MultiHeadAttention = struct {
         use_cache: bool,
     ) !void {
         const exact_softmax = std.process.hasEnvVar(self.allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
+        const query_gate = self.query_gate;
         std.debug.assert(self.n_heads > 0 and self.n_kv_heads > 0);
         std.debug.assert(self.n_heads % self.n_kv_heads == 0);
 
@@ -783,19 +912,33 @@ pub const MultiHeadAttention = struct {
         std.debug.assert(input_tensor.shape[2] == self.d_model and output_tensor.shape[2] == self.d_model);
 
         // Check for fused QKV
+        const fused_projection_dim = (if (query_gate) query_dim * 2 else query_dim) + 2 * kv_total_dim;
         const use_fused_projection = if (self.fused_qkv) |fq| blk: {
-            if (fq.dtype == .f32 and fq.shape[1] == query_dim + 2 * kv_total_dim) break :blk true;
-            break :blk fq.shape[0] == query_dim + 2 * kv_total_dim;
+            if (fq.dtype == .f32 and fq.shape[1] == fused_projection_dim) break :blk true;
+            break :blk fq.shape[0] == fused_projection_dim;
         } else false;
 
-        try self.ensureTemp(scratch, sequence_len, use_cache, query_dim, kv_total_dim, use_fused_projection);
+        const gated_query_projection_dim = if (!use_fused_projection and query_gate) blk: {
+            const query_weights = self.q_proj orelse return error.MissingAttentionWeights;
+            const query_projection_dim = try self.projectionOutputDim(query_weights);
+            if (query_projection_dim != query_dim * 2) return error.InvalidShape;
+            break :blk query_projection_dim;
+        } else null;
+        try self.ensureTemp(
+            scratch,
+            sequence_len,
+            use_cache,
+            query_dim,
+            kv_total_dim,
+            use_fused_projection or query_gate,
+        );
 
         // Project Q/K/V
         const input_view = Tensor.view2D(input_tensor.data(), sequence_len, self.d_model);
         var query_view: Tensor = undefined; // Safe: both branches assign before use
         var key_view: Tensor = undefined; // Safe: both branches assign before use
         var value_view: Tensor = undefined; // Safe: both branches assign before use
-
+        var q_bias_applied = false;
         if (use_fused_projection) {
             const fused_weights = self.fused_qkv.?;
             const fused_kernel = self.matmul_qkv_fused orelse self.matmul_qkv;
@@ -807,24 +950,48 @@ pub const MultiHeadAttention = struct {
             const query_weights = self.q_proj orelse return error.MissingAttentionWeights;
             const key_weights = self.k_proj orelse return error.MissingAttentionWeights;
             const value_weights = self.v_proj orelse return error.MissingAttentionWeights;
+            const query_projection_dim = gated_query_projection_dim orelse query_dim;
+            try cpu_common.ensureF32Slice(self.allocator, &scratch.q, sequence_len * query_projection_dim);
 
-            var query_workspace = Tensor.view2DSlice(scratch.q[0 .. sequence_len * query_dim], sequence_len, query_dim);
+            var query_workspace = Tensor.view2DSlice(scratch.q[0 .. sequence_len * query_projection_dim], sequence_len, query_projection_dim);
             var key_workspace = Tensor.view2DSlice(scratch.k[0 .. sequence_len * kv_total_dim], sequence_len, kv_total_dim);
             var value_workspace = Tensor.view2DSlice(scratch.v[0 .. sequence_len * kv_total_dim], sequence_len, kv_total_dim);
 
             self.matmul_qkv(&input_view, query_weights, &query_workspace, matmul_scratch);
+            if (self.q_bias) |bias| {
+                if (bias.len == query_projection_dim) {
+                    cpu_common.addBiasRows(query_workspace.asSlice(f32), bias, sequence_len, query_projection_dim);
+                    q_bias_applied = true;
+                }
+            }
+            if (query_gate) {
+                try cpu_gated_attention.compactQueryProjection(
+                    scratch.q[0 .. sequence_len * query_projection_dim],
+                    scratch.qkv[0 .. sequence_len * query_dim],
+                    sequence_len,
+                    query_dim,
+                    query_projection_dim,
+                    self.n_heads,
+                    self.head_dim,
+                );
+            }
             const matmul_kernel_k = self.matmul_k orelse self.matmul_qkv;
             const matmul_kernel_v = self.matmul_v orelse self.matmul_qkv;
             matmul_kernel_k(&input_view, key_weights, &key_workspace, matmul_scratch);
             matmul_kernel_v(&input_view, value_weights, &value_workspace, matmul_scratch);
 
-            query_view = query_workspace;
+            query_view = if (query_gate)
+                Tensor.view2DSlice(scratch.qkv[0 .. sequence_len * query_dim], sequence_len, query_dim)
+            else
+                Tensor.view2DSlice(scratch.q[0 .. sequence_len * query_dim], sequence_len, query_dim);
             key_view = key_workspace;
             value_view = value_workspace;
         }
 
         // Apply biases if present
-        if (self.q_bias) |bias| cpu_common.addBiasRows(query_view.asSlice(f32), bias, sequence_len, query_dim);
+        if (!q_bias_applied) {
+            if (self.q_bias) |bias| cpu_common.addBiasRows(query_view.asSlice(f32), bias, sequence_len, query_dim);
+        }
         if (self.k_bias) |bias| cpu_common.addBiasRows(key_view.asSlice(f32), bias, sequence_len, kv_total_dim);
         if (self.v_bias) |bias| cpu_common.addBiasRows(value_view.asSlice(f32), bias, sequence_len, kv_total_dim);
 
@@ -1029,6 +1196,18 @@ pub const MultiHeadAttention = struct {
         }
 
         // Output projection
+        if (query_gate) {
+            const query_projection_dim = gated_query_projection_dim orelse unreachable;
+            try cpu_gated_attention.applyOutputGateInPlace(
+                context_values[0 .. sequence_len * query_dim],
+                scratch.q[0 .. sequence_len * query_projection_dim],
+                sequence_len,
+                query_dim,
+                query_projection_dim,
+                self.n_heads,
+                self.head_dim,
+            );
+        }
         const attn_view = Tensor.view2DSlice(context_values[0 .. sequence_len * query_dim], sequence_len, query_dim);
         var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), sequence_len, self.d_model);
         self.matmul_o(&attn_view, self.o_proj, &out_view, matmul_scratch);
@@ -1062,7 +1241,7 @@ pub const MultiHeadAttention = struct {
     /// - slot_indices.len == batch_size
     /// - each batch row corresponds to one decode token for one scheduler slot
     pub fn forwardWithBatchedCacheSlots(
-        self: *const MultiHeadAttention,
+        self: *const Self,
         input_tensor: *const Tensor,
         output_tensor: *Tensor,
         cache: *BatchedKVCache,
@@ -1074,6 +1253,7 @@ pub const MultiHeadAttention = struct {
         if (!use_cache) return error.InvalidArgument;
 
         const exact_softmax = std.process.hasEnvVar(self.allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
+        const query_gate = self.query_gate;
         std.debug.assert(self.n_heads > 0 and self.n_kv_heads > 0);
         std.debug.assert(self.n_heads % self.n_kv_heads == 0);
         std.debug.assert(input_tensor.n_dims == 3 and output_tensor.n_dims == 3);
@@ -1091,17 +1271,31 @@ pub const MultiHeadAttention = struct {
         const heads_per_kv_group = n_heads / n_kv_heads;
         const scale = self.scale;
 
+        const fused_projection_dim = (if (query_gate) query_dim * 2 else query_dim) + 2 * kv_total_dim;
         const use_fused_projection = if (self.fused_qkv) |fq| blk: {
-            if (fq.dtype == .f32 and fq.shape[1] == query_dim + 2 * kv_total_dim) break :blk true;
-            break :blk fq.shape[0] == query_dim + 2 * kv_total_dim;
+            if (fq.dtype == .f32 and fq.shape[1] == fused_projection_dim) break :blk true;
+            break :blk fq.shape[0] == fused_projection_dim;
         } else false;
-        try self.ensureTemp(scratch, batch_size, true, query_dim, kv_total_dim, use_fused_projection);
+        const gated_query_projection_dim = if (!use_fused_projection and query_gate) blk: {
+            const query_weights = self.q_proj orelse return error.MissingAttentionWeights;
+            const query_projection_dim = try self.projectionOutputDim(query_weights);
+            if (query_projection_dim != query_dim * 2) return error.InvalidShape;
+            break :blk query_projection_dim;
+        } else null;
+        try self.ensureTemp(
+            scratch,
+            batch_size,
+            true,
+            query_dim,
+            kv_total_dim,
+            use_fused_projection or query_gate,
+        );
 
         const input_view = Tensor.view2D(input_tensor.data(), batch_size, self.d_model);
         var query_view: Tensor = undefined;
         var key_view: Tensor = undefined;
         var value_view: Tensor = undefined;
-
+        var q_bias_applied = false;
         if (use_fused_projection) {
             const fused_weights = self.fused_qkv.?;
             const fused_kernel = self.matmul_qkv_fused orelse self.matmul_qkv;
@@ -1113,23 +1307,47 @@ pub const MultiHeadAttention = struct {
             const query_weights = self.q_proj orelse return error.MissingAttentionWeights;
             const key_weights = self.k_proj orelse return error.MissingAttentionWeights;
             const value_weights = self.v_proj orelse return error.MissingAttentionWeights;
+            const query_projection_dim = gated_query_projection_dim orelse query_dim;
+            try cpu_common.ensureF32Slice(self.allocator, &scratch.q, batch_size * query_projection_dim);
 
-            var query_workspace = Tensor.view2DSlice(scratch.q[0 .. batch_size * query_dim], batch_size, query_dim);
+            var query_workspace = Tensor.view2DSlice(scratch.q[0 .. batch_size * query_projection_dim], batch_size, query_projection_dim);
             var key_workspace = Tensor.view2DSlice(scratch.k[0 .. batch_size * kv_total_dim], batch_size, kv_total_dim);
             var value_workspace = Tensor.view2DSlice(scratch.v[0 .. batch_size * kv_total_dim], batch_size, kv_total_dim);
 
             self.matmul_qkv(&input_view, query_weights, &query_workspace, matmul_scratch);
+            if (self.q_bias) |bias| {
+                if (bias.len == query_projection_dim) {
+                    cpu_common.addBiasRows(query_workspace.asSlice(f32), bias, batch_size, query_projection_dim);
+                    q_bias_applied = true;
+                }
+            }
+            if (query_gate) {
+                try cpu_gated_attention.compactQueryProjection(
+                    scratch.q[0 .. batch_size * query_projection_dim],
+                    scratch.qkv[0 .. batch_size * query_dim],
+                    batch_size,
+                    query_dim,
+                    query_projection_dim,
+                    self.n_heads,
+                    self.head_dim,
+                );
+            }
             const matmul_kernel_k = self.matmul_k orelse self.matmul_qkv;
             const matmul_kernel_v = self.matmul_v orelse self.matmul_qkv;
             matmul_kernel_k(&input_view, key_weights, &key_workspace, matmul_scratch);
             matmul_kernel_v(&input_view, value_weights, &value_workspace, matmul_scratch);
 
-            query_view = query_workspace;
+            query_view = if (query_gate)
+                Tensor.view2DSlice(scratch.qkv[0 .. batch_size * query_dim], batch_size, query_dim)
+            else
+                Tensor.view2DSlice(scratch.q[0 .. batch_size * query_dim], batch_size, query_dim);
             key_view = key_workspace;
             value_view = value_workspace;
         }
 
-        if (self.q_bias) |bias| cpu_common.addBiasRows(query_view.asSlice(f32), bias, batch_size, query_dim);
+        if (!q_bias_applied) {
+            if (self.q_bias) |bias| cpu_common.addBiasRows(query_view.asSlice(f32), bias, batch_size, query_dim);
+        }
         if (self.k_bias) |bias| cpu_common.addBiasRows(key_view.asSlice(f32), bias, batch_size, kv_total_dim);
         if (self.v_bias) |bias| cpu_common.addBiasRows(value_view.asSlice(f32), bias, batch_size, kv_total_dim);
 
@@ -1253,6 +1471,18 @@ pub const MultiHeadAttention = struct {
             }
         }
 
+        if (query_gate) {
+            const query_projection_dim = gated_query_projection_dim orelse unreachable;
+            try cpu_gated_attention.applyOutputGateInPlace(
+                context_values[0 .. batch_size * query_dim],
+                scratch.q[0 .. batch_size * query_projection_dim],
+                batch_size,
+                query_dim,
+                query_projection_dim,
+                self.n_heads,
+                self.head_dim,
+            );
+        }
         const attn_view = Tensor.view2DSlice(context_values[0 .. batch_size * query_dim], batch_size, query_dim);
         var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), batch_size, self.d_model);
         self.matmul_o(&attn_view, self.o_proj, &out_view, matmul_scratch);
@@ -1260,7 +1490,7 @@ pub const MultiHeadAttention = struct {
     }
 
     /// Describe this attention module for introspection/debugging.
-    pub fn describe(self: *const MultiHeadAttention, writer: anytype, indent: usize, show_kernels: bool) !void {
+    pub fn describe(self: *const Self, writer: anytype, indent: usize, show_kernels: bool) !void {
         const query_dim = self.n_heads * self.head_dim;
         const kv_dim = self.n_kv_heads * self.head_dim;
 
@@ -1296,7 +1526,7 @@ pub const MultiHeadAttention = struct {
         }
     }
 
-    fn formatKernels(self: *const MultiHeadAttention, writer: anytype, indent: usize) !void {
+    fn formatKernels(self: *const Self, writer: anytype, indent: usize) !void {
         const query_dim = self.n_heads * self.head_dim;
         const kv_dim = self.n_kv_heads * self.head_dim;
 
@@ -1337,7 +1567,7 @@ pub const MultiHeadAttention = struct {
 
     /// Forward pass with performance tracing.
     pub fn forwardTraced(
-        self: *const MultiHeadAttention,
+        self: *const Self,
         input_tensor: *const Tensor,
         output_tensor: *Tensor,
         cache: *AttnCache,
@@ -1348,7 +1578,6 @@ pub const MultiHeadAttention = struct {
         try self.forward(input_tensor, output_tensor, cache, scratch, matmul_scratch, use_cache);
     }
 };
-
 pub const FusedAttention = MultiHeadAttention;
 
 // =============================================================================
@@ -1455,7 +1684,7 @@ pub const BatchedAttnTemp = struct {
 /// 3. Computes attention for each sequence against its cached K/V
 /// 4. Projects output for all sequences
 fn forwardBatchedDecode(
-    self: *const MultiHeadAttention,
+    self: anytype,
     requests: []const BatchedDecodeRequest,
     cache: *BatchedKVCache,
     scratch: *BatchedAttnTemp,
@@ -2999,6 +3228,87 @@ test "MultiHeadAttention.ensureKvCapacity: preserves cached data during growth" 
 
     // Cache position should be preserved
     try std.testing.expectEqual(@as(usize, 2), cache.cache_position);
+}
+
+test "compactGatedQueryProjection extracts per-head q lanes without corrupting gates" {
+    const packed_q = [_]f32{
+        1, 2, 10, 11, 3, 4, 12, 13,
+        5, 6, 14, 15, 7, 8, 16, 17,
+    };
+    var compacted = [_]f32{0} ** 8;
+
+    try cpu_gated_attention.compactQueryProjection(&packed_q, &compacted, 2, 4, 8, 2, 2);
+
+    const expected = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try std.testing.expectEqualSlices(f32, &expected, &compacted);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        1, 2, 10, 11, 3, 4, 12, 13,
+        5, 6, 14, 15, 7, 8, 16, 17,
+    }, &packed_q);
+}
+
+test "applyGatedAttentionOutputInPlace reads per-head gate lanes" {
+    var context = [_]f32{ 1, 2, 3, 4 };
+    const packed_q = [_]f32{ 10, 11, 0, 0, 12, 13, 1, -1 };
+
+    try cpu_gated_attention.applyOutputGateInPlace(&context, &packed_q, 1, 4, 8, 2, 2);
+
+    const expected = [_]f32{
+        1 * (1.0 / (1.0 + @exp(-0.0))),
+        2 * (1.0 / (1.0 + @exp(-0.0))),
+        3 * (1.0 / (1.0 + @exp(-1.0))),
+        4 * (1.0 / (1.0 + @exp(1.0))),
+    };
+    try std.testing.expectApproxEqAbs(expected[0], context[0], 1e-6);
+    try std.testing.expectApproxEqAbs(expected[1], context[1], 1e-6);
+    try std.testing.expectApproxEqAbs(expected[2], context[2], 1e-6);
+    try std.testing.expectApproxEqAbs(expected[3], context[3], 1e-6);
+}
+
+test "MultiHeadAttention.ensureTemp allocates qkv scratch for gated query projections" {
+    const allocator = std.testing.allocator;
+
+    var o_proj_data = [_]f32{0} ** 16;
+    const o_proj = Tensor.view2DSlice(&o_proj_data, 4, 4);
+
+    const mha = MultiHeadAttention{
+        .d_model = 8,
+        .n_heads = 2,
+        .n_kv_heads = 2,
+        .head_dim = 4,
+        .max_seq_len = 64,
+        .scale = 0.5,
+        .o_proj = &o_proj,
+        .allocator = allocator,
+        .matmul_qkv = undefined,
+        .matmul_o = undefined,
+    };
+
+    var scratch = AttnTemp{};
+    defer scratch.deinit(allocator);
+
+    try mha.ensureTemp(&scratch, 2, false, 8, 8, true);
+    try std.testing.expect(scratch.qkv.len >= 2 * 2 * (8 + 2 * 8));
+}
+
+test "applyGatedAttentionOutputInPlace applies sigmoid gate to attention output" {
+    var context = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const packed_q = [_]f32{
+        10, 11, 0, 1, 12, 13, -1, 2,
+        20, 21, 1, 0, 22, 23, 2,  -2,
+    };
+    try cpu_gated_attention.applyOutputGateInPlace(&context, &packed_q, 2, 4, 8, 2, 2);
+    const expected = [_]f32{
+        1 * (1.0 / (1.0 + @exp(-@as(f32, 0)))),
+        2 * (1.0 / (1.0 + @exp(-@as(f32, 1)))),
+        3 * (1.0 / (1.0 + @exp(-@as(f32, -1)))),
+        4 * (1.0 / (1.0 + @exp(-@as(f32, 2)))),
+        5 * (1.0 / (1.0 + @exp(-@as(f32, 1)))),
+        6 * (1.0 / (1.0 + @exp(-@as(f32, 0)))),
+        7 * (1.0 / (1.0 + @exp(-@as(f32, 2)))),
+        8 * (1.0 / (1.0 + @exp(-@as(f32, -2)))),
+    };
+    try std.testing.expectEqualSlices(f32, &expected, &context);
 }
 
 test "applyPositionDelta applies negative multimodal offset" {

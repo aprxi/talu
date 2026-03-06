@@ -29,9 +29,11 @@ const mla_kernel = @import("../kernels/mla_attention.zig");
 const ffn_kernel = @import("../kernels/ffn.zig");
 const moe_kernel = @import("../kernels/moe.zig");
 const mamba_kernel = @import("../kernels/mamba.zig");
+const gated_delta_kernel = @import("../kernels/gated_delta.zig");
 const shortconv_kernel = @import("../kernels/shortconv.zig");
 const vision_adapters = @import("../../../vision_program_adapters.zig");
 const state_bindings = @import("../state_bindings.zig");
+const trace = @import("../../../../xray/root.zig").trace;
 
 const Tensor = tensor.Tensor;
 const Attention = attn_kernel.MultiHeadAttention;
@@ -52,6 +54,7 @@ const MlaAttentionKernelBinding = *const mla_kernel.MLAttention;
 const SwiGLUKernelBinding = *const ffn_kernel.SwiGLU;
 const MoeKernelBinding = *const moe_kernel.MoEFFN;
 const MambaKernelBinding = *const mamba_kernel.MambaKernel;
+const GatedDeltaKernelBinding = *const gated_delta_kernel.GatedDeltaKernel;
 const ShortConvKernelBinding = *const shortconv_kernel.ShortConvKernel;
 fn zeroTensor() Tensor {
     return .{
@@ -87,6 +90,7 @@ const AttentionRuntimeMetadata = struct {
     rope: @TypeOf(@as(attn_kernel.MultiHeadAttention, undefined).rope),
     runtime_rope: @TypeOf(@as(attn_kernel.MultiHeadAttention, undefined).runtime_rope),
     position_delta: isize,
+    rope_interleaved: bool,
     norm_eps: f32,
     allocator: std.mem.Allocator,
     matmul_qkv: @TypeOf(@as(attn_kernel.MultiHeadAttention, undefined).matmul_qkv),
@@ -171,10 +175,16 @@ const MoeRuntimeMetadata = struct {
 };
 
 const MambaRuntimeMetadata = struct {
-    config: @TypeOf(@as(mamba_kernel.MambaKernel, undefined).config),
+    mamba_config: @TypeOf(@as(mamba_kernel.MambaKernel, undefined).config),
     matmul_in_proj: @TypeOf(@as(mamba_kernel.MambaKernel, undefined).matmul_in_proj),
     matmul_out_proj: @TypeOf(@as(mamba_kernel.MambaKernel, undefined).matmul_out_proj),
-    ssm_scan: @TypeOf(@as(mamba_kernel.MambaKernel, undefined).ssm_scan),
+    ssm_scan: ?@TypeOf(@as(mamba_kernel.MambaKernel, undefined).ssm_scan) = null,
+    layer_idx: u16,
+};
+
+const GatedDeltaRuntimeMetadata = struct {
+    matmul_in_proj: @TypeOf(@as(gated_delta_kernel.GatedDeltaKernel, undefined).matmul_in_proj),
+    matmul_out_proj: @TypeOf(@as(gated_delta_kernel.GatedDeltaKernel, undefined).matmul_out_proj),
     layer_idx: u16,
 };
 
@@ -340,6 +350,7 @@ pub const Block = struct {
     instruction_swiglu_bindings: []?SwiGLUKernelBinding = &.{},
     instruction_moe_bindings: []?MoeKernelBinding = &.{},
     instruction_mamba_bindings: []?MambaKernelBinding = &.{},
+    instruction_gated_delta_bindings: []?GatedDeltaKernelBinding = &.{},
     instruction_shortconv_bindings: []?ShortConvKernelBinding = &.{},
     /// Execute-path non-weight metadata derived at load time.
     instruction_norm_runtime_metadata: []?NormRuntimeMetadata = &.{},
@@ -348,6 +359,7 @@ pub const Block = struct {
     instruction_swiglu_runtime_metadata: []?SwiGluRuntimeMetadata = &.{},
     instruction_moe_runtime_metadata: []?MoeRuntimeMetadata = &.{},
     instruction_mamba_runtime_metadata: []?MambaRuntimeMetadata = &.{},
+    instruction_gated_delta_runtime_metadata: []?GatedDeltaRuntimeMetadata = &.{},
     instruction_shortconv_runtime_metadata: []?ShortConvRuntimeMetadata = &.{},
     /// Per-instruction prefix offsets into `instruction_weight_ptrs`.
     instruction_weight_offsets: []u32 = &.{},
@@ -407,6 +419,7 @@ pub const Block = struct {
         const runtime_metadata = try buildRuntimeMetadata(
             allocator,
             typed_kernel_refs,
+            &compiled_plan.plan,
         );
         const weight_table = try buildInstructionWeightTable(
             allocator,
@@ -433,6 +446,7 @@ pub const Block = struct {
             .instruction_swiglu_bindings = typed_kernel_refs.swiglu,
             .instruction_moe_bindings = typed_kernel_refs.moe,
             .instruction_mamba_bindings = typed_kernel_refs.mamba,
+            .instruction_gated_delta_bindings = typed_kernel_refs.gated_delta,
             .instruction_shortconv_bindings = typed_kernel_refs.shortconv,
             .instruction_norm_runtime_metadata = runtime_metadata.norm,
             .instruction_attention_runtime_metadata = runtime_metadata.attention,
@@ -440,6 +454,7 @@ pub const Block = struct {
             .instruction_swiglu_runtime_metadata = runtime_metadata.swiglu,
             .instruction_moe_runtime_metadata = runtime_metadata.moe,
             .instruction_mamba_runtime_metadata = runtime_metadata.mamba,
+            .instruction_gated_delta_runtime_metadata = runtime_metadata.gated_delta,
             .instruction_shortconv_runtime_metadata = runtime_metadata.shortconv,
             .instruction_weight_offsets = weight_table.offsets,
             .instruction_weight_ptrs = weight_table.ptrs,
@@ -464,6 +479,7 @@ pub const Block = struct {
         if (self.instruction_swiglu_bindings.len > 0) allocator.free(self.instruction_swiglu_bindings);
         if (self.instruction_moe_bindings.len > 0) allocator.free(self.instruction_moe_bindings);
         if (self.instruction_mamba_bindings.len > 0) allocator.free(self.instruction_mamba_bindings);
+        if (self.instruction_gated_delta_bindings.len > 0) allocator.free(self.instruction_gated_delta_bindings);
         if (self.instruction_shortconv_bindings.len > 0) allocator.free(self.instruction_shortconv_bindings);
         if (self.instruction_norm_runtime_metadata.len > 0) allocator.free(self.instruction_norm_runtime_metadata);
         if (self.instruction_attention_runtime_metadata.len > 0) allocator.free(self.instruction_attention_runtime_metadata);
@@ -471,6 +487,7 @@ pub const Block = struct {
         if (self.instruction_swiglu_runtime_metadata.len > 0) allocator.free(self.instruction_swiglu_runtime_metadata);
         if (self.instruction_moe_runtime_metadata.len > 0) allocator.free(self.instruction_moe_runtime_metadata);
         if (self.instruction_mamba_runtime_metadata.len > 0) allocator.free(self.instruction_mamba_runtime_metadata);
+        if (self.instruction_gated_delta_runtime_metadata.len > 0) allocator.free(self.instruction_gated_delta_runtime_metadata);
         if (self.instruction_shortconv_runtime_metadata.len > 0) allocator.free(self.instruction_shortconv_runtime_metadata);
         plan_compiler.deinitCompiledPlan(allocator, &self.compiled_plan);
         self.* = undefined;
@@ -503,6 +520,7 @@ pub const Block = struct {
         swiglu: []?SwiGLUKernelBinding,
         moe: []?MoeKernelBinding,
         mamba: []?MambaKernelBinding,
+        gated_delta: []?GatedDeltaKernelBinding,
         shortconv: []?ShortConvKernelBinding,
 
         fn deinit(self: TypedInstructionKernelRefs, allocator: std.mem.Allocator) void {
@@ -512,6 +530,7 @@ pub const Block = struct {
             allocator.free(self.swiglu);
             allocator.free(self.moe);
             allocator.free(self.mamba);
+            allocator.free(self.gated_delta);
             allocator.free(self.shortconv);
         }
     };
@@ -523,6 +542,7 @@ pub const Block = struct {
         swiglu: []?SwiGluRuntimeMetadata,
         moe: []?MoeRuntimeMetadata,
         mamba: []?MambaRuntimeMetadata,
+        gated_delta: []?GatedDeltaRuntimeMetadata,
         shortconv: []?ShortConvRuntimeMetadata,
 
         fn deinit(self: RuntimeMetadata, allocator: std.mem.Allocator) void {
@@ -532,6 +552,7 @@ pub const Block = struct {
             allocator.free(self.swiglu);
             allocator.free(self.moe);
             allocator.free(self.mamba);
+            allocator.free(self.gated_delta);
             allocator.free(self.shortconv);
         }
     };
@@ -539,6 +560,7 @@ pub const Block = struct {
     fn buildRuntimeMetadata(
         allocator: std.mem.Allocator,
         typed_kernel_refs: TypedInstructionKernelRefs,
+        plan: *const runtime_contract.ExecutionPlan,
     ) !RuntimeMetadata {
         const len = typed_kernel_refs.norm.len;
         const norm = try allocator.alloc(?NormRuntimeMetadata, len);
@@ -553,6 +575,8 @@ pub const Block = struct {
         errdefer allocator.free(moe);
         const mamba = try allocator.alloc(?MambaRuntimeMetadata, len);
         errdefer allocator.free(mamba);
+        const gated_delta = try allocator.alloc(?GatedDeltaRuntimeMetadata, len);
+        errdefer allocator.free(gated_delta);
         const shortconv = try allocator.alloc(?ShortConvRuntimeMetadata, len);
         errdefer allocator.free(shortconv);
         @memset(norm, null);
@@ -561,6 +585,7 @@ pub const Block = struct {
         @memset(swiglu, null);
         @memset(moe, null);
         @memset(mamba, null);
+        @memset(gated_delta, null);
         @memset(shortconv, null);
 
         for (0..len) |idx| {
@@ -601,6 +626,7 @@ pub const Block = struct {
                     .rope = binding.rope,
                     .runtime_rope = binding.runtime_rope,
                     .position_delta = binding.position_delta,
+                    .rope_interleaved = binding.rope_interleaved,
                     .norm_eps = binding.norm_eps,
                     .allocator = binding.allocator,
                     .matmul_qkv = binding.matmul_qkv,
@@ -699,11 +725,20 @@ pub const Block = struct {
                 };
             }
             if (typed_kernel_refs.mamba[idx]) |binding| {
+                if (plan.instructions[idx].opcode != .mamba_mixer) return error.InvalidInstructionBinding;
                 mamba[idx] = .{
-                    .config = binding.config,
+                    .mamba_config = binding.config,
                     .matmul_in_proj = binding.matmul_in_proj,
                     .matmul_out_proj = binding.matmul_out_proj,
                     .ssm_scan = binding.ssm_scan,
+                    .layer_idx = binding.layer_idx,
+                };
+            }
+            if (typed_kernel_refs.gated_delta[idx]) |binding| {
+                if (plan.instructions[idx].opcode != .gated_delta_net) return error.InvalidInstructionBinding;
+                gated_delta[idx] = .{
+                    .matmul_in_proj = binding.matmul_in_proj,
+                    .matmul_out_proj = binding.matmul_out_proj,
                     .layer_idx = binding.layer_idx,
                 };
             }
@@ -738,6 +773,7 @@ pub const Block = struct {
             .swiglu = swiglu,
             .moe = moe,
             .mamba = mamba,
+            .gated_delta = gated_delta,
             .shortconv = shortconv,
         };
     }
@@ -761,6 +797,8 @@ pub const Block = struct {
         errdefer allocator.free(moe);
         const mamba = try allocator.alloc(?MambaKernelBinding, len);
         errdefer allocator.free(mamba);
+        const gated_delta = try allocator.alloc(?GatedDeltaKernelBinding, len);
+        errdefer allocator.free(gated_delta);
         const shortconv = try allocator.alloc(?ShortConvKernelBinding, len);
         errdefer allocator.free(shortconv);
 
@@ -770,6 +808,7 @@ pub const Block = struct {
         @memset(swiglu, null);
         @memset(moe, null);
         @memset(mamba, null);
+        @memset(gated_delta, null);
         @memset(shortconv, null);
 
         for (compiled_plan.plan.instructions, 0..) |insn, op_index| {
@@ -815,6 +854,10 @@ pub const Block = struct {
                     .mamba => |binding| binding,
                     else => return error.InvalidInstructionBinding,
                 },
+                .gated_delta_net => gated_delta[op_index] = switch (kernel) {
+                    .gated_delta => |binding| binding,
+                    else => return error.InvalidInstructionBinding,
+                },
                 .shortconv => shortconv[op_index] = switch (kernel) {
                     .shortconv => |binding| binding,
                     else => return error.InvalidInstructionBinding,
@@ -830,6 +873,7 @@ pub const Block = struct {
             .swiglu = swiglu,
             .moe = moe,
             .mamba = mamba,
+            .gated_delta = gated_delta,
             .shortconv = shortconv,
         };
     }
@@ -1037,21 +1081,22 @@ pub const Block = struct {
             },
             .mamba_mixer => {
                 const mamba_binding = typed_kernel_refs.mamba[op_index] orelse return error.InvalidInstructionBinding;
+                const binding = mamba_binding;
                 return switch (slot_idx) {
-                    0 => @ptrCast(@constCast(mamba_binding.weights.in_proj)),
-                    1 => @ptrCast(@constCast(mamba_binding.weights.conv1d_weight)),
-                    2 => @ptrCast(@constCast(mamba_binding.weights.A_log)),
-                    3 => @ptrCast(@constCast(mamba_binding.weights.D)),
-                    4 => @ptrCast(@constCast(mamba_binding.weights.out_proj)),
-                    5 => if (mamba_binding.weights.conv1d_bias) |conv_bias|
+                    0 => @ptrCast(@constCast(binding.weights.in_proj)),
+                    1 => @ptrCast(@constCast(binding.weights.conv1d_weight)),
+                    2 => @ptrCast(@constCast(binding.weights.A_log)),
+                    3 => @ptrCast(@constCast(binding.weights.D)),
+                    4 => @ptrCast(@constCast(binding.weights.out_proj)),
+                    5 => if (binding.weights.conv1d_bias) |conv_bias|
                         @ptrCast(@constCast(conv_bias))
                     else
                         @ptrCast(@constCast(&missing_weight_tensor)),
-                    6 => if (mamba_binding.weights.dt_bias) |dt_bias|
+                    6 => if (binding.weights.dt_bias) |dt_bias|
                         @ptrCast(@constCast(dt_bias))
                     else
                         @ptrCast(@constCast(&missing_weight_tensor)),
-                    7 => if (mamba_binding.weights.norm_weight) |norm_weight|
+                    7 => if (binding.weights.norm_weight) |norm_weight|
                         @ptrCast(@constCast(norm_weight))
                     else
                         @ptrCast(@constCast(&missing_weight_tensor)),
@@ -1059,6 +1104,28 @@ pub const Block = struct {
                     9 => @ptrCast(@constCast(&missing_weight_tensor)),
                     10 => @ptrCast(@constCast(&missing_weight_tensor)),
                     11 => @ptrCast(@constCast(&missing_weight_tensor)),
+                    else => error.InvalidWeightRefCount,
+                };
+            },
+            .gated_delta_net => {
+                const binding = typed_kernel_refs.gated_delta[op_index] orelse return error.InvalidInstructionBinding;
+                return switch (slot_idx) {
+                    0 => @ptrCast(@constCast(binding.weights.in_proj)),
+                    1 => @ptrCast(@constCast(binding.weights.conv1d_weight)),
+                    2 => @ptrCast(@constCast(binding.weights.A_log)),
+                    3 => @ptrCast(@constCast(binding.weights.out_proj)),
+                    4 => if (binding.weights.conv1d_bias) |conv_bias|
+                        @ptrCast(@constCast(conv_bias))
+                    else
+                        @ptrCast(@constCast(&missing_weight_tensor)),
+                    5 => if (binding.weights.dt_bias) |dt_bias|
+                        @ptrCast(@constCast(dt_bias))
+                    else
+                        @ptrCast(@constCast(&missing_weight_tensor)),
+                    6 => if (binding.weights.norm_weight) |norm_weight|
+                        @ptrCast(@constCast(norm_weight))
+                    else
+                        @ptrCast(@constCast(&missing_weight_tensor)),
                     else => error.InvalidWeightRefCount,
                 };
             },
@@ -1415,6 +1482,7 @@ pub const Block = struct {
             .swiglu => op_index < self.instruction_swiglu_runtime_metadata.len and self.instruction_swiglu_runtime_metadata[op_index] != null,
             .moe => op_index < self.instruction_moe_runtime_metadata.len and self.instruction_moe_runtime_metadata[op_index] != null,
             .mamba_mixer => op_index < self.instruction_mamba_runtime_metadata.len and self.instruction_mamba_runtime_metadata[op_index] != null,
+            .gated_delta_net => op_index < self.instruction_gated_delta_runtime_metadata.len and self.instruction_gated_delta_runtime_metadata[op_index] != null,
             .shortconv => op_index < self.instruction_shortconv_runtime_metadata.len and self.instruction_shortconv_runtime_metadata[op_index] != null,
             else => false,
         };
@@ -1540,6 +1608,7 @@ pub const Block = struct {
         .multihead_attention,
         .swiglu,
         .mamba_mixer,
+        .gated_delta_net,
         .shortconv,
         .mla_attention,
         .residual_add,
@@ -1574,6 +1643,7 @@ pub const Block = struct {
         table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = multiheadAttentionKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.swiglu)] = swiGluKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = mambaMixerKernelRuntimeAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.gated_delta_net)] = gatedDeltaNetKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.shortconv)] = shortConvKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = mlaAttentionKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.residual_add)] = residualAddRuntimeAdapter;
@@ -1621,6 +1691,7 @@ pub const Block = struct {
         caps[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.swiglu)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
+        caps[@intFromEnum(runtime_contract.Opcode.gated_delta_net)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.shortconv)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.mla_attention)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.residual_add)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
@@ -1677,6 +1748,7 @@ pub const Block = struct {
         table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = true;
         table[@intFromEnum(runtime_contract.Opcode.swiglu)] = true;
         table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.gated_delta_net)] = true;
         table[@intFromEnum(runtime_contract.Opcode.shortconv)] = true;
         break :blk table;
     };
@@ -1704,6 +1776,7 @@ pub const Block = struct {
     const batched_decode_unsupported: [256]bool = blk: {
         var table = [_]bool{false} ** 256;
         table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.gated_delta_net)] = true;
         table[@intFromEnum(runtime_contract.Opcode.shortconv)] = true;
         table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = true;
         break :blk table;
@@ -1804,7 +1877,6 @@ pub const Block = struct {
             params,
         );
     }
-
     fn mlaAttentionKernelRuntimeAdapter(
         ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
@@ -1881,6 +1953,25 @@ pub const Block = struct {
         );
     }
 
+    fn gatedDeltaNetKernelRuntimeAdapter(
+        ctx: *runtime_contract.ExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        views: []const runtime_contract.TensorViewDesc,
+        state_blocks: []runtime_contract.StateBlockHandle,
+        params: []const runtime_contract.ParamBlock,
+    ) !void {
+        try macroKernelRuntimeAdapter(
+            .gated_delta_net,
+            ctx,
+            insn,
+            registers,
+            views,
+            state_blocks,
+            params,
+        );
+    }
+
     fn shortConvKernelRuntimeAdapter(
         ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
@@ -1907,7 +1998,7 @@ pub const Block = struct {
         registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        _: []const runtime_contract.ParamBlock,
+        params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
         try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
@@ -1953,6 +2044,11 @@ pub const Block = struct {
             if (weight_handles.len != 11) return error.InvalidWeightRefCount;
             if (state.op_index >= state.block.instruction_attention_runtime_metadata.len) return error.InvalidInstructionIndex;
             const meta = state.block.instruction_attention_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
+            const attention_param = try runtime_contract.paramAs(
+                runtime_contract.AttentionKernelParam,
+                params,
+                .multihead_attention,
+            );
             const q_proj_or_fused = tensorFromWeightHandle(weight_handles[0]);
             const k_proj_or_missing = tensorFromWeightHandle(weight_handles[1]);
             const v_proj_or_missing = tensorFromWeightHandle(weight_handles[2]);
@@ -1967,6 +2063,7 @@ pub const Block = struct {
                 .sliding_window = meta.sliding_window,
                 .is_causal = meta.is_causal,
                 .layer_idx = meta.layer_idx,
+                .query_gate = attention_param.query_gate != 0,
                 .q_proj = null,
                 .k_proj = null,
                 .v_proj = null,
@@ -1975,6 +2072,7 @@ pub const Block = struct {
                 .rope = meta.rope,
                 .runtime_rope = meta.runtime_rope,
                 .position_delta = meta.position_delta,
+                .rope_interleaved = meta.rope_interleaved,
                 .q_norm = null,
                 .k_norm = null,
                 .norm_eps = meta.norm_eps,
@@ -2139,8 +2237,14 @@ pub const Block = struct {
             if (weight_handles.len != 12) return error.InvalidWeightRefCount;
             if (state.op_index >= state.block.instruction_mamba_runtime_metadata.len) return error.InvalidInstructionIndex;
             const meta = state.block.instruction_mamba_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
+            // Phase-5 slot contract carries these optional/fused follow-on weights.
+            // CPU mamba mixer kernel does not consume them directly in this opcode.
+            _ = tensorFromWeightHandle(weight_handles[8]);
+            _ = optionalTensorFromWeightHandle(weight_handles[9]);
+            _ = optionalTensorFromWeightHandle(weight_handles[10]);
+            _ = optionalTensorFromWeightHandle(weight_handles[11]);
             var mamba_local = mamba_kernel.MambaKernel{
-                .config = meta.config,
+                .config = meta.mamba_config,
                 .weights = .{
                     .in_proj = tensorFromWeightHandle(weight_handles[0]),
                     .conv1d_weight = tensorFromWeightHandle(weight_handles[1]),
@@ -2153,16 +2257,47 @@ pub const Block = struct {
                 },
                 .matmul_in_proj = meta.matmul_in_proj,
                 .matmul_out_proj = meta.matmul_out_proj,
-                .ssm_scan = meta.ssm_scan,
+                .ssm_scan = meta.ssm_scan orelse return error.InvalidInstructionBinding,
                 .layer_idx = meta.layer_idx,
             };
-            // Phase-5 slot contract carries these optional/fused follow-on weights.
-            // CPU mamba mixer kernel does not consume them directly in this opcode.
-            _ = tensorFromWeightHandle(weight_handles[8]);
-            _ = optionalTensorFromWeightHandle(weight_handles[9]);
-            _ = optionalTensorFromWeightHandle(weight_handles[10]);
-            _ = optionalTensorFromWeightHandle(weight_handles[11]);
             try dispatchMambaWithMode(state, insn, state_blocks, input, output, &mamba_local);
+            return;
+        } else if (comptime expected_opcode == .gated_delta_net) {
+            if (weight_handles.len != 7) return error.InvalidWeightRefCount;
+            if (state.op_index >= state.block.instruction_gated_delta_runtime_metadata.len) return error.InvalidInstructionIndex;
+            const meta = state.block.instruction_gated_delta_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
+            const gated_delta_param = try runtime_contract.paramAs(
+                runtime_contract.GatedDeltaKernelParam,
+                params,
+                .gated_delta_net,
+            );
+            const d_model = std.math.mul(
+                u32,
+                gated_delta_param.n_heads,
+                gated_delta_param.d_head,
+            ) catch return error.InvalidParamBlockABI;
+            if (gated_delta_param.d_inner != d_model) return error.InvalidParamBlockABI;
+            var gated_delta_local = gated_delta_kernel.GatedDeltaKernel{
+                .config = .{
+                    .d_model = d_model,
+                    .d_conv = gated_delta_param.d_conv,
+                    .n_heads = gated_delta_param.n_heads,
+                    .d_head = gated_delta_param.d_head,
+                },
+                .weights = .{
+                    .in_proj = tensorFromWeightHandle(weight_handles[0]),
+                    .conv1d_weight = tensorFromWeightHandle(weight_handles[1]),
+                    .conv1d_bias = optionalTensorFromWeightHandle(weight_handles[4]),
+                    .A_log = tensorFromWeightHandle(weight_handles[2]),
+                    .dt_bias = optionalTensorFromWeightHandle(weight_handles[5]),
+                    .norm_weight = optionalTensorFromWeightHandle(weight_handles[6]),
+                    .out_proj = tensorFromWeightHandle(weight_handles[3]),
+                },
+                .matmul_in_proj = meta.matmul_in_proj,
+                .matmul_out_proj = meta.matmul_out_proj,
+                .layer_idx = meta.layer_idx,
+            };
+            try dispatchGatedDeltaWithMode(state, insn, state_blocks, input, output, &gated_delta_local);
             return;
         } else if (comptime expected_opcode == .shortconv) {
             if (weight_handles.len != 4) return error.InvalidWeightRefCount;
@@ -2306,6 +2441,31 @@ pub const Block = struct {
         if (!state.use_batched_dispatch) return error.InvalidStateDescriptorBinding;
         if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
         const binding = try requireMambaRuntimeBindingForInstruction(
+            state,
+            insn,
+            state_blocks,
+            state.block.block_idx,
+        );
+        try kernel.forward(
+            input,
+            output,
+            binding.state,
+            binding.scratch,
+            &state.scratch.matmul_scratch,
+        );
+    }
+
+    fn dispatchGatedDeltaWithMode(
+        state: *RuntimeDispatchState,
+        insn: *const runtime_contract.Instruction,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+        input: *const Tensor,
+        output: *Tensor,
+        kernel: *const gated_delta_kernel.GatedDeltaKernel,
+    ) !void {
+        if (!state.use_batched_dispatch) return error.InvalidStateDescriptorBinding;
+        if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
+        const binding = try requireGatedDeltaRuntimeBindingForInstruction(
             state,
             insn,
             state_blocks,
@@ -3363,6 +3523,11 @@ pub const Block = struct {
         scratch: *runtime.MambaScratch,
     };
 
+    const GatedDeltaRuntimeBinding = struct {
+        state: *runtime.GatedDeltaState,
+        scratch: *runtime.GatedDeltaScratch,
+    };
+
     fn requireMambaRuntimeBindingForInstruction(
         _: *RuntimeDispatchState,
         insn: *const runtime_contract.Instruction,
@@ -3387,6 +3552,39 @@ pub const Block = struct {
         return .{
             .state = mamba_state,
             .scratch = mamba_scratch,
+        };
+    }
+
+    fn requireGatedDeltaRuntimeBindingForInstruction(
+        _: *RuntimeDispatchState,
+        insn: *const runtime_contract.Instruction,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+        block_idx: usize,
+    ) !GatedDeltaRuntimeBinding {
+        const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
+        const state_block = runtime_contract.findStateBlock(state_blocks, state_id) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        const recurrent_state = runtime_contract.stateValueFromBlock(*state_bindings.RecurrentRuntimeState, state_block) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        if (recurrent_state.runtime_kind != runtime_contract.state_runtime_kind_gated_delta_cache) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        const slot_state = recurrent_state.scratch.getSlotLayerState(recurrent_state.slot_index, block_idx) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        const gated_delta_state = if (slot_state.gated_delta_state) |*slot_gated_delta_state|
+            slot_gated_delta_state
+        else {
+            return error.InvalidStateDescriptorBinding;
+        };
+        const gated_delta_scratch = recurrent_state.scratch.getGatedDeltaScratch() orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        return .{
+            .state = gated_delta_state,
+            .scratch = gated_delta_scratch,
         };
     }
 
@@ -3653,12 +3851,20 @@ pub const Block = struct {
             try writer.writeAll("(ffn): ");
             try ffn.describe(writer, indent + 2, show_kernels);
         }
-        if (self.block._mamba) |mamba_k| {
+        if (self.block.getMambaKernel()) |mamba_k| {
             try writer.writeByteNTimes(' ', indent + 2);
             try writer.print("(mixer): Mamba(d_model={}, d_state={}, d_conv={})\n", .{
                 mamba_k.config.d_model,
                 mamba_k.config.d_state,
                 mamba_k.config.d_conv,
+            });
+        }
+        if (self.block.getGatedDeltaKernel()) |gated_delta_k| {
+            try writer.writeByteNTimes(' ', indent + 2);
+            try writer.print("(mixer): GatedDelta(d_model={}, d_head={}, d_conv={})\n", .{
+                gated_delta_k.config.d_model,
+                gated_delta_k.config.d_head,
+                gated_delta_k.config.d_conv,
             });
         }
 
@@ -3702,6 +3908,13 @@ pub const Block = struct {
                         m.config.d_model,
                         m.config.d_state,
                         m.config.d_conv,
+                    });
+                },
+                .gated_delta_net => if (self.instruction_gated_delta_bindings[op_index]) |g| {
+                    try writer.print(": GatedDelta(d_model={}, d_head={}, d_conv={})", .{
+                        g.config.d_model,
+                        g.config.d_head,
+                        g.config.d_conv,
                     });
                 },
                 .shortconv => if (self.instruction_shortconv_bindings[op_index]) |s| {
@@ -4032,6 +4245,7 @@ fn createTestTransformerBlock(allocator: std.mem.Allocator, weights: *TestWeight
         block_weights,
         1e-5,
         .{}, // ModelRuntime with default values
+        false,
         1.0,
         1.0,
         false,
@@ -4266,6 +4480,7 @@ test "resolveKernelWeightPtrForSlot emits missing sentinels for fused attention 
     var swiglu = [_]?SwiGLUKernelBinding{null};
     var moe = [_]?MoeKernelBinding{null};
     var mamba = [_]?MambaKernelBinding{null};
+    var gated_delta = [_]?GatedDeltaKernelBinding{null};
     var shortconv = [_]?ShortConvKernelBinding{null};
     const typed = Block.TypedInstructionKernelRefs{
         .norm = norm[0..],
@@ -4274,6 +4489,7 @@ test "resolveKernelWeightPtrForSlot emits missing sentinels for fused attention 
         .swiglu = swiglu[0..],
         .moe = moe[0..],
         .mamba = mamba[0..],
+        .gated_delta = gated_delta[0..],
         .shortconv = shortconv[0..],
     };
     const insn = runtime_contract.Instruction{
@@ -4333,6 +4549,7 @@ test "buildRuntimeMetadata preserves shortconv time-major weight tensor view" {
     var swiglu = [_]?SwiGLUKernelBinding{null};
     var moe = [_]?MoeKernelBinding{null};
     var mamba = [_]?MambaKernelBinding{null};
+    var gated_delta = [_]?GatedDeltaKernelBinding{null};
     var shortconv = [_]?ShortConvKernelBinding{&shortconv_binding};
     const typed = Block.TypedInstructionKernelRefs{
         .norm = norm[0..],
@@ -4341,10 +4558,25 @@ test "buildRuntimeMetadata preserves shortconv time-major weight tensor view" {
         .swiglu = swiglu[0..],
         .moe = moe[0..],
         .mamba = mamba[0..],
+        .gated_delta = gated_delta[0..],
         .shortconv = shortconv[0..],
     };
 
-    var runtime_meta = try Block.buildRuntimeMetadata(testing.allocator, typed);
+    const plan = runtime_contract.ExecutionPlan{
+        .instructions = &.{
+            .{
+                .opcode = .shortconv,
+                .inputs = &.{},
+                .outputs = &.{},
+                .weights = &.{},
+                .param_block_id = null,
+                .state_block_id = null,
+            },
+        },
+        .register_count = 0,
+        .state_descs = &.{},
+    };
+    var runtime_meta = try Block.buildRuntimeMetadata(testing.allocator, typed, &plan);
     defer runtime_meta.deinit(testing.allocator);
     const shortconv_meta = runtime_meta.shortconv[0] orelse return error.TestUnexpectedResult;
     const time_major_tensor = shortconv_meta.conv_weight_time_major orelse return error.TestUnexpectedResult;
@@ -4371,6 +4603,7 @@ test "shortConvTimeMajorWeightPtr returns pointer only for shortconv slot 1" {
     var swiglu = [_]?SwiGluRuntimeMetadata{null};
     var moe = [_]?MoeRuntimeMetadata{null};
     var mamba = [_]?MambaRuntimeMetadata{null};
+    var gated_delta = [_]?GatedDeltaRuntimeMetadata{null};
     const runtime_meta = Block.RuntimeMetadata{
         .norm = norm[0..],
         .attention = attention[0..],
@@ -4378,6 +4611,7 @@ test "shortConvTimeMajorWeightPtr returns pointer only for shortconv slot 1" {
         .swiglu = swiglu[0..],
         .moe = moe[0..],
         .mamba = mamba[0..],
+        .gated_delta = gated_delta[0..],
         .shortconv = shortconv[0..],
     };
 
@@ -4413,6 +4647,7 @@ test "resolveKernelWeightPtrForSlot routes layernorm bias via norm_bias slot" {
     var swiglu = [_]?SwiGLUKernelBinding{null};
     var moe = [_]?MoeKernelBinding{null};
     var mamba = [_]?MambaKernelBinding{null};
+    var gated_delta = [_]?GatedDeltaKernelBinding{null};
     var shortconv = [_]?ShortConvKernelBinding{null};
     const typed = Block.TypedInstructionKernelRefs{
         .norm = norm[0..],
@@ -4421,6 +4656,7 @@ test "resolveKernelWeightPtrForSlot routes layernorm bias via norm_bias slot" {
         .swiglu = swiglu[0..],
         .moe = moe[0..],
         .mamba = mamba[0..],
+        .gated_delta = gated_delta[0..],
         .shortconv = shortconv[0..],
     };
 
@@ -4445,6 +4681,7 @@ test "resolveKernelWeightPtrForSlot emits missing sentinel for dense swiglu up s
     var swiglu = [_]?SwiGLUKernelBinding{&swiglu_binding};
     var moe = [_]?MoeKernelBinding{null};
     var mamba = [_]?MambaKernelBinding{null};
+    var gated_delta = [_]?GatedDeltaKernelBinding{null};
     var shortconv = [_]?ShortConvKernelBinding{null};
     const typed = Block.TypedInstructionKernelRefs{
         .norm = norm[0..],
@@ -4453,6 +4690,7 @@ test "resolveKernelWeightPtrForSlot emits missing sentinel for dense swiglu up s
         .swiglu = swiglu[0..],
         .moe = moe[0..],
         .mamba = mamba[0..],
+        .gated_delta = gated_delta[0..],
         .shortconv = shortconv[0..],
     };
     const insn = runtime_contract.Instruction{
@@ -4500,6 +4738,7 @@ test "resolveKernelWeightPtrForSlot rejects multi-expert moe bindings" {
     var swiglu = [_]?SwiGLUKernelBinding{null};
     var moe = [_]?MoeKernelBinding{&moe_binding};
     var mamba = [_]?MambaKernelBinding{null};
+    var gated_delta = [_]?GatedDeltaKernelBinding{null};
     var shortconv = [_]?ShortConvKernelBinding{null};
     const typed = Block.TypedInstructionKernelRefs{
         .norm = norm[0..],
@@ -4508,6 +4747,7 @@ test "resolveKernelWeightPtrForSlot rejects multi-expert moe bindings" {
         .swiglu = swiglu[0..],
         .moe = moe[0..],
         .mamba = mamba[0..],
+        .gated_delta = gated_delta[0..],
         .shortconv = shortconv[0..],
     };
 

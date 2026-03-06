@@ -482,6 +482,7 @@ pub fn loadModelWithArchitecture(
             .sliding_window = if (block_type == .attention_mlp) layer_window_size else 0,
             .kernel_meta = layer_meta,
             .mamba_config = null,
+            .gated_delta_config = null,
             .shortconv_config = null,
             // MoE configuration (architecture-driven loading)
             .num_experts = if (model_config.num_experts > 0) @intCast(model_config.num_experts) else 0,
@@ -503,6 +504,16 @@ pub fn loadModelWithArchitecture(
                 .d_head = if (meta_cfg) |cfg| cfg.d_head else @intCast(model_config.mamba_d_head),
                 .n_groups = if (meta_cfg) |cfg| cfg.n_groups else @intCast(model_config.mamba_n_groups),
             };
+        }
+        if (block_type == .gated_delta) {
+            if (layer_meta.gated_delta_config) |cfg| {
+                map_context.gated_delta_config = .{
+                    .d_model = @intCast(model_config.d_model),
+                    .d_conv = cfg.d_conv,
+                    .n_heads = cfg.n_heads,
+                    .d_head = cfg.d_head,
+                };
+            } else return error.MissingGatedDeltaConfig;
         }
         if (block_type == .shortconv) {
             const meta_cfg = layer_meta.shortconv_config;
@@ -668,6 +679,7 @@ fn transposeToOwned(allocator: std.mem.Allocator, t: Tensor, data_type: DType) !
 
     return owned.view();
 }
+
 
 fn readEnvFlag(allocator: std.mem.Allocator, name: []const u8, default_value: bool) bool {
     const env_value = std.process.getEnvVarOwned(allocator, name) catch return default_value;
@@ -1195,6 +1207,7 @@ test "transposeToOwned: BF16 transpose" {
     try std.testing.expectEqual(@as(u16, 0x4000), result_data[2]);
     try std.testing.expectEqual(@as(u16, 0x4080), result_data[3]);
 }
+
 
 test "bytesToU16Slice: aligned conversion" {
     const allocator = std.testing.allocator;

@@ -582,8 +582,9 @@ fn getMetalUnsupportedReason(
 }
 
 fn runtimeHasMetalUnsupportedFeatures(runtime: *const tensor.ModelRuntime) bool {
-    // Metal decode-model path currently does not support mamba layer topology.
-    return runtime.has_mamba;
+    // Metal decode-model path currently does not support recurrent mamba or
+    // gated-delta layer topologies.
+    return runtime.has_mamba or runtime.has_gated_delta;
 }
 
 fn initCpu(
@@ -694,6 +695,10 @@ test "runtimeHasMetalUnsupportedFeatures flags unsupported metal topology" {
 
     runtime.has_mla = false;
     runtime.has_mamba = true;
+    try std.testing.expect(runtimeHasMetalUnsupportedFeatures(&runtime));
+
+    runtime.has_mamba = false;
+    runtime.has_gated_delta = true;
     try std.testing.expect(runtimeHasMetalUnsupportedFeatures(&runtime));
 }
 

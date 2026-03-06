@@ -599,6 +599,7 @@ pub const ModelRuntime = struct {
     /// Architecture capability flags copied from static model metadata.
     has_moe: bool = false,
     has_mamba: bool = false,
+    has_gated_delta: bool = false,
     has_shortconv: bool = false,
     has_mla: bool = false,
     weight_offset: f32 = 0.0,

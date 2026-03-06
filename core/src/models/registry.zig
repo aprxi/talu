@@ -20,6 +20,7 @@ const llama3 = @import("llama/llama3.zig");
 const ministral3 = @import("mistral/ministral3.zig");
 const phi4 = @import("phi/phi4.zig");
 const qwen3 = @import("qwen/qwen3.zig");
+const qwen3_5 = @import("qwen/qwen3_5.zig");
 const qwen3_moe = @import("qwen/qwen3_moe.zig");
 const qwen3_next = @import("qwen/qwen3_next.zig");
 const vision_shared = @import("vision_shared.zig");
@@ -89,6 +90,12 @@ pub const entries: []const Entry = &.{
         .model_types = qwen3.model_types,
     },
     .{
+        .id = qwen3_5.id,
+        .family = qwen3_5.family,
+        .version = qwen3_5.version,
+        .model_types = qwen3_5.model_types,
+    },
+    .{
         .id = qwen3_moe.id,
         .family = qwen3_moe.family,
         .version = qwen3_moe.version,
@@ -145,6 +152,15 @@ pub fn blockProgramFor(entry: Entry, block_kind: op_types.BlockKind) ?[]const la
         return switch (block_kind) {
             .attention_mlp => qwen3_next.attention_mlp_program,
             .mamba => qwen3_next.mamba_program,
+            .gated_delta => null,
+            .shortconv => null,
+        };
+    }
+    if (std.mem.eql(u8, entry.id, qwen3_5.id)) {
+        return switch (block_kind) {
+            .attention_mlp => qwen3_5.attention_mlp_program,
+            .mamba => null,
+            .gated_delta => qwen3_5.gated_delta_program,
             .shortconv => null,
         };
     }
@@ -152,6 +168,7 @@ pub fn blockProgramFor(entry: Entry, block_kind: op_types.BlockKind) ?[]const la
         return switch (block_kind) {
             .attention_mlp => granite_hybrid.attention_mlp_program,
             .mamba => granite_hybrid.mamba_program,
+            .gated_delta => null,
             .shortconv => null,
         };
     }
@@ -160,6 +177,7 @@ pub fn blockProgramFor(entry: Entry, block_kind: op_types.BlockKind) ?[]const la
             .attention_mlp => lfm2.attention_mlp_program,
             .shortconv => lfm2.shortconv_program,
             .mamba => null,
+            .gated_delta => null,
         };
     }
     if (std.mem.eql(u8, entry.id, lfm2_5.id)) {
@@ -167,6 +185,7 @@ pub fn blockProgramFor(entry: Entry, block_kind: op_types.BlockKind) ?[]const la
             .attention_mlp => lfm2_5.attention_mlp_program,
             .shortconv => lfm2_5.shortconv_program,
             .mamba => null,
+            .gated_delta => null,
         };
     }
 
@@ -188,6 +207,7 @@ pub fn blockProgramFor(entry: Entry, block_kind: op_types.BlockKind) ?[]const la
 pub fn visionProgramFor(entry: Entry) ?[]const layer_ops.LayerOp {
     if (std.mem.eql(u8, entry.id, youtu_vl.id)) return vision_shared.vision_program;
     if (std.mem.eql(u8, entry.id, qwen3.id)) return vision_shared.vision_program;
+    if (std.mem.eql(u8, entry.id, qwen3_5.id)) return vision_shared.vision_program;
     if (std.mem.eql(u8, entry.id, lfm2.id)) return vision_shared.vision_program;
     return null;
 }
@@ -230,24 +250,39 @@ fn runtimeDescriptorFromSpec(spec: op_types.StateDescriptorSpec) runtime_contrac
     };
 }
 
-pub fn defaultStateDescriptorForId(state_id: u8) runtime_contract.StateDescriptor {
+pub fn defaultStateDescriptorForId(state_id: u8) !runtime_contract.StateDescriptor {
     for (op_types.default_state_descriptors) |spec| {
         if (spec.id == state_id) return runtimeDescriptorFromSpec(spec);
     }
-    var fallback = op_types.default_unknown_state_descriptor;
-    fallback.id = state_id;
-    return runtimeDescriptorFromSpec(fallback);
+    return error.UnknownStateDescriptorId;
 }
 
-pub fn stateDescriptorForId(entry: Entry, state_id: u8) runtime_contract.StateDescriptor {
-    const fallback = defaultStateDescriptorForId(state_id);
-    const arch = runtimeArchitectureById(entry.id) orelse {
-        return fallback;
+pub fn stateDescriptorForId(entry: Entry, state_id: u8) !runtime_contract.StateDescriptor {
+    const builtin_descriptor = defaultStateDescriptorForId(state_id) catch |builtin_err| switch (builtin_err) {
+        error.UnknownStateDescriptorId => runtimeDescriptorFromSpec(blk: {
+            const arch = runtimeArchitectureById(entry.id) orelse return error.UnknownStateDescriptorId;
+            for (arch.state_descriptors) |spec| {
+                if (spec.id == state_id) break :blk spec;
+            }
+            return error.UnknownStateDescriptorId;
+        }),
+        else => return builtin_err,
     };
-    const spec = arch.stateDescriptorForId(state_id);
+
+    const arch = runtimeArchitectureById(entry.id) orelse {
+        return builtin_descriptor;
+    };
+    var spec_opt: ?op_types.StateDescriptorSpec = null;
+    for (arch.state_descriptors) |spec| {
+        if (spec.id == state_id) {
+            spec_opt = spec;
+            break;
+        }
+    }
+    const spec = spec_opt orelse return builtin_descriptor;
     var descriptor = runtimeDescriptorFromSpec(spec);
     if (descriptor.runtime_kind == runtime_contract.state_runtime_kind_none) {
-        descriptor.runtime_kind = fallback.runtime_kind;
+        descriptor.runtime_kind = builtin_descriptor.runtime_kind;
     }
     return descriptor;
 }
@@ -270,6 +305,8 @@ pub fn configParseHookByModelType(model_type: []const u8) ?op_types.ConfigParseH
 test "registry supports llama and qwen model types" {
     try std.testing.expect(isSupportedModelType("llama3"));
     try std.testing.expect(isSupportedModelType("qwen3"));
+    try std.testing.expect(isSupportedModelType("qwen3_5"));
+    try std.testing.expect(isSupportedModelType("qwen3.5"));
     try std.testing.expect(isSupportedModelType("qwen3_moe"));
     try std.testing.expect(isSupportedModelType("gemma3"));
     try std.testing.expect(isSupportedModelType("granite"));
@@ -284,10 +321,18 @@ test "registry returns canonical entry for known model type" {
     const entry = detectByModelType("granitehybrid");
     try std.testing.expect(entry != null);
     try std.testing.expectEqualStrings("granite_hybrid", entry.?.id);
+
+    const qwen35 = detectByModelType("qwen3_5");
+    try std.testing.expect(qwen35 != null);
+    try std.testing.expectEqualStrings("qwen3_5", qwen35.?.id);
 }
 
 test "registry rejects unknown model type" {
     try std.testing.expect(!isSupportedModelType("unknown_model_type"));
+}
+
+test "defaultStateDescriptorForId rejects unknown state ids" {
+    try std.testing.expectError(error.UnknownStateDescriptorId, defaultStateDescriptorForId(77));
 }
 
 test "registry finds entry by architecture id" {

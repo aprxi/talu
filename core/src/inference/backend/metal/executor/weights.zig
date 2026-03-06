@@ -296,6 +296,7 @@ fn layerProgramWeightBindingKeyFor(
             .mamba_down_proj
         else
             error.InvalidWeightBindingName,
+        .gated_delta_net => error.UnsupportedModel,
         .shortconv => if (std.mem.eql(u8, slot_name, "in_proj"))
             .shortconv_in_proj
         else if (std.mem.eql(u8, slot_name, "conv_weight"))
@@ -1096,6 +1097,9 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     } else return error.InvalidTensorType;
                 }
             },
+            .gated_delta => {
+                return error.UnsupportedModel;
+            },
             .shortconv => |shortconv_block| {
                 weight_handles.layers[layer_idx].kind = .shortconv;
                 try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .shortconv);
@@ -1172,7 +1176,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
             const block = try models.runtime_blocks.layerToBlockWeights(arena_allocator, layer);
             const moe_block_weights = switch (block) {
                 .attention_mlp => |attn| attn.moe_weights orelse continue,
-                .mamba, .shortconv => continue, // Mamba/ShortConv layers don't have MoE
+                .mamba, .gated_delta, .shortconv => continue, // recurrent-only blocks don't have MoE
             };
             if (!moe_block_weights.use_mxfp4) return error.NotImplemented;
             const num_experts: usize = moe_block_weights.experts.len;

@@ -102,6 +102,10 @@ pub const LayerOp = union(enum) {
         /// Optional state descriptor id for this kernel op.
         /// When null, the op is stateless in the compiled plan.
         state_block_id: ?u8 = null,
+        /// Optional instruction-local attention execution metadata.
+        attention_config: ?op_types.AttentionConfig = null,
+        /// Optional instruction-local gated-delta execution metadata.
+        gated_delta_config: ?op_types.GatedDeltaConfig = null,
     },
 
     /// residual += branch * scale

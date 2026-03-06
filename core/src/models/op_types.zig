@@ -17,6 +17,7 @@ pub const OpType = enum {
     mlp,
     moe,
     mamba_mixer, // Mamba2 SSM layer (monolithic)
+    gated_delta_net,
     shortconv, // Gated short convolution (monolithic)
 
     // Residual connection
@@ -70,6 +71,7 @@ pub const builtin_state_block_bytes: u64 = 64;
 pub const kv_cache_state_id: u8 = 0;
 pub const shortconv_state_id: u8 = 1;
 pub const mamba_state_id: u8 = 2;
+pub const gated_delta_state_id: u8 = 3;
 
 /// Default architecture-level state descriptors for baseline models.
 pub const default_state_descriptors = [_]StateDescriptorSpec{
@@ -97,6 +99,14 @@ pub const default_state_descriptors = [_]StateDescriptorSpec{
         .lifecycle = .slot_persistent,
         .runtime_kind = runtime_contract.state_runtime_kind_mamba_cache,
     },
+    .{
+        .id = gated_delta_state_id,
+        .size_bytes = builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = true,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_gated_delta_cache,
+    },
 };
 
 /// Default descriptor contract for unknown state ids.
@@ -120,12 +130,24 @@ pub const MLAConfig = struct {
     rope_interleave: bool = true,
 };
 
+pub const AttentionConfig = struct {
+    rope_interleaved: ?bool = null,
+    query_gate: bool = false,
+};
+
 pub const MambaConfig = struct {
     d_state: u32 = 0,
     d_conv: u32 = 0,
     n_heads: u32 = 0,
     d_head: u32 = 0,
     n_groups: u32 = 1,
+    d_inner: u32 = 0,
+};
+
+pub const GatedDeltaConfig = struct {
+    d_conv: u32 = 0,
+    n_heads: u32 = 0,
+    d_head: u32 = 0,
     d_inner: u32 = 0,
 };
 
@@ -140,8 +162,10 @@ pub const ShortConvConfig = struct {
 /// LayerOp remains the execution bytecode; KernelMeta carries static loader hints.
 pub const KernelMeta = struct {
     is_causal: bool = true,
+    attention_config: AttentionConfig = .{},
     mla_config: ?MLAConfig = null,
     mamba_config: ?MambaConfig = null,
+    gated_delta_config: ?GatedDeltaConfig = null,
     shortconv_config: ?ShortConvConfig = null,
 };
 
@@ -264,6 +288,8 @@ pub const BlockKind = enum {
     attention_mlp,
     /// Mamba2 state-space mixer block.
     mamba,
+    /// Gated DeltaNet recurrent mixer block.
+    gated_delta,
     /// ShortConv gated convolution block.
     shortconv,
 
@@ -275,10 +301,11 @@ pub const BlockKind = enum {
             .{ "transformer", .attention_mlp },
             .{ "full_attention", .attention_mlp },
             .{ "sliding_attention", .attention_mlp },
-            .{ "linear_attention", .mamba },
+            .{ "linear_attention", .gated_delta },
             .{ "mamba", .mamba },
             .{ "mamba2", .mamba },
             .{ "ssm", .mamba },
+            .{ "gated_delta", .gated_delta },
             .{ "shortconv", .shortconv },
             .{ "conv", .shortconv },
         });
@@ -303,6 +330,7 @@ pub fn fusedLayerKindId(kind: BlockKind) ?FusedLayerKindId {
         .attention_mlp => .attention_mlp,
         .shortconv => .shortconv,
         .mamba => .mamba,
+        .gated_delta => null,
     };
 }
 
@@ -356,6 +384,7 @@ pub const Architecture = struct {
     has_qk_norm: bool = false,
     has_moe: bool = false,
     has_mamba: bool = false, // Has mamba_mixer ops (heterogeneous)
+    has_gated_delta: bool = false, // Has gated_delta_net ops (heterogeneous)
     has_shortconv: bool = false, // Has shortconv ops (heterogeneous)
     has_mla: bool = false, // Has MLA (Multi-Latent Attention) ops
     has_fused_qkv: bool = false, // Fused QKV projection (single weight for Q+K+V)

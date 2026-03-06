@@ -1851,6 +1851,50 @@ test "matmulBF16 basic 1x4" {
     try std.testing.expectApproxEqAbs(15.0, out_data[1], 1e-3);
 }
 
+test "matmulBF16 wide output matches scalar reference" {
+    const allocator = std.testing.allocator;
+    const k_dim = 33;
+    const n_cols = 257;
+
+    var a = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ 1, k_dim });
+    defer a.deinit();
+    var b = try tensor_mod.OwnedTensor.init(allocator, .bf16, &.{ n_cols, k_dim });
+    defer b.deinit();
+    var out = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ 1, n_cols });
+    defer out.deinit();
+
+    const a_data = a.asSlice(f32);
+    for (a_data, 0..) |*value, idx| {
+        value.* = @as(f32, @floatFromInt((idx % 7) + 1)) * 0.125;
+    }
+
+    const b_data = b.asSlice(u16);
+    for (0..n_cols) |row| {
+        for (0..k_dim) |col| {
+            const value = (@as(f32, @floatFromInt((row % 11) - 5)) * 0.0625) +
+                (@as(f32, @floatFromInt((col % 13) - 6)) * 0.03125);
+            b_data[row * k_dim + col] = dtype_mod.f32ToBf16(value);
+        }
+    }
+
+    var a_view = a.view();
+    var b_view = b.view();
+    var out_view = out.view();
+    var scratch = try MatmulScratch.init(allocator);
+    defer scratch.deinit();
+
+    matmulBF16(&a_view, &b_view, &out_view, &scratch);
+
+    const out_data = out.asSlice(f32);
+    for (0..n_cols) |row| {
+        var expected: f32 = 0.0;
+        for (0..k_dim) |col| {
+            expected += a_data[col] * dtype_mod.bf16ToF32(b_data[row * k_dim + col]);
+        }
+        try std.testing.expectApproxEqAbs(expected, out_data[row], 5e-3);
+    }
+}
+
 test "matmulF16 basic 1x4" {
     const allocator = std.testing.allocator;
 

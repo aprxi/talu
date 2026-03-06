@@ -900,6 +900,9 @@ const BlockRuntimeLayer = struct {
             .mamba_mixer => {
                 return error.UnsupportedModel;
             },
+            .gated_delta_net => {
+                return error.UnsupportedModel;
+            },
             .swiglu => {
                 if (op_index >= self.instruction_swiglu_weight_slots.len) return error.InvalidInstructionIndex;
                 const binding = self.instruction_swiglu_weight_slots[op_index] orelse return error.UnsupportedModel;
@@ -2946,10 +2949,10 @@ pub const CudaBackend = struct {
                                     used_device_lookup = true;
                                 }
                             }
-                        }
-                    },
-                }
+                    }
+                },
             }
+        }
             if (!used_device_lookup) {
                 const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.runtime_buffers.hidden_host) catch |err| switch (err) {
                     error.InvalidArgument => return error.InvalidArgument,

@@ -507,9 +507,9 @@ fn buildStateDescriptors(
         if (!seen[state_id]) continue;
         seen[state_id] = false;
         descriptors[idx] = if (descriptor_entry) |entry|
-            registry.stateDescriptorForId(entry, state_id)
+            try registry.stateDescriptorForId(entry, state_id)
         else
-            registry.defaultStateDescriptorForId(state_id);
+            try registry.defaultStateDescriptorForId(state_id);
         idx += 1;
     }
     return descriptors;
@@ -689,8 +689,9 @@ fn validateProgramBlockKindStateCompatibility(
     program: []const layer_ops.LayerOp,
     block_kind: op_types.BlockKind,
 ) !void {
-    _ = program;
-    _ = block_kind;
+    if (runtime_contract.firstLayerProgramStateMismatch(program, block_kind)) |_| {
+        return error.InvalidLayerProgramStateTopology;
+    }
 }
 
 /// Options for plan compilation.
@@ -1184,7 +1185,7 @@ test "compileLayerProgram emits shortconv state descriptor when shortconv op is 
     try std.testing.expectEqual(@as(?u8, shortconv_state_id), compiled.plan.instructions[0].state_block_id);
 }
 
-test "buildStateDescriptors accepts unknown state ids" {
+test "buildStateDescriptors rejects unknown state ids" {
     const allocator = std.testing.allocator;
     const instructions = [_]runtime_contract.Instruction{
         .{
@@ -1196,11 +1197,10 @@ test "buildStateDescriptors accepts unknown state ids" {
             .state_block_id = 77,
         },
     };
-    const descriptors = try buildStateDescriptors(allocator, instructions[0..], null);
-    defer if (descriptors.len > 0) allocator.free(descriptors);
-    try std.testing.expectEqual(@as(usize, 1), descriptors.len);
-    try std.testing.expectEqual(@as(u8, 77), descriptors[0].id);
-    try std.testing.expectEqual(runtime_contract.StateLifecycle.request_scoped, descriptors[0].lifecycle);
+    try std.testing.expectError(
+        error.UnknownStateDescriptorId,
+        buildStateDescriptors(allocator, instructions[0..], null),
+    );
 }
 
 test "buildStateDescriptors preserves builtin descriptor for builtin state ids without metadata entry" {
@@ -1578,7 +1578,7 @@ test "dead output is killed at producer for immediate physical reclaim" {
     try std.testing.expect((kill1[branch_reg / 64] & (@as(u64, 1) << @intCast(branch_reg % 64))) == 0);
 }
 
-test "validateProgramBlockKindStateCompatibility does not enforce builtin topology" {
+test "validateProgramBlockKindStateCompatibility rejects incompatible builtin topology" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{
             .id = 0,
@@ -1588,5 +1588,21 @@ test "validateProgramBlockKindStateCompatibility does not enforce builtin topolo
             .state_block_id = runtime_contract.shortconv_state_id,
         } },
     };
-    try validateProgramBlockKindStateCompatibility(&program, .attention_mlp);
+    try std.testing.expectError(
+        error.InvalidLayerProgramStateTopology,
+        validateProgramBlockKindStateCompatibility(&program, .attention_mlp),
+    );
+}
+
+test "validateProgramBlockKindStateCompatibility accepts gated delta topology" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .branch_out,
+            .debug_type = .gated_delta_net,
+            .state_block_id = runtime_contract.gated_delta_state_id,
+        } },
+    };
+    try validateProgramBlockKindStateCompatibility(&program, .gated_delta);
 }

@@ -143,7 +143,18 @@ const JsonConfig = struct {
         rope_theta: ?f64 = null,
         rope_type: ?[]const u8 = null,
         factor: ?f64 = null,
+        low_freq_factor: ?f64 = null,
+        high_freq_factor: ?f64 = null,
+        beta_slow: ?f64 = null,
+        beta_fast: ?f64 = null,
+        attention_factor: ?f64 = null,
+        mscale: ?f64 = null,
+        mscale_all_dim: ?f64 = null,
+        truncate: ?bool = null,
         original_max_position_embeddings: ?i64 = null,
+        mrope_section: ?[]const i64 = null,
+        mrope_interleaved: ?bool = null,
+        partial_rotary_factor: ?f64 = null,
     } = null,
     // Norm epsilon
     norm_eps: ?f64 = null,
@@ -354,7 +365,14 @@ pub fn parseLayerTypes(
         else => return null,
     };
 
-    const layer_types_value = obj.get("layer_types") orelse return null;
+    const layer_types_value = obj.get("layer_types") orelse blk: {
+        if (obj.get("text_config")) |tc| {
+            if (tc == .object) {
+                if (tc.object.get("layer_types")) |lt| break :blk lt;
+            }
+        }
+        return null;
+    };
     const layer_types_array = switch (layer_types_value) {
         .array => |a| a,
         else => return null,
@@ -552,6 +570,43 @@ pub fn loadConfigForArchitectureWithHook(
             .mrope_section = mrope_section,
             .mrope_interleaved = rope_scaling_config.mrope_interleaved orelse false,
         };
+    } else if (config_json.rope_parameters) |rope_params| blk: {
+        var rope_type_val: @TypeOf((tensor.RopeScaling{}).rope_type) = .none;
+        if (rope_params.rope_type) |rope_type_str| {
+            if (std.mem.eql(u8, rope_type_str, "llama3")) rope_type_val = .llama3;
+            if (std.mem.eql(u8, rope_type_str, "linear")) rope_type_val = .linear;
+            if (std.mem.eql(u8, rope_type_str, "yarn")) rope_type_val = .yarn;
+        }
+        const beta_slow = if (rope_params.beta_slow) |f| @as(f32, @floatCast(f)) else 1.0;
+        const beta_fast = if (rope_params.beta_fast) |f| @as(f32, @floatCast(f)) else 32.0;
+        const attention_factor = if (rope_params.attention_factor) |f| @as(f32, @floatCast(f)) else 0.0;
+        const mscale = if (rope_params.mscale) |f| @as(f32, @floatCast(f)) else 0.0;
+        const mscale_all_dim = if (rope_params.mscale_all_dim) |f| @as(f32, @floatCast(f)) else 0.0;
+        const truncate = rope_params.truncate orelse true;
+        var mrope_section: [3]u32 = .{ 0, 0, 0 };
+        if (rope_params.mrope_section) |section| {
+            if (section.len == 3) {
+                for (0..3) |idx| {
+                    mrope_section[idx] = std.math.cast(u32, section[idx]) orelse 0;
+                }
+            }
+        }
+
+        break :blk .{
+            .rope_type = rope_type_val,
+            .factor = if (rope_params.factor) |f| @floatCast(f) else 1.0,
+            .low_freq_factor = if (rope_params.low_freq_factor) |f| @floatCast(f) else beta_slow,
+            .high_freq_factor = if (rope_params.high_freq_factor) |f| @floatCast(f) else beta_fast,
+            .beta_slow = beta_slow,
+            .beta_fast = beta_fast,
+            .attention_factor = attention_factor,
+            .mscale = mscale,
+            .mscale_all_dim = mscale_all_dim,
+            .truncate = truncate,
+            .original_max_position_embeddings = if (rope_params.original_max_position_embeddings) |v| @intCast(v) else 8192,
+            .mrope_section = mrope_section,
+            .mrope_interleaved = rope_params.mrope_interleaved orelse false,
+        };
     } else .{};
 
     // Detect GELU activation from hidden_activation field
@@ -596,6 +651,11 @@ pub fn loadConfigForArchitectureWithHook(
         .shortconv_conv_dim_out = 0,
         .shortconv_has_bias = false,
     };
+    if (config_json.rope_parameters) |rope_params| {
+        if (rope_params.partial_rotary_factor) |partial_rotary_factor| {
+            config.rope_dim = @intFromFloat(@as(f32, @floatFromInt(config.head_dim)) * @as(f32, @floatCast(partial_rotary_factor)));
+        }
+    }
 
     if (config_parse_hook) |hook| {
         hook(config_obj, root_obj, &config);
@@ -1280,6 +1340,7 @@ test "loadConfigForArchitecture parses common hook fields across all architectur
         .{ .model_type = "lfm2_5", .architecture_id = "lfm2_5" },
         .{ .model_type = "phi4", .architecture_id = "phi" },
         .{ .model_type = "qwen3", .architecture_id = "qwen3" },
+        .{ .model_type = "qwen3_5", .architecture_id = "qwen3_5" },
         .{ .model_type = "qwen3_moe", .architecture_id = "qwen3_moe" },
         .{ .model_type = "qwen3_next", .architecture_id = "qwen3_next" },
         .{ .model_type = "gpt_oss", .architecture_id = "gpt_oss" },
@@ -1336,6 +1397,36 @@ test "loadConfigForArchitecture parses common hook fields across all architectur
     }
 }
 
+test "parseLayerTypes reads text_config.layer_types when root layer_types is absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "text_config": {
+        \\    "layer_types": ["linear_attention", "full_attention", "linear_attention"]
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const variant_names = [_][]const u8{
+        "linear_attention",
+        "full_attention",
+    };
+    const layer_types = try parseLayerTypes(std.testing.allocator, path, &variant_names, null);
+    defer if (layer_types) |items| std.testing.allocator.free(items);
+
+    try std.testing.expect(layer_types != null);
+    try std.testing.expectEqual(@as(usize, 3), layer_types.?.len);
+    try std.testing.expectEqual(@as(u8, 0), layer_types.?[0]);
+    try std.testing.expectEqual(@as(u8, 1), layer_types.?[1]);
+    try std.testing.expectEqual(@as(u8, 0), layer_types.?[2]);
+}
+
 test "loadConfigForArchitecture parses Phi partial rotary factor via hook" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1360,6 +1451,46 @@ test "loadConfigForArchitecture parses Phi partial rotary factor via hook" {
 
     const config = try loadConfigForArchitecture(std.testing.allocator, path, "phi");
     try std.testing.expectEqual(@as(i32, 96), config.rope_dim);
+}
+
+test "loadConfig parses rope_parameters partial rotary and mrope metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "text_config": {
+        \\    "vocab_size": 248320,
+        \\    "hidden_size": 1024,
+        \\    "num_hidden_layers": 24,
+        \\    "num_attention_heads": 8,
+        \\    "num_key_value_heads": 2,
+        \\    "head_dim": 256,
+        \\    "intermediate_size": 3584,
+        \\    "max_position_embeddings": 262144,
+        \\    "rope_parameters": {
+        \\      "rope_type": "default",
+        \\      "rope_theta": 10000000,
+        \\      "partial_rotary_factor": 0.25,
+        \\      "mrope_interleaved": true,
+        \\      "mrope_section": [11, 11, 10]
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfig(std.testing.allocator, path);
+    try std.testing.expectEqual(@as(i32, 64), config.rope_dim);
+    try std.testing.expectApproxEqAbs(@as(f32, 10_000_000.0), config.rope_theta, 0.01);
+    try std.testing.expectEqual(@as(u32, 11), config.rope_scaling.mrope_section[0]);
+    try std.testing.expectEqual(@as(u32, 11), config.rope_scaling.mrope_section[1]);
+    try std.testing.expectEqual(@as(u32, 10), config.rope_scaling.mrope_section[2]);
+    try std.testing.expect(config.rope_scaling.mrope_interleaved);
 }
 
 test "loadConfig parses vision deepstack probe layers from vision_config via youtu hook" {

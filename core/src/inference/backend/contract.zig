@@ -108,6 +108,7 @@ const required_kernel_names = [_][]const u8{
     "embedding",
     "ffn",
     "fused_attention",
+    "gated_delta",
     "kv_cache",
     "mamba",
     "mla_attention",
@@ -249,6 +250,7 @@ pub fn assertExecutorSymbolLayout(comptime E: type, comptime backend_name: []con
         requireTypeAliasEq(E.BlockKind, E.weights.BlockType, backend_name ++ ".executor.BlockKind");
 
         requireEnumTag(E.BlockKind, backend_name ++ ".executor.BlockKind", "attention_mlp");
+        requireEnumTag(E.BlockKind, backend_name ++ ".executor.BlockKind", "gated_delta");
         requireEnumTag(E.BlockKind, backend_name ++ ".executor.BlockKind", "mamba");
         requireEnumTag(E.BlockKind, backend_name ++ ".executor.BlockKind", "shortconv");
     }
@@ -345,6 +347,15 @@ fn assertKernelContract(comptime K: type, comptime backend_name: []const u8, com
         requireStructField(Module.ShortConvKernel.ForwardParams, owner ++ ".ShortConvKernel.ForwardParams", "scratch");
         requireStructField(Module.ShortConvKernel.ForwardParams, owner ++ ".ShortConvKernel.ForwardParams", "matmul_scratch");
         requireMethodArity(Module.ShortConvKernel, owner ++ ".ShortConvKernel", "forward", 6);
+    } else if (std.mem.eql(u8, kernel_name, "gated_delta")) {
+        requireLayoutDecl(Module, owner, "GatedDeltaKernel");
+        requireLayoutDecl(Module.GatedDeltaKernel, owner ++ ".GatedDeltaKernel", "ForwardParams");
+        requireStructField(Module.GatedDeltaKernel.ForwardParams, owner ++ ".GatedDeltaKernel.ForwardParams", "input_tensor");
+        requireStructField(Module.GatedDeltaKernel.ForwardParams, owner ++ ".GatedDeltaKernel.ForwardParams", "output_tensor");
+        requireStructField(Module.GatedDeltaKernel.ForwardParams, owner ++ ".GatedDeltaKernel.ForwardParams", "state");
+        requireStructField(Module.GatedDeltaKernel.ForwardParams, owner ++ ".GatedDeltaKernel.ForwardParams", "scratch");
+        requireStructField(Module.GatedDeltaKernel.ForwardParams, owner ++ ".GatedDeltaKernel.ForwardParams", "matmul_scratch");
+        requireMethodArity(Module.GatedDeltaKernel, owner ++ ".GatedDeltaKernel", "forward", 6);
     } else if (std.mem.eql(u8, kernel_name, "moe")) {
         requireLayoutDecl(Module, owner, "MoEFFN");
         requireLayoutDecl(Module.MoEFFN, owner ++ ".MoEFFN", "ForwardParams");

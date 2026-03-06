@@ -6,6 +6,7 @@
 const std = @import("std");
 const tensor = @import("../tensor.zig");
 const graph_types = @import("op_types.zig");
+const transforms = @import("load/transforms.zig");
 
 const Tensor = tensor.Tensor;
 
@@ -54,6 +55,8 @@ pub const MLAConfig = struct {
     rope_interleave: bool,
 };
 
+pub const AttentionConfig = graph_types.AttentionConfig;
+
 pub const MambaConfig = struct {
     d_model: u32,
     d_state: u32,
@@ -63,12 +66,29 @@ pub const MambaConfig = struct {
     n_groups: u32 = 1,
 };
 
+pub const GatedDeltaConfig = struct {
+    d_model: u32,
+    d_conv: u32,
+    n_heads: u32,
+    d_head: u32,
+};
+
 pub const MambaWeights = struct {
     in_proj: *const Tensor,
     conv1d_weight: *const Tensor,
     conv1d_bias: ?*const Tensor = null,
     A_log: *const Tensor,
     D: *const Tensor,
+    dt_bias: ?*const Tensor = null,
+    norm_weight: ?*const Tensor = null,
+    out_proj: *const Tensor,
+};
+
+pub const GatedDeltaWeights = struct {
+    in_proj: *const Tensor,
+    conv1d_weight: *const Tensor,
+    conv1d_bias: ?*const Tensor = null,
+    A_log: *const Tensor,
     dt_bias: ?*const Tensor = null,
     norm_weight: ?*const Tensor = null,
     out_proj: *const Tensor,
@@ -116,6 +136,7 @@ pub const AttentionMlpWeights = struct {
     moe_weights: ?*MoEWeights = null,
     sinks: ?[]const f32 = null,
     is_causal: bool = true,
+    attention_config: AttentionConfig = .{},
     mla_config: ?MLAConfig = null,
     q_a_proj: ?*const Tensor = null,
     q_a_norm: ?*const Tensor = null,
@@ -136,6 +157,21 @@ pub const MambaBlockWeights = struct {
     weights: MambaWeights,
     fused_gate_up: ?FusedBlockWeights = null,
     down_proj: ?*const Tensor = null,
+    w1: ?*const Tensor = null,
+    w2: ?*const Tensor = null,
+    w3: ?*const Tensor = null,
+};
+
+pub const GatedDeltaBlockWeights = struct {
+    ln1_weight: *const Tensor,
+    ln2_weight: ?*const Tensor = null,
+    config: GatedDeltaConfig,
+    weights: GatedDeltaWeights,
+    fused_gate_up: ?FusedBlockWeights = null,
+    down_proj: ?*const Tensor = null,
+    w1: ?*const Tensor = null,
+    w2: ?*const Tensor = null,
+    w3: ?*const Tensor = null,
 };
 
 pub const ShortConvBlockWeights = struct {
@@ -153,6 +189,7 @@ pub const BlockKind = graph_types.BlockKind;
 pub const BlockWeights = union(BlockKind) {
     attention_mlp: AttentionMlpWeights,
     mamba: MambaBlockWeights,
+    gated_delta: GatedDeltaBlockWeights,
     shortconv: ShortConvBlockWeights,
 };
 
@@ -168,6 +205,7 @@ pub const BlockMapContext = struct {
     sliding_window: usize = 0,
     kernel_meta: graph_types.KernelMeta = .{},
     mamba_config: ?MambaConfig = null,
+    gated_delta_config: ?GatedDeltaConfig = null,
     shortconv_config: ?ShortConvConfig = null,
     num_experts: usize = 0,
     experts_per_token: usize = 0,
@@ -220,6 +258,17 @@ fn getBiasSliceAlias(map: *const WeightMap, name: []const u8, alias: []const u8)
         return weight.asSlice(f32);
     }
     return null;
+}
+
+fn requiredRuntimeAllocator(context: BlockMapContext) !std.mem.Allocator {
+    return context.allocator orelse error.OutOfMemory;
+}
+
+fn buildOnesF32Vector(allocator: std.mem.Allocator, len: usize) !*const Tensor {
+    const tensor_len: i64 = @intCast(len);
+    const ones = try Tensor.init(allocator, &.{tensor_len}, .f32, tensor.Device.cpu());
+    @memset(ones.asSliceMut(f32), 1.0);
+    return ones;
 }
 
 fn buildMxfp4MoEWeights(
@@ -482,6 +531,7 @@ pub fn blockWeightsFromMap(
                     .moe_weights = moe_weights,
                     .sinks = sinks,
                     .is_causal = context.kernel_meta.is_causal,
+                    .attention_config = context.kernel_meta.attention_config,
                     .mla_config = mla_config,
                     .q_a_proj = q_a_proj,
                     .q_a_norm = q_a_norm,
@@ -492,16 +542,86 @@ pub fn blockWeightsFromMap(
                 },
             };
         },
-        .mamba => {
-            const mamba_config = context.mamba_config orelse return error.MissingMambaConfig;
+        .gated_delta => {
             const ln1_weight = try getRequiredWeight(map, "input_layernorm.weight");
             const ln2_weight = getOptionalWeight(map, "post_attention_layernorm.weight");
-            const in_proj = try getRequiredWeight(map, "mixer.in_proj.weight");
-            const out_proj = try getRequiredWeight(map, "mixer.out_proj.weight");
-            const conv1d_weight = try getRequiredWeight(map, "mixer.conv1d.weight");
+
+            const split_qkv = getOptionalWeight(map, "linear_attn.in_proj_qkv.weight");
+            const split_z = getOptionalWeight(map, "linear_attn.in_proj_z.weight");
+            const split_a = getOptionalWeight(map, "linear_attn.in_proj_a.weight");
+            const split_b = getOptionalWeight(map, "linear_attn.in_proj_b.weight");
+            const in_proj = blk: {
+                if (getOptionalWeight(map, "mixer.in_proj.weight")) |weight| break :blk weight;
+                if (split_qkv != null and split_z != null and split_b != null) {
+                    const allocator = try requiredRuntimeAllocator(context);
+                    break :blk try transforms.buildGatedDeltaSplitInProj(allocator, split_qkv.?, split_z.?, split_b.?, split_a);
+                }
+                return error.MissingWeight;
+            };
+            const out_proj = getOptionalWeight(map, "mixer.out_proj.weight") orelse
+                getOptionalWeight(map, "linear_attn.out_proj.weight") orelse
+                return error.MissingWeight;
+            const conv1d_weight = getOptionalWeight(map, "mixer.conv1d.weight") orelse
+                getOptionalWeight(map, "linear_attn.conv1d.weight") orelse
+                return error.MissingWeight;
             const conv1d_bias = getOptionalWeight(map, "mixer.conv1d.bias");
-            const A_log = try getRequiredWeight(map, "mixer.A_log");
-            const D = try getRequiredWeight(map, "mixer.D");
+            const A_log = getOptionalWeight(map, "mixer.A_log") orelse
+                getOptionalWeight(map, "linear_attn.A_log") orelse
+                return error.MissingWeight;
+            const dt_bias = getOptionalWeight(map, "mixer.dt_bias") orelse
+                getOptionalWeight(map, "linear_attn.dt_bias");
+            const norm_weight = getOptionalWeight(map, "mixer.norm.weight") orelse
+                getOptionalWeight(map, "linear_attn.norm.weight");
+
+            const fused_gate_up = getOptionalWeight(map, "mlp.input_linear.weight") orelse
+                getOptionalWeight(map, "mlp.gate_up_proj.weight");
+            const down_proj = getOptionalWeight(map, "mlp.output_linear.weight") orelse
+                getOptionalWeight(map, "mlp.down_proj.weight");
+
+            var w1: ?*const Tensor = null;
+            var w2: ?*const Tensor = null;
+            var w3: ?*const Tensor = null;
+            if (fused_gate_up == null) {
+                w1 = getOptionalWeight(map, "mlp.gate_proj.weight");
+                w3 = getOptionalWeight(map, "mlp.up_proj.weight");
+                w2 = down_proj;
+            }
+
+            var fused_gate_up_weights: ?FusedBlockWeights = null;
+            if (fused_gate_up) |fg| {
+                fused_gate_up_weights = .{ .gate_up = fg.*, .gate_up_layout = .concat };
+            }
+
+            const gated_delta_config = context.gated_delta_config orelse return error.MissingGatedDeltaConfig;
+            return BlockWeights{ .gated_delta = .{
+                .ln1_weight = ln1_weight,
+                .ln2_weight = ln2_weight,
+                .config = gated_delta_config,
+                .weights = .{
+                    .in_proj = in_proj,
+                    .out_proj = out_proj,
+                    .conv1d_weight = conv1d_weight,
+                    .conv1d_bias = conv1d_bias,
+                    .A_log = A_log,
+                    .dt_bias = dt_bias,
+                    .norm_weight = norm_weight,
+                },
+                .fused_gate_up = fused_gate_up_weights,
+                .down_proj = down_proj,
+                .w1 = w1,
+                .w2 = w2,
+                .w3 = w3,
+            } };
+        },
+        .mamba => {
+            const ln1_weight = try getRequiredWeight(map, "input_layernorm.weight");
+            const ln2_weight = getOptionalWeight(map, "post_attention_layernorm.weight");
+
+            const in_proj = getOptionalWeight(map, "mixer.in_proj.weight") orelse return error.MissingWeight;
+            const out_proj = getOptionalWeight(map, "mixer.out_proj.weight") orelse return error.MissingWeight;
+            const conv1d_weight = getOptionalWeight(map, "mixer.conv1d.weight") orelse return error.MissingWeight;
+            const conv1d_bias = getOptionalWeight(map, "mixer.conv1d.bias");
+            const A_log = getOptionalWeight(map, "mixer.A_log") orelse return error.MissingWeight;
             const dt_bias = getOptionalWeight(map, "mixer.dt_bias");
             const norm_weight = getOptionalWeight(map, "mixer.norm.weight");
 
@@ -510,10 +630,27 @@ pub fn blockWeightsFromMap(
             const down_proj = getOptionalWeight(map, "mlp.output_linear.weight") orelse
                 getOptionalWeight(map, "mlp.down_proj.weight");
 
+            var w1: ?*const Tensor = null;
+            var w2: ?*const Tensor = null;
+            var w3: ?*const Tensor = null;
+            if (fused_gate_up == null) {
+                w1 = getOptionalWeight(map, "mlp.gate_proj.weight");
+                w3 = getOptionalWeight(map, "mlp.up_proj.weight");
+                w2 = down_proj;
+            }
+
             var fused_gate_up_weights: ?FusedBlockWeights = null;
             if (fused_gate_up) |fg| {
                 fused_gate_up_weights = .{ .gate_up = fg.*, .gate_up_layout = .concat };
             }
+
+            const mamba_config = context.mamba_config orelse return error.MissingMambaConfig;
+            const D = blk: {
+                if (getOptionalWeight(map, "mixer.D")) |weight| break :blk weight;
+                const allocator = try requiredRuntimeAllocator(context);
+                const d_len: usize = @intCast(A_log.shape[0]);
+                break :blk try buildOnesF32Vector(allocator, d_len);
+            };
 
             return BlockWeights{ .mamba = .{
                 .ln1_weight = ln1_weight,
@@ -531,6 +668,9 @@ pub fn blockWeightsFromMap(
                 },
                 .fused_gate_up = fused_gate_up_weights,
                 .down_proj = down_proj,
+                .w1 = w1,
+                .w2 = w2,
+                .w3 = w3,
             } };
         },
         .shortconv => {
@@ -578,4 +718,72 @@ pub fn blockWeightsFromMap(
             } };
         },
     }
+}
+
+test "blockWeightsFromMap gated_delta accepts qwen3.5 split linear attention weights" {
+    const allocator = std.testing.allocator;
+    var map = WeightMap{};
+    defer map.deinit(allocator);
+
+    var ln1_data = [_]f32{ 1, 1 };
+    var in_proj_qkv_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var in_proj_z_data = [_]f32{ 9, 10, 11, 12 };
+    var in_proj_b_data = [_]f32{ 13, 14 };
+    var in_proj_a_data = [_]f32{ 13, 14 };
+    var conv_data = [_]f32{ 0, 1, 2, 3, 4, 5 };
+    var a_log_data = [_]f32{ 0.1, 0.2 };
+    var dt_bias_data = [_]f32{ 0.3, 0.4 };
+    var norm_data = [_]f32{ 1, 1 };
+    var out_proj_data = [_]f32{ 1, 0, 0, 1 };
+    var mlp_gate_data = [_]f32{ 1, 2, 3, 4 };
+    var mlp_up_data = [_]f32{ 5, 6, 7, 8 };
+    var mlp_down_data = [_]f32{ 9, 10, 11, 12 };
+
+    var ln1 = Tensor.view2DSlice(ln1_data[0..], 1, 2);
+    var in_proj_qkv = Tensor.view2DSlice(in_proj_qkv_data[0..], 4, 2);
+    var in_proj_z = Tensor.view2DSlice(in_proj_z_data[0..], 2, 2);
+    var in_proj_b = Tensor.view2DSlice(in_proj_b_data[0..], 1, 2);
+    var in_proj_a = Tensor.view2DSlice(in_proj_a_data[0..], 1, 2);
+    var conv = Tensor.view(@ptrCast(conv_data[0..].ptr), &.{ 6, 1, 1 }, .f32, null);
+    var a_log = Tensor.view(@ptrCast(a_log_data[0..].ptr), &.{2}, .f32, null);
+    var dt_bias = Tensor.view(@ptrCast(dt_bias_data[0..].ptr), &.{2}, .f32, null);
+    var norm = Tensor.view(@ptrCast(norm_data[0..].ptr), &.{2}, .f32, null);
+    var out_proj = Tensor.view2DSlice(out_proj_data[0..], 2, 2);
+    var mlp_gate = Tensor.view2DSlice(mlp_gate_data[0..], 2, 2);
+    var mlp_up = Tensor.view2DSlice(mlp_up_data[0..], 2, 2);
+    var mlp_down = Tensor.view2DSlice(mlp_down_data[0..], 2, 2);
+
+    try map.put(allocator, "input_layernorm.weight", &ln1);
+    try map.put(allocator, "linear_attn.in_proj_qkv.weight", &in_proj_qkv);
+    try map.put(allocator, "linear_attn.in_proj_z.weight", &in_proj_z);
+    try map.put(allocator, "linear_attn.in_proj_b.weight", &in_proj_b);
+    try map.put(allocator, "linear_attn.in_proj_a.weight", &in_proj_a);
+    try map.put(allocator, "linear_attn.conv1d.weight", &conv);
+    try map.put(allocator, "linear_attn.A_log", &a_log);
+    try map.put(allocator, "linear_attn.dt_bias", &dt_bias);
+    try map.put(allocator, "linear_attn.norm.weight", &norm);
+    try map.put(allocator, "linear_attn.out_proj.weight", &out_proj);
+    try map.put(allocator, "mlp.gate_proj.weight", &mlp_gate);
+    try map.put(allocator, "mlp.up_proj.weight", &mlp_up);
+    try map.put(allocator, "mlp.down_proj.weight", &mlp_down);
+
+    const block = try blockWeightsFromMap(&map, .gated_delta, .{
+        .gated_delta_config = .{
+            .d_model = 2,
+            .d_conv = 1,
+            .n_heads = 2,
+            .d_head = 1,
+        },
+        .allocator = allocator,
+    });
+
+    try std.testing.expect(block == .gated_delta);
+    const gated_delta = block.gated_delta;
+    try std.testing.expectEqual(@as(i64, 8), gated_delta.weights.in_proj.shape[0]);
+    try std.testing.expectEqual(@as(i64, 2), gated_delta.weights.in_proj.shape[1]);
+    try std.testing.expect(gated_delta.weights.dt_bias != null);
+    try std.testing.expect(gated_delta.weights.norm_weight != null);
+    try std.testing.expect(gated_delta.w1 != null);
+    try std.testing.expect(gated_delta.w2 != null);
+    try std.testing.expect(gated_delta.w3 != null);
 }

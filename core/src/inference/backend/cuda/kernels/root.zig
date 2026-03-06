@@ -11,6 +11,7 @@ pub const support = .{
     .embedding = false,
     .ffn = true,
     .fused_attention = false,
+    .gated_delta = false,
     .kv_cache = false,
     .mamba = false,
     .mla_attention = false,
@@ -111,6 +112,37 @@ pub const ffn = struct {
             _ = p2;
             _ = p3;
             _ = p4;
+            return error.UnsupportedModel;
+        }
+    };
+};
+
+pub const gated_delta = struct {
+    pub const supported = false;
+    pub const UnsupportedError = error{UnsupportedKernel};
+    pub fn unsupported() UnsupportedError {
+        return error.UnsupportedKernel;
+    }
+    pub fn requireImplemented() UnsupportedError {
+        return error.UnsupportedKernel;
+    }
+
+    pub const GatedDeltaKernel = struct {
+        pub const ForwardParams = struct {
+            input_tensor: ?*anyopaque,
+            output_tensor: ?*anyopaque,
+            state: ?*anyopaque,
+            scratch: ?*anyopaque,
+            matmul_scratch: ?*anyopaque,
+        };
+
+        pub fn forward(self: *@This(), input_tensor: ?*anyopaque, output_tensor: ?*anyopaque, state: ?*anyopaque, scratch: ?*anyopaque, matmul_scratch: ?*anyopaque) !void {
+            _ = self;
+            _ = input_tensor;
+            _ = output_tensor;
+            _ = state;
+            _ = scratch;
+            _ = matmul_scratch;
             return error.UnsupportedModel;
         }
     };

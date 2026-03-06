@@ -24,8 +24,11 @@ pub const Opcode = enum(u8) {
     vision_deepstack_extract = 18,
     vision_scatter = 19,
 
+    // Reserved 9..15 for structural/vision expansion.
+    // Future macro-ops MUST use 32..63.
+    gated_delta_net = 32,
+
     // Primitive ops (v1 compatibility path for existing LayerOp programs)
-    // Keep 32..63 reserved for future macro-ops.
     mul = 64,
     mean = 65,
     pow = 66,
@@ -67,6 +70,7 @@ pub fn isMacro(opcode: Opcode) bool {
         .swiglu,
         .moe,
         .mamba_mixer,
+        .gated_delta_net,
         .shortconv,
         .mla_attention,
         .embedding,

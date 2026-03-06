@@ -271,7 +271,7 @@ pub const LocalEngine = struct {
             try runtime_contract.appendUniqueStateDescriptor(
                 storage,
                 count,
-                models.registry.stateDescriptorForId(entry, state_id),
+                try models.registry.stateDescriptorForId(entry, state_id),
             );
         }
     }

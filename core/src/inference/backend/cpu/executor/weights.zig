@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
+const dtype = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_rowwise = compute.cpu.rowwise;
@@ -35,6 +36,7 @@ const norm = @import("../kernels/norm.zig");
 const rope = @import("../kernels/rope.zig");
 const embedding = @import("../kernels/embedding.zig");
 const mamba = @import("../kernels/mamba.zig");
+const gated_delta = @import("../kernels/gated_delta.zig");
 const shortconv = @import("../kernels/shortconv.zig");
 const mla = @import("../kernels/mla_attention.zig");
 
@@ -64,6 +66,11 @@ pub const MambaConfig = mamba.MambaConfig;
 pub const MambaWeights = mamba.MambaWeights;
 pub const MambaState = mamba.MambaState;
 pub const MambaScratch = mamba.MambaScratch;
+pub const GatedDeltaKernel = gated_delta.GatedDeltaKernel;
+pub const GatedDeltaConfig = gated_delta.GatedDeltaConfig;
+pub const GatedDeltaWeights = gated_delta.GatedDeltaWeights;
+pub const GatedDeltaState = gated_delta.GatedDeltaState;
+pub const GatedDeltaScratch = gated_delta.GatedDeltaScratch;
 
 // ShortConv kernel types (for heterogeneous models)
 pub const ShortConvKernel = shortconv.ShortConvKernel;
@@ -80,6 +87,7 @@ pub const FusedBlockWeights = runtime_blocks.FusedBlockWeights;
 pub const MoEWeights = runtime_blocks.MoEWeights;
 pub const AttentionMlpWeights = runtime_blocks.AttentionMlpWeights;
 pub const MambaBlockWeights = runtime_blocks.MambaBlockWeights;
+pub const GatedDeltaBlockWeights = runtime_blocks.GatedDeltaBlockWeights;
 pub const ShortConvBlockWeights = runtime_blocks.ShortConvBlockWeights;
 pub const BlockWeights = runtime_blocks.BlockWeights;
 pub const WeightMap = runtime_blocks.WeightMap;
@@ -103,6 +111,7 @@ pub const BlockInitContext = struct {
     max_seq_len: usize,
     norm_eps: f32,
     runtime: tensor.ModelRuntime,
+    rope_interleaved: bool = false,
     residual_multiplier: f32,
     attention_scale: f32,
     use_gelu: bool,
@@ -135,6 +144,83 @@ pub const BlockInitContext = struct {
 /// Returns null for quantized types (which have complex layouts with scales/biases).
 fn fuseGateUpWeights(allocator: std.mem.Allocator, w1: *const Tensor, w3: *const Tensor) !?Tensor {
     return cpu_layout.fuseTwoProjectionWeights(allocator, w1, w3);
+}
+
+fn copyTensorToF32(
+    allocator: std.mem.Allocator,
+    src: *const Tensor,
+    expected_in: ?usize,
+) !*Tensor {
+    if (src.dtype.isQuantized()) return error.UnsupportedDType;
+    const dims: usize = @intCast(src.n_dims);
+    if (dims == 0 or dims > tensor.MAX_NDIM) return error.InvalidShape;
+
+    if (expected_in) |in_dim| {
+        if (dims != 2) return error.InvalidShape;
+        const rows: usize = @intCast(src.shape[0]);
+        const cols: usize = @intCast(src.shape[1]);
+        if (rows == 0 or cols == 0) return error.InvalidShape;
+        if (rows != in_dim and cols != in_dim) return error.InvalidShape;
+
+        if (cols == in_dim and rows != in_dim) {
+            const dst = try Tensor.init(allocator, &.{ @intCast(cols), @intCast(rows) }, .f32, src.device);
+            errdefer dst.deinit(allocator);
+            const dst_data = dst.asSliceMut(f32);
+            switch (src.dtype) {
+                .f32 => {
+                    const src_data = src.asSlice(f32);
+                    for (0..rows) |r| {
+                        for (0..cols) |c| {
+                            dst_data[c * rows + r] = src_data[r * cols + c];
+                        }
+                    }
+                },
+                .bf16 => {
+                    const src_data = src.asSlice(u16);
+                    for (0..rows) |r| {
+                        for (0..cols) |c| {
+                            dst_data[c * rows + r] = dtype.bf16ToF32(src_data[r * cols + c]);
+                        }
+                    }
+                },
+                .f16 => {
+                    const src_data = src.asSlice(u16);
+                    for (0..rows) |r| {
+                        for (0..cols) |c| {
+                            dst_data[c * rows + r] = dtype.fp16ToF32(src_data[r * cols + c]);
+                        }
+                    }
+                },
+                else => return error.UnsupportedDType,
+            }
+            return dst;
+        }
+    }
+
+    var shape_buf: [tensor.MAX_NDIM]i64 = undefined;
+    for (0..dims) |idx| shape_buf[idx] = src.shape[idx];
+
+    const dst = try Tensor.init(allocator, shape_buf[0..dims], .f32, src.device);
+    errdefer dst.deinit(allocator);
+
+    const dst_data = dst.asSliceMut(f32);
+    switch (src.dtype) {
+        .f32 => @memcpy(dst_data, src.asSlice(f32)),
+        .bf16 => {
+            const src_data = src.asSlice(u16);
+            for (src_data, 0..) |value, idx| {
+                dst_data[idx] = dtype.bf16ToF32(value);
+            }
+        },
+        .f16 => {
+            const src_data = src.asSlice(u16);
+            for (src_data, 0..) |value, idx| {
+                dst_data[idx] = dtype.fp16ToF32(value);
+            }
+        },
+        else => return error.UnsupportedDType,
+    }
+    return dst;
 }
 
 /// Create a heap-allocated NormKernel, choosing LayerNorm when bias is present.
@@ -218,6 +304,27 @@ inline fn toKernelMambaWeights(weights: runtime_blocks.MambaWeights) mamba.Mamba
         .conv1d_bias = weights.conv1d_bias,
         .A_log = weights.A_log,
         .D = weights.D,
+        .dt_bias = weights.dt_bias,
+        .norm_weight = weights.norm_weight,
+        .out_proj = weights.out_proj,
+    };
+}
+
+inline fn toKernelGatedDeltaConfig(cfg: runtime_blocks.GatedDeltaConfig) gated_delta.GatedDeltaConfig {
+    return .{
+        .d_model = cfg.d_model,
+        .d_conv = cfg.d_conv,
+        .n_heads = cfg.n_heads,
+        .d_head = cfg.d_head,
+    };
+}
+
+inline fn toKernelGatedDeltaWeights(weights: runtime_blocks.GatedDeltaWeights) gated_delta.GatedDeltaWeights {
+    return .{
+        .in_proj = weights.in_proj,
+        .conv1d_weight = weights.conv1d_weight,
+        .conv1d_bias = weights.conv1d_bias,
+        .A_log = weights.A_log,
         .dt_bias = weights.dt_bias,
         .norm_weight = weights.norm_weight,
         .out_proj = weights.out_proj,
@@ -397,6 +504,135 @@ pub const FfnLayer = union(enum) {
     }
 };
 
+fn freeOwnedTensorStorage(allocator: std.mem.Allocator, owned: Tensor) void {
+    const data_ptr = owned.data_ptr orelse unreachable;
+    const elem_size = owned.dtype.elementSize();
+    const total_size = @as(usize, @intCast(owned.shape[0])) * @as(usize, @intCast(owned.shape[1])) * elem_size;
+    allocator.free(@as([*]u8, @ptrCast(data_ptr))[0..total_size]);
+}
+
+const OptionalSwigluTail = struct {
+    layer: ?*FfnLayer = null,
+    fused_gate_up_storage: ?Tensor = null,
+    fused_gate_up_owned: bool = false,
+
+    fn deinit(self: *OptionalSwigluTail, allocator: std.mem.Allocator) void {
+        if (self.layer) |layer| allocator.destroy(layer);
+        if (self.fused_gate_up_owned) {
+            if (self.fused_gate_up_storage) |fg| freeOwnedTensorStorage(allocator, fg);
+        }
+        self.* = .{};
+    }
+};
+
+fn buildOptionalSwigluTail(
+    allocator: std.mem.Allocator,
+    d_model: usize,
+    d_ff: usize,
+    use_gelu: bool,
+    block_idx: usize,
+    fused_gate_up: ?FusedBlockWeights,
+    output_proj: ?*const Tensor,
+    w1: ?*const Tensor,
+    w2: ?*const Tensor,
+    w3: ?*const Tensor,
+    required: bool,
+) !OptionalSwigluTail {
+    if (fused_gate_up) |fused| {
+        if (fused.gate_up) |gate_up| {
+            const down_proj = output_proj orelse return error.InvalidConfiguration;
+            const dk_gate_up = try cpu_linalg.matmulKernel(gate_up.dtype);
+            const dk_down = try cpu_linalg.matmulKernel(down_proj.dtype);
+            const ffn_layer_ptr = try allocator.create(FfnLayer);
+            errdefer allocator.destroy(ffn_layer_ptr);
+            ffn_layer_ptr.* = .{ .swiglu = .{
+                .d_model = d_model,
+                .d_ff = d_ff,
+                .use_gelu = use_gelu,
+                .layer_idx = @intCast(block_idx),
+                .w1 = null,
+                .w2 = down_proj,
+                .w3 = null,
+                .fused_gate_up = gate_up,
+                .fused_gate_up_layout = toKernelGateUpLayout(fused.gate_up_layout),
+                .allocator = allocator,
+                .matmul_gate = dk_gate_up.func,
+                .matmul_gate_up = dk_gate_up.func,
+                .matmul_down = dk_down.func,
+                .kernel_name_gate = null,
+                .kernel_name_gate_up = dk_gate_up.name,
+                .kernel_name_down = dk_down.name,
+            } };
+            return .{
+                .layer = ffn_layer_ptr,
+                .fused_gate_up_storage = gate_up,
+            };
+        }
+    }
+
+    if (w1 != null and w2 != null and w3 != null) {
+        const gate_proj = w1.?;
+        const down_proj = w2.?;
+        const up_proj = w3.?;
+        const maybe_fused = try fuseGateUpWeights(allocator, gate_proj, up_proj);
+        const ffn_layer_ptr = try allocator.create(FfnLayer);
+        errdefer allocator.destroy(ffn_layer_ptr);
+        if (maybe_fused) |fused_tensor| {
+            errdefer freeOwnedTensorStorage(allocator, fused_tensor);
+            const dk_gate_up = try cpu_linalg.matmulKernel(gate_proj.dtype);
+            const dk_down = try cpu_linalg.matmulKernel(down_proj.dtype);
+            ffn_layer_ptr.* = .{ .swiglu = .{
+                .d_model = d_model,
+                .d_ff = d_ff,
+                .use_gelu = use_gelu,
+                .layer_idx = @intCast(block_idx),
+                .w1 = null,
+                .w2 = down_proj,
+                .w3 = null,
+                .fused_gate_up = fused_tensor,
+                .fused_gate_up_layout = .concat,
+                .allocator = allocator,
+                .matmul_gate = dk_gate_up.func,
+                .matmul_gate_up = dk_gate_up.func,
+                .matmul_down = dk_down.func,
+                .kernel_name_gate = null,
+                .kernel_name_gate_up = dk_gate_up.name,
+                .kernel_name_down = dk_down.name,
+            } };
+            return .{
+                .layer = ffn_layer_ptr,
+                .fused_gate_up_storage = fused_tensor,
+                .fused_gate_up_owned = true,
+            };
+        }
+
+        const dk_gate = try cpu_linalg.matmulKernel(gate_proj.dtype);
+        const dk_down = try cpu_linalg.matmulKernel(down_proj.dtype);
+        ffn_layer_ptr.* = .{ .swiglu = .{
+            .d_model = d_model,
+            .d_ff = d_ff,
+            .use_gelu = use_gelu,
+            .layer_idx = @intCast(block_idx),
+            .w1 = gate_proj,
+            .w2 = down_proj,
+            .w3 = up_proj,
+            .fused_gate_up = null,
+            .fused_gate_up_layout = .concat,
+            .allocator = allocator,
+            .matmul_gate = dk_gate.func,
+            .matmul_gate_up = null,
+            .matmul_down = dk_down.func,
+            .kernel_name_gate = dk_gate.name,
+            .kernel_name_gate_up = null,
+            .kernel_name_down = dk_down.name,
+        } };
+        return .{ .layer = ffn_layer_ptr };
+    }
+
+    if (required) return error.MissingFFNWeights;
+    return .{};
+}
+
 // =============================================================================
 // Block Type System for Heterogeneous Models
 // =============================================================================
@@ -427,6 +663,8 @@ pub const TransformerBlock = struct {
     /// These are referenced by weight_registry entries.
     fused_qkv_storage: ?tensor.Tensor = null,
     fused_gate_up_storage: ?tensor.Tensor = null,
+    owned_mamba_in_proj: ?*tensor.Tensor = null,
+    owned_gated_delta_in_proj: ?*tensor.Tensor = null,
     /// True if fused_gate_up_storage data was allocated by us (needs freeing)
     fused_gate_up_owned: bool = false,
 
@@ -476,6 +714,17 @@ pub const TransformerBlock = struct {
 
     pub fn getMambaKernelMut(self: *TransformerBlock) ?*mamba.MambaKernel {
         return if (self.getMambaKernel()) |mamba_ptr| @constCast(mamba_ptr) else null;
+    }
+
+    pub fn getGatedDeltaKernel(self: *const TransformerBlock) ?*const gated_delta.GatedDeltaKernel {
+        for (self.kernels) |kernel| {
+            if (kernel == .gated_delta) return kernel.gated_delta;
+        }
+        return null;
+    }
+
+    pub fn getGatedDeltaKernelMut(self: *TransformerBlock) ?*gated_delta.GatedDeltaKernel {
+        return if (self.getGatedDeltaKernel()) |gated_delta_ptr| @constCast(gated_delta_ptr) else null;
     }
 
     pub fn getShortConvKernel(self: *const TransformerBlock) ?*const shortconv.ShortConvKernel {
@@ -534,6 +783,7 @@ pub const TransformerBlock = struct {
                 .attention => |p| allocator.destroy(@constCast(p)),
                 .mla_attention => |p| allocator.destroy(@constCast(p)),
                 .mamba => |p| allocator.destroy(@constCast(p)),
+                .gated_delta => |p| allocator.destroy(@constCast(p)),
                 .shortconv => |p| {
                     // Free transposed weight buffer before destroying kernel.
                     const shortconv_kernel = @constCast(p);
@@ -546,13 +796,10 @@ pub const TransformerBlock = struct {
 
         // Free fused gate_up storage if we allocated it
         if (self.fused_gate_up_owned) {
-            if (self.fused_gate_up_storage) |fg| {
-                const data_ptr = fg.data_ptr orelse unreachable;
-                const elem_size = fg.dtype.elementSize();
-                const total_size = @as(usize, @intCast(fg.shape[0])) * @as(usize, @intCast(fg.shape[1])) * elem_size;
-                allocator.free(@as([*]u8, @ptrCast(data_ptr))[0..total_size]);
-            }
+            if (self.fused_gate_up_storage) |fg| freeOwnedTensorStorage(allocator, fg);
         }
+        if (self.owned_mamba_in_proj) |tensor_ptr| tensor_ptr.deinit(allocator);
+        if (self.owned_gated_delta_in_proj) |tensor_ptr| tensor_ptr.deinit(allocator);
 
         if (self.kernels.len > 0) allocator.free(self.kernels);
         self.weight_registry.deinit(allocator);
@@ -578,6 +825,7 @@ pub const TransformerBlock = struct {
             weights,
             context.norm_eps,
             context.runtime,
+            context.rope_interleaved,
             context.residual_multiplier,
             context.attention_scale,
             context.use_gelu,
@@ -596,6 +844,7 @@ pub const TransformerBlock = struct {
         weights: BlockWeights,
         norm_eps: f32,
         runtime: tensor.ModelRuntime,
+        rope_interleaved: bool,
         residual_multiplier: f32,
         attention_scale: f32,
         use_gelu: bool,
@@ -613,6 +862,7 @@ pub const TransformerBlock = struct {
             null,
             norm_eps,
             runtime,
+            rope_interleaved,
             residual_multiplier,
             attention_scale,
             use_gelu,
@@ -632,6 +882,7 @@ pub const TransformerBlock = struct {
         program: ?[]const layer_ops.LayerOp,
         norm_eps: f32,
         runtime: tensor.ModelRuntime,
+        rope_interleaved: bool,
         residual_multiplier: f32,
         attention_scale: f32,
         use_gelu: bool,
@@ -650,6 +901,7 @@ pub const TransformerBlock = struct {
                 program,
                 norm_eps,
                 runtime,
+                rope_interleaved,
                 residual_multiplier,
                 attention_scale,
                 use_gelu,
@@ -660,6 +912,17 @@ pub const TransformerBlock = struct {
                 d_model,
                 d_ff,
                 mamba_weights,
+                norm_eps,
+                runtime,
+                residual_multiplier,
+                use_gelu,
+                block_idx,
+            ),
+            .gated_delta => |gated_delta_weights| try initGatedDelta(
+                allocator,
+                d_model,
+                d_ff,
+                gated_delta_weights,
                 norm_eps,
                 runtime,
                 residual_multiplier,
@@ -693,6 +956,7 @@ pub const TransformerBlock = struct {
         program: ?[]const layer_ops.LayerOp,
         norm_eps: f32,
         runtime: tensor.ModelRuntime,
+        rope_interleaved: bool,
         residual_multiplier: f32,
         attention_scale: f32,
         use_gelu: bool,
@@ -763,7 +1027,7 @@ pub const TransformerBlock = struct {
         }
         errdefer if (post_ffn_norm_ptr) |p| allocator.destroy(p);
 
-        // Create either MLA or standard attention kernel
+        // Create either MLA or standard attention kernel.
         var attn_kernel: ?*attn.MultiHeadAttention = null;
         var mla_kernel: ?*mla.MLAttention = null;
 
@@ -795,7 +1059,6 @@ pub const TransformerBlock = struct {
             };
             mla_kernel = mla_ptr;
         } else {
-            // Standard attention kernel
             const attn_ptr = try allocator.create(attn.MultiHeadAttention);
             errdefer allocator.destroy(attn_ptr);
             attn_ptr.* = .{
@@ -808,12 +1071,14 @@ pub const TransformerBlock = struct {
                 .qk_norm_weight_offset = runtime.qk_norm_weight_offset,
                 .sliding_window = weights.sliding_window,
                 .layer_idx = @intCast(block_idx),
+                .query_gate = weights.attention_config.query_gate,
                 .q_proj = weights.q_proj,
                 .k_proj = weights.k_proj,
                 .v_proj = weights.v_proj,
                 .o_proj = weights.o_proj,
                 .fused_qkv = weights.fused.qkv_proj,
                 .rope = null,
+                .rope_interleaved = weights.attention_config.rope_interleaved orelse rope_interleaved,
                 .q_norm = weights.q_norm,
                 .k_norm = weights.k_norm,
                 .norm_eps = norm_eps,
@@ -846,10 +1111,7 @@ pub const TransformerBlock = struct {
         // Track fused gate_up ownership at function scope (used in block return)
         var owned_fused_gate_up: ?Tensor = null;
         errdefer if (owned_fused_gate_up) |fg| {
-            const data_ptr = fg.data_ptr orelse unreachable;
-            const elem_size = fg.dtype.elementSize();
-            const total_size = @as(usize, @intCast(fg.shape[0])) * @as(usize, @intCast(fg.shape[1])) * elem_size;
-            allocator.free(@as([*]u8, @ptrCast(data_ptr))[0..total_size]);
+            freeOwnedTensorStorage(allocator, fg);
         };
 
         if (weights.moe_weights) |moe_w| {
@@ -953,8 +1215,10 @@ pub const TransformerBlock = struct {
                     .multihead_attention => {
                         if (mla_kernel) |mla_k| {
                             try kernel_list.append(allocator, .{ .mla_attention = mla_k });
+                        } else if (attn_kernel) |attn_k| {
+                            try kernel_list.append(allocator, .{ .attention = attn_k });
                         } else {
-                            try kernel_list.append(allocator, .{ .attention = attn_kernel.? });
+                            return error.InvalidConfiguration;
                         }
                     },
                     .mlp, .moe => {
@@ -1021,10 +1285,6 @@ pub const TransformerBlock = struct {
         use_gelu: bool,
         block_idx: usize,
     ) !TransformerBlock {
-        const matmul_in_proj = (try cpu_linalg.matmulKernel(weights.weights.in_proj.dtype)).func;
-        const matmul_out_proj = (try cpu_linalg.matmulKernel(weights.weights.out_proj.dtype)).func;
-        const ssm_scan = compute.cpu.simd.ssm_scan.stateScanF32;
-
         const ln1_ptr = try createNormKernel(allocator, weights.ln1_weight, null, d_model, norm_eps, runtime.weight_offset, @intCast(block_idx), .layer_attn_norm);
         errdefer allocator.destroy(ln1_ptr);
 
@@ -1033,68 +1293,48 @@ pub const TransformerBlock = struct {
             ln2_ptr = try createNormKernel(allocator, ln2_w, null, d_model, norm_eps, runtime.weight_offset, @intCast(block_idx), .layer_ffn_norm);
         }
         errdefer if (ln2_ptr) |p| allocator.destroy(p);
-
+        const kernel_mamba_weights = toKernelMambaWeights(weights.weights);
+        const matmul_in_proj = (try cpu_linalg.matmulKernel(kernel_mamba_weights.in_proj.dtype)).func;
+        const matmul_out_proj = (try cpu_linalg.matmulKernel(kernel_mamba_weights.out_proj.dtype)).func;
+        const ssm_scan = compute.cpu.simd.ssm_scan.stateScanF32;
         const mamba_ptr = try allocator.create(mamba.MambaKernel);
         errdefer allocator.destroy(mamba_ptr);
         mamba_ptr.* = mamba.MambaKernel.init(
             toKernelMambaConfig(weights.config),
-            toKernelMambaWeights(weights.weights),
+            kernel_mamba_weights,
             matmul_in_proj,
             matmul_out_proj,
             ssm_scan,
         );
         mamba_ptr.layer_idx = @intCast(block_idx);
+        const recurrent_kernel: runtime_mod.CpuKernel = .{ .mamba = mamba_ptr };
 
-        // Build FFN layer if weights are present (Granite Hybrid has shared_mlp for all layers)
-        var ffn_ptr: ?*FfnLayer = null;
-        var fused_gate_up_storage: ?tensor.Tensor = null;
-
-        if (weights.fused_gate_up) |fused| {
-            // Fused gate+up projection from shared_mlp.input_linear
-            if (fused.gate_up) |gate_up| {
-                fused_gate_up_storage = gate_up;
-                const down_proj = weights.down_proj orelse return error.InvalidConfiguration;
-                const dk_gate_up = try cpu_linalg.matmulKernel(gate_up.dtype);
-                const dk_down = try cpu_linalg.matmulKernel(down_proj.dtype);
-                const ffn_layer_ptr = try allocator.create(FfnLayer);
-                errdefer allocator.destroy(ffn_layer_ptr);
-                ffn_layer_ptr.* = .{
-                    .swiglu = .{
-                        .d_model = d_model,
-                        .d_ff = d_ff,
-                        .use_gelu = use_gelu,
-                        .layer_idx = @intCast(block_idx),
-                        .w1 = null, // gate_proj
-                        .w2 = down_proj, // down_proj (required)
-                        .w3 = null, // up_proj
-                        .fused_gate_up = gate_up,
-                        .fused_gate_up_layout = toKernelGateUpLayout(fused.gate_up_layout),
-                        .allocator = allocator,
-                        .matmul_gate = dk_gate_up.func, // Reuse for both gate/up when fused
-                        .matmul_gate_up = dk_gate_up.func,
-                        .matmul_down = dk_down.func,
-                        .kernel_name_gate = null,
-                        .kernel_name_gate_up = dk_gate_up.name,
-                        .kernel_name_down = dk_down.name,
-                    },
-                };
-                ffn_ptr = ffn_layer_ptr;
-            }
-        }
+        var ffn_build = try buildOptionalSwigluTail(
+            allocator,
+            d_model,
+            d_ff,
+            use_gelu,
+            block_idx,
+            weights.fused_gate_up,
+            weights.down_proj,
+            weights.w1,
+            weights.w2,
+            weights.w3,
+            true,
+        );
+        errdefer ffn_build.deinit(allocator);
 
         var kernel_list = std.ArrayListUnmanaged(CpuKernel){};
         errdefer kernel_list.deinit(allocator);
 
         try kernel_list.append(allocator, .{ .norm = ln1_ptr });
-        try kernel_list.append(allocator, .{ .mamba = mamba_ptr });
+        try kernel_list.append(allocator, recurrent_kernel);
 
         if (ln2_ptr) |n| {
             try kernel_list.append(allocator, .{ .norm = n });
         }
 
-        if (ffn_ptr) |ffn_ptr_local| {
-            try kernel_list.append(allocator, .{ .swiglu = &ffn_ptr_local.swiglu });
-        }
+        try kernel_list.append(allocator, .{ .swiglu = &ffn_build.layer.?.swiglu });
 
         const kernels = try kernel_list.toOwnedSlice(allocator);
         errdefer allocator.free(kernels);
@@ -1104,7 +1344,86 @@ pub const TransformerBlock = struct {
             .block_type = .mamba,
             .residual_multiplier = residual_multiplier,
             .block_idx = block_idx,
-            .fused_gate_up_storage = fused_gate_up_storage,
+            .fused_gate_up_storage = ffn_build.fused_gate_up_storage,
+            .fused_gate_up_owned = ffn_build.fused_gate_up_owned,
+        };
+    }
+
+    /// Initialize a Gated DeltaNet block.
+    fn initGatedDelta(
+        allocator: std.mem.Allocator,
+        d_model: usize,
+        d_ff: usize,
+        weights: GatedDeltaBlockWeights,
+        norm_eps: f32,
+        runtime: tensor.ModelRuntime,
+        residual_multiplier: f32,
+        use_gelu: bool,
+        block_idx: usize,
+    ) !TransformerBlock {
+        const ln1_ptr = try createNormKernel(allocator, weights.ln1_weight, null, d_model, norm_eps, runtime.weight_offset, @intCast(block_idx), .layer_attn_norm);
+        errdefer allocator.destroy(ln1_ptr);
+
+        var ln2_ptr: ?*norm.NormKernel = null;
+        if (weights.ln2_weight) |ln2_w| {
+            ln2_ptr = try createNormKernel(allocator, ln2_w, null, d_model, norm_eps, runtime.weight_offset, @intCast(block_idx), .layer_ffn_norm);
+        }
+        errdefer if (ln2_ptr) |p| allocator.destroy(p);
+
+        var owned_gated_delta_in_proj: ?*tensor.Tensor = null;
+        errdefer if (owned_gated_delta_in_proj) |tensor_ptr| tensor_ptr.deinit(allocator);
+
+        var kernel_gated_delta_weights = toKernelGatedDeltaWeights(weights.weights);
+        if (kernel_gated_delta_weights.in_proj.dtype != .f32) {
+            owned_gated_delta_in_proj = try copyTensorToF32(allocator, kernel_gated_delta_weights.in_proj, d_model);
+            kernel_gated_delta_weights.in_proj = owned_gated_delta_in_proj.?;
+        }
+        const matmul_in_proj = (try cpu_linalg.matmulKernel(kernel_gated_delta_weights.in_proj.dtype)).func;
+        const matmul_out_proj = (try cpu_linalg.matmulKernel(kernel_gated_delta_weights.out_proj.dtype)).func;
+        const gated_delta_ptr = try allocator.create(gated_delta.GatedDeltaKernel);
+        errdefer allocator.destroy(gated_delta_ptr);
+        gated_delta_ptr.* = gated_delta.GatedDeltaKernel.init(
+            toKernelGatedDeltaConfig(weights.config),
+            kernel_gated_delta_weights,
+            matmul_in_proj,
+            matmul_out_proj,
+        );
+        gated_delta_ptr.layer_idx = @intCast(block_idx);
+
+        var ffn_build = try buildOptionalSwigluTail(
+            allocator,
+            d_model,
+            d_ff,
+            use_gelu,
+            block_idx,
+            weights.fused_gate_up,
+            weights.down_proj,
+            weights.w1,
+            weights.w2,
+            weights.w3,
+            true,
+        );
+        errdefer ffn_build.deinit(allocator);
+
+        var kernel_list = std.ArrayListUnmanaged(CpuKernel){};
+        errdefer kernel_list.deinit(allocator);
+
+        try kernel_list.append(allocator, .{ .norm = ln1_ptr });
+        try kernel_list.append(allocator, .{ .gated_delta = gated_delta_ptr });
+        if (ln2_ptr) |n| try kernel_list.append(allocator, .{ .norm = n });
+        try kernel_list.append(allocator, .{ .swiglu = &ffn_build.layer.?.swiglu });
+
+        const kernels = try kernel_list.toOwnedSlice(allocator);
+        errdefer allocator.free(kernels);
+
+        return TransformerBlock{
+            .kernels = kernels,
+            .block_type = .gated_delta,
+            .residual_multiplier = residual_multiplier,
+            .block_idx = block_idx,
+            .fused_gate_up_storage = ffn_build.fused_gate_up_storage,
+            .owned_gated_delta_in_proj = owned_gated_delta_in_proj,
+            .fused_gate_up_owned = ffn_build.fused_gate_up_owned,
         };
     }
 
@@ -1149,101 +1468,20 @@ pub const TransformerBlock = struct {
         // This eliminates strided gather operations in the hot loop
         try shortconv_ptr.initTransposedWeights(allocator);
 
-        // Build FFN layer if weights are present
-        var ffn_ptr: ?*FfnLayer = null;
-        var fused_gate_up_storage: ?tensor.Tensor = null;
-        var fused_gate_up_owned: bool = false;
-
-        if (weights.fused_gate_up) |fused| {
-            if (fused.gate_up) |gate_up| {
-                fused_gate_up_storage = gate_up;
-                const down_proj = weights.w2 orelse return error.InvalidConfiguration;
-                const dk_gate_up = try cpu_linalg.matmulKernel(gate_up.dtype);
-                const dk_down = try cpu_linalg.matmulKernel(down_proj.dtype);
-                const ffn_layer_ptr = try allocator.create(FfnLayer);
-                errdefer allocator.destroy(ffn_layer_ptr);
-                ffn_layer_ptr.* = .{ .swiglu = .{
-                    .d_model = d_model,
-                    .d_ff = d_ff,
-                    .use_gelu = use_gelu,
-                    .layer_idx = @intCast(block_idx),
-                    .w1 = null,
-                    .w2 = down_proj,
-                    .w3 = null,
-                    .fused_gate_up = gate_up,
-                    .fused_gate_up_layout = toKernelGateUpLayout(fused.gate_up_layout),
-                    .allocator = allocator,
-                    .matmul_gate = dk_gate_up.func,
-                    .matmul_gate_up = dk_gate_up.func,
-                    .matmul_down = dk_down.func,
-                    .kernel_name_gate = null,
-                    .kernel_name_gate_up = dk_gate_up.name,
-                    .kernel_name_down = dk_down.name,
-                } };
-                ffn_ptr = ffn_layer_ptr;
-            }
-        } else if (weights.w1 != null and weights.w2 != null and weights.w3 != null) {
-            // Separate w1/w2/w3 weights - try to fuse w1 (gate) and w3 (up) at load time
-            const w1 = weights.w1.?;
-            const w2 = weights.w2.?;
-            const w3 = weights.w3.?;
-
-            // Try to fuse for non-quantized types. Quantized types need separate matmuls.
-            const maybe_fused = try fuseGateUpWeights(allocator, w1, w3);
-            if (maybe_fused) |fused_tensor| {
-                fused_gate_up_storage = fused_tensor;
-                fused_gate_up_owned = true; // We allocated this, need to free it
-
-                const dk_gate_up = try cpu_linalg.matmulKernel(w1.dtype);
-                const dk_down = try cpu_linalg.matmulKernel(w2.dtype);
-                const ffn_layer_ptr = try allocator.create(FfnLayer);
-                errdefer allocator.destroy(ffn_layer_ptr);
-                ffn_layer_ptr.* = .{ .swiglu = .{
-                    .d_model = d_model,
-                    .d_ff = d_ff,
-                    .use_gelu = use_gelu,
-                    .layer_idx = @intCast(block_idx),
-                    .w1 = null,
-                    .w2 = w2,
-                    .w3 = null,
-                    .fused_gate_up = fused_tensor,
-                    .fused_gate_up_layout = .concat,
-                    .allocator = allocator,
-                    .matmul_gate = dk_gate_up.func,
-                    .matmul_gate_up = dk_gate_up.func,
-                    .matmul_down = dk_down.func,
-                    .kernel_name_gate = null,
-                    .kernel_name_gate_up = dk_gate_up.name,
-                    .kernel_name_down = dk_down.name,
-                } };
-                ffn_ptr = ffn_layer_ptr;
-            } else {
-                // Quantized types - use separate w1/w3 matmuls
-                const dk_gate = try cpu_linalg.matmulKernel(w1.dtype);
-                const dk_down = try cpu_linalg.matmulKernel(w2.dtype);
-                const ffn_layer_ptr = try allocator.create(FfnLayer);
-                errdefer allocator.destroy(ffn_layer_ptr);
-                ffn_layer_ptr.* = .{ .swiglu = .{
-                    .d_model = d_model,
-                    .d_ff = d_ff,
-                    .use_gelu = use_gelu,
-                    .layer_idx = @intCast(block_idx),
-                    .w1 = w1,
-                    .w2 = w2,
-                    .w3 = w3,
-                    .fused_gate_up = null,
-                    .fused_gate_up_layout = .concat,
-                    .allocator = allocator,
-                    .matmul_gate = dk_gate.func,
-                    .matmul_gate_up = null,
-                    .matmul_down = dk_down.func,
-                    .kernel_name_gate = dk_gate.name,
-                    .kernel_name_gate_up = null,
-                    .kernel_name_down = dk_down.name,
-                } };
-                ffn_ptr = ffn_layer_ptr;
-            }
-        }
+        var ffn_build = try buildOptionalSwigluTail(
+            allocator,
+            d_model,
+            d_ff,
+            use_gelu,
+            block_idx,
+            weights.fused_gate_up,
+            weights.w2,
+            weights.w1,
+            weights.w2,
+            weights.w3,
+            false,
+        );
+        errdefer ffn_build.deinit(allocator);
 
         var kernel_list = std.ArrayListUnmanaged(CpuKernel){};
         errdefer kernel_list.deinit(allocator);
@@ -1255,7 +1493,7 @@ pub const TransformerBlock = struct {
             try kernel_list.append(allocator, .{ .norm = n });
         }
 
-        if (ffn_ptr) |ffn_ptr_local| {
+        if (ffn_build.layer) |ffn_ptr_local| {
             try kernel_list.append(allocator, .{ .swiglu = &ffn_ptr_local.swiglu });
         }
 
@@ -1267,8 +1505,8 @@ pub const TransformerBlock = struct {
             .block_type = .shortconv,
             .residual_multiplier = residual_multiplier,
             .block_idx = block_idx,
-            .fused_gate_up_storage = fused_gate_up_storage,
-            .fused_gate_up_owned = fused_gate_up_owned,
+            .fused_gate_up_storage = ffn_build.fused_gate_up_storage,
+            .fused_gate_up_owned = ffn_build.fused_gate_up_owned,
         };
     }
 
@@ -1278,6 +1516,7 @@ pub const TransformerBlock = struct {
         switch (weights) {
             .attention_mlp => |attn_weights| try self.initAttentionMlpRegistry(allocator, attn_weights),
             .mamba => |mamba_weights| try self.initMambaRegistry(allocator, mamba_weights),
+            .gated_delta => |gated_delta_weights| try self.initGatedDeltaRegistry(allocator, gated_delta_weights),
             .shortconv => |shortconv_weights| try self.initShortConvRegistry(allocator, shortconv_weights),
         }
     }
@@ -1373,6 +1612,15 @@ pub const TransformerBlock = struct {
         // Mamba mixer weights are accessed through the MambaKernel, not the registry
     }
 
+    fn initGatedDeltaRegistry(self: *TransformerBlock, allocator: std.mem.Allocator, weights: GatedDeltaBlockWeights) !void {
+        try self.weight_registry.put(allocator, "input_layernorm.weight", weights.ln1_weight);
+        try self.weight_registry.put(allocator, "norm.weight", weights.ln1_weight);
+        if (weights.ln2_weight) |ln2_w| {
+            try self.weight_registry.put(allocator, "post_attention_layernorm.weight", ln2_w);
+            try self.weight_registry.put(allocator, "post_mixer_layernorm.weight", ln2_w);
+        }
+    }
+
     /// Initialize weight registry for ShortConv blocks.
     fn initShortConvRegistry(self: *TransformerBlock, allocator: std.mem.Allocator, weights: ShortConvBlockWeights) !void {
         // Register ShortConv-specific weight names
@@ -1418,6 +1666,7 @@ pub fn buildBlocks(
         const block_kind: BlockType = switch (block_weight) {
             .attention_mlp => .attention_mlp,
             .mamba => .mamba,
+            .gated_delta => .gated_delta,
             .shortconv => .shortconv,
         };
         const layer_program = if (static_entry) |entry|
@@ -1436,6 +1685,7 @@ pub fn buildBlocks(
             layer_program,
             config.norm_eps,
             runtime,
+            config.rope_scaling.mrope_interleaved,
             config.residual_multiplier,
             attention_scale,
             use_gelu_activation,
@@ -1497,6 +1747,7 @@ pub fn buildBlocksFromLayers(
             layer_program,
             config.norm_eps,
             runtime,
+            config.rope_scaling.mrope_interleaved,
             config.residual_multiplier,
             attention_scale,
             use_gelu_activation,
@@ -2387,12 +2638,140 @@ test "TransformerBlock.deinit frees all memory" {
         weights,
         1e-5,
         .{},
+        false,
         1.0,
         1.0,
         false,
         0,
     );
     defer block.deinit(allocator);
+}
+
+test "copyTensorToF32 converts bf16 matrices" {
+    const allocator = std.testing.allocator;
+
+    var src_storage = [_]u16{
+        dtype.f32ToBf16(1.0),
+        dtype.f32ToBf16(-2.0),
+        dtype.f32ToBf16(3.5),
+        dtype.f32ToBf16(0.25),
+    };
+    var src = Tensor.view(@ptrCast(src_storage[0..].ptr), &.{ 2, 2 }, .bf16, null);
+
+    const copied = try copyTensorToF32(allocator, &src, null);
+    defer copied.deinit(allocator);
+
+    try std.testing.expectEqual(tensor.DType.f32, copied.dtype);
+    try std.testing.expectEqual(@as(i64, 2), copied.shape[0]);
+    try std.testing.expectEqual(@as(i64, 2), copied.shape[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), copied.asSlice(f32)[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.0), copied.asSlice(f32)[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), copied.asSlice(f32)[2], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), copied.asSlice(f32)[3], 1e-5);
+}
+
+test "TransformerBlock.init converts gated-delta mamba in_proj to f32" {
+    const allocator = std.testing.allocator;
+
+    const d_model = 2;
+    const d_ff = 4;
+    const d_inner = 1;
+    const d_conv = 1;
+    const n_heads = 1;
+    const head_dim = 1;
+    const proj_len = 4 * d_inner + 2 * n_heads;
+
+    var ln1_weight = try tensor.OwnedTensor.init(allocator, .f32, &.{d_model});
+    defer ln1_weight.deinit();
+    var ln2_weight = try tensor.OwnedTensor.init(allocator, .f32, &.{d_model});
+    defer ln2_weight.deinit();
+    var conv1d_weight = try tensor.OwnedTensor.init(allocator, .f32, &.{ 3 * d_inner, d_conv });
+    defer conv1d_weight.deinit();
+    var a_log = try tensor.OwnedTensor.init(allocator, .f32, &.{n_heads});
+    defer a_log.deinit();
+    var dt_bias = try tensor.OwnedTensor.init(allocator, .f32, &.{n_heads});
+    defer dt_bias.deinit();
+    var norm_weight = try tensor.OwnedTensor.init(allocator, .f32, &.{head_dim});
+    defer norm_weight.deinit();
+    var out_proj = try tensor.OwnedTensor.init(allocator, .f32, &.{ d_inner, d_model });
+    defer out_proj.deinit();
+    var gate_up = try tensor.OwnedTensor.init(allocator, .f32, &.{ d_model, d_ff * 2 });
+    defer gate_up.deinit();
+    var down_proj = try tensor.OwnedTensor.init(allocator, .f32, &.{ d_model, d_ff });
+    defer down_proj.deinit();
+
+    var in_proj_storage = [_]u16{
+        dtype.f32ToBf16(0.1), dtype.f32ToBf16(0.2),
+        dtype.f32ToBf16(0.3), dtype.f32ToBf16(0.4),
+        dtype.f32ToBf16(0.5), dtype.f32ToBf16(0.6),
+        dtype.f32ToBf16(0.7), dtype.f32ToBf16(0.8),
+        dtype.f32ToBf16(0.9), dtype.f32ToBf16(1.0),
+        dtype.f32ToBf16(1.1), dtype.f32ToBf16(1.2),
+    };
+
+    var ln1_tensor = ln1_weight.view();
+    var ln2_tensor = ln2_weight.view();
+    var in_proj_tensor = Tensor.view(@ptrCast(in_proj_storage[0..].ptr), &.{ proj_len, d_model }, .bf16, null);
+    var conv1d_tensor = conv1d_weight.view();
+    var a_log_tensor = a_log.view();
+    var dt_bias_tensor = dt_bias.view();
+    var norm_tensor = norm_weight.view();
+    var out_proj_tensor = out_proj.view();
+    const gate_up_tensor = gate_up.view();
+    var down_proj_tensor = down_proj.view();
+
+    const weights = BlockWeights{ .gated_delta = .{
+        .ln1_weight = &ln1_tensor,
+        .ln2_weight = &ln2_tensor,
+        .config = .{
+            .d_model = d_model,
+            .d_conv = d_conv,
+            .n_heads = n_heads,
+            .d_head = head_dim,
+        },
+        .weights = .{
+            .in_proj = &in_proj_tensor,
+            .conv1d_weight = &conv1d_tensor,
+            .A_log = &a_log_tensor,
+            .dt_bias = &dt_bias_tensor,
+            .norm_weight = &norm_tensor,
+            .out_proj = &out_proj_tensor,
+        },
+        .fused_gate_up = .{
+            .gate_up = gate_up_tensor,
+            .gate_up_layout = .concat,
+        },
+        .down_proj = &down_proj_tensor,
+    } };
+
+    var block = try TransformerBlock.init(
+        allocator,
+        d_model,
+        d_ff,
+        n_heads,
+        n_heads,
+        head_dim,
+        8,
+        weights,
+        1e-5,
+        .{},
+        false,
+        1.0,
+        1.0,
+        false,
+        0,
+    );
+    defer block.deinit(allocator);
+
+    const kernel = block.getGatedDeltaKernel() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(block.owned_gated_delta_in_proj != null);
+    try std.testing.expectEqual(tensor.DType.f32, kernel.weights.in_proj.dtype);
+    try std.testing.expectEqual(@as(i64, d_model), kernel.weights.in_proj.shape[0]);
+    try std.testing.expectEqual(@as(i64, proj_len), kernel.weights.in_proj.shape[1]);
+    try std.testing.expectApproxEqAbs(dtype.bf16ToF32(dtype.f32ToBf16(0.1)), kernel.weights.in_proj.asSlice(f32)[0], 1e-6);
+    try std.testing.expectApproxEqAbs(dtype.bf16ToF32(dtype.f32ToBf16(0.3)), kernel.weights.in_proj.asSlice(f32)[1], 1e-6);
+    try std.testing.expectApproxEqAbs(dtype.bf16ToF32(dtype.f32ToBf16(1.0)), kernel.weights.in_proj.asSlice(f32)[10], 1e-6);
+    try std.testing.expectApproxEqAbs(dtype.bf16ToF32(dtype.f32ToBf16(1.2)), kernel.weights.in_proj.asSlice(f32)[11], 1e-6);
 }
 
 test "ScratchBuffer initAttention initializes selected attention caches" {
@@ -2553,6 +2932,7 @@ test "TransformerBlock: attention_mlp block type accessors" {
     try std.testing.expect(block.getAttention() != null);
     try std.testing.expect(block.getFfnLayer() != null);
     try std.testing.expect(block.getMambaKernel() == null);
+    try std.testing.expect(block.getGatedDeltaKernel() == null);
     try std.testing.expect(block.getLn1().dim() == d_model);
     try std.testing.expect(block.getLn2() != null);
 }
@@ -2622,6 +3002,7 @@ test "TransformerBlock: mamba block type accessors" {
     try std.testing.expect(block.getAttention() == null);
     try std.testing.expect(block.getFfnLayer() == null);
     try std.testing.expect(block.getMambaKernel() != null);
+    try std.testing.expect(block.getGatedDeltaKernel() == null);
     try std.testing.expect(block.getLn1().dim() == d_model);
     try std.testing.expect(block.getLn2() == null); // Mamba block without ln2
 }

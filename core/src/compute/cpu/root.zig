@@ -20,6 +20,8 @@ pub const recurrence = @import("recurrence.zig");
 pub const indexing = @import("indexing.zig");
 
 pub const activation = @import("activation.zig");
+pub const gated_attention = @import("gated_attention.zig");
+pub const gated_delta = @import("gated_delta.zig");
 pub const elementwise = @import("elementwise.zig");
 pub const normalization = @import("normalization.zig");
 pub const rowwise = @import("rowwise.zig");
@@ -48,6 +50,8 @@ test {
     _ = recurrence;
     _ = indexing;
     _ = activation;
+    _ = gated_attention;
+    _ = gated_delta;
     _ = elementwise;
     _ = normalization;
     _ = rowwise;

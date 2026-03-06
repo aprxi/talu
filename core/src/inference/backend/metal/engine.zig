@@ -210,6 +210,7 @@ pub const MetalBackend = struct {
         kv_cache = 1,
         shortconv_cache = 2,
         mamba_cache = 3,
+        gated_delta_cache = 4,
     };
 
     fn runtimeRoleForRuntimeKind(runtime_kind: u8) !StateRuntimeRole {
@@ -218,6 +219,7 @@ pub const MetalBackend = struct {
             runtime_contract.state_runtime_kind_kv_cache => .kv_cache,
             runtime_contract.state_runtime_kind_shortconv_cache => .shortconv_cache,
             runtime_contract.state_runtime_kind_mamba_cache => .mamba_cache,
+            runtime_contract.state_runtime_kind_gated_delta_cache => .gated_delta_cache,
             else => error.InvalidStateDescriptorBinding,
         };
     }
@@ -245,6 +247,18 @@ pub const MetalBackend = struct {
     fn resetNoopState(_: *const runtime_contract.StateBlockHandle) !void {}
 
     fn deinitNoopState(_: *const runtime_contract.StateBlockHandle) !void {}
+
+    fn initUnsupportedState(_: *MetalBackend, _: *const runtime_contract.StateBlockHandle) !bool {
+        return error.UnsupportedModel;
+    }
+
+    fn resetUnsupportedState(_: *const runtime_contract.StateBlockHandle) !void {
+        return error.UnsupportedModel;
+    }
+
+    fn deinitUnsupportedState(_: *const runtime_contract.StateBlockHandle) !void {
+        return error.UnsupportedModel;
+    }
 
     fn initKvCacheState(self: *MetalBackend, state_block: *const runtime_contract.StateBlockHandle) !bool {
         const cache = try stateObjectPtr(runtime_graph_mod.Cache, state_block);
@@ -316,6 +330,11 @@ pub const MetalBackend = struct {
             .reset = resetMambaState,
             .deinit = deinitMambaState,
         };
+        table[@intFromEnum(StateRuntimeRole.gated_delta_cache)] = .{
+            .init = initUnsupportedState,
+            .reset = resetUnsupportedState,
+            .deinit = deinitUnsupportedState,
+        };
         break :blk table;
     };
 
@@ -363,6 +382,7 @@ pub const MetalBackend = struct {
                 const cache = stateObjectPtr(runtime_graph_mod.MambaCache, state_block) catch break :blk false;
                 break :blk runtimeHandleLooksValid(cache.handle);
             },
+            .gated_delta_cache => true,
         };
     }
 
@@ -1255,12 +1275,21 @@ test "deriveStateRuntimeRoles maps descriptor runtime_kind values" {
             .lifecycle = .slot_persistent,
             .runtime_kind = runtime_contract.state_runtime_kind_mamba_cache,
         },
+        .{
+            .id = runtime_contract.gated_delta_state_id,
+            .size_bytes = 64,
+            .align_bytes = 64,
+            .zero_init = false,
+            .lifecycle = .slot_persistent,
+            .runtime_kind = runtime_contract.state_runtime_kind_gated_delta_cache,
+        },
     };
 
     const roles = try MetalBackend.deriveStateRuntimeRoles(descriptors[0..]);
     try std.testing.expectEqual(MetalBackend.StateRuntimeRole.kv_cache, roles[0]);
     try std.testing.expectEqual(MetalBackend.StateRuntimeRole.shortconv_cache, roles[1]);
     try std.testing.expectEqual(MetalBackend.StateRuntimeRole.mamba_cache, roles[2]);
+    try std.testing.expectEqual(MetalBackend.StateRuntimeRole.gated_delta_cache, roles[3]);
 }
 
 test "deriveStateRuntimeRoles rejects unsupported runtime_kind" {
