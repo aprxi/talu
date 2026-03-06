@@ -72,6 +72,11 @@ const COL_TILE_SIZE_FP16: usize = 32;
 /// Below this, use tiled row+column parallelization for better load balance.
 const TILE_THRESHOLD: usize = 64;
 
+/// K-loop tile size for f32 outer-product kernels.
+/// The goal is to keep a B chunk (K_TILE x N x 4 bytes) resident in cache
+/// across the inner column sweep on the multi-row training path.
+const K_TILE: usize = 256;
+
 // =============================================================================
 // Kernel Limits
 // =============================================================================
@@ -145,6 +150,7 @@ pub fn matmulF32(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Mat
 
     const row_tiles_task = struct {
         fn runRowTiles(start: usize, end: usize, task_ctx: *MatmulF32Ctx) void {
+            @setFloatMode(.optimized);
             const k = task_ctx.k_dim;
             const n = task_ctx.n_cols;
             const vec_end = n - (n % VEC);
@@ -153,33 +159,44 @@ pub fn matmulF32(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Mat
 
             // ROW_TILE rows at a time: 4 accumulators share each B load
             while (row + ROW_TILE <= end) : (row += ROW_TILE) {
-                // Process VEC columns at a time, keeping C tile in registers
-                var col: usize = 0;
-                while (col < vec_end) : (col += VEC) {
-                    var acc: [ROW_TILE]VecF32 = .{@as(VecF32, @splat(0))} ** ROW_TILE;
+                var k_start: usize = 0;
+                while (k_start < k) : (k_start += K_TILE) {
+                    const k_end = @min(k_start + K_TILE, k);
 
-                    for (0..k) |ki| {
-                        const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
+                    // Process VEC columns at a time, keeping C tile in registers.
+                    var col: usize = 0;
+                    while (col < vec_end) : (col += VEC) {
+                        var acc: [ROW_TILE]VecF32 = undefined;
                         inline for (0..ROW_TILE) |r| {
-                            const a_val: VecF32 = @splat(task_ctx.a[(row + r) * k + ki]);
-                            acc[r] = @mulAdd(VecF32, a_val, b_vec, acc[r]);
+                            acc[r] = if (k_start == 0)
+                                @as(VecF32, @splat(0))
+                            else
+                                task_ctx.c[(row + r) * n + col ..][0..VEC].*;
+                        }
+
+                        for (k_start..k_end) |ki| {
+                            const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
+                            inline for (0..ROW_TILE) |r| {
+                                const a_val: VecF32 = @splat(task_ctx.a[(row + r) * k + ki]);
+                                acc[r] = @mulAdd(VecF32, a_val, b_vec, acc[r]);
+                            }
+                        }
+
+                        inline for (0..ROW_TILE) |r| {
+                            task_ctx.c[(row + r) * n + col ..][0..VEC].* = acc[r];
                         }
                     }
 
-                    inline for (0..ROW_TILE) |r| {
-                        task_ctx.c[(row + r) * n + col ..][0..VEC].* = acc[r];
-                    }
-                }
-
-                // Scalar tail
-                if (col < n) {
-                    inline for (0..ROW_TILE) |r| {
-                        for (col..n) |c_idx| {
-                            var sum: f32 = 0;
-                            for (0..k) |ki| {
-                                sum = @mulAdd(f32, task_ctx.a[(row + r) * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                    // Scalar tail
+                    if (col < n) {
+                        inline for (0..ROW_TILE) |r| {
+                            for (col..n) |c_idx| {
+                                var sum: f32 = if (k_start == 0) 0 else task_ctx.c[(row + r) * n + c_idx];
+                                for (k_start..k_end) |ki| {
+                                    sum = @mulAdd(f32, task_ctx.a[(row + r) * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                                }
+                                task_ctx.c[(row + r) * n + c_idx] = sum;
                             }
-                            task_ctx.c[(row + r) * n + c_idx] = sum;
                         }
                     }
                 }
@@ -187,22 +204,30 @@ pub fn matmulF32(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Mat
 
             // Remaining rows (< ROW_TILE)
             while (row < end) : (row += 1) {
-                var col: usize = 0;
-                while (col < vec_end) : (col += VEC) {
-                    var acc: VecF32 = @as(VecF32, @splat(0));
-                    for (0..k) |ki| {
-                        const a_val: VecF32 = @splat(task_ctx.a[row * k + ki]);
-                        const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
-                        acc = @mulAdd(VecF32, a_val, b_vec, acc);
+                var k_start: usize = 0;
+                while (k_start < k) : (k_start += K_TILE) {
+                    const k_end = @min(k_start + K_TILE, k);
+
+                    var col: usize = 0;
+                    while (col < vec_end) : (col += VEC) {
+                        var acc: VecF32 = if (k_start == 0)
+                            @as(VecF32, @splat(0))
+                        else
+                            task_ctx.c[row * n + col ..][0..VEC].*;
+                        for (k_start..k_end) |ki| {
+                            const a_val: VecF32 = @splat(task_ctx.a[row * k + ki]);
+                            const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
+                            acc = @mulAdd(VecF32, a_val, b_vec, acc);
+                        }
+                        task_ctx.c[row * n + col ..][0..VEC].* = acc;
                     }
-                    task_ctx.c[row * n + col ..][0..VEC].* = acc;
-                }
-                for (col..n) |c_idx| {
-                    var sum: f32 = 0;
-                    for (0..k) |ki| {
-                        sum = @mulAdd(f32, task_ctx.a[row * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                    for (col..n) |c_idx| {
+                        var sum: f32 = if (k_start == 0) 0 else task_ctx.c[row * n + c_idx];
+                        for (k_start..k_end) |ki| {
+                            sum = @mulAdd(f32, task_ctx.a[row * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                        }
+                        task_ctx.c[row * n + c_idx] = sum;
                     }
-                    task_ctx.c[row * n + c_idx] = sum;
                 }
             }
         }
@@ -288,57 +313,67 @@ pub fn matmulF32Accum(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch:
             var row = start;
 
             while (row + ROW_TILE <= end) : (row += ROW_TILE) {
-                var col: usize = 0;
-                while (col < vec_end) : (col += VEC) {
-                    // Load existing C values (accumulate, not overwrite)
-                    var acc: [ROW_TILE]VecF32 = undefined;
-                    inline for (0..ROW_TILE) |r| {
-                        acc[r] = task_ctx.c[(row + r) * n + col ..][0..VEC].*;
-                    }
+                var k_start: usize = 0;
+                while (k_start < k) : (k_start += K_TILE) {
+                    const k_end = @min(k_start + K_TILE, k);
 
-                    for (0..k) |ki| {
-                        const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
+                    var col: usize = 0;
+                    while (col < vec_end) : (col += VEC) {
+                        // Load existing C values (accumulate, not overwrite)
+                        var acc: [ROW_TILE]VecF32 = undefined;
                         inline for (0..ROW_TILE) |r| {
-                            const a_val: VecF32 = @splat(task_ctx.a[(row + r) * k + ki]);
-                            acc[r] = @mulAdd(VecF32, a_val, b_vec, acc[r]);
+                            acc[r] = task_ctx.c[(row + r) * n + col ..][0..VEC].*;
+                        }
+
+                        for (k_start..k_end) |ki| {
+                            const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
+                            inline for (0..ROW_TILE) |r| {
+                                const a_val: VecF32 = @splat(task_ctx.a[(row + r) * k + ki]);
+                                acc[r] = @mulAdd(VecF32, a_val, b_vec, acc[r]);
+                            }
+                        }
+
+                        inline for (0..ROW_TILE) |r| {
+                            task_ctx.c[(row + r) * n + col ..][0..VEC].* = acc[r];
                         }
                     }
 
-                    inline for (0..ROW_TILE) |r| {
-                        task_ctx.c[(row + r) * n + col ..][0..VEC].* = acc[r];
-                    }
-                }
-
-                if (col < n) {
-                    inline for (0..ROW_TILE) |r| {
-                        for (col..n) |c_idx| {
-                            var sum = task_ctx.c[(row + r) * n + c_idx];
-                            for (0..k) |ki| {
-                                sum = @mulAdd(f32, task_ctx.a[(row + r) * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                    if (col < n) {
+                        inline for (0..ROW_TILE) |r| {
+                            for (col..n) |c_idx| {
+                                var sum = task_ctx.c[(row + r) * n + c_idx];
+                                for (k_start..k_end) |ki| {
+                                    sum = @mulAdd(f32, task_ctx.a[(row + r) * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                                }
+                                task_ctx.c[(row + r) * n + c_idx] = sum;
                             }
-                            task_ctx.c[(row + r) * n + c_idx] = sum;
                         }
                     }
                 }
             }
 
             while (row < end) : (row += 1) {
-                var col: usize = 0;
-                while (col < vec_end) : (col += VEC) {
-                    var acc: VecF32 = task_ctx.c[row * n + col ..][0..VEC].*;
-                    for (0..k) |ki| {
-                        const a_val: VecF32 = @splat(task_ctx.a[row * k + ki]);
-                        const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
-                        acc = @mulAdd(VecF32, a_val, b_vec, acc);
+                var k_start: usize = 0;
+                while (k_start < k) : (k_start += K_TILE) {
+                    const k_end = @min(k_start + K_TILE, k);
+
+                    var col: usize = 0;
+                    while (col < vec_end) : (col += VEC) {
+                        var acc: VecF32 = task_ctx.c[row * n + col ..][0..VEC].*;
+                        for (k_start..k_end) |ki| {
+                            const a_val: VecF32 = @splat(task_ctx.a[row * k + ki]);
+                            const b_vec: VecF32 = task_ctx.b[ki * n + col ..][0..VEC].*;
+                            acc = @mulAdd(VecF32, a_val, b_vec, acc);
+                        }
+                        task_ctx.c[row * n + col ..][0..VEC].* = acc;
                     }
-                    task_ctx.c[row * n + col ..][0..VEC].* = acc;
-                }
-                for (col..n) |c_idx| {
-                    var sum = task_ctx.c[row * n + c_idx];
-                    for (0..k) |ki| {
-                        sum = @mulAdd(f32, task_ctx.a[row * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                    for (col..n) |c_idx| {
+                        var sum = task_ctx.c[row * n + c_idx];
+                        for (k_start..k_end) |ki| {
+                            sum = @mulAdd(f32, task_ctx.a[row * k + ki], task_ctx.b[ki * n + c_idx], sum);
+                        }
+                        task_ctx.c[row * n + c_idx] = sum;
                     }
-                    task_ctx.c[row * n + c_idx] = sum;
                 }
             }
         }
@@ -1443,6 +1478,100 @@ test "matmulF32 zeros" {
 
     for (out.asSlice(f32)) |v| {
         try std.testing.expectApproxEqAbs(0.0, v, 1e-5);
+    }
+}
+
+test "matmulF32 tiled K path matches scalar reference" {
+    const allocator = std.testing.allocator;
+    const M = 3;
+    const K = 300;
+    const N = 5;
+
+    var a = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ M, K });
+    defer a.deinit();
+    var b = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ K, N });
+    defer b.deinit();
+    var out = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ M, N });
+    defer out.deinit();
+
+    for (a.asSlice(f32), 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 17)) - 8;
+        v.* = @as(f32, @floatFromInt(centered)) * 0.25;
+    }
+    for (b.asSlice(f32), 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 13)) - 6;
+        v.* = @as(f32, @floatFromInt(centered)) * 0.5;
+    }
+
+    var a_view = a.view();
+    var b_view = b.view();
+    var out_view = out.view();
+    var scratch = try MatmulScratch.init(allocator);
+    defer scratch.deinit();
+
+    matmulF32(&a_view, &b_view, &out_view, &scratch);
+
+    const a_data = a.asSlice(f32);
+    const b_data = b.asSlice(f32);
+    const out_data = out.asSlice(f32);
+    for (0..M) |row| {
+        for (0..N) |col| {
+            var expected: f32 = 0;
+            for (0..K) |ki| {
+                expected += a_data[row * K + ki] * b_data[ki * N + col];
+            }
+            try std.testing.expectApproxEqAbs(expected, out_data[row * N + col], 1e-4);
+        }
+    }
+}
+
+test "matmulF32Accum tiled K path accumulates correctly" {
+    const allocator = std.testing.allocator;
+    const M = 2;
+    const K = 300;
+    const N = 4;
+
+    var a = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ M, K });
+    defer a.deinit();
+    var b = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ K, N });
+    defer b.deinit();
+    var out = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ M, N });
+    defer out.deinit();
+
+    for (a.asSlice(f32), 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 11)) - 5;
+        v.* = @as(f32, @floatFromInt(centered)) * 0.2;
+    }
+    for (b.asSlice(f32), 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 7)) - 3;
+        v.* = @as(f32, @floatFromInt(centered)) * 0.4;
+    }
+    for (out.asSlice(f32), 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)))) * 0.1;
+    }
+
+    const baseline = try allocator.dupe(f32, out.asSlice(f32));
+    defer allocator.free(baseline);
+
+    var a_view = a.view();
+    var b_view = b.view();
+    var out_view = out.view();
+    var scratch = try MatmulScratch.init(allocator);
+    defer scratch.deinit();
+
+    matmulF32Accum(&a_view, &b_view, &out_view, &scratch);
+
+    const a_data = a.asSlice(f32);
+    const b_data = b.asSlice(f32);
+    const out_data = out.asSlice(f32);
+    for (0..M) |row| {
+        for (0..N) |col| {
+            var expected = baseline[row * N + col];
+            for (0..K) |ki| {
+                expected += a_data[row * K + ki] * b_data[ki * N + col];
+            }
+            try std.testing.expectApproxEqAbs(expected, out_data[row * N + col], 1e-4);
+        }
     }
 }
 
