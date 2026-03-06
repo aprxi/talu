@@ -421,7 +421,7 @@ impl TokenizerHandle {
         let options = talu_sys::EncodeOptions::default();
         // SAFETY: self.ptr is valid, text is valid UTF-8.
         let result = unsafe {
-            talu_sys::talu_tokenizer_encode(self.ptr, text.as_bytes().as_ptr(), text.len(), options)
+            talu_sys::talu_tokenizer_encode(self.ptr, text.as_bytes().as_ptr(), text.len(), &options)
         };
         if !result.error_msg.is_null() {
             return Err(error_from_last_or("Failed to encode text"));
@@ -448,7 +448,7 @@ impl TokenizerHandle {
         let options = talu_sys::EncodeOptions::default();
         // SAFETY: self.ptr is valid, text is valid UTF-8.
         let result = unsafe {
-            talu_sys::talu_tokenizer_encode(self.ptr, text.as_bytes().as_ptr(), text.len(), options)
+            talu_sys::talu_tokenizer_encode(self.ptr, text.as_bytes().as_ptr(), text.len(), &options)
         };
         if !result.error_msg.is_null() {
             return Err(error_from_last_or("Failed to encode text"));

@@ -19,6 +19,46 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+fn isManyPointerType(zig_type: []const u8) bool {
+    return std.mem.startsWith(u8, zig_type, "[*]") or
+        std.mem.startsWith(u8, zig_type, "?[*]") or
+        std.mem.startsWith(u8, zig_type, "[*c]") or
+        std.mem.startsWith(u8, zig_type, "?[*c]");
+}
+
+fn manyPointerStartIndex(zig_type: []const u8) usize {
+    if (std.mem.startsWith(u8, zig_type, "?[*c]")) return 5;
+    if (std.mem.startsWith(u8, zig_type, "[*c]")) return 4;
+    if (std.mem.startsWith(u8, zig_type, "?[*]")) return 4;
+    return 3;
+}
+
+fn countManyPointers(zig_type: []const u8) usize {
+    var ptr_count: usize = 0;
+    var pos: usize = 0;
+
+    while (pos < zig_type.len) {
+        const plain_idx = std.mem.indexOfPos(u8, zig_type, pos, "[*]");
+        const c_idx = std.mem.indexOfPos(u8, zig_type, pos, "[*c]");
+
+        const next_idx = if (plain_idx == null)
+            c_idx
+        else if (c_idx == null)
+            plain_idx
+        else
+            @min(plain_idx.?, c_idx.?);
+
+        if (next_idx) |idx| {
+            ptr_count += 1;
+            pos = idx + 3;
+            continue;
+        }
+        break;
+    }
+
+    return ptr_count;
+}
+
 /// Information about an extern struct
 const StructInfo = struct {
     name: []const u8,
@@ -127,13 +167,12 @@ fn zigToCtype(zig_type: []const u8, known_structs: *std.StringHashMap(StructInfo
     }
 
     // POINTER types (arrays, slices)
-    if (std.mem.startsWith(u8, zig_type, "[*]") or
-        std.mem.startsWith(u8, zig_type, "?[*]"))
-    {
+    if (isManyPointerType(zig_type)) {
         // Skip sentinel-terminated pointers [*:0] which are handled separately
         if (std.mem.indexOf(u8, zig_type, ":0]") != null) {
             // Check for array of strings: ?[*][*:0]u8 -> POINTER(c_char_p)
             if (std.mem.indexOf(u8, zig_type, "[*][*:0]u8") != null or
+                std.mem.indexOf(u8, zig_type, "[*c][*:0]u8") != null or
                 std.mem.indexOf(u8, zig_type, "?[*][*:0]u8") != null)
             {
                 return "POINTER(c_char_p)";
@@ -141,12 +180,7 @@ fn zigToCtype(zig_type: []const u8, known_structs: *std.StringHashMap(StructInfo
             // Fall through to sentinel handling below
         } else {
             // Double pointer check (non-sentinel)
-            var ptr_count: usize = 0;
-            var pos: usize = 0;
-            while (std.mem.indexOfPos(u8, zig_type, pos, "[*]")) |idx| {
-                ptr_count += 1;
-                pos = idx + 3;
-            }
+            const ptr_count = countManyPointers(zig_type);
             if (ptr_count > 1) {
                 return "c_void_p";
             }
@@ -156,7 +190,7 @@ fn zigToCtype(zig_type: []const u8, known_structs: *std.StringHashMap(StructInfo
             if (std.mem.indexOf(u8, zig_type, "u8") != null) return "c_void_p"; // For function params; struct fields handled separately
             // Check if it's a pointer to a known struct type
             // Format: ?[*]StructName or [*]StructName
-            const start_idx = if (std.mem.startsWith(u8, zig_type, "?[*]")) @as(usize, 4) else @as(usize, 3);
+            const start_idx = manyPointerStartIndex(zig_type);
             const elem_type = zig_type[start_idx..];
             if (known_structs.contains(elem_type)) {
                 return null; // Signal this is POINTER(StructName), handled by caller
@@ -194,10 +228,10 @@ fn zigToPythonFieldType(zig_type: []const u8, known_structs: *std.StringHashMap(
 
     // Check for pointer-to-struct: ?[*]StructName or [*]StructName (not sentinel-terminated)
     // Also handles ?[*]const StructName
-    if ((std.mem.startsWith(u8, zig_type, "?[*]") or std.mem.startsWith(u8, zig_type, "[*]")) and
+    if (isManyPointerType(zig_type) and
         std.mem.indexOf(u8, zig_type, ":0]") == null)
     {
-        const start_idx = if (std.mem.startsWith(u8, zig_type, "?[*]")) @as(usize, 4) else @as(usize, 3);
+        const start_idx = manyPointerStartIndex(zig_type);
         var elem_type = zig_type[start_idx..];
         // Strip 'const ' prefix if present
         if (std.mem.startsWith(u8, elem_type, "const ")) {
@@ -870,10 +904,10 @@ fn generatePythonBindings(
 
                     // Check for pointer-to-struct: ?[*]StructName or [*]StructName (not sentinel-terminated)
                     // Also handles ?[*]const StructName
-                    if ((std.mem.startsWith(u8, ft, "?[*]") or std.mem.startsWith(u8, ft, "[*]")) and
+                    if (isManyPointerType(ft) and
                         std.mem.indexOf(u8, ft, ":0]") == null)
                     {
-                        const start_idx = if (std.mem.startsWith(u8, ft, "?[*]")) @as(usize, 4) else @as(usize, 3);
+                        const start_idx = manyPointerStartIndex(ft);
                         var elem_type = ft[start_idx..];
                         // Strip "const " prefix if present
                         if (std.mem.startsWith(u8, elem_type, "const ")) {
@@ -929,8 +963,7 @@ fn generatePythonBindings(
             const py_type = zigToPythonFieldType(field.zig_type, structs);
 
             // Check if this is a pointer-to-struct field
-            const is_ptr_to_struct = (std.mem.startsWith(u8, field.zig_type, "?[*]") or
-                std.mem.startsWith(u8, field.zig_type, "[*]")) and
+            const is_ptr_to_struct = isManyPointerType(field.zig_type) and
                 std.mem.indexOf(u8, field.zig_type, ":0]") == null and
                 structs.contains(py_type);
 
@@ -1243,7 +1276,8 @@ fn generateWrapperFunctions(
 /// Check if a parameter type is an optional pointer
 fn isOptionalPointer(zig_type: []const u8) bool {
     return std.mem.startsWith(u8, zig_type, "?*") or
-        std.mem.startsWith(u8, zig_type, "?[*]");
+        std.mem.startsWith(u8, zig_type, "?[*]") or
+        std.mem.startsWith(u8, zig_type, "?[*c]");
 }
 
 /// Check if a parameter name suggests epsilon
@@ -1261,7 +1295,8 @@ fn zigParamToPythonType(zig_type: []const u8, structs: *std.StringHashMap(Struct
 
     // Pointers -> int
     if (std.mem.startsWith(u8, zig_type, "*") or
-        std.mem.startsWith(u8, zig_type, "[*]"))
+        std.mem.startsWith(u8, zig_type, "[*]") or
+        std.mem.startsWith(u8, zig_type, "[*c]"))
     {
         return "int";
     }

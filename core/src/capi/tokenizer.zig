@@ -16,6 +16,31 @@ const SignalGuard = @import("signal_guard.zig").SignalGuard;
 
 const allocator = std.heap.c_allocator;
 
+var empty_byte_storage: [1]u8 = .{0};
+var empty_u32_storage: [1]u32 = .{0};
+var empty_usize_storage: [1]usize = .{0};
+var empty_offset_storage: [1]TokenOffset = .{.{ .start = 0, .end = 0 }};
+var empty_token_string_storage: [1][*:0]u8 = .{@constCast("")};
+
+fn emptyBytePtr() [*c]u8 {
+    return empty_byte_storage[0..].ptr;
+}
+
+fn emptyU32Ptr() [*c]u32 {
+    return empty_u32_storage[0..].ptr;
+}
+
+fn emptyOffsetPtr() [*c]TokenOffset {
+    return empty_offset_storage[0..].ptr;
+}
+
+fn emptyUsizePtr() [*c]usize {
+    return empty_usize_storage[0..].ptr;
+}
+
+fn emptyTokenStringPtr() [*c][*:0]u8 {
+    return empty_token_string_storage[0..].ptr;
+}
 
 /// Allocates a NUL-terminated copy of a byte slice.
 /// Returns null on allocation failure (OOM).
@@ -40,18 +65,18 @@ fn allocZFromSlice(bytes: []const u8) ?[*:0]u8 {
 pub const OpaqueTokenizerHandle = opaque {};
 
 pub const EncodeResult = extern struct {
-    ids: ?[*]u32,
-    offsets: ?[*]TokenOffset,
-    attention_mask: ?[*]u32,
-    special_tokens_mask: ?[*]u32,
+    ids: [*c]u32,
+    offsets: [*c]TokenOffset,
+    attention_mask: [*c]u32,
+    special_tokens_mask: [*c]u32,
     num_tokens: usize,
-    error_msg: ?[*:0]const u8,
+    error_msg: [*c]const u8,
 };
 
 pub const DecodeResult = extern struct {
-    text: ?[*]u8,
+    text: [*c]u8,
     text_len: usize,
-    error_msg: ?[*:0]const u8,
+    error_msg: [*c]const u8,
 };
 
 pub const EncodeOptions = extern struct {
@@ -64,17 +89,17 @@ pub const EncodeOptions = extern struct {
 };
 
 pub const TokenizeResult = extern struct {
-    tokens: ?[*][*:0]u8,
+    tokens: [*c][*:0]u8,
     num_tokens: usize,
-    error_msg: ?[*:0]const u8,
+    error_msg: [*c]const u8,
 };
 
 pub const TokenizeBytesResult = extern struct {
-    data: ?[*]u8,
+    data: [*c]u8,
     data_len: usize,
-    offsets: ?[*]usize,
+    offsets: [*c]usize,
     num_tokens: usize,
-    error_msg: ?[*:0]const u8,
+    error_msg: [*c]const u8,
 };
 
 pub const TokenOffset = extern struct {
@@ -83,16 +108,16 @@ pub const TokenOffset = extern struct {
 };
 
 pub const EosTokenResult = extern struct {
-    tokens: ?[*]u32,
+    tokens: [*c]u32,
     num_tokens: usize,
 };
 
 pub const BatchEncodeResult = extern struct {
-    ids: ?[*]u32,
-    offsets: ?[*]usize,
+    ids: [*c]u32,
+    offsets: [*c]usize,
     total_tokens: usize,
     num_sequences: usize,
-    error_msg: ?[*:0]const u8,
+    error_msg: [*c]const u8,
 };
 
 pub const SpecialTokensResult = extern struct {
@@ -106,11 +131,11 @@ pub const DecodeOptionsC = extern struct {
 };
 
 pub const VocabResult = extern struct {
-    tokens: ?[*][*:0]u8,
-    lengths: ?[*]u32,
+    tokens: [*c][*:0]u8,
+    lengths: [*c]u32,
     num_entries: usize,
-    ids: ?[*]u32,
-    error_msg: ?[*:0]const u8,
+    ids: [*c]u32,
+    error_msg: [*c]const u8,
 };
 
 pub const PaddedTensorOptions = extern struct {
@@ -122,11 +147,11 @@ pub const PaddedTensorOptions = extern struct {
 };
 
 pub const PaddedTensorResult = extern struct {
-    input_ids: ?[*]u32,
-    attention_mask: ?[*]u32,
+    input_ids: [*c]u32,
+    attention_mask: [*c]u32,
     num_sequences: usize,
     padded_length: usize,
-    error_msg: ?[*:0]const u8,
+    error_msg: [*c]const u8,
 };
 
 // =============================================================================
@@ -299,7 +324,7 @@ fn computeTruncation(ids_len: usize, options: ?*const EncodeOptions) TruncationP
 /// Caller must free via talu_encode_result_free().
 pub export fn talu_tokenizer_encode(
     handle: ?*OpaqueTokenizerHandle,
-    text: [*]const u8,
+    text: [*c]const u8,
     text_len: usize,
     options: ?*const EncodeOptions,
 ) callconv(.c) EncodeResult {
@@ -310,8 +335,20 @@ pub export fn talu_tokenizer_encode(
         return err;
     }));
 
+    const text_slice = if (text_len == 0)
+        ""
+    else blk: {
+        const text_ptr = text orelse {
+            capi_error.setError(error.InvalidArgument, "text is null with non-zero length", .{});
+            var err = std.mem.zeroes(EncodeResult);
+            err.error_msg = "InvalidArgument";
+            return err;
+        };
+        break :blk text_ptr[0..text_len];
+    };
+
     const add_special = if (options) |o| o.add_bos != 0 else true;
-    var rich = tok_offsets.encode(allocator, tok.tok.tokenizer_handle, text[0..text_len], add_special) catch |e| {
+    var rich = tok_offsets.encode(allocator, tok.tok.tokenizer_handle, text_slice, add_special) catch |e| {
         capi_error.setError(e, "Encode failed", .{});
         var err = std.mem.zeroes(EncodeResult);
         err.error_msg = "Encode failed";
@@ -328,10 +365,10 @@ pub export fn talu_tokenizer_encode(
     };
 
     var ret = std.mem.zeroes(EncodeResult);
-    ret.ids = if (rich.ids.len > 0) rich.ids.ptr else null;
-    ret.offsets = if (rich.offsets.len > 0) @ptrCast(rich.offsets.ptr) else null;
-    ret.attention_mask = if (rich.attention_mask.len > 0) rich.attention_mask.ptr else null;
-    ret.special_tokens_mask = if (rich.special_tokens_mask.len > 0) rich.special_tokens_mask.ptr else null;
+    ret.ids = if (rich.ids.len > 0) rich.ids.ptr else emptyU32Ptr();
+    ret.offsets = if (rich.offsets.len > 0) @ptrCast(rich.offsets.ptr) else emptyOffsetPtr();
+    ret.attention_mask = if (rich.attention_mask.len > 0) rich.attention_mask.ptr else emptyU32Ptr();
+    ret.special_tokens_mask = if (rich.special_tokens_mask.len > 0) rich.special_tokens_mask.ptr else emptyU32Ptr();
     ret.num_tokens = rich.ids.len;
     return ret;
 }
@@ -371,7 +408,7 @@ fn fillTokenStrings(tok_handle: anytype, text: []const u8, out: [][*:0]u8) ?usiz
 /// debugging or visualization. Caller must free via talu_tokenize_result_free().
 pub export fn talu_tokenizer_tokenize(
     handle: ?*OpaqueTokenizerHandle,
-    text: [*]const u8,
+    text: [*c]const u8,
     text_len: usize,
 ) callconv(.c) TokenizeResult {
     const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
@@ -379,18 +416,32 @@ pub export fn talu_tokenizer_tokenize(
         return .{ .tokens = null, .num_tokens = 0, .error_msg = "Invalid handle" };
     }));
 
-    const count = getTokenCount(tok.tok.tokenizer_handle, text[0..text_len]) orelse {
+    const text_slice = if (text_len == 0)
+        ""
+    else blk: {
+        const text_ptr = text orelse {
+            capi_error.setError(error.InvalidArgument, "text is null with non-zero length", .{});
+            return .{ .tokens = null, .num_tokens = 0, .error_msg = "InvalidArgument" };
+        };
+        break :blk text_ptr[0..text_len];
+    };
+
+    const count = getTokenCount(tok.tok.tokenizer_handle, text_slice) orelse {
         capi_error.setError(error.InternalError, "Tokenization failed", .{});
         return .{ .tokens = null, .num_tokens = 0, .error_msg = "Tokenization failed" };
     };
-    if (count == 0) return std.mem.zeroes(TokenizeResult);
 
     const out = allocator.alloc([*:0]u8, count) catch {
         capi_error.setError(error.OutOfMemory, "Allocation failed", .{});
         return .{ .tokens = null, .num_tokens = 0, .error_msg = "OutOfMemory" };
     };
 
-    const actual = fillTokenStrings(tok.tok.tokenizer_handle, text[0..text_len], out) orelse {
+    if (count == 0) {
+        allocator.free(out);
+        return .{ .tokens = emptyTokenStringPtr(), .num_tokens = 0, .error_msg = null };
+    }
+
+    const actual = fillTokenStrings(tok.tok.tokenizer_handle, text_slice, out) orelse {
         capi_error.setError(error.InternalError, "Tokenization failed", .{});
         allocator.free(out);
         return .{ .tokens = null, .num_tokens = 0, .error_msg = "Tokenization failed" };
@@ -404,6 +455,7 @@ pub export fn talu_tokenizer_tokenize(
 /// Safe to call with null (no-op).
 pub export fn talu_tokenize_result_free(tokens: ?[*][*:0]u8, num_tokens: usize) callconv(.c) void {
     const t = tokens orelse return;
+    if (num_tokens == 0) return;
     // Free each token string, then free the array of pointers
     for (0..num_tokens) |i| tok_pipeline.tokenizer_string_free(t[i]);
     allocator.free(t[0..num_tokens]);
@@ -415,7 +467,7 @@ pub export fn talu_tokenize_result_free(tokens: ?[*][*:0]u8, num_tokens: usize) 
 /// Useful for byte-level operations. Caller must free via talu_tokenize_bytes_result_free().
 pub export fn talu_tokenizer_tokenize_bytes(
     handle: ?*OpaqueTokenizerHandle,
-    text: [*]const u8,
+    text: [*c]const u8,
     text_len: usize,
 ) callconv(.c) TokenizeBytesResult {
     // Cast opaque handle to TokenizerHandle
@@ -426,7 +478,19 @@ pub export fn talu_tokenizer_tokenize_bytes(
         return err_result;
     }));
 
-    var result = tokenizer_mod.tokenizeToBytes(allocator, tok.tok.tokenizer_handle, text[0..text_len]) catch |e| {
+    const text_slice = if (text_len == 0)
+        ""
+    else blk: {
+        const text_ptr = text orelse {
+            capi_error.setError(error.InvalidArgument, "text is null with non-zero length", .{});
+            var err_result = std.mem.zeroes(TokenizeBytesResult);
+            err_result.error_msg = "InvalidArgument";
+            return err_result;
+        };
+        break :blk text_ptr[0..text_len];
+    };
+
+    var result = tokenizer_mod.tokenizeToBytes(allocator, tok.tok.tokenizer_handle, text_slice) catch |e| {
         capi_error.setError(e, "Tokenization failed", .{});
         var err_result = std.mem.zeroes(TokenizeBytesResult);
         err_result.error_msg = "Tokenization failed";
@@ -435,8 +499,8 @@ pub export fn talu_tokenizer_tokenize_bytes(
 
     // Transfer ownership to caller by extracting pointers and clearing result
     // This prevents result.deinit() from freeing the memory we're returning
-    const data_ptr = if (result.data.len > 0) result.data.ptr else null;
-    const offsets_ptr = if (result.offsets.len > 0) result.offsets.ptr else null;
+    const data_ptr = if (result.data.len > 0) result.data.ptr else emptyBytePtr();
+    const offsets_ptr = if (result.offsets.len > 0) result.offsets.ptr else emptyUsizePtr();
     const data_len = result.data.len;
     const num_tokens = result.tokenCount();
 
@@ -474,7 +538,7 @@ pub export fn talu_tokenize_bytes_result_free(
 /// Caller must free via talu_decode_result_free().
 pub export fn talu_tokenizer_decode(
     handle: ?*OpaqueTokenizerHandle,
-    tokens: [*]const u32,
+    tokens: [*c]const u32,
     num_tokens: usize,
     options: ?*const DecodeOptionsC,
 ) callconv(.c) DecodeResult {
@@ -487,12 +551,18 @@ pub export fn talu_tokenizer_decode(
     }));
 
     if (num_tokens == 0) return std.mem.zeroes(DecodeResult);
+    const token_ptr = tokens orelse {
+        capi_error.setError(error.InvalidArgument, "tokens is null with non-zero length", .{});
+        var err_result = std.mem.zeroes(DecodeResult);
+        err_result.error_msg = "InvalidArgument";
+        return err_result;
+    };
 
     const opts = tokenizer_mod.Tokenizer.DecodeOptions{
         .skip_special_tokens = if (options) |o| o.skip_special_tokens != 0 else true,
     };
 
-    const decoded = tok.tok.decodeWithOptions(tokens[0..num_tokens], opts) catch |e| {
+    const decoded = tok.tok.decodeWithOptions(token_ptr[0..num_tokens], opts) catch |e| {
         const msg = switch (e) {
             error.InvalidTokenId => "Invalid token ID: out of range for vocabulary",
             else => "Decode failed",
@@ -528,8 +598,8 @@ pub export fn talu_tokenizer_decode(
 /// Caller must free via talu_batch_encode_result_free().
 pub export fn talu_tokenizer_encode_batch(
     handle: ?*OpaqueTokenizerHandle,
-    texts: [*]const [*]const u8,
-    lengths: [*]const usize,
+    texts: [*c]const [*c]const u8,
+    lengths: [*c]const usize,
     num_texts: usize,
     options: ?*const EncodeOptions,
 ) callconv(.c) BatchEncodeResult {
@@ -542,10 +612,24 @@ pub export fn talu_tokenizer_encode_batch(
     }));
 
     if (num_texts == 0) return std.mem.zeroes(BatchEncodeResult);
+    const text_ptrs = texts orelse {
+        capi_error.setError(error.InvalidArgument, "texts is null with non-zero count", .{});
+        var err_result = std.mem.zeroes(BatchEncodeResult);
+        err_result.error_msg = "InvalidArgument";
+        return err_result;
+    };
+    const length_ptrs = lengths orelse {
+        capi_error.setError(error.InvalidArgument, "lengths is null with non-zero count", .{});
+        var err_result = std.mem.zeroes(BatchEncodeResult);
+        err_result.error_msg = "InvalidArgument";
+        return err_result;
+    };
+    const batch_text_ptrs: [*]const [*]const u8 = @ptrCast(text_ptrs);
+    const batch_length_ptrs: [*]const usize = @ptrCast(length_ptrs);
 
     const add_special = if (options) |o| o.add_bos != 0 else true;
 
-    var result = tok_batch.encodeBatch(allocator, &tok.tok, texts, lengths, num_texts, add_special) catch |e| {
+    var result = tok_batch.encodeBatch(allocator, &tok.tok, batch_text_ptrs, batch_length_ptrs, num_texts, add_special) catch |e| {
         capi_error.setError(e, "Batch encoding failed", .{});
         var err_result = std.mem.zeroes(BatchEncodeResult);
         err_result.error_msg = "Batch encoding failed";
@@ -887,4 +971,103 @@ test "fuzz tokenizer JSON parsing with random input" {
             // Any return is fine - we just want no crashes
         }
     }.testOne, .{});
+}
+
+test "talu_tokenizer_encode empty input returns sliceable empty buffers" {
+    const json =
+        \\{
+        \\  "version": "1.0",
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"<unk>": 0, "a": 1},
+        \\    "merges": []
+        \\  },
+        \\  "added_tokens": [
+        \\    {"id": 0, "content": "<unk>", "special": true}
+        \\  ],
+        \\  "normalizer": null,
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": true},
+        \\  "post_processor": null,
+        \\  "decoder": {"type": "ByteLevel"}
+        \\}
+    ;
+
+    var handle: ?*OpaqueTokenizerHandle = null;
+    try std.testing.expectEqual(@as(i32, 0), talu_tokenizer_create_from_json(json.ptr, json.len, &handle));
+    defer talu_tokenizer_free(handle);
+
+    var options = std.mem.zeroes(EncodeOptions);
+    const result = talu_tokenizer_encode(handle, "".ptr, 0, &options);
+    defer talu_encode_result_free(result);
+
+    try std.testing.expect(result.error_msg == null);
+    try std.testing.expectEqual(@as(usize, 0), result.num_tokens);
+    try std.testing.expect(result.ids != null);
+    try std.testing.expect(result.offsets != null);
+    try std.testing.expect(result.attention_mask != null);
+    try std.testing.expect(result.special_tokens_mask != null);
+}
+
+test "talu_tokenizer_tokenize empty input returns sliceable empty token array" {
+    const json =
+        \\{
+        \\  "version": "1.0",
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"<unk>": 0, "a": 1},
+        \\    "merges": []
+        \\  },
+        \\  "added_tokens": [
+        \\    {"id": 0, "content": "<unk>", "special": true}
+        \\  ],
+        \\  "normalizer": null,
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": true},
+        \\  "post_processor": null,
+        \\  "decoder": {"type": "ByteLevel"}
+        \\}
+    ;
+
+    var handle: ?*OpaqueTokenizerHandle = null;
+    try std.testing.expectEqual(@as(i32, 0), talu_tokenizer_create_from_json(json.ptr, json.len, &handle));
+    defer talu_tokenizer_free(handle);
+
+    const result = talu_tokenizer_tokenize(handle, "".ptr, 0);
+    defer talu_tokenize_result_free(result.tokens, result.num_tokens);
+
+    try std.testing.expect(result.error_msg == null);
+    try std.testing.expectEqual(@as(usize, 0), result.num_tokens);
+    try std.testing.expect(result.tokens != null);
+}
+
+test "talu_tokenizer_tokenize_bytes empty input returns sliceable empty byte buffer" {
+    const json =
+        \\{
+        \\  "version": "1.0",
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {"<unk>": 0, "a": 1},
+        \\    "merges": []
+        \\  },
+        \\  "added_tokens": [
+        \\    {"id": 0, "content": "<unk>", "special": true}
+        \\  ],
+        \\  "normalizer": null,
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": true},
+        \\  "post_processor": null,
+        \\  "decoder": {"type": "ByteLevel"}
+        \\}
+    ;
+
+    var handle: ?*OpaqueTokenizerHandle = null;
+    try std.testing.expectEqual(@as(i32, 0), talu_tokenizer_create_from_json(json.ptr, json.len, &handle));
+    defer talu_tokenizer_free(handle);
+
+    const result = talu_tokenizer_tokenize_bytes(handle, "".ptr, 0);
+    defer talu_tokenize_bytes_result_free(result.data, result.data_len, result.offsets, result.num_tokens);
+
+    try std.testing.expect(result.error_msg == null);
+    try std.testing.expectEqual(@as(usize, 0), result.num_tokens);
+    try std.testing.expect(result.data != null);
+    try std.testing.expect(result.offsets != null);
+    try std.testing.expectEqual(@as(usize, 0), result.offsets.?[0]);
 }

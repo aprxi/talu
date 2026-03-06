@@ -492,7 +492,6 @@ fn parseVocabAndMerges(model: *BpeModel) !void {
         const now = std.time.nanoTimestamp();
         const duration_ms = @as(f64, @floatFromInt(now - t_start)) / 1_000_000.0;
         log.trace("tokenizer", "Pair merges built", .{ .duration_ms = duration_ms, .entries = model.pair_merges.count() }, @src());
-
     }
 
     // Find unk_id
@@ -632,7 +631,6 @@ fn initByteMap(model: *BpeModel) !void {
     }
 }
 
-
 pub const IdList = std.ArrayListUnmanaged(i32);
 
 fn findBestPair(
@@ -763,7 +761,6 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
             n_syms += 1;
         }
     }
-
     // Fast path: single-symbol words skip merge loop and collect entirely.
     if (n_syms == 1) {
         const sym = &syms[0];
@@ -860,11 +857,25 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
         // This reduces pair_merges hash lookups from O(n_pairs × n_passes)
         // to O(n_pairs + 2 × n_merges).
         const CachedPair = struct { pos: i32, rank: i32, new_id: i32 };
-        var pair_cache: [MAX_WORD_SYMBOLS]CachedPair = undefined;
+        var pair_cache_stack: [MAX_WORD_SYMBOLS]CachedPair = undefined;
+        var pair_cache_heap: ?[]CachedPair = null;
+        defer if (pair_cache_heap) |cache| allocator.free(cache);
+        var pair_cache: []CachedPair = &pair_cache_stack;
         var n_cached: usize = 0;
         // Position-to-cache-index tracking for O(1) stale entry removal.
-        var pos_to_cache: [MAX_WORD_SYMBOLS]i16 = undefined;
-        @memset(pos_to_cache[0..n_syms], @as(i16, -1));
+        // Use the actual symbol count here; long words already spill `syms`
+        // to the heap and the cache must follow suit to avoid overflow.
+        var pos_to_cache_stack: [MAX_WORD_SYMBOLS]i32 = undefined;
+        var pos_to_cache_heap: ?[]i32 = null;
+        defer if (pos_to_cache_heap) |cache| allocator.free(cache);
+        var pos_to_cache: []i32 = &pos_to_cache_stack;
+        if (n_syms > MAX_WORD_SYMBOLS) {
+            pair_cache_heap = try allocator.alloc(CachedPair, n_syms);
+            pair_cache = pair_cache_heap.?;
+            pos_to_cache_heap = try allocator.alloc(i32, n_syms);
+            pos_to_cache = pos_to_cache_heap.?;
+        }
+        @memset(pos_to_cache[0..n_syms], -1);
 
         // Phase 1: Build pair cache (single scan, one hash lookup per pair)
         {
@@ -875,6 +886,7 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
                     const right_sym = &syms[@intCast(sym.next)];
                     if (right_sym.id >= 0) {
                         if (model.pair_merges.get(.{ .left = sym.id, .right = right_sym.id })) |info| {
+                            std.debug.assert(n_cached < pair_cache.len);
                             pos_to_cache[@intCast(si)] = @intCast(n_cached);
                             pair_cache[n_cached] = .{ .pos = si, .rank = info.rank, .new_id = info.new_id };
                             n_cached += 1;
@@ -884,7 +896,6 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
                 si = sym.next;
             }
         }
-
         // Phase 2: Process merges from cache
         while (n_cached > 0) {
             // Find entry with minimum rank; leftmost position breaks ties
@@ -893,7 +904,7 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
             for (1..n_cached) |i| {
                 if (pair_cache[i].rank < pair_cache[best_idx].rank or
                     (pair_cache[i].rank == pair_cache[best_idx].rank and
-                    pair_cache[i].pos < pair_cache[best_idx].pos))
+                        pair_cache[i].pos < pair_cache[best_idx].pos))
                 {
                     best_idx = i;
                 }
@@ -936,7 +947,7 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
                         n_cached -= 1;
                         if (cui < n_cached) {
                             pair_cache[cui] = pair_cache[n_cached];
-                            pos_to_cache[@intCast(pair_cache[cui].pos)] = ci;
+                            pos_to_cache[@intCast(pair_cache[cui].pos)] = @intCast(cui);
                         }
                         pos_to_cache[@intCast(stale_pos)] = -1;
                     }
@@ -948,6 +959,7 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
                 const ln = &syms[@intCast(left.prev)];
                 if (ln.id >= 0) {
                     if (model.pair_merges.get(.{ .left = ln.id, .right = left.id })) |info| {
+                        std.debug.assert(n_cached < pair_cache.len);
                         pos_to_cache[@intCast(left.prev)] = @intCast(n_cached);
                         pair_cache[n_cached] = .{ .pos = left.prev, .rank = info.rank, .new_id = info.new_id };
                         n_cached += 1;
@@ -959,6 +971,7 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
                 const rn = &syms[@intCast(left.next)];
                 if (rn.id >= 0) {
                     if (model.pair_merges.get(.{ .left = left.id, .right = rn.id })) |info| {
+                        std.debug.assert(n_cached < pair_cache.len);
                         pos_to_cache[@intCast(best.pos)] = @intCast(n_cached);
                         pair_cache[n_cached] = .{ .pos = best.pos, .rank = info.rank, .new_id = info.new_id };
                         n_cached += 1;
@@ -1024,7 +1037,6 @@ fn encodeWordCore(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8, out_id
         }
         try out_ids.ensureUnusedCapacity(allocator, n_output);
     }
-
     var si: i32 = 0;
     while (si >= 0) {
         const sym = &syms[@intCast(si)];
@@ -1999,4 +2011,40 @@ test "tokenizer_bpe_create_from_spec: initByteMap handles control characters wit
         // Control chars should be mapped to codepoints >= 256 (offset range)
         try std.testing.expect(codepoint >= 256 or codepoint == @as(i32, @intCast(b)));
     }
+}
+
+test "encodeWordDirect handles long words above MAX_WORD_SYMBOLS without cache overflow" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"vocab": {"a": 0}, "merges": [["a", "a"]]}
+    ;
+
+    const tokenizer = try createBpeTokenizer(allocator, json, false);
+    defer allocator.destroy(tokenizer);
+    defer tokenizer.destroy();
+
+    const model: *BpeModel = @ptrCast(@alignCast(tokenizer.model.?));
+    const merged_id = model.vocab_hash.get("aa").?;
+
+    const word_len = MAX_WORD_SYMBOLS * 2 + 1;
+    const long_word = try allocator.alloc(u8, word_len);
+    defer allocator.free(long_word);
+    @memset(long_word, 'a');
+
+    var first_ids = IdList{};
+    defer first_ids.deinit(allocator);
+    try model.encodeWordDirect(tokenizer, long_word, &first_ids);
+
+    var second_ids = IdList{};
+    defer second_ids.deinit(allocator);
+    try model.encodeWordDirect(tokenizer, long_word, &second_ids);
+
+    const expected_token_count = word_len / 2 + 1;
+    try std.testing.expectEqual(expected_token_count, first_ids.items.len);
+    try std.testing.expectEqualSlices(i32, first_ids.items, second_ids.items);
+
+    for (first_ids.items[0 .. first_ids.items.len - 1]) |id| {
+        try std.testing.expectEqual(merged_id, id);
+    }
+    try std.testing.expectEqual(@as(i32, 0), first_ids.items[first_ids.items.len - 1]);
 }

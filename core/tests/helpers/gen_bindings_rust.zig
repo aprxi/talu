@@ -20,6 +20,14 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+fn rustPointerType(is_const: bool, pointee: []const u8) []const u8 {
+    return std.fmt.allocPrint(
+        std.heap.page_allocator,
+        "{s} {s}",
+        .{ if (is_const) "*const" else "*mut", pointee },
+    ) catch @panic("OOM");
+}
+
 /// Information about an extern struct
 const StructInfo = struct {
     name: []const u8,
@@ -204,6 +212,10 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(pointee, "ChatCreateOptions")) return "*mut ChatCreateOptions";
             if (eql(pointee, "CRemoteModelListResult")) return "*mut CRemoteModelListResult";
             if (eql(pointee, "ConvertOptions")) return if (is_const) "*const ConvertOptions" else "*mut ConvertOptions";
+            if (eql(pointee, "EncodeOptions")) return if (is_const) "*const EncodeOptions" else "*mut EncodeOptions";
+            if (eql(pointee, "DecodeOptionsC")) return if (is_const) "*const DecodeOptionsC" else "*mut DecodeOptionsC";
+            if (eql(pointee, "PaddedTensorOptions")) return if (is_const) "*const PaddedTensorOptions" else "*mut PaddedTensorOptions";
+            if (eql(pointee, "ValidateConfigC")) return if (is_const) "*const ValidateConfigC" else "*mut ValidateConfigC";
             if (eql(pointee, "CSessionList")) return if (is_const) "*const CSessionList" else "*mut CSessionList";
             if (eql(pointee, "CSessionRecord")) return if (is_const) "*const CSessionRecord" else "*mut CSessionRecord";
             if (eql(pointee, "CapturedTensorInfo")) return if (is_const) "*const CapturedTensorInfo" else "*mut CapturedTensorInfo";
@@ -249,8 +261,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(pointee, "CColumnData")) return if (is_const) "*const CColumnData" else "*mut CColumnData";
             if (eql(pointee, "CColumnValue")) return if (is_const) "*const CColumnValue" else "*mut CColumnValue";
             if (eql(pointee, "CColumnFilter")) return if (is_const) "*const CColumnFilter" else "*mut CColumnFilter";
-            // Fallback: return without wrapper (will cause compile error if used)
-            return pointee;
+            return rustPointerType(is_const, pointee);
         }
     }
 
@@ -270,7 +281,9 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
 
     // POINTER types (arrays, slices)
     if (std.mem.startsWith(u8, zig_type, "[*]") or
-        std.mem.startsWith(u8, zig_type, "?[*]"))
+        std.mem.startsWith(u8, zig_type, "?[*]") or
+        std.mem.startsWith(u8, zig_type, "[*c]") or
+        std.mem.startsWith(u8, zig_type, "?[*c]"))
     {
         // Check if the OUTER pointer is sentinel-terminated (e.g. [*:0]u8, ?[*:0]u8).
         // Must not match inner sentinels in types like ?[*]const ?[*:0]const u8.
@@ -290,22 +303,43 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             }
         }
 
-        // Check element type
-        const elem_is_const = std.mem.indexOf(u8, zig_type, "const ") != null;
-        if (std.mem.indexOf(u8, zig_type, "f32") != null) return "*const f32";
-        if (std.mem.indexOf(u8, zig_type, "u32") != null) return if (elem_is_const) "*const u32" else "*mut u32";
-        if (std.mem.indexOf(u8, zig_type, "u16") != null) return if (elem_is_const) "*const u16" else "*mut u16";
-        if (std.mem.indexOf(u8, zig_type, "usize") != null) return if (elem_is_const) "*const usize" else "*mut usize";
-        if (std.mem.indexOf(u8, zig_type, "u8") != null) return if (elem_is_const) "*const u8" else "*mut u8";
-
-        // Check if pointer to known struct
-        const start_idx = if (std.mem.startsWith(u8, zig_type, "?[*]")) @as(usize, 4) else @as(usize, 3);
+        const start_idx: usize = blk: {
+            if (std.mem.startsWith(u8, zig_type, "?[*c]")) break :blk 5;
+            if (std.mem.startsWith(u8, zig_type, "[*c]")) break :blk 4;
+            if (std.mem.startsWith(u8, zig_type, "?[*]")) break :blk 4;
+            break :blk 3;
+        };
         var elem_type = zig_type[start_idx..];
-        // Strip 'const ' prefix if present
         const is_const = std.mem.startsWith(u8, elem_type, "const ");
         if (is_const) {
             elem_type = elem_type[6..];
         }
+
+        // Nested pointer-to-byte arrays appear as [*c]const [*c]const u8 for
+        // batch tokenizer input. Preserve the double indirection instead of
+        // collapsing it to *const u8.
+        if (std.mem.startsWith(u8, elem_type, "[*]") or
+            std.mem.startsWith(u8, elem_type, "?[*]") or
+            std.mem.startsWith(u8, elem_type, "[*c]") or
+            std.mem.startsWith(u8, elem_type, "?[*c]"))
+        {
+            const inner_is_const = std.mem.indexOf(u8, elem_type, "const u8") != null;
+            if (std.mem.indexOf(u8, elem_type, "u8") != null) {
+                return if (is_const)
+                    (if (inner_is_const) "*const *const u8" else "*const *mut u8")
+                else
+                    (if (inner_is_const) "*mut *const u8" else "*mut *mut u8");
+            }
+        }
+
+        // Check element type
+        if (std.mem.indexOf(u8, zig_type, "f32") != null) return "*const f32";
+        if (std.mem.indexOf(u8, zig_type, "u32") != null) return if (is_const) "*const u32" else "*mut u32";
+        if (std.mem.indexOf(u8, zig_type, "u16") != null) return if (is_const) "*const u16" else "*mut u16";
+        if (std.mem.indexOf(u8, zig_type, "usize") != null) return if (is_const) "*const usize" else "*mut usize";
+        if (std.mem.indexOf(u8, zig_type, "u8") != null) return if (is_const) "*const u8" else "*mut u8";
+
+        // Check if pointer to known struct
         // Strip module prefix (e.g. "ops.CColumnValue" -> "CColumnValue")
         if (std.mem.lastIndexOfScalar(u8, elem_type, '.')) |dot| {
             elem_type = elem_type[dot + 1 ..];
@@ -333,9 +367,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(elem_type, "CSqlParam")) {
                 return if (is_const) "*const CSqlParam" else "*mut CSqlParam";
             }
-            // Default fallback — log a warning if we hit this; likely a new struct
-            // that needs an entry above.
-            return elem_type;
+            return rustPointerType(is_const, elem_type);
         }
 
         return "*mut c_void";
@@ -1500,4 +1532,48 @@ fn toPascalCase(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     }
 
     return result.items;
+}
+
+fn putTestStruct(map: *std.StringHashMap(StructInfo), name: []const u8) !void {
+    try map.put(name, .{
+        .name = name,
+        .fields = &.{},
+        .source_file = "test",
+    });
+}
+
+test "zigToRustType maps known struct pointers to Rust pointers" {
+    var structs = std.StringHashMap(StructInfo).init(std.testing.allocator);
+    defer structs.deinit();
+    var enums = std.StringHashMap(EnumInfo).init(std.testing.allocator);
+    defer enums.deinit();
+
+    try putTestStruct(&structs, "EncodeOptions");
+    try putTestStruct(&structs, "DecodeOptionsC");
+    try putTestStruct(&structs, "SemanticValidationResultC");
+
+    try std.testing.expectEqualStrings(
+        "*const EncodeOptions",
+        zigToRustType("?*const EncodeOptions", &structs, &enums),
+    );
+    try std.testing.expectEqualStrings(
+        "*const DecodeOptionsC",
+        zigToRustType("?*const DecodeOptionsC", &structs, &enums),
+    );
+    try std.testing.expectEqualStrings(
+        "*mut SemanticValidationResultC",
+        zigToRustType("?*SemanticValidationResultC", &structs, &enums),
+    );
+}
+
+test "zigToRustType preserves nested C pointer arrays for tokenizer batches" {
+    var structs = std.StringHashMap(StructInfo).init(std.testing.allocator);
+    defer structs.deinit();
+    var enums = std.StringHashMap(EnumInfo).init(std.testing.allocator);
+    defer enums.deinit();
+
+    try std.testing.expectEqualStrings(
+        "*const *const u8",
+        zigToRustType("[*c]const [*c]const u8", &structs, &enums),
+    );
 }

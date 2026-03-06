@@ -287,6 +287,11 @@ pub enum ErrorCode {
     PolicyDeniedExec = 808,
     PolicyDeniedCwd = 809,
     PolicyInvalid = 810,
+    PolicyStrictUnavailable = 811,
+    PolicyStrictSetupFailed = 812,
+    SandboxDetectFailed = 813,
+    SandboxProbeFailed = 814,
+    SandboxCgroupUnavailable = 815,
     OutOfMemory = 900,
     InvalidArgument = 901,
     InvalidHandle = 902,
@@ -294,6 +299,17 @@ pub enum ErrorCode {
     UnsupportedAbiVersion = 904,
     ResourceExhausted = 905,
     InternalError = 999,
+    TrainInvalidState = 1000,
+    TrainModelLoadFailed = 1001,
+    TrainAdapterConfigInvalid = 1002,
+    TrainDataLoadFailed = 1003,
+    TrainDataInvalidFormat = 1004,
+    TrainNotConfigured = 1005,
+    TrainAlreadyRunning = 1006,
+    TrainCheckpointSaveFailed = 1007,
+    TrainCheckpointLoadFailed = 1008,
+    TrainStepFailed = 1009,
+    TrainCancelled = 1010,
 }
 
 impl From<i32> for ErrorCode {
@@ -354,6 +370,11 @@ impl From<i32> for ErrorCode {
             808 => ErrorCode::PolicyDeniedExec,
             809 => ErrorCode::PolicyDeniedCwd,
             810 => ErrorCode::PolicyInvalid,
+            811 => ErrorCode::PolicyStrictUnavailable,
+            812 => ErrorCode::PolicyStrictSetupFailed,
+            813 => ErrorCode::SandboxDetectFailed,
+            814 => ErrorCode::SandboxProbeFailed,
+            815 => ErrorCode::SandboxCgroupUnavailable,
             900 => ErrorCode::OutOfMemory,
             901 => ErrorCode::InvalidArgument,
             902 => ErrorCode::InvalidHandle,
@@ -361,7 +382,18 @@ impl From<i32> for ErrorCode {
             904 => ErrorCode::UnsupportedAbiVersion,
             905 => ErrorCode::ResourceExhausted,
             999 => ErrorCode::InternalError,
-            _ => ErrorCode::InternalError,
+            1000 => ErrorCode::TrainInvalidState,
+            1001 => ErrorCode::TrainModelLoadFailed,
+            1002 => ErrorCode::TrainAdapterConfigInvalid,
+            1003 => ErrorCode::TrainDataLoadFailed,
+            1004 => ErrorCode::TrainDataInvalidFormat,
+            1005 => ErrorCode::TrainNotConfigured,
+            1006 => ErrorCode::TrainAlreadyRunning,
+            1007 => ErrorCode::TrainCheckpointSaveFailed,
+            1008 => ErrorCode::TrainCheckpointLoadFailed,
+            1009 => ErrorCode::TrainStepFailed,
+            1010 => ErrorCode::TrainCancelled,
+            _ => ErrorCode::TrainCancelled,
         }
     }
 }
@@ -472,6 +504,24 @@ impl From<u8> for FinishReason {
     }
 }
 
+/// Source: core/src/capi/agent/runtime.zig
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TaluAgentRuntimeMode {
+    Host = 0,
+    Strict = 1,
+}
+
+impl From<i32> for TaluAgentRuntimeMode {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => TaluAgentRuntimeMode::Host,
+            1 => TaluAgentRuntimeMode::Strict,
+            _ => TaluAgentRuntimeMode::Strict,
+        }
+    }
+}
+
 /// Source: core/src/converter/scheme.zig
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -492,22 +542,22 @@ impl From<u32> for QuantLevel {
     }
 }
 
-/// Source: core/src/capi/template.zig
+/// Source: core/src/capi/agent/runtime.zig
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CSpanSourceType {
-    StaticText = 0,
-    Variable = 1,
-    Expression = 2,
+pub enum TaluSandboxBackend {
+    LinuxLocal = 0,
+    Oci = 1,
+    AppleContainer = 2,
 }
 
-impl From<i32> for CSpanSourceType {
+impl From<i32> for TaluSandboxBackend {
     fn from(value: i32) -> Self {
         match value {
-            0 => CSpanSourceType::StaticText,
-            1 => CSpanSourceType::Variable,
-            2 => CSpanSourceType::Expression,
-            _ => CSpanSourceType::Expression,
+            0 => TaluSandboxBackend::LinuxLocal,
+            1 => TaluSandboxBackend::Oci,
+            2 => TaluSandboxBackend::AppleContainer,
+            _ => TaluSandboxBackend::AppleContainer,
         }
     }
 }
@@ -550,6 +600,26 @@ impl From<u32> for Platform {
             1 => Platform::Metal,
             2 => Platform::Cuda,
             _ => Platform::Cuda,
+        }
+    }
+}
+
+/// Source: core/src/capi/template.zig
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CSpanSourceType {
+    StaticText = 0,
+    Variable = 1,
+    Expression = 2,
+}
+
+impl From<i32> for CSpanSourceType {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => CSpanSourceType::StaticText,
+            1 => CSpanSourceType::Variable,
+            2 => CSpanSourceType::Expression,
+            _ => CSpanSourceType::Expression,
         }
     }
 }
@@ -629,17 +699,48 @@ impl Default for ConvertOptions {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TokenizeResult {
-    pub tokens: *mut *mut c_char,
+    pub tokens: *const *const c_char,
     pub num_tokens: usize,
-    pub error_msg: *const c_char,
+    pub error_msg: *const u8,
 }
 
 impl Default for TokenizeResult {
     fn default() -> Self {
         Self {
-            tokens: std::ptr::null_mut(),
+            tokens: std::ptr::null(),
             num_tokens: 0,
             error_msg: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/train_full.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CTransformerConfig {
+    pub vocab_size: u32,
+    pub d_model: u32,
+    pub num_layers: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub d_ff: u32,
+    pub seq_len: u32,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
+}
+
+impl Default for CTransformerConfig {
+    fn default() -> Self {
+        Self {
+            vocab_size: 0,
+            d_model: 0,
+            num_layers: 0,
+            num_heads: 0,
+            num_kv_heads: 0,
+            d_ff: 0,
+            seq_len: 0,
+            rope_theta: 0.0,
+            norm_eps: 0.0,
         }
     }
 }
@@ -1192,7 +1293,10 @@ pub struct TokenOffset {
 
 impl Default for TokenOffset {
     fn default() -> Self {
-        Self { start: 0, end: 0 }
+        Self {
+            start: 0,
+            end: 0,
+        }
     }
 }
 
@@ -1314,7 +1418,9 @@ pub struct ChatCreateOptions {
 
 impl Default for ChatCreateOptions {
     fn default() -> Self {
-        Self { offline: false }
+        Self {
+            offline: false,
+        }
     }
 }
 
@@ -1353,7 +1459,7 @@ pub struct BatchEncodeResult {
     pub offsets: *mut usize,
     pub total_tokens: usize,
     pub num_sequences: usize,
-    pub error_msg: *const c_char,
+    pub error_msg: *const u8,
 }
 
 impl Default for BatchEncodeResult {
@@ -1889,7 +1995,7 @@ impl Default for CColumnFilter {
 pub struct DecodeResult {
     pub text: *mut u8,
     pub text_len: usize,
-    pub error_msg: *const c_char,
+    pub error_msg: *const u8,
 }
 
 impl Default for DecodeResult {
@@ -1910,7 +2016,7 @@ pub struct PaddedTensorResult {
     pub attention_mask: *mut u32,
     pub num_sequences: usize,
     pub padded_length: usize,
-    pub error_msg: *const c_char,
+    pub error_msg: *const u8,
 }
 
 impl Default for PaddedTensorResult {
@@ -2020,6 +2126,39 @@ impl Default for CSessionRecord {
             created_at_ms: 0,
             updated_at_ms: 0,
             _reserved: [0; 8],
+        }
+    }
+}
+
+/// Source: core/src/capi/train_full.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CFullSessionConfig {
+    pub learning_rate: f32,
+    pub min_learning_rate: f32,
+    pub weight_decay: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub epsilon: f32,
+    pub max_grad_norm: f32,
+    pub batch_size: u32,
+    pub warmup_steps: u64,
+    pub total_steps: u64,
+}
+
+impl Default for CFullSessionConfig {
+    fn default() -> Self {
+        Self {
+            learning_rate: 0.0,
+            min_learning_rate: 0.0,
+            weight_decay: 0.0,
+            beta1: 0.0,
+            beta2: 0.0,
+            epsilon: 0.0,
+            max_grad_norm: 0.0,
+            batch_size: 0,
+            warmup_steps: 0,
+            total_steps: 0,
         }
     }
 }
@@ -2206,6 +2345,31 @@ impl Default for CScanParams {
     }
 }
 
+/// Source: core/src/capi/train_full.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CFullSessionInfo {
+    pub current_step: u64,
+    pub total_steps: u64,
+    pub total_params: u64,
+    pub batch_size: u32,
+    pub state: u8,
+    pub _padding: [u8; 3],
+}
+
+impl Default for CFullSessionInfo {
+    fn default() -> Self {
+        Self {
+            current_step: 0,
+            total_steps: 0,
+            total_params: 0,
+            batch_size: 0,
+            state: 0,
+            _padding: [0; 3],
+        }
+    }
+}
+
 /// Source: core/src/capi/db/table.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -2237,7 +2401,7 @@ pub struct TokenizeBytesResult {
     pub data_len: usize,
     pub offsets: *mut usize,
     pub num_tokens: usize,
-    pub error_msg: *const c_char,
+    pub error_msg: *const u8,
 }
 
 impl Default for TokenizeBytesResult {
@@ -2261,7 +2425,7 @@ pub struct EncodeResult {
     pub attention_mask: *mut u32,
     pub special_tokens_mask: *mut u32,
     pub num_tokens: usize,
-    pub error_msg: *const c_char,
+    pub error_msg: *const u8,
 }
 
 impl Default for EncodeResult {
@@ -2936,6 +3100,39 @@ impl Default for ExecutionPlanInfo {
     }
 }
 
+/// Source: core/src/capi/agent/runtime.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TaluCapabilityReport {
+    pub kernel_version_ok: bool,
+    pub kernel_version_major: u32,
+    pub kernel_version_minor: u32,
+    pub landlock_available: bool,
+    pub landlock_abi_version: u8,
+    pub user_ns_available: bool,
+    pub seccomp_available: bool,
+    pub cgroupv2_available: bool,
+    pub cgroupv2_writable: bool,
+    pub probes_passed: bool,
+}
+
+impl Default for TaluCapabilityReport {
+    fn default() -> Self {
+        Self {
+            kernel_version_ok: false,
+            kernel_version_major: 0,
+            kernel_version_minor: 0,
+            landlock_available: false,
+            landlock_abi_version: 0,
+            user_ns_available: false,
+            seccomp_available: false,
+            cgroupv2_available: false,
+            cgroupv2_writable: false,
+            probes_passed: false,
+        }
+    }
+}
+
 /// Source: core/src/capi/agent/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3219,17 +3416,17 @@ impl Default for CRemoteModelInfo {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct VocabResult {
-    pub tokens: *mut *mut c_char,
+    pub tokens: *const *const c_char,
     pub lengths: *mut u32,
     pub num_entries: usize,
     pub ids: *mut u32,
-    pub error_msg: *const c_char,
+    pub error_msg: *const u8,
 }
 
 impl Default for VocabResult {
     fn default() -> Self {
         Self {
-            tokens: std::ptr::null_mut(),
+            tokens: std::ptr::null(),
             lengths: std::ptr::null_mut(),
             num_entries: 0,
             ids: std::ptr::null_mut(),
@@ -3442,15 +3639,19 @@ pub type RouterTokenCallback =
 
 /// Unified progress callback - receives structured progress updates from core.
 /// This is the new callback type used by all long-running operations.
-pub type CProgressCallback = Option<unsafe extern "C" fn(*const ProgressUpdate, *mut c_void)>;
+pub type CProgressCallback =
+    Option<unsafe extern "C" fn(*const ProgressUpdate, *mut c_void)>;
 
 /// Legacy progress callback (deprecated - use CProgressCallback).
-pub type ProgressCallback = Option<unsafe extern "C" fn(u64, u64, *mut c_void)>;
+pub type ProgressCallback =
+    Option<unsafe extern "C" fn(u64, u64, *mut c_void)>;
 
 /// Legacy file start callback (deprecated - use CProgressCallback).
-pub type FileStartCallback = Option<unsafe extern "C" fn(*const c_char, *mut c_void)>;
+pub type FileStartCallback =
+    Option<unsafe extern "C" fn(*const c_char, *mut c_void)>;
 
-pub type StorageCallback = Option<unsafe extern "C" fn(*const CStorageEvent, *mut c_void) -> i32>;
+pub type StorageCallback =
+    Option<unsafe extern "C" fn(*const CStorageEvent, *mut c_void) -> i32>;
 
 // =============================================================================
 // Type Aliases (Backwards Compatibility)
@@ -3568,27 +3769,13 @@ extern "C" {
     // core/src/capi/agent/root.zig
     pub fn talu_agent_add_goal(handle: *mut c_void, goal: *const c_char) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_bus_add_peer(
-        handle: *mut c_void,
-        agent_id: *const c_char,
-        url: *const c_char,
-        transport: u8,
-    ) -> c_int;
+    pub fn talu_agent_bus_add_peer(handle: *mut c_void, agent_id: *const c_char, url: *const c_char, transport: u8) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_bus_broadcast(
-        handle: *mut c_void,
-        from: *const c_char,
-        payload: *const c_char,
-    ) -> c_int;
+    pub fn talu_agent_bus_broadcast(handle: *mut c_void, from: *const c_char, payload: *const c_char) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_create(out_bus: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_bus_deliver(
-        handle: *mut c_void,
-        from: *const c_char,
-        to: *const c_char,
-        payload: *const c_char,
-    ) -> c_int;
+    pub fn talu_agent_bus_deliver(handle: *mut c_void, from: *const c_char, to: *const c_char, payload: *const c_char) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_free(handle: *mut c_void);
     // core/src/capi/agent/root.zig
@@ -3598,101 +3785,45 @@ extern "C" {
     // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_remove_peer(handle: *mut c_void, agent_id: *const c_char);
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_bus_send(
-        handle: *mut c_void,
-        from: *const c_char,
-        to: *const c_char,
-        payload: *const c_char,
-    ) -> c_int;
+    pub fn talu_agent_bus_send(handle: *mut c_void, from: *const c_char, to: *const c_char, payload: *const c_char) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_bus_set_notify(
-        handle: *mut c_void,
-        agent_id: *const c_char,
-        notify_fn: *mut c_void,
-        user_data: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_bus_set_notify(handle: *mut c_void, agent_id: *const c_char, notify_fn: *mut c_void, user_data: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_unregister(handle: *mut c_void, agent_id: *const c_char);
     // core/src/capi/agent/root.zig
     pub fn talu_agent_clear_goals(handle: *mut c_void);
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_continue(handle: *mut c_void, out_result: CAgentLoopResult) -> c_int;
+    pub fn talu_agent_continue(handle: *mut c_void, out_result: *mut CAgentLoopResult) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_create(
-        backend_handle: *mut c_void,
-        config_ptr: CAgentCreateConfig,
-        out_agent: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_create(backend_handle: *mut c_void, config_ptr: *const CAgentCreateConfig, out_agent: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_free(handle: *mut c_void);
     // core/src/capi/agent/root.zig
     pub fn talu_agent_get_chat(handle: *mut c_void) -> *mut c_void;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_get_id(
-        handle: *mut c_void,
-        out_ptr: *mut c_void,
-        out_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_get_id(handle: *mut c_void, out_ptr: *mut c_void, out_len: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_goal_count(handle: *mut c_void) -> usize;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_heartbeat(handle: *mut c_void, out_result: CAgentLoopResult) -> c_int;
+    pub fn talu_agent_heartbeat(handle: *mut c_void, out_result: *mut CAgentLoopResult) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_policy_check_action(
-        policy: *mut c_void,
-        action: *const c_char,
-        command: *const c_char,
-        cwd: *const c_char,
-        resource: *const c_char,
-        timeout_ms: u64,
-        out_allowed: *mut c_void,
-        out_reason: *mut c_void,
-        out_reason_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_policy_check_action(policy: *mut c_void, action: *const c_char, command: *const c_char, cwd: *const c_char, resource: *const c_char, timeout_ms: u64, out_allowed: *mut c_void, out_reason: *mut c_void, out_reason_len: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_policy_check_file(
-        policy: *mut c_void,
-        action: *const c_char,
-        resource: *const c_char,
-        is_dir: bool,
-        out_allowed: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_policy_check_file(policy: *mut c_void, action: *const c_char, resource: *const c_char, is_dir: bool, out_allowed: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_policy_check_process(
-        policy: *mut c_void,
-        action: *const c_char,
-        command: *const c_char,
-        cwd: *const c_char,
-        out_allowed: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_policy_check_process(policy: *mut c_void, action: *const c_char, command: *const c_char, cwd: *const c_char, out_allowed: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_policy_create(json: *const u8, len: usize, out_policy: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_policy_free(policy: *mut c_void);
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_prompt(
-        handle: *mut c_void,
-        message: *const c_char,
-        out_result: CAgentLoopResult,
-    ) -> c_int;
+    pub fn talu_agent_policy_prepare_runtime(policy: *mut c_void, cwd: *const c_char) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_register_tool(
-        handle: *mut c_void,
-        name_ptr: *const c_char,
-        description_ptr: *const c_char,
-        parameters_schema_ptr: *const c_char,
-        execute_fn: *mut c_void,
-        user_data: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_prompt(handle: *mut c_void, message: *const c_char, out_result: *mut CAgentLoopResult) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_registry_add(
-        handle: *mut c_void,
-        name_ptr: *const c_char,
-        description_ptr: *const c_char,
-        parameters_schema_ptr: *const c_char,
-        execute_fn: *mut c_void,
-        user_data: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_register_tool(handle: *mut c_void, name_ptr: *const c_char, description_ptr: *const c_char, parameters_schema_ptr: *const c_char, execute_fn: *mut c_void, user_data: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_registry_add(handle: *mut c_void, name_ptr: *const c_char, description_ptr: *const c_char, parameters_schema_ptr: *const c_char, execute_fn: *mut c_void, user_data: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_registry_count(handle: *mut c_void) -> usize;
     // core/src/capi/agent/root.zig
@@ -3702,121 +3833,51 @@ extern "C" {
     // core/src/capi/agent/root.zig
     pub fn talu_agent_remove_goal(handle: *mut c_void, goal: *const c_char) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_run(
-        chat_handle: *mut c_void,
-        backend_handle: *mut c_void,
-        registry_handle: *mut c_void,
-        config_ptr: CAgentLoopConfig,
-        out_result: CAgentLoopResult,
-    ) -> c_int;
+    pub fn talu_agent_run(chat_handle: *mut c_void, backend_handle: *mut c_void, registry_handle: *mut c_void, config_ptr: *const CAgentLoopConfig, out_result: *mut CAgentLoopResult) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_run_loop(
-        handle: *mut c_void,
-        idle_timeout_ms: u64,
-        out_result: CAgentLoopResult,
-    ) -> c_int;
+    pub fn talu_agent_run_loop(handle: *mut c_void, idle_timeout_ms: u64, out_result: *mut CAgentLoopResult) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_set_after_tool(
-        handle: *mut c_void,
-        after_fn: *mut c_void,
-        user_data: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_runtime_validate_strict(policy: *mut c_void, cwd: *const c_char, sandbox_backend: c_int) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_set_before_tool(
-        handle: *mut c_void,
-        before_fn: *mut c_void,
-        user_data: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_runtime_validate_strict_ext(sandbox_backend: c_int, strict_required: bool, run_probes: bool, cwd: *const c_char, out_report: *mut TaluCapabilityReport) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_set_after_tool(handle: *mut c_void, after_fn: *mut c_void, user_data: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_set_before_tool(handle: *mut c_void, before_fn: *mut c_void, user_data: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_set_bus(handle: *mut c_void, bus_handle: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_set_context_inject(
-        handle: *mut c_void,
-        inject_fn: *mut c_void,
-        user_data: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_set_context_inject(handle: *mut c_void, inject_fn: *mut c_void, user_data: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_set_system(handle: *mut c_void, system_prompt: *const c_char) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_set_vector_store(
-        agent_handle: *mut c_void,
-        store_handle: *mut c_void,
-        config_ptr: CRagConfig,
-    ) -> c_int;
+    pub fn talu_agent_set_vector_store(agent_handle: *mut c_void, store_handle: *mut c_void, config_ptr: *const CRagConfig) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_agent_wait_for_message(
-        handle: *mut c_void,
-        timeout_ms: u64,
-        out_received: *mut c_void,
-    ) -> c_int;
+    pub fn talu_agent_wait_for_message(handle: *mut c_void, timeout_ms: u64, out_received: *mut c_void) -> c_int;
     // core/src/capi/memory.zig
     pub fn talu_alloc_string(len: usize) -> *mut u8;
     // core/src/capi/session.zig
-    pub fn talu_apply_chat_template(
-        model_path: *const c_char,
-        messages_json: *const c_char,
-        add_generation_prompt: c_int,
-        out_prompt: *mut c_void,
-    ) -> c_int;
+    pub fn talu_apply_chat_template(model_path: *const c_char, messages_json: *const c_char, add_generation_prompt: c_int, out_prompt: *mut c_void) -> c_int;
     // core/src/capi/session.zig
-    pub fn talu_apply_chat_template_string(
-        template_ptr: *const u8,
-        template_len: usize,
-        messages_json: *const c_char,
-        add_generation_prompt: c_int,
-        bos_token: *const c_char,
-        eos_token: *const c_char,
-        out_prompt: *mut c_void,
-    ) -> c_int;
+    pub fn talu_apply_chat_template_string(template_ptr: *const u8, template_len: usize, messages_json: *const c_char, add_generation_prompt: c_int, bos_token: *const c_char, eos_token: *const c_char, out_prompt: *mut c_void) -> c_int;
     // core/src/capi/router.zig
-    pub fn talu_backend_create_from_canonical(
-        canon: *mut c_void,
-        options: BackendCreateOptions,
-        out_backend: *mut c_void,
-    ) -> c_int;
+    pub fn talu_backend_create_from_canonical(canon: *mut c_void, options: BackendCreateOptions, out_backend: *mut c_void) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_backend_free(backend: *mut c_void);
     // core/src/capi/router.zig
-    pub fn talu_backend_get_capabilities(
-        backend_type_raw: c_int,
-        backend_config: BackendUnion,
-        out_caps: *mut TaluCapabilities,
-    ) -> c_int;
+    pub fn talu_backend_get_capabilities(backend_type_raw: c_int, backend_config: *const BackendUnion, out_caps: *mut TaluCapabilities) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_backend_list_models(backend: *mut c_void) -> CRemoteModelListResult;
     // core/src/capi/router.zig
     pub fn talu_backend_list_models_free(result: *mut c_void);
     // core/src/capi/tokenizer.zig
-    pub fn talu_batch_encode_result_free(
-        ids: *mut u32,
-        offsets: *mut usize,
-        total_tokens: usize,
-        num_sequences: usize,
-    );
+    pub fn talu_batch_encode_result_free(ids: *mut u32, offsets: *mut usize, total_tokens: usize, num_sequences: usize);
     // core/src/capi/dlpack.zig
-    pub fn talu_batch_mask_to_dlpack(
-        ids: *const u32,
-        offsets: *const usize,
-        num_sequences: usize,
-        max_length: usize,
-        padding_side: u8,
-    ) -> DLManagedTensor;
+    pub fn talu_batch_mask_to_dlpack(ids: *const u32, offsets: *const usize, num_sequences: usize, max_length: usize, padding_side: u8) -> *mut DLManagedTensor;
     // core/src/capi/dlpack.zig
-    pub fn talu_batch_to_dlpack(
-        ids: *const u32,
-        offsets: *const usize,
-        num_sequences: usize,
-        pad_id: u32,
-        max_length: usize,
-        padding_side: u8,
-    ) -> DLManagedTensor;
+    pub fn talu_batch_to_dlpack(ids: *const u32, offsets: *const usize, num_sequences: usize, pad_id: u32, max_length: usize, padding_side: u8) -> *mut DLManagedTensor;
     // core/src/capi/tokenizer.zig
-    pub fn talu_batch_to_padded_tensor(
-        ids: *const u32,
-        offsets: *const usize,
-        num_sequences: usize,
-        options: PaddedTensorOptions,
-    ) -> PaddedTensorResult;
+    pub fn talu_batch_to_padded_tensor(ids: *const u32, offsets: *const usize, num_sequences: usize, options: *const PaddedTensorOptions) -> PaddedTensorResult;
     // core/src/capi/buffer.zig
     pub fn talu_buffer_create_from_copy(tokens: *const u32, num_tokens: usize) -> *mut c_void;
     // core/src/capi/buffer.zig
@@ -3834,38 +3895,19 @@ extern "C" {
     // core/src/capi/buffer.zig
     pub fn talu_buffer_retain(handle: *mut c_void);
     // core/src/capi/dlpack.zig
-    pub fn talu_buffer_to_dlpack(
-        buffer_handle: *mut c_void,
-        offset_elems: usize,
-        len: usize,
-    ) -> DLManagedTensor;
+    pub fn talu_buffer_to_dlpack(buffer_handle: *mut c_void, offset_elems: usize, len: usize) -> *mut DLManagedTensor;
     // core/src/capi/responses.zig
     pub fn talu_chat_clear(handle: *mut c_void);
     // core/src/capi/responses.zig
-    pub fn talu_chat_count_tokens(
-        chat_handle: *mut c_void,
-        model: *const c_char,
-        additional_message: *const u8,
-        additional_message_len: usize,
-    ) -> i64;
+    pub fn talu_chat_count_tokens(chat_handle: *mut c_void, model: *const c_char, additional_message: *const u8, additional_message_len: usize) -> i64;
     // core/src/capi/responses.zig
     pub fn talu_chat_create(options: *mut ChatCreateOptions) -> *mut c_void;
     // core/src/capi/responses.zig
-    pub fn talu_chat_create_with_session(
-        session_id: *const c_char,
-        options: *mut ChatCreateOptions,
-    ) -> *mut c_void;
+    pub fn talu_chat_create_with_session(session_id: *const c_char, options: *mut ChatCreateOptions) -> *mut c_void;
     // core/src/capi/responses.zig
-    pub fn talu_chat_create_with_system(
-        system: *const c_char,
-        options: *mut ChatCreateOptions,
-    ) -> *mut c_void;
+    pub fn talu_chat_create_with_system(system: *const c_char, options: *mut ChatCreateOptions) -> *mut c_void;
     // core/src/capi/responses.zig
-    pub fn talu_chat_create_with_system_and_session(
-        system: *const c_char,
-        session_id: *const c_char,
-        options: *mut ChatCreateOptions,
-    ) -> *mut c_void;
+    pub fn talu_chat_create_with_system_and_session(system: *const c_char, session_id: *const c_char, options: *mut ChatCreateOptions) -> *mut c_void;
     // core/src/capi/responses.zig
     pub fn talu_chat_free(handle: *mut c_void);
     // core/src/capi/responses.zig
@@ -3901,19 +3943,7 @@ extern "C" {
     // core/src/capi/responses.zig
     pub fn talu_chat_max_context_length(model: *const c_char) -> u64;
     // core/src/capi/responses.zig
-    pub fn talu_chat_notify_session_update(
-        chat_handle: *mut c_void,
-        model: *const c_char,
-        title: *const c_char,
-        system_prompt: *const c_char,
-        config_json: *const c_char,
-        marker: *const c_char,
-        parent_session_id: *const c_char,
-        group_id: *const c_char,
-        metadata_json: *const c_char,
-        source_doc_id: *const c_char,
-        project_id: *const c_char,
-    ) -> c_int;
+    pub fn talu_chat_notify_session_update(chat_handle: *mut c_void, model: *const c_char, title: *const c_char, system_prompt: *const c_char, config_json: *const c_char, marker: *const c_char, parent_session_id: *const c_char, group_id: *const c_char, metadata_json: *const c_char, source_doc_id: *const c_char, project_id: *const c_char) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_chat_reset(handle: *mut c_void);
     // core/src/capi/responses.zig
@@ -3933,11 +3963,7 @@ extern "C" {
     // core/src/capi/responses.zig
     pub fn talu_chat_set_temperature(handle: *mut c_void, value: f32);
     // core/src/capi/responses.zig
-    pub fn talu_chat_set_tool_choice(
-        handle: *mut c_void,
-        json: *const c_char,
-        json_len: usize,
-    ) -> c_int;
+    pub fn talu_chat_set_tool_choice(handle: *mut c_void, json: *const c_char, json_len: usize) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_chat_set_tools(handle: *mut c_void, json: *const c_char, json_len: usize) -> c_int;
     // core/src/capi/responses.zig
@@ -3963,11 +3989,7 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_config_validate(spec: *mut TaluModelSpec) -> c_int;
     // core/src/capi/converter.zig
-    pub fn talu_convert(
-        model_path: *const c_char,
-        output_dir: *const c_char,
-        options: *const ConvertOptions,
-    ) -> ConvertResult;
+    pub fn talu_convert(model_path: *const c_char, output_dir: *const c_char, options: *const ConvertOptions) -> ConvertResult;
     // core/src/capi/converter.zig
     pub fn talu_convert_free_string(string_ptr: *const c_char);
     // core/src/capi/converter.zig
@@ -3975,114 +3997,45 @@ extern "C" {
     // core/src/capi/converter.zig
     pub fn talu_convert_schemes(out_schemes: *mut c_void) -> c_int;
     // core/src/capi/db/blob.zig
-    pub fn talu_db_blob_exists(
-        db_path: *const c_char,
-        blob_ref: *const c_char,
-        out_exists: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_blob_exists(db_path: *const c_char, blob_ref: *const c_char, out_exists: *mut c_void) -> c_int;
     // core/src/capi/db/blob.zig
     pub fn talu_db_blob_free_string_list(list: *mut CStringList);
     // core/src/capi/db/blob.zig
-    pub fn talu_db_blob_gc(
-        db_path: *const c_char,
-        min_blob_age_seconds: u64,
-        out_stats: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_blob_gc(db_path: *const c_char, min_blob_age_seconds: u64, out_stats: *mut c_void) -> c_int;
     // core/src/capi/db/blob.zig
-    pub fn talu_db_blob_list(
-        db_path: *const c_char,
-        limit: usize,
-        out_refs: *mut *mut CStringList,
-    ) -> c_int;
+    pub fn talu_db_blob_list(db_path: *const c_char, limit: usize, out_refs: *mut *mut CStringList) -> c_int;
     // core/src/capi/db/blob.zig
-    pub fn talu_db_blob_open_stream(
-        db_path: *const c_char,
-        blob_ref: *const c_char,
-        out_stream: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_blob_open_stream(db_path: *const c_char, blob_ref: *const c_char, out_stream: *mut c_void) -> c_int;
     // core/src/capi/db/blob.zig
-    pub fn talu_db_blob_open_write_stream(db_path: *const c_char, out_stream: *mut c_void)
-        -> c_int;
+    pub fn talu_db_blob_open_write_stream(db_path: *const c_char, out_stream: *mut c_void) -> c_int;
     // core/src/capi/db/blob.zig
-    pub fn talu_db_blob_put(
-        db_path: *const c_char,
-        bytes: *const u8,
-        bytes_len: usize,
-        out_blob_ref: *mut u8,
-        out_blob_ref_capacity: usize,
-    ) -> c_int;
+    pub fn talu_db_blob_put(db_path: *const c_char, bytes: *const u8, bytes_len: usize, out_blob_ref: *mut u8, out_blob_ref_capacity: usize) -> c_int;
     // core/src/capi/db/blob.zig
     pub fn talu_db_blob_stream_close(stream_handle: *mut c_void);
     // core/src/capi/db/blob.zig
-    pub fn talu_db_blob_stream_read(
-        stream_handle: *mut c_void,
-        out_buffer: *mut u8,
-        out_buffer_len: usize,
-        out_read_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_blob_stream_read(stream_handle: *mut c_void, out_buffer: *mut u8, out_buffer_len: usize, out_read_len: *mut c_void) -> c_int;
     // core/src/capi/db/blob.zig
     pub fn talu_db_blob_stream_seek(stream_handle: *mut c_void, offset_bytes: u64) -> c_int;
     // core/src/capi/db/blob.zig
-    pub fn talu_db_blob_stream_total_size(
-        stream_handle: *mut c_void,
-        out_total_size: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_blob_stream_total_size(stream_handle: *mut c_void, out_total_size: *mut c_void) -> c_int;
     // core/src/capi/db/blob.zig
     pub fn talu_db_blob_write_stream_close(stream_handle: *mut c_void);
     // core/src/capi/db/blob.zig
-    pub fn talu_db_blob_write_stream_finish(
-        stream_handle: *mut c_void,
-        out_blob_ref: *mut u8,
-        out_blob_ref_capacity: usize,
-    ) -> c_int;
+    pub fn talu_db_blob_write_stream_finish(stream_handle: *mut c_void, out_blob_ref: *mut u8, out_blob_ref_capacity: usize) -> c_int;
     // core/src/capi/db/blob.zig
-    pub fn talu_db_blob_write_stream_write(
-        stream_handle: *mut c_void,
-        bytes: *const u8,
-        bytes_len: usize,
-    ) -> c_int;
+    pub fn talu_db_blob_write_stream_write(stream_handle: *mut c_void, bytes: *const u8, bytes_len: usize) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_add_tag(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        tag_id: *const c_char,
-        group_id: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_docs_add_tag(db_path: *const c_char, doc_id: *const c_char, tag_id: *const c_char, group_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_count_expired(db_path: *const c_char, out_count: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_create(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        doc_type: *const c_char,
-        title: *const c_char,
-        doc_json: *const c_char,
-        tags_text: *const c_char,
-        parent_id: *const c_char,
-        marker: *const c_char,
-        group_id: *const c_char,
-        owner_id: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_docs_create(db_path: *const c_char, doc_id: *const c_char, doc_type: *const c_char, title: *const c_char, doc_json: *const c_char, tags_text: *const c_char, parent_id: *const c_char, marker: *const c_char, group_id: *const c_char, owner_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_create_delta(
-        db_path: *const c_char,
-        base_doc_id: *const c_char,
-        new_doc_id: *const c_char,
-        delta_json: *const c_char,
-        title: *const c_char,
-        tags_text: *const c_char,
-        marker: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_docs_create_delta(db_path: *const c_char, base_doc_id: *const c_char, new_doc_id: *const c_char, delta_json: *const c_char, title: *const c_char, tags_text: *const c_char, marker: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_delete(db_path: *const c_char, doc_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_delete_batch(
-        db_path: *const c_char,
-        doc_ids: *const *const c_char,
-        doc_ids_count: usize,
-        doc_type: *const c_char,
-        out_deleted_count: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_docs_delete_batch(db_path: *const c_char, doc_ids: *const *const c_char, doc_ids_count: usize, doc_type: *const c_char, out_deleted_count: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_free_changes(list: *mut CChangeList);
     // core/src/capi/db/table.zig
@@ -4096,214 +4049,83 @@ extern "C" {
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_free_string_list(list: *mut CStringList);
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_get(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        out_doc: *mut CDocumentRecord,
-    ) -> c_int;
+    pub fn talu_db_docs_get(db_path: *const c_char, doc_id: *const c_char, out_doc: *mut CDocumentRecord) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_get_base_id(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        out_base_id: *mut u8,
-        out_base_id_len: usize,
-    ) -> c_int;
+    pub fn talu_db_docs_get_base_id(db_path: *const c_char, doc_id: *const c_char, out_base_id: *mut u8, out_base_id_len: usize) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_get_blob_ref(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        out_blob_ref: *mut u8,
-        out_blob_ref_capacity: usize,
-        out_has_external_ref: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_docs_get_blob_ref(db_path: *const c_char, doc_id: *const c_char, out_blob_ref: *mut u8, out_blob_ref_capacity: usize, out_has_external_ref: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_get_by_tag(
-        db_path: *const c_char,
-        tag_id: *const c_char,
-        out_doc_ids: *mut *mut CStringList,
-    ) -> c_int;
+    pub fn talu_db_docs_get_by_tag(db_path: *const c_char, tag_id: *const c_char, out_doc_ids: *mut *mut CStringList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_get_changes(
-        db_path: *const c_char,
-        since_seq: u64,
-        group_id: *const c_char,
-        limit: u32,
-        out_list: *mut *mut CChangeList,
-    ) -> c_int;
+    pub fn talu_db_docs_get_changes(db_path: *const c_char, since_seq: u64, group_id: *const c_char, limit: u32, out_list: *mut *mut CChangeList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_get_compaction_stats(
-        db_path: *const c_char,
-        out_stats: *mut CCompactionStats,
-    ) -> c_int;
+    pub fn talu_db_docs_get_compaction_stats(db_path: *const c_char, out_stats: *mut CCompactionStats) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_get_delta_chain(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        out_chain: *mut *mut CDeltaChain,
-    ) -> c_int;
+    pub fn talu_db_docs_get_delta_chain(db_path: *const c_char, doc_id: *const c_char, out_chain: *mut *mut CDeltaChain) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_get_garbage_candidates(
-        db_path: *const c_char,
-        out_ids: *mut *mut CStringList,
-    ) -> c_int;
+    pub fn talu_db_docs_get_garbage_candidates(db_path: *const c_char, out_ids: *mut *mut CStringList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_get_tags(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        out_tag_ids: *mut *mut CStringList,
-    ) -> c_int;
+    pub fn talu_db_docs_get_tags(db_path: *const c_char, doc_id: *const c_char, out_tag_ids: *mut *mut CStringList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_is_delta(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        out_is_delta: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_docs_is_delta(db_path: *const c_char, doc_id: *const c_char, out_is_delta: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_list(
-        db_path: *const c_char,
-        doc_type: *const c_char,
-        group_id: *const c_char,
-        owner_id: *const c_char,
-        marker: *const c_char,
-        limit: u32,
-        out_list: *mut *mut CDocumentList,
-    ) -> c_int;
+    pub fn talu_db_docs_list(db_path: *const c_char, doc_type: *const c_char, group_id: *const c_char, owner_id: *const c_char, marker: *const c_char, limit: u32, out_list: *mut *mut CDocumentList) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_purge_expired(db_path: *const c_char, out_count: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_remove_tag(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        tag_id: *const c_char,
-        group_id: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_docs_remove_tag(db_path: *const c_char, doc_id: *const c_char, tag_id: *const c_char, group_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_search(
-        db_path: *const c_char,
-        query: *const c_char,
-        doc_type: *const c_char,
-        limit: u32,
-        out_list: *mut *mut CSearchResultList,
-    ) -> c_int;
+    pub fn talu_db_docs_search(db_path: *const c_char, query: *const c_char, doc_type: *const c_char, limit: u32, out_list: *mut *mut CSearchResultList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_search_batch(
-        db_path: *const c_char,
-        queries_json: *const u8,
-        queries_len: usize,
-        out_results_json: *mut c_void,
-        out_results_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_docs_search_batch(db_path: *const c_char, queries_json: *const u8, queries_len: usize, out_results_json: *mut c_void, out_results_len: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_set_marker_batch(
-        db_path: *const c_char,
-        doc_ids: *const *const c_char,
-        doc_ids_count: usize,
-        marker: *const c_char,
-        doc_type: *const c_char,
-        out_updated_count: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_docs_set_marker_batch(db_path: *const c_char, doc_ids: *const *const c_char, doc_ids_count: usize, marker: *const c_char, doc_type: *const c_char, out_updated_count: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_set_ttl(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        ttl_seconds: u64,
-    ) -> c_int;
+    pub fn talu_db_docs_set_ttl(db_path: *const c_char, doc_id: *const c_char, ttl_seconds: u64) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_update(
-        db_path: *const c_char,
-        doc_id: *const c_char,
-        title: *const c_char,
-        doc_json: *const c_char,
-        tags_text: *const c_char,
-        marker: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_docs_update(db_path: *const c_char, doc_id: *const c_char, title: *const c_char, doc_json: *const c_char, tags_text: *const c_char, marker: *const c_char) -> c_int;
     // core/src/capi/db/kv.zig
     pub fn talu_db_kv_compact(handle: *mut c_void) -> c_int;
     // core/src/capi/db/kv.zig
-    pub fn talu_db_kv_delete(
-        handle: *mut c_void,
-        key: *const c_char,
-        out_deleted: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_kv_delete(handle: *mut c_void, key: *const c_char, out_deleted: *mut c_void) -> c_int;
     // core/src/capi/db/kv.zig
     pub fn talu_db_kv_flush(handle: *mut c_void) -> c_int;
     // core/src/capi/db/kv.zig
     pub fn talu_db_kv_free(handle: *mut c_void);
     // core/src/capi/db/kv.zig
-    pub fn talu_db_kv_free_list(list: CKvList);
+    pub fn talu_db_kv_free_list(list: *mut CKvList);
     // core/src/capi/db/kv.zig
-    pub fn talu_db_kv_free_value(value: CKvValue);
+    pub fn talu_db_kv_free_value(value: *mut CKvValue);
     // core/src/capi/db/kv.zig
-    pub fn talu_db_kv_get(handle: *mut c_void, key: *const c_char, out_value: CKvValue) -> c_int;
+    pub fn talu_db_kv_get(handle: *mut c_void, key: *const c_char, out_value: *mut CKvValue) -> c_int;
     // core/src/capi/db/kv.zig
-    pub fn talu_db_kv_init(
-        db_path: *const c_char,
-        namespace: *const c_char,
-        out_handle: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_kv_init(db_path: *const c_char, namespace: *const c_char, out_handle: *mut c_void) -> c_int;
     // core/src/capi/db/kv.zig
-    pub fn talu_db_kv_list(handle: *mut c_void, out_list: CKvList) -> c_int;
+    pub fn talu_db_kv_list(handle: *mut c_void, out_list: *mut CKvList) -> c_int;
     // core/src/capi/db/kv.zig
-    pub fn talu_db_kv_put(
-        handle: *mut c_void,
-        key: *const c_char,
-        value: *const u8,
-        value_len: usize,
-    ) -> c_int;
+    pub fn talu_db_kv_put(handle: *mut c_void, key: *const c_char, value: *const u8, value_len: usize) -> c_int;
     // core/src/capi/db/ops.zig
     pub fn talu_db_ops_set_durability(chat_handle: *mut c_void, mode: u8) -> c_int;
     // core/src/capi/db/ops.zig
     pub fn talu_db_ops_set_max_segment_size(chat_handle: *mut c_void, max_bytes: u64) -> c_int;
     // core/src/capi/db/ops.zig
-    pub fn talu_db_ops_set_storage_db(
-        chat_handle: *mut c_void,
-        db_path: *const c_char,
-        session_id: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_ops_set_storage_db(chat_handle: *mut c_void, db_path: *const c_char, session_id: *const c_char) -> c_int;
     // core/src/capi/db/ops.zig
     pub fn talu_db_ops_simulate_crash(chat_handle: *mut c_void) -> c_int;
     // core/src/capi/db/ops.zig
-    pub fn talu_db_ops_snapshot_create(
-        _db_path: *const c_char,
-        _out_snapshot_id: *mut u8,
-        _out_snapshot_id_capacity: usize,
-    ) -> c_int;
+    pub fn talu_db_ops_snapshot_create(_db_path: *const c_char, _out_snapshot_id: *mut u8, _out_snapshot_id_capacity: usize) -> c_int;
     // core/src/capi/db/ops.zig
-    pub fn talu_db_ops_snapshot_release(
-        _db_path: *const c_char,
-        _snapshot_id: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_ops_snapshot_release(_db_path: *const c_char, _snapshot_id: *const c_char) -> c_int;
     // core/src/capi/db/ops.zig
-    pub fn talu_db_ops_vector_build_indexes_with_generation(
-        handle: *mut c_void,
-        expected_generation: u64,
-        max_segments: usize,
-        out_built_segments: *mut c_void,
-        out_failed_segments: *mut c_void,
-        out_pending_segments: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_ops_vector_build_indexes_with_generation(handle: *mut c_void, expected_generation: u64, max_segments: usize, out_built_segments: *mut c_void, out_failed_segments: *mut c_void, out_pending_segments: *mut c_void) -> c_int;
     // core/src/capi/db/ops.zig
-    pub fn talu_db_ops_vector_compact(
-        handle: *mut c_void,
-        dims: u32,
-        out_kept_count: *mut c_void,
-        out_removed_tombstones: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_ops_vector_compact(handle: *mut c_void, dims: u32, out_kept_count: *mut c_void, out_removed_tombstones: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_add_tag(
-        db_path: *const c_char,
-        session_id: *const c_char,
-        tag_id: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_session_add_tag(db_path: *const c_char, session_id: *const c_char, tag_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_session_delete(db_path: *const c_char, session_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_fork(
-        db_path: *const c_char,
-        source_session_id: *const c_char,
-        target_item_id: u64,
-        new_session_id: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_session_fork(db_path: *const c_char, source_session_id: *const c_char, target_item_id: u64, new_session_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_session_free_list(sessions: *mut CSessionList);
     // core/src/capi/db/table.zig
@@ -4311,142 +4133,37 @@ extern "C" {
     // core/src/capi/db/table.zig
     pub fn talu_db_session_free_tag_batch(batch: *mut CSessionTagBatch);
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_get(
-        db_path: *const c_char,
-        session_id: *const c_char,
-        out_session: *mut CSessionRecord,
-    ) -> c_int;
+    pub fn talu_db_session_get(db_path: *const c_char, session_id: *const c_char, out_session: *mut CSessionRecord) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_get_tags(
-        db_path: *const c_char,
-        session_id: *const c_char,
-        out_tag_ids: *mut *mut CRelationStringList,
-    ) -> c_int;
+    pub fn talu_db_session_get_tags(db_path: *const c_char, session_id: *const c_char, out_tag_ids: *mut *mut CRelationStringList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_get_tags_batch(
-        db_path: *const c_char,
-        session_ids: *const *const c_char,
-        session_count: u32,
-        out_result: *mut *mut CSessionTagBatch,
-    ) -> c_int;
+    pub fn talu_db_session_get_tags_batch(db_path: *const c_char, session_ids: *const *const c_char, session_count: u32, out_result: *mut *mut CSessionTagBatch) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_list(
-        db_path: *const c_char,
-        limit: u32,
-        before_updated_at_ms: i64,
-        before_session_id: *const c_char,
-        group_id: *const c_char,
-        search_query: *const c_char,
-        tags_filter: *const c_char,
-        tags_filter_any: *const c_char,
-        project_id: *const c_char,
-        project_id_null: c_int,
-        out_sessions: *mut *mut CSessionList,
-    ) -> c_int;
+    pub fn talu_db_session_list(db_path: *const c_char, limit: u32, before_updated_at_ms: i64, before_session_id: *const c_char, group_id: *const c_char, search_query: *const c_char, tags_filter: *const c_char, tags_filter_any: *const c_char, project_id: *const c_char, project_id_null: c_int, out_sessions: *mut *mut CSessionList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_list_batch(
-        db_path: *const c_char,
-        offset: u32,
-        limit: u32,
-        group_id: *const c_char,
-        marker_filter: *const c_char,
-        search_query: *const c_char,
-        tags_filter_any: *const c_char,
-        project_id: *const c_char,
-        project_id_null: c_int,
-        out_sessions: *mut *mut CSessionList,
-    ) -> c_int;
+    pub fn talu_db_session_list_batch(db_path: *const c_char, offset: u32, limit: u32, group_id: *const c_char, marker_filter: *const c_char, search_query: *const c_char, tags_filter_any: *const c_char, project_id: *const c_char, project_id_null: c_int, out_sessions: *mut *mut CSessionList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_list_by_source(
-        db_path: *const c_char,
-        source_doc_id: *const c_char,
-        limit: u32,
-        before_updated_at_ms: i64,
-        before_session_id: *const c_char,
-        out_sessions: *mut *mut CSessionList,
-    ) -> c_int;
+    pub fn talu_db_session_list_by_source(db_path: *const c_char, source_doc_id: *const c_char, limit: u32, before_updated_at_ms: i64, before_session_id: *const c_char, out_sessions: *mut *mut CSessionList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_list_ex(
-        db_path: *const c_char,
-        limit: u32,
-        before_updated_at_ms: i64,
-        before_session_id: *const c_char,
-        group_id: *const c_char,
-        search_query: *const c_char,
-        tags_filter: *const c_char,
-        tags_filter_any: *const c_char,
-        marker_filter: *const c_char,
-        marker_filter_any: *const c_char,
-        model_filter: *const c_char,
-        created_after_ms: i64,
-        created_before_ms: i64,
-        updated_after_ms: i64,
-        updated_before_ms: i64,
-        has_tags: c_int,
-        source_doc_id: *const c_char,
-        project_id: *const c_char,
-        project_id_null: c_int,
-        out_sessions: *mut *mut CSessionList,
-    ) -> c_int;
+    pub fn talu_db_session_list_ex(db_path: *const c_char, limit: u32, before_updated_at_ms: i64, before_session_id: *const c_char, group_id: *const c_char, search_query: *const c_char, tags_filter: *const c_char, tags_filter_any: *const c_char, marker_filter: *const c_char, marker_filter_any: *const c_char, model_filter: *const c_char, created_after_ms: i64, created_before_ms: i64, updated_after_ms: i64, updated_before_ms: i64, has_tags: c_int, source_doc_id: *const c_char, project_id: *const c_char, project_id_null: c_int, out_sessions: *mut *mut CSessionList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_load_conversation(
-        db_path: *const c_char,
-        session_id: *const c_char,
-    ) -> *mut c_void;
+    pub fn talu_db_session_load_conversation(db_path: *const c_char, session_id: *const c_char) -> *mut c_void;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_remove_tag(
-        db_path: *const c_char,
-        session_id: *const c_char,
-        tag_id: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_session_remove_tag(db_path: *const c_char, session_id: *const c_char, tag_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_update(
-        db_path: *const c_char,
-        session_id: *const c_char,
-        title: *const c_char,
-        marker: *const c_char,
-        metadata_json: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_session_update(db_path: *const c_char, session_id: *const c_char, title: *const c_char, marker: *const c_char, metadata_json: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_session_update_ex(
-        db_path: *const c_char,
-        session_id: *const c_char,
-        title: *const c_char,
-        marker: *const c_char,
-        metadata_json: *const c_char,
-        source_doc_id: *const c_char,
-        project_id: *const c_char,
-        clear_project_id: c_int,
-    ) -> c_int;
+    pub fn talu_db_session_update_ex(db_path: *const c_char, session_id: *const c_char, title: *const c_char, marker: *const c_char, metadata_json: *const c_char, source_doc_id: *const c_char, project_id: *const c_char, clear_project_id: c_int) -> c_int;
     // core/src/capi/db/sql.zig
-    pub fn talu_db_sql_execute(
-        db_path: *const c_char,
-        query: *const c_char,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_sql_execute(db_path: *const c_char, query: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/db/sql.zig
-    pub fn talu_db_sql_query(
-        db_path: *const c_char,
-        query: *const c_char,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_sql_query(db_path: *const c_char, query: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/db/sql.zig
     pub fn talu_db_sql_query_free(ptr: *const c_char);
     // core/src/capi/db/sql.zig
-    pub fn talu_db_sql_query_params(
-        db_path: *const c_char,
-        query: *const c_char,
-        params: *const CSqlParam,
-        num_params: u32,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_sql_query_params(db_path: *const c_char, query: *const c_char, params: *const CSqlParam, num_params: u32, out_json: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_table_append_row(
-        handle: *mut c_void,
-        schema_id: u16,
-        columns: *const CColumnValue,
-        num_cols: u32,
-    ) -> c_int;
+    pub fn talu_db_table_append_row(handle: *mut c_void, schema_id: u16, columns: *const CColumnValue, num_cols: u32) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_table_close(handle: *mut c_void);
     // core/src/capi/db/table.zig
@@ -4456,336 +4173,89 @@ extern "C" {
     // core/src/capi/db/table.zig
     pub fn talu_db_table_free_rows(iter: *mut CRowIterator);
     // core/src/capi/db/table.zig
-    pub fn talu_db_table_get(
-        handle: *mut c_void,
-        schema_id: u16,
-        pk_hash: u64,
-        legacy_hash: u64,
-        out_iter: *mut CRowIterator,
-    ) -> c_int;
+    pub fn talu_db_table_get(handle: *mut c_void, schema_id: u16, pk_hash: u64, legacy_hash: u64, out_iter: *mut CRowIterator) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_table_open(
-        db_root: *const u8,
-        db_root_len: usize,
-        ns: *const u8,
-        ns_len: usize,
-        policy: *const CCompactionPolicy,
-        out_handle: *mut *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_table_open(db_root: *const u8, db_root_len: usize, ns: *const u8, ns_len: usize, policy: *const CCompactionPolicy, out_handle: *mut *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_table_open_readonly(
-        db_root: *const u8,
-        db_root_len: usize,
-        ns: *const u8,
-        ns_len: usize,
-        out_handle: *mut *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_table_open_readonly(db_root: *const u8, db_root_len: usize, ns: *const u8, ns_len: usize, out_handle: *mut *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_table_scan(
-        handle: *mut c_void,
-        params: *const CScanParams,
-        out_iter: *mut CRowIterator,
-    ) -> c_int;
+    pub fn talu_db_table_scan(handle: *mut c_void, params: *const CScanParams, out_iter: *mut CRowIterator) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_tag_create(
-        db_path: *const c_char,
-        tag_id: *const c_char,
-        name: *const c_char,
-        color: *const c_char,
-        description: *const c_char,
-        group_id: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_tag_create(db_path: *const c_char, tag_id: *const c_char, name: *const c_char, color: *const c_char, description: *const c_char, group_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_tag_delete(db_path: *const c_char, tag_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_tag_free_list(tags: *mut CTagList);
     // core/src/capi/db/table.zig
-    pub fn talu_db_tag_get(
-        db_path: *const c_char,
-        tag_id: *const c_char,
-        out_tag: *mut CTagRecord,
-    ) -> c_int;
+    pub fn talu_db_tag_get(db_path: *const c_char, tag_id: *const c_char, out_tag: *mut CTagRecord) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_tag_get_by_name(
-        db_path: *const c_char,
-        name: *const c_char,
-        group_id: *const c_char,
-        out_tag: *mut CTagRecord,
-    ) -> c_int;
+    pub fn talu_db_tag_get_by_name(db_path: *const c_char, name: *const c_char, group_id: *const c_char, out_tag: *mut CTagRecord) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_tag_get_conversations(
-        db_path: *const c_char,
-        tag_id: *const c_char,
-        out_session_ids: *mut *mut CRelationStringList,
-    ) -> c_int;
+    pub fn talu_db_tag_get_conversations(db_path: *const c_char, tag_id: *const c_char, out_session_ids: *mut *mut CRelationStringList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_tag_list(
-        db_path: *const c_char,
-        group_id: *const c_char,
-        out_tags: *mut *mut CTagList,
-    ) -> c_int;
+    pub fn talu_db_tag_list(db_path: *const c_char, group_id: *const c_char, out_tags: *mut *mut CTagList) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_tag_update(
-        db_path: *const c_char,
-        tag_id: *const c_char,
-        name: *const c_char,
-        color: *const c_char,
-        description: *const c_char,
-    ) -> c_int;
+    pub fn talu_db_tag_update(db_path: *const c_char, tag_id: *const c_char, name: *const c_char, color: *const c_char, description: *const c_char) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_append(
-        handle: *mut c_void,
-        ids_ptr: *mut c_void,
-        vectors_ptr: *const f32,
-        count: usize,
-        dims: u32,
-    ) -> c_int;
+    pub fn talu_db_vector_append(handle: *mut c_void, ids_ptr: *mut c_void, vectors_ptr: *const f32, count: usize, dims: u32) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_append_ex(
-        handle: *mut c_void,
-        ids_ptr: *mut c_void,
-        vectors_ptr: *const f32,
-        count: usize,
-        dims: u32,
-        normalize: bool,
-        reject_existing: bool,
-    ) -> c_int;
+    pub fn talu_db_vector_append_ex(handle: *mut c_void, ids_ptr: *mut c_void, vectors_ptr: *const f32, count: usize, dims: u32, normalize: bool, reject_existing: bool) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_append_idempotent_ex(
-        handle: *mut c_void,
-        ids_ptr: *mut c_void,
-        vectors_ptr: *const f32,
-        count: usize,
-        dims: u32,
-        normalize: bool,
-        reject_existing: bool,
-        key_hash: u64,
-        request_hash: u64,
-    ) -> c_int;
+    pub fn talu_db_vector_append_idempotent_ex(handle: *mut c_void, ids_ptr: *mut c_void, vectors_ptr: *const f32, count: usize, dims: u32, normalize: bool, reject_existing: bool, key_hash: u64, request_hash: u64) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_build_indexes_with_generation(
-        handle: *mut c_void,
-        expected_generation: u64,
-        max_segments: usize,
-        out_built_segments: *mut c_void,
-        out_failed_segments: *mut c_void,
-        out_pending_segments: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_build_indexes_with_generation(handle: *mut c_void, expected_generation: u64, max_segments: usize, out_built_segments: *mut c_void, out_failed_segments: *mut c_void, out_pending_segments: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_changes(
-        handle: *mut c_void,
-        since: u64,
-        limit: usize,
-        out_seqs: *mut c_void,
-        out_ops: *mut c_void,
-        out_ids: *mut c_void,
-        out_timestamps: *mut c_void,
-        out_count: *mut c_void,
-        out_has_more: *mut c_void,
-        out_next_since: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_changes(handle: *mut c_void, since: u64, limit: usize, out_seqs: *mut c_void, out_ops: *mut c_void, out_ids: *mut c_void, out_timestamps: *mut c_void, out_count: *mut c_void, out_has_more: *mut c_void, out_next_since: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_compact(
-        handle: *mut c_void,
-        dims: u32,
-        out_kept_count: *mut c_void,
-        out_removed_tombstones: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_compact(handle: *mut c_void, dims: u32, out_kept_count: *mut c_void, out_removed_tombstones: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_compact_expired_tombstones(
-        handle: *mut c_void,
-        dims: u32,
-        now_ms: i64,
-        max_age_ms: i64,
-        out_kept_count: *mut c_void,
-        out_removed_tombstones: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_compact_expired_tombstones(handle: *mut c_void, dims: u32, now_ms: i64, max_age_ms: i64, out_kept_count: *mut c_void, out_removed_tombstones: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_compact_idempotent(
-        handle: *mut c_void,
-        dims: u32,
-        key_hash: u64,
-        request_hash: u64,
-        out_kept_count: *mut c_void,
-        out_removed_tombstones: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_compact_idempotent(handle: *mut c_void, dims: u32, key_hash: u64, request_hash: u64, out_kept_count: *mut c_void, out_removed_tombstones: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_compact_with_generation(
-        handle: *mut c_void,
-        dims: u32,
-        expected_generation: u64,
-        out_kept_count: *mut c_void,
-        out_removed_tombstones: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_compact_with_generation(handle: *mut c_void, dims: u32, expected_generation: u64, out_kept_count: *mut c_void, out_removed_tombstones: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_delete(
-        handle: *mut c_void,
-        ids_ptr: *mut c_void,
-        count: usize,
-        out_deleted_count: *mut c_void,
-        out_not_found_count: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_delete(handle: *mut c_void, ids_ptr: *mut c_void, count: usize, out_deleted_count: *mut c_void, out_not_found_count: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_delete_idempotent(
-        handle: *mut c_void,
-        ids_ptr: *mut c_void,
-        count: usize,
-        key_hash: u64,
-        request_hash: u64,
-        out_deleted_count: *mut c_void,
-        out_not_found_count: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_delete_idempotent(handle: *mut c_void, ids_ptr: *mut c_void, count: usize, key_hash: u64, request_hash: u64, out_deleted_count: *mut c_void, out_not_found_count: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_fetch(
-        handle: *mut c_void,
-        ids_ptr: *mut c_void,
-        count: usize,
-        include_values: bool,
-        out_ids: *mut c_void,
-        out_vectors: *mut c_void,
-        out_found_count: *mut c_void,
-        out_dims: *mut c_void,
-        out_missing_ids: *mut c_void,
-        out_missing_count: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_fetch(handle: *mut c_void, ids_ptr: *mut c_void, count: usize, include_values: bool, out_ids: *mut c_void, out_vectors: *mut c_void, out_found_count: *mut c_void, out_dims: *mut c_void, out_missing_ids: *mut c_void, out_missing_count: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
     pub fn talu_db_vector_free(handle: *mut c_void);
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_free_changes(
-        seqs_ptr: *mut c_void,
-        ops_ptr: *mut u8,
-        ids_ptr: *mut c_void,
-        timestamps_ptr: *mut c_void,
-        count: usize,
-    );
+    pub fn talu_db_vector_free_changes(seqs_ptr: *mut c_void, ops_ptr: *mut u8, ids_ptr: *mut c_void, timestamps_ptr: *mut c_void, count: usize);
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_free_fetch(
-        ids_ptr: *mut c_void,
-        vectors_ptr: *const f32,
-        found_count: usize,
-        dims: u32,
-        missing_ids_ptr: *mut c_void,
-        missing_count: usize,
-    );
+    pub fn talu_db_vector_free_fetch(ids_ptr: *mut c_void, vectors_ptr: *const f32, found_count: usize, dims: u32, missing_ids_ptr: *mut c_void, missing_count: usize);
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_free_load(
-        ids_ptr: *mut c_void,
-        vectors_ptr: *const f32,
-        count: usize,
-        dims: u32,
-    );
+    pub fn talu_db_vector_free_load(ids_ptr: *mut c_void, vectors_ptr: *const f32, count: usize, dims: u32);
     // core/src/capi/db/vector.zig
     pub fn talu_db_vector_free_search(ids_ptr: *mut c_void, scores_ptr: *const f32, count: usize);
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_free_search_batch(
-        ids_ptr: *mut c_void,
-        scores_ptr: *const f32,
-        count_per_query: u32,
-        query_count: u32,
-    );
+    pub fn talu_db_vector_free_search_batch(ids_ptr: *mut c_void, scores_ptr: *const f32, count_per_query: u32, query_count: u32);
     // core/src/capi/db/vector.zig
     pub fn talu_db_vector_init(db_path: *const c_char, out_handle: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_load(
-        handle: *mut c_void,
-        out_ids: *mut c_void,
-        out_vectors: *mut c_void,
-        out_count: *mut c_void,
-        out_dims: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_load(handle: *mut c_void, out_ids: *mut c_void, out_vectors: *mut c_void, out_count: *mut c_void, out_dims: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_scan_batch(
-        handle: *mut c_void,
-        query_ptr: *const f32,
-        query_len: usize,
-        dims: u32,
-        query_count: u32,
-        out_ids: *mut c_void,
-        ids_len: usize,
-        out_scores: *const f32,
-        scores_len: usize,
-        out_total_rows: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_scan_batch(handle: *mut c_void, query_ptr: *const f32, query_len: usize, dims: u32, query_count: u32, out_ids: *mut c_void, ids_len: usize, out_scores: *const f32, scores_len: usize, out_total_rows: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_search(
-        handle: *mut c_void,
-        query_ptr: *const f32,
-        query_len: usize,
-        k: u32,
-        out_ids: *mut c_void,
-        out_scores: *mut c_void,
-        out_count: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_search(handle: *mut c_void, query_ptr: *const f32, query_len: usize, k: u32, out_ids: *mut c_void, out_scores: *mut c_void, out_count: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_search_batch(
-        handle: *mut c_void,
-        query_ptr: *const f32,
-        query_len: usize,
-        dims: u32,
-        query_count: u32,
-        k: u32,
-        out_ids: *mut c_void,
-        out_scores: *mut c_void,
-        out_count_per_query: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_search_batch(handle: *mut c_void, query_ptr: *const f32, query_len: usize, dims: u32, query_count: u32, k: u32, out_ids: *mut c_void, out_scores: *mut c_void, out_count_per_query: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_search_batch_ex(
-        handle: *mut c_void,
-        query_ptr: *const f32,
-        query_len: usize,
-        dims: u32,
-        query_count: u32,
-        k: u32,
-        normalize_queries: bool,
-        approximate: bool,
-        out_ids: *mut c_void,
-        out_scores: *mut c_void,
-        out_count_per_query: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_search_batch_ex(handle: *mut c_void, query_ptr: *const f32, query_len: usize, dims: u32, query_count: u32, k: u32, normalize_queries: bool, approximate: bool, out_ids: *mut c_void, out_scores: *mut c_void, out_count_per_query: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
     pub fn talu_db_vector_set_durability(handle: *mut c_void, mode: u8) -> c_int;
     // core/src/capi/db/vector.zig
     pub fn talu_db_vector_simulate_crash(handle: *mut c_void);
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_stats(
-        handle: *mut c_void,
-        out_visible_count: *mut c_void,
-        out_tombstone_count: *mut c_void,
-        out_segment_count: *mut c_void,
-        out_total_count: *mut c_void,
-        out_manifest_generation: *mut c_void,
-        out_index_ready_segments: *mut c_void,
-        out_index_pending_segments: *mut c_void,
-        out_index_failed_segments: *mut c_void,
-    ) -> c_int;
+    pub fn talu_db_vector_stats(handle: *mut c_void, out_visible_count: *mut c_void, out_tombstone_count: *mut c_void, out_segment_count: *mut c_void, out_total_count: *mut c_void, out_manifest_generation: *mut c_void, out_index_ready_segments: *mut c_void, out_index_pending_segments: *mut c_void, out_index_failed_segments: *mut c_void) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_upsert(
-        handle: *mut c_void,
-        ids_ptr: *mut c_void,
-        vectors_ptr: *const f32,
-        count: usize,
-        dims: u32,
-    ) -> c_int;
+    pub fn talu_db_vector_upsert(handle: *mut c_void, ids_ptr: *mut c_void, vectors_ptr: *const f32, count: usize, dims: u32) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_upsert_ex(
-        handle: *mut c_void,
-        ids_ptr: *mut c_void,
-        vectors_ptr: *const f32,
-        count: usize,
-        dims: u32,
-        normalize: bool,
-    ) -> c_int;
+    pub fn talu_db_vector_upsert_ex(handle: *mut c_void, ids_ptr: *mut c_void, vectors_ptr: *const f32, count: usize, dims: u32, normalize: bool) -> c_int;
     // core/src/capi/db/vector.zig
-    pub fn talu_db_vector_upsert_idempotent_ex(
-        handle: *mut c_void,
-        ids_ptr: *mut c_void,
-        vectors_ptr: *const f32,
-        count: usize,
-        dims: u32,
-        normalize: bool,
-        key_hash: u64,
-        request_hash: u64,
-    ) -> c_int;
+    pub fn talu_db_vector_upsert_idempotent_ex(handle: *mut c_void, ids_ptr: *mut c_void, vectors_ptr: *const f32, count: usize, dims: u32, normalize: bool, key_hash: u64, request_hash: u64) -> c_int;
     // core/src/capi/tokenizer.zig
     pub fn talu_decode_result_free(text: *mut u8, text_len: usize);
     // core/src/capi/converter.zig
@@ -4805,99 +4275,41 @@ extern "C" {
     // core/src/capi/file.zig
     pub fn talu_file_info_free(info: *mut TaluFileInfo);
     // core/src/capi/file.zig
-    pub fn talu_file_inspect(
-        bytes: *const u8,
-        bytes_len: usize,
-        out_info: *mut TaluFileInfo,
-        out_image: *mut TaluImageInfo,
-    ) -> c_int;
+    pub fn talu_file_inspect(bytes: *const u8, bytes_len: usize, out_info: *mut TaluFileInfo, out_image: *mut TaluImageInfo) -> c_int;
     // core/src/capi/file.zig
-    pub fn talu_file_transform(
-        bytes: *const u8,
-        bytes_len: usize,
-        opts: *const TaluFileTransformOptions,
-        out_bytes: *mut c_void,
-        out_len: *mut c_void,
-        out_image: *mut TaluImageInfo,
-    ) -> c_int;
+    pub fn talu_file_transform(bytes: *const u8, bytes_len: usize, opts: *const TaluFileTransformOptions, out_bytes: *mut c_void, out_len: *mut c_void, out_image: *mut TaluImageInfo) -> c_int;
     // core/src/capi/template.zig
-    pub fn talu_free_spans(spans: COutputSpan, count: u32);
+    pub fn talu_free_spans(spans: *mut COutputSpan, count: u32);
     // core/src/capi/memory.zig
     pub fn talu_free_string(ptr: *mut u8, len: usize);
     // core/src/capi/agent/root.zig
-    pub fn talu_fs_create(
-        workspace_dir: *const c_char,
-        policy: *mut c_void,
-        out_handle: *mut c_void,
-    ) -> c_int;
+    pub fn talu_fs_create(workspace_dir: *const c_char, policy: *mut c_void, out_handle: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_fs_edit(
-        handle: *mut c_void,
-        path: *const c_char,
-        old_text: *const u8,
-        old_len: usize,
-        new_text: *const u8,
-        new_len: usize,
-        replace_all: bool,
-        out_replacements: *mut c_void,
-    ) -> c_int;
+    pub fn talu_fs_edit(handle: *mut c_void, path: *const c_char, old_text: *const u8, old_len: usize, new_text: *const u8, new_len: usize, replace_all: bool, out_replacements: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_fs_free(handle: *mut c_void);
     // core/src/capi/agent/root.zig
     pub fn talu_fs_free_string(ptr: *const u8, len: usize);
     // core/src/capi/agent/root.zig
-    pub fn talu_fs_list(
-        handle: *mut c_void,
-        path: *const c_char,
-        glob: *const c_char,
-        recursive: bool,
-        limit: usize,
-        out_json: *mut c_void,
-        out_json_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_fs_list(handle: *mut c_void, path: *const c_char, glob: *const c_char, recursive: bool, limit: usize, out_json: *mut c_void, out_json_len: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_fs_mkdir(handle: *mut c_void, path: *const c_char, recursive: bool) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_fs_read(
-        handle: *mut c_void,
-        path: *const c_char,
-        max_bytes: usize,
-        out_content: *mut c_void,
-        out_content_len: *mut c_void,
-        out_size: *mut c_void,
-        out_truncated: *mut c_void,
-    ) -> c_int;
+    pub fn talu_fs_read(handle: *mut c_void, path: *const c_char, max_bytes: usize, out_content: *mut c_void, out_content_len: *mut c_void, out_size: *mut c_void, out_truncated: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_fs_remove(handle: *mut c_void, path: *const c_char, recursive: bool) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_fs_rename(handle: *mut c_void, from: *const c_char, to: *const c_char) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_fs_stat(
-        handle: *mut c_void,
-        path: *const c_char,
-        out_stat: *mut TaluFsStat,
-    ) -> c_int;
+    pub fn talu_fs_stat(handle: *mut c_void, path: *const c_char, out_stat: *mut TaluFsStat) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_fs_write(
-        handle: *mut c_void,
-        path: *const c_char,
-        content: *const u8,
-        content_len: usize,
-        mkdir: bool,
-        out_bytes_written: *mut c_void,
-    ) -> c_int;
+    pub fn talu_fs_write(handle: *mut c_void, path: *const c_char, content: *const u8, content_len: usize, mkdir: bool, out_bytes_written: *mut c_void) -> c_int;
     // core/src/capi/template.zig
-    pub fn talu_get_chat_template_source(
-        model_path: *const c_char,
-        out_source: *mut c_void,
-    ) -> c_int;
+    pub fn talu_get_chat_template_source(model_path: *const c_char, out_source: *mut c_void) -> c_int;
     // core/src/capi/session.zig
     pub fn talu_get_eos_tokens(model_dir: *const c_char) -> EosTokenResult;
     // core/src/capi/session.zig
-    pub fn talu_get_generation_config(
-        model_dir: *const c_char,
-        out_config: *mut GenerationConfigInfo,
-    ) -> c_int;
+    pub fn talu_get_generation_config(model_dir: *const c_char, out_config: *mut GenerationConfigInfo) -> c_int;
     // core/src/capi/log.zig
     pub fn talu_get_log_format() -> c_int;
     // core/src/capi/log.zig
@@ -4909,36 +4321,17 @@ extern "C" {
     // core/src/capi/tensor.zig
     pub fn talu_hello() -> *const c_char;
     // core/src/capi/file.zig
-    pub fn talu_image_convert(
-        src: *const TaluImage,
-        opts: *const TaluImageConvertOptions,
-        out_image: *mut TaluImage,
-    ) -> c_int;
+    pub fn talu_image_convert(src: *const TaluImage, opts: *const TaluImageConvertOptions, out_image: *mut TaluImage) -> c_int;
     // core/src/capi/file.zig
-    pub fn talu_image_decode(
-        bytes: *const u8,
-        bytes_len: usize,
-        opts: *const TaluImageDecodeOptions,
-        out_image: *mut TaluImage,
-    ) -> c_int;
+    pub fn talu_image_decode(bytes: *const u8, bytes_len: usize, opts: *const TaluImageDecodeOptions, out_image: *mut TaluImage) -> c_int;
     // core/src/capi/file.zig
-    pub fn talu_image_encode(
-        src: *const TaluImage,
-        opts: *const TaluImageEncodeOptions,
-        out_bytes: *mut c_void,
-        out_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_image_encode(src: *const TaluImage, opts: *const TaluImageEncodeOptions, out_bytes: *mut c_void, out_len: *mut c_void) -> c_int;
     // core/src/capi/file.zig
     pub fn talu_image_encode_free(bytes: *mut u8, len: usize);
     // core/src/capi/file.zig
     pub fn talu_image_free(img: *mut TaluImage);
     // core/src/capi/file.zig
-    pub fn talu_image_to_model_input(
-        bytes: *const u8,
-        bytes_len: usize,
-        spec: *const TaluModelInputSpec,
-        out_buffer: *mut TaluModelBuffer,
-    ) -> c_int;
+    pub fn talu_image_to_model_input(bytes: *const u8, bytes_len: usize, spec: *const TaluModelInputSpec, out_buffer: *mut TaluModelBuffer) -> c_int;
     // core/src/capi/error.zig
     pub fn talu_last_error() -> *const c_char;
     // core/src/capi/error.zig
@@ -4948,34 +4341,13 @@ extern "C" {
     // core/src/capi/converter.zig
     pub fn talu_model_info_free(info: *mut ModelInfo);
     // core/src/capi/tokenizer.zig
-    pub fn talu_padded_tensor_result_free(
-        input_ids: *mut u32,
-        attention_mask: *mut u32,
-        num_sequences: usize,
-        padded_length: usize,
-    );
+    pub fn talu_padded_tensor_result_free(input_ids: *mut u32, attention_mask: *mut u32, num_sequences: usize, padded_length: usize);
     // core/src/capi/file.zig
-    pub fn talu_pdf_page_count(bytes: *const u8, bytes_len: usize, out_count: *mut c_void)
-        -> c_int;
+    pub fn talu_pdf_page_count(bytes: *const u8, bytes_len: usize, out_count: *mut c_void) -> c_int;
     // core/src/capi/file.zig
-    pub fn talu_pdf_render_page(
-        bytes: *const u8,
-        bytes_len: usize,
-        page_index: u32,
-        dpi: u32,
-        out_image: *mut TaluImage,
-    ) -> c_int;
+    pub fn talu_pdf_render_page(bytes: *const u8, bytes_len: usize, page_index: u32, dpi: u32, out_image: *mut TaluImage) -> c_int;
     // core/src/capi/file.zig
-    pub fn talu_pdf_transform_page(
-        bytes: *const u8,
-        bytes_len: usize,
-        page_index: u32,
-        dpi: u32,
-        opts: *const TaluFileTransformOptions,
-        out_bytes: *mut c_void,
-        out_len: *mut c_void,
-        out_image: *mut TaluImageInfo,
-    ) -> c_int;
+    pub fn talu_pdf_transform_page(bytes: *const u8, bytes_len: usize, page_index: u32, dpi: u32, opts: *const TaluFileTransformOptions, out_bytes: *mut c_void, out_len: *mut c_void, out_image: *mut TaluImageInfo) -> c_int;
     // core/src/capi/plugins.zig
     pub fn talu_plugins_list_count(list: *const CPluginList) -> u32;
     // core/src/capi/plugins.zig
@@ -4985,17 +4357,9 @@ extern "C" {
     // core/src/capi/plugins.zig
     pub fn talu_plugins_scan(plugins_dir: *const c_char, out_list: *mut *mut CPluginList) -> c_int;
     // core/src/capi/policy.zig
-    pub fn talu_policy_create(
-        json_ptr: *const u8,
-        json_len: usize,
-        out_policy: *mut c_void,
-    ) -> c_int;
+    pub fn talu_policy_create(json_ptr: *const u8, json_len: usize, out_policy: *mut c_void) -> c_int;
     // core/src/capi/policy.zig
-    pub fn talu_policy_evaluate(
-        handle: *mut c_void,
-        action_ptr: *const u8,
-        action_len: usize,
-    ) -> u8;
+    pub fn talu_policy_evaluate(handle: *mut c_void, action_ptr: *const u8, action_len: usize) -> u8;
     // core/src/capi/policy.zig
     pub fn talu_policy_free(handle: *mut c_void);
     // core/src/capi/policy.zig
@@ -5005,45 +4369,25 @@ extern "C" {
     // core/src/capi/agent/root.zig
     pub fn talu_process_close(process_handle: *mut c_void);
     // core/src/capi/agent/root.zig
-    pub fn talu_process_exit_code(
-        process_handle: *mut c_void,
-        out_code: *mut c_void,
-        out_has_code: *mut c_void,
-    ) -> c_int;
+    pub fn talu_process_exit_code(process_handle: *mut c_void, out_code: *mut c_void, out_has_code: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_process_open(
-        command: *const c_char,
-        cwd: *const c_char,
-        policy: *mut c_void,
-        out_process: *mut c_void,
-    ) -> c_int;
+    pub fn talu_process_open(command: *const c_char, cwd: *const c_char, policy: *mut c_void, runtime_mode: c_int, sandbox_backend: c_int, out_process: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_process_read(
-        process_handle: *mut c_void,
-        buf: *mut u8,
-        buf_len: usize,
-        out_read: *mut c_void,
-    ) -> c_int;
+    pub fn talu_process_read(process_handle: *mut c_void, buf: *mut u8, buf_len: usize, out_read: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_process_signal(process_handle: *mut c_void, sig: u8) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_process_write(process_handle: *mut c_void, data: *const u8, len: usize) -> c_int;
     // core/src/capi/provider_config.zig
-    pub fn talu_provider_config_health(
-        db_root: *const c_char,
-        name: *const c_char,
-    ) -> CProviderHealthResult;
+    pub fn talu_provider_config_health(db_root: *const c_char, name: *const c_char) -> CProviderHealthResult;
     // core/src/capi/provider_config.zig
-    pub fn talu_provider_config_health_free(result: CProviderHealthResult);
+    pub fn talu_provider_config_health_free(result: *mut CProviderHealthResult);
     // core/src/capi/provider_config.zig
     pub fn talu_provider_config_list(db_root: *const c_char) -> CProviderConfigList;
     // core/src/capi/provider_config.zig
-    pub fn talu_provider_config_list_free(list: CProviderConfigList);
+    pub fn talu_provider_config_list_free(list: *mut CProviderConfigList);
     // core/src/capi/provider_config.zig
-    pub fn talu_provider_config_list_provider_models(
-        db_root: *const c_char,
-        name: *const c_char,
-    ) -> *mut c_void;
+    pub fn talu_provider_config_list_provider_models(db_root: *const c_char, name: *const c_char) -> *mut c_void;
     // core/src/capi/provider_config.zig
     pub fn talu_provider_config_list_provider_models_free(result: *mut CRemoteModelListResult);
     // core/src/capi/provider_config.zig
@@ -5051,20 +4395,11 @@ extern "C" {
     // core/src/capi/provider_config.zig
     pub fn talu_provider_config_list_remote_models_free(result: *mut CRemoteModelListResult);
     // core/src/capi/provider_config.zig
-    pub fn talu_provider_config_resolve_credentials(
-        db_root: *const c_char,
-        name: *const c_char,
-    ) -> CProviderCredentials;
+    pub fn talu_provider_config_resolve_credentials(db_root: *const c_char, name: *const c_char) -> CProviderCredentials;
     // core/src/capi/provider_config.zig
-    pub fn talu_provider_config_resolve_credentials_free(creds: CProviderCredentials);
+    pub fn talu_provider_config_resolve_credentials_free(creds: *mut CProviderCredentials);
     // core/src/capi/provider_config.zig
-    pub fn talu_provider_config_set(
-        db_root: *const c_char,
-        name: *const c_char,
-        enabled: *mut c_void,
-        api_key: *const c_char,
-        base_url: *const c_char,
-    ) -> c_int;
+    pub fn talu_provider_config_set(db_root: *const c_char, name: *const c_char, enabled: *mut c_void, api_key: *const c_char, base_url: *const c_char) -> c_int;
     // core/src/capi/provider.zig
     pub fn talu_provider_count() -> usize;
     // core/src/capi/provider.zig
@@ -5074,12 +4409,7 @@ extern "C" {
     // core/src/capi/provider.zig
     pub fn talu_provider_has_prefix(model_id: *const c_char) -> c_int;
     // core/src/capi/provider.zig
-    pub fn talu_provider_parse(
-        model_id: *const c_char,
-        provider_out: *mut CProviderInfo,
-        model_id_start: *mut c_void,
-        model_id_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_provider_parse(model_id: *const c_char, provider_out: *mut CProviderInfo, model_id_start: *mut c_void, model_id_len: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_cache_dir_exists(model_id: *const c_char) -> c_int;
     // core/src/capi/repository.zig
@@ -5087,26 +4417,13 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_exists(model_id: *const c_char, token: *const c_char) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_fetch(
-        model_id: *const c_char,
-        options: *mut DownloadOptions,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_fetch(model_id: *const c_char, options: *mut DownloadOptions, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_fetch_file(
-        model_id: *const c_char,
-        filename: *const c_char,
-        options: *mut DownloadOptions,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_fetch_file(model_id: *const c_char, filename: *const c_char, options: *mut DownloadOptions, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_get_cache_dir(model_id: *const c_char, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_get_cached_path(
-        model_id: *const c_char,
-        require_weights: bool,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_get_cached_path(model_id: *const c_char, require_weights: bool, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_get_hf_home(out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
@@ -5116,24 +4433,15 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_is_model_id(path: *const c_char) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_list(
-        model_path: *const c_char,
-        token: *const c_char,
-        out: *mut *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_list(model_path: *const c_char, token: *const c_char, out: *mut *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_list_count(list: *mut CachedModelList) -> usize;
     // core/src/capi/repository.zig
     pub fn talu_repo_list_free(list: *mut CachedModelList);
     // core/src/capi/repository.zig
-    pub fn talu_repo_list_get_id(list: *mut CachedModelList, idx: usize, out: *mut c_void)
-        -> c_int;
+    pub fn talu_repo_list_get_id(list: *mut CachedModelList, idx: usize, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_list_get_path(
-        list: *mut CachedModelList,
-        idx: usize,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_list_get_path(list: *mut CachedModelList, idx: usize, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_list_get_source(list: *mut CachedModelList, idx: usize) -> u8;
     // core/src/capi/repository.zig
@@ -5143,40 +4451,23 @@ extern "C" {
     // core/src/capi/repo_meta.zig
     pub fn talu_repo_meta_free(handle: *mut c_void);
     // core/src/capi/repo_meta.zig
-    pub fn talu_repo_meta_free_list(list: CPinList);
+    pub fn talu_repo_meta_free_list(list: *mut CPinList);
     // core/src/capi/repo_meta.zig
     pub fn talu_repo_meta_init(db_path: *const c_char, out_handle: *mut c_void) -> c_int;
     // core/src/capi/repo_meta.zig
-    pub fn talu_repo_meta_list_pins(handle: *mut c_void, out_list: CPinList) -> c_int;
+    pub fn talu_repo_meta_list_pins(handle: *mut c_void, out_list: *mut CPinList) -> c_int;
     // core/src/capi/repo_meta.zig
     pub fn talu_repo_meta_pin(handle: *mut c_void, model_uri: *const c_char) -> c_int;
     // core/src/capi/repo_meta.zig
     pub fn talu_repo_meta_unpin(handle: *mut c_void, model_uri: *const c_char) -> c_int;
     // core/src/capi/repo_meta.zig
-    pub fn talu_repo_meta_update_size(
-        handle: *mut c_void,
-        model_uri: *const c_char,
-        size_bytes: u64,
-    ) -> c_int;
+    pub fn talu_repo_meta_update_size(handle: *mut c_void, model_uri: *const c_char, size_bytes: u64) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_mtime(model_id: *const c_char) -> i64;
     // core/src/capi/repository.zig
-    pub fn talu_repo_resolve_path(
-        uri: *const c_char,
-        offline: bool,
-        token: *const c_char,
-        endpoint_url: *const c_char,
-        require_weights: bool,
-        out_path: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_resolve_path(uri: *const c_char, offline: bool, token: *const c_char, endpoint_url: *const c_char, require_weights: bool, out_path: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_search(
-        query: *const c_char,
-        limit: usize,
-        token: *const c_char,
-        endpoint_url: *const c_char,
-        out: *mut *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_search(query: *const c_char, limit: usize, token: *const c_char, endpoint_url: *const c_char, out: *mut *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_search_result_count(list: *mut c_void) -> usize;
     // core/src/capi/repository.zig
@@ -5184,36 +4475,17 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_search_result_get_downloads(list: *mut c_void, idx: usize) -> i64;
     // core/src/capi/repository.zig
-    pub fn talu_repo_search_result_get_id(list: *mut c_void, idx: usize, out: *mut c_void)
-        -> c_int;
+    pub fn talu_repo_search_result_get_id(list: *mut c_void, idx: usize, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_search_result_get_last_modified(
-        list: *mut c_void,
-        idx: usize,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_search_result_get_last_modified(list: *mut c_void, idx: usize, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_search_result_get_likes(list: *mut c_void, idx: usize) -> i64;
     // core/src/capi/repository.zig
     pub fn talu_repo_search_result_get_params(list: *mut c_void, idx: usize) -> i64;
     // core/src/capi/repository.zig
-    pub fn talu_repo_search_result_get_pipeline_tag(
-        list: *mut c_void,
-        idx: usize,
-        out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_search_result_get_pipeline_tag(list: *mut c_void, idx: usize, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_search_rich(
-        query: *const c_char,
-        limit: usize,
-        token: *const c_char,
-        endpoint_url: *const c_char,
-        filter: *const c_char,
-        sort: u8,
-        direction: u8,
-        library: *const c_char,
-        out: *mut *mut c_void,
-    ) -> c_int;
+    pub fn talu_repo_search_rich(query: *const c_char, limit: usize, token: *const c_char, endpoint_url: *const c_char, filter: *const c_char, sort: u8, direction: u8, library: *const c_char, out: *mut *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_size(model_id: *const c_char) -> u64;
     // core/src/capi/repository.zig
@@ -5227,42 +4499,15 @@ extern "C" {
     // core/src/capi/session.zig
     pub fn talu_resolve_model_path(model_path: *const c_char, out_path: *mut c_void) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_append_function_call(
-        handle: *mut ResponsesHandle,
-        call_id: *const c_char,
-        name: *const c_char,
-        arguments_ptr: *const u8,
-        arguments_len: usize,
-    ) -> i64;
+    pub fn talu_responses_append_function_call(handle: *mut ResponsesHandle, call_id: *const c_char, name: *const c_char, arguments_ptr: *const u8, arguments_len: usize) -> i64;
     // core/src/capi/responses.zig
-    pub fn talu_responses_append_function_call_output(
-        handle: *mut ResponsesHandle,
-        call_id: *const c_char,
-        output_ptr: *const u8,
-        output_len: usize,
-    ) -> i64;
+    pub fn talu_responses_append_function_call_output(handle: *mut ResponsesHandle, call_id: *const c_char, output_ptr: *const u8, output_len: usize) -> i64;
     // core/src/capi/responses.zig
-    pub fn talu_responses_append_message(
-        handle: *mut ResponsesHandle,
-        role: u8,
-        content_ptr: *const u8,
-        content_len: usize,
-    ) -> i64;
+    pub fn talu_responses_append_message(handle: *mut ResponsesHandle, role: u8, content_ptr: *const u8, content_len: usize) -> i64;
     // core/src/capi/responses.zig
-    pub fn talu_responses_append_message_hidden(
-        handle: *mut ResponsesHandle,
-        role: u8,
-        content_ptr: *const u8,
-        content_len: usize,
-        hidden: bool,
-    ) -> i64;
+    pub fn talu_responses_append_message_hidden(handle: *mut ResponsesHandle, role: u8, content_ptr: *const u8, content_len: usize, hidden: bool) -> i64;
     // core/src/capi/responses.zig
-    pub fn talu_responses_append_text_content(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        content_ptr: *const u8,
-        content_len: usize,
-    ) -> c_int;
+    pub fn talu_responses_append_text_content(handle: *mut ResponsesHandle, item_index: usize, content_ptr: *const u8, content_len: usize) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_begin_fork(handle: *mut ResponsesHandle) -> u64;
     // core/src/capi/responses.zig
@@ -5270,18 +4515,9 @@ extern "C" {
     // core/src/capi/responses.zig
     pub fn talu_responses_clear_keeping_system(handle: *mut ResponsesHandle);
     // core/src/capi/responses.zig
-    pub fn talu_responses_clone(
-        dest_handle: *mut ResponsesHandle,
-        source_handle: *mut ResponsesHandle,
-        batch_size: usize,
-    ) -> c_int;
+    pub fn talu_responses_clone(dest_handle: *mut ResponsesHandle, source_handle: *mut ResponsesHandle, batch_size: usize) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_clone_prefix(
-        dest_handle: *mut ResponsesHandle,
-        source_handle: *mut ResponsesHandle,
-        last_index: usize,
-        batch_size: usize,
-    ) -> c_int;
+    pub fn talu_responses_clone_prefix(dest_handle: *mut ResponsesHandle, source_handle: *mut ResponsesHandle, last_index: usize, batch_size: usize) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_create() -> *mut ResponsesHandle;
     // core/src/capi/responses.zig
@@ -5291,160 +4527,61 @@ extern "C" {
     // core/src/capi/responses.zig
     pub fn talu_responses_free(handle: *mut ResponsesHandle);
     // core/src/capi/responses.zig
-    pub fn talu_responses_get_item(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CItem,
-    ) -> c_int;
+    pub fn talu_responses_get_item(handle: *mut ResponsesHandle, index: usize, out: *mut CItem) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_insert_message(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        role: u8,
-        content_ptr: *const u8,
-        content_len: usize,
-    ) -> i64;
+    pub fn talu_responses_insert_message(handle: *mut ResponsesHandle, index: usize, role: u8, content_ptr: *const u8, content_len: usize) -> i64;
     // core/src/capi/responses.zig
-    pub fn talu_responses_insert_message_hidden(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        role: u8,
-        content_ptr: *const u8,
-        content_len: usize,
-        hidden: bool,
-    ) -> i64;
+    pub fn talu_responses_insert_message_hidden(handle: *mut ResponsesHandle, index: usize, role: u8, content_ptr: *const u8, content_len: usize, hidden: bool) -> i64;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_as_function_call(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CFunctionCallItem,
-    ) -> c_int;
+    pub fn talu_responses_item_as_function_call(handle: *mut ResponsesHandle, index: usize, out: *mut CFunctionCallItem) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_as_function_call_output(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CFunctionCallOutputItem,
-    ) -> c_int;
+    pub fn talu_responses_item_as_function_call_output(handle: *mut ResponsesHandle, index: usize, out: *mut CFunctionCallOutputItem) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_as_item_reference(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CItemReferenceItem,
-    ) -> c_int;
+    pub fn talu_responses_item_as_item_reference(handle: *mut ResponsesHandle, index: usize, out: *mut CItemReferenceItem) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_as_message(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CMessageItem,
-    ) -> c_int;
+    pub fn talu_responses_item_as_message(handle: *mut ResponsesHandle, index: usize, out: *mut CMessageItem) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_as_reasoning(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out: *mut CReasoningItem,
-    ) -> c_int;
+    pub fn talu_responses_item_as_reasoning(handle: *mut ResponsesHandle, index: usize, out: *mut CReasoningItem) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_item_count(handle: *mut ResponsesHandle) -> usize;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_fco_get_part(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        part_index: usize,
-        out: *mut CContentPart,
-    ) -> c_int;
+    pub fn talu_responses_item_fco_get_part(handle: *mut ResponsesHandle, item_index: usize, part_index: usize, out: *mut CContentPart) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_get_generation_json(
-        handle: *mut ResponsesHandle,
-        index: usize,
-        out_ptr: *mut c_void,
-        out_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_responses_item_get_generation_json(handle: *mut ResponsesHandle, index: usize, out_ptr: *mut c_void, out_len: *mut c_void) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_message_content_count(
-        handle: *mut ResponsesHandle,
-        index: usize,
-    ) -> usize;
+    pub fn talu_responses_item_message_content_count(handle: *mut ResponsesHandle, index: usize) -> usize;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_message_get_content(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        part_index: usize,
-        out: *mut CContentPart,
-    ) -> c_int;
+    pub fn talu_responses_item_message_get_content(handle: *mut ResponsesHandle, item_index: usize, part_index: usize, out: *mut CContentPart) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_reasoning_content_count(
-        handle: *mut ResponsesHandle,
-        index: usize,
-    ) -> usize;
+    pub fn talu_responses_item_reasoning_content_count(handle: *mut ResponsesHandle, index: usize) -> usize;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_reasoning_get_content(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        part_index: usize,
-        out: *mut CContentPart,
-    ) -> c_int;
+    pub fn talu_responses_item_reasoning_get_content(handle: *mut ResponsesHandle, item_index: usize, part_index: usize, out: *mut CContentPart) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_reasoning_get_summary(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        part_index: usize,
-        out: *mut CContentPart,
-    ) -> c_int;
+    pub fn talu_responses_item_reasoning_get_summary(handle: *mut ResponsesHandle, item_index: usize, part_index: usize, out: *mut CContentPart) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_item_reasoning_summary_count(
-        handle: *mut ResponsesHandle,
-        index: usize,
-    ) -> usize;
+    pub fn talu_responses_item_reasoning_summary_count(handle: *mut ResponsesHandle, index: usize) -> usize;
     // core/src/capi/responses.zig
     pub fn talu_responses_item_type(handle: *mut ResponsesHandle, index: usize) -> u8;
     // core/src/capi/responses.zig
-    pub fn talu_responses_load_completions_json(
-        handle: *mut ResponsesHandle,
-        json: *const c_char,
-    ) -> c_int;
+    pub fn talu_responses_load_completions_json(handle: *mut ResponsesHandle, json: *const c_char) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_load_responses_json(
-        handle: *mut ResponsesHandle,
-        json: *const c_char,
-    ) -> c_int;
+    pub fn talu_responses_load_responses_json(handle: *mut ResponsesHandle, json: *const c_char) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_load_storage_records(
-        handle: *mut ResponsesHandle,
-        records_ptr: *const CStorageRecord,
-        records_len: usize,
-    ) -> c_int;
+    pub fn talu_responses_load_storage_records(handle: *mut ResponsesHandle, records_ptr: *const CStorageRecord, records_len: usize) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_pop(handle: *mut ResponsesHandle) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_remove(handle: *mut ResponsesHandle, index: usize) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_set_item_parent(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        parent_item_id: u64,
-        has_parent: bool,
-    ) -> c_int;
+    pub fn talu_responses_set_item_parent(handle: *mut ResponsesHandle, item_index: usize, parent_item_id: u64, has_parent: bool) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_set_item_status(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        status: u8,
-    ) -> c_int;
+    pub fn talu_responses_set_item_status(handle: *mut ResponsesHandle, item_index: usize, status: u8) -> c_int;
     // core/src/capi/responses.zig
-    pub fn talu_responses_set_item_validation_flags(
-        handle: *mut ResponsesHandle,
-        item_index: usize,
-        json_valid: bool,
-        schema_valid: bool,
-        repaired: bool,
-    ) -> c_int;
+    pub fn talu_responses_set_item_validation_flags(handle: *mut ResponsesHandle, item_index: usize, json_valid: bool, schema_valid: bool, repaired: bool) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_to_completions_json(handle: *mut ResponsesHandle) -> *const c_char;
     // core/src/capi/responses.zig
-    pub fn talu_responses_to_responses_json(
-        handle: *mut ResponsesHandle,
-        direction: u8,
-    ) -> *const c_char;
+    pub fn talu_responses_to_responses_json(handle: *mut ResponsesHandle, direction: u8) -> *const c_char;
     // core/src/capi/responses.zig
     pub fn talu_responses_truncate_after(handle: *mut ResponsesHandle, last_index: usize) -> c_int;
     // core/src/capi/responses.zig
@@ -5452,34 +4589,15 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_router_close_all();
     // core/src/capi/router.zig
-    pub fn talu_router_create_iterator(
-        chat_handle: *mut c_void,
-        parts: *const GenerateContentPart,
-        num_parts: usize,
-        backend: *mut c_void,
-        config: *const CGenerateConfig,
-    ) -> *mut c_void;
+    pub fn talu_router_create_iterator(chat_handle: *mut c_void, parts: *const GenerateContentPart, num_parts: usize, backend: *mut c_void, config: *const CGenerateConfig) -> *mut c_void;
     // core/src/capi/router.zig
-    pub fn talu_router_embed(
-        model: *const c_char,
-        text: *const c_char,
-        pooling: CPoolingStrategy,
-        normalize: bool,
-        out_embedding: *mut c_void,
-        out_dim: *mut c_void,
-    ) -> c_int;
+    pub fn talu_router_embed(model: *const c_char, text: *const c_char, pooling: CPoolingStrategy, normalize: bool, out_embedding: *mut c_void, out_dim: *mut c_void) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_router_embedding_dim(model: *const c_char) -> usize;
     // core/src/capi/router.zig
     pub fn talu_router_embedding_free(embedding: *const f32, dim: usize);
     // core/src/capi/router.zig
-    pub fn talu_router_generate_with_backend(
-        chat_handle: *mut c_void,
-        parts: *const GenerateContentPart,
-        num_parts: usize,
-        backend: *mut c_void,
-        config: *const CGenerateConfig,
-    ) -> CGenerateResult;
+    pub fn talu_router_generate_with_backend(chat_handle: *mut c_void, parts: *const GenerateContentPart, num_parts: usize, backend: *mut c_void, config: *const CGenerateConfig) -> CGenerateResult;
     // core/src/capi/router.zig
     pub fn talu_router_iterator_cancel(iterator: *mut c_void);
     // core/src/capi/router.zig
@@ -5509,12 +4627,7 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_router_result_free(result: *mut CGenerateResult);
     // core/src/capi/validate.zig
-    pub fn talu_semantic_validator_check(
-        handle: *mut c_void,
-        json_str: *const u8,
-        json_len: usize,
-        out_violation: SemanticViolationC,
-    ) -> c_int;
+    pub fn talu_semantic_validator_check(handle: *mut c_void, json_str: *const u8, json_len: usize, out_violation: *mut SemanticViolationC) -> c_int;
     // core/src/capi/validate.zig
     pub fn talu_semantic_validator_create(schema_json: *const c_char) -> *mut c_void;
     // core/src/capi/validate.zig
@@ -5530,163 +4643,55 @@ extern "C" {
     // core/src/capi/log.zig
     pub fn talu_set_log_level(level: c_int);
     // core/src/capi/validate.zig
-    pub fn talu_set_response_format(
-        chat_handle: *mut c_void,
-        schema_json: *const c_char,
-        config: ValidateConfigC,
-        stop_tokens: *const u32,
-        stop_tokens_len: usize,
-        prefix_token_ids: *const u32,
-        prefix_token_ids_len: usize,
-    ) -> c_int;
+    pub fn talu_set_response_format(chat_handle: *mut c_void, schema_json: *const c_char, config: *const ValidateConfigC, stop_tokens: *const u32, stop_tokens_len: usize, prefix_token_ids: *const u32, prefix_token_ids_len: usize) -> c_int;
     // core/src/capi/validate.zig
-    pub fn talu_set_response_format_handle(
-        chat_handle: *mut c_void,
-        grammar_handle: *mut c_void,
-        config: ValidateConfigC,
-        stop_tokens: *const u32,
-        stop_tokens_len: usize,
-        prefix_token_ids: *const u32,
-        prefix_token_ids_len: usize,
-    ) -> c_int;
+    pub fn talu_set_response_format_handle(chat_handle: *mut c_void, grammar_handle: *mut c_void, config: *const ValidateConfigC, stop_tokens: *const u32, stop_tokens_len: usize, prefix_token_ids: *const u32, prefix_token_ids_len: usize) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_shell_alive(shell_handle: *mut c_void) -> bool;
     // core/src/capi/agent/root.zig
-    pub fn talu_shell_check_command(
-        command: *const c_char,
-        out_allowed: *mut c_void,
-        out_reason: *mut c_void,
-        out_reason_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_shell_check_command(command: *const c_char, out_allowed: *mut c_void, out_reason: *mut c_void, out_reason_len: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_shell_close(shell_handle: *mut c_void);
     // core/src/capi/agent/root.zig
-    pub fn talu_shell_default_policy_json(
-        out_json: *mut c_void,
-        out_json_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_shell_default_policy_json(out_json: *mut c_void, out_json_len: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_shell_exec(
-        command: *const c_char,
-        cwd: *const c_char,
-        policy: *mut c_void,
-        out_stdout: *mut c_void,
-        out_stdout_len: *mut c_void,
-        out_stderr: *mut c_void,
-        out_stderr_len: *mut c_void,
-        out_exit_code: *mut c_void,
-    ) -> c_int;
+    pub fn talu_shell_exec(command: *const c_char, cwd: *const c_char, policy: *mut c_void, runtime_mode: c_int, sandbox_backend: c_int, out_stdout: *mut c_void, out_stdout_len: *mut c_void, out_stderr: *mut c_void, out_stderr_len: *mut c_void, out_exit_code: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_shell_exec_streaming(
-        command: *const c_char,
-        cwd: *const c_char,
-        policy: *mut c_void,
-        timeout_ms: u64,
-        on_stdout: *mut c_void,
-        on_stdout_ctx: *mut c_void,
-        on_stderr: *mut c_void,
-        on_stderr_ctx: *mut c_void,
-        out_exit_code: *mut c_void,
-    ) -> c_int;
+    pub fn talu_shell_exec_streaming(command: *const c_char, cwd: *const c_char, policy: *mut c_void, runtime_mode: c_int, sandbox_backend: c_int, timeout_ms: u64, on_stdout: *mut c_void, on_stdout_ctx: *mut c_void, on_stderr: *mut c_void, on_stderr_ctx: *mut c_void, out_exit_code: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_shell_free_string(ptr: *const u8, len: usize);
     // core/src/capi/agent/root.zig
-    pub fn talu_shell_normalize_command(
-        command: *const c_char,
-        out_normalized: *mut c_void,
-        out_normalized_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_shell_normalize_command(command: *const c_char, out_normalized: *mut c_void, out_normalized_len: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_shell_open(
-        cols: u16,
-        rows: u16,
-        cwd: *const c_char,
-        policy: *mut c_void,
-        out_shell: *mut c_void,
-    ) -> c_int;
+    pub fn talu_shell_open(cols: u16, rows: u16, cwd: *const c_char, policy: *mut c_void, runtime_mode: c_int, sandbox_backend: c_int, out_shell: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_shell_read(
-        shell_handle: *mut c_void,
-        buf: *mut u8,
-        buf_len: usize,
-        out_read: *mut c_void,
-    ) -> c_int;
+    pub fn talu_shell_read(shell_handle: *mut c_void, buf: *mut u8, buf_len: usize, out_read: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_shell_resize(shell_handle: *mut c_void, cols: u16, rows: u16) -> c_int;
     // core/src/capi/agent/root.zig
-    pub fn talu_shell_scrollback(
-        shell_handle: *mut c_void,
-        out_data: *mut c_void,
-        out_len: *mut c_void,
-    ) -> c_int;
+    pub fn talu_shell_scrollback(shell_handle: *mut c_void, out_data: *mut c_void, out_len: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_shell_signal(shell_handle: *mut c_void, sig: u8) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_shell_write(shell_handle: *mut c_void, data: *const u8, len: usize) -> c_int;
     // core/src/capi/sql.zig
-    pub fn talu_sql_query(
-        db_path: *const c_char,
-        query: *const c_char,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_sql_query(db_path: *const c_char, query: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/sql.zig
     pub fn talu_sql_query_free(ptr: *const c_char);
     // core/src/capi/sql.zig
-    pub fn talu_sql_query_params(
-        db_path: *const c_char,
-        query: *const c_char,
-        params: *const CSqlParam,
-        num_params: u32,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_sql_query_params(db_path: *const c_char, query: *const c_char, params: *const CSqlParam, num_params: u32, out_json: *mut c_void) -> c_int;
     // core/src/capi/error.zig
-    pub fn talu_take_last_error(
-        out_buf: *mut u8,
-        out_buf_size: usize,
-        out_code: *mut c_void,
-    ) -> usize;
+    pub fn talu_take_last_error(out_buf: *mut u8, out_buf_size: usize, out_code: *mut c_void) -> usize;
     // core/src/capi/template.zig
-    pub fn talu_template_render(
-        template_str: *const c_char,
-        json_vars: *const c_char,
-        strict: bool,
-        out_rendered: *mut c_void,
-    ) -> c_int;
+    pub fn talu_template_render(template_str: *const c_char, json_vars: *const c_char, strict: bool, out_rendered: *mut c_void) -> c_int;
     // core/src/capi/template.zig
-    pub fn talu_template_render_debug(
-        template_str: *const c_char,
-        json_vars: *const c_char,
-        strict: bool,
-        out_rendered: *mut c_void,
-        out_spans: *mut c_void,
-        out_span_count: *mut c_void,
-    ) -> c_int;
+    pub fn talu_template_render_debug(template_str: *const c_char, json_vars: *const c_char, strict: bool, out_rendered: *mut c_void, out_spans: *mut c_void, out_span_count: *mut c_void) -> c_int;
     // core/src/capi/template.zig
-    pub fn talu_template_render_with_filters(
-        template_str: *const c_char,
-        json_vars: *const c_char,
-        strict: bool,
-        filter_names: *const *const c_char,
-        filter_callbacks: *mut c_void,
-        filter_user_data: *mut c_void,
-        num_filters: usize,
-        out_rendered: *mut c_void,
-    ) -> c_int;
+    pub fn talu_template_render_with_filters(template_str: *const c_char, json_vars: *const c_char, strict: bool, filter_names: *const *const c_char, filter_callbacks: *mut c_void, filter_user_data: *mut c_void, num_filters: usize, out_rendered: *mut c_void) -> c_int;
     // core/src/capi/template.zig
-    pub fn talu_template_validate(
-        template_str: *const c_char,
-        json_vars: *const c_char,
-        out_result_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_template_validate(template_str: *const c_char, json_vars: *const c_char, out_result_json: *mut c_void) -> c_int;
     // core/src/capi/tensor.zig
-    pub fn talu_tensor_create(
-        shape_ptr: *mut c_void,
-        ndim: usize,
-        dtype: u32,
-        device_type: c_int,
-        device_id: c_int,
-        out_tensor: *mut c_void,
-    ) -> c_int;
+    pub fn talu_tensor_create(shape_ptr: *mut c_void, ndim: usize, dtype: u32, device_type: c_int, device_id: c_int, out_tensor: *mut c_void) -> c_int;
     // core/src/capi/tensor.zig
     pub fn talu_tensor_data_ptr(t: *mut c_void, out_ptr: *mut c_void) -> c_int;
     // core/src/capi/tensor.zig
@@ -5716,20 +4721,11 @@ extern "C" {
     // core/src/capi/tensor.zig
     pub fn talu_tensor_typestr(t: *mut c_void) -> *const c_char;
     // core/src/capi/tensor.zig
-    pub fn talu_tensor_zeros(
-        shape_ptr: *mut c_void,
-        ndim: usize,
-        dtype: u32,
-        out_tensor: *mut c_void,
-    ) -> c_int;
+    pub fn talu_tensor_zeros(shape_ptr: *mut c_void, ndim: usize, dtype: u32, out_tensor: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
     pub fn talu_text_free(text: *const c_char);
     // core/src/capi/validate.zig
-    pub fn talu_token_mask_apply(
-        mask_handle: *mut c_void,
-        logits: *const f32,
-        logits_len: usize,
-    ) -> c_int;
+    pub fn talu_token_mask_apply(mask_handle: *mut c_void, logits: *const f32, logits_len: usize) -> c_int;
     // core/src/capi/validate.zig
     pub fn talu_token_mask_clear(mask_handle: *mut c_void);
     // core/src/capi/validate.zig
@@ -5751,44 +4747,19 @@ extern "C" {
     // core/src/capi/validate.zig
     pub fn talu_token_mask_set_all(mask_handle: *mut c_void);
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenize_bytes_result_free(
-        data: *mut u8,
-        data_len: usize,
-        offsets: *mut usize,
-        num_tokens: usize,
-    );
+    pub fn talu_tokenize_bytes_result_free(data: *mut u8, data_len: usize, offsets: *mut usize, num_tokens: usize);
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenize_result_free(tokens: *mut *mut c_char, num_tokens: usize);
+    pub fn talu_tokenize_result_free(tokens: *const *const c_char, num_tokens: usize);
     // core/src/capi/tokenizer.zig
     pub fn talu_tokenizer_create(model_path: *const c_char, out_tokenizer: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_create_from_json(
-        json_ptr: *const u8,
-        json_len: usize,
-        out_tokenizer: *mut c_void,
-    ) -> c_int;
+    pub fn talu_tokenizer_create_from_json(json_ptr: *const u8, json_len: usize, out_tokenizer: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_decode(
-        handle: *mut c_void,
-        tokens: *const u32,
-        num_tokens: usize,
-        options: DecodeOptionsC,
-    ) -> DecodeResult;
+    pub fn talu_tokenizer_decode(handle: *mut c_void, tokens: *const u32, num_tokens: usize, options: *const DecodeOptionsC) -> DecodeResult;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_encode(
-        handle: *mut c_void,
-        text: *const u8,
-        text_len: usize,
-        options: EncodeOptions,
-    ) -> EncodeResult;
+    pub fn talu_tokenizer_encode(handle: *mut c_void, text: *const u8, text_len: usize, options: *const EncodeOptions) -> EncodeResult;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_encode_batch(
-        handle: *mut c_void,
-        texts: *const u8,
-        lengths: *const usize,
-        num_texts: usize,
-        options: EncodeOptions,
-    ) -> BatchEncodeResult;
+    pub fn talu_tokenizer_encode_batch(handle: *mut c_void, texts: *const *const u8, lengths: *const usize, num_texts: usize, options: *const EncodeOptions) -> BatchEncodeResult;
     // core/src/capi/tokenizer.zig
     pub fn talu_tokenizer_free(handle: *mut c_void);
     // core/src/capi/tokenizer.zig
@@ -5804,187 +4775,101 @@ extern "C" {
     // core/src/capi/tokenizer.zig
     pub fn talu_tokenizer_get_vocab_size(handle: *mut c_void) -> usize;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_id_to_token(
-        handle: *mut c_void,
-        token_id: c_int,
-        out_token: *mut c_void,
-    ) -> c_int;
+    pub fn talu_tokenizer_id_to_token(handle: *mut c_void, token_id: c_int, out_token: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_token_to_id(
-        handle: *mut c_void,
-        token: *const u8,
-        token_len: usize,
-    ) -> c_int;
+    pub fn talu_tokenizer_token_to_id(handle: *mut c_void, token: *const u8, token_len: usize) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_tokenize(
-        handle: *mut c_void,
-        text: *const u8,
-        text_len: usize,
-    ) -> TokenizeResult;
+    pub fn talu_tokenizer_tokenize(handle: *mut c_void, text: *const u8, text_len: usize) -> TokenizeResult;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokenizer_tokenize_bytes(
-        handle: *mut c_void,
-        text: *const u8,
-        text_len: usize,
-    ) -> TokenizeBytesResult;
+    pub fn talu_tokenizer_tokenize_bytes(handle: *mut c_void, text: *const u8, text_len: usize) -> TokenizeBytesResult;
     // core/src/capi/tokenizer.zig
-    pub fn talu_tokens_concat(
-        tokens_a: *const u32,
-        num_a: usize,
-        tokens_b: *const u32,
-        num_b: usize,
-    ) -> *mut u32;
+    pub fn talu_tokens_concat(tokens_a: *const u32, num_a: usize, tokens_b: *const u32, num_b: usize) -> *mut u32;
     // core/src/capi/tokenizer.zig
     pub fn talu_tokens_free(tokens: *mut u32, num_tokens: usize);
+    // core/src/capi/train.zig
+    pub fn talu_train_configure(handle: *mut c_void, config: *mut c_void) -> c_int;
+    // core/src/capi/train.zig
+    pub fn talu_train_create(out: *mut c_void) -> c_int;
+    // core/src/capi/train.zig
+    pub fn talu_train_destroy(handle: *mut c_void);
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_configure(handle: *mut c_void, config: *const CFullSessionConfig) -> c_int;
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_create(out: *mut c_void) -> c_int;
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_destroy(handle: *mut c_void);
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_get_info(handle: *mut c_void, out_info: *mut CFullSessionInfo) -> c_int;
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_init_model(handle: *mut c_void, config: *const CTransformerConfig, seed: u64) -> c_int;
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_load_data(handle: *mut c_void, data_path: *const c_char) -> c_int;
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_run(handle: *mut c_void, callback: *mut c_void, user_data: *mut c_void) -> c_int;
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_set_data(handle: *mut c_void, tokens_ptr: *const u32, tokens_len: usize) -> c_int;
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_step(handle: *mut c_void, out_metrics: *mut c_void) -> c_int;
+    // core/src/capi/train.zig
+    pub fn talu_train_get_info(handle: *mut c_void, out_info: *mut c_void) -> c_int;
+    // core/src/capi/train.zig
+    pub fn talu_train_load_data(handle: *mut c_void, data_path: *const c_char) -> c_int;
+    // core/src/capi/train.zig
+    pub fn talu_train_load_model(handle: *mut c_void, model_path: *const c_char, lora_config: *mut c_void, target_modules: *const *const c_char, num_targets: usize) -> c_int;
+    // core/src/capi/train.zig
+    pub fn talu_train_run(handle: *mut c_void, callback: *mut c_void, user_data: *mut c_void) -> c_int;
+    // core/src/capi/train.zig
+    pub fn talu_train_save_checkpoint(handle: *mut c_void, output_path: *const c_char) -> c_int;
     // core/src/capi/code.zig
-    pub fn talu_treesitter_extract_call_sites(
-        source: *const u8,
-        source_len: u32,
-        lang: *const c_char,
-        definer_fqn: *const c_char,
-        file_path: *const c_char,
-        project_root: *const c_char,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_extract_call_sites(source: *const u8, source_len: u32, lang: *const c_char, definer_fqn: *const c_char, file_path: *const c_char, project_root: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/code.zig
-    pub fn talu_treesitter_extract_callables(
-        source: *const u8,
-        source_len: u32,
-        lang: *const c_char,
-        file_path: *const c_char,
-        project_root: *const c_char,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_extract_callables(source: *const u8, source_len: u32, lang: *const c_char, file_path: *const c_char, project_root: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/code.zig
-    pub fn talu_treesitter_highlight(
-        source: *const u8,
-        source_len: u32,
-        lang: *const c_char,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_highlight(source: *const u8, source_len: u32, lang: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/code.zig
-    pub fn talu_treesitter_highlight_from_tree(
-        tree_handle: *mut c_void,
-        source: *const u8,
-        source_len: u32,
-        lang: *const c_char,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_highlight_from_tree(tree_handle: *mut c_void, source: *const u8, source_len: u32, lang: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/code.zig
-    pub fn talu_treesitter_highlight_rich(
-        source: *const u8,
-        source_len: u32,
-        lang: *const c_char,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_highlight_rich(source: *const u8, source_len: u32, lang: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/code.zig
-    pub fn talu_treesitter_highlight_rich_from_tree(
-        tree_handle: *mut c_void,
-        source: *const u8,
-        source_len: u32,
-        lang: *const c_char,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_highlight_rich_from_tree(tree_handle: *mut c_void, source: *const u8, source_len: u32, lang: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/code.zig
-    pub fn talu_treesitter_language_from_filename(
-        filename: *const c_char,
-        out_lang: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_language_from_filename(filename: *const c_char, out_lang: *mut c_void) -> c_int;
     // core/src/capi/code.zig
     pub fn talu_treesitter_languages(out_str: *mut c_void) -> c_int;
     // core/src/capi/code.zig
-    pub fn talu_treesitter_parse(
-        handle: *mut c_void,
-        source: *const u8,
-        source_len: u32,
-        out_tree: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_parse(handle: *mut c_void, source: *const u8, source_len: u32, out_tree: *mut c_void) -> c_int;
     // core/src/capi/code.zig
-    pub fn talu_treesitter_parse_incremental(
-        handle: *mut c_void,
-        source: *const u8,
-        source_len: u32,
-        old_tree: *mut c_void,
-        out_tree: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_parse_incremental(handle: *mut c_void, source: *const u8, source_len: u32, old_tree: *mut c_void, out_tree: *mut c_void) -> c_int;
     // core/src/capi/code.zig
     pub fn talu_treesitter_parser_create(lang: *const c_char) -> *mut c_void;
     // core/src/capi/code.zig
     pub fn talu_treesitter_parser_free(handle: *mut c_void);
     // core/src/capi/code.zig
-    pub fn talu_treesitter_query_create(
-        lang: *const c_char,
-        pattern: *const u8,
-        pattern_len: u32,
-        out_handle: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_query_create(lang: *const c_char, pattern: *const u8, pattern_len: u32, out_handle: *mut c_void) -> c_int;
     // core/src/capi/code.zig
-    pub fn talu_treesitter_query_exec(
-        query_handle: *mut c_void,
-        tree_handle: *mut c_void,
-        source: *const u8,
-        source_len: u32,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_query_exec(query_handle: *mut c_void, tree_handle: *mut c_void, source: *const u8, source_len: u32, out_json: *mut c_void) -> c_int;
     // core/src/capi/code.zig
     pub fn talu_treesitter_query_free(handle: *mut c_void);
     // core/src/capi/code.zig
-    pub fn talu_treesitter_tree_edit(
-        handle: *mut c_void,
-        start_byte: u32,
-        old_end_byte: u32,
-        new_end_byte: u32,
-        start_row: u32,
-        start_column: u32,
-        old_end_row: u32,
-        old_end_column: u32,
-        new_end_row: u32,
-        new_end_column: u32,
-    ) -> c_int;
+    pub fn talu_treesitter_tree_edit(handle: *mut c_void, start_byte: u32, old_end_byte: u32, new_end_byte: u32, start_row: u32, start_column: u32, old_end_row: u32, old_end_column: u32, new_end_row: u32, new_end_column: u32) -> c_int;
     // core/src/capi/code.zig
     pub fn talu_treesitter_tree_free(handle: *mut c_void);
     // core/src/capi/code.zig
-    pub fn talu_treesitter_tree_json(
-        tree_handle: *mut c_void,
-        source: *const u8,
-        source_len: u32,
-        lang: *const c_char,
-        out_json: *mut c_void,
-    ) -> c_int;
+    pub fn talu_treesitter_tree_json(tree_handle: *mut c_void, source: *const u8, source_len: u32, lang: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/code.zig
     pub fn talu_treesitter_tree_sexp(handle: *mut c_void, out_str: *mut c_void) -> c_int;
     // core/src/capi/validate.zig
-    pub fn talu_validate_accept(
-        handle: *mut c_void,
-        token_id: u32,
-        token_text: *const c_char,
-    ) -> c_int;
+    pub fn talu_validate_accept(handle: *mut c_void, token_id: u32, token_text: *const c_char) -> c_int;
     // core/src/capi/validate.zig
-    pub fn talu_validate_apply(
-        handle: *mut c_void,
-        tokenizer: *mut c_void,
-        logits: *const f32,
-        logits_len: usize,
-    ) -> c_int;
+    pub fn talu_validate_apply(handle: *mut c_void, tokenizer: *mut c_void, logits: *const f32, logits_len: usize) -> c_int;
     // core/src/capi/validate.zig
-    pub fn talu_validate_create(
-        schema_json: *const c_char,
-        allow_thinking: bool,
-        start_marker: *const c_char,
-        stop_tokens: *const u32,
-        stop_tokens_len: usize,
-    ) -> *mut c_void;
+    pub fn talu_validate_create(schema_json: *const c_char, allow_thinking: bool, start_marker: *const c_char, stop_tokens: *const u32, stop_tokens_len: usize) -> *mut c_void;
     // core/src/capi/validate.zig
-    pub fn talu_validate_engine_advance(handle: *mut c_void, bytes: *const u8, len: usize)
-        -> usize;
+    pub fn talu_validate_engine_advance(handle: *mut c_void, bytes: *const u8, len: usize) -> usize;
     // core/src/capi/validate.zig
     pub fn talu_validate_engine_advance_byte(handle: *mut c_void, byte: u8) -> c_int;
     // core/src/capi/validate.zig
-    pub fn talu_validate_engine_can_accept(
-        handle: *mut c_void,
-        bytes: *const u8,
-        len: usize,
-    ) -> bool;
+    pub fn talu_validate_engine_can_accept(handle: *mut c_void, bytes: *const u8, len: usize) -> bool;
     // core/src/capi/validate.zig
     pub fn talu_validate_engine_count_valid_bytes(handle: *mut c_void) -> c_int;
     // core/src/capi/validate.zig
@@ -5992,43 +4877,23 @@ extern "C" {
     // core/src/capi/validate.zig
     pub fn talu_validate_engine_destroy(handle: *mut c_void);
     // core/src/capi/validate.zig
-    pub fn talu_validate_engine_get_deterministic_continuation(
-        handle: *mut c_void,
-        out_len: *mut c_void,
-    ) -> *const u8;
+    pub fn talu_validate_engine_get_deterministic_continuation(handle: *mut c_void, out_len: *mut c_void) -> *const u8;
     // core/src/capi/validate.zig
     pub fn talu_validate_engine_get_position(handle: *mut c_void) -> usize;
     // core/src/capi/validate.zig
     pub fn talu_validate_engine_get_state_count(handle: *mut c_void) -> usize;
     // core/src/capi/validate.zig
-    pub fn talu_validate_engine_get_valid_bytes(
-        handle: *mut c_void,
-        out_valid: *mut c_void,
-    ) -> c_int;
+    pub fn talu_validate_engine_get_valid_bytes(handle: *mut c_void, out_valid: *mut c_void) -> c_int;
     // core/src/capi/validate.zig
-    pub fn talu_validate_engine_get_valid_tokens(
-        handle: *mut c_void,
-        vocab_size: usize,
-        mask_out: *mut c_void,
-        token_fn: *mut c_void,
-        ctx: *mut c_void,
-    ) -> c_int;
+    pub fn talu_validate_engine_get_valid_tokens(handle: *mut c_void, vocab_size: usize, mask_out: *mut c_void, token_fn: *mut c_void, ctx: *mut c_void) -> c_int;
     // core/src/capi/validate.zig
-    pub fn talu_validate_engine_get_valid_tokens_with_tokenizer(
-        handle: *mut c_void,
-        tokenizer: *mut c_void,
-        mask_out: *mut c_void,
-    ) -> c_int;
+    pub fn talu_validate_engine_get_valid_tokens_with_tokenizer(handle: *mut c_void, tokenizer: *mut c_void, mask_out: *mut c_void) -> c_int;
     // core/src/capi/validate.zig
     pub fn talu_validate_engine_is_complete(handle: *mut c_void) -> bool;
     // core/src/capi/validate.zig
     pub fn talu_validate_engine_reset(handle: *mut c_void) -> c_int;
     // core/src/capi/validate.zig
-    pub fn talu_validate_engine_validate(
-        handle: *mut c_void,
-        bytes: *const u8,
-        len: usize,
-    ) -> c_int;
+    pub fn talu_validate_engine_validate(handle: *mut c_void, bytes: *const u8, len: usize) -> c_int;
     // core/src/capi/validate.zig
     pub fn talu_validate_free(handle: *mut c_void);
     // core/src/capi/validate.zig
@@ -6036,17 +4901,9 @@ extern "C" {
     // core/src/capi/validate.zig
     pub fn talu_validate_reset(handle: *mut c_void);
     // core/src/capi/validate.zig
-    pub fn talu_validate_response_format(
-        chat_handle: *mut c_void,
-        out_result: SemanticValidationResultC,
-    ) -> c_int;
+    pub fn talu_validate_response_format(chat_handle: *mut c_void, out_result: *mut SemanticValidationResultC) -> c_int;
     // core/src/capi/tokenizer.zig
-    pub fn talu_vocab_result_free(
-        tokens: *mut *mut c_char,
-        lengths: *mut u32,
-        ids: *mut u32,
-        num_entries: usize,
-    );
+    pub fn talu_vocab_result_free(tokens: *const *const c_char, lengths: *mut u32, ids: *mut u32, num_entries: usize);
     // core/src/capi/xray.zig
     pub fn talu_xray_capture_clear(handle: *mut c_void);
     // core/src/capi/xray.zig
@@ -6066,37 +4923,17 @@ extern "C" {
     // core/src/capi/xray.zig
     pub fn talu_xray_capture_overflow(handle: *mut c_void) -> bool;
     // core/src/capi/xray.zig
-    pub fn talu_xray_count_matching(
-        handle: *mut c_void,
-        point: u8,
-        layer: u16,
-        token: u32,
-    ) -> usize;
+    pub fn talu_xray_count_matching(handle: *mut c_void, point: u8, layer: u16, token: u32) -> usize;
     // core/src/capi/xray.zig
-    pub fn talu_xray_find_anomaly(
-        handle: *mut c_void,
-        out_point: *mut c_void,
-        out_layer: *mut c_void,
-        out_token: *mut c_void,
-    ) -> bool;
+    pub fn talu_xray_find_anomaly(handle: *mut c_void, out_point: *mut c_void, out_layer: *mut c_void, out_token: *mut c_void) -> bool;
     // core/src/capi/xray.zig
     pub fn talu_xray_get(handle: *mut c_void, index: usize, out: *mut CapturedTensorInfo) -> bool;
     // core/src/capi/xray.zig
-    pub fn talu_xray_get_data(
-        handle: *mut c_void,
-        index: usize,
-        out_data: *mut u8,
-        max_len: usize,
-    ) -> usize;
+    pub fn talu_xray_get_data(handle: *mut c_void, index: usize, out_data: *mut u8, max_len: usize) -> usize;
     // core/src/capi/xray.zig
     pub fn talu_xray_get_data_size(handle: *mut c_void, index: usize) -> usize;
     // core/src/capi/xray.zig
-    pub fn talu_xray_get_samples(
-        handle: *mut c_void,
-        index: usize,
-        out_samples: *const f32,
-        max_samples: usize,
-    ) -> usize;
+    pub fn talu_xray_get_samples(handle: *mut c_void, index: usize, out_samples: *const f32, max_samples: usize) -> usize;
     // core/src/capi/xray.zig
     pub fn talu_xray_point_name(point: u8) -> *const c_char;
 }
@@ -6104,6 +4941,7 @@ extern "C" {
 // =============================================================================
 // Safe Helpers
 // =============================================================================
+
 
 /// Safe wrapper for xray capture creation.
 pub fn xray_capture_create(points_mask: u32, mode: u8, sample_count: u32) -> *mut c_void {
@@ -6146,8 +4984,6 @@ pub fn xray_point_name(point: u8) -> &'static str {
     if ptr.is_null() {
         "unknown"
     } else {
-        unsafe { std::ffi::CStr::from_ptr(ptr) }
-            .to_str()
-            .unwrap_or("unknown")
+        unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap_or("unknown")
     }
 }

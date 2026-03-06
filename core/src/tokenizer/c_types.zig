@@ -170,7 +170,10 @@ pub const Tokenizer = extern struct {
 
     /// Encode with explicit length (supports text with embedded null bytes)
     pub fn encodeSlice(self: *Tokenizer, input: []const u8, enc: *TokenizerEncoding) c_int {
-        if (input.len == 0) return 0;
+        if (input.len == 0) {
+            enc.* = std.mem.zeroes(TokenizerEncoding);
+            return 0;
+        }
         return switch (self.type) {
             .bpe => blk: {
                 const model: *bpe.BpeModel = @ptrCast(@alignCast(self.model.?));
@@ -561,4 +564,39 @@ test "VocabListC.fromEntries handles empty input" {
     defer list.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), list.count());
+}
+
+test "Tokenizer.encodeSlice empty input zeroes output encoding" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"vocab": {"<unk>": 0, "a": 1}, "merges": []}
+    ;
+
+    const tokenizer = try bpe.createBpeTokenizer(allocator, json, false);
+    defer allocator.destroy(tokenizer);
+    defer tokenizer.destroy();
+
+    var dummy_id: i32 = 1;
+    var dummy_token_ptr: [*c]u8 = null;
+    var dummy_attention_mask: i32 = 2;
+    var dummy_type_id: i32 = 3;
+    var dummy_special_mask: i32 = 4;
+    var dummy_offset = Offset{ .start = 5, .end = 6 };
+    var dummy_overflow = std.mem.zeroes(TokenizerEncoding);
+    var encoding = TokenizerEncoding{
+        .ids = &dummy_id,
+        .ids_len = 123,
+        .tokens = &dummy_token_ptr,
+        .tokens_len = 456,
+        .attention_mask = &dummy_attention_mask,
+        .type_ids = &dummy_type_id,
+        .special_tokens_mask = &dummy_special_mask,
+        .offsets = &dummy_offset,
+        .overflows = &dummy_overflow,
+        .overflow_count = 789,
+    };
+
+    const rc = tokenizer.encodeSlice("", &encoding);
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    try std.testing.expectEqual(std.mem.zeroes(TokenizerEncoding), encoding);
 }
