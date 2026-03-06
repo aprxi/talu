@@ -117,10 +117,10 @@ fn layerForward(
     // Attention RMSNorm
     norm_fwd.rmsnormForwardSave(la.normed_attn, la.inv_rms_attn, hidden, lw.attn_norm.asSlice(f32), config.norm_eps, bs, d);
 
-    // Q/K/V projections: [bs, d] @ [out, d]^T → [bs, out]
-    linear_fwd.linearForward(la.q, la.normed_attn, lw.q_proj.asSlice(f32), bs, d, nh * hd, scratch);
-    linear_fwd.linearForward(la.k, la.normed_attn, lw.k_proj.asSlice(f32), bs, d, nkv * hd, scratch);
-    linear_fwd.linearForward(la.v, la.normed_attn, lw.v_proj.asSlice(f32), bs, d, nkv * hd, scratch);
+    // Fused QKV projection: [bs, d] @ [qkv_dim, d]^T → [bs, qkv_dim]
+    // la.qkv is contiguous [q | k | v], lw.qkv_proj_buf is [q_proj; k_proj; v_proj].
+    const qkv_dim = nh * hd + 2 * nkv * hd;
+    linear_fwd.linearForward(la.qkv, la.normed_attn, lw.qkv_proj_buf, bs, d, qkv_dim, scratch);
 
     // Apply RoPE to Q and K (batch version precomputes inv_freq once)
     rope_fwd.ropeForwardBatch(la.q[0 .. bs * nh * hd], b, s, nh, hd, hd, config.rope_theta);

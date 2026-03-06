@@ -370,66 +370,44 @@ fn layerBackward(
     rope_bw.ropeBackwardBatch(grad_q[0 .. bs * nh * hd], b, s, nh, hd, hd, config.rope_theta);
     rope_bw.ropeBackwardBatch(grad_k[0 .. bs * nkv * hd], b, s, nkv, hd, hd, config.rope_theta);
 
-    // Q projection backward:
-    // Forward: q_pre_rope = normed_attn @ q_proj^T
+    // Fused QKV projection backward.
+    // grad_qkv = [grad_q | grad_k | grad_v] is already contiguous in global_scratch.
+    const qkv_dim = nh * hd + 2 * nkv * hd;
+    const grad_qkv = global_scratch[qkv_base .. qkv_base + bs * qkv_dim];
+
+    // Fused gradWeight: grad_qkv_proj += grad_qkv^T @ normed_attn
+    // Write into a contiguous scratch region, then scatter to individual grad tensors.
+    const grad_qkv_weight_base = d_scores_base; // reuse d_scores region (no longer needed)
+    const grad_qkv_weight = global_scratch[grad_qkv_weight_base .. grad_qkv_weight_base + qkv_dim * d];
+    // Initialize from existing gradient accumulators (gradWeight accumulates, not overwrites).
+    const q_grad_size = nh * hd * d;
+    const kv_grad_size = nkv * hd * d;
+    @memcpy(grad_qkv_weight[0..q_grad_size], lw.grad_q_proj.asSlice());
+    @memcpy(grad_qkv_weight[q_grad_size .. q_grad_size + kv_grad_size], lw.grad_k_proj.asSlice());
+    @memcpy(grad_qkv_weight[q_grad_size + kv_grad_size .. q_grad_size + 2 * kv_grad_size], lw.grad_v_proj.asSlice());
+
     linear.gradWeight(
-        lw.grad_q_proj.asSliceMut(),
-        grad_q,
+        grad_qkv_weight,
+        grad_qkv,
         la.normed_attn,
         bs,
-        nh * hd,
+        qkv_dim,
         d,
         scratch,
     );
-    // grad_normed_attn from Q path → write into grad_hidden
+
+    // Scatter back to individual grad tensors.
+    @memcpy(lw.grad_q_proj.asSliceMut(), grad_qkv_weight[0..q_grad_size]);
+    @memcpy(lw.grad_k_proj.asSliceMut(), grad_qkv_weight[q_grad_size .. q_grad_size + kv_grad_size]);
+    @memcpy(lw.grad_v_proj.asSliceMut(), grad_qkv_weight[q_grad_size + kv_grad_size .. q_grad_size + 2 * kv_grad_size]);
+
+    // Fused gradInput: grad_hidden = grad_qkv @ qkv_proj (single overwrite)
     linear.gradInput(
         grad_hidden,
-        grad_q,
-        lw.q_proj.asSlice(f32),
+        grad_qkv,
+        lw.qkv_proj_buf,
         bs,
-        nh * hd,
-        d,
-        scratch,
-    );
-
-    // K projection backward:
-    linear.gradWeight(
-        lw.grad_k_proj.asSliceMut(),
-        grad_k,
-        la.normed_attn,
-        bs,
-        nkv * hd,
-        d,
-        scratch,
-    );
-    // grad_normed_attn from K path → accumulate into grad_hidden
-    linear.gradInputAccum(
-        grad_hidden,
-        grad_k,
-        lw.k_proj.asSlice(f32),
-        bs,
-        nkv * hd,
-        d,
-        scratch,
-    );
-
-    // V projection backward:
-    linear.gradWeight(
-        lw.grad_v_proj.asSliceMut(),
-        grad_v,
-        la.normed_attn,
-        bs,
-        nkv * hd,
-        d,
-        scratch,
-    );
-    // grad_normed_attn from V path → accumulate into grad_hidden
-    linear.gradInputAccum(
-        grad_hidden,
-        grad_v,
-        lw.v_proj.asSlice(f32),
-        bs,
-        nkv * hd,
+        qkv_dim,
         d,
         scratch,
     );
@@ -451,23 +429,6 @@ fn layerBackward(
         0.0,
         grad_residual_attn, // fused residual add
     );
-}
-
-/// SIMD element-wise accumulate: dst[i] += src[i].
-fn simdAccum(dst: []f32, src: []const f32) void {
-    @setFloatMode(.optimized);
-    std.debug.assert(dst.len == src.len);
-    const len = dst.len;
-    var i: usize = 0;
-    while (i + VEC <= len) : (i += VEC) {
-        var d: F32Vec = dst[i..][0..VEC].*;
-        const s: F32Vec = src[i..][0..VEC].*;
-        d += s;
-        dst[i..][0..VEC].* = d;
-    }
-    while (i < len) : (i += 1) {
-        dst[i] += src[i];
-    }
 }
 
 /// Recompute silu(gate) * up (SwiGLU forward) for use in down_proj gradWeight.

@@ -23,12 +23,19 @@ const TransformerConfig = model_config.TransformerConfig;
 
 /// Weights and gradients for a single transformer layer.
 pub const LayerWeights = struct {
+    allocator: Allocator,
+
     // Attention block
     attn_norm: OwnedTensor, // [d_model]
     q_proj: OwnedTensor, // [num_heads * head_dim, d_model]
     k_proj: OwnedTensor, // [num_kv_heads * head_dim, d_model]
     v_proj: OwnedTensor, // [num_kv_heads * head_dim, d_model]
     o_proj: OwnedTensor, // [d_model, num_heads * head_dim]
+
+    /// Fused QKV weight buffer for single-matmul projection.
+    /// [q_dim + 2*kv_dim, d_model] — concatenation of q_proj, k_proj, v_proj.
+    /// Synced from individual projections via syncQkvBuf().
+    qkv_proj_buf: []f32,
 
     // FFN block (SwiGLU)
     ffn_norm: OwnedTensor, // [d_model]
@@ -57,6 +64,7 @@ pub const LayerWeights = struct {
         const kv_dim = nkv * hd;
 
         var self: LayerWeights = undefined;
+        self.allocator = allocator;
         var init_count: u32 = 0;
         errdefer {
             // Deinit in reverse order for each successfully initialized field.
@@ -84,6 +92,9 @@ pub const LayerWeights = struct {
         self.v_proj = try OwnedTensor.init(allocator, .f32, &.{ kv_dim, d });
         init_count += 1;
         self.o_proj = try OwnedTensor.init(allocator, .f32, &.{ d, q_dim });
+        init_count += 1;
+        self.qkv_proj_buf = try allocator.alloc(f32, (q_dim + 2 * kv_dim) * d);
+        errdefer allocator.free(self.qkv_proj_buf);
         init_count += 1;
         self.ffn_norm = try OwnedTensor.init(allocator, .f32, &.{d});
         init_count += 1;
@@ -117,6 +128,17 @@ pub const LayerWeights = struct {
         return self;
     }
 
+    /// Copy q_proj, k_proj, v_proj into the contiguous qkv_proj_buf
+    /// for fused QKV matmul. Call after weight initialization or optimizer step.
+    pub fn syncQkvBuf(self: *LayerWeights) void {
+        const q_data = self.q_proj.asSlice(f32);
+        const k_data = self.k_proj.asSlice(f32);
+        const v_data = self.v_proj.asSlice(f32);
+        @memcpy(self.qkv_proj_buf[0..q_data.len], q_data);
+        @memcpy(self.qkv_proj_buf[q_data.len .. q_data.len + k_data.len], k_data);
+        @memcpy(self.qkv_proj_buf[q_data.len + k_data.len .. q_data.len + k_data.len + v_data.len], v_data);
+    }
+
     /// Zero all gradient buffers between training steps.
     pub fn zeroGrads(self: *LayerWeights) void {
         self.grad_attn_norm.zero();
@@ -145,6 +167,7 @@ pub const LayerWeights = struct {
         self.up_proj.deinit();
         self.gate_proj.deinit();
         self.ffn_norm.deinit();
+        self.allocator.free(self.qkv_proj_buf);
         self.o_proj.deinit();
         self.v_proj.deinit();
         self.k_proj.deinit();
@@ -250,6 +273,8 @@ pub const ModelWeights = struct {
             xavierUniform(layer.gate_proj.asSlice(f32), d, ff, random);
             xavierUniform(layer.up_proj.asSlice(f32), d, ff, random);
             xavierUniform(layer.down_proj.asSlice(f32), ff, d, random);
+
+            layer.syncQkvBuf();
         }
     }
 

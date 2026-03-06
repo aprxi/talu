@@ -453,6 +453,9 @@ pub const FullTrainingSession = struct {
             opt.step(layer.gate_proj.asSlice(f32), layer.grad_gate_proj.asSlice(), &states[base + 6], lr);
             opt.step(layer.up_proj.asSlice(f32), layer.grad_up_proj.asSlice(), &states[base + 7], lr);
             opt.step(layer.down_proj.asSlice(f32), layer.grad_down_proj.asSlice(), &states[base + 8], lr);
+
+            // Sync fused QKV weight buffer after q/k/v weights updated.
+            layer.syncQkvBuf();
         }
     }
 };

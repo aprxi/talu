@@ -26,15 +26,19 @@ pub const LayerActivations = struct {
     /// [batch * seq]
     inv_rms_attn: []f32,
 
-    /// Query vectors after projection and RoPE.
+    /// Contiguous QKV buffer backing q, k, v slices.
+    /// [batch * seq * (num_heads * head_dim + 2 * num_kv_heads * head_dim)]
+    qkv: []f32,
+
+    /// Query vectors after projection and RoPE (view into qkv).
     /// [batch * seq * num_heads * head_dim]
     q: []f32,
 
-    /// Key vectors after projection and RoPE.
+    /// Key vectors after projection and RoPE (view into qkv).
     /// [batch * seq * num_kv_heads * head_dim]
     k: []f32,
 
-    /// Value vectors after projection.
+    /// Value vectors after projection (view into qkv).
     /// [batch * seq * num_kv_heads * head_dim]
     v: []f32,
 
@@ -133,14 +137,18 @@ pub const ActivationCache = struct {
         self.grad_hidden = try allocator.alloc(f32, bsd);
         errdefer allocator.free(self.grad_hidden);
 
-        // Scratch sized for backward pass peak usage:
-        //   FFN backward:  d + 3*ff  (residual + swiglu recompute + grad_gate + grad_up)
-        //   Attn backward: d + 2*nh*hd + 2*nkv*hd + nh*s  (residual + attn_output + grad_q + grad_k + grad_v + d_scores)
-        //   CE backward:   v  (grad_logits)
-        const ffn_scratch = d + 3 * ff;
-        const attn_scratch = d + 2 * nh * hd + 2 * nkv * hd + nh * s;
-        const max_dim = @max(v, @max(ffn_scratch, attn_scratch));
-        self.scratch = try allocator.alloc(f32, bs * max_dim);
+        // Scratch sized for backward pass peak usage (total elements, not per-token):
+        //   FFN backward:  bs*(d + 3*ff)  (residual + swiglu recompute + grad_gate + grad_up)
+        //   Attn backward: bs*(d + 2*nh*hd + 2*nkv*hd) + max(b*nh*s*s, qkv_dim*d)
+        //                  (residual + attn_output + grad_q/k/v + d_scores OR grad_qkv_weight)
+        //   CE backward:   bs*v  (grad_logits)
+        const ffn_total = bs * (d + 3 * ff);
+        const qkv_dim = nh * hd + 2 * nkv * hd;
+        const attn_base = bs * (d + 2 * nh * hd + 2 * nkv * hd);
+        const attn_tail = @max(b * nh * s * s, qkv_dim * d);
+        const attn_total = attn_base + attn_tail;
+        const ce_total = bs * v;
+        self.scratch = try allocator.alloc(f32, @max(ce_total, @max(ffn_total, attn_total)));
         errdefer allocator.free(self.scratch);
 
         self.layers = try allocator.alloc(LayerActivations, config.num_layers);
@@ -159,12 +167,13 @@ pub const ActivationCache = struct {
             errdefer allocator.free(la.normed_attn);
             la.inv_rms_attn = try allocator.alloc(f32, bs);
             errdefer allocator.free(la.inv_rms_attn);
-            la.q = try allocator.alloc(f32, bs * nh * hd);
-            errdefer allocator.free(la.q);
-            la.k = try allocator.alloc(f32, bs * nkv * hd);
-            errdefer allocator.free(la.k);
-            la.v = try allocator.alloc(f32, bs * nkv * hd);
-            errdefer allocator.free(la.v);
+            const q_size = bs * nh * hd;
+            const kv_size = bs * nkv * hd;
+            la.qkv = try allocator.alloc(f32, q_size + 2 * kv_size);
+            errdefer allocator.free(la.qkv);
+            la.q = la.qkv[0..q_size];
+            la.k = la.qkv[q_size .. q_size + kv_size];
+            la.v = la.qkv[q_size + kv_size .. q_size + 2 * kv_size];
             la.attn_output = try allocator.alloc(f32, bs * nh * hd);
             errdefer allocator.free(la.attn_output);
             la.attn_probs = try allocator.alloc(f32, b * nh * s * s);
@@ -209,9 +218,7 @@ fn freeLayerActivations(allocator: Allocator, la: *LayerActivations) void {
     allocator.free(la.residual_pre_ffn);
     allocator.free(la.attn_probs);
     allocator.free(la.attn_output);
-    allocator.free(la.v);
-    allocator.free(la.k);
-    allocator.free(la.q);
+    allocator.free(la.qkv);
     allocator.free(la.inv_rms_attn);
     allocator.free(la.normed_attn);
     allocator.free(la.residual_pre_attn);
