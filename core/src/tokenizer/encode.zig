@@ -325,24 +325,31 @@ pub fn findAddedTokenContentById(tokenizer: *ct.Tokenizer, id: i32) ?[]const u8 
 /// Accumulator for building token encoding results.
 /// Token strings are not tracked here — they are resolved lazily from IDs
 /// by consumers that need them (e.g. offset computation via idToToken).
+///
+/// Special token flags use a sparse representation: only positions where
+/// special == 1 are stored (typically 0-10 per input). This eliminates
+/// per-word zero-append overhead (161K appendNTimes calls for 1MB input).
 const EncodeAccum = struct {
     ids: std.ArrayListUnmanaged(i32) = .{},
-    special: std.ArrayListUnmanaged(i32) = .{},
+    /// Sparse positions where special == 1 (added tokens only).
+    special_positions: std.ArrayListUnmanaged(u32) = .{},
 
     fn deinit(self: *EncodeAccum) void {
-        self.special.deinit(Allocator);
+        self.special_positions.deinit(Allocator);
         self.ids.deinit(Allocator);
     }
 
     fn appendAdded(self: *EncodeAccum, added_token: *const ct.AddedToken) !void {
+        if (added_token.special != 0) {
+            try self.special_positions.append(Allocator, @intCast(self.ids.items.len));
+        }
         try self.ids.append(Allocator, added_token.id);
-        try self.special.append(Allocator, added_token.special);
     }
 
     /// Append tokens from cached IDs (word cache hit path).
+    /// BPE-produced tokens are never special — no tracking needed.
     fn appendCachedIds(self: *EncodeAccum, cached_ids: []const i32) !void {
         try self.ids.appendSlice(Allocator, cached_ids);
-        try self.special.appendNTimes(Allocator, 0, cached_ids.len);
     }
 
     fn appendEncoding(self: *EncodeAccum, encoding: *const ct.TokenizerEncoding, added_head: ?*ct.AddedToken) !void {
@@ -350,8 +357,10 @@ const EncodeAccum = struct {
         const ids_ptr: [*]i32 = @ptrCast(encoding.ids.?);
 
         for (0..encoding.ids_len) |id_index| {
+            if (checkSpecial(added_head, ids_ptr[id_index]) != 0) {
+                try self.special_positions.append(Allocator, @intCast(self.ids.items.len));
+            }
             try self.ids.append(Allocator, ids_ptr[id_index]);
-            try self.special.append(Allocator, checkSpecial(added_head, ids_ptr[id_index]));
         }
     }
 
@@ -370,22 +379,36 @@ const EncodeAccum = struct {
             return;
         }
 
-        var buffers_out = try buffers.allocBuffers(token_count);
+        // Transfer ids ownership directly (avoids alloc + memcpy for the
+        // largest buffer). Allocate remaining buffers individually.
+        var buffers_out = buffers.Buffers{
+            .ids = try self.ids.toOwnedSlice(Allocator),
+            .tokens = &.{},
+            .attention_mask = &.{},
+            .type_ids = &.{},
+            .special = &.{},
+            .offsets = &.{},
+        };
         errdefer buffers_out.deinit();
 
-        @memcpy(buffers_out.ids, self.ids.items);
-        @memcpy(buffers_out.special, self.special.items);
-        for (0..token_count) |token_idx| {
-            buffers_out.attention_mask[token_idx] = 1;
-            buffers_out.type_ids[token_idx] = 0;
-            buffers_out.offsets[token_idx] = .{ .start = 0, .end = 0 };
+        buffers_out.tokens = try Allocator.alloc([*c]u8, token_count);
+        @memset(buffers_out.tokens, null);
+        buffers_out.attention_mask = try Allocator.alloc(i32, token_count);
+        @memset(buffers_out.attention_mask, 1);
+        buffers_out.type_ids = try Allocator.alloc(i32, token_count);
+        @memset(buffers_out.type_ids, 0);
+        buffers_out.special = try Allocator.alloc(i32, token_count);
+        @memset(buffers_out.special, 0);
+        for (self.special_positions.items) |pos| {
+            buffers_out.special[pos] = 1;
         }
+        buffers_out.offsets = try Allocator.alloc(ct.Offset, token_count);
+        @memset(std.mem.sliceAsBytes(buffers_out.offsets), 0);
 
         buffers.initEncoding(out_encoding, &buffers_out, token_count, null, 0);
 
-        // Ownership transferred - just free containers
-        self.ids.deinit(Allocator);
-        self.special.deinit(Allocator);
+        // ids ownership transferred via toOwnedSlice; just free sparse positions
+        self.special_positions.deinit(Allocator);
         self.* = .{};
     }
 };
@@ -477,7 +500,6 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
     // Pre-allocate: ~4 bytes per token is typical for BPE
     const estimated_tokens = normalized.text.len / 4;
     try accum.ids.ensureTotalCapacity(Allocator, estimated_tokens);
-    try accum.special.ensureTotalCapacity(Allocator, estimated_tokens);
 
     var cursor: usize = 0;
     var span_index: usize = 0;
@@ -589,6 +611,18 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
         var word_cache = WordCache.init();
         defer word_cache.deinit();
 
+        // Byte-level BPE fast path: hoist model pointer, skip type checks,
+        // and add direct-lookup paths for 1-2 byte words.
+        if (is_byte_level_bpe) {
+            if (tokenizer.model) |model_ptr| {
+                const model: *bpe.BpeModel = @ptrCast(@alignCast(model_ptr));
+                for (pretokenized.tokens.items) |token_item| {
+                    try encodeWordBpe(model, tokenizer, token_item.sliceConst(), accumulator, &word_cache);
+                }
+                return;
+            }
+        }
+
         for (pretokenized.tokens.items, 0..) |token_item, token_index| {
             const add_sp_prefix = if (is_metaspace)
                 false
@@ -633,6 +667,14 @@ const WordCache = struct {
         const key_copy = arena_alloc.dupe(u8, word) catch return;
         const ids_copy = arena_alloc.dupe(i32, ids) catch return;
         self.map.put(Allocator, key_copy, ids_copy) catch return;
+    }
+
+    /// Fast insert for BPE path: key slice outlives cache, skip key dupe.
+    /// Caller guarantees word slice remains valid until cache deinit.
+    fn putBorrowed(self: *WordCache, word: []const u8, ids: []const i32) void {
+        const arena_alloc = self.arena.allocator();
+        const ids_copy = arena_alloc.dupe(i32, ids) catch return;
+        self.map.put(Allocator, word, ids_copy) catch return;
     }
 };
 
@@ -841,9 +883,8 @@ fn mergeChunkResults(
     }
 
     try accumulator.ids.ensureTotalCapacity(Allocator, accumulator.ids.items.len + total_owned);
-    try accumulator.special.ensureTotalCapacity(Allocator, accumulator.special.items.len + total_owned);
 
-    // Merge owned tokens
+    // Merge owned tokens (special flags not needed — BPE words are never special)
     for (results, own_starts, own_ends) |*r, own_start, own_end| {
         var token_pos: usize = 0;
         for (r.word_offsets.items, r.word_token_counts.items) |offset, count| {
@@ -852,13 +893,12 @@ fn mergeChunkResults(
                 const start_idx = token_pos;
                 const end_idx = token_pos + count;
                 accumulator.ids.appendSliceAssumeCapacity(r.accum.ids.items[start_idx..end_idx]);
-                accumulator.special.appendSliceAssumeCapacity(r.accum.special.items[start_idx..end_idx]);
             }
             token_pos += count;
         }
         // Free containers
         r.accum.ids.deinit(Allocator);
-        r.accum.special.deinit(Allocator);
+        r.accum.special_positions.deinit(Allocator);
         r.accum = .{};
         r.word_token_counts.deinit(Allocator);
         r.word_offsets.deinit(Allocator);
@@ -866,25 +906,67 @@ fn mergeChunkResults(
     }
 }
 
+/// Byte-level BPE fast path: model pointer pre-hoisted, no prefix construction,
+/// no type/null checks per word. Adds direct-lookup paths for 1-2 byte words
+/// that bypass both cache and BPE entirely.
+fn encodeWordBpe(model: *bpe.BpeModel, tokenizer: *ct.Tokenizer, word: []const u8, accumulator: *EncodeAccum, cache: *WordCache) !void {
+    // 1-byte: direct vocab ID lookup (no cache, no BPE)
+    if (word.len == 1 and model.use_raw_byte_init) {
+        const id = model.orig_byte_vocab_ids[word[0]];
+        if (id >= 0) {
+            try accumulator.ids.append(Allocator, id);
+            return;
+        }
+    }
+
+    // 2-byte: two vocab IDs + single merge check (no cache, no BPE loop)
+    if (word.len == 2 and model.use_raw_byte_init) {
+        const id_a = model.orig_byte_vocab_ids[word[0]];
+        const id_b = model.orig_byte_vocab_ids[word[1]];
+        if (id_a >= 0 and id_b >= 0) {
+            if (model.pair_merges.get(.{ .left = id_a, .right = id_b })) |info| {
+                try accumulator.ids.append(Allocator, info.new_id);
+            } else {
+                try accumulator.ids.appendSlice(Allocator, &.{ id_a, id_b });
+            }
+            return;
+        }
+    }
+
+    // Word cache lookup
+    if (cache.get(word)) |cached_ids| {
+        try accumulator.appendCachedIds(cached_ids);
+        return;
+    }
+
+    // BPE encode
+    const old_len = accumulator.ids.items.len;
+    try model.encodeWordDirect(tokenizer, word, &accumulator.ids);
+    // Word slices from pretokenize outlive the cache — skip key dupe.
+    cache.putBorrowed(word, accumulator.ids.items[old_len..]);
+}
+
 fn encodeWord(tokenizer: *ct.Tokenizer, word_bytes: []const u8, add_sentencepiece_prefix: bool, accumulator: *EncodeAccum, cache: ?*WordCache) !void {
-    // Stack buffer for word bytes (avoids heap allocation for typical words)
+    // Fast path: no prefix needed — use word_bytes directly (no copy).
+    // Slow path: prepend ▁ (3 bytes) using stack or heap buffer.
     var stack_buf: [1024]u8 = undefined;
     var heap_buf: ?[]u8 = null;
     defer if (heap_buf) |hb| Allocator.free(hb);
 
-    const prefix_len: usize = if (add_sentencepiece_prefix) 3 else 0; // ▁ = 3 bytes
-    const total_len = prefix_len + word_bytes.len;
-    const buf = if (total_len <= stack_buf.len)
-        stack_buf[0..total_len]
+    const word = if (!add_sentencepiece_prefix)
+        word_bytes
     else blk: {
-        heap_buf = Allocator.alloc(u8, total_len) catch return error.OutOfMemory;
-        break :blk heap_buf.?;
+        const total_len = 3 + word_bytes.len;
+        const buf = if (total_len <= stack_buf.len)
+            stack_buf[0..total_len]
+        else inner: {
+            heap_buf = Allocator.alloc(u8, total_len) catch return error.OutOfMemory;
+            break :inner heap_buf.?;
+        };
+        @memcpy(buf[0..3], "\xE2\x96\x81");
+        @memcpy(buf[3..], word_bytes);
+        break :blk buf;
     };
-
-    if (add_sentencepiece_prefix) @memcpy(buf[0..3], "\xE2\x96\x81");
-    @memcpy(buf[prefix_len..], word_bytes);
-
-    const word = buf[0..total_len];
 
     // Word cache lookup: skip BPE on repeated words
     if (cache) |wc| {
@@ -901,10 +983,8 @@ fn encodeWord(tokenizer: *ct.Tokenizer, word_bytes: []const u8, add_sentencepiec
             const model: *bpe.BpeModel = @ptrCast(@alignCast(model_ptr));
             const old_len = accumulator.ids.items.len;
             try model.encodeWordDirect(tokenizer, word, &accumulator.ids);
-            const new_count = accumulator.ids.items.len - old_len;
-            // BPE-produced tokens from regular words are never special
-            // (special/added tokens are handled separately by encodeNormalized)
-            try accumulator.special.appendNTimes(Allocator, 0, new_count);
+            // BPE-produced tokens are never special — sparse tracking
+            // in EncodeAccum handles this without per-word overhead.
 
             // Cache miss: store IDs for future hits
             if (cache) |wc| {
@@ -1082,7 +1162,8 @@ test "EncodeAccum appendAdded adds token" {
 
     try std.testing.expectEqual(@as(usize, 1), accum.ids.items.len);
     try std.testing.expectEqual(@as(i32, 123), accum.ids.items[0]);
-    try std.testing.expectEqual(@as(i32, 1), accum.special.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), accum.special_positions.items.len);
+    try std.testing.expectEqual(@as(u32, 0), accum.special_positions.items[0]);
 }
 
 test "tokenizer_encoding_free_struct handles empty encoding" {

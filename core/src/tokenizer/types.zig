@@ -39,6 +39,9 @@ pub const PretokenizeResult = struct {
     tokens: std.ArrayListUnmanaged(Token),
     ranges: std.ArrayListUnmanaged(Range),
     arena: std.heap.ArenaAllocator,
+    /// When true, tokens point directly into the input buffer (no arena copy).
+    /// Safe only when applyByteLevel is skipped (tokens are not modified).
+    zero_copy: bool = false,
 
     pub fn init() PretokenizeResult {
         return .{

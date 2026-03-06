@@ -181,6 +181,7 @@ fn pretokenize_single(pretokenizer: ?*const ct.PreTokenizer, input: []const u8, 
 /// Internal implementation using error handling for cleaner code
 fn pretokenize_single_impl(pretokenizer: ?*const ct.PreTokenizer, input: []const u8, base_offset: usize, skip_byte_level: bool) PretokenizeError!PretokenizeResult {
     var result = PretokenizeResult.init();
+    result.zero_copy = skip_byte_level;
     errdefer result.deinit();
 
     if (pretokenizer) |p| {
@@ -511,11 +512,16 @@ fn splitMetaspace(result: *PretokenizeResult, input: []const u8, base_offset: us
 
 /// Append a token string to result
 fn appendToken(result: *PretokenizeResult, token_bytes: []const u8, range_start: usize) !void {
-    const arena_alloc = result.arena.allocator();
-    const token_buf = arena_alloc.alloc(u8, token_bytes.len + 1) catch return error.OutOfMemory;
-    @memcpy(token_buf[0..token_bytes.len], token_bytes);
-    token_buf[token_bytes.len] = 0; // null terminator for C API
-    try result.tokens.append(Allocator, .{ .ptr = token_buf.ptr, .len = token_bytes.len });
+    if (result.zero_copy) {
+        // Zero-copy: store pointer directly into input buffer (no arena alloc).
+        try result.tokens.append(Allocator, .{ .ptr = @constCast(token_bytes.ptr), .len = token_bytes.len });
+    } else {
+        const arena_alloc = result.arena.allocator();
+        const token_buf = arena_alloc.alloc(u8, token_bytes.len + 1) catch return error.OutOfMemory;
+        @memcpy(token_buf[0..token_bytes.len], token_bytes);
+        token_buf[token_bytes.len] = 0; // null terminator for C API
+        try result.tokens.append(Allocator, .{ .ptr = token_buf.ptr, .len = token_bytes.len });
+    }
     try result.ranges.append(Allocator, .{ .start = range_start, .end = range_start + token_bytes.len });
 }
 
