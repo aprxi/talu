@@ -8,6 +8,7 @@ pub const supported = true;
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const Tensor = tensor.Tensor;
+const log = @import("../../../../log.zig");
 const compute = @import("../../../../compute/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
@@ -48,6 +49,8 @@ pub const GatedDeltaState = struct {
     ) !GatedDeltaState {
         const d_inner = @as(usize, config.n_heads) * @as(usize, config.d_head);
         const qkv_len = d_inner * 3;
+        // Time-major state layout: [batch, d_conv, qkv_len].
+        // This matches the SIMD-friendly conv1d_depthwise.runTimeMajor path.
         const conv_state_size = batch_size * qkv_len * config.d_conv;
         const ssm_state_size = batch_size * config.n_heads * config.d_head * config.d_head;
 
@@ -138,6 +141,8 @@ pub const GatedDeltaKernel = struct {
     matmul_in_proj: cpu_linalg.MatmulFn,
     matmul_out_proj: cpu_linalg.MatmulFn,
     layer_idx: u16 = trace.TraceEmission.NO_LAYER,
+    conv_weight_transposed: ?[]f32 = null,
+    weight_allocator: ?std.mem.Allocator = null,
 
     pub fn init(
         config: GatedDeltaConfig,
@@ -150,7 +155,33 @@ pub const GatedDeltaKernel = struct {
             .weights = weights,
             .matmul_in_proj = matmul_in_proj,
             .matmul_out_proj = matmul_out_proj,
+            .conv_weight_transposed = null,
+            .weight_allocator = null,
         };
+    }
+
+    pub fn initTransposedWeights(self: *GatedDeltaKernel, allocator: std.mem.Allocator) !void {
+        if (self.conv_weight_transposed != null) return;
+
+        const d_inner: usize = @as(usize, self.config.n_heads) * @as(usize, self.config.d_head);
+        const conv_dim = d_inner * 3;
+        const d_conv: usize = self.config.d_conv;
+        const src = self.weights.conv1d_weight.asSlice(f32);
+
+        const transposed = try allocator.alloc(f32, conv_dim * d_conv);
+        errdefer allocator.free(transposed);
+
+        try cpu_conv1d.transposeChannelMajorToTimeMajor(src, transposed, conv_dim, d_conv);
+        self.conv_weight_transposed = transposed;
+        self.weight_allocator = allocator;
+    }
+
+    pub fn deinit(self: *GatedDeltaKernel) void {
+        if (self.conv_weight_transposed) |weight_t| {
+            if (self.weight_allocator) |alloc| alloc.free(weight_t);
+        }
+        self.conv_weight_transposed = null;
+        self.weight_allocator = null;
     }
 
     fn projectionOutputDim(weight: *const Tensor, d_model: usize) !usize {
@@ -202,7 +233,20 @@ pub const GatedDeltaKernel = struct {
         const full_input_data = input.asSlice(f32);
         const full_output_data = output.asSlice(f32);
 
-        const conv_weight = w.conv1d_weight.asSlice(f32);
+        const conv_weight_t = self.conv_weight_transposed orelse {
+            log.warn("inference", "CPU gated-delta missing time-major conv weights at execute", .{
+                .layer_idx = self.layer_idx,
+                .d_model = d_model,
+                .d_conv = d_conv,
+                .n_heads = n_heads,
+                .d_head = d_head,
+                .conv_dtype = @tagName(w.conv1d_weight.dtype),
+                .conv_dims = w.conv1d_weight.n_dims,
+                .conv_shape0 = if (w.conv1d_weight.n_dims > 0) w.conv1d_weight.shape[0] else 0,
+                .conv_shape1 = if (w.conv1d_weight.n_dims > 1) w.conv1d_weight.shape[1] else 0,
+            });
+            return error.InvalidConfiguration;
+        };
         const conv_bias = if (w.conv1d_bias) |bias| bias.asSlice(f32) else null;
         const A_log = w.A_log.asSlice(f32);
         const dt_bias = if (w.dt_bias) |bias| bias.asSlice(f32) else null;
@@ -224,7 +268,7 @@ pub const GatedDeltaKernel = struct {
             const beta_raw = proj_out[qkv_len + d_inner .. qkv_len + d_inner + n_heads];
             const a_raw = proj_out[qkv_len + d_inner + n_heads .. qkv_len + d_inner + 2 * n_heads];
 
-            try cpu_conv1d.stepDepthwiseState(qkv, conv_state, conv_weight, conv_bias, qkv_len, d_conv);
+            cpu_conv1d.runTimeMajorValues(qkv, conv_state, conv_weight_t, qkv, conv_bias, qkv_len, d_conv);
             cpu_gated_delta.applySiluInPlace(qkv);
 
             const query = qkv[0..d_inner];

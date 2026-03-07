@@ -14,6 +14,8 @@ pub const Scenario = enum {
     role_attn_out_bf16,
     role_ffn_gate_bf16,
     role_ffn_down_bf16,
+    gated_delta_conv_f32,
+    gated_delta_qk_norm_f32,
     gated_delta_step_f32,
     gated_delta_norm_f32,
     gated_attention_gate_f32,
@@ -100,6 +102,10 @@ fn sampleLoops(which: Scenario, profile: Profile) usize {
             .ci => 64,
             .bw => 32,
         },
+        .gated_delta_conv_f32, .gated_delta_qk_norm_f32 => switch (profile) {
+            .ci => 256,
+            .bw => 128,
+        },
         .gated_delta_step_f32 => switch (profile) {
             .ci => 128,
             .bw => 64,
@@ -180,6 +186,7 @@ fn modelRoleMatmulDims(model_id: []const u8, which: Scenario) !RoleMatmulDims {
 const GatedDeltaDims = struct {
     n_heads: usize,
     d_head: usize,
+    d_conv: usize,
 
     fn dInner(self: GatedDeltaDims) usize {
         return self.n_heads * self.d_head;
@@ -263,8 +270,8 @@ const ScanDims = struct {
 
 fn profileGatedDeltaDims(profile: Profile) GatedDeltaDims {
     return switch (profile) {
-        .ci => .{ .n_heads = 8, .d_head = 64 },
-        .bw => .{ .n_heads = 16, .d_head = 128 },
+        .ci => .{ .n_heads = 8, .d_head = 64, .d_conv = 4 },
+        .bw => .{ .n_heads = 16, .d_head = 128, .d_conv = 4 },
     };
 }
 
@@ -879,6 +886,111 @@ pub fn runGatedDeltaStepF32(allocator: std.mem.Allocator, cfg: RunConfig) !Scena
         .flops_per_iter = @intCast(flops * repeats),
         .bytes_per_iter = @intCast(bytes * repeats),
         .note = "Qwen3.5 recurrent step",
+    };
+}
+
+pub fn runGatedDeltaConvF32(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    const dims = profileGatedDeltaDims(cfg.profile);
+    const repeats = sampleLoops(.gated_delta_conv_f32, cfg.profile);
+    const qkv_len = 3 * dims.dInner();
+    const state_elems = qkv_len * dims.d_conv;
+
+    const baseline_values = try allocFilledF32(allocator, qkv_len, 201);
+    defer allocator.free(baseline_values);
+    const values = try allocator.alloc(f32, qkv_len);
+    defer allocator.free(values);
+    const state = try allocZeroF32(allocator, state_elems);
+    defer allocator.free(state);
+    const weight_channel_major = try allocFilledF32(allocator, state_elems, 202);
+    defer allocator.free(weight_channel_major);
+    const weight_time_major = try allocator.alloc(f32, state_elems);
+    defer allocator.free(weight_time_major);
+    try cpu.conv1d_depthwise.transposeChannelMajorToTimeMajor(weight_channel_major, weight_time_major, qkv_len, dims.d_conv);
+    const bias = try allocFilledF32(allocator, qkv_len, 203);
+    defer allocator.free(bias);
+    const out = try allocZeroF32(allocator, qkv_len);
+    defer allocator.free(out);
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    @memcpy(values, baseline_values);
+    @memset(state, 0.0);
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..repeats) |_| cpu.conv1d_depthwise.runTimeMajorValues(values, state, weight_time_major, out, bias, qkv_len, dims.d_conv);
+    const cold_ns = timer.read();
+
+    for (0..cfg.warmup) |_| {
+        @memcpy(values, baseline_values);
+        @memset(state, 0.0);
+        for (0..repeats) |_| cpu.conv1d_depthwise.runTimeMajorValues(values, state, weight_time_major, out, bias, qkv_len, dims.d_conv);
+    }
+    for (samples) |*sample| {
+        @memcpy(values, baseline_values);
+        @memset(state, 0.0);
+        timer = std.time.Timer.start() catch unreachable;
+        for (0..repeats) |_| cpu.conv1d_depthwise.runTimeMajorValues(values, state, weight_time_major, out, bias, qkv_len, dims.d_conv);
+        sample.eval_ns = timer.read();
+    }
+
+    const flops = qkv_len * (2 * dims.d_conv + 1);
+    const bytes = (3 * state_elems + 4 * qkv_len) * @sizeOf(f32);
+    return .{
+        .name = "gdelta_conv_f32",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_ns = cold_ns,
+        .sample_loops = repeats,
+        .flops_per_iter = @intCast(flops * repeats),
+        .bytes_per_iter = @intCast(bytes * repeats),
+        .note = "Qwen3.5 depthwise conv step",
+    };
+}
+
+pub fn runGatedDeltaQkNormF32(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    const dims = profileGatedDeltaDims(cfg.profile);
+    const repeats = sampleLoops(.gated_delta_qk_norm_f32, cfg.profile);
+    const d_inner = dims.dInner();
+    const baseline_query = try allocFilledF32(allocator, d_inner, 211);
+    defer allocator.free(baseline_query);
+    const baseline_key = try allocFilledF32(allocator, d_inner, 212);
+    defer allocator.free(baseline_key);
+    const query = try allocator.alloc(f32, d_inner);
+    defer allocator.free(query);
+    const key = try allocator.alloc(f32, d_inner);
+    defer allocator.free(key);
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    @memcpy(query, baseline_query);
+    @memcpy(key, baseline_key);
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..repeats) |_| try cpu.gated_delta.normalizeQueryKeyInPlace(query, key, dims.n_heads, dims.d_head);
+    const cold_ns = timer.read();
+
+    for (0..cfg.warmup) |_| {
+        @memcpy(query, baseline_query);
+        @memcpy(key, baseline_key);
+        for (0..repeats) |_| try cpu.gated_delta.normalizeQueryKeyInPlace(query, key, dims.n_heads, dims.d_head);
+    }
+    for (samples) |*sample| {
+        @memcpy(query, baseline_query);
+        @memcpy(key, baseline_key);
+        timer = std.time.Timer.start() catch unreachable;
+        for (0..repeats) |_| try cpu.gated_delta.normalizeQueryKeyInPlace(query, key, dims.n_heads, dims.d_head);
+        sample.eval_ns = timer.read();
+    }
+
+    const flops = 6 * d_inner;
+    const bytes = 4 * d_inner * @sizeOf(f32);
+    return .{
+        .name = "gdelta_qk_norm_f32",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_ns = cold_ns,
+        .sample_loops = repeats,
+        .flops_per_iter = @intCast(flops * repeats),
+        .bytes_per_iter = @intCast(bytes * repeats),
+        .note = "Qwen3.5 q/k normalization",
     };
 }
 

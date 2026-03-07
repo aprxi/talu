@@ -396,10 +396,29 @@ pub const LocalEngine = struct {
         const loader_thread_handle = std.Thread.spawn(.{}, ModelLoaderThread.loadModel, .{&loader_thread_state}) catch null;
 
         // Load tokenizer while model loads in background
-        var tokenizer_instance = if (model_bundle.tokenizer_json()) |json|
-            try tokenizer_mod.Tokenizer.initFromJson(allocator, json)
-        else
-            try tokenizer_mod.Tokenizer.initFromPath(allocator, model_bundle.tokenizer_path());
+        var tokenizer_instance = blk: {
+            if (model_bundle.tokenizer_json()) |json| {
+                break :blk tokenizer_mod.Tokenizer.initFromJson(allocator, json) catch |err| {
+                    log.warn("inference", "Tokenizer initialization failed", .{
+                        .reason = @errorName(err),
+                        .source = "json",
+                        .json_bytes = json.len,
+                        .model_path = resolved_model_path,
+                    });
+                    return err;
+                };
+            }
+            const tokenizer_path = model_bundle.tokenizer_path();
+            break :blk tokenizer_mod.Tokenizer.initFromPath(allocator, tokenizer_path) catch |err| {
+                log.warn("inference", "Tokenizer initialization failed", .{
+                    .reason = @errorName(err),
+                    .source = "path",
+                    .tokenizer_path = tokenizer_path,
+                    .model_path = resolved_model_path,
+                });
+                return err;
+            };
+        };
         errdefer tokenizer_instance.deinit();
 
         {

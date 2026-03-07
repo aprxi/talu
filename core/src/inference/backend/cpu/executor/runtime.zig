@@ -6,6 +6,7 @@
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 const graph_types = @import("../../../../models/op_types.zig");
+const log = @import("../../../../log.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
@@ -568,7 +569,14 @@ pub const CpuKernel = union(enum) {
             } else return SlotContextError.MissingMambaState,
             .gated_delta => |k| if (slot_state.gated_delta_state) |*gated_delta_state| {
                 const gated_delta_scratch = shared_state.gated_delta_scratch orelse return SlotContextError.MissingGatedDeltaScratch;
-                try k.forward(input, output, gated_delta_state, gated_delta_scratch, &ctx.scratch.matmul_scratch);
+                k.forward(input, output, gated_delta_state, gated_delta_scratch, &ctx.scratch.matmul_scratch) catch |err| {
+                    log.warn("inference", "CPU gated-delta kernel forward failed", .{
+                        .reason = @errorName(err),
+                        .layer_idx = k.layer_idx,
+                        .has_time_major = k.conv_weight_transposed != null,
+                    });
+                    return err;
+                };
             } else return SlotContextError.MissingGatedDeltaState,
             .shortconv => |k| if (slot_state.shortconv_state) |*shortconv_state| {
                 const shortconv_scratch = shared_state.shortconv_scratch orelse return SlotContextError.MissingShortConvScratch;
@@ -604,7 +612,14 @@ pub const CpuKernel = union(enum) {
             } else return SlotContextError.MissingMambaState,
             .gated_delta => |k| if (slot_state.gated_delta_state) |*gated_delta_state| {
                 const gated_delta_scratch = shared_state.gated_delta_scratch orelse return SlotContextError.MissingGatedDeltaScratch;
-                try k.forward(input, output, gated_delta_state, gated_delta_scratch, &ctx.scratch.matmul_scratch);
+                k.forward(input, output, gated_delta_state, gated_delta_scratch, &ctx.scratch.matmul_scratch) catch |err| {
+                    log.warn("inference", "CPU gated-delta batched forward failed", .{
+                        .reason = @errorName(err),
+                        .layer_idx = k.layer_idx,
+                        .has_time_major = k.conv_weight_transposed != null,
+                    });
+                    return err;
+                };
             } else return SlotContextError.MissingGatedDeltaState,
             .shortconv => |k| if (slot_state.shortconv_state) |*shortconv_state| {
                 const shortconv_scratch = shared_state.shortconv_scratch orelse return SlotContextError.MissingShortConvScratch;

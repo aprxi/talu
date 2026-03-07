@@ -4,6 +4,11 @@
 //! rather than inside inference backend orchestration.
 
 const std = @import("std");
+const math = @import("math.zig");
+const simd = math.simd;
+
+const VEC_LEN = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
 
 pub fn compactQueryProjection(
     query_projection_values: []const f32,
@@ -49,6 +54,7 @@ pub fn applyOutputGateInPlace(
     if (head_count * head_dim != query_dim) return error.InvalidShape;
     if (query_projection_dim != head_count * head_dim * 2) return error.InvalidShape;
 
+    const one: F32Vec = @splat(1.0);
     for (0..sequence_len) |row| {
         const row_ctx_offset = row * query_dim;
         const row_proj_offset = row * query_projection_dim;
@@ -59,8 +65,15 @@ pub fn applyOutputGateInPlace(
             const gate_base = head_idx * head_dim * 2 + head_dim;
             const context_head = context_row[ctx_base .. ctx_base + head_dim];
             const gate_head = proj_row[gate_base .. gate_base + head_dim];
-            for (context_head, gate_head) |*ov, gv| {
-                ov.* *= 1.0 / (1.0 + @exp(-gv));
+            var idx: usize = 0;
+            while (idx + VEC_LEN - 1 < head_dim) : (idx += VEC_LEN) {
+                const gate_vec: F32Vec = gate_head[idx..][0..VEC_LEN].*;
+                const sig = one / (one + math.fastExp(-gate_vec));
+                const ctx = context_head[idx..][0..VEC_LEN];
+                ctx.* = ctx.* * sig;
+            }
+            while (idx < head_dim) : (idx += 1) {
+                context_head[idx] *= 1.0 / (1.0 + math.fastExpScalar(-gate_head[idx]));
             }
         }
     }

@@ -593,7 +593,16 @@ fn initCpu(
     reason: []const u8,
     progress: progress_mod.Context,
 ) !Backend {
-    const cpu_backend_state = try cpu.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE, progress);
+    const cpu_backend_state = cpu.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE, progress) catch |err| {
+        log.warn("inference", "CPU backend init failed", .{
+            .reason = @errorName(err),
+            .arch = @tagName(loaded.config.model_arch),
+            .has_gated_delta = loaded.runtime.has_gated_delta,
+            .has_shortconv = loaded.runtime.has_shortconv,
+            .has_mamba = loaded.runtime.has_mamba,
+        });
+        return err;
+    };
     log.info("inference", "Backend selected: cpu", .{ .reason = reason });
     return .{ .cpu = cpu_backend_state };
 }

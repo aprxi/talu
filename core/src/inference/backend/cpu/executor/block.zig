@@ -9,6 +9,7 @@ const plan_compiler = @import("../../../../models/plan/compiler.zig");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const error_context = @import("../../../../error_context.zig");
+const log = @import("../../../../log.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const tv = compute.cpu.tensor_view;
@@ -185,6 +186,10 @@ const MambaRuntimeMetadata = struct {
 const GatedDeltaRuntimeMetadata = struct {
     matmul_in_proj: @TypeOf(@as(gated_delta_kernel.GatedDeltaKernel, undefined).matmul_in_proj),
     matmul_out_proj: @TypeOf(@as(gated_delta_kernel.GatedDeltaKernel, undefined).matmul_out_proj),
+    // Flattened runtime handle for pre-transposed conv weights (time-major).
+    // When present, the execute path reuses this exact view and preserves the
+    // optimized conv1d path during warmup and batched dispatch.
+    conv_weight_time_major: ?Tensor = null,
     layer_idx: u16,
 };
 
@@ -739,6 +744,18 @@ pub const Block = struct {
                 gated_delta[idx] = .{
                     .matmul_in_proj = binding.matmul_in_proj,
                     .matmul_out_proj = binding.matmul_out_proj,
+                    .conv_weight_time_major = if (binding.conv_weight_transposed) |weight_t|
+                        Tensor.view(
+                            @ptrCast(std.mem.sliceAsBytes(weight_t).ptr),
+                            &.{
+                                @as(usize, @intCast(binding.config.d_conv)),
+                                @as(usize, @intCast(binding.config.n_heads)) * @as(usize, @intCast(binding.config.d_head)) * 3,
+                            },
+                            .f32,
+                            null,
+                        )
+                    else
+                        null,
                     .layer_idx = binding.layer_idx,
                 };
             }
@@ -2306,7 +2323,21 @@ pub const Block = struct {
                 .matmul_in_proj = meta.matmul_in_proj,
                 .matmul_out_proj = meta.matmul_out_proj,
                 .layer_idx = meta.layer_idx,
+                .conv_weight_transposed = if (meta.conv_weight_time_major) |tensor_view|
+                    tensor_view.asSlice(f32)
+                else
+                    null,
             };
+            if (gated_delta_local.conv_weight_transposed == null) {
+                log.warn("inference", "CPU gated-delta runtime metadata missing time-major conv view", .{
+                    .op_index = state.op_index,
+                    .layer_idx = meta.layer_idx,
+                    .weight_dtype = @tagName(gated_delta_local.weights.conv1d_weight.dtype),
+                    .weight_dims = gated_delta_local.weights.conv1d_weight.n_dims,
+                    .weight_shape0 = if (gated_delta_local.weights.conv1d_weight.n_dims > 0) gated_delta_local.weights.conv1d_weight.shape[0] else 0,
+                    .weight_shape1 = if (gated_delta_local.weights.conv1d_weight.n_dims > 1) gated_delta_local.weights.conv1d_weight.shape[1] else 0,
+                });
+            }
             try dispatchGatedDeltaWithMode(state, insn, state_blocks, input, output, &gated_delta_local);
             return;
         } else if (comptime expected_opcode == .shortconv) {
@@ -4637,6 +4668,66 @@ test "shortConvTimeMajorWeightPtr returns pointer only for shortconv slot 1" {
     try testing.expectEqual(expected_ptr, @intFromPtr(@as(*const Tensor, @ptrCast(@alignCast(ptr)))));
     try testing.expect(Block.shortConvTimeMajorWeightPtr(&runtime_meta, .shortconv, 0, 0) == null);
     try testing.expect(Block.shortConvTimeMajorWeightPtr(&runtime_meta, .multihead_attention, 0, 1) == null);
+}
+
+test "buildRuntimeMetadata preserves gated-delta time-major conv weight view" {
+    const dk = try cpu_linalg.matmulKernel(.f32);
+    var conv_weight_time_major_storage = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const gated_delta_binding = gated_delta_kernel.GatedDeltaKernel{
+        .config = .{
+            .d_model = 4,
+            .d_conv = 2,
+            .n_heads = 1,
+            .d_head = 1,
+        },
+        .weights = undefined,
+        .matmul_in_proj = dk.func,
+        .matmul_out_proj = dk.func,
+        .layer_idx = 0,
+        .conv_weight_transposed = conv_weight_time_major_storage[0..],
+        .weight_allocator = null,
+    };
+
+    var norm = [_]?NormKernelBinding{null};
+    var attention = [_]?AttentionKernelBinding{null};
+    var mla = [_]?MlaAttentionKernelBinding{null};
+    var swiglu = [_]?SwiGLUKernelBinding{null};
+    var moe = [_]?MoeKernelBinding{null};
+    var mamba = [_]?MambaKernelBinding{null};
+    var gated_delta = [_]?GatedDeltaKernelBinding{&gated_delta_binding};
+    var shortconv = [_]?ShortConvKernelBinding{null};
+    const typed = Block.TypedInstructionKernelRefs{
+        .norm = norm[0..],
+        .attention = attention[0..],
+        .mla_attention = mla[0..],
+        .swiglu = swiglu[0..],
+        .moe = moe[0..],
+        .mamba = mamba[0..],
+        .gated_delta = gated_delta[0..],
+        .shortconv = shortconv[0..],
+    };
+
+    const plan = runtime_contract.ExecutionPlan{
+        .instructions = &.{
+            .{
+                .opcode = .gated_delta_net,
+                .inputs = &.{},
+                .outputs = &.{},
+                .weights = &.{},
+                .param_block_id = null,
+                .state_block_id = null,
+            },
+        },
+        .register_count = 0,
+        .state_descs = &.{},
+    };
+    var runtime_meta = try Block.buildRuntimeMetadata(testing.allocator, typed, &plan);
+    defer runtime_meta.deinit(testing.allocator);
+    const gated_delta_meta = runtime_meta.gated_delta[0] orelse return error.TestUnexpectedResult;
+    const time_major_tensor = gated_delta_meta.conv_weight_time_major orelse return error.TestUnexpectedResult;
+    const time_major_slice = time_major_tensor.asSlice(f32);
+    try testing.expectEqual(conv_weight_time_major_storage.len, time_major_slice.len);
+    try testing.expectEqual(@intFromPtr(conv_weight_time_major_storage[0..].ptr), @intFromPtr(time_major_slice.ptr));
 }
 
 test "resolveKernelWeightPtrForSlot routes layernorm bias via norm_bias slot" {

@@ -188,6 +188,102 @@ pub fn runTimeMajor(
     }
 }
 
+/// Depthwise 1D convolution with time-major transposed weights `[d_conv, conv_dim]`
+/// where the newest state row is written directly from `values`.
+pub fn runTimeMajorValues(
+    values: []const f32,
+    state: []f32,
+    weight_t: []const f32,
+    out: []f32,
+    bias: ?[]const f32,
+    conv_dim: usize,
+    d_conv: usize,
+) void {
+    @setFloatMode(.optimized);
+
+    if (d_conv > 1) {
+        const shift_src = state[conv_dim..];
+        const shift_dst = state[0 .. (d_conv - 1) * conv_dim];
+        @memcpy(shift_dst, shift_src[0..shift_dst.len]);
+    }
+
+    const newest_row = state[(d_conv - 1) * conv_dim ..][0..conv_dim];
+    @memcpy(newest_row, values[0..conv_dim]);
+
+    @memset(out, 0);
+
+    var k: usize = 0;
+    while (k + 4 <= d_conv) : (k += 4) {
+        const s0 = state[k * conv_dim ..][0..conv_dim];
+        const s1 = state[(k + 1) * conv_dim ..][0..conv_dim];
+        const s2 = state[(k + 2) * conv_dim ..][0..conv_dim];
+        const s3 = state[(k + 3) * conv_dim ..][0..conv_dim];
+        const w0 = weight_t[k * conv_dim ..][0..conv_dim];
+        const w1 = weight_t[(k + 1) * conv_dim ..][0..conv_dim];
+        const w2 = weight_t[(k + 2) * conv_dim ..][0..conv_dim];
+        const w3 = weight_t[(k + 3) * conv_dim ..][0..conv_dim];
+
+        var i: usize = 0;
+        while (i + VEC <= conv_dim) : (i += VEC) {
+            var acc: @Vector(VEC, f32) = out[i..][0..VEC].*;
+            acc = @mulAdd(@Vector(VEC, f32), s0[i..][0..VEC].*, w0[i..][0..VEC].*, acc);
+            acc = @mulAdd(@Vector(VEC, f32), s1[i..][0..VEC].*, w1[i..][0..VEC].*, acc);
+            acc = @mulAdd(@Vector(VEC, f32), s2[i..][0..VEC].*, w2[i..][0..VEC].*, acc);
+            acc = @mulAdd(@Vector(VEC, f32), s3[i..][0..VEC].*, w3[i..][0..VEC].*, acc);
+            out[i..][0..VEC].* = acc;
+        }
+        while (i < conv_dim) : (i += 1) {
+            out[i] += s0[i] * w0[i] + s1[i] * w1[i] + s2[i] * w2[i] + s3[i] * w3[i];
+        }
+    }
+
+    while (k + 2 <= d_conv) : (k += 2) {
+        const s0 = state[k * conv_dim ..][0..conv_dim];
+        const s1 = state[(k + 1) * conv_dim ..][0..conv_dim];
+        const w0 = weight_t[k * conv_dim ..][0..conv_dim];
+        const w1 = weight_t[(k + 1) * conv_dim ..][0..conv_dim];
+
+        var i: usize = 0;
+        while (i + VEC <= conv_dim) : (i += VEC) {
+            var acc: @Vector(VEC, f32) = out[i..][0..VEC].*;
+            acc = @mulAdd(@Vector(VEC, f32), s0[i..][0..VEC].*, w0[i..][0..VEC].*, acc);
+            acc = @mulAdd(@Vector(VEC, f32), s1[i..][0..VEC].*, w1[i..][0..VEC].*, acc);
+            out[i..][0..VEC].* = acc;
+        }
+        while (i < conv_dim) : (i += 1) {
+            out[i] += s0[i] * w0[i] + s1[i] * w1[i];
+        }
+    }
+
+    while (k < d_conv) : (k += 1) {
+        const state_row = state[k * conv_dim ..][0..conv_dim];
+        const weight_row = weight_t[k * conv_dim ..][0..conv_dim];
+
+        var i: usize = 0;
+        while (i + VEC <= conv_dim) : (i += VEC) {
+            const s: @Vector(VEC, f32) = state_row[i..][0..VEC].*;
+            const w: @Vector(VEC, f32) = weight_row[i..][0..VEC].*;
+            const o: @Vector(VEC, f32) = out[i..][0..VEC].*;
+            out[i..][0..VEC].* = @mulAdd(@Vector(VEC, f32), s, w, o);
+        }
+        while (i < conv_dim) : (i += 1) {
+            out[i] += state_row[i] * weight_row[i];
+        }
+    }
+
+    if (bias) |b| {
+        var i: usize = 0;
+        while (i + VEC <= conv_dim) : (i += VEC) {
+            const o: @Vector(VEC, f32) = out[i..][0..VEC].*;
+            const bv: @Vector(VEC, f32) = b[i..][0..VEC].*;
+            out[i..][0..VEC].* = o + bv;
+        }
+        while (i < conv_dim) : (i += 1) {
+            out[i] += b[i];
+        }
+    }
+}
+
 /// Transpose channel-major depthwise weights `[conv_dim, d_conv]` into
 /// time-major layout `[d_conv, conv_dim]`.
 pub fn transposeChannelMajorToTimeMajor(
@@ -265,6 +361,33 @@ test "transposeChannelMajorToTimeMajor transposes expected layout" {
         2, 5,
         3, 6,
     }, &dst);
+}
+
+test "runTimeMajorValues matches stepDepthwiseState for raw newest row" {
+    var values_a = [_]f32{ 0.5, -0.25, 1.0, 0.75 };
+    var values_b = values_a;
+    var state_a = [_]f32{0} ** 12;
+    var state_b = [_]f32{0} ** 12;
+    const weight_channel_major = [_]f32{
+        0.1, 0.2, 0.3,
+        0.4, 0.5, 0.6,
+        0.7, 0.8, 0.9,
+        1.0, 1.1, 1.2,
+    };
+    var weight_time_major = [_]f32{0} ** 12;
+    try transposeChannelMajorToTimeMajor(&weight_channel_major, &weight_time_major, 4, 3);
+    const bias = [_]f32{ 0.01, -0.02, 0.03, -0.04 };
+    var out = [_]f32{0} ** 4;
+
+    try stepDepthwiseState(&values_a, &state_a, &weight_channel_major, &bias, 4, 3);
+    runTimeMajorValues(&values_b, &state_b, &weight_time_major, &out, &bias, 4, 3);
+
+    try std.testing.expectEqualSlices(f32, &values_a, &out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        0.5, -0.25, 1.0, 0.75,
+    }, &state_b);
 }
 
 test "stepDepthwiseState updates state and writes output in place" {

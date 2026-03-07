@@ -163,6 +163,8 @@ pub const ffn_norm_point_mappings = [_]PointBenchMap{
 };
 
 pub const qwen3_5_hidden_rows = [_][]const u8{
+    "gdelta_conv_f32",
+    "gdelta_qk_norm_f32",
     "gdelta_step_f32",
     "gdelta_norm_f32",
 };

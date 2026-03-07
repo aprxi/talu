@@ -876,7 +876,11 @@ pub const TransformerBlock = struct {
                 .attention => |p| allocator.destroy(@constCast(p)),
                 .mla_attention => |p| allocator.destroy(@constCast(p)),
                 .mamba => |p| allocator.destroy(@constCast(p)),
-                .gated_delta => |p| allocator.destroy(@constCast(p)),
+                .gated_delta => |p| {
+                    const gated_delta_kernel = @constCast(p);
+                    gated_delta_kernel.deinit();
+                    allocator.destroy(gated_delta_kernel);
+                },
                 .shortconv => |p| {
                     // Free transposed weight buffer before destroying kernel.
                     const shortconv_kernel = @constCast(p);
@@ -1481,6 +1485,20 @@ pub const TransformerBlock = struct {
             matmul_in_proj,
             matmul_out_proj,
         );
+        gated_delta_ptr.initTransposedWeights(allocator) catch |err| {
+            log.warn("inference", "CPU gated-delta transposed-weight init failed", .{
+                .err_name = @errorName(err),
+                .block_idx = block_idx,
+                .conv_dtype = @tagName(kernel_gated_delta_weights.conv1d_weight.dtype),
+                .conv_dims = kernel_gated_delta_weights.conv1d_weight.n_dims,
+                .conv_shape0 = if (kernel_gated_delta_weights.conv1d_weight.n_dims > 0) kernel_gated_delta_weights.conv1d_weight.shape[0] else 0,
+                .conv_shape1 = if (kernel_gated_delta_weights.conv1d_weight.n_dims > 1) kernel_gated_delta_weights.conv1d_weight.shape[1] else 0,
+                .d_conv = weights.config.d_conv,
+                .n_heads = weights.config.n_heads,
+                .d_head = weights.config.d_head,
+            });
+            return err;
+        };
         gated_delta_ptr.layer_idx = @intCast(block_idx);
 
         var ffn_build = try buildOptionalSwigluTail(
@@ -2899,6 +2917,7 @@ test "TransformerBlock.init converts gated-delta mamba in_proj to f32" {
     const kernel = block.getGatedDeltaKernel() orelse return error.TestUnexpectedResult;
     try std.testing.expect(block.owned_gated_delta_in_proj != null);
     try std.testing.expectEqual(tensor.DType.f32, kernel.weights.in_proj.dtype);
+    try std.testing.expect(kernel.conv_weight_transposed != null);
     try std.testing.expectEqual(@as(i64, d_model), kernel.weights.in_proj.shape[0]);
     try std.testing.expectEqual(@as(i64, proj_len), kernel.weights.in_proj.shape[1]);
     try std.testing.expectApproxEqAbs(dtype.bf16ToF32(dtype.f32ToBf16(0.1)), kernel.weights.in_proj.asSlice(f32)[0], 1e-6);

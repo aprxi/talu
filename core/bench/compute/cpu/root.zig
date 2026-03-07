@@ -237,6 +237,8 @@ fn runScenario(allocator: std.mem.Allocator, cfg: scenarios.RunConfig, which: sc
         .softmax_f32 => try scenarios.runSoftmaxF32(allocator, cfg),
         .shortconv_decode_f32 => try scenarios.runShortconvDecodeF32(allocator, cfg),
         .mamba_scan_f32 => try scenarios.runMambaScanF32(allocator, cfg),
+        .gated_delta_conv_f32 => try scenarios.runGatedDeltaConvF32(allocator, cfg),
+        .gated_delta_qk_norm_f32 => try scenarios.runGatedDeltaQkNormF32(allocator, cfg),
         .gated_delta_step_f32 => try scenarios.runGatedDeltaStepF32(allocator, cfg),
         .gated_delta_norm_f32 => try scenarios.runGatedDeltaNormF32(allocator, cfg),
         .gated_attention_gate_f32 => try scenarios.runGatedAttentionGateF32(allocator, cfg),
@@ -344,6 +346,8 @@ pub fn main() !void {
                 try runModelPreset(stdout, allocator, cfg.run, cfg.format, model_id, &peaks);
             } else {
                 if (cfg.format == .table) try stdout.writeAll("P1 model-critical\n");
+                updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_conv_f32));
+                updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_qk_norm_f32));
                 updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_step_f32));
                 updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_norm_f32));
                 updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_attention_gate_f32));
@@ -389,6 +393,8 @@ pub fn main() !void {
         .softmax_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .softmax_f32)),
         .shortconv_decode_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .shortconv_decode_f32)),
         .mamba_scan_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .mamba_scan_f32)),
+        .gated_delta_conv_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_conv_f32)),
+        .gated_delta_qk_norm_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_qk_norm_f32)),
         .gated_delta_step_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_step_f32)),
         .gated_delta_norm_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_norm_f32)),
         .gated_attention_gate_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_attention_gate_f32)),
@@ -446,6 +452,8 @@ fn scenarioFromBenchRowName(name: []const u8) ?scenarios.Scenario {
     if (std.mem.eql(u8, name, "role.attn_out")) return .role_attn_out_bf16;
     if (std.mem.eql(u8, name, "role.ffn_gate")) return .role_ffn_gate_bf16;
     if (std.mem.eql(u8, name, "role.ffn_down")) return .role_ffn_down_bf16;
+    if (std.mem.eql(u8, name, "gdelta_conv_f32")) return .gated_delta_conv_f32;
+    if (std.mem.eql(u8, name, "gdelta_qk_norm_f32")) return .gated_delta_qk_norm_f32;
     if (std.mem.eql(u8, name, "gdelta_step_f32")) return .gated_delta_step_f32;
     if (std.mem.eql(u8, name, "gdelta_norm_f32")) return .gated_delta_norm_f32;
     if (std.mem.eql(u8, name, "rope_f32")) return .rope_f32;
