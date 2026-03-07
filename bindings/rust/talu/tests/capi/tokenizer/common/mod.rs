@@ -569,6 +569,14 @@ pub fn byte_token_id(byte: u8) -> u32 {
     byte as u32 + 4
 }
 
+/// UTF-8 token surface emitted by the byte-level fixture for a raw byte.
+///
+/// This is the GPT-2 byte-to-Unicode mapping encoded as UTF-8, not the
+/// original input byte.
+pub fn byte_token_surface(byte: u8) -> String {
+    gpt2_byte_to_unicode()[byte as usize].to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Post-processor fixture (adds BOS/EOS during encoding)
 // ---------------------------------------------------------------------------

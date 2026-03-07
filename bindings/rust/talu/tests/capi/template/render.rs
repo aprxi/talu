@@ -921,6 +921,26 @@ fn is_string_true_for_strings() {
     );
 }
 
+/// Tests can override `strftime_now()` directly through template context
+/// instead of normalizing rendered output after the fact.
+#[test]
+fn strftime_now_override_string_is_used_verbatim() {
+    let tmpl = "Today: {{ strftime_now('%Y-%m-%d') }}";
+    let vars = r#"{"strftime_now":true,"strftime_now_override":"[TODAY]"}"#;
+    let result = render_template(tmpl, vars, false).unwrap();
+    assert_eq!(result, "Today: [TODAY]");
+}
+
+/// Exact epoch override keeps `strftime_now()` deterministic while still
+/// exercising the formatter itself.
+#[test]
+fn strftime_now_epoch_override_formats_requested_pattern() {
+    let tmpl = "{{ strftime_now('%Y-%m-%d %H:%M:%S') }}";
+    let vars = r#"{"strftime_now":true,"strftime_now_epoch_secs":0}"#;
+    let result = render_template(tmpl, vars, false).unwrap();
+    assert_eq!(result, "1970-01-01 00:00:00");
+}
+
 /// `is string` must return false for non-string values.
 #[test]
 fn is_string_false_for_non_strings() {

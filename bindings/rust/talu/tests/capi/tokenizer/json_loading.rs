@@ -15,6 +15,9 @@ fn no_bos() -> talu_sys::EncodeOptions {
     }
 }
 
+// Keep in sync with core/src/tokenizer/loader.zig.
+const MAX_JSON_PIPELINE_DEPTH: usize = 128;
+
 /// Try to load a tokenizer from JSON; return Ok(handle) or Err(error_code).
 fn try_load(json_str: &str) -> Result<*mut c_void, i32> {
     let json = json_str.as_bytes();
@@ -38,6 +41,67 @@ fn nested_sequence_normalizer(depth: usize, leaf: &str) -> String {
     for _ in 0..depth {
         current = format!(
             r#"{{"type":"Sequence","normalizers":[{}]}}"#,
+            current
+        );
+    }
+    current
+}
+
+fn nested_sequence_pretokenizer(depth: usize, leaf: &str) -> String {
+    let mut current = leaf.to_owned();
+    for _ in 0..depth {
+        current = format!(
+            r#"{{"type":"Sequence","pretokenizers":[{}]}}"#,
+            current
+        );
+    }
+    current
+}
+
+fn nested_sequence_postprocessor(depth: usize, leaf: &str) -> String {
+    let mut current = leaf.to_owned();
+    for _ in 0..depth {
+        current = format!(
+            r#"{{"type":"Sequence","processors":[{}]}}"#,
+            current
+        );
+    }
+    current
+}
+
+fn nested_sequence_decoder(depth: usize, leaf: &str) -> String {
+    let mut current = leaf.to_owned();
+    for _ in 0..depth {
+        current = format!(
+            r#"{{"type":"Sequence","decoders":[{}]}}"#,
+            current
+        );
+    }
+    current
+}
+
+fn nested_sequence_wordpiece_decoder(depth: usize, cleanup: bool) -> String {
+    let mut current = format!(
+        r###"{{"type":"WordPiece","prefix":"##","cleanup":{}}}"###,
+        if cleanup { "true" } else { "false" }
+    );
+    for _ in 0..depth {
+        current = format!(
+            r#"{{"type":"Sequence","decoders":[{}]}}"#,
+            current
+        );
+    }
+    current
+}
+
+fn nested_sequence_metaspace_decoder(depth: usize, add_prefix_space: bool) -> String {
+    let mut current = format!(
+        r#"{{"type":"Metaspace","replacement":"▁","add_prefix_space":{}}}"#,
+        if add_prefix_space { "true" } else { "false" }
+    );
+    for _ in 0..depth {
+        current = format!(
+            r#"{{"type":"Sequence","decoders":[{}]}}"#,
             current
         );
     }
@@ -93,6 +157,30 @@ fn bpe_hf_default_optional_fields_load() {
     unsafe { talu_sys::talu_tokenizer_free(handle) };
 }
 
+/// Extremely sparse BPE vocab IDs must be rejected up front rather than
+/// attempting to allocate an `id_to_token` table near the attacker-controlled
+/// max ID.
+#[test]
+fn bpe_astronomically_sparse_vocab_id_returns_error() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "boom": 2147483647},
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    assert!(
+        try_load(json).is_err(),
+        "astronomically sparse BPE vocab IDs must be rejected deterministically"
+    );
+}
+
 /// Valid minimal WordPiece JSON loads without error.
 #[test]
 fn valid_minimal_wordpiece_loads() {
@@ -111,6 +199,29 @@ fn valid_minimal_wordpiece_loads() {
 }"#;
     let handle = try_load(json).expect("valid WordPiece JSON must load");
     unsafe { talu_sys::talu_tokenizer_free(handle) };
+}
+
+/// Extremely sparse WordPiece vocab IDs must also be rejected before building
+/// the dense ID lookup table.
+#[test]
+fn wordpiece_astronomically_sparse_vocab_id_returns_error() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {"[UNK]": 0, "boom": 2147483647}
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    assert!(
+        try_load(json).is_err(),
+        "astronomically sparse WordPiece vocab IDs must be rejected deterministically"
+    );
 }
 
 /// Valid minimal Unigram JSON loads without error.
@@ -262,7 +373,7 @@ fn unknown_pretokenizer_type_returns_error() {
 /// rather than failing or crashing due to parser/loader recursion.
 #[test]
 fn deeply_nested_sequence_normalizer_loads_and_normalizes() {
-    let normalizer = nested_sequence_normalizer(64, r#"{"type":"Lowercase"}"#);
+    let normalizer = nested_sequence_normalizer(MAX_JSON_PIPELINE_DEPTH, r#"{"type":"Lowercase"}"#);
     let json = format!(
         r#"{{
   "version": "1.0",
@@ -287,6 +398,318 @@ fn deeply_nested_sequence_normalizer_loads_and_normalizes() {
         vec![1, 2, 3],
         "deeply nested lowercase normalizer must still apply semantics correctly"
     );
+}
+
+/// Extremely deep Sequence normalizers must be rejected deterministically
+/// instead of recursing until stack exhaustion.
+#[test]
+fn deeply_nested_sequence_normalizer_over_limit_returns_error() {
+    let normalizer =
+        nested_sequence_normalizer(MAX_JSON_PIPELINE_DEPTH + 1, r#"{"type":"Lowercase"}"#);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{"<unk>": 0, "a": 1}},
+    "merges": []
+  }},
+  "added_tokens": [{{"id": 0, "content": "<unk>", "special": true}}],
+  "normalizer": {},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}}"#,
+        normalizer
+    );
+    assert!(
+        try_load(&json).is_err(),
+        "over-limit normalizer nesting must return an error, not overflow"
+    );
+}
+
+/// Sequence normalizers exactly at the supported nesting budget must still load.
+#[test]
+fn deeply_nested_sequence_normalizer_at_limit_loads() {
+    let normalizer = nested_sequence_normalizer(MAX_JSON_PIPELINE_DEPTH, r#"{"type":"Lowercase"}"#);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{"<unk>": 0, "a": 1}},
+    "merges": []
+  }},
+  "added_tokens": [{{"id": 0, "content": "<unk>", "special": true}}],
+  "normalizer": {},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}}"#,
+        normalizer
+    );
+    let handle = try_load(&json).expect("at-limit normalizer nesting must load");
+    unsafe { talu_sys::talu_tokenizer_free(handle) };
+}
+
+/// Extremely deep Sequence pre-tokenizers must be rejected deterministically
+/// instead of recursing until stack exhaustion.
+#[test]
+fn deeply_nested_sequence_pretokenizer_over_limit_returns_error() {
+    let pre_tokenizer =
+        nested_sequence_pretokenizer(MAX_JSON_PIPELINE_DEPTH + 1, r#"{"type":"Whitespace"}"#);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{"<unk>": 0, "a": 1}},
+    "merges": []
+  }},
+  "added_tokens": [{{"id": 0, "content": "<unk>", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": {},
+  "post_processor": null,
+  "decoder": null
+}}"#,
+        pre_tokenizer
+    );
+    assert!(
+        try_load(&json).is_err(),
+        "over-limit pretokenizer nesting must return an error, not overflow"
+    );
+}
+
+/// Sequence pre-tokenizers exactly at the supported nesting budget must still load.
+#[test]
+fn deeply_nested_sequence_pretokenizer_at_limit_loads() {
+    let pre_tokenizer =
+        nested_sequence_pretokenizer(MAX_JSON_PIPELINE_DEPTH, r#"{"type":"Whitespace"}"#);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{"<unk>": 0, "a": 1}},
+    "merges": []
+  }},
+  "added_tokens": [{{"id": 0, "content": "<unk>", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": {},
+  "post_processor": null,
+  "decoder": null
+}}"#,
+        pre_tokenizer
+    );
+    let handle = try_load(&json).expect("at-limit pretokenizer nesting must load");
+    unsafe { talu_sys::talu_tokenizer_free(handle) };
+}
+
+/// Extremely deep Sequence post-processors must be rejected deterministically
+/// instead of recursing until stack exhaustion.
+#[test]
+fn deeply_nested_sequence_postprocessor_over_limit_returns_error() {
+    let post_processor =
+        nested_sequence_postprocessor(MAX_JSON_PIPELINE_DEPTH + 1, r#"{"type":"ByteLevel"}"#);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{"<unk>": 0, "a": 1}},
+    "merges": []
+  }},
+  "added_tokens": [{{"id": 0, "content": "<unk>", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": {},
+  "decoder": null
+}}"#,
+        post_processor
+    );
+    assert!(
+        try_load(&json).is_err(),
+        "over-limit postprocessor nesting must return an error, not overflow"
+    );
+}
+
+/// Sequence post-processors exactly at the supported nesting budget must still load.
+#[test]
+fn deeply_nested_sequence_postprocessor_at_limit_loads() {
+    let post_processor =
+        nested_sequence_postprocessor(MAX_JSON_PIPELINE_DEPTH, r#"{"type":"ByteLevel"}"#);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{"<unk>": 0, "a": 1}},
+    "merges": []
+  }},
+  "added_tokens": [{{"id": 0, "content": "<unk>", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": {},
+  "decoder": null
+}}"#,
+        post_processor
+    );
+    let handle = try_load(&json).expect("at-limit postprocessor nesting must load");
+    unsafe { talu_sys::talu_tokenizer_free(handle) };
+}
+
+/// Sequence decoders above the supported nesting budget must return a typed
+/// loader error instead of recursing indefinitely.
+#[test]
+fn deeply_nested_sequence_decoder_over_limit_returns_error() {
+    let decoder =
+        nested_sequence_decoder(MAX_JSON_PIPELINE_DEPTH + 1, r#"{"type":"ByteLevel"}"#);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{"<unk>": 0, "a": 1}},
+    "merges": []
+  }},
+  "added_tokens": [{{"id": 0, "content": "<unk>", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {}
+}}"#,
+        decoder
+    );
+    assert!(
+        try_load(&json).is_err(),
+        "over-limit decoder nesting must return an error, not overflow"
+    );
+}
+
+/// Sequence decoders exactly at the supported nesting budget must still load.
+#[test]
+fn deeply_nested_sequence_decoder_at_limit_loads() {
+    let decoder =
+        nested_sequence_decoder(MAX_JSON_PIPELINE_DEPTH, r#"{"type":"ByteLevel"}"#);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{"<unk>": 0, "a": 1}},
+    "merges": []
+  }},
+  "added_tokens": [{{"id": 0, "content": "<unk>", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {}
+}}"#,
+        decoder
+    );
+    let handle = try_load(&json).expect("at-limit decoder nesting must load");
+    unsafe { talu_sys::talu_tokenizer_free(handle) };
+}
+
+/// Over-limit nested Metaspace decoder trees must also be rejected, not just
+/// generic ByteLevel decoder leaves.
+#[test]
+fn deeply_nested_sequence_metaspace_decoder_over_limit_returns_error() {
+    let decoder = nested_sequence_metaspace_decoder(MAX_JSON_PIPELINE_DEPTH + 1, true);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{"<unk>": 0, "a": 1}},
+    "merges": []
+  }},
+  "added_tokens": [{{"id": 0, "content": "<unk>", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {}
+}}"#,
+        decoder
+    );
+    assert!(
+        try_load(&json).is_err(),
+        "over-limit nested Metaspace decoder must return an error, not overflow or load"
+    );
+}
+
+/// Over-limit nested WordPiece decoder trees must also be rejected.
+#[test]
+fn deeply_nested_sequence_wordpiece_decoder_over_limit_returns_error() {
+    let decoder = nested_sequence_wordpiece_decoder(MAX_JSON_PIPELINE_DEPTH + 1, false);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {{"[UNK]": 0, "a": 1}}
+  }},
+  "added_tokens": [{{"id": 0, "content": "[UNK]", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {}
+}}"#,
+        decoder
+    );
+    assert!(
+        try_load(&json).is_err(),
+        "over-limit nested WordPiece decoder must return an error, not overflow or load"
+    );
+}
+
+/// At-limit nested Metaspace decoder trees must still load.
+#[test]
+fn deeply_nested_sequence_metaspace_decoder_at_limit_loads() {
+    let decoder = nested_sequence_metaspace_decoder(MAX_JSON_PIPELINE_DEPTH, true);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{"<unk>": 0, "a": 1}},
+    "merges": []
+  }},
+  "added_tokens": [{{"id": 0, "content": "<unk>", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {}
+}}"#,
+        decoder
+    );
+    let handle = try_load(&json).expect("at-limit nested Metaspace decoder must load");
+    unsafe { talu_sys::talu_tokenizer_free(handle) };
+}
+
+/// At-limit nested WordPiece decoder trees must still load.
+#[test]
+fn deeply_nested_sequence_wordpiece_decoder_at_limit_loads() {
+    let decoder = nested_sequence_wordpiece_decoder(MAX_JSON_PIPELINE_DEPTH, false);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {{"[UNK]": 0, "a": 1}}
+  }},
+  "added_tokens": [{{"id": 0, "content": "[UNK]", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {}
+}}"#,
+        decoder
+    );
+    let handle = try_load(&json).expect("at-limit nested WordPiece decoder must load");
+    unsafe { talu_sys::talu_tokenizer_free(handle) };
 }
 
 /// Unknown decoder type must be rejected.

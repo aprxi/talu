@@ -520,6 +520,86 @@ fn offsets_byte_level_mixed_ascii_emoji() {
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
+/// Offsets for a regional-indicator flag emoji must still map one token per
+/// UTF-8 byte on the byte-level fixture.
+#[test]
+fn offsets_byte_level_flag_emoji() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let text = "🇺🇸";
+    assert_eq!(text.len(), 8);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 8);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    for (i, off) in offsets.iter().enumerate() {
+        assert_eq!(off.start as usize, i, "flag offset[{i}].start");
+        assert_eq!(off.end as usize, i + 1, "flag offset[{i}].end");
+    }
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Offsets for a variation-selector emoji sequence must remain single-byte
+/// spans on the byte-level fixture.
+#[test]
+fn offsets_byte_level_variation_selector_emoji() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let text = "❤️";
+    assert_eq!(text.len(), 6);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 6);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    for (i, off) in offsets.iter().enumerate() {
+        assert_eq!(off.start as usize, i, "variation-selector offset[{i}].start");
+        assert_eq!(off.end as usize, i + 1, "variation-selector offset[{i}].end");
+    }
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Offsets for a ZWJ family emoji sequence must remain one-byte spans on the
+/// byte-level fixture even though the visible glyph is a single grapheme.
+#[test]
+fn offsets_byte_level_zwj_family_sequence() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let text = "👨\u{200D}👩\u{200D}👧\u{200D}👦";
+    assert_eq!(text.len(), 25);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 25);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    for (i, off) in offsets.iter().enumerate() {
+        assert_eq!(off.start as usize, i, "zwj offset[{i}].start");
+        assert_eq!(off.end as usize, i + 1, "zwj offset[{i}].end");
+    }
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Offsets for decomposed combining-mark text must also remain one-byte spans
+/// on the byte-level fixture.
+#[test]
+fn offsets_byte_level_decomposed_combining_marks() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let text = "a\u{0301}\u{0308}";
+    assert_eq!(text.len(), 5);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 5);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    for (i, off) in offsets.iter().enumerate() {
+        assert_eq!(off.start as usize, i, "combining offset[{i}].start");
+        assert_eq!(off.end as usize, i + 1, "combining offset[{i}].end");
+    }
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
 // ===========================================================================
 // Truncation preserves all encode result fields
 // ===========================================================================
@@ -1141,6 +1221,72 @@ fn offsets_replace_expansion_in_middle_preserves_neighbor_spans() {
     assert_eq!((offsets[2].start, offsets[2].end), (1, 2), "expanded n span");
     assert_eq!((offsets[3].start, offsets[3].end), (1, 2), "expanded d span");
     assert_eq!((offsets[4].start, offsets[4].end), (2, 3), "B span");
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Large NFKC expansions must keep every emitted token mapped to the original
+/// source scalar span, not drift or walk past the source buffer.
+#[test]
+fn offsets_with_nfkc_large_expansion_map_to_single_source_scalar() {
+    let json = build_byte_level_tokenizer_json().replace(
+        "\"normalizer\": null,",
+        "\"normalizer\": {\"type\": \"NFKC\"},",
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let input = "\u{FDFA}";
+    assert_eq!(input.len(), 3, "U+FDFA must be a 3-byte UTF-8 scalar");
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert!(
+        result.num_tokens > 10,
+        "U+FDFA should expand substantially under NFKC, got only {} tokens",
+        result.num_tokens
+    );
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    for (idx, off) in offsets.iter().enumerate() {
+        assert_eq!(
+            (off.start, off.end),
+            (0, 3),
+            "expanded token {idx} must map back to the original U+FDFA byte span"
+        );
+    }
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Repeating a large-expansion scalar many times must not overflow offset
+/// reconstruction. Every expanded token still belongs to exactly one original
+/// 3-byte scalar span.
+#[test]
+fn offsets_with_repeated_nfkc_large_expansion_stay_within_source_bounds() {
+    let json = build_byte_level_tokenizer_json().replace(
+        "\"normalizer\": null,",
+        "\"normalizer\": {\"type\": \"NFKC\"},",
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let input = "\u{FDFA}".repeat(64);
+    assert_eq!(input.len(), 64 * 3, "repeated U+FDFA must stay 3 bytes per scalar");
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert!(
+        result.num_tokens > 64 * 10,
+        "repeated U+FDFA should expand substantially under NFKC, got only {} tokens",
+        result.num_tokens
+    );
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    for (idx, off) in offsets.iter().enumerate() {
+        let start = off.start as usize;
+        let end = off.end as usize;
+        assert!(start < end, "expanded token {idx} must have a non-empty source span");
+        assert!(end <= input.len(), "expanded token {idx} must stay within the source bounds");
+        assert_eq!(end - start, 3, "expanded token {idx} must map to exactly one source scalar");
+        assert_eq!(start % 3, 0, "expanded token {idx} start must align to the repeated-scalar boundary");
+    }
+
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 

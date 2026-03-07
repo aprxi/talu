@@ -10,6 +10,7 @@ const ct = @import("c_types.zig");
 const tok_encode = @import("encode.zig");
 const normalize = @import("normalize.zig");
 const unigram = @import("unigram.zig");
+const utils = @import("utils.zig");
 const wordpiece = @import("wordpiece.zig");
 
 /// Token offset in source text (UTF-8 byte indices).
@@ -51,6 +52,7 @@ pub fn computeOffsetsFromEncoding(
     };
     const token_cstrs: ?[*][*c]u8 = if (encoding.tokens) |toks| @ptrCast(toks) else null;
     const is_byte_level = tokenizer_handle.pretokenizer.byte_level != 0;
+    const byte_level_uses_source_map = is_byte_level and byteLevelRequiresSourceMap(tokenizer_handle);
     const unk_id = tokenizer_handle.getUnkId();
 
     for (0..token_count) |token_idx| {
@@ -58,6 +60,14 @@ pub fn computeOffsetsFromEncoding(
 
         // Resolve token text: from encoding.tokens if available, otherwise from vocab by ID.
         var token_text: []const u8 = blk: {
+            // Byte-level offsets are defined in terms of model byte tokens, not
+            // the higher-level token surfaces that encode() may expose for the
+            // original UTF-8 text. Use the vocab/add-token text by ID here so a
+            // single raw byte never expands to an entire emoji or accented scalar.
+            if (is_byte_level and token_id != unk_id) {
+                break :blk tokenizer_handle.idToToken(token_id) orelse
+                    tok_encode.findAddedTokenContentById(tokenizer_handle, token_id) orelse "";
+            }
             if (token_cstrs) |ts| {
                 const token_ptr: [*c]u8 = ts[token_idx];
                 if (token_ptr != null) break :blk std.mem.sliceTo(token_ptr, 0);
@@ -92,7 +102,11 @@ pub fn computeOffsetsFromEncoding(
             const end_offset = start_offset + token_byte_sequence.len;
             offsets[token_idx] = if (normalizedSpanIsSynthetic(&normalized, start_offset, end_offset))
                 .{ .start = 0, .end = 0 }
-            else blk: {
+            else if (byte_level_uses_source_map) blk: {
+                const source_offset = normalizedSpanToSourceOffset(&normalized, start_offset, end_offset);
+                text_offset = source_offset.end;
+                break :blk source_offset;
+            } else blk: {
                 const start_raw = text_offset;
                 const end_raw = start_raw + @as(u32, @intCast(token_byte_sequence.len));
                 text_offset = end_raw;
@@ -104,7 +118,16 @@ pub fn computeOffsetsFromEncoding(
 
         // Byte-level unk: each unk token represents 1 source byte
         if (token_text.len == 0 and is_byte_level and token_id == unk_id) {
-            if (text_offset < text.len) {
+            if (byte_level_uses_source_map) {
+                if (normalized_offset < normalized.text.len) {
+                    const source_offset = normalizedSpanToSourceOffset(&normalized, normalized_offset, normalized_offset + 1);
+                    offsets[token_idx] = source_offset;
+                    text_offset = source_offset.end;
+                    normalized_offset += 1;
+                } else {
+                    offsets[token_idx] = .{ .start = 0, .end = 0 };
+                }
+            } else if (text_offset < text.len) {
                 offsets[token_idx] = .{ .start = text_offset, .end = text_offset + 1 };
                 text_offset += 1;
                 normalized_offset += 1;
@@ -148,6 +171,23 @@ pub fn computeOffsetsFromEncoding(
     }
 
     return offsets;
+}
+
+fn byteLevelRequiresSourceMap(tokenizer_handle: *const ct.Tokenizer) bool {
+    const normalizer = tokenizer_handle.normalizer;
+    return normalizer.lowercase != 0 or
+        normalizer.nfc != 0 or
+        normalizer.nfd != 0 or
+        normalizer.nfkc != 0 or
+        normalizer.nfkd != 0 or
+        normalizer.strip_accents != 0 or
+        normalizer.strip_left != 0 or
+        normalizer.strip_right != 0 or
+        normalizer.clean_text != 0 or
+        normalizer.handle_chinese_chars != 0 or
+        normalizer.prepend != null or
+        normalizer.replace_pattern != null or
+        tokenizer_handle.pretokenizer.add_prefix_space != 0;
 }
 
 fn normalizedSpanIsSynthetic(normalized: *const @import("types.zig").Normalized, start: usize, end: usize) bool {
@@ -904,6 +944,55 @@ test "computeOffsetsFromEncoding maps byte-level unk tokens with token surfaces 
     for (offsets, 0..) |off, idx| {
         try std.testing.expectEqual(@as(u32, @intCast(idx)), off.start);
         try std.testing.expectEqual(@as(u32, @intCast(idx + 1)), off.end);
+    }
+}
+
+test "computeOffsetsFromEncoding maps large nfkc expansion bytes to original scalar span" {
+    const allocator = std.testing.allocator;
+    var normalizer = std.mem.zeroes(ct.Normalizer);
+    normalizer.nfkc = 1;
+    var normalized = try normalize.normalize_text(&normalizer, "ﷺ");
+    defer normalized.deinit();
+
+    var tokenizer = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.pretokenizer.byte_level = 1;
+
+    const token_count = normalized.text.len;
+    const ids = try allocator.alloc(i32, token_count);
+    defer allocator.free(ids);
+    const token_ptrs = try allocator.alloc([*c]u8, token_count);
+    defer {
+        for (token_ptrs) |token_ptr| {
+            if (token_ptr != null) allocator.free(std.mem.sliceTo(@as([*:0]u8, @ptrCast(token_ptr)), 0));
+        }
+        allocator.free(token_ptrs);
+    }
+
+    for (normalized.text, 0..) |byte_value, idx| {
+        ids[idx] = @intCast(idx + 10);
+
+        const codepoint: u21 = @intCast(utils.byteToUnicodeCodepoint(byte_value));
+        var utf8_buf: [4]u8 = undefined;
+        const utf8_len = try std.unicode.utf8Encode(codepoint, &utf8_buf);
+        const token = try allocator.allocSentinel(u8, utf8_len, 0);
+        @memcpy(token[0..utf8_len], utf8_buf[0..utf8_len]);
+        token_ptrs[idx] = token.ptr;
+    }
+
+    var encoding = std.mem.zeroes(ct.TokenizerEncoding);
+    encoding.ids = @ptrCast(ids.ptr);
+    encoding.ids_len = token_count;
+    encoding.tokens = @ptrCast(token_ptrs.ptr);
+    encoding.tokens_len = token_count;
+
+    const offsets = try computeOffsetsFromEncoding(allocator, &encoding, &tokenizer, "ﷺ");
+    defer allocator.free(offsets);
+
+    try std.testing.expect(offsets.len > 10);
+    for (offsets, 0..) |off, idx| {
+        try std.testing.expectEqual(@as(u32, 0), off.start);
+        try std.testing.expectEqual(@as(u32, 3), off.end);
+        _ = idx;
     }
 }
 

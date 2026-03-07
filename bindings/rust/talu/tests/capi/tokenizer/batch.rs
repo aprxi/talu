@@ -648,6 +648,57 @@ fn padded_tensor_complex_batch_mask() {
     }
 }
 
+/// A highly skewed batch shape must still produce correct flat row strides:
+/// one long sequence followed by many empty rows. This targets tail-row stride
+/// math rather than ordinary padding semantics.
+#[test]
+fn padded_tensor_skewed_long_plus_many_empty_sequences() {
+    let ctx = TokenizerTestContext::new();
+    let long = "a".repeat(2048);
+    let mut texts = Vec::with_capacity(257);
+    texts.push(long.as_str());
+    for _ in 0..256 {
+        texts.push("");
+    }
+
+    let pad_opts = talu_sys::PaddedTensorOptions {
+        pad_id: 99,
+        padding_side: 0,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+
+    let result = ctx.batch_to_padded_tensor(&texts, &no_bos(), &pad_opts);
+    assert_eq!(result.num_sequences, 257);
+    assert_eq!(result.padded_length, 2048);
+
+    let row = result.padded_length;
+    assert_eq!(result.input_ids.len(), result.num_sequences * row);
+    assert_eq!(result.attention_mask.len(), result.num_sequences * row);
+
+    assert!(
+        result.input_ids[0..row].iter().all(|&id| id == 69),
+        "first row should contain the long 'a' sequence only"
+    );
+    assert!(
+        result.attention_mask[0..row].iter().all(|&m| m == 1),
+        "first row mask should be entirely active"
+    );
+
+    for seq in 1..result.num_sequences {
+        let start = seq * row;
+        let end = start + row;
+        assert!(
+            result.input_ids[start..end].iter().all(|&id| id == 99),
+            "empty row {seq} must be entirely pad_id"
+        );
+        assert!(
+            result.attention_mask[start..end].iter().all(|&m| m == 0),
+            "empty row {seq} mask must be entirely zero"
+        );
+    }
+}
+
 /// Padded tensor layout must include the synthetic prefix-space token in the
 /// encoded lengths before padding is applied.
 #[test]

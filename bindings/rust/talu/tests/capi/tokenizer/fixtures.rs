@@ -7,50 +7,14 @@
 //! Opt-in via `TALU_TOKENIZER_FIXTURES` pointing at the dataset root.
 //! Silently skipped when the env var is absent.
 
-use regex::Regex;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use std::{collections::HashMap, fs, ptr};
 
 /// Max example failures to keep per model (keeps output readable).
 const MAX_EXAMPLES: usize = 3;
-
-/// Regex patterns to normalize dynamic dates in chat template output.
-/// Must match the Python script's `normalize_dates()`.
-static DATE_NORMALIZERS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
-    vec![
-        // "Today Date: 13 Feb 2026" or "Today's Date: 13 Feb 2026"
-        (
-            Regex::new(
-                r"(Today(?:'s)?\s+Date:\s*)\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}"
-            ).unwrap(),
-            "${1}[TODAY]",
-        ),
-        // "Today's Date: February 13, 2026"
-        (
-            Regex::new(
-                r"(Today(?:'s)?\s+Date:\s*)(?:January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2},?\s*\d{4}"
-            ).unwrap(),
-            "${1}[TODAY]",
-        ),
-        // "Current date: 2026-02-13"
-        (
-            Regex::new(r"(Current date:\s*)\d{4}-\d{2}-\d{2}").unwrap(),
-            "${1}[TODAY]",
-        ),
-    ]
-});
-
-fn normalize_dates(text: &str) -> String {
-    let mut result = text.to_string();
-    for (re, replacement) in DATE_NORMALIZERS.iter() {
-        result = re.replace_all(&result, *replacement).to_string();
-    }
-    result
-}
 
 // ---------------------------------------------------------------------------
 // Correctly-typed FFI declarations
@@ -225,26 +189,35 @@ impl Drop for FixtureTokenizer {
 // Chat template helper
 // ---------------------------------------------------------------------------
 
-fn apply_chat_template(
+/// Render fixture chat templates with deterministic `strftime_now()` output.
+///
+/// The fixture dataset stores `[TODAY]` placeholders, so the test harness uses
+/// the generic template renderer and overrides `strftime_now()` to emit that
+/// exact sentinel instead of normalizing rendered output with regexes.
+fn render_fixture_chat_template(
     template: &str,
     messages_json: &str,
     add_generation_prompt: bool,
     bos_token: &str,
     eos_token: &str,
 ) -> Result<String, i32> {
-    let msgs = CString::new(messages_json).unwrap();
-    let bos = CString::new(bos_token).unwrap();
-    let eos = CString::new(eos_token).unwrap();
+    let template = CString::new(template).unwrap();
+    let vars = serde_json::json!({
+        "messages": serde_json::from_str::<serde_json::Value>(messages_json).unwrap(),
+        "add_generation_prompt": add_generation_prompt,
+        "bos_token": bos_token,
+        "eos_token": eos_token,
+        "strftime_now": true,
+        "strftime_now_override": "[TODAY]",
+    });
+    let vars = CString::new(vars.to_string()).unwrap();
     let mut out: *mut c_char = ptr::null_mut();
 
     let rc = unsafe {
-        talu_sys::talu_apply_chat_template_string(
+        talu_sys::talu_template_render(
             template.as_ptr(),
-            template.len(),
-            msgs.as_ptr(),
-            add_generation_prompt as c_int,
-            bos.as_ptr(),
-            eos.as_ptr(),
+            vars.as_ptr(),
+            false,
             &mut out as *mut _ as *mut c_void,
         )
     };
@@ -253,7 +226,7 @@ fn apply_chat_template(
         return Err(rc);
     }
 
-    assert!(!out.is_null(), "chat template succeeded but output is null");
+    assert!(!out.is_null(), "chat template render succeeded but output is null");
     let s = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
     unsafe { talu_sys::talu_text_free(out) };
     Ok(s)
@@ -696,19 +669,19 @@ fn fixture_chat_template() {
             let expected_text = entry.expected.as_ref().unwrap();
             let messages_json = serde_json::to_string(&entry.messages).unwrap();
 
-            match apply_chat_template(
+            match render_fixture_chat_template(
                 &template,
                 &messages_json,
                 entry.add_generation_prompt,
                 bos,
                 eos,
             ) {
-                Ok(actual) if normalize_dates(&actual) != *expected_text => {
+                Ok(actual) if actual != *expected_text => {
                     s.fail(format!(
                         "chat_template({:?})\n  expected: {:?}\n  actual:   {:?}",
                         entry.name,
                         expected_text,
-                        normalize_dates(&actual)
+                        actual
                     ));
                 }
                 Err(rc) => {

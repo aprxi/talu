@@ -170,14 +170,16 @@ fn token_to_id_requires_exact_length() {
     );
 }
 
-/// token_to_id with invalid UTF-8 byte sequences must be deterministic.
+/// `token_to_id` matches exact token bytes only, so malformed UTF-8 must be
+/// rejected as not-found rather than crashing or partially decoding.
 #[test]
-fn token_to_id_invalid_utf8_bytes_deterministic() {
+fn token_to_id_invalid_utf8_bytes_return_not_found() {
     let ctx = TokenizerTestContext::new();
     let bad: &[u8] = &[0xED, 0xA0, 0x80]; // surrogate-like invalid UTF-8
     let a = unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), bad.as_ptr(), bad.len()) };
     let b = unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), bad.as_ptr(), bad.len()) };
     assert_eq!(a, b, "token_to_id invalid UTF-8 behavior must be deterministic");
+    assert_eq!(a, -1, "malformed UTF-8 token bytes must not match any vocab entry");
 }
 
 /// token_to_id for known regular ASCII tokens returns correct IDs.

@@ -17,7 +17,7 @@ fn no_bos() -> talu_sys::EncodeOptions {
     }
 }
 
-fn tokenize_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
+pub(super) fn tokenize_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
     let result = unsafe {
         talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
@@ -37,7 +37,7 @@ fn tokenize_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
     tokens
 }
 
-fn tokenize_bytes_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
+pub(super) fn tokenize_bytes_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
     let result = unsafe {
         talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
@@ -226,6 +226,117 @@ fn use_regex_false_contraction_merge_consistent_across_offsets_and_tokenize_surf
     assert_eq!((offsets[3].start, offsets[3].end), (4, 5));
 
     unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Uppercase contractions must still preserve the apostrophe boundary when
+/// regex splitting is enabled. This locks down the non-lowercase path instead
+/// of relying only on lowercase contraction fixtures.
+#[test]
+fn use_regex_prevents_cross_uppercase_apostrophe_merge() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "D": 4, "O": 5, "N": 6, "'": 7, "T": 8,
+      "N'": 9
+    },
+    "merges": ["N '"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(ctx.encode_with("DON'T", &no_bos()), vec![4, 5, 6, 7, 8]);
+    assert_eq!(tokenize_strings(&ctx, "DON'T"), ["D", "O", "N", "'", "T"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "DON'T"), ["D", "O", "N", "'", "T"]);
+
+    let result = unsafe { encode_raw(ctx.handle(), b"DON'T", &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
+    assert_eq!((offsets[2].start, offsets[2].end), (2, 3));
+    assert_eq!((offsets[3].start, offsets[3].end), (3, 4));
+    assert_eq!((offsets[4].start, offsets[4].end), (4, 5));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Disabling regex on the same uppercase input must permit the merge across
+/// the apostrophe boundary, matching the lowercase contract.
+#[test]
+fn use_regex_false_allows_cross_uppercase_apostrophe_merge() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "D": 4, "O": 5, "N": 6, "'": 7, "T": 8,
+      "N'": 9
+    },
+    "merges": ["N '"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(ctx.encode_with("DON'T", &no_bos()), vec![4, 5, 9, 8]);
+}
+
+/// The uppercase apostrophe path must stay consistent across the common GPT-2
+/// contraction suffixes, not only the `'T` case.
+#[test]
+fn use_regex_true_uppercase_contractions_preserve_apostrophe_boundaries() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "I": 4, "T": 5, "V": 6, "E": 7, "S": 8, "'": 9,
+      "'V": 10, "'S": 11
+    },
+    "merges": ["' V", "' S"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(tokenize_strings(&ctx, "I'VE"), ["I", "'", "V", "E"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "I'VE"), ["I", "'", "V", "E"]);
+    assert_eq!(ctx.encode_with("I'VE", &no_bos()), vec![4, 9, 6, 7]);
+
+    assert_eq!(tokenize_strings(&ctx, "IT'S"), ["I", "T", "'", "S"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "IT'S"), ["I", "T", "'", "S"]);
+    assert_eq!(ctx.encode_with("IT'S", &no_bos()), vec![4, 5, 9, 8]);
 }
 
 // ===========================================================================

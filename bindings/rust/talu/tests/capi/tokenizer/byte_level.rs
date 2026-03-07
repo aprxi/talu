@@ -290,6 +290,30 @@ fn zwj_emoji_roundtrip() {
     assert_eq!(decoded, input);
 }
 
+/// Regional-indicator flag emoji "🇺🇸" (8 bytes) roundtrips exactly.
+#[test]
+fn flag_emoji_roundtrip() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let input = "🇺🇸";
+    assert_eq!(input.len(), 8);
+    let tokens = ctx.encode_with(input, &no_bos());
+    assert_eq!(tokens.len(), 8);
+    let decoded = ctx.decode(&tokens);
+    assert_eq!(decoded, input);
+}
+
+/// Variation-selector emoji sequence "❤️" must roundtrip exactly.
+#[test]
+fn variation_selector_emoji_roundtrip() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let input = "❤️";
+    assert_eq!(input.len(), 6);
+    let tokens = ctx.encode_with(input, &no_bos());
+    assert_eq!(tokens.len(), 6);
+    let decoded = ctx.decode(&tokens);
+    assert_eq!(decoded, input);
+}
+
 /// Vocab size is 260 (4 special + 256 byte tokens).
 #[test]
 fn byte_level_vocab_size() {

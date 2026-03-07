@@ -647,9 +647,8 @@ fn skip_special_preserves_non_special_added() {
 
 /// lstrip=true must consume leading whitespace before the added token.
 ///
-/// BUG: lstrip is not implemented — the flag is accepted in JSON but
-/// has no effect. This test asserts the CORRECT behavior so it will
-/// fail until lstrip is implemented. Mark #[ignore] to keep CI green.
+/// This regression stays active because both strip directions are part of the
+/// added-token contract and must remain correct together.
 #[test]
 fn lstrip_consumes_leading_whitespace_with_rstrip() {
     let json = r####"{
@@ -694,6 +693,189 @@ fn lstrip_consumes_leading_whitespace_with_rstrip() {
             "rstrip: space after [MID] must be consumed, got: {tokens:?}"
         );
     }
+}
+
+/// Added-token matching must run before GPT-2 regex pretokenization.
+///
+/// With a ByteLevel pretokenizer using `use_regex=true`, the raw text
+/// `"don't"` would normally be split at the contraction boundary. An exact
+/// added token for `"don't"` must preempt that split and surface unchanged
+/// across encode and tokenize APIs.
+#[test]
+fn added_token_preempts_gpt2_regex_split() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "d": 4, "o": 5, "n": 6, "'": 7, "t": 8
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true},
+    {"id": 200, "content": "don't", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let tokens = ctx.encode_with("don't", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![200],
+        "added token must preempt GPT-2 regex splitting, got: {tokens:?}"
+    );
+
+    let token_strings = super::gpt2::tokenize_strings(&ctx, "don't");
+    assert_eq!(token_strings, vec!["don't"]);
+
+    let token_bytes = super::gpt2::tokenize_bytes_strings(&ctx, "don't");
+    assert_eq!(token_bytes, vec!["don't"]);
+}
+
+/// Added-token matching must also preempt GPT-2 regex boundaries for
+/// space-prefixed punctuation chunks, not only contraction splits.
+#[test]
+fn added_token_preempts_gpt2_regex_punctuation_chunk_split() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "h": 4, "i": 5, "!": 6
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true},
+    {"id": 201, "content": "hi!!", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let tokens = ctx.encode_with("hi!!", &no_bos());
+    assert_eq!(tokens, vec![201]);
+    assert_eq!(super::gpt2::tokenize_strings(&ctx, "hi!!"), vec!["hi!!"]);
+    assert_eq!(super::gpt2::tokenize_bytes_strings(&ctx, "hi!!"), vec!["hi!!"]);
+}
+
+/// Added-token matching must preempt GPT-2 regex letter/digit boundaries too.
+#[test]
+fn added_token_preempts_gpt2_regex_letter_digit_boundary() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5, "c": 6, "1": 7, "2": 8, "3": 9
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true},
+    {"id": 202, "content": "abc123", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let tokens = ctx.encode_with("abc123", &no_bos());
+    assert_eq!(tokens, vec![202]);
+    assert_eq!(super::gpt2::tokenize_strings(&ctx, "abc123"), vec!["abc123"]);
+    assert_eq!(super::gpt2::tokenize_bytes_strings(&ctx, "abc123"), vec!["abc123"]);
+}
+
+/// Added-token matching must also beat GPT-2 regex chunking when the token
+/// begins with a real leading space. This is distinct from synthetic
+/// add-prefix-space behavior: the input bytes themselves start with `' '`.
+#[test]
+fn added_token_preempts_gpt2_regex_leading_space_chunk() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      " ": 4, "h": 5, "e": 6, "l": 7, "o": 8
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true},
+    {"id": 203, "content": " hello", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let tokens = ctx.encode_with(" hello", &no_bos());
+    assert_eq!(tokens, vec![203]);
+    assert_eq!(super::gpt2::tokenize_strings(&ctx, " hello"), vec![" hello"]);
+    assert_eq!(super::gpt2::tokenize_bytes_strings(&ctx, " hello"), vec![" hello"]);
+}
+
+/// Added-token matching must also beat a Metaspace pretokenizer on a real
+/// leading-space chunk. Metaspace would normally rewrite `" world"` to
+/// `"▁world"`, but an exact added token must win first and surface unchanged.
+#[test]
+fn added_token_preempts_metaspace_leading_space_chunk() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "▁world": 4
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true},
+    {"id": 204, "content": " world", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "Metaspace", "replacement": "▁", "add_prefix_space": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let tokens = ctx.encode_with(" world", &no_bos());
+    assert_eq!(tokens, vec![204]);
+    assert_eq!(tokenize_strings(&ctx, " world"), vec![" world"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, " world"), vec![" world"]);
 }
 
 // ===========================================================================
@@ -821,6 +1003,42 @@ fn three_overlapping_longest_wins() {
     assert_eq!(
         tokens3[0], 100,
         "1 overlapping: 'a' must match, got: {tokens3:?}"
+    );
+}
+
+/// Equal-length overlaps at different starting positions must still be
+/// resolved left-to-right. On "abc", "ab" starts earlier than "bc", so the
+/// encoder must commit to "ab" first and leave only "c" behind.
+#[test]
+fn equal_length_overlapping_added_tokens_prefer_leftmost_match() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "a": 3, "b": 4, "c": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "ab", "special": false},
+    {"id": 101, "content": "bc", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("abc", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![100, 5],
+        "equal-length overlapping added tokens must prefer the leftmost match: got {tokens:?}"
     );
 }
 
@@ -1147,6 +1365,150 @@ fn single_word_true_does_not_match_digit_or_underscore_boundaries() {
         assert!(
             !tokens.contains(&100),
             "single_word should not match when adjacent to digit/underscore for {text:?}"
+        );
+    }
+}
+
+/// single_word=true must treat non-ASCII letters as in-word boundaries too.
+///
+/// ASCII-only boundary checks would incorrectly match "cat" inside words like
+/// "écat" or "cat日". The contract is word semantics, not ASCII semantics.
+#[test]
+fn single_word_true_does_not_match_adjacent_unicode_letters() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "c": 3, "a": 4, "t": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    for text in ["écat", "caté", "日cat", "cat日"] {
+        let tokens = ctx.encode_with(text, &no_bos());
+        assert!(
+            !tokens.contains(&100),
+            "single_word should not match inside a Unicode word for {text:?}, got {tokens:?}"
+        );
+    }
+}
+
+/// Emoji are symbol boundaries, not word characters, so single_word matching
+/// should still fire when the added token is adjacent to emoji.
+#[test]
+fn single_word_true_matches_adjacent_to_emoji_boundaries() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "c": 3, "a": 4, "t": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("🙂cat🙂", &no_bos());
+    assert_eq!(
+        tokens.iter().filter(|&&id| id == 100).count(),
+        1,
+        "single_word should still match next to emoji symbol boundaries, got {tokens:?}"
+    );
+}
+
+/// Combining marks extend the neighboring word; they are not standalone
+/// boundaries. `single_word=true` must not match through a decomposed accent.
+#[test]
+fn single_word_true_does_not_match_adjacent_combining_marks() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "c": 3, "a": 4, "t": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    for text in ["e\u{0301}cat", "cate\u{0301}"] {
+        let tokens = ctx.encode_with(text, &no_bos());
+        assert!(
+            !tokens.contains(&100),
+            "single_word should not match through combining-mark word boundaries for {text:?}, got {tokens:?}"
+        );
+    }
+}
+
+/// `single_word=true` must also treat non-ASCII numeric characters as
+/// in-word neighbors, not boundaries.
+#[test]
+fn single_word_true_does_not_match_adjacent_unicode_numbers() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "c": 3, "a": 4, "t": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 100, "content": "cat", "special": false, "single_word": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    for text in ["٣cat", "cat५", "Ⅳcat", "catⅫ"] {
+        let tokens = ctx.encode_with(text, &no_bos());
+        assert!(
+            !tokens.contains(&100),
+            "single_word should not match through Unicode numeric boundaries for {text:?}, got {tokens:?}"
         );
     }
 }
