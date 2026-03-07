@@ -10,6 +10,7 @@ const tok_encode = @import("encode.zig");
 const offsets_mod = @import("offsets.zig");
 const pipeline_impl = @import("pipeline.zig");
 const unigram_model = @import("unigram.zig");
+const log = @import("../log.zig");
 
 // Unicode replacement character (U+FFFD)
 const REPLACEMENT_CHAR = "\xEF\xBF\xBD";
@@ -32,10 +33,25 @@ pub const Tokenizer = struct {
     /// Initialize from a path. Accepts sentinel-terminated slice to avoid allocation.
     pub fn initFromPathZ(allocator: std.mem.Allocator, path: [:0]const u8) !Tokenizer {
         const tokenizer_handle = pipeline_impl.tokenizer_from_pretrained(path.ptr);
-        if (tokenizer_handle == null) return TokenizerError.InitFailed;
+        if (tokenizer_handle == null) {
+            log.warn("tokenizer", "Tokenizer init from path failed", .{
+                .source = "path",
+                .path = path,
+                .stage = "loader",
+            });
+            return TokenizerError.InitFailed;
+        }
         errdefer pipeline_impl.tokenizer_free(tokenizer_handle.?);
         var tokenizer = Tokenizer{ .allocator = allocator, .tokenizer_handle = tokenizer_handle.? };
-        try tokenizer.buildPrefixIndex();
+        tokenizer.buildPrefixIndex() catch |err| {
+            log.warn("tokenizer", "Tokenizer init from path failed", .{
+                .source = "path",
+                .path = path,
+                .stage = "prefix_index",
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         return tokenizer;
     }
 
@@ -52,10 +68,25 @@ pub const Tokenizer = struct {
     /// Initialize from a JSON string in memory.
     pub fn initFromJsonZ(allocator: std.mem.Allocator, json: [:0]const u8) !Tokenizer {
         const tokenizer_handle = pipeline_impl.tokenizer_from_json_string(json.ptr);
-        if (tokenizer_handle == null) return TokenizerError.InitFailed;
+        if (tokenizer_handle == null) {
+            log.warn("tokenizer", "Tokenizer init from JSON failed", .{
+                .source = "json",
+                .json_bytes = json.len,
+                .stage = "loader",
+            });
+            return TokenizerError.InitFailed;
+        }
         errdefer pipeline_impl.tokenizer_free(tokenizer_handle.?);
         var tokenizer = Tokenizer{ .allocator = allocator, .tokenizer_handle = tokenizer_handle.? };
-        try tokenizer.buildPrefixIndex();
+        tokenizer.buildPrefixIndex() catch |err| {
+            log.warn("tokenizer", "Tokenizer init from JSON failed", .{
+                .source = "json",
+                .json_bytes = json.len,
+                .stage = "prefix_index",
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         return tokenizer;
     }
 

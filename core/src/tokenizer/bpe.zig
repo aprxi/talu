@@ -1308,7 +1308,14 @@ pub fn createBpeTokenizer(allocator: std.mem.Allocator, json_buffer: []const u8,
     tok.postproc.sep_id = -1;
     tok.postproc.add_special = 0;
 
-    var model = try create(allocator, json_buffer, json_owned);
+    var model = create(allocator, json_buffer, json_owned) catch |err| {
+        log.warn("tokenizer", "BPE model creation failed", .{
+            .reason = @errorName(err),
+            .json_bytes = json_buffer.len,
+            .json_owned = @intFromBool(json_owned),
+        });
+        return err;
+    };
     errdefer {
         if (model.json_owned and model.json_buffer.len > 0) {
             allocator.free(@constCast(model.json_buffer));
@@ -1323,6 +1330,9 @@ pub fn createBpeTokenizer(allocator: std.mem.Allocator, json_buffer: []const u8,
 
     if (tok_fns.tokenizer_pretokenizer_set(&tok.pretokenizer, DEFAULT_PATTERN.ptr) != 0) {
         tok_fns.tokenizer_set_error(tok, "Failed to compile BPE regex");
+        log.warn("tokenizer", "BPE default pretokenizer init failed", .{
+            .json_bytes = json_buffer.len,
+        });
         return error.PretokenizerInitFailed;
     }
 

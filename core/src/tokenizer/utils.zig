@@ -74,15 +74,33 @@ pub fn byteToUnicodeCodepoint(byte_value: u8) u32 {
 
 /// Find a section in JSON by key, returns slice starting at the value (after colon)
 pub fn findJsonSection(json: []const u8, key: []const u8) ?[]const u8 {
-    var search_offset: usize = 0;
-    while (std.mem.indexOfPos(u8, json, search_offset, key)) |pos| {
-        var scan_offset = pos + key.len;
-        // Skip whitespace and colon
-        while (scan_offset < json.len and (json[scan_offset] == ' ' or json[scan_offset] == ':' or json[scan_offset] == '\t' or json[scan_offset] == '\n' or json[scan_offset] == '\r')) : (scan_offset += 1) {}
-        if (scan_offset < json.len and (json[scan_offset] == '{' or json[scan_offset] == '[')) {
-            return json[scan_offset..];
+    var cursor: usize = 0;
+    while (cursor < json.len) {
+        if (json[cursor] == '"') {
+            const key_start = cursor;
+            cursor += 1;
+            while (cursor < json.len) {
+                if (json[cursor] == '\\' and cursor + 1 < json.len) {
+                    cursor += 2;
+                } else if (json[cursor] == '"') {
+                    cursor += 1;
+                    break;
+                } else {
+                    cursor += 1;
+                }
+            }
+
+            const key_end = cursor;
+            if (key_end - key_start == key.len and std.mem.eql(u8, json[key_start..key_end], key)) {
+                var scan_offset = key_end;
+                while (scan_offset < json.len and (json[scan_offset] == ' ' or json[scan_offset] == ':' or json[scan_offset] == '\t' or json[scan_offset] == '\n' or json[scan_offset] == '\r')) : (scan_offset += 1) {}
+                if (scan_offset < json.len and (json[scan_offset] == '{' or json[scan_offset] == '[')) {
+                    return json[scan_offset..];
+                }
+            }
+        } else {
+            cursor += 1;
         }
-        search_offset = pos + 1;
     }
     return null;
 }
@@ -115,6 +133,19 @@ pub fn findMatchingBrace(byte_values: []const u8, open: u8, close: u8) ?usize {
         }
     }
     return null;
+}
+
+test "findJsonSection ignores key text inside string values" {
+    const json =
+        \\{
+        \\  "added_tokens": [{"content":"model"}],
+        \\  "model": {"type": "BPE", "vocab": {}, "merges": []}
+        \\}
+    ;
+
+    const section = findJsonSection(json, "\"model\"") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(section.len > 0);
+    try std.testing.expectEqual(@as(u8, '{'), section[0]);
 }
 
 // =============================================================================
