@@ -553,8 +553,15 @@ fn offsets_byte_level_variation_selector_emoji() {
 
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     for (i, off) in offsets.iter().enumerate() {
-        assert_eq!(off.start as usize, i, "variation-selector offset[{i}].start");
-        assert_eq!(off.end as usize, i + 1, "variation-selector offset[{i}].end");
+        assert_eq!(
+            off.start as usize, i,
+            "variation-selector offset[{i}].start"
+        );
+        assert_eq!(
+            off.end as usize,
+            i + 1,
+            "variation-selector offset[{i}].end"
+        );
     }
 
     unsafe { talu_sys::talu_encode_result_free(result) };
@@ -847,7 +854,11 @@ fn offsets_with_lowercase_and_strip_accents_map_to_original_bytes() {
     assert_eq!(result.num_tokens, 4, "CAFÉ should normalize to c a f e");
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
-    assert_eq!(ids, &[1, 2, 3, 4], "expected normalized token IDs for c a f e");
+    assert_eq!(
+        ids,
+        &[1, 2, 3, 4],
+        "expected normalized token IDs for c a f e"
+    );
 
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
@@ -1028,7 +1039,10 @@ fn offsets_wordpiece_lowercase_strip_accents_map_to_original_bytes() {
 
     let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.num_tokens, 1, "normalized whole word should stay one token");
+    assert_eq!(
+        result.num_tokens, 1,
+        "normalized whole word should stay one token"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
     assert_eq!(ids, &[1]);
@@ -1036,6 +1050,119 @@ fn offsets_wordpiece_lowercase_strip_accents_map_to_original_bytes() {
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
 
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// BertNormalizer `clean_text=true` rewrites CR/LF controls to spaces. Offsets
+/// for surviving WordPiece tokens must still map to the original source bytes.
+#[test]
+fn offsets_wordpiece_clean_text_crlf_maps_to_original_bytes() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "a": 1, "b": 2
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": false,
+    "strip_accents": false,
+    "lowercase": true
+  },
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "A\r\nB";
+    assert_eq!(input.len(), 4);
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(result.num_tokens, 2, "CR/LF cleanup should still yield A and B");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 2]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!(
+        (offsets[1].start, offsets[1].end),
+        (3, 4),
+        "token 'b' must map to the original 'B' byte after CR/LF cleanup"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// If pretokenization removes all user content, template post-processing must
+/// still return a valid specials-only sequence with synthetic zero offsets.
+#[test]
+fn offsets_whitespace_removed_then_template_specials_stay_synthetic() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"H": 4, "i": 5},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Split",
+    "pattern": {"Regex": "\\s+"},
+    "behavior": "Removed",
+    "invert": false
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 1}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "special_tokens": {
+      "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+      "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]}
+    }
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        add_eos: 1,
+        ..Default::default()
+    };
+    let input = "\r\n \t";
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &opts) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(result.num_tokens, 2, "only BOS/EOS should remain");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 2]);
+    let special =
+        unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    assert_eq!(special, &[1, 1], "both output tokens must be marked special");
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 0));
+    assert_eq!((offsets[1].start, offsets[1].end), (0, 0));
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
@@ -1092,7 +1219,8 @@ fn postprocessor_masks_and_offsets_are_exact() {
     assert_eq!(ids, &[1, 4, 5, 2]);
     let attn = unsafe { std::slice::from_raw_parts(result.attention_mask, result.num_tokens) };
     assert_eq!(attn, &[1, 1, 1, 1]);
-    let special = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    let special =
+        unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
     assert_eq!(special, &[1, 0, 0, 1]);
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!((offsets[0].start, offsets[0].end), (0, 0));
@@ -1151,7 +1279,8 @@ fn postprocessor_masks_and_offsets_empty_input() {
     assert_eq!(result.num_tokens, 2);
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
     assert_eq!(ids, &[1, 2]);
-    let special = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    let special =
+        unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
     assert_eq!(special, &[1, 1]);
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!((offsets[0].start, offsets[0].end), (0, 0));
@@ -1217,9 +1346,21 @@ fn offsets_replace_expansion_in_middle_preserves_neighbor_spans() {
 
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!((offsets[0].start, offsets[0].end), (0, 1), "A span");
-    assert_eq!((offsets[1].start, offsets[1].end), (1, 2), "expanded a span");
-    assert_eq!((offsets[2].start, offsets[2].end), (1, 2), "expanded n span");
-    assert_eq!((offsets[3].start, offsets[3].end), (1, 2), "expanded d span");
+    assert_eq!(
+        (offsets[1].start, offsets[1].end),
+        (1, 2),
+        "expanded a span"
+    );
+    assert_eq!(
+        (offsets[2].start, offsets[2].end),
+        (1, 2),
+        "expanded n span"
+    );
+    assert_eq!(
+        (offsets[3].start, offsets[3].end),
+        (1, 2),
+        "expanded d span"
+    );
     assert_eq!((offsets[4].start, offsets[4].end), (2, 3), "B span");
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
@@ -1267,7 +1408,11 @@ fn offsets_with_repeated_nfkc_large_expansion_stay_within_source_bounds() {
     );
     let ctx = TokenizerTestContext::from_json(&json);
     let input = "\u{FDFA}".repeat(64);
-    assert_eq!(input.len(), 64 * 3, "repeated U+FDFA must stay 3 bytes per scalar");
+    assert_eq!(
+        input.len(),
+        64 * 3,
+        "repeated U+FDFA must stay 3 bytes per scalar"
+    );
 
     let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
@@ -1281,10 +1426,24 @@ fn offsets_with_repeated_nfkc_large_expansion_stay_within_source_bounds() {
     for (idx, off) in offsets.iter().enumerate() {
         let start = off.start as usize;
         let end = off.end as usize;
-        assert!(start < end, "expanded token {idx} must have a non-empty source span");
-        assert!(end <= input.len(), "expanded token {idx} must stay within the source bounds");
-        assert_eq!(end - start, 3, "expanded token {idx} must map to exactly one source scalar");
-        assert_eq!(start % 3, 0, "expanded token {idx} start must align to the repeated-scalar boundary");
+        assert!(
+            start < end,
+            "expanded token {idx} must have a non-empty source span"
+        );
+        assert!(
+            end <= input.len(),
+            "expanded token {idx} must stay within the source bounds"
+        );
+        assert_eq!(
+            end - start,
+            3,
+            "expanded token {idx} must map to exactly one source scalar"
+        );
+        assert_eq!(
+            start % 3,
+            0,
+            "expanded token {idx} start must align to the repeated-scalar boundary"
+        );
     }
 
     unsafe { talu_sys::talu_encode_result_free(result) };
@@ -1409,7 +1568,10 @@ fn offsets_repeated_merged_subsequences_no_zero_spans() {
     let result = unsafe { super::common::encode_raw(ctx.handle(), b"hellohello", &no_bos()) };
     assert!(result.error_msg.is_null());
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
-    assert_eq!(result.num_tokens, 2, "hellohello should merge into two hello tokens");
+    assert_eq!(
+        result.num_tokens, 2,
+        "hellohello should merge into two hello tokens"
+    );
     assert_eq!((offsets[0].start, offsets[0].end), (0, 5));
     assert_eq!((offsets[1].start, offsets[1].end), (5, 10));
 }
@@ -1460,7 +1622,8 @@ fn postprocessor_truncation_right_preserves_masks_and_offsets() {
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 3);
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
-    let special = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    let special =
+        unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(ids, &[1, 4, 5]);
     assert_eq!(special, &[1, 0, 0]);
@@ -1516,7 +1679,8 @@ fn postprocessor_truncation_left_preserves_masks_and_offsets() {
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 3);
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
-    let special = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    let special =
+        unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(ids, &[4, 5, 2]);
     assert_eq!(special, &[0, 0, 1]);

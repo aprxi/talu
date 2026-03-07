@@ -482,7 +482,10 @@ fn nested_byte_fallback_decoder_null_options_matches_flat_behavior() {
     let ids = [1, 4, 3, 9, 10, 2, 5];
 
     let flat_result = unsafe { super::common::decode_raw_null_options(flat.handle(), &ids) };
-    assert!(flat_result.error_msg.is_null(), "flat decode with null options should succeed");
+    assert!(
+        flat_result.error_msg.is_null(),
+        "flat decode with null options should succeed"
+    );
     let flat_text = unsafe {
         let slice = std::slice::from_raw_parts(flat_result.text, flat_result.text_len);
         std::str::from_utf8(slice)
@@ -515,8 +518,12 @@ fn nested_byte_fallback_decoder_null_options_matches_flat_behavior() {
 #[test]
 fn decode_byte_fallback_null_options_defaults_to_skip_special_tokens() {
     let ctx = TokenizerTestContext::from_json(BYTE_FALLBACK_JSON);
-    let result = unsafe { super::common::decode_raw_null_options(ctx.handle(), &[1, 4, 3, 9, 10, 2, 5]) };
-    assert!(result.error_msg.is_null(), "decode with null options should succeed");
+    let result =
+        unsafe { super::common::decode_raw_null_options(ctx.handle(), &[1, 4, 3, 9, 10, 2, 5]) };
+    assert!(
+        result.error_msg.is_null(),
+        "decode with null options should succeed"
+    );
     let text = unsafe {
         let slice = std::slice::from_raw_parts(result.text, result.text_len);
         std::str::from_utf8(slice).expect("decode must return valid UTF-8")

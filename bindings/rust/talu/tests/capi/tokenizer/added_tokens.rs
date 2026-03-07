@@ -19,15 +19,21 @@ fn no_bos() -> talu_sys::EncodeOptions {
 }
 
 fn tokenize_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
-    let result =
-        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len()) };
+    let result = unsafe {
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+    };
     assert!(result.error_msg.is_null(), "tokenize failed");
     let tokens = if result.tokens.is_null() || result.num_tokens == 0 {
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(result.tokens, result.num_tokens) }
             .iter()
-            .map(|ptr| unsafe { std::ffi::CStr::from_ptr(*ptr) }.to_str().unwrap().to_owned())
+            .map(|ptr| {
+                unsafe { std::ffi::CStr::from_ptr(*ptr) }
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
             .collect()
     };
     unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
@@ -552,8 +558,14 @@ fn multiple_added_tokens_visible_on_tokenize_surfaces() {
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
 
-    assert_eq!(ctx.encode_with("[A]hello[B]", &no_bos()), [100, 9, 7, 10, 10, 11, 101]);
-    assert_eq!(tokenize_strings(&ctx, "[A]hello[B]"), ["[A]", "h", "e", "l", "l", "o", "[B]"]);
+    assert_eq!(
+        ctx.encode_with("[A]hello[B]", &no_bos()),
+        [100, 9, 7, 10, 10, 11, 101]
+    );
+    assert_eq!(
+        tokenize_strings(&ctx, "[A]hello[B]"),
+        ["[A]", "h", "e", "l", "l", "o", "[B]"]
+    );
     assert_eq!(
         tokenize_bytes_strings(&ctx, "[A]hello[B]"),
         ["[A]", "h", "e", "l", "l", "o", "[B]"]
@@ -682,14 +694,16 @@ fn lstrip_consumes_leading_whitespace_with_rstrip() {
     // lstrip=true: space before [MID] should be consumed
     if mid_pos > 0 {
         assert_ne!(
-            tokens[mid_pos - 1], 5,
+            tokens[mid_pos - 1],
+            5,
             "lstrip: space before [MID] must be consumed, got: {tokens:?}"
         );
     }
     // rstrip=true: space after [MID] should be consumed
     if mid_pos + 1 < tokens.len() {
         assert_ne!(
-            tokens[mid_pos + 1], 5,
+            tokens[mid_pos + 1],
+            5,
             "rstrip: space after [MID] must be consumed, got: {tokens:?}"
         );
     }
@@ -772,7 +786,10 @@ fn added_token_preempts_gpt2_regex_punctuation_chunk_split() {
     let tokens = ctx.encode_with("hi!!", &no_bos());
     assert_eq!(tokens, vec![201]);
     assert_eq!(super::gpt2::tokenize_strings(&ctx, "hi!!"), vec!["hi!!"]);
-    assert_eq!(super::gpt2::tokenize_bytes_strings(&ctx, "hi!!"), vec!["hi!!"]);
+    assert_eq!(
+        super::gpt2::tokenize_bytes_strings(&ctx, "hi!!"),
+        vec!["hi!!"]
+    );
 }
 
 /// Added-token matching must preempt GPT-2 regex letter/digit boundaries too.
@@ -804,8 +821,14 @@ fn added_token_preempts_gpt2_regex_letter_digit_boundary() {
 
     let tokens = ctx.encode_with("abc123", &no_bos());
     assert_eq!(tokens, vec![202]);
-    assert_eq!(super::gpt2::tokenize_strings(&ctx, "abc123"), vec!["abc123"]);
-    assert_eq!(super::gpt2::tokenize_bytes_strings(&ctx, "abc123"), vec!["abc123"]);
+    assert_eq!(
+        super::gpt2::tokenize_strings(&ctx, "abc123"),
+        vec!["abc123"]
+    );
+    assert_eq!(
+        super::gpt2::tokenize_bytes_strings(&ctx, "abc123"),
+        vec!["abc123"]
+    );
 }
 
 /// Added-token matching must also beat GPT-2 regex chunking when the token
@@ -839,8 +862,14 @@ fn added_token_preempts_gpt2_regex_leading_space_chunk() {
 
     let tokens = ctx.encode_with(" hello", &no_bos());
     assert_eq!(tokens, vec![203]);
-    assert_eq!(super::gpt2::tokenize_strings(&ctx, " hello"), vec![" hello"]);
-    assert_eq!(super::gpt2::tokenize_bytes_strings(&ctx, " hello"), vec![" hello"]);
+    assert_eq!(
+        super::gpt2::tokenize_strings(&ctx, " hello"),
+        vec![" hello"]
+    );
+    assert_eq!(
+        super::gpt2::tokenize_bytes_strings(&ctx, " hello"),
+        vec![" hello"]
+    );
 }
 
 /// Added-token matching must also beat a Metaspace pretokenizer on a real
@@ -876,6 +905,72 @@ fn added_token_preempts_metaspace_leading_space_chunk() {
     assert_eq!(tokens, vec![204]);
     assert_eq!(tokenize_strings(&ctx, " world"), vec![" world"]);
     assert_eq!(tokenize_bytes_strings(&ctx, " world"), vec![" world"]);
+}
+
+/// Added-token matching must preempt WordPiece greedy segmentation, not run
+/// after it. If "hello" is an added token, WordPiece must not split it.
+#[test]
+fn added_token_preempts_wordpiece_greedy_matching() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0,
+      "he": 1,
+      "##llo": 2
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 200, "content": "hello", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(ctx.encode_with("hello", &no_bos()), vec![200]);
+    assert_eq!(tokenize_strings(&ctx, "hello"), vec!["hello"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "hello"), vec!["hello"]);
+}
+
+/// Added-token matching must also preempt Unigram Viterbi path selection.
+#[test]
+fn added_token_preempts_unigram_viterbi_path() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["he", -1.0],
+      ["llo", -1.0],
+      ["h", -5.0],
+      ["e", -5.0],
+      ["l", -5.0],
+      ["o", -5.0]
+    ]
+  },
+  "added_tokens": [
+    {"id": 200, "content": "hello", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(
+        ctx.encode_with("hello", &no_bos()),
+        vec![200],
+        "added token must win before unigram Viterbi path scoring"
+    );
 }
 
 // ===========================================================================
@@ -1003,6 +1098,36 @@ fn three_overlapping_longest_wins() {
     assert_eq!(
         tokens3[0], 100,
         "1 overlapping: 'a' must match, got: {tokens3:?}"
+    );
+}
+
+/// Longest-match precedence must remain dominant even when overlapping added
+/// tokens have conflicting whitespace-consumption flags.
+#[test]
+fn overlapping_longest_match_wins_over_conflicting_rstrip_flags() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "a": 1, "b": 2, "c": 3, " ": 4},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "ab", "special": false, "rstrip": true},
+    {"id": 101, "content": "abc", "special": false, "rstrip": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("abc ", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![101, 4],
+        "longest overlap token must win; shorter token rstrip must not preempt selection"
     );
 }
 
@@ -1316,16 +1441,7 @@ fn single_word_true_matches_all_common_punctuation_boundaries() {
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
     for text in [
-        "cat.",
-        ",cat,",
-        "!cat!",
-        "?cat?",
-        ":cat;",
-        "(cat)",
-        "[cat]",
-        "{cat}",
-        "\"cat\"",
-        "'cat'",
+        "cat.", ",cat,", "!cat!", "?cat?", ":cat;", "(cat)", "[cat]", "{cat}", "\"cat\"", "'cat'",
     ] {
         let tokens = ctx.encode_with(text, &no_bos());
         assert!(
@@ -1594,12 +1710,9 @@ fn empty_added_token_no_crash() {
   "decoder": null
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
-    // Should not crash. Empty content token is skipped.
+    // Empty-content added token must be ignored; base vocab tokenization stays exact.
     let tokens = ctx.encode_with("abc", &no_bos());
-    assert!(
-        !tokens.is_empty(),
-        "encode should produce tokens even with empty added token"
-    );
+    assert_eq!(tokens, vec![3, 4, 5], "empty added token must be ignored");
 }
 
 /// single_word matching should also be visible on the tokenize surface when
@@ -1994,7 +2107,10 @@ fn single_word_punctuation_boundary_visible_on_tokenize_bytes_surface() {
     let ctx = TokenizerTestContext::from_json(json);
 
     assert_eq!(ctx.encode_with("\"cat\"!", &no_bos()), [1, 100, 1, 2]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "\"cat\"!"), ["\"", "cat", "\"", "!"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "\"cat\"!"),
+        ["\"", "cat", "\"", "!"]
+    );
 }
 
 /// Longest-match added tokens must claim the full source span of the winning
@@ -2096,7 +2212,10 @@ fn added_token_normalized_false_visible_on_tokenize_bytes_surface() {
     let ctx = TokenizerTestContext::from_json(json);
 
     assert_eq!(ctx.encode_with("HELLO", &no_bos()), [3, 4, 5, 5, 6]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "HELLO"), ["h", "e", "l", "l", "o"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "HELLO"),
+        ["h", "e", "l", "l", "o"]
+    );
 }
 
 /// rstrip should also be reflected on the tokenize_bytes surface.
@@ -2178,7 +2297,10 @@ fn longest_match_visible_on_tokenize_surfaces() {
 
     assert_eq!(ctx.encode_with("abcdef", &no_bos()), [102, 3, 4, 5]);
     assert_eq!(tokenize_strings(&ctx, "abcdef"), ["abc", "d", "e", "f"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "abcdef"), ["abc", "d", "e", "f"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "abcdef"),
+        ["abc", "d", "e", "f"]
+    );
 
     assert_eq!(ctx.encode_with("abdef", &no_bos()), [101, 3, 4, 5]);
     assert_eq!(tokenize_strings(&ctx, "abdef"), ["ab", "d", "e", "f"]);
@@ -2295,4 +2417,78 @@ fn added_token_preemption_batch_matches_individual_sequences() {
             "batch slice must equal individual encode for preemption case {i}: {text:?}"
         );
     }
+}
+
+/// lstrip=true should consume Unicode whitespace, not only ASCII whitespace.
+#[test]
+fn lstrip_consumes_unicode_whitespace_nbsp_and_ideographic_space() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 200, "content": "[MID]", "special": false, "lstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let base = ctx.encode_with("[MID]x", &no_bos());
+    let with_nbsp = ctx.encode_with("\u{00A0}[MID]x", &no_bos());
+    let with_ideographic = ctx.encode_with("\u{3000}[MID]x", &no_bos());
+
+    assert_eq!(
+        with_nbsp, base,
+        "lstrip should consume leading NBSP before added token"
+    );
+    assert_eq!(
+        with_ideographic, base,
+        "lstrip should consume leading ideographic space before added token"
+    );
+}
+
+/// rstrip=true should consume Unicode whitespace, not only ASCII whitespace.
+#[test]
+fn rstrip_consumes_unicode_whitespace_nbsp_and_ideographic_space() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 200, "content": "[MID]", "special": false, "rstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let base = ctx.encode_with("[MID]x", &no_bos());
+    let with_nbsp = ctx.encode_with("[MID]\u{00A0}x", &no_bos());
+    let with_ideographic = ctx.encode_with("[MID]\u{3000}x", &no_bos());
+
+    assert_eq!(
+        with_nbsp, base,
+        "rstrip should consume trailing NBSP after added token"
+    );
+    assert_eq!(
+        with_ideographic, base,
+        "rstrip should consume trailing ideographic space after added token"
+    );
 }

@@ -270,7 +270,11 @@ fn tokenize_and_tokenize_bytes_match_tokens_across_cases() {
             "case {case_idx}: tokenize failed"
         );
         let byte_result = unsafe {
-            talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+            talu_sys::talu_tokenizer_tokenize_bytes(
+                ctx.handle(),
+                text.as_bytes().as_ptr(),
+                text.len(),
+            )
         };
         assert!(
             byte_result.error_msg.is_null(),
@@ -294,8 +298,11 @@ fn tokenize_and_tokenize_bytes_match_tokens_across_cases() {
         let byte_tokens = if byte_result.num_tokens == 0 {
             Vec::<Vec<u8>>::new()
         } else {
-            let offsets = unsafe { std::slice::from_raw_parts(byte_result.offsets, byte_result.num_tokens + 1) };
-            let data = unsafe { std::slice::from_raw_parts(byte_result.data, byte_result.data_len) };
+            let offsets = unsafe {
+                std::slice::from_raw_parts(byte_result.offsets, byte_result.num_tokens + 1)
+            };
+            let data =
+                unsafe { std::slice::from_raw_parts(byte_result.data, byte_result.data_len) };
             (0..byte_result.num_tokens)
                 .map(|i| data[offsets[i]..offsets[i + 1]].to_vec())
                 .collect::<Vec<Vec<u8>>>()

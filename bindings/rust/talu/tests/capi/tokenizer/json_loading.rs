@@ -36,13 +36,62 @@ fn try_load(json_str: &str) -> Result<*mut c_void, i32> {
     }
 }
 
+fn assert_rejected(json_str: &str, expected: talu_sys::ErrorCode, context: &str) {
+    let rc = try_load(json_str).expect_err(context);
+    assert_eq!(
+        rc, expected as i32,
+        "{context}: expected {:?} ({}) but got rc={}",
+        expected, expected as i32, rc
+    );
+}
+
+fn assert_rejected_valid_json(json_str: &str, expected: talu_sys::ErrorCode, context: &str) {
+    serde_json::from_str::<serde_json::Value>(json_str)
+        .expect("test fixture must be syntactically valid JSON");
+    assert_rejected(json_str, expected, context);
+}
+
+fn max_object_depth(json: &str) -> usize {
+    let bytes = json.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'{' => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+                i += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    max_depth
+}
+
 fn nested_sequence_normalizer(depth: usize, leaf: &str) -> String {
     let mut current = leaf.to_owned();
     for _ in 0..depth {
-        current = format!(
-            r#"{{"type":"Sequence","normalizers":[{}]}}"#,
-            current
-        );
+        current = format!(r#"{{"type":"Sequence","normalizers":[{}]}}"#, current);
     }
     current
 }
@@ -50,10 +99,7 @@ fn nested_sequence_normalizer(depth: usize, leaf: &str) -> String {
 fn nested_sequence_pretokenizer(depth: usize, leaf: &str) -> String {
     let mut current = leaf.to_owned();
     for _ in 0..depth {
-        current = format!(
-            r#"{{"type":"Sequence","pretokenizers":[{}]}}"#,
-            current
-        );
+        current = format!(r#"{{"type":"Sequence","pretokenizers":[{}]}}"#, current);
     }
     current
 }
@@ -61,10 +107,7 @@ fn nested_sequence_pretokenizer(depth: usize, leaf: &str) -> String {
 fn nested_sequence_postprocessor(depth: usize, leaf: &str) -> String {
     let mut current = leaf.to_owned();
     for _ in 0..depth {
-        current = format!(
-            r#"{{"type":"Sequence","processors":[{}]}}"#,
-            current
-        );
+        current = format!(r#"{{"type":"Sequence","processors":[{}]}}"#, current);
     }
     current
 }
@@ -72,10 +115,7 @@ fn nested_sequence_postprocessor(depth: usize, leaf: &str) -> String {
 fn nested_sequence_decoder(depth: usize, leaf: &str) -> String {
     let mut current = leaf.to_owned();
     for _ in 0..depth {
-        current = format!(
-            r#"{{"type":"Sequence","decoders":[{}]}}"#,
-            current
-        );
+        current = format!(r#"{{"type":"Sequence","decoders":[{}]}}"#, current);
     }
     current
 }
@@ -86,10 +126,7 @@ fn nested_sequence_wordpiece_decoder(depth: usize, cleanup: bool) -> String {
         if cleanup { "true" } else { "false" }
     );
     for _ in 0..depth {
-        current = format!(
-            r#"{{"type":"Sequence","decoders":[{}]}}"#,
-            current
-        );
+        current = format!(r#"{{"type":"Sequence","decoders":[{}]}}"#, current);
     }
     current
 }
@@ -100,12 +137,25 @@ fn nested_sequence_metaspace_decoder(depth: usize, add_prefix_space: bool) -> St
         if add_prefix_space { "true" } else { "false" }
     );
     for _ in 0..depth {
-        current = format!(
-            r#"{{"type":"Sequence","decoders":[{}]}}"#,
-            current
-        );
+        current = format!(r#"{{"type":"Sequence","decoders":[{}]}}"#, current);
     }
     current
+}
+
+#[test]
+fn nested_sequence_helpers_object_depth_matches_requested_depth() {
+    let depth = 7usize;
+    let normalizer = nested_sequence_normalizer(depth, r#"{"type":"Lowercase"}"#);
+    let pretokenizer = nested_sequence_pretokenizer(depth, r#"{"type":"Whitespace"}"#);
+    let postprocessor = nested_sequence_postprocessor(depth, r#"{"type":"ByteLevel"}"#);
+    let decoder = nested_sequence_decoder(depth, r#"{"type":"ByteLevel"}"#);
+
+    // One object for each Sequence wrapper plus one object for the leaf node.
+    let expected = depth + 1;
+    assert_eq!(max_object_depth(&normalizer), expected);
+    assert_eq!(max_object_depth(&pretokenizer), expected);
+    assert_eq!(max_object_depth(&postprocessor), expected);
+    assert_eq!(max_object_depth(&decoder), expected);
 }
 
 // ===========================================================================
@@ -175,9 +225,10 @@ fn bpe_astronomically_sparse_vocab_id_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "astronomically sparse BPE vocab IDs must be rejected deterministically"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "astronomically sparse BPE vocab IDs must be rejected deterministically",
     );
 }
 
@@ -218,9 +269,10 @@ fn wordpiece_astronomically_sparse_vocab_id_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "astronomically sparse WordPiece vocab IDs must be rejected deterministically"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "astronomically sparse WordPiece vocab IDs must be rejected deterministically",
     );
 }
 
@@ -248,16 +300,21 @@ fn valid_minimal_unigram_loads() {
 #[test]
 fn invalid_json_returns_error() {
     let json = r#"{ "version": "1.0", "model": { "type": "BPE""#;
-    assert!(
-        try_load(json).is_err(),
-        "malformed JSON must return error"
+    assert_rejected(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "malformed JSON must return error",
     );
 }
 
 /// Empty string returns error.
 #[test]
 fn empty_string_returns_error() {
-    assert!(try_load("").is_err(), "empty string must return error");
+    assert_rejected(
+        "",
+        talu_sys::ErrorCode::InvalidArgument,
+        "empty string must return error",
+    );
 }
 
 /// Missing `model` section must return error.
@@ -271,7 +328,11 @@ fn missing_model_section_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(try_load(json).is_err(), "missing model must be rejected");
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "missing model must be rejected",
+    );
 }
 
 /// Unknown model type must return error.
@@ -286,7 +347,11 @@ fn unknown_model_type_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(try_load(json).is_err(), "unknown model type must be rejected");
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unknown model type must be rejected",
+    );
 }
 
 /// BPE configs with duplicate vocab IDs must be rejected.
@@ -305,9 +370,10 @@ fn bpe_duplicate_vocab_ids_return_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "duplicate vocab IDs must not load (ambiguous id->token mapping)"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "duplicate vocab IDs must not load (ambiguous id->token mapping)",
     );
 }
 
@@ -327,9 +393,10 @@ fn invalid_unicode_surrogate_escape_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "unpaired surrogate escape must be rejected"
+    assert_rejected(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unpaired surrogate escape must be rejected",
     );
 }
 
@@ -345,9 +412,10 @@ fn unknown_normalizer_type_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "unknown normalizer type must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unknown normalizer type must be rejected",
     );
 }
 
@@ -363,9 +431,10 @@ fn unknown_pretokenizer_type_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "unknown pre_tokenizer type must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unknown pre_tokenizer type must be rejected",
     );
 }
 
@@ -422,9 +491,10 @@ fn deeply_nested_sequence_normalizer_over_limit_returns_error() {
 }}"#,
         normalizer
     );
-    assert!(
-        try_load(&json).is_err(),
-        "over-limit normalizer nesting must return an error, not overflow"
+    assert_rejected(
+        &json,
+        talu_sys::ErrorCode::InternalError,
+        "over-limit normalizer nesting must return an error, not overflow",
     );
 }
 
@@ -474,9 +544,10 @@ fn deeply_nested_sequence_pretokenizer_over_limit_returns_error() {
 }}"#,
         pre_tokenizer
     );
-    assert!(
-        try_load(&json).is_err(),
-        "over-limit pretokenizer nesting must return an error, not overflow"
+    assert_rejected(
+        &json,
+        talu_sys::ErrorCode::InternalError,
+        "over-limit pretokenizer nesting must return an error, not overflow",
     );
 }
 
@@ -527,9 +598,10 @@ fn deeply_nested_sequence_postprocessor_over_limit_returns_error() {
 }}"#,
         post_processor
     );
-    assert!(
-        try_load(&json).is_err(),
-        "over-limit postprocessor nesting must return an error, not overflow"
+    assert_rejected(
+        &json,
+        talu_sys::ErrorCode::InternalError,
+        "over-limit postprocessor nesting must return an error, not overflow",
     );
 }
 
@@ -562,8 +634,7 @@ fn deeply_nested_sequence_postprocessor_at_limit_loads() {
 /// loader error instead of recursing indefinitely.
 #[test]
 fn deeply_nested_sequence_decoder_over_limit_returns_error() {
-    let decoder =
-        nested_sequence_decoder(MAX_JSON_PIPELINE_DEPTH + 1, r#"{"type":"ByteLevel"}"#);
+    let decoder = nested_sequence_decoder(MAX_JSON_PIPELINE_DEPTH + 1, r#"{"type":"ByteLevel"}"#);
     let json = format!(
         r#"{{
   "version": "1.0",
@@ -580,17 +651,17 @@ fn deeply_nested_sequence_decoder_over_limit_returns_error() {
 }}"#,
         decoder
     );
-    assert!(
-        try_load(&json).is_err(),
-        "over-limit decoder nesting must return an error, not overflow"
+    assert_rejected(
+        &json,
+        talu_sys::ErrorCode::InternalError,
+        "over-limit decoder nesting must return an error, not overflow",
     );
 }
 
 /// Sequence decoders exactly at the supported nesting budget must still load.
 #[test]
 fn deeply_nested_sequence_decoder_at_limit_loads() {
-    let decoder =
-        nested_sequence_decoder(MAX_JSON_PIPELINE_DEPTH, r#"{"type":"ByteLevel"}"#);
+    let decoder = nested_sequence_decoder(MAX_JSON_PIPELINE_DEPTH, r#"{"type":"ByteLevel"}"#);
     let json = format!(
         r#"{{
   "version": "1.0",
@@ -632,9 +703,10 @@ fn deeply_nested_sequence_metaspace_decoder_over_limit_returns_error() {
 }}"#,
         decoder
     );
-    assert!(
-        try_load(&json).is_err(),
-        "over-limit nested Metaspace decoder must return an error, not overflow or load"
+    assert_rejected(
+        &json,
+        talu_sys::ErrorCode::InternalError,
+        "over-limit nested Metaspace decoder must return an error, not overflow or load",
     );
 }
 
@@ -658,9 +730,10 @@ fn deeply_nested_sequence_wordpiece_decoder_over_limit_returns_error() {
 }}"#,
         decoder
     );
-    assert!(
-        try_load(&json).is_err(),
-        "over-limit nested WordPiece decoder must return an error, not overflow or load"
+    assert_rejected(
+        &json,
+        talu_sys::ErrorCode::InternalError,
+        "over-limit nested WordPiece decoder must return an error, not overflow or load",
     );
 }
 
@@ -724,7 +797,11 @@ fn unknown_decoder_type_returns_error() {
   "post_processor": null,
   "decoder": { "type": "DoesNotExist" }
 }"#;
-    assert!(try_load(json).is_err(), "unknown decoder type must be rejected");
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unknown decoder type must be rejected",
+    );
 }
 
 /// TemplateProcessing that references undefined special tokens must be rejected.
@@ -755,9 +832,10 @@ fn template_processing_missing_special_token_definition_returns_error() {
   },
   "decoder": {"type": "ByteLevel"}
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "template processor with undefined special token mapping must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "template processor with undefined special token mapping must be rejected",
     );
 }
 
@@ -773,7 +851,11 @@ fn missing_model_type_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(try_load(json).is_err(), "missing model.type must be rejected");
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "missing model.type must be rejected",
+    );
 }
 
 /// BPE model missing vocab must be rejected.
@@ -788,7 +870,11 @@ fn bpe_missing_vocab_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(try_load(json).is_err(), "BPE without vocab must be rejected");
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "BPE without vocab must be rejected",
+    );
 }
 
 /// Unknown post_processor type must be rejected.
@@ -803,9 +889,10 @@ fn unknown_postprocessor_type_returns_error() {
   "post_processor": { "type": "DoesNotExist" },
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "unknown post_processor type must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unknown post_processor type must be rejected",
     );
 }
 
@@ -821,9 +908,10 @@ fn split_pretokenizer_missing_pattern_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "Split pre_tokenizer without pattern must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "Split pre_tokenizer without pattern must be rejected",
     );
 }
 
@@ -839,9 +927,10 @@ fn replace_normalizer_missing_pattern_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "Replace normalizer without pattern must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "Replace normalizer without pattern must be rejected",
     );
 }
 
@@ -857,9 +946,10 @@ fn prepend_normalizer_missing_text_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "Prepend normalizer without prepend text must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "Prepend normalizer without prepend text must be rejected",
     );
 }
 
@@ -875,9 +965,10 @@ fn added_token_missing_content_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "added token missing content must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "added token missing content must be rejected",
     );
 }
 
@@ -893,9 +984,10 @@ fn added_token_non_numeric_id_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "added token non-numeric id must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "added token non-numeric id must be rejected",
     );
 }
 
@@ -914,9 +1006,10 @@ fn added_tokens_duplicate_ids_return_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "duplicate added token IDs must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "duplicate added token IDs must be rejected",
     );
 }
 
@@ -935,9 +1028,10 @@ fn added_tokens_duplicate_content_return_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "duplicate added token content with different IDs must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "duplicate added token content with different IDs must be rejected",
     );
 }
 
@@ -957,9 +1051,10 @@ fn vocab_added_token_id_collision_with_different_content_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "vocab/added-token ID collision with different content must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "vocab/added-token ID collision with different content must be rejected",
     );
 }
 
@@ -979,7 +1074,11 @@ fn bpe_vocab_float_id_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(try_load(json).is_err(), "float vocab IDs must be rejected");
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "float vocab IDs must be rejected",
+    );
 }
 
 /// BPE vocab IDs must be non-negative.
@@ -998,7 +1097,11 @@ fn bpe_vocab_negative_id_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(try_load(json).is_err(), "negative vocab IDs must be rejected");
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "negative vocab IDs must be rejected",
+    );
 }
 
 /// BPE merges must be an array.
@@ -1017,7 +1120,11 @@ fn bpe_merges_non_array_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(try_load(json).is_err(), "non-array merges must be rejected");
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "non-array merges must be rejected",
+    );
 }
 
 /// Array-format BPE merges must contain exactly two string tokens.
@@ -1036,9 +1143,10 @@ fn bpe_merge_pair_with_three_items_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "merge entries with arity != 2 must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "merge entries with arity != 2 must be rejected",
     );
 }
 
@@ -1058,9 +1166,10 @@ fn bpe_merge_pair_non_string_element_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "merge entries with non-string elements must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "merge entries with non-string elements must be rejected",
     );
 }
 
@@ -1080,9 +1189,10 @@ fn bpe_merge_string_without_separator_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "string merge entries without a pair separator must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "string merge entries without a pair separator must be rejected",
     );
 }
 
@@ -1102,9 +1212,10 @@ fn bpe_duplicate_merge_entries_return_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "duplicate merge pairs must be rejected to avoid rank ambiguity"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "duplicate merge pairs must be rejected to avoid rank ambiguity",
     );
 }
 
@@ -1124,9 +1235,10 @@ fn bpe_merge_string_with_double_space_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "merge strings must have exactly one separator space"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "merge strings must have exactly one separator space",
     );
 }
 
@@ -1146,9 +1258,10 @@ fn bpe_merge_string_with_leading_space_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "merge strings with leading spaces must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "merge strings with leading spaces must be rejected",
     );
 }
 
@@ -1168,9 +1281,10 @@ fn bpe_merge_string_with_trailing_space_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "merge strings with trailing spaces must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "merge strings with trailing spaces must be rejected",
     );
 }
 
@@ -1190,9 +1304,10 @@ fn bpe_merge_referencing_unknown_symbol_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "merge entries with unknown symbols must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "merge entries with unknown symbols must be rejected",
     );
 }
 
@@ -1214,9 +1329,10 @@ fn bpe_unsupported_dropout_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "unsupported BPE dropout must be rejected, not ignored"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unsupported BPE dropout must be rejected, not ignored",
     );
 }
 
@@ -1238,9 +1354,10 @@ fn bpe_unsupported_fuse_unk_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "unsupported BPE fuse_unk must be rejected, not ignored"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unsupported BPE fuse_unk must be rejected, not ignored",
     );
 }
 
@@ -1262,9 +1379,10 @@ fn bpe_unsupported_byte_fallback_flag_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "unsupported explicit BPE byte_fallback flag must be rejected, not ignored"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unsupported explicit BPE byte_fallback flag must be rejected, not ignored",
     );
 }
 
@@ -1286,9 +1404,10 @@ fn bpe_unsupported_continuing_subword_prefix_returns_error() {
   "post_processor": null,
   "decoder": null
 }"###;
-    assert!(
-        try_load(json).is_err(),
-        "unsupported BPE continuing_subword_prefix must be rejected, not ignored"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unsupported BPE continuing_subword_prefix must be rejected, not ignored",
     );
 }
 
@@ -1310,9 +1429,10 @@ fn bpe_unsupported_end_of_word_suffix_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "unsupported BPE end_of_word_suffix must be rejected, not ignored"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unsupported BPE end_of_word_suffix must be rejected, not ignored",
     );
 }
 
@@ -1334,9 +1454,10 @@ fn bpe_unsupported_ignore_merges_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "unsupported BPE ignore_merges must be rejected, not ignored"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "unsupported BPE ignore_merges must be rejected, not ignored",
     );
 }
 
@@ -1352,9 +1473,10 @@ fn added_token_missing_id_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "added token missing id must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "added token missing id must be rejected",
     );
 }
 
@@ -1370,9 +1492,10 @@ fn added_token_negative_id_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "negative added token IDs must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "negative added token IDs must be rejected",
     );
 }
 
@@ -1388,9 +1511,10 @@ fn added_token_float_id_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "float added token IDs must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "float added token IDs must be rejected",
     );
 }
 
@@ -1430,9 +1554,10 @@ fn duplicate_vocab_token_keys_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "duplicate vocab token keys must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "duplicate vocab token keys must be rejected",
     );
 }
 
@@ -1452,9 +1577,10 @@ fn vocab_token_with_embedded_nul_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "vocab keys with embedded NUL must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "vocab keys with embedded NUL must be rejected",
     );
 }
 
@@ -1470,9 +1596,10 @@ fn added_token_content_with_embedded_nul_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "added token content with embedded NUL must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "added token content with embedded NUL must be rejected",
     );
 }
 
@@ -1488,7 +1615,11 @@ fn added_tokens_non_array_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(try_load(json).is_err(), "non-array added_tokens must be rejected");
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "non-array added_tokens must be rejected",
+    );
 }
 
 /// normalizer must be object or null.
@@ -1503,9 +1634,10 @@ fn normalizer_non_object_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "non-object normalizer must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "non-object normalizer must be rejected",
     );
 }
 
@@ -1521,9 +1653,10 @@ fn pretokenizer_non_object_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "non-object pre_tokenizer must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "non-object pre_tokenizer must be rejected",
     );
 }
 
@@ -1539,9 +1672,10 @@ fn postprocessor_non_object_returns_error() {
   "post_processor": "TemplateProcessing",
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "non-object post_processor must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "non-object post_processor must be rejected",
     );
 }
 
@@ -1557,7 +1691,11 @@ fn decoder_non_object_returns_error() {
   "post_processor": null,
   "decoder": "ByteLevel"
 }"#;
-    assert!(try_load(json).is_err(), "non-object decoder must be rejected");
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "non-object decoder must be rejected",
+    );
 }
 
 /// TemplateProcessing single field must be an array of template elements.
@@ -1587,9 +1725,10 @@ fn template_processing_single_non_array_returns_error() {
   },
   "decoder": {"type": "ByteLevel"}
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "TemplateProcessing.single must be an array"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "TemplateProcessing.single must be an array",
     );
 }
 
@@ -1623,9 +1762,10 @@ fn template_processing_special_tokens_ids_non_array_returns_error() {
   },
   "decoder": {"type": "ByteLevel"}
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "TemplateProcessing special_tokens ids must be an array"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "TemplateProcessing special_tokens ids must be an array",
     );
 }
 
@@ -1645,9 +1785,10 @@ fn wordpiece_array_vocab_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "WordPiece must reject Unigram-style array vocab"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "WordPiece must reject Unigram-style array vocab",
     );
 }
 
@@ -1667,9 +1808,10 @@ fn unigram_object_vocab_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "Unigram must reject object-form vocab"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "Unigram must reject object-form vocab",
     );
 }
 
@@ -1689,9 +1831,10 @@ fn unigram_vocab_entry_missing_score_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "Unigram entries missing score must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "Unigram entries missing score must be rejected",
     );
 }
 
@@ -1711,9 +1854,58 @@ fn unigram_vocab_entry_non_numeric_score_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "Unigram entries with non-numeric score must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "Unigram entries with non-numeric score must be rejected",
+    );
+}
+
+/// Unigram must reject non-finite scores (NaN) instead of accepting poisoned
+/// DP weights.
+#[test]
+fn unigram_vocab_entry_nan_score_returns_error() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [["<unk>", 0.0], ["a", NaN]]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    assert_rejected(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "Unigram NaN scores must be rejected",
+    );
+}
+
+/// Unigram must reject non-finite scores (+Infinity) to avoid unstable
+/// behavior from malformed model files.
+#[test]
+fn unigram_vocab_entry_infinity_score_returns_error() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [["<unk>", 0.0], ["a", Infinity]]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    assert_rejected(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "Unigram +Infinity scores must be rejected",
     );
 }
 
@@ -1733,9 +1925,10 @@ fn unigram_vocab_entry_extra_field_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "Unigram entries with arity != 2 must be rejected"
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "Unigram entries with arity != 2 must be rejected",
     );
 }
 
@@ -1846,7 +2039,11 @@ fn empty_merges_is_valid() {
     let ctx = TokenizerTestContext::from_json(json);
     // Each char stays as individual token
     let tokens = ctx.encode_with("ab", &no_bos());
-    assert_eq!(tokens, vec![0, 1], "empty merges: each char is its own token");
+    assert_eq!(
+        tokens,
+        vec![0, 1],
+        "empty merges: each char is its own token"
+    );
 }
 
 /// All optional pipeline stages set to null.
@@ -1903,9 +2100,15 @@ fn non_contiguous_vocab_ids() {
 }"#;
     let ctx = TokenizerTestContext::from_json(json);
     let decoded = ctx.decode(&[100]);
-    assert_eq!(decoded, "hello", "non-contiguous ID 100 must map to 'hello'");
+    assert_eq!(
+        decoded, "hello",
+        "non-contiguous ID 100 must map to 'hello'"
+    );
     let decoded = ctx.decode(&[200]);
-    assert_eq!(decoded, "world", "non-contiguous ID 200 must map to 'world'");
+    assert_eq!(
+        decoded, "world",
+        "non-contiguous ID 200 must map to 'world'"
+    );
 }
 
 // ===========================================================================

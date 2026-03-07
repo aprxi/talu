@@ -170,7 +170,10 @@ fn use_regex_true_contraction_boundary_consistent_across_tokenize_surfaces() {
     let ctx = TokenizerTestContext::from_json(json);
 
     assert_eq!(tokenize_strings(&ctx, "don't"), ["d", "o", "n", "'", "t"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "don't"), ["d", "o", "n", "'", "t"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "don't"),
+        ["d", "o", "n", "'", "t"]
+    );
 
     let batch = ctx.encode_batch(&["don't", "don't"], &no_bos());
     assert_eq!(batch.num_sequences, 2);
@@ -259,7 +262,10 @@ fn use_regex_prevents_cross_uppercase_apostrophe_merge() {
 
     assert_eq!(ctx.encode_with("DON'T", &no_bos()), vec![4, 5, 6, 7, 8]);
     assert_eq!(tokenize_strings(&ctx, "DON'T"), ["D", "O", "N", "'", "T"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "DON'T"), ["D", "O", "N", "'", "T"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "DON'T"),
+        ["D", "O", "N", "'", "T"]
+    );
 
     let result = unsafe { encode_raw(ctx.handle(), b"DON'T", &no_bos()) };
     assert!(result.error_msg.is_null(), "encode failed");
@@ -337,6 +343,66 @@ fn use_regex_true_uppercase_contractions_preserve_apostrophe_boundaries() {
     assert_eq!(tokenize_strings(&ctx, "IT'S"), ["I", "T", "'", "S"]);
     assert_eq!(tokenize_bytes_strings(&ctx, "IT'S"), ["I", "T", "'", "S"]);
     assert_eq!(ctx.encode_with("IT'S", &no_bos()), vec![4, 5, 9, 8]);
+}
+
+/// Pathological apostrophe/space runs must remain deterministic under the
+/// GPT-2 regex path and preserve exact byte cardinality.
+#[test]
+fn use_regex_pathological_apostrophe_space_runs_are_deterministic() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "'": 4, "\u0120": 5
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = no_bos();
+
+    let apostrophes = "'".repeat(8_192);
+    let spaces = " ".repeat(8_192);
+
+    let apostrophes_first = ctx.encode_with(&apostrophes, &opts);
+    let apostrophes_second = ctx.encode_with(&apostrophes, &opts);
+    assert_eq!(
+        apostrophes_first, apostrophes_second,
+        "long apostrophe runs must be deterministic under use_regex=true"
+    );
+    assert!(
+        !apostrophes_first.is_empty(),
+        "long apostrophe runs must produce tokens"
+    );
+
+    let spaces_first = ctx.encode_with(&spaces, &opts);
+    let spaces_second = ctx.encode_with(&spaces, &opts);
+    assert_eq!(
+        spaces_first, spaces_second,
+        "long space runs must be deterministic under use_regex=true"
+    );
+    assert!(
+        !spaces_first.is_empty(),
+        "long space runs must produce tokens"
+    );
+    assert_eq!(
+        tokenize_strings(&ctx, &spaces),
+        tokenize_bytes_strings(&ctx, &spaces)
+    );
+    assert_eq!(ctx.decode(&apostrophes_first), apostrophes);
+    assert_eq!(ctx.decode(&spaces_first), spaces);
 }
 
 // ===========================================================================
@@ -448,7 +514,10 @@ fn use_regex_digit_letter_boundary_is_consistent_for_batch_and_offsets() {
     let ctx = TokenizerTestContext::from_json(json);
 
     assert_eq!(tokenize_strings(&ctx, "abc123"), ["a", "b", "c1", "2", "3"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "abc123"), ["a", "b", "c1", "2", "3"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "abc123"),
+        ["a", "b", "c1", "2", "3"]
+    );
 
     let result = unsafe { encode_raw(ctx.handle(), b"abc123", &no_bos()) };
     assert!(result.error_msg.is_null(), "encode failed");
@@ -930,7 +999,10 @@ fn use_regex_false_mixed_classes_allow_cross_chunk_merges() {
 
     assert_eq!(ctx.encode_with("ab12!?", &no_bos()), vec![4, 13, 14, 9]);
     assert_eq!(tokenize_strings(&ctx, "ab12!?"), ["a", "b1", "2!", "?"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "ab12!?"), ["a", "b1", "2!", "?"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "ab12!?"),
+        ["a", "b1", "2!", "?"]
+    );
 
     let result = unsafe { encode_raw(ctx.handle(), b"ab12!?", &no_bos()) };
     assert!(result.error_msg.is_null(), "encode failed");
@@ -972,7 +1044,10 @@ fn use_regex_true_space_prefixed_word_then_punctuation_merges_per_chunk() {
 
     assert_eq!(ctx.encode_with(" hi!?", &no_bos()), vec![9, 6, 11]);
     assert_eq!(tokenize_strings(&ctx, " hi!?"), ["\u{0120}h", "i", "!?"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, " hi!?"), ["\u{0120}h", "i", "!?"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, " hi!?"),
+        ["\u{0120}h", "i", "!?"]
+    );
 
     let result = unsafe { encode_raw(ctx.handle(), b" hi!?", &no_bos()) };
     assert!(result.error_msg.is_null(), "encode failed");
@@ -1013,7 +1088,10 @@ fn use_regex_false_space_prefixed_word_then_punctuation_allows_cross_boundary_me
 
     assert_eq!(ctx.encode_with(" hi!?", &no_bos()), vec![9, 10, 8]);
     assert_eq!(tokenize_strings(&ctx, " hi!?"), ["\u{0120}h", "i!", "?"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, " hi!?"), ["\u{0120}h", "i!", "?"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, " hi!?"),
+        ["\u{0120}h", "i!", "?"]
+    );
 
     let result = unsafe { encode_raw(ctx.handle(), b" hi!?", &no_bos()) };
     assert!(result.error_msg.is_null(), "encode failed");
@@ -1125,8 +1203,14 @@ fn use_regex_prevents_cross_digit_space_merge() {
     let ctx = TokenizerTestContext::from_json(json);
 
     assert_eq!(ctx.encode_with("12 hi", &no_bos()), vec![4, 5, 10, 8]);
-    assert_eq!(tokenize_strings(&ctx, "12 hi"), ["1", "2", "\u{0120}h", "i"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "12 hi"), ["1", "2", "\u{0120}h", "i"]);
+    assert_eq!(
+        tokenize_strings(&ctx, "12 hi"),
+        ["1", "2", "\u{0120}h", "i"]
+    );
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "12 hi"),
+        ["1", "2", "\u{0120}h", "i"]
+    );
 }
 
 /// With regex disabled, the entire string is one chunk, so the 2+Ġ merge must
@@ -1158,8 +1242,14 @@ fn use_regex_false_allows_cross_digit_space_merge() {
     let ctx = TokenizerTestContext::from_json(json);
 
     assert_eq!(ctx.encode_with("12 hi", &no_bos()), vec![4, 9, 7, 8]);
-    assert_eq!(tokenize_strings(&ctx, "12 hi"), ["1", "2\u{0120}", "h", "i"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "12 hi"), ["1", "2\u{0120}", "h", "i"]);
+    assert_eq!(
+        tokenize_strings(&ctx, "12 hi"),
+        ["1", "2\u{0120}", "h", "i"]
+    );
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "12 hi"),
+        ["1", "2\u{0120}", "h", "i"]
+    );
 
     let result = unsafe { encode_raw(ctx.handle(), b"12 hi", &no_bos()) };
     assert!(result.error_msg.is_null(), "encode failed");
@@ -1268,8 +1358,14 @@ fn use_regex_prevents_cross_punctuation_space_merge() {
     let ctx = TokenizerTestContext::from_json(json);
 
     assert_eq!(ctx.encode_with("!? hi", &no_bos()), vec![4, 5, 10, 8]);
-    assert_eq!(tokenize_strings(&ctx, "!? hi"), ["!", "?", "\u{0120}h", "i"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "!? hi"), ["!", "?", "\u{0120}h", "i"]);
+    assert_eq!(
+        tokenize_strings(&ctx, "!? hi"),
+        ["!", "?", "\u{0120}h", "i"]
+    );
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "!? hi"),
+        ["!", "?", "\u{0120}h", "i"]
+    );
 }
 
 /// With regex disabled, the same input is one chunk, so the ?+Ġ merge must
@@ -1301,8 +1397,14 @@ fn use_regex_false_allows_cross_punctuation_space_merge() {
     let ctx = TokenizerTestContext::from_json(json);
 
     assert_eq!(ctx.encode_with("!? hi", &no_bos()), vec![4, 9, 7, 8]);
-    assert_eq!(tokenize_strings(&ctx, "!? hi"), ["!", "?\u{0120}", "h", "i"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "!? hi"), ["!", "?\u{0120}", "h", "i"]);
+    assert_eq!(
+        tokenize_strings(&ctx, "!? hi"),
+        ["!", "?\u{0120}", "h", "i"]
+    );
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "!? hi"),
+        ["!", "?\u{0120}", "h", "i"]
+    );
 
     let result = unsafe { encode_raw(ctx.handle(), b"!? hi", &no_bos()) };
     assert!(result.error_msg.is_null(), "encode failed");

@@ -129,10 +129,7 @@ fn all_ascii_bytes_produce_correct_token() {
         // Each ASCII byte is valid single-byte UTF-8.
         let s = unsafe { std::str::from_utf8_unchecked(std::slice::from_ref(&b)) };
         let tokens = ctx.encode_with(s, &opts);
-        assert!(
-            !tokens.is_empty(),
-            "byte 0x{b:02X}: expected at least 1 token"
-        );
+        assert_eq!(tokens.len(), 1, "byte 0x{b:02X}: expected exactly 1 token");
         assert_ne!(tokens[0], 3, "byte 0x{b:02X} should not be unk");
         assert_eq!(tokens[0], byte_token_id(b), "byte 0x{b:02X} ID mismatch");
     }
@@ -373,7 +370,11 @@ fn add_prefix_space_does_not_duplicate_existing_leading_space() {
     let ctx = TokenizerTestContext::from_json(&json);
 
     let tokens = ctx.encode_with(" Hello", &no_bos());
-    let expected: Vec<u32> = " Hello".as_bytes().iter().map(|&b| byte_token_id(b)).collect();
+    let expected: Vec<u32> = " Hello"
+        .as_bytes()
+        .iter()
+        .map(|&b| byte_token_id(b))
+        .collect();
     assert_eq!(tokens, expected);
     // Decode cannot distinguish a real leading space from a synthetic
     // add_prefix_space byte once they collapse to the same ID stream. The
@@ -426,7 +427,10 @@ fn add_prefix_space_token_surfaces_show_single_prefix_marker() {
         .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
     let ctx = TokenizerTestContext::from_json(&json);
 
-    assert_eq!(tokenize_strings(&ctx, "Hello"), ["Ġ", "H", "e", "l", "l", "o"]);
+    assert_eq!(
+        tokenize_strings(&ctx, "Hello"),
+        ["Ġ", "H", "e", "l", "l", "o"]
+    );
     assert_eq!(
         tokenize_bytes_strings(&ctx, "Hello"),
         ["Ġ", "H", "e", "l", "l", "o"]
@@ -489,7 +493,10 @@ fn add_prefix_space_existing_leading_space_has_single_marker_on_token_surfaces()
         .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
     let ctx = TokenizerTestContext::from_json(&json);
 
-    assert_eq!(tokenize_strings(&ctx, " Hello"), ["Ġ", "H", "e", "l", "l", "o"]);
+    assert_eq!(
+        tokenize_strings(&ctx, " Hello"),
+        ["Ġ", "H", "e", "l", "l", "o"]
+    );
     assert_eq!(
         tokenize_bytes_strings(&ctx, " Hello"),
         ["Ġ", "H", "e", "l", "l", "o"]
@@ -511,7 +518,11 @@ fn add_prefix_space_mixed_batch_keeps_per_sequence_prefix_contract() {
 
     let seq0 = &batch.ids[0..6];
     let seq1 = &batch.ids[6..12];
-    let expected0: Vec<u32> = " Hello".as_bytes().iter().map(|&b| byte_token_id(b)).collect();
+    let expected0: Vec<u32> = " Hello"
+        .as_bytes()
+        .iter()
+        .map(|&b| byte_token_id(b))
+        .collect();
     let expected1 = vec![
         byte_token_id(b' '),
         byte_token_id(b'W'),
@@ -541,7 +552,11 @@ fn add_prefix_space_right_truncation_keeps_prefix_token() {
     let tokens = ctx.encode_with("Hello", &opts);
     assert_eq!(
         tokens,
-        vec![byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'e')]
+        vec![
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'e')
+        ]
     );
     assert_eq!(ctx.decode(&tokens), "He");
 }
@@ -564,7 +579,11 @@ fn add_prefix_space_left_truncation_drops_prefix_token() {
     let tokens = ctx.encode_with("Hello", &opts);
     assert_eq!(
         tokens,
-        vec![byte_token_id(b'l'), byte_token_id(b'l'), byte_token_id(b'o')]
+        vec![
+            byte_token_id(b'l'),
+            byte_token_id(b'l'),
+            byte_token_id(b'o')
+        ]
     );
     assert_eq!(ctx.decode(&tokens), "llo");
 }
@@ -625,8 +644,48 @@ fn add_prefix_space_empty_input_stays_empty() {
     let ctx = TokenizerTestContext::from_json(&json);
 
     let tokens = ctx.encode_with("", &no_bos());
-    assert!(tokens.is_empty(), "empty input must not gain a synthetic prefix token");
+    assert!(
+        tokens.is_empty(),
+        "empty input must not gain a synthetic prefix token"
+    );
     assert_eq!(ctx.decode(&tokens), "");
     assert!(tokenize_strings(&ctx, "").is_empty());
     assert!(tokenize_bytes_strings(&ctx, "").is_empty());
+}
+
+/// Literal GPT-2 marker codepoints must not be interpreted as real
+/// whitespace/newline bytes.
+#[test]
+fn literal_gpt2_markers_do_not_smuggle_space_or_newline_tokens() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // Real raw bytes.
+    let space_ids = ctx.encode_with(" ", &opts);
+    let newline_ids = ctx.encode_with("\n", &opts);
+
+    // Literal marker codepoints users can type directly.
+    let literal_space_marker_ids = ctx.encode_with("Ġ", &opts);
+    let literal_newline_marker_ids = ctx.encode_with("Ċ", &opts);
+
+    assert_eq!(space_ids.len(), 1, "raw space should be one byte token");
+    assert_eq!(newline_ids.len(), 1, "raw newline should be one byte token");
+    assert_eq!(
+        literal_space_marker_ids.len(),
+        "Ġ".len(),
+        "literal Ġ should tokenize as its UTF-8 bytes"
+    );
+    assert_eq!(
+        literal_newline_marker_ids.len(),
+        "Ċ".len(),
+        "literal Ċ should tokenize as its UTF-8 bytes"
+    );
+    assert_ne!(
+        literal_space_marker_ids, space_ids,
+        "literal Ġ must not smuggle the raw-space token"
+    );
+    assert_ne!(
+        literal_newline_marker_ids, newline_ids,
+        "literal Ċ must not smuggle the raw-newline token"
+    );
 }

@@ -224,7 +224,10 @@ fn encode_zalgo_combining_marks_is_deterministic() {
     let input = format!("a{combining}");
     let first = ctx.encode_with(&input, &opts);
     let second = ctx.encode_with(&input, &opts);
-    assert_eq!(first, second, "combining-mark heavy input must be deterministic");
+    assert_eq!(
+        first, second,
+        "combining-mark heavy input must be deterministic"
+    );
     assert_eq!(
         first.len(),
         input.len(),

@@ -122,11 +122,7 @@ fn four_repeated_chars_double_merge() {
     // "aaaa" → [a, a, a, a] → merge left (a,a) → [aa, a, a]
     // → merge left (a,a) → [aa, aa] = [5, 5]
     let tokens = ctx.encode_with("aaaa", &no_bos());
-    assert_eq!(
-        tokens,
-        vec![5, 5],
-        "'aaaa' → [aa=5, aa=5], got: {tokens:?}"
-    );
+    assert_eq!(tokens, vec![5, 5], "'aaaa' → [aa=5, aa=5], got: {tokens:?}");
 }
 
 /// "aaaaa" (5 a's) with merge a+a→aa: → [aa, aa, a].
@@ -704,7 +700,11 @@ fn cascade_merges_auto_create_missing_intermediate_tokens() {
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
     let tokens = ctx.encode_with("abc", &no_bos());
-    assert_eq!(tokens.len(), 1, "cascade should reduce to one token, got: {tokens:?}");
+    assert_eq!(
+        tokens.len(),
+        1,
+        "cascade should reduce to one token, got: {tokens:?}"
+    );
     let decoded = ctx.decode(&tokens);
     assert_eq!(
         decoded, "abc",
@@ -853,7 +853,8 @@ fn auto_created_merge_token_consistent_across_surfaces() {
     };
     assert!(tok.error_msg.is_null(), "tokenize should succeed");
     assert_eq!(tok.num_tokens, 1, "tokenize must produce one token");
-    let ptrs = unsafe { std::slice::from_raw_parts(tok.tokens as *const *const i8, tok.num_tokens) };
+    let ptrs =
+        unsafe { std::slice::from_raw_parts(tok.tokens as *const *const i8, tok.num_tokens) };
     let t0 = unsafe { std::ffi::CStr::from_ptr(ptrs[0]) }
         .to_string_lossy()
         .to_string();
@@ -867,7 +868,10 @@ fn auto_created_merge_token_consistent_across_surfaces() {
     assert_eq!(bytes.num_tokens, 1, "tokenize_bytes must produce one token");
     let offsets = unsafe { std::slice::from_raw_parts(bytes.offsets, bytes.num_tokens + 1) };
     let data = unsafe { std::slice::from_raw_parts(bytes.data, bytes.data_len) };
-    assert_eq!(std::str::from_utf8(&data[offsets[0]..offsets[1]]).unwrap(), "ab");
+    assert_eq!(
+        std::str::from_utf8(&data[offsets[0]..offsets[1]]).unwrap(),
+        "ab"
+    );
     unsafe {
         talu_sys::talu_tokenize_bytes_result_free(
             bytes.data,
@@ -1011,7 +1015,11 @@ fn byte_fallback_encodes_unknown_ascii_byte() {
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
     let tokens = ctx.encode_with("a", &no_bos());
-    assert_eq!(tokens, vec![1], "unknown 'a' should use <0x61> byte fallback");
+    assert_eq!(
+        tokens,
+        vec![1],
+        "unknown 'a' should use <0x61> byte fallback"
+    );
 }
 
 /// Multi-byte UTF-8 unknown chars should emit one fallback token per byte when
@@ -1285,7 +1293,10 @@ fn long_word_over_max_word_symbols_is_deterministic() {
     let input = "a".repeat(1025);
     let first = ctx.encode_with(&input, &no_bos());
     let second = ctx.encode_with(&input, &no_bos());
-    assert_eq!(first, second, "long-word BPE encoding must be deterministic");
+    assert_eq!(
+        first, second,
+        "long-word BPE encoding must be deterministic"
+    );
 }
 
 // ===========================================================================
@@ -1946,7 +1957,11 @@ fn non_bytelevel_multibyte_exact_symbol_limit() {
     let ctx = TokenizerTestContext::from_json(json);
     let input = "é".repeat(512);
     let tokens = ctx.encode_with(&input, &no_bos());
-    assert_eq!(tokens.len(), 256, "512 symbols should reduce to 256 merged tokens");
+    assert_eq!(
+        tokens.len(),
+        256,
+        "512 symbols should reduce to 256 merged tokens"
+    );
     assert!(
         tokens.iter().all(|&id| id == 2),
         "all tokens at 512 boundary should be merged 'éé' (id 2)"

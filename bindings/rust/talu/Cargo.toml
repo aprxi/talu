@@ -9,6 +9,10 @@ readme = "README.md"
 categories = ["api-bindings"]
 keywords = ["talu", "llm", "inference"]
 
+[features]
+default = []
+fixtures = []
+
 [dependencies]
 talu-sys = { path = "../talu-sys" }
 
@@ -23,6 +27,7 @@ dirs = "6"
 getrandom = "0.3"
 regex = "1"
 serde_json = "1"
+proptest = "1"
 
 [[bench]]
 name = "search"

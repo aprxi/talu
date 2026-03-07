@@ -149,7 +149,10 @@ fn byte_level_seeded_raw_bytes_preserve_exact_byte_ids_and_offsets() {
     for (seed, len) in [(1_u64, 0_usize), (7, 1), (19, 31), (42, 257)] {
         let bytes = seeded_bytes(seed, len);
         let result = unsafe { super::common::encode_raw(ctx.handle(), &bytes, &no_bos()) };
-        assert!(result.error_msg.is_null(), "seed={seed} len={len}: encode failed");
+        assert!(
+            result.error_msg.is_null(),
+            "seed={seed} len={len}: encode failed"
+        );
         assert_eq!(
             result.num_tokens,
             bytes.len(),
@@ -165,8 +168,15 @@ fn byte_level_seeded_raw_bytes_preserve_exact_byte_ids_and_offsets() {
                 byte_token_id(byte),
                 "seed={seed} len={len}: raw byte at index {idx} must map to its exact byte token ID"
             );
-            assert_eq!(offsets[idx].start as usize, idx, "seed={seed} len={len}: offset[{idx}].start");
-            assert_eq!(offsets[idx].end as usize, idx + 1, "seed={seed} len={len}: offset[{idx}].end");
+            assert_eq!(
+                offsets[idx].start as usize, idx,
+                "seed={seed} len={len}: offset[{idx}].start"
+            );
+            assert_eq!(
+                offsets[idx].end as usize,
+                idx + 1,
+                "seed={seed} len={len}: offset[{idx}].end"
+            );
         }
 
         unsafe { talu_sys::talu_encode_result_free(result) };
@@ -188,7 +198,8 @@ fn byte_level_seeded_raw_bytes_batch_matches_individual_sequences() {
 
     let ptrs: Vec<*const u8> = cases.iter().map(|bytes| bytes.as_ptr()).collect();
     let lengths: Vec<usize> = cases.iter().map(Vec::len).collect();
-    let batch = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
+    let batch =
+        unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
     assert!(batch.error_msg.is_null(), "batch encode failed");
     assert_eq!(batch.num_sequences, cases.len());
 
@@ -229,19 +240,18 @@ fn byte_level_seeded_raw_bytes_batch_offsets_match_individual_lengths() {
 
     let ptrs: Vec<*const u8> = cases.iter().map(|bytes| bytes.as_ptr()).collect();
     let lengths: Vec<usize> = cases.iter().map(Vec::len).collect();
-    let batch = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
+    let batch =
+        unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
     assert!(batch.error_msg.is_null(), "batch encode failed");
     assert_eq!(batch.num_sequences, cases.len());
 
     let offsets = unsafe { std::slice::from_raw_parts(batch.offsets, batch.num_sequences + 1) };
-    let mut expected = Vec::with_capacity(cases.len() + 1);
-    expected.push(0usize);
-    for bytes in &cases {
-        expected.push(expected.last().copied().unwrap() + bytes.len());
-    }
+    // Hardcoded expected offsets for this exact seeded corpus.
+    // This intentionally avoids deriving expectations from input lengths so the
+    // test can catch semantic changes in raw-byte handling.
+    let expected = [0usize, 0, 1, 12, 76];
     assert_eq!(
-        offsets,
-        expected.as_slice(),
+        offsets, expected,
         "seeded raw-byte batch offsets must equal cumulative individual token counts"
     );
 
@@ -261,11 +271,19 @@ fn byte_level_seeded_raw_bytes_batch_offsets_match_individual_lengths() {
 #[test]
 fn byte_level_batch_valid_utf8_slices_decode_to_original_sequences() {
     let ctx = TokenizerTestContext::with_byte_level();
-    let cases = ["", "Hello", "café", "🇺🇸", "👨\u{200d}👩\u{200d}👧\u{200d}👦", "a\u{0301}"];
+    let cases = [
+        "",
+        "Hello",
+        "café",
+        "🇺🇸",
+        "👨\u{200d}👩\u{200d}👧\u{200d}👦",
+        "a\u{0301}",
+    ];
 
     let ptrs: Vec<*const u8> = cases.iter().map(|text| text.as_bytes().as_ptr()).collect();
     let lengths: Vec<usize> = cases.iter().map(|text| text.len()).collect();
-    let batch = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
+    let batch =
+        unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
     assert!(batch.error_msg.is_null(), "batch encode failed");
     assert_eq!(batch.num_sequences, cases.len());
 
@@ -358,11 +376,22 @@ fn rapid_encode_free_200_cycles() {
     let ctx = TokenizerTestContext::new();
     let opts = no_bos();
     let texts = ["Hello", "abc", "012", "!@#$%", "A"];
+    let expected = [
+        vec![44, 73, 80, 80, 83],
+        vec![69, 70, 71],
+        vec![20, 21, 22],
+        vec![5, 36, 7, 8, 9],
+        vec![37],
+    ];
 
     for i in 0..200 {
-        let text = texts[i % texts.len()];
+        let case = i % texts.len();
+        let text = texts[case];
         let tokens = ctx.encode_with(text, &opts);
-        assert!(!tokens.is_empty(), "cycle {i}: should produce tokens");
+        assert_eq!(
+            tokens, expected[case],
+            "cycle {i}: tokenization must remain exact under rapid encode/free"
+        );
     }
 }
 
@@ -377,11 +406,16 @@ fn rapid_decode_free_200_cycles() {
         &[69, 70, 71],         // "abc"
         &[20, 21, 22],         // "012"
     ];
+    let expected = ["Hi", "Hello", "A", "abc", "012"];
 
     for i in 0..200 {
-        let tokens = token_sets[i % token_sets.len()];
+        let case = i % token_sets.len();
+        let tokens = token_sets[case];
         let text = ctx.decode(tokens);
-        assert!(!text.is_empty(), "cycle {i}: should produce text");
+        assert_eq!(
+            text, expected[case],
+            "cycle {i}: decode output must remain exact under rapid decode/free"
+        );
     }
 }
 
@@ -621,18 +655,128 @@ fn concurrent_encode_barrier_high_contention() {
             barrier.wait();
             for i in 0..iterations {
                 let idx = (thread_id + i) % texts.len();
-                let result =
-                    OwnedEncodeResult::new(unsafe { super::common::encode_raw(shared.ptr(), texts[idx], &opts) });
-                assert!(result.error_msg().is_null(), "thread {thread_id} iter {i}: encode failed");
+                let result = OwnedEncodeResult::new(unsafe {
+                    super::common::encode_raw(shared.ptr(), texts[idx], &opts)
+                });
+                assert!(
+                    result.error_msg().is_null(),
+                    "thread {thread_id} iter {i}: encode failed"
+                );
                 let tokens = result.ids();
-                assert_eq!(tokens, expected[idx], "thread {thread_id} iter {i}: wrong tokens");
+                assert_eq!(
+                    tokens, expected[idx],
+                    "thread {thread_id} iter {i}: wrong tokens"
+                );
             }
         });
         handles.push(handle);
     }
 
     for (i, handle) in handles.into_iter().enumerate() {
-        handle.join().unwrap_or_else(|_| panic!("Thread {i} panicked"));
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("Thread {i} panicked"));
+    }
+}
+
+/// High-contention byte-level encoding with heterogeneous payload geometry
+/// (empty, tiny, medium, large, Unicode, and malformed UTF-8) must remain
+/// exact under concurrent access and allocator pressure.
+#[test]
+fn concurrent_byte_level_heterogeneous_payloads_match_exact_byte_ids() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let shared = Arc::new(SharedHandle(ctx.handle()));
+    let barrier = Arc::new(Barrier::new(6));
+
+    let mut payloads: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        vec![0x00],
+        b"A".to_vec(),
+        b"Hello".to_vec(),
+        "café".as_bytes().to_vec(),
+        "日本語".as_bytes().to_vec(),
+        "👨\u{200d}👩\u{200d}👧\u{200d}👦".as_bytes().to_vec(),
+        vec![0xF0, 0x9F, 0x8E, 0x80, 0xC0, 0xAF, 0x80, 0xFF],
+        seeded_bytes(0x11, 257),
+        seeded_bytes(0x2222, 4096),
+    ];
+    payloads.push(vec![0xF0, 0x9F, 0x8E, 0x80, 0xC0, 0xAF, 0x80, 0xFF].repeat(128)); // 1_024 bytes
+    payloads.push(seeded_bytes(0xBAD5_EED, 4_096));
+
+    let expected_ids: Vec<Vec<u32>> = payloads
+        .iter()
+        .map(|bytes| bytes.iter().map(|&b| byte_token_id(b)).collect())
+        .collect();
+
+    let payloads = Arc::new(payloads);
+    let expected_ids = Arc::new(expected_ids);
+    let mut handles = Vec::new();
+
+    for thread_id in 0..6 {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        let payloads = Arc::clone(&payloads);
+        let expected_ids = Arc::clone(&expected_ids);
+        let handle = thread::spawn(move || {
+            let opts = no_bos();
+            barrier.wait();
+            for i in 0..12 {
+                let idx = (thread_id * 5 + i * 7) % payloads.len();
+                let bytes = &payloads[idx];
+                let expected = &expected_ids[idx];
+                let result = unsafe { super::common::encode_raw(shared.ptr(), bytes, &opts) };
+                assert!(
+                    result.error_msg.is_null(),
+                    "thread {thread_id} iter {i}: encode failed for case {idx}"
+                );
+                assert_eq!(
+                    result.num_tokens,
+                    bytes.len(),
+                    "thread {thread_id} iter {i}: token count must equal byte length for case {idx}"
+                );
+                let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+                assert_eq!(
+                    ids,
+                    expected.as_slice(),
+                    "thread {thread_id} iter {i}: wrong IDs for heterogeneous case {idx}"
+                );
+                let offsets =
+                    unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+                if !offsets.is_empty() {
+                    assert_eq!(
+                        offsets[0].start, 0,
+                        "thread {thread_id} iter {i}: first offset start"
+                    );
+                    assert_eq!(
+                        offsets[0].end, 1,
+                        "thread {thread_id} iter {i}: first offset end"
+                    );
+                    let mid = offsets.len() / 2;
+                    assert_eq!(
+                        offsets[mid].start as usize, mid,
+                        "thread {thread_id} iter {i}: mid offset start"
+                    );
+                    assert_eq!(
+                        offsets[mid].end as usize,
+                        mid + 1,
+                        "thread {thread_id} iter {i}: mid offset end"
+                    );
+                    assert_eq!(
+                        offsets.last().unwrap().end as usize,
+                        bytes.len(),
+                        "thread {thread_id} iter {i}: last offset end"
+                    );
+                }
+                unsafe { talu_sys::talu_encode_result_free(result) };
+            }
+        });
+        handles.push(handle);
+    }
+
+    for (i, handle) in handles.into_iter().enumerate() {
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("Thread {i} panicked"));
     }
 }
 
@@ -651,9 +795,13 @@ fn concurrent_last_error_code_is_thread_isolated() {
             let opts = no_bos();
             barrier.wait();
             for i in 0..500 {
-                let result =
-                    OwnedEncodeResult::new(unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &opts) });
-                assert!(result.error_msg().is_null(), "success thread iter {i}: encode failed");
+                let result = OwnedEncodeResult::new(unsafe {
+                    super::common::encode_raw(shared.ptr(), b"Hello", &opts)
+                });
+                assert!(
+                    result.error_msg().is_null(),
+                    "success thread iter {i}: encode failed"
+                );
                 assert_eq!(
                     unsafe { talu_sys::talu_last_error_code() },
                     talu_sys::ErrorCode::Ok as i32,
@@ -670,8 +818,9 @@ fn concurrent_last_error_code_is_thread_isolated() {
             let opts = talu_sys::DecodeOptionsC::default();
             barrier.wait();
             for i in 0..500 {
-                let result =
-                    OwnedDecodeResult::new(unsafe { super::common::decode_raw(shared.ptr(), &[u32::MAX], &opts) });
+                let result = OwnedDecodeResult::new(unsafe {
+                    super::common::decode_raw(shared.ptr(), &[u32::MAX], &opts)
+                });
                 assert!(
                     !result.error_msg().is_null(),
                     "error thread iter {i}: invalid-token decode must fail"
@@ -708,16 +857,24 @@ fn concurrent_mixed_workload_barrier_high_contention() {
             for i in 0..500 {
                 match (thread_id + i) % 4 {
                     0 => {
-                        let enc =
-                            OwnedEncodeResult::new(unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &encode_opts) });
-                        assert!(enc.error_msg().is_null(), "thread {thread_id} iter {i}: encode failed");
+                        let enc = OwnedEncodeResult::new(unsafe {
+                            super::common::encode_raw(shared.ptr(), b"Hello", &encode_opts)
+                        });
+                        assert!(
+                            enc.error_msg().is_null(),
+                            "thread {thread_id} iter {i}: encode failed"
+                        );
                         let ids = enc.ids();
                         assert_eq!(ids, &[44, 73, 80, 80, 83]);
                     }
                     1 => {
-                        let dec =
-                            OwnedDecodeResult::new(unsafe { super::common::decode_raw(shared.ptr(), &[44, 77], &decode_opts) });
-                        assert!(dec.error_msg().is_null(), "thread {thread_id} iter {i}: decode failed");
+                        let dec = OwnedDecodeResult::new(unsafe {
+                            super::common::decode_raw(shared.ptr(), &[44, 77], &decode_opts)
+                        });
+                        assert!(
+                            dec.error_msg().is_null(),
+                            "thread {thread_id} iter {i}: decode failed"
+                        );
                         assert_eq!(dec.text(), "Hi");
                     }
                     2 => {
@@ -765,7 +922,10 @@ fn concurrent_take_last_error_is_thread_isolated() {
             barrier.wait();
             for i in 0..400 {
                 let result = unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &opts) };
-                assert!(result.error_msg.is_null(), "success thread iter {i}: encode failed");
+                assert!(
+                    result.error_msg.is_null(),
+                    "success thread iter {i}: encode failed"
+                );
                 let mut code = -1;
                 let required = unsafe {
                     talu_sys::talu_take_last_error(
@@ -774,7 +934,10 @@ fn concurrent_take_last_error_is_thread_isolated() {
                         &mut code as *mut _ as *mut std::ffi::c_void,
                     )
                 };
-                assert_eq!(required, 0, "success thread iter {i}: take_last_error should be empty");
+                assert_eq!(
+                    required, 0,
+                    "success thread iter {i}: take_last_error should be empty"
+                );
                 assert_eq!(
                     code,
                     talu_sys::ErrorCode::Ok as i32,
@@ -838,9 +1001,13 @@ fn concurrent_invalid_json_creation_does_not_bleed_into_clean_encode_thread() {
             let opts = no_bos();
             barrier.wait();
             for i in 0..400 {
-                let result =
-                    OwnedEncodeResult::new(unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &opts) });
-                assert!(result.error_msg().is_null(), "success thread iter {i}: encode failed");
+                let result = OwnedEncodeResult::new(unsafe {
+                    super::common::encode_raw(shared.ptr(), b"Hello", &opts)
+                });
+                assert!(
+                    result.error_msg().is_null(),
+                    "success thread iter {i}: encode failed"
+                );
                 assert_eq!(result.ids(), &[44, 73, 80, 80, 83]);
                 assert_eq!(
                     unsafe { talu_sys::talu_last_error_code() },
@@ -864,7 +1031,10 @@ fn concurrent_invalid_json_creation_does_not_bleed_into_clean_encode_thread() {
                         &mut handle as *mut _ as *mut c_void,
                     )
                 };
-                assert_ne!(rc, 0, "error thread iter {i}: null/empty JSON input must fail to load");
+                assert_ne!(
+                    rc, 0,
+                    "error thread iter {i}: null/empty JSON input must fail to load"
+                );
                 assert!(
                     handle.is_null(),
                     "error thread iter {i}: failed creation must not return a handle"
@@ -1097,7 +1267,10 @@ fn seeded_property_roundtrip_ascii_non_space() {
         let input = seeded_ascii_non_space(seed ^ case_idx as u64, len);
         let tokens = ctx.encode_with(&input, &opts);
         let decoded = ctx.decode(&tokens);
-        assert_eq!(decoded, input, "seeded roundtrip failed for case {case_idx}");
+        assert_eq!(
+            decoded, input,
+            "seeded roundtrip failed for case {case_idx}"
+        );
     }
 }
 
@@ -1156,7 +1329,11 @@ fn seeded_property_truncation_invariants() {
         };
         let right = ctx.encode_with(&input, &right_opts);
         let left = ctx.encode_with(&input, &left_opts);
-        assert_eq!(right, full[..keep], "right truncation mismatch at case {case_idx}");
+        assert_eq!(
+            right,
+            full[..keep],
+            "right truncation mismatch at case {case_idx}"
+        );
         assert_eq!(
             left,
             full[full.len() - keep..],
@@ -1274,14 +1451,18 @@ fn concurrent_mixed_workload_high_contention() {
                 let case = (thread_id + i) % 4;
                 match case {
                     0 => {
-                        let enc = unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &encode_opts) };
+                        let enc = unsafe {
+                            super::common::encode_raw(shared.ptr(), b"Hello", &encode_opts)
+                        };
                         assert!(enc.error_msg.is_null());
                         let ids = unsafe { std::slice::from_raw_parts(enc.ids, enc.num_tokens) };
                         assert_eq!(ids, &[44, 73, 80, 80, 83]);
                         unsafe { talu_sys::talu_encode_result_free(enc) };
                     }
                     1 => {
-                        let dec = unsafe { super::common::decode_raw(shared.ptr(), &[44, 77], &decode_opts) };
+                        let dec = unsafe {
+                            super::common::decode_raw(shared.ptr(), &[44, 77], &decode_opts)
+                        };
                         assert!(dec.error_msg.is_null());
                         let text = unsafe {
                             std::str::from_utf8(std::slice::from_raw_parts(dec.text, dec.text_len))

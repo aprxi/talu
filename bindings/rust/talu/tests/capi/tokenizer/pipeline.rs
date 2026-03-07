@@ -4,7 +4,9 @@
 //! pre-tokenizer configurations to verify that each pipeline stage
 //! transforms input text correctly before BPE tokenization.
 
-use crate::capi::tokenizer::common::TokenizerTestContext;
+use crate::capi::tokenizer::common::{
+    build_byte_level_tokenizer_json, byte_token_id, encode_raw, TokenizerTestContext,
+};
 
 fn no_bos() -> talu_sys::EncodeOptions {
     talu_sys::EncodeOptions {
@@ -541,7 +543,10 @@ fn pretokenizer_split_regex_empty_match_completes() {
     let text = "hello world";
     let first = ctx.encode_with(text, &opts);
     let second = ctx.encode_with(text, &opts);
-    assert_eq!(first, second, "empty-match regex pretokenization must be deterministic");
+    assert_eq!(
+        first, second,
+        "empty-match regex pretokenization must be deterministic"
+    );
 }
 
 /// Split behavior Removed should drop regex matches and keep non-matching gaps.
@@ -630,6 +635,27 @@ fn pretokenizer_split_pathological_regex_deterministic() {
     let first = ctx.encode_with(&text, &no_bos());
     let second = ctx.encode_with(&text, &no_bos());
     assert_eq!(first, second, "pathological regex must be deterministic");
+}
+
+/// A larger non-matching catastrophic-backtracking shape must also complete
+/// and remain deterministic. This guards against regex-limit regressions.
+#[test]
+fn pretokenizer_split_pathological_regex_large_non_match_deterministic() {
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"(a+)+b"},"behavior":"Isolated","invert":false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let text = format!("{}c", "a".repeat(4096));
+    let first = ctx.encode_with(&text, &no_bos());
+    let second = ctx.encode_with(&text, &no_bos());
+    assert_eq!(
+        first, second,
+        "large non-matching pathological regex input must be deterministic"
+    );
+    assert!(
+        !first.is_empty(),
+        "large non-matching pathological regex input must still produce output tokens"
+    );
 }
 
 /// Sequence containing {"type": "Lowercase"} works correctly.
@@ -789,9 +815,7 @@ fn normalizer_replace_no_match() {
 /// Prepend normalizer adds a prefix string to the input.
 #[test]
 fn normalizer_prepend() {
-    let json = byte_level_with_normalizer(
-        r#"{"type": "Prepend", "prepend": "X"}"#,
-    );
+    let json = byte_level_with_normalizer(r#"{"type": "Prepend", "prepend": "X"}"#);
     let ctx = TokenizerTestContext::from_json(&json);
     let ctx_raw = TokenizerTestContext::with_byte_level();
     let opts = no_bos();
@@ -809,9 +833,7 @@ fn normalizer_prepend() {
 /// Prepend("X") on "" should produce "X" → tokens for "X".
 #[test]
 fn normalizer_prepend_empty_input() {
-    let json = byte_level_with_normalizer(
-        r#"{"type": "Prepend", "prepend": "X"}"#,
-    );
+    let json = byte_level_with_normalizer(r#"{"type": "Prepend", "prepend": "X"}"#);
     let ctx = TokenizerTestContext::from_json(&json);
     let ctx_raw = TokenizerTestContext::with_byte_level();
     let opts = no_bos();
@@ -930,19 +952,17 @@ fn pretokenizer_metaspace_no_prefix_space() {
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
     let opts = no_bos();
-    // "hello" with add_prefix_space=false → no ▁ prefix → "hello" (not "▁hello")
+    // add_prefix_space=false must not inject metaspace marker token.
     let tokens = ctx.encode_with("hello", &opts);
-    // Token 2 is ▁hello. If no prefix, it should NOT match.
-    // Instead should match "hello"=3 if available, or char fallback.
     assert!(
-        !tokens.is_empty(),
-        "encode must produce tokens"
+        !tokens.contains(&2),
+        "add_prefix_space=false must not prepend ▁hello token"
     );
-    // With add_prefix_space=false, should NOT produce ▁hello (id=2) as first token
-    if tokens[0] == 2 {
-        // This would mean ▁ was incorrectly prepended
-        panic!("add_prefix_space=false must NOT prepend ▁, got ▁hello as first token");
-    }
+    assert_eq!(
+        ctx.decode(&tokens),
+        "hello",
+        "add_prefix_space=false must preserve plain decode text"
+    );
 }
 
 // ===========================================================================
@@ -966,4 +986,84 @@ fn normalizer_sequence_three_stages() {
         tokens, expected,
         "Sequence(Lowercase, StripAccents, NFC): 'CAFÉ' → 'cafe'"
     );
+}
+
+/// Sequence[Split(Removed), ByteLevel] with repetitive input must preserve
+/// per-occurrence source offsets for repeated identical tokens.
+#[test]
+fn pretokenizer_split_removed_then_bytelevel_repetitive_offsets_stay_aligned() {
+    let json = build_byte_level_tokenizer_json().replace(
+        r#""pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}"#,
+        r#""pre_tokenizer": {"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"\\s*,\\s*"},"behavior":"Removed","invert":false},{"type":"ByteLevel","add_prefix_space":false}]}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let input = "a , a , a , a";
+
+    let result = unsafe { encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(
+        result.num_tokens, 4,
+        "split/removed should keep only four a's"
+    );
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(
+        ids,
+        &[
+            byte_token_id(b'a'),
+            byte_token_id(b'a'),
+            byte_token_id(b'a'),
+            byte_token_id(b'a')
+        ]
+    );
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (4, 5));
+    assert_eq!((offsets[2].start, offsets[2].end), (8, 9));
+    assert_eq!((offsets[3].start, offsets[3].end), (12, 13));
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Split pretokenizer on malformed UTF-8 must stay deterministic and must not
+/// crash across repeated calls.
+#[test]
+fn pretokenizer_split_invalid_utf8_is_stable() {
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"\\w+"},"behavior":"Isolated","invert":false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let bytes = [0xFF, b'a', 0xC3, b'b', 0x80];
+
+    let first = unsafe { encode_raw(ctx.handle(), &bytes, &no_bos()) };
+    let second = unsafe { encode_raw(ctx.handle(), &bytes, &no_bos()) };
+
+    assert_eq!(
+        first.error_msg.is_null(),
+        second.error_msg.is_null(),
+        "split pretokenizer invalid-UTF8 behavior must be deterministic"
+    );
+
+    if first.error_msg.is_null() {
+        assert!(second.error_msg.is_null());
+        assert_eq!(first.num_tokens, second.num_tokens);
+
+        let first_ids = if first.num_tokens == 0 || first.ids.is_null() {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(first.ids, first.num_tokens) }
+        };
+        let second_ids = if second.num_tokens == 0 || second.ids.is_null() {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(second.ids, second.num_tokens) }
+        };
+        assert_eq!(first_ids, second_ids);
+    }
+
+    unsafe {
+        talu_sys::talu_encode_result_free(first);
+        talu_sys::talu_encode_result_free(second);
+    }
 }

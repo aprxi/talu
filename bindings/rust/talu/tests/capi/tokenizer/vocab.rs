@@ -84,7 +84,10 @@ fn id_to_token_out_of_range() {
         talu_sys::ErrorCode::InvalidArgument as i32,
         "out-of-range token ID must return InvalidArgument"
     );
-    assert!(out.is_null(), "output must remain null for out-of-range token ID");
+    assert!(
+        out.is_null(),
+        "output must remain null for out-of-range token ID"
+    );
 }
 
 /// id_to_token for negative IDs must return error and null output.
@@ -100,7 +103,10 @@ fn id_to_token_negative_id_errors() {
         talu_sys::ErrorCode::InvalidArgument as i32,
         "negative token ID must return InvalidArgument"
     );
-    assert!(out.is_null(), "output must remain null for negative token ID");
+    assert!(
+        out.is_null(),
+        "output must remain null for negative token ID"
+    );
 }
 
 /// id_to_token must clear a stale output pointer on error.
@@ -160,9 +166,8 @@ fn token_to_id_requires_exact_length() {
     let with_null_suffix = b"<s>\x00xyz";
     let id_suffix =
         unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), with_suffix.as_ptr(), 6) };
-    let id_null_suffix = unsafe {
-        talu_sys::talu_tokenizer_token_to_id(ctx.handle(), with_null_suffix.as_ptr(), 7)
-    };
+    let id_null_suffix =
+        unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), with_null_suffix.as_ptr(), 7) };
     assert_eq!(id_suffix, -1, "token_to_id must not prefix-match '<s>'");
     assert_eq!(
         id_null_suffix, -1,
@@ -178,8 +183,14 @@ fn token_to_id_invalid_utf8_bytes_return_not_found() {
     let bad: &[u8] = &[0xED, 0xA0, 0x80]; // surrogate-like invalid UTF-8
     let a = unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), bad.as_ptr(), bad.len()) };
     let b = unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), bad.as_ptr(), bad.len()) };
-    assert_eq!(a, b, "token_to_id invalid UTF-8 behavior must be deterministic");
-    assert_eq!(a, -1, "malformed UTF-8 token bytes must not match any vocab entry");
+    assert_eq!(
+        a, b,
+        "token_to_id invalid UTF-8 behavior must be deterministic"
+    );
+    assert_eq!(
+        a, -1,
+        "malformed UTF-8 token bytes must not match any vocab entry"
+    );
 }
 
 /// token_to_id for known regular ASCII tokens returns correct IDs.
@@ -268,8 +279,9 @@ fn get_vocab_lengths_match_returned_strings() {
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_entries, 260);
 
-    let tokens =
-        unsafe { std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_entries) };
+    let tokens = unsafe {
+        std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_entries)
+    };
     let lengths = unsafe { std::slice::from_raw_parts(result.lengths, result.num_entries) };
 
     for i in 0..result.num_entries {

@@ -185,8 +185,14 @@ fn decode_null_tokens_zero_len_is_empty_success() {
             &talu_sys::DecodeOptionsC::default(),
         )
     };
-    assert!(result.error_msg.is_null(), "zero-length decode should succeed");
-    assert!(result.text.is_null(), "empty decode should have null text pointer");
+    assert!(
+        result.error_msg.is_null(),
+        "zero-length decode should succeed"
+    );
+    assert!(
+        result.text.is_null(),
+        "empty decode should have null text pointer"
+    );
     assert_eq!(result.text_len, 0);
     unsafe { talu_sys::talu_tokenizer_free(handle) };
 }
@@ -222,7 +228,10 @@ fn decode_null_tokens_nonzero_len_returns_error() {
 fn encode_null_text_zero_len_is_empty_success() {
     let ctx = TokenizerTestContext::new();
     let result = unsafe { common::encode_raw_null_options(ctx.handle(), &[]) };
-    assert!(result.error_msg.is_null(), "zero-length encode should succeed");
+    assert!(
+        result.error_msg.is_null(),
+        "zero-length encode should succeed"
+    );
     assert!(
         !result.ids.is_null(),
         "empty encode should expose sliceable sentinel buffers"
@@ -304,9 +313,18 @@ fn encode_batch_null_arrays_zero_count_is_empty_success() {
             &talu_sys::EncodeOptions::default(),
         )
     };
-    assert!(result.error_msg.is_null(), "zero-count batch encode should succeed");
-    assert!(result.ids.is_null(), "empty batch encode should have null ids");
-    assert!(result.offsets.is_null(), "empty batch encode should have null offsets");
+    assert!(
+        result.error_msg.is_null(),
+        "zero-count batch encode should succeed"
+    );
+    assert!(
+        result.ids.is_null(),
+        "empty batch encode should have null ids"
+    );
+    assert!(
+        result.offsets.is_null(),
+        "empty batch encode should have null offsets"
+    );
     assert_eq!(result.total_tokens, 0);
     assert_eq!(result.num_sequences, 0);
 }
@@ -331,7 +349,10 @@ fn encode_batch_null_texts_nonzero_count_returns_error() {
         "batch encode with null texts and non-zero count must fail"
     );
     assert!(result.ids.is_null(), "ids should remain null on error");
-    assert!(result.offsets.is_null(), "offsets should remain null on error");
+    assert!(
+        result.offsets.is_null(),
+        "offsets should remain null on error"
+    );
     assert_eq!(result.total_tokens, 0);
     assert_eq!(result.num_sequences, 0);
     assert_eq!(
@@ -362,7 +383,10 @@ fn encode_batch_null_lengths_nonzero_count_returns_error() {
         "batch encode with null lengths and non-zero count must fail"
     );
     assert!(result.ids.is_null(), "ids should remain null on error");
-    assert!(result.offsets.is_null(), "offsets should remain null on error");
+    assert!(
+        result.offsets.is_null(),
+        "offsets should remain null on error"
+    );
     assert_eq!(result.total_tokens, 0);
     assert_eq!(result.num_sequences, 0);
     assert_eq!(
@@ -417,7 +441,10 @@ fn tokenize_null_text_zero_len_is_empty_success() {
     assert!(!handle.is_null());
 
     let result = unsafe { talu_sys::talu_tokenizer_tokenize(handle, ptr::null(), 0) };
-    assert!(result.error_msg.is_null(), "zero-length tokenize should succeed");
+    assert!(
+        result.error_msg.is_null(),
+        "zero-length tokenize should succeed"
+    );
     assert_eq!(result.num_tokens, 0);
     unsafe {
         talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens);
@@ -636,7 +663,10 @@ fn batch_to_padded_tensor_null_ids_returns_error() {
         !result.error_msg.is_null(),
         "null ids with non-zero sequences must return an error"
     );
-    assert!(result.input_ids.is_null(), "input_ids must be null on error");
+    assert!(
+        result.input_ids.is_null(),
+        "input_ids must be null on error"
+    );
 }
 
 /// batch_to_padded_tensor with null offsets and non-zero sequence count returns error.
@@ -655,7 +685,10 @@ fn batch_to_padded_tensor_null_offsets_returns_error() {
         !result.error_msg.is_null(),
         "null offsets with non-zero sequences must return an error"
     );
-    assert!(result.input_ids.is_null(), "input_ids must be null on error");
+    assert!(
+        result.input_ids.is_null(),
+        "input_ids must be null on error"
+    );
 }
 
 /// batch_to_padded_tensor with zero sequences should return an empty success result.
@@ -669,8 +702,14 @@ fn batch_to_padded_tensor_zero_sequences_is_empty_success() {
             &talu_sys::PaddedTensorOptions::default(),
         )
     };
-    assert!(result.error_msg.is_null(), "zero-sequence call should succeed");
-    assert!(result.input_ids.is_null(), "input_ids should be null for empty result");
+    assert!(
+        result.error_msg.is_null(),
+        "zero-sequence call should succeed"
+    );
+    assert!(
+        result.input_ids.is_null(),
+        "input_ids should be null for empty result"
+    );
     assert_eq!(result.num_sequences, 0);
     assert_eq!(result.padded_length, 0);
 }
@@ -678,7 +717,9 @@ fn batch_to_padded_tensor_zero_sequences_is_empty_success() {
 /// Freeing null vocab result is a no-op.
 #[test]
 fn vocab_result_free_null_is_noop() {
-    unsafe { talu_sys::talu_vocab_result_free(ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0) };
+    unsafe {
+        talu_sys::talu_vocab_result_free(ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0)
+    };
 }
 
 /// talu_take_last_error must report, then consume and clear tokenizer errors.
@@ -704,7 +745,10 @@ fn take_last_error_query_then_consume_for_tokenizer_error() {
         talu_sys::ErrorCode::InvalidHandle as i32,
         "query mode must return InvalidHandle for null tokenizer handle"
     );
-    assert!(required > 1, "required size should include at least one byte plus NUL");
+    assert!(
+        required > 1,
+        "required size should include at least one byte plus NUL"
+    );
     assert_eq!(
         unsafe { talu_sys::talu_last_error_code() },
         talu_sys::ErrorCode::InvalidHandle as i32,
@@ -726,7 +770,10 @@ fn take_last_error_query_then_consume_for_tokenizer_error() {
         talu_sys::ErrorCode::InvalidHandle as i32,
         "consume mode must return InvalidHandle for null tokenizer handle"
     );
-    assert!(copied > 0, "consume mode must copy a non-empty error message");
+    assert!(
+        copied > 0,
+        "consume mode must copy a non-empty error message"
+    );
     assert_eq!(
         unsafe { talu_sys::talu_last_error_code() },
         talu_sys::ErrorCode::Ok as i32,

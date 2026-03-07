@@ -109,7 +109,11 @@ fn batch_encode_byte_level_add_prefix_space_shifts_sequence_lengths() {
     );
     assert_eq!(
         &batch.ids[6..9],
-        &[byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'i')]
+        &[
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'i')
+        ]
     );
 }
 
@@ -126,7 +130,11 @@ fn batch_encode_byte_level_add_prefix_space_empty_sequence_stays_empty() {
     assert_eq!(batch.offsets, vec![0, 0, 3]);
     assert_eq!(
         batch.ids,
-        vec![byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'i')]
+        vec![
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'i')
+        ]
     );
 }
 
@@ -143,7 +151,11 @@ fn batch_encode_byte_level_add_prefix_space_roundtrip_preserves_real_leading_spa
 
     let seq0 = &batch.ids[batch.offsets[0]..batch.offsets[1]];
     let seq1 = &batch.ids[batch.offsets[1]..batch.offsets[2]];
-    let expected0: Vec<u32> = " Hello".as_bytes().iter().map(|&b| byte_token_id(b)).collect();
+    let expected0: Vec<u32> = " Hello"
+        .as_bytes()
+        .iter()
+        .map(|&b| byte_token_id(b))
+        .collect();
     let expected1 = vec![
         byte_token_id(b' '),
         byte_token_id(b'H'),
@@ -255,7 +267,10 @@ fn batch_encode_byte_level_add_prefix_space_truncation_right_preserves_prefix_to
         ..Default::default()
     };
     let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
-    assert!(result.error_msg.is_null(), "batch truncation should succeed");
+    assert!(
+        result.error_msg.is_null(),
+        "batch truncation should succeed"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) };
@@ -299,7 +314,10 @@ fn batch_encode_byte_level_add_prefix_space_truncation_right_decodes_kept_window
         ..Default::default()
     };
     let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
-    assert!(result.error_msg.is_null(), "batch truncation should succeed");
+    assert!(
+        result.error_msg.is_null(),
+        "batch truncation should succeed"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
     assert_eq!(ctx.decode(ids), "He");
@@ -332,7 +350,10 @@ fn batch_encode_byte_level_add_prefix_space_truncation_left_drops_prefix_token()
         ..Default::default()
     };
     let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
-    assert!(result.error_msg.is_null(), "batch truncation should succeed");
+    assert!(
+        result.error_msg.is_null(),
+        "batch truncation should succeed"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) };
@@ -376,7 +397,10 @@ fn batch_encode_byte_level_add_prefix_space_truncation_left_decodes_tail_window(
         ..Default::default()
     };
     let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
-    assert!(result.error_msg.is_null(), "batch truncation should succeed");
+    assert!(
+        result.error_msg.is_null(),
+        "batch truncation should succeed"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
     assert_eq!(ctx.decode(ids), "llo");
@@ -767,7 +791,11 @@ fn padded_tensor_byte_level_add_prefix_space_empty_sequence_is_all_padding() {
 
     assert_eq!(
         &result.input_ids[3..6],
-        &[byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'i')]
+        &[
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'i')
+        ]
     );
     assert_eq!(&result.attention_mask[3..6], &[1, 1, 1]);
 }
@@ -792,7 +820,11 @@ fn padded_tensor_byte_level_add_prefix_space_left_padding_mixed_real_and_synthet
 
     assert_eq!(
         &result.input_ids[0..3],
-        &[byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'i')]
+        &[
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'i')
+        ]
     );
     assert_eq!(&result.attention_mask[0..3], &[1, 1, 1]);
 
@@ -824,17 +856,24 @@ fn padded_tensor_byte_level_add_prefix_space_right_truncation_keeps_prefix() {
 
     assert_eq!(
         &result.input_ids[0..3],
-        &[byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'e')]
+        &[
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'e')
+        ]
     );
     assert_eq!(&result.attention_mask[0..3], &[1, 1, 1]);
 
     assert_eq!(
         &result.input_ids[3..6],
-        &[byte_token_id(b' '), byte_token_id(b'H'), byte_token_id(b'i')]
+        &[
+            byte_token_id(b' '),
+            byte_token_id(b'H'),
+            byte_token_id(b'i')
+        ]
     );
     assert_eq!(&result.attention_mask[3..6], &[1, 1, 1]);
 }
-
 
 // ===========================================================================
 // Token utilities
@@ -925,7 +964,8 @@ fn batch_encode_null_options_defaults_to_add_special_tokens() {
     let t1 = b"H";
     let ptrs = [t0.as_ptr(), t1.as_ptr()];
     let lengths = [t0.len(), t1.len()];
-    let result = unsafe { super::common::encode_batch_raw_null_options(ctx.handle(), &ptrs, &lengths) };
+    let result =
+        unsafe { super::common::encode_batch_raw_null_options(ctx.handle(), &ptrs, &lengths) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_sequences, 2);
     assert_eq!(result.total_tokens, 7);
@@ -953,7 +993,8 @@ fn padded_tensor_null_options_uses_defaults() {
     let t1 = b"Hi";
     let ptrs = [t0.as_ptr(), t1.as_ptr()];
     let lengths = [t0.len(), t1.len()];
-    let batch = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
+    let batch =
+        unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
     assert!(batch.error_msg.is_null());
     assert_eq!(batch.num_sequences, 2);
 
@@ -1137,8 +1178,9 @@ fn padded_tensor_rejects_invalid_padding_side() {
         padding_side: 2,
         ..Default::default()
     };
-    let result =
-        unsafe { super::common::batch_to_padded_tensor_raw(ids.as_ptr(), offsets.as_ptr(), 1, &opts) };
+    let result = unsafe {
+        super::common::batch_to_padded_tensor_raw(ids.as_ptr(), offsets.as_ptr(), 1, &opts)
+    };
     assert!(
         !result.error_msg.is_null(),
         "invalid padding_side must return an error"
@@ -1184,6 +1226,48 @@ fn padded_tensor_rejects_offsets_not_starting_at_zero() {
     }
 }
 
+/// Padded tensor conversion must reject pathological max_length values that
+/// would overflow allocation math instead of attempting huge allocations.
+#[test]
+fn padded_tensor_rejects_usize_max_length_overflow() {
+    let ids = [44u32, 77u32];
+    let offsets = [0usize, 2usize];
+    let opts = talu_sys::PaddedTensorOptions {
+        max_length: usize::MAX,
+        truncate: true,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+    let result = unsafe {
+        super::common::batch_to_padded_tensor_raw(ids.as_ptr(), offsets.as_ptr(), 1, &opts)
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "usize::MAX max_length must be rejected with an error"
+    );
+}
+
+/// Even with valid IDs/offsets, very large bounded max_length for multiple
+/// sequences must fail safely rather than wrap multiplication.
+#[test]
+fn padded_tensor_rejects_large_multi_sequence_overflow() {
+    let ids = [44u32, 77u32, 69u32];
+    let offsets = [0usize, 2usize, 3usize];
+    let opts = talu_sys::PaddedTensorOptions {
+        max_length: isize::MAX as usize,
+        truncate: true,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+    let result = unsafe {
+        super::common::batch_to_padded_tensor_raw(ids.as_ptr(), offsets.as_ptr(), 2, &opts)
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "extreme max_length with multiple sequences must be rejected safely"
+    );
+}
+
 /// Padded tensor consumes exactly the prefix described by `offsets[num_sequences]`.
 ///
 /// The C ABI does not include a separate `ids_len`, so memory beyond the last
@@ -1205,7 +1289,11 @@ fn padded_tensor_ignores_memory_beyond_last_declared_offset() {
     let attention_mask = unsafe { std::slice::from_raw_parts(result.attention_mask, total) };
     assert_eq!(result.num_sequences, 2);
     assert_eq!(result.padded_length, 1);
-    assert_eq!(input_ids, &[44, 0], "only the declared prefix should be consumed");
+    assert_eq!(
+        input_ids,
+        &[44, 0],
+        "only the declared prefix should be consumed"
+    );
     assert_eq!(attention_mask, &[1, 0]);
 
     unsafe {
@@ -1299,7 +1387,10 @@ fn tokenize_bytes_offsets_seeded_invariants() {
         let result = unsafe {
             talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), s.as_bytes().as_ptr(), s.len())
         };
-        assert!(result.error_msg.is_null(), "case {case_idx}: tokenize_bytes failed");
+        assert!(
+            result.error_msg.is_null(),
+            "case {case_idx}: tokenize_bytes failed"
+        );
         let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens + 1) };
         assert_eq!(offsets[0], 0, "case {case_idx}: offsets[0]");
         assert_eq!(
@@ -1337,7 +1428,10 @@ fn batch_encode_truncation_right_applies_per_sequence() {
         ..Default::default()
     };
     let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
-    assert!(result.error_msg.is_null(), "batch right truncation should succeed");
+    assert!(
+        result.error_msg.is_null(),
+        "batch right truncation should succeed"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) };
@@ -1346,7 +1440,11 @@ fn batch_encode_truncation_right_applies_per_sequence() {
         &[44, 73, 69, 70],
         "right truncation must keep first 2 tokens of each sequence"
     );
-    assert_eq!(offsets, &[0, 2, 4], "offsets must reflect truncated lengths");
+    assert_eq!(
+        offsets,
+        &[0, 2, 4],
+        "offsets must reflect truncated lengths"
+    );
 
     unsafe {
         talu_sys::talu_batch_encode_result_free(
@@ -1374,7 +1472,10 @@ fn batch_encode_truncation_left_applies_per_sequence() {
         ..Default::default()
     };
     let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &opts) };
-    assert!(result.error_msg.is_null(), "batch left truncation should succeed");
+    assert!(
+        result.error_msg.is_null(),
+        "batch left truncation should succeed"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.total_tokens) };
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_sequences + 1) };
@@ -1383,7 +1484,11 @@ fn batch_encode_truncation_left_applies_per_sequence() {
         &[80, 83, 70, 71],
         "left truncation must keep last 2 tokens of each sequence"
     );
-    assert_eq!(offsets, &[0, 2, 4], "offsets must reflect truncated lengths");
+    assert_eq!(
+        offsets,
+        &[0, 2, 4],
+        "offsets must reflect truncated lengths"
+    );
 
     unsafe {
         talu_sys::talu_batch_encode_result_free(
@@ -1424,7 +1529,11 @@ fn batch_encode_template_truncation_caps_total_length() {
         &[1, 4, 5, 1, 4, 2],
         "max_length=3 must cap each sequence after post-processing"
     );
-    assert_eq!(offsets, &[0, 3, 6], "offsets must reflect capped sequence lengths");
+    assert_eq!(
+        offsets,
+        &[0, 3, 6],
+        "offsets must reflect capped sequence lengths"
+    );
 
     unsafe {
         talu_sys::talu_batch_encode_result_free(

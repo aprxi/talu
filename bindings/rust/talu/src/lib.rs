@@ -97,7 +97,6 @@ pub use kv::{KvEntry, KvError, KvHandle, KvValue};
 pub use logging::{LogFormat, LogLevel};
 pub use model::{GenerationConfigInfo, ModelInfo, QuantMethod};
 pub use process::{ProcessError, ProcessSession};
-pub use shell::{AgentRuntimeMode, SandboxBackend, ShellError, ShellSession};
 pub use provider::{
     provider_config_health, provider_config_list, provider_config_list_provider_models,
     provider_config_list_remote_models, provider_config_resolve_credentials, provider_config_set,
@@ -108,6 +107,7 @@ pub use repo::{
     ProgressAction as RepoProgressAction, SearchDirection, SearchSort,
 };
 pub use repo_meta::{RepoMetaError, RepoMetaStore, RepoPinEntry};
+pub use shell::{AgentRuntimeMode, SandboxBackend, ShellError, ShellSession};
 pub use sql::{SqlEngine, SqlError};
 pub use storage::{SessionRecord, StorageError, StorageHandle};
 pub use table::{

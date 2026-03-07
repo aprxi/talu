@@ -14,15 +14,21 @@ fn no_bos() -> talu_sys::EncodeOptions {
 }
 
 fn tokenize_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
-    let result =
-        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len()) };
+    let result = unsafe {
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+    };
     assert!(result.error_msg.is_null(), "tokenize failed");
     let tokens = if result.tokens.is_null() || result.num_tokens == 0 {
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(result.tokens, result.num_tokens) }
             .iter()
-            .map(|ptr| unsafe { std::ffi::CStr::from_ptr(*ptr) }.to_str().unwrap().to_owned())
+            .map(|ptr| {
+                unsafe { std::ffi::CStr::from_ptr(*ptr) }
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
             .collect()
     };
     unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
@@ -565,7 +571,10 @@ fn unigram_char_fallback_for_unknown_word() {
 fn unigram_tokenize_surfaces_expose_char_fallback_sequence() {
     let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
     assert_eq!(tokenize_strings(&ctx, "abc"), vec!["▁", "a", "b", "c"]);
-    assert_eq!(tokenize_bytes_strings(&ctx, "abc"), vec!["▁", "a", "b", "c"]);
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "abc"),
+        vec!["▁", "a", "b", "c"]
+    );
 }
 
 /// The tokenization surfaces must show distinct metaspace-prefixed tokens for
@@ -573,7 +582,10 @@ fn unigram_tokenize_surfaces_expose_char_fallback_sequence() {
 #[test]
 fn unigram_tokenize_surfaces_expose_multiword_whole_tokens() {
     let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
-    assert_eq!(tokenize_strings(&ctx, "hello world"), vec!["▁hello", "▁world"]);
+    assert_eq!(
+        tokenize_strings(&ctx, "hello world"),
+        vec!["▁hello", "▁world"]
+    );
     assert_eq!(
         tokenize_bytes_strings(&ctx, "hello world"),
         vec!["▁hello", "▁world"]
@@ -628,7 +640,11 @@ fn unigram_encode_empty() {
         ..Default::default()
     };
     let tokens = ctx.encode_with("", &opts);
-    assert_eq!(tokens, Vec::<u32>::new(), "empty input must produce empty output");
+    assert_eq!(
+        tokens,
+        Vec::<u32>::new(),
+        "empty input must produce empty output"
+    );
 }
 
 /// Encode→decode roundtrip preserves text.
@@ -953,10 +969,16 @@ fn unigram_long_repeated_words_keep_same_local_segmentation() {
   "post_processor": null
 }"#;
     let ctx = TokenizerTestContext::from_json(json);
-    let input = std::iter::repeat_n("hello", 2000).collect::<Vec<_>>().join(" ");
+    let input = std::iter::repeat_n("hello", 2000)
+        .collect::<Vec<_>>()
+        .join(" ");
     let tokens = ctx.encode_with(&input, &no_bos());
 
-    assert_eq!(tokens.len(), 2000, "each repeated word should stay one token");
+    assert_eq!(
+        tokens.len(),
+        2000,
+        "each repeated word should stay one token"
+    );
     assert!(
         tokens.iter().all(|&id| id == 1),
         "all repeated words should keep the same winning token regardless of absolute position"
@@ -1066,7 +1088,16 @@ fn unigram_batch_matches_individual_wholeword_and_charfallback() {
     let batch = ctx.encode_batch(&["hello", "abc", ""], &no_bos());
     assert_eq!(batch.num_sequences, 3);
     assert_eq!(batch.offsets, vec![0, 1, 5, 5]);
-    assert_eq!(batch.ids[batch.offsets[0]..batch.offsets[1]], ctx.encode_with("hello", &no_bos()));
-    assert_eq!(batch.ids[batch.offsets[1]..batch.offsets[2]], ctx.encode_with("abc", &no_bos()));
-    assert_eq!(batch.ids[batch.offsets[2]..batch.offsets[3]], ctx.encode_with("", &no_bos()));
+    assert_eq!(
+        batch.ids[batch.offsets[0]..batch.offsets[1]],
+        ctx.encode_with("hello", &no_bos())
+    );
+    assert_eq!(
+        batch.ids[batch.offsets[1]..batch.offsets[2]],
+        ctx.encode_with("abc", &no_bos())
+    );
+    assert_eq!(
+        batch.ids[batch.offsets[2]..batch.offsets[3]],
+        ctx.encode_with("", &no_bos())
+    );
 }

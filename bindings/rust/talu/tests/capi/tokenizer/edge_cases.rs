@@ -3,13 +3,118 @@
 //! Tests control characters, special token strings as text, whitespace edge
 //! cases, option interactions, batch edge cases, and encode determinism.
 
-use crate::capi::tokenizer::common::TokenizerTestContext;
+use crate::capi::tokenizer::common::{
+    build_byte_level_tokenizer_json, byte_token_surface, TokenizerTestContext,
+};
 
 fn no_bos() -> talu_sys::EncodeOptions {
     talu_sys::EncodeOptions {
         add_bos: 0,
         ..Default::default()
     }
+}
+
+fn assert_invalid_utf8_vector_maps_to_unk_per_byte(
+    ctx: &TokenizerTestContext,
+    case_name: &str,
+    bytes: &[u8],
+) {
+    let opts = no_bos();
+    let expected_ids = vec![3u32; bytes.len()];
+
+    let encoded = unsafe { super::common::encode_raw(ctx.handle(), bytes, &opts) };
+    assert!(
+        encoded.error_msg.is_null(),
+        "{case_name}: encode must not error for malformed UTF-8"
+    );
+    let ids = unsafe { std::slice::from_raw_parts(encoded.ids, encoded.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(encoded.offsets, encoded.num_tokens) };
+    assert_eq!(
+        ids,
+        expected_ids.as_slice(),
+        "{case_name}: each malformed byte must map to <unk>"
+    );
+    assert_eq!(
+        encoded.num_tokens,
+        bytes.len(),
+        "{case_name}: malformed UTF-8 must produce one token per byte"
+    );
+    for (idx, off) in offsets.iter().enumerate() {
+        assert_eq!(off.start as usize, idx, "{case_name}: offset[{idx}].start");
+        assert_eq!(off.end as usize, idx + 1, "{case_name}: offset[{idx}].end");
+    }
+    let decoded = ctx.decode(ids);
+    assert_eq!(
+        decoded,
+        "<unk>".repeat(bytes.len()),
+        "{case_name}: decode(ids) must retain exact malformed-byte cardinality"
+    );
+    unsafe { talu_sys::talu_encode_result_free(encoded) };
+
+    let tokenized =
+        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    assert!(
+        tokenized.error_msg.is_null(),
+        "{case_name}: tokenize must not error for malformed UTF-8"
+    );
+    assert_eq!(
+        tokenized.num_tokens,
+        bytes.len(),
+        "{case_name}: tokenize must emit one token per malformed byte"
+    );
+    let ptrs = unsafe {
+        std::slice::from_raw_parts(tokenized.tokens as *const *const i8, tokenized.num_tokens)
+    };
+    let tokens: Vec<String> = ptrs
+        .iter()
+        .map(|&ptr| {
+            unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let expected_token_strings: Vec<String> =
+        (0..bytes.len()).map(|_| "<unk>".to_string()).collect();
+    assert_eq!(
+        tokens, expected_token_strings,
+        "{case_name}: tokenize token strings must be one <unk> per malformed byte"
+    );
+    unsafe { talu_sys::talu_tokenize_result_free(tokenized.tokens, tokenized.num_tokens) };
+
+    let tokenized_bytes = unsafe {
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), bytes.as_ptr(), bytes.len())
+    };
+    assert!(
+        tokenized_bytes.error_msg.is_null(),
+        "{case_name}: tokenize_bytes must not error for malformed UTF-8"
+    );
+    assert_eq!(
+        tokenized_bytes.num_tokens,
+        bytes.len(),
+        "{case_name}: tokenize_bytes must emit one token per malformed byte"
+    );
+    let data =
+        unsafe { std::slice::from_raw_parts(tokenized_bytes.data, tokenized_bytes.data_len) };
+    let byte_offsets = unsafe {
+        std::slice::from_raw_parts(tokenized_bytes.offsets, tokenized_bytes.num_tokens + 1)
+    };
+    let token_slices: Vec<&str> = byte_offsets
+        .windows(2)
+        .map(|w| std::str::from_utf8(&data[w[0]..w[1]]).unwrap())
+        .collect();
+    assert_eq!(
+        token_slices,
+        vec!["<unk>"; bytes.len()],
+        "{case_name}: tokenize_bytes slices must be one <unk> per malformed byte"
+    );
+    unsafe {
+        talu_sys::talu_tokenize_bytes_result_free(
+            tokenized_bytes.data,
+            tokenized_bytes.data_len,
+            tokenized_bytes.offsets,
+            tokenized_bytes.num_tokens,
+        )
+    };
 }
 
 // ===========================================================================
@@ -87,7 +192,11 @@ fn encode_invalid_utf8_bytes_map_to_unk_per_byte_with_exact_offsets() {
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(ids, &[3, 3, 3], "each malformed byte must map to <unk>");
-    assert_eq!(result.num_tokens, bytes.len(), "one token per malformed byte");
+    assert_eq!(
+        result.num_tokens,
+        bytes.len(),
+        "one token per malformed byte"
+    );
     assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
     assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
     assert_eq!((offsets[2].start, offsets[2].end), (2, 3));
@@ -108,17 +217,26 @@ fn tokenize_invalid_utf8_bytes_surface_unk_per_byte() {
     let ctx = TokenizerTestContext::new();
     let bytes: &[u8] = &[0xED, 0xA0, 0x80]; // surrogate-like invalid UTF-8 sequence
 
-    let result = unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    let result =
+        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
     assert!(
         result.error_msg.is_null(),
         "invalid UTF-8 must not fail tokenize in the base fixture"
     );
-    assert_eq!(result.num_tokens, bytes.len(), "one token per malformed byte");
+    assert_eq!(
+        result.num_tokens,
+        bytes.len(),
+        "one token per malformed byte"
+    );
     let ptrs =
         unsafe { std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens) };
     let tokens: Vec<String> = ptrs
         .iter()
-        .map(|&ptr| unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+        .map(|&ptr| {
+            unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     assert_eq!(tokens, vec!["<unk>", "<unk>", "<unk>"]);
     unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
@@ -131,13 +249,18 @@ fn tokenize_bytes_invalid_utf8_surface_unk_per_byte() {
     let ctx = TokenizerTestContext::new();
     let bytes: &[u8] = &[0xE2, 0x82]; // truncated 3-byte UTF-8 sequence
 
-    let result =
-        unsafe { talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    let result = unsafe {
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), bytes.as_ptr(), bytes.len())
+    };
     assert!(
         result.error_msg.is_null(),
         "invalid UTF-8 must not fail tokenize_bytes in the base fixture"
     );
-    assert_eq!(result.num_tokens, bytes.len(), "one token per malformed byte");
+    assert_eq!(
+        result.num_tokens,
+        bytes.len(),
+        "one token per malformed byte"
+    );
     let data = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens + 1) };
     let tokens: Vec<&str> = offsets
@@ -145,7 +268,11 @@ fn tokenize_bytes_invalid_utf8_surface_unk_per_byte() {
         .map(|w| std::str::from_utf8(&data[w[0]..w[1]]).unwrap())
         .collect();
     assert_eq!(tokens, vec!["<unk>", "<unk>"]);
-    assert_eq!(offsets, &[0, 5, 10], "offsets must delimit '<unk>' slices exactly");
+    assert_eq!(
+        offsets,
+        &[0, 5, 10],
+        "offsets must delimit '<unk>' slices exactly"
+    );
     unsafe {
         talu_sys::talu_tokenize_bytes_result_free(
             result.data,
@@ -154,6 +281,79 @@ fn tokenize_bytes_invalid_utf8_surface_unk_per_byte() {
             result.num_tokens,
         );
     }
+}
+
+/// Unicode-consortium-style malformed UTF-8 vectors (overlong encodings,
+/// surrogate ranges, invalid leading bytes, and out-of-range scalars) must be
+/// handled deterministically as one `<unk>` per byte without panics.
+#[test]
+fn malformed_utf8_matrix_maps_to_unk_per_byte_across_all_surfaces() {
+    let ctx = TokenizerTestContext::new();
+    let cases: &[(&str, &[u8])] = &[
+        ("overlong_2byte_ascii_slash", &[0xC0, 0xAF]),
+        ("overlong_3byte_nul", &[0xE0, 0x80, 0x80]),
+        ("overlong_4byte_nul", &[0xF0, 0x80, 0x80, 0x80]),
+        ("surrogate_high_d800", &[0xED, 0xA0, 0x80]),
+        ("surrogate_low_dc00", &[0xED, 0xB0, 0x80]),
+        ("out_of_range_u110000", &[0xF4, 0x90, 0x80, 0x80]),
+        ("lone_continuation", &[0x80]),
+        ("invalid_start_fe", &[0xFE]),
+        ("invalid_start_ff", &[0xFF]),
+        (
+            "mixed_invalid_sequence",
+            &[0xF0, 0x9F, 0x8E, 0xC0, 0xAF, 0x80, 0xFF],
+        ),
+    ];
+
+    for (case_name, bytes) in cases {
+        assert_invalid_utf8_vector_maps_to_unk_per_byte(&ctx, case_name, bytes);
+    }
+}
+
+/// In a byte-level BPE model, adjacent malformed UTF-8 bytes must still be
+/// eligible for BPE merges when an explicit merge rule exists for their
+/// byte-token surfaces.
+#[test]
+fn byte_level_invalid_utf8_adjacent_bytes_can_merge_when_rule_exists() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&build_byte_level_tokenizer_json()).expect("valid fixture json");
+
+    let left = byte_token_surface(0xFF);
+    let right = byte_token_surface(0xFE);
+    let merged = format!("{left}{right}");
+    let merged_id = 4096u32;
+
+    let model = value
+        .get_mut("model")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("model object must exist");
+    let vocab = model
+        .get_mut("vocab")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("vocab object must exist");
+    vocab.insert(merged.clone(), serde_json::json!(merged_id));
+    model.insert("merges".to_string(), serde_json::json!([format!("{left} {right}")]));
+
+    let json = serde_json::to_string(&value).expect("json serialization must succeed");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let bytes = [0xFFu8, 0xFEu8];
+    let result = unsafe { super::common::encode_raw(ctx.handle(), &bytes, &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode must succeed");
+
+    assert_eq!(
+        result.num_tokens, 1,
+        "adjacent malformed bytes must merge into one token when merge rule exists"
+    );
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[merged_id], "merged invalid-byte token ID mismatch");
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 2),
+        "merged invalid-byte token must span both source bytes"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 // ===========================================================================
@@ -413,8 +613,14 @@ fn batch_encode_invalid_utf8_bytes_is_deterministic() {
         } else {
             unsafe { std::slice::from_raw_parts(second.offsets, second.num_sequences + 1) }.to_vec()
         };
-        assert_eq!(ids_a, ids_b, "invalid UTF-8 batch IDs must be deterministic");
-        assert_eq!(off_a, off_b, "invalid UTF-8 batch offsets must be deterministic");
+        assert_eq!(
+            ids_a, ids_b,
+            "invalid UTF-8 batch IDs must be deterministic"
+        );
+        assert_eq!(
+            off_a, off_b,
+            "invalid UTF-8 batch offsets must be deterministic"
+        );
     }
 
     unsafe {
@@ -439,8 +645,10 @@ fn tokenize_invalid_utf8_token_strings_are_deterministic() {
     let ctx = TokenizerTestContext::new();
     let bytes: &[u8] = &[0xF0, 0x9F, 0x8E]; // truncated sequence
 
-    let first = unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
-    let second = unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    let first =
+        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
+    let second =
+        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), bytes.as_ptr(), bytes.len()) };
     assert_eq!(
         first.error_msg.is_null(),
         second.error_msg.is_null(),
@@ -448,17 +656,27 @@ fn tokenize_invalid_utf8_token_strings_are_deterministic() {
     );
 
     if first.error_msg.is_null() {
-        let ptrs_a =
-            unsafe { std::slice::from_raw_parts(first.tokens as *const *const i8, first.num_tokens) };
-        let ptrs_b =
-            unsafe { std::slice::from_raw_parts(second.tokens as *const *const i8, second.num_tokens) };
+        let ptrs_a = unsafe {
+            std::slice::from_raw_parts(first.tokens as *const *const i8, first.num_tokens)
+        };
+        let ptrs_b = unsafe {
+            std::slice::from_raw_parts(second.tokens as *const *const i8, second.num_tokens)
+        };
         let toks_a: Vec<String> = ptrs_a
             .iter()
-            .map(|p| unsafe { std::ffi::CStr::from_ptr(*p) }.to_string_lossy().to_string())
+            .map(|p| {
+                unsafe { std::ffi::CStr::from_ptr(*p) }
+                    .to_string_lossy()
+                    .to_string()
+            })
             .collect();
         let toks_b: Vec<String> = ptrs_b
             .iter()
-            .map(|p| unsafe { std::ffi::CStr::from_ptr(*p) }.to_string_lossy().to_string())
+            .map(|p| {
+                unsafe { std::ffi::CStr::from_ptr(*p) }
+                    .to_string_lossy()
+                    .to_string()
+            })
             .collect();
         assert_eq!(
             toks_a, toks_b,

@@ -175,7 +175,9 @@ impl Policy {
             )
         };
         if rc != 0 {
-            return Err(error_from_last_or("Failed to precompile strict runtime policy"));
+            return Err(error_from_last_or(
+                "Failed to precompile strict runtime policy",
+            ));
         }
         Ok(())
     }

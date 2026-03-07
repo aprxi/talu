@@ -43,7 +43,10 @@ fn decode_invalid_token_id_out_of_vocab_errors() {
         !result.error_msg.is_null(),
         "out-of-range token ID must return non-null error_msg"
     );
-    assert!(result.text.is_null(), "text pointer must be null on decode error");
+    assert!(
+        result.text.is_null(),
+        "text pointer must be null on decode error"
+    );
     assert_eq!(result.text_len, 0, "text_len must be 0 on decode error");
     let code = unsafe { talu_sys::talu_last_error_code() };
     assert_eq!(
@@ -63,7 +66,10 @@ fn decode_invalid_token_id_u32_max_errors() {
         !result.error_msg.is_null(),
         "u32::MAX token ID must return non-null error_msg"
     );
-    assert!(result.text.is_null(), "text pointer must be null on decode error");
+    assert!(
+        result.text.is_null(),
+        "text pointer must be null on decode error"
+    );
     assert_eq!(result.text_len, 0, "text_len must be 0 on decode error");
     let code = unsafe { talu_sys::talu_last_error_code() };
     assert_eq!(
@@ -132,7 +138,10 @@ fn encode_null_options_defaults_to_add_special_tokens() {
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
     let result = unsafe { super::common::encode_raw_null_options(ctx.handle(), b"Hi") };
-    assert!(result.error_msg.is_null(), "encode with null options should succeed");
+    assert!(
+        result.error_msg.is_null(),
+        "encode with null options should succeed"
+    );
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
     assert_eq!(
         ids,
@@ -184,6 +193,75 @@ fn decode_null_options_strip_vocab_shadowed_specials() {
         "null decode options must strip BOS/EOS by default"
     );
     unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
+}
+
+/// Cleanup must apply punctuation-space contractions sequentially across a
+/// cascade of punctuation tokens, not stop after the first replacement.
+#[test]
+fn cleanup_handles_punctuation_cascade_sequence() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "hello": 1, ",": 2, ".": 3, "?": 4, "!": 5
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let decoded = ctx.decode(&[1, 2, 3, 4, 5]);
+    assert_eq!(
+        decoded, "hello,.?!",
+        "cleanup must handle punctuation cascades in sequence"
+    );
+}
+
+/// `skip_special_tokens` must filter by special-token IDs, not by token text.
+/// A regular vocab token with the same text as a special token must be kept.
+#[test]
+fn skip_special_filters_by_id_not_token_string() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"<unk>": 0, "<s>": 1, "H": 2},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 99, "content": "<s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    let keep = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+
+    assert_eq!(
+        ctx.decode_with(&[1, 2, 99, 2], &keep),
+        "<s>H<s>H",
+        "retain mode must decode both regular and special <s> token IDs"
+    );
+    assert_eq!(
+        ctx.decode_with(&[1, 2, 99, 2], &skip),
+        "<s>HH",
+        "skip mode must strip only special ID 99 while retaining vocab ID 1"
+    );
 }
 
 /// Roundtrip for multiple known strings.
@@ -1259,8 +1337,7 @@ fn doubly_nested_metaspace_with_special_tokens_matches_flat_behavior() {
 #[test]
 fn doubly_nested_metaspace_no_prefix_with_special_tokens_matches_flat_behavior() {
     let flat = TokenizerTestContext::from_json(flat_metaspace_special_no_prefix_json());
-    let nested =
-        TokenizerTestContext::from_json(&doubly_nested_metaspace_special_no_prefix_json());
+    let nested = TokenizerTestContext::from_json(&doubly_nested_metaspace_special_no_prefix_json());
     let retain = talu_sys::DecodeOptionsC {
         skip_special_tokens: 0,
     };
@@ -1276,8 +1353,7 @@ fn doubly_nested_metaspace_no_prefix_with_special_tokens_matches_flat_behavior()
 #[test]
 fn doubly_nested_metaspace_no_prefix_with_special_tokens_skip_matches_flat_behavior() {
     let flat = TokenizerTestContext::from_json(flat_metaspace_special_no_prefix_json());
-    let nested =
-        TokenizerTestContext::from_json(&doubly_nested_metaspace_special_no_prefix_json());
+    let nested = TokenizerTestContext::from_json(&doubly_nested_metaspace_special_no_prefix_json());
     let skip = talu_sys::DecodeOptionsC {
         skip_special_tokens: 1,
     };
@@ -1293,12 +1369,14 @@ fn doubly_nested_metaspace_no_prefix_with_special_tokens_skip_matches_flat_behav
 #[test]
 fn doubly_nested_metaspace_no_prefix_with_special_tokens_null_options_matches_flat_behavior() {
     let flat = TokenizerTestContext::from_json(flat_metaspace_special_no_prefix_json());
-    let nested =
-        TokenizerTestContext::from_json(&doubly_nested_metaspace_special_no_prefix_json());
+    let nested = TokenizerTestContext::from_json(&doubly_nested_metaspace_special_no_prefix_json());
     let ids = [1, 4, 3, 2, 5, 6, 7];
 
     let flat_result = unsafe { super::common::decode_raw_null_options(flat.handle(), &ids) };
-    assert!(flat_result.error_msg.is_null(), "flat decode with null options should succeed");
+    assert!(
+        flat_result.error_msg.is_null(),
+        "flat decode with null options should succeed"
+    );
     let flat_text = unsafe {
         let slice = std::slice::from_raw_parts(flat_result.text, flat_result.text_len);
         std::str::from_utf8(slice)
@@ -1351,7 +1429,10 @@ fn doubly_nested_metaspace_with_special_tokens_null_options_matches_flat_behavio
     let ids = [1, 4, 3, 2, 5, 6, 7];
 
     let flat_result = unsafe { super::common::decode_raw_null_options(flat.handle(), &ids) };
-    assert!(flat_result.error_msg.is_null(), "flat decode with null options should succeed");
+    assert!(
+        flat_result.error_msg.is_null(),
+        "flat decode with null options should succeed"
+    );
     let flat_text = unsafe {
         let slice = std::slice::from_raw_parts(flat_result.text, flat_result.text_len);
         std::str::from_utf8(slice)
@@ -1929,7 +2010,10 @@ fn decode_mixed_valid_and_invalid_token_ids_errors() {
         !result.error_msg.is_null(),
         "decode must fail when any token ID is invalid"
     );
-    assert!(result.text.is_null(), "text pointer must be null on decode error");
+    assert!(
+        result.text.is_null(),
+        "text pointer must be null on decode error"
+    );
     assert_eq!(result.text_len, 0, "text_len must be 0 on decode error");
 }
 

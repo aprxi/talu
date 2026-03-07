@@ -418,7 +418,10 @@ pub fn validate_strict_runtime(
     sandbox_backend: SandboxBackend,
 ) -> Result<(), ShellError> {
     let c_cwd = cwd
-        .map(|value| CString::new(value).map_err(|_| ShellError::InvalidArgument("cwd contains null byte".into())))
+        .map(|value| {
+            CString::new(value)
+                .map_err(|_| ShellError::InvalidArgument("cwd contains null byte".into()))
+        })
         .transpose()?;
     let policy_ptr = policy.map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut());
     let rc = unsafe {
@@ -429,7 +432,10 @@ pub fn validate_strict_runtime(
         )
     };
     if rc != ERROR_CODE_OK {
-        return Err(ShellError::from_code(rc, "strict runtime validation failed"));
+        return Err(ShellError::from_code(
+            rc,
+            "strict runtime validation failed",
+        ));
     }
     Ok(())
 }

@@ -47,10 +47,7 @@ fn list_sessions_with_search(db_path: &str, search_query: &str) -> Vec<String> {
         )
     };
 
-    assert_eq!(
-        result, 0,
-        "talu_db_session_list with search_query failed"
-    );
+    assert_eq!(result, 0, "talu_db_session_list with search_query failed");
 
     let mut ids = Vec::new();
     if !c_list.is_null() {

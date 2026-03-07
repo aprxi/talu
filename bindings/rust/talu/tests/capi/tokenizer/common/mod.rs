@@ -665,7 +665,10 @@ pub unsafe fn decode_raw(
 ///
 /// # Safety
 /// `handle` must be a valid tokenizer handle.
-pub unsafe fn decode_raw_null_options(handle: *mut c_void, tokens: &[u32]) -> talu_sys::DecodeResult {
+pub unsafe fn decode_raw_null_options(
+    handle: *mut c_void,
+    tokens: &[u32],
+) -> talu_sys::DecodeResult {
     talu_tokenizer_decode(handle, tokens.as_ptr(), tokens.len(), std::ptr::null())
 }
 

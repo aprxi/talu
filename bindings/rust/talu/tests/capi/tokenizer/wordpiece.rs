@@ -14,15 +14,21 @@ fn no_bos() -> talu_sys::EncodeOptions {
 }
 
 fn tokenize_strings(ctx: &TokenizerTestContext, text: &str) -> Vec<String> {
-    let result =
-        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len()) };
+    let result = unsafe {
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
+    };
     assert!(result.error_msg.is_null(), "tokenize failed");
     let tokens = if result.tokens.is_null() || result.num_tokens == 0 {
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(result.tokens, result.num_tokens) }
             .iter()
-            .map(|ptr| unsafe { std::ffi::CStr::from_ptr(*ptr) }.to_str().unwrap().to_owned())
+            .map(|ptr| {
+                unsafe { std::ffi::CStr::from_ptr(*ptr) }
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
             .collect()
     };
     unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
@@ -207,12 +213,18 @@ fn batch_matches_individual_for_subword_and_punctuation_cases() {
     assert_eq!(batch.num_sequences, 3);
     assert_eq!(batch.offsets, vec![0, 2, 6, 7]);
 
-    assert_eq!(batch.ids[batch.offsets[0]..batch.offsets[1]], ctx.encode_with("going", &no_bos()));
+    assert_eq!(
+        batch.ids[batch.offsets[0]..batch.offsets[1]],
+        ctx.encode_with("going", &no_bos())
+    );
     assert_eq!(
         batch.ids[batch.offsets[1]..batch.offsets[2]],
         ctx.encode_with("hello...", &no_bos())
     );
-    assert_eq!(batch.ids[batch.offsets[2]..batch.offsets[3]], ctx.encode_with("xyz", &no_bos()));
+    assert_eq!(
+        batch.ids[batch.offsets[2]..batch.offsets[3]],
+        ctx.encode_with("xyz", &no_bos())
+    );
 }
 
 /// Unknown WordPiece words must surface as a single `[UNK]` token on both
@@ -463,7 +475,8 @@ fn offsets_over_limit_middle_word_keep_neighbor_boundaries() {
   "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
-    let result = unsafe { super::common::encode_raw(ctx.handle(), b"hello aaaaaa world", &no_bos()) };
+    let result =
+        unsafe { super::common::encode_raw(ctx.handle(), b"hello aaaaaa world", &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 3);
 
@@ -1072,7 +1085,10 @@ fn doubly_nested_wordpiece_cleanup_false_null_options_matches_flat_behavior() {
     let ids = [1, 3, 4, 2];
 
     let flat_result = unsafe { super::common::decode_raw_null_options(flat.handle(), &ids) };
-    assert!(flat_result.error_msg.is_null(), "flat decode with null options should succeed");
+    assert!(
+        flat_result.error_msg.is_null(),
+        "flat decode with null options should succeed"
+    );
     let flat_text = unsafe {
         let slice = std::slice::from_raw_parts(flat_result.text, flat_result.text_len);
         std::str::from_utf8(slice)
@@ -2022,5 +2038,52 @@ fn encode_emoji_produces_unk_not_dropped() {
         tokens,
         vec![3, 0, 4],
         "Emoji 🌍 (U+1F30D, 4-byte UTF-8) must produce [UNK], not be dropped, got: {tokens:?}"
+    );
+}
+
+/// max_input_chars_per_word must be measured in Unicode scalar count, not
+/// UTF-8 byte count.
+#[test]
+fn wordpiece_max_input_chars_uses_unicode_scalars_not_bytes() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 5,
+    "vocab": {
+      "[UNK]": 0,
+      "é": 1,
+      "##é": 2
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = no_bos();
+
+    // 5 Unicode scalars, 10 UTF-8 bytes. This should pass the max=5 boundary.
+    let within_limit = "ééééé";
+    let tokens = ctx.encode_with(within_limit, &opts);
+    assert_eq!(
+        tokens,
+        vec![1, 2, 2, 2, 2],
+        "max_input_chars_per_word must use scalar count; 5-char input should not become [UNK]"
+    );
+
+    // 6 Unicode scalars should exceed the max and collapse to [UNK].
+    let over_limit = "éééééé";
+    let tokens = ctx.encode_with(over_limit, &opts);
+    assert_eq!(
+        tokens,
+        vec![0],
+        "input above max_input_chars_per_word must produce [UNK]"
     );
 }
