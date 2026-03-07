@@ -32,8 +32,10 @@ struct KernelPointUsage {
 #[derive(Debug, Deserialize)]
 struct PerfHintsJson {
     bench_model: String,
-    point_mappings: Vec<PointBenchMapJson>,
-    hidden_rows: Vec<String>,
+    prefill_point_mappings: Vec<PointBenchMapJson>,
+    decode_point_mappings: Vec<PointBenchMapJson>,
+    prefill_hidden_rows: Vec<String>,
+    decode_hidden_rows: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,7 +681,7 @@ fn print_architecture_tree(
         println!();
         println!("Bench helper:");
         println!("  make -C core/bench/compute/cpu model={}", perf_hints.bench_model);
-        let bench_focus = derive_bench_focus(&perf_hints, kernel_point_usage, other_usage);
+        let bench_focus = derive_bench_focus(&perf_hints, kernel_point_usage, other_usage, mode_label.contains("decode"));
         if !bench_focus.is_empty() {
             println!();
             println!("Bench Focus Mapping:");
@@ -694,17 +696,28 @@ fn derive_bench_focus(
     perf_hints: &PerfHintsJson,
     kernel_point_usage: &[KernelPointUsage],
     other_usage: &[PointUsage],
+    decode_mode: bool,
 ) -> Vec<(String, String)> {
     let point_totals = point_total_usage(kernel_point_usage, other_usage);
     let mut rows: Vec<(String, String, u64)> = Vec::new();
+    let point_mappings = if decode_mode {
+        &perf_hints.decode_point_mappings
+    } else {
+        &perf_hints.prefill_point_mappings
+    };
+    let hidden_rows = if decode_mode {
+        &perf_hints.decode_hidden_rows
+    } else {
+        &perf_hints.prefill_hidden_rows
+    };
 
-    for mapping in &perf_hints.point_mappings {
+    for mapping in point_mappings {
         if let Some(total_us) = point_totals.get(mapping.point.as_str()) {
             rows.push((mapping.point.clone(), mapping.bench_row.clone(), *total_us));
         }
     }
 
-    for row in &perf_hints.hidden_rows {
+    for row in hidden_rows {
         rows.push(("hidden".to_string(), row.clone(), 0));
     }
 

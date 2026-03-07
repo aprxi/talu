@@ -38,6 +38,7 @@ const log = @import("../../../log.zig");
 const validate = @import("../../../validate/root.zig");
 const tokenizer_mod = @import("../../../tokenizer/root.zig");
 const runtime_contract = @import("../../runtime_contract/root.zig");
+const trace = @import("../../../xray/trace.zig");
 
 /// Request state in the scheduler.
 pub const RequestState = enum {
@@ -93,9 +94,20 @@ pub const Request = struct {
     submit_time: i64,
     /// Finish reason for completed requests
     finish_reason: FinishReason,
+    /// Time spent in prefill for this request.
+    prefill_ns: u64 = 0,
+    /// Time spent in decode steps for this request.
+    decode_ns: u64 = 0,
+    /// Whether to capture final-step logits for this request.
+    capture_final_logits: bool = false,
+    /// Captured final-step logits (owned when non-empty).
+    final_logits: []f32 = &.{},
 
     pub fn deinit(self: *Request, alloc: std.mem.Allocator) void {
         self.generated_tokens.deinit(alloc);
+        if (self.final_logits.len > 0) {
+            alloc.free(self.final_logits);
+        }
         if (self.error_msg) |msg| {
             alloc.free(msg);
         }
@@ -409,6 +421,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .priority = submit_config.priority,
                 .submit_time = std.time.milliTimestamp(),
                 .finish_reason = .in_progress,
+                .capture_final_logits = submit_config.return_final_logits,
             };
 
             try self.requests.put(request_entry.id, request_entry);
@@ -559,10 +572,18 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
 
             // Run batched decode
+            var decode_timer = std.time.Timer.start() catch unreachable;
             try self.backend.decodeBatch(
                 self.decode_requests[0..decode_batch_size],
                 self.decode_results[0..decode_batch_size],
             );
+            const decode_step_ns = decode_timer.read();
+            for (self.active_requests.items) |active_request_id| {
+                const request_entry = self.requests.get(active_request_id) orelse continue;
+                if (request_entry.state != .generating) continue;
+                if (request_entry.slot_index == null) continue;
+                request_entry.decode_ns += decode_step_ns;
+            }
 
             // Sample next tokens and build events
             var token_events: std.ArrayList(TokenEvent) = .{};
@@ -581,12 +602,39 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (matched_request_entry == null) continue;
                 const request_entry = matched_request_entry.?;
 
+                if (trace.isEnabled()) {
+                    trace.emitFinal(
+                        .logits_ready,
+                        @intCast(request_entry.generated_tokens.items.len),
+                        @intCast(request_entry.token_position),
+                        @ptrCast(result.logits.ptr),
+                        .f32,
+                        .{ @intCast(result.logits.len), 0, 0, 0 },
+                        1,
+                        "decodeBatch_logits",
+                    );
+                }
+
                 // Sample next token using optimized sampler (SIMD, pre-allocated workspace)
                 const next_token = self.sampleToken(
                     result.logits,
                     request_entry.sampling_config,
                     request_entry.grammar_sampler,
                 ) catch 0;
+
+                if (trace.isEnabled()) {
+                    var selected_token = [_]f32{@floatFromInt(next_token)};
+                    trace.emitFinal(
+                        .token_select,
+                        @intCast(request_entry.generated_tokens.items.len),
+                        @intCast(request_entry.token_position),
+                        @ptrCast(selected_token[0..].ptr),
+                        .f32,
+                        .{ 1, 0, 0, 0 },
+                        1,
+                        "sampleToken",
+                    );
+                }
 
                 // Add to generated tokens
                 try request_entry.generated_tokens.append(self.allocator, next_token);
@@ -638,6 +686,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
                 // Handle completion
                 if (is_final_token) {
+                    if (request_entry.capture_final_logits and request_entry.final_logits.len == 0) {
+                        request_entry.final_logits = try self.captureFinalLogits(true, result.logits);
+                    }
                     self.completeRequest(request_entry, finish_reason);
                 }
             }
@@ -683,10 +734,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         /// Submits one request and runs to completion, returning generated tokens.
         /// This is a convenience wrapper for single-request use cases.
         ///
-        /// Uses a single-request route that bypasses `step()` overhead when the scheduler
-        /// has no other active requests. This avoids per-token ArrayList iterations
-        /// and allocation overhead that hurt single-request performance.
-        ///
         /// Returns an owned slice of generated tokens (caller must free).
         pub fn generateSync(
             self: *Self,
@@ -694,35 +741,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             max_tokens: usize,
             options: ?SubmitOptions,
         ) !GenerateSyncResult {
-            const submit_config = options orelse SubmitOptions{};
-            const eos_token_ids = submit_config.eos_token_ids orelse self.config.default_eos_token_ids;
-            const stop_sequences = submit_config.stop_sequences;
-            const sampling_config = submit_config.sampling orelse self.config.default_sampling;
-            const callback = submit_config.callback;
-            const callback_data = submit_config.callback_data;
-            const grammar_sampler = submit_config.grammar_sampler;
-            const stop_flag = submit_config.stop_flag;
-            const vision_input = submit_config.vision_input;
-
-            // Single-request route: if no other requests are active, bypass full `step()` machinery.
-            // This avoids per-token overhead from ArrayList iterations and allocations
-            if (self.active_requests.items.len == 0 and self.pending_queue.items.len == 0) {
-                return self.generateSyncSingleRequestRoute(
-                    prompt_tokens,
-                    max_tokens,
-                    eos_token_ids,
-                    stop_sequences,
-                    &sampling_config,
-                    callback,
-                    callback_data,
-                    grammar_sampler,
-                    vision_input,
-                    stop_flag,
-                    submit_config.return_final_logits,
-                );
-            }
-
-            // Request-tracking route: use `step()` for concurrent requests.
+            // Always use the standard queued scheduler path.
             const request_id = try self.submit(prompt_tokens, max_tokens, options);
 
             // Run until this request completes
@@ -749,364 +768,20 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const request_entry = self.requests.get(request_id) orelse return error.RequestNotFound;
             const generated_tokens = try self.allocator.dupe(u32, request_entry.generated_tokens.items);
             const finish_reason = request_entry.finish_reason;
+            const prefill_ns = request_entry.prefill_ns;
+            const decode_ns = request_entry.decode_ns;
+            const final_logits: []f32 = if (request_entry.final_logits.len > 0)
+                try self.allocator.dupe(f32, request_entry.final_logits)
+            else
+                &.{};
 
             // Cleanup
             self.remove(request_id);
 
-            // Note: request-tracking route doesn't have accurate timing (would need to track in Request).
             return GenerateSyncResult{
                 .tokens = generated_tokens,
+                .final_logits = final_logits,
                 .finish_reason = finish_reason,
-                .prefill_ns = 0,
-                .decode_ns = 0,
-            };
-        }
-
-        /// Single-request route for synchronous generation.
-        /// Bypasses all request tracking and `step()` overhead.
-        fn generateSyncSingleRequestRoute(
-            self: *Self,
-            prompt_tokens: []const u32,
-            max_tokens: usize,
-            eos_token_ids: []const u32,
-            stop_sequences: []const []const u32,
-            sampling_config: *const sampling.SamplingConfig,
-            callback: ?*const fn (u64, u32, bool, ?*anyopaque) void,
-            callback_data: ?*anyopaque,
-            grammar_sampler: ?*validate.sampler.ConstrainedSampler,
-            vision_input: ?*const anyopaque,
-            stop_flag: ?*const std.atomic.Value(bool),
-            return_final_logits: bool,
-        ) !GenerateSyncResult {
-            // Check stop flag early - if already cancelled, return immediately
-            if (stop_flag) |flag| {
-                if (flag.load(.acquire)) {
-                    return GenerateSyncResult{
-                        .tokens = &[_]u32{},
-                        .final_logits = &.{},
-                        .finish_reason = .cancelled,
-                        .prefill_ns = 0,
-                        .decode_ns = 0,
-                    };
-                }
-            }
-
-            var total_timer = std.time.Timer.start() catch unreachable;
-
-            // Allocate slot directly (bypass request tracking)
-            const slot_index = self.backend.allocSlot() orelse return error.NoSlotsAvailable;
-            defer self.backend.freeSlot(slot_index);
-            // Use slot-persistent storage (same as scheduler path)
-            const sp_blocks = if (self.slot_persistent_descs.len > 0)
-                try self.slotStateBlocksForSlot(slot_index)
-            else
-                null;
-            var np_blocks = try self.allocateRequestStateBlocks();
-            defer {
-                self.applyLifecycleActionToRequestStateBlocks(&np_blocks, .evict) catch {};
-                np_blocks.deinit(self.allocator);
-            }
-            // Merge handles for binding
-            var merged: [runtime_contract.max_state_descriptors]runtime_contract.StateBlockHandle = undefined;
-            var merge_count: usize = 0;
-            if (sp_blocks) |spb| {
-                for (spb.handles) |h| {
-                    merged[merge_count] = h;
-                    merge_count += 1;
-                }
-            }
-            for (np_blocks.handles) |h| {
-                merged[merge_count] = h;
-                merge_count += 1;
-            }
-            if (merge_count > 0) {
-                try self.backend.bindSlotStateBlocks(slot_index, merged[0..merge_count]);
-            }
-            defer self.backend.unbindSlotStateBlocks(slot_index);
-
-            var prefill_timer = std.time.Timer.start() catch unreachable;
-            // Prefill
-            log.debug("inference", "Scheduler single-request route prefill start", .{
-                .slot_index = slot_index,
-                .prompt_len = prompt_tokens.len,
-                .has_vision_input = @as(u8, @intFromBool(vision_input != null)),
-            }, @src());
-            try self.prefillWithOptionalVision(slot_index, prompt_tokens, vision_input);
-            const prefill_ns = prefill_timer.read();
-            log.debug("scheduler", "Prefill complete", .{
-                .slot_index = slot_index,
-                .prompt_len = prompt_tokens.len,
-                .duration_ms = @as(f64, @floatFromInt(prefill_ns)) / 1_000_000.0,
-                .tok_per_sec = @as(f64, @floatFromInt(prompt_tokens.len)) * 1_000_000_000.0 / @as(f64, @floatFromInt(prefill_ns)),
-            }, @src());
-
-            // Reseed sampler if seed is provided (for deterministic generation)
-            if (sampling_config.seed != 0) {
-                self.sampler.reseed(sampling_config.seed);
-            }
-
-            var effective_sampling_config = sampling_config.*;
-            const decode_tail_route = self.selectDecodeTailRoute(
-                &effective_sampling_config,
-                stop_sequences,
-                grammar_sampler,
-                vision_input != null,
-            );
-            const chosen_decode_tail_route: DecodeTailRoute = if (return_final_logits and decode_tail_route == .backend_decode_streaming)
-                .decode_batch
-            else
-                decode_tail_route;
-            log.debug("scheduler", "Scheduler decode tail route selected", .{
-                .route = @tagName(chosen_decode_tail_route),
-                .sampling_strategy = @as(u8, @intCast(@intFromEnum(effective_sampling_config.strategy))),
-                .has_stop_sequences = @as(u8, @intFromBool(stop_sequences.len != 0)),
-                .has_grammar = @as(u8, @intFromBool(grammar_sampler != null)),
-                .has_vision_input = @as(u8, @intFromBool(vision_input != null)),
-            }, @src());
-
-            // Sample first token from prefill logits
-            var current_token = self.sampleToken(self.logits_buffer, effective_sampling_config, grammar_sampler) catch 0;
-
-            // Allocate output buffer (pre-allocate max size to avoid per-token reallocs)
-            var generated = try std.ArrayList(u32).initCapacity(self.allocator, max_tokens);
-            errdefer generated.deinit(self.allocator);
-
-            try generated.append(self.allocator, current_token);
-            if (grammarIsComplete(grammar_sampler)) {
-                if (callback) |cb| cb(0, current_token, true, callback_data);
-                return GenerateSyncResult{
-                    .tokens = try generated.toOwnedSlice(self.allocator),
-                    .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
-                    .finish_reason = .stop_sequence,
-                    .prefill_ns = prefill_ns,
-                    .decode_ns = 0,
-                };
-            }
-
-            // Check first token for EOS
-            for (eos_token_ids) |eos_id| {
-                if (current_token == eos_id) {
-                    if (callback) |cb| cb(0, current_token, true, callback_data);
-                    return GenerateSyncResult{
-                        .tokens = try generated.toOwnedSlice(self.allocator),
-                        .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
-                        .finish_reason = if (grammarCompleteOnEos(grammar_sampler)) .stop_sequence else .eos_token,
-                        .prefill_ns = prefill_ns,
-                        .decode_ns = 0,
-                    };
-                }
-            }
-
-            // Check first token for stop sequences
-            if (stop_sequences.len > 0) {
-                const stop_len = checkStopSequence(generated.items, stop_sequences);
-                if (stop_len > 0) {
-                    generated.shrinkRetainingCapacity(generated.items.len - stop_len);
-                    return GenerateSyncResult{
-                        .tokens = try generated.toOwnedSlice(self.allocator),
-                        .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
-                        .finish_reason = .stop_sequence,
-                        .prefill_ns = prefill_ns,
-                        .decode_ns = 0,
-                    };
-                }
-            }
-
-            if (callback) |cb| cb(0, current_token, false, callback_data);
-
-            // Check max_tokens == 1
-            if (max_tokens <= 1) {
-                return GenerateSyncResult{
-                    .tokens = try generated.toOwnedSlice(self.allocator),
-                    .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
-                    .finish_reason = .length,
-                    .prefill_ns = prefill_ns,
-                    .decode_ns = 0,
-                };
-            }
-
-            if (chosen_decode_tail_route == .backend_decode_streaming) {
-                const remaining_token_budget = max_tokens - generated.items.len;
-                const generated_tail = try self.allocator.alloc(u32, remaining_token_budget);
-                defer self.allocator.free(generated_tail);
-
-                var decode_timer = std.time.Timer.start() catch unreachable;
-
-                if (stop_flag) |flag| {
-                    if (flag.load(.acquire)) {
-                        return GenerateSyncResult{
-                            .tokens = try generated.toOwnedSlice(self.allocator),
-                            .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
-                            .finish_reason = .cancelled,
-                            .prefill_ns = prefill_ns,
-                            .decode_ns = 0,
-                        };
-                    }
-                }
-
-                const tail_count = if (comptime @hasDecl(BackendType, "decodeStreaming"))
-                    try self.backend.decodeStreaming(
-                        current_token,
-                        // start_position is the position index for first_token.
-                        // First generated token comes from prefill, so subtract 1.
-                        prompt_tokens.len + generated.items.len - 1,
-                        remaining_token_budget,
-                        eos_token_ids,
-                        generated_tail,
-                        null,
-                        null,
-                    )
-                else
-                    unreachable;
-
-                try generated.appendSlice(self.allocator, generated_tail[0..tail_count]);
-
-                if (callback) |cb| {
-                    for (generated_tail[0..tail_count], 0..) |token_id, idx| {
-                        cb(0, token_id, idx + 1 == tail_count, callback_data);
-                    }
-                }
-
-                const decode_ns = decode_timer.read();
-                const finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
-                log.debug("scheduler", "Decode complete (streaming)", .{
-                    .tokens_generated = generated.items.len,
-                    .decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0,
-                    .decode_tok_per_sec = @as(f64, @floatFromInt(generated.items.len)) * 1_000_000_000.0 / @as(f64, @floatFromInt(decode_ns)),
-                }, @src());
-                return GenerateSyncResult{
-                    .tokens = try generated.toOwnedSlice(self.allocator),
-                    .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
-                    .finish_reason = finish_reason,
-                    .prefill_ns = prefill_ns,
-                    .decode_ns = decode_ns,
-                };
-            }
-
-            // Decode loop via decodeBatch.
-            var decode_timer = std.time.Timer.start() catch unreachable;
-            var tokens_generated: usize = 1; // Already have first token from prefill
-            var last_step_logits: []const f32 = self.logits_buffer;
-
-            while (generated.items.len < max_tokens) {
-                // Check stop flag (allows external cancellation)
-                if (stop_flag) |flag| {
-                    if (flag.load(.acquire)) {
-                        const decode_ns = decode_timer.read();
-                        log.debug("scheduler", "Decode cancelled (stop flag)", .{
-                            .tokens_generated = tokens_generated,
-                            .decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0,
-                        }, @src());
-                        return GenerateSyncResult{
-                            .tokens = try generated.toOwnedSlice(self.allocator),
-                            .final_logits = try self.captureFinalLogits(return_final_logits, last_step_logits),
-                            .finish_reason = .cancelled,
-                            .prefill_ns = prefill_ns,
-                            .decode_ns = decode_ns,
-                        };
-                    }
-                }
-
-                // Reset step-scoped state before each decode step
-                try applyStepScopedReset(&np_blocks);
-
-                // Decode step
-                self.decode_requests[0] = .{
-                    .slot_index = slot_index,
-                    .token = current_token,
-                };
-                try self.backend.decodeBatch(self.decode_requests[0..1], self.decode_results[0..1]);
-                last_step_logits = self.decode_results[0].logits;
-
-                // Sample next token
-                const next_token = self.sampleToken(self.decode_results[0].logits, effective_sampling_config, grammar_sampler) catch 0;
-
-                try generated.append(self.allocator, next_token);
-                current_token = next_token;
-                tokens_generated += 1;
-                if (grammarIsComplete(grammar_sampler)) {
-                    const decode_ns = decode_timer.read();
-                    const total_ns = total_timer.read();
-                    log.debug("scheduler", "Decode complete (grammar)", .{
-                        .tokens_generated = tokens_generated,
-                        .decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0,
-                        .decode_tok_per_sec = @as(f64, @floatFromInt(tokens_generated)) * 1_000_000_000.0 / @as(f64, @floatFromInt(decode_ns)),
-                        .total_ms = @as(f64, @floatFromInt(total_ns)) / 1_000_000.0,
-                    }, @src());
-                    if (callback) |cb| cb(0, next_token, true, callback_data);
-                    return GenerateSyncResult{
-                        .tokens = try generated.toOwnedSlice(self.allocator),
-                        .final_logits = try self.captureFinalLogits(return_final_logits, last_step_logits),
-                        .finish_reason = .stop_sequence,
-                        .prefill_ns = prefill_ns,
-                        .decode_ns = decode_ns,
-                    };
-                }
-
-                // Check for EOS
-                for (eos_token_ids) |eos_id| {
-                    if (next_token == eos_id) {
-                        const decode_ns = decode_timer.read();
-                        const total_ns = total_timer.read();
-                        log.debug("scheduler", "Decode complete (EOS)", .{
-                            .tokens_generated = tokens_generated,
-                            .decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0,
-                            .decode_tok_per_sec = @as(f64, @floatFromInt(tokens_generated)) * 1_000_000_000.0 / @as(f64, @floatFromInt(decode_ns)),
-                            .total_ms = @as(f64, @floatFromInt(total_ns)) / 1_000_000.0,
-                        }, @src());
-                        if (callback) |cb| cb(0, next_token, true, callback_data);
-                        return GenerateSyncResult{
-                            .tokens = try generated.toOwnedSlice(self.allocator),
-                            .final_logits = try self.captureFinalLogits(return_final_logits, last_step_logits),
-                            .finish_reason = if (grammarCompleteOnEos(grammar_sampler)) .stop_sequence else .eos_token,
-                            .prefill_ns = prefill_ns,
-                            .decode_ns = decode_ns,
-                        };
-                    }
-                }
-
-                // Check for stop sequences
-                if (stop_sequences.len > 0) {
-                    const stop_len = checkStopSequence(generated.items, stop_sequences);
-                    if (stop_len > 0) {
-                        generated.shrinkRetainingCapacity(generated.items.len - stop_len);
-                        const decode_ns = decode_timer.read();
-                        const total_ns = total_timer.read();
-                        log.debug("scheduler", "Decode complete (stop seq)", .{
-                            .tokens_generated = tokens_generated,
-                            .decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0,
-                            .decode_tok_per_sec = @as(f64, @floatFromInt(tokens_generated)) * 1_000_000_000.0 / @as(f64, @floatFromInt(decode_ns)),
-                            .total_ms = @as(f64, @floatFromInt(total_ns)) / 1_000_000.0,
-                        }, @src());
-                        if (callback) |cb| cb(0, next_token, true, callback_data);
-                        return GenerateSyncResult{
-                            .tokens = try generated.toOwnedSlice(self.allocator),
-                            .final_logits = try self.captureFinalLogits(return_final_logits, last_step_logits),
-                            .finish_reason = .stop_sequence,
-                            .prefill_ns = prefill_ns,
-                            .decode_ns = decode_ns,
-                        };
-                    }
-                }
-
-                // Invoke callback
-                if (callback) |cb| {
-                    const is_final = generated.items.len >= max_tokens;
-                    cb(0, next_token, is_final, callback_data);
-                }
-            }
-
-            const decode_ns = decode_timer.read();
-            log.debug("scheduler", "Decode complete (length)", .{
-                .tokens_generated = tokens_generated,
-                .decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0,
-                .decode_tok_per_sec = @as(f64, @floatFromInt(tokens_generated)) * 1_000_000_000.0 / @as(f64, @floatFromInt(decode_ns)),
-            }, @src());
-
-            return GenerateSyncResult{
-                .tokens = try generated.toOwnedSlice(self.allocator),
-                .final_logits = try self.captureFinalLogits(return_final_logits, last_step_logits),
-                .finish_reason = .length,
                 .prefill_ns = prefill_ns,
                 .decode_ns = decode_ns,
             };
@@ -1347,12 +1022,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (request_entry.slot_index == null) continue;
 
                 // Run prefill for this request
+                var prefill_timer = std.time.Timer.start() catch unreachable;
                 try self.resetRequestStateBlocks(request_entry.id);
                 try self.prefillWithOptionalVision(
                     request_entry.slot_index.?,
                     request_entry.prompt_tokens,
                     request_entry.vision_input,
                 );
+                request_entry.prefill_ns = prefill_timer.read();
 
                 request_entry.token_position = request_entry.prompt_tokens.len;
                 request_entry.state = .generating;
@@ -1400,6 +1077,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }
 
                 if (is_final_token) {
+                    if (request_entry.capture_final_logits and request_entry.final_logits.len == 0) {
+                        request_entry.final_logits = try self.captureFinalLogits(true, self.logits_buffer);
+                    }
                     self.completeRequest(request_entry, finish_reason);
                 }
             }
@@ -1449,28 +1129,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }
             }
             return 0;
-        }
-
-        const DecodeTailRoute = enum {
-            backend_decode_streaming,
-            decode_batch,
-        };
-
-        fn selectDecodeTailRoute(
-            self: *const Self,
-            sampling_config: *const sampling.SamplingConfig,
-            stop_sequences: []const []const u32,
-            grammar_sampler: ?*validate.sampler.ConstrainedSampler,
-            has_vision_input: bool,
-        ) DecodeTailRoute {
-            if (has_vision_input) return .decode_batch;
-            if (stop_sequences.len != 0) return .decode_batch;
-            if (grammar_sampler != null) return .decode_batch;
-            if (sampling_config.strategy != .greedy) return .decode_batch;
-            if (comptime !@hasDecl(BackendType, "decodeStreaming")) return .decode_batch;
-            if (comptime !@hasDecl(BackendType, "supportsSchedulerBackendDecodeStreamingRoute")) return .decode_batch;
-            if (!self.backend.supportsSchedulerBackendDecodeStreamingRoute()) return .decode_batch;
-            return .backend_decode_streaming;
         }
 
         fn prefillWithOptionalVision(
@@ -2625,7 +2283,7 @@ const MockStreamingScheduler = GenericScheduler(MockStreamingBackend);
 // Scheduler Integration Tests - init/deinit
 // =============================================================================
 
-test "generateSync uses backend decode-streaming route for greedy sampling" {
+test "generateSync uses queued decodeBatch route for greedy sampling" {
     const alloc = std.testing.allocator;
     var backend = MockStreamingBackend.init(alloc, 256);
     defer backend.deinit();
@@ -2645,10 +2303,10 @@ test "generateSync uses backend decode-streaming route for greedy sampling" {
     });
     defer result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), backend.decode_streaming_calls);
-    try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
+    try std.testing.expect(backend.decode_batch_calls > 0);
     try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
-    try std.testing.expectEqualSlices(u32, &.{ 42, 44, 45, 46 }, result.tokens);
+    try std.testing.expectEqualSlices(u32, &.{ 42, 42, 42, 42 }, result.tokens);
 }
 
 test "generateSync uses decodeBatch route with vision input" {
@@ -3758,7 +3416,7 @@ test "step callback invocation" {
     try std.testing.expect(callback_data.is_final);
 }
 
-test "generateSync single-request route - basic generation" {
+test "generateSync queued route - basic generation" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();
@@ -3768,13 +3426,30 @@ test "generateSync single-request route - basic generation" {
 
     const prompt = [_]u32{ 1, 2, 3 };
 
-    // generateSync should use single-request route when no other requests are active.
     var result = try scheduler.generateSync(&prompt, 5, null);
     defer result.deinit(alloc);
 
     // Should generate up to max_tokens
     try std.testing.expectEqual(@as(usize, 5), result.tokens.len);
     try std.testing.expectEqual(FinishReason.length, result.finish_reason);
+}
+
+test "generateSync queued route captures final logits when requested" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 4);
+    defer backend.deinit();
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{});
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3 };
+    var result = try scheduler.generateSync(&prompt, 3, .{
+        .return_final_logits = true,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, backend.vocab_size), result.final_logits.len);
+    try std.testing.expect(result.tokens.len > 0);
 }
 
 test "Scheduler descriptor-backed state blocks are bound and validated" {
@@ -3916,7 +3591,7 @@ test "Scheduler rejects descriptor size that cannot fit host usize" {
     return error.TestUnexpectedResult;
 }
 
-test "generateSync single-request route - EOS detection" {
+test "generateSync queued route - EOS detection" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();
@@ -3939,7 +3614,7 @@ test "generateSync single-request route - EOS detection" {
     try std.testing.expectEqual(FinishReason.eos_token, result.finish_reason);
 }
 
-test "generateSync single-request route - stop sequences" {
+test "generateSync queued route - stop sequences" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();
@@ -3962,7 +3637,7 @@ test "generateSync single-request route - stop sequences" {
     try std.testing.expectEqual(FinishReason.stop_sequence, result.finish_reason);
 }
 
-test "generateSync single-request route - callback invocation" {
+test "generateSync queued route - callback invocation" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();
@@ -3996,7 +3671,7 @@ test "generateSync single-request route - callback invocation" {
     try std.testing.expectEqual(@as(usize, 5), callback_data.token_count);
 }
 
-test "generateSync request-tracking route - used when other requests are active" {
+test "generateSync queued route - used when other requests are active" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();
@@ -4012,10 +3687,10 @@ test "generateSync request-tracking route - used when other requests are active"
     const prompt1 = [_]u32{ 1, 2, 3 };
     const prompt2 = [_]u32{ 4, 5, 6 };
 
-    // Submit first request (this would use the single-request route in isolation).
+    // Submit first request so a second request is processed while another is active.
     _ = try scheduler.submit(&prompt1, 5, null);
 
-    // Now scheduler has active requests, generateSync should use request-tracking route.
+    // generateSync uses the same queued scheduler route in all cases.
     var result = try scheduler.generateSync(&prompt2, 5, null);
     defer result.deinit(alloc);
 
@@ -4023,7 +3698,7 @@ test "generateSync request-tracking route - used when other requests are active"
     try std.testing.expect(result.tokens.len > 0);
 }
 
-test "generateSync single-request route - seed produces deterministic output" {
+test "generateSync queued route - seed produces deterministic output" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();

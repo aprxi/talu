@@ -36,7 +36,7 @@ pub const PointBenchMap = struct {
 };
 
 pub const RoleDims = struct {
-    /// CPU bench row name, for example `role.attn_q`.
+    /// CPU bench row name, for example `prefill.attn_q` or `decode.ffn_gate`.
     bench_row: []const u8,
     /// Representative token count for the architecture-level bench preset.
     tokens: usize,
@@ -49,30 +49,51 @@ pub const RoleDims = struct {
 pub const PerfHints = struct {
     /// Architecture-level bench id used by `make -C core/bench/compute/cpu model=<id>`.
     bench_model: []const u8,
-    /// Direct xray point -> bench row mappings.
-    point_mappings: []const PointBenchMap = &.{},
-    /// Hidden compute rows that matter for the architecture but do not always
-    /// appear clearly in xray summaries.
-    hidden_rows: []const []const u8 = &.{},
+    /// Direct xray input/prefill point -> bench row mappings.
+    prefill_point_mappings: []const PointBenchMap = &.{},
+    /// Direct xray output/decode point -> bench row mappings.
+    decode_point_mappings: []const PointBenchMap = &.{},
+    /// Hidden compute rows that matter for prefill but do not always appear
+    /// clearly in xray summaries.
+    prefill_hidden_rows: []const []const u8 = &.{},
+    /// Hidden compute rows that matter for decode but do not always appear
+    /// clearly in xray summaries.
+    decode_hidden_rows: []const []const u8 = &.{},
     /// Representative role dimensions for architecture-level bench presets.
     role_dims: []const RoleDims = &.{},
 };
 
 /// Shared representative text-model role dimensions for architectures that do
-/// not provide their own overrides. These are not intended to mirror one exact
-/// checkpoint; they provide a stable architecture-level proxy so bench remains
-/// usable even when a family spans multiple concrete sizes.
+/// not provide their own overrides. These are phase-specific on purpose:
+/// prefill and decode stress different compute paths and must not share one
+/// ambiguous row name.
+///
+/// These are not intended to mirror one exact checkpoint; they provide a
+/// stable architecture-level proxy so bench remains usable even when a family
+/// spans multiple concrete sizes.
 pub const default_text_role_dims = [_]RoleDims{
-    .{ .bench_row = "role.attn_q", .tokens = 14, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "role.attn_k", .tokens = 14, .hidden = 1024, .out = 256 },
-    .{ .bench_row = "role.attn_v", .tokens = 14, .hidden = 1024, .out = 256 },
-    .{ .bench_row = "role.attn_out", .tokens = 14, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "role.ffn_gate", .tokens = 14, .hidden = 1024, .out = 4096 },
-    .{ .bench_row = "role.ffn_down", .tokens = 14, .hidden = 4096, .out = 1024 },
+    .{ .bench_row = "prefill.attn_q", .tokens = 14, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "prefill.attn_k", .tokens = 14, .hidden = 1024, .out = 256 },
+    .{ .bench_row = "prefill.attn_v", .tokens = 14, .hidden = 1024, .out = 256 },
+    .{ .bench_row = "prefill.attn_out", .tokens = 14, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "prefill.ffn_gate", .tokens = 14, .hidden = 1024, .out = 4096 },
+    .{ .bench_row = "prefill.ffn_down", .tokens = 14, .hidden = 4096, .out = 1024 },
+    .{ .bench_row = "prefill.layer_attn_norm", .tokens = 14, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "prefill.layer_ffn_norm", .tokens = 14, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "prefill.final_norm", .tokens = 14, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "decode.attn_q", .tokens = 1, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "decode.attn_k", .tokens = 1, .hidden = 1024, .out = 256 },
+    .{ .bench_row = "decode.attn_v", .tokens = 1, .hidden = 1024, .out = 256 },
+    .{ .bench_row = "decode.attn_out", .tokens = 1, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "decode.ffn_gate", .tokens = 1, .hidden = 1024, .out = 4096 },
+    .{ .bench_row = "decode.ffn_down", .tokens = 1, .hidden = 4096, .out = 1024 },
+    .{ .bench_row = "decode.layer_attn_norm", .tokens = 1, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "decode.layer_ffn_norm", .tokens = 1, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "decode.final_norm", .tokens = 1, .hidden = 1024, .out = 1024 },
 };
 
-pub fn pointMappingFor(hints: *const PerfHints, point: []const u8) ?[]const u8 {
-    for (hints.point_mappings) |mapping| {
+pub fn pointMappingFor(mappings: []const PointBenchMap, point: []const u8) ?[]const u8 {
+    for (mappings) |mapping| {
         if (std.mem.eql(u8, mapping.point, point)) return mapping.bench_row;
     }
     return null;
@@ -96,8 +117,8 @@ pub fn writeJson(writer: anytype, hints: *const PerfHints) !void {
     try writer.writeAll("{\"bench_model\":");
     try writeJsonString(writer, hints.bench_model);
 
-    try writer.writeAll(",\"point_mappings\":[");
-    for (hints.point_mappings, 0..) |mapping, idx| {
+    try writer.writeAll(",\"prefill_point_mappings\":[");
+    for (hints.prefill_point_mappings, 0..) |mapping, idx| {
         if (idx != 0) try writer.writeByte(',');
         try writer.writeAll("{\"point\":");
         try writeJsonString(writer, mapping.point);
@@ -107,8 +128,26 @@ pub fn writeJson(writer: anytype, hints: *const PerfHints) !void {
     }
     try writer.writeByte(']');
 
-    try writer.writeAll(",\"hidden_rows\":[");
-    for (hints.hidden_rows, 0..) |row, idx| {
+    try writer.writeAll(",\"decode_point_mappings\":[");
+    for (hints.decode_point_mappings, 0..) |mapping, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"point\":");
+        try writeJsonString(writer, mapping.point);
+        try writer.writeAll(",\"bench_row\":");
+        try writeJsonString(writer, mapping.bench_row);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+
+    try writer.writeAll(",\"prefill_hidden_rows\":[");
+    for (hints.prefill_hidden_rows, 0..) |row, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writeJsonString(writer, row);
+    }
+    try writer.writeByte(']');
+
+    try writer.writeAll(",\"decode_hidden_rows\":[");
+    for (hints.decode_hidden_rows, 0..) |row, idx| {
         if (idx != 0) try writer.writeByte(',');
         try writeJsonString(writer, row);
     }
@@ -130,36 +169,68 @@ pub fn writeJson(writer: anytype, hints: *const PerfHints) !void {
     try writer.writeAll("]}");
 }
 
-pub const standard_attention_mlp_point_mappings = [_]PointBenchMap{
-    .{ .point = "attn.q", .bench_row = "role.attn_q" },
-    .{ .point = "attn.k", .bench_row = "role.attn_k" },
-    .{ .point = "attn.v", .bench_row = "role.attn_v" },
-    .{ .point = "attn.out", .bench_row = "role.attn_out" },
-    .{ .point = "ffn.gate", .bench_row = "role.ffn_gate" },
-    .{ .point = "ffn.down", .bench_row = "role.ffn_down" },
+pub const standard_attention_mlp_prefill_point_mappings = [_]PointBenchMap{
+    .{ .point = "attn.q", .bench_row = "prefill.attn_q" },
+    .{ .point = "attn.k", .bench_row = "prefill.attn_k" },
+    .{ .point = "attn.v", .bench_row = "prefill.attn_v" },
+    .{ .point = "attn.out", .bench_row = "prefill.attn_out" },
+    .{ .point = "ffn.gate", .bench_row = "prefill.ffn_gate" },
+    .{ .point = "ffn.down", .bench_row = "prefill.ffn_down" },
     .{ .point = "embed_pos", .bench_row = "rope_f32" },
-    .{ .point = "layer_attn_norm", .bench_row = "rms_f32" },
-    .{ .point = "layer_ffn_norm", .bench_row = "rms_f32" },
-    .{ .point = "final_norm", .bench_row = "rms_f32" },
+    .{ .point = "layer_attn_norm", .bench_row = "prefill.layer_attn_norm" },
+    .{ .point = "layer_ffn_norm", .bench_row = "prefill.layer_ffn_norm" },
+    .{ .point = "final_norm", .bench_row = "prefill.final_norm" },
 };
 
-pub const attention_norm_point_mappings = [_]PointBenchMap{
-    .{ .point = "attn.q", .bench_row = "role.attn_q" },
-    .{ .point = "attn.k", .bench_row = "role.attn_k" },
-    .{ .point = "attn.v", .bench_row = "role.attn_v" },
-    .{ .point = "attn.out", .bench_row = "role.attn_out" },
+pub const standard_attention_mlp_decode_point_mappings = [_]PointBenchMap{
+    .{ .point = "attn.q", .bench_row = "decode.attn_q" },
+    .{ .point = "attn.k", .bench_row = "decode.attn_k" },
+    .{ .point = "attn.v", .bench_row = "decode.attn_v" },
+    .{ .point = "attn.out", .bench_row = "decode.attn_out" },
+    .{ .point = "ffn.gate", .bench_row = "decode.ffn_gate" },
+    .{ .point = "ffn.down", .bench_row = "decode.ffn_down" },
     .{ .point = "embed_pos", .bench_row = "rope_f32" },
-    .{ .point = "layer_attn_norm", .bench_row = "rms_f32" },
-    .{ .point = "layer_ffn_norm", .bench_row = "rms_f32" },
-    .{ .point = "final_norm", .bench_row = "rms_f32" },
+    .{ .point = "layer_attn_norm", .bench_row = "decode.layer_attn_norm" },
+    .{ .point = "layer_ffn_norm", .bench_row = "decode.layer_ffn_norm" },
+    .{ .point = "final_norm", .bench_row = "decode.final_norm" },
 };
 
-pub const ffn_norm_point_mappings = [_]PointBenchMap{
-    .{ .point = "ffn.gate", .bench_row = "role.ffn_gate" },
-    .{ .point = "ffn.down", .bench_row = "role.ffn_down" },
-    .{ .point = "layer_attn_norm", .bench_row = "rms_f32" },
-    .{ .point = "layer_ffn_norm", .bench_row = "rms_f32" },
-    .{ .point = "final_norm", .bench_row = "rms_f32" },
+pub const attention_norm_prefill_point_mappings = [_]PointBenchMap{
+    .{ .point = "attn.q", .bench_row = "prefill.attn_q" },
+    .{ .point = "attn.k", .bench_row = "prefill.attn_k" },
+    .{ .point = "attn.v", .bench_row = "prefill.attn_v" },
+    .{ .point = "attn.out", .bench_row = "prefill.attn_out" },
+    .{ .point = "embed_pos", .bench_row = "rope_f32" },
+    .{ .point = "layer_attn_norm", .bench_row = "prefill.layer_attn_norm" },
+    .{ .point = "layer_ffn_norm", .bench_row = "prefill.layer_ffn_norm" },
+    .{ .point = "final_norm", .bench_row = "prefill.final_norm" },
+};
+
+pub const attention_norm_decode_point_mappings = [_]PointBenchMap{
+    .{ .point = "attn.q", .bench_row = "decode.attn_q" },
+    .{ .point = "attn.k", .bench_row = "decode.attn_k" },
+    .{ .point = "attn.v", .bench_row = "decode.attn_v" },
+    .{ .point = "attn.out", .bench_row = "decode.attn_out" },
+    .{ .point = "embed_pos", .bench_row = "rope_f32" },
+    .{ .point = "layer_attn_norm", .bench_row = "decode.layer_attn_norm" },
+    .{ .point = "layer_ffn_norm", .bench_row = "decode.layer_ffn_norm" },
+    .{ .point = "final_norm", .bench_row = "decode.final_norm" },
+};
+
+pub const ffn_norm_prefill_point_mappings = [_]PointBenchMap{
+    .{ .point = "ffn.gate", .bench_row = "prefill.ffn_gate" },
+    .{ .point = "ffn.down", .bench_row = "prefill.ffn_down" },
+    .{ .point = "layer_attn_norm", .bench_row = "prefill.layer_attn_norm" },
+    .{ .point = "layer_ffn_norm", .bench_row = "prefill.layer_ffn_norm" },
+    .{ .point = "final_norm", .bench_row = "prefill.final_norm" },
+};
+
+pub const ffn_norm_decode_point_mappings = [_]PointBenchMap{
+    .{ .point = "ffn.gate", .bench_row = "decode.ffn_gate" },
+    .{ .point = "ffn.down", .bench_row = "decode.ffn_down" },
+    .{ .point = "layer_attn_norm", .bench_row = "decode.layer_attn_norm" },
+    .{ .point = "layer_ffn_norm", .bench_row = "decode.layer_ffn_norm" },
+    .{ .point = "final_norm", .bench_row = "decode.final_norm" },
 };
 
 pub const qwen3_5_hidden_rows = [_][]const u8{
@@ -178,73 +249,114 @@ pub const mamba_hidden_rows = [_][]const u8{
 };
 
 pub const qwen3_5_role_dims = [_]RoleDims{
-    .{ .bench_row = "role.attn_q", .tokens = 14, .hidden = 1024, .out = 2048 },
-    .{ .bench_row = "role.attn_k", .tokens = 14, .hidden = 1024, .out = 512 },
-    .{ .bench_row = "role.attn_v", .tokens = 14, .hidden = 1024, .out = 512 },
-    .{ .bench_row = "role.attn_out", .tokens = 14, .hidden = 1024, .out = 1024 },
-    .{ .bench_row = "role.ffn_gate", .tokens = 14, .hidden = 1024, .out = 7168 },
-    .{ .bench_row = "role.ffn_down", .tokens = 14, .hidden = 3584, .out = 1024 },
+    .{ .bench_row = "prefill.attn_q", .tokens = 14, .hidden = 1024, .out = 2048 },
+    .{ .bench_row = "prefill.attn_k", .tokens = 14, .hidden = 1024, .out = 512 },
+    .{ .bench_row = "prefill.attn_v", .tokens = 14, .hidden = 1024, .out = 512 },
+    .{ .bench_row = "prefill.attn_out", .tokens = 14, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "prefill.ffn_gate", .tokens = 14, .hidden = 1024, .out = 7168 },
+    .{ .bench_row = "prefill.ffn_down", .tokens = 14, .hidden = 3584, .out = 1024 },
+    .{ .bench_row = "prefill.layer_attn_norm", .tokens = 14, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "prefill.layer_ffn_norm", .tokens = 14, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "prefill.final_norm", .tokens = 14, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "decode.attn_q", .tokens = 1, .hidden = 1024, .out = 2048 },
+    .{ .bench_row = "decode.attn_k", .tokens = 1, .hidden = 1024, .out = 512 },
+    .{ .bench_row = "decode.attn_v", .tokens = 1, .hidden = 1024, .out = 512 },
+    .{ .bench_row = "decode.attn_out", .tokens = 1, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "decode.ffn_gate", .tokens = 1, .hidden = 1024, .out = 7168 },
+    .{ .bench_row = "decode.ffn_down", .tokens = 1, .hidden = 3584, .out = 1024 },
+    .{ .bench_row = "decode.lm_head_bf16", .tokens = 1, .hidden = 1024, .out = 248320 },
+    .{ .bench_row = "decode.lm_head_f16", .tokens = 1, .hidden = 1024, .out = 248320 },
+    .{ .bench_row = "decode.lm_head_f32", .tokens = 1, .hidden = 1024, .out = 248320 },
+    .{ .bench_row = "decode.lm_head_runtime_f32", .tokens = 1, .hidden = 1024, .out = 248320 },
+    .{ .bench_row = "decode.layer_attn_norm", .tokens = 1, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "decode.layer_ffn_norm", .tokens = 1, .hidden = 1024, .out = 1024 },
+    .{ .bench_row = "decode.final_norm", .tokens = 1, .hidden = 1024, .out = 1024 },
+};
+
+pub const qwen3_5_decode_point_mappings = [_]PointBenchMap{
+    .{ .point = "attn.q", .bench_row = "decode.attn_q" },
+    .{ .point = "attn.k", .bench_row = "decode.attn_k" },
+    .{ .point = "attn.v", .bench_row = "decode.attn_v" },
+    .{ .point = "attn.out", .bench_row = "decode.attn_out" },
+    .{ .point = "ffn.gate", .bench_row = "decode.ffn_gate" },
+    .{ .point = "ffn.down", .bench_row = "decode.ffn_down" },
+    .{ .point = "lm_head", .bench_row = "decode.lm_head_runtime_f32" },
+    .{ .point = "embed_pos", .bench_row = "rope_f32" },
+    .{ .point = "layer_attn_norm", .bench_row = "decode.layer_attn_norm" },
+    .{ .point = "layer_ffn_norm", .bench_row = "decode.layer_ffn_norm" },
+    .{ .point = "final_norm", .bench_row = "decode.final_norm" },
 };
 
 pub fn standardAttentionMlpHints(comptime bench_model: []const u8) PerfHints {
     return .{
         .bench_model = bench_model,
-        .point_mappings = standard_attention_mlp_point_mappings[0..],
+        .prefill_point_mappings = standard_attention_mlp_prefill_point_mappings[0..],
+        .decode_point_mappings = standard_attention_mlp_decode_point_mappings[0..],
     };
 }
 
 pub fn standardAttentionMlpShortConvHints(comptime bench_model: []const u8) PerfHints {
     return .{
         .bench_model = bench_model,
-        .point_mappings = standard_attention_mlp_point_mappings[0..],
-        .hidden_rows = shortconv_hidden_rows[0..],
+        .prefill_point_mappings = standard_attention_mlp_prefill_point_mappings[0..],
+        .decode_point_mappings = standard_attention_mlp_decode_point_mappings[0..],
+        .prefill_hidden_rows = shortconv_hidden_rows[0..],
+        .decode_hidden_rows = shortconv_hidden_rows[0..],
     };
 }
 
 pub fn standardAttentionMlpMambaHints(comptime bench_model: []const u8) PerfHints {
     return .{
         .bench_model = bench_model,
-        .point_mappings = standard_attention_mlp_point_mappings[0..],
-        .hidden_rows = mamba_hidden_rows[0..],
+        .prefill_point_mappings = standard_attention_mlp_prefill_point_mappings[0..],
+        .decode_point_mappings = standard_attention_mlp_decode_point_mappings[0..],
+        .prefill_hidden_rows = mamba_hidden_rows[0..],
+        .decode_hidden_rows = mamba_hidden_rows[0..],
     };
 }
 
 pub fn attentionOnlyHints(comptime bench_model: []const u8) PerfHints {
     return .{
         .bench_model = bench_model,
-        .point_mappings = attention_norm_point_mappings[0..],
+        .prefill_point_mappings = attention_norm_prefill_point_mappings[0..],
+        .decode_point_mappings = attention_norm_decode_point_mappings[0..],
     };
 }
 
 pub fn attentionOnlyMambaHints(comptime bench_model: []const u8) PerfHints {
     return .{
         .bench_model = bench_model,
-        .point_mappings = attention_norm_point_mappings[0..],
-        .hidden_rows = mamba_hidden_rows[0..],
+        .prefill_point_mappings = attention_norm_prefill_point_mappings[0..],
+        .decode_point_mappings = attention_norm_decode_point_mappings[0..],
+        .prefill_hidden_rows = mamba_hidden_rows[0..],
+        .decode_hidden_rows = mamba_hidden_rows[0..],
     };
 }
 
 pub fn ffnNormHints(comptime bench_model: []const u8) PerfHints {
     return .{
         .bench_model = bench_model,
-        .point_mappings = ffn_norm_point_mappings[0..],
+        .prefill_point_mappings = ffn_norm_prefill_point_mappings[0..],
+        .decode_point_mappings = ffn_norm_decode_point_mappings[0..],
     };
 }
 
 test "pointMappingFor resolves known mapping" {
     const hints = PerfHints{
         .bench_model = "demo",
-        .point_mappings = standard_attention_mlp_point_mappings[0..],
+        .prefill_point_mappings = standard_attention_mlp_prefill_point_mappings[0..],
     };
-    try std.testing.expectEqualStrings("role.ffn_gate", pointMappingFor(&hints, "ffn.gate").?);
-    try std.testing.expect(pointMappingFor(&hints, "not_a_point") == null);
+    try std.testing.expectEqualStrings("prefill.ffn_gate", pointMappingFor(hints.prefill_point_mappings, "ffn.gate").?);
+    try std.testing.expect(pointMappingFor(hints.prefill_point_mappings, "not_a_point") == null);
 }
 
 test "writeJson includes bench model and hidden rows" {
     const hints = PerfHints{
         .bench_model = "qwen3_5",
-        .point_mappings = standard_attention_mlp_point_mappings[0..1],
-        .hidden_rows = qwen3_5_hidden_rows[0..],
+        .prefill_point_mappings = standard_attention_mlp_prefill_point_mappings[0..1],
+        .decode_point_mappings = standard_attention_mlp_decode_point_mappings[0..1],
+        .prefill_hidden_rows = qwen3_5_hidden_rows[0..],
+        .decode_hidden_rows = qwen3_5_hidden_rows[0..],
         .role_dims = qwen3_5_role_dims[0..1],
     };
 
@@ -253,5 +365,6 @@ test "writeJson includes bench model and hidden rows" {
     try writeJson(out.writer(std.testing.allocator), &hints);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"bench_model\":\"qwen3_5\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"gdelta_step_f32\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"role.attn_q\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"prefill.attn_q\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"decode.attn_q\"") != null);
 }

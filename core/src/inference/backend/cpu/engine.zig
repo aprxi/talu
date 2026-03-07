@@ -830,7 +830,7 @@ pub const FusedCpuBackend = struct {
         if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
 
         // 4. Compute logits
-        try self.computeLogitsFromHidden(hidden_buffer, logits_out);
+        try self.computeLogitsFromHiddenRows(hidden_buffer, 1, logits_out);
     }
 
     /// Streaming token generation with callback support.
@@ -877,7 +877,7 @@ pub const FusedCpuBackend = struct {
             if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
 
             // 4. Compute logits
-            try self.computeLogitsFromHidden(hidden_buffer, logits_buffer);
+            try self.computeLogitsFromHiddenRows(hidden_buffer, 1, logits_buffer);
 
             // 5. Greedy sample next token
             const max_logit_index = cpu_reduction.argmaxIndex(logits_buffer);
@@ -933,7 +933,7 @@ pub const FusedCpuBackend = struct {
         if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
 
         // 4. Compute logits
-        try self.computeLogitsFromHidden(hidden_buffer, logits_buffer);
+        try self.computeLogitsFromHiddenRows(hidden_buffer, 1, logits_buffer);
 
         return logits_buffer;
     }
@@ -1219,7 +1219,7 @@ pub const FusedCpuBackend = struct {
         if (self.model.norm) |*n| n.forward(&last_hidden_view, &last_hidden_view);
 
         // 4. Compute logits
-        try self.computeLogitsFromHidden(last_hidden_slice, logits_out);
+        try self.computeLogitsFromHiddenRows(last_hidden_slice, 1, logits_out);
     }
 
     /// Copy K/V data from a single-sequence AttnCache to the batched cache slot.
@@ -1469,7 +1469,7 @@ pub const FusedCpuBackend = struct {
         }
 
         // 3) Batched LM-head logits in one matmul over compact hidden rows.
-        self.computeLogitsFromHiddenBatch(compact_hidden, request_total, compact_logits) catch return;
+        self.computeLogitsFromHiddenRows(compact_hidden, request_total, compact_logits) catch return;
 
         // 4) Scatter compact logits rows back to slot-local buffers and fill results.
         for (requests, 0..) |request, request_index| {
@@ -1513,55 +1513,42 @@ pub const FusedCpuBackend = struct {
         return self.logits_buffers[offset..][0..self.vocab_size];
     }
 
-    fn computeLogitsFromHidden(self: *FusedCpuBackend, hidden_slice: []const f32, logits_buffer: []f32) !void {
-        const lm_head_ptr = &(self.loaded.lm_head orelse return error.MissingLmHead);
-        var hidden_view = Tensor.view2DSlice(@constCast(hidden_slice), 1, self.d_model);
-        var logits_view = Tensor.view2DSlice(logits_buffer, 1, self.vocab_size);
-        try cpu_linalg.matmulAuto(&hidden_view, lm_head_ptr, &logits_view, &self.scratch.matmul_scratch);
-
-        // Emit trace point for logits before scaling (if handler installed)
-        trace.emitFinal(
-            .lm_head,
-            0, // token
-            0, // position (could track this if needed)
-            @ptrCast(logits_buffer.ptr),
-            .f32,
-            .{ @intCast(self.vocab_size), 0, 0, 0 },
-            1,
-            "matmul_lm_head",
-        );
-
-        cpu_rowwise.scaleInPlaceReciprocal(logits_buffer, self.loaded.config.logits_scaling);
-
-        // Emit trace point for scaled logits (after temperature/scaling applied)
-        if (self.loaded.config.logits_scaling != 1.0) {
-            trace.emitFinal(
-                .logits_scaled,
-                0,
-                0,
-                @ptrCast(logits_buffer.ptr),
-                .f32,
-                .{ @intCast(self.vocab_size), 0, 0, 0 },
-                1,
-                null,
-            );
-        }
-    }
-
-    fn computeLogitsFromHiddenBatch(
+    fn computeLogitsFromHiddenRows(
         self: *FusedCpuBackend,
         hidden_rows: []const f32,
         row_count: usize,
         logits_out: []f32,
     ) !void {
         const lm_head_ptr = &(self.loaded.lm_head orelse return error.MissingLmHead);
+        const lm_head_kernel_name = switch (lm_head_ptr.dtype) {
+            .bf16 => "matmul_lm_head_bf16",
+            .f16 => "matmul_lm_head_f16",
+            .f32 => "matmul_lm_head_f32",
+            .grouped_affine_u4 => "matmul_lm_head_gaffine_u4",
+            .grouped_affine_u8 => "matmul_lm_head_gaffine_u8",
+            else => "matmul_lm_head",
+        };
         std.debug.assert(hidden_rows.len >= row_count * self.d_model);
         std.debug.assert(logits_out.len >= row_count * self.vocab_size);
 
-        var hidden_view = Tensor.view2DSlice(@constCast(hidden_rows), row_count, self.d_model);
-        var logits_view = Tensor.view2DSlice(logits_out, row_count, self.vocab_size);
-        try cpu_linalg.matmulAuto(&hidden_view, lm_head_ptr, &logits_view, &self.scratch.matmul_scratch);
-        cpu_rowwise.scaleInPlaceReciprocal(logits_out[0 .. row_count * self.vocab_size], self.loaded.config.logits_scaling);
+        if (lm_head_ptr.dtype == .bf16) {
+            cpu_linalg.matmulLmHeadRowsBf16(
+                hidden_rows,
+                row_count,
+                lm_head_ptr,
+                logits_out,
+                self.loaded.config.logits_scaling,
+                &self.scratch.matmul_scratch,
+            );
+        } else {
+            var hidden_view = Tensor.view2DSlice(@constCast(hidden_rows), row_count, self.d_model);
+            var logits_view = Tensor.view2DSlice(logits_out, row_count, self.vocab_size);
+            try cpu_linalg.matmulAuto(&hidden_view, lm_head_ptr, &logits_view, &self.scratch.matmul_scratch);
+            cpu_rowwise.scaleInPlaceReciprocal(
+                logits_out[0 .. row_count * self.vocab_size],
+                self.loaded.config.logits_scaling,
+            );
+        }
 
         if (trace.isEnabled()) {
             for (0..row_count) |row_index| {
@@ -1574,7 +1561,7 @@ pub const FusedCpuBackend = struct {
                     .f32,
                     .{ @intCast(self.vocab_size), 0, 0, 0 },
                     1,
-                    "matmul_lm_head",
+                    lm_head_kernel_name,
                 );
                 if (self.loaded.config.logits_scaling != 1.0) {
                     trace.emitFinal(

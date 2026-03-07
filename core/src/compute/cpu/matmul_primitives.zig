@@ -4,6 +4,7 @@
 //! with SIMD acceleration.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const parallel = @import("../../system/parallel.zig");
 const tensor_mod = @import("../../tensor.zig");
@@ -11,6 +12,7 @@ const dtype_mod = @import("../../dtype.zig");
 const simd = @import("simd/arch/root.zig");
 const grouped_affine_quant = @import("quant/grouped_affine_quant.zig");
 const multi_row = @import("matmul_prefill.zig");
+const rowwise = @import("rowwise.zig");
 const log = @import("../../log.zig");
 
 // Re-export types
@@ -64,9 +66,18 @@ const COL_TILE_SIZE: usize = 128;
 
 /// Column tile size for BF16/F16 multi-row path.
 /// BF16/F16 are memory-bandwidth bound (not compute bound like quantized).
-/// Smaller tiles keep the active weight block in L1 cache (32KB typical).
-/// With k=1024 (common hidden dim), 32 columns * 1024 * 2 bytes = 64KB fits in L1.
-const COL_TILE_SIZE_FP16: usize = 32;
+/// Small hidden widths benefit from 16-column tiles because the active BF16
+/// weight block stays inside a typical 32KB L1 data cache. Larger hidden
+/// widths need wider tiles to avoid excessive tile overhead.
+const COL_TILE_SIZE_FP16_SMALL_K: usize = 16;
+const COL_TILE_SIZE_FP16_LARGE_K: usize = 32;
+
+fn fp16ColTileSize(k_dim: usize) usize {
+    if (k_dim <= 2048) {
+        return COL_TILE_SIZE_FP16_SMALL_K;
+    }
+    return COL_TILE_SIZE_FP16_LARGE_K;
+}
 
 /// Batch size threshold: above this, parallelize over rows only.
 /// Below this, use tiled row+column parallelization for better load balance.
@@ -115,6 +126,197 @@ pub fn matmulKernel(weight_dtype: DType) !DispatchedKernel {
 pub fn matmulAuto(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulScratch) !void {
     const dispatched = try matmulKernel(b.dtype);
     dispatched.func(a, b, out, scratch);
+}
+
+const has_lm_head_decode_avx512 = builtin.cpu.arch == .x86_64 and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f);
+
+/// BF16 logits projection over one or more hidden rows.
+///
+/// This is the canonical CPU logits path for BF16 `lm_head` weights.
+/// `row_count` is data, not a mode split at the inference layer.
+pub fn matmulLmHeadRowsBf16(
+    hidden_rows: []const f32,
+    row_count: usize,
+    weight: *const Tensor,
+    logits_out: []f32,
+    logits_scaling: f32,
+    scratch: *MatmulScratch,
+) void {
+    std.debug.assert(weight.dtype == .bf16 and weight.n_dims == 2);
+    const n_cols: usize = @intCast(weight.shape[0]);
+    const k_dim: usize = @intCast(weight.shape[1]);
+    std.debug.assert(hidden_rows.len >= row_count * k_dim);
+    std.debug.assert(logits_out.len >= row_count * n_cols);
+
+    if (row_count != 1) {
+        var hidden_view = Tensor.view2DSlice(@constCast(hidden_rows), row_count, k_dim);
+        var logits_view = Tensor.view2DSlice(logits_out[0 .. row_count * n_cols], row_count, n_cols);
+        matmulBF16(&hidden_view, weight, &logits_view, scratch);
+        if (logits_scaling != 1.0) {
+            rowwise.scaleInPlaceReciprocal(logits_out[0 .. row_count * n_cols], logits_scaling);
+        }
+        return;
+    }
+
+    const input_row = hidden_rows[0..k_dim];
+    const output_row = logits_out[0..n_cols];
+
+    if (!has_lm_head_decode_avx512) {
+        var hidden_view = Tensor.view2DSlice(@constCast(input_row), 1, k_dim);
+        var logits_view = Tensor.view2DSlice(output_row, 1, n_cols);
+        matmulBF16(&hidden_view, weight, &logits_view, scratch);
+        if (logits_scaling != 1.0) {
+            rowwise.scaleInPlaceReciprocal(output_row, logits_scaling);
+        }
+        return;
+    }
+
+    const reciprocal: f32 = if (logits_scaling != 1.0) 1.0 / logits_scaling else 1.0;
+    const b_data = weight.asSliceUnaligned(u16);
+
+    const DecodeLmHeadCtx = struct {
+        input: []const f32,
+        weight: []align(1) const u16,
+        output: []f32,
+        n_cols: usize,
+        k_dim: usize,
+        reciprocal: f32,
+    };
+    var context = DecodeLmHeadCtx{
+        .input = input_row,
+        .weight = b_data,
+        .output = output_row,
+        .n_cols = n_cols,
+        .k_dim = k_dim,
+        .reciprocal = reciprocal,
+    };
+
+    const decode_task = struct {
+        fn runDecodeCols(start: usize, end: usize, task_ctx: *DecodeLmHeadCtx) void {
+            const VecF32 = @Vector(16, f32);
+            const VecU16 = @Vector(16, u16);
+            const Shift = @Vector(16, u5);
+            const shift16: Shift = @splat(16);
+
+            const k_len = task_ctx.k_dim;
+            const b_base = task_ctx.weight;
+            const a_row = task_ctx.input;
+            const out_row = task_ctx.output[0..task_ctx.n_cols];
+
+            var col_idx = start;
+
+            while (col_idx + 4 <= end) : (col_idx += 4) {
+                const b0 = b_base[col_idx * k_len ..][0..k_len];
+                const b1 = b_base[(col_idx + 1) * k_len ..][0..k_len];
+                const b2 = b_base[(col_idx + 2) * k_len ..][0..k_len];
+                const b3 = b_base[(col_idx + 3) * k_len ..][0..k_len];
+
+                var acc0: VecF32 = @splat(0);
+                var acc1: VecF32 = @splat(0);
+                var acc2: VecF32 = @splat(0);
+                var acc3: VecF32 = @splat(0);
+
+                var k_idx: usize = 0;
+                while (k_idx + 32 <= k_len) : (k_idx += 32) {
+                    const a_vec: VecF32 = a_row[k_idx..][0..16].*;
+                    const a_vec_next: VecF32 = a_row[k_idx + 16 ..][0..16].*;
+                    @prefetch(@as([*]const u8, @ptrCast(b0.ptr + k_idx + 128)), .{ .locality = 3 });
+                    @prefetch(@as([*]const u8, @ptrCast(b1.ptr + k_idx + 128)), .{ .locality = 3 });
+                    @prefetch(@as([*]const u8, @ptrCast(b2.ptr + k_idx + 128)), .{ .locality = 3 });
+                    @prefetch(@as([*]const u8, @ptrCast(b3.ptr + k_idx + 128)), .{ .locality = 3 });
+
+                    const w0_u16: VecU16 = b0[k_idx..][0..16].*;
+                    const w1_u16: VecU16 = b1[k_idx..][0..16].*;
+                    const w2_u16: VecU16 = b2[k_idx..][0..16].*;
+                    const w3_u16: VecU16 = b3[k_idx..][0..16].*;
+                    const w0_u16_next: VecU16 = b0[k_idx + 16 ..][0..16].*;
+                    const w1_u16_next: VecU16 = b1[k_idx + 16 ..][0..16].*;
+                    const w2_u16_next: VecU16 = b2[k_idx + 16 ..][0..16].*;
+                    const w3_u16_next: VecU16 = b3[k_idx + 16 ..][0..16].*;
+
+                    const w0: VecF32 = @bitCast(@as(@Vector(16, u32), w0_u16) << shift16);
+                    const w1: VecF32 = @bitCast(@as(@Vector(16, u32), w1_u16) << shift16);
+                    const w2: VecF32 = @bitCast(@as(@Vector(16, u32), w2_u16) << shift16);
+                    const w3: VecF32 = @bitCast(@as(@Vector(16, u32), w3_u16) << shift16);
+                    const w0_next: VecF32 = @bitCast(@as(@Vector(16, u32), w0_u16_next) << shift16);
+                    const w1_next: VecF32 = @bitCast(@as(@Vector(16, u32), w1_u16_next) << shift16);
+                    const w2_next: VecF32 = @bitCast(@as(@Vector(16, u32), w2_u16_next) << shift16);
+                    const w3_next: VecF32 = @bitCast(@as(@Vector(16, u32), w3_u16_next) << shift16);
+
+                    acc0 = @mulAdd(VecF32, a_vec, w0, acc0);
+                    acc1 = @mulAdd(VecF32, a_vec, w1, acc1);
+                    acc2 = @mulAdd(VecF32, a_vec, w2, acc2);
+                    acc3 = @mulAdd(VecF32, a_vec, w3, acc3);
+                    acc0 = @mulAdd(VecF32, a_vec_next, w0_next, acc0);
+                    acc1 = @mulAdd(VecF32, a_vec_next, w1_next, acc1);
+                    acc2 = @mulAdd(VecF32, a_vec_next, w2_next, acc2);
+                    acc3 = @mulAdd(VecF32, a_vec_next, w3_next, acc3);
+                }
+
+                while (k_idx + 16 <= k_len) : (k_idx += 16) {
+                    const a_vec: VecF32 = a_row[k_idx..][0..16].*;
+                    @prefetch(@as([*]const u8, @ptrCast(b0.ptr + k_idx + 64)), .{ .locality = 3 });
+                    @prefetch(@as([*]const u8, @ptrCast(b1.ptr + k_idx + 64)), .{ .locality = 3 });
+                    @prefetch(@as([*]const u8, @ptrCast(b2.ptr + k_idx + 64)), .{ .locality = 3 });
+                    @prefetch(@as([*]const u8, @ptrCast(b3.ptr + k_idx + 64)), .{ .locality = 3 });
+
+                    const w0_u16: VecU16 = b0[k_idx..][0..16].*;
+                    const w1_u16: VecU16 = b1[k_idx..][0..16].*;
+                    const w2_u16: VecU16 = b2[k_idx..][0..16].*;
+                    const w3_u16: VecU16 = b3[k_idx..][0..16].*;
+
+                    const w0: VecF32 = @bitCast(@as(@Vector(16, u32), w0_u16) << shift16);
+                    const w1: VecF32 = @bitCast(@as(@Vector(16, u32), w1_u16) << shift16);
+                    const w2: VecF32 = @bitCast(@as(@Vector(16, u32), w2_u16) << shift16);
+                    const w3: VecF32 = @bitCast(@as(@Vector(16, u32), w3_u16) << shift16);
+
+                    acc0 = @mulAdd(VecF32, a_vec, w0, acc0);
+                    acc1 = @mulAdd(VecF32, a_vec, w1, acc1);
+                    acc2 = @mulAdd(VecF32, a_vec, w2, acc2);
+                    acc3 = @mulAdd(VecF32, a_vec, w3, acc3);
+                }
+
+                var sum0 = @reduce(.Add, acc0);
+                var sum1 = @reduce(.Add, acc1);
+                var sum2 = @reduce(.Add, acc2);
+                var sum3 = @reduce(.Add, acc3);
+                while (k_idx < k_len) : (k_idx += 1) {
+                    const a_val = a_row[k_idx];
+                    sum0 += a_val * bf16ToF32(b0[k_idx]);
+                    sum1 += a_val * bf16ToF32(b1[k_idx]);
+                    sum2 += a_val * bf16ToF32(b2[k_idx]);
+                    sum3 += a_val * bf16ToF32(b3[k_idx]);
+                }
+
+                out_row[col_idx] = sum0 * task_ctx.reciprocal;
+                out_row[col_idx + 1] = sum1 * task_ctx.reciprocal;
+                out_row[col_idx + 2] = sum2 * task_ctx.reciprocal;
+                out_row[col_idx + 3] = sum3 * task_ctx.reciprocal;
+            }
+
+            while (col_idx < end) : (col_idx += 1) {
+                const b_row = b_base[col_idx * k_len ..][0..k_len];
+                var acc: VecF32 = @splat(0);
+                var k_idx: usize = 0;
+
+                while (k_idx + 16 <= k_len) : (k_idx += 16) {
+                    const a_vec: VecF32 = a_row[k_idx..][0..16].*;
+                    const w_u16: VecU16 = b_row[k_idx..][0..16].*;
+                    const w_vec: VecF32 = @bitCast(@as(@Vector(16, u32), w_u16) << shift16);
+                    acc = @mulAdd(VecF32, a_vec, w_vec, acc);
+                }
+
+                var sum = @reduce(.Add, acc);
+                while (k_idx < k_len) : (k_idx += 1) {
+                    sum += a_row[k_idx] * bf16ToF32(b_row[k_idx]);
+                }
+                out_row[col_idx] = sum * task_ctx.reciprocal;
+            }
+        }
+    }.runDecodeCols;
+
+    parallel.global().parallelFor(n_cols, decode_task, &context);
 }
 
 pub fn matmulF32(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulScratch) void {
@@ -451,16 +653,12 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
                 var acc3: @Vector(VEC, f32) = @splat(0);
 
                 var k_idx: usize = 0;
-                // Main SIMD loop - process all 4 columns with shared activation load
                 while (k_idx + VEC <= k_len) : (k_idx += VEC) {
                     const a_vec: @Vector(VEC, f32) = a_row[k_idx..][0..VEC].*;
-
-                    // Prefetch next cache lines
                     @prefetch(@as([*]const u8, @ptrCast(b0.ptr + k_idx + 64)), .{ .locality = 3 });
                     @prefetch(@as([*]const u8, @ptrCast(b1.ptr + k_idx + 64)), .{ .locality = 3 });
                     @prefetch(@as([*]const u8, @ptrCast(b2.ptr + k_idx + 64)), .{ .locality = 3 });
                     @prefetch(@as([*]const u8, @ptrCast(b3.ptr + k_idx + 64)), .{ .locality = 3 });
-
                     const w0: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b0[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
                     const w1: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b1[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
                     const w2: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b2[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
@@ -518,104 +716,264 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
         // Decode: parallelize over output columns.
         parallel.global().parallelFor(n_cols, decode_task, &context);
     } else {
-        // Prefill/batch: tile over rows * columns
-        // Use smaller tiles for BF16 to keep weights in L1 cache (memory-bound workload)
-        const tile_size = COL_TILE_SIZE_FP16;
+        // Prefill/batch: tile over columns and reuse each loaded BF16 weight row
+        // across several activation rows before moving on. Wide FFN projections are
+        // limited by weight traffic, so row×column tiling throws away the only reuse
+        // that matters here.
+        const tile_size = fp16ColTileSize(k_dim);
         const tiles_per_row = (n_cols + tile_size - 1) / tile_size;
-        const total_tiles = m_rows * tiles_per_row;
 
         const tiled_task = struct {
-            fn runRowColTiles(start: usize, end: usize, task_ctx: *MatmulBF16Ctx) void {
+            fn runColTiles(start: usize, end: usize, task_ctx: *MatmulBF16Ctx) void {
                 const k_len = task_ctx.k_dim;
                 const n_len = task_ctx.n_cols;
-                const tile_size_local = COL_TILE_SIZE_FP16;
-                const tiles_per_row_local = (n_len + tile_size_local - 1) / tile_size_local;
+                const tile_size_local = fp16ColTileSize(k_len);
                 const VEC = simd.f32_vec_len;
+                const ROW_BLOCK = 4;
                 const b_base = task_ctx.b;
 
-                for (start..end) |tile_idx| {
-                    const row = tile_idx / tiles_per_row_local;
-                    const col_tile = tile_idx % tiles_per_row_local;
+                for (start..end) |col_tile| {
                     const col_start = col_tile * tile_size_local;
                     const col_end = @min(col_start + tile_size_local, n_len);
 
-                    const a_row = task_ctx.a[row * k_len ..][0..k_len];
-                    const out_row = task_ctx.c[row * n_len ..][0..n_len];
+                    var row: usize = 0;
+                    while (row + ROW_BLOCK <= task_ctx.m_rows) : (row += ROW_BLOCK) {
+                        const a0 = task_ctx.a[(row + 0) * k_len ..][0..k_len];
+                        const a1 = task_ctx.a[(row + 1) * k_len ..][0..k_len];
+                        const a2 = task_ctx.a[(row + 2) * k_len ..][0..k_len];
+                        const a3 = task_ctx.a[(row + 3) * k_len ..][0..k_len];
+                        const out0 = task_ctx.c[(row + 0) * n_len ..][0..n_len];
+                        const out1 = task_ctx.c[(row + 1) * n_len ..][0..n_len];
+                        const out2 = task_ctx.c[(row + 2) * n_len ..][0..n_len];
+                        const out3 = task_ctx.c[(row + 3) * n_len ..][0..n_len];
 
-                    var col_idx = col_start;
+                        var col_idx = col_start;
+                        while (col_idx + 4 <= col_end) : (col_idx += 4) {
+                            const b0 = b_base[col_idx * k_len ..][0..k_len];
+                            const b1 = b_base[(col_idx + 1) * k_len ..][0..k_len];
+                            const b2 = b_base[(col_idx + 2) * k_len ..][0..k_len];
+                            const b3 = b_base[(col_idx + 3) * k_len ..][0..k_len];
 
-                    // Process 4 columns at a time for better ILP
-                    while (col_idx + 4 <= col_end) : (col_idx += 4) {
-                        const b0 = b_base[col_idx * k_len ..][0..k_len];
-                        const b1 = b_base[(col_idx + 1) * k_len ..][0..k_len];
-                        const b2 = b_base[(col_idx + 2) * k_len ..][0..k_len];
-                        const b3 = b_base[(col_idx + 3) * k_len ..][0..k_len];
+                            var acc00: @Vector(VEC, f32) = @splat(0);
+                            var acc01: @Vector(VEC, f32) = @splat(0);
+                            var acc02: @Vector(VEC, f32) = @splat(0);
+                            var acc03: @Vector(VEC, f32) = @splat(0);
+                            var acc10: @Vector(VEC, f32) = @splat(0);
+                            var acc11: @Vector(VEC, f32) = @splat(0);
+                            var acc12: @Vector(VEC, f32) = @splat(0);
+                            var acc13: @Vector(VEC, f32) = @splat(0);
+                            var acc20: @Vector(VEC, f32) = @splat(0);
+                            var acc21: @Vector(VEC, f32) = @splat(0);
+                            var acc22: @Vector(VEC, f32) = @splat(0);
+                            var acc23: @Vector(VEC, f32) = @splat(0);
+                            var acc30: @Vector(VEC, f32) = @splat(0);
+                            var acc31: @Vector(VEC, f32) = @splat(0);
+                            var acc32: @Vector(VEC, f32) = @splat(0);
+                            var acc33: @Vector(VEC, f32) = @splat(0);
 
-                        var acc0: @Vector(VEC, f32) = @splat(0);
-                        var acc1: @Vector(VEC, f32) = @splat(0);
-                        var acc2: @Vector(VEC, f32) = @splat(0);
-                        var acc3: @Vector(VEC, f32) = @splat(0);
+                            var k_idx: usize = 0;
+                            while (k_idx + VEC <= k_len) : (k_idx += VEC) {
+                                const a0_vec: @Vector(VEC, f32) = a0[k_idx..][0..VEC].*;
+                                const a1_vec: @Vector(VEC, f32) = a1[k_idx..][0..VEC].*;
+                                const a2_vec: @Vector(VEC, f32) = a2[k_idx..][0..VEC].*;
+                                const a3_vec: @Vector(VEC, f32) = a3[k_idx..][0..VEC].*;
 
-                        var k_idx: usize = 0;
-                        while (k_idx + VEC <= k_len) : (k_idx += VEC) {
-                            const a_vec: @Vector(VEC, f32) = a_row[k_idx..][0..VEC].*;
+                                @prefetch(@as([*]const u8, @ptrCast(b0.ptr + k_idx + 64)), .{ .locality = 3 });
+                                const w0: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b0[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
+                                const w1: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b1[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
+                                const w2: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b2[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
+                                const w3: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b3[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
 
-                            @prefetch(@as([*]const u8, @ptrCast(b0.ptr + k_idx + 64)), .{ .locality = 3 });
+                                acc00 = @mulAdd(@Vector(VEC, f32), a0_vec, w0, acc00);
+                                acc01 = @mulAdd(@Vector(VEC, f32), a0_vec, w1, acc01);
+                                acc02 = @mulAdd(@Vector(VEC, f32), a0_vec, w2, acc02);
+                                acc03 = @mulAdd(@Vector(VEC, f32), a0_vec, w3, acc03);
+                                acc10 = @mulAdd(@Vector(VEC, f32), a1_vec, w0, acc10);
+                                acc11 = @mulAdd(@Vector(VEC, f32), a1_vec, w1, acc11);
+                                acc12 = @mulAdd(@Vector(VEC, f32), a1_vec, w2, acc12);
+                                acc13 = @mulAdd(@Vector(VEC, f32), a1_vec, w3, acc13);
+                                acc20 = @mulAdd(@Vector(VEC, f32), a2_vec, w0, acc20);
+                                acc21 = @mulAdd(@Vector(VEC, f32), a2_vec, w1, acc21);
+                                acc22 = @mulAdd(@Vector(VEC, f32), a2_vec, w2, acc22);
+                                acc23 = @mulAdd(@Vector(VEC, f32), a2_vec, w3, acc23);
+                                acc30 = @mulAdd(@Vector(VEC, f32), a3_vec, w0, acc30);
+                                acc31 = @mulAdd(@Vector(VEC, f32), a3_vec, w1, acc31);
+                                acc32 = @mulAdd(@Vector(VEC, f32), a3_vec, w2, acc32);
+                                acc33 = @mulAdd(@Vector(VEC, f32), a3_vec, w3, acc33);
+                            }
 
-                            const w0: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b0[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
-                            const w1: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b1[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
-                            const w2: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b2[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
-                            const w3: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b3[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
+                            var sum00 = @reduce(.Add, acc00);
+                            var sum01 = @reduce(.Add, acc01);
+                            var sum02 = @reduce(.Add, acc02);
+                            var sum03 = @reduce(.Add, acc03);
+                            var sum10 = @reduce(.Add, acc10);
+                            var sum11 = @reduce(.Add, acc11);
+                            var sum12 = @reduce(.Add, acc12);
+                            var sum13 = @reduce(.Add, acc13);
+                            var sum20 = @reduce(.Add, acc20);
+                            var sum21 = @reduce(.Add, acc21);
+                            var sum22 = @reduce(.Add, acc22);
+                            var sum23 = @reduce(.Add, acc23);
+                            var sum30 = @reduce(.Add, acc30);
+                            var sum31 = @reduce(.Add, acc31);
+                            var sum32 = @reduce(.Add, acc32);
+                            var sum33 = @reduce(.Add, acc33);
 
-                            acc0 = @mulAdd(@Vector(VEC, f32), a_vec, w0, acc0);
-                            acc1 = @mulAdd(@Vector(VEC, f32), a_vec, w1, acc1);
-                            acc2 = @mulAdd(@Vector(VEC, f32), a_vec, w2, acc2);
-                            acc3 = @mulAdd(@Vector(VEC, f32), a_vec, w3, acc3);
+                            while (k_idx < k_len) : (k_idx += 1) {
+                                const w0 = bf16ToF32(b0[k_idx]);
+                                const w1 = bf16ToF32(b1[k_idx]);
+                                const w2 = bf16ToF32(b2[k_idx]);
+                                const w3 = bf16ToF32(b3[k_idx]);
+                                const a0v = a0[k_idx];
+                                const a1v = a1[k_idx];
+                                const a2v = a2[k_idx];
+                                const a3v = a3[k_idx];
+
+                                sum00 += a0v * w0;
+                                sum01 += a0v * w1;
+                                sum02 += a0v * w2;
+                                sum03 += a0v * w3;
+                                sum10 += a1v * w0;
+                                sum11 += a1v * w1;
+                                sum12 += a1v * w2;
+                                sum13 += a1v * w3;
+                                sum20 += a2v * w0;
+                                sum21 += a2v * w1;
+                                sum22 += a2v * w2;
+                                sum23 += a2v * w3;
+                                sum30 += a3v * w0;
+                                sum31 += a3v * w1;
+                                sum32 += a3v * w2;
+                                sum33 += a3v * w3;
+                            }
+
+                            out0[col_idx] = sum00;
+                            out0[col_idx + 1] = sum01;
+                            out0[col_idx + 2] = sum02;
+                            out0[col_idx + 3] = sum03;
+                            out1[col_idx] = sum10;
+                            out1[col_idx + 1] = sum11;
+                            out1[col_idx + 2] = sum12;
+                            out1[col_idx + 3] = sum13;
+                            out2[col_idx] = sum20;
+                            out2[col_idx + 1] = sum21;
+                            out2[col_idx + 2] = sum22;
+                            out2[col_idx + 3] = sum23;
+                            out3[col_idx] = sum30;
+                            out3[col_idx + 1] = sum31;
+                            out3[col_idx + 2] = sum32;
+                            out3[col_idx + 3] = sum33;
                         }
 
-                        var sum0 = @reduce(.Add, acc0);
-                        var sum1 = @reduce(.Add, acc1);
-                        var sum2 = @reduce(.Add, acc2);
-                        var sum3 = @reduce(.Add, acc3);
+                        while (col_idx < col_end) : (col_idx += 1) {
+                            const b_row = b_base[col_idx * k_len ..][0..k_len];
+                            var acc0: @Vector(VEC, f32) = @splat(0);
+                            var acc1: @Vector(VEC, f32) = @splat(0);
+                            var acc2: @Vector(VEC, f32) = @splat(0);
+                            var acc3: @Vector(VEC, f32) = @splat(0);
+                            var k_idx: usize = 0;
 
-                        while (k_idx < k_len) : (k_idx += 1) {
-                            const a_val = a_row[k_idx];
-                            sum0 += a_val * bf16ToF32(b0[k_idx]);
-                            sum1 += a_val * bf16ToF32(b1[k_idx]);
-                            sum2 += a_val * bf16ToF32(b2[k_idx]);
-                            sum3 += a_val * bf16ToF32(b3[k_idx]);
+                            while (k_idx + VEC <= k_len) : (k_idx += VEC) {
+                                const w_u16: @Vector(VEC, u16) = b_row[k_idx..][0..VEC].*;
+                                const w_vec: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), w_u16) << @as(@Vector(VEC, u5), @splat(16)));
+                                acc0 = @mulAdd(@Vector(VEC, f32), a0[k_idx..][0..VEC].*, w_vec, acc0);
+                                acc1 = @mulAdd(@Vector(VEC, f32), a1[k_idx..][0..VEC].*, w_vec, acc1);
+                                acc2 = @mulAdd(@Vector(VEC, f32), a2[k_idx..][0..VEC].*, w_vec, acc2);
+                                acc3 = @mulAdd(@Vector(VEC, f32), a3[k_idx..][0..VEC].*, w_vec, acc3);
+                            }
+
+                            var sum0 = @reduce(.Add, acc0);
+                            var sum1 = @reduce(.Add, acc1);
+                            var sum2 = @reduce(.Add, acc2);
+                            var sum3 = @reduce(.Add, acc3);
+                            while (k_idx < k_len) : (k_idx += 1) {
+                                const w = bf16ToF32(b_row[k_idx]);
+                                sum0 += a0[k_idx] * w;
+                                sum1 += a1[k_idx] * w;
+                                sum2 += a2[k_idx] * w;
+                                sum3 += a3[k_idx] * w;
+                            }
+                            out0[col_idx] = sum0;
+                            out1[col_idx] = sum1;
+                            out2[col_idx] = sum2;
+                            out3[col_idx] = sum3;
                         }
-
-                        out_row[col_idx] = sum0;
-                        out_row[col_idx + 1] = sum1;
-                        out_row[col_idx + 2] = sum2;
-                        out_row[col_idx + 3] = sum3;
                     }
 
-                    // Handle remaining columns
-                    while (col_idx < col_end) : (col_idx += 1) {
-                        const b_row = b_base[col_idx * k_len ..][0..k_len];
-                        var acc: @Vector(VEC, f32) = @splat(0);
-                        var k_idx: usize = 0;
+                    while (row < task_ctx.m_rows) : (row += 1) {
+                        const a_row = task_ctx.a[row * k_len ..][0..k_len];
+                        const out_row = task_ctx.c[row * n_len ..][0..n_len];
+                        var col_idx = col_start;
 
-                        while (k_idx + VEC <= k_len) : (k_idx += VEC) {
-                            const a_vec: @Vector(VEC, f32) = a_row[k_idx..][0..VEC].*;
-                            const b_u16: @Vector(VEC, u16) = b_row[k_idx..][0..VEC].*;
-                            const b_vec: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b_u16) << @as(@Vector(VEC, u5), @splat(16)));
-                            acc = @mulAdd(@Vector(VEC, f32), a_vec, b_vec, acc);
+                        while (col_idx + 4 <= col_end) : (col_idx += 4) {
+                            const b0 = b_base[col_idx * k_len ..][0..k_len];
+                            const b1 = b_base[(col_idx + 1) * k_len ..][0..k_len];
+                            const b2 = b_base[(col_idx + 2) * k_len ..][0..k_len];
+                            const b3 = b_base[(col_idx + 3) * k_len ..][0..k_len];
+
+                            var acc0: @Vector(VEC, f32) = @splat(0);
+                            var acc1: @Vector(VEC, f32) = @splat(0);
+                            var acc2: @Vector(VEC, f32) = @splat(0);
+                            var acc3: @Vector(VEC, f32) = @splat(0);
+
+                            var k_idx: usize = 0;
+                            while (k_idx + VEC <= k_len) : (k_idx += VEC) {
+                                const a_vec: @Vector(VEC, f32) = a_row[k_idx..][0..VEC].*;
+                                @prefetch(@as([*]const u8, @ptrCast(b0.ptr + k_idx + 64)), .{ .locality = 3 });
+                                const w0: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b0[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
+                                const w1: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b1[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
+                                const w2: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b2[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
+                                const w3: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b3[k_idx..][0..VEC].*) << @as(@Vector(VEC, u5), @splat(16)));
+
+                                acc0 = @mulAdd(@Vector(VEC, f32), a_vec, w0, acc0);
+                                acc1 = @mulAdd(@Vector(VEC, f32), a_vec, w1, acc1);
+                                acc2 = @mulAdd(@Vector(VEC, f32), a_vec, w2, acc2);
+                                acc3 = @mulAdd(@Vector(VEC, f32), a_vec, w3, acc3);
+                            }
+
+                            var sum0 = @reduce(.Add, acc0);
+                            var sum1 = @reduce(.Add, acc1);
+                            var sum2 = @reduce(.Add, acc2);
+                            var sum3 = @reduce(.Add, acc3);
+
+                            while (k_idx < k_len) : (k_idx += 1) {
+                                const a_val = a_row[k_idx];
+                                sum0 += a_val * bf16ToF32(b0[k_idx]);
+                                sum1 += a_val * bf16ToF32(b1[k_idx]);
+                                sum2 += a_val * bf16ToF32(b2[k_idx]);
+                                sum3 += a_val * bf16ToF32(b3[k_idx]);
+                            }
+
+                            out_row[col_idx] = sum0;
+                            out_row[col_idx + 1] = sum1;
+                            out_row[col_idx + 2] = sum2;
+                            out_row[col_idx + 3] = sum3;
                         }
 
-                        var sum = @reduce(.Add, acc);
-                        while (k_idx < k_len) : (k_idx += 1) {
-                            sum += a_row[k_idx] * bf16ToF32(b_row[k_idx]);
+                        while (col_idx < col_end) : (col_idx += 1) {
+                            const b_row = b_base[col_idx * k_len ..][0..k_len];
+                            var acc: @Vector(VEC, f32) = @splat(0);
+                            var k_idx: usize = 0;
+
+                            while (k_idx + VEC <= k_len) : (k_idx += VEC) {
+                                const a_vec: @Vector(VEC, f32) = a_row[k_idx..][0..VEC].*;
+                                const b_u16: @Vector(VEC, u16) = b_row[k_idx..][0..VEC].*;
+                                const b_vec: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b_u16) << @as(@Vector(VEC, u5), @splat(16)));
+                                acc = @mulAdd(@Vector(VEC, f32), a_vec, b_vec, acc);
+                            }
+
+                            var sum = @reduce(.Add, acc);
+                            while (k_idx < k_len) : (k_idx += 1) {
+                                sum += a_row[k_idx] * bf16ToF32(b_row[k_idx]);
+                            }
+                            out_row[col_idx] = sum;
                         }
-                        out_row[col_idx] = sum;
                     }
                 }
             }
-        }.runRowColTiles;
+        }.runColTiles;
 
-        parallel.global().parallelFor(total_tiles, tiled_task, &context);
+        parallel.global().parallelFor(tiles_per_row, tiled_task, &context);
     }
 }
 
@@ -700,7 +1058,7 @@ fn matmulF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulS
     } else {
         // Prefill/batch: tile over rows * columns
         // Use smaller tiles for F16 to keep weights in L1 cache (memory-bound workload)
-        const tile_size = COL_TILE_SIZE_FP16;
+        const tile_size = fp16ColTileSize(k_dim);
         const tiles_per_row = (n_cols + tile_size - 1) / tile_size;
         const total_tiles = m_rows * tiles_per_row;
 
@@ -708,7 +1066,7 @@ fn matmulF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulS
             fn runRowColTiles(start: usize, end: usize, task_ctx: *MatmulF16Ctx) void {
                 const k_len = task_ctx.k_dim;
                 const n_len = task_ctx.n_cols;
-                const tile_size_local = COL_TILE_SIZE_FP16;
+                const tile_size_local = fp16ColTileSize(k_len);
                 const tiles_per_row_local = (n_len + tile_size_local - 1) / tile_size_local;
                 const VEC = simd.f32_vec_len;
                 const N = 4; // Increased unroll factor for better ILP
@@ -727,9 +1085,7 @@ fn matmulF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulS
                         var acc: [N]@Vector(VEC, f32) = .{@as(@Vector(VEC, f32), @splat(0))} ** N;
                         var k_idx: usize = 0;
 
-                        // Main loop with prefetch and 4x unroll
                         while (k_idx + N * VEC - 1 < k_len) : (k_idx += N * VEC) {
-                            // Prefetch next cache lines for weights
                             @prefetch(@as([*]const u8, @ptrCast(b_row.ptr + k_idx + N * VEC)), .{ .locality = 3 });
 
                             inline for (0..N) |vec_idx| {
@@ -752,7 +1108,6 @@ fn matmulF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulS
                         inline for (0..N) |vec_idx| total += acc[vec_idx];
                         var sum = @reduce(.Add, total);
 
-                        // Scalar tail
                         while (k_idx < k_len) : (k_idx += 1) {
                             sum += a_row[k_idx] * fp16ToF32(b_row[k_idx]);
                         }

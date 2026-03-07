@@ -463,7 +463,8 @@ test "talu_model_performance_hints returns qwen3_5 json" {
     try std.testing.expect(out_json != null);
     const payload = std.mem.span(out_json.?);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"bench_model\":\"qwen3_5\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"role.ffn_gate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"prefill.ffn_gate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"decode.ffn_gate\"") != null);
 }
 
 test "talu_model_performance_hints returns null for unknown architecture" {

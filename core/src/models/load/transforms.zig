@@ -639,7 +639,13 @@ pub fn orientEmbedding(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeT
         return error.MissingScales;
     }
 
-    return try ensureF32(allocator, embed_tensor);
+    // Keep dense embedding tables in their native dtype so tied-lm-head models
+    // can execute logits projection on native precision paths.
+    _ = allocator;
+    return switch (embed_tensor.dtype) {
+        .f32, .f16, .bf16 => embed_tensor,
+        else => error.UnexpectedDType,
+    };
 }
 
 pub fn convertToF32(allocator: std.mem.Allocator, t: Tensor) !Tensor {
@@ -1184,7 +1190,7 @@ test "orientWeight returns untransposed when rows equals expected_in" {
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), out[2], 1e-6);
 }
 
-test "orientEmbedding converts f16 embedding to f32" {
+test "orientEmbedding keeps f16 embedding dtype" {
     const allocator = std.testing.allocator;
     const writer = @import("../../io/safetensors/writer.zig");
 
@@ -1216,16 +1222,16 @@ test "orientEmbedding converts f16 embedding to f32" {
     config.d_model = 2; // embedding dimension
     const result = try orientEmbedding(arena_alloc.allocator(), &st, "embed", config);
 
-    try std.testing.expectEqual(DType.f32, result.dtype);
+    try std.testing.expectEqual(DType.f16, result.dtype);
     try std.testing.expectEqual(@as(u8, 2), result.n_dims);
     try std.testing.expectEqual(@as(i64, 4), result.shape[0]);
     try std.testing.expectEqual(@as(i64, 2), result.shape[1]);
 
-    const out = result.asSlice(f32);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[1], 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), out[2], 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), out[3], 1e-3);
+    const out = result.asSliceUnaligned(u16);
+    try std.testing.expectEqual(@as(u16, 0x3C00), out[0]);
+    try std.testing.expectEqual(@as(u16, 0x4000), out[1]);
+    try std.testing.expectEqual(@as(u16, 0x4200), out[2]);
+    try std.testing.expectEqual(@as(u16, 0x4400), out[3]);
 }
 
 test "orientEmbedding passes through f32 embedding unchanged" {

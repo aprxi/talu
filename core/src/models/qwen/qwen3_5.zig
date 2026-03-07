@@ -294,8 +294,10 @@ const qwen3_5_conversion_fusions = [_]types.ConversionFusion{
 
 const qwen3_5_perf_hints = perf.PerfHints{
     .bench_model = "qwen3_5",
-    .point_mappings = perf.standard_attention_mlp_point_mappings[0..],
-    .hidden_rows = perf.qwen3_5_hidden_rows[0..],
+    .prefill_point_mappings = perf.standard_attention_mlp_prefill_point_mappings[0..],
+    .decode_point_mappings = perf.qwen3_5_decode_point_mappings[0..],
+    .prefill_hidden_rows = perf.qwen3_5_hidden_rows[0..],
+    .decode_hidden_rows = perf.qwen3_5_hidden_rows[0..],
     .role_dims = perf.qwen3_5_role_dims[0..],
 };
 

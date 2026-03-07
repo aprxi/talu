@@ -8,12 +8,28 @@ const harness = @import("harness.zig");
 
 pub const Scenario = enum {
     all,
-    role_attn_q_bf16,
-    role_attn_k_bf16,
-    role_attn_v_bf16,
-    role_attn_out_bf16,
-    role_ffn_gate_bf16,
-    role_ffn_down_bf16,
+    prefill_attn_q_bf16,
+    prefill_attn_k_bf16,
+    prefill_attn_v_bf16,
+    prefill_attn_out_bf16,
+    prefill_ffn_gate_bf16,
+    prefill_ffn_down_bf16,
+    decode_attn_q_bf16,
+    decode_attn_k_bf16,
+    decode_attn_v_bf16,
+    decode_attn_out_bf16,
+    decode_ffn_gate_bf16,
+    decode_ffn_down_bf16,
+    decode_lm_head_bf16,
+    decode_lm_head_f16,
+    decode_lm_head_f32,
+    decode_lm_head_runtime_f32,
+    prefill_layer_attn_norm_f32,
+    prefill_layer_ffn_norm_f32,
+    prefill_final_norm_f32,
+    decode_layer_attn_norm_f32,
+    decode_layer_ffn_norm_f32,
+    decode_final_norm_f32,
     gated_delta_conv_f32,
     gated_delta_qk_norm_f32,
     gated_delta_step_f32,
@@ -74,13 +90,33 @@ pub const ScenarioResult = struct {
 
 fn sampleLoops(which: Scenario, profile: Profile) usize {
     return switch (which) {
-        .role_attn_k_bf16, .role_attn_v_bf16 => switch (profile) {
+        .prefill_attn_k_bf16, .prefill_attn_v_bf16 => switch (profile) {
             .ci => 32,
             .bw => 16,
         },
-        .role_attn_q_bf16, .role_attn_out_bf16, .role_ffn_gate_bf16, .role_ffn_down_bf16 => switch (profile) {
+        .prefill_attn_q_bf16, .prefill_attn_out_bf16, .prefill_ffn_gate_bf16, .prefill_ffn_down_bf16 => switch (profile) {
             .ci => 8,
             .bw => 4,
+        },
+        .decode_attn_k_bf16, .decode_attn_v_bf16 => switch (profile) {
+            .ci => 256,
+            .bw => 128,
+        },
+        .decode_attn_q_bf16, .decode_attn_out_bf16, .decode_ffn_gate_bf16, .decode_ffn_down_bf16 => switch (profile) {
+            .ci => 128,
+            .bw => 64,
+        },
+        .decode_lm_head_bf16, .decode_lm_head_f16, .decode_lm_head_f32, .decode_lm_head_runtime_f32 => switch (profile) {
+            .ci => 1,
+            .bw => 1,
+        },
+        .prefill_layer_attn_norm_f32, .prefill_layer_ffn_norm_f32, .prefill_final_norm_f32 => switch (profile) {
+            .ci => 64,
+            .bw => 32,
+        },
+        .decode_layer_attn_norm_f32, .decode_layer_ffn_norm_f32, .decode_final_norm_f32 => switch (profile) {
+            .ci => 512,
+            .bw => 256,
         },
         .add_f32, .mul_f32 => switch (profile) {
             .ci => 128,
@@ -158,17 +194,33 @@ const RoleMatmulDims = struct {
 
 fn roleBenchRowName(which: Scenario) ![]const u8 {
     return switch (which) {
-        .role_attn_q_bf16 => "role.attn_q",
-        .role_attn_k_bf16 => "role.attn_k",
-        .role_attn_v_bf16 => "role.attn_v",
-        .role_attn_out_bf16 => "role.attn_out",
-        .role_ffn_gate_bf16 => "role.ffn_gate",
-        .role_ffn_down_bf16 => "role.ffn_down",
+        .prefill_attn_q_bf16 => "prefill.attn_q",
+        .prefill_attn_k_bf16 => "prefill.attn_k",
+        .prefill_attn_v_bf16 => "prefill.attn_v",
+        .prefill_attn_out_bf16 => "prefill.attn_out",
+        .prefill_ffn_gate_bf16 => "prefill.ffn_gate",
+        .prefill_ffn_down_bf16 => "prefill.ffn_down",
+        .decode_attn_q_bf16 => "decode.attn_q",
+        .decode_attn_k_bf16 => "decode.attn_k",
+        .decode_attn_v_bf16 => "decode.attn_v",
+        .decode_attn_out_bf16 => "decode.attn_out",
+        .decode_ffn_gate_bf16 => "decode.ffn_gate",
+        .decode_ffn_down_bf16 => "decode.ffn_down",
+        .decode_lm_head_bf16 => "decode.lm_head_bf16",
+        .decode_lm_head_f16 => "decode.lm_head_f16",
+        .decode_lm_head_f32 => "decode.lm_head_f32",
+        .decode_lm_head_runtime_f32 => "decode.lm_head_runtime_f32",
+        .prefill_layer_attn_norm_f32 => "prefill.layer_attn_norm",
+        .prefill_layer_ffn_norm_f32 => "prefill.layer_ffn_norm",
+        .prefill_final_norm_f32 => "prefill.final_norm",
+        .decode_layer_attn_norm_f32 => "decode.layer_attn_norm",
+        .decode_layer_ffn_norm_f32 => "decode.layer_ffn_norm",
+        .decode_final_norm_f32 => "decode.final_norm",
         else => error.InvalidArgument,
     };
 }
 
-fn modelRoleMatmulDims(model_id: []const u8, which: Scenario) !RoleMatmulDims {
+fn modelRoleDims(model_id: []const u8, which: Scenario) !RoleMatmulDims {
     const hints = models.performanceHintsByName(model_id) orelse return error.InvalidArgument;
     const bench_row = try roleBenchRowName(which);
     // Model-owned overrides win. Otherwise bench falls back to a shared
@@ -1475,7 +1527,7 @@ pub fn runMatmulThroughputF16(allocator: std.mem.Allocator, cfg: RunConfig) !Sce
 
 fn runRoleMatmulBf16(allocator: std.mem.Allocator, cfg: RunConfig, which: Scenario) !ScenarioResult {
     const model_id = cfg.model_id orelse return error.InvalidArgument;
-    const dims = try modelRoleMatmulDims(model_id, which);
+    const dims = try modelRoleDims(model_id, which);
     const repeats = sampleLoops(which, cfg.profile);
 
     var a = try tensor.OwnedTensor.init(allocator, .f32, &.{ dims.tokens, dims.hidden });
@@ -1492,7 +1544,84 @@ fn runRoleMatmulBf16(allocator: std.mem.Allocator, cfg: RunConfig, which: Scenar
     var out_view = out.view();
     var scratch = try cpu.matmul.MatmulScratch.init(allocator);
     defer scratch.deinit();
-    const dispatched = try cpu.matmul.matmulKernel(.bf16);
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..repeats) |_| {
+        if (which == .decode_lm_head_bf16) {
+            cpu.matmul.matmulLmHeadRowsBf16(a.asSlice(f32), 1, &b_view, out.asSlice(f32), 1.0, &scratch);
+        } else {
+            const dispatched = try cpu.matmul.matmulKernel(.bf16);
+            dispatched.func(&a_view, &b_view, &out_view, &scratch);
+        }
+    }
+    const cold_ns = timer.read();
+
+    for (0..cfg.warmup) |_| for (0..repeats) |_| {
+        if (which == .decode_lm_head_bf16) {
+            cpu.matmul.matmulLmHeadRowsBf16(a.asSlice(f32), 1, &b_view, out.asSlice(f32), 1.0, &scratch);
+        } else {
+            const dispatched = try cpu.matmul.matmulKernel(.bf16);
+            dispatched.func(&a_view, &b_view, &out_view, &scratch);
+        }
+    };
+    for (samples) |*sample| {
+        timer = std.time.Timer.start() catch unreachable;
+        for (0..repeats) |_| {
+            if (which == .decode_lm_head_bf16) {
+                cpu.matmul.matmulLmHeadRowsBf16(a.asSlice(f32), 1, &b_view, out.asSlice(f32), 1.0, &scratch);
+            } else {
+                const dispatched = try cpu.matmul.matmulKernel(.bf16);
+                dispatched.func(&a_view, &b_view, &out_view, &scratch);
+            }
+        }
+        sample.eval_ns = timer.read();
+    }
+
+    const flops: u64 = @intCast(2 * dims.tokens * dims.hidden * dims.out);
+    const bytes: u64 = @intCast(dims.tokens * dims.hidden * @sizeOf(f32) + dims.out * dims.hidden * @sizeOf(u16) + 2 * dims.tokens * dims.out * @sizeOf(f32));
+    return .{
+        .name = try roleBenchRowName(which),
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_ns = cold_ns,
+        .sample_loops = repeats,
+        .flops_per_iter = flops * repeats,
+        .bytes_per_iter = bytes * repeats,
+        .note = switch (which) {
+            .prefill_attn_q_bf16, .decode_attn_q_bf16 => "xray role: attn.q -> bf16 projection",
+            .prefill_attn_k_bf16, .decode_attn_k_bf16 => "xray role: attn.k -> bf16 projection",
+            .prefill_attn_v_bf16, .decode_attn_v_bf16 => "xray role: attn.v -> bf16 projection",
+            .prefill_attn_out_bf16, .decode_attn_out_bf16 => "xray role: attn.out -> bf16 projection",
+            .prefill_ffn_gate_bf16, .decode_ffn_gate_bf16 => "xray role: ffn.gate -> bf16 projection",
+            .prefill_ffn_down_bf16, .decode_ffn_down_bf16 => "xray role: ffn.down -> bf16 projection",
+            .decode_lm_head_bf16 => "xray role: lm_head -> bf16 logits projection",
+            else => unreachable,
+        },
+    };
+}
+
+fn runRoleMatmulF16(allocator: std.mem.Allocator, cfg: RunConfig, which: Scenario) !ScenarioResult {
+    const model_id = cfg.model_id orelse return error.InvalidArgument;
+    const dims = try modelRoleDims(model_id, which);
+    const repeats = sampleLoops(which, cfg.profile);
+
+    var a = try tensor.OwnedTensor.init(allocator, .f32, &.{ dims.tokens, dims.hidden });
+    defer a.deinit();
+    var b = try tensor.OwnedTensor.init(allocator, .f16, &.{ dims.out, dims.hidden });
+    defer b.deinit();
+    var out = try tensor.OwnedTensor.init(allocator, .f32, &.{ dims.tokens, dims.out });
+    defer out.deinit();
+    fillTensorF32(&a, 241);
+    fillU16SliceAsF16(b.asSlice(u16), 242);
+
+    var a_view = a.view();
+    var b_view = b.view();
+    var out_view = out.view();
+    var scratch = try cpu.matmul.MatmulScratch.init(allocator);
+    defer scratch.deinit();
+    const dispatched = try cpu.matmul.matmulKernel(.f16);
     const samples = try allocator.alloc(harness.Sample, cfg.iters);
     errdefer allocator.free(samples);
 
@@ -1518,39 +1647,249 @@ fn runRoleMatmulBf16(allocator: std.mem.Allocator, cfg: RunConfig, which: Scenar
         .flops_per_iter = flops * repeats,
         .bytes_per_iter = bytes * repeats,
         .note = switch (which) {
-            .role_attn_q_bf16 => "xray role: attn.q -> bf16 projection",
-            .role_attn_k_bf16 => "xray role: attn.k -> bf16 projection",
-            .role_attn_v_bf16 => "xray role: attn.v -> bf16 projection",
-            .role_attn_out_bf16 => "xray role: attn.out -> bf16 projection",
-            .role_ffn_gate_bf16 => "xray role: ffn.gate -> bf16 projection",
-            .role_ffn_down_bf16 => "xray role: ffn.down -> bf16 projection",
+            .decode_lm_head_f16 => "xray role: lm_head -> f16 logits projection",
             else => unreachable,
         },
     };
 }
 
-pub fn runRoleAttnQBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
-    return runRoleMatmulBf16(allocator, cfg, .role_attn_q_bf16);
+fn runRoleMatmulF32(allocator: std.mem.Allocator, cfg: RunConfig, which: Scenario) !ScenarioResult {
+    const model_id = cfg.model_id orelse return error.InvalidArgument;
+    const dims = try modelRoleDims(model_id, which);
+    const repeats = sampleLoops(which, cfg.profile);
+
+    var a = try tensor.OwnedTensor.init(allocator, .f32, &.{ dims.tokens, dims.hidden });
+    defer a.deinit();
+    var b = try tensor.OwnedTensor.init(allocator, .f32, &.{ dims.out, dims.hidden });
+    defer b.deinit();
+    var out = try tensor.OwnedTensor.init(allocator, .f32, &.{ dims.tokens, dims.out });
+    defer out.deinit();
+    fillTensorF32(&a, 341);
+    fillTensorF32(&b, 342);
+
+    var a_view = a.view();
+    var b_view = b.view();
+    var out_view = out.view();
+    var scratch = try cpu.matmul.MatmulScratch.init(allocator);
+    defer scratch.deinit();
+    const dispatched = try cpu.matmul.matmulKernel(.f32);
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..repeats) |_| dispatched.func(&a_view, &b_view, &out_view, &scratch);
+    const cold_ns = timer.read();
+
+    for (0..cfg.warmup) |_| for (0..repeats) |_| dispatched.func(&a_view, &b_view, &out_view, &scratch);
+    for (samples) |*sample| {
+        timer = std.time.Timer.start() catch unreachable;
+        for (0..repeats) |_| dispatched.func(&a_view, &b_view, &out_view, &scratch);
+        sample.eval_ns = timer.read();
+    }
+
+    const flops: u64 = @intCast(2 * dims.tokens * dims.hidden * dims.out);
+    const bytes: u64 = @intCast((dims.tokens * dims.hidden + dims.out * dims.hidden + 2 * dims.tokens * dims.out) * @sizeOf(f32));
+    return .{
+        .name = try roleBenchRowName(which),
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_ns = cold_ns,
+        .sample_loops = repeats,
+        .flops_per_iter = flops * repeats,
+        .bytes_per_iter = bytes * repeats,
+        .note = switch (which) {
+            .decode_lm_head_f32 => "xray role: lm_head -> f32 logits projection",
+            else => unreachable,
+        },
+    };
 }
 
-pub fn runRoleAttnKBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
-    return runRoleMatmulBf16(allocator, cfg, .role_attn_k_bf16);
+fn runRoleMatmulRuntimeF32(allocator: std.mem.Allocator, cfg: RunConfig, which: Scenario) !ScenarioResult {
+    const model_id = cfg.model_id orelse return error.InvalidArgument;
+    const dims = try modelRoleDims(model_id, which);
+    const repeats = sampleLoops(which, cfg.profile);
+
+    const hidden_rows = try allocFilledF32(allocator, dims.tokens * dims.hidden, 441);
+    defer allocator.free(hidden_rows);
+    const logits_out = try allocZeroF32(allocator, dims.tokens * dims.out);
+    defer allocator.free(logits_out);
+    var lm_head = try tensor.OwnedTensor.init(allocator, .f32, &.{ dims.out, dims.hidden });
+    defer lm_head.deinit();
+    fillTensorF32(&lm_head, 442);
+
+    const logits_scaling: f32 = 1.0;
+    var lm_head_view = lm_head.view();
+    var scratch = try cpu.matmul.MatmulScratch.init(allocator);
+    defer scratch.deinit();
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..repeats) |_| {
+        var hidden_view = tensor.Tensor.view2DSlice(hidden_rows, dims.tokens, dims.hidden);
+        var logits_view = tensor.Tensor.view2DSlice(logits_out, dims.tokens, dims.out);
+        try cpu.linalg.matmulAuto(&hidden_view, &lm_head_view, &logits_view, &scratch);
+        cpu.rowwise.scaleInPlaceReciprocal(logits_out, logits_scaling);
+    }
+    const cold_ns = timer.read();
+
+    for (0..cfg.warmup) |_| for (0..repeats) |_| {
+        var hidden_view = tensor.Tensor.view2DSlice(hidden_rows, dims.tokens, dims.hidden);
+        var logits_view = tensor.Tensor.view2DSlice(logits_out, dims.tokens, dims.out);
+        try cpu.linalg.matmulAuto(&hidden_view, &lm_head_view, &logits_view, &scratch);
+        cpu.rowwise.scaleInPlaceReciprocal(logits_out, logits_scaling);
+    };
+    for (samples) |*sample| {
+        timer = std.time.Timer.start() catch unreachable;
+        for (0..repeats) |_| {
+            var hidden_view = tensor.Tensor.view2DSlice(hidden_rows, dims.tokens, dims.hidden);
+            var logits_view = tensor.Tensor.view2DSlice(logits_out, dims.tokens, dims.out);
+            try cpu.linalg.matmulAuto(&hidden_view, &lm_head_view, &logits_view, &scratch);
+            cpu.rowwise.scaleInPlaceReciprocal(logits_out, logits_scaling);
+        }
+        sample.eval_ns = timer.read();
+    }
+
+    const flops: u64 = @intCast(2 * dims.tokens * dims.hidden * dims.out);
+    const bytes: u64 = @intCast((dims.tokens * dims.hidden + dims.out * dims.hidden + 2 * dims.tokens * dims.out) * @sizeOf(f32));
+    return .{
+        .name = try roleBenchRowName(which),
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_ns = cold_ns,
+        .sample_loops = repeats,
+        .flops_per_iter = flops * repeats,
+        .bytes_per_iter = bytes * repeats,
+        .note = switch (which) {
+            .decode_lm_head_runtime_f32 => "xray role: lm_head -> runtime f32 (matmulAuto + scaling)",
+            else => unreachable,
+        },
+    };
 }
 
-pub fn runRoleAttnVBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
-    return runRoleMatmulBf16(allocator, cfg, .role_attn_v_bf16);
+fn runRoleRmsNormF32(allocator: std.mem.Allocator, cfg: RunConfig, which: Scenario) !ScenarioResult {
+    const model_id = cfg.model_id orelse return error.InvalidArgument;
+    const dims = try modelRoleDims(model_id, which);
+    const repeats = sampleLoops(which, cfg.profile);
+    const elems = dims.tokens * dims.hidden;
+    const input = try allocFilledF32(allocator, elems, 305);
+    defer allocator.free(input);
+    const out = try allocZeroF32(allocator, elems);
+    defer allocator.free(out);
+    const weight = try allocFilledF32(allocator, dims.hidden, 306);
+    defer allocator.free(weight);
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    var timer = std.time.Timer.start() catch unreachable;
+    for (0..repeats) |_| cpu.math.rmsnormContiguous(out, input, weight, null, .f32, dims.tokens, dims.hidden, 1e-6, 0.0);
+    const cold_ns = timer.read();
+
+    for (0..cfg.warmup) |_| for (0..repeats) |_| cpu.math.rmsnormContiguous(out, input, weight, null, .f32, dims.tokens, dims.hidden, 1e-6, 0.0);
+    for (samples) |*sample| {
+        timer = std.time.Timer.start() catch unreachable;
+        for (0..repeats) |_| cpu.math.rmsnormContiguous(out, input, weight, null, .f32, dims.tokens, dims.hidden, 1e-6, 0.0);
+        sample.eval_ns = timer.read();
+    }
+
+    return .{
+        .name = try roleBenchRowName(which),
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_ns = cold_ns,
+        .sample_loops = repeats,
+        .flops_per_iter = @as(u64, @intCast(4 * elems * repeats)),
+        .bytes_per_iter = @as(u64, @intCast((2 * elems + dims.hidden) * @sizeOf(f32) * repeats)),
+        .note = "xray role: rmsnorm -> f32 contiguous inference path",
+    };
 }
 
-pub fn runRoleAttnOutBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
-    return runRoleMatmulBf16(allocator, cfg, .role_attn_out_bf16);
+pub fn runPrefillAttnQBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .prefill_attn_q_bf16);
 }
 
-pub fn runRoleFfnGateBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
-    return runRoleMatmulBf16(allocator, cfg, .role_ffn_gate_bf16);
+pub fn runPrefillAttnKBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .prefill_attn_k_bf16);
 }
 
-pub fn runRoleFfnDownBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
-    return runRoleMatmulBf16(allocator, cfg, .role_ffn_down_bf16);
+pub fn runPrefillAttnVBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .prefill_attn_v_bf16);
+}
+
+pub fn runPrefillAttnOutBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .prefill_attn_out_bf16);
+}
+
+pub fn runPrefillFfnGateBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .prefill_ffn_gate_bf16);
+}
+
+pub fn runPrefillFfnDownBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .prefill_ffn_down_bf16);
+}
+
+pub fn runDecodeAttnQBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .decode_attn_q_bf16);
+}
+
+pub fn runDecodeAttnKBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .decode_attn_k_bf16);
+}
+
+pub fn runDecodeAttnVBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .decode_attn_v_bf16);
+}
+
+pub fn runDecodeAttnOutBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .decode_attn_out_bf16);
+}
+
+pub fn runDecodeFfnGateBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .decode_ffn_gate_bf16);
+}
+
+pub fn runDecodeFfnDownBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .decode_ffn_down_bf16);
+}
+
+pub fn runDecodeLmHeadBf16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulBf16(allocator, cfg, .decode_lm_head_bf16);
+}
+
+pub fn runDecodeLmHeadF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulF16(allocator, cfg, .decode_lm_head_f16);
+}
+
+pub fn runDecodeLmHeadF32(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulF32(allocator, cfg, .decode_lm_head_f32);
+}
+
+pub fn runDecodeLmHeadRuntimeF32(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleMatmulRuntimeF32(allocator, cfg, .decode_lm_head_runtime_f32);
+}
+
+pub fn runPrefillLayerAttnNormF32(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleRmsNormF32(allocator, cfg, .prefill_layer_attn_norm_f32);
+}
+
+pub fn runPrefillLayerFfnNormF32(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleRmsNormF32(allocator, cfg, .prefill_layer_ffn_norm_f32);
+}
+
+pub fn runPrefillFinalNormF32(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleRmsNormF32(allocator, cfg, .prefill_final_norm_f32);
+}
+
+pub fn runDecodeLayerAttnNormF32(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleRmsNormF32(allocator, cfg, .decode_layer_attn_norm_f32);
+}
+
+pub fn runDecodeLayerFfnNormF32(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleRmsNormF32(allocator, cfg, .decode_layer_ffn_norm_f32);
+}
+
+pub fn runDecodeFinalNormF32(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    return runRoleRmsNormF32(allocator, cfg, .decode_final_norm_f32);
 }
 
 fn runMatmulGroupedAffine(allocator: std.mem.Allocator, cfg: RunConfig, comptime weight_dtype: dtype.DType) !ScenarioResult {
@@ -1623,10 +1962,12 @@ test "bw gated delta profile matches qwen3.5 widths" {
 }
 
 test "qwen3.5 prefill role dims match xray-visible projections" {
-    const q = try modelRoleMatmulDims("qwen3_5", .role_attn_q_bf16);
+    const q = try modelRoleDims("qwen3_5", .prefill_attn_q_bf16);
     try std.testing.expectEqualDeep(RoleMatmulDims{ .tokens = 14, .hidden = 1024, .out = 2048 }, q);
-    const gate = try modelRoleMatmulDims("qwen3_5", .role_ffn_gate_bf16);
+    const gate = try modelRoleDims("qwen3_5", .prefill_ffn_gate_bf16);
     try std.testing.expectEqualDeep(RoleMatmulDims{ .tokens = 14, .hidden = 1024, .out = 7168 }, gate);
-    const down = try modelRoleMatmulDims("qwen3_5", .role_ffn_down_bf16);
+    const down = try modelRoleDims("qwen3_5", .prefill_ffn_down_bf16);
     try std.testing.expectEqualDeep(RoleMatmulDims{ .tokens = 14, .hidden = 3584, .out = 1024 }, down);
+    const lm_head = try modelRoleDims("qwen3_5", .decode_lm_head_runtime_f32);
+    try std.testing.expectEqualDeep(RoleMatmulDims{ .tokens = 1, .hidden = 1024, .out = 248320 }, lm_head);
 }

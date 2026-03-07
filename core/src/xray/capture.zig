@@ -85,7 +85,9 @@ pub const TracePointSet = packed struct {
     final_norm: bool = false,
     lm_head: bool = false,
     logits_scaled: bool = false,
-    _padding: u9 = 0,
+    logits_ready: bool = false,
+    token_select: bool = false,
+    _padding: u7 = 0,
 
     pub fn all() TracePointSet {
         return .{
@@ -112,6 +114,8 @@ pub const TracePointSet = packed struct {
             .final_norm = true,
             .lm_head = true,
             .logits_scaled = true,
+            .logits_ready = true,
+            .token_select = true,
         };
     }
 
@@ -144,6 +148,8 @@ pub const TracePointSet = packed struct {
             .final_norm => self.final_norm,
             .lm_head => self.lm_head,
             .logits_scaled => self.logits_scaled,
+            .logits_ready => self.logits_ready,
+            .token_select => self.token_select,
             _ => false, // Custom points not in standard set
         };
     }
@@ -588,7 +594,7 @@ test "TraceCapture find iterator" {
     var cap = TraceCapture.init(std.testing.allocator, config);
     defer cap.deinit();
 
-    const data = [_]f32{ 1.0 };
+    const data = [_]f32{1.0};
 
     // Add multiple records
     for ([_]u16{ 0, 1, 2 }) |layer| {

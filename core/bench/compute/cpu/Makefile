@@ -7,7 +7,7 @@ WARMUP ?= 8
 ITERS ?= 24
 FORMAT ?= table
 
-.PHONY: default help run-model add mul rms rms_bf16 rms_f16 smx scv ssm delta gdnorm gate gate_long mmthr mm_bf16 mm_f16 mm_u4 mm_u8 micro all quick steady qwen35 role_attn_q role_attn_k role_attn_v role_attn_out role_ffn_gate role_ffn_down
+.PHONY: default help run-model add mul rms rms_bf16 rms_f16 smx scv ssm delta gdnorm gate gate_long mmthr mm_bf16 mm_f16 mm_u4 mm_u8 micro all quick steady qwen35 prefill_attn_q prefill_attn_k prefill_attn_v prefill_attn_out prefill_ffn_gate prefill_ffn_down decode_attn_q decode_attn_k decode_attn_v decode_attn_out decode_ffn_gate decode_ffn_down decode_lm_head prefill_layer_attn_norm prefill_layer_ffn_norm prefill_final_norm decode_layer_attn_norm decode_layer_ffn_norm decode_final_norm
 
 default:
 ifeq ($(strip $(MODEL)),)
@@ -48,6 +48,12 @@ help:
 	@echo "  make -C core/bench/compute/cpu decode_u4"
 	@echo "  make -C core/bench/compute/cpu decode_u8"
 	@echo "  make -C core/bench/compute/cpu qwen35"
+	@echo "  make -C core/bench/compute/cpu model=qwen3_5 decode_ffn_gate"
+	@echo "  make -C core/bench/compute/cpu model=qwen3_5 decode_lm_head"
+	@echo ""
+	@echo "Naming:"
+	@echo "  prefill_* / prefill.*  = input/prefill-side compute rows"
+	@echo "  decode_* / decode.*    = output/decode-side compute rows"
 	@echo "  make -C core/bench/compute/cpu micro"
 	@echo "  make -C core/bench/compute/cpu all"
 	@echo "  make -C core/bench/compute/cpu quick"
@@ -66,9 +72,10 @@ run-model:
 		--warmup "$(WARMUP)" \
 		--iters "$(ITERS)"
 
-add mul rms rms_bf16 rms_f16 smx scv ssm delta gdnorm gate gate_long rope rope_f16 rope_bf16 sdpa sdpa_f16 sdpa_bf16 mmthr mm_bf16 mm_f16 mm_u4 mm_u8 decode_bf16 decode_u4 decode_u8 micro all role_attn_q role_attn_k role_attn_v role_attn_out role_ffn_gate role_ffn_down:
+add mul rms rms_bf16 rms_f16 smx scv ssm delta gdnorm gate gate_long rope rope_f16 rope_bf16 sdpa sdpa_f16 sdpa_bf16 mmthr mm_bf16 mm_f16 mm_u4 mm_u8 decode_bf16 decode_u4 decode_u8 micro all prefill_attn_q prefill_attn_k prefill_attn_v prefill_attn_out prefill_ffn_gate prefill_ffn_down decode_attn_q decode_attn_k decode_attn_v decode_attn_out decode_ffn_gate decode_ffn_down decode_lm_head prefill_layer_attn_norm prefill_layer_ffn_norm prefill_final_norm decode_layer_attn_norm decode_layer_ffn_norm decode_final_norm:
 	@cd "$(ROOT_DIR)" && \
 	zig build bench-cpu-compute -Drelease -- \
+		$(if $(strip $(MODEL)),--preset "$(MODEL)",) \
 		--scenario "$@" \
 		--profile "$(PROFILE)" \
 		--format "$(FORMAT)" \

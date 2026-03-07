@@ -49,6 +49,8 @@ pub const TracePoint = enum(u8) {
     final_norm,
     lm_head, // From lm_head matmul
     logits_scaled, // After temperature scaling
+    logits_ready, // Logits materialized and available to sampler
+    token_select, // Next-token selection (argmax/sampling)
 
     // Extensible - custom points can use values >= 128
     _,
@@ -78,6 +80,8 @@ pub const TracePoint = enum(u8) {
             .final_norm => "final_norm",
             .lm_head => "lm_head",
             .logits_scaled => "logits_scaled",
+            .logits_ready => "logits_ready",
+            .token_select => "token_select",
             _ => "custom",
         };
     }
@@ -353,4 +357,3 @@ test "TracedTensor calculations" {
     try std.testing.expectEqual(@as(usize, 2 * 8 * 64), ref.elementCount());
     try std.testing.expectEqual(@as(usize, 2 * 8 * 64 * 4), ref.byteSize());
 }
-

@@ -7,7 +7,8 @@ fn returns_perf_hints_for_registered_architecture() {
             .expect("fetch perf hints")
             .expect("registered architecture should have perf hints");
         assert!(json.contains(&format!("\"bench_model\":\"{arch}\"")));
-        assert!(json.contains("\"point_mappings\""));
+        assert!(json.contains("\"prefill_point_mappings\""));
+        assert!(json.contains("\"decode_point_mappings\""));
     }
 }
 

@@ -70,12 +70,29 @@ fn parsePreset(value: []const u8) ![]const u8 {
 
 fn parseScenario(value: []const u8) !scenarios.Scenario {
     if (std.mem.eql(u8, value, "all")) return .all;
-    if (std.mem.eql(u8, value, "role_attn_q") or std.mem.eql(u8, value, "attn_q")) return .role_attn_q_bf16;
-    if (std.mem.eql(u8, value, "role_attn_k") or std.mem.eql(u8, value, "attn_k")) return .role_attn_k_bf16;
-    if (std.mem.eql(u8, value, "role_attn_v") or std.mem.eql(u8, value, "attn_v")) return .role_attn_v_bf16;
-    if (std.mem.eql(u8, value, "role_attn_out") or std.mem.eql(u8, value, "attn_out")) return .role_attn_out_bf16;
-    if (std.mem.eql(u8, value, "role_ffn_gate") or std.mem.eql(u8, value, "ffn_gate")) return .role_ffn_gate_bf16;
-    if (std.mem.eql(u8, value, "role_ffn_down") or std.mem.eql(u8, value, "ffn_down")) return .role_ffn_down_bf16;
+    if (std.mem.eql(u8, value, "prefill_attn_q") or std.mem.eql(u8, value, "prefill.attn_q")) return .prefill_attn_q_bf16;
+    if (std.mem.eql(u8, value, "prefill_attn_k") or std.mem.eql(u8, value, "prefill.attn_k")) return .prefill_attn_k_bf16;
+    if (std.mem.eql(u8, value, "prefill_attn_v") or std.mem.eql(u8, value, "prefill.attn_v")) return .prefill_attn_v_bf16;
+    if (std.mem.eql(u8, value, "prefill_attn_out") or std.mem.eql(u8, value, "prefill.attn_out")) return .prefill_attn_out_bf16;
+    if (std.mem.eql(u8, value, "prefill_ffn_gate") or std.mem.eql(u8, value, "prefill.ffn_gate")) return .prefill_ffn_gate_bf16;
+    if (std.mem.eql(u8, value, "prefill_ffn_down") or std.mem.eql(u8, value, "prefill.ffn_down")) return .prefill_ffn_down_bf16;
+    if (std.mem.eql(u8, value, "decode_attn_q") or std.mem.eql(u8, value, "decode.attn_q")) return .decode_attn_q_bf16;
+    if (std.mem.eql(u8, value, "decode_attn_k") or std.mem.eql(u8, value, "decode.attn_k")) return .decode_attn_k_bf16;
+    if (std.mem.eql(u8, value, "decode_attn_v") or std.mem.eql(u8, value, "decode.attn_v")) return .decode_attn_v_bf16;
+    if (std.mem.eql(u8, value, "decode_attn_out") or std.mem.eql(u8, value, "decode.attn_out")) return .decode_attn_out_bf16;
+    if (std.mem.eql(u8, value, "decode_ffn_gate") or std.mem.eql(u8, value, "decode.ffn_gate")) return .decode_ffn_gate_bf16;
+    if (std.mem.eql(u8, value, "decode_ffn_down") or std.mem.eql(u8, value, "decode.ffn_down")) return .decode_ffn_down_bf16;
+    if (std.mem.eql(u8, value, "decode_lm_head") or std.mem.eql(u8, value, "decode.lm_head")) return .decode_lm_head_bf16;
+    if (std.mem.eql(u8, value, "decode_lm_head_bf16") or std.mem.eql(u8, value, "decode.lm_head_bf16")) return .decode_lm_head_bf16;
+    if (std.mem.eql(u8, value, "decode_lm_head_f16") or std.mem.eql(u8, value, "decode.lm_head_f16")) return .decode_lm_head_f16;
+    if (std.mem.eql(u8, value, "decode_lm_head_f32") or std.mem.eql(u8, value, "decode.lm_head_f32")) return .decode_lm_head_f32;
+    if (std.mem.eql(u8, value, "decode_lm_head_runtime_f32") or std.mem.eql(u8, value, "decode.lm_head_runtime_f32")) return .decode_lm_head_runtime_f32;
+    if (std.mem.eql(u8, value, "prefill_layer_attn_norm") or std.mem.eql(u8, value, "prefill.layer_attn_norm")) return .prefill_layer_attn_norm_f32;
+    if (std.mem.eql(u8, value, "prefill_layer_ffn_norm") or std.mem.eql(u8, value, "prefill.layer_ffn_norm")) return .prefill_layer_ffn_norm_f32;
+    if (std.mem.eql(u8, value, "prefill_final_norm") or std.mem.eql(u8, value, "prefill.final_norm")) return .prefill_final_norm_f32;
+    if (std.mem.eql(u8, value, "decode_layer_attn_norm") or std.mem.eql(u8, value, "decode.layer_attn_norm")) return .decode_layer_attn_norm_f32;
+    if (std.mem.eql(u8, value, "decode_layer_ffn_norm") or std.mem.eql(u8, value, "decode.layer_ffn_norm")) return .decode_layer_ffn_norm_f32;
+    if (std.mem.eql(u8, value, "decode_final_norm") or std.mem.eql(u8, value, "decode.final_norm")) return .decode_final_norm_f32;
     if (std.mem.eql(u8, value, "delta") or std.mem.eql(u8, value, "gdelta")) return .gated_delta_step_f32;
     if (std.mem.eql(u8, value, "gdnorm") or std.mem.eql(u8, value, "gdelta_norm")) return .gated_delta_norm_f32;
     if (std.mem.eql(u8, value, "gate") or std.mem.eql(u8, value, "gattn")) return .gated_attention_gate_f32;
@@ -123,7 +140,7 @@ fn printUsage(writer: anytype) !void {
         \\  zig build bench-cpu-compute -Drelease -- [options]
         \\
         \\Options:
-        \\  --scenario <all|role_attn_q|role_attn_k|role_attn_v|role_attn_out|role_ffn_gate|role_ffn_down|delta|gdnorm|gate|gate_long|rope|rope_f16|rope_bf16|sdpa|sdpa_f16|sdpa_bf16|rms|rms_bf16|rms_f16|smx|decode_bf16|decode_u4|decode_u8|scv|ssm|mmthr|mm_bf16|mm_f16|mm_u4|mm_u8|micro|add|mul>
+        \\  --scenario <all|prefill_attn_q|prefill_attn_k|prefill_attn_v|prefill_attn_out|prefill_ffn_gate|prefill_ffn_down|decode_attn_q|decode_attn_k|decode_attn_v|decode_attn_out|decode_ffn_gate|decode_ffn_down|decode_lm_head|decode_lm_head_bf16|decode_lm_head_f16|decode_lm_head_f32|decode_lm_head_runtime_f32|prefill_layer_attn_norm|prefill_layer_ffn_norm|prefill_final_norm|decode_layer_attn_norm|decode_layer_ffn_norm|decode_final_norm|delta|gdnorm|gate|gate_long|rope|rope_f16|rope_bf16|sdpa|sdpa_f16|sdpa_bf16|rms|rms_bf16|rms_f16|smx|decode_bf16|decode_u4|decode_u8|scv|ssm|mmthr|mm_bf16|mm_f16|mm_u4|mm_u8|micro|add|mul>
         \\  --preset <architecture_id>
         \\  --profile <ci|bw>               default: bw
         \\  --format <table|csv|tsv>        default: table
@@ -223,12 +240,28 @@ fn printResultCsv(writer: anytype, cfg: scenarios.RunConfig, result: *scenarios.
 
 fn runScenario(allocator: std.mem.Allocator, cfg: scenarios.RunConfig, which: scenarios.Scenario) !scenarios.ScenarioResult {
     return switch (which) {
-        .role_attn_q_bf16 => try scenarios.runRoleAttnQBf16(allocator, cfg),
-        .role_attn_k_bf16 => try scenarios.runRoleAttnKBf16(allocator, cfg),
-        .role_attn_v_bf16 => try scenarios.runRoleAttnVBf16(allocator, cfg),
-        .role_attn_out_bf16 => try scenarios.runRoleAttnOutBf16(allocator, cfg),
-        .role_ffn_gate_bf16 => try scenarios.runRoleFfnGateBf16(allocator, cfg),
-        .role_ffn_down_bf16 => try scenarios.runRoleFfnDownBf16(allocator, cfg),
+        .prefill_attn_q_bf16 => try scenarios.runPrefillAttnQBf16(allocator, cfg),
+        .prefill_attn_k_bf16 => try scenarios.runPrefillAttnKBf16(allocator, cfg),
+        .prefill_attn_v_bf16 => try scenarios.runPrefillAttnVBf16(allocator, cfg),
+        .prefill_attn_out_bf16 => try scenarios.runPrefillAttnOutBf16(allocator, cfg),
+        .prefill_ffn_gate_bf16 => try scenarios.runPrefillFfnGateBf16(allocator, cfg),
+        .prefill_ffn_down_bf16 => try scenarios.runPrefillFfnDownBf16(allocator, cfg),
+        .decode_attn_q_bf16 => try scenarios.runDecodeAttnQBf16(allocator, cfg),
+        .decode_attn_k_bf16 => try scenarios.runDecodeAttnKBf16(allocator, cfg),
+        .decode_attn_v_bf16 => try scenarios.runDecodeAttnVBf16(allocator, cfg),
+        .decode_attn_out_bf16 => try scenarios.runDecodeAttnOutBf16(allocator, cfg),
+        .decode_ffn_gate_bf16 => try scenarios.runDecodeFfnGateBf16(allocator, cfg),
+        .decode_ffn_down_bf16 => try scenarios.runDecodeFfnDownBf16(allocator, cfg),
+        .decode_lm_head_bf16 => try scenarios.runDecodeLmHeadBf16(allocator, cfg),
+        .decode_lm_head_f16 => try scenarios.runDecodeLmHeadF16(allocator, cfg),
+        .decode_lm_head_f32 => try scenarios.runDecodeLmHeadF32(allocator, cfg),
+        .decode_lm_head_runtime_f32 => try scenarios.runDecodeLmHeadRuntimeF32(allocator, cfg),
+        .prefill_layer_attn_norm_f32 => try scenarios.runPrefillLayerAttnNormF32(allocator, cfg),
+        .prefill_layer_ffn_norm_f32 => try scenarios.runPrefillLayerFfnNormF32(allocator, cfg),
+        .prefill_final_norm_f32 => try scenarios.runPrefillFinalNormF32(allocator, cfg),
+        .decode_layer_attn_norm_f32 => try scenarios.runDecodeLayerAttnNormF32(allocator, cfg),
+        .decode_layer_ffn_norm_f32 => try scenarios.runDecodeLayerFfnNormF32(allocator, cfg),
+        .decode_final_norm_f32 => try scenarios.runDecodeFinalNormF32(allocator, cfg),
         .add_f32 => try scenarios.runAddF32(allocator, cfg),
         .mul_f32 => try scenarios.runMulF32(allocator, cfg),
         .rmsnorm_f32 => try scenarios.runRmsNormF32(allocator, cfg),
@@ -379,12 +412,28 @@ pub fn main() !void {
                 updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .micro_matmul_f32));
             }
         },
-        .role_attn_q_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .role_attn_q_bf16)),
-        .role_attn_k_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .role_attn_k_bf16)),
-        .role_attn_v_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .role_attn_v_bf16)),
-        .role_attn_out_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .role_attn_out_bf16)),
-        .role_ffn_gate_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .role_ffn_gate_bf16)),
-        .role_ffn_down_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .role_ffn_down_bf16)),
+        .prefill_attn_q_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .prefill_attn_q_bf16)),
+        .prefill_attn_k_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .prefill_attn_k_bf16)),
+        .prefill_attn_v_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .prefill_attn_v_bf16)),
+        .prefill_attn_out_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .prefill_attn_out_bf16)),
+        .prefill_ffn_gate_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .prefill_ffn_gate_bf16)),
+        .prefill_ffn_down_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .prefill_ffn_down_bf16)),
+        .decode_attn_q_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_attn_q_bf16)),
+        .decode_attn_k_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_attn_k_bf16)),
+        .decode_attn_v_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_attn_v_bf16)),
+        .decode_attn_out_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_attn_out_bf16)),
+        .decode_ffn_gate_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_ffn_gate_bf16)),
+        .decode_ffn_down_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_ffn_down_bf16)),
+        .decode_lm_head_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_lm_head_bf16)),
+        .decode_lm_head_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_lm_head_f16)),
+        .decode_lm_head_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_lm_head_f32)),
+        .decode_lm_head_runtime_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_lm_head_runtime_f32)),
+        .prefill_layer_attn_norm_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .prefill_layer_attn_norm_f32)),
+        .prefill_layer_ffn_norm_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .prefill_layer_ffn_norm_f32)),
+        .prefill_final_norm_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .prefill_final_norm_f32)),
+        .decode_layer_attn_norm_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_layer_attn_norm_f32)),
+        .decode_layer_ffn_norm_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_layer_ffn_norm_f32)),
+        .decode_final_norm_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_final_norm_f32)),
         .add_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .add_f32)),
         .mul_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .mul_f32)),
         .rmsnorm_f32 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .rmsnorm_f32)),
@@ -437,21 +486,43 @@ pub fn main() !void {
 fn printPresetMapping(writer: anytype, model_id: []const u8) !void {
     const hints = models.performanceHintsByName(model_id) orelse return;
     try writer.writeAll("Xray Alignment\n");
-    for (hints.point_mappings) |mapping| {
+    for (hints.prefill_point_mappings) |mapping| {
         try writer.print("  {s: <14} -> {s}\n", .{ mapping.point, mapping.bench_row });
     }
-    for (hints.hidden_rows) |row_name| {
+    for (hints.prefill_hidden_rows) |row_name| {
+        try writer.print("  {s: <14} -> {s}\n", .{ "hidden", row_name });
+    }
+    for (hints.decode_point_mappings) |mapping| {
+        try writer.print("  {s: <14} -> {s}\n", .{ mapping.point, mapping.bench_row });
+    }
+    for (hints.decode_hidden_rows) |row_name| {
         try writer.print("  {s: <14} -> {s}\n", .{ "hidden", row_name });
     }
 }
 fn scenarioFromBenchRowName(name: []const u8) ?scenarios.Scenario {
-    if (std.mem.eql(u8, name, "role.attn_q")) return .role_attn_q_bf16;
-    if (std.mem.eql(u8, name, "role.attn_k")) return .role_attn_k_bf16;
-    if (std.mem.eql(u8, name, "role.attn_v")) return .role_attn_v_bf16;
-    if (std.mem.eql(u8, name, "role.attn.out")) return .role_attn_out_bf16;
-    if (std.mem.eql(u8, name, "role.attn_out")) return .role_attn_out_bf16;
-    if (std.mem.eql(u8, name, "role.ffn_gate")) return .role_ffn_gate_bf16;
-    if (std.mem.eql(u8, name, "role.ffn_down")) return .role_ffn_down_bf16;
+    if (std.mem.eql(u8, name, "prefill.attn_q")) return .prefill_attn_q_bf16;
+    if (std.mem.eql(u8, name, "prefill.attn_k")) return .prefill_attn_k_bf16;
+    if (std.mem.eql(u8, name, "prefill.attn_v")) return .prefill_attn_v_bf16;
+    if (std.mem.eql(u8, name, "prefill.attn_out")) return .prefill_attn_out_bf16;
+    if (std.mem.eql(u8, name, "prefill.ffn_gate")) return .prefill_ffn_gate_bf16;
+    if (std.mem.eql(u8, name, "prefill.ffn_down")) return .prefill_ffn_down_bf16;
+    if (std.mem.eql(u8, name, "decode.attn_q")) return .decode_attn_q_bf16;
+    if (std.mem.eql(u8, name, "decode.attn_k")) return .decode_attn_k_bf16;
+    if (std.mem.eql(u8, name, "decode.attn_v")) return .decode_attn_v_bf16;
+    if (std.mem.eql(u8, name, "decode.attn_out")) return .decode_attn_out_bf16;
+    if (std.mem.eql(u8, name, "decode.ffn_gate")) return .decode_ffn_gate_bf16;
+    if (std.mem.eql(u8, name, "decode.ffn_down")) return .decode_ffn_down_bf16;
+    if (std.mem.eql(u8, name, "decode.lm_head")) return .decode_lm_head_bf16;
+    if (std.mem.eql(u8, name, "decode.lm_head_bf16")) return .decode_lm_head_bf16;
+    if (std.mem.eql(u8, name, "decode.lm_head_f16")) return .decode_lm_head_f16;
+    if (std.mem.eql(u8, name, "decode.lm_head_f32")) return .decode_lm_head_f32;
+    if (std.mem.eql(u8, name, "decode.lm_head_runtime_f32")) return .decode_lm_head_runtime_f32;
+    if (std.mem.eql(u8, name, "prefill.layer_attn_norm")) return .prefill_layer_attn_norm_f32;
+    if (std.mem.eql(u8, name, "prefill.layer_ffn_norm")) return .prefill_layer_ffn_norm_f32;
+    if (std.mem.eql(u8, name, "prefill.final_norm")) return .prefill_final_norm_f32;
+    if (std.mem.eql(u8, name, "decode.layer_attn_norm")) return .decode_layer_attn_norm_f32;
+    if (std.mem.eql(u8, name, "decode.layer_ffn_norm")) return .decode_layer_ffn_norm_f32;
+    if (std.mem.eql(u8, name, "decode.final_norm")) return .decode_final_norm_f32;
     if (std.mem.eql(u8, name, "gdelta_conv_f32")) return .gated_delta_conv_f32;
     if (std.mem.eql(u8, name, "gdelta_qk_norm_f32")) return .gated_delta_qk_norm_f32;
     if (std.mem.eql(u8, name, "gdelta_step_f32")) return .gated_delta_step_f32;
@@ -471,16 +542,30 @@ fn runModelPreset(writer: anytype, allocator: std.mem.Allocator, cfg: scenarios.
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
 
-    if (format == .table and hints.point_mappings.len != 0) try writer.writeAll("P0 xray-aligned roles\n");
-    for (hints.point_mappings) |mapping| {
+    if (format == .table and hints.prefill_point_mappings.len != 0) try writer.writeAll("P0 xray prefill-aligned roles\n");
+    for (hints.prefill_point_mappings) |mapping| {
         if (seen.contains(mapping.bench_row)) continue;
         try seen.put(mapping.bench_row, {});
         const scenario = scenarioFromBenchRowName(mapping.bench_row) orelse continue;
         updatePeaks(peaks, try runOne(writer, allocator, cfg, format, scenario));
     }
 
-    if (format == .table and hints.hidden_rows.len != 0) try writer.writeAll("P1 hidden compute behind xray labels\n");
-    for (hints.hidden_rows) |row_name| {
+    if (format == .table and hints.decode_point_mappings.len != 0) try writer.writeAll("P1 xray decode-aligned roles\n");
+    for (hints.decode_point_mappings) |mapping| {
+        if (seen.contains(mapping.bench_row)) continue;
+        try seen.put(mapping.bench_row, {});
+        const scenario = scenarioFromBenchRowName(mapping.bench_row) orelse continue;
+        updatePeaks(peaks, try runOne(writer, allocator, cfg, format, scenario));
+    }
+
+    if (format == .table and hints.prefill_hidden_rows.len != 0) try writer.writeAll("P2 hidden compute behind prefill roles\n");
+    for (hints.prefill_hidden_rows) |row_name| {
+        const scenario = scenarioFromBenchRowName(row_name) orelse continue;
+        updatePeaks(peaks, try runOne(writer, allocator, cfg, format, scenario));
+    }
+
+    if (format == .table and hints.decode_hidden_rows.len != 0) try writer.writeAll("P3 hidden compute behind decode roles\n");
+    for (hints.decode_hidden_rows) |row_name| {
         const scenario = scenarioFromBenchRowName(row_name) orelse continue;
         updatePeaks(peaks, try runOne(writer, allocator, cfg, format, scenario));
     }

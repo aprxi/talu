@@ -61,6 +61,8 @@ class Point(IntEnum):
     FINAL_NORM = 20
     LM_HEAD = 21  # lm_head matmul
     LOGITS_SCALED = 22
+    LOGITS_READY = 23  # logits materialized and ready for selection
+    TOKEN_SELECT = 24  # next-token selection (argmax/sampling)
 
 
 # Point bitmasks for configuration
@@ -87,7 +89,9 @@ POINT_CONV_OUT_PROJ = 1 << 19
 POINT_FINAL_NORM = 1 << 20
 POINT_LM_HEAD = 1 << 21
 POINT_LOGITS_SCALED = 1 << 22
-POINT_ALL = 0x7FFFFF  # All 23 points
+POINT_LOGITS_READY = 1 << 23
+POINT_TOKEN_SELECT = 1 << 24
+POINT_ALL = 0x1FFFFFF  # All 25 points
 
 
 def points_to_mask(points: Sequence[str | Point]) -> int:

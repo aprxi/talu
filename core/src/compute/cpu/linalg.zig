@@ -15,6 +15,7 @@ pub const MatmulFn = matmul.MatmulFn;
 pub const DispatchedKernel = matmul.DispatchedKernel;
 pub const matmulKernel = matmul.matmulKernel;
 pub const matmulAuto = matmul.matmulAuto;
+pub const matmulLmHeadRowsBf16 = matmul.matmulLmHeadRowsBf16;
 pub const matmulF32 = matmul.matmulF32;
 pub const matmulF32Accum = matmul.matmulF32Accum;
 pub const matmulGaffineU4 = matmul.matmulGaffineU4;

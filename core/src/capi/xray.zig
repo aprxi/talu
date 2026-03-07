@@ -358,4 +358,6 @@ pub const POINT_CONV_OUT_PROJ: u32 = 1 << 19;
 pub const POINT_FINAL_NORM: u32 = 1 << 20;
 pub const POINT_LOGITS: u32 = 1 << 21; // lm_head
 pub const POINT_LOGITS_SCALED: u32 = 1 << 22;
-pub const POINT_ALL: u32 = 0x7FFFFF; // All 23 points
+pub const POINT_LOGITS_READY: u32 = 1 << 23;
+pub const POINT_TOKEN_SELECT: u32 = 1 << 24;
+pub const POINT_ALL: u32 = 0x1FFFFFF; // All 25 points

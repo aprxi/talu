@@ -39,8 +39,10 @@ from ._bindings import (
     POINT_EMBED,
     POINT_FINAL_NORM,
     POINT_LM_HEAD,
+    POINT_LOGITS_READY,
     POINT_LOGITS_SCALED,
     POINT_MAMBA_OUT,
+    POINT_TOKEN_SELECT,
     AnomalyLocation,
     CapturedTensor,
     CaptureMode,
@@ -70,4 +72,6 @@ __all__ = [
     "POINT_FINAL_NORM",
     "POINT_LM_HEAD",
     "POINT_LOGITS_SCALED",
+    "POINT_LOGITS_READY",
+    "POINT_TOKEN_SELECT",
 ]
