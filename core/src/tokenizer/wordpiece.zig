@@ -5,6 +5,8 @@
 
 const std = @import("std");
 const ct = @import("c_types.zig");
+
+const MAX_MODEL_VOCAB_SIZE: usize = 1_000_000;
 const decoders = @import("decoders.zig");
 const utils = @import("utils.zig");
 
@@ -421,6 +423,7 @@ fn buildFromSpec(model: *WordPieceModel, spec: *const ct.WordPieceModelSpec) !vo
         if (next > max_id) max_id = next;
     }
     if (max_id == 0) return error.IncompleteSpec;
+    if (max_id > MAX_MODEL_VOCAB_SIZE) return error.InvalidArgument;
     try allocIdToToken(model, max_id);
 
     for (vocab) |entry| {

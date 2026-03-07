@@ -4,7 +4,8 @@
 //! at scale — matching the depth of the db/chat stress tests.
 
 use crate::capi::tokenizer::common::{
-    byte_token_id, OwnedDecodeResult, OwnedEncodeResult, TokenizerTestContext, TOKENIZER_JSON,
+    byte_token_id, byte_token_surface, OwnedDecodeResult, OwnedEncodeResult, TokenizerTestContext,
+    TOKENIZER_JSON,
 };
 use std::ffi::c_void;
 use std::ptr;
@@ -52,6 +53,15 @@ fn seeded_ascii_non_space(seed: u64, len: usize) -> String {
     for _ in 0..len {
         let v = (lcg_next(&mut state) % 94) as u8; // 0x21..=0x7E
         out.push((0x21 + v) as char);
+    }
+    out
+}
+
+fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        out.push((lcg_next(&mut state) & 0xFF) as u8);
     }
     out
 }
@@ -127,6 +137,215 @@ fn tokenize_bytes_100k_chars() {
             result.num_tokens,
         )
     };
+}
+
+/// Byte-level encoding of deterministic arbitrary bytes must preserve exact
+/// byte-token IDs and single-byte offsets, even for embedded NULs and invalid
+/// UTF-8 subsequences.
+#[test]
+fn byte_level_seeded_raw_bytes_preserve_exact_byte_ids_and_offsets() {
+    let ctx = TokenizerTestContext::with_byte_level();
+
+    for (seed, len) in [(1_u64, 0_usize), (7, 1), (19, 31), (42, 257)] {
+        let bytes = seeded_bytes(seed, len);
+        let result = unsafe { super::common::encode_raw(ctx.handle(), &bytes, &no_bos()) };
+        assert!(result.error_msg.is_null(), "seed={seed} len={len}: encode failed");
+        assert_eq!(
+            result.num_tokens,
+            bytes.len(),
+            "seed={seed} len={len}: byte-level token count must equal raw byte count"
+        );
+
+        let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+        let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+
+        for (idx, (&byte, &id)) in bytes.iter().zip(ids.iter()).enumerate() {
+            assert_eq!(
+                id,
+                byte_token_id(byte),
+                "seed={seed} len={len}: raw byte at index {idx} must map to its exact byte token ID"
+            );
+            assert_eq!(offsets[idx].start as usize, idx, "seed={seed} len={len}: offset[{idx}].start");
+            assert_eq!(offsets[idx].end as usize, idx + 1, "seed={seed} len={len}: offset[{idx}].end");
+        }
+
+        unsafe { talu_sys::talu_encode_result_free(result) };
+    }
+}
+
+/// Batch byte-level encoding of deterministic arbitrary bytes must preserve the
+/// exact per-sequence byte-token streams produced by individual encoding.
+#[test]
+fn byte_level_seeded_raw_bytes_batch_matches_individual_sequences() {
+    let ctx = TokenizerTestContext::with_byte_level();
+
+    let cases = [
+        seeded_bytes(11, 0),
+        seeded_bytes(23, 3),
+        seeded_bytes(47, 19),
+        seeded_bytes(99, 128),
+    ];
+
+    let ptrs: Vec<*const u8> = cases.iter().map(|bytes| bytes.as_ptr()).collect();
+    let lengths: Vec<usize> = cases.iter().map(Vec::len).collect();
+    let batch = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
+    assert!(batch.error_msg.is_null(), "batch encode failed");
+    assert_eq!(batch.num_sequences, cases.len());
+
+    let ids = unsafe { std::slice::from_raw_parts(batch.ids, batch.total_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(batch.offsets, batch.num_sequences + 1) };
+
+    for (idx, bytes) in cases.iter().enumerate() {
+        let expected: Vec<u32> = bytes.iter().map(|&byte| byte_token_id(byte)).collect();
+        assert_eq!(
+            &ids[offsets[idx]..offsets[idx + 1]],
+            expected.as_slice(),
+            "seeded raw-byte batch slice must equal exact byte-token IDs for sequence {idx}"
+        );
+    }
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            batch.ids,
+            batch.offsets,
+            batch.total_tokens,
+            batch.num_sequences,
+        )
+    };
+}
+
+/// Batch byte-level offsets must equal the cumulative per-sequence token
+/// counts from individual encodes, even for empty slices and arbitrary bytes.
+#[test]
+fn byte_level_seeded_raw_bytes_batch_offsets_match_individual_lengths() {
+    let ctx = TokenizerTestContext::with_byte_level();
+
+    let cases = [
+        seeded_bytes(3, 0),
+        seeded_bytes(17, 1),
+        seeded_bytes(41, 11),
+        seeded_bytes(73, 64),
+    ];
+
+    let ptrs: Vec<*const u8> = cases.iter().map(|bytes| bytes.as_ptr()).collect();
+    let lengths: Vec<usize> = cases.iter().map(Vec::len).collect();
+    let batch = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
+    assert!(batch.error_msg.is_null(), "batch encode failed");
+    assert_eq!(batch.num_sequences, cases.len());
+
+    let offsets = unsafe { std::slice::from_raw_parts(batch.offsets, batch.num_sequences + 1) };
+    let mut expected = Vec::with_capacity(cases.len() + 1);
+    expected.push(0usize);
+    for bytes in &cases {
+        expected.push(expected.last().copied().unwrap() + bytes.len());
+    }
+    assert_eq!(
+        offsets,
+        expected.as_slice(),
+        "seeded raw-byte batch offsets must equal cumulative individual token counts"
+    );
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            batch.ids,
+            batch.offsets,
+            batch.total_tokens,
+            batch.num_sequences,
+        )
+    };
+}
+
+/// For valid UTF-8 inputs, each batch byte-level slice must decode back to its
+/// original sequence when decoded independently. This catches slice-boundary
+/// bugs that ID-only batch comparisons can miss.
+#[test]
+fn byte_level_batch_valid_utf8_slices_decode_to_original_sequences() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let cases = ["", "Hello", "café", "🇺🇸", "👨\u{200d}👩\u{200d}👧\u{200d}👦", "a\u{0301}"];
+
+    let ptrs: Vec<*const u8> = cases.iter().map(|text| text.as_bytes().as_ptr()).collect();
+    let lengths: Vec<usize> = cases.iter().map(|text| text.len()).collect();
+    let batch = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
+    assert!(batch.error_msg.is_null(), "batch encode failed");
+    assert_eq!(batch.num_sequences, cases.len());
+
+    let ids = unsafe { std::slice::from_raw_parts(batch.ids, batch.total_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(batch.offsets, batch.num_sequences + 1) };
+
+    for (idx, text) in cases.iter().enumerate() {
+        let decoded = ctx.decode_with(
+            &ids[offsets[idx]..offsets[idx + 1]],
+            &talu_sys::DecodeOptionsC {
+                skip_special_tokens: 0,
+            },
+        );
+        assert_eq!(
+            decoded, *text,
+            "batch byte-level slice must decode to the original valid UTF-8 sequence at index {idx}"
+        );
+    }
+
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            batch.ids,
+            batch.offsets,
+            batch.total_tokens,
+            batch.num_sequences,
+        )
+    };
+}
+
+/// Byte-level tokenize_bytes on deterministic arbitrary bytes must expose the
+/// exact UTF-8 token surfaces for the GPT-2 byte-to-Unicode mapping, not raw
+/// input bytes.
+#[test]
+fn byte_level_seeded_raw_bytes_tokenize_bytes_surfaces_exact_slices() {
+    let ctx = TokenizerTestContext::with_byte_level();
+
+    for (seed, len) in [(5_u64, 0_usize), (13, 2), (29, 17), (77, 96)] {
+        let bytes = seeded_bytes(seed, len);
+        let result = unsafe {
+            talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), bytes.as_ptr(), bytes.len())
+        };
+        assert!(
+            result.error_msg.is_null(),
+            "seed={seed} len={len}: tokenize_bytes failed"
+        );
+        assert_eq!(
+            result.num_tokens,
+            bytes.len(),
+            "seed={seed} len={len}: byte-level tokenize_bytes count must equal raw byte count"
+        );
+
+        let data = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
+        let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens + 1) };
+        assert_eq!(offsets[0], 0, "seed={seed} len={len}: offsets[0]");
+        assert_eq!(
+            *offsets.last().unwrap(),
+            data.len(),
+            "seed={seed} len={len}: last offset must equal data_len"
+        );
+
+        for (idx, &byte) in bytes.iter().enumerate() {
+            let start = offsets[idx];
+            let end = offsets[idx + 1];
+            let expected = byte_token_surface(byte);
+            assert_eq!(
+                &data[start..end],
+                expected.as_bytes(),
+                "seed={seed} len={len}: token {idx} surface must equal exact byte-level token bytes"
+            );
+        }
+
+        unsafe {
+            talu_sys::talu_tokenize_bytes_result_free(
+                result.data,
+                result.data_len,
+                result.offsets,
+                result.num_tokens,
+            )
+        };
+    }
 }
 
 // ===========================================================================
@@ -603,6 +822,66 @@ fn concurrent_take_last_error_is_thread_isolated() {
     err_handle.join().expect("error thread panicked");
 }
 
+/// Repeated tokenizer-creation failures on one thread must not poison clean
+/// encode calls or error-state queries on another thread. This stresses the
+/// create/destroy error path, not just decode failures on an existing handle.
+#[test]
+fn concurrent_invalid_json_creation_does_not_bleed_into_clean_encode_thread() {
+    let ctx = TokenizerTestContext::new();
+    let shared = Arc::new(SharedHandle(ctx.handle()));
+    let barrier = Arc::new(Barrier::new(2));
+
+    let ok_handle = {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let opts = no_bos();
+            barrier.wait();
+            for i in 0..400 {
+                let result =
+                    OwnedEncodeResult::new(unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &opts) });
+                assert!(result.error_msg().is_null(), "success thread iter {i}: encode failed");
+                assert_eq!(result.ids(), &[44, 73, 80, 80, 83]);
+                assert_eq!(
+                    unsafe { talu_sys::talu_last_error_code() },
+                    talu_sys::ErrorCode::Ok as i32,
+                    "success thread iter {i}: error code leaked from create failure thread"
+                );
+            }
+        })
+    };
+
+    let err_handle = {
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            for i in 0..400 {
+                let mut handle: *mut c_void = ptr::null_mut();
+                let rc = unsafe {
+                    talu_sys::talu_tokenizer_create_from_json(
+                        ptr::null(),
+                        0,
+                        &mut handle as *mut _ as *mut c_void,
+                    )
+                };
+                assert_ne!(rc, 0, "error thread iter {i}: null/empty JSON input must fail to load");
+                assert!(
+                    handle.is_null(),
+                    "error thread iter {i}: failed creation must not return a handle"
+                );
+                assert_ne!(
+                    unsafe { talu_sys::talu_last_error_code() },
+                    talu_sys::ErrorCode::Ok as i32,
+                    "error thread iter {i}: create failure must set a thread-local error"
+                );
+            }
+        })
+    };
+
+    ok_handle.join().expect("success thread panicked");
+    err_handle.join().expect("error thread panicked");
+}
+
 // ===========================================================================
 // Batch scaling tests
 // ===========================================================================
@@ -726,7 +1005,7 @@ fn encode_truncation_max_length_zero_is_noop() {
 #[test]
 fn concurrent_tokenizer_creation_8_threads() {
     let num_threads = 8;
-    let iterations = 10;
+    let iterations = 50;
     let mut handles = Vec::new();
 
     for thread_id in 0..num_threads {

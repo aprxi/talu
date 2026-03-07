@@ -15,6 +15,9 @@ const errors = @import("errors.zig");
 const types = @import("types.zig");
 const log = @import("../log.zig");
 const parallel = @import("../system/parallel.zig");
+const c = @cImport({
+    @cInclude("utf8proc.h");
+});
 
 const Allocator = types.Allocator;
 const Token = types.Token;
@@ -32,10 +35,61 @@ fn isAddedTokenWordByte(byte_value: u8) bool {
     return std.ascii.isAlphabetic(byte_value) or std.ascii.isDigit(byte_value) or byte_value == '_';
 }
 
+fn isUtf8ContinuationByte(byte_value: u8) bool {
+    return (byte_value & 0xC0) == 0x80;
+}
+
+fn isAddedTokenWordCodepoint(codepoint: c.utf8proc_int32_t) bool {
+    return switch (c.utf8proc_category(codepoint)) {
+        c.UTF8PROC_CATEGORY_LU,
+        c.UTF8PROC_CATEGORY_LL,
+        c.UTF8PROC_CATEGORY_LT,
+        c.UTF8PROC_CATEGORY_LM,
+        c.UTF8PROC_CATEGORY_LO,
+        c.UTF8PROC_CATEGORY_MN,
+        c.UTF8PROC_CATEGORY_MC,
+        c.UTF8PROC_CATEGORY_ME,
+        c.UTF8PROC_CATEGORY_ND,
+        c.UTF8PROC_CATEGORY_NL,
+        c.UTF8PROC_CATEGORY_NO,
+        => true,
+        else => false,
+    };
+}
+
+fn isAddedTokenWordAt(input_bytes: []const u8, position: usize) bool {
+    if (position >= input_bytes.len) return false;
+    const first_byte = input_bytes[position];
+    if (first_byte < 0x80) return isAddedTokenWordByte(first_byte);
+
+    var codepoint: c.utf8proc_int32_t = 0;
+    const consumed = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + position), @intCast(input_bytes.len - position), &codepoint);
+    if (consumed <= 0) return false;
+    return isAddedTokenWordCodepoint(codepoint);
+}
+
+fn isAddedTokenWordBefore(input_bytes: []const u8, position: usize) bool {
+    if (position == 0) return false;
+
+    var start = position - 1;
+    while (start > 0 and isUtf8ContinuationByte(input_bytes[start])) : (start -= 1) {}
+
+    if (input_bytes[start] < 0x80) {
+        return isAddedTokenWordByte(input_bytes[start]);
+    }
+
+    var codepoint: c.utf8proc_int32_t = 0;
+    const consumed = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + start), @intCast(input_bytes.len - start), &codepoint);
+    if (consumed <= 0 or start + @as(usize, @intCast(consumed)) != position) {
+        return false;
+    }
+    return isAddedTokenWordCodepoint(codepoint);
+}
+
 fn hasAddedTokenBoundary(input_bytes: []const u8, position: usize, content_len: usize) bool {
-    const left_boundary_ok = position == 0 or !isAddedTokenWordByte(input_bytes[position - 1]);
+    const left_boundary_ok = position == 0 or !isAddedTokenWordBefore(input_bytes, position);
     const right_pos = position + content_len;
-    const right_boundary_ok = right_pos == input_bytes.len or !isAddedTokenWordByte(input_bytes[right_pos]);
+    const right_boundary_ok = right_pos == input_bytes.len or !isAddedTokenWordAt(input_bytes, right_pos);
     return left_boundary_ok and right_boundary_ok;
 }
 
@@ -1480,6 +1534,35 @@ test "tokenizer collect_added_spans does not match normalized false token on nor
     defer spans.deinit(Allocator);
 
     try std.testing.expectEqual(@as(usize, 0), spans.items.len);
+}
+
+test "tokenizer collect_added_spans does not match single_word token inside unicode letters" {
+    const allocator = std.testing.allocator;
+    const content: [:0]const u8 = "cat";
+
+    var added = ct.AddedToken{
+        .content = @constCast(@ptrCast(content.ptr)),
+        .id = 100,
+        .special = 0,
+        .single_word = 1,
+        .lstrip = 0,
+        .rstrip = 0,
+        .normalized = 1,
+        .next = null,
+    };
+    var tokenizer = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.added = &added;
+
+    inline for ([_][]const u8{ "écat", "cat日" }) |input| {
+        var normalizer = std.mem.zeroes(ct.Normalizer);
+        var normalized = try normalize.normalize_text(&normalizer, input);
+        defer normalized.deinit();
+
+        var spans = collect_added_spans(&tokenizer, &normalized, input) orelse return error.OutOfMemory;
+        defer spans.deinit(allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), spans.items.len);
+    }
 }
 
 test "encodeCombined preserves whitespace gap boundaries for non-byte-level bpe" {

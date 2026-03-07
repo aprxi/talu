@@ -57,6 +57,134 @@ const BYTE_FALLBACK_JSON: &str = r####"{
 }
 "####;
 
+fn nested_byte_fallback_decoder_json() -> String {
+    BYTE_FALLBACK_JSON.replace(
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+      {"type": "ByteFallback"},
+      {"type": "Fuse"},
+      {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+    ]
+  }"#,
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+          {"type": "ByteFallback"},
+          {"type": "Fuse"},
+          {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+        ]
+      }
+    ]
+  }"#,
+    )
+}
+
+fn outer_sequence_with_nested_byte_fallback_json() -> String {
+    BYTE_FALLBACK_JSON.replace(
+        r#"{"type": "ByteFallback"}"#,
+        r#"{
+        "type": "Sequence",
+        "decoders": [
+          {"type": "ByteFallback"}
+        ]
+      }"#,
+    )
+}
+
+fn outer_sequence_with_nested_fuse_json() -> String {
+    BYTE_FALLBACK_JSON.replace(
+        r#"{"type": "Fuse"}"#,
+        r#"{
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Fuse"}
+        ]
+      }"#,
+    )
+}
+
+/// A flat ByteFallback decoder followed by a Replace stage.
+const BYTE_FALLBACK_THEN_REPLACE_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "<0xC3>": 1,
+      "<0xA9>": 2
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "ByteFallback"},
+      {"type": "Replace", "pattern": {"String": "é"}, "content": "X"}
+    ]
+  }
+}
+"####;
+
+fn byte_fallback_then_nested_replace_json() -> String {
+    BYTE_FALLBACK_THEN_REPLACE_JSON.replace(
+        r#"{"type": "Replace", "pattern": {"String": "é"}, "content": "X"}"#,
+        r#"{
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Replace", "pattern": {"String": "é"}, "content": "X"}
+        ]
+      }"#,
+    )
+}
+
+const BYTE_FALLBACK_ONLY_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "<0xC3>": 1,
+      "<0xA9>": 2
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "ByteFallback"}
+}
+"####;
+
+fn nested_byte_fallback_only_decoder_json() -> String {
+    BYTE_FALLBACK_ONLY_JSON.replace(
+        r#""decoder": {"type": "ByteFallback"}"#,
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "ByteFallback"}
+        ]
+      }
+    ]
+  }"#,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Single-byte fallback
 // ---------------------------------------------------------------------------
@@ -147,6 +275,80 @@ fn decode_regular_then_byte_fallback_utf8() {
     assert_eq!(ctx.decode(&[4, 3, 9, 10]), "hello é");
 }
 
+/// A nested Sequence wrapper around the byte-fallback decoder chain must
+/// preserve the exact same decode output as the flat chain.
+#[test]
+fn nested_byte_fallback_decoder_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(BYTE_FALLBACK_JSON);
+    let nested = TokenizerTestContext::from_json(&nested_byte_fallback_decoder_json());
+
+    for ids in [&[9, 10][..], &[4, 3, 9, 10][..], &[14, 15, 16, 17][..]] {
+        assert_eq!(
+            nested.decode(ids),
+            flat.decode(ids),
+            "nested byte-fallback decoder must behave exactly like the flat chain for ids {ids:?}"
+        );
+    }
+}
+
+/// Nested ByteFallback-only decoders must behave exactly like the flat
+/// ByteFallback decoder. This isolates ByteFallback itself from Replace/Fuse/Strip.
+#[test]
+fn nested_byte_fallback_only_decoder_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(BYTE_FALLBACK_ONLY_JSON);
+    let nested = TokenizerTestContext::from_json(&nested_byte_fallback_only_decoder_json());
+    assert_eq!(
+        nested.decode(&[1, 2]),
+        flat.decode(&[1, 2]),
+        "nested ByteFallback-only decoder must match flat behavior"
+    );
+}
+
+/// A nested ByteFallback stage inside an otherwise flat outer Sequence must
+/// behave exactly like the flat byte-fallback chain.
+#[test]
+fn outer_sequence_with_nested_byte_fallback_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(BYTE_FALLBACK_JSON);
+    let nested = TokenizerTestContext::from_json(&outer_sequence_with_nested_byte_fallback_json());
+
+    for ids in [&[9, 10][..], &[4, 3, 9, 10][..], &[14, 15, 16, 17][..]] {
+        assert_eq!(
+            nested.decode(ids),
+            flat.decode(ids),
+            "outer Sequence with nested ByteFallback stage must match flat behavior for ids {ids:?}"
+        );
+    }
+}
+
+/// A nested Fuse stage inside an otherwise flat outer Sequence must behave
+/// exactly like the flat byte-fallback chain.
+#[test]
+fn outer_sequence_with_nested_fuse_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(BYTE_FALLBACK_JSON);
+    let nested = TokenizerTestContext::from_json(&outer_sequence_with_nested_fuse_json());
+
+    for ids in [&[9, 10][..], &[4, 3, 9, 10][..], &[14, 15, 16, 17][..]] {
+        assert_eq!(
+            nested.decode(ids),
+            flat.decode(ids),
+            "outer Sequence with nested Fuse stage must match flat behavior for ids {ids:?}"
+        );
+    }
+}
+
+/// A nested Replace stage after ByteFallback must behave exactly like the flat
+/// ByteFallback+Replace chain.
+#[test]
+fn byte_fallback_then_nested_replace_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(BYTE_FALLBACK_THEN_REPLACE_JSON);
+    let nested = TokenizerTestContext::from_json(&byte_fallback_then_nested_replace_json());
+    assert_eq!(
+        nested.decode(&[1, 2]),
+        flat.decode(&[1, 2]),
+        "ByteFallback followed by nested Replace must match flat behavior"
+    );
+}
+
 /// `▁hello` + `<0xF0>` + `<0x9F>` + `<0x98>` + `<0x8A>` → "hello😊".
 ///
 /// No separator between regular token and byte-fallback emoji.
@@ -232,6 +434,79 @@ fn decode_byte_fallback_skip_special_matches_manual_filtering() {
         ctx.decode_with(&full, &skip),
         ctx.decode_with(&filtered, &keep),
         "skip_special_tokens must match manual filtering for byte-fallback decode"
+    );
+}
+
+/// A root nested byte-fallback decoder subtree must preserve the same
+/// skip-special behavior as the flat decoder pipeline.
+#[test]
+fn nested_byte_fallback_decoder_skip_special_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(BYTE_FALLBACK_JSON);
+    let nested = TokenizerTestContext::from_json(&nested_byte_fallback_decoder_json());
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+        ..Default::default()
+    };
+    let ids = [1, 4, 3, 9, 10, 2, 5];
+    assert_eq!(
+        nested.decode_with(&ids, &skip),
+        flat.decode_with(&ids, &skip),
+        "root nested byte-fallback decoder must match flat skip-special behavior"
+    );
+}
+
+/// A root nested byte-fallback decoder subtree must also preserve retained
+/// special-token behavior, not just skip-special behavior.
+#[test]
+fn nested_byte_fallback_decoder_retain_special_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(BYTE_FALLBACK_JSON);
+    let nested = TokenizerTestContext::from_json(&nested_byte_fallback_decoder_json());
+    let keep = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+        ..Default::default()
+    };
+    let ids = [1, 4, 3, 9, 10, 2, 5];
+    assert_eq!(
+        nested.decode_with(&ids, &keep),
+        flat.decode_with(&ids, &keep),
+        "root nested byte-fallback decoder must match flat retain-special behavior"
+    );
+}
+
+/// Null decode options must preserve the same default skip-special behavior on
+/// a root nested byte-fallback decoder subtree as on the flat decoder.
+#[test]
+fn nested_byte_fallback_decoder_null_options_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(BYTE_FALLBACK_JSON);
+    let nested = TokenizerTestContext::from_json(&nested_byte_fallback_decoder_json());
+    let ids = [1, 4, 3, 9, 10, 2, 5];
+
+    let flat_result = unsafe { super::common::decode_raw_null_options(flat.handle(), &ids) };
+    assert!(flat_result.error_msg.is_null(), "flat decode with null options should succeed");
+    let flat_text = unsafe {
+        let slice = std::slice::from_raw_parts(flat_result.text, flat_result.text_len);
+        std::str::from_utf8(slice)
+            .expect("flat decode must return valid UTF-8")
+            .to_owned()
+    };
+    unsafe { talu_sys::talu_decode_result_free(flat_result.text, flat_result.text_len) };
+
+    let nested_result = unsafe { super::common::decode_raw_null_options(nested.handle(), &ids) };
+    assert!(
+        nested_result.error_msg.is_null(),
+        "nested decode with null options should succeed"
+    );
+    let nested_text = unsafe {
+        let slice = std::slice::from_raw_parts(nested_result.text, nested_result.text_len);
+        std::str::from_utf8(slice)
+            .expect("nested decode must return valid UTF-8")
+            .to_owned()
+    };
+    unsafe { talu_sys::talu_decode_result_free(nested_result.text, nested_result.text_len) };
+
+    assert_eq!(
+        nested_text, flat_text,
+        "root nested byte-fallback decoder must match flat null-options decode behavior"
     );
 }
 

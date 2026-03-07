@@ -297,7 +297,22 @@ fn functionStrftimeNow(e: *Evaluator, args: []const *const Expr) EvalError!Templ
         };
     }
 
-    const timestamp = std.time.timestamp();
+    if (e.ctx.get("strftime_now_override")) |override| {
+        switch (override) {
+            .string => |s| return .{ .string = s },
+            else => {},
+        }
+    }
+
+    const timestamp = blk: {
+        if (e.ctx.get("strftime_now_epoch_secs")) |override| {
+            switch (override) {
+                .integer => |secs| break :blk secs,
+                else => {},
+            }
+        }
+        break :blk std.time.timestamp();
+    };
     const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
     const day_secs = epoch_secs.getDaySeconds();
     const epoch_day = epoch_secs.getEpochDay();
@@ -520,6 +535,34 @@ test "callFunction float - from int" {
     const args = [_]*const Expr{&arg_expr};
     const result = try callFunction(&eval_ctx, "float", &args);
     try std.testing.expectEqual(@as(f64, 42.0), result.float);
+}
+
+test "callFunction strftime_now honors string override" {
+    var ctx = TemplateParser.init(std.testing.allocator);
+    defer ctx.deinit();
+    try ctx.set("strftime_now_override", .{ .string = "[TODAY]" });
+
+    var eval_ctx = Evaluator.init(std.testing.allocator, &ctx);
+    defer eval_ctx.deinit();
+
+    const fmt_expr = Expr{ .string = "%Y-%m-%d" };
+    const args = [_]*const Expr{&fmt_expr};
+    const result = try callFunction(&eval_ctx, "strftime_now", &args);
+    try std.testing.expectEqualStrings("[TODAY]", result.string);
+}
+
+test "callFunction strftime_now honors epoch override" {
+    var ctx = TemplateParser.init(std.testing.allocator);
+    defer ctx.deinit();
+    try ctx.set("strftime_now_epoch_secs", .{ .integer = 0 });
+
+    var eval_ctx = Evaluator.init(std.testing.allocator, &ctx);
+    defer eval_ctx.deinit();
+
+    const fmt_expr = Expr{ .string = "%Y-%m-%d %H:%M:%S" };
+    const args = [_]*const Expr{&fmt_expr};
+    const result = try callFunction(&eval_ctx, "strftime_now", &args);
+    try std.testing.expectEqualStrings("1970-01-01 00:00:00", result.string);
 }
 
 test "callFunction dict" {

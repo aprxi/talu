@@ -281,6 +281,47 @@ fn offsets_unknown_middle_word_keep_neighbor_boundaries() {
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
+/// A literal continuing-subword prefix in raw input must not be treated as a
+/// position-0 WordPiece token. BertPreTokenizer splits the punctuation, so the
+/// raw text "##ing" becomes "#" "#" "ing", not the vocab token "##ing".
+#[test]
+fn encode_literal_continuing_prefix_at_word_start_is_not_promoted_to_subword_id() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    assert_eq!(ctx.encode("##ing"), vec![0, 0, 0]);
+    assert_eq!(
+        tokenize_strings(&ctx, "##ing"),
+        vec!["[UNK]", "[UNK]", "[UNK]"]
+    );
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "##ing"),
+        vec!["[UNK]", "[UNK]", "[UNK]"]
+    );
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"##ing", &no_bos()) };
+    assert!(result.error_msg.is_null());
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
+    assert_eq!((offsets[2].start, offsets[2].end), (2, 5));
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// A literal "##" prefix before a known whole word must remain punctuation in
+/// the raw encode path rather than being stripped into a fake subword match.
+#[test]
+fn encode_literal_continuing_prefix_before_known_word_preserves_punctuation_split() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    assert_eq!(ctx.encode("##hello"), vec![0, 0, 4]);
+    assert_eq!(
+        tokenize_strings(&ctx, "##hello"),
+        vec!["[UNK]", "[UNK]", "hello"]
+    );
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "##hello"),
+        vec!["[UNK]", "[UNK]", "hello"]
+    );
+}
+
 /// When skip_special_tokens removes a leading special token, the first
 /// remaining WordPiece subword must still decode as position 0 and preserve its
 /// `##` prefix.
@@ -631,6 +672,589 @@ fn cleanup_false_preserves_contraction_spacing() {
     assert_eq!(
         decoded, "i 'm",
         "cleanup=false must preserve space before apostrophe contraction, got: {decoded:?}"
+    );
+}
+
+/// Wrapping a WordPiece decoder in a Sequence must preserve the same runtime
+/// behavior, including `cleanup=false`.
+#[test]
+fn nested_wordpiece_decoder_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "i": 3, "'m": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+    "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "WordPiece", "prefix": "##", "cleanup": false}
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    assert_eq!(
+        nested.decode(&[3, 4]),
+        flat.decode(&[3, 4]),
+        "nested WordPiece decoder must match flat behavior"
+    );
+}
+
+/// A root nested WordPiece subtree must also preserve the exact runtime
+/// behavior of the flat decoder.
+#[test]
+fn doubly_nested_wordpiece_decoder_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "i": 3, "'m": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "WordPiece", "prefix": "##", "cleanup": false}
+        ]
+      }
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    assert_eq!(
+        nested.decode(&[3, 4]),
+        flat.decode(&[3, 4]),
+        "doubly nested WordPiece decoder must match flat behavior"
+    );
+}
+
+/// Root nested WordPiece with `cleanup=true` must preserve the exact cleanup
+/// behavior of the flat decoder.
+#[test]
+fn doubly_nested_wordpiece_decoder_cleanup_true_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0,
+      "hello": 1, ",": 2, "world": 3, "?": 4
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "WordPiece", "prefix": "##", "cleanup": true}
+        ]
+      }
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    assert_eq!(
+        nested.decode(&[1, 2, 3, 4]),
+        flat.decode(&[1, 2, 3, 4]),
+        "doubly nested WordPiece decoder with cleanup=true must match flat behavior"
+    );
+}
+
+/// Root nested WordPiece with `cleanup=true` must also preserve contraction
+/// cleanup behavior, not just punctuation cleanup.
+#[test]
+fn doubly_nested_wordpiece_cleanup_true_contraction_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0,
+      "i": 1, "'m": 2
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "WordPiece", "prefix": "##", "cleanup": true}
+        ]
+      }
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    assert_eq!(
+        nested.decode(&[1, 2]),
+        flat.decode(&[1, 2]),
+        "doubly nested WordPiece cleanup=true contraction behavior must match flat"
+    );
+}
+
+/// Root nested WordPiece with `cleanup=true` must also preserve punctuation
+/// cleanup behavior when special tokens are retained or skipped.
+#[test]
+fn doubly_nested_wordpiece_cleanup_true_punctuation_with_specials_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, ",": 4, "world": 5, "?": 6
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "WordPiece", "prefix": "##", "cleanup": true}
+        ]
+      }
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    let keep = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    let ids = [1, 3, 4, 5, 6, 2];
+
+    assert_eq!(
+        nested.decode_with(&ids, &keep),
+        flat.decode_with(&ids, &keep),
+        "doubly nested WordPiece cleanup=true punctuation retain-special behavior must match flat"
+    );
+    assert_eq!(
+        nested.decode_with(&ids, &skip),
+        flat.decode_with(&ids, &skip),
+        "doubly nested WordPiece cleanup=true punctuation skip-special behavior must match flat"
+    );
+}
+
+/// Root nested WordPiece with `cleanup=false` must preserve the same
+/// skip-special behavior as the flat decoder.
+#[test]
+fn doubly_nested_wordpiece_cleanup_false_skip_special_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "i": 3, "'m": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "WordPiece", "prefix": "##", "cleanup": false}
+        ]
+      }
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    let keep = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+
+    assert_eq!(
+        nested.decode_with(&[1, 3, 4, 2], &keep),
+        flat.decode_with(&[1, 3, 4, 2], &keep),
+        "doubly nested WordPiece cleanup=false retain-special behavior must match flat"
+    );
+    assert_eq!(
+        nested.decode_with(&[1, 3, 4, 2], &skip),
+        flat.decode_with(&[1, 3, 4, 2], &skip),
+        "doubly nested WordPiece cleanup=false skip-special behavior must match flat"
+    );
+}
+
+/// Even when special tokens are stripped, a doubly nested WordPiece decoder
+/// with `cleanup=false` must preserve the same non-cleanup spacing as the flat
+/// decoder.
+#[test]
+fn doubly_nested_wordpiece_cleanup_false_skip_only_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "i": 3, "'m": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "WordPiece", "prefix": "##", "cleanup": false}
+        ]
+      }
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+
+    assert_eq!(
+        nested.decode_with(&[1, 3, 4, 2], &skip),
+        flat.decode_with(&[1, 3, 4, 2], &skip),
+        "doubly nested WordPiece cleanup=false skip-only behavior must match flat"
+    );
+}
+
+/// Null decode options must preserve the same default skip-special behavior on
+/// a root nested WordPiece cleanup=false decoder as on the flat decoder.
+#[test]
+fn doubly_nested_wordpiece_cleanup_false_null_options_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "i": 3, "'m": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "WordPiece", "prefix": "##", "cleanup": false}
+        ]
+      }
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    let ids = [1, 3, 4, 2];
+
+    let flat_result = unsafe { super::common::decode_raw_null_options(flat.handle(), &ids) };
+    assert!(flat_result.error_msg.is_null(), "flat decode with null options should succeed");
+    let flat_text = unsafe {
+        let slice = std::slice::from_raw_parts(flat_result.text, flat_result.text_len);
+        std::str::from_utf8(slice)
+            .expect("flat decode must return valid UTF-8")
+            .to_owned()
+    };
+    unsafe { talu_sys::talu_decode_result_free(flat_result.text, flat_result.text_len) };
+
+    let nested_result = unsafe { super::common::decode_raw_null_options(nested.handle(), &ids) };
+    assert!(
+        nested_result.error_msg.is_null(),
+        "nested decode with null options should succeed"
+    );
+    let nested_text = unsafe {
+        let slice = std::slice::from_raw_parts(nested_result.text, nested_result.text_len);
+        std::str::from_utf8(slice)
+            .expect("nested decode must return valid UTF-8")
+            .to_owned()
+    };
+    unsafe { talu_sys::talu_decode_result_free(nested_result.text, nested_result.text_len) };
+
+    assert_eq!(
+        nested_text, flat_text,
+        "doubly nested WordPiece cleanup=false must match flat null-options decode behavior"
+    );
+}
+
+/// Root nested WordPiece with `cleanup=false` must also preserve punctuation
+/// spacing behavior, not just apostrophe-contraction spacing.
+#[test]
+fn doubly_nested_wordpiece_cleanup_false_punctuation_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0,
+      "hello": 1, ",": 2, "world": 3, "?": 4
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "WordPiece", "prefix": "##", "cleanup": false}
+        ]
+      }
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    assert_eq!(
+        nested.decode(&[1, 2, 3, 4]),
+        flat.decode(&[1, 2, 3, 4]),
+        "doubly nested WordPiece cleanup=false punctuation behavior must match flat"
+    );
+}
+
+/// Root nested WordPiece with `cleanup=false` must preserve punctuation
+/// spacing behavior even when special tokens are retained or skipped.
+#[test]
+fn doubly_nested_wordpiece_cleanup_false_punctuation_with_specials_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, ",": 4, "world": 5, "?": 6
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "WordPiece", "prefix": "##", "cleanup": false}
+        ]
+      }
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    let keep = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    let ids = [1, 3, 4, 5, 6, 2];
+
+    assert_eq!(
+        nested.decode_with(&ids, &keep),
+        flat.decode_with(&ids, &keep),
+        "doubly nested WordPiece cleanup=false punctuation retain-special behavior must match flat"
+    );
+    assert_eq!(
+        nested.decode_with(&ids, &skip),
+        flat.decode_with(&ids, &skip),
+        "doubly nested WordPiece cleanup=false punctuation skip-special behavior must match flat"
+    );
+}
+
+/// Even when special tokens are stripped, a doubly nested WordPiece decoder
+/// with `cleanup=false` must preserve flat punctuation spacing behavior.
+#[test]
+fn doubly_nested_wordpiece_cleanup_false_punctuation_skip_only_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, ",": 4, "world": 5, "?": 6
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let nested_json = flat_json.replace(
+        r###""decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}"###,
+        r###""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "WordPiece", "prefix": "##", "cleanup": false}
+        ]
+      }
+    ]
+  }"###,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    let ids = [1, 3, 4, 5, 6, 2];
+
+    assert_eq!(
+        nested.decode_with(&ids, &skip),
+        flat.decode_with(&ids, &skip),
+        "doubly nested WordPiece cleanup=false punctuation skip-only behavior must match flat"
     );
 }
 

@@ -678,6 +678,206 @@ fn unigram_viterbi_subword_selection() {
     );
 }
 
+/// Equal-score paths must remain deterministic: ties keep the first path
+/// encountered in vocab order because the DP only updates on strictly better
+/// scores.
+#[test]
+fn unigram_equal_score_tie_prefers_earlier_whole_token() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "vocab": [
+      ["ab", -2.0],
+      ["a", -1.0],
+      ["b", -1.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("ab", &opts);
+    assert_eq!(
+        tokens,
+        vec![0],
+        "equal-score tie must keep the earlier whole-token path, got: {tokens:?}"
+    );
+}
+
+/// The same equal-score tie must flip when vocab order changes, proving the
+/// contract is vocab-order determinism rather than an accidental preference for
+/// whole-word matches.
+#[test]
+fn unigram_equal_score_tie_tracks_vocab_order() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "vocab": [
+      ["a", -1.0],
+      ["ab", -2.0],
+      ["b", -1.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("ab", &opts);
+    assert_eq!(
+        tokens,
+        vec![0, 2],
+        "equal-score tie must follow first-seen vocab order, got: {tokens:?}"
+    );
+}
+
+/// Multi-branch equal-score ties must still follow first-seen vocab order at
+/// each DP position, not an accidental preference for fewer tokens or longer
+/// matches.
+#[test]
+fn unigram_equal_score_multibranch_tie_prefers_first_seen_path() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "vocab": [
+      ["a", -1.0],
+      ["ab", -2.0],
+      ["abc", -3.0],
+      ["bc", -2.0],
+      ["b", -1.0],
+      ["c", -1.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("abc", &opts);
+    assert_eq!(
+        tokens,
+        vec![0, 3],
+        "multi-branch equal-score tie must keep the first-seen path per DP state, got: {tokens:?}"
+    );
+}
+
+/// Reordering the same equal-score multi-branch vocab must flip the chosen
+/// path, proving the contract is stable vocab-order determinism rather than an
+/// incidental longest-match heuristic.
+#[test]
+fn unigram_equal_score_multibranch_tie_tracks_vocab_order() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "vocab": [
+      ["abc", -3.0],
+      ["ab", -2.0],
+      ["a", -1.0],
+      ["bc", -2.0],
+      ["b", -1.0],
+      ["c", -1.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("abc", &opts);
+    assert_eq!(
+        tokens,
+        vec![0],
+        "reordered multi-branch equal-score tie must follow first-seen vocab order, got: {tokens:?}"
+    );
+}
+
+/// Near-epsilon score advantages must still be honored deterministically. A
+/// whole token that is slightly better than the split path must win.
+#[test]
+fn unigram_near_epsilon_score_advantage_prefers_whole_token() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "vocab": [
+      ["ab", -2.0000000],
+      ["a", -1.0000000],
+      ["b", -1.0000010]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("ab", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![0],
+        "slightly better whole-token score must beat the split path, got: {tokens:?}"
+    );
+}
+
+/// The converse near-epsilon case must also be stable: if the split path is
+/// slightly better than the whole token, Viterbi must choose the split.
+#[test]
+fn unigram_near_epsilon_score_advantage_prefers_split_path() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "vocab": [
+      ["ab", -2.0000020],
+      ["a", -1.0000000],
+      ["b", -1.0000010]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("ab", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![1, 2],
+        "slightly better split path must beat the whole token, got: {tokens:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Unigram with unk_id: unknown chars produce unk token
 // ---------------------------------------------------------------------------
@@ -727,6 +927,39 @@ fn unigram_long_unbroken_input_deterministic() {
     assert!(
         !first.is_empty(),
         "long unigram input should produce at least one token"
+    );
+}
+
+/// Long repeated input must not drift to a different local segmentation based
+/// on absolute position in the stream.
+#[test]
+fn unigram_long_repeated_words_keep_same_local_segmentation() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581hello", -0.1],
+      ["\u2581he", -0.2],
+      ["llo", -0.2]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = std::iter::repeat_n("hello", 2000).collect::<Vec<_>>().join(" ");
+    let tokens = ctx.encode_with(&input, &no_bos());
+
+    assert_eq!(tokens.len(), 2000, "each repeated word should stay one token");
+    assert!(
+        tokens.iter().all(|&id| id == 1),
+        "all repeated words should keep the same winning token regardless of absolute position"
     );
 }
 

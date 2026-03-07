@@ -31,20 +31,15 @@ fn main() {
     // Re-run this build script whenever the native library changes so the
     // copy in target/<profile>/deps/ stays in sync with zig-out/lib/.
     println!("cargo:rerun-if-changed={}", src.display());
+    // Cargo does not otherwise know that the Rust tests depend on Zig sources.
+    // Track the core tokenizer sources too so Zig edits trigger a fresh copy.
+    println!("cargo:rerun-if-changed=../../core/src");
 
     if src.exists() {
-        // Copy only if source is newer or destination is missing.
-        let needs_copy = !dst.exists() || {
-            let src_meta = std::fs::metadata(&src).ok();
-            let dst_meta = std::fs::metadata(&dst).ok();
-            match (src_meta, dst_meta) {
-                (Some(s), Some(d)) => s.modified().ok() > d.modified().ok(),
-                _ => true,
-            }
-        };
-        if needs_copy {
-            std::fs::copy(&src, &dst).expect("failed to copy libtalu into deps/");
-        }
+        // Always refresh the test-side copy when this build script runs.
+        // Zig can preserve the installed library's mtime across rebuilds, which
+        // makes an mtime-only check stale even when the contents changed.
+        std::fs::copy(&src, &dst).expect("failed to copy libtalu into deps/");
     }
 
     // $ORIGIN: the dynamic linker looks in the directory containing the

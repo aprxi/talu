@@ -332,6 +332,223 @@ const SEQUENCE_STRIP_DECODER_JSON: &str = r####"{
   }
 }"####;
 
+fn nested_sequence_strip_decoder_json() -> String {
+    SEQUENCE_STRIP_DECODER_JSON.replace(
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "Replace", "pattern": {"String": "\u2581"}, "content": " "},
+      {"type": "ByteFallback"},
+      {"type": "Fuse"},
+      {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+    ]
+  }"#,
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Replace", "pattern": {"String": "\u2581"}, "content": " "},
+          {"type": "ByteFallback"},
+          {"type": "Fuse"},
+          {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+        ]
+      }
+    ]
+  }"#,
+    )
+}
+
+fn nested_metaspace_decoder_json() -> String {
+    SENTENCEPIECE_BPE_JSON.replace(
+        r#""decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}"#,
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}
+    ]
+  }"#,
+    )
+}
+
+fn doubly_nested_metaspace_decoder_json() -> String {
+    SENTENCEPIECE_BPE_JSON.replace(
+        r#""decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}"#,
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}
+        ]
+      }
+    ]
+  }"#,
+    )
+}
+
+fn doubly_nested_metaspace_special_decoder_json() -> String {
+    METASPACE_SPECIAL_TOKEN_JSON.replace(
+        r#""decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}"#,
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}
+        ]
+      }
+    ]
+  }"#,
+    )
+}
+
+fn flat_metaspace_special_no_prefix_json() -> &'static str {
+    r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581": 3,
+      "\u2581and": 4, "\u2581are": 5, "\u2581special": 6, "\u2581tokens": 7
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": false}
+}"####
+}
+
+fn doubly_nested_metaspace_special_no_prefix_json() -> String {
+    flat_metaspace_special_no_prefix_json().replace(
+        r#""decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": false}"#,
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": false}
+        ]
+      }
+    ]
+  }"#,
+    )
+}
+
+fn outer_sequence_with_nested_replace_json() -> String {
+    SEQUENCE_STRIP_DECODER_JSON.replace(
+        r#"{"type": "Replace", "pattern": {"String": "\u2581"}, "content": " "}"#,
+        r#"{
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Replace", "pattern": {"String": "\u2581"}, "content": " "}
+        ]
+      }"#,
+    )
+}
+
+fn outer_sequence_with_nested_strip_json() -> String {
+    SEQUENCE_STRIP_DECODER_JSON.replace(
+        r#"{"type": "Strip", "content": " ", "start": 1, "stop": 0}"#,
+        r#"{
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+        ]
+      }"#,
+    )
+}
+
+const REPLACE_ONLY_DECODER_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "\u2581Hello": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "Replace", "pattern": {"String": "\u2581"}, "content": " "}
+    ]
+  }
+}"####;
+
+fn nested_replace_only_decoder_json() -> String {
+    REPLACE_ONLY_DECODER_JSON.replace(
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "Replace", "pattern": {"String": "\u2581"}, "content": " "}
+    ]
+  }"#,
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Replace", "pattern": {"String": "\u2581"}, "content": " "}
+        ]
+      }
+    ]
+  }"#,
+    )
+}
+
+const STRIP_ONLY_DECODER_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      " hello": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+}"####;
+
+fn nested_strip_only_decoder_json() -> String {
+    STRIP_ONLY_DECODER_JSON.replace(
+        r#""decoder": {"type": "Strip", "content": " ", "start": 1, "stop": 0}"#,
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+        ]
+      }
+    ]
+  }"#,
+    )
+}
+
 /// ▁▁▁▁ (4 metaspace chars) must decode to "   " (3 spaces).
 ///
 /// Replace converts each ▁ to a space (4 spaces), then Strip removes
@@ -363,6 +580,80 @@ fn sequence_decode_words_strip_one_leading() {
         decoded, "Hello world",
         "▁Hello + ▁world must decode to 'Hello world', got: {decoded:?}"
     );
+}
+
+/// A nested Sequence decoder wrapper must preserve the exact runtime behavior
+/// of the equivalent flat Replace+ByteFallback+Fuse+Strip chain.
+#[test]
+fn nested_sequence_decoder_matches_flat_sequence_behavior() {
+    let flat = TokenizerTestContext::from_json(SEQUENCE_STRIP_DECODER_JSON);
+    let nested = TokenizerTestContext::from_json(&nested_sequence_strip_decoder_json());
+
+    for ids in [&[4][..], &[5, 6][..]] {
+        assert_eq!(
+            nested.decode(ids),
+            flat.decode(ids),
+            "nested Sequence decoder must behave exactly like the equivalent flat chain for ids {ids:?}"
+        );
+    }
+}
+
+/// Nested Replace-only decoders must behave exactly like the flat Replace
+/// chain. This isolates whether nested decoder traversal applies Replace at
+/// all, independent of ByteFallback/Fuse/Strip.
+#[test]
+fn nested_replace_only_decoder_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(REPLACE_ONLY_DECODER_JSON);
+    let nested = TokenizerTestContext::from_json(&nested_replace_only_decoder_json());
+    assert_eq!(
+        nested.decode(&[1]),
+        flat.decode(&[1]),
+        "nested Replace-only decoder must match flat behavior"
+    );
+}
+
+/// Nested Strip-only decoders must behave exactly like the flat Strip decoder.
+#[test]
+fn nested_strip_only_decoder_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(STRIP_ONLY_DECODER_JSON);
+    let nested = TokenizerTestContext::from_json(&nested_strip_only_decoder_json());
+    assert_eq!(
+        nested.decode(&[1]),
+        flat.decode(&[1]),
+        "nested Strip-only decoder must match flat behavior"
+    );
+}
+
+/// A nested Replace stage inside an otherwise flat outer Sequence must behave
+/// exactly like the flat chain.
+#[test]
+fn outer_sequence_with_nested_replace_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(SEQUENCE_STRIP_DECODER_JSON);
+    let nested = TokenizerTestContext::from_json(&outer_sequence_with_nested_replace_json());
+
+    for ids in [&[4][..], &[5, 6][..]] {
+        assert_eq!(
+            nested.decode(ids),
+            flat.decode(ids),
+            "outer Sequence with nested Replace stage must match flat behavior for ids {ids:?}"
+        );
+    }
+}
+
+/// A nested Strip stage inside an otherwise flat outer Sequence must behave
+/// exactly like the flat chain.
+#[test]
+fn outer_sequence_with_nested_strip_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(SEQUENCE_STRIP_DECODER_JSON);
+    let nested = TokenizerTestContext::from_json(&outer_sequence_with_nested_strip_json());
+
+    for ids in [&[4][..], &[5, 6][..]] {
+        assert_eq!(
+            nested.decode(ids),
+            flat.decode(ids),
+            "outer Sequence with nested Strip stage must match flat behavior for ids {ids:?}"
+        );
+    }
 }
 
 /// Minimal SentencePiece-style BPE with unique vocab keys.
@@ -408,6 +699,262 @@ fn sentencepiece_decode_preserves_accented_chars() {
     assert_eq!(
         decoded, "café",
         "SentencePiece BPE must preserve é, got: {decoded:?}"
+    );
+}
+
+/// Wrapping a Metaspace decoder in a Sequence must not change runtime decode
+/// behavior for the same token stream.
+#[test]
+fn nested_metaspace_decoder_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(SENTENCEPIECE_BPE_JSON);
+    let nested = TokenizerTestContext::from_json(&nested_metaspace_decoder_json());
+
+    for ids in [&[4, 5][..], &[12, 13, 14, 15][..]] {
+        assert_eq!(
+            nested.decode(ids),
+            flat.decode(ids),
+            "nested Metaspace decoder must behave exactly like the flat decoder for ids {ids:?}"
+        );
+    }
+}
+
+/// A root nested Metaspace subtree must also preserve the exact runtime
+/// behavior of the flat decoder.
+#[test]
+fn doubly_nested_metaspace_decoder_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(SENTENCEPIECE_BPE_JSON);
+    let nested = TokenizerTestContext::from_json(&doubly_nested_metaspace_decoder_json());
+
+    for ids in [&[4, 5][..], &[12, 13, 14, 15][..]] {
+        assert_eq!(
+            nested.decode(ids),
+            flat.decode(ids),
+            "doubly nested Metaspace decoder must behave exactly like the flat decoder for ids {ids:?}"
+        );
+    }
+}
+
+/// Root nested Metaspace must also preserve the non-default
+/// `add_prefix_space=false` behavior of the flat decoder.
+#[test]
+fn doubly_nested_metaspace_no_prefix_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "\u2581hello": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": false}
+}"####;
+    let nested_json = flat_json.replace(
+        r#""decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": false}"#,
+        r#""decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": false}
+        ]
+      }
+    ]
+  }"#,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    assert_eq!(
+        nested.decode(&[1]),
+        flat.decode(&[1]),
+        "doubly nested Metaspace with add_prefix_space=false must match flat behavior"
+    );
+}
+
+/// A flat Metaspace decoder followed by a nested Strip stage must behave like
+/// the equivalent flat Sequence(Metaspace, Strip) chain.
+#[test]
+fn metaspace_then_nested_strip_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "\u2581caf": 1, "é": 2
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true},
+      {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+    ]
+  }
+}"####;
+    let nested_json = flat_json.replace(
+        r#"{"type": "Strip", "content": " ", "start": 1, "stop": 0}"#,
+        r#"{
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+        ]
+      }"#,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    assert_eq!(
+        nested.decode(&[1, 2]),
+        flat.decode(&[1, 2]),
+        "Metaspace followed by nested Strip must match the flat decoder chain"
+    );
+}
+
+/// A flat Metaspace decoder followed by a nested Replace stage must behave
+/// like the equivalent flat Sequence(Metaspace, Replace) chain.
+#[test]
+fn metaspace_then_nested_replace_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "\u2581caf": 1, "é": 2
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true},
+      {"type": "Replace", "pattern": {"String": " "}, "content": "_"}
+    ]
+  }
+}"####;
+    let nested_json = flat_json.replace(
+        r#"{"type": "Replace", "pattern": {"String": " "}, "content": "_"}"#,
+        r#"{
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Replace", "pattern": {"String": " "}, "content": "_"}
+        ]
+      }"#,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    assert_eq!(
+        nested.decode(&[1, 2]),
+        flat.decode(&[1, 2]),
+        "Metaspace followed by nested Replace must match the flat decoder chain"
+    );
+}
+
+/// A flat WordPiece decoder with `cleanup=false` followed by a nested Strip
+/// stage must preserve the same runtime behavior as the flat chain.
+#[test]
+fn wordpiece_then_nested_strip_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0,
+      " hello": 1
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "WordPiece", "prefix": "##", "cleanup": false},
+      {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+    ]
+  }
+}"####;
+    let nested_json = flat_json.replace(
+        r#"{"type": "Strip", "content": " ", "start": 1, "stop": 0}"#,
+        r#"{
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+        ]
+      }"#,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    assert_eq!(
+        nested.decode(&[1]),
+        flat.decode(&[1]),
+        "WordPiece followed by nested Strip must match the flat decoder chain"
+    );
+}
+
+/// A flat WordPiece decoder with `cleanup=false` followed by a nested Replace
+/// stage must preserve the same runtime behavior as the flat chain.
+#[test]
+fn wordpiece_then_nested_replace_matches_flat_behavior() {
+    let flat_json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0,
+      "i": 1, "'m": 2
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "WordPiece", "prefix": "##", "cleanup": false},
+      {"type": "Replace", "pattern": {"String": " "}, "content": "_"}
+    ]
+  }
+}"####;
+    let nested_json = flat_json.replace(
+        r#"{"type": "Replace", "pattern": {"String": " "}, "content": "_"}"#,
+        r#"{
+        "type": "Sequence",
+        "decoders": [
+          {"type": "Replace", "pattern": {"String": " "}, "content": "_"}
+        ]
+      }"#,
+    );
+
+    let flat = TokenizerTestContext::from_json(flat_json);
+    let nested = TokenizerTestContext::from_json(&nested_json);
+    assert_eq!(
+        nested.decode(&[1, 2]),
+        flat.decode(&[1, 2]),
+        "WordPiece followed by nested Replace must match the flat decoder chain"
     );
 }
 
@@ -675,6 +1222,163 @@ fn metaspace_encode_with_special_tokens() {
     );
 }
 
+/// The Metaspace decoder must roundtrip the same special-token boundary shape
+/// that the encoder emits: special literals retained, internal spaces restored,
+/// and the standalone ▁ before </s> becoming a real trailing space.
+#[test]
+fn metaspace_decode_with_special_tokens_roundtrips_exact_text() {
+    let ctx = TokenizerTestContext::from_json(METASPACE_SPECIAL_TOKEN_JSON);
+    let retain = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    let decoded = ctx.decode_with(&[1, 4, 3, 2, 5, 6, 7], &retain);
+    assert_eq!(
+        decoded, "<s> and </s> are special tokens",
+        "Metaspace decode must restore spaces exactly across retained special-token boundaries, got: {decoded:?}"
+    );
+}
+
+/// Root nested Metaspace must preserve the same retained-special-token decode
+/// behavior as the flat decoder on special-token boundary text.
+#[test]
+fn doubly_nested_metaspace_with_special_tokens_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(METASPACE_SPECIAL_TOKEN_JSON);
+    let nested = TokenizerTestContext::from_json(&doubly_nested_metaspace_special_decoder_json());
+    let retain = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    assert_eq!(
+        nested.decode_with(&[1, 4, 3, 2, 5, 6, 7], &retain),
+        flat.decode_with(&[1, 4, 3, 2, 5, 6, 7], &retain),
+        "doubly nested Metaspace must match flat retained-special behavior across special-token boundaries"
+    );
+}
+
+/// Root nested Metaspace must also preserve special-token boundary behavior on
+/// the non-default `add_prefix_space=false` branch.
+#[test]
+fn doubly_nested_metaspace_no_prefix_with_special_tokens_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(flat_metaspace_special_no_prefix_json());
+    let nested =
+        TokenizerTestContext::from_json(&doubly_nested_metaspace_special_no_prefix_json());
+    let retain = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    assert_eq!(
+        nested.decode_with(&[1, 4, 3, 2, 5, 6, 7], &retain),
+        flat.decode_with(&[1, 4, 3, 2, 5, 6, 7], &retain),
+        "doubly nested Metaspace add_prefix_space=false must match flat retained-special behavior"
+    );
+}
+
+/// Root nested Metaspace must also preserve skip-special behavior on the
+/// non-default `add_prefix_space=false` branch.
+#[test]
+fn doubly_nested_metaspace_no_prefix_with_special_tokens_skip_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(flat_metaspace_special_no_prefix_json());
+    let nested =
+        TokenizerTestContext::from_json(&doubly_nested_metaspace_special_no_prefix_json());
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    assert_eq!(
+        nested.decode_with(&[1, 4, 3, 2, 5, 6, 7], &skip),
+        flat.decode_with(&[1, 4, 3, 2, 5, 6, 7], &skip),
+        "doubly nested Metaspace add_prefix_space=false must match flat skip-special behavior"
+    );
+}
+
+/// Null decode options must preserve the same default skip-special behavior on
+/// the root nested Metaspace `add_prefix_space=false` branch as on the flat decoder.
+#[test]
+fn doubly_nested_metaspace_no_prefix_with_special_tokens_null_options_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(flat_metaspace_special_no_prefix_json());
+    let nested =
+        TokenizerTestContext::from_json(&doubly_nested_metaspace_special_no_prefix_json());
+    let ids = [1, 4, 3, 2, 5, 6, 7];
+
+    let flat_result = unsafe { super::common::decode_raw_null_options(flat.handle(), &ids) };
+    assert!(flat_result.error_msg.is_null(), "flat decode with null options should succeed");
+    let flat_text = unsafe {
+        let slice = std::slice::from_raw_parts(flat_result.text, flat_result.text_len);
+        std::str::from_utf8(slice)
+            .expect("flat decode must return valid UTF-8")
+            .to_owned()
+    };
+    unsafe { talu_sys::talu_decode_result_free(flat_result.text, flat_result.text_len) };
+
+    let nested_result = unsafe { super::common::decode_raw_null_options(nested.handle(), &ids) };
+    assert!(
+        nested_result.error_msg.is_null(),
+        "nested decode with null options should succeed"
+    );
+    let nested_text = unsafe {
+        let slice = std::slice::from_raw_parts(nested_result.text, nested_result.text_len);
+        std::str::from_utf8(slice)
+            .expect("nested decode must return valid UTF-8")
+            .to_owned()
+    };
+    unsafe { talu_sys::talu_decode_result_free(nested_result.text, nested_result.text_len) };
+
+    assert_eq!(
+        nested_text, flat_text,
+        "doubly nested Metaspace add_prefix_space=false must match flat null-options decode behavior"
+    );
+}
+
+/// Root nested Metaspace must also preserve skip-special behavior across
+/// special-token boundaries on the `add_prefix_space=true` branch.
+#[test]
+fn doubly_nested_metaspace_with_special_tokens_skip_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(METASPACE_SPECIAL_TOKEN_JSON);
+    let nested = TokenizerTestContext::from_json(&doubly_nested_metaspace_special_decoder_json());
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    assert_eq!(
+        nested.decode_with(&[1, 4, 3, 2, 5, 6, 7], &skip),
+        flat.decode_with(&[1, 4, 3, 2, 5, 6, 7], &skip),
+        "doubly nested Metaspace must match flat skip-special behavior across special-token boundaries"
+    );
+}
+
+/// Null decode options must preserve the same default skip-special behavior on
+/// a root nested Metaspace decoder subtree as on the flat decoder.
+#[test]
+fn doubly_nested_metaspace_with_special_tokens_null_options_matches_flat_behavior() {
+    let flat = TokenizerTestContext::from_json(METASPACE_SPECIAL_TOKEN_JSON);
+    let nested = TokenizerTestContext::from_json(&doubly_nested_metaspace_special_decoder_json());
+    let ids = [1, 4, 3, 2, 5, 6, 7];
+
+    let flat_result = unsafe { super::common::decode_raw_null_options(flat.handle(), &ids) };
+    assert!(flat_result.error_msg.is_null(), "flat decode with null options should succeed");
+    let flat_text = unsafe {
+        let slice = std::slice::from_raw_parts(flat_result.text, flat_result.text_len);
+        std::str::from_utf8(slice)
+            .expect("flat decode must return valid UTF-8")
+            .to_owned()
+    };
+    unsafe { talu_sys::talu_decode_result_free(flat_result.text, flat_result.text_len) };
+
+    let nested_result = unsafe { super::common::decode_raw_null_options(nested.handle(), &ids) };
+    assert!(
+        nested_result.error_msg.is_null(),
+        "nested decode with null options should succeed"
+    );
+    let nested_text = unsafe {
+        let slice = std::slice::from_raw_parts(nested_result.text, nested_result.text_len);
+        std::str::from_utf8(slice)
+            .expect("nested decode must return valid UTF-8")
+            .to_owned()
+    };
+    unsafe { talu_sys::talu_decode_result_free(nested_result.text, nested_result.text_len) };
+
+    assert_eq!(
+        nested_text, flat_text,
+        "doubly nested Metaspace must match flat null-options decode behavior across special-token boundaries"
+    );
+}
+
 // ===========================================================================
 // ByteLevel BPE: added token with tab character decodes correctly
 // ===========================================================================
@@ -784,6 +1488,22 @@ fn sentencepiece_prepend_rearms_after_second_special_token() {
         tokens,
         vec![1, 3, 15, 3, 2, 3, 20],
         "prepend ▁ must re-arm after every special token, got: {tokens:?}"
+    );
+}
+
+/// This fixture has `decoder: null`, so decode must preserve the raw
+/// SentencePiece marker tokens exactly as stored in vocab. Retained specials
+/// must not cause the raw `▁` markers around them to be dropped or fused.
+#[test]
+fn sentencepiece_prepend_decode_without_decoder_preserves_raw_markers() {
+    let ctx = TokenizerTestContext::from_json(PREPEND_REPLACE_BPE_JSON);
+    let retain = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    let decoded = ctx.decode_with(&[1, 3, 15, 3, 2, 3, 20], &retain);
+    assert_eq!(
+        decoded, "<s>▁▁hello▁</s>▁▁world",
+        "without an explicit decoder, decode must preserve raw SentencePiece marker tokens across retained specials, got: {decoded:?}"
     );
 }
 
@@ -1126,6 +1846,76 @@ fn cleanup_disabled_preserves_spaces() {
     assert_eq!(
         decoded, "i 'm sure ?",
         "cleanup=false must preserve intermediate spaces, got: {decoded:?}"
+    );
+}
+
+/// Cleanup removes only the space immediately before punctuation, matching the
+/// sequential HuggingFace replacement contract even when literal space tokens
+/// create a wider run of spaces.
+#[test]
+fn cleanup_multiple_literal_spaces_before_question_mark() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, " ": 4, "?": 5
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let decoded = ctx.decode(&[3, 4, 5]);
+    assert_eq!(
+        decoded, "hello  ?",
+        "cleanup must remove only the final punctuation-adjacent space in a literal space run, got: {decoded:?}"
+    );
+}
+
+/// Cleanup should not strip newline content itself. If a literal newline token
+/// sits before punctuation, only the ordinary space inserted before the
+/// punctuation should be removed.
+#[test]
+fn cleanup_preserves_newline_before_question_mark() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, "\n": 4, "?": 5
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let decoded = ctx.decode(&[3, 4, 5]);
+    assert_eq!(
+        decoded, "hello \n?",
+        "cleanup must preserve literal newline content while stripping only the final space before punctuation, got: {decoded:?}"
     );
 }
 

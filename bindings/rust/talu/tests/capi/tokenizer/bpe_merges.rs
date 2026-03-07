@@ -1705,6 +1705,49 @@ fn seven_repeated_chars_cascade() {
     );
 }
 
+/// The 5-symbol re-scan path and the 6-symbol cached path must agree on the
+/// same cascade family at the threshold where the implementation switches
+/// algorithms.
+#[test]
+fn threshold_boundary_cascade_family_matches_small_and_cached_paths() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "aa": 5, "aaaa": 6, "aaaaa": 7, "aaaaaa": 8
+    },
+    "merges": ["a a", "aa aa", "aaaa a", "aaaa aa"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let five = ctx.encode_with("aaaaa", &no_bos());
+    assert_eq!(
+        five,
+        vec![7],
+        "5-symbol small path must collapse to [aaaaa=7], got: {five:?}"
+    );
+
+    let six = ctx.encode_with("aaaaaa", &no_bos());
+    assert_eq!(
+        six,
+        vec![8],
+        "6-symbol cached path must collapse to [aaaaaa=8], got: {six:?}"
+    );
+}
+
 // ===========================================================================
 // Unknown token handling fast paths (single/two symbol)
 // ===========================================================================

@@ -543,13 +543,14 @@ pub fn build(b: *std.Build) void {
     linkCDependencies(b, lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
     addMetalSupport(b, lib_mod, lib, enable_metal);
 
-    b.installArtifact(lib);
+    const install_lib = b.addInstallArtifact(lib, .{});
+    b.getInstallStep().dependOn(&install_lib.step);
 
     // ==========================================================================
     // Python install step - copies library to bindings/python/talu/
     // ==========================================================================
     const python_install_step = b.step("python-install", "Build and copy shared library to Python bindings");
-    python_install_step.dependOn(b.getInstallStep());
+    python_install_step.dependOn(&install_lib.step);
 
     // Determine platform-specific library name
     const lib_name = switch (target.result.os.tag) {
@@ -622,7 +623,8 @@ pub fn build(b: *std.Build) void {
     }
     // macOS frameworks already linked via linkCDependencies
 
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
     var install_mlx_metallib_step: ?*std.Build.Step.InstallFile = null;
     if (target.result.os.tag == .macos) {
         if (findMlxMetallib(b)) |mlx_metallib_path| {
@@ -652,8 +654,9 @@ pub fn build(b: *std.Build) void {
     // Builds library, copies to Python, and builds CLI - all in ReleaseFast.
     // This is the recommended build command for development and agents.
     const release_step = b.step("release", "Build library + CLI and copy to Python (recommended)");
+    release_step.dependOn(&install_lib.step);
     release_step.dependOn(python_install_step);
-    release_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    release_step.dependOn(&install_exe.step);
     if (install_mlx_metallib_step) |step| {
         release_step.dependOn(&step.step);
     }

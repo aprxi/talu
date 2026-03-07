@@ -50,6 +50,7 @@ const Symbol = struct {
 };
 
 const MAX_WORD_SYMBOLS = 512;
+const MAX_MODEL_VOCAB_SIZE: usize = 1_000_000;
 
 /// BPE model. Vocab and merges are parsed synchronously during creation.
 pub const BpeModel = struct {
@@ -150,7 +151,8 @@ fn create(allocator: std.mem.Allocator, json_buffer: []const u8, json_owned: boo
     errdefer allocator.destroy(model);
 
     // Determine vocab size by finding max ID in JSON (scan for largest number after ":")
-    const vocab_size = findVocabSize(json_buffer);
+    const vocab_size = try findVocabSize(json_buffer);
+    if (vocab_size == 0 or vocab_size > MAX_MODEL_VOCAB_SIZE) return error.InvalidArgument;
 
     model.* = .{
         .allocator = allocator,
@@ -197,7 +199,7 @@ fn create(allocator: std.mem.Allocator, json_buffer: []const u8, json_owned: boo
 }
 
 /// Find vocab size by scanning for max ID in JSON
-fn findVocabSize(json: []const u8) usize {
+fn findVocabSize(json: []const u8) !usize {
     // Modern LLMs have varying vocab sizes (32k to 256k+)
     // Scan for largest ID to get accurate size
     var max_id: usize = 0;
@@ -212,7 +214,8 @@ fn findVocabSize(json: []const u8) usize {
             if (scan_idx < json.len and json[scan_idx] >= '0' and json[scan_idx] <= '9') {
                 var num: usize = 0;
                 while (scan_idx < json.len and json[scan_idx] >= '0' and json[scan_idx] <= '9') {
-                    num = num * 10 + (json[scan_idx] - '0');
+                    num = std.math.mul(usize, num, 10) catch return error.InvalidArgument;
+                    num = std.math.add(usize, num, @as(usize, json[scan_idx] - '0')) catch return error.InvalidArgument;
                     scan_idx += 1;
                 }
                 if (num > max_id) max_id = num;
@@ -221,7 +224,7 @@ fn findVocabSize(json: []const u8) usize {
             scan_idx += 1;
         }
     }
-    return max_id + 1;
+    return std.math.add(usize, max_id, 1) catch error.InvalidArgument;
 }
 
 /// Parse vocab and merges from JSON - single pass, no pre-scanning
@@ -1555,7 +1558,7 @@ test "tokenizer_bpe_create_from_spec: findVocabSize with simple vocab" {
     const json =
         \\{"vocab": {"a": 0, "b": 1, "c": 2}}
     ;
-    const size = findVocabSize(json);
+    const size = try findVocabSize(json);
     try std.testing.expectEqual(@as(usize, 3), size);
 }
 
@@ -1563,7 +1566,7 @@ test "tokenizer_bpe_create_from_spec: findVocabSize with gaps in IDs" {
     const json =
         \\{"vocab": {"a": 0, "b": 5, "c": 10}}
     ;
-    const size = findVocabSize(json);
+    const size = try findVocabSize(json);
     try std.testing.expectEqual(@as(usize, 11), size);
 }
 
@@ -1571,7 +1574,7 @@ test "tokenizer_bpe_create_from_spec: findVocabSize with large IDs" {
     const json =
         \\{"vocab": {"token1": 100, "token2": 50000, "token3": 25}}
     ;
-    const size = findVocabSize(json);
+    const size = try findVocabSize(json);
     try std.testing.expectEqual(@as(usize, 50001), size);
 }
 
@@ -1585,8 +1588,16 @@ test "tokenizer_bpe_create_from_spec: findVocabSize with whitespace" {
         \\  }
         \\}
     ;
-    const size = findVocabSize(json);
+    const size = try findVocabSize(json);
     try std.testing.expectEqual(@as(usize, 3), size);
+}
+
+test "tokenizer_bpe_create_from_spec: findVocabSize reports oversize sparse ids" {
+    const json =
+        \\{"vocab": {"a": 2147483647}}
+    ;
+    const size = try findVocabSize(json);
+    try std.testing.expect(size > MAX_MODEL_VOCAB_SIZE);
 }
 
 test "tokenizer_bpe_create_from_spec: findSectionStart finds vocab section" {
