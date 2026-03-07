@@ -3,6 +3,7 @@
 const layer_ops = @import("../layer_ops.zig");
 const types = @import("../op_types.zig");
 const config_hooks = @import("../config/hook_utils.zig");
+const perf = @import("../perf_hints.zig");
 
 pub const id: []const u8 = "llama2";
 pub const family: []const u8 = "llama";
@@ -72,6 +73,7 @@ const llama2_global_weights = [_]types.WeightSpec{
     .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
     .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
+const llama2_perf_hints = perf.standardAttentionMlpHints("llama2");
 pub var arch: types.Architecture = .{
     .name = "llama2",
     .model_types = &llama2_model_types,
@@ -97,4 +99,5 @@ pub var arch: types.Architecture = .{
     .norm_weight_offset = 0.0,
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
+    .performance_hints = &llama2_perf_hints,
 };

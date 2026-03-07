@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use serde::Deserialize;
 use serde_json::json;
 
 use talu::error::last_error_message;
@@ -14,6 +15,31 @@ struct KernelUsage {
     name: String,
     call_count: usize,
     total_us: u64,
+}
+
+struct PointUsage {
+    point: String,
+    call_count: usize,
+    total_us: u64,
+}
+
+struct KernelPointUsage {
+    kernel_name: String,
+    total_us: u64,
+    points: Vec<PointUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PerfHintsJson {
+    bench_model: String,
+    point_mappings: Vec<PointBenchMapJson>,
+    hidden_rows: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PointBenchMapJson {
+    point: String,
+    bench_row: String,
 }
 
 /// Derive kernel usage from trace records (counts + timing).
@@ -40,6 +66,82 @@ fn derive_kernel_usage(trace: &[talu::TraceRecord], record_delta_ns: &[i64]) -> 
         })
         .collect();
     usage.sort_by(|a, b| b.total_us.cmp(&a.total_us));
+    usage
+}
+
+fn derive_kernel_usage_by_point(
+    trace: &[talu::TraceRecord],
+    record_delta_ns: &[i64],
+) -> Vec<KernelPointUsage> {
+    let mut kernel_point_stats: std::collections::HashMap<String, std::collections::HashMap<String, (usize, u64)>> =
+        std::collections::HashMap::new();
+    let mut kernel_totals: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+
+    for (i, record) in trace.iter().enumerate() {
+        if let Some(kernel_name) = &record.kernel_name {
+            if !kernel_name.is_empty() {
+                let delta_us = record_delta_ns[i].unsigned_abs() / 1_000;
+                *kernel_totals.entry(kernel_name.clone()).or_insert(0) += delta_us;
+                let point_stats = kernel_point_stats
+                    .entry(kernel_name.clone())
+                    .or_default();
+                let entry = point_stats.entry(record.point.clone()).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += delta_us;
+            }
+        }
+    }
+
+    let mut usage: Vec<KernelPointUsage> = kernel_point_stats
+        .into_iter()
+        .map(|(kernel_name, points)| {
+            let mut point_usage: Vec<PointUsage> = points
+                .into_iter()
+                .map(|(point, (call_count, total_us))| PointUsage {
+                    point,
+                    call_count,
+                    total_us,
+                })
+                .collect();
+            point_usage.sort_by(|a, b| b.total_us.cmp(&a.total_us).then_with(|| a.point.cmp(&b.point)));
+            KernelPointUsage {
+                total_us: kernel_totals.get(&kernel_name).copied().unwrap_or(0),
+                kernel_name,
+                points: point_usage,
+            }
+        })
+        .collect();
+    usage.sort_by(|a, b| b.total_us.cmp(&a.total_us).then_with(|| a.kernel_name.cmp(&b.kernel_name)));
+    usage
+}
+
+fn derive_other_usage(trace: &[talu::TraceRecord], record_delta_ns: &[i64]) -> Vec<PointUsage> {
+    let mut stats: std::collections::HashMap<String, (usize, u64)> =
+        std::collections::HashMap::new();
+    for (i, record) in trace.iter().enumerate() {
+        let has_kernel = record
+            .kernel_name
+            .as_ref()
+            .map(|name| !name.is_empty())
+            .unwrap_or(false);
+        if !has_kernel {
+            let delta_us = record_delta_ns[i].unsigned_abs() / 1_000;
+            let entry = stats.entry(record.point.clone()).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += delta_us;
+        }
+    }
+
+    let mut usage: Vec<PointUsage> = stats
+        .into_iter()
+        .map(|(point, (call_count, total_us))| PointUsage {
+            point,
+            call_count,
+            total_us,
+        })
+        .collect();
+    usage.sort_by(|a, b| b.total_us.cmp(&a.total_us).then_with(|| a.point.cmp(&b.point)));
     usage
 }
 
@@ -103,6 +205,8 @@ pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
 
     // Derive kernel usage from trace records
     let usage = derive_kernel_usage(&trace, &record_delta_ns);
+    let kernel_point_usage = derive_kernel_usage_by_point(&trace, &record_delta_ns);
+    let other_usage = derive_other_usage(&trace, &record_delta_ns);
 
     if args.json {
         let trace_records: Vec<_> = trace
@@ -151,8 +255,33 @@ pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
     } else {
         "input (prefill)"
     };
-    print_architecture_tree(&model_info, &trace, &record_delta_ns, &usage, mode_label);
+    print_architecture_tree(
+        &model_info,
+        &trace,
+        &record_delta_ns,
+        &usage,
+        &kernel_point_usage,
+        &other_usage,
+        load_perf_hints(&model_info)?,
+        mode_label,
+    );
     Ok(())
+}
+
+fn load_perf_hints(model_info: &talu::ModelInfo) -> Result<Option<PerfHintsJson>> {
+    if let Some(raw) = talu::model::performance_hints_json(&model_info.model_type)? {
+        let hints: PerfHintsJson =
+            serde_json::from_str(&raw).map_err(|e| anyhow!("invalid performance hints JSON: {e}"))?;
+        return Ok(Some(hints));
+    }
+    if !model_info.architecture.is_empty() {
+        if let Some(raw) = talu::model::performance_hints_json(&model_info.architecture)? {
+            let hints: PerfHintsJson = serde_json::from_str(&raw)
+                .map_err(|e| anyhow!("invalid performance hints JSON: {e}"))?;
+            return Ok(Some(hints));
+        }
+    }
+    Ok(None)
 }
 
 /// Format microseconds right-aligned into a fixed-width column.
@@ -174,6 +303,9 @@ fn print_architecture_tree(
     trace: &[talu::TraceRecord],
     record_delta_ns: &[i64],
     kernels: &[KernelUsage],
+    kernel_point_usage: &[KernelPointUsage],
+    other_usage: &[PointUsage],
+    perf_hints: Option<PerfHintsJson>,
     mode_label: &str,
 ) {
     // ── Separate non-layer records and layer records ──
@@ -500,4 +632,107 @@ fn print_architecture_tree(
             );
         }
     }
+
+    if !kernel_point_usage.is_empty() {
+        println!();
+        println!("Kernel Usage By Point:");
+        for kernel in kernel_point_usage {
+            println!("  {}(..)", kernel.kernel_name);
+            for point in &kernel.points {
+                let pct = if kernel.total_us > 0 {
+                    point.total_us as f64 / kernel.total_us as f64 * 100.0
+                } else {
+                    0.0
+                };
+                println!(
+                    "    {:20} {:6} calls  {} {:5.1}%",
+                    point.point,
+                    point.call_count,
+                    format_us(point.total_us, 1),
+                    pct,
+                );
+            }
+            println!();
+        }
+    }
+
+    if !other_usage.is_empty() {
+        let other_total_us: u64 = other_usage.iter().map(|point| point.total_us).sum();
+        println!("Other Usage:");
+        for point in other_usage {
+            let pct = if other_total_us > 0 {
+                point.total_us as f64 / other_total_us as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "  {:22} {:6} calls  {} {:5.1}%",
+                point.point,
+                point.call_count,
+                format_us(point.total_us, 1),
+                pct,
+            );
+        }
+    }
+
+    if let Some(perf_hints) = perf_hints {
+        println!();
+        println!("Bench helper:");
+        println!("  make -C core/bench/compute/cpu model={}", perf_hints.bench_model);
+        let bench_focus = derive_bench_focus(&perf_hints, kernel_point_usage, other_usage);
+        if !bench_focus.is_empty() {
+            println!();
+            println!("Bench Focus Mapping:");
+            for (point, bench_row) in bench_focus {
+                println!("  {:18} -> {}", point, bench_row);
+            }
+        }
+    }
+}
+
+fn derive_bench_focus(
+    perf_hints: &PerfHintsJson,
+    kernel_point_usage: &[KernelPointUsage],
+    other_usage: &[PointUsage],
+) -> Vec<(String, String)> {
+    let point_totals = point_total_usage(kernel_point_usage, other_usage);
+    let mut rows: Vec<(String, String, u64)> = Vec::new();
+
+    for mapping in &perf_hints.point_mappings {
+        if let Some(total_us) = point_totals.get(mapping.point.as_str()) {
+            rows.push((mapping.point.clone(), mapping.bench_row.clone(), *total_us));
+        }
+    }
+
+    for row in &perf_hints.hidden_rows {
+        rows.push(("hidden".to_string(), row.clone(), 0));
+    }
+
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    let mut deduped: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (point, bench_row, _) in rows {
+        let key = format!("{point}:{bench_row}");
+        if seen.insert(key) {
+            deduped.push((point, bench_row));
+        }
+    }
+    deduped
+}
+
+fn point_total_usage(
+    kernel_point_usage: &[KernelPointUsage],
+    other_usage: &[PointUsage],
+) -> std::collections::HashMap<String, u64> {
+    let mut totals = std::collections::HashMap::new();
+    for kernel in kernel_point_usage {
+        for point in &kernel.points {
+            *totals.entry(point.point.clone()).or_insert(0) += point.total_us;
+        }
+    }
+    for point in other_usage {
+        *totals.entry(point.point.clone()).or_insert(0) += point.total_us;
+    }
+    totals
 }

@@ -5,6 +5,7 @@ const tensor = @import("../../tensor.zig");
 const layer_ops = @import("../layer_ops.zig");
 const types = @import("../op_types.zig");
 const config_hooks = @import("../config/hook_utils.zig");
+const perf = @import("../perf_hints.zig");
 const vision_shared = @import("../vision_shared.zig");
 
 pub const id: []const u8 = "lfm2";
@@ -149,6 +150,7 @@ const lfm2_global_weights = [_]types.WeightSpec{
     .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "model.language_model.embedding_norm.weight", "model.language_model.norm.weight", "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
     .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "model.language_model.lm_head.weight", "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
+const lfm2_perf_hints = perf.standardAttentionMlpShortConvHints("lfm2");
 pub var arch: types.Architecture = .{
     .name = "lfm2",
     .model_types = &lfm2_model_types,
@@ -177,4 +179,5 @@ pub var arch: types.Architecture = .{
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
     .vision = vision_shared.metadata,
+    .performance_hints = &lfm2_perf_hints,
 };

@@ -12,6 +12,7 @@ const progress_mod = @import("../progress.zig");
 pub const registry = @import("registry.zig");
 pub const layer_ops = @import("layer_ops.zig");
 pub const op_types = @import("op_types.zig");
+pub const perf_hints = @import("perf_hints.zig");
 pub const runtime_blocks = @import("runtime_blocks.zig");
 pub const rope_scaling = @import("rope_scaling.zig");
 pub const vision = @import("vision.zig");
@@ -69,6 +70,10 @@ pub fn detectByModelType(model_type: []const u8) ?ModelDescriptor {
 
 pub fn isSupportedModelType(model_type: []const u8) bool {
     return registry.isSupportedModelType(model_type);
+}
+
+pub fn performanceHintsByName(name: []const u8) ?*const perf_hints.PerfHints {
+    return registry.performanceHintsByName(name);
 }
 
 test "models root delegates model type lookup to static registry" {

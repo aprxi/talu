@@ -6,6 +6,7 @@ const layer_ops = @import("../layer_ops.zig");
 const types = @import("../op_types.zig");
 const vision_shared = @import("../vision_shared.zig");
 const config_hooks = @import("../config/hook_utils.zig");
+const perf = @import("../perf_hints.zig");
 
 pub const id: []const u8 = "youtu_vl";
 pub const family: []const u8 = "youtu_vl";
@@ -76,6 +77,7 @@ const youtu_vl_global_weights = [_]types.WeightSpec{
     .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
     .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
+const youtu_vl_perf_hints = perf.standardAttentionMlpHints("youtu_vl");
 
 fn parseConfigHook(
     config_obj: std.json.ObjectMap,
@@ -123,4 +125,5 @@ pub var arch: types.Architecture = .{
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
     .vision = vision_shared.metadata,
+    .performance_hints = &youtu_vl_perf_hints,
 };

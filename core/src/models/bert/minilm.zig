@@ -3,6 +3,7 @@
 const layer_ops = @import("../layer_ops.zig");
 const types = @import("../op_types.zig");
 const config_hooks = @import("../config/hook_utils.zig");
+const perf = @import("../perf_hints.zig");
 
 pub const id: []const u8 = "minilm";
 pub const family: []const u8 = "bert";
@@ -78,6 +79,7 @@ const minilm_global_weights = [_]types.WeightSpec{
     .{ .id = "embedding_ln", .suffix = "bert.embeddings.LayerNorm.weight", .aliases = &.{"embeddings.LayerNorm.weight"}, .module_type = "LayerNorm", .layout = .none, .dtype = "float32", .required = true },
     .{ .id = "embedding_ln_bias", .suffix = "bert.embeddings.LayerNorm.bias", .aliases = &.{"embeddings.LayerNorm.bias"}, .module_type = "LayerNorm", .layout = .none, .dtype = "float32", .required = true },
 };
+const minilm_perf_hints = perf.standardAttentionMlpHints("minilm");
 pub var arch: types.Architecture = .{
     .name = "minilm",
     .model_types = &minilm_model_types,
@@ -104,4 +106,5 @@ pub var arch: types.Architecture = .{
     .norm_weight_offset = 0.0,
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
+    .performance_hints = &minilm_perf_hints,
 };

@@ -4260,6 +4260,8 @@ extern "C" {
     pub fn talu_decode_result_free(text: *mut u8, text_len: usize);
     // core/src/capi/converter.zig
     pub fn talu_describe(model_path: *const c_char) -> ModelInfo;
+    // core/src/capi/converter.zig
+    pub fn talu_model_performance_hints(name: *const c_char, out_json: *mut *mut c_char) -> c_int;
     // core/src/capi/tensor.zig
     pub fn talu_dlpack_capsule_name() -> *const c_char;
     // core/src/capi/tensor.zig

@@ -1124,6 +1124,40 @@ pub fn build(b: *std.Build) void {
     }
 
     // ==========================================================================
+    // CPU compute benchmark harness (core/bench/compute/cpu/)
+    // ==========================================================================
+    const bench_cpu_compute_path = "core/bench/compute/cpu/root.zig";
+    if (std.fs.cwd().access(bench_cpu_compute_path, .{})) |_| {
+        const host_target = b.resolveTargetQuery(.{});
+        const bench_cpu_compute_mod = b.createModule(.{
+            .root_source_file = b.path(bench_cpu_compute_path),
+            .target = host_target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "main", .module = integration_main_mod },
+            },
+        });
+        const bench_cpu_compute_exe = b.addExecutable(.{
+            .name = "bench-cpu-compute",
+            .root_module = bench_cpu_compute_mod,
+        });
+        linkCDependencies(b, bench_cpu_compute_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        b.installArtifact(bench_cpu_compute_exe);
+
+        const run_bench_cpu_compute = b.addRunArtifact(bench_cpu_compute_exe);
+        if (b.args) |args| {
+            for (args) |arg| {
+                run_bench_cpu_compute.addArg(arg);
+            }
+        }
+        const bench_cpu_compute_step = b.step("bench-cpu-compute", "Run CPU compute benchmark harness");
+        bench_cpu_compute_step.dependOn(&run_bench_cpu_compute.step);
+    } else |_| {
+        // CPU compute benchmark harness not present - skip
+    }
+
+    // ==========================================================================
     // Metal compute benchmark harness (core/bench/compute/metal/)
     // ==========================================================================
     const bench_metal_compute_path = "core/bench/compute/metal/root.zig";

@@ -6,6 +6,7 @@ const std = @import("std");
 const common_types = @import("common/types.zig");
 const layer_ops = @import("layer_ops.zig");
 const op_types = @import("op_types.zig");
+const perf_hints = @import("perf_hints.zig");
 const runtime_contract = @import("../inference/runtime_contract/root.zig");
 const runtime_architectures = @import("runtime_architectures.zig");
 const minilm = @import("bert/minilm.zig");
@@ -229,6 +230,20 @@ pub fn runtimeArchitectureById(arch_id: []const u8) ?*const op_types.Architectur
 
 pub fn runtimeArchitectureByModelType(model_type: []const u8) ?*const op_types.Architecture {
     return runtime_architectures.detectByModelType(model_type);
+}
+
+/// Resolve model-owned performance hints by architecture id or model_type.
+/// This is the single source of truth for xray-to-bench mappings.
+pub fn performanceHintsByName(name: []const u8) ?*const perf_hints.PerfHints {
+    if (runtimeArchitectureById(name)) |arch| return arch.performance_hints;
+    if (runtimeArchitectureByModelType(name)) |arch| return arch.performance_hints;
+    return null;
+}
+
+test "all registered architectures export performance hints" {
+    for (entries) |entry| {
+        try std.testing.expect(performanceHintsByName(entry.id) != null);
+    }
 }
 
 fn runtimeLifecycleFromSpec(lifecycle: op_types.StateLifecycle) runtime_contract.StateLifecycle {

@@ -126,6 +126,34 @@ pub fn describe(model_path: &str) -> Result<ModelInfo> {
     Ok(result)
 }
 
+/// Returns model-owned performance hints as JSON.
+///
+/// This is the bridge between inference-facing xray points and compute-facing
+/// benchmark rows. Input may be either an architecture id or a model type.
+pub fn performance_hints_json(name: &str) -> Result<Option<String>> {
+    let c_name = CString::new(name)?;
+    let mut out_json: *mut c_char = std::ptr::null_mut();
+
+    // SAFETY: c_name is valid and out_json points to writable storage.
+    let rc = unsafe { talu_sys::talu_model_performance_hints(c_name.as_ptr(), &mut out_json) };
+    if rc != 0 {
+        return Err(error_from_last_or("Failed to get model performance hints"));
+    }
+    if out_json.is_null() {
+        return Ok(None);
+    }
+
+    // SAFETY: out_json is a valid NUL-terminated string allocated by the C API.
+    let json = unsafe { CStr::from_ptr(out_json) }
+        .to_string_lossy()
+        .into_owned();
+    let len = json.len() + 1;
+
+    // SAFETY: the pointer and length match the C API allocation contract.
+    unsafe { talu_sys::talu_free_string(out_json.cast::<u8>(), len) };
+    Ok(Some(json))
+}
+
 /// Gets the generation config from a model directory.
 pub fn get_generation_config(model_dir: &str) -> Result<GenerationConfigInfo> {
     let c_path = CString::new(model_dir)?;

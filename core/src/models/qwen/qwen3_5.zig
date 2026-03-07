@@ -3,6 +3,7 @@
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const layer_ops = @import("../layer_ops.zig");
+const perf = @import("../perf_hints.zig");
 const types = @import("../op_types.zig");
 const config_hooks = @import("../config/hook_utils.zig");
 const vision_shared = @import("../vision_shared.zig");
@@ -291,9 +292,17 @@ const qwen3_5_conversion_fusions = [_]types.ConversionFusion{
     },
 };
 
+const qwen3_5_perf_hints = perf.PerfHints{
+    .bench_model = "qwen3_5",
+    .point_mappings = perf.standard_attention_mlp_point_mappings[0..],
+    .hidden_rows = perf.qwen3_5_hidden_rows[0..],
+    .role_dims = perf.qwen3_5_role_dims[0..],
+};
+
 pub var arch: types.Architecture = .{
     .name = "qwen3_5",
     .model_types = &qwen3_5_model_types,
+    .performance_hints = &qwen3_5_perf_hints,
     .parse_config_hook = parseConfigHook,
     .block_variants = &qwen3_5_block_variants,
     .layer_map = &qwen3_5_layer_map,

@@ -143,6 +143,7 @@ pub const DecodeOptionsC = tokenizer.DecodeOptionsC;
 
 // Re-export model description C API functions.
 pub const talu_describe = converter.talu_describe;
+pub const talu_model_performance_hints = converter.talu_model_performance_hints;
 pub const talu_model_info_free = converter.talu_model_info_free;
 pub const talu_execution_plan = converter.talu_execution_plan;
 pub const ExecutionPlanInfo = converter.ExecutionPlanInfo;

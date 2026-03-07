@@ -13,6 +13,7 @@ const std = @import("std");
 const scheme_mod = @import("../converter/scheme.zig");
 const io = @import("../io/root.zig");
 const model_config = @import("../models/config/root.zig");
+const models_dispatcher = @import("../models/root.zig");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 const xray = @import("../xray/root.zig");
@@ -228,6 +229,39 @@ pub export fn talu_describe(model_path: [*:0]const u8) callconv(.c) ModelInfo {
     return info;
 }
 
+/// Resolve architecture-owned performance hints as a JSON string.
+///
+/// This exposes model-owned xray->bench mapping metadata to bindings without
+/// duplicating architecture tables outside `models/`.
+///
+/// Input may be either an architecture id or a model type. If no hints are
+/// registered for the name, this succeeds with `out_json = null`.
+/// Caller must free non-null output with `talu_free_string()`.
+pub export fn talu_model_performance_hints(
+    name: [*:0]const u8,
+    out_json: *?[*:0]u8,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    out_json.* = null;
+
+    const hints = models_dispatcher.performanceHintsByName(std.mem.span(name)) orelse return 0;
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    models_dispatcher.perf_hints.writeJson(out.writer(allocator), hints) catch |err| {
+        capi_error.setError(err, "Failed to serialize model performance hints", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    const duped = allocator.dupeZ(u8, out.items) catch |err| {
+        capi_error.setError(err, "Failed to allocate model performance hints", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    out_json.* = duped.ptr;
+    return 0;
+}
+
 /// Free a C string allocated by this module.
 fn freeCString(cstr: [*:0]const u8) void {
     const slice = std.mem.sliceTo(cstr, 0);
@@ -416,6 +450,26 @@ fn planToInfo(plan: execution_plan.ExecutionPlan) ExecutionPlanInfo {
     info.uses_gelu = plan.uses_gelu;
     info.is_supported = plan.is_supported;
     return info;
+}
+
+test "talu_model_performance_hints returns qwen3_5 json" {
+    var out_json: ?[*:0]u8 = null;
+    try std.testing.expectEqual(@as(i32, 0), talu_model_performance_hints("qwen3_5", &out_json));
+    defer if (out_json) |ptr| {
+        const slice = std.mem.span(ptr);
+        allocator.free(slice.ptr[0 .. slice.len + 1]);
+    };
+
+    try std.testing.expect(out_json != null);
+    const payload = std.mem.span(out_json.?);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"bench_model\":\"qwen3_5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"role.ffn_gate\"") != null);
+}
+
+test "talu_model_performance_hints returns null for unknown architecture" {
+    var out_json: ?[*:0]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), talu_model_performance_hints("definitely_not_real", &out_json));
+    try std.testing.expect(out_json == null);
 }
 
 fn executionPlanError(msg: [*:0]const u8) ExecutionPlanInfo {
