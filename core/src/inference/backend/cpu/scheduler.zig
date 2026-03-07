@@ -852,7 +852,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 grammar_sampler,
                 vision_input != null,
             );
-            const chosen_decode_tail_route: DecodeTailRoute = if (return_final_logits and decode_tail_route == .backend_decode_streaming)
+            const chosen_decode_tail_route: DecodeTailRoute = if (return_final_logits and decode_tail_route != .decode_batch)
                 .decode_batch
             else
                 decode_tail_route;
@@ -978,6 +978,78 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .tokens = try generated.toOwnedSlice(self.allocator),
                     .final_logits = try self.captureFinalLogits(return_final_logits, self.logits_buffer),
                     .finish_reason = finish_reason,
+                    .prefill_ns = prefill_ns,
+                    .decode_ns = decode_ns,
+                };
+            }
+
+            if (chosen_decode_tail_route == .backend_decode_top_k) {
+                if (comptime !@hasDecl(BackendType, "decodeTopKCandidates")) unreachable;
+                const candidate_cap = @min(effective_sampling_config.top_k, self.backend.vocabSize());
+                const candidate_logits = try self.allocator.alloc(f32, candidate_cap);
+                defer self.allocator.free(candidate_logits);
+                const candidate_ids = try self.allocator.alloc(u32, candidate_cap);
+                defer self.allocator.free(candidate_ids);
+
+                var decode_timer = std.time.Timer.start() catch unreachable;
+
+                while (generated.items.len < max_tokens) {
+                    if (stop_flag) |flag| {
+                        if (flag.load(.acquire)) {
+                            const decode_ns = decode_timer.read();
+                            return GenerateSyncResult{
+                                .tokens = try generated.toOwnedSlice(self.allocator),
+                                .final_logits = &.{},
+                                .finish_reason = .cancelled,
+                                .prefill_ns = prefill_ns,
+                                .decode_ns = decode_ns,
+                            };
+                        }
+                    }
+
+                    try applyStepScopedReset(&np_blocks);
+
+                    const candidate_count = try self.backend.decodeTopKCandidates(
+                        slot_index,
+                        current_token,
+                        candidate_cap,
+                        candidate_logits,
+                        candidate_ids,
+                    );
+                    const next_token = self.sampleTopKCandidates(
+                        candidate_logits[0..candidate_count],
+                        candidate_ids[0..candidate_count],
+                        effective_sampling_config,
+                    ) catch 0;
+
+                    try generated.append(self.allocator, next_token);
+                    current_token = next_token;
+
+                    for (eos_token_ids) |eos_id| {
+                        if (next_token == eos_id) {
+                            const decode_ns = decode_timer.read();
+                            if (callback) |cb| cb(0, next_token, true, callback_data);
+                            return GenerateSyncResult{
+                                .tokens = try generated.toOwnedSlice(self.allocator),
+                                .final_logits = &.{},
+                                .finish_reason = .eos_token,
+                                .prefill_ns = prefill_ns,
+                                .decode_ns = decode_ns,
+                            };
+                        }
+                    }
+
+                    if (callback) |cb| {
+                        const is_final = generated.items.len >= max_tokens;
+                        cb(0, next_token, is_final, callback_data);
+                    }
+                }
+
+                const decode_ns = decode_timer.read();
+                return GenerateSyncResult{
+                    .tokens = try generated.toOwnedSlice(self.allocator),
+                    .final_logits = &.{},
+                    .finish_reason = .length,
                     .prefill_ns = prefill_ns,
                     .decode_ns = decode_ns,
                 };
@@ -1453,6 +1525,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
         const DecodeTailRoute = enum {
             backend_decode_streaming,
+            backend_decode_top_k,
             decode_batch,
         };
 
@@ -1466,11 +1539,31 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             if (has_vision_input) return .decode_batch;
             if (stop_sequences.len != 0) return .decode_batch;
             if (grammar_sampler != null) return .decode_batch;
+            if (sampling_config.strategy == .top_k) {
+                if (comptime !@hasDecl(BackendType, "decodeTopKCandidates")) return .decode_batch;
+                if (comptime !@hasDecl(BackendType, "supportsSchedulerBackendTopKDecodeRoute")) return .decode_batch;
+                if (!self.backend.supportsSchedulerBackendTopKDecodeRoute(sampling_config)) return .decode_batch;
+                return .backend_decode_top_k;
+            }
             if (sampling_config.strategy != .greedy) return .decode_batch;
             if (comptime !@hasDecl(BackendType, "decodeStreaming")) return .decode_batch;
             if (comptime !@hasDecl(BackendType, "supportsSchedulerBackendDecodeStreamingRoute")) return .decode_batch;
             if (!self.backend.supportsSchedulerBackendDecodeStreamingRoute()) return .decode_batch;
             return .backend_decode_streaming;
+        }
+
+        fn sampleTopKCandidates(
+            self: *Self,
+            candidate_logits: []const f32,
+            candidate_ids: []const u32,
+            sampling_config: sampling.SamplingConfig,
+        ) !u32 {
+            if (candidate_logits.len == 0 or candidate_logits.len != candidate_ids.len) return error.InvalidArgument;
+            var reduced_config = sampling_config;
+            reduced_config.strategy = .top_k;
+            reduced_config.top_k = @min(reduced_config.top_k, candidate_logits.len);
+            const sampled_idx = try self.sampler.sample(candidate_logits, reduced_config);
+            return candidate_ids[sampled_idx];
         }
 
         fn prefillWithOptionalVision(
@@ -2497,6 +2590,7 @@ const MockStreamingBackend = struct {
     slot_in_use: bool = false,
     decode_batch_calls: usize = 0,
     decode_streaming_calls: usize = 0,
+    decode_top_k_calls: usize = 0,
     prefill_with_vision_calls: usize = 0,
     allocated_logits: std.ArrayList([]f32),
     greedy_token: usize = 42,
@@ -2617,6 +2711,31 @@ const MockStreamingBackend = struct {
         }
         return max_tokens;
     }
+
+    fn supportsSchedulerBackendTopKDecodeRoute(
+        self: *const MockStreamingBackend,
+        sampling_config: *const sampling.SamplingConfig,
+    ) bool {
+        _ = self;
+        return sampling_config.strategy == .top_k and sampling_config.min_p == 0.0;
+    }
+
+    fn decodeTopKCandidates(
+        self: *MockStreamingBackend,
+        slot_index: usize,
+        token: u32,
+        top_k: usize,
+        candidate_logits_out: []f32,
+        candidate_ids_out: []u32,
+    ) !usize {
+        _ = slot_index;
+        _ = token;
+        self.decode_top_k_calls += 1;
+        if (top_k == 0) return error.InvalidArgument;
+        candidate_logits_out[0] = 10.0;
+        candidate_ids_out[0] = @intCast(self.greedy_token);
+        return 1;
+    }
 };
 
 const MockStreamingScheduler = GenericScheduler(MockStreamingBackend);
@@ -2708,7 +2827,39 @@ test "generateSync uses decodeBatch when stop sequences are configured" {
     try std.testing.expectEqual(@as(usize, 3), result.tokens.len);
 }
 
-test "generateSync uses decodeBatch route when sampling strategy is top_k" {
+test "generateSync uses backend top-k route when supported" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .top_k,
+            .top_k = 1,
+            .temperature = 0.7,
+            .seed = 7,
+        },
+    });
+    defer scheduler.deinit();
+
+    var result = try scheduler.generateSync(&[_]u32{ 7, 8, 9 }, 4, .{
+        .sampling = .{
+            .strategy = .top_k,
+            .top_k = 1,
+            .temperature = 0.7,
+            .seed = 7,
+        },
+        .eos_token_ids = &[_]u32{9999},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
+    try std.testing.expect(backend.decode_top_k_calls > 0);
+    try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
+}
+
+test "generateSync uses decodeBatch route when top_k config is unsupported" {
     const alloc = std.testing.allocator;
     var backend = MockStreamingBackend.init(alloc, 256);
     defer backend.deinit();
@@ -2718,6 +2869,7 @@ test "generateSync uses decodeBatch route when sampling strategy is top_k" {
             .strategy = .top_k,
             .top_k = 20,
             .temperature = 0.7,
+            .min_p = 0.1,
             .seed = 7,
         },
     });
@@ -2728,6 +2880,7 @@ test "generateSync uses decodeBatch route when sampling strategy is top_k" {
             .strategy = .top_k,
             .top_k = 20,
             .temperature = 0.7,
+            .min_p = 0.1,
             .seed = 7,
         },
         .eos_token_ids = &[_]u32{9999},
@@ -2736,6 +2889,7 @@ test "generateSync uses decodeBatch route when sampling strategy is top_k" {
 
     try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
     try std.testing.expect(backend.decode_batch_calls > 0);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_top_k_calls);
     try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
 }
 

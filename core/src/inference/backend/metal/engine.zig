@@ -15,6 +15,7 @@ const log = @import("../../../log.zig");
 const compute = @import("../../../compute/root.zig");
 const metal_compute = compute.metal;
 const graph = metal_compute.graph;
+const metal_sampling = @import("sampling.zig");
 const runtime_graph_mod = @import("runtime_graph.zig");
 const runtime_contract = @import("../../runtime_contract/root.zig");
 const LoadedModel = models.LoadedModel;
@@ -552,6 +553,106 @@ pub const MetalBackend = struct {
         slot_position.* = position + 1;
     }
 
+    fn decodeSlotGreedy(
+        self: *MetalBackend,
+        slot_index: usize,
+        token: u32,
+        position: usize,
+    ) !u32 {
+        const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
+        const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
+        const logits_handle = try runtime_trait.transformerForwardLazy(
+            self.allocator,
+            self.weights,
+            &[_]u32{token},
+            try self.slotStateBlocks(slot_index),
+            self.config,
+            effective_position,
+        );
+        defer graph.freeArray(logits_handle);
+
+        const selection_logits = if (self.config.logits_scaling < 0.0)
+            graph.mlx_lazy_multiply_scalar(logits_handle, -1.0)
+        else
+            logits_handle;
+        defer if (selection_logits != logits_handle) graph.freeArray(selection_logits);
+
+        const token_handle = graph.mlx_lazy_argmax(selection_logits, -1);
+        defer graph.freeArray(token_handle);
+        graph.eval(&[_]graph.ArrayHandle{token_handle});
+
+        const slot_position = try self.slotPositionPtr(slot_index);
+        slot_position.* = position + 1;
+        return graph.mlx_array_item_u32(token_handle);
+    }
+
+    pub fn supportsSchedulerBackendTopKDecodeRoute(
+        self: *const MetalBackend,
+        sampling_config: *const metal_sampling.SamplingConfig,
+    ) bool {
+        _ = self;
+        return sampling_config.strategy == .top_k and
+            sampling_config.top_k > 0 and
+            sampling_config.temperature > 0.0 and
+            sampling_config.min_p == 0.0;
+    }
+
+    pub fn decodeTopKCandidates(
+        self: *MetalBackend,
+        slot_index: usize,
+        token: u32,
+        top_k: usize,
+        candidate_logits_out: []f32,
+        candidate_ids_out: []u32,
+    ) !usize {
+        if (top_k == 0) return error.InvalidArgument;
+        if (candidate_logits_out.len < top_k or candidate_ids_out.len < top_k) return error.InvalidArgument;
+
+        const slot_position = try self.slotPositionPtr(slot_index);
+        const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
+        const effective_position = try common_mrope.applyPositionDelta(slot_position.*, slot_rope_delta.*);
+        const logits_handle = try runtime_trait.transformerForwardLazy(
+            self.allocator,
+            self.weights,
+            &[_]u32{token},
+            try self.slotStateBlocks(slot_index),
+            self.config,
+            effective_position,
+        );
+        defer graph.freeArray(logits_handle);
+
+        var shape_buffer: [8]usize = undefined;
+        const rank = graph.getShape(logits_handle, &shape_buffer);
+        if (rank == 0) return error.InvalidShape;
+
+        const vocab_dim = shape_buffer[rank - 1];
+        if (vocab_dim != self.vocab_size) return error.InvalidShape;
+
+        const k = @min(top_k, vocab_dim);
+        const axis: c_int = @intCast(rank - 1);
+        const partitioned_indices = graph.mlx_lazy_argpartition(logits_handle, -@as(c_int, @intCast(k)), axis);
+        defer graph.freeArray(partitioned_indices);
+
+        var starts = [_]c_int{0} ** 8;
+        var ends = [_]c_int{0} ** 8;
+        for (0..rank) |dim| {
+            ends[dim] = @intCast(shape_buffer[dim]);
+        }
+        starts[rank - 1] = @intCast(vocab_dim - k);
+
+        const top_k_indices = graph.mlx_lazy_slice(partitioned_indices, &starts, &ends, rank);
+        defer graph.freeArray(top_k_indices);
+
+        const top_k_logits = graph.mlx_lazy_take_along_axis(logits_handle, top_k_indices, axis);
+        defer graph.freeArray(top_k_logits);
+
+        graph.eval(&[_]graph.ArrayHandle{ top_k_indices, top_k_logits });
+        graph.copyToHost(top_k_logits, candidate_logits_out[0..k]);
+        graph.copyU32ToHost(top_k_indices, candidate_ids_out[0..k]);
+        slot_position.* += 1;
+        return k;
+    }
+
     fn slotLogits(self: *MetalBackend, slot_index: usize) ![]f32 {
         if (slot_index >= self.max_batch_size) return error.InvalidArgument;
         const start = slot_index * self.vocab_size;
@@ -1084,11 +1185,8 @@ pub const MetalBackend = struct {
         var current_token = first_token;
         var current_position = start_position;
         var generated_count: usize = 0;
-        const logits = self.slot_logits_buffer[0..self.vocab_size];
-
         while (generated_count < budget) {
-            try self.decodeSlot(0, current_token, current_position, logits);
-            const next_token = try self.selectNextTokenFromLogits(logits);
+            const next_token = try self.decodeSlotGreedy(0, current_token, current_position);
             output_tokens[generated_count] = next_token;
             generated_count += 1;
             current_position += 1;
@@ -1414,6 +1512,32 @@ test "decodeBatch advances positions across multiple slots" {
     try std.testing.expectError(error.InvalidArgument, backend.decodeBatch(duplicate_requests[0..], duplicate_results[0..]));
     try std.testing.expectEqual(@as(usize, 3), backend.getPosition(slot0));
     try std.testing.expectEqual(@as(usize, 3), backend.getPosition(slot1));
+}
+
+test "decodeStreaming greedy token matches decode logits argmax" {
+    if (!isAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const loaded = try weights_trait.createTestLoadedModel(allocator);
+    defer weights_trait.destroyTestLoadedModel(allocator, loaded);
+
+    var backend = try MetalBackend.init(allocator, loaded);
+    defer backend.deinit();
+
+    const vocab_size = backend.vocabSize();
+    const logits = try allocator.alloc(f32, vocab_size);
+    defer allocator.free(logits);
+
+    try backend.prefill(&[_]u32{ 1, 2 }, logits);
+    const position = backend.getPosition(0);
+    try backend.decode(3, position, logits);
+    const expected = try backend.selectNextTokenFromLogits(logits);
+
+    var output: [1]u32 = undefined;
+    const generated = try backend.decodeStreaming(3, position, 1, &.{}, output[0..], null, null);
+
+    try std.testing.expectEqual(@as(usize, 1), generated);
+    try std.testing.expectEqual(expected, output[0]);
 }
 
 test "metal availability" {

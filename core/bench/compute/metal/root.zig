@@ -73,6 +73,10 @@ fn parseScenario(value: []const u8) !scenarios.Scenario {
     if (std.mem.eql(u8, value, "scvq") or std.mem.eql(u8, value, "shortconv_decode_quantized_u4")) return .shortconv_decode_quantized_u4;
     if (std.mem.eql(u8, value, "ssm") or std.mem.eql(u8, value, "state_space_decode_f16")) return .state_space_decode_f16;
     if (std.mem.eql(u8, value, "gdm") or std.mem.eql(u8, value, "gated_delta_decode_f16")) return .gated_delta_decode_f16;
+    if (std.mem.eql(u8, value, "gdblk") or std.mem.eql(u8, value, "gated_delta_block_f16")) return .gated_delta_block_f16;
+    if (std.mem.eql(u8, value, "lmhf") or std.mem.eql(u8, value, "lmhead_f16")) return .lm_head_f16;
+    if (std.mem.eql(u8, value, "lmhb") or std.mem.eql(u8, value, "lmhead_bf16")) return .lm_head_bf16;
+    if (std.mem.eql(u8, value, "lmhost") or std.mem.eql(u8, value, "lm_head_host_f16")) return .lm_head_host_f16;
     if (std.mem.eql(u8, value, "gdmq") or std.mem.eql(u8, value, "gdmq_u4") or std.mem.eql(u8, value, "gated_delta_decode_quantized_u4")) return .gated_delta_decode_quantized_u4;
     if (std.mem.eql(u8, value, "mmthr") or std.mem.eql(u8, value, "matmul_throughput_f16")) return .matmul_throughput_f16;
     if (std.mem.eql(u8, value, "micro") or std.mem.eql(u8, value, "micro_matmul_f16")) return .micro_matmul_f16;
@@ -99,7 +103,7 @@ fn printUsage(writer: anytype) !void {
         \\  zig build bench-metal-compute -Drelease -- [options]
         \\
         \\Options:
-        \\  --scenario <all|add|mul|rms|smx|ffnq_u4|ffnq_u8|ffnd|qmm_u4|qmm_u8|attn|scv|scvq|ssm|gdm|gdmq_u4|mmthr|micro|decode|decd|decq> default: all
+        \\  --scenario <all|add|mul|rms|smx|ffnq_u4|ffnq_u8|ffnd|qmm_u4|qmm_u8|attn|scv|scvq|ssm|gdm|gdblk|lmhf|lmhb|lmhost|gdmq_u4|mmthr|micro|decode|decd|decq> default: all
         \\  --profile <ci|bw>               default: bw
         \\  --format <table|csv|tsv>        default: table
         \\  --warmup <N>                    default: 8
@@ -158,28 +162,28 @@ fn printResultTable(
 ) !void {
     const gbps_eval_p50 = metrics.gbps(result.bytes_per_iter, summary.eval.p50_ns);
     const tflops_eval_p50 = metrics.tflops(result.flops_per_iter, summary.eval.p50_ns);
-    const warm_us_p50 = @as(f64, @floatFromInt(summary.eval.p50_ns)) / 1000.0;
-    const bytes_m = @as(f64, @floatFromInt(result.bytes_per_iter)) / 1_000_000.0;
-    const flops_m = @as(f64, @floatFromInt(result.flops_per_iter)) / 1_000_000.0;
+    const graph_us_p50 = @as(f64, @floatFromInt(summary.build.p50_ns)) / 1000.0;
+    const eval_us_p50 = @as(f64, @floatFromInt(summary.eval.p50_ns)) / 1000.0;
+    const total_us_p50 = @as(f64, @floatFromInt(summary.total.p50_ns)) / 1000.0;
 
     try writer.print(
-        "{s: <12} {s: <2} {d: >7.1} {d: >7.1} {d: >6.2} {d: >7.4} {d: >6.1} {d: >6.1}\n",
+        "{s: <12} {s: <2} {d: >8.1} {d: >7.1} {d: >8.1} {d: >7.1} {d: >6.2} {d: >7.4}\n",
         .{
             result.name,
             profileName(cfg.profile),
-            warm_us_p50,
+            graph_us_p50,
+            eval_us_p50,
+            total_us_p50,
             cold_us,
             gbps_eval_p50,
             tflops_eval_p50,
-            bytes_m,
-            flops_m,
         },
     );
 }
 
 fn printTsvHeader(writer: anytype) !void {
     try writer.writeAll(
-        "scenario\tprofile\twarmup\titers\twarm_us\tcold_us\tgbps\ttflops\tbytes_it\tflops_it\n",
+        "scenario\tprofile\twarmup\titers\tgraph_us\teval_us\ttotal_us\tcold_us\tgbps\ttflops\tbytes_it\tflops_it\n",
     );
 }
 
@@ -192,16 +196,20 @@ fn printResultTsv(
 ) !void {
     const gbps_eval_p50 = metrics.gbps(result.bytes_per_iter, summary.eval.p50_ns);
     const tflops_eval_p50 = metrics.tflops(result.flops_per_iter, summary.eval.p50_ns);
-    const warm_us_p50 = @as(f64, @floatFromInt(summary.eval.p50_ns)) / 1000.0;
+    const graph_us_p50 = @as(f64, @floatFromInt(summary.build.p50_ns)) / 1000.0;
+    const eval_us_p50 = @as(f64, @floatFromInt(summary.eval.p50_ns)) / 1000.0;
+    const total_us_p50 = @as(f64, @floatFromInt(summary.total.p50_ns)) / 1000.0;
 
     try writer.print(
-        "{s}\t{s}\t{}\t{}\t{d:.3}\t{d:.3}\t{d:.3}\t{d:.6}\t{}\t{}\n",
+        "{s}\t{s}\t{}\t{}\t{d:.3}\t{d:.3}\t{d:.3}\t{d:.3}\t{d:.3}\t{d:.6}\t{}\t{}\n",
         .{
             result.name,
             profileName(cfg.profile),
             cfg.warmup,
             cfg.iters,
-            warm_us_p50,
+            graph_us_p50,
+            eval_us_p50,
+            total_us_p50,
             cold_us,
             gbps_eval_p50,
             tflops_eval_p50,
@@ -212,7 +220,7 @@ fn printResultTsv(
 }
 
 fn printCsvHeader(writer: anytype) !void {
-    try writer.writeAll("scenario,profile,warmup,iters,warm_us,cold_us,gbps,tflops,bytes_it,flops_it\n");
+    try writer.writeAll("scenario,profile,warmup,iters,graph_us,eval_us,total_us,cold_us,gbps,tflops,bytes_it,flops_it\n");
 }
 
 fn printResultCsv(
@@ -224,16 +232,20 @@ fn printResultCsv(
 ) !void {
     const gbps_eval_p50 = metrics.gbps(result.bytes_per_iter, summary.eval.p50_ns);
     const tflops_eval_p50 = metrics.tflops(result.flops_per_iter, summary.eval.p50_ns);
-    const warm_us_p50 = @as(f64, @floatFromInt(summary.eval.p50_ns)) / 1000.0;
+    const graph_us_p50 = @as(f64, @floatFromInt(summary.build.p50_ns)) / 1000.0;
+    const eval_us_p50 = @as(f64, @floatFromInt(summary.eval.p50_ns)) / 1000.0;
+    const total_us_p50 = @as(f64, @floatFromInt(summary.total.p50_ns)) / 1000.0;
 
     try writer.print(
-        "{s},{s},{},{},{d:.3},{d:.3},{d:.3},{d:.6},{},{}\n",
+        "{s},{s},{},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.6},{},{}\n",
         .{
             result.name,
             profileName(cfg.profile),
             cfg.warmup,
             cfg.iters,
-            warm_us_p50,
+            graph_us_p50,
+            eval_us_p50,
+            total_us_p50,
             cold_us,
             gbps_eval_p50,
             tflops_eval_p50,
@@ -263,6 +275,10 @@ fn runScenario(
         .shortconv_decode_quantized_u4 => try scenarios.runShortconvDecodeQuantizedU4(allocator, cfg),
         .state_space_decode_f16 => try scenarios.runStateSpaceDecodeF16(allocator, cfg),
         .gated_delta_decode_f16 => try scenarios.runGatedDeltaDecodeF16(allocator, cfg),
+        .gated_delta_block_f16 => try scenarios.runGatedDeltaBlockF16(allocator, cfg),
+        .lm_head_f16 => try scenarios.runLmHeadF16(allocator, cfg),
+        .lm_head_bf16 => try scenarios.runLmHeadBF16(allocator, cfg),
+        .lm_head_host_f16 => try scenarios.runLmHeadHostF16(allocator, cfg),
         .gated_delta_decode_quantized_u4 => try scenarios.runGatedDeltaDecodeQuantizedU4(allocator, cfg),
         .matmul_throughput_f16 => try scenarios.runMatmulThroughputF16(allocator, cfg),
         .micro_matmul_f16 => try scenarios.runMicroMatmulF16(allocator, cfg),
@@ -368,8 +384,8 @@ pub fn main() !void {
                 cfg.run.warmup,
                 cfg.run.iters,
             });
-            try stdout.writeAll("scenario     pr warm_us cold_us  GB/s    TF/s  MB_it  MF_it\n");
-            try stdout.writeAll("-----------------------------------------------------------\n");
+            try stdout.writeAll("scenario     pr graph_us eval_us total_us cold_us  GB/s    TF/s\n");
+            try stdout.writeAll("----------------------------------------------------------------\n");
         },
         .csv => try printCsvHeader(stdout),
         .tsv => try printTsvHeader(stdout),
@@ -390,6 +406,10 @@ pub fn main() !void {
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .shortconv_decode_bf16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .state_space_decode_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_decode_f16));
+            updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_block_f16));
+            updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .lm_head_f16));
+            updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .lm_head_bf16));
+            updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .lm_head_host_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .matmul_throughput_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_dense_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_quantized_mix_u4));
@@ -416,6 +436,10 @@ pub fn main() !void {
         .shortconv_decode_quantized_u4 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .shortconv_decode_quantized_u4)),
         .state_space_decode_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .state_space_decode_f16)),
         .gated_delta_decode_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_decode_f16)),
+        .gated_delta_block_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_block_f16)),
+        .lm_head_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .lm_head_f16)),
+        .lm_head_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .lm_head_bf16)),
+        .lm_head_host_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .lm_head_host_f16)),
         .gated_delta_decode_quantized_u4 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_decode_quantized_u4)),
         .matmul_throughput_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .matmul_throughput_f16)),
         .micro_matmul_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .micro_matmul_f16)),
@@ -425,7 +449,7 @@ pub fn main() !void {
     }
 
     if (cfg.format == .table) {
-        try stdout.writeAll("-----------------------------------------------------------\n");
+        try stdout.writeAll("----------------------------------------------------------------\n");
         try stdout.print("peak GB/s: {d:.2} ({s})  peak TF/s: {d:.4} ({s})\n", .{
             peaks.gbps,
             peaks.gbps_name,
@@ -433,13 +457,13 @@ pub fn main() !void {
             peaks.tflops_name,
         });
         try stdout.writeAll("Legend:\n");
-        try stdout.writeAll("  warm_us : warm-path p50 eval latency (us). Lower is better.\n");
+        try stdout.writeAll("  graph_us: warm-path p50 graph-build latency (us). Lower is better.\n");
+        try stdout.writeAll("  eval_us : warm-path p50 eval latency (us). Lower is better.\n");
+        try stdout.writeAll("  total_us: warm-path p50 total latency (us). Lower is better.\n");
         try stdout.writeAll("  cold_us : one-time cold gap in total latency (us):\n");
         try stdout.writeAll("            max(0, cold_total_us - warm_total_us). Lower is better.\n");
         try stdout.writeAll("  GB/s    : bytes_it / eval_p50_ns. Higher is better for memory-bound methods.\n");
         try stdout.writeAll("  TF/s    : flops_it / eval_p50_ns / 1000. Higher is better for compute-bound.\n");
-        try stdout.writeAll("  MB_it   : per-iteration bytes in decimal MB.\n");
-        try stdout.writeAll("  MF_it   : per-iteration flops in decimal MF.\n");
     }
 }
 

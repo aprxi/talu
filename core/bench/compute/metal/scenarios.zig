@@ -21,6 +21,10 @@ pub const Scenario = enum {
     shortconv_decode_quantized_u4,
     state_space_decode_f16,
     gated_delta_decode_f16,
+    gated_delta_block_f16,
+    lm_head_f16,
+    lm_head_bf16,
+    lm_head_host_f16,
     gated_delta_decode_quantized_u4,
     matmul_throughput_f16,
     micro_matmul_f16,
@@ -134,6 +138,45 @@ const OwnedBF16 = struct {
     }
 };
 
+const OwnedBF16DenseWeight = struct {
+    data: []u16,
+    handle: graph.ArrayHandle,
+
+    fn init2D(allocator: std.mem.Allocator, rows: usize, cols: usize, seed: u64) !OwnedBF16DenseWeight {
+        const count = rows * cols;
+        const data = try allocator.alloc(u16, count);
+        fillDeterministicBF16(data, seed);
+        const shape = [_]i64{ @intCast(rows), @intCast(cols) };
+        const ptr: [*]align(1) const u16 = @ptrCast(data.ptr);
+        const handle = graph.createArrayBF16DenseWeightUnaligned(ptr, data.len, &shape) orelse return error.OutOfMemory;
+        return .{ .data = data, .handle = handle };
+    }
+
+    fn deinit(self: *OwnedBF16DenseWeight, allocator: std.mem.Allocator) void {
+        graph.freeArray(self.handle);
+        allocator.free(self.data);
+    }
+};
+
+const OwnedBF16Norm = struct {
+    data: []u16,
+    handle: graph.ArrayHandle,
+
+    fn init1D(allocator: std.mem.Allocator, len: usize, seed: u64) !OwnedBF16Norm {
+        const data = try allocator.alloc(u16, len);
+        fillDeterministicBF16(data, seed);
+        const shape = [_]i64{@intCast(len)};
+        const ptr: [*]align(1) const u16 = @ptrCast(data.ptr);
+        const handle = graph.createArrayBF16NormUnaligned(ptr, data.len, &shape) orelse return error.OutOfMemory;
+        return .{ .data = data, .handle = handle };
+    }
+
+    fn deinit(self: *OwnedBF16Norm, allocator: std.mem.Allocator) void {
+        graph.freeArray(self.handle);
+        allocator.free(self.data);
+    }
+};
+
 const DecodeLayer = struct {
     wq: OwnedF16,
     wk: OwnedF16,
@@ -202,6 +245,18 @@ fn fillDeterministicBF16(data: []u16, seed: u64) void {
         const value = 0.01 + (r / 255.0) * 0.04 + @as(f32, @floatFromInt((idx % 7))) * 0.001;
         slot.* = f32ToBf16Bits(value);
     }
+}
+
+fn argmaxHost(values: []const f32) u32 {
+    var best_idx: usize = 0;
+    var best_val: f32 = -std.math.inf(f32);
+    for (values, 0..) |v, idx| {
+        if (v > best_val) {
+            best_val = v;
+            best_idx = idx;
+        }
+    }
+    return @intCast(best_idx);
 }
 
 fn profileMicroDims(profile: Profile) struct { m: usize, k: usize, n: usize } {
@@ -336,15 +391,62 @@ fn profileGatedDeltaDecodeDims(profile: Profile) struct {
         .ci => .{
             .hidden = 512,
             .n_heads = 8,
-            .d_head = 64,
+            .d_head = 128,
             .d_conv = 4,
             .steps = 16,
         },
         .bw => .{
             .hidden = 1024,
             .n_heads = 16,
-            .d_head = 64,
+            .d_head = 128,
             .d_conv = 4,
+            .steps = 48,
+        },
+    };
+}
+
+fn profileGatedDeltaBlockDims(profile: Profile) struct {
+    hidden: usize,
+    ff: usize,
+    n_heads: usize,
+    d_head: usize,
+    d_conv: usize,
+    steps: usize,
+} {
+    return switch (profile) {
+        .ci => .{
+            .hidden = 512,
+            .ff = 1792,
+            .n_heads = 8,
+            .d_head = 128,
+            .d_conv = 4,
+            .steps = 16,
+        },
+        .bw => .{
+            .hidden = 1024,
+            .ff = 3584,
+            .n_heads = 16,
+            .d_head = 128,
+            .d_conv = 4,
+            .steps = 48,
+        },
+    };
+}
+
+fn profileLmHeadDims(profile: Profile) struct {
+    hidden: usize,
+    vocab: usize,
+    steps: usize,
+} {
+    return switch (profile) {
+        .ci => .{
+            .hidden = 1024,
+            .vocab = 65536,
+            .steps = 16,
+        },
+        .bw => .{
+            .hidden = 1024,
+            .vocab = 248320,
             .steps = 48,
         },
     };
@@ -1474,7 +1576,6 @@ pub fn runGatedDeltaDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Sce
     try expectMetalReady();
 
     const dims = profileGatedDeltaDecodeDims(cfg.profile);
-    if (dims.hidden != dims.n_heads * dims.d_head) return error.InvalidInput;
 
     const d_inner = dims.n_heads * dims.d_head;
     const qkv_len = 3 * d_inner;
@@ -1568,13 +1669,313 @@ pub fn runGatedDeltaDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Sce
     };
 }
 
+pub fn runGatedDeltaBlockF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    try expectMetalReady();
+
+    const dims = profileGatedDeltaBlockDims(cfg.profile);
+    const d_inner = dims.n_heads * dims.d_head;
+    const qkv_len = 3 * d_inner;
+    const proj_dim = (4 * d_inner) + (2 * dims.n_heads);
+
+    const token_shape = [_]i64{ 1, 1, @intCast(dims.hidden) };
+    var x = try OwnedF16.initShape(allocator, &token_shape, 0xA321);
+    defer x.deinit(allocator);
+
+    var ln1_w = try OwnedF16.init1D(allocator, dims.hidden, 0xA322);
+    defer ln1_w.deinit(allocator);
+    var in_proj = try OwnedF16.init2D(allocator, dims.hidden, proj_dim, 0xA323);
+    defer in_proj.deinit(allocator);
+    var conv_w = try OwnedF16.init2D(allocator, dims.d_conv, qkv_len, 0xA324);
+    defer conv_w.deinit(allocator);
+    var conv_b = try OwnedF16.init1D(allocator, qkv_len, 0xA325);
+    defer conv_b.deinit(allocator);
+    var a_log = try OwnedF16.init1D(allocator, dims.n_heads, 0xA326);
+    defer a_log.deinit(allocator);
+    var dt_bias = try OwnedF16.init1D(allocator, dims.n_heads, 0xA327);
+    defer dt_bias.deinit(allocator);
+    var norm_weight = try OwnedF16.init1D(allocator, d_inner, 0xA328);
+    defer norm_weight.deinit(allocator);
+    var out_proj = try OwnedF16.init2D(allocator, d_inner, dims.hidden, 0xA329);
+    defer out_proj.deinit(allocator);
+    var ln2_w = try OwnedF16.init1D(allocator, dims.hidden, 0xA32A);
+    defer ln2_w.deinit(allocator);
+    var w1 = try OwnedF16.init2D(allocator, dims.hidden, dims.ff, 0xA32B);
+    defer w1.deinit(allocator);
+    var w2 = try OwnedF16.init2D(allocator, dims.ff, dims.hidden, 0xA32C);
+    defer w2.deinit(allocator);
+    var w3 = try OwnedF16.init2D(allocator, dims.hidden, dims.ff, 0xA32D);
+    defer w3.deinit(allocator);
+
+    const cache = graph.mlx_state_space_cache_create(1);
+    defer graph.mlx_state_space_cache_free(cache);
+
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    const total_iters = cfg.warmup + cfg.iters;
+    var sample_idx: usize = 0;
+    var iter: usize = 0;
+    var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
+    graph.mlx_clear_memory_cache();
+    while (iter < total_iters) : (iter += 1) {
+        graph.mlx_state_space_cache_reset(cache);
+        graph.beginForwardGraphBuild();
+        const t0 = std.time.nanoTimestamp();
+        var out: graph.ArrayHandle = x.handle;
+        var step: usize = 0;
+        while (step < dims.steps) : (step += 1) {
+            const residual = out;
+            const norm1 = graph.mlx_lazy_rms_norm(out, ln1_w.handle, 1.0e-5);
+            const mixed = graph.mlx_lazy_gated_delta_mixer_bf16(
+                norm1,
+                in_proj.handle,
+                conv_w.handle,
+                conv_b.handle,
+                a_log.handle,
+                dt_bias.handle,
+                norm_weight.handle,
+                out_proj.handle,
+                cache,
+                0,
+                dims.d_conv,
+                dims.n_heads,
+                dims.d_head,
+            );
+            const hidden_1 = graph.mlx_lazy_add(residual, mixed);
+            const norm2 = graph.mlx_lazy_rms_norm(hidden_1, ln2_w.handle, 1.0e-5);
+            const ffn = graph.mlx_lazy_fused_ffn_bf16(
+                norm2,
+                w1.handle,
+                w3.handle,
+                w2.handle,
+            );
+            out = graph.mlx_lazy_add(hidden_1, ffn);
+        }
+        const t1 = std.time.nanoTimestamp();
+        var handles = [_]graph.ArrayHandle{out};
+        const t2 = std.time.nanoTimestamp();
+        graph.eval(&handles);
+        const t3 = std.time.nanoTimestamp();
+
+        recordSample(&cold_first, samples, &sample_idx, iter, cfg.warmup, t0, t1, t2, t3);
+    }
+
+    const gdm_in_proj_flops = @as(u128, 2) * dims.hidden * proj_dim;
+    const gdm_out_proj_flops = @as(u128, 2) * d_inner * dims.hidden;
+    const gdm_conv_flops = @as(u128, 2) * dims.d_conv * qkv_len + @as(u128, 3) * qkv_len;
+    const recurrent_state_elems = @as(u128, dims.n_heads) * dims.d_head * dims.d_head;
+    const gdm_recurrent_flops = @as(u128, 12) * recurrent_state_elems + @as(u128, 8) * dims.n_heads * dims.d_head;
+    const ffn_flops = @as(u128, 6) * dims.hidden * dims.ff;
+    const norm_flops = @as(u128, 12) * dims.hidden;
+    const add_flops = @as(u128, 2) * dims.hidden;
+    const flops_per_step = gdm_in_proj_flops + gdm_out_proj_flops + gdm_conv_flops + gdm_recurrent_flops + ffn_flops + norm_flops + add_flops;
+
+    const gdm_in_proj_bytes = @as(u128, dims.hidden) * proj_dim * 2;
+    const gdm_out_proj_bytes = @as(u128, d_inner) * dims.hidden * 2;
+    const gdm_conv_bytes = (@as(u128, dims.d_conv) * qkv_len + qkv_len) * 2;
+    const gdm_vec_bytes = (@as(u128, 2) * dims.n_heads + d_inner) * 2;
+    const gdm_conv_state_bytes = (@as(u128, 2) * dims.d_conv * qkv_len) * 4;
+    const gdm_recurrent_state_bytes = (@as(u128, 2) * dims.n_heads * dims.d_head * dims.d_head) * 4;
+    const ffn_weight_bytes = @as(u128, 3) * dims.hidden * dims.ff * 2;
+    const ffn_io_bytes = @as(u128, 2) * dims.hidden * 2;
+    const norm_bytes = @as(u128, 2) * ((@as(u128, 2) * dims.hidden + dims.hidden) * 2);
+    const add_bytes = @as(u128, 2) * (@as(u128, 3) * dims.hidden * 2);
+    const bytes_per_step = gdm_in_proj_bytes + gdm_out_proj_bytes + gdm_conv_bytes + gdm_vec_bytes + gdm_conv_state_bytes + gdm_recurrent_state_bytes + ffn_weight_bytes + ffn_io_bytes + norm_bytes + add_bytes;
+
+    return .{
+        .name = "p1_gdblk",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_first = cold_first,
+        .flops_per_iter = toU64Saturating(flops_per_step * dims.steps),
+        .bytes_per_iter = toU64Saturating(bytes_per_step * dims.steps),
+        .note = "gated-delta block decode method: norm + gated-delta + add + norm + ffn + add",
+    };
+}
+
+pub fn runLmHeadF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    try expectMetalReady();
+
+    const dims = profileLmHeadDims(cfg.profile);
+    const token_shape = [_]i64{ 1, 1, @intCast(dims.hidden) };
+    var x = try OwnedF16.initShape(allocator, &token_shape, 0xB101);
+    defer x.deinit(allocator);
+    var ln_final = try OwnedF16.init1D(allocator, dims.hidden, 0xB102);
+    defer ln_final.deinit(allocator);
+    var lm_head = try OwnedF16.init2D(allocator, dims.hidden, dims.vocab, 0xB103);
+    defer lm_head.deinit(allocator);
+
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    const total_iters = cfg.warmup + cfg.iters;
+    var sample_idx: usize = 0;
+    var iter: usize = 0;
+    var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
+    graph.mlx_clear_memory_cache();
+    while (iter < total_iters) : (iter += 1) {
+        graph.beginForwardGraphBuild();
+        const t0 = std.time.nanoTimestamp();
+        var logits: graph.ArrayHandle = null;
+        var step: usize = 0;
+        while (step < dims.steps) : (step += 1) {
+            const final_normed = graph.mlx_lazy_rms_norm(x.handle, ln_final.handle, 1.0e-5);
+            logits = graph.mlx_lazy_matmul(final_normed, lm_head.handle);
+        }
+        const t1 = std.time.nanoTimestamp();
+        var handles = [_]graph.ArrayHandle{logits};
+        const t2 = std.time.nanoTimestamp();
+        graph.eval(&handles);
+        const t3 = std.time.nanoTimestamp();
+
+        recordSample(&cold_first, samples, &sample_idx, iter, cfg.warmup, t0, t1, t2, t3);
+    }
+
+    const flops_per_step = (@as(u128, 2) * dims.hidden * dims.vocab) + (@as(u128, 6) * dims.hidden);
+    const bytes_per_step = (@as(u128, dims.hidden) * dims.vocab * 2) + (@as(u128, 3) * dims.hidden * 2);
+
+    return .{
+        .name = "p1_lmh_f16",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_first = cold_first,
+        .flops_per_iter = toU64Saturating(flops_per_step * dims.steps),
+        .bytes_per_iter = toU64Saturating(bytes_per_step * dims.steps),
+        .note = "final rmsnorm plus dense f16 lm_head projection",
+    };
+}
+
+pub fn runLmHeadBF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    try expectMetalReady();
+
+    const dims = profileLmHeadDims(cfg.profile);
+    const token_shape = [_]i64{ 1, 1, @intCast(dims.hidden) };
+    var x = try OwnedBF16.initShape(allocator, &token_shape, 0xB201);
+    defer x.deinit(allocator);
+    var ln_final = try OwnedBF16Norm.init1D(allocator, dims.hidden, 0xB202);
+    defer ln_final.deinit(allocator);
+    var lm_head = try OwnedBF16DenseWeight.init2D(allocator, dims.hidden, dims.vocab, 0xB203);
+    defer lm_head.deinit(allocator);
+
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    const total_iters = cfg.warmup + cfg.iters;
+    var sample_idx: usize = 0;
+    var iter: usize = 0;
+    var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
+    graph.mlx_clear_memory_cache();
+    while (iter < total_iters) : (iter += 1) {
+        graph.beginForwardGraphBuild();
+        const t0 = std.time.nanoTimestamp();
+        var logits: graph.ArrayHandle = null;
+        var step: usize = 0;
+        while (step < dims.steps) : (step += 1) {
+            const final_normed = graph.mlx_lazy_rms_norm(x.handle, ln_final.handle, 1.0e-5);
+            logits = graph.mlx_lazy_matmul(final_normed, lm_head.handle);
+        }
+        const t1 = std.time.nanoTimestamp();
+        var handles = [_]graph.ArrayHandle{logits};
+        const t2 = std.time.nanoTimestamp();
+        graph.eval(&handles);
+        const t3 = std.time.nanoTimestamp();
+
+        recordSample(&cold_first, samples, &sample_idx, iter, cfg.warmup, t0, t1, t2, t3);
+    }
+
+    const flops_per_step = (@as(u128, 2) * dims.hidden * dims.vocab) + (@as(u128, 6) * dims.hidden);
+    const bytes_per_step = (@as(u128, dims.hidden) * dims.vocab * 2) + (@as(u128, 3) * dims.hidden * 2);
+
+    return .{
+        .name = "p1_lmh_bf16",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_first = cold_first,
+        .flops_per_iter = toU64Saturating(flops_per_step * dims.steps),
+        .bytes_per_iter = toU64Saturating(bytes_per_step * dims.steps),
+        .note = "final rmsnorm plus dense bf16 lm_head projection using live weight-load policy",
+    };
+}
+
+pub fn runLmHeadHostF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    try expectMetalReady();
+
+    const dims = profileLmHeadDims(cfg.profile);
+    const token_shape = [_]i64{ 1, 1, @intCast(dims.hidden) };
+    var x = try OwnedF16.initShape(allocator, &token_shape, 0xB301);
+    defer x.deinit(allocator);
+    var ln_final = try OwnedF16.init1D(allocator, dims.hidden, 0xB302);
+    defer ln_final.deinit(allocator);
+    var lm_head = try OwnedF16.init2D(allocator, dims.hidden, dims.vocab, 0xB303);
+    defer lm_head.deinit(allocator);
+
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+    const host_logits = try allocator.alloc(f32, dims.vocab);
+    defer allocator.free(host_logits);
+
+    const total_iters = cfg.warmup + cfg.iters;
+    var sample_idx: usize = 0;
+    var iter: usize = 0;
+    var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
+    var sink_token: u32 = 0;
+    graph.mlx_clear_memory_cache();
+    while (iter < total_iters) : (iter += 1) {
+        var build_ns: u64 = 0;
+        var eval_ns: u64 = 0;
+        const total_start = std.time.nanoTimestamp();
+        var step: usize = 0;
+        while (step < dims.steps) : (step += 1) {
+            graph.beginForwardGraphBuild();
+            const t0 = std.time.nanoTimestamp();
+            const final_normed = graph.mlx_lazy_rms_norm(x.handle, ln_final.handle, 1.0e-5);
+            const logits = graph.mlx_lazy_matmul(final_normed, lm_head.handle);
+            const t1 = std.time.nanoTimestamp();
+            var handles = [_]graph.ArrayHandle{logits};
+            const t2 = std.time.nanoTimestamp();
+            graph.eval(&handles);
+            const t3 = std.time.nanoTimestamp();
+            graph.copyToHost(logits, host_logits);
+            sink_token +%= argmaxHost(host_logits);
+            build_ns +%= elapsedNs(t0, t1);
+            eval_ns +%= elapsedNs(t2, t3);
+            graph.freeArray(logits);
+            graph.freeArray(final_normed);
+        }
+        const total_end = std.time.nanoTimestamp();
+        const sample = harness.Sample{
+            .build_ns = build_ns,
+            .eval_ns = eval_ns,
+            .total_ns = elapsedNs(total_start, total_end),
+        };
+        if (iter == 0) cold_first = sample;
+        if (iter >= cfg.warmup and sample_idx < samples.len) {
+            samples[sample_idx] = sample;
+            sample_idx += 1;
+        }
+    }
+    std.mem.doNotOptimizeAway(sink_token);
+
+    const flops_per_step = (@as(u128, 2) * dims.hidden * dims.vocab) + (@as(u128, 6) * dims.hidden);
+    const bytes_per_step = (@as(u128, dims.hidden) * dims.vocab * 2) + (@as(u128, 3) * dims.hidden * 2);
+
+    return .{
+        .name = "p1_lmhost",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_first = cold_first,
+        .flops_per_iter = toU64Saturating(flops_per_step * dims.steps),
+        .bytes_per_iter = toU64Saturating(bytes_per_step * dims.steps),
+        .note = "final rmsnorm plus dense f16 lm_head projection with host logits copy and argmax",
+    };
+}
+
 pub fn runGatedDeltaDecodeQuantizedU4(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
     try expectMetalReady();
 
     const dims = profileGatedDeltaDecodeDims(cfg.profile);
     const bits: usize = 4;
     const group_size: usize = 64;
-    if (dims.hidden != dims.n_heads * dims.d_head) return error.InvalidInput;
     if (dims.hidden % group_size != 0) return error.InvalidInput;
     if (dims.hidden % 8 != 0) return error.InvalidInput;
 
@@ -2274,4 +2675,72 @@ pub fn runDecodeQuantizedMixU4(allocator: std.mem.Allocator, cfg: RunConfig) !Sc
         .bytes_per_iter = bytes,
         .note = "quantized decode token path with shortconv+attention mix and quantized logits",
     };
+}
+
+test "runGatedDeltaBlockF16 returns gated-delta block scenario metadata" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!metal.isAvailable()) return;
+
+    var result = try runGatedDeltaBlockF16(std.testing.allocator, .{
+        .warmup = 0,
+        .iters = 1,
+        .profile = .ci,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("p1_gdblk", result.name);
+    try std.testing.expect(result.flops_per_iter > 0);
+    try std.testing.expect(result.bytes_per_iter > 0);
+    try std.testing.expectEqual(@as(usize, 1), result.samples.len);
+}
+
+test "runLmHeadF16 returns lm_head f16 scenario metadata" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!metal.isAvailable()) return;
+
+    var result = try runLmHeadF16(std.testing.allocator, .{
+        .warmup = 0,
+        .iters = 1,
+        .profile = .ci,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("p1_lmh_f16", result.name);
+    try std.testing.expect(result.flops_per_iter > 0);
+    try std.testing.expect(result.bytes_per_iter > 0);
+    try std.testing.expectEqual(@as(usize, 1), result.samples.len);
+}
+
+test "runLmHeadBF16 returns lm_head bf16 scenario metadata" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!metal.isAvailable()) return;
+
+    var result = try runLmHeadBF16(std.testing.allocator, .{
+        .warmup = 0,
+        .iters = 1,
+        .profile = .ci,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("p1_lmh_bf16", result.name);
+    try std.testing.expect(result.flops_per_iter > 0);
+    try std.testing.expect(result.bytes_per_iter > 0);
+    try std.testing.expectEqual(@as(usize, 1), result.samples.len);
+}
+
+test "runLmHeadHostF16 returns lm_head host scenario metadata" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!metal.isAvailable()) return;
+
+    var result = try runLmHeadHostF16(std.testing.allocator, .{
+        .warmup = 0,
+        .iters = 1,
+        .profile = .ci,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("p1_lmhost", result.name);
+    try std.testing.expect(result.flops_per_iter > 0);
+    try std.testing.expect(result.bytes_per_iter > 0);
+    try std.testing.expectEqual(@as(usize, 1), result.samples.len);
 }
