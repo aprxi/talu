@@ -490,6 +490,17 @@ void* mlx_lazy_argmax(const void* handle, int axis) {
     return pool_array(argmax(input_arr, axis));
 }
 
+void* mlx_lazy_argpartition(const void* handle, int kth, int axis) {
+    const auto& input_arr = *static_cast<const array*>(handle);
+    return pool_array(argpartition(input_arr, kth, axis));
+}
+
+void* mlx_lazy_take_along_axis(const void* input, const void* indices, int axis) {
+    const auto& input_arr = *static_cast<const array*>(input);
+    const auto& indices_arr = *static_cast<const array*>(indices);
+    return pool_array(take_along_axis(input_arr, indices_arr, axis));
+}
+
 // ============================================================================
 // Creation Operations
 // ============================================================================

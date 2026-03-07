@@ -355,6 +355,35 @@ pub const Backend = union(enum) {
         }
     }
 
+    pub fn supportsSchedulerBackendTopKDecodeRoute(
+        self: *const Backend,
+        sampling_config: *const cpu.sampling.SamplingConfig,
+    ) bool {
+        return switch (self.*) {
+            .cpu => false,
+            .metal => |*b| if (has_metal) b.supportsSchedulerBackendTopKDecodeRoute(sampling_config) else unreachable,
+            .cuda => false,
+        };
+    }
+
+    pub fn decodeTopKCandidates(
+        self: *Backend,
+        slot_index: usize,
+        token: u32,
+        top_k: usize,
+        candidate_logits_out: []f32,
+        candidate_ids_out: []u32,
+    ) !usize {
+        return switch (self.*) {
+            .cpu => error.InvalidArgument,
+            .metal => |*b| if (has_metal)
+                b.decodeTopKCandidates(slot_index, token, top_k, candidate_logits_out, candidate_ids_out)
+            else
+                unreachable,
+            .cuda => error.InvalidArgument,
+        };
+    }
+
     /// Get vocab size for this model
     pub fn vocabSize(self: *const Backend) usize {
         switch (self.*) {

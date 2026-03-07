@@ -1941,8 +1941,35 @@ void* mlx_lazy_gated_delta_mixer_bf16(
         ssm_state = zeros({1, n_heads_i, d_head_i, d_head_i}, float32);
     }
 
-    const array in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
-    const array out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+    array in_proj_rhs(0.0f, input_arr.dtype());
+    array out_proj_rhs(0.0f, input_arr.dtype());
+    if (layer_state != nullptr) {
+        const bool need_proj_rhs_refresh =
+            layer_state->in_proj_rhs == nullptr ||
+            layer_state->out_proj_rhs == nullptr ||
+            layer_state->in_proj_handle != in_proj ||
+            layer_state->out_proj_handle != out_proj ||
+            layer_state->hidden_dim != hidden_dim ||
+            layer_state->d_inner != d_inner;
+        if (need_proj_rhs_refresh) {
+            in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
+            out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+            delete layer_state->in_proj_rhs;
+            delete layer_state->out_proj_rhs;
+            layer_state->in_proj_rhs = new array(in_proj_rhs);
+            layer_state->out_proj_rhs = new array(out_proj_rhs);
+            layer_state->in_proj_handle = in_proj;
+            layer_state->out_proj_handle = out_proj;
+            layer_state->hidden_dim = hidden_dim;
+            layer_state->d_inner = d_inner;
+        } else {
+            in_proj_rhs = *layer_state->in_proj_rhs;
+            out_proj_rhs = *layer_state->out_proj_rhs;
+        }
+    } else {
+        in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
+        out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+    }
     StateSpaceCallable in_proj_fn{
         .fn = state_space_apply_matmul_rhs,
         .ctx = &in_proj_rhs,

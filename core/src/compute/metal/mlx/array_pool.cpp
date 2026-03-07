@@ -295,6 +295,13 @@ void mlx_array_to_float32(const void* handle, float* out, size_t size) {
     memcpy(out, converted.data<float>(), size * sizeof(float));
 }
 
+void mlx_array_to_uint32(const void* handle, uint32_t* out, size_t size) {
+    const auto& array_ref = *static_cast<const array*>(handle);
+    auto converted = (array_ref.dtype() != uint32) ? astype(array_ref, uint32) : array_ref;
+    eval(converted);
+    memcpy(out, converted.data<uint32_t>(), size * sizeof(uint32_t));
+}
+
 uint32_t mlx_array_item_u32(const void* handle) {
     const auto& array_ref = *static_cast<const array*>(handle);
     return static_cast<uint32_t>(array_ref.item<int32_t>());

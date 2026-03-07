@@ -546,9 +546,25 @@ pub extern fn mlx_array_to_float32(
     size: usize,
 ) void;
 
+pub extern fn mlx_array_to_uint32(
+    handle: ArrayHandle,
+    out: [*]u32,
+    size: usize,
+) void;
+
 /// GPU-side argmax - returns array handle with selected index
 /// Use to avoid CPU roundtrip during sampling
 pub extern fn mlx_lazy_argmax(handle: ArrayHandle, axis: c_int) ArrayHandle;
+
+/// GPU-side argpartition - returns partitioned indices along the axis.
+pub extern fn mlx_lazy_argpartition(handle: ArrayHandle, kth: c_int, axis: c_int) ArrayHandle;
+
+/// Gather values using indices along a single axis.
+pub extern fn mlx_lazy_take_along_axis(
+    input: ArrayHandle,
+    indices: ArrayHandle,
+    axis: c_int,
+) ArrayHandle;
 
 /// Get scalar u32 value from array (blocks until evaluated)
 pub extern fn mlx_array_item_u32(handle: ArrayHandle) u32;
@@ -660,6 +676,10 @@ pub fn asyncEval(handles: []const ArrayHandle) void {
 /// Copy array data from GPU to CPU
 pub fn copyToHost(handle: ArrayHandle, out: []f32) void {
     mlx_array_to_float32(handle, out.ptr, out.len);
+}
+
+pub fn copyU32ToHost(handle: ArrayHandle, out: []u32) void {
+    mlx_array_to_uint32(handle, out.ptr, out.len);
 }
 
 /// Get array shape and dimensions
