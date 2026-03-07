@@ -144,6 +144,12 @@ pub fn tokenizer_pretokenizer_set(pretokenizer: *ct.PreTokenizer, pattern_opt: ?
     return 0;
 }
 
+fn clearRegexPretokenizerState(pretokenizer: *ct.PreTokenizer) void {
+    tokenizer_pretokenizer_free(pretokenizer);
+    pretokenizer.regex_split = 0;
+    pretokenizer.regex_invert = 0;
+}
+
 pub fn tokenizer_apply_pretokenizer_spec(tok: ?*ct.Tokenizer, spec: ?*const ct.PreTokenizerSpec) void {
     if (tok == null or spec == null) return;
     const tokenizer = tok.?;
@@ -158,10 +164,14 @@ pub fn tokenizer_apply_pretokenizer_spec(tok: ?*ct.Tokenizer, spec: ?*const ct.P
     tokenizer.pretokenizer.metaspace = pretokenizer_spec.metaspace;
     if (pretokenizer_spec.pattern) |pat| {
         _ = tokenizer_pretokenizer_set(&tokenizer.pretokenizer, @ptrCast(pat));
+    } else if (pretokenizer_spec.byte_level != 0 and pretokenizer_spec.use_regex == 0) {
+        // ByteLevel(use_regex=false) must disable the model/default GPT-2 regex
+        // so merges can span class boundaries within one chunk.
+        clearRegexPretokenizerState(&tokenizer.pretokenizer);
     } else if (pretokenizer_spec.whitespace != 0 or pretokenizer_spec.punctuation != 0 or pretokenizer_spec.metaspace != 0) {
         // Non-regex pretokenizer: clear any model-default regex so the
         // whitespace/punctuation/metaspace flags take effect.
-        _ = tokenizer_pretokenizer_set(&tokenizer.pretokenizer, null);
+        clearRegexPretokenizerState(&tokenizer.pretokenizer);
     }
 }
 
@@ -927,6 +937,32 @@ test "splitByGpt2Fast matches splitByRegex on varied input" {
             }
         }
     }
+}
+
+test "tokenizer_apply_pretokenizer_spec clears regex for bytelevel use_regex false" {
+    var tokenizer = std.mem.zeroes(ct.Tokenizer);
+    defer tokenizer_pretokenizer_free(&tokenizer.pretokenizer);
+
+    _ = tokenizer_pretokenizer_set(&tokenizer.pretokenizer, GPT2_PATTERN.ptr);
+    try std.testing.expect(tokenizer.pretokenizer.re != null);
+
+    const spec = ct.PreTokenizerSpec{
+        .type = null,
+        .add_prefix_space = 0,
+        .trim_offsets = 1,
+        .use_regex = 0,
+        .byte_level = 1,
+        .whitespace = 0,
+        .punctuation = 0,
+        .pattern = null,
+        .regex_split = 0,
+        .regex_invert = 0,
+        .metaspace = 0,
+    };
+    tokenizer_apply_pretokenizer_spec(&tokenizer, &spec);
+
+    try std.testing.expect(tokenizer.pretokenizer.re == null);
+    try std.testing.expect(tokenizer.pretokenizer.pattern == null);
 }
 
 test "tokenizer Split Removed overrides default regex pretokenizer for whitespace" {

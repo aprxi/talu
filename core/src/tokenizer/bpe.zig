@@ -1147,17 +1147,18 @@ fn bpe_decode_with_options_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]c
 
     for (tokens, 0..) |*slot, id_idx| {
         const id = ids[id_idx];
+        // Added tokens take precedence over plain vocab lookup so their
+        // special-token semantics remain visible during decode.
+        if (findAddedTokenInfoById(tok, id)) |added_info| {
+            slot.* = .{ .slice = std.mem.sliceTo(added_info.content, 0), .is_special = added_info.is_special };
+            continue;
+        }
         // Check id_to_token array (regular vocab tokens are not special)
         if (id >= 0 and @as(usize, @intCast(id)) < model.id_to_token.len) {
             if (model.id_to_token[@as(usize, @intCast(id))]) |token| {
                 slot.* = .{ .slice = token, .is_special = false };
                 continue;
             }
-        }
-        // Check added tokens - use the actual special flag from tokenizer config
-        if (findAddedTokenInfoById(tok, id)) |added_info| {
-            slot.* = .{ .slice = std.mem.sliceTo(added_info.content, 0), .is_special = added_info.is_special };
-            continue;
         }
         slot.* = .{ .slice = std.mem.sliceTo(unk_ptr, 0), .is_special = false };
     }

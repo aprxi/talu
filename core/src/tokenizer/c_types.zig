@@ -152,6 +152,10 @@ pub const Decoder = extern struct {
     strip_start: c_int,
     /// Number of trailing spaces to strip (from Strip decoder "stop" field)
     strip_stop: c_int,
+    /// WordPiece decoder config was explicitly loaded from tokenizer.json.
+    wordpiece: c_int,
+    /// WordPiece decoder cleanup_tokenization_spaces behavior.
+    cleanup: c_int,
     /// Metaspace decoder: strip leading space added during encode
     add_prefix_space: c_int,
     /// Metaspace decoder is active and should map ▁ back to space.
@@ -537,6 +541,8 @@ test "Decoder struct default values" {
     decoder.strip_start = 1;
     try std.testing.expectEqual(@as(c_int, 1), decoder.strip_start);
     try std.testing.expectEqual(@as(c_int, 0), decoder.strip_stop);
+    try std.testing.expectEqual(@as(c_int, 0), decoder.wordpiece);
+    try std.testing.expectEqual(@as(c_int, 0), decoder.cleanup);
 }
 
 test "VocabListC.fromEntries creates valid parallel arrays" {

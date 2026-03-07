@@ -63,6 +63,23 @@ pub fn tokenizer_apply_normalizer_spec(tok: ?*ct.Tokenizer, spec: ?*const ct.Nor
     tokenizer.normalizer.replace_content = normalizer_spec.replace_content;
 }
 
+pub fn tokenizer_normalizer_free(normalizer_opt: ?*ct.Normalizer) void {
+    if (normalizer_opt == null) return;
+    const normalizer = normalizer_opt.?;
+    if (normalizer.prepend) |ptr| {
+        Allocator.free(std.mem.sliceTo(ptr, 0));
+        normalizer.prepend = null;
+    }
+    if (normalizer.replace_pattern) |ptr| {
+        Allocator.free(std.mem.sliceTo(ptr, 0));
+        normalizer.replace_pattern = null;
+    }
+    if (normalizer.replace_content) |ptr| {
+        Allocator.free(std.mem.sliceTo(ptr, 0));
+        normalizer.replace_content = null;
+    }
+}
+
 /// Apply Unicode normalization while preserving embedded null bytes.
 /// utf8proc normalization functions stop at null bytes, so we split input
 /// at nulls, normalize each segment, and reassemble with nulls preserved.

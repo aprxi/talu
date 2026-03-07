@@ -742,8 +742,8 @@ fn merges_do_not_cross_whitespace_pretokenizer_boundaries() {
     let split_tokens = ctx.encode_with("a b", &no_bos());
     assert_eq!(
         split_tokens,
-        vec![4, 3, 5],
-        "whitespace-separated input must not collapse to merged token across the boundary"
+        vec![4, 5],
+        "Whitespace pre-tokenizer must block the cross-word merge and drop the separator itself"
     );
     assert!(
         !split_tokens.contains(&6),

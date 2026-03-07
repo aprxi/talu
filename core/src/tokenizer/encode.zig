@@ -6,6 +6,7 @@
 const std = @import("std");
 const ct = @import("c_types.zig");
 const bpe = @import("bpe.zig");
+const pipeline = @import("pipeline.zig");
 const pretokenize = @import("pretokenize.zig");
 const normalize = @import("normalize.zig");
 const postprocess = @import("postprocess.zig");
@@ -18,6 +19,7 @@ const parallel = @import("../system/parallel.zig");
 const Allocator = types.Allocator;
 const Token = types.Token;
 const Normalized = types.Normalized;
+const Range = types.Range;
 
 // Added token span
 const AddedSpan = struct {
@@ -25,6 +27,61 @@ const AddedSpan = struct {
     end: usize,
     at: *const ct.AddedToken,
 };
+
+fn isAddedTokenWordByte(byte_value: u8) bool {
+    return std.ascii.isAlphabetic(byte_value) or std.ascii.isDigit(byte_value) or byte_value == '_';
+}
+
+fn hasAddedTokenBoundary(input_bytes: []const u8, position: usize, content_len: usize) bool {
+    const left_boundary_ok = position == 0 or !isAddedTokenWordByte(input_bytes[position - 1]);
+    const right_pos = position + content_len;
+    const right_boundary_ok = right_pos == input_bytes.len or !isAddedTokenWordByte(input_bytes[right_pos]);
+    return left_boundary_ok and right_boundary_ok;
+}
+
+fn consumeAddedWhitespaceForward(input_bytes: []const u8, start: usize) usize {
+    var cursor = start;
+    while (cursor < input_bytes.len) {
+        if (std.ascii.isWhitespace(input_bytes[cursor])) {
+            cursor += 1;
+            continue;
+        }
+        if (cursor + 3 <= input_bytes.len and
+            input_bytes[cursor] == 0xE2 and
+            input_bytes[cursor + 1] == 0x96 and
+            input_bytes[cursor + 2] == 0x81)
+        {
+            cursor += 3;
+            continue;
+        }
+        break;
+    }
+    return cursor;
+}
+
+fn leadingAsciiWhitespaceLen(input_bytes: []const u8) usize {
+    var cursor: usize = 0;
+    while (cursor < input_bytes.len and std.ascii.isWhitespace(input_bytes[cursor])) : (cursor += 1) {}
+    return cursor;
+}
+
+fn trailingAsciiWhitespaceStart(input_bytes: []const u8) usize {
+    var cursor = input_bytes.len;
+    while (cursor > 0 and std.ascii.isWhitespace(input_bytes[cursor - 1])) : (cursor -= 1) {}
+    return cursor;
+}
+
+fn findNormalizedCursorForSourceEnd(normalized: *const Normalized, start_cursor: usize, source_end: usize) usize {
+    if (source_end == 0) return start_cursor;
+    var cursor = start_cursor;
+    while (cursor < normalized.text.len and cursor < normalized.map_end.len) : (cursor += 1) {
+        const mapped_end = normalized.map_end[cursor];
+        if (mapped_end >= @as(i32, @intCast(source_end))) {
+            return cursor + 1;
+        }
+    }
+    return normalized.text.len;
+}
 
 // ============================================================================
 // ADDED TOKENS COLLECTION
@@ -37,19 +94,12 @@ fn matches_added_token_boundaries(added_token: *const ct.AddedToken, input_bytes
     if (!std.mem.eql(u8, input_bytes[position..][0..content.len], content)) return false;
 
     if (added_token.single_word != 0) {
-        const left_boundary_ok = (position == 0) or std.ascii.isWhitespace(input_bytes[position - 1]);
-        const right_boundary_ok = (position + content.len == input_bytes.len) or std.ascii.isWhitespace(input_bytes[position + content.len]);
-        if (!left_boundary_ok or !right_boundary_ok) return false;
+        if (!hasAddedTokenBoundary(input_bytes, position, content.len)) return false;
     }
-    // lstrip: if true, skip leading whitespace before matching (handled elsewhere)
-    // rstrip: if true, consume trailing whitespace after token (handled elsewhere)
-    // These do NOT restrict where the token can appear
-    _ = added_token.lstrip;
-    _ = added_token.rstrip;
     return true;
 }
 
-fn collect_added_spans(tokenizer: *ct.Tokenizer, normalized: []const u8, normalized_map: []const i32, original_input: []const u8) ?std.ArrayListUnmanaged(AddedSpan) {
+fn collect_added_spans(tokenizer: *ct.Tokenizer, normalized: *const Normalized, original_input: []const u8) ?std.ArrayListUnmanaged(AddedSpan) {
     // Fast path: no added tokens → no spans possible.
     // Skips the O(normalized.len × n_added) byte-by-byte walk.
     if (tokenizer.added == null) {
@@ -59,14 +109,14 @@ fn collect_added_spans(tokenizer: *ct.Tokenizer, normalized: []const u8, normali
     var spans = std.ArrayListUnmanaged(AddedSpan){};
 
     log.trace("tokenizer", "collect_added_spans", .{
-        .normalized_len = normalized.len,
+        .normalized_len = normalized.text.len,
         .has_added_tokens = tokenizer.added != null,
     }, @src());
 
     var cursor: usize = 0;
-    while (cursor < normalized.len) {
-        var best_match: ?*const ct.AddedToken = null;
-        var best_match_len: usize = 0;
+    while (cursor < normalized.text.len) {
+        var best_match: ?AddedSpan = null;
+        var best_span_len: usize = 0;
 
         var added_iter = tokenizer.added;
         while (added_iter) |added_token| {
@@ -80,11 +130,11 @@ fn collect_added_spans(tokenizer: *ct.Tokenizer, normalized: []const u8, normali
                 continue;
             }
 
-            const text = if (added_token.normalized != 0) normalized else original_input;
+            const text = if (added_token.normalized != 0) normalized.text else original_input;
             const text_pos_opt: ?usize = if (added_token.normalized != 0) cursor else blk: {
                 // For non-normalized tokens, map back to original position
-                if (cursor < normalized_map.len and normalized_map[cursor] >= 0) {
-                    break :blk @as(usize, @intCast(normalized_map[cursor]));
+                if (cursor < normalized.map.len and normalized.map[cursor] >= 0) {
+                    break :blk @as(usize, @intCast(normalized.map[cursor]));
                 }
                 // Position doesn't map to original (e.g., prepended chars) - skip
                 break :blk null;
@@ -95,49 +145,49 @@ fn collect_added_spans(tokenizer: *ct.Tokenizer, normalized: []const u8, normali
             }
             const text_len = text.len;
             const text_pos = text_pos_opt.?;
+            const content_pos = if (added_token.lstrip != 0) consumeAddedWhitespaceForward(text, text_pos) else text_pos;
 
-            if (text_pos + content.len > text_len) {
+            if (content_pos + content.len > text_len) {
                 added_iter = added_token.next;
                 continue;
             }
-            if (!std.mem.eql(u8, text[text_pos..][0..content.len], content)) {
+            if (!std.mem.eql(u8, text[content_pos..][0..content.len], content)) {
                 added_iter = added_token.next;
                 continue;
             }
-            if (!matches_added_token_boundaries(added_token, text, text_pos)) {
+            if (!matches_added_token_boundaries(added_token, text, content_pos)) {
                 added_iter = added_token.next;
                 continue;
             }
-            if (content.len > best_match_len) {
-                best_match = added_token;
-                best_match_len = content.len;
+            var text_end = content_pos + content.len;
+            if (added_token.rstrip != 0) {
+                text_end = consumeAddedWhitespaceForward(text, text_end);
+            }
+
+            const span_end = if (added_token.normalized != 0)
+                cursor + (text_end - text_pos)
+            else
+                findNormalizedCursorForSourceEnd(normalized, cursor, text_end);
+
+            const span = AddedSpan{
+                .start = cursor,
+                .end = span_end,
+                .at = added_token,
+            };
+            const span_len = span.end - span.start;
+            if (span_len > best_span_len) {
+                best_match = span;
+                best_span_len = span_len;
             }
             added_iter = added_token.next;
         }
 
         if (best_match) |matched| {
-            var span_end = cursor + best_match_len;
-            // rstrip: consume trailing whitespace after the token.
-            // Check both ASCII whitespace and ▁ (U+2581 = E2 96 81), which
-            // is the SentencePiece space replacement after normalization.
-            if (matched.rstrip != 0) {
-                while (span_end < normalized.len) {
-                    if (std.ascii.isWhitespace(normalized[span_end])) {
-                        span_end += 1;
-                    } else if (span_end + 3 <= normalized.len and
-                        normalized[span_end] == 0xE2 and
-                        normalized[span_end + 1] == 0x96 and
-                        normalized[span_end + 2] == 0x81)
-                    {
-                        span_end += 3;
-                    } else break;
-                }
-            }
-            spans.append(Allocator, .{ .start = cursor, .end = span_end, .at = matched }) catch {
+            spans.append(Allocator, matched) catch {
                 spans.deinit(Allocator);
                 return null;
             };
-            cursor = span_end;
+            cursor = matched.end;
         } else {
             cursor += 1;
         }
@@ -413,6 +463,13 @@ const EncodeAccum = struct {
     }
 };
 
+fn encodeLiteralBpeBytes(tokenizer: *ct.Tokenizer, bytes: []const u8, accumulator: *EncodeAccum) !void {
+    if (bytes.len == 0 or tokenizer.type != .bpe) return;
+    const model_ptr = tokenizer.model orelse return error.OutOfMemory;
+    const model: *bpe.BpeModel = @ptrCast(@alignCast(model_ptr));
+    try model.encodeWordDirect(tokenizer, bytes, &accumulator.ids);
+}
+
 /// Check if input exactly matches an added token
 fn findExactAddedToken(tokenizer: *ct.Tokenizer, input: []const u8) ?*const ct.AddedToken {
     var added_iter = tokenizer.added;
@@ -515,7 +572,7 @@ fn encode_internal_impl(tokenizer: *ct.Tokenizer, input: []const u8, out: *ct.To
 
 fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *const Normalized, out: *ct.TokenizerEncoding) !void {
     // Step 2: Collect added token spans
-    var spans = collect_added_spans(tokenizer, normalized.text, normalized.map, input) orelse return error.OutOfMemory;
+    var spans = collect_added_spans(tokenizer, normalized, input) orelse return error.OutOfMemory;
     defer spans.deinit(Allocator);
 
     // Step 3: Encode segments
@@ -536,6 +593,9 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
     // Track whether the initial prepend ▁ was skipped and needs re-attaching.
     // This is a one-shot flag: once consumed by the first non-special segment, it stays false.
     var needs_prepend = false;
+    const preserve_literal_gap_whitespace = tokenizer.type == .bpe and
+        tokenizer.pretokenizer.metaspace == 0 and
+        tokenizer.normalizer.prepend == null;
 
     // Skip the prepend if input starts with an added token
     // (the prepend was added by normalization but shouldn't apply to added tokens)
@@ -546,6 +606,7 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
     }
 
     while (cursor < normalized.text.len) {
+        const previous_was_added = span_index > 0 and cursor == spans.items[span_index - 1].end;
         // Handle added token spans
         if (span_index < spans.items.len and cursor == spans.items[span_index].start) {
             const added_span = spans.items[span_index];
@@ -566,9 +627,36 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
         }
 
         const segment = normalized.text[cursor..next_span_start];
+        var segment_start: usize = 0;
+        var segment_end: usize = segment.len;
+
+        if (preserve_literal_gap_whitespace and previous_was_added) {
+            const leading_ws_len = leadingAsciiWhitespaceLen(segment);
+            if (leading_ws_len > 0) {
+                try encodeLiteralBpeBytes(tokenizer, segment[0..leading_ws_len], &accum);
+                segment_start = leading_ws_len;
+            }
+        }
+
+        if (preserve_literal_gap_whitespace and span_index < spans.items.len) {
+            const trailing_ws_start = trailingAsciiWhitespaceStart(segment[segment_start..]) + segment_start;
+            if (trailing_ws_start < segment_end) {
+                segment_end = trailing_ws_start;
+            }
+        }
+
+        const interior = segment[segment_start..segment_end];
         const should_prepend = needs_prepend and prepend_bytes.len > 0;
-        needs_prepend = false;
-        try encodeSegmentMaybePrepended(tokenizer, segment, cursor, should_prepend, prepend_bytes, &accum);
+        if (interior.len > 0) {
+            needs_prepend = false;
+            try encodeSegmentMaybePrepended(tokenizer, interior, cursor + segment_start, should_prepend, prepend_bytes, &accum);
+        }
+        if (segment_end < segment.len and preserve_literal_gap_whitespace) {
+            try encodeLiteralBpeBytes(tokenizer, segment[segment_end..], &accum);
+            needs_prepend = false;
+        } else if (interior.len == 0 and should_prepend) {
+            needs_prepend = false;
+        }
         cursor = next_span_start;
     }
 
@@ -605,7 +693,11 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
         tokenizer.normalizer.prepend != null;
     const is_byte_level_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.byte_level != 0;
     const is_metaspace = tokenizer.pretokenizer.metaspace != 0;
-    const per_word_encode = is_sentencepiece_bpe or is_byte_level_bpe or is_metaspace;
+    const split_bpe_encode = tokenizer.type == ct.ModelType.bpe and
+        tokenizer.pretokenizer.byte_level == 0 and
+        tokenizer.pretokenizer.metaspace == 0 and
+        (tokenizer.pretokenizer.whitespace != 0 or tokenizer.pretokenizer.punctuation != 0);
+    const per_word_encode = is_sentencepiece_bpe or is_byte_level_bpe or is_metaspace or split_bpe_encode;
 
     // Skip byte-level encoding in pretokenize when the BPE model can handle
     // raw bytes directly via orig_byte_vocab_ids. This eliminates the
@@ -659,7 +751,38 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
             try encodeWord(tokenizer, token_item.sliceConst(), add_sp_prefix, accumulator, &word_cache);
         }
     } else {
-        try encodeCombined(tokenizer, pretokenized.tokens.items, accumulator);
+        try encodeCombined(tokenizer, segment, base_offset, pretokenized.tokens.items, pretokenized.ranges.items, accumulator);
+    }
+}
+
+fn encodeBpePretokenizedWithGaps(
+    tokenizer: *ct.Tokenizer,
+    segment: []const u8,
+    base_offset: usize,
+    token_items: []Token,
+    token_ranges: []const Range,
+    accumulator: *EncodeAccum,
+) !void {
+    if (token_items.len == 0) return;
+
+    var cursor: usize = 0;
+    var word_cache = WordCache.init();
+    defer word_cache.deinit();
+
+    for (token_items, token_ranges) |token_item, token_range| {
+        const rel_start = token_range.start - base_offset;
+        const rel_end = token_range.end - base_offset;
+
+        if (rel_start > cursor) {
+            try encodeLiteralBpeBytes(tokenizer, segment[cursor..rel_start], accumulator);
+        }
+
+        try encodeWord(tokenizer, token_item.sliceConst(), false, accumulator, &word_cache);
+        cursor = rel_end;
+    }
+
+    if (cursor < segment.len) {
+        try encodeLiteralBpeBytes(tokenizer, segment[cursor..], accumulator);
     }
 }
 
@@ -1040,8 +1163,22 @@ fn encodeWord(tokenizer: *ct.Tokenizer, word_bytes: []const u8, add_sentencepiec
     }
 }
 
-fn encodeCombined(tokenizer: *ct.Tokenizer, token_items: []Token, accumulator: *EncodeAccum) !void {
+fn encodeCombined(
+    tokenizer: *ct.Tokenizer,
+    segment: []const u8,
+    base_offset: usize,
+    token_items: []Token,
+    token_ranges: []const Range,
+    accumulator: *EncodeAccum,
+) !void {
     if (token_items.len == 0) return;
+
+    if (tokenizer.type == .bpe and tokenizer.pretokenizer.byte_level == 0 and tokenizer.pretokenizer.metaspace == 0 and
+        (tokenizer.pretokenizer.whitespace != 0 or tokenizer.pretokenizer.punctuation != 0))
+    {
+        try encodeCombinedBpePreservingGaps(tokenizer, segment, base_offset, token_items, token_ranges, accumulator);
+        return;
+    }
 
     // Compute total size needed
     var total_len: usize = 0;
@@ -1073,6 +1210,11 @@ fn encodeCombined(tokenizer: *ct.Tokenizer, token_items: []Token, accumulator: *
         pos += slice.len;
     }
 
+    if (tokenizer.type == .bpe and tokenizer.added != null) {
+        try encodeLiteralBpeBytes(tokenizer, buf[0..pos], accumulator);
+        return;
+    }
+
     var encoding = std.mem.zeroes(ct.TokenizerEncoding);
     defer tokenizer_encoding_free_struct(&encoding);
 
@@ -1080,6 +1222,64 @@ fn encodeCombined(tokenizer: *ct.Tokenizer, token_items: []Token, accumulator: *
     if (rc != 0) return error.OutOfMemory;
 
     try accumulator.appendEncoding(&encoding, tokenizer.added);
+}
+
+fn encodeCombinedBpePreservingGaps(
+    tokenizer: *ct.Tokenizer,
+    segment: []const u8,
+    base_offset: usize,
+    token_items: []Token,
+    token_ranges: []const Range,
+    accumulator: *EncodeAccum,
+) !void {
+    if (token_items.len == 0) return;
+
+    var total_len: usize = 0;
+    var cursor: usize = 0;
+    for (token_ranges, 0..) |token_range, token_index| {
+        const rel_start = token_range.start - base_offset;
+        const rel_end = token_range.end - base_offset;
+        if (rel_start > cursor) total_len += rel_start - cursor;
+        total_len += token_items[token_index].len;
+        cursor = rel_end;
+    }
+    if (cursor < segment.len) total_len += segment.len - cursor;
+
+    var stack_buf: [4096]u8 = undefined;
+    var heap_buf: ?[]u8 = null;
+    defer if (heap_buf) |hb| Allocator.free(hb);
+
+    const buf = if (total_len <= stack_buf.len)
+        stack_buf[0..total_len]
+    else blk: {
+        heap_buf = Allocator.alloc(u8, total_len) catch return error.OutOfMemory;
+        break :blk heap_buf.?;
+    };
+
+    var write_pos: usize = 0;
+    cursor = 0;
+    for (token_ranges, 0..) |token_range, token_index| {
+        const rel_start = token_range.start - base_offset;
+        const rel_end = token_range.end - base_offset;
+
+        if (rel_start > cursor) {
+            const gap = segment[cursor..rel_start];
+            @memcpy(buf[write_pos..][0..gap.len], gap);
+            write_pos += gap.len;
+        }
+
+        const slice = token_items[token_index].sliceConst();
+        @memcpy(buf[write_pos..][0..slice.len], slice);
+        write_pos += slice.len;
+        cursor = rel_end;
+    }
+    if (cursor < segment.len) {
+        const gap = segment[cursor..];
+        @memcpy(buf[write_pos..][0..gap.len], gap);
+        write_pos += gap.len;
+    }
+
+    try encodeLiteralBpeBytes(tokenizer, buf[0..write_pos], accumulator);
 }
 
 /// Encode options that can be passed as runtime arguments (thread-safe).
@@ -1192,6 +1392,140 @@ test "EncodeAccum appendAdded adds token" {
     try std.testing.expectEqual(@as(i32, 123), accum.ids.items[0]);
     try std.testing.expectEqual(@as(usize, 1), accum.special_positions.items.len);
     try std.testing.expectEqual(@as(u32, 0), accum.special_positions.items[0]);
+}
+
+test "tokenizer collect_added_spans matches single_word token at punctuation boundary" {
+    var normalized = Normalized{
+        .text = try Allocator.dupe(u8, "cat."),
+        .map = try Allocator.dupe(i32, &[_]i32{ 0, 1, 2, 3 }),
+        .map_end = try Allocator.dupe(i32, &[_]i32{ 1, 2, 3, 4 }),
+    };
+    defer normalized.deinit();
+
+    const content: [:0]const u8 = "cat";
+    var added = ct.AddedToken{
+        .content = @constCast(@ptrCast(content.ptr)),
+        .id = 100,
+        .special = 0,
+        .single_word = 1,
+        .lstrip = 0,
+        .rstrip = 0,
+        .normalized = 1,
+        .next = null,
+    };
+    var tokenizer = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.added = &added;
+
+    var spans = collect_added_spans(&tokenizer, &normalized, "cat.") orelse return error.OutOfMemory;
+    defer spans.deinit(Allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.items.len);
+    try std.testing.expectEqual(@as(usize, 0), spans.items[0].start);
+    try std.testing.expectEqual(@as(usize, 3), spans.items[0].end);
+}
+
+test "tokenizer collect_added_spans expands lstrip to include leading whitespace" {
+    var normalized = Normalized{
+        .text = try Allocator.dupe(u8, " \t\n[MID]x"),
+        .map = try Allocator.dupe(i32, &[_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8 }),
+        .map_end = try Allocator.dupe(i32, &[_]i32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 }),
+    };
+    defer normalized.deinit();
+
+    const content: [:0]const u8 = "[MID]";
+    var added = ct.AddedToken{
+        .content = @constCast(@ptrCast(content.ptr)),
+        .id = 100,
+        .special = 0,
+        .single_word = 0,
+        .lstrip = 1,
+        .rstrip = 0,
+        .normalized = 1,
+        .next = null,
+    };
+    var tokenizer = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.added = &added;
+
+    var spans = collect_added_spans(&tokenizer, &normalized, " \t\n[MID]x") orelse return error.OutOfMemory;
+    defer spans.deinit(Allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), spans.items.len);
+    try std.testing.expectEqual(@as(usize, 0), spans.items[0].start);
+    try std.testing.expectEqual(@as(usize, 8), spans.items[0].end);
+}
+
+test "tokenizer collect_added_spans does not match normalized false token on normalized-only text" {
+    var normalized = Normalized{
+        .text = try Allocator.dupe(u8, "hello"),
+        .map = try Allocator.dupe(i32, &[_]i32{ 0, 1, 2, 3, 4 }),
+        .map_end = try Allocator.dupe(i32, &[_]i32{ 1, 2, 3, 4, 5 }),
+    };
+    defer normalized.deinit();
+
+    const content: [:0]const u8 = "hello";
+    var added = ct.AddedToken{
+        .content = @constCast(@ptrCast(content.ptr)),
+        .id = 100,
+        .special = 0,
+        .single_word = 0,
+        .lstrip = 0,
+        .rstrip = 0,
+        .normalized = 0,
+        .next = null,
+    };
+    var tokenizer = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.added = &added;
+
+    var spans = collect_added_spans(&tokenizer, &normalized, "HELLO") orelse return error.OutOfMemory;
+    defer spans.deinit(Allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), spans.items.len);
+}
+
+test "encodeCombined preserves whitespace gap boundaries for non-byte-level bpe" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "version": "1.0",
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+        \\      "a": 4, "b": 5, "ab": 6
+        \\    },
+        \\    "merges": ["a b"]
+        \\  },
+        \\  "added_tokens": [
+        \\    {"id": 0, "content": "<pad>", "special": true},
+        \\    {"id": 1, "content": "<s>", "special": true},
+        \\    {"id": 2, "content": "</s>", "special": true},
+        \\    {"id": 3, "content": "<unk>", "special": true}
+        \\  ],
+        \\  "normalizer": null,
+        \\  "pre_tokenizer": {"type": "Whitespace"},
+        \\  "post_processor": null,
+        \\  "decoder": null
+        \\}
+    ;
+    const json_z = try allocator.dupeZ(u8, json);
+    defer allocator.free(json_z);
+
+    const tokenizer = pipeline.tokenizer_from_json_string(json_z.ptr) orelse return error.OutOfMemory;
+    defer {
+        tokenizer.destroy();
+        allocator.destroy(tokenizer);
+    }
+
+    var encoding = std.mem.zeroes(ct.TokenizerEncoding);
+    defer tokenizer_encoding_free_struct(&encoding);
+
+    try std.testing.expectEqual(@as(c_int, 0), tokenizer_encode_struct_with_options(tokenizer, "a b", &encoding, .{}));
+    try std.testing.expectEqual(@as(usize, 3), encoding.ids_len);
+
+    const ids: [*]i32 = @ptrCast(encoding.ids.?);
+    try std.testing.expectEqual(@as(i32, 4), ids[0]);
+    try std.testing.expectEqual(@as(i32, 3), ids[1]);
+    try std.testing.expectEqual(@as(i32, 5), ids[2]);
 }
 
 test "tokenizer_encoding_free_struct handles empty encoding" {

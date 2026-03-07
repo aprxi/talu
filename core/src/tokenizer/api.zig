@@ -6,8 +6,10 @@
 const std = @import("std");
 
 const ct = @import("c_types.zig");
+const tok_encode = @import("encode.zig");
 const offsets_mod = @import("offsets.zig");
 const pipeline_impl = @import("pipeline.zig");
+const unigram_model = @import("unigram.zig");
 
 // Unicode replacement character (U+FFFD)
 const REPLACEMENT_CHAR = "\xEF\xBF\xBD";
@@ -120,6 +122,7 @@ pub const Tokenizer = struct {
             if (token_text.len == 0) continue;
             const decoded = try offsets_mod.decodeTokenToBytes(self.allocator, token_text, self.tokenizer_handle);
             defer if (decoded.ptr != token_text.ptr) self.allocator.free(decoded);
+            if (decoded.len == 0) continue;
 
             try token_bytes.appendSlice(self.allocator, decoded);
             const idx: usize = decoded[0];
@@ -207,7 +210,7 @@ pub const Tokenizer = struct {
         const ids_i32_buffer = try self.allocator.alloc(i32, ids.len);
         errdefer self.allocator.free(ids_i32_buffer);
         for (ids, 0..) |id, idx| {
-            if (self.vocab_size > 0 and id >= self.vocab_size) {
+            if (self.vocab_size > 0 and id >= self.vocab_size and tok_encode.findAddedTokenContentById(self.tokenizer_handle, @intCast(id)) == null) {
                 return TokenizerError.InvalidTokenId;
             }
             ids_i32_buffer[idx] = std.math.cast(i32, id) orelse return TokenizerError.InvalidTokenId;
@@ -459,6 +462,81 @@ test "idsToI32Checked - rejects value just over i32 max" {
     };
     const ids = [_]u32{0x80000000}; // i32::MAX + 1
     try std.testing.expectError(TokenizerError.InvalidTokenId, dummy.idsToI32Checked(&ids));
+}
+
+test "idsToI32Checked accepts added token id beyond base vocab" {
+    var raw = std.mem.zeroes(ct.Tokenizer);
+    var added = std.mem.zeroes(ct.AddedToken);
+    const content = try std.testing.allocator.dupeZ(u8, "special");
+    defer std.testing.allocator.free(content);
+    added.id = 7;
+    added.content = @ptrCast(content.ptr);
+    raw.added = &added;
+
+    var dummy = Tokenizer{
+        .allocator = std.testing.allocator,
+        .tokenizer_handle = &raw,
+        .vocab_size = 3,
+    };
+
+    const ids = [_]u32{7};
+    const ids_i32 = try dummy.idsToI32Checked(&ids);
+    defer std.testing.allocator.free(ids_i32);
+
+    try std.testing.expectEqual(@as(i32, 7), ids_i32[0]);
+}
+
+test "buildPrefixIndex skips zero-length decoded unigram metaspace token" {
+    const allocator = std.testing.allocator;
+
+    const raw = try allocator.create(ct.Tokenizer);
+    defer allocator.destroy(raw);
+    raw.* = std.mem.zeroes(ct.Tokenizer);
+    raw.type = .unigram;
+    raw.pretokenizer.metaspace = 1;
+    raw.pretokenizer.add_prefix_space = 1;
+    raw.decoder.metaspace = 1;
+    raw.decoder.add_prefix_space = 1;
+
+    const model = try allocator.create(unigram_model.UnigramModel);
+    defer allocator.destroy(model);
+    model.* = .{
+        .allocator = allocator,
+        .vocab = .{},
+        .id_to_token = try allocator.alloc(?[*:0]u8, 2),
+        .vocab_size = 2,
+        .unk_id = 0,
+        .bos_id = -1,
+        .eos_id = -1,
+        .unk_token = std.mem.zeroes([16]u8),
+        .unk_entry = null,
+        .owner = raw,
+    };
+    defer allocator.free(model.id_to_token);
+    @memset(model.id_to_token, null);
+    raw.model = model;
+
+    const unk = try allocator.dupeZ(u8, "<unk>");
+    defer allocator.free(unk);
+    const metaspace = try allocator.dupeZ(u8, "\xE2\x96\x81");
+    defer allocator.free(metaspace);
+    model.id_to_token[0] = unk.ptr;
+    model.id_to_token[1] = metaspace.ptr;
+
+    var tokenizer = Tokenizer{
+        .allocator = allocator,
+        .tokenizer_handle = raw,
+    };
+    try tokenizer.buildPrefixIndex();
+    defer {
+        for (tokenizer.prefix_index) |bucket| {
+            if (bucket.len > 0) allocator.free(bucket);
+        }
+        if (tokenizer.token_bytes_data.len > 0) allocator.free(tokenizer.token_bytes_data);
+        if (tokenizer.token_bytes_offsets.len > 0) allocator.free(tokenizer.token_bytes_offsets);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), tokenizer.tokenBytes(1).?.len);
 }
 
 test "Tokenizer.streamingDecoder - creates decoder with initial state" {

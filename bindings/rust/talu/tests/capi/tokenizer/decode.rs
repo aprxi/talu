@@ -365,7 +365,11 @@ fn sequence_decode_words_strip_one_leading() {
     );
 }
 
-/// Minimal SentencePiece-style BPE with ▁ word boundaries and non-ASCII tokens.
+/// Minimal SentencePiece-style BPE with unique vocab keys.
+///
+/// JSON object keys must be unique. This fixture intentionally keeps only one
+/// standalone `▁` entry so loader tests are checking tokenizer behavior rather
+/// than ambiguous duplicate-key parsing.
 const SENTENCEPIECE_BPE_JSON: &str = r####"{
   "version": "1.0",
   "model": {
@@ -376,8 +380,7 @@ const SENTENCEPIECE_BPE_JSON: &str = r####"{
       "\u2581caf": 4, "é": 5,
       "\u2581r": 6, "\u2581és": 7, "um": 8,
       "\u2581na": 9, "ï": 10, "ve": 11,
-      "\u2581Hello": 12, ",": 13, "\u2581world": 14, "!": 15,
-      "\u2581": 16
+      "\u2581Hello": 12, ",": 13, "\u2581world": 14, "!": 15
     },
     "merges": []
   },

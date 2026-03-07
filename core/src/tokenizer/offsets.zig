@@ -5,9 +5,12 @@
 //! in a single pass through the encoding pipeline.
 
 const std = @import("std");
+const pipeline = @import("pipeline.zig");
 const ct = @import("c_types.zig");
 const tok_encode = @import("encode.zig");
 const normalize = @import("normalize.zig");
+const unigram = @import("unigram.zig");
+const wordpiece = @import("wordpiece.zig");
 
 /// Token offset in source text (UTF-8 byte indices).
 pub const TokenOffset = extern struct {
@@ -54,7 +57,7 @@ pub fn computeOffsetsFromEncoding(
         const token_id = enc_ids[token_idx];
 
         // Resolve token text: from encoding.tokens if available, otherwise from vocab by ID.
-        const token_text: []const u8 = blk: {
+        var token_text: []const u8 = blk: {
             if (token_cstrs) |ts| {
                 const token_ptr: [*c]u8 = ts[token_idx];
                 if (token_ptr != null) break :blk std.mem.sliceTo(token_ptr, 0);
@@ -66,6 +69,10 @@ pub fn computeOffsetsFromEncoding(
             break :blk tokenizer_handle.idToToken(token_id) orelse
                 tok_encode.findAddedTokenContentById(tokenizer_handle, token_id) orelse "";
         };
+
+        if (is_byte_level and token_id == unk_id) {
+            token_text = "";
+        }
 
         if (is_byte_level and token_text.len > 0) {
             const token_byte_sequence = decodeTokenToBytes(alloc, token_text, tokenizer_handle) catch {
@@ -100,6 +107,7 @@ pub fn computeOffsetsFromEncoding(
             if (text_offset < text.len) {
                 offsets[token_idx] = .{ .start = text_offset, .end = text_offset + 1 };
                 text_offset += 1;
+                normalized_offset += 1;
             } else {
                 offsets[token_idx] = .{ .start = 0, .end = 0 };
             }
@@ -107,8 +115,14 @@ pub fn computeOffsetsFromEncoding(
         }
 
         if (!is_byte_level and token_id == unk_id and normalized_offset < normalized.text.len) {
-            offsets[token_idx] = normalizedSpanToSourceOffset(&normalized, normalized_offset, normalized_offset + 1);
-            normalized_offset += 1;
+            if (tokenizer_handle.type == .wordpiece) {
+                const span = nextWordPieceUnknownSpan(normalized.text, normalized_offset);
+                offsets[token_idx] = normalizedSpanToSourceOffset(&normalized, span.start, span.end);
+                normalized_offset = span.end;
+            } else {
+                offsets[token_idx] = normalizedSpanToSourceOffset(&normalized, normalized_offset, normalized_offset + 1);
+                normalized_offset += 1;
+            }
             continue;
         }
 
@@ -350,6 +364,14 @@ pub fn decodeTokenToBytes(allocator: std.mem.Allocator, token_text: []const u8, 
     const is_byte_level = tokenizer_handle.pretokenizer.byte_level != 0;
 
     if (!is_byte_level) {
+        if (tokenizer_handle.type == .unigram and std.mem.startsWith(u8, token_text, "\xE2\x96\x81")) {
+            const suffix = token_text[3..];
+            if (suffix.len == 0) return token_text[0..0];
+            return allocator.dupe(u8, suffix);
+        }
+        if (tokenizer_handle.type == .wordpiece and std.mem.startsWith(u8, token_text, "##")) {
+            return allocator.dupe(u8, token_text[2..]);
+        }
         if (token_text.len == 6 and std.mem.startsWith(u8, token_text, "<0x") and token_text[5] == '>') {
             const value = std.fmt.parseUnsigned(u8, token_text[3..5], 16) catch return token_text;
             const decoded = try allocator.alloc(u8, 1);
@@ -443,6 +465,37 @@ pub fn findSubsequence(source: []const u8, pattern: []const u8) ?usize {
         }
     }
     return null;
+}
+
+const NormalizedSpan = struct {
+    start: usize,
+    end: usize,
+};
+
+fn nextWordPieceUnknownSpan(text: []const u8, offset: usize) NormalizedSpan {
+    var start = offset;
+    while (start < text.len and std.ascii.isWhitespace(text[start])) : (start += 1) {}
+    if (start >= text.len) return .{ .start = offset, .end = offset };
+
+    if (isAsciiPunctuation(text[start])) {
+        const punct_len = utf8CharLen(text[start]);
+        return .{ .start = start, .end = @min(text.len, start + punct_len) };
+    }
+
+    var end = start;
+    while (end < text.len) {
+        const byte = text[end];
+        if (std.ascii.isWhitespace(byte) or isAsciiPunctuation(byte)) break;
+        end += utf8CharLen(byte);
+    }
+    return .{ .start = start, .end = end };
+}
+
+fn isAsciiPunctuation(ch: u8) bool {
+    return switch (ch) {
+        '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~' => true,
+        else => false,
+    };
 }
 
 // =============================================================================
@@ -544,9 +597,314 @@ test "findSubsequence finds single character" {
     try std.testing.expectEqual(@as(usize, 2), result.?);
 }
 
+test "decodeTokenToBytes returns borrowed empty slice for standalone unigram metaspace token" {
+    var tokenizer = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.type = .unigram;
+
+    const token = "\xE2\x96\x81";
+    const decoded = try decodeTokenToBytes(std.testing.allocator, token, &tokenizer);
+
+    try std.testing.expectEqual(@as(usize, 0), decoded.len);
+    try std.testing.expectEqual(token.ptr, decoded.ptr);
+}
+
 test "computeOffsetsFromEncoding requires integration testing" {
     // Requires fully initialized tokenizer with vocab, model, normalizer.
     // Integration tests: tests/tokenizer/test_*.py
+}
+
+fn addWordPieceTestToken(model: *wordpiece.WordPieceModel, token: []const u8, id: usize) !void {
+    const allocator = model.allocator;
+    const dup = try allocator.dupeZ(u8, token);
+    errdefer allocator.free(dup);
+    try model.vocab_strings.append(allocator, dup);
+    try model.vocab.put(allocator, dup[0..dup.len], @intCast(id));
+    model.id_to_token[id] = dup.ptr;
+}
+
+fn initWordPieceTokenizerForOffsets(allocator: std.mem.Allocator, vocab_size: usize) !struct {
+    tokenizer: *ct.Tokenizer,
+    model: *wordpiece.WordPieceModel,
+} {
+    const tokenizer = try allocator.create(ct.Tokenizer);
+    errdefer allocator.destroy(tokenizer);
+    tokenizer.* = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.type = .wordpiece;
+
+    const model = try allocator.create(wordpiece.WordPieceModel);
+    errdefer allocator.destroy(model);
+    model.* = .{
+        .allocator = allocator,
+        .vocab = .{},
+        .id_to_token = try allocator.alloc(?[*:0]u8, vocab_size),
+        .vocab_strings = .{},
+        .vocab_size = vocab_size,
+        .unk_id = 0,
+        .unk_token = std.mem.zeroes([16]u8),
+        .max_input_chars_per_word = 200,
+        .owner = tokenizer,
+    };
+    @memset(model.id_to_token, null);
+    @memcpy(model.unk_token[0.."[UNK]".len], "[UNK]");
+
+    tokenizer.model = model;
+    return .{ .tokenizer = tokenizer, .model = model };
+}
+
+fn deinitWordPieceTokenizerForOffsets(allocator: std.mem.Allocator, tokenizer: *ct.Tokenizer, model: *wordpiece.WordPieceModel) void {
+    tokenizer.model = null;
+    for (model.vocab_strings.items) |s| allocator.free(s);
+    model.vocab_strings.deinit(allocator);
+    model.vocab.deinit(allocator);
+    allocator.free(model.id_to_token);
+    allocator.destroy(model);
+    allocator.destroy(tokenizer);
+}
+
+fn addUnigramTestToken(model: *unigram.UnigramModel, token: []const u8, score: f32, id: usize) !void {
+    const allocator = model.allocator;
+    const dup = try allocator.dupeZ(u8, token);
+    errdefer allocator.free(dup);
+    try model.vocab.append(allocator, .{
+        .token = dup,
+        .score = score,
+        .id = @intCast(id),
+    });
+    model.id_to_token[id] = dup.ptr;
+}
+
+fn initUnigramTokenizerForOffsets(allocator: std.mem.Allocator, vocab_size: usize) !struct {
+    tokenizer: *ct.Tokenizer,
+    model: *unigram.UnigramModel,
+} {
+    const tokenizer = try allocator.create(ct.Tokenizer);
+    errdefer allocator.destroy(tokenizer);
+    tokenizer.* = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.type = .unigram;
+    tokenizer.pretokenizer.metaspace = 1;
+    tokenizer.pretokenizer.add_prefix_space = 1;
+    tokenizer.decoder.metaspace = 1;
+    tokenizer.decoder.add_prefix_space = 1;
+
+    const model = try allocator.create(unigram.UnigramModel);
+    errdefer allocator.destroy(model);
+    model.* = .{
+        .allocator = allocator,
+        .vocab = .{},
+        .id_to_token = try allocator.alloc(?[*:0]u8, vocab_size),
+        .vocab_size = vocab_size,
+        .unk_id = 0,
+        .bos_id = -1,
+        .eos_id = -1,
+        .unk_token = std.mem.zeroes([16]u8),
+        .unk_entry = null,
+        .owner = tokenizer,
+    };
+    @memset(model.id_to_token, null);
+    @memcpy(model.unk_token[0.."<unk>".len], "<unk>");
+
+    tokenizer.model = model;
+    return .{ .tokenizer = tokenizer, .model = model };
+}
+
+fn deinitUnigramTokenizerForOffsets(allocator: std.mem.Allocator, tokenizer: *ct.Tokenizer, model: *unigram.UnigramModel) void {
+    tokenizer.model = null;
+    for (model.vocab.items) |entry| allocator.free(entry.token);
+    model.vocab.deinit(allocator);
+    allocator.free(model.id_to_token);
+    allocator.destroy(model);
+    allocator.destroy(tokenizer);
+}
+
+test "computeOffsetsFromEncoding strips wordpiece continuation prefix" {
+    const allocator = std.testing.allocator;
+    const setup = try initWordPieceTokenizerForOffsets(allocator, 3);
+    defer deinitWordPieceTokenizerForOffsets(allocator, setup.tokenizer, setup.model);
+
+    try addWordPieceTestToken(setup.model, "[UNK]", 0);
+    try addWordPieceTestToken(setup.model, "go", 1);
+    try addWordPieceTestToken(setup.model, "##ing", 2);
+
+    const ids = try allocator.alloc(i32, 2);
+    defer allocator.free(ids);
+    ids[0] = 1;
+    ids[1] = 2;
+
+    const encoding = ct.TokenizerEncoding{
+        .ids = @ptrCast(ids.ptr),
+        .ids_len = 2,
+        .tokens = null,
+        .tokens_len = 0,
+        .attention_mask = null,
+        .type_ids = null,
+        .special_tokens_mask = null,
+        .offsets = null,
+        .overflows = null,
+        .overflow_count = 0,
+    };
+
+    const offsets = try computeOffsetsFromEncoding(allocator, &encoding, setup.tokenizer, "going");
+    defer allocator.free(offsets);
+
+    try std.testing.expectEqual(@as(u32, 0), offsets[0].start);
+    try std.testing.expectEqual(@as(u32, 2), offsets[0].end);
+    try std.testing.expectEqual(@as(u32, 2), offsets[1].start);
+    try std.testing.expectEqual(@as(u32, 5), offsets[1].end);
+}
+
+test "computeOffsetsFromEncoding maps wordpiece unk to full word span" {
+    const allocator = std.testing.allocator;
+    const setup = try initWordPieceTokenizerForOffsets(allocator, 3);
+    defer deinitWordPieceTokenizerForOffsets(allocator, setup.tokenizer, setup.model);
+
+    try addWordPieceTestToken(setup.model, "[UNK]", 0);
+    try addWordPieceTestToken(setup.model, "hello", 1);
+    try addWordPieceTestToken(setup.model, "world", 2);
+
+    const ids = try allocator.alloc(i32, 3);
+    defer allocator.free(ids);
+    ids[0] = 1;
+    ids[1] = 0;
+    ids[2] = 2;
+
+    const encoding = ct.TokenizerEncoding{
+        .ids = @ptrCast(ids.ptr),
+        .ids_len = 3,
+        .tokens = null,
+        .tokens_len = 0,
+        .attention_mask = null,
+        .type_ids = null,
+        .special_tokens_mask = null,
+        .offsets = null,
+        .overflows = null,
+        .overflow_count = 0,
+    };
+
+    const offsets = try computeOffsetsFromEncoding(allocator, &encoding, setup.tokenizer, "hello xyz world");
+    defer allocator.free(offsets);
+
+    try std.testing.expectEqual(@as(u32, 0), offsets[0].start);
+    try std.testing.expectEqual(@as(u32, 5), offsets[0].end);
+    try std.testing.expectEqual(@as(u32, 6), offsets[1].start);
+    try std.testing.expectEqual(@as(u32, 9), offsets[1].end);
+    try std.testing.expectEqual(@as(u32, 10), offsets[2].start);
+    try std.testing.expectEqual(@as(u32, 15), offsets[2].end);
+}
+
+test "computeOffsetsFromEncoding maps unigram whole-word metaspace token to source span" {
+    const allocator = std.testing.allocator;
+    const setup = try initUnigramTokenizerForOffsets(allocator, 2);
+    defer deinitUnigramTokenizerForOffsets(allocator, setup.tokenizer, setup.model);
+
+    try addUnigramTestToken(setup.model, "<unk>", 0.0, 0);
+    try addUnigramTestToken(setup.model, "\xE2\x96\x81hello", -1.0, 1);
+
+    const ids = try allocator.alloc(i32, 1);
+    defer allocator.free(ids);
+    ids[0] = 1;
+
+    const encoding = ct.TokenizerEncoding{
+        .ids = @ptrCast(ids.ptr),
+        .ids_len = 1,
+        .tokens = null,
+        .tokens_len = 0,
+        .attention_mask = null,
+        .type_ids = null,
+        .special_tokens_mask = null,
+        .offsets = null,
+        .overflows = null,
+        .overflow_count = 0,
+    };
+
+    const offsets = try computeOffsetsFromEncoding(allocator, &encoding, setup.tokenizer, "hello");
+    defer allocator.free(offsets);
+
+    try std.testing.expectEqual(@as(u32, 0), offsets[0].start);
+    try std.testing.expectEqual(@as(u32, 5), offsets[0].end);
+}
+
+test "computeOffsetsFromEncoding maps unigram multiword metaspace tokens to each word span" {
+    const allocator = std.testing.allocator;
+    const setup = try initUnigramTokenizerForOffsets(allocator, 3);
+    defer deinitUnigramTokenizerForOffsets(allocator, setup.tokenizer, setup.model);
+
+    try addUnigramTestToken(setup.model, "<unk>", 0.0, 0);
+    try addUnigramTestToken(setup.model, "\xE2\x96\x81hello", -1.0, 1);
+    try addUnigramTestToken(setup.model, "\xE2\x96\x81world", -1.5, 2);
+
+    const ids = try allocator.alloc(i32, 2);
+    defer allocator.free(ids);
+    ids[0] = 1;
+    ids[1] = 2;
+
+    const encoding = ct.TokenizerEncoding{
+        .ids = @ptrCast(ids.ptr),
+        .ids_len = 2,
+        .tokens = null,
+        .tokens_len = 0,
+        .attention_mask = null,
+        .type_ids = null,
+        .special_tokens_mask = null,
+        .offsets = null,
+        .overflows = null,
+        .overflow_count = 0,
+    };
+
+    const offsets = try computeOffsetsFromEncoding(allocator, &encoding, setup.tokenizer, "hello world");
+    defer allocator.free(offsets);
+
+    try std.testing.expectEqual(@as(u32, 0), offsets[0].start);
+    try std.testing.expectEqual(@as(u32, 5), offsets[0].end);
+    try std.testing.expectEqual(@as(u32, 6), offsets[1].start);
+    try std.testing.expectEqual(@as(u32, 11), offsets[1].end);
+}
+
+test "computeOffsetsFromEncoding maps byte-level unk tokens with token surfaces to single-byte spans" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "version": "1.0",
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+        \\      "H": 44, "i": 77, "b": 70, "y": 93, "e": 73
+        \\    },
+        \\    "merges": []
+        \\  },
+        \\  "added_tokens": [
+        \\    {"id": 0, "content": "<pad>", "special": true},
+        \\    {"id": 1, "content": "<s>", "special": true},
+        \\    {"id": 2, "content": "</s>", "special": true},
+        \\    {"id": 3, "content": "<unk>", "special": true}
+        \\  ],
+        \\  "normalizer": null,
+        \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+        \\  "post_processor": null,
+        \\  "decoder": {"type": "ByteLevel"}
+        \\}
+    ;
+    const json_z = try allocator.dupeZ(u8, json);
+    defer allocator.free(json_z);
+
+    const tokenizer = pipeline.tokenizer_from_json_string(json_z.ptr) orelse return error.OutOfMemory;
+    defer {
+        tokenizer.destroy();
+        allocator.destroy(tokenizer);
+    }
+
+    var encoding = std.mem.zeroes(ct.TokenizerEncoding);
+    defer tok_encode.tokenizer_encoding_free_struct(&encoding);
+    try std.testing.expectEqual(@as(c_int, 0), tok_encode.tokenizer_encode_struct_with_options(tokenizer, "Hi🎉bye", &encoding, .{}));
+
+    const offsets = try computeOffsetsFromEncoding(allocator, &encoding, tokenizer, "Hi🎉bye");
+    defer allocator.free(offsets);
+
+    try std.testing.expectEqual(@as(usize, 9), offsets.len);
+    for (offsets, 0..) |off, idx| {
+        try std.testing.expectEqual(@as(u32, @intCast(idx)), off.start);
+        try std.testing.expectEqual(@as(u32, @intCast(idx + 1)), off.end);
+    }
 }
 
 test "encode requires integration testing" {

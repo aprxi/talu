@@ -971,9 +971,13 @@ fn added_token_float_id_returns_error() {
     );
 }
 
-/// added_tokens entries with empty content are invalid.
+/// Empty added-token content is ignored rather than rejected.
+///
+/// This matches the runtime contract exercised by the added-tokens suite:
+/// loading must succeed, and the empty entry must not interfere with normal
+/// encoding behavior.
 #[test]
-fn added_token_empty_content_returns_error() {
+fn added_token_empty_content_is_ignored() {
     let json = r#"{
   "version": "1.0",
   "model": { "type": "BPE", "vocab": {"a": 0}, "merges": [] },
@@ -983,10 +987,8 @@ fn added_token_empty_content_returns_error() {
   "post_processor": null,
   "decoder": null
 }"#;
-    assert!(
-        try_load(json).is_err(),
-        "added token empty content must be rejected"
-    );
+    let handle = try_load(json).expect("empty added-token content must be ignored");
+    unsafe { talu_sys::talu_tokenizer_free(handle) };
 }
 
 /// Duplicate token keys in vocab are ambiguous and must be rejected.

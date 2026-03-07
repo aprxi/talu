@@ -225,6 +225,7 @@ fn wordpiece_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: 
     const model = @as(*WordPieceModel, @ptrCast(@alignCast(tokenizer.model.?)));
     const allocator = model.allocator;
     const unk_ptr: [*:0]const u8 = @ptrCast(&model.unk_token);
+    const cleanup_enabled = tokenizer.decoder.cleanup != 0;
 
     var result = std.ArrayListUnmanaged(u8){};
     defer result.deinit(allocator);
@@ -259,68 +260,70 @@ fn wordpiece_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: 
         first = false;
     }
 
-    // Cleanup: match HuggingFace's clean_up_tokenization_spaces exactly.
-    // HF applies sequential str.replace() calls — order matters because
-    // earlier replacements create patterns matched by later ones.
-    // E.g. "n ' t" → (pass 1: " ' " → "'") → "n't" → (pass 2: " n't" → "n't")
-    //
-    // Pass 1: punctuation + apostrophe spacing
-    //   .replace(" .", ".").replace(" ?", "?").replace(" !", "!").replace(" ,", ",")
-    //   .replace(" ' ", "'")
-    {
-        var wp: usize = 0;
-        var rp: usize = 0;
-        while (rp < result.items.len) {
-            if (result.items[rp] == ' ' and rp + 1 < result.items.len) {
-                // " ." " ?" " !" " ," — remove space before punct
-                if (isCleanupPunct(result.items[rp + 1])) {
-                    rp += 1;
-                    continue;
+    if (cleanup_enabled) {
+        // Cleanup: match HuggingFace's clean_up_tokenization_spaces exactly.
+        // HF applies sequential str.replace() calls — order matters because
+        // earlier replacements create patterns matched by later ones.
+        // E.g. "n ' t" → (pass 1: " ' " → "'") → "n't" → (pass 2: " n't" → "n't")
+        //
+        // Pass 1: punctuation + apostrophe spacing
+        //   .replace(" .", ".").replace(" ?", "?").replace(" !", "!").replace(" ,", ",")
+        //   .replace(" ' ", "'")
+        {
+            var wp: usize = 0;
+            var rp: usize = 0;
+            while (rp < result.items.len) {
+                if (result.items[rp] == ' ' and rp + 1 < result.items.len) {
+                    // " ." " ?" " !" " ," — remove space before punct
+                    if (isCleanupPunct(result.items[rp + 1])) {
+                        rp += 1;
+                        continue;
+                    }
+                    // " ' " → "'" — remove both surrounding spaces
+                    if (rp + 2 < result.items.len and result.items[rp + 1] == '\'' and result.items[rp + 2] == ' ') {
+                        result.items[wp] = '\'';
+                        wp += 1;
+                        rp += 3;
+                        continue;
+                    }
                 }
-                // " ' " → "'" — remove both surrounding spaces
-                if (rp + 2 < result.items.len and result.items[rp + 1] == '\'' and result.items[rp + 2] == ' ') {
-                    result.items[wp] = '\'';
-                    wp += 1;
-                    rp += 3;
-                    continue;
-                }
+                result.items[wp] = result.items[rp];
+                wp += 1;
+                rp += 1;
             }
-            result.items[wp] = result.items[rp];
-            wp += 1;
-            rp += 1;
+            result.items.len = wp;
         }
-        result.items.len = wp;
-    }
-    // Pass 2: contractions
-    //   .replace(" n't", "n't").replace(" 'm", "'m").replace(" 's", "'s")
-    //   .replace(" 've", "'ve").replace(" 're", "'re")
-    {
-        var wp: usize = 0;
-        var rp: usize = 0;
-        while (rp < result.items.len) {
-            if (rp + 1 < result.items.len and result.items[rp] == ' ') {
-                const rest = result.items[rp + 1 ..];
-                if (rest.len >= 3 and rest[0] == 'n' and rest[1] == '\'' and rest[2] == 't') {
-                    rp += 1;
-                    continue;
+        // Pass 2: contractions
+        //   .replace(" n't", "n't").replace(" 'm", "'m").replace(" 's", "'s")
+        //   .replace(" 've", "'ve").replace(" 're", "'re")
+        {
+            var wp: usize = 0;
+            var rp: usize = 0;
+            while (rp < result.items.len) {
+                if (rp + 1 < result.items.len and result.items[rp] == ' ') {
+                    const rest = result.items[rp + 1 ..];
+                    if (rest.len >= 3 and rest[0] == 'n' and rest[1] == '\'' and rest[2] == 't') {
+                        rp += 1;
+                        continue;
+                    }
+                    if (rest.len >= 2 and rest[0] == '\'' and (rest[1] == 'm' or rest[1] == 's')) {
+                        rp += 1;
+                        continue;
+                    }
+                    if (rest.len >= 3 and rest[0] == '\'' and
+                        ((rest[1] == 'v' and rest[2] == 'e') or
+                            (rest[1] == 'r' and rest[2] == 'e')))
+                    {
+                        rp += 1;
+                        continue;
+                    }
                 }
-                if (rest.len >= 2 and rest[0] == '\'' and (rest[1] == 'm' or rest[1] == 's')) {
-                    rp += 1;
-                    continue;
-                }
-                if (rest.len >= 3 and rest[0] == '\'' and
-                    ((rest[1] == 'v' and rest[2] == 'e') or
-                    (rest[1] == 'r' and rest[2] == 'e')))
-                {
-                    rp += 1;
-                    continue;
-                }
+                result.items[wp] = result.items[rp];
+                wp += 1;
+                rp += 1;
             }
-            result.items[wp] = result.items[rp];
-            wp += 1;
-            rp += 1;
+            result.items.len = wp;
         }
-        result.items.len = wp;
     }
 
     // Null-terminate and return
@@ -365,6 +368,7 @@ fn initTokenizerWithAllocator(allocator: std.mem.Allocator) !*ct.Tokenizer {
     const tokenizer = try allocator.create(ct.Tokenizer);
     tokenizer.* = std.mem.zeroes(ct.Tokenizer);
     tokenizer.type = ct.ModelType.wordpiece;
+    tokenizer.decoder.cleanup = 1;
     tokenizer.normalizer.lowercase = 1;
     tokenizer.normalizer.nfd = 1;
     tokenizer.postproc.cls_id = -1;
@@ -610,6 +614,7 @@ test "wordpieceDecodeWithOptions decodes token IDs with subword joining" {
     tokenizer.* = std.mem.zeroes(ct.Tokenizer);
     tokenizer.type = ct.ModelType.wordpiece;
     tokenizer.model = model;
+    tokenizer.decoder.cleanup = 1;
     model.owner = tokenizer;
     defer {
         tokenizer.model = null;
@@ -645,6 +650,7 @@ test "wordpieceDecodeWithOptions skip_special_tokens omits special tokens" {
     tokenizer.* = std.mem.zeroes(ct.Tokenizer);
     tokenizer.type = ct.ModelType.wordpiece;
     tokenizer.model = model;
+    tokenizer.decoder.cleanup = 1;
     model.owner = tokenizer;
 
     // Mark [CLS] (id=0) and [SEP] (id=2) as special tokens
@@ -696,6 +702,7 @@ test "wordpieceDecodeWithOptions applies cleanup_tokenization_spaces" {
     tokenizer.* = std.mem.zeroes(ct.Tokenizer);
     tokenizer.type = ct.ModelType.wordpiece;
     tokenizer.model = model;
+    tokenizer.decoder.cleanup = 1;
     model.owner = tokenizer;
     defer {
         tokenizer.model = null;
@@ -716,6 +723,43 @@ test "wordpieceDecodeWithOptions applies cleanup_tokenization_spaces" {
     defer allocator.free(out[0 .. out_len + 1]);
 
     try std.testing.expectEqualStrings("I don't.", out[0..out_len]);
+}
+
+test "wordpieceDecodeWithOptions preserves spacing when cleanup disabled" {
+    const allocator = std.testing.allocator;
+
+    var model = try initModel(allocator);
+    try allocIdToToken(model, 4);
+    try addVocabEntry(model, "hello", 0);
+    try addVocabEntry(model, ",", 1);
+    try addVocabEntry(model, "world", 2);
+    try addVocabEntry(model, "?", 3);
+
+    var tokenizer = try allocator.create(ct.Tokenizer);
+    tokenizer.* = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.type = ct.ModelType.wordpiece;
+    tokenizer.model = model;
+    tokenizer.decoder.wordpiece = 1;
+    tokenizer.decoder.cleanup = 0;
+    model.owner = tokenizer;
+    defer {
+        tokenizer.model = null;
+        for (model.vocab_strings.items) |s| allocator.free(s);
+        model.vocab_strings.deinit(allocator);
+        model.vocab.deinit(allocator);
+        allocator.free(model.id_to_token);
+        allocator.destroy(model);
+        allocator.destroy(tokenizer);
+    }
+
+    var ids = [_]i32{ 0, 1, 2, 3 };
+    var out: [*c]u8 = undefined;
+    var out_len: usize = 0;
+    const rc = wordpieceDecodeWithOptions(tokenizer, &ids, ids.len, &out, &out_len, .{});
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    defer allocator.free(out[0 .. out_len + 1]);
+
+    try std.testing.expectEqualStrings("hello , world ?", out[0..out_len]);
 }
 
 test "wordpieceDestroy requires integration testing" {

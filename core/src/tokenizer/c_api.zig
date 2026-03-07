@@ -7,6 +7,7 @@ const std = @import("std");
 const ct = @import("c_types.zig");
 const encode = @import("encode.zig");
 const errors = @import("errors.zig");
+const normalize = @import("normalize.zig");
 const pretokenize = @import("pretokenize.zig");
 const strings = @import("strings.zig");
 const types = @import("types.zig");
@@ -37,7 +38,7 @@ pub fn tokenizer_added_token_add(tokenizer: *ct.Tokenizer, content: ?[*:0]const 
         .single_word = 0,
         .lstrip = 0,
         .rstrip = 0,
-        .normalized = 0,
+        .normalized = 1,
         .next = tokenizer.added,
     };
     tokenizer.added = added_node;
@@ -74,6 +75,7 @@ fn tokenizer_free_impl(tokenizer_opt: ?*ct.Tokenizer) void {
     const tokenizer = tokenizer_opt.?;
     tokenizer.destroy();
     tokenizer_added_tokens_free(tokenizer);
+    normalize.tokenizer_normalizer_free(&tokenizer.normalizer);
     pretokenize.tokenizer_pretokenizer_free(&tokenizer.pretokenizer);
     errors.freeLastError(tokenizer);
     Allocator.destroy(tokenizer);
