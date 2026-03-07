@@ -72,6 +72,8 @@ fn parseScenario(value: []const u8) !scenarios.Scenario {
     if (std.mem.eql(u8, value, "scv") or std.mem.eql(u8, value, "shortconv_decode_bf16")) return .shortconv_decode_bf16;
     if (std.mem.eql(u8, value, "scvq") or std.mem.eql(u8, value, "shortconv_decode_quantized_u4")) return .shortconv_decode_quantized_u4;
     if (std.mem.eql(u8, value, "ssm") or std.mem.eql(u8, value, "state_space_decode_f16")) return .state_space_decode_f16;
+    if (std.mem.eql(u8, value, "gdm") or std.mem.eql(u8, value, "gated_delta_decode_f16")) return .gated_delta_decode_f16;
+    if (std.mem.eql(u8, value, "gdmq") or std.mem.eql(u8, value, "gdmq_u4") or std.mem.eql(u8, value, "gated_delta_decode_quantized_u4")) return .gated_delta_decode_quantized_u4;
     if (std.mem.eql(u8, value, "mmthr") or std.mem.eql(u8, value, "matmul_throughput_f16")) return .matmul_throughput_f16;
     if (std.mem.eql(u8, value, "micro") or std.mem.eql(u8, value, "micro_matmul_f16")) return .micro_matmul_f16;
     if (std.mem.eql(u8, value, "decode") or std.mem.eql(u8, value, "decode_synth_f16")) return .decode_synth_f16;
@@ -97,7 +99,7 @@ fn printUsage(writer: anytype) !void {
         \\  zig build bench-metal-compute -Drelease -- [options]
         \\
         \\Options:
-        \\  --scenario <all|add|mul|rms|smx|ffnq_u4|ffnq_u8|ffnd|qmm_u4|qmm_u8|attn|scv|scvq|ssm|mmthr|micro|decode|decd|decq> default: all
+        \\  --scenario <all|add|mul|rms|smx|ffnq_u4|ffnq_u8|ffnd|qmm_u4|qmm_u8|attn|scv|scvq|ssm|gdm|gdmq_u4|mmthr|micro|decode|decd|decq> default: all
         \\  --profile <ci|bw>               default: bw
         \\  --format <table|csv|tsv>        default: table
         \\  --warmup <N>                    default: 8
@@ -260,6 +262,8 @@ fn runScenario(
         .shortconv_decode_bf16 => try scenarios.runShortconvDecodeBF16(allocator, cfg),
         .shortconv_decode_quantized_u4 => try scenarios.runShortconvDecodeQuantizedU4(allocator, cfg),
         .state_space_decode_f16 => try scenarios.runStateSpaceDecodeF16(allocator, cfg),
+        .gated_delta_decode_f16 => try scenarios.runGatedDeltaDecodeF16(allocator, cfg),
+        .gated_delta_decode_quantized_u4 => try scenarios.runGatedDeltaDecodeQuantizedU4(allocator, cfg),
         .matmul_throughput_f16 => try scenarios.runMatmulThroughputF16(allocator, cfg),
         .micro_matmul_f16 => try scenarios.runMicroMatmulF16(allocator, cfg),
         .decode_synth_f16 => try scenarios.runDecodeSynthF16(allocator, cfg),
@@ -385,6 +389,7 @@ pub fn main() !void {
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .shortconv_decode_quantized_u4));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .shortconv_decode_bf16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .state_space_decode_f16));
+            updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_decode_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .matmul_throughput_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_dense_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_quantized_mix_u4));
@@ -410,6 +415,8 @@ pub fn main() !void {
         .shortconv_decode_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .shortconv_decode_bf16)),
         .shortconv_decode_quantized_u4 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .shortconv_decode_quantized_u4)),
         .state_space_decode_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .state_space_decode_f16)),
+        .gated_delta_decode_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_decode_f16)),
+        .gated_delta_decode_quantized_u4 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .gated_delta_decode_quantized_u4)),
         .matmul_throughput_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .matmul_throughput_f16)),
         .micro_matmul_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .micro_matmul_f16)),
         .decode_synth_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_synth_f16)),
@@ -444,5 +451,7 @@ test "parseScenario accepts short and full names" {
     try std.testing.expectEqual(scenarios.Scenario.shortconv_decode_bf16, try parseScenario("scv"));
     try std.testing.expectEqual(scenarios.Scenario.shortconv_decode_quantized_u4, try parseScenario("scvq"));
     try std.testing.expectEqual(scenarios.Scenario.state_space_decode_f16, try parseScenario("ssm"));
+    try std.testing.expectEqual(scenarios.Scenario.gated_delta_decode_f16, try parseScenario("gdm"));
+    try std.testing.expectEqual(scenarios.Scenario.gated_delta_decode_quantized_u4, try parseScenario("gdmq"));
     try std.testing.expectEqual(scenarios.Scenario.fused_ffn_dense_decode_f16, try parseScenario("ffnd"));
 }

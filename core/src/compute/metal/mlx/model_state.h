@@ -66,6 +66,7 @@ struct StateSpaceLayer {
     int hidden_dim = 0;
     int d_inner = 0;
     int d_ff = 0;
+
 };
 
 struct MLXStateSpaceCache {

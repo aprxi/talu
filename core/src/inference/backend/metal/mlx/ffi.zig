@@ -9,6 +9,7 @@ pub const ArrayHandle = mlx_graph.ArrayHandle;
 pub const CacheHandle = runtime_graph.CacheHandle;
 pub const ShortConvCacheHandle = runtime_graph.ShortConvCacheHandle;
 pub const MambaCacheHandle = runtime_graph.MambaCacheHandle;
+pub const GatedDeltaCacheHandle = runtime_graph.GatedDeltaCacheHandle;
 
 pub extern fn mlx_lazy_causal_conv_mixer_bf16(
     input: ArrayHandle,
@@ -102,6 +103,44 @@ pub extern fn mlx_lazy_state_space_block_quantized(
     d_head: usize,
     n_groups: usize,
     gate_up_layout: u8,
+) ArrayHandle;
+
+pub extern fn mlx_lazy_gated_delta_mixer_bf16(
+    input: ArrayHandle,
+    in_proj: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    a_log: ArrayHandle,
+    dt_bias: ArrayHandle,
+    norm_weight: ArrayHandle,
+    out_proj: ArrayHandle,
+    gated_delta_cache: GatedDeltaCacheHandle,
+    layer_idx: usize,
+    d_conv: usize,
+    n_heads: usize,
+    d_head: usize,
+) ArrayHandle;
+
+pub extern fn mlx_lazy_gated_delta_mixer_quantized(
+    input: ArrayHandle,
+    in_w: ArrayHandle,
+    in_s: ArrayHandle,
+    in_b: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    a_log: ArrayHandle,
+    dt_bias: ArrayHandle,
+    norm_weight: ArrayHandle,
+    out_w: ArrayHandle,
+    out_s: ArrayHandle,
+    out_b: ArrayHandle,
+    group_size: usize,
+    bits: usize,
+    gated_delta_cache: GatedDeltaCacheHandle,
+    layer_idx: usize,
+    d_conv: usize,
+    n_heads: usize,
+    d_head: usize,
 ) ArrayHandle;
 
 pub extern fn mlx_lazy_fused_attention(

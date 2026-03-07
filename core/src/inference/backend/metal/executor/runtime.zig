@@ -15,6 +15,7 @@ const mlx_graph = compute.metal.graph;
 pub const Cache = runtime_graph.Cache;
 pub const ShortConvCache = runtime_graph.ShortConvCache;
 pub const MambaCache = runtime_graph.MambaCache;
+pub const GatedDeltaCache = runtime_graph.GatedDeltaCache;
 
 pub const DeepstackAdditions = model_executor.DeepstackAdditions;
 pub const RuntimeRoPEOverride = model_executor.RuntimeRoPEOverride;

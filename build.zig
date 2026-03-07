@@ -48,6 +48,36 @@ fn getVersion(b: *std.Build) []const u8 {
     return b.allocator.dupe(u8, trimmed) catch return "0.0.0";
 }
 
+fn pathExists(path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.accessAbsolute(path, .{}) catch return false;
+        return true;
+    }
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+fn findMlxMetallib(b: *std.Build) ?[]const u8 {
+    const env_path = std.process.getEnvVarOwned(b.allocator, "MLX_METALLIB") catch null;
+    if (env_path) |path| {
+        if (pathExists(path)) return path;
+        b.allocator.free(path);
+    }
+
+    const candidates = [_][]const u8{
+        "deps/mlx/lib/mlx.metallib",
+        "deps/mlx-src/build/mlx/backend/metal/kernels/mlx.metallib",
+        "/opt/homebrew/bin/mlx.metallib",
+        "/usr/local/bin/mlx.metallib",
+    };
+    for (candidates) |candidate| {
+        if (pathExists(candidate)) {
+            return b.allocator.dupe(u8, candidate) catch @panic("OOM");
+        }
+    }
+    return null;
+}
+
 // =============================================================================
 // Dependencies — each built from ports/<dep>/build.zig
 // =============================================================================
@@ -593,11 +623,25 @@ pub fn build(b: *std.Build) void {
     // macOS frameworks already linked via linkCDependencies
 
     b.installArtifact(exe);
+    var install_mlx_metallib_step: ?*std.Build.Step.InstallFile = null;
+    if (target.result.os.tag == .macos) {
+        if (findMlxMetallib(b)) |mlx_metallib_path| {
+            const copy_mlx_metallib = b.addInstallFileWithDir(
+                .{ .cwd_relative = mlx_metallib_path },
+                .bin,
+                "mlx.metallib",
+            );
+            b.getInstallStep().dependOn(&copy_mlx_metallib.step);
+            install_mlx_metallib_step = copy_mlx_metallib;
+        }
+    }
 
-    const run_cmd = b.addRunArtifact(exe);
+    const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "talu")});
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
-        run_cmd.addArgs(args);
+        for (args) |arg| {
+            run_cmd.addArg(arg);
+        }
     }
     const run_step = b.step("run", "Run the CLI executable");
     run_step.dependOn(&run_cmd.step);
@@ -610,6 +654,9 @@ pub fn build(b: *std.Build) void {
     const release_step = b.step("release", "Build library + CLI and copy to Python (recommended)");
     release_step.dependOn(python_install_step);
     release_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    if (install_mlx_metallib_step) |step| {
+        release_step.dependOn(&step.step);
+    }
 
     // Enforce release mode for the release step
     if (optimize == .Debug) {
@@ -1179,7 +1226,8 @@ pub fn build(b: *std.Build) void {
         addMetalSupport(b, bench_metal_compute_mod, bench_metal_compute_exe, enable_metal);
         b.installArtifact(bench_metal_compute_exe);
 
-        const run_bench_metal_compute = b.addRunArtifact(bench_metal_compute_exe);
+        const run_bench_metal_compute = b.addSystemCommand(&.{b.getInstallPath(.bin, "bench-metal-compute")});
+        run_bench_metal_compute.step.dependOn(b.getInstallStep());
         if (b.args) |args| {
             for (args) |arg| {
                 run_bench_metal_compute.addArg(arg);

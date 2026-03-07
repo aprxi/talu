@@ -35,6 +35,7 @@ pub const Device = metal_compute.Device;
 pub const Buffer = metal_compute.Buffer;
 pub const isAvailable = metal_compute.isAvailable;
 pub const Cache = runtime_graph_mod.Cache;
+pub const GatedDeltaCache = runtime_graph_mod.GatedDeltaCache;
 pub const WeightHandles = weights_trait.WeightHandles;
 /// Metal backend for GPU-accelerated transformer inference
 pub const MetalBackend = struct {
@@ -248,18 +249,6 @@ pub const MetalBackend = struct {
 
     fn deinitNoopState(_: *const runtime_contract.StateBlockHandle) !void {}
 
-    fn initUnsupportedState(_: *MetalBackend, _: *const runtime_contract.StateBlockHandle) !bool {
-        return error.UnsupportedModel;
-    }
-
-    fn resetUnsupportedState(_: *const runtime_contract.StateBlockHandle) !void {
-        return error.UnsupportedModel;
-    }
-
-    fn deinitUnsupportedState(_: *const runtime_contract.StateBlockHandle) !void {
-        return error.UnsupportedModel;
-    }
-
     fn initKvCacheState(self: *MetalBackend, state_block: *const runtime_contract.StateBlockHandle) !bool {
         const cache = try stateObjectPtr(runtime_graph_mod.Cache, state_block);
         cache.* = runtime_graph_mod.Cache.init(self.layer_count, true, self.cache_max_seq_len);
@@ -308,6 +297,22 @@ pub const MetalBackend = struct {
         mamba.* = runtime_graph_mod.MambaCache.disabled();
     }
 
+    fn initGatedDeltaState(self: *MetalBackend, state_block: *const runtime_contract.StateBlockHandle) !bool {
+        const gated_delta = try stateObjectPtr(runtime_graph_mod.GatedDeltaCache, state_block);
+        gated_delta.* = runtime_graph_mod.GatedDeltaCache.init(self.layer_count);
+        return true;
+    }
+
+    fn resetGatedDeltaState(state_block: *const runtime_contract.StateBlockHandle) !void {
+        (try stateObjectPtr(runtime_graph_mod.GatedDeltaCache, state_block)).reset();
+    }
+
+    fn deinitGatedDeltaState(state_block: *const runtime_contract.StateBlockHandle) !void {
+        const gated_delta = try stateObjectPtr(runtime_graph_mod.GatedDeltaCache, state_block);
+        gated_delta.deinit();
+        gated_delta.* = runtime_graph_mod.GatedDeltaCache.disabled();
+    }
+
     const state_runtime_ops: [@typeInfo(StateRuntimeRole).@"enum".fields.len]StateRuntimeOps = blk: {
         var table: [@typeInfo(StateRuntimeRole).@"enum".fields.len]StateRuntimeOps = undefined;
         table[@intFromEnum(StateRuntimeRole.none)] = .{
@@ -331,9 +336,9 @@ pub const MetalBackend = struct {
             .deinit = deinitMambaState,
         };
         table[@intFromEnum(StateRuntimeRole.gated_delta_cache)] = .{
-            .init = initUnsupportedState,
-            .reset = resetUnsupportedState,
-            .deinit = deinitUnsupportedState,
+            .init = initGatedDeltaState,
+            .reset = resetGatedDeltaState,
+            .deinit = deinitGatedDeltaState,
         };
         break :blk table;
     };
@@ -382,7 +387,10 @@ pub const MetalBackend = struct {
                 const cache = stateObjectPtr(runtime_graph_mod.MambaCache, state_block) catch break :blk false;
                 break :blk runtimeHandleLooksValid(cache.handle);
             },
-            .gated_delta_cache => true,
+            .gated_delta_cache => blk: {
+                const cache = stateObjectPtr(runtime_graph_mod.GatedDeltaCache, state_block) catch break :blk false;
+                break :blk runtimeHandleLooksValid(cache.handle);
+            },
         };
     }
 
@@ -1277,8 +1285,8 @@ test "deriveStateRuntimeRoles maps descriptor runtime_kind values" {
         },
         .{
             .id = runtime_contract.gated_delta_state_id,
-            .size_bytes = 64,
-            .align_bytes = 64,
+            .size_bytes = @sizeOf(runtime_graph_mod.GatedDeltaCache),
+            .align_bytes = @alignOf(runtime_graph_mod.GatedDeltaCache),
             .zero_init = false,
             .lifecycle = .slot_persistent,
             .runtime_kind = runtime_contract.state_runtime_kind_gated_delta_cache,

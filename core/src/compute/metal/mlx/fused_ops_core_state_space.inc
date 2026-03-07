@@ -275,6 +275,7 @@ struct QuantParamCastCacheKeyHash {
 static constexpr size_t kQuantParamCastCacheMaxEntries = 4096;
 static constexpr size_t kStateSpaceStaticCacheMaxEntries = 1024;
 static constexpr size_t kStateSpaceRowCacheMaxEntries = 1024;
+static constexpr size_t kGatedDeltaStaticCacheMaxEntries = 1024;
 
 static inline std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash>& quant_param_cast_cache_store() {
     static thread_local std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash> cache;
@@ -354,6 +355,46 @@ static inline std::unordered_map<StateSpaceRowCacheKey, array, StateSpaceRowCach
 
 static inline void state_space_row_cache_clear() {
     state_space_row_cache_store().clear();
+}
+
+struct GatedDeltaStaticCacheKey {
+    const void* a_log_handle = nullptr;
+    const void* norm_weight_handle = nullptr;
+    int n_heads = 0;
+    int d_head = 0;
+
+    bool operator==(const GatedDeltaStaticCacheKey& other) const {
+        return a_log_handle == other.a_log_handle &&
+               norm_weight_handle == other.norm_weight_handle &&
+               n_heads == other.n_heads &&
+               d_head == other.d_head;
+    }
+};
+
+struct GatedDeltaStaticCacheKeyHash {
+    size_t operator()(const GatedDeltaStaticCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.a_log_handle);
+        h ^= std::hash<const void*>{}(key.norm_weight_handle) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.n_heads) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.d_head) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct GatedDeltaStaticTerms {
+    array a_log_exp_row;
+    std::optional<array> norm_weight_heads = std::nullopt;
+};
+
+static inline array ensure_float32(const array& arr);
+
+static inline std::unordered_map<GatedDeltaStaticCacheKey, GatedDeltaStaticTerms, GatedDeltaStaticCacheKeyHash>& gated_delta_static_cache_store() {
+    static thread_local std::unordered_map<GatedDeltaStaticCacheKey, GatedDeltaStaticTerms, GatedDeltaStaticCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void gated_delta_static_cache_clear() {
+    gated_delta_static_cache_store().clear();
 }
 
 static inline array cast_tensor_cached(
@@ -470,6 +511,240 @@ static inline array resolve_state_space_row_cached(
     return inserted->second;
 }
 
+static inline GatedDeltaStaticTerms resolve_gated_delta_static_terms(
+    const void* a_log_handle,
+    const void* norm_weight_handle,
+    const array& a_log_arr,
+    const std::optional<array>& norm_weight_arr,
+    int n_heads,
+    int d_head
+) {
+    const auto uncached = [&]() -> GatedDeltaStaticTerms {
+        GatedDeltaStaticTerms terms{
+            exp(reshape(a_log_arr, {n_heads})),
+            std::nullopt,
+        };
+        if (!norm_weight_arr.has_value()) {
+            return terms;
+        }
+
+        const int d_inner = n_heads * d_head;
+        array weights = ensure_float32(*norm_weight_arr);
+        if (weights.ndim() == 2 && weights.shape(0) == 1) {
+            weights = reshape(weights, {weights.shape(1)});
+        }
+        if (weights.ndim() != 1) {
+            throw std::invalid_argument("[gated_delta] norm_weight must be rank-1");
+        }
+        if (weights.shape(0) == d_head) {
+            terms.norm_weight_heads = broadcast_to(reshape(weights, {1, d_head}), {n_heads, d_head});
+        } else if (weights.shape(0) == d_inner) {
+            terms.norm_weight_heads = reshape(weights, {n_heads, d_head});
+        } else {
+            throw std::invalid_argument("[gated_delta] norm_weight shape incompatible with head dims");
+        }
+        return terms;
+    };
+
+    if (a_log_handle == nullptr && norm_weight_handle == nullptr) {
+        return uncached();
+    }
+
+    auto& cache = gated_delta_static_cache_store();
+    if (cache.size() >= kGatedDeltaStaticCacheMaxEntries) {
+        cache.clear();
+    }
+
+    GatedDeltaStaticCacheKey key;
+    key.a_log_handle = a_log_handle;
+    key.norm_weight_handle = norm_weight_handle;
+    key.n_heads = n_heads;
+    key.d_head = d_head;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    GatedDeltaStaticTerms terms = uncached();
+    eval(terms.a_log_exp_row);
+    if (terms.norm_weight_heads.has_value()) {
+        eval(*terms.norm_weight_heads);
+    }
+    auto [inserted, _] = cache.emplace(key, std::move(terms));
+    return inserted->second;
+}
+
+static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
+    static thread_local fast::CustomKernelFunction kernel = fast::metal_kernel(
+        "talu_gated_delta_recurrence_step",
+        {
+            "state",
+            "query",
+            "key",
+            "value",
+            "z",
+            "beta_raw",
+            "a_raw",
+            "a_log_exp",
+            "dt_bias",
+            "norm_weight",
+        },
+        { "out", "next_state" },
+        R"(
+    constexpr float eps = 1.0e-6f;
+    const uint lane = thread_position_in_grid.x;
+    const uint head = thread_position_in_grid.y;
+    if (lane >= D_HEAD) {
+      return;
+    }
+
+    threadgroup float q_shared[D_HEAD];
+    threadgroup float k_shared[D_HEAD];
+    threadgroup float reduce_shared[D_HEAD];
+    threadgroup float scalar_shared[4];
+
+    const uint vec_base = head * D_HEAD;
+    const uint state_base = head * D_HEAD * D_HEAD;
+
+    float q = query[vec_base + lane];
+    float k = key[vec_base + lane];
+
+    reduce_shared[lane] = q * q;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
+      if (lane < offset) {
+        reduce_shared[lane] += reduce_shared[lane + offset];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+      scalar_shared[0] = rsqrt(reduce_shared[0] + eps) * rsqrt((float)D_HEAD);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    reduce_shared[lane] = k * k;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
+      if (lane < offset) {
+        reduce_shared[lane] += reduce_shared[lane + offset];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+      scalar_shared[1] = rsqrt(reduce_shared[0] + eps);
+      const float a = a_raw[head] + dt_bias[head];
+      scalar_shared[2] = 1.0f / (1.0f + exp(-beta_raw[head]));
+      scalar_shared[3] = exp((-a_log_exp[head]) * log(1.0f + exp(a)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    q *= scalar_shared[0];
+    k *= scalar_shared[1];
+    q_shared[lane] = q;
+    k_shared[lane] = k;
+    reduce_shared[lane] = q * k;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
+      if (lane < offset) {
+        reduce_shared[lane] += reduce_shared[lane + offset];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+      scalar_shared[0] = reduce_shared[0];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float beta = scalar_shared[2];
+    const float decay = scalar_shared[3];
+    float kv_mem = 0.0f;
+    float out_value = 0.0f;
+    for (uint i = 0; i < D_HEAD; ++i) {
+      const uint state_index = state_base + (i * D_HEAD) + lane;
+      const float scaled = state[state_index] * decay;
+      kv_mem += scaled * k_shared[i];
+      out_value += scaled * q_shared[i];
+    }
+
+    kv_mem = (value[vec_base + lane] - kv_mem) * beta;
+    out_value += kv_mem * scalar_shared[0];
+
+    for (uint i = 0; i < D_HEAD; ++i) {
+      const uint state_index = state_base + (i * D_HEAD) + lane;
+      const float scaled = state[state_index] * decay;
+      next_state[state_index] = scaled + k_shared[i] * kv_mem;
+    }
+
+    reduce_shared[lane] = out_value * out_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
+      if (lane < offset) {
+        reduce_shared[lane] += reduce_shared[lane + offset];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+      scalar_shared[1] = rsqrt((reduce_shared[0] / (float)D_HEAD) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    out_value *= scalar_shared[1];
+    out_value *= norm_weight[vec_base + lane];
+    const float z_value = z[vec_base + lane];
+    out[vec_base + lane] = out_value * (z_value * (1.0f / (1.0f + exp(-z_value))));
+        )",
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static inline std::pair<array, array> gated_delta_recurrence_step(
+    const array& state,
+    const array& query,
+    const array& key,
+    const array& value,
+    const array& z,
+    const array& beta_raw,
+    const array& a_raw,
+    const array& a_log_exp_row,
+    const array& dt_bias_heads,
+    const array& norm_weight_heads,
+    int n_heads,
+    int d_head
+) {
+    auto outputs = gated_delta_recurrence_step_kernel()(
+        {
+            state,
+            query,
+            key,
+            value,
+            z,
+            beta_raw,
+            a_raw,
+            a_log_exp_row,
+            dt_bias_heads,
+            norm_weight_heads,
+        },
+        {
+            Shape{n_heads, d_head},
+            Shape{n_heads, d_head, d_head},
+        },
+        { float32, float32 },
+        { d_head, n_heads, 1 },
+        { d_head, 1, 1 },
+        { { "D_HEAD", d_head } },
+        std::nullopt,
+        false,
+        {}
+    );
+    if (outputs.size() != 2) {
+        throw std::runtime_error("[gated_delta] recurrence kernel returned unexpected output count");
+    }
+    return { outputs[0], outputs[1] };
+}
+
 static inline array orient_matmul_rhs_cached(
     const void* weight_handle,
     const array& weight,
@@ -562,6 +837,7 @@ void mlx_weight_transform_cache_clear() {
     quant_param_cast_cache_clear();
     state_space_static_cache_clear();
     state_space_row_cache_clear();
+    gated_delta_static_cache_clear();
     attention_fused_qkv_cache_clear();
     ffn_quantized_gate_up_cache_clear();
     ffn_fused_gate_up_cache_clear();
@@ -1014,6 +1290,22 @@ static array state_space_apply_quantized_linear(const array& x, const void* ctx_
     );
 }
 
+static inline array gated_delta_mixer_forward_core(
+    const array& input,
+    const StateSpaceCallable& in_proj_fn,
+    const array& conv_kernel_broadcast,
+    const std::optional<array>& conv_bias_row,
+    const array& a_log_exp_row,
+    const std::optional<array>& dt_bias_row,
+    const std::optional<array>& norm_weight_heads,
+    const StateSpaceCallable& out_proj_fn,
+    int d_conv,
+    int n_heads,
+    int d_head,
+    array& conv_state,
+    array& ssm_state
+);
+
 static array state_space_forward_core(
     const array& input, // [1, L, d_model]
     const array& ln1_weight,
@@ -1110,28 +1402,18 @@ static array state_space_forward_core(
         reshape(x_heads_group_all, {seq_len, n_groups, heads_per_group, d_head, 1}) *
         reshape(b_groups_all, {seq_len, n_groups, 1, 1, d_state});
 
-    array ssm_all_group(0.0f, float32);
-    if (seq_len == 1) {
-        // Decode fast path: exact single-step recurrence.
-        // s_next = dA * s_prev + x_term (algebraically equivalent to scan at L=1).
-        const array ssm_next = dA_all * ssm_state_group + x_term_all;
-        ssm_state_group = ssm_next;
-        ssm_all_group = ssm_next;
-    } else {
-        // Solve s_t = dA_t * s_{t-1} + x_t with parallel prefix products/sums.
-        // dA_t is strictly non-negative (exp of real), so clipping protects only
-        // against denorm/underflow during long prefills.
-        const array prefix = cumprod(dA_all, 0);
-        const array prefix_safe = clip(prefix, array(1.0e-20f), std::nullopt);
-        const array ssm_terms = x_term_all / prefix_safe;
-        const array ssm_accum = cumsum(ssm_terms, 0);
-        ssm_all_group = prefix * (ssm_state_group + ssm_accum);
-        ssm_state_group = slice(
-            ssm_all_group,
-            {seq_len - 1, 0, 0, 0, 0},
-            {seq_len, n_groups, heads_per_group, d_head, d_state}
-        );
-    }
+    // Solve s_t = dA_t * s_{t-1} + x_t with one recurrence path for all
+    // sequence lengths, including decode where seq_len == 1.
+    const array prefix = cumprod(dA_all, 0);
+    const array prefix_safe = clip(prefix, array(1.0e-20f), std::nullopt);
+    const array ssm_terms = x_term_all / prefix_safe;
+    const array ssm_accum = cumsum(ssm_terms, 0);
+    array ssm_all_group = prefix * (ssm_state_group + ssm_accum);
+    ssm_state_group = slice(
+        ssm_all_group,
+        {seq_len - 1, 0, 0, 0, 0},
+        {seq_len, n_groups, heads_per_group, d_head, d_state}
+    );
 
     ssm_state = reshape(ssm_state_group, {1, n_heads, d_head, d_state});
 
@@ -1194,6 +1476,116 @@ static array state_space_forward_core(
     const array mid_proj_in = (mid.dtype() == model_dtype) ? mid : astype(mid, model_dtype);
     const array ffn_out = state_space_call(down_proj_fn, mid_proj_in);
     return hidden_1 + ffn_out * residual_multiplier;
+}
+
+static inline array gated_delta_mixer_forward_core(
+    const array& input,
+    const StateSpaceCallable& in_proj_fn,
+    const array& conv_kernel_broadcast,
+    const std::optional<array>& conv_bias_row,
+    const array& a_log_exp_row,
+    const std::optional<array>& dt_bias_row,
+    const std::optional<array>& norm_weight_heads,
+    const StateSpaceCallable& out_proj_fn,
+    int d_conv,
+    int n_heads,
+    int d_head,
+    array& conv_state,
+    array& ssm_state
+) {
+    const int seq_len = input.shape(1);
+    const int d_inner = n_heads * d_head;
+    const int qkv_len = d_inner * 3;
+    const int proj_len = (4 * d_inner) + (2 * n_heads);
+    if (n_heads <= 0 || d_head <= 0 || d_conv <= 0) {
+        throw std::invalid_argument("[gated_delta] invalid config dims");
+    }
+
+    const array proj_all = state_space_call(in_proj_fn, input);
+    if (proj_all.shape(2) < proj_len) {
+        throw std::invalid_argument("[gated_delta] in_proj output too small");
+    }
+
+    array qkv_all = slice(proj_all, {0, 0, 0}, {1, seq_len, qkv_len});
+    const array z_all = ensure_float32(slice(proj_all, {0, 0, qkv_len}, {1, seq_len, qkv_len + d_inner}));
+    const array beta_raw_all = ensure_float32(slice(
+        proj_all,
+        {0, 0, qkv_len + d_inner},
+        {1, seq_len, qkv_len + d_inner + n_heads}
+    ));
+    const array a_raw_all = ensure_float32(slice(
+        proj_all,
+        {0, 0, qkv_len + d_inner + n_heads},
+        {1, seq_len, proj_len}
+    ));
+
+    array conv_seq = causal_conv_run_sequence(
+        &conv_state,
+        qkv_all,
+        conv_kernel_broadcast,
+        seq_len,
+        d_conv,
+        qkv_len
+    );
+    if (conv_bias_row) {
+        conv_seq = conv_seq + reshape(*conv_bias_row, {1, 1, qkv_len});
+    }
+    const array qkv_conv_all = ensure_float32(conv_seq * sigmoid(conv_seq));
+
+    const std::optional<array> dt_bias_heads = dt_bias_row
+        ? std::optional<array>(reshape(*dt_bias_row, {n_heads}))
+        : std::nullopt;
+    const Dtype model_dtype = input.dtype();
+    const array dt_bias_heads_value = dt_bias_heads.has_value() ? *dt_bias_heads : zeros({n_heads}, float32);
+    const array norm_weight_heads_value = norm_weight_heads.has_value() ? *norm_weight_heads : ones({n_heads, d_head}, float32);
+
+    array state = reshape(ssm_state, {n_heads, d_head, d_head});
+    array query_all = reshape(slice(qkv_conv_all, {0, 0, 0}, {1, seq_len, d_inner}), {seq_len, n_heads, d_head});
+    array key_all = reshape(slice(qkv_conv_all, {0, 0, d_inner}, {1, seq_len, 2 * d_inner}), {seq_len, n_heads, d_head});
+    const array value_all = reshape(slice(qkv_conv_all, {0, 0, 2 * d_inner}, {1, seq_len, qkv_len}), {seq_len, n_heads, d_head});
+    const array z_heads_all = reshape(z_all, {seq_len, n_heads, d_head});
+
+    std::vector<array> outputs;
+    outputs.reserve(static_cast<size_t>(seq_len));
+
+    for (int token_idx = 0; token_idx < seq_len; ++token_idx) {
+        array query = reshape(slice(query_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
+        array key = reshape(slice(key_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
+        const array value = reshape(slice(value_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
+        const array z = reshape(slice(z_heads_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
+        const array beta_raw = reshape(slice(beta_raw_all, {0, token_idx, 0}, {1, token_idx + 1, n_heads}), {n_heads});
+        const array a_raw = reshape(slice(a_raw_all, {0, token_idx, 0}, {1, token_idx + 1, n_heads}), {n_heads});
+        const auto [out, next_state] = gated_delta_recurrence_step(
+            state,
+            query,
+            key,
+            value,
+            z,
+            beta_raw,
+            a_raw,
+            a_log_exp_row,
+            dt_bias_heads_value,
+            norm_weight_heads_value,
+            n_heads,
+            d_head
+        );
+        state = next_state;
+
+        array out_proj_in = reshape(out, {1, 1, d_inner});
+        if (out_proj_in.dtype() != model_dtype) {
+            out_proj_in = astype(out_proj_in, model_dtype);
+        }
+        outputs.emplace_back(state_space_call(out_proj_fn, out_proj_in));
+    }
+
+    ssm_state = reshape(state, {1, n_heads, d_head, d_head});
+    if (outputs.empty()) {
+        throw std::invalid_argument("[gated_delta] empty sequence");
+    }
+    if (outputs.size() == 1) {
+        return outputs.front();
+    }
+    return concatenate(outputs, 1);
 }
 
 void* mlx_lazy_state_space_block_bf16(
@@ -1458,6 +1850,275 @@ void* mlx_lazy_state_space_block_bf16(
         *layer_state->ssm_state = ssm_state;
     }
 
+    return pool_array(out);
+}
+
+void* mlx_lazy_gated_delta_mixer_bf16(
+    const void* input,
+    const void* in_proj,
+    const void* conv_weight,
+    const void* conv_bias,
+    const void* a_log,
+    const void* dt_bias,
+    const void* norm_weight,
+    const void* out_proj,
+    void* gated_delta_cache_ptr,
+    size_t layer_idx,
+    size_t d_conv,
+    size_t n_heads,
+    size_t d_head
+) {
+    mlx_count_op();
+    const auto& input_arr = *static_cast<const array*>(input);
+    const auto& in_proj_w = *static_cast<const array*>(in_proj);
+    const auto& conv_w = *static_cast<const array*>(conv_weight);
+    const auto* conv_b = static_cast<const array*>(conv_bias);
+    const auto a_log_arr = cast_tensor_cached(a_log, *static_cast<const array*>(a_log), float32);
+    const auto* dt_b = static_cast<const array*>(dt_bias);
+    const auto* norm_w = static_cast<const array*>(norm_weight);
+    const auto& out_proj_w = *static_cast<const array*>(out_proj);
+
+    const int d_conv_i = static_cast<int>(d_conv);
+    const int n_heads_i = static_cast<int>(n_heads);
+    const int d_head_i = static_cast<int>(d_head);
+    const int hidden_dim = input_arr.shape(2);
+    const int d_inner = n_heads_i * d_head_i;
+    const int qkv_len = d_inner * 3;
+
+    auto* cache = static_cast<MLXStateSpaceCache*>(gated_delta_cache_ptr);
+    StateSpaceLayer* layer_state = nullptr;
+    if (cache != nullptr && layer_idx < cache->layers.size()) {
+        layer_state = &cache->layers[layer_idx];
+    }
+    const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
+    const std::optional<array> conv_bias_row = (conv_b != nullptr)
+        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, input_arr.dtype(), 0))
+        : std::nullopt;
+    const std::optional<array> dt_bias_row = (dt_b != nullptr)
+        ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
+        : std::nullopt;
+    const std::optional<array> norm_weight_arr = (norm_w != nullptr)
+        ? std::optional<array>(*norm_w)
+        : std::nullopt;
+    const auto static_terms = resolve_gated_delta_static_terms(
+        a_log,
+        norm_weight,
+        a_log_arr,
+        norm_weight_arr,
+        n_heads_i,
+        d_head_i
+    );
+
+    array conv_state(0.0f, input_arr.dtype());
+    if (layer_state != nullptr) {
+        const bool need_init =
+            layer_state->conv_state == nullptr ||
+            layer_state->conv_state->shape(1) != d_conv_i ||
+            layer_state->conv_state->shape(2) != qkv_len ||
+            layer_state->conv_state->dtype() != input_arr.dtype();
+        if (need_init) {
+            delete layer_state->conv_state;
+            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, input_arr.dtype()));
+        }
+        conv_state = *layer_state->conv_state;
+    } else {
+        conv_state = zeros({1, d_conv_i, qkv_len}, input_arr.dtype());
+    }
+
+    array ssm_state(0.0f, float32);
+    if (layer_state != nullptr) {
+        const bool need_init =
+            layer_state->ssm_state == nullptr ||
+            layer_state->ssm_state->shape(1) != n_heads_i ||
+            layer_state->ssm_state->shape(2) != d_head_i ||
+            layer_state->ssm_state->shape(3) != d_head_i;
+        if (need_init) {
+            delete layer_state->ssm_state;
+            layer_state->ssm_state = new array(zeros({1, n_heads_i, d_head_i, d_head_i}, float32));
+        }
+        ssm_state = *layer_state->ssm_state;
+    } else {
+        ssm_state = zeros({1, n_heads_i, d_head_i, d_head_i}, float32);
+    }
+
+    const array in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
+    const array out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+    StateSpaceCallable in_proj_fn{
+        .fn = state_space_apply_matmul_rhs,
+        .ctx = &in_proj_rhs,
+    };
+    StateSpaceCallable out_proj_fn{
+        .fn = state_space_apply_matmul_rhs,
+        .ctx = &out_proj_rhs,
+    };
+    const array out = gated_delta_mixer_forward_core(
+        input_arr,
+        in_proj_fn,
+        conv_kernel_broadcast,
+        conv_bias_row,
+        static_terms.a_log_exp_row,
+        dt_bias_row,
+        static_terms.norm_weight_heads,
+        out_proj_fn,
+        d_conv_i,
+        n_heads_i,
+        d_head_i,
+        conv_state,
+        ssm_state
+    );
+
+    if (layer_state != nullptr) {
+        *layer_state->conv_state = conv_state;
+        *layer_state->ssm_state = ssm_state;
+    }
+    return pool_array(out);
+}
+
+void* mlx_lazy_gated_delta_mixer_quantized(
+    const void* input,
+    const void* in_w,
+    const void* in_s,
+    const void* in_b,
+    const void* conv_weight,
+    const void* conv_bias,
+    const void* a_log,
+    const void* dt_bias,
+    const void* norm_weight,
+    const void* out_w,
+    const void* out_s,
+    const void* out_b,
+    size_t group_size,
+    size_t bits,
+    void* gated_delta_cache_ptr,
+    size_t layer_idx,
+    size_t d_conv,
+    size_t n_heads,
+    size_t d_head
+) {
+    mlx_count_op();
+    const auto& input_arr = *static_cast<const array*>(input);
+    const auto& in_proj_w = *static_cast<const array*>(in_w);
+    const auto& in_proj_s = *static_cast<const array*>(in_s);
+    const auto& in_proj_b = *static_cast<const array*>(in_b);
+    const auto& conv_w = *static_cast<const array*>(conv_weight);
+    const auto* conv_b = static_cast<const array*>(conv_bias);
+    const auto a_log_arr = cast_tensor_cached(a_log, *static_cast<const array*>(a_log), float32);
+    const auto* dt_b = static_cast<const array*>(dt_bias);
+    const auto* norm_w = static_cast<const array*>(norm_weight);
+    const auto& out_proj_w = *static_cast<const array*>(out_w);
+    const auto& out_proj_s = *static_cast<const array*>(out_s);
+    const auto& out_proj_b = *static_cast<const array*>(out_b);
+
+    const int d_conv_i = static_cast<int>(d_conv);
+    const int n_heads_i = static_cast<int>(n_heads);
+    const int d_head_i = static_cast<int>(d_head);
+    const int d_inner = n_heads_i * d_head_i;
+    const int qkv_len = d_inner * 3;
+    const int group_size_i = static_cast<int>(group_size);
+    const int bits_i = static_cast<int>(bits);
+
+    auto* cache = static_cast<MLXStateSpaceCache*>(gated_delta_cache_ptr);
+    StateSpaceLayer* layer_state = nullptr;
+    if (cache != nullptr && layer_idx < cache->layers.size()) {
+        layer_state = &cache->layers[layer_idx];
+    }
+    const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
+    const std::optional<array> conv_bias_row = (conv_b != nullptr)
+        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, input_arr.dtype(), 0))
+        : std::nullopt;
+    const std::optional<array> dt_bias_row = (dt_b != nullptr)
+        ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
+        : std::nullopt;
+    const std::optional<array> norm_weight_arr = (norm_w != nullptr)
+        ? std::optional<array>(*norm_w)
+        : std::nullopt;
+    const auto static_terms = resolve_gated_delta_static_terms(
+        a_log,
+        norm_weight,
+        a_log_arr,
+        norm_weight_arr,
+        n_heads_i,
+        d_head_i
+    );
+
+    array conv_state(0.0f, input_arr.dtype());
+    if (layer_state != nullptr) {
+        const bool need_init =
+            layer_state->conv_state == nullptr ||
+            layer_state->conv_state->shape(1) != d_conv_i ||
+            layer_state->conv_state->shape(2) != qkv_len ||
+            layer_state->conv_state->dtype() != input_arr.dtype();
+        if (need_init) {
+            delete layer_state->conv_state;
+            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, input_arr.dtype()));
+        }
+        conv_state = *layer_state->conv_state;
+    } else {
+        conv_state = zeros({1, d_conv_i, qkv_len}, input_arr.dtype());
+    }
+
+    array ssm_state(0.0f, float32);
+    if (layer_state != nullptr) {
+        const bool need_init =
+            layer_state->ssm_state == nullptr ||
+            layer_state->ssm_state->shape(1) != n_heads_i ||
+            layer_state->ssm_state->shape(2) != d_head_i ||
+            layer_state->ssm_state->shape(3) != d_head_i;
+        if (need_init) {
+            delete layer_state->ssm_state;
+            layer_state->ssm_state = new array(zeros({1, n_heads_i, d_head_i, d_head_i}, float32));
+        }
+        ssm_state = *layer_state->ssm_state;
+    } else {
+        ssm_state = zeros({1, n_heads_i, d_head_i, d_head_i}, float32);
+    }
+
+    StateSpaceQuantLinearCtx in_proj_ctx{
+        .w = &in_proj_w,
+        .s = &in_proj_s,
+        .b = &in_proj_b,
+        .s_handle = in_s,
+        .b_handle = in_b,
+        .group_size = group_size_i,
+        .bits = bits_i,
+    };
+    StateSpaceQuantLinearCtx out_proj_ctx{
+        .w = &out_proj_w,
+        .s = &out_proj_s,
+        .b = &out_proj_b,
+        .s_handle = out_s,
+        .b_handle = out_b,
+        .group_size = group_size_i,
+        .bits = bits_i,
+    };
+    StateSpaceCallable in_proj_fn{
+        .fn = state_space_apply_quantized_linear,
+        .ctx = &in_proj_ctx,
+    };
+    StateSpaceCallable out_proj_fn{
+        .fn = state_space_apply_quantized_linear,
+        .ctx = &out_proj_ctx,
+    };
+    const array out = gated_delta_mixer_forward_core(
+        input_arr,
+        in_proj_fn,
+        conv_kernel_broadcast,
+        conv_bias_row,
+        static_terms.a_log_exp_row,
+        dt_bias_row,
+        static_terms.norm_weight_heads,
+        out_proj_fn,
+        d_conv_i,
+        n_heads_i,
+        d_head_i,
+        conv_state,
+        ssm_state
+    );
+
+    if (layer_state != nullptr) {
+        *layer_state->conv_state = conv_state;
+        *layer_state->ssm_state = ssm_state;
+    }
     return pool_array(out);
 }
 

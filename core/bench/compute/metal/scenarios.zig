@@ -20,6 +20,8 @@ pub const Scenario = enum {
     shortconv_decode_bf16,
     shortconv_decode_quantized_u4,
     state_space_decode_f16,
+    gated_delta_decode_f16,
+    gated_delta_decode_quantized_u4,
     matmul_throughput_f16,
     micro_matmul_f16,
     decode_synth_f16,
@@ -317,6 +319,31 @@ fn profileStateSpaceDecodeDims(profile: Profile) struct {
             .d_head = 64,
             .d_state = 16,
             .n_groups = 8,
+            .d_conv = 4,
+            .steps = 48,
+        },
+    };
+}
+
+fn profileGatedDeltaDecodeDims(profile: Profile) struct {
+    hidden: usize,
+    n_heads: usize,
+    d_head: usize,
+    d_conv: usize,
+    steps: usize,
+} {
+    return switch (profile) {
+        .ci => .{
+            .hidden = 512,
+            .n_heads = 8,
+            .d_head = 64,
+            .d_conv = 4,
+            .steps = 16,
+        },
+        .bw => .{
+            .hidden = 1024,
+            .n_heads = 16,
+            .d_head = 64,
             .d_conv = 4,
             .steps = 48,
         },
@@ -1440,6 +1467,227 @@ pub fn runStateSpaceDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Sce
         .flops_per_iter = toU64Saturating(flops_per_step * dims.steps),
         .bytes_per_iter = toU64Saturating(bytes_per_step * dims.steps),
         .note = "state-space decode method with recurrent conv+ssm state updates",
+    };
+}
+
+pub fn runGatedDeltaDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    try expectMetalReady();
+
+    const dims = profileGatedDeltaDecodeDims(cfg.profile);
+    if (dims.hidden != dims.n_heads * dims.d_head) return error.InvalidInput;
+
+    const d_inner = dims.n_heads * dims.d_head;
+    const qkv_len = 3 * d_inner;
+    const proj_dim = (4 * d_inner) + (2 * dims.n_heads);
+
+    const token_shape = [_]i64{ 1, 1, @intCast(dims.hidden) };
+    var x = try OwnedF16.initShape(allocator, &token_shape, 0xA301);
+    defer x.deinit(allocator);
+
+    var in_proj = try OwnedF16.init2D(allocator, dims.hidden, proj_dim, 0xA302);
+    defer in_proj.deinit(allocator);
+    var conv_w = try OwnedF16.init2D(allocator, dims.d_conv, qkv_len, 0xA303);
+    defer conv_w.deinit(allocator);
+    var conv_b = try OwnedF16.init1D(allocator, qkv_len, 0xA304);
+    defer conv_b.deinit(allocator);
+    var a_log = try OwnedF16.init1D(allocator, dims.n_heads, 0xA305);
+    defer a_log.deinit(allocator);
+    var dt_bias = try OwnedF16.init1D(allocator, dims.n_heads, 0xA306);
+    defer dt_bias.deinit(allocator);
+    var norm_weight = try OwnedF16.init1D(allocator, d_inner, 0xA307);
+    defer norm_weight.deinit(allocator);
+    var out_proj = try OwnedF16.init2D(allocator, d_inner, dims.hidden, 0xA308);
+    defer out_proj.deinit(allocator);
+
+    const cache = graph.mlx_state_space_cache_create(1);
+    defer graph.mlx_state_space_cache_free(cache);
+
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    const total_iters = cfg.warmup + cfg.iters;
+    var sample_idx: usize = 0;
+    var iter: usize = 0;
+    var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
+    graph.mlx_clear_memory_cache();
+    while (iter < total_iters) : (iter += 1) {
+        graph.mlx_state_space_cache_reset(cache);
+        graph.beginForwardGraphBuild();
+        const t0 = std.time.nanoTimestamp();
+        var out: graph.ArrayHandle = x.handle;
+        var step: usize = 0;
+        while (step < dims.steps) : (step += 1) {
+            out = graph.mlx_lazy_gated_delta_mixer_bf16(
+                out,
+                in_proj.handle,
+                conv_w.handle,
+                conv_b.handle,
+                a_log.handle,
+                dt_bias.handle,
+                norm_weight.handle,
+                out_proj.handle,
+                cache,
+                0,
+                dims.d_conv,
+                dims.n_heads,
+                dims.d_head,
+            );
+        }
+        const t1 = std.time.nanoTimestamp();
+        var handles = [_]graph.ArrayHandle{out};
+        const t2 = std.time.nanoTimestamp();
+        graph.eval(&handles);
+        const t3 = std.time.nanoTimestamp();
+
+        recordSample(&cold_first, samples, &sample_idx, iter, cfg.warmup, t0, t1, t2, t3);
+    }
+
+    const in_proj_flops = @as(u128, 2) * dims.hidden * proj_dim;
+    const out_proj_flops = @as(u128, 2) * d_inner * dims.hidden;
+    const conv_flops = @as(u128, 2) * dims.d_conv * qkv_len + @as(u128, 3) * qkv_len;
+    const recurrent_state_elems = @as(u128, dims.n_heads) * dims.d_head * dims.d_head;
+    const recurrent_flops = @as(u128, 12) * recurrent_state_elems + @as(u128, 8) * dims.n_heads * dims.d_head;
+    const flops_per_step = in_proj_flops + out_proj_flops + conv_flops + recurrent_flops;
+
+    const in_proj_bytes = @as(u128, dims.hidden) * proj_dim * 2;
+    const out_proj_bytes = @as(u128, d_inner) * dims.hidden * 2;
+    const conv_bytes = (@as(u128, dims.d_conv) * qkv_len + qkv_len) * 2;
+    const vec_bytes = (@as(u128, 2) * dims.n_heads + d_inner) * 2;
+    const conv_state_bytes = (@as(u128, 2) * dims.d_conv * qkv_len) * 4;
+    const recurrent_state_bytes = (@as(u128, 2) * dims.n_heads * dims.d_head * dims.d_head) * 4;
+    const bytes_per_step = in_proj_bytes + out_proj_bytes + conv_bytes + vec_bytes + conv_state_bytes + recurrent_state_bytes;
+
+    return .{
+        .name = "p1_gdm",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_first = cold_first,
+        .flops_per_iter = toU64Saturating(flops_per_step * dims.steps),
+        .bytes_per_iter = toU64Saturating(bytes_per_step * dims.steps),
+        .note = "gated-delta decode method with recurrent conv+delta state updates",
+    };
+}
+
+pub fn runGatedDeltaDecodeQuantizedU4(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    try expectMetalReady();
+
+    const dims = profileGatedDeltaDecodeDims(cfg.profile);
+    const bits: usize = 4;
+    const group_size: usize = 64;
+    if (dims.hidden != dims.n_heads * dims.d_head) return error.InvalidInput;
+    if (dims.hidden % group_size != 0) return error.InvalidInput;
+    if (dims.hidden % 8 != 0) return error.InvalidInput;
+
+    const d_inner = dims.n_heads * dims.d_head;
+    const qkv_len = 3 * d_inner;
+    const proj_dim = (4 * d_inner) + (2 * dims.n_heads);
+
+    const token_shape = [_]i64{ 1, 1, @intCast(dims.hidden) };
+    const qkv_shape = [_]i64{@intCast(qkv_len)};
+    const head_shape = [_]i64{@intCast(dims.n_heads)};
+    const inner_shape = [_]i64{@intCast(d_inner)};
+    var x = try OwnedBF16.initShape(allocator, &token_shape, 0xA311);
+    defer x.deinit(allocator);
+
+    const in_packed_k = dims.hidden * bits / 32;
+    var in_w = try OwnedU32.init2D(allocator, proj_dim, in_packed_k, 0xA312);
+    defer in_w.deinit(allocator);
+    var in_s = try OwnedBF16.init2D(allocator, proj_dim, dims.hidden / group_size, 0xA313);
+    defer in_s.deinit(allocator);
+    var in_b = try OwnedBF16.init2D(allocator, proj_dim, dims.hidden / group_size, 0xA314);
+    defer in_b.deinit(allocator);
+
+    var conv_w = try OwnedBF16.init2D(allocator, dims.d_conv, qkv_len, 0xA315);
+    defer conv_w.deinit(allocator);
+    var conv_b = try OwnedBF16.initShape(allocator, &qkv_shape, 0xA316);
+    defer conv_b.deinit(allocator);
+    var a_log = try OwnedBF16.initShape(allocator, &head_shape, 0xA317);
+    defer a_log.deinit(allocator);
+    var dt_bias = try OwnedBF16.initShape(allocator, &head_shape, 0xA318);
+    defer dt_bias.deinit(allocator);
+    var norm_weight = try OwnedBF16.initShape(allocator, &inner_shape, 0xA319);
+    defer norm_weight.deinit(allocator);
+
+    const out_packed_k = d_inner * bits / 32;
+    var out_w = try OwnedU32.init2D(allocator, dims.hidden, out_packed_k, 0xA31A);
+    defer out_w.deinit(allocator);
+    var out_s = try OwnedBF16.init2D(allocator, dims.hidden, d_inner / group_size, 0xA31B);
+    defer out_s.deinit(allocator);
+    var out_b = try OwnedBF16.init2D(allocator, dims.hidden, d_inner / group_size, 0xA31C);
+    defer out_b.deinit(allocator);
+
+    const cache = graph.mlx_state_space_cache_create(1);
+    defer graph.mlx_state_space_cache_free(cache);
+
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    const total_iters = cfg.warmup + cfg.iters;
+    var sample_idx: usize = 0;
+    var iter: usize = 0;
+    var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
+    graph.mlx_clear_memory_cache();
+    while (iter < total_iters) : (iter += 1) {
+        graph.mlx_state_space_cache_reset(cache);
+        graph.beginForwardGraphBuild();
+        const t0 = std.time.nanoTimestamp();
+        var out: graph.ArrayHandle = x.handle;
+        var step: usize = 0;
+        while (step < dims.steps) : (step += 1) {
+            out = graph.mlx_lazy_gated_delta_mixer_quantized(
+                out,
+                in_w.handle,
+                in_s.handle,
+                in_b.handle,
+                conv_w.handle,
+                conv_b.handle,
+                a_log.handle,
+                dt_bias.handle,
+                norm_weight.handle,
+                out_w.handle,
+                out_s.handle,
+                out_b.handle,
+                group_size,
+                bits,
+                cache,
+                0,
+                dims.d_conv,
+                dims.n_heads,
+                dims.d_head,
+            );
+        }
+        const t1 = std.time.nanoTimestamp();
+        var handles = [_]graph.ArrayHandle{out};
+        const t2 = std.time.nanoTimestamp();
+        graph.eval(&handles);
+        const t3 = std.time.nanoTimestamp();
+
+        recordSample(&cold_first, samples, &sample_idx, iter, cfg.warmup, t0, t1, t2, t3);
+    }
+
+    const in_proj_flops = @as(u128, 2) * dims.hidden * proj_dim;
+    const out_proj_flops = @as(u128, 2) * d_inner * dims.hidden;
+    const conv_flops = @as(u128, 2) * dims.d_conv * qkv_len + @as(u128, 3) * qkv_len;
+    const recurrent_state_elems = @as(u128, dims.n_heads) * dims.d_head * dims.d_head;
+    const recurrent_flops = @as(u128, 12) * recurrent_state_elems + @as(u128, 8) * dims.n_heads * dims.d_head;
+    const flops_per_step = in_proj_flops + out_proj_flops + conv_flops + recurrent_flops;
+
+    const in_weight_bytes = @as(u128, proj_dim) * dims.hidden * bits / 8;
+    const in_scale_bias_bytes = @as(u128, proj_dim) * (dims.hidden / group_size) * 2 * 2;
+    const out_weight_bytes = @as(u128, dims.hidden) * d_inner * bits / 8;
+    const out_scale_bias_bytes = @as(u128, dims.hidden) * (d_inner / group_size) * 2 * 2;
+    const conv_bytes = (@as(u128, dims.d_conv) * qkv_len + qkv_len + @as(u128, 2) * dims.n_heads + d_inner) * 2;
+    const state_bytes = (@as(u128, 2) * dims.d_conv * qkv_len + @as(u128, 2) * dims.n_heads * dims.d_head * dims.d_head) * 4;
+    const bytes_per_step = in_weight_bytes + in_scale_bias_bytes + out_weight_bytes + out_scale_bias_bytes + conv_bytes + state_bytes;
+
+    return .{
+        .name = "p1_gdmq_u4",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_first = cold_first,
+        .flops_per_iter = toU64Saturating(flops_per_step * dims.steps),
+        .bytes_per_iter = toU64Saturating(bytes_per_step * dims.steps),
+        .note = "quantized gated-delta decode method with recurrent conv+delta state updates (u4)",
     };
 }
 

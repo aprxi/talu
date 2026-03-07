@@ -296,7 +296,22 @@ fn layerProgramWeightBindingKeyFor(
             .mamba_down_proj
         else
             error.InvalidWeightBindingName,
-        .gated_delta_net => error.UnsupportedModel,
+        .gated_delta_net => if (std.mem.eql(u8, slot_name, "in_proj"))
+            .gated_delta_in_proj
+        else if (std.mem.eql(u8, slot_name, "conv_weight"))
+            .gated_delta_conv_weight
+        else if (std.mem.eql(u8, slot_name, "a_log"))
+            .gated_delta_a_log
+        else if (std.mem.eql(u8, slot_name, "out_proj"))
+            .gated_delta_out_proj
+        else if (std.mem.eql(u8, slot_name, "conv_bias"))
+            .gated_delta_conv_bias
+        else if (std.mem.eql(u8, slot_name, "dt_bias"))
+            .gated_delta_dt_bias
+        else if (std.mem.eql(u8, slot_name, "norm_weight"))
+            .gated_delta_norm_weight
+        else
+            error.InvalidWeightBindingName,
         .shortconv => if (std.mem.eql(u8, slot_name, "in_proj"))
             .shortconv_in_proj
         else if (std.mem.eql(u8, slot_name, "conv_weight"))
@@ -471,6 +486,23 @@ fn layerProgramStaticWeightPtr(
             @ptrCast(weight)
         else
             null,
+        .gated_delta_in_proj => if (layer.gated_delta_in_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.gated_delta_in_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .gated_delta_conv_weight => if (layer.gated_delta_conv_weight) |*weight| @ptrCast(weight) else null,
+        .gated_delta_a_log => if (layer.gated_delta_a_log) |*weight| @ptrCast(weight) else null,
+        .gated_delta_out_proj => if (layer.gated_delta_out_proj) |*weight|
+            @ptrCast(weight)
+        else if (layer.gated_delta_out_proj_bf16) |*weight|
+            @ptrCast(weight)
+        else
+            null,
+        .gated_delta_conv_bias => if (layer.gated_delta_conv_bias) |*weight| @ptrCast(weight) else null,
+        .gated_delta_dt_bias => if (layer.gated_delta_dt_bias) |*weight| @ptrCast(weight) else null,
+        .gated_delta_norm_weight => if (layer.gated_delta_norm_weight) |*weight| @ptrCast(weight) else null,
         .shortconv_in_proj => if (layer.shortconv_in_proj) |*weight|
             @ptrCast(weight)
         else if (layer.shortconv_in_proj_bf16) |*weight|
@@ -575,6 +607,9 @@ fn layerProgramWeightPtrForKey(
         .mamba_norm_weight,
         .mamba_gate_up,
         .mamba_down_proj,
+        .gated_delta_conv_bias,
+        .gated_delta_dt_bias,
+        .gated_delta_norm_weight,
         .shortconv_conv_bias,
         => missingOptionalWeightPtrInternal(),
         else => error.MissingWeight,
@@ -1097,8 +1132,78 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     } else return error.InvalidTensorType;
                 }
             },
-            .gated_delta => {
-                return error.UnsupportedModel;
+            .gated_delta => |gated_delta_block| {
+                weight_handles.layers[layer_idx].kind = .gated_delta;
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .gated_delta);
+
+                var ln1_arr = try loadNormWeight(gated_delta_block.ln1_weight);
+                if (weight_handles.has_norm_weight_offset) {
+                    ln1_arr = mlx_graph.mlx_add_one(ln1_arr);
+                }
+                weight_handles.layers[layer_idx].ln1_weight = ln1_arr;
+
+                const ln2_tensor = gated_delta_block.ln2_weight orelse gated_delta_block.ln1_weight;
+                var ln2_arr = try loadNormWeight(ln2_tensor);
+                if (weight_handles.has_norm_weight_offset) {
+                    ln2_arr = mlx_graph.mlx_add_one(ln2_arr);
+                }
+                weight_handles.layers[layer_idx].ln2_weight = ln2_arr;
+
+                weight_handles.layers[layer_idx].gated_delta_d_conv = @intCast(gated_delta_block.config.d_conv);
+                weight_handles.layers[layer_idx].gated_delta_n_heads = @intCast(gated_delta_block.config.n_heads);
+                weight_handles.layers[layer_idx].gated_delta_d_head = @intCast(gated_delta_block.config.d_head);
+
+                weight_handles.layers[layer_idx].gated_delta_conv_weight = try tensorToArray(gated_delta_block.weights.conv1d_weight);
+                weight_handles.layers[layer_idx].gated_delta_a_log = try tensorToArray(gated_delta_block.weights.A_log);
+                if (gated_delta_block.weights.conv1d_bias) |bias| {
+                    weight_handles.layers[layer_idx].gated_delta_conv_bias = try tensorToArray(bias);
+                }
+                if (gated_delta_block.weights.dt_bias) |bias| {
+                    weight_handles.layers[layer_idx].gated_delta_dt_bias = try tensorToArray(bias);
+                }
+                if (gated_delta_block.weights.norm_weight) |norm_w| {
+                    weight_handles.layers[layer_idx].gated_delta_norm_weight = try loadNormWeight(norm_w);
+                }
+
+                const core_quantized = isGroupedAffineDType(gated_delta_block.weights.in_proj.dtype) and
+                    isGroupedAffineDType(gated_delta_block.weights.out_proj.dtype);
+                const core_dense = isDenseNumericDType(gated_delta_block.weights.in_proj.dtype) and
+                    isDenseNumericDType(gated_delta_block.weights.out_proj.dtype);
+                if (core_quantized == core_dense) return error.InvalidTensorType;
+                weight_handles.layers[layer_idx].is_quantized = core_quantized;
+                if (core_quantized) {
+                    const quant_bits = try quantBitsFor(gated_delta_block.weights.in_proj.dtype);
+                    if (try quantBitsFor(gated_delta_block.weights.out_proj.dtype) != quant_bits) return error.InvalidTensorType;
+                    weight_handles.layers[layer_idx].gated_delta_in_proj = try loadQuantizedWeight(gated_delta_block.weights.in_proj, quant_bits);
+                    weight_handles.layers[layer_idx].gated_delta_out_proj = try loadQuantizedWeight(gated_delta_block.weights.out_proj, quant_bits);
+                } else {
+                    weight_handles.layers[layer_idx].gated_delta_in_proj_bf16 = try tensorToArray(gated_delta_block.weights.in_proj);
+                    weight_handles.layers[layer_idx].gated_delta_out_proj_bf16 = try tensorToArray(gated_delta_block.weights.out_proj);
+                }
+
+                if (gated_delta_block.w1) |w1| {
+                    if (isGroupedAffineDType(w1.dtype)) {
+                        weight_handles.layers[layer_idx].w1 = try loadQuantizedWeight(w1, try quantBitsFor(w1.dtype));
+                    } else {
+                        weight_handles.layers[layer_idx].w1_bf16 = try tensorToArray(w1);
+                    }
+                }
+                if (gated_delta_block.w2) |w2| {
+                    if (isGroupedAffineDType(w2.dtype)) {
+                        weight_handles.layers[layer_idx].w2 = try loadQuantizedWeight(w2, try quantBitsFor(w2.dtype));
+                    } else {
+                        weight_handles.layers[layer_idx].w2_bf16 = try tensorToArray(w2);
+                    }
+                }
+                if (gated_delta_block.w3) |w3| {
+                    if (isGroupedAffineDType(w3.dtype)) {
+                        weight_handles.layers[layer_idx].w3 = try loadQuantizedWeight(w3, try quantBitsFor(w3.dtype));
+                    } else {
+                        weight_handles.layers[layer_idx].w3_bf16 = try tensorToArray(w3);
+                    }
+                }
+
+                weight_handles.layers[layer_idx].moe = null;
             },
             .shortconv => |shortconv_block| {
                 weight_handles.layers[layer_idx].kind = .shortconv;
@@ -1529,6 +1634,17 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
         if (layer.mamba_d_skip) |h| mlx_graph.freeArray(h);
         if (layer.mamba_dt_bias) |h| mlx_graph.freeArray(h);
         if (layer.mamba_norm_weight) |h| mlx_graph.freeArray(h);
+
+        // Gated-delta fields
+        if (layer.gated_delta_in_proj) |quantized_weight| freeQuantizedWeight(quantized_weight);
+        if (layer.gated_delta_out_proj) |quantized_weight| freeQuantizedWeight(quantized_weight);
+        if (layer.gated_delta_in_proj_bf16) |h| mlx_graph.freeArray(h);
+        if (layer.gated_delta_out_proj_bf16) |h| mlx_graph.freeArray(h);
+        if (layer.gated_delta_conv_weight) |h| mlx_graph.freeArray(h);
+        if (layer.gated_delta_conv_bias) |h| mlx_graph.freeArray(h);
+        if (layer.gated_delta_a_log) |h| mlx_graph.freeArray(h);
+        if (layer.gated_delta_dt_bias) |h| mlx_graph.freeArray(h);
+        if (layer.gated_delta_norm_weight) |h| mlx_graph.freeArray(h);
     }
     allocator.free(weight_handles.layers);
 
@@ -1726,6 +1842,13 @@ pub const WeightHandles = struct {
         mamba_ln2_weight,
         mamba_gate_up,
         mamba_down_proj,
+        gated_delta_in_proj,
+        gated_delta_conv_weight,
+        gated_delta_a_log,
+        gated_delta_out_proj,
+        gated_delta_conv_bias,
+        gated_delta_dt_bias,
+        gated_delta_norm_weight,
         shortconv_in_proj,
         shortconv_conv_weight,
         shortconv_out_proj,
@@ -1762,6 +1885,12 @@ pub const WeightHandles = struct {
             invalid,
         };
         pub const MambaStorageKind = enum {
+            quantized,
+            dense,
+            missing,
+            invalid,
+        };
+        pub const GatedDeltaStorageKind = enum {
             quantized,
             dense,
             missing,
@@ -1873,6 +2002,20 @@ pub const WeightHandles = struct {
             concat = 0,
             interleaved = 1,
         } = .concat,
+
+        // Gated-delta weights/config (used when kind == .gated_delta)
+        gated_delta_d_conv: usize = 0,
+        gated_delta_n_heads: usize = 0,
+        gated_delta_d_head: usize = 0,
+        gated_delta_in_proj: ?QuantizedWeight = null,
+        gated_delta_out_proj: ?QuantizedWeight = null,
+        gated_delta_in_proj_bf16: ?ArrayHandle = null,
+        gated_delta_out_proj_bf16: ?ArrayHandle = null,
+        gated_delta_conv_weight: ?ArrayHandle = null,
+        gated_delta_conv_bias: ?ArrayHandle = null,
+        gated_delta_a_log: ?ArrayHandle = null,
+        gated_delta_dt_bias: ?ArrayHandle = null,
+        gated_delta_norm_weight: ?ArrayHandle = null,
 
         pub fn getLn1(self: *const LayerWeights) ArrayHandle {
             return self.ln1_weight;
@@ -2045,6 +2188,37 @@ pub const WeightHandles = struct {
                 return .dense;
             }
 
+            return .invalid;
+        }
+
+        pub fn gatedDeltaStorageKind(self: *const LayerWeights) GatedDeltaStorageKind {
+            const has_required_state = self.gated_delta_conv_weight != null and
+                self.gated_delta_a_log != null;
+            const has_any_gated_delta_field = self.gated_delta_in_proj != null or
+                self.gated_delta_out_proj != null or
+                self.gated_delta_in_proj_bf16 != null or
+                self.gated_delta_out_proj_bf16 != null or
+                self.gated_delta_conv_weight != null or
+                self.gated_delta_conv_bias != null or
+                self.gated_delta_a_log != null or
+                self.gated_delta_dt_bias != null or
+                self.gated_delta_norm_weight != null;
+
+            if (!has_required_state) {
+                return if (has_any_gated_delta_field) .invalid else .missing;
+            }
+
+            const quantized_core_complete = self.gated_delta_in_proj != null and
+                self.gated_delta_out_proj != null and
+                self.gated_delta_in_proj_bf16 == null and
+                self.gated_delta_out_proj_bf16 == null;
+            const dense_core_complete = self.gated_delta_in_proj == null and
+                self.gated_delta_out_proj == null and
+                self.gated_delta_in_proj_bf16 != null and
+                self.gated_delta_out_proj_bf16 != null;
+            if (quantized_core_complete and dense_core_complete) return .invalid;
+            if (quantized_core_complete) return .quantized;
+            if (dense_core_complete) return .dense;
             return .invalid;
         }
 
@@ -2233,6 +2407,37 @@ test "LayerWeights storage helpers classify MLA dense path" {
     };
     try testing.expect(layer.isMLA());
     try testing.expectEqual(WeightHandles.LayerWeights.MLAStorageKind.dense, layer.mlaStorageKind());
+}
+
+test "LayerWeights storage helpers classify gated-delta quantized and dense paths" {
+    const quantized = WeightHandles.LayerWeights{
+        .ln1_weight = testHandle(1),
+        .ln2_weight = testHandle(2),
+        .gated_delta_in_proj = testQuantizedWeight(10, 64, 4),
+        .gated_delta_out_proj = testQuantizedWeight(20, 64, 4),
+        .gated_delta_conv_weight = testHandle(30),
+        .gated_delta_a_log = testHandle(31),
+        .gated_delta_dt_bias = testHandle(32),
+        .gated_delta_norm_weight = testHandle(33),
+    };
+    try testing.expectEqual(
+        WeightHandles.LayerWeights.GatedDeltaStorageKind.quantized,
+        quantized.gatedDeltaStorageKind(),
+    );
+
+    const dense = WeightHandles.LayerWeights{
+        .ln1_weight = testHandle(40),
+        .ln2_weight = testHandle(41),
+        .gated_delta_in_proj_bf16 = testHandle(42),
+        .gated_delta_out_proj_bf16 = testHandle(43),
+        .gated_delta_conv_weight = testHandle(44),
+        .gated_delta_conv_bias = testHandle(45),
+        .gated_delta_a_log = testHandle(46),
+    };
+    try testing.expectEqual(
+        WeightHandles.LayerWeights.GatedDeltaStorageKind.dense,
+        dense.gatedDeltaStorageKind(),
+    );
 }
 
 /// Helper to create a minimal test LoadedModel with BF16 weights (non-quantized path).
@@ -2718,4 +2923,67 @@ test "buildLayerProgramWeightBindingKeys resolves rmsnorm weight and bias slots"
     try testing.expectEqual(@as(usize, 2), keys.len);
     try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.norm_weight, keys[0]);
     try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.norm_bias, keys[1]);
+}
+
+test "buildLayerProgramWeightBindingKeys resolves gated-delta slots to keys" {
+    const inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+    const outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const weight_refs = [_]runtime_contract.WeightRef{
+        .{ .index = 0 },
+        .{ .index = 1 },
+        .{ .index = 2 },
+        .{ .index = 3 },
+        .{ .index = 4 },
+        .{ .index = 5 },
+        .{ .index = 6 },
+    };
+    const instructions = [_]runtime_contract.Instruction{
+        .{
+            .opcode = .gated_delta_net,
+            .inputs = inputs[0..],
+            .outputs = outputs[0..],
+            .weights = weight_refs[0..],
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+    };
+    const kill0 = [_]u64{0b0011};
+    const compiled = runtime_contract.CompiledPlan{
+        .plan = .{
+            .instructions = instructions[0..],
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .weight_bindings = &.{
+            .{ .index = 0, .name = "__kernel_weight::1::in_proj::0" },
+            .{ .index = 1, .name = "__kernel_weight::1::conv_weight::0" },
+            .{ .index = 2, .name = "__kernel_weight::1::a_log::0" },
+            .{ .index = 3, .name = "__kernel_weight::1::out_proj::0" },
+            .{ .index = 4, .name = "__kernel_weight::1::conv_bias::0" },
+            .{ .index = 5, .name = "__kernel_weight::1::dt_bias::0" },
+            .{ .index = 6, .name = "__kernel_weight::1::norm_weight::0" },
+        },
+        .register_buffer_specs = &.{
+            .{ .size = 1, .@"align" = 4 },
+            .{ .size = 1, .@"align" = 4 },
+        },
+        .liveness = .{
+            .register_last_read = &.{ 0, 0 },
+            .kill_after_instruction = &.{kill0[0..]},
+        },
+        .peak_registers = 1,
+        .diagnostics = &.{},
+    };
+
+    const keys = try buildLayerProgramWeightBindingKeys(testing.allocator, &compiled);
+    defer if (keys.len > 0) testing.allocator.free(keys);
+    try testing.expectEqual(@as(usize, 7), keys.len);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.gated_delta_in_proj, keys[0]);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.gated_delta_conv_weight, keys[1]);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.gated_delta_a_log, keys[2]);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.gated_delta_out_proj, keys[3]);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.gated_delta_conv_bias, keys[4]);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.gated_delta_dt_bias, keys[5]);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.gated_delta_norm_weight, keys[6]);
 }

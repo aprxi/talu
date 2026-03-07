@@ -11,6 +11,7 @@ pub const ArrayHandle = mlx_graph.ArrayHandle;
 pub const CacheHandle = ?*anyopaque;
 pub const ShortConvCacheHandle = ?*anyopaque;
 pub const MambaCacheHandle = ?*anyopaque;
+pub const GatedDeltaCacheHandle = ?*anyopaque;
 
 extern fn mlx_cache_create(n_layers: usize, max_seq_len: usize) CacheHandle;
 extern fn mlx_cache_create_bfloat16(n_layers: usize, max_seq_len: usize) CacheHandle;
@@ -198,6 +199,28 @@ pub const MambaCache = struct {
     }
 
     pub fn deinit(self: MambaCache) void {
+        if (self.handle == null) return;
+        mlx_state_space_cache_free(self.handle);
+    }
+};
+
+pub const GatedDeltaCache = struct {
+    handle: GatedDeltaCacheHandle,
+
+    pub fn init(n_layers: usize) GatedDeltaCache {
+        return .{ .handle = mlx_state_space_cache_create(n_layers) };
+    }
+
+    pub fn disabled() GatedDeltaCache {
+        return .{ .handle = null };
+    }
+
+    pub fn reset(self: GatedDeltaCache) void {
+        if (self.handle == null) return;
+        mlx_state_space_cache_reset(self.handle);
+    }
+
+    pub fn deinit(self: GatedDeltaCache) void {
         if (self.handle == null) return;
         mlx_state_space_cache_free(self.handle);
     }

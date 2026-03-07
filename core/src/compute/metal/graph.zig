@@ -477,6 +477,46 @@ pub extern fn mlx_lazy_state_space_block_bf16(
     gate_up_layout: u8,
 ) ArrayHandle;
 
+/// Gated-delta mixer (dense/bfloat16 path)
+pub extern fn mlx_lazy_gated_delta_mixer_bf16(
+    input: ArrayHandle,
+    in_proj: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    a_log: ArrayHandle,
+    dt_bias: ArrayHandle,
+    norm_weight: ArrayHandle,
+    out_proj: ArrayHandle,
+    state_space_cache: StateSpaceCacheHandle,
+    layer_idx: usize,
+    d_conv: usize,
+    n_heads: usize,
+    d_head: usize,
+) ArrayHandle;
+
+/// Gated-delta mixer (quantized grouped-affine path)
+pub extern fn mlx_lazy_gated_delta_mixer_quantized(
+    input: ArrayHandle,
+    in_w: ArrayHandle,
+    in_s: ArrayHandle,
+    in_b: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    a_log: ArrayHandle,
+    dt_bias: ArrayHandle,
+    norm_weight: ArrayHandle,
+    out_w: ArrayHandle,
+    out_s: ArrayHandle,
+    out_b: ArrayHandle,
+    group_size: usize,
+    bits: usize,
+    state_space_cache: StateSpaceCacheHandle,
+    layer_idx: usize,
+    d_conv: usize,
+    n_heads: usize,
+    d_head: usize,
+) ArrayHandle;
+
 /// State-space recurrent state cache lifecycle
 pub extern fn mlx_state_space_cache_create(n_layers: usize) StateSpaceCacheHandle;
 pub extern fn mlx_state_space_cache_reset(cache: StateSpaceCacheHandle) void;
@@ -1006,6 +1046,115 @@ test "mlx_lazy_state_space_block_bf16 prefill matches token-by-token path" {
             d_head,
             n_groups,
             0,
+        );
+
+        var step_eval_handles = [_]ArrayHandle{step_out};
+        eval(&step_eval_handles);
+        var step_scalar: [1]f32 = undefined;
+        copyToHost(step_out, &step_scalar);
+        step_host[i] = step_scalar[0];
+
+        freeArray(step_out);
+        freeArray(input_tok);
+    }
+
+    for (prefill_host, step_host) |prefill_value, step_value| {
+        try std.testing.expectApproxEqAbs(prefill_value, step_value, 1.0e-3);
+    }
+}
+
+test "mlx_lazy_gated_delta_mixer_bf16 prefill matches token-by-token path" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const seq_len: usize = 4;
+    const d_conv: usize = 2;
+    const n_heads: usize = 1;
+    const d_head: usize = 1;
+
+    const in_proj_data = [_]f32{ 0.45, -0.35, 0.30, 0.20, -0.15, 0.10 }; // [d_model=1, proj=6]
+    const conv_weight_data = [_]f32{
+        0.12, -0.08, 0.05,
+        0.07, 0.09,  -0.04,
+    }; // [d_conv=2, qkv_len=3]
+    const conv_bias_data = [_]f32{ 0.01, -0.02, 0.03 };
+    const a_log_data = [_]f32{-0.9};
+    const dt_bias_data = [_]f32{-0.2};
+    const norm_weight_data = [_]f32{1.1};
+    const out_proj_data = [_]f32{0.8}; // [d_inner=1, d_model=1]
+    const input_seq_data = [_]f32{ 0.25, -0.10, 0.15, -0.05 }; // [1, L, 1]
+
+    const s1 = [_]i64{1};
+    const in_proj_shape = [_]i64{ 1, 6 };
+    const conv_weight_shape = [_]i64{ 2, 3 };
+    const s3 = [_]i64{3};
+    const out_proj_shape = [_]i64{ 1, 1 };
+    const input_seq_shape = [_]i64{ 1, @intCast(seq_len), 1 };
+    const input_tok_shape = [_]i64{ 1, 1, 1 };
+
+    const in_proj = createArrayF32(&in_proj_data, &in_proj_shape);
+    defer freeArray(in_proj);
+    const conv_weight = createArrayF32(&conv_weight_data, &conv_weight_shape);
+    defer freeArray(conv_weight);
+    const conv_bias = createArrayF32(&conv_bias_data, &s3);
+    defer freeArray(conv_bias);
+    const a_log = createArrayF32(&a_log_data, &s1);
+    defer freeArray(a_log);
+    const dt_bias = createArrayF32(&dt_bias_data, &s1);
+    defer freeArray(dt_bias);
+    const norm_weight = createArrayF32(&norm_weight_data, &s1);
+    defer freeArray(norm_weight);
+    const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
+    defer freeArray(out_proj);
+
+    const prefill_cache = mlx_state_space_cache_create(1);
+    defer mlx_state_space_cache_free(prefill_cache);
+    const step_cache = mlx_state_space_cache_create(1);
+    defer mlx_state_space_cache_free(step_cache);
+
+    const input_seq = createArrayF32(&input_seq_data, &input_seq_shape);
+    defer freeArray(input_seq);
+    const prefill_out = mlx_lazy_gated_delta_mixer_bf16(
+        input_seq,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        dt_bias,
+        norm_weight,
+        out_proj,
+        prefill_cache,
+        0,
+        d_conv,
+        n_heads,
+        d_head,
+    );
+    defer freeArray(prefill_out);
+
+    var prefill_eval_handles = [_]ArrayHandle{prefill_out};
+    eval(&prefill_eval_handles);
+
+    var prefill_host: [seq_len]f32 = undefined;
+    copyToHost(prefill_out, &prefill_host);
+
+    var step_host: [seq_len]f32 = undefined;
+    for (input_seq_data, 0..) |tok, i| {
+        const token_data = [_]f32{tok};
+        const input_tok = createArrayF32(&token_data, &input_tok_shape);
+        const step_out = mlx_lazy_gated_delta_mixer_bf16(
+            input_tok,
+            in_proj,
+            conv_weight,
+            conv_bias,
+            a_log,
+            dt_bias,
+            norm_weight,
+            out_proj,
+            step_cache,
+            0,
+            d_conv,
+            n_heads,
+            d_head,
         );
 
         var step_eval_handles = [_]ArrayHandle{step_out};

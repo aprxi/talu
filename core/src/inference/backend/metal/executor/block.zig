@@ -15,6 +15,7 @@ const runtime_graph = @import("../runtime_graph.zig");
 const weights_mod = @import("weights.zig");
 const attention_kernel = @import("../kernels/attention.zig");
 const ffn_kernel = @import("../kernels/ffn.zig");
+const gated_delta_kernel = @import("../kernels/gated_delta.zig");
 const mamba_kernel = @import("../kernels/mamba.zig");
 const mla_kernel = @import("../kernels/mla_attention.zig");
 const moe_kernel = @import("../kernels/moe.zig");
@@ -28,6 +29,7 @@ const enable_dispatch_observability: bool = false;
 var layer_program_dispatch_counters = runtime_contract.DispatchCounters{};
 
 pub const Cache = runtime_graph.Cache;
+pub const GatedDeltaCache = runtime_graph.GatedDeltaCache;
 pub const ShortConvCache = runtime_graph.ShortConvCache;
 pub const MambaCache = runtime_graph.MambaCache;
 const ModelConfig = tensor.ModelConfig;
@@ -52,11 +54,15 @@ pub const TransformerBlock = struct {
         use_gelu: bool,
         attention_multiplier: f32,
         attention_storage_kind: LayerWeights.AttentionStorageKind,
+        gated_delta_storage_kind: LayerWeights.GatedDeltaStorageKind,
         shortconv_storage_kind: LayerWeights.ShortConvStorageKind,
         ffn_storage_kind: LayerWeights.FfnStorageKind,
         mla_storage_kind: LayerWeights.MLAStorageKind,
         mamba_storage_kind: LayerWeights.MambaStorageKind,
         mla_config: ?WeightHandles.MLAConfig,
+        gated_delta_d_conv: usize,
+        gated_delta_n_heads: usize,
+        gated_delta_d_head: usize,
         shortconv_d_conv: usize,
         shortconv_conv_dim: usize,
         moe_router_group_size: usize,
@@ -153,6 +159,7 @@ pub const TransformerBlock = struct {
         .rmsnorm,
         .multihead_attention,
         .mla_attention,
+        .gated_delta_net,
         .shortconv,
         .swiglu,
         .moe,
@@ -165,6 +172,7 @@ pub const TransformerBlock = struct {
         table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = layerProgramNormRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = layerProgramAttentionRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.mla_attention)] = layerProgramAttentionRuntimeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.gated_delta_net)] = layerProgramGatedDeltaRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.shortconv)] = layerProgramShortConvRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.swiglu)] = layerProgramSwiGluRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.moe)] = layerProgramMoeRuntimeAdapter;
@@ -496,6 +504,30 @@ pub const TransformerBlock = struct {
         return shortconv_out;
     }
 
+    fn runGatedDeltaKernel(
+        input: mlx_graph.ArrayHandle,
+        gated_delta: gated_delta_kernel.GatedDeltaKernel,
+        layer_idx: usize,
+        gated_delta_cache: ?GatedDeltaCache,
+    ) !mlx_graph.ArrayHandle {
+        var kernel = gated_delta;
+        var gd_state = gated_delta_kernel.GatedDeltaState{
+            .cache = gated_delta_cache,
+            .layer_idx = layer_idx,
+        };
+        var gd_scratch = gated_delta_kernel.GatedDeltaScratch{};
+        var gd_matmul = gated_delta_kernel.MatmulScratch{};
+        var gd_out: mlx_graph.ArrayHandle = undefined;
+        try kernel.forward(
+            input,
+            &gd_out,
+            &gd_state,
+            &gd_scratch,
+            &gd_matmul,
+        );
+        return gd_out;
+    }
+
     fn runMambaKernel(
         input: mlx_graph.ArrayHandle,
         mamba: mamba_kernel.MambaKernel,
@@ -750,6 +782,58 @@ pub const TransformerBlock = struct {
         arraySlotFromHandle(io.outputs[0]).* = output;
     }
 
+    fn layerProgramGatedDeltaAdapter(
+        state: *LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        gated_delta_cache: ?GatedDeltaCache,
+    ) !void {
+        const io = try instructionIoSlices(insn, registers);
+        if (comptime std.debug.runtime_safety) {
+            if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        }
+        const weight_handles = try instructionWeightSlice(insn, registers);
+        if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
+        const input = arraySlotFromHandle(io.inputs[0]).*;
+        var gated_delta_binding = gated_delta_kernel.GatedDeltaKernel{
+            .d_conv = state.runtime_meta.gated_delta_d_conv,
+            .n_heads = state.runtime_meta.gated_delta_n_heads,
+            .d_head = state.runtime_meta.gated_delta_d_head,
+            .in_proj = null,
+            .in_proj_bf16 = null,
+            .conv_weight = null,
+            .conv_bias = null,
+            .a_log = null,
+            .dt_bias = null,
+            .norm_weight = null,
+            .out_proj = null,
+            .out_proj_bf16 = null,
+        };
+        switch (state.runtime_meta.gated_delta_storage_kind) {
+            .quantized => {
+                gated_delta_binding.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
+                gated_delta_binding.out_proj = quantizedWeightFromHandle(weight_handles[3]).*;
+            },
+            .dense => {
+                gated_delta_binding.in_proj_bf16 = arrayWeightFromHandle(weight_handles[0]).*;
+                gated_delta_binding.out_proj_bf16 = arrayWeightFromHandle(weight_handles[3]).*;
+            },
+            else => return error.InvalidTensorType,
+        }
+        gated_delta_binding.conv_weight = arrayWeightFromHandle(weight_handles[1]).*;
+        gated_delta_binding.a_log = arrayWeightFromHandle(weight_handles[2]).*;
+        gated_delta_binding.conv_bias = optionalArrayWeightFromHandle(weight_handles[4]);
+        gated_delta_binding.dt_bias = optionalArrayWeightFromHandle(weight_handles[5]);
+        gated_delta_binding.norm_weight = optionalArrayWeightFromHandle(weight_handles[6]);
+        const output = try runGatedDeltaKernel(
+            input,
+            gated_delta_binding,
+            state.layer_idx,
+            gated_delta_cache,
+        );
+        arraySlotFromHandle(io.outputs[0]).* = output;
+    }
+
     fn layerProgramSwiGluAdapter(
         state: *LayerProgramExecutionContext,
         insn: *const runtime_contract.Instruction,
@@ -987,6 +1071,38 @@ pub const TransformerBlock = struct {
         );
     }
 
+    fn layerProgramGatedDeltaRuntimeAdapter(
+        ctx: *runtime_contract.ExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        _: []const runtime_contract.TensorViewDesc,
+        state_blocks: []runtime_contract.StateBlockHandle,
+        params: []const runtime_contract.ParamBlock,
+    ) !void {
+        const state = try layerProgramExecutionState(ctx);
+        const p = try runtime_contract.paramAs(runtime_contract.GatedDeltaKernelParam, params, .gated_delta_net);
+        const d_inner = std.math.mul(u32, p.n_heads, p.d_head) catch return error.InvalidParamBlockABI;
+        if (p.d_inner != d_inner) return error.InvalidParamBlockABI;
+        if (p.d_conv != @as(u32, @intCast(state.runtime_meta.gated_delta_d_conv)) or
+            p.n_heads != @as(u32, @intCast(state.runtime_meta.gated_delta_n_heads)) or
+            p.d_head != @as(u32, @intCast(state.runtime_meta.gated_delta_d_head)))
+        {
+            return error.InvalidParamBlockABI;
+        }
+        const gated_delta_cache = try requireInstructionStateValue(
+            GatedDeltaCache,
+            state,
+            insn,
+            state_blocks,
+        );
+        try layerProgramGatedDeltaAdapter(
+            state,
+            insn,
+            registers,
+            gated_delta_cache,
+        );
+    }
+
     fn layerProgramSwiGluRuntimeAdapter(
         ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
@@ -1159,11 +1275,15 @@ pub const TransformerBlock = struct {
                 .use_gelu = weight_handles.use_gelu,
                 .attention_multiplier = weight_handles.attention_multiplier,
                 .attention_storage_kind = lw.attentionStorageKind(),
+                .gated_delta_storage_kind = lw.gatedDeltaStorageKind(),
                 .shortconv_storage_kind = lw.shortconvStorageKind(),
                 .ffn_storage_kind = lw.ffnStorageKind(),
                 .mla_storage_kind = lw.mlaStorageKind(),
                 .mamba_storage_kind = lw.mambaStorageKind(),
                 .mla_config = lw.mla_config,
+                .gated_delta_d_conv = lw.gated_delta_d_conv,
+                .gated_delta_n_heads = lw.gated_delta_n_heads,
+                .gated_delta_d_head = lw.gated_delta_d_head,
                 .shortconv_d_conv = lw.shortconv_d_conv,
                 .shortconv_conv_dim = lw.shortconv_conv_dim,
                 .moe_router_group_size = if (lw.moe) |moe| moe.router_group_size else 0,
@@ -1329,6 +1449,7 @@ test "layer_program_adapter_table covers Metal LayerOp execution subset" {
         .rmsnorm,
         .multihead_attention,
         .mla_attention,
+        .gated_delta_net,
         .swiglu,
         .moe,
         .mamba_mixer,
