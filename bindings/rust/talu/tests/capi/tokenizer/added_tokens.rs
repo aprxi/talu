@@ -872,6 +872,66 @@ fn added_token_preempts_gpt2_regex_leading_space_chunk() {
     );
 }
 
+/// Added-token preemption must remain exact when the token is an all-digit
+/// chunk embedded inside a larger numeric run. Surrounding digits must remain
+/// intact and offsets must stay contiguous/exhaustive.
+#[test]
+fn added_token_preempts_gpt2_regex_embedded_numeric_chunk_without_mangling_neighbors() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "0": 10, "1": 11, "2": 12, "3": 13, "4": 14, "5": 15,
+      "6": 16, "7": 17, "8": 18, "9": 19
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true},
+    {"id": 250, "content": "12345", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "001234500";
+
+    let ids = ctx.encode_with(input, &no_bos());
+    assert_eq!(
+        ids,
+        vec![10, 10, 250, 10, 10],
+        "numeric added token must preempt only its exact inner chunk"
+    );
+    assert_eq!(
+        tokenize_strings(&ctx, input),
+        vec!["0", "0", "12345", "0", "0"],
+        "token surfaces must preserve surrounding numeric neighbors"
+    );
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, input),
+        vec!["0", "0", "12345", "0", "0"],
+        "tokenize_bytes surfaces must align with tokenize surfaces"
+    );
+
+    let raw = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(raw.error_msg.is_null(), "encode_raw failed");
+    assert_eq!(raw.num_tokens, 5);
+    let offsets = unsafe { std::slice::from_raw_parts(raw.offsets, raw.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
+    assert_eq!((offsets[2].start, offsets[2].end), (2, 7));
+    assert_eq!((offsets[3].start, offsets[3].end), (7, 8));
+    assert_eq!((offsets[4].start, offsets[4].end), (8, 9));
+    unsafe { talu_sys::talu_encode_result_free(raw) };
+}
+
 /// Added-token matching must also beat a Metaspace pretokenizer on a real
 /// leading-space chunk. Metaspace would normally rewrite `" world"` to
 /// `"▁world"`, but an exact added token must win first and surface unchanged.
@@ -2655,12 +2715,64 @@ fn adjacent_rstrip_and_lstrip_compete_for_multiple_spaces() {
     assert!(raw.error_msg.is_null());
     assert_eq!(raw.num_tokens, 3);
     let offsets = unsafe { std::slice::from_raw_parts(raw.offsets, raw.num_tokens) };
-    assert_eq!((offsets[0].start, offsets[0].end), (0, 3));
-    assert_eq!((offsets[1].start, offsets[1].end), (3, 10));
+    // rstrip on [A] owns the full shared whitespace run; [B] starts after it.
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 7));
+    assert_eq!((offsets[1].start, offsets[1].end), (7, 10));
     assert_eq!((offsets[2].start, offsets[2].end), (10, 11));
     assert!(
         offsets[0].end <= offsets[1].start && offsets[1].end <= offsets[2].start,
         "offsets must remain monotonic and non-overlapping"
+    );
+    unsafe { talu_sys::talu_encode_result_free(raw) };
+}
+
+/// The same `rstrip`/`lstrip` boundary contention must hold for multi-byte
+/// Unicode spaces (ideographic space), without leaked standalone space tokens.
+#[test]
+fn adjacent_rstrip_and_lstrip_compete_for_ideographic_spaces() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 210, "content": "[A]", "special": false, "rstrip": true},
+    {"id": 211, "content": "[B]", "special": false, "lstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "[A]\u{3000}\u{3000}[B]x";
+
+    assert_eq!(
+        ctx.encode_with(input, &no_bos()),
+        vec![210, 211, 1],
+        "shared ideographic-space run must not leak standalone space tokens"
+    );
+
+    let raw = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(raw.error_msg.is_null());
+    assert_eq!(raw.num_tokens, 3);
+    let offsets = unsafe { std::slice::from_raw_parts(raw.offsets, raw.num_tokens) };
+
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 9));
+    assert_eq!(
+        (offsets[1].start, offsets[1].end),
+        (9, 12),
+        "rstrip owner must consume ideographic spaces before [B]"
+    );
+    assert_eq!((offsets[2].start, offsets[2].end), (12, 13));
+    assert!(
+        offsets[0].end <= offsets[1].start && offsets[1].end <= offsets[2].start,
+        "offsets must remain monotonic and non-overlapping with Unicode spaces"
     );
     unsafe { talu_sys::talu_encode_result_free(raw) };
 }

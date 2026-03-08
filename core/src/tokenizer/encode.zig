@@ -39,6 +39,26 @@ fn isUtf8ContinuationByte(byte_value: u8) bool {
     return (byte_value & 0xC0) == 0x80;
 }
 
+fn isUnicodeWhitespaceCodepoint(codepoint: c.utf8proc_int32_t) bool {
+    return switch (c.utf8proc_category(codepoint)) {
+        c.UTF8PROC_CATEGORY_ZS, c.UTF8PROC_CATEGORY_ZL, c.UTF8PROC_CATEGORY_ZP => true,
+        else => false,
+    };
+}
+
+fn whitespaceLenAt(input_bytes: []const u8, position: usize) usize {
+    if (position >= input_bytes.len) return 0;
+    const byte_value = input_bytes[position];
+    if (byte_value < 0x80) {
+        return if (std.ascii.isWhitespace(byte_value)) 1 else 0;
+    }
+
+    var codepoint: c.utf8proc_int32_t = 0;
+    const consumed = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + position), @intCast(input_bytes.len - position), &codepoint);
+    if (consumed <= 0) return 0;
+    return if (isUnicodeWhitespaceCodepoint(codepoint)) @intCast(consumed) else 0;
+}
+
 fn isAddedTokenWordCodepoint(codepoint: c.utf8proc_int32_t) bool {
     return switch (c.utf8proc_category(codepoint)) {
         c.UTF8PROC_CATEGORY_LU,
@@ -96,8 +116,9 @@ fn hasAddedTokenBoundary(input_bytes: []const u8, position: usize, content_len: 
 fn consumeAddedWhitespaceForward(input_bytes: []const u8, start: usize) usize {
     var cursor = start;
     while (cursor < input_bytes.len) {
-        if (std.ascii.isWhitespace(input_bytes[cursor])) {
-            cursor += 1;
+        const ws_len = whitespaceLenAt(input_bytes, cursor);
+        if (ws_len > 0) {
+            cursor += ws_len;
             continue;
         }
         if (cursor + 3 <= input_bytes.len and
@@ -115,13 +136,23 @@ fn consumeAddedWhitespaceForward(input_bytes: []const u8, start: usize) usize {
 
 fn leadingAsciiWhitespaceLen(input_bytes: []const u8) usize {
     var cursor: usize = 0;
-    while (cursor < input_bytes.len and std.ascii.isWhitespace(input_bytes[cursor])) : (cursor += 1) {}
+    while (cursor < input_bytes.len) {
+        const ws_len = whitespaceLenAt(input_bytes, cursor);
+        if (ws_len == 0) break;
+        cursor += ws_len;
+    }
     return cursor;
 }
 
 fn trailingAsciiWhitespaceStart(input_bytes: []const u8) usize {
     var cursor = input_bytes.len;
-    while (cursor > 0 and std.ascii.isWhitespace(input_bytes[cursor - 1])) : (cursor -= 1) {}
+    while (cursor > 0) {
+        var start = cursor - 1;
+        while (start > 0 and isUtf8ContinuationByte(input_bytes[start])) : (start -= 1) {}
+        const ws_len = whitespaceLenAt(input_bytes, start);
+        if (ws_len == 0 or start + ws_len != cursor) break;
+        cursor = start;
+    }
     return cursor;
 }
 
@@ -758,16 +789,44 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
     // applyByteLevel pass (arena allocs + UTF-8 encoding per byte).
     const skip_byte_level = is_byte_level_bpe and tokenizer.pretokenizer.is_sequence == 0 and
         if (tokenizer.model) |model_ptr| blk: {
-        const model: *bpe.BpeModel = @ptrCast(@alignCast(model_ptr));
-        break :blk model.use_raw_byte_init;
-    } else false;
+            const model: *bpe.BpeModel = @ptrCast(@alignCast(model_ptr));
+            break :blk model.use_raw_byte_init;
+        } else false;
+
+    // Regex pretokenizers can emit very long single tokens (e.g. 8k spaces).
+    // Overlap dedup is only safe when token runs are shorter than overlap.
+    // Keep parallelism for normal inputs, fall back to sequential on risky runs.
+    const regex_parallel_risky = blk: {
+        if (tokenizer.pretokenizer.re == null) break :blk false;
+        var current_class: u8 = 255;
+        var run_len: usize = 0;
+        for (segment) |byte_value| {
+            if (byte_value >= 0x80) break :blk true;
+            const cls: u8 = if (std.ascii.isWhitespace(byte_value))
+                0
+            else if (std.ascii.isAlphabetic(byte_value))
+                1
+            else if (std.ascii.isDigit(byte_value))
+                2
+            else
+                3;
+            if (cls == current_class) {
+                run_len += 1;
+            } else {
+                current_class = cls;
+                run_len = 1;
+            }
+            if (run_len > overlap_bytes) break :blk true;
+        }
+        break :blk false;
+    };
 
     // Overlapping-chunk parallelism: split text, parallelize both regex + BPE,
     // deduplicate at merge using word offsets vs midpoints.
     // Skip parallelism when the segment has no whitespace: without word
     // boundaries, the pretokenizer produces one word per chunk and the
     // overlap-based ownership deduplication silently drops all non-first chunks.
-    if (per_word_encode and segment.len >= chunk_parallel_threshold and
+    if (per_word_encode and !regex_parallel_risky and segment.len >= chunk_parallel_threshold and
         std.mem.indexOfScalar(u8, segment, ' ') != null)
     {
         const pool = parallel.global();
@@ -931,6 +990,7 @@ const ChunkContext = struct {
     is_metaspace: bool,
     skip_byte_level: bool,
     had_error: std.atomic.Value(bool),
+    had_oversized_token: std.atomic.Value(bool),
 };
 
 fn chunkWorker(start: usize, end: usize, ctx: *ChunkContext) void {
@@ -970,6 +1030,14 @@ fn processChunk(ctx: *ChunkContext, chunk_idx: usize) void {
     defer word_cache.deinit();
 
     for (words, ranges, 0..) |token_item, range, token_index| {
+        // Overlap dedup is only correct when every token fully fits inside
+        // the overlap window; otherwise ownership-by-start can drop or
+        // duplicate bytes across chunk boundaries. Signal fallback.
+        if (range.end > range.start and (range.end - range.start) > overlap_bytes) {
+            ctx.had_oversized_token.store(true, .release);
+            return;
+        }
+
         const tokens_before: u32 = @intCast(result.accum.ids.items.len);
 
         const add_sp_prefix = if (ctx.is_metaspace)
@@ -997,6 +1065,32 @@ fn processChunk(ctx: *ChunkContext, chunk_idx: usize) void {
     }
 }
 
+fn encodeSegmentPerWordSequential(
+    tokenizer: *ct.Tokenizer,
+    segment: []const u8,
+    base_offset: usize,
+    accumulator: *EncodeAccum,
+    is_sentencepiece_bpe: bool,
+    is_metaspace: bool,
+    skip_byte_level: bool,
+) !void {
+    var pretokenized = try pretokenize.pretokenize(
+        &tokenizer.pretokenizer,
+        segment,
+        .{ .start = base_offset, .end = base_offset + segment.len },
+        skip_byte_level,
+    );
+    defer pretokenized.deinit();
+
+    var word_cache = WordCache.init();
+    defer word_cache.deinit();
+
+    for (pretokenized.tokens.items, 0..) |token_item, token_index| {
+        const add_sp_prefix = if (is_metaspace) false else (is_sentencepiece_bpe and token_index > 0);
+        try encodeWord(tokenizer, token_item.sliceConst(), add_sp_prefix, accumulator, &word_cache);
+    }
+}
+
 fn encodeSegmentOverlapped(
     tokenizer: *ct.Tokenizer,
     segment: []const u8,
@@ -1011,16 +1105,7 @@ fn encodeSegmentOverlapped(
     const n_chunks = @min(n_threads, @max(1, segment.len / min_chunk_bytes));
 
     if (n_chunks <= 1) {
-        // Fall back to sequential
-        var pretokenized = try pretokenize.pretokenize(&tokenizer.pretokenizer, segment, .{ .start = base_offset, .end = base_offset + segment.len }, skip_byte_level);
-        defer pretokenized.deinit();
-        var word_cache = WordCache.init();
-        defer word_cache.deinit();
-        for (pretokenized.tokens.items, 0..) |token_item, token_index| {
-            const add_sp_prefix = if (is_metaspace) false else (is_sentencepiece_bpe and token_index > 0);
-            try encodeWord(tokenizer, token_item.sliceConst(), add_sp_prefix, accumulator, &word_cache);
-        }
-        return;
+        return encodeSegmentPerWordSequential(tokenizer, segment, base_offset, accumulator, is_sentencepiece_bpe, is_metaspace, skip_byte_level);
     }
 
     // Compute split points, chunk byte ranges (with overlap), and owned ranges
@@ -1059,9 +1144,15 @@ fn encodeSegmentOverlapped(
         .is_metaspace = is_metaspace,
         .skip_byte_level = skip_byte_level,
         .had_error = std.atomic.Value(bool).init(false),
+        .had_oversized_token = std.atomic.Value(bool).init(false),
     };
 
     pool.parallelFor(n_chunks * CACHE_LINE_ITEMS, chunkWorker, &ctx);
+
+    if (ctx.had_oversized_token.load(.acquire)) {
+        for (results) |*r| r.deinit();
+        return encodeSegmentPerWordSequential(tokenizer, segment, base_offset, accumulator, is_sentencepiece_bpe, is_metaspace, skip_byte_level);
+    }
 
     if (ctx.had_error.load(.acquire)) return error.OutOfMemory;
 
@@ -1227,6 +1318,8 @@ fn encodeCombined(
 ) !void {
     if (token_items.len == 0) return;
 
+    const join_with_spaces = tokenizer.type != ct.ModelType.bpe and tokenizer.pretokenizer.metaspace == 0;
+
     if (tokenizer.type == .bpe and tokenizer.pretokenizer.byte_level == 0 and tokenizer.pretokenizer.metaspace == 0 and
         (tokenizer.pretokenizer.whitespace != 0 or tokenizer.pretokenizer.punctuation != 0))
     {
@@ -1237,7 +1330,7 @@ fn encodeCombined(
     // Compute total size needed
     var total_len: usize = 0;
     for (token_items, 0..) |token_item, token_index| {
-        if (tokenizer.type != ct.ModelType.bpe and token_index > 0) total_len += 1; // space
+        if (join_with_spaces and token_index > 0) total_len += 1; // space
         total_len += token_item.len;
     }
 
@@ -1255,7 +1348,7 @@ fn encodeCombined(
 
     var pos: usize = 0;
     for (token_items, 0..) |token_item, token_index| {
-        if (tokenizer.type != ct.ModelType.bpe and token_index > 0) {
+        if (join_with_spaces and token_index > 0) {
             buf[pos] = ' ';
             pos += 1;
         }
@@ -1458,7 +1551,7 @@ test "tokenizer collect_added_spans matches single_word token at punctuation bou
 
     const content: [:0]const u8 = "cat";
     var added = ct.AddedToken{
-        .content = @constCast(@ptrCast(content.ptr)),
+        .content = @ptrCast(@constCast(content.ptr)),
         .id = 100,
         .special = 0,
         .single_word = 1,
@@ -1488,7 +1581,7 @@ test "tokenizer collect_added_spans expands lstrip to include leading whitespace
 
     const content: [:0]const u8 = "[MID]";
     var added = ct.AddedToken{
-        .content = @constCast(@ptrCast(content.ptr)),
+        .content = @ptrCast(@constCast(content.ptr)),
         .id = 100,
         .special = 0,
         .single_word = 0,
@@ -1518,7 +1611,7 @@ test "tokenizer collect_added_spans does not match normalized false token on nor
 
     const content: [:0]const u8 = "hello";
     var added = ct.AddedToken{
-        .content = @constCast(@ptrCast(content.ptr)),
+        .content = @ptrCast(@constCast(content.ptr)),
         .id = 100,
         .special = 0,
         .single_word = 0,
@@ -1541,7 +1634,7 @@ test "tokenizer collect_added_spans does not match single_word token inside unic
     const content: [:0]const u8 = "cat";
 
     var added = ct.AddedToken{
-        .content = @constCast(@ptrCast(content.ptr)),
+        .content = @ptrCast(@constCast(content.ptr)),
         .id = 100,
         .special = 0,
         .single_word = 1,

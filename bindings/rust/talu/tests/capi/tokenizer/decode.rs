@@ -224,6 +224,68 @@ fn cleanup_handles_punctuation_cascade_sequence() {
     );
 }
 
+fn hf_cleanup_reference(text: &str) -> String {
+    text.replace(" .", ".")
+        .replace(" ?", "?")
+        .replace(" !", "!")
+        .replace(" ,", ",")
+        .replace(" ' ", "'")
+        .replace(" n't", "n't")
+        .replace(" 'm", "'m")
+        .replace(" 's", "'s")
+        .replace(" 've", "'ve")
+        .replace(" 're", "'re")
+}
+
+/// Cleanup behavior must match the exact sequential HF-style replacement chain
+/// over dense mixed punctuation/contraction token permutations.
+#[test]
+fn cleanup_matches_reference_replace_chain_on_dense_token_permutations() {
+    let json_cleanup_false = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0,
+      "foo": 1, "bar": 2,
+      ".": 3, ",": 4, "?": 5, "!": 6,
+      "'": 7, "n": 8, "t": 9, "m": 10, "s": 11, "ve": 12, "re": 13
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let json_cleanup_true = json_cleanup_false.replace("\"cleanup\": false", "\"cleanup\": true");
+    let raw_ctx = TokenizerTestContext::from_json(json_cleanup_false);
+    let clean_ctx = TokenizerTestContext::from_json(&json_cleanup_true);
+
+    let pool = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+    let mut seed: u64 = 0xC0FFEE_F00DBABE;
+    for case_idx in 0..256usize {
+        let len = 4 + ((seed as usize) % 10);
+        let mut ids = Vec::with_capacity(len);
+        for _ in 0..len {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let idx = ((seed >> 32) as usize) % pool.len();
+            ids.push(pool[idx]);
+        }
+
+        let raw = raw_ctx.decode(&ids);
+        let cleaned = clean_ctx.decode(&ids);
+        let expected = hf_cleanup_reference(&raw);
+        assert_eq!(
+            cleaned, expected,
+            "cleanup chain mismatch at permutation case {case_idx}: ids={ids:?} raw={raw:?}"
+        );
+    }
+}
+
 /// `skip_special_tokens` must filter by special-token IDs, not by token text.
 /// A regular vocab token with the same text as a special token must be kept.
 #[test]
@@ -2158,6 +2220,37 @@ fn cleanup_preserves_newline_before_question_mark() {
     assert_eq!(
         decoded, "hello \n?",
         "cleanup must preserve literal newline content while stripping only the final space before punctuation, got: {decoded:?}"
+    );
+}
+
+/// Cleanup with French guillemets should preserve interior quote spacing while
+/// still applying punctuation cleanup before a trailing question mark.
+#[test]
+fn cleanup_french_guillemets_preserve_inner_spacing_and_strip_space_before_question() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "hello": 1, "«": 2, "»": 3, "?": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let decoded = ctx.decode(&[2, 1, 3, 4]);
+    assert_eq!(
+        decoded, "« hello »?",
+        "cleanup should preserve guillemet inner spacing while stripping final punctuation-adjacent space"
     );
 }
 

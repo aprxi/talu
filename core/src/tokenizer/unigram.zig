@@ -91,6 +91,13 @@ fn findEntry(model: *UnigramModel, token: []const u8) ?*UniEntry {
     return null;
 }
 
+fn findEntryById(model: *UnigramModel, id: i32) ?*UniEntry {
+    for (model.vocab.items) |*e| {
+        if (e.id == id) return e;
+    }
+    return null;
+}
+
 fn allocIdToToken(model: *UnigramModel, size: usize) !void {
     model.id_to_token = try model.allocator.alloc(?[*:0]u8, size);
     for (model.id_to_token) |*slot| slot.* = null;
@@ -267,6 +274,7 @@ fn loadText(model: *UnigramModel, path_z: [*:0]const u8) !void {
 
 fn encodeWord(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []const u8) !EncodedWord {
     const allocator = model.allocator;
+    const unk_entry = findEntryById(model, model.unk_id);
     const word_z = try allocator.dupeZ(u8, word);
     defer allocator.free(word_z);
     if (tok_fns.tokenizer_added_token_find(tokenizer, word_z.ptr)) |added| {
@@ -310,17 +318,6 @@ fn encodeWord(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []const u8) 
                 }
             }
         }
-        if (best_entry[pos] == null and model.unk_entry != null) {
-            const unk = model.unk_entry.?;
-            if (pos + 1 <= len) {
-                const cand = unk.score + best[pos + 1];
-                if (cand > best[pos]) {
-                    best[pos] = cand;
-                    best_len[pos] = 1;
-                    best_entry[pos] = unk;
-                }
-            }
-        }
     }
     if (best_entry[0] == null) return error.EncodeFailed;
 
@@ -334,8 +331,26 @@ fn encodeWord(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []const u8) 
     while (pos < len and best_entry[pos] != null) {
         const entry = best_entry[pos].?;
         const token_len = best_len[pos];
+
+        if (unk_entry != null and entry == unk_entry.? and token_len == 1) {
+            // Fuse consecutive fallback unknown bytes into a single <unk> run.
+            const run_start = pos;
+            var run_end = pos + token_len;
+            while (run_end < len and best_entry[run_end] != null) {
+                const next_entry = best_entry[run_end].?;
+                if (next_entry != unk_entry.? or best_len[run_end] != 1) break;
+                run_end += 1;
+            }
+            ids[count] = entry.id;
+            const chunk = try allocator.dupeZ(u8, word[run_start..run_end]);
+            toks[count] = chunk.ptr;
+            count += 1;
+            pos = run_end;
+            continue;
+        }
+
         ids[count] = entry.id;
-        if (model.unk_entry != null and entry == model.unk_entry.?) {
+        if (unk_entry != null and entry == unk_entry.?) {
             const chunk = try allocator.dupeZ(u8, word[pos .. pos + token_len]);
             toks[count] = chunk.ptr;
         } else {
@@ -390,9 +405,21 @@ fn encodeWordGreedy(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []cons
         }
         if (best_entry == null) {
             const unk_chunk = word[pos .. pos + 1];
-            try ids.append(allocator, model.unk_id);
-            const dup = try allocator.dupeZ(u8, unk_chunk);
-            try toks.append(allocator, dup.ptr);
+            if (ids.items.len > 0 and ids.items[ids.items.len - 1] == model.unk_id and toks.items.len > 0) {
+                // Fuse consecutive greedy unknown bytes into one <unk> run.
+                const prev_ptr = toks.items[toks.items.len - 1];
+                const prev = std.mem.sliceTo(prev_ptr, 0);
+                const merged = try allocator.alloc(u8, prev.len + 1 + 1);
+                @memcpy(merged[0..prev.len], prev);
+                merged[prev.len] = unk_chunk[0];
+                merged[prev.len + 1] = 0;
+                allocator.free(prev);
+                toks.items[toks.items.len - 1] = @ptrCast(merged.ptr);
+            } else {
+                try ids.append(allocator, model.unk_id);
+                const dup = try allocator.dupeZ(u8, unk_chunk);
+                try toks.append(allocator, dup.ptr);
+            }
             pos += 1;
             continue;
         }
@@ -448,13 +475,27 @@ fn unigram_encode(tokenizer: *ct.Tokenizer, text: []const u8, enc: *ct.Tokenizer
         };
         defer freeEncodedWordDeep(allocator, encoded);
 
-        ids.ensureUnusedCapacity(allocator, encoded.ids.len) catch return -1;
-        toks.ensureUnusedCapacity(allocator, encoded.tokens.len) catch return -1;
-        ids.appendSliceAssumeCapacity(encoded.ids);
-        // Append token pointers - dup strings for ownership transfer
-        for (encoded.tokens) |t| {
-            const dup = allocator.dupeZ(u8, std.mem.sliceTo(t, 0)) catch return -1;
-            toks.appendAssumeCapacity(dup.ptr);
+        // Append token pointers - dup strings for ownership transfer.
+        // Fuse adjacent unknown pieces into a single <unk> run.
+        for (encoded.ids, encoded.tokens) |encoded_id, encoded_tok_ptr| {
+            if (encoded_id == model.unk_id and ids.items.len > 0 and ids.items[ids.items.len - 1] == model.unk_id and toks.items.len > 0) {
+                const prev_ptr = toks.items[toks.items.len - 1];
+                const prev = std.mem.sliceTo(prev_ptr, 0);
+                const next_piece = std.mem.sliceTo(encoded_tok_ptr, 0);
+                const merged = allocator.alloc(u8, prev.len + next_piece.len + 1) catch return -1;
+                @memcpy(merged[0..prev.len], prev);
+                @memcpy(merged[prev.len .. prev.len + next_piece.len], next_piece);
+                merged[prev.len + next_piece.len] = 0;
+                allocator.free(prev);
+                toks.items[toks.items.len - 1] = @ptrCast(merged.ptr);
+            } else {
+                ids.append(allocator, encoded_id) catch return -1;
+                const dup = allocator.dupeZ(u8, std.mem.sliceTo(encoded_tok_ptr, 0)) catch return -1;
+                toks.append(allocator, dup.ptr) catch {
+                    allocator.free(dup);
+                    return -1;
+                };
+            }
         }
     }
 

@@ -257,13 +257,16 @@ fn splitByRegex(result: *PretokenizeResult, input: []const u8, base_offset: usiz
     const emit_matches = !split_matches or invert_matches;
     const emit_gaps = !invert_matches;
 
-    var cursor: usize = 0;
-    while (cursor <= input.len) {
-        const match_rc = pcre2_match(regex_code, @ptrCast(input.ptr), input.len, cursor, match_data);
+    // Keep search position separate from emitted-gap position so zero-width
+    // regex matches cannot skip input bytes while we advance to avoid loops.
+    var emit_cursor: usize = 0;
+    var search_cursor: usize = 0;
+    while (search_cursor <= input.len) {
+        const match_rc = pcre2_match(regex_code, @ptrCast(input.ptr), input.len, search_cursor, match_data);
         if (match_rc <= 0) {
             // No more matches - emit remaining text as a gap
-            if (emit_gaps and cursor < input.len) {
-                try appendToken(result, input[cursor..], base_offset + cursor);
+            if (emit_gaps and emit_cursor < input.len) {
+                try appendToken(result, input[emit_cursor..], base_offset + emit_cursor);
             }
             break;
         }
@@ -272,13 +275,23 @@ fn splitByRegex(result: *PretokenizeResult, input: []const u8, base_offset: usiz
         const match_end: usize = @intCast(ovector[1]);
 
         if (match_end == match_start) {
-            cursor = match_end + 1;
+            // Zero-width match: do not consume input; just advance search.
+            // This keeps split semantics stable while preventing infinite loops.
+            if (search_cursor >= input.len) {
+                if (emit_gaps and emit_cursor < input.len) {
+                    try appendToken(result, input[emit_cursor..], base_offset + emit_cursor);
+                }
+                break;
+            }
+            const cp_len = std.unicode.utf8ByteSequenceLength(input[search_cursor]) catch 1;
+            const step = if (search_cursor + cp_len <= input.len) cp_len else 1;
+            search_cursor += step;
             continue;
         }
 
         // Emit the gap before the match
-        if (emit_gaps and match_start > cursor) {
-            try appendToken(result, input[cursor..match_start], base_offset + cursor);
+        if (emit_gaps and match_start > emit_cursor) {
+            try appendToken(result, input[emit_cursor..match_start], base_offset + emit_cursor);
         }
 
         // Emit the match itself
@@ -286,7 +299,8 @@ fn splitByRegex(result: *PretokenizeResult, input: []const u8, base_offset: usiz
             try appendToken(result, input[match_start..match_end], base_offset + match_start);
         }
 
-        cursor = match_end;
+        emit_cursor = match_end;
+        search_cursor = match_end;
     }
 }
 
@@ -343,11 +357,18 @@ fn splitByGpt2Fast(result: *PretokenizeResult, input: []const u8, base_offset: u
                 const match_start: usize = @intCast(ovector[0]);
                 const match_end: usize = @intCast(ovector[1]);
                 if (match_end > match_start) {
+                    // If regex skipped forward, preserve skipped raw bytes.
+                    if (match_start > cursor) {
+                        try appendToken(result, input[cursor..match_start], base_offset + cursor);
+                    }
                     try appendToken(result, input[match_start..match_end], base_offset + match_start);
                     cursor = match_end;
                     continue;
                 }
             }
+            // No valid regex match at this position (or regex engine error):
+            // preserve the byte as its own token so raw-byte paths are lossless.
+            try appendToken(result, input[cursor .. cursor + 1], base_offset + cursor);
             cursor += 1;
             continue;
         }

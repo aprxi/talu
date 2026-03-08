@@ -721,6 +721,50 @@ fn pretokenizer_split_pathological_regex_large_non_match_deterministic() {
     );
 }
 
+/// A byte-unit regex (`\\C`) can intentionally bisect a valid multi-byte UTF-8
+/// emoji when used in Split pretokenization. The pipeline must not crash and
+/// must preserve roundtrip decode correctness.
+#[test]
+fn pretokenizer_split_byte_unit_regex_bisected_emoji_is_safe() {
+    let json = build_byte_level_tokenizer_json().replace(
+        "\"pre_tokenizer\": {\"type\": \"ByteLevel\", \"add_prefix_space\": false},",
+        r#""pre_tokenizer": {"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"\\C\\C"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false}]}, "#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let input = "A😊B";
+
+    let result = unsafe { encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode must succeed on bisected emoji");
+    assert_eq!(
+        result.num_tokens,
+        input.len(),
+        "byte-level path must still emit one token per input byte"
+    );
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) }.to_vec();
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    for (idx, off) in offsets.iter().enumerate() {
+        let start = off.start as usize;
+        let end = off.end as usize;
+        assert!(
+            start <= end && end <= input.len(),
+            "offset[{idx}] out of bounds for bisected emoji path: ({start},{end})"
+        );
+    }
+    assert_eq!(
+        offsets.iter().map(|o| o.end as usize).max().unwrap_or(0),
+        input.len(),
+        "offsets must still cover the full input byte range"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+
+    let decoded = ctx.decode(&ids);
+    assert_eq!(
+        decoded, input,
+        "decode must preserve text even when Split bisects UTF-8 bytes"
+    );
+}
+
 #[cfg(target_os = "linux")]
 unsafe fn run_pcre2_invalid_utf8_page_boundary_inner() {
     use std::ffi::c_void;

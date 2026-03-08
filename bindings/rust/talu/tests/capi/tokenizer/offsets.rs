@@ -1776,6 +1776,87 @@ fn byte_fallback_truncation_preserves_utf8_sliceable_offsets_for_partial_emoji()
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
+/// Byte-level truncation that bisects a multi-byte scalar must still decode
+/// to valid UTF-8 (with replacement chars), and offsets must remain byte-true.
+#[test]
+fn byte_level_truncation_mid_emoji_decodes_safely_with_replacement() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let input = "A😊B";
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 3,
+        ..Default::default()
+    };
+
+    let enc = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &opts) };
+    assert!(enc.error_msg.is_null());
+    assert_eq!(
+        enc.num_tokens, 3,
+        "truncation must keep A + first two emoji bytes"
+    );
+
+    let ids: Vec<u32> = if enc.ids.is_null() || enc.num_tokens == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(enc.ids, enc.num_tokens) }.to_vec()
+    };
+    let offsets: Vec<talu_sys::TokenOffset> = if enc.offsets.is_null() || enc.num_tokens == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(enc.offsets, enc.num_tokens) }.to_vec()
+    };
+    unsafe { talu_sys::talu_encode_result_free(enc) };
+
+    assert_eq!(offsets.len(), 3);
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
+    assert_eq!((offsets[2].start, offsets[2].end), (2, 3));
+
+    assert!(input.get(0..1).is_some(), "ASCII slice must be UTF-8 sliceable");
+    assert!(
+        input.get(1..2).is_none() && input.get(2..3).is_none(),
+        "mid-emoji byte offsets are expected to be non-sliceable in byte-level mode"
+    );
+
+    let dec = unsafe {
+        super::common::decode_raw(
+            ctx.handle(),
+            &ids,
+            &talu_sys::DecodeOptionsC {
+                skip_special_tokens: 0,
+            },
+        )
+    };
+    assert!(
+        dec.error_msg.is_null(),
+        "decode of truncated byte-level stream must not hard-fail"
+    );
+    let decoded = if dec.text.is_null() || dec.text_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(dec.text, dec.text_len) };
+        std::str::from_utf8(bytes)
+            .expect("decoded text must be valid UTF-8")
+            .to_owned()
+    };
+    unsafe { talu_sys::talu_decode_result_free(dec.text, dec.text_len) };
+
+    assert!(
+        decoded.starts_with('A'),
+        "decoded prefix must preserve surviving ASCII byte"
+    );
+    assert!(
+        decoded.contains('\u{FFFD}'),
+        "bisected UTF-8 scalar must sanitize to replacement char(s)"
+    );
+    assert!(
+        !decoded.contains('B'),
+        "truncation at 3 tokens must exclude trailing B byte"
+    );
+}
+
 /// Repeated merged subsequences should never produce zero offsets.
 #[test]
 fn offsets_repeated_merged_subsequences_no_zero_spans() {

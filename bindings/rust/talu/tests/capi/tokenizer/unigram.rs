@@ -1139,6 +1139,65 @@ fn unigram_mixed_known_unknown() {
     );
 }
 
+/// Consecutive unknown characters should be represented as a single `<unk>`
+/// run (SentencePiece-style unknown fusion), not one `<unk>` per char.
+#[test]
+fn unigram_consecutive_unknown_chars_fuse_to_single_unk_run() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["a", -1.0],
+      ["b", -1.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+
+    let tokens = ctx.encode_with("azxqb", &opts);
+    assert_eq!(
+        tokens,
+        vec![1, 0, 2],
+        "unknown run 'zxq' should fuse into a single <unk> between known neighbors"
+    );
+
+    let raw = unsafe { super::common::encode_raw(ctx.handle(), "azxqb".as_bytes(), &opts) };
+    assert!(raw.error_msg.is_null());
+    assert_eq!(raw.num_tokens, 3);
+    let offsets = unsafe { std::slice::from_raw_parts(raw.offsets, raw.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!(
+        (offsets[1].start, offsets[1].end),
+        (1, 4),
+        "fused <unk> must own the full unknown run span"
+    );
+    assert_eq!((offsets[2].start, offsets[2].end), (4, 5));
+    unsafe { talu_sys::talu_encode_result_free(raw) };
+
+    assert_eq!(
+        tokenize_strings(&ctx, "azxqb"),
+        vec!["a", "<unk>", "b"],
+        "tokenize surface must expose one fused <unk> token for the unknown run"
+    );
+    assert_eq!(
+        tokenize_bytes_strings(&ctx, "azxqb"),
+        vec!["a", "<unk>", "b"],
+        "tokenize_bytes surface must expose one fused <unk> token for the unknown run"
+    );
+}
+
 /// Without a pre-tokenizer, unknown characters should still be visible as
 /// `<unk>` on both tokenization surfaces rather than disappearing.
 #[test]

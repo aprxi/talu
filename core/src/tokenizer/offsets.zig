@@ -12,12 +12,90 @@ const normalize = @import("normalize.zig");
 const unigram = @import("unigram.zig");
 const utils = @import("utils.zig");
 const wordpiece = @import("wordpiece.zig");
+const c = @cImport({
+    @cInclude("utf8proc.h");
+});
 
 /// Token offset in source text (UTF-8 byte indices).
 pub const TokenOffset = extern struct {
     start: u32,
     end: u32,
 };
+
+fn findAddedTokenById(tokenizer_handle: *const ct.Tokenizer, token_id: i32) ?*const ct.AddedToken {
+    var added_iter = tokenizer_handle.added;
+    while (added_iter) |added| : (added_iter = added.next) {
+        if (added.id == token_id) return added;
+    }
+    return null;
+}
+
+fn isUtf8ContinuationByte(byte_value: u8) bool {
+    return (byte_value & 0xC0) == 0x80;
+}
+
+fn isUnicodeWhitespaceCodepoint(codepoint: c.utf8proc_int32_t) bool {
+    return switch (c.utf8proc_category(codepoint)) {
+        c.UTF8PROC_CATEGORY_ZS, c.UTF8PROC_CATEGORY_ZL, c.UTF8PROC_CATEGORY_ZP => true,
+        else => false,
+    };
+}
+
+fn whitespaceLenAt(input_bytes: []const u8, position: usize) usize {
+    if (position >= input_bytes.len) return 0;
+    const byte_value = input_bytes[position];
+    if (byte_value < 0x80) {
+        return if (std.ascii.isWhitespace(byte_value)) 1 else 0;
+    }
+    var codepoint: c.utf8proc_int32_t = 0;
+    const consumed = c.utf8proc_iterate(@ptrCast(input_bytes.ptr + position), @intCast(input_bytes.len - position), &codepoint);
+    if (consumed <= 0) return 0;
+    return if (isUnicodeWhitespaceCodepoint(codepoint)) @intCast(consumed) else 0;
+}
+
+fn allWhitespace(input_bytes: []const u8) bool {
+    var cursor: usize = 0;
+    while (cursor < input_bytes.len) {
+        const ws_len = whitespaceLenAt(input_bytes, cursor);
+        if (ws_len == 0) return false;
+        cursor += ws_len;
+    }
+    return true;
+}
+
+fn consumeWhitespaceForward(input_bytes: []const u8, start: usize) usize {
+    var cursor = start;
+    while (cursor < input_bytes.len) {
+        const ws_len = whitespaceLenAt(input_bytes, cursor);
+        if (ws_len == 0) break;
+        cursor += ws_len;
+    }
+    return cursor;
+}
+
+fn adjustAddedTokenSpan(
+    tokenizer_handle: *const ct.Tokenizer,
+    token_id: i32,
+    normalized_text: []const u8,
+    normalized_cursor: usize,
+    start_offset: usize,
+    end_offset: usize,
+) struct { start: usize, end: usize } {
+    var span_start = start_offset;
+    var span_end = end_offset;
+
+    const added = findAddedTokenById(tokenizer_handle, token_id) orelse {
+        return .{ .start = span_start, .end = span_end };
+    };
+
+    if (added.lstrip != 0 and normalized_cursor <= span_start and allWhitespace(normalized_text[normalized_cursor..span_start])) {
+        span_start = normalized_cursor;
+    }
+    if (added.rstrip != 0) {
+        span_end = consumeWhitespaceForward(normalized_text, span_end);
+    }
+    return .{ .start = span_start, .end = span_end };
+}
 
 /// Compute byte offsets from an already-computed encoding's token strings.
 /// Matches each token's decoded byte representation against normalized text and
@@ -91,15 +169,28 @@ pub fn computeOffsetsFromEncoding(
             };
             defer if (token_byte_sequence.ptr != token_text.ptr) alloc.free(token_byte_sequence);
 
-            if (normalized_offset + token_byte_sequence.len > normalized.text.len or
-                !std.mem.eql(u8, normalized.text[normalized_offset..][0..token_byte_sequence.len], token_byte_sequence))
-            {
-                offsets[token_idx] = .{ .start = 0, .end = 0 };
-                continue;
-            }
+            const remaining_text = normalized.text[normalized_offset..];
+            const match_offset = if (remaining_text.len >= token_byte_sequence.len and
+                std.mem.eql(u8, remaining_text[0..token_byte_sequence.len], token_byte_sequence))
+                @as(usize, 0)
+            else
+                findSubsequence(remaining_text, token_byte_sequence) orelse {
+                    offsets[token_idx] = .{ .start = 0, .end = 0 };
+                    continue;
+                };
 
-            const start_offset = normalized_offset;
-            const end_offset = start_offset + token_byte_sequence.len;
+            const base_start_offset = normalized_offset + match_offset;
+            const base_end_offset = base_start_offset + token_byte_sequence.len;
+            const span = adjustAddedTokenSpan(
+                tokenizer_handle,
+                token_id,
+                normalized.text,
+                normalized_offset,
+                base_start_offset,
+                base_end_offset,
+            );
+            const start_offset = span.start;
+            const end_offset = span.end;
             offsets[token_idx] = if (normalizedSpanIsSynthetic(&normalized, start_offset, end_offset))
                 .{ .start = 0, .end = 0 }
             else if (byte_level_uses_source_map) blk: {
@@ -107,8 +198,8 @@ pub fn computeOffsetsFromEncoding(
                 text_offset = source_offset.end;
                 break :blk source_offset;
             } else blk: {
-                const start_raw = text_offset;
-                const end_raw = start_raw + @as(u32, @intCast(token_byte_sequence.len));
+                const start_raw: u32 = @intCast(start_offset);
+                const end_raw: u32 = @intCast(end_offset);
                 text_offset = end_raw;
                 break :blk .{ .start = start_raw, .end = end_raw };
             };
@@ -142,6 +233,57 @@ pub fn computeOffsetsFromEncoding(
                 const span = nextWordPieceUnknownSpan(normalized.text, normalized_offset);
                 offsets[token_idx] = normalizedSpanToSourceOffset(&normalized, span.start, span.end);
                 normalized_offset = span.end;
+            } else if (tokenizer_handle.type == .unigram) {
+                const start_offset = normalized_offset;
+                const token_is_placeholder_unk = token_text.len == 0 or std.mem.eql(u8, token_text, "<unk>");
+                const default_span_len = if (token_is_placeholder_unk)
+                    @as(usize, 0)
+                else
+                    token_text.len;
+                var end_offset = @min(start_offset + default_span_len, normalized.text.len);
+
+                // Fused unigram unknown runs should own bytes up to the next
+                // resolvable non-unk token boundary.
+                var lookahead = token_idx + 1;
+                while (lookahead < token_count) : (lookahead += 1) {
+                    const next_id = enc_ids[lookahead];
+                    if (next_id == unk_id) continue;
+
+                    var next_text: []const u8 = "";
+                    if (token_cstrs) |ts| {
+                        const ptr: [*c]u8 = ts[lookahead];
+                        if (ptr != null) next_text = std.mem.sliceTo(ptr, 0);
+                    }
+                    if (next_text.len == 0) {
+                        next_text = tokenizer_handle.idToToken(next_id) orelse
+                            tok_encode.findAddedTokenContentById(tokenizer_handle, next_id) orelse "";
+                    }
+                    if (next_text.len == 0) continue;
+
+                    const next_bytes = decodeTokenToBytes(alloc, next_text, tokenizer_handle) catch continue;
+                    defer if (next_bytes.ptr != next_text.ptr) alloc.free(next_bytes);
+
+                    if (findSubsequence(normalized.text[start_offset..], next_bytes)) |match_offset| {
+                        end_offset = start_offset + match_offset;
+                        break;
+                    }
+                }
+
+                if (end_offset <= start_offset and start_offset < normalized.text.len) {
+                    if (token_is_placeholder_unk) {
+                        const span = nextWordPieceUnknownSpan(normalized.text, start_offset);
+                        if (span.end > span.start) {
+                            end_offset = span.end;
+                        } else {
+                            end_offset = start_offset + 1;
+                        }
+                    } else {
+                        end_offset = start_offset + 1;
+                    }
+                }
+                if (end_offset > normalized.text.len) end_offset = normalized.text.len;
+                offsets[token_idx] = normalizedSpanToSourceOffset(&normalized, start_offset, end_offset);
+                normalized_offset = end_offset;
             } else {
                 offsets[token_idx] = normalizedSpanToSourceOffset(&normalized, normalized_offset, normalized_offset + 1);
                 normalized_offset += 1;
@@ -161,8 +303,18 @@ pub fn computeOffsetsFromEncoding(
 
         const remaining_text = normalized.text[normalized_offset..];
         if (findSubsequence(remaining_text, token_byte_sequence)) |match_offset| {
-            const start_offset = normalized_offset + match_offset;
-            const end_offset = start_offset + token_byte_sequence.len;
+            const base_start_offset = normalized_offset + match_offset;
+            const base_end_offset = base_start_offset + token_byte_sequence.len;
+            const span = adjustAddedTokenSpan(
+                tokenizer_handle,
+                token_id,
+                normalized.text,
+                normalized_offset,
+                base_start_offset,
+                base_end_offset,
+            );
+            const start_offset = span.start;
+            const end_offset = span.end;
             offsets[token_idx] = normalizedSpanToSourceOffset(&normalized, start_offset, end_offset);
             normalized_offset = end_offset;
         } else {

@@ -104,6 +104,210 @@ fn no_bos() -> talu_sys::EncodeOptions {
     }
 }
 
+fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    const PRIME: u64 = 1099511628211;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+fn run_bpe_parallel_chunking_digest_inner() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0, "a": 1, "aa": 2
+    },
+    "merges": ["a a"]
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = no_bos();
+
+    // One long contiguous non-whitespace segment to force overlap chunking
+    // when THREADS>1 in the tokenizer's global parallel pool.
+    let input = "a".repeat(20_480);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &opts) };
+    assert!(result.error_msg.is_null(), "parallel digest encode must succeed");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids.len(), offsets.len(), "ids/offset lengths must match");
+    assert_eq!(
+        offsets.last().map(|o| o.end as usize).unwrap_or(0),
+        input.len(),
+        "offset coverage must reach full input length"
+    );
+
+    let mut digest = 1469598103934665603u64;
+    digest = fnv1a64_update(digest, &(result.num_tokens as u64).to_le_bytes());
+    for &id in ids {
+        digest = fnv1a64_update(digest, &(id as u64).to_le_bytes());
+    }
+    for off in offsets {
+        digest = fnv1a64_update(digest, &(off.start as u64).to_le_bytes());
+        digest = fnv1a64_update(digest, &(off.end as u64).to_le_bytes());
+    }
+    println!("BPE_PARALLEL_DIGEST={digest:016x}:{}", result.num_tokens);
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+fn run_bpe_parallel_chunking_multibyte_digest_inner() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0, "é": 1, "éé": 2
+    },
+    "merges": ["é é"]
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = no_bos();
+
+    // 6144 codepoints (~12KB UTF-8) ensures overlap chunking with multibyte
+    // symbols and keeps runtime fast.
+    let input = "é".repeat(6_144);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &opts) };
+    assert!(
+        result.error_msg.is_null(),
+        "parallel multibyte digest encode must succeed"
+    );
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids.len(), offsets.len(), "ids/offset lengths must match");
+    assert_eq!(
+        offsets.last().map(|o| o.end as usize).unwrap_or(0),
+        input.len(),
+        "offset coverage must reach full multibyte input length"
+    );
+
+    let mut digest = 1469598103934665603u64;
+    digest = fnv1a64_update(digest, &(result.num_tokens as u64).to_le_bytes());
+    for &id in ids {
+        digest = fnv1a64_update(digest, &(id as u64).to_le_bytes());
+    }
+    for off in offsets {
+        digest = fnv1a64_update(digest, &(off.start as u64).to_le_bytes());
+        digest = fnv1a64_update(digest, &(off.end as u64).to_le_bytes());
+    }
+    println!("BPE_PARALLEL_MB_DIGEST={digest:016x}:{}", result.num_tokens);
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Internal BPE overlap chunking (THREADS>1) must be mathematically identical
+/// to sequential behavior (THREADS=1) for IDs and offsets.
+#[test]
+fn bpe_parallel_chunking_thread_counts_match_sequential_digest() {
+    const INNER_ENV: &str = "TALU_INNER_BPE_PARALLEL_DIGEST";
+    if std::env::var_os(INNER_ENV).is_some() {
+        run_bpe_parallel_chunking_digest_inner();
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let mut baseline: Option<String> = None;
+    for threads in [1usize, 2, 4, 8, 16] {
+        let output = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("capi::tokenizer::stress::bpe_parallel_chunking_thread_counts_match_sequential_digest")
+            .arg("--nocapture")
+            .env(INNER_ENV, "1")
+            .env("THREADS", threads.to_string())
+            .output()
+            .expect("subprocess launch for BPE parallel digest test must succeed");
+
+        assert!(
+            output.status.success(),
+            "BPE parallel digest subprocess failed for THREADS={threads} (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let marker = stdout
+            .lines()
+            .find(|line| line.starts_with("BPE_PARALLEL_DIGEST="))
+            .unwrap_or_else(|| panic!("digest marker missing for THREADS={threads}\nstdout:\n{stdout}"))
+            .to_string();
+
+        if let Some(base) = &baseline {
+            assert_eq!(
+                marker, *base,
+                "BPE parallel chunking mismatch at THREADS={threads}: expected {base}, got {marker}"
+            );
+        } else {
+            baseline = Some(marker);
+        }
+    }
+}
+
+/// Internal BPE overlap chunking must also remain thread-count invariant for
+/// multibyte UTF-8 symbols and byte offsets.
+#[test]
+fn bpe_parallel_chunking_multibyte_thread_counts_match_sequential_digest() {
+    const INNER_ENV: &str = "TALU_INNER_BPE_PARALLEL_MB_DIGEST";
+    if std::env::var_os(INNER_ENV).is_some() {
+        run_bpe_parallel_chunking_multibyte_digest_inner();
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let mut baseline: Option<String> = None;
+    for threads in [1usize, 2, 4, 8, 16] {
+        let output = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("capi::tokenizer::stress::bpe_parallel_chunking_multibyte_thread_counts_match_sequential_digest")
+            .arg("--nocapture")
+            .env(INNER_ENV, "1")
+            .env("THREADS", threads.to_string())
+            .output()
+            .expect("subprocess launch for BPE multibyte parallel digest test must succeed");
+
+        assert!(
+            output.status.success(),
+            "BPE multibyte parallel digest subprocess failed for THREADS={threads} (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let marker = stdout
+            .lines()
+            .find(|line| line.starts_with("BPE_PARALLEL_MB_DIGEST="))
+            .unwrap_or_else(|| panic!("multibyte digest marker missing for THREADS={threads}\nstdout:\n{stdout}"))
+            .to_string();
+
+        if let Some(base) = &baseline {
+            assert_eq!(
+                marker, *base,
+                "BPE multibyte parallel chunking mismatch at THREADS={threads}: expected {base}, got {marker}"
+            );
+        } else {
+            baseline = Some(marker);
+        }
+    }
+}
+
 // ===========================================================================
 // Large input tests
 // ===========================================================================

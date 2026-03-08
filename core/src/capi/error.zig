@@ -174,9 +174,11 @@ pub export fn talu_error_buf_size() callconv(.c) usize {
 pub export fn talu_take_last_error(
     out_buf: ?[*]u8,
     out_buf_size: usize,
-    out_code: *i32,
+    out_code: ?*i32,
 ) callconv(.c) usize {
-    out_code.* = @intFromEnum(last_error_code);
+    if (out_code) |code_ptr| {
+        code_ptr.* = @intFromEnum(last_error_code);
+    }
 
     if (last_error_code == .ok) return 0;
 

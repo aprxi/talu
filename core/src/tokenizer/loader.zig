@@ -867,6 +867,7 @@ fn parseAddedTokens(arena_allocator: std.mem.Allocator, json_scanner: *std.json.
 }
 
 const MAX_JSON_PIPELINE_DEPTH: usize = 128;
+const MAX_JSON_PIPELINE_BREADTH: usize = 16_384;
 
 fn ensureJsonDepthWithinLimit(json_bytes: []const u8, comptime err: anyerror) !void {
     // Match the recursive parser's actual risk surface: nested objects.
@@ -1022,12 +1023,15 @@ fn parseNormalizerDepth(arena_allocator: std.mem.Allocator, json_scanner: *std.j
                 } else if (std.mem.eql(u8, key, "normalizers")) {
                     // Sequence normalizer - parse the array and aggregate settings
                     if ((try json_scanner.next()) != .array_begin) return error.InvalidNormalizer;
+                    var element_count: usize = 0;
                     while (true) {
                         const arr_token = try json_scanner.peekNextTokenType();
                         if (arr_token == .array_end) {
                             _ = try json_scanner.next();
                             break;
                         }
+                        element_count += 1;
+                        if (element_count > MAX_JSON_PIPELINE_BREADTH) return error.InvalidNormalizer;
                         // Recursively parse each sub-normalizer
                         const sub = try parseNormalizerDepth(arena_allocator, json_scanner, depth + 1);
                         // Aggregate: OR the boolean flags
@@ -1095,6 +1099,7 @@ fn parsePreTokenizerDepth(arena_allocator: std.mem.Allocator, json_scanner: *std
     if (first != .object_begin) return error.InvalidPreTokenizer;
     var saw_type = false;
     var saw_pattern = false;
+    var saw_regex_pattern = false;
     var saw_sequence = false;
 
     while (true) {
@@ -1170,6 +1175,7 @@ fn parsePreTokenizerDepth(arena_allocator: std.mem.Allocator, json_scanner: *std
                                             else => return error.InvalidPreTokenizer,
                                         };
                                         saw_pattern = true;
+                                        if (std.mem.eql(u8, pattern_key, "Regex")) saw_regex_pattern = true;
                                     } else {
                                         try json_scanner.skipValue();
                                     }
@@ -1182,12 +1188,15 @@ fn parsePreTokenizerDepth(arena_allocator: std.mem.Allocator, json_scanner: *std
                     // Sequence pre_tokenizer
                     if ((try json_scanner.next()) != .array_begin) return error.InvalidPreTokenizer;
                     saw_sequence = true;
+                    var element_count: usize = 0;
                     while (true) {
                         const arr_token = try json_scanner.peekNextTokenType();
                         if (arr_token == .array_end) {
                             _ = try json_scanner.next();
                             break;
                         }
+                        element_count += 1;
+                        if (element_count > MAX_JSON_PIPELINE_BREADTH) return error.InvalidPreTokenizer;
                         const sub = try parsePreTokenizerDepth(arena_allocator, json_scanner, depth + 1);
                         // Aggregate settings
                         pretokenizer.add_prefix_space = pretokenizer.add_prefix_space or sub.add_prefix_space;
@@ -1233,6 +1242,14 @@ fn parsePreTokenizerDepth(arena_allocator: std.mem.Allocator, json_scanner: *std
             pretokenizer.regex_split = !std.mem.eql(u8, b, "Isolated");
         } else {
             pretokenizer.regex_split = true; // Default: split on pattern
+        }
+        if (saw_regex_pattern) {
+            var regex_validator = std.mem.zeroes(ct.PreTokenizer);
+            defer tok_fns.tokenizer_pretokenizer_free(&regex_validator);
+            const pat_z = try arena_allocator.dupeZ(u8, pretokenizer.pattern.?);
+            if (tok_fns.tokenizer_pretokenizer_set(&regex_validator, pat_z.ptr) != 0) {
+                return error.InvalidPreTokenizer;
+            }
         }
     } else if (std.mem.eql(u8, pretokenizer.type, "Sequence")) {
         if (!saw_sequence) return error.InvalidPreTokenizer;

@@ -87,7 +87,6 @@ fn applyNormWithNullBytes(input_bytes: []const u8, form: UnicodeNormForm) Normal
     // Fast path: no null bytes in input
     if (std.mem.indexOfScalar(u8, input_bytes, 0) == null) {
         const input_copy = try Allocator.alloc(u8, input_bytes.len + 1);
-        errdefer Allocator.free(input_copy);
         @memcpy(input_copy[0..input_bytes.len], input_bytes);
         input_copy[input_bytes.len] = 0;
         const result_ptr = applyUnicodeNorm(@ptrCast(input_copy.ptr), form);
@@ -264,6 +263,12 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
         end_map = base_ends;
     }
 
+    errdefer {
+        if (normalized_bytes.ptr != sentencepiece.text.ptr) Allocator.free(normalized_bytes);
+        if (start_map) |m| Allocator.free(m);
+        if (end_map) |m| Allocator.free(m);
+    }
+
     // Apply Unicode normalization forms if enabled.
     if (normalizer.nfc != 0) {
         const next = try applyNormPreservingMap(normalized_bytes, start_map.?, end_map.?, .nfc);
@@ -301,12 +306,6 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
         start_map = next.map;
         end_map = next.map_end;
     }
-    errdefer {
-        if (normalized_bytes.ptr != sentencepiece.text.ptr) Allocator.free(normalized_bytes);
-        if (start_map) |m| Allocator.free(m);
-        if (end_map) |m| Allocator.free(m);
-    }
-
     // Fast path: when no per-codepoint transforms are enabled, skip utf8proc
     // iteration entirely. Just copy text and build position map directly.
     const is_passthrough = normalizer.clean_text == 0 and
@@ -351,6 +350,16 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
         var codepoint: c.utf8proc_int32_t = 0;
         const consumed_len = c.utf8proc_iterate(@ptrCast(normalized_bytes.ptr + input_index), @intCast(normalized_bytes.len - input_index), &codepoint);
         if (consumed_len <= 0) {
+            // Preserve malformed bytes as U+FFFD instead of silently dropping
+            // them, so downstream tokenization/offsets never lose source bytes.
+            const source_span = spanForRange(start_map.?, end_map.?, input_index, input_index + 1);
+            const replacement = "\xEF\xBF\xBD";
+            @memcpy(normalized_buf[out_index..][0..replacement.len], replacement);
+            for (0..replacement.len) |byte_idx| {
+                position_map[out_index + byte_idx] = source_span.start;
+                position_map_end[out_index + byte_idx] = source_span.end;
+            }
+            out_index += replacement.len;
             input_index += 1;
             continue;
         }

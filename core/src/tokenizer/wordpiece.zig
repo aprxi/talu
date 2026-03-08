@@ -97,6 +97,24 @@ fn findId(model: *const WordPieceModel, token: []const u8) ?i32 {
     return model.vocab.get(token);
 }
 
+fn countUnicodeScalarsLossy(bytes: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(bytes) catch {
+        // Keep invalid UTF-8 bytes visible to the max-input boundary logic:
+        // each malformed leading/continuation byte still counts as one scalar.
+        var idx: usize = 0;
+        var count: usize = 0;
+        while (idx < bytes.len) : (count += 1) {
+            const seq_len = std.unicode.utf8ByteSequenceLength(bytes[idx]) catch 1;
+            if (seq_len == 0 or idx + seq_len > bytes.len) {
+                idx += 1;
+            } else {
+                idx += seq_len;
+            }
+        }
+        return count;
+    };
+}
+
 fn encodeWord(model: *WordPieceModel, tokenizer: *ct.Tokenizer, word: []const u8) !EncodedWord {
     const allocator = model.allocator;
 
@@ -114,8 +132,12 @@ fn encodeWord(model: *WordPieceModel, tokenizer: *ct.Tokenizer, word: []const u8
         return EncodedWord{ .ids = ids, .tokens = toks };
     }
 
-    // Words exceeding max_input_chars_per_word are treated as unknown
-    if (model.max_input_chars_per_word > 0 and word.len > model.max_input_chars_per_word) {
+    // Words exceeding max_input_chars_per_word are treated as unknown.
+    // HuggingFace WordPiece defines this boundary in Unicode scalar count,
+    // not UTF-8 byte length.
+    if (model.max_input_chars_per_word > 0 and
+        countUnicodeScalarsLossy(word) > model.max_input_chars_per_word)
+    {
         return error.UnknownWord;
     }
 
@@ -268,9 +290,8 @@ fn wordpiece_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: 
         // earlier replacements create patterns matched by later ones.
         // E.g. "n ' t" → (pass 1: " ' " → "'") → "n't" → (pass 2: " n't" → "n't")
         //
-        // Pass 1: punctuation + apostrophe spacing
+        // Pass 1a: punctuation spacing
         //   .replace(" .", ".").replace(" ?", "?").replace(" !", "!").replace(" ,", ",")
-        //   .replace(" ' ", "'")
         {
             var wp: usize = 0;
             var rp: usize = 0;
@@ -281,13 +302,28 @@ fn wordpiece_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: 
                         rp += 1;
                         continue;
                     }
-                    // " ' " → "'" — remove both surrounding spaces
-                    if (rp + 2 < result.items.len and result.items[rp + 1] == '\'' and result.items[rp + 2] == ' ') {
-                        result.items[wp] = '\'';
-                        wp += 1;
-                        rp += 3;
-                        continue;
-                    }
+                }
+                result.items[wp] = result.items[rp];
+                wp += 1;
+                rp += 1;
+            }
+            result.items.len = wp;
+        }
+        // Pass 1b: apostrophe spacing
+        //   .replace(" ' ", "'")
+        {
+            var wp: usize = 0;
+            var rp: usize = 0;
+            while (rp < result.items.len) {
+                if (rp + 2 < result.items.len and
+                    result.items[rp] == ' ' and
+                    result.items[rp + 1] == '\'' and
+                    result.items[rp + 2] == ' ')
+                {
+                    result.items[wp] = '\'';
+                    wp += 1;
+                    rp += 3;
+                    continue;
                 }
                 result.items[wp] = result.items[rp];
                 wp += 1;

@@ -15,6 +15,8 @@ const error_codes = @import("error_codes.zig");
 const SignalGuard = @import("signal_guard.zig").SignalGuard;
 
 const allocator = std.heap.c_allocator;
+const MAX_CAPI_BATCH_TEXTS: usize = 1_000_000;
+const MAX_CAPI_TEXT_LEN: usize = 1 << 30; // 1 GiB safety ceiling for hostile FFI lengths
 
 var empty_byte_storage: [1]u8 = .{0};
 var empty_u32_storage: [1]u32 = .{0};
@@ -160,7 +162,7 @@ pub const PaddedTensorResult = extern struct {
 
 /// Context for signal-guarded tokenizer creation.
 const TokenizerCreateContext = struct {
-    model_path: [*:0]const u8,
+    model_path: []const u8,
     result_handle: ?*TokenizerHandle = null,
     result_error: ?anyerror = null,
 };
@@ -168,7 +170,7 @@ const TokenizerCreateContext = struct {
 /// Callback for signal-guarded tokenizer creation.
 fn tokenizerCreateCallback(ctx_ptr: *anyopaque) callconv(.c) c_int {
     const ctx: *TokenizerCreateContext = @ptrCast(@alignCast(ctx_ptr));
-    ctx.result_handle = TokenizerHandle.init(allocator, std.mem.span(ctx.model_path)) catch |err| {
+    ctx.result_handle = TokenizerHandle.init(allocator, ctx.model_path) catch |err| {
         ctx.result_error = err;
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -183,10 +185,14 @@ fn tokenizerCreateCallback(ctx_ptr: *anyopaque) callconv(.c) c_int {
 /// This function is protected against fatal signals (SIGBUS) that can occur during
 /// resource exhaustion. If a signal is caught, returns error code 905 (resource_exhausted).
 pub export fn talu_tokenizer_create(
-    model_path: [*:0]const u8,
+    model_path: ?[*:0]const u8,
     out_tokenizer: ?*?*OpaqueTokenizerHandle,
 ) callconv(.c) i32 {
     capi_error.clearError();
+    const model_path_ptr = model_path orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "model_path is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
     const out = out_tokenizer orelse {
         capi_error.setErrorWithCode(.invalid_argument, "out_tokenizer is null", .{});
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
@@ -199,7 +205,7 @@ pub export fn talu_tokenizer_create(
     defer guard.deinit();
 
     var ctx = TokenizerCreateContext{
-        .model_path = model_path,
+        .model_path = std.mem.span(model_path_ptr),
     };
 
     const result = guard.call(tokenizerCreateCallback, @ptrCast(&ctx));
@@ -656,6 +662,37 @@ pub export fn talu_tokenizer_encode_batch(
     };
     const batch_text_ptrs: [*]const [*]const u8 = @ptrCast(text_ptrs);
     const batch_length_ptrs: [*]const usize = @ptrCast(length_ptrs);
+    if (num_texts > MAX_CAPI_BATCH_TEXTS) {
+        capi_error.setError(error.InvalidArgument, "num_texts exceeds API safety limit", .{});
+        var err_result = std.mem.zeroes(BatchEncodeResult);
+        err_result.error_msg = "InvalidArgument";
+        return err_result;
+    }
+    var total_declared_bytes: usize = 0;
+    for (0..num_texts) |idx| {
+        const ptr_i = batch_text_ptrs[idx];
+        const len_i = batch_length_ptrs[idx];
+        if (len_i > 0 and @intFromPtr(ptr_i) == 0) {
+            capi_error.setError(error.InvalidArgument, "texts contains null pointer with non-zero length", .{});
+            var err_result = std.mem.zeroes(BatchEncodeResult);
+            err_result.error_msg = "InvalidArgument";
+            return err_result;
+        }
+        if (len_i > MAX_CAPI_TEXT_LEN) {
+            capi_error.setError(error.InvalidArgument, "text length exceeds API safety limit", .{});
+            var err_result = std.mem.zeroes(BatchEncodeResult);
+            err_result.error_msg = "InvalidArgument";
+            return err_result;
+        }
+        const sum, const overflow = @addWithOverflow(total_declared_bytes, len_i);
+        if (overflow != 0) {
+            capi_error.setError(error.InvalidArgument, "batch lengths overflow", .{});
+            var err_result = std.mem.zeroes(BatchEncodeResult);
+            err_result.error_msg = "InvalidArgument";
+            return err_result;
+        }
+        total_declared_bytes = sum;
+    }
     if (validateEncodeOptions(options)) |msg| {
         capi_error.setError(error.InvalidArgument, "{s}", .{msg});
         var err_result = std.mem.zeroes(BatchEncodeResult);
@@ -722,11 +759,15 @@ fn paddedTensorError(msg: [*:0]const u8) PaddedTensorResult {
 fn convertPaddedOptions(options: ?*const PaddedTensorOptions) tok_batch.PaddedTensorOptions {
     const o = options orelse return .{};
     var opt = std.mem.zeroes(tok_batch.PaddedTensorOptions);
+    const raw_bytes: [*]const u8 = @ptrCast(o);
+    const truncate_raw = raw_bytes[@offsetOf(PaddedTensorOptions, "truncate")];
+    const mask_raw = raw_bytes[@offsetOf(PaddedTensorOptions, "return_attention_mask")];
     opt.pad_id = o.pad_id;
     opt.padding_side = if (o.padding_side == 1) .left else .right;
     opt.max_length = o.max_length;
-    opt.truncate = o.truncate;
-    opt.return_attention_mask = o.return_attention_mask;
+    // FFI callers may pass non-canonical bool bytes; treat any nonzero byte as true.
+    opt.truncate = truncate_raw != 0;
+    opt.return_attention_mask = mask_raw != 0;
     return opt;
 }
 
@@ -808,15 +849,19 @@ pub export fn talu_tokenizer_get_eos_tokens(handle: ?*OpaqueTokenizerHandle) cal
 ///
 /// Returns the filesystem path to the model's directory.
 /// Caller must free the returned string via talu_text_free().
-pub export fn talu_tokenizer_get_model_dir(handle: ?*OpaqueTokenizerHandle, out_path: *?[*:0]u8) callconv(.c) i32 {
+pub export fn talu_tokenizer_get_model_dir(handle: ?*OpaqueTokenizerHandle, out_path: ?*?[*:0]u8) callconv(.c) i32 {
     capi_error.clearError();
-    out_path.* = null;
+    const out = out_path orelse {
+        capi_error.setError(error.InvalidArgument, "out_path is null", .{});
+        return @intFromEnum(error_codes.errorToCode(error.InvalidArgument));
+    };
+    out.* = null;
     // Cast opaque handle to TokenizerHandle
     const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
         capi_error.setError(error.InvalidHandle, "Invalid handle", .{});
         return @intFromEnum(error_codes.errorToCode(error.InvalidHandle));
     }));
-    out_path.* = allocZFromSlice(tok.model_dir) orelse {
+    out.* = allocZFromSlice(tok.model_dir) orelse {
         capi_error.setError(error.OutOfMemory, "Allocation failed", .{});
         return @intFromEnum(error_codes.errorToCode(error.OutOfMemory));
     };
@@ -925,9 +970,13 @@ pub export fn talu_tokenizer_get_model_max_length(handle: ?*OpaqueTokenizerHandl
 /// Converts a token ID to its string representation.
 ///
 /// Caller must free the returned string via talu_text_free().
-pub export fn talu_tokenizer_id_to_token(handle: ?*OpaqueTokenizerHandle, token_id: i32, out_token: *?[*:0]u8) callconv(.c) i32 {
+pub export fn talu_tokenizer_id_to_token(handle: ?*OpaqueTokenizerHandle, token_id: i32, out_token: ?*?[*:0]u8) callconv(.c) i32 {
     capi_error.clearError();
-    out_token.* = null;
+    const out = out_token orelse {
+        capi_error.setError(error.InvalidArgument, "out_token is null", .{});
+        return @intFromEnum(error_codes.errorToCode(error.InvalidArgument));
+    };
+    out.* = null;
     // Cast opaque handle to TokenizerHandle
     const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
         capi_error.setError(error.InvalidHandle, "Invalid handle", .{});
@@ -939,7 +988,7 @@ pub export fn talu_tokenizer_id_to_token(handle: ?*OpaqueTokenizerHandle, token_
         return @intFromEnum(error_codes.errorToCode(error.InvalidArgument));
     };
 
-    out_token.* = allocZFromSlice(text) orelse {
+    out.* = allocZFromSlice(text) orelse {
         capi_error.setError(error.OutOfMemory, "Allocation failed", .{});
         return @intFromEnum(error_codes.errorToCode(error.OutOfMemory));
     };
@@ -950,14 +999,35 @@ pub export fn talu_tokenizer_id_to_token(handle: ?*OpaqueTokenizerHandle, token_
 ///
 /// Returns -1 if the token is not in the vocabulary.
 /// Returns error code (negative) if handle is null.
-pub export fn talu_tokenizer_token_to_id(handle: ?*OpaqueTokenizerHandle, token: [*]const u8, token_len: usize) callconv(.c) i32 {
+pub export fn talu_tokenizer_token_to_id(handle: ?*OpaqueTokenizerHandle, token: ?[*]const u8, token_len: usize) callconv(.c) i32 {
     capi_error.clearError();
     const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
         capi_error.setError(error.InvalidHandle, "tokenizer handle is null", .{});
         return @intFromEnum(error_codes.errorToCode(error.InvalidHandle));
     }));
+    if (token_len > 0 and token == null) {
+        capi_error.setError(error.InvalidArgument, "token pointer is null with non-zero length", .{});
+        return @intFromEnum(error_codes.errorToCode(error.InvalidArgument));
+    }
+    const token_slice = if (token_len == 0) "" else token.?[0..token_len];
+
+    // Non-special added tokens preempt base vocab for exact content collisions.
+    // Special tokens that only exist in added_tokens are intentionally not
+    // surfaced by token_to_id; decode skip_special behavior relies on this.
+    var added_iter = tok.tok.tokenizer_handle.added;
+    while (added_iter) |added| : (added_iter = added.next) {
+        if (added.special == 0) {
+            if (added.content) |content_ptr| {
+                const content = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(content_ptr)), 0);
+                if (std.mem.eql(u8, content, token_slice)) {
+                    return added.id;
+                }
+            }
+        }
+    }
+
     // Returns -1 if token not found (not an error, just "not in vocabulary")
-    return tok.tok.tokenizer_handle.tokenToId(token[0..token_len]) orelse -1;
+    return tok.tok.tokenizer_handle.tokenToId(token_slice) orelse -1;
 }
 
 // =============================================================================
@@ -978,7 +1048,8 @@ pub export fn talu_tokens_concat(
     tokens_b: ?[*]const u32,
     num_b: usize,
 ) callconv(.c) ?[*]u32 {
-    const total = num_a + num_b;
+    const total, const overflow = @addWithOverflow(num_a, num_b);
+    if (overflow != 0) return null;
     if (total == 0) return null;
     if (num_a > 0 and tokens_a == null) return null;
     if (num_b > 0 and tokens_b == null) return null;

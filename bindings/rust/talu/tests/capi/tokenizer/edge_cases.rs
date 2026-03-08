@@ -398,6 +398,8 @@ fn unigram_invalid_utf8_middle_byte_not_silently_dropped() {
     if result.error_msg.is_null() {
         let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
         let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+        let offset_pairs: Vec<(u32, u32)> = offsets.iter().map(|o| (o.start, o.end)).collect();
+        eprintln!("DEBUG unigram invalid utf8 ids={ids:?} offsets={offset_pairs:?}");
         assert!(
             ids.contains(&0),
             "successful Unigram malformed-UTF8 path must surface unknown content"

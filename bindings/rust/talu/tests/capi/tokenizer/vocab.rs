@@ -391,6 +391,76 @@ fn merges_vocab_size() {
     assert_eq!(size, 105);
 }
 
+/// Merge rules may define output tokens not explicitly listed in `vocab`.
+/// Those implicit tokens must be materialized with stable ID/token APIs.
+#[test]
+fn merges_implicitly_define_vocab_entries_with_full_api_parity() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "a": 1,
+      "b": 2
+    },
+    "merges": ["a b"]
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+
+    let enc = unsafe { super::common::encode_raw(ctx.handle(), b"ab", &opts) };
+    assert!(enc.error_msg.is_null(), "encode must succeed");
+    assert_eq!(enc.num_tokens, 1, "'ab' should merge into one implicit token");
+    let ids = unsafe { std::slice::from_raw_parts(enc.ids, enc.num_tokens) };
+    let merged_id = ids[0];
+    unsafe { talu_sys::talu_encode_result_free(enc) };
+
+    assert!(
+        merged_id >= 3,
+        "implicit merge token ID must be allocated beyond explicit vocab IDs"
+    );
+    let size = unsafe { talu_sys::talu_tokenizer_get_vocab_size(ctx.handle()) };
+    assert_eq!(size, 4, "implicit merge token must increase reported vocab size");
+
+    let mut out: *mut i8 = ptr::null_mut();
+    let rc = unsafe {
+        talu_sys::talu_tokenizer_id_to_token(
+            ctx.handle(),
+            merged_id as i32,
+            &mut out as *mut _ as *mut c_void,
+        )
+    };
+    assert_eq!(rc, 0, "id_to_token must resolve implicit merge token");
+    let text = unsafe { std::ffi::CStr::from_ptr(out) }
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(text, "ab");
+    unsafe { talu_sys::talu_text_free(out) };
+
+    let token_id =
+        unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), b"ab".as_ptr(), 2) };
+    assert_eq!(
+        token_id as u32, merged_id,
+        "token_to_id must resolve implicit merge token to allocated ID"
+    );
+    assert_eq!(
+        ctx.decode(&[merged_id]),
+        "ab",
+        "decode must roundtrip implicit merge token exactly"
+    );
+}
+
 // ===========================================================================
 // Boundary and edge cases
 // ===========================================================================

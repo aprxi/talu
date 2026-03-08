@@ -569,6 +569,32 @@ fn add_prefix_space_mixed_batch_keeps_per_sequence_prefix_contract() {
     assert_eq!(seq1, expected1);
 }
 
+/// Decode cannot distinguish synthetic vs organic leading space once both
+/// encodings collapse to the same ID stream.
+///
+/// The truthful contract is encode-time (no duplicated leading space token).
+/// Decode strips one leading space when add_prefix_space is active.
+#[test]
+fn add_prefix_space_decode_collapses_synthetic_and_organic_leading_space() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+
+    let no_leading = ctx.encode_with("Hello", &no_bos());
+    let with_leading = ctx.encode_with(" Hello", &no_bos());
+
+    assert_eq!(
+        ctx.decode(&no_leading),
+        "Hello",
+        "synthetic prefix space must not survive decode"
+    );
+    assert_eq!(
+        ctx.decode(&with_leading),
+        "Hello",
+        "decode cannot recover whether the leading space was synthetic or organic"
+    );
+}
+
 /// Right truncation must apply after the synthetic prefix token has been
 /// inserted, so the prefix remains part of the kept prefix window.
 #[test]

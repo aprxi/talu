@@ -377,6 +377,215 @@ fn decode_null_tokens_usize_max_len_returns_error() {
     );
 }
 
+#[cfg(target_os = "linux")]
+unsafe fn run_bpe_encode_page_boundary_guard_inner() {
+    use std::ffi::c_void;
+
+    unsafe extern "C" {
+        fn getpagesize() -> i32;
+        fn mmap(
+            addr: *mut c_void,
+            length: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: isize,
+        ) -> *mut c_void;
+        fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+    }
+
+    const PROT_NONE: i32 = 0;
+    const PROT_READ: i32 = 0x1;
+    const PROT_WRITE: i32 = 0x2;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_ANONYMOUS: i32 = 0x20;
+
+    let page = unsafe { getpagesize() } as usize;
+    assert!(page > 0, "page size must be positive");
+    let len = page * 2;
+    let mapping = unsafe {
+        mmap(
+            ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping as isize, -1, "mmap for encode page-guard must succeed");
+
+    let base = mapping.cast::<u8>();
+    let guard = unsafe { base.add(page) };
+    assert_eq!(
+        unsafe { mprotect(guard.cast(), page, PROT_NONE) },
+        0,
+        "mprotect(PROT_NONE) for encode guard page failed"
+    );
+
+    let tail = unsafe { base.add(page - 1) };
+    unsafe { *tail = b'a' };
+
+    let ctx = TokenizerTestContext::with_byte_level();
+    let input = unsafe { std::slice::from_raw_parts(tail, 1) };
+    let result = unsafe {
+        common::encode_raw(ctx.handle(), input, &talu_sys::EncodeOptions::default())
+    };
+    assert!(
+        result.error_msg.is_null(),
+        "BPE encode at readable-page boundary must succeed without over-read"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+    assert_eq!(
+        unsafe { munmap(mapping, len) },
+        0,
+        "munmap for encode page-guard mapping failed"
+    );
+}
+
+/// BPE encode must not read beyond `text_len` even when input ends at an
+/// unreadable page boundary.
+#[cfg(target_os = "linux")]
+#[test]
+fn bpe_encode_page_boundary_guard_no_overread() {
+    const ENV_KEY: &str = "TALU_INNER_BPE_ENCODE_PAGE_GUARD";
+    if std::env::var_os(ENV_KEY).is_some() {
+        unsafe { run_bpe_encode_page_boundary_guard_inner() };
+        return;
+    }
+    assert_subprocess_test_ok(
+        "capi::tokenizer::memory::bpe_encode_page_boundary_guard_no_overread",
+        ENV_KEY,
+        "1",
+    );
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn run_bpe_decode_page_boundary_guard_inner() {
+    use std::ffi::c_void;
+
+    unsafe extern "C" {
+        fn getpagesize() -> i32;
+        fn mmap(
+            addr: *mut c_void,
+            length: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: isize,
+        ) -> *mut c_void;
+        fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+    }
+
+    const PROT_NONE: i32 = 0;
+    const PROT_READ: i32 = 0x1;
+    const PROT_WRITE: i32 = 0x2;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_ANONYMOUS: i32 = 0x20;
+
+    let page = unsafe { getpagesize() } as usize;
+    assert!(page > 0, "page size must be positive");
+    let len = page * 2;
+    let mapping = unsafe {
+        mmap(
+            ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping as isize, -1, "mmap for decode page-guard must succeed");
+
+    let base = mapping.cast::<u8>();
+    let guard = unsafe { base.add(page) };
+    assert_eq!(
+        unsafe { mprotect(guard.cast(), page, PROT_NONE) },
+        0,
+        "mprotect(PROT_NONE) for decode guard page failed"
+    );
+
+    let token_ptr = unsafe { base.add(page - std::mem::size_of::<u32>()) as *mut u32 };
+    unsafe { *token_ptr = 44u32 };
+
+    let ctx = TokenizerTestContext::new();
+    let result = unsafe {
+        talu_sys::talu_tokenizer_decode(
+            ctx.handle(),
+            token_ptr as *const u32,
+            1,
+            &talu_sys::DecodeOptionsC::default(),
+        )
+    };
+    if result.error_msg.is_null() && !result.text.is_null() && result.text_len > 0 {
+        let bytes = unsafe { std::slice::from_raw_parts(result.text, result.text_len) };
+        let _ = std::str::from_utf8(bytes).expect("decode output must remain valid UTF-8");
+    }
+    unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
+    assert_eq!(
+        unsafe { munmap(mapping, len) },
+        0,
+        "munmap for decode page-guard mapping failed"
+    );
+}
+
+/// BPE decode must not read past the provided token array length when the
+/// final token sits at an unreadable page boundary.
+#[cfg(target_os = "linux")]
+#[test]
+fn bpe_decode_page_boundary_guard_no_overread() {
+    const ENV_KEY: &str = "TALU_INNER_BPE_DECODE_PAGE_GUARD";
+    if std::env::var_os(ENV_KEY).is_some() {
+        unsafe { run_bpe_decode_page_boundary_guard_inner() };
+        return;
+    }
+    assert_subprocess_test_ok(
+        "capi::tokenizer::memory::bpe_decode_page_boundary_guard_no_overread",
+        ENV_KEY,
+        "1",
+    );
+}
+
+fn run_decode_unaligned_token_pointer_is_safe_inner() {
+    let ctx = TokenizerTestContext::new();
+    let mut raw = [0u8; 8];
+    raw[1..5].copy_from_slice(&44u32.to_ne_bytes());
+    let unaligned_tokens = unsafe { raw.as_ptr().add(1) as *const u32 };
+
+    let result = unsafe {
+        talu_sys::talu_tokenizer_decode(
+            ctx.handle(),
+            unaligned_tokens,
+            1,
+            &talu_sys::DecodeOptionsC::default(),
+        )
+    };
+    if result.error_msg.is_null() && !result.text.is_null() && result.text_len > 0 {
+        let bytes = unsafe { std::slice::from_raw_parts(result.text, result.text_len) };
+        let _ = std::str::from_utf8(bytes).expect("decode output must remain valid UTF-8");
+    }
+    unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
+}
+
+/// Decode must never crash when called with an unaligned token pointer from
+/// hostile FFI callers; it may return either success or a typed error.
+#[test]
+fn decode_unaligned_token_pointer_is_safe() {
+    const ENV_KEY: &str = "TALU_INNER_DECODE_UNALIGNED_PTR";
+    if std::env::var_os(ENV_KEY).is_some() {
+        run_decode_unaligned_token_pointer_is_safe_inner();
+        return;
+    }
+    assert_subprocess_test_ok(
+        "capi::tokenizer::memory::decode_unaligned_token_pointer_is_safe",
+        ENV_KEY,
+        "1",
+    );
+}
+
 /// Encoding with null text pointer and zero length should be empty success.
 #[test]
 fn encode_null_text_zero_len_is_empty_success() {
@@ -455,6 +664,49 @@ fn encode_null_text_usize_max_len_returns_error() {
         unsafe { talu_sys::talu_last_error_code() },
         talu_sys::ErrorCode::InvalidArgument as i32,
         "encode null text + usize::MAX len must set InvalidArgument"
+    );
+}
+
+fn run_encode_valid_ptr_usize_max_len_returns_error_inner() {
+    let ctx = TokenizerTestContext::new();
+    let one = [b'A'];
+    let result = unsafe {
+        talu_sys::talu_tokenizer_encode(
+            ctx.handle(),
+            one.as_ptr(),
+            usize::MAX,
+            &talu_sys::EncodeOptions::default(),
+        )
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "encode with valid pointer + usize::MAX len must fail"
+    );
+    assert!(
+        result.ids.is_null(),
+        "encode error path must not expose token buffers"
+    );
+    assert_eq!(result.num_tokens, 0);
+    assert_ne!(
+        unsafe { talu_sys::talu_last_error_code() },
+        talu_sys::ErrorCode::Ok as i32,
+        "valid pointer + impossible length must set a typed error"
+    );
+}
+
+/// A valid pointer with an impossible declared length must fail safely and
+/// never be trusted for slice construction.
+#[test]
+fn encode_valid_ptr_usize_max_len_returns_error() {
+    const ENV_KEY: &str = "TALU_INNER_ENCODE_VALID_PTR_USIZE_MAX";
+    if std::env::var_os(ENV_KEY).is_some() {
+        run_encode_valid_ptr_usize_max_len_returns_error_inner();
+        return;
+    }
+    assert_subprocess_test_ok(
+        "capi::tokenizer::memory::encode_valid_ptr_usize_max_len_returns_error",
+        ENV_KEY,
+        "1",
     );
 }
 
@@ -653,6 +905,142 @@ fn encode_batch_null_arrays_usize_max_count_returns_error() {
         unsafe { talu_sys::talu_last_error_code() },
         talu_sys::ErrorCode::InvalidArgument as i32,
         "batch encode null arrays + usize::MAX count must set InvalidArgument"
+    );
+}
+
+fn run_encode_batch_valid_arrays_usize_max_count_returns_error_inner() {
+    let ctx = TokenizerTestContext::new();
+    let text = b"A";
+    let texts = [text.as_ptr()];
+    let lengths = [text.len()];
+    let result = unsafe {
+        talu_sys::talu_tokenizer_encode_batch(
+            ctx.handle(),
+            texts.as_ptr(),
+            lengths.as_ptr(),
+            usize::MAX,
+            &talu_sys::EncodeOptions::default(),
+        )
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "valid pointer arrays + usize::MAX num_texts must fail"
+    );
+    assert!(result.ids.is_null(), "ids must be null on error");
+    assert!(result.offsets.is_null(), "offsets must be null on error");
+    assert_eq!(result.total_tokens, 0);
+    assert_eq!(result.num_sequences, 0);
+    assert_ne!(
+        unsafe { talu_sys::talu_last_error_code() },
+        talu_sys::ErrorCode::Ok as i32,
+        "valid arrays + impossible count must set a typed error"
+    );
+}
+
+/// Even when top-level arrays are non-null, an impossible `num_texts` must be
+/// rejected before any traversal/arithmetic over caller memory.
+#[test]
+fn encode_batch_valid_arrays_usize_max_count_returns_error() {
+    const ENV_KEY: &str = "TALU_INNER_BATCH_VALID_ARRAYS_USIZE_MAX";
+    if std::env::var_os(ENV_KEY).is_some() {
+        run_encode_batch_valid_arrays_usize_max_count_returns_error_inner();
+        return;
+    }
+    assert_subprocess_test_ok(
+        "capi::tokenizer::memory::encode_batch_valid_arrays_usize_max_count_returns_error",
+        ENV_KEY,
+        "1",
+    );
+}
+
+fn run_encode_batch_lengths_sum_overflow_returns_error_inner() {
+    let ctx = TokenizerTestContext::new();
+    let a = b"A";
+    let b = b"B";
+    let texts = [a.as_ptr(), b.as_ptr()];
+    let lengths = [(usize::MAX / 2) + 1, (usize::MAX / 2) + 1];
+    let result = unsafe {
+        talu_sys::talu_tokenizer_encode_batch(
+            ctx.handle(),
+            texts.as_ptr(),
+            lengths.as_ptr(),
+            2,
+            &talu_sys::EncodeOptions::default(),
+        )
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "overflowing total-token accumulator in batch lengths must be rejected"
+    );
+    assert!(result.ids.is_null(), "ids must be null on error");
+    assert!(result.offsets.is_null(), "offsets must be null on error");
+    assert_eq!(result.total_tokens, 0);
+    assert_eq!(result.num_sequences, 0);
+    assert_ne!(
+        unsafe { talu_sys::talu_last_error_code() },
+        talu_sys::ErrorCode::Ok as i32,
+        "overflowing total lengths must set a typed error"
+    );
+}
+
+/// Batch length accumulation must detect `usize` sum overflow before any
+/// allocation/copy attempt (`len[0] + len[1]` wrapping to a small value).
+#[test]
+fn encode_batch_lengths_sum_overflow_returns_error() {
+    const ENV_KEY: &str = "TALU_INNER_BATCH_LENGTH_SUM_OVERFLOW";
+    if std::env::var_os(ENV_KEY).is_some() {
+        run_encode_batch_lengths_sum_overflow_returns_error_inner();
+        return;
+    }
+    assert_subprocess_test_ok(
+        "capi::tokenizer::memory::encode_batch_lengths_sum_overflow_returns_error",
+        ENV_KEY,
+        "1",
+    );
+}
+
+fn run_encode_batch_valid_ptr_usize_max_len_returns_error_inner() {
+    let ctx = TokenizerTestContext::new();
+    let text = b"A";
+    let texts = [text.as_ptr()];
+    let lengths = [usize::MAX];
+    let result = unsafe {
+        talu_sys::talu_tokenizer_encode_batch(
+            ctx.handle(),
+            texts.as_ptr(),
+            lengths.as_ptr(),
+            1,
+            &talu_sys::EncodeOptions::default(),
+        )
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "batch encode with valid pointer + impossible usize::MAX length must fail"
+    );
+    assert!(result.ids.is_null(), "ids must be null on error");
+    assert!(result.offsets.is_null(), "offsets must be null on error");
+    assert_eq!(result.total_tokens, 0);
+    assert_eq!(result.num_sequences, 0);
+    assert_eq!(
+        unsafe { talu_sys::talu_last_error_code() },
+        talu_sys::ErrorCode::InvalidArgument as i32,
+        "impossible per-sequence length must set InvalidArgument"
+    );
+}
+
+/// A valid non-null text pointer paired with `usize::MAX` length must be
+/// rejected before any read/allocation, not trigger UB/crash.
+#[test]
+fn encode_batch_valid_ptr_usize_max_len_returns_error() {
+    const ENV_KEY: &str = "TALU_INNER_BATCH_VALID_PTR_USIZE_MAX_LEN";
+    if std::env::var_os(ENV_KEY).is_some() {
+        run_encode_batch_valid_ptr_usize_max_len_returns_error_inner();
+        return;
+    }
+    assert_subprocess_test_ok(
+        "capi::tokenizer::memory::encode_batch_valid_ptr_usize_max_len_returns_error",
+        ENV_KEY,
+        "1",
     );
 }
 

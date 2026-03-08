@@ -348,6 +348,44 @@ fn six_symbol_word_large_path() {
     );
 }
 
+/// Crossing from 5 symbols (small path) to 6 symbols (cached path) must not
+/// alter the already-merged prefix when the extra tail symbol has no merge.
+#[test]
+fn small_vs_cached_path_prefix_parity_with_one_extra_tail_symbol() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6,
+      "ab": 7, "abc": 8, "abcd": 9, "abcde": 10
+    },
+    "merges": ["a b", "ab c", "abc d", "abcd e"]
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let five = ctx.encode_with("abcde", &no_bos()); // 5 symbols -> small path
+    let six = ctx.encode_with("abcdef", &no_bos()); // 6 symbols -> cached path
+
+    assert_eq!(five, vec![10], "five-symbol path should collapse to abcde");
+    assert_eq!(
+        six,
+        vec![10, 6],
+        "six-symbol path should preserve merged abcde prefix and append f"
+    );
+    assert_eq!(
+        &six[..five.len()],
+        five.as_slice(),
+        "cached-path prefix must match small-path output exactly"
+    );
+}
+
 /// 7-symbol word: "helloab" — verify large-path correctness.
 #[test]
 fn seven_symbol_word() {
@@ -1363,6 +1401,62 @@ fn byte_fallback_unknown_middle_offsets_cover_merged_and_fallback_spans() {
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
+/// With ByteLevel pre-tokenization, an embedded NUL byte must remain a normal
+/// mergeable symbol when a rule explicitly targets its mapped token surface.
+#[test]
+fn byte_level_embedded_nul_can_participate_in_bpe_merges() {
+    let mut json: serde_json::Value =
+        serde_json::from_str(&super::common::build_byte_level_tokenizer_json())
+            .expect("byte-level fixture json must parse");
+    let model = json
+        .get_mut("model")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("model object must exist");
+    let vocab = model
+        .get_mut("vocab")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("vocab object must exist");
+
+    let a_surface = super::common::byte_token_surface(b'a');
+    let nul_surface = super::common::byte_token_surface(0x00);
+    let b_id = super::common::byte_token_id(b'b');
+    let merged_surface = format!("{a_surface}{nul_surface}");
+    let merged_id = 9000u32;
+    vocab.insert(merged_surface.clone(), serde_json::json!(merged_id));
+    model.insert(
+        "merges".to_string(),
+        serde_json::json!([format!("{a_surface} {nul_surface}")]),
+    );
+
+    let json_string = serde_json::to_string(&json).expect("json must serialize");
+    let ctx = TokenizerTestContext::from_json(&json_string);
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"a\0b", &no_bos()) };
+    assert!(
+        result.error_msg.is_null(),
+        "byte-level encode with embedded NUL must succeed"
+    );
+    assert_eq!(
+        result.num_tokens, 2,
+        "a+NUL merge plus trailing b should yield exactly two tokens"
+    );
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(ids, &[merged_id, b_id], "unexpected merged ID sequence");
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 2),
+        "merged a+NUL token must span the first two bytes"
+    );
+    assert_eq!(
+        (offsets[1].start, offsets[1].end),
+        (2, 3),
+        "trailing b token offset mismatch"
+    );
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
 /// Words longer than MAX_WORD_SYMBOLS (512) must still be encoded correctly.
 /// With only merge `a+a->aa`, 513 'a' should reduce to 256 'aa' + 1 'a'.
 #[test]
@@ -1435,6 +1529,67 @@ fn long_word_over_max_word_symbols_is_deterministic() {
         first, second,
         "long-word BPE encoding must be deterministic"
     );
+}
+
+/// Adversarial merge chains that repeatedly reintroduce overlapping substrings
+/// must still terminate deterministically (no loop/stall in cached-pair path).
+#[test]
+fn adversarial_overlapping_substring_merges_terminate_deterministically() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5, "ab": 6, "ba": 7, "aba": 8, "bab": 9, "abab": 10, "baba": 11
+    },
+    "merges": ["a b", "b a", "ab a", "ba b", "aba b", "bab a"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "abab".repeat(300); // 1200 symbols => cached/heap merge path
+    let first = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    let second = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(first.error_msg.is_null(), "first adversarial encode must succeed");
+    assert!(
+        second.error_msg.is_null(),
+        "second adversarial encode must succeed"
+    );
+
+    let first_ids = unsafe { std::slice::from_raw_parts(first.ids, first.num_tokens) }.to_vec();
+    let second_ids =
+        unsafe { std::slice::from_raw_parts(second.ids, second.num_tokens) }.to_vec();
+    assert_eq!(
+        first_ids, second_ids,
+        "adversarial overlapping chain must remain deterministic"
+    );
+
+    let first_offsets =
+        unsafe { std::slice::from_raw_parts(first.offsets, first.num_tokens) }.to_vec();
+    assert!(
+        !first_offsets.is_empty(),
+        "adversarial merge chain must produce at least one token"
+    );
+    assert_eq!(
+        first_offsets.last().expect("non-empty offsets").end as usize,
+        input.len(),
+        "adversarial merge chain offsets must fully cover source bytes"
+    );
+
+    unsafe {
+        talu_sys::talu_encode_result_free(first);
+        talu_sys::talu_encode_result_free(second);
+    }
 }
 
 // ===========================================================================
@@ -1565,6 +1720,54 @@ fn stale_pair_after_shared_symbol_consumed() {
         tokens,
         vec![4, 12, 7, 8, 9, 10, 11],
         "stale pair: 'abcdefgh' → [a, bc=12, d, e, f, g, h], got: {tokens:?}"
+    );
+}
+
+/// Repeated right-side merges followed by left-edge dependent merges stress
+/// `pos_to_cache` index-shift bookkeeping after large compaction.
+///
+/// Input: "ab" + ("cd" repeated 400) = 802 symbols (cached/heap path).
+/// Merges:
+///   rank 0: c+d -> cd (fires 400x on the right side)
+///   rank 1: b+cd -> bcd (left edge after compaction)
+///   rank 2: a+bcd -> abcd (left edge final)
+#[test]
+fn right_heavy_compaction_then_left_edge_merge_remains_correct() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3,
+      "a": 4, "b": 5, "c": 6, "d": 7,
+      "cd": 8, "bcd": 9, "abcd": 10
+    },
+    "merges": ["c d", "b cd", "a bcd"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = format!("ab{}", "cd".repeat(400));
+    let tokens = ctx.encode_with(&input, &no_bos());
+
+    assert_eq!(
+        tokens.len(),
+        400,
+        "expected [abcd] + 399 [cd] after right-heavy compaction"
+    );
+    assert_eq!(tokens[0], 10, "first token must be abcd");
+    assert!(
+        tokens[1..].iter().all(|&id| id == 8),
+        "remaining tokens must all be cd after compaction path"
     );
 }
 
