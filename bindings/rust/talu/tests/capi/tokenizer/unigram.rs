@@ -662,6 +662,29 @@ fn unigram_roundtrip() {
     }
 }
 
+/// Metaspace/SentencePiece decoding is intentionally lossy when input
+/// natively contains the replacement character ▁ (U+2581).
+#[test]
+fn metaspace_literal_replacement_char_roundtrip_is_lossy() {
+    let ctx = TokenizerTestContext::from_json(UNIGRAM_FALLBACK_JSON);
+    let input = "hello ▁ world";
+    let tokens = ctx.encode_with(input, &no_bos());
+    let decoded = ctx.decode(&tokens);
+
+    assert_ne!(
+        decoded, input,
+        "literal ▁ in user text should not roundtrip losslessly through metaspace decoder"
+    );
+    assert!(
+        !decoded.contains('▁'),
+        "metaspace decoder should replace ▁ with spaces in output"
+    );
+    assert!(
+        decoded.chars().filter(|&c| c == ' ').count() >= 3,
+        "lossy decode should contain expanded spaces where ▁ appeared"
+    );
+}
+
 /// Single character input encodes to character token.
 #[test]
 fn unigram_single_char() {
@@ -891,6 +914,103 @@ fn unigram_near_epsilon_score_advantage_prefers_split_path() {
         tokens,
         vec![1, 2],
         "slightly better split path must beat the whole token, got: {tokens:?}"
+    );
+}
+
+/// Tiny-magnitude fractional score jitter near `f32` epsilon must still be
+/// resolved deterministically in favor of the numerically better split path.
+#[test]
+fn unigram_tiny_fractional_jitter_prefers_split_path() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "vocab": [
+      ["ab", -0.00000031],
+      ["a", -0.00000010],
+      ["b", -0.00000020]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("ab", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![1, 2],
+        "tiny fractional jitter should still prefer the better split path, got: {tokens:?}"
+    );
+}
+
+/// The converse tiny-jitter case must remain deterministic in the opposite
+/// direction when the whole token is fractionally better than the split.
+#[test]
+fn unigram_tiny_fractional_jitter_prefers_whole_token() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "vocab": [
+      ["ab", -0.00000029],
+      ["a", -0.00000010],
+      ["b", -0.00000020]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode_with("ab", &no_bos());
+    assert_eq!(
+        tokens,
+        vec![0],
+        "tiny fractional jitter should still prefer the better whole-token path, got: {tokens:?}"
+    );
+}
+
+/// Extreme negative finite scores over long inputs should not crash or produce
+/// nondeterministic output when Viterbi accumulators approach `-inf`.
+#[test]
+fn unigram_extreme_negative_scores_long_input_is_deterministic() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["a", -1.0e38]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "a".repeat(4096);
+
+    let first = ctx.encode_with(&input, &no_bos());
+    let second = ctx.encode_with(&input, &no_bos());
+    assert_eq!(
+        first, second,
+        "extreme-score long-input Viterbi path must remain deterministic"
+    );
+    assert!(
+        !first.is_empty(),
+        "extreme-score Viterbi should still emit a concrete tokenization"
+    );
+    assert!(
+        first.iter().all(|&id| id == 0 || id == 1),
+        "extreme-score Viterbi should only emit configured unigram IDs"
     );
 }
 

@@ -438,6 +438,144 @@ fn deep_cascade_five_levels_cached_path() {
     );
 }
 
+/// Deep power-of-two cascade at the MAX_WORD_SYMBOLS boundary (512 symbols)
+/// must reduce deterministically to one token without cache corruption.
+#[test]
+fn deep_power_of_two_cascade_512_symbols_reduces_to_one_token() {
+    let levels = 9usize; // 2^9 = 512 symbols.
+    let mut vocab_entries = vec![
+        "\"<pad>\": 0".to_string(),
+        "\"<s>\": 1".to_string(),
+        "\"</s>\": 2".to_string(),
+        "\"<unk>\": 3".to_string(),
+        "\"a\": 4".to_string(),
+    ];
+    let mut merges = Vec::with_capacity(levels);
+
+    let mut prev = "a".to_string();
+    for i in 0..levels {
+        let merged = format!("{prev}{prev}");
+        let id = 5 + (i as u32);
+        vocab_entries.push(format!("\"{}\": {}", merged, id));
+        merges.push(format!("\"{} {}\"", prev, prev));
+        prev = merged;
+    }
+
+    let json = format!(
+        r####"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{
+      {}
+    }},
+    "merges": [{}]
+  }},
+  "added_tokens": [
+    {{"id": 0, "content": "<pad>", "special": true}},
+    {{"id": 1, "content": "<s>", "special": true}},
+    {{"id": 2, "content": "</s>", "special": true}},
+    {{"id": 3, "content": "<unk>", "special": true}}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {{"type": "ByteLevel", "add_prefix_space": false}},
+  "post_processor": null,
+  "decoder": {{"type": "ByteLevel"}}
+}}"####,
+        vocab_entries.join(",\n      "),
+        merges.join(", ")
+    );
+
+    let ctx = TokenizerTestContext::from_json(&json);
+    let input = "a".repeat(1usize << levels);
+    let first = ctx.encode_with(&input, &no_bos());
+    let second = ctx.encode_with(&input, &no_bos());
+    assert_eq!(first, second, "deep cascade must be deterministic");
+    assert_eq!(
+        first.len(),
+        1,
+        "2^9 repeated-symbol cascade should fully reduce to one token"
+    );
+    assert_eq!(
+        first,
+        vec![5 + ((levels as u32) - 1)],
+        "final reduced token ID must match the deepest configured cascade level"
+    );
+}
+
+/// An unbalanced deep cascade (left-growing chain) at the 512-symbol boundary
+/// must remain deterministic and fully reducible.
+///
+/// Merge chain:
+///   a b -> ab
+///   ab b -> abb
+///   abb b -> abbb
+///   ...
+/// Input: "a" followed by 511 "b" symbols (512 total symbols).
+#[test]
+fn deep_unbalanced_cascade_512_symbols_reduces_to_one_token() {
+    let levels = 511usize;
+    let mut vocab_entries = vec![
+        "\"<pad>\": 0".to_string(),
+        "\"<s>\": 1".to_string(),
+        "\"</s>\": 2".to_string(),
+        "\"<unk>\": 3".to_string(),
+        "\"a\": 4".to_string(),
+        "\"b\": 5".to_string(),
+    ];
+    let mut merges = Vec::with_capacity(levels);
+
+    let mut prev = "a".to_string();
+    for i in 0..levels {
+        let merged = format!("{prev}b");
+        let id = 6 + (i as u32);
+        vocab_entries.push(format!("\"{}\": {}", merged, id));
+        merges.push(format!("\"{} b\"", prev));
+        prev = merged;
+    }
+
+    let json = format!(
+        r####"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{
+      {}
+    }},
+    "merges": [{}]
+  }},
+  "added_tokens": [
+    {{"id": 0, "content": "<pad>", "special": true}},
+    {{"id": 1, "content": "<s>", "special": true}},
+    {{"id": 2, "content": "</s>", "special": true}},
+    {{"id": 3, "content": "<unk>", "special": true}}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {{"type": "ByteLevel", "add_prefix_space": false}},
+  "post_processor": null,
+  "decoder": {{"type": "ByteLevel"}}
+}}"####,
+        vocab_entries.join(",\n      "),
+        merges.join(", ")
+    );
+
+    let ctx = TokenizerTestContext::from_json(&json);
+    let input = format!("a{}", "b".repeat(levels));
+    let first = ctx.encode_with(&input, &no_bos());
+    let second = ctx.encode_with(&input, &no_bos());
+    assert_eq!(first, second, "unbalanced cascade must be deterministic");
+    assert_eq!(
+        first.len(),
+        1,
+        "unbalanced 512-symbol cascade should fully reduce to one token"
+    );
+    assert_eq!(
+        first,
+        vec![6 + ((levels as u32) - 1)],
+        "final token ID must match the deepest unbalanced chain level"
+    );
+}
+
 // ===========================================================================
 // Merge creates pair at distant position (cache re-scan)
 // ===========================================================================

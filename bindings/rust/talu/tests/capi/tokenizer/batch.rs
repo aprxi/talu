@@ -922,6 +922,60 @@ fn tokens_concat_rejects_null_second_with_nonzero_length() {
     }
 }
 
+fn run_batch_encode_with_null_pointers_in_array_inner() {
+    let ctx = TokenizerTestContext::new();
+    let t0 = b"Hi";
+    let t2 = b"A";
+    let ptrs = [t0.as_ptr(), std::ptr::null(), t2.as_ptr()];
+    let lengths = [t0.len(), 1usize, t2.len()];
+    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
+    assert!(
+        !result.error_msg.is_null(),
+        "inner null text pointer with non-zero length must return a typed error"
+    );
+    if result.error_msg.is_null() && !result.ids.is_null() && result.total_tokens > 0 {
+        unsafe {
+            talu_sys::talu_batch_encode_result_free(
+                result.ids,
+                result.offsets,
+                result.total_tokens,
+                result.num_sequences,
+            )
+        };
+    }
+}
+
+/// encode_batch must reject jagged input arrays where the top-level `texts`
+/// pointer is valid but one inner element pointer is null with non-zero length.
+///
+/// Runs in a subprocess so a native null-deref crash is reported as a normal
+/// assertion failure instead of aborting the parent test harness.
+#[test]
+fn batch_encode_with_null_pointers_in_array_returns_error() {
+    const INNER_ENV: &str = "TALU_INNER_BATCH_JAGGED_NULL";
+    if std::env::var_os(INNER_ENV).is_some() {
+        run_batch_encode_with_null_pointers_in_array_inner();
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let output = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("capi::tokenizer::batch::batch_encode_with_null_pointers_in_array_returns_error")
+        .arg("--nocapture")
+        .env(INNER_ENV, "1")
+        .output()
+        .expect("subprocess launch for jagged-null batch test must succeed");
+
+    assert!(
+        output.status.success(),
+        "jagged-null batch input crashed or failed (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// encode_batch with null options pointer must use C-API default add_special_tokens=true.
 #[test]
 fn batch_encode_null_options_defaults_to_add_special_tokens() {
@@ -1226,6 +1280,36 @@ fn padded_tensor_rejects_offsets_not_starting_at_zero() {
     }
 }
 
+/// Padded tensor must reject non-monotonic offset arrays to prevent unsigned
+/// underflow in per-sequence length math (`offsets[i+1] - offsets[i]`).
+#[test]
+fn padded_tensor_rejects_non_monotonic_offsets() {
+    let ids = [44u32, 77u32, 69u32, 70u32, 71u32];
+    let offsets = [0usize, 5usize, 2usize];
+    let result = unsafe {
+        super::common::batch_to_padded_tensor_raw(
+            ids.as_ptr(),
+            offsets.as_ptr(),
+            2,
+            &talu_sys::PaddedTensorOptions::default(),
+        )
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "non-monotonic offsets must be rejected"
+    );
+    if result.error_msg.is_null() {
+        unsafe {
+            talu_sys::talu_padded_tensor_result_free(
+                result.input_ids,
+                result.attention_mask,
+                result.num_sequences,
+                result.padded_length,
+            )
+        };
+    }
+}
+
 /// Padded tensor conversion must reject pathological max_length values that
 /// would overflow allocation math instead of attempting huge allocations.
 #[test]
@@ -1266,6 +1350,345 @@ fn padded_tensor_rejects_large_multi_sequence_overflow() {
         !result.error_msg.is_null(),
         "extreme max_length with multiple sequences must be rejected safely"
     );
+}
+
+/// `pad_id` accepts full u32 range from FFI callers; using `u32::MAX` must not
+/// crash or truncate values in padded rows.
+#[test]
+fn padded_tensor_accepts_u32_max_pad_id_without_corruption() {
+    let ctx = TokenizerTestContext::new();
+    let pad_opts = talu_sys::PaddedTensorOptions {
+        pad_id: u32::MAX,
+        padding_side: 0,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+
+    let result = ctx.batch_to_padded_tensor(&["A", "Hi"], &no_bos(), &pad_opts);
+    assert_eq!(result.num_sequences, 2);
+    assert_eq!(result.padded_length, 2);
+
+    // Row0: "A" padded to length 2 with u32::MAX.
+    assert_eq!(result.input_ids[0], 37);
+    assert_eq!(result.input_ids[1], u32::MAX);
+    assert_eq!(result.attention_mask[0], 1);
+    assert_eq!(result.attention_mask[1], 0);
+
+    // Row1: "Hi" unchanged.
+    assert_eq!(&result.input_ids[2..4], &[44, 77]);
+    assert_eq!(&result.attention_mask[2..4], &[1, 1]);
+}
+
+/// For non-zero sequence counts, C API currently requires a non-null `ids`
+/// pointer even when offsets encode zero consumed IDs.
+#[test]
+fn padded_tensor_single_empty_sequence_max_length_zero_null_ids_returns_error() {
+    let offsets = [0usize, 0usize];
+    let opts = talu_sys::PaddedTensorOptions {
+        max_length: 0,
+        truncate: true,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+    let result = unsafe {
+        super::common::batch_to_padded_tensor_raw(std::ptr::null(), offsets.as_ptr(), 1, &opts)
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "null ids pointer with num_sequences=1 must be rejected by current C-API contract"
+    );
+}
+
+/// With a non-null sentinel IDs pointer, an empty single sequence with
+/// `max_length=0` should produce an empty success tensor.
+#[test]
+fn padded_tensor_single_empty_sequence_max_length_zero_nonnull_ids_is_empty_success() {
+    let offsets = [0usize, 0usize];
+    let opts = talu_sys::PaddedTensorOptions {
+        max_length: 0,
+        truncate: true,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+    let ids_ptr = std::ptr::NonNull::<u32>::dangling().as_ptr() as *const u32;
+    let result = unsafe { super::common::batch_to_padded_tensor_raw(ids_ptr, offsets.as_ptr(), 1, &opts) };
+    assert!(
+        result.error_msg.is_null(),
+        "non-null sentinel ids pointer with empty offsets should succeed"
+    );
+    assert_eq!(result.num_sequences, 1);
+    assert_eq!(result.padded_length, 0);
+    // Zero-length outputs may be represented by null or non-null sentinel
+    // pointers across FFI boundaries; only lengths are semantically relevant.
+    unsafe {
+        talu_sys::talu_padded_tensor_result_free(
+            result.input_ids,
+            result.attention_mask,
+            result.num_sequences,
+            result.padded_length,
+        )
+    };
+}
+
+fn run_padded_tensor_noncanonical_bool_bytes_match_canonical_true_inner() {
+    let ids = [44u32];
+    let offsets = [0usize, 1usize];
+    let canonical = talu_sys::PaddedTensorOptions {
+        pad_id: 99,
+        padding_side: 0,
+        max_length: 2,
+        truncate: true,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+
+    let expected = unsafe {
+        super::common::batch_to_padded_tensor_raw(ids.as_ptr(), offsets.as_ptr(), 1, &canonical)
+    };
+    assert!(
+        expected.error_msg.is_null(),
+        "canonical padded tensor options must succeed in baseline comparison"
+    );
+
+    let mut raw = [0u8; std::mem::size_of::<talu_sys::PaddedTensorOptions>()];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&canonical as *const talu_sys::PaddedTensorOptions).cast::<u8>(),
+            raw.as_mut_ptr(),
+            raw.len(),
+        );
+    }
+    let base = (&canonical as *const talu_sys::PaddedTensorOptions).cast::<u8>() as usize;
+    let truncate_off = std::ptr::addr_of!(canonical.truncate).cast::<u8>() as usize - base;
+    let mask_off = std::ptr::addr_of!(canonical.return_attention_mask).cast::<u8>() as usize - base;
+    raw[truncate_off] = 0xFE;
+    raw[mask_off] = 0x02;
+
+    let got = unsafe {
+        talu_sys::talu_batch_to_padded_tensor(
+            ids.as_ptr(),
+            offsets.as_ptr(),
+            1,
+            raw.as_ptr().cast::<talu_sys::PaddedTensorOptions>(),
+        )
+    };
+    assert!(
+        got.error_msg.is_null(),
+        "non-canonical boolean bytes in PaddedTensorOptions must not crash and must be accepted as true"
+    );
+    assert_eq!(got.num_sequences, expected.num_sequences);
+    assert_eq!(got.padded_length, expected.padded_length);
+
+    let expected_total = expected.num_sequences * expected.padded_length;
+    let got_total = got.num_sequences * got.padded_length;
+    assert_eq!(got_total, expected_total);
+    let expected_ids = if expected_total == 0 || expected.input_ids.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(expected.input_ids, expected_total) }
+    };
+    let got_ids = if got_total == 0 || got.input_ids.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(got.input_ids, got_total) }
+    };
+    assert_eq!(
+        got_ids, expected_ids,
+        "non-canonical boolean bytes must preserve tensor IDs semantics"
+    );
+    let expected_mask = if expected_total == 0 || expected.attention_mask.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(expected.attention_mask, expected_total) }
+    };
+    let got_mask = if got_total == 0 || got.attention_mask.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(got.attention_mask, got_total) }
+    };
+    assert_eq!(
+        got_mask, expected_mask,
+        "non-canonical boolean bytes must preserve attention mask semantics"
+    );
+
+    unsafe {
+        talu_sys::talu_padded_tensor_result_free(
+            expected.input_ids,
+            expected.attention_mask,
+            expected.num_sequences,
+            expected.padded_length,
+        );
+        talu_sys::talu_padded_tensor_result_free(
+            got.input_ids,
+            got.attention_mask,
+            got.num_sequences,
+            got.padded_length,
+        );
+    }
+}
+
+/// Foreign callers may pass non-canonical bool bytes in FFI structs. Those
+/// bytes must not crash the C API and must behave like canonical nonzero true.
+#[test]
+fn padded_tensor_noncanonical_bool_bytes_match_canonical_true() {
+    const INNER_ENV: &str = "TALU_INNER_PAD_BOOL_BYTES";
+    if std::env::var_os(INNER_ENV).is_some() {
+        run_padded_tensor_noncanonical_bool_bytes_match_canonical_true_inner();
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let output = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("capi::tokenizer::batch::padded_tensor_noncanonical_bool_bytes_match_canonical_true")
+        .arg("--nocapture")
+        .env(INNER_ENV, "1")
+        .output()
+        .expect("subprocess launch for padded non-canonical bool-byte test must succeed");
+
+    assert!(
+        output.status.success(),
+        "padded non-canonical bool-byte subprocess failed (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Zero sequences should remain an empty success regardless of large
+/// max_length values.
+#[test]
+fn padded_tensor_zero_sequences_with_huge_max_length_is_empty_success() {
+    let opts = talu_sys::PaddedTensorOptions {
+        max_length: usize::MAX,
+        truncate: false,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+    let result = unsafe {
+        super::common::batch_to_padded_tensor_raw(std::ptr::null(), std::ptr::null(), 0, &opts)
+    };
+    assert!(
+        result.error_msg.is_null(),
+        "zero-sequence padded tensor should not depend on max_length magnitude"
+    );
+    assert_eq!(result.num_sequences, 0);
+    assert_eq!(result.padded_length, 0);
+    unsafe {
+        talu_sys::talu_padded_tensor_result_free(
+            result.input_ids,
+            result.attention_mask,
+            result.num_sequences,
+            result.padded_length,
+        )
+    };
+}
+
+fn run_padded_tensor_rejects_wrapping_integer_overflow_inner() {
+    let ids = [44u32];
+    let offsets = [0usize, 1usize];
+    let num_sequences = (usize::MAX / 2) + 1;
+    let opts = talu_sys::PaddedTensorOptions {
+        max_length: 2,
+        truncate: true,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+    let result = unsafe {
+        super::common::batch_to_padded_tensor_raw(
+            ids.as_ptr(),
+            offsets.as_ptr(),
+            num_sequences,
+            &opts,
+        )
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "wrapping multiplication in padded tensor sizing must be rejected"
+    );
+    if result.error_msg.is_null() {
+        unsafe {
+            talu_sys::talu_padded_tensor_result_free(
+                result.input_ids,
+                result.attention_mask,
+                result.num_sequences,
+                result.padded_length,
+            )
+        };
+    }
+}
+
+/// Padded tensor conversion must reject wrapping `num_sequences * padded_length`
+/// overflows (ReleaseFast wrap-around) before allocation/copy loops.
+#[test]
+fn padded_tensor_rejects_wrapping_integer_overflow() {
+    const INNER_ENV: &str = "TALU_INNER_PADDED_WRAP_OVERFLOW";
+    if std::env::var_os(INNER_ENV).is_some() {
+        run_padded_tensor_rejects_wrapping_integer_overflow_inner();
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let output = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("capi::tokenizer::batch::padded_tensor_rejects_wrapping_integer_overflow")
+        .arg("--nocapture")
+        .env(INNER_ENV, "1")
+        .output()
+        .expect("subprocess launch for padded wrapping-overflow test must succeed");
+
+    assert!(
+        output.status.success(),
+        "padded tensor wrapping-overflow subprocess failed (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Very large but non-overflowing allocation requests must never crash.
+///
+/// Host behavior is intentionally accepted as bifurcated:
+/// 1) strict allocators return a typed error immediately;
+/// 2) overcommitting allocators may return a successful virtual allocation.
+///
+/// In both cases the API contract is safety (no abort/segfault) plus a valid
+/// free path when success is reported.
+#[test]
+#[ignore = "expensive OOM-path stress; run manually when validating allocator failure behavior"]
+fn padded_tensor_gracefully_handles_massive_non_wrapping_allocation_request() {
+    let num_sequences = 50_000usize;
+    let max_length = 200_000usize; // 10^10 elements (~40GB for u32 tensor).
+
+    let ids = [44u32];
+    let mut offsets = vec![1usize; num_sequences + 1];
+    offsets[0] = 0;
+    let opts = talu_sys::PaddedTensorOptions {
+        max_length,
+        truncate: false,
+        return_attention_mask: true,
+        ..Default::default()
+    };
+    let result = unsafe {
+        super::common::batch_to_padded_tensor_raw(
+            ids.as_ptr(),
+            offsets.as_ptr(),
+            num_sequences,
+            &opts,
+        )
+    };
+    if result.error_msg.is_null() {
+        assert_eq!(result.num_sequences, num_sequences);
+        assert_eq!(result.padded_length, max_length);
+        unsafe {
+            talu_sys::talu_padded_tensor_result_free(
+                result.input_ids,
+                result.attention_mask,
+                result.num_sequences,
+                result.padded_length,
+            )
+        };
+    }
 }
 
 /// Padded tensor consumes exactly the prefix described by `offsets[num_sequences]`.

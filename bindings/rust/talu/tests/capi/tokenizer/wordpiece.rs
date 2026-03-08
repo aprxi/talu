@@ -1995,6 +1995,53 @@ fn wordpiece_exactly_at_max_input_chars() {
     );
 }
 
+/// Large overlapping WordPiece vocabularies must still choose the deterministic
+/// greedy-longest match and remain stable across runs.
+#[test]
+fn wordpiece_large_overlapping_vocab_longest_match_is_deterministic() {
+    let mut vocab_entries = Vec::with_capacity(1025);
+    vocab_entries.push("\"[UNK]\": 0".to_string());
+    for n in 1..=1024usize {
+        vocab_entries.push(format!("\"{}\": {}", "a".repeat(n), n));
+    }
+
+    let json = format!(
+        r####"{{
+  "version": "1.0",
+  "model": {{
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 2000,
+    "vocab": {{
+      {}
+    }}
+  }},
+  "added_tokens": [{{"id": 0, "content": "[UNK]", "special": true}}],
+  "normalizer": null,
+  "pre_tokenizer": {{ "type": "BertPreTokenizer" }},
+  "post_processor": null,
+  "decoder": {{ "type": "WordPiece", "prefix": "##", "cleanup": true }}
+}}"####,
+        vocab_entries.join(",\n      ")
+    );
+
+    let ctx = TokenizerTestContext::from_json(&json);
+    let input = "a".repeat(1024);
+    let first = ctx.encode_with(&input, &no_bos());
+    let second = ctx.encode_with(&input, &no_bos());
+
+    assert_eq!(
+        first, second,
+        "large overlapping vocab must remain deterministic"
+    );
+    assert_eq!(
+        first,
+        vec![1024],
+        "greedy longest match should pick the full 1024-char token"
+    );
+}
+
 /// Emoji character (🌍 U+1F30D) must produce [UNK], not be silently dropped.
 #[test]
 fn encode_emoji_produces_unk_not_dropped() {
@@ -2085,5 +2132,52 @@ fn wordpiece_max_input_chars_uses_unicode_scalars_not_bytes() {
         tokens,
         vec![0],
         "input above max_input_chars_per_word must produce [UNK]"
+    );
+}
+
+/// max_input_chars_per_word must be evaluated after normalization.
+///
+/// Here NFC composes each `e + U+0301` pair to `é`, so input that is above the
+/// pre-normalization scalar budget can still be valid after normalization.
+#[test]
+fn wordpiece_max_input_chars_counts_normalized_scalars_accurately() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 5,
+    "vocab": {
+      "[UNK]": 0,
+      "é": 1,
+      "##é": 2
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true}
+  ],
+  "normalizer": {"type": "NFC"},
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = no_bos();
+
+    let decomposed_within_after_nfc = "e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}";
+    let tokens = ctx.encode_with(decomposed_within_after_nfc, &opts);
+    assert_eq!(
+        tokens,
+        vec![1, 2, 2, 2, 2],
+        "max_input_chars_per_word must use post-normalization scalar count"
+    );
+
+    let decomposed_over_after_nfc = "e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}";
+    let tokens = ctx.encode_with(decomposed_over_after_nfc, &opts);
+    assert_eq!(
+        tokens,
+        vec![0],
+        "input still above max after normalization must produce [UNK]"
     );
 }

@@ -873,6 +873,100 @@ fn offsets_with_lowercase_and_strip_accents_map_to_original_bytes() {
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
+/// A `normalized=true` added token matched after lowercase+accent stripping
+/// must still map back to the full original source span, even when normalized
+/// byte length is shorter than the input (CAFÉ: 5 bytes -> cafe: 4 bytes).
+#[test]
+fn offsets_added_token_normalized_match_maps_to_original_longer_source_span() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "c": 1, "a": 2, "f": 3, "e": 4
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "cafe", "special": false, "normalized": true}
+  ],
+  "normalizer": {"type": "Sequence", "normalizers": [{"type": "Lowercase"}, {"type": "StripAccents"}]},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "CAFÉ";
+    assert_eq!(input.len(), 5, "É must occupy two UTF-8 bytes in source");
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(
+        result.num_tokens, 1,
+        "normalized added token should collapse CAFÉ -> cafe into one added token"
+    );
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[100], "expected normalized added token ID");
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 5),
+        "normalized added token offset must map to full original source span"
+    );
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// A `normalized=true` added token matched after length-expanding
+/// normalization must still map back to the original shorter source span.
+/// Here "&" (1 byte) expands to "and" (3 bytes) before added-token matching.
+#[test]
+fn offsets_added_token_normalized_match_maps_to_original_shorter_source_span() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "&": 1, "a": 2, "n": 3, "d": 4
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 100, "content": "and", "special": false, "normalized": true}
+  ],
+  "normalizer": {"type": "Replace", "pattern": {"String": "&"}, "content": "and"},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "&";
+    assert_eq!(input.len(), 1);
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert_eq!(
+        result.num_tokens, 1,
+        "normalized added token should collapse expanded normalization output into one token"
+    );
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[100], "expected normalized added token ID");
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!(
+        (offsets[0].start, offsets[0].end),
+        (0, 1),
+        "expanded normalized token must map back to original '&' source span"
+    );
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
 /// Lowercase-only normalization must map tokens back to original uppercase source bytes.
 #[test]
 fn offsets_with_lowercase_map_to_original_bytes() {
@@ -1449,6 +1543,68 @@ fn offsets_with_repeated_nfkc_large_expansion_stay_within_source_bounds() {
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
+/// A chained normalizer pipeline (Prepend + NFKC + Lowercase + StripAccents)
+/// on a mixed expansion/shrink/control input must keep all offsets within the
+/// original source and preserve critical source spans.
+#[test]
+fn offsets_compound_normalizer_sequence_stays_mapped_to_original_source() {
+    let json = build_byte_level_tokenizer_json().replace(
+        "\"normalizer\": null,",
+        "\"normalizer\": {\"type\": \"Sequence\", \"normalizers\": [{\"type\": \"Prepend\", \"prepend\": \"X\"}, {\"type\": \"NFKC\"}, {\"type\": \"Lowercase\"}, {\"type\": \"StripAccents\"}]},",
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let input = "\u{FDFA} \u{0130}\r\n";
+    // [0..3]=U+FDFA, [3..4]=space, [4..6]=U+0130, [6..7]=CR, [7..8]=LF.
+    assert_eq!(input.len(), 8);
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed");
+    assert!(
+        result.num_tokens > 12,
+        "compound normalizer should emit a substantial expanded output, got {} tokens",
+        result.num_tokens
+    );
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    for (idx, off) in offsets.iter().enumerate() {
+        let start = off.start as usize;
+        let end = off.end as usize;
+        assert!(
+            start <= end && end <= input.len(),
+            "offset[{idx}] must stay in source bounds: ({start},{end}) vs input len {}",
+            input.len()
+        );
+        assert!(
+            input.is_char_boundary(start) && input.is_char_boundary(end),
+            "offset[{idx}] must stay on UTF-8 scalar boundaries: ({start},{end})"
+        );
+    }
+
+    let expanded_fd_fa = offsets
+        .iter()
+        .filter(|off| off.start == 0 && off.end == 3)
+        .count();
+    assert!(
+        expanded_fd_fa > 10,
+        "NFKC expansion of U+FDFA should map many output tokens back to [0,3], got {expanded_fd_fa}"
+    );
+
+    assert!(
+        offsets.iter().any(|off| off.start == 4 && off.end == 6),
+        "normalized U+0130 must map back to its original [4,6] source span"
+    );
+    assert!(
+        offsets.iter().any(|off| off.start == 6 && off.end == 7),
+        "CR byte must remain traceable to [6,7]"
+    );
+    assert!(
+        offsets.iter().any(|off| off.start == 7 && off.end == 8),
+        "LF byte must remain traceable to [7,8]"
+    );
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
 /// Replace normalizer shrinking text (remove apostrophe) must preserve original byte mapping.
 #[test]
 fn offsets_replace_shrink_preserves_original_positions() {
@@ -1558,6 +1714,65 @@ fn offsets_per_byte_unk_multibyte_unknown_map_to_original_span() {
         (0, 2),
         "second per-byte <unk> must map to the full composed-é span"
     );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Truncating inside byte-fallback output for a multibyte scalar must still
+/// return source offsets that are valid UTF-8 slice boundaries.
+#[test]
+fn byte_fallback_truncation_preserves_utf8_sliceable_offsets_for_partial_emoji() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "A": 1,
+      "B": 2,
+      "<0xF0>": 10,
+      "<0x9F>": 11,
+      "<0x98>": 12,
+      "<0x80>": 13
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "A😀B";
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 3,
+        ..Default::default()
+    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &opts) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(result.num_tokens, 3, "A + two fallback bytes after truncation");
+
+    let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+    assert_eq!(ids, &[1, 10, 11]);
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 1));
+    assert_eq!((offsets[1].start, offsets[1].end), (1, 5));
+    assert_eq!((offsets[2].start, offsets[2].end), (1, 5));
+
+    for (idx, off) in offsets.iter().enumerate() {
+        let start = off.start as usize;
+        let end = off.end as usize;
+        assert!(
+            input.get(start..end).is_some(),
+            "offset[{idx}] must be directly sliceable on UTF-8 boundaries: ({start},{end})"
+        );
+    }
+
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
@@ -1741,5 +1956,166 @@ fn byte_level_add_prefix_space_real_leading_space_keeps_real_offset() {
     assert_eq!((offsets[4].start, offsets[4].end), (4, 5));
     assert_eq!((offsets[5].start, offsets[5].end), (5, 6));
 
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Byte-level models expose byte-span offsets, which are intrinsically not
+/// UTF-8-sliceable for multibyte scalars (e.g. emoji). This test codifies that
+/// contract explicitly.
+#[test]
+fn byte_level_offsets_are_intrinsically_non_sliceable_for_multibyte_chars() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let input = "😊";
+    assert_eq!(input.len(), 4, "emoji must occupy 4 UTF-8 bytes");
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null());
+    assert_eq!(
+        result.num_tokens, 4,
+        "byte-level encoding should emit one token per UTF-8 byte"
+    );
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    // At least one span must bisect a UTF-8 scalar boundary.
+    assert!(
+        offsets.iter().any(|off| input.get(off.start as usize..off.end as usize).is_none()),
+        "byte-level byte-span offsets should not all be UTF-8-sliceable for multibyte input"
+    );
+    assert!(
+        !input.is_char_boundary(offsets[0].end as usize),
+        "first byte-level token for emoji must end off a scalar boundary"
+    );
+
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Deeply stacked combining marks ("Zalgo") must still yield sliceable,
+/// monotonic UTF-8 offsets for WordPiece pipelines.
+#[test]
+fn offsets_wordpiece_zalgo_combining_marks_are_sliceable() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 512,
+    "vocab": {
+      "[UNK]": 0,
+      "a": 1,
+      "b": 2
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": false,
+    "lowercase": false
+  },
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let mut input = String::from("a");
+    for _ in 0..200 {
+        input.push('\u{0301}');
+    }
+    input.push('b');
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed on zalgo input");
+    assert!(result.num_tokens > 0, "zalgo input must emit at least one token");
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    let mut prev_end = 0usize;
+    for (idx, off) in offsets.iter().enumerate() {
+        let start = off.start as usize;
+        let end = off.end as usize;
+        assert!(
+            start <= end && end <= input.len(),
+            "offset[{idx}] out of bounds: ({start},{end})"
+        );
+        assert_eq!(
+            start, prev_end,
+            "offset[{idx}] must be contiguous (prev_end={prev_end}, start={start})"
+        );
+        assert!(
+            input.get(start..end).is_some(),
+            "offset[{idx}] must be UTF-8-sliceable: ({start},{end})"
+        );
+        prev_end = end;
+    }
+    assert_eq!(
+        prev_end,
+        input.len(),
+        "zalgo input must be fully covered by final offset end (dropped bytes detected)"
+    );
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Offsets around BiDi control chars and ZWJ emoji sequences must remain
+/// sliceable and in-bounds.
+#[test]
+fn offsets_wordpiece_bidi_and_zwj_are_sliceable() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 512,
+    "vocab": {
+      "[UNK]": 0,
+      "ab": 1,
+      "cd": 2,
+      "ef": 3
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": false,
+    "lowercase": false
+  },
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "ab\u{202E}cd👨\u{200D}👩\u{200D}👧\u{200D}👦ef";
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(result.error_msg.is_null(), "encode failed on BiDi/ZWJ input");
+    assert!(result.num_tokens > 0, "BiDi/ZWJ input must emit at least one token");
+
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    let mut prev_end = 0usize;
+    for (idx, off) in offsets.iter().enumerate() {
+        let start = off.start as usize;
+        let end = off.end as usize;
+        assert!(
+            start <= end && end <= input.len(),
+            "offset[{idx}] out of bounds: ({start},{end})"
+        );
+        assert_eq!(
+            start, prev_end,
+            "offset[{idx}] must be contiguous (prev_end={prev_end}, start={start})"
+        );
+        assert!(
+            input.get(start..end).is_some(),
+            "offset[{idx}] must be UTF-8-sliceable around BiDi/ZWJ content: ({start},{end})"
+        );
+        prev_end = end;
+    }
+    assert_eq!(
+        prev_end,
+        input.len(),
+        "BiDi/ZWJ input must be fully covered by final offset end (dropped bytes detected)"
+    );
     unsafe { talu_sys::talu_encode_result_free(result) };
 }

@@ -7,12 +7,30 @@
 use crate::capi::tokenizer::common::{
     build_byte_level_tokenizer_json, byte_token_id, encode_raw, TokenizerTestContext,
 };
+use std::sync::mpsc;
+use std::time::Duration;
 
 fn no_bos() -> talu_sys::EncodeOptions {
     talu_sys::EncodeOptions {
         add_bos: 0,
         ..Default::default()
     }
+}
+
+fn encode_with_deadlock_guard(json: &str, text: &str, timeout_ms: u64) -> Vec<u32> {
+    let (tx, rx) = mpsc::channel();
+    let json_owned = json.to_owned();
+    let text_owned = text.to_owned();
+
+    std::thread::spawn(move || {
+        let ctx = TokenizerTestContext::from_json(&json_owned);
+        let tokens = ctx.encode_with(&text_owned, &no_bos());
+        tx.send(tokens)
+            .expect("zero-width regex worker must send encode result");
+    });
+
+    rx.recv_timeout(Duration::from_millis(timeout_ms))
+        .expect("encode likely hung (zero-width regex loop did not make progress)")
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +567,51 @@ fn pretokenizer_split_regex_empty_match_completes() {
     );
 }
 
+/// Split with a zero-width start-anchor regex must terminate and preserve
+/// tokenization parity with a null pre-tokenizer (no chars consumed).
+#[test]
+fn pretokenizer_split_regex_caret_empty_match_matches_null_pretokenizer() {
+    let split_json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"^"},"behavior":"Removed","invert":false}"#,
+    );
+    let baseline_json = ascii_with_pretokenizer("null");
+
+    let text = "hello world";
+
+    // Deadlock guard: zero-width regex engines can loop if the cursor is not
+    // advanced on empty matches.
+    let split_tokens = encode_with_deadlock_guard(&split_json, text, 500);
+    let baseline_tokens = encode_with_deadlock_guard(&baseline_json, text, 500);
+
+    assert_eq!(
+        split_tokens, baseline_tokens,
+        "zero-width '^' split must not alter tokenization vs null pre-tokenizer"
+    );
+}
+
+/// Split with a zero-width word-boundary regex must terminate and preserve
+/// tokenization parity with a null pre-tokenizer (boundary matches consume
+/// zero bytes and must not cause looping or token loss).
+#[test]
+fn pretokenizer_split_regex_word_boundary_empty_match_matches_null_pretokenizer() {
+    let split_json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"\\b"},"behavior":"Removed","invert":false}"#,
+    );
+    let baseline_json = ascii_with_pretokenizer("null");
+
+    let text = "hello world";
+
+    // Deadlock guard: zero-width regex engines can loop if the cursor is not
+    // advanced on empty matches.
+    let split_tokens = encode_with_deadlock_guard(&split_json, text, 500);
+    let baseline_tokens = encode_with_deadlock_guard(&baseline_json, text, 500);
+
+    assert_eq!(
+        split_tokens, baseline_tokens,
+        "zero-width '\\\\b' split must not alter tokenization vs null pre-tokenizer"
+    );
+}
+
 /// Split behavior Removed should drop regex matches and keep non-matching gaps.
 #[test]
 fn pretokenizer_split_removed_drops_matches() {
@@ -655,6 +718,169 @@ fn pretokenizer_split_pathological_regex_large_non_match_deterministic() {
     assert!(
         !first.is_empty(),
         "large non-matching pathological regex input must still produce output tokens"
+    );
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn run_pcre2_invalid_utf8_page_boundary_inner() {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    unsafe extern "C" {
+        fn getpagesize() -> i32;
+        fn mmap(
+            addr: *mut c_void,
+            length: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: isize,
+        ) -> *mut c_void;
+        fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+    }
+
+    const PROT_NONE: i32 = 0;
+    const PROT_READ: i32 = 0x1;
+    const PROT_WRITE: i32 = 0x2;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_ANONYMOUS: i32 = 0x20;
+
+    let page_size = unsafe { getpagesize() };
+    assert!(page_size > 0, "getpagesize must return a positive value");
+    let page = page_size as usize;
+    let len = page * 2;
+
+    let mapping = unsafe {
+        mmap(
+            ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(
+        mapping as isize, -1,
+        "mmap for guarded boundary test must succeed"
+    );
+
+    let base = mapping.cast::<u8>();
+    let guard = unsafe { base.add(page) };
+    let protect_rc = unsafe { mprotect(guard.cast(), page, PROT_NONE) };
+    assert_eq!(protect_rc, 0, "mprotect(PROT_NONE) for guard page failed");
+
+    let tail = unsafe { base.add(page - 1) };
+    unsafe { *tail = 0xF0 };
+
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"\\p{L}+"},"behavior":"Isolated","invert":false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let opts = no_bos();
+    let input = unsafe { std::slice::from_raw_parts(tail, 1) };
+    let result = unsafe { encode_raw(ctx.handle(), input, &opts) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
+
+    let unmap_rc = unsafe { munmap(mapping, len) };
+    assert_eq!(unmap_rc, 0, "munmap for guarded boundary mapping failed");
+}
+
+/// Invalid UTF-8 fed to PCRE2-backed Split pretokenization must never trigger
+/// an out-of-bounds read across an unreadable page boundary.
+///
+/// This runs in a subprocess so a native crash is reported as a test failure
+/// instead of terminating the parent harness.
+#[cfg(target_os = "linux")]
+#[test]
+fn pretokenizer_pcre2_invalid_utf8_page_boundary_overread() {
+    const INNER_ENV: &str = "TALU_INNER_PCRE2_PAGE_GUARD";
+    if std::env::var_os(INNER_ENV).is_some() {
+        unsafe { run_pcre2_invalid_utf8_page_boundary_inner() };
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let output = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("capi::tokenizer::pipeline::pretokenizer_pcre2_invalid_utf8_page_boundary_overread")
+        .arg("--nocapture")
+        .env(INNER_ENV, "1")
+        .output()
+        .expect("subprocess launch for guarded invalid-UTF8 PCRE2 test must succeed");
+
+    assert!(
+        output.status.success(),
+        "guarded invalid-UTF8 PCRE2 path crashed or failed (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Pathological backtracking patterns on very large non-matching input must
+/// return a typed error when PCRE2 exhausts internal match limits.
+#[test]
+#[ignore = "expensive regex-engine stress; run manually when validating PCRE2 failure propagation"]
+fn pretokenizer_pcre2_match_limit_exhaustion_returns_error() {
+    let json = ascii_with_pretokenizer(
+        r#"{"type":"Split","pattern":{"Regex":"(a+)+b"},"behavior":"Isolated","invert":false}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let text = vec![b'a'; 5 * 1024 * 1024];
+    let result = unsafe { encode_raw(ctx.handle(), &text, &no_bos()) };
+    assert!(
+        !result.error_msg.is_null(),
+        "PCRE2 match-limit exhaustion must propagate as a hard tokenizer error"
+    );
+    if result.error_msg.is_null() {
+        unsafe { talu_sys::talu_encode_result_free(result) };
+    }
+}
+
+/// Exponential Sequence(Replace) normalizer bombs must fail safely through the
+/// C API (typed error), not hang or crash the process.
+#[test]
+#[ignore = "expensive OOM-path stress; run manually for malicious-normalizer validation"]
+fn normalizer_exponential_expansion_bomb_is_safely_caught() {
+    let stage =
+        r#"{"type":"Replace","pattern":{"String":"a"},"content":"aaaaa"}"#.to_string();
+    let chain = vec![stage; 20].join(",");
+    let normalizer = format!(r#"{{"type":"Sequence","normalizers":[{chain}]}}"#);
+    let json = byte_level_with_normalizer(&normalizer);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let result = unsafe { encode_raw(ctx.handle(), b"a", &no_bos()) };
+    assert!(
+        !result.error_msg.is_null(),
+        "exponential normalizer expansion must return a typed error instead of crashing"
+    );
+    if result.error_msg.is_null() {
+        unsafe { talu_sys::talu_encode_result_free(result) };
+    }
+}
+
+/// Large Replace-normalizer expansions must remain deterministic and bounded,
+/// not hang or crash on repeated expansion-heavy input.
+#[test]
+fn normalizer_replace_large_expansion_deterministic() {
+    let json = byte_level_with_normalizer(
+        r#"{"type":"Replace","pattern":{"String":"a"},"content":"aaaaa"}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let text = "a".repeat(20_000);
+
+    let first = ctx.encode_with(&text, &no_bos());
+    let second = ctx.encode_with(&text, &no_bos());
+
+    assert_eq!(
+        first, second,
+        "large Replace expansion must be deterministic across runs"
+    );
+    assert_eq!(
+        first.len(),
+        100_000,
+        "Replace(a->aaaaa) must expand token count 5x on pure 'a' input"
     );
 }
 
@@ -1066,4 +1292,75 @@ fn pretokenizer_split_invalid_utf8_is_stable() {
         talu_sys::talu_encode_result_free(first);
         talu_sys::talu_encode_result_free(second);
     }
+}
+
+fn run_normalizer_nfc_with_invalid_utf8_fails_gracefully_inner() {
+    let json = byte_level_with_normalizer(r#"{"type": "NFC"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let bytes = [0xFFu8, 0xC0u8, 0x80u8];
+
+    let first = unsafe { encode_raw(ctx.handle(), &bytes, &no_bos()) };
+    let second = unsafe { encode_raw(ctx.handle(), &bytes, &no_bos()) };
+
+    assert_eq!(
+        first.error_msg.is_null(),
+        second.error_msg.is_null(),
+        "NFC invalid-UTF8 behavior must be deterministic across calls"
+    );
+
+    if first.error_msg.is_null() {
+        assert!(second.error_msg.is_null());
+        assert_eq!(
+            first.num_tokens, second.num_tokens,
+            "successful NFC invalid-UTF8 path must be deterministic in token count"
+        );
+
+        let first_ids = if first.ids.is_null() || first.num_tokens == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(first.ids, first.num_tokens) }
+        };
+        let second_ids = if second.ids.is_null() || second.num_tokens == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(second.ids, second.num_tokens) }
+        };
+        assert_eq!(
+            first_ids, second_ids,
+            "successful NFC invalid-UTF8 path must be deterministic in IDs"
+        );
+    }
+
+    unsafe {
+        talu_sys::talu_encode_result_free(first);
+        talu_sys::talu_encode_result_free(second);
+    }
+}
+
+/// NFC normalization on invalid UTF-8 must fail gracefully or produce a stable
+/// fallback path; it must never crash inside normalization.
+#[test]
+fn normalizer_nfc_with_invalid_utf8_fails_gracefully() {
+    const INNER_ENV: &str = "TALU_INNER_NFC_INVALID_UTF8";
+    if std::env::var_os(INNER_ENV).is_some() {
+        run_normalizer_nfc_with_invalid_utf8_fails_gracefully_inner();
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let output = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("capi::tokenizer::pipeline::normalizer_nfc_with_invalid_utf8_fails_gracefully")
+        .arg("--nocapture")
+        .env(INNER_ENV, "1")
+        .output()
+        .expect("subprocess launch for NFC invalid-UTF8 test must succeed");
+
+    assert!(
+        output.status.success(),
+        "NFC invalid-UTF8 subprocess failed (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }

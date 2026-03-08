@@ -159,6 +159,58 @@ fn encode_rejects_invalid_truncation_side() {
     }
 }
 
+/// Non-canonical nonzero option bytes from foreign callers (e.g. 255 for
+/// boolean-like flags) must be treated identically to canonical `1`.
+#[test]
+fn encode_noncanonical_nonzero_flag_bytes_match_canonical_true() {
+    let ctx = TokenizerTestContext::new();
+    let canonical = talu_sys::EncodeOptions {
+        add_bos: 1,
+        truncation: 1,
+        truncation_side: 0,
+        max_length: 2,
+        ..Default::default()
+    };
+    let noncanonical = talu_sys::EncodeOptions {
+        add_bos: 255,
+        truncation: 255,
+        truncation_side: 0,
+        max_length: 2,
+        ..Default::default()
+    };
+
+    let expected = ctx.encode_with("Hello", &canonical);
+    let got = ctx.encode_with("Hello", &noncanonical);
+    assert_eq!(
+        got, expected,
+        "non-canonical nonzero flag bytes must behave like true across FFI"
+    );
+}
+
+/// FFI callers may send nonzero garbage in struct padding bytes; encode must
+/// ignore `_padding` and produce identical results.
+#[test]
+fn encode_options_padding_bytes_are_ignored() {
+    let ctx = TokenizerTestContext::new();
+    let canonical = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 0,
+        truncation_side: 0,
+        _padding: [0; 4],
+        max_length: 0,
+        add_eos: 0,
+    };
+    let mut dirty = canonical;
+    dirty._padding = [0xFF; 4];
+
+    let expected = ctx.encode_with("Hello", &canonical);
+    let got = ctx.encode_with("Hello", &dirty);
+    assert_eq!(
+        got, expected,
+        "EncodeOptions padding bytes must not affect encode semantics"
+    );
+}
+
 /// Repeated pattern with spaces: "abc123 " × 50.
 /// Spaces become unk (3), ASCII chars encode normally.
 #[test]

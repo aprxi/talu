@@ -8,9 +8,11 @@ use crate::capi::tokenizer::common::{
     TOKENIZER_JSON,
 };
 use std::ffi::c_void;
+use std::fs;
 use std::ptr;
-use std::sync::{Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -66,6 +68,34 @@ fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
+struct TempModelDir {
+    path: std::path::PathBuf,
+}
+
+impl TempModelDir {
+    fn new_with_tokenizer_json(json: &str) -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time must be after UNIX_EPOCH")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "talu_lazy_loader_race_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        fs::create_dir_all(&path).expect("temp model dir must be created");
+        fs::write(path.join("tokenizer.json"), json.as_bytes())
+            .expect("tokenizer.json must be written");
+        Self { path }
+    }
+}
+
+impl Drop for TempModelDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Default encode options (no BOS).
 fn no_bos() -> talu_sys::EncodeOptions {
     talu_sys::EncodeOptions {
@@ -85,6 +115,52 @@ fn encode_1mb_string() {
     let input = ascii_string(1_000_000);
     let tokens = ctx.encode_with(&input, &no_bos());
     assert_eq!(tokens.len(), 1_000_000);
+}
+
+/// Heuristic DoS probe for BPE merge complexity on a massive single word.
+///
+/// This is an opt-in stress test: run manually to detect regressions toward an
+/// O(N^2) merge loop on large repetitive inputs.
+#[test]
+#[ignore = "expensive algorithmic-DoS probe; run manually when validating BPE merge complexity"]
+fn bpe_massive_word_merges_in_subquadratic_time() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "a": 1, "aa": 2
+    },
+    "merges": ["a a"]
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": null
+}"####;
+
+    let input = "a".repeat(60_000);
+    let (tx, rx) = mpsc::channel();
+    let json_owned = json.to_string();
+
+    std::thread::spawn(move || {
+        let ctx = TokenizerTestContext::from_json(&json_owned);
+        let tokens = ctx.encode_with(&input, &no_bos());
+        tx.send(tokens.len())
+            .expect("sender must deliver token length");
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        Ok(len) => {
+            assert_eq!(len, 30_000, "60k 'a's should reduce to 30k 'aa' tokens");
+        }
+        Err(_) => {
+            panic!(
+                "BPE algorithmic DoS vulnerability detected: merge exceeded 500ms budget"
+            );
+        }
+    }
 }
 
 /// Decoding 1M tokens roundtrips to the original 1MB string.
@@ -567,6 +643,80 @@ fn concurrent_decode_8_threads() {
     }
 }
 
+/// Concurrent decode with heterogeneous valid/invalid ID arrays must keep
+/// per-call decoder state isolated and deterministic across threads.
+#[test]
+fn concurrent_decode_mixed_valid_invalid_inputs_remains_isolated() {
+    let ctx = TokenizerTestContext::new();
+    let shared = Arc::new(SharedHandle(ctx.handle()));
+    let barrier = Arc::new(Barrier::new(8));
+    let decode_opts = talu_sys::DecodeOptionsC::default();
+    let mut handles = Vec::new();
+
+    #[derive(Clone, Copy)]
+    enum Expectation {
+        Text(&'static str),
+        Error,
+    }
+
+    let cases: Arc<Vec<(Vec<u32>, Expectation)>> = Arc::new(vec![
+        (vec![44, 77], Expectation::Text("Hi")),
+        (vec![44, 73, 80, 80, 83], Expectation::Text("Hello")),
+        (vec![20, 21, 22], Expectation::Text("012")),
+        (vec![999_999], Expectation::Error),
+        (vec![44, 999_999, 77], Expectation::Error),
+        (vec![u32::MAX], Expectation::Error),
+    ]);
+
+    for thread_id in 0..8 {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        let cases = Arc::clone(&cases);
+        let handle = thread::spawn(move || {
+            barrier.wait();
+            for i in 0..300 {
+                let idx = (thread_id * 13 + i * 7) % cases.len();
+                let (ids, expected) = &cases[idx];
+                let result = unsafe { super::common::decode_raw(shared.ptr(), ids, &decode_opts) };
+
+                match expected {
+                    Expectation::Text(text) => {
+                        assert!(
+                            result.error_msg.is_null(),
+                            "thread {thread_id} iter {i}: valid case {idx} unexpectedly failed"
+                        );
+                        let decoded = unsafe {
+                            let slice = std::slice::from_raw_parts(result.text, result.text_len);
+                            std::str::from_utf8(slice).expect("decode output must be UTF-8")
+                        };
+                        assert_eq!(
+                            decoded, *text,
+                            "thread {thread_id} iter {i}: valid decode mismatch for case {idx}"
+                        );
+                    }
+                    Expectation::Error => {
+                        assert!(
+                            !result.error_msg.is_null(),
+                            "thread {thread_id} iter {i}: invalid case {idx} must fail"
+                        );
+                        assert!(result.text.is_null());
+                        assert_eq!(result.text_len, 0);
+                    }
+                }
+
+                unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
+            }
+        });
+        handles.push(handle);
+    }
+
+    for (i, handle) in handles.into_iter().enumerate() {
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("Thread {i} panicked"));
+    }
+}
+
 /// 8 threads × 25 iterations of encode→decode roundtrip on shared handle.
 ///
 /// Each thread encodes a string, decodes the result, and verifies the roundtrip.
@@ -670,6 +820,59 @@ fn concurrent_encode_barrier_high_contention() {
             }
         });
         handles.push(handle);
+    }
+
+    for (i, handle) in handles.into_iter().enumerate() {
+        handle
+            .join()
+            .unwrap_or_else(|_| panic!("Thread {i} panicked"));
+    }
+}
+
+/// Forced lockstep contention: every iteration synchronizes all threads before
+/// and after encode so calls collide in time, and all threads encode from the
+/// exact same input memory address.
+#[test]
+fn concurrent_encode_lockstep_same_input_pointer_forced_contention() {
+    let ctx = TokenizerTestContext::new();
+    let shared = Arc::new(SharedHandle(ctx.handle()));
+    let input = Arc::new(b"Hello123!?Hello123!?".to_vec());
+    let opts = no_bos();
+    let expected = Arc::new(ctx.encode_with(
+        std::str::from_utf8(&input).expect("lockstep test input must be valid UTF-8"),
+        &opts,
+    ));
+
+    let num_threads = 12;
+    let iterations = 128;
+    let start_barrier = Arc::new(Barrier::new(num_threads));
+    let end_barrier = Arc::new(Barrier::new(num_threads));
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for thread_id in 0..num_threads {
+        let shared = Arc::clone(&shared);
+        let input = Arc::clone(&input);
+        let expected = Arc::clone(&expected);
+        let start_barrier = Arc::clone(&start_barrier);
+        let end_barrier = Arc::clone(&end_barrier);
+        handles.push(thread::spawn(move || {
+            for i in 0..iterations {
+                start_barrier.wait();
+                let result = unsafe { super::common::encode_raw(shared.ptr(), input.as_slice(), &opts) };
+                assert!(
+                    result.error_msg.is_null(),
+                    "thread {thread_id} iter {i}: encode failed"
+                );
+                let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+                assert_eq!(
+                    ids,
+                    expected.as_slice(),
+                    "thread {thread_id} iter {i}: lockstep same-pointer encode mismatch"
+                );
+                unsafe { talu_sys::talu_encode_result_free(result) };
+                end_barrier.wait();
+            }
+        }));
     }
 
     for (i, handle) in handles.into_iter().enumerate() {
@@ -983,6 +1186,160 @@ fn concurrent_take_last_error_is_thread_isolated() {
 
     ok_handle.join().expect("success thread panicked");
     err_handle.join().expect("error thread panicked");
+}
+
+fn run_concurrent_error_paths_do_not_data_race_inner(threads: usize, iterations: usize) {
+    let ctx = TokenizerTestContext::new();
+    let shared = Arc::new(SharedHandle(ctx.handle()));
+    let barrier = Arc::new(Barrier::new(threads));
+    let bad_opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        truncation: 1,
+        truncation_side: 255, // invalid side to force deterministic encode error
+        max_length: 2,
+        ..Default::default()
+    };
+
+    let mut handles = Vec::with_capacity(threads);
+    for thread_id in 0..threads {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        let opts = bad_opts;
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for i in 0..iterations {
+                let result = unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &opts) };
+                assert!(
+                    !result.error_msg.is_null(),
+                    "thread {thread_id} iter {i}: invalid truncation_side must fail"
+                );
+                unsafe { talu_sys::talu_encode_result_free(result) };
+            }
+        }));
+    }
+
+    for (i, h) in handles.into_iter().enumerate() {
+        h.join().unwrap_or_else(|_| panic!("Thread {i} panicked"));
+    }
+}
+
+/// Concurrent error-path encode calls on a shared handle must not crash.
+///
+/// This specifically stress-tests shared error-state mutation paths that are
+/// not exercised by success-only concurrency tests.
+#[test]
+fn concurrent_error_paths_do_not_data_race() {
+    const INNER_ENV: &str = "TALU_INNER_CONCURRENT_ERROR_PATHS";
+    if std::env::var_os(INNER_ENV).is_some() {
+        run_concurrent_error_paths_do_not_data_race_inner(16, 500);
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let output = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("capi::tokenizer::stress::concurrent_error_paths_do_not_data_race")
+        .arg("--nocapture")
+        .env(INNER_ENV, "1")
+        .output()
+        .expect("subprocess launch for concurrent error-path race test must succeed");
+
+    assert!(
+        output.status.success(),
+        "concurrent error-path race subprocess failed (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// TSAN-targeted variant: same race surface as
+/// `concurrent_error_paths_do_not_data_race`, but with heavier iteration
+/// counts intended for sanitizer runs.
+#[test]
+#[ignore = "run under ThreadSanitizer to deterministically detect shared error-state races"]
+fn concurrent_error_paths_do_not_data_race_tsan() {
+    run_concurrent_error_paths_do_not_data_race_inner(24, 5_000);
+}
+
+fn run_file_loader_first_encode_concurrent_race_inner(threads: usize) {
+    let temp_model = TempModelDir::new_with_tokenizer_json(TOKENIZER_JSON);
+    let model_path = std::ffi::CString::new(temp_model.path.to_string_lossy().into_owned())
+        .expect("temp model dir path must be valid C string");
+
+    let mut handle: *mut c_void = ptr::null_mut();
+    let rc = unsafe {
+        talu_sys::talu_tokenizer_create(
+            model_path.as_ptr(),
+            &mut handle as *mut _ as *mut c_void,
+        )
+    };
+    assert_eq!(
+        rc, 0,
+        "file-based tokenizer create must succeed before lazy-loader race stress"
+    );
+    assert!(!handle.is_null(), "file-based create returned null handle");
+
+    let shared = Arc::new(SharedHandle(handle));
+    let barrier = Arc::new(Barrier::new(threads));
+    let mut joins = Vec::with_capacity(threads);
+
+    for thread_id in 0..threads {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        joins.push(thread::spawn(move || {
+            let opts = no_bos();
+            barrier.wait();
+            let result = unsafe { super::common::encode_raw(shared.ptr(), b"Hello", &opts) };
+            assert!(
+                result.error_msg.is_null(),
+                "thread {thread_id}: first encode on file-loaded tokenizer must succeed"
+            );
+            let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+            assert_eq!(
+                ids,
+                &[44, 73, 80, 80, 83],
+                "thread {thread_id}: first encode must match fixture token IDs"
+            );
+            unsafe { talu_sys::talu_encode_result_free(result) };
+        }));
+    }
+
+    for (i, join) in joins.into_iter().enumerate() {
+        join.join()
+            .unwrap_or_else(|_| panic!("lazy-loader race thread {i} panicked"));
+    }
+
+    unsafe { talu_sys::talu_tokenizer_free(handle) };
+}
+
+/// File-based `talu_tokenizer_create` must be safe under concurrent first
+/// encode calls. If model internals are lazily initialized on first use, this
+/// test exposes races by releasing all threads on the same barrier tick.
+#[test]
+fn file_loader_first_encode_concurrent_race_is_safe() {
+    const INNER_ENV: &str = "TALU_INNER_FILE_LOADER_FIRST_ENCODE_RACE";
+    if std::env::var_os(INNER_ENV).is_some() {
+        run_file_loader_first_encode_concurrent_race_inner(16);
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let output = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("capi::tokenizer::stress::file_loader_first_encode_concurrent_race_is_safe")
+        .arg("--nocapture")
+        .env(INNER_ENV, "1")
+        .output()
+        .expect("subprocess launch for file-loader first-encode race test must succeed");
+
+    assert!(
+        output.status.success(),
+        "file-loader first-encode race subprocess failed (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 /// Repeated tokenizer-creation failures on one thread must not poison clean

@@ -7,7 +7,8 @@
 //! Token ID layout: byte b → ID b + 4.
 
 use crate::capi::tokenizer::common::{
-    build_byte_level_tokenizer_json, byte_token_id, encode_raw, TokenizerTestContext,
+    build_byte_level_tokenizer_json, byte_token_id, byte_token_surface, encode_raw,
+    TokenizerTestContext,
 };
 
 fn no_bos() -> talu_sys::EncodeOptions {
@@ -115,6 +116,39 @@ fn cjk_tokenizes_to_byte_tokens() {
             "byte {i} (0x{b:02X}) ID mismatch"
         );
     }
+}
+
+/// Embedded NUL bytes must be surfaced as GPT-2 byte-level Unicode tokens in
+/// `tokenize` C-string output, never as raw `\0` that would truncate C-strings.
+#[test]
+fn tokenize_embedded_nul_uses_safe_bytelevel_surface() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let text = "a\0b";
+
+    let surfaces = tokenize_strings(&ctx, text);
+    assert_eq!(
+        surfaces,
+        vec!["a".to_string(), "Ā".to_string(), "b".to_string()],
+        "tokenize must escape embedded NUL as the GPT-2 byte-level surface"
+    );
+    assert_eq!(
+        surfaces[1],
+        byte_token_surface(0x00),
+        "embedded NUL must surface as mapped byte token text"
+    );
+
+    let bytes_surfaces = tokenize_bytes_strings(&ctx, text);
+    assert_eq!(
+        bytes_surfaces, surfaces,
+        "tokenize and tokenize_bytes surfaces must agree for embedded NUL input"
+    );
+
+    let ids = ctx.encode_with(text, &no_bos());
+    assert_eq!(
+        ids,
+        vec![byte_token_id(b'a'), byte_token_id(0x00), byte_token_id(b'b')],
+        "embedded NUL must remain represented in byte-level ID stream"
+    );
 }
 
 /// Every ASCII byte (0x00–0x7F) produces the correct byte token.

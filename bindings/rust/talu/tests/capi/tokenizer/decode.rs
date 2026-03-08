@@ -702,6 +702,124 @@ fn nested_strip_only_decoder_matches_flat_behavior() {
     );
 }
 
+/// Strip(start=1, content=" ") must not remove unrelated leading characters.
+#[test]
+fn decoder_strip_start_does_not_remove_non_matching_characters() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      " HelloWorld": 1,
+      "HelloWorld": 2
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(
+        ctx.decode(&[1]),
+        "HelloWorld",
+        "matching leading strip content must be removed exactly once"
+    );
+    assert_eq!(
+        ctx.decode(&[2]),
+        "HelloWorld",
+        "non-matching leading character must not be removed by Strip(start=1)"
+    );
+}
+
+fn run_decoder_strip_out_of_bounds_start_stop_inner() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0,
+      "   ": 1,
+      "Hello": 2
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "Strip", "content": " ", "start": 100, "stop": 100}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result =
+        unsafe { super::common::decode_raw(ctx.handle(), &[1], &talu_sys::DecodeOptionsC::default()) };
+    assert!(
+        result.error_msg.is_null(),
+        "strip decoder with out-of-bounds bounds must not error"
+    );
+    let text = if result.text.is_null() || result.text_len == 0 {
+        ""
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(result.text, result.text_len) };
+        std::str::from_utf8(slice).expect("decode must return valid UTF-8")
+    };
+    assert_eq!(
+        text, "",
+        "Strip(start=100, stop=100) over short matching content must clamp to empty"
+    );
+    unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
+
+    let non_match =
+        unsafe { super::common::decode_raw(ctx.handle(), &[2], &talu_sys::DecodeOptionsC::default()) };
+    assert!(
+        non_match.error_msg.is_null(),
+        "strip decoder must not error on non-matching leading content"
+    );
+    let non_match_text = if non_match.text.is_null() || non_match.text_len == 0 {
+        ""
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(non_match.text, non_match.text_len) };
+        std::str::from_utf8(slice).expect("decode must return valid UTF-8")
+    };
+    assert_eq!(
+        non_match_text, "Hello",
+        "non-matching content must remain unchanged even with oversized start/stop"
+    );
+    unsafe { talu_sys::talu_decode_result_free(non_match.text, non_match.text_len) };
+}
+
+/// Strip decoder bounds far outside the decoded string must clamp safely and
+/// never crash (subprocess-isolated to treat native aborts as test failures).
+#[test]
+fn decoder_strip_out_of_bounds_start_stop_clamps_safely() {
+    const INNER_ENV: &str = "TALU_INNER_STRIP_OOB_CLAMP";
+    if std::env::var_os(INNER_ENV).is_some() {
+        run_decoder_strip_out_of_bounds_start_stop_inner();
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let output = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("capi::tokenizer::decode::decoder_strip_out_of_bounds_start_stop_clamps_safely")
+        .arg("--nocapture")
+        .env(INNER_ENV, "1")
+        .output()
+        .expect("subprocess launch for strip out-of-bounds clamp test must succeed");
+
+    assert!(
+        output.status.success(),
+        "strip out-of-bounds clamp subprocess failed (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// A nested Replace stage inside an otherwise flat outer Sequence must behave
 /// exactly like the flat chain.
 #[test]
@@ -1965,6 +2083,49 @@ fn cleanup_multiple_literal_spaces_before_question_mark() {
     );
 }
 
+/// Large cleanup workloads with many literal-space tokens before punctuation
+/// must remain deterministic and preserve the same sequential replacement
+/// contract as small cases.
+#[test]
+fn cleanup_large_literal_space_run_before_question_mark_is_deterministic() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      " ": 3, "?": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let n = 20_000usize;
+    let mut ids = vec![3u32; n];
+    ids.push(4);
+
+    let first = ctx.decode(&ids);
+    let second = ctx.decode(&ids);
+    assert_eq!(first, second, "large cleanup decode must be deterministic");
+
+    let expected = format!("{}?", " ".repeat((2 * n) - 1));
+    assert_eq!(
+        first, expected,
+        "large literal-space cleanup must preserve the same one-space removal contract"
+    );
+}
+
 /// Cleanup should not strip newline content itself. If a literal newline token
 /// sits before punctuation, only the ordinary space inserted before the
 /// punctuation should be removed.
@@ -2057,4 +2218,152 @@ fn wordpiece_decode_invalid_token_id_errors() {
         result.text_len, 0,
         "text_len must be 0 for invalid WordPiece decode"
     );
+}
+
+/// Invalid ID before a valid WordPiece continuation token must fail cleanly and
+/// not enter a partial subword decode state.
+#[test]
+fn wordpiece_decode_invalid_then_subword_errors_cleanly() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "go": 1, "##ing": 2
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe {
+        super::common::decode_raw(
+            ctx.handle(),
+            &[999_999, 2],
+            &talu_sys::DecodeOptionsC::default(),
+        )
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "invalid+subword decode must fail with a typed error"
+    );
+    assert!(result.text.is_null());
+    assert_eq!(result.text_len, 0);
+    unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
+
+    // Erroring decode must not poison subsequent decodes on the same handle.
+    let ok = unsafe {
+        super::common::decode_raw(ctx.handle(), &[1, 2], &talu_sys::DecodeOptionsC::default())
+    };
+    assert!(
+        ok.error_msg.is_null(),
+        "decoder state must recover after invalid+subword failure"
+    );
+    let text = unsafe {
+        let bytes = std::slice::from_raw_parts(ok.text, ok.text_len);
+        std::str::from_utf8(bytes).expect("wordpiece decode output must be UTF-8")
+    };
+    assert_eq!(text, "going");
+    unsafe { talu_sys::talu_decode_result_free(ok.text, ok.text_len) };
+}
+
+/// Valid WordPiece continuation token followed by invalid ID must also fail
+/// cleanly and avoid partial output emission.
+#[test]
+fn wordpiece_decode_subword_then_invalid_errors_cleanly() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "go": 1, "##ing": 2
+    }
+  },
+  "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let result = unsafe {
+        super::common::decode_raw(
+            ctx.handle(),
+            &[2, 999_999],
+            &talu_sys::DecodeOptionsC::default(),
+        )
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "subword+invalid decode must fail with a typed error"
+    );
+    assert!(result.text.is_null());
+    assert_eq!(result.text_len, 0);
+    unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
+
+    // Erroring decode must not poison subsequent decodes on the same handle.
+    let ok = unsafe {
+        super::common::decode_raw(ctx.handle(), &[1, 2], &talu_sys::DecodeOptionsC::default())
+    };
+    assert!(
+        ok.error_msg.is_null(),
+        "decoder state must recover after subword+invalid failure"
+    );
+    let text = unsafe {
+        let bytes = std::slice::from_raw_parts(ok.text, ok.text_len);
+        std::str::from_utf8(bytes).expect("wordpiece decode output must be UTF-8")
+    };
+    assert_eq!(text, "going");
+    unsafe { talu_sys::talu_decode_result_free(ok.text, ok.text_len) };
+}
+
+/// Special-token wrappers must not hide invalid IDs in the middle.
+#[test]
+fn decode_bos_invalid_eos_errors_cleanly() {
+    let ctx = TokenizerTestContext::with_special_tokens();
+    let result = unsafe {
+        super::common::decode_raw(
+            ctx.handle(),
+            &[1, 999_999, 2],
+            &talu_sys::DecodeOptionsC {
+                skip_special_tokens: 0,
+            },
+        )
+    };
+    assert!(
+        !result.error_msg.is_null(),
+        "BOS/invalid/EOS decode must fail instead of partially decoding"
+    );
+    assert!(result.text.is_null());
+    assert_eq!(result.text_len, 0);
+
+    // Special-token decode error must not poison subsequent decodes.
+    let ok = unsafe {
+        super::common::decode_raw(
+            ctx.handle(),
+            &[1, 44, 77, 2],
+            &talu_sys::DecodeOptionsC {
+                skip_special_tokens: 0,
+            },
+        )
+    };
+    assert!(
+        ok.error_msg.is_null(),
+        "decoder state must recover after BOS/invalid/EOS failure"
+    );
+    let text = unsafe {
+        let bytes = std::slice::from_raw_parts(ok.text, ok.text_len);
+        std::str::from_utf8(bytes).expect("decode output must be UTF-8")
+    };
+    assert_eq!(text, "<s>Hi</s>");
+    unsafe { talu_sys::talu_decode_result_free(ok.text, ok.text_len) };
 }

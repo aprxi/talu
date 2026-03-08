@@ -262,14 +262,15 @@ impl TokenizerTestContext {
             result.error_msg.is_null(),
             "decode failed: error_msg is non-null"
         );
-        if result.text.is_null() || result.text_len == 0 {
-            return String::new();
-        }
-        let text = unsafe {
-            let slice = std::slice::from_raw_parts(result.text, result.text_len);
-            std::str::from_utf8(slice)
-                .expect("decode returned invalid UTF-8 bytes")
-                .to_owned()
+        let text = if result.text.is_null() || result.text_len == 0 {
+            String::new()
+        } else {
+            unsafe {
+                let slice = std::slice::from_raw_parts(result.text, result.text_len);
+                std::str::from_utf8(slice)
+                    .expect("decode returned invalid UTF-8 bytes")
+                    .to_owned()
+            }
         };
         unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
         text

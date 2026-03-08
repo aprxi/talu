@@ -532,6 +532,52 @@ fn decode_byte_fallback_null_options_defaults_to_skip_special_tokens() {
     unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
 }
 
+/// Literal input text that looks like a byte-fallback token must be treated as
+/// literal characters during encode, not captured as a synthetic byte-fallback
+/// symbol by raw vocab lookup.
+#[test]
+fn encode_literal_byte_fallback_string_is_not_captured_by_vocab() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "<": 1,
+      "0": 2,
+      "x": 3,
+      "4": 4,
+      "1": 5,
+      ">": 6,
+      "<0x41>": 7
+    },
+    "merges": []
+  },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": {"type": "ByteFallback"}
+}
+"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    let literal = ctx.encode_with("<0x41>", &talu_sys::EncodeOptions::default());
+    assert_eq!(
+        literal,
+        vec![1, 2, 3, 4, 5, 6],
+        "literal '<0x41>' text must tokenize as literal characters, not fallback token id 7"
+    );
+
+    assert_eq!(ctx.decode(&literal), "<0x41>");
+    assert_eq!(
+        ctx.decode(&[7]),
+        "A",
+        "byte-fallback token id must remain semantically distinct at decode time"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Edge cases
 // ---------------------------------------------------------------------------

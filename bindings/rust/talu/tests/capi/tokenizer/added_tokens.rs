@@ -939,6 +939,89 @@ fn added_token_preempts_wordpiece_greedy_matching() {
     assert_eq!(tokenize_bytes_strings(&ctx, "hello"), vec!["hello"]);
 }
 
+/// Added-token matching must happen after normalization but before
+/// BertPreTokenizer punctuation splitting. A literal `##`-prefixed added token
+/// should still match when input casing differs and lowercase normalization is
+/// enabled.
+#[test]
+fn added_token_hashhash_prefix_matches_after_lowercase_before_pretokenizer_split() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0,
+      "hello": 1
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 201, "content": "##hello", "special": false}
+  ],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": false,
+    "lowercase": true
+  },
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    assert_eq!(
+        ctx.encode_with("##HELLO", &no_bos()),
+        vec![201],
+        "added-token matching should win after lowercase normalization and before punctuation split"
+    );
+    assert_eq!(tokenize_strings(&ctx, "##HELLO"), vec!["##hello"]);
+    assert_eq!(tokenize_bytes_strings(&ctx, "##HELLO"), vec!["##hello"]);
+}
+
+/// Added token content collision with base vocab must resolve in favor of the
+/// added token during encode and token-id lookup.
+#[test]
+fn added_token_exact_content_collision_preempts_base_vocab() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0,
+      "hello": 10
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 99, "content": "hello", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    assert_eq!(
+        ctx.encode_with("hello", &no_bos()),
+        vec![99],
+        "added token must preempt colliding base-vocab token content during encode"
+    );
+
+    let id = unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), b"hello".as_ptr(), 5) };
+    assert_eq!(
+        id, 99,
+        "token_to_id must resolve colliding token content to added-token id"
+    );
+}
+
 /// Added-token matching must also preempt Unigram Viterbi path selection.
 #[test]
 fn added_token_preempts_unigram_viterbi_path() {
@@ -2490,5 +2573,152 @@ fn rstrip_consumes_unicode_whitespace_nbsp_and_ideographic_space() {
     assert_eq!(
         with_ideographic, base,
         "rstrip should consume trailing ideographic space after added token"
+    );
+}
+
+/// Adjacent added tokens with `rstrip` then `lstrip` must consume a shared
+/// boundary space exactly once with deterministic ownership (left token wins).
+#[test]
+fn adjacent_rstrip_then_lstrip_claims_single_shared_space_without_offset_overlap() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1, " ": 2
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 210, "content": "[A]", "special": false, "rstrip": true},
+    {"id": 211, "content": "[B]", "special": false, "lstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "[A] [B]x";
+
+    assert_eq!(
+        ctx.encode_with(input, &no_bos()),
+        vec![210, 211, 1],
+        "shared boundary space must not be emitted as a standalone token"
+    );
+
+    let raw = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(raw.error_msg.is_null());
+    assert_eq!(raw.num_tokens, 3);
+    let offsets = unsafe { std::slice::from_raw_parts(raw.offsets, raw.num_tokens) };
+    // Left token owns the shared boundary space via rstrip.
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 4));
+    assert_eq!((offsets[1].start, offsets[1].end), (4, 7));
+    assert_eq!((offsets[2].start, offsets[2].end), (7, 8));
+    unsafe { talu_sys::talu_encode_result_free(raw) };
+}
+
+/// With multiple shared spaces, adjacent `rstrip`/`lstrip` added tokens must
+/// still maintain deterministic, monotonic offset ownership without overlap.
+#[test]
+fn adjacent_rstrip_and_lstrip_compete_for_multiple_spaces() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "x": 1, " ": 2
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 210, "content": "[A]", "special": false, "rstrip": true},
+    {"id": 211, "content": "[B]", "special": false, "lstrip": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let input = "[A]    [B]x";
+
+    assert_eq!(
+        ctx.encode_with(input, &no_bos()),
+        vec![210, 211, 1],
+        "shared multi-space run must not leak standalone space tokens"
+    );
+
+    let raw = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
+    assert!(raw.error_msg.is_null());
+    assert_eq!(raw.num_tokens, 3);
+    let offsets = unsafe { std::slice::from_raw_parts(raw.offsets, raw.num_tokens) };
+    assert_eq!((offsets[0].start, offsets[0].end), (0, 3));
+    assert_eq!((offsets[1].start, offsets[1].end), (3, 10));
+    assert_eq!((offsets[2].start, offsets[2].end), (10, 11));
+    assert!(
+        offsets[0].end <= offsets[1].start && offsets[1].end <= offsets[2].start,
+        "offsets must remain monotonic and non-overlapping"
+    );
+    unsafe { talu_sys::talu_encode_result_free(raw) };
+}
+
+/// Large added-token dictionaries must preserve deterministic matching and
+/// still find a late-entry token without false-positive preemption.
+#[test]
+fn large_added_token_dictionary_matches_late_entry_deterministically() {
+    let count = 10_000usize;
+    let mut added = Vec::with_capacity(count + 1);
+    added.push(r#"{"id": 0, "content": "<unk>", "special": true}"#.to_string());
+    for i in 0..count {
+        added.push(format!(
+            r#"{{"id": {}, "content": "__AT_{:05}__", "special": false}}"#,
+            1000 + i,
+            i
+        ));
+    }
+
+    let json = format!(
+        r####"{{
+  "version": "1.0",
+  "model": {{
+    "type": "BPE",
+    "vocab": {{
+      "<unk>": 0, "x": 1
+    }},
+    "merges": []
+  }},
+  "added_tokens": [{}],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}}"####,
+        added.join(",")
+    );
+
+    let ctx = TokenizerTestContext::from_json(&json);
+    let target_idx = count - 1;
+    let target_id = 1000 + target_idx as u32;
+    let target = format!("__AT_{:05}__", target_idx);
+    let input = format!("{target}x");
+
+    let first = ctx.encode_with(&input, &no_bos());
+    let second = ctx.encode_with(&input, &no_bos());
+    assert_eq!(
+        first, second,
+        "large added-token dictionary matching must be deterministic"
+    );
+    assert_eq!(
+        first,
+        vec![target_id, 1],
+        "late added-token entry must be matched exactly"
+    );
+    assert_eq!(
+        ctx.encode_with("xxxxx", &no_bos()),
+        vec![1, 1, 1, 1, 1],
+        "non-matching text must not be spuriously captured by large added-token sets"
     );
 }

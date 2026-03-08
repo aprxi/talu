@@ -310,6 +310,110 @@ fn malformed_utf8_matrix_maps_to_unk_per_byte_across_all_surfaces() {
     }
 }
 
+/// WordPiece with BertNormalizer must not silently drop malformed middle bytes.
+/// If encode succeeds, the invalid byte must still be represented by a token
+/// span and surfaced as unknown content rather than disappearing.
+#[test]
+fn wordpiece_bertnormalizer_invalid_utf8_middle_byte_not_silently_dropped() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0,
+      "hello": 1,
+      "world": 2
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true}
+  ],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": false,
+    "lowercase": true
+  },
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": false}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let bytes = b"Hello \xFF World";
+    const INVALID_IDX: usize = 6;
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), bytes, &no_bos()) };
+    if result.error_msg.is_null() {
+        let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+        let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+        assert!(
+            ids.contains(&0),
+            "successful WordPiece/BertNormalizer malformed-UTF8 path must surface unknown content"
+        );
+        assert!(
+            offsets.iter().any(|off| {
+                let start = off.start as usize;
+                let end = off.end as usize;
+                start <= INVALID_IDX && INVALID_IDX < end
+            }),
+            "invalid middle byte must remain owned by at least one token span (no silent byte drop)"
+        );
+    }
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
+/// Unigram + Metaspace must also avoid silently dropping malformed middle
+/// bytes. If encode succeeds, the invalid byte must remain represented by at
+/// least one token span (typically as unknown content) rather than vanishing.
+#[test]
+fn unigram_invalid_utf8_middle_byte_not_silently_dropped() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581hello", -2.0],
+      ["\u2581world", -3.0]
+    ]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true},
+  "post_processor": null,
+  "decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let bytes = b"Hello \xFF World";
+    const INVALID_IDX: usize = 6;
+
+    let result = unsafe { super::common::encode_raw(ctx.handle(), bytes, &no_bos()) };
+    if result.error_msg.is_null() {
+        let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+        let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+        assert!(
+            ids.contains(&0),
+            "successful Unigram malformed-UTF8 path must surface unknown content"
+        );
+        assert!(
+            offsets.iter().any(|off| {
+                let start = off.start as usize;
+                let end = off.end as usize;
+                start <= INVALID_IDX && INVALID_IDX < end
+            }),
+            "invalid middle byte must remain owned by at least one token span (no silent byte drop)"
+        );
+    }
+    unsafe { talu_sys::talu_encode_result_free(result) };
+}
+
 /// In a byte-level BPE model, adjacent malformed UTF-8 bytes must still be
 /// eligible for BPE merges when an explicit merge rule exists for their
 /// byte-token surfaces.

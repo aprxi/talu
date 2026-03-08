@@ -142,6 +142,19 @@ fn nested_sequence_metaspace_decoder(depth: usize, add_prefix_space: bool) -> St
     current
 }
 
+fn wide_sequence_normalizer(width: usize, leaf: &str) -> String {
+    let mut out = String::with_capacity(32 + width * (leaf.len() + 1));
+    out.push_str(r#"{"type":"Sequence","normalizers":["#);
+    for i in 0..width {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(leaf);
+    }
+    out.push_str("]}");
+    out
+}
+
 #[test]
 fn nested_sequence_helpers_object_depth_matches_requested_depth() {
     let depth = 7usize;
@@ -156,6 +169,60 @@ fn nested_sequence_helpers_object_depth_matches_requested_depth() {
     assert_eq!(max_object_depth(&pretokenizer), expected);
     assert_eq!(max_object_depth(&postprocessor), expected);
     assert_eq!(max_object_depth(&decoder), expected);
+}
+
+fn run_extremely_wide_sequence_normalizer_returns_error_inner() {
+    let width = 50_000usize;
+    let normalizer = wide_sequence_normalizer(width, r#"{"type":"Lowercase"}"#);
+    let json = format!(
+        r#"{{
+  "version": "1.0",
+  "model": {{ "type": "BPE", "vocab": {{"a": 0}}, "merges": [] }},
+  "added_tokens": [],
+  "normalizer": {normalizer},
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}}"#
+    );
+    serde_json::from_str::<serde_json::Value>(&json)
+        .expect("wide sequence fixture must be syntactically valid JSON");
+    assert_rejected(
+        &json,
+        talu_sys::ErrorCode::InternalError,
+        "excessively wide sequence normalizer arrays must be rejected",
+    );
+}
+
+/// Extremely wide Sequence normalizer arrays must be rejected with a typed
+/// error instead of consuming unbounded memory/time during tokenizer load.
+///
+/// Runs in a subprocess so native crashes are surfaced as normal assertion
+/// failures rather than aborting the parent test harness.
+#[test]
+fn extremely_wide_sequence_normalizer_returns_error() {
+    const INNER_ENV: &str = "TALU_INNER_WIDE_SEQ_NORM";
+    if std::env::var_os(INNER_ENV).is_some() {
+        run_extremely_wide_sequence_normalizer_returns_error_inner();
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test executable path must resolve");
+    let output = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("capi::tokenizer::json_loading::extremely_wide_sequence_normalizer_returns_error")
+        .arg("--nocapture")
+        .env(INNER_ENV, "1")
+        .output()
+        .expect("subprocess launch for wide sequence-normalizer test must succeed");
+
+    assert!(
+        output.status.success(),
+        "wide sequence-normalizer subprocess failed (status: {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 // ===========================================================================
@@ -435,6 +502,31 @@ fn unknown_pretokenizer_type_returns_error() {
         json,
         talu_sys::ErrorCode::InternalError,
         "unknown pre_tokenizer type must be rejected",
+    );
+}
+
+/// Split pretokenizers with syntactically invalid regex patterns must fail
+/// gracefully during tokenizer creation.
+#[test]
+fn pretokenizer_invalid_regex_syntax_fails_gracefully() {
+    let json = r#"{
+  "version": "1.0",
+  "model": { "type": "BPE", "vocab": {"<unk>": 0, "a": 1}, "merges": [] },
+  "added_tokens": [{"id": 0, "content": "<unk>", "special": true}],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Split",
+    "pattern": {"Regex": "(a+b"},
+    "behavior": "Isolated",
+    "invert": false
+  },
+  "post_processor": null,
+  "decoder": null
+}"#;
+    assert_rejected_valid_json(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "invalid regex syntax must be rejected cleanly at load time",
     );
 }
 
@@ -1906,6 +1998,30 @@ fn unigram_vocab_entry_infinity_score_returns_error() {
         json,
         talu_sys::ErrorCode::InternalError,
         "Unigram +Infinity scores must be rejected",
+    );
+}
+
+/// Unigram must reject non-finite scores (-Infinity) as well; DP with
+/// negative infinity weights is not a valid model contract.
+#[test]
+fn unigram_vocab_entry_negative_infinity_score_returns_error() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [["<unk>", 0.0], ["a", -Infinity]]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"#;
+    assert_rejected(
+        json,
+        talu_sys::ErrorCode::InternalError,
+        "Unigram -Infinity scores must be rejected",
     );
 }
 
