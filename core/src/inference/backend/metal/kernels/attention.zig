@@ -49,6 +49,7 @@ pub const MultiHeadAttention = struct {
     norm_eps: f32,
     query_pre_attn_scalar: f32 = 0.0,
     attention_multiplier: f32 = 0.0,
+    query_gate: bool = false,
 
     q_proj: ?QuantizedWeight = null,
     k_proj: ?QuantizedWeight = null,
@@ -129,6 +130,7 @@ pub const MultiHeadAttention = struct {
                     q_proj.bits,
                     self.query_pre_attn_scalar,
                     self.attention_multiplier,
+                    self.query_gate,
                 );
                 return;
             }
@@ -168,6 +170,7 @@ pub const MultiHeadAttention = struct {
                 q_proj.bits,
                 self.query_pre_attn_scalar,
                 self.attention_multiplier,
+                self.query_gate,
             );
             return;
         }
@@ -206,6 +209,7 @@ pub const MultiHeadAttention = struct {
             self.norm_eps,
             self.query_pre_attn_scalar,
             self.attention_multiplier,
+            self.query_gate,
         );
     }
 };

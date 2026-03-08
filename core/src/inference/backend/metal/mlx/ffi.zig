@@ -179,6 +179,7 @@ pub extern fn mlx_lazy_fused_attention(
     bits: usize,
     query_pre_attn_scalar: f32,
     attention_multiplier: f32,
+    query_gate: bool,
 ) ArrayHandle;
 
 pub extern fn mlx_lazy_fused_attention_qkv_quantized_o_dense(
@@ -215,6 +216,7 @@ pub extern fn mlx_lazy_fused_attention_qkv_quantized_o_dense(
     bits: usize,
     query_pre_attn_scalar: f32,
     attention_multiplier: f32,
+    query_gate: bool,
 ) ArrayHandle;
 
 pub extern fn mlx_lazy_fused_ffn(
@@ -231,6 +233,24 @@ pub extern fn mlx_lazy_fused_ffn(
     group_size: usize,
     bits: usize,
     use_gelu: bool,
+) ArrayHandle;
+
+pub extern fn mlx_lazy_rms_norm_fused_ffn(
+    input: ArrayHandle,
+    norm_w: ArrayHandle,
+    gate_w: ArrayHandle,
+    gate_s: ArrayHandle,
+    gate_b: ArrayHandle,
+    up_w: ArrayHandle,
+    up_s: ArrayHandle,
+    up_b: ArrayHandle,
+    down_w: ArrayHandle,
+    down_s: ArrayHandle,
+    down_b: ArrayHandle,
+    group_size: usize,
+    bits: usize,
+    use_gelu: bool,
+    eps: f32,
 ) ArrayHandle;
 
 pub extern fn mlx_lazy_fused_attention_bf16(
@@ -259,6 +279,7 @@ pub extern fn mlx_lazy_fused_attention_bf16(
     rms_eps: f32,
     query_pre_attn_scalar: f32,
     attention_multiplier: f32,
+    query_gate: bool,
 ) ArrayHandle;
 
 pub extern fn mlx_lazy_mla_attention_quantized(

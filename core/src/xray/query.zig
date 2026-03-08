@@ -235,6 +235,7 @@ test "CaptureQuery get" {
         .layer = trace.TraceEmission.NO_LAYER,
         .token = 0,
         .position = 5,
+        .backend = .cpu,
         .tensor = .{ .ptr = @ptrCast(&data), .dtype = .f32, .shape = .{ 3, 0, 0, 0 }, .ndim = 1 },
         .timestamp_ns = 0,
         .kernel_name = std.mem.zeroes([48]u8),
@@ -260,6 +261,7 @@ test "CaptureQuery findFirst" {
         .layer = 0,
         .token = 0,
         .position = 0,
+        .backend = .cpu,
         .tensor = .{ .ptr = @ptrCast(&normal), .dtype = .f32, .shape = .{ 3, 0, 0, 0 }, .ndim = 1 },
         .timestamp_ns = 0,
         .kernel_name = std.mem.zeroes([48]u8),
@@ -272,6 +274,7 @@ test "CaptureQuery findFirst" {
         .layer = 5,
         .token = 0,
         .position = 0,
+        .backend = .cpu,
         .tensor = .{ .ptr = @ptrCast(&with_nan), .dtype = .f32, .shape = .{ 3, 0, 0, 0 }, .ndim = 1 },
         .timestamp_ns = 0,
         .kernel_name = std.mem.zeroes([48]u8),
@@ -290,7 +293,7 @@ test "CaptureQuery count" {
     var cap = capture.TraceCapture.init(std.testing.allocator, config);
     defer cap.deinit();
 
-    const data = [_]f32{ 1.0 };
+    const data = [_]f32{1.0};
 
     // Add 3 layer_attn_out records
     for ([_]u16{ 0, 1, 2 }) |layer| {
@@ -299,6 +302,7 @@ test "CaptureQuery count" {
             .layer = layer,
             .token = 0,
             .position = 0,
+            .backend = .cpu,
             .tensor = .{ .ptr = @ptrCast(&data), .dtype = .f32, .shape = .{ 1, 0, 0, 0 }, .ndim = 1 },
             .timestamp_ns = 0,
             .kernel_name = std.mem.zeroes([48]u8),
@@ -311,6 +315,7 @@ test "CaptureQuery count" {
         .layer = trace.TraceEmission.NO_LAYER,
         .token = 0,
         .position = 0,
+        .backend = .cpu,
         .tensor = .{ .ptr = @ptrCast(&data), .dtype = .f32, .shape = .{ 1, 0, 0, 0 }, .ndim = 1 },
         .timestamp_ns = 0,
         .kernel_name = std.mem.zeroes([48]u8),

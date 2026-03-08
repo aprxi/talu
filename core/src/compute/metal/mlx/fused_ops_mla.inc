@@ -180,7 +180,9 @@ void* mlx_lazy_mla_attention_quantized(
             *static_cast<const array*>(q_a_s),
             *static_cast<const array*>(q_a_b),
             group_size_i,
-            bits_i
+            bits_i,
+            q_a_s,
+            q_a_b
         );
     };
     const auto q_b_fn = [q_b_w, q_b_s, q_b_b, group_size_i, bits_i](const array& in) -> array {
@@ -190,7 +192,9 @@ void* mlx_lazy_mla_attention_quantized(
             *static_cast<const array*>(q_b_s),
             *static_cast<const array*>(q_b_b),
             group_size_i,
-            bits_i
+            bits_i,
+            q_b_s,
+            q_b_b
         );
     };
     const auto kv_a_fn = [kv_a_w, kv_a_s, kv_a_b, group_size_i, bits_i](const array& in) -> array {
@@ -200,7 +204,9 @@ void* mlx_lazy_mla_attention_quantized(
             *static_cast<const array*>(kv_a_s),
             *static_cast<const array*>(kv_a_b),
             group_size_i,
-            bits_i
+            bits_i,
+            kv_a_s,
+            kv_a_b
         );
     };
     const auto kv_b_fn = [kv_b_w, kv_b_s, kv_b_b, group_size_i, bits_i](const array& in) -> array {
@@ -210,7 +216,9 @@ void* mlx_lazy_mla_attention_quantized(
             *static_cast<const array*>(kv_b_s),
             *static_cast<const array*>(kv_b_b),
             group_size_i,
-            bits_i
+            bits_i,
+            kv_b_s,
+            kv_b_b
         );
     };
     const auto out_fn = [o_w, o_s, o_b, group_size_i, bits_i](const array& in) -> array {
@@ -220,7 +228,9 @@ void* mlx_lazy_mla_attention_quantized(
             *static_cast<const array*>(o_s),
             *static_cast<const array*>(o_b),
             group_size_i,
-            bits_i
+            bits_i,
+            o_s,
+            o_b
         );
     };
 

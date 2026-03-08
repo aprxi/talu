@@ -219,6 +219,8 @@ pub const TraceEmission = struct {
     token: u32,
     /// Position in sequence (for KV cache alignment)
     position: u32,
+    /// Backend that emitted this trace point.
+    backend: Backend,
     /// The tensor data
     tensor: TracedTensor,
     /// Timestamp for ordering
@@ -235,6 +237,7 @@ pub const Handler = *const fn (TraceEmission) void;
 /// The global handler - set by inspection system, null when disabled.
 /// Using atomic to be safe across threads (inspection might be enabled/disabled).
 var handler_atomic: std.atomic.Value(?Handler) = std.atomic.Value(?Handler).init(null);
+threadlocal var backend_context: Backend = .cpu;
 
 /// Set the trace handler. Called by inspection system on setup.
 pub fn setHandler(h: ?Handler) void {
@@ -244,6 +247,19 @@ pub fn setHandler(h: ?Handler) void {
 /// Get current handler (for inspection system to check if enabled).
 pub fn getHandler() ?Handler {
     return handler_atomic.load(.acquire);
+}
+
+/// Set backend context for subsequent trace emissions on this thread.
+/// Returns previous backend context.
+pub fn setBackendContext(backend: Backend) Backend {
+    const prev = backend_context;
+    backend_context = backend;
+    return prev;
+}
+
+/// Get backend context for this thread.
+pub fn getBackendContext() Backend {
+    return backend_context;
 }
 
 /// Check if tracing is enabled (for conditional expensive operations).
@@ -275,6 +291,7 @@ pub inline fn emit(
         .layer = layer,
         .token = token,
         .position = position,
+        .backend = backend_context,
         .tensor = .{
             .ptr = ptr,
             .dtype = dtype,
@@ -340,6 +357,7 @@ test "trace handler receives emissions" {
     try std.testing.expectEqual(@as(usize, 1), TestCapture.call_count);
     const e = TestCapture.last_emission.?;
     try std.testing.expectEqual(TracePoint.attn_out, e.point);
+    try std.testing.expectEqual(Backend.cpu, e.backend);
     try std.testing.expectEqual(@as(u16, 5), e.layer);
     try std.testing.expectEqual(@as(u32, 10), e.position);
     try std.testing.expectEqual(DType.bf16, e.tensor.dtype);

@@ -1118,9 +1118,11 @@ async fn agent_shell_ws_strict_mode_tui_less_smoke() {
     let shell_id = create_shell(&ctx);
     let mut ws = ws_connect(&ctx, &shell_id).await;
 
-    ws.send(Message::Binary(b"less /etc/hosts\nq\nexit\n".to_vec().into()))
-        .await
-        .expect("ws send");
+    ws.send(Message::Binary(
+        b"less /etc/hosts\nq\nexit\n".to_vec().into(),
+    ))
+    .await
+    .expect("ws send");
 
     let (output, exit_event) = ws_drain_output(&mut ws).await;
     let text = String::from_utf8_lossy(&output);
@@ -1164,11 +1166,9 @@ async fn agent_shell_ws_strict_mode_tui_vim_smoke() {
     let shell_id = create_shell(&ctx);
     let mut ws = ws_connect(&ctx, &shell_id).await;
 
-    ws.send(
-        Message::Binary(
-            b"vim -Nu NONE -n -c 'q' /etc/hosts\nexit\n".to_vec().into(),
-        ),
-    )
+    ws.send(Message::Binary(
+        b"vim -Nu NONE -n -c 'q' /etc/hosts\nexit\n".to_vec().into(),
+    ))
     .await
     .expect("ws send");
 

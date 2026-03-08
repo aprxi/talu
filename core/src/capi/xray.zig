@@ -43,6 +43,7 @@ pub const CapturedTensorInfo = extern struct {
     layer: u16,
     token: u32,
     position: u32,
+    backend: u8,
     shape: [4]u32,
     ndim: u8,
     dtype: u8,
@@ -305,6 +306,7 @@ fn capturedToInfo(record: *const capture.CapturedTensor) CapturedTensorInfo {
     info.layer = record.layer;
     info.token = record.token;
     info.position = record.position;
+    info.backend = @intFromEnum(record.backend);
     info.shape = record.shape;
     info.ndim = record.ndim;
     info.dtype = @intFromEnum(record.dtype);

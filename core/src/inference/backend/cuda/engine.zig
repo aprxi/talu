@@ -16,6 +16,7 @@ const compute = @import("../../../compute/root.zig");
 const tensor = @import("../../../tensor.zig");
 const dtype = @import("../../../dtype.zig");
 const log = @import("../../../log.zig");
+const trace = @import("../../../xray/trace.zig");
 const load_transforms = @import("../../../models/load/transforms.zig");
 const vision_types = @import("../../vision_types.zig");
 const smoke_checks = @import("smoke_checks.zig");
@@ -2949,10 +2950,10 @@ pub const CudaBackend = struct {
                                     used_device_lookup = true;
                                 }
                             }
-                    }
-                },
+                        }
+                    },
+                }
             }
-        }
             if (!used_device_lookup) {
                 const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.runtime_buffers.hidden_host) catch |err| switch (err) {
                     error.InvalidArgument => return error.InvalidArgument,
@@ -3844,6 +3845,48 @@ pub const CudaBackend = struct {
         return @ptrCast(@alignCast(raw_state));
     }
 
+    fn traceShapeBsd(seq_len: u32, dim: u32) [4]u32 {
+        return .{ 1, seq_len, dim, 0 };
+    }
+
+    fn traceTokenIndex(ctx: *const LayerProgramExecutionContext) u32 {
+        if (ctx.seq_len_u32 == 0) return 0;
+        return ctx.seq_len_u32 - 1;
+    }
+
+    fn emitLayerProgramTracePoint(
+        ctx: *const LayerProgramExecutionContext,
+        point: trace.TracePoint,
+        shape: [4]u32,
+        ndim: u8,
+        kernel_name: []const u8,
+    ) void {
+        if (!trace.isEnabled()) return;
+        var marker = [_]f32{0.0};
+        trace.emit(
+            point,
+            @intCast(ctx.layer_index),
+            traceTokenIndex(ctx),
+            ctx.position_u32,
+            @ptrCast(marker[0..].ptr),
+            .f32,
+            shape,
+            ndim,
+            kernel_name,
+        );
+    }
+
+    fn inferNormTracePoint(layer: *const BlockRuntimeLayer, op_index: usize) trace.TracePoint {
+        const compiled = layer.compiled_plan orelse return .layer_ffn_norm;
+        if (op_index + 1 < compiled.plan.instructions.len) {
+            const next_opcode = compiled.plan.instructions[op_index + 1].opcode;
+            if (next_opcode == .multihead_attention or next_opcode == .mla_attention or next_opcode == .shortconv) {
+                return .layer_attn_norm;
+            }
+        }
+        return .layer_ffn_norm;
+    }
+
     fn layerProgramStateBlocksForInstruction(
         insn: *const runtime_contract.Instruction,
         ctx: *LayerProgramExecutionContext,
@@ -4275,6 +4318,13 @@ pub const CudaBackend = struct {
         );
         const layer = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
         try exec_ctx.backend.layerProgramNormAdapter(layer, insn, registers, exec_ctx);
+        emitLayerProgramTracePoint(
+            exec_ctx,
+            inferNormTracePoint(layer, exec_ctx.op_index),
+            traceShapeBsd(exec_ctx.seq_len_u32, exec_ctx.d_model_u32),
+            3,
+            "cuda_rmsnorm",
+        );
     }
 
     fn layerProgramAttentionRuntimeAdapter(
@@ -4292,7 +4342,23 @@ pub const CudaBackend = struct {
             state_blocks,
         );
         const layer = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
+        if (layer.instructionAttentionRef(exec_ctx.op_index)) |cfg| {
+            emitLayerProgramTracePoint(
+                exec_ctx,
+                .attn_q,
+                traceShapeBsd(exec_ctx.seq_len_u32, @intCast(cfg.q_dim)),
+                3,
+                "cuda_attention_q",
+            );
+        } else |_| {}
         try exec_ctx.backend.layerProgramAttentionAdapter(layer, insn, registers, state_blocks, exec_ctx);
+        emitLayerProgramTracePoint(
+            exec_ctx,
+            .attn_out,
+            traceShapeBsd(exec_ctx.seq_len_u32, exec_ctx.d_model_u32),
+            3,
+            "cuda_attention_out",
+        );
     }
 
     fn layerProgramShortConvRuntimeAdapter(
@@ -4310,7 +4376,23 @@ pub const CudaBackend = struct {
             state_blocks,
         );
         const layer = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
+        if (layer.instructionShortConvRef(exec_ctx.op_index)) |cfg| {
+            emitLayerProgramTracePoint(
+                exec_ctx,
+                .conv_in_proj,
+                traceShapeBsd(exec_ctx.seq_len_u32, @intCast(cfg.conv_dim * 3)),
+                3,
+                "cuda_shortconv_in_proj",
+            );
+        } else |_| {}
         try exec_ctx.backend.layerProgramShortConvAdapter(layer, insn, registers, state_blocks, exec_ctx);
+        emitLayerProgramTracePoint(
+            exec_ctx,
+            .conv_out_proj,
+            traceShapeBsd(exec_ctx.seq_len_u32, exec_ctx.d_model_u32),
+            3,
+            "cuda_shortconv_out_proj",
+        );
     }
 
     fn layerProgramSwiGluRuntimeAdapter(
@@ -4328,7 +4410,25 @@ pub const CudaBackend = struct {
             state_blocks,
         );
         const layer = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
+        const weight_handles = try instructionWeightSlice(insn, registers);
+        if (weight_handles.len >= 2) {
+            const gate = linearWeightFromWeightHandle(weight_handles[0]);
+            emitLayerProgramTracePoint(
+                exec_ctx,
+                .ffn_gate,
+                traceShapeBsd(exec_ctx.seq_len_u32, @intCast(gate.cols())),
+                3,
+                "cuda_ffn_gate",
+            );
+        }
         try exec_ctx.backend.layerProgramSwiGluAdapter(layer, insn, registers, exec_ctx);
+        emitLayerProgramTracePoint(
+            exec_ctx,
+            .ffn_down,
+            traceShapeBsd(exec_ctx.seq_len_u32, exec_ctx.d_model_u32),
+            3,
+            "cuda_ffn_down",
+        );
     }
 
     fn layerProgramResidualAddRuntimeAdapter(
@@ -4348,6 +4448,13 @@ pub const CudaBackend = struct {
         _ = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
         const scale = try decodeResidualScaleFromParams(params);
         try exec_ctx.backend.layerProgramResidualAddAdapter(insn, registers, scale, exec_ctx);
+        emitLayerProgramTracePoint(
+            exec_ctx,
+            .block_out,
+            traceShapeBsd(exec_ctx.seq_len_u32, exec_ctx.d_model_u32),
+            3,
+            "cuda_residual_add",
+        );
     }
 
     fn dispatchLayerProgramInstruction(
@@ -4420,6 +4527,8 @@ pub const CudaBackend = struct {
         shortconv_step_function: compute.cuda.Function,
         attention_kernels: AttentionKernelSet,
     ) !void {
+        const prev_backend = trace.setBackendContext(.cuda);
+        defer _ = trace.setBackendContext(prev_backend);
         const compiled_plan = layer.compiled_plan orelse return error.UnsupportedModel;
         const required_slot_count = blk: {
             var required: usize = 0;

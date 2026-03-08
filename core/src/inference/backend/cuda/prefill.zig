@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const log = @import("../../../log.zig");
+const trace = @import("../../../xray/trace.zig");
 
 fn slotIndexSupported(self: anytype, slot_index: usize) bool {
     const SelfType = @TypeOf(self.*);
@@ -11,6 +12,8 @@ fn slotIndexSupported(self: anytype, slot_index: usize) bool {
 }
 
 pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
+    const prev_backend = trace.setBackendContext(.cuda);
+    defer _ = trace.setBackendContext(prev_backend);
     const SelfType = @TypeOf(self.*);
     if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
         try self.ensureSlotStateBlocksBoundForScheduler(0);
@@ -61,6 +64,16 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
     self.logPrefillTimingImpl("prefill", tokens.len, prefill_elapsed_ns);
     @memcpy(logits_out, self.slot_logits);
+    trace.emitFinal(
+        .logits_ready,
+        0,
+        @intCast(tokens.len),
+        @ptrCast(logits_out.ptr),
+        .f32,
+        .{ @intCast(self.vocab_size), 0, 0, 0 },
+        1,
+        "cuda_logits_host",
+    );
     self.slot_position = tokens.len;
 }
 
@@ -70,6 +83,8 @@ pub fn prefillSlot(
     tokens: []const u32,
     logits_out: []f32,
 ) !void {
+    const prev_backend = trace.setBackendContext(.cuda);
+    defer _ = trace.setBackendContext(prev_backend);
     const SelfType = @TypeOf(self.*);
     if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
         try self.ensureSlotStateBlocksBoundForScheduler(slot_index);
@@ -130,6 +145,16 @@ pub fn prefillSlot(
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
     self.logPrefillTimingImpl("prefill_slot", tokens.len, prefill_elapsed_ns);
     @memcpy(logits_out, self.slot_logits);
+    trace.emitFinal(
+        .logits_ready,
+        0,
+        @intCast(tokens.len),
+        @ptrCast(logits_out.ptr),
+        .f32,
+        .{ @intCast(self.vocab_size), 0, 0, 0 },
+        1,
+        "cuda_logits_host",
+    );
     self.slot_position = tokens.len;
 }
 

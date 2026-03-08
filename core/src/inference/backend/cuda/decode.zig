@@ -3,6 +3,7 @@
 const contract = @import("../contract.zig");
 const common_mrope = @import("../../vision_mrope.zig");
 const log = @import("../../../log.zig");
+const trace = @import("../../../xray/trace.zig");
 
 fn slotIndexSupported(self: anytype, slot_index: usize) bool {
     const SelfType = @TypeOf(self.*);
@@ -12,6 +13,8 @@ fn slotIndexSupported(self: anytype, slot_index: usize) bool {
 }
 
 pub fn decode(self: anytype, token: u32, position: usize, logits_out: []f32) !void {
+    const prev_backend = trace.setBackendContext(.cuda);
+    defer _ = trace.setBackendContext(prev_backend);
     const SelfType = @TypeOf(self.*);
     if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
         try self.ensureSlotStateBlocksBoundForScheduler(0);
@@ -26,6 +29,16 @@ pub fn decode(self: anytype, token: u32, position: usize, logits_out: []f32) !vo
     }
     const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_delta);
     try self.computeGpuPrototypeLogits(token, effective_position, logits_out);
+    trace.emitFinal(
+        .logits_ready,
+        0,
+        @intCast(position + 1),
+        @ptrCast(logits_out.ptr),
+        .f32,
+        .{ @intCast(self.vocab_size), 0, 0, 0 },
+        1,
+        "cuda_logits_host",
+    );
     self.slot_position = position + 1;
 }
 
@@ -34,6 +47,8 @@ pub fn decodeBatch(
     requests: []const contract.DecodeRequest,
     results: []contract.DecodeResult,
 ) !void {
+    const prev_backend = trace.setBackendContext(.cuda);
+    defer _ = trace.setBackendContext(prev_backend);
     const SelfType = @TypeOf(self.*);
     if (results.len < requests.len) {
         log.warn("inference", "CUDA decodeBatch invalid args", .{
@@ -83,6 +98,16 @@ pub fn decodeBatch(
         .slot_index = req.slot_index,
         .logits = self.slot_logits,
     };
+    trace.emitFinal(
+        .logits_ready,
+        0,
+        @intCast(self.slot_position + 1),
+        @ptrCast(self.slot_logits.ptr),
+        .f32,
+        .{ @intCast(self.vocab_size), 0, 0, 0 },
+        1,
+        "cuda_logits_host",
+    );
     self.slot_position += 1;
 }
 
@@ -96,6 +121,8 @@ pub fn decodeStreaming(
     callback: ?*const fn (u32, ?*anyopaque) void,
     callback_data: ?*anyopaque,
 ) !usize {
+    const prev_backend = trace.setBackendContext(.cuda);
+    defer _ = trace.setBackendContext(prev_backend);
     const SelfType = @TypeOf(self.*);
     if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
         try self.ensureSlotStateBlocksBoundForScheduler(0);
@@ -126,6 +153,16 @@ pub fn decodeStreaming(
             null,
         );
         const next_token = try self.selectNextTokenFromDeviceLogitsImpl();
+        trace.emitFinal(
+            .token_select,
+            0,
+            @intCast(position + 1),
+            @ptrCast(std.mem.asBytes(&next_token).ptr),
+            .u32,
+            .{ 1, 0, 0, 0 },
+            1,
+            "gpu_argmax",
+        );
         output_tokens[generated] = next_token;
         position += 1;
         self.slot_position = position;

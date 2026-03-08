@@ -10,6 +10,7 @@ const op_types = @import("../../../../models/op_types.zig");
 const tensor = @import("../../../../tensor.zig");
 const opcode_map = @import("../../../../models/plan/opcode_map.zig");
 const log = @import("../../../../log.zig");
+const trace = @import("../../../../xray/trace.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const weights_mod = @import("weights.zig");
@@ -215,6 +216,72 @@ pub const TransformerBlock = struct {
     fn layerProgramExecutionState(ctx: *runtime_contract.ExecutionContext) !*LayerProgramExecutionContext {
         const raw_state = ctx.workspace.any orelse return error.InvalidDispatchState;
         return @ptrCast(@alignCast(raw_state));
+    }
+
+    fn inferTraceSeqLen(state: *const LayerProgramExecutionContext) u32 {
+        var shape_buffer: [8]usize = undefined;
+        const rank = mlx_graph.getShape(state.residual.*, &shape_buffer);
+        if (rank >= 2 and shape_buffer[1] > 0 and shape_buffer[1] <= std.math.maxInt(u32)) {
+            return @intCast(shape_buffer[1]);
+        }
+        return 1;
+    }
+
+    fn traceShapeBsd(seq_len: u32, dim: u32) [4]u32 {
+        return .{ 1, seq_len, dim, 0 };
+    }
+
+    fn traceTokenIndex(seq_len: u32) u32 {
+        if (seq_len == 0) return 0;
+        return seq_len - 1;
+    }
+
+    fn tracePosition(state: *const LayerProgramExecutionContext, seq_len: u32) u32 {
+        const seq_tail = if (seq_len > 0) seq_len - 1 else 0;
+        const pos = state.pos_offset + seq_tail;
+        return @intCast(@min(pos, std.math.maxInt(u32)));
+    }
+
+    fn emitLayerProgramTracePoint(
+        state: *const LayerProgramExecutionContext,
+        point: trace.TracePoint,
+        shape: [4]u32,
+        ndim: u8,
+        kernel_name: []const u8,
+    ) void {
+        if (!trace.isEnabled()) return;
+        var marker = [_]f32{0.0};
+        const seq_len = inferTraceSeqLen(state);
+        trace.emit(
+            point,
+            @intCast(state.layer_idx),
+            traceTokenIndex(seq_len),
+            tracePosition(state, seq_len),
+            @ptrCast(marker[0..].ptr),
+            .f32,
+            shape,
+            ndim,
+            kernel_name,
+        );
+    }
+
+    fn inferNormTracePoint(state: *const LayerProgramExecutionContext, insn: *const runtime_contract.Instruction) trace.TracePoint {
+        const plan = &state.compiled_plan.plan;
+        var op_index: ?usize = null;
+        for (plan.instructions, 0..) |*candidate, idx| {
+            if (candidate == insn) {
+                op_index = idx;
+                break;
+            }
+        }
+        const op_idx = op_index orelse return .layer_ffn_norm;
+        if (op_idx + 1 < plan.instructions.len) {
+            const next_opcode = plan.instructions[op_idx + 1].opcode;
+            if (next_opcode == .multihead_attention or next_opcode == .mla_attention or next_opcode == .shortconv or next_opcode == .gated_delta_net) {
+                return .layer_attn_norm;
+            }
+        }
+        return .layer_ffn_norm;
     }
 
     fn layerProgramStateBlocksForInstruction(
@@ -574,14 +641,29 @@ pub const TransformerBlock = struct {
         norm_insn: *const runtime_contract.Instruction,
         swiglu_insn: *const runtime_contract.Instruction,
     ) bool {
-        if (state.runtime_meta.ffn_storage_kind != .dense) return false;
         if (norm_insn.opcode != opcode_map.Opcode.rmsnorm) return false;
         if (swiglu_insn.opcode != opcode_map.Opcode.swiglu) return false;
         if (norm_insn.inputs.len != 1 or norm_insn.outputs.len != 1) return false;
         if (swiglu_insn.inputs.len != 1 or swiglu_insn.outputs.len != 1) return false;
         if (norm_insn.weights.len != 1) return false;
         if (swiglu_insn.weights.len != runtime_contract.expectedWeightRefCount(swiglu_insn.opcode)) return false;
-        return norm_insn.outputs[0] == swiglu_insn.inputs[0];
+        if (norm_insn.outputs[0] != swiglu_insn.inputs[0]) return false;
+        return state.runtime_meta.ffn_storage_kind == .dense;
+    }
+
+    fn canFuseQuantizedRmsNormSwiGlu(
+        state: *const LayerProgramExecutionContext,
+        norm_insn: *const runtime_contract.Instruction,
+        swiglu_insn: *const runtime_contract.Instruction,
+    ) bool {
+        if (norm_insn.opcode != opcode_map.Opcode.rmsnorm) return false;
+        if (swiglu_insn.opcode != opcode_map.Opcode.swiglu) return false;
+        if (norm_insn.inputs.len != 1 or norm_insn.outputs.len != 1) return false;
+        if (swiglu_insn.inputs.len != 1 or swiglu_insn.outputs.len != 1) return false;
+        if (norm_insn.weights.len != 1) return false;
+        if (swiglu_insn.weights.len != runtime_contract.expectedWeightRefCount(swiglu_insn.opcode)) return false;
+        if (norm_insn.outputs[0] != swiglu_insn.inputs[0]) return false;
+        return state.runtime_meta.ffn_storage_kind == .quantized;
     }
 
     fn runDenseRmsNormSwiGluFusion(
@@ -597,6 +679,8 @@ pub const TransformerBlock = struct {
         );
         const norm_io = try instructionIoSlices(norm_insn, norm_handles.registers);
         const norm_weights = try instructionWeightSlice(norm_insn, norm_handles.registers);
+        const norm_input = arraySlotFromHandle(norm_io.inputs[0]).*;
+        const norm_weight = arrayWeightFromHandle(norm_weights[0]).*;
         const swiglu_handles = try buildLayerProgramInstructionHandles(
             swiglu_insn,
             state,
@@ -607,12 +691,49 @@ pub const TransformerBlock = struct {
         const swiglu_weights = try instructionWeightSlice(swiglu_insn, swiglu_handles.registers);
         var output: mlx_graph.ArrayHandle = undefined;
         ffn_kernel.forwardRmsNormFusedBf16(
-            arraySlotFromHandle(norm_io.inputs[0]).*,
-            arrayWeightFromHandle(norm_weights[0]).*,
+            norm_input,
+            norm_weight,
             state.runtime_meta.model_config.norm_eps,
             arrayWeightFromHandle(swiglu_weights[0]).*,
             arrayWeightFromHandle(swiglu_weights[1]).*,
             arrayWeightFromHandle(swiglu_weights[2]).*,
+            &output,
+        );
+        arraySlotFromHandle(swiglu_io.outputs[0]).* = output;
+    }
+
+    fn runQuantizedRmsNormSwiGluFusion(
+        state: *LayerProgramExecutionContext,
+        norm_insn: *const runtime_contract.Instruction,
+        swiglu_insn: *const runtime_contract.Instruction,
+    ) !void {
+        const norm_handles = try buildLayerProgramInstructionHandles(
+            norm_insn,
+            state,
+            state.instruction_handles,
+            state.instruction_views,
+        );
+        const norm_io = try instructionIoSlices(norm_insn, norm_handles.registers);
+        const norm_weights = try instructionWeightSlice(norm_insn, norm_handles.registers);
+        const norm_input = arraySlotFromHandle(norm_io.inputs[0]).*;
+        const norm_weight = arrayWeightFromHandle(norm_weights[0]).*;
+        const swiglu_handles = try buildLayerProgramInstructionHandles(
+            swiglu_insn,
+            state,
+            state.instruction_handles,
+            state.instruction_views,
+        );
+        const swiglu_io = try instructionIoSlices(swiglu_insn, swiglu_handles.registers);
+        const swiglu_weights = try instructionWeightSlice(swiglu_insn, swiglu_handles.registers);
+        var output: mlx_graph.ArrayHandle = undefined;
+        try ffn_kernel.forwardRmsNormFusedQuantized(
+            norm_input,
+            norm_weight,
+            state.runtime_meta.model_config.norm_eps,
+            state.runtime_meta.use_gelu,
+            quantizedWeightFromHandle(swiglu_weights[0]).*,
+            quantizedWeightFromHandle(swiglu_weights[1]).*,
+            quantizedWeightFromHandle(swiglu_weights[2]).*,
             &output,
         );
         arraySlotFromHandle(swiglu_io.outputs[0]).* = output;
@@ -661,6 +782,7 @@ pub const TransformerBlock = struct {
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
         cache: ?Cache,
+        query_gate: bool,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
         if (comptime std.debug.runtime_safety) {
@@ -707,6 +829,7 @@ pub const TransformerBlock = struct {
                     .norm_eps = state.runtime_meta.model_config.norm_eps,
                     .query_pre_attn_scalar = state.runtime_meta.model_config.query_pre_attn_scalar,
                     .attention_multiplier = state.runtime_meta.attention_multiplier,
+                    .query_gate = query_gate,
                     .q_proj = null,
                     .k_proj = null,
                     .v_proj = null,
@@ -1072,6 +1195,14 @@ pub const TransformerBlock = struct {
             insn,
             registers,
         );
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            inferNormTracePoint(state, insn),
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_rmsnorm",
+        );
     }
 
     fn layerProgramAttentionRuntimeAdapter(
@@ -1080,7 +1211,7 @@ pub const TransformerBlock = struct {
         registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        _: []const runtime_contract.ParamBlock,
+        params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
         const cache = try instructionStateValueOrNull(
@@ -1089,11 +1220,39 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        const seq_len = inferTraceSeqLen(state);
+        const q_dim: u32 = if (insn.opcode == .multihead_attention)
+            @intCast(state.runtime_meta.model_config.n_heads * state.runtime_meta.model_config.head_dim)
+        else
+            @intCast(state.runtime_meta.model_config.d_model);
+        emitLayerProgramTracePoint(
+            state,
+            .attn_q,
+            traceShapeBsd(seq_len, q_dim),
+            3,
+            "metal_attention_q",
+        );
+        const query_gate = if (insn.opcode == .multihead_attention) blk: {
+            const p = try runtime_contract.paramAs(
+                runtime_contract.AttentionKernelParam,
+                params,
+                .multihead_attention,
+            );
+            break :blk p.query_gate != 0;
+        } else false;
         try layerProgramAttentionAdapter(
             state,
             insn,
             registers,
             cache,
+            query_gate,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .attn_out,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_attention_out",
         );
     }
 
@@ -1112,11 +1271,26 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            .conv_in_proj,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.shortconv_conv_dim * 3)),
+            3,
+            "metal_shortconv_in_proj",
+        );
         try layerProgramShortConvAdapter(
             state,
             insn,
             registers,
             shortconv_cache,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .conv_out_proj,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_shortconv_out_proj",
         );
     }
 
@@ -1144,11 +1318,19 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        const seq_len = inferTraceSeqLen(state);
         try layerProgramGatedDeltaAdapter(
             state,
             insn,
             registers,
             gated_delta_cache,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .block_out,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_gated_delta_out",
         );
     }
 
@@ -1161,10 +1343,25 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            .ffn_gate,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_ff)),
+            3,
+            "metal_ffn_gate",
+        );
         try layerProgramSwiGluAdapter(
             state,
             insn,
             registers,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .ffn_down,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_ffn_down",
         );
     }
 
@@ -1177,10 +1374,25 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            .ffn_gate,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_ff)),
+            3,
+            "metal_moe_gate",
+        );
         try layerProgramMoeAdapter(
             state,
             insn,
             registers,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .ffn_down,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_moe_down",
         );
     }
 
@@ -1199,11 +1411,19 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        const seq_len = inferTraceSeqLen(state);
         try layerProgramMambaAdapter(
             state,
             insn,
             registers,
             mamba_cache,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .mamba_out,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_mamba_out",
         );
     }
 
@@ -1228,6 +1448,14 @@ pub const TransformerBlock = struct {
             insn,
             registers,
             scale_kind,
+        );
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            .block_out,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_residual_add",
         );
     }
 
@@ -1364,6 +1592,15 @@ pub const TransformerBlock = struct {
                         runtime_contract.recordExecutionDispatch(&rt_ctx, next_insn.opcode);
                     }
                     try runDenseRmsNormSwiGluFusion(&exec_ctx, insn, next_insn);
+                    insn_idx += 2;
+                    continue;
+                }
+                if (canFuseQuantizedRmsNormSwiGlu(&exec_ctx, insn, next_insn)) {
+                    if (enable_dispatch_observability) {
+                        runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
+                        runtime_contract.recordExecutionDispatch(&rt_ctx, next_insn.opcode);
+                    }
+                    try runQuantizedRmsNormSwiGluFusion(&exec_ctx, insn, next_insn);
                     insn_idx += 2;
                     continue;
                 }
@@ -1574,6 +1811,74 @@ test "canFuseDenseRmsNormSwiGlu rejects mismatched registers" {
     };
 
     try std.testing.expect(!TransformerBlock.canFuseDenseRmsNormSwiGlu(&ctx, &norm_insn, &swiglu_insn));
+}
+
+test "canFuseQuantizedRmsNormSwiGlu accepts direct quantized norm to swiglu handoff" {
+    var ctx = std.mem.zeroes(TransformerBlock.LayerProgramExecutionContext);
+    ctx.runtime_meta.ffn_storage_kind = .quantized;
+
+    const norm_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+    const norm_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const norm_weights = [_]runtime_contract.WeightRef{.{ .index = 0 }};
+    const swiglu_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const swiglu_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(2)};
+    const swiglu_weights = [_]runtime_contract.WeightRef{
+        .{ .index = 1 },
+        .{ .index = 2 },
+        .{ .index = 3 },
+    };
+    const norm_insn = runtime_contract.Instruction{
+        .opcode = .rmsnorm,
+        .inputs = &norm_inputs,
+        .outputs = &norm_outputs,
+        .weights = &norm_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const swiglu_insn = runtime_contract.Instruction{
+        .opcode = .swiglu,
+        .inputs = &swiglu_inputs,
+        .outputs = &swiglu_outputs,
+        .weights = &swiglu_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+
+    try std.testing.expect(TransformerBlock.canFuseQuantizedRmsNormSwiGlu(&ctx, &norm_insn, &swiglu_insn));
+}
+
+test "canFuseQuantizedRmsNormSwiGlu rejects dense storage kind" {
+    var ctx = std.mem.zeroes(TransformerBlock.LayerProgramExecutionContext);
+    ctx.runtime_meta.ffn_storage_kind = .dense;
+
+    const norm_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+    const norm_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const norm_weights = [_]runtime_contract.WeightRef{.{ .index = 0 }};
+    const swiglu_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const swiglu_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(2)};
+    const swiglu_weights = [_]runtime_contract.WeightRef{
+        .{ .index = 1 },
+        .{ .index = 2 },
+        .{ .index = 3 },
+    };
+    const norm_insn = runtime_contract.Instruction{
+        .opcode = .rmsnorm,
+        .inputs = &norm_inputs,
+        .outputs = &norm_outputs,
+        .weights = &norm_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const swiglu_insn = runtime_contract.Instruction{
+        .opcode = .swiglu,
+        .inputs = &swiglu_inputs,
+        .outputs = &swiglu_outputs,
+        .weights = &swiglu_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+
+    try std.testing.expect(!TransformerBlock.canFuseQuantizedRmsNormSwiGlu(&ctx, &norm_insn, &swiglu_insn));
 }
 
 test "layer_program_adapter_table covers Metal LayerOp execution subset" {

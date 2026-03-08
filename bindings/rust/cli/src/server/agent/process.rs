@@ -157,12 +157,14 @@ pub async fn handle_spawn(
                 talu::process::ProcessError::PolicyDeniedExec(_) => {
                     (StatusCode::FORBIDDEN, "policy_denied_exec")
                 }
-                talu::process::ProcessError::StrictUnavailable(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "strict_runtime_unavailable")
-                }
-                talu::process::ProcessError::StrictSetupFailed(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "strict_runtime_setup_failed")
-                }
+                talu::process::ProcessError::StrictUnavailable(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "strict_runtime_unavailable",
+                ),
+                talu::process::ProcessError::StrictSetupFailed(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "strict_runtime_setup_failed",
+                ),
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "process_error"),
             };
             return json_error(

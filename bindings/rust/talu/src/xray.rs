@@ -15,6 +15,8 @@ pub struct TraceRecord {
     pub token: u32,
     /// Position in sequence
     pub position: u32,
+    /// Backend id (0=cpu, 1=metal, 2=cuda)
+    pub backend: u8,
     /// Tensor shape
     pub shape: Vec<u32>,
     /// Data type
@@ -65,6 +67,16 @@ impl TraceRecord {
     pub fn shape_str(&self) -> String {
         let dims: Vec<String> = self.shape.iter().map(|d| d.to_string()).collect();
         format!("[{}]", dims.join(", "))
+    }
+
+    /// Get backend name.
+    pub fn backend_name(&self) -> &'static str {
+        match self.backend {
+            0 => "cpu",
+            1 => "metal",
+            2 => "cuda",
+            _ => "other",
+        }
     }
 }
 
@@ -155,6 +167,7 @@ impl XrayCaptureHandle {
                 layer: info.layer,
                 token: info.token,
                 position: info.position,
+                backend: info.backend,
                 shape,
                 dtype: info.dtype,
                 kernel_name,

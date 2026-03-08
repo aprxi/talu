@@ -181,6 +181,8 @@ pub const CapturedTensor = struct {
     token: u32,
     /// Position in sequence
     position: u32,
+    /// Backend that emitted this trace point.
+    backend: trace.Backend,
     /// Timestamp
     timestamp_ns: i128,
     /// Shape
@@ -252,7 +254,7 @@ pub const TraceCapture = struct {
         if (!self.config.tokens.matches(emission.token)) return;
 
         // Check memory limit
-        const record_size = self.estimateRecordSize(emission.tensor);
+        const record_size = self.estimateRecordSize(emission.backend, emission.tensor);
         if (self.config.memory_limit) |limit| {
             if (self.memory_used + record_size > limit) {
                 self.overflow = true;
@@ -260,12 +262,17 @@ pub const TraceCapture = struct {
             }
         }
 
-        // Compute statistics
-        const tensor_stats = stats_mod.compute(emission.tensor);
+        // Non-CPU backends may emit device pointers that are not host-readable.
+        // Capture metadata only for those emissions.
+        const can_read_tensor = emission.backend == .cpu;
+        const tensor_stats = if (can_read_tensor)
+            stats_mod.compute(emission.tensor)
+        else
+            TensorStats.EMPTY;
 
         // Capture samples if requested
         var samples: ?[]f32 = null;
-        if (self.config.mode == .sample or self.config.mode == .full) {
+        if (can_read_tensor and (self.config.mode == .sample or self.config.mode == .full)) {
             const sample_len = @min(self.config.sample_count, @as(u32, @intCast(emission.tensor.elementCount())));
             if (sample_len > 0) {
                 samples = self.allocator.alloc(f32, sample_len) catch null;
@@ -277,7 +284,7 @@ pub const TraceCapture = struct {
 
         // Capture full data if requested
         var data: ?[]u8 = null;
-        if (self.config.mode == .full) {
+        if (can_read_tensor and self.config.mode == .full) {
             const byte_size = emission.tensor.byteSize();
             if (byte_size > 0) {
                 data = self.allocator.alloc(u8, byte_size) catch null;
@@ -293,6 +300,7 @@ pub const TraceCapture = struct {
             .layer = emission.layer,
             .token = emission.token,
             .position = emission.position,
+            .backend = emission.backend,
             .timestamp_ns = emission.timestamp_ns,
             .shape = emission.tensor.shape,
             .ndim = emission.tensor.ndim,
@@ -314,13 +322,14 @@ pub const TraceCapture = struct {
         self.memory_used += record_size;
     }
 
-    fn estimateRecordSize(self: *const TraceCapture, tensor: trace.TracedTensor) usize {
+    fn estimateRecordSize(self: *const TraceCapture, backend: trace.Backend, tensor: trace.TracedTensor) usize {
         var size: usize = @sizeOf(CapturedTensor);
-        if (self.config.mode == .sample or self.config.mode == .full) {
+        const can_read_tensor = backend == .cpu;
+        if (can_read_tensor and (self.config.mode == .sample or self.config.mode == .full)) {
             const sample_len = @min(self.config.sample_count, @as(u32, @intCast(tensor.elementCount())));
             size += sample_len * @sizeOf(f32);
         }
-        if (self.config.mode == .full) {
+        if (can_read_tensor and self.config.mode == .full) {
             size += tensor.byteSize();
         }
         return size;
@@ -494,6 +503,7 @@ test "TraceCapture basic flow" {
         .layer = trace.TraceEmission.NO_LAYER,
         .token = 0,
         .position = 5,
+        .backend = .cpu,
         .tensor = .{
             .ptr = @ptrCast(&data),
             .dtype = .f32,
@@ -529,6 +539,7 @@ test "TraceCapture filtering" {
         .layer = 5,
         .token = 0,
         .position = 0,
+        .backend = .cpu,
         .tensor = .{ .ptr = @ptrCast(&data), .dtype = .f32, .shape = .{ 2, 0, 0, 0 }, .ndim = 1 },
         .timestamp_ns = 0,
         .kernel_name = std.mem.zeroes([48]u8),
@@ -541,6 +552,7 @@ test "TraceCapture filtering" {
         .layer = 4,
         .token = 0,
         .position = 0,
+        .backend = .cpu,
         .tensor = .{ .ptr = @ptrCast(&data), .dtype = .f32, .shape = .{ 2, 0, 0, 0 }, .ndim = 1 },
         .timestamp_ns = 0,
         .kernel_name = std.mem.zeroes([48]u8),
@@ -553,6 +565,7 @@ test "TraceCapture filtering" {
         .layer = 7,
         .token = 0,
         .position = 0,
+        .backend = .cpu,
         .tensor = .{ .ptr = @ptrCast(&data), .dtype = .f32, .shape = .{ 2, 0, 0, 0 }, .ndim = 1 },
         .timestamp_ns = 0,
         .kernel_name = std.mem.zeroes([48]u8),
@@ -575,6 +588,7 @@ test "TraceCapture with samples" {
         .layer = trace.TraceEmission.NO_LAYER,
         .token = 0,
         .position = 0,
+        .backend = .cpu,
         .tensor = .{ .ptr = @ptrCast(&data), .dtype = .f32, .shape = .{ 8, 0, 0, 0 }, .ndim = 1 },
         .timestamp_ns = 0,
         .kernel_name = std.mem.zeroes([48]u8),
@@ -603,6 +617,7 @@ test "TraceCapture find iterator" {
             .layer = layer,
             .token = 0,
             .position = 0,
+            .backend = .cpu,
             .tensor = .{ .ptr = @ptrCast(&data), .dtype = .f32, .shape = .{ 1, 0, 0, 0 }, .ndim = 1 },
             .timestamp_ns = 0,
             .kernel_name = std.mem.zeroes([48]u8),
