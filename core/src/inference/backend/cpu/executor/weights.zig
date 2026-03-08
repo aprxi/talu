@@ -1467,14 +1467,8 @@ pub const TransformerBlock = struct {
         }
         errdefer if (ln2_ptr) |p| allocator.destroy(p);
 
-        var owned_gated_delta_in_proj: ?*tensor.Tensor = null;
-        errdefer if (owned_gated_delta_in_proj) |tensor_ptr| tensor_ptr.deinit(allocator);
-
-        var kernel_gated_delta_weights = toKernelGatedDeltaWeights(weights.weights);
-        if (kernel_gated_delta_weights.in_proj.dtype != .f32) {
-            owned_gated_delta_in_proj = try copyTensorToF32(allocator, kernel_gated_delta_weights.in_proj, d_model);
-            kernel_gated_delta_weights.in_proj = owned_gated_delta_in_proj.?;
-        }
+        const owned_gated_delta_in_proj: ?*tensor.Tensor = null;
+        const kernel_gated_delta_weights = toKernelGatedDeltaWeights(weights.weights);
         const matmul_in_proj = (try cpu_linalg.matmulKernel(kernel_gated_delta_weights.in_proj.dtype)).func;
         const matmul_out_proj = (try cpu_linalg.matmulKernel(kernel_gated_delta_weights.out_proj.dtype)).func;
         const gated_delta_ptr = try allocator.create(gated_delta.GatedDeltaKernel);
@@ -2821,7 +2815,7 @@ test "copyTensorToF32 dequantizes grouped-affine tensors and transposes when exp
     try std.testing.expectApproxEqAbs(@as(f32, 32.0), copied.asSlice(f32)[31], 1e-5);
 }
 
-test "TransformerBlock.init converts gated-delta mamba in_proj to f32" {
+test "TransformerBlock.init keeps gated-delta in_proj native dtype" {
     const allocator = std.testing.allocator;
 
     const d_model = 2;
@@ -2915,15 +2909,16 @@ test "TransformerBlock.init converts gated-delta mamba in_proj to f32" {
     defer block.deinit(allocator);
 
     const kernel = block.getGatedDeltaKernel() orelse return error.TestUnexpectedResult;
-    try std.testing.expect(block.owned_gated_delta_in_proj != null);
-    try std.testing.expectEqual(tensor.DType.f32, kernel.weights.in_proj.dtype);
+    try std.testing.expect(block.owned_gated_delta_in_proj == null);
+    try std.testing.expectEqual(tensor.DType.bf16, kernel.weights.in_proj.dtype);
     try std.testing.expect(kernel.conv_weight_transposed != null);
-    try std.testing.expectEqual(@as(i64, d_model), kernel.weights.in_proj.shape[0]);
-    try std.testing.expectEqual(@as(i64, proj_len), kernel.weights.in_proj.shape[1]);
-    try std.testing.expectApproxEqAbs(dtype.bf16ToF32(dtype.f32ToBf16(0.1)), kernel.weights.in_proj.asSlice(f32)[0], 1e-6);
-    try std.testing.expectApproxEqAbs(dtype.bf16ToF32(dtype.f32ToBf16(0.3)), kernel.weights.in_proj.asSlice(f32)[1], 1e-6);
-    try std.testing.expectApproxEqAbs(dtype.bf16ToF32(dtype.f32ToBf16(1.0)), kernel.weights.in_proj.asSlice(f32)[10], 1e-6);
-    try std.testing.expectApproxEqAbs(dtype.bf16ToF32(dtype.f32ToBf16(1.2)), kernel.weights.in_proj.asSlice(f32)[11], 1e-6);
+    try std.testing.expectEqual(@as(i64, proj_len), kernel.weights.in_proj.shape[0]);
+    try std.testing.expectEqual(@as(i64, d_model), kernel.weights.in_proj.shape[1]);
+    const in_proj_data = kernel.weights.in_proj.asSlice(u16);
+    try std.testing.expectEqual(dtype.f32ToBf16(0.1), in_proj_data[0]);
+    try std.testing.expectEqual(dtype.f32ToBf16(0.3), in_proj_data[2]);
+    try std.testing.expectEqual(dtype.f32ToBf16(1.0), in_proj_data[9]);
+    try std.testing.expectEqual(dtype.f32ToBf16(1.2), in_proj_data[11]);
 }
 
 test "ScratchBuffer initAttention initializes selected attention caches" {
