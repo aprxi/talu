@@ -175,12 +175,14 @@ pub async fn handle_create(
                 | talu::shell::ShellError::CommandDenied(_) => {
                     (StatusCode::FORBIDDEN, "policy_denied_exec")
                 }
-                talu::shell::ShellError::StrictUnavailable(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "strict_runtime_unavailable")
-                }
-                talu::shell::ShellError::StrictSetupFailed(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "strict_runtime_setup_failed")
-                }
+                talu::shell::ShellError::StrictUnavailable(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "strict_runtime_unavailable",
+                ),
+                talu::shell::ShellError::StrictSetupFailed(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "strict_runtime_setup_failed",
+                ),
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "shell_error"),
             };
             return json_error(status, code, &format!("failed to open shell: {e}"));

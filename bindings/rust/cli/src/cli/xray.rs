@@ -17,6 +17,52 @@ struct KernelUsage {
     total_us: u64,
 }
 
+struct KernelShapeUsageRow {
+    backend: String,
+    kernel_name: String,
+    shape: String,
+    call_count: usize,
+    total_us: u64,
+    share_global_pct: f64,
+    avg_us: u64,
+    p50_us: u64,
+    p90_us: u64,
+    min_us: u64,
+    max_us: u64,
+    us_per_token: u64,
+}
+
+struct KernelShapeAccumulator {
+    call_count: usize,
+    total_us: u64,
+    samples_us: Vec<u64>,
+}
+
+struct PointUsageRow {
+    point: String,
+    backend: String,
+    call_count: usize,
+    total_us: u64,
+    share_pct: f64,
+    avg_us: u64,
+    p50_us: u64,
+    p90_us: u64,
+    min_us: u64,
+    max_us: u64,
+    us_per_token: u64,
+    shape_count: usize,
+    kernel_count: usize,
+}
+
+struct PointAccumulator {
+    call_count: usize,
+    total_us: u64,
+    samples_us: Vec<u64>,
+    shape_signatures: std::collections::HashSet<String>,
+    kernels: std::collections::HashSet<String>,
+    backends: std::collections::HashSet<String>,
+}
+
 struct PointUsage {
     point: String,
     call_count: usize,
@@ -32,16 +78,18 @@ struct KernelPointUsage {
 #[derive(Debug, Deserialize)]
 struct PerfHintsJson {
     bench_model: String,
-    prefill_point_mappings: Vec<PointBenchMapJson>,
-    decode_point_mappings: Vec<PointBenchMapJson>,
-    prefill_hidden_rows: Vec<String>,
-    decode_hidden_rows: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct PointBenchMapJson {
-    point: String,
-    bench_row: String,
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 2 {
+        return ".".repeat(max_chars);
+    }
+    let keep = max_chars - 2;
+    let prefix: String = s.chars().take(keep).collect();
+    format!("{prefix}..")
 }
 
 /// Derive kernel usage from trace records (counts + timing).
@@ -75,8 +123,10 @@ fn derive_kernel_usage_by_point(
     trace: &[talu::TraceRecord],
     record_delta_ns: &[i64],
 ) -> Vec<KernelPointUsage> {
-    let mut kernel_point_stats: std::collections::HashMap<String, std::collections::HashMap<String, (usize, u64)>> =
-        std::collections::HashMap::new();
+    let mut kernel_point_stats: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, (usize, u64)>,
+    > = std::collections::HashMap::new();
     let mut kernel_totals: std::collections::HashMap<String, u64> =
         std::collections::HashMap::new();
 
@@ -85,9 +135,7 @@ fn derive_kernel_usage_by_point(
             if !kernel_name.is_empty() {
                 let delta_us = record_delta_ns[i].unsigned_abs() / 1_000;
                 *kernel_totals.entry(kernel_name.clone()).or_insert(0) += delta_us;
-                let point_stats = kernel_point_stats
-                    .entry(kernel_name.clone())
-                    .or_default();
+                let point_stats = kernel_point_stats.entry(kernel_name.clone()).or_default();
                 let entry = point_stats.entry(record.point.clone()).or_insert((0, 0));
                 entry.0 += 1;
                 entry.1 += delta_us;
@@ -106,7 +154,11 @@ fn derive_kernel_usage_by_point(
                     total_us,
                 })
                 .collect();
-            point_usage.sort_by(|a, b| b.total_us.cmp(&a.total_us).then_with(|| a.point.cmp(&b.point)));
+            point_usage.sort_by(|a, b| {
+                b.total_us
+                    .cmp(&a.total_us)
+                    .then_with(|| a.point.cmp(&b.point))
+            });
             KernelPointUsage {
                 total_us: kernel_totals.get(&kernel_name).copied().unwrap_or(0),
                 kernel_name,
@@ -114,7 +166,11 @@ fn derive_kernel_usage_by_point(
             }
         })
         .collect();
-    usage.sort_by(|a, b| b.total_us.cmp(&a.total_us).then_with(|| a.kernel_name.cmp(&b.kernel_name)));
+    usage.sort_by(|a, b| {
+        b.total_us
+            .cmp(&a.total_us)
+            .then_with(|| a.kernel_name.cmp(&b.kernel_name))
+    });
     usage
 }
 
@@ -143,8 +199,358 @@ fn derive_other_usage(trace: &[talu::TraceRecord], record_delta_ns: &[i64]) -> V
             total_us,
         })
         .collect();
-    usage.sort_by(|a, b| b.total_us.cmp(&a.total_us).then_with(|| a.point.cmp(&b.point)));
+    usage.sort_by(|a, b| {
+        b.total_us
+            .cmp(&a.total_us)
+            .then_with(|| a.point.cmp(&b.point))
+    });
     usage
+}
+
+fn detect_token_count(trace: &[talu::TraceRecord]) -> u64 {
+    trace
+        .iter()
+        .find(|r| r.shape.len() >= 2 && r.shape[0] == 1)
+        .map(|r| r.shape[1] as u64)
+        .unwrap_or(1)
+}
+
+fn percentile_us(samples: &[u64], percentile: usize) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let last = sorted.len() - 1;
+    let idx = (last * percentile) / 100;
+    sorted[idx]
+}
+
+fn derive_point_table(
+    trace: &[talu::TraceRecord],
+    record_delta_ns: &[i64],
+    total_us: u64,
+    token_count: u64,
+) -> Vec<PointUsageRow> {
+    let mut by_point: std::collections::HashMap<String, PointAccumulator> =
+        std::collections::HashMap::new();
+    for (i, record) in trace.iter().enumerate() {
+        let delta_us = record_delta_ns[i].unsigned_abs() / 1_000;
+        let entry = by_point
+            .entry(record.point.clone())
+            .or_insert_with(|| PointAccumulator {
+                call_count: 0,
+                total_us: 0,
+                samples_us: Vec::new(),
+                shape_signatures: std::collections::HashSet::new(),
+                kernels: std::collections::HashSet::new(),
+                backends: std::collections::HashSet::new(),
+            });
+        entry.call_count += 1;
+        entry.total_us += delta_us;
+        entry.samples_us.push(delta_us);
+        let signature = format!("{} {}", record.shape_str(), record.dtype_name());
+        entry.shape_signatures.insert(signature);
+        entry.backends.insert(record.backend_name().to_string());
+        if let Some(kernel_name) = &record.kernel_name {
+            if !kernel_name.is_empty() {
+                entry.kernels.insert(kernel_name.clone());
+            }
+        }
+    }
+
+    by_point
+        .into_iter()
+        .map(|(point, acc)| {
+            let avg_us = if acc.call_count > 0 {
+                acc.total_us / acc.call_count as u64
+            } else {
+                0
+            };
+            let share_pct = if total_us > 0 {
+                (acc.total_us as f64 / total_us as f64) * 100.0
+            } else {
+                0.0
+            };
+            let us_per_token = if token_count > 0 {
+                acc.total_us / token_count
+            } else {
+                acc.total_us
+            };
+            let backend = if acc.backends.len() == 1 {
+                acc.backends
+                    .iter()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "-".to_string())
+            } else {
+                "mixed".to_string()
+            };
+            PointUsageRow {
+                point,
+                backend,
+                call_count: acc.call_count,
+                total_us: acc.total_us,
+                share_pct,
+                avg_us,
+                p50_us: percentile_us(&acc.samples_us, 50),
+                p90_us: percentile_us(&acc.samples_us, 90),
+                min_us: *acc.samples_us.iter().min().unwrap_or(&0),
+                max_us: *acc.samples_us.iter().max().unwrap_or(&0),
+                us_per_token,
+                shape_count: acc.shape_signatures.len(),
+                kernel_count: acc.kernels.len(),
+            }
+        })
+        .collect()
+}
+
+fn derive_kernel_shape_table(
+    trace: &[talu::TraceRecord],
+    record_delta_ns: &[i64],
+    total_us: u64,
+    token_count: u64,
+) -> Vec<KernelShapeUsageRow> {
+    let mut by_key: std::collections::HashMap<
+        String,
+        (String, String, String, KernelShapeAccumulator),
+    > = std::collections::HashMap::new();
+    for (i, record) in trace.iter().enumerate() {
+        let backend = record.backend_name().to_string();
+        let kernel_name: String = match &record.kernel_name {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => "other(non-kernel)".to_string(),
+        };
+        let shape = record.shape_str();
+        let key = format!("{backend}\u{1f}{kernel_name}\u{1f}{shape}");
+        let delta_us = record_delta_ns[i].unsigned_abs() / 1_000;
+        let entry = by_key.entry(key).or_insert_with(|| {
+            (
+                backend.clone(),
+                kernel_name.clone(),
+                shape.clone(),
+                KernelShapeAccumulator {
+                    call_count: 0,
+                    total_us: 0,
+                    samples_us: Vec::new(),
+                },
+            )
+        });
+        entry.3.call_count += 1;
+        entry.3.total_us += delta_us;
+        entry.3.samples_us.push(delta_us);
+    }
+
+    let mut rows: Vec<KernelShapeUsageRow> = by_key
+        .into_values()
+        .map(|(backend, kernel_name, shape, acc)| {
+            let share_global_pct = if total_us > 0 {
+                (acc.total_us as f64 / total_us as f64) * 100.0
+            } else {
+                0.0
+            };
+            let avg_us = if acc.call_count > 0 {
+                acc.total_us / acc.call_count as u64
+            } else {
+                0
+            };
+            let us_per_token = if token_count > 0 {
+                acc.total_us / token_count
+            } else {
+                acc.total_us
+            };
+            KernelShapeUsageRow {
+                backend,
+                kernel_name,
+                shape,
+                call_count: acc.call_count,
+                total_us: acc.total_us,
+                share_global_pct,
+                avg_us,
+                p50_us: percentile_us(&acc.samples_us, 50),
+                p90_us: percentile_us(&acc.samples_us, 90),
+                min_us: *acc.samples_us.iter().min().unwrap_or(&0),
+                max_us: *acc.samples_us.iter().max().unwrap_or(&0),
+                us_per_token,
+            }
+        })
+        .collect();
+
+    rows.sort_by(|a, b| {
+        b.total_us
+            .cmp(&a.total_us)
+            .then_with(|| a.backend.cmp(&b.backend))
+            .then_with(|| a.kernel_name.cmp(&b.kernel_name))
+            .then_with(|| a.shape.cmp(&b.shape))
+    });
+    rows
+}
+
+fn print_method_table(
+    model_info: &talu::ModelInfo,
+    mode_label: &str,
+    mut kernel_rows: Vec<KernelShapeUsageRow>,
+    mut point_rows: Vec<PointUsageRow>,
+    total_us: u64,
+    token_count: u64,
+    perf_hints: Option<PerfHintsJson>,
+) {
+    kernel_rows.sort_by(|a, b| {
+        b.total_us
+            .cmp(&a.total_us)
+            .then_with(|| a.backend.cmp(&b.backend))
+            .then_with(|| a.kernel_name.cmp(&b.kernel_name))
+            .then_with(|| a.shape.cmp(&b.shape))
+    });
+    point_rows.sort_by(|a, b| {
+        b.total_us
+            .cmp(&a.total_us)
+            .then_with(|| a.point.cmp(&b.point))
+    });
+
+    let model_name = model_info
+        .architecture
+        .split("For")
+        .next()
+        .unwrap_or(&model_info.model_type);
+    println!(
+        "{} ({}) \u{2014} {} [table]",
+        model_name, model_info.model_type, mode_label
+    );
+    println!(
+        "total={}  per_token={}  tokens={}",
+        format_us(total_us, 1),
+        format_us(
+            if token_count > 0 {
+                total_us / token_count
+            } else {
+                total_us
+            },
+            1
+        ),
+        token_count,
+    );
+    println!();
+
+    println!("Kernel Methods");
+    println!(
+        "{:<7} {:<24} {:<20} {:>7} {:>10} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10}",
+        "backend",
+        "kernel",
+        "shape",
+        "calls",
+        "total_us",
+        "share",
+        "avg_us",
+        "p50_us",
+        "p90_us",
+        "min_us",
+        "max_us",
+        "us/token"
+    );
+    println!("{}", "-".repeat(184));
+
+    for row in &kernel_rows {
+        let kernel_name = truncate_with_ellipsis(&row.kernel_name, 24);
+        println!(
+            "{:<7} {:<24} {:<20} {:>7} {:>10} {:>6.1}% {:>9} {:>9} {:>9} {:>9} {:>9} {:>10}",
+            row.backend,
+            kernel_name,
+            row.shape,
+            row.call_count,
+            row.total_us,
+            row.share_global_pct,
+            row.avg_us,
+            row.p50_us,
+            row.p90_us,
+            row.min_us,
+            row.max_us,
+            row.us_per_token,
+        );
+    }
+
+    let kernels_total_us: u64 = kernel_rows.iter().map(|r| r.total_us).sum();
+    let kernels_total_calls: usize = kernel_rows.iter().map(|r| r.call_count).sum();
+    let kernels_share = if total_us > 0 {
+        (kernels_total_us as f64 / total_us as f64) * 100.0
+    } else {
+        0.0
+    };
+    let total_tok_s = if total_us > 0 {
+        (token_count as f64 * 1_000_000.0) / total_us as f64
+    } else {
+        0.0
+    };
+    println!("{}", "-".repeat(184));
+    println!(
+        "{:<7} {:<24} {:<20} {:>7} {:>10} {:>6.1}% ({:.1} tok/s)",
+        "-",
+        "TOTAL(kernels)",
+        "",
+        kernels_total_calls,
+        kernels_total_us,
+        kernels_share,
+        total_tok_s
+    );
+    println!();
+
+    println!("Logical Op Totals");
+    println!(
+        "{:<22} {:<7} {:>7} {:>10} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>8} {:>8}",
+        "logical_op",
+        "backend",
+        "calls",
+        "total_us",
+        "share",
+        "avg_us",
+        "p50_us",
+        "p90_us",
+        "min_us",
+        "max_us",
+        "us/token",
+        "shapes",
+        "kernels"
+    );
+    println!("{}", "-".repeat(145));
+    for row in &point_rows {
+        println!(
+            "{:<22} {:<7} {:>7} {:>10} {:>6.1}% {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>8} {:>8}",
+            row.point,
+            row.backend,
+            row.call_count,
+            row.total_us,
+            row.share_pct,
+            row.avg_us,
+            row.p50_us,
+            row.p90_us,
+            row.min_us,
+            row.max_us,
+            row.us_per_token,
+            row.shape_count,
+            row.kernel_count,
+        );
+    }
+    let points_total_us: u64 = point_rows.iter().map(|r| r.total_us).sum();
+    let points_total_calls: usize = point_rows.iter().map(|r| r.call_count).sum();
+    let points_share = if total_us > 0 {
+        (points_total_us as f64 / total_us as f64) * 100.0
+    } else {
+        0.0
+    };
+    println!("{}", "-".repeat(145));
+    println!(
+        "{:<22} {:<7} {:>7} {:>10} {:>6.1}%",
+        "TOTAL(logical_ops)", "-", points_total_calls, points_total_us, points_share
+    );
+
+    if let Some(perf_hints) = perf_hints {
+        println!();
+        println!("Bench helper:");
+        println!(
+            "  make -C core/bench/compute/cpu model={}",
+            perf_hints.bench_model
+        );
+    }
 }
 
 pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
@@ -179,19 +585,17 @@ pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
 
     let all_trace = capture.get_trace();
 
-    // Split trace into prefill and decode records.
-    // Prefill records have multi-token shapes (shape[1] > 1 for 3D tensors).
-    // Decode records have single-token shapes (shape[1] == 1 for 3D, or come after them).
-    // The split point is where layer records transition from seq_len>1 to seq_len==1.
-    let split_idx = all_trace
-        .iter()
-        .position(|r| r.layer != 0xFFFF && r.shape.len() >= 2 && r.shape[1] == 1)
-        .unwrap_or(all_trace.len());
-
+    // Split trace into prefill/decode records.
+    // For --input, keep full trace. CUDA prefill can emit prefix-growing shapes
+    // (seq_len=1,2,3,...) which would otherwise be incorrectly split to empty.
     let trace: Vec<talu::TraceRecord> = if decode_mode {
+        let split_idx = all_trace
+            .iter()
+            .position(|r| r.layer != 0xFFFF && r.shape.len() >= 2 && r.shape[1] == 1)
+            .unwrap_or(all_trace.len());
         all_trace.into_iter().skip(split_idx).collect()
     } else {
-        all_trace.into_iter().take(split_idx).collect()
+        all_trace
     };
 
     // Compute per-record deltas (ns from previous record)
@@ -257,6 +661,27 @@ pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
     } else {
         "input (prefill)"
     };
+    let total_us: u64 = record_delta_ns
+        .iter()
+        .map(|ns| ns.unsigned_abs() / 1_000)
+        .sum();
+    let token_count = detect_token_count(&trace);
+    let perf_hints = load_perf_hints(&model_info)?;
+    if args.table {
+        let kernel_shape_rows =
+            derive_kernel_shape_table(&trace, &record_delta_ns, total_us, token_count);
+        let point_rows = derive_point_table(&trace, &record_delta_ns, total_us, token_count);
+        print_method_table(
+            &model_info,
+            mode_label,
+            kernel_shape_rows,
+            point_rows,
+            total_us,
+            token_count,
+            perf_hints,
+        );
+        return Ok(());
+    }
     print_architecture_tree(
         &model_info,
         &trace,
@@ -264,7 +689,7 @@ pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
         &usage,
         &kernel_point_usage,
         &other_usage,
-        load_perf_hints(&model_info)?,
+        perf_hints,
         mode_label,
     );
     Ok(())
@@ -272,8 +697,8 @@ pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
 
 fn load_perf_hints(model_info: &talu::ModelInfo) -> Result<Option<PerfHintsJson>> {
     if let Some(raw) = talu::model::performance_hints_json(&model_info.model_type)? {
-        let hints: PerfHintsJson =
-            serde_json::from_str(&raw).map_err(|e| anyhow!("invalid performance hints JSON: {e}"))?;
+        let hints: PerfHintsJson = serde_json::from_str(&raw)
+            .map_err(|e| anyhow!("invalid performance hints JSON: {e}"))?;
         return Ok(Some(hints));
     }
     if !model_info.architecture.is_empty() {
@@ -564,11 +989,7 @@ fn print_architecture_tree(
     );
 
     // Detect token count from first 3D shape with seq_len > 1 (prefill), or seq_len == 1 (decode)
-    let n_tokens = trace
-        .iter()
-        .find(|r| r.shape.len() >= 2 && r.shape[0] == 1)
-        .map(|r| r.shape[1] as u64)
-        .unwrap_or(1);
+    let n_tokens = detect_token_count(trace);
     if n_tokens > 1 {
         let per_token_us = grand_total_us / n_tokens;
         println!(
@@ -680,72 +1101,9 @@ fn print_architecture_tree(
     if let Some(perf_hints) = perf_hints {
         println!();
         println!("Bench helper:");
-        println!("  make -C core/bench/compute/cpu model={}", perf_hints.bench_model);
-        let bench_focus = derive_bench_focus(&perf_hints, kernel_point_usage, other_usage, mode_label.contains("decode"));
-        if !bench_focus.is_empty() {
-            println!();
-            println!("Bench Focus Mapping:");
-            for (point, bench_row) in bench_focus {
-                println!("  {:18} -> {}", point, bench_row);
-            }
-        }
+        println!(
+            "  make -C core/bench/compute/cpu model={}",
+            perf_hints.bench_model
+        );
     }
-}
-
-fn derive_bench_focus(
-    perf_hints: &PerfHintsJson,
-    kernel_point_usage: &[KernelPointUsage],
-    other_usage: &[PointUsage],
-    decode_mode: bool,
-) -> Vec<(String, String)> {
-    let point_totals = point_total_usage(kernel_point_usage, other_usage);
-    let mut rows: Vec<(String, String, u64)> = Vec::new();
-    let point_mappings = if decode_mode {
-        &perf_hints.decode_point_mappings
-    } else {
-        &perf_hints.prefill_point_mappings
-    };
-    let hidden_rows = if decode_mode {
-        &perf_hints.decode_hidden_rows
-    } else {
-        &perf_hints.prefill_hidden_rows
-    };
-
-    for mapping in point_mappings {
-        if let Some(total_us) = point_totals.get(mapping.point.as_str()) {
-            rows.push((mapping.point.clone(), mapping.bench_row.clone(), *total_us));
-        }
-    }
-
-    for row in hidden_rows {
-        rows.push(("hidden".to_string(), row.clone(), 0));
-    }
-
-    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-
-    let mut deduped: Vec<(String, String)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (point, bench_row, _) in rows {
-        let key = format!("{point}:{bench_row}");
-        if seen.insert(key) {
-            deduped.push((point, bench_row));
-        }
-    }
-    deduped
-}
-
-fn point_total_usage(
-    kernel_point_usage: &[KernelPointUsage],
-    other_usage: &[PointUsage],
-) -> std::collections::HashMap<String, u64> {
-    let mut totals = std::collections::HashMap::new();
-    for kernel in kernel_point_usage {
-        for point in &kernel.points {
-            *totals.entry(point.point.clone()).or_insert(0) += point.total_us;
-        }
-    }
-    for point in other_usage {
-        *totals.entry(point.point.clone()).or_insert(0) += point.total_us;
-    }
-    totals
 }

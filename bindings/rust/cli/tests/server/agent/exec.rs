@@ -113,10 +113,7 @@ fn agent_exec_strict_mode_without_policy_fails_startup() {
     let mut cfg = ServerConfig::new();
     cfg.agent_runtime_mode = Some("strict".to_string());
     cfg.sandbox_backend = Some("linux-local".to_string());
-    assert_server_startup_fails(
-        cfg,
-        "strict agent runtime mode requires a policy",
-    );
+    assert_server_startup_fails(cfg, "strict agent runtime mode requires a policy");
 }
 
 #[test]
@@ -140,10 +137,7 @@ fn agent_exec_strict_mode_invalid_runtime_policy_fails_startup() {
             {"effect":"deny","action":"tool.fs.write","resource":"src/private/**"}
         ]
     }"#;
-    assert_server_startup_fails(
-        config_with_strict_policy(policy),
-        "strict runtime policy",
-    );
+    assert_server_startup_fails(config_with_strict_policy(policy), "strict runtime policy");
 }
 
 // ---------------------------------------------------------------------------

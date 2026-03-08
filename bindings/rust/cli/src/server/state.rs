@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use talu::InferenceBackend;
 use talu::policy::Policy;
+use talu::InferenceBackend;
 
 use crate::server::tenant::TenantRegistry;
 use crate::server::{AgentRuntimeMode, SandboxBackend};

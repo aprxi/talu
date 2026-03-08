@@ -555,6 +555,10 @@ pub(super) struct XrayArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Print compact per-method table instead of architecture tree
+    #[arg(long)]
+    pub table: bool,
+
     /// Prompt text (default: "xray")
     #[arg(trailing_var_arg = true)]
     pub prompt: Vec<String>,
@@ -1088,6 +1092,20 @@ mod tests {
                 assert_eq!(args.profile, "default");
             }
             _ => panic!("expected sample command"),
+        }
+    }
+
+    #[test]
+    fn parse_xray_table_flag() {
+        let cli = parse(&["talu", "xray", "Qwen/Qwen3.5-0.8B", "--output", "--table"])
+            .expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Xray(args)) => {
+                assert!(args.output);
+                assert!(args.table);
+            }
+            _ => panic!("expected xray command"),
         }
     }
 

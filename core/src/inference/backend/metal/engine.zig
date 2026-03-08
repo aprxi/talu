@@ -10,6 +10,7 @@ const tensor = @import("../../../tensor.zig");
 const common_mrope = @import("vision/mrope.zig");
 const ModelConfig = tensor.ModelConfig;
 const log = @import("../../../log.zig");
+const trace = @import("../../../xray/trace.zig");
 
 // Import compute primitives from compute/
 const compute = @import("../../../compute/root.zig");
@@ -444,6 +445,8 @@ pub const MetalBackend = struct {
     }
 
     fn prefillSlotImpl(self: *MetalBackend, slot_index: usize, tokens: []const u32, logits_out: []f32) !void {
+        const prev_backend = trace.setBackendContext(.metal);
+        defer _ = trace.setBackendContext(prev_backend);
         const sequence_len = tokens.len;
         if (sequence_len == 0) return;
         const trace_prefill_timing = std.posix.getenv("TALU_METAL_PREFILL_TIMING") != null;
@@ -497,6 +500,16 @@ pub const MetalBackend = struct {
             );
         }
         graph.copyToHost(logits_handle, logits_out[0..self.vocab_size]);
+        trace.emitFinal(
+            .logits_ready,
+            @intCast(sequence_len - 1),
+            @intCast(sequence_len),
+            @ptrCast(logits_out.ptr),
+            .f32,
+            .{ @intCast(self.vocab_size), 0, 0, 0 },
+            1,
+            "metal_logits_host",
+        );
         const t_copy_done_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
         graph.freeArray(logits_handle);
@@ -536,6 +549,8 @@ pub const MetalBackend = struct {
         position: usize,
         logits_out: []f32,
     ) !void {
+        const prev_backend = trace.setBackendContext(.metal);
+        defer _ = trace.setBackendContext(prev_backend);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
         const logits_handle = try runtime_trait.transformerForwardLazy(
@@ -549,6 +564,16 @@ pub const MetalBackend = struct {
         defer graph.freeArray(logits_handle);
         graph.eval(&[_]graph.ArrayHandle{logits_handle});
         graph.copyToHost(logits_handle, logits_out);
+        trace.emitFinal(
+            .logits_ready,
+            0,
+            @intCast(position + 1),
+            @ptrCast(logits_out.ptr),
+            .f32,
+            .{ @intCast(self.vocab_size), 0, 0, 0 },
+            1,
+            "metal_logits_host",
+        );
         const slot_position = try self.slotPositionPtr(slot_index);
         slot_position.* = position + 1;
     }
@@ -559,6 +584,8 @@ pub const MetalBackend = struct {
         token: u32,
         position: usize,
     ) !u32 {
+        const prev_backend = trace.setBackendContext(.metal);
+        defer _ = trace.setBackendContext(prev_backend);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
         const logits_handle = try runtime_trait.transformerForwardLazy(
@@ -583,7 +610,18 @@ pub const MetalBackend = struct {
 
         const slot_position = try self.slotPositionPtr(slot_index);
         slot_position.* = position + 1;
-        return graph.mlx_array_item_u32(token_handle);
+        const next_token = graph.mlx_array_item_u32(token_handle);
+        trace.emitFinal(
+            .token_select,
+            0,
+            @intCast(position + 1),
+            @ptrCast(std.mem.asBytes(&next_token).ptr),
+            .u32,
+            .{ 1, 0, 0, 0 },
+            1,
+            "gpu_argmax",
+        );
+        return next_token;
     }
 
     pub fn supportsSchedulerBackendTopKDecodeRoute(
@@ -989,6 +1027,8 @@ pub const MetalBackend = struct {
         vision_input: ?*const PrefillVisionInput,
         logits_out: []f32,
     ) !void {
+        const prev_backend = trace.setBackendContext(.metal);
+        defer _ = trace.setBackendContext(prev_backend);
         try self.ensureSlotStateBlocksBoundForScheduler(slot_index);
         if (slot_index == 0) self.slot_in_use = true else self.extra_slots[try self.toExtraSlotIndex(slot_index)].in_use = true;
         if (vision_input == null) return self.prefillSlotImpl(slot_index, tokens, logits_out);
@@ -1120,6 +1160,16 @@ pub const MetalBackend = struct {
         std.debug.assert(shape_buffer[rank - 1] == self.vocab_size);
         if (rank == 2) std.debug.assert(shape_buffer[0] == 1);
         graph.copyToHost(logits_handle, logits_out[0..self.vocab_size]);
+        trace.emitFinal(
+            .logits_ready,
+            @intCast(sequence_len - 1),
+            @intCast(sequence_len),
+            @ptrCast(logits_out.ptr),
+            .f32,
+            .{ @intCast(self.vocab_size), 0, 0, 0 },
+            1,
+            "metal_logits_host",
+        );
 
         slot_position.* = sequence_len;
     }
