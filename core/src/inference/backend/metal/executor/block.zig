@@ -10,6 +10,7 @@ const op_types = @import("../../../../models/op_types.zig");
 const tensor = @import("../../../../tensor.zig");
 const opcode_map = @import("../../../../models/plan/opcode_map.zig");
 const log = @import("../../../../log.zig");
+const trace = @import("../../../../xray/trace.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const weights_mod = @import("weights.zig");
@@ -215,6 +216,72 @@ pub const TransformerBlock = struct {
     fn layerProgramExecutionState(ctx: *runtime_contract.ExecutionContext) !*LayerProgramExecutionContext {
         const raw_state = ctx.workspace.any orelse return error.InvalidDispatchState;
         return @ptrCast(@alignCast(raw_state));
+    }
+
+    fn inferTraceSeqLen(state: *const LayerProgramExecutionContext) u32 {
+        var shape_buffer: [8]usize = undefined;
+        const rank = mlx_graph.getShape(state.residual.*, &shape_buffer);
+        if (rank >= 2 and shape_buffer[1] > 0 and shape_buffer[1] <= std.math.maxInt(u32)) {
+            return @intCast(shape_buffer[1]);
+        }
+        return 1;
+    }
+
+    fn traceShapeBsd(seq_len: u32, dim: u32) [4]u32 {
+        return .{ 1, seq_len, dim, 0 };
+    }
+
+    fn traceTokenIndex(seq_len: u32) u32 {
+        if (seq_len == 0) return 0;
+        return seq_len - 1;
+    }
+
+    fn tracePosition(state: *const LayerProgramExecutionContext, seq_len: u32) u32 {
+        const seq_tail = if (seq_len > 0) seq_len - 1 else 0;
+        const pos = state.pos_offset + seq_tail;
+        return @intCast(@min(pos, std.math.maxInt(u32)));
+    }
+
+    fn emitLayerProgramTracePoint(
+        state: *const LayerProgramExecutionContext,
+        point: trace.TracePoint,
+        shape: [4]u32,
+        ndim: u8,
+        kernel_name: []const u8,
+    ) void {
+        if (!trace.isEnabled()) return;
+        var marker = [_]f32{0.0};
+        const seq_len = inferTraceSeqLen(state);
+        trace.emit(
+            point,
+            @intCast(state.layer_idx),
+            traceTokenIndex(seq_len),
+            tracePosition(state, seq_len),
+            @ptrCast(marker[0..].ptr),
+            .f32,
+            shape,
+            ndim,
+            kernel_name,
+        );
+    }
+
+    fn inferNormTracePoint(state: *const LayerProgramExecutionContext, insn: *const runtime_contract.Instruction) trace.TracePoint {
+        const plan = &state.compiled_plan.plan;
+        var op_index: ?usize = null;
+        for (plan.instructions, 0..) |*candidate, idx| {
+            if (candidate == insn) {
+                op_index = idx;
+                break;
+            }
+        }
+        const op_idx = op_index orelse return .layer_ffn_norm;
+        if (op_idx + 1 < plan.instructions.len) {
+            const next_opcode = plan.instructions[op_idx + 1].opcode;
+            if (next_opcode == .multihead_attention or next_opcode == .mla_attention or next_opcode == .shortconv or next_opcode == .gated_delta_net) {
+                return .layer_attn_norm;
+            }
+        }
+        return .layer_ffn_norm;
     }
 
     fn layerProgramStateBlocksForInstruction(
@@ -1072,6 +1139,14 @@ pub const TransformerBlock = struct {
             insn,
             registers,
         );
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            inferNormTracePoint(state, insn),
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_rmsnorm",
+        );
     }
 
     fn layerProgramAttentionRuntimeAdapter(
@@ -1089,11 +1164,30 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        const seq_len = inferTraceSeqLen(state);
+        const q_dim: u32 = if (insn.opcode == .multihead_attention)
+            @intCast(state.runtime_meta.model_config.n_heads * state.runtime_meta.model_config.head_dim)
+        else
+            @intCast(state.runtime_meta.model_config.d_model);
+        emitLayerProgramTracePoint(
+            state,
+            .attn_q,
+            traceShapeBsd(seq_len, q_dim),
+            3,
+            "metal_attention_q",
+        );
         try layerProgramAttentionAdapter(
             state,
             insn,
             registers,
             cache,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .attn_out,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_attention_out",
         );
     }
 
@@ -1112,11 +1206,26 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            .conv_in_proj,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.shortconv_conv_dim * 3)),
+            3,
+            "metal_shortconv_in_proj",
+        );
         try layerProgramShortConvAdapter(
             state,
             insn,
             registers,
             shortconv_cache,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .conv_out_proj,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_shortconv_out_proj",
         );
     }
 
@@ -1144,11 +1253,19 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        const seq_len = inferTraceSeqLen(state);
         try layerProgramGatedDeltaAdapter(
             state,
             insn,
             registers,
             gated_delta_cache,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .block_out,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_gated_delta_out",
         );
     }
 
@@ -1161,10 +1278,25 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            .ffn_gate,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_ff)),
+            3,
+            "metal_ffn_gate",
+        );
         try layerProgramSwiGluAdapter(
             state,
             insn,
             registers,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .ffn_down,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_ffn_down",
         );
     }
 
@@ -1177,10 +1309,25 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            .ffn_gate,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_ff)),
+            3,
+            "metal_moe_gate",
+        );
         try layerProgramMoeAdapter(
             state,
             insn,
             registers,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .ffn_down,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_moe_down",
         );
     }
 
@@ -1199,11 +1346,19 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        const seq_len = inferTraceSeqLen(state);
         try layerProgramMambaAdapter(
             state,
             insn,
             registers,
             mamba_cache,
+        );
+        emitLayerProgramTracePoint(
+            state,
+            .mamba_out,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_mamba_out",
         );
     }
 
@@ -1228,6 +1383,14 @@ pub const TransformerBlock = struct {
             insn,
             registers,
             scale_kind,
+        );
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            .block_out,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_residual_add",
         );
     }
 
