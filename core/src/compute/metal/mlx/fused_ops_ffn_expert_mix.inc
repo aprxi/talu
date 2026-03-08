@@ -256,6 +256,55 @@ static inline array ffn_fused_gate_up_rhs_cached(
     return inserted->second;
 }
 
+static inline fast::CustomKernelFunction& ffn_swiglu_from_fused_gate_up_kernel() {
+    static thread_local fast::CustomKernelFunction kernel = fast::metal_kernel(
+        "talu_ffn_swiglu_from_fused_gate_up",
+        { "gate_up" },
+        { "mid" },
+        R"(
+    const uint idx = thread_position_in_grid.x;
+    if (idx >= ELEMENTS) {
+      return;
+    }
+    const uint d = idx % D_FF;
+    const uint token = idx / D_FF;
+    const uint base = token * (2 * D_FF);
+    const float gate = gate_up[base + d];
+    const float up = gate_up[base + D_FF + d];
+    mid[idx] = (gate * (1.0f / (1.0f + exp(-gate)))) * up;
+        )",
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static inline array ffn_swiglu_from_fused_gate_up(const array& gate_up, int batch_size, int seq_len, int d_ff) {
+    if (batch_size <= 0 || seq_len <= 0 || d_ff <= 0) {
+        throw std::invalid_argument("[fused_ffn] invalid swiglu dims");
+    }
+    const int elements = batch_size * seq_len * d_ff;
+    auto outputs = ffn_swiglu_from_fused_gate_up_kernel()(
+        { gate_up },
+        { Shape{batch_size, seq_len, d_ff} },
+        { gate_up.dtype() },
+        { elements, 1, 1 },
+        { 256, 1, 1 },
+        {
+            { "D_FF", d_ff },
+            { "ELEMENTS", elements },
+        },
+        std::nullopt,
+        false,
+        {}
+    );
+    if (outputs.size() != 1) {
+        throw std::runtime_error("[fused_ffn] swiglu kernel returned unexpected output count");
+    }
+    return outputs[0];
+}
+
 void* mlx_lazy_fused_ffn_bf16(
     const void* input,
     const void* gate_w, const void* up_w, const void* down_w
@@ -279,9 +328,7 @@ void* mlx_lazy_fused_ffn_bf16(
     auto gate_up = matmul_lastdim(x, rhs.gate_up_wt);
     const int batch_size = x.shape(0);
     const int seq_len = x.shape(1);
-    auto gate = slice(gate_up, {0, 0, 0}, {batch_size, seq_len, rhs.d_ff});
-    auto up = slice(gate_up, {0, 0, rhs.d_ff}, {batch_size, seq_len, 2 * rhs.d_ff});
-    auto mid = (gate * sigmoid(gate)) * up;
+    auto mid = ffn_swiglu_from_fused_gate_up(gate_up, batch_size, seq_len, rhs.d_ff);
     auto out = matmul_lastdim(mid, rhs.down_wt);
 
     return pool_array(std::move(out));
@@ -316,9 +363,7 @@ void* mlx_lazy_rms_norm_fused_ffn_bf16(
     auto gate_up = matmul_lastdim(normed, rhs.gate_up_wt);
     const int batch_size = x.shape(0);
     const int seq_len = x.shape(1);
-    auto gate = slice(gate_up, {0, 0, 0}, {batch_size, seq_len, rhs.d_ff});
-    auto up = slice(gate_up, {0, 0, rhs.d_ff}, {batch_size, seq_len, 2 * rhs.d_ff});
-    auto mid = (gate * sigmoid(gate)) * up;
+    auto mid = ffn_swiglu_from_fused_gate_up(gate_up, batch_size, seq_len, rhs.d_ff);
     auto out = matmul_lastdim(mid, rhs.down_wt);
 
     return pool_array(std::move(out));
