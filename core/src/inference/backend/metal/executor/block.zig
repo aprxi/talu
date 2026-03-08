@@ -641,14 +641,29 @@ pub const TransformerBlock = struct {
         norm_insn: *const runtime_contract.Instruction,
         swiglu_insn: *const runtime_contract.Instruction,
     ) bool {
-        if (state.runtime_meta.ffn_storage_kind != .dense) return false;
         if (norm_insn.opcode != opcode_map.Opcode.rmsnorm) return false;
         if (swiglu_insn.opcode != opcode_map.Opcode.swiglu) return false;
         if (norm_insn.inputs.len != 1 or norm_insn.outputs.len != 1) return false;
         if (swiglu_insn.inputs.len != 1 or swiglu_insn.outputs.len != 1) return false;
         if (norm_insn.weights.len != 1) return false;
         if (swiglu_insn.weights.len != runtime_contract.expectedWeightRefCount(swiglu_insn.opcode)) return false;
-        return norm_insn.outputs[0] == swiglu_insn.inputs[0];
+        if (norm_insn.outputs[0] != swiglu_insn.inputs[0]) return false;
+        return state.runtime_meta.ffn_storage_kind == .dense;
+    }
+
+    fn canFuseQuantizedRmsNormSwiGlu(
+        state: *const LayerProgramExecutionContext,
+        norm_insn: *const runtime_contract.Instruction,
+        swiglu_insn: *const runtime_contract.Instruction,
+    ) bool {
+        if (norm_insn.opcode != opcode_map.Opcode.rmsnorm) return false;
+        if (swiglu_insn.opcode != opcode_map.Opcode.swiglu) return false;
+        if (norm_insn.inputs.len != 1 or norm_insn.outputs.len != 1) return false;
+        if (swiglu_insn.inputs.len != 1 or swiglu_insn.outputs.len != 1) return false;
+        if (norm_insn.weights.len != 1) return false;
+        if (swiglu_insn.weights.len != runtime_contract.expectedWeightRefCount(swiglu_insn.opcode)) return false;
+        if (norm_insn.outputs[0] != swiglu_insn.inputs[0]) return false;
+        return state.runtime_meta.ffn_storage_kind == .quantized;
     }
 
     fn runDenseRmsNormSwiGluFusion(
@@ -664,6 +679,8 @@ pub const TransformerBlock = struct {
         );
         const norm_io = try instructionIoSlices(norm_insn, norm_handles.registers);
         const norm_weights = try instructionWeightSlice(norm_insn, norm_handles.registers);
+        const norm_input = arraySlotFromHandle(norm_io.inputs[0]).*;
+        const norm_weight = arrayWeightFromHandle(norm_weights[0]).*;
         const swiglu_handles = try buildLayerProgramInstructionHandles(
             swiglu_insn,
             state,
@@ -674,12 +691,49 @@ pub const TransformerBlock = struct {
         const swiglu_weights = try instructionWeightSlice(swiglu_insn, swiglu_handles.registers);
         var output: mlx_graph.ArrayHandle = undefined;
         ffn_kernel.forwardRmsNormFusedBf16(
-            arraySlotFromHandle(norm_io.inputs[0]).*,
-            arrayWeightFromHandle(norm_weights[0]).*,
+            norm_input,
+            norm_weight,
             state.runtime_meta.model_config.norm_eps,
             arrayWeightFromHandle(swiglu_weights[0]).*,
             arrayWeightFromHandle(swiglu_weights[1]).*,
             arrayWeightFromHandle(swiglu_weights[2]).*,
+            &output,
+        );
+        arraySlotFromHandle(swiglu_io.outputs[0]).* = output;
+    }
+
+    fn runQuantizedRmsNormSwiGluFusion(
+        state: *LayerProgramExecutionContext,
+        norm_insn: *const runtime_contract.Instruction,
+        swiglu_insn: *const runtime_contract.Instruction,
+    ) !void {
+        const norm_handles = try buildLayerProgramInstructionHandles(
+            norm_insn,
+            state,
+            state.instruction_handles,
+            state.instruction_views,
+        );
+        const norm_io = try instructionIoSlices(norm_insn, norm_handles.registers);
+        const norm_weights = try instructionWeightSlice(norm_insn, norm_handles.registers);
+        const norm_input = arraySlotFromHandle(norm_io.inputs[0]).*;
+        const norm_weight = arrayWeightFromHandle(norm_weights[0]).*;
+        const swiglu_handles = try buildLayerProgramInstructionHandles(
+            swiglu_insn,
+            state,
+            state.instruction_handles,
+            state.instruction_views,
+        );
+        const swiglu_io = try instructionIoSlices(swiglu_insn, swiglu_handles.registers);
+        const swiglu_weights = try instructionWeightSlice(swiglu_insn, swiglu_handles.registers);
+        var output: mlx_graph.ArrayHandle = undefined;
+        try ffn_kernel.forwardRmsNormFusedQuantized(
+            norm_input,
+            norm_weight,
+            state.runtime_meta.model_config.norm_eps,
+            state.runtime_meta.use_gelu,
+            quantizedWeightFromHandle(swiglu_weights[0]).*,
+            quantizedWeightFromHandle(swiglu_weights[1]).*,
+            quantizedWeightFromHandle(swiglu_weights[2]).*,
             &output,
         );
         arraySlotFromHandle(swiglu_io.outputs[0]).* = output;
@@ -728,6 +782,7 @@ pub const TransformerBlock = struct {
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
         cache: ?Cache,
+        query_gate: bool,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
         if (comptime std.debug.runtime_safety) {
@@ -774,6 +829,7 @@ pub const TransformerBlock = struct {
                     .norm_eps = state.runtime_meta.model_config.norm_eps,
                     .query_pre_attn_scalar = state.runtime_meta.model_config.query_pre_attn_scalar,
                     .attention_multiplier = state.runtime_meta.attention_multiplier,
+                    .query_gate = query_gate,
                     .q_proj = null,
                     .k_proj = null,
                     .v_proj = null,
@@ -1155,7 +1211,7 @@ pub const TransformerBlock = struct {
         registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        _: []const runtime_contract.ParamBlock,
+        params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
         const cache = try instructionStateValueOrNull(
@@ -1176,11 +1232,20 @@ pub const TransformerBlock = struct {
             3,
             "metal_attention_q",
         );
+        const query_gate = if (insn.opcode == .multihead_attention) blk: {
+            const p = try runtime_contract.paramAs(
+                runtime_contract.AttentionKernelParam,
+                params,
+                .multihead_attention,
+            );
+            break :blk p.query_gate != 0;
+        } else false;
         try layerProgramAttentionAdapter(
             state,
             insn,
             registers,
             cache,
+            query_gate,
         );
         emitLayerProgramTracePoint(
             state,
@@ -1530,6 +1595,15 @@ pub const TransformerBlock = struct {
                     insn_idx += 2;
                     continue;
                 }
+                if (canFuseQuantizedRmsNormSwiGlu(&exec_ctx, insn, next_insn)) {
+                    if (enable_dispatch_observability) {
+                        runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
+                        runtime_contract.recordExecutionDispatch(&rt_ctx, next_insn.opcode);
+                    }
+                    try runQuantizedRmsNormSwiGluFusion(&exec_ctx, insn, next_insn);
+                    insn_idx += 2;
+                    continue;
+                }
             }
             try dispatchLayerProgramInstruction(insn, &exec_ctx, &rt_ctx);
             insn_idx += 1;
@@ -1737,6 +1811,74 @@ test "canFuseDenseRmsNormSwiGlu rejects mismatched registers" {
     };
 
     try std.testing.expect(!TransformerBlock.canFuseDenseRmsNormSwiGlu(&ctx, &norm_insn, &swiglu_insn));
+}
+
+test "canFuseQuantizedRmsNormSwiGlu accepts direct quantized norm to swiglu handoff" {
+    var ctx = std.mem.zeroes(TransformerBlock.LayerProgramExecutionContext);
+    ctx.runtime_meta.ffn_storage_kind = .quantized;
+
+    const norm_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+    const norm_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const norm_weights = [_]runtime_contract.WeightRef{.{ .index = 0 }};
+    const swiglu_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const swiglu_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(2)};
+    const swiglu_weights = [_]runtime_contract.WeightRef{
+        .{ .index = 1 },
+        .{ .index = 2 },
+        .{ .index = 3 },
+    };
+    const norm_insn = runtime_contract.Instruction{
+        .opcode = .rmsnorm,
+        .inputs = &norm_inputs,
+        .outputs = &norm_outputs,
+        .weights = &norm_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const swiglu_insn = runtime_contract.Instruction{
+        .opcode = .swiglu,
+        .inputs = &swiglu_inputs,
+        .outputs = &swiglu_outputs,
+        .weights = &swiglu_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+
+    try std.testing.expect(TransformerBlock.canFuseQuantizedRmsNormSwiGlu(&ctx, &norm_insn, &swiglu_insn));
+}
+
+test "canFuseQuantizedRmsNormSwiGlu rejects dense storage kind" {
+    var ctx = std.mem.zeroes(TransformerBlock.LayerProgramExecutionContext);
+    ctx.runtime_meta.ffn_storage_kind = .dense;
+
+    const norm_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+    const norm_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const norm_weights = [_]runtime_contract.WeightRef{.{ .index = 0 }};
+    const swiglu_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const swiglu_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(2)};
+    const swiglu_weights = [_]runtime_contract.WeightRef{
+        .{ .index = 1 },
+        .{ .index = 2 },
+        .{ .index = 3 },
+    };
+    const norm_insn = runtime_contract.Instruction{
+        .opcode = .rmsnorm,
+        .inputs = &norm_inputs,
+        .outputs = &norm_outputs,
+        .weights = &norm_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const swiglu_insn = runtime_contract.Instruction{
+        .opcode = .swiglu,
+        .inputs = &swiglu_inputs,
+        .outputs = &swiglu_outputs,
+        .weights = &swiglu_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+
+    try std.testing.expect(!TransformerBlock.canFuseQuantizedRmsNormSwiGlu(&ctx, &norm_insn, &swiglu_insn));
 }
 
 test "layer_program_adapter_table covers Metal LayerOp execution subset" {

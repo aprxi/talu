@@ -611,9 +611,9 @@ fn getMetalUnsupportedReason(
 }
 
 fn runtimeHasMetalUnsupportedFeatures(runtime: *const tensor.ModelRuntime) bool {
-    // Metal decode-model path currently does not support recurrent mamba or
-    // gated-delta layer topologies.
-    return runtime.has_mamba or runtime.has_gated_delta;
+    // Metal decode-model path currently does not support recurrent mamba
+    // layer topologies.
+    return runtime.has_mamba;
 }
 
 fn initCpu(
@@ -648,6 +648,10 @@ fn initMetal(
     if (!isMetalSupported(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features)) {
         log.info("inference", "Metal backend rejected model", .{
             .reason = getMetalUnsupportedReason(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features),
+            .has_mamba = @as(u8, @intFromBool(loaded.runtime.has_mamba)),
+            .has_gated_delta = @as(u8, @intFromBool(loaded.runtime.has_gated_delta)),
+            .has_shortconv = @as(u8, @intFromBool(loaded.runtime.has_shortconv)),
+            .has_mla = @as(u8, @intFromBool(loaded.runtime.has_mla)),
         });
         return error.UnsupportedModel;
     }
@@ -737,7 +741,7 @@ test "runtimeHasMetalUnsupportedFeatures flags unsupported metal topology" {
 
     runtime.has_mamba = false;
     runtime.has_gated_delta = true;
-    try std.testing.expect(runtimeHasMetalUnsupportedFeatures(&runtime));
+    try std.testing.expect(!runtimeHasMetalUnsupportedFeatures(&runtime));
 }
 
 test "defaultModelLoadOptions follows platform capability" {

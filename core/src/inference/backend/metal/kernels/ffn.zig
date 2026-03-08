@@ -31,6 +31,37 @@ pub fn forwardRmsNormFusedBf16(
     );
 }
 
+pub fn forwardRmsNormFusedQuantized(
+    input_tensor: ArrayHandle,
+    norm_weight: ArrayHandle,
+    eps: f32,
+    use_gelu: bool,
+    w1: WeightHandles.QuantizedWeight,
+    w3: WeightHandles.QuantizedWeight,
+    w2: WeightHandles.QuantizedWeight,
+    output_tensor: *ArrayHandle,
+) !void {
+    if (w1.group_size != w2.group_size or w1.group_size != w3.group_size) return error.InvalidTensorType;
+    if (w1.bits != w2.bits or w1.bits != w3.bits) return error.InvalidTensorType;
+    output_tensor.* = mlx_fused.mlx_lazy_rms_norm_fused_ffn(
+        input_tensor,
+        norm_weight,
+        w1.weights,
+        w1.scales,
+        w1.biases,
+        w3.weights,
+        w3.scales,
+        w3.biases,
+        w2.weights,
+        w2.scales,
+        w2.biases,
+        w1.group_size,
+        w1.bits,
+        use_gelu,
+        eps,
+    );
+}
+
 pub const SwiGLU = struct {
     /// Canonical kernel-call contract for backend parity checks.
     pub const ForwardParams = struct {

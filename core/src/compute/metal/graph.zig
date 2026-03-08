@@ -206,6 +206,7 @@ pub extern fn mlx_lazy_fused_attention(
     bits: usize,
     query_pre_attn_scalar: f32,
     attention_multiplier: f32,
+    query_gate: bool,
 ) ArrayHandle;
 
 /// Fused BF16/FP16 dense attention block:
@@ -236,6 +237,7 @@ pub extern fn mlx_lazy_fused_attention_bf16(
     rms_eps: f32,
     query_pre_attn_scalar: f32,
     attention_multiplier: f32,
+    query_gate: bool,
 ) ArrayHandle;
 
 /// Dequantize - >>> Lazy: dequantize
