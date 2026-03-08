@@ -597,9 +597,9 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     if (lane >= D_HEAD) {
       return;
     }
-
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
+    threadgroup float3 stats_shared[D_HEAD];
     threadgroup float reduce_shared[D_HEAD];
     threadgroup float scalar_shared[4];
 
@@ -609,51 +609,30 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     float q = query[vec_base + lane];
     float k = key[vec_base + lane];
 
-    reduce_shared[lane] = q * q;
+    stats_shared[lane] = float3(q * q, k * k, q * k);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
       if (lane < offset) {
-        reduce_shared[lane] += reduce_shared[lane + offset];
+        stats_shared[lane] += stats_shared[lane + offset];
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0) {
-      scalar_shared[0] = rsqrt(reduce_shared[0] + eps) * rsqrt((float)D_HEAD);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    reduce_shared[lane] = k * k;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
-      if (lane < offset) {
-        reduce_shared[lane] += reduce_shared[lane + offset];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (lane == 0) {
-      scalar_shared[1] = rsqrt(reduce_shared[0] + eps);
+      const float q_scale = rsqrt(stats_shared[0].x + eps) * rsqrt((float)D_HEAD);
+      const float k_scale = rsqrt(stats_shared[0].y + eps);
+      scalar_shared[0] = stats_shared[0].z * q_scale * k_scale;
+      scalar_shared[1] = k_scale;
       const float a = a_raw[head] + dt_bias[head];
       scalar_shared[2] = 1.0f / (1.0f + exp(-beta_raw[head]));
       scalar_shared[3] = exp((-a_log_exp[head]) * log(1.0f + exp(a)));
+      stats_shared[0].x = q_scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    q *= scalar_shared[0];
+    q *= stats_shared[0].x;
     k *= scalar_shared[1];
     q_shared[lane] = q;
     k_shared[lane] = k;
-    reduce_shared[lane] = q * k;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
-      if (lane < offset) {
-        reduce_shared[lane] += reduce_shared[lane + offset];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (lane == 0) {
-      scalar_shared[0] = reduce_shared[0];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float beta = scalar_shared[2];
     const float decay = scalar_shared[3];
@@ -2000,6 +1979,7 @@ void* mlx_lazy_gated_delta_mixer_bf16(
     }
     return pool_array(out);
 }
+
 
 void* mlx_lazy_gated_delta_mixer_quantized(
     const void* input,

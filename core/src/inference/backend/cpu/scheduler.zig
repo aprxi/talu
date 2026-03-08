@@ -200,7 +200,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         /// Scratch buffers for batched decode
         decode_requests: []DecodeRequest,
         decode_results: []DecodeResult,
-
         /// Logits buffer for prefill
         logits_buffer: []f32,
 
@@ -372,6 +371,40 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             const sampled = try self.sampler.sample(logits, sampling_config);
             return @intCast(sampled);
+        }
+
+        fn sampleTopKCandidateToken(
+            self: *Self,
+            candidate_logits: []const f32,
+            candidate_ids: []const u32,
+            sampling_config: sampling.SamplingConfig,
+        ) !u32 {
+            if (candidate_logits.len == 0 or candidate_logits.len != candidate_ids.len) {
+                return error.InvalidArgument;
+            }
+            if (self.logits_buffer.len < candidate_logits.len) {
+                return error.InvalidArgument;
+            }
+
+            const working_logits = self.logits_buffer[0..candidate_logits.len];
+            @memcpy(working_logits, candidate_logits);
+
+            if (sampling_config.logit_bias) |bias_entries| {
+                for (bias_entries) |entry| {
+                    for (candidate_ids, 0..) |candidate_id, idx| {
+                        if (candidate_id == entry.token_id) {
+                            working_logits[idx] += entry.bias;
+                        }
+                    }
+                }
+            }
+
+            var candidate_sampling = sampling_config;
+            candidate_sampling.top_k = @min(candidate_sampling.top_k, candidate_logits.len);
+            candidate_sampling.logit_bias = null;
+
+            const sampled_idx = try self.sampler.sample(working_logits, candidate_sampling);
+            return candidate_ids[sampled_idx];
         }
 
         fn grammarIsComplete(grammar_sampler: ?*validate.sampler.ConstrainedSampler) bool {
@@ -550,7 +583,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     request_entry.prompt_tokens[request_entry.prompt_tokens.len - 1]
                 else
                     continue;
-
                 self.decode_requests[decode_batch_size] = .{
                     .slot_index = request_entry.slot_index.?,
                     .token = last_token_id,
@@ -741,6 +773,43 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             max_tokens: usize,
             options: ?SubmitOptions,
         ) !GenerateSyncResult {
+            const submit_config = options orelse SubmitOptions{};
+            const effective_sampling = submit_config.sampling orelse self.config.default_sampling;
+            const backend_supports_greedy_streaming = comptime blk: {
+                if (!@hasDecl(BackendType, "decodeStreaming")) break :blk false;
+                if (!@hasDecl(BackendType, "supportsSchedulerBackendDecodeStreamingRoute")) break :blk false;
+                break :blk true;
+            };
+            const backend_supports_top_k_candidates = comptime blk: {
+                if (!@hasDecl(BackendType, "decodeTopKCandidates")) break :blk false;
+                if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKDecodeRoute")) break :blk false;
+                break :blk true;
+            };
+            const can_use_greedy_streaming = prompt_tokens.len > 0 and
+                self.active_requests.items.len == 0 and
+                self.pending_queue.items.len == 0 and
+                submit_config.vision_input == null and
+                submit_config.stop_sequences.len == 0 and
+                submit_config.grammar_sampler == null and
+                !submit_config.return_final_logits and
+                effective_sampling.strategy == .greedy and
+                backend_supports_greedy_streaming and
+                self.backend.supportsSchedulerBackendDecodeStreamingRoute();
+            if (can_use_greedy_streaming) {
+                return self.generateSyncGreedyStreamingRoute(prompt_tokens, max_tokens, &submit_config, &effective_sampling);
+            }
+            const can_use_top_k_candidate_route = prompt_tokens.len > 0 and
+                self.active_requests.items.len == 0 and
+                self.pending_queue.items.len == 0 and
+                submit_config.vision_input == null and
+                submit_config.grammar_sampler == null and
+                !submit_config.return_final_logits and
+                backend_supports_top_k_candidates and
+                self.backend.supportsSchedulerBackendTopKDecodeRoute(&effective_sampling);
+            if (can_use_top_k_candidate_route) {
+                return self.generateSyncTopKCandidateRoute(prompt_tokens, max_tokens, &submit_config, &effective_sampling);
+            }
+
             // Always use the standard queued scheduler path.
             const request_id = try self.submit(prompt_tokens, max_tokens, options);
 
@@ -784,6 +853,331 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .finish_reason = finish_reason,
                 .prefill_ns = prefill_ns,
                 .decode_ns = decode_ns,
+            };
+        }
+
+        fn generateSyncGreedyStreamingRoute(
+            self: *Self,
+            prompt_tokens: []const u32,
+            max_tokens: usize,
+            submit_config: *const SubmitOptions,
+            sampling_config: *const sampling.SamplingConfig,
+        ) !GenerateSyncResult {
+            if (max_tokens == 0) {
+                return .{
+                    .tokens = try self.allocator.dupe(u32, &.{}),
+                    .finish_reason = .length,
+                    .prefill_ns = 0,
+                    .decode_ns = 0,
+                };
+            }
+
+            if (submit_config.stop_flag) |flag| {
+                if (flag.load(.acquire)) {
+                    return .{
+                        .tokens = try self.allocator.dupe(u32, &.{}),
+                        .finish_reason = .cancelled,
+                        .prefill_ns = 0,
+                        .decode_ns = 0,
+                    };
+                }
+            }
+
+            const slot_index = self.backend.allocSlot() orelse return error.NoSlotsAvailable;
+            defer self.backend.freeSlot(slot_index);
+
+            const sp_blocks = if (self.slot_persistent_descs.len > 0)
+                try self.slotStateBlocksForSlot(slot_index)
+            else
+                null;
+            var np_blocks = try self.allocateRequestStateBlocks();
+            defer {
+                self.applyLifecycleActionToRequestStateBlocks(&np_blocks, .evict) catch {};
+                np_blocks.deinit(self.allocator);
+            }
+
+            var merged: [runtime_contract.max_state_descriptors]runtime_contract.StateBlockHandle = undefined;
+            var merge_count: usize = 0;
+            if (sp_blocks) |spb| {
+                for (spb.handles) |h| {
+                    merged[merge_count] = h;
+                    merge_count += 1;
+                }
+            }
+            for (np_blocks.handles) |h| {
+                merged[merge_count] = h;
+                merge_count += 1;
+            }
+            if (merge_count > 0) {
+                try self.backend.bindSlotStateBlocks(slot_index, merged[0..merge_count]);
+            }
+            defer self.backend.unbindSlotStateBlocks(slot_index);
+
+            if (sampling_config.seed != 0) {
+                self.sampler.reseed(sampling_config.seed);
+            }
+
+            var prefill_timer = std.time.Timer.start() catch unreachable;
+            try self.prefillWithOptionalVision(slot_index, prompt_tokens, null);
+            const prefill_ns = prefill_timer.read();
+
+            const eos_token_ids = submit_config.eos_token_ids orelse self.config.default_eos_token_ids;
+            const current_token = self.sampleToken(self.logits_buffer, sampling_config.*, null) catch 0;
+
+            var generated = try std.ArrayList(u32).initCapacity(self.allocator, max_tokens);
+            errdefer generated.deinit(self.allocator);
+            try generated.append(self.allocator, current_token);
+
+            var finished = false;
+            for (eos_token_ids) |eos_id| {
+                if (current_token == eos_id) {
+                    finished = true;
+                    break;
+                }
+            }
+
+            if (submit_config.callback) |cb| {
+                const is_final = finished or max_tokens == 1;
+                cb(0, current_token, is_final, submit_config.callback_data);
+            }
+
+            if (finished) {
+                return .{
+                    .tokens = try generated.toOwnedSlice(self.allocator),
+                    .finish_reason = .eos_token,
+                    .prefill_ns = prefill_ns,
+                    .decode_ns = 0,
+                };
+            }
+            if (max_tokens == 1) {
+                return .{
+                    .tokens = try generated.toOwnedSlice(self.allocator),
+                    .finish_reason = .length,
+                    .prefill_ns = prefill_ns,
+                    .decode_ns = 0,
+                };
+            }
+
+            const remaining_token_budget = max_tokens - generated.items.len;
+            const generated_tail = try self.allocator.alloc(u32, remaining_token_budget);
+            defer self.allocator.free(generated_tail);
+
+            var decode_timer = std.time.Timer.start() catch unreachable;
+            if (submit_config.stop_flag) |flag| {
+                if (flag.load(.acquire)) {
+                    return .{
+                        .tokens = try generated.toOwnedSlice(self.allocator),
+                        .finish_reason = .cancelled,
+                        .prefill_ns = prefill_ns,
+                        .decode_ns = 0,
+                    };
+                }
+            }
+
+            const tail_count = try self.backend.decodeStreaming(
+                current_token,
+                prompt_tokens.len + generated.items.len - 1,
+                remaining_token_budget,
+                eos_token_ids,
+                generated_tail,
+                null,
+                null,
+            );
+            try generated.appendSlice(self.allocator, generated_tail[0..tail_count]);
+
+            if (submit_config.callback) |cb| {
+                for (generated_tail[0..tail_count], 0..) |token_id, idx| {
+                    cb(0, token_id, idx + 1 == tail_count, submit_config.callback_data);
+                }
+            }
+
+            const decode_ns = decode_timer.read();
+            const finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
+            return .{
+                .tokens = try generated.toOwnedSlice(self.allocator),
+                .finish_reason = finish_reason,
+                .prefill_ns = prefill_ns,
+                .decode_ns = decode_ns,
+            };
+        }
+
+        fn generateSyncTopKCandidateRoute(
+            self: *Self,
+            prompt_tokens: []const u32,
+            max_tokens: usize,
+            submit_config: *const SubmitOptions,
+            sampling_config: *const sampling.SamplingConfig,
+        ) !GenerateSyncResult {
+            if (max_tokens == 0) {
+                return .{
+                    .tokens = try self.allocator.dupe(u32, &.{}),
+                    .finish_reason = .length,
+                    .prefill_ns = 0,
+                    .decode_ns = 0,
+                };
+            }
+
+            if (submit_config.stop_flag) |flag| {
+                if (flag.load(.acquire)) {
+                    return .{
+                        .tokens = try self.allocator.dupe(u32, &.{}),
+                        .finish_reason = .cancelled,
+                        .prefill_ns = 0,
+                        .decode_ns = 0,
+                    };
+                }
+            }
+
+            const slot_index = self.backend.allocSlot() orelse return error.NoSlotsAvailable;
+            defer self.backend.freeSlot(slot_index);
+
+            const sp_blocks = if (self.slot_persistent_descs.len > 0)
+                try self.slotStateBlocksForSlot(slot_index)
+            else
+                null;
+            var np_blocks = try self.allocateRequestStateBlocks();
+            defer {
+                self.applyLifecycleActionToRequestStateBlocks(&np_blocks, .evict) catch {};
+                np_blocks.deinit(self.allocator);
+            }
+
+            var merged: [runtime_contract.max_state_descriptors]runtime_contract.StateBlockHandle = undefined;
+            var merge_count: usize = 0;
+            if (sp_blocks) |spb| {
+                for (spb.handles) |h| {
+                    merged[merge_count] = h;
+                    merge_count += 1;
+                }
+            }
+            for (np_blocks.handles) |h| {
+                merged[merge_count] = h;
+                merge_count += 1;
+            }
+            if (merge_count > 0) {
+                try self.backend.bindSlotStateBlocks(slot_index, merged[0..merge_count]);
+            }
+            defer self.backend.unbindSlotStateBlocks(slot_index);
+
+            if (sampling_config.seed != 0) {
+                self.sampler.reseed(sampling_config.seed);
+            }
+
+            var prefill_timer = std.time.Timer.start() catch unreachable;
+            try self.prefillWithOptionalVision(slot_index, prompt_tokens, null);
+            const prefill_ns = prefill_timer.read();
+
+            const eos_token_ids = submit_config.eos_token_ids orelse self.config.default_eos_token_ids;
+            var current_token = self.sampleToken(self.logits_buffer, sampling_config.*, null) catch 0;
+
+            var generated = try std.ArrayList(u32).initCapacity(self.allocator, max_tokens);
+            errdefer generated.deinit(self.allocator);
+            try generated.append(self.allocator, current_token);
+
+            var finish_reason: FinishReason = .in_progress;
+            for (eos_token_ids) |eos_id| {
+                if (current_token == eos_id) {
+                    finish_reason = .eos_token;
+                    break;
+                }
+            }
+            if (finish_reason == .in_progress and submit_config.stop_sequences.len > 0) {
+                const stop_len = checkStopSequence(generated.items, submit_config.stop_sequences);
+                if (stop_len > 0) {
+                    finish_reason = .stop_sequence;
+                    generated.shrinkRetainingCapacity(generated.items.len - stop_len);
+                }
+            }
+
+            if (submit_config.callback) |cb| {
+                const is_final = finish_reason != .in_progress or max_tokens == 1;
+                if (finish_reason != .stop_sequence) {
+                    cb(0, current_token, is_final, submit_config.callback_data);
+                }
+            }
+
+            if (finish_reason != .in_progress) {
+                return .{
+                    .tokens = try generated.toOwnedSlice(self.allocator),
+                    .finish_reason = finish_reason,
+                    .prefill_ns = prefill_ns,
+                    .decode_ns = 0,
+                };
+            }
+            if (max_tokens == 1) {
+                return .{
+                    .tokens = try generated.toOwnedSlice(self.allocator),
+                    .finish_reason = .length,
+                    .prefill_ns = prefill_ns,
+                    .decode_ns = 0,
+                };
+            }
+
+            const max_candidate_count = @min(sampling_config.top_k, self.backend.vocabSize());
+            var candidate_logits = try self.allocator.alloc(f32, max_candidate_count);
+            defer self.allocator.free(candidate_logits);
+            var candidate_ids = try self.allocator.alloc(u32, max_candidate_count);
+            defer self.allocator.free(candidate_ids);
+
+            var decode_timer = std.time.Timer.start() catch unreachable;
+            while (generated.items.len < max_tokens) {
+                if (submit_config.stop_flag) |flag| {
+                    if (flag.load(.acquire)) {
+                        return .{
+                            .tokens = try generated.toOwnedSlice(self.allocator),
+                            .finish_reason = .cancelled,
+                            .prefill_ns = prefill_ns,
+                            .decode_ns = decode_timer.read(),
+                        };
+                    }
+                }
+
+                const candidate_count = try self.backend.decodeTopKCandidates(
+                    slot_index,
+                    current_token,
+                    max_candidate_count,
+                    candidate_logits,
+                    candidate_ids,
+                );
+                if (candidate_count == 0) return error.InvalidArgument;
+
+                current_token = try self.sampleTopKCandidateToken(
+                    candidate_logits[0..candidate_count],
+                    candidate_ids[0..candidate_count],
+                    sampling_config.*,
+                );
+                try generated.append(self.allocator, current_token);
+
+                finish_reason = .in_progress;
+                for (eos_token_ids) |eos_id| {
+                    if (current_token == eos_id) {
+                        finish_reason = .eos_token;
+                        break;
+                    }
+                }
+                if (finish_reason == .in_progress and submit_config.stop_sequences.len > 0) {
+                    const stop_len = checkStopSequence(generated.items, submit_config.stop_sequences);
+                    if (stop_len > 0) {
+                        finish_reason = .stop_sequence;
+                        generated.shrinkRetainingCapacity(generated.items.len - stop_len);
+                    }
+                }
+                if (finish_reason == .in_progress and generated.items.len >= max_tokens) {
+                    finish_reason = .length;
+                }
+
+                if (submit_config.callback) |cb| {
+                    if (finish_reason != .stop_sequence) {
+                        cb(0, current_token, finish_reason != .in_progress, submit_config.callback_data);
+                    }
+                }
+                if (finish_reason != .in_progress) break;
+            }
+
+            return .{
+                .tokens = try generated.toOwnedSlice(self.allocator),
+                .finish_reason = finish_reason,
+                .prefill_ns = prefill_ns,
+                .decode_ns = decode_timer.read(),
             };
         }
 
@@ -2155,6 +2549,7 @@ const MockStreamingBackend = struct {
     slot_in_use: bool = false,
     decode_batch_calls: usize = 0,
     decode_streaming_calls: usize = 0,
+    decode_top_k_calls: usize = 0,
     prefill_with_vision_calls: usize = 0,
     allocated_logits: std.ArrayList([]f32),
     greedy_token: usize = 42,
@@ -2186,6 +2581,17 @@ const MockStreamingBackend = struct {
     fn supportsSchedulerBackendDecodeStreamingRoute(self: *const MockStreamingBackend) bool {
         _ = self;
         return true;
+    }
+
+    fn supportsSchedulerBackendTopKDecodeRoute(
+        self: *const MockStreamingBackend,
+        sampling_config: *const sampling.SamplingConfig,
+    ) bool {
+        _ = self;
+        return sampling_config.strategy == .top_k and
+            sampling_config.top_k > 0 and
+            sampling_config.temperature > 0.0 and
+            sampling_config.min_p == 0.0;
     }
 
     fn allocSlot(self: *MockStreamingBackend) ?usize {
@@ -2275,6 +2681,29 @@ const MockStreamingBackend = struct {
         }
         return max_tokens;
     }
+
+    fn decodeTopKCandidates(
+        self: *MockStreamingBackend,
+        slot_index: usize,
+        token: u32,
+        top_k: usize,
+        candidate_logits_out: []f32,
+        candidate_ids_out: []u32,
+    ) !usize {
+        _ = slot_index;
+        _ = token;
+        self.decode_top_k_calls += 1;
+        const count = @min(top_k, candidate_logits_out.len);
+        if (count == 0 or candidate_ids_out.len < count) return error.InvalidArgument;
+        for (candidate_logits_out[0..count], 0..) |*logit, idx| {
+            logit.* = if (idx == 0) 10.0 else -10.0 - @as(f32, @floatFromInt(idx));
+        }
+        candidate_ids_out[0] = @intCast(self.greedy_token);
+        for (candidate_ids_out[1..count], 1..) |*token_id, idx| {
+            token_id.* = @intCast(self.greedy_token + idx);
+        }
+        return count;
+    }
 };
 
 const MockStreamingScheduler = GenericScheduler(MockStreamingBackend);
@@ -2283,7 +2712,7 @@ const MockStreamingScheduler = GenericScheduler(MockStreamingBackend);
 // Scheduler Integration Tests - init/deinit
 // =============================================================================
 
-test "generateSync uses queued decodeBatch route for greedy sampling" {
+test "generateSync uses backend decode-streaming route for greedy sampling" {
     const alloc = std.testing.allocator;
     var backend = MockStreamingBackend.init(alloc, 256);
     defer backend.deinit();
@@ -2303,10 +2732,10 @@ test "generateSync uses queued decodeBatch route for greedy sampling" {
     });
     defer result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
-    try std.testing.expect(backend.decode_batch_calls > 0);
+    try std.testing.expectEqual(@as(usize, 1), backend.decode_streaming_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
     try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
-    try std.testing.expectEqualSlices(u32, &.{ 42, 42, 42, 42 }, result.tokens);
+    try std.testing.expectEqualSlices(u32, &.{ 42, 44, 45, 46 }, result.tokens);
 }
 
 test "generateSync uses decodeBatch route with vision input" {
@@ -2366,7 +2795,7 @@ test "generateSync uses decodeBatch when stop sequences are configured" {
     try std.testing.expectEqual(@as(usize, 3), result.tokens.len);
 }
 
-test "generateSync uses decodeBatch route when sampling strategy is top_k" {
+test "generateSync uses backend top-k candidate route for top_k sampling" {
     const alloc = std.testing.allocator;
     var backend = MockStreamingBackend.init(alloc, 256);
     defer backend.deinit();
@@ -2374,7 +2803,7 @@ test "generateSync uses decodeBatch route when sampling strategy is top_k" {
     var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
         .default_sampling = .{
             .strategy = .top_k,
-            .top_k = 20,
+            .top_k = 4,
             .temperature = 0.7,
             .seed = 7,
         },
@@ -2384,7 +2813,7 @@ test "generateSync uses decodeBatch route when sampling strategy is top_k" {
     var result = try scheduler.generateSync(&[_]u32{ 7, 8, 9 }, 4, .{
         .sampling = .{
             .strategy = .top_k,
-            .top_k = 20,
+            .top_k = 4,
             .temperature = 0.7,
             .seed = 7,
         },
@@ -2393,8 +2822,10 @@ test "generateSync uses decodeBatch route when sampling strategy is top_k" {
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
-    try std.testing.expect(backend.decode_batch_calls > 0);
+    try std.testing.expectEqual(@as(usize, 3), backend.decode_top_k_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
     try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
+    try std.testing.expectEqualSlices(u32, &.{ 42, 42, 42, 42 }, result.tokens);
 }
 
 test "Scheduler.init - creates with default config" {

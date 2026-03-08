@@ -332,6 +332,15 @@ pub extern fn mlx_lazy_fused_ffn_bf16(
     down_w: ArrayHandle,
 ) ArrayHandle;
 
+pub extern fn mlx_lazy_rms_norm_fused_ffn_bf16(
+    input: ArrayHandle,
+    norm_w: ArrayHandle,
+    gate_w: ArrayHandle,
+    up_w: ArrayHandle,
+    down_w: ArrayHandle,
+    eps: f32,
+) ArrayHandle;
+
 pub extern fn mlx_lazy_fused_expert_mix_ffn_mxfp4(
     input: ArrayHandle,
     router_w: ArrayHandle,

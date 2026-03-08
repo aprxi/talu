@@ -1742,12 +1742,13 @@ pub fn runGatedDeltaBlockF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scen
                 dims.d_head,
             );
             const hidden_1 = graph.mlx_lazy_add(residual, mixed);
-            const norm2 = graph.mlx_lazy_rms_norm(hidden_1, ln2_w.handle, 1.0e-5);
-            const ffn = graph.mlx_lazy_fused_ffn_bf16(
-                norm2,
+            const ffn = graph.mlx_lazy_rms_norm_fused_ffn_bf16(
+                hidden_1,
+                ln2_w.handle,
                 w1.handle,
                 w3.handle,
                 w2.handle,
+                1.0e-5,
             );
             out = graph.mlx_lazy_add(hidden_1, ffn);
         }

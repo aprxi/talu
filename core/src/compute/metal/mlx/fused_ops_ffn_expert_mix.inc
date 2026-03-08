@@ -287,6 +287,44 @@ void* mlx_lazy_fused_ffn_bf16(
     return pool_array(std::move(out));
 }
 
+void* mlx_lazy_rms_norm_fused_ffn_bf16(
+    const void* input,
+    const void* norm_w,
+    const void* gate_w,
+    const void* up_w,
+    const void* down_w,
+    float eps
+) {
+    const auto& x = *static_cast<const array*>(input);
+    const auto& norm_weight = *static_cast<const array*>(norm_w);
+    const int in_features = x.shape(2);
+
+    const auto& gate_weight = *static_cast<const array*>(gate_w);
+    const auto& up_weight = *static_cast<const array*>(up_w);
+    const auto& down_weight = *static_cast<const array*>(down_w);
+    const auto& rhs = ffn_fused_dense_rhs_cached(
+        gate_w,
+        up_w,
+        down_w,
+        gate_weight,
+        up_weight,
+        down_weight,
+        in_features
+    );
+
+    auto normed = fast::rms_norm(x, norm_weight, eps);
+    auto gate_up = matmul_lastdim(normed, rhs.gate_up_wt);
+    const int batch_size = x.shape(0);
+    const int seq_len = x.shape(1);
+    auto gate = slice(gate_up, {0, 0, 0}, {batch_size, seq_len, rhs.d_ff});
+    auto up = slice(gate_up, {0, 0, rhs.d_ff}, {batch_size, seq_len, 2 * rhs.d_ff});
+    auto mid = (gate * sigmoid(gate)) * up;
+    auto out = matmul_lastdim(mid, rhs.down_wt);
+
+    return pool_array(std::move(out));
+}
+
+
 // ============================================================================
 // Fused ExpertMix FFN Block (MXFP4 quantized experts)
 // ============================================================================

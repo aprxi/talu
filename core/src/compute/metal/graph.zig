@@ -274,6 +274,15 @@ pub extern fn mlx_lazy_fused_ffn_bf16(
     down_w: ArrayHandle,
 ) ArrayHandle;
 
+pub extern fn mlx_lazy_rms_norm_fused_ffn_bf16(
+    input: ArrayHandle,
+    norm_w: ArrayHandle,
+    gate_w: ArrayHandle,
+    up_w: ArrayHandle,
+    down_w: ArrayHandle,
+    eps: f32,
+) ArrayHandle;
+
 /// Element-wise add - >>> Lazy
 pub extern fn mlx_lazy_add(a: ArrayHandle, b: ArrayHandle) ArrayHandle;
 
@@ -1189,6 +1198,70 @@ test "mlx_lazy_gated_delta_mixer_bf16 prefill matches token-by-token path" {
 
     for (prefill_host, step_host) |prefill_value, step_value| {
         try std.testing.expectApproxEqAbs(prefill_value, step_value, 1.0e-3);
+    }
+}
+
+test "mlx_lazy_rms_norm_fused_ffn_bf16 matches rms_norm plus fused_ffn_bf16" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const input_data = [_]f32{
+        0.2, -0.1,
+        0.3, 0.4,
+    };
+    const norm_weight_data = [_]f32{ 1.1, 0.9 };
+    const gate_weight_data = [_]f32{
+        0.5,  -0.2,
+        -0.1, 0.4,
+    };
+    const up_weight_data = [_]f32{
+        0.3, 0.1,
+        0.2, -0.3,
+    };
+    const down_weight_data = [_]f32{
+        0.6, -0.4,
+        0.2, 0.7,
+    };
+
+    const input_shape = [_]i64{ 1, 2, 2 };
+    const norm_shape = [_]i64{2};
+    const proj_shape = [_]i64{ 2, 2 };
+
+    const input = createArrayF32(&input_data, &input_shape);
+    defer freeArray(input);
+    const norm_weight = createArrayF32(&norm_weight_data, &norm_shape);
+    defer freeArray(norm_weight);
+    const gate_weight = createArrayF32(&gate_weight_data, &proj_shape);
+    defer freeArray(gate_weight);
+    const up_weight = createArrayF32(&up_weight_data, &proj_shape);
+    defer freeArray(up_weight);
+    const down_weight = createArrayF32(&down_weight_data, &proj_shape);
+    defer freeArray(down_weight);
+
+    const ref_norm = mlx_lazy_rms_norm(input, norm_weight, 1.0e-5);
+    defer freeArray(ref_norm);
+    const ref_out = mlx_lazy_fused_ffn_bf16(ref_norm, gate_weight, up_weight, down_weight);
+    defer freeArray(ref_out);
+    const fused_out = mlx_lazy_rms_norm_fused_ffn_bf16(
+        input,
+        norm_weight,
+        gate_weight,
+        up_weight,
+        down_weight,
+        1.0e-5,
+    );
+    defer freeArray(fused_out);
+
+    var eval_handles = [_]ArrayHandle{ ref_out, fused_out };
+    eval(&eval_handles);
+
+    var ref_host: [4]f32 = undefined;
+    var fused_host: [4]f32 = undefined;
+    copyToHost(ref_out, &ref_host);
+    copyToHost(fused_out, &fused_host);
+
+    for (ref_host, fused_host) |ref_value, fused_value| {
+        try std.testing.expectApproxEqAbs(ref_value, fused_value, 1.0e-4);
     }
 }
 

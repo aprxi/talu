@@ -12,6 +12,25 @@ pub const WeightHandles = weights.WeightHandles;
 pub const FfnScratch = struct {};
 pub const MatmulScratch = struct {};
 
+pub fn forwardRmsNormFusedBf16(
+    input_tensor: ArrayHandle,
+    norm_weight: ArrayHandle,
+    eps: f32,
+    gate_weight: ArrayHandle,
+    up_weight: ArrayHandle,
+    down_weight: ArrayHandle,
+    output_tensor: *ArrayHandle,
+) void {
+    output_tensor.* = mlx_fused.mlx_lazy_rms_norm_fused_ffn_bf16(
+        input_tensor,
+        norm_weight,
+        gate_weight,
+        up_weight,
+        down_weight,
+        eps,
+    );
+}
+
 pub const SwiGLU = struct {
     /// Canonical kernel-call contract for backend parity checks.
     pub const ForwardParams = struct {
