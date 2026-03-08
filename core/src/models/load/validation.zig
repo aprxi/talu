@@ -241,8 +241,15 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
                 }
 
                 const d_inner: usize = @intCast(block.config.n_heads * block.config.d_head);
-                const proj_out = (4 * d_inner) + (2 * @as(usize, @intCast(block.config.n_heads)));
-                const qkv_out = 3 * d_inner;
+                const d_conv: usize = @intCast(block.config.d_conv);
+                if (d_conv == 0) return reporter.reportError("layer {} gated_delta d_conv invalid (0)", .{layer_idx});
+                const conv_numel = tensorNumel(block.weights.conv1d_weight);
+                if ((conv_numel % d_conv) != 0)
+                    return reporter.reportError("layer {} gated_delta conv1d_weight numel {} not divisible by d_conv {}", .{
+                        layer_idx, conv_numel, d_conv,
+                    });
+                const qkv_out = conv_numel / d_conv;
+                const proj_out = qkv_out + d_inner + (2 * @as(usize, @intCast(block.config.n_heads)));
                 if (!isProjected2DShapeMatch(block.weights.in_proj, d_model, proj_out))
                     return reporter.reportError("layer {} gated_delta in_proj shape mismatch (shape=[{},{}], expected d_model={} proj_out={})", .{
                         layer_idx, block.weights.in_proj.shape[0], block.weights.in_proj.shape[1], d_model, proj_out,
@@ -251,7 +258,7 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
                     return reporter.reportError("layer {} gated_delta out_proj shape mismatch (shape=[{},{}], expected=[{},{}])", .{
                         layer_idx, block.weights.out_proj.shape[0], block.weights.out_proj.shape[1], d_inner, d_model,
                     });
-                if (!isConvWeightShapeMatch(block.weights.conv1d_weight, qkv_out, @intCast(block.config.d_conv)))
+                if (!isConvWeightShapeMatch(block.weights.conv1d_weight, qkv_out, d_conv))
                     return reporter.reportError("layer {} gated_delta conv1d_weight shape mismatch", .{layer_idx});
                 if (block.weights.conv1d_bias) |bias| {
                     if (!isVectorShape(bias, qkv_out))

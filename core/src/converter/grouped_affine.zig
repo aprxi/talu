@@ -11,6 +11,7 @@ const safetensors = @import("../io/safetensors/root.zig");
 const repository = @import("../io/repository/root.zig");
 const gaf_paths = @import("gaf_paths.zig");
 const config_loader = @import("../models/config/root.zig");
+const op_types = @import("../models/op_types.zig");
 const parallel = @import("../system/parallel.zig");
 const convert = @import("root.zig");
 const models_registry = @import("../models/registry.zig");
@@ -188,19 +189,29 @@ pub fn convertToGroupedAffine(
     var fusion_map: ?convert.ConversionFusionMap = null;
     defer if (fusion_map) |*fm| fm.deinit();
 
+    var runtime_arch: ?*const op_types.Architecture = null;
     if (model_type) |mt| {
-        if (models_registry.detectByModelType(mt)) |entry| {
-            if (models_registry.runtimeArchitectureById(entry.id)) |arch| {
-                layout_map = convert.buildWeightLayoutMap(allocator, arch, @intCast(model_config.n_layers)) catch |err| blk: {
-                    log.warn("converter", "Failed to build layout map", .{ .err = @errorName(err) });
-                    break :blk null;
-                };
-                fusion_map = convert.buildConversionFusionMap(allocator, arch, @intCast(model_config.n_layers)) catch |err| blk: {
-                    log.warn("converter", "Failed to build fusion map", .{ .err = @errorName(err) });
-                    break :blk null;
-                };
+        // Primary path: resolve static runtime architecture directly by model_type.
+        runtime_arch = models_registry.runtimeArchitectureByModelType(mt);
+        // Fallback path: route via registry entry id for compatibility.
+        if (runtime_arch == null) {
+            if (models_registry.detectByModelType(mt)) |entry| {
+                runtime_arch = models_registry.runtimeArchitectureById(entry.id);
             }
         }
+    }
+
+    if (runtime_arch) |arch| {
+        layout_map = convert.buildWeightLayoutMap(allocator, arch, @intCast(model_config.n_layers)) catch |err| blk: {
+            log.warn("converter", "Failed to build layout map", .{ .err = @errorName(err), .arch = arch.name });
+            break :blk null;
+        };
+        fusion_map = convert.buildConversionFusionMap(allocator, arch, @intCast(model_config.n_layers)) catch |err| blk: {
+            log.warn("converter", "Failed to build fusion map", .{ .err = @errorName(err), .arch = arch.name });
+            break :blk null;
+        };
+    } else if (model_type) |mt| {
+        log.warn("converter", "No runtime architecture metadata for model_type", .{ .model_type = mt });
     }
 
     // Quantized conversion requires architecture-driven layout metadata.

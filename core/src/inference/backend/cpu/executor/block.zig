@@ -184,6 +184,7 @@ const MambaRuntimeMetadata = struct {
 };
 
 const GatedDeltaRuntimeMetadata = struct {
+    config: @TypeOf(@as(gated_delta_kernel.GatedDeltaKernel, undefined).config),
     matmul_in_proj: @TypeOf(@as(gated_delta_kernel.GatedDeltaKernel, undefined).matmul_in_proj),
     matmul_out_proj: @TypeOf(@as(gated_delta_kernel.GatedDeltaKernel, undefined).matmul_out_proj),
     // Flattened runtime handle for pre-transposed conv weights (time-major).
@@ -742,20 +743,19 @@ pub const Block = struct {
             if (typed_kernel_refs.gated_delta[idx]) |binding| {
                 if (plan.instructions[idx].opcode != .gated_delta_net) return error.InvalidInstructionBinding;
                 gated_delta[idx] = .{
+                    .config = binding.config,
                     .matmul_in_proj = binding.matmul_in_proj,
                     .matmul_out_proj = binding.matmul_out_proj,
-                    .conv_weight_time_major = if (binding.conv_weight_transposed) |weight_t|
-                        Tensor.view(
+                    .conv_weight_time_major = if (binding.conv_weight_transposed) |weight_t| blk: {
+                        const d_conv: usize = @intCast(binding.config.d_conv);
+                        if (d_conv == 0 or (weight_t.len % d_conv) != 0) break :blk null;
+                        break :blk Tensor.view(
                             @ptrCast(std.mem.sliceAsBytes(weight_t).ptr),
-                            &.{
-                                @as(usize, @intCast(binding.config.d_conv)),
-                                @as(usize, @intCast(binding.config.n_heads)) * @as(usize, @intCast(binding.config.d_head)) * 3,
-                            },
+                            &.{ d_conv, weight_t.len / d_conv },
                             .f32,
                             null,
-                        )
-                    else
-                        null,
+                        );
+                    } else null,
                     .layer_idx = binding.layer_idx,
                 };
             }
@@ -2292,24 +2292,13 @@ pub const Block = struct {
             if (weight_handles.len != 7) return error.InvalidWeightRefCount;
             if (state.op_index >= state.block.instruction_gated_delta_runtime_metadata.len) return error.InvalidInstructionIndex;
             const meta = state.block.instruction_gated_delta_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
-            const gated_delta_param = try runtime_contract.paramAs(
-                runtime_contract.GatedDeltaKernelParam,
-                params,
-                .gated_delta_net,
-            );
-            const d_inner = std.math.mul(
-                u32,
-                gated_delta_param.n_heads,
-                gated_delta_param.d_head,
-            ) catch return error.InvalidParamBlockABI;
-            if (gated_delta_param.d_inner != d_inner) return error.InvalidParamBlockABI;
             const d_model = try hiddenWidthFromTensor(input);
             var gated_delta_local = gated_delta_kernel.GatedDeltaKernel{
                 .config = .{
                     .d_model = d_model,
-                    .d_conv = gated_delta_param.d_conv,
-                    .n_heads = gated_delta_param.n_heads,
-                    .d_head = gated_delta_param.d_head,
+                    .d_conv = meta.config.d_conv,
+                    .n_heads = meta.config.n_heads,
+                    .d_head = meta.config.d_head,
                 },
                 .weights = .{
                     .in_proj = tensorFromWeightHandle(weight_handles[0]),

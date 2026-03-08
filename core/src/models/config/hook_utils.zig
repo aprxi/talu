@@ -83,6 +83,13 @@ pub fn applyShortConvConfig(config_obj: std.json.ObjectMap, root_obj: std.json.O
     if (getBoolFromConfigOrRoot(config_obj, root_obj, "conv_bias")) |v| config.shortconv_has_bias = v;
 }
 
+pub fn applyLinearAttentionConfig(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *tensor.ModelConfig) void {
+    if (getIntFromConfigOrRoot(config_obj, root_obj, "linear_num_key_heads")) |v| config.linear_num_key_heads = v;
+    if (getIntFromConfigOrRoot(config_obj, root_obj, "linear_num_value_heads")) |v| config.linear_num_value_heads = v;
+    if (getIntFromConfigOrRoot(config_obj, root_obj, "linear_key_head_dim")) |v| config.linear_key_head_dim = v;
+    if (getIntFromConfigOrRoot(config_obj, root_obj, "linear_value_head_dim")) |v| config.linear_value_head_dim = v;
+}
+
 pub fn applyPhiPartialRotary(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *tensor.ModelConfig) void {
     if (getFloatFromConfigOrRoot(config_obj, root_obj, "partial_rotary_factor")) |partial_rotary_factor| {
         config.rope_dim = @intFromFloat(@as(f32, @floatFromInt(config.head_dim)) * partial_rotary_factor);

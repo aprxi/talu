@@ -308,6 +308,10 @@ pub const FusedCpuBackend = struct {
         max_batch_size: usize,
         progress: progress_mod.Context,
     ) !FusedCpuBackend {
+        if (!loaded.config.tie_word_embeddings and loaded.lm_head == null) {
+            return error.MissingLmHead;
+        }
+
         const model_width: usize = @intCast(loaded.config.d_model);
         const vocab_size: usize = @intCast(loaded.config.vocab_size);
         const layer_total: usize = @intCast(loaded.config.n_layers);

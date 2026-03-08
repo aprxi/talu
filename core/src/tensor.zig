@@ -653,6 +653,11 @@ pub const ModelConfig = struct {
     shortconv_conv_dim: i32 = 0, // Intermediate dimension
     shortconv_conv_dim_out: i32 = 0, // Output dimension (usually = d_model)
     shortconv_has_bias: bool = false, // Whether conv has bias
+    // Linear-attention / gated-delta config (for heterogeneous models like Qwen3.5)
+    linear_num_key_heads: i32 = 0,
+    linear_num_value_heads: i32 = 0,
+    linear_key_head_dim: i32 = 0,
+    linear_value_head_dim: i32 = 0,
     // Vision encoder config (for multimodal models)
     vision_hidden_size: i32 = 0,
     vision_depth: i32 = 0,

@@ -48,6 +48,9 @@ pub const GatedDeltaState = struct {
         config: GatedDeltaConfig,
     ) !GatedDeltaState {
         const d_inner = @as(usize, config.n_heads) * @as(usize, config.d_head);
+        // Allocate for the maximal historical qkv packing (3*d_inner). Some
+        // architectures (e.g. Qwen3.5 4B/9B) use asymmetric q/k vs v widths
+        // and consume a smaller runtime qkv_len.
         const qkv_len = d_inner * 3;
         // Time-major state layout: [batch, d_conv, qkv_len].
         // This matches the SIMD-friendly conv1d_depthwise.runTimeMajor path.
@@ -163,9 +166,8 @@ pub const GatedDeltaKernel = struct {
     pub fn initTransposedWeights(self: *GatedDeltaKernel, allocator: std.mem.Allocator) !void {
         if (self.conv_weight_transposed != null) return;
 
-        const d_inner: usize = @as(usize, self.config.n_heads) * @as(usize, self.config.d_head);
-        const conv_dim = d_inner * 3;
         const d_conv: usize = self.config.d_conv;
+        const conv_dim = try convChannelDim(self.weights.conv1d_weight, d_conv);
         const src = self.weights.conv1d_weight.asSlice(f32);
 
         const transposed = try allocator.alloc(f32, conv_dim * d_conv);
@@ -195,6 +197,13 @@ pub const GatedDeltaKernel = struct {
         return dim0;
     }
 
+    fn convChannelDim(weight: *const Tensor, d_conv: usize) !usize {
+        if (d_conv == 0) return error.InvalidShape;
+        const values = weight.asSlice(f32);
+        if (values.len == 0 or (values.len % d_conv) != 0) return error.InvalidShape;
+        return values.len / d_conv;
+    }
+
     pub fn forward(
         self: *const GatedDeltaKernel,
         input: *const Tensor,
@@ -209,7 +218,7 @@ pub const GatedDeltaKernel = struct {
         const d_model: usize = cfg.d_model;
         const d_inner: usize = @as(usize, cfg.n_heads) * @as(usize, cfg.d_head);
         const d_conv: usize = cfg.d_conv;
-        const n_heads: usize = cfg.n_heads;
+        const n_v_heads: usize = cfg.n_heads;
         const d_head: usize = cfg.d_head;
 
         const batch_size: usize = if (input.n_dims == 3) @intCast(input.shape[0]) else 1;
@@ -221,11 +230,12 @@ pub const GatedDeltaKernel = struct {
         else
             1;
 
-        const qkv_len = d_inner * 3;
-        const proj_len = qkv_len + d_inner + 2 * n_heads;
         const weight_proj_len = try projectionOutputDim(w.in_proj, d_model);
-        if (weight_proj_len < proj_len) return error.InvalidShape;
-
+        const qkv_len = try convChannelDim(w.conv1d_weight, d_conv);
+        const minimum_proj = d_inner + (2 * n_v_heads);
+        if (weight_proj_len <= minimum_proj) return error.InvalidShape;
+        if (state.conv_state.len < qkv_len * d_conv) return error.InvalidShape;
+        const proj_len = weight_proj_len;
         const proj_out = scratch.getProjection(proj_len);
         const temp = scratch.getConvOutput(d_inner);
         const ssm_out = scratch.getSsmOutput(d_inner);
@@ -238,7 +248,7 @@ pub const GatedDeltaKernel = struct {
                 .layer_idx = self.layer_idx,
                 .d_model = d_model,
                 .d_conv = d_conv,
-                .n_heads = n_heads,
+                .n_heads = n_v_heads,
                 .d_head = d_head,
                 .conv_dtype = @tagName(w.conv1d_weight.dtype),
                 .conv_dims = w.conv1d_weight.n_dims,
@@ -265,16 +275,24 @@ pub const GatedDeltaKernel = struct {
 
             const qkv = proj_out[0..qkv_len];
             const z = proj_out[qkv_len .. qkv_len + d_inner];
-            const beta_raw = proj_out[qkv_len + d_inner .. qkv_len + d_inner + n_heads];
-            const a_raw = proj_out[qkv_len + d_inner + n_heads .. qkv_len + d_inner + 2 * n_heads];
+            const beta_raw = proj_out[qkv_len + d_inner .. qkv_len + d_inner + n_v_heads];
+            const a_raw = proj_out[qkv_len + d_inner + n_v_heads .. qkv_len + d_inner + 2 * n_v_heads];
+
+            if (qkv_len <= d_inner) return error.InvalidShape;
+            const qk_total = qkv_len - d_inner;
+            if ((qk_total % 2) != 0) return error.InvalidShape;
+            const qk_inner = qk_total / 2;
+            if ((qk_inner % d_head) != 0) return error.InvalidShape;
+            const n_qk_heads = qk_inner / d_head;
+            if (n_qk_heads == 0 or (n_v_heads % n_qk_heads) != 0) return error.InvalidShape;
 
             cpu_conv1d.runTimeMajorValues(qkv, conv_state, conv_weight_t, qkv, conv_bias, qkv_len, d_conv);
             cpu_gated_delta.applySiluInPlace(qkv);
 
-            const query = qkv[0..d_inner];
-            const key = qkv[d_inner .. 2 * d_inner];
-            const value = qkv[2 * d_inner .. 3 * d_inner];
-            try cpu_gated_delta.normalizeQueryKeyInPlace(query, key, n_heads, d_head);
+            const query = qkv[0..qk_inner];
+            const key = qkv[qk_inner .. 2 * qk_inner];
+            const value = qkv[2 * qk_inner .. 2 * qk_inner + d_inner];
+            try cpu_gated_delta.normalizeQueryKeyInPlace(query, key, n_qk_heads, d_head);
             try cpu_gated_delta.runStateSpaceStep(
                 temp,
                 ssm_out,
@@ -286,11 +304,12 @@ pub const GatedDeltaKernel = struct {
                 a_raw,
                 A_log,
                 dt_bias,
-                n_heads,
+                n_qk_heads,
+                n_v_heads,
                 d_head,
             );
 
-            for (0..n_heads) |head_idx| {
+            for (0..n_v_heads) |head_idx| {
                 const out_head = ssm_out[head_idx * d_head ..][0..d_head];
                 const z_head = z[head_idx * d_head ..][0..d_head];
                 const norm_head = try cpu_gated_delta.normWeightSlice(norm_data, head_idx, d_head, d_inner);

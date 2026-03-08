@@ -909,21 +909,21 @@ pub fn runGatedDeltaStepF32(allocator: std.mem.Allocator, cfg: RunConfig) !Scena
 
     @memcpy(ssm_state, baseline_state);
     var timer = std.time.Timer.start() catch unreachable;
-    for (0..repeats) |_| try cpu.gated_delta.runStateSpaceStep(kv_mem, ssm_out, ssm_state, query, key, value, beta_raw, a_raw, a_log, dt_bias, dims.n_heads, dims.d_head);
+    for (0..repeats) |_| try cpu.gated_delta.runStateSpaceStep(kv_mem, ssm_out, ssm_state, query, key, value, beta_raw, a_raw, a_log, dt_bias, dims.n_heads, dims.n_heads, dims.d_head);
     const cold_ns = timer.read();
 
     for (0..cfg.warmup) |_| {
         @memcpy(ssm_state, baseline_state);
         @memset(kv_mem, 0.0);
         @memset(ssm_out, 0.0);
-        for (0..repeats) |_| try cpu.gated_delta.runStateSpaceStep(kv_mem, ssm_out, ssm_state, query, key, value, beta_raw, a_raw, a_log, dt_bias, dims.n_heads, dims.d_head);
+        for (0..repeats) |_| try cpu.gated_delta.runStateSpaceStep(kv_mem, ssm_out, ssm_state, query, key, value, beta_raw, a_raw, a_log, dt_bias, dims.n_heads, dims.n_heads, dims.d_head);
     }
     for (samples) |*sample| {
         @memcpy(ssm_state, baseline_state);
         @memset(kv_mem, 0.0);
         @memset(ssm_out, 0.0);
         timer = std.time.Timer.start() catch unreachable;
-        for (0..repeats) |_| try cpu.gated_delta.runStateSpaceStep(kv_mem, ssm_out, ssm_state, query, key, value, beta_raw, a_raw, a_log, dt_bias, dims.n_heads, dims.d_head);
+        for (0..repeats) |_| try cpu.gated_delta.runStateSpaceStep(kv_mem, ssm_out, ssm_state, query, key, value, beta_raw, a_raw, a_log, dt_bias, dims.n_heads, dims.n_heads, dims.d_head);
         sample.eval_ns = timer.read();
     }
 

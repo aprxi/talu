@@ -137,22 +137,28 @@ pub fn runStateSpaceStep(
     a_raw: []const f32,
     a_log: []const f32,
     dt_bias: ?[]const f32,
-    n_heads: usize,
+    n_qk_heads: usize,
+    n_v_heads: usize,
     d_head: usize,
 ) !void {
-    const d_inner = n_heads * d_head;
+    if (n_qk_heads == 0 or n_v_heads == 0 or d_head == 0) return error.InvalidShape;
+    if ((n_v_heads % n_qk_heads) != 0) return error.InvalidShape;
+    const qk_inner = n_qk_heads * d_head;
+    const d_inner = n_v_heads * d_head;
     if (kv_mem.len != d_inner) return error.InvalidShape;
     if (ssm_out.len != d_inner) return error.InvalidShape;
-    if (query.len != d_inner or key.len != d_inner or value.len != d_inner) return error.InvalidShape;
-    if (beta_raw.len != n_heads or a_raw.len != n_heads or a_log.len != n_heads) return error.InvalidShape;
-    if (dt_bias) |bias| if (bias.len != n_heads) return error.InvalidShape;
-    if (ssm_state.len != n_heads * d_head * d_head) return error.InvalidShape;
+    if (query.len != qk_inner or key.len != qk_inner or value.len != d_inner) return error.InvalidShape;
+    if (beta_raw.len != n_v_heads or a_raw.len != n_v_heads or a_log.len != n_v_heads) return error.InvalidShape;
+    if (dt_bias) |bias| if (bias.len != n_v_heads) return error.InvalidShape;
+    if (ssm_state.len != n_v_heads * d_head * d_head) return error.InvalidShape;
 
     @memset(ssm_out, 0.0);
+    const qk_repeat = n_v_heads / n_qk_heads;
 
-    for (0..n_heads) |head_idx| {
-        const query_head = query[head_idx * d_head ..][0..d_head];
-        const key_head = key[head_idx * d_head ..][0..d_head];
+    for (0..n_v_heads) |head_idx| {
+        const qk_head_idx = head_idx / qk_repeat;
+        const query_head = query[qk_head_idx * d_head ..][0..d_head];
+        const key_head = key[qk_head_idx * d_head ..][0..d_head];
         const value_head = value[head_idx * d_head ..][0..d_head];
         const kv_mem_head = kv_mem[head_idx * d_head ..][0..d_head];
         const out_head = ssm_out[head_idx * d_head ..][0..d_head];
@@ -268,7 +274,7 @@ test "runStateSpaceStep matches naive reference update" {
     var ref_ssm_out = ssm_out;
     var ref_ssm_state = ssm_state;
 
-    try runStateSpaceStep(&kv_mem, &ssm_out, &ssm_state, &query, &key, &value, &beta_raw, &a_raw, &a_log, &dt_bias, n_heads, d_head);
+    try runStateSpaceStep(&kv_mem, &ssm_out, &ssm_state, &query, &key, &value, &beta_raw, &a_raw, &a_log, &dt_bias, n_heads, n_heads, d_head);
 
     const beta = 1.0 / (1.0 + @exp(-beta_raw[0]));
     const g = -@exp(a_log[0]) * activation.softplus(a_raw[0] + dt_bias[0]);

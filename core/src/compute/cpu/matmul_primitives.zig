@@ -1057,84 +1057,9 @@ fn matmulGaffineU8(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *M
 
     const a_data = a.asSlice(f32);
     const out_data = out.asSlice(f32);
-
-    const k_div_4 = k_dim / 4;
-    const k_div_group = k_dim / group;
-    const group_u32 = group / 4;
-
-    // Defense-in-depth: validate k_div_group fits in stack buffers (should be checked at load time)
-    std.debug.assert(k_div_group <= MAX_GROUPS);
-
-    const MatmulGaffineU8Ctx = struct {
-        a: []const f32,
-        packed_b: []align(1) const u32,
-        scales: []align(1) const u16,
-        biases: []align(1) const u16,
-        scales_dtype: DType,
-        out: []f32,
-        m_rows: usize,
-        n_cols: usize,
-        k_dim: usize,
-        group: usize,
-        k_div_4: usize,
-        k_div_group: usize,
-        group_u32: usize,
-    };
-
-    var context = MatmulGaffineU8Ctx{
-        .a = a_data,
-        .packed_b = packed_vals,
-        .scales = scales,
-        .biases = biases,
-        .scales_dtype = scales_dtype,
-        .out = out_data,
-        .m_rows = m_rows,
-        .n_cols = n_cols,
-        .k_dim = k_dim,
-        .group = group,
-        .k_div_4 = k_div_4,
-        .k_div_group = k_div_group,
-        .group_u32 = group_u32,
-    };
-
-    const row_tiles_task = struct {
-        fn runRowTiles(start: usize, end: usize, task_ctx: *MatmulGaffineU8Ctx) void {
-            var scales_f32: [MAX_GROUPS]f32 align(64) = undefined; // filled in loop below
-            var biases_f32: [MAX_GROUPS]f32 align(64) = undefined; // filled in loop below
-
-            for (start..end) |row| {
-                const a_ptr = task_ctx.a.ptr + row * task_ctx.k_dim;
-                const out_row = task_ctx.out[row * task_ctx.n_cols ..][0..task_ctx.n_cols];
-
-                for (0..task_ctx.n_cols) |col| {
-                    const w_ptr = task_ctx.packed_b.ptr + col * task_ctx.k_div_4;
-                    const s_ptr = task_ctx.scales.ptr + col * task_ctx.k_div_group;
-                    const b_ptr = task_ctx.biases.ptr + col * task_ctx.k_div_group;
-
-                    for (0..task_ctx.k_div_group) |group_idx| {
-                        scales_f32[group_idx] = gaffineScaleBiasToF32(task_ctx.scales_dtype, s_ptr[group_idx]);
-                        biases_f32[group_idx] = gaffineScaleBiasToF32(task_ctx.scales_dtype, b_ptr[group_idx]);
-                    }
-
-                    out_row[col] = gaffineU8DotProductOpt(
-                        a_ptr,
-                        w_ptr,
-                        &scales_f32,
-                        &biases_f32,
-                        task_ctx.group,
-                        task_ctx.k_div_group,
-                        task_ctx.group_u32,
-                    );
-                }
-            }
-        }
-    }.runRowTiles;
-
-    if (m_rows >= TILE_THRESHOLD) {
-        parallel.global().parallelFor(m_rows, row_tiles_task, &context);
-    } else {
-        row_tiles_task(0, m_rows, &context);
-    }
+    // Unified rows path: use the same multi-row prefill kernel for any row count.
+    log.trace("compute", "gaffine_u8 rows", .{ .m = m_rows, .k = k_dim, .n = n_cols, .group = group }, @src());
+    multi_row.matmulGaffineU8Prefill(a_data, m_rows, k_dim, packed_vals, scales, biases, scales_dtype, n_cols, group, out_data);
 }
 
 test "MatmulScratch init deinit" {

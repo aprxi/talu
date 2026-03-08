@@ -109,6 +109,7 @@ fn parseConfigHook(
     config: *tensor.ModelConfig,
 ) void {
     config_hooks.applyCommonTextConfig(config_obj, root_obj, config);
+    config_hooks.applyLinearAttentionConfig(config_obj, root_obj, config);
     config_hooks.applyMambaConfig(config_obj, root_obj, config);
     config_hooks.applyVisionConfig(root_obj, config);
 }

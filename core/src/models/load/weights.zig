@@ -506,14 +506,23 @@ pub fn loadModelWithArchitecture(
             };
         }
         if (block_type == .gated_delta) {
-            if (layer_meta.gated_delta_config) |cfg| {
-                map_context.gated_delta_config = .{
-                    .d_model = @intCast(model_config.d_model),
-                    .d_conv = cfg.d_conv,
-                    .n_heads = cfg.n_heads,
-                    .d_head = cfg.d_head,
-                };
-            } else return error.MissingGatedDeltaConfig;
+            const meta_cfg = layer_meta.gated_delta_config orelse return error.MissingGatedDeltaConfig;
+            const cfg_num_value_heads: u32 = if (model_config.linear_num_value_heads > 0)
+                @intCast(model_config.linear_num_value_heads)
+            else
+                meta_cfg.n_heads;
+            const cfg_value_head_dim: u32 = if (model_config.linear_value_head_dim > 0)
+                @intCast(model_config.linear_value_head_dim)
+            else
+                meta_cfg.d_head;
+            if (cfg_num_value_heads == 0 or cfg_value_head_dim == 0) return error.InvalidShape;
+            _ = std.math.mul(u32, cfg_num_value_heads, cfg_value_head_dim) catch return error.InvalidShape;
+            map_context.gated_delta_config = .{
+                .d_model = @intCast(model_config.d_model),
+                .d_conv = meta_cfg.d_conv,
+                .n_heads = cfg_num_value_heads,
+                .d_head = cfg_value_head_dim,
+            };
         }
         if (block_type == .shortconv) {
             const meta_cfg = layer_meta.shortconv_config;
@@ -679,7 +688,6 @@ fn transposeToOwned(allocator: std.mem.Allocator, t: Tensor, data_type: DType) !
 
     return owned.view();
 }
-
 
 fn readEnvFlag(allocator: std.mem.Allocator, name: []const u8, default_value: bool) bool {
     const env_value = std.process.getEnvVarOwned(allocator, name) catch return default_value;
@@ -1207,7 +1215,6 @@ test "transposeToOwned: BF16 transpose" {
     try std.testing.expectEqual(@as(u16, 0x4000), result_data[2]);
     try std.testing.expectEqual(@as(u16, 0x4080), result_data[3]);
 }
-
 
 test "bytesToU16Slice: aligned conversion" {
     const allocator = std.testing.allocator;

@@ -210,6 +210,58 @@ const JsonConfig = struct {
     }
 };
 
+fn objectIntField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .integer => value.integer,
+        else => null,
+    };
+}
+
+fn objectStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .string => value.string,
+        else => null,
+    };
+}
+
+fn mergeRootQuantizationConfig(config_json: *JsonConfig, root_obj: std.json.ObjectMap) void {
+    if (config_json.quantization == null) {
+        if (root_obj.get("quantization")) |raw| {
+            if (raw == .object) {
+                const q = raw.object;
+                config_json.quantization = .{
+                    .group_size = objectIntField(q, "group_size"),
+                    .bits = objectIntField(q, "bits"),
+                    .mode = objectStringField(q, "mode"),
+                };
+            }
+        }
+    }
+
+    if (config_json.quantization_config == null) {
+        if (root_obj.get("quantization_config")) |raw| {
+            if (raw == .object) {
+                const q = raw.object;
+                config_json.quantization_config = .{
+                    .group_size = objectIntField(q, "group_size"),
+                    .bits = objectIntField(q, "bits"),
+                    .quant_method = objectStringField(q, "quant_method"),
+                    .mode = objectStringField(q, "mode"),
+                };
+            }
+        }
+    }
+
+    // Multimodal wrappers often keep tie_word_embeddings at the root while
+    // model dimensions live under text_config. Preserve the root value when
+    // parsing from text_config to avoid silently forcing tied embeddings.
+    if (config_json.tie_word_embeddings == null) {
+        config_json.tie_word_embeddings = getBoolField(root_obj, "tie_word_embeddings");
+    }
+}
+
 /// Minimal config payload used for architecture detection before full parsing.
 pub const BaseConfig = struct {
     model_type: ?[]const u8 = null,
@@ -485,7 +537,10 @@ pub fn loadConfigForArchitectureWithHook(
         };
     };
     defer parsed_config.deinit();
-    const config_json = parsed_config.value;
+    var config_json = parsed_config.value;
+    // When parsing multimodal configs from text_config, quantization settings
+    // usually remain at root. Merge them so grouped-affine bit-width stays correct.
+    mergeRootQuantizationConfig(&config_json, root_obj);
 
     const vocab_size = config_json.firstInt(.{"vocab_size"}) orelse return error.MissingField;
     const d_model = config_json.firstInt(.{ "d_model", "hidden_size" }) orelse return error.MissingField;
@@ -650,6 +705,10 @@ pub fn loadConfigForArchitectureWithHook(
         .shortconv_conv_dim = 0,
         .shortconv_conv_dim_out = 0,
         .shortconv_has_bias = false,
+        .linear_num_key_heads = 0,
+        .linear_num_value_heads = 0,
+        .linear_key_head_dim = 0,
+        .linear_value_head_dim = 0,
     };
     if (config_json.rope_parameters) |rope_params| {
         if (rope_params.partial_rotary_factor) |partial_rotary_factor| {
@@ -1059,6 +1118,39 @@ test "JsonConfig.gaffineBits returns default 4 when not present" {
 
     const result = config.gaffineBits();
     try std.testing.expectEqual(@as(i32, 4), result);
+}
+
+test "loadConfig reads root quantization when parsing text_config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": { "bits": 8, "group_size": 64 },
+        \\  "text_config": {
+        \\    "vocab_size": 248320,
+        \\    "hidden_size": 1024,
+        \\    "num_hidden_layers": 24,
+        \\    "num_attention_heads": 8,
+        \\    "num_key_value_heads": 2,
+        \\    "head_dim": 256,
+        \\    "intermediate_size": 3584,
+        \\    "max_position_embeddings": 262144
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfig(std.testing.allocator, path);
+    try std.testing.expectEqual(tensor.QuantMethod.gaffine, config.quant_method);
+    try std.testing.expectEqual(@as(i32, 8), config.gaffine_bits);
+    try std.testing.expectEqual(@as(i32, 64), config.gaffine_group_size);
+    try std.testing.expectEqual(false, config.tie_word_embeddings);
 }
 
 test "initialDff prefers MoE intermediate size when experts are configured" {

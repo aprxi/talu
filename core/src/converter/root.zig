@@ -13,6 +13,7 @@ const tensor_mod = @import("../tensor.zig");
 const safetensors = @import("../io/safetensors/root.zig");
 const dtype_mod = @import("../dtype.zig");
 const op_types = @import("../models/op_types.zig");
+const models_registry = @import("../models/registry.zig");
 
 pub const mapping = @import("mapping.zig");
 pub const grouped_affine = @import("grouped_affine.zig");
@@ -1443,4 +1444,11 @@ test "shouldQuantizeTensorByLayout keeps unknown tensors in source precision" {
     try std.testing.expect(!shouldQuantizeTensorByLayout(null, "model.layers.0.feed_forward.w1.weight", t));
     try std.testing.expect(!shouldQuantizeTensorByLayout(null, "model.layers.0.self_attn.out_proj.weight", t));
     try std.testing.expect(!shouldQuantizeTensorByLayout(null, "model.layers.0.conv.in_proj.weight", t));
+}
+
+test "buildWeightLayoutMap supports qwen3_5 runtime architecture" {
+    const arch = models_registry.runtimeArchitectureByModelType("qwen3_5") orelse return error.TestUnexpectedResult;
+    var layout_map = try buildWeightLayoutMap(std.testing.allocator, arch, 24);
+    defer layout_map.deinit();
+    try std.testing.expect(layout_map.layouts.count() > 0);
 }
