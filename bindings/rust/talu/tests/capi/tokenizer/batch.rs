@@ -928,7 +928,8 @@ fn run_batch_encode_with_null_pointers_in_array_inner() {
     let t2 = b"A";
     let ptrs = [t0.as_ptr(), std::ptr::null(), t2.as_ptr()];
     let lengths = [t0.len(), 1usize, t2.len()];
-    let result = unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
+    let result =
+        unsafe { super::common::encode_batch_raw(ctx.handle(), &ptrs, &lengths, &no_bos()) };
     assert!(
         !result.error_msg.is_null(),
         "inner null text pointer with non-zero length must return a typed error"
@@ -1411,7 +1412,8 @@ fn padded_tensor_single_empty_sequence_max_length_zero_nonnull_ids_is_empty_succ
         ..Default::default()
     };
     let ids_ptr = std::ptr::NonNull::<u32>::dangling().as_ptr() as *const u32;
-    let result = unsafe { super::common::batch_to_padded_tensor_raw(ids_ptr, offsets.as_ptr(), 1, &opts) };
+    let result =
+        unsafe { super::common::batch_to_padded_tensor_raw(ids_ptr, offsets.as_ptr(), 1, &opts) };
     assert!(
         result.error_msg.is_null(),
         "non-null sentinel ids pointer with empty offsets should succeed"

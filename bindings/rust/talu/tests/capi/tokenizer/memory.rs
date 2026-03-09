@@ -47,13 +47,18 @@ fn create_null_output_returns_error() {
 
 fn run_create_from_null_path_returns_error_inner() {
     let mut handle: *mut c_void = ptr::null_mut();
-    let rc = unsafe { talu_sys::talu_tokenizer_create(ptr::null(), &mut handle as *mut _ as *mut c_void) };
+    let rc = unsafe {
+        talu_sys::talu_tokenizer_create(ptr::null(), &mut handle as *mut _ as *mut c_void)
+    };
     assert_eq!(
         rc,
         talu_sys::ErrorCode::InvalidArgument as i32,
         "create with null model_path must return InvalidArgument"
     );
-    assert!(handle.is_null(), "handle must remain null on create failure");
+    assert!(
+        handle.is_null(),
+        "handle must remain null on create failure"
+    );
 }
 
 /// Passing a null C-string path to `talu_tokenizer_create` must fail with a
@@ -77,15 +82,9 @@ fn run_create_from_excessively_long_path_returns_error_inner() {
     let c_path = CString::new(long_path).expect("path fixture must not contain interior NUL");
     let mut handle: *mut c_void = ptr::null_mut();
     let rc = unsafe {
-        talu_sys::talu_tokenizer_create(
-            c_path.as_ptr(),
-            &mut handle as *mut _ as *mut c_void,
-        )
+        talu_sys::talu_tokenizer_create(c_path.as_ptr(), &mut handle as *mut _ as *mut c_void)
     };
-    assert_ne!(
-        rc, 0,
-        "excessively long path must not load successfully"
-    );
+    assert_ne!(rc, 0, "excessively long path must not load successfully");
     assert!(
         handle.is_null(),
         "handle must remain null when create fails for long path"
@@ -133,8 +132,10 @@ fn run_create_from_json_with_invalid_utf8_fails_gracefully_inner() {
   "added_tokens": [{"id": 0, "content": "#;
     let mut bytes = json.to_vec();
     bytes.push(0xFF);
-    bytes.extend_from_slice(br#"", "special": true}]
-}"#);
+    bytes.extend_from_slice(
+        br#"", "special": true}]
+}"#,
+    );
 
     let mut handle: *mut c_void = ptr::null_mut();
     let rc = unsafe {
@@ -145,7 +146,10 @@ fn run_create_from_json_with_invalid_utf8_fails_gracefully_inner() {
         )
     };
     assert_ne!(rc, 0, "invalid UTF-8 JSON bytes must be rejected");
-    assert!(handle.is_null(), "handle must remain null on invalid UTF-8 JSON");
+    assert!(
+        handle.is_null(),
+        "handle must remain null on invalid UTF-8 JSON"
+    );
 }
 
 /// Invalid UTF-8 bytes inside JSON config must be rejected with an error and
@@ -414,7 +418,10 @@ unsafe fn run_bpe_encode_page_boundary_guard_inner() {
             0,
         )
     };
-    assert_ne!(mapping as isize, -1, "mmap for encode page-guard must succeed");
+    assert_ne!(
+        mapping as isize, -1,
+        "mmap for encode page-guard must succeed"
+    );
 
     let base = mapping.cast::<u8>();
     let guard = unsafe { base.add(page) };
@@ -429,9 +436,8 @@ unsafe fn run_bpe_encode_page_boundary_guard_inner() {
 
     let ctx = TokenizerTestContext::with_byte_level();
     let input = unsafe { std::slice::from_raw_parts(tail, 1) };
-    let result = unsafe {
-        common::encode_raw(ctx.handle(), input, &talu_sys::EncodeOptions::default())
-    };
+    let result =
+        unsafe { common::encode_raw(ctx.handle(), input, &talu_sys::EncodeOptions::default()) };
     assert!(
         result.error_msg.is_null(),
         "BPE encode at readable-page boundary must succeed without over-read"
@@ -498,7 +504,10 @@ unsafe fn run_bpe_decode_page_boundary_guard_inner() {
             0,
         )
     };
-    assert_ne!(mapping as isize, -1, "mmap for decode page-guard must succeed");
+    assert_ne!(
+        mapping as isize, -1,
+        "mmap for decode page-guard must succeed"
+    );
 
     let base = mapping.cast::<u8>();
     let guard = unsafe { base.add(page) };
@@ -733,7 +742,8 @@ fn encode_error_message_survives_tokenizer_free_until_result_free() {
         max_length: 2,
         ..Default::default()
     };
-    let result = unsafe { talu_sys::talu_tokenizer_encode(handle, b"Hello".as_ptr(), 5, &bad_opts) };
+    let result =
+        unsafe { talu_sys::talu_tokenizer_encode(handle, b"Hello".as_ptr(), 5, &bad_opts) };
     assert!(
         !result.error_msg.is_null(),
         "invalid encode options must produce an error message"
@@ -1122,7 +1132,8 @@ fn tokenize_null_text_nonzero_len_returns_error() {
 #[test]
 fn tokenize_null_text_usize_max_len_returns_error() {
     let ctx = TokenizerTestContext::new();
-    let result = unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), ptr::null(), usize::MAX) };
+    let result =
+        unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), ptr::null(), usize::MAX) };
     assert!(
         !result.error_msg.is_null(),
         "tokenize with null text and usize::MAX length must fail"
@@ -1371,9 +1382,7 @@ fn token_to_id_null_ptr_nonzero_len_returns_error() {
 fn run_tokens_concat_rejects_usize_overflow_inner() {
     let a = [1u32];
     let b = [2u32, 3u32];
-    let out = unsafe {
-        talu_sys::talu_tokens_concat(a.as_ptr(), usize::MAX, b.as_ptr(), b.len())
-    };
+    let out = unsafe { talu_sys::talu_tokens_concat(a.as_ptr(), usize::MAX, b.as_ptr(), b.len()) };
     assert!(
         out.is_null(),
         "tokens_concat must reject usize overflow in combined length"

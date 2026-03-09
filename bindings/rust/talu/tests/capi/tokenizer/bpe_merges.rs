@@ -1560,15 +1560,17 @@ fn adversarial_overlapping_substring_merges_terminate_deterministically() {
     let input = "abab".repeat(300); // 1200 symbols => cached/heap merge path
     let first = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
     let second = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
-    assert!(first.error_msg.is_null(), "first adversarial encode must succeed");
+    assert!(
+        first.error_msg.is_null(),
+        "first adversarial encode must succeed"
+    );
     assert!(
         second.error_msg.is_null(),
         "second adversarial encode must succeed"
     );
 
     let first_ids = unsafe { std::slice::from_raw_parts(first.ids, first.num_tokens) }.to_vec();
-    let second_ids =
-        unsafe { std::slice::from_raw_parts(second.ids, second.num_tokens) }.to_vec();
+    let second_ids = unsafe { std::slice::from_raw_parts(second.ids, second.num_tokens) }.to_vec();
     assert_eq!(
         first_ids, second_ids,
         "adversarial overlapping chain must remain deterministic"

@@ -421,7 +421,10 @@ fn merges_implicitly_define_vocab_entries_with_full_api_parity() {
 
     let enc = unsafe { super::common::encode_raw(ctx.handle(), b"ab", &opts) };
     assert!(enc.error_msg.is_null(), "encode must succeed");
-    assert_eq!(enc.num_tokens, 1, "'ab' should merge into one implicit token");
+    assert_eq!(
+        enc.num_tokens, 1,
+        "'ab' should merge into one implicit token"
+    );
     let ids = unsafe { std::slice::from_raw_parts(enc.ids, enc.num_tokens) };
     let merged_id = ids[0];
     unsafe { talu_sys::talu_encode_result_free(enc) };
@@ -431,7 +434,10 @@ fn merges_implicitly_define_vocab_entries_with_full_api_parity() {
         "implicit merge token ID must be allocated beyond explicit vocab IDs"
     );
     let size = unsafe { talu_sys::talu_tokenizer_get_vocab_size(ctx.handle()) };
-    assert_eq!(size, 4, "implicit merge token must increase reported vocab size");
+    assert_eq!(
+        size, 4,
+        "implicit merge token must increase reported vocab size"
+    );
 
     let mut out: *mut i8 = ptr::null_mut();
     let rc = unsafe {
@@ -448,8 +454,7 @@ fn merges_implicitly_define_vocab_entries_with_full_api_parity() {
     assert_eq!(text, "ab");
     unsafe { talu_sys::talu_text_free(out) };
 
-    let token_id =
-        unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), b"ab".as_ptr(), 2) };
+    let token_id = unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), b"ab".as_ptr(), 2) };
     assert_eq!(
         token_id as u32, merged_id,
         "token_to_id must resolve implicit merge token to allocated ID"

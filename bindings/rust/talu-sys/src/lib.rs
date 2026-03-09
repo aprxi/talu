@@ -1248,6 +1248,8 @@ pub struct CapturedTensorInfo {
     pub ndim: u8,
     pub dtype: u8,
     pub kernel_name: [u8; 48],
+    pub work_flops: u64,
+    pub work_bytes: u64,
     pub stats: TensorStats,
     pub timestamp_ns: i64,
 }
@@ -1264,6 +1266,8 @@ impl Default for CapturedTensorInfo {
             ndim: 0,
             dtype: 0,
             kernel_name: [0; 48],
+            work_flops: 0,
+            work_bytes: 0,
             stats: TensorStats::default(),
             timestamp_ns: 0,
         }

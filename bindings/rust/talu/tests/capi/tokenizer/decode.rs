@@ -817,8 +817,9 @@ fn run_decoder_strip_out_of_bounds_start_stop_inner() {
   "decoder": {"type": "Strip", "content": " ", "start": 100, "stop": 100}
 }"####;
     let ctx = TokenizerTestContext::from_json(json);
-    let result =
-        unsafe { super::common::decode_raw(ctx.handle(), &[1], &talu_sys::DecodeOptionsC::default()) };
+    let result = unsafe {
+        super::common::decode_raw(ctx.handle(), &[1], &talu_sys::DecodeOptionsC::default())
+    };
     assert!(
         result.error_msg.is_null(),
         "strip decoder with out-of-bounds bounds must not error"
@@ -835,8 +836,9 @@ fn run_decoder_strip_out_of_bounds_start_stop_inner() {
     );
     unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
 
-    let non_match =
-        unsafe { super::common::decode_raw(ctx.handle(), &[2], &talu_sys::DecodeOptionsC::default()) };
+    let non_match = unsafe {
+        super::common::decode_raw(ctx.handle(), &[2], &talu_sys::DecodeOptionsC::default())
+    };
     assert!(
         non_match.error_msg.is_null(),
         "strip decoder must not error on non-matching leading content"

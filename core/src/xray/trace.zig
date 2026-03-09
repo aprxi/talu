@@ -51,6 +51,13 @@ pub const TracePoint = enum(u8) {
     logits_scaled, // After temperature scaling
     logits_ready, // Logits materialized and available to sampler
     token_select, // Next-token selection (argmax/sampling)
+    ffn_act_map, // Activation map stage (e.g. SiLU/GELU map)
+    ffn_act_mix, // Activation mix stage (e.g. gate*up or fused act*mul)
+    gdelta_in_proj, // Gated-Delta input projection output
+    gdelta_conv, // Gated-Delta depthwise conv + SiLU output
+    gdelta_ssm, // Gated-Delta state-space step output
+    gdelta_norm, // Gated-Delta gated RMS norm output
+    gdelta_out, // Gated-Delta output projection
 
     // Extensible - custom points can use values >= 128
     _,
@@ -82,6 +89,13 @@ pub const TracePoint = enum(u8) {
             .logits_scaled => "logits_scaled",
             .logits_ready => "logits_ready",
             .token_select => "token_select",
+            .ffn_act_map => "ffn.act.map",
+            .ffn_act_mix => "ffn.act.mix",
+            .gdelta_in_proj => "gdelta.in_proj",
+            .gdelta_conv => "gdelta.conv",
+            .gdelta_ssm => "gdelta.ssm",
+            .gdelta_norm => "gdelta.norm",
+            .gdelta_out => "gdelta.out",
             _ => "custom",
         };
     }
@@ -227,12 +241,22 @@ pub const TraceEmission = struct {
     timestamp_ns: i128,
     /// Kernel name that produced this tensor (null-terminated, max 48 chars)
     kernel_name: [48]u8,
+    /// Exact work counters provided by runtime call sites.
+    /// These are semantic workload counters (not hardware counters).
+    work_flops: u64 = 0,
+    work_bytes: u64 = 0,
 
     pub const NO_LAYER: u16 = 0xFFFF;
 };
 
 /// Handler function type - inspection system implements this.
 pub const Handler = *const fn (TraceEmission) void;
+
+/// Runtime-provided work counters attached to a trace emission.
+pub const Work = struct {
+    flops: u64 = 0,
+    bytes: u64 = 0,
+};
 
 /// The global handler - set by inspection system, null when disabled.
 /// Using atomic to be safe across threads (inspection might be enabled/disabled).
@@ -280,6 +304,22 @@ pub inline fn emit(
     ndim: u8,
     kernel_name: ?[]const u8,
 ) void {
+    emitWithWork(point, layer, token, position, ptr, dtype, shape, ndim, kernel_name, .{});
+}
+
+/// Emit a trace point with exact runtime work counters.
+pub inline fn emitWithWork(
+    point: TracePoint,
+    layer: u16,
+    token: u32,
+    position: u32,
+    ptr: [*]const u8,
+    dtype: DType,
+    shape: [4]u32,
+    ndim: u8,
+    kernel_name: ?[]const u8,
+    work: Work,
+) void {
     const h = handler_atomic.load(.acquire) orelse return;
     var name_buf: [48]u8 = std.mem.zeroes([48]u8);
     if (kernel_name) |name| {
@@ -300,6 +340,8 @@ pub inline fn emit(
         },
         .timestamp_ns = std.time.nanoTimestamp(),
         .kernel_name = name_buf,
+        .work_flops = work.flops,
+        .work_bytes = work.bytes,
     });
 }
 
@@ -314,7 +356,43 @@ pub inline fn emitFinal(
     ndim: u8,
     kernel_name: ?[]const u8,
 ) void {
-    emit(point, TraceEmission.NO_LAYER, token, position, ptr, dtype, shape, ndim, kernel_name);
+    emitFinalWithWork(
+        point,
+        token,
+        position,
+        ptr,
+        dtype,
+        shape,
+        ndim,
+        kernel_name,
+        .{},
+    );
+}
+
+/// Emit final-stage trace point with exact runtime work counters.
+pub inline fn emitFinalWithWork(
+    point: TracePoint,
+    token: u32,
+    position: u32,
+    ptr: [*]const u8,
+    dtype: DType,
+    shape: [4]u32,
+    ndim: u8,
+    kernel_name: ?[]const u8,
+    work: Work,
+) void {
+    emitWithWork(
+        point,
+        TraceEmission.NO_LAYER,
+        token,
+        position,
+        ptr,
+        dtype,
+        shape,
+        ndim,
+        kernel_name,
+        work,
+    );
 }
 
 // ============================================================================

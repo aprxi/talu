@@ -23,6 +23,9 @@ pub struct TraceRecord {
     pub dtype: u8,
     /// Kernel name that produced this tensor (e.g., "matmul_q4_cpu_avx512")
     pub kernel_name: Option<String>,
+    /// Runtime-provided exact work counters.
+    pub work_flops: u64,
+    pub work_bytes: u64,
     /// Tensor statistics
     pub stats: TraceStats,
     /// Nanosecond timestamp (monotonic clock)
@@ -98,9 +101,19 @@ pub struct XrayCaptureHandle {
 }
 
 impl XrayCaptureHandle {
-    /// Create a new capture handle with all trace points enabled.
+    /// Create a new capture handle with all trace points enabled (stats mode).
     pub fn new() -> Result<Self> {
-        // Mode 0 = stats only, sample_count = 0
+        // Mode 1 = stats only, sample_count = 0
+        let handle = unsafe { talu_sys::talu_xray_capture_create_all(1, 0) };
+        if handle.is_null() {
+            return Err(error_from_last_or("xray capture create failed"));
+        }
+        Ok(Self { handle })
+    }
+
+    /// Create a low-overhead capture handle for timing/table views.
+    pub fn new_timing() -> Result<Self> {
+        // Mode 0 = metadata/timing only, sample_count = 0
         let handle = unsafe { talu_sys::talu_xray_capture_create_all(0, 0) };
         if handle.is_null() {
             return Err(error_from_last_or("xray capture create failed"));
@@ -171,6 +184,8 @@ impl XrayCaptureHandle {
                 shape,
                 dtype: info.dtype,
                 kernel_name,
+                work_flops: info.work_flops,
+                work_bytes: info.work_bytes,
                 stats: TraceStats {
                     count: info.stats.count,
                     min: info.stats.min,

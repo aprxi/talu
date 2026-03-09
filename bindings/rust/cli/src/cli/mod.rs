@@ -559,6 +559,10 @@ pub(super) struct XrayArgs {
     #[arg(long)]
     pub table: bool,
 
+    /// Show detailed per-segment timeline table (verbose)
+    #[arg(long)]
+    pub debug: bool,
+
     /// Prompt text (default: "xray")
     #[arg(trailing_var_arg = true)]
     pub prompt: Vec<String>,
@@ -1104,6 +1108,28 @@ mod tests {
             Some(Commands::Xray(args)) => {
                 assert!(args.output);
                 assert!(args.table);
+            }
+            _ => panic!("expected xray command"),
+        }
+    }
+
+    #[test]
+    fn parse_xray_debug_flag() {
+        let cli = parse(&[
+            "talu",
+            "xray",
+            "Qwen/Qwen3.5-0.8B",
+            "--output",
+            "--table",
+            "--debug",
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Xray(args)) => {
+                assert!(args.output);
+                assert!(args.table);
+                assert!(args.debug);
             }
             _ => panic!("expected xray command"),
         }

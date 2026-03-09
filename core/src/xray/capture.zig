@@ -11,6 +11,8 @@ pub const TensorStats = stats_mod.TensorStats;
 
 /// What data to capture from each tensor.
 pub const TraceCaptureMode = enum(u8) {
+    /// Metadata/timing only: no tensor stats or value sampling.
+    timing,
     /// Statistics only: min, max, mean, rms, nan_count, inf_count
     stats,
     /// Statistics + first N tensor values
@@ -87,7 +89,13 @@ pub const TracePointSet = packed struct {
     logits_scaled: bool = false,
     logits_ready: bool = false,
     token_select: bool = false,
-    _padding: u7 = 0,
+    ffn_act_map: bool = false,
+    ffn_act_mix: bool = false,
+    gdelta_in_proj: bool = false,
+    gdelta_conv: bool = false,
+    gdelta_ssm: bool = false,
+    gdelta_norm: bool = false,
+    gdelta_out: bool = false,
 
     pub fn all() TracePointSet {
         return .{
@@ -105,6 +113,8 @@ pub const TracePointSet = packed struct {
             .ffn_gate = true,
             .ffn_up = true,
             .ffn_act = true,
+            .ffn_act_map = true,
+            .ffn_act_mix = true,
             .ffn_down = true,
             .block_out = true,
             .mamba_out = true,
@@ -116,6 +126,11 @@ pub const TracePointSet = packed struct {
             .logits_scaled = true,
             .logits_ready = true,
             .token_select = true,
+            .gdelta_in_proj = true,
+            .gdelta_conv = true,
+            .gdelta_ssm = true,
+            .gdelta_norm = true,
+            .gdelta_out = true,
         };
     }
 
@@ -139,6 +154,8 @@ pub const TracePointSet = packed struct {
             .ffn_gate => self.ffn_gate,
             .ffn_up => self.ffn_up,
             .ffn_act => self.ffn_act,
+            .ffn_act_map => self.ffn_act_map,
+            .ffn_act_mix => self.ffn_act_mix,
             .ffn_down => self.ffn_down,
             .block_out => self.block_out,
             .mamba_out => self.mamba_out,
@@ -150,6 +167,11 @@ pub const TracePointSet = packed struct {
             .logits_scaled => self.logits_scaled,
             .logits_ready => self.logits_ready,
             .token_select => self.token_select,
+            .gdelta_in_proj => self.gdelta_in_proj,
+            .gdelta_conv => self.gdelta_conv,
+            .gdelta_ssm => self.gdelta_ssm,
+            .gdelta_norm => self.gdelta_norm,
+            .gdelta_out => self.gdelta_out,
             _ => false, // Custom points not in standard set
         };
     }
@@ -193,6 +215,9 @@ pub const CapturedTensor = struct {
     dtype: trace.DType,
     /// Kernel name that produced this tensor (null-terminated)
     kernel_name: [48]u8,
+    /// Runtime-provided exact work counters.
+    work_flops: u64,
+    work_bytes: u64,
     /// Computed statistics
     stats: TensorStats,
     /// Sample values (if mode was sample or full)
@@ -265,7 +290,7 @@ pub const TraceCapture = struct {
         // Non-CPU backends may emit device pointers that are not host-readable.
         // Capture metadata only for those emissions.
         const can_read_tensor = emission.backend == .cpu;
-        const tensor_stats = if (can_read_tensor)
+        const tensor_stats = if (can_read_tensor and self.config.mode != .timing)
             stats_mod.compute(emission.tensor)
         else
             TensorStats.EMPTY;
@@ -306,6 +331,8 @@ pub const TraceCapture = struct {
             .ndim = emission.tensor.ndim,
             .dtype = emission.tensor.dtype,
             .kernel_name = emission.kernel_name,
+            .work_flops = emission.work_flops,
+            .work_bytes = emission.work_bytes,
             .stats = tensor_stats,
             .samples = samples,
             .data = data,

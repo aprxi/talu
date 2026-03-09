@@ -15,6 +15,30 @@ const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_gated_delta = compute.cpu.gated_delta;
 const trace = @import("../../../../xray/root.zig").trace;
 
+fn saturatingU64FromU128(value: u128) u64 {
+    return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
+}
+
+fn tensorStorageBytes(weight: *const Tensor) u64 {
+    var bytes: u128 = @intCast(weight.data_size);
+    if (weight.gaffine) |meta| {
+        bytes += meta.scales.len;
+        bytes += meta.biases.len;
+    }
+    return saturatingU64FromU128(bytes);
+}
+
+fn matmulWork(rows: usize, k: usize, n: usize, weight: *const Tensor) trace.Work {
+    const rows128: u128 = @intCast(rows);
+    const k128: u128 = @intCast(k);
+    const n128: u128 = @intCast(n);
+    const flops = saturatingU64FromU128(2 * rows128 * k128 * n128);
+    const input_bytes = rows128 * k128 * @sizeOf(f32);
+    const output_bytes = rows128 * n128 * @sizeOf(f32);
+    const bytes = saturatingU64FromU128(input_bytes + output_bytes + @as(u128, tensorStorageBytes(weight)));
+    return .{ .flops = flops, .bytes = bytes };
+}
+
 pub const GatedDeltaConfig = struct {
     d_model: u32,
     d_conv: u32,
@@ -263,6 +287,7 @@ pub const GatedDeltaKernel = struct {
         const conv_state = state.conv_state;
         const ssm_state = state.ssm_state;
         const norm_data = if (w.norm_weight) |norm_w| norm_w.asSlice(f32) else null;
+        const trace_enabled = trace.isEnabled();
 
         for (0..seq_len) |t| {
             const token_offset = t * d_model;
@@ -272,6 +297,20 @@ pub const GatedDeltaKernel = struct {
             var input_view = Tensor.view2DSlice(input_data, 1, d_model);
             var proj_view = Tensor.view2DSlice(proj_out, 1, proj_len);
             self.matmul_in_proj(&input_view, w.in_proj, &proj_view, matmul_scratch);
+            if (trace_enabled) {
+                trace.emitWithWork(
+                    .gdelta_in_proj,
+                    self.layer_idx,
+                    0,
+                    @intCast(t),
+                    proj_view.data().ptr,
+                    .f32,
+                    .{ 1, 1, @intCast(proj_len), 0 },
+                    3,
+                    null,
+                    matmulWork(1, d_model, proj_len, w.in_proj),
+                );
+            }
 
             const qkv = proj_out[0..qkv_len];
             const z = proj_out[qkv_len .. qkv_len + d_inner];
@@ -288,6 +327,19 @@ pub const GatedDeltaKernel = struct {
 
             cpu_conv1d.runTimeMajorValues(qkv, conv_state, conv_weight_t, qkv, conv_bias, qkv_len, d_conv);
             cpu_gated_delta.applySiluInPlace(qkv);
+            if (trace_enabled) {
+                trace.emit(
+                    .gdelta_conv,
+                    self.layer_idx,
+                    0,
+                    @intCast(t),
+                    @ptrCast(qkv.ptr),
+                    .f32,
+                    .{ 1, 1, @intCast(qkv_len), 0 },
+                    3,
+                    null,
+                );
+            }
 
             const query = qkv[0..qk_inner];
             const key = qkv[qk_inner .. 2 * qk_inner];
@@ -308,6 +360,19 @@ pub const GatedDeltaKernel = struct {
                 n_v_heads,
                 d_head,
             );
+            if (trace_enabled) {
+                trace.emit(
+                    .gdelta_ssm,
+                    self.layer_idx,
+                    0,
+                    @intCast(t),
+                    @ptrCast(ssm_out.ptr),
+                    .f32,
+                    .{ 1, 1, @intCast(d_inner), 0 },
+                    3,
+                    null,
+                );
+            }
 
             for (0..n_v_heads) |head_idx| {
                 const out_head = ssm_out[head_idx * d_head ..][0..d_head];
@@ -315,10 +380,37 @@ pub const GatedDeltaKernel = struct {
                 const norm_head = try cpu_gated_delta.normWeightSlice(norm_data, head_idx, d_head, d_inner);
                 try cpu_gated_delta.applyGatedRmsNormInPlace(out_head, z_head, norm_head);
             }
+            if (trace_enabled) {
+                trace.emit(
+                    .gdelta_norm,
+                    self.layer_idx,
+                    0,
+                    @intCast(t),
+                    @ptrCast(ssm_out.ptr),
+                    .f32,
+                    .{ 1, 1, @intCast(d_inner), 0 },
+                    3,
+                    null,
+                );
+            }
 
             var ssm_view = Tensor.view2DSlice(ssm_out, 1, d_inner);
             var out_view = Tensor.view2DSlice(output_data, 1, d_model);
             self.matmul_out_proj(&ssm_view, w.out_proj, &out_view, matmul_scratch);
+            if (trace_enabled) {
+                trace.emitWithWork(
+                    .gdelta_out,
+                    self.layer_idx,
+                    0,
+                    @intCast(t),
+                    out_view.data().ptr,
+                    .f32,
+                    .{ 1, 1, @intCast(d_model), 0 },
+                    3,
+                    null,
+                    matmulWork(1, d_inner, d_model, w.out_proj),
+                );
+            }
         }
     }
 };

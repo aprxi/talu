@@ -468,9 +468,6 @@ pub fn main() !void {
     if (cfg.format == .table) {
         try stdout.writeAll("------------------------------------------------------------------------\n");
         try stdout.print("peak GB/s: {d:.2} ({s})  peak TF/s: {d:.4} ({s})\n", .{ peaks.gbps, peaks.gbps_name, peaks.tflops, peaks.tflops_name });
-        if (cfg.run.model_id) |model_id| {
-            try printPresetMapping(stdout, model_id);
-        }
         try stdout.writeAll("Legend:\n");
         try stdout.writeAll("  loops   : inner kernel repeats per measured sample. Higher means less timer noise.\n");
         try stdout.writeAll("  warm_us : warm-path p50 eval latency (us). Lower is better.\n");
@@ -480,23 +477,6 @@ pub fn main() !void {
         try stdout.writeAll("  TF/s    : flops_it / eval_p50_ns / 1000. Higher is better for compute-bound.\n");
         try stdout.writeAll("  MB_it   : per-iteration bytes in decimal MB.\n");
         try stdout.writeAll("  MF_it   : per-iteration flops in decimal MF.\n");
-    }
-}
-
-fn printPresetMapping(writer: anytype, model_id: []const u8) !void {
-    const hints = models.performanceHintsByName(model_id) orelse return;
-    try writer.writeAll("Xray Alignment\n");
-    for (hints.prefill_point_mappings) |mapping| {
-        try writer.print("  {s: <14} -> {s}\n", .{ mapping.point, mapping.bench_row });
-    }
-    for (hints.prefill_hidden_rows) |row_name| {
-        try writer.print("  {s: <14} -> {s}\n", .{ "hidden", row_name });
-    }
-    for (hints.decode_point_mappings) |mapping| {
-        try writer.print("  {s: <14} -> {s}\n", .{ mapping.point, mapping.bench_row });
-    }
-    for (hints.decode_hidden_rows) |row_name| {
-        try writer.print("  {s: <14} -> {s}\n", .{ "hidden", row_name });
     }
 }
 fn scenarioFromBenchRowName(name: []const u8) ?scenarios.Scenario {

@@ -54,7 +54,10 @@ fn byte_level_variant_json_internal(
         if use_regex { "true" } else { "false" }
     );
     build_byte_level_tokenizer_json()
-        .replace("\"normalizer\": null,", &format!("\"normalizer\": {normalizer},"))
+        .replace(
+            "\"normalizer\": null,",
+            &format!("\"normalizer\": {normalizer},"),
+        )
         .replace(
             "\"pre_tokenizer\": {\"type\": \"ByteLevel\", \"add_prefix_space\": false},",
             &format!("\"pre_tokenizer\": {pre},"),
@@ -88,13 +91,7 @@ fn byte_level_variant_json_with_decoder_mode(
             byte_level
         ),
     };
-    byte_level_variant_json_internal(
-        lowercase,
-        clean_text,
-        add_prefix_space,
-        use_regex,
-        &decoder,
-    )
+    byte_level_variant_json_internal(lowercase, clean_text, add_prefix_space, use_regex, &decoder)
 }
 
 fn assert_subprocess_test_ok(test_name: &str, env_key: &str, env_val: &str) {
@@ -1565,37 +1562,60 @@ fn run_byte_level_pipeline_variant_configs_are_deterministic_inner() {
                             );
 
                             if first.error_msg.is_null() {
-                                let first_ids: Vec<u32> = if first.ids.is_null() || first.num_tokens == 0 {
-                                    Vec::new()
-                                } else {
-                                    unsafe { std::slice::from_raw_parts(first.ids, first.num_tokens) }.to_vec()
-                                };
-                                let second_ids: Vec<u32> = if second.ids.is_null() || second.num_tokens == 0 {
-                                    Vec::new()
-                                } else {
-                                    unsafe { std::slice::from_raw_parts(second.ids, second.num_tokens) }.to_vec()
-                                };
-                                assert_eq!(first_ids, second_ids, "variant IDs must match for deterministic encode");
-
-                                let first_offsets: Vec<(u32, u32)> =
-                                    if first.offsets.is_null() || first.num_tokens == 0 {
+                                let first_ids: Vec<u32> =
+                                    if first.ids.is_null() || first.num_tokens == 0 {
                                         Vec::new()
                                     } else {
-                                        unsafe { std::slice::from_raw_parts(first.offsets, first.num_tokens) }
-                                            .iter()
-                                            .map(|off| (off.start, off.end))
-                                            .collect()
+                                        unsafe {
+                                            std::slice::from_raw_parts(first.ids, first.num_tokens)
+                                        }
+                                        .to_vec()
                                     };
+                                let second_ids: Vec<u32> = if second.ids.is_null()
+                                    || second.num_tokens == 0
+                                {
+                                    Vec::new()
+                                } else {
+                                    unsafe {
+                                        std::slice::from_raw_parts(second.ids, second.num_tokens)
+                                    }
+                                    .to_vec()
+                                };
+                                assert_eq!(
+                                    first_ids, second_ids,
+                                    "variant IDs must match for deterministic encode"
+                                );
+
+                                let first_offsets: Vec<(u32, u32)> = if first.offsets.is_null()
+                                    || first.num_tokens == 0
+                                {
+                                    Vec::new()
+                                } else {
+                                    unsafe {
+                                        std::slice::from_raw_parts(first.offsets, first.num_tokens)
+                                    }
+                                    .iter()
+                                    .map(|off| (off.start, off.end))
+                                    .collect()
+                                };
                                 let second_offsets: Vec<(u32, u32)> =
                                     if second.offsets.is_null() || second.num_tokens == 0 {
                                         Vec::new()
                                     } else {
-                                        unsafe { std::slice::from_raw_parts(second.offsets, second.num_tokens) }
-                                            .iter()
-                                            .map(|off| (off.start, off.end))
-                                            .collect()
+                                        unsafe {
+                                            std::slice::from_raw_parts(
+                                                second.offsets,
+                                                second.num_tokens,
+                                            )
+                                        }
+                                        .iter()
+                                        .map(|off| (off.start, off.end))
+                                        .collect()
                                     };
-                                assert_eq!(first_offsets, second_offsets, "variant offsets must match for deterministic encode");
+                                assert_eq!(
+                                    first_offsets, second_offsets,
+                                    "variant offsets must match for deterministic encode"
+                                );
                             }
 
                             unsafe {

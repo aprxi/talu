@@ -146,7 +146,11 @@ fn tokenize_embedded_nul_uses_safe_bytelevel_surface() {
     let ids = ctx.encode_with(text, &no_bos());
     assert_eq!(
         ids,
-        vec![byte_token_id(b'a'), byte_token_id(0x00), byte_token_id(b'b')],
+        vec![
+            byte_token_id(b'a'),
+            byte_token_id(0x00),
+            byte_token_id(b'b')
+        ],
         "embedded NUL must remain represented in byte-level ID stream"
     );
 }

@@ -22,6 +22,30 @@ const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capt
 const Tensor = tensor.Tensor;
 const MatmulFn = cpu_linalg.MatmulFn;
 
+fn saturatingU64FromU128(value: u128) u64 {
+    return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
+}
+
+fn tensorStorageBytes(weight: *const Tensor) u64 {
+    var bytes: u128 = @intCast(weight.data_size);
+    if (weight.gaffine) |meta| {
+        bytes += meta.scales.len;
+        bytes += meta.biases.len;
+    }
+    return saturatingU64FromU128(bytes);
+}
+
+fn matmulWork(rows: usize, k: usize, n: usize, weight: *const Tensor) trace.Work {
+    const rows128: u128 = @intCast(rows);
+    const k128: u128 = @intCast(k);
+    const n128: u128 = @intCast(n);
+    const flops = saturatingU64FromU128(2 * rows128 * k128 * n128);
+    const input_bytes = rows128 * k128 * @sizeOf(f32);
+    const output_bytes = rows128 * n128 * @sizeOf(f32);
+    const bytes = saturatingU64FromU128(input_bytes + output_bytes + @as(u128, tensorStorageBytes(weight)));
+    return .{ .flops = flops, .bytes = bytes };
+}
+
 pub const GateUpLayout = enum {
     concat,
     interleaved,
@@ -81,6 +105,7 @@ pub const SwiGLU = struct {
         std.debug.assert(input_tensor.n_dims == 3 and output_tensor.n_dims == 3);
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1); // Only batch=1 supported
         const sequence_len: usize = @intCast(input_tensor.shape[1]);
+        const trace_enabled = trace.isEnabled();
         std.debug.assert(input_tensor.shape[2] == self.d_model and output_tensor.shape[2] == self.d_model);
 
         const use_fused_gate_up = if (self.fused_gate_up) |fg| blk: {
@@ -121,12 +146,40 @@ pub const SwiGLU = struct {
             fused_kernel(&input_view, &fused_weight, &gate_up_output, matmul_scratch);
             gate_output = gate_up_output;
             up_output = gate_up_output;
+            if (trace_enabled) {
+                trace.emitWithWork(
+                    .ffn_gate,
+                    self.layer_idx,
+                    0,
+                    @intCast(sequence_len),
+                    gate_output.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(sequence_len), @intCast(2 * self.d_ff), 0 },
+                    3,
+                    self.kernel_name_gate_up,
+                    matmulWork(sequence_len, self.d_model, 2 * self.d_ff, &fused_weight),
+                );
+            }
         } else {
             const gate_weight = self.w1 orelse return error.MissingFFNWeights;
             var gate_workspace = Tensor.view2DSlice(scratch.gate[0 .. sequence_len * self.d_ff], sequence_len, self.d_ff);
             self.matmul_gate(&input_view, gate_weight, &gate_workspace, matmul_scratch);
             if (self.w1_bias) |bias| cpu_common.addBiasRows(gate_workspace.asSlice(f32), bias, sequence_len, self.d_ff);
             gate_output = gate_workspace;
+            if (trace_enabled) {
+                trace.emitWithWork(
+                    .ffn_gate,
+                    self.layer_idx,
+                    0,
+                    @intCast(sequence_len),
+                    gate_output.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(sequence_len), @intCast(self.d_ff), 0 },
+                    3,
+                    self.kernel_name_gate,
+                    matmulWork(sequence_len, self.d_model, self.d_ff, gate_weight),
+                );
+            }
 
             if (is_dense_only) {
                 up_output = gate_workspace; // unused in dense-only path
@@ -135,41 +188,20 @@ pub const SwiGLU = struct {
                 var up_workspace = Tensor.view2DSlice(scratch.up, sequence_len, self.d_ff);
                 self.matmul_gate(&input_view, up_weight, &up_workspace, matmul_scratch);
                 up_output = up_workspace;
-            }
-        }
-
-        if (trace.isEnabled()) {
-            const gate_dim: usize = if (use_fused_gate_up) 2 * self.d_ff else self.d_ff;
-            // Get kernel name for gate/up operation
-            const kernel_name: ?[]const u8 = if (use_fused_gate_up)
-                self.kernel_name_gate_up
-            else
-                self.kernel_name_gate;
-            trace.emit(
-                .ffn_gate,
-                self.layer_idx,
-                0,
-                @intCast(sequence_len),
-                gate_output.data().ptr,
-                .f32,
-                .{ 1, @intCast(sequence_len), @intCast(gate_dim), 0 },
-                3,
-                kernel_name,
-            );
-            // Emit ffn_up only for split path (separate up projection)
-            // In fused path, gate+up are a single matmul already reported by ffn_gate
-            if (!use_fused_gate_up) {
-                trace.emit(
-                    .ffn_up,
-                    self.layer_idx,
-                    0,
-                    @intCast(sequence_len),
-                    up_output.data().ptr,
-                    .f32,
-                    .{ 1, @intCast(sequence_len), @intCast(self.d_ff), 0 },
-                    3,
-                    self.kernel_name_gate,
-                );
+                if (trace_enabled) {
+                    trace.emitWithWork(
+                        .ffn_up,
+                        self.layer_idx,
+                        0,
+                        @intCast(sequence_len),
+                        up_output.data().ptr,
+                        .f32,
+                        .{ 1, @intCast(sequence_len), @intCast(self.d_ff), 0 },
+                        3,
+                        self.kernel_name_gate,
+                        matmulWork(sequence_len, self.d_model, self.d_ff, up_weight),
+                    );
+                }
             }
         }
 
@@ -232,12 +264,36 @@ pub const SwiGLU = struct {
                 const gate_values = gate_output.asSlice(f32);
                 const gate_activation_values = gate_activation_view.asSlice(f32);
                 cpu_activation.geluMap(gate_values, gate_activation_values);
+                if (trace_enabled) {
+                    trace.emit(
+                        .ffn_act_map,
+                        self.layer_idx,
+                        0,
+                        @intCast(sequence_len),
+                        gate_activation_view.data().ptr,
+                        .f32,
+                        .{ 1, @intCast(sequence_len), @intCast(self.d_ff), 0 },
+                        3,
+                        null,
+                    );
+                }
             } else if (self.use_swiglu_variant) {
                 const gate = gate_output.asSlice(f32)[0..hidden_element_count];
                 const up = up_output.asSlice(f32)[0..hidden_element_count];
                 cpu_activation.swigluVariantSplit(gate, up, scratch.hidden[0..hidden_element_count]);
                 hidden_output = Tensor.view2DSlice(scratch.hidden[0..hidden_element_count], sequence_len, self.d_ff);
-                if (trace.isEnabled()) {
+                if (trace_enabled) {
+                    trace.emit(
+                        .ffn_act_mix,
+                        self.layer_idx,
+                        0,
+                        @intCast(sequence_len),
+                        hidden_output.data().ptr,
+                        .f32,
+                        .{ 1, @intCast(sequence_len), @intCast(self.d_ff), 0 },
+                        3,
+                        null,
+                    );
                     trace.emit(
                         .ffn_act,
                         self.layer_idx,
@@ -253,8 +309,8 @@ pub const SwiGLU = struct {
                 var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), sequence_len, self.d_model);
                 self.matmul_down(&hidden_output, self.w2, &out_view, matmul_scratch);
                 if (self.w2_bias) |bias| cpu_common.addBiasRows(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
-                if (trace.isEnabled()) {
-                    trace.emit(
+                if (trace_enabled) {
+                    trace.emitWithWork(
                         .ffn_down,
                         self.layer_idx,
                         0,
@@ -264,6 +320,7 @@ pub const SwiGLU = struct {
                         .{ 1, @intCast(sequence_len), @intCast(self.d_model), 0 },
                         3,
                         self.kernel_name_down,
+                        matmulWork(sequence_len, self.d_ff, self.d_model, self.w2),
                     );
                 }
                 // Dump capture (compiled in only for dump binary)
@@ -274,6 +331,19 @@ pub const SwiGLU = struct {
                 return;
             } else {
                 cpu_activation.siluMap(gate_output.asSlice(f32), gate_activation_view.asSlice(f32));
+                if (trace_enabled) {
+                    trace.emit(
+                        .ffn_act_map,
+                        self.layer_idx,
+                        0,
+                        @intCast(sequence_len),
+                        gate_activation_view.data().ptr,
+                        .f32,
+                        .{ 1, @intCast(sequence_len), @intCast(self.d_ff), 0 },
+                        3,
+                        null,
+                    );
+                }
             }
 
             if (is_dense_only) {
@@ -289,7 +359,18 @@ pub const SwiGLU = struct {
             }
         }
 
-        if (trace.isEnabled()) {
+        if (trace_enabled) {
+            trace.emit(
+                .ffn_act_mix,
+                self.layer_idx,
+                0,
+                @intCast(sequence_len),
+                hidden_output.data().ptr,
+                .f32,
+                .{ 1, @intCast(sequence_len), @intCast(self.d_ff), 0 },
+                3,
+                null,
+            );
             trace.emit(
                 .ffn_act,
                 self.layer_idx,
@@ -306,8 +387,8 @@ pub const SwiGLU = struct {
         var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), sequence_len, self.d_model);
         self.matmul_down(&hidden_output, self.w2, &out_view, matmul_scratch);
         if (self.w2_bias) |bias| cpu_common.addBiasRows(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
-        if (trace.isEnabled()) {
-            trace.emit(
+        if (trace_enabled) {
+            trace.emitWithWork(
                 .ffn_down,
                 self.layer_idx,
                 0,
@@ -317,6 +398,7 @@ pub const SwiGLU = struct {
                 .{ 1, @intCast(sequence_len), @intCast(self.d_model), 0 },
                 3,
                 self.kernel_name_down,
+                matmulWork(sequence_len, self.d_ff, self.d_model, self.w2),
             );
         }
         // Dump capture (compiled in only for dump binary)

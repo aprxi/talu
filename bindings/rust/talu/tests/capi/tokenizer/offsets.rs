@@ -1180,7 +1180,10 @@ fn offsets_wordpiece_clean_text_crlf_maps_to_original_bytes() {
 
     let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null(), "encode failed");
-    assert_eq!(result.num_tokens, 2, "CR/LF cleanup should still yield A and B");
+    assert_eq!(
+        result.num_tokens, 2,
+        "CR/LF cleanup should still yield A and B"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
     assert_eq!(ids, &[1, 2]);
@@ -1253,7 +1256,11 @@ fn offsets_whitespace_removed_then_template_specials_stay_synthetic() {
     assert_eq!(ids, &[1, 2]);
     let special =
         unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
-    assert_eq!(special, &[1, 1], "both output tokens must be marked special");
+    assert_eq!(
+        special,
+        &[1, 1],
+        "both output tokens must be marked special"
+    );
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!((offsets[0].start, offsets[0].end), (0, 0));
     assert_eq!((offsets[1].start, offsets[1].end), (0, 0));
@@ -1754,7 +1761,10 @@ fn byte_fallback_truncation_preserves_utf8_sliceable_offsets_for_partial_emoji()
     };
     let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &opts) };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.num_tokens, 3, "A + two fallback bytes after truncation");
+    assert_eq!(
+        result.num_tokens, 3,
+        "A + two fallback bytes after truncation"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
     assert_eq!(ids, &[1, 10, 11]);
@@ -1814,7 +1824,10 @@ fn byte_level_truncation_mid_emoji_decodes_safely_with_replacement() {
     assert_eq!((offsets[1].start, offsets[1].end), (1, 2));
     assert_eq!((offsets[2].start, offsets[2].end), (2, 3));
 
-    assert!(input.get(0..1).is_some(), "ASCII slice must be UTF-8 sliceable");
+    assert!(
+        input.get(0..1).is_some(),
+        "ASCII slice must be UTF-8 sliceable"
+    );
     assert!(
         input.get(1..2).is_none() && input.get(2..3).is_none(),
         "mid-emoji byte offsets are expected to be non-sliceable in byte-level mode"
@@ -2059,7 +2072,9 @@ fn byte_level_offsets_are_intrinsically_non_sliceable_for_multibyte_chars() {
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     // At least one span must bisect a UTF-8 scalar boundary.
     assert!(
-        offsets.iter().any(|off| input.get(off.start as usize..off.end as usize).is_none()),
+        offsets
+            .iter()
+            .any(|off| input.get(off.start as usize..off.end as usize).is_none()),
         "byte-level byte-span offsets should not all be UTF-8-sliceable for multibyte input"
     );
     assert!(
@@ -2108,7 +2123,10 @@ fn offsets_wordpiece_zalgo_combining_marks_are_sliceable() {
 
     let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null(), "encode failed on zalgo input");
-    assert!(result.num_tokens > 0, "zalgo input must emit at least one token");
+    assert!(
+        result.num_tokens > 0,
+        "zalgo input must emit at least one token"
+    );
 
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     let mut prev_end = 0usize;
@@ -2171,8 +2189,14 @@ fn offsets_wordpiece_bidi_and_zwj_are_sliceable() {
     let input = "ab\u{202E}cd👨\u{200D}👩\u{200D}👧\u{200D}👦ef";
 
     let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
-    assert!(result.error_msg.is_null(), "encode failed on BiDi/ZWJ input");
-    assert!(result.num_tokens > 0, "BiDi/ZWJ input must emit at least one token");
+    assert!(
+        result.error_msg.is_null(),
+        "encode failed on BiDi/ZWJ input"
+    );
+    assert!(
+        result.num_tokens > 0,
+        "BiDi/ZWJ input must emit at least one token"
+    );
 
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     let mut prev_end = 0usize;

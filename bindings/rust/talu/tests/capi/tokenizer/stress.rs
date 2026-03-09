@@ -137,7 +137,10 @@ fn run_bpe_parallel_chunking_digest_inner() {
     // when THREADS>1 in the tokenizer's global parallel pool.
     let input = "a".repeat(20_480);
     let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &opts) };
-    assert!(result.error_msg.is_null(), "parallel digest encode must succeed");
+    assert!(
+        result.error_msg.is_null(),
+        "parallel digest encode must succeed"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
     let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
@@ -246,7 +249,9 @@ fn bpe_parallel_chunking_thread_counts_match_sequential_digest() {
         let marker = stdout
             .lines()
             .find(|line| line.starts_with("BPE_PARALLEL_DIGEST="))
-            .unwrap_or_else(|| panic!("digest marker missing for THREADS={threads}\nstdout:\n{stdout}"))
+            .unwrap_or_else(|| {
+                panic!("digest marker missing for THREADS={threads}\nstdout:\n{stdout}")
+            })
             .to_string();
 
         if let Some(base) = &baseline {
@@ -294,7 +299,9 @@ fn bpe_parallel_chunking_multibyte_thread_counts_match_sequential_digest() {
         let marker = stdout
             .lines()
             .find(|line| line.starts_with("BPE_PARALLEL_MB_DIGEST="))
-            .unwrap_or_else(|| panic!("multibyte digest marker missing for THREADS={threads}\nstdout:\n{stdout}"))
+            .unwrap_or_else(|| {
+                panic!("multibyte digest marker missing for THREADS={threads}\nstdout:\n{stdout}")
+            })
             .to_string();
 
         if let Some(base) = &baseline {
@@ -360,9 +367,7 @@ fn bpe_massive_word_merges_in_subquadratic_time() {
             assert_eq!(len, 30_000, "60k 'a's should reduce to 30k 'aa' tokens");
         }
         Err(_) => {
-            panic!(
-                "BPE algorithmic DoS vulnerability detected: merge exceeded 500ms budget"
-            );
+            panic!("BPE algorithmic DoS vulnerability detected: merge exceeded 500ms budget");
         }
     }
 }
@@ -1062,7 +1067,8 @@ fn concurrent_encode_lockstep_same_input_pointer_forced_contention() {
         handles.push(thread::spawn(move || {
             for i in 0..iterations {
                 start_barrier.wait();
-                let result = unsafe { super::common::encode_raw(shared.ptr(), input.as_slice(), &opts) };
+                let result =
+                    unsafe { super::common::encode_raw(shared.ptr(), input.as_slice(), &opts) };
                 assert!(
                     result.error_msg.is_null(),
                     "thread {thread_id} iter {i}: encode failed"
@@ -1473,10 +1479,7 @@ fn run_file_loader_first_encode_concurrent_race_inner(threads: usize) {
 
     let mut handle: *mut c_void = ptr::null_mut();
     let rc = unsafe {
-        talu_sys::talu_tokenizer_create(
-            model_path.as_ptr(),
-            &mut handle as *mut _ as *mut c_void,
-        )
+        talu_sys::talu_tokenizer_create(model_path.as_ptr(), &mut handle as *mut _ as *mut c_void)
     };
     assert_eq!(
         rc, 0,

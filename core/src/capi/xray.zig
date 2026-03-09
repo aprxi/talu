@@ -48,6 +48,8 @@ pub const CapturedTensorInfo = extern struct {
     ndim: u8,
     dtype: u8,
     kernel_name: [48]u8,
+    work_flops: u64,
+    work_bytes: u64,
     stats: TensorStats,
     timestamp_ns: i64,
 };
@@ -311,6 +313,8 @@ fn capturedToInfo(record: *const capture.CapturedTensor) CapturedTensorInfo {
     info.ndim = record.ndim;
     info.dtype = @intFromEnum(record.dtype);
     info.kernel_name = record.kernel_name;
+    info.work_flops = record.work_flops;
+    info.work_bytes = record.work_bytes;
     info.stats.count = record.stats.count;
     info.stats.min = record.stats.min;
     info.stats.max = record.stats.max;
@@ -326,12 +330,14 @@ fn capturedToInfo(record: *const capture.CapturedTensor) CapturedTensorInfo {
 // Capture Mode Constants
 // =============================================================================
 
+/// CaptureMode.timing - metadata/timing only (no stats/value scans)
+pub const CAPTURE_MODE_TIMING: u8 = 0;
 /// CaptureMode.stats - statistics only
-pub const CAPTURE_MODE_STATS: u8 = 0;
+pub const CAPTURE_MODE_STATS: u8 = 1;
 /// CaptureMode.sample - statistics + first N values
-pub const CAPTURE_MODE_SAMPLE: u8 = 1;
+pub const CAPTURE_MODE_SAMPLE: u8 = 2;
 /// CaptureMode.full - complete tensor copy
-pub const CAPTURE_MODE_FULL: u8 = 2;
+pub const CAPTURE_MODE_FULL: u8 = 3;
 
 // =============================================================================
 // Point Constants (for bitmask)
@@ -362,4 +368,11 @@ pub const POINT_LOGITS: u32 = 1 << 21; // lm_head
 pub const POINT_LOGITS_SCALED: u32 = 1 << 22;
 pub const POINT_LOGITS_READY: u32 = 1 << 23;
 pub const POINT_TOKEN_SELECT: u32 = 1 << 24;
-pub const POINT_ALL: u32 = 0x1FFFFFF; // All 25 points
+pub const POINT_LAYER_FFN_ACT_MAP: u32 = 1 << 25;
+pub const POINT_LAYER_FFN_ACT_MIX: u32 = 1 << 26;
+pub const POINT_GDELTA_IN_PROJ: u32 = 1 << 27;
+pub const POINT_GDELTA_CONV: u32 = 1 << 28;
+pub const POINT_GDELTA_SSM: u32 = 1 << 29;
+pub const POINT_GDELTA_NORM: u32 = 1 << 30;
+pub const POINT_GDELTA_OUT: u32 = 1 << 31;
+pub const POINT_ALL: u32 = 0xFFFFFFFF; // All 32 points

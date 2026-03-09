@@ -734,7 +734,10 @@ fn pretokenizer_split_byte_unit_regex_bisected_emoji_is_safe() {
     let input = "A😊B";
 
     let result = unsafe { encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
-    assert!(result.error_msg.is_null(), "encode must succeed on bisected emoji");
+    assert!(
+        result.error_msg.is_null(),
+        "encode must succeed on bisected emoji"
+    );
     assert_eq!(
         result.num_tokens,
         input.len(),
@@ -888,8 +891,7 @@ fn pretokenizer_pcre2_match_limit_exhaustion_returns_error() {
 #[test]
 #[ignore = "expensive OOM-path stress; run manually for malicious-normalizer validation"]
 fn normalizer_exponential_expansion_bomb_is_safely_caught() {
-    let stage =
-        r#"{"type":"Replace","pattern":{"String":"a"},"content":"aaaaa"}"#.to_string();
+    let stage = r#"{"type":"Replace","pattern":{"String":"a"},"content":"aaaaa"}"#.to_string();
     let chain = vec![stage; 20].join(",");
     let normalizer = format!(r#"{{"type":"Sequence","normalizers":[{chain}]}}"#);
     let json = byte_level_with_normalizer(&normalizer);

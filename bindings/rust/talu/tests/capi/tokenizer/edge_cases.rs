@@ -438,7 +438,10 @@ fn byte_level_invalid_utf8_adjacent_bytes_can_merge_when_rule_exists() {
         .and_then(serde_json::Value::as_object_mut)
         .expect("vocab object must exist");
     vocab.insert(merged.clone(), serde_json::json!(merged_id));
-    model.insert("merges".to_string(), serde_json::json!([format!("{left} {right}")]));
+    model.insert(
+        "merges".to_string(),
+        serde_json::json!([format!("{left} {right}")]),
+    );
 
     let json = serde_json::to_string(&value).expect("json serialization must succeed");
     let ctx = TokenizerTestContext::from_json(&json);

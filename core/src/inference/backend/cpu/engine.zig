@@ -1517,6 +1517,19 @@ pub const FusedCpuBackend = struct {
         return self.logits_buffers[offset..][0..self.vocab_size];
     }
 
+    fn saturatingU64FromU128(value: u128) u64 {
+        return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
+    }
+
+    fn tensorStorageBytes(weight: *const Tensor) u64 {
+        var bytes: u128 = @intCast(weight.data_size);
+        if (weight.gaffine) |meta| {
+            bytes += meta.scales.len;
+            bytes += meta.biases.len;
+        }
+        return saturatingU64FromU128(bytes);
+    }
+
     fn computeLogitsFromHiddenRows(
         self: *FusedCpuBackend,
         hidden_rows: []const f32,
@@ -1555,9 +1568,20 @@ pub const FusedCpuBackend = struct {
         }
 
         if (trace.isEnabled()) {
+            const rows128: u128 = @intCast(row_count);
+            const d_model128: u128 = @intCast(self.d_model);
+            const vocab128: u128 = @intCast(self.vocab_size);
+            const total_flops = saturatingU64FromU128(2 * rows128 * d_model128 * vocab128);
+            const total_bytes = saturatingU64FromU128(
+                rows128 * d_model128 * @sizeOf(f32) +
+                    @as(u128, tensorStorageBytes(lm_head_ptr)) +
+                    rows128 * vocab128 * @sizeOf(f32),
+            );
+            const per_row_flops = if (row_count > 0) total_flops / @as(u64, @intCast(row_count)) else 0;
+            const per_row_bytes = if (row_count > 0) total_bytes / @as(u64, @intCast(row_count)) else 0;
             for (0..row_count) |row_index| {
                 const row_logits = logits_out[row_index * self.vocab_size ..][0..self.vocab_size];
-                trace.emitFinal(
+                trace.emitFinalWithWork(
                     .lm_head,
                     @intCast(row_index),
                     0,
@@ -1566,6 +1590,7 @@ pub const FusedCpuBackend = struct {
                     .{ @intCast(self.vocab_size), 0, 0, 0 },
                     1,
                     lm_head_kernel_name,
+                    .{ .flops = per_row_flops, .bytes = per_row_bytes },
                 );
                 if (self.loaded.config.logits_scaling != 1.0) {
                     trace.emitFinal(

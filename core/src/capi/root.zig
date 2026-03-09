@@ -502,6 +502,7 @@ pub const talu_xray_point_name = xray.talu_xray_point_name;
 pub const XrayCaptureHandle = xray.CaptureHandle;
 pub const XrayTensorStats = xray.TensorStats;
 pub const XrayCapturedTensorInfo = xray.CapturedTensorInfo;
+pub const XRAY_CAPTURE_MODE_TIMING = xray.CAPTURE_MODE_TIMING;
 pub const XRAY_CAPTURE_MODE_STATS = xray.CAPTURE_MODE_STATS;
 pub const XRAY_CAPTURE_MODE_SAMPLE = xray.CAPTURE_MODE_SAMPLE;
 pub const XRAY_CAPTURE_MODE_FULL = xray.CAPTURE_MODE_FULL;
