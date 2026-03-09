@@ -514,12 +514,6 @@ static void apply_attention_rope(
     if (use_runtime_rope && (rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0)) {
         use_runtime_rope = false;
     }
-    // Decode correctness guard:
-    // seq_len==1 path in runtime-table rope can drift numerically for some
-    // query-gated models (e.g. qwen3.5). Keep decode on fast::rope.
-    if (seq_len == 1) {
-        use_runtime_rope = false;
-    }
     if (use_runtime_rope) {
         const auto& cos_table = *static_cast<const array*>(runtime_rope_cos);
         const auto& sin_table = *static_cast<const array*>(runtime_rope_sin);

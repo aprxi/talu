@@ -5,9 +5,11 @@
 
 const std = @import("std");
 const models = @import("../../../models/root.zig");
+const rope_scaling = @import("../../../models/rope_scaling.zig");
 const contract = @import("../contract.zig");
 const tensor = @import("../../../tensor.zig");
 const common_mrope = @import("vision/mrope.zig");
+const cpu_math_rope = @import("../../../compute/cpu/math_rope.zig");
 const ModelConfig = tensor.ModelConfig;
 const log = @import("../../../log.zig");
 const trace = @import("../../../xray/trace.zig");
@@ -70,6 +72,7 @@ pub const MetalBackend = struct {
     state_runtime_roles: [MaxStateDescriptors]StateRuntimeRole,
     state_descriptor_count: u8,
     slot0_state_binding: SlotStateBinding = .{},
+    text_runtime_rope: ?cpu_math_rope.RoPE = null,
 
     // Track position for decode
     current_position: usize,
@@ -143,6 +146,49 @@ pub const MetalBackend = struct {
         return config_max_seq_len;
     }
 
+    fn buildTextRuntimeRoPE(_: std.mem.Allocator, loaded: *LoadedModel) !?cpu_math_rope.RoPE {
+        const rope_allocator = std.heap.c_allocator;
+        if (loaded.position_embeddings != null) return null;
+        const rope_dim: usize = if (loaded.config.rope_dim > 0)
+            @intCast(loaded.config.rope_dim)
+        else
+            @intCast(loaded.config.head_dim);
+        if (rope_dim == 0) return null;
+
+        var freqs = try rope_scaling.materializeInverseFrequencies(
+            rope_allocator,
+            rope_dim,
+            loaded.config.rope_theta,
+            loaded.config.rope_scaling,
+        );
+        defer freqs.deinit(rope_allocator);
+
+        return try cpu_math_rope.RoPE.initFromInvFreq(
+            rope_allocator,
+            rope_dim,
+            @intCast(loaded.config.max_seq_len),
+            freqs.inv_freq,
+            freqs.attention_scaling,
+        );
+    }
+
+    fn textRuntimeRoPEOverride(self: *MetalBackend, pos_offset: usize, sequence_len: usize) ?runtime_trait.RuntimeRoPEOverride {
+        if (sequence_len == 0) return null;
+        if (self.text_runtime_rope) |*rope| {
+            const max_pos = pos_offset + (sequence_len - 1);
+            _ = rope.getCos(max_pos);
+            _ = rope.getSin(max_pos);
+            const rows = max_pos + 1;
+            const table_len = rows * rope.dim;
+            return .{
+                .cos = rope.freqs_cos[0..table_len],
+                .sin = rope.freqs_sin[0..table_len],
+                .dim = rope.dim,
+            };
+        }
+        return null;
+    }
+
     fn primeBoundSlotExecutionGraph(self: *MetalBackend, slot_index: usize) !void {
         if (self.state_descriptor_count == 0) return;
         const prime_shapes = [_]usize{ 1, 21 };
@@ -150,27 +196,34 @@ pub const MetalBackend = struct {
             const prime_tokens = try self.allocator.alloc(u32, prime_seq_len);
             defer self.allocator.free(prime_tokens);
             @memset(prime_tokens, 0);
+            const prime_rope = self.textRuntimeRoPEOverride(0, prime_seq_len);
             if (prime_seq_len == 1) {
                 // Decode warmup: warm the single-token logits path used by decodeSlot.
-                const prime_logits = try runtime_trait.transformerForwardLazy(
+                const prime_logits = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
                     self.allocator,
                     self.weights,
                     prime_tokens,
                     try self.slotStateBlocks(slot_index),
                     self.config,
                     0,
+                    null,
+                    null,
+                    prime_rope,
                 );
                 defer graph.freeArray(prime_logits);
                 graph.eval(&[_]graph.ArrayHandle{prime_logits});
             } else {
                 // Prefill warmup: warm the hidden prefill graph used by prefill.
-                const prime_hidden = try runtime_trait.transformerForwardHiddenLazy(
+                const prime_hidden = try runtime_trait.transformerForwardHiddenLazyWithEmbeddingOverride(
                     self.allocator,
                     self.weights,
                     prime_tokens,
                     try self.slotStateBlocks(slot_index),
                     self.config,
                     0,
+                    null,
+                    null,
+                    prime_rope,
                 );
                 defer graph.freeArray(prime_hidden);
                 graph.eval(&[_]graph.ArrayHandle{prime_hidden});
@@ -461,14 +514,18 @@ pub const MetalBackend = struct {
         const t_reset_done_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
         const use_direct_prefill_logits = std.posix.getenv("TALU_METAL_PREFILL_DIRECT_LOGITS") != null;
+        const runtime_rope_ctx = self.textRuntimeRoPEOverride(0, sequence_len);
         const logits_handle = if (use_direct_prefill_logits) blk: {
-            const full_logits = try runtime_trait.transformerForwardLazy(
+            const full_logits = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
                 self.allocator,
                 self.weights,
                 tokens,
                 try self.slotStateBlocks(slot_index),
                 self.config,
                 0, // pos_offset
+                null,
+                null,
+                runtime_rope_ctx,
             );
             const last_logits = graph.mlx_lazy_slice_last(full_logits);
             if (last_logits == full_logits) {
@@ -477,13 +534,16 @@ pub const MetalBackend = struct {
             graph.freeArray(full_logits);
             break :blk last_logits;
         } else blk: {
-            const hidden_handle = try runtime_trait.transformerForwardHiddenLazy(
+            const hidden_handle = try runtime_trait.transformerForwardHiddenLazyWithEmbeddingOverride(
                 self.allocator,
                 self.weights,
                 tokens,
                 try self.slotStateBlocks(slot_index),
                 self.config,
                 0, // pos_offset
+                null,
+                null,
+                runtime_rope_ctx,
             );
             defer graph.freeArray(hidden_handle);
             var starts: [3]c_int = .{ 0, @intCast(sequence_len - 1), 0 };
@@ -570,13 +630,17 @@ pub const MetalBackend = struct {
         defer _ = trace.setBackendContext(prev_backend);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
-        const logits_handle = try runtime_trait.transformerForwardLazy(
+        const runtime_rope_ctx = self.textRuntimeRoPEOverride(effective_position, 1);
+        const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
             self.allocator,
             self.weights,
             &[_]u32{token},
             try self.slotStateBlocks(slot_index),
             self.config,
             effective_position,
+            null,
+            null,
+            runtime_rope_ctx,
         );
         defer graph.freeArray(logits_handle);
         graph.eval(&[_]graph.ArrayHandle{logits_handle});
@@ -605,13 +669,17 @@ pub const MetalBackend = struct {
         defer _ = trace.setBackendContext(prev_backend);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
-        const logits_handle = try runtime_trait.transformerForwardLazy(
+        const runtime_rope_ctx = self.textRuntimeRoPEOverride(effective_position, 1);
+        const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
             self.allocator,
             self.weights,
             &[_]u32{token},
             try self.slotStateBlocks(slot_index),
             self.config,
             effective_position,
+            null,
+            null,
+            runtime_rope_ctx,
         );
         defer graph.freeArray(logits_handle);
 
@@ -646,6 +714,7 @@ pub const MetalBackend = struct {
         sampling_config: *const metal_sampling.SamplingConfig,
     ) bool {
         _ = self;
+        if (std.posix.getenv("TALU_PARITY_DEBUG") != null) return false;
         return sampling_config.strategy == .top_k and
             sampling_config.top_k > 0 and
             sampling_config.temperature > 0.0 and
@@ -666,13 +735,17 @@ pub const MetalBackend = struct {
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         const effective_position = try common_mrope.applyPositionDelta(slot_position.*, slot_rope_delta.*);
-        const logits_handle = try runtime_trait.transformerForwardLazy(
+        const runtime_rope_ctx = self.textRuntimeRoPEOverride(effective_position, 1);
+        const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
             self.allocator,
             self.weights,
             &[_]u32{token},
             try self.slotStateBlocks(slot_index),
             self.config,
             effective_position,
+            null,
+            null,
+            runtime_rope_ctx,
         );
         defer graph.freeArray(logits_handle);
 
@@ -724,6 +797,7 @@ pub const MetalBackend = struct {
 
     pub fn supportsSchedulerBackendDecodeStreamingRoute(self: *const MetalBackend) bool {
         _ = self;
+        if (std.posix.getenv("TALU_PARITY_DEBUG") != null) return false;
         return true;
     }
 
@@ -742,6 +816,8 @@ pub const MetalBackend = struct {
         const layer_count: usize = @intCast(loaded.config.n_layers);
         const max_seq_len: usize = @intCast(loaded.config.max_seq_len);
         const cache_max_seq_len = resolveCacheMaxSeqLen(max_seq_len);
+        var text_runtime_rope = try buildTextRuntimeRoPE(allocator, loaded);
+        errdefer if (text_runtime_rope) |*rope| rope.deinit(std.heap.c_allocator);
         log.debug("inference", "Metal cache capacity policy", .{
             .config_max_seq_len = max_seq_len,
             .cache_max_seq_len = cache_max_seq_len,
@@ -795,12 +871,14 @@ pub const MetalBackend = struct {
             .state_runtime_roles = state_runtime_roles,
             .state_descriptor_count = state_descriptor_count,
             .current_position = 0,
+            .text_runtime_rope = text_runtime_rope,
         };
         errdefer backend.deinit();
         return backend;
     }
 
     pub fn deinit(self: *MetalBackend) void {
+        if (self.text_runtime_rope) |*rope| rope.deinit(std.heap.c_allocator);
         if (self.vision_runtime) |*rt| rt.deinit();
         if (self.slot0_state_binding.bound) {
             self.deinitSlotBindingStateObjects(&self.slot0_state_binding);
