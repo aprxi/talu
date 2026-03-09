@@ -373,6 +373,62 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             return @intCast(sampled);
         }
 
+        fn parityDebugEnabled() bool {
+            return std.posix.getenv("TALU_PARITY_DEBUG") != null;
+        }
+
+        const ParityTopLogit = struct {
+            token_id: u32 = 0,
+            value: f32 = -std.math.inf(f32),
+        };
+
+        fn parityTop3(logits: []const f32) [3]ParityTopLogit {
+            var top = [_]ParityTopLogit{ .{}, .{}, .{} };
+            for (logits, 0..) |value, idx| {
+                const token_id: u32 = @intCast(idx);
+                if (value > top[0].value) {
+                    top[2] = top[1];
+                    top[1] = top[0];
+                    top[0] = .{ .token_id = token_id, .value = value };
+                } else if (value > top[1].value) {
+                    top[2] = top[1];
+                    top[1] = .{ .token_id = token_id, .value = value };
+                } else if (value > top[2].value) {
+                    top[2] = .{ .token_id = token_id, .value = value };
+                }
+            }
+            return top;
+        }
+
+        fn parityLogits(
+            self: *Self,
+            phase: []const u8,
+            position: usize,
+            logits: []const f32,
+            selected: u32,
+            slot_index: usize,
+        ) void {
+            _ = self;
+            if (!parityDebugEnabled()) return;
+            const top = parityTop3(logits);
+            std.debug.print(
+                "PARITY backend={s} phase={s} pos={} slot={} selected={} top0={}({d:.6}) top1={}({d:.6}) top2={}({d:.6})\n",
+                .{
+                    @typeName(BackendType),
+                    phase,
+                    position,
+                    slot_index,
+                    selected,
+                    top[0].token_id,
+                    top[0].value,
+                    top[1].token_id,
+                    top[1].value,
+                    top[2].token_id,
+                    top[2].value,
+                },
+            );
+        }
+
         fn sampleTopKCandidateToken(
             self: *Self,
             candidate_logits: []const f32,
@@ -653,6 +709,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     request_entry.sampling_config,
                     request_entry.grammar_sampler,
                 ) catch 0;
+                self.parityLogits(
+                    "decode",
+                    request_entry.token_position,
+                    result.logits,
+                    next_token,
+                    result.slot_index,
+                );
 
                 if (trace.isEnabled()) {
                     var selected_token = [_]f32{@floatFromInt(next_token)};
@@ -1434,6 +1497,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     request_entry.sampling_config,
                     request_entry.grammar_sampler,
                 ) catch 0;
+                self.parityLogits(
+                    "prefill",
+                    request_entry.token_position,
+                    self.logits_buffer,
+                    first_token_id,
+                    request_entry.slot_index.?,
+                );
                 try request_entry.generated_tokens.append(self.allocator, first_token_id);
 
                 // Check for EOS token
