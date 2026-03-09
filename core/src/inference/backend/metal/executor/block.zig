@@ -80,6 +80,7 @@ pub const TransformerBlock = struct {
 
     const LayerProgramExecutionContext = struct {
         compiled_plan: *const runtime_contract.CompiledPlan,
+        layer_weights: *const LayerWeights,
         layer_idx: usize,
         pos_offset: usize,
         runtime_rope_cos_handle: mlx_graph.ArrayHandle,
@@ -92,6 +93,9 @@ pub const TransformerBlock = struct {
         instruction_views: []runtime_contract.TensorViewDesc,
         runtime_meta: LayerRuntimeMetadata,
         resolved_weight_ptrs: []const ?*anyopaque,
+        rmsnorm_weight_order: [6]?mlx_graph.ArrayHandle = [_]?mlx_graph.ArrayHandle{null} ** 6,
+        rmsnorm_weight_count: usize = 0,
+        rmsnorm_fallback_logged: bool = false,
         state_bindings: [MaxLayerProgramStateBindings]?LayerProgramStateBinding = [_]?LayerProgramStateBinding{null} ** MaxLayerProgramStateBindings,
         state_binding_count: usize = 0,
     };
@@ -388,7 +392,59 @@ pub const TransformerBlock = struct {
         if (slot_idx >= insn.weights.len) return error.InvalidWeightRefIndex;
         const ref_index = insn.weights[slot_idx].index;
         if (ref_index >= ctx.resolved_weight_ptrs.len) return error.InvalidWeightRefIndex;
-        return ctx.resolved_weight_ptrs[ref_index] orelse error.InvalidWeightBindingName;
+        if (ctx.resolved_weight_ptrs[ref_index]) |ptr| return ptr;
+        const binding_key: WeightHandles.LayerProgramWeightBindingKey = if (ref_index < ctx.layer_weights.weight_binding_keys.len)
+            ctx.layer_weights.weight_binding_keys[ref_index]
+        else
+            .invalid;
+        log.warn("inference", "Metal layer-program unresolved weight pointer", .{
+            .layer = ctx.layer_idx,
+            .opcode = @intFromEnum(insn.opcode),
+            .weight_ref_index = ref_index,
+            .weight_slot = slot_idx,
+            .binding_key = @tagName(binding_key),
+            .weights_len = insn.weights.len,
+            .resolved_len = ctx.resolved_weight_ptrs.len,
+        });
+        if (isRecoverableMissingLayerProgramWeight(binding_key)) {
+            return weights_mod.missingOptionalWeightPtr();
+        }
+        return error.InvalidWeightBindingName;
+    }
+
+    fn isRecoverableMissingLayerProgramWeight(
+        key: WeightHandles.LayerProgramWeightBindingKey,
+    ) bool {
+        return switch (key) {
+            .norm_weight,
+            .norm_bias,
+            .attention_q_norm,
+            .attention_k_norm,
+            .attention_q_bias,
+            .attention_k_bias,
+            .attention_v_bias,
+            .attention_o_bias,
+            .attention_attn_sinks,
+            .swiglu_w1_bias,
+            .swiglu_w2_bias,
+            .moe_router_bias,
+            .moe_gate_bias,
+            .moe_up_bias,
+            .moe_down_bias,
+            .moe_router_scales,
+            .moe_router_quant_bias,
+            .mamba_conv_bias,
+            .mamba_dt_bias,
+            .mamba_norm_weight,
+            .mamba_gate_up,
+            .mamba_down_proj,
+            .gated_delta_conv_bias,
+            .gated_delta_dt_bias,
+            .gated_delta_norm_weight,
+            .shortconv_conv_bias,
+            => true,
+            else => false,
+        };
     }
 
     fn isMissingOptionalWeightHandle(handle: runtime_contract.TensorHandle) bool {
@@ -482,6 +538,286 @@ pub const TransformerBlock = struct {
             .one => 1.0,
             .residual_multiplier => residual_multiplier,
             .literal => |value| value,
+        };
+    }
+
+    fn countRmsNormInstructions(plan: *const runtime_contract.ExecutionPlan) usize {
+        var count: usize = 0;
+        for (plan.instructions) |insn| {
+            if (insn.opcode == .rmsnorm) count += 1;
+        }
+        return count;
+    }
+
+    fn buildRmsNormWeightOrder(state: *LayerProgramExecutionContext) void {
+        state.rmsnorm_weight_order = [_]?mlx_graph.ArrayHandle{null} ** 6;
+        state.rmsnorm_weight_count = 0;
+
+        const layer = state.layer_weights;
+        const rmsnorm_instruction_count = countRmsNormInstructions(&state.compiled_plan.plan);
+        const base_rmsnorm_count: usize = 2 +
+            (if (layer.pre_ffn_norm != null) @as(usize, 1) else 0) +
+            (if (layer.post_ffn_norm != null) @as(usize, 1) else 0);
+        const include_qk_norm_in_order = layer.q_norm != null and
+            layer.k_norm != null and
+            rmsnorm_instruction_count > base_rmsnorm_count;
+
+        state.rmsnorm_weight_order[state.rmsnorm_weight_count] = layer.ln1_weight;
+        state.rmsnorm_weight_count += 1;
+
+        if (include_qk_norm_in_order) {
+            if (layer.q_norm) |w| {
+                state.rmsnorm_weight_order[state.rmsnorm_weight_count] = w;
+                state.rmsnorm_weight_count += 1;
+            }
+            if (layer.k_norm) |w| {
+                state.rmsnorm_weight_order[state.rmsnorm_weight_count] = w;
+                state.rmsnorm_weight_count += 1;
+            }
+        }
+
+        state.rmsnorm_weight_order[state.rmsnorm_weight_count] = layer.ln2_weight;
+        state.rmsnorm_weight_count += 1;
+
+        if (layer.pre_ffn_norm) |w| {
+            state.rmsnorm_weight_order[state.rmsnorm_weight_count] = w;
+            state.rmsnorm_weight_count += 1;
+        }
+        if (layer.post_ffn_norm) |w| {
+            state.rmsnorm_weight_order[state.rmsnorm_weight_count] = w;
+            state.rmsnorm_weight_count += 1;
+        }
+    }
+
+    fn normalizeRmsNormWeightForFeatureDim(
+        weight: mlx_graph.ArrayHandle,
+        feature_dim: usize,
+    ) ?mlx_graph.ArrayHandle {
+        if (weight == null or feature_dim == 0) return null;
+        var shape_buf: [8]usize = undefined;
+        const rank = mlx_graph.getShape(weight, &shape_buf);
+        if (rank == 0) return weight;
+
+        var normalized = weight;
+        var dim: usize = 0;
+        if (rank == 1) {
+            dim = shape_buf[0];
+        } else {
+            var flat_count: usize = 1;
+            for (0..rank) |axis| {
+                flat_count *= shape_buf[axis];
+            }
+            if (flat_count == 0) return null;
+            const flat_shape = [_]usize{flat_count};
+            normalized = mlx_graph.mlx_lazy_reshape(weight, &flat_shape, 1);
+            dim = flat_count;
+        }
+
+        if (dim == feature_dim) return normalized;
+        if (feature_dim == dim * 2) return normalized;
+        if (dim > feature_dim and dim % feature_dim == 0) {
+            const starts = [_]c_int{0};
+            const ends = [_]c_int{@intCast(feature_dim)};
+            return mlx_graph.mlx_lazy_slice(normalized, &starts, &ends, 1);
+        }
+        return null;
+    }
+
+    fn selectRmsNormWeightByFeatureWidth(
+        state: *const LayerProgramExecutionContext,
+        feature_dim: usize,
+    ) ?mlx_graph.ArrayHandle {
+        const candidates = [_]?mlx_graph.ArrayHandle{
+            state.layer_weights.ln1_weight,
+            state.layer_weights.ln2_weight,
+            state.layer_weights.q_norm,
+            state.layer_weights.k_norm,
+            state.layer_weights.pre_ffn_norm,
+            state.layer_weights.post_ffn_norm,
+        };
+        for (candidates) |candidate_opt| {
+            const candidate = candidate_opt orelse continue;
+            if (normalizeRmsNormWeightForFeatureDim(candidate, feature_dim)) |normalized| {
+                return normalized;
+            }
+        }
+        return null;
+    }
+
+    fn firstRank1RmsNormWeight(state: *const LayerProgramExecutionContext) ?mlx_graph.ArrayHandle {
+        for (state.rmsnorm_weight_order[0..state.rmsnorm_weight_count]) |candidate_opt| {
+            const candidate = candidate_opt orelse continue;
+            var shape_buf: [8]usize = undefined;
+            const rank = mlx_graph.getShape(candidate, &shape_buf);
+            if (rank == 1 or rank == 0) return candidate;
+        }
+        return null;
+    }
+
+    fn sanitizeAttentionNormWeight(
+        weight_opt: ?mlx_graph.ArrayHandle,
+        expected_width: usize,
+    ) ?mlx_graph.ArrayHandle {
+        const weight = weight_opt orelse return null;
+        if (expected_width == 0) return null;
+
+        var shape_buf: [8]usize = undefined;
+        const rank = mlx_graph.getShape(weight, &shape_buf);
+        if (rank == 0) return null;
+
+        if (rank == 1) {
+            const dim = shape_buf[0];
+            if (dim == expected_width) return weight;
+            if (dim > expected_width) {
+                const starts = [_]c_int{0};
+                const ends = [_]c_int{@intCast(expected_width)};
+                return mlx_graph.mlx_lazy_slice(weight, &starts, &ends, 1);
+            }
+            return null;
+        }
+
+        var flat_count: usize = 1;
+        for (0..rank) |axis| {
+            flat_count *= shape_buf[axis];
+        }
+        if (flat_count < expected_width) return null;
+
+        const flat_shape = [_]usize{flat_count};
+        const flat = mlx_graph.mlx_lazy_reshape(weight, &flat_shape, 1);
+        if (flat_count == expected_width) return flat;
+        const starts = [_]c_int{0};
+        const ends = [_]c_int{@intCast(expected_width)};
+        return mlx_graph.mlx_lazy_slice(flat, &starts, &ends, 1);
+    }
+
+    fn synthesizeRmsNormWeightFromInput(
+        input: mlx_graph.ArrayHandle,
+        input_shape: *const [8]usize,
+        input_rank: usize,
+    ) !mlx_graph.ArrayHandle {
+        if (input_rank == 0) return error.InvalidTensorType;
+        if (input_rank > 8) return error.InvalidTensorType;
+        // Construct a tensor whose flattened element count equals feature width.
+        // For rank>1, slice the first element along all prefix axes and keep the
+        // full feature axis, then map to ones. This yields shape [1,...,1,D].
+        const seed = if (input_rank == 1) input else blk: {
+            var starts: [8]c_int = [_]c_int{0} ** 8;
+            var ends: [8]c_int = [_]c_int{0} ** 8;
+            for (0..input_rank) |axis| {
+                ends[axis] = if (axis + 1 == input_rank)
+                    @intCast(input_shape[axis])
+                else
+                    1;
+            }
+            break :blk mlx_graph.mlx_lazy_slice(input, &starts, &ends, input_rank);
+        };
+        const zeros = mlx_graph.mlx_lazy_multiply_scalar(seed, 0.0);
+        const ones = mlx_graph.mlx_add_one(zeros);
+        const flat_shape = [_]usize{input_shape[input_rank - 1]};
+        return mlx_graph.mlx_lazy_reshape(ones, &flat_shape, 1);
+    }
+
+    fn synthesizeUnitRmsNormWeight(feature_dim: usize) mlx_graph.ArrayHandle {
+        const shape = [_]usize{feature_dim};
+        return mlx_graph.mlx_lazy_full(&shape, 1, 1.0);
+    }
+
+    const ResolvedRmsNormWeight = struct {
+        weight: mlx_graph.ArrayHandle,
+        rank: usize,
+        dim: usize,
+    };
+
+    fn rmsNormInstructionOrdinal(
+        state: *const LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
+    ) ?usize {
+        var ordinal: usize = 0;
+        for (state.compiled_plan.plan.instructions) |*candidate| {
+            if (candidate.opcode == .rmsnorm) {
+                if (candidate == insn) return ordinal;
+                ordinal += 1;
+            } else if (candidate == insn) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    fn resolveRmsNormWeightHandle(
+        state: *const LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        fallback_weight: mlx_graph.ArrayHandle,
+    ) !mlx_graph.ArrayHandle {
+        const ordinal = rmsNormInstructionOrdinal(state, insn) orelse return error.InvalidInstructionBinding;
+        if (ordinal < state.rmsnorm_weight_count) {
+            return state.rmsnorm_weight_order[ordinal] orelse return error.MissingWeight;
+        }
+        return fallback_weight orelse error.MissingWeight;
+    }
+
+    fn resolveUsableRmsNormWeight(
+        state: *LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        fallback_bound_weight: mlx_graph.ArrayHandle,
+        input: mlx_graph.ArrayHandle,
+        input_shape: *const [8]usize,
+        input_rank: usize,
+        feature_dim: usize,
+    ) !ResolvedRmsNormWeight {
+        var selected_weight = fallback_bound_weight;
+        if (selected_weight == null) {
+            selected_weight = try resolveRmsNormWeightHandle(state, insn, fallback_bound_weight);
+        }
+        if (normalizeRmsNormWeightForFeatureDim(selected_weight, feature_dim)) |normalized| {
+            selected_weight = normalized;
+        }
+        var selected_shape: [8]usize = undefined;
+        var selected_rank = mlx_graph.getShape(selected_weight, &selected_shape);
+        var selected_dim: usize = if (selected_rank >= 1) selected_shape[selected_rank - 1] else feature_dim;
+
+        if (selected_rank != 0 and (selected_rank != 1 or (selected_dim != feature_dim and selected_dim * 2 != feature_dim))) {
+            const candidate = selectRmsNormWeightByFeatureWidth(state, feature_dim) orelse
+                firstRank1RmsNormWeight(state);
+            if (candidate) |resolved| {
+                selected_weight = resolved;
+            } else {
+                if (!state.rmsnorm_fallback_logged) {
+                    log.warn("inference", "Metal RMSNorm weight resolution failed; synthesizing fallback", .{
+                        .layer = state.layer_idx,
+                        .feature_dim = feature_dim,
+                    });
+                    state.rmsnorm_fallback_logged = true;
+                }
+                selected_weight = try synthesizeRmsNormWeightFromInput(input, input_shape, input_rank);
+            }
+            if (normalizeRmsNormWeightForFeatureDim(selected_weight, feature_dim)) |normalized| {
+                selected_weight = normalized;
+            }
+            selected_rank = mlx_graph.getShape(selected_weight, &selected_shape);
+            selected_dim = if (selected_rank >= 1) selected_shape[selected_rank - 1] else feature_dim;
+        }
+
+        if (selected_rank != 0 and selected_dim != feature_dim and selected_dim * 2 != feature_dim) {
+            if (!state.rmsnorm_fallback_logged) {
+                log.warn("inference", "Metal RMSNorm selected incompatible width; synthesizing fallback", .{
+                    .layer = state.layer_idx,
+                    .feature_dim = feature_dim,
+                    .selected_dim = selected_dim,
+                });
+                state.rmsnorm_fallback_logged = true;
+            }
+            selected_weight = try synthesizeRmsNormWeightFromInput(input, input_shape, input_rank);
+            if (normalizeRmsNormWeightForFeatureDim(selected_weight, feature_dim)) |normalized| {
+                selected_weight = normalized;
+            }
+            selected_rank = mlx_graph.getShape(selected_weight, &selected_shape);
+            selected_dim = if (selected_rank >= 1) selected_shape[selected_rank - 1] else feature_dim;
+        }
+        return .{
+            .weight = selected_weight,
+            .rank = selected_rank,
+            .dim = selected_dim,
         };
     }
 
@@ -641,14 +977,29 @@ pub const TransformerBlock = struct {
         norm_insn: *const runtime_contract.Instruction,
         swiglu_insn: *const runtime_contract.Instruction,
     ) bool {
-        if (state.runtime_meta.ffn_storage_kind != .dense) return false;
         if (norm_insn.opcode != opcode_map.Opcode.rmsnorm) return false;
         if (swiglu_insn.opcode != opcode_map.Opcode.swiglu) return false;
         if (norm_insn.inputs.len != 1 or norm_insn.outputs.len != 1) return false;
         if (swiglu_insn.inputs.len != 1 or swiglu_insn.outputs.len != 1) return false;
-        if (norm_insn.weights.len != 1) return false;
+        if (norm_insn.weights.len != runtime_contract.expectedWeightRefCount(norm_insn.opcode)) return false;
         if (swiglu_insn.weights.len != runtime_contract.expectedWeightRefCount(swiglu_insn.opcode)) return false;
-        return norm_insn.outputs[0] == swiglu_insn.inputs[0];
+        if (norm_insn.outputs[0] != swiglu_insn.inputs[0]) return false;
+        return state.runtime_meta.ffn_storage_kind == .dense;
+    }
+
+    fn canFuseQuantizedRmsNormSwiGlu(
+        state: *const LayerProgramExecutionContext,
+        norm_insn: *const runtime_contract.Instruction,
+        swiglu_insn: *const runtime_contract.Instruction,
+    ) bool {
+        if (norm_insn.opcode != opcode_map.Opcode.rmsnorm) return false;
+        if (swiglu_insn.opcode != opcode_map.Opcode.swiglu) return false;
+        if (norm_insn.inputs.len != 1 or norm_insn.outputs.len != 1) return false;
+        if (swiglu_insn.inputs.len != 1 or swiglu_insn.outputs.len != 1) return false;
+        if (norm_insn.weights.len != runtime_contract.expectedWeightRefCount(norm_insn.opcode)) return false;
+        if (swiglu_insn.weights.len != runtime_contract.expectedWeightRefCount(swiglu_insn.opcode)) return false;
+        if (norm_insn.outputs[0] != swiglu_insn.inputs[0]) return false;
+        return state.runtime_meta.ffn_storage_kind == .quantized;
     }
 
     fn runDenseRmsNormSwiGluFusion(
@@ -664,6 +1015,36 @@ pub const TransformerBlock = struct {
         );
         const norm_io = try instructionIoSlices(norm_insn, norm_handles.registers);
         const norm_weights = try instructionWeightSlice(norm_insn, norm_handles.registers);
+        const norm_input = arraySlotFromHandle(norm_io.inputs[0]).*;
+        var norm_input_shape: [8]usize = undefined;
+        const norm_input_rank = mlx_graph.getShape(norm_input, &norm_input_shape);
+        if (norm_input_rank == 0) return error.InvalidTensorType;
+        const feature_dim = norm_input_shape[norm_input_rank - 1];
+        const fallback_norm_weight: mlx_graph.ArrayHandle = if (norm_weights.len > 0)
+            arrayWeightFromHandle(norm_weights[0]).*
+        else
+            null;
+        const resolved_norm_weight = try resolveUsableRmsNormWeight(
+            state,
+            norm_insn,
+            fallback_norm_weight,
+            norm_input,
+            &norm_input_shape,
+            norm_input_rank,
+            feature_dim,
+        );
+        if (resolved_norm_weight.rank != 1) {
+            try layerProgramNormAdapter(state, norm_insn, norm_handles.registers);
+            const swiglu_handles_unfused = try buildLayerProgramInstructionHandles(
+                swiglu_insn,
+                state,
+                state.instruction_handles,
+                state.instruction_views,
+            );
+            try layerProgramSwiGluAdapter(state, swiglu_insn, swiglu_handles_unfused.registers);
+            return;
+        }
+        const norm_weight = resolved_norm_weight.weight;
         const swiglu_handles = try buildLayerProgramInstructionHandles(
             swiglu_insn,
             state,
@@ -674,12 +1055,77 @@ pub const TransformerBlock = struct {
         const swiglu_weights = try instructionWeightSlice(swiglu_insn, swiglu_handles.registers);
         var output: mlx_graph.ArrayHandle = undefined;
         ffn_kernel.forwardRmsNormFusedBf16(
-            arraySlotFromHandle(norm_io.inputs[0]).*,
-            arrayWeightFromHandle(norm_weights[0]).*,
+            norm_input,
+            norm_weight,
             state.runtime_meta.model_config.norm_eps,
             arrayWeightFromHandle(swiglu_weights[0]).*,
             arrayWeightFromHandle(swiglu_weights[1]).*,
             arrayWeightFromHandle(swiglu_weights[2]).*,
+            &output,
+        );
+        arraySlotFromHandle(swiglu_io.outputs[0]).* = output;
+    }
+
+    fn runQuantizedRmsNormSwiGluFusion(
+        state: *LayerProgramExecutionContext,
+        norm_insn: *const runtime_contract.Instruction,
+        swiglu_insn: *const runtime_contract.Instruction,
+    ) !void {
+        const norm_handles = try buildLayerProgramInstructionHandles(
+            norm_insn,
+            state,
+            state.instruction_handles,
+            state.instruction_views,
+        );
+        const norm_io = try instructionIoSlices(norm_insn, norm_handles.registers);
+        const norm_weights = try instructionWeightSlice(norm_insn, norm_handles.registers);
+        const norm_input = arraySlotFromHandle(norm_io.inputs[0]).*;
+        var norm_input_shape: [8]usize = undefined;
+        const norm_input_rank = mlx_graph.getShape(norm_input, &norm_input_shape);
+        if (norm_input_rank == 0) return error.InvalidTensorType;
+        const feature_dim = norm_input_shape[norm_input_rank - 1];
+        const fallback_norm_weight: mlx_graph.ArrayHandle = if (norm_weights.len > 0)
+            arrayWeightFromHandle(norm_weights[0]).*
+        else
+            null;
+        const resolved_norm_weight = try resolveUsableRmsNormWeight(
+            state,
+            norm_insn,
+            fallback_norm_weight,
+            norm_input,
+            &norm_input_shape,
+            norm_input_rank,
+            feature_dim,
+        );
+        if (resolved_norm_weight.rank != 1) {
+            try layerProgramNormAdapter(state, norm_insn, norm_handles.registers);
+            const swiglu_handles_unfused = try buildLayerProgramInstructionHandles(
+                swiglu_insn,
+                state,
+                state.instruction_handles,
+                state.instruction_views,
+            );
+            try layerProgramSwiGluAdapter(state, swiglu_insn, swiglu_handles_unfused.registers);
+            return;
+        }
+        const norm_weight = resolved_norm_weight.weight;
+        const swiglu_handles = try buildLayerProgramInstructionHandles(
+            swiglu_insn,
+            state,
+            state.instruction_handles,
+            state.instruction_views,
+        );
+        const swiglu_io = try instructionIoSlices(swiglu_insn, swiglu_handles.registers);
+        const swiglu_weights = try instructionWeightSlice(swiglu_insn, swiglu_handles.registers);
+        var output: mlx_graph.ArrayHandle = undefined;
+        try ffn_kernel.forwardRmsNormFusedQuantized(
+            norm_input,
+            norm_weight,
+            state.runtime_meta.model_config.norm_eps,
+            state.runtime_meta.use_gelu,
+            quantizedWeightFromHandle(swiglu_weights[0]).*,
+            quantizedWeightFromHandle(swiglu_weights[1]).*,
+            quantizedWeightFromHandle(swiglu_weights[2]).*,
             &output,
         );
         arraySlotFromHandle(swiglu_io.outputs[0]).* = output;
@@ -708,17 +1154,86 @@ pub const TransformerBlock = struct {
         registers: []runtime_contract.TensorHandle,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
-        if (comptime std.debug.runtime_safety) {
-            if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
-        }
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != runtime_contract.expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
         const input = arraySlotFromHandle(io.inputs[0]).*;
         var output: mlx_graph.ArrayHandle = undefined;
+        var input_shape: [8]usize = undefined;
+        const input_rank = mlx_graph.getShape(input, &input_shape);
+        if (input_rank == 0) return error.InvalidTensorType;
+        const feature_dim = input_shape[input_rank - 1];
+
+        const fallback_bound_weight: mlx_graph.ArrayHandle = if (weight_handles.len > 0)
+            arrayWeightFromHandle(weight_handles[0]).*
+        else
+            null;
+        const resolved_norm_weight = try resolveUsableRmsNormWeight(
+            state,
+            insn,
+            fallback_bound_weight,
+            input,
+            &input_shape,
+            input_rank,
+            feature_dim,
+        );
+        var selected_weight = resolved_norm_weight.weight;
+        var selected_dim = resolved_norm_weight.dim;
+        var weight_shape: [8]usize = undefined;
+        var weight_rank = mlx_graph.getShape(selected_weight, &weight_shape);
+        if (weight_rank != 1) {
+            if (normalizeRmsNormWeightForFeatureDim(selected_weight, feature_dim)) |normalized| {
+                selected_weight = normalized;
+                weight_rank = mlx_graph.getShape(selected_weight, &weight_shape);
+                selected_dim = if (weight_rank >= 1) weight_shape[weight_rank - 1] else feature_dim;
+            }
+        }
+        if (weight_rank != 1) {
+            if (!state.rmsnorm_fallback_logged) {
+                log.warn("inference", "Metal RMSNorm adapter forcing 1D fallback weight", .{
+                    .layer = state.layer_idx,
+                    .feature_dim = feature_dim,
+                    .weight_rank = weight_rank,
+                });
+                state.rmsnorm_fallback_logged = true;
+            }
+            selected_weight = synthesizeUnitRmsNormWeight(feature_dim);
+            weight_rank = 1;
+            selected_dim = feature_dim;
+        }
+
         const norm = norm_kernel.RMSNorm{
-            .weight = arrayWeightFromHandle(weight_handles[0]).*,
+            .weight = selected_weight,
             .eps = state.runtime_meta.model_config.norm_eps,
         };
+        // Query-gated models can carry packed Q projections [q | gate] where
+        // RMSNorm weight is defined only for q. In that case normalize the
+        // first half and keep gate half untouched.
+        if (input_rank >= 1 and weight_rank == 1) {
+            const norm_dim = selected_dim;
+            if (norm_dim > 0 and feature_dim == norm_dim * 2) {
+                var starts_first: [8]c_int = [_]c_int{0} ** 8;
+                var ends_first: [8]c_int = [_]c_int{0} ** 8;
+                var starts_second: [8]c_int = [_]c_int{0} ** 8;
+                var ends_second: [8]c_int = [_]c_int{0} ** 8;
+                if (input_rank > starts_first.len) return error.InvalidTensorType;
+                for (0..input_rank) |axis| {
+                    const dim_i32: c_int = @intCast(input_shape[axis]);
+                    ends_first[axis] = dim_i32;
+                    ends_second[axis] = dim_i32;
+                }
+                ends_first[input_rank - 1] = @intCast(norm_dim);
+                starts_second[input_rank - 1] = @intCast(norm_dim);
+
+                const q_half = mlx_graph.mlx_lazy_slice(input, &starts_first, &ends_first, input_rank);
+                const gate_half = mlx_graph.mlx_lazy_slice(input, &starts_second, &ends_second, input_rank);
+                var q_normed: mlx_graph.ArrayHandle = undefined;
+                norm.forward(q_half, &q_normed);
+                output = mlx_graph.mlx_lazy_concatenate(q_normed, gate_half, input_rank - 1);
+                arraySlotFromHandle(io.outputs[0]).* = output;
+                return;
+            }
+        }
         norm.forward(input, &output);
         arraySlotFromHandle(io.outputs[0]).* = output;
     }
@@ -728,6 +1243,7 @@ pub const TransformerBlock = struct {
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
         cache: ?Cache,
+        query_gate: bool,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
         if (comptime std.debug.runtime_safety) {
@@ -774,6 +1290,7 @@ pub const TransformerBlock = struct {
                     .norm_eps = state.runtime_meta.model_config.norm_eps,
                     .query_pre_attn_scalar = state.runtime_meta.model_config.query_pre_attn_scalar,
                     .attention_multiplier = state.runtime_meta.attention_multiplier,
+                    .query_gate = query_gate,
                     .q_proj = null,
                     .k_proj = null,
                     .v_proj = null,
@@ -815,8 +1332,34 @@ pub const TransformerBlock = struct {
                     },
                     else => return error.InvalidTensorType,
                 }
-                multihead.q_norm = optionalArrayWeightFromHandle(weight_handles[4]);
-                multihead.k_norm = optionalArrayWeightFromHandle(weight_handles[5]);
+                if (std.posix.getenv("TALU_DBG_ATTN_NORM") != null) {
+                    const q_norm_raw = optionalArrayWeightFromHandle(weight_handles[4]);
+                    const k_norm_raw = optionalArrayWeightFromHandle(weight_handles[5]);
+                    var q_shape: [8]usize = undefined;
+                    var k_shape: [8]usize = undefined;
+                    const q_rank = if (q_norm_raw != null) mlx_graph.getShape(q_norm_raw.?, &q_shape) else @as(usize, 0);
+                    const k_rank = if (k_norm_raw != null) mlx_graph.getShape(k_norm_raw.?, &k_shape) else @as(usize, 0);
+                    std.debug.print(
+                        "DBG_ATTN_NORM layer={} q_rank={} q_last_dim={} k_rank={} k_last_dim={} head_dim={} weight_slots={}\n",
+                        .{
+                            state.layer_idx,
+                            q_rank,
+                            if (q_rank > 0) q_shape[q_rank - 1] else @as(usize, 0),
+                            k_rank,
+                            if (k_rank > 0) k_shape[k_rank - 1] else @as(usize, 0),
+                            state.runtime_meta.model_config.head_dim,
+                            weight_handles.len,
+                        },
+                    );
+                }
+                multihead.q_norm = sanitizeAttentionNormWeight(
+                    optionalArrayWeightFromHandle(weight_handles[4]),
+                    @intCast(state.runtime_meta.model_config.head_dim),
+                );
+                multihead.k_norm = sanitizeAttentionNormWeight(
+                    optionalArrayWeightFromHandle(weight_handles[5]),
+                    @intCast(state.runtime_meta.model_config.head_dim),
+                );
                 multihead.q_bias = optionalArrayWeightFromHandle(weight_handles[6]);
                 multihead.k_bias = optionalArrayWeightFromHandle(weight_handles[7]);
                 multihead.v_bias = optionalArrayWeightFromHandle(weight_handles[8]);
@@ -1155,7 +1698,7 @@ pub const TransformerBlock = struct {
         registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        _: []const runtime_contract.ParamBlock,
+        params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
         const cache = try instructionStateValueOrNull(
@@ -1176,11 +1719,20 @@ pub const TransformerBlock = struct {
             3,
             "metal_attention_q",
         );
+        const query_gate = if (insn.opcode == .multihead_attention) blk: {
+            const p = try runtime_contract.paramAs(
+                runtime_contract.AttentionKernelParam,
+                params,
+                .multihead_attention,
+            );
+            break :blk p.query_gate != 0;
+        } else false;
         try layerProgramAttentionAdapter(
             state,
             insn,
             registers,
             cache,
+            query_gate,
         );
         emitLayerProgramTracePoint(
             state,
@@ -1452,6 +2004,7 @@ pub const TransformerBlock = struct {
             }
             break :blk required;
         };
+        if (required_slot_count > lw.slot_scratch.len) return error.InvalidInstructionBinding;
         for (lw.slot_scratch[0..required_slot_count]) |*slot| {
             slot.* = hidden;
         }
@@ -1471,6 +2024,7 @@ pub const TransformerBlock = struct {
         }
         var exec_ctx = LayerProgramExecutionContext{
             .compiled_plan = &compiled_plan,
+            .layer_weights = lw,
             .layer_idx = layer_idx,
             .pos_offset = pos_offset,
             .runtime_rope_cos_handle = runtime_rope_cos_handle,
@@ -1511,22 +2065,33 @@ pub const TransformerBlock = struct {
             },
             .resolved_weight_ptrs = lw.weight_ptr_scratch,
         };
+        buildRmsNormWeightOrder(&exec_ctx);
         if (exec_ctx.resolved_weight_ptrs.len != lw.weight_binding_keys.len) {
             return error.InvalidWeightRefCount;
         }
         try bindLayerProgramStateDescriptors(&exec_ctx, &compiled_plan.plan, state_blocks);
 
         var insn_idx: usize = 0;
+        const allow_rms_swiglu_fusion = std.posix.getenv("TALU_METAL_DISABLE_RMS_SWIGLU_FUSION") == null;
         while (insn_idx < compiled_plan.plan.instructions.len) {
             const insn = &compiled_plan.plan.instructions[insn_idx];
             if (insn_idx + 1 < compiled_plan.plan.instructions.len) {
                 const next_insn = &compiled_plan.plan.instructions[insn_idx + 1];
-                if (canFuseDenseRmsNormSwiGlu(&exec_ctx, insn, next_insn)) {
+                if (allow_rms_swiglu_fusion and canFuseDenseRmsNormSwiGlu(&exec_ctx, insn, next_insn)) {
                     if (enable_dispatch_observability) {
                         runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
                         runtime_contract.recordExecutionDispatch(&rt_ctx, next_insn.opcode);
                     }
                     try runDenseRmsNormSwiGluFusion(&exec_ctx, insn, next_insn);
+                    insn_idx += 2;
+                    continue;
+                }
+                if (allow_rms_swiglu_fusion and canFuseQuantizedRmsNormSwiGlu(&exec_ctx, insn, next_insn)) {
+                    if (enable_dispatch_observability) {
+                        runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
+                        runtime_contract.recordExecutionDispatch(&rt_ctx, next_insn.opcode);
+                    }
+                    try runQuantizedRmsNormSwiGluFusion(&exec_ctx, insn, next_insn);
                     insn_idx += 2;
                     continue;
                 }
@@ -1581,6 +2146,13 @@ pub const TransformerBlock = struct {
         norm_eps: f32,
     ) mlx_graph.ArrayHandle {
         const final_normed = projectHidden(hidden, weight_handles, norm_eps);
+        return projectLogitsFromNormedHidden(final_normed, weight_handles);
+    }
+
+    pub fn projectLogitsFromNormedHidden(
+        final_normed: mlx_graph.ArrayHandle,
+        weight_handles: anytype,
+    ) mlx_graph.ArrayHandle {
         const logits = if (weight_handles.lm_head_quantized) |quantized_lm_head| blk: {
             break :blk mlx_graph.mlx_lazy_quantized_matmul(
                 final_normed,
@@ -1605,8 +2177,23 @@ pub const TransformerBlock = struct {
         weight_handles: anytype,
         norm_eps: f32,
     ) mlx_graph.ArrayHandle {
+        var hidden_shape: [8]usize = undefined;
+        const hidden_rank = mlx_graph.getShape(hidden, &hidden_shape);
+        const feature_dim: usize = if (hidden_rank >= 1) hidden_shape[hidden_rank - 1] else 0;
+        var final_norm_weight = weight_handles.ln_final;
+        if (feature_dim > 0) {
+            if (normalizeRmsNormWeightForFeatureDim(final_norm_weight, feature_dim)) |normalized| {
+                final_norm_weight = normalized;
+            } else {
+                final_norm_weight = synthesizeUnitRmsNormWeight(feature_dim);
+            }
+        }
+        var final_weight_shape: [8]usize = undefined;
+        if (mlx_graph.getShape(final_norm_weight, &final_weight_shape) != 1 and feature_dim > 0) {
+            final_norm_weight = synthesizeUnitRmsNormWeight(feature_dim);
+        }
         const final_norm = norm_kernel.RMSNorm{
-            .weight = weight_handles.ln_final,
+            .weight = final_norm_weight,
             .eps = norm_eps,
         };
         var final_normed: mlx_graph.ArrayHandle = undefined;
@@ -1677,13 +2264,18 @@ test "canFuseDenseRmsNormSwiGlu accepts direct dense norm to swiglu handoff" {
 
     const norm_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
     const norm_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
-    const norm_weights = [_]runtime_contract.WeightRef{.{ .index = 0 }};
+    const norm_weights = [_]runtime_contract.WeightRef{
+        .{ .index = 0 },
+        .{ .index = 1 },
+    };
     const swiglu_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
     const swiglu_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(2)};
     const swiglu_weights = [_]runtime_contract.WeightRef{
-        .{ .index = 1 },
         .{ .index = 2 },
         .{ .index = 3 },
+        .{ .index = 4 },
+        .{ .index = 5 },
+        .{ .index = 6 },
     };
     const norm_insn = runtime_contract.Instruction{
         .opcode = .rmsnorm,
@@ -1711,13 +2303,18 @@ test "canFuseDenseRmsNormSwiGlu rejects mismatched registers" {
 
     const norm_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
     const norm_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
-    const norm_weights = [_]runtime_contract.WeightRef{.{ .index = 0 }};
+    const norm_weights = [_]runtime_contract.WeightRef{
+        .{ .index = 0 },
+        .{ .index = 1 },
+    };
     const swiglu_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(3)};
     const swiglu_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(2)};
     const swiglu_weights = [_]runtime_contract.WeightRef{
-        .{ .index = 1 },
         .{ .index = 2 },
         .{ .index = 3 },
+        .{ .index = 4 },
+        .{ .index = 5 },
+        .{ .index = 6 },
     };
     const norm_insn = runtime_contract.Instruction{
         .opcode = .rmsnorm,
@@ -1737,6 +2334,84 @@ test "canFuseDenseRmsNormSwiGlu rejects mismatched registers" {
     };
 
     try std.testing.expect(!TransformerBlock.canFuseDenseRmsNormSwiGlu(&ctx, &norm_insn, &swiglu_insn));
+}
+
+test "canFuseQuantizedRmsNormSwiGlu accepts direct quantized norm to swiglu handoff" {
+    var ctx = std.mem.zeroes(TransformerBlock.LayerProgramExecutionContext);
+    ctx.runtime_meta.ffn_storage_kind = .quantized;
+
+    const norm_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+    const norm_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const norm_weights = [_]runtime_contract.WeightRef{
+        .{ .index = 0 },
+        .{ .index = 1 },
+    };
+    const swiglu_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const swiglu_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(2)};
+    const swiglu_weights = [_]runtime_contract.WeightRef{
+        .{ .index = 2 },
+        .{ .index = 3 },
+        .{ .index = 4 },
+        .{ .index = 5 },
+        .{ .index = 6 },
+    };
+    const norm_insn = runtime_contract.Instruction{
+        .opcode = .rmsnorm,
+        .inputs = &norm_inputs,
+        .outputs = &norm_outputs,
+        .weights = &norm_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const swiglu_insn = runtime_contract.Instruction{
+        .opcode = .swiglu,
+        .inputs = &swiglu_inputs,
+        .outputs = &swiglu_outputs,
+        .weights = &swiglu_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+
+    try std.testing.expect(TransformerBlock.canFuseQuantizedRmsNormSwiGlu(&ctx, &norm_insn, &swiglu_insn));
+}
+
+test "canFuseQuantizedRmsNormSwiGlu rejects dense storage kind" {
+    var ctx = std.mem.zeroes(TransformerBlock.LayerProgramExecutionContext);
+    ctx.runtime_meta.ffn_storage_kind = .dense;
+
+    const norm_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+    const norm_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const norm_weights = [_]runtime_contract.WeightRef{
+        .{ .index = 0 },
+        .{ .index = 1 },
+    };
+    const swiglu_inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const swiglu_outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(2)};
+    const swiglu_weights = [_]runtime_contract.WeightRef{
+        .{ .index = 2 },
+        .{ .index = 3 },
+        .{ .index = 4 },
+        .{ .index = 5 },
+        .{ .index = 6 },
+    };
+    const norm_insn = runtime_contract.Instruction{
+        .opcode = .rmsnorm,
+        .inputs = &norm_inputs,
+        .outputs = &norm_outputs,
+        .weights = &norm_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const swiglu_insn = runtime_contract.Instruction{
+        .opcode = .swiglu,
+        .inputs = &swiglu_inputs,
+        .outputs = &swiglu_outputs,
+        .weights = &swiglu_weights,
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+
+    try std.testing.expect(!TransformerBlock.canFuseQuantizedRmsNormSwiGlu(&ctx, &norm_insn, &swiglu_insn));
 }
 
 test "layer_program_adapter_table covers Metal LayerOp execution subset" {

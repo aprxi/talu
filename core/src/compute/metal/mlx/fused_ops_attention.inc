@@ -369,7 +369,7 @@ static ProjectedQkv project_quantized_qkv(
     return projected;
 }
 
-static void reshape_qkv_to_attention_layout(
+static std::optional<array> reshape_qkv_to_attention_layout(
     array* q,
     array* k,
     array* v,
@@ -377,25 +377,97 @@ static void reshape_qkv_to_attention_layout(
     int seq_len,
     int n_heads,
     int n_kv_heads,
-    int head_dim
+    int head_dim,
+    bool query_gate
 ) {
     if (q == nullptr || k == nullptr || v == nullptr) {
         throw std::invalid_argument("[attention] null qkv tensor");
     }
+
+    auto canonicalize_projection = [&](array* values, const char* name) -> int {
+        if (values == nullptr) {
+            throw std::invalid_argument(std::string("[attention] null ") + name + " tensor");
+        }
+        if (values->ndim() == 0) {
+            throw std::invalid_argument(std::string("[attention] scalar ") + name + " tensor is invalid");
+        }
+
+        if (values->ndim() == 3 && values->shape(0) == batch_size && values->shape(1) == seq_len) {
+            return values->shape(2);
+        }
+
+        if (values->ndim() == 4 && values->shape(0) == batch_size && values->shape(1) == seq_len) {
+            const int merged_dim = values->shape(2) * values->shape(3);
+            *values = reshape(*values, {batch_size, seq_len, merged_dim});
+            return merged_dim;
+        }
+
+        if (values->ndim() == 4 && values->shape(0) == batch_size && values->shape(2) == seq_len) {
+            const int merged_dim = values->shape(1) * values->shape(3);
+            auto transposed = transpose(*values, {0, 2, 1, 3});
+            *values = reshape(transposed, {batch_size, seq_len, merged_dim});
+            return merged_dim;
+        }
+
+        if (values->ndim() == 3 && values->shape(0) == batch_size && values->shape(2) == seq_len) {
+            *values = transpose(*values, {0, 2, 1});
+            return values->shape(2);
+        }
+
+        throw std::invalid_argument(std::string("[attention] unsupported ") + name + " projection layout");
+    };
+
+    const int q_dim = canonicalize_projection(q, "query");
+    const int k_dim = canonicalize_projection(k, "key");
+    const int v_dim = canonicalize_projection(v, "value");
+
+    const int q_out = n_heads * head_dim;
+    const int q_packed_out = q_out * 2;
+    const int kv_out = n_kv_heads * head_dim;
+    const bool has_query_gate = query_gate || q_dim == q_packed_out;
+    if (has_query_gate) {
+        if (q_dim != q_packed_out) {
+            throw std::invalid_argument("[attention] gated query projection width mismatch");
+        }
+    } else if (q_dim != q_out) {
+        throw std::invalid_argument("[attention] query projection width mismatch");
+    }
+    if (k_dim != kv_out || v_dim != kv_out) {
+        throw std::invalid_argument("[attention] key/value projection width mismatch");
+    }
+
+    std::optional<array> query_gates = std::nullopt;
+    if (has_query_gate) {
+        // Keep parity with CPU compactQueryProjection/applyOutputGateInPlace:
+        // query lanes are packed per head as [q_head, gate_head].
+        auto q_packed = reshape(*q, {batch_size, seq_len, n_heads, 2, head_dim});
+        auto q_values = slice(q_packed, {0, 0, 0, 0, 0}, {batch_size, seq_len, n_heads, 1, head_dim});
+        auto q_gate = slice(q_packed, {0, 0, 0, 1, 0}, {batch_size, seq_len, n_heads, 2, head_dim});
+        *q = reshape(q_values, {batch_size, seq_len, n_heads, head_dim});
+        query_gates = reshape(q_gate, {batch_size, seq_len, n_heads, head_dim});
+    }
+
     if (batch_size == 1 && seq_len == 1) {
-        // Decode fast path: reshape directly to attention layout and avoid
-        // no-op transpose nodes on singleton sequence dimensions.
         *q = reshape(*q, {1, n_heads, 1, head_dim});
         *k = reshape(*k, {1, n_kv_heads, 1, head_dim});
         *v = reshape(*v, {1, n_kv_heads, 1, head_dim});
-        return;
+        if (query_gates.has_value()) {
+            query_gates = reshape(query_gates.value(), {1, n_heads, 1, head_dim});
+        }
+        return query_gates;
     }
-    *q = reshape(*q, {batch_size, seq_len, n_heads, head_dim});
+    if (!has_query_gate) {
+        *q = reshape(*q, {batch_size, seq_len, n_heads, head_dim});
+    }
     *k = reshape(*k, {batch_size, seq_len, n_kv_heads, head_dim});
     *v = reshape(*v, {batch_size, seq_len, n_kv_heads, head_dim});
     *q = transpose(*q, {0, 2, 1, 3});
     *k = transpose(*k, {0, 2, 1, 3});
     *v = transpose(*v, {0, 2, 1, 3});
+    if (query_gates.has_value()) {
+        query_gates = transpose(query_gates.value(), {0, 2, 1, 3});
+    }
+    return query_gates;
 }
 
 static void maybe_apply_qk_norm(
@@ -409,10 +481,16 @@ static void maybe_apply_qk_norm(
         throw std::invalid_argument("[attention] null qk tensor");
     }
     if (q_norm_w != nullptr) {
-        *q = fast::rms_norm(*q, *static_cast<const array*>(q_norm_w), rms_eps);
+        const auto& q_weight = *static_cast<const array*>(q_norm_w);
+        const int q_width = q->shape(q->ndim() - 1);
+        const array q_norm = canonicalize_rms_norm_weight(q_weight, q_width, "attention.q_norm");
+        *q = fast::rms_norm(*q, q_norm, rms_eps);
     }
     if (k_norm_w != nullptr) {
-        *k = fast::rms_norm(*k, *static_cast<const array*>(k_norm_w), rms_eps);
+        const auto& k_weight = *static_cast<const array*>(k_norm_w);
+        const int k_width = k->shape(k->ndim() - 1);
+        const array k_norm = canonicalize_rms_norm_weight(k_weight, k_width, "attention.k_norm");
+        *k = fast::rms_norm(*k, k_norm, rms_eps);
     }
 }
 
@@ -436,8 +514,9 @@ static void apply_attention_rope(
     if (use_runtime_rope && (rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0)) {
         use_runtime_rope = false;
     }
-    // Decode fast path: for single-token steps, dispatch the dedicated rope
-    // kernel instead of building a runtime-table slice/mul graph.
+    // Decode correctness guard:
+    // seq_len==1 path in runtime-table rope can drift numerically for some
+    // query-gated models (e.g. qwen3.5). Keep decode on fast::rope.
     if (seq_len == 1) {
         use_runtime_rope = false;
     }
@@ -526,6 +605,24 @@ static array run_attention_kernel(
     );
 }
 
+static array apply_query_output_gate(
+    const array& attention_out,
+    const std::optional<array>& query_gate_values
+) {
+    if (!query_gate_values.has_value()) {
+        return attention_out;
+    }
+    auto gate_values = query_gate_values.value();
+    if (gate_values.dtype() != float32) {
+        gate_values = astype(gate_values, float32);
+    }
+    auto gate = sigmoid(gate_values);
+    if (gate.dtype() != attention_out.dtype()) {
+        gate = astype(gate, attention_out.dtype());
+    }
+    return attention_out * gate;
+}
+
 static array reshape_attention_output(
     const array& attention_out,
     int batch_size,
@@ -558,7 +655,8 @@ void* mlx_lazy_fused_attention(
     float rms_eps,
     size_t group_size, size_t bits,
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
-    float attention_multiplier    // 0 for default, >0 uses this directly as scale
+    float attention_multiplier,   // 0 for default, >0 uses this directly as scale
+    bool query_gate
 ) {
     mlx_count_op();
     const auto& x = *static_cast<const array*>(input);
@@ -583,7 +681,7 @@ void* mlx_lazy_fused_attention(
         v_bias
     );
 
-    reshape_qkv_to_attention_layout(
+    const auto query_gate_values = reshape_qkv_to_attention_layout(
         &projected.q,
         &projected.k,
         &projected.v,
@@ -591,7 +689,8 @@ void* mlx_lazy_fused_attention(
         seq_len,
         n_heads_int,
         n_kv_heads_int,
-        head_dim_int
+        head_dim_int,
+        query_gate
     );
     maybe_apply_qk_norm(&projected.q, &projected.k, q_norm_w, k_norm_w, rms_eps);
     apply_attention_rope(
@@ -627,6 +726,7 @@ void* mlx_lazy_fused_attention(
         is_prefill,
         attn_sinks
     );
+    attn_out = apply_query_output_gate(attn_out, query_gate_values);
     attn_out = reshape_attention_output(attn_out, batch_size, seq_len, n_heads_int * head_dim_int);
 
     // Output projection
@@ -676,7 +776,8 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
     float rms_eps,
     size_t group_size, size_t bits,
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
-    float attention_multiplier    // 0 for default, >0 uses this directly as scale
+    float attention_multiplier,   // 0 for default, >0 uses this directly as scale
+    bool query_gate
 ) {
     mlx_count_op();
     const auto& x = *static_cast<const array*>(input);
@@ -701,7 +802,7 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
         v_bias
     );
 
-    reshape_qkv_to_attention_layout(
+    const auto query_gate_values = reshape_qkv_to_attention_layout(
         &projected.q,
         &projected.k,
         &projected.v,
@@ -709,7 +810,8 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
         seq_len,
         n_heads_int,
         n_kv_heads_int,
-        head_dim_int
+        head_dim_int,
+        query_gate
     );
     maybe_apply_qk_norm(&projected.q, &projected.k, q_norm_w, k_norm_w, rms_eps);
     apply_attention_rope(
@@ -745,6 +847,7 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
         is_prefill,
         attn_sinks
     );
+    attn_out = apply_query_output_gate(attn_out, query_gate_values);
     attn_out = reshape_attention_output(attn_out, batch_size, seq_len, n_heads_int * head_dim_int);
 
     // Dense output projection (o_w stored as [out, in]).
@@ -845,6 +948,82 @@ void* mlx_lazy_fused_ffn(
     return pool_array(std::move(out));
 }
 
+void* mlx_lazy_rms_norm_fused_ffn(
+    const void* input,
+    const void* norm_w,
+    const void* gate_w, const void* gate_s, const void* gate_b,
+    const void* up_w, const void* up_s, const void* up_b,
+    const void* down_w, const void* down_s, const void* down_b,
+    size_t group_size, size_t bits,
+    bool use_gelu,
+    float eps
+) {
+    mlx_count_op();
+    const auto& x = *static_cast<const array*>(input);
+    const auto& norm_weight_raw = *static_cast<const array*>(norm_w);
+    const int in_features = x.shape(2);
+    const array norm_weight = canonicalize_rms_norm_weight(norm_weight_raw, in_features, "rms_norm_fused_ffn");
+    int gs = static_cast<int>(group_size);
+    int b = static_cast<int>(bits);
+    const auto& gate_w_arr = *static_cast<const array*>(gate_w);
+    const auto& gate_s_arr = *static_cast<const array*>(gate_s);
+    const auto& gate_b_arr = *static_cast<const array*>(gate_b);
+    const auto& up_w_arr = *static_cast<const array*>(up_w);
+    const auto& up_s_arr = *static_cast<const array*>(up_s);
+    const auto& up_b_arr = *static_cast<const array*>(up_b);
+
+    auto normed = fast::rms_norm(x, norm_weight, eps);
+    const auto& fused = ffn_quantized_gate_up_cached(
+        gate_w,
+        gate_s,
+        gate_b,
+        up_w,
+        up_s,
+        up_b,
+        gate_w_arr,
+        gate_s_arr,
+        gate_b_arr,
+        up_w_arr,
+        up_s_arr,
+        up_b_arr
+    );
+    const auto gate_up = quantized_linear_no_bias(
+        normed,
+        fused.weights,
+        fused.scales,
+        fused.biases,
+        gs,
+        b
+    );
+    const int batch_size = x.shape(0);
+    const int seq_len = x.shape(1);
+    auto gate = slice(gate_up, {0, 0, 0}, {batch_size, seq_len, fused.d_ff});
+    auto up = slice(gate_up, {0, 0, fused.d_ff}, {batch_size, seq_len, 2 * fused.d_ff});
+
+    auto mid = [&]() -> array {
+        if (use_gelu) {
+            const float sqrt_2_over_pi = 0.7978845608f;
+            auto x3 = gate * gate * gate;
+            auto inner = sqrt_2_over_pi * (gate + 0.044715f * x3);
+            return 0.5f * gate * (1.0f + tanh(inner)) * up;
+        } else {
+            return (gate * sigmoid(gate)) * up;
+        }
+    }();
+
+    auto out = quantized_linear_no_bias(
+        mid,
+        *static_cast<const array*>(down_w),
+        *static_cast<const array*>(down_s),
+        *static_cast<const array*>(down_b),
+        gs,
+        b,
+        down_s,
+        down_b
+    );
+    return pool_array(std::move(out));
+}
+
 // ============================================================================
 // Fused Attention Block (BFloat16 - non-quantized)
 // ============================================================================
@@ -867,7 +1046,8 @@ void* mlx_lazy_fused_attention_bf16(
     const void* runtime_rope_cos, const void* runtime_rope_sin, size_t runtime_rope_dim,
     float rms_eps,
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
-    float attention_multiplier    // 0 for default, >0 uses this directly as scale
+    float attention_multiplier,   // 0 for default, >0 uses this directly as scale
+    bool query_gate
 ) {
     mlx_count_op();
     const auto& x = *static_cast<const array*>(input);
@@ -878,6 +1058,7 @@ void* mlx_lazy_fused_attention_bf16(
     const int n_kv_heads_int = static_cast<int>(n_kv_heads);
     const int head_dim_int = static_cast<int>(head_dim);
     const int q_out = n_heads_int * head_dim_int;
+    const int q_proj_out = query_gate ? (q_out * 2) : q_out;
     const int kv_out = n_kv_heads_int * head_dim_int;
     const float scale_value = resolve_attention_scale(query_pre_attn_scalar, attention_multiplier, head_dim_int);
 
@@ -892,21 +1073,21 @@ void* mlx_lazy_fused_attention_bf16(
         k_weight,
         v_weight,
         hidden_dim,
-        q_out,
+        q_proj_out,
         kv_out
     );
     auto o_wt = orient_matmul_rhs_cached(o_w, *static_cast<const array*>(o_w), q_out, hidden_dim, true);
 
     auto qkv = matmul_lastdim(x, qkv_wt);
-    array q = slice(qkv, {0, 0, 0}, {batch_size, seq_len, q_out});
-    array k = slice(qkv, {0, 0, q_out}, {batch_size, seq_len, q_out + kv_out});
-    array v = slice(qkv, {0, 0, q_out + kv_out}, {batch_size, seq_len, q_out + 2 * kv_out});
+    array q = slice(qkv, {0, 0, 0}, {batch_size, seq_len, q_proj_out});
+    array k = slice(qkv, {0, 0, q_proj_out}, {batch_size, seq_len, q_proj_out + kv_out});
+    array v = slice(qkv, {0, 0, q_proj_out + kv_out}, {batch_size, seq_len, q_proj_out + 2 * kv_out});
 
     maybe_add_linear_bias(&q, q_bias);
     maybe_add_linear_bias(&k, k_bias);
     maybe_add_linear_bias(&v, v_bias);
 
-    reshape_qkv_to_attention_layout(
+    const auto query_gate_values = reshape_qkv_to_attention_layout(
         &q,
         &k,
         &v,
@@ -914,7 +1095,8 @@ void* mlx_lazy_fused_attention_bf16(
         seq_len,
         n_heads_int,
         n_kv_heads_int,
-        head_dim_int
+        head_dim_int,
+        query_gate
     );
     maybe_apply_qk_norm(&q, &k, q_norm_w, k_norm_w, rms_eps);
     // Keep dense attention compute on the model projection dtype after optional
@@ -949,6 +1131,7 @@ void* mlx_lazy_fused_attention_bf16(
     );
 
     auto attn_out = run_attention_kernel(q, k_for_attn, v_for_attn, scale_value, is_prefill, attn_sinks);
+    attn_out = apply_query_output_gate(attn_out, query_gate_values);
     attn_out = reshape_attention_output(attn_out, batch_size, seq_len, q_out);
 
     // Output projection

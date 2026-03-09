@@ -879,6 +879,14 @@ pub const LocalEngine = struct {
         };
         defer result.deinit(self.allocator);
 
+        log.debug("router", "Scheduler token sample", .{
+            .count = result.tokens.len,
+            .t0 = if (result.tokens.len > 0) result.tokens[0] else @as(u32, std.math.maxInt(u32)),
+            .t1 = if (result.tokens.len > 1) result.tokens[1] else @as(u32, std.math.maxInt(u32)),
+            .t2 = if (result.tokens.len > 2) result.tokens[2] else @as(u32, std.math.maxInt(u32)),
+            .t3 = if (result.tokens.len > 3) result.tokens[3] else @as(u32, std.math.maxInt(u32)),
+        }, @src());
+
         // Strip trailing EOS token if present
         var tokens_to_decode = result.tokens;
         if (tokens_to_decode.len > 0) {

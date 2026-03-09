@@ -460,24 +460,42 @@ pub const MetalBackend = struct {
         try self.resetSlotState(slot_index);
         const t_reset_done_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
-        const hidden_handle = try runtime_trait.transformerForwardHiddenLazy(
-            self.allocator,
-            self.weights,
-            tokens,
-            try self.slotStateBlocks(slot_index),
-            self.config,
-            0, // pos_offset
-        );
-        defer graph.freeArray(hidden_handle);
-        var starts: [3]c_int = .{ 0, @intCast(sequence_len - 1), 0 };
-        var ends: [3]c_int = .{ 1, @intCast(sequence_len), @intCast(self.d_model) };
-        const last_hidden_handle = graph.mlx_lazy_slice(hidden_handle, &starts, &ends, 3);
-        defer graph.freeArray(last_hidden_handle);
-        const logits_handle = metal_executor.block.TransformerBlock.projectLogits(
-            last_hidden_handle,
-            self.weights,
-            self.config.norm_eps,
-        );
+        const use_direct_prefill_logits = std.posix.getenv("TALU_METAL_PREFILL_DIRECT_LOGITS") != null;
+        const logits_handle = if (use_direct_prefill_logits) blk: {
+            const full_logits = try runtime_trait.transformerForwardLazy(
+                self.allocator,
+                self.weights,
+                tokens,
+                try self.slotStateBlocks(slot_index),
+                self.config,
+                0, // pos_offset
+            );
+            const last_logits = graph.mlx_lazy_slice_last(full_logits);
+            if (last_logits == full_logits) {
+                break :blk full_logits;
+            }
+            graph.freeArray(full_logits);
+            break :blk last_logits;
+        } else blk: {
+            const hidden_handle = try runtime_trait.transformerForwardHiddenLazy(
+                self.allocator,
+                self.weights,
+                tokens,
+                try self.slotStateBlocks(slot_index),
+                self.config,
+                0, // pos_offset
+            );
+            defer graph.freeArray(hidden_handle);
+            var starts: [3]c_int = .{ 0, @intCast(sequence_len - 1), 0 };
+            var ends: [3]c_int = .{ 1, @intCast(sequence_len), @intCast(self.d_model) };
+            const last_hidden_handle = graph.mlx_lazy_slice(hidden_handle, &starts, &ends, 3);
+            defer graph.freeArray(last_hidden_handle);
+            break :blk metal_executor.block.TransformerBlock.projectLogitsFromNormedHidden(
+                last_hidden_handle,
+                self.weights,
+            );
+        };
+        defer graph.freeArray(logits_handle);
         const t_graph_built_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
         graph.eval(&[_]graph.ArrayHandle{logits_handle});
@@ -512,7 +530,6 @@ pub const MetalBackend = struct {
         );
         const t_copy_done_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
-        graph.freeArray(logits_handle);
         const t_end_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
         slot_position.* = sequence_len;
@@ -1146,10 +1163,9 @@ pub const MetalBackend = struct {
         var ends: [3]c_int = .{ 1, @intCast(sequence_len), @intCast(self.d_model) };
         const last_hidden_handle = graph.mlx_lazy_slice(hidden_handle, &starts, &ends, 3);
         defer graph.freeArray(last_hidden_handle);
-        const logits_handle = metal_executor.block.TransformerBlock.projectLogits(
+        const logits_handle = metal_executor.block.TransformerBlock.projectLogitsFromNormedHidden(
             last_hidden_handle,
             self.weights,
-            self.config.norm_eps,
         );
         defer graph.freeArray(logits_handle);
         graph.eval(&[_]graph.ArrayHandle{logits_handle});

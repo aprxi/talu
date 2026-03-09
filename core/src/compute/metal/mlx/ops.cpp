@@ -434,9 +434,13 @@ void* mlx_lazy_softmax(const void* input, int axis) {
 }
 
 void* mlx_lazy_rms_norm(const void* input, const void* weight, float eps) {
+    const auto& input_arr = *static_cast<const array*>(input);
+    const auto& weight_arr = *static_cast<const array*>(weight);
+    const int width = input_arr.shape(input_arr.ndim() - 1);
+    const array norm_weight = canonicalize_rms_norm_weight(weight_arr, width, "rms_norm");
     return pool_array(fast::rms_norm(
-        *static_cast<const array*>(input),
-        *static_cast<const array*>(weight),
+        input_arr,
+        norm_weight,
         eps
     ));
 }

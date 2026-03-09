@@ -4623,6 +4623,8 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_router_iterator_generation_ns(iterator: *mut c_void) -> u64;
     // core/src/capi/router.zig
+    pub fn talu_router_iterator_output_text(iterator: *mut c_void) -> *const c_char;
+    // core/src/capi/router.zig
     pub fn talu_router_iterator_has_error(iterator: *mut c_void) -> bool;
     // core/src/capi/router.zig
     pub fn talu_router_iterator_item_type(iterator: *mut c_void) -> u8;

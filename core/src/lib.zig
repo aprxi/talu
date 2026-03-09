@@ -314,6 +314,7 @@ comptime {
     _ = &capi.talu_router_iterator_completion_tokens;
     _ = &capi.talu_router_iterator_prefill_ns;
     _ = &capi.talu_router_iterator_generation_ns;
+    _ = &capi.talu_router_iterator_output_text;
 
     // X-Ray API (tensor inspection during inference)
     _ = &capi.talu_xray_capture_create;

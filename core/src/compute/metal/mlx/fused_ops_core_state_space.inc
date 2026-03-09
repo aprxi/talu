@@ -1327,7 +1327,8 @@ static array state_space_forward_core(
     const int min_proj_dim = (2 * d_inner + 2 * bc_len + n_heads);
 
     // Hoist token-independent preprocessing out of the recurrent loop.
-    const array norm_all = fast::rms_norm(input, ln1_weight, norm_eps);
+    const array ln1_norm_weight = canonicalize_rms_norm_weight(ln1_weight, input.shape(2), "state_space.ln1_weight");
+    const array norm_all = fast::rms_norm(input, ln1_norm_weight, norm_eps);
     const array proj_all = state_space_call(in_proj_fn, norm_all);
     const int proj_dim = proj_all.shape(2);
     if (proj_dim < min_proj_dim) {
@@ -1405,7 +1406,8 @@ static array state_space_forward_core(
     array ssm_out = reshape(y_all, {1, seq_len, d_inner});
     ssm_out = ssm_out * (z_all * sigmoid(z_all));
     if (norm_weight) {
-        ssm_out = fast::rms_norm(ssm_out, *norm_weight, 1e-5f);
+        const array ssm_norm_weight = canonicalize_rms_norm_weight(*norm_weight, d_inner, "state_space.norm_weight");
+        ssm_out = fast::rms_norm(ssm_out, ssm_norm_weight, 1e-5f);
     }
 
     const Dtype model_dtype = input.dtype();
@@ -1422,7 +1424,8 @@ static array state_space_forward_core(
         throw std::invalid_argument("[state_space] missing ln2 weight for FFN path");
     }
 
-    const array norm2 = fast::rms_norm(hidden_1, *ln2_weight, norm_eps);
+    const array ln2_norm_weight = canonicalize_rms_norm_weight(*ln2_weight, hidden_1.shape(2), "state_space.ln2_weight");
+    const array norm2 = fast::rms_norm(hidden_1, ln2_norm_weight, norm_eps);
     const array norm2_proj_in = (norm2.dtype() == model_dtype) ? norm2 : astype(norm2, model_dtype);
     const array gate_up = state_space_call(gate_up_fn, norm2_proj_in);
     const int gate_up_dim = gate_up.shape(2);

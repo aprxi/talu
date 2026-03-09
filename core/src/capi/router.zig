@@ -317,6 +317,17 @@ pub export fn talu_router_iterator_generation_ns(
     return iter.getGenerationNs();
 }
 
+/// Gets the final decoded output text after generation completes.
+///
+/// Returns null if iterator is null or no final text is available.
+/// Pointer remains valid until talu_router_iterator_free().
+pub export fn talu_router_iterator_output_text(
+    iterator: ?*TaluTokenIterator,
+) callconv(.c) ?[*:0]const u8 {
+    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return null));
+    return iter.getFinalText();
+}
+
 /// Gets the item type of the most recently returned token.
 ///
 /// Returns a responses ItemType discriminator (u8).

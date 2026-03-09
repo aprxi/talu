@@ -447,32 +447,32 @@ pub const TraceCapture = struct {
     };
 };
 
-/// Global capture instance (set by Inspector).
-/// Single-threaded: only accessed from main thread via enable()/disable().
-var global_capture: ?*TraceCapture = null;
+/// Global capture instance used by trace handler callbacks.
+/// Must be atomic because backend emissions can race with enable/disable.
+var global_capture_atomic: std.atomic.Value(?*TraceCapture) = std.atomic.Value(?*TraceCapture).init(null);
 
 /// Handler function that routes to global capture.
 fn globalHandler(emission: trace.TraceEmission) void {
-    if (global_capture) |cap| {
+    if (global_capture_atomic.load(.acquire)) |cap| {
         cap.handleEmission(emission);
     }
 }
 
 /// Enable capturing with the given capture instance.
 pub fn enable(cap: *TraceCapture) void {
-    global_capture = cap;
+    global_capture_atomic.store(cap, .release);
     trace.setHandler(&globalHandler);
 }
 
 /// Disable capturing.
 pub fn disable() void {
+    global_capture_atomic.store(null, .release);
     trace.setHandler(null);
-    global_capture = null;
 }
 
 /// Check if capturing is enabled.
 pub fn isEnabled() bool {
-    return global_capture != null;
+    return global_capture_atomic.load(.acquire) != null;
 }
 
 // ============================================================================

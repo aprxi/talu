@@ -22,6 +22,7 @@ pub const Scenario = enum {
     state_space_decode_f16,
     gated_delta_decode_f16,
     gated_delta_block_f16,
+    gated_delta_block_quantized_u4,
     lm_head_f16,
     lm_head_bf16,
     lm_head_host_f16,
@@ -390,15 +391,16 @@ fn profileGatedDeltaDecodeDims(profile: Profile) struct {
     return switch (profile) {
         .ci => .{
             .hidden = 512,
-            .n_heads = 8,
-            .d_head = 128,
+            .n_heads = 4,
+            .d_head = 256,
             .d_conv = 4,
             .steps = 16,
         },
         .bw => .{
             .hidden = 1024,
-            .n_heads = 16,
-            .d_head = 128,
+            // Match Qwen3.5 decode geometry to keep this bench representative.
+            .n_heads = 8,
+            .d_head = 256,
             .d_conv = 4,
             .steps = 48,
         },
@@ -417,16 +419,16 @@ fn profileGatedDeltaBlockDims(profile: Profile) struct {
         .ci => .{
             .hidden = 512,
             .ff = 1792,
-            .n_heads = 8,
-            .d_head = 128,
+            .n_heads = 4,
+            .d_head = 256,
             .d_conv = 4,
             .steps = 16,
         },
         .bw => .{
             .hidden = 1024,
             .ff = 3584,
-            .n_heads = 16,
-            .d_head = 128,
+            .n_heads = 8,
+            .d_head = 256,
             .d_conv = 4,
             .steps = 48,
         },
@@ -1243,6 +1245,7 @@ pub fn runAttentionDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scen
                 1.0e-5,
                 0.0,
                 0.0,
+                false,
             );
         }
         const t1 = std.time.nanoTimestamp();
@@ -1791,6 +1794,189 @@ pub fn runGatedDeltaBlockF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scen
         .flops_per_iter = toU64Saturating(flops_per_step * dims.steps),
         .bytes_per_iter = toU64Saturating(bytes_per_step * dims.steps),
         .note = "gated-delta block decode method: norm + gated-delta + add + norm + ffn + add",
+    };
+}
+
+pub fn runGatedDeltaBlockQuantizedU4(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    try expectMetalReady();
+
+    const dims = profileGatedDeltaBlockDims(cfg.profile);
+    const bits: usize = 4;
+    const group_size: usize = 64;
+    if (dims.hidden % group_size != 0) return error.InvalidInput;
+    if (dims.ff % group_size != 0) return error.InvalidInput;
+    if (dims.hidden % 8 != 0 or dims.ff % 8 != 0) return error.InvalidInput;
+
+    const d_inner = dims.n_heads * dims.d_head;
+    const qkv_len = 3 * d_inner;
+    const proj_dim = (4 * d_inner) + (2 * dims.n_heads);
+    if (d_inner % group_size != 0) return error.InvalidInput;
+
+    const token_shape = [_]i64{ 1, 1, @intCast(dims.hidden) };
+    const qkv_shape = [_]i64{@intCast(qkv_len)};
+    const head_shape = [_]i64{@intCast(dims.n_heads)};
+    const inner_shape = [_]i64{@intCast(d_inner)};
+    var x = try OwnedBF16.initShape(allocator, &token_shape, 0xA341);
+    defer x.deinit(allocator);
+
+    var ln1_w = try OwnedBF16Norm.init1D(allocator, dims.hidden, 0xA342);
+    defer ln1_w.deinit(allocator);
+    var ln2_w = try OwnedBF16Norm.init1D(allocator, dims.hidden, 0xA343);
+    defer ln2_w.deinit(allocator);
+
+    const in_packed_k = dims.hidden * bits / 32;
+    const out_packed_k = d_inner * bits / 32;
+    var in_w = try OwnedU32.init2D(allocator, proj_dim, in_packed_k, 0xA344);
+    defer in_w.deinit(allocator);
+    var in_s = try OwnedBF16.init2D(allocator, proj_dim, dims.hidden / group_size, 0xA345);
+    defer in_s.deinit(allocator);
+    var in_b = try OwnedBF16.init2D(allocator, proj_dim, dims.hidden / group_size, 0xA346);
+    defer in_b.deinit(allocator);
+
+    var conv_w = try OwnedBF16.init2D(allocator, dims.d_conv, qkv_len, 0xA347);
+    defer conv_w.deinit(allocator);
+    var conv_b = try OwnedBF16.initShape(allocator, &qkv_shape, 0xA348);
+    defer conv_b.deinit(allocator);
+    var a_log = try OwnedBF16.initShape(allocator, &head_shape, 0xA349);
+    defer a_log.deinit(allocator);
+    var dt_bias = try OwnedBF16.initShape(allocator, &head_shape, 0xA34A);
+    defer dt_bias.deinit(allocator);
+    var norm_weight = try OwnedBF16.initShape(allocator, &inner_shape, 0xA34B);
+    defer norm_weight.deinit(allocator);
+
+    var out_w = try OwnedU32.init2D(allocator, dims.hidden, out_packed_k, 0xA34C);
+    defer out_w.deinit(allocator);
+    var out_s = try OwnedBF16.init2D(allocator, dims.hidden, d_inner / group_size, 0xA34D);
+    defer out_s.deinit(allocator);
+    var out_b = try OwnedBF16.init2D(allocator, dims.hidden, d_inner / group_size, 0xA34E);
+    defer out_b.deinit(allocator);
+
+    const gate_up_packed_k = dims.hidden * bits / 32;
+    const down_packed_k = dims.ff * bits / 32;
+    const gate_up_groups = dims.hidden / group_size;
+    const down_groups = dims.ff / group_size;
+    var w1 = try OwnedU32.init2D(allocator, dims.ff, gate_up_packed_k, 0xA34F);
+    defer w1.deinit(allocator);
+    var w3 = try OwnedU32.init2D(allocator, dims.ff, gate_up_packed_k, 0xA350);
+    defer w3.deinit(allocator);
+    var w2 = try OwnedU32.init2D(allocator, dims.hidden, down_packed_k, 0xA351);
+    defer w2.deinit(allocator);
+    var w1_s = try OwnedBF16.init2D(allocator, dims.ff, gate_up_groups, 0xA352);
+    defer w1_s.deinit(allocator);
+    var w1_b = try OwnedBF16.init2D(allocator, dims.ff, gate_up_groups, 0xA353);
+    defer w1_b.deinit(allocator);
+    var w3_s = try OwnedBF16.init2D(allocator, dims.ff, gate_up_groups, 0xA354);
+    defer w3_s.deinit(allocator);
+    var w3_b = try OwnedBF16.init2D(allocator, dims.ff, gate_up_groups, 0xA355);
+    defer w3_b.deinit(allocator);
+    var w2_s = try OwnedBF16.init2D(allocator, dims.hidden, down_groups, 0xA356);
+    defer w2_s.deinit(allocator);
+    var w2_b = try OwnedBF16.init2D(allocator, dims.hidden, down_groups, 0xA357);
+    defer w2_b.deinit(allocator);
+
+    const cache = graph.mlx_state_space_cache_create(1);
+    defer graph.mlx_state_space_cache_free(cache);
+
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    const total_iters = cfg.warmup + cfg.iters;
+    var sample_idx: usize = 0;
+    var iter: usize = 0;
+    var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
+    graph.mlx_clear_memory_cache();
+    while (iter < total_iters) : (iter += 1) {
+        graph.mlx_state_space_cache_reset(cache);
+        graph.beginForwardGraphBuild();
+        const t0 = std.time.nanoTimestamp();
+        var out: graph.ArrayHandle = x.handle;
+        var step: usize = 0;
+        while (step < dims.steps) : (step += 1) {
+            const residual = out;
+            const norm1 = graph.mlx_lazy_rms_norm(out, ln1_w.handle, 1.0e-5);
+            const mixed = graph.mlx_lazy_gated_delta_mixer_quantized(
+                norm1,
+                in_w.handle,
+                in_s.handle,
+                in_b.handle,
+                conv_w.handle,
+                conv_b.handle,
+                a_log.handle,
+                dt_bias.handle,
+                norm_weight.handle,
+                out_w.handle,
+                out_s.handle,
+                out_b.handle,
+                group_size,
+                bits,
+                cache,
+                0,
+                dims.d_conv,
+                dims.n_heads,
+                dims.d_head,
+            );
+            const hidden_1 = graph.mlx_lazy_add(residual, mixed);
+            const norm2 = graph.mlx_lazy_rms_norm(hidden_1, ln2_w.handle, 1.0e-5);
+            const ffn = graph.mlx_lazy_fused_ffn(
+                norm2,
+                w1.handle,
+                w1_s.handle,
+                w1_b.handle,
+                w3.handle,
+                w3_s.handle,
+                w3_b.handle,
+                w2.handle,
+                w2_s.handle,
+                w2_b.handle,
+                group_size,
+                bits,
+                false,
+            );
+            out = graph.mlx_lazy_add(hidden_1, ffn);
+        }
+        const t1 = std.time.nanoTimestamp();
+        var handles = [_]graph.ArrayHandle{out};
+        const t2 = std.time.nanoTimestamp();
+        graph.eval(&handles);
+        const t3 = std.time.nanoTimestamp();
+        recordSample(&cold_first, samples, &sample_idx, iter, cfg.warmup, t0, t1, t2, t3);
+    }
+
+    const gdm_in_proj_flops = @as(u128, 2) * dims.hidden * proj_dim;
+    const gdm_out_proj_flops = @as(u128, 2) * d_inner * dims.hidden;
+    const gdm_conv_flops = @as(u128, 2) * dims.d_conv * qkv_len + @as(u128, 3) * qkv_len;
+    const recurrent_state_elems = @as(u128, dims.n_heads) * dims.d_head * dims.d_head;
+    const gdm_recurrent_flops = @as(u128, 12) * recurrent_state_elems + @as(u128, 8) * dims.n_heads * dims.d_head;
+    const ffn_flops = @as(u128, 6) * dims.hidden * dims.ff;
+    const norm_flops = @as(u128, 12) * dims.hidden;
+    const add_flops = @as(u128, 2) * dims.hidden;
+    const flops_per_step = gdm_in_proj_flops + gdm_out_proj_flops + gdm_conv_flops + gdm_recurrent_flops + ffn_flops + norm_flops + add_flops;
+
+    const gdm_in_weight_bytes = @as(u128, proj_dim) * dims.hidden * bits / 8;
+    const gdm_in_scale_bias_bytes = @as(u128, proj_dim) * (dims.hidden / group_size) * 2 * 2;
+    const gdm_out_weight_bytes = @as(u128, dims.hidden) * d_inner * bits / 8;
+    const gdm_out_scale_bias_bytes = @as(u128, dims.hidden) * (d_inner / group_size) * 2 * 2;
+    const gdm_conv_bytes = (@as(u128, dims.d_conv) * qkv_len + qkv_len) * 2;
+    const gdm_vec_bytes = (@as(u128, 2) * dims.n_heads + d_inner) * 2;
+    const gdm_conv_state_bytes = (@as(u128, 2) * dims.d_conv * qkv_len) * 4;
+    const gdm_recurrent_state_bytes = (@as(u128, 2) * dims.n_heads * dims.d_head * dims.d_head) * 4;
+    const ffn_gate_up_weight_bytes = (@as(u128, 2) * dims.ff * dims.hidden * bits) / 8;
+    const ffn_down_weight_bytes = (@as(u128, dims.hidden) * dims.ff * bits) / 8;
+    const ffn_gate_up_scale_bias_bytes = @as(u128, 2) * dims.ff * gate_up_groups * 2 * 2;
+    const ffn_down_scale_bias_bytes = @as(u128, dims.hidden) * down_groups * 2 * 2;
+    const ffn_io_bytes = @as(u128, 2) * dims.hidden * 2;
+    const norm_bytes = @as(u128, 2) * ((@as(u128, 2) * dims.hidden + dims.hidden) * 2);
+    const add_bytes = @as(u128, 2) * (@as(u128, 3) * dims.hidden * 2);
+    const bytes_per_step = gdm_in_weight_bytes + gdm_in_scale_bias_bytes + gdm_out_weight_bytes + gdm_out_scale_bias_bytes + gdm_conv_bytes + gdm_vec_bytes + gdm_conv_state_bytes + gdm_recurrent_state_bytes + ffn_gate_up_weight_bytes + ffn_down_weight_bytes + ffn_gate_up_scale_bias_bytes + ffn_down_scale_bias_bytes + ffn_io_bytes + norm_bytes + add_bytes;
+
+    return .{
+        .name = "p1_gdblkq_u4",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_first = cold_first,
+        .flops_per_iter = toU64Saturating(flops_per_step * dims.steps),
+        .bytes_per_iter = toU64Saturating(bytes_per_step * dims.steps),
+        .note = "quantized gated-delta block decode method: norm + gated-delta(u4) + add + norm + ffn(u4) + add",
     };
 }
 
@@ -2580,6 +2766,7 @@ pub fn runDecodeQuantizedMixU4(allocator: std.mem.Allocator, cfg: RunConfig) !Sc
                     bits,
                     0.0,
                     0.0,
+                    false,
                 );
             };
 
@@ -2690,6 +2877,23 @@ test "runGatedDeltaBlockF16 returns gated-delta block scenario metadata" {
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("p1_gdblk", result.name);
+    try std.testing.expect(result.flops_per_iter > 0);
+    try std.testing.expect(result.bytes_per_iter > 0);
+    try std.testing.expectEqual(@as(usize, 1), result.samples.len);
+}
+
+test "runGatedDeltaBlockQuantizedU4 returns gated-delta block quantized scenario metadata" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!metal.isAvailable()) return;
+
+    var result = try runGatedDeltaBlockQuantizedU4(std.testing.allocator, .{
+        .warmup = 0,
+        .iters = 1,
+        .profile = .ci,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("p1_gdblkq_u4", result.name);
     try std.testing.expect(result.flops_per_iter > 0);
     try std.testing.expect(result.bytes_per_iter > 0);
     try std.testing.expectEqual(@as(usize, 1), result.samples.len);

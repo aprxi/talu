@@ -80,6 +80,20 @@ fn loadNormWeight(weight: *const Tensor) MLXError!ArrayHandle {
     }
 }
 
+fn persistArrayHandle(handle: ArrayHandle) MLXError!ArrayHandle {
+    if (handle == null) return error.InvalidTensorType;
+    var shape: [8]usize = undefined;
+    const rank = mlx_graph.getShape(handle, &shape);
+    if (rank == 0) return handle;
+    return mlx_graph.mlx_persistent_reshape(handle, &shape, rank);
+}
+
+fn addOnePersistent(base: ArrayHandle) MLXError!ArrayHandle {
+    if (base == null) return error.InvalidTensorType;
+    const added = mlx_graph.mlx_add_one(base);
+    return try persistArrayHandle(added);
+}
+
 fn isGroupedAffineDType(dtype: dtype_mod.DType) bool {
     return dtype == .grouped_affine_u4 or dtype == .grouped_affine_u8;
 }
@@ -558,7 +572,40 @@ fn layerProgramStaticWeightPtr(
 fn resolveLayerProgramNormWeightPtr(
     layer: *WeightHandles.LayerWeights,
     norm_weight_index: usize,
+    qk_norm_as_rms_ops: bool,
 ) !*anyopaque {
+    if (qk_norm_as_rms_ops) {
+        var ordered: [6]?*anyopaque = [_]?*anyopaque{null} ** 6;
+        var count: usize = 0;
+
+        ordered[count] = @ptrCast(&layer.ln1_weight);
+        count += 1;
+
+        if (layer.q_norm) |*w| {
+            ordered[count] = @ptrCast(w);
+            count += 1;
+        }
+        if (layer.k_norm) |*w| {
+            ordered[count] = @ptrCast(w);
+            count += 1;
+        }
+
+        ordered[count] = @ptrCast(&layer.ln2_weight);
+        count += 1;
+
+        if (layer.pre_ffn_norm) |*w| {
+            ordered[count] = @ptrCast(w);
+            count += 1;
+        }
+        if (layer.post_ffn_norm) |*w| {
+            ordered[count] = @ptrCast(w);
+            count += 1;
+        }
+
+        if (norm_weight_index >= count) return error.MissingWeight;
+        return ordered[norm_weight_index] orelse error.MissingWeight;
+    }
+
     return switch (norm_weight_index) {
         0 => @ptrCast(&layer.ln1_weight),
         1 => @ptrCast(&layer.ln2_weight),
@@ -580,9 +627,10 @@ fn layerProgramWeightPtrForKey(
     layer: *WeightHandles.LayerWeights,
     key: WeightHandles.LayerProgramWeightBindingKey,
     norm_weight_index: usize,
+    qk_norm_as_rms_ops: bool,
 ) !*anyopaque {
     if (key == .invalid) return error.InvalidWeightBindingName;
-    if (key == .norm_weight) return try resolveLayerProgramNormWeightPtr(layer, norm_weight_index);
+    if (key == .norm_weight) return try resolveLayerProgramNormWeightPtr(layer, norm_weight_index, qk_norm_as_rms_ops);
     if (key == .norm_bias) return missingOptionalWeightPtrInternal();
     if (layerProgramStaticWeightPtr(layer, key)) |ptr| return ptr;
 
@@ -622,6 +670,22 @@ fn finalizeLayerProgramWeightPointers(layer: *WeightHandles.LayerWeights) !void 
     if (layer.weight_ptr_scratch.len != compiled.weight_bindings.len) return error.InvalidWeightRefCount;
     @memset(layer.weight_ptr_scratch, null);
 
+    var rmsnorm_instruction_count: usize = 0;
+    for (compiled.plan.instructions) |insn| {
+        if (insn.opcode == .rmsnorm) rmsnorm_instruction_count += 1;
+    }
+    var has_named_attention_qk_norm = false;
+    for (layer.weight_binding_keys) |key| {
+        if (key == .attention_q_norm or key == .attention_k_norm) {
+            has_named_attention_qk_norm = true;
+            break;
+        }
+    }
+    const qk_norm_as_rms_ops = !has_named_attention_qk_norm and
+        layer.q_norm != null and
+        layer.k_norm != null and
+        rmsnorm_instruction_count > 4;
+
     var norm_weight_index: usize = 0;
     for (compiled.plan.instructions, 0..) |insn, op_index| {
         const expected_slots = runtime_contract.expectedKernelWeightSlots(insn.opcode);
@@ -642,7 +706,7 @@ fn finalizeLayerProgramWeightPointers(layer: *WeightHandles.LayerWeights) !void 
 
             const key = try layerProgramWeightBindingKeyFor(insn.opcode, parsed.slot_name);
             if (layer.weight_binding_keys[weight_ref.index] != key) return error.InvalidWeightBindingName;
-            const ptr = try layerProgramWeightPtrForKey(layer, key, norm_weight_index);
+            const ptr = try layerProgramWeightPtrForKey(layer, key, norm_weight_index, qk_norm_as_rms_ops);
             if (layer.weight_ptr_scratch[weight_ref.index]) |existing| {
                 if (existing != ptr) return error.InvalidWeightBindingName;
             } else {
@@ -781,7 +845,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
     // Architecture features from graph definition
     weight_handles.has_norm_weight_offset = loaded.runtime.weight_offset != 0.0;
-    weight_handles.use_sqrt_embedding_scale = loaded.runtime.weight_offset != 0.0; // architectures with (1+w) norms also use sqrt scaling
+    weight_handles.use_sqrt_embedding_scale = false;
     weight_handles.use_gelu = loaded.config.use_gelu;
     weight_handles.use_post_attn_norm = loaded.runtime.weight_offset != 0.0; // architectures with (1+w) norms use post-attn norm before residual
     weight_handles.d_model = @intCast(loaded.config.d_model);
@@ -867,7 +931,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 var ln1_arr = try loadNormWeight(attn_block.ln1_weight);
                 // (1+w) RMSNorm formulation
                 if (weight_handles.has_norm_weight_offset) {
-                    ln1_arr = mlx_graph.mlx_add_one(ln1_arr);
+                    ln1_arr = try addOnePersistent(ln1_arr);
                 }
                 weight_handles.layers[layer_idx].ln1_weight = ln1_arr;
 
@@ -875,7 +939,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 var ln2_arr = try loadNormWeight(attn_block.ln2_weight);
                 // (1+w) RMSNorm formulation
                 if (weight_handles.has_norm_weight_offset) {
-                    ln2_arr = mlx_graph.mlx_add_one(ln2_arr);
+                    ln2_arr = try addOnePersistent(ln2_arr);
                 }
                 weight_handles.layers[layer_idx].ln2_weight = ln2_arr;
 
@@ -1016,7 +1080,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     var q_norm_arr = try loadNormWeight(q_norm_tensor);
                     // (1+w) RMSNorm formulation
                     if (weight_handles.has_norm_weight_offset) {
-                        q_norm_arr = mlx_graph.mlx_add_one(q_norm_arr);
+                        q_norm_arr = try addOnePersistent(q_norm_arr);
                     }
                     weight_handles.layers[layer_idx].q_norm = q_norm_arr;
                 } else {
@@ -1027,7 +1091,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     var k_norm_arr = try loadNormWeight(k_norm_tensor);
                     // (1+w) RMSNorm formulation
                     if (weight_handles.has_norm_weight_offset) {
-                        k_norm_arr = mlx_graph.mlx_add_one(k_norm_arr);
+                        k_norm_arr = try addOnePersistent(k_norm_arr);
                     }
                     weight_handles.layers[layer_idx].k_norm = k_norm_arr;
                 } else {
@@ -1039,7 +1103,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     var norm_arr = try loadNormWeight(pre_ffn_norm_tensor);
                     // (1+w) RMSNorm formulation
                     if (weight_handles.has_norm_weight_offset) {
-                        norm_arr = mlx_graph.mlx_add_one(norm_arr);
+                        norm_arr = try addOnePersistent(norm_arr);
                     }
                     weight_handles.layers[layer_idx].pre_ffn_norm = norm_arr;
                 } else {
@@ -1050,7 +1114,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     var norm_arr = try loadNormWeight(post_ffn_norm_tensor);
                     // (1+w) RMSNorm formulation
                     if (weight_handles.has_norm_weight_offset) {
-                        norm_arr = mlx_graph.mlx_add_one(norm_arr);
+                        norm_arr = try addOnePersistent(norm_arr);
                     }
                     weight_handles.layers[layer_idx].post_ffn_norm = norm_arr;
                 } else {
@@ -1066,14 +1130,14 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
                 var ln1_arr = try loadNormWeight(mamba_block.ln1_weight);
                 if (weight_handles.has_norm_weight_offset) {
-                    ln1_arr = mlx_graph.mlx_add_one(ln1_arr);
+                    ln1_arr = try addOnePersistent(ln1_arr);
                 }
                 weight_handles.layers[layer_idx].ln1_weight = ln1_arr;
 
                 const ln2_tensor = mamba_block.ln2_weight orelse mamba_block.ln1_weight;
                 var ln2_arr = try loadNormWeight(ln2_tensor);
                 if (weight_handles.has_norm_weight_offset) {
-                    ln2_arr = mlx_graph.mlx_add_one(ln2_arr);
+                    ln2_arr = try addOnePersistent(ln2_arr);
                 }
                 weight_handles.layers[layer_idx].ln2_weight = ln2_arr;
 
@@ -1135,17 +1199,33 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
             .gated_delta => |gated_delta_block| {
                 weight_handles.layers[layer_idx].kind = .gated_delta;
                 try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .gated_delta);
+                if (std.posix.getenv("TALU_DBG_GD_WEIGHTS") != null and layer_idx == 0) {
+                    const in_proj = gated_delta_block.weights.in_proj;
+                    const out_proj = gated_delta_block.weights.out_proj;
+                    std.debug.print(
+                        "DBG_GD_WEIGHTS layer={} in_proj_shape=[{},{}] in_proj_dtype={s} out_proj_shape=[{},{}] out_proj_dtype={s}\n",
+                        .{
+                            layer_idx,
+                            if (in_proj.n_dims > 0) in_proj.shape[0] else @as(i64, 0),
+                            if (in_proj.n_dims > 1) in_proj.shape[1] else @as(i64, 0),
+                            @tagName(in_proj.dtype),
+                            if (out_proj.n_dims > 0) out_proj.shape[0] else @as(i64, 0),
+                            if (out_proj.n_dims > 1) out_proj.shape[1] else @as(i64, 0),
+                            @tagName(out_proj.dtype),
+                        },
+                    );
+                }
 
                 var ln1_arr = try loadNormWeight(gated_delta_block.ln1_weight);
                 if (weight_handles.has_norm_weight_offset) {
-                    ln1_arr = mlx_graph.mlx_add_one(ln1_arr);
+                    ln1_arr = try addOnePersistent(ln1_arr);
                 }
                 weight_handles.layers[layer_idx].ln1_weight = ln1_arr;
 
                 const ln2_tensor = gated_delta_block.ln2_weight orelse gated_delta_block.ln1_weight;
                 var ln2_arr = try loadNormWeight(ln2_tensor);
                 if (weight_handles.has_norm_weight_offset) {
-                    ln2_arr = mlx_graph.mlx_add_one(ln2_arr);
+                    ln2_arr = try addOnePersistent(ln2_arr);
                 }
                 weight_handles.layers[layer_idx].ln2_weight = ln2_arr;
 
@@ -1212,7 +1292,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
                 var ln1_arr = try loadNormWeight(shortconv_block.ln1_weight);
                 if (weight_handles.has_norm_weight_offset) {
-                    ln1_arr = mlx_graph.mlx_add_one(ln1_arr);
+                    ln1_arr = try addOnePersistent(ln1_arr);
                 }
                 weight_handles.layers[layer_idx].ln1_weight = ln1_arr;
 
@@ -1220,7 +1300,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 const ln2_tensor = shortconv_block.ln2_weight orelse return error.MissingField;
                 var ln2_arr = try loadNormWeight(ln2_tensor);
                 if (weight_handles.has_norm_weight_offset) {
-                    ln2_arr = mlx_graph.mlx_add_one(ln2_arr);
+                    ln2_arr = try addOnePersistent(ln2_arr);
                 }
                 weight_handles.layers[layer_idx].ln2_weight = ln2_arr;
 
@@ -1486,7 +1566,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
         var ln_final_arr = try loadNormWeight(&ln_f);
         // (1+w) RMSNorm formulation
         if (weight_handles.has_norm_weight_offset) {
-            ln_final_arr = mlx_graph.mlx_add_one(ln_final_arr);
+            ln_final_arr = try addOnePersistent(ln_final_arr);
         }
         weight_handles.ln_final = ln_final_arr;
     }
@@ -1541,6 +1621,41 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 mlx_graph.freeArray(weight_handles.lm_head.?);
                 weight_handles.lm_head = lm_head_t;
             }
+        }
+    }
+
+    if (std.posix.getenv("TALU_DBG_METAL_LMHEAD") != null) {
+        if (weight_handles.lm_head) |lm_head| {
+            var shape: [8]usize = undefined;
+            const rank = mlx_graph.getShape(lm_head, &shape);
+            std.debug.print(
+                "DBG_METAL_LMHEAD dense rank={} d0={} d1={} d_model={} vocab={}\n",
+                .{
+                    rank,
+                    if (rank > 0) shape[0] else @as(usize, 0),
+                    if (rank > 1) shape[1] else @as(usize, 0),
+                    loaded.config.d_model,
+                    loaded.config.vocab_size,
+                },
+            );
+        } else if (weight_handles.lm_head_quantized != null) {
+            const q = weight_handles.lm_head_quantized.?;
+            var w_shape: [8]usize = undefined;
+            const w_rank = mlx_graph.getShape(q.weights, &w_shape);
+            std.debug.print(
+                "DBG_METAL_LMHEAD quant rank={} d0={} d1={} group_size={} bits={} d_model={} vocab={}\n",
+                .{
+                    w_rank,
+                    if (w_rank > 0) w_shape[0] else @as(usize, 0),
+                    if (w_rank > 1) w_shape[1] else @as(usize, 0),
+                    q.group_size,
+                    q.bits,
+                    loaded.config.d_model,
+                    loaded.config.vocab_size,
+                },
+            );
+        } else {
+            std.debug.print("DBG_METAL_LMHEAD missing\n", .{});
         }
     }
 
