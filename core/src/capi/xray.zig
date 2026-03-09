@@ -376,3 +376,316 @@ pub const POINT_GDELTA_SSM: u32 = 1 << 29;
 pub const POINT_GDELTA_NORM: u32 = 1 << 30;
 pub const POINT_GDELTA_OUT: u32 = 1 << 31;
 pub const POINT_ALL: u32 = 0xFFFFFFFF; // All 32 points
+
+// =============================================================================
+// Reference Recording & Verification System
+// =============================================================================
+
+/// Opaque handle for reference recorder
+pub const ReferenceRecorderHandle = opaque {};
+
+/// Opaque handle for reference data
+pub const ReferenceDataHandle = opaque {};
+
+/// Opaque handle for reference verifier
+pub const ReferenceVerifierHandle = opaque {};
+
+/// Opaque handle for verify capture
+pub const VerifyCaptureHandle = opaque {};
+
+// ---- Reference Recorder ----
+
+/// Create a new reference recorder for recording phase.
+/// Returns null on failure (check talu_error_message for details).
+pub export fn talu_xray_reference_recorder_create(
+    model_name: [*:0]const u8,
+    seed: u64,
+    temperature: f32,
+    max_tokens: u32,
+) callconv(.c) ?*ReferenceRecorderHandle {
+    capi_error.clearError();
+    const name = std.mem.span(model_name);
+    const recorder = allocator.create(xray.ReferenceRecorder) catch {
+        capi_error.setError(error.OutOfMemory, "failed to allocate reference recorder", .{});
+        return null;
+    };
+    recorder.* = xray.ReferenceRecorder.init(allocator, name, seed, temperature, max_tokens) catch |err| {
+        allocator.destroy(recorder);
+        capi_error.setError(err, "failed to initialize reference recorder", .{});
+        return null;
+    };
+    return @ptrCast(recorder);
+}
+
+/// Record a sampled token in the reference.
+/// Returns false on error (check talu_error_message).
+pub export fn talu_xray_reference_recorder_record_token(
+    handle: ?*ReferenceRecorderHandle,
+    token_id: u32,
+) callconv(.c) bool {
+    capi_error.clearError();
+    const recorder = getReferenceRecorder(handle) orelse {
+        capi_error.setError(error.InvalidHandle, "recorder handle is null", .{});
+        return false;
+    };
+    recorder.recordToken(token_id) catch |err| {
+        capi_error.setError(err, "failed to record token", .{});
+        return false;
+    };
+    return true;
+}
+
+/// Advance to next token position in recording.
+pub export fn talu_xray_reference_recorder_next_token(handle: ?*ReferenceRecorderHandle) callconv(.c) void {
+    const recorder = getReferenceRecorder(handle) orelse return;
+    recorder.nextToken();
+}
+
+/// Finalize recording and create reference data.
+/// Returns null on failure (check talu_error_message).
+/// The recorder handle is consumed and should not be used after this call.
+pub export fn talu_xray_reference_recorder_finalize(
+    handle: ?*ReferenceRecorderHandle,
+) callconv(.c) ?*ReferenceDataHandle {
+    capi_error.clearError();
+    const recorder = getReferenceRecorder(handle) orelse {
+        capi_error.setError(error.InvalidHandle, "recorder handle is null", .{});
+        return null;
+    };
+    var reference = recorder.finalize() catch |err| {
+        capi_error.setError(err, "failed to finalize recorder", .{});
+        return null;
+    };
+    const ref_data = allocator.create(xray.ReferenceData) catch {
+        reference.deinit();
+        capi_error.setError(error.OutOfMemory, "failed to allocate reference data", .{});
+        return null;
+    };
+    ref_data.* = reference;
+    // Note: recorder is consumed by finalize, caller should not destroy it
+    allocator.destroy(recorder);
+    return @ptrCast(ref_data);
+}
+
+/// Destroy reference recorder (only use if not finalized).
+pub export fn talu_xray_reference_recorder_destroy(handle: ?*ReferenceRecorderHandle) callconv(.c) void {
+    const recorder = getReferenceRecorder(handle) orelse return;
+    recorder.deinit();
+    allocator.destroy(recorder);
+}
+
+// ---- Reference Data ----
+
+/// Save reference data to JSON file.
+/// Returns false on error (check talu_error_message).
+pub export fn talu_xray_reference_data_save_json(
+    handle: ?*ReferenceDataHandle,
+    file_path: [*:0]const u8,
+) callconv(.c) bool {
+    capi_error.clearError();
+    const ref_data = getReferenceData(handle) orelse {
+        capi_error.setError(error.InvalidHandle, "reference data handle is null", .{});
+        return false;
+    };
+    const path = std.mem.span(file_path);
+    xray.reference.JsonFormat.writeToFile(ref_data, path) catch |err| {
+        capi_error.setError(err, "failed to write reference to JSON file", .{});
+        return false;
+    };
+    return true;
+}
+
+/// Load reference data from JSON file.
+/// Returns null on failure (check talu_error_message).
+pub export fn talu_xray_reference_data_load_json(
+    file_path: [*:0]const u8,
+) callconv(.c) ?*ReferenceDataHandle {
+    capi_error.clearError();
+    const path = std.mem.span(file_path);
+    var reference = xray.reference.JsonFormat.readFromFile(allocator, path) catch |err| {
+        capi_error.setError(err, "failed to load reference from JSON file", .{});
+        return null;
+    };
+    const ref_data = allocator.create(xray.ReferenceData) catch {
+        reference.deinit();
+        capi_error.setError(error.OutOfMemory, "failed to allocate reference data", .{});
+        return null;
+    };
+    ref_data.* = reference;
+    return @ptrCast(ref_data);
+}
+
+/// Destroy reference data.
+pub export fn talu_xray_reference_data_destroy(handle: ?*ReferenceDataHandle) callconv(.c) void {
+    const ref_data = getReferenceData(handle) orelse return;
+    ref_data.deinit();
+    allocator.destroy(ref_data);
+}
+
+// ---- Reference Verifier ----
+
+/// Create a reference verifier for verification phase.
+/// Returns null on failure (check talu_error_message).
+pub export fn talu_xray_reference_verifier_create(
+    ref_data_handle: ?*ReferenceDataHandle,
+    tolerance: f32,
+) callconv(.c) ?*ReferenceVerifierHandle {
+    capi_error.clearError();
+    const ref_data = getReferenceData(ref_data_handle) orelse {
+        capi_error.setError(error.InvalidHandle, "reference data handle is null", .{});
+        return null;
+    };
+    const verifier = allocator.create(xray.ReferenceVerifier) catch {
+        capi_error.setError(error.OutOfMemory, "failed to allocate reference verifier", .{});
+        return null;
+    };
+    verifier.* = xray.ReferenceVerifier.init(allocator, ref_data, tolerance);
+    return @ptrCast(verifier);
+}
+
+/// Get next forced token from verifier (for teacher forcing).
+/// Returns 0xFFFFFFFF if no more tokens available.
+pub export fn talu_xray_reference_verifier_get_next_token(
+    handle: ?*ReferenceVerifierHandle,
+) callconv(.c) u32 {
+    const verifier = getReferenceVerifier(handle) orelse return 0xFFFFFFFF;
+    return verifier.getNextToken() orelse 0xFFFFFFFF;
+}
+
+/// Advance to next token position in verification.
+pub export fn talu_xray_reference_verifier_next_token(handle: ?*ReferenceVerifierHandle) callconv(.c) void {
+    const verifier = getReferenceVerifier(handle) orelse return;
+    verifier.nextToken();
+}
+
+/// Check if verification has detected divergence.
+pub export fn talu_xray_reference_verifier_has_diverged(handle: ?*ReferenceVerifierHandle) callconv(.c) bool {
+    const verifier = getReferenceVerifier(handle) orelse return false;
+    return verifier.has_diverged;
+}
+
+/// Destroy reference verifier.
+pub export fn talu_xray_reference_verifier_destroy(handle: ?*ReferenceVerifierHandle) callconv(.c) void {
+    const verifier = getReferenceVerifier(handle) orelse return;
+    // Note: verifier doesn't own allocator, just reset
+    allocator.destroy(verifier);
+}
+
+// ---- Verify Capture ----
+
+/// Create verify capture in recording mode.
+/// Returns null on failure (check talu_error_message).
+pub export fn talu_xray_verify_capture_create_recording(
+    recorder_handle: ?*ReferenceRecorderHandle,
+) callconv(.c) ?*VerifyCaptureHandle {
+    capi_error.clearError();
+    const recorder = getReferenceRecorder(recorder_handle) orelse {
+        capi_error.setError(error.InvalidHandle, "recorder handle is null", .{});
+        return null;
+    };
+    const verify_cap = allocator.create(xray.VerifyCapture) catch {
+        capi_error.setError(error.OutOfMemory, "failed to allocate verify capture", .{});
+        return null;
+    };
+    verify_cap.* = xray.VerifyCapture.initRecording(allocator, recorder);
+    return @ptrCast(verify_cap);
+}
+
+/// Create verify capture in verification mode.
+/// Returns null on failure (check talu_error_message).
+/// panic_dump_dir can be null to disable panic dumps.
+pub export fn talu_xray_verify_capture_create_verification(
+    verifier_handle: ?*ReferenceVerifierHandle,
+    panic_dump_dir: ?[*:0]const u8,
+) callconv(.c) ?*VerifyCaptureHandle {
+    capi_error.clearError();
+    const verifier = getReferenceVerifier(verifier_handle) orelse {
+        capi_error.setError(error.InvalidHandle, "verifier handle is null", .{});
+        return null;
+    };
+    const dump_dir: ?[]const u8 = if (panic_dump_dir) |ptr| std.mem.span(ptr) else null;
+    const verify_cap = allocator.create(xray.VerifyCapture) catch {
+        capi_error.setError(error.OutOfMemory, "failed to allocate verify capture", .{});
+        return null;
+    };
+    verify_cap.* = xray.VerifyCapture.initVerification(allocator, verifier, dump_dir);
+    return @ptrCast(verify_cap);
+}
+
+/// Enable verify capture (start receiving trace emissions).
+pub export fn talu_xray_verify_capture_enable(handle: ?*VerifyCaptureHandle) callconv(.c) void {
+    const verify_cap = getVerifyCapture(handle) orelse return;
+    xray.enableVerifyCapture(verify_cap);
+}
+
+/// Disable verify capture (stop receiving trace emissions).
+pub export fn talu_xray_verify_capture_disable() callconv(.c) void {
+    xray.disableVerifyCapture();
+}
+
+/// Destroy verify capture.
+pub export fn talu_xray_verify_capture_destroy(handle: ?*VerifyCaptureHandle) callconv(.c) void {
+    const verify_cap = getVerifyCapture(handle) orelse return;
+    // Disable if this capture is active
+    xray.disableVerifyCapture();
+    verify_cap.deinit();
+    allocator.destroy(verify_cap);
+}
+
+// ---- Teacher Forcing ----
+
+/// Enable teacher forcing using a verifier as the token source.
+/// The sampler will get forced tokens from the verifier during generation.
+pub export fn talu_xray_teacher_forcing_enable_with_verifier(
+    verifier_handle: ?*ReferenceVerifierHandle,
+) callconv(.c) void {
+    const verifier = getReferenceVerifier(verifier_handle) orelse return;
+
+    // Create a callback that gets tokens from the verifier
+    const Wrapper = struct {
+        fn getToken(ctx: ?*anyopaque) ?u32 {
+            const ver: *xray.ReferenceVerifier = @ptrCast(@alignCast(ctx.?));
+            return ver.getNextToken();
+        }
+    };
+
+    xray.enableTeacherForcing(&Wrapper.getToken, verifier);
+}
+
+/// Disable teacher forcing (return to normal sampling).
+pub export fn talu_xray_teacher_forcing_disable() callconv(.c) void {
+    xray.disableTeacherForcing();
+}
+
+/// Check if teacher forcing is active.
+pub export fn talu_xray_teacher_forcing_is_enabled() callconv(.c) bool {
+    return xray.isTeacherForcingEnabled();
+}
+
+/// Get next forced token (for use by sampler).
+/// Returns 0xFFFFFFFF if teacher forcing is disabled or no more tokens.
+pub export fn talu_xray_teacher_forcing_get_next_token() callconv(.c) u32 {
+    return xray.getNextForcedToken() orelse 0xFFFFFFFF;
+}
+
+// ---- Helpers ----
+
+fn getReferenceRecorder(handle: ?*ReferenceRecorderHandle) ?*xray.ReferenceRecorder {
+    const h = handle orelse return null;
+    return @ptrCast(@alignCast(h));
+}
+
+fn getReferenceData(handle: ?*ReferenceDataHandle) ?*xray.ReferenceData {
+    const h = handle orelse return null;
+    return @ptrCast(@alignCast(h));
+}
+
+fn getReferenceVerifier(handle: ?*ReferenceVerifierHandle) ?*xray.ReferenceVerifier {
+    const h = handle orelse return null;
+    return @ptrCast(@alignCast(h));
+}
+
+fn getVerifyCapture(handle: ?*VerifyCaptureHandle) ?*xray.VerifyCapture {
+    const h = handle orelse return null;
+    return @ptrCast(@alignCast(h));
+}

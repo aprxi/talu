@@ -1008,8 +1008,148 @@ fn print_checkpoint_consistency_warnings(point_rows: &[PointUsageRow]) {
     }
 }
 
+/// Recording mode: generate tokens and save reference stats to JSON
+fn cmd_xray_record(model: &str, ref_path: &str, args: &XrayArgs) -> Result<()> {
+    use talu::xray::{ReferenceRecorderHandle, VerifyCaptureHandle};
+
+    let prompt_text = if args.prompt.is_empty() {
+        "xray".to_string()
+    } else {
+        args.prompt.join(" ")
+    };
+
+    println!("Recording reference for model: {}", model);
+    println!("  Tokens: {}", args.tokens);
+    println!("  Seed: {}", args.seed);
+    println!("  Prompt: \"{}\"", prompt_text);
+
+    let max_tokens = args.tokens;
+
+    // Create reference recorder (use seed from args)
+    let recorder = ReferenceRecorderHandle::new(model, args.seed, 1.0, max_tokens)?;
+
+    // Create verify capture in recording mode
+    let verify_cap = VerifyCaptureHandle::new_recording(&recorder)?;
+
+    // Create backend and chat
+    let backend = create_backend_for_model(model, None)?;
+    let chat = ChatHandle::new(None)?;
+
+    // Enable capture AFTER backend initialization to skip warmup passes
+    verify_cap.enable();
+
+    let content = vec![talu::router::ContentPart::Text(prompt_text)];
+
+    let cfg = talu::router::GenerateConfig {
+        temperature: 1.0,
+        max_tokens: max_tokens as usize,
+        seed: args.seed,
+        ..Default::default()
+    };
+
+    let result = talu::router::generate(&chat, &content, &backend, &cfg);
+
+    VerifyCaptureHandle::disable();
+
+    let result = result?;
+    if result.error_code() != 0 {
+        let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
+        return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
+    }
+
+    if let Some(_text) = result.text() {
+        println!("\nGenerated {} tokens.", result.completion_tokens());
+    } else {
+        println!("Warning: No text generated, reference will have empty token transcript");
+    }
+
+    // Finalize and save
+    println!("Finalizing reference...");
+    let reference = recorder.finalize()?;
+    reference.save(ref_path)?;
+
+    println!("✓ Reference saved to: {}", ref_path);
+    Ok(())
+}
+
+/// Verification mode: load reference and verify generation matches
+fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs) -> Result<()> {
+    use talu::xray::{ReferenceDataHandle, ReferenceVerifierHandle, VerifyCaptureHandle, TeacherForcing};
+
+    let prompt_text = if args.prompt.is_empty() {
+        "xray".to_string()
+    } else {
+        args.prompt.join(" ")
+    };
+
+    println!("Verifying model {} against reference: {}", model, ref_path);
+    println!("  Tokens: {}", args.tokens);
+    println!("  Seed: {}", args.seed);
+    println!("  Tolerance: {}", tolerance);
+    println!("  Prompt: \"{}\"", prompt_text);
+
+    // Load reference
+    let reference = ReferenceDataHandle::load(ref_path)?;
+
+    // Create verifier
+    let verifier = ReferenceVerifierHandle::new(&reference, tolerance)?;
+
+    // Create verify capture in verification mode
+    let verify_cap = VerifyCaptureHandle::new_verification(&verifier, Some("/tmp/panic_dumps"))?;
+
+    // Create backend and chat
+    let backend = create_backend_for_model(model, None)?;
+    let chat = ChatHandle::new(None)?;
+
+    // Enable capture AFTER backend initialization to skip warmup passes
+    verify_cap.enable();
+
+    // Enable teacher forcing
+    TeacherForcing::enable_with_verifier(&verifier);
+
+    let content = vec![talu::router::ContentPart::Text(prompt_text)];
+
+    // Use same config as recording
+    let cfg = talu::router::GenerateConfig {
+        temperature: 1.0, // Will be overridden by teacher forcing
+        max_tokens: args.tokens as usize,
+        seed: args.seed,
+        ..Default::default()
+    };
+
+    println!("Verifying {} tokens with teacher forcing...", args.tokens);
+    let result = talu::router::generate(&chat, &content, &backend, &cfg);
+
+    TeacherForcing::disable();
+    VerifyCaptureHandle::disable();
+
+    let result = result?;
+    if result.error_code() != 0 {
+        let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
+        return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
+    }
+
+    // Check if verification detected divergence
+    if verifier.has_diverged() {
+        println!("✗ Verification FAILED: Divergence detected");
+        println!("  Check panic dumps in /tmp/panic_dumps/");
+        return Err(anyhow!("Verification failed: numerical divergence detected"));
+    }
+
+    println!("✓ Verification PASSED: No divergence detected");
+    Ok(())
+}
+
 pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
     let model = &args.model;
+
+    // Check for recording/verification modes
+    if let Some(ref_path) = &args.record_reference {
+        return cmd_xray_record(model, ref_path, &args);
+    }
+    if let Some(ref_path) = &args.verify_reference {
+        return cmd_xray_verify(model, ref_path, args.tolerance, &args);
+    }
 
     let decode_mode = args.output;
 

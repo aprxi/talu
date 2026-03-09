@@ -155,6 +155,29 @@ pub const Sampler = struct {
     }
 
     fn sampleImpl(self: *Sampler, logits: []const f32, config: SamplingConfig) !usize {
+        // Import xray and trace once for use throughout the function
+        const xray = @import("../../../xray/root.zig");
+        const trace = @import("../../../xray/trace.zig");
+
+        // Check for teacher forcing (verification mode)
+        if (xray.getNextForcedToken()) |forced_token| {
+            // Emit token_select so xray can track this token
+            if (trace.isEnabled()) {
+                const next_token_u32: u32 = @intCast(forced_token);
+                trace.emitFinal(
+                    .token_select,
+                    0, // batch index
+                    0, // position
+                    @ptrCast(&next_token_u32),
+                    .u32,
+                    .{ 1, 0, 0, 0 },
+                    1,
+                    "teacher_forcing",
+                );
+            }
+            return forced_token;
+        }
+
         if (logits.len == 0) return error.InvalidInput;
         if (logits.len > self.workspace.probabilities.len) return error.InvalidInput;
 
@@ -164,7 +187,24 @@ pub const Sampler = struct {
         if (config.min_p < 0 or config.min_p > 1.0) return error.InvalidMinP;
 
         if (config.strategy == .greedy) {
-            return cpu_reduction.argmaxIndex(logits);
+            const selected_index = cpu_reduction.argmaxIndex(logits);
+
+            // Emit token_select for greedy sampling too
+            if (xray.isTraceEnabled()) {
+                const next_token_u32: u32 = @intCast(selected_index);
+                trace.emitFinal(
+                    .token_select,
+                    0, // batch index
+                    0, // position
+                    @ptrCast(&next_token_u32),
+                    .u32,
+                    .{ 1, 0, 0, 0 },
+                    1,
+                    "greedy",
+                );
+            }
+
+            return selected_index;
         }
 
         // For non-greedy strategies, temperature must be positive
@@ -238,6 +278,22 @@ pub const Sampler = struct {
                 break;
             }
         }
+
+        // Emit token_select so xray can track this token during recording
+        if (xray.isTraceEnabled()) {
+            const next_token_u32: u32 = @intCast(sampled_index);
+            trace.emitFinal(
+                .token_select,
+                0, // batch index
+                0, // position
+                @ptrCast(&next_token_u32),
+                .u32,
+                .{ 1, 0, 0, 0 },
+                1,
+                "sampling",
+            );
+        }
+
         return sampled_index;
     }
 };

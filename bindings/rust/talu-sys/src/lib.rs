@@ -4266,8 +4266,6 @@ extern "C" {
     pub fn talu_decode_result_free(text: *mut u8, text_len: usize);
     // core/src/capi/converter.zig
     pub fn talu_describe(model_path: *const c_char) -> ModelInfo;
-    // core/src/capi/converter.zig
-    pub fn talu_model_performance_hints(name: *const c_char, out_json: *mut *mut c_char) -> c_int;
     // core/src/capi/tensor.zig
     pub fn talu_dlpack_capsule_name() -> *const c_char;
     // core/src/capi/tensor.zig
@@ -4348,6 +4346,8 @@ extern "C" {
     pub fn talu_model_buffer_free(buf: *mut TaluModelBuffer);
     // core/src/capi/converter.zig
     pub fn talu_model_info_free(info: *mut ModelInfo);
+    // core/src/capi/converter.zig
+    pub fn talu_model_performance_hints(name: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
     pub fn talu_padded_tensor_result_free(input_ids: *mut u32, attention_mask: *mut u32, num_sequences: usize, padded_length: usize);
     // core/src/capi/file.zig
@@ -4623,13 +4623,13 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_router_iterator_generation_ns(iterator: *mut c_void) -> u64;
     // core/src/capi/router.zig
-    pub fn talu_router_iterator_output_text(iterator: *mut c_void) -> *const c_char;
-    // core/src/capi/router.zig
     pub fn talu_router_iterator_has_error(iterator: *mut c_void) -> bool;
     // core/src/capi/router.zig
     pub fn talu_router_iterator_item_type(iterator: *mut c_void) -> u8;
     // core/src/capi/router.zig
     pub fn talu_router_iterator_next(iterator: *mut c_void) -> *const c_char;
+    // core/src/capi/router.zig
+    pub fn talu_router_iterator_output_text(iterator: *mut c_void) -> *const c_char;
     // core/src/capi/router.zig
     pub fn talu_router_iterator_prefill_ns(iterator: *mut c_void) -> u64;
     // core/src/capi/router.zig
@@ -4805,6 +4805,10 @@ extern "C" {
     // core/src/capi/train_full.zig
     pub fn talu_train_full_configure(handle: *mut c_void, config: *const CFullSessionConfig) -> c_int;
     // core/src/capi/train_full.zig
+    pub fn talu_train_full_copy_optimizer_state_f32(handle: *mut c_void, out_state: *const f32, out_len: usize) -> c_int;
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_copy_weights_f32(handle: *mut c_void, out_weights: *const f32, out_len: usize) -> c_int;
+    // core/src/capi/train_full.zig
     pub fn talu_train_full_create(out: *mut c_void) -> c_int;
     // core/src/capi/train_full.zig
     pub fn talu_train_full_destroy(handle: *mut c_void);
@@ -4814,6 +4818,10 @@ extern "C" {
     pub fn talu_train_full_init_model(handle: *mut c_void, config: *const CTransformerConfig, seed: u64) -> c_int;
     // core/src/capi/train_full.zig
     pub fn talu_train_full_load_data(handle: *mut c_void, data_path: *const c_char) -> c_int;
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_load_optimizer_state_f32(handle: *mut c_void, in_state: *const f32, in_len: usize) -> c_int;
+    // core/src/capi/train_full.zig
+    pub fn talu_train_full_load_weights_f32(handle: *mut c_void, in_weights: *const f32, in_len: usize, step: u64) -> c_int;
     // core/src/capi/train_full.zig
     pub fn talu_train_full_run(handle: *mut c_void, callback: *mut c_void, user_data: *mut c_void) -> c_int;
     // core/src/capi/train_full.zig
@@ -4946,6 +4954,50 @@ extern "C" {
     pub fn talu_xray_get_samples(handle: *mut c_void, index: usize, out_samples: *const f32, max_samples: usize) -> usize;
     // core/src/capi/xray.zig
     pub fn talu_xray_point_name(point: u8) -> *const c_char;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_data_destroy(handle: *mut c_void);
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_data_load_json(file_path: *const c_char) -> *mut c_void;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_data_save_json(handle: *mut c_void, file_path: *const c_char) -> bool;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_recorder_create(model_name: *const c_char, seed: u64, temperature: f32, max_tokens: u32) -> *mut c_void;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_recorder_destroy(handle: *mut c_void);
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_recorder_finalize(handle: *mut c_void) -> *mut c_void;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_recorder_next_token(handle: *mut c_void);
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_recorder_record_token(handle: *mut c_void, token_id: u32) -> bool;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_verifier_create(ref_data_handle: *mut c_void, tolerance: f32) -> *mut c_void;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_verifier_destroy(handle: *mut c_void);
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_verifier_get_next_token(handle: *mut c_void) -> u32;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_verifier_has_diverged(handle: *mut c_void) -> bool;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_reference_verifier_next_token(handle: *mut c_void);
+    // core/src/capi/xray.zig
+    pub fn talu_xray_teacher_forcing_disable();
+    // core/src/capi/xray.zig
+    pub fn talu_xray_teacher_forcing_enable_with_verifier(verifier_handle: *mut c_void);
+    // core/src/capi/xray.zig
+    pub fn talu_xray_teacher_forcing_get_next_token() -> u32;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_teacher_forcing_is_enabled() -> bool;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_verify_capture_create_recording(recorder_handle: *mut c_void) -> *mut c_void;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_verify_capture_create_verification(verifier_handle: *mut c_void, panic_dump_dir: *const c_char) -> *mut c_void;
+    // core/src/capi/xray.zig
+    pub fn talu_xray_verify_capture_destroy(handle: *mut c_void);
+    // core/src/capi/xray.zig
+    pub fn talu_xray_verify_capture_disable();
+    // core/src/capi/xray.zig
+    pub fn talu_xray_verify_capture_enable(handle: *mut c_void);
 }
 
 // =============================================================================

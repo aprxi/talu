@@ -563,6 +563,26 @@ pub(super) struct XrayArgs {
     #[arg(long)]
     pub debug: bool,
 
+    /// Record reference stats to JSON file for cross-backend verification
+    #[arg(long, group = "verify_mode")]
+    pub record_reference: Option<String>,
+
+    /// Verify against reference stats from JSON file
+    #[arg(long, group = "verify_mode")]
+    pub verify_reference: Option<String>,
+
+    /// Tolerance for stats comparison during verification (default: 1e-3)
+    #[arg(long, default_value = "0.001")]
+    pub tolerance: f32,
+
+    /// Number of tokens to generate for recording/verification (default: 100)
+    #[arg(long, default_value = "100")]
+    pub tokens: u32,
+
+    /// Random seed for deterministic generation (default: 42)
+    #[arg(long, default_value = "42")]
+    pub seed: u64,
+
     /// Prompt text (default: "xray")
     #[arg(trailing_var_arg = true)]
     pub prompt: Vec<String>,

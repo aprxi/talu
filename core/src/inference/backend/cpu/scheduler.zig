@@ -251,9 +251,15 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             errdefer allocator.free(decode_result_buffer);
 
             // Initialize optimized sampler with pre-allocated workspace
+            // Use seed from config if specified (non-zero), otherwise use time-based seed
+            const sampler_seed = if (config.default_sampling.seed != 0)
+                config.default_sampling.seed
+            else
+                @as(u64, @intCast(std.time.milliTimestamp()));
+
             var sampler_instance = try sampling.Sampler.init(
                 allocator,
-                @intCast(std.time.milliTimestamp()),
+                sampler_seed,
                 vocab,
             );
             errdefer sampler_instance.deinit();

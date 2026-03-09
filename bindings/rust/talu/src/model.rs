@@ -135,7 +135,7 @@ pub fn performance_hints_json(name: &str) -> Result<Option<String>> {
     let mut out_json: *mut c_char = std::ptr::null_mut();
 
     // SAFETY: c_name is valid and out_json points to writable storage.
-    let rc = unsafe { talu_sys::talu_model_performance_hints(c_name.as_ptr(), &mut out_json) };
+    let rc = unsafe { talu_sys::talu_model_performance_hints(c_name.as_ptr(), &mut out_json as *mut _ as *mut std::os::raw::c_void) };
     if rc != 0 {
         return Err(error_from_last_or("Failed to get model performance hints"));
     }
