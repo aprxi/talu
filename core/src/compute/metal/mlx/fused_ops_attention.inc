@@ -481,10 +481,16 @@ static void maybe_apply_qk_norm(
         throw std::invalid_argument("[attention] null qk tensor");
     }
     if (q_norm_w != nullptr) {
-        *q = fast::rms_norm(*q, *static_cast<const array*>(q_norm_w), rms_eps);
+        const auto& q_weight = *static_cast<const array*>(q_norm_w);
+        const int q_width = q->shape(q->ndim() - 1);
+        const array q_norm = canonicalize_rms_norm_weight(q_weight, q_width, "attention.q_norm");
+        *q = fast::rms_norm(*q, q_norm, rms_eps);
     }
     if (k_norm_w != nullptr) {
-        *k = fast::rms_norm(*k, *static_cast<const array*>(k_norm_w), rms_eps);
+        const auto& k_weight = *static_cast<const array*>(k_norm_w);
+        const int k_width = k->shape(k->ndim() - 1);
+        const array k_norm = canonicalize_rms_norm_weight(k_weight, k_width, "attention.k_norm");
+        *k = fast::rms_norm(*k, k_norm, rms_eps);
     }
 }
 
@@ -954,7 +960,9 @@ void* mlx_lazy_rms_norm_fused_ffn(
 ) {
     mlx_count_op();
     const auto& x = *static_cast<const array*>(input);
-    const auto& norm_weight = *static_cast<const array*>(norm_w);
+    const auto& norm_weight_raw = *static_cast<const array*>(norm_w);
+    const int in_features = x.shape(2);
+    const array norm_weight = canonicalize_rms_norm_weight(norm_weight_raw, in_features, "rms_norm_fused_ffn");
     int gs = static_cast<int>(group_size);
     int b = static_cast<int>(bits);
     const auto& gate_w_arr = *static_cast<const array*>(gate_w);

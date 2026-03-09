@@ -577,7 +577,11 @@ pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
         ..Default::default()
     };
 
-    let result = talu::router::generate(&chat, &content, &backend, &cfg)?;
+    let result = talu::router::generate(&chat, &content, &backend, &cfg);
+    // Stop capture before reading records so no backend thread can append
+    // while we iterate the captured trace buffer.
+    capture.disable();
+    let result = result?;
     if result.error_code() != 0 {
         let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
         return Err(anyhow!("Error: {} (code {})", message, result.error_code()));

@@ -1,8 +1,19 @@
 //! Safe wrappers for talu generation/inference routing.
 
 use crate::error::error_from_last_or;
+use crate::responses::ResponsesView;
 use crate::{ChatHandle, GenerateResult, InferenceBackend, Result};
 use std::ffi::{c_void, CStr, CString};
+
+fn has_visible_text(text: &str) -> bool {
+    text.chars().any(|ch| {
+        if ch.is_ascii() {
+            !ch.is_ascii_whitespace() && !ch.is_ascii_control()
+        } else {
+            !ch.is_whitespace()
+        }
+    })
+}
 
 /// Content type for generation input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,6 +423,8 @@ pub fn generate_stream(
         return Err(error_from_last_or("Failed to create iterator"));
     }
 
+    let mut emitted_visible_text = false;
+
     // Poll for tokens
     loop {
         // SAFETY: iterator is valid (checked above)
@@ -442,8 +455,10 @@ pub fn generate_stream(
             break;
         }
 
-        // SAFETY: token_ptr is valid C string from the iterator
-        let token = unsafe { CStr::from_ptr(token_ptr) }.to_str().unwrap_or("");
+        // SAFETY: token_ptr is valid C string from the iterator.
+        // Stream chunks can contain non-UTF8 byte sequences for byte-level
+        // tokenizers; preserve them lossily instead of dropping the chunk.
+        let token_text = unsafe { CStr::from_ptr(token_ptr) }.to_string_lossy();
 
         // Read content classification for this token
         // SAFETY: iterator is valid
@@ -454,10 +469,13 @@ pub fn generate_stream(
         });
 
         let stream_token = StreamToken {
-            text: token,
+            text: token_text.as_ref(),
             item_type,
             content_type,
         };
+        if !emitted_visible_text && has_visible_text(stream_token.text) {
+            emitted_visible_text = true;
+        }
 
         // Call user callback
         if !callback(&stream_token) {
@@ -465,6 +483,35 @@ pub fn generate_stream(
             // SAFETY: iterator is valid
             unsafe { talu_sys::talu_router_iterator_cancel(iterator) };
             break;
+        }
+    }
+
+    if !emitted_visible_text {
+        let final_text_ptr = unsafe { talu_sys::talu_router_iterator_output_text(iterator) };
+        if !final_text_ptr.is_null() {
+            let final_text = unsafe { CStr::from_ptr(final_text_ptr) }.to_string_lossy();
+            if has_visible_text(final_text.as_ref()) {
+                let fallback = StreamToken {
+                    text: final_text.as_ref(),
+                    item_type: talu_sys::ItemType::Message,
+                    content_type: talu_sys::ContentType::OutputText,
+                };
+                let _ = callback(&fallback);
+                emitted_visible_text = true;
+            }
+        }
+    }
+
+    if !emitted_visible_text {
+        if let Ok(Some(text)) = chat.responses().last_assistant_message_text() {
+            if has_visible_text(&text) {
+                let fallback = StreamToken {
+                    text: text.as_str(),
+                    item_type: talu_sys::ItemType::Message,
+                    content_type: talu_sys::ContentType::OutputText,
+                };
+                let _ = callback(&fallback);
+            }
         }
     }
 

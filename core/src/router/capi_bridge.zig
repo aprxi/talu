@@ -356,41 +356,8 @@ pub fn generate(
         return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
     };
 
-    // Build options
-    var built = buildOptions(allocator, config, engine) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-    defer built.deinit(allocator);
-
-    // Generate
-    const result = engine.generate(chat, built.options) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
-    defer result.deinit(allocator);
-
-    // Copy result text
-    const text = allocator.dupe(u8, result.text) catch {
-        return .{
-            .text = null,
-            .token_count = result.generated_tokens,
-            .prompt_tokens = result.prompt_tokens,
-            .completion_tokens = result.generated_tokens,
-            .prefill_ns = result.prefill_ns,
-            .generation_ns = result.decode_ns,
-            .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory),
-        };
-    };
-
-    // Convert finish reason
-    const finish_reason: CFinishReason = @enumFromInt(@intFromEnum(result.finish_reason));
-
-    return .{
-        .text = text,
-        .token_count = result.generated_tokens,
-        .prompt_tokens = result.prompt_tokens,
-        .completion_tokens = result.generated_tokens,
-        .prefill_ns = result.prefill_ns,
-        .generation_ns = result.decode_ns,
-        .error_code = 0,
-        .finish_reason = finish_reason,
-        .tool_calls = result.tool_calls,
-    };
+    // Keep local non-stream generation on the same iterator-backed execution route.
+    return generateWithLocalEngine(allocator, chat, engine, config);
 }
 
 /// Generate using a spec-based InferenceBackend.
@@ -456,55 +423,59 @@ fn generateWithLocalEngine(
     var built = buildOptions(allocator, config, local_engine) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
     defer built.deinit(allocator);
 
-    log.debug("router", "LocalEngine generate", .{
+    log.debug("router", "LocalEngine generate (iterator route)", .{
         .max_tokens = built.options.max_tokens orelse 0,
         .has_tools = @as(u8, @intFromBool(built.options.tools_json != null)),
     }, @src());
 
-    // Generate
-    var result = local_engine.generate(chat, built.options) catch |err| {
-        if (err == error.UnsupportedContentType)
-            capi_error.setError(err, "This model does not support images. Use a vision-language model (e.g. LFM2-VL-450M).", .{})
-        else
-            capi_error.setError(err, "generate error: {s}", .{@errorName(err)});
+    // Non-stream generation must execute through the same iterator route as stream.
+    var iter = iterator_mod.TokenIterator.init(allocator, local_engine, chat, built.options) catch |err| {
+        capi_error.setError(err, "Failed to create iterator", .{});
         return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
     };
-    log.debug("router", "LocalEngine generate completed", .{
-        .prompt_tokens = result.prompt_tokens,
-        .completion_tokens = result.generated_tokens,
-    }, @src());
+    defer iter.deinit();
 
-    // Transfer tool_calls ownership to the returned GenerateResult before deinit
-    // frees them. Null out the field so deinit skips freeing the transferred data.
-    const tool_calls = result.tool_calls;
-    result.tool_calls = null;
-    defer result.deinit(allocator);
+    while (iter.next()) |_| {}
 
-    // Copy result text
-    const text = allocator.dupe(u8, result.text) catch {
-        // Free transferred tool_calls on OOM (we own them now).
+    if (iter.hasError()) {
+        if (iter.getErrorMsg()) |msg| {
+            capi_error.set_last_error(msg);
+        } else {
+            capi_error.set_last_error("Generation failed");
+        }
+        return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
+    }
+
+    const tool_calls = iter.takeLocalToolCalls();
+
+    const final_slice: []const u8 = if (iter.getFinalText()) |z_text| std.mem.span(z_text) else "";
+    const final_text = allocator.dupe(u8, final_slice) catch {
         freeToolCallRefs(allocator, tool_calls);
         return .{
             .text = null,
-            .token_count = result.generated_tokens,
-            .prompt_tokens = result.prompt_tokens,
-            .completion_tokens = result.generated_tokens,
-            .prefill_ns = result.prefill_ns,
-            .generation_ns = result.decode_ns,
+            .token_count = iter.getCompletionTokens(),
+            .prompt_tokens = iter.getPromptTokens(),
+            .completion_tokens = iter.getCompletionTokens(),
+            .prefill_ns = iter.getPrefillNs(),
+            .generation_ns = iter.getGenerationNs(),
             .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory),
         };
     };
 
-    // Convert finish reason
-    const finish_reason: CFinishReason = @enumFromInt(@intFromEnum(result.finish_reason));
+    const finish_reason = std.meta.intToEnum(CFinishReason, iter.getFinishReason()) catch CFinishReason.eos_token;
+
+    log.debug("router", "LocalEngine iterator route completed", .{
+        .prompt_tokens = iter.getPromptTokens(),
+        .completion_tokens = iter.getCompletionTokens(),
+    }, @src());
 
     return .{
-        .text = text,
-        .token_count = result.generated_tokens,
-        .prompt_tokens = result.prompt_tokens,
-        .completion_tokens = result.generated_tokens,
-        .prefill_ns = result.prefill_ns,
-        .generation_ns = result.decode_ns,
+        .text = final_text,
+        .token_count = iter.getCompletionTokens(),
+        .prompt_tokens = iter.getPromptTokens(),
+        .completion_tokens = iter.getCompletionTokens(),
+        .prefill_ns = iter.getPrefillNs(),
+        .generation_ns = iter.getGenerationNs(),
         .error_code = 0,
         .finish_reason = finish_reason,
         .tool_calls = tool_calls,

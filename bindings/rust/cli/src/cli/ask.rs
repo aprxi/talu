@@ -21,10 +21,21 @@ use super::models::list_provider_models;
 
 const DEFAULT_STDIN_IMAGE_PROMPT: &str = "Describe this image.";
 
+fn has_visible_text(text: &str) -> bool {
+    text.chars().any(|ch| {
+        if ch.is_ascii() {
+            !ch.is_ascii_whitespace() && !ch.is_ascii_control()
+        } else {
+            !ch.is_whitespace()
+        }
+    })
+}
+
 struct StreamCtx {
     raw_output: bool,
     hide_thinking: bool,
     in_reasoning: bool,
+    emitted_visible: bool,
     prefill_spinner: Option<indicatif::ProgressBar>,
 }
 
@@ -34,6 +45,7 @@ impl StreamCtx {
             raw_output,
             hide_thinking,
             in_reasoning: false,
+            emitted_visible: false,
             prefill_spinner: None,
         }
     }
@@ -64,6 +76,9 @@ impl StreamCtx {
 
         let _ = io::stdout().write_all(token.text.as_bytes());
         let _ = io::stdout().flush();
+        if has_visible_text(token.text) {
+            self.emitted_visible = true;
+        }
     }
 
     fn flush(&mut self) {
@@ -792,8 +807,21 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         let stream_result =
             talu::router::generate_stream(&chat, &content, &backend, &cfg, callback)?;
         // Flush after streaming
+        let mut emitted_visible = false;
         if let Ok(mut guard) = ctx.lock() {
             guard.flush();
+            emitted_visible = guard.emitted_visible;
+        }
+
+        if !emitted_visible
+            && !silent
+            && !use_json
+            && output_path.is_none()
+            && !raw_output
+        {
+            if let Some(text) = latest_visible_text(&chat, !hide_thinking)? {
+                emit_output(&text)?;
+            }
         }
 
         // Print stats (cyan color)

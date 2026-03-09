@@ -343,8 +343,9 @@ void* mlx_lazy_rms_norm_fused_ffn_bf16(
     float eps
 ) {
     const auto& x = *static_cast<const array*>(input);
-    const auto& norm_weight = *static_cast<const array*>(norm_w);
     const int in_features = x.shape(2);
+    const auto& norm_weight_raw = *static_cast<const array*>(norm_w);
+    const array norm_weight = canonicalize_rms_norm_weight(norm_weight_raw, in_features, "rms_norm_fused_ffn_bf16");
 
     const auto& gate_weight = *static_cast<const array*>(gate_w);
     const auto& up_weight = *static_cast<const array*>(up_w);

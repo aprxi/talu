@@ -84,6 +84,8 @@ pub const TokenIterator = struct {
     ring: [RING_BUFFER_SIZE]TokenSlot,
     write_idx: std.atomic.Value(usize),
     read_idx: std.atomic.Value(usize),
+    streamed_slot_count: std.atomic.Value(usize),
+    streamed_non_ws_bytes: std.atomic.Value(usize),
 
     // Synchronization
     mutex: std.Thread.Mutex,
@@ -109,6 +111,11 @@ pub const TokenIterator = struct {
     prefill_ns: std.atomic.Value(u64),
     generation_ns: std.atomic.Value(u64),
     finish_reason: std.atomic.Value(u8), // FinishReason discriminator
+    // Final decoded output text as a NUL-terminated buffer for C-API fallback.
+    final_text_z: ?[]u8,
+    // Tool call refs produced by local generation, if any.
+    // Owned by iterator unless transferred by takeLocalToolCalls().
+    local_tool_calls: ?[]const local_mod.ToolCallRef,
 
     // Reasoning tag filter state (worker thread only — no atomics needed)
     filter_state: FilterState,
@@ -183,6 +190,8 @@ pub const TokenIterator = struct {
             .ring = undefined,
             .write_idx = std.atomic.Value(usize).init(0),
             .read_idx = std.atomic.Value(usize).init(0),
+            .streamed_slot_count = std.atomic.Value(usize).init(0),
+            .streamed_non_ws_bytes = std.atomic.Value(usize).init(0),
             .mutex = .{},
             .not_empty = .{},
             .not_full = .{},
@@ -199,6 +208,8 @@ pub const TokenIterator = struct {
             .prefill_ns = std.atomic.Value(u64).init(0),
             .generation_ns = std.atomic.Value(u64).init(0),
             .finish_reason = std.atomic.Value(u8).init(@intFromEnum(FinishReason.eos_token)),
+            .final_text_z = null,
+            .local_tool_calls = null,
             .filter_state = .normal,
             .filter_partial_buf = undefined,
             .filter_partial_len = 0,
@@ -269,6 +280,8 @@ pub const TokenIterator = struct {
             .ring = undefined,
             .write_idx = std.atomic.Value(usize).init(0),
             .read_idx = std.atomic.Value(usize).init(0),
+            .streamed_slot_count = std.atomic.Value(usize).init(0),
+            .streamed_non_ws_bytes = std.atomic.Value(usize).init(0),
             .mutex = .{},
             .not_empty = .{},
             .not_full = .{},
@@ -285,6 +298,8 @@ pub const TokenIterator = struct {
             .prefill_ns = std.atomic.Value(u64).init(0),
             .generation_ns = std.atomic.Value(u64).init(0),
             .finish_reason = std.atomic.Value(u8).init(@intFromEnum(FinishReason.eos_token)),
+            .final_text_z = null,
+            .local_tool_calls = null,
             .filter_state = .normal,
             .filter_partial_buf = undefined,
             .filter_partial_len = 0,
@@ -437,6 +452,20 @@ pub const TokenIterator = struct {
         return self.finish_reason.load(.acquire);
     }
 
+    /// Get final decoded output text.
+    /// Pointer is valid until `deinit()` and may be null if generation yielded no text.
+    pub fn getFinalText(self: *TokenIterator) ?[*:0]const u8 {
+        const text_z = self.final_text_z orelse return null;
+        return @ptrCast(text_z.ptr);
+    }
+
+    /// Transfer local tool call refs to caller ownership.
+    pub fn takeLocalToolCalls(self: *TokenIterator) ?[]const local_mod.ToolCallRef {
+        const calls = self.local_tool_calls;
+        self.local_tool_calls = null;
+        return calls;
+    }
+
     /// Clean up the iterator.
     ///
     /// Waits for the worker thread to complete (cancels if still running),
@@ -467,6 +496,17 @@ pub const TokenIterator = struct {
         // Free error message if any
         if (self.error_msg) |msg| {
             self.allocator.free(msg);
+        }
+        if (self.final_text_z) |text_z| {
+            self.allocator.free(text_z);
+        }
+        if (self.local_tool_calls) |calls| {
+            for (calls) |call| {
+                self.allocator.free(call.call_id);
+                self.allocator.free(call.name);
+                self.allocator.free(call.arguments);
+            }
+            self.allocator.free(calls);
         }
 
         // Free marker strings
@@ -511,6 +551,17 @@ pub const TokenIterator = struct {
         }
     }
 
+    fn setFinalText(self: *TokenIterator, text: []const u8) !void {
+        if (self.final_text_z) |existing| {
+            self.allocator.free(existing);
+            self.final_text_z = null;
+        }
+        const out = try self.allocator.alloc(u8, text.len + 1);
+        @memcpy(out[0..text.len], text);
+        out[text.len] = 0;
+        self.final_text_z = out;
+    }
+
     fn runLocalGeneration(self: *TokenIterator) !void {
         // Check external stop flag before starting (if caller already cancelled)
         if (self.options.?.stop_flag) |external_flag| {
@@ -532,9 +583,51 @@ pub const TokenIterator = struct {
         const engine = self.engine.?;
 
         // Run generation (this blocks until complete)
-        const result = try engine.generate(self.chat.?, opts);
+        var result = try engine.generate(self.chat.?, opts);
         // Use engine's allocator for result cleanup since generate() allocated with it
         defer result.deinit(engine.allocator);
+        self.local_tool_calls = result.tool_calls;
+        result.tool_calls = null;
+        try self.setFinalText(result.text);
+
+        const streamed_slots = self.streamed_slot_count.load(.acquire);
+        const streamed_non_ws = self.streamed_non_ws_bytes.load(.acquire);
+        log.debug("router", "Iterator local generation complete", .{
+            .generated_tokens = result.generated_tokens,
+            .text_len = result.text.len,
+            .streamed_slots = streamed_slots,
+            .streamed_non_ws = streamed_non_ws,
+        }, @src());
+
+        // Some backend decode routes (notably certain metal table paths) may
+        // return a full decoded result without invoking token callbacks.
+        // If no streamed slots were produced, emit the final decoded text as a
+        // single chunk so iterator consumers never observe an empty stream.
+        if (result.text.len > 0 and (streamed_slots == 0 or streamed_non_ws == 0)) {
+            log.debug("router", "Iterator local fallback emit", .{
+                .text_len = result.text.len,
+                .streamed_slots = streamed_slots,
+                .streamed_non_ws = streamed_non_ws,
+            }, @src());
+            if (self.is_tool_generation) {
+                try self.pushSlot(
+                    result.text,
+                    0,
+                    @intFromEnum(ItemType.function_call),
+                    @intFromEnum(ContentType.output_text),
+                );
+            } else if (self.raw_output) {
+                try self.pushSlot(
+                    result.text,
+                    0,
+                    @intFromEnum(ItemType.message),
+                    @intFromEnum(ContentType.output_text),
+                );
+            } else {
+                try self.filterAndPush(result.text, 0);
+                try self.flushPartialBuf(0);
+            }
+        }
 
         // Store stats for caller to retrieve
         self.prompt_tokens.store(result.prompt_tokens, .release);
@@ -565,6 +658,7 @@ pub const TokenIterator = struct {
             return err;
         };
         defer result.deinit(engine.allocator);
+        try self.setFinalText(result.text);
 
         const end_time = std.time.nanoTimestamp();
         const generation_ns: u64 = @intCast(end_time - start_time);
@@ -935,9 +1029,6 @@ pub const TokenIterator = struct {
     fn pushSlot(self: *TokenIterator, text: []const u8, token_id: u32, item_type: u8, content_type: u8) !void {
         if (text.len == 0) return;
 
-        // Truncate if too long
-        const len = @min(text.len, MAX_TOKEN_LEN - 1);
-
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -963,12 +1054,32 @@ pub const TokenIterator = struct {
         const slot_idx = write % RING_BUFFER_SIZE;
         const slot = &self.ring[slot_idx];
 
-        @memcpy(slot.text[0..len], text[0..len]);
-        slot.text[len] = 0; // Null terminate
-        slot.len = len;
+        // Iterator tokens cross a C-string ABI boundary. Strip interior NUL
+        // bytes to avoid truncating streamed tokens at the first '\x00'.
+        const capped_len = @min(text.len, MAX_TOKEN_LEN - 1);
+        var out_len: usize = 0;
+        for (text[0..capped_len]) |byte| {
+            if (byte == 0) continue;
+            slot.text[out_len] = byte;
+            out_len += 1;
+            if (out_len >= MAX_TOKEN_LEN - 1) break;
+        }
+        if (out_len == 0) return;
+
+        slot.text[out_len] = 0; // Null terminate
+        slot.len = out_len;
         slot.token_id = token_id;
         slot.item_type = item_type;
         slot.content_type = content_type;
+
+        _ = self.streamed_slot_count.fetchAdd(1, .acq_rel);
+        var non_ws: usize = 0;
+        for (slot.text[0..out_len]) |byte| {
+            if (byte >= 0x80 or (byte >= 0x21 and byte <= 0x7E)) non_ws += 1;
+        }
+        if (non_ws > 0) {
+            _ = self.streamed_non_ws_bytes.fetchAdd(non_ws, .acq_rel);
+        }
 
         // Advance write index
         self.write_idx.store(write + 1, .release);
@@ -1211,9 +1322,12 @@ fn makeTestIterator(start_marker: []const u8, end_marker: []const u8) TokenItera
     // Ring buffer + sync
     iter.write_idx = std.atomic.Value(usize).init(0);
     iter.read_idx = std.atomic.Value(usize).init(0);
+    iter.streamed_slot_count = std.atomic.Value(usize).init(0);
+    iter.streamed_non_ws_bytes = std.atomic.Value(usize).init(0);
     iter.mutex = .{};
     iter.not_empty = .{};
     iter.not_full = .{};
+    iter.final_text_z = null;
     iter.cancelled = std.atomic.Value(bool).init(false);
 
     // Initialize ring slots
@@ -1411,4 +1525,37 @@ test "filterAndPush: non-newline after tag preserved" {
         }
     }
     try std.testing.expectEqualStrings("Hello", response_buf[0..response_len]);
+}
+
+test "pushSlot strips interior NUL bytes for C-string streaming" {
+    var iter = makeTestIterator("<think>", "</think>");
+    const raw = [_]u8{ 'A', 0, 'B' };
+    try iter.pushSlot(
+        &raw,
+        7,
+        @intFromEnum(ItemType.message),
+        @intFromEnum(ContentType.output_text),
+    );
+
+    var slots: [4]TestSlot = undefined;
+    const n = drainSlots(&iter, &slots);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("AB", slots[0].text);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(ItemType.message)), slots[0].item_type);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(ContentType.output_text)), slots[0].content_type);
+}
+
+test "pushSlot drops pure NUL chunks" {
+    var iter = makeTestIterator("<think>", "</think>");
+    const raw = [_]u8{0};
+    try iter.pushSlot(
+        &raw,
+        7,
+        @intFromEnum(ItemType.message),
+        @intFromEnum(ContentType.output_text),
+    );
+
+    var slots: [4]TestSlot = undefined;
+    const n = drainSlots(&iter, &slots);
+    try std.testing.expectEqual(@as(usize, 0), n);
 }

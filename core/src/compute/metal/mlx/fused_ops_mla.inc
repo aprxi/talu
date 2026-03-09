@@ -38,7 +38,8 @@ static array mla_attention_core(
     if (q_comp.shape(2) != q_lora_rank) {
         throw std::invalid_argument("[mla] q_a_proj output does not match q_lora_rank");
     }
-    q_comp = fast::rms_norm(q_comp, q_a_norm_w, rms_eps);
+    const array q_a_norm = canonicalize_rms_norm_weight(q_a_norm_w, q_lora_rank, "mla.q_a_norm");
+    q_comp = fast::rms_norm(q_comp, q_a_norm, rms_eps);
     // FP32 allowlist: keep Q projection accumulation in FP32 for attention logits.
     array q_proj = astype(q_b_proj_fn(q_comp), float32);
     if (q_proj.shape(2) != n_heads * qk_head_dim) {
@@ -52,7 +53,8 @@ static array mla_attention_core(
     }
     array kv_nope = slice(kv_comp, {0, 0, 0}, {batch_size, seq_len, kv_lora_rank});
     array k_rope_shared = slice(kv_comp, {0, 0, kv_lora_rank}, {batch_size, seq_len, kv_lora_rank + qk_rope_head_dim});
-    kv_nope = fast::rms_norm(kv_nope, kv_a_norm_w, rms_eps);
+    const array kv_a_norm = canonicalize_rms_norm_weight(kv_a_norm_w, kv_lora_rank, "mla.kv_a_norm");
+    kv_nope = fast::rms_norm(kv_nope, kv_a_norm, rms_eps);
     // FP32 allowlist: keep KV expansion accumulation in FP32 for attention logits.
     array kv_proj = astype(kv_b_proj_fn(kv_nope), float32);
     if (kv_proj.shape(2) != n_heads * (qk_nope_head_dim + v_head_dim)) {

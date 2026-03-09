@@ -480,6 +480,7 @@ pub const talu_router_iterator_prompt_tokens = router.talu_router_iterator_promp
 pub const talu_router_iterator_completion_tokens = router.talu_router_iterator_completion_tokens;
 pub const talu_router_iterator_prefill_ns = router.talu_router_iterator_prefill_ns;
 pub const talu_router_iterator_generation_ns = router.talu_router_iterator_generation_ns;
+pub const talu_router_iterator_output_text = router.talu_router_iterator_output_text;
 pub const TaluTokenIterator = router.TaluTokenIterator;
 
 // Re-export X-Ray C API functions (tensor inspection during inference).
