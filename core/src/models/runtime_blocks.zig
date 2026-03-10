@@ -71,6 +71,9 @@ pub const GatedDeltaConfig = struct {
     d_conv: u32,
     n_heads: u32,
     d_head: u32,
+    /// Number of key/query heads. May be less than n_heads (value heads) for
+    /// GQA-style models (e.g. Qwen3.5-4B). Defaults to n_heads when symmetric.
+    n_key_heads: u32 = 0,
 };
 
 pub const MambaWeights = struct {

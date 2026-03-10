@@ -705,6 +705,10 @@ pub const CompileOptions = struct {
     /// When provided, compiler emits state descriptors from architecture metadata
     /// rather than runtime-contract built-in defaults.
     state_descriptor_entry: ?registry.Entry = null,
+    /// When non-null, overrides the gated_delta_config in any gated_delta_net
+    /// kernel op. Use this when the loaded model config differs from the
+    /// architecture's static defaults (e.g. larger models with more heads).
+    gated_delta_config_override: ?op_types.GatedDeltaConfig = null,
 };
 
 pub fn compileLayerProgram(
@@ -733,7 +737,20 @@ pub fn compileLayerProgram(
     for (program) |op| {
         const opcode = opcode_map.opcodeForLayerOp(op);
         const param_block_id: u16 = @intCast(param_blocks.items.len);
-        try param_blocks.append(allocator, try serializeLayerOpParam(allocator, opcode, op));
+        // Apply gated_delta_config_override when the caller provides actual
+        // model-config-derived dimensions that differ from the static arch defaults.
+        const op_for_params: layer_ops.LayerOp = if (options.gated_delta_config_override) |gd_cfg|
+            switch (op) {
+                .kernel => |k| if (k.debug_type == .gated_delta_net) blk: {
+                    var patched = k;
+                    patched.gated_delta_config = gd_cfg;
+                    break :blk .{ .kernel = patched };
+                } else op,
+                else => op,
+            }
+        else
+            op;
+        try param_blocks.append(allocator, try serializeLayerOpParam(allocator, opcode, op_for_params));
         const insn = try compileOneInstruction(allocator, op, param_block_id, &weight_bindings, &reg_map);
         if (insn.weights.len != runtime_contract.expectedWeightRefCount(insn.opcode)) {
             return error.InvalidWeightRefCount;

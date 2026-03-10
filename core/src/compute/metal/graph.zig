@@ -502,6 +502,7 @@ pub extern fn mlx_lazy_gated_delta_mixer_bf16(
     layer_idx: usize,
     d_conv: usize,
     n_heads: usize,
+    n_key_heads: usize,
     d_head: usize,
 ) ArrayHandle;
 
@@ -525,6 +526,7 @@ pub extern fn mlx_lazy_gated_delta_mixer_quantized(
     layer_idx: usize,
     d_conv: usize,
     n_heads: usize,
+    n_key_heads: usize,
     d_head: usize,
 ) ArrayHandle;
 
@@ -1158,6 +1160,7 @@ test "mlx_lazy_gated_delta_mixer_bf16 prefill matches token-by-token path" {
         0,
         d_conv,
         n_heads,
+        n_heads,
         d_head,
     );
     defer freeArray(prefill_out);
@@ -1184,6 +1187,7 @@ test "mlx_lazy_gated_delta_mixer_bf16 prefill matches token-by-token path" {
             step_cache,
             0,
             d_conv,
+            n_heads,
             n_heads,
             d_head,
         );

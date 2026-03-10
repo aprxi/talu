@@ -727,6 +727,7 @@ fn compileLayerProgramContract(
     layer: *WeightHandles.LayerWeights,
     static_entry: ?models_registry.Entry,
     block_kind: topology.BlockKind,
+    gated_delta_config_override: ?topology.GatedDeltaConfig,
 ) !void {
     layer.compiled_plan = null;
     layer.register_to_slot_map = &.{};
@@ -740,6 +741,7 @@ fn compileLayerProgramContract(
 
     layer.compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, .decode, .{
         .state_descriptor_entry = entry,
+        .gated_delta_config_override = gated_delta_config_override,
     });
     errdefer if (layer.compiled_plan) |*compiled_plan| {
         plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
@@ -924,7 +926,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
         switch (block) {
             .attention_mlp => |attn_block| {
                 weight_handles.layers[layer_idx].kind = .attention_mlp;
-                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .attention_mlp);
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .attention_mlp, null);
                 const is_mla = attn_block.isMLA();
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
@@ -1126,7 +1128,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
             },
             .mamba => |mamba_block| {
                 weight_handles.layers[layer_idx].kind = .mamba;
-                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .mamba);
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .mamba, null);
 
                 var ln1_arr = try loadNormWeight(mamba_block.ln1_weight);
                 if (weight_handles.has_norm_weight_offset) {
@@ -1198,7 +1200,12 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
             },
             .gated_delta => |gated_delta_block| {
                 weight_handles.layers[layer_idx].kind = .gated_delta;
-                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .gated_delta);
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .gated_delta, .{
+                    .d_conv = @intCast(gated_delta_block.config.d_conv),
+                    .n_heads = @intCast(gated_delta_block.config.n_heads),
+                    .d_head = @intCast(gated_delta_block.config.d_head),
+                    .d_inner = @intCast(gated_delta_block.config.n_heads * gated_delta_block.config.d_head),
+                });
                 if (std.posix.getenv("TALU_DBG_GD_WEIGHTS") != null and layer_idx == 0) {
                     const in_proj = gated_delta_block.weights.in_proj;
                     const out_proj = gated_delta_block.weights.out_proj;
@@ -1231,6 +1238,10 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
                 weight_handles.layers[layer_idx].gated_delta_d_conv = @intCast(gated_delta_block.config.d_conv);
                 weight_handles.layers[layer_idx].gated_delta_n_heads = @intCast(gated_delta_block.config.n_heads);
+                weight_handles.layers[layer_idx].gated_delta_n_key_heads = if (gated_delta_block.config.n_key_heads > 0)
+                    @intCast(gated_delta_block.config.n_key_heads)
+                else
+                    @intCast(gated_delta_block.config.n_heads);
                 weight_handles.layers[layer_idx].gated_delta_d_head = @intCast(gated_delta_block.config.d_head);
 
                 weight_handles.layers[layer_idx].gated_delta_conv_weight = try tensorToArray(gated_delta_block.weights.conv1d_weight);
@@ -1287,7 +1298,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
             },
             .shortconv => |shortconv_block| {
                 weight_handles.layers[layer_idx].kind = .shortconv;
-                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .shortconv);
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .shortconv, null);
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
                 var ln1_arr = try loadNormWeight(shortconv_block.ln1_weight);
@@ -2121,6 +2132,7 @@ pub const WeightHandles = struct {
         // Gated-delta weights/config (used when kind == .gated_delta)
         gated_delta_d_conv: usize = 0,
         gated_delta_n_heads: usize = 0,
+        gated_delta_n_key_heads: usize = 0,
         gated_delta_d_head: usize = 0,
         gated_delta_in_proj: ?QuantizedWeight = null,
         gated_delta_out_proj: ?QuantizedWeight = null,

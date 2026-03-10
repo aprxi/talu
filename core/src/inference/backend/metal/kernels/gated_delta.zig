@@ -32,6 +32,7 @@ pub const GatedDeltaKernel = struct {
 
     d_conv: usize,
     n_heads: usize,
+    n_key_heads: usize,
     d_head: usize,
     in_proj: ?QuantizedWeight = null,
     in_proj_bf16: ?ArrayHandle = null,
@@ -84,6 +85,7 @@ pub const GatedDeltaKernel = struct {
                 state.layer_idx,
                 self.d_conv,
                 self.n_heads,
+                self.n_key_heads,
                 self.d_head,
             );
             return;
@@ -102,6 +104,7 @@ pub const GatedDeltaKernel = struct {
             state.layer_idx,
             self.d_conv,
             self.n_heads,
+            self.n_key_heads,
             self.d_head,
         );
     }

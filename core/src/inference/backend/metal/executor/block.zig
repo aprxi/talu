@@ -63,6 +63,7 @@ pub const TransformerBlock = struct {
         mla_config: ?WeightHandles.MLAConfig,
         gated_delta_d_conv: usize,
         gated_delta_n_heads: usize,
+        gated_delta_n_key_heads: usize,
         gated_delta_d_head: usize,
         shortconv_d_conv: usize,
         shortconv_conv_dim: usize,
@@ -1457,6 +1458,7 @@ pub const TransformerBlock = struct {
         var gated_delta_binding = gated_delta_kernel.GatedDeltaKernel{
             .d_conv = state.runtime_meta.gated_delta_d_conv,
             .n_heads = state.runtime_meta.gated_delta_n_heads,
+            .n_key_heads = state.runtime_meta.gated_delta_n_key_heads,
             .d_head = state.runtime_meta.gated_delta_d_head,
             .in_proj = null,
             .in_proj_bf16 = null,
@@ -2049,6 +2051,7 @@ pub const TransformerBlock = struct {
                 .mla_config = lw.mla_config,
                 .gated_delta_d_conv = lw.gated_delta_d_conv,
                 .gated_delta_n_heads = lw.gated_delta_n_heads,
+                .gated_delta_n_key_heads = lw.gated_delta_n_key_heads,
                 .gated_delta_d_head = lw.gated_delta_d_head,
                 .shortconv_d_conv = lw.shortconv_d_conv,
                 .shortconv_conv_dim = lw.shortconv_conv_dim,

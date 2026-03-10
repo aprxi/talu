@@ -1280,6 +1280,7 @@ static inline array gated_delta_mixer_forward_core(
     const StateSpaceCallable& out_proj_fn,
     int d_conv,
     int n_heads,
+    int n_key_heads,
     int d_head,
     array& conv_state,
     array& ssm_state
@@ -1471,14 +1472,19 @@ static inline array gated_delta_mixer_forward_core(
     const StateSpaceCallable& out_proj_fn,
     int d_conv,
     int n_heads,
+    int n_key_heads,
     int d_head,
     array& conv_state,
     array& ssm_state
 ) {
     const int seq_len = input.shape(1);
+    // n_key_heads may be < n_heads for GQA-style models (e.g. Qwen3.5-4B).
+    // Q and K use n_key_heads; V uses n_heads (value heads).
+    const int n_kh = (n_key_heads > 0 && n_key_heads <= n_heads) ? n_key_heads : n_heads;
     const int d_inner = n_heads * d_head;
-    const int qkv_len = d_inner * 3;
-    const int proj_len = (4 * d_inner) + (2 * n_heads);
+    const int qk_len = n_kh * d_head;
+    const int qkv_len = qk_len * 2 + d_inner;
+    const int proj_len = qkv_len + d_inner + (2 * n_heads);
     if (n_heads <= 0 || d_head <= 0 || d_conv <= 0) {
         throw std::invalid_argument("[gated_delta] invalid config dims");
     }
@@ -1522,10 +1528,23 @@ static inline array gated_delta_mixer_forward_core(
     const array norm_weight_heads_value = norm_weight_heads.has_value() ? *norm_weight_heads : ones({n_heads, d_head}, float32);
 
     array state = reshape(ssm_state, {n_heads, d_head, d_head});
-    array query_all = reshape(slice(qkv_conv_all, {0, 0, 0}, {1, seq_len, d_inner}), {seq_len, n_heads, d_head});
-    array key_all = reshape(slice(qkv_conv_all, {0, 0, d_inner}, {1, seq_len, 2 * d_inner}), {seq_len, n_heads, d_head});
-    const array value_all = reshape(slice(qkv_conv_all, {0, 0, 2 * d_inner}, {1, seq_len, qkv_len}), {seq_len, n_heads, d_head});
+
+    // Slice Q and K (n_kh heads each) and V (n_heads value heads).
+    array query_kh = reshape(slice(qkv_conv_all, {0, 0, 0}, {1, seq_len, qk_len}), {seq_len, n_kh, d_head});
+    array key_kh   = reshape(slice(qkv_conv_all, {0, 0, qk_len}, {1, seq_len, 2 * qk_len}), {seq_len, n_kh, d_head});
+    const array value_all = reshape(slice(qkv_conv_all, {0, 0, 2 * qk_len}, {1, seq_len, qkv_len}), {seq_len, n_heads, d_head});
     const array z_heads_all = reshape(z_all, {seq_len, n_heads, d_head});
+
+    // Expand Q and K from n_kh to n_heads when using GQA (groups_per_key > 1).
+    // Each KV head is shared by groups_per_key value heads, so we need interleaved
+    // repeat: [k0,k0,k1,k1,...] not block repeat [k0,k1,...,k0,k1,...].
+    const int groups_per_key = n_heads / n_kh;
+    array query_all = (groups_per_key > 1)
+        ? reshape(tile(reshape(query_kh, {seq_len, n_kh, 1, d_head}), {1, 1, groups_per_key, 1}), {seq_len, n_heads, d_head})
+        : query_kh;
+    array key_all = (groups_per_key > 1)
+        ? reshape(tile(reshape(key_kh, {seq_len, n_kh, 1, d_head}), {1, 1, groups_per_key, 1}), {seq_len, n_heads, d_head})
+        : key_kh;
 
     std::vector<array> outputs;
     outputs.reserve(static_cast<size_t>(seq_len));
@@ -1848,6 +1867,7 @@ void* mlx_lazy_gated_delta_mixer_bf16(
     size_t layer_idx,
     size_t d_conv,
     size_t n_heads,
+    size_t n_key_heads,
     size_t d_head
 ) {
     mlx_count_op();
@@ -1862,10 +1882,13 @@ void* mlx_lazy_gated_delta_mixer_bf16(
 
     const int d_conv_i = static_cast<int>(d_conv);
     const int n_heads_i = static_cast<int>(n_heads);
+    const int n_key_heads_i = static_cast<int>(n_key_heads > 0 ? n_key_heads : n_heads);
     const int d_head_i = static_cast<int>(d_head);
     const int hidden_dim = input_arr.shape(2);
     const int d_inner = n_heads_i * d_head_i;
-    const int qkv_len = d_inner * 3;
+    // xbc = q + k + v where q,k use n_key_heads and v uses n_heads (value heads).
+    // For symmetric models n_key_heads == n_heads, reducing to d_inner * 3.
+    const int qkv_len = n_key_heads_i * d_head_i * 2 + d_inner;
 
     auto* cache = static_cast<MLXStateSpaceCache*>(gated_delta_cache_ptr);
     StateSpaceLayer* layer_state = nullptr;
@@ -1971,6 +1994,7 @@ void* mlx_lazy_gated_delta_mixer_bf16(
         out_proj_fn,
         d_conv_i,
         n_heads_i,
+        n_key_heads_i,
         d_head_i,
         conv_state,
         ssm_state
@@ -2003,6 +2027,7 @@ void* mlx_lazy_gated_delta_mixer_quantized(
     size_t layer_idx,
     size_t d_conv,
     size_t n_heads,
+    size_t n_key_heads,
     size_t d_head
 ) {
     mlx_count_op();
@@ -2021,9 +2046,10 @@ void* mlx_lazy_gated_delta_mixer_quantized(
 
     const int d_conv_i = static_cast<int>(d_conv);
     const int n_heads_i = static_cast<int>(n_heads);
+    const int n_key_heads_i = static_cast<int>(n_key_heads > 0 ? n_key_heads : n_heads);
     const int d_head_i = static_cast<int>(d_head);
     const int d_inner = n_heads_i * d_head_i;
-    const int qkv_len = d_inner * 3;
+    const int qkv_len = n_key_heads_i * d_head_i * 2 + d_inner;
     const int group_size_i = static_cast<int>(group_size);
     const int bits_i = static_cast<int>(bits);
 
@@ -2120,6 +2146,7 @@ void* mlx_lazy_gated_delta_mixer_quantized(
         out_proj_fn,
         d_conv_i,
         n_heads_i,
+        n_key_heads_i,
         d_head_i,
         conv_state,
         ssm_state

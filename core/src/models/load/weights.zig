@@ -517,11 +517,18 @@ pub fn loadModelWithArchitecture(
                 meta_cfg.d_head;
             if (cfg_num_value_heads == 0 or cfg_value_head_dim == 0) return error.InvalidShape;
             _ = std.math.mul(u32, cfg_num_value_heads, cfg_value_head_dim) catch return error.InvalidShape;
+            // Key heads may differ from value heads (GQA-style models).
+            // Fall back to value head count when not specified.
+            const cfg_num_key_heads: u32 = if (model_config.linear_num_key_heads > 0)
+                @intCast(model_config.linear_num_key_heads)
+            else
+                cfg_num_value_heads;
             map_context.gated_delta_config = .{
                 .d_model = @intCast(model_config.d_model),
                 .d_conv = meta_cfg.d_conv,
                 .n_heads = cfg_num_value_heads,
                 .d_head = cfg_value_head_dim,
+                .n_key_heads = cfg_num_key_heads,
             };
         }
         if (block_type == .shortconv) {
