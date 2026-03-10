@@ -5,8 +5,6 @@ import type {
   PluginDefinition,
 } from "../../kernel/types.ts";
 
-type StatusState = "idle" | "running" | "success" | "error";
-
 interface TerminalHandle {
   write(text: string): void;
   writeln(text: string): void;
@@ -18,58 +16,24 @@ interface TerminalHandle {
   dispose(): void;
 }
 
-function setStatus(statusEl: HTMLElement, state: StatusState, message: string): void {
-  statusEl.dataset["state"] = state;
-  statusEl.textContent = message;
+interface HostEntry {
+  id: string;
+  label: string;
+  primary: boolean;
+  terminal: TerminalHandle | null;
+  terminalHost: HTMLElement;
+  shell: AgentShellSession | null;
+  shellEventSub: Disposable | null;
+  terminalInputSub: Disposable | null;
+  resizeObserver: ResizeObserver | null;
+  tabKeyHandler: ((e: KeyboardEvent) => void) | null;
+  status: "disconnected" | "connecting" | "connected" | "error";
+  openInFlight: Promise<unknown> | null;
 }
 
-function formatJson(value: unknown): string {
-  return JSON.stringify(value, null, 2);
-}
-
-function parseErrorDetails(err: unknown): { code: string | null; message: string } {
-  const raw = err instanceof Error ? err.message : String(err);
-
-  const wrappedCodeMatch = raw.match(/^Agent\s+[a-z.]+\s+failed:\s*([a-zA-Z0-9_]+):\s*(.+)$/);
-  if (wrappedCodeMatch) {
-    return { code: wrappedCodeMatch[1] ?? null, message: wrappedCodeMatch[2] ?? raw };
-  }
-
-  const bracketMatch = raw.match(/^\[([a-zA-Z0-9_]+)\]\s*(.+)$/);
-  if (bracketMatch) {
-    return { code: bracketMatch[1] ?? null, message: bracketMatch[2] ?? raw };
-  }
-
-  const colonMatch = raw.match(/([a-z][a-z0-9_]+):\s*(.+)$/i);
-  if (colonMatch) {
-    return { code: colonMatch[1] ?? null, message: colonMatch[2] ?? raw };
-  }
-
-  return { code: null, message: raw };
-}
-
-function renderError(outputEl: HTMLElement, operation: string, err: unknown): void {
-  const details = parseErrorDetails(err);
-  outputEl.textContent = formatJson({
-    operation,
-    ok: false,
-    error: {
-      code: details.code,
-      message: details.message,
-    },
-  });
-}
-
-function requireFilePath(pathInput: HTMLInputElement): string {
-  const path = pathInput.value.trim();
-  if (path.length === 0 || path === "." || path === "/") {
-    throw new Error("invalid_request: file path is required (example: notes/todo.txt)");
-  }
-  if (path.endsWith("/")) {
-    throw new Error("invalid_request: path must target a file, not a directory");
-  }
-  return path;
-}
+// ---------------------------------------------------------------------------
+// Terminal creation
+// ---------------------------------------------------------------------------
 
 function createFallbackTerminal(host: HTMLElement): TerminalHandle {
   host.innerHTML = "";
@@ -80,8 +44,7 @@ function createFallbackTerminal(host: HTMLElement): TerminalHandle {
   pre.style.padding = "12px";
   pre.style.whiteSpace = "pre-wrap";
   pre.style.wordBreak = "break-word";
-  pre.style.minHeight = "220px";
-  pre.style.maxHeight = "320px";
+  pre.style.height = "100%";
   pre.style.overflow = "auto";
   host.appendChild(pre);
 
@@ -213,41 +176,85 @@ async function createTerminal(host: HTMLElement): Promise<TerminalHandle> {
   }
 }
 
-function buildWorkspaceOpsDom(root: HTMLElement): void {
+// ---------------------------------------------------------------------------
+// DOM
+// ---------------------------------------------------------------------------
+
+function buildHostsDom(root: HTMLElement): void {
+  root.style.display = "flex";
+  root.style.height = "100%";
+  root.style.overflow = "hidden";
+
   root.innerHTML = `
-    <div style="display:flex;flex-direction:column;gap:12px;padding:12px;height:100%;overflow:auto;">
-      <div class="panel-section" style="display:flex;flex-direction:column;gap:8px;">
-        <div class="panel-heading">Terminal</div>
-        <div id="wop-shell-state" style="font-size:12px;color:var(--text-muted);">disconnected</div>
-        <div id="wop-terminal-host" style="border:1px solid var(--border);border-radius:8px;background:var(--bg-code);min-height:360px;max-height:65vh;overflow:auto;"></div>
+    <aside class="sidebar">
+      <div class="sidebar-header" style="padding:0.75rem;">
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);">Hosts</div>
       </div>
-
-      <div class="panel-section" style="display:flex;flex-direction:column;gap:8px;">
-        <div class="panel-heading">Write / Edit</div>
-        <textarea id="wop-content" class="form-textarea mono" placeholder="Content for writeFile"></textarea>
-        <textarea id="wop-old-text" class="form-textarea mono" placeholder="Old text (for editFile)"></textarea>
-        <textarea id="wop-new-text" class="form-textarea mono" placeholder="New text (for editFile)"></textarea>
-        <div style="display:flex;gap:8px;">
-          <button id="wop-write-btn" class="btn btn-primary">Write</button>
-          <button id="wop-edit-btn" class="btn btn-ghost">Edit</button>
-        </div>
+      <div class="sidebar-content scroll-thin">
+        <div id="wop-host-list"></div>
       </div>
-
-      <div class="panel-section" style="display:flex;flex-direction:column;gap:8px;">
-        <div class="panel-heading">Files</div>
-        <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;">
-          <input id="wop-path" class="form-input" type="text" value="." placeholder="Path (e.g. ., src/main.ts)">
-          <button id="wop-ls-btn" class="btn btn-ghost">List</button>
-          <button id="wop-read-btn" class="btn btn-ghost">Read</button>
-        </div>
-      </div>
-
-      <div class="panel-section" style="display:flex;flex-direction:column;gap:8px;min-height:0;">
-        <div id="wop-status" data-state="idle" style="font-size:12px;color:var(--text-muted);">idle</div>
-        <pre id="wop-output" style="margin:0;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-code);color:var(--text);white-space:pre-wrap;word-break:break-word;min-height:180px;max-height:360px;overflow:auto;"></pre>
-      </div>
+    </aside>
+    <div style="display:flex;flex-direction:column;flex:1;min-width:0;overflow:hidden;">
+      <div id="wop-shell-state" style="font-size:11px;color:var(--text-muted);padding:4px 12px;flex-shrink:0;border-bottom:1px solid var(--border);">disconnected</div>
+      <div id="wop-terminal-area" style="flex:1;min-height:0;position:relative;"></div>
     </div>
   `;
+}
+
+function renderHostList(
+  listEl: HTMLElement,
+  hosts: HostEntry[],
+  selectedId: string,
+  onSelect: (id: string) => void,
+): void {
+  listEl.innerHTML = "";
+  for (const host of hosts) {
+    const item = document.createElement("button");
+    item.className = "sidebar-item";
+    item.style.cssText =
+      "display:flex;align-items:center;gap:0.5rem;width:100%;padding:0.5rem 0.75rem;" +
+      "font-size:13px;font-family:inherit;border:none;border-radius:6px;cursor:pointer;" +
+      "text-align:left;transition:background 0.15s,color 0.15s;";
+
+    const isSelected = host.id === selectedId;
+    item.style.background = isSelected
+      ? "color-mix(in srgb, var(--primary) 12%, transparent)"
+      : "transparent";
+    item.style.color = isSelected ? "var(--text)" : "var(--text-muted)";
+
+    // Status dot
+    const dot = document.createElement("span");
+    dot.style.cssText = "width:8px;height:8px;border-radius:50%;flex-shrink:0;";
+    if (host.status === "connected") {
+      dot.style.background = "var(--success, #22c55e)";
+    } else if (host.status === "connecting") {
+      dot.style.background = "var(--warning, #eab308)";
+    } else if (host.status === "error") {
+      dot.style.background = "var(--error, #ef4444)";
+    } else {
+      dot.style.background = "var(--text-muted)";
+      dot.style.opacity = "0.4";
+    }
+
+    const label = document.createElement("span");
+    label.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+    label.textContent = host.label;
+
+    if (host.primary) {
+      const badge = document.createElement("span");
+      badge.style.cssText =
+        "font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:0.03em;" +
+        "padding:1px 4px;border-radius:3px;flex-shrink:0;margin-left:auto;" +
+        "background:color-mix(in srgb, var(--primary) 15%, transparent);color:var(--primary);";
+      badge.textContent = "primary";
+      item.append(dot, label, badge);
+    } else {
+      item.append(dot, label);
+    }
+
+    item.addEventListener("click", () => onSelect(host.id));
+    listEl.appendChild(item);
+  }
 }
 
 function requiredElement<T extends HTMLElement>(root: HTMLElement, id: string): T {
@@ -258,16 +265,20 @@ function requiredElement<T extends HTMLElement>(root: HTMLElement, id: string): 
   return el;
 }
 
+// ---------------------------------------------------------------------------
+// Plugin
+// ---------------------------------------------------------------------------
+
 export const workspaceOpsPlugin: PluginDefinition = {
   manifest: {
     id: "talu.workspaceops",
-    name: "Terminal",
+    name: "Hosts",
     version: "0.1.0",
     builtin: true,
     permissions: ["filesystem", "exec"],
     requiresCapabilities: ["filesystem", "exec"],
     contributes: {
-      mode: { key: "workspace", label: "Terminal" },
+      mode: { key: "hosts", label: "Hosts" },
     },
   },
 
@@ -276,166 +287,193 @@ export const workspaceOpsPlugin: PluginDefinition = {
   },
 
   async run(ctx: PluginContext, signal: AbortSignal): Promise<void> {
-    buildWorkspaceOpsDom(ctx.container);
+    buildHostsDom(ctx.container);
 
-    const pathInput = requiredElement<HTMLInputElement>(ctx.container, "wop-path");
-    const lsBtn = requiredElement<HTMLButtonElement>(ctx.container, "wop-ls-btn");
-    const readBtn = requiredElement<HTMLButtonElement>(ctx.container, "wop-read-btn");
-    const contentInput = requiredElement<HTMLTextAreaElement>(ctx.container, "wop-content");
-    const oldTextInput = requiredElement<HTMLTextAreaElement>(ctx.container, "wop-old-text");
-    const newTextInput = requiredElement<HTMLTextAreaElement>(ctx.container, "wop-new-text");
-    const writeBtn = requiredElement<HTMLButtonElement>(ctx.container, "wop-write-btn");
-    const editBtn = requiredElement<HTMLButtonElement>(ctx.container, "wop-edit-btn");
-    const shellState = requiredElement<HTMLElement>(ctx.container, "wop-shell-state");
-    const terminalHost = requiredElement<HTMLElement>(ctx.container, "wop-terminal-host");
-    const statusEl = requiredElement<HTMLElement>(ctx.container, "wop-status");
-    const outputEl = requiredElement<HTMLElement>(ctx.container, "wop-output");
+    const hostListEl = requiredElement<HTMLElement>(ctx.container, "wop-host-list");
+    const shellStateEl = requiredElement<HTMLElement>(ctx.container, "wop-shell-state");
+    const terminalArea = requiredElement<HTMLElement>(ctx.container, "wop-terminal-area");
 
-    const terminal = await createTerminal(terminalHost);
-    terminal.focus();
+    // --- Host state ---
 
-    let shell: AgentShellSession | null = null;
-    let shellEventSub: Disposable | null = null;
-    let openInFlight:
-      | Promise<{ shellId: string; cols: number; rows: number; cwd: string | null } | { shellId: string; status: string }>
-      | null = null;
+    const primaryHostname = window.location.hostname || "localhost";
 
-    const runAction = async (operation: string, fn: () => Promise<unknown>): Promise<void> => {
-      setStatus(statusEl, "running", `running ${operation}...`);
-      try {
-        const result = await fn();
-        setStatus(statusEl, "success", `${operation} succeeded`);
-        outputEl.textContent = formatJson({ operation, ok: true, data: result });
-      } catch (err) {
-        setStatus(statusEl, "error", `${operation} failed`);
-        renderError(outputEl, operation, err);
+    const hosts: HostEntry[] = [
+      {
+        id: "primary",
+        label: primaryHostname,
+        primary: true,
+        terminal: null,
+        terminalHost: document.createElement("div"),
+        shell: null,
+        shellEventSub: null,
+        terminalInputSub: null,
+        resizeObserver: null,
+        tabKeyHandler: null,
+        status: "disconnected",
+        openInFlight: null,
+      },
+    ];
+
+    // Set up the terminal host container for the primary host.
+    hosts[0]!.terminalHost.style.cssText =
+      "position:absolute;inset:0;background:var(--bg-code);overflow:hidden;";
+    terminalArea.appendChild(hosts[0]!.terminalHost);
+
+    let selectedHostId = "primary";
+
+    // --- Rendering ---
+
+    const syncUI = (): void => {
+      const host = hosts.find((h) => h.id === selectedHostId);
+      renderHostList(hostListEl, hosts, selectedHostId, selectHost);
+      if (host) {
+        shellStateEl.textContent =
+          host.status === "connected" && host.shell
+            ? `connected (${host.shell.id})`
+            : host.status;
       }
     };
 
-    const resetShell = (): void => {
-      shellEventSub?.dispose();
-      shellEventSub = null;
-      shell = null;
-      shellState.textContent = "disconnected";
+    // --- Per-host terminal + shell wiring ---
+
+    const wireTerminal = (host: HostEntry): void => {
+      if (!host.terminal) return;
+
+      const sendShellInput = (data: string): void => {
+        if (!host.shell) return;
+        host.shell.send(data);
+      };
+
+      host.terminalInputSub = host.terminal.onData((data) => {
+        sendShellInput(data);
+      });
+
+      const tabHandler = (event: KeyboardEvent): void => {
+        if (event.key !== "Tab") return;
+        if (event.altKey || event.ctrlKey || event.metaKey) return;
+        event.preventDefault();
+        event.stopPropagation();
+        sendShellInput("\t");
+      };
+      host.tabKeyHandler = tabHandler;
+      host.terminalHost.addEventListener("keydown", tabHandler, { capture: true });
+
+      const observer = new ResizeObserver(() => {
+        host.terminal?.fit();
+        if (!host.shell) return;
+        const cols = host.terminal?.getCols() ?? 0;
+        const rows = host.terminal?.getRows() ?? 0;
+        if (cols <= 0 || rows <= 0) return;
+        host.shell.resize(cols, rows);
+      });
+      observer.observe(host.terminalHost);
+      host.resizeObserver = observer;
     };
 
-    lsBtn.addEventListener("click", () => {
-      void runAction("fs.ls", async () => {
-        const path = pathInput.value.trim() || ".";
-        return ctx.agent.fs.ls(path, { recursive: false, limit: 200 });
-      });
-    });
+    const openShellForHost = async (host: HostEntry): Promise<void> => {
+      if (host.shell || host.openInFlight) return;
 
-    readBtn.addEventListener("click", () => {
-      void runAction("fs.readFile", async () => {
-        const path = requireFilePath(pathInput);
-        return ctx.agent.fs.readFile(path, { encoding: "utf-8", maxBytes: 262_144 });
-      });
-    });
+      host.status = "connecting";
+      syncUI();
 
-    writeBtn.addEventListener("click", () => {
-      void runAction("fs.writeFile", async () => {
-        const path = requireFilePath(pathInput);
-        return ctx.agent.fs.writeFile(path, contentInput.value, { encoding: "utf-8", mkdir: true });
-      });
-    });
+      host.openInFlight = (async () => {
+        // Create terminal if not yet initialized.
+        if (!host.terminal) {
+          host.terminal = await createTerminal(host.terminalHost);
+          wireTerminal(host);
+        }
 
-    editBtn.addEventListener("click", () => {
-      void runAction("fs.editFile", async () => {
-        const path = requireFilePath(pathInput);
-        return ctx.agent.fs.editFile(path, oldTextInput.value, newTextInput.value, { replaceAll: false });
-      });
-    });
-
-    const openShell = async (): Promise<{ shellId: string; cols: number; rows: number; cwd: string | null } | { shellId: string; status: string }> => {
-      if (shell) {
-        return { shellId: shell.id, status: "already_open" };
-      }
-      if (openInFlight) {
-        return openInFlight;
-      }
-
-      openInFlight = (async () => {
-        terminal.fit();
-        const cols = terminal.getCols() > 0 ? terminal.getCols() : 120;
-        const rows = terminal.getRows() > 0 ? terminal.getRows() : 32;
+        host.terminal.fit();
+        const cols = host.terminal.getCols() > 0 ? host.terminal.getCols() : 120;
+        const rows = host.terminal.getRows() > 0 ? host.terminal.getRows() : 32;
         const opened = await ctx.agent.shell.open({ cwd: ctx.agent.cwd, cols, rows });
-        shell = opened;
-        shellState.textContent = `connected (${opened.id})`;
-        shellEventSub = opened.onEvent((event) => {
+        host.shell = opened;
+        host.status = "connected";
+
+        host.shellEventSub = opened.onEvent((event) => {
           if (event.type === "data") {
-            terminal.write(event.data ?? "");
+            host.terminal?.write(event.data ?? "");
           } else if (event.type === "error") {
-            terminal.writeln(`[error] ${event.message ?? "shell error"}`);
+            host.terminal?.writeln(`[error] ${event.message ?? "shell error"}`);
           } else if (event.type === "exit") {
-            terminal.writeln(`[exit] code=${event.code ?? "unknown"}`);
-            resetShell();
+            host.terminal?.writeln(`[exit] code=${event.code ?? "unknown"}`);
+            host.shellEventSub?.dispose();
+            host.shellEventSub = null;
+            host.shell = null;
+            host.status = "disconnected";
+            syncUI();
           }
         });
-        terminal.focus();
-        return { shellId: opened.id, cols: opened.cols, rows: opened.rows, cwd: opened.cwd };
+
+        host.terminal.focus();
+        syncUI();
       })();
 
       try {
-        return await openInFlight;
+        await host.openInFlight;
+      } catch (err) {
+        host.status = "error";
+        host.terminal?.writeln(`[error] ${err instanceof Error ? err.message : String(err)}`);
+        syncUI();
       } finally {
-        openInFlight = null;
+        host.openInFlight = null;
       }
     };
 
-    const sendShellInput = (data: string): void => {
-      if (!shell) return;
-      try {
-        shell.send(data);
-      } catch (err) {
-        setStatus(statusEl, "error", "shell.input failed");
-        renderError(outputEl, "shell.input", err);
+    // --- Host selection ---
+
+    const selectHost = (hostId: string): void => {
+      if (selectedHostId === hostId) return;
+      selectedHostId = hostId;
+
+      // Show/hide terminal containers.
+      for (const h of hosts) {
+        h.terminalHost.style.display = h.id === hostId ? "" : "none";
       }
+
+      const host = hosts.find((h) => h.id === hostId);
+      if (host) {
+        // Lazily initialize terminal + shell.
+        if (!host.terminal) {
+          void openShellForHost(host);
+        } else {
+          host.terminal.fit();
+          host.terminal.focus();
+        }
+      }
+
+      syncUI();
     };
 
-    const terminalInputSub = terminal.onData((data) => {
-      sendShellInput(data);
-    });
-
-    const tabKeyHandler = (event: KeyboardEvent): void => {
-      if (event.key !== "Tab") return;
-      if (event.altKey || event.ctrlKey || event.metaKey) return;
-      event.preventDefault();
-      event.stopPropagation();
-      sendShellInput("\t");
-    };
-    terminalHost.addEventListener("keydown", tabKeyHandler, { capture: true });
-
-    const resizeObserver = new ResizeObserver(() => {
-      terminal.fit();
-      if (!shell) return;
-      const cols = terminal.getCols();
-      const rows = terminal.getRows();
-      if (cols <= 0 || rows <= 0) return;
-      try {
-        shell.resize(cols, rows);
-      } catch (err) {
-        setStatus(statusEl, "error", "shell.resize failed");
-        renderError(outputEl, "shell.resize", err);
-      }
-    });
-    resizeObserver.observe(terminalHost);
+    // --- Cleanup ---
 
     signal.addEventListener("abort", () => {
-      terminalHost.removeEventListener("keydown", tabKeyHandler, { capture: true } as EventListenerOptions);
-      terminalInputSub.dispose();
-      resizeObserver.disconnect();
-      terminal.dispose();
-      if (!shell) return;
-      const active = shell;
-      resetShell();
-      void active.close().catch(() => {});
+      for (const host of hosts) {
+        if (host.tabKeyHandler) {
+          host.terminalHost.removeEventListener("keydown", host.tabKeyHandler, {
+            capture: true,
+          } as EventListenerOptions);
+        }
+        host.terminalInputSub?.dispose();
+        host.resizeObserver?.disconnect();
+        host.terminal?.dispose();
+        if (host.shell) {
+          const active = host.shell;
+          host.shellEventSub?.dispose();
+          host.shell = null;
+          void active.close().catch(() => {});
+        }
+      }
     });
 
+    // --- Boot: initialize primary host ---
+
+    syncUI();
+
     if (!signal.aborted) {
-      void runAction("shell.open", openShell);
+      void openShellForHost(hosts[0]!);
     }
 
-    ctx.log.info("Workspace ops plugin ready.");
+    ctx.log.info("Hosts plugin ready.");
   },
 };

@@ -5,7 +5,7 @@ import { browserPlugin } from "./plugins/browser/index.ts";
 import { filesPlugin } from "./plugins/files/index.ts";
 import { chatPlugin } from "./plugins/chat/index.ts";
 import { repoPlugin } from "./plugins/repo/index.ts";
-import { workspaceOpsPlugin } from "./plugins/workspace-ops/index.ts";
+import { editorOpsPlugin } from "./plugins/editor-ops/index.ts";
 
 document.addEventListener("DOMContentLoaded", () => {
   bootKernel([
@@ -13,7 +13,7 @@ document.addEventListener("DOMContentLoaded", () => {
     promptsPlugin,
     browserPlugin,
     filesPlugin,
-    workspaceOpsPlugin,
+    editorOpsPlugin,
     chatPlugin,
     repoPlugin,
   ]);

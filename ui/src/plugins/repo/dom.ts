@@ -36,6 +36,11 @@ export interface RepoDom {
   manageBackBtn: HTMLButtonElement;
   manageLocalTabBtn: HTMLButtonElement;
   manageDiscoverTabBtn: HTMLButtonElement;
+  hostsList: HTMLElement;
+  terminalPage: HTMLElement;
+  terminalBackBtn: HTMLButtonElement;
+  terminalTitle: HTMLElement;
+  terminalHost: HTMLElement;
 }
 
 let root: HTMLElement;
@@ -84,6 +89,11 @@ export function getRepoDom(): RepoDom {
     manageBackBtn: root.querySelector<HTMLButtonElement>("#rp-manage-back")!,
     manageLocalTabBtn: root.querySelector<HTMLButtonElement>('[data-manage-tab="local"]')!,
     manageDiscoverTabBtn: root.querySelector<HTMLButtonElement>('[data-manage-tab="discover"]')!,
+    hostsList: root.querySelector<HTMLElement>("#rp-hosts-list")!,
+    terminalPage: root.querySelector<HTMLElement>("#rp-terminal-page")!,
+    terminalBackBtn: root.querySelector<HTMLButtonElement>("#rp-terminal-back")!,
+    terminalTitle: root.querySelector<HTMLElement>("#rp-terminal-title")!,
+    terminalHost: root.querySelector<HTMLElement>("#rp-terminal-host")!,
   };
   return cached;
 }

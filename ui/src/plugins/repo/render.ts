@@ -363,13 +363,14 @@ export function updateRepoToolbar(): void {
 
 export function syncRepoTabs(): void {
   const dom = getRepoDom();
-  const isManaging = repoState.subPage === "manage-local";
+  const sub = repoState.subPage;
 
-  // Top-level: show either routing-main (providers) or manage-local sub-page.
-  dom.routingMain.classList.toggle("hidden", isManaging);
-  dom.manageLocal.classList.toggle("hidden", !isManaging);
+  // Top-level: show routing-main, manage-local, or terminal sub-page.
+  dom.routingMain.classList.toggle("hidden", sub !== null);
+  dom.manageLocal.classList.toggle("hidden", sub !== "manage-local");
+  dom.terminalPage.classList.toggle("hidden", sub !== "terminal");
 
-  if (isManaging) {
+  if (sub === "manage-local") {
     const tab = repoState.manageLocalTab;
     dom.discoverView.classList.toggle("hidden", tab !== "discover");
     dom.discoverToolbar.classList.toggle("hidden", tab !== "discover");

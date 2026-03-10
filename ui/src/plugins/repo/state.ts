@@ -3,7 +3,13 @@
 import type { ProviderEntry } from "../../types.ts";
 
 export type RepoTab = "discover" | "local" | "providers";
-export type RepoSubPage = null | "manage-local";
+export type RepoSubPage = null | "manage-local" | "terminal";
+
+export interface HostEntry {
+  id: string;
+  label: string;
+  primary: boolean;
+}
 export type ManageLocalTab = "discover" | "local";
 export type LocalSourceFilter = "all" | "hub" | "managed";
 export type SortColumn = "name" | "size" | "date";
@@ -86,4 +92,8 @@ export const repoState = {
   providers: [] as ProviderEntry[],
   chatModels: [] as string[],
   browseModels: new Map<string, { id: string }[]>(),
+  hosts: [
+    { id: "primary", label: window.location.hostname || "localhost", primary: true },
+  ] as HostEntry[],
+  activeTerminalHostId: null as string | null,
 };

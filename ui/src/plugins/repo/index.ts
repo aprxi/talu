@@ -19,15 +19,19 @@ import {
   updateRepoToolbar,
 } from "./render.ts";
 import { getRepoDom } from "./dom.ts";
+import { renderHosts, wireHostEvents } from "./hosts-render.ts";
+import { openTerminalForHost, wireTerminalEvents, disposeTerminals } from "./hosts-terminal.ts";
 
 export const repoPlugin: PluginDefinition = {
   manifest: {
     id: "talu.repo",
-    name: "Routing",
+    name: "Router",
     version: "0.1.0",
     builtin: true,
+    permissions: ["exec"],
+    requiresCapabilities: ["exec"],
     contributes: {
-      mode: { key: "routing", label: "Routing" },
+      mode: { key: "routing", label: "Router" },
     },
   },
 
@@ -55,14 +59,20 @@ export const repoPlugin: PluginDefinition = {
     const dom = getRepoDom();
     wireProviderEvents(dom.providersList);
     wireChatModelEvents(dom.chatModelsList);
+    wireHostEvents(dom.hostsList, (hostId) => openTerminalForHost(hostId, ctx));
+    wireTerminalEvents();
 
     // Load chat models from KV (needed before providers render for "Added" state).
     await loadChatModels();
 
-    // Refresh when the Routing mode is activated.
-    ctx.events.on<{ to: string }>("mode.changed", ({ to }) => {
+    // Refresh when the Routing mode is activated; clean up terminal when leaving.
+    ctx.events.on<{ to: string; from: string }>("mode.changed", ({ to, from }) => {
       if (to === "routing") {
         initRepoView();
+      } else if (from === "routing" && repoState.subPage === "terminal") {
+        disposeTerminals();
+        repoState.subPage = null;
+        repoState.activeTerminalHostId = null;
       }
     });
 
@@ -104,11 +114,14 @@ export const repoPlugin: PluginDefinition = {
 
 /** Reset state and show providers view when the mode becomes active. */
 function initRepoView(): void {
+  disposeTerminals();
   repoState.selectedIds.clear();
   repoState.subPage = null;
+  repoState.activeTerminalHostId = null;
   repoState.tab = "providers";
   syncRepoTabs();
   updateRepoToolbar();
   loadProviders();
   renderChatModels();
+  renderHosts();
 }

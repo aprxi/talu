@@ -36,7 +36,21 @@ export function buildRepoDOM(container: HTMLElement): void {
           </select>
         </div>
         <div id="rp-providers-list" class="repo-providers-list"></div>
+        <div class="repo-chat-models-divider"></div>
+        <div class="repo-providers-header">
+          <span class="repo-providers-title">Hosts</span>
+        </div>
+        <div id="rp-hosts-list" class="repo-hosts-list"></div>
       </div>
+    </div>
+
+    <!-- ═══ Terminal sub-page (hidden by default) ═══ -->
+    <div id="rp-terminal-page" class="hidden" style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+      <div class="rp-subpage-header">
+        <button id="rp-terminal-back" class="btn btn-ghost btn-sm rp-back-btn">${BACK_ICON} Back</button>
+        <span id="rp-terminal-title" style="font-size:13px;font-weight:500;color:var(--text);"></span>
+      </div>
+      <div id="rp-terminal-host" style="flex:1;min-height:0;background:var(--bg-code);overflow:hidden;"></div>
     </div>
 
     <!-- ═══ Manage-local sub-page (hidden by default) ═══ -->
