@@ -1074,7 +1074,9 @@ fn cmd_xray_record(model: &str, ref_path: &str, args: &XrayArgs) -> Result<()> {
 
 /// Verification mode: load reference and verify generation matches
 fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs) -> Result<()> {
-    use talu::xray::{ReferenceDataHandle, ReferenceVerifierHandle, VerifyCaptureHandle, TeacherForcing};
+    use talu::xray::{
+        ReferenceDataHandle, ReferenceVerifierHandle, TeacherForcing, VerifyCaptureHandle,
+    };
 
     let prompt_text = if args.prompt.is_empty() {
         "xray".to_string()
@@ -1129,11 +1131,23 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
     }
 
+    if let Err(err) = verifier.finish() {
+        if verifier.has_diverged() {
+            println!("✗ Verification FAILED: Divergence detected");
+            println!("  {}", err);
+            println!("  Check panic dumps in /tmp/panic_dumps/");
+            return Err(anyhow!("Verification failed: {}", err));
+        }
+        return Err(err.into());
+    }
+
     // Check if verification detected divergence
     if verifier.has_diverged() {
         println!("✗ Verification FAILED: Divergence detected");
         println!("  Check panic dumps in /tmp/panic_dumps/");
-        return Err(anyhow!("Verification failed: numerical divergence detected"));
+        return Err(anyhow!(
+            "Verification failed: numerical divergence detected"
+        ));
     }
 
     println!("✓ Verification PASSED: No divergence detected");

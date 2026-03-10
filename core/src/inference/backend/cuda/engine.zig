@@ -61,6 +61,10 @@ const EmbeddingLookupKind = enum(u8) {
     gaffine_u4,
 };
 
+fn saturatingU64FromU128(value: u128) u64 {
+    return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
+}
+
 const KernelSlot = enum {
     vector_add,
     vector_add_scaled,
@@ -3456,6 +3460,36 @@ pub const CudaBackend = struct {
 
         const logits_out = logits_out_opt.?;
         try self.runtime_buffers.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host));
+        if (trace.isEnabled()) {
+            const rows128: u128 = 1;
+            const d_model128: u128 = @intCast(self.d_model);
+            const vocab128: u128 = @intCast(self.runtime_buffers.projected_vocab);
+            const total_flops = saturatingU64FromU128(2 * rows128 * d_model128 * vocab128);
+            const total_bytes = saturatingU64FromU128(
+                rows128 * d_model128 * @sizeOf(f32) +
+                    @as(u128, self.runtime_buffers.projection_weight.byteSize()) +
+                    rows128 * vocab128 * @sizeOf(f32),
+            );
+            const kernel_name = switch (self.runtime_buffers.projection_weight) {
+                .dense_f32 => "matmul_lm_head_f32",
+                .dense_u16 => |w| switch (w.dtype) {
+                    .bf16 => "matmul_lm_head_bf16",
+                    .f16 => "matmul_lm_head_f16",
+                },
+                .gaffine_u4 => "matmul_lm_head_gaffine_u4",
+            };
+            trace.emitFinalWithWork(
+                .lm_head,
+                @intCast(position),
+                0,
+                @ptrCast(self.runtime_buffers.projected_logits_host.ptr),
+                .f32,
+                .{ @intCast(self.runtime_buffers.projected_vocab), 0, 0, 0 },
+                1,
+                kernel_name,
+                .{ .flops = total_flops, .bytes = total_bytes },
+            );
+        }
 
         if (self.runtime_buffers.projected_vocab == logits_out.len) {
             @memcpy(logits_out, self.runtime_buffers.projected_logits_host);
@@ -3466,6 +3500,18 @@ pub const CudaBackend = struct {
         if (self.loaded.config.logits_scaling != 1.0) {
             for (logits_out) |*v| {
                 v.* /= self.loaded.config.logits_scaling;
+            }
+            if (trace.isEnabled()) {
+                trace.emitFinal(
+                    .logits_scaled,
+                    @intCast(position),
+                    0,
+                    @ptrCast(logits_out.ptr),
+                    .f32,
+                    .{ @intCast(self.vocab_size), 0, 0, 0 },
+                    1,
+                    null,
+                );
             }
         }
     }

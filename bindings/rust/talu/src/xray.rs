@@ -241,7 +241,8 @@ impl ReferenceRecorderHandle {
 
     /// Record a sampled token.
     pub fn record_token(&self, token_id: u32) -> Result<()> {
-        let ok = unsafe { talu_sys::talu_xray_reference_recorder_record_token(self.handle, token_id) };
+        let ok =
+            unsafe { talu_sys::talu_xray_reference_recorder_record_token(self.handle, token_id) };
         if !ok {
             return Err(error_from_last_or("failed to record token"));
         }
@@ -261,7 +262,9 @@ impl ReferenceRecorderHandle {
         }
         // Prevent drop from destroying the already-consumed handle
         self.handle = std::ptr::null_mut();
-        Ok(ReferenceDataHandle { handle: data_handle })
+        Ok(ReferenceDataHandle {
+            handle: data_handle,
+        })
     }
 }
 
@@ -293,7 +296,8 @@ impl ReferenceDataHandle {
     /// Save reference data to JSON file.
     pub fn save(&self, path: &str) -> Result<()> {
         let c_path = std::ffi::CString::new(path)?;
-        let ok = unsafe { talu_sys::talu_xray_reference_data_save_json(self.handle, c_path.as_ptr()) };
+        let ok =
+            unsafe { talu_sys::talu_xray_reference_data_save_json(self.handle, c_path.as_ptr()) };
         if !ok {
             return Err(error_from_last_or("failed to save reference to JSON"));
         }
@@ -323,9 +327,8 @@ pub struct ReferenceVerifierHandle {
 impl ReferenceVerifierHandle {
     /// Create a new reference verifier for verification phase.
     pub fn new(reference: &ReferenceDataHandle, tolerance: f32) -> Result<Self> {
-        let handle = unsafe {
-            talu_sys::talu_xray_reference_verifier_create(reference.as_ptr(), tolerance)
-        };
+        let handle =
+            unsafe { talu_sys::talu_xray_reference_verifier_create(reference.as_ptr(), tolerance) };
         if handle.is_null() {
             return Err(error_from_last_or("reference verifier create failed"));
         }
@@ -353,6 +356,15 @@ impl ReferenceVerifierHandle {
         unsafe { talu_sys::talu_xray_reference_verifier_has_diverged(self.handle) }
     }
 
+    /// Finalize verification and fail if expected reference points were not observed.
+    pub fn finish(&self) -> Result<()> {
+        let ok = unsafe { talu_sys::talu_xray_reference_verifier_finish(self.handle) };
+        if !ok {
+            return Err(error_from_last_or("reference verifier finish failed"));
+        }
+        Ok(())
+    }
+
     /// Get raw handle for passing to other FFI functions.
     pub fn as_ptr(&self) -> *mut c_void {
         self.handle
@@ -376,11 +388,12 @@ pub struct VerifyCaptureHandle {
 impl VerifyCaptureHandle {
     /// Create verify capture in recording mode.
     pub fn new_recording(recorder: &ReferenceRecorderHandle) -> Result<Self> {
-        let handle = unsafe {
-            talu_sys::talu_xray_verify_capture_create_recording(recorder.handle)
-        };
+        let handle =
+            unsafe { talu_sys::talu_xray_verify_capture_create_recording(recorder.handle) };
         if handle.is_null() {
-            return Err(error_from_last_or("verify capture create (recording) failed"));
+            return Err(error_from_last_or(
+                "verify capture create (recording) failed",
+            ));
         }
         Ok(Self { handle })
     }
@@ -391,14 +404,21 @@ impl VerifyCaptureHandle {
         verifier: &ReferenceVerifierHandle,
         panic_dump_dir: Option<&str>,
     ) -> Result<Self> {
-        let c_dir = panic_dump_dir.map(|s| std::ffi::CString::new(s).ok()).flatten();
-        let dir_ptr = c_dir.as_ref().map(|cs| cs.as_ptr()).unwrap_or(std::ptr::null());
+        let c_dir = panic_dump_dir
+            .map(|s| std::ffi::CString::new(s).ok())
+            .flatten();
+        let dir_ptr = c_dir
+            .as_ref()
+            .map(|cs| cs.as_ptr())
+            .unwrap_or(std::ptr::null());
 
         let handle = unsafe {
             talu_sys::talu_xray_verify_capture_create_verification(verifier.as_ptr(), dir_ptr)
         };
         if handle.is_null() {
-            return Err(error_from_last_or("verify capture create (verification) failed"));
+            return Err(error_from_last_or(
+                "verify capture create (verification) failed",
+            ));
         }
         Ok(Self { handle })
     }

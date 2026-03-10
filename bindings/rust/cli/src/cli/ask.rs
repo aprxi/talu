@@ -813,12 +813,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
             emitted_visible = guard.emitted_visible;
         }
 
-        if !emitted_visible
-            && !silent
-            && !use_json
-            && output_path.is_none()
-            && !raw_output
-        {
+        if !emitted_visible && !silent && !use_json && output_path.is_none() && !raw_output {
             if let Some(text) = latest_visible_text(&chat, !hide_thinking)? {
                 emit_output(&text)?;
             }

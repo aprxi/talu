@@ -564,10 +564,29 @@ pub export fn talu_xray_reference_verifier_has_diverged(handle: ?*ReferenceVerif
     return verifier.has_diverged;
 }
 
+/// Finalize verification and fail if expected reference points were not observed.
+pub export fn talu_xray_reference_verifier_finish(handle: ?*ReferenceVerifierHandle) callconv(.c) bool {
+    capi_error.clearError();
+    const verifier = getReferenceVerifier(handle) orelse {
+        capi_error.setError(error.InvalidHandle, "reference verifier handle is null", .{});
+        return false;
+    };
+    verifier.finish() catch |err| {
+        if (verifier.divergence_point) |div| {
+            const msg_len = std.mem.indexOfScalar(u8, &div.message, 0) orelse div.message.len;
+            capi_error.setError(err, "{s}", .{div.message[0..msg_len]});
+        } else {
+            capi_error.setError(err, "reference verification incomplete", .{});
+        }
+        return false;
+    };
+    return true;
+}
+
 /// Destroy reference verifier.
 pub export fn talu_xray_reference_verifier_destroy(handle: ?*ReferenceVerifierHandle) callconv(.c) void {
     const verifier = getReferenceVerifier(handle) orelse return;
-    // Note: verifier doesn't own allocator, just reset
+    verifier.deinit();
     allocator.destroy(verifier);
 }
 

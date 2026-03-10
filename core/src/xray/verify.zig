@@ -49,13 +49,23 @@ pub const VerifyCapture = struct {
     /// Has a panic dump been triggered?
     panic_triggered: bool,
 
+    fn verificationPointSet() capture_mod.TracePointSet {
+        return .{
+            .final_norm = true,
+            .lm_head = true,
+            .logits_scaled = true,
+            .logits_ready = true,
+            .token_select = true,
+        };
+    }
+
     pub fn initRecording(
         allocator: std.mem.Allocator,
         recorder: *ReferenceRecorder,
     ) VerifyCapture {
         const config = TraceCaptureConfig{
             .mode = .stats,
-            .points = capture_mod.TracePointSet.all(),
+            .points = verificationPointSet(),
         };
 
         return .{
@@ -76,7 +86,7 @@ pub const VerifyCapture = struct {
     ) VerifyCapture {
         const config = TraceCaptureConfig{
             .mode = .stats,
-            .points = capture_mod.TracePointSet.all(),
+            .points = verificationPointSet(),
         };
 
         return .{
@@ -128,17 +138,11 @@ pub const VerifyCapture = struct {
             },
         }
         if (is_token_select) return;
+        if (!self.capture.config.points.contains(emission.point)) return;
 
-        // For non-CPU backends, we need to handle device memory
-        const can_compute_stats = emission.backend == .cpu;
-
-        if (!can_compute_stats) {
-            // Can't compute stats from device pointer - skip for now
-            // TODO: Add device-to-host copy support for Metal/CUDA
-            return;
-        }
-
-        // Compute stats
+        // Xray emitters must only publish host-accessible tensors. This keeps
+        // verification backend-agnostic and avoids duplicating device-specific
+        // stats paths here.
         const tensor_stats = stats_mod.compute(emission.tensor);
 
         switch (self.mode) {
@@ -322,6 +326,117 @@ test "VerifyCapture verification mode detects divergence" {
     // Verifier should have detected divergence
     try std.testing.expect(verifier.has_diverged);
     try std.testing.expect(verifier.divergence_point != null);
+}
+
+test "VerifyCapture verification mode compares host tensors from non-CPU backends" {
+    const allocator = std.testing.allocator;
+
+    const golden_stats = TensorStats{
+        .count = 4,
+        .min = 1.0,
+        .max = 4.0,
+        .sum = 10.0,
+        .sum_sq = 30.0,
+        .nan_count = 0,
+        .inf_count = 0,
+    };
+
+    const ref = reference_mod.ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{100},
+        .stats_records = &[_]reference_mod.StatsRecord{.{
+            .token_idx = 0,
+            .layer = trace.TraceEmission.NO_LAYER,
+            .point = .lm_head,
+            .position = 0,
+            .stats = golden_stats,
+        }},
+        .allocator = allocator,
+    };
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
+    defer verify_cap.deinit();
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 10.0 };
+    const emission = TraceEmission{
+        .point = .lm_head,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 0,
+        .position = 0,
+        .backend = .cuda,
+        .tensor = .{
+            .ptr = @ptrCast(&data),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    verify_cap.handleEmission(emission);
+
+    try std.testing.expect(verifier.has_diverged);
+    try std.testing.expect(verifier.divergence_point != null);
+}
+
+test "VerifyCapture ignores non-verification trace points" {
+    const allocator = std.testing.allocator;
+
+    const golden_stats = TensorStats{
+        .count = 4,
+        .min = 1.0,
+        .max = 4.0,
+        .sum = 10.0,
+        .sum_sq = 30.0,
+        .nan_count = 0,
+        .inf_count = 0,
+    };
+
+    const ref = reference_mod.ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{100},
+        .stats_records = &[_]reference_mod.StatsRecord{.{
+            .token_idx = 0,
+            .layer = trace.TraceEmission.NO_LAYER,
+            .point = .lm_head,
+            .position = 0,
+            .stats = golden_stats,
+        }},
+        .allocator = allocator,
+    };
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
+    defer verify_cap.deinit();
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 10.0 };
+    const emission = TraceEmission{
+        .point = .layer_ffn_norm,
+        .layer = 0,
+        .token = 0,
+        .position = 14,
+        .backend = .cpu,
+        .tensor = .{
+            .ptr = @ptrCast(&data),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    verify_cap.handleEmission(emission);
+
+    try std.testing.expect(!verifier.has_diverged);
 }
 
 test "VerifyCapture token_select u32 advances verifier and skips stats comparison" {

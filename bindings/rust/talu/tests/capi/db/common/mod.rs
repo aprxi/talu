@@ -1,7 +1,7 @@
 //! Shared test fixtures for the DB integration test suite.
 
-use tempfile::TempDir;
 use std::path::{Path, PathBuf};
+use tempfile::TempDir;
 
 /// Ephemeral database context that auto-cleans on drop.
 ///

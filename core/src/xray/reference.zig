@@ -180,6 +180,9 @@ pub const ReferenceVerifier = struct {
     /// Current position in token transcript (for teacher forcing)
     token_idx: u32,
 
+    /// Next reference stats record expected from verification.
+    expected_record_idx: usize,
+
     /// Divergence detection
     has_diverged: bool,
     divergence_point: ?DivergenceInfo,
@@ -204,9 +207,14 @@ pub const ReferenceVerifier = struct {
             .reference = reference,
             .tolerance = tolerance,
             .token_idx = 0,
+            .expected_record_idx = 0,
             .has_diverged = false,
             .divergence_point = null,
         };
+    }
+
+    pub fn deinit(self: *ReferenceVerifier) void {
+        _ = self;
     }
 
     /// Get the next token to force (for teacher forcing)
@@ -231,42 +239,25 @@ pub const ReferenceVerifier = struct {
         // Skip if already diverged
         if (self.has_diverged) return;
 
-        // Find golden stats
-        const golden = self.reference.findStats(
+        if (self.expected_record_idx >= self.reference.stats_records.len) return;
+
+        const golden = &self.reference.stats_records[self.expected_record_idx];
+        if (!golden.matches(
             self.token_idx,
             emission.layer,
             emission.point,
             emission.position,
-        ) orelse {
-            // Missing golden stats - this is a divergence
-            self.has_diverged = true;
-            var msg_buf: [256]u8 = undefined;
-            const msg = try std.fmt.bufPrint(&msg_buf,
-                "Missing golden stats for token={d} layer={d} point={s} pos={d}",
-                .{ self.token_idx, emission.layer, emission.point.name(), emission.position }
-            );
-            self.divergence_point = .{
-                .token_idx = self.token_idx,
-                .layer = emission.layer,
-                .point = emission.point,
-                .position = emission.position,
-                .expected = TensorStats.EMPTY,
-                .actual = actual_stats,
-                .message = std.mem.zeroes([256]u8),
-            };
-            @memcpy(self.divergence_point.?.message[0..msg.len], msg);
-            return error.ReferenceMissing;
-        };
+        )) {
+            // Backends may emit additional xray points or a finer-grained view.
+            // Ignore unmatched emissions here, then enforce completeness at the end.
+            return;
+        }
 
         // Compare stats
         if (!self.statsMatch(golden.stats, actual_stats)) {
             self.has_diverged = true;
             var msg_buf: [256]u8 = undefined;
-            const msg = try std.fmt.bufPrint(&msg_buf,
-                "Stats divergence at token={d} layer={d} point={s}: RMS expected={d:.6} actual={d:.6}",
-                .{ self.token_idx, emission.layer, emission.point.name(),
-                   golden.stats.rms(), actual_stats.rms() }
-            );
+            const msg = try std.fmt.bufPrint(&msg_buf, "Stats divergence at token={d} layer={d} point={s}: RMS expected={d:.6} actual={d:.6}", .{ self.token_idx, emission.layer, emission.point.name(), golden.stats.rms(), actual_stats.rms() });
             self.divergence_point = .{
                 .token_idx = self.token_idx,
                 .layer = emission.layer,
@@ -279,6 +270,33 @@ pub const ReferenceVerifier = struct {
             @memcpy(self.divergence_point.?.message[0..msg.len], msg);
             return error.StatsDivergence;
         }
+
+        self.expected_record_idx += 1;
+    }
+
+    pub fn finish(self: *ReferenceVerifier) !void {
+        if (self.has_diverged) return;
+        if (self.expected_record_idx >= self.reference.stats_records.len) return;
+
+        const missing = self.reference.stats_records[self.expected_record_idx];
+        self.has_diverged = true;
+        var msg_buf: [256]u8 = undefined;
+        const msg = try std.fmt.bufPrint(
+            &msg_buf,
+            "Missing expected stats for token={d} layer={d} point={s} pos={d}",
+            .{ missing.token_idx, missing.layer, missing.point.name(), missing.position },
+        );
+        self.divergence_point = .{
+            .token_idx = missing.token_idx,
+            .layer = missing.layer,
+            .point = missing.point,
+            .position = missing.position,
+            .expected = missing.stats,
+            .actual = TensorStats.EMPTY,
+            .message = std.mem.zeroes([256]u8),
+        };
+        @memcpy(self.divergence_point.?.message[0..msg.len], msg);
+        return error.ReferenceMissing;
     }
 
     fn statsMatch(self: *const ReferenceVerifier, expected: TensorStats, actual: TensorStats) bool {
@@ -592,6 +610,7 @@ test "ReferenceVerifier matches good stats" {
     };
 
     var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    defer verifier.deinit();
 
     const emission = trace.TraceEmission{
         .point = .lm_head,
@@ -644,6 +663,7 @@ test "ReferenceVerifier detects divergence" {
     };
 
     var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    defer verifier.deinit();
 
     const emission = trace.TraceEmission{
         .point = .lm_head,
@@ -674,6 +694,65 @@ test "ReferenceVerifier detects divergence" {
 
     const result = verifier.checkEmission(emission, bad_stats);
     try std.testing.expectError(error.StatsDivergence, result);
+    try std.testing.expect(verifier.has_diverged);
+    try std.testing.expect(verifier.divergence_point != null);
+}
+
+test "ReferenceVerifier ignores extra emissions but finish enforces completeness" {
+    const allocator = std.testing.allocator;
+
+    const golden_stats = TensorStats{
+        .count = 4,
+        .min = 1.0,
+        .max = 4.0,
+        .sum = 10.0,
+        .sum_sq = 30.0,
+        .nan_count = 0,
+        .inf_count = 0,
+    };
+
+    const ref = ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{100},
+        .stats_records = &[_]StatsRecord{
+            .{
+                .token_idx = 0,
+                .layer = 7,
+                .point = .layer_ffn_norm,
+                .position = 14,
+                .stats = golden_stats,
+            },
+        },
+        .allocator = allocator,
+    };
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    defer verifier.deinit();
+
+    const extra_emission = trace.TraceEmission{
+        .point = .layer_ffn_norm,
+        .layer = 0,
+        .token = 0,
+        .position = 0,
+        .backend = .cuda,
+        .tensor = .{
+            .ptr = @ptrFromInt(0x1000),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    try verifier.checkEmission(extra_emission, golden_stats);
+    try std.testing.expect(!verifier.has_diverged);
+
+    const result = verifier.finish();
+    try std.testing.expectError(error.ReferenceMissing, result);
     try std.testing.expect(verifier.has_diverged);
     try std.testing.expect(verifier.divergence_point != null);
 }
