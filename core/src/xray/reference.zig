@@ -13,6 +13,7 @@ const std = @import("std");
 const stats_mod = @import("stats.zig");
 const trace = @import("trace.zig");
 const capture_mod = @import("capture.zig");
+const teacher_forcing = @import("teacher_forcing.zig");
 
 const TensorStats = stats_mod.TensorStats;
 const TracePoint = trace.TracePoint;
@@ -217,6 +218,11 @@ pub const ReferenceVerifier = struct {
         _ = self;
     }
 
+    fn tokenOnlyVerificationEnabled() bool {
+        const raw = std.posix.getenv("TALU_XRAY_VERIFY_TOKEN_ONLY") orelse return false;
+        return !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
+    }
+
     /// Get the next token to force (for teacher forcing)
     pub fn getNextToken(self: *const ReferenceVerifier) ?u32 {
         if (self.token_idx >= self.reference.token_transcript.len) {
@@ -284,6 +290,8 @@ pub const ReferenceVerifier = struct {
         emission: trace.TraceEmission,
         actual_stats: TensorStats,
     ) !void {
+        if (tokenOnlyVerificationEnabled() and !teacher_forcing.isEnabled()) return;
+
         // Skip if already diverged
         if (self.has_diverged) return;
 
@@ -329,6 +337,7 @@ pub const ReferenceVerifier = struct {
             }
             return error.StatsDivergence;
         }
+        if (tokenOnlyVerificationEnabled()) return;
         if (self.expected_record_idx >= self.reference.stats_records.len) return;
 
         const missing = self.reference.stats_records[self.expected_record_idx];
@@ -774,6 +783,50 @@ test "ReferenceVerifier detects token divergence" {
     try std.testing.expect(verifier.has_diverged);
     try std.testing.expect(verifier.divergence_point != null);
     try std.testing.expectError(error.TokenDivergence, verifier.finish());
+}
+
+test "ReferenceVerifier finish skips stats coverage in token-only mode" {
+    const allocator = std.testing.allocator;
+
+    const golden_stats = TensorStats{
+        .count = 4,
+        .min = 1.0,
+        .max = 4.0,
+        .sum = 10.0,
+        .sum_sq = 30.0,
+        .nan_count = 0,
+        .inf_count = 0,
+    };
+
+    const ref = ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{100},
+        .stats_records = &[_]StatsRecord{.{
+            .token_idx = 0,
+            .layer = trace.TraceEmission.NO_LAYER,
+            .point = .lm_head,
+            .position = 0,
+            .stats = golden_stats,
+        }},
+        .allocator = allocator,
+    };
+
+    const EnvFns = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: i32) i32;
+        extern "c" fn unsetenv(name: [*:0]const u8) i32;
+    };
+
+    try std.testing.expectEqual(@as(i32, 0), EnvFns.setenv("TALU_XRAY_VERIFY_TOKEN_ONLY", "1", 1));
+    defer _ = EnvFns.unsetenv("TALU_XRAY_VERIFY_TOKEN_ONLY");
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    defer verifier.deinit();
+
+    try verifier.finish();
+    try std.testing.expect(!verifier.has_diverged);
 }
 
 test "ReferenceVerifier ignores extra emissions but finish enforces completeness" {

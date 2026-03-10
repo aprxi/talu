@@ -415,7 +415,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             slot_index: usize,
         ) void {
             _ = self;
-            if (!parityDebugEnabled()) return;
+            if (std.posix.getenv("TALU_PARITY_LOG") == null) return;
             const top = parityTop3(logits);
             std.debug.print(
                 "PARITY backend={s} phase={s} pos={} slot={} selected={} top0={}({d:.6}) top1={}({d:.6}) top2={}({d:.6})\n",
@@ -437,16 +437,38 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
         fn sampleTopKCandidateToken(
             self: *Self,
-            candidate_logits: []const f32,
-            candidate_ids: []const u32,
+            candidate_logits: []f32,
+            candidate_ids: []u32,
             sampling_config: sampling.SamplingConfig,
         ) !u32 {
+            const xray = @import("../../../xray/root.zig");
+
+            // Teacher forcing tokens are vocabulary IDs, not indices into the
+            // backend-provided top-k candidate subset. Handle them directly.
+            if (xray.getNextForcedToken()) |forced_token| {
+                if (trace.isEnabled()) {
+                    trace.emitFinal(
+                        .token_select,
+                        0,
+                        0,
+                        @ptrCast(std.mem.asBytes(&forced_token).ptr),
+                        .u32,
+                        .{ 1, 0, 0, 0 },
+                        1,
+                        "teacher_forcing_topk",
+                    );
+                }
+                return forced_token;
+            }
+
             if (candidate_logits.len == 0 or candidate_logits.len != candidate_ids.len) {
                 return error.InvalidArgument;
             }
             if (self.logits_buffer.len < candidate_logits.len) {
                 return error.InvalidArgument;
             }
+
+            sortTopKCandidatesByTokenId(candidate_logits, candidate_ids);
 
             const working_logits = self.logits_buffer[0..candidate_logits.len];
             @memcpy(working_logits, candidate_logits);
@@ -467,6 +489,24 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             const sampled_idx = try self.sampler.sample(working_logits, candidate_sampling);
             return candidate_ids[sampled_idx];
+        }
+
+        fn sortTopKCandidatesByTokenId(candidate_logits: []f32, candidate_ids: []u32) void {
+            std.debug.assert(candidate_logits.len == candidate_ids.len);
+            if (candidate_ids.len <= 1) return;
+
+            var i: usize = 1;
+            while (i < candidate_ids.len) : (i += 1) {
+                const id = candidate_ids[i];
+                const logit = candidate_logits[i];
+                var j = i;
+                while (j > 0 and candidate_ids[j - 1] > id) : (j -= 1) {
+                    candidate_ids[j] = candidate_ids[j - 1];
+                    candidate_logits[j] = candidate_logits[j - 1];
+                }
+                candidate_ids[j] = id;
+                candidate_logits[j] = logit;
+            }
         }
 
         fn grammarIsComplete(grammar_sampler: ?*validate.sampler.ConstrainedSampler) bool {
@@ -2629,6 +2669,8 @@ const MockStreamingBackend = struct {
     prefill_with_vision_calls: usize = 0,
     allocated_logits: std.ArrayList([]f32),
     greedy_token: usize = 42,
+    alternate_top_k_order: bool = false,
+    flat_top_k_logits: bool = false,
 
     fn init(allocator: std.mem.Allocator, vocab_size: usize) MockStreamingBackend {
         return .{
@@ -2771,6 +2813,19 @@ const MockStreamingBackend = struct {
         self.decode_top_k_calls += 1;
         const count = @min(top_k, candidate_logits_out.len);
         if (count == 0 or candidate_ids_out.len < count) return error.InvalidArgument;
+        if (self.flat_top_k_logits and count >= 2) {
+            const base_id: u32 = @intCast(self.greedy_token);
+            const flip_order = self.alternate_top_k_order and (self.decode_top_k_calls % 2 == 1);
+            candidate_logits_out[0] = 0.0;
+            candidate_logits_out[1] = 0.0;
+            candidate_ids_out[0] = if (flip_order) base_id + 1 else base_id;
+            candidate_ids_out[1] = if (flip_order) base_id else base_id + 1;
+            for (2..count) |idx| {
+                candidate_logits_out[idx] = -10.0 - @as(f32, @floatFromInt(idx));
+                candidate_ids_out[idx] = base_id + @as(u32, @intCast(idx));
+            }
+            return count;
+        }
         for (candidate_logits_out[0..count], 0..) |*logit, idx| {
             logit.* = if (idx == 0) 10.0 else -10.0 - @as(f32, @floatFromInt(idx));
         }
@@ -4247,6 +4302,98 @@ test "generateSync queued route - seed produces deterministic output" {
 
     // Same seed must produce same tokens (fundamental determinism invariant)
     try std.testing.expectEqualSlices(u32, result1.tokens, result2.tokens);
+}
+
+test "generateSync top-k candidate route - candidate order does not affect seeded output" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    backend.alternate_top_k_order = true;
+    backend.flat_top_k_logits = true;
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .top_k,
+            .temperature = 1.0,
+            .top_k = 2,
+        },
+    });
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3 };
+    const sampling_cfg = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .temperature = 1.0,
+        .top_k = 2,
+        .seed = 42,
+    };
+
+    var result1 = try scheduler.generateSync(&prompt, 2, .{
+        .sampling = sampling_cfg,
+        .eos_token_ids = &[_]u32{9999},
+    });
+    defer result1.deinit(alloc);
+
+    var result2 = try scheduler.generateSync(&prompt, 2, .{
+        .sampling = sampling_cfg,
+        .eos_token_ids = &[_]u32{9999},
+    });
+    defer result2.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result1.tokens.len);
+    try std.testing.expectEqual(@as(usize, 2), result2.tokens.len);
+    try std.testing.expectEqualSlices(u32, result1.tokens, result2.tokens);
+    try std.testing.expectEqual(@as(usize, 2), backend.decode_top_k_calls);
+}
+
+test "generateSync top-k candidate route honors teacher forcing vocab ids" {
+    const xray = @import("../../../xray/root.zig");
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .top_k,
+            .temperature = 1.0,
+            .top_k = 2,
+        },
+    });
+    defer scheduler.deinit();
+
+    const TeacherState = struct {
+        tokens: [2]u32,
+        index: usize = 0,
+    };
+    var teacher_state = TeacherState{
+        .tokens = .{ @intCast(backend.greedy_token), 999 },
+    };
+    const Provider = struct {
+        fn getNext(ctx: ?*anyopaque) ?u32 {
+            const state: *TeacherState = @ptrCast(@alignCast(ctx.?));
+            if (state.index >= state.tokens.len) return null;
+            const token = state.tokens[state.index];
+            state.index += 1;
+            return token;
+        }
+    };
+
+    xray.enableTeacherForcing(&Provider.getNext, &teacher_state);
+    defer xray.disableTeacherForcing();
+
+    var result = try scheduler.generateSync(&[_]u32{ 1, 2, 3 }, 2, .{
+        .sampling = .{
+            .strategy = .top_k,
+            .temperature = 1.0,
+            .top_k = 2,
+        },
+        .eos_token_ids = &[_]u32{9999},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.tokens.len);
+    try std.testing.expectEqual(@as(u32, @intCast(backend.greedy_token)), result.tokens[0]);
+    try std.testing.expectEqual(@as(u32, 999), result.tokens[1]);
 }
 
 test "Scheduler mixed lifecycle: slot-persistent stable, request-scoped freed between requests" {

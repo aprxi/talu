@@ -383,6 +383,8 @@ impl Drop for ReferenceVerifierHandle {
 /// Handle for verify capture (enhanced capture with recording/verification).
 pub struct VerifyCaptureHandle {
     handle: *mut c_void,
+    // Keep C string storage alive while C side may hold a borrowed pointer.
+    _panic_dump_dir: Option<std::ffi::CString>,
 }
 
 impl VerifyCaptureHandle {
@@ -395,7 +397,10 @@ impl VerifyCaptureHandle {
                 "verify capture create (recording) failed",
             ));
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            _panic_dump_dir: None,
+        })
     }
 
     /// Create verify capture in verification mode.
@@ -420,7 +425,10 @@ impl VerifyCaptureHandle {
                 "verify capture create (verification) failed",
             ));
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            _panic_dump_dir: c_dir,
+        })
     }
 
     /// Enable verify capture (start receiving trace emissions).

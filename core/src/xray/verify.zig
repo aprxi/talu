@@ -6,10 +6,12 @@
 //! - Verification mode: Checks emissions against reference, triggers panic dump on divergence
 
 const std = @import("std");
+const builtin = @import("builtin");
 const trace = @import("trace.zig");
 const capture_mod = @import("capture.zig");
 const stats_mod = @import("stats.zig");
 const reference_mod = @import("reference.zig");
+const teacher_forcing = @import("teacher_forcing.zig");
 
 const TraceEmission = trace.TraceEmission;
 const TensorStats = stats_mod.TensorStats;
@@ -51,6 +53,9 @@ pub const VerifyCapture = struct {
 
     fn verificationPointSet() capture_mod.TracePointSet {
         return .{
+            .layer_attn_norm = true,
+            .layer_ffn_norm = true,
+            .block_out = true,
             .final_norm = true,
             .lm_head = true,
             .logits_scaled = true,
@@ -110,6 +115,32 @@ pub const VerifyCapture = struct {
             emission.tensor.elementCount() == 1;
     }
 
+    fn ignoreTokenParity() bool {
+        const raw = std.posix.getenv("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY") orelse return false;
+        return !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
+    }
+
+    fn tokenOnlyVerificationEnabled() bool {
+        const raw = std.posix.getenv("TALU_XRAY_VERIFY_TOKEN_ONLY") orelse return false;
+        return !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
+    }
+
+    fn logVerificationDivergence(verifier: *const ReferenceVerifier, err: anyerror) void {
+        if (comptime builtin.is_test) {
+            std.log.warn("DIVERGENCE DETECTED: {}", .{err});
+        } else {
+            std.log.err("DIVERGENCE DETECTED: {}", .{err});
+        }
+        if (verifier.divergence_point) |div| {
+            const msg_len = std.mem.indexOfScalar(u8, &div.message, 0) orelse div.message.len;
+            if (comptime builtin.is_test) {
+                std.log.warn("{s}", .{div.message[0..msg_len]});
+            } else {
+                std.log.err("{s}", .{div.message[0..msg_len]});
+            }
+        }
+    }
+
     /// Handle a trace emission
     pub fn handleEmission(self: *VerifyCapture, emission: TraceEmission) void {
         const is_token_select = emission.point == .token_select;
@@ -133,14 +164,15 @@ pub const VerifyCapture = struct {
                 if (self.verifier) |ver| {
                     if (is_transcript_token_select) {
                         const token_id_ptr: *const u32 = @ptrCast(@alignCast(emission.tensor.ptr));
-                        ver.checkToken(token_id_ptr.*) catch |err| {
-                            std.log.err("DIVERGENCE DETECTED: {}", .{err});
-                            if (ver.divergence_point) |div| {
-                                const msg_len = std.mem.indexOfScalar(u8, &div.message, 0) orelse div.message.len;
-                                std.log.err("{s}", .{div.message[0..msg_len]});
-                            }
-                            return;
-                        };
+                        // In localization passes, token_select is used only to advance token
+                        // index so numeric checkpoints can still be compared after free-run
+                        // token mismatch.
+                        if (!ignoreTokenParity() and !teacher_forcing.isEnabled()) {
+                            ver.checkToken(token_id_ptr.*) catch |err| {
+                                logVerificationDivergence(ver, err);
+                                return;
+                            };
+                        }
                         ver.nextToken();
                     }
                 }
@@ -148,6 +180,7 @@ pub const VerifyCapture = struct {
         }
         if (is_token_select) return;
         if (!self.capture.config.points.contains(emission.point)) return;
+        if (self.mode == .verify and tokenOnlyVerificationEnabled() and !teacher_forcing.isEnabled()) return;
 
         // Xray emitters must only publish host-accessible tensors. This keeps
         // verification backend-agnostic and avoids duplicating device-specific
@@ -168,12 +201,9 @@ pub const VerifyCapture = struct {
                 if (self.verifier) |ver| {
                     ver.checkEmission(emission, tensor_stats) catch |err| {
                         // Divergence detected!
-                        std.log.err("DIVERGENCE DETECTED: {}", .{err});
+                        logVerificationDivergence(ver, err);
 
                         if (ver.divergence_point) |div| {
-                            const msg_len = std.mem.indexOfScalar(u8, &div.message, 0) orelse div.message.len;
-                            std.log.err("{s}", .{div.message[0..msg_len]});
-
                             // Trigger panic dump if not already done
                             if (!self.panic_triggered and self.panic_dump_dir != null) {
                                 self.triggerPanicDump(emission, tensor_stats, &div) catch |dump_err| {
@@ -474,6 +504,54 @@ test "VerifyCapture token_select u32 advances verifier and skips stats compariso
         .backend = .metal,
         .tensor = .{
             .ptr = @ptrCast(std.mem.asBytes(&token_id).ptr),
+            .dtype = .u32,
+            .shape = .{ 1, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    verify_cap.handleEmission(emission);
+
+    try std.testing.expectEqual(@as(u32, 1), verifier.token_idx);
+    try std.testing.expect(!verifier.has_diverged);
+}
+
+test "VerifyCapture token_select u32 ignores token parity when teacher forcing is enabled" {
+    const allocator = std.testing.allocator;
+
+    const ref = reference_mod.ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{123},
+        .stats_records = &.{},
+        .allocator = allocator,
+    };
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
+    defer verify_cap.deinit();
+
+    const Provider = struct {
+        fn getNext(_: ?*anyopaque) ?u32 {
+            return 123;
+        }
+    };
+    teacher_forcing.enable(&Provider.getNext, null);
+    defer teacher_forcing.disable();
+
+    const mismatched_token_id: u32 = 999;
+    const emission = TraceEmission{
+        .point = .token_select,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 0,
+        .position = 14,
+        .backend = .metal,
+        .tensor = .{
+            .ptr = @ptrCast(std.mem.asBytes(&mismatched_token_id).ptr),
             .dtype = .u32,
             .shape = .{ 1, 0, 0, 0 },
             .ndim = 1,

@@ -1093,10 +1093,6 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
     // Load reference
     let reference = ReferenceDataHandle::load(ref_path)?;
 
-    // Create backend and chat
-    let backend = create_backend_for_model(model, None)?;
-    let content = vec![talu::router::ContentPart::Text(prompt_text.clone())];
-
     // Use same config as recording
     let cfg = talu::router::GenerateConfig {
         temperature: 1.0,
@@ -1105,53 +1101,141 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         ..Default::default()
     };
 
-    let run_pass = |teacher_forcing: bool| -> Result<(bool, Option<String>)> {
-        let verifier = ReferenceVerifierHandle::new(&reference, tolerance)?;
-        let verify_cap =
-            VerifyCaptureHandle::new_verification(&verifier, Some("/tmp/panic_dumps"))?;
-        let chat = ChatHandle::new(None)?;
-
-        verify_cap.enable();
-        if teacher_forcing {
-            TeacherForcing::enable_with_verifier(&verifier);
-        }
-
-        let result = talu::router::generate(&chat, &content, &backend, &cfg);
-
-        if teacher_forcing {
-            TeacherForcing::disable();
-        }
-        VerifyCaptureHandle::disable();
-
-        let result = result?;
-        if result.error_code() != 0 {
-            let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
-            return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
-        }
-
-        match verifier.finish() {
-            Ok(()) => {
-                if verifier.has_diverged() {
-                    Ok((true, None))
-                } else {
-                    Ok((false, None))
-                }
-            }
-            Err(err) => {
-                if verifier.has_diverged() {
-                    Ok((true, Some(err.to_string())))
-                } else {
-                    Err(err.into())
-                }
+    let run_pass = |teacher_forcing: bool, parity_debug: bool| -> Result<(bool, Option<String>)> {
+        let prev_parity_debug = std::env::var_os("TALU_PARITY_DEBUG");
+        let prev_parity_quiet = std::env::var_os("TALU_PARITY_QUIET");
+        let prev_ignore_token_parity = std::env::var_os("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY");
+        let prev_verify_mode = std::env::var_os("TALU_XRAY_VERIFY_MODE");
+        let prev_token_only = std::env::var_os("TALU_XRAY_VERIFY_TOKEN_ONLY");
+        unsafe {
+            std::env::set_var("TALU_XRAY_VERIFY_MODE", "1");
+            if teacher_forcing {
+                std::env::remove_var("TALU_XRAY_VERIFY_TOKEN_ONLY");
+            } else {
+                std::env::set_var("TALU_XRAY_VERIFY_TOKEN_ONLY", "1");
             }
         }
+        if parity_debug {
+            unsafe {
+                std::env::set_var("TALU_PARITY_DEBUG", "1");
+                std::env::set_var("TALU_PARITY_QUIET", "1");
+            }
+        }
+        if teacher_forcing {
+            unsafe {
+                std::env::set_var("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY", "1");
+            }
+        }
+
+        let run_result = (|| -> Result<(bool, Option<String>)> {
+            let verifier = ReferenceVerifierHandle::new(&reference, tolerance)?;
+            let verify_cap =
+                VerifyCaptureHandle::new_verification(&verifier, Some("/tmp/panic_dumps"))?;
+            let backend = create_backend_for_model(model, None)?;
+            let chat = ChatHandle::new(None)?;
+            let content = vec![talu::router::ContentPart::Text(prompt_text.clone())];
+
+            verify_cap.enable();
+            if teacher_forcing {
+                TeacherForcing::enable_with_verifier(&verifier);
+            }
+
+            let result = talu::router::generate(&chat, &content, &backend, &cfg);
+
+            if teacher_forcing {
+                TeacherForcing::disable();
+            }
+            VerifyCaptureHandle::disable();
+
+            let result = result?;
+            if result.error_code() != 0 {
+                let message =
+                    last_error_message().unwrap_or_else(|| "generation failed".to_string());
+                return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
+            }
+
+            if !teacher_forcing {
+                if verifier.has_diverged() {
+                    let msg = verifier.finish().err().map(|err| err.to_string());
+                    return Ok((true, msg));
+                }
+                if verifier.get_next_token().is_some() {
+                    return Ok((
+                        true,
+                        Some(
+                            "Token transcript mismatch: generation ended before consuming reference transcript"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                return Ok((false, None));
+            }
+
+            match verifier.finish() {
+                Ok(()) => Ok((verifier.has_diverged(), None)),
+                Err(err) => {
+                    if verifier.has_diverged() {
+                        Ok((true, Some(err.to_string())))
+                    } else {
+                        Err(err.into())
+                    }
+                }
+            }
+        })();
+
+        if parity_debug {
+            match prev_parity_debug {
+                Some(value) => unsafe {
+                    std::env::set_var("TALU_PARITY_DEBUG", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("TALU_PARITY_DEBUG");
+                },
+            }
+            match prev_parity_quiet {
+                Some(value) => unsafe {
+                    std::env::set_var("TALU_PARITY_QUIET", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("TALU_PARITY_QUIET");
+                },
+            }
+        }
+        if teacher_forcing {
+            match prev_ignore_token_parity {
+                Some(value) => unsafe {
+                    std::env::set_var("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY");
+                },
+            }
+        }
+        match prev_verify_mode {
+            Some(value) => unsafe {
+                std::env::set_var("TALU_XRAY_VERIFY_MODE", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TALU_XRAY_VERIFY_MODE");
+            },
+        }
+        match prev_token_only {
+            Some(value) => unsafe {
+                std::env::set_var("TALU_XRAY_VERIFY_TOKEN_ONLY", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TALU_XRAY_VERIFY_TOKEN_ONLY");
+            },
+        }
+
+        run_result
     };
 
     println!(
         "Phase 1/2: Free-run token parity (no teacher forcing), {} tokens...",
         args.tokens
     );
-    let (phase1_diverged, phase1_msg) = run_pass(false)?;
+    let (phase1_diverged, phase1_msg) = run_pass(false, false)?;
     if !phase1_diverged {
         println!("✓ Verification PASSED: Free-run token transcript matches reference");
         return Ok(());
@@ -1162,13 +1246,17 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         println!("  {}", msg);
     }
 
-    println!("Phase 2/2: Teacher-forced numeric localization on final-path checkpoints...");
-    let (phase2_diverged, phase2_msg) = run_pass(true)?;
+    println!("Phase 2/2: Teacher-forced numeric localization on layer+final checkpoints (TALU_PARITY_DEBUG=1)...");
+    let (phase2_diverged, phase2_msg) = run_pass(true, true)?;
 
     if phase2_diverged {
         println!("✗ Verification FAILED: Divergence detected");
         if let Some(msg) = phase2_msg {
-            println!("  {}", msg);
+            if msg.contains("Missing expected stats") {
+                println!("  Insufficient checkpoint coverage: {}", msg);
+            } else {
+                println!("  {}", msg);
+            }
         }
         println!("  Check panic dumps in /tmp/panic_dumps/");
         return Err(anyhow!(

@@ -130,6 +130,112 @@ pub const MetalBackend = struct {
         return if (self.config.logits_scaling < 0.0) argminHost(logits) else argmaxHost(logits);
     }
 
+    fn parityDebugEnabled() bool {
+        return std.posix.getenv("TALU_PARITY_DEBUG") != null;
+    }
+
+    fn emitParityFinalPathCheckpoints() bool {
+        return trace.isEnabled() and parityDebugEnabled();
+    }
+
+    fn projectLastHiddenToLogits(
+        self: *MetalBackend,
+        last_hidden_handle: graph.ArrayHandle,
+        logits_out: []f32,
+        emit_final_path_points: bool,
+    ) !void {
+        if (logits_out.len < self.vocab_size) return error.InvalidArgument;
+
+        const final_norm_handle = metal_executor.block.TransformerBlock.projectHidden(
+            last_hidden_handle,
+            self.weights,
+            self.config.norm_eps,
+        );
+        defer graph.freeArray(final_norm_handle);
+
+        const lm_head_handle = if (self.weights.lm_head_quantized) |quantized_lm_head| blk: {
+            break :blk graph.mlx_lazy_quantized_matmul(
+                final_norm_handle,
+                quantized_lm_head.weights,
+                quantized_lm_head.scales,
+                quantized_lm_head.biases,
+                quantized_lm_head.group_size,
+                quantized_lm_head.bits,
+                true,
+            );
+        } else blk: {
+            break :blk graph.mlx_lazy_matmul(final_norm_handle, self.weights.lm_head.?);
+        };
+        defer graph.freeArray(lm_head_handle);
+
+        const logits_handle = if (self.weights.logits_scaling != 1.0)
+            graph.mlx_lazy_multiply_scalar(lm_head_handle, 1.0 / self.weights.logits_scaling)
+        else
+            lm_head_handle;
+        defer if (logits_handle != lm_head_handle) graph.freeArray(logits_handle);
+
+        if (emit_final_path_points) {
+            graph.eval(&[_]graph.ArrayHandle{ final_norm_handle, lm_head_handle, logits_handle });
+        } else {
+            graph.eval(&[_]graph.ArrayHandle{logits_handle});
+        }
+        graph.copyToHost(logits_handle, logits_out[0..self.vocab_size]);
+
+        if (!emit_final_path_points) return;
+
+        const final_norm_host = try self.allocator.alloc(f32, self.d_model);
+        defer self.allocator.free(final_norm_host);
+        graph.copyToHost(final_norm_handle, final_norm_host);
+        trace.emitFinal(
+            .final_norm,
+            0,
+            1,
+            @ptrCast(final_norm_host.ptr),
+            .f32,
+            .{ @intCast(self.d_model), 0, 0, 0 },
+            1,
+            "metal_final_norm_host",
+        );
+
+        if (self.weights.logits_scaling != 1.0) {
+            const lm_head_host = try self.allocator.alloc(f32, self.vocab_size);
+            defer self.allocator.free(lm_head_host);
+            graph.copyToHost(lm_head_handle, lm_head_host);
+            trace.emitFinal(
+                .lm_head,
+                0,
+                0,
+                @ptrCast(lm_head_host.ptr),
+                .f32,
+                .{ @intCast(self.vocab_size), 0, 0, 0 },
+                1,
+                "matmul_lm_head",
+            );
+            trace.emitFinal(
+                .logits_scaled,
+                0,
+                0,
+                @ptrCast(logits_out.ptr),
+                .f32,
+                .{ @intCast(self.vocab_size), 0, 0, 0 },
+                1,
+                null,
+            );
+            return;
+        }
+
+        trace.emitFinal(
+            .lm_head,
+            0,
+            0,
+            @ptrCast(logits_out.ptr),
+            .f32,
+            .{ @intCast(self.vocab_size), 0, 0, 0 },
+            1,
+            "matmul_lm_head",
+        );
+    }
+
     fn resolveMaxBatchSize() usize {
         if (std.posix.getenv("TALU_METAL_MAX_BATCH_SIZE")) |raw| {
             const parsed = std.fmt.parseUnsigned(usize, std.mem.sliceTo(raw, 0), 10) catch return 8;
@@ -513,9 +619,15 @@ pub const MetalBackend = struct {
         try self.resetSlotState(slot_index);
         const t_reset_done_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
-        const use_direct_prefill_logits = std.posix.getenv("TALU_METAL_PREFILL_DIRECT_LOGITS") != null;
+        const emit_final_path_points = emitParityFinalPathCheckpoints();
+        const use_direct_prefill_logits = !emit_final_path_points and
+            std.posix.getenv("TALU_METAL_PREFILL_DIRECT_LOGITS") != null;
         const runtime_rope_ctx = self.textRuntimeRoPEOverride(0, sequence_len);
-        const logits_handle = if (use_direct_prefill_logits) blk: {
+        const t_graph_built_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
+        var t_eval_done_ns: i128 = t_graph_built_ns;
+        var t_copy_done_ns: i128 = t_graph_built_ns;
+
+        if (use_direct_prefill_logits) {
             const full_logits = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
                 self.allocator,
                 self.weights,
@@ -528,12 +640,33 @@ pub const MetalBackend = struct {
                 runtime_rope_ctx,
             );
             const last_logits = graph.mlx_lazy_slice_last(full_logits);
-            if (last_logits == full_logits) {
-                break :blk full_logits;
+            const logits_handle = if (last_logits == full_logits) full_logits else blk: {
+                graph.freeArray(full_logits);
+                break :blk last_logits;
+            };
+            defer graph.freeArray(logits_handle);
+            graph.eval(&[_]graph.ArrayHandle{logits_handle});
+            t_eval_done_ns = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
+
+            var shape_buffer: [8]usize = undefined;
+            const rank = graph.getShape(logits_handle, &shape_buffer);
+            std.debug.assert(rank >= 1);
+            std.debug.assert(shape_buffer[rank - 1] == self.vocab_size);
+            if (rank == 2) std.debug.assert(shape_buffer[0] == 1);
+            if (trace_prefill_timing) {
+                std.debug.print(
+                    "METAL_PREFILL_LOGITS_SHAPE rank={} d0={} d1={} d2={}\n",
+                    .{
+                        rank,
+                        if (rank > 0) shape_buffer[0] else 0,
+                        if (rank > 1) shape_buffer[1] else 0,
+                        if (rank > 2) shape_buffer[2] else 0,
+                    },
+                );
             }
-            graph.freeArray(full_logits);
-            break :blk last_logits;
-        } else blk: {
+            graph.copyToHost(logits_handle, logits_out[0..self.vocab_size]);
+            t_copy_done_ns = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
+        } else {
             const hidden_handle = try runtime_trait.transformerForwardHiddenLazyWithEmbeddingOverride(
                 self.allocator,
                 self.weights,
@@ -550,34 +683,15 @@ pub const MetalBackend = struct {
             var ends: [3]c_int = .{ 1, @intCast(sequence_len), @intCast(self.d_model) };
             const last_hidden_handle = graph.mlx_lazy_slice(hidden_handle, &starts, &ends, 3);
             defer graph.freeArray(last_hidden_handle);
-            break :blk metal_executor.block.TransformerBlock.projectLogitsFromNormedHidden(
+            try self.projectLastHiddenToLogits(
                 last_hidden_handle,
-                self.weights,
+                logits_out,
+                emit_final_path_points,
             );
-        };
-        defer graph.freeArray(logits_handle);
-        const t_graph_built_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
-
-        graph.eval(&[_]graph.ArrayHandle{logits_handle});
-        const t_eval_done_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
-
-        var shape_buffer: [8]usize = undefined;
-        const rank = graph.getShape(logits_handle, &shape_buffer);
-        std.debug.assert(rank >= 1);
-        std.debug.assert(shape_buffer[rank - 1] == self.vocab_size);
-        if (rank == 2) std.debug.assert(shape_buffer[0] == 1);
-        if (trace_prefill_timing) {
-            std.debug.print(
-                "METAL_PREFILL_LOGITS_SHAPE rank={} d0={} d1={} d2={}\n",
-                .{
-                    rank,
-                    if (rank > 0) shape_buffer[0] else 0,
-                    if (rank > 1) shape_buffer[1] else 0,
-                    if (rank > 2) shape_buffer[2] else 0,
-                },
-            );
+            const t_done = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
+            t_eval_done_ns = t_done;
+            t_copy_done_ns = t_done;
         }
-        graph.copyToHost(logits_handle, logits_out[0..self.vocab_size]);
         trace.emitFinal(
             .logits_ready,
             @intCast(sequence_len - 1),
@@ -588,7 +702,6 @@ pub const MetalBackend = struct {
             1,
             "metal_logits_host",
         );
-        const t_copy_done_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
         const t_end_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
@@ -631,20 +744,37 @@ pub const MetalBackend = struct {
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
         const runtime_rope_ctx = self.textRuntimeRoPEOverride(effective_position, 1);
-        const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
-            self.allocator,
-            self.weights,
-            &[_]u32{token},
-            try self.slotStateBlocks(slot_index),
-            self.config,
-            effective_position,
-            null,
-            null,
-            runtime_rope_ctx,
-        );
-        defer graph.freeArray(logits_handle);
-        graph.eval(&[_]graph.ArrayHandle{logits_handle});
-        graph.copyToHost(logits_handle, logits_out);
+        const emit_final_path_points = emitParityFinalPathCheckpoints();
+        if (emit_final_path_points) {
+            const hidden_handle = try runtime_trait.transformerForwardHiddenLazyWithEmbeddingOverride(
+                self.allocator,
+                self.weights,
+                &[_]u32{token},
+                try self.slotStateBlocks(slot_index),
+                self.config,
+                effective_position,
+                null,
+                null,
+                runtime_rope_ctx,
+            );
+            defer graph.freeArray(hidden_handle);
+            try self.projectLastHiddenToLogits(hidden_handle, logits_out, true);
+        } else {
+            const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
+                self.allocator,
+                self.weights,
+                &[_]u32{token},
+                try self.slotStateBlocks(slot_index),
+                self.config,
+                effective_position,
+                null,
+                null,
+                runtime_rope_ctx,
+            );
+            defer graph.freeArray(logits_handle);
+            graph.eval(&[_]graph.ArrayHandle{logits_handle});
+            graph.copyToHost(logits_handle, logits_out);
+        }
         trace.emitFinal(
             .logits_ready,
             0,
@@ -1243,19 +1373,11 @@ pub const MetalBackend = struct {
         var ends: [3]c_int = .{ 1, @intCast(sequence_len), @intCast(self.d_model) };
         const last_hidden_handle = graph.mlx_lazy_slice(hidden_handle, &starts, &ends, 3);
         defer graph.freeArray(last_hidden_handle);
-        const logits_handle = metal_executor.block.TransformerBlock.projectLogitsFromNormedHidden(
+        try self.projectLastHiddenToLogits(
             last_hidden_handle,
-            self.weights,
+            logits_out,
+            emitParityFinalPathCheckpoints(),
         );
-        defer graph.freeArray(logits_handle);
-        graph.eval(&[_]graph.ArrayHandle{logits_handle});
-
-        var shape_buffer: [8]usize = undefined;
-        const rank = graph.getShape(logits_handle, &shape_buffer);
-        std.debug.assert(rank >= 1);
-        std.debug.assert(shape_buffer[rank - 1] == self.vocab_size);
-        if (rank == 2) std.debug.assert(shape_buffer[0] == 1);
-        graph.copyToHost(logits_handle, logits_out[0..self.vocab_size]);
         trace.emitFinal(
             .logits_ready,
             @intCast(sequence_len - 1),
