@@ -10,13 +10,13 @@
 
 use std::path::PathBuf;
 
-use crate::capi::db::common::{total_wal_size, TestContext};
+use crate::capi::db::common::{resolve_namespace_dir, total_wal_size, TestContext};
 use talu::responses::{MessageRole, ResponsesView};
 use talu::ChatHandle;
 
 /// Resolve the chat namespace directory for a DB root.
 fn chat_dir(db_root: &str) -> PathBuf {
-    PathBuf::from(db_root).join("chat")
+    resolve_namespace_dir(db_root, "chat")
 }
 
 /// File size, or 0 if the file does not exist.

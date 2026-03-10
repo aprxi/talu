@@ -1,6 +1,7 @@
 //! Shared test fixtures for the DB integration test suite.
 
 use tempfile::TempDir;
+use std::path::{Path, PathBuf};
 
 /// Ephemeral database context that auto-cleans on drop.
 ///
@@ -36,14 +37,15 @@ impl TestContext {
 /// each writer creates a unique `wal-<hex>.wal` file. On clean close
 /// the file is deleted; orphaned files indicate a crash.
 pub fn find_wal_files(db_root: &str, namespace: &str) -> Vec<std::path::PathBuf> {
-    let ns_dir = std::path::Path::new(db_root).join(namespace);
     let mut wals = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&ns_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with("wal-") && name_str.ends_with(".wal") {
-                wals.push(entry.path());
+    for ns_dir in namespace_dir_candidates(db_root, namespace) {
+        if let Ok(entries) = std::fs::read_dir(&ns_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("wal-") && name_str.ends_with(".wal") {
+                    wals.push(entry.path());
+                }
             }
         }
     }
@@ -57,6 +59,26 @@ pub fn total_wal_size(db_root: &str, namespace: &str) -> u64 {
         .filter_map(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .sum()
+}
+
+/// Return candidate namespace directories for compatibility across layouts.
+pub fn namespace_dir_candidates(db_root: &str, namespace: &str) -> [PathBuf; 2] {
+    [
+        Path::new(db_root).join(namespace),
+        Path::new(db_root).join("tables").join(namespace),
+    ]
+}
+
+/// Resolve a namespace directory, preferring whichever exists on disk.
+pub fn resolve_namespace_dir(db_root: &str, namespace: &str) -> PathBuf {
+    let candidates = namespace_dir_candidates(db_root, namespace);
+    if candidates[0].exists() {
+        candidates[0].clone()
+    } else if candidates[1].exists() {
+        candidates[1].clone()
+    } else {
+        candidates[0].clone()
+    }
 }
 
 /// Generate deterministic test vectors.

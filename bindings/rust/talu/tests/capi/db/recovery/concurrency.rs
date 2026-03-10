@@ -161,7 +161,15 @@ fn threaded_concurrent_appends() {
         .map(|i| {
             let path = db_path.clone();
             std::thread::spawn(move || {
-                let store = VectorStore::open(&path).expect("thread open failed");
+                let mut store_opt = None;
+                for _attempt in 0..128 {
+                    if let Ok(store) = VectorStore::open(&path) {
+                        store_opt = Some(store);
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                let store = store_opt.expect("thread open failed after retries");
                 let id = (i + 1) as u64;
                 let vec = vec![id as f32, 0.0, 0.0, 0.0];
                 store

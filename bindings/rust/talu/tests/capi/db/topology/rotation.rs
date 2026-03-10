@@ -11,7 +11,7 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
-use crate::capi::db::common::TestContext;
+use crate::capi::db::common::{resolve_namespace_dir, TestContext};
 use talu::responses::{MessageRole, ResponsesView};
 use talu::vector::VectorStore;
 use talu::{ChatHandle, StorageHandle};
@@ -38,7 +38,7 @@ struct SegmentEntry {
 
 /// Resolve the chat namespace directory for a DB root.
 fn chat_dir(db_root: &str) -> PathBuf {
-    PathBuf::from(db_root).join("chat")
+    resolve_namespace_dir(db_root, "chat")
 }
 
 /// List all `seg-*.talu` files in a directory.

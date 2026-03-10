@@ -92,7 +92,8 @@ fn writer_and_reader_threads_interleave() {
     let sid = TestContext::unique_session_id();
     let rounds = 5;
 
-    let (tx, rx) = mpsc::channel::<usize>();
+    let (tx_written, rx_written) = mpsc::channel::<usize>();
+    let (tx_read, rx_read) = mpsc::channel::<()>();
 
     // Writer thread: opens, writes, closes, signals.
     let writer_path = db_path.clone();
@@ -105,7 +106,8 @@ fn writer_and_reader_threads_interleave() {
             let msg = format!("Thread msg {round}");
             append_message(&chat, msg.as_bytes());
             drop(chat); // Flush before signaling.
-            tx.send(round + 1).expect("writer: send");
+            tx_written.send(round + 1).expect("writer: send");
+            rx_read.recv().expect("writer: wait for reader ack");
         }
     });
 
@@ -114,7 +116,7 @@ fn writer_and_reader_threads_interleave() {
     let reader_sid = sid.clone();
     let reader = std::thread::spawn(move || {
         for _ in 0..rounds {
-            let expected_count = rx.recv().expect("reader: recv");
+            let expected_count = rx_written.recv().expect("reader: recv");
             let storage = StorageHandle::open(&reader_path).expect("reader: open");
             let conv = storage.load_session(&reader_sid).expect("reader: load");
             assert_eq!(
@@ -123,6 +125,7 @@ fn writer_and_reader_threads_interleave() {
                 "Reader expected {expected_count} messages, got {}",
                 conv.item_count(),
             );
+            tx_read.send(()).expect("reader: ack");
         }
     });
 
@@ -161,7 +164,16 @@ fn parallel_writers_different_sessions() {
             std::thread::spawn(move || {
                 bar.wait(); // Maximize concurrency.
                 let chat = ChatHandle::new(None).expect("new");
-                chat.set_storage_db(&path, &sid).expect("set");
+                // Chat writers are single-writer per namespace; parallel opens can race.
+                let mut opened = false;
+                for _attempt in 0..64 {
+                    if chat.set_storage_db(&path, &sid).is_ok() {
+                        opened = true;
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                assert!(opened, "set_storage_db never succeeded for session {sid}");
 
                 for j in 0..messages_per_writer {
                     let msg = format!("Writer {i} msg {j}");

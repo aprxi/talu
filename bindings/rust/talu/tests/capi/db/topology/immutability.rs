@@ -12,7 +12,7 @@
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
-use crate::capi::db::common::{find_wal_files, TestContext};
+use crate::capi::db::common::{find_wal_files, resolve_namespace_dir, TestContext};
 use talu::responses::{MessageRole, ResponsesView};
 use talu::vector::VectorStore;
 use talu::{ChatHandle, StorageHandle};
@@ -40,12 +40,12 @@ fn file_size(path: &std::path::Path) -> u64 {
 
 /// Resolve the chat namespace directory for a DB root.
 fn chat_dir(db_root: &str) -> PathBuf {
-    PathBuf::from(db_root).join("chat")
+    resolve_namespace_dir(db_root, "chat")
 }
 
 /// Resolve the vector namespace directory for a DB root.
 fn vector_dir(db_root: &str) -> PathBuf {
-    PathBuf::from(db_root).join("vector")
+    resolve_namespace_dir(db_root, "vector")
 }
 
 // ---------------------------------------------------------------------------

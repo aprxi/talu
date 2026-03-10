@@ -94,8 +94,8 @@ fn free_functions_take_pointers() {
     // Additional runtime check: verify pointer size assumptions.
     // Free functions taking pointers should have function pointers the same size
     // as any other function pointer (8 bytes on 64-bit systems).
-    let free_string_list_ptr = talu_sys::talu_db_blob_free_string_list as usize;
-    let free_tags_ptr = talu_sys::talu_db_tag_free_list as usize;
+    let free_string_list_ptr = talu_sys::talu_db_blob_free_string_list as *const () as usize;
+    let free_tags_ptr = talu_sys::talu_db_tag_free_list as *const () as usize;
 
     // Both should be valid function addresses (non-zero)
     assert_ne!(
