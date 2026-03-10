@@ -34,33 +34,22 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     }
     if (tokens.len > self.max_seq_len) return error.InvalidArgument;
     self.slot_rope_position_delta = 0;
+    try self.beginParityPrefillCapture(tokens.len);
+    defer self.endParityPrefillCapture();
     const prefill_start_ns: i128 = std.time.nanoTimestamp();
-    try self.ensureKvCapacity(tokens.len);
-
-    var i: usize = 0;
-    while (i < tokens.len) : (i += 1) {
-        const download_logits = self.shouldDownloadPrefillLogitsImpl(i, tokens.len);
-        self.computeGpuPrototypeLogitsWithLayerLimit(
-            tokens[i],
-            i,
-            0,
-            if (download_logits) self.slot_logits else null,
-            self.block_runtime.blocks.len,
-            download_logits,
-            download_logits,
-            false,
-            null,
-            null,
-            null,
-        ) catch |err| {
-            log.warn("inference", "CUDA prefill token step failed", .{
-                .token_index = i,
-                .token_id = tokens[i],
-                .reason = @errorName(err),
-            });
-            return err;
-        };
-    }
+    self.parity_prefill_token_index = tokens.len - 1;
+    self.computeGpuPrototypePrefillLogitsWithLayerLimit(
+        tokens,
+        0,
+        self.slot_logits,
+        self.block_runtime.blocks.len,
+    ) catch |err| {
+        log.warn("inference", "CUDA prefill batched path failed", .{
+            .token_count = tokens.len,
+            .reason = @errorName(err),
+        });
+        return err;
+    };
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
     self.logPrefillTimingImpl("prefill", tokens.len, prefill_elapsed_ns);
     @memcpy(logits_out, self.slot_logits);
@@ -115,33 +104,23 @@ pub fn prefillSlot(
     }
     if (tokens.len > self.max_seq_len) return error.InvalidArgument;
     self.slot_rope_position_delta = 0;
+    try self.beginParityPrefillCapture(tokens.len);
+    defer self.endParityPrefillCapture();
     const prefill_start_ns: i128 = std.time.nanoTimestamp();
-    try self.ensureKvCapacity(tokens.len);
-    var i: usize = 0;
-    while (i < tokens.len) : (i += 1) {
-        const download_logits = self.shouldDownloadPrefillLogitsImpl(i, tokens.len);
-        self.computeGpuPrototypeLogitsWithLayerLimit(
-            tokens[i],
-            i,
-            slot_index,
-            if (download_logits) self.slot_logits else null,
-            self.block_runtime.blocks.len,
-            download_logits,
-            download_logits,
-            false,
-            null,
-            null,
-            null,
-        ) catch |err| {
-            log.warn("inference", "CUDA prefillSlot token step failed", .{
-                .slot_index = slot_index,
-                .token_index = i,
-                .token_id = tokens[i],
-                .reason = @errorName(err),
-            });
-            return err;
-        };
-    }
+    self.parity_prefill_token_index = tokens.len - 1;
+    self.computeGpuPrototypePrefillLogitsWithLayerLimit(
+        tokens,
+        slot_index,
+        self.slot_logits,
+        self.block_runtime.blocks.len,
+    ) catch |err| {
+        log.warn("inference", "CUDA prefillSlot batched path failed", .{
+            .slot_index = slot_index,
+            .token_count = tokens.len,
+            .reason = @errorName(err),
+        });
+        return err;
+    };
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
     self.logPrefillTimingImpl("prefill_slot", tokens.len, prefill_elapsed_ns);
     @memcpy(logits_out, self.slot_logits);
@@ -178,6 +157,7 @@ const MockBackend = struct {
     slot_state_bound: bool = true,
     compute_calls: usize = 0,
     timing_calls: usize = 0,
+    parity_prefill_token_index: usize = 0,
 
     fn init() MockBackend {
         var backend = MockBackend{};
@@ -201,35 +181,29 @@ const MockBackend = struct {
         return token_index + 1 == token_count;
     }
 
-    fn computeGpuPrototypeLogitsWithLayerLimit(
+    fn beginParityPrefillCapture(self: *MockBackend, seq_len: usize) !void {
+        _ = self;
+        _ = seq_len;
+    }
+
+    fn endParityPrefillCapture(self: *MockBackend) void {
+        _ = self;
+    }
+
+    fn computeGpuPrototypePrefillLogitsWithLayerLimit(
         self: *MockBackend,
-        token: u32,
-        position: usize,
+        tokens: []const u32,
         slot_index: usize,
-        logits_out_opt: ?[]f32,
+        logits_out: []f32,
         layer_limit: usize,
-        compute_logits: bool,
-        download_logits: bool,
-        ensure_kv_capacity: bool,
-        hidden_override: ?[]const f32,
-        deepstack_layer_features_opt: ?[]const []const f32,
-        deepstack_feature_index_opt: ?usize,
     ) !void {
-        _ = token;
-        _ = position;
+        _ = tokens;
         _ = slot_index;
         _ = layer_limit;
-        _ = compute_logits;
-        _ = download_logits;
-        _ = ensure_kv_capacity;
-        _ = hidden_override;
-        _ = deepstack_layer_features_opt;
-        _ = deepstack_feature_index_opt;
+        self.ensure_kv_capacity_calls += 1;
         self.compute_calls += 1;
-        if (logits_out_opt) |logits_out| {
-            for (logits_out, 0..) |*logit, idx| {
-                logit.* = @floatFromInt(idx);
-            }
+        for (logits_out, 0..) |*logit, idx| {
+            logit.* = @floatFromInt(idx);
         }
     }
 
@@ -241,28 +215,28 @@ const MockBackend = struct {
     }
 };
 
-test "prefill executes token-wise prefill path" {
+test "prefill executes batched prefill path" {
     var backend = MockBackend.init();
     const tokens = [_]u32{ 1, 2, 3 };
     var logits_out: [8]f32 = undefined;
 
     try prefill(&backend, tokens[0..], logits_out[0..]);
 
-    try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
+    try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
     try testing.expectEqual(tokens.len, backend.compute_calls);
     try testing.expectEqual(tokens.len, backend.slot_position);
 }
 
-test "prefillSlot executes token-wise prefill path" {
+test "prefillSlot executes batched prefill path" {
     var backend = MockBackend.init();
     const tokens = [_]u32{ 4, 5 };
     var logits_out: [8]f32 = undefined;
 
     try prefillSlot(&backend, 0, tokens[0..], logits_out[0..]);
 
-    try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
+    try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
     try testing.expectEqual(tokens.len, backend.compute_calls);
     try testing.expectEqual(tokens.len, backend.slot_position);
 }

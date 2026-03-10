@@ -54,7 +54,14 @@ pub const VerifyCapture = struct {
     fn verificationPointSet() capture_mod.TracePointSet {
         return .{
             .layer_attn_norm = true,
+            .attn_out = true,
+            .gdelta_in_proj = true,
+            .gdelta_conv = true,
+            .gdelta_ssm = true,
+            .gdelta_norm = true,
+            .gdelta_out = true,
             .layer_ffn_norm = true,
+            .ffn_down = true,
             .block_out = true,
             .final_norm = true,
             .lm_head = true,

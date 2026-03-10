@@ -1272,7 +1272,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         ref_path
     };
 
-    println!("Phase 2/2: Teacher-forced numeric localization on layer+final checkpoints (TALU_PARITY_DEBUG=1)...");
+    println!("Phase 2/2: Teacher-forced numeric localization on layer/final, branch, and gated-delta checkpoints (TALU_PARITY_DEBUG=1)...");
     if let Some(token_idx) = phase2_divergence_token {
         println!(
             "  Focusing numeric localization from token={} (phase-1 divergence point)",

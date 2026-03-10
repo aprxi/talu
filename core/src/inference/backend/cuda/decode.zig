@@ -90,6 +90,8 @@ pub fn decodeBatch(
         true,
         true,
         true,
+        1,
+        self.slot_position,
         null,
         null,
         null,
@@ -148,6 +150,8 @@ pub fn decodeStreaming(
             true,
             false,
             true,
+            1,
+            position,
             null,
             null,
             null,
@@ -270,6 +274,8 @@ const MockDecodeBackend = struct {
         compute_logits: bool,
         download_logits: bool,
         ensure_kv_capacity: bool,
+        trace_seq_len_u32: u32,
+        trace_pos_offset: usize,
         hidden_override: ?[]const f32,
         deepstack_layer_features_opt: ?[]const []const f32,
         deepstack_feature_index_opt: ?usize,
@@ -282,6 +288,8 @@ const MockDecodeBackend = struct {
         _ = compute_logits;
         _ = download_logits;
         _ = ensure_kv_capacity;
+        _ = trace_seq_len_u32;
+        _ = trace_pos_offset;
         _ = hidden_override;
         _ = deepstack_layer_features_opt;
         _ = deepstack_feature_index_opt;

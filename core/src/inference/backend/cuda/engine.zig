@@ -10,6 +10,7 @@ const layer_ops = models.layer_ops;
 const op_types = models.op_types;
 const opcode_map = models.plan.opcode_map;
 const plan_compiler = models.plan.compiler;
+const rope_scaling = models.rope_scaling;
 const runtime_contract = @import("../../runtime_contract/root.zig");
 const contract = @import("../contract.zig");
 const compute = @import("../../../compute/root.zig");
@@ -32,7 +33,7 @@ const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 const prototype_eps: f32 = 1e-5;
 const initial_kv_cache_tokens: usize = 256;
-const kv_cache_dtype_fp16: bool = true;
+const kv_cache_dtype_fp16: bool = false;
 const enable_fused_attention_f16_kv: bool = true;
 const max_fused_attention_f16_kv_seq_len: u32 = 384;
 const enable_device_embedding_lookup: bool = true;
@@ -290,6 +291,8 @@ const RuntimeBuffers = struct {
     max_kv: usize,
     max_seq_len: usize,
     head_dim: usize,
+    shortconv_dim: usize,
+    row_capacity: usize,
     using_model_norm: bool,
     using_model_projection: bool,
     projection_from_lm_head: bool,
@@ -461,6 +464,8 @@ const RuntimeBuffers = struct {
             .max_kv = max_kv,
             .max_seq_len = max_seq_len,
             .head_dim = head_dim,
+            .shortconv_dim = shortconv_dim,
+            .row_capacity = 1,
             .using_model_norm = using_model_norm,
             .using_model_projection = using_model_projection,
             .projection_from_lm_head = projection_from_lm_head,
@@ -547,6 +552,45 @@ const RuntimeBuffers = struct {
         if (self.attn_probs_dev) |*buf| return buf;
         return error.CudaKernelUnavailable;
     }
+
+    fn ensureRowCapacity(self: *RuntimeBuffers, device: *compute.cuda.Device, required_rows: usize) !void {
+        if (required_rows == 0) return error.InvalidArgument;
+        if (required_rows <= self.row_capacity) return;
+        if (required_rows > self.max_seq_len) return error.InvalidArgument;
+
+        var new_capacity = self.row_capacity;
+        if (new_capacity == 0) new_capacity = 1;
+        while (new_capacity < required_rows) {
+            const doubled = std.math.mul(usize, new_capacity, 2) catch self.max_seq_len;
+            const next = if (doubled > new_capacity) doubled else self.max_seq_len;
+            new_capacity = @min(self.max_seq_len, next);
+            if (new_capacity == self.max_seq_len) break;
+        }
+        if (new_capacity < required_rows) return error.InvalidArgument;
+
+        const d_model_bytes = std.math.mul(usize, self.hidden_host.len, @sizeOf(f32)) catch return error.InvalidArgument;
+        const d_ff_bytes = std.math.mul(usize, self.max_dff, @sizeOf(f32)) catch return error.InvalidArgument;
+        const d_attn_bytes = std.math.mul(usize, self.max_attn, @sizeOf(f32)) catch return error.InvalidArgument;
+        const d_kv_bytes = std.math.mul(usize, self.max_kv, @sizeOf(f32)) catch return error.InvalidArgument;
+        const shortconv_proj_bytes = std.math.mul(usize, self.shortconv_dim * 3, @sizeOf(f32)) catch return error.InvalidArgument;
+        const shortconv_conv_bytes = std.math.mul(usize, self.shortconv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
+
+        try resizeScratchBuffer(device, &self.input_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.norm_out_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.attn_q_dev, std.math.mul(usize, d_attn_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.attn_k_dev, std.math.mul(usize, d_kv_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.attn_v_dev, std.math.mul(usize, d_kv_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.attn_context_dev, std.math.mul(usize, d_attn_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.attn_out_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.ffn_gate_dev, std.math.mul(usize, d_ff_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.ffn_up_dev, std.math.mul(usize, d_ff_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.ffn_mul_dev, std.math.mul(usize, d_ff_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.ffn_down_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.deepstack_add_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.shortconv_proj_dev, std.math.mul(usize, shortconv_proj_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.shortconv_conv_dev, std.math.mul(usize, shortconv_conv_bytes, new_capacity) catch return error.InvalidArgument);
+        self.row_capacity = new_capacity;
+    }
 };
 
 const LayerAttentionRuntime = struct {
@@ -573,8 +617,15 @@ const LayerAttentionRuntime = struct {
     k_cache: compute.cuda.Buffer,
     v_cache: compute.cuda.Buffer,
     kv_capacity: usize,
+    cpu_kernel: ?cpu_kernels.MultiHeadAttention = null,
+    cpu_cache: ?cpu_kernels.AttnCache = null,
+    cpu_scratch: ?cpu_kernels.AttnTemp = null,
+    cpu_matmul_scratch: ?compute.cpu.linalg.MatmulScratch = null,
 
     fn deinit(self: *LayerAttentionRuntime, device: *compute.cuda.Device) void {
+        if (self.cpu_matmul_scratch) |*scratch| scratch.deinit();
+        if (self.cpu_scratch) |*scratch| scratch.deinit(self.cpu_kernel.?.allocator);
+        if (self.cpu_cache) |*cache| cache.deinit(self.cpu_kernel.?.allocator);
         self.v_cache.deinit(device);
         self.k_cache.deinit(device);
         if (self.post_ffn_norm_weight) |*w| w.deinit(device);
@@ -1608,6 +1659,69 @@ const BlockRuntime = struct {
                     const d_ff = w1_dev.cols();
                     var w2_dev = try uploadLinearWeightWithContext(device, allocator, w2, d_ff, layer_idx, "mlp.down_proj.weight");
                     errdefer w2_dev.deinit(device);
+                    var cpu_attention_kernel: ?cpu_kernels.MultiHeadAttention = null;
+                    var cpu_attention_cache: ?cpu_kernels.AttnCache = null;
+                    var cpu_attention_scratch: ?cpu_kernels.AttnTemp = null;
+                    var cpu_attention_matmul_scratch: ?compute.cpu.linalg.MatmulScratch = null;
+                    if (attn.attention_config.query_gate) {
+                        const q_proj_host = attn.q_proj orelse return error.MissingWeight;
+                        const k_proj_host = attn.k_proj orelse return error.MissingWeight;
+                        const v_proj_host = attn.v_proj orelse return error.MissingWeight;
+                        const dk_q = try compute.cpu.linalg.matmulKernel(q_proj_host.dtype);
+                        const dk_k = if (k_proj_host.dtype != q_proj_host.dtype) try compute.cpu.linalg.matmulKernel(k_proj_host.dtype) else null;
+                        const dk_v = if (v_proj_host.dtype != q_proj_host.dtype) try compute.cpu.linalg.matmulKernel(v_proj_host.dtype) else null;
+                        const dk_o = try compute.cpu.linalg.matmulKernel(attn.o_proj.dtype);
+                        cpu_attention_kernel = .{
+                            .d_model = d_model,
+                            .n_heads = n_heads,
+                            .n_kv_heads = n_kv_heads,
+                            .head_dim = head_dim,
+                            .max_seq_len = max_seq_len,
+                            .scale = if (loaded.config.attention_multiplier > 0.0)
+                                loaded.config.attention_multiplier
+                            else if (loaded.config.query_pre_attn_scalar > 0.0)
+                                1.0 / std.math.sqrt(loaded.config.query_pre_attn_scalar)
+                            else
+                                1.0 / std.math.sqrt(@as(f32, @floatFromInt(head_dim))),
+                            .qk_norm_weight_offset = loaded.runtime.qk_norm_weight_offset,
+                            .sliding_window = attn.sliding_window,
+                            .is_causal = attn.is_causal,
+                            .layer_idx = @intCast(layer_idx),
+                            .query_gate = attn.attention_config.query_gate,
+                            .q_proj = attn.q_proj,
+                            .k_proj = attn.k_proj,
+                            .v_proj = attn.v_proj,
+                            .o_proj = attn.o_proj,
+                            .fused_qkv = attn.fused.qkv_proj,
+                            .rope = null,
+                            .runtime_rope = null,
+                            .position_delta = 0,
+                            .rope_interleaved = attn.attention_config.rope_interleaved orelse false,
+                            .q_norm = attn.q_norm,
+                            .k_norm = attn.k_norm,
+                            .norm_eps = if (loaded.config.norm_eps > 0.0) loaded.config.norm_eps else prototype_eps,
+                            .allocator = allocator,
+                            .matmul_qkv = dk_q.func,
+                            .matmul_k = if (dk_k) |dk| dk.func else null,
+                            .matmul_v = if (dk_v) |dk| dk.func else null,
+                            .matmul_qkv_fused = null,
+                            .matmul_o = dk_o.func,
+                            .kernel_name_qkv = dk_q.name,
+                            .kernel_name_k = if (dk_k) |dk| dk.name else null,
+                            .kernel_name_v = if (dk_v) |dk| dk.name else null,
+                            .kernel_name_qkv_fused = null,
+                            .kernel_name_o = dk_o.name,
+                            .q_bias = attn.q_bias,
+                            .k_bias = attn.k_bias,
+                            .v_bias = attn.v_bias,
+                            .o_bias = attn.o_bias,
+                            .sinks = attn.sinks,
+                            .flash_attention_fn = null,
+                        };
+                        cpu_attention_cache = .{};
+                        cpu_attention_scratch = .{};
+                        cpu_attention_matmul_scratch = try compute.cpu.linalg.MatmulScratch.init(allocator);
+                    }
                     if (k_proj_dev.cols() != v_proj_dev.cols()) {
                         log.warn("inference", "CUDA block runtime k/v dim mismatch", .{
                             .layer = layer_idx,
@@ -1704,6 +1818,10 @@ const BlockRuntime = struct {
                         .k_cache = k_cache,
                         .v_cache = v_cache,
                         .kv_capacity = kv_capacity,
+                        .cpu_kernel = cpu_attention_kernel,
+                        .cpu_cache = cpu_attention_cache,
+                        .cpu_scratch = cpu_attention_scratch,
+                        .cpu_matmul_scratch = cpu_attention_matmul_scratch,
                     };
                     blocks[layer_idx].attention_binding = &blocks[layer_idx].attention_runtime.?;
                     CudaBackend.bindAttentionNormWeights(&blocks[layer_idx], &blocks[layer_idx].attention_runtime.?);
@@ -2357,6 +2475,8 @@ pub const CudaBackend = struct {
     rope_dim: usize,
     attention_scale: f32,
     norm_eps: f32,
+    cpu_rope_global: ?*cpu_kernels.RoPE = null,
+    cpu_rope_local: ?*cpu_kernels.RoPE = null,
     max_batch_size: usize = 1,
     slot_in_use: bool = false,
     slot_position: usize = 0,
@@ -2370,11 +2490,21 @@ pub const CudaBackend = struct {
     prefill_dispatch_window_start: [256]u64 = [_]u64{0} ** 256,
     layer_program_slot_buffers: []compute.cuda.Buffer = &.{},
     layer_program_slot_ptrs: []*compute.cuda.Buffer = &.{},
+    layer_program_slot_widths: []usize = &.{},
+    layer_program_row_capacity: usize = 1,
     argmax_index_dev: compute.cuda.Buffer,
     gated_delta_stage_input_host: []f32,
     gated_delta_stage_output_host: []f32,
     query_gate_projection_host: []f32,
     query_gate_values_host: []f32,
+    qk_norm_weight_host: []f32,
+    trace_checkpoint_host: []f32,
+    parity_prefill_seq_len: usize,
+    parity_prefill_token_index: usize,
+    parity_prefill_layer_attn_norm_host: []f32,
+    parity_prefill_layer_ffn_norm_host: []f32,
+    parity_prefill_block_out_host: []f32,
+    parity_checkpoint_warned: [256]bool,
 
     const max_state_bindings_per_slot: usize = runtime_contract.max_state_descriptors;
 
@@ -2414,6 +2544,8 @@ pub const CudaBackend = struct {
             .rope_dim = 0,
             .attention_scale = 0.0,
             .norm_eps = prototype_eps,
+            .cpu_rope_global = null,
+            .cpu_rope_local = null,
             .slot_logits = undefined,
             .state_descriptors_storage = undefined,
             .state_descriptor_count = 0,
@@ -2423,11 +2555,21 @@ pub const CudaBackend = struct {
             .prefill_dispatch_window_start = [_]u64{0} ** 256,
             .layer_program_slot_buffers = &.{},
             .layer_program_slot_ptrs = &.{},
+            .layer_program_slot_widths = &.{},
+            .layer_program_row_capacity = 1,
             .argmax_index_dev = undefined,
             .gated_delta_stage_input_host = &.{},
             .gated_delta_stage_output_host = &.{},
             .query_gate_projection_host = &.{},
             .query_gate_values_host = &.{},
+            .qk_norm_weight_host = &.{},
+            .trace_checkpoint_host = &.{},
+            .parity_prefill_seq_len = 0,
+            .parity_prefill_token_index = 0,
+            .parity_prefill_layer_attn_norm_host = &.{},
+            .parity_prefill_layer_ffn_norm_host = &.{},
+            .parity_prefill_block_out_host = &.{},
+            .parity_checkpoint_warned = [_]bool{false} ** 256,
         };
         if (backend.n_heads == 0 or backend.n_kv_heads == 0 or backend.head_dim == 0 or backend.max_seq_len == 0) {
             return error.InvalidArgument;
@@ -2446,6 +2588,7 @@ pub const CudaBackend = struct {
             1.0 / std.math.sqrt(loaded.config.query_pre_attn_scalar)
         else
             1.0 / std.math.sqrt(@as(f32, @floatFromInt(backend.head_dim)));
+        try backend.initCpuRuntimeRopeHandles();
         backend.norm_eps = if (loaded.config.norm_eps > 0.0) loaded.config.norm_eps else prototype_eps;
         if (backend.device.supportsStreams()) {
             const stream = try backend.device.createStream();
@@ -2468,6 +2611,7 @@ pub const CudaBackend = struct {
         errdefer backend.argmax_index_dev.deinit(&backend.device);
         backend.block_runtime = try BlockRuntime.init(allocator, &backend.device, loaded);
         errdefer backend.block_runtime.deinit(allocator, &backend.device);
+        backend.assignCpuRuntimeRopeToAttentionFallbacks();
         for (backend.block_runtime.blocks) |*layer| {
             if (layer.compiled_plan) |*compiled_plan| {
                 try runtime_contract.appendUniquePlanStateDescriptors(
@@ -2637,8 +2781,21 @@ pub const CudaBackend = struct {
         if (self.slot_state_bindings.len > 0) self.allocator.free(self.slot_state_bindings);
         if (self.query_gate_projection_host.len > 0) self.allocator.free(self.query_gate_projection_host);
         if (self.query_gate_values_host.len > 0) self.allocator.free(self.query_gate_values_host);
+        if (self.qk_norm_weight_host.len > 0) self.allocator.free(self.qk_norm_weight_host);
+        if (self.trace_checkpoint_host.len > 0) self.allocator.free(self.trace_checkpoint_host);
+        if (self.parity_prefill_layer_attn_norm_host.len > 0) self.allocator.free(self.parity_prefill_layer_attn_norm_host);
+        if (self.parity_prefill_layer_ffn_norm_host.len > 0) self.allocator.free(self.parity_prefill_layer_ffn_norm_host);
+        if (self.parity_prefill_block_out_host.len > 0) self.allocator.free(self.parity_prefill_block_out_host);
         if (self.gated_delta_stage_input_host.len > 0) self.allocator.free(self.gated_delta_stage_input_host);
         if (self.gated_delta_stage_output_host.len > 0) self.allocator.free(self.gated_delta_stage_output_host);
+        if (self.cpu_rope_local) |rope| {
+            rope.deinit(self.allocator);
+            self.allocator.destroy(rope);
+        }
+        if (self.cpu_rope_global) |rope| {
+            rope.deinit(self.allocator);
+            self.allocator.destroy(rope);
+        }
         self.allocator.free(self.slot_logits);
         self.deinitLayerProgramSlotBuffers();
         self.block_runtime.deinit(self.allocator, &self.device);
@@ -2671,18 +2828,20 @@ pub const CudaBackend = struct {
         if (required == 0) {
             self.layer_program_slot_buffers = &.{};
             self.layer_program_slot_ptrs = &.{};
+            self.layer_program_slot_widths = &.{};
+            self.layer_program_row_capacity = 1;
             return;
         }
 
-        const slot_width_max = try self.allocator.alloc(usize, required);
-        defer self.allocator.free(slot_width_max);
-        @memset(slot_width_max, 0);
+        self.layer_program_slot_widths = try self.allocator.alloc(usize, required);
+        errdefer self.allocator.free(self.layer_program_slot_widths);
+        @memset(self.layer_program_slot_widths, 0);
         for (self.block_runtime.blocks) |layer| {
             for (layer.slot_width_hints, 0..) |width, slot_idx| {
-                if (slot_idx >= slot_width_max.len) continue;
-                if (slot_width_max[slot_idx] == 0) {
-                    slot_width_max[slot_idx] = width;
-                } else if (width != 0 and slot_width_max[slot_idx] != width) {
+                if (slot_idx >= self.layer_program_slot_widths.len) continue;
+                if (self.layer_program_slot_widths[slot_idx] == 0) {
+                    self.layer_program_slot_widths[slot_idx] = width;
+                } else if (width != 0 and self.layer_program_slot_widths[slot_idx] != width) {
                     return error.InvalidRegisterSpecSize;
                 }
             }
@@ -2698,7 +2857,7 @@ pub const CudaBackend = struct {
         }
 
         for (0..required) |idx| {
-            const width = slot_width_max[idx];
+            const width = self.layer_program_slot_widths[idx];
             if (width == 0) return error.InvalidRegisterSpecSize;
             const bytes = std.math.mul(usize, width, @sizeOf(f32)) catch return error.InvalidArgument;
             self.layer_program_slot_buffers[idx] = try self.device.allocBuffer(bytes);
@@ -2710,6 +2869,31 @@ pub const CudaBackend = struct {
         for (self.layer_program_slot_buffers, 0..) |*buf, idx| {
             self.layer_program_slot_ptrs[idx] = buf;
         }
+        self.layer_program_row_capacity = 1;
+    }
+
+    fn ensureLayerProgramSlotRowCapacity(self: *CudaBackend, required_rows: usize) !void {
+        if (required_rows == 0) return error.InvalidArgument;
+        if (required_rows <= self.layer_program_row_capacity) return;
+        if (required_rows > self.max_seq_len) return error.InvalidArgument;
+        if (self.layer_program_slot_buffers.len == 0) return;
+
+        var new_capacity = self.layer_program_row_capacity;
+        if (new_capacity == 0) new_capacity = 1;
+        while (new_capacity < required_rows) {
+            const doubled = std.math.mul(usize, new_capacity, 2) catch self.max_seq_len;
+            const next = if (doubled > new_capacity) doubled else self.max_seq_len;
+            new_capacity = @min(self.max_seq_len, next);
+            if (new_capacity == self.max_seq_len) break;
+        }
+        if (new_capacity < required_rows) return error.InvalidArgument;
+
+        for (self.layer_program_slot_buffers, 0..) |*buf, idx| {
+            const width = self.layer_program_slot_widths[idx];
+            const row_bytes = std.math.mul(usize, width, @sizeOf(f32)) catch return error.InvalidArgument;
+            try resizeScratchBuffer(&self.device, buf, std.math.mul(usize, row_bytes, new_capacity) catch return error.InvalidArgument);
+        }
+        self.layer_program_row_capacity = new_capacity;
     }
 
     fn deinitLayerProgramSlotBuffers(self: *CudaBackend) void {
@@ -2723,6 +2907,11 @@ pub const CudaBackend = struct {
         }
         self.allocator.free(self.layer_program_slot_buffers);
         self.layer_program_slot_buffers = &.{};
+        if (self.layer_program_slot_widths.len > 0) {
+            self.allocator.free(self.layer_program_slot_widths);
+            self.layer_program_slot_widths = &.{};
+        }
+        self.layer_program_row_capacity = 1;
     }
 
     pub fn vocabSize(self: *const CudaBackend) usize {
@@ -2791,6 +2980,7 @@ pub const CudaBackend = struct {
                 .reason = @errorName(err),
             });
         };
+        self.resetAttentionCpuStates();
         self.resetGatedDeltaStates();
     }
 
@@ -3048,6 +3238,8 @@ pub const CudaBackend = struct {
                 download_logits,
                 download_logits,
                 false,
+                @intCast(i + 1),
+                i,
                 hidden_override,
                 deepstack_layer_features_opt,
                 deepstack_feature_index,
@@ -3130,6 +3322,8 @@ pub const CudaBackend = struct {
             true,
             true,
             true,
+            1,
+            position,
             null,
             null,
             null,
@@ -3146,6 +3340,8 @@ pub const CudaBackend = struct {
         compute_logits: bool,
         download_logits: bool,
         ensure_kv_capacity: bool,
+        trace_seq_len_u32: u32,
+        trace_pos_offset: usize,
         hidden_override: ?[]const f32,
         deepstack_layer_features_opt: ?[]const []const f32,
         deepstack_feature_index_opt: ?usize,
@@ -3161,13 +3357,13 @@ pub const CudaBackend = struct {
         if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
         if (position == 0) {
             try self.resetShortConvStates();
+            self.resetAttentionCpuStates();
             self.resetGatedDeltaStates();
         }
         if (ensure_kv_capacity) {
             try self.ensureKvCapacity(position + 1);
         }
 
-        const rmsnorm_function = self.rmsnorm_function orelse return error.CudaKernelUnavailable;
         const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
         if (self.loaded.config.residual_multiplier != 1.0 and self.vector_add_scaled_function == null) {
             return error.CudaKernelUnavailable;
@@ -3226,6 +3422,9 @@ pub const CudaBackend = struct {
         const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
         const seq_len_u32: u32 = @intCast(position + 1);
         const position_u32: u32 = @intCast(position);
+        const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+        var input_row = try bufferSlice(&self.runtime_buffers.input_dev, 0, row_bytes);
+        var norm_out_row = try bufferSlice(&self.runtime_buffers.norm_out_dev, 0, row_bytes);
         const global_rope_theta: f32 = if (self.loaded.config.rope_theta > 1.0) self.loaded.config.rope_theta else 10000.0;
         const local_rope_theta: f32 = if (self.loaded.config.rope_local_theta > 1.0 and self.loaded.config.sliding_window > 0)
             self.loaded.config.rope_local_theta
@@ -3235,7 +3434,7 @@ pub const CudaBackend = struct {
         if (hidden_override) |hidden| {
             if (hidden.len != self.d_model) return error.InvalidArgument;
             @memcpy(self.runtime_buffers.hidden_host, hidden);
-            try self.runtime_buffers.input_dev.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
+            try input_row.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
         } else {
             var used_device_lookup = false;
             if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
@@ -3247,7 +3446,7 @@ pub const CudaBackend = struct {
                                 &self.kernel_arg_pack,
                                 &self.device,
                                 kernel,
-                                &self.runtime_buffers.input_dev,
+                                &input_row,
                                 &lookup.buffer,
                                 lookup.dim0,
                                 lookup.dim1,
@@ -3265,7 +3464,7 @@ pub const CudaBackend = struct {
                                 &self.kernel_arg_pack,
                                 &self.device,
                                 kernel,
-                                &self.runtime_buffers.input_dev,
+                                &input_row,
                                 &lookup.buffer,
                                 lookup.dim0,
                                 lookup.dim1,
@@ -3284,7 +3483,7 @@ pub const CudaBackend = struct {
                                 &self.kernel_arg_pack,
                                 &self.device,
                                 kernel,
-                                &self.runtime_buffers.input_dev,
+                                &input_row,
                                 &lookup.buffer,
                                 lookup.dim0,
                                 lookup.dim1,
@@ -3305,7 +3504,7 @@ pub const CudaBackend = struct {
                                         &self.kernel_arg_pack,
                                         &self.device,
                                         kernel,
-                                        &self.runtime_buffers.input_dev,
+                                        &input_row,
                                         &lookup.buffer,
                                         scales_buf,
                                         biases_buf,
@@ -3343,10 +3542,11 @@ pub const CudaBackend = struct {
                         v.* *= self.loaded.config.embedding_multiplier;
                     }
                 }
-                try self.runtime_buffers.input_dev.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
+                try input_row.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
             }
         }
 
+        var final_hidden = input_row;
         var layer_idx: usize = 0;
         while (layer_idx < layer_limit) : (layer_idx += 1) {
             const layer = &self.block_runtime.blocks[layer_idx];
@@ -3358,7 +3558,7 @@ pub const CudaBackend = struct {
                 .attn_weighted_sum_heads_f16_kv_function = attn_weighted_sum_heads_f16_kv_function,
                 .attn_fused_heads_f16_kv_function = attn_fused_heads_f16_kv_function,
             };
-            try self.tryExecuteLayerProgram(
+            final_hidden = try self.tryExecuteLayerProgram(
                 layer,
                 slot_index,
                 layer_idx,
@@ -3367,7 +3567,10 @@ pub const CudaBackend = struct {
                 rope_dim_u32,
                 n_heads_u32,
                 n_kv_heads_u32,
+                1,
                 seq_len_u32,
+                trace_seq_len_u32,
+                trace_pos_offset,
                 position,
                 position_u32,
                 global_rope_theta,
@@ -3422,6 +3625,7 @@ pub const CudaBackend = struct {
                             &self.runtime_buffers.input_dev,
                             d_model_u32,
                         );
+                        final_hidden = self.runtime_buffers.input_dev;
                     }
                 }
             }
@@ -3429,24 +3633,22 @@ pub const CudaBackend = struct {
 
         if (!compute_logits) return;
 
-        try compute.cuda.rmsnorm.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            rmsnorm_function,
-            &self.runtime_buffers.input_dev,
+        try self.runRmsnormExactMaybeCpu(
+            "decode_final_norm",
+            &final_hidden,
             &self.runtime_buffers.norm_weight_dev,
-            &self.runtime_buffers.norm_out_dev,
+            &norm_out_row,
             1,
-            d_model_u32,
+            self.d_model,
             self.norm_eps,
             self.loaded.runtime.weight_offset,
         );
         if (trace.isEnabled()) {
-            try self.runtime_buffers.norm_out_dev.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
+            try norm_out_row.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
             trace.emitFinal(
                 .final_norm,
                 @intCast(position),
-                @intCast(position + 1),
+                1,
                 @ptrCast(self.runtime_buffers.hidden_host.ptr),
                 .f32,
                 .{ @intCast(self.d_model), 0, 0, 0 },
@@ -3455,7 +3657,7 @@ pub const CudaBackend = struct {
             );
         }
 
-        try self.linearForward(&self.runtime_buffers.norm_out_dev, &self.runtime_buffers.projection_weight, &self.runtime_buffers.logits_dev);
+        try self.linearForwardRows(&norm_out_row, 1, &self.runtime_buffers.projection_weight, &self.runtime_buffers.logits_dev);
         if (!download_logits) return;
 
         const logits_out = logits_out_opt.?;
@@ -3505,6 +3707,191 @@ pub const CudaBackend = struct {
                 trace.emitFinal(
                     .logits_scaled,
                     @intCast(position),
+                    0,
+                    @ptrCast(logits_out.ptr),
+                    .f32,
+                    .{ @intCast(self.vocab_size), 0, 0, 0 },
+                    1,
+                    null,
+                );
+            }
+        }
+    }
+
+    pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
+        self: *CudaBackend,
+        tokens: []const u32,
+        slot_index: usize,
+        logits_out: []f32,
+        layer_limit: usize,
+    ) !void {
+        if (tokens.len == 0) return error.InvalidArgument;
+        if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
+        if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+        if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
+
+        const rows = tokens.len;
+        const hidden_count = std.math.mul(usize, rows, self.d_model) catch return error.InvalidArgument;
+        const hidden_host = try self.allocator.alloc(f32, hidden_count);
+        defer self.allocator.free(hidden_host);
+
+        try populatePrefillHiddenFromTokens(self.loaded, tokens, self.d_model, hidden_host, null);
+        try self.runtime_buffers.ensureRowCapacity(&self.device, rows);
+        try self.ensureLayerProgramSlotRowCapacity(rows);
+        try self.ensureKvCapacity(rows);
+        try self.resetShortConvStates();
+        self.resetAttentionCpuStates();
+        self.resetGatedDeltaStates();
+        try self.runtime_buffers.input_dev.upload(&self.device, std.mem.sliceAsBytes(hidden_host));
+
+        const d_model_u32: u32 = @intCast(self.d_model);
+        const head_dim_u32: u32 = @intCast(self.head_dim);
+        const rope_dim_u32: u32 = @intCast(self.rope_dim);
+        const n_heads_u32: u32 = @intCast(self.n_heads);
+        const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
+        const active_rows_u32: u32 = @intCast(rows);
+        const seq_len_u32: u32 = @intCast(rows);
+        const last_position = rows - 1;
+        const last_position_u32: u32 = @intCast(last_position);
+        const global_rope_theta: f32 = if (self.loaded.config.rope_theta > 1.0) self.loaded.config.rope_theta else 10000.0;
+        const local_rope_theta: f32 = if (self.loaded.config.rope_local_theta > 1.0 and self.loaded.config.sliding_window > 0)
+            self.loaded.config.rope_local_theta
+        else
+            global_rope_theta;
+        const attention_kernels = AttentionKernelSet{
+            .attn_scores_heads_f32_function = if (kv_cache_dtype_fp16)
+                null
+            else
+                (self.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable),
+            .attn_weighted_sum_heads_f32_function = if (kv_cache_dtype_fp16)
+                null
+            else
+                (self.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable),
+            .attn_scores_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+                (self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
+            else
+                null,
+            .softmax_rows_function = self.softmax_rows_function,
+            .attn_weighted_sum_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+                (self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
+            else
+                null,
+            .attn_fused_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+                self.attn_fused_heads_f16_kv_function
+            else
+                null,
+        };
+
+        var final_hidden_rows = self.runtime_buffers.input_dev;
+        var layer_idx: usize = 0;
+        while (layer_idx < layer_limit) : (layer_idx += 1) {
+            const layer = &self.block_runtime.blocks[layer_idx];
+            final_hidden_rows = try self.tryExecuteLayerProgram(
+                layer,
+                slot_index,
+                layer_idx,
+                d_model_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                n_heads_u32,
+                n_kv_heads_u32,
+                active_rows_u32,
+                seq_len_u32,
+                seq_len_u32,
+                0,
+                last_position,
+                last_position_u32,
+                global_rope_theta,
+                local_rope_theta,
+                self.rope_function orelse return error.CudaKernelUnavailable,
+                self.copy_function orelse return error.CudaKernelUnavailable,
+                if (kv_cache_dtype_fp16)
+                    (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
+                else
+                    null,
+                if (kv_cache_dtype_fp16) self.kv_write_f16_function else null,
+                if (kv_cache_dtype_fp16) self.rope_store_f16_function else null,
+                self.shortconv_step_function orelse return error.CudaKernelUnavailable,
+                attention_kernels,
+            );
+        }
+
+        const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+        const last_offset = std.math.mul(usize, last_position, row_bytes) catch return error.InvalidArgument;
+        var last_hidden = try bufferSlice(&final_hidden_rows, last_offset, row_bytes);
+        var last_norm = try bufferSlice(&self.runtime_buffers.norm_out_dev, 0, row_bytes);
+        try self.runRmsnormExactMaybeCpu(
+            "prefill_final_norm",
+            &last_hidden,
+            &self.runtime_buffers.norm_weight_dev,
+            &last_norm,
+            1,
+            self.d_model,
+            self.norm_eps,
+            self.loaded.runtime.weight_offset,
+        );
+        if (trace.isEnabled()) {
+            try last_norm.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
+            trace.emitFinal(
+                .final_norm,
+                @intCast(last_position),
+                1,
+                @ptrCast(self.runtime_buffers.hidden_host.ptr),
+                .f32,
+                .{ @intCast(self.d_model), 0, 0, 0 },
+                1,
+                "cuda_final_norm_host",
+            );
+        }
+
+        try self.linearForwardRows(&last_norm, 1, &self.runtime_buffers.projection_weight, &self.runtime_buffers.logits_dev);
+        try self.runtime_buffers.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host));
+        if (trace.isEnabled()) {
+            const rows128: u128 = 1;
+            const d_model128: u128 = @intCast(self.d_model);
+            const vocab128: u128 = @intCast(self.runtime_buffers.projected_vocab);
+            const total_flops = saturatingU64FromU128(2 * rows128 * d_model128 * vocab128);
+            const total_bytes = saturatingU64FromU128(
+                rows128 * d_model128 * @sizeOf(f32) +
+                    @as(u128, self.runtime_buffers.projection_weight.byteSize()) +
+                    rows128 * vocab128 * @sizeOf(f32),
+            );
+            const kernel_name = switch (self.runtime_buffers.projection_weight) {
+                .dense_f32 => "matmul_lm_head_f32",
+                .dense_u16 => |w| switch (w.dtype) {
+                    .bf16 => "matmul_lm_head_bf16",
+                    .f16 => "matmul_lm_head_f16",
+                },
+                .gaffine_u4 => "matmul_lm_head_gaffine_u4",
+            };
+            trace.emitFinalWithWork(
+                .lm_head,
+                @intCast(last_position),
+                0,
+                @ptrCast(self.runtime_buffers.projected_logits_host.ptr),
+                .f32,
+                .{ @intCast(self.runtime_buffers.projected_vocab), 0, 0, 0 },
+                1,
+                kernel_name,
+                .{ .flops = total_flops, .bytes = total_bytes },
+            );
+        }
+
+        if (self.runtime_buffers.projected_vocab == logits_out.len) {
+            @memcpy(logits_out, self.runtime_buffers.projected_logits_host);
+        } else {
+            @memset(logits_out, -1.0e9);
+            @memcpy(logits_out[0..self.runtime_buffers.projected_vocab], self.runtime_buffers.projected_logits_host);
+        }
+        if (self.loaded.config.logits_scaling != 1.0) {
+            for (logits_out) |*v| {
+                v.* /= self.loaded.config.logits_scaling;
+            }
+            if (trace.isEnabled()) {
+                trace.emitFinal(
+                    .logits_scaled,
+                    @intCast(last_position),
                     0,
                     @ptrCast(logits_out.ptr),
                     .f32,
@@ -3616,6 +4003,13 @@ pub const CudaBackend = struct {
         }
     }
 
+    fn resetAttentionCpuStates(self: *CudaBackend) void {
+        for (self.block_runtime.blocks) |*layer| {
+            const block = layer.attention_binding orelse continue;
+            if (block.cpu_cache) |*cache| cache.resetCache();
+        }
+    }
+
     fn ensureGatedDeltaHostStageCapacity(self: *CudaBackend, elements: usize) !void {
         if (elements == 0) return error.InvalidArgument;
         if (self.gated_delta_stage_input_host.len < elements) {
@@ -3638,6 +4032,62 @@ pub const CudaBackend = struct {
             if (self.query_gate_values_host.len > 0) self.allocator.free(self.query_gate_values_host);
             self.query_gate_values_host = try self.allocator.alloc(f32, value_elements);
         }
+    }
+
+    fn ensureQkNormWeightHostCapacity(self: *CudaBackend, weight_elements: usize) !void {
+        if (weight_elements == 0) return error.InvalidArgument;
+        if (self.qk_norm_weight_host.len < weight_elements) {
+            if (self.qk_norm_weight_host.len > 0) self.allocator.free(self.qk_norm_weight_host);
+            self.qk_norm_weight_host = try self.allocator.alloc(f32, weight_elements);
+        }
+    }
+
+    fn runRmsnormExactMaybeCpu(
+        self: *CudaBackend,
+        _: []const u8,
+        input: *const compute.cuda.Buffer,
+        weight: *const compute.cuda.Buffer,
+        output: *compute.cuda.Buffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        weight_offset: f32,
+    ) !void {
+        if (!trace.isEnabled()) {
+            return compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                input,
+                weight,
+                output,
+                @intCast(rows),
+                @intCast(cols),
+                eps,
+                weight_offset,
+            );
+        }
+        if (rows == 0 or cols == 0) return error.InvalidArgument;
+        const element_count = std.math.mul(usize, rows, cols) catch return error.InvalidArgument;
+        try self.ensureGatedDeltaHostStageCapacity(element_count);
+        try self.ensureQkNormWeightHostCapacity(cols);
+        const input_host = self.gated_delta_stage_input_host[0..element_count];
+        const output_host = self.gated_delta_stage_output_host[0..element_count];
+        const weight_host = self.qk_norm_weight_host[0..cols];
+        try input.download(&self.device, std.mem.sliceAsBytes(input_host));
+        try weight.download(&self.device, std.mem.sliceAsBytes(weight_host));
+        compute.cpu.math.rmsnormContiguous(
+            output_host,
+            input_host,
+            weight_host,
+            null,
+            .f32,
+            rows,
+            cols,
+            eps,
+            weight_offset,
+        );
+        try output.upload(&self.device, std.mem.sliceAsBytes(output_host));
     }
 
     fn compactQueryGateProjectionInPlace(
@@ -3682,6 +4132,69 @@ pub const CudaBackend = struct {
             self.head_dim,
         );
         try self.runtime_buffers.attn_context_dev.upload(&self.device, std.mem.sliceAsBytes(self.query_gate_values_host[0..query_elements]));
+    }
+
+    fn applyQueryGateQkNormCpuInPlace(
+        self: *CudaBackend,
+        q_norm_weight: ?*const DeviceTensor,
+        k_norm_weight: ?*const DeviceTensor,
+        stage_rows: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) !void {
+        if (stage_rows == 0) return error.InvalidArgument;
+        const query_elements = std.math.mul(usize, stage_rows, q_dim) catch return error.InvalidArgument;
+        const key_elements = std.math.mul(usize, stage_rows, kv_dim) catch return error.InvalidArgument;
+        try self.ensureQueryGateHostStageCapacity(query_elements, query_elements);
+        if (self.gated_delta_stage_input_host.len < key_elements) {
+            if (self.gated_delta_stage_input_host.len > 0) self.allocator.free(self.gated_delta_stage_input_host);
+            self.gated_delta_stage_input_host = try self.allocator.alloc(f32, key_elements);
+        }
+
+        const query_host = self.query_gate_values_host[0..query_elements];
+        const key_host = self.gated_delta_stage_input_host[0..key_elements];
+        try self.runtime_buffers.attn_q_dev.download(&self.device, std.mem.sliceAsBytes(query_host));
+        try self.runtime_buffers.attn_k_dev.download(&self.device, std.mem.sliceAsBytes(key_host));
+
+        if (q_norm_weight) |weight| {
+            const head_dim = self.head_dim;
+            try self.ensureQkNormWeightHostCapacity(head_dim);
+            const weight_host = self.qk_norm_weight_host[0..head_dim];
+            try weight.buffer.download(&self.device, std.mem.sliceAsBytes(weight_host));
+            if (self.loaded.runtime.qk_norm_weight_offset != 0.0) {
+                for (weight_host) |*v| v.* += self.loaded.runtime.qk_norm_weight_offset;
+            }
+            var row_idx: usize = 0;
+            while (row_idx < stage_rows) : (row_idx += 1) {
+                const row_base = row_idx * q_dim;
+                var head_idx: usize = 0;
+                while (head_idx < self.n_heads) : (head_idx += 1) {
+                    const base = row_base + head_idx * head_dim;
+                    compute.cpu.normalization.rmsnormInPlace(query_host[base .. base + head_dim], weight_host, self.norm_eps);
+                }
+            }
+        }
+        if (k_norm_weight) |weight| {
+            const head_dim = self.head_dim;
+            try self.ensureQkNormWeightHostCapacity(head_dim);
+            const weight_host = self.qk_norm_weight_host[0..head_dim];
+            try weight.buffer.download(&self.device, std.mem.sliceAsBytes(weight_host));
+            if (self.loaded.runtime.qk_norm_weight_offset != 0.0) {
+                for (weight_host) |*v| v.* += self.loaded.runtime.qk_norm_weight_offset;
+            }
+            var row_idx: usize = 0;
+            while (row_idx < stage_rows) : (row_idx += 1) {
+                const row_base = row_idx * kv_dim;
+                var head_idx: usize = 0;
+                while (head_idx < self.n_kv_heads) : (head_idx += 1) {
+                    const base = row_base + head_idx * head_dim;
+                    compute.cpu.normalization.rmsnormInPlace(key_host[base .. base + head_dim], weight_host, self.norm_eps);
+                }
+            }
+        }
+
+        try self.runtime_buffers.attn_q_dev.upload(&self.device, std.mem.sliceAsBytes(query_host));
+        try self.runtime_buffers.attn_k_dev.upload(&self.device, std.mem.sliceAsBytes(key_host));
     }
 
     fn linearForward(
@@ -3844,6 +4357,7 @@ pub const CudaBackend = struct {
 
     fn addResidualWithModelScale(
         self: *CudaBackend,
+        out: *compute.cuda.Buffer,
         residual: *compute.cuda.Buffer,
         branch: *compute.cuda.Buffer,
         count: u32,
@@ -3854,9 +4368,9 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 vector_add_function,
+                out,
                 residual,
                 branch,
-                residual,
                 count,
             );
             return;
@@ -3867,9 +4381,9 @@ pub const CudaBackend = struct {
             &self.kernel_arg_pack,
             &self.device,
             vector_add_scaled_function,
+            out,
             residual,
             branch,
-            residual,
             self.loaded.config.residual_multiplier,
             count,
         );
@@ -3877,22 +4391,23 @@ pub const CudaBackend = struct {
 
     fn addResidualWithScale(
         self: *CudaBackend,
+        out: *compute.cuda.Buffer,
         residual: *compute.cuda.Buffer,
         branch: *compute.cuda.Buffer,
         count: u32,
         scale: layer_ops.ResidualScale,
     ) !void {
         switch (scale) {
-            .residual_multiplier => return self.addResidualWithModelScale(residual, branch, count),
+            .residual_multiplier => return self.addResidualWithModelScale(out, residual, branch, count),
             .one => {
                 const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
                 return compute.cuda.vector_add.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
                     vector_add_function,
+                    out,
                     residual,
                     branch,
-                    residual,
                     count,
                 );
             },
@@ -3903,9 +4418,9 @@ pub const CudaBackend = struct {
                         &self.kernel_arg_pack,
                         &self.device,
                         vector_add_function,
+                        out,
                         residual,
                         branch,
-                        residual,
                         count,
                     );
                 }
@@ -3914,9 +4429,9 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     vector_add_scaled_function,
+                    out,
                     residual,
                     branch,
-                    residual,
                     literal,
                     count,
                 );
@@ -3925,11 +4440,12 @@ pub const CudaBackend = struct {
     }
 
     fn programBuffer(self: *CudaBackend, reg_idx: usize, ctx: *const LayerProgramExecutionContext) ?*compute.cuda.Buffer {
-        if (reg_idx == 0) return &self.runtime_buffers.input_dev;
+        _ = self;
+        if (reg_idx == 0) return @constCast(&ctx.input_view);
         if (reg_idx >= ctx.register_to_slot_map.len) return null;
         const slot_idx = ctx.register_to_slot_map[reg_idx];
         if (slot_idx == BlockRuntimeLayer.invalid_slot or slot_idx >= ctx.slot_buffers.len) return null;
-        return ctx.slot_buffers[slot_idx];
+        return @constCast(&ctx.slot_buffers[slot_idx]);
     }
 
     fn appendLayerNormWeight(layer: *BlockRuntimeLayer, weight: ?*const DeviceTensor) void {
@@ -4035,51 +4551,72 @@ pub const CudaBackend = struct {
             };
         }
 
-        if (q_norm_weight) |q_norm_value| {
-            compute.cuda.rmsnorm.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                &self.runtime_buffers.attn_q_dev,
-                &q_norm_value.buffer,
-                &self.runtime_buffers.attn_q_dev,
-                n_heads_u32,
-                head_dim_u32,
-                self.norm_eps,
-                self.loaded.runtime.qk_norm_weight_offset,
+        if (cfg.query_gate and (q_norm_weight != null or k_norm_weight != null)) {
+            self.applyQueryGateQkNormCpuInPlace(
+                q_norm_weight,
+                k_norm_weight,
+                stage_rows,
+                cfg.q_dim,
+                cfg.kv_dim,
             ) catch |err| {
-                log.warn("inference", "CUDA attention q_norm failed", .{
+                log.warn("inference", "CUDA attention query-gate qk_norm CPU stage failed", .{
                     .seq_len = seq_len_u32,
                     .stage_rows = stage_rows,
-                    .n_heads = n_heads_u32,
-                    .head_dim = head_dim_u32,
+                    .q_dim = cfg.q_dim,
+                    .kv_dim = cfg.kv_dim,
                     .reason = @errorName(err),
                 });
                 return err;
             };
-        }
-        if (k_norm_weight) |k_norm_value| {
-            compute.cuda.rmsnorm.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                &self.runtime_buffers.attn_k_dev,
-                &k_norm_value.buffer,
-                &self.runtime_buffers.attn_k_dev,
-                n_kv_heads_u32,
-                head_dim_u32,
-                self.norm_eps,
-                self.loaded.runtime.qk_norm_weight_offset,
-            ) catch |err| {
-                log.warn("inference", "CUDA attention k_norm failed", .{
-                    .seq_len = seq_len_u32,
-                    .stage_rows = stage_rows,
-                    .n_kv_heads = n_kv_heads_u32,
-                    .head_dim = head_dim_u32,
-                    .reason = @errorName(err),
-                });
-                return err;
-            };
+        } else {
+            if (q_norm_weight) |q_norm_value| {
+                const q_norm_rows = std.math.mul(u32, @intCast(stage_rows), n_heads_u32) catch return error.InvalidArgument;
+                compute.cuda.rmsnorm.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                    &self.runtime_buffers.attn_q_dev,
+                    &q_norm_value.buffer,
+                    &self.runtime_buffers.attn_q_dev,
+                    q_norm_rows,
+                    head_dim_u32,
+                    self.norm_eps,
+                    self.loaded.runtime.qk_norm_weight_offset,
+                ) catch |err| {
+                    log.warn("inference", "CUDA attention q_norm failed", .{
+                        .seq_len = seq_len_u32,
+                        .stage_rows = stage_rows,
+                        .n_heads = n_heads_u32,
+                        .head_dim = head_dim_u32,
+                        .reason = @errorName(err),
+                    });
+                    return err;
+                };
+            }
+            if (k_norm_weight) |k_norm_value| {
+                const k_norm_rows = std.math.mul(u32, @intCast(stage_rows), n_kv_heads_u32) catch return error.InvalidArgument;
+                compute.cuda.rmsnorm.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                    &self.runtime_buffers.attn_k_dev,
+                    &k_norm_value.buffer,
+                    &self.runtime_buffers.attn_k_dev,
+                    k_norm_rows,
+                    head_dim_u32,
+                    self.norm_eps,
+                    self.loaded.runtime.qk_norm_weight_offset,
+                ) catch |err| {
+                    log.warn("inference", "CUDA attention k_norm failed", .{
+                        .seq_len = seq_len_u32,
+                        .stage_rows = stage_rows,
+                        .n_kv_heads = n_kv_heads_u32,
+                        .head_dim = head_dim_u32,
+                        .reason = @errorName(err),
+                    });
+                    return err;
+                };
+            }
         }
 
         const use_fused_attention_heads_f16_kv = (!cfg.query_gate) and attention_mod.useFusedHeadsF16Kv(
@@ -4441,7 +4978,6 @@ pub const CudaBackend = struct {
             });
             return err;
         };
-
         output.upload(&self.device, std.mem.sliceAsBytes(output_host)) catch |err| {
             log.warn("inference", "CUDA gated-delta output upload failed", .{
                 .seq_len = seq_len,
@@ -4452,6 +4988,36 @@ pub const CudaBackend = struct {
             });
             return err;
         };
+    }
+
+    fn runAttentionMixerStepCpu(
+        self: *CudaBackend,
+        block: *LayerAttentionRuntime,
+        input: *const compute.cuda.Buffer,
+        output: *compute.cuda.Buffer,
+        seq_len: usize,
+    ) !void {
+        const kernel = &(block.cpu_kernel orelse return error.InvalidInstructionBinding);
+        const cache = &(block.cpu_cache orelse return error.InvalidInstructionBinding);
+        const scratch = &(block.cpu_scratch orelse return error.InvalidInstructionBinding);
+        const matmul_scratch = &(block.cpu_matmul_scratch orelse return error.InvalidInstructionBinding);
+        const element_count = std.math.mul(usize, seq_len, self.d_model) catch return error.InvalidArgument;
+        try self.ensureGatedDeltaHostStageCapacity(element_count);
+        const input_host = self.gated_delta_stage_input_host[0..element_count];
+        const output_host = self.gated_delta_stage_output_host[0..element_count];
+        try input.download(&self.device, std.mem.sliceAsBytes(input_host));
+        kernel.position_delta = self.slot_rope_position_delta;
+        var input_view = Tensor.view3DSlice(input_host, seq_len, self.d_model);
+        var output_view = Tensor.view3DSlice(output_host, seq_len, self.d_model);
+        try kernel.forward(
+            &input_view,
+            &output_view,
+            cache,
+            scratch,
+            matmul_scratch,
+            true,
+        );
+        try output.upload(&self.device, std.mem.sliceAsBytes(output_host));
     }
 
     fn applyBiasF32(
@@ -4515,7 +5081,10 @@ pub const CudaBackend = struct {
         rope_dim_u32: u32,
         n_heads_u32: u32,
         n_kv_heads_u32: u32,
+        active_rows_u32: u32,
         seq_len_u32: u32,
+        trace_seq_len_u32: u32,
+        trace_pos_offset: usize,
         position: usize,
         position_u32: u32,
         global_rope_theta: f32,
@@ -4528,7 +5097,8 @@ pub const CudaBackend = struct {
         shortconv_step_function: compute.cuda.Function,
         attention_kernels: AttentionKernelSet,
         register_to_slot_map: []const u8,
-        slot_buffers: []*compute.cuda.Buffer,
+        input_view: compute.cuda.Buffer,
+        slot_buffers: []compute.cuda.Buffer,
         instruction_handles: []runtime_contract.TensorHandle,
         instruction_views: []runtime_contract.TensorViewDesc,
     };
@@ -4600,28 +5170,179 @@ pub const CudaBackend = struct {
         return .{ 1, seq_len, dim, 0 };
     }
 
-    fn traceTokenIndex(ctx: *const LayerProgramExecutionContext) u32 {
-        if (ctx.seq_len_u32 == 0) return 0;
-        return ctx.seq_len_u32 - 1;
+    fn traceTokenIndex(seq_len: u32) u32 {
+        if (seq_len == 0) return 0;
+        return seq_len - 1;
+    }
+
+    fn tracePositionForPoint(point: trace.TracePoint, pos_offset: usize, seq_len: u32) u32 {
+        if (seq_len == 0) return 0;
+        return switch (point) {
+            .attn_q, .attn_k, .attn_v, .embed_pos => if (seq_len == 1)
+                @intCast(@min(pos_offset, std.math.maxInt(u32)))
+            else
+                seq_len,
+            .attn_qk, .attn_weights, .attn_out => if (seq_len == 1)
+                @intCast(@min(pos_offset + 1, std.math.maxInt(u32)))
+            else
+                seq_len,
+            else => seq_len,
+        };
+    }
+
+    fn parityDebugEnabled() bool {
+        return std.posix.getenv("TALU_PARITY_DEBUG") != null;
+    }
+
+    fn ensureParityPrefillBufferCapacity(self: *CudaBackend, buffer: *[]f32, elements: usize) !void {
+        if (buffer.*.len >= elements) return;
+        if (buffer.*.len > 0) self.allocator.free(buffer.*);
+        buffer.* = try self.allocator.alloc(f32, elements);
+    }
+
+    pub fn beginParityPrefillCapture(self: *CudaBackend, seq_len: usize) !void {
+        self.parity_prefill_seq_len = 0;
+        self.parity_prefill_token_index = 0;
+        @memset(&self.parity_checkpoint_warned, false);
+        if (!parityDebugEnabled() or !trace.isEnabled() or seq_len == 0) return;
+        const layer_count = self.block_runtime.blocks.len;
+        const elements = std.math.mul(usize, layer_count, std.math.mul(usize, seq_len, self.d_model) catch return error.InvalidArgument) catch return error.InvalidArgument;
+        try self.ensureParityPrefillBufferCapacity(&self.parity_prefill_layer_attn_norm_host, elements);
+        try self.ensureParityPrefillBufferCapacity(&self.parity_prefill_layer_ffn_norm_host, elements);
+        try self.ensureParityPrefillBufferCapacity(&self.parity_prefill_block_out_host, elements);
+        self.parity_prefill_seq_len = seq_len;
+    }
+
+    pub fn endParityPrefillCapture(self: *CudaBackend) void {
+        self.parity_prefill_seq_len = 0;
+        self.parity_prefill_token_index = 0;
+        @memset(&self.parity_checkpoint_warned, false);
+    }
+
+    fn parityPrefillBufferForPoint(self: *CudaBackend, point: trace.TracePoint) ?[]f32 {
+        return switch (point) {
+            .layer_attn_norm => self.parity_prefill_layer_attn_norm_host,
+            .layer_ffn_norm => self.parity_prefill_layer_ffn_norm_host,
+            .block_out => self.parity_prefill_block_out_host,
+            else => null,
+        };
+    }
+
+    fn ensureTraceCheckpointHostCapacity(self: *CudaBackend, elements: usize) !void {
+        if (self.trace_checkpoint_host.len >= elements) return;
+        if (self.trace_checkpoint_host.len > 0) self.allocator.free(self.trace_checkpoint_host);
+        self.trace_checkpoint_host = try self.allocator.alloc(f32, elements);
     }
 
     fn emitLayerProgramTracePoint(
-        ctx: *const LayerProgramExecutionContext,
+        ctx: *LayerProgramExecutionContext,
         point: trace.TracePoint,
         shape: [4]u32,
         ndim: u8,
         kernel_name: []const u8,
+        output: ?*const compute.cuda.Buffer,
     ) void {
         if (!trace.isEnabled()) return;
         var marker = [_]f32{0.0};
+        // CUDA timing emits may exist without a host-materialized tensor. Only mark
+        // the emission as f32 after a successful host download so verification never
+        // computes stats from synthetic marker storage.
+        var emit_dtype: trace.DType = .u8;
+        const parity_prefill_active = parityDebugEnabled() and ctx.trace_seq_len_u32 > 1 and ctx.backend.parityPrefillBufferForPoint(point) != null;
+        const seq_len: u32 = if (parity_prefill_active)
+            ctx.trace_seq_len_u32
+        else if (parityDebugEnabled())
+            ctx.active_rows_u32
+        else
+            ctx.trace_seq_len_u32;
+        const emission_token: u32 = if (parity_prefill_active) 0 else traceTokenIndex(seq_len);
+        var emit_shape = shape;
+        if (parity_prefill_active and ndim >= 2) emit_shape[1] = seq_len;
+        if (!parity_prefill_active and parityDebugEnabled() and ndim >= 2) emit_shape[1] = ctx.active_rows_u32;
+        var data_ptr: [*]const u8 = @ptrCast(marker[0..].ptr);
+        if (parityDebugEnabled()) {
+            if (output) |buffer| {
+                const width = @as(usize, emit_shape[ndim - 1]);
+                if (parity_prefill_active) {
+                    if (ctx.backend.parityPrefillBufferForPoint(point)) |prefill_buffer| {
+                        const parity_seq_len = @as(usize, ctx.trace_seq_len_u32);
+                        if (ctx.backend.parity_prefill_seq_len != parity_seq_len) {
+                            const layer_count = ctx.backend.block_runtime.blocks.len;
+                            const elements = std.math.mul(usize, layer_count, std.math.mul(usize, parity_seq_len, ctx.backend.d_model) catch return) catch return;
+                            ctx.backend.ensureParityPrefillBufferCapacity(&ctx.backend.parity_prefill_layer_attn_norm_host, elements) catch return;
+                            ctx.backend.ensureParityPrefillBufferCapacity(&ctx.backend.parity_prefill_layer_ffn_norm_host, elements) catch return;
+                            ctx.backend.ensureParityPrefillBufferCapacity(&ctx.backend.parity_prefill_block_out_host, elements) catch return;
+                            ctx.backend.parity_prefill_seq_len = parity_seq_len;
+                        }
+                        if (width > 0 and ctx.layer_index < ctx.backend.block_runtime.blocks.len and ctx.trace_pos_offset < parity_seq_len) {
+                            ctx.backend.ensureTraceCheckpointHostCapacity(width) catch return;
+                            const row_host = ctx.backend.trace_checkpoint_host[0..width];
+                            buffer.download(&ctx.backend.device, std.mem.sliceAsBytes(row_host)) catch |err| {
+                                const warn_idx = @intFromEnum(point);
+                                if (!ctx.backend.parity_checkpoint_warned[warn_idx]) {
+                                    ctx.backend.parity_checkpoint_warned[warn_idx] = true;
+                                    log.warn("inference", "CUDA parity checkpoint row download failed", .{
+                                        .point = point.name(),
+                                        .layer_index = ctx.layer_index,
+                                        .position = ctx.trace_pos_offset,
+                                        .seq_len = parity_seq_len,
+                                        .width = width,
+                                        .buffer_bytes = buffer.size,
+                                        .reason = @errorName(err),
+                                    });
+                                }
+                                return;
+                            };
+                            const per_layer = parity_seq_len * width;
+                            const dst_start = ctx.layer_index * per_layer + ctx.trace_pos_offset * width;
+                            @memcpy(prefill_buffer[dst_start .. dst_start + width], row_host);
+                            if (ctx.trace_pos_offset + 1 != parity_seq_len) return;
+                            data_ptr = @ptrCast(prefill_buffer[ctx.layer_index * per_layer ..][0..per_layer].ptr);
+                            emit_dtype = .f32;
+                        }
+                    } else {
+                        return;
+                    }
+                } else {
+                    var element_count: usize = 1;
+                    for (0..ndim) |dim_idx| {
+                        // Trace downloads must match the emitted checkpoint shape, not the
+                        // original logical prompt shape. Under parity debug, one-row outputs
+                        // such as attn.out/ffn.down are emitted with active-row shapes.
+                        element_count *= @as(usize, emit_shape[dim_idx]);
+                    }
+                    if (element_count > 0) {
+                        ctx.backend.ensureTraceCheckpointHostCapacity(element_count) catch return;
+                        const host = ctx.backend.trace_checkpoint_host[0..element_count];
+                        buffer.download(&ctx.backend.device, std.mem.sliceAsBytes(host)) catch |err| {
+                            const warn_idx = @intFromEnum(point);
+                            if (!ctx.backend.parity_checkpoint_warned[warn_idx]) {
+                                ctx.backend.parity_checkpoint_warned[warn_idx] = true;
+                                log.warn("inference", "CUDA checkpoint download failed", .{
+                                    .point = point.name(),
+                                    .layer_index = ctx.layer_index,
+                                    .position = ctx.trace_pos_offset,
+                                    .element_count = element_count,
+                                    .buffer_bytes = buffer.size,
+                                    .reason = @errorName(err),
+                                });
+                            }
+                            return;
+                        };
+                        data_ptr = @ptrCast(host.ptr);
+                        emit_dtype = .f32;
+                    }
+                }
+            }
+        }
         trace.emit(
             point,
             @intCast(ctx.layer_index),
-            traceTokenIndex(ctx),
-            ctx.position_u32,
-            @ptrCast(marker[0..].ptr),
-            .f32,
-            shape,
+            emission_token,
+            tracePositionForPoint(point, ctx.trace_pos_offset, seq_len),
+            data_ptr,
+            emit_dtype,
+            emit_shape,
             ndim,
             kernel_name,
         );
@@ -4631,7 +5352,11 @@ pub const CudaBackend = struct {
         const compiled = layer.compiled_plan orelse return .layer_ffn_norm;
         if (op_index + 1 < compiled.plan.instructions.len) {
             const next_opcode = compiled.plan.instructions[op_index + 1].opcode;
-            if (next_opcode == .multihead_attention or next_opcode == .mla_attention or next_opcode == .shortconv) {
+            if (next_opcode == .multihead_attention or
+                next_opcode == .mla_attention or
+                next_opcode == .shortconv or
+                next_opcode == .gated_delta_net)
+            {
                 return .layer_attn_norm;
             }
         }
@@ -4865,6 +5590,63 @@ pub const CudaBackend = struct {
         return total;
     }
 
+    fn initCpuRuntimeRopeHandles(self: *CudaBackend) !void {
+        if (self.loaded.position_embeddings != null) return;
+        if (self.rope_dim == 0) return;
+
+        var global_freqs = try rope_scaling.materializeInverseFrequencies(
+            self.allocator,
+            self.rope_dim,
+            self.loaded.config.rope_theta,
+            self.loaded.config.rope_scaling,
+        );
+        defer global_freqs.deinit(self.allocator);
+
+        const global_rope = try self.allocator.create(cpu_kernels.RoPE);
+        errdefer self.allocator.destroy(global_rope);
+        global_rope.* = try cpu_kernels.RoPE.initFromInvFreq(
+            self.allocator,
+            self.rope_dim,
+            @intCast(self.loaded.config.max_seq_len),
+            global_freqs.inv_freq,
+            global_freqs.attention_scaling,
+        );
+        self.cpu_rope_global = global_rope;
+
+        if (self.loaded.config.rope_local_theta > 0 and self.loaded.config.sliding_window > 0) {
+            var local_freqs = try rope_scaling.materializeInverseFrequencies(
+                self.allocator,
+                self.rope_dim,
+                self.loaded.config.rope_local_theta,
+                self.loaded.config.rope_scaling,
+            );
+            defer local_freqs.deinit(self.allocator);
+
+            const local_rope = try self.allocator.create(cpu_kernels.RoPE);
+            errdefer self.allocator.destroy(local_rope);
+            local_rope.* = try cpu_kernels.RoPE.initFromInvFreq(
+                self.allocator,
+                self.rope_dim,
+                @intCast(self.loaded.config.max_seq_len),
+                local_freqs.inv_freq,
+                local_freqs.attention_scaling,
+            );
+            self.cpu_rope_local = local_rope;
+        }
+    }
+
+    fn assignCpuRuntimeRopeToAttentionFallbacks(self: *CudaBackend) void {
+        for (self.block_runtime.blocks) |*layer| {
+            const block = layer.attention_binding orelse continue;
+            if (block.cpu_kernel) |*kernel| {
+                kernel.rope = if (kernel.sliding_window > 0 and self.cpu_rope_local != null)
+                    self.cpu_rope_local
+                else
+                    self.cpu_rope_global;
+            }
+        }
+    }
+
     fn layerProgramNormAdapter(
         self: *CudaBackend,
         _: *BlockRuntimeLayer,
@@ -4879,6 +5661,18 @@ pub const CudaBackend = struct {
         const input = bufferFromTensorHandle(io.inputs[0]);
         const output = bufferFromTensorHandle(io.outputs[0]);
         const weight = deviceTensorFromWeightHandle(weight_handles[0]);
+        if (parityDebugEnabled()) {
+            return self.runRmsnormExactMaybeCpu(
+                "layer_program_norm",
+                input,
+                &weight.buffer,
+                output,
+                ctx.active_rows_u32,
+                ctx.d_model_u32,
+                self.norm_eps,
+                self.loaded.runtime.weight_offset,
+            );
+        }
         compute.cuda.rmsnorm.runWithFunction(
             &self.kernel_arg_pack,
             &self.device,
@@ -4886,13 +5680,13 @@ pub const CudaBackend = struct {
             input,
             &weight.buffer,
             output,
-            1,
+            ctx.active_rows_u32,
             ctx.d_model_u32,
             self.norm_eps,
             self.loaded.runtime.weight_offset,
         ) catch |err| {
             if (err == error.InvalidArgument) {
-                const expected_io_bytes = std.math.mul(usize, @as(usize, 1), @as(usize, ctx.d_model_u32) * @sizeOf(f32)) catch 0;
+                const expected_io_bytes = std.math.mul(usize, @as(usize, ctx.active_rows_u32), @as(usize, ctx.d_model_u32) * @sizeOf(f32)) catch 0;
                 const expected_weight_bytes = std.math.mul(usize, @as(usize, ctx.d_model_u32), @sizeOf(f32)) catch 0;
                 log.warn("inference", "CUDA rmsnorm adapter invalid args", .{
                     .layer_index = ctx.layer_index,
@@ -4939,35 +5733,83 @@ pub const CudaBackend = struct {
             return error.InvalidStateDescriptorBinding;
         }
         const attention_binding = try requireAttentionRuntimeBinding(kv_state, ctx.layer_index);
-        try self.runAttentionMixerStep(
-            cfg,
-            &attention_binding.k_cache,
-            &attention_binding.v_cache,
-            &q_proj,
-            &k_proj,
-            &v_proj,
-            &o_proj,
-            q_norm_weight,
-            k_norm_weight,
-            input,
-            output,
-            ctx.d_model_u32,
-            ctx.head_dim_u32,
-            ctx.rope_dim_u32,
-            ctx.n_heads_u32,
-            ctx.n_kv_heads_u32,
-            ctx.seq_len_u32,
-            ctx.position,
-            ctx.position_u32,
-            ctx.global_rope_theta,
-            ctx.local_rope_theta,
-            ctx.rope_function,
-            ctx.copy_function,
-            ctx.cast_f32_to_f16_function,
-            ctx.kv_write_f16_function,
-            ctx.rope_store_f16_function,
-            ctx.attention_kernels,
-        );
+        if (attention_binding.cpu_kernel != null) {
+            return self.runAttentionMixerStepCpu(
+                attention_binding,
+                input,
+                output,
+                @intCast(ctx.active_rows_u32),
+            );
+        }
+        if (ctx.active_rows_u32 <= 1) {
+            try self.runAttentionMixerStep(
+                cfg,
+                &attention_binding.k_cache,
+                &attention_binding.v_cache,
+                &q_proj,
+                &k_proj,
+                &v_proj,
+                &o_proj,
+                q_norm_weight,
+                k_norm_weight,
+                input,
+                output,
+                ctx.d_model_u32,
+                ctx.head_dim_u32,
+                ctx.rope_dim_u32,
+                ctx.n_heads_u32,
+                ctx.n_kv_heads_u32,
+                ctx.seq_len_u32,
+                ctx.position,
+                ctx.position_u32,
+                ctx.global_rope_theta,
+                ctx.local_rope_theta,
+                ctx.rope_function,
+                ctx.copy_function,
+                ctx.cast_f32_to_f16_function,
+                ctx.kv_write_f16_function,
+                ctx.rope_store_f16_function,
+                ctx.attention_kernels,
+            );
+            return;
+        }
+
+        const row_bytes = std.math.mul(usize, @as(usize, ctx.d_model_u32), @sizeOf(f32)) catch return error.InvalidArgument;
+        var row_idx: usize = 0;
+        while (row_idx < ctx.active_rows_u32) : (row_idx += 1) {
+            const offset = std.math.mul(usize, row_idx, row_bytes) catch return error.InvalidArgument;
+            var input_row = try bufferSlice(input, offset, row_bytes);
+            var output_row = try bufferSlice(output, offset, row_bytes);
+            try self.runAttentionMixerStep(
+                cfg,
+                &attention_binding.k_cache,
+                &attention_binding.v_cache,
+                &q_proj,
+                &k_proj,
+                &v_proj,
+                &o_proj,
+                q_norm_weight,
+                k_norm_weight,
+                &input_row,
+                &output_row,
+                ctx.d_model_u32,
+                ctx.head_dim_u32,
+                ctx.rope_dim_u32,
+                ctx.n_heads_u32,
+                ctx.n_kv_heads_u32,
+                @intCast(row_idx + 1),
+                row_idx,
+                @intCast(row_idx),
+                ctx.global_rope_theta,
+                ctx.local_rope_theta,
+                ctx.rope_function,
+                ctx.copy_function,
+                ctx.cast_f32_to_f16_function,
+                ctx.kv_write_f16_function,
+                ctx.rope_store_f16_function,
+                ctx.attention_kernels,
+            );
+        }
     }
 
     fn layerProgramShortConvAdapter(
@@ -4997,17 +5839,41 @@ pub const CudaBackend = struct {
             return error.InvalidStateDescriptorBinding;
         }
         const shortconv_binding = try requireShortConvRuntimeBinding(shortconv_state, ctx.layer_index);
-        try self.runShortConvMixerStep(
-            cfg,
-            &shortconv_binding.conv_state,
-            &in_proj,
-            &out_proj,
-            &conv_weight,
-            conv_bias,
-            input,
-            output,
-            ctx.shortconv_step_function,
-        );
+        if (ctx.active_rows_u32 <= 1) {
+            try self.runShortConvMixerStep(
+                cfg,
+                &shortconv_binding.conv_state,
+                &in_proj,
+                &out_proj,
+                &conv_weight,
+                conv_bias,
+                input,
+                output,
+                ctx.shortconv_step_function,
+            );
+            return;
+        }
+
+        const input_row_bytes = std.math.mul(usize, @as(usize, in_proj.rows()), @sizeOf(f32)) catch return error.InvalidArgument;
+        const output_row_bytes = std.math.mul(usize, @as(usize, out_proj.cols()), @sizeOf(f32)) catch return error.InvalidArgument;
+        var row_idx: usize = 0;
+        while (row_idx < ctx.active_rows_u32) : (row_idx += 1) {
+            const input_offset = std.math.mul(usize, row_idx, input_row_bytes) catch return error.InvalidArgument;
+            const output_offset = std.math.mul(usize, row_idx, output_row_bytes) catch return error.InvalidArgument;
+            var input_row = try bufferSlice(input, input_offset, input_row_bytes);
+            var output_row = try bufferSlice(output, output_offset, output_row_bytes);
+            try self.runShortConvMixerStep(
+                cfg,
+                &shortconv_binding.conv_state,
+                &in_proj,
+                &out_proj,
+                &conv_weight,
+                conv_bias,
+                &input_row,
+                &output_row,
+                ctx.shortconv_step_function,
+            );
+        }
     }
 
     fn layerProgramGatedDeltaAdapter(
@@ -5030,34 +5896,16 @@ pub const CudaBackend = struct {
             return error.InvalidStateDescriptorBinding;
         }
         const binding = try requireGatedDeltaRuntimeBinding(gated_delta_state, ctx.layer_index);
-        const rows = bufferF32RowCount(input, self.d_model) catch |err| {
-            log.warn("inference", "CUDA gated-delta input row count invalid", .{
-                .layer_index = ctx.layer_index,
-                .op_index = ctx.op_index,
-                .input_bytes = input.size,
-                .d_model = self.d_model,
-                .reason = @errorName(err),
-            });
-            return err;
-        };
-        const out_rows = bufferF32RowCount(output, self.d_model) catch |err| {
-            log.warn("inference", "CUDA gated-delta output row count invalid", .{
-                .layer_index = ctx.layer_index,
-                .op_index = ctx.op_index,
-                .output_bytes = output.size,
-                .d_model = self.d_model,
-                .reason = @errorName(err),
-            });
-            return err;
-        };
-        if (out_rows != rows) {
+        const expected_rows: usize = @intCast(ctx.active_rows_u32);
+        const expected_bytes = std.math.mul(usize, expected_rows, self.d_model * @sizeOf(f32)) catch return error.InvalidArgument;
+        if (input.size != expected_bytes or output.size != expected_bytes) {
             log.warn("inference", "CUDA gated-delta row count mismatch", .{
                 .layer_index = ctx.layer_index,
                 .op_index = ctx.op_index,
-                .input_rows = rows,
-                .output_rows = out_rows,
+                .expected_rows = expected_rows,
                 .input_bytes = input.size,
                 .output_bytes = output.size,
+                .expected_bytes = expected_bytes,
                 .d_model = self.d_model,
             });
             return error.InvalidInstructionBinding;
@@ -5066,7 +5914,7 @@ pub const CudaBackend = struct {
             binding,
             input,
             output,
-            rows,
+            expected_rows,
         );
         _ = layer;
     }
@@ -5114,9 +5962,29 @@ pub const CudaBackend = struct {
     ) !void {
         const io = try instructionIoSlices(insn, registers);
         if (io.inputs.len < 2 or io.outputs.len == 0) return error.InvalidInstructionBinding;
+        const residual_src = bufferFromTensorHandle(io.inputs[0]);
         const residual = bufferFromTensorHandle(io.outputs[0]);
         const branch = bufferFromTensorHandle(io.inputs[1]);
-        try self.addResidualWithScale(residual, branch, ctx.d_model_u32, scale);
+        const count = std.math.mul(u32, ctx.active_rows_u32, ctx.d_model_u32) catch return error.InvalidArgument;
+        if (parityDebugEnabled()) {
+            const count_usize: usize = @intCast(count);
+            const host_storage = try self.allocator.alloc(f32, count_usize * 3);
+            defer self.allocator.free(host_storage);
+            const host_residual = host_storage[0..count_usize];
+            const host_branch = host_storage[count_usize .. count_usize * 2];
+            const host_out = host_storage[count_usize * 2 .. count_usize * 3];
+            try residual_src.download(&self.device, std.mem.sliceAsBytes(host_residual));
+            try branch.download(&self.device, std.mem.sliceAsBytes(host_branch));
+            const scale_value: f32 = switch (scale) {
+                .residual_multiplier => self.loaded.config.residual_multiplier,
+                .one => 1.0,
+                .literal => |literal| literal,
+            };
+            compute.cpu.rowwise.addIntoScaled(host_residual, host_branch, host_out, scale_value);
+            try residual.upload(&self.device, std.mem.sliceAsBytes(host_out));
+            return;
+        }
+        try self.addResidualWithScale(residual, residual_src, branch, count, scale);
     }
 
     fn layerProgramNormRuntimeAdapter(
@@ -5128,6 +5996,8 @@ pub const CudaBackend = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const exec_ctx = try layerProgramExecutionState(rt_ctx);
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         _ = try runtime_contract.requireInstructionStateBlockForPlan(
             insn,
             &exec_ctx.layer.compiled_plan.?.plan,
@@ -5138,9 +6008,10 @@ pub const CudaBackend = struct {
         emitLayerProgramTracePoint(
             exec_ctx,
             inferNormTracePoint(layer, exec_ctx.op_index),
-            traceShapeBsd(exec_ctx.seq_len_u32, exec_ctx.d_model_u32),
+            traceShapeBsd(exec_ctx.trace_seq_len_u32, exec_ctx.d_model_u32),
             3,
             "cuda_rmsnorm",
+            bufferFromTensorHandle(io.outputs[0]),
         );
     }
 
@@ -5159,23 +6030,35 @@ pub const CudaBackend = struct {
             state_blocks,
         );
         const layer = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
-        if (layer.instructionAttentionRef(exec_ctx.op_index)) |cfg| {
+        const emits_traced_inside_cpu_fallback = if (layer.instructionAttentionRef(exec_ctx.op_index)) |cfg| blk: {
+            // Query-gated attention currently runs through the traced CPU fallback inside
+            // the CUDA backend. Skipping the wrapper emit here avoids duplicate attn.q/out
+            // rows with one synthetic metadata record and one real host-backed record.
+            if (!cfg.query_gate) {
+                emitLayerProgramTracePoint(
+                    exec_ctx,
+                    .attn_q,
+                    traceShapeBsd(exec_ctx.trace_seq_len_u32, @intCast(cfg.q_dim)),
+                    3,
+                    "cuda_attention_q",
+                    null,
+                );
+            }
+            break :blk cfg.query_gate;
+        } else |_| false;
+        try exec_ctx.backend.layerProgramAttentionAdapter(layer, insn, registers, state_blocks, exec_ctx);
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        if (!emits_traced_inside_cpu_fallback) {
             emitLayerProgramTracePoint(
                 exec_ctx,
-                .attn_q,
-                traceShapeBsd(exec_ctx.seq_len_u32, @intCast(cfg.q_dim)),
+                .attn_out,
+                traceShapeBsd(exec_ctx.trace_seq_len_u32, exec_ctx.d_model_u32),
                 3,
-                "cuda_attention_q",
+                "cuda_attention_out",
+                bufferFromTensorHandle(io.outputs[0]),
             );
-        } else |_| {}
-        try exec_ctx.backend.layerProgramAttentionAdapter(layer, insn, registers, state_blocks, exec_ctx);
-        emitLayerProgramTracePoint(
-            exec_ctx,
-            .attn_out,
-            traceShapeBsd(exec_ctx.seq_len_u32, exec_ctx.d_model_u32),
-            3,
-            "cuda_attention_out",
-        );
+        }
     }
 
     fn layerProgramShortConvRuntimeAdapter(
@@ -5197,18 +6080,22 @@ pub const CudaBackend = struct {
             emitLayerProgramTracePoint(
                 exec_ctx,
                 .conv_in_proj,
-                traceShapeBsd(exec_ctx.seq_len_u32, @intCast(cfg.conv_dim * 3)),
+                traceShapeBsd(exec_ctx.trace_seq_len_u32, @intCast(cfg.conv_dim * 3)),
                 3,
                 "cuda_shortconv_in_proj",
+                null,
             );
         } else |_| {}
         try exec_ctx.backend.layerProgramShortConvAdapter(layer, insn, registers, state_blocks, exec_ctx);
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         emitLayerProgramTracePoint(
             exec_ctx,
             .conv_out_proj,
-            traceShapeBsd(exec_ctx.seq_len_u32, exec_ctx.d_model_u32),
+            traceShapeBsd(exec_ctx.trace_seq_len_u32, exec_ctx.d_model_u32),
             3,
             "cuda_shortconv_out_proj",
+            bufferFromTensorHandle(io.outputs[0]),
         );
     }
 
@@ -5251,18 +6138,22 @@ pub const CudaBackend = struct {
             emitLayerProgramTracePoint(
                 exec_ctx,
                 .ffn_gate,
-                traceShapeBsd(exec_ctx.seq_len_u32, @intCast(gate.cols())),
+                traceShapeBsd(exec_ctx.trace_seq_len_u32, @intCast(gate.cols())),
                 3,
                 "cuda_ffn_gate",
+                null,
             );
         }
         try exec_ctx.backend.layerProgramSwiGluAdapter(layer, insn, registers, exec_ctx);
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         emitLayerProgramTracePoint(
             exec_ctx,
             .ffn_down,
-            traceShapeBsd(exec_ctx.seq_len_u32, exec_ctx.d_model_u32),
+            traceShapeBsd(exec_ctx.trace_seq_len_u32, exec_ctx.d_model_u32),
             3,
             "cuda_ffn_down",
+            bufferFromTensorHandle(io.outputs[0]),
         );
     }
 
@@ -5283,12 +6174,15 @@ pub const CudaBackend = struct {
         _ = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
         const scale = try decodeResidualScaleFromParams(params);
         try exec_ctx.backend.layerProgramResidualAddAdapter(insn, registers, scale, exec_ctx);
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 2 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         emitLayerProgramTracePoint(
             exec_ctx,
             .block_out,
-            traceShapeBsd(exec_ctx.seq_len_u32, exec_ctx.d_model_u32),
+            traceShapeBsd(exec_ctx.trace_seq_len_u32, exec_ctx.d_model_u32),
             3,
             "cuda_residual_add",
+            bufferFromTensorHandle(io.outputs[0]),
         );
     }
 
@@ -5301,9 +6195,9 @@ pub const CudaBackend = struct {
         self.recordLayerProgramDispatch(insn.opcode);
 
         var active_slots: [1]usize = .{0};
-        var seq_lengths: [1]u32 = .{ctx.seq_len_u32};
+        var seq_lengths: [1]u32 = .{ctx.active_rows_u32};
         var rt_ctx = runtime_contract.ExecutionContext{
-            .mode = if (ctx.seq_len_u32 > 1) .prefill else .decode,
+            .mode = if (ctx.active_rows_u32 > 1) .prefill else .decode,
             .active_slots = active_slots[0..],
             .sequence_lengths = seq_lengths[0..],
             .batch_size = 1,
@@ -5349,7 +6243,10 @@ pub const CudaBackend = struct {
         rope_dim_u32: u32,
         n_heads_u32: u32,
         n_kv_heads_u32: u32,
+        active_rows_u32: u32,
         seq_len_u32: u32,
+        trace_seq_len_u32: u32,
+        trace_pos_offset: usize,
         position: usize,
         position_u32: u32,
         global_rope_theta: f32,
@@ -5361,7 +6258,7 @@ pub const CudaBackend = struct {
         rope_store_f16_function: ?compute.cuda.Function,
         shortconv_step_function: compute.cuda.Function,
         attention_kernels: AttentionKernelSet,
-    ) !void {
+    ) !compute.cuda.Buffer {
         const prev_backend = trace.setBackendContext(.cuda);
         defer _ = trace.setBackendContext(prev_backend);
         const compiled_plan = layer.compiled_plan orelse return error.UnsupportedModel;
@@ -5380,6 +6277,15 @@ pub const CudaBackend = struct {
         defer if (instruction_handles.len > 0) self.allocator.free(instruction_handles);
         const instruction_views = try self.allocator.alloc(runtime_contract.TensorViewDesc, handle_capacity);
         defer if (instruction_views.len > 0) self.allocator.free(instruction_views);
+        const active_input_bytes = std.math.mul(usize, @as(usize, active_rows_u32), @as(usize, d_model_u32) * @sizeOf(f32)) catch return error.InvalidArgument;
+        const input_view = try bufferSlice(&self.runtime_buffers.input_dev, 0, active_input_bytes);
+        const slot_buffer_views = try self.allocator.alloc(compute.cuda.Buffer, required_slot_count);
+        defer if (slot_buffer_views.len > 0) self.allocator.free(slot_buffer_views);
+        for (slot_buffer_views, 0..) |*view, slot_idx| {
+            const width = layer.slot_width_hints[slot_idx];
+            const bytes = std.math.mul(usize, @as(usize, active_rows_u32), width * @sizeOf(f32)) catch return error.InvalidArgument;
+            view.* = try bufferSlice(self.layer_program_slot_ptrs[slot_idx], 0, bytes);
+        }
         var exec_ctx = LayerProgramExecutionContext{
             .backend = self,
             .layer = layer,
@@ -5391,7 +6297,10 @@ pub const CudaBackend = struct {
             .rope_dim_u32 = rope_dim_u32,
             .n_heads_u32 = n_heads_u32,
             .n_kv_heads_u32 = n_kv_heads_u32,
+            .active_rows_u32 = active_rows_u32,
             .seq_len_u32 = seq_len_u32,
+            .trace_seq_len_u32 = trace_seq_len_u32,
+            .trace_pos_offset = trace_pos_offset,
             .position = position,
             .position_u32 = position_u32,
             .global_rope_theta = global_rope_theta,
@@ -5404,7 +6313,8 @@ pub const CudaBackend = struct {
             .shortconv_step_function = shortconv_step_function,
             .attention_kernels = attention_kernels,
             .register_to_slot_map = layer.register_to_slot_map,
-            .slot_buffers = self.layer_program_slot_ptrs[0..required_slot_count],
+            .input_view = input_view,
+            .slot_buffers = slot_buffer_views,
             .instruction_handles = instruction_handles,
             .instruction_views = instruction_views,
         };
@@ -5434,9 +6344,11 @@ pub const CudaBackend = struct {
                 copy_function,
                 final_buf,
                 &self.runtime_buffers.input_dev,
-                d_model_u32,
+                std.math.mul(u32, active_rows_u32, d_model_u32) catch return error.InvalidArgument,
             );
+            return final_buf.*;
         }
+        return exec_ctx.input_view;
     }
 
     fn runAttentionContext(
@@ -5714,49 +6626,10 @@ pub const CudaBackend = struct {
         up_weight: *const LinearWeight,
     ) !bool {
         if (try self.tryFusedDenseU16GateUpForward(input, gate_weight, up_weight)) return true;
-
-        const fused_kernel = self.gaffine_u4_matvec_gate_up_function orelse return false;
-        const gate = switch (gate_weight.*) {
-            .gaffine_u4 => |w| w,
-            else => return false,
-        };
-        const up = switch (up_weight.*) {
-            .gaffine_u4 => |w| w,
-            else => return false,
-        };
-
-        if (gate.rows != self.d_model or up.rows != self.d_model) return false;
-        if (gate.scales_dtype_tag != up.scales_dtype_tag) return false;
-        if (gate.cols > std.math.maxInt(u32) or
-            up.cols > std.math.maxInt(u32) or
-            gate.rows > std.math.maxInt(u32))
-        {
-            return false;
-        }
-
-        try compute.cuda.gaffine_u4_matvec_gate_up.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            fused_kernel,
-            input,
-            &gate.packed_data,
-            &gate.scales,
-            &gate.biases,
-            &self.runtime_buffers.ffn_gate_dev,
-            @intCast(gate.cols),
-            gate.group_size,
-            gate.scales_dtype_tag,
-            &up.packed_data,
-            &up.scales,
-            &up.biases,
-            &self.runtime_buffers.ffn_up_dev,
-            @intCast(up.cols),
-            up.group_size,
-            up.scales_dtype_tag,
-            @intCast(gate.rows),
-            1,
-        );
-        return true;
+        // The grouped-affine fused gate/up path is still not numerically aligned with
+        // CPU on Qwen3.5 parity verification. Use the shared unfused matvec path until
+        // the fused kernel has a model-true regression guard.
+        return false;
     }
 
     fn tryFusedDenseU16GateUpForward(
@@ -6140,6 +7013,15 @@ fn bufferSlice(buffer: *const compute.cuda.Buffer, byte_offset: usize, byte_len:
         .pointer = ptr,
         .size = byte_len,
     };
+}
+
+fn resizeScratchBuffer(device: *compute.cuda.Device, buffer: *compute.cuda.Buffer, new_size: usize) !void {
+    if (new_size == 0) return error.InvalidArgument;
+    if (buffer.size == new_size) return;
+    var next = try device.allocBuffer(new_size);
+    errdefer next.deinit(device);
+    buffer.deinit(device);
+    buffer.* = next;
 }
 
 fn freeOwnedTensorView(allocator: std.mem.Allocator, t: Tensor) void {
