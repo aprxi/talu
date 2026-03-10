@@ -15,6 +15,7 @@ import { buildSettingsDOM } from "./build-dom.ts";
 import { populateForm, populateLocalModelSelect, updateSystemPromptDisplay, showModelParams, handleModelChange } from "./form.ts";
 import { wireEvents } from "./events.ts";
 import { loadCustomThemes, populateThemeSelects } from "./theme-editor.ts";
+import { navigate, onRouteChange } from "../../kernel/system/router.ts";
 
 export const settingsPlugin: PluginDefinition = {
   manifest: {
@@ -68,7 +69,20 @@ export const settingsPlugin: PluginDefinition = {
         const el = ctx.container.querySelector<HTMLElement>(`[data-settings-tab="${t}"]`);
         if (el) el.style.display = t === tab ? "" : "none";
       }
+      navigate({ mode: "settings", sub: tab === "model" ? null : tab, resource: null }, { replace: true });
     });
+
+    // Route-driven tab switching (Back/Forward + deep links).
+    ctx.subscriptions.add(onRouteChange((route) => {
+      if (route.mode !== "settings") return;
+      const tab = (SETTINGS_TABS as readonly string[]).includes(route.sub ?? "")
+        ? route.sub!
+        : "model";
+      for (const t of SETTINGS_TABS) {
+        const el = ctx.container.querySelector<HTMLElement>(`[data-settings-tab="${t}"]`);
+        if (el) el.style.display = t === tab ? "" : "none";
+      }
+    }));
 
     // Load persisted custom themes and register with kernel.
     await loadCustomThemes();

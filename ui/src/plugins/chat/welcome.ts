@@ -6,6 +6,7 @@ import { updatePanelChatInfo } from "./panel-params.ts";
 import { layout } from "./deps.ts";
 import { renderSidebar } from "./sidebar-list.ts";
 import { clearAttachments } from "./attachments.ts";
+import { navigate } from "../../kernel/system/router.ts";
 
 export function showWelcome(): void {
   const dom = getChatDom();
@@ -52,6 +53,9 @@ export function startNewConversation(projectId?: string | null): void {
   chatState.activeChat = null;
   chatState.lastResponseId = null;
   chatState.pendingProjectId = projectId ?? null;
+
+  // Update URL hash to chat welcome.
+  navigate({ mode: "chat", sub: null, resource: null });
 
   // Ensure the project group is open so the user can see chats.
   const groupKey = projectId ?? "__default__";

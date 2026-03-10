@@ -25,6 +25,7 @@ import { buildPromptsDOM } from "../prompts/build-dom.ts";
 import { initPromptsDom } from "../prompts/dom.ts";
 import { wireEvents as wirePromptsEvents } from "../prompts/editor.ts";
 import { initPage as initPromptsPage } from "../prompts/index.ts";
+import { navigate, onRouteChange } from "../../kernel/system/router.ts";
 
 function initConversationsBrowser(): void {
   // Cancel any in-flight load so it won't overwrite state.
@@ -101,12 +102,14 @@ export const browserPlugin: PluginDefinition = {
       bState.subPage = "context";
       syncBrowserSubPage();
       initPromptsPage();
+      navigate({ mode: "conversations", sub: "context", resource: null });
     });
 
     // Context exit: back button → return to conversations.
     dom.contextBackBtn.addEventListener("click", () => {
       bState.subPage = null;
       syncBrowserSubPage();
+      navigate({ mode: "conversations", sub: null, resource: null });
     });
 
     // Activate contributed menu slot in the toolbar.
@@ -120,6 +123,19 @@ export const browserPlugin: PluginDefinition = {
         initConversationsBrowser();
       }
     });
+
+    // Route-driven sub-page handling (Back/Forward + deep links).
+    ctx.subscriptions.add(onRouteChange((route) => {
+      if (route.mode !== "conversations") return;
+      if (route.sub === "context" && bState.subPage !== "context") {
+        bState.subPage = "context";
+        syncBrowserSubPage();
+        initPromptsPage();
+      } else if (!route.sub && bState.subPage !== null) {
+        bState.subPage = null;
+        syncBrowserSubPage();
+      }
+    }));
 
     ctx.log.info("Browser plugin ready.");
   },

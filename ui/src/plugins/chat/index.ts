@@ -34,6 +34,7 @@ import { getChatPanelDom } from "./chat-panel-dom.ts";
 import { chatState, getActiveProjectId, loadCollapsedGroups } from "./state.ts";
 import { getModelsService, getPromptsService } from "./deps.ts";
 import { initProjectStore, loadApiProjects, migrateLocalStorageProjects } from "../../render/project-combo.ts";
+import { onRouteChange } from "../../kernel/system/router.ts";
 
 function populatePromptSelect(
   sel: HTMLSelectElement,
@@ -203,6 +204,21 @@ export const chatPlugin: PluginDefinition = {
     // Load initial data and show welcome state.
     showWelcome();
     await loadSessions();
+
+    // Route-driven session selection (deep links and Back/Forward).
+    ctx.subscriptions.add(onRouteChange((route) => {
+      if (route.mode !== "chat") return;
+      const sessionId = route.sub;
+      if (!sessionId) {
+        // #/chat → show welcome (new conversation).
+        if (chatState.activeSessionId) {
+          startNewConversation(getActiveProjectId());
+        }
+      } else if (sessionId !== chatState.activeSessionId && !sessionId.startsWith("__pending_")) {
+        // #/chat/<id> → select that session.
+        selectChat(sessionId);
+      }
+    }));
 
     // Migrate localStorage projects → API (one-time, non-blocking).
     migrateLocalStorageProjects().catch(() => {});

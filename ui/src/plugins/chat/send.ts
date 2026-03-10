@@ -15,6 +15,7 @@ import {
   isAttachmentUploadInProgress,
   uploadFiles,
 } from "./attachments.ts";
+import { navigate } from "../../kernel/system/router.ts";
 import type { Conversation, CreateResponseRequest, InputContentItem, UsageStats } from "../../types.ts";
 
 export function setupInputEvents(): void {
@@ -131,6 +132,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
     streamSessionId = sid;
     if (isActive()) {
       chatState.activeSessionId = sid;
+      navigate({ mode: "chat", sub: sid, resource: null }, { replace: true });
     } else {
       chatState.backgroundStreamSessions.add(sid);
     }
@@ -358,6 +360,8 @@ async function discoverSessionId(): Promise<void> {
   if (chatState.activeSessionId && !chatState.activeSessionId.startsWith("__pending_")) return;
   const list = await api.listConversations({ limit: 1 });
   if (list.ok && list.data && list.data.data.length > 0) {
-    chatState.activeSessionId = list.data.data[0]!.id;
+    const realId = list.data.data[0]!.id;
+    chatState.activeSessionId = realId;
+    navigate({ mode: "chat", sub: realId, resource: null }, { replace: true });
   }
 }

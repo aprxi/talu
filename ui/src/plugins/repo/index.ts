@@ -21,6 +21,7 @@ import {
 import { getRepoDom } from "./dom.ts";
 import { renderHosts, wireHostEvents } from "./hosts-render.ts";
 import { openTerminalForHost, wireTerminalEvents, disposeTerminals } from "./hosts-terminal.ts";
+import { navigate, onRouteChange } from "../../kernel/system/router.ts";
 
 export const repoPlugin: PluginDefinition = {
   manifest: {
@@ -86,6 +87,7 @@ export const repoPlugin: PluginDefinition = {
       syncRepoTabs();
       loadProviders();
       renderChatModels();
+      navigate({ mode: "routing", sub: null, resource: null });
     });
 
     // Manage-local tab switching (Local ↔ Discover).
@@ -107,6 +109,27 @@ export const repoPlugin: PluginDefinition = {
         }
       });
     }
+
+    // Route-driven sub-page handling (Back/Forward + deep links).
+    ctx.subscriptions.add(onRouteChange((route) => {
+      if (route.mode !== "routing") return;
+      if (route.sub === "manage-local" && repoState.subPage !== "manage-local") {
+        repoState.subPage = "manage-local";
+        syncRepoTabs();
+      } else if (route.sub === "terminal" && route.resource) {
+        if (repoState.activeTerminalHostId !== route.resource) {
+          openTerminalForHost(route.resource, ctx);
+        }
+      } else if (!route.sub && repoState.subPage !== null) {
+        disposeTerminals();
+        repoState.subPage = null;
+        repoState.activeTerminalHostId = null;
+        syncRepoTabs();
+        loadProviders();
+        renderChatModels();
+        renderHosts();
+      }
+    }));
 
     ctx.log.info("Repo plugin ready.");
   },

@@ -27,6 +27,7 @@ import { StatusBarManager } from "../ui/status-bar.ts";
 import { ViewManager } from "../ui/view-manager.ts";
 import { importWithWatchdog, ImportTimeoutError } from "./import-watchdog.ts";
 import { partitionByActivation, topologicalSort, parseActivationEvent, type PluginDescriptor } from "./activation.ts";
+import { initRouter, replayCurrentRoute } from "../system/router.ts";
 import { verifyIntegrity } from "../security/integrity.ts";
 import { ModeManager } from "../ui/mode-manager.ts";
 import { NetworkConnectivity } from "../system/network.ts";
@@ -493,7 +494,9 @@ export async function bootKernel(builtinPlugins: PluginDefinition[]): Promise<vo
   // Activate mode manager after plugins are running (so they can listen for mode.changed).
   kernelDisposables.track(modeManager.installActivityBarListeners());
   kernelDisposables.track(modeManager.installChatGroupNavListeners());
-  await modeManager.restoreLastMode();
+  kernelDisposables.track(initRouter());
+  kernelDisposables.track(modeManager.initFromRoute());
+  replayCurrentRoute();
 
   // Load third-party plugins (skipped in safe mode).
   if (!safeMode) {

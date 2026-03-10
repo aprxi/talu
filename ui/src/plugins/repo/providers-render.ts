@@ -10,6 +10,7 @@ import { addChatModel, browseProviderModels, browseLocalModels } from "./chat-mo
 import { renderChatModels } from "./chat-models-render.ts";
 import { syncRepoTabs, updateRepoToolbar } from "./render.ts";
 import { loadModels } from "./data.ts";
+import { navigate } from "../../kernel/system/router.ts";
 import type { ProviderEntry } from "../../types.ts";
 
 // ---------------------------------------------------------------------------
@@ -270,6 +271,7 @@ export function wireProviderEvents(container: HTMLElement): void {
       syncRepoTabs();
       updateRepoToolbar();
       loadModels();
+      navigate({ mode: "routing", sub: "manage-local", resource: null });
       return;
     }
 

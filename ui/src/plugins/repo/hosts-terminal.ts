@@ -10,6 +10,7 @@ import { createTerminal } from "../../lib/terminal.ts";
 import { repoState } from "./state.ts";
 import { getRepoDom } from "./dom.ts";
 import { syncRepoTabs } from "./render.ts";
+import { navigate } from "../../kernel/system/router.ts";
 
 interface ActiveTerminal {
   hostId: string;
@@ -53,6 +54,7 @@ export function openTerminalForHost(hostId: string, ctx: PluginContext): void {
 
   repoState.activeTerminalHostId = hostId;
   repoState.subPage = "terminal";
+  navigate({ mode: "routing", sub: "terminal", resource: hostId });
 
   const dom = getRepoDom();
 
@@ -148,6 +150,7 @@ export function closeTerminal(): void {
   dom.terminalPage.classList.add("hidden");
   dom.routingMain.classList.remove("hidden");
   syncRepoTabs();
+  navigate({ mode: "routing", sub: null, resource: null });
 }
 
 export function wireTerminalEvents(): void {

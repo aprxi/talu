@@ -1,5 +1,6 @@
 import type { Conversation } from "../types.ts";
 import { el, isPinned, getTags, PIN_SVG, FORK_SVG, relativeTime } from "./helpers.ts";
+import { serializeRoute } from "../kernel/system/router.ts";
 
 export function renderSidebarItem(
   session: Conversation,
@@ -14,7 +15,11 @@ export function renderSidebarItem(
   if (isForked) cls += " forked";
   if (isGenerating) cls += " generating";
 
-  const item = el("div", cls);
+  const item = document.createElement("a");
+  item.className = cls;
+  item.href = session.id.startsWith("__pending_")
+    ? "#/chat"
+    : serializeRoute({ mode: "chat", sub: session.id, resource: null });
   item.dataset["id"] = session.id;
 
   const content = el("div", "sidebar-item-content");

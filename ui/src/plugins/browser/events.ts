@@ -84,7 +84,6 @@ export function wireEvents(): void {
         handleCardRestore(id);
       } else {
         pluginEvents.emit("sessions.selected", { sessionId: id });
-        mode.switch("chat");
         chatService.selectChat(id);
       }
       return;

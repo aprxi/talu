@@ -50,16 +50,18 @@ export function setupSidebarEvents(): void {
   dom.sidebarList.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
 
-    // Pin/unpin button
+    // Pin/unpin button (prevent anchor navigation)
     const pinBtn = target.closest<HTMLElement>("[data-pin]");
     if (pinBtn?.dataset["pin"]) {
+      e.preventDefault();
       handleTogglePin(pinBtn.dataset["pin"]);
       return;
     }
 
-    // Click on sidebar item → open chat
-    const item = target.closest<HTMLElement>(".sidebar-item");
+    // Click on sidebar item → SPA navigate (prevent default anchor behavior)
+    const item = target.closest<HTMLAnchorElement>("a.sidebar-item");
     if (item?.dataset["id"]) {
+      e.preventDefault();
       selectChat(item.dataset["id"]);
     }
   });

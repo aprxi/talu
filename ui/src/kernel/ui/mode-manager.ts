@@ -1,17 +1,16 @@
 /**
  * Mode Manager — kernel-owned mode switching for the activity bar.
  *
- * Owns the active mode state, activity bar button handling, provenance
- * updates, and persistence via localStorage.
+ * Owns the active mode state, activity bar button handling, and provenance
+ * updates. The URL hash is the single source of truth for the active mode.
  * Emits "mode.changed" on the kernel EventBus for plugin coordination.
  */
 
 import type { Disposable } from "../types.ts";
 import type { EventBusImpl } from "../system/event-bus.ts";
 import { updateProvenance } from "./provenance.ts";
-import { getSetting, setSetting } from "../system/kv-settings.ts";
+import { getCurrentRoute, navigate, onRouteChange } from "../system/router.ts";
 
-const STORAGE_KEY = "talu-last-active-mode";
 const CHAT_GROUP_MODES = new Set(["chat", "conversations", "routing"]);
 
 export class ModeManager {
@@ -35,7 +34,7 @@ export class ModeManager {
     return this.active;
   }
 
-  switchMode(mode: string): void {
+  switchMode(mode: string, opts?: { fromRoute?: boolean }): void {
     if (this.active === mode) return;
     const from = this.active;
     this.active = mode;
@@ -81,26 +80,31 @@ export class ModeManager {
       updateProvenance(info.label, info.pluginId, true);
     }
 
-    // Persist to KV (primary, fire-and-forget) and localStorage (sync cache).
-    void setSetting(STORAGE_KEY, mode);
-    try {
-      localStorage.setItem(STORAGE_KEY, mode);
-    } catch { /* storage full or disabled */ }
+    // Update URL hash unless this switch was triggered by a route change.
+    if (!opts?.fromRoute) {
+      navigate({ mode, sub: null, resource: null });
+    }
 
     // Notify plugins.
     this.eventBus.emit("mode.changed", { from, to: mode });
   }
 
-  /** Restore the last active mode from KV (falls back to localStorage). */
-  async restoreLastMode(): Promise<void> {
-    try {
-      const saved = await getSetting(STORAGE_KEY);
-      if (saved && this.modes.has(saved) && saved !== this.active) {
-        this.switchMode(saved);
-      }
-    } catch {
-      // KV/storage disabled — stay on default mode (chat).
+  /** Initialize mode from the current URL hash. Call after plugins have registered. */
+  initFromRoute(): Disposable {
+    // Read the current hash and switch to the matching mode.
+    const route = getCurrentRoute();
+    const mode = this.modes.has(route.mode) ? route.mode : "chat";
+    if (mode !== this.active) {
+      this.switchMode(mode, { fromRoute: true });
     }
+
+    // Subscribe to future route changes for Back/Forward navigation.
+    return onRouteChange((route) => {
+      const newMode = this.modes.has(route.mode) ? route.mode : "chat";
+      if (newMode !== this.active) {
+        this.switchMode(newMode, { fromRoute: true });
+      }
+    });
   }
 
   /** Install click handlers on activity bar buttons. Returns a Disposable for cleanup. */
@@ -156,7 +160,7 @@ export class ModeManager {
         return;
       }
 
-      // Tab-switching buttons (files, models).
+      // Tab-switching buttons (files, settings).
       const tab = btn.getAttribute("data-nav-tab");
       if (tab) {
         const group = btn.closest<HTMLElement>(".subnav-group");

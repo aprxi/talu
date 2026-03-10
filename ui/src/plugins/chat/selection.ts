@@ -10,6 +10,7 @@ import { hideChatPanel } from "./panel-readonly.ts";
 import { handleTitleRename } from "./sidebar-actions.ts";
 import { renderSidebar } from "./sidebar-list.ts";
 import { appendGeneratingIndicator } from "./messages.ts";
+import { navigate } from "../../kernel/system/router.ts";
 import type { Conversation } from "../../types.ts";
 
 export async function selectChat(id: string): Promise<void> {
@@ -33,6 +34,12 @@ export async function selectChat(id: string): Promise<void> {
   chatState.activeSessionId = id;
   chatState.lastResponseId = null;
   setInputEnabled(true);
+
+  // Update URL hash (skip transient pending IDs).
+  if (!id.startsWith("__pending_")) {
+    navigate({ mode: "chat", sub: id, resource: null });
+  }
+
   renderSidebar();
 
   hideWelcome();
@@ -63,6 +70,7 @@ export async function selectChat(id: string): Promise<void> {
       renderEmptyState(result.error ?? "Failed to load conversation"),
     );
     notifications.error(result.error ?? "Failed to load conversation");
+    navigate({ mode: "chat", sub: null, resource: null }, { replace: true });
     return;
   }
 

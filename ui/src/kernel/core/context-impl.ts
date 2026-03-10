@@ -288,7 +288,7 @@ export function createPluginContext(
     timers,
     dialogs: new StandardDialogsImpl(manifest.name),
     notifications: new NotificationsImpl(),
-    router: new HashRouterImpl(pluginId),
+    router: new HashRouterImpl(),
     assets: createAssetResolver(pluginId),
     configuration: config,
     status: new PluginStatusImpl(pluginId),

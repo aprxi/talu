@@ -12,6 +12,7 @@ import { buildFilesDOM } from "./build-dom.ts";
 import { renderFilesTable, renderStats, renderPreview, syncFilesTabs } from "./render.ts";
 import { refreshFiles } from "./data.ts";
 import { wireFileEvents } from "./events.ts";
+import { navigate, onRouteChange } from "../../kernel/system/router.ts";
 
 function initFilesView(): void {
   // If already loading, let the in-flight request finish; just re-render.
@@ -75,7 +76,21 @@ export const filesPlugin: PluginDefinition = {
       fState.selectedFileId = null;
       syncFilesTabs();
       refreshFiles();
+      navigate({ mode: "files", sub: tab === "all" ? null : tab, resource: null }, { replace: true });
     });
+
+    // Route-driven tab switching (Back/Forward + deep links).
+    ctx.subscriptions.add(onRouteChange((route) => {
+      if (route.mode !== "files") return;
+      const tab = route.sub === "archived" ? "archived" : "all";
+      if (tab !== fState.tab) {
+        fState.tab = tab;
+        fState.selectedIds.clear();
+        fState.selectedFileId = null;
+        syncFilesTabs();
+        refreshFiles();
+      }
+    }));
 
     ctx.log.info("Files plugin ready.");
   },
