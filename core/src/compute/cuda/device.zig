@@ -428,6 +428,9 @@ pub const Buffer = struct {
         if (data.len == 0) return;
 
         try device.makeCurrent();
+        if (device.launch_stream) |stream| {
+            try device.synchronizeStream(stream);
+        }
         if (device.api.cu_memcpy_dtoh(@ptrCast(data.ptr), self.pointer, data.len) != cuda_success) {
             return error.CudaCopyFailed;
         }

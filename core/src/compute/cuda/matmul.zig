@@ -9,9 +9,12 @@ const device_mod = @import("device.zig");
 const cublas_status_success: c_int = 0;
 const cublas_status_alloc_failed: c_int = 3;
 const cublas_op_n: c_int = 0;
+const cublas_pedantic_math: c_int = 2;
 
 const CublasCreateFn = *const fn (*?*anyopaque) callconv(.c) c_int;
 const CublasDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CublasSetMathModeFn = *const fn (?*anyopaque, c_int) callconv(.c) c_int;
+const CublasSetStreamFn = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int;
 const CublasSgemmFn = *const fn (
     ?*anyopaque,
     c_int,
@@ -32,6 +35,8 @@ const CublasSgemmFn = *const fn (
 const CublasApi = struct {
     cublas_create: CublasCreateFn,
     cublas_destroy: CublasDestroyFn,
+    cublas_set_math_mode: CublasSetMathModeFn,
+    cublas_set_stream: CublasSetStreamFn,
     cublas_sgemm: CublasSgemmFn,
 };
 
@@ -52,6 +57,10 @@ pub const Blas = struct {
         const create_status = api.cublas_create(&handle);
         if (create_status == cublas_status_alloc_failed) return error.OutOfMemory;
         if (create_status != cublas_status_success or handle == null) return error.CublasCreateFailed;
+        if (api.cublas_set_math_mode(handle, cublas_pedantic_math) != cublas_status_success) {
+            _ = api.cublas_destroy(handle);
+            return error.CublasMathModeFailed;
+        }
 
         return .{
             .lib = lib,
@@ -88,6 +97,9 @@ pub const Blas = struct {
         if (c.size < m * n * @sizeOf(f32)) return error.InvalidArgument;
 
         try device.makeCurrent();
+        if (self.api.cublas_set_stream(self.handle, device.getLaunchStream()) != cublas_status_success) {
+            return error.CublasStreamSetFailed;
+        }
 
         // cuBLAS is column-major. For row-major C=A@B, compute C^T=B^T@A^T by
         // swapping operands and dimensions in the column-major GEMM call.
@@ -139,10 +151,19 @@ fn lookupRequired(comptime T: type, lib: *std.DynLib, symbol: [:0]const u8) !T {
     return lib.lookup(T, symbol) orelse error.CublasSymbolMissing;
 }
 
+fn lookupRequiredAny(comptime T: type, lib: *std.DynLib, symbols: []const [:0]const u8) !T {
+    for (symbols) |symbol| {
+        if (lib.lookup(T, symbol)) |fn_ptr| return fn_ptr;
+    }
+    return error.CublasSymbolMissing;
+}
+
 fn loadCublasApi(lib: *std.DynLib) !CublasApi {
     return .{
         .cublas_create = try lookupRequired(CublasCreateFn, lib, "cublasCreate_v2"),
         .cublas_destroy = try lookupRequired(CublasDestroyFn, lib, "cublasDestroy_v2"),
+        .cublas_set_math_mode = try lookupRequiredAny(CublasSetMathModeFn, lib, &.{ "cublasSetMathMode_v2", "cublasSetMathMode" }),
+        .cublas_set_stream = try lookupRequiredAny(CublasSetStreamFn, lib, &.{ "cublasSetStream_v2", "cublasSetStream" }),
         .cublas_sgemm = try lookupRequired(CublasSgemmFn, lib, "cublasSgemm_v2"),
     };
 }
