@@ -94,8 +94,41 @@ pub const VerifyCapture = struct {
         self.capture.deinit();
     }
 
+    fn isTranscriptTokenSelect(emission: TraceEmission) bool {
+        return emission.point == .token_select and
+            emission.tensor.dtype == .u32 and
+            emission.tensor.elementCount() == 1;
+    }
+
     /// Handle a trace emission
     pub fn handleEmission(self: *VerifyCapture, emission: TraceEmission) void {
+        const is_token_select = emission.point == .token_select;
+        const is_transcript_token_select = isTranscriptTokenSelect(emission);
+
+        // token_select is a control signal: update transcript/token index from
+        // scalar u32 events only, then skip stats comparison for this point.
+        switch (self.mode) {
+            .record => {
+                if (self.recorder) |rec| {
+                    if (is_transcript_token_select) {
+                        const token_id_ptr: *const u32 = @ptrCast(@alignCast(emission.tensor.ptr));
+                        rec.recordToken(token_id_ptr.*) catch |err| {
+                            std.log.err("Failed to record generated token transcript: {}", .{err});
+                        };
+                        rec.nextToken();
+                    }
+                }
+            },
+            .verify => {
+                if (self.verifier) |ver| {
+                    if (is_transcript_token_select) {
+                        ver.nextToken();
+                    }
+                }
+            },
+        }
+        if (is_token_select) return;
+
         // For non-CPU backends, we need to handle device memory
         const can_compute_stats = emission.backend == .cpu;
 
@@ -115,16 +148,6 @@ pub const VerifyCapture = struct {
                     rec.recordEmission(emission, tensor_stats) catch |err| {
                         std.log.err("Failed to record emission: {}", .{err});
                     };
-                    // Auto-track token generation via token_select
-                    if (emission.point == .token_select) {
-                        if (emission.tensor.dtype == .u32 and emission.tensor.elementCount() == 1) {
-                            const token_id_ptr: *const u32 = @ptrCast(@alignCast(emission.tensor.ptr));
-                            rec.recordToken(token_id_ptr.*) catch |err| {
-                                std.log.err("Failed to record generated token transcript: {}", .{err});
-                            };
-                        }
-                        rec.nextToken();
-                    }
                 }
             },
             .verify => {
@@ -147,10 +170,6 @@ pub const VerifyCapture = struct {
                             }
                         }
                     };
-                    // Auto-advance verifier on token_select
-                    if (emission.point == .token_select) {
-                        ver.nextToken();
-                    }
                 }
             },
         }
@@ -174,10 +193,7 @@ pub const VerifyCapture = struct {
 
         // Build filename
         var filename_buf: [256]u8 = undefined;
-        const filename = try std.fmt.bufPrint(&filename_buf,
-            "divergence_token{d}_layer{d}_{s}.npz",
-            .{ divergence.token_idx, divergence.layer, divergence.point.name() }
-        );
+        const filename = try std.fmt.bufPrint(&filename_buf, "divergence_token{d}_layer{d}_{s}.npz", .{ divergence.token_idx, divergence.layer, divergence.point.name() });
 
         const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ dump_dir, filename });
         defer self.allocator.free(full_path);
@@ -306,4 +322,118 @@ test "VerifyCapture verification mode detects divergence" {
     // Verifier should have detected divergence
     try std.testing.expect(verifier.has_diverged);
     try std.testing.expect(verifier.divergence_point != null);
+}
+
+test "VerifyCapture token_select u32 advances verifier and skips stats comparison" {
+    const allocator = std.testing.allocator;
+
+    const ref = reference_mod.ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{123},
+        .stats_records = &.{},
+        .allocator = allocator,
+    };
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
+    defer verify_cap.deinit();
+
+    const token_id: u32 = 123;
+    const emission = TraceEmission{
+        .point = .token_select,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 0,
+        .position = 14,
+        .backend = .metal,
+        .tensor = .{
+            .ptr = @ptrCast(std.mem.asBytes(&token_id).ptr),
+            .dtype = .u32,
+            .shape = .{ 1, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    verify_cap.handleEmission(emission);
+
+    try std.testing.expectEqual(@as(u32, 1), verifier.token_idx);
+    try std.testing.expect(!verifier.has_diverged);
+}
+
+test "VerifyCapture token_select f32 does not advance verifier" {
+    const allocator = std.testing.allocator;
+
+    const ref = reference_mod.ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{123},
+        .stats_records = &.{},
+        .allocator = allocator,
+    };
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
+    defer verify_cap.deinit();
+
+    const token_id_f32 = [_]f32{123};
+    const emission = TraceEmission{
+        .point = .token_select,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 0,
+        .position = 14,
+        .backend = .cpu,
+        .tensor = .{
+            .ptr = @ptrCast(token_id_f32[0..].ptr),
+            .dtype = .f32,
+            .shape = .{ 1, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    verify_cap.handleEmission(emission);
+
+    try std.testing.expectEqual(@as(u32, 0), verifier.token_idx);
+    try std.testing.expect(!verifier.has_diverged);
+}
+
+test "VerifyCapture recording token_select u32 updates transcript without stats record" {
+    const allocator = std.testing.allocator;
+
+    var recorder = try ReferenceRecorder.init(allocator, "test_model", 42, 1.0, 10);
+    defer recorder.deinit();
+
+    var verify_cap = VerifyCapture.initRecording(allocator, &recorder);
+    defer verify_cap.deinit();
+
+    const token_id: u32 = 321;
+    const emission = TraceEmission{
+        .point = .token_select,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 0,
+        .position = 0,
+        .backend = .metal,
+        .tensor = .{
+            .ptr = @ptrCast(std.mem.asBytes(&token_id).ptr),
+            .dtype = .u32,
+            .shape = .{ 1, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    verify_cap.handleEmission(emission);
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.token_transcript.items.len);
+    try std.testing.expectEqual(@as(u32, 321), recorder.token_transcript.items[0]);
+    try std.testing.expectEqual(@as(u32, 1), recorder.current_token_idx);
+    try std.testing.expectEqual(@as(usize, 0), recorder.stats_records.items.len);
 }
