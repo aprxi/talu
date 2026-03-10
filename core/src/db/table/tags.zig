@@ -269,11 +269,16 @@ pub const TagAdapter = struct {
 
         var session_hash_value = session_hash;
         var tag_hash_value = tag_hash;
+        // The chat namespace policy may be persisted by the sessions adapter
+        // (dedup_column_id = 3). Mirror session hash into column 3 so generic
+        // writer validation passes for conversation-tag rows as well.
+        var dedup_compat_value = session_hash;
         var ts_value = added_at_ms;
 
         const columns = [_]ColumnValue{
             .{ .column_id = col_session_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&session_hash_value) },
             .{ .column_id = col_tag_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&tag_hash_value) },
+            .{ .column_id = col_group_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&dedup_compat_value) },
             .{ .column_id = col_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&ts_value) },
             .{ .column_id = col_payload, .shape = .VARBYTES, .phys_type = .BINARY, .encoding = .RAW, .dims = 0, .data = payload },
         };
@@ -292,11 +297,14 @@ pub const TagAdapter = struct {
 
         var session_hash_value = session_hash;
         var tag_hash_value = tag_hash;
+        // Keep column 3 populated for chat-policy dedup compatibility.
+        var dedup_compat_value = session_hash;
         var ts_value = removed_at_ms;
 
         const columns = [_]ColumnValue{
             .{ .column_id = col_session_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&session_hash_value) },
             .{ .column_id = col_tag_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&tag_hash_value) },
+            .{ .column_id = col_group_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&dedup_compat_value) },
             .{ .column_id = col_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&ts_value) },
             .{ .column_id = col_payload, .shape = .VARBYTES, .phys_type = .BINARY, .encoding = .RAW, .dims = 0, .data = payload },
         };
