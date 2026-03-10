@@ -187,6 +187,14 @@ pub const ReferenceVerifier = struct {
     /// Divergence detection
     has_diverged: bool,
     divergence_point: ?DivergenceInfo,
+    last_observed: ?ObservedPoint,
+
+    const ObservedPoint = struct {
+        token_idx: u32,
+        layer: u16,
+        point: TracePoint,
+        position: u32,
+    };
 
     pub const DivergenceInfo = struct {
         token_idx: u32,
@@ -211,11 +219,31 @@ pub const ReferenceVerifier = struct {
             .expected_record_idx = 0,
             .has_diverged = false,
             .divergence_point = null,
+            .last_observed = null,
         };
     }
 
     pub fn deinit(self: *ReferenceVerifier) void {
         _ = self;
+    }
+
+    fn shouldUpdateLastObserved(self: *const ReferenceVerifier, emission: trace.TraceEmission) bool {
+        if (self.expected_record_idx >= self.reference.stats_records.len) return true;
+        const expected = self.reference.stats_records[self.expected_record_idx];
+        if (self.token_idx < expected.token_idx) return true;
+        if (self.token_idx > expected.token_idx) return false;
+
+        if (expected.layer != trace.TraceEmission.NO_LAYER) {
+            if (emission.layer == trace.TraceEmission.NO_LAYER) return false;
+            if (emission.layer < expected.layer) return true;
+            if (emission.layer > expected.layer) return false;
+        }
+
+        const emission_point_ord = @intFromEnum(emission.point);
+        const expected_point_ord = @intFromEnum(expected.point);
+        if (emission_point_ord < expected_point_ord) return true;
+        if (emission_point_ord > expected_point_ord) return false;
+        return emission.position <= expected.position;
     }
 
     fn tokenOnlyVerificationEnabled() bool {
@@ -295,6 +323,15 @@ pub const ReferenceVerifier = struct {
         // Skip if already diverged
         if (self.has_diverged) return;
 
+        if (self.shouldUpdateLastObserved(emission)) {
+            self.last_observed = .{
+                .token_idx = self.token_idx,
+                .layer = emission.layer,
+                .point = emission.point,
+                .position = emission.position,
+            };
+        }
+
         if (self.expected_record_idx >= self.reference.stats_records.len) return;
 
         const golden = &self.reference.stats_records[self.expected_record_idx];
@@ -343,9 +380,46 @@ pub const ReferenceVerifier = struct {
         const missing = self.reference.stats_records[self.expected_record_idx];
         self.has_diverged = true;
         var msg_buf: [256]u8 = undefined;
-        const msg = try std.fmt.bufPrint(
+        const msg = if (self.expected_record_idx > 0 and self.last_observed != null) blk: {
+            const matched = self.reference.stats_records[self.expected_record_idx - 1];
+            const observed = self.last_observed.?;
+            break :blk try std.fmt.bufPrint(
+                &msg_buf,
+                "Missing expected stats for token={d} layer={d} point={s} pos={d}; last matched token={d} layer={d} point={s} pos={d}; last observed token={d} layer={d} point={s} pos={d}",
+                .{
+                    missing.token_idx,
+                    missing.layer,
+                    missing.point.name(),
+                    missing.position,
+                    matched.token_idx,
+                    matched.layer,
+                    matched.point.name(),
+                    matched.position,
+                    observed.token_idx,
+                    observed.layer,
+                    observed.point.name(),
+                    observed.position,
+                },
+            );
+        } else if (self.last_observed != null) blk: {
+            const observed = self.last_observed.?;
+            break :blk try std.fmt.bufPrint(
+                &msg_buf,
+                "Missing expected stats for token={d} layer={d} point={s} pos={d}; last observed token={d} layer={d} point={s} pos={d}",
+                .{
+                    missing.token_idx,
+                    missing.layer,
+                    missing.point.name(),
+                    missing.position,
+                    observed.token_idx,
+                    observed.layer,
+                    observed.point.name(),
+                    observed.position,
+                },
+            );
+        } else try std.fmt.bufPrint(
             &msg_buf,
-            "Missing expected stats for token={d} layer={d} point={s} pos={d}",
+            "Missing expected stats for token={d} layer={d} point={s} pos={d}; no observed checkpoints",
             .{ missing.token_idx, missing.layer, missing.point.name(), missing.position },
         );
         self.divergence_point = .{
@@ -886,4 +960,191 @@ test "ReferenceVerifier ignores extra emissions but finish enforces completeness
     try std.testing.expectError(error.ReferenceMissing, result);
     try std.testing.expect(verifier.has_diverged);
     try std.testing.expect(verifier.divergence_point != null);
+    const div = verifier.divergence_point.?;
+    const msg_len = std.mem.indexOfScalar(u8, &div.message, 0) orelse div.message.len;
+    try std.testing.expect(std.mem.indexOf(u8, div.message[0..msg_len], "last observed token=0 layer=0 point=layer_ffn_norm pos=0") != null);
+}
+
+test "ReferenceVerifier finish reports last matched and last observed checkpoints" {
+    const allocator = std.testing.allocator;
+
+    const golden_stats = TensorStats{
+        .count = 4,
+        .min = 1.0,
+        .max = 4.0,
+        .sum = 10.0,
+        .sum_sq = 30.0,
+        .nan_count = 0,
+        .inf_count = 0,
+    };
+
+    const ref = ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{100},
+        .stats_records = &[_]StatsRecord{
+            .{
+                .token_idx = 0,
+                .layer = 0,
+                .point = .layer_attn_norm,
+                .position = 14,
+                .stats = golden_stats,
+            },
+            .{
+                .token_idx = 0,
+                .layer = 0,
+                .point = .layer_ffn_norm,
+                .position = 14,
+                .stats = golden_stats,
+            },
+        },
+        .allocator = allocator,
+    };
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    defer verifier.deinit();
+
+    const attn_emission = trace.TraceEmission{
+        .point = .layer_attn_norm,
+        .layer = 0,
+        .token = 0,
+        .position = 14,
+        .backend = .cuda,
+        .tensor = .{
+            .ptr = @ptrFromInt(0x1000),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+    const other_emission = trace.TraceEmission{
+        .point = .block_out,
+        .layer = 0,
+        .token = 0,
+        .position = 14,
+        .backend = .cuda,
+        .tensor = .{
+            .ptr = @ptrFromInt(0x1000),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    try verifier.checkEmission(attn_emission, golden_stats);
+    try verifier.checkEmission(other_emission, golden_stats);
+    const result = verifier.finish();
+    try std.testing.expectError(error.ReferenceMissing, result);
+    const div = verifier.divergence_point.?;
+    const msg_len = std.mem.indexOfScalar(u8, &div.message, 0) orelse div.message.len;
+    const msg = div.message[0..msg_len];
+    try std.testing.expect(std.mem.indexOf(u8, msg, "last matched token=0 layer=0 point=layer_attn_norm pos=14") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "last observed token=0 layer=0 point=block.out pos=14") != null);
+}
+
+test "ReferenceVerifier keeps last observed local to missing checkpoint window" {
+    const allocator = std.testing.allocator;
+
+    const golden_stats = TensorStats{
+        .count = 4,
+        .min = 1.0,
+        .max = 4.0,
+        .sum = 10.0,
+        .sum_sq = 30.0,
+        .nan_count = 0,
+        .inf_count = 0,
+    };
+
+    const ref = ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 2,
+        .token_transcript = &[_]u32{ 100, 200 },
+        .stats_records = &[_]StatsRecord{
+            .{
+                .token_idx = 0,
+                .layer = 0,
+                .point = .layer_attn_norm,
+                .position = 14,
+                .stats = golden_stats,
+            },
+            .{
+                .token_idx = 0,
+                .layer = 0,
+                .point = .layer_ffn_norm,
+                .position = 14,
+                .stats = golden_stats,
+            },
+        },
+        .allocator = allocator,
+    };
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    defer verifier.deinit();
+
+    const matched = trace.TraceEmission{
+        .point = .layer_attn_norm,
+        .layer = 0,
+        .token = 0,
+        .position = 14,
+        .backend = .cuda,
+        .tensor = .{
+            .ptr = @ptrFromInt(0x1000),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+    const local_observed = trace.TraceEmission{
+        .point = .block_out,
+        .layer = 0,
+        .token = 0,
+        .position = 14,
+        .backend = .cuda,
+        .tensor = .{
+            .ptr = @ptrFromInt(0x1000),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+    const later_token = trace.TraceEmission{
+        .point = .logits_ready,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 1,
+        .position = 2,
+        .backend = .cuda,
+        .tensor = .{
+            .ptr = @ptrFromInt(0x1000),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    try verifier.checkEmission(matched, golden_stats);
+    try verifier.checkEmission(local_observed, golden_stats);
+    verifier.nextToken();
+    try verifier.checkEmission(later_token, golden_stats);
+
+    const result = verifier.finish();
+    try std.testing.expectError(error.ReferenceMissing, result);
+    const div = verifier.divergence_point.?;
+    const msg_len = std.mem.indexOfScalar(u8, &div.message, 0) orelse div.message.len;
+    const msg = div.message[0..msg_len];
+    try std.testing.expect(std.mem.indexOf(u8, msg, "last observed token=0 layer=0 point=block.out pos=14") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "token=1 layer=65535 point=logits_ready") == null);
 }
