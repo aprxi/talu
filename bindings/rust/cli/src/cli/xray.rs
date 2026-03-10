@@ -1093,65 +1093,93 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
     // Load reference
     let reference = ReferenceDataHandle::load(ref_path)?;
 
-    // Create verifier
-    let verifier = ReferenceVerifierHandle::new(&reference, tolerance)?;
-
-    // Create verify capture in verification mode
-    let verify_cap = VerifyCaptureHandle::new_verification(&verifier, Some("/tmp/panic_dumps"))?;
-
     // Create backend and chat
     let backend = create_backend_for_model(model, None)?;
-    let chat = ChatHandle::new(None)?;
-
-    // Enable capture AFTER backend initialization to skip warmup passes
-    verify_cap.enable();
-
-    // Enable teacher forcing
-    TeacherForcing::enable_with_verifier(&verifier);
-
-    let content = vec![talu::router::ContentPart::Text(prompt_text)];
+    let content = vec![talu::router::ContentPart::Text(prompt_text.clone())];
 
     // Use same config as recording
     let cfg = talu::router::GenerateConfig {
-        temperature: 1.0, // Will be overridden by teacher forcing
+        temperature: 1.0,
         max_tokens: args.tokens as usize,
         seed: args.seed,
         ..Default::default()
     };
 
-    println!("Verifying {} tokens with teacher forcing...", args.tokens);
-    let result = talu::router::generate(&chat, &content, &backend, &cfg);
+    let run_pass = |teacher_forcing: bool| -> Result<(bool, Option<String>)> {
+        let verifier = ReferenceVerifierHandle::new(&reference, tolerance)?;
+        let verify_cap =
+            VerifyCaptureHandle::new_verification(&verifier, Some("/tmp/panic_dumps"))?;
+        let chat = ChatHandle::new(None)?;
 
-    TeacherForcing::disable();
-    VerifyCaptureHandle::disable();
-
-    let result = result?;
-    if result.error_code() != 0 {
-        let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
-        return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
-    }
-
-    if let Err(err) = verifier.finish() {
-        if verifier.has_diverged() {
-            println!("✗ Verification FAILED: Divergence detected");
-            println!("  {}", err);
-            println!("  Check panic dumps in /tmp/panic_dumps/");
-            return Err(anyhow!("Verification failed: {}", err));
+        verify_cap.enable();
+        if teacher_forcing {
+            TeacherForcing::enable_with_verifier(&verifier);
         }
-        return Err(err.into());
+
+        let result = talu::router::generate(&chat, &content, &backend, &cfg);
+
+        if teacher_forcing {
+            TeacherForcing::disable();
+        }
+        VerifyCaptureHandle::disable();
+
+        let result = result?;
+        if result.error_code() != 0 {
+            let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
+            return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
+        }
+
+        match verifier.finish() {
+            Ok(()) => {
+                if verifier.has_diverged() {
+                    Ok((true, None))
+                } else {
+                    Ok((false, None))
+                }
+            }
+            Err(err) => {
+                if verifier.has_diverged() {
+                    Ok((true, Some(err.to_string())))
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
+    };
+
+    println!(
+        "Phase 1/2: Free-run token parity (no teacher forcing), {} tokens...",
+        args.tokens
+    );
+    let (phase1_diverged, phase1_msg) = run_pass(false)?;
+    if !phase1_diverged {
+        println!("✓ Verification PASSED: Free-run token transcript matches reference");
+        return Ok(());
     }
 
-    // Check if verification detected divergence
-    if verifier.has_diverged() {
+    println!("✗ Phase 1 FAILED: free-run divergence detected");
+    if let Some(msg) = phase1_msg {
+        println!("  {}", msg);
+    }
+
+    println!("Phase 2/2: Teacher-forced numeric localization on final-path checkpoints...");
+    let (phase2_diverged, phase2_msg) = run_pass(true)?;
+
+    if phase2_diverged {
         println!("✗ Verification FAILED: Divergence detected");
+        if let Some(msg) = phase2_msg {
+            println!("  {}", msg);
+        }
         println!("  Check panic dumps in /tmp/panic_dumps/");
         return Err(anyhow!(
-            "Verification failed: numerical divergence detected"
+            "Verification failed: free-run token mismatch with teacher-forced numerical divergence"
         ));
     }
 
-    println!("✓ Verification PASSED: No divergence detected");
-    Ok(())
+    println!("✗ Verification FAILED: Free-run token mismatch detected");
+    println!("  Teacher-forced numeric pass matched selected checkpoints.");
+    println!("  This suggests divergence is in sampling/selection path beyond current numeric checkpoints.");
+    Err(anyhow!("Verification failed: free-run token mismatch"))
 }
 
 pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {

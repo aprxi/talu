@@ -230,6 +230,54 @@ pub const ReferenceVerifier = struct {
         self.token_idx += 1;
     }
 
+    /// Check that a sampled token matches the reference transcript at current index.
+    pub fn checkToken(self: *ReferenceVerifier, actual_token_id: u32) !void {
+        if (self.has_diverged) return;
+
+        if (self.token_idx >= self.reference.token_transcript.len) {
+            self.has_diverged = true;
+            var msg_buf: [256]u8 = undefined;
+            const msg = try std.fmt.bufPrint(
+                &msg_buf,
+                "Extra generated token at token={d}: actual={d}, no reference token available",
+                .{ self.token_idx, actual_token_id },
+            );
+            self.divergence_point = .{
+                .token_idx = self.token_idx,
+                .layer = trace.TraceEmission.NO_LAYER,
+                .point = .token_select,
+                .position = self.token_idx,
+                .expected = TensorStats.EMPTY,
+                .actual = TensorStats.EMPTY,
+                .message = std.mem.zeroes([256]u8),
+            };
+            @memcpy(self.divergence_point.?.message[0..msg.len], msg);
+            return error.TokenDivergence;
+        }
+
+        const expected_token_id = self.reference.token_transcript[self.token_idx];
+        if (expected_token_id == actual_token_id) return;
+
+        self.has_diverged = true;
+        var msg_buf: [256]u8 = undefined;
+        const msg = try std.fmt.bufPrint(
+            &msg_buf,
+            "Token divergence at token={d}: expected={d} actual={d}",
+            .{ self.token_idx, expected_token_id, actual_token_id },
+        );
+        self.divergence_point = .{
+            .token_idx = self.token_idx,
+            .layer = trace.TraceEmission.NO_LAYER,
+            .point = .token_select,
+            .position = self.token_idx,
+            .expected = TensorStats.EMPTY,
+            .actual = TensorStats.EMPTY,
+            .message = std.mem.zeroes([256]u8),
+        };
+        @memcpy(self.divergence_point.?.message[0..msg.len], msg);
+        return error.TokenDivergence;
+    }
+
     /// Check stats from an emission against reference
     pub fn checkEmission(
         self: *ReferenceVerifier,
@@ -275,7 +323,12 @@ pub const ReferenceVerifier = struct {
     }
 
     pub fn finish(self: *ReferenceVerifier) !void {
-        if (self.has_diverged) return;
+        if (self.has_diverged) {
+            if (self.divergence_point) |div| {
+                if (div.point == .token_select) return error.TokenDivergence;
+            }
+            return error.StatsDivergence;
+        }
         if (self.expected_record_idx >= self.reference.stats_records.len) return;
 
         const missing = self.reference.stats_records[self.expected_record_idx];
@@ -696,6 +749,31 @@ test "ReferenceVerifier detects divergence" {
     try std.testing.expectError(error.StatsDivergence, result);
     try std.testing.expect(verifier.has_diverged);
     try std.testing.expect(verifier.divergence_point != null);
+}
+
+test "ReferenceVerifier detects token divergence" {
+    const allocator = std.testing.allocator;
+
+    const ref = ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 2,
+        .token_transcript = &[_]u32{ 100, 200 },
+        .stats_records = &.{},
+        .allocator = allocator,
+    };
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+
+    try verifier.checkToken(100);
+    verifier.nextToken();
+
+    const result = verifier.checkToken(201);
+    try std.testing.expectError(error.TokenDivergence, result);
+    try std.testing.expect(verifier.has_diverged);
+    try std.testing.expect(verifier.divergence_point != null);
+    try std.testing.expectError(error.TokenDivergence, verifier.finish());
 }
 
 test "ReferenceVerifier ignores extra emissions but finish enforces completeness" {

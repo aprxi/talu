@@ -132,6 +132,15 @@ pub const VerifyCapture = struct {
             .verify => {
                 if (self.verifier) |ver| {
                     if (is_transcript_token_select) {
+                        const token_id_ptr: *const u32 = @ptrCast(@alignCast(emission.tensor.ptr));
+                        ver.checkToken(token_id_ptr.*) catch |err| {
+                            std.log.err("DIVERGENCE DETECTED: {}", .{err});
+                            if (ver.divergence_point) |div| {
+                                const msg_len = std.mem.indexOfScalar(u8, &div.message, 0) orelse div.message.len;
+                                std.log.err("{s}", .{div.message[0..msg_len]});
+                            }
+                            return;
+                        };
                         ver.nextToken();
                     }
                 }
