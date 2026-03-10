@@ -241,10 +241,27 @@ pub const TransformerBlock = struct {
         return seq_len - 1;
     }
 
-    fn tracePosition(state: *const LayerProgramExecutionContext, seq_len: u32) u32 {
-        const seq_tail = if (seq_len > 0) seq_len - 1 else 0;
-        const pos = state.pos_offset + seq_tail;
-        return @intCast(@min(pos, std.math.maxInt(u32)));
+    fn saturatingU32(value: usize) u32 {
+        return @intCast(@min(value, std.math.maxInt(u32)));
+    }
+
+    fn tracePositionForPoint(point: trace.TracePoint, pos_offset: usize, seq_len: u32) u32 {
+        if (seq_len == 0) return 0;
+        return switch (point) {
+            // Match CPU attention decode traces:
+            // - q/k/v/embed_pos use cache position before qk/softmax update.
+            .attn_q, .attn_k, .attn_v, .embed_pos => if (seq_len == 1)
+                saturatingU32(pos_offset)
+            else
+                seq_len,
+            // - qk/weights/attn_out use cache position after appending decode token.
+            .attn_qk, .attn_weights, .attn_out => if (seq_len == 1)
+                saturatingU32(pos_offset + 1)
+            else
+                seq_len,
+            // Norm/FFN/residual-style points use sequence length in CPU traces.
+            else => seq_len,
+        };
     }
 
     fn emitLayerProgramTracePoint(
@@ -261,7 +278,7 @@ pub const TransformerBlock = struct {
             point,
             @intCast(state.layer_idx),
             traceTokenIndex(seq_len),
-            tracePosition(state, seq_len),
+            tracePositionForPoint(point, state.pos_offset, seq_len),
             @ptrCast(marker[0..].ptr),
             .f32,
             shape,
@@ -2482,4 +2499,21 @@ test "layer program contract rejects stateful opcode bound to wrong block kind" 
         .state_mismatch => |mismatch| try std.testing.expectEqual(opcode_map.Opcode.shortconv, mismatch.opcode),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "tracePositionForPoint prefill uses sequence length across points" {
+    const seq_len: u32 = 14;
+    const pos_offset: usize = 0;
+    try std.testing.expectEqual(@as(u32, 14), TransformerBlock.tracePositionForPoint(.layer_attn_norm, pos_offset, seq_len));
+    try std.testing.expectEqual(@as(u32, 14), TransformerBlock.tracePositionForPoint(.attn_q, pos_offset, seq_len));
+    try std.testing.expectEqual(@as(u32, 14), TransformerBlock.tracePositionForPoint(.attn_out, pos_offset, seq_len));
+}
+
+test "tracePositionForPoint decode matches CPU trace semantics" {
+    const seq_len: u32 = 1;
+    const pos_offset: usize = 14;
+    try std.testing.expectEqual(@as(u32, 1), TransformerBlock.tracePositionForPoint(.layer_attn_norm, pos_offset, seq_len));
+    try std.testing.expectEqual(@as(u32, 14), TransformerBlock.tracePositionForPoint(.attn_q, pos_offset, seq_len));
+    try std.testing.expectEqual(@as(u32, 15), TransformerBlock.tracePositionForPoint(.attn_out, pos_offset, seq_len));
+    try std.testing.expectEqual(@as(u32, 1), TransformerBlock.tracePositionForPoint(.ffn_down, pos_offset, seq_len));
 }

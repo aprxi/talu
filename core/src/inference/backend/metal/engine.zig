@@ -729,6 +729,8 @@ pub const MetalBackend = struct {
         candidate_logits_out: []f32,
         candidate_ids_out: []u32,
     ) !usize {
+        const prev_backend = trace.setBackendContext(.metal);
+        defer _ = trace.setBackendContext(prev_backend);
         if (top_k == 0) return error.InvalidArgument;
         if (candidate_logits_out.len < top_k or candidate_ids_out.len < top_k) return error.InvalidArgument;
 
