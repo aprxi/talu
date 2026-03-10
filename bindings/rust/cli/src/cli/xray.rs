@@ -1090,9 +1090,6 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
     println!("  Tolerance: {}", tolerance);
     println!("  Prompt: \"{}\"", prompt_text);
 
-    // Load reference
-    let reference = ReferenceDataHandle::load(ref_path)?;
-
     // Use same config as recording
     let cfg = talu::router::GenerateConfig {
         temperature: 1.0,
@@ -1101,7 +1098,10 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         ..Default::default()
     };
 
-    let run_pass = |teacher_forcing: bool, parity_debug: bool| -> Result<(bool, Option<String>)> {
+    let run_pass = |teacher_forcing: bool,
+                    parity_debug: bool,
+                    reference_path: &str|
+     -> Result<(bool, Option<String>)> {
         let prev_parity_debug = std::env::var_os("TALU_PARITY_DEBUG");
         let prev_parity_quiet = std::env::var_os("TALU_PARITY_QUIET");
         let prev_ignore_token_parity = std::env::var_os("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY");
@@ -1128,6 +1128,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         }
 
         let run_result = (|| -> Result<(bool, Option<String>)> {
+            let reference = ReferenceDataHandle::load(reference_path)?;
             let verifier = ReferenceVerifierHandle::new(&reference, tolerance)?;
             let verify_cap =
                 VerifyCaptureHandle::new_verification(&verifier, Some("/tmp/panic_dumps"))?;
@@ -1235,19 +1236,53 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         "Phase 1/2: Free-run token parity (no teacher forcing), {} tokens...",
         args.tokens
     );
-    let (phase1_diverged, phase1_msg) = run_pass(false, false)?;
+    let (phase1_diverged, phase1_msg) = run_pass(false, false, ref_path)?;
     if !phase1_diverged {
         println!("✓ Verification PASSED: Free-run token transcript matches reference");
         return Ok(());
     }
 
     println!("✗ Phase 1 FAILED: free-run divergence detected");
-    if let Some(msg) = phase1_msg {
+    if let Some(msg) = phase1_msg.as_deref() {
         println!("  {}", msg);
     }
 
+    let phase2_divergence_token = phase1_msg.as_deref().and_then(parse_token_divergence_index);
+    let mut phase2_temp_ref_path: Option<std::path::PathBuf> = None;
+    let phase2_ref_path = if let Some(token_idx) = phase2_divergence_token {
+        if token_idx > 0 {
+            let reference_json = std::fs::read_to_string(ref_path)?;
+            let filtered_reference_json =
+                filter_reference_stats_from_token(&reference_json, token_idx)?;
+            let temp_path = std::env::temp_dir().join(format!(
+                "talu_xray_verify_focus_{}_{}.json",
+                std::process::id(),
+                token_idx
+            ));
+            std::fs::write(&temp_path, filtered_reference_json)?;
+            phase2_temp_ref_path = Some(temp_path);
+            phase2_temp_ref_path
+                .as_ref()
+                .and_then(|path| path.to_str())
+                .ok_or_else(|| anyhow!("failed to build temporary phase-2 reference path"))?
+        } else {
+            ref_path
+        }
+    } else {
+        ref_path
+    };
+
     println!("Phase 2/2: Teacher-forced numeric localization on layer+final checkpoints (TALU_PARITY_DEBUG=1)...");
-    let (phase2_diverged, phase2_msg) = run_pass(true, true)?;
+    if let Some(token_idx) = phase2_divergence_token {
+        println!(
+            "  Focusing numeric localization from token={} (phase-1 divergence point)",
+            token_idx
+        );
+    }
+    let (phase2_diverged, phase2_msg) = run_pass(true, true, phase2_ref_path)?;
+    if let Some(path) = phase2_temp_ref_path {
+        let _ = std::fs::remove_file(path);
+    }
 
     if phase2_diverged {
         println!("✗ Verification FAILED: Divergence detected");
@@ -1268,6 +1303,88 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
     println!("  Teacher-forced numeric pass matched selected checkpoints.");
     println!("  This suggests divergence is in sampling/selection path beyond current numeric checkpoints.");
     Err(anyhow!("Verification failed: free-run token mismatch"))
+}
+
+fn parse_token_divergence_index(msg: &str) -> Option<u32> {
+    let marker = "Token divergence at token=";
+    let start = msg.find(marker)? + marker.len();
+    let end = msg[start..]
+        .find(|ch: char| !ch.is_ascii_digit())
+        .map(|offset| start + offset)
+        .unwrap_or(msg.len());
+    msg[start..end].parse::<u32>().ok()
+}
+
+fn filter_reference_stats_from_token(reference_json: &str, start_token: u32) -> Result<String> {
+    if start_token == 0 {
+        return Ok(reference_json.to_string());
+    }
+
+    let mut parsed: serde_json::Value = serde_json::from_str(reference_json)?;
+    let stats = parsed
+        .get_mut("stats")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| anyhow!("reference JSON missing stats array"))?;
+
+    stats.retain(|record| {
+        record
+            .get("token_idx")
+            .and_then(serde_json::Value::as_u64)
+            .map(|token_idx| token_idx >= start_token as u64)
+            .unwrap_or(false)
+    });
+
+    Ok(serde_json::to_string(&parsed)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter_reference_stats_from_token, parse_token_divergence_index};
+
+    #[test]
+    fn parse_token_divergence_index_extracts_token() {
+        let msg = "Token divergence at token=17: expected=123 actual=456";
+        assert_eq!(parse_token_divergence_index(msg), Some(17));
+    }
+
+    #[test]
+    fn parse_token_divergence_index_ignores_other_messages() {
+        let msg = "Stats divergence at token=0 layer=0 point=layer_ffn_norm";
+        assert_eq!(parse_token_divergence_index(msg), None);
+    }
+
+    #[test]
+    fn filter_reference_stats_from_token_keeps_only_focused_stats() {
+        let input = r#"{
+            "metadata":{"model_name":"m","seed":42,"temperature":1.0,"max_tokens":4},
+            "tokens":[10,11,12,13],
+            "stats":[
+                {"token_idx":0,"layer":0,"point":"layer_ffn_norm","position":1,"stats":{"count":1,"min":0.0,"max":0.0,"sum":0.0,"sum_sq":0.0,"nan_count":0,"inf_count":0}},
+                {"token_idx":1,"layer":0,"point":"layer_ffn_norm","position":2,"stats":{"count":1,"min":0.0,"max":0.0,"sum":0.0,"sum_sq":0.0,"nan_count":0,"inf_count":0}},
+                {"token_idx":2,"layer":0,"point":"layer_ffn_norm","position":3,"stats":{"count":1,"min":0.0,"max":0.0,"sum":0.0,"sum_sq":0.0,"nan_count":0,"inf_count":0}}
+            ]
+        }"#;
+        let filtered = filter_reference_stats_from_token(input, 1).expect("filter should succeed");
+        let value: serde_json::Value =
+            serde_json::from_str(&filtered).expect("filtered output should be valid json");
+        let stats = value
+            .get("stats")
+            .and_then(serde_json::Value::as_array)
+            .expect("stats array should exist");
+        assert_eq!(stats.len(), 2);
+        assert_eq!(
+            stats[0]
+                .get("token_idx")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            stats[1]
+                .get("token_idx")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+    }
 }
 
 pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
