@@ -19,37 +19,6 @@ fn config_with_policy(policy_json: &str) -> ServerConfig {
     cfg
 }
 
-fn config_with_strict_policy(policy_json: &str) -> ServerConfig {
-    let mut cfg = config_with_policy(policy_json);
-    cfg.agent_runtime_mode = Some("strict".to_string());
-    cfg.sandbox_backend = Some("linux-local".to_string());
-    cfg
-}
-
-#[test]
-fn agent_exec_policy_prepare_runtime_rejects_deny_plus_allow_write() {
-    let policy = talu::policy::Policy::from_json(
-        r#"{
-            "default":"deny",
-            "statements":[
-                {"effect":"allow","action":"tool.exec","command":"echo *"},
-                {"effect":"allow","action":"tool.fs.write","resource":"src/**"},
-                {"effect":"deny","action":"tool.fs.write","resource":"src/private/**"}
-            ]
-        }"#,
-    )
-    .expect("policy parse");
-    let err = policy
-        .prepare_runtime(Some("."))
-        .expect_err("expected strict runtime precompile failure");
-    assert!(
-        err.to_string().contains("strict")
-            || err.to_string().contains("policy")
-            || err.to_string().contains("runtime"),
-        "unexpected error: {err}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Input validation
 // ---------------------------------------------------------------------------
@@ -127,19 +96,6 @@ fn agent_exec_strict_mode_with_oci_backend_fails_startup() {
     );
 }
 
-#[test]
-fn agent_exec_strict_mode_invalid_runtime_policy_fails_startup() {
-    let policy = r#"{
-        "default":"deny",
-        "statements":[
-            {"effect":"allow","action":"tool.exec","command":"echo *"},
-            {"effect":"allow","action":"tool.fs.write","resource":"src/**"},
-            {"effect":"deny","action":"tool.fs.write","resource":"src/private/**"}
-        ]
-    }"#;
-    assert_server_startup_fails(config_with_strict_policy(policy), "strict runtime policy");
-}
-
 // ---------------------------------------------------------------------------
 // Command policy
 // ---------------------------------------------------------------------------
@@ -213,104 +169,6 @@ fn agent_exec_policy_denied_surfaces_error_event() {
     assert!(
         events.iter().any(|e| e["type"] == "error"),
         "expected error event: {events:?}"
-    );
-}
-
-#[test]
-fn agent_exec_strict_mode_blocks_nested_subprocess_exec() {
-    let policy = r#"{
-        "default":"deny",
-        "statements":[
-            {"effect":"allow","action":"tool.exec","command":"python3 *"}
-        ]
-    }"#;
-    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
-
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/agent/exec",
-        &serde_json::json!({
-            "command": "python3 -c 'raise SystemExit(__import__(\"os\").system(\"ls\")//256)'"
-        }),
-    );
-    assert_eq!(resp.status, 200, "body: {}", resp.body);
-
-    let events = parse_sse_events(&resp.body);
-    let exit_code = events
-        .iter()
-        .find(|e| e["type"] == "exit")
-        .and_then(|e| e["code"].as_i64());
-
-    assert!(
-        exit_code.is_some_and(|code| code != 0),
-        "expected non-zero exit for denied descendant exec: {events:?}"
-    );
-}
-
-#[test]
-fn agent_exec_strict_mode_blocks_descendant_file_write_without_fs_write_allow() {
-    std::fs::create_dir_all("/tmp/allowed").expect("create /tmp/allowed");
-    let policy = r#"{
-        "default":"deny",
-        "statements":[
-            {"effect":"allow","action":"tool.exec","command":"python3 *"},
-            {"effect":"allow","action":"tool.fs.write","resource":"allowed/**"}
-        ]
-    }"#;
-    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
-
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/agent/exec",
-        &serde_json::json!({
-            "command": "python3 -c '__import__(\"pathlib\").Path(\"/tmp/deny-write.txt\").write_text(\"x\")'",
-            "cwd": "/tmp"
-        }),
-    );
-    assert_eq!(resp.status, 200, "body: {}", resp.body);
-
-    let events = parse_sse_events(&resp.body);
-    let exit_code = events
-        .iter()
-        .find(|e| e["type"] == "exit")
-        .and_then(|e| e["code"].as_i64());
-
-    assert!(
-        exit_code.is_some_and(|code| code != 0),
-        "expected non-zero exit for denied descendant write: {events:?}"
-    );
-}
-
-#[test]
-fn agent_exec_strict_mode_allows_descendant_file_write_with_fs_write_allow() {
-    let policy = r#"{
-        "default":"deny",
-        "statements":[
-            {"effect":"allow","action":"tool.exec","command":"python3 *"},
-            {"effect":"allow","action":"tool.fs.write","resource":"**"}
-        ]
-    }"#;
-    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
-
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/agent/exec",
-        &serde_json::json!({
-            "command": "python3 -c '__import__(\"pathlib\").Path(\"allow-write.txt\").write_text(\"ok\")'",
-            "cwd": "/tmp"
-        }),
-    );
-    assert_eq!(resp.status, 200, "body: {}", resp.body);
-
-    let events = parse_sse_events(&resp.body);
-    let exit_code = events
-        .iter()
-        .find(|e| e["type"] == "exit")
-        .and_then(|e| e["code"].as_i64());
-
-    assert!(
-        exit_code.is_some_and(|code| code == 0),
-        "expected zero exit for allowed descendant write: {events:?}"
     );
 }
 

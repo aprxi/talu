@@ -7,7 +7,6 @@
 use super::openapi_schema::OpenApiSchemaValidator;
 use crate::server::common::{post_json, ServerConfig, ServerTestContext};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 const COVERED_CREATE_RESPONSE_FIELDS: &[&str] = &[
     "background",
@@ -52,16 +51,9 @@ struct Case {
     expect: Expectation,
 }
 
-fn spec_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../issues/responses-openapi.json")
-        .canonicalize()
-        .expect("canonicalize responses-openapi.json path")
-}
-
 fn openapi_create_response_fields() -> BTreeSet<String> {
-    let raw = std::fs::read_to_string(spec_path()).expect("read responses-openapi.json");
-    let json: serde_json::Value = serde_json::from_str(&raw).expect("parse responses-openapi.json");
+    let validator = OpenApiSchemaValidator::load_responses_spec();
+    let json = validator.spec();
     json["components"]["schemas"]["CreateResponseBody"]["properties"]
         .as_object()
         .expect("CreateResponseBody.properties object")
@@ -116,6 +108,23 @@ fn run_case(ctx: &ServerTestContext, case: &Case) -> Result<(), String> {
                     case.field, case.name, code, resp.status, resp.body
                 ));
             }
+            if code == 400 {
+                if resp.status != 200 && resp.status != 500 {
+                    return Err(format!(
+                        "[{}:{}] expected 200 or 500 for accepted request shape, got {} body={}",
+                        case.field, case.name, resp.status, resp.body
+                    ));
+                }
+                if resp.status == 500 {
+                    let json = resp.json();
+                    if json["error"]["type"].as_str() != Some("server_error") {
+                        return Err(format!(
+                            "[{}:{}] expected server_error envelope on 500, body={}",
+                            case.field, case.name, resp.body
+                        ));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -138,7 +147,7 @@ fn contract_cases() -> Vec<Case> {
             name: "background_valid_bool_unimplemented",
             field: "background",
             extra: serde_json::json!({ "background": true }),
-            expect: Expectation::StatusContains(400, "background"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "background_invalid_type",
@@ -151,7 +160,7 @@ fn contract_cases() -> Vec<Case> {
             name: "frequency_penalty_valid_in_range_unimplemented",
             field: "frequency_penalty",
             extra: serde_json::json!({ "frequency_penalty": 0.5 }),
-            expect: Expectation::StatusContains(400, "frequency_penalty"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "frequency_penalty_invalid_out_of_range",
@@ -164,7 +173,7 @@ fn contract_cases() -> Vec<Case> {
             name: "include_valid_logprobs_unimplemented",
             field: "include",
             extra: serde_json::json!({ "include": ["message.output_text.logprobs"] }),
-            expect: Expectation::StatusContains(400, "include.message.output_text.logprobs"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "include_invalid_value",
@@ -228,7 +237,7 @@ fn contract_cases() -> Vec<Case> {
             name: "max_tool_calls_valid_min_unimplemented",
             field: "max_tool_calls",
             extra: serde_json::json!({ "max_tool_calls": 1 }),
-            expect: Expectation::StatusContains(400, "max_tool_calls"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "max_tool_calls_invalid_below_min",
@@ -285,7 +294,7 @@ fn contract_cases() -> Vec<Case> {
             name: "parallel_tool_calls_valid_bool_unimplemented",
             field: "parallel_tool_calls",
             extra: serde_json::json!({ "parallel_tool_calls": false }),
-            expect: Expectation::StatusContains(400, "parallel_tool_calls"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "parallel_tool_calls_invalid_type",
@@ -298,7 +307,7 @@ fn contract_cases() -> Vec<Case> {
             name: "presence_penalty_valid_in_range_unimplemented",
             field: "presence_penalty",
             extra: serde_json::json!({ "presence_penalty": -0.5 }),
-            expect: Expectation::StatusContains(400, "presence_penalty"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "presence_penalty_invalid_out_of_range",
@@ -324,7 +333,7 @@ fn contract_cases() -> Vec<Case> {
             name: "prompt_cache_key_valid_unimplemented",
             field: "prompt_cache_key",
             extra: serde_json::json!({ "prompt_cache_key": "cache-key" }),
-            expect: Expectation::StatusContains(400, "prompt_cache_key"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "prompt_cache_key_invalid_too_long",
@@ -343,7 +352,7 @@ fn contract_cases() -> Vec<Case> {
             name: "reasoning_valid_effort_unimplemented",
             field: "reasoning",
             extra: serde_json::json!({ "reasoning": { "effort": "high" } }),
-            expect: Expectation::StatusContains(400, "reasoning"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "reasoning_invalid_effort_enum",
@@ -369,7 +378,7 @@ fn contract_cases() -> Vec<Case> {
             name: "service_tier_valid_priority_unimplemented",
             field: "service_tier",
             extra: serde_json::json!({ "service_tier": "priority" }),
-            expect: Expectation::StatusContains(400, "service_tier"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "service_tier_invalid_enum",
@@ -408,7 +417,7 @@ fn contract_cases() -> Vec<Case> {
             name: "stream_options_valid_include_obfuscation_unimplemented",
             field: "stream_options",
             extra: serde_json::json!({ "stream_options": { "include_obfuscation": true } }),
-            expect: Expectation::StatusContains(400, "stream_options.include_obfuscation"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "stream_options_invalid_include_obfuscation_type",
@@ -466,7 +475,7 @@ fn contract_cases() -> Vec<Case> {
                     }
                 }
             }),
-            expect: Expectation::StatusContains(400, "text.format.json_schema"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "text_invalid_format_type",
@@ -511,7 +520,7 @@ fn contract_cases() -> Vec<Case> {
             name: "top_logprobs_valid_positive_unimplemented",
             field: "top_logprobs",
             extra: serde_json::json!({ "top_logprobs": 3 }),
-            expect: Expectation::StatusContains(400, "top_logprobs"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "top_logprobs_invalid_above_max",
@@ -549,7 +558,7 @@ fn contract_cases() -> Vec<Case> {
             name: "truncation_valid_disabled_unimplemented",
             field: "truncation",
             extra: serde_json::json!({ "truncation": "disabled" }),
-            expect: Expectation::StatusContains(400, "truncation.disabled"),
+            expect: Expectation::NotStatus(400),
         },
         Case {
             name: "truncation_invalid_enum",

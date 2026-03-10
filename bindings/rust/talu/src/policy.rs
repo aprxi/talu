@@ -24,17 +24,39 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 
 unsafe extern "C" {
-    #[link_name = "talu_agent_policy_check_process"]
-    fn talu_agent_policy_check_process_raw(
+    #[link_name = "talu_agent_policy_prepare_runtime"]
+    fn talu_agent_policy_prepare_runtime_raw(policy: *mut c_void, cwd: *const c_char) -> c_int;
+
+    #[link_name = "talu_agent_policy_check_file"]
+    fn talu_agent_policy_check_file_raw(
+        policy: *mut c_void,
+        action: *const c_char,
+        resource: *const c_char,
+        is_dir: bool,
+        out_allowed: *mut c_void,
+    ) -> c_int;
+
+    #[link_name = "talu_agent_policy_check_process_detailed"]
+    fn talu_agent_policy_check_process_detailed_raw(
         policy: *mut c_void,
         action: *const c_char,
         command: *const c_char,
         cwd: *const c_char,
         out_allowed: *mut c_void,
+        out_deny_reason: *mut c_int,
     ) -> c_int;
 
-    #[link_name = "talu_agent_policy_prepare_runtime"]
-    fn talu_agent_policy_prepare_runtime_raw(policy: *mut c_void, cwd: *const c_char) -> c_int;
+    #[link_name = "talu_agent_policy_validate_strict_emulation"]
+    fn talu_agent_policy_validate_strict_emulation_raw(policy: *mut c_void) -> c_int;
+
+    #[link_name = "talu_agent_policy_strict_emulation_decisions"]
+    fn talu_agent_policy_strict_emulation_decisions_raw(
+        policy: *mut c_void,
+        cwd: *const c_char,
+        out_deny_descendant_exec: *mut c_void,
+        out_deny_write: *mut c_void,
+        out_allow_python_exec: *mut c_void,
+    ) -> c_int;
 }
 
 /// IAM-style evaluation result.
@@ -55,6 +77,29 @@ pub enum Mode {
     Enforce = 0,
     /// Denied actions are logged but allowed through.
     Audit = 1,
+}
+
+/// Reason why a process action was denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ProcessDenyReason {
+    Action = 1,
+    Cwd = 2,
+}
+
+/// Process policy decision including deny classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessPolicyDecision {
+    pub allowed: bool,
+    pub deny_reason: Option<ProcessDenyReason>,
+}
+
+/// Strict-runtime emulation guard decisions derived from policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrictEmulationDecisions {
+    pub deny_descendant_exec: bool,
+    pub deny_write: bool,
+    pub allow_python_exec: bool,
 }
 
 /// RAII wrapper for a policy handle.
@@ -142,24 +187,45 @@ impl Policy {
         command: Option<&str>,
         cwd: Option<&str>,
     ) -> Result<bool> {
+        Ok(self.check_process_detailed(action, command, cwd)?.allowed)
+    }
+
+    /// Evaluate a process-style action and classify deny reason.
+    pub fn check_process_detailed(
+        &self,
+        action: &str,
+        command: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<ProcessPolicyDecision> {
         let c_action = CString::new(action)?;
         let c_command = command.map(CString::new).transpose()?;
         let c_cwd = cwd.map(CString::new).transpose()?;
 
         let mut allowed = false;
+        let mut deny_reason_code = 0i32;
         let rc = unsafe {
-            talu_agent_policy_check_process_raw(
+            talu_agent_policy_check_process_detailed_raw(
                 self.ptr,
                 c_action.as_ptr(),
                 c_command.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 c_cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 (&mut allowed as *mut bool).cast(),
+                &mut deny_reason_code,
             )
         };
         if rc != 0 {
             return Err(error_from_last_or("Failed to evaluate process policy"));
         }
-        Ok(allowed)
+        let deny_reason = match deny_reason_code {
+            0 => None,
+            1 => Some(ProcessDenyReason::Action),
+            2 => Some(ProcessDenyReason::Cwd),
+            _ => return Err(error_from_last_or("Failed to decode process deny reason")),
+        };
+        Ok(ProcessPolicyDecision {
+            allowed,
+            deny_reason: if allowed { None } else { deny_reason },
+        })
     }
 
     /// Pre-compile strict runtime profiles for this policy and optional cwd.
@@ -180,6 +246,68 @@ impl Policy {
             ));
         }
         Ok(())
+    }
+
+    /// Evaluate a filesystem action (`tool.fs.read` / `tool.fs.write` /
+    /// `tool.fs.delete`) for a given resource path.
+    pub fn check_file(&self, action: &str, resource: &str, is_dir: bool) -> Result<bool> {
+        let c_action = CString::new(action)?;
+        let c_resource = CString::new(resource)?;
+        let mut allowed = false;
+        let rc = unsafe {
+            talu_agent_policy_check_file_raw(
+                self.ptr,
+                c_action.as_ptr(),
+                c_resource.as_ptr(),
+                is_dir,
+                (&mut allowed as *mut bool).cast(),
+            )
+        };
+        if rc != 0 {
+            return Err(error_from_last_or("Failed to evaluate file policy"));
+        }
+        Ok(allowed)
+    }
+
+    /// Validate whether this policy is compatible with strict-runtime emulation.
+    pub fn validate_strict_emulation(&self) -> Result<()> {
+        let rc = unsafe { talu_agent_policy_validate_strict_emulation_raw(self.ptr) };
+        if rc != 0 {
+            return Err(error_from_last_or(
+                "Failed to validate strict runtime emulation policy",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compute strict-runtime emulation guard decisions for optional cwd.
+    pub fn strict_emulation_decisions(
+        &self,
+        cwd: Option<&str>,
+    ) -> Result<StrictEmulationDecisions> {
+        let c_cwd = cwd.map(CString::new).transpose()?;
+        let mut deny_descendant_exec = false;
+        let mut deny_write = false;
+        let mut allow_python_exec = true;
+        let rc = unsafe {
+            talu_agent_policy_strict_emulation_decisions_raw(
+                self.ptr,
+                c_cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                (&mut deny_descendant_exec as *mut bool).cast(),
+                (&mut deny_write as *mut bool).cast(),
+                (&mut allow_python_exec as *mut bool).cast(),
+            )
+        };
+        if rc != 0 {
+            return Err(error_from_last_or(
+                "Failed to evaluate strict runtime emulation decisions",
+            ));
+        }
+        Ok(StrictEmulationDecisions {
+            deny_descendant_exec,
+            deny_write,
+            allow_python_exec,
+        })
     }
 }
 
@@ -258,5 +386,45 @@ mod tests {
             .check_process("tool.exec", Some("git status"), None)
             .unwrap());
         assert!(policy.check_process("tool.exec", Some("ls"), None).unwrap());
+    }
+
+    #[test]
+    fn test_check_process_detailed_reports_cwd_reason() {
+        let json = r#"{
+            "default":"deny",
+            "statements":[
+                {"effect":"allow","action":"tool.exec","command":"rg *"},
+                {"effect":"deny","action":"tool.exec","command":"rg *","cwd":"tmp/**"}
+            ]
+        }"#;
+        let policy = Policy::from_json(json).unwrap();
+        let decision = policy
+            .check_process_detailed("tool.exec", Some("rg foo"), Some("tmp"))
+            .unwrap();
+        assert!(!decision.allowed);
+        assert_eq!(decision.deny_reason, Some(ProcessDenyReason::Cwd));
+    }
+
+    #[test]
+    fn test_validate_strict_emulation_rejects_mixed_file_rules() {
+        let json = r#"{
+            "default":"deny",
+            "statements":[
+                {"effect":"allow","action":"tool.fs.write","resource":"src/**"},
+                {"effect":"deny","action":"tool.fs.write","resource":"src/private/**"}
+            ]
+        }"#;
+        let policy = Policy::from_json(json).unwrap();
+        assert!(policy.validate_strict_emulation().is_err());
+    }
+
+    #[test]
+    fn test_strict_emulation_decisions_default_deny_is_conservative() {
+        let json = r#"{"default":"deny","statements":[]}"#;
+        let policy = Policy::from_json(json).unwrap();
+        let decisions = policy.strict_emulation_decisions(None).unwrap();
+        assert!(decisions.deny_descendant_exec);
+        assert!(decisions.deny_write);
+        assert!(!decisions.allow_python_exec);
     }
 }

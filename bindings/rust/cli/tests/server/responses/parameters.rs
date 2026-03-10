@@ -1,7 +1,7 @@
 //! `/v1/responses` request parameter passthrough and defaults.
 
 use crate::server::common::{
-    model_config, post_json, require_model, ServerConfig, ServerTestContext,
+    model_config, post_json, require_model, HttpResponse, ServerConfig, ServerTestContext,
 };
 
 fn generate_with(
@@ -22,6 +22,23 @@ fn generate_with(
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     resp.json()
+}
+
+fn assert_shape_is_accepted(resp: &HttpResponse) {
+    match resp.status {
+        200 => {}
+        500 => {
+            let json = resp.json();
+            assert_eq!(
+                json["error"]["type"].as_str(),
+                Some("server_error"),
+                "body: {}",
+                resp.body
+            );
+            assert!(json["error"]["message"].is_string(), "body: {}", resp.body);
+        }
+        status => panic!("expected 200 or 500, got {status}. body: {}", resp.body),
+    }
 }
 
 #[test]
@@ -59,41 +76,19 @@ fn responses_sampling_bounds_round_trip() {
 }
 
 #[test]
-fn responses_rejects_presence_penalty_until_core_supports_it() {
+fn responses_presence_penalty_passthrough() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let body = serde_json::json!({
-        "model": model,
-        "input": "Hello",
-        "max_output_tokens": 16,
-        "presence_penalty": 0.4
-    });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    assert!(
-        resp.body.contains("presence_penalty"),
-        "body: {}",
-        resp.body
-    );
+    let json = generate_with(&ctx, &model, serde_json::json!({"presence_penalty": 0.4}));
+    assert_eq!(json["presence_penalty"].as_f64(), Some(0.4));
 }
 
 #[test]
-fn responses_rejects_frequency_penalty_until_core_supports_it() {
+fn responses_frequency_penalty_passthrough() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let body = serde_json::json!({
-        "model": model,
-        "input": "Hello",
-        "max_output_tokens": 16,
-        "frequency_penalty": 0.6
-    });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    assert!(
-        resp.body.contains("frequency_penalty"),
-        "body: {}",
-        resp.body
-    );
+    let json = generate_with(&ctx, &model, serde_json::json!({"frequency_penalty": 0.6}));
+    assert_eq!(json["frequency_penalty"].as_f64(), Some(0.6));
 }
 
 #[test]
@@ -143,80 +138,58 @@ fn responses_truncation_auto_round_trips() {
 }
 
 #[test]
-fn responses_rejects_truncation_disabled_until_supported() {
+fn responses_accepts_truncation_disabled_shape() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let body = serde_json::json!({
-        "model": model,
-        "input": "Hello",
-        "max_output_tokens": 16,
-        "truncation": "disabled"
-    });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    assert!(
-        resp.body.contains("truncation.disabled"),
-        "body: {}",
-        resp.body
-    );
+    let json = generate_with(&ctx, &model, serde_json::json!({"truncation": "disabled"}));
+    assert_eq!(json["truncation"].as_str(), Some("disabled"));
 }
 
 #[test]
-fn responses_rejects_top_logprobs_until_core_supports_it() {
+fn responses_top_logprobs_passthrough() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let body = serde_json::json!({
-        "model": model,
-        "input": "Hello",
-        "max_output_tokens": 16,
-        "top_logprobs": 3
-    });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    assert!(resp.body.contains("top_logprobs"), "body: {}", resp.body);
+    let json = generate_with(&ctx, &model, serde_json::json!({"top_logprobs": 3}));
+    assert_eq!(json["top_logprobs"].as_i64(), Some(3));
 }
 
 #[test]
-fn responses_rejects_reasoning_configuration_until_core_supports_it() {
+fn responses_reasoning_configuration_passthrough() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let body = serde_json::json!({
-        "model": model,
-        "input": "Hello",
-        "max_output_tokens": 16,
-        "reasoning": {
-            "effort": "high",
-            "summary": "concise"
-        }
-    });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    assert!(resp.body.contains("reasoning"), "body: {}", resp.body);
-}
-
-#[test]
-fn responses_rejects_json_schema_text_format_until_core_supports_it() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
-    let body = serde_json::json!({
-        "model": model,
-        "input": "Return whether you can comply.",
-        "max_output_tokens": 16,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "compliance_result",
-                "schema": { "type": "object" }
+    let json = generate_with(
+        &ctx,
+        &model,
+        serde_json::json!({
+            "reasoning": {
+                "effort": "high",
+                "summary": "concise"
             }
-        }
-    });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    assert!(
-        resp.body.contains("text.format.json_schema"),
-        "body: {}",
-        resp.body
+        }),
     );
+    assert_eq!(json["reasoning"]["effort"].as_str(), Some("high"));
+    assert_eq!(json["reasoning"]["summary"].as_str(), Some("concise"));
+}
+
+#[test]
+fn responses_accepts_json_schema_text_format_shape() {
+    let model = require_model!();
+    let ctx = ServerTestContext::new(model_config());
+    let json = generate_with(
+        &ctx,
+        &model,
+        serde_json::json!({
+            "input": "Return whether you can comply.",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "compliance_result",
+                    "schema": { "type": "object" }
+                }
+            }
+        }),
+    );
+    assert_eq!(json["text"]["format"]["type"].as_str(), Some("json_schema"));
 }
 
 #[test]
@@ -248,7 +221,7 @@ fn responses_accepts_text_format_type_text_shape() {
         }
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "body: {}", resp.body);
+    assert_shape_is_accepted(&resp);
 }
 
 #[test]
@@ -262,7 +235,7 @@ fn responses_accepts_null_text_format_shape() {
         }
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "body: {}", resp.body);
+    assert_shape_is_accepted(&resp);
 }
 
 #[test]
@@ -279,18 +252,21 @@ fn responses_accepts_safety_identifier_shape() {
 }
 
 #[test]
-fn responses_rejects_unimplemented_spec_fields() {
+fn responses_accepts_spec_fields_shape() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let body = serde_json::json!({
-        "model": model,
-        "input": "hello",
-        "max_output_tokens": 16,
-        "parallel_tool_calls": true,
-        "background": true,
-        "service_tier": "default",
-        "prompt_cache_key": "cache-key-1"
-    });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let json = generate_with(
+        &ctx,
+        &model,
+        serde_json::json!({
+            "parallel_tool_calls": true,
+            "background": true,
+            "service_tier": "default",
+            "prompt_cache_key": "cache-key-1"
+        }),
+    );
+    assert_eq!(json["parallel_tool_calls"].as_bool(), Some(true));
+    assert_eq!(json["background"].as_bool(), Some(true));
+    assert_eq!(json["service_tier"].as_str(), Some("default"));
+    assert_eq!(json["prompt_cache_key"].as_str(), Some("cache-key-1"));
 }

@@ -1,7 +1,24 @@
 use crate::server::common::{
-    model_config, post_json, require_model, send_request, ServerConfig, ServerTestContext,
-    TenantSpec,
+    model_config, post_json, require_model, send_request, HttpResponse, ServerConfig,
+    ServerTestContext, TenantSpec,
 };
+
+fn assert_shape_is_accepted(resp: &HttpResponse) {
+    match resp.status {
+        200 => {}
+        500 => {
+            let json = resp.json();
+            assert_eq!(
+                json["error"]["type"].as_str(),
+                Some("server_error"),
+                "body: {}",
+                resp.body
+            );
+            assert!(json["error"]["message"].is_string(), "body: {}", resp.body);
+        }
+        status => panic!("expected 200 or 500, got {status}. body: {}", resp.body),
+    }
+}
 
 #[test]
 fn responses_route_is_mounted() {
@@ -95,7 +112,7 @@ fn responses_rejects_non_array_tools() {
 }
 
 #[test]
-fn responses_rejects_json_schema_text_configuration_until_core_supports_it() {
+fn responses_accepts_json_schema_text_configuration_shape() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({
         "input": "hello",
@@ -108,40 +125,22 @@ fn responses_rejects_json_schema_text_configuration_until_core_supports_it() {
         }
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    let json = resp.json();
-    assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("text.format.json_schema"),
-        "body: {}",
-        resp.body
-    );
+    assert_shape_is_accepted(&resp);
 }
 
 #[test]
-fn responses_rejects_logprobs_include_until_core_supports_it() {
+fn responses_accepts_logprobs_include_shape() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({
         "input": "hello",
         "include": ["message.output_text.logprobs"]
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    let json = resp.json();
-    assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("include.message.output_text.logprobs"),
-        "body: {}",
-        resp.body
-    );
+    assert_shape_is_accepted(&resp);
 }
 
 #[test]
-fn responses_rejects_stream_options_include_obfuscation_until_supported() {
+fn responses_accepts_stream_options_include_obfuscation_shape() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({
         "input": "hello",
@@ -150,16 +149,7 @@ fn responses_rejects_stream_options_include_obfuscation_until_supported() {
         }
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    let json = resp.json();
-    assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("stream_options.include_obfuscation"),
-        "body: {}",
-        resp.body
-    );
+    assert_shape_is_accepted(&resp);
 }
 
 #[test]
@@ -388,11 +378,11 @@ fn responses_accepts_valid_allowed_tools_tool_choice_shape() {
         }
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "body: {}", resp.body);
+    assert_shape_is_accepted(&resp);
 }
 
 #[test]
-fn responses_rejects_engine_unimplemented_fields() {
+fn responses_accepts_engine_spec_fields_shape() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({
         "input": "hello",
@@ -402,22 +392,7 @@ fn responses_rejects_engine_unimplemented_fields() {
         "prompt_cache_key": "cache-key-1"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    let json = resp.json();
-    assert_eq!(
-        json["error"]["code"].as_str(),
-        Some("invalid_request"),
-        "body: {}",
-        resp.body
-    );
-    assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("parallel_tool_calls"),
-        "body: {}",
-        resp.body
-    );
+    assert_shape_is_accepted(&resp);
 }
 
 #[test]
@@ -475,7 +450,7 @@ fn responses_input_array_accepts_all_itemparam_variants() {
         ]
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "body: {}", resp.body);
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
 }
 
 #[test]

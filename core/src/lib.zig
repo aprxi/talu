@@ -422,6 +422,9 @@ comptime {
     _ = &capi.talu_agent_policy_check_action;
     _ = &capi.talu_agent_policy_check_file;
     _ = &capi.talu_agent_policy_check_process;
+    _ = &capi.talu_agent_policy_check_process_detailed;
+    _ = &capi.talu_agent_policy_validate_strict_emulation;
+    _ = &capi.talu_agent_policy_strict_emulation_decisions;
 
     // Agent filesystem API
     _ = &capi.talu_fs_create;

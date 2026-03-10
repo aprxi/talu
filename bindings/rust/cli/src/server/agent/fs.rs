@@ -204,6 +204,18 @@ fn encode_content(content: &[u8], encoding: &str) -> Result<String, String> {
     }
 }
 
+fn normalized_absolute_for_prefix(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            return canon_parent.join(name);
+        }
+    }
+    path.to_path_buf()
+}
+
 fn to_workspace_relative(workspace: &Path, requested: &str) -> String {
     let requested_path = Path::new(requested);
     let absolute: PathBuf = if requested_path.is_absolute() {
@@ -211,8 +223,13 @@ fn to_workspace_relative(workspace: &Path, requested: &str) -> String {
     } else {
         workspace.join(requested_path)
     };
+    let workspace_abs = normalized_absolute_for_prefix(workspace);
+    let absolute_norm = normalized_absolute_for_prefix(&absolute);
 
-    match absolute.strip_prefix(workspace) {
+    match absolute_norm
+        .strip_prefix(&workspace_abs)
+        .or_else(|_| absolute.strip_prefix(workspace))
+    {
         Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
         Ok(rel) => rel.to_string_lossy().to_string(),
         Err(_) => requested.to_string(),

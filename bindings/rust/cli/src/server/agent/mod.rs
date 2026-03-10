@@ -14,8 +14,8 @@ pub(crate) fn load_runtime_policy(state: &AppState) -> Option<Arc<Policy>> {
     state.agent_policy.clone()
 }
 
-pub(crate) fn runtime_mode_for_talu(mode: AgentRuntimeMode) -> talu::shell::AgentRuntimeMode {
-    match mode {
+pub(crate) fn runtime_mode_for_talu(state: &AppState) -> talu::shell::AgentRuntimeMode {
+    match state.agent_runtime_mode {
         AgentRuntimeMode::Host => talu::shell::AgentRuntimeMode::Host,
         AgentRuntimeMode::Strict => talu::shell::AgentRuntimeMode::Strict,
     }

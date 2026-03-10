@@ -105,6 +105,16 @@ fn open_storage(
         None => base.to_path_buf(),
     };
 
+    if !path.exists() {
+        std::fs::create_dir_all(&path).map_err(|e| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                &format!("Failed to initialize storage path {}: {e}", path.display()),
+            )
+        })?;
+    }
+
     StorageHandle::open(&path).map_err(|e| {
         json_error(
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -36,6 +36,7 @@ use crate::server::providers;
 use crate::server::proxy;
 use crate::server::repo;
 use crate::server::responses;
+use crate::server::responses_openapi;
 use crate::server::search;
 use crate::server::sessions;
 use crate::server::settings;
@@ -61,8 +62,12 @@ pub struct ErrorBody {
 static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(openapi::build_openapi_json);
 static OPENAPI_CHAT_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/chat/"]));
-static OPENAPI_RESPONSES_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/responses"]));
+static OPENAPI_RESPONSES_SPEC: Lazy<Vec<u8>> = Lazy::new(|| {
+    responses_openapi::patch_responses_openapi_spec(&filter_openapi_paths(
+        &OPENAPI_SPEC,
+        &["/v1/responses"],
+    ))
+});
 static OPENAPI_MODELS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/models"]));
 static OPENAPI_FILES_SPEC: Lazy<Vec<u8>> =

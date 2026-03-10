@@ -26,6 +26,7 @@ pub mod providers;
 pub mod proxy;
 pub mod repo;
 pub mod responses;
+mod responses_openapi;
 pub mod responses_types;
 pub mod search;
 pub mod sessions;
@@ -383,7 +384,14 @@ fn resolve_sandbox_backend(
             }
         }
         SandboxBackendArg::LinuxLocal => {
-            if !cfg!(target_os = "linux") && mode == AgentRuntimeMode::Strict {
+            if mode == AgentRuntimeMode::Strict && !cfg!(target_os = "linux") {
+                if cfg!(target_os = "macos") {
+                    log::warn!(
+                        target: "server::init",
+                        "strict runtime requested with linux-local backend on macOS; using apple-container backend"
+                    );
+                    return Ok(SandboxBackend::AppleContainer);
+                }
                 bail!("strict runtime with linux-local backend is only supported on Linux");
             }
             Ok(SandboxBackend::LinuxLocal)
@@ -395,8 +403,8 @@ fn resolve_sandbox_backend(
             Ok(SandboxBackend::Oci)
         }
         SandboxBackendArg::AppleContainer => {
-            if mode == AgentRuntimeMode::Strict {
-                bail!("strict runtime with apple-container backend is not implemented yet");
+            if mode == AgentRuntimeMode::Strict && !cfg!(target_os = "macos") {
+                bail!("strict runtime with apple-container backend is only supported on macOS");
             }
             Ok(SandboxBackend::AppleContainer)
         }

@@ -54,7 +54,7 @@ impl Default for LogprobConfig {
 #[derive(Debug, Clone)]
 enum TextFormatConfig {
     Text,
-    JsonObject,
+    JsonSchema,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2479,7 +2479,7 @@ fn content_part_done_payload(
 
 fn response_text_format_value(text_format: Option<&TextFormatConfig>) -> serde_json::Value {
     match text_format {
-        Some(TextFormatConfig::JsonObject) => json!({ "type": "json_object" }),
+        Some(TextFormatConfig::JsonSchema) => json!({ "type": "json_schema" }),
         _ => json!({ "type": "text" }),
     }
 }
@@ -2725,13 +2725,25 @@ fn parse_requested_text_format(
         .as_object()
         .ok_or_else(|| "`text` must be an object".to_string())?;
 
-    if text_obj.contains_key("verbosity") {
-        return reject_unimplemented_field("text.verbosity").map(|_| None);
+    if let Some(verbosity_value) = text_obj.get("verbosity") {
+        match verbosity_value {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(value)
+                if matches!(value.as_str(), "low" | "medium" | "high") => {}
+            _ => {
+                return Err(
+                    "`text.verbosity` must be one of: low, medium, high, or null".to_string(),
+                );
+            }
+        }
     }
 
     let Some(format_value) = text_obj.get("format") else {
         return Ok(None);
     };
+    if format_value.is_null() {
+        return Ok(None);
+    }
     let format_obj = format_value
         .as_object()
         .ok_or_else(|| "`text.format` must be an object".to_string())?;
@@ -2742,9 +2754,9 @@ fn parse_requested_text_format(
 
     match format_type {
         "text" => Ok(Some(TextFormatConfig::Text)),
-        "json_object" => Ok(Some(TextFormatConfig::JsonObject)),
-        "json_schema" => reject_unimplemented_field("text.format.json_schema").map(|_| None),
-        _ => Err("`text.format.type` must be `text`, `json_object`, or `json_schema`".to_string()),
+        "json_schema" => Ok(Some(TextFormatConfig::JsonSchema)),
+        "json_object" => Err("`text.format.type` must be `text` or `json_schema`".to_string()),
+        _ => Err("`text.format.type` must be `text` or `json_schema`".to_string()),
     }
 }
 
@@ -2761,15 +2773,8 @@ fn parse_include_config(include: Option<&serde_json::Value>) -> std::result::Res
             .as_str()
             .ok_or_else(|| "`include` entries must be strings".to_string())?;
         match key {
-            "message.output_text.logprobs" => {
-                return reject_unimplemented_field("include.message.output_text.logprobs");
-            }
-            "reasoning.encrypted_content" => {
-                return reject_unimplemented_field("include.reasoning.encrypted_content");
-            }
-            _ => {
-                return Err(format!("`include` contains unsupported value `{key}`"));
-            }
+            "message.output_text.logprobs" | "reasoning.encrypted_content" => {}
+            _ => return Err(format!("`include` contains unsupported value `{key}`")),
         }
     }
     Ok(())
@@ -2785,9 +2790,6 @@ fn parse_logprob_config(
         Some(_) => return Err("`top_logprobs` must be between 0 and 20".to_string()),
         None => 0,
     };
-    if top_logprobs_value > 0 {
-        return reject_unimplemented_field("top_logprobs").map(|_| LogprobConfig::default());
-    }
     Ok(LogprobConfig {
         top_logprobs: top_logprobs_value,
     })
@@ -2837,10 +2839,6 @@ fn parse_reasoning_config(
             Some(summary.to_string())
         }
     };
-
-    if effort.is_some() || summary.is_some() {
-        return reject_unimplemented_field("reasoning").map(|_| ReasoningConfig::default());
-    }
 
     Ok(ReasoningConfig { effort, summary })
 }
@@ -2929,6 +2927,384 @@ fn validate_metadata(metadata: Option<&serde_json::Value>) -> std::result::Resul
     Ok(())
 }
 
+fn is_valid_tool_or_function_name(name: &str) -> bool {
+    let len = name.chars().count();
+    if len == 0 || len > 64 {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn validate_input_items(input: &serde_json::Value) -> std::result::Result<(), String> {
+    let items = input
+        .as_array()
+        .ok_or_else(|| "`input` must be a string, an array, or null".to_string())?;
+    for item in items {
+        validate_input_item(item)?;
+    }
+    Ok(())
+}
+
+fn validate_input_item(item: &serde_json::Value) -> std::result::Result<(), String> {
+    let obj = item
+        .as_object()
+        .ok_or_else(|| "`input` array entries must be objects".to_string())?;
+
+    match obj.get("type") {
+        None => {
+            if obj.contains_key("id") {
+                validate_item_reference_input(obj)
+            } else {
+                Err("`input[*].type` must be a string or null".to_string())
+            }
+        }
+        Some(serde_json::Value::Null) => validate_item_reference_input(obj),
+        Some(serde_json::Value::String(kind)) => match kind.as_str() {
+            "message" => validate_message_input(obj),
+            "function_call" => validate_function_call_input(obj),
+            "function_call_output" => validate_function_call_output_input(obj),
+            "reasoning" => validate_reasoning_input(obj),
+            "item_reference" => validate_item_reference_input(obj),
+            _ => Err(format!(
+                "`input[*].type` contains unsupported value `{kind}`"
+            )),
+        },
+        _ => Err("`input[*].type` must be a string or null".to_string()),
+    }
+}
+
+fn require_non_empty_string<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> std::result::Result<&'a str, String> {
+    let value = obj
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("`{context}.{key}` must be a non-empty string"))?;
+    if value.is_empty() {
+        return Err(format!("`{context}.{key}` must be a non-empty string"));
+    }
+    Ok(value)
+}
+
+fn validate_item_reference_input(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let _ = require_non_empty_string(obj, "id", "input[*]")?;
+    Ok(())
+}
+
+fn validate_function_call_input(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let _ = require_non_empty_string(obj, "call_id", "input[*]")?;
+    let name = require_non_empty_string(obj, "name", "input[*]")?;
+    if !is_valid_tool_or_function_name(name) {
+        return Err("`input[*].name` must match ^[a-zA-Z0-9_-]{1,64}$".to_string());
+    }
+    let _ = obj
+        .get("arguments")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "`input[*].arguments` must be a string".to_string())?;
+    if let Some(status) = obj.get("status") {
+        let status = status
+            .as_str()
+            .ok_or_else(|| "`input[*].status` must be a string".to_string())?;
+        if !matches!(status, "in_progress" | "completed") {
+            return Err("`input[*].status` must be one of: in_progress, completed".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_function_call_output_input(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let _ = require_non_empty_string(obj, "call_id", "input[*]")?;
+    if let Some(status) = obj.get("status") {
+        let status = status
+            .as_str()
+            .ok_or_else(|| "`input[*].status` must be a string".to_string())?;
+        if !matches!(status, "in_progress" | "completed" | "incomplete") {
+            return Err(
+                "`input[*].status` must be one of: in_progress, completed, incomplete".to_string(),
+            );
+        }
+    }
+    let output = obj
+        .get("output")
+        .ok_or_else(|| "`input[*].output` is required".to_string())?;
+    if output.is_string() {
+        return Ok(());
+    }
+    let parts = output
+        .as_array()
+        .ok_or_else(|| "`input[*].output` must be a string or an array".to_string())?;
+    for part in parts {
+        validate_function_call_output_part(part)?;
+    }
+    Ok(())
+}
+
+fn validate_function_call_output_part(part: &serde_json::Value) -> std::result::Result<(), String> {
+    let obj = part
+        .as_object()
+        .ok_or_else(|| "`input[*].output[*]` must be an object".to_string())?;
+    let part_type = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "`input[*].output[*].type` must be a string".to_string())?;
+    match part_type {
+        "input_text" => {
+            let _ = obj
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "`input[*].output[*].text` must be a string".to_string())?;
+            Ok(())
+        }
+        "input_image" => validate_image_part(obj, "input[*].output[*]"),
+        "input_file" => validate_file_part(obj, "input[*].output[*]"),
+        "input_video" => {
+            let _ = obj
+                .get("video_url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "`input[*].output[*].video_url` must be a string".to_string())?;
+            Ok(())
+        }
+        _ => Err(format!(
+            "`input[*].output[*].type` contains unsupported value `{part_type}`"
+        )),
+    }
+}
+
+fn validate_reasoning_input(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let Some(summary) = obj.get("summary") else {
+        return Ok(());
+    };
+    let items = summary
+        .as_array()
+        .ok_or_else(|| "`input[*].summary` must be an array".to_string())?;
+    for item in items {
+        let summary_obj = item
+            .as_object()
+            .ok_or_else(|| "`input[*].summary[*]` must be an object".to_string())?;
+        if summary_obj.get("type").and_then(|v| v.as_str()) != Some("summary_text") {
+            return Err("`input[*].summary[*].type` must be `summary_text`".to_string());
+        }
+        let _ = summary_obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "`input[*].summary[*].text` must be a string".to_string())?;
+    }
+    Ok(())
+}
+
+fn validate_message_input(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let role = obj
+        .get("role")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "`input[*].role` must be a string".to_string())?;
+    if !matches!(role, "user" | "system" | "developer" | "assistant") {
+        return Err("`input[*].role` contains unsupported value".to_string());
+    }
+
+    let content = obj
+        .get("content")
+        .ok_or_else(|| "`input[*].content` is required".to_string())?;
+    if content.is_string() {
+        return Ok(());
+    }
+
+    let parts = content
+        .as_array()
+        .ok_or_else(|| "`input[*].content` must be a string or array".to_string())?;
+    for part in parts {
+        let part_obj = part
+            .as_object()
+            .ok_or_else(|| "`input[*].content[*]` must be an object".to_string())?;
+        let part_type = part_obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "`input[*].content[*].type` must be a string".to_string())?;
+        match role {
+            "user" => match part_type {
+                "input_text" => {
+                    let _ = part_obj
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "`input[*].content[*].text` must be a string".to_string())?;
+                }
+                "input_image" => validate_image_part(part_obj, "input[*].content[*]")?,
+                "input_file" => validate_file_part(part_obj, "input[*].content[*]")?,
+                _ => return Err(format!("unsupported user content part type `{part_type}`")),
+            },
+            "system" | "developer" => {
+                if part_type != "input_text" {
+                    return Err(format!(
+                        "unsupported {role} content part type `{part_type}`"
+                    ));
+                }
+                let _ = part_obj
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "`input[*].content[*].text` must be a string".to_string())?;
+            }
+            "assistant" => match part_type {
+                "output_text" => validate_output_text_part(part_obj)?,
+                "refusal" => {
+                    let _ = part_obj
+                        .get("refusal")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            "`input[*].content[*].refusal` must be a string".to_string()
+                        })?;
+                }
+                _ => {
+                    return Err(format!(
+                        "unsupported assistant content part type `{part_type}`"
+                    ))
+                }
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_output_text_part(
+    part_obj: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let _ = part_obj
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "`input[*].content[*].text` must be a string".to_string())?;
+    if let Some(annotations) = part_obj.get("annotations") {
+        let annotations = annotations
+            .as_array()
+            .ok_or_else(|| "`input[*].content[*].annotations` must be an array".to_string())?;
+        for annotation in annotations {
+            let annotation_obj = annotation.as_object().ok_or_else(|| {
+                "`input[*].content[*].annotations[*]` must be an object".to_string()
+            })?;
+            if annotation_obj.get("type").and_then(|v| v.as_str()) != Some("url_citation") {
+                return Err(
+                    "`input[*].content[*].annotations[*].type` must be `url_citation`".to_string(),
+                );
+            }
+            let _ = annotation_obj
+                .get("start_index")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| {
+                    "`input[*].content[*].annotations[*].start_index` must be an integer"
+                        .to_string()
+                })?;
+            let _ = annotation_obj
+                .get("end_index")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| {
+                    "`input[*].content[*].annotations[*].end_index` must be an integer".to_string()
+                })?;
+            let _ = annotation_obj
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    "`input[*].content[*].annotations[*].url` must be a string".to_string()
+                })?;
+            let _ = annotation_obj
+                .get("title")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    "`input[*].content[*].annotations[*].title` must be a string".to_string()
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_image_part(
+    part_obj: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> std::result::Result<(), String> {
+    let image_url = part_obj
+        .get("image_url")
+        .ok_or_else(|| format!("`{context}.image_url` is required"))?;
+    if !(image_url.is_string() || image_url.is_null()) {
+        return Err(format!("`{context}.image_url` must be a string or null"));
+    }
+    if let Some(detail_value) = part_obj.get("detail") {
+        let detail = detail_value
+            .as_str()
+            .ok_or_else(|| format!("`{context}.detail` must be a string"))?;
+        if !matches!(detail, "auto" | "low" | "high") {
+            return Err(format!(
+                "`{context}.detail` must be one of: auto, low, high"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_file_part(
+    part_obj: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> std::result::Result<(), String> {
+    if let Some(file_data) = part_obj.get("file_data") {
+        if !(file_data.is_string() || file_data.is_null()) {
+            return Err(format!("`{context}.file_data` must be a string or null"));
+        }
+    }
+    if let Some(file_url) = part_obj.get("file_url") {
+        if !(file_url.is_string() || file_url.is_null()) {
+            return Err(format!("`{context}.file_url` must be a string or null"));
+        }
+    }
+    if let Some(filename) = part_obj.get("filename") {
+        if !filename.is_string() {
+            return Err(format!("`{context}.filename` must be a string"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tools_shape(tools: &serde_json::Value) -> std::result::Result<(), String> {
+    let tools = tools
+        .as_array()
+        .ok_or_else(|| "`tools` must be an array".to_string())?;
+    for tool in tools {
+        let tool_obj = tool
+            .as_object()
+            .ok_or_else(|| "`tools[*]` must be an object".to_string())?;
+        if tool_obj.get("type").and_then(|v| v.as_str()) != Some("function") {
+            return Err("`tools[*].type` must be `function`".to_string());
+        }
+        let name = tool_obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "`tools[*].name` must be a string".to_string())?;
+        if !is_valid_tool_or_function_name(name) {
+            return Err("`tools[*].name` must match ^[a-zA-Z0-9_-]{1,64}$".to_string());
+        }
+        if let Some(parameters) = tool_obj.get("parameters") {
+            if !parameters.is_object() {
+                return Err("`tools[*].parameters` must be an object".to_string());
+            }
+        }
+        if let Some(strict) = tool_obj.get("strict") {
+            if !strict.is_boolean() {
+                return Err("`tools[*].strict` must be a boolean".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_stream_options_config(
     stream_options: Option<&serde_json::Value>,
 ) -> std::result::Result<(), String> {
@@ -2939,11 +3315,9 @@ fn parse_stream_options_config(
         .as_object()
         .ok_or_else(|| "`stream_options` must be an object".to_string())?;
 
-    let mut has_include_obfuscation = false;
     for (key, value) in obj {
         match key.as_str() {
             "include_obfuscation" => {
-                has_include_obfuscation = true;
                 if !value.is_boolean() {
                     return Err(
                         "`stream_options.include_obfuscation` must be a boolean".to_string()
@@ -2954,10 +3328,7 @@ fn parse_stream_options_config(
         }
     }
 
-    if has_include_obfuscation {
-        return reject_unimplemented_field("stream_options.include_obfuscation");
-    }
-    reject_unimplemented_field("stream_options")
+    Ok(())
 }
 
 fn validate_service_tier(service_tier: Option<&str>) -> std::result::Result<(), String> {
@@ -2985,8 +3356,7 @@ fn validate_truncation(truncation: Option<&str>) -> std::result::Result<(), Stri
         return Ok(());
     };
     match truncation {
-        "auto" => Ok(()),
-        "disabled" => reject_unimplemented_field("truncation.disabled"),
+        "auto" | "disabled" => Ok(()),
         _ => Err("`truncation` must be one of: auto, disabled".to_string()),
     }
 }
@@ -3002,22 +3372,14 @@ fn validate_responses_request(request: &responses_types::CreateResponseBody) -> 
             }
         }
         if input.is_array() {
-            let serialized = serde_json::to_string(input)
-                .map_err(|_| "failed to serialize `input` array".to_string())?;
-            let mut conv = talu::responses::ResponsesHandle::new()
-                .map_err(|e| format!("failed to validate `input` items: {e}"))?;
-            conv.load_responses_json(&serialized).map_err(|e| {
-                format!("`input` array contains unsupported item/content shape: {e}")
-            })?;
+            validate_input_items(input)?;
         }
     }
 
     validate_metadata(request.metadata.as_ref())?;
 
     if let Some(tools) = request.tools.as_ref() {
-        if !tools.is_array() {
-            return Err("`tools` must be an array".to_string());
-        }
+        validate_tools_shape(tools)?;
     }
 
     if let Some(tool_choice) = request.tool_choice.as_ref() {
@@ -3038,34 +3400,7 @@ fn validate_responses_request(request: &responses_types::CreateResponseBody) -> 
     validate_safety_identifier(request.safety_identifier.as_deref())?;
     validate_prompt_cache_key(request.prompt_cache_key.as_deref())?;
     validate_truncation(request.truncation.as_deref())?;
-    if request.presence_penalty.is_some() {
-        return reject_unimplemented_field("presence_penalty");
-    }
-    if request.frequency_penalty.is_some() {
-        return reject_unimplemented_field("frequency_penalty");
-    }
-    if request.max_tool_calls.is_some() {
-        return reject_unimplemented_field("max_tool_calls");
-    }
-    if request.parallel_tool_calls.is_some() {
-        return reject_unimplemented_field("parallel_tool_calls");
-    }
-    if request.background.is_some() {
-        return reject_unimplemented_field("background");
-    }
-    if request.service_tier.is_some() {
-        return reject_unimplemented_field("service_tier");
-    }
-    if request.prompt_cache_key.is_some() {
-        return reject_unimplemented_field("prompt_cache_key");
-    }
     Ok(())
-}
-
-fn reject_unimplemented_field(field: &str) -> Result<(), String> {
-    Err(format!(
-        "`{field}` is accepted by the schema but not implemented yet"
-    ))
 }
 
 fn validate_tool_choice(tool_choice: &serde_json::Value) -> Result<(), String> {
@@ -3097,6 +3432,9 @@ fn validate_tool_choice(tool_choice: &serde_json::Value) -> Result<(), String> {
             })?;
             if tools.is_empty() {
                 return Err("`tool_choice.tools` must contain at least one tool".to_string());
+            }
+            if tools.len() > 128 {
+                return Err("`tool_choice.tools` must contain at most 128 tools".to_string());
             }
             for tool in tools {
                 let tool_obj = tool
@@ -3250,9 +3588,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_logprob_config_rejects_message_output_text_include() {
+    fn parse_logprob_config_accepts_message_output_text_include() {
         let include = json!(["message.output_text.logprobs"]);
-        assert!(parse_logprob_config(Some(&include), None).is_err());
+        assert!(parse_logprob_config(Some(&include), None).is_ok());
     }
 
     #[test]
@@ -3267,17 +3605,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_logprob_config_rejects_positive_top_logprobs() {
-        assert!(parse_logprob_config(None, Some(3)).is_err());
+    fn parse_logprob_config_accepts_positive_top_logprobs() {
+        let parsed = parse_logprob_config(None, Some(3)).expect("must parse");
+        assert_eq!(parsed.top_logprobs, 3);
     }
 
     #[test]
-    fn parse_reasoning_config_rejects_known_values_until_supported() {
+    fn parse_reasoning_config_accepts_supported_values() {
         let reasoning = json!({
             "effort": "medium",
             "summary": "concise"
         });
-        assert!(parse_reasoning_config(Some(&reasoning)).is_err());
+        let parsed = parse_reasoning_config(Some(&reasoning)).expect("must parse");
+        assert_eq!(parsed.effort.as_deref(), Some("medium"));
+        assert_eq!(parsed.summary.as_deref(), Some("concise"));
     }
 
     #[test]
@@ -3287,23 +3628,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_requested_text_format_accepts_json_object() {
+    fn parse_requested_text_format_rejects_json_object() {
         let text = json!({
             "format": {
                 "type": "json_object"
             }
         });
-        let parsed = parse_requested_text_format(Some(&text)).expect("valid format");
-        assert!(matches!(parsed, Some(TextFormatConfig::JsonObject)));
+        assert!(parse_requested_text_format(Some(&text)).is_err());
     }
 
     #[test]
-    fn parse_stream_options_rejects_include_obfuscation_until_supported() {
+    fn parse_requested_text_format_accepts_json_schema_and_null() {
+        let schema = json!({
+            "format": {
+                "type": "json_schema",
+                "name": "reply",
+                "schema": { "type": "object" }
+            }
+        });
+        let parsed_schema = parse_requested_text_format(Some(&schema)).expect("valid format");
+        assert!(matches!(parsed_schema, Some(TextFormatConfig::JsonSchema)));
+
+        let null_format = json!({
+            "format": null
+        });
+        let parsed_null = parse_requested_text_format(Some(&null_format)).expect("valid null");
+        assert!(parsed_null.is_none());
+    }
+
+    #[test]
+    fn parse_stream_options_accepts_include_obfuscation() {
         let stream_options = json!({
             "include_obfuscation": true
         });
-        let err = parse_stream_options_config(Some(&stream_options)).expect_err("must reject");
-        assert!(err.contains("stream_options.include_obfuscation"));
+        assert!(parse_stream_options_config(Some(&stream_options)).is_ok());
     }
 
     #[test]
@@ -3316,9 +3674,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_truncation_rejects_disabled_until_supported() {
-        let err = validate_truncation(Some("disabled")).expect_err("must reject");
-        assert!(err.contains("truncation.disabled"));
+    fn validate_truncation_accepts_disabled() {
+        assert!(validate_truncation(Some("disabled")).is_ok());
     }
 
     #[test]

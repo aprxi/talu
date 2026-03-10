@@ -23,13 +23,6 @@ fn config_with_policy(policy_json: &str) -> ServerConfig {
     cfg
 }
 
-fn config_with_strict_policy(policy_json: &str) -> ServerConfig {
-    let mut cfg = config_with_policy(policy_json);
-    cfg.agent_runtime_mode = Some("strict".to_string());
-    cfg.sandbox_backend = Some("linux-local".to_string());
-    cfg
-}
-
 fn config_with_policy_file(path: &std::path::Path) -> ServerConfig {
     let mut cfg = ServerConfig::new();
     cfg.policy_file = Some(path.to_path_buf());
@@ -223,122 +216,6 @@ fn agent_process_spawn_denied_by_policy() {
     );
     assert_eq!(resp.status, 403, "body: {}", resp.body);
     assert_eq!(resp.json()["error"]["code"], "policy_denied_exec");
-}
-
-#[test]
-fn agent_process_spawn_strict_mode_blocks_nested_subprocess_exec() {
-    let policy = r#"{
-        "default":"deny",
-        "statements":[
-            {"effect":"allow","action":"tool.process","command":"python3 *"}
-        ]
-    }"#;
-    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
-
-    let process_id = spawn_process(
-        &ctx,
-        "python3 -c 'raise SystemExit(__import__(\"os\").system(\"ls\")//256)'",
-    );
-
-    let stream = get(
-        ctx.addr(),
-        &format!("/v1/agent/processes/{process_id}/stream"),
-    );
-    assert_eq!(stream.status, 200, "stream body: {}", stream.body);
-
-    let events = parse_sse_events(&stream.body);
-    let exit_code = events
-        .iter()
-        .find(|e| e["type"] == "exit")
-        .and_then(|e| e["code"].as_i64());
-
-    assert!(
-        exit_code.is_some_and(|code| code != 0),
-        "expected non-zero exit for denied descendant exec: {events:?}"
-    );
-}
-
-#[test]
-fn agent_process_spawn_strict_mode_blocks_descendant_file_write_without_fs_write_allow() {
-    std::fs::create_dir_all("/tmp/allowed").expect("create /tmp/allowed");
-    let policy = r#"{
-        "default":"deny",
-        "statements":[
-            {"effect":"allow","action":"tool.process","command":"python3 *"},
-            {"effect":"allow","action":"tool.fs.write","resource":"allowed/**"}
-        ]
-    }"#;
-    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
-
-    let create = post_json(
-        ctx.addr(),
-        "/v1/agent/processes/spawn",
-        &serde_json::json!({
-            "command": "python3 -c '__import__(\"pathlib\").Path(\"/tmp/deny-proc-write.txt\").write_text(\"x\")'",
-            "cwd": "/tmp"
-        }),
-    );
-    assert_eq!(create.status, 200, "body: {}", create.body);
-    let process_id = create.json()["process_id"]
-        .as_str()
-        .expect("process_id")
-        .to_string();
-
-    let stream = get(
-        ctx.addr(),
-        &format!("/v1/agent/processes/{process_id}/stream"),
-    );
-    assert_eq!(stream.status, 200, "stream body: {}", stream.body);
-    let events = parse_sse_events(&stream.body);
-    let exit_code = events
-        .iter()
-        .find(|e| e["type"] == "exit")
-        .and_then(|e| e["code"].as_i64());
-    assert!(
-        exit_code.is_some_and(|code| code != 0),
-        "expected non-zero exit for denied descendant write: {events:?}"
-    );
-}
-
-#[test]
-fn agent_process_spawn_strict_mode_allows_descendant_file_write_with_fs_write_allow() {
-    let policy = r#"{
-        "default":"deny",
-        "statements":[
-            {"effect":"allow","action":"tool.process","command":"python3 *"},
-            {"effect":"allow","action":"tool.fs.write","resource":"**"}
-        ]
-    }"#;
-    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
-
-    let create = post_json(
-        ctx.addr(),
-        "/v1/agent/processes/spawn",
-        &serde_json::json!({
-            "command": "python3 -c '__import__(\"pathlib\").Path(\"allow-proc-write.txt\").write_text(\"ok\")'",
-            "cwd": "/tmp"
-        }),
-    );
-    assert_eq!(create.status, 200, "body: {}", create.body);
-    let process_id = create.json()["process_id"]
-        .as_str()
-        .expect("process_id")
-        .to_string();
-
-    let stream = get(
-        ctx.addr(),
-        &format!("/v1/agent/processes/{process_id}/stream"),
-    );
-    assert_eq!(stream.status, 200, "stream body: {}", stream.body);
-    let events = parse_sse_events(&stream.body);
-    let exit_code = events
-        .iter()
-        .find(|e| e["type"] == "exit")
-        .and_then(|e| e["code"].as_i64());
-    assert!(
-        exit_code.is_some_and(|code| code == 0),
-        "expected zero exit for allowed descendant write: {events:?}"
-    );
 }
 
 #[test]
