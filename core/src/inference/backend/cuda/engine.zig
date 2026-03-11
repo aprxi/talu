@@ -4249,36 +4249,23 @@ pub const CudaBackend = struct {
                     .f16 => self.matmul_f16_function orelse return error.CudaKernelUnavailable,
                     .bf16 => self.matmul_bf16_function orelse return error.CudaKernelUnavailable,
                 };
-                if (!packed_rows) {
-                    var row_index: usize = 0;
-                    while (row_index < rows) : (row_index += 1) {
-                        var input_row = try logicalF32RowSlice(input, rows, row_index, w.rows);
-                        var out_row = try logicalF32RowSlice(out, rows, row_index, w.cols);
-                        try compute.cuda.matmul_u16.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            kernel,
-                            &input_row,
-                            &w.buffer,
-                            &out_row,
-                            1,
-                            @intCast(w.rows),
-                            @intCast(w.cols),
-                        );
-                    }
-                    return;
+                var row_index: usize = 0;
+                while (row_index < rows) : (row_index += 1) {
+                    var input_row = try logicalF32RowSlice(input, rows, row_index, w.rows);
+                    var out_row = try logicalF32RowSlice(out, rows, row_index, w.cols);
+                    try compute.cuda.matmul_u16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &input_row,
+                        &w.buffer,
+                        &out_row,
+                        1,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                    );
                 }
-                try compute.cuda.matmul_u16.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    kernel,
-                    input,
-                    &w.buffer,
-                    out,
-                    @intCast(rows),
-                    @intCast(w.rows),
-                    @intCast(w.cols),
-                );
+                return;
             },
             .gaffine_u4 => |w| {
                 const kernel = self.gaffine_u4_matvec_function orelse return error.CudaKernelUnavailable;
@@ -4539,20 +4526,6 @@ pub const CudaBackend = struct {
         if (rows == 0 or cols == 0) return error.InvalidArgument;
         const packed_count = std.math.mul(u32, rows, cols) catch return error.InvalidArgument;
         const packed_bytes = std.math.mul(usize, @as(usize, packed_count), @sizeOf(f32)) catch return error.InvalidArgument;
-        if (input.size == packed_bytes and output.size == packed_bytes) {
-            return compute.cuda.rmsnorm.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                input,
-                weight,
-                output,
-                rows,
-                cols,
-                self.norm_eps,
-                self.loaded.runtime.weight_offset,
-            );
-        }
         if (input.size < packed_bytes or output.size < packed_bytes) return error.InvalidInstructionBinding;
 
         const row_count: usize = @intCast(rows);
@@ -5243,6 +5216,7 @@ pub const CudaBackend = struct {
         kernel.position_delta = self.slot_rope_position_delta;
         var input_view = Tensor.view3DSlice(input_host, seq_len, self.d_model);
         var output_view = Tensor.view3DSlice(output_host, seq_len, self.d_model);
+        const use_cache = attentionFallbackUsesCache(seq_len);
         // Attention fallback executes on CPU tensors; preserve host-readable
         // trace semantics even when wrapped by the CUDA execution route.
         const prev_backend = trace.setBackendContext(.cpu);
@@ -5253,10 +5227,14 @@ pub const CudaBackend = struct {
             cache,
             scratch,
             matmul_scratch,
-            true,
+            use_cache,
         );
         try self.uploadRowsF32StrideAware(output_host, seq_len, self.d_model, output);
         try self.device.synchronize();
+    }
+
+    fn attentionFallbackUsesCache(seq_len: usize) bool {
+        return seq_len == 1;
     }
 
     fn applyBiasF32(
@@ -9679,4 +9657,10 @@ test "logicalF32RowSlice uses widened row stride for staged slot buffers" {
     const row1 = try logicalF32RowSlice(&buffer, 2, 1, logical_width);
     try std.testing.expectEqual(buffer.pointer + widened_row_bytes, row1.pointer);
     try std.testing.expectEqual(@as(usize, logical_row_bytes), row1.size);
+}
+
+test "attentionFallbackUsesCache uses decode mode only for single-row execution" {
+    try std.testing.expect(CudaBackend.attentionFallbackUsesCache(1));
+    try std.testing.expect(!CudaBackend.attentionFallbackUsesCache(2));
+    try std.testing.expect(!CudaBackend.attentionFallbackUsesCache(15));
 }
