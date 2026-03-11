@@ -761,12 +761,14 @@ const GatedDeltaBlockRuntime = struct {
     ffn_w2: ?LinearWeight = null,
     ffn_w3: ?LinearWeight = null,
     in_proj: LinearWeight,
+    out_proj: LinearWeight,
     kernel: cpu_kernels.GatedDeltaKernel,
     state: cpu_kernels.GatedDeltaState,
     scratch: cpu_kernels.GatedDeltaScratch,
     matmul_scratch: compute.cpu.linalg.MatmulScratch,
 
     fn deinit(self: *GatedDeltaBlockRuntime, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
+        self.out_proj.deinit(device);
         self.in_proj.deinit(device);
         if (self.ffn_w3) |*w| w.deinit(device);
         if (self.ffn_w2) |*w| w.deinit(device);
@@ -2017,6 +2019,8 @@ const BlockRuntime = struct {
 
                     var in_proj_dev = try uploadLinearWeightWithContext(device, allocator, gated_delta.weights.in_proj, d_model, layer_idx, "gated_delta.in_proj");
                     errdefer in_proj_dev.deinit(device);
+                    var out_proj_dev = try uploadLinearWeightWithContext(device, allocator, gated_delta.weights.out_proj, @as(usize, gated_delta.config.n_heads) * @as(usize, gated_delta.config.d_head), layer_idx, "gated_delta.out_proj");
+                    errdefer out_proj_dev.deinit(device);
 
                     const in_proj_dispatch = try compute.cpu.linalg.matmulKernel(gated_delta.weights.in_proj.dtype);
                     const out_proj_dispatch = try compute.cpu.linalg.matmulKernel(gated_delta.weights.out_proj.dtype);
@@ -2072,7 +2076,7 @@ const BlockRuntime = struct {
                     const layer_norm_bytes = ln1_weight.byteSize() + (if (ln2_weight) |w| w.byteSize() else 0);
                     norm_weight_bytes = std.math.add(usize, norm_weight_bytes, layer_norm_bytes) catch return error.InvalidArgument;
 
-                    var layer_linear_bytes: usize = 0;
+                    var layer_linear_bytes: usize = in_proj_dev.byteSize() + out_proj_dev.byteSize();
                     if (ffn_w1) |w| layer_linear_bytes = std.math.add(usize, layer_linear_bytes, w.byteSize()) catch return error.InvalidArgument;
                     if (ffn_w2) |w| layer_linear_bytes = std.math.add(usize, layer_linear_bytes, w.byteSize()) catch return error.InvalidArgument;
                     if (ffn_w3) |w| layer_linear_bytes = std.math.add(usize, layer_linear_bytes, w.byteSize()) catch return error.InvalidArgument;
@@ -2093,6 +2097,7 @@ const BlockRuntime = struct {
                         .ffn_w2 = ffn_w2,
                         .ffn_w3 = ffn_w3,
                         .in_proj = in_proj_dev,
+                        .out_proj = out_proj_dev,
                         .kernel = gated_delta_kernel,
                         .state = gated_delta_state,
                         .scratch = gated_delta_scratch,
@@ -2558,6 +2563,7 @@ pub const CudaBackend = struct {
     layer_program_row_capacity: usize = 1,
     argmax_index_dev: compute.cuda.Buffer,
     gated_delta_stage_input_host: []f32,
+    gated_delta_stage_mid_host: []f32,
     gated_delta_stage_output_host: []f32,
     query_gate_projection_host: []f32,
     query_gate_values_host: []f32,
@@ -2623,6 +2629,7 @@ pub const CudaBackend = struct {
             .layer_program_row_capacity = 1,
             .argmax_index_dev = undefined,
             .gated_delta_stage_input_host = &.{},
+            .gated_delta_stage_mid_host = &.{},
             .gated_delta_stage_output_host = &.{},
             .query_gate_projection_host = &.{},
             .query_gate_values_host = &.{},
@@ -2853,6 +2860,7 @@ pub const CudaBackend = struct {
         if (self.parity_prefill_layer_ffn_norm_host.len > 0) self.allocator.free(self.parity_prefill_layer_ffn_norm_host);
         if (self.parity_prefill_block_out_host.len > 0) self.allocator.free(self.parity_prefill_block_out_host);
         if (self.gated_delta_stage_input_host.len > 0) self.allocator.free(self.gated_delta_stage_input_host);
+        if (self.gated_delta_stage_mid_host.len > 0) self.allocator.free(self.gated_delta_stage_mid_host);
         if (self.gated_delta_stage_output_host.len > 0) self.allocator.free(self.gated_delta_stage_output_host);
         if (self.cpu_rope_local) |rope| {
             rope.deinit(self.allocator);
@@ -4086,6 +4094,10 @@ pub const CudaBackend = struct {
             if (self.gated_delta_stage_input_host.len > 0) self.allocator.free(self.gated_delta_stage_input_host);
             self.gated_delta_stage_input_host = try self.allocator.alloc(f32, elements);
         }
+        if (self.gated_delta_stage_mid_host.len < elements) {
+            if (self.gated_delta_stage_mid_host.len > 0) self.allocator.free(self.gated_delta_stage_mid_host);
+            self.gated_delta_stage_mid_host = try self.allocator.alloc(f32, elements);
+        }
         if (self.gated_delta_stage_output_host.len < elements) {
             if (self.gated_delta_stage_output_host.len > 0) self.allocator.free(self.gated_delta_stage_output_host);
             self.gated_delta_stage_output_host = try self.allocator.alloc(f32, elements);
@@ -5195,14 +5207,11 @@ pub const CudaBackend = struct {
 
         const proj_element_count = std.math.mul(usize, seq_len, proj_len) catch return error.InvalidArgument;
         const proj_bytes = std.math.mul(usize, proj_element_count, @sizeOf(f32)) catch return error.InvalidArgument;
-        try self.ensureGatedDeltaHostStageCapacity(proj_element_count);
+        const ssm_element_count = std.math.mul(usize, seq_len, d_inner) catch return error.InvalidArgument;
+        try self.ensureGatedDeltaHostStageCapacity(@max(proj_element_count, ssm_element_count));
         const proj_host = self.gated_delta_stage_input_host[0..proj_element_count];
+        const ssm_host = self.gated_delta_stage_mid_host[0..ssm_element_count];
         const output_element_count = std.math.mul(usize, seq_len, d_model) catch return error.InvalidArgument;
-        if (self.gated_delta_stage_output_host.len < output_element_count) {
-            if (self.gated_delta_stage_output_host.len > 0) self.allocator.free(self.gated_delta_stage_output_host);
-            self.gated_delta_stage_output_host = try self.allocator.alloc(f32, output_element_count);
-        }
-        const output_host = self.gated_delta_stage_output_host[0..output_element_count];
 
         var proj_dev = try bufferSlice(&self.runtime_buffers.gdelta_proj_dev, 0, proj_bytes);
         try self.linearForwardRows(input, seq_len, &block.in_proj, &proj_dev);
@@ -5257,7 +5266,6 @@ pub const CudaBackend = struct {
         defer _ = trace.setBackendContext(prev_backend);
         for (0..seq_len) |t| {
             const proj_row = proj_host[t * proj_len ..][0..proj_len];
-            const output_row = output_host[t * d_model ..][0..d_model];
             const temp = block.scratch.getConvOutput(d_inner);
             const ssm_out = block.scratch.getSsmOutput(d_inner);
 
@@ -5343,34 +5351,53 @@ pub const CudaBackend = struct {
                 );
             }
 
-            var ssm_view = Tensor.view2DSlice(ssm_out, 1, d_inner);
-            var out_view = Tensor.view2DSlice(output_row, 1, d_model);
-            block.kernel.matmul_out_proj(&ssm_view, block.kernel.weights.out_proj, &out_view, &block.matmul_scratch);
-            if (trace_enabled) {
+            @memcpy(ssm_host[t * d_inner ..][0..d_inner], ssm_out);
+        }
+
+        var ssm_dev = try bufferSlice(&self.runtime_buffers.gdelta_proj_dev, 0, std.math.mul(usize, ssm_element_count, @sizeOf(f32)) catch return error.InvalidArgument);
+        self.uploadRowsF32StrideAware(ssm_host, seq_len, d_inner, &ssm_dev) catch |err| {
+            log.warn("inference", "CUDA gated-delta normalized state upload failed", .{
+                .seq_len = seq_len,
+                .d_inner = d_inner,
+                .stage_bytes = ssm_element_count * @sizeOf(f32),
+                .reason = @errorName(err),
+            });
+            return err;
+        };
+        try self.linearForwardRows(&ssm_dev, seq_len, &block.out_proj, output);
+        if (trace_enabled) {
+            if (self.gated_delta_stage_output_host.len < output_element_count) {
+                if (self.gated_delta_stage_output_host.len > 0) self.allocator.free(self.gated_delta_stage_output_host);
+                self.gated_delta_stage_output_host = try self.allocator.alloc(f32, output_element_count);
+            }
+            const output_host = self.gated_delta_stage_output_host[0..output_element_count];
+            self.downloadRowsF32StrideAware(output, seq_len, d_model, output_host) catch |err| {
+                log.warn("inference", "CUDA gated-delta output download failed", .{
+                    .seq_len = seq_len,
+                    .d_model = d_model,
+                    .output_bytes = output.size,
+                    .stage_bytes = output_element_count * @sizeOf(f32),
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
+            const prev_gpu_backend = trace.setBackendContext(.cuda);
+            defer _ = trace.setBackendContext(prev_gpu_backend);
+            for (0..seq_len) |t| {
+                const output_row = output_host[t * d_model ..][0..d_model];
                 trace.emit(
                     .gdelta_out,
                     block.kernel.layer_idx,
                     0,
                     @intCast(trace_pos_offset + t),
-                    out_view.data().ptr,
+                    @ptrCast(output_row.ptr),
                     .f32,
                     .{ 1, 1, @intCast(d_model), 0 },
                     3,
-                    null,
+                    "cuda_gdelta_out_host",
                 );
             }
         }
-
-        self.uploadRowsF32StrideAware(output_host, seq_len, self.d_model, output) catch |err| {
-            log.warn("inference", "CUDA gated-delta output upload failed", .{
-                .seq_len = seq_len,
-                .d_model = d_model,
-                .output_bytes = output.size,
-                .stage_bytes = output_element_count * @sizeOf(f32),
-                .reason = @errorName(err),
-            });
-            return err;
-        };
         // Ensure host-produced fallback output is globally visible before
         // subsequent CUDA kernels consume this buffer.
         try self.device.synchronize();
