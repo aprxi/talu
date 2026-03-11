@@ -130,17 +130,33 @@ pub const MetalBackend = struct {
         return if (self.config.logits_scaling < 0.0) argminHost(logits) else argmaxHost(logits);
     }
 
-    fn parityDebugEnabled() bool {
-        return std.posix.getenv("TALU_PARITY_DEBUG") != null;
-    }
-
     fn emitParityFinalPathCheckpoints() bool {
-        return trace.isEnabled() and parityDebugEnabled();
+        // XRAY ACCEPTABLE USE:
+        // Verify is observability-only. It MUST NOT toggle prefill/decode route
+        // selection, fusion eligibility, or kernel choice. Keep this disabled
+        // unless we can emit final-path probes from the already-selected
+        // production route.
+        return false;
     }
 
     fn applyLogitsScalingHandle(self: *MetalBackend, logits_handle: graph.ArrayHandle) graph.ArrayHandle {
         if (self.weights.logits_scaling == 1.0) return logits_handle;
         return graph.mlx_lazy_multiply_scalar(logits_handle, 1.0 / self.weights.logits_scaling);
+    }
+
+    fn emitLmHeadFromReadyLogits(self: *MetalBackend, logits_out: []const f32) !void {
+        if (!trace.isEnabled()) return;
+        if (logits_out.len < self.vocab_size) return error.InvalidArgument;
+        trace.emitFinal(
+            .lm_head,
+            0,
+            0,
+            @ptrCast(logits_out.ptr),
+            .f32,
+            .{ @intCast(self.vocab_size), 0, 0, 0 },
+            1,
+            "metal_lm_head_host",
+        );
     }
 
     fn projectLastNormedHiddenToLogits(
@@ -193,14 +209,13 @@ pub const MetalBackend = struct {
         );
 
         if (self.weights.logits_scaling != 1.0) {
-            const lm_head_host = try self.allocator.alloc(f32, self.vocab_size);
-            defer self.allocator.free(lm_head_host);
-            graph.copyToHost(lm_head_handle, lm_head_host);
+            // Keep lm_head trace semantics aligned with CPU: emit the same
+            // scaled logits buffer used for token selection.
             trace.emitFinal(
                 .lm_head,
                 0,
                 0,
-                @ptrCast(lm_head_host.ptr),
+                @ptrCast(logits_out.ptr),
                 .f32,
                 .{ @intCast(self.vocab_size), 0, 0, 0 },
                 1,
@@ -691,6 +706,7 @@ pub const MetalBackend = struct {
             t_eval_done_ns = t_done;
             t_copy_done_ns = t_done;
         }
+        try self.emitLmHeadFromReadyLogits(logits_out);
         trace.emitFinal(
             .logits_ready,
             @intCast(sequence_len - 1),
@@ -776,6 +792,7 @@ pub const MetalBackend = struct {
             graph.eval(&[_]graph.ArrayHandle{logits_handle});
             graph.copyToHost(logits_handle, logits_out);
         }
+        try self.emitLmHeadFromReadyLogits(logits_out);
         trace.emitFinal(
             .logits_ready,
             0,
@@ -847,11 +864,10 @@ pub const MetalBackend = struct {
         sampling_config: *const metal_sampling.SamplingConfig,
     ) bool {
         _ = self;
-        if (std.posix.getenv("TALU_PARITY_DEBUG") != null) return false;
-        return sampling_config.strategy == .top_k and
-            sampling_config.top_k > 0 and
-            sampling_config.temperature > 0.0 and
-            sampling_config.min_p == 0.0;
+        _ = sampling_config;
+        // Disabled until decodeTopKCandidates is numerically parity-clean with
+        // the canonical decodeBatch route. Scheduler must use one correct path.
+        return false;
     }
 
     pub fn decodeTopKCandidates(
@@ -934,7 +950,8 @@ pub const MetalBackend = struct {
 
     pub fn supportsSchedulerBackendDecodeStreamingRoute(self: *const MetalBackend) bool {
         _ = self;
-        if (std.posix.getenv("TALU_PARITY_DEBUG") != null) return false;
+        // XRAY ACCEPTABLE USE:
+        // Verify must never disable/enable scheduler routes.
         return true;
     }
 

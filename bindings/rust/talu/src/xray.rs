@@ -457,6 +457,26 @@ impl VerifyCaptureHandle {
     pub fn disable() {
         unsafe { talu_sys::talu_xray_verify_capture_disable() };
     }
+
+    /// Set transcript-only token parity behavior for verify runs.
+    pub fn set_ignore_token_parity(enabled: bool) {
+        unsafe { talu_sys::talu_xray_verify_set_ignore_token_parity(enabled) };
+    }
+
+    /// Clear transcript-only token parity override.
+    pub fn clear_ignore_token_parity_override() {
+        unsafe { talu_sys::talu_xray_verify_clear_ignore_token_parity_override() };
+    }
+
+    /// Set capture-only token-only verification behavior.
+    pub fn set_token_only(enabled: bool) {
+        unsafe { talu_sys::talu_xray_verify_set_token_only(enabled) };
+    }
+
+    /// Clear token-only verification override.
+    pub fn clear_token_only_override() {
+        unsafe { talu_sys::talu_xray_verify_clear_token_only_override() };
+    }
 }
 
 impl Drop for VerifyCaptureHandle {

@@ -264,10 +264,6 @@ pub const TransformerBlock = struct {
         };
     }
 
-    fn xrayVerifyModeEnabled() bool {
-        return std.posix.getenv("TALU_XRAY_VERIFY_MODE") != null;
-    }
-
     fn emitLayerProgramTracePoint(
         state: *const LayerProgramExecutionContext,
         point: trace.TracePoint,
@@ -276,9 +272,8 @@ pub const TransformerBlock = struct {
         kernel_name: []const u8,
     ) void {
         if (!trace.isEnabled()) return;
-        // block_out must carry real host data for parity verification; a dummy
-        // marker pointer creates invalid stats and false divergences.
-        if (xrayVerifyModeEnabled() and point == .block_out) return;
+        // block_out must carry real host data; marker-pointer traces are invalid.
+        if (point == .block_out) return;
         var marker = [_]f32{0.0};
         const seq_len = inferTraceSeqLen(state);
         trace.emit(
@@ -1752,29 +1747,60 @@ pub const TransformerBlock = struct {
             .cache = gated_delta_cache,
             .layer_idx = state.layer_idx,
         };
+        // XRAY ACCEPTABLE USE:
+        // Trace state is capture-only. It can mirror intermediates to host but
+        // MUST NOT change the selected kernel path or arithmetic.
+        const gd_trace_state_ptr: ?*gated_delta_kernel.GatedDeltaState = if (trace.isEnabled())
+            &gd_trace_state
+        else
+            null;
         const output = try runGatedDeltaKernel(
             input,
             gated_delta_binding,
             state.layer_idx,
             gated_delta_cache,
-            if (xrayVerifyModeEnabled()) &gd_trace_state else null,
+            gd_trace_state_ptr,
         );
         arraySlotFromHandle(io.outputs[0]).* = output;
-        if (xrayVerifyModeEnabled()) {
+        if (trace.isEnabled()) {
+            const captured_handles: [4]?mlx_graph.ArrayHandle = .{
+                gd_trace_state.trace_in_proj,
+                gd_trace_state.trace_conv,
+                gd_trace_state.trace_ssm,
+                gd_trace_state.trace_norm,
+            };
+            defer {
+                // Capture kernels may alias returned intermediates. Free only
+                // unique non-output handles to avoid accidental double-free/UAF.
+                var seen: [4]mlx_graph.ArrayHandle = undefined;
+                var seen_count: usize = 0;
+                for (captured_handles) |maybe_handle| {
+                    const handle = maybe_handle orelse continue;
+                    if (handle == output) continue;
+                    var duplicate = false;
+                    for (seen[0..seen_count]) |existing| {
+                        if (existing == handle) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) {
+                        seen[seen_count] = handle;
+                        seen_count += 1;
+                        mlx_graph.freeArray(handle);
+                    }
+                }
+            }
             if (gd_trace_state.trace_in_proj) |handle| {
-                defer mlx_graph.freeArray(handle);
                 emitArrayPerTokenHostTracePoint(state, handle, .gdelta_in_proj, "metal_gdelta_in_proj_host");
             }
             if (gd_trace_state.trace_conv) |handle| {
-                defer mlx_graph.freeArray(handle);
                 emitArrayPerTokenHostTracePoint(state, handle, .gdelta_conv, "metal_gdelta_conv_host");
             }
             if (gd_trace_state.trace_ssm) |handle| {
-                defer mlx_graph.freeArray(handle);
                 emitArrayPerTokenHostTracePoint(state, handle, .gdelta_ssm, "metal_gdelta_ssm_host");
             }
             if (gd_trace_state.trace_norm) |handle| {
-                defer mlx_graph.freeArray(handle);
                 emitArrayPerTokenHostTracePoint(state, handle, .gdelta_norm, "metal_gdelta_norm_host");
             }
             emitArrayPerTokenHostTracePoint(state, output, .gdelta_out, "metal_gdelta_out_host");
@@ -1970,28 +1996,14 @@ pub const TransformerBlock = struct {
             insn,
             registers,
         );
-        const seq_len = inferTraceSeqLen(state);
-        if (xrayVerifyModeEnabled()) {
-            // In verify mode emit host-backed stats under the single logical
-            // norm checkpoint this instruction corresponds to.
-            const point = inferNormTracePoint(state, insn);
-            emitLayerProgramModelWidthHostTracePoint(
-                state,
-                insn,
-                registers,
-                point,
-                "metal_rmsnorm_host",
-            );
-        } else {
-            const point = inferNormTracePoint(state, insn);
-            emitLayerProgramTracePoint(
-                state,
-                point,
-                traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
-                3,
-                "metal_rmsnorm",
-            );
-        }
+        const point = inferNormTracePoint(state, insn);
+        emitLayerProgramModelWidthHostTracePoint(
+            state,
+            insn,
+            registers,
+            point,
+            "metal_rmsnorm_host",
+        );
     }
 
     fn layerProgramAttentionRuntimeAdapter(
@@ -2375,9 +2387,10 @@ pub const TransformerBlock = struct {
         try bindLayerProgramStateDescriptors(&exec_ctx, &compiled_plan.plan, state_blocks);
 
         var insn_idx: usize = 0;
-        const allow_rms_swiglu_fusion = std.posix.getenv("TALU_METAL_DISABLE_RMS_SWIGLU_FUSION") == null and
-            std.posix.getenv("TALU_PARITY_DEBUG") == null and
-            !xrayVerifyModeEnabled();
+        // XRAY ACCEPTABLE USE:
+        // Fusion policy is a production performance decision. Verify/tracing
+        // must not alter fusion on/off.
+        const allow_rms_swiglu_fusion = std.posix.getenv("TALU_METAL_DISABLE_RMS_SWIGLU_FUSION") == null;
         while (insn_idx < compiled_plan.plan.instructions.len) {
             const insn = &compiled_plan.plan.instructions[insn_idx];
             if (insn_idx + 1 < compiled_plan.plan.instructions.len) {

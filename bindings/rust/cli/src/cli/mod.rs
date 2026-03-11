@@ -567,13 +567,14 @@ pub(super) struct XrayArgs {
     #[arg(long)]
     pub verify: bool,
 
+    /// Internal use only: record a reference bundle to a specific path.
+    /// Hidden to keep user-facing xray workflow single-path (`--verify`).
+    #[arg(long, hide = true)]
+    pub record_reference: Option<String>,
+
     /// Ignore cache and regenerate CPU golden reference before verify
     #[arg(long)]
     pub no_cache: bool,
-
-    /// Also print full-checkpoint tensor diff against CPU sidecar.
-    #[arg(long)]
-    pub diff_full: bool,
 
     /// Targeted fast verify for a single checkpoint:
     /// `<token>:<layer|global>:<point>[:<pos>]`

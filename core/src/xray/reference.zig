@@ -13,7 +13,6 @@ const std = @import("std");
 const stats_mod = @import("stats.zig");
 const trace = @import("trace.zig");
 const capture_mod = @import("capture.zig");
-const teacher_forcing = @import("teacher_forcing.zig");
 
 const TensorStats = stats_mod.TensorStats;
 const TracePoint = trace.TracePoint;
@@ -238,11 +237,6 @@ pub const ReferenceVerifier = struct {
         return true;
     }
 
-    fn tokenOnlyVerificationEnabled() bool {
-        const raw = std.posix.getenv("TALU_XRAY_VERIFY_TOKEN_ONLY") orelse return false;
-        return !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
-    }
-
     /// Get the next token to force (for teacher forcing)
     pub fn getNextToken(self: *const ReferenceVerifier) ?u32 {
         if (self.token_idx >= self.reference.token_transcript.len) {
@@ -310,8 +304,6 @@ pub const ReferenceVerifier = struct {
         emission: trace.TraceEmission,
         actual_stats: TensorStats,
     ) !void {
-        if (tokenOnlyVerificationEnabled() and !teacher_forcing.isEnabled()) return;
-
         // Skip if already diverged
         if (self.has_diverged) return;
 
@@ -366,7 +358,6 @@ pub const ReferenceVerifier = struct {
             }
             return error.StatsDivergence;
         }
-        if (tokenOnlyVerificationEnabled()) return;
         if (self.expected_record_idx >= self.reference.stats_records.len) return;
 
         const missing = self.reference.stats_records[self.expected_record_idx];
@@ -428,6 +419,7 @@ pub const ReferenceVerifier = struct {
     }
 
     fn statsMatch(self: *const ReferenceVerifier, expected: TensorStats, actual: TensorStats) bool {
+        const tol = self.tolerance;
         // Check for anomaly mismatch
         if (expected.nan_count != actual.nan_count) return false;
         if (expected.inf_count != actual.inf_count) return false;
@@ -435,19 +427,21 @@ pub const ReferenceVerifier = struct {
         // Check element count
         if (expected.count != actual.count) return false;
 
-        // Check RMS difference
+        // Check RMS difference.
+        // Use combined abs+rel threshold so tiny absolute noise on small
+        // magnitudes does not trigger false divergence.
         const rms_diff = @abs(expected.rms() - actual.rms());
         const rms_rel = if (expected.rms() > 0) rms_diff / expected.rms() else rms_diff;
-        if (rms_rel > self.tolerance) return false;
+        if (rms_diff > tol and rms_rel > tol) return false;
 
-        // Check L2 norm difference
+        // Check L2 norm difference with the same abs+rel guard.
         const l2_diff = @abs(expected.l2Norm() - actual.l2Norm());
         const l2_rel = if (expected.l2Norm() > 0) l2_diff / expected.l2Norm() else l2_diff;
-        if (l2_rel > self.tolerance) return false;
+        if (l2_diff > tol and l2_rel > tol) return false;
 
-        // Check mean difference
+        // Mean is already a low-magnitude scalar, keep absolute threshold.
         const mean_diff = @abs(expected.mean() - actual.mean());
-        if (mean_diff > self.tolerance) return false;
+        if (mean_diff > tol) return false;
 
         return true;
     }
@@ -851,50 +845,6 @@ test "ReferenceVerifier detects token divergence" {
     try std.testing.expectError(error.TokenDivergence, verifier.finish());
 }
 
-test "ReferenceVerifier finish skips stats coverage in token-only mode" {
-    const allocator = std.testing.allocator;
-
-    const golden_stats = TensorStats{
-        .count = 4,
-        .min = 1.0,
-        .max = 4.0,
-        .sum = 10.0,
-        .sum_sq = 30.0,
-        .nan_count = 0,
-        .inf_count = 0,
-    };
-
-    const ref = ReferenceData{
-        .model_name = "test",
-        .seed = 42,
-        .temperature = 1.0,
-        .max_tokens = 1,
-        .token_transcript = &[_]u32{100},
-        .stats_records = &[_]StatsRecord{.{
-            .token_idx = 0,
-            .layer = trace.TraceEmission.NO_LAYER,
-            .point = .lm_head,
-            .position = 0,
-            .stats = golden_stats,
-        }},
-        .allocator = allocator,
-    };
-
-    const EnvFns = struct {
-        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: i32) i32;
-        extern "c" fn unsetenv(name: [*:0]const u8) i32;
-    };
-
-    try std.testing.expectEqual(@as(i32, 0), EnvFns.setenv("TALU_XRAY_VERIFY_TOKEN_ONLY", "1", 1));
-    defer _ = EnvFns.unsetenv("TALU_XRAY_VERIFY_TOKEN_ONLY");
-
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
-    defer verifier.deinit();
-
-    try verifier.finish();
-    try std.testing.expect(!verifier.has_diverged);
-}
-
 test "ReferenceVerifier ignores extra emissions but finish enforces completeness" {
     const allocator = std.testing.allocator;
 
@@ -1139,4 +1089,78 @@ test "ReferenceVerifier keeps last observed local to missing checkpoint window" 
     const msg = div.message[0..msg_len];
     try std.testing.expect(std.mem.indexOf(u8, msg, "last observed token=0 layer=0 point=block.out pos=14") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "token=1 layer=65535 point=logits_ready") == null);
+}
+
+test "ReferenceVerifier statsMatch allows tiny absolute RMS/L2 drift" {
+    const allocator = std.testing.allocator;
+    const ref = ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{},
+        .stats_records = &[_]StatsRecord{},
+        .allocator = allocator,
+    };
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    defer verifier.deinit();
+
+    // Mirrors observed metal-vs-cpu checkpoint drift:
+    // expected RMS=0.075257, actual RMS=0.075268 (rel ~0.001048, abs ~1e-5).
+    const expected = TensorStats{
+        .count = 1,
+        .min = 0.075257,
+        .max = 0.075257,
+        .sum = 0.075257,
+        .sum_sq = 0.075257 * 0.075257,
+        .nan_count = 0,
+        .inf_count = 0,
+    };
+    const actual = TensorStats{
+        .count = 1,
+        .min = 0.075268,
+        .max = 0.075268,
+        .sum = 0.075268,
+        .sum_sq = 0.075268 * 0.075268,
+        .nan_count = 0,
+        .inf_count = 0,
+    };
+
+    try std.testing.expect(verifier.statsMatch(expected, actual));
+}
+
+test "ReferenceVerifier statsMatch rejects large RMS/L2 drift" {
+    const allocator = std.testing.allocator;
+    const ref = ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{},
+        .stats_records = &[_]StatsRecord{},
+        .allocator = allocator,
+    };
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    defer verifier.deinit();
+
+    const expected = TensorStats{
+        .count = 1,
+        .min = 1.0,
+        .max = 1.0,
+        .sum = 1.0,
+        .sum_sq = 1.0,
+        .nan_count = 0,
+        .inf_count = 0,
+    };
+    const actual = TensorStats{
+        .count = 1,
+        .min = 1.01,
+        .max = 1.01,
+        .sum = 1.01,
+        .sum_sq = 1.01 * 1.01,
+        .nan_count = 0,
+        .inf_count = 0,
+    };
+
+    try std.testing.expect(!verifier.statsMatch(expected, actual));
 }

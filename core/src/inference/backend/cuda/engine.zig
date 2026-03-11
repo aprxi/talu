@@ -5191,7 +5191,7 @@ pub const CudaBackend = struct {
     }
 
     fn parityDebugEnabled() bool {
-        return std.posix.getenv("TALU_PARITY_DEBUG") != null;
+        return trace.isEnabled();
     }
 
     fn ensureParityPrefillBufferCapacity(self: *CudaBackend, buffer: *[]f32, elements: usize) !void {
