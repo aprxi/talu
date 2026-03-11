@@ -1266,7 +1266,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         ));
         let _ = run_pass(
             true,
-            true,
+            false,
             &reference_json_path,
             max_tokens,
             Some(&candidate_npz),
@@ -1359,7 +1359,11 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         println!("details:");
         println!("  kind=checkpoint");
         println!("  checkpoint={}", selected.key);
-        println!("  expected_len={} actual_len={}", expected.len(), actual.len());
+        println!(
+            "  expected_len={} actual_len={}",
+            expected.len(),
+            actual.len()
+        );
         println!(
             "  metric=rms expected={:.6} actual={:.6} abs_diff={:.6} rel_diff={:.6}",
             expected_rms, actual_rms, abs_rms_diff, rel_rms
@@ -1389,7 +1393,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
     ));
     let (diverged, divergence_msg) = run_pass(
         false,
-        true,
+        false,
         &reference_json_path,
         args.tokens as usize,
         Some(&candidate_npz_phase1),
@@ -1413,7 +1417,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         ));
         let (_, phase2_msg) = run_pass(
             true,
-            true,
+            false,
             &reference_json_path,
             args.tokens as usize,
             Some(&candidate_npz_phase2),
@@ -1427,7 +1431,8 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
                 load_npz_f32(&candidate_npz_phase2),
             ) {
                 (Ok(expected), Ok(actual)) => {
-                    if let Some(first_diff) = find_first_checkpoint_diff(&expected, &actual, tolerance)
+                    if let Some(first_diff) =
+                        find_first_checkpoint_diff(&expected, &actual, tolerance)
                     {
                         print_first_checkpoint_diff(&first_diff);
                         print_targeted_checkpoint_hint(model, &prompt_text, &first_diff.parsed);
@@ -1664,9 +1669,13 @@ fn parse_verify_checkpoint_target(raw: &str) -> Result<VerifyCheckpointTarget> {
             raw
         ));
     }
-    let token = parts[0]
-        .parse::<u32>()
-        .map_err(|_| anyhow!("invalid token '{}' in --verify-checkpoint '{}'", parts[0], raw))?;
+    let token = parts[0].parse::<u32>().map_err(|_| {
+        anyhow!(
+            "invalid token '{}' in --verify-checkpoint '{}'",
+            parts[0],
+            raw
+        )
+    })?;
     let layer = if parts[1].eq_ignore_ascii_case("global") {
         VerifyLayerTarget::Global
     } else {
@@ -2084,16 +2093,16 @@ fn find_first_checkpoint_diff(
         };
         (
             a.token,
-            a.position,
             scope_rank(&a.scope),
+            a.position,
             a.layer_index,
             a.point.as_str(),
             a.key.as_str(),
         )
             .cmp(&(
                 b.token,
-                b.position,
                 scope_rank(&b.scope),
+                b.position,
                 b.layer_index,
                 b.point.as_str(),
                 b.key.as_str(),
@@ -2336,9 +2345,9 @@ fn print_full_diff_report(expected_path: &Path, actual_path: &Path, report: &Ful
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_npz_entry_key, parse_checkpoint_key, parse_npy_f32,
+        find_first_checkpoint_diff, normalize_npz_entry_key, parse_checkpoint_key, parse_npy_f32,
         parse_verify_checkpoint_target, reference_cache_key, select_checkpoint_key,
-        VerifyCheckpointTarget, VerifyLayerTarget,
+        FirstCheckpointDiffKind, VerifyCheckpointTarget, VerifyLayerTarget,
     };
     use std::collections::BTreeMap;
 
@@ -2412,9 +2421,18 @@ mod tests {
     #[test]
     fn select_checkpoint_key_picks_lowest_position_when_unspecified() {
         let mut tensors = BTreeMap::new();
-        tensors.insert("tok1_pos18_layer_0_layer_ffn_norm".to_string(), vec![0.0f32]);
-        tensors.insert("tok1_pos16_layer_0_layer_ffn_norm".to_string(), vec![0.0f32]);
-        tensors.insert("tok1_pos16_layer_1_layer_ffn_norm".to_string(), vec![0.0f32]);
+        tensors.insert(
+            "tok1_pos18_layer_0_layer_ffn_norm".to_string(),
+            vec![0.0f32],
+        );
+        tensors.insert(
+            "tok1_pos16_layer_0_layer_ffn_norm".to_string(),
+            vec![0.0f32],
+        );
+        tensors.insert(
+            "tok1_pos16_layer_1_layer_ffn_norm".to_string(),
+            vec![0.0f32],
+        );
 
         let target = VerifyCheckpointTarget {
             token: 1,
@@ -2430,10 +2448,19 @@ mod tests {
     #[test]
     fn select_checkpoint_key_prefers_common_key_when_position_unspecified() {
         let mut golden = BTreeMap::new();
-        golden.insert("tok0_pos1_layer_0_layer_attn_norm".to_string(), vec![0.0f32]);
-        golden.insert("tok0_pos16_layer_0_layer_attn_norm".to_string(), vec![0.0f32]);
+        golden.insert(
+            "tok0_pos1_layer_0_layer_attn_norm".to_string(),
+            vec![0.0f32],
+        );
+        golden.insert(
+            "tok0_pos16_layer_0_layer_attn_norm".to_string(),
+            vec![0.0f32],
+        );
         let mut candidate = BTreeMap::new();
-        candidate.insert("tok0_pos16_layer_0_layer_attn_norm".to_string(), vec![0.0f32]);
+        candidate.insert(
+            "tok0_pos16_layer_0_layer_attn_norm".to_string(),
+            vec![0.0f32],
+        );
 
         let target = VerifyCheckpointTarget {
             token: 0,
@@ -2444,6 +2471,24 @@ mod tests {
         let selected = select_checkpoint_key(&golden, &target, Some(&candidate))
             .expect("selection should succeed");
         assert_eq!(selected.key, "tok0_pos16_layer_0_layer_attn_norm");
+    }
+
+    #[test]
+    fn find_first_checkpoint_diff_prefers_layer_before_global() {
+        let mut expected = BTreeMap::new();
+        expected.insert("tok0_pos0_global_0_lm_head".to_string(), vec![1.0f32]);
+        expected.insert(
+            "tok0_pos16_layer_0_layer_attn_norm".to_string(),
+            vec![1.0f32],
+        );
+
+        let mut actual = BTreeMap::new();
+        actual.insert("tok0_pos0_global_0_lm_head".to_string(), vec![1.0f32]);
+
+        let diff = find_first_checkpoint_diff(&expected, &actual, 1e-3)
+            .expect("a missing layer checkpoint should be reported");
+        assert_eq!(diff.parsed.key, "tok0_pos16_layer_0_layer_attn_norm");
+        assert!(matches!(diff.kind, FirstCheckpointDiffKind::Missing));
     }
 
     #[test]

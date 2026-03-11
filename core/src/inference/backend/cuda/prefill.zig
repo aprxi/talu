@@ -176,11 +176,6 @@ const MockBackend = struct {
         if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
     }
 
-    fn shouldDownloadPrefillLogitsImpl(self: *const MockBackend, token_index: usize, token_count: usize) bool {
-        _ = self;
-        return token_index + 1 == token_count;
-    }
-
     fn beginParityPrefillCapture(self: *MockBackend, seq_len: usize) !void {
         _ = self;
         _ = seq_len;
@@ -224,7 +219,7 @@ test "prefill executes batched prefill path" {
 
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
-    try testing.expectEqual(tokens.len, backend.compute_calls);
+    try testing.expectEqual(@as(usize, 1), backend.compute_calls);
     try testing.expectEqual(tokens.len, backend.slot_position);
 }
 
@@ -237,7 +232,7 @@ test "prefillSlot executes batched prefill path" {
 
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
-    try testing.expectEqual(tokens.len, backend.compute_calls);
+    try testing.expectEqual(@as(usize, 1), backend.compute_calls);
     try testing.expectEqual(tokens.len, backend.slot_position);
 }
 

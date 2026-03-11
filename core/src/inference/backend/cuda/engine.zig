@@ -666,6 +666,30 @@ fn bufferF32RowCount(buffer: *const compute.cuda.Buffer, width: usize) !usize {
     return rows;
 }
 
+fn logicalF32RowSlice(
+    buffer: *const compute.cuda.Buffer,
+    rows: usize,
+    row_index: usize,
+    logical_width: usize,
+) !compute.cuda.Buffer {
+    if (rows == 0 or logical_width == 0 or row_index >= rows) return error.InvalidArgument;
+    const row_bytes = std.math.mul(usize, logical_width, @sizeOf(f32)) catch return error.InvalidArgument;
+    const packed_bytes = std.math.mul(usize, rows, row_bytes) catch return error.InvalidArgument;
+    if (buffer.size < packed_bytes) return error.InvalidInstructionBinding;
+
+    const row_stride = if (buffer.size == packed_bytes)
+        row_bytes
+    else blk: {
+        if (buffer.size % rows != 0) return error.InvalidInstructionBinding;
+        const stride = buffer.size / rows;
+        if (stride < row_bytes) return error.InvalidInstructionBinding;
+        break :blk stride;
+    };
+
+    const row_offset = std.math.mul(usize, row_index, row_stride) catch return error.InvalidArgument;
+    return bufferSlice(buffer, row_offset, row_bytes);
+}
+
 const AttentionWeightRefs = struct {
     q_proj: ?*const LinearWeight = null,
     k_proj: ?*const LinearWeight = null,
@@ -3633,13 +3657,15 @@ pub const CudaBackend = struct {
 
         if (!compute_logits) return;
 
-        try self.runRmsnormExactMaybeCpu(
-            "decode_final_norm",
+        try compute.cuda.rmsnorm.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.rmsnorm_function orelse return error.CudaKernelUnavailable,
             &final_hidden,
             &self.runtime_buffers.norm_weight_dev,
             &norm_out_row,
             1,
-            self.d_model,
+            @intCast(self.d_model),
             self.norm_eps,
             self.loaded.runtime.weight_offset,
         );
@@ -3673,12 +3699,12 @@ pub const CudaBackend = struct {
                     rows128 * vocab128 * @sizeOf(f32),
             );
             const kernel_name = switch (self.runtime_buffers.projection_weight) {
-                .dense_f32 => "matmul_lm_head_f32",
+                .dense_f32 => "matmul_lm_head_f32_host",
                 .dense_u16 => |w| switch (w.dtype) {
-                    .bf16 => "matmul_lm_head_bf16",
-                    .f16 => "matmul_lm_head_f16",
+                    .bf16 => "matmul_lm_head_bf16_host",
+                    .f16 => "matmul_lm_head_f16_host",
                 },
-                .gaffine_u4 => "matmul_lm_head_gaffine_u4",
+                .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
             };
             trace.emitFinalWithWork(
                 .lm_head,
@@ -3821,13 +3847,15 @@ pub const CudaBackend = struct {
         const last_offset = std.math.mul(usize, last_position, row_bytes) catch return error.InvalidArgument;
         var last_hidden = try bufferSlice(&final_hidden_rows, last_offset, row_bytes);
         var last_norm = try bufferSlice(&self.runtime_buffers.norm_out_dev, 0, row_bytes);
-        try self.runRmsnormExactMaybeCpu(
-            "prefill_final_norm",
+        try compute.cuda.rmsnorm.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.rmsnorm_function orelse return error.CudaKernelUnavailable,
             &last_hidden,
             &self.runtime_buffers.norm_weight_dev,
             &last_norm,
             1,
-            self.d_model,
+            @intCast(self.d_model),
             self.norm_eps,
             self.loaded.runtime.weight_offset,
         );
@@ -3858,12 +3886,12 @@ pub const CudaBackend = struct {
                     rows128 * vocab128 * @sizeOf(f32),
             );
             const kernel_name = switch (self.runtime_buffers.projection_weight) {
-                .dense_f32 => "matmul_lm_head_f32",
+                .dense_f32 => "matmul_lm_head_f32_host",
                 .dense_u16 => |w| switch (w.dtype) {
-                    .bf16 => "matmul_lm_head_bf16",
-                    .f16 => "matmul_lm_head_f16",
+                    .bf16 => "matmul_lm_head_bf16_host",
+                    .f16 => "matmul_lm_head_f16_host",
                 },
-                .gaffine_u4 => "matmul_lm_head_gaffine_u4",
+                .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
             };
             trace.emitFinalWithWork(
                 .lm_head,
@@ -4042,54 +4070,6 @@ pub const CudaBackend = struct {
         }
     }
 
-    fn runRmsnormExactMaybeCpu(
-        self: *CudaBackend,
-        _: []const u8,
-        input: *const compute.cuda.Buffer,
-        weight: *const compute.cuda.Buffer,
-        output: *compute.cuda.Buffer,
-        rows: usize,
-        cols: usize,
-        eps: f32,
-        weight_offset: f32,
-    ) !void {
-        if (!trace.isEnabled()) {
-            return compute.cuda.rmsnorm.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                input,
-                weight,
-                output,
-                @intCast(rows),
-                @intCast(cols),
-                eps,
-                weight_offset,
-            );
-        }
-        if (rows == 0 or cols == 0) return error.InvalidArgument;
-        const element_count = std.math.mul(usize, rows, cols) catch return error.InvalidArgument;
-        try self.ensureGatedDeltaHostStageCapacity(element_count);
-        try self.ensureQkNormWeightHostCapacity(cols);
-        const input_host = self.gated_delta_stage_input_host[0..element_count];
-        const output_host = self.gated_delta_stage_output_host[0..element_count];
-        const weight_host = self.qk_norm_weight_host[0..cols];
-        try input.download(&self.device, std.mem.sliceAsBytes(input_host));
-        try weight.download(&self.device, std.mem.sliceAsBytes(weight_host));
-        compute.cpu.math.rmsnormContiguous(
-            output_host,
-            input_host,
-            weight_host,
-            null,
-            .f32,
-            rows,
-            cols,
-            eps,
-            weight_offset,
-        );
-        try output.upload(&self.device, std.mem.sliceAsBytes(output_host));
-    }
-
     fn compactQueryGateProjectionInPlace(
         self: *CudaBackend,
         seq_len: usize,
@@ -4098,8 +4078,11 @@ pub const CudaBackend = struct {
     ) !void {
         const projection_elements = std.math.mul(usize, seq_len, q_projection_dim) catch return error.InvalidArgument;
         const query_elements = std.math.mul(usize, seq_len, q_dim) catch return error.InvalidArgument;
+        const projection_bytes = std.math.mul(usize, projection_elements, @sizeOf(f32)) catch return error.InvalidArgument;
+        const query_bytes = std.math.mul(usize, query_elements, @sizeOf(f32)) catch return error.InvalidArgument;
         try self.ensureQueryGateHostStageCapacity(projection_elements, query_elements);
-        try self.runtime_buffers.attn_q_dev.download(&self.device, std.mem.sliceAsBytes(self.query_gate_projection_host[0..projection_elements]));
+        var q_projection_stage = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, projection_bytes);
+        try q_projection_stage.download(&self.device, std.mem.sliceAsBytes(self.query_gate_projection_host[0..projection_elements]));
         try compute.cpu.gated_attention.compactQueryProjection(
             self.query_gate_projection_host[0..projection_elements],
             self.query_gate_values_host[0..query_elements],
@@ -4109,7 +4092,8 @@ pub const CudaBackend = struct {
             self.n_heads,
             self.head_dim,
         );
-        try self.runtime_buffers.attn_q_dev.upload(&self.device, std.mem.sliceAsBytes(self.query_gate_values_host[0..query_elements]));
+        var q_values_stage = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, query_bytes);
+        try q_values_stage.upload(&self.device, std.mem.sliceAsBytes(self.query_gate_values_host[0..query_elements]));
     }
 
     fn applyQueryGateToContextInPlace(
@@ -4120,8 +4104,10 @@ pub const CudaBackend = struct {
     ) !void {
         const projection_elements = std.math.mul(usize, seq_len, q_projection_dim) catch return error.InvalidArgument;
         const query_elements = std.math.mul(usize, seq_len, q_dim) catch return error.InvalidArgument;
+        const context_bytes = std.math.mul(usize, query_elements, @sizeOf(f32)) catch return error.InvalidArgument;
         try self.ensureQueryGateHostStageCapacity(projection_elements, query_elements);
-        try self.runtime_buffers.attn_context_dev.download(&self.device, std.mem.sliceAsBytes(self.query_gate_values_host[0..query_elements]));
+        var context_stage = try bufferSlice(&self.runtime_buffers.attn_context_dev, 0, context_bytes);
+        try context_stage.download(&self.device, std.mem.sliceAsBytes(self.query_gate_values_host[0..query_elements]));
         try compute.cpu.gated_attention.applyOutputGateInPlace(
             self.query_gate_values_host[0..query_elements],
             self.query_gate_projection_host[0..projection_elements],
@@ -4131,7 +4117,7 @@ pub const CudaBackend = struct {
             self.n_heads,
             self.head_dim,
         );
-        try self.runtime_buffers.attn_context_dev.upload(&self.device, std.mem.sliceAsBytes(self.query_gate_values_host[0..query_elements]));
+        try context_stage.upload(&self.device, std.mem.sliceAsBytes(self.query_gate_values_host[0..query_elements]));
     }
 
     fn applyQueryGateQkNormCpuInPlace(
@@ -4145,6 +4131,8 @@ pub const CudaBackend = struct {
         if (stage_rows == 0) return error.InvalidArgument;
         const query_elements = std.math.mul(usize, stage_rows, q_dim) catch return error.InvalidArgument;
         const key_elements = std.math.mul(usize, stage_rows, kv_dim) catch return error.InvalidArgument;
+        const query_bytes = std.math.mul(usize, query_elements, @sizeOf(f32)) catch return error.InvalidArgument;
+        const key_bytes = std.math.mul(usize, key_elements, @sizeOf(f32)) catch return error.InvalidArgument;
         try self.ensureQueryGateHostStageCapacity(query_elements, query_elements);
         if (self.gated_delta_stage_input_host.len < key_elements) {
             if (self.gated_delta_stage_input_host.len > 0) self.allocator.free(self.gated_delta_stage_input_host);
@@ -4153,8 +4141,10 @@ pub const CudaBackend = struct {
 
         const query_host = self.query_gate_values_host[0..query_elements];
         const key_host = self.gated_delta_stage_input_host[0..key_elements];
-        try self.runtime_buffers.attn_q_dev.download(&self.device, std.mem.sliceAsBytes(query_host));
-        try self.runtime_buffers.attn_k_dev.download(&self.device, std.mem.sliceAsBytes(key_host));
+        var q_stage = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, query_bytes);
+        var k_stage = try bufferSlice(&self.runtime_buffers.attn_k_dev, 0, key_bytes);
+        try q_stage.download(&self.device, std.mem.sliceAsBytes(query_host));
+        try k_stage.download(&self.device, std.mem.sliceAsBytes(key_host));
 
         if (q_norm_weight) |weight| {
             const head_dim = self.head_dim;
@@ -4193,8 +4183,8 @@ pub const CudaBackend = struct {
             }
         }
 
-        try self.runtime_buffers.attn_q_dev.upload(&self.device, std.mem.sliceAsBytes(query_host));
-        try self.runtime_buffers.attn_k_dev.upload(&self.device, std.mem.sliceAsBytes(key_host));
+        try q_stage.upload(&self.device, std.mem.sliceAsBytes(query_host));
+        try k_stage.upload(&self.device, std.mem.sliceAsBytes(key_host));
     }
 
     fn linearForward(
@@ -4214,8 +4204,36 @@ pub const CudaBackend = struct {
         out: *compute.cuda.Buffer,
     ) !void {
         if (rows == 0) return error.InvalidArgument;
+        const input_row_width = weight.rows();
+        const output_row_width = weight.cols();
+        const input_row_bytes = std.math.mul(usize, input_row_width, @sizeOf(f32)) catch return error.InvalidArgument;
+        const output_row_bytes = std.math.mul(usize, output_row_width, @sizeOf(f32)) catch return error.InvalidArgument;
+        const packed_input_bytes = std.math.mul(usize, rows, input_row_bytes) catch return error.InvalidArgument;
+        const packed_output_bytes = std.math.mul(usize, rows, output_row_bytes) catch return error.InvalidArgument;
+        const packed_rows = input.size == packed_input_bytes and out.size == packed_output_bytes;
+        if (input.size < packed_input_bytes or out.size < packed_output_bytes) {
+            return error.InvalidInstructionBinding;
+        }
+
         switch (weight.*) {
             .dense_f32 => |w| {
+                if (!packed_rows) {
+                    var row_index: usize = 0;
+                    while (row_index < rows) : (row_index += 1) {
+                        var input_row = try logicalF32RowSlice(input, rows, row_index, w.rows);
+                        var out_row = try logicalF32RowSlice(out, rows, row_index, w.cols);
+                        try self.blas.matmulF32(
+                            &self.device,
+                            &input_row,
+                            1,
+                            w.rows,
+                            &w.buffer,
+                            w.cols,
+                            &out_row,
+                        );
+                    }
+                    return;
+                }
                 try self.blas.matmulF32(
                     &self.device,
                     input,
@@ -4231,6 +4249,25 @@ pub const CudaBackend = struct {
                     .f16 => self.matmul_f16_function orelse return error.CudaKernelUnavailable,
                     .bf16 => self.matmul_bf16_function orelse return error.CudaKernelUnavailable,
                 };
+                if (!packed_rows) {
+                    var row_index: usize = 0;
+                    while (row_index < rows) : (row_index += 1) {
+                        var input_row = try logicalF32RowSlice(input, rows, row_index, w.rows);
+                        var out_row = try logicalF32RowSlice(out, rows, row_index, w.cols);
+                        try compute.cuda.matmul_u16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            kernel,
+                            &input_row,
+                            &w.buffer,
+                            &out_row,
+                            1,
+                            @intCast(w.rows),
+                            @intCast(w.cols),
+                        );
+                    }
+                    return;
+                }
                 try compute.cuda.matmul_u16.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
@@ -4245,7 +4282,7 @@ pub const CudaBackend = struct {
             },
             .gaffine_u4 => |w| {
                 const kernel = self.gaffine_u4_matvec_function orelse return error.CudaKernelUnavailable;
-                if (rows == 1 or self.gaffine_sequence_rows_supported) {
+                if (packed_rows and (rows == 1 or self.gaffine_sequence_rows_supported)) {
                     try compute.cuda.gaffine_u4_matvec.runWithFunction(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -4264,14 +4301,10 @@ pub const CudaBackend = struct {
                     return;
                 }
 
-                const in_row_bytes = std.math.mul(usize, w.rows, @sizeOf(f32)) catch return error.InvalidArgument;
-                const out_row_bytes = std.math.mul(usize, w.cols, @sizeOf(f32)) catch return error.InvalidArgument;
                 var row_index: usize = 0;
                 while (row_index < rows) : (row_index += 1) {
-                    const input_offset = std.math.mul(usize, row_index, in_row_bytes) catch return error.InvalidArgument;
-                    const out_offset = std.math.mul(usize, row_index, out_row_bytes) catch return error.InvalidArgument;
-                    var input_row = try bufferSlice(input, input_offset, in_row_bytes);
-                    var out_row = try bufferSlice(out, out_offset, out_row_bytes);
+                    var input_row = try logicalF32RowSlice(input, rows, row_index, w.rows);
+                    var out_row = try logicalF32RowSlice(out, rows, row_index, w.cols);
                     try compute.cuda.gaffine_u4_matvec.runWithFunction(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -4298,12 +4331,19 @@ pub const CudaBackend = struct {
         q_proj: *const LinearWeight,
         k_proj: *const LinearWeight,
         v_proj: *const LinearWeight,
+        rows: usize,
     ) !ProjectionPath {
-        if (try self.tryFusedQkvForward(input, q_proj, k_proj, v_proj)) return .fused;
+        if (rows == 1 and try self.tryFusedQkvForward(input, q_proj, k_proj, v_proj)) return .fused;
 
-        try self.linearForward(input, q_proj, &self.runtime_buffers.attn_q_dev);
-        try self.linearForward(input, k_proj, &self.runtime_buffers.attn_k_dev);
-        try self.linearForward(input, v_proj, &self.runtime_buffers.attn_v_dev);
+        const q_bytes = std.math.mul(usize, rows, q_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
+        const k_bytes = std.math.mul(usize, rows, k_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
+        const v_bytes = std.math.mul(usize, rows, v_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
+        var q_out = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, q_bytes);
+        var k_out = try bufferSlice(&self.runtime_buffers.attn_k_dev, 0, k_bytes);
+        var v_out = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, v_bytes);
+        try self.linearForwardRows(input, rows, q_proj, &q_out);
+        try self.linearForwardRows(input, rows, k_proj, &k_out);
+        try self.linearForwardRows(input, rows, v_proj, &v_out);
         return .unfused;
     }
 
@@ -4311,8 +4351,9 @@ pub const CudaBackend = struct {
         self: *CudaBackend,
         input: *const compute.cuda.Buffer,
         block: *const LayerAttentionRuntime,
+        rows: usize,
     ) !ProjectionPath {
-        return self.runGateUpProjectionWithWeights(input, &block.w1, &block.w3);
+        return self.runGateUpProjectionWithWeights(input, &block.w1, &block.w3, rows);
     }
 
     fn runGateUpProjectionWithWeights(
@@ -4320,11 +4361,16 @@ pub const CudaBackend = struct {
         input: *const compute.cuda.Buffer,
         gate_weight: *const LinearWeight,
         up_weight: *const LinearWeight,
+        rows: usize,
     ) !ProjectionPath {
-        if (try self.tryFusedGateUpForward(input, gate_weight, up_weight)) return .fused;
+        if (rows == 1 and try self.tryFusedGateUpForward(input, gate_weight, up_weight)) return .fused;
 
-        try self.linearForward(input, gate_weight, &self.runtime_buffers.ffn_gate_dev);
-        try self.linearForward(input, up_weight, &self.runtime_buffers.ffn_up_dev);
+        const gate_bytes = std.math.mul(usize, rows, gate_weight.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
+        const up_bytes = std.math.mul(usize, rows, up_weight.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
+        var gate_out = try bufferSlice(&self.runtime_buffers.ffn_gate_dev, 0, gate_bytes);
+        var up_out = try bufferSlice(&self.runtime_buffers.ffn_up_dev, 0, up_bytes);
+        try self.linearForwardRows(input, rows, gate_weight, &gate_out);
+        try self.linearForwardRows(input, rows, up_weight, &up_out);
         return .unfused;
     }
 
@@ -4368,9 +4414,9 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 vector_add_function,
-                out,
                 residual,
                 branch,
+                out,
                 count,
             );
             return;
@@ -4381,9 +4427,9 @@ pub const CudaBackend = struct {
             &self.kernel_arg_pack,
             &self.device,
             vector_add_scaled_function,
-            out,
             residual,
             branch,
+            out,
             self.loaded.config.residual_multiplier,
             count,
         );
@@ -4405,9 +4451,9 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     vector_add_function,
-                    out,
                     residual,
                     branch,
+                    out,
                     count,
                 );
             },
@@ -4418,9 +4464,9 @@ pub const CudaBackend = struct {
                         &self.kernel_arg_pack,
                         &self.device,
                         vector_add_function,
-                        out,
                         residual,
                         branch,
+                        out,
                         count,
                     );
                 }
@@ -4429,13 +4475,111 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     vector_add_scaled_function,
-                    out,
                     residual,
                     branch,
+                    out,
                     literal,
                     count,
                 );
             },
+        }
+    }
+
+    fn addResidualWithScaleRowsStrideAware(
+        self: *CudaBackend,
+        out: *compute.cuda.Buffer,
+        residual: *compute.cuda.Buffer,
+        branch: *compute.cuda.Buffer,
+        rows: u32,
+        cols: u32,
+        scale: layer_ops.ResidualScale,
+    ) !void {
+        if (rows == 0 or cols == 0) return error.InvalidArgument;
+        const packed_count = std.math.mul(u32, rows, cols) catch return error.InvalidArgument;
+        const packed_bytes = std.math.mul(usize, @as(usize, packed_count), @sizeOf(f32)) catch return error.InvalidArgument;
+        if (out.size == packed_bytes and residual.size == packed_bytes and branch.size == packed_bytes) {
+            return self.addResidualWithScale(out, residual, branch, packed_count, scale);
+        }
+        if (out.size < packed_bytes or residual.size < packed_bytes or branch.size < packed_bytes) {
+            return error.InvalidInstructionBinding;
+        }
+
+        const row_count: usize = @intCast(rows);
+        if (out.size % row_count != 0 or residual.size % row_count != 0 or branch.size % row_count != 0) {
+            return error.InvalidInstructionBinding;
+        }
+        const row_bytes = std.math.mul(usize, @as(usize, cols), @sizeOf(f32)) catch return error.InvalidArgument;
+        const out_stride = out.size / row_count;
+        const residual_stride = residual.size / row_count;
+        const branch_stride = branch.size / row_count;
+        if (out_stride < row_bytes or residual_stride < row_bytes or branch_stride < row_bytes) {
+            return error.InvalidInstructionBinding;
+        }
+
+        var row_idx: usize = 0;
+        while (row_idx < row_count) : (row_idx += 1) {
+            const out_offset = std.math.mul(usize, row_idx, out_stride) catch return error.InvalidArgument;
+            const residual_offset = std.math.mul(usize, row_idx, residual_stride) catch return error.InvalidArgument;
+            const branch_offset = std.math.mul(usize, row_idx, branch_stride) catch return error.InvalidArgument;
+            var out_row = try bufferSlice(out, out_offset, row_bytes);
+            var residual_row = try bufferSlice(residual, residual_offset, row_bytes);
+            var branch_row = try bufferSlice(branch, branch_offset, row_bytes);
+            try self.addResidualWithScale(&out_row, &residual_row, &branch_row, cols, scale);
+        }
+    }
+
+    fn runRmsnormRowsStrideAware(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        weight: *const compute.cuda.Buffer,
+        output: *compute.cuda.Buffer,
+        rows: u32,
+        cols: u32,
+    ) !void {
+        if (rows == 0 or cols == 0) return error.InvalidArgument;
+        const packed_count = std.math.mul(u32, rows, cols) catch return error.InvalidArgument;
+        const packed_bytes = std.math.mul(usize, @as(usize, packed_count), @sizeOf(f32)) catch return error.InvalidArgument;
+        if (input.size == packed_bytes and output.size == packed_bytes) {
+            return compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                input,
+                weight,
+                output,
+                rows,
+                cols,
+                self.norm_eps,
+                self.loaded.runtime.weight_offset,
+            );
+        }
+        if (input.size < packed_bytes or output.size < packed_bytes) return error.InvalidInstructionBinding;
+
+        const row_count: usize = @intCast(rows);
+        if (input.size % row_count != 0 or output.size % row_count != 0) return error.InvalidInstructionBinding;
+        const row_bytes = std.math.mul(usize, @as(usize, cols), @sizeOf(f32)) catch return error.InvalidArgument;
+        const input_stride = input.size / row_count;
+        const output_stride = output.size / row_count;
+        if (input_stride < row_bytes or output_stride < row_bytes) return error.InvalidInstructionBinding;
+
+        var row_idx: usize = 0;
+        while (row_idx < row_count) : (row_idx += 1) {
+            const input_offset = std.math.mul(usize, row_idx, input_stride) catch return error.InvalidArgument;
+            const output_offset = std.math.mul(usize, row_idx, output_stride) catch return error.InvalidArgument;
+            var input_row = try bufferSlice(input, input_offset, row_bytes);
+            var output_row = try bufferSlice(output, output_offset, row_bytes);
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                &input_row,
+                weight,
+                &output_row,
+                1,
+                cols,
+                self.norm_eps,
+                self.loaded.runtime.weight_offset,
+            );
         }
     }
 
@@ -4522,7 +4666,14 @@ pub const CudaBackend = struct {
             });
             return err;
         };
-        _ = self.runQkvProjection(input, q_proj, k_proj, v_proj) catch |err| {
+        const q_stage_bytes = std.math.mul(usize, stage_rows, cfg.q_projection_dim * @sizeOf(f32)) catch return error.InvalidArgument;
+        const kv_stage_bytes = std.math.mul(usize, stage_rows, cfg.kv_dim * @sizeOf(f32)) catch return error.InvalidArgument;
+        const context_stage_bytes = std.math.mul(usize, stage_rows, o_proj.rows() * @sizeOf(f32)) catch return error.InvalidArgument;
+        var attn_q_stage = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, q_stage_bytes);
+        var attn_k_stage = try bufferSlice(&self.runtime_buffers.attn_k_dev, 0, kv_stage_bytes);
+        var attn_v_stage = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, kv_stage_bytes);
+        var attn_context_stage = try bufferSlice(&self.runtime_buffers.attn_context_dev, 0, context_stage_bytes);
+        _ = self.runQkvProjection(input, q_proj, k_proj, v_proj, stage_rows) catch |err| {
             log.warn("inference", "CUDA attention qkv projection failed", .{
                 .seq_len = seq_len_u32,
                 .stage_rows = stage_rows,
@@ -4575,9 +4726,9 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                    &self.runtime_buffers.attn_q_dev,
+                    &attn_q_stage,
                     &q_norm_value.buffer,
-                    &self.runtime_buffers.attn_q_dev,
+                    &attn_q_stage,
                     q_norm_rows,
                     head_dim_u32,
                     self.norm_eps,
@@ -4599,9 +4750,9 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                    &self.runtime_buffers.attn_k_dev,
+                    &attn_k_stage,
                     &k_norm_value.buffer,
-                    &self.runtime_buffers.attn_k_dev,
+                    &attn_k_stage,
                     k_norm_rows,
                     head_dim_u32,
                     self.norm_eps,
@@ -4632,7 +4783,7 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 rope_function,
-                &self.runtime_buffers.attn_q_dev,
+                &attn_q_stage,
                 n_heads_u32,
                 head_dim_u32,
                 rope_dim_u32,
@@ -4657,7 +4808,7 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 rope_function,
-                &self.runtime_buffers.attn_k_dev,
+                &attn_k_stage,
                 n_kv_heads_u32,
                 head_dim_u32,
                 rope_dim_u32,
@@ -4710,8 +4861,8 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     kv_write_f16,
-                    &self.runtime_buffers.attn_k_dev,
-                    &self.runtime_buffers.attn_v_dev,
+                    &attn_k_stage,
+                    &attn_v_stage,
                     &k_row,
                     &v_row,
                     n_kv_heads_u32,
@@ -4736,7 +4887,7 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     rope_store_f16,
-                    &self.runtime_buffers.attn_k_dev,
+                    &attn_k_stage,
                     &k_row,
                     n_kv_heads_u32,
                     head_dim_u32,
@@ -4759,7 +4910,7 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                    &self.runtime_buffers.attn_v_dev,
+                    &attn_v_stage,
                     &v_row,
                     @intCast(cfg.kv_dim),
                 ) catch |err| {
@@ -4777,7 +4928,7 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                    &self.runtime_buffers.attn_k_dev,
+                    &attn_k_stage,
                     &k_row,
                     @intCast(cfg.kv_dim),
                 ) catch |err| {
@@ -4794,7 +4945,7 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                    &self.runtime_buffers.attn_v_dev,
+                    &attn_v_stage,
                     &v_row,
                     @intCast(cfg.kv_dim),
                 ) catch |err| {
@@ -4813,7 +4964,7 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 copy_function,
-                &self.runtime_buffers.attn_k_dev,
+                &attn_k_stage,
                 &k_row,
                 @intCast(cfg.kv_dim),
             ) catch |err| {
@@ -4830,7 +4981,7 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 copy_function,
-                &self.runtime_buffers.attn_v_dev,
+                &attn_v_stage,
                 &v_row,
                 @intCast(cfg.kv_dim),
             ) catch |err| {
@@ -4850,6 +5001,8 @@ pub const CudaBackend = struct {
         const kv_dim_u32: u32 = @intCast(cfg.kv_dim);
         _ = self.runAttentionContext(
             cfg,
+            &attn_q_stage,
+            &attn_context_stage,
             k_cache,
             v_cache,
             attention_kernels,
@@ -4888,13 +5041,13 @@ pub const CudaBackend = struct {
                 return err;
             };
         }
-        self.linearForwardRows(&self.runtime_buffers.attn_context_dev, stage_rows, o_proj, output) catch |err| {
+        self.linearForwardRows(&attn_context_stage, stage_rows, o_proj, output) catch |err| {
             log.warn("inference", "CUDA attention output projection failed", .{
                 .seq_len = seq_len_u32,
                 .stage_rows = stage_rows,
                 .o_proj_in_dim = o_proj.rows(),
                 .o_proj_out_dim = o_proj.cols(),
-                .context_bytes = self.runtime_buffers.attn_context_dev.size,
+                .context_bytes = attn_context_stage.size,
                 .output_bytes = output.size,
                 .reason = @errorName(err),
             });
@@ -4938,6 +5091,70 @@ pub const CudaBackend = struct {
         try self.linearForwardRows(&self.runtime_buffers.shortconv_conv_dev, rows, out_proj, output);
     }
 
+    fn downloadRowsF32StrideAware(
+        self: *CudaBackend,
+        src: *const compute.cuda.Buffer,
+        rows: usize,
+        row_width: usize,
+        dst: []f32,
+    ) !void {
+        if (rows == 0 or row_width == 0) return error.InvalidArgument;
+        const logical_elements = std.math.mul(usize, rows, row_width) catch return error.InvalidArgument;
+        if (dst.len < logical_elements) return error.InvalidArgument;
+        const row_bytes = std.math.mul(usize, row_width, @sizeOf(f32)) catch return error.InvalidArgument;
+        const packed_bytes = std.math.mul(usize, logical_elements, @sizeOf(f32)) catch return error.InvalidArgument;
+        if (src.size < packed_bytes) return error.InvalidInstructionBinding;
+
+        if (rows == 1 or src.size == packed_bytes) {
+            return src.download(&self.device, std.mem.sliceAsBytes(dst[0..logical_elements]));
+        }
+
+        if (src.size % rows != 0) return error.InvalidInstructionBinding;
+        const src_row_stride = src.size / rows;
+        if (src_row_stride < row_bytes) return error.InvalidInstructionBinding;
+
+        var row_idx: usize = 0;
+        while (row_idx < rows) : (row_idx += 1) {
+            const src_offset = std.math.mul(usize, row_idx, src_row_stride) catch return error.InvalidArgument;
+            var src_row = try bufferSlice(src, src_offset, row_bytes);
+            const dst_start = std.math.mul(usize, row_idx, row_width) catch return error.InvalidArgument;
+            const dst_row = dst[dst_start .. dst_start + row_width];
+            try src_row.download(&self.device, std.mem.sliceAsBytes(dst_row));
+        }
+    }
+
+    fn uploadRowsF32StrideAware(
+        self: *CudaBackend,
+        src: []const f32,
+        rows: usize,
+        row_width: usize,
+        dst: *compute.cuda.Buffer,
+    ) !void {
+        if (rows == 0 or row_width == 0) return error.InvalidArgument;
+        const logical_elements = std.math.mul(usize, rows, row_width) catch return error.InvalidArgument;
+        if (src.len < logical_elements) return error.InvalidArgument;
+        const row_bytes = std.math.mul(usize, row_width, @sizeOf(f32)) catch return error.InvalidArgument;
+        const packed_bytes = std.math.mul(usize, logical_elements, @sizeOf(f32)) catch return error.InvalidArgument;
+        if (dst.size < packed_bytes) return error.InvalidInstructionBinding;
+
+        if (rows == 1 or dst.size == packed_bytes) {
+            return dst.upload(&self.device, std.mem.sliceAsBytes(src[0..logical_elements]));
+        }
+
+        if (dst.size % rows != 0) return error.InvalidInstructionBinding;
+        const dst_row_stride = dst.size / rows;
+        if (dst_row_stride < row_bytes) return error.InvalidInstructionBinding;
+
+        var row_idx: usize = 0;
+        while (row_idx < rows) : (row_idx += 1) {
+            const dst_offset = std.math.mul(usize, row_idx, dst_row_stride) catch return error.InvalidArgument;
+            var dst_row = try bufferSlice(dst, dst_offset, row_bytes);
+            const src_start = std.math.mul(usize, row_idx, row_width) catch return error.InvalidArgument;
+            const src_row = src[src_start .. src_start + row_width];
+            try dst_row.upload(&self.device, std.mem.sliceAsBytes(src_row));
+        }
+    }
+
     fn runGatedDeltaMixerStep(
         self: *CudaBackend,
         block: *GatedDeltaBlockRuntime,
@@ -4949,7 +5166,10 @@ pub const CudaBackend = struct {
         try self.ensureGatedDeltaHostStageCapacity(element_count);
         const input_host = self.gated_delta_stage_input_host[0..element_count];
         const output_host = self.gated_delta_stage_output_host[0..element_count];
-        input.download(&self.device, std.mem.sliceAsBytes(input_host)) catch |err| {
+        // Fallback stages through host memory; force completion of prior CUDA work
+        // before device->host read to preserve deterministic ordering.
+        try self.device.synchronize();
+        self.downloadRowsF32StrideAware(input, seq_len, self.d_model, input_host) catch |err| {
             log.warn("inference", "CUDA gated-delta input download failed", .{
                 .seq_len = seq_len,
                 .d_model = self.d_model,
@@ -4962,6 +5182,16 @@ pub const CudaBackend = struct {
 
         var input_view = Tensor.view2DSlice(input_host, seq_len, self.d_model);
         var output_view = Tensor.view2DSlice(output_host, seq_len, self.d_model);
+        const prev_trace_position_offset = block.kernel.trace_position_offset;
+        block.kernel.trace_position_offset = if (self.parity_prefill_seq_len > 1 and seq_len == 1)
+            self.parity_prefill_token_index
+        else
+            0;
+        defer block.kernel.trace_position_offset = prev_trace_position_offset;
+        // Gated-delta executes on CPU tensors in this fallback path, so mark
+        // nested trace emissions as CPU-host readable for verify/full sidecars.
+        const prev_backend = trace.setBackendContext(.cpu);
+        defer _ = trace.setBackendContext(prev_backend);
         block.kernel.forward(
             &input_view,
             &output_view,
@@ -4978,7 +5208,7 @@ pub const CudaBackend = struct {
             });
             return err;
         };
-        output.upload(&self.device, std.mem.sliceAsBytes(output_host)) catch |err| {
+        self.uploadRowsF32StrideAware(output_host, seq_len, self.d_model, output) catch |err| {
             log.warn("inference", "CUDA gated-delta output upload failed", .{
                 .seq_len = seq_len,
                 .d_model = self.d_model,
@@ -4988,6 +5218,9 @@ pub const CudaBackend = struct {
             });
             return err;
         };
+        // Ensure host-produced fallback output is globally visible before
+        // subsequent CUDA kernels consume this buffer.
+        try self.device.synchronize();
     }
 
     fn runAttentionMixerStepCpu(
@@ -5005,10 +5238,15 @@ pub const CudaBackend = struct {
         try self.ensureGatedDeltaHostStageCapacity(element_count);
         const input_host = self.gated_delta_stage_input_host[0..element_count];
         const output_host = self.gated_delta_stage_output_host[0..element_count];
-        try input.download(&self.device, std.mem.sliceAsBytes(input_host));
+        try self.device.synchronize();
+        try self.downloadRowsF32StrideAware(input, seq_len, self.d_model, input_host);
         kernel.position_delta = self.slot_rope_position_delta;
         var input_view = Tensor.view3DSlice(input_host, seq_len, self.d_model);
         var output_view = Tensor.view3DSlice(output_host, seq_len, self.d_model);
+        // Attention fallback executes on CPU tensors; preserve host-readable
+        // trace semantics even when wrapped by the CUDA execution route.
+        const prev_backend = trace.setBackendContext(.cpu);
+        defer _ = trace.setBackendContext(prev_backend);
         try kernel.forward(
             &input_view,
             &output_view,
@@ -5017,7 +5255,8 @@ pub const CudaBackend = struct {
             matmul_scratch,
             true,
         );
-        try output.upload(&self.device, std.mem.sliceAsBytes(output_host));
+        try self.uploadRowsF32StrideAware(output_host, seq_len, self.d_model, output);
+        try self.device.synchronize();
     }
 
     fn applyBiasF32(
@@ -5046,6 +5285,7 @@ pub const CudaBackend = struct {
     fn runFfnStep(
         self: *CudaBackend,
         input: *const compute.cuda.Buffer,
+        rows: usize,
         gate_weight: *const LinearWeight,
         up_weight: *const LinearWeight,
         down_weight: *const LinearWeight,
@@ -5054,15 +5294,16 @@ pub const CudaBackend = struct {
         d_ff: u32,
         output: *compute.cuda.Buffer,
     ) !void {
-        const rows = try bufferF32RowCount(input, gate_weight.rows());
         const activation_count = std.math.mul(u32, @intCast(rows), d_ff) catch return error.InvalidArgument;
-        _ = try self.runGateUpProjectionWithWeights(input, gate_weight, up_weight);
+        const activation_bytes = std.math.mul(usize, @as(usize, activation_count), @sizeOf(f32)) catch return error.InvalidArgument;
+        _ = try self.runGateUpProjectionWithWeights(input, gate_weight, up_weight, rows);
         if (gate_bias) |bias| {
             if (rows != 1) return error.UnsupportedModel;
             try self.applyBiasF32(&self.runtime_buffers.ffn_gate_dev, bias, d_ff);
         }
         try self.runFfnActivationMul(activation_count);
-        try self.linearForwardRows(&self.runtime_buffers.ffn_mul_dev, rows, down_weight, output);
+        var mul_in = try bufferSlice(&self.runtime_buffers.ffn_mul_dev, 0, activation_bytes);
+        try self.linearForwardRows(&mul_in, rows, down_weight, output);
         if (down_bias) |bias| {
             if (rows != 1) return error.UnsupportedModel;
             const d_model = std.math.cast(u32, down_weight.cols()) orelse return error.InvalidArgument;
@@ -5190,10 +5431,6 @@ pub const CudaBackend = struct {
         };
     }
 
-    fn parityDebugEnabled() bool {
-        return std.posix.getenv("TALU_PARITY_DEBUG") != null;
-    }
-
     fn ensureParityPrefillBufferCapacity(self: *CudaBackend, buffer: *[]f32, elements: usize) !void {
         if (buffer.*.len >= elements) return;
         if (buffer.*.len > 0) self.allocator.free(buffer.*);
@@ -5204,7 +5441,7 @@ pub const CudaBackend = struct {
         self.parity_prefill_seq_len = 0;
         self.parity_prefill_token_index = 0;
         @memset(&self.parity_checkpoint_warned, false);
-        if (!parityDebugEnabled() or !trace.isEnabled() or seq_len == 0) return;
+        if (!trace.isEnabled() or seq_len == 0) return;
         const layer_count = self.block_runtime.blocks.len;
         const elements = std.math.mul(usize, layer_count, std.math.mul(usize, seq_len, self.d_model) catch return error.InvalidArgument) catch return error.InvalidArgument;
         try self.ensureParityPrefillBufferCapacity(&self.parity_prefill_layer_attn_norm_host, elements);
@@ -5248,90 +5485,86 @@ pub const CudaBackend = struct {
         // the emission as f32 after a successful host download so verification never
         // computes stats from synthetic marker storage.
         var emit_dtype: trace.DType = .u8;
-        const parity_prefill_active = parityDebugEnabled() and ctx.trace_seq_len_u32 > 1 and ctx.backend.parityPrefillBufferForPoint(point) != null;
-        const seq_len: u32 = if (parity_prefill_active)
-            ctx.trace_seq_len_u32
-        else if (parityDebugEnabled())
-            ctx.active_rows_u32
+        const parity_prefill_seq_len_u32: u32 = if (ctx.backend.parity_prefill_seq_len > 0)
+            @intCast(ctx.backend.parity_prefill_seq_len)
         else
             ctx.trace_seq_len_u32;
-        const emission_token: u32 = if (parity_prefill_active) 0 else traceTokenIndex(seq_len);
+        const parity_prefill_active = parity_prefill_seq_len_u32 > 1 and ctx.backend.parityPrefillBufferForPoint(point) != null;
+        const logical_seq_len: u32 = ctx.trace_seq_len_u32;
+        const shape_seq_len: u32 = if (parity_prefill_active)
+            parity_prefill_seq_len_u32
+        else
+            ctx.active_rows_u32;
+        const position_seq_len: u32 = if (parity_prefill_active)
+            parity_prefill_seq_len_u32
+        else
+            ctx.seq_len_u32;
+        const emission_token: u32 = if (parity_prefill_active) 0 else traceTokenIndex(logical_seq_len);
         var emit_shape = shape;
-        if (parity_prefill_active and ndim >= 2) emit_shape[1] = seq_len;
-        if (!parity_prefill_active and parityDebugEnabled() and ndim >= 2) emit_shape[1] = ctx.active_rows_u32;
+        if (ndim >= 2) emit_shape[1] = shape_seq_len;
         var data_ptr: [*]const u8 = @ptrCast(marker[0..].ptr);
-        if (parityDebugEnabled()) {
-            if (output) |buffer| {
-                const width = @as(usize, emit_shape[ndim - 1]);
-                if (parity_prefill_active) {
-                    if (ctx.backend.parityPrefillBufferForPoint(point)) |prefill_buffer| {
-                        const parity_seq_len = @as(usize, ctx.trace_seq_len_u32);
-                        if (ctx.backend.parity_prefill_seq_len != parity_seq_len) {
-                            const layer_count = ctx.backend.block_runtime.blocks.len;
-                            const elements = std.math.mul(usize, layer_count, std.math.mul(usize, parity_seq_len, ctx.backend.d_model) catch return) catch return;
-                            ctx.backend.ensureParityPrefillBufferCapacity(&ctx.backend.parity_prefill_layer_attn_norm_host, elements) catch return;
-                            ctx.backend.ensureParityPrefillBufferCapacity(&ctx.backend.parity_prefill_layer_ffn_norm_host, elements) catch return;
-                            ctx.backend.ensureParityPrefillBufferCapacity(&ctx.backend.parity_prefill_block_out_host, elements) catch return;
-                            ctx.backend.parity_prefill_seq_len = parity_seq_len;
-                        }
-                        if (width > 0 and ctx.layer_index < ctx.backend.block_runtime.blocks.len and ctx.trace_pos_offset < parity_seq_len) {
-                            ctx.backend.ensureTraceCheckpointHostCapacity(width) catch return;
-                            const row_host = ctx.backend.trace_checkpoint_host[0..width];
-                            buffer.download(&ctx.backend.device, std.mem.sliceAsBytes(row_host)) catch |err| {
-                                const warn_idx = @intFromEnum(point);
-                                if (!ctx.backend.parity_checkpoint_warned[warn_idx]) {
-                                    ctx.backend.parity_checkpoint_warned[warn_idx] = true;
-                                    log.warn("inference", "CUDA parity checkpoint row download failed", .{
-                                        .point = point.name(),
-                                        .layer_index = ctx.layer_index,
-                                        .position = ctx.trace_pos_offset,
-                                        .seq_len = parity_seq_len,
-                                        .width = width,
-                                        .buffer_bytes = buffer.size,
-                                        .reason = @errorName(err),
-                                    });
-                                }
-                                return;
-                            };
-                            const per_layer = parity_seq_len * width;
-                            const dst_start = ctx.layer_index * per_layer + ctx.trace_pos_offset * width;
-                            @memcpy(prefill_buffer[dst_start .. dst_start + width], row_host);
-                            if (ctx.trace_pos_offset + 1 != parity_seq_len) return;
-                            data_ptr = @ptrCast(prefill_buffer[ctx.layer_index * per_layer ..][0..per_layer].ptr);
-                            emit_dtype = .f32;
-                        }
-                    } else {
-                        return;
-                    }
-                } else {
-                    var element_count: usize = 1;
-                    for (0..ndim) |dim_idx| {
-                        // Trace downloads must match the emitted checkpoint shape, not the
-                        // original logical prompt shape. Under parity debug, one-row outputs
-                        // such as attn.out/ffn.down are emitted with active-row shapes.
-                        element_count *= @as(usize, emit_shape[dim_idx]);
-                    }
-                    if (element_count > 0) {
-                        ctx.backend.ensureTraceCheckpointHostCapacity(element_count) catch return;
-                        const host = ctx.backend.trace_checkpoint_host[0..element_count];
-                        buffer.download(&ctx.backend.device, std.mem.sliceAsBytes(host)) catch |err| {
+        if (output) |buffer| {
+            const width = @as(usize, emit_shape[ndim - 1]);
+            if (parity_prefill_active) {
+                if (ctx.backend.parityPrefillBufferForPoint(point)) |prefill_buffer| {
+                    const parity_seq_len = ctx.backend.parity_prefill_seq_len;
+                    if (parity_seq_len == 0) return;
+                    if (width > 0 and ctx.layer_index < ctx.backend.block_runtime.blocks.len) {
+                        const per_layer = parity_seq_len * width;
+                        ctx.backend.ensureTraceCheckpointHostCapacity(per_layer) catch return;
+                        const layer_host = ctx.backend.trace_checkpoint_host[0..per_layer];
+                        ctx.backend.downloadRowsF32StrideAware(buffer, parity_seq_len, width, layer_host) catch |err| {
                             const warn_idx = @intFromEnum(point);
                             if (!ctx.backend.parity_checkpoint_warned[warn_idx]) {
                                 ctx.backend.parity_checkpoint_warned[warn_idx] = true;
-                                log.warn("inference", "CUDA checkpoint download failed", .{
+                                log.warn("inference", "CUDA parity checkpoint download failed", .{
                                     .point = point.name(),
                                     .layer_index = ctx.layer_index,
                                     .position = ctx.trace_pos_offset,
-                                    .element_count = element_count,
+                                    .seq_len = parity_seq_len,
+                                    .width = width,
+                                    .element_count = per_layer,
                                     .buffer_bytes = buffer.size,
                                     .reason = @errorName(err),
                                 });
                             }
                             return;
                         };
-                        data_ptr = @ptrCast(host.ptr);
+                        const dst_start = ctx.layer_index * per_layer;
+                        @memcpy(prefill_buffer[dst_start .. dst_start + per_layer], layer_host);
+                        data_ptr = @ptrCast(prefill_buffer[dst_start .. dst_start + per_layer].ptr);
                         emit_dtype = .f32;
                     }
+                } else {
+                    return;
+                }
+            } else {
+                var element_count: usize = 1;
+                for (0..ndim) |dim_idx| {
+                    // Trace downloads must match the emitted checkpoint shape, not
+                    // logical sequence length metadata.
+                    element_count *= @as(usize, emit_shape[dim_idx]);
+                }
+                if (element_count > 0) {
+                    ctx.backend.ensureTraceCheckpointHostCapacity(element_count) catch return;
+                    const host = ctx.backend.trace_checkpoint_host[0..element_count];
+                    buffer.download(&ctx.backend.device, std.mem.sliceAsBytes(host)) catch |err| {
+                        const warn_idx = @intFromEnum(point);
+                        if (!ctx.backend.parity_checkpoint_warned[warn_idx]) {
+                            ctx.backend.parity_checkpoint_warned[warn_idx] = true;
+                            log.warn("inference", "CUDA checkpoint download failed", .{
+                                .point = point.name(),
+                                .layer_index = ctx.layer_index,
+                                .position = ctx.trace_pos_offset,
+                                .element_count = element_count,
+                                .buffer_bytes = buffer.size,
+                                .reason = @errorName(err),
+                            });
+                        }
+                        return;
+                    };
+                    data_ptr = @ptrCast(host.ptr);
+                    emit_dtype = .f32;
                 }
             }
         }
@@ -5339,7 +5572,7 @@ pub const CudaBackend = struct {
             point,
             @intCast(ctx.layer_index),
             emission_token,
-            tracePositionForPoint(point, ctx.trace_pos_offset, seq_len),
+            tracePositionForPoint(point, ctx.trace_pos_offset, position_seq_len),
             data_ptr,
             emit_dtype,
             emit_shape,
@@ -5661,30 +5894,7 @@ pub const CudaBackend = struct {
         const input = bufferFromTensorHandle(io.inputs[0]);
         const output = bufferFromTensorHandle(io.outputs[0]);
         const weight = deviceTensorFromWeightHandle(weight_handles[0]);
-        if (parityDebugEnabled()) {
-            return self.runRmsnormExactMaybeCpu(
-                "layer_program_norm",
-                input,
-                &weight.buffer,
-                output,
-                ctx.active_rows_u32,
-                ctx.d_model_u32,
-                self.norm_eps,
-                self.loaded.runtime.weight_offset,
-            );
-        }
-        compute.cuda.rmsnorm.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-            input,
-            &weight.buffer,
-            output,
-            ctx.active_rows_u32,
-            ctx.d_model_u32,
-            self.norm_eps,
-            self.loaded.runtime.weight_offset,
-        ) catch |err| {
+        self.runRmsnormRowsStrideAware(input, &weight.buffer, output, ctx.active_rows_u32, ctx.d_model_u32) catch |err| {
             if (err == error.InvalidArgument) {
                 const expected_io_bytes = std.math.mul(usize, @as(usize, ctx.active_rows_u32), @as(usize, ctx.d_model_u32) * @sizeOf(f32)) catch 0;
                 const expected_weight_bytes = std.math.mul(usize, @as(usize, ctx.d_model_u32), @sizeOf(f32)) catch 0;
@@ -5774,12 +5984,20 @@ pub const CudaBackend = struct {
             return;
         }
 
-        const row_bytes = std.math.mul(usize, @as(usize, ctx.d_model_u32), @sizeOf(f32)) catch return error.InvalidArgument;
         var row_idx: usize = 0;
         while (row_idx < ctx.active_rows_u32) : (row_idx += 1) {
-            const offset = std.math.mul(usize, row_idx, row_bytes) catch return error.InvalidArgument;
-            var input_row = try bufferSlice(input, offset, row_bytes);
-            var output_row = try bufferSlice(output, offset, row_bytes);
+            var input_row = try logicalF32RowSlice(
+                input,
+                @intCast(ctx.active_rows_u32),
+                row_idx,
+                @intCast(ctx.d_model_u32),
+            );
+            var output_row = try logicalF32RowSlice(
+                output,
+                @intCast(ctx.active_rows_u32),
+                row_idx,
+                @intCast(ctx.d_model_u32),
+            );
             try self.runAttentionMixerStep(
                 cfg,
                 &attention_binding.k_cache,
@@ -5854,14 +6072,20 @@ pub const CudaBackend = struct {
             return;
         }
 
-        const input_row_bytes = std.math.mul(usize, @as(usize, in_proj.rows()), @sizeOf(f32)) catch return error.InvalidArgument;
-        const output_row_bytes = std.math.mul(usize, @as(usize, out_proj.cols()), @sizeOf(f32)) catch return error.InvalidArgument;
         var row_idx: usize = 0;
         while (row_idx < ctx.active_rows_u32) : (row_idx += 1) {
-            const input_offset = std.math.mul(usize, row_idx, input_row_bytes) catch return error.InvalidArgument;
-            const output_offset = std.math.mul(usize, row_idx, output_row_bytes) catch return error.InvalidArgument;
-            var input_row = try bufferSlice(input, input_offset, input_row_bytes);
-            var output_row = try bufferSlice(output, output_offset, output_row_bytes);
+            var input_row = try logicalF32RowSlice(
+                input,
+                @intCast(ctx.active_rows_u32),
+                row_idx,
+                in_proj.rows(),
+            );
+            var output_row = try logicalF32RowSlice(
+                output,
+                @intCast(ctx.active_rows_u32),
+                row_idx,
+                out_proj.cols(),
+            );
             try self.runShortConvMixerStep(
                 cfg,
                 &shortconv_binding.conv_state,
@@ -5924,7 +6148,7 @@ pub const CudaBackend = struct {
         _: *BlockRuntimeLayer,
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
-        _: *LayerProgramExecutionContext,
+        ctx: *LayerProgramExecutionContext,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
@@ -5943,6 +6167,7 @@ pub const CudaBackend = struct {
         const d_ff_u32: u32 = @intCast(d_ff);
         try self.runFfnStep(
             input,
+            @intCast(ctx.active_rows_u32),
             gate_weight,
             up_weight,
             down_weight,
@@ -5965,26 +6190,14 @@ pub const CudaBackend = struct {
         const residual_src = bufferFromTensorHandle(io.inputs[0]);
         const residual = bufferFromTensorHandle(io.outputs[0]);
         const branch = bufferFromTensorHandle(io.inputs[1]);
-        const count = std.math.mul(u32, ctx.active_rows_u32, ctx.d_model_u32) catch return error.InvalidArgument;
-        if (parityDebugEnabled()) {
-            const count_usize: usize = @intCast(count);
-            const host_storage = try self.allocator.alloc(f32, count_usize * 3);
-            defer self.allocator.free(host_storage);
-            const host_residual = host_storage[0..count_usize];
-            const host_branch = host_storage[count_usize .. count_usize * 2];
-            const host_out = host_storage[count_usize * 2 .. count_usize * 3];
-            try residual_src.download(&self.device, std.mem.sliceAsBytes(host_residual));
-            try branch.download(&self.device, std.mem.sliceAsBytes(host_branch));
-            const scale_value: f32 = switch (scale) {
-                .residual_multiplier => self.loaded.config.residual_multiplier,
-                .one => 1.0,
-                .literal => |literal| literal,
-            };
-            compute.cpu.rowwise.addIntoScaled(host_residual, host_branch, host_out, scale_value);
-            try residual.upload(&self.device, std.mem.sliceAsBytes(host_out));
-            return;
-        }
-        try self.addResidualWithScale(residual, residual_src, branch, count, scale);
+        try self.addResidualWithScaleRowsStrideAware(
+            residual,
+            residual_src,
+            branch,
+            ctx.active_rows_u32,
+            ctx.d_model_u32,
+            scale,
+        );
     }
 
     fn layerProgramNormRuntimeAdapter(
@@ -6338,14 +6551,47 @@ pub const CudaBackend = struct {
         const final_register_idx = runtime_contract.registerToIndex(final_register);
         if (final_register_idx != 0) {
             const final_buf = self.programBuffer(final_register_idx, &exec_ctx) orelse return error.UnsupportedModel;
-            try compute.cuda.copy.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                copy_function,
-                final_buf,
-                &self.runtime_buffers.input_dev,
-                std.math.mul(u32, active_rows_u32, d_model_u32) catch return error.InvalidArgument,
-            );
+            const row_elems_usize: usize = @intCast(d_model_u32);
+            const row_bytes = std.math.mul(usize, row_elems_usize, @sizeOf(f32)) catch return error.InvalidArgument;
+            const slot_idx = if (final_register_idx < layer.register_to_slot_map.len)
+                layer.register_to_slot_map[final_register_idx]
+            else
+                BlockRuntimeLayer.invalid_slot;
+            const final_row_width = if (slot_idx == BlockRuntimeLayer.invalid_slot or slot_idx >= layer.slot_width_hints.len)
+                row_elems_usize
+            else
+                layer.slot_width_hints[slot_idx];
+
+            // Final output may live in a widened temporary slot. For multi-row prefill,
+            // copy row-by-row using slot stride so later rows do not alias padding.
+            if (final_row_width == row_elems_usize) {
+                try compute.cuda.copy.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    copy_function,
+                    final_buf,
+                    &self.runtime_buffers.input_dev,
+                    std.math.mul(u32, active_rows_u32, d_model_u32) catch return error.InvalidArgument,
+                );
+            } else {
+                const src_row_stride = std.math.mul(usize, final_row_width, @sizeOf(f32)) catch return error.InvalidArgument;
+                const row_count: usize = @intCast(active_rows_u32);
+                var row_idx: usize = 0;
+                while (row_idx < row_count) : (row_idx += 1) {
+                    const src_offset = std.math.mul(usize, row_idx, src_row_stride) catch return error.InvalidArgument;
+                    const dst_offset = std.math.mul(usize, row_idx, row_bytes) catch return error.InvalidArgument;
+                    var src_row = try bufferSlice(final_buf, src_offset, row_bytes);
+                    var dst_row = try bufferSlice(&self.runtime_buffers.input_dev, dst_offset, row_bytes);
+                    try compute.cuda.copy.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        copy_function,
+                        &src_row,
+                        &dst_row,
+                        d_model_u32,
+                    );
+                }
+            }
             return final_buf.*;
         }
         return exec_ctx.input_view;
@@ -6354,6 +6600,8 @@ pub const CudaBackend = struct {
     fn runAttentionContext(
         self: *CudaBackend,
         cfg: *const LayerAttentionExecConfig,
+        q_stage: *const compute.cuda.Buffer,
+        context_stage: *compute.cuda.Buffer,
         k_cache: *const compute.cuda.Buffer,
         v_cache: *const compute.cuda.Buffer,
         kernels: AttentionKernelSet,
@@ -6395,10 +6643,10 @@ pub const CudaBackend = struct {
                     &self.kernel_arg_pack,
                     &self.device,
                     kernels.attn_fused_heads_f16_kv_function.?,
-                    &self.runtime_buffers.attn_q_dev,
+                    q_stage,
                     &k_cache_view,
                     &v_cache_view,
-                    &self.runtime_buffers.attn_context_dev,
+                    context_stage,
                     @intCast(self.n_heads),
                     effective_seq_len_u32,
                     kv_dim_u32,
@@ -6418,7 +6666,7 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-                &self.runtime_buffers.attn_q_dev,
+                q_stage,
                 &k_cache_view,
                 attn_scores_dev,
                 @intCast(self.n_heads),
@@ -6443,7 +6691,7 @@ pub const CudaBackend = struct {
                 kernels.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
                 attn_probs_dev,
                 &v_cache_view,
-                &self.runtime_buffers.attn_context_dev,
+                context_stage,
                 @intCast(self.n_heads),
                 effective_seq_len_u32,
                 kv_dim_u32,
@@ -6462,7 +6710,7 @@ pub const CudaBackend = struct {
             &self.kernel_arg_pack,
             &self.device,
             attn_scores_heads_f32_function,
-            &self.runtime_buffers.attn_q_dev,
+            q_stage,
             &k_cache_view,
             attn_scores_dev,
             @intCast(self.n_heads),
@@ -6487,7 +6735,7 @@ pub const CudaBackend = struct {
             attn_weighted_sum_heads_f32_function,
             attn_probs_dev,
             &v_cache_view,
-            &self.runtime_buffers.attn_context_dev,
+            context_stage,
             @intCast(self.n_heads),
             effective_seq_len_u32,
             kv_dim_u32,
@@ -6654,6 +6902,8 @@ pub const CudaBackend = struct {
         {
             return false;
         }
+        const rows = bufferF32RowCount(input, gate.rows) catch return false;
+        if (rows != 1) return false;
 
         const fused_kernel = switch (gate.dtype) {
             .f16 => self.matvec_gate_up_f16_function orelse return false,
@@ -9402,4 +9652,31 @@ test "bufferF32RowCount derives staged row count from buffer bytes" {
         .size = bytes,
     };
     try std.testing.expectEqual(@as(usize, 2), try bufferF32RowCount(&buffer, 1024));
+}
+
+test "logicalF32RowSlice uses packed row offsets for tightly packed buffers" {
+    const row_width = 8;
+    const row_bytes = row_width * @sizeOf(f32);
+    const buffer = compute.cuda.Buffer{
+        .pointer = 4096,
+        .size = 2 * row_bytes,
+    };
+
+    const row1 = try logicalF32RowSlice(&buffer, 2, 1, row_width);
+    try std.testing.expectEqual(buffer.pointer + row_bytes, row1.pointer);
+    try std.testing.expectEqual(@as(usize, row_bytes), row1.size);
+}
+
+test "logicalF32RowSlice uses widened row stride for staged slot buffers" {
+    const logical_width = 8;
+    const logical_row_bytes = logical_width * @sizeOf(f32);
+    const widened_row_bytes = 16 * @sizeOf(f32);
+    const buffer = compute.cuda.Buffer{
+        .pointer = 8192,
+        .size = 2 * widened_row_bytes,
+    };
+
+    const row1 = try logicalF32RowSlice(&buffer, 2, 1, logical_width);
+    try std.testing.expectEqual(buffer.pointer + widened_row_bytes, row1.pointer);
+    try std.testing.expectEqual(@as(usize, logical_row_bytes), row1.size);
 }
