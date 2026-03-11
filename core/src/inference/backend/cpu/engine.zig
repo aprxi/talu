@@ -47,6 +47,7 @@ const cpu_blocks = cpu_executor.weights;
 const runtime_contract = @import("../../runtime_contract/root.zig");
 const common_mrope = @import("vision/mrope.zig");
 const trace = @import("../../../xray/trace.zig");
+const xray = @import("../../../xray/root.zig");
 const PoolingStrategy = contract.PoolingStrategy;
 const LoadedModel = models.LoadedModel;
 const kernels = @import("kernels/root.zig");
@@ -863,6 +864,7 @@ pub const FusedCpuBackend = struct {
         const logits_buffer = self.getLogitsBuffer(0);
 
         while (generated_count < max_tokens) {
+            if (xray.isVerifyStopRequested()) break;
             const token_ids = &[_]u32{current_token};
 
             // 1. Get embedding

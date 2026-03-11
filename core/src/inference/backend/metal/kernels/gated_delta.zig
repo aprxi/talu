@@ -14,11 +14,6 @@ pub const GatedDeltaCache = runtime_graph.GatedDeltaCache;
 pub const GatedDeltaState = struct {
     cache: ?GatedDeltaCache = null,
     layer_idx: usize = 0,
-    trace_capture_enabled: bool = false,
-    trace_in_proj: ?ArrayHandle = null,
-    trace_conv: ?ArrayHandle = null,
-    trace_ssm: ?ArrayHandle = null,
-    trace_norm: ?ArrayHandle = null,
 };
 
 pub const GatedDeltaScratch = struct {};
@@ -60,16 +55,13 @@ pub const GatedDeltaKernel = struct {
         _ = scratch;
         _ = matmul_scratch;
 
-        state.trace_in_proj = null;
-        state.trace_conv = null;
-        state.trace_ssm = null;
-        state.trace_norm = null;
-
         const cache_handle = if (state.cache) |cache| cache.handle else null;
         const has_quantized_core = self.in_proj != null and self.out_proj != null;
         const has_dense_core = self.in_proj_bf16 != null and self.out_proj_bf16 != null;
         if (has_quantized_core == has_dense_core) return error.InvalidTensorType;
-        const verify_mode = state.trace_capture_enabled;
+        // XRAY CONTRACT:
+        // Verification is observability-only. This kernel must stay on the
+        // production path regardless of tracing/verification state.
 
         if (has_quantized_core) {
             const in_proj = self.in_proj.?;
@@ -77,114 +69,46 @@ pub const GatedDeltaKernel = struct {
             if (in_proj.group_size != out_proj.group_size or in_proj.bits != out_proj.bits) {
                 return error.InvalidTensorType;
             }
-            if (verify_mode) {
-                var trace_in_proj: ArrayHandle = null;
-                var trace_conv: ArrayHandle = null;
-                var trace_ssm: ArrayHandle = null;
-                var trace_norm: ArrayHandle = null;
-                output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_quantized_capture(
-                    input_tensor,
-                    in_proj.weights,
-                    in_proj.scales,
-                    in_proj.biases,
-                    self.conv_weight,
-                    if (self.conv_bias) |bias| bias else null,
-                    self.a_log,
-                    if (self.dt_bias) |bias| bias else null,
-                    if (self.norm_weight) |weight| weight else null,
-                    out_proj.weights,
-                    out_proj.scales,
-                    out_proj.biases,
-                    in_proj.group_size,
-                    in_proj.bits,
-                    cache_handle,
-                    state.layer_idx,
-                    self.d_conv,
-                    self.n_heads,
-                    self.n_key_heads,
-                    self.d_head,
-                    &trace_in_proj,
-                    &trace_conv,
-                    &trace_ssm,
-                    &trace_norm,
-                );
-                state.trace_in_proj = trace_in_proj;
-                state.trace_conv = trace_conv;
-                state.trace_ssm = trace_ssm;
-                state.trace_norm = trace_norm;
-            } else {
-                output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_quantized(
-                    input_tensor,
-                    in_proj.weights,
-                    in_proj.scales,
-                    in_proj.biases,
-                    self.conv_weight,
-                    if (self.conv_bias) |bias| bias else null,
-                    self.a_log,
-                    if (self.dt_bias) |bias| bias else null,
-                    if (self.norm_weight) |weight| weight else null,
-                    out_proj.weights,
-                    out_proj.scales,
-                    out_proj.biases,
-                    in_proj.group_size,
-                    in_proj.bits,
-                    cache_handle,
-                    state.layer_idx,
-                    self.d_conv,
-                    self.n_heads,
-                    self.n_key_heads,
-                    self.d_head,
-                );
-            }
+            output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_quantized(
+                input_tensor,
+                in_proj.weights,
+                in_proj.scales,
+                in_proj.biases,
+                self.conv_weight,
+                if (self.conv_bias) |bias| bias else null,
+                self.a_log,
+                if (self.dt_bias) |bias| bias else null,
+                if (self.norm_weight) |weight| weight else null,
+                out_proj.weights,
+                out_proj.scales,
+                out_proj.biases,
+                in_proj.group_size,
+                in_proj.bits,
+                cache_handle,
+                state.layer_idx,
+                self.d_conv,
+                self.n_heads,
+                self.n_key_heads,
+                self.d_head,
+            );
             return;
         }
 
-        if (verify_mode) {
-            var trace_in_proj: ArrayHandle = null;
-            var trace_conv: ArrayHandle = null;
-            var trace_ssm: ArrayHandle = null;
-            var trace_norm: ArrayHandle = null;
-            output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_bf16_capture(
-                input_tensor,
-                self.in_proj_bf16.?,
-                self.conv_weight,
-                if (self.conv_bias) |bias| bias else null,
-                self.a_log,
-                if (self.dt_bias) |bias| bias else null,
-                if (self.norm_weight) |weight| weight else null,
-                self.out_proj_bf16.?,
-                cache_handle,
-                state.layer_idx,
-                self.d_conv,
-                self.n_heads,
-                self.n_key_heads,
-                self.d_head,
-                &trace_in_proj,
-                &trace_conv,
-                &trace_ssm,
-                &trace_norm,
-            );
-            state.trace_in_proj = trace_in_proj;
-            state.trace_conv = trace_conv;
-            state.trace_ssm = trace_ssm;
-            state.trace_norm = trace_norm;
-        } else {
-            output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_bf16(
-                input_tensor,
-                self.in_proj_bf16.?,
-                self.conv_weight,
-                if (self.conv_bias) |bias| bias else null,
-                self.a_log,
-                if (self.dt_bias) |bias| bias else null,
-                if (self.norm_weight) |weight| weight else null,
-                self.out_proj_bf16.?,
-                cache_handle,
-                state.layer_idx,
-                self.d_conv,
-                self.n_heads,
-                self.n_key_heads,
-                self.d_head,
-            );
-        }
+        output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_bf16(
+            input_tensor,
+            self.in_proj_bf16.?,
+            self.conv_weight,
+            if (self.conv_bias) |bias| bias else null,
+            self.a_log,
+            if (self.dt_bias) |bias| bias else null,
+            if (self.norm_weight) |weight| weight else null,
+            self.out_proj_bf16.?,
+            cache_handle,
+            state.layer_idx,
+            self.d_conv,
+            self.n_heads,
+            self.n_key_heads,
+            self.d_head,
+        );
     }
 };

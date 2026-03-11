@@ -39,6 +39,14 @@ const validate = @import("../../../validate/root.zig");
 const tokenizer_mod = @import("../../../tokenizer/root.zig");
 const runtime_contract = @import("../../runtime_contract/root.zig");
 const trace = @import("../../../xray/trace.zig");
+const xray = @import("../../../xray/root.zig");
+
+fn generationShouldStop(stop_flag: ?*const std.atomic.Value(bool)) bool {
+    if (stop_flag) |flag| {
+        if (flag.load(.acquire)) return true;
+    }
+    return xray.isVerifyStopRequested();
+}
 
 /// Request state in the scheduler.
 pub const RequestState = enum {
@@ -437,8 +445,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             candidate_ids: []u32,
             sampling_config: sampling.SamplingConfig,
         ) !u32 {
-            const xray = @import("../../../xray/root.zig");
-
             // Teacher forcing tokens are vocabulary IDs, not indices into the
             // backend-provided top-k candidate subset. Handle them directly.
             if (xray.getNextForcedToken()) |forced_token| {
@@ -977,15 +983,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 };
             }
 
-            if (submit_config.stop_flag) |flag| {
-                if (flag.load(.acquire)) {
-                    return .{
-                        .tokens = try self.allocator.dupe(u32, &.{}),
-                        .finish_reason = .cancelled,
-                        .prefill_ns = 0,
-                        .decode_ns = 0,
-                    };
-                }
+            if (generationShouldStop(submit_config.stop_flag)) {
+                return .{
+                    .tokens = try self.allocator.dupe(u32, &.{}),
+                    .finish_reason = .cancelled,
+                    .prefill_ns = 0,
+                    .decode_ns = 0,
+                };
             }
 
             const slot_index = self.backend.allocSlot() orelse return error.NoSlotsAvailable;
@@ -1025,6 +1029,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             var prefill_timer = std.time.Timer.start() catch unreachable;
             try self.prefillWithOptionalVision(slot_index, prompt_tokens, null);
             const prefill_ns = prefill_timer.read();
+            if (generationShouldStop(submit_config.stop_flag)) {
+                return .{
+                    .tokens = try self.allocator.dupe(u32, &.{}),
+                    .finish_reason = .cancelled,
+                    .prefill_ns = prefill_ns,
+                    .decode_ns = 0,
+                };
+            }
 
             const eos_token_ids = submit_config.eos_token_ids orelse self.config.default_eos_token_ids;
             const current_token = self.sampleToken(self.logits_buffer, sampling_config.*, null) catch 0;
@@ -1068,15 +1080,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             defer self.allocator.free(generated_tail);
 
             var decode_timer = std.time.Timer.start() catch unreachable;
-            if (submit_config.stop_flag) |flag| {
-                if (flag.load(.acquire)) {
-                    return .{
-                        .tokens = try generated.toOwnedSlice(self.allocator),
-                        .finish_reason = .cancelled,
-                        .prefill_ns = prefill_ns,
-                        .decode_ns = 0,
-                    };
-                }
+            if (generationShouldStop(submit_config.stop_flag)) {
+                return .{
+                    .tokens = try generated.toOwnedSlice(self.allocator),
+                    .finish_reason = .cancelled,
+                    .prefill_ns = prefill_ns,
+                    .decode_ns = 0,
+                };
             }
 
             const tail_count = try self.backend.decodeStreaming(
@@ -1122,15 +1132,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 };
             }
 
-            if (submit_config.stop_flag) |flag| {
-                if (flag.load(.acquire)) {
-                    return .{
-                        .tokens = try self.allocator.dupe(u32, &.{}),
-                        .finish_reason = .cancelled,
-                        .prefill_ns = 0,
-                        .decode_ns = 0,
-                    };
-                }
+            if (generationShouldStop(submit_config.stop_flag)) {
+                return .{
+                    .tokens = try self.allocator.dupe(u32, &.{}),
+                    .finish_reason = .cancelled,
+                    .prefill_ns = 0,
+                    .decode_ns = 0,
+                };
             }
 
             const slot_index = self.backend.allocSlot() orelse return error.NoSlotsAvailable;
@@ -1170,6 +1178,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             var prefill_timer = std.time.Timer.start() catch unreachable;
             try self.prefillWithOptionalVision(slot_index, prompt_tokens, null);
             const prefill_ns = prefill_timer.read();
+            if (generationShouldStop(submit_config.stop_flag)) {
+                return .{
+                    .tokens = try self.allocator.dupe(u32, &.{}),
+                    .finish_reason = .cancelled,
+                    .prefill_ns = prefill_ns,
+                    .decode_ns = 0,
+                };
+            }
 
             const eos_token_ids = submit_config.eos_token_ids orelse self.config.default_eos_token_ids;
             var current_token = self.sampleToken(self.logits_buffer, sampling_config.*, null) catch 0;
@@ -1225,15 +1241,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             var decode_timer = std.time.Timer.start() catch unreachable;
             while (generated.items.len < max_tokens) {
-                if (submit_config.stop_flag) |flag| {
-                    if (flag.load(.acquire)) {
-                        return .{
-                            .tokens = try generated.toOwnedSlice(self.allocator),
-                            .finish_reason = .cancelled,
-                            .prefill_ns = prefill_ns,
-                            .decode_ns = decode_timer.read(),
-                        };
-                    }
+                if (generationShouldStop(submit_config.stop_flag)) {
+                    return .{
+                        .tokens = try generated.toOwnedSlice(self.allocator),
+                        .finish_reason = .cancelled,
+                        .prefill_ns = prefill_ns,
+                        .decode_ns = decode_timer.read(),
+                    };
                 }
 
                 const candidate_count = try self.backend.decodeTopKCandidates(
@@ -4343,7 +4357,6 @@ test "generateSync top-k candidate route - candidate order does not affect seede
 }
 
 test "generateSync top-k candidate route honors teacher forcing vocab ids" {
-    const xray = @import("../../../xray/root.zig");
     const alloc = std.testing.allocator;
     var backend = MockStreamingBackend.init(alloc, 256);
     defer backend.deinit();

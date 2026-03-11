@@ -25,6 +25,9 @@ const ReferenceVerifier = reference_mod.ReferenceVerifier;
 
 var ignore_token_parity_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var token_only_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var verification_full_capture_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var verification_point_mask_override: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 /// XRAY VERIFY CONTROL:
 /// These controls are observability/transcript-only switches.
@@ -43,6 +46,26 @@ pub fn setTokenOnlyOverride(enabled: bool) void {
 
 pub fn clearTokenOnlyOverride() void {
     token_only_enabled.store(false, .release);
+}
+
+pub fn setVerificationFullCaptureOverride(enabled: bool) void {
+    verification_full_capture_enabled.store(enabled, .release);
+}
+
+pub fn clearVerificationFullCaptureOverride() void {
+    verification_full_capture_enabled.store(false, .release);
+}
+
+pub fn setVerificationPointMaskOverride(mask: u64) void {
+    verification_point_mask_override.store(mask, .release);
+}
+
+pub fn clearVerificationPointMaskOverride() void {
+    verification_point_mask_override.store(0, .release);
+}
+
+pub fn isStopRequested() bool {
+    return stop_requested.load(.acquire);
 }
 
 /// Mode for verification capture.
@@ -84,8 +107,37 @@ pub const VerifyCapture = struct {
     /// Has a panic dump been triggered?
     panic_triggered: bool,
 
-    fn verificationPointSet() capture_mod.TracePointSet {
-        return capture_mod.TracePointSet.all();
+    fn defaultVerificationPointSet() capture_mod.TracePointSet {
+        // Verify only points that every backend can emit as real host-readable
+        // tensors on the production execution path. Marker-only points and
+        // backend-private internals do not belong in the default parity contract.
+        return .{
+            .layer_attn_norm = true,
+            .block_out = true,
+            .lm_head = true,
+            .logits_ready = true,
+            .token_select = true,
+            .gdelta_out = true,
+        };
+    }
+
+    fn configuredVerificationPointSet() capture_mod.TracePointSet {
+        const override_mask = verification_point_mask_override.load(.acquire);
+        if (override_mask != 0) {
+            return capture_mod.TracePointSet.fromBuiltinMask(override_mask);
+        }
+        return defaultVerificationPointSet();
+    }
+
+    fn verificationFullCaptureEnabled() bool {
+        return verification_full_capture_enabled.load(.acquire);
+    }
+
+    fn effectivePointSet(self: *const VerifyCapture) capture_mod.TracePointSet {
+        if (self.mode == .verify and tokenOnlyVerificationEnabled() and !teacher_forcing.isEnabled()) {
+            return .{ .token_select = true };
+        }
+        return self.capture.config.points;
     }
 
     pub fn initRecording(
@@ -94,7 +146,7 @@ pub const VerifyCapture = struct {
     ) VerifyCapture {
         const config = TraceCaptureConfig{
             .mode = .stats,
-            .points = verificationPointSet(),
+            .points = defaultVerificationPointSet(),
             .allow_non_cpu_host_data = true,
         };
 
@@ -122,7 +174,7 @@ pub const VerifyCapture = struct {
     ) VerifyCapture {
         const config = TraceCaptureConfig{
             .mode = .stats,
-            .points = verificationPointSet(),
+            .points = configuredVerificationPointSet(),
             .allow_non_cpu_host_data = true,
         };
 
@@ -132,11 +184,11 @@ pub const VerifyCapture = struct {
             .mode = .verify,
             .recorder = null,
             .verifier = verifier,
-            .recording_full_capture = blk: {
+            .recording_full_capture = if (verificationFullCaptureEnabled()) blk: {
                 var capture = dump_capture_mod.Capture.init(allocator);
                 capture.enable();
                 break :blk capture;
-            },
+            } else null,
             .recording_full_index = 0,
             .panic_dump_dir = panic_dump_dir,
             .panic_triggered = false,
@@ -247,6 +299,7 @@ pub const VerifyCapture = struct {
                         // token mismatch.
                         if (!ignoreTokenParity() and !teacher_forcing.isEnabled()) {
                             ver.checkToken(token_id_ptr.*) catch |err| {
+                                stop_requested.store(true, .release);
                                 logVerificationDivergence(ver, err);
                                 return;
                             };
@@ -280,6 +333,7 @@ pub const VerifyCapture = struct {
                 if (self.verifier) |ver| {
                     ver.checkEmission(emission, tensor_stats) catch |err| {
                         // Divergence detected!
+                        stop_requested.store(true, .release);
                         logVerificationDivergence(ver, err);
 
                         if (ver.divergence_point) |div| {
@@ -419,11 +473,14 @@ fn globalVerifyHandler(emission: TraceEmission) void {
 
 pub fn enableVerifyCapture(cap: *VerifyCapture) void {
     global_verify_capture = cap;
+    stop_requested.store(false, .release);
+    trace.setActiveBuiltInPointMask(cap.effectivePointSet().builtinMask());
     trace.setHandler(&globalVerifyHandler);
 }
 
 pub fn disableVerifyCapture() void {
     global_verify_capture = null;
+    stop_requested.store(false, .release);
     trace.setHandler(null);
 }
 
@@ -492,17 +549,22 @@ test "VerifyCapture recording mode writes full tensor NPZ sidecar" {
 
     verify_cap.handleEmission(emission);
 
+    const full_capture = &(verify_cap.recording_full_capture orelse unreachable);
+    try std.testing.expectEqual(@as(usize, 1), full_capture.tensors.items.len);
+
     const path = try std.fs.path.join(allocator, &[_][]const u8{
         "/tmp",
         "talu_verify_capture_recording_full_sidecar_test.npz",
     });
     defer allocator.free(path);
-    std.fs.cwd().deleteFile(path) catch {};
-    defer std.fs.cwd().deleteFile(path) catch {};
+    std.fs.deleteFileAbsolute(path) catch {};
+    defer std.fs.deleteFileAbsolute(path) catch {};
 
     try verify_cap.saveFullNpz(path);
 
-    const stat = try std.fs.cwd().statFile(path);
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const stat = try file.stat();
     try std.testing.expect(stat.size > 0);
 }
 
@@ -605,7 +667,7 @@ test "VerifyCapture full sidecar names use logical token index progression" {
 
     const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const layer_emission = TraceEmission{
-        .point = .layer_ffn_norm,
+        .point = .block_out,
         .layer = 0,
         .token = 0, // still backend slot token
         .position = 11,
@@ -743,6 +805,76 @@ test "VerifyCapture verification mode compares host tensors from non-CPU backend
 
     try std.testing.expect(verifier.has_diverged);
     try std.testing.expect(verifier.divergence_point != null);
+}
+
+test "VerifyCapture verification mode disables full sidecar capture by default" {
+    const allocator = std.testing.allocator;
+
+    const ref = reference_mod.ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{100},
+        .stats_records = &.{},
+        .allocator = allocator,
+    };
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
+    defer verify_cap.deinit();
+
+    try std.testing.expect(verify_cap.recording_full_capture == null);
+}
+
+test "VerifyCapture verification mode enables full sidecar capture only when requested" {
+    const allocator = std.testing.allocator;
+
+    const ref = reference_mod.ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{100},
+        .stats_records = &.{},
+        .allocator = allocator,
+    };
+
+    setVerificationFullCaptureOverride(true);
+    defer clearVerificationFullCaptureOverride();
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
+    defer verify_cap.deinit();
+
+    try std.testing.expect(verify_cap.recording_full_capture != null);
+}
+
+test "VerifyCapture token-only phase narrows effective point set to token_select" {
+    const allocator = std.testing.allocator;
+
+    const ref = reference_mod.ReferenceData{
+        .model_name = "test",
+        .seed = 42,
+        .temperature = 1.0,
+        .max_tokens = 1,
+        .token_transcript = &[_]u32{100},
+        .stats_records = &.{},
+        .allocator = allocator,
+    };
+
+    setTokenOnlyOverride(true);
+    defer clearTokenOnlyOverride();
+
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
+    defer verify_cap.deinit();
+
+    const points = verify_cap.effectivePointSet();
+    try std.testing.expect(points.contains(.token_select));
+    try std.testing.expect(!points.contains(.layer_attn_norm));
+    try std.testing.expect(!points.contains(.gdelta_out));
+    try std.testing.expect(!points.contains(.lm_head));
 }
 
 test "VerifyCapture ignores custom trace points outside verification set" {
@@ -929,15 +1061,35 @@ test "VerifyCapture token_select f32 does not advance verifier" {
 }
 
 test "VerifyCapture verification point set is complete" {
-    const points = VerifyCapture.verificationPointSet();
+    const points = VerifyCapture.defaultVerificationPointSet();
     try std.testing.expect(points.contains(.layer_attn_norm));
-    try std.testing.expect(points.contains(.layer_ffn_norm));
-    try std.testing.expect(points.contains(.gdelta_ssm));
-    try std.testing.expect(points.contains(.gdelta_norm));
-    try std.testing.expect(points.contains(.gdelta_out));
+    try std.testing.expect(points.contains(.block_out));
     try std.testing.expect(points.contains(.lm_head));
     try std.testing.expect(points.contains(.logits_ready));
     try std.testing.expect(points.contains(.token_select));
+    try std.testing.expect(points.contains(.gdelta_out));
+    try std.testing.expect(!points.contains(.layer_ffn_norm));
+    try std.testing.expect(!points.contains(.ffn_act));
+    try std.testing.expect(!points.contains(.ffn_act_map));
+    try std.testing.expect(!points.contains(.ffn_act_mix));
+    try std.testing.expect(!points.contains(.gdelta_in_proj));
+    try std.testing.expect(!points.contains(.gdelta_conv));
+    try std.testing.expect(!points.contains(.gdelta_ssm));
+    try std.testing.expect(!points.contains(.gdelta_norm));
+    try std.testing.expect(!points.contains(.conv_out_proj));
+    try std.testing.expect(!points.contains(.mamba_out));
+    try std.testing.expect(!points.contains(.final_norm));
+    try std.testing.expect(!points.contains(.logits_scaled));
+}
+
+test "VerifyCapture configured verification point set honors override" {
+    setVerificationPointMaskOverride((@as(u64, 1) << @intFromEnum(trace.TracePoint.lm_head)));
+    defer clearVerificationPointMaskOverride();
+
+    const points = VerifyCapture.configuredVerificationPointSet();
+    try std.testing.expect(points.contains(.lm_head));
+    try std.testing.expect(!points.contains(.gdelta_out));
+    try std.testing.expect(!points.contains(.layer_attn_norm));
 }
 
 test "VerifyCapture recording token_select u32 updates transcript without stats record" {

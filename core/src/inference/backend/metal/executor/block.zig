@@ -271,7 +271,7 @@ pub const TransformerBlock = struct {
         ndim: u8,
         kernel_name: []const u8,
     ) void {
-        if (!trace.isEnabled()) return;
+        if (!trace.shouldEmit(point)) return;
         // block_out must carry real host data; marker-pointer traces are invalid.
         if (point == .block_out) return;
         var marker = [_]f32{0.0};
@@ -296,7 +296,7 @@ pub const TransformerBlock = struct {
         point: trace.TracePoint,
         kernel_name: []const u8,
     ) void {
-        if (!trace.isEnabled()) return;
+        if (!trace.shouldEmit(point)) return;
 
         const io = instructionIoSlices(insn, registers) catch return;
         if (io.outputs.len == 0) return;
@@ -366,7 +366,7 @@ pub const TransformerBlock = struct {
         point: trace.TracePoint,
         kernel_name: []const u8,
     ) void {
-        if (!trace.isEnabled()) return;
+        if (!trace.shouldEmit(point)) return;
 
         const io = instructionIoSlices(insn, registers) catch return;
         if (io.outputs.len == 0) return;
@@ -381,6 +381,7 @@ pub const TransformerBlock = struct {
         var width: usize = 0;
         switch (output_rank) {
             3 => {
+                if (output_shape[0] != 1) return;
                 seq_len = output_shape[1];
                 width = output_shape[2];
             },
@@ -396,31 +397,21 @@ pub const TransformerBlock = struct {
         }
         if (seq_len == 0 or width == 0) return;
 
-        for (0..seq_len) |token_idx| {
-            const token_handle = if (output_rank == 1) output else blk: {
-                var starts: [8]c_int = [_]c_int{0} ** 8;
-                var ends: [8]c_int = [_]c_int{0} ** 8;
-                for (0..output_rank) |axis| {
-                    ends[axis] = @intCast(output_shape[axis]);
-                }
-                const seq_axis: usize = if (output_rank == 3) 1 else 0;
-                starts[seq_axis] = @intCast(token_idx);
-                ends[seq_axis] = @intCast(token_idx + 1);
-                break :blk mlx_graph.mlx_lazy_slice(output, &starts, &ends, output_rank);
-            };
-            defer if (token_handle != output) mlx_graph.freeArray(token_handle);
+        const element_count = seq_len * width;
+        mlx_graph.eval(&.{output});
+        const host_buf = std.heap.c_allocator.alloc(f32, element_count) catch return;
+        defer std.heap.c_allocator.free(host_buf);
+        mlx_graph.copyToHost(output, host_buf);
 
-            mlx_graph.eval(&.{token_handle});
-            const host_buf = std.heap.c_allocator.alloc(f32, width) catch return;
-            defer std.heap.c_allocator.free(host_buf);
-            mlx_graph.copyToHost(token_handle, host_buf);
+        for (0..seq_len) |token_idx| {
+            const token_values = host_buf[(token_idx * width)..][0..width];
 
             trace.emit(
                 point,
                 @intCast(state.layer_idx),
                 0,
                 @intCast(token_idx),
-                @ptrCast(host_buf.ptr),
+                @ptrCast(token_values.ptr),
                 .f32,
                 .{ 1, 1, @intCast(width), 0 },
                 3,
@@ -435,7 +426,7 @@ pub const TransformerBlock = struct {
         point: trace.TracePoint,
         kernel_name: []const u8,
     ) void {
-        if (!trace.isEnabled()) return;
+        if (!trace.shouldEmit(point)) return;
         if (output == null) return;
 
         var output_shape: [8]usize = undefined;
@@ -446,6 +437,7 @@ pub const TransformerBlock = struct {
         var width: usize = 0;
         switch (output_rank) {
             3 => {
+                if (output_shape[0] != 1) return;
                 seq_len = output_shape[1];
                 width = output_shape[2];
             },
@@ -461,31 +453,21 @@ pub const TransformerBlock = struct {
         }
         if (seq_len == 0 or width == 0) return;
 
-        for (0..seq_len) |token_idx| {
-            const token_handle = if (output_rank == 1) output else blk: {
-                var starts: [8]c_int = [_]c_int{0} ** 8;
-                var ends: [8]c_int = [_]c_int{0} ** 8;
-                for (0..output_rank) |axis| {
-                    ends[axis] = @intCast(output_shape[axis]);
-                }
-                const seq_axis: usize = if (output_rank == 3) 1 else 0;
-                starts[seq_axis] = @intCast(token_idx);
-                ends[seq_axis] = @intCast(token_idx + 1);
-                break :blk mlx_graph.mlx_lazy_slice(output, &starts, &ends, output_rank);
-            };
-            defer if (token_handle != output) mlx_graph.freeArray(token_handle);
+        const element_count = seq_len * width;
+        mlx_graph.eval(&.{output});
+        const host_buf = std.heap.c_allocator.alloc(f32, element_count) catch return;
+        defer std.heap.c_allocator.free(host_buf);
+        mlx_graph.copyToHost(output, host_buf);
 
-            mlx_graph.eval(&.{token_handle});
-            const host_buf = std.heap.c_allocator.alloc(f32, width) catch return;
-            defer std.heap.c_allocator.free(host_buf);
-            mlx_graph.copyToHost(token_handle, host_buf);
+        for (0..seq_len) |token_idx| {
+            const token_values = host_buf[(token_idx * width)..][0..width];
 
             trace.emit(
                 point,
                 @intCast(state.layer_idx),
                 0,
                 @intCast(token_idx),
-                @ptrCast(host_buf.ptr),
+                @ptrCast(token_values.ptr),
                 .f32,
                 .{ 1, 1, @intCast(width), 0 },
                 3,
@@ -1165,13 +1147,11 @@ pub const TransformerBlock = struct {
         gated_delta: gated_delta_kernel.GatedDeltaKernel,
         layer_idx: usize,
         gated_delta_cache: ?GatedDeltaCache,
-        trace_state: ?*gated_delta_kernel.GatedDeltaState,
     ) !mlx_graph.ArrayHandle {
         var kernel = gated_delta;
         var gd_state = gated_delta_kernel.GatedDeltaState{
             .cache = gated_delta_cache,
             .layer_idx = layer_idx,
-            .trace_capture_enabled = trace_state != null,
         };
         var gd_scratch = gated_delta_kernel.GatedDeltaScratch{};
         var gd_matmul = gated_delta_kernel.MatmulScratch{};
@@ -1183,9 +1163,6 @@ pub const TransformerBlock = struct {
             &gd_scratch,
             &gd_matmul,
         );
-        if (trace_state) |out_state| {
-            out_state.* = gd_state;
-        }
         return gd_out;
     }
 
@@ -1743,66 +1720,14 @@ pub const TransformerBlock = struct {
         gated_delta_binding.conv_bias = optionalArrayWeightFromHandle(weight_handles[4]);
         gated_delta_binding.dt_bias = optionalArrayWeightFromHandle(weight_handles[5]);
         gated_delta_binding.norm_weight = optionalArrayWeightFromHandle(weight_handles[6]);
-        var gd_trace_state: gated_delta_kernel.GatedDeltaState = .{
-            .cache = gated_delta_cache,
-            .layer_idx = state.layer_idx,
-        };
-        // XRAY ACCEPTABLE USE:
-        // Trace state is capture-only. It can mirror intermediates to host but
-        // MUST NOT change the selected kernel path or arithmetic.
-        const gd_trace_state_ptr: ?*gated_delta_kernel.GatedDeltaState = if (trace.isEnabled())
-            &gd_trace_state
-        else
-            null;
         const output = try runGatedDeltaKernel(
             input,
             gated_delta_binding,
             state.layer_idx,
             gated_delta_cache,
-            gd_trace_state_ptr,
         );
         arraySlotFromHandle(io.outputs[0]).* = output;
-        if (trace.isEnabled()) {
-            const captured_handles: [4]?mlx_graph.ArrayHandle = .{
-                gd_trace_state.trace_in_proj,
-                gd_trace_state.trace_conv,
-                gd_trace_state.trace_ssm,
-                gd_trace_state.trace_norm,
-            };
-            defer {
-                // Capture kernels may alias returned intermediates. Free only
-                // unique non-output handles to avoid accidental double-free/UAF.
-                var seen: [4]mlx_graph.ArrayHandle = undefined;
-                var seen_count: usize = 0;
-                for (captured_handles) |maybe_handle| {
-                    const handle = maybe_handle orelse continue;
-                    if (handle == output) continue;
-                    var duplicate = false;
-                    for (seen[0..seen_count]) |existing| {
-                        if (existing == handle) {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-                    if (!duplicate) {
-                        seen[seen_count] = handle;
-                        seen_count += 1;
-                        mlx_graph.freeArray(handle);
-                    }
-                }
-            }
-            if (gd_trace_state.trace_in_proj) |handle| {
-                emitArrayPerTokenHostTracePoint(state, handle, .gdelta_in_proj, "metal_gdelta_in_proj_host");
-            }
-            if (gd_trace_state.trace_conv) |handle| {
-                emitArrayPerTokenHostTracePoint(state, handle, .gdelta_conv, "metal_gdelta_conv_host");
-            }
-            if (gd_trace_state.trace_ssm) |handle| {
-                emitArrayPerTokenHostTracePoint(state, handle, .gdelta_ssm, "metal_gdelta_ssm_host");
-            }
-            if (gd_trace_state.trace_norm) |handle| {
-                emitArrayPerTokenHostTracePoint(state, handle, .gdelta_norm, "metal_gdelta_norm_host");
-            }
+        if (trace.shouldEmit(.gdelta_out)) {
             emitArrayPerTokenHostTracePoint(state, output, .gdelta_out, "metal_gdelta_out_host");
         }
     }

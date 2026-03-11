@@ -396,7 +396,7 @@ pub const Model = struct {
                 hidden = mlx_graph.mlx_lazy_add(hidden, deepstack_layer_additions[layer_idx]);
             }
 
-            if (trace.isEnabled()) {
+            if (trace.shouldEmit(.block_out)) {
                 try emitBlockOutHostTrace(
                     allocator,
                     hidden,

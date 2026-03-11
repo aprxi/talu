@@ -477,6 +477,26 @@ impl VerifyCaptureHandle {
     pub fn clear_token_only_override() {
         unsafe { talu_sys::talu_xray_verify_clear_token_only_override() };
     }
+
+    /// Enable or disable full tensor sidecar capture for verification mode.
+    pub fn set_full_capture(enabled: bool) {
+        unsafe { talu_sys::talu_xray_verify_set_full_capture(enabled) };
+    }
+
+    /// Clear full-capture verification override.
+    pub fn clear_full_capture_override() {
+        unsafe { talu_sys::talu_xray_verify_clear_full_capture_override() };
+    }
+
+    /// Restrict verification to a specific built-in trace-point mask.
+    pub fn set_point_mask(mask: u64) {
+        unsafe { talu_sys::talu_xray_verify_set_point_mask(mask) };
+    }
+
+    /// Clear verification point-mask override.
+    pub fn clear_point_mask_override() {
+        unsafe { talu_sys::talu_xray_verify_clear_point_mask_override() };
+    }
 }
 
 impl Drop for VerifyCaptureHandle {

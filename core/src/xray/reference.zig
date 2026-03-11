@@ -334,7 +334,18 @@ pub const ReferenceVerifier = struct {
         if (!self.statsMatch(golden.stats, actual_stats)) {
             self.has_diverged = true;
             var msg_buf: [256]u8 = undefined;
-            const msg = try std.fmt.bufPrint(&msg_buf, "Stats divergence at token={d} layer={d} point={s}: RMS expected={d:.6} actual={d:.6}", .{ self.token_idx, emission.layer, emission.point.name(), golden.stats.rms(), actual_stats.rms() });
+            const msg = try std.fmt.bufPrint(
+                &msg_buf,
+                "Stats divergence at token={d} layer={d} point={s} pos={d}: RMS expected={d:.6} actual={d:.6}",
+                .{
+                    self.token_idx,
+                    emission.layer,
+                    emission.point.name(),
+                    emission.position,
+                    golden.stats.rms(),
+                    actual_stats.rms(),
+                },
+            );
             self.divergence_point = .{
                 .token_idx = self.token_idx,
                 .layer = emission.layer,

@@ -13,6 +13,7 @@ const cpu_math_rope = @import("../../../compute/cpu/math_rope.zig");
 const ModelConfig = tensor.ModelConfig;
 const log = @import("../../../log.zig");
 const trace = @import("../../../xray/trace.zig");
+const xray = @import("../../../xray/root.zig");
 
 // Import compute primitives from compute/
 const compute = @import("../../../compute/root.zig");
@@ -145,7 +146,7 @@ pub const MetalBackend = struct {
     }
 
     fn emitLmHeadFromReadyLogits(self: *MetalBackend, logits_out: []const f32) !void {
-        if (!trace.isEnabled()) return;
+        if (!trace.shouldEmit(.lm_head)) return;
         if (logits_out.len < self.vocab_size) return error.InvalidArgument;
         trace.emitFinal(
             .lm_head,
@@ -707,16 +708,18 @@ pub const MetalBackend = struct {
             t_copy_done_ns = t_done;
         }
         try self.emitLmHeadFromReadyLogits(logits_out);
-        trace.emitFinal(
-            .logits_ready,
-            @intCast(sequence_len - 1),
-            @intCast(sequence_len),
-            @ptrCast(logits_out.ptr),
-            .f32,
-            .{ @intCast(self.vocab_size), 0, 0, 0 },
-            1,
-            "metal_logits_host",
-        );
+        if (trace.shouldEmit(.logits_ready)) {
+            trace.emitFinal(
+                .logits_ready,
+                @intCast(sequence_len - 1),
+                @intCast(sequence_len),
+                @ptrCast(logits_out.ptr),
+                .f32,
+                .{ @intCast(self.vocab_size), 0, 0, 0 },
+                1,
+                "metal_logits_host",
+            );
+        }
 
         const t_end_ns: i128 = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
@@ -793,16 +796,18 @@ pub const MetalBackend = struct {
             graph.copyToHost(logits_handle, logits_out);
         }
         try self.emitLmHeadFromReadyLogits(logits_out);
-        trace.emitFinal(
-            .logits_ready,
-            0,
-            @intCast(position + 1),
-            @ptrCast(logits_out.ptr),
-            .f32,
-            .{ @intCast(self.vocab_size), 0, 0, 0 },
-            1,
-            "metal_logits_host",
-        );
+        if (trace.shouldEmit(.logits_ready)) {
+            trace.emitFinal(
+                .logits_ready,
+                0,
+                @intCast(position + 1),
+                @ptrCast(logits_out.ptr),
+                .f32,
+                .{ @intCast(self.vocab_size), 0, 0, 0 },
+                1,
+                "metal_logits_host",
+            );
+        }
         const slot_position = try self.slotPositionPtr(slot_index);
         slot_position.* = position + 1;
     }
@@ -846,16 +851,18 @@ pub const MetalBackend = struct {
         const slot_position = try self.slotPositionPtr(slot_index);
         slot_position.* = position + 1;
         const next_token = graph.mlx_array_item_u32(token_handle);
-        trace.emitFinal(
-            .token_select,
-            0,
-            @intCast(position + 1),
-            @ptrCast(std.mem.asBytes(&next_token).ptr),
-            .u32,
-            .{ 1, 0, 0, 0 },
-            1,
-            "gpu_argmax",
-        );
+        if (trace.shouldEmit(.token_select)) {
+            trace.emitFinal(
+                .token_select,
+                0,
+                @intCast(position + 1),
+                @ptrCast(std.mem.asBytes(&next_token).ptr),
+                .u32,
+                .{ 1, 0, 0, 0 },
+                1,
+                "gpu_argmax",
+            );
+        }
         return next_token;
     }
 
@@ -1400,16 +1407,18 @@ pub const MetalBackend = struct {
             logits_out,
             emitParityFinalPathCheckpoints(),
         );
-        trace.emitFinal(
-            .logits_ready,
-            @intCast(sequence_len - 1),
-            @intCast(sequence_len),
-            @ptrCast(logits_out.ptr),
-            .f32,
-            .{ @intCast(self.vocab_size), 0, 0, 0 },
-            1,
-            "metal_logits_host",
-        );
+        if (trace.shouldEmit(.logits_ready)) {
+            trace.emitFinal(
+                .logits_ready,
+                @intCast(sequence_len - 1),
+                @intCast(sequence_len),
+                @ptrCast(logits_out.ptr),
+                .f32,
+                .{ @intCast(self.vocab_size), 0, 0, 0 },
+                1,
+                "metal_logits_host",
+            );
+        }
 
         slot_position.* = sequence_len;
     }
@@ -1476,6 +1485,7 @@ pub const MetalBackend = struct {
         var current_position = start_position;
         var generated_count: usize = 0;
         while (generated_count < budget) {
+            if (xray.isVerifyStopRequested()) break;
             const next_token = try self.decodeSlotGreedy(0, current_token, current_position);
             output_tokens[generated_count] = next_token;
             generated_count += 1;

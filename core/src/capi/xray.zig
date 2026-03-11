@@ -664,6 +664,28 @@ pub export fn talu_xray_verify_clear_token_only_override() callconv(.c) void {
     xray.clearVerifyTokenOnlyOverride();
 }
 
+/// Enable or disable full tensor capture during verification mode.
+/// This changes only what verify records, never backend execution behavior.
+pub export fn talu_xray_verify_set_full_capture(enabled: bool) callconv(.c) void {
+    xray.setVerifyFullCaptureOverride(enabled);
+}
+
+/// Clear verification full-capture override.
+pub export fn talu_xray_verify_clear_full_capture_override() callconv(.c) void {
+    xray.clearVerifyFullCaptureOverride();
+}
+
+/// Restrict verification to a specific built-in point mask.
+/// This changes only which points verify compares/captures.
+pub export fn talu_xray_verify_set_point_mask(mask: u64) callconv(.c) void {
+    xray.setVerifyPointMaskOverride(mask);
+}
+
+/// Clear verification point-mask override.
+pub export fn talu_xray_verify_clear_point_mask_override() callconv(.c) void {
+    xray.clearVerifyPointMaskOverride();
+}
+
 /// Persist full CPU tensor sidecar captured in recording mode to NPZ.
 /// Returns false on error (check talu_error_message).
 pub export fn talu_xray_verify_capture_save_recording_full_npz(

@@ -261,11 +261,24 @@ pub const Work = struct {
 /// The global handler - set by inspection system, null when disabled.
 /// Using atomic to be safe across threads (inspection might be enabled/disabled).
 var handler_atomic: std.atomic.Value(?Handler) = std.atomic.Value(?Handler).init(null);
+// Active built-in trace points for the current handler. Backends that need to
+// materialize host-readable tensors must gate that work on shouldEmit(point),
+// not merely on handler presence, otherwise "token-only" verify passes still
+// pay for and can be destabilized by unused trace-copy paths.
+var built_in_point_mask_atomic: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 threadlocal var backend_context: Backend = .cpu;
 
 /// Set the trace handler. Called by inspection system on setup.
 pub fn setHandler(h: ?Handler) void {
     handler_atomic.store(h, .release);
+    if (h == null) {
+        built_in_point_mask_atomic.store(0, .release);
+    }
+}
+
+/// Set the active built-in trace-point mask for the current handler.
+pub fn setActiveBuiltInPointMask(mask: u64) void {
+    built_in_point_mask_atomic.store(mask, .release);
 }
 
 /// Get current handler (for inspection system to check if enabled).
@@ -289,6 +302,16 @@ pub fn getBackendContext() Backend {
 /// Check if tracing is enabled (for conditional expensive operations).
 pub inline fn isEnabled() bool {
     return handler_atomic.load(.acquire) != null;
+}
+
+/// Check whether a specific trace point should be emitted by the backend.
+/// This is the correct guard for expensive host materialization.
+pub inline fn shouldEmit(point: TracePoint) bool {
+    if (handler_atomic.load(.acquire) == null) return false;
+    const point_idx = @intFromEnum(point);
+    if (point_idx >= 64) return true;
+    const mask = built_in_point_mask_atomic.load(.acquire);
+    return ((mask >> @as(u6, @intCast(point_idx))) & 1) != 0;
 }
 
 /// Emit a trace point. No-op if handler is null.
@@ -440,6 +463,21 @@ test "trace handler receives emissions" {
     try std.testing.expectEqual(@as(u32, 10), e.position);
     try std.testing.expectEqual(DType.bf16, e.tensor.dtype);
     try std.testing.expectEqual(@as(u8, 3), e.tensor.ndim);
+}
+
+test "shouldEmit honors active built-in point mask" {
+    const TestCapture = struct {
+        fn handler(_: TraceEmission) void {}
+    };
+
+    setHandler(&TestCapture.handler);
+    defer setHandler(null);
+    setActiveBuiltInPointMask((@as(u64, 1) << @intFromEnum(TracePoint.lm_head)));
+    defer setActiveBuiltInPointMask(0);
+
+    try std.testing.expect(shouldEmit(.lm_head));
+    try std.testing.expect(!shouldEmit(.token_select));
+    try std.testing.expect(!shouldEmit(.gdelta_out));
 }
 
 test "TracedTensor calculations" {

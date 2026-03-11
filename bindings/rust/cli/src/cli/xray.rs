@@ -16,6 +16,144 @@ use crate::provider::create_backend_for_model;
 use super::repo::resolve_model_path;
 use super::XrayArgs;
 
+struct VerifyOverrideGuard {
+    point_mask_overridden: bool,
+}
+
+impl VerifyOverrideGuard {
+    fn new(teacher_forcing: bool, full_capture: bool, point_mask_override: Option<u64>) -> Self {
+        // Verify runner invariant:
+        // Any temporary state configured here must remain transcript-level only.
+        // Do not add toggles that alter backend execution behavior.
+        talu::xray::VerifyCaptureHandle::set_ignore_token_parity(teacher_forcing);
+        talu::xray::VerifyCaptureHandle::set_token_only(!teacher_forcing);
+        talu::xray::VerifyCaptureHandle::set_full_capture(full_capture);
+        if let Some(mask) = point_mask_override {
+            talu::xray::VerifyCaptureHandle::set_point_mask(mask);
+        }
+        Self {
+            point_mask_overridden: point_mask_override.is_some(),
+        }
+    }
+}
+
+impl Drop for VerifyOverrideGuard {
+    fn drop(&mut self) {
+        talu::xray::VerifyCaptureHandle::clear_ignore_token_parity_override();
+        talu::xray::VerifyCaptureHandle::clear_token_only_override();
+        talu::xray::VerifyCaptureHandle::clear_full_capture_override();
+        if self.point_mask_overridden {
+            talu::xray::VerifyCaptureHandle::clear_point_mask_override();
+        }
+    }
+}
+
+struct ActiveVerifyRunGuard {
+    teacher_forcing_enabled: bool,
+}
+
+impl ActiveVerifyRunGuard {
+    fn activate(
+        teacher_forcing: bool,
+        verifier: &talu::xray::ReferenceVerifierHandle,
+        verify_cap: &talu::xray::VerifyCaptureHandle,
+    ) -> Self {
+        verify_cap.enable();
+        if teacher_forcing {
+            talu::xray::TeacherForcing::enable_with_verifier(verifier);
+        }
+        Self {
+            teacher_forcing_enabled: teacher_forcing,
+        }
+    }
+}
+
+impl Drop for ActiveVerifyRunGuard {
+    fn drop(&mut self) {
+        if self.teacher_forcing_enabled {
+            talu::xray::TeacherForcing::disable();
+        }
+        talu::xray::VerifyCaptureHandle::disable();
+    }
+}
+
+struct CacheRefreshLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl CacheRefreshLock {
+    fn acquire(reference_path: &Path) -> Result<Self> {
+        let path = reference_lock_path(reference_path);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|err| {
+                anyhow!(
+                    "xray CPU reference cache is already being refreshed: {} ({err})",
+                    path.display()
+                )
+            })?;
+        Ok(Self { path, _file: file })
+    }
+}
+
+impl Drop for CacheRefreshLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+struct TempReferenceBundle {
+    reference_path: PathBuf,
+    sidecar_path: PathBuf,
+    keep: bool,
+}
+
+impl TempReferenceBundle {
+    fn new(final_reference_path: &Path) -> Self {
+        let reference_path = temp_reference_path(final_reference_path, std::process::id());
+        let sidecar_path = reference_sidecar_path(&reference_path);
+        Self {
+            reference_path,
+            sidecar_path,
+            keep: false,
+        }
+    }
+
+    fn persist(&mut self, final_reference_path: &Path) -> Result<()> {
+        if !self.reference_path.exists() {
+            return Err(anyhow!(
+                "CPU reference refresh did not produce JSON cache: {}",
+                self.reference_path.display()
+            ));
+        }
+        if !self.sidecar_path.exists() {
+            return Err(anyhow!(
+                "CPU reference refresh did not produce NPZ sidecar: {}",
+                self.sidecar_path.display()
+            ));
+        }
+
+        let final_sidecar_path = reference_sidecar_path(final_reference_path);
+        replace_file_atomically(&self.reference_path, final_reference_path)?;
+        replace_file_atomically(&self.sidecar_path, &final_sidecar_path)?;
+        self.keep = true;
+        Ok(())
+    }
+}
+
+impl Drop for TempReferenceBundle {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.reference_path);
+        let _ = std::fs::remove_file(&self.sidecar_path);
+    }
+}
+
 /// Kernel usage derived from trace records.
 struct KernelUsage {
     name: String,
@@ -1098,9 +1236,7 @@ fn cmd_xray_record(model: &str, ref_path: &str, args: &XrayArgs) -> Result<()> {
 /// - Verify is observability-only; it MUST NOT change kernel selection/arithmetic.
 /// - Teacher forcing may control token progression only; it must not alter math paths.
 fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs) -> Result<()> {
-    use talu::xray::{
-        ReferenceDataHandle, ReferenceVerifierHandle, TeacherForcing, VerifyCaptureHandle,
-    };
+    use talu::xray::{ReferenceDataHandle, ReferenceVerifierHandle, VerifyCaptureHandle};
 
     let reference_json_path = ref_path.to_string();
     let golden_full_npz = PathBuf::from(format!("{}.layers_full.npz", reference_json_path));
@@ -1126,13 +1262,14 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
     let run_pass = |teacher_forcing: bool,
                     reference_path: &str,
                     max_tokens: usize,
-                    full_npz_path: Option<&Path>|
+                    full_npz_path: Option<&Path>,
+                    point_mask_override: Option<u64>|
      -> Result<(bool, Option<String>)> {
-        // Verify runner invariant:
-        // Any temporary state configured here must remain transcript-level only.
-        // Do not add toggles that alter backend execution behavior.
-        VerifyCaptureHandle::set_ignore_token_parity(teacher_forcing);
-        VerifyCaptureHandle::set_token_only(!teacher_forcing);
+        let _override_guard = VerifyOverrideGuard::new(
+            teacher_forcing,
+            full_npz_path.is_some(),
+            point_mask_override,
+        );
 
         if teacher_forcing {
             // Phase 2: localization run on fixed transcript.
@@ -1154,18 +1291,12 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             let backend = create_backend_for_model(model, None)?;
             let chat = ChatHandle::new(None)?;
             let content = vec![talu::router::ContentPart::Text(prompt_text.clone())];
-
-            verify_cap.enable();
-            if teacher_forcing {
-                TeacherForcing::enable_with_verifier(&verifier);
-            }
+            let active_run_guard =
+                ActiveVerifyRunGuard::activate(teacher_forcing, &verifier, &verify_cap);
 
             let result = talu::router::generate(&chat, &content, &backend, &cfg);
 
-            if teacher_forcing {
-                TeacherForcing::disable();
-            }
-            VerifyCaptureHandle::disable();
+            drop(active_run_guard);
             if let Some(path) = full_npz_path {
                 if let Some(path_str) = path.to_str() {
                     verify_cap.save_full_npz(path_str)?;
@@ -1174,6 +1305,10 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
 
             let result = result?;
             if result.error_code() != 0 {
+                if verifier.has_diverged() {
+                    let msg = verifier.finish().err().map(|err| err.to_string());
+                    return Ok((true, msg));
+                }
                 let message =
                     last_error_message().unwrap_or_else(|| "generation failed".to_string());
                 return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
@@ -1208,13 +1343,12 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             }
         })();
 
-        VerifyCaptureHandle::clear_ignore_token_parity_override();
-        VerifyCaptureHandle::clear_token_only_override();
         run_result
     };
 
     if let Some(target) = checkpoint_target {
         let max_tokens = (target.token as usize).saturating_add(1).max(1);
+        let target_point_mask = point_mask_for_name(&target.point)?;
         println!(
             "Targeted checkpoint verification ({}, max_tokens={}):",
             args.verify_checkpoint
@@ -1226,7 +1360,13 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             "talu_xray_verify_candidate_{}_checkpoint.layers_full.npz",
             std::process::id()
         ));
-        let _ = run_pass(true, &reference_json_path, max_tokens, Some(&candidate_npz))?;
+        let _ = run_pass(
+            true,
+            &reference_json_path,
+            max_tokens,
+            Some(&candidate_npz),
+            Some(target_point_mask),
+        )?;
 
         if !golden_full_npz.exists() {
             return Err(anyhow!(
@@ -1300,8 +1440,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             (sum_sq / actual.len() as f64).sqrt()
         };
         let abs_rms_diff = (actual_rms - expected_rms).abs();
-        let diverged =
-            len_mismatch || exceeds_numeric_tolerance(rel_rms, abs_rms_diff, tolerance);
+        let diverged = len_mismatch || exceeds_numeric_tolerance(rel_rms, abs_rms_diff, tolerance);
 
         println!(
             "token={}, layer={}, point={}, pos={} -> {}",
@@ -1346,8 +1485,13 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         "Phase 1/2: Free-run token parity ({} tokens, first divergence only)...",
         args.tokens
     );
-    let (diverged, divergence_msg) =
-        run_pass(false, &reference_json_path, args.tokens as usize, None)?;
+    let (diverged, divergence_msg) = run_pass(
+        false,
+        &reference_json_path,
+        args.tokens as usize,
+        None,
+        None,
+    )?;
 
     if diverged {
         println!("✗ Phase 1 FAILED");
@@ -1373,50 +1517,18 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             "Phase 2/2: Teacher-forced numeric localization from token=0 (max_tokens={})...",
             phase2_max_tokens
         );
-        let candidate_npz_phase2 = std::env::temp_dir().join(format!(
-            "talu_xray_verify_candidate_{}_phase2.layers_full.npz",
-            std::process::id()
-        ));
-        let (_, phase2_msg) = run_pass(
-            true,
-            &reference_json_path,
-            phase2_max_tokens,
-            Some(&candidate_npz_phase2),
-        )?;
+        let (_, phase2_msg) = run_pass(true, &reference_json_path, phase2_max_tokens, None, None)?;
 
         println!("✗ Verification FAILED");
-        let mut printed_numeric = false;
-        if golden_full_npz.exists() && candidate_npz_phase2.exists() {
-            match (
-                load_npz_f32(&golden_full_npz),
-                load_npz_f32(&candidate_npz_phase2),
-            ) {
-                (Ok(expected), Ok(actual)) => {
-                    if let Some(first_diff) =
-                        find_first_checkpoint_diff(&expected, &actual, tolerance)
-                    {
-                        print_first_checkpoint_diff(&first_diff);
-                        print_targeted_checkpoint_hint(model, &prompt_text, &first_diff.parsed);
-                        printed_numeric = true;
-                    }
-                }
-                (Err(err), _) | (_, Err(err)) => {
-                    println!("details:");
-                    println!("  phase2 sidecar diff unavailable: {}", err);
-                }
-            }
-        }
-        if !printed_numeric {
-            if let Some(msg) = phase2_msg {
-                print_first_divergence_report(&msg);
-            } else if let Some(msg) = divergence_msg {
-                print_first_divergence_report(&msg);
-            } else {
-                println!("token=?, layer=?, point=? -> FAILED");
-                println!();
-                println!("details:");
-                println!("  divergence detected but no structured message was provided");
-            }
+        if let Some(msg) = phase2_msg {
+            print_first_divergence_report(&msg);
+        } else if let Some(msg) = divergence_msg {
+            print_first_divergence_report(&msg);
+        } else {
+            println!("token=?, layer=?, point=? -> FAILED");
+            println!();
+            println!("details:");
+            println!("  divergence detected but no structured message was provided");
         }
 
         println!("  Check panic dumps in /tmp/panic_dumps/");
@@ -1458,7 +1570,7 @@ fn reference_cache_key(model: &str, prompt: &str, seed: u64, tokens: u32) -> Str
     // Cache contract marker:
     // - ties default verify cache to CPU-recorded references only
     // - invalidates stale cache bundles created before backend-scoped keys
-    const CACHE_SCHEMA_VERSION: u32 = 2;
+    const CACHE_SCHEMA_VERSION: u32 = 3;
     const REFERENCE_BACKEND: &str = "cpu";
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     CACHE_SCHEMA_VERSION.hash(&mut hasher);
@@ -1470,9 +1582,73 @@ fn reference_cache_key(model: &str, prompt: &str, seed: u64, tokens: u32) -> Str
     format!("{:016x}", hasher.finish())
 }
 
+fn reference_sidecar_path(reference_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.layers_full.npz", reference_path.display()))
+}
+
+fn reference_lock_path(reference_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.lock", reference_path.display()))
+}
+
+fn ensure_reference_cache_unlocked(reference_path: &Path) -> Result<()> {
+    let lock_path = reference_lock_path(reference_path);
+    if lock_path.exists() {
+        return Err(anyhow!(
+            "xray CPU reference cache refresh is in progress: {}",
+            lock_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn temp_reference_path(reference_path: &Path, pid: u32) -> PathBuf {
+    PathBuf::from(format!("{}.tmp.{}", reference_path.display(), pid))
+}
+
+fn replace_file_atomically(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(target_family = "unix")]
+    {
+        std::fs::rename(src, dst).map_err(|err| {
+            anyhow!(
+                "failed to replace cache file {} with {}: {err}",
+                dst.display(),
+                src.display()
+            )
+        })?;
+    }
+
+    #[cfg(not(target_family = "unix"))]
+    {
+        if dst.exists() {
+            std::fs::remove_file(dst).map_err(|err| {
+                anyhow!(
+                    "failed to remove existing cache file {}: {err}",
+                    dst.display()
+                )
+            })?;
+        }
+        std::fs::rename(src, dst).map_err(|err| {
+            anyhow!(
+                "failed to replace cache file {} with {}: {err}",
+                dst.display(),
+                src.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 fn refresh_cpu_reference_cache(model: &str, reference_path: &Path, args: &XrayArgs) -> Result<()> {
-    let exe_path = std::env::current_exe()
-        .map_err(|err| anyhow!("failed to resolve current executable for CPU cache refresh: {err}"))?;
+    // Refresh must never leave a half-written cache bundle behind. Record into a
+    // temp bundle in the same directory, then replace the final bundle only
+    // after both JSON and NPZ are present.
+    let _lock = CacheRefreshLock::acquire(reference_path)?;
+    let mut temp_bundle = TempReferenceBundle::new(reference_path);
+
+    let exe_path = std::env::current_exe().map_err(|err| {
+        anyhow!("failed to resolve current executable for CPU cache refresh: {err}")
+    })?;
 
     let mut cmd = Command::new(&exe_path);
     cmd.env("BACKEND", "cpu");
@@ -1480,7 +1656,8 @@ fn refresh_cpu_reference_cache(model: &str, reference_path: &Path, args: &XrayAr
         .arg(model)
         .arg("--record-reference")
         .arg(
-            reference_path
+            temp_bundle
+                .reference_path
                 .to_str()
                 .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
         )
@@ -1499,6 +1676,7 @@ fn refresh_cpu_reference_cache(model: &str, reference_path: &Path, args: &XrayAr
         .output()
         .map_err(|err| anyhow!("failed to spawn CPU reference recorder: {err}"))?;
     if output.status.success() {
+        temp_bundle.persist(reference_path)?;
         return Ok(());
     }
 
@@ -1528,7 +1706,7 @@ fn default_dev_reference_path(model: &str, args: &XrayArgs) -> Result<PathBuf> {
 
 fn cmd_xray_verify_default(model: &str, args: &XrayArgs) -> Result<()> {
     let reference_path = default_dev_reference_path(model, args)?;
-    let sidecar_path = PathBuf::from(format!("{}.layers_full.npz", reference_path.display()));
+    let sidecar_path = reference_sidecar_path(&reference_path);
     println!("Using cache bundle: {}", sidecar_path.display());
     let refresh_cache = args.no_cache || !reference_path.exists() || !sidecar_path.exists();
     if refresh_cache {
@@ -1538,6 +1716,8 @@ fn cmd_xray_verify_default(model: &str, args: &XrayArgs) -> Result<()> {
             println!("CPU reference cache missing, generating it first...");
         }
         refresh_cpu_reference_cache(model, &reference_path, args)?;
+    } else {
+        ensure_reference_cache_unlocked(&reference_path)?;
     }
 
     cmd_xray_verify(
@@ -1653,6 +1833,50 @@ fn parse_verify_checkpoint_target(raw: &str) -> Result<VerifyCheckpointTarget> {
     })
 }
 
+fn point_mask_for_name(point: &str) -> Result<u64> {
+    let point_idx = match point {
+        "embed_tokens" => 0u32,
+        "embed_pos" => 1,
+        "layer_input" => 2,
+        "layer_attn_norm" => 3,
+        "attn.q" => 4,
+        "attn.k" => 5,
+        "attn.v" => 6,
+        "attn.qk" => 7,
+        "attn.weights" => 8,
+        "attn.out" => 9,
+        "layer_ffn_norm" => 10,
+        "ffn.gate" => 11,
+        "ffn.up" => 12,
+        "ffn.act" => 13,
+        "ffn.down" => 14,
+        "block.out" => 15,
+        "mamba.out" => 16,
+        "conv.in_proj" => 17,
+        "conv.conv" => 18,
+        "conv.out_proj" => 19,
+        "final_norm" => 20,
+        "lm_head" => 21,
+        "logits_scaled" => 22,
+        "logits_ready" => 23,
+        "token_select" => 24,
+        "ffn.act.map" => 25,
+        "ffn.act.mix" => 26,
+        "gdelta.in_proj" => 27,
+        "gdelta.conv" => 28,
+        "gdelta.ssm" => 29,
+        "gdelta.norm" => 30,
+        "gdelta.out" => 31,
+        _ => {
+            return Err(anyhow!(
+                "unsupported checkpoint point '{}': targeted verify currently supports built-in xray points only",
+                point
+            ));
+        }
+    };
+    Ok(1u64 << point_idx)
+}
+
 fn parse_checkpoint_key(key: &str) -> Option<ParsedCheckpointKey> {
     let key = normalize_npz_entry_key(key);
     let (token, position, scope, layer_index, point) = {
@@ -1765,22 +1989,29 @@ fn print_first_divergence_report(msg: &str) {
         let token = parse_u32_after(msg, "token=");
         let layer = parse_u32_after(msg, "layer=");
         let point = parse_point_after(msg, "point=");
+        let position = parse_u32_after(msg, "pos=");
         let expected = parse_f32_after(msg, "RMS expected=");
         let actual = parse_f32_after(msg, "actual=");
 
         println!(
-            "token={}, layer={}, point={} -> FAILED",
+            "token={}, layer={}, point={}, pos={} -> FAILED",
             token
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "?".to_string()),
             layer
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "?".to_string()),
-            point.clone().unwrap_or_else(|| "?".to_string())
+            point.clone().unwrap_or_else(|| "?".to_string()),
+            position
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_string())
         );
         println!();
         println!("details:");
         println!("  kind=stats");
+        if let Some(position) = position {
+            println!("  position={}", position);
+        }
         match (expected, actual) {
             (Some(exp), Some(act)) => {
                 let abs = (act - exp).abs();
@@ -1828,15 +2059,19 @@ fn print_first_divergence_report(msg: &str) {
         let token = parse_u32_after(msg, "token=");
         let layer = parse_u32_after(msg, "layer=");
         let point = parse_point_after(msg, "point=");
+        let position = parse_u32_after(msg, "pos=");
         println!(
-            "token={}, layer={}, point={} -> FAILED",
+            "token={}, layer={}, point={}, pos={} -> FAILED",
             token
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "?".to_string()),
             layer
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "?".to_string()),
-            point.clone().unwrap_or_else(|| "?".to_string())
+            point.clone().unwrap_or_else(|| "?".to_string()),
+            position
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_string())
         );
         println!();
         println!("details:");
@@ -1850,6 +2085,9 @@ fn print_first_divergence_report(msg: &str) {
         if let Some(point) = point {
             println!("  point={}", point);
         }
+        if let Some(position) = position {
+            println!("  position={}", position);
+        }
         println!("  detail=expected checkpoint missing from backend trace");
         return;
     }
@@ -1861,25 +2099,17 @@ fn print_first_divergence_report(msg: &str) {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 enum FirstCheckpointDiffKind {
     Missing,
-    LengthMismatch {
-        actual_len: usize,
-    },
-    Numeric {
-        actual_len: usize,
-        expected_rms: f64,
-        actual_rms: f64,
-        abs_rms_diff: f64,
-        rel_rms: f64,
-        max_abs: f32,
-    },
+    LengthMismatch,
+    Numeric,
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct FirstCheckpointDiff {
     parsed: ParsedCheckpointKey,
-    expected_len: usize,
     kind: FirstCheckpointDiffKind,
 }
 
@@ -1985,6 +2215,7 @@ fn exceeds_numeric_tolerance(rel_rms: f64, abs_rms_diff: f64, tolerance: f32) ->
     rel_rms > tol && abs_rms_diff > tol
 }
 
+#[cfg(test)]
 fn rms(values: &[f32]) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -1999,6 +2230,7 @@ fn rms(values: &[f32]) -> f64 {
     (sum_sq / values.len() as f64).sqrt()
 }
 
+#[cfg(test)]
 fn find_first_checkpoint_diff(
     expected: &BTreeMap<String, Vec<f32>>,
     actual: &BTreeMap<String, Vec<f32>>,
@@ -2040,7 +2272,6 @@ fn find_first_checkpoint_diff(
             None => {
                 return Some(FirstCheckpointDiff {
                     parsed,
-                    expected_len,
                     kind: FirstCheckpointDiffKind::Missing,
                 });
             }
@@ -2048,10 +2279,7 @@ fn find_first_checkpoint_diff(
         if actual_tensor.len() != expected_len {
             return Some(FirstCheckpointDiff {
                 parsed,
-                expected_len,
-                kind: FirstCheckpointDiffKind::LengthMismatch {
-                    actual_len: actual_tensor.len(),
-                },
+                kind: FirstCheckpointDiffKind::LengthMismatch,
             });
         }
         let (rel_rms, max_abs) = rel_rms_and_max_abs(expected_tensor, actual_tensor);
@@ -2059,71 +2287,14 @@ fn find_first_checkpoint_diff(
         let actual_rms = rms(actual_tensor);
         let abs_rms_diff = (actual_rms - expected_rms).abs();
         if exceeds_numeric_tolerance(rel_rms, abs_rms_diff, tolerance) {
+            let _ = (max_abs, expected_rms, actual_rms);
             return Some(FirstCheckpointDiff {
                 parsed,
-                expected_len,
-                kind: FirstCheckpointDiffKind::Numeric {
-                    actual_len: actual_tensor.len(),
-                    expected_rms,
-                    actual_rms,
-                    abs_rms_diff,
-                    rel_rms,
-                    max_abs,
-                },
+                kind: FirstCheckpointDiffKind::Numeric,
             });
         }
     }
     None
-}
-
-fn print_first_checkpoint_diff(diff: &FirstCheckpointDiff) {
-    let layer_label = if diff.parsed.scope == "global" {
-        "global".to_string()
-    } else {
-        diff.parsed.layer_index.to_string()
-    };
-    println!(
-        "token={}, layer={}, point={} -> FAILED",
-        diff.parsed.token, layer_label, diff.parsed.point
-    );
-    println!();
-    println!("details:");
-    match &diff.kind {
-        FirstCheckpointDiffKind::Missing => {
-            println!("  kind=coverage");
-            println!("  checkpoint={}", diff.parsed.key);
-            println!("  detail=checkpoint missing from candidate sidecar");
-        }
-        FirstCheckpointDiffKind::LengthMismatch { actual_len } => {
-            println!("  kind=checkpoint");
-            println!("  checkpoint={}", diff.parsed.key);
-            println!(
-                "  expected_len={} actual_len={}",
-                diff.expected_len, actual_len
-            );
-            println!("  detail=length mismatch");
-        }
-        FirstCheckpointDiffKind::Numeric {
-            actual_len,
-            expected_rms,
-            actual_rms,
-            abs_rms_diff,
-            rel_rms,
-            max_abs,
-        } => {
-            println!("  kind=checkpoint");
-            println!("  checkpoint={}", diff.parsed.key);
-            println!(
-                "  expected_len={} actual_len={}",
-                diff.expected_len, actual_len
-            );
-            println!(
-                "  metric=rms expected={:.6} actual={:.6} abs_diff={:.6} rel_diff={:.6}",
-                expected_rms, actual_rms, abs_rms_diff, rel_rms
-            );
-            println!("  metric=max_abs_diff value={:.6}", max_abs);
-        }
-    }
 }
 
 fn print_targeted_checkpoint_hint(model: &str, prompt_text: &str, parsed: &ParsedCheckpointKey) {
@@ -2145,11 +2316,14 @@ fn print_targeted_checkpoint_hint(model: &str, prompt_text: &str, parsed: &Parse
 #[cfg(test)]
 mod tests {
     use super::{
-        find_first_checkpoint_diff, normalize_npz_entry_key, parse_checkpoint_key, parse_npy_f32,
-        parse_verify_checkpoint_target, reference_cache_key, select_checkpoint_key,
-        FirstCheckpointDiffKind, VerifyCheckpointTarget, VerifyLayerTarget,
+        ensure_reference_cache_unlocked, find_first_checkpoint_diff, normalize_npz_entry_key,
+        parse_checkpoint_key, parse_npy_f32, parse_verify_checkpoint_target, reference_cache_key,
+        reference_lock_path, reference_sidecar_path, replace_file_atomically,
+        select_checkpoint_key, temp_reference_path, FirstCheckpointDiffKind,
+        VerifyCheckpointTarget, VerifyLayerTarget,
     };
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     #[test]
     fn normalize_npz_entry_key_strips_index_prefix() {
@@ -2303,6 +2477,75 @@ mod tests {
         let a = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100);
         let b = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 43, 100);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn reference_sidecar_path_appends_npz_suffix() {
+        let path = reference_sidecar_path(Path::new("/tmp/xray_qwen.json"));
+        assert_eq!(
+            path,
+            Path::new("/tmp/xray_qwen.json.layers_full.npz").to_path_buf()
+        );
+    }
+
+    #[test]
+    fn reference_lock_path_appends_lock_suffix() {
+        let path = reference_lock_path(Path::new("/tmp/xray_qwen.json"));
+        assert_eq!(path, Path::new("/tmp/xray_qwen.json.lock").to_path_buf());
+    }
+
+    #[test]
+    fn ensure_reference_cache_unlocked_rejects_live_lock() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be monotonic enough for test naming")
+            .as_nanos();
+        let reference_path =
+            std::env::temp_dir().join(format!("talu_xray_lock_test_{}.json", nonce));
+        let lock_path = reference_lock_path(&reference_path);
+        std::fs::write(&lock_path, "locked").expect("write lock");
+
+        let err = ensure_reference_cache_unlocked(&reference_path).expect_err("lock should fail");
+        assert!(
+            err.to_string().contains("refresh is in progress"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn temp_reference_path_is_derived_from_reference_path() {
+        let path = temp_reference_path(Path::new("/tmp/xray_qwen.json"), 1234);
+        assert_eq!(
+            path,
+            Path::new("/tmp/xray_qwen.json.tmp.1234").to_path_buf()
+        );
+    }
+
+    #[test]
+    fn replace_file_atomically_replaces_destination_contents() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be monotonic enough for test naming")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "talu_xray_replace_file_atomically_test_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let src = temp_dir.join("src.txt");
+        let dst = temp_dir.join("dst.txt");
+        std::fs::write(&src, "new").expect("write src");
+        std::fs::write(&dst, "old").expect("write dst");
+
+        replace_file_atomically(&src, &dst).expect("replace should succeed");
+
+        assert_eq!(std::fs::read_to_string(&dst).expect("read dst"), "new");
+        assert!(!src.exists());
+        let _ = std::fs::remove_file(&dst);
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 }
 

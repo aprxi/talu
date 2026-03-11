@@ -46,6 +46,11 @@ pub const setVerifyIgnoreTokenParityOverride = verify.setIgnoreTokenParityOverri
 pub const clearVerifyIgnoreTokenParityOverride = verify.clearIgnoreTokenParityOverride;
 pub const setVerifyTokenOnlyOverride = verify.setTokenOnlyOverride;
 pub const clearVerifyTokenOnlyOverride = verify.clearTokenOnlyOverride;
+pub const setVerifyFullCaptureOverride = verify.setVerificationFullCaptureOverride;
+pub const clearVerifyFullCaptureOverride = verify.clearVerificationFullCaptureOverride;
+pub const setVerifyPointMaskOverride = verify.setVerificationPointMaskOverride;
+pub const clearVerifyPointMaskOverride = verify.clearVerificationPointMaskOverride;
+pub const isVerifyStopRequested = verify.isStopRequested;
 
 // Teacher forcing (for verification)
 pub const TeacherForcingHook = teacher_forcing.TeacherForcingHook;

@@ -175,6 +175,80 @@ pub const TracePointSet = packed struct {
             _ => false, // Custom points not in standard set
         };
     }
+
+    pub fn builtinMask(self: TracePointSet) u64 {
+        var mask: u64 = 0;
+        if (self.embed) mask |= @as(u64, 1) << 0;
+        if (self.embed_pos) mask |= @as(u64, 1) << 1;
+        if (self.layer_input) mask |= @as(u64, 1) << 2;
+        if (self.layer_attn_norm) mask |= @as(u64, 1) << 3;
+        if (self.attn_q) mask |= @as(u64, 1) << 4;
+        if (self.attn_k) mask |= @as(u64, 1) << 5;
+        if (self.attn_v) mask |= @as(u64, 1) << 6;
+        if (self.attn_qk) mask |= @as(u64, 1) << 7;
+        if (self.attn_weights) mask |= @as(u64, 1) << 8;
+        if (self.attn_out) mask |= @as(u64, 1) << 9;
+        if (self.layer_ffn_norm) mask |= @as(u64, 1) << 10;
+        if (self.ffn_gate) mask |= @as(u64, 1) << 11;
+        if (self.ffn_up) mask |= @as(u64, 1) << 12;
+        if (self.ffn_act) mask |= @as(u64, 1) << 13;
+        if (self.ffn_down) mask |= @as(u64, 1) << 14;
+        if (self.block_out) mask |= @as(u64, 1) << 15;
+        if (self.mamba_out) mask |= @as(u64, 1) << 16;
+        if (self.conv_in_proj) mask |= @as(u64, 1) << 17;
+        if (self.conv_conv) mask |= @as(u64, 1) << 18;
+        if (self.conv_out_proj) mask |= @as(u64, 1) << 19;
+        if (self.final_norm) mask |= @as(u64, 1) << 20;
+        if (self.lm_head) mask |= @as(u64, 1) << 21;
+        if (self.logits_scaled) mask |= @as(u64, 1) << 22;
+        if (self.logits_ready) mask |= @as(u64, 1) << 23;
+        if (self.token_select) mask |= @as(u64, 1) << 24;
+        if (self.ffn_act_map) mask |= @as(u64, 1) << 25;
+        if (self.ffn_act_mix) mask |= @as(u64, 1) << 26;
+        if (self.gdelta_in_proj) mask |= @as(u64, 1) << 27;
+        if (self.gdelta_conv) mask |= @as(u64, 1) << 28;
+        if (self.gdelta_ssm) mask |= @as(u64, 1) << 29;
+        if (self.gdelta_norm) mask |= @as(u64, 1) << 30;
+        if (self.gdelta_out) mask |= @as(u64, 1) << 31;
+        return mask;
+    }
+
+    pub fn fromBuiltinMask(mask: u64) TracePointSet {
+        return .{
+            .embed = (mask & (@as(u64, 1) << 0)) != 0,
+            .embed_pos = (mask & (@as(u64, 1) << 1)) != 0,
+            .layer_input = (mask & (@as(u64, 1) << 2)) != 0,
+            .layer_attn_norm = (mask & (@as(u64, 1) << 3)) != 0,
+            .attn_q = (mask & (@as(u64, 1) << 4)) != 0,
+            .attn_k = (mask & (@as(u64, 1) << 5)) != 0,
+            .attn_v = (mask & (@as(u64, 1) << 6)) != 0,
+            .attn_qk = (mask & (@as(u64, 1) << 7)) != 0,
+            .attn_weights = (mask & (@as(u64, 1) << 8)) != 0,
+            .attn_out = (mask & (@as(u64, 1) << 9)) != 0,
+            .layer_ffn_norm = (mask & (@as(u64, 1) << 10)) != 0,
+            .ffn_gate = (mask & (@as(u64, 1) << 11)) != 0,
+            .ffn_up = (mask & (@as(u64, 1) << 12)) != 0,
+            .ffn_act = (mask & (@as(u64, 1) << 13)) != 0,
+            .ffn_down = (mask & (@as(u64, 1) << 14)) != 0,
+            .block_out = (mask & (@as(u64, 1) << 15)) != 0,
+            .mamba_out = (mask & (@as(u64, 1) << 16)) != 0,
+            .conv_in_proj = (mask & (@as(u64, 1) << 17)) != 0,
+            .conv_conv = (mask & (@as(u64, 1) << 18)) != 0,
+            .conv_out_proj = (mask & (@as(u64, 1) << 19)) != 0,
+            .final_norm = (mask & (@as(u64, 1) << 20)) != 0,
+            .lm_head = (mask & (@as(u64, 1) << 21)) != 0,
+            .logits_scaled = (mask & (@as(u64, 1) << 22)) != 0,
+            .logits_ready = (mask & (@as(u64, 1) << 23)) != 0,
+            .token_select = (mask & (@as(u64, 1) << 24)) != 0,
+            .ffn_act_map = (mask & (@as(u64, 1) << 25)) != 0,
+            .ffn_act_mix = (mask & (@as(u64, 1) << 26)) != 0,
+            .gdelta_in_proj = (mask & (@as(u64, 1) << 27)) != 0,
+            .gdelta_conv = (mask & (@as(u64, 1) << 28)) != 0,
+            .gdelta_ssm = (mask & (@as(u64, 1) << 29)) != 0,
+            .gdelta_norm = (mask & (@as(u64, 1) << 30)) != 0,
+            .gdelta_out = (mask & (@as(u64, 1) << 31)) != 0,
+        };
+    }
 };
 
 /// Configuration for what to capture.
@@ -473,6 +547,7 @@ fn globalHandler(emission: trace.TraceEmission) void {
 /// Enable capturing with the given capture instance.
 pub fn enable(cap: *TraceCapture) void {
     global_capture_atomic.store(cap, .release);
+    trace.setActiveBuiltInPointMask(cap.config.points.builtinMask());
     trace.setHandler(&globalHandler);
 }
 
@@ -507,6 +582,26 @@ test "TracePointSet operations" {
     try std.testing.expect(custom.contains(.lm_head));
     try std.testing.expect(custom.contains(.attn_out));
     try std.testing.expect(!custom.contains(.embed));
+}
+
+test "TracePointSet builtinMask/fromBuiltinMask round-trip" {
+    var points = TracePointSet.none();
+    points.layer_attn_norm = true;
+    points.block_out = true;
+    points.lm_head = true;
+    points.token_select = true;
+    points.gdelta_out = true;
+
+    const mask = points.builtinMask();
+    const round_trip = TracePointSet.fromBuiltinMask(mask);
+
+    try std.testing.expect(round_trip.contains(.layer_attn_norm));
+    try std.testing.expect(round_trip.contains(.block_out));
+    try std.testing.expect(round_trip.contains(.lm_head));
+    try std.testing.expect(round_trip.contains(.token_select));
+    try std.testing.expect(round_trip.contains(.gdelta_out));
+    try std.testing.expect(!round_trip.contains(.attn_out));
+    try std.testing.expect(!round_trip.contains(.ffn_act));
 }
 
 test "LayerFilter" {
