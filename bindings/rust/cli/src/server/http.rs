@@ -33,8 +33,8 @@ use crate::server::openapi;
 use crate::server::plugins;
 use crate::server::projects;
 use crate::server::providers;
-use crate::server::pubsub;
 use crate::server::proxy;
+use crate::server::pubsub;
 use crate::server::repo;
 use crate::server::responses;
 use crate::server::responses_openapi;
@@ -1125,10 +1125,25 @@ impl Service<Request<Incoming>> for Router {
                             db::kv::handle_flush(state, req, auth).await
                         }
                         (Method::POST, p)
+                            if p.starts_with("/v1/db/kv/namespaces/") && p.ends_with("/batch") =>
+                        {
+                            db::kv::handle_batch(state, req, auth).await
+                        }
+                        (Method::POST, p)
                             if p.starts_with("/v1/db/kv/namespaces/")
                                 && p.ends_with("/compact") =>
                         {
                             db::kv::handle_compact(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.starts_with("/v1/db/kv/namespaces/") && p.ends_with("/stats") =>
+                        {
+                            db::kv::handle_stats(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.starts_with("/v1/db/kv/namespaces/") && p.ends_with("/watch") =>
+                        {
+                            db::kv::handle_watch(state, req, auth).await
                         }
                         // DB SQL plane endpoints
                         (Method::POST, "/v1/db/sql/query") => {
@@ -1384,7 +1399,11 @@ fn is_kv_state_op_path(path: &str) -> bool {
     let Some(stripped) = path.strip_prefix("/v1/db/kv/namespaces/") else {
         return false;
     };
-    stripped.ends_with("/flush") || stripped.ends_with("/compact")
+    stripped.ends_with("/flush")
+        || stripped.ends_with("/compact")
+        || stripped.ends_with("/batch")
+        || stripped.ends_with("/stats")
+        || stripped.ends_with("/watch")
 }
 
 /// True when path is a known vector sub-path (points/*, stats, compact, etc.)

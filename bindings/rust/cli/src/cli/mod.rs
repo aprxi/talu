@@ -1059,8 +1059,8 @@ mod tests {
 
     #[test]
     fn parse_serve_workdir_flag() {
-        let cli = parse(&["talu", "serve", "--workdir", "/tmp/workdir"])
-            .expect("parse should succeed");
+        let cli =
+            parse(&["talu", "serve", "--workdir", "/tmp/workdir"]).expect("parse should succeed");
 
         match cli.command {
             Some(Commands::Serve(args)) => {
@@ -1197,16 +1197,15 @@ mod tests {
     #[test]
     fn parse_xray_tokens_from_env_and_default() {
         let _env_guard = EnvVarGuard::set("TOKENS", None);
-        let cli_default = parse(&["talu", "xray", "Qwen/Qwen3.5-0.8B"])
-            .expect("parse should succeed");
+        let cli_default =
+            parse(&["talu", "xray", "Qwen/Qwen3.5-0.8B"]).expect("parse should succeed");
         match cli_default.command {
             Some(Commands::Xray(args)) => assert_eq!(args.tokens, 10),
             _ => panic!("expected xray command"),
         }
 
         let _env_guard = EnvVarGuard::set("TOKENS", Some("17"));
-        let cli_env =
-            parse(&["talu", "xray", "Qwen/Qwen3.5-0.8B"]).expect("parse should succeed");
+        let cli_env = parse(&["talu", "xray", "Qwen/Qwen3.5-0.8B"]).expect("parse should succeed");
         match cli_env.command {
             Some(Commands::Xray(args)) => assert_eq!(args.tokens, 17),
             _ => panic!("expected xray command"),

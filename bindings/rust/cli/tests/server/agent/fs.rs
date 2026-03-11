@@ -293,10 +293,7 @@ fn agent_fs_workdir_flag_overrides_env_workdir() {
 
     let cli_file = cli_workspace.path().join("priority.txt");
     let env_file = env_workspace.path().join("priority.txt");
-    assert!(
-        cli_file.exists(),
-        "file should be created in --workdir"
-    );
+    assert!(cli_file.exists(), "file should be created in --workdir");
     assert!(
         !env_file.exists(),
         "file must not be created in TALU_WORKDIR when CLI flag is set"

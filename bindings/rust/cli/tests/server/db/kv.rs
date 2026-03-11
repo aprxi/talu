@@ -1,7 +1,12 @@
 //! Integration tests for low-level `/v1/db/kv/*` endpoints.
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
 use super::db_config;
 use crate::server::common::*;
+use base64::Engine as _;
 use tempfile::TempDir;
 
 fn put_kv(addr: std::net::SocketAddr, namespace: &str, key: &str, value: &str) -> HttpResponse {
@@ -37,6 +42,17 @@ fn get_with_headers(
     send_request(addr, "GET", path, headers, None)
 }
 
+fn post_batch(addr: std::net::SocketAddr, namespace: &str, body: &str) -> HttpResponse {
+    let path = format!("/v1/db/kv/namespaces/{namespace}/batch");
+    send_request(
+        addr,
+        "POST",
+        &path,
+        &[("Content-Type", "application/json")],
+        Some(body),
+    )
+}
+
 #[test]
 fn kv_put_get_delete_roundtrip() {
     let temp = TempDir::new().expect("temp dir");
@@ -48,6 +64,8 @@ fn kv_put_get_delete_roundtrip() {
     assert_eq!(put_json["namespace"], "ns1");
     assert_eq!(put_json["key"], "alpha");
     assert_eq!(put_json["value_len"], 5);
+    assert_eq!(put_json["durability"], "strong");
+    assert_eq!(put_json["ttl_ms"], 0);
 
     let get_resp = get(ctx.addr(), "/v1/db/kv/namespaces/ns1/entries/alpha");
     assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
@@ -64,6 +82,142 @@ fn kv_put_get_delete_roundtrip() {
     let missing = get(ctx.addr(), "/v1/db/kv/namespaces/ns1/entries/alpha");
     assert_eq!(missing.status, 404, "body: {}", missing.body);
     assert_eq!(missing.json()["error"]["code"], "not_found");
+}
+
+#[test]
+fn kv_put_accepts_durability_and_ttl_query_params() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let put = send_request(
+        ctx.addr(),
+        "PUT",
+        "/v1/db/kv/namespaces/ns1/entries/ephemeral?durability=ephemeral&ttl_ms=5000",
+        &[("Content-Type", "application/octet-stream")],
+        Some("value"),
+    );
+    assert_eq!(put.status, 200, "body: {}", put.body);
+    let json = put.json();
+    assert_eq!(json["durability"], "ephemeral");
+    assert_eq!(json["ttl_ms"], 5000);
+}
+
+#[test]
+fn kv_put_rejects_invalid_durability_query_param() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let put = send_request(
+        ctx.addr(),
+        "PUT",
+        "/v1/db/kv/namespaces/ns1/entries/alpha?durability=invalid",
+        &[("Content-Type", "application/octet-stream")],
+        Some("hello"),
+    );
+    assert_eq!(put.status, 400, "body: {}", put.body);
+    assert_eq!(put.json()["error"]["code"], "invalid_argument");
+}
+
+#[test]
+fn kv_put_rejects_invalid_ttl_query_param() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let put = send_request(
+        ctx.addr(),
+        "PUT",
+        "/v1/db/kv/namespaces/ns1/entries/alpha?ttl_ms=not-a-number",
+        &[("Content-Type", "application/octet-stream")],
+        Some("hello"),
+    );
+    assert_eq!(put.status, 400, "body: {}", put.body);
+    assert_eq!(put.json()["error"]["code"], "invalid_argument");
+}
+
+#[test]
+fn kv_batch_coalesces_last_write_wins() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let body = serde_json::json!({
+        "entries": [
+            {"key": "cursor:u1", "value_base64": "MQ==", "durability": "ephemeral", "ttl_ms": 5000},
+            {"key": "cursor:u1", "value_base64": "Mg==", "durability": "ephemeral", "ttl_ms": 5000},
+            {"key": "session", "value_base64": "bWV0YQ==", "durability": "batched"}
+        ]
+    });
+    let resp = post_batch(ctx.addr(), "ns_batch", &body.to_string());
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(json["requested_count"], 3);
+    assert_eq!(json["applied_count"], 2);
+    assert_eq!(json["coalesced_count"], 1);
+
+    let get_cursor = get(
+        ctx.addr(),
+        "/v1/db/kv/namespaces/ns_batch/entries/cursor:u1",
+    );
+    assert_eq!(get_cursor.status, 200, "body: {}", get_cursor.body);
+    assert_eq!(get_cursor.json()["value_hex"], "32");
+}
+
+#[test]
+fn kv_batch_large_duplicate_set_coalesces_to_unique_keys() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let mut entries = Vec::with_capacity(2049);
+    for idx in 0..2048 {
+        let payload = base64::engine::general_purpose::STANDARD.encode(format!("v{idx}"));
+        entries.push(serde_json::json!({
+            "key": "cursor:u1",
+            "value_base64": payload,
+            "durability": "ephemeral",
+            "ttl_ms": 5000
+        }));
+    }
+    entries.push(serde_json::json!({
+        "key": "session",
+        "value_base64": "bWV0YQ==",
+        "durability": "batched"
+    }));
+
+    let body = serde_json::json!({ "entries": entries });
+    let resp = post_batch(ctx.addr(), "ns_batch_large", &body.to_string());
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(json["requested_count"], 2049);
+    assert_eq!(json["applied_count"], 2);
+    assert_eq!(json["coalesced_count"], 2047);
+
+    let get_cursor = get(
+        ctx.addr(),
+        "/v1/db/kv/namespaces/ns_batch_large/entries/cursor:u1",
+    );
+    assert_eq!(get_cursor.status, 200, "body: {}", get_cursor.body);
+}
+
+#[test]
+fn kv_stats_exposes_runtime_counters() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let put = send_request(
+        ctx.addr(),
+        "PUT",
+        "/v1/db/kv/namespaces/ns_stats/entries/meta?durability=batched",
+        &[("Content-Type", "application/octet-stream")],
+        Some("v1"),
+    );
+    assert_eq!(put.status, 200, "body: {}", put.body);
+
+    let stats = get(ctx.addr(), "/v1/db/kv/namespaces/ns_stats/stats");
+    assert_eq!(stats.status, 200, "body: {}", stats.body);
+    let json = stats.json();
+    assert_eq!(json["namespace"], "ns_stats");
+    assert!(json["batched_pending"].is_number());
+    assert!(json["batched_max_pending"].as_u64().unwrap_or(0) > 0);
+    assert!(json["watch_subscribers"].is_number());
 }
 
 #[test]
@@ -173,6 +327,14 @@ fn kv_rejects_invalid_namespace_and_entry_paths() {
         whitespace_namespace.json()["error"]["code"],
         "invalid_argument"
     );
+
+    let bad_namespace = get(ctx.addr(), "/v1/db/kv/namespaces/ns%2Fbad/entries");
+    assert_eq!(bad_namespace.status, 400, "body: {}", bad_namespace.body);
+    assert_eq!(bad_namespace.json()["error"]["code"], "invalid_argument");
+
+    let control_key = get(ctx.addr(), "/v1/db/kv/namespaces/ns/entries/%0A");
+    assert_eq!(control_key.status, 400, "body: {}", control_key.body);
+    assert_eq!(control_key.json()["error"]["code"], "invalid_argument");
 }
 
 #[test]
@@ -297,6 +459,58 @@ fn kv_endpoints_require_storage() {
     assert_eq!(compact.status, 503, "body: {}", compact.body);
     assert_eq!(compact.json()["error"]["code"], "no_storage");
 }
+
+#[test]
+fn kv_watch_stream_emits_sse_events() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let mut stream = TcpStream::connect(ctx.addr()).expect("connect stream");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let request = format!(
+        "GET /v1/db/kv/namespaces/ns_watch/watch HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: text/event-stream\r\n\r\n",
+        ctx.addr()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write watch request");
+
+    let put = put_kv(ctx.addr(), "ns_watch", "alpha", "watch-value");
+    assert_eq!(put.status, 200, "body: {}", put.body);
+
+    let mut buf = [0u8; 8192];
+    let mut out = Vec::new();
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.windows(11).any(|w| w == b"event: event")
+                    && out.windows(8).any(|w| w == b"\"alpha\"")
+                {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(err) => panic!("failed reading watch stream response: {err}"),
+        }
+    }
+
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("text/event-stream"),
+        "expected SSE headers, got:\n{text}"
+    );
+    assert!(
+        text.contains("event: event"),
+        "expected event frame, got:\n{text}"
+    );
+    assert!(text.contains("\"key\":\"alpha\""), "body:\n{text}");
+}
+
 
 #[test]
 fn kv_flush_and_compact_reject_missing_namespace_path_segment() {

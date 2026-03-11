@@ -23,8 +23,8 @@ pub mod openapi;
 pub mod plugins;
 pub mod projects;
 pub mod providers;
-pub mod pubsub;
 pub mod proxy;
+pub mod pubsub;
 pub mod repo;
 pub mod responses;
 mod responses_openapi;
@@ -242,7 +242,10 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
             .expect("strict runtime mode requires policy by prior check");
         talu::shell::validate_strict_runtime(
             Some(strict_policy),
-            workdir.as_ref().map(|path| path.to_string_lossy()).as_deref(),
+            workdir
+                .as_ref()
+                .map(|path| path.to_string_lossy())
+                .as_deref(),
             sandbox_backend_for_talu(sandbox_backend),
         )
         .context("validate strict runtime policy and sandbox support")?;
@@ -252,7 +255,10 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
             sandbox_backend_for_talu(sandbox_backend),
             true, // strict_required
             args.strict_probes,
-            workdir.as_ref().map(|path| path.to_string_lossy()).as_deref(),
+            workdir
+                .as_ref()
+                .map(|path| path.to_string_lossy())
+                .as_deref(),
         )
         .context("validate strict runtime capabilities")?;
         log::info!(
@@ -295,6 +301,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         shell_session_ttl: listen::SHELL_SESSION_TTL,
         process_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         process_session_ttl: listen::PROCESS_SESSION_TTL,
+        kv_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         agent_runtime_mode: args.agent_runtime_mode,
         sandbox_backend,
         pubsub: tokio::sync::Mutex::new(pubsub::PubSubState::new()),

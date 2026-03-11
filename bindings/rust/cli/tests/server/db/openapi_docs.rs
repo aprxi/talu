@@ -148,6 +148,32 @@ fn openapi_sql_spec_includes_query_and_explain_paths() {
 }
 
 #[test]
+fn openapi_kv_put_exposes_durability_and_ttl_query_params() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let resp = get(ctx.addr(), "/openapi/db/kv.json");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    let put = &json["paths"]["/v1/db/kv/namespaces/{namespace}/entries/{key}"]["put"];
+    let params = put["parameters"]
+        .as_array()
+        .expect("kv put must include parameters");
+
+    let has_param = |name: &str, location: &str| {
+        params.iter().any(|p| {
+            p.get("name").and_then(|v| v.as_str()) == Some(name)
+                && p.get("in").and_then(|v| v.as_str()) == Some(location)
+        })
+    };
+
+    assert!(has_param("namespace", "path"));
+    assert!(has_param("key", "path"));
+    assert!(has_param("durability", "query"));
+    assert!(has_param("ttl_ms", "query"));
+}
+
+#[test]
 fn openapi_plane_specs_include_expected_paths_and_methods() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
@@ -194,7 +220,10 @@ fn openapi_plane_specs_include_expected_paths_and_methods() {
                     &["put", "get", "delete"],
                 ),
                 ("/v1/db/kv/namespaces/{namespace}/flush", &["post"]),
+                ("/v1/db/kv/namespaces/{namespace}/batch", &["post"]),
                 ("/v1/db/kv/namespaces/{namespace}/compact", &["post"]),
+                ("/v1/db/kv/namespaces/{namespace}/stats", &["get"]),
+                ("/v1/db/kv/namespaces/{namespace}/watch", &["get"]),
             ],
         ),
         (

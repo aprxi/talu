@@ -208,6 +208,26 @@ impl From<u8> for BackendType {
     }
 }
 
+/// Source: core/src/capi/agent/policy.zig
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CProcessDenyReason {
+    None = 0,
+    Action = 1,
+    Cwd = 2,
+}
+
+impl From<i32> for CProcessDenyReason {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => CProcessDenyReason::None,
+            1 => CProcessDenyReason::Action,
+            2 => CProcessDenyReason::Cwd,
+            _ => CProcessDenyReason::Cwd,
+        }
+    }
+}
+
 /// Source: core/src/capi/progress.zig
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -2164,6 +2184,107 @@ impl Default for CFullSessionConfig {
     }
 }
 
+/// Source: core/src/capi/db/kv.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CKvNamespaceStats {
+    pub batched_pending: usize,
+    pub batched_max_pending: usize,
+    pub batched_max_lag_ms: i64,
+    pub batched_next_flush_deadline_ms: i64,
+    pub batched_enqueued_writes: u64,
+    pub batched_coalesced_writes: u64,
+    pub batched_rejected_writes: u64,
+    pub batched_flush_count: u64,
+    pub batched_flushed_entries: u64,
+    pub total_live_entries: usize,
+    pub ephemeral_live_entries: usize,
+    pub watch_published: u64,
+    pub watch_overwritten: u64,
+    pub watch_capacity: usize,
+    pub _reserved: [u8; 8],
+}
+
+impl Default for CKvNamespaceStats {
+    fn default() -> Self {
+        Self {
+            batched_pending: 0,
+            batched_max_pending: 0,
+            batched_max_lag_ms: 0,
+            batched_next_flush_deadline_ms: 0,
+            batched_enqueued_writes: 0,
+            batched_coalesced_writes: 0,
+            batched_rejected_writes: 0,
+            batched_flush_count: 0,
+            batched_flushed_entries: 0,
+            total_live_entries: 0,
+            ephemeral_live_entries: 0,
+            watch_published: 0,
+            watch_overwritten: 0,
+            watch_capacity: 0,
+            _reserved: [0; 8],
+        }
+    }
+}
+
+/// Source: core/src/capi/db/kv.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CKvWatchEvent {
+    pub seq: u64,
+    pub event_type: u8,
+    pub durability_class: u8,
+    pub has_durability: bool,
+    pub ttl_ms: u64,
+    pub has_ttl: bool,
+    pub _flags_reserved: [u8; 6],
+    pub key: *const c_char,
+    pub value_len: usize,
+    pub updated_at_ms: i64,
+    pub _reserved: [u8; 8],
+}
+
+impl Default for CKvWatchEvent {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            event_type: 0,
+            durability_class: 0,
+            has_durability: false,
+            ttl_ms: 0,
+            has_ttl: false,
+            _flags_reserved: [0; 6],
+            key: std::ptr::null(),
+            value_len: 0,
+            updated_at_ms: 0,
+            _reserved: [0; 8],
+        }
+    }
+}
+
+/// Source: core/src/capi/db/kv.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CKvWatchBatch {
+    pub items: *mut CKvWatchEvent,
+    pub count: usize,
+    pub lost: bool,
+    pub _flags_reserved: [u8; 7],
+    pub _arena: *mut c_void,
+}
+
+impl Default for CKvWatchBatch {
+    fn default() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            count: 0,
+            lost: false,
+            _flags_reserved: [0; 7],
+            _arena: std::ptr::null_mut(),
+        }
+    }
+}
+
 /// Source: core/src/capi/repo_meta.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3864,11 +3985,30 @@ extern "C" {
         out_allowed: *mut c_void,
     ) -> c_int;
     // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_check_process_detailed(
+        policy: *mut c_void,
+        action: *const c_char,
+        command: *const c_char,
+        cwd: *const c_char,
+        out_allowed: *mut c_void,
+        out_deny_reason: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_policy_create(json: *const u8, len: usize, out_policy: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_policy_free(policy: *mut c_void);
     // core/src/capi/agent/root.zig
     pub fn talu_agent_policy_prepare_runtime(policy: *mut c_void, cwd: *const c_char) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_strict_emulation_decisions(
+        policy: *mut c_void,
+        cwd: *const c_char,
+        out_deny_descendant_exec: *mut c_void,
+        out_deny_write: *mut c_void,
+        out_allow_python_exec: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_validate_strict_emulation(policy: *mut c_void) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_agent_prompt(
         handle: *mut c_void,
@@ -4442,9 +4582,13 @@ extern "C" {
     // core/src/capi/db/kv.zig
     pub fn talu_db_kv_flush(handle: *mut c_void) -> c_int;
     // core/src/capi/db/kv.zig
+    pub fn talu_db_kv_flush_batched(handle: *mut c_void) -> c_int;
+    // core/src/capi/db/kv.zig
     pub fn talu_db_kv_free(handle: *mut c_void);
     // core/src/capi/db/kv.zig
     pub fn talu_db_kv_free_list(list: *mut CKvList);
+    // core/src/capi/db/kv.zig
+    pub fn talu_db_kv_free_watch_batch(batch: *mut CKvWatchBatch);
     // core/src/capi/db/kv.zig
     pub fn talu_db_kv_free_value(value: *mut CKvValue);
     // core/src/capi/db/kv.zig
@@ -4467,6 +4611,24 @@ extern "C" {
         key: *const c_char,
         value: *const u8,
         value_len: usize,
+    ) -> c_int;
+    // core/src/capi/db/kv.zig
+    pub fn talu_db_kv_put_ex(
+        handle: *mut c_void,
+        key: *const c_char,
+        value: *const u8,
+        value_len: usize,
+        durability_class: u8,
+        ttl_ms: u64,
+    ) -> c_int;
+    // core/src/capi/db/kv.zig
+    pub fn talu_db_kv_stats(handle: *mut c_void, out_stats: *mut CKvNamespaceStats) -> c_int;
+    // core/src/capi/db/kv.zig
+    pub fn talu_db_kv_watch_drain(
+        handle: *mut c_void,
+        after_seq: u64,
+        max_events: usize,
+        out_batch: *mut CKvWatchBatch,
     ) -> c_int;
     // core/src/capi/db/ops.zig
     pub fn talu_db_ops_set_durability(chat_handle: *mut c_void, mode: u8) -> c_int;
@@ -6445,11 +6607,11 @@ extern "C" {
     // core/src/capi/xray.zig
     pub fn talu_xray_reference_verifier_destroy(handle: *mut c_void);
     // core/src/capi/xray.zig
+    pub fn talu_xray_reference_verifier_finish(handle: *mut c_void) -> bool;
+    // core/src/capi/xray.zig
     pub fn talu_xray_reference_verifier_get_next_token(handle: *mut c_void) -> u32;
     // core/src/capi/xray.zig
     pub fn talu_xray_reference_verifier_has_diverged(handle: *mut c_void) -> bool;
-    // core/src/capi/xray.zig
-    pub fn talu_xray_reference_verifier_finish(handle: *mut c_void) -> bool;
     // core/src/capi/xray.zig
     pub fn talu_xray_reference_verifier_next_token(handle: *mut c_void);
     // core/src/capi/xray.zig

@@ -21,9 +21,26 @@ pub const schema_kv_state: u16 = 20;
 const col_key_hash: u32 = 1;
 const col_ts: u32 = 2;
 const col_op_type: u32 = 3;
+const col_durability: u32 = 4;
+const col_expires_at_ms: u32 = 5;
 const col_key: u32 = 10;
 const col_value: u32 = 20;
 const default_compact_threshold: usize = 500;
+const default_strong_max_pending: usize = 10_000;
+const default_batched_max_pending: usize = 10_000;
+const default_batched_max_lag_ms: i64 = 250;
+const default_watch_capacity: usize = 1024;
+
+pub const DurabilityClass = enum(u8) {
+    strong = 0,
+    batched = 1,
+    ephemeral = 2,
+};
+
+pub const PutOptions = struct {
+    durability: DurabilityClass = .strong,
+    ttl_ms: u64 = 0,
+};
 
 const KvOp = enum(u8) {
     put = 1,
@@ -33,6 +50,188 @@ const KvOp = enum(u8) {
 const StoredValue = struct {
     value: []u8,
     updated_at_ms: i64,
+    durability: DurabilityClass,
+    expires_at_ms: ?i64,
+};
+
+pub const WatchEventType = enum(u8) {
+    put = 1,
+    delete = 2,
+};
+
+pub const WatchEvent = struct {
+    seq: u64,
+    event_type: WatchEventType,
+    key: []u8,
+    value_len: usize,
+    durability: ?DurabilityClass,
+    ttl_ms: ?u64,
+    updated_at_ms: i64,
+
+    pub fn deinit(self: *WatchEvent, allocator: Allocator) void {
+        allocator.free(self.key);
+    }
+};
+
+pub const WatchDrainResult = struct {
+    events: []WatchEvent,
+    lost: bool,
+
+    pub fn deinit(self: *WatchDrainResult, allocator: Allocator) void {
+        for (self.events) |*event| {
+            event.deinit(allocator);
+        }
+        allocator.free(self.events);
+    }
+};
+
+const WatchEventRecord = struct {
+    seq: u64,
+    event_type: WatchEventType,
+    key: []u8,
+    value_len: usize,
+    durability: ?DurabilityClass,
+    ttl_ms: ?u64,
+    updated_at_ms: i64,
+
+    fn cloneOwned(self: WatchEventRecord, allocator: Allocator) !WatchEvent {
+        return .{
+            .seq = self.seq,
+            .event_type = self.event_type,
+            .key = try allocator.dupe(u8, self.key),
+            .value_len = self.value_len,
+            .durability = self.durability,
+            .ttl_ms = self.ttl_ms,
+            .updated_at_ms = self.updated_at_ms,
+        };
+    }
+
+    fn deinit(self: *WatchEventRecord, allocator: Allocator) void {
+        allocator.free(self.key);
+    }
+};
+
+const WatchLog = struct {
+    allocator: Allocator,
+    entries: []WatchEventRecord,
+    head: usize,
+    len: usize,
+    next_seq: u64,
+    overwritten: u64,
+
+    fn init(allocator: Allocator, max_events: usize) !WatchLog {
+        return .{
+            .allocator = allocator,
+            .entries = try allocator.alloc(WatchEventRecord, max_events),
+            .head = 0,
+            .len = 0,
+            .next_seq = 1,
+            .overwritten = 0,
+        };
+    }
+
+    fn deinit(self: *WatchLog) void {
+        for (0..self.len) |offset| {
+            const idx = (self.head + offset) % self.entries.len;
+            self.entries[idx].deinit(self.allocator);
+        }
+        self.allocator.free(self.entries);
+    }
+
+    fn capacity(self: WatchLog) usize {
+        return self.entries.len;
+    }
+
+    fn publishedCount(self: WatchLog) u64 {
+        return self.next_seq - 1;
+    }
+
+    fn append(
+        self: *WatchLog,
+        event_type: WatchEventType,
+        key: []const u8,
+        value_len: usize,
+        durability: ?DurabilityClass,
+        ttl_ms: ?u64,
+        updated_at_ms: i64,
+    ) !void {
+        if (self.entries.len == 0) return;
+        if (self.len == self.entries.len) {
+            self.entries[self.head].deinit(self.allocator);
+            self.head = (self.head + 1) % self.entries.len;
+            self.len -= 1;
+            self.overwritten += 1;
+        }
+
+        const idx = (self.head + self.len) % self.entries.len;
+        self.entries[idx] = .{
+            .seq = self.next_seq,
+            .event_type = event_type,
+            .key = try self.allocator.dupe(u8, key),
+            .value_len = value_len,
+            .durability = durability,
+            .ttl_ms = ttl_ms,
+            .updated_at_ms = updated_at_ms,
+        };
+        self.next_seq += 1;
+        self.len += 1;
+    }
+
+    fn drainSince(self: *WatchLog, allocator: Allocator, after_seq: u64, max_count: usize) !WatchDrainResult {
+        if (max_count == 0 or self.len == 0) {
+            return .{ .events = try allocator.alloc(WatchEvent, 0), .lost = false };
+        }
+
+        const oldest_seq = self.entries[self.head].seq;
+        const lost = after_seq > 0 and oldest_seq > after_seq + 1;
+        const first_seq = if (after_seq + 1 > oldest_seq) after_seq + 1 else oldest_seq;
+
+        var available: usize = 0;
+        var seq = first_seq;
+        const newest_seq = self.next_seq - 1;
+        while (seq <= newest_seq and available < max_count) : (seq += 1) {
+            available += 1;
+        }
+
+        var out = try allocator.alloc(WatchEvent, available);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*event| {
+                event.deinit(allocator);
+            }
+            allocator.free(out);
+        }
+
+        for (0..available) |idx| {
+            const event_seq = first_seq + idx;
+            const record_idx = (self.head + @as(usize, @intCast(event_seq - oldest_seq))) % self.entries.len;
+            out[idx] = try self.entries[record_idx].cloneOwned(allocator);
+            initialized += 1;
+        }
+        return .{ .events = out, .lost = lost };
+    }
+};
+
+const BatchedPending = struct {
+    updated_at_ms: i64,
+    creates_stale_row: bool,
+};
+
+pub const NamespaceStats = struct {
+    batched_pending: usize,
+    batched_max_pending: usize,
+    batched_max_lag_ms: i64,
+    batched_next_flush_deadline_ms: i64,
+    batched_enqueued_writes: u64,
+    batched_coalesced_writes: u64,
+    batched_rejected_writes: u64,
+    batched_flush_count: u64,
+    batched_flushed_entries: u64,
+    total_live_entries: usize,
+    ephemeral_live_entries: usize,
+    watch_published: u64,
+    watch_overwritten: u64,
+    watch_capacity: usize,
 };
 
 const CompactedSegment = struct {
@@ -48,6 +247,8 @@ pub const EntryRecord = struct {
     key: []u8,
     value: []u8,
     updated_at_ms: i64,
+    durability: DurabilityClass,
+    expires_at_ms: ?i64,
 
     pub fn deinit(self: *EntryRecord, allocator: Allocator) void {
         allocator.free(self.key);
@@ -64,7 +265,7 @@ pub const ValueRecord = struct {
     }
 };
 
-/// KVStore stores latest key/value state in-memory and appends every mutation.
+/// KVStore stores latest key/value state in-memory and appends durable mutations.
 /// Thread safety: NOT thread-safe (single-writer lock semantics in Writer).
 pub const KVStore = struct {
     allocator: Allocator,
@@ -73,9 +274,22 @@ pub const KVStore = struct {
     fs_writer: *db_writer.Writer,
     fs_reader: *db_reader.Reader,
     values: std.StringHashMap(StoredValue),
+    batched_pending: std.StringHashMap(BatchedPending),
+    strong_max_pending: usize,
+    strong_rejected_writes: u64,
+    batched_max_pending: usize,
+    batched_max_lag_ms: i64,
+    batched_next_flush_deadline_ms: ?i64,
+    batched_enqueued_writes: u64,
+    batched_coalesced_writes: u64,
+    batched_rejected_writes: u64,
+    batched_flush_count: u64,
+    batched_flushed_entries: u64,
     stale_count: usize,
     tombstone_count: usize,
     compact_threshold: usize,
+    now_ms_override: ?i64,
+    watch_log: WatchLog,
 
     pub fn init(allocator: Allocator, db_root: []const u8, namespace: []const u8) !KVStore {
         if (namespace.len == 0) return error.InvalidArgument;
@@ -102,9 +316,22 @@ pub const KVStore = struct {
             .fs_writer = writer_ptr,
             .fs_reader = reader_ptr,
             .values = std.StringHashMap(StoredValue).init(allocator),
+            .batched_pending = std.StringHashMap(BatchedPending).init(allocator),
+            .strong_max_pending = default_strong_max_pending,
+            .strong_rejected_writes = 0,
+            .batched_max_pending = default_batched_max_pending,
+            .batched_max_lag_ms = default_batched_max_lag_ms,
+            .batched_next_flush_deadline_ms = null,
+            .batched_enqueued_writes = 0,
+            .batched_coalesced_writes = 0,
+            .batched_rejected_writes = 0,
+            .batched_flush_count = 0,
+            .batched_flushed_entries = 0,
             .stale_count = 0,
             .tombstone_count = 0,
             .compact_threshold = default_compact_threshold,
+            .now_ms_override = null,
+            .watch_log = try WatchLog.init(allocator, default_watch_capacity),
         };
         errdefer store.deinit();
 
@@ -113,6 +340,7 @@ pub const KVStore = struct {
     }
 
     pub fn deinit(self: *KVStore) void {
+        self.flushBatched() catch {};
         self.fs_writer.flushBlock() catch {};
         self.fs_writer.deinit();
         self.allocator.destroy(self.fs_writer);
@@ -122,20 +350,57 @@ pub const KVStore = struct {
 
         self.clearState();
         self.values.deinit();
+        self.batched_pending.deinit();
+        self.watch_log.deinit();
         self.allocator.free(self.namespace);
         self.allocator.free(self.db_root);
     }
 
+    pub fn stats(self: *KVStore) NamespaceStats {
+        self.pruneExpiredAll(self.nowMs());
+        var ephemeral_live_entries: usize = 0;
+        var iter = self.values.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.durability == .ephemeral) {
+                ephemeral_live_entries += 1;
+            }
+        }
+
+        return .{
+            .batched_pending = self.batched_pending.count(),
+            .batched_max_pending = self.batched_max_pending,
+            .batched_max_lag_ms = self.batched_max_lag_ms,
+            .batched_next_flush_deadline_ms = self.batched_next_flush_deadline_ms orelse -1,
+            .batched_enqueued_writes = self.batched_enqueued_writes,
+            .batched_coalesced_writes = self.batched_coalesced_writes,
+            .batched_rejected_writes = self.batched_rejected_writes,
+            .batched_flush_count = self.batched_flush_count,
+            .batched_flushed_entries = self.batched_flushed_entries,
+            .total_live_entries = self.values.count(),
+            .ephemeral_live_entries = ephemeral_live_entries,
+            .watch_published = self.watch_log.publishedCount(),
+            .watch_overwritten = self.watch_log.overwritten,
+            .watch_capacity = self.watch_log.capacity(),
+        };
+    }
+
     pub fn contains(self: *KVStore, key: []const u8) bool {
+        self.pruneExpiredKey(key, self.nowMs());
         return self.values.contains(key);
     }
 
     pub fn getCopy(self: *KVStore, allocator: Allocator, key: []const u8) !?[]u8 {
+        const now_ms = self.nowMs();
+        try self.flushBatchedIfDue(now_ms);
+        self.pruneExpiredKey(key, now_ms);
         const value = self.values.get(key) orelse return null;
         return try allocator.dupe(u8, value.value);
     }
 
     pub fn getEntryCopy(self: *KVStore, allocator: Allocator, key: []const u8) !?ValueRecord {
+        const now_ms = self.nowMs();
+        try self.flushBatchedIfDue(now_ms);
+        self.pruneExpiredKey(key, now_ms);
         const value = self.values.get(key) orelse return null;
         return .{
             .value = try allocator.dupe(u8, value.value),
@@ -144,16 +409,40 @@ pub const KVStore = struct {
     }
 
     pub fn put(self: *KVStore, key: []const u8, value: []const u8) !void {
-        if (key.len == 0) return error.InvalidArgument;
+        return self.putWithOptions(key, value, .{});
+    }
 
-        const now_ms = std.time.milliTimestamp();
-        try self.appendEvent(.put, key, value, now_ms);
+    pub fn putWithOptions(self: *KVStore, key: []const u8, value: []const u8, options: PutOptions) !void {
+        if (key.len == 0) return error.InvalidArgument;
+        const now_ms = self.nowMs();
+        try self.flushBatchedIfDue(now_ms);
+        self.pruneExpiredKey(key, now_ms);
+
+        if (options.durability == .batched) {
+            try self.ensureBatchedAdmission(key);
+        } else {
+            self.removeBatchedPending(key);
+        }
+
+        const expires_at_ms = try self.computeExpiresAt(now_ms, options.ttl_ms);
+        if (options.durability == .strong) {
+            try self.ensureStrongAdmission();
+            try self.appendEvent(.put, key, value, now_ms, options.durability, expires_at_ms);
+        }
+        var creates_stale_on_flush = false;
 
         if (self.values.getPtr(key)) |existing| {
+            const existing_was_durable = existing.durability != .ephemeral;
             self.allocator.free(existing.value);
             existing.value = try self.allocator.dupe(u8, value);
             existing.updated_at_ms = now_ms;
-            self.stale_count += 1;
+            existing.durability = options.durability;
+            existing.expires_at_ms = expires_at_ms;
+            if (options.durability == .strong and existing_was_durable) {
+                self.stale_count += 1;
+            } else if (options.durability == .batched and existing_was_durable) {
+                creates_stale_on_flush = true;
+            }
         } else {
             const key_copy = try self.allocator.dupe(u8, key);
             errdefer self.allocator.free(key_copy);
@@ -162,29 +451,65 @@ pub const KVStore = struct {
             try self.values.putNoClobber(key_copy, .{
                 .value = value_copy,
                 .updated_at_ms = now_ms,
+                .durability = options.durability,
+                .expires_at_ms = expires_at_ms,
             });
         }
+
+        if (options.durability == .batched) {
+            try self.queueBatchedPut(key, now_ms, creates_stale_on_flush);
+        }
+
+        try self.publishWatchPut(key, value.len, options.durability, options.ttl_ms, now_ms);
 
         try self.maybeAutoCompact();
     }
 
     pub fn delete(self: *KVStore, key: []const u8) !bool {
         if (key.len == 0) return error.InvalidArgument;
+        const now_ms = self.nowMs();
+        try self.flushBatchedIfDue(now_ms);
+        self.pruneExpiredKey(key, now_ms);
         if (!self.values.contains(key)) return false;
 
-        const now_ms = std.time.milliTimestamp();
-        try self.appendEvent(.delete, key, &.{}, now_ms);
+        self.removeBatchedPending(key);
+        const existing = self.values.get(key) orelse return false;
+        if (existing.durability != .ephemeral) {
+            try self.ensureStrongAdmission();
+            try self.appendEvent(.delete, key, &.{}, now_ms, .strong, null);
+            self.stale_count += 1;
+            self.tombstone_count += 1;
+        }
 
         self.removeEntry(key);
-        self.stale_count += 1;
-        self.tombstone_count += 1;
+        try self.publishWatchDelete(key, now_ms);
 
         try self.maybeAutoCompact();
         return true;
     }
 
     pub fn listEntries(self: *KVStore, allocator: Allocator) ![]EntryRecord {
-        var out = try allocator.alloc(EntryRecord, self.values.count());
+        try self.flushBatchedIfDue(self.nowMs());
+        return self.listEntriesInternal(allocator, true);
+    }
+
+    pub fn watchDrain(self: *KVStore, allocator: Allocator, after_seq: u64, max_count: usize) !WatchDrainResult {
+        const now_ms = self.nowMs();
+        try self.flushBatchedIfDue(now_ms);
+        self.pruneExpiredAll(now_ms);
+        return self.watch_log.drainSince(allocator, after_seq, max_count);
+    }
+
+    fn listEntriesInternal(self: *KVStore, allocator: Allocator, include_ephemeral: bool) ![]EntryRecord {
+        self.pruneExpiredAll(self.nowMs());
+        var count: usize = 0;
+        var count_iter = self.values.iterator();
+        while (count_iter.next()) |entry| {
+            if (!include_ephemeral and entry.value_ptr.durability == .ephemeral) continue;
+            count += 1;
+        }
+
+        var out = try allocator.alloc(EntryRecord, count);
         errdefer {
             for (out) |*entry| {
                 if (entry.key.len > 0) allocator.free(entry.key);
@@ -192,15 +517,24 @@ pub const KVStore = struct {
             }
             allocator.free(out);
         }
-        @memset(out, .{ .key = "", .value = &.{}, .updated_at_ms = 0 });
+        @memset(out, .{
+            .key = "",
+            .value = &.{},
+            .updated_at_ms = 0,
+            .durability = .strong,
+            .expires_at_ms = null,
+        });
 
         var idx: usize = 0;
         var iter = self.values.iterator();
         while (iter.next()) |entry| {
+            if (!include_ephemeral and entry.value_ptr.durability == .ephemeral) continue;
             out[idx] = .{
                 .key = try allocator.dupe(u8, entry.key_ptr.*),
                 .value = try allocator.dupe(u8, entry.value_ptr.value),
                 .updated_at_ms = entry.value_ptr.updated_at_ms,
+                .durability = entry.value_ptr.durability,
+                .expires_at_ms = entry.value_ptr.expires_at_ms,
             };
             idx += 1;
         }
@@ -210,10 +544,11 @@ pub const KVStore = struct {
     }
 
     pub fn compact(self: *KVStore) !void {
+        try self.flushBatched();
         try self.fs_writer.flushBlock();
 
-        const now_ms = std.time.milliTimestamp();
-        const entries = try self.listEntries(self.allocator);
+        const now_ms = self.nowMs();
+        const entries = try self.listEntriesInternal(self.allocator, false);
         defer freeEntryRecords(self.allocator, entries);
 
         var compacted_segment: ?CompactedSegment = null;
@@ -323,14 +658,26 @@ pub const KVStore = struct {
     }
 
     pub fn flush(self: *KVStore) !void {
+        try self.flushBatched();
         try self.fs_writer.flushBlock();
         try self.maybeAutoCompact();
+    }
+
+    pub fn flushBatched(self: *KVStore) !void {
+        try self.flushBatchedPending();
     }
 
     fn loadAll(self: *KVStore) !void {
         self.clearState();
         self.stale_count = 0;
         self.tombstone_count = 0;
+        self.strong_rejected_writes = 0;
+        self.batched_next_flush_deadline_ms = null;
+        self.batched_enqueued_writes = 0;
+        self.batched_coalesced_writes = 0;
+        self.batched_rejected_writes = 0;
+        self.batched_flush_count = 0;
+        self.batched_flushed_entries = 0;
 
         _ = try self.fs_reader.refreshIfChanged();
         const blocks = try self.fs_reader.getBlocks(self.allocator);
@@ -353,6 +700,8 @@ pub const KVStore = struct {
             const ts_desc = findColumn(descs, col_ts) orelse continue;
             const key_desc = findColumn(descs, col_key) orelse continue;
             const value_desc = findColumn(descs, col_value) orelse continue;
+            const durability_desc = findColumn(descs, col_durability);
+            const expires_desc = findColumn(descs, col_expires_at_ms);
 
             const op_buf = reader.readColumnData(block.offset, op_desc, self.allocator) catch continue;
             defer self.allocator.free(op_buf);
@@ -362,6 +711,24 @@ pub const KVStore = struct {
             defer self.allocator.free(ts_buf);
             _ = try checkedRowCount(header.row_count, ts_buf.len, @sizeOf(i64));
 
+            const durability_buf = if (durability_desc) |desc|
+                reader.readColumnData(block.offset, desc, self.allocator) catch continue
+            else
+                null;
+            defer if (durability_buf) |buf| self.allocator.free(buf);
+            if (durability_buf) |buf| {
+                _ = try checkedRowCount(header.row_count, buf.len, @sizeOf(u8));
+            }
+
+            const expires_buf = if (expires_desc) |desc|
+                reader.readColumnData(block.offset, desc, self.allocator) catch continue
+            else
+                null;
+            defer if (expires_buf) |buf| self.allocator.free(buf);
+            if (expires_buf) |buf| {
+                _ = try checkedRowCount(header.row_count, buf.len, @sizeOf(i64));
+            }
+
             var key_buffers = readVarBytesBuffers(handle.file, block.offset, key_desc, header.row_count, self.allocator) catch continue;
             defer key_buffers.deinit(self.allocator);
             var value_buffers = readVarBytesBuffers(handle.file, block.offset, value_desc, header.row_count, self.allocator) catch continue;
@@ -369,12 +736,28 @@ pub const KVStore = struct {
 
             const ops = @as([*]const u8, @ptrCast(@alignCast(op_buf.ptr)))[0..header.row_count];
             const ts = @as([*]const i64, @ptrCast(@alignCast(ts_buf.ptr)))[0..header.row_count];
+            const durability_values = if (durability_buf) |buf|
+                @as([*]const u8, @ptrCast(@alignCast(buf.ptr)))[0..header.row_count]
+            else
+                null;
+            const expires_values = if (expires_buf) |buf|
+                @as([*]const i64, @ptrCast(@alignCast(buf.ptr)))[0..header.row_count]
+            else
+                null;
             for (0..header.row_count) |row_idx| {
                 row_count_total += 1;
                 const op = try parseKvOp(ops[row_idx]);
                 const key = try key_buffers.sliceForRow(row_idx);
                 const value = try value_buffers.sliceForRow(row_idx);
-                try self.applyReplay(op, key, value, ts[row_idx]);
+                const durability = if (durability_values) |values|
+                    normalizePersistedDurability(try parseDurabilityClass(values[row_idx]))
+                else
+                    .strong;
+                const expires_at_ms = if (expires_values) |values|
+                    decodeExpiresAt(values[row_idx])
+                else
+                    null;
+                try self.applyReplay(op, key, value, ts[row_idx], durability, expires_at_ms);
             }
         }
 
@@ -386,20 +769,193 @@ pub const KVStore = struct {
         try self.compact();
     }
 
-    fn appendEvent(self: *KVStore, op: KvOp, key: []const u8, value: []const u8, ts_ms: i64) !void {
+    fn ensureStrongAdmission(self: *KVStore) !void {
+        if (self.batched_pending.count() < self.strong_max_pending) return;
+        self.strong_rejected_writes += 1;
+        return error.ResourceExhausted;
+    }
+
+    fn ensureBatchedAdmission(self: *KVStore, key: []const u8) !void {
+        if (self.batched_pending.contains(key)) return;
+        if (self.batched_pending.count() < self.batched_max_pending) return;
+        self.batched_rejected_writes += 1;
+        return error.ResourceExhausted;
+    }
+
+    fn queueBatchedPut(self: *KVStore, key: []const u8, updated_at_ms: i64, creates_stale_row: bool) !void {
+        if (self.batched_pending.getPtr(key)) |pending| {
+            pending.updated_at_ms = updated_at_ms;
+            pending.creates_stale_row = pending.creates_stale_row or creates_stale_row;
+            self.batched_enqueued_writes += 1;
+            self.batched_coalesced_writes += 1;
+            self.scheduleBatchedFlush(updated_at_ms);
+            return;
+        }
+
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        try self.batched_pending.putNoClobber(key_copy, .{
+            .updated_at_ms = updated_at_ms,
+            .creates_stale_row = creates_stale_row,
+        });
+        self.batched_enqueued_writes += 1;
+        self.scheduleBatchedFlush(updated_at_ms);
+    }
+
+    fn scheduleBatchedFlush(self: *KVStore, now_ms: i64) void {
+        const deadline = now_ms +| self.batched_max_lag_ms;
+        if (self.batched_next_flush_deadline_ms) |current| {
+            self.batched_next_flush_deadline_ms = @min(current, deadline);
+            return;
+        }
+        self.batched_next_flush_deadline_ms = deadline;
+    }
+
+    fn flushBatchedIfDue(self: *KVStore, now_ms: i64) !void {
+        const deadline = self.batched_next_flush_deadline_ms orelse return;
+        if (now_ms < deadline) return;
+        try self.flushBatchedPending();
+    }
+
+    fn flushBatchedPending(self: *KVStore) !void {
+        if (self.batched_pending.count() == 0) {
+            self.batched_next_flush_deadline_ms = null;
+            return;
+        }
+
+        var keys = std.ArrayList([]const u8).empty;
+        defer keys.deinit(self.allocator);
+
+        var collect_iter = self.batched_pending.iterator();
+        while (collect_iter.next()) |entry| {
+            try keys.append(self.allocator, entry.key_ptr.*);
+        }
+        std.sort.pdq([]const u8, keys.items, {}, lessThanBytesSlice);
+
+        var flushed: u64 = 0;
+        for (keys.items) |key| {
+            const pending = self.batched_pending.get(key) orelse continue;
+            const current = self.values.get(key) orelse {
+                self.removeBatchedPending(key);
+                continue;
+            };
+            if (current.durability != .batched) {
+                self.removeBatchedPending(key);
+                continue;
+            }
+
+            try self.appendEvent(.put, key, current.value, pending.updated_at_ms, current.durability, current.expires_at_ms);
+            if (pending.creates_stale_row) {
+                self.stale_count += 1;
+            }
+            self.removeBatchedPending(key);
+            flushed += 1;
+        }
+
+        self.batched_next_flush_deadline_ms = null;
+        if (flushed > 0) {
+            self.batched_flush_count += 1;
+            self.batched_flushed_entries += flushed;
+        }
+    }
+
+    pub fn setNowMsForTesting(self: *KVStore, now_ms: ?i64) void {
+        self.now_ms_override = now_ms;
+    }
+
+    fn nowMs(self: *KVStore) i64 {
+        return self.now_ms_override orelse std.time.milliTimestamp();
+    }
+
+    fn computeExpiresAt(self: *KVStore, now_ms: i64, ttl_ms: u64) !?i64 {
+        _ = self;
+        if (ttl_ms == 0) return null;
+        const ttl_i64 = std.math.cast(i64, ttl_ms) orelse return error.InvalidArgument;
+        return now_ms +| ttl_i64;
+    }
+
+    fn isExpired(record: StoredValue, now_ms: i64) bool {
+        const expires_at_ms = record.expires_at_ms orelse return false;
+        return now_ms >= expires_at_ms;
+    }
+
+    fn pruneExpiredKey(self: *KVStore, key: []const u8, now_ms: i64) void {
+        const existing = self.values.get(key) orelse return;
+        if (!isExpired(existing, now_ms)) return;
+        self.removeEntry(key);
+        self.publishWatchDelete(key, now_ms) catch {};
+    }
+
+    fn pruneExpiredAll(self: *KVStore, now_ms: i64) void {
+        var to_remove = std.ArrayList([]const u8).empty;
+        defer to_remove.deinit(self.allocator);
+
+        var iter = self.values.iterator();
+        while (iter.next()) |entry| {
+            if (!isExpired(entry.value_ptr.*, now_ms)) continue;
+            to_remove.append(self.allocator, entry.key_ptr.*) catch return;
+        }
+
+        for (to_remove.items) |key| {
+            self.removeEntry(key);
+            self.publishWatchDelete(key, now_ms) catch {};
+        }
+    }
+
+    fn publishWatchPut(
+        self: *KVStore,
+        key: []const u8,
+        value_len: usize,
+        durability: DurabilityClass,
+        ttl_ms: u64,
+        updated_at_ms: i64,
+    ) !void {
+        try self.watch_log.append(
+            .put,
+            key,
+            value_len,
+            durability,
+            if (ttl_ms == 0) null else ttl_ms,
+            updated_at_ms,
+        );
+    }
+
+    fn publishWatchDelete(self: *KVStore, key: []const u8, updated_at_ms: i64) !void {
+        try self.watch_log.append(.delete, key, 0, null, null, updated_at_ms);
+    }
+
+    fn appendEvent(
+        self: *KVStore,
+        op: KvOp,
+        key: []const u8,
+        value: []const u8,
+        ts_ms: i64,
+        durability: DurabilityClass,
+        expires_at_ms: ?i64,
+    ) !void {
         var key_hash_value = computeHash(key);
         var ts_value = ts_ms;
         var op_value: u8 = @intFromEnum(op);
+        var durability_value: u8 = @intFromEnum(durability);
+        var expires_value: i64 = encodeExpiresAt(expires_at_ms);
 
         const columns = [_]ColumnValue{
             .{ .column_id = col_key_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&key_hash_value) },
             .{ .column_id = col_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&ts_value) },
             .{ .column_id = col_op_type, .shape = .SCALAR, .phys_type = .U8, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&op_value) },
+            .{ .column_id = col_durability, .shape = .SCALAR, .phys_type = .U8, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&durability_value) },
+            .{ .column_id = col_expires_at_ms, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&expires_value) },
             .{ .column_id = col_key, .shape = .VARBYTES, .phys_type = .BINARY, .encoding = .RAW, .dims = 0, .data = key },
             .{ .column_id = col_value, .shape = .VARBYTES, .phys_type = .BINARY, .encoding = .RAW, .dims = 0, .data = value },
         };
 
         try self.fs_writer.appendRow(schema_kv_state, &columns);
+    }
+
+    fn removeBatchedPending(self: *KVStore, key: []const u8) void {
+        if (self.batched_pending.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+        }
     }
 
     fn removeEntry(self: *KVStore, key: []const u8) void {
@@ -409,13 +965,23 @@ pub const KVStore = struct {
         }
     }
 
-    fn applyReplay(self: *KVStore, op: KvOp, key: []const u8, value: []const u8, ts_ms: i64) !void {
+    fn applyReplay(
+        self: *KVStore,
+        op: KvOp,
+        key: []const u8,
+        value: []const u8,
+        ts_ms: i64,
+        durability: DurabilityClass,
+        expires_at_ms: ?i64,
+    ) !void {
         switch (op) {
             .put => {
                 if (self.values.getPtr(key)) |existing| {
                     self.allocator.free(existing.value);
                     existing.value = try self.allocator.dupe(u8, value);
                     existing.updated_at_ms = ts_ms;
+                    existing.durability = durability;
+                    existing.expires_at_ms = expires_at_ms;
                     return;
                 }
 
@@ -426,6 +992,8 @@ pub const KVStore = struct {
                 try self.values.putNoClobber(key_copy, .{
                     .value = value_copy,
                     .updated_at_ms = ts_ms,
+                    .durability = durability,
+                    .expires_at_ms = expires_at_ms,
                 });
             },
             .delete => self.removeEntry(key),
@@ -433,6 +1001,12 @@ pub const KVStore = struct {
     }
 
     fn clearState(self: *KVStore) void {
+        var pending_iter = self.batched_pending.iterator();
+        while (pending_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.batched_pending.clearRetainingCapacity();
+
         var iter = self.values.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -468,6 +1042,10 @@ pub const KVStore = struct {
 
         var ops = try self.allocator.alloc(u8, entries.len);
         defer self.allocator.free(ops);
+        var durability = try self.allocator.alloc(u8, entries.len);
+        defer self.allocator.free(durability);
+        var expires_at_ms = try self.allocator.alloc(i64, entries.len);
+        defer self.allocator.free(expires_at_ms);
 
         var key_data = std.ArrayList(u8).empty;
         defer key_data.deinit(self.allocator);
@@ -490,6 +1068,8 @@ pub const KVStore = struct {
             hashes[idx] = computeHash(entry.key);
             ts[idx] = entry.updated_at_ms;
             ops[idx] = @intFromEnum(KvOp.put);
+            durability[idx] = @intFromEnum(entry.durability);
+            expires_at_ms[idx] = encodeExpiresAt(entry.expires_at_ms);
             min_ts = @min(min_ts, ts[idx]);
             max_ts = @max(max_ts, ts[idx]);
 
@@ -513,6 +1093,8 @@ pub const KVStore = struct {
         try builder.addColumn(col_key_hash, .SCALAR, .U64, .RAW, 1, std.mem.sliceAsBytes(hashes), null, null);
         try builder.addColumn(col_ts, .SCALAR, .I64, .RAW, 1, std.mem.sliceAsBytes(ts), null, null);
         try builder.addColumn(col_op_type, .SCALAR, .U8, .RAW, 1, ops, null, null);
+        try builder.addColumn(col_durability, .SCALAR, .U8, .RAW, 1, durability, null, null);
+        try builder.addColumn(col_expires_at_ms, .SCALAR, .I64, .RAW, 1, std.mem.sliceAsBytes(expires_at_ms), null, null);
         try builder.addColumn(col_key, .VARBYTES, .BINARY, .RAW, 0, key_data.items, key_offsets.items, key_lengths.items);
         try builder.addColumn(col_value, .VARBYTES, .BINARY, .RAW, 0, value_data.items, value_offsets.items, value_lengths.items);
 
@@ -572,6 +1154,10 @@ fn lessThanEntryRecord(_: void, a: EntryRecord, b: EntryRecord) bool {
     return std.mem.lessThan(u8, a.key, b.key);
 }
 
+fn lessThanBytesSlice(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
 pub fn freeEntryRecords(allocator: Allocator, entries: []EntryRecord) void {
     for (entries) |*entry| {
         entry.deinit(allocator);
@@ -585,6 +1171,29 @@ fn parseKvOp(raw: u8) !KvOp {
         2 => .delete,
         else => error.InvalidColumnData,
     };
+}
+
+fn parseDurabilityClass(raw: u8) !DurabilityClass {
+    return switch (raw) {
+        0 => .strong,
+        1 => .batched,
+        2 => .ephemeral,
+        else => error.InvalidColumnData,
+    };
+}
+
+fn normalizePersistedDurability(raw: DurabilityClass) DurabilityClass {
+    if (raw == .ephemeral) return .strong;
+    return raw;
+}
+
+fn encodeExpiresAt(expires_at_ms: ?i64) i64 {
+    return expires_at_ms orelse -1;
+}
+
+fn decodeExpiresAt(raw: i64) ?i64 {
+    if (raw < 0) return null;
+    return raw;
 }
 
 fn computeHash(value: []const u8) u64 {
@@ -798,4 +1407,316 @@ test "KVStore.compact rewrites manifest to current active state only" {
     var manifest = try db_manifest.Manifest.load(std.testing.allocator, manifest_path);
     defer manifest.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), manifest.segments.len);
+}
+
+test "KVStore.putWithOptions ephemeral TTL expires deterministically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    {
+        var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+        defer store.deinit();
+
+        store.setNowMsForTesting(1000);
+        try store.putWithOptions("presence:u1", "online", .{
+            .durability = .ephemeral,
+            .ttl_ms = 50,
+        });
+
+        try std.testing.expect(store.contains("presence:u1"));
+        {
+            const value = (try store.getCopy(std.testing.allocator, "presence:u1")).?;
+            defer std.testing.allocator.free(value);
+            try std.testing.expectEqualStrings("online", value);
+        }
+
+        store.setNowMsForTesting(1049);
+        try std.testing.expect(store.contains("presence:u1"));
+
+        store.setNowMsForTesting(1050);
+        try std.testing.expect(!store.contains("presence:u1"));
+        try std.testing.expect((try store.getCopy(std.testing.allocator, "presence:u1")) == null);
+    }
+
+    {
+        var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+        defer store.deinit();
+        try std.testing.expect(!store.contains("presence:u1"));
+    }
+}
+
+test "KVStore.putWithOptions ephemeral values do not survive restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    {
+        var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+        defer store.deinit();
+
+        try store.putWithOptions("presence:u1", "online", .{
+            .durability = .ephemeral,
+        });
+        try std.testing.expect(store.contains("presence:u1"));
+        try store.flush();
+    }
+
+    {
+        var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+        defer store.deinit();
+        try std.testing.expect(!store.contains("presence:u1"));
+        try std.testing.expect((try store.getCopy(std.testing.allocator, "presence:u1")) == null);
+    }
+}
+
+test "KVStore.putWithOptions rejects ttl overflow" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+    defer store.deinit();
+
+    try std.testing.expectError(error.InvalidArgument, store.putWithOptions("k", "v", .{
+        .durability = .ephemeral,
+        .ttl_ms = std.math.maxInt(u64),
+    }));
+}
+
+test "KVStore.putWithOptions durable ttl survives restart and expires deterministically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    {
+        var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+        defer store.deinit();
+
+        store.setNowMsForTesting(1_000);
+        try store.putWithOptions("checkpoint", "v1", .{
+            .durability = .strong,
+            .ttl_ms = 50,
+        });
+        try store.flush();
+    }
+
+    {
+        var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+        defer store.deinit();
+
+        store.setNowMsForTesting(1_049);
+        try std.testing.expect(store.contains("checkpoint"));
+        store.setNowMsForTesting(1_050);
+        try std.testing.expect(!store.contains("checkpoint"));
+    }
+}
+
+test "KVStore.watchDrain emits put and ttl-driven delete events from core state transitions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var store = try KVStore.init(std.testing.allocator, root, "kv_watch_test");
+    defer store.deinit();
+
+    store.setNowMsForTesting(1_000);
+    try store.putWithOptions("presence:u1", "online", .{
+        .durability = .ephemeral,
+        .ttl_ms = 50,
+    });
+
+    var first = try store.watchDrain(std.testing.allocator, 0, 16);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), first.events.len);
+    try std.testing.expectEqual(WatchEventType.put, first.events[0].event_type);
+    try std.testing.expectEqualStrings("presence:u1", first.events[0].key);
+    try std.testing.expectEqual(@as(?u64, 50), first.events[0].ttl_ms);
+
+    store.setNowMsForTesting(1_050);
+    try std.testing.expect(!store.contains("presence:u1"));
+
+    var second = try store.watchDrain(std.testing.allocator, first.events[0].seq, 16);
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), second.events.len);
+    try std.testing.expectEqual(WatchEventType.delete, second.events[0].event_type);
+    try std.testing.expectEqualStrings("presence:u1", second.events[0].key);
+    try std.testing.expect(second.events[0].durability == null);
+    try std.testing.expect(second.events[0].ttl_ms == null);
+}
+
+test "KVStore.watchDrain reports lost when source ring overwrites unseen events" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var store = try KVStore.init(std.testing.allocator, root, "kv_watch_gap_test");
+    defer store.deinit();
+    store.watch_log.deinit();
+    store.watch_log = try WatchLog.init(std.testing.allocator, 2);
+
+    try store.put("k1", "v1");
+    try store.put("k2", "v2");
+    try store.put("k3", "v3");
+
+    var drained = try store.watchDrain(std.testing.allocator, 1, 16);
+    defer drained.deinit(std.testing.allocator);
+    try std.testing.expect(drained.lost);
+    try std.testing.expectEqual(@as(usize, 2), drained.events.len);
+    try std.testing.expectEqualStrings("k2", drained.events[0].key);
+    try std.testing.expectEqualStrings("k3", drained.events[1].key);
+}
+
+test "KVStore batched queue enforces cap and coalesces updates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+    defer store.deinit();
+
+    store.batched_max_pending = 1;
+    store.setNowMsForTesting(1000);
+
+    try store.putWithOptions("k1", "v1", .{ .durability = .batched });
+    try store.putWithOptions("k1", "v2", .{ .durability = .batched });
+
+    var stats = store.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.batched_pending);
+    try std.testing.expectEqual(@as(u64, 2), stats.batched_enqueued_writes);
+    try std.testing.expectEqual(@as(u64, 1), stats.batched_coalesced_writes);
+    try std.testing.expect(stats.batched_next_flush_deadline_ms >= 0);
+
+    try std.testing.expectError(error.ResourceExhausted, store.putWithOptions("k2", "v", .{
+        .durability = .batched,
+    }));
+    stats = store.stats();
+    try std.testing.expectEqual(@as(u64, 1), stats.batched_rejected_writes);
+    try std.testing.expectEqual(@as(usize, 1), stats.batched_pending);
+}
+
+test "KVStore batched coalescing does not trigger auto-compaction before durable flush" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+    defer store.deinit();
+
+    // If stale accounting incorrectly tracks in-memory coalesced writes, this
+    // low threshold would trigger a premature compact() and drain pending writes.
+    store.compact_threshold = 1;
+    store.setNowMsForTesting(1000);
+
+    try store.putWithOptions("k1", "v1", .{ .durability = .batched });
+    try store.putWithOptions("k1", "v2", .{ .durability = .batched });
+
+    var stats = store.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.batched_pending);
+
+    const value = (try store.getCopy(std.testing.allocator, "k1")).?;
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("v2", value);
+
+    try store.flushBatched();
+    stats = store.stats();
+    try std.testing.expectEqual(@as(usize, 0), stats.batched_pending);
+}
+
+test "KVStore flushes batched writes when lag deadline elapses" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+    defer store.deinit();
+
+    store.batched_max_lag_ms = 10;
+    store.setNowMsForTesting(1000);
+    try store.putWithOptions("k1", "v1", .{ .durability = .batched });
+
+    var stats = store.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.batched_pending);
+
+    // A subsequent operation after the lag window should flush pending writes first.
+    store.setNowMsForTesting(1011);
+    try store.put("strong", "s1");
+
+    stats = store.stats();
+    try std.testing.expectEqual(@as(usize, 0), stats.batched_pending);
+    try std.testing.expectEqual(@as(u64, 1), stats.batched_flush_count);
+    try std.testing.expectEqual(@as(u64, 1), stats.batched_flushed_entries);
+}
+
+test "KVStore strong writes reject when durable backlog is saturated" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+    defer store.deinit();
+
+    store.batched_max_pending = 1;
+    store.strong_max_pending = 1;
+    store.setNowMsForTesting(1_000);
+
+    try store.putWithOptions("queued", "v1", .{ .durability = .batched });
+    try std.testing.expectError(error.ResourceExhausted, store.putWithOptions("critical", "v2", .{
+        .durability = .strong,
+    }));
+
+    try store.flushBatched();
+    try store.putWithOptions("critical", "v2", .{ .durability = .strong });
+}
+
+test "KVStore.flushBatched persists batched writes across restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    {
+        var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+        defer store.deinit();
+
+        store.setNowMsForTesting(1000);
+        try store.putWithOptions("k1", "v1", .{ .durability = .batched });
+
+        var stats = store.stats();
+        try std.testing.expectEqual(@as(usize, 1), stats.batched_pending);
+
+        try store.flushBatched();
+        stats = store.stats();
+        try std.testing.expectEqual(@as(usize, 0), stats.batched_pending);
+    }
+
+    {
+        var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+        defer store.deinit();
+
+        const value = (try store.getCopy(std.testing.allocator, "k1")).?;
+        defer std.testing.allocator.free(value);
+        try std.testing.expectEqualStrings("v1", value);
+    }
 }

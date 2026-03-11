@@ -93,7 +93,7 @@ pub use file::{
     ResizeFilter, ResizeOptions, TransformOptions as FileTransformOptions, TransformResult,
 };
 pub use fs::{FsEditResult, FsError, FsHandle, FsReadResult, FsStat, FsWriteResult};
-pub use kv::{KvEntry, KvError, KvHandle, KvValue};
+pub use kv::{KvDurability, KvEntry, KvError, KvHandle, KvNamespaceStats, KvPutOptions, KvValue};
 pub use logging::{LogFormat, LogLevel};
 pub use model::{GenerationConfigInfo, ModelInfo, QuantMethod};
 pub use process::{ProcessError, ProcessSession};

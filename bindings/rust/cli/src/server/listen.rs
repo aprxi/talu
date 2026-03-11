@@ -30,6 +30,8 @@ const CODE_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::fro
 const SHELL_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often the process session reaper runs.
 const PROCESS_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often KV batched write-behind queues are flushed.
+const KV_BATCHED_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result<()> {
     let state = Arc::new(state);
@@ -100,6 +102,27 @@ pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result
                     evicted,
                     sessions.len(),
                 );
+            }
+        }
+    });
+
+    // Background task: flush KV batched write-behind queues.
+    let kv_flush_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(KV_BATCHED_FLUSH_INTERVAL);
+        loop {
+            interval.tick().await;
+            let handles = {
+                let cache = kv_flush_state.kv_handles.lock().await;
+                cache.values().cloned().collect::<Vec<_>>()
+            };
+            for handle in handles {
+                if let Err(err) = handle.lock().await.flush_batched() {
+                    log::warn!(
+                        target: "server::db_kv",
+                        "failed to flush batched kv queue: {err}"
+                    );
+                }
             }
         }
     });

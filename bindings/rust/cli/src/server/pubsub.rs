@@ -67,7 +67,10 @@ impl PubSubState {
     }
 
     pub fn subscribe(&mut self, client_id: u64, topic: String) {
-        self.subscriptions.entry(topic).or_default().insert(client_id);
+        self.subscriptions
+            .entry(topic)
+            .or_default()
+            .insert(client_id);
     }
 
     pub fn unsubscribe(&mut self, client_id: u64, topic: &str) {
@@ -162,10 +165,7 @@ pub async fn handle_ws(
         .unwrap()
 }
 
-async fn handle_ws_connection(
-    state: Arc<crate::server::state::AppState>,
-    upgraded: Upgraded,
-) {
+async fn handle_ws_connection(state: Arc<crate::server::state::AppState>, upgraded: Upgraded) {
     let mut ws: WsStream =
         WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
 
