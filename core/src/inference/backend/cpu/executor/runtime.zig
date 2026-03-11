@@ -313,7 +313,18 @@ pub const ScratchBuffer = struct {
     }
 
     pub fn resetCaches(self: *ScratchBuffer) void {
-        for (self.slot_states) |*slot_state| {
+        for (0..self.slot_count) |slot_index| {
+            self.resetSlotCaches(slot_index);
+        }
+    }
+
+    /// Reset persistent caches/states for a single scheduler slot.
+    /// Used by prefill and slot lifecycle transitions to guarantee deterministic
+    /// token-0 state without perturbing other active slots.
+    pub fn resetSlotCaches(self: *ScratchBuffer, slot_index: usize) void {
+        if (slot_index >= self.slot_count) return;
+        for (0..self.layer_count) |layer_idx| {
+            const slot_state = self.getSlotLayerState(slot_index, layer_idx) orelse continue;
             if (slot_state.attn_cache) |*cache| cache.resetCache();
             if (slot_state.mla_cache) |*cache| cache.resetCache();
             if (slot_state.mamba_state) |*state| state.reset();
@@ -684,4 +695,43 @@ test "CpuKernel.forward returns typed error when attention cache is missing" {
     const fake_attention = @as(*const attn.MultiHeadAttention, @ptrFromInt(@as(usize, @alignOf(attn.MultiHeadAttention))));
     const kernel = CpuKernel{ .attention = fake_attention };
     try std.testing.expectError(SlotContextError.MissingAttentionCache, kernel.forward(&input, &output, ctx));
+}
+
+test "ScratchBuffer.resetSlotCaches resets only target slot recurrent state" {
+    const allocator = std.testing.allocator;
+    var scratch = try ScratchBuffer.initWithSlots(allocator, 8, 16, 1, 2);
+    defer scratch.deinit();
+
+    const gd_config = gated_delta.GatedDeltaConfig{
+        .d_model = 8,
+        .d_conv = 4,
+        .n_heads = 2,
+        .d_head = 2,
+    };
+    try scratch.initGatedDelta(&.{0}, gd_config);
+
+    const slot0 = scratch.getSlotLayerState(0, 0) orelse return error.TestUnexpectedResult;
+    const slot1 = scratch.getSlotLayerState(1, 0) orelse return error.TestUnexpectedResult;
+    const slot0_state = &(slot0.gated_delta_state orelse return error.TestUnexpectedResult);
+    const slot1_state = &(slot1.gated_delta_state orelse return error.TestUnexpectedResult);
+
+    @memset(slot0_state.conv_state, 1.0);
+    @memset(slot0_state.ssm_state, 1.0);
+    @memset(slot1_state.conv_state, 2.0);
+    @memset(slot1_state.ssm_state, 2.0);
+
+    scratch.resetSlotCaches(0);
+
+    for (slot0_state.conv_state) |value| {
+        try std.testing.expectEqual(@as(f32, 0.0), value);
+    }
+    for (slot0_state.ssm_state) |value| {
+        try std.testing.expectEqual(@as(f32, 0.0), value);
+    }
+    for (slot1_state.conv_state) |value| {
+        try std.testing.expectEqual(@as(f32, 2.0), value);
+    }
+    for (slot1_state.ssm_state) |value| {
+        try std.testing.expectEqual(@as(f32, 2.0), value);
+    }
 }

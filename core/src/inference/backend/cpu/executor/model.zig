@@ -385,6 +385,7 @@ pub const Transformer = struct {
         const layered_cache = resolveLayeredCache(state_blocks);
         if (!use_cache) {
             if (layered_cache) |cache| cache.resetSlot(slot_index);
+            scratch.resetSlotCaches(slot_index);
         }
         const seq_len: usize = @intCast(input_tensor.shape[1]);
         for (self.layers) |*layer| {
@@ -480,6 +481,9 @@ pub const Transformer = struct {
         if (!use_cache) {
             if (layered_cache) |cache| {
                 for (slot_indices) |slot_index| cache.resetSlot(slot_index);
+            }
+            for (slot_indices) |slot_index| {
+                scratch.resetSlotCaches(slot_index);
             }
         }
 
@@ -1173,4 +1177,54 @@ test "Transformer.resolveLayeredCache ignores non-kv runtime state blocks" {
     };
 
     try std.testing.expect(Transformer.resolveLayeredCache(&.{state_block}) == null);
+}
+
+test "forwardWithBatchedCache resets only target slot recurrent state when use_cache=false" {
+    const allocator = std.testing.allocator;
+    const model = createMockTransformer(1, 8, 16);
+    var scratch = try ScratchBuffer.initWithSlots(allocator, 8, 16, 1, 2);
+    defer scratch.deinit();
+
+    const gd_config = @import("../kernels/gated_delta.zig").GatedDeltaConfig{
+        .d_model = 8,
+        .d_conv = 4,
+        .n_heads = 2,
+        .d_head = 2,
+    };
+    try scratch.initGatedDelta(&.{0}, gd_config);
+
+    const slot0 = scratch.getSlotLayerState(0, 0) orelse return error.TestUnexpectedResult;
+    const slot1 = scratch.getSlotLayerState(1, 0) orelse return error.TestUnexpectedResult;
+    const slot0_state = &(slot0.gated_delta_state orelse return error.TestUnexpectedResult);
+    const slot1_state = &(slot1.gated_delta_state orelse return error.TestUnexpectedResult);
+    @memset(slot0_state.conv_state, 1.0);
+    @memset(slot0_state.ssm_state, 1.0);
+    @memset(slot1_state.conv_state, 2.0);
+    @memset(slot1_state.ssm_state, 2.0);
+
+    var input_storage = [_]f32{ 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0 };
+    var output_storage = [_]f32{0.0} ** 8;
+    const input_tensor = Tensor.view3DSlice(input_storage[0..], 1, 8);
+    var output_tensor = Tensor.view3DSlice(output_storage[0..], 1, 8);
+    try model.forwardWithBatchedCache(
+        &input_tensor,
+        &output_tensor,
+        &scratch,
+        &.{},
+        0,
+        false,
+    );
+
+    for (slot0_state.conv_state) |value| {
+        try std.testing.expectEqual(@as(f32, 0.0), value);
+    }
+    for (slot0_state.ssm_state) |value| {
+        try std.testing.expectEqual(@as(f32, 0.0), value);
+    }
+    for (slot1_state.conv_state) |value| {
+        try std.testing.expectEqual(@as(f32, 2.0), value);
+    }
+    for (slot1_state.ssm_state) |value| {
+        try std.testing.expectEqual(@as(f32, 2.0), value);
+    }
 }

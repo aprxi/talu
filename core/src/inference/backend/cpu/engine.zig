@@ -960,10 +960,8 @@ pub const FusedCpuBackend = struct {
         // Full single-token forward pass to warm up all layer weights.
         // This forces mmap pages to load, so the user doesn't wait during
         // the first real inference with no progress feedback.
-        var maybe_layered_cache: ?*LayeredBatchedKVCache = null;
         if (self.boundLayeredCacheForSlot(0)) |layered_cache| {
             layered_cache.resetSlot(0);
-            maybe_layered_cache = layered_cache;
         } else |err| switch (err) {
             error.UnknownStateDescriptorId => {},
             else => {
@@ -997,10 +995,8 @@ pub const FusedCpuBackend = struct {
             return err;
         };
 
-        // Reset after warmup
-        if (maybe_layered_cache) |layered_cache| {
-            layered_cache.resetSlot(0);
-        }
+        // Reset after warmup so recurrent slot state never leaks into first user prefill.
+        self.resetSlot(0);
     }
 
     // =========================================================================
