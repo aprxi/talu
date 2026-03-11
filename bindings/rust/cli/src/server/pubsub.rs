@@ -1,8 +1,9 @@
-//! `/v1/pubsub/ws` — lightweight topic-based publish-subscribe over WebSocket.
+//! `/v1/agent/pubsub/ws` — lightweight topic-based publish-subscribe over WebSocket.
 //!
 //! Clients connect, subscribe to topics, and publish messages. The server
 //! relays each published message to all *other* subscribers of that topic.
-//! Used for instant cross-window editor sync and future agent↔UI communication.
+//! Used for instant cross-window editor sync. This is a temporary transport
+//! surface pending a core-backed collaboration API.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -15,11 +16,12 @@ use hyper::body::Incoming;
 use hyper::upgrade::Upgraded;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+use utoipa::ToSchema;
 
 use crate::server::code_ws;
 
@@ -98,11 +100,19 @@ impl PubSubState {
 // Protocol types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct PubSubRequest {
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub(crate) struct PubSubRequest {
     #[serde(rename = "type")]
     msg_type: String,
     topic: Option<String>,
+    data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PubSubRelayMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    topic: String,
     data: Option<serde_json::Value>,
 }
 
@@ -110,6 +120,11 @@ struct PubSubRequest {
 // WebSocket handler
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(get, path = "/v1/agent/pubsub/ws", tag = "Agent::PubSub",
+    responses(
+        (status = 101, description = "WebSocket upgrade. Clients send subscribe/unsubscribe/publish envelopes and receive relayed message envelopes."),
+        (status = 400, body = crate::server::http::ErrorResponse),
+    ))]
 pub async fn handle_ws(
     state: Arc<crate::server::state::AppState>,
     req: Request<Incoming>,
@@ -226,12 +241,14 @@ async fn handle_client_message(
         }
         "publish" => {
             // Build relay message.
-            let relay = serde_json::json!({
-                "type": "message",
-                "topic": topic,
-                "data": req.data,
-            });
-            pubsub.publish(client_id, topic, &relay.to_string());
+            let relay = PubSubRelayMessage {
+                msg_type: "message".to_string(),
+                topic: topic.to_string(),
+                data: req.data,
+            };
+            if let Ok(relay_json) = serde_json::to_string(&relay) {
+                pubsub.publish(client_id, topic, &relay_json);
+            }
         }
         _ => {} // ignore unknown types
     }

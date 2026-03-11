@@ -103,6 +103,10 @@ static OPENAPI_DB_SQL_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/sql/"]));
 static OPENAPI_DB_OPS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/ops/"]));
+static OPENAPI_AGENT_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/"]));
+static OPENAPI_AGENT_PUBSUB_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/pubsub"]));
 static OPENAPI_AGENT_FS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/fs/"]));
 static OPENAPI_AGENT_EXEC_SPEC: Lazy<Vec<u8>> =
@@ -279,6 +283,16 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_DB_OPS_SPEC.clone())).boxed())
                     .unwrap(),
+                (Method::GET, "/openapi/agent.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AGENT_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/agent/pubsub.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AGENT_PUBSUB_SPEC.clone())).boxed())
+                    .unwrap(),
                 (Method::GET, "/openapi/agent/fs.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
@@ -337,6 +351,7 @@ impl Service<Request<Incoming>> for Router {
                     swagger_ui_response("/openapi/projects.json", "Talu API :: Projects")
                 }
                 (Method::GET, "/docs/db") => docs_hub_response(),
+                (Method::GET, "/docs/agent") => docs_hub_response(),
                 (Method::GET, "/docs/db/tables") => {
                     swagger_ui_response("/openapi/db/tables.json", "Talu API :: DB::Tables")
                 }
@@ -357,6 +372,9 @@ impl Service<Request<Incoming>> for Router {
                 }
                 (Method::GET, "/docs/agent/fs") => {
                     swagger_ui_response("/openapi/agent/fs.json", "Talu API :: Agent::FS")
+                }
+                (Method::GET, "/docs/agent/pubsub") => {
+                    swagger_ui_response("/openapi/agent/pubsub.json", "Talu API :: Agent::PubSub")
                 }
                 (Method::GET, "/docs/agent/exec") => {
                     swagger_ui_response("/openapi/agent/exec.json", "Talu API :: Agent::Exec")
@@ -1025,8 +1043,8 @@ impl Service<Request<Incoming>> for Router {
                         {
                             code::handle_session_delete(state, req, auth).await
                         }
-                        // PubSub WebSocket for cross-client topic messaging
-                        (Method::GET, "/v1/pubsub/ws")
+                        // Temporary WebSocket topic relay used by current editor sync.
+                        (Method::GET, "/v1/agent/pubsub/ws")
                             if req
                                 .headers()
                                 .get("upgrade")
@@ -1753,26 +1771,6 @@ a:hover {
           <td class="desc">File upload/list/get plus stateless inspect and transform APIs.</td>
         </tr>
         <tr>
-          <td class="mono"><a href="/docs/agent/fs"><code>agent/fs</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/fs.json" title="/openapi/agent/fs.json">json</a><button class="copy-btn" data-url="/openapi/agent/fs.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Workdir filesystem runtime APIs (`/v1/agent/fs/*`).</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/agent/exec"><code>agent/exec</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/exec.json" title="/openapi/agent/exec.json">json</a><button class="copy-btn" data-url="/openapi/agent/exec.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">One-shot shell command execution streamed as SSE (`/v1/agent/exec`).</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/agent/shell"><code>agent/shell</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/shell.json" title="/openapi/agent/shell.json">json</a><button class="copy-btn" data-url="/openapi/agent/shell.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Interactive PTY shell lifecycle and WebSocket attach endpoints.</td>
-        </tr>
-        <tr>
-          <td class="mono"><a href="/docs/agent/process"><code>agent/process</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/process.json" title="/openapi/agent/process.json">json</a><button class="copy-btn" data-url="/openapi/agent/process.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Long-lived process sessions with stdin send and SSE stream endpoints (`/v1/agent/processes/*`).</td>
-        </tr>
-        <tr>
           <td class="mono"><a href="/docs/repo"><code>repo</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/repo.json" title="/openapi/repo.json">json</a><button class="copy-btn" data-url="/openapi/repo.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td class="desc">Repository model management, pin lifecycle, and sync endpoints.</td>
@@ -1806,6 +1804,45 @@ a:hover {
           <td class="mono"><a href="/docs/events"><code>events</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/events.json" title="/openapi/events.json">json</a><button class="copy-btn" data-url="/openapi/events.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td class="desc">Unified in-memory observability stream and replay APIs (`/v1/events*`).</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th><a class="header-link" href="/docs/agent"><code>/docs/agent</code></a></th>
+          <th class="json-cell"><a class="json-link" href="/openapi/agent.json" title="/openapi/agent.json">json</a><button class="copy-btn" data-url="/openapi/agent.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono"><a href="/docs/agent/fs"><code>fs</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/fs.json" title="/openapi/agent/fs.json">json</a><button class="copy-btn" data-url="/openapi/agent/fs.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Workdir filesystem runtime APIs (`/v1/agent/fs/*`).</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/agent/pubsub"><code>pubsub</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/pubsub.json" title="/openapi/agent/pubsub.json">json</a><button class="copy-btn" data-url="/openapi/agent/pubsub.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Temporary topic-based WebSocket relay used by current editor sync (`/v1/agent/pubsub/ws`). Planned to migrate to core-backed collaboration APIs.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/agent/exec"><code>exec</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/exec.json" title="/openapi/agent/exec.json">json</a><button class="copy-btn" data-url="/openapi/agent/exec.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">One-shot shell command execution streamed as SSE (`/v1/agent/exec`).</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/agent/shell"><code>shell</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/shell.json" title="/openapi/agent/shell.json">json</a><button class="copy-btn" data-url="/openapi/agent/shell.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Interactive PTY shell lifecycle and WebSocket attach endpoints.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/agent/process"><code>process</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/process.json" title="/openapi/agent/process.json">json</a><button class="copy-btn" data-url="/openapi/agent/process.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Long-lived process sessions with stdin send and SSE stream endpoints (`/v1/agent/processes/*`).</td>
         </tr>
       </tbody>
     </table>

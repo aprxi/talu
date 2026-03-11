@@ -3,4 +3,5 @@
 mod exec;
 mod fs;
 mod process;
+mod pubsub;
 mod shell;

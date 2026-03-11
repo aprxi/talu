@@ -18,6 +18,18 @@ fn docs_hubs_serve_navigation_index() {
         "expected /docs/db/tables link"
     );
     assert!(
+        docs.body.contains("/docs/agent/fs"),
+        "expected /docs/agent/fs link"
+    );
+    assert!(
+        docs.body.contains("/docs/agent/pubsub"),
+        "expected /docs/agent/pubsub link"
+    );
+    assert!(
+        docs.body.contains("/docs/agent"),
+        "expected /docs/agent link"
+    );
+    assert!(
         docs.body.contains("/openapi.json"),
         "expected /openapi.json link"
     );
@@ -32,6 +44,10 @@ fn docs_hubs_serve_navigation_index() {
     assert!(
         db_docs.body.contains("/docs/db/kv"),
         "expected /docs/db/kv link"
+    );
+    assert!(
+        db_docs.body.contains("/openapi/agent.json"),
+        "expected /openapi/agent.json link in shared docs hub"
     );
     assert!(
         db_docs.body.contains("/openapi/db.json"),

@@ -10,8 +10,8 @@ use crate::server::agent::{
     exec as agent_exec, fs as agent_fs, process as agent_process, shell as agent_shell,
 };
 use crate::server::{
-    code, db, events, file, files, handlers, http, plugins, projects, proxy, repo, responses,
-    responses_types, search, sessions, settings, tags,
+    code, db, events, file, files, handlers, http, plugins, projects, proxy, pubsub, repo,
+    responses, responses_types, search, sessions, settings, tags,
 };
 
 #[derive(OpenApi)]
@@ -46,6 +46,7 @@ use crate::server::{
         (name = "Agent::Exec", description = "One-shot shell command execution (SSE). Runtime mode: strict = kernel/runtime sandbox guarantee; host = passthrough without firewall guarantee."),
         (name = "Agent::Shell", description = "Interactive shell lifecycle and WebSocket attach. Runtime mode: strict = kernel/runtime sandbox guarantee; host = passthrough without firewall guarantee."),
         (name = "Agent::Process", description = "Long-lived process sessions (spawn/send/stream/delete/list). Runtime mode: strict = kernel/runtime sandbox guarantee; host = passthrough without firewall guarantee."),
+        (name = "Agent::PubSub", description = "Temporary topic-based WebSocket relay used by current editor sync until core collaboration APIs exist."),
     ),
     security(
         ("gateway_secret" = []),
@@ -74,6 +75,7 @@ use crate::server::{
         agent_process::handle_send,
         agent_process::handle_stream,
         agent_process::handle_delete,
+        pubsub::handle_ws,
         events::handle_replay,
         events::handle_stream,
         events::handle_topics,
@@ -227,6 +229,8 @@ use crate::server::{
         agent_process::ProcessSendResponse,
         agent_process::ProcessDeleteResponse,
         agent_process::ProcessEvent,
+        pubsub::PubSubRequest,
+        pubsub::PubSubRelayMessage,
         // Events
         events::EventCorrelation,
         events::EventEnvelope,
