@@ -54,7 +54,7 @@ pub const TracePoint = enum(u8) {
     ffn_act_map, // Activation map stage (e.g. SiLU/GELU map)
     ffn_act_mix, // Activation mix stage (e.g. gate*up or fused act*mul)
     gdelta_in_proj, // Gated-Delta input projection output
-    gdelta_conv, // Gated-Delta depthwise conv + SiLU output
+    gdelta_conv, // Gated-Delta depthwise conv output (pre-SiLU)
     gdelta_ssm, // Gated-Delta state-space step output
     gdelta_norm, // Gated-Delta gated RMS norm output
     gdelta_out, // Gated-Delta output projection

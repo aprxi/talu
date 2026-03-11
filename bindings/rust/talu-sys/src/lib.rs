@@ -6473,6 +6473,11 @@ extern "C" {
     pub fn talu_xray_verify_capture_disable();
     // core/src/capi/xray.zig
     pub fn talu_xray_verify_capture_enable(handle: *mut c_void);
+    // core/src/capi/xray.zig
+    pub fn talu_xray_verify_capture_save_recording_full_npz(
+        handle: *mut c_void,
+        file_path: *const c_char,
+    ) -> bool;
 }
 
 // =============================================================================

@@ -191,6 +191,9 @@ pub const TraceCaptureConfig = struct {
     sample_count: u32 = 8,
     /// Memory limit in bytes (null = unlimited)
     memory_limit: ?usize = null,
+    /// Trust that non-CPU backend emissions are host-readable pointers.
+    /// Use only when emitters guarantee host accessibility (e.g. verify mode).
+    allow_non_cpu_host_data: bool = false,
 };
 
 /// A captured tensor record.
@@ -271,6 +274,11 @@ pub const TraceCapture = struct {
         self.overflow = false;
     }
 
+    fn kernelNameSlice(name: [48]u8) []const u8 {
+        const len = std.mem.indexOfScalar(u8, &name, 0) orelse name.len;
+        return name[0..len];
+    }
+
     /// Handle an emission from the trace system.
     pub fn handleEmission(self: *TraceCapture, emission: trace.TraceEmission) void {
         // Check if we should capture this emission
@@ -288,8 +296,12 @@ pub const TraceCapture = struct {
         }
 
         // Non-CPU backends may emit device pointers that are not host-readable.
-        // Capture metadata only for those emissions.
-        const can_read_tensor = emission.backend == .cpu;
+        // Only read them when emitter explicitly marks host accessibility.
+        const kernel_name = kernelNameSlice(emission.kernel_name);
+        const non_cpu_host_readable = emission.backend != .cpu and
+            self.config.allow_non_cpu_host_data and
+            std.mem.endsWith(u8, kernel_name, "_host");
+        const can_read_tensor = emission.backend == .cpu or non_cpu_host_readable;
         const tensor_stats = if (can_read_tensor and self.config.mode != .timing)
             stats_mod.compute(emission.tensor)
         else
@@ -351,7 +363,7 @@ pub const TraceCapture = struct {
 
     fn estimateRecordSize(self: *const TraceCapture, backend: trace.Backend, tensor: trace.TracedTensor) usize {
         var size: usize = @sizeOf(CapturedTensor);
-        const can_read_tensor = backend == .cpu;
+        const can_read_tensor = backend == .cpu or self.config.allow_non_cpu_host_data;
         if (can_read_tensor and (self.config.mode == .sample or self.config.mode == .full)) {
             const sample_len = @min(self.config.sample_count, @as(u32, @intCast(tensor.elementCount())));
             size += sample_len * @sizeOf(f32);

@@ -228,22 +228,14 @@ pub const ReferenceVerifier = struct {
     }
 
     fn shouldUpdateLastObserved(self: *const ReferenceVerifier, emission: trace.TraceEmission) bool {
+        _ = emission;
         if (self.expected_record_idx >= self.reference.stats_records.len) return true;
         const expected = self.reference.stats_records[self.expected_record_idx];
-        if (self.token_idx < expected.token_idx) return true;
+        // Keep "last observed" local to the token window where the missing
+        // checkpoint is expected. Once verification has advanced beyond that
+        // token, don't let newer emissions overwrite this context.
         if (self.token_idx > expected.token_idx) return false;
-
-        if (expected.layer != trace.TraceEmission.NO_LAYER) {
-            if (emission.layer == trace.TraceEmission.NO_LAYER) return false;
-            if (emission.layer < expected.layer) return true;
-            if (emission.layer > expected.layer) return false;
-        }
-
-        const emission_point_ord = @intFromEnum(emission.point);
-        const expected_point_ord = @intFromEnum(expected.point);
-        if (emission_point_ord < expected_point_ord) return true;
-        if (emission_point_ord > expected_point_ord) return false;
-        return emission.position <= expected.position;
+        return true;
     }
 
     fn tokenOnlyVerificationEnabled() bool {

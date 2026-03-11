@@ -14,7 +14,8 @@ const dtype_mod = @import("../../dtype.zig");
 pub const DumpEnabled = build_options.dump_tensors;
 
 /// Maximum number of tensors that can be captured in one run.
-const MAX_CAPTURES = 4096;
+/// Verification/reference sidecars can exceed 4K checkpoints for 100-token runs.
+const MAX_CAPTURES = 1_048_576;
 
 /// Maximum total bytes across all captures (1GB limit).
 const MAX_TOTAL_BYTES: usize = 1024 * 1024 * 1024;

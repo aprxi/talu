@@ -642,6 +642,25 @@ pub export fn talu_xray_verify_capture_disable() callconv(.c) void {
     xray.disableVerifyCapture();
 }
 
+/// Persist full CPU tensor sidecar captured in recording mode to NPZ.
+/// Returns false on error (check talu_error_message).
+pub export fn talu_xray_verify_capture_save_recording_full_npz(
+    handle: ?*VerifyCaptureHandle,
+    file_path: [*:0]const u8,
+) callconv(.c) bool {
+    capi_error.clearError();
+    const verify_cap = getVerifyCapture(handle) orelse {
+        capi_error.setError(error.InvalidHandle, "verify capture handle is null", .{});
+        return false;
+    };
+    const path = std.mem.span(file_path);
+    verify_cap.saveFullNpz(path) catch |err| {
+        capi_error.setError(err, "failed to write full NPZ: {}", .{err});
+        return false;
+    };
+    return true;
+}
+
 /// Destroy verify capture.
 pub export fn talu_xray_verify_capture_destroy(handle: ?*VerifyCaptureHandle) callconv(.c) void {
     const verify_cap = getVerifyCapture(handle) orelse return;

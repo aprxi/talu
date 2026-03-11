@@ -563,20 +563,29 @@ pub(super) struct XrayArgs {
     #[arg(long)]
     pub debug: bool,
 
-    /// Record reference stats to JSON file for cross-backend verification
-    #[arg(long, group = "verify_mode")]
-    pub record_reference: Option<String>,
+    /// Verify against cached CPU reference (auto-record if missing)
+    #[arg(long)]
+    pub verify: bool,
 
-    /// Verify against reference stats from JSON file
-    #[arg(long, group = "verify_mode")]
-    pub verify_reference: Option<String>,
+    /// Ignore cache and regenerate CPU golden reference before verify
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Also print full-checkpoint tensor diff against CPU sidecar.
+    #[arg(long)]
+    pub diff_full: bool,
+
+    /// Targeted fast verify for a single checkpoint:
+    /// `<token>:<layer|global>:<point>[:<pos>]`
+    #[arg(long)]
+    pub verify_checkpoint: Option<String>,
 
     /// Tolerance for stats comparison during verification (default: 1e-3)
     #[arg(long, default_value = "0.001")]
     pub tolerance: f32,
 
-    /// Number of tokens to generate for recording/verification (default: 100)
-    #[arg(long, default_value = "100")]
+    /// Number of tokens to generate for recording/verification (default: TOKENS env or 10)
+    #[arg(long, env = "TOKENS", default_value_t = 10u32)]
     pub tokens: u32,
 
     /// Random seed for deterministic generation (default: 42)
@@ -810,6 +819,36 @@ fn print_usage() {
 mod tests {
     use super::*;
     use clap::{CommandFactory, FromArgMatches};
+    use std::ffi::OsString;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         let mut cmd = Cli::command();
@@ -1151,6 +1190,32 @@ mod tests {
                 assert!(args.table);
                 assert!(args.debug);
             }
+            _ => panic!("expected xray command"),
+        }
+    }
+
+    #[test]
+    fn parse_xray_tokens_from_env_and_default() {
+        let _env_guard = EnvVarGuard::set("TOKENS", None);
+        let cli_default = parse(&["talu", "xray", "Qwen/Qwen3.5-0.8B"])
+            .expect("parse should succeed");
+        match cli_default.command {
+            Some(Commands::Xray(args)) => assert_eq!(args.tokens, 10),
+            _ => panic!("expected xray command"),
+        }
+
+        let _env_guard = EnvVarGuard::set("TOKENS", Some("17"));
+        let cli_env =
+            parse(&["talu", "xray", "Qwen/Qwen3.5-0.8B"]).expect("parse should succeed");
+        match cli_env.command {
+            Some(Commands::Xray(args)) => assert_eq!(args.tokens, 17),
+            _ => panic!("expected xray command"),
+        }
+
+        let cli_flag = parse(&["talu", "xray", "Qwen/Qwen3.5-0.8B", "--tokens", "23"])
+            .expect("parse should succeed");
+        match cli_flag.command {
+            Some(Commands::Xray(args)) => assert_eq!(args.tokens, 23),
             _ => panic!("expected xray command"),
         }
     }

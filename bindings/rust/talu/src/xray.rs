@@ -436,6 +436,23 @@ impl VerifyCaptureHandle {
         unsafe { talu_sys::talu_xray_verify_capture_enable(self.handle) };
     }
 
+    /// Save full host-readable tensor sidecar captured by this verify capture.
+    pub fn save_full_npz(&self, path: &str) -> Result<()> {
+        let c_path = std::ffi::CString::new(path)?;
+        let ok = unsafe {
+            talu_sys::talu_xray_verify_capture_save_recording_full_npz(self.handle, c_path.as_ptr())
+        };
+        if !ok {
+            return Err(error_from_last_or("verify capture save full npz failed"));
+        }
+        Ok(())
+    }
+
+    /// Backward-compatible alias.
+    pub fn save_recording_full_npz(&self, path: &str) -> Result<()> {
+        self.save_full_npz(path)
+    }
+
     /// Disable verify capture (stop receiving trace emissions).
     pub fn disable() {
         unsafe { talu_sys::talu_xray_verify_capture_disable() };

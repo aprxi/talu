@@ -12,12 +12,14 @@ const capture_mod = @import("capture.zig");
 const stats_mod = @import("stats.zig");
 const reference_mod = @import("reference.zig");
 const teacher_forcing = @import("teacher_forcing.zig");
+const dump_capture_mod = @import("dump/capture.zig");
+const dump_npz_mod = @import("dump/npz.zig");
+const core_dtype = @import("../dtype.zig");
 
 const TraceEmission = trace.TraceEmission;
 const TensorStats = stats_mod.TensorStats;
 const TraceCapture = capture_mod.TraceCapture;
 const TraceCaptureConfig = capture_mod.TraceCaptureConfig;
-const TraceCaptureMode = capture_mod.TraceCaptureMode;
 const ReferenceRecorder = reference_mod.ReferenceRecorder;
 const ReferenceVerifier = reference_mod.ReferenceVerifier;
 
@@ -45,6 +47,10 @@ pub const VerifyCapture = struct {
     /// Verification state (when mode == .verify)
     verifier: ?*ReferenceVerifier,
 
+    /// Full-tensor recording sidecar.
+    recording_full_capture: ?dump_capture_mod.Capture,
+    recording_full_index: usize,
+
     /// Panic dump path (for full tensor dumps on divergence)
     panic_dump_dir: ?[]const u8,
 
@@ -52,23 +58,7 @@ pub const VerifyCapture = struct {
     panic_triggered: bool,
 
     fn verificationPointSet() capture_mod.TracePointSet {
-        return .{
-            .layer_attn_norm = true,
-            .attn_out = true,
-            .gdelta_in_proj = true,
-            .gdelta_conv = true,
-            .gdelta_ssm = true,
-            .gdelta_norm = true,
-            .gdelta_out = true,
-            .layer_ffn_norm = true,
-            .ffn_down = true,
-            .block_out = true,
-            .final_norm = true,
-            .lm_head = true,
-            .logits_scaled = true,
-            .logits_ready = true,
-            .token_select = true,
-        };
+        return capture_mod.TracePointSet.all();
     }
 
     pub fn initRecording(
@@ -78,6 +68,7 @@ pub const VerifyCapture = struct {
         const config = TraceCaptureConfig{
             .mode = .stats,
             .points = verificationPointSet(),
+            .allow_non_cpu_host_data = true,
         };
 
         return .{
@@ -86,6 +77,12 @@ pub const VerifyCapture = struct {
             .mode = .record,
             .recorder = recorder,
             .verifier = null,
+            .recording_full_capture = blk: {
+                var capture = dump_capture_mod.Capture.init(allocator);
+                capture.enable();
+                break :blk capture;
+            },
+            .recording_full_index = 0,
             .panic_dump_dir = null,
             .panic_triggered = false,
         };
@@ -99,6 +96,7 @@ pub const VerifyCapture = struct {
         const config = TraceCaptureConfig{
             .mode = .stats,
             .points = verificationPointSet(),
+            .allow_non_cpu_host_data = true,
         };
 
         return .{
@@ -107,13 +105,34 @@ pub const VerifyCapture = struct {
             .mode = .verify,
             .recorder = null,
             .verifier = verifier,
+            .recording_full_capture = blk: {
+                var capture = dump_capture_mod.Capture.init(allocator);
+                capture.enable();
+                break :blk capture;
+            },
+            .recording_full_index = 0,
             .panic_dump_dir = panic_dump_dir,
             .panic_triggered = false,
         };
     }
 
     pub fn deinit(self: *VerifyCapture) void {
+        if (self.recording_full_capture) |*recording_full_capture| {
+            recording_full_capture.disable();
+            recording_full_capture.deinit();
+        }
         self.capture.deinit();
+    }
+
+    /// Persist full host-readable tensor values captured for this verify capture to NPZ.
+    /// In record mode this is the CPU golden sidecar. In verify mode this is the
+    /// backend candidate sidecar (typically phase-2 teacher-forced run).
+    pub fn saveFullNpz(self: *VerifyCapture, path: []const u8) !void {
+        const full_capture = &(self.recording_full_capture orelse return error.InvalidMode);
+        var writer = dump_npz_mod.NpzWriter.init(self.allocator);
+        defer writer.deinit();
+        try writer.addAll(full_capture);
+        try writer.write(path);
     }
 
     fn isTranscriptTokenSelect(emission: TraceEmission) bool {
@@ -132,7 +151,22 @@ pub const VerifyCapture = struct {
         return !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
     }
 
+    fn kernelNameSlice(name: [48]u8) []const u8 {
+        const len = std.mem.indexOfScalar(u8, &name, 0) orelse name.len;
+        return name[0..len];
+    }
+
+    fn isHostReadableEmission(emission: TraceEmission) bool {
+        if (emission.backend == .cpu) return true;
+        const kernel_name = kernelNameSlice(emission.kernel_name);
+        return std.mem.endsWith(u8, kernel_name, "_host");
+    }
+
     fn logVerificationDivergence(verifier: *const ReferenceVerifier, err: anyerror) void {
+        if (std.posix.getenv("TALU_PARITY_QUIET")) |raw| {
+            const enabled = !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
+            if (enabled) return;
+        }
         if (comptime builtin.is_test) {
             std.log.warn("DIVERGENCE DETECTED: {}", .{err});
         } else {
@@ -152,6 +186,8 @@ pub const VerifyCapture = struct {
     pub fn handleEmission(self: *VerifyCapture, emission: TraceEmission) void {
         const is_token_select = emission.point == .token_select;
         const is_transcript_token_select = isTranscriptTokenSelect(emission);
+
+        self.recordFullEmission(emission);
 
         // token_select is a control signal: update transcript/token index from
         // scalar u32 events only, then skip stats comparison for this point.
@@ -188,6 +224,7 @@ pub const VerifyCapture = struct {
         if (is_token_select) return;
         if (!self.capture.config.points.contains(emission.point)) return;
         if (self.mode == .verify and tokenOnlyVerificationEnabled() and !teacher_forcing.isEnabled()) return;
+        if (!isHostReadableEmission(emission)) return;
 
         // Xray emitters must only publish host-accessible tensors. This keeps
         // verification backend-agnostic and avoids duplicating device-specific
@@ -231,6 +268,12 @@ pub const VerifyCapture = struct {
         actual_stats: TensorStats,
         divergence: *const ReferenceVerifier.DivergenceInfo,
     ) !void {
+        const quiet = blk: {
+            if (std.posix.getenv("TALU_PARITY_QUIET")) |raw| {
+                break :blk !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
+            }
+            break :blk false;
+        };
         const dump_dir = self.panic_dump_dir orelse return;
 
         // Switch to full capture mode temporarily to capture the failing tensor
@@ -250,11 +293,83 @@ pub const VerifyCapture = struct {
 
         // Write NPZ with full tensor data
         // TODO: Integrate with npz writer
-        std.log.warn("Would write panic dump to: {s}", .{full_path});
-        std.log.warn("Expected RMS: {d:.6}, Actual RMS: {d:.6}", .{
-            divergence.expected.rms(),
-            actual_stats.rms(),
-        });
+        if (!quiet) {
+            std.log.warn("Would write panic dump to: {s}", .{full_path});
+            std.log.warn("Expected RMS: {d:.6}, Actual RMS: {d:.6}", .{
+                divergence.expected.rms(),
+                actual_stats.rms(),
+            });
+        }
+    }
+
+    fn recordFullEmission(self: *VerifyCapture, emission: TraceEmission) void {
+        const full_capture = &(self.recording_full_capture orelse return);
+        if (!self.capture.config.points.contains(emission.point)) return;
+        if (self.mode == .verify and tokenOnlyVerificationEnabled() and !teacher_forcing.isEnabled()) {
+            return;
+        }
+        if (!isHostReadableEmission(emission)) return;
+        const dtype = switch (emission.tensor.dtype) {
+            .f32 => core_dtype.DType.f32,
+            .f64 => core_dtype.DType.f64,
+            .i32 => core_dtype.DType.i32,
+            .i64 => core_dtype.DType.i64,
+            .f16 => core_dtype.DType.f16,
+            .bf16 => core_dtype.DType.bf16,
+            .i8 => core_dtype.DType.i8,
+            .i16 => core_dtype.DType.i16,
+            .u8 => core_dtype.DType.u8,
+            .u16 => core_dtype.DType.u16,
+            .u32 => core_dtype.DType.u32,
+            .u64 => core_dtype.DType.u64,
+            .grouped_affine_u4 => core_dtype.DType.grouped_affine_u4,
+            .grouped_affine_u8 => core_dtype.DType.grouped_affine_u8,
+        };
+        var shape_usize: [4]usize = .{ 0, 0, 0, 0 };
+        for (0..emission.tensor.ndim) |dim| {
+            shape_usize[dim] = @intCast(emission.tensor.shape[dim]);
+        }
+
+        const layer_label: []const u8 = if (emission.layer == trace.TraceEmission.NO_LAYER)
+            "global"
+        else
+            "layer";
+        const layer_idx: u16 = if (emission.layer == trace.TraceEmission.NO_LAYER)
+            0
+        else
+            emission.layer;
+        const logical_token_idx: u32 = switch (self.mode) {
+            .record => if (self.recorder) |rec| rec.current_token_idx else emission.token,
+            .verify => if (self.verifier) |ver| ver.token_idx else emission.token,
+        };
+
+        var name_buf: [192]u8 = undefined;
+        const tensor_name = std.fmt.bufPrint(
+            &name_buf,
+            "{d}_tok{d}_pos{d}_{s}_{d}_{s}",
+            .{
+                self.recording_full_index,
+                logical_token_idx,
+                emission.position,
+                layer_label,
+                layer_idx,
+                emission.point.name(),
+            },
+        ) catch |err| {
+            std.log.warn("failed to build full tensor sidecar name: {}", .{err});
+            return;
+        };
+
+        full_capture.record(
+            tensor_name,
+            emission.tensor.ptr,
+            dtype,
+            shape_usize,
+            emission.tensor.ndim,
+        ) catch |err| {
+            std.log.warn("failed to capture full tensor sidecar emission: {}", .{err});
+        };
+        self.recording_full_index += 1;
     }
 };
 
@@ -312,6 +427,169 @@ test "VerifyCapture recording mode" {
 
     // Check that recorder captured the stats
     try std.testing.expectEqual(@as(usize, 1), recorder.stats_records.items.len);
+}
+
+test "VerifyCapture recording mode writes full tensor NPZ sidecar" {
+    const allocator = std.testing.allocator;
+
+    var recorder = try ReferenceRecorder.init(allocator, "test_model", 42, 1.0, 10);
+    defer recorder.deinit();
+
+    var verify_cap = VerifyCapture.initRecording(allocator, &recorder);
+    defer verify_cap.deinit();
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const emission = TraceEmission{
+        .point = .lm_head,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 0,
+        .position = 0,
+        .backend = .cpu,
+        .tensor = .{
+            .ptr = @ptrCast(&data),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    verify_cap.handleEmission(emission);
+
+    const path = try std.fs.path.join(allocator, &[_][]const u8{
+        "/tmp",
+        "talu_verify_capture_recording_full_sidecar_test.npz",
+    });
+    defer allocator.free(path);
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    try verify_cap.saveFullNpz(path);
+
+    const stat = try std.fs.cwd().statFile(path);
+    try std.testing.expect(stat.size > 0);
+}
+
+test "VerifyCapture skips non-host Metal emissions" {
+    const allocator = std.testing.allocator;
+
+    var recorder = try ReferenceRecorder.init(allocator, "test_model", 42, 1.0, 10);
+    defer recorder.deinit();
+
+    var verify_cap = VerifyCapture.initRecording(allocator, &recorder);
+    defer verify_cap.deinit();
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    var kernel_name = std.mem.zeroes([48]u8);
+    @memcpy(kernel_name[0.."metal_test_kernel".len], "metal_test_kernel");
+    const emission = TraceEmission{
+        .point = .lm_head,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 0,
+        .position = 0,
+        .backend = .metal,
+        .tensor = .{
+            .ptr = @ptrCast(&data),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = kernel_name,
+    };
+
+    verify_cap.handleEmission(emission);
+
+    try std.testing.expectEqual(@as(usize, 0), recorder.stats_records.items.len);
+    const full_capture = &(verify_cap.recording_full_capture orelse unreachable);
+    try std.testing.expectEqual(@as(usize, 0), full_capture.tensors.items.len);
+}
+
+test "VerifyCapture accepts host-tagged Metal emissions" {
+    const allocator = std.testing.allocator;
+
+    var recorder = try ReferenceRecorder.init(allocator, "test_model", 42, 1.0, 10);
+    defer recorder.deinit();
+
+    var verify_cap = VerifyCapture.initRecording(allocator, &recorder);
+    defer verify_cap.deinit();
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    var kernel_name = std.mem.zeroes([48]u8);
+    @memcpy(kernel_name[0.."metal_test_kernel_host".len], "metal_test_kernel_host");
+    const emission = TraceEmission{
+        .point = .lm_head,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 0,
+        .position = 0,
+        .backend = .metal,
+        .tensor = .{
+            .ptr = @ptrCast(&data),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = kernel_name,
+    };
+
+    verify_cap.handleEmission(emission);
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.stats_records.items.len);
+    const full_capture = &(verify_cap.recording_full_capture orelse unreachable);
+    try std.testing.expectEqual(@as(usize, 1), full_capture.tensors.items.len);
+}
+
+test "VerifyCapture full sidecar names use logical token index progression" {
+    const allocator = std.testing.allocator;
+
+    var recorder = try ReferenceRecorder.init(allocator, "test_model", 42, 1.0, 10);
+    defer recorder.deinit();
+
+    var verify_cap = VerifyCapture.initRecording(allocator, &recorder);
+    defer verify_cap.deinit();
+
+    const selected_token: u32 = 123;
+    const token_select = TraceEmission{
+        .point = .token_select,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 0, // backend slot token, should not drive sidecar token naming
+        .position = 10,
+        .backend = .cpu,
+        .tensor = .{
+            .ptr = @ptrCast(&selected_token),
+            .dtype = .u32,
+            .shape = .{ 1, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+    verify_cap.handleEmission(token_select);
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const layer_emission = TraceEmission{
+        .point = .layer_ffn_norm,
+        .layer = 0,
+        .token = 0, // still backend slot token
+        .position = 11,
+        .backend = .cpu,
+        .tensor = .{
+            .ptr = @ptrCast(&data),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+    verify_cap.handleEmission(layer_emission);
+
+    const full_capture = &(verify_cap.recording_full_capture orelse unreachable);
+    try std.testing.expectEqual(@as(usize, 2), full_capture.tensors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, full_capture.tensors.items[0].name, "_tok0_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_capture.tensors.items[1].name, "_tok1_") != null);
 }
 
 test "VerifyCapture verification mode detects divergence" {
@@ -408,6 +686,8 @@ test "VerifyCapture verification mode compares host tensors from non-CPU backend
     defer verify_cap.deinit();
 
     const data = [_]f32{ 1.0, 2.0, 3.0, 10.0 };
+    var kernel_name = std.mem.zeroes([48]u8);
+    @memcpy(kernel_name[0.."cuda_lm_head_host".len], "cuda_lm_head_host");
     const emission = TraceEmission{
         .point = .lm_head,
         .layer = trace.TraceEmission.NO_LAYER,
@@ -421,7 +701,7 @@ test "VerifyCapture verification mode compares host tensors from non-CPU backend
             .ndim = 1,
         },
         .timestamp_ns = 0,
-        .kernel_name = std.mem.zeroes([48]u8),
+        .kernel_name = kernel_name,
     };
 
     verify_cap.handleEmission(emission);
@@ -430,7 +710,7 @@ test "VerifyCapture verification mode compares host tensors from non-CPU backend
     try std.testing.expect(verifier.divergence_point != null);
 }
 
-test "VerifyCapture ignores non-verification trace points" {
+test "VerifyCapture ignores custom trace points outside verification set" {
     const allocator = std.testing.allocator;
 
     const golden_stats = TensorStats{
@@ -465,7 +745,7 @@ test "VerifyCapture ignores non-verification trace points" {
 
     const data = [_]f32{ 1.0, 2.0, 3.0, 10.0 };
     const emission = TraceEmission{
-        .point = .layer_ffn_norm,
+        .point = @enumFromInt(200),
         .layer = 0,
         .token = 0,
         .position = 14,
@@ -611,6 +891,18 @@ test "VerifyCapture token_select f32 does not advance verifier" {
 
     try std.testing.expectEqual(@as(u32, 0), verifier.token_idx);
     try std.testing.expect(!verifier.has_diverged);
+}
+
+test "VerifyCapture verification point set is complete" {
+    const points = VerifyCapture.verificationPointSet();
+    try std.testing.expect(points.contains(.layer_attn_norm));
+    try std.testing.expect(points.contains(.layer_ffn_norm));
+    try std.testing.expect(points.contains(.gdelta_ssm));
+    try std.testing.expect(points.contains(.gdelta_norm));
+    try std.testing.expect(points.contains(.gdelta_out));
+    try std.testing.expect(points.contains(.lm_head));
+    try std.testing.expect(points.contains(.logits_ready));
+    try std.testing.expect(points.contains(.token_select));
 }
 
 test "VerifyCapture recording token_select u32 updates transcript without stats record" {
