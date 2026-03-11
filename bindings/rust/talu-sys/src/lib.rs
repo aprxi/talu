@@ -6474,6 +6474,14 @@ extern "C" {
     // core/src/capi/xray.zig
     pub fn talu_xray_verify_capture_enable(handle: *mut c_void);
     // core/src/capi/xray.zig
+    pub fn talu_xray_verify_clear_ignore_token_parity_override();
+    // core/src/capi/xray.zig
+    pub fn talu_xray_verify_clear_token_only_override();
+    // core/src/capi/xray.zig
+    pub fn talu_xray_verify_set_ignore_token_parity(enabled: bool);
+    // core/src/capi/xray.zig
+    pub fn talu_xray_verify_set_token_only(enabled: bool);
+    // core/src/capi/xray.zig
     pub fn talu_xray_verify_capture_save_recording_full_npz(
         handle: *mut c_void,
         file_path: *const c_char,

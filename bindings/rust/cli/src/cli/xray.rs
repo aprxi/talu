@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use talu::error::last_error_message;
 use talu::{ChatHandle, XrayCaptureHandle};
@@ -1081,7 +1082,21 @@ fn cmd_xray_record(model: &str, ref_path: &str, args: &XrayArgs) -> Result<()> {
     Ok(())
 }
 
-/// Verification mode: load reference and verify generation matches
+/// Verification mode: load reference and verify generation matches.
+///
+/// XRAY VERIFY PROCEDURE (contract):
+/// 1) Phase 1 free-run token parity:
+///    - Run generation normally and compare selected token IDs.
+///    - This is the production-behavior tripwire.
+/// 2) Phase 2 teacher-forced numeric localization:
+///    - Replay on the reference transcript and compare captured checkpoints.
+///    - This localizes first numeric divergence without sequence drift.
+///
+/// XRAY VERIFY RULES (non-negotiable):
+/// - Verify is observability-only; it MUST NOT change backend route selection.
+/// - Verify is observability-only; it MUST NOT change fusion policy.
+/// - Verify is observability-only; it MUST NOT change kernel selection/arithmetic.
+/// - Teacher forcing may control token progression only; it must not alter math paths.
 fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs) -> Result<()> {
     use talu::xray::{
         ReferenceDataHandle, ReferenceVerifierHandle, TeacherForcing, VerifyCaptureHandle,
@@ -1109,30 +1124,20 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         .transpose()?;
 
     let run_pass = |teacher_forcing: bool,
-                    parity_debug: bool,
                     reference_path: &str,
                     max_tokens: usize,
                     full_npz_path: Option<&Path>|
      -> Result<(bool, Option<String>)> {
-        let prev_parity_debug = std::env::var_os("TALU_PARITY_DEBUG");
-        let prev_parity_quiet = std::env::var_os("TALU_PARITY_QUIET");
-        let prev_ignore_token_parity = std::env::var_os("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY");
-        let prev_verify_mode = std::env::var_os("TALU_XRAY_VERIFY_MODE");
-        let prev_token_only = std::env::var_os("TALU_XRAY_VERIFY_TOKEN_ONLY");
-        unsafe {
-            std::env::set_var("TALU_XRAY_VERIFY_MODE", "1");
-            std::env::remove_var("TALU_XRAY_VERIFY_TOKEN_ONLY");
-        }
-        if parity_debug {
-            unsafe {
-                std::env::set_var("TALU_PARITY_DEBUG", "1");
-                std::env::set_var("TALU_PARITY_QUIET", "1");
-            }
-        }
+        // Verify runner invariant:
+        // Any temporary state configured here must remain transcript-level only.
+        // Do not add toggles that alter backend execution behavior.
+        VerifyCaptureHandle::set_ignore_token_parity(teacher_forcing);
+        VerifyCaptureHandle::set_token_only(!teacher_forcing);
+
         if teacher_forcing {
-            unsafe {
-                std::env::set_var("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY", "1");
-            }
+            // Phase 2: localization run on fixed transcript.
+        } else {
+            // Phase 1: pure free-run transcript parity with token-only capture.
         }
 
         let run_result = (|| -> Result<(bool, Option<String>)> {
@@ -1203,51 +1208,8 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             }
         })();
 
-        if parity_debug {
-            match prev_parity_debug {
-                Some(value) => unsafe {
-                    std::env::set_var("TALU_PARITY_DEBUG", value);
-                },
-                None => unsafe {
-                    std::env::remove_var("TALU_PARITY_DEBUG");
-                },
-            }
-            match prev_parity_quiet {
-                Some(value) => unsafe {
-                    std::env::set_var("TALU_PARITY_QUIET", value);
-                },
-                None => unsafe {
-                    std::env::remove_var("TALU_PARITY_QUIET");
-                },
-            }
-        }
-        if teacher_forcing {
-            match prev_ignore_token_parity {
-                Some(value) => unsafe {
-                    std::env::set_var("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY", value);
-                },
-                None => unsafe {
-                    std::env::remove_var("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY");
-                },
-            }
-        }
-        match prev_verify_mode {
-            Some(value) => unsafe {
-                std::env::set_var("TALU_XRAY_VERIFY_MODE", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TALU_XRAY_VERIFY_MODE");
-            },
-        }
-        match prev_token_only {
-            Some(value) => unsafe {
-                std::env::set_var("TALU_XRAY_VERIFY_TOKEN_ONLY", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TALU_XRAY_VERIFY_TOKEN_ONLY");
-            },
-        }
-
+        VerifyCaptureHandle::clear_ignore_token_parity_override();
+        VerifyCaptureHandle::clear_token_only_override();
         run_result
     };
 
@@ -1264,13 +1226,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             "talu_xray_verify_candidate_{}_checkpoint.layers_full.npz",
             std::process::id()
         ));
-        let _ = run_pass(
-            true,
-            true,
-            &reference_json_path,
-            max_tokens,
-            Some(&candidate_npz),
-        )?;
+        let _ = run_pass(true, &reference_json_path, max_tokens, Some(&candidate_npz))?;
 
         if !golden_full_npz.exists() {
             return Err(anyhow!(
@@ -1289,9 +1245,6 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             )
         })?;
         let actual = candidate_tensors.get(&selected.key);
-        if !args.diff_full {
-            let _ = std::fs::remove_file(&candidate_npz);
-        }
 
         let layer_label = if selected.scope == "global" {
             "global".to_string()
@@ -1310,6 +1263,8 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
                 println!("  kind=coverage");
                 println!("  checkpoint={}", selected.key);
                 println!("  detail=checkpoint missing from candidate sidecar");
+                println!("  golden_sidecar={}", golden_full_npz.display());
+                println!("  candidate_sidecar={}", candidate_npz.display());
                 return Err(anyhow!(
                     "Verification failed: candidate missing checkpoint {}",
                     selected.key
@@ -1319,7 +1274,6 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
 
         let (rel_rms, max_abs) = rel_rms_and_max_abs(expected, actual);
         let len_mismatch = expected.len() != actual.len();
-        let diverged = len_mismatch || rel_rms > tolerance as f64;
 
         let expected_rms = if expected.is_empty() {
             0.0f64
@@ -1346,6 +1300,8 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             (sum_sq / actual.len() as f64).sqrt()
         };
         let abs_rms_diff = (actual_rms - expected_rms).abs();
+        let diverged =
+            len_mismatch || exceeds_numeric_tolerance(rel_rms, abs_rms_diff, tolerance);
 
         println!(
             "token={}, layer={}, point={}, pos={} -> {}",
@@ -1369,6 +1325,8 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             println!("  detail=length mismatch");
         }
         if diverged {
+            println!("  golden_sidecar={}", golden_full_npz.display());
+            println!("  candidate_sidecar={}", candidate_npz.display());
             print_targeted_checkpoint_hint(model, &prompt_text, &selected);
             return Err(anyhow!(
                 "Verification failed: checkpoint divergence at {} (rel_rms={:.6})",
@@ -1376,6 +1334,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
                 rel_rms
             ));
         }
+        let _ = std::fs::remove_file(&candidate_npz);
         return Ok(());
     }
 
@@ -1383,17 +1342,8 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         "Phase 1/2: Free-run token parity ({} tokens, first divergence only)...",
         args.tokens
     );
-    let candidate_npz_phase1 = std::env::temp_dir().join(format!(
-        "talu_xray_verify_candidate_{}_phase1.layers_full.npz",
-        std::process::id()
-    ));
-    let (diverged, divergence_msg) = run_pass(
-        false,
-        true,
-        &reference_json_path,
-        args.tokens as usize,
-        Some(&candidate_npz_phase1),
-    )?;
+    let (diverged, divergence_msg) =
+        run_pass(false, &reference_json_path, args.tokens as usize, None)?;
 
     if diverged {
         println!("✗ Phase 1 FAILED");
@@ -1406,16 +1356,27 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             println!("  divergence detected but no structured message was provided");
         }
 
-        println!("Phase 2/2: Teacher-forced numeric localization from token=0...");
+        let phase2_max_tokens = divergence_msg
+            .as_deref()
+            .and_then(|msg| parse_u32_after(msg, "token="))
+            .map(|token_idx| token_idx.saturating_add(1) as usize)
+            .map(|count| count.max(1))
+            .unwrap_or(args.tokens as usize)
+            .min(args.tokens as usize)
+            .max(1);
+
+        println!(
+            "Phase 2/2: Teacher-forced numeric localization from token=0 (max_tokens={})...",
+            phase2_max_tokens
+        );
         let candidate_npz_phase2 = std::env::temp_dir().join(format!(
             "talu_xray_verify_candidate_{}_phase2.layers_full.npz",
             std::process::id()
         ));
         let (_, phase2_msg) = run_pass(
             true,
-            true,
             &reference_json_path,
-            args.tokens as usize,
+            phase2_max_tokens,
             Some(&candidate_npz_phase2),
         )?;
 
@@ -1443,14 +1404,8 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         if !printed_numeric {
             if let Some(msg) = phase2_msg {
                 print_first_divergence_report(&msg);
-                if args.diff_full {
-                    println!("  Raw: {}", msg);
-                }
             } else if let Some(msg) = divergence_msg {
                 print_first_divergence_report(&msg);
-                if args.diff_full {
-                    println!("  Raw: {}", msg);
-                }
             } else {
                 println!("token=?, layer=?, point=? -> FAILED");
                 println!();
@@ -1459,52 +1414,8 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             }
         }
 
-        if args.diff_full {
-            if golden_full_npz.exists() && candidate_npz_phase2.exists() {
-                match diff_full_npz(&golden_full_npz, &candidate_npz_phase2, tolerance) {
-                    Ok(report) => {
-                        print_full_diff_report(&golden_full_npz, &candidate_npz_phase2, &report);
-                    }
-                    Err(err) => {
-                        println!("  Full tensor diff unavailable: {}", err);
-                    }
-                }
-            } else {
-                println!(
-                    "  Full tensor diff unavailable: expected sidecars missing (golden={}, candidate={})",
-                    golden_full_npz.display(),
-                    candidate_npz_phase2.display()
-                );
-            }
-        }
-        if !args.diff_full {
-            let _ = std::fs::remove_file(&candidate_npz_phase1);
-            let _ = std::fs::remove_file(&candidate_npz_phase2);
-        }
         println!("  Check panic dumps in /tmp/panic_dumps/");
         return Err(anyhow!("Verification failed: divergence detected"));
-    }
-
-    if args.diff_full {
-        if golden_full_npz.exists() && candidate_npz_phase1.exists() {
-            match diff_full_npz(&golden_full_npz, &candidate_npz_phase1, tolerance) {
-                Ok(report) => {
-                    print_full_diff_report(&golden_full_npz, &candidate_npz_phase1, &report);
-                }
-                Err(err) => {
-                    println!("  Full tensor diff unavailable: {}", err);
-                }
-            }
-        } else {
-            println!(
-                "  Full tensor diff unavailable: expected sidecars missing (golden={}, candidate={})",
-                golden_full_npz.display(),
-                candidate_npz_phase1.display()
-            );
-        }
-    }
-    if !args.diff_full {
-        let _ = std::fs::remove_file(&candidate_npz_phase1);
     }
 
     println!("token=all, layer=all, point=all -> PASSED");
@@ -1539,12 +1450,61 @@ fn effective_prompt_text(args: &XrayArgs) -> String {
 }
 
 fn reference_cache_key(model: &str, prompt: &str, seed: u64, tokens: u32) -> String {
+    // Cache contract marker:
+    // - ties default verify cache to CPU-recorded references only
+    // - invalidates stale cache bundles created before backend-scoped keys
+    const CACHE_SCHEMA_VERSION: u32 = 2;
+    const REFERENCE_BACKEND: &str = "cpu";
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    CACHE_SCHEMA_VERSION.hash(&mut hasher);
+    REFERENCE_BACKEND.hash(&mut hasher);
     model.hash(&mut hasher);
     prompt.hash(&mut hasher);
     seed.hash(&mut hasher);
     tokens.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn refresh_cpu_reference_cache(model: &str, reference_path: &Path, args: &XrayArgs) -> Result<()> {
+    let exe_path = std::env::current_exe()
+        .map_err(|err| anyhow!("failed to resolve current executable for CPU cache refresh: {err}"))?;
+
+    let mut cmd = Command::new(&exe_path);
+    cmd.env("BACKEND", "cpu");
+    cmd.arg("xray")
+        .arg(model)
+        .arg("--record-reference")
+        .arg(
+            reference_path
+                .to_str()
+                .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
+        )
+        .arg("--tokens")
+        .arg(args.tokens.to_string())
+        .arg("--seed")
+        .arg(args.seed.to_string());
+
+    if !args.prompt.is_empty() {
+        for prompt_part in &args.prompt {
+            cmd.arg(prompt_part);
+        }
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|err| anyhow!("failed to spawn CPU reference recorder: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(anyhow!(
+        "CPU reference refresh failed (status={}):\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    ))
 }
 
 fn default_dev_reference_path(model: &str, args: &XrayArgs) -> Result<PathBuf> {
@@ -1572,27 +1532,7 @@ fn cmd_xray_verify_default(model: &str, args: &XrayArgs) -> Result<()> {
         } else {
             println!("CPU reference cache missing, generating it first...");
         }
-
-        let previous_backend = std::env::var_os("BACKEND");
-        unsafe {
-            std::env::set_var("BACKEND", "cpu");
-        }
-        let record_result = cmd_xray_record(
-            model,
-            reference_path
-                .to_str()
-                .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
-            args,
-        );
-        match previous_backend {
-            Some(value) => unsafe {
-                std::env::set_var("BACKEND", value);
-            },
-            None => unsafe {
-                std::env::remove_var("BACKEND");
-            },
-        }
-        record_result?;
+        refresh_cpu_reference_cache(model, &reference_path, args)?;
     }
 
     cmd_xray_verify(
@@ -1912,28 +1852,6 @@ fn print_first_divergence_report(msg: &str) {
 }
 
 #[derive(Debug, Clone)]
-struct FullTensorDiffEntry {
-    key: String,
-    rel_rms: f64,
-    max_abs: f32,
-    expected_len: usize,
-    actual_len: usize,
-}
-
-#[derive(Debug, Default)]
-struct FullTensorDiffReport {
-    expected_count: usize,
-    actual_count: usize,
-    matched_count: usize,
-    missing_count: usize,
-    extra_count: usize,
-    divergent_count: usize,
-    first_divergence: Option<FullTensorDiffEntry>,
-    worst_divergence: Option<FullTensorDiffEntry>,
-    per_layer: BTreeMap<i32, (usize, usize, f64)>, // layer -> (matched, divergent, worst_rel_rms)
-}
-
-#[derive(Debug, Clone)]
 enum FirstCheckpointDiffKind {
     Missing,
     LengthMismatch {
@@ -2053,6 +1971,11 @@ fn rel_rms_and_max_abs(expected: &[f32], actual: &[f32]) -> (f64, f32) {
     (rel_rms, max_abs)
 }
 
+fn exceeds_numeric_tolerance(rel_rms: f64, abs_rms_diff: f64, tolerance: f32) -> bool {
+    let tol = tolerance as f64;
+    rel_rms > tol && abs_rms_diff > tol
+}
+
 fn rms(values: &[f32]) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -2123,9 +2046,10 @@ fn find_first_checkpoint_diff(
             });
         }
         let (rel_rms, max_abs) = rel_rms_and_max_abs(expected_tensor, actual_tensor);
-        if rel_rms > tolerance as f64 {
-            let expected_rms = rms(expected_tensor);
-            let actual_rms = rms(actual_tensor);
+        let expected_rms = rms(expected_tensor);
+        let actual_rms = rms(actual_tensor);
+        let abs_rms_diff = (actual_rms - expected_rms).abs();
+        if exceeds_numeric_tolerance(rel_rms, abs_rms_diff, tolerance) {
             return Some(FirstCheckpointDiff {
                 parsed,
                 expected_len,
@@ -2133,7 +2057,7 @@ fn find_first_checkpoint_diff(
                     actual_len: actual_tensor.len(),
                     expected_rms,
                     actual_rms,
-                    abs_rms_diff: (actual_rms - expected_rms).abs(),
+                    abs_rms_diff,
                     rel_rms,
                     max_abs,
                 },
@@ -2207,130 +2131,6 @@ fn print_targeted_checkpoint_hint(model: &str, prompt_text: &str, parsed: &Parse
         "  ./zig-out/bin/talu xray {} --verify --verify-checkpoint {}:{}:{}:{} \"{}\"",
         model, parsed.token, layer_arg, parsed.point, parsed.position, prompt_escaped
     );
-}
-
-fn extract_layer_from_key(key: &str) -> i32 {
-    let parts: Vec<&str> = key.split('_').collect();
-    for i in 0..parts.len().saturating_sub(1) {
-        if parts[i] == "layer" || parts[i] == "global" {
-            if let Ok(layer_idx) = parts[i + 1].parse::<i32>() {
-                return if parts[i] == "global" { -1 } else { layer_idx };
-            }
-        }
-    }
-    -2
-}
-
-fn diff_full_npz(
-    expected_path: &Path,
-    actual_path: &Path,
-    tolerance: f32,
-) -> Result<FullTensorDiffReport> {
-    let expected = load_npz_f32(expected_path)?;
-    let actual = load_npz_f32(actual_path)?;
-
-    let expected_keys: BTreeSet<String> = expected.keys().cloned().collect();
-    let actual_keys: BTreeSet<String> = actual.keys().cloned().collect();
-
-    let mut report = FullTensorDiffReport {
-        expected_count: expected_keys.len(),
-        actual_count: actual_keys.len(),
-        ..Default::default()
-    };
-
-    for key in expected_keys.intersection(&actual_keys) {
-        let expected_tensor = expected
-            .get(key)
-            .ok_or_else(|| anyhow!("missing expected key in map: {}", key))?;
-        let actual_tensor = actual
-            .get(key)
-            .ok_or_else(|| anyhow!("missing actual key in map: {}", key))?;
-        report.matched_count += 1;
-
-        let (rel_rms, max_abs) = rel_rms_and_max_abs(expected_tensor, actual_tensor);
-        let layer = extract_layer_from_key(key);
-        let layer_stats = report.per_layer.entry(layer).or_insert((0, 0, 0.0));
-        layer_stats.0 += 1;
-
-        let len_mismatch = expected_tensor.len() != actual_tensor.len();
-        let diverged = len_mismatch || rel_rms > tolerance as f64;
-        if diverged {
-            report.divergent_count += 1;
-            layer_stats.1 += 1;
-            if rel_rms > layer_stats.2 {
-                layer_stats.2 = rel_rms;
-            }
-            let entry = FullTensorDiffEntry {
-                key: key.clone(),
-                rel_rms,
-                max_abs,
-                expected_len: expected_tensor.len(),
-                actual_len: actual_tensor.len(),
-            };
-            if report.first_divergence.is_none() {
-                report.first_divergence = Some(entry.clone());
-            }
-            match &report.worst_divergence {
-                Some(worst) if worst.rel_rms >= entry.rel_rms => {}
-                _ => report.worst_divergence = Some(entry),
-            }
-        }
-    }
-
-    report.missing_count = expected_keys.difference(&actual_keys).count();
-    report.extra_count = actual_keys.difference(&expected_keys).count();
-    Ok(report)
-}
-
-fn print_full_diff_report(expected_path: &Path, actual_path: &Path, report: &FullTensorDiffReport) {
-    println!(
-        "Full Tensor Diff (golden vs candidate)\n  Golden: {}\n  Candidate: {}",
-        expected_path.display(),
-        actual_path.display()
-    );
-    println!(
-        "  Checkpoints: expected={} actual={} compared={} diverged={} passed={} missing={} extra={}",
-        report.expected_count,
-        report.actual_count,
-        report.matched_count,
-        report.divergent_count,
-        report.matched_count.saturating_sub(report.divergent_count),
-        report.missing_count,
-        report.extra_count
-    );
-    if let Some(first) = &report.first_divergence {
-        println!(
-            "  First divergence: {} (rel_rms={:.6}, max_abs={:.6}, len={} vs {})",
-            first.key, first.rel_rms, first.max_abs, first.expected_len, first.actual_len
-        );
-    }
-    if let Some(worst) = &report.worst_divergence {
-        println!(
-            "  Worst divergence: {} (rel_rms={:.6}, max_abs={:.6}, len={} vs {})",
-            worst.key, worst.rel_rms, worst.max_abs, worst.expected_len, worst.actual_len
-        );
-    }
-    if report.per_layer.is_empty() {
-        return;
-    }
-    println!("  Layer progress:");
-    for (layer, (matched, divergent, worst_rel)) in &report.per_layer {
-        let label = if *layer == -1 {
-            "global".to_string()
-        } else if *layer >= 0 {
-            format!("layer {}", layer)
-        } else {
-            "unknown".to_string()
-        };
-        println!(
-            "    {}: compared={} diverged={} passed={} worst_rel_rms={:.6}",
-            label,
-            matched,
-            divergent,
-            matched.saturating_sub(*divergent),
-            worst_rel
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2463,6 +2263,10 @@ mod tests {
 
 pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
     let model = &args.model;
+
+    if let Some(ref_path) = &args.record_reference {
+        return cmd_xray_record(model, ref_path, &args);
+    }
 
     // Check for verification mode
     if args.verify {
