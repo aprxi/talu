@@ -395,13 +395,18 @@ comptime {
     _ = &capi.talu_db_kv_init;
     _ = &capi.talu_db_kv_free;
     _ = &capi.talu_db_kv_put;
+    _ = &capi.talu_db_kv_put_ex;
     _ = &capi.talu_db_kv_get;
     _ = &capi.talu_db_kv_delete;
     _ = &capi.talu_db_kv_list;
     _ = &capi.talu_db_kv_free_value;
     _ = &capi.talu_db_kv_free_list;
     _ = &capi.talu_db_kv_flush;
+    _ = &capi.talu_db_kv_flush_batched;
     _ = &capi.talu_db_kv_compact;
+    _ = &capi.talu_db_kv_stats;
+    _ = &capi.talu_db_kv_watch_drain;
+    _ = &capi.talu_db_kv_free_watch_batch;
 
     // Vector DB idempotent write API
     _ = &capi.talu_db_vector_append_idempotent_ex;

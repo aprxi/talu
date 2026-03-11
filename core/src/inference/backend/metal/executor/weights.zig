@@ -1611,7 +1611,9 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 .bf16 => {
                     const lm_len = lm_head_tensor.data_size / 2;
                     const lm_ptr: [*]align(1) const u16 = @ptrCast(lm_head_tensor.data_ptr);
-                    weight_handles.lm_head = mlx_graph.createArrayBF16DenseWeightUnaligned(lm_ptr, lm_len, lm_shape);
+                    // Keep LM-head in BF16 to preserve source-model numeric behavior.
+                    // Downcasting to F16 here introduces avoidable logits drift versus CPU.
+                    weight_handles.lm_head = mlx_graph.createArrayBF16Unaligned(lm_ptr, lm_len, lm_shape);
                 },
                 .f16 => {
                     const lm_len = lm_head_tensor.data_size / 2;
@@ -1816,18 +1818,19 @@ fn loadQuantizedWeight(tensor: *const Tensor, bits: usize) !WeightHandles.Quanti
     const scales_ptr = @as([*]align(1) const u16, @ptrCast(gaffine_meta.scales.ptr));
     const scales_shape = [_]usize{ row_count, group_count };
 
-    // Keep quantized affine params on compute-native f16 at load time.
-    // This removes first-use BF16->F16 cast work from prefill/decode hot paths.
+    // Preserve source quantization-param dtype for grouped-affine parity.
+    // CPU consumes BF16 scales/biases as BF16->F32; forcing F16 here can
+    // introduce small but token-visible drift at lm_head.
     const scales = if (gaffine_meta.scales_dtype == .f16)
         mlx_graph.mlx_array_from_float16(scales_ptr, &scales_shape, 2)
     else
-        mlx_graph.mlx_array_from_bfloat16_dense_weight(scales_ptr, &scales_shape, 2);
+        mlx_graph.mlx_array_from_bfloat16(scales_ptr, &scales_shape, 2);
 
     const biases_ptr = @as([*]align(1) const u16, @ptrCast(gaffine_meta.biases.ptr));
     const biases = if (gaffine_meta.scales_dtype == .f16)
         mlx_graph.mlx_array_from_float16(biases_ptr, &scales_shape, 2)
     else
-        mlx_graph.mlx_array_from_bfloat16_dense_weight(biases_ptr, &scales_shape, 2);
+        mlx_graph.mlx_array_from_bfloat16(biases_ptr, &scales_shape, 2);
 
     return .{
         .weights = packed_weights,

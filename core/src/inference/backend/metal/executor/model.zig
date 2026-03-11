@@ -148,10 +148,6 @@ fn traceLastHiddenVector(
     }
 }
 
-fn xrayVerifyModeEnabled() bool {
-    return std.posix.getenv("TALU_XRAY_VERIFY_MODE") != null;
-}
-
 fn emitBlockOutHostTrace(
     allocator: std.mem.Allocator,
     hidden: ArrayHandle,
@@ -400,7 +396,7 @@ pub const Model = struct {
                 hidden = mlx_graph.mlx_lazy_add(hidden, deepstack_layer_additions[layer_idx]);
             }
 
-            if (trace.isEnabled() and xrayVerifyModeEnabled()) {
+            if (trace.isEnabled()) {
                 try emitBlockOutHostTrace(
                     allocator,
                     hidden,

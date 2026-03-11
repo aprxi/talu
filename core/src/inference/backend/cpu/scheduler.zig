@@ -379,10 +379,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             return @intCast(sampled);
         }
 
-        fn parityDebugEnabled() bool {
-            return std.posix.getenv("TALU_PARITY_DEBUG") != null;
-        }
-
         const ParityTopLogit = struct {
             token_id: u32 = 0,
             value: f32 = -std.math.inf(f32),

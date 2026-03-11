@@ -118,6 +118,9 @@ pub fn sweepUnreferencedBlobsWithOptions(
     // Mark phase 2: dynamic tables (generic VARBYTES scanning).
     try markDynamicTableBlobRefs(allocator, db_root, &digests, &stats.invalid_reference_count);
 
+    // Mark phase 3: KV namespaces (generic VARBYTES scanning).
+    try markDynamicKvBlobRefs(allocator, db_root, &digests, &stats.invalid_reference_count);
+
     stats.referenced_blob_count = digests.count();
 
     // Sweep phase.
@@ -347,6 +350,33 @@ fn markDynamicTableBlobRefs(
     }
 }
 
+/// Discover namespaces under `kv/` and mark blob refs from KV values.
+fn markDynamicKvBlobRefs(
+    allocator: Allocator,
+    db_root: []const u8,
+    digests: *DigestSet,
+    invalid_ref_count: *usize,
+) !void {
+    var store = try db_blob_store.BlobStore.init(allocator, db_root);
+    defer store.deinit();
+
+    const kv_path = try std.fmt.allocPrint(allocator, "{s}/kv", .{db_root});
+    defer allocator.free(kv_path);
+
+    var kv_dir = std.fs.cwd().openDir(kv_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer kv_dir.close();
+
+    var ns_iter = kv_dir.iterate();
+    while (try ns_iter.next()) |ns_entry| {
+        if (ns_entry.kind != .directory) continue;
+        try markBlockRefsGeneric(allocator, kv_path, ns_entry.name, &store, digests, invalid_ref_count);
+        try markWalRefsGeneric(allocator, kv_path, ns_entry.name, &store, digests, invalid_ref_count);
+    }
+}
+
 fn isBuiltinTable(name: []const u8) bool {
     for (builtin_policies) |policy| {
         if (std.mem.eql(u8, name, policy.table_name)) return true;
@@ -559,7 +589,7 @@ fn isBlobRefCandidate(value: []const u8) bool {
     return (value.len == db_blob_store.sha256_ref_len and
         std.mem.startsWith(u8, value, db_blob_store.sha256_ref_prefix)) or
         (value.len == db_blob_store.multipart_ref_len and
-        std.mem.startsWith(u8, value, db_blob_store.multipart_ref_prefix));
+            std.mem.startsWith(u8, value, db_blob_store.multipart_ref_prefix));
 }
 
 // =============================================================================
@@ -922,6 +952,33 @@ fn appendPayloadRow(
     defer allocator.free(tbl_root);
 
     var writer = try db_writer.Writer.open(allocator, tbl_root, namespace);
+    writer.durability = .full;
+
+    const col = db_writer.ColumnValue{
+        .column_id = col_payload,
+        .shape = .VARBYTES,
+        .phys_type = .BINARY,
+        .encoding = .KVBUF,
+        .dims = 1,
+        .data = payload,
+    };
+    try writer.appendRow(schema_id, &.{col});
+    if (flush) try writer.flushBlock();
+    return writer;
+}
+
+fn appendKvPayloadRow(
+    allocator: Allocator,
+    db_root: []const u8,
+    namespace: []const u8,
+    schema_id: u16,
+    payload: []const u8,
+    flush: bool,
+) !db_writer.Writer {
+    const kv_root = try std.fmt.allocPrint(allocator, "{s}/kv", .{db_root});
+    defer allocator.free(kv_root);
+
+    var writer = try db_writer.Writer.open(allocator, kv_root, namespace);
     writer.durability = .full;
 
     const col = db_writer.ColumnValue{
@@ -1309,6 +1366,81 @@ test "sweepUnreferencedBlobs discovers WAL blobs in dynamic tables" {
     const keep = try store.readAll(wal_blob.refSlice(), allocator);
     defer allocator.free(keep);
     try std.testing.expectEqualStrings("dynamic-wal-ref", keep);
+    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
+}
+
+test "sweepUnreferencedBlobs discovers blobs in kv namespaces" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const kv_blob = try store.put("kv-block-ref");
+    const orphan_blob = try store.put("kv-block-orphan");
+
+    {
+        var pw = kvbuf.KvBufWriter.init();
+        defer pw.deinit(allocator);
+        try pw.addString(allocator, 77, kv_blob.refSlice());
+        const payload = try pw.finish(allocator);
+        defer allocator.free(payload);
+        var writer = try appendKvPayloadRow(allocator, root_path, "collab", 20, payload, true);
+        writer.deinit();
+    }
+
+    const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
+        .min_blob_age_seconds = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats.referenced_blob_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.deleted_blob_files);
+
+    const keep = try store.readAll(kv_blob.refSlice(), allocator);
+    defer allocator.free(keep);
+    try std.testing.expectEqualStrings("kv-block-ref", keep);
+    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
+}
+
+test "sweepUnreferencedBlobs discovers WAL blobs in kv namespaces" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const wal_blob = try store.put("kv-wal-ref");
+    const orphan_blob = try store.put("kv-wal-orphan");
+
+    var wal_writer: ?db_writer.Writer = null;
+    defer if (wal_writer) |*w| w.deinit();
+    {
+        var pw = kvbuf.KvBufWriter.init();
+        defer pw.deinit(allocator);
+        try pw.addString(allocator, 88, wal_blob.refSlice());
+        const payload = try pw.finish(allocator);
+        defer allocator.free(payload);
+        wal_writer = try appendKvPayloadRow(allocator, root_path, "collab", 20, payload, false);
+    }
+
+    const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
+        .min_blob_age_seconds = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats.referenced_blob_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.deleted_blob_files);
+
+    const keep = try store.readAll(wal_blob.refSlice(), allocator);
+    defer allocator.free(keep);
+    try std.testing.expectEqualStrings("kv-wal-ref", keep);
     try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
 }
 

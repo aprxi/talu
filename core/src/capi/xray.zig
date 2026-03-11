@@ -642,6 +642,28 @@ pub export fn talu_xray_verify_capture_disable() callconv(.c) void {
     xray.disableVerifyCapture();
 }
 
+/// Set transcript-only override for token parity checks in verification mode.
+/// This is observability-only and must not change backend execution paths.
+pub export fn talu_xray_verify_set_ignore_token_parity(enabled: bool) callconv(.c) void {
+    xray.setVerifyIgnoreTokenParityOverride(enabled);
+}
+
+/// Clear transcript-only token parity override (fall back to environment/default).
+pub export fn talu_xray_verify_clear_ignore_token_parity_override() callconv(.c) void {
+    xray.clearVerifyIgnoreTokenParityOverride();
+}
+
+/// Set capture-only token-only verification mode.
+/// This is observability-only and must not change backend execution paths.
+pub export fn talu_xray_verify_set_token_only(enabled: bool) callconv(.c) void {
+    xray.setVerifyTokenOnlyOverride(enabled);
+}
+
+/// Clear token-only verification override (fall back to environment/default).
+pub export fn talu_xray_verify_clear_token_only_override() callconv(.c) void {
+    xray.clearVerifyTokenOnlyOverride();
+}
+
 /// Persist full CPU tensor sidecar captured in recording mode to NPZ.
 /// Returns false on error (check talu_error_message).
 pub export fn talu_xray_verify_capture_save_recording_full_npz(

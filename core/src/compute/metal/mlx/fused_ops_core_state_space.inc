@@ -630,7 +630,7 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
     threadgroup float3 stats_shared[D_HEAD];
-    threadgroup float reduce_shared[D_HEAD];
+    threadgroup float out_shared[D_HEAD];
     threadgroup float scalar_shared[4];
 
     const uint vec_base = head * D_HEAD;
@@ -648,8 +648,8 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0) {
-      const float q_scale = rsqrt(stats_shared[0].x + eps) * rsqrt((float)D_HEAD);
-      const float k_scale = rsqrt(stats_shared[0].y + eps);
+      const float q_scale = (1.0f / sqrt(stats_shared[0].x + eps)) * (1.0f / sqrt((float)D_HEAD));
+      const float k_scale = 1.0f / sqrt(stats_shared[0].y + eps);
       scalar_shared[0] = stats_shared[0].z * q_scale * k_scale;
       scalar_shared[1] = k_scale;
       const float a = a_raw[head] + dt_bias[head];
@@ -685,16 +685,15 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
       next_state[state_index] = scaled + k_shared[i] * kv_mem;
     }
 
-    reduce_shared[lane] = out_value * out_value;
+    out_shared[lane] = out_value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
-      if (lane < offset) {
-        reduce_shared[lane] += reduce_shared[lane + offset];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
     if (lane == 0) {
-      scalar_shared[1] = rsqrt((reduce_shared[0] / (float)D_HEAD) + eps);
+      float sum_sq = 0.0f;
+      for (uint i = 0; i < D_HEAD; ++i) {
+        const float v = out_shared[i];
+        sum_sq += v * v;
+      }
+      scalar_shared[1] = 1.0f / sqrt((sum_sq / (float)D_HEAD) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -764,7 +763,7 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
     threadgroup float3 stats_shared[D_HEAD];
-    threadgroup float reduce_shared[D_HEAD];
+    threadgroup float out_shared[D_HEAD];
     threadgroup float scalar_shared[4];
 
     const uint vec_base = head * D_HEAD;
@@ -782,8 +781,8 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0) {
-      const float q_scale = rsqrt(stats_shared[0].x + eps) * rsqrt((float)D_HEAD);
-      const float k_scale = rsqrt(stats_shared[0].y + eps);
+      const float q_scale = (1.0f / sqrt(stats_shared[0].x + eps)) * (1.0f / sqrt((float)D_HEAD));
+      const float k_scale = 1.0f / sqrt(stats_shared[0].y + eps);
       scalar_shared[0] = stats_shared[0].z * q_scale * k_scale;
       scalar_shared[1] = k_scale;
       const float a = a_raw[head] + dt_bias[head];
@@ -820,16 +819,15 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
       next_state[state_index] = scaled + k_shared[i] * kv_mem;
     }
 
-    reduce_shared[lane] = out_value * out_value;
+    out_shared[lane] = out_value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
-      if (lane < offset) {
-        reduce_shared[lane] += reduce_shared[lane + offset];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
     if (lane == 0) {
-      scalar_shared[1] = rsqrt((reduce_shared[0] / (float)D_HEAD) + eps);
+      float sum_sq = 0.0f;
+      for (uint i = 0; i < D_HEAD; ++i) {
+        const float v = out_shared[i];
+        sum_sq += v * v;
+      }
+      scalar_shared[1] = 1.0f / sqrt((sum_sq / (float)D_HEAD) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1022,8 +1020,8 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_ssm_probe_kerne
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0) {
-      const float q_scale = rsqrt(stats_shared[0].x + eps) * rsqrt((float)D_HEAD);
-      const float k_scale = rsqrt(stats_shared[0].y + eps);
+      const float q_scale = (1.0f / sqrt(stats_shared[0].x + eps)) * (1.0f / sqrt((float)D_HEAD));
+      const float k_scale = 1.0f / sqrt(stats_shared[0].y + eps);
       scalar_shared[0] = stats_shared[0].z * q_scale * k_scale;
       scalar_shared[1] = k_scale;
       const float a = a_raw[head] + dt_bias[head];
@@ -1308,7 +1306,7 @@ static array layer_norm_last_dim(
     const auto x_mean = mean(x, -1, true);
     const auto centered = x - x_mean;
     const auto variance = mean(centered * centered, -1, true);
-    const auto inv_std = rsqrt(variance + eps);
+    const auto inv_std = 1.0f / sqrt(variance + eps);
     const auto normed = centered * inv_std;
     return normed * weight + bias;
 }
@@ -2514,8 +2512,11 @@ void* mlx_lazy_gated_delta_mixer_bf16(
             layer_state->hidden_dim != hidden_dim ||
             layer_state->d_inner != d_inner;
         if (need_proj_rhs_refresh) {
-            in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
-            out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+            // CPU BF16 linear kernels multiply f32 activations with BF16 weights
+            // while accumulating in f32. Keep parity by materializing RHS in f32
+            // so recurrent-path matmuls stay f32 end-to-end.
+            in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+            out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
             delete layer_state->in_proj_rhs;
             delete layer_state->out_proj_rhs;
             layer_state->in_proj_rhs = new array(in_proj_rhs);
@@ -2529,8 +2530,8 @@ void* mlx_lazy_gated_delta_mixer_bf16(
             out_proj_rhs = *layer_state->out_proj_rhs;
         }
     } else {
-        in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
-        out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+        in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+        out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
     }
     StateSpaceCallable in_proj_fn{
         .fn = state_space_apply_matmul_rhs,
@@ -2842,8 +2843,10 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
             layer_state->hidden_dim != hidden_dim ||
             layer_state->d_inner != d_inner;
         if (need_proj_rhs_refresh) {
-            in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
-            out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+            // Keep capture path numerically identical to non-capture BF16 path:
+            // recurrent-path projections use f32 activations and f32 RHS.
+            in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+            out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
             delete layer_state->in_proj_rhs;
             delete layer_state->out_proj_rhs;
             layer_state->in_proj_rhs = new array(in_proj_rhs);
@@ -2857,8 +2860,8 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
             out_proj_rhs = *layer_state->out_proj_rhs;
         }
     } else {
-        in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
-        out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+        in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+        out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
     }
     StateSpaceCallable in_proj_fn{
         .fn = state_space_apply_matmul_rhs,

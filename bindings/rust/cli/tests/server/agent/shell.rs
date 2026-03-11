@@ -41,6 +41,37 @@ fn strict_backend_available() -> bool {
     talu::shell::validate_strict_runtime_ext(backend, true, false, Some("/tmp")).is_ok()
 }
 
+fn strict_shell_open_available(policy_json: &str) -> bool {
+    let backend = if cfg!(target_os = "linux") {
+        talu::shell::SandboxBackend::LinuxLocal
+    } else if cfg!(target_os = "macos") {
+        talu::shell::SandboxBackend::AppleContainer
+    } else {
+        return false;
+    };
+    let policy = match talu::policy::Policy::from_json(policy_json) {
+        Ok(policy) => policy,
+        Err(_) => return false,
+    };
+    match talu::shell::ShellSession::open_with_policy_runtime(
+        80,
+        24,
+        None,
+        Some(&policy),
+        talu::shell::AgentRuntimeMode::Strict,
+        backend,
+    ) {
+        Ok(shell) => {
+            drop(shell);
+            true
+        }
+        Err(err) => {
+            eprintln!("Skipped: strict shell open unavailable in test environment: {err}");
+            false
+        }
+    }
+}
+
 fn gateway_config() -> ServerConfig {
     let mut cfg = ServerConfig::new();
     cfg.gateway_secret = Some("secret".to_string());
@@ -968,11 +999,6 @@ async fn agent_shell_ws_exit_event_on_shell_exit() {
 
 #[tokio::test]
 async fn agent_shell_ws_strict_mode_tui_less_smoke() {
-    if !strict_backend_available() {
-        eprintln!("Skipped: strict runtime backend unavailable in test environment");
-        return;
-    }
-
     let has_less = std::process::Command::new("sh")
         .arg("-c")
         .arg("command -v less >/dev/null 2>&1")
@@ -993,6 +1019,10 @@ async fn agent_shell_ws_strict_mode_tui_less_smoke() {
             {"effect":"allow","action":"tool.exec","command":"less *"}
         ]
     }"#;
+    if !strict_backend_available() || !strict_shell_open_available(policy) {
+        eprintln!("Skipped: strict runtime shell backend unavailable in test environment");
+        return;
+    }
     let ctx = ServerTestContext::new(config_with_strict_policy(policy));
     let shell_id = create_shell(&ctx);
     let mut ws = ws_connect(&ctx, &shell_id).await;
@@ -1021,11 +1051,6 @@ async fn agent_shell_ws_strict_mode_tui_less_smoke() {
 
 #[tokio::test]
 async fn agent_shell_ws_strict_mode_tui_vim_smoke() {
-    if !strict_backend_available() {
-        eprintln!("Skipped: strict runtime backend unavailable in test environment");
-        return;
-    }
-
     let has_vim = std::process::Command::new("sh")
         .arg("-c")
         .arg("command -v vim >/dev/null 2>&1")
@@ -1046,6 +1071,10 @@ async fn agent_shell_ws_strict_mode_tui_vim_smoke() {
             {"effect":"allow","action":"tool.exec","command":"vim *"}
         ]
     }"#;
+    if !strict_backend_available() || !strict_shell_open_available(policy) {
+        eprintln!("Skipped: strict runtime shell backend unavailable in test environment");
+        return;
+    }
     let ctx = ServerTestContext::new(config_with_strict_policy(policy));
     let shell_id = create_shell(&ctx);
     let mut ws = ws_connect(&ctx, &shell_id).await;

@@ -114,6 +114,12 @@ fn openapi_db_documented_operations_are_routable_through_http_dispatcher() {
         let concrete_path = materialize_db_path(template, &suffix);
 
         for method in methods.keys() {
+            // Streaming routes intentionally keep connections open; the generic
+            // dispatcher contract helper reads until EOF and is not suitable for
+            // these long-lived endpoints.
+            if method == "get" && template.ends_with("/watch") {
+                continue;
+            }
             let resp = request_for_method(ctx.addr(), method, &concrete_path);
 
             assert_ne!(

@@ -181,7 +181,10 @@ fn open_fs<'a>(
     state: &'a AppState,
     policy: Option<&talu::policy::Policy>,
 ) -> Result<(FsHandle, &'a Path), Response<BoxBody>> {
-    let workdir = state.workdir.as_deref().ok_or_else(missing_workdir_response)?;
+    let workdir = state
+        .workdir
+        .as_deref()
+        .ok_or_else(missing_workdir_response)?;
     FsHandle::open_with_policy(&workdir.to_string_lossy(), policy)
         .map(|handle| (handle, workdir))
         .map_err(|e| fs_error_response(e, "failed to initialize workdir fs"))

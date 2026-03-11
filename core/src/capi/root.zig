@@ -238,16 +238,24 @@ pub const KvHandle = db_kv.KvHandle;
 pub const CKvValue = db_kv.CKvValue;
 pub const CKvEntry = db_kv.CKvEntry;
 pub const CKvList = db_kv.CKvList;
+pub const CKvNamespaceStats = db_kv.CKvNamespaceStats;
+pub const CKvWatchEvent = db_kv.CKvWatchEvent;
+pub const CKvWatchBatch = db_kv.CKvWatchBatch;
 pub const talu_db_kv_init = db_kv.talu_db_kv_init;
 pub const talu_db_kv_free = db_kv.talu_db_kv_free;
 pub const talu_db_kv_put = db_kv.talu_db_kv_put;
+pub const talu_db_kv_put_ex = db_kv.talu_db_kv_put_ex;
 pub const talu_db_kv_get = db_kv.talu_db_kv_get;
 pub const talu_db_kv_delete = db_kv.talu_db_kv_delete;
 pub const talu_db_kv_list = db_kv.talu_db_kv_list;
 pub const talu_db_kv_free_value = db_kv.talu_db_kv_free_value;
 pub const talu_db_kv_free_list = db_kv.talu_db_kv_free_list;
 pub const talu_db_kv_flush = db_kv.talu_db_kv_flush;
+pub const talu_db_kv_flush_batched = db_kv.talu_db_kv_flush_batched;
 pub const talu_db_kv_compact = db_kv.talu_db_kv_compact;
+pub const talu_db_kv_stats = db_kv.talu_db_kv_stats;
+pub const talu_db_kv_watch_drain = db_kv.talu_db_kv_watch_drain;
+pub const talu_db_kv_free_watch_batch = db_kv.talu_db_kv_free_watch_batch;
 
 // Re-export SQL C API functions.
 pub const talu_sql_query = sql_api.talu_sql_query;

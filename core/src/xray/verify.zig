@@ -23,7 +23,34 @@ const TraceCaptureConfig = capture_mod.TraceCaptureConfig;
 const ReferenceRecorder = reference_mod.ReferenceRecorder;
 const ReferenceVerifier = reference_mod.ReferenceVerifier;
 
-/// Mode for verification capture
+var ignore_token_parity_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var token_only_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// XRAY VERIFY CONTROL:
+/// These controls are observability/transcript-only switches.
+/// They MUST NOT alter backend route selection, fusion policy, or kernel math.
+pub fn setIgnoreTokenParityOverride(enabled: bool) void {
+    ignore_token_parity_enabled.store(enabled, .release);
+}
+
+pub fn clearIgnoreTokenParityOverride() void {
+    ignore_token_parity_enabled.store(false, .release);
+}
+
+pub fn setTokenOnlyOverride(enabled: bool) void {
+    token_only_enabled.store(enabled, .release);
+}
+
+pub fn clearTokenOnlyOverride() void {
+    token_only_enabled.store(false, .release);
+}
+
+/// Mode for verification capture.
+///
+/// XRAY VERIFY CONTRACT:
+/// - Verify is capture/compare orchestration only.
+/// - Verify controls transcript handling (teacher forcing / token parity checks).
+/// - Verify MUST NOT control backend route selection, fusion policy, or kernel math.
 pub const VerifyMode = enum {
     /// Recording mode: generate normally and capture stats
     record,
@@ -142,13 +169,15 @@ pub const VerifyCapture = struct {
     }
 
     fn ignoreTokenParity() bool {
-        const raw = std.posix.getenv("TALU_XRAY_VERIFY_IGNORE_TOKEN_PARITY") orelse return false;
-        return !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
+        // Transcript policy only. This flag is permitted because it changes
+        // verifier token-check behavior, not backend compute behavior.
+        return ignore_token_parity_enabled.load(.acquire);
     }
 
     fn tokenOnlyVerificationEnabled() bool {
-        const raw = std.posix.getenv("TALU_XRAY_VERIFY_TOKEN_ONLY") orelse return false;
-        return !(raw.len == 0 or (raw.len == 1 and raw[0] == '0'));
+        // Capture policy only. This must never be used as a backend execution
+        // switch (route/fusion/kernel selection).
+        return token_only_enabled.load(.acquire);
     }
 
     fn kernelNameSlice(name: [48]u8) []const u8 {
@@ -184,6 +213,12 @@ pub const VerifyCapture = struct {
 
     /// Handle a trace emission
     pub fn handleEmission(self: *VerifyCapture, emission: TraceEmission) void {
+        if (self.mode == .verify) {
+            if (self.verifier) |ver| {
+                if (ver.has_diverged) return;
+            }
+        }
+
         const is_token_select = emission.point == .token_select;
         const is_transcript_token_select = isTranscriptTokenSelect(emission);
 

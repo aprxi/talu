@@ -62,6 +62,7 @@ fn build_app() -> Router {
         shell_session_ttl: std::time::Duration::from_secs(15 * 60),
         process_sessions: Mutex::new(HashMap::new()),
         process_session_ttl: std::time::Duration::from_secs(15 * 60),
+        kv_handles: Mutex::new(HashMap::new()),
         agent_runtime_mode: AgentRuntimeMode::Host,
         sandbox_backend: SandboxBackend::LinuxLocal,
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use talu::kv::KvHandle;
 use talu::policy::Policy;
 use talu::InferenceBackend;
 
@@ -123,6 +124,8 @@ pub struct AppState {
     pub process_sessions: Mutex<HashMap<String, ProcessSession>>,
     /// Max idle time before a detached process session is evicted by the reaper.
     pub process_session_ttl: std::time::Duration,
+    /// Shared long-lived KV namespace handles keyed by `<root>\0<namespace>`.
+    pub kv_handles: Mutex<HashMap<String, Arc<Mutex<KvHandle>>>>,
     /// Agent terminal runtime mode (`host` vs `strict`).
     pub agent_runtime_mode: AgentRuntimeMode,
     /// Selected sandbox backend.

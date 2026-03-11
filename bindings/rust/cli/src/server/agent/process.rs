@@ -146,7 +146,10 @@ pub async fn handle_spawn(
     let runtime_mode = super::runtime_mode_for_talu(&state);
     let sandbox_backend = super::sandbox_backend_for_talu(state.sandbox_backend);
     let effective_cwd = if state.agent_runtime_mode == crate::server::AgentRuntimeMode::Strict {
-        request.cwd.clone().or_else(|| super::default_workdir(&state))
+        request
+            .cwd
+            .clone()
+            .or_else(|| super::default_workdir(&state))
     } else {
         request.cwd.clone()
     };
@@ -512,9 +515,13 @@ pub async fn handle_ws(
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
-                if let Err(err) =
-                    handle_ws_connection(state_for_ws.clone(), process_id.clone(), process, upgraded)
-                        .await
+                if let Err(err) = handle_ws_connection(
+                    state_for_ws.clone(),
+                    process_id.clone(),
+                    process,
+                    upgraded,
+                )
+                .await
                 {
                     log::warn!(target: "server::agent_process", "process ws {} ended with error: {}", process_id, err);
                 }
