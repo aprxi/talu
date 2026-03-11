@@ -326,7 +326,6 @@ pub const GatedDeltaKernel = struct {
             if (n_qk_heads == 0 or (n_v_heads % n_qk_heads) != 0) return error.InvalidShape;
 
             cpu_conv1d.runTimeMajorValues(qkv, conv_state, conv_weight_t, qkv, conv_bias, qkv_len, d_conv);
-            cpu_gated_delta.applySiluInPlace(qkv);
             if (trace_enabled) {
                 trace.emit(
                     .gdelta_conv,
@@ -340,6 +339,7 @@ pub const GatedDeltaKernel = struct {
                     null,
                 );
             }
+            cpu_gated_delta.applySiluInPlace(qkv);
 
             const query = qkv[0..qk_inner];
             const key = qkv[qk_inner .. 2 * qk_inner];
