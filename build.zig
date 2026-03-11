@@ -346,6 +346,9 @@ fn addMetalSupport(
     mod.addIncludePath(b.path("core/src/compute/metal"));
     mod.addIncludePath(b.path("core/src/compute/metal/mlx"));
     mod.addIncludePath(b.path("deps/mlx/include"));
+    artifact.addIncludePath(b.path("core/src/compute/metal"));
+    artifact.addIncludePath(b.path("core/src/compute/metal/mlx"));
+    artifact.addIncludePath(b.path("deps/mlx/include"));
 
     artifact.linkFramework("Metal");
     artifact.linkFramework("MetalPerformanceShaders");
@@ -782,6 +785,9 @@ pub fn build(b: *std.Build) void {
         \\  image
         \\  compute
         \\  inference
+        \\  inference-cpu
+        \\  inference-metal
+        \\  inference-cuda
         \\  agent
         \\
         \\Example: zig build test-db -Drelease
@@ -881,6 +887,15 @@ pub fn build(b: *std.Build) void {
         "Vision",
         "layer program",
     });
+    ut.addLazy("inference-cpu", b.path("core/src/lib.zig"), &.{
+        "inference.backend.cpu",
+    });
+    ut.addLazy("inference-metal", b.path("core/src/lib.zig"), &.{
+        "inference.backend.metal",
+    });
+    ut.addLazy("inference-cuda", b.path("core/src/lib.zig"), &.{
+        "inference.backend.cuda",
+    });
     ut.addLazy("agent", b.path("core/src/lib.zig"), &.{
         "ToolRegistry",
         "MessageBus",
@@ -968,6 +983,67 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
+
+    // Metal-focused inference integration tests (opt-in lane).
+    const integration_metal_step = b.step(
+        "test-integration-inference-metal",
+        "Run inference backend Metal integration tests",
+    );
+    if (target.result.os.tag == .macos and enable_metal) {
+        const integration_metal_build_options = b.addOptions();
+        integration_metal_build_options.addOption(bool, "enable_metal", true);
+        integration_metal_build_options.addOption(bool, "enable_cuda", enable_cuda);
+        integration_metal_build_options.addOption(bool, "cuda_startup_selftests", cuda_startup_selftests);
+        integration_metal_build_options.addOption(bool, "debug_matmul", debug_matmul);
+        integration_metal_build_options.addOption(bool, "dump_tensors", dump_tensors);
+        integration_metal_build_options.addOption([]const u8, "version", version);
+
+        const integration_metal_main_mod = b.createModule(.{
+            .root_source_file = b.path("core/src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        integration_metal_main_mod.addImport("cuda_assets", cuda_assets_mod);
+        integration_metal_main_mod.addOptions("build_options", integration_metal_build_options);
+        addCDependencies(b, integration_metal_main_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
+
+        const integration_metal_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/tests/inference/backend/metal/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "main", .module = integration_metal_main_mod },
+            },
+        });
+
+        const integration_metal_tests = b.addTest(.{
+            .name = "test-integration-inference-metal",
+            .root_module = integration_metal_test_mod,
+        });
+        linkCDependencies(b, integration_metal_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        addMetalSupport(b, integration_metal_main_mod, integration_metal_tests, true);
+        const install_integration_metal_tests = b.addInstallArtifact(integration_metal_tests, .{});
+
+        const run_integration_metal_tests = b.addSystemCommand(&.{
+            b.getInstallPath(.bin, "test-integration-inference-metal"),
+        });
+        run_integration_metal_tests.step.dependOn(&install_integration_metal_tests.step);
+        if (findMlxMetallib(b)) |mlx_metallib_path| {
+            run_integration_metal_tests.setEnvironmentVariable("MLX_METALLIB", mlx_metallib_path);
+        }
+        // Harden allocator diagnostics for intermittent heap corruption on Metal paths.
+        run_integration_metal_tests.setEnvironmentVariable("MallocScribble", "1");
+        run_integration_metal_tests.setEnvironmentVariable("MallocGuardEdges", "1");
+        run_integration_metal_tests.setEnvironmentVariable("MallocCheckHeapStart", "1");
+        run_integration_metal_tests.setEnvironmentVariable("MallocCheckHeapEach", "1");
+        integration_metal_step.dependOn(&run_integration_metal_tests.step);
+    } else {
+        integration_metal_step.dependOn(&FailStep.create(
+            b,
+            "test-integration-inference-metal requires macOS with Metal enabled (-Dmetal=true)\n",
+        ).step);
+    }
 
     // Models metadata report command:
     //   zig build models-report -- registry

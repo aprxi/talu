@@ -1,13 +1,219 @@
 //! Integration tests for inference.backend.metal.MetalBackend
 //!
 //! Note: MetalBackend is only available on macOS with Metal support.
-//! This test file verifies type accessibility.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const main = @import("main");
 
-test "metal backend placeholder test" {
-    // MetalBackend is only available on macOS
-    // This test verifies the test file exists for coverage
-    try std.testing.expect(true);
+const has_metal = builtin.os.tag == .macos;
+const metal = if (has_metal) main.inference.backend.metal else void;
+const runtime_contract = main.inference.runtime_contract;
+const weights = if (has_metal) main.inference.backend.metal.executor.weights else void;
+const xray = main.xray;
+
+fn pathExists(path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.accessAbsolute(path, .{}) catch return false;
+        return true;
+    }
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+fn resolveMlxMetallibPath() ?[]const u8 {
+    const env = std.posix.getenv("MLX_METALLIB");
+    if (env) |value| {
+        const raw = std.mem.sliceTo(value, 0);
+        if (raw.len > 0 and pathExists(raw)) return raw;
+    }
+
+    const candidates = [_][]const u8{
+        "zig-out/bin/mlx.metallib",
+        "zig-out/lib/mlx.metallib",
+        "deps/mlx/lib/mlx.metallib",
+        "deps/mlx-src/build/mlx/backend/metal/kernels/mlx.metallib",
+        "/opt/homebrew/bin/mlx.metallib",
+        "/usr/local/bin/mlx.metallib",
+    };
+    for (candidates) |candidate| {
+        if (pathExists(candidate)) return candidate;
+    }
+    return null;
+}
+
+fn canRunMetalRuntime() bool {
+    if (comptime !has_metal) return false;
+    if (!metal.isAvailable()) return false;
+    const metallib = resolveMlxMetallibPath() orelse return false;
+
+    const allocator = std.testing.allocator;
+    const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch return false;
+    defer allocator.free(exe_dir);
+    const colocated = std.fs.path.join(allocator, &.{ exe_dir, "mlx.metallib" }) catch return false;
+    defer allocator.free(colocated);
+
+    if (!pathExists(colocated)) {
+        const metallib_abs = if (std.fs.path.isAbsolute(metallib))
+            metallib
+        else
+            (std.fs.cwd().realpathAlloc(allocator, metallib) catch return false);
+        defer if (!std.fs.path.isAbsolute(metallib)) allocator.free(metallib_abs);
+
+        std.fs.copyFileAbsolute(metallib_abs, colocated, .{}) catch return false;
+    }
+    return true;
+}
+
+const BoundSlotState = struct {
+    allocator: std.mem.Allocator,
+    backend: *metal.MetalBackend,
+    slot_index: usize,
+    buffers: [runtime_contract.max_state_descriptors][]align(64) u8 = undefined,
+    count: usize = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        backend: *metal.MetalBackend,
+        slot_index: usize,
+    ) !BoundSlotState {
+        var bound = BoundSlotState{
+            .allocator = allocator,
+            .backend = backend,
+            .slot_index = slot_index,
+        };
+        errdefer bound.deinit();
+
+        const descriptors = backend.stateDescriptors();
+        if (descriptors.len == 0) return bound;
+
+        var handles: [runtime_contract.max_state_descriptors]runtime_contract.StateBlockHandle = undefined;
+        for (descriptors, 0..) |descriptor, idx| {
+            if (descriptor.align_bytes > 64) return error.InvalidStateDescriptorBinding;
+            const bytes_u64 = @max(descriptor.size_bytes, runtime_contract.builtin_state_block_bytes);
+            const bytes: usize = @intCast(bytes_u64);
+            const storage = try allocator.alignedAlloc(u8, .@"64", bytes);
+            @memset(storage, 0);
+            bound.buffers[idx] = storage;
+            bound.count += 1;
+
+            handles[idx] = .{
+                .id = descriptor.id,
+                .ptr = storage.ptr,
+                .size = bytes_u64,
+                .align_bytes = 64,
+            };
+        }
+
+        try backend.bindSlotStateBlocks(slot_index, handles[0..descriptors.len]);
+        return bound;
+    }
+
+    fn deinit(self: *BoundSlotState) void {
+        self.backend.unbindSlotStateBlocks(self.slot_index);
+        for (self.buffers[0..self.count]) |buf| self.allocator.free(buf);
+        self.count = 0;
+    }
+};
+
+test "metal backend init/prefill/decode lifecycle is stable across repeated iterations" {
+    if (!canRunMetalRuntime()) return;
+
+    const allocator = std.testing.allocator;
+    const iterations: usize = 24;
+
+    for (0..iterations) |_| {
+        const loaded = try weights.createTestLoadedModel(allocator);
+        defer weights.destroyTestLoadedModel(allocator, loaded);
+        loaded.runtime.architecture_id = "qwen3";
+
+        var backend = try metal.MetalBackend.init(allocator, loaded);
+        defer backend.deinit();
+
+        var bound_state = try BoundSlotState.init(allocator, &backend, 0);
+        defer bound_state.deinit();
+
+        const vocab_size = backend.vocabSize();
+        const logits = try allocator.alloc(f32, vocab_size);
+        defer allocator.free(logits);
+
+        try backend.prefill(&[_]u32{ 1, 2, 3 }, logits);
+        const pos = backend.getPosition(0);
+        try std.testing.expectEqual(@as(usize, 3), pos);
+        try backend.decode(4, pos, logits);
+    }
+}
+
+test "metal backend slot allocate/free churn is stable" {
+    if (!canRunMetalRuntime()) return;
+
+    const allocator = std.testing.allocator;
+    const loaded = try weights.createTestLoadedModel(allocator);
+    defer weights.destroyTestLoadedModel(allocator, loaded);
+    loaded.runtime.architecture_id = "qwen3";
+
+    var backend = try metal.MetalBackend.init(allocator, loaded);
+    defer backend.deinit();
+
+    // Repeated slot churn exercises reset/free paths that are easy to get
+    // wrong and can cause sporadic heap corruption.
+    for (0..64) |_| {
+        const slot = backend.allocSlot() orelse return error.TestUnexpectedResult;
+        backend.freeSlot(slot);
+    }
+}
+
+test "metal backend xray record+verify capture path is stable under repeated runs" {
+    if (!canRunMetalRuntime()) return;
+
+    const allocator = std.testing.allocator;
+    const iterations: usize = 20;
+
+    for (0..iterations) |_| {
+        const loaded = try weights.createTestLoadedModel(allocator);
+        defer weights.destroyTestLoadedModel(allocator, loaded);
+        loaded.runtime.architecture_id = "qwen3";
+
+        var backend = try metal.MetalBackend.init(allocator, loaded);
+        defer backend.deinit();
+
+        var bound_state = try BoundSlotState.init(allocator, &backend, 0);
+        defer bound_state.deinit();
+
+        const vocab_size = backend.vocabSize();
+        const logits = try allocator.alloc(f32, vocab_size);
+        defer allocator.free(logits);
+
+        var recorder = try xray.ReferenceRecorder.init(allocator, "metal-test", 42, 1.0, 8);
+        defer recorder.deinit();
+        {
+            var record_capture = xray.VerifyCapture.initRecording(allocator, &recorder);
+            defer record_capture.deinit();
+
+            xray.enableVerifyCapture(&record_capture);
+            defer xray.disableVerifyCapture();
+
+            try backend.prefill(&[_]u32{ 1, 2, 3, 4 }, logits);
+            try backend.decode(5, backend.getPosition(0), logits);
+            try backend.decode(6, backend.getPosition(0), logits);
+        }
+
+        var ref_data = try recorder.finalize();
+        defer ref_data.deinit();
+
+        var verifier = xray.ReferenceVerifier.init(allocator, &ref_data, 1e-3);
+        defer verifier.deinit();
+        {
+            var verify_capture = xray.VerifyCapture.initVerification(allocator, &verifier, null);
+            defer verify_capture.deinit();
+
+            xray.enableVerifyCapture(&verify_capture);
+            defer xray.disableVerifyCapture();
+
+            try backend.prefill(&[_]u32{ 1, 2, 3, 4 }, logits);
+            try backend.decode(5, backend.getPosition(0), logits);
+            try backend.decode(6, backend.getPosition(0), logits);
+        }
+        try verifier.finish();
+    }
 }

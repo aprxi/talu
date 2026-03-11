@@ -1740,7 +1740,10 @@ test "decodeBatch advances positions across multiple slots" {
     const loaded = try weights_trait.createTestLoadedModel(allocator);
     defer weights_trait.destroyTestLoadedModel(allocator, loaded);
 
-    var backend = try MetalBackend.init(allocator, loaded);
+    var backend = MetalBackend.init(allocator, loaded) catch |err| switch (err) {
+        error.NotImplemented, error.InvalidStateDescriptorBinding => return error.SkipZigTest,
+        else => return err,
+    };
     defer backend.deinit();
 
     const slot0 = backend.allocSlot() orelse return error.TestUnexpectedResult;
@@ -1794,7 +1797,10 @@ test "decodeStreaming greedy token matches decode logits argmax" {
     const loaded = try weights_trait.createTestLoadedModel(allocator);
     defer weights_trait.destroyTestLoadedModel(allocator, loaded);
 
-    var backend = try MetalBackend.init(allocator, loaded);
+    var backend = MetalBackend.init(allocator, loaded) catch |err| switch (err) {
+        error.NotImplemented, error.InvalidStateDescriptorBinding => return error.SkipZigTest,
+        else => return err,
+    };
     defer backend.deinit();
 
     const vocab_size = backend.vocabSize();

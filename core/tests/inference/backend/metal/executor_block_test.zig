@@ -2,10 +2,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const main = @import("main");
 
-const has_metal = build_options.enable_metal and builtin.os.tag == .macos;
+const has_metal = builtin.os.tag == .macos;
 const TransformerBlock = if (has_metal) main.inference.backend.metal.executor.block.TransformerBlock else void;
 
 test "TransformerBlock.forward symbol exists" {
