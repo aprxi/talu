@@ -42,6 +42,7 @@ pub const gaffine_u4_matvec = @import("gaffine_u4_matvec.zig");
 pub const gaffine_u4_matvec_gate_up = @import("gaffine_u4_matvec_gate_up.zig");
 pub const gaffine_u4_matvec_qkv = @import("gaffine_u4_matvec_qkv.zig");
 pub const shortconv_step = @import("shortconv_step.zig");
+pub const gated_delta_conv = @import("gated_delta_conv.zig");
 pub const gated_delta_ssm = @import("gated_delta_ssm.zig");
 pub const matmul_u16 = @import("matmul_u16.zig");
 
@@ -97,6 +98,7 @@ test {
     _ = gaffine_u4_matvec_gate_up;
     _ = gaffine_u4_matvec_qkv;
     _ = shortconv_step;
+    _ = gated_delta_conv;
     _ = gated_delta_ssm;
     _ = matmul_u16;
 }
