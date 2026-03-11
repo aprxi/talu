@@ -11,3 +11,4 @@
 #include "ops/matvec_ops.cu"
 #include "ops/quant_ops.cu"
 #include "ops/shortconv_ops.cu"
+#include "ops/gated_delta_ops.cu"

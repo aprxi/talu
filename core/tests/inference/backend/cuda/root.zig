@@ -18,5 +18,6 @@ test "cuda backend type is available when enabled" {
 }
 
 test {
+    _ = @import("gated_delta_ssm_test.zig");
     std.testing.refAllDecls(@This());
 }

@@ -9,7 +9,7 @@ pub const PrimitiveCapabilities = struct {
     memory: bool = true,
     indexing: bool = false,
     quant_decode: bool = false,
-    state_space: bool = false,
+    state_space: bool = true,
 };
 
 pub const support: PrimitiveCapabilities = .{};
