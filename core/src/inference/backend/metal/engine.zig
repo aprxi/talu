@@ -204,7 +204,7 @@ pub const MetalBackend = struct {
                 .f32,
                 .{ @intCast(self.vocab_size), 0, 0, 0 },
                 1,
-                "matmul_lm_head",
+                "metal_lm_head_host",
             );
             trace.emitFinal(
                 .logits_scaled,
@@ -214,7 +214,7 @@ pub const MetalBackend = struct {
                 .f32,
                 .{ @intCast(self.vocab_size), 0, 0, 0 },
                 1,
-                null,
+                "metal_logits_scaled_host",
             );
             return;
         }
@@ -227,7 +227,7 @@ pub const MetalBackend = struct {
             .f32,
             .{ @intCast(self.vocab_size), 0, 0, 0 },
             1,
-            "matmul_lm_head",
+            "metal_lm_head_host",
         );
     }
 
