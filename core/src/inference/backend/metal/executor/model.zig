@@ -9,6 +9,8 @@ const compute = @import("../../../../compute/root.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const block_executor = @import("block.zig");
+const inspect = @import("../../../../xray/root.zig");
+const trace = inspect.trace;
 
 const ArrayHandle = compute.metal.graph.ArrayHandle;
 const mlx_graph = compute.metal.graph;
@@ -146,6 +148,75 @@ fn traceLastHiddenVector(
     }
 }
 
+fn xrayVerifyModeEnabled() bool {
+    return std.posix.getenv("TALU_XRAY_VERIFY_MODE") != null;
+}
+
+fn emitBlockOutHostTrace(
+    allocator: std.mem.Allocator,
+    hidden: ArrayHandle,
+    layer_idx: usize,
+    fallback_seq_len: usize,
+    fallback_d_model: usize,
+) !void {
+    const MappedShape = struct {
+        batch: usize,
+        seq: usize,
+        width: usize,
+    };
+
+    var shape: [8]usize = undefined;
+    const rank = mlx_graph.getShape(hidden, &shape);
+    if (rank == 0) return;
+
+    const mapped: MappedShape = switch (rank) {
+        3 => .{
+            .batch = shape[0],
+            .seq = shape[1],
+            .width = shape[2],
+        },
+        2 => .{
+            .batch = 1,
+            .seq = shape[0],
+            .width = shape[1],
+        },
+        1 => .{
+            .batch = 1,
+            .seq = 1,
+            .width = shape[0],
+        },
+        else => .{
+            .batch = 1,
+            .seq = if (fallback_seq_len > 0) fallback_seq_len else 1,
+            .width = if (fallback_d_model > 0) fallback_d_model else 1,
+        },
+    };
+    if (mapped.seq == 0 or mapped.width == 0) return;
+    const element_count = mapped.batch * mapped.seq * mapped.width;
+
+    mlx_graph.eval(&.{hidden});
+    const host_buf = try allocator.alloc(f32, element_count);
+    defer allocator.free(host_buf);
+    mlx_graph.copyToHost(hidden, host_buf);
+
+    trace.emit(
+        .block_out,
+        @intCast(layer_idx),
+        0,
+        @intCast(mapped.seq),
+        @ptrCast(host_buf.ptr),
+        .f32,
+        .{
+            @intCast(mapped.batch),
+            @intCast(mapped.seq),
+            @intCast(mapped.width),
+            0,
+        },
+        3,
+        "metal_block_out_host",
+    );
+}
+
 pub const Model = struct {
     pub fn forward(
         allocator: std.mem.Allocator,
@@ -254,7 +325,7 @@ pub const Model = struct {
             return error.MLXNotAvailable;
         }
 
-        const trace = std.posix.getenv("TALU_TRACE_METAL_UNSAFE") != null;
+        const trace_hidden_debug = std.posix.getenv("TALU_TRACE_METAL_UNSAFE") != null;
         const trace_layer_timing = std.posix.getenv("TALU_METAL_LAYER_TIMING") != null;
         const phase: []const u8 = if (input_ids.len == 1) "decode" else "prefill";
 
@@ -292,7 +363,7 @@ pub const Model = struct {
             break :blk mlx_graph.createArrayF32(hidden_values, &hidden_shape);
         } else try gatherTokenEmbeddingsLazy(weight_handles, input_ids);
 
-        if (trace) {
+        if (trace_hidden_debug) {
             try traceLastHiddenVector(allocator, "metal", phase, null, hidden, sequence_len, @intCast(weight_handles.d_model));
         }
 
@@ -329,7 +400,17 @@ pub const Model = struct {
                 hidden = mlx_graph.mlx_lazy_add(hidden, deepstack_layer_additions[layer_idx]);
             }
 
-            if (trace) {
+            if (trace.isEnabled() and xrayVerifyModeEnabled()) {
+                try emitBlockOutHostTrace(
+                    allocator,
+                    hidden,
+                    layer_idx,
+                    sequence_len,
+                    @intCast(weight_handles.d_model),
+                );
+            }
+
+            if (trace_hidden_debug) {
                 try traceLastHiddenVector(allocator, "metal", phase, layer_idx, hidden, sequence_len, @intCast(weight_handles.d_model));
             }
         }
@@ -349,7 +430,7 @@ pub const Model = struct {
             return error.MLXNotAvailable;
         }
 
-        const trace = std.posix.getenv("TALU_TRACE_METAL_UNSAFE") != null;
+        const trace_hidden_debug = std.posix.getenv("TALU_TRACE_METAL_UNSAFE") != null;
 
         const norm_eps = config.norm_eps;
         const layer_count: usize = @intCast(config.n_layers);
@@ -378,7 +459,7 @@ pub const Model = struct {
                 0,
             );
 
-            if (trace) {
+            if (trace_hidden_debug) {
                 try traceLastHiddenVector(allocator, "metal", "decode", layer_idx, hidden, 1, @intCast(weight_handles.d_model));
             }
         }

@@ -138,24 +138,22 @@ pub const MetalBackend = struct {
         return trace.isEnabled() and parityDebugEnabled();
     }
 
-    fn projectLastHiddenToLogits(
+    fn applyLogitsScalingHandle(self: *MetalBackend, logits_handle: graph.ArrayHandle) graph.ArrayHandle {
+        if (self.weights.logits_scaling == 1.0) return logits_handle;
+        return graph.mlx_lazy_multiply_scalar(logits_handle, 1.0 / self.weights.logits_scaling);
+    }
+
+    fn projectLastNormedHiddenToLogits(
         self: *MetalBackend,
-        last_hidden_handle: graph.ArrayHandle,
+        last_normed_hidden_handle: graph.ArrayHandle,
         logits_out: []f32,
         emit_final_path_points: bool,
     ) !void {
         if (logits_out.len < self.vocab_size) return error.InvalidArgument;
 
-        const final_norm_handle = metal_executor.block.TransformerBlock.projectHidden(
-            last_hidden_handle,
-            self.weights,
-            self.config.norm_eps,
-        );
-        defer graph.freeArray(final_norm_handle);
-
         const lm_head_handle = if (self.weights.lm_head_quantized) |quantized_lm_head| blk: {
             break :blk graph.mlx_lazy_quantized_matmul(
-                final_norm_handle,
+                last_normed_hidden_handle,
                 quantized_lm_head.weights,
                 quantized_lm_head.scales,
                 quantized_lm_head.biases,
@@ -164,18 +162,15 @@ pub const MetalBackend = struct {
                 true,
             );
         } else blk: {
-            break :blk graph.mlx_lazy_matmul(final_norm_handle, self.weights.lm_head.?);
+            break :blk graph.mlx_lazy_matmul(last_normed_hidden_handle, self.weights.lm_head.?);
         };
         defer graph.freeArray(lm_head_handle);
 
-        const logits_handle = if (self.weights.logits_scaling != 1.0)
-            graph.mlx_lazy_multiply_scalar(lm_head_handle, 1.0 / self.weights.logits_scaling)
-        else
-            lm_head_handle;
+        const logits_handle = applyLogitsScalingHandle(self, lm_head_handle);
         defer if (logits_handle != lm_head_handle) graph.freeArray(logits_handle);
 
         if (emit_final_path_points) {
-            graph.eval(&[_]graph.ArrayHandle{ final_norm_handle, lm_head_handle, logits_handle });
+            graph.eval(&[_]graph.ArrayHandle{ last_normed_hidden_handle, lm_head_handle, logits_handle });
         } else {
             graph.eval(&[_]graph.ArrayHandle{logits_handle});
         }
@@ -185,7 +180,7 @@ pub const MetalBackend = struct {
 
         const final_norm_host = try self.allocator.alloc(f32, self.d_model);
         defer self.allocator.free(final_norm_host);
-        graph.copyToHost(final_norm_handle, final_norm_host);
+        graph.copyToHost(last_normed_hidden_handle, final_norm_host);
         trace.emitFinal(
             .final_norm,
             0,
@@ -628,7 +623,7 @@ pub const MetalBackend = struct {
         var t_copy_done_ns: i128 = t_graph_built_ns;
 
         if (use_direct_prefill_logits) {
-            const full_logits = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
+            const raw_full_logits = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
                 self.allocator,
                 self.weights,
                 tokens,
@@ -639,12 +634,16 @@ pub const MetalBackend = struct {
                 null,
                 runtime_rope_ctx,
             );
+            defer graph.freeArray(raw_full_logits);
+            const full_logits = applyLogitsScalingHandle(self, raw_full_logits);
+            if (full_logits != raw_full_logits) {
+                defer graph.freeArray(full_logits);
+            }
             const last_logits = graph.mlx_lazy_slice_last(full_logits);
-            const logits_handle = if (last_logits == full_logits) full_logits else blk: {
-                graph.freeArray(full_logits);
-                break :blk last_logits;
-            };
-            defer graph.freeArray(logits_handle);
+            const logits_handle = if (last_logits == full_logits) full_logits else last_logits;
+            if (logits_handle != full_logits) {
+                defer graph.freeArray(logits_handle);
+            }
             graph.eval(&[_]graph.ArrayHandle{logits_handle});
             t_eval_done_ns = if (trace_prefill_timing) std.time.nanoTimestamp() else 0;
 
@@ -683,7 +682,7 @@ pub const MetalBackend = struct {
             var ends: [3]c_int = .{ 1, @intCast(sequence_len), @intCast(self.d_model) };
             const last_hidden_handle = graph.mlx_lazy_slice(hidden_handle, &starts, &ends, 3);
             defer graph.freeArray(last_hidden_handle);
-            try self.projectLastHiddenToLogits(
+            try self.projectLastNormedHiddenToLogits(
                 last_hidden_handle,
                 logits_out,
                 emit_final_path_points,
@@ -758,9 +757,9 @@ pub const MetalBackend = struct {
                 runtime_rope_ctx,
             );
             defer graph.freeArray(hidden_handle);
-            try self.projectLastHiddenToLogits(hidden_handle, logits_out, true);
+            try self.projectLastNormedHiddenToLogits(hidden_handle, logits_out, true);
         } else {
-            const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
+            const raw_logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
                 self.allocator,
                 self.weights,
                 &[_]u32{token},
@@ -771,6 +770,8 @@ pub const MetalBackend = struct {
                 null,
                 runtime_rope_ctx,
             );
+            const logits_handle = applyLogitsScalingHandle(self, raw_logits_handle);
+            defer if (logits_handle != raw_logits_handle) graph.freeArray(raw_logits_handle);
             defer graph.freeArray(logits_handle);
             graph.eval(&[_]graph.ArrayHandle{logits_handle});
             graph.copyToHost(logits_handle, logits_out);
@@ -800,7 +801,7 @@ pub const MetalBackend = struct {
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
         const runtime_rope_ctx = self.textRuntimeRoPEOverride(effective_position, 1);
-        const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
+        const raw_logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
             self.allocator,
             self.weights,
             &[_]u32{token},
@@ -811,6 +812,8 @@ pub const MetalBackend = struct {
             null,
             runtime_rope_ctx,
         );
+        const logits_handle = applyLogitsScalingHandle(self, raw_logits_handle);
+        defer if (logits_handle != raw_logits_handle) graph.freeArray(raw_logits_handle);
         defer graph.freeArray(logits_handle);
 
         const selection_logits = if (self.config.logits_scaling < 0.0)
@@ -868,7 +871,7 @@ pub const MetalBackend = struct {
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         const effective_position = try common_mrope.applyPositionDelta(slot_position.*, slot_rope_delta.*);
         const runtime_rope_ctx = self.textRuntimeRoPEOverride(effective_position, 1);
-        const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
+        const raw_logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
             self.allocator,
             self.weights,
             &[_]u32{token},
@@ -879,6 +882,8 @@ pub const MetalBackend = struct {
             null,
             runtime_rope_ctx,
         );
+        const logits_handle = applyLogitsScalingHandle(self, raw_logits_handle);
+        defer if (logits_handle != raw_logits_handle) graph.freeArray(raw_logits_handle);
         defer graph.freeArray(logits_handle);
 
         var shape_buffer: [8]usize = undefined;
@@ -1373,7 +1378,7 @@ pub const MetalBackend = struct {
         var ends: [3]c_int = .{ 1, @intCast(sequence_len), @intCast(self.d_model) };
         const last_hidden_handle = graph.mlx_lazy_slice(hidden_handle, &starts, &ends, 3);
         defer graph.freeArray(last_hidden_handle);
-        try self.projectLastHiddenToLogits(
+        try self.projectLastNormedHiddenToLogits(
             last_hidden_handle,
             logits_out,
             emitParityFinalPathCheckpoints(),

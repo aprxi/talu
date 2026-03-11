@@ -58,10 +58,8 @@ fn tensorToArray(tensor: *const Tensor) MLXError!ArrayHandle {
 fn loadNormWeight(weight: *const Tensor) MLXError!ArrayHandle {
     switch (weight.dtype) {
         .f32 => {
-            // F32 norms - convert element count correctly
             const element_count = weight.data_size / 4;
             const shape = [_]usize{element_count};
-            // Use raw pointer to avoid alignment requirements
             return mlx_graph.mlx_array_from_float32(@ptrCast(weight.data_ptr), &shape, 1);
         },
         .f16 => {
@@ -674,17 +672,11 @@ fn finalizeLayerProgramWeightPointers(layer: *WeightHandles.LayerWeights) !void 
     for (compiled.plan.instructions) |insn| {
         if (insn.opcode == .rmsnorm) rmsnorm_instruction_count += 1;
     }
-    var has_named_attention_qk_norm = false;
-    for (layer.weight_binding_keys) |key| {
-        if (key == .attention_q_norm or key == .attention_k_norm) {
-            has_named_attention_qk_norm = true;
-            break;
-        }
-    }
-    const qk_norm_as_rms_ops = !has_named_attention_qk_norm and
-        layer.q_norm != null and
-        layer.k_norm != null and
-        rmsnorm_instruction_count > 4;
+    const qk_norm_as_rms_ops = shouldUseQkNormAsRmsOps(
+        layer,
+        layer.weight_binding_keys,
+        rmsnorm_instruction_count,
+    );
 
     var norm_weight_index: usize = 0;
     for (compiled.plan.instructions, 0..) |insn, op_index| {
@@ -720,6 +712,31 @@ fn finalizeLayerProgramWeightPointers(layer: *WeightHandles.LayerWeights) !void 
     for (layer.weight_ptr_scratch) |ptr| {
         if (ptr == null) return error.MissingWeight;
     }
+}
+
+fn shouldUseQkNormAsRmsOps(
+    layer: *const WeightHandles.LayerWeights,
+    weight_binding_keys: []const WeightHandles.LayerProgramWeightBindingKey,
+    rmsnorm_instruction_count: usize,
+) bool {
+    var has_named_attention_qk_norm = false;
+    for (weight_binding_keys) |key| {
+        if (key == .attention_q_norm or key == .attention_k_norm) {
+            has_named_attention_qk_norm = true;
+            break;
+        }
+    }
+
+    const base_rmsnorm_count: usize = 2 +
+        (if (layer.pre_ffn_norm != null) @as(usize, 1) else 0) +
+        (if (layer.post_ffn_norm != null) @as(usize, 1) else 0);
+
+    // Keep norm-binding heuristic aligned with block runtime dispatch: when
+    // plan RMSNorm count exceeds base norms, q/k norms are explicit RMS ops.
+    return !has_named_attention_qk_norm and
+        layer.q_norm != null and
+        layer.k_norm != null and
+        rmsnorm_instruction_count > base_rmsnorm_count;
 }
 
 fn compileLayerProgramContract(
@@ -1206,23 +1223,6 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     .d_head = @intCast(gated_delta_block.config.d_head),
                     .d_inner = @intCast(gated_delta_block.config.n_heads * gated_delta_block.config.d_head),
                 });
-                if (std.posix.getenv("TALU_DBG_GD_WEIGHTS") != null and layer_idx == 0) {
-                    const in_proj = gated_delta_block.weights.in_proj;
-                    const out_proj = gated_delta_block.weights.out_proj;
-                    std.debug.print(
-                        "DBG_GD_WEIGHTS layer={} in_proj_shape=[{},{}] in_proj_dtype={s} out_proj_shape=[{},{}] out_proj_dtype={s}\n",
-                        .{
-                            layer_idx,
-                            if (in_proj.n_dims > 0) in_proj.shape[0] else @as(i64, 0),
-                            if (in_proj.n_dims > 1) in_proj.shape[1] else @as(i64, 0),
-                            @tagName(in_proj.dtype),
-                            if (out_proj.n_dims > 0) out_proj.shape[0] else @as(i64, 0),
-                            if (out_proj.n_dims > 1) out_proj.shape[1] else @as(i64, 0),
-                            @tagName(out_proj.dtype),
-                        },
-                    );
-                }
-
                 var ln1_arr = try loadNormWeight(gated_delta_block.ln1_weight);
                 if (weight_handles.has_norm_weight_offset) {
                     ln1_arr = try addOnePersistent(ln1_arr);
@@ -2565,6 +2565,38 @@ test "LayerWeights storage helpers classify gated-delta quantized and dense path
         WeightHandles.LayerWeights.GatedDeltaStorageKind.dense,
         dense.gatedDeltaStorageKind(),
     );
+}
+
+test "shouldUseQkNormAsRmsOps detects qk norms represented as rmsnorm ops" {
+    const layer = WeightHandles.LayerWeights{
+        .ln1_weight = testHandle(1),
+        .ln2_weight = testHandle(2),
+        .q_norm = testHandle(3),
+        .k_norm = testHandle(4),
+    };
+    const keys = [_]WeightHandles.LayerProgramWeightBindingKey{
+        .norm_weight,
+        .norm_weight,
+        .norm_weight,
+        .norm_weight,
+    };
+    try testing.expect(shouldUseQkNormAsRmsOps(&layer, keys[0..], 4));
+}
+
+test "shouldUseQkNormAsRmsOps disabled when attention qk norm slots are explicitly bound" {
+    const layer = WeightHandles.LayerWeights{
+        .ln1_weight = testHandle(10),
+        .ln2_weight = testHandle(11),
+        .q_norm = testHandle(12),
+        .k_norm = testHandle(13),
+    };
+    const keys = [_]WeightHandles.LayerProgramWeightBindingKey{
+        .norm_weight,
+        .attention_q_norm,
+        .attention_k_norm,
+        .norm_weight,
+    };
+    try testing.expect(!shouldUseQkNormAsRmsOps(&layer, keys[0..], 4));
 }
 
 /// Helper to create a minimal test LoadedModel with BF16 weights (non-quantized path).

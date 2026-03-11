@@ -264,6 +264,10 @@ pub const TransformerBlock = struct {
         };
     }
 
+    fn xrayVerifyModeEnabled() bool {
+        return std.posix.getenv("TALU_XRAY_VERIFY_MODE") != null;
+    }
+
     fn emitLayerProgramTracePoint(
         state: *const LayerProgramExecutionContext,
         point: trace.TracePoint,
@@ -272,6 +276,9 @@ pub const TransformerBlock = struct {
         kernel_name: []const u8,
     ) void {
         if (!trace.isEnabled()) return;
+        // block_out must carry real host data for parity verification; a dummy
+        // marker pointer creates invalid stats and false divergences.
+        if (xrayVerifyModeEnabled() and point == .block_out) return;
         var marker = [_]f32{0.0};
         const seq_len = inferTraceSeqLen(state);
         trace.emit(
@@ -285,6 +292,211 @@ pub const TransformerBlock = struct {
             ndim,
             kernel_name,
         );
+    }
+
+    fn emitLayerProgramModelWidthHostTracePoint(
+        state: *const LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        point: trace.TracePoint,
+        kernel_name: []const u8,
+    ) void {
+        if (!trace.isEnabled()) return;
+
+        const io = instructionIoSlices(insn, registers) catch return;
+        if (io.outputs.len == 0) return;
+        const output = arraySlotFromHandle(io.outputs[0]).*;
+        if (output == null) return;
+
+        var output_shape: [8]usize = undefined;
+        const output_rank = mlx_graph.getShape(output, &output_shape);
+        if (output_rank == 0) return;
+
+        var element_count: usize = 1;
+        for (0..output_rank) |axis| {
+            element_count = std.math.mul(usize, element_count, output_shape[axis]) catch return;
+        }
+        if (element_count == 0) return;
+
+        const MappedShape = struct {
+            batch: usize,
+            seq_len: usize,
+            width: usize,
+        };
+        const mapped: MappedShape = switch (output_rank) {
+            3 => .{
+                .batch = output_shape[0],
+                .seq_len = output_shape[1],
+                .width = output_shape[2],
+            },
+            2 => .{
+                .batch = @as(usize, 1),
+                .seq_len = output_shape[0],
+                .width = output_shape[1],
+            },
+            1 => .{
+                .batch = @as(usize, 1),
+                .seq_len = @as(usize, 1),
+                .width = output_shape[0],
+            },
+            else => return,
+        };
+        if (mapped.seq_len == 0 or mapped.width == 0) return;
+        const seq_len_u32: u32 = @intCast(@min(mapped.seq_len, @as(usize, std.math.maxInt(u32))));
+        const batch_u32: u32 = @intCast(@min(mapped.batch, @as(usize, std.math.maxInt(u32))));
+        const width_u32: u32 = @intCast(@min(mapped.width, @as(usize, std.math.maxInt(u32))));
+
+        mlx_graph.eval(&.{output});
+        const host_buf = std.heap.c_allocator.alloc(f32, element_count) catch return;
+        defer std.heap.c_allocator.free(host_buf);
+        mlx_graph.copyToHost(output, host_buf);
+
+        trace.emit(
+            point,
+            @intCast(state.layer_idx),
+            traceTokenIndex(seq_len_u32),
+            tracePositionForPoint(point, state.pos_offset, seq_len_u32),
+            @ptrCast(host_buf.ptr),
+            .f32,
+            .{ batch_u32, seq_len_u32, width_u32, 0 },
+            3,
+            kernel_name,
+        );
+    }
+
+    fn emitLayerProgramPerTokenHostTracePoint(
+        state: *const LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        point: trace.TracePoint,
+        kernel_name: []const u8,
+    ) void {
+        if (!trace.isEnabled()) return;
+
+        const io = instructionIoSlices(insn, registers) catch return;
+        if (io.outputs.len == 0) return;
+        const output = arraySlotFromHandle(io.outputs[0]).*;
+        if (output == null) return;
+
+        var output_shape: [8]usize = undefined;
+        const output_rank = mlx_graph.getShape(output, &output_shape);
+        if (output_rank == 0) return;
+
+        var seq_len: usize = 0;
+        var width: usize = 0;
+        switch (output_rank) {
+            3 => {
+                seq_len = output_shape[1];
+                width = output_shape[2];
+            },
+            2 => {
+                seq_len = output_shape[0];
+                width = output_shape[1];
+            },
+            1 => {
+                seq_len = 1;
+                width = output_shape[0];
+            },
+            else => return,
+        }
+        if (seq_len == 0 or width == 0) return;
+
+        for (0..seq_len) |token_idx| {
+            const token_handle = if (output_rank == 1) output else blk: {
+                var starts: [8]c_int = [_]c_int{0} ** 8;
+                var ends: [8]c_int = [_]c_int{0} ** 8;
+                for (0..output_rank) |axis| {
+                    ends[axis] = @intCast(output_shape[axis]);
+                }
+                const seq_axis: usize = if (output_rank == 3) 1 else 0;
+                starts[seq_axis] = @intCast(token_idx);
+                ends[seq_axis] = @intCast(token_idx + 1);
+                break :blk mlx_graph.mlx_lazy_slice(output, &starts, &ends, output_rank);
+            };
+            defer if (token_handle != output) mlx_graph.freeArray(token_handle);
+
+            mlx_graph.eval(&.{token_handle});
+            const host_buf = std.heap.c_allocator.alloc(f32, width) catch return;
+            defer std.heap.c_allocator.free(host_buf);
+            mlx_graph.copyToHost(token_handle, host_buf);
+
+            trace.emit(
+                point,
+                @intCast(state.layer_idx),
+                0,
+                @intCast(token_idx),
+                @ptrCast(host_buf.ptr),
+                .f32,
+                .{ 1, 1, @intCast(width), 0 },
+                3,
+                kernel_name,
+            );
+        }
+    }
+
+    fn emitArrayPerTokenHostTracePoint(
+        state: *const LayerProgramExecutionContext,
+        output: mlx_graph.ArrayHandle,
+        point: trace.TracePoint,
+        kernel_name: []const u8,
+    ) void {
+        if (!trace.isEnabled()) return;
+        if (output == null) return;
+
+        var output_shape: [8]usize = undefined;
+        const output_rank = mlx_graph.getShape(output, &output_shape);
+        if (output_rank == 0) return;
+
+        var seq_len: usize = 0;
+        var width: usize = 0;
+        switch (output_rank) {
+            3 => {
+                seq_len = output_shape[1];
+                width = output_shape[2];
+            },
+            2 => {
+                seq_len = output_shape[0];
+                width = output_shape[1];
+            },
+            1 => {
+                seq_len = 1;
+                width = output_shape[0];
+            },
+            else => return,
+        }
+        if (seq_len == 0 or width == 0) return;
+
+        for (0..seq_len) |token_idx| {
+            const token_handle = if (output_rank == 1) output else blk: {
+                var starts: [8]c_int = [_]c_int{0} ** 8;
+                var ends: [8]c_int = [_]c_int{0} ** 8;
+                for (0..output_rank) |axis| {
+                    ends[axis] = @intCast(output_shape[axis]);
+                }
+                const seq_axis: usize = if (output_rank == 3) 1 else 0;
+                starts[seq_axis] = @intCast(token_idx);
+                ends[seq_axis] = @intCast(token_idx + 1);
+                break :blk mlx_graph.mlx_lazy_slice(output, &starts, &ends, output_rank);
+            };
+            defer if (token_handle != output) mlx_graph.freeArray(token_handle);
+
+            mlx_graph.eval(&.{token_handle});
+            const host_buf = std.heap.c_allocator.alloc(f32, width) catch return;
+            defer std.heap.c_allocator.free(host_buf);
+            mlx_graph.copyToHost(token_handle, host_buf);
+
+            trace.emit(
+                point,
+                @intCast(state.layer_idx),
+                0,
+                @intCast(token_idx),
+                @ptrCast(host_buf.ptr),
+                .f32,
+                .{ 1, 1, @intCast(width), 0 },
+                3,
+                kernel_name,
+            );
+        }
     }
 
     fn inferNormTracePoint(state: *const LayerProgramExecutionContext, insn: *const runtime_contract.Instruction) trace.TracePoint {
@@ -567,18 +779,38 @@ pub const TransformerBlock = struct {
         return count;
     }
 
+    fn shouldIncludeQkNormInRmsOrder(
+        layer: *const LayerWeights,
+        rmsnorm_instruction_count: usize,
+    ) bool {
+        var has_named_attention_qk_norm = false;
+        for (layer.weight_binding_keys) |key| {
+            if (key == .attention_q_norm or key == .attention_k_norm) {
+                has_named_attention_qk_norm = true;
+                break;
+            }
+        }
+
+        const base_rmsnorm_count: usize = 2 +
+            (if (layer.pre_ffn_norm != null) @as(usize, 1) else 0) +
+            (if (layer.post_ffn_norm != null) @as(usize, 1) else 0);
+
+        return !has_named_attention_qk_norm and
+            layer.q_norm != null and
+            layer.k_norm != null and
+            rmsnorm_instruction_count > base_rmsnorm_count;
+    }
+
     fn buildRmsNormWeightOrder(state: *LayerProgramExecutionContext) void {
         state.rmsnorm_weight_order = [_]?mlx_graph.ArrayHandle{null} ** 6;
         state.rmsnorm_weight_count = 0;
 
         const layer = state.layer_weights;
         const rmsnorm_instruction_count = countRmsNormInstructions(&state.compiled_plan.plan);
-        const base_rmsnorm_count: usize = 2 +
-            (if (layer.pre_ffn_norm != null) @as(usize, 1) else 0) +
-            (if (layer.post_ffn_norm != null) @as(usize, 1) else 0);
-        const include_qk_norm_in_order = layer.q_norm != null and
-            layer.k_norm != null and
-            rmsnorm_instruction_count > base_rmsnorm_count;
+        const include_qk_norm_in_order = shouldIncludeQkNormInRmsOrder(
+            layer,
+            rmsnorm_instruction_count,
+        );
 
         state.rmsnorm_weight_order[state.rmsnorm_weight_count] = layer.ln1_weight;
         state.rmsnorm_weight_count += 1;
@@ -783,9 +1015,21 @@ pub const TransformerBlock = struct {
         input_rank: usize,
         feature_dim: usize,
     ) !ResolvedRmsNormWeight {
+        // Use instruction-bound weight handles as source of truth. Ordered
+        // fallback is only used when bindings are incomplete.
         var selected_weight = fallback_bound_weight;
         if (selected_weight == null) {
-            selected_weight = try resolveRmsNormWeightHandle(state, insn, fallback_bound_weight);
+            selected_weight = resolveRmsNormWeightHandle(state, insn, fallback_bound_weight) catch fallback_bound_weight;
+        }
+        if (selected_weight == null) {
+            if (!state.rmsnorm_fallback_logged) {
+                log.warn("inference", "Metal RMSNorm missing instruction-bound weight; synthesizing fallback", .{
+                    .layer = state.layer_idx,
+                    .feature_dim = feature_dim,
+                });
+                state.rmsnorm_fallback_logged = true;
+            }
+            selected_weight = try synthesizeRmsNormWeightFromInput(input, input_shape, input_rank);
         }
         if (normalizeRmsNormWeightForFeatureDim(selected_weight, feature_dim)) |normalized| {
             selected_weight = normalized;
@@ -795,20 +1039,16 @@ pub const TransformerBlock = struct {
         var selected_dim: usize = if (selected_rank >= 1) selected_shape[selected_rank - 1] else feature_dim;
 
         if (selected_rank != 0 and (selected_rank != 1 or (selected_dim != feature_dim and selected_dim * 2 != feature_dim))) {
-            const candidate = selectRmsNormWeightByFeatureWidth(state, feature_dim) orelse
-                firstRank1RmsNormWeight(state);
-            if (candidate) |resolved| {
-                selected_weight = resolved;
-            } else {
-                if (!state.rmsnorm_fallback_logged) {
-                    log.warn("inference", "Metal RMSNorm weight resolution failed; synthesizing fallback", .{
-                        .layer = state.layer_idx,
-                        .feature_dim = feature_dim,
-                    });
-                    state.rmsnorm_fallback_logged = true;
-                }
-                selected_weight = try synthesizeRmsNormWeightFromInput(input, input_shape, input_rank);
+            if (!state.rmsnorm_fallback_logged) {
+                log.warn("inference", "Metal RMSNorm instruction-bound weight incompatible with input width; synthesizing fallback", .{
+                    .layer = state.layer_idx,
+                    .feature_dim = feature_dim,
+                    .selected_dim = selected_dim,
+                    .selected_rank = selected_rank,
+                });
+                state.rmsnorm_fallback_logged = true;
             }
+            selected_weight = try synthesizeRmsNormWeightFromInput(input, input_shape, input_rank);
             if (normalizeRmsNormWeightForFeatureDim(selected_weight, feature_dim)) |normalized| {
                 selected_weight = normalized;
             }
@@ -930,11 +1170,13 @@ pub const TransformerBlock = struct {
         gated_delta: gated_delta_kernel.GatedDeltaKernel,
         layer_idx: usize,
         gated_delta_cache: ?GatedDeltaCache,
+        trace_state: ?*gated_delta_kernel.GatedDeltaState,
     ) !mlx_graph.ArrayHandle {
         var kernel = gated_delta;
         var gd_state = gated_delta_kernel.GatedDeltaState{
             .cache = gated_delta_cache,
             .layer_idx = layer_idx,
+            .trace_capture_enabled = trace_state != null,
         };
         var gd_scratch = gated_delta_kernel.GatedDeltaScratch{};
         var gd_matmul = gated_delta_kernel.MatmulScratch{};
@@ -946,6 +1188,9 @@ pub const TransformerBlock = struct {
             &gd_scratch,
             &gd_matmul,
         );
+        if (trace_state) |out_state| {
+            out_state.* = gd_state;
+        }
         return gd_out;
     }
 
@@ -1503,13 +1748,37 @@ pub const TransformerBlock = struct {
         gated_delta_binding.conv_bias = optionalArrayWeightFromHandle(weight_handles[4]);
         gated_delta_binding.dt_bias = optionalArrayWeightFromHandle(weight_handles[5]);
         gated_delta_binding.norm_weight = optionalArrayWeightFromHandle(weight_handles[6]);
+        var gd_trace_state: gated_delta_kernel.GatedDeltaState = .{
+            .cache = gated_delta_cache,
+            .layer_idx = state.layer_idx,
+        };
         const output = try runGatedDeltaKernel(
             input,
             gated_delta_binding,
             state.layer_idx,
             gated_delta_cache,
+            if (xrayVerifyModeEnabled()) &gd_trace_state else null,
         );
         arraySlotFromHandle(io.outputs[0]).* = output;
+        if (xrayVerifyModeEnabled()) {
+            if (gd_trace_state.trace_in_proj) |handle| {
+                defer mlx_graph.freeArray(handle);
+                emitArrayPerTokenHostTracePoint(state, handle, .gdelta_in_proj, "metal_gdelta_in_proj_host");
+            }
+            if (gd_trace_state.trace_conv) |handle| {
+                defer mlx_graph.freeArray(handle);
+                emitArrayPerTokenHostTracePoint(state, handle, .gdelta_conv, "metal_gdelta_conv_host");
+            }
+            if (gd_trace_state.trace_ssm) |handle| {
+                defer mlx_graph.freeArray(handle);
+                emitArrayPerTokenHostTracePoint(state, handle, .gdelta_ssm, "metal_gdelta_ssm_host");
+            }
+            if (gd_trace_state.trace_norm) |handle| {
+                defer mlx_graph.freeArray(handle);
+                emitArrayPerTokenHostTracePoint(state, handle, .gdelta_norm, "metal_gdelta_norm_host");
+            }
+            emitArrayPerTokenHostTracePoint(state, output, .gdelta_out, "metal_gdelta_out_host");
+        }
     }
 
     fn layerProgramSwiGluAdapter(
@@ -1702,13 +1971,27 @@ pub const TransformerBlock = struct {
             registers,
         );
         const seq_len = inferTraceSeqLen(state);
-        emitLayerProgramTracePoint(
-            state,
-            inferNormTracePoint(state, insn),
-            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
-            3,
-            "metal_rmsnorm",
-        );
+        if (xrayVerifyModeEnabled()) {
+            // In verify mode emit host-backed stats under the single logical
+            // norm checkpoint this instruction corresponds to.
+            const point = inferNormTracePoint(state, insn);
+            emitLayerProgramModelWidthHostTracePoint(
+                state,
+                insn,
+                registers,
+                point,
+                "metal_rmsnorm_host",
+            );
+        } else {
+            const point = inferNormTracePoint(state, insn);
+            emitLayerProgramTracePoint(
+                state,
+                point,
+                traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+                3,
+                "metal_rmsnorm",
+            );
+        }
     }
 
     fn layerProgramAttentionRuntimeAdapter(
@@ -2092,7 +2375,9 @@ pub const TransformerBlock = struct {
         try bindLayerProgramStateDescriptors(&exec_ctx, &compiled_plan.plan, state_blocks);
 
         var insn_idx: usize = 0;
-        const allow_rms_swiglu_fusion = std.posix.getenv("TALU_METAL_DISABLE_RMS_SWIGLU_FUSION") == null;
+        const allow_rms_swiglu_fusion = std.posix.getenv("TALU_METAL_DISABLE_RMS_SWIGLU_FUSION") == null and
+            std.posix.getenv("TALU_PARITY_DEBUG") == null and
+            !xrayVerifyModeEnabled();
         while (insn_idx < compiled_plan.plan.instructions.len) {
             const insn = &compiled_plan.plan.instructions[insn_idx];
             if (insn_idx + 1 < compiled_plan.plan.instructions.len) {
@@ -2499,6 +2784,36 @@ test "layer program contract rejects stateful opcode bound to wrong block kind" 
         .state_mismatch => |mismatch| try std.testing.expectEqual(opcode_map.Opcode.shortconv, mismatch.opcode),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "shouldIncludeQkNormInRmsOrder includes qk norms when only norm slots exist" {
+    var layer = std.mem.zeroes(LayerWeights);
+    layer.q_norm = @as(mlx_graph.ArrayHandle, @ptrFromInt(1));
+    layer.k_norm = @as(mlx_graph.ArrayHandle, @ptrFromInt(2));
+    layer.weight_binding_keys = &[_]WeightHandles.LayerProgramWeightBindingKey{
+        .norm_weight,
+        .norm_weight,
+        .norm_weight,
+        .norm_weight,
+    };
+    try std.testing.expect(
+        TransformerBlock.shouldIncludeQkNormInRmsOrder(&layer, 4),
+    );
+}
+
+test "shouldIncludeQkNormInRmsOrder disables qk norms when explicit qk slots exist" {
+    var layer = std.mem.zeroes(LayerWeights);
+    layer.q_norm = @as(mlx_graph.ArrayHandle, @ptrFromInt(1));
+    layer.k_norm = @as(mlx_graph.ArrayHandle, @ptrFromInt(2));
+    layer.weight_binding_keys = &[_]WeightHandles.LayerProgramWeightBindingKey{
+        .norm_weight,
+        .attention_q_norm,
+        .attention_k_norm,
+        .norm_weight,
+    };
+    try std.testing.expect(
+        !TransformerBlock.shouldIncludeQkNormInRmsOrder(&layer, 4),
+    );
 }
 
 test "tracePositionForPoint prefill uses sequence length across points" {
