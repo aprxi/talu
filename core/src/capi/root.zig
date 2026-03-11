@@ -744,6 +744,9 @@ pub const talu_agent_policy_prepare_runtime = agent.talu_agent_policy_prepare_ru
 pub const talu_agent_policy_check_action = agent.talu_agent_policy_check_action;
 pub const talu_agent_policy_check_file = agent.talu_agent_policy_check_file;
 pub const talu_agent_policy_check_process = agent.talu_agent_policy_check_process;
+pub const talu_agent_policy_check_process_detailed = agent.talu_agent_policy_check_process_detailed;
+pub const talu_agent_policy_validate_strict_emulation = agent.talu_agent_policy_validate_strict_emulation;
+pub const talu_agent_policy_strict_emulation_decisions = agent.talu_agent_policy_strict_emulation_decisions;
 pub const talu_agent_runtime_validate_strict = agent.talu_agent_runtime_validate_strict;
 pub const TaluAgentPolicy = agent.TaluAgentPolicy;
 

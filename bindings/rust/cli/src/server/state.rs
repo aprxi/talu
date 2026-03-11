@@ -97,8 +97,8 @@ pub struct AppState {
     pub tenant_registry: Option<TenantRegistry>,
     /// TaluDB storage bucket for `/v1/chat/sessions` endpoints.
     pub bucket_path: Option<PathBuf>,
-    /// Canonical workspace root for `/v1/agent/fs/*` endpoints.
-    pub workspace_dir: PathBuf,
+    /// Canonical workdir root for `/v1/agent/fs/*` endpoints.
+    pub workdir: Option<PathBuf>,
     /// Optional JSON policy applied to `/v1/agent/*` runtime operations.
     pub agent_policy_json: Option<String>,
     /// Parsed policy handle for `/v1/agent/*` endpoints (loaded at startup).
@@ -127,4 +127,6 @@ pub struct AppState {
     pub agent_runtime_mode: AgentRuntimeMode,
     /// Selected sandbox backend.
     pub sandbox_backend: SandboxBackend,
+    /// PubSub relay state for cross-client topic messaging.
+    pub pubsub: Mutex<crate::server::pubsub::PubSubState>,
 }

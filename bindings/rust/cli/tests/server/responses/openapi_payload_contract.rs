@@ -38,8 +38,9 @@ fn responses_openapi_validator_supports_all_reachable_keywords() {
 fn responses_openapi_stream_event_registry_matches_path_schema() {
     let validator = OpenApiSchemaValidator::load_responses_spec();
     let spec = validator.spec();
+    let responses_path = validator.responses_path();
 
-    let refs = spec["paths"]["/responses"]["post"]["responses"]["200"]["content"]
+    let refs = spec["paths"][responses_path]["post"]["responses"]["200"]["content"]
         ["text/event-stream"]["schema"]["oneOf"]
         .as_array()
         .expect("event stream oneOf array");
@@ -88,9 +89,14 @@ fn responses_openapi_stream_event_registry_matches_path_schema() {
 fn responses_openapi_non_stream_payload_matches_response_resource_contract() {
     let model = require_model!();
     let validator = OpenApiSchemaValidator::load_responses_spec();
+    let responses_path = validator.responses_path();
+    let responses_ptr = format!(
+        "/paths/{}/post/responses/200/content/application~1json/schema",
+        responses_path.replace('/', "~1")
+    );
     let schema = validator
         .spec()
-        .pointer("/paths/~1responses/post/responses/200/content/application~1json/schema")
+        .pointer(&responses_ptr)
         .expect("responses 200 application/json schema");
 
     let ctx = ServerTestContext::new(model_config());

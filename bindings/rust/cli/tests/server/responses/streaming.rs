@@ -1,6 +1,6 @@
+use super::openapi_schema::OpenApiSchemaValidator;
 use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
     let mut events = Vec::new();
@@ -19,12 +19,8 @@ fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
 }
 
 fn openapi_stream_event_types() -> BTreeSet<String> {
-    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../issues/responses-openapi.json")
-        .canonicalize()
-        .expect("canonicalize responses-openapi.json path");
-    let raw = std::fs::read_to_string(spec_path).expect("read responses-openapi.json");
-    let json: serde_json::Value = serde_json::from_str(&raw).expect("parse responses-openapi.json");
+    let validator = OpenApiSchemaValidator::load_responses_spec();
+    let json = validator.spec();
     let schemas = json["components"]["schemas"]
         .as_object()
         .expect("components.schemas object");
@@ -452,7 +448,7 @@ fn responses_stream_delta_events_have_indices_and_sequence() {
 }
 
 #[test]
-fn responses_stream_rejects_logprobs_request_until_core_supports_it() {
+fn responses_stream_accepts_logprobs_request_shape() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
@@ -464,14 +460,16 @@ fn responses_stream_rejects_logprobs_request_until_core_supports_it() {
         "top_logprobs": 2
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-    let json = resp.json();
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let events = parse_sse_events(&resp.body);
+    let delta = events
+        .iter()
+        .find(|(event_type, _)| event_type.ends_with(".delta"))
+        .map(|(_, event)| event)
+        .expect("missing delta event");
     assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("include.message.output_text.logprobs"),
-        "body: {}",
+        delta.get("logprobs").is_some(),
+        "delta event must expose logprobs field. body: {}",
         resp.body
     );
 }

@@ -9,7 +9,7 @@ fn config_with_workspace(workspace: &TempDir) -> ServerConfig {
 
 fn config_with_workspace_flag(workspace: &TempDir) -> ServerConfig {
     let mut cfg = ServerConfig::new();
-    cfg.workspace_dir = Some(workspace.path().to_path_buf());
+    cfg.workdir = Some(workspace.path().to_path_buf());
     cfg
 }
 
@@ -19,7 +19,7 @@ fn config_with_workspace_and_policy(
 ) -> ServerConfig {
     let mut cfg = ServerConfig::new();
     cfg.env_vars.push((
-        "TALU_WORKSPACE_DIR".to_string(),
+        "TALU_WORKDIR".to_string(),
         workspace.path().to_string_lossy().to_string(),
     ));
     if let Some(policy) = policy_json {
@@ -128,6 +128,25 @@ fn agent_fs_edit_rejects_empty_old_text_via_core_validation() {
 }
 
 #[test]
+fn agent_fs_requires_workdir() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+
+    let read_resp = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({
+            "path": "notes/main.txt"
+        }),
+    );
+    assert_eq!(read_resp.status, 400, "body: {}", read_resp.body);
+    assert_eq!(read_resp.json()["error"]["code"], "no_workdir");
+    assert_eq!(
+        read_resp.json()["error"]["message"],
+        "no workdir was passed"
+    );
+}
+
+#[test]
 fn agent_fs_stat_list_rename_and_remove() {
     let workspace = TempDir::new().expect("workspace");
     let ctx = ServerTestContext::new(config_with_workspace(&workspace));
@@ -220,7 +239,7 @@ fn agent_fs_blocks_outside_workspace_access() {
 }
 
 #[test]
-fn agent_fs_workspace_dir_flag_scopes_workspace_access() {
+fn agent_fs_workdir_flag_scopes_workspace_access() {
     let workspace = TempDir::new().expect("workspace");
     let outside = TempDir::new().expect("outside");
     let outside_file = outside.path().join("outside.txt");
@@ -251,12 +270,12 @@ fn agent_fs_workspace_dir_flag_scopes_workspace_access() {
 }
 
 #[test]
-fn agent_fs_workspace_dir_flag_overrides_env_workspace_dir() {
+fn agent_fs_workdir_flag_overrides_env_workdir() {
     let cli_workspace = TempDir::new().expect("cli workspace");
     let env_workspace = TempDir::new().expect("env workspace");
     let mut cfg = config_with_workspace_flag(&cli_workspace);
     cfg.env_vars.push((
-        "TALU_WORKSPACE_DIR".to_string(),
+        "TALU_WORKDIR".to_string(),
         env_workspace.path().to_string_lossy().to_string(),
     ));
     let ctx = ServerTestContext::new(cfg);
@@ -276,11 +295,11 @@ fn agent_fs_workspace_dir_flag_overrides_env_workspace_dir() {
     let env_file = env_workspace.path().join("priority.txt");
     assert!(
         cli_file.exists(),
-        "file should be created in --workspace-dir"
+        "file should be created in --workdir"
     );
     assert!(
         !env_file.exists(),
-        "file must not be created in TALU_WORKSPACE_DIR when CLI flag is set"
+        "file must not be created in TALU_WORKDIR when CLI flag is set"
     );
 }
 

@@ -53,11 +53,22 @@ export function renderHosts(): void {
 
     dom.hostsList.appendChild(row);
   }
+
+  // Test bench button for process WebSocket.
+  const testRow = document.createElement("div");
+  testRow.style.cssText = "margin-top:0.5rem;";
+  const testBtn = document.createElement("button");
+  testBtn.className = "btn btn-ghost btn-sm";
+  testBtn.textContent = "Test Process WS";
+  testBtn.dataset["action"] = "test-process-ws";
+  testRow.appendChild(testBtn);
+  dom.hostsList.appendChild(testRow);
 }
 
 export function wireHostEvents(
   container: HTMLElement,
   onOpenTerminal: (hostId: string) => void,
+  onTestProcessWs?: () => void,
 ): void {
   container.addEventListener("click", (e) => {
     const target = (e.target as Element).closest<HTMLElement>("[data-action]");
@@ -67,6 +78,8 @@ export function wireHostEvents(
     const hostId = target.dataset["hostId"];
     if (action === "open-terminal" && hostId) {
       onOpenTerminal(hostId);
+    } else if (action === "test-process-ws" && onTestProcessWs) {
+      onTestProcessWs();
     }
   });
 }

@@ -132,6 +132,46 @@ pub export fn talu_agent_policy_check_process(
     return policy_api.talu_agent_policy_check_process(policy, action, command, cwd, out_allowed);
 }
 
+pub export fn talu_agent_policy_check_process_detailed(
+    policy: ?*TaluAgentPolicy,
+    action: ?[*:0]const u8,
+    command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    out_allowed: ?*bool,
+    out_deny_reason: ?*c_int,
+) callconv(.c) i32 {
+    return policy_api.talu_agent_policy_check_process_detailed(
+        policy,
+        action,
+        command,
+        cwd,
+        out_allowed,
+        out_deny_reason,
+    );
+}
+
+pub export fn talu_agent_policy_validate_strict_emulation(
+    policy: ?*TaluAgentPolicy,
+) callconv(.c) i32 {
+    return policy_api.talu_agent_policy_validate_strict_emulation(policy);
+}
+
+pub export fn talu_agent_policy_strict_emulation_decisions(
+    policy: ?*TaluAgentPolicy,
+    cwd: ?[*:0]const u8,
+    out_deny_descendant_exec: ?*bool,
+    out_deny_write: ?*bool,
+    out_allow_python_exec: ?*bool,
+) callconv(.c) i32 {
+    return policy_api.talu_agent_policy_strict_emulation_decisions(
+        policy,
+        cwd,
+        out_deny_descendant_exec,
+        out_deny_write,
+        out_allow_python_exec,
+    );
+}
+
 pub export fn talu_agent_runtime_validate_strict(
     policy: ?*TaluAgentPolicy,
     cwd: ?[*:0]const u8,

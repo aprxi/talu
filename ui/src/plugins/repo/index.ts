@@ -60,7 +60,32 @@ export const repoPlugin: PluginDefinition = {
     const dom = getRepoDom();
     wireProviderEvents(dom.providersList);
     wireChatModelEvents(dom.chatModelsList);
-    wireHostEvents(dom.hostsList, (hostId) => openTerminalForHost(hostId, ctx));
+    wireHostEvents(dom.hostsList, (hostId) => openTerminalForHost(hostId, ctx), () => {
+      // Test bench: spawn a process via WebSocket, display output in a <pre>.
+      const output = document.createElement("pre");
+      output.style.cssText = "margin:0.5rem 0;padding:0.5rem;background:var(--bg-secondary);border-radius:4px;font-size:12px;max-height:200px;overflow:auto;";
+      output.textContent = "[spawning process...]\n";
+      dom.hostsList.appendChild(output);
+
+      void (async () => {
+        try {
+          const proc = await ctx.agent.process.open("echo hello-from-process-ws");
+          proc.onEvent((event) => {
+            if (event.type === "data") {
+              output.textContent += event.data ?? "";
+            } else if (event.type === "exit") {
+              output.textContent += `\n[exit code=${event.code ?? "unknown"}]\n`;
+              setTimeout(() => { void proc.close().catch(() => {}); output.remove(); }, 5000);
+            } else if (event.type === "error") {
+              output.textContent += `\n[error: ${event.message}]\n`;
+            }
+          });
+        } catch (err) {
+          output.textContent += `[error: ${err instanceof Error ? err.message : String(err)}]\n`;
+          setTimeout(() => output.remove(), 5000);
+        }
+      })();
+    });
     wireTerminalEvents();
 
     // Load chat models from KV (needed before providers render for "Added" state).

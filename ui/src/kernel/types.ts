@@ -549,8 +549,35 @@ export interface AgentShellAccess {
   open(opts?: AgentShellOpenOptions): Promise<AgentShellSession>;
 }
 
+export interface AgentProcessEvent {
+  type: "data" | "exit" | "error";
+  data?: string;
+  code?: number;
+  message?: string;
+}
+
+export interface AgentProcessOpenOptions {
+  cwd?: string;
+  onEvent?: (event: AgentProcessEvent) => void;
+}
+
+export interface AgentProcessSession {
+  readonly id: string;
+  readonly command: string;
+  readonly cwd: string | null;
+  send(data: string): void;
+  signal(name: string): void;
+  onEvent(handler: (event: AgentProcessEvent) => void): Disposable;
+  close(): Promise<void>;
+}
+
+export interface AgentProcessAccess {
+  open(command: string, opts?: AgentProcessOpenOptions): Promise<AgentProcessSession>;
+}
+
 export interface AgentAccess {
   readonly fs: AgentFsAccess;
   readonly shell: AgentShellAccess;
-  cwd: string;
+  readonly process: AgentProcessAccess;
+  cwd: string | null;
 }

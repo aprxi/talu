@@ -303,14 +303,15 @@ fn get_blob_nonexistent_hash_returns_error() {
     assert_ne!(resp.status, 200, "non-existent blob should not return 200");
 }
 
-/// Blob endpoint returns 404 when no bucket is configured.
+/// Blob endpoint returns 503 when no bucket is configured.
 #[test]
-fn get_blob_no_bucket_returns_404() {
+fn get_blob_no_bucket_returns_503() {
     let ctx = ServerTestContext::new(no_bucket_config());
 
     let hash = "b".repeat(64);
     let resp = get(ctx.addr(), &format!("/v1/db/blobs/{}", hash));
-    assert_eq!(resp.status, 404, "body: {}", resp.body);
+    assert_eq!(resp.status, 503, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "no_storage");
 }
 
 // ---------------------------------------------------------------------------

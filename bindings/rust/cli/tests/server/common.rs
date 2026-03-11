@@ -27,8 +27,8 @@ pub struct ServerConfig {
     pub no_bucket: bool,
     /// Serve console UI from this directory instead of bundled assets.
     pub html_dir: Option<PathBuf>,
-    /// Workspace root passed via `talu serve --workspace-dir`.
-    pub workspace_dir: Option<PathBuf>,
+    /// Workdir root passed via `talu serve --workdir`.
+    pub workdir: Option<PathBuf>,
     /// Policy file passed via `talu serve --policy-file`.
     pub policy_file: Option<PathBuf>,
     /// Runtime mode passed via `talu serve --agent-runtime-mode`.
@@ -48,7 +48,7 @@ impl ServerConfig {
             bucket: None,
             no_bucket: false,
             html_dir: None,
-            workspace_dir: None,
+            workdir: None,
             policy_file: None,
             agent_runtime_mode: None,
             sandbox_backend: None,
@@ -116,6 +116,8 @@ impl ServerTestContext {
             .env_remove("LD_PRELOAD")
             .env_remove("MALLOC_CHECK_")
             .env_remove("MALLOC_PERTURB_")
+            .env_remove("TALU_WORKDIR")
+            .env_remove("TALU_WORKSPACE_DIR")
             // Ensure clean environment for subprocess
             .env("TALU_LOG_LEVEL", "info");
 
@@ -144,8 +146,8 @@ impl ServerTestContext {
         if let Some(ref html_dir) = config.html_dir {
             command.arg("--html-dir").arg(html_dir);
         }
-        if let Some(ref workspace_dir) = config.workspace_dir {
-            command.arg("--workspace-dir").arg(workspace_dir);
+        if let Some(ref workdir) = config.workdir {
+            command.arg("--workdir").arg(workdir);
         }
         if let Some(ref policy_file) = config.policy_file {
             command.arg("--policy-file").arg(policy_file);

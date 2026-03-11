@@ -65,6 +65,7 @@ describe("createPluginContext — permission gates", () => {
 
   beforeEach(() => {
     document.body.innerHTML = `<div id="status-bar"></div>`;
+    (globalThis as { __TALU_BOOTSTRAP__?: unknown }).__TALU_BOOTSTRAP__ = undefined;
     infra = makeInfra();
   });
 
@@ -339,6 +340,15 @@ describe("createPluginContext — permission gates", () => {
     expect(file.content).toBe("hello");
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     fetchSpy.mockRestore();
+  });
+
+  test("agent cwd initializes from bootstrap workdir", () => {
+    (globalThis as { __TALU_BOOTSTRAP__?: unknown }).__TALU_BOOTSTRAP__ = {
+      workdir: "/tmp/project",
+    };
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(builtinManifest(), document.createElement("div"), infra, disposables, new AbortController());
+    expect(ctx.agent.cwd).toBe("/tmp/project");
   });
 
   test("third-party without 'exec' permission → throws on agent.shell.exec", async () => {

@@ -44,6 +44,7 @@ pub const ALLOWED_COMMANDS: []const []const u8 = &.{
     "bat",
     "less",
     "more",
+    "vim",
     "head",
     "tail",
     "wc",

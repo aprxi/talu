@@ -28,6 +28,12 @@ pub const ProcessCheckResult = struct {
     deny_reason: ?ProcessDenyReason = null,
 };
 
+pub const StrictEmulationDecisions = struct {
+    deny_descendant_exec: bool = false,
+    deny_write: bool = false,
+    allow_python_exec: bool = true,
+};
+
 /// Return a definitive effect for all descendants of `directory_resource`, when
 /// it can be proven from recursive resource rules.
 ///
@@ -189,6 +195,56 @@ pub fn checkProcessAction(
     }
 
     return .{ .allowed = false, .deny_reason = .action };
+}
+
+/// Return the first unsupported fs action for strict runtime emulation.
+///
+/// Strict emulation requires deterministic allow/deny behavior for these
+/// actions. Mixed allow+deny rule sets are not representable in the runtime
+/// wrappers and are therefore rejected.
+pub fn strictEmulationUnsupportedAction(policy: *const Policy) ?[]const u8 {
+    const actions = [_][]const u8{
+        "tool.fs.read",
+        "tool.fs.write",
+        "tool.fs.delete",
+    };
+    for (actions) |action| {
+        if (!strictEmulationSupportsFileAction(policy, action)) return action;
+    }
+    return null;
+}
+
+/// Compute strict runtime emulation decisions from policy semantics.
+pub fn strictEmulationDecisions(
+    policy: *const Policy,
+    cwd: ?[]const u8,
+) StrictEmulationDecisions {
+    const exec_allowed = checkProcessAction(policy, "tool.exec", "ls", cwd).allowed;
+    const write_allowed = checkFileAction(policy, "tool.fs.write", "**", false);
+    const python_allowed = checkProcessAction(policy, "tool.exec", "python3 -c pass", cwd).allowed;
+    return .{
+        .deny_descendant_exec = !exec_allowed,
+        .deny_write = !write_allowed,
+        .allow_python_exec = python_allowed,
+    };
+}
+
+fn strictEmulationSupportsFileAction(policy: *const Policy, action: []const u8) bool {
+    var has_allow = false;
+    var has_deny = false;
+
+    for (policy.statements) |stmt| {
+        if (!actionPatternMatches(stmt.action_pattern, action)) continue;
+        switch (stmt.effect) {
+            .allow => has_allow = true,
+            .deny => has_deny = true,
+        }
+    }
+
+    if (policy.default_effect == .allow) {
+        return !has_deny;
+    }
+    return !(has_allow and has_deny);
 }
 
 fn actionPatternMatches(pattern_value: []const u8, action: []const u8) bool {

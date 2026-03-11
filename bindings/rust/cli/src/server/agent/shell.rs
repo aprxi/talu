@@ -146,13 +146,10 @@ pub async fn handle_create(
     }
 
     let policy = super::load_runtime_policy(&state);
-    let runtime_mode = super::runtime_mode_for_talu(state.agent_runtime_mode);
+    let runtime_mode = super::runtime_mode_for_talu(&state);
     let sandbox_backend = super::sandbox_backend_for_talu(state.sandbox_backend);
     let effective_cwd = if state.agent_runtime_mode == crate::server::AgentRuntimeMode::Strict {
-        request
-            .cwd
-            .clone()
-            .or_else(|| Some(state.workspace_dir.to_string_lossy().into_owned()))
+        request.cwd.clone().or_else(|| super::default_workdir(&state))
     } else {
         request.cwd.clone()
     };

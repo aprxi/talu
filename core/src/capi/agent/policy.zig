@@ -21,6 +21,14 @@ pub const ProcessPolicyResult = struct {
     deny_reason: ?ProcessDenyReason = null,
 };
 
+pub const CProcessDenyReason = enum(c_int) {
+    none = 0,
+    action = 1,
+    cwd = 2,
+};
+
+pub const StrictEmulationDecisions = policy_mod.StrictEmulationDecisions;
+
 pub const FileSubtreeDecision = enum {
     allow,
     deny,
@@ -122,6 +130,26 @@ fn cwdMatches(prepared_cwd: ?[]const u8, requested_cwd: ?[]const u8) bool {
     if (prepared_cwd == null and requested_cwd == null) return true;
     if (prepared_cwd == null or requested_cwd == null) return false;
     return std.mem.eql(u8, prepared_cwd.?, requested_cwd.?);
+}
+
+fn toCDenyReason(reason: ?ProcessDenyReason) CProcessDenyReason {
+    return switch (reason orelse .action) {
+        .action => .action,
+        .cwd => .cwd,
+    };
+}
+
+pub fn validateStrictEmulationPolicy(policy: ?*TaluAgentPolicy) ?[]const u8 {
+    const p = toPolicyConst(policy) orelse return null;
+    return policy_mod.strictEmulationUnsupportedAction(p);
+}
+
+pub fn strictEmulationDecisions(
+    policy: ?*TaluAgentPolicy,
+    cwd: ?[]const u8,
+) StrictEmulationDecisions {
+    const p = toPolicyConst(policy) orelse return .{};
+    return policy_mod.strictEmulationDecisions(p, cwd);
 }
 
 pub fn clampTimeoutMs(policy: ?*TaluAgentPolicy, requested_ms: u64) u64 {
@@ -344,6 +372,89 @@ pub fn talu_agent_policy_check_process(
     return 0;
 }
 
+pub fn talu_agent_policy_check_process_detailed(
+    policy: ?*TaluAgentPolicy,
+    action: ?[*:0]const u8,
+    command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    out_allowed: ?*bool,
+    out_deny_reason: ?*c_int,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    if (out_allowed) |ptr| ptr.* = false;
+    if (out_deny_reason) |ptr| ptr.* = @intFromEnum(CProcessDenyReason.none);
+
+    const out = out_allowed orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_allowed is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const action_slice = std.mem.sliceTo(action orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "action is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }, 0);
+    const command_slice = if (command) |ptr| std.mem.sliceTo(ptr, 0) else null;
+    const cwd_slice = if (cwd) |ptr| std.mem.sliceTo(ptr, 0) else null;
+
+    const result = enforceProcessPolicy(policy, action_slice, command_slice, cwd_slice);
+    out.* = result.allowed;
+    if (out_deny_reason) |ptr| {
+        ptr.* = if (result.allowed)
+            @intFromEnum(CProcessDenyReason.none)
+        else
+            @intFromEnum(toCDenyReason(result.deny_reason));
+    }
+    return 0;
+}
+
+pub fn talu_agent_policy_validate_strict_emulation(
+    policy: ?*TaluAgentPolicy,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    if (validateStrictEmulationPolicy(policy)) |action| {
+        capi_error.setErrorWithCode(
+            .shell_exec_failed,
+            "strict runtime emulation does not support mixed allow/deny rules for {s}",
+            .{action},
+        );
+        return @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed);
+    }
+    return 0;
+}
+
+pub fn talu_agent_policy_strict_emulation_decisions(
+    policy: ?*TaluAgentPolicy,
+    cwd: ?[*:0]const u8,
+    out_deny_descendant_exec: ?*bool,
+    out_deny_write: ?*bool,
+    out_allow_python_exec: ?*bool,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    if (out_deny_descendant_exec) |ptr| ptr.* = false;
+    if (out_deny_write) |ptr| ptr.* = false;
+    if (out_allow_python_exec) |ptr| ptr.* = true;
+
+    const out_exec = out_deny_descendant_exec orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_deny_descendant_exec is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const out_write = out_deny_write orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_deny_write is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const out_python = out_allow_python_exec orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_allow_python_exec is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    const cwd_slice = if (cwd) |ptr| std.mem.sliceTo(ptr, 0) else null;
+    const decisions = strictEmulationDecisions(policy, cwd_slice);
+    out_exec.* = decisions.deny_descendant_exec;
+    out_write.* = decisions.deny_write;
+    out_python.* = decisions.allow_python_exec;
+    return 0;
+}
+
 test "talu_agent_policy_create check and free" {
     var handle: ?*TaluAgentPolicy = null;
     const policy_json =
@@ -368,6 +479,86 @@ test "talu_agent_policy_create check and free" {
     );
     try std.testing.expectEqual(@as(i32, 0), check_rc);
     try std.testing.expect(allowed);
+}
+
+test "talu_agent_policy_check_process_detailed reports cwd reason" {
+    var handle: ?*TaluAgentPolicy = null;
+    const policy_json =
+        \\{
+        \\  "default":"deny",
+        \\  "statements":[
+        \\    {"effect":"allow","action":"tool.exec","command":"rg *"},
+        \\    {"effect":"deny","action":"tool.exec","command":"rg *","cwd":"tmp/**"}
+        \\  ]
+        \\}
+    ;
+    const rc = talu_agent_policy_create(policy_json.ptr, policy_json.len, &handle);
+    defer talu_agent_policy_free(handle);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+
+    var allowed = false;
+    var deny_reason: c_int = @intFromEnum(CProcessDenyReason.none);
+    const check_rc = talu_agent_policy_check_process_detailed(
+        handle,
+        "tool.exec",
+        "rg foo",
+        "tmp",
+        &allowed,
+        &deny_reason,
+    );
+    try std.testing.expectEqual(@as(i32, 0), check_rc);
+    try std.testing.expect(!allowed);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(CProcessDenyReason.cwd)), deny_reason);
+}
+
+test "talu_agent_policy_validate_strict_emulation rejects mixed fs action rules" {
+    var handle: ?*TaluAgentPolicy = null;
+    const policy_json =
+        \\{
+        \\  "default":"deny",
+        \\  "statements":[
+        \\    {"effect":"allow","action":"tool.fs.write","resource":"src/**"},
+        \\    {"effect":"deny","action":"tool.fs.write","resource":"src/private/**"}
+        \\  ]
+        \\}
+    ;
+    const rc = talu_agent_policy_create(policy_json.ptr, policy_json.len, &handle);
+    defer talu_agent_policy_free(handle);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+
+    const validate_rc = talu_agent_policy_validate_strict_emulation(handle);
+    try std.testing.expectEqual(
+        @as(i32, @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed)),
+        validate_rc,
+    );
+}
+
+test "talu_agent_policy_strict_emulation_decisions derives conservative flags" {
+    var handle: ?*TaluAgentPolicy = null;
+    const policy_json =
+        \\{
+        \\  "default":"deny",
+        \\  "statements":[]
+        \\}
+    ;
+    const rc = talu_agent_policy_create(policy_json.ptr, policy_json.len, &handle);
+    defer talu_agent_policy_free(handle);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+
+    var deny_exec = false;
+    var deny_write = false;
+    var allow_python = true;
+    const decision_rc = talu_agent_policy_strict_emulation_decisions(
+        handle,
+        null,
+        &deny_exec,
+        &deny_write,
+        &allow_python,
+    );
+    try std.testing.expectEqual(@as(i32, 0), decision_rc);
+    try std.testing.expect(deny_exec);
+    try std.testing.expect(deny_write);
+    try std.testing.expect(!allow_python);
 }
 
 test "talu_agent_policy_prepare_runtime precompiles strict profiles" {

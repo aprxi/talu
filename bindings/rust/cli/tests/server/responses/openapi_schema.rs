@@ -1,6 +1,7 @@
+use crate::server::common::{get, ServerConfig, ServerTestContext};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::sync::OnceLock;
 
 const SUPPORTED_SCHEMA_KEYWORDS: &[&str] = &[
     "$ref",
@@ -41,17 +42,52 @@ pub struct OpenApiSchemaValidator {
 
 impl OpenApiSchemaValidator {
     pub fn load_responses_spec() -> Self {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../issues/responses-openapi.json")
-            .canonicalize()
-            .expect("canonicalize responses-openapi.json path");
-        let raw = std::fs::read_to_string(path).expect("read responses-openapi.json");
-        let spec: Value = serde_json::from_str(&raw).expect("parse responses-openapi.json");
-        Self { spec }
+        static SPEC: OnceLock<Value> = OnceLock::new();
+        let spec = SPEC.get_or_init(|| {
+            let ctx = ServerTestContext::new(ServerConfig::new());
+            let resp = get(ctx.addr(), "/openapi/responses.json");
+            assert_eq!(
+                resp.status, 200,
+                "failed to fetch /openapi/responses.json: {}",
+                resp.body
+            );
+            serde_json::from_str(&resp.body).expect("parse /openapi/responses.json")
+        });
+        Self { spec: spec.clone() }
     }
 
     pub fn spec(&self) -> &Value {
         &self.spec
+    }
+
+    pub fn responses_path(&self) -> &str {
+        if self
+            .spec
+            .get("paths")
+            .and_then(|v| v.get("/v1/responses"))
+            .is_some()
+        {
+            "/v1/responses"
+        } else if self
+            .spec
+            .get("paths")
+            .and_then(|v| v.get("/responses"))
+            .is_some()
+        {
+            "/responses"
+        } else {
+            panic!("responses path missing from spec");
+        }
+    }
+
+    fn responses_post_pointer_prefix(&self) -> &'static str {
+        if self.spec.pointer("/paths/~1v1~1responses").is_some() {
+            "/paths/~1v1~1responses/post"
+        } else if self.spec.pointer("/paths/~1responses").is_some() {
+            "/paths/~1responses/post"
+        } else {
+            panic!("responses post path missing from spec");
+        }
     }
 
     pub fn schema_by_name(&self, name: &str) -> &Value {
@@ -77,9 +113,13 @@ impl OpenApiSchemaValidator {
     }
 
     pub fn validate_responses_stream_event_schema(&self, event: &Value) -> Result<(), Vec<String>> {
+        let stream_ptr = format!(
+            "{}/responses/200/content/text~1event-stream/schema",
+            self.responses_post_pointer_prefix()
+        );
         let schema = self
             .spec
-            .pointer("/paths/~1responses/post/responses/200/content/text~1event-stream/schema")
+            .pointer(&stream_ptr)
             .expect("responses stream schema");
         self.validate_schema(schema, event)
     }
@@ -88,13 +128,14 @@ impl OpenApiSchemaValidator {
         let mut keywords = BTreeSet::new();
         let mut seen_refs = HashSet::new();
 
+        let prefix = self.responses_post_pointer_prefix();
         let roots = [
-            "/paths/~1responses/post/requestBody/content/application~1json/schema",
-            "/paths/~1responses/post/responses/200/content/application~1json/schema",
-            "/paths/~1responses/post/responses/200/content/text~1event-stream/schema",
+            format!("{prefix}/requestBody/content/application~1json/schema"),
+            format!("{prefix}/responses/200/content/application~1json/schema"),
+            format!("{prefix}/responses/200/content/text~1event-stream/schema"),
         ];
 
-        for ptr in roots {
+        for ptr in &roots {
             let schema = self
                 .spec
                 .pointer(ptr)

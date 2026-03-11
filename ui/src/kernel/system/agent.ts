@@ -3,6 +3,9 @@ import type {
   AgentExecEvent,
   AgentExecOptions,
   AgentExecResult,
+  AgentProcessEvent,
+  AgentProcessOpenOptions,
+  AgentProcessSession,
   AgentShellEvent,
   AgentShellOpenOptions,
   AgentShellSession,
@@ -13,7 +16,7 @@ import type { ApiClient, ApiResult } from "../../api.ts";
 interface CreateAgentAccessOptions {
   api: ApiClient;
   requirePermission: (name: "filesystem" | "exec") => void;
-  defaultCwd?: string;
+  defaultCwd?: string | null;
 }
 
 function unwrapApiResult<T>(operation: string, result: ApiResult<T>): T {
@@ -120,7 +123,7 @@ export function createAgentAccess(options: CreateAgentAccessOptions): AgentAcces
   const encoder = new TextEncoder();
 
   const agent: AgentAccess = {
-    cwd: options.defaultCwd ?? ".",
+    cwd: options.defaultCwd ?? null,
     fs: {
       async readFile(path, opts) {
         requirePermission("filesystem");
@@ -248,7 +251,7 @@ export function createAgentAccess(options: CreateAgentAccessOptions): AgentAcces
         const resp = await api.agentExec(
           {
             command,
-            cwd: opts?.cwd ?? agent.cwd,
+            cwd: opts?.cwd ?? agent.cwd ?? undefined,
             timeout_ms: opts?.timeoutMs,
           },
           opts?.signal,
@@ -268,7 +271,7 @@ export function createAgentAccess(options: CreateAgentAccessOptions): AgentAcces
         const created = unwrapApiResult(
           "shell.open",
           await api.agentShellCreate({
-            cwd: opts?.cwd ?? agent.cwd,
+            cwd: opts?.cwd ?? agent.cwd ?? undefined,
             cols: opts?.cols,
             rows: opts?.rows,
           }),
@@ -367,6 +370,115 @@ export function createAgentAccess(options: CreateAgentAccessOptions): AgentAcces
             const result = await api.agentShellDelete(created.shell_id);
             if (!result.ok && !result.error?.includes("shell not found")) {
               throw new Error(`Agent shell close failed: ${result.error ?? "unknown error"}`);
+            }
+          },
+        };
+      },
+    },
+
+    process: {
+      async open(command: string, opts?: AgentProcessOpenOptions): Promise<AgentProcessSession> {
+        requirePermission("exec");
+        if (!command.trim()) {
+          throw new Error("Agent process open failed: command is empty");
+        }
+
+        const created = unwrapApiResult(
+          "process.open",
+          await api.agentProcessSpawn({
+            command,
+            cwd: opts?.cwd ?? agent.cwd ?? undefined,
+          }),
+        );
+
+        const listeners = new Set<(event: AgentProcessEvent) => void>();
+        let closed = false;
+        let exited = false;
+        const decoder = new TextDecoder();
+
+        const emit = (event: AgentProcessEvent): void => {
+          opts?.onEvent?.(event);
+          for (const handler of listeners) {
+            handler(event);
+          }
+        };
+
+        const ws = new WebSocket(toWebSocketUrl(`/v1/agent/processes/${encodeURIComponent(created.process_id)}/ws`));
+        ws.binaryType = "arraybuffer";
+
+        ws.addEventListener("message", (evt) => {
+          if (typeof evt.data === "string") {
+            let parsed: { type?: string; code?: number; message?: string } | null = null;
+            try {
+              parsed = JSON.parse(evt.data) as { type?: string; code?: number; message?: string };
+            } catch {
+              parsed = null;
+            }
+            if (!parsed) return;
+            if (parsed.type === "exit") {
+              exited = true;
+              emit({ type: "exit", code: parsed.code });
+            } else if (parsed.type === "error") {
+              emit({ type: "error", message: parsed.message ?? "process error" });
+            }
+            return;
+          }
+
+          if (evt.data instanceof ArrayBuffer) {
+            emit({ type: "data", data: decoder.decode(evt.data) });
+            return;
+          }
+
+          if (evt.data instanceof Blob) {
+            void evt.data.arrayBuffer().then((buffer) => {
+              emit({ type: "data", data: decoder.decode(buffer) });
+            });
+          }
+        });
+
+        ws.addEventListener("error", () => {
+          emit({ type: "error", message: "process websocket error" });
+        });
+
+        ws.addEventListener("close", () => {
+          if (!exited) emit({ type: "exit" });
+        });
+
+        return {
+          id: created.process_id,
+          command,
+          cwd: created.cwd ?? null,
+          send(data: string): void {
+            if (ws.readyState !== WebSocket.OPEN) {
+              throw new Error("Agent process send failed: websocket is not open");
+            }
+            ws.send(encoder.encode(data));
+          },
+          signal(name: string): void {
+            if (ws.readyState !== WebSocket.OPEN) {
+              throw new Error("Agent process signal failed: websocket is not open");
+            }
+            ws.send(JSON.stringify({ type: "signal", signal: name }));
+          },
+          onEvent(handler: (event: AgentProcessEvent) => void): Disposable {
+            listeners.add(handler);
+            return {
+              dispose(): void {
+                listeners.delete(handler);
+              },
+            };
+          },
+          async close(): Promise<void> {
+            if (closed) return;
+            closed = true;
+
+            if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+              ws.close();
+            }
+
+            const result = await api.agentProcessDelete(created.process_id);
+            if (!result.ok && !result.error?.includes("process not found")) {
+              throw new Error(`Agent process close failed: ${result.error ?? "unknown error"}`);
             }
           },
         };

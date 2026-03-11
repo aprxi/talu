@@ -111,13 +111,13 @@ describe("createAgentAccess", () => {
       requirePermission(name) {
         if (name === "exec") execPermissionChecks += 1;
       },
-      defaultCwd: ".",
+      defaultCwd: null,
     });
 
     const result = await agent.shell.exec("echo ok");
     expect(result.stdout).toBe("ok");
     expect(result.exitCode).toBe(0);
-    expect(receivedCwd).toBe(".");
+    expect(receivedCwd).toBeUndefined();
     expect(execPermissionChecks).toBe(1);
   });
 

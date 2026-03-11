@@ -140,6 +140,23 @@ export interface AgentShellDeleteResponse {
   terminated: boolean;
 }
 
+export interface AgentProcessSpawnRequest {
+  command: string;
+  cwd?: string;
+}
+
+export interface AgentProcessSessionResponse {
+  process_id: string;
+  command: string;
+  cwd?: string | null;
+  attached_streams: number;
+}
+
+export interface AgentProcessDeleteResponse {
+  process_id: string;
+  terminated: boolean;
+}
+
 export interface ApiClient {
   listConversations(opts?: { offset?: number; limit?: number; marker?: string; search?: string; tags_any?: string; project_id?: string }): Promise<ApiResult<ConversationList>>;
   search(req: SearchRequest): Promise<ApiResult<SearchResponse>>;
@@ -209,6 +226,8 @@ export interface ApiClient {
   agentExec(body: AgentExecRequest, signal?: AbortSignal): Promise<Response>;
   agentShellCreate(body: AgentShellCreateRequest): Promise<ApiResult<AgentShellSessionResponse>>;
   agentShellDelete(shellId: string): Promise<ApiResult<AgentShellDeleteResponse>>;
+  agentProcessSpawn(body: AgentProcessSpawnRequest): Promise<ApiResult<AgentProcessSessionResponse>>;
+  agentProcessDelete(processId: string): Promise<ApiResult<AgentProcessDeleteResponse>>;
 }
 
 function hexToUtf8(hex: string): string {
@@ -502,5 +521,7 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     }),
     agentShellCreate: (body) => requestAgentJson<AgentShellSessionResponse>("POST", "/v1/agent/shells", body),
     agentShellDelete: (shellId) => requestAgentJson<AgentShellDeleteResponse>("DELETE", `/v1/agent/shells/${encodeURIComponent(shellId)}`),
+    agentProcessSpawn: (body) => requestAgentJson<AgentProcessSessionResponse>("POST", "/v1/agent/processes/spawn", body),
+    agentProcessDelete: (processId) => requestAgentJson<AgentProcessDeleteResponse>("DELETE", `/v1/agent/processes/${encodeURIComponent(processId)}`),
   };
 }
