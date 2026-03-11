@@ -23,6 +23,7 @@ pub mod openapi;
 pub mod plugins;
 pub mod projects;
 pub mod providers;
+pub mod pubsub;
 pub mod proxy;
 pub mod repo;
 pub mod responses;
@@ -117,11 +118,11 @@ pub struct ServerArgs {
     #[arg(long, env = "TALU_POLICY_FILE")]
     pub policy_file: Option<PathBuf>,
 
-    /// Canonical workspace root for `/v1/agent/fs/*` endpoint sandboxing.
+    /// Canonical workdir root for `/v1/agent/fs/*` endpoint sandboxing.
     ///
     /// Relative request paths are resolved against this directory.
-    #[arg(long, env = "TALU_WORKSPACE_DIR")]
-    pub workspace_dir: Option<PathBuf>,
+    #[arg(long, env = "TALU_WORKDIR")]
+    pub workdir: Option<PathBuf>,
 
     /// Runtime mode for `/v1/agent/exec`, `/v1/agent/shells/*`, and
     /// `/v1/agent/processes/*`.
@@ -202,16 +203,14 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         }
     };
 
-    let workspace_dir = args
-        .workspace_dir
-        .or_else(|| std::env::var_os("TALU_WORKSPACE_DIR").map(PathBuf::from))
-        .unwrap_or_else(|| std::env::current_dir().expect("current dir"));
-    let workspace_dir = workspace_dir.canonicalize().with_context(|| {
-        format!(
-            "canonicalize agent fs workspace path: {}",
-            workspace_dir.display()
-        )
-    })?;
+    let workdir = args
+        .workdir
+        .or_else(|| std::env::var_os("TALU_WORKDIR").map(PathBuf::from))
+        .map(|path| {
+            path.canonicalize()
+                .with_context(|| format!("canonicalize agent fs workdir path: {}", path.display()))
+        })
+        .transpose()?;
     let env_agent_policy_json = std::env::var("TALU_AGENT_POLICY_JSON").ok();
     if args.policy_file.is_some() && env_agent_policy_json.is_some() {
         bail!("--policy-file conflicts with TALU_AGENT_POLICY_JSON; use exactly one source");
@@ -243,7 +242,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
             .expect("strict runtime mode requires policy by prior check");
         talu::shell::validate_strict_runtime(
             Some(strict_policy),
-            Some(&workspace_dir.to_string_lossy()),
+            workdir.as_ref().map(|path| path.to_string_lossy()).as_deref(),
             sandbox_backend_for_talu(sandbox_backend),
         )
         .context("validate strict runtime policy and sandbox support")?;
@@ -253,7 +252,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
             sandbox_backend_for_talu(sandbox_backend),
             true, // strict_required
             args.strict_probes,
-            Some(&workspace_dir.to_string_lossy()),
+            workdir.as_ref().map(|path| path.to_string_lossy()).as_deref(),
         )
         .context("validate strict runtime capabilities")?;
         log::info!(
@@ -283,7 +282,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         gateway_secret,
         tenant_registry,
         bucket_path,
-        workspace_dir,
+        workdir,
         agent_policy_json,
         agent_policy,
         html_dir: args.html_dir,
@@ -298,6 +297,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         process_session_ttl: listen::PROCESS_SESSION_TTL,
         agent_runtime_mode: args.agent_runtime_mode,
         sandbox_backend,
+        pubsub: tokio::sync::Mutex::new(pubsub::PubSubState::new()),
     };
 
     let addr = SocketAddr::new(args.host, args.port);

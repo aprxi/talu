@@ -169,12 +169,22 @@ fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, Response<B
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()))
 }
 
-fn open_fs(
-    state: &AppState,
+fn missing_workdir_response() -> Response<BoxBody> {
+    json_error(
+        StatusCode::BAD_REQUEST,
+        "no_workdir",
+        "no workdir was passed",
+    )
+}
+
+fn open_fs<'a>(
+    state: &'a AppState,
     policy: Option<&talu::policy::Policy>,
-) -> Result<FsHandle, Response<BoxBody>> {
-    FsHandle::open_with_policy(&state.workspace_dir.to_string_lossy(), policy)
-        .map_err(|e| fs_error_response(e, "failed to initialize workspace fs"))
+) -> Result<(FsHandle, &'a Path), Response<BoxBody>> {
+    let workdir = state.workdir.as_deref().ok_or_else(missing_workdir_response)?;
+    FsHandle::open_with_policy(&workdir.to_string_lossy(), policy)
+        .map(|handle| (handle, workdir))
+        .map_err(|e| fs_error_response(e, "failed to initialize workdir fs"))
 }
 
 fn load_policy(state: &AppState) -> Option<Arc<talu::policy::Policy>> {
@@ -297,8 +307,8 @@ pub async fn handle_read(
     let encoding = encoding_or_default(request.encoding);
     let max_bytes = request.max_bytes.unwrap_or(DEFAULT_MAX_READ_BYTES);
     let policy = load_policy(&state);
-    let fs = match open_fs(&state, policy.as_deref()) {
-        Ok(fs) => fs,
+    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+        Ok(value) => value,
         Err(resp) => return resp,
     };
     let read = match fs.read(&request.path, max_bytes) {
@@ -314,7 +324,7 @@ pub async fn handle_read(
     json_response(
         StatusCode::OK,
         &FsReadResponse {
-            path: to_workspace_relative(&state.workspace_dir, &request.path),
+            path: to_workspace_relative(workdir, &request.path),
             content,
             encoding,
             size: read.size,
@@ -346,8 +356,8 @@ pub async fn handle_write(
     };
 
     let policy = load_policy(&state);
-    let fs = match open_fs(&state, policy.as_deref()) {
-        Ok(fs) => fs,
+    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+        Ok(value) => value,
         Err(resp) => return resp,
     };
     let result = match fs.write(&request.path, &content, request.mkdir.unwrap_or(false)) {
@@ -358,7 +368,7 @@ pub async fn handle_write(
     json_response(
         StatusCode::OK,
         &FsWriteResponse {
-            path: to_workspace_relative(&state.workspace_dir, &request.path),
+            path: to_workspace_relative(workdir, &request.path),
             bytes_written: result.bytes_written,
         },
     )
@@ -381,8 +391,8 @@ pub async fn handle_edit(
         Err(resp) => return resp,
     };
     let policy = load_policy(&state);
-    let fs = match open_fs(&state, policy.as_deref()) {
-        Ok(fs) => fs,
+    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+        Ok(value) => value,
         Err(resp) => return resp,
     };
     let result = match fs.edit(
@@ -398,7 +408,7 @@ pub async fn handle_edit(
     json_response(
         StatusCode::OK,
         &FsEditResponse {
-            path: to_workspace_relative(&state.workspace_dir, &request.path),
+            path: to_workspace_relative(workdir, &request.path),
             replacements: result.replacements,
         },
     )
@@ -422,8 +432,8 @@ pub async fn handle_stat(
     };
 
     let policy = load_policy(&state);
-    let fs = match open_fs(&state, policy.as_deref()) {
-        Ok(fs) => fs,
+    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+        Ok(value) => value,
         Err(resp) => return resp,
     };
     let stat = match fs.stat(&request.path) {
@@ -434,7 +444,7 @@ pub async fn handle_stat(
     json_response(
         StatusCode::OK,
         &FsStatResponse {
-            path: to_workspace_relative(&state.workspace_dir, &request.path),
+            path: to_workspace_relative(workdir, &request.path),
             exists: stat.exists,
             is_file: stat.is_file,
             is_dir: stat.is_dir,
@@ -465,8 +475,8 @@ pub async fn handle_list(
     };
 
     let policy = load_policy(&state);
-    let fs = match open_fs(&state, policy.as_deref()) {
-        Ok(fs) => fs,
+    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+        Ok(value) => value,
         Err(resp) => return resp,
     };
     let raw_json = match fs.list_json(
@@ -492,7 +502,7 @@ pub async fn handle_list(
     json_response(
         StatusCode::OK,
         &FsListResponse {
-            path: to_workspace_relative(&state.workspace_dir, &request.path),
+            path: to_workspace_relative(workdir, &request.path),
             entries: payload.entries,
             truncated: payload.truncated,
         },
@@ -517,15 +527,15 @@ pub async fn handle_remove(
     };
 
     let policy = load_policy(&state);
-    let fs = match open_fs(&state, policy.as_deref()) {
-        Ok(fs) => fs,
+    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+        Ok(value) => value,
         Err(resp) => return resp,
     };
     match fs.remove(&request.path, request.recursive.unwrap_or(false)) {
         Ok(()) => json_response(
             StatusCode::OK,
             &FsRemoveResponse {
-                path: to_workspace_relative(&state.workspace_dir, &request.path),
+                path: to_workspace_relative(workdir, &request.path),
                 removed: true,
             },
         ),
@@ -551,15 +561,15 @@ pub async fn handle_mkdir(
     };
 
     let policy = load_policy(&state);
-    let fs = match open_fs(&state, policy.as_deref()) {
-        Ok(fs) => fs,
+    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+        Ok(value) => value,
         Err(resp) => return resp,
     };
     match fs.mkdir(&request.path, request.recursive.unwrap_or(false)) {
         Ok(()) => json_response(
             StatusCode::OK,
             &FsMkdirResponse {
-                path: to_workspace_relative(&state.workspace_dir, &request.path),
+                path: to_workspace_relative(workdir, &request.path),
                 created: true,
             },
         ),
@@ -585,16 +595,16 @@ pub async fn handle_rename(
     };
 
     let policy = load_policy(&state);
-    let fs = match open_fs(&state, policy.as_deref()) {
-        Ok(fs) => fs,
+    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+        Ok(value) => value,
         Err(resp) => return resp,
     };
     match fs.rename(&request.from, &request.to) {
         Ok(()) => json_response(
             StatusCode::OK,
             &FsRenameResponse {
-                from: to_workspace_relative(&state.workspace_dir, &request.from),
-                to: to_workspace_relative(&state.workspace_dir, &request.to),
+                from: to_workspace_relative(workdir, &request.from),
+                to: to_workspace_relative(workdir, &request.to),
             },
         ),
         Err(e) => fs_error_response(e, "failed to rename path"),

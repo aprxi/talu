@@ -42,7 +42,7 @@ use crate::server::{
         (name = "Proxy", description = "Plugin outbound HTTP proxy"),
         (name = "Repository", description = "Model cache management (list, search, download, delete)"),
         (name = "Code", description = "Tree-sitter code analysis and incremental parsing"),
-        (name = "Agent::FS", description = "Workspace filesystem capabilities"),
+        (name = "Agent::FS", description = "Workdir filesystem capabilities"),
         (name = "Agent::Exec", description = "One-shot shell command execution (SSE). Runtime mode: strict = kernel/runtime sandbox guarantee; host = passthrough without firewall guarantee."),
         (name = "Agent::Shell", description = "Interactive shell lifecycle and WebSocket attach. Runtime mode: strict = kernel/runtime sandbox guarantee; host = passthrough without firewall guarantee."),
         (name = "Agent::Process", description = "Long-lived process sessions (spawn/send/stream/delete/list). Runtime mode: strict = kernel/runtime sandbox guarantee; host = passthrough without firewall guarantee."),

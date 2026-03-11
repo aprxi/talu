@@ -43,6 +43,7 @@ import type { ContextKeyService } from "../registries/context-keys.ts";
 import type { MenuRegistry } from "../registries/menus.ts";
 import { createApiClient } from "../../api.ts";
 import { createAgentAccess } from "../system/agent.ts";
+import { getBootstrapWorkdir } from "../system/bootstrap.ts";
 
 /** Shared kernel infrastructure passed to all plugin contexts. */
 export interface KernelInfrastructure {
@@ -328,7 +329,7 @@ export function createPluginContext(
     agent: createAgentAccess({
       api: agentApi,
       requirePermission,
-      defaultCwd: ".",
+      defaultCwd: getBootstrapWorkdir(),
     }),
     context,
     menus,

@@ -386,7 +386,7 @@ export const workspaceOpsPlugin: PluginDefinition = {
         host.terminal.fit();
         const cols = host.terminal.getCols() > 0 ? host.terminal.getCols() : 120;
         const rows = host.terminal.getRows() > 0 ? host.terminal.getRows() : 32;
-        const opened = await ctx.agent.shell.open({ cwd: ctx.agent.cwd, cols, rows });
+        const opened = await ctx.agent.shell.open({ cwd: ctx.agent.cwd ?? undefined, cols, rows });
         host.shell = opened;
         host.status = "connected";
 

@@ -1019,13 +1019,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_serve_workspace_dir_flag() {
-        let cli = parse(&["talu", "serve", "--workspace-dir", "/tmp/workspace"])
+    fn parse_serve_workdir_flag() {
+        let cli = parse(&["talu", "serve", "--workdir", "/tmp/workdir"])
             .expect("parse should succeed");
 
         match cli.command {
             Some(Commands::Serve(args)) => {
-                assert_eq!(args.workspace_dir, Some(PathBuf::from("/tmp/workspace")));
+                assert_eq!(args.workdir, Some(PathBuf::from("/tmp/workdir")));
             }
             _ => panic!("expected serve command"),
         }

@@ -110,7 +110,7 @@ export function openTerminalForHost(hostId: string, ctx: PluginContext): void {
       terminal.fit();
       const cols = terminal.getCols() > 0 ? terminal.getCols() : 120;
       const rows = terminal.getRows() > 0 ? terminal.getRows() : 32;
-      const opened = await ctx.agent.shell.open({ cwd: ctx.agent.cwd, cols, rows });
+      const opened = await ctx.agent.shell.open({ cwd: ctx.agent.cwd ?? undefined, cols, rows });
 
       if (!active || active.hostId !== hostId) {
         // User navigated away — close the shell we just opened.

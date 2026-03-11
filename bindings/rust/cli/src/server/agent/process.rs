@@ -1,26 +1,35 @@
 //! `/v1/agent/processes/*` long-lived process session endpoints.
 //!
 //! Transport/glue only: parse HTTP, call core `talu_process_*` APIs via
-//! `talu::process::ProcessSession`, and stream bytes as SSE.
+//! `talu::process::ProcessSession`, and stream bytes as SSE or WebSocket.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::SinkExt;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
+use hyper::upgrade::Upgraded;
 use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use utoipa::ToSchema;
 
 use crate::server::auth_gateway::AuthContext;
+use crate::server::code_ws;
 use crate::server::state::{AppState, ProcessSession};
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+type WsStream = WebSocketStream<TokioIo<Upgraded>>;
 
 const STREAM_READ_BUFFER_BYTES: usize = 16 * 1024;
 const STREAM_POLL_INTERVAL_MS: u64 = 10;
@@ -74,6 +83,13 @@ pub(crate) struct ProcessEvent {
     code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessControlMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    signal: Option<String>,
 }
 
 #[utoipa::path(post, path = "/v1/agent/processes/spawn", tag = "Agent::Process",
@@ -130,10 +146,7 @@ pub async fn handle_spawn(
     let runtime_mode = super::runtime_mode_for_talu(&state);
     let sandbox_backend = super::sandbox_backend_for_talu(state.sandbox_backend);
     let effective_cwd = if state.agent_runtime_mode == crate::server::AgentRuntimeMode::Strict {
-        request
-            .cwd
-            .clone()
-            .or_else(|| Some(state.workspace_dir.to_string_lossy().into_owned()))
+        request.cwd.clone().or_else(|| super::default_workdir(&state))
     } else {
         request.cwd.clone()
     };
@@ -427,6 +440,255 @@ pub async fn handle_stream(
         .unwrap()
 }
 
+#[utoipa::path(get, path = "/v1/agent/processes/{id}/ws", tag = "Agent::Process",
+    params(("id" = String, Path, description = "Process session id")),
+    responses(
+        (status = 101, description = "WebSocket upgrade"),
+        (status = 400, body = crate::server::http::ErrorResponse),
+        (status = 403, body = crate::server::http::ErrorResponse),
+        (status = 404, body = crate::server::http::ErrorResponse),
+        (status = 409, body = crate::server::http::ErrorResponse),
+    ))]
+pub async fn handle_ws(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    auth: Option<AuthContext>,
+) -> Response<BoxBody> {
+    let path = req.uri().path().to_string();
+    let process_id = match process_id_from_ws_path(&path) {
+        Some(value) => value.to_string(),
+        None => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invalid process ws path",
+            )
+        }
+    };
+
+    let owner = owner_key(auth.as_ref());
+    let process = {
+        let mut sessions = state.process_sessions.lock().await;
+        let session = match sessions.get_mut(&process_id) {
+            Some(value) => value,
+            None => return json_error(StatusCode::NOT_FOUND, "not_found", "process not found"),
+        };
+
+        if session.owner_key != owner {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "process belongs to another auth context",
+            );
+        }
+
+        if session.attached_streams > 0 {
+            return json_error(
+                StatusCode::CONFLICT,
+                "already_streaming",
+                "process stream already attached",
+            );
+        }
+
+        session.attached_streams += 1;
+        session.last_access = Instant::now();
+        session.process.clone()
+    };
+
+    let key = match req.headers().get("sec-websocket-key") {
+        Some(value) => value.as_bytes().to_vec(),
+        None => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Missing Sec-WebSocket-Key header",
+            )
+        }
+    };
+    let accept = code_ws::compute_accept_key(&key);
+
+    let upgrade = hyper::upgrade::on(req);
+    let state_for_ws = state.clone();
+    tokio::spawn(async move {
+        match upgrade.await {
+            Ok(upgraded) => {
+                if let Err(err) =
+                    handle_ws_connection(state_for_ws.clone(), process_id.clone(), process, upgraded)
+                        .await
+                {
+                    log::warn!(target: "server::agent_process", "process ws {} ended with error: {}", process_id, err);
+                }
+                detach_stream(&state_for_ws, &process_id).await;
+            }
+            Err(e) => {
+                log::error!(target: "server::agent_process", "WebSocket upgrade failed: {e}");
+                detach_stream(&state_for_ws, &process_id).await;
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-accept", accept)
+        .body(Full::new(Bytes::new()).boxed())
+        .unwrap()
+}
+
+async fn handle_ws_connection(
+    state: Arc<AppState>,
+    process_id: String,
+    process: Arc<Mutex<talu::process::ProcessSession>>,
+    upgraded: Upgraded,
+) -> Result<(), String> {
+    let mut ws: WsStream =
+        WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
+
+    let mut interval = tokio::time::interval(Duration::from_millis(STREAM_POLL_INTERVAL_MS));
+    let mut read_buf = vec![0u8; STREAM_READ_BUFFER_BYTES];
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let mut should_exit = false;
+                let mut output_len = 0usize;
+                let mut exit_code: Option<i32> = None;
+                {
+                    let mut guard = process.lock().await;
+                    match guard.read(&mut read_buf) {
+                        Ok(n) => output_len = n,
+                        Err(e) => {
+                            let _ = ws_send_error(&mut ws, "read_failed", &e.to_string()).await;
+                            should_exit = true;
+                        }
+                    }
+
+                    if !should_exit {
+                        match guard.is_alive() {
+                            Ok(alive) => {
+                                if !alive {
+                                    should_exit = true;
+                                    exit_code = guard.exit_code().ok().flatten();
+                                }
+                            }
+                            Err(e) => {
+                                let _ = ws_send_error(&mut ws, "alive_failed", &e.to_string()).await;
+                                should_exit = true;
+                            }
+                        }
+                    }
+                }
+
+                if output_len > 0 {
+                    ws.send(Message::Binary(read_buf[..output_len].to_vec().into()))
+                        .await
+                        .map_err(|e| format!("failed to send process output: {e}"))?;
+                    touch_process_session(&state, &process_id).await;
+                }
+
+                if should_exit {
+                    let _ = ws.send(Message::Text(
+                        json!({"type":"exit","code":exit_code}).to_string().into(),
+                    )).await;
+                    break;
+                }
+            }
+            maybe_msg = futures_util::StreamExt::next(&mut ws) => {
+                let msg = match maybe_msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => return Err(format!("ws receive failed: {e}")),
+                    None => break,
+                };
+
+                match msg {
+                    Message::Binary(data) => {
+                        let mut guard = process.lock().await;
+                        if let Err(e) = guard.write(&data) {
+                            let _ = ws_send_error(&mut ws, "write_failed", &e.to_string()).await;
+                            break;
+                        }
+                        touch_process_session(&state, &process_id).await;
+                    }
+                    Message::Text(text) => {
+                        let control: ProcessControlMessage = match serde_json::from_str(&text) {
+                            Ok(value) => value,
+                            Err(e) => {
+                                let _ = ws_send_error(&mut ws, "invalid_json", &e.to_string()).await;
+                                continue;
+                            }
+                        };
+
+                        match control.msg_type.as_str() {
+                            "signal" => {
+                                let signal_name = control.signal.as_deref().unwrap_or("");
+                                let signal = match parse_signal(signal_name) {
+                                    Some(value) => value,
+                                    None => {
+                                        let _ = ws_send_error(
+                                            &mut ws,
+                                            "invalid_signal",
+                                            "signal must be one of INT, TERM, KILL, HUP, QUIT",
+                                        ).await;
+                                        continue;
+                                    }
+                                };
+
+                                let mut guard = process.lock().await;
+                                if let Err(e) = guard.signal(signal) {
+                                    let _ = ws_send_error(&mut ws, "signal_failed", &e.to_string()).await;
+                                }
+                                touch_process_session(&state, &process_id).await;
+                            }
+                            other => {
+                                let _ = ws_send_error(
+                                    &mut ws,
+                                    "unsupported_message",
+                                    &format!("unsupported control message type: {other}"),
+                                ).await;
+                            }
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        ws.send(Message::Pong(payload))
+                            .await
+                            .map_err(|e| format!("failed to send pong: {e}"))?;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn ws_send_error(ws: &mut WsStream, code: &str, message: &str) -> Result<(), String> {
+    ws.send(Message::Text(
+        json!({
+            "type": "error",
+            "code": code,
+            "message": message,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .map_err(|e| e.to_string())
+}
+
+fn parse_signal(value: &str) -> Option<u8> {
+    match value.to_ascii_uppercase().as_str() {
+        "INT" | "SIGINT" => Some(2),
+        "TERM" | "SIGTERM" => Some(15),
+        "KILL" | "SIGKILL" => Some(9),
+        "HUP" | "SIGHUP" => Some(1),
+        "QUIT" | "SIGQUIT" => Some(3),
+        _ => None,
+    }
+}
+
 #[utoipa::path(delete, path = "/v1/agent/processes/{id}", tag = "Agent::Process",
     params(("id" = String, Path, description = "Process session id")),
     responses(
@@ -491,6 +753,20 @@ fn process_id_from_path(path: &str) -> Option<&str> {
         return None;
     }
     Some(rest)
+}
+
+fn process_id_from_ws_path(path: &str) -> Option<&str> {
+    let prefix = "/v1/agent/processes/";
+    let suffix = "/ws";
+    let rest = path.strip_prefix(prefix)?;
+    if !rest.ends_with(suffix) {
+        return None;
+    }
+    let id = &rest[..rest.len().saturating_sub(suffix.len())];
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    Some(id)
 }
 
 fn process_id_from_send_path(path: &str) -> Option<&str> {

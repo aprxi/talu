@@ -33,6 +33,7 @@ use crate::server::openapi;
 use crate::server::plugins;
 use crate::server::projects;
 use crate::server::providers;
+use crate::server::pubsub;
 use crate::server::proxy;
 use crate::server::repo;
 use crate::server::responses;
@@ -629,6 +630,25 @@ impl Service<Request<Incoming>> for Router {
                             }
                         }
                         (Method::GET, p)
+                            if p.starts_with("/v1/agent/processes/")
+                                && p.ends_with("/ws")
+                                && req
+                                    .headers()
+                                    .get("upgrade")
+                                    .and_then(|v| v.to_str().ok())
+                                    .is_some_and(|v| v.eq_ignore_ascii_case("websocket")) =>
+                        {
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_process::handle_ws(state, req, auth).await
+                            }
+                        }
+                        (Method::GET, p)
                             if p.starts_with("/v1/agent/processes/") && p.ends_with("/stream") =>
                         {
                             if let Some(resp) = enforce_plugin_agent_capability(
@@ -1004,6 +1024,16 @@ impl Service<Request<Incoming>> for Router {
                                 || p.starts_with("/code/session/") =>
                         {
                             code::handle_session_delete(state, req, auth).await
+                        }
+                        // PubSub WebSocket for cross-client topic messaging
+                        (Method::GET, "/v1/pubsub/ws")
+                            if req
+                                .headers()
+                                .get("upgrade")
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|v| v.eq_ignore_ascii_case("websocket")) =>
+                        {
+                            pubsub::handle_ws(state, req).await
                         }
                         // WebSocket upgrade for real-time code analysis
                         (Method::GET, "/v1/code/ws") | (Method::GET, "/code/ws")
@@ -1395,6 +1425,10 @@ fn is_blob_item_path(path: &str) -> bool {
 /// 2. Bundled assets (when built with `make ui` / `cfg(bundled_ui)`)
 /// 3. 404 with a helpful message
 fn serve_ui_asset(state: &AppState, filename: &str, content_type: &str) -> Response<BoxBody> {
+    if filename == "index.html" {
+        return serve_index_html(state);
+    }
+
     // --html-dir takes precedence over bundled assets.
     if let Some(ref dir) = state.html_dir {
         return serve_file(dir, filename, content_type);
@@ -1413,6 +1447,65 @@ fn serve_ui_asset(state: &AppState, filename: &str, content_type: &str) -> Respo
         "ui_not_available",
         "No UI bundled. Run 'make ui' or use --html-dir",
     )
+}
+
+fn serve_index_html(state: &AppState) -> Response<BoxBody> {
+    let html = if let Some(ref dir) = state.html_dir {
+        let path = dir.join("index.html");
+        match std::fs::read_to_string(&path) {
+            Ok(html) => html,
+            Err(_) => {
+                return json_error(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "Asset not found: index.html",
+                )
+            }
+        }
+    } else {
+        #[cfg(bundled_ui)]
+        {
+            String::from_utf8_lossy(CONSOLE_HTML).into_owned()
+        }
+        #[cfg(not(bundled_ui))]
+        {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "ui_not_available",
+                "No UI bundled. Run 'make ui' or use --html-dir",
+            );
+        }
+    };
+
+    let body = inject_bootstrap_script(&html, state);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .unwrap()
+}
+
+fn inject_bootstrap_script(html: &str, state: &AppState) -> String {
+    let payload = serde_json::json!({
+        "workdir": state
+            .workdir
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+    });
+    let payload_json = serde_json::to_string(&payload)
+        .unwrap_or_else(|_| "{\"workdir\":null}".to_string())
+        .replace("</", "<\\/");
+    let script = format!(r#"<script>window.__TALU_BOOTSTRAP__={payload_json};</script>"#);
+
+    if let Some(index) = html.find("</head>") {
+        let mut injected = String::with_capacity(html.len() + script.len());
+        injected.push_str(&html[..index]);
+        injected.push_str(&script);
+        injected.push_str(&html[index..]);
+        injected
+    } else {
+        format!("{script}{html}")
+    }
 }
 
 /// Return bundled asset bytes by filename.
@@ -1662,7 +1755,7 @@ a:hover {
         <tr>
           <td class="mono"><a href="/docs/agent/fs"><code>agent/fs</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/agent/fs.json" title="/openapi/agent/fs.json">json</a><button class="copy-btn" data-url="/openapi/agent/fs.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Workspace filesystem runtime APIs (`/v1/agent/fs/*`).</td>
+          <td class="desc">Workdir filesystem runtime APIs (`/v1/agent/fs/*`).</td>
         </tr>
         <tr>
           <td class="mono"><a href="/docs/agent/exec"><code>agent/exec</code></a></td>

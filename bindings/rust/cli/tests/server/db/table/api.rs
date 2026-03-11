@@ -79,7 +79,7 @@ fn build_app_with_storage(temp_dir: &TempDir) -> Router {
         gateway_secret: None,
         tenant_registry: None,
         bucket_path: Some(temp_dir.path().to_path_buf()),
-        workspace_dir: std::env::current_dir().expect("cwd"),
+        workdir: Some(std::env::current_dir().expect("cwd")),
         agent_policy_json: None,
         agent_policy: None,
         html_dir: None,
@@ -94,6 +94,7 @@ fn build_app_with_storage(temp_dir: &TempDir) -> Router {
         process_session_ttl: std::time::Duration::from_secs(15 * 60),
         agent_runtime_mode: AgentRuntimeMode::Host,
         sandbox_backend: SandboxBackend::LinuxLocal,
+        pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
     };
 
     Router::new(Arc::new(state))
@@ -111,7 +112,7 @@ fn build_app_no_storage() -> Router {
         gateway_secret: None,
         tenant_registry: None,
         bucket_path: None,
-        workspace_dir: std::env::current_dir().expect("cwd"),
+        workdir: Some(std::env::current_dir().expect("cwd")),
         agent_policy_json: None,
         agent_policy: None,
         html_dir: None,
@@ -126,6 +127,7 @@ fn build_app_no_storage() -> Router {
         process_session_ttl: std::time::Duration::from_secs(15 * 60),
         agent_runtime_mode: AgentRuntimeMode::Host,
         sandbox_backend: SandboxBackend::LinuxLocal,
+        pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
     };
 
     Router::new(Arc::new(state))

@@ -76,9 +76,7 @@ pub async fn handle_exec(
     let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     let command = request.command;
     let cwd = if state.agent_runtime_mode == crate::server::AgentRuntimeMode::Strict {
-        request
-            .cwd
-            .or_else(|| Some(state.workspace_dir.to_string_lossy().into_owned()))
+        request.cwd.or_else(|| super::default_workdir(&state))
     } else {
         request.cwd
     };

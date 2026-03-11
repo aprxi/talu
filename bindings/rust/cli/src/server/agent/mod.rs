@@ -28,3 +28,10 @@ pub(crate) fn sandbox_backend_for_talu(backend: SandboxBackend) -> talu::shell::
         SandboxBackend::AppleContainer => talu::shell::SandboxBackend::AppleContainer,
     }
 }
+
+pub(crate) fn default_workdir(state: &AppState) -> Option<String> {
+    state
+        .workdir
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+}
