@@ -115,6 +115,48 @@ export interface AgentFsRenameResponse {
   to: string;
 }
 
+export type CollabParticipantKind = "human" | "agent" | "external" | "system";
+
+export interface CollabOpenSessionRequest {
+  participant_id?: string;
+  participant_kind?: CollabParticipantKind;
+  role?: string;
+}
+
+export interface CollabOpenSessionResponse {
+  resource_kind: string;
+  resource_id: string;
+  namespace: string;
+  participant_id: string;
+  participant_kind: CollabParticipantKind;
+  status: string;
+}
+
+export interface CollabSnapshotResponse {
+  resource_kind: string;
+  resource_id: string;
+  namespace: string;
+  snapshot_base64: string | null;
+  updated_at_ms: number | null;
+}
+
+export interface CollabSubmitOpRequest {
+  actor_id: string;
+  actor_seq: number;
+  op_id: string;
+  payload_base64: string;
+  issued_at_ms?: number;
+  snapshot_base64?: string;
+}
+
+export interface CollabSubmitOpResponse {
+  resource_kind: string;
+  resource_id: string;
+  namespace: string;
+  op_key: string;
+  accepted: boolean;
+}
+
 export interface AgentExecRequest {
   command: string;
   cwd?: string;
@@ -223,6 +265,9 @@ export interface ApiClient {
   agentFsRemove(body: AgentFsRemoveRequest): Promise<ApiResult<AgentFsRemoveResponse>>;
   agentFsMkdir(body: AgentFsMkdirRequest): Promise<ApiResult<AgentFsMkdirResponse>>;
   agentFsRename(body: AgentFsRenameRequest): Promise<ApiResult<AgentFsRenameResponse>>;
+  collabOpenSession(kind: string, id: string, body: CollabOpenSessionRequest): Promise<ApiResult<CollabOpenSessionResponse>>;
+  collabGetSnapshot(kind: string, id: string): Promise<ApiResult<CollabSnapshotResponse>>;
+  collabSubmitOp(kind: string, id: string, body: CollabSubmitOpRequest): Promise<ApiResult<CollabSubmitOpResponse>>;
   agentExec(body: AgentExecRequest, signal?: AbortSignal): Promise<Response>;
   agentShellCreate(body: AgentShellCreateRequest): Promise<ApiResult<AgentShellSessionResponse>>;
   agentShellDelete(shellId: string): Promise<ApiResult<AgentShellDeleteResponse>>;
@@ -513,6 +558,23 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     agentFsRemove: (body) => requestAgentJson<AgentFsRemoveResponse>("DELETE", "/v1/agent/fs/rm", body),
     agentFsMkdir: (body) => requestAgentJson<AgentFsMkdirResponse>("POST", "/v1/agent/fs/mkdir", body),
     agentFsRename: (body) => requestAgentJson<AgentFsRenameResponse>("POST", "/v1/agent/fs/rename", body),
+    collabOpenSession: (kind, id, body) =>
+      requestJson<CollabOpenSessionResponse>(
+        "POST",
+        `/v1/collab/resources/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/sessions`,
+        body,
+      ),
+    collabGetSnapshot: (kind, id) =>
+      requestJson<CollabSnapshotResponse>(
+        "GET",
+        `/v1/collab/resources/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/snapshot`,
+      ),
+    collabSubmitOp: (kind, id, body) =>
+      requestJson<CollabSubmitOpResponse>(
+        "POST",
+        `/v1/collab/resources/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/ops`,
+        body,
+      ),
     agentExec: (body, signal) => fetchFn(`${BASE}/v1/agent/exec`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },

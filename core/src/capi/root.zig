@@ -32,6 +32,7 @@ pub const db_blob = @import("db/blob.zig");
 pub const db_kv = @import("db/kv.zig");
 pub const db_sql = @import("db/sql.zig");
 pub const db_ops = @import("db/ops.zig");
+pub const collab_api = @import("collab.zig");
 
 // Force-include all DB submodule exports (needed for FFI symbol generation).
 comptime {
@@ -41,6 +42,7 @@ comptime {
     _ = db_kv;
     _ = db_sql;
     _ = db_ops;
+    _ = collab_api;
     _ = provider_config;
 }
 
@@ -256,6 +258,34 @@ pub const talu_db_kv_compact = db_kv.talu_db_kv_compact;
 pub const talu_db_kv_stats = db_kv.talu_db_kv_stats;
 pub const talu_db_kv_watch_drain = db_kv.talu_db_kv_watch_drain;
 pub const talu_db_kv_free_watch_batch = db_kv.talu_db_kv_free_watch_batch;
+
+pub const CollabHandle = collab_api.CollabHandle;
+pub const CCollabSession = collab_api.CCollabSession;
+pub const CCollabSummary = collab_api.CCollabSummary;
+pub const CCollabValue = collab_api.CCollabValue;
+pub const CCollabOpResult = collab_api.CCollabOpResult;
+pub const CCollabHistoryEntry = collab_api.CCollabHistoryEntry;
+pub const CCollabHistoryList = collab_api.CCollabHistoryList;
+pub const CCollabWatchEvent = collab_api.CCollabWatchEvent;
+pub const CCollabWatchBatch = collab_api.CCollabWatchBatch;
+pub const talu_collab_init = collab_api.talu_collab_init;
+pub const talu_collab_free = collab_api.talu_collab_free;
+pub const talu_collab_open_session = collab_api.talu_collab_open_session;
+pub const talu_collab_get_summary = collab_api.talu_collab_get_summary;
+pub const talu_collab_get_snapshot = collab_api.talu_collab_get_snapshot;
+pub const talu_collab_submit_op = collab_api.talu_collab_submit_op;
+pub const talu_collab_get_history = collab_api.talu_collab_get_history;
+pub const talu_collab_clear_snapshot = collab_api.talu_collab_clear_snapshot;
+pub const talu_collab_put_presence = collab_api.talu_collab_put_presence;
+pub const talu_collab_get_presence = collab_api.talu_collab_get_presence;
+pub const talu_collab_watch_drain = collab_api.talu_collab_watch_drain;
+pub const talu_collab_watch_wait = collab_api.talu_collab_watch_wait;
+pub const talu_collab_free_session = collab_api.talu_collab_free_session;
+pub const talu_collab_free_summary = collab_api.talu_collab_free_summary;
+pub const talu_collab_free_value = collab_api.talu_collab_free_value;
+pub const talu_collab_free_op_result = collab_api.talu_collab_free_op_result;
+pub const talu_collab_free_history = collab_api.talu_collab_free_history;
+pub const talu_collab_free_watch_batch = collab_api.talu_collab_free_watch_batch;
 
 // Re-export SQL C API functions.
 pub const talu_sql_query = sql_api.talu_sql_query;

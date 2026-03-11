@@ -22,8 +22,16 @@ fn docs_hubs_serve_navigation_index() {
         "expected /docs/agent/fs link"
     );
     assert!(
-        docs.body.contains("/docs/agent/pubsub"),
-        "expected /docs/agent/pubsub link"
+        docs.body.contains("/docs/collab/pubsub"),
+        "expected /docs/collab/pubsub link"
+    );
+    assert!(
+        docs.body.contains("/docs/collab"),
+        "expected /docs/collab link"
+    );
+    assert!(
+        docs.body.contains("/docs/collab/resources"),
+        "expected /docs/collab/resources link"
     );
     assert!(
         docs.body.contains("/docs/agent"),

@@ -48,11 +48,11 @@ describe("connectPubSub", () => {
     (globalThis as { WebSocket: typeof WebSocket }).WebSocket = FakeWebSocket as unknown as typeof WebSocket;
   });
 
-  test("connects to the agent pubsub websocket", () => {
+  test("connects to the collab pubsub websocket", () => {
     const client = connectPubSub();
 
     expect(FakeWebSocket.instances).toHaveLength(1);
-    expect(FakeWebSocket.instances[0]!.url).toContain("/v1/agent/pubsub/ws");
+    expect(FakeWebSocket.instances[0]!.url).toContain("/v1/collab/pubsub/ws");
 
     client.close();
   });

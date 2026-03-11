@@ -23,6 +23,8 @@ pub const CODE_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs
 pub const SHELL_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Default max idle time before a detached process session is evicted.
 pub const PROCESS_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Default max idle time before a detached collab handle is evicted.
+pub const COLLAB_HANDLE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// How often the session reaper runs.
 const CODE_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -30,6 +32,8 @@ const CODE_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::fro
 const SHELL_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often the process session reaper runs.
 const PROCESS_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the collab handle reaper runs.
+const COLLAB_HANDLE_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often KV batched write-behind queues are flushed.
 const KV_BATCHED_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -101,6 +105,29 @@ pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result
                     "evicted {} stale process session(s) ({} remaining)",
                     evicted,
                     sessions.len(),
+                );
+            }
+        }
+    });
+
+    // Background task: evict detached stale collab handles.
+    let collab_gc_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(COLLAB_HANDLE_REAP_INTERVAL);
+        loop {
+            interval.tick().await;
+            let mut handles = collab_gc_state.collab_handles.lock().await;
+            let before = handles.len();
+            handles.retain(|_, entry| {
+                entry.active_streams > 0 || entry.last_access.elapsed() < COLLAB_HANDLE_TTL
+            });
+            let evicted = before.saturating_sub(handles.len());
+            if evicted > 0 {
+                log::info!(
+                    target: "server::collab",
+                    "evicted {} stale collab handle(s) ({} remaining)",
+                    evicted,
+                    handles.len(),
                 );
             }
         }

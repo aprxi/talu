@@ -97,6 +97,7 @@ pub const models_config_model_description = @import("models/config/model_descrip
 
 // db (TaluDB append-only columnar storage)
 pub const db = @import("db/root.zig");
+pub const collab = @import("collab/root.zig");
 
 // responses (conversation / item / reasoning types)
 pub const responses = @import("responses/root.zig");

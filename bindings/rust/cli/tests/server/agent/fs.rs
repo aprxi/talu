@@ -1,6 +1,7 @@
 use crate::server::common::{
     assert_server_startup_fails, delete_json, get, post_json, ServerConfig, ServerTestContext,
 };
+use base64::Engine as _;
 use tempfile::TempDir;
 
 fn config_with_workspace(workspace: &TempDir) -> ServerConfig {
@@ -95,6 +96,130 @@ fn agent_fs_write_read_edit_roundtrip() {
     );
     assert_eq!(read_after.status, 200, "body: {}", read_after.body);
     assert_eq!(read_after.json()["content"], "world");
+}
+
+#[test]
+fn agent_fs_write_and_edit_sync_workdir_collab_snapshot() {
+    let workspace = TempDir::new().expect("workspace");
+    let ctx = ServerTestContext::new(config_with_workspace(&workspace));
+
+    let write_resp = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/write",
+        &serde_json::json!({
+            "path": "notes/main.txt",
+            "content": "hello",
+            "encoding": "utf-8",
+            "mkdir": true
+        }),
+    );
+    assert_eq!(write_resp.status, 200, "body: {}", write_resp.body);
+
+    let snapshot_after_write = get(
+        ctx.addr(),
+        "/v1/collab/resources/workdir_file/notes%2Fmain.txt/snapshot",
+    );
+    assert_eq!(snapshot_after_write.status, 200, "body: {}", snapshot_after_write.body);
+    let snapshot_json = snapshot_after_write.json();
+    let snapshot_bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            snapshot_json["snapshot_base64"]
+                .as_str()
+                .expect("snapshot base64"),
+        )
+        .expect("decode snapshot");
+    assert_eq!(snapshot_bytes, b"hello");
+
+    let edit_resp = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/edit",
+        &serde_json::json!({
+            "path": "notes/main.txt",
+            "old_text": "hello",
+            "new_text": "world"
+        }),
+    );
+    assert_eq!(edit_resp.status, 200, "body: {}", edit_resp.body);
+
+    let snapshot_after_edit = get(
+        ctx.addr(),
+        "/v1/collab/resources/workdir_file/notes%2Fmain.txt/snapshot",
+    );
+    assert_eq!(snapshot_after_edit.status, 200, "body: {}", snapshot_after_edit.body);
+    let snapshot_json = snapshot_after_edit.json();
+    let snapshot_bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            snapshot_json["snapshot_base64"]
+                .as_str()
+                .expect("snapshot base64"),
+        )
+        .expect("decode snapshot");
+    assert_eq!(snapshot_bytes, b"world");
+}
+
+#[test]
+fn agent_fs_remove_and_rename_sync_workdir_collab_snapshots() {
+    let workspace = TempDir::new().expect("workspace");
+    let ctx = ServerTestContext::new(config_with_workspace(&workspace));
+
+    let write_resp = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/write",
+        &serde_json::json!({
+            "path": "notes/main.txt",
+            "content": "hello",
+            "encoding": "utf-8",
+            "mkdir": true
+        }),
+    );
+    assert_eq!(write_resp.status, 200, "body: {}", write_resp.body);
+
+    let rename_resp = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/rename",
+        &serde_json::json!({
+            "from": "notes/main.txt",
+            "to": "notes/renamed.txt"
+        }),
+    );
+    assert_eq!(rename_resp.status, 200, "body: {}", rename_resp.body);
+
+    let old_snapshot = get(
+        ctx.addr(),
+        "/v1/collab/resources/workdir_file/notes%2Fmain.txt/snapshot",
+    );
+    assert_eq!(old_snapshot.status, 200, "body: {}", old_snapshot.body);
+    assert_eq!(old_snapshot.json()["snapshot_base64"], serde_json::Value::Null);
+
+    let renamed_snapshot = get(
+        ctx.addr(),
+        "/v1/collab/resources/workdir_file/notes%2Frenamed.txt/snapshot",
+    );
+    assert_eq!(renamed_snapshot.status, 200, "body: {}", renamed_snapshot.body);
+    let renamed_bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            renamed_snapshot.json()["snapshot_base64"]
+                .as_str()
+                .expect("renamed snapshot base64"),
+        )
+        .expect("decode renamed snapshot");
+    assert_eq!(renamed_bytes, b"hello");
+
+    let remove_resp = delete_json(
+        ctx.addr(),
+        "/v1/agent/fs/rm",
+        &serde_json::json!({
+            "path": "notes/renamed.txt"
+        }),
+    );
+    assert_eq!(remove_resp.status, 200, "body: {}", remove_resp.body);
+
+    let removed_snapshot = get(
+        ctx.addr(),
+        "/v1/collab/resources/workdir_file/notes%2Frenamed.txt/snapshot",
+    );
+    assert_eq!(removed_snapshot.status, 200, "body: {}", removed_snapshot.body);
+    assert_eq!(removed_snapshot.json()["snapshot_base64"], serde_json::Value::Null);
 }
 
 #[test]

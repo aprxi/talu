@@ -24,6 +24,7 @@ use crate::server::agent::shell as agent_shell;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::code;
 use crate::server::code_ws;
+use crate::server::collab;
 use crate::server::db;
 use crate::server::events;
 use crate::server::file;
@@ -105,8 +106,12 @@ static OPENAPI_DB_OPS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/ops/"]));
 static OPENAPI_AGENT_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/"]));
-static OPENAPI_AGENT_PUBSUB_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/pubsub"]));
+static OPENAPI_COLLAB_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/collab/"]));
+static OPENAPI_COLLAB_RESOURCES_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/collab/resources/"]));
+static OPENAPI_COLLAB_PUBSUB_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/collab/pubsub"]));
 static OPENAPI_AGENT_FS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/fs/"]));
 static OPENAPI_AGENT_EXEC_SPEC: Lazy<Vec<u8>> =
@@ -288,10 +293,20 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_AGENT_SPEC.clone())).boxed())
                     .unwrap(),
-                (Method::GET, "/openapi/agent/pubsub.json") => Response::builder()
+                (Method::GET, "/openapi/collab.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_AGENT_PUBSUB_SPEC.clone())).boxed())
+                    .body(Full::new(Bytes::from(OPENAPI_COLLAB_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/collab/resources.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_COLLAB_RESOURCES_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/collab/pubsub.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_COLLAB_PUBSUB_SPEC.clone())).boxed())
                     .unwrap(),
                 (Method::GET, "/openapi/agent/fs.json") => Response::builder()
                     .status(StatusCode::OK)
@@ -351,6 +366,7 @@ impl Service<Request<Incoming>> for Router {
                     swagger_ui_response("/openapi/projects.json", "Talu API :: Projects")
                 }
                 (Method::GET, "/docs/db") => docs_hub_response(),
+                (Method::GET, "/docs/collab") => docs_hub_response(),
                 (Method::GET, "/docs/agent") => docs_hub_response(),
                 (Method::GET, "/docs/db/tables") => {
                     swagger_ui_response("/openapi/db/tables.json", "Talu API :: DB::Tables")
@@ -373,9 +389,13 @@ impl Service<Request<Incoming>> for Router {
                 (Method::GET, "/docs/agent/fs") => {
                     swagger_ui_response("/openapi/agent/fs.json", "Talu API :: Agent::FS")
                 }
-                (Method::GET, "/docs/agent/pubsub") => {
-                    swagger_ui_response("/openapi/agent/pubsub.json", "Talu API :: Agent::PubSub")
+                (Method::GET, "/docs/collab/pubsub") => {
+                    swagger_ui_response("/openapi/collab/pubsub.json", "Talu API :: Collab::PubSub")
                 }
+                (Method::GET, "/docs/collab/resources") => swagger_ui_response(
+                    "/openapi/collab/resources.json",
+                    "Talu API :: Collab::Resources",
+                ),
                 (Method::GET, "/docs/agent/exec") => {
                     swagger_ui_response("/openapi/agent/exec.json", "Talu API :: Agent::Exec")
                 }
@@ -689,6 +709,33 @@ impl Service<Request<Incoming>> for Router {
                             } else {
                                 agent_process::handle_delete(state, req, auth).await
                             }
+                        }
+                        (Method::POST, p) if collab::is_collab_session_open_path(p) => {
+                            collab::handle_open_session(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_events_stream_path(p) => {
+                            collab::handle_stream_events(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_ws_path(p) => {
+                            collab::handle_ws(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_history_path(p) => {
+                            collab::handle_get_history(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_snapshot_path(p) => {
+                            collab::handle_get_snapshot(state, req, auth).await
+                        }
+                        (Method::POST, p) if collab::is_collab_ops_path(p) => {
+                            collab::handle_submit_op(state, req, auth).await
+                        }
+                        (Method::PUT, p) if collab::is_collab_presence_path(p) => {
+                            collab::handle_put_presence(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_presence_path(p) => {
+                            collab::handle_get_presence(state, req, auth).await
+                        }
+                        (Method::GET, p) if collab::is_collab_resource_root_path(p) => {
+                            collab::handle_get_resource(state, req, auth).await
                         }
                         (Method::GET, "/v1/events") => {
                             events::handle_replay(state, req, auth).await
@@ -1043,8 +1090,8 @@ impl Service<Request<Incoming>> for Router {
                         {
                             code::handle_session_delete(state, req, auth).await
                         }
-                        // Temporary WebSocket topic relay used by current editor sync.
-                        (Method::GET, "/v1/agent/pubsub/ws")
+                        // Temporary collaboration WebSocket topic relay used by current editor sync.
+                        (Method::GET, "/v1/collab/pubsub/ws")
                             if req
                                 .headers()
                                 .get("upgrade")
@@ -1387,6 +1434,7 @@ fn is_known_path(path: &str) -> bool {
         || db::table::is_table_scan_path(path)
         || db::table::is_table_meta_policy_path(path)
         || is_dynamic_vector_path(path)
+        || collab::is_collab_resource_prefix(path)
         || is_blob_item_path(path)
 }
 
@@ -1824,6 +1872,11 @@ a:hover {
           <td class="json-cell"><a class="json-link" href="/openapi/events.json" title="/openapi/events.json">json</a><button class="copy-btn" data-url="/openapi/events.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td class="desc">Unified in-memory observability stream and replay APIs (`/v1/events*`).</td>
         </tr>
+        <tr>
+          <td class="mono"><a href="/docs/collab"><code>collab</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/collab.json" title="/openapi/collab.json">json</a><button class="copy-btn" data-url="/openapi/collab.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Collaboration runtime APIs (`/v1/collab/*`).</td>
+        </tr>
       </tbody>
     </table>
   </div>
@@ -1844,11 +1897,6 @@ a:hover {
           <td class="desc">Workdir filesystem runtime APIs (`/v1/agent/fs/*`).</td>
         </tr>
         <tr>
-          <td class="mono"><a href="/docs/agent/pubsub"><code>pubsub</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/agent/pubsub.json" title="/openapi/agent/pubsub.json">json</a><button class="copy-btn" data-url="/openapi/agent/pubsub.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Temporary topic-based WebSocket relay used by current editor sync (`/v1/agent/pubsub/ws`). Planned to migrate to core-backed collaboration APIs.</td>
-        </tr>
-        <tr>
           <td class="mono"><a href="/docs/agent/exec"><code>exec</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/agent/exec.json" title="/openapi/agent/exec.json">json</a><button class="copy-btn" data-url="/openapi/agent/exec.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td class="desc">One-shot shell command execution streamed as SSE (`/v1/agent/exec`).</td>
@@ -1862,6 +1910,30 @@ a:hover {
           <td class="mono"><a href="/docs/agent/process"><code>process</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/agent/process.json" title="/openapi/agent/process.json">json</a><button class="copy-btn" data-url="/openapi/agent/process.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td class="desc">Long-lived process sessions with stdin send and SSE stream endpoints (`/v1/agent/processes/*`).</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th><a class="header-link" href="/docs/collab"><code>/docs/collab</code></a></th>
+          <th class="json-cell"><a class="json-link" href="/openapi/collab.json" title="/openapi/collab.json">json</a><button class="copy-btn" data-url="/openapi/collab.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono"><a href="/docs/collab/resources"><code>resources</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/collab/resources.json" title="/openapi/collab/resources.json">json</a><button class="copy-btn" data-url="/openapi/collab/resources.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Session, ops, presence, snapshot, history, SSE watch, and active WebSocket APIs for collaborative resources (`/v1/collab/resources/*`).</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/collab/pubsub"><code>pubsub</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/collab/pubsub.json" title="/openapi/collab/pubsub.json">json</a><button class="copy-btn" data-url="/openapi/collab/pubsub.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Legacy topic-based WebSocket relay retained for compatibility (`/v1/collab/pubsub/ws`) alongside the resource-backed collab APIs.</td>
         </tr>
       </tbody>
     </table>

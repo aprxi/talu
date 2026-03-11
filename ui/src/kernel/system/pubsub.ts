@@ -1,10 +1,9 @@
 /**
  * PubSub client — topic-based publish-subscribe over a single WebSocket.
  *
- * Used for instant cross-window sync in the current editor implementation. The server
- * at `/v1/agent/pubsub/ws` relays published messages to all other subscribers
- * of the same topic. This is a temporary transport pending a core-backed
- * collaboration/session API.
+ * This remains a compatibility transport. The server at `/v1/collab/pubsub/ws`
+ * relays published messages to all other subscribers of the same topic while
+ * newer editor flows move to resource-backed collaboration sessions.
  */
 
 import type { Disposable } from "../types.ts";
@@ -51,7 +50,7 @@ export function connectPubSub(): PubSubClient {
   function connect(): void {
     if (closed) return;
 
-    ws = new WebSocket(toWsUrl("/v1/agent/pubsub/ws"));
+    ws = new WebSocket(toWsUrl("/v1/collab/pubsub/ws"));
 
     ws.addEventListener("open", () => {
       // Re-subscribe to all active topics after reconnect.

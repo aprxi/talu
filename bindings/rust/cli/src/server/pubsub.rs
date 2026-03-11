@@ -1,4 +1,4 @@
-//! `/v1/agent/pubsub/ws` — lightweight topic-based publish-subscribe over WebSocket.
+//! `/v1/collab/pubsub/ws` — lightweight collaboration relay over WebSocket.
 //!
 //! Clients connect, subscribe to topics, and publish messages. The server
 //! relays each published message to all *other* subscribers of that topic.
@@ -123,7 +123,7 @@ pub(crate) struct PubSubRelayMessage {
 // WebSocket handler
 // ---------------------------------------------------------------------------
 
-#[utoipa::path(get, path = "/v1/agent/pubsub/ws", tag = "Agent::PubSub",
+#[utoipa::path(get, path = "/v1/collab/pubsub/ws", tag = "Collab::PubSub",
     responses(
         (status = 101, description = "WebSocket upgrade. Clients send subscribe/unsubscribe/publish envelopes and receive relayed message envelopes."),
         (status = 400, body = crate::server::http::ErrorResponse),

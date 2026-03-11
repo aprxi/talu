@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use talu::{FsError, FsHandle};
 use utoipa::ToSchema;
 
+use crate::server::collab::{open_collab_handle, resolve_storage_root};
 use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;
 
@@ -22,6 +23,8 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infalli
 
 const DEFAULT_MAX_READ_BYTES: usize = 256 * 1024;
 const DEFAULT_LIST_LIMIT: usize = 1000;
+const COLLAB_WORKDIR_RESOURCE_KIND: &str = "workdir_file";
+const COLLAB_SYNC_ACTOR_ID: &str = "system:agent_fs";
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct FsReadRequest {
@@ -249,6 +252,139 @@ fn to_workspace_relative(workspace: &Path, requested: &str) -> String {
     }
 }
 
+fn collab_resource_id_for_workdir_file(workdir: &Path, requested: &str) -> String {
+    to_workspace_relative(workdir, requested)
+}
+
+fn full_read_limit_for_current_file(fs: &FsHandle, path: &str) -> Result<usize, FsError> {
+    let stat = fs.stat(path)?;
+    let size = usize::try_from(stat.size)
+        .map_err(|_| FsError::TooLarge("file is too large to mirror into collab".to_string()))?;
+    Ok(size.saturating_add(1).max(1))
+}
+
+async fn sync_workdir_collab_snapshot(
+    state: &Arc<AppState>,
+    auth: Option<&AuthContext>,
+    resource_id: &str,
+    snapshot: &[u8],
+    op_kind: &str,
+) {
+    if state.bucket_path.is_none() {
+        return;
+    }
+
+    let Ok(root) = resolve_storage_root(state, auth) else {
+        return;
+    };
+    let Ok(collab) =
+        open_collab_handle(state, &root, COLLAB_WORKDIR_RESOURCE_KIND, resource_id).await
+    else {
+        return;
+    };
+
+    let issued_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let actor_seq = if issued_at_ms <= 0 {
+        1
+    } else {
+        u64::try_from(issued_at_ms).unwrap_or(u64::MAX)
+    };
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "type": op_kind,
+        "source": "agent.fs",
+        "resource_kind": COLLAB_WORKDIR_RESOURCE_KIND,
+        "resource_id": resource_id,
+        "snapshot_bytes": snapshot.len(),
+        "issued_at_ms": issued_at_ms,
+    }))
+    .unwrap_or_else(|_| b"{}".to_vec());
+    let op_id = format!("{op_kind}-{actor_seq}");
+    let _ = collab.submit_op(
+        COLLAB_SYNC_ACTOR_ID,
+        actor_seq,
+        &op_id,
+        &payload,
+        Some(issued_at_ms),
+        Some(snapshot),
+    );
+}
+
+async fn clear_workdir_collab_snapshot(
+    state: &Arc<AppState>,
+    auth: Option<&AuthContext>,
+    resource_id: &str,
+    op_kind: &str,
+) {
+    if state.bucket_path.is_none() {
+        return;
+    }
+
+    let Ok(root) = resolve_storage_root(state, auth) else {
+        return;
+    };
+    let Ok(collab) =
+        open_collab_handle(state, &root, COLLAB_WORKDIR_RESOURCE_KIND, resource_id).await
+    else {
+        return;
+    };
+    let _ = collab.clear_snapshot(
+        COLLAB_SYNC_ACTOR_ID,
+        talu::collab::ParticipantKind::System,
+        Some("sync"),
+        op_kind,
+    );
+}
+
+fn absolute_workdir_path(workdir: &Path, requested: &str) -> PathBuf {
+    let requested_path = Path::new(requested);
+    if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        workdir.join(requested_path)
+    }
+}
+
+fn collect_workdir_file_resource_ids(workdir: &Path, requested: &str) -> std::io::Result<Vec<String>> {
+    let mut resource_ids = Vec::new();
+    collect_workdir_file_resource_ids_from_absolute(
+        workdir,
+        &absolute_workdir_path(workdir, requested),
+        &mut resource_ids,
+    )?;
+    Ok(resource_ids)
+}
+
+fn collect_workdir_file_resource_ids_from_absolute(
+    workdir: &Path,
+    absolute: &Path,
+    resource_ids: &mut Vec<String>,
+) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(absolute)?;
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(absolute)? {
+            let entry = entry?;
+            collect_workdir_file_resource_ids_from_absolute(workdir, &entry.path(), resource_ids)?;
+        }
+        return Ok(());
+    }
+
+    resource_ids.push(to_workspace_relative(workdir, &absolute.to_string_lossy()));
+    Ok(())
+}
+
+fn map_renamed_resource_id(from: &str, to: &str, existing: &str) -> Option<String> {
+    let suffix = Path::new(existing).strip_prefix(Path::new(from)).ok()?;
+    let mapped = if suffix.as_os_str().is_empty() {
+        PathBuf::from(to)
+    } else {
+        Path::new(to).join(suffix)
+    };
+    Some(mapped.to_string_lossy().to_string())
+}
+
 fn fs_error_response(err: FsError, fallback: &str) -> Response<BoxBody> {
     let message = err.to_string();
     match err {
@@ -342,7 +478,7 @@ pub async fn handle_read(
 pub async fn handle_write(
     state: Arc<AppState>,
     req: Request<Incoming>,
-    _auth: Option<AuthContext>,
+    auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -359,19 +495,32 @@ pub async fn handle_write(
     };
 
     let policy = load_policy(&state);
-    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
-        Ok(value) => value,
-        Err(resp) => return resp,
+    let (result, response_path, resource_id) = {
+        let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+            Ok(value) => value,
+            Err(resp) => return resp,
+        };
+        let result = match fs.write(&request.path, &content, request.mkdir.unwrap_or(false)) {
+            Ok(v) => v,
+            Err(e) => return fs_error_response(e, "failed to write file"),
+        };
+        let response_path = to_workspace_relative(workdir, &request.path);
+        let resource_id = collab_resource_id_for_workdir_file(workdir, &request.path);
+        (result, response_path, resource_id)
     };
-    let result = match fs.write(&request.path, &content, request.mkdir.unwrap_or(false)) {
-        Ok(v) => v,
-        Err(e) => return fs_error_response(e, "failed to write file"),
-    };
+    sync_workdir_collab_snapshot(
+        &state,
+        auth.as_ref(),
+        &resource_id,
+        &content,
+        "fs_write",
+    )
+    .await;
 
     json_response(
         StatusCode::OK,
         &FsWriteResponse {
-            path: to_workspace_relative(workdir, &request.path),
+            path: response_path,
             bytes_written: result.bytes_written,
         },
     )
@@ -383,7 +532,7 @@ pub async fn handle_write(
 pub async fn handle_edit(
     state: Arc<AppState>,
     req: Request<Incoming>,
-    _auth: Option<AuthContext>,
+    auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -394,24 +543,47 @@ pub async fn handle_edit(
         Err(resp) => return resp,
     };
     let policy = load_policy(&state);
-    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
-        Ok(value) => value,
-        Err(resp) => return resp,
+    let (result, response_path, resource_id, snapshot_bytes) = {
+        let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+            Ok(value) => value,
+            Err(resp) => return resp,
+        };
+        let result = match fs.edit(
+            &request.path,
+            request.old_text.as_bytes(),
+            request.new_text.as_bytes(),
+            request.replace_all.unwrap_or(false),
+        ) {
+            Ok(v) => v,
+            Err(e) => return fs_error_response(e, "failed to edit file"),
+        };
+        let snapshot_bytes =
+            if let Ok(read_limit) = full_read_limit_for_current_file(&fs, &request.path) {
+                fs.read(&request.path, read_limit)
+                    .ok()
+                    .map(|read_back| read_back.content)
+            } else {
+                None
+            };
+        let response_path = to_workspace_relative(workdir, &request.path);
+        let resource_id = collab_resource_id_for_workdir_file(workdir, &request.path);
+        (result, response_path, resource_id, snapshot_bytes)
     };
-    let result = match fs.edit(
-        &request.path,
-        request.old_text.as_bytes(),
-        request.new_text.as_bytes(),
-        request.replace_all.unwrap_or(false),
-    ) {
-        Ok(v) => v,
-        Err(e) => return fs_error_response(e, "failed to edit file"),
-    };
+    if let Some(snapshot_bytes) = snapshot_bytes.as_deref() {
+        sync_workdir_collab_snapshot(
+            &state,
+            auth.as_ref(),
+            &resource_id,
+            snapshot_bytes,
+            "fs_edit",
+        )
+        .await;
+    }
 
     json_response(
         StatusCode::OK,
         &FsEditResponse {
-            path: to_workspace_relative(workdir, &request.path),
+            path: response_path,
             replacements: result.replacements,
         },
     )
@@ -518,7 +690,7 @@ pub async fn handle_list(
 pub async fn handle_remove(
     state: Arc<AppState>,
     req: Request<Incoming>,
-    _auth: Option<AuthContext>,
+    auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -530,20 +702,28 @@ pub async fn handle_remove(
     };
 
     let policy = load_policy(&state);
-    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
-        Ok(value) => value,
-        Err(resp) => return resp,
+    let (response_path, removed_resource_ids) = {
+        let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+            Ok(value) => value,
+            Err(resp) => return resp,
+        };
+        let removed_resource_ids = collect_workdir_file_resource_ids(workdir, &request.path).ok();
+        let response_path = to_workspace_relative(workdir, &request.path);
+        match fs.remove(&request.path, request.recursive.unwrap_or(false)) {
+            Ok(()) => (response_path, removed_resource_ids.unwrap_or_default()),
+            Err(e) => return fs_error_response(e, "failed to remove path"),
+        }
     };
-    match fs.remove(&request.path, request.recursive.unwrap_or(false)) {
-        Ok(()) => json_response(
-            StatusCode::OK,
-            &FsRemoveResponse {
-                path: to_workspace_relative(workdir, &request.path),
-                removed: true,
-            },
-        ),
-        Err(e) => fs_error_response(e, "failed to remove path"),
+    for resource_id in &removed_resource_ids {
+        clear_workdir_collab_snapshot(&state, auth.as_ref(), resource_id, "fs_delete").await;
     }
+    json_response(
+        StatusCode::OK,
+        &FsRemoveResponse {
+            path: response_path,
+            removed: true,
+        },
+    )
 }
 
 #[utoipa::path(post, path = "/v1/agent/fs/mkdir", tag = "Agent::FS",
@@ -586,7 +766,7 @@ pub async fn handle_mkdir(
 pub async fn handle_rename(
     state: Arc<AppState>,
     req: Request<Incoming>,
-    _auth: Option<AuthContext>,
+    auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -598,20 +778,57 @@ pub async fn handle_rename(
     };
 
     let policy = load_policy(&state);
-    let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
-        Ok(value) => value,
-        Err(resp) => return resp,
+    let (from_path, to_path, removed_resource_ids, renamed_targets) = {
+        let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
+            Ok(value) => value,
+            Err(resp) => return resp,
+        };
+        let from_path = to_workspace_relative(workdir, &request.from);
+        let to_path = to_workspace_relative(workdir, &request.to);
+        let source_resource_ids = collect_workdir_file_resource_ids(workdir, &request.from).ok();
+        match fs.rename(&request.from, &request.to) {
+            Ok(()) => {
+                let renamed_targets = source_resource_ids
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|resource_id| {
+                        map_renamed_resource_id(&from_path, &to_path, resource_id).map(|mapped| {
+                            let bytes = full_read_limit_for_current_file(&fs, &mapped)
+                                .ok()
+                                .and_then(|read_limit| fs.read(&mapped, read_limit).ok())
+                                .map(|read| read.content);
+                            (mapped, bytes)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (from_path, to_path, source_resource_ids.unwrap_or_default(), renamed_targets)
+            }
+            Err(e) => return fs_error_response(e, "failed to rename path"),
+        }
     };
-    match fs.rename(&request.from, &request.to) {
-        Ok(()) => json_response(
-            StatusCode::OK,
-            &FsRenameResponse {
-                from: to_workspace_relative(workdir, &request.from),
-                to: to_workspace_relative(workdir, &request.to),
-            },
-        ),
-        Err(e) => fs_error_response(e, "failed to rename path"),
+    for resource_id in &removed_resource_ids {
+        clear_workdir_collab_snapshot(&state, auth.as_ref(), resource_id, "fs_rename").await;
     }
+    for (resource_id, snapshot_bytes) in &renamed_targets {
+        if let Some(snapshot_bytes) = snapshot_bytes.as_deref() {
+            sync_workdir_collab_snapshot(
+                &state,
+                auth.as_ref(),
+                resource_id,
+                snapshot_bytes,
+                "fs_rename",
+            )
+            .await;
+        }
+    }
+    json_response(
+        StatusCode::OK,
+        &FsRenameResponse {
+            from: from_path,
+            to: to_path,
+        },
+    )
 }
 
 fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<BoxBody> {

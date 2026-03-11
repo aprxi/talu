@@ -8,6 +8,7 @@ mod server {
     pub mod auth;
     pub mod chat;
     pub mod code;
+    pub mod collab;
     pub mod common;
     pub mod compliance;
     pub mod console;

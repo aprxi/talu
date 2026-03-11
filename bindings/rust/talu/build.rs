@@ -46,8 +46,8 @@ fn main() {
     // executable. Works for any machine, any checkout location, and on
     // crates.io once libtalu.so is placed next to the binary.
     if cfg!(target_os = "linux") {
-        println!("cargo:rustc-link-arg-tests=-Wl,-rpath,$ORIGIN");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
     } else if cfg!(target_os = "macos") {
-        println!("cargo:rustc-link-arg-tests=-Wl,-rpath,@executable_path");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
     }
 }

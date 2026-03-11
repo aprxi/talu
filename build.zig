@@ -776,6 +776,7 @@ pub fn build(b: *std.Build) void {
         \\  validate
         \\  io
         \\  db
+        \\  collab
         \\  template
         \\  policy
         \\  models
@@ -835,6 +836,15 @@ pub fn build(b: *std.Build) void {
         "index build",
         "vector",
         "bench",
+    });
+    ut.addLazy("collab", b.path("core/src/lib.zig"), &.{
+        "ResourceStore",
+        "SessionStore",
+        "OperationEnvelope",
+        "StorageLane",
+        "TextCrdt",
+        "LamportClock",
+        "collab",
     });
     ut.addLazy("template", b.path("core/src/lib.zig"), &.{
         "TemplateInput",

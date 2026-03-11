@@ -48,6 +48,7 @@
 //! Both implement [`responses::ResponsesView`] for read access to items.
 
 pub mod blobs;
+pub mod collab;
 pub mod convert;
 pub mod documents;
 pub mod error;
@@ -81,6 +82,14 @@ pub use wrappers::{
 
 // Re-export commonly used types for CLI convenience
 pub use blobs::{BlobError, BlobGcStats, BlobReadStream, BlobWriteStream, BlobsHandle};
+pub use collab::{
+    BinaryValue as CollabBinaryValue, CollabError, CollabHandle,
+    HistoryEntry as CollabHistoryEntry, OpSubmitResult as CollabOpSubmitResult,
+    ParticipantKind as CollabParticipantKind, ResourceSummary as CollabResourceSummary,
+    SessionInfo as CollabSessionInfo, WatchBatch as CollabWatchBatch,
+    WatchDurability as CollabWatchDurability, WatchEvent as CollabWatchEvent,
+    WatchEventType as CollabWatchEventType,
+};
 pub use convert::{
     ConvertOptions, ConvertProgress, ConvertResult, ProgressAction as ConvertProgressAction, Scheme,
 };

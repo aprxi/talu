@@ -51,6 +51,7 @@ pub const tensor = @import("tensor.zig");
 pub const xray = @import("xray/root.zig");
 pub const validate = @import("validate/root.zig");
 pub const db = @import("db/root.zig");
+pub const collab = @import("collab/root.zig");
 pub const policy = @import("agent/policy/root.zig");
 pub const dump = @import("xray/dump/root.zig");
 pub const agent = @import("agent/root.zig");
@@ -407,6 +408,24 @@ comptime {
     _ = &capi.talu_db_kv_stats;
     _ = &capi.talu_db_kv_watch_drain;
     _ = &capi.talu_db_kv_free_watch_batch;
+    _ = &capi.talu_collab_init;
+    _ = &capi.talu_collab_free;
+    _ = &capi.talu_collab_open_session;
+    _ = &capi.talu_collab_get_summary;
+    _ = &capi.talu_collab_get_snapshot;
+    _ = &capi.talu_collab_submit_op;
+    _ = &capi.talu_collab_get_history;
+    _ = &capi.talu_collab_clear_snapshot;
+    _ = &capi.talu_collab_put_presence;
+    _ = &capi.talu_collab_get_presence;
+    _ = &capi.talu_collab_watch_drain;
+    _ = &capi.talu_collab_watch_wait;
+    _ = &capi.talu_collab_free_session;
+    _ = &capi.talu_collab_free_summary;
+    _ = &capi.talu_collab_free_value;
+    _ = &capi.talu_collab_free_op_result;
+    _ = &capi.talu_collab_free_history;
+    _ = &capi.talu_collab_free_watch_batch;
 
     // Vector DB idempotent write API
     _ = &capi.talu_db_vector_append_idempotent_ex;

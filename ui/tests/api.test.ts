@@ -261,6 +261,28 @@ describe("ApiClient — URL paths and methods", () => {
     expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({ path: "notes.txt", max_bytes: 128 });
   });
 
+  test("collabOpenSession → POST /v1/collab/resources/:kind/:id/sessions", async () => {
+    await client.collabOpenSession("workdir_file", "notes/main.txt", {
+      participant_id: "human:1",
+      participant_kind: "human",
+      role: "editor",
+    });
+    expect(calls[0]!.url).toBe("/v1/collab/resources/workdir_file/notes%2Fmain.txt/sessions");
+    expect(calls[0]!.init?.method).toBe("POST");
+  });
+
+  test("collabSubmitOp → POST /v1/collab/resources/:kind/:id/ops", async () => {
+    await client.collabSubmitOp("workdir_file", "notes/main.txt", {
+      actor_id: "human:1",
+      actor_seq: 1,
+      op_id: "ui_live-1",
+      payload_base64: "e30=",
+      snapshot_base64: "aGVsbG8=",
+    });
+    expect(calls[0]!.url).toBe("/v1/collab/resources/workdir_file/notes%2Fmain.txt/ops");
+    expect(calls[0]!.init?.method).toBe("POST");
+  });
+
   test("agentFsRemove → DELETE /v1/agent/fs/rm with JSON body", async () => {
     await client.agentFsRemove({ path: "notes.txt", recursive: true });
     expect(calls[0]!.url).toBe("/v1/agent/fs/rm");

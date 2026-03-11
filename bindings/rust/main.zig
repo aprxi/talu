@@ -1,5 +1,6 @@
 const std = @import("std");
 
+// Thin Zig executable shim that transfers control into the Rust CLI entrypoint.
 extern fn talu_cli_main() c_int;
 
 pub fn main() void {

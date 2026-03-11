@@ -11,6 +11,7 @@ pub mod agent;
 pub mod auth_gateway;
 pub mod code;
 pub mod code_ws;
+pub mod collab;
 pub mod db;
 pub mod events;
 pub mod file;
@@ -302,6 +303,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         process_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         process_session_ttl: listen::PROCESS_SESSION_TTL,
         kv_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        collab_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         agent_runtime_mode: args.agent_runtime_mode,
         sandbox_backend,
         pubsub: tokio::sync::Mutex::new(pubsub::PubSubState::new()),

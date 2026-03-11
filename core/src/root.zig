@@ -18,6 +18,7 @@ pub const compute = @import("compute/root.zig");
 pub const validate = @import("validate/root.zig");
 pub const db = @import("db/root.zig");
 pub const image = @import("image/root.zig");
+pub const collab = @import("collab/root.zig");
 
 // =============================================================================
 // Behavioral Type Exports

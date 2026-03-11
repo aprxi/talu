@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use talu::collab::CollabHandle;
 use talu::kv::KvHandle;
 use talu::policy::Policy;
 use talu::InferenceBackend;
@@ -89,6 +90,13 @@ pub struct ProcessSession {
     pub attached_streams: usize,
 }
 
+pub struct CollabHandleEntry {
+    pub handle: Arc<CollabHandle>,
+    pub last_access: std::time::Instant,
+    /// Number of currently attached live stream clients (SSE or WebSocket).
+    pub active_streams: usize,
+}
+
 pub struct AppState {
     pub backend: Arc<Mutex<BackendState>>,
     pub configured_model: Option<String>,
@@ -126,6 +134,8 @@ pub struct AppState {
     pub process_session_ttl: std::time::Duration,
     /// Shared long-lived KV namespace handles keyed by `<root>\0<namespace>`.
     pub kv_handles: Mutex<HashMap<String, Arc<Mutex<KvHandle>>>>,
+    /// Shared long-lived collab resource handles keyed by `<root>\0<kind>\0<id>`.
+    pub collab_handles: Mutex<HashMap<String, CollabHandleEntry>>,
     /// Agent terminal runtime mode (`host` vs `strict`).
     pub agent_runtime_mode: AgentRuntimeMode,
     /// Selected sandbox backend.

@@ -40,6 +40,7 @@ fn build_app() -> Router {
         process_sessions: Mutex::new(HashMap::new()),
         process_session_ttl: std::time::Duration::from_secs(15 * 60),
         kv_handles: Mutex::new(HashMap::new()),
+        collab_handles: Mutex::new(HashMap::new()),
         agent_runtime_mode: AgentRuntimeMode::Host,
         sandbox_backend: SandboxBackend::LinuxLocal,
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
@@ -82,9 +83,9 @@ fn ws_request(path: &str) -> Request<Full<Bytes>> {
 }
 
 #[tokio::test]
-async fn agent_pubsub_websocket_is_exposed_under_agent_namespace() {
+async fn collab_pubsub_websocket_is_exposed_under_collab_namespace() {
     let app = build_app();
-    let resp = send_request(&app, ws_request("/v1/agent/pubsub/ws")).await;
+    let resp = send_request(&app, ws_request("/v1/collab/pubsub/ws")).await;
     assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
 }
 
