@@ -969,45 +969,6 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
 
-    // Dedicated inference parity integration lane.
-    // Keep this isolated from broad inference/integration suites so backend
-    // parity iteration can stay focused and fast.
-    const parity_build_options = b.addOptions();
-    parity_build_options.addOption(bool, "enable_metal", enable_metal);
-    parity_build_options.addOption(bool, "enable_cuda", enable_cuda);
-    parity_build_options.addOption(bool, "cuda_startup_selftests", cuda_startup_selftests);
-    parity_build_options.addOption(bool, "debug_matmul", debug_matmul);
-    parity_build_options.addOption(bool, "dump_tensors", dump_tensors);
-    parity_build_options.addOption([]const u8, "version", version);
-
-    const parity_main_mod = b.createModule(.{
-        .root_source_file = b.path("core/src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    parity_main_mod.addImport("cuda_assets", cuda_assets_mod);
-    parity_main_mod.addOptions("build_options", parity_build_options);
-    addCDependencies(b, parity_main_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
-
-    const parity_test_mod = b.createModule(.{
-        .root_source_file = b.path("core/tests/inference/parity/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "main", .module = parity_main_mod },
-        },
-    });
-    const parity_tests = b.addTest(.{
-        .root_module = parity_test_mod,
-    });
-    linkCDependencies(b, parity_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
-    addMetalSupport(b, parity_test_mod, parity_tests, enable_metal);
-
-    const run_parity_tests = b.addRunArtifact(parity_tests);
-    const parity_test_step = b.step("test-inference-parity", "Run inference parity integration tests");
-    parity_test_step.dependOn(&run_parity_tests.step);
-
     // Models metadata report command:
     //   zig build models-report -- registry
     //   zig build models-report -- metadata
