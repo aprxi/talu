@@ -6,22 +6,22 @@ extern "C" __global__ void talu_gated_delta_conv_values_f32(
     const float* bias,
     unsigned int conv_dim,
     unsigned int d_conv,
-    unsigned int has_bias
+    unsigned int has_bias,
+    unsigned int ring_head
 ) {
     const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= conv_dim) return;
+    if (d_conv == 0 || ring_head >= d_conv) return;
 
-    if (d_conv > 1) {
-        for (unsigned int k = 0; k + 1 < d_conv; ++k) {
-            state[k * conv_dim + ch] = state[(k + 1) * conv_dim + ch];
-        }
-    }
-
-    state[(d_conv - 1) * conv_dim + ch] = values[ch];
+    state[ring_head * conv_dim + ch] = values[ch];
 
     float acc = 0.0f;
+    unsigned int state_row = ring_head + 1;
+    if (state_row >= d_conv) state_row = 0;
     for (unsigned int k = 0; k < d_conv; ++k) {
-        acc += state[k * conv_dim + ch] * weight_time_major[k * conv_dim + ch];
+        acc += state[state_row * conv_dim + ch] * weight_time_major[k * conv_dim + ch];
+        state_row += 1;
+        if (state_row >= d_conv) state_row = 0;
     }
     if (has_bias != 0u) {
         acc += bias[ch];

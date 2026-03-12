@@ -92,7 +92,6 @@ extern "C" __global__ void talu_gated_delta_ssm_f32(
         for (unsigned int k_idx = 0; k_idx < d_head; ++k_idx) {
             const unsigned int state_idx = state_base + k_idx * d_head + out_idx;
             const float scaled = state[state_idx] * g_exp;
-            state[state_idx] = scaled;
             kv += scaled * key_norm[k_idx];
             acc += scaled * query_norm[k_idx];
         }
@@ -102,7 +101,8 @@ extern "C" __global__ void talu_gated_delta_ssm_f32(
 
         for (unsigned int k_idx = 0; k_idx < d_head; ++k_idx) {
             const unsigned int state_idx = state_base + k_idx * d_head + out_idx;
-            state[state_idx] += kv * key_norm[k_idx];
+            const float scaled = state[state_idx] * g_exp;
+            state[state_idx] = scaled + kv * key_norm[k_idx];
         }
 
         out[head_idx * d_head + out_idx] = acc;

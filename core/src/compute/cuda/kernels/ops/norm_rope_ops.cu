@@ -103,6 +103,7 @@ extern "C" __global__ void talu_rope_f32(
 ) {
     // Llama/Qwen-style half-rotation layout: first half rotates with second half.
     const unsigned int half = rope_dim >> 1;
+    const float log2_theta = log2f(theta);
     const unsigned int pair_index = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int total_pairs = n_heads * half;
     if (pair_index >= total_pairs) return;
@@ -111,7 +112,7 @@ extern "C" __global__ void talu_rope_f32(
     const unsigned int pair = pair_index % half;
     const unsigned int base = head * head_dim;
 
-    const float inv_freq = powf(theta, -2.0f * (float)pair / (float)rope_dim);
+    const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
     const float angle = (float)position * inv_freq;
     float s = 0.0f;
     float c = 0.0f;
@@ -140,6 +141,7 @@ extern "C" __global__ void talu_rope_store_f16(
     const unsigned int head = idx / head_dim;
     const unsigned int dim = idx % head_dim;
     const unsigned int base = head * head_dim;
+    const float log2_theta = log2f(theta);
 
     float out_v = input_f32[idx];
     if (dim < rope_dim) {
@@ -149,7 +151,7 @@ extern "C" __global__ void talu_rope_store_f16(
         const unsigned int hi_idx = base + half + pair;
         const float x0 = input_f32[lo_idx];
         const float x1 = input_f32[hi_idx];
-        const float inv_freq = powf(theta, -2.0f * (float)pair / (float)rope_dim);
+        const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
         const float angle = (float)position * inv_freq;
         float s = 0.0f;
         float c = 0.0f;
@@ -179,6 +181,7 @@ extern "C" __global__ void talu_kv_write_f16(
     const unsigned int head = idx / head_dim;
     const unsigned int dim = idx % head_dim;
     const unsigned int base = head * head_dim;
+    const float log2_theta = log2f(theta);
 
     float k_out = input_k_f32[idx];
     if (dim < rope_dim) {
@@ -188,7 +191,7 @@ extern "C" __global__ void talu_kv_write_f16(
         const unsigned int hi_idx = base + half + pair;
         const float x0 = input_k_f32[lo_idx];
         const float x1 = input_k_f32[hi_idx];
-        const float inv_freq = powf(theta, -2.0f * (float)pair / (float)rope_dim);
+        const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
         const float angle = (float)position * inv_freq;
         float s = 0.0f;
         float c = 0.0f;
@@ -200,4 +203,53 @@ extern "C" __global__ void talu_kv_write_f16(
     __half* out_v = reinterpret_cast<__half*>(out_v_f16);
     out_k[idx] = __float2half_rn(k_out);
     out_v[idx] = __float2half_rn(input_v_f32[idx]);
+}
+
+extern "C" __global__ void talu_kv_write_f16_rows(
+    unsigned short* out_k_f16,
+    unsigned short* out_v_f16,
+    const float* input_k_f32,
+    const float* input_v_f32,
+    unsigned int n_heads,
+    unsigned int head_dim,
+    unsigned int rope_dim,
+    unsigned int q_rows,
+    unsigned int row_stride,
+    unsigned int position_base,
+    float theta
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int row_width = n_heads * head_dim;
+    const unsigned int total = q_rows * row_width;
+    if (idx >= total) return;
+
+    const unsigned int row = idx / row_width;
+    const unsigned int row_offset = idx - (row * row_width);
+    const unsigned int head = row_offset / head_dim;
+    const unsigned int dim = row_offset % head_dim;
+    const unsigned int row_base = row * row_width;
+    const unsigned int head_base = row_base + (head * head_dim);
+    const float log2_theta = log2f(theta);
+
+    float k_out = input_k_f32[idx];
+    if (dim < rope_dim) {
+        const unsigned int half = rope_dim >> 1;
+        const unsigned int pair = (dim < half) ? dim : (dim - half);
+        const unsigned int lo_idx = head_base + pair;
+        const unsigned int hi_idx = head_base + half + pair;
+        const float x0 = input_k_f32[lo_idx];
+        const float x1 = input_k_f32[hi_idx];
+        const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+        const float angle = (float)(position_base + row) * inv_freq;
+        float s = 0.0f;
+        float c = 0.0f;
+        __sincosf(angle, &s, &c);
+        k_out = (dim < half) ? fmaf(x0, c, -x1 * s) : fmaf(x0, s, x1 * c);
+    }
+
+    const unsigned int out_idx = row * row_stride + row_offset;
+    __half* out_k = reinterpret_cast<__half*>(out_k_f16);
+    __half* out_v = reinterpret_cast<__half*>(out_v_f16);
+    out_k[out_idx] = __float2half_rn(k_out);
+    out_v[out_idx] = __float2half_rn(input_v_f32[idx]);
 }

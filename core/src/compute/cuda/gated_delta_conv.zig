@@ -22,8 +22,9 @@ pub fn runWithFunction(
     out: *device_mod.Buffer,
     conv_dim: u32,
     d_conv: u32,
+    ring_head: u32,
 ) !void {
-    try validateArgs(values, state, weight_time_major, bias, out, conv_dim, d_conv);
+    try validateArgs(values, state, weight_time_major, bias, out, conv_dim, d_conv, ring_head);
 
     arg_pack.reset();
     try arg_pack.appendBufferPtr(out);
@@ -34,6 +35,7 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, conv_dim);
     try arg_pack.appendScalar(u32, d_conv);
     try arg_pack.appendScalar(u32, if (bias != null) 1 else 0);
+    try arg_pack.appendScalar(u32, ring_head);
 
     const block_x: u32 = 256;
     try launch_mod.launch(device, function, .{
@@ -50,8 +52,10 @@ fn validateArgs(
     out: *const device_mod.Buffer,
     conv_dim: u32,
     d_conv: u32,
+    ring_head: u32,
 ) !void {
     if (conv_dim == 0 or d_conv == 0) return error.InvalidArgument;
+    if (ring_head >= d_conv) return error.InvalidArgument;
     const vec_bytes = std.math.mul(usize, @as(usize, conv_dim), @sizeOf(f32)) catch return error.InvalidArgument;
     if (values.size < vec_bytes or out.size < vec_bytes) return error.InvalidArgument;
 
@@ -71,7 +75,7 @@ test "validateArgs rejects zero dimensions" {
     const vec = device_mod.Buffer{ .pointer = 0, .size = 16 };
     try std.testing.expectError(
         error.InvalidArgument,
-        validateArgs(&vec, &vec, &vec, null, &vec, 0, 3),
+        validateArgs(&vec, &vec, &vec, null, &vec, 0, 3, 0),
     );
 }
 
@@ -80,7 +84,7 @@ test "validateArgs rejects undersized state buffer" {
     const small_state = device_mod.Buffer{ .pointer = 0, .size = 4 * @sizeOf(f32) };
     try std.testing.expectError(
         error.InvalidArgument,
-        validateArgs(&vec, &small_state, &vec, null, &vec, 8, 2),
+        validateArgs(&vec, &small_state, &vec, null, &vec, 8, 2, 0),
     );
 }
 
@@ -90,6 +94,15 @@ test "validateArgs rejects undersized bias when provided" {
     const small_bias = device_mod.Buffer{ .pointer = 0, .size = @sizeOf(f32) };
     try std.testing.expectError(
         error.InvalidArgument,
-        validateArgs(&vec, &taps, &taps, &small_bias, &vec, 8, 2),
+        validateArgs(&vec, &taps, &taps, &small_bias, &vec, 8, 2, 0),
+    );
+}
+
+test "validateArgs rejects out-of-range ring head" {
+    const vec = device_mod.Buffer{ .pointer = 0, .size = 8 * @sizeOf(f32) };
+    const taps = device_mod.Buffer{ .pointer = 0, .size = 16 * @sizeOf(f32) };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        validateArgs(&vec, &taps, &taps, null, &vec, 8, 2, 2),
     );
 }
