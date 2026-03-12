@@ -1,4 +1,4 @@
-import { SEARCH_ICON as ICON_SEARCH, CLOSE_ICON as ICON_CLEAR, FOLDER_PLUS_ICON, COLLAPSE_ALL_ICON, SORT_RECENT_ICON, SORT_CREATED_ICON } from "../../icons.ts";
+import { SEARCH_ICON as ICON_SEARCH, CLOSE_ICON as ICON_CLEAR, FOLDER_PLUS_ICON, COLLAPSE_ALL_ICON, SORT_RECENT_ICON, SORT_CREATED_ICON, SETTINGS_ICON } from "../../icons.ts";
 
 /** Build the full chat DOM into the plugin's shadow root container. */
 export function buildChatDOM(container: HTMLElement): void {
@@ -51,6 +51,9 @@ export function buildChatDOM(container: HTMLElement): void {
               <select id="welcome-prompt" class="form-select form-select-inline" title="System prompt">
                 <option value="">No prompt</option>
               </select>
+              <button id="welcome-settings" class="btn btn-ghost btn-icon" title="Advanced options">
+                ${SETTINGS_ICON}
+              </button>
               <div class="flex-1"></div>
               <button id="welcome-attach" class="btn btn-ghost btn-icon" title="Upload file">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.48l9.2-9.2a4 4 0 0 1 5.65 5.66l-9.2 9.19a2 2 0 0 1-2.82-2.82l8.49-8.48"/></svg>
@@ -61,6 +64,29 @@ export function buildChatDOM(container: HTMLElement): void {
               <button id="welcome-send" class="btn btn-primary btn-send">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               </button>
+            </div>
+          </div>
+          <div id="welcome-advanced" class="welcome-advanced hidden">
+            <div id="welcome-variant-row" class="welcome-variant-row hidden">
+              <div id="welcome-variant-pills" class="welcome-variant-pills"></div>
+            </div>
+            <div class="welcome-advanced-grid">
+              <div class="welcome-advanced-field">
+                <label class="form-label form-label-sm" for="welcome-temperature">Temperature</label>
+                <input id="welcome-temperature" type="number" class="form-input form-input-sm" step="0.1" min="0" max="2" placeholder="1.0">
+              </div>
+              <div class="welcome-advanced-field">
+                <label class="form-label form-label-sm" for="welcome-top-p">Top P</label>
+                <input id="welcome-top-p" type="number" class="form-input form-input-sm" step="0.05" min="0" max="1" placeholder="1.0">
+              </div>
+              <div class="welcome-advanced-field">
+                <label class="form-label form-label-sm" for="welcome-top-k">Top K</label>
+                <input id="welcome-top-k" type="number" class="form-input form-input-sm" step="1" min="0" placeholder="50">
+              </div>
+              <div class="welcome-advanced-field">
+                <label class="form-label form-label-sm" for="welcome-max-tokens">Max Tokens</label>
+                <input id="welcome-max-tokens" type="number" class="form-input form-input-sm" step="1" min="1" placeholder="2048">
+              </div>
             </div>
           </div>
         </div>

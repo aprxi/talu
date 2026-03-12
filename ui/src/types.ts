@@ -225,9 +225,13 @@ export interface ModelOverrides {
 /** Enriched model entry returned by GET /v1/settings. */
 export interface ModelEntry {
   id: string;
+  /** Human-friendly name for the model selector (e.g. family name). Falls back to `id`. */
+  display_name?: string;
   source: "managed" | "hub";
   defaults: ModelDefaults;
   overrides: ModelOverrides;
+  /** Available quant variants for this model family. */
+  variants?: { id: string; label: string; size_bytes?: number }[];
 }
 
 /** Provider with runtime configuration from GET /v1/providers. */
@@ -531,6 +535,7 @@ export interface RepoModel {
   mtime: number;
   architecture?: string;
   quant_scheme?: string;
+  source_model_id?: string;
   pinned: boolean;
 }
 

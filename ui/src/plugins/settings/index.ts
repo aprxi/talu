@@ -16,6 +16,36 @@ import { populateForm, populateLocalModelSelect, updateSystemPromptDisplay, show
 import { wireEvents } from "./events.ts";
 import { loadCustomThemes, populateThemeSelects } from "./theme-editor.ts";
 import { navigate, onRouteChange } from "../../kernel/system/router.ts";
+import type { ModelEntry } from "../../types.ts";
+
+/** Collapse quant variants into one entry per family.
+ *  Managed models with GAF suffixes (e.g. Qwen/Qwen3-0.6B-GAF4) share
+ *  the same parent (Qwen/Qwen3-0.6B). Only the first variant per family
+ *  appears in the selector, with the family name as display_name. */
+function deduplicateByFamily(models: ModelEntry[]): ModelEntry[] {
+  const families = new Map<string, { entry: ModelEntry; variants: { id: string; label: string }[] }>();
+  for (const m of models) {
+    let familyKey = m.id;
+    if (m.source === "managed") {
+      const stripped = m.id.replace(/-GAF\d+(-G\d+)?$/, "");
+      if (stripped !== m.id) familyKey = stripped;
+    }
+    const label = familyKey !== m.id
+      ? m.id.slice(familyKey.length + 1)
+      : (m.id.split("/").pop() ?? m.id);
+    if (!families.has(familyKey)) {
+      families.set(familyKey, {
+        entry: { ...m, display_name: familyKey !== m.id ? familyKey : undefined },
+        variants: [],
+      });
+    }
+    families.get(familyKey)!.variants.push({ id: m.id, label });
+  }
+  return [...families.values()].map(({ entry, variants }) => ({
+    ...entry,
+    variants,
+  }));
+}
 
 export const settingsPlugin: PluginDefinition = {
   manifest: {
@@ -95,7 +125,7 @@ export const settingsPlugin: PluginDefinition = {
       return;
     }
 
-    settingsState.availableModels = result.data.available_models ?? [];
+    settingsState.availableModels = deduplicateByFamily(result.data.available_models ?? []);
     settingsState.systemPromptEnabled = result.data.system_prompt_enabled;
     if (result.data.model) {
       settingsState.activeModel = result.data.model;
@@ -130,30 +160,58 @@ export const settingsPlugin: PluginDefinition = {
       if (settingsState.chatModelsActive) return;
       const res = await api.getSettings();
       if (res.ok && res.data) {
-        settingsState.availableModels = res.data.available_models ?? [];
+        settingsState.availableModels = deduplicateByFamily(res.data.available_models ?? []);
         populateLocalModelSelect();
         emitModelChanged();
       }
     });
 
     // Chat models (user-curated list from providers tab) replaces available models.
-    ctx.events.on<{ models: string[] }>("repo.chatModels.changed", ({ models }) => {
-      if (models.length === 0) {
-        settingsState.chatModelsActive = false;
-        return;
-      }
-      settingsState.chatModelsActive = true;
-      settingsState.availableModels = models.map((id) => ({
-        id,
-        source: (id.includes("::") ? "hub" : "managed") as "hub" | "managed",
-        defaults: { temperature: 1.0, top_k: 50, top_p: 1.0, do_sample: true },
-        overrides: {},
-      }));
-      // If the active model is not in the new list, switch to the first entry.
-      if (!models.includes(settingsState.activeModel) && models.length > 0) {
-        settingsState.activeModel = models[0]!;
-      }
-      emitModelChanged();
+    // Uses family dedup so the model selector shows one entry per family.
+    ctx.events.on<{ models: string[]; families?: { familyId: string; defaultVariant: string; variants?: { id: string; label: string; size_bytes?: number }[] }[] }>(
+      "repo.chatModels.changed",
+      ({ models, families }) => {
+        if (models.length === 0) {
+          settingsState.chatModelsActive = false;
+          return;
+        }
+        settingsState.chatModelsActive = true;
+
+        // One entry per family (display name = family, value = default variant).
+        const localEntries = (families ?? []).map((f) => ({
+          id: f.defaultVariant,
+          display_name: f.familyId !== f.defaultVariant ? f.familyId : undefined,
+          source: "managed" as const,
+          defaults: { temperature: 1.0, top_k: 50, top_p: 1.0, do_sample: true },
+          overrides: {},
+          variants: f.variants,
+        }));
+        // Remote models as individual entries.
+        const remoteEntries = models
+          .filter((id) => id.includes("::"))
+          .map((id) => ({
+            id,
+            source: "hub" as const,
+            defaults: { temperature: 1.0, top_k: 50, top_p: 1.0, do_sample: true },
+            overrides: {},
+          }));
+        settingsState.availableModels = [...localEntries, ...remoteEntries];
+
+        if (!settingsState.availableModels.some((m) => m.id === settingsState.activeModel) && settingsState.availableModels.length > 0) {
+          settingsState.activeModel = settingsState.availableModels[0]!.id;
+        }
+        emitModelChanged();
+      },
+    );
+
+    // Select a specific model variant (emitted by repo plugin variant pills).
+    // The variant ID may not be in availableModels (which has one entry per family),
+    // so we set it directly — the server handles any valid model ID.
+    // Don't emit model.changed: variant switches within a family don't need to
+    // re-populate model selects, and doing so can cascade a change event that
+    // resets the active model back to the family default.
+    ctx.events.on<{ modelId: string }>("repo.selectModel", ({ modelId }) => {
+      settingsState.activeModel = modelId;
     });
 
     ctx.log.info("Settings loaded.", { model: settingsState.activeModel, models: settingsState.availableModels.length });

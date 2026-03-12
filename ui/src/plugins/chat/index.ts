@@ -36,6 +36,14 @@ import { getModelsService, getPromptsService } from "./deps.ts";
 import { initProjectStore, loadApiProjects, migrateLocalStorageProjects } from "../../render/project-combo.ts";
 import { onRouteChange } from "../../kernel/system/router.ts";
 
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const val = bytes / Math.pow(1024, i);
+  return `${val < 10 ? val.toFixed(1) : Math.round(val)} ${units[i]}`;
+}
+
 function populatePromptSelect(
   sel: HTMLSelectElement,
   prompts: { id: string; name: string }[],
@@ -146,6 +154,34 @@ export const chatPlugin: PluginDefinition = {
     setupInfiniteScroll();
     initCodeBlockCopyHandler(ctx.container, ctx.clipboard, ctx.timers);
 
+    // Welcome settings gear → toggle inline advanced options.
+    // The advanced section is absolutely positioned below the input so it
+    // doesn't shift the centered input container.
+    {
+      const dom = getChatDom();
+      const positionAdvanced = () => {
+        const inputContainer = dom.welcomeInput.closest(".input-container");
+        if (!inputContainer) return;
+        const inputRect = inputContainer.getBoundingClientRect();
+        const parentRect = dom.welcomeState.getBoundingClientRect();
+        dom.welcomeAdvanced.style.top = `${inputRect.bottom - parentRect.top + 8}px`;
+      };
+      dom.welcomeSettings.addEventListener("click", () => {
+        const wasHidden = dom.welcomeAdvanced.classList.contains("hidden");
+        dom.welcomeAdvanced.classList.toggle("hidden");
+        dom.welcomeSettings.classList.toggle("active", wasHidden);
+        if (wasHidden) positionAdvanced();
+      });
+      dom.welcomeAdvanced.addEventListener("dblclick", () => {
+        dom.welcomeAdvanced.classList.add("hidden");
+        dom.welcomeSettings.classList.remove("active");
+      });
+      window.addEventListener("resize", () => {
+        if (!dom.welcomeAdvanced.classList.contains("hidden")) positionAdvanced();
+      });
+
+    }
+
     // Listen for cross-plugin events.
     ctx.events.on<{ modelId: string; availableModels: ModelEntry[] }>("model.changed", ({ modelId, availableModels }) => {
       const dom = getChatDom();
@@ -153,6 +189,39 @@ export const chatPlugin: PluginDefinition = {
       populateModelSelect(dom.welcomeModel, availableModels, modelId);
       populateModelSelect(pd.panelModel, availableModels, modelId);
       syncRightPanelParams(modelId);
+
+      // Render variant pills for the active model's family.
+      const entry = availableModels.find((m) => m.id === modelId)
+        ?? availableModels.find((m) => m.variants?.some((v) => v.id === modelId));
+      if (entry?.variants && entry.variants.length > 0) {
+        dom.welcomeVariantRow.classList.remove("hidden");
+        dom.welcomeVariantPills.innerHTML = "";
+        const multiVariant = entry.variants.length > 1;
+        for (const v of entry.variants) {
+          const pill = document.createElement("button");
+          pill.className = "welcome-variant-pill";
+          // Format: "GAF4 · 2.5 GB" or just label
+          let text = v.label;
+          if (v.size_bytes && v.size_bytes > 0) {
+            text += ` \u00b7 ${formatBytes(v.size_bytes)}`;
+          }
+          pill.textContent = text;
+          pill.title = v.id;
+          if (v.id === modelId) pill.classList.add("active");
+          if (multiVariant) {
+            pill.addEventListener("click", () => {
+              ctx.events.emit("repo.selectModel", { modelId: v.id });
+              // Update active pill visually.
+              for (const p of dom.welcomeVariantPills.children) {
+                (p as HTMLElement).classList.toggle("active", p === pill);
+              }
+            });
+          }
+          dom.welcomeVariantPills.appendChild(pill);
+        }
+      } else {
+        dom.welcomeVariantRow.classList.add("hidden");
+      }
     });
 
     ctx.events.on<{ sessionId: string }>("sessions.selected", ({ sessionId }) => {
@@ -165,6 +234,12 @@ export const chatPlugin: PluginDefinition = {
 
     ctx.events.on<{ enabled: boolean }>("settings.system_prompt_enabled", ({ enabled }) => {
       chatState.systemPromptEnabled = enabled;
+    });
+
+    // Variant pill in repo plugin → open a new chat with that model.
+    ctx.events.on("repo.openChat", () => {
+      ctx.mode.switch("chat");
+      startNewConversation(getActiveProjectId());
     });
 
     // Close the chat panel when leaving chat mode.

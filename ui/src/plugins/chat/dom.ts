@@ -26,6 +26,14 @@ export interface ChatDom {
   welcomeAttachmentList: HTMLElement;
   welcomeModel: HTMLSelectElement;
   welcomePrompt: HTMLSelectElement;
+  welcomeSettings: HTMLButtonElement;
+  welcomeAdvanced: HTMLElement;
+  welcomeVariantRow: HTMLElement;
+  welcomeVariantPills: HTMLElement;
+  welcomeTemperature: HTMLInputElement;
+  welcomeTopP: HTMLInputElement;
+  welcomeTopK: HTMLInputElement;
+  welcomeMaxTokens: HTMLInputElement;
 
   // Active chat input
   inputBar: HTMLElement;
@@ -72,6 +80,14 @@ export function getChatDom(): ChatDom {
     welcomeAttachmentList: q("#welcome-attachment-list"),
     welcomeModel: q<HTMLSelectElement>("#welcome-model"),
     welcomePrompt: q<HTMLSelectElement>("#welcome-prompt"),
+    welcomeSettings: q<HTMLButtonElement>("#welcome-settings"),
+    welcomeAdvanced: q("#welcome-advanced"),
+    welcomeVariantRow: q("#welcome-variant-row"),
+    welcomeVariantPills: q("#welcome-variant-pills"),
+    welcomeTemperature: q<HTMLInputElement>("#welcome-temperature"),
+    welcomeTopP: q<HTMLInputElement>("#welcome-top-p"),
+    welcomeTopK: q<HTMLInputElement>("#welcome-top-k"),
+    welcomeMaxTokens: q<HTMLInputElement>("#welcome-max-tokens"),
 
     inputBar: q("#input-bar"),
     inputText: q<HTMLTextAreaElement>("#input-text"),

@@ -10,7 +10,7 @@ import { repoState } from "./state.ts";
 import { loadModels, searchHub } from "./data.ts";
 import { loadProviders } from "./providers-data.ts";
 import { wireProviderEvents } from "./providers-render.ts";
-import { loadChatModels } from "./chat-models-data.ts";
+import { loadChatModels, syncPinnedToChatModels } from "./chat-models-data.ts";
 import { renderChatModels, wireChatModelEvents } from "./chat-models-render.ts";
 import {
   renderModelsTable,
@@ -88,8 +88,10 @@ export const repoPlugin: PluginDefinition = {
     });
     wireTerminalEvents();
 
-    // Load chat models from KV (needed before providers render for "Added" state).
+    // Load models first so inferFamilyKey works when emitChanged fires.
+    await loadModels();
     await loadChatModels();
+    await syncPinnedToChatModels();
 
     // Refresh when the Routing mode is activated; clean up terminal when leaving.
     ctx.events.on<{ to: string; from: string }>("mode.changed", ({ to, from }) => {
@@ -170,6 +172,7 @@ function initRepoView(): void {
   syncRepoTabs();
   updateRepoToolbar();
   loadProviders();
+  loadModels().then(() => syncPinnedToChatModels());
   renderChatModels();
   renderHosts();
 }

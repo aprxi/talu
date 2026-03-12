@@ -47,6 +47,9 @@ pub(crate) struct CachedModelResponse {
     /// Quantization scheme (e.g., "F16", "GAF4_64", "MXFP4"), if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quant_scheme: Option<String>,
+    /// Source model ID this was converted from (e.g., "Qwen/Qwen3-0.6B"), if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_model_id: Option<String>,
     /// Whether this model is pinned in the active profile.
     pub pinned: bool,
 }
@@ -295,6 +298,16 @@ pub async fn handle_list(
                     Err(_) => (None, None),
                 };
 
+                // Read source_model_id from talu_meta.json (managed models only).
+                let source_model_id = if source == "managed" {
+                    std::fs::read_to_string(std::path::Path::new(&m.path).join("talu_meta.json"))
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| v.get("source_model_id")?.as_str().map(String::from))
+                } else {
+                    None
+                };
+
                 let is_pinned = pinned_set.contains(&m.id);
 
                 CachedModelResponse {
@@ -305,6 +318,7 @@ pub async fn handle_list(
                     mtime,
                     architecture,
                     quant_scheme,
+                    source_model_id,
                     pinned: is_pinned,
                 }
             })

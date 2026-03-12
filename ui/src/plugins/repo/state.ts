@@ -43,6 +43,7 @@ export interface CachedModel {
   mtime: number;
   architecture?: string;
   quant_scheme?: string;
+  source_model_id?: string;
   pinned: boolean;
 }
 
@@ -97,3 +98,17 @@ export const repoState = {
   ] as HostEntry[],
   activeTerminalHostId: null as string | null,
 };
+
+/**
+ * Infer the family key for a model.
+ * Uses source_model_id if available, otherwise strips quant suffixes
+ * like -GAF4, -GAF8, -GAF4-G32 from managed model IDs.
+ */
+export function inferFamilyKey(model: CachedModel): string {
+  if (model.source_model_id) return model.source_model_id;
+  if (model.source === "managed") {
+    const stripped = model.id.replace(/-GAF\d+(-G\d+)?$/, "");
+    if (stripped !== model.id) return stripped;
+  }
+  return model.id;
+}

@@ -96,6 +96,110 @@
 }
 
 /* =============================================================================
+   Welcome — Inline Advanced Options
+   ============================================================================= */
+
+.welcome-advanced {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  width: calc(100% - 3rem);
+  max-width: 768px;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-code);
+  cursor: default;
+  user-select: none;
+  z-index: 1;
+}
+
+.welcome-advanced.hidden {
+  display: none;
+}
+
+.welcome-variant-row {
+  margin-bottom: 0.75rem;
+}
+
+.welcome-variant-row.hidden {
+  display: none;
+}
+
+.welcome-variant-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.welcome-variant-pill {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 500;
+  font-family: var(--font-mono);
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-muted);
+  cursor: default;
+  white-space: nowrap;
+  transition: background 100ms ease, color 100ms ease, border-color 100ms ease;
+}
+
+/* Only show pointer when there are multiple variants to choose from. */
+.welcome-variant-pills:has(.welcome-variant-pill + .welcome-variant-pill) .welcome-variant-pill {
+  cursor: pointer;
+}
+
+.welcome-variant-pills:has(.welcome-variant-pill + .welcome-variant-pill) .welcome-variant-pill:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.welcome-variant-pill.active {
+  background: var(--bg-hover);
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.welcome-advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.75rem;
+}
+
+.welcome-advanced-field .form-label-sm {
+  display: block;
+  margin-bottom: 0.25rem;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.welcome-advanced-field .form-input-sm {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.welcome-advanced-field .form-input-sm:focus {
+  border-color: var(--primary);
+  outline: none;
+}
+
+@media (max-width: 600px) {
+  .welcome-advanced-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* =============================================================================
    Input Box (welcome + bottom bar)
    ============================================================================= */
 

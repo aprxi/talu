@@ -1,7 +1,7 @@
 /** Data loading and mutation functions for the repo plugin. */
 
 import { api, events, notifications, dialogs, status, timers } from "./deps.ts";
-import { repoState } from "./state.ts";
+import { repoState, inferFamilyKey } from "./state.ts";
 import {
   renderModelsTable,
   renderDiscoverResults,
@@ -10,6 +10,8 @@ import {
   renderStats,
   updateRepoToolbar,
 } from "./render.ts";
+import { syncPinnedToChatModels } from "./chat-models-data.ts";
+import type { CachedModel } from "./state.ts";
 
 // ---------------------------------------------------------------------------
 // List cached models
@@ -216,26 +218,42 @@ export async function deleteModel(modelId: string): Promise<void> {
 // Pin / Unpin
 // ---------------------------------------------------------------------------
 
+/** Returns all models in the same family (same source_model_id or inferred from name). */
+export function getModelFamily(modelId: string): CachedModel[] {
+  const model = repoState.models.find((m) => m.id === modelId);
+  if (!model) return [];
+  const familyKey = inferFamilyKey(model);
+  return repoState.models.filter((m) => inferFamilyKey(m) === familyKey);
+}
+
 export async function pinModel(modelId: string): Promise<void> {
-  const res = await api.pinRepoModel(modelId);
-  if (res.ok) {
-    const model = repoState.models.find((m) => m.id === modelId);
-    if (model) model.pinned = true;
-    renderModelsTable();
-  } else {
-    notifications.error(`Pin failed: ${res.error ?? "unknown"}`);
+  const family = getModelFamily(modelId);
+  const targets = family.length > 0 ? family : [{ id: modelId }];
+
+  const results = await Promise.all(
+    targets.filter((m) => !("pinned" in m && m.pinned)).map((m) => api.pinRepoModel(m.id)),
+  );
+  if (results.some((r) => !r.ok)) {
+    notifications.error("Pin failed for some models");
   }
+  for (const m of family) m.pinned = true;
+  renderModelsTable();
+  await syncPinnedToChatModels();
 }
 
 export async function unpinModel(modelId: string): Promise<void> {
-  const res = await api.unpinRepoModel(modelId);
-  if (res.ok) {
-    const model = repoState.models.find((m) => m.id === modelId);
-    if (model) model.pinned = false;
-    renderModelsTable();
-  } else {
-    notifications.error(`Unpin failed: ${res.error ?? "unknown"}`);
+  const family = getModelFamily(modelId);
+  const targets = family.length > 0 ? family : [{ id: modelId }];
+
+  const results = await Promise.all(
+    targets.filter((m) => "pinned" in m && m.pinned).map((m) => api.unpinRepoModel(m.id)),
+  );
+  if (results.some((r) => !r.ok)) {
+    notifications.error("Unpin failed for some models");
   }
+  for (const m of family) m.pinned = false;
+  renderModelsTable();
+  await syncPinnedToChatModels();
 }
 
 // ---------------------------------------------------------------------------
@@ -275,4 +293,5 @@ export async function pinSelectedModels(): Promise<void> {
   repoState.selectedIds.clear();
   renderModelsTable();
   updateRepoToolbar();
+  await syncPinnedToChatModels();
 }

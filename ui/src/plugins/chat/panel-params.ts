@@ -4,14 +4,23 @@ import { api, notifications, getModelsService, format, timers } from "./deps.ts"
 import type { Conversation, CreateResponseRequest, SettingsPatch } from "../../types.ts";
 import type { Disposable } from "../../kernel/types.ts";
 
-/** Get current sampling parameters from the panel inputs. */
+/** Get current sampling parameters from the panel inputs.
+ *  Welcome-state inline inputs override panel inputs when set. */
 export function getSamplingParams(): Partial<CreateResponseRequest> {
+  const dom = getChatDom();
   const pd = getChatPanelDom();
-  const temp = pd.panelTemperature.value.trim();
-  const topP = pd.panelTopP.value.trim();
-  const topK = pd.panelTopK.value.trim();
+
+  // Welcome inline inputs take precedence (for new-chat flow).
+  const wTemp = dom.welcomeTemperature.value.trim();
+  const wTopP = dom.welcomeTopP.value.trim();
+  const wTopK = dom.welcomeTopK.value.trim();
+  const wMaxTok = dom.welcomeMaxTokens.value.trim();
+
+  const temp = wTemp || pd.panelTemperature.value.trim();
+  const topP = wTopP || pd.panelTopP.value.trim();
+  const topK = wTopK || pd.panelTopK.value.trim();
   const minP = pd.panelMinP.value.trim();
-  const maxTok = pd.panelMaxOutputTokens.value.trim();
+  const maxTok = wMaxTok || pd.panelMaxOutputTokens.value.trim();
   const repPen = pd.panelRepetitionPenalty.value.trim();
   const seed = pd.panelSeed.value.trim();
 
