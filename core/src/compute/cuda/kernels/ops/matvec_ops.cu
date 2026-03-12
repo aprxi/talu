@@ -1,5 +1,5 @@
 static constexpr unsigned int TALU_WARP_SIZE = 32;
-static constexpr unsigned int TALU_MATMUL_TILE_K = 256;
+static constexpr unsigned int TALU_MATMUL_TILE_K = 1024;
 
 static __device__ __forceinline__ float talu_warp_sum_f32(float value) {
     value += __shfl_down_sync(0xFFFFFFFFu, value, 16);
