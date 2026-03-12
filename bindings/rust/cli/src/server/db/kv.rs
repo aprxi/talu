@@ -4,8 +4,8 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -20,9 +20,7 @@ use utoipa::ToSchema;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;
 
-use talu::kv::{
-    KvDurability, KvError, KvHandle, KvNamespaceStats, KvPutOptions, KvWatchEventType,
-};
+use talu::kv::{KvDurability, KvError, KvHandle, KvNamespaceStats, KvPutOptions, KvWatchEventType};
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 type SharedKvHandle = Arc<tokio::sync::Mutex<KvHandle>>;
@@ -122,7 +120,9 @@ impl Drop for WatchSubscriberGuard {
 
 fn watch_subscriber_guard(cache_key: &str) -> WatchSubscriberGuard {
     let counter = {
-        let mut counters = KV_WATCH_SUBSCRIBERS.lock().expect("watch subscriber mutex poisoned");
+        let mut counters = KV_WATCH_SUBSCRIBERS
+            .lock()
+            .expect("watch subscriber mutex poisoned");
         counters
             .entry(cache_key.to_string())
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
@@ -704,10 +704,11 @@ pub async fn handle_watch(
             _subscriber_guard: subscriber_guard,
         },
         |state| async move {
-            state.queue
-            .next_frame()
-            .await
-            .map(|chunk| (Ok::<_, Infallible>(Frame::data(chunk)), state))
+            state
+                .queue
+                .next_frame()
+                .await
+                .map(|chunk| (Ok::<_, Infallible>(Frame::data(chunk)), state))
         },
     );
     let body = StreamBody::new(stream).boxed();
@@ -1180,7 +1181,11 @@ mod tests {
         assert!(!queue.push(Bytes::from_static(b"event: event2\n\n")).await);
 
         queue
-            .push_gap_and_close(watch_gap_frame("ns", "consumer_too_slow", "consumer too slow"))
+            .push_gap_and_close(watch_gap_frame(
+                "ns",
+                "consumer_too_slow",
+                "consumer too slow",
+            ))
             .await;
 
         let frame = queue.next_frame().await.expect("gap frame");

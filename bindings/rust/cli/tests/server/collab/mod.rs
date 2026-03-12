@@ -108,6 +108,47 @@ fn collab_session_ops_history_snapshot_roundtrip() {
 }
 
 #[test]
+fn collab_submit_op_accepts_batched_durability() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+    let payload = base64::engine::general_purpose::STANDARD.encode(br#"{"insert":"x"}"#);
+
+    let submit = post_json(
+        ctx.addr(),
+        "/v1/collab/resources/text_document/doc-batched/ops",
+        &serde_json::json!({
+            "actor_id": "human:1",
+            "actor_seq": 1,
+            "op_id": "op-1",
+            "payload_base64": payload,
+            "durability": "batched",
+        }),
+    );
+    assert_eq!(submit.status, 200, "body: {}", submit.body);
+}
+
+#[test]
+fn collab_submit_op_rejects_invalid_durability() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+    let payload = base64::engine::general_purpose::STANDARD.encode(br#"{"insert":"x"}"#);
+
+    let submit = post_json(
+        ctx.addr(),
+        "/v1/collab/resources/text_document/doc-invalid-durability/ops",
+        &serde_json::json!({
+            "actor_id": "human:1",
+            "actor_seq": 1,
+            "op_id": "op-1",
+            "payload_base64": payload,
+            "durability": "invalid",
+        }),
+    );
+    assert_eq!(submit.status, 400, "body: {}", submit.body);
+    assert_eq!(submit.json()["error"]["code"], "invalid_argument");
+}
+
+#[test]
 fn collab_history_supports_cursor_pagination() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
@@ -205,7 +246,11 @@ fn collab_resource_ws_upgrade_returns_switching_protocols() {
         None,
     );
 
-    assert_eq!(resp.status, 101, "headers: {} body: {}", resp.headers, resp.body);
+    assert_eq!(
+        resp.status, 101,
+        "headers: {} body: {}",
+        resp.headers, resp.body
+    );
 }
 
 #[tokio::test]
@@ -213,8 +258,8 @@ async fn collab_resource_ws_submit_op_broadcasts_snapshot() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
     let resource_path = "/v1/collab/resources/workdir_file/notes.txt/ws";
-    let payload = base64::engine::general_purpose::STANDARD
-        .encode(br#"{"type":"ui_live","source":"test"}"#);
+    let payload =
+        base64::engine::general_purpose::STANDARD.encode(br#"{"type":"ui_live","source":"test"}"#);
     let snapshot =
         base64::engine::general_purpose::STANDARD.encode("hello from websocket".as_bytes());
 
@@ -258,6 +303,7 @@ async fn collab_resource_ws_submit_op_broadcasts_snapshot() {
             "op_id": "ws-op-1",
             "payload_base64": payload,
             "snapshot_base64": snapshot,
+            "durability": "batched",
         })
         .to_string()
         .into(),

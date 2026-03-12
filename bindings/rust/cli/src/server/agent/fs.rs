@@ -15,14 +15,16 @@ use serde::{Deserialize, Serialize};
 use talu::{FsError, FsHandle};
 use utoipa::ToSchema;
 
-use crate::server::collab::{open_collab_handle, resolve_storage_root};
 use crate::server::auth_gateway::AuthContext;
+use crate::server::collab::{open_collab_handle, resolve_storage_root};
 use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
 const DEFAULT_MAX_READ_BYTES: usize = 256 * 1024;
 const DEFAULT_LIST_LIMIT: usize = 1000;
+const COLLAB_MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
+const COLLAB_MAX_READ_LIMIT: usize = COLLAB_MAX_SNAPSHOT_BYTES + 1;
 const COLLAB_WORKDIR_RESOURCE_KIND: &str = "workdir_file";
 const COLLAB_SYNC_ACTOR_ID: &str = "system:agent_fs";
 
@@ -270,6 +272,16 @@ async fn sync_workdir_collab_snapshot(
     snapshot: &[u8],
     op_kind: &str,
 ) {
+    sync_workdir_collab_op(state, auth, resource_id, op_kind, Some(snapshot)).await;
+}
+
+async fn sync_workdir_collab_op(
+    state: &Arc<AppState>,
+    auth: Option<&AuthContext>,
+    resource_id: &str,
+    op_kind: &str,
+    snapshot: Option<&[u8]>,
+) {
     if state.bucket_path.is_none() {
         return;
     }
@@ -297,7 +309,8 @@ async fn sync_workdir_collab_snapshot(
         "source": "agent.fs",
         "resource_kind": COLLAB_WORKDIR_RESOURCE_KIND,
         "resource_id": resource_id,
-        "snapshot_bytes": snapshot.len(),
+        "snapshot_bytes": snapshot.map_or(0, |bytes| bytes.len()),
+        "snapshot_included": snapshot.is_some(),
         "issued_at_ms": issued_at_ms,
     }))
     .unwrap_or_else(|_| b"{}".to_vec());
@@ -308,7 +321,8 @@ async fn sync_workdir_collab_snapshot(
         &op_id,
         &payload,
         Some(issued_at_ms),
-        Some(snapshot),
+        snapshot,
+        talu::collab::WatchDurability::Strong,
     );
 }
 
@@ -347,7 +361,10 @@ fn absolute_workdir_path(workdir: &Path, requested: &str) -> PathBuf {
     }
 }
 
-fn collect_workdir_file_resource_ids(workdir: &Path, requested: &str) -> std::io::Result<Vec<String>> {
+fn collect_workdir_file_resource_ids(
+    workdir: &Path,
+    requested: &str,
+) -> std::io::Result<Vec<String>> {
     let mut resource_ids = Vec::new();
     collect_workdir_file_resource_ids_from_absolute(
         workdir,
@@ -383,6 +400,20 @@ fn map_renamed_resource_id(from: &str, to: &str, existing: &str) -> Option<Strin
         Path::new(to).join(suffix)
     };
     Some(mapped.to_string_lossy().to_string())
+}
+
+fn should_sync_collab_snapshot(snapshot: &[u8]) -> bool {
+    if snapshot.len() > COLLAB_MAX_SNAPSHOT_BYTES {
+        return false;
+    }
+    if snapshot.contains(&0) {
+        return false;
+    }
+    std::str::from_utf8(snapshot).is_ok()
+}
+
+fn should_read_collab_snapshot(read_limit: usize) -> bool {
+    read_limit <= COLLAB_MAX_READ_LIMIT
 }
 
 fn fs_error_response(err: FsError, fallback: &str) -> Response<BoxBody> {
@@ -508,14 +539,12 @@ pub async fn handle_write(
         let resource_id = collab_resource_id_for_workdir_file(workdir, &request.path);
         (result, response_path, resource_id)
     };
-    sync_workdir_collab_snapshot(
-        &state,
-        auth.as_ref(),
-        &resource_id,
-        &content,
-        "fs_write",
-    )
-    .await;
+    if should_sync_collab_snapshot(&content) {
+        sync_workdir_collab_snapshot(&state, auth.as_ref(), &resource_id, &content, "fs_write")
+            .await;
+    } else {
+        clear_workdir_collab_snapshot(&state, auth.as_ref(), &resource_id, "fs_write").await;
+    }
 
     json_response(
         StatusCode::OK,
@@ -559,9 +588,13 @@ pub async fn handle_edit(
         };
         let snapshot_bytes =
             if let Ok(read_limit) = full_read_limit_for_current_file(&fs, &request.path) {
-                fs.read(&request.path, read_limit)
-                    .ok()
-                    .map(|read_back| read_back.content)
+                if should_read_collab_snapshot(read_limit) {
+                    fs.read(&request.path, read_limit)
+                        .ok()
+                        .map(|read_back| read_back.content)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -570,14 +603,20 @@ pub async fn handle_edit(
         (result, response_path, resource_id, snapshot_bytes)
     };
     if let Some(snapshot_bytes) = snapshot_bytes.as_deref() {
-        sync_workdir_collab_snapshot(
-            &state,
-            auth.as_ref(),
-            &resource_id,
-            snapshot_bytes,
-            "fs_edit",
-        )
-        .await;
+        if should_sync_collab_snapshot(snapshot_bytes) {
+            sync_workdir_collab_snapshot(
+                &state,
+                auth.as_ref(),
+                &resource_id,
+                snapshot_bytes,
+                "fs_edit",
+            )
+            .await;
+        } else {
+            clear_workdir_collab_snapshot(&state, auth.as_ref(), &resource_id, "fs_edit").await;
+        }
+    } else {
+        clear_workdir_collab_snapshot(&state, auth.as_ref(), &resource_id, "fs_edit").await;
     }
 
     json_response(
@@ -702,15 +741,26 @@ pub async fn handle_remove(
     };
 
     let policy = load_policy(&state);
-    let (response_path, removed_resource_ids) = {
+    let removed_resource_ids = {
+        let Some(workdir) = state.workdir.as_ref() else {
+            return missing_workdir_response();
+        };
+        let workdir = workdir.clone();
+        let requested = request.path.clone();
+        tokio::task::spawn_blocking(move || collect_workdir_file_resource_ids(&workdir, &requested))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+    };
+    let response_path = {
         let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
             Ok(value) => value,
             Err(resp) => return resp,
         };
-        let removed_resource_ids = collect_workdir_file_resource_ids(workdir, &request.path).ok();
         let response_path = to_workspace_relative(workdir, &request.path);
         match fs.remove(&request.path, request.recursive.unwrap_or(false)) {
-            Ok(()) => (response_path, removed_resource_ids.unwrap_or_default()),
+            Ok(()) => response_path,
             Err(e) => return fs_error_response(e, "failed to remove path"),
         }
     };
@@ -778,48 +828,65 @@ pub async fn handle_rename(
     };
 
     let policy = load_policy(&state);
-    let (from_path, to_path, removed_resource_ids, renamed_targets) = {
+    let source_resource_ids = {
+        let Some(workdir) = state.workdir.as_ref() else {
+            return missing_workdir_response();
+        };
+        let workdir = workdir.clone();
+        let requested = request.from.clone();
+        tokio::task::spawn_blocking(move || collect_workdir_file_resource_ids(&workdir, &requested))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+    };
+    let (from_path, to_path, renamed_targets) = {
         let (fs, workdir) = match open_fs(&state, policy.as_deref()) {
             Ok(value) => value,
             Err(resp) => return resp,
         };
         let from_path = to_workspace_relative(workdir, &request.from);
         let to_path = to_workspace_relative(workdir, &request.to);
-        let source_resource_ids = collect_workdir_file_resource_ids(workdir, &request.from).ok();
         match fs.rename(&request.from, &request.to) {
             Ok(()) => {
                 let renamed_targets = source_resource_ids
-                    .as_deref()
-                    .unwrap_or(&[])
                     .iter()
                     .filter_map(|resource_id| {
                         map_renamed_resource_id(&from_path, &to_path, resource_id).map(|mapped| {
                             let bytes = full_read_limit_for_current_file(&fs, &mapped)
                                 .ok()
+                                .filter(|read_limit| should_read_collab_snapshot(*read_limit))
                                 .and_then(|read_limit| fs.read(&mapped, read_limit).ok())
                                 .map(|read| read.content);
                             (mapped, bytes)
                         })
                     })
                     .collect::<Vec<_>>();
-                (from_path, to_path, source_resource_ids.unwrap_or_default(), renamed_targets)
+                (from_path, to_path, renamed_targets)
             }
             Err(e) => return fs_error_response(e, "failed to rename path"),
         }
     };
-    for resource_id in &removed_resource_ids {
+    for resource_id in &source_resource_ids {
         clear_workdir_collab_snapshot(&state, auth.as_ref(), resource_id, "fs_rename").await;
     }
     for (resource_id, snapshot_bytes) in &renamed_targets {
         if let Some(snapshot_bytes) = snapshot_bytes.as_deref() {
-            sync_workdir_collab_snapshot(
-                &state,
-                auth.as_ref(),
-                resource_id,
-                snapshot_bytes,
-                "fs_rename",
-            )
-            .await;
+            if should_sync_collab_snapshot(snapshot_bytes) {
+                sync_workdir_collab_snapshot(
+                    &state,
+                    auth.as_ref(),
+                    resource_id,
+                    snapshot_bytes,
+                    "fs_rename",
+                )
+                .await;
+            } else {
+                clear_workdir_collab_snapshot(&state, auth.as_ref(), resource_id, "fs_rename")
+                    .await;
+            }
+        } else {
+            clear_workdir_collab_snapshot(&state, auth.as_ref(), resource_id, "fs_rename").await;
         }
     }
     json_response(

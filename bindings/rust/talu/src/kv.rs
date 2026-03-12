@@ -411,7 +411,8 @@ impl KvHandle {
     pub fn watch_drain(&self, after_seq: u64, max_events: usize) -> Result<KvWatchBatch, KvError> {
         let mut out = talu_sys::CKvWatchBatch::default();
         // SAFETY: handle is valid and out points to writable memory.
-        let rc = unsafe { talu_db_kv_watch_drain_raw(self.handle, after_seq, max_events, &mut out) };
+        let rc =
+            unsafe { talu_db_kv_watch_drain_raw(self.handle, after_seq, max_events, &mut out) };
         if rc != ERROR_CODE_OK {
             return Err(KvError::from_code(rc, "failed to drain kv watch events"));
         }
@@ -465,7 +466,10 @@ impl KvHandle {
             }
         }
         unsafe { talu_db_kv_free_watch_batch_raw(&mut out) };
-        Ok(KvWatchBatch { events, lost: out.lost })
+        Ok(KvWatchBatch {
+            events,
+            lost: out.lost,
+        })
     }
 }
 

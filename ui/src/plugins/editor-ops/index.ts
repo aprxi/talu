@@ -33,7 +33,7 @@ interface EditorState {
 const STORAGE_AUTO_SAVE = "editor.autoSave";
 const AUTO_SAVE_DELAY_MS = 800;
 const STAT_POLL_INTERVAL_MS = 2000;
-const LIVE_SYNC_DELAY_MS = 120;
+const LIVE_SYNC_DELAY_MS = 500;
 const COLLAB_RESOURCE_KIND = "workdir_file";
 
 /* ------------------------------------------------------------------ */
@@ -237,11 +237,13 @@ export const editorOpsPlugin: PluginDefinition = {
       if (snapshot === previousValue) return;
       const selectionStart = editorEl.selectionStart ?? previousValue.length;
       const selectionEnd = editorEl.selectionEnd ?? previousValue.length;
+      const scrollTop = editorEl.scrollTop;
       const remappedSelectionStart = remapSelectionIndex(selectionStart, previousValue, snapshot);
       const remappedSelectionEnd = remapSelectionIndex(selectionEnd, previousValue, snapshot);
       suppressLiveSync = true;
       editorEl.value = snapshot;
       editorEl.setSelectionRange(remappedSelectionStart, remappedSelectionEnd);
+      editorEl.scrollTop = scrollTop;
       suppressLiveSync = false;
       state.dirty = false;
       updateSaveBtn();
@@ -294,6 +296,7 @@ export const editorOpsPlugin: PluginDefinition = {
             snapshot_base64?: string | null;
             message?: string;
             op_id?: string;
+            key?: string;
           } | null = null;
           try {
             payload = JSON.parse(message.data) as typeof payload;
@@ -306,6 +309,12 @@ export const editorOpsPlugin: PluginDefinition = {
             return;
           }
           if (payload.type === "snapshot") {
+            if (payload.key && payload.key.startsWith(`ops/${participantId}:`)) {
+              return;
+            }
+            if (state.dirty || inflightLiveSnapshot !== null || queuedLiveSnapshot !== null) {
+              return;
+            }
             applyIncomingSnapshot(path, payload.snapshot_base64 ?? null, "Live");
             return;
           }
@@ -517,6 +526,7 @@ export const editorOpsPlugin: PluginDefinition = {
         op_id: opId,
         payload_base64: payload,
         snapshot_base64: encodeUtf8Base64(next.text),
+        durability: "batched",
       }));
     }
 

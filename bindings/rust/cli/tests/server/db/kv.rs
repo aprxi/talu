@@ -511,7 +511,6 @@ fn kv_watch_stream_emits_sse_events() {
     assert!(text.contains("\"key\":\"alpha\""), "body:\n{text}");
 }
 
-
 #[test]
 fn kv_flush_and_compact_reject_missing_namespace_path_segment() {
     let temp = TempDir::new().expect("temp dir");

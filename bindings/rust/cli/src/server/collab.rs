@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -18,6 +18,7 @@ use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::upgrade::Upgraded;
 use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -25,7 +26,6 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use utoipa::ToSchema;
-use hyper_util::rt::TokioIo;
 
 use crate::server::auth_gateway::AuthContext;
 use crate::server::code_ws;
@@ -50,6 +50,7 @@ const MAX_HISTORY_LIMIT: usize = 5_000;
 const WATCH_STREAM_CAPACITY: usize = 128;
 const WATCH_HEARTBEAT_SECONDS: u64 = 15;
 const WATCH_DRAIN_MAX_EVENTS: usize = 128;
+const WATCH_WAIT_POLL_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -106,6 +107,8 @@ pub struct SubmitOpRequest {
     pub payload_base64: String,
     pub issued_at_ms: Option<i64>,
     pub snapshot_base64: Option<String>,
+    #[serde(default)]
+    pub durability: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -194,6 +197,8 @@ struct CollabWsSubmitOpMessage {
     snapshot_base64: String,
     #[serde(default)]
     issued_at_ms: Option<i64>,
+    #[serde(default)]
+    durability: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -592,6 +597,12 @@ pub async fn handle_submit_op(
         &payload,
         op_req.issued_at_ms,
         snapshot.as_deref(),
+        match parse_submit_durability(op_req.durability.as_deref()) {
+            Ok(value) => value,
+            Err(message) => {
+                return json_error(StatusCode::BAD_REQUEST, "invalid_argument", message);
+            }
+        },
     ) {
         Ok(v) => v,
         Err(err) => return collab_error_response(err),
@@ -686,7 +697,8 @@ pub async fn handle_get_history(
         Err(err) => return collab_error_response(err),
     };
     let next_cursor = if ops.len() > limit {
-        ops.get(limit.saturating_sub(1)).map(|entry| entry.key.clone())
+        ops.get(limit.saturating_sub(1))
+            .map(|entry| entry.key.clone())
     } else {
         None
     };
@@ -794,11 +806,7 @@ pub async fn handle_put_presence(
             );
         }
     };
-    let ttl_ms = match collab.put_presence(
-        &participant_id,
-        &payload,
-        put_req.ttl_ms.unwrap_or(0),
-    ) {
+    let ttl_ms = match collab.put_presence(&participant_id, &payload, put_req.ttl_ms.unwrap_or(0)) {
         Ok(v) => v,
         Err(err) => return collab_error_response(err),
     };
@@ -974,33 +982,37 @@ pub async fn handle_stream_events(
     let state_for_stream = state.clone();
     tokio::spawn(async move {
         let mut after_seq = initial_after_seq;
+        let mut last_keepalive_at = Instant::now();
         'producer: loop {
-            let wait = match collab_watch_wait_blocking(
-                collab.clone(),
-                after_seq,
-                WATCH_HEARTBEAT_SECONDS * 1_000,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    producer_queue.close().await;
-                    break 'producer;
-                }
-            };
+            let wait =
+                match collab_watch_wait_blocking(collab.clone(), after_seq, WATCH_WAIT_POLL_MS)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        producer_queue.close().await;
+                        break 'producer;
+                    }
+                };
 
             if wait.timed_out {
-                if !producer_queue.push(Bytes::from_static(b": keepalive\n\n")).await {
-                    producer_queue
-                        .push_gap_and_close(watch_gap_frame(
-                            &resource_kind,
-                            &resource_id,
-                            &namespace_for_stream,
-                            "consumer_too_slow",
-                            "consumer too slow",
-                        ))
-                        .await;
-                    break;
+                if last_keepalive_at.elapsed() >= Duration::from_secs(WATCH_HEARTBEAT_SECONDS) {
+                    if !producer_queue
+                        .push(Bytes::from_static(b": keepalive\n\n"))
+                        .await
+                    {
+                        producer_queue
+                            .push_gap_and_close(watch_gap_frame(
+                                &resource_kind,
+                                &resource_id,
+                                &namespace_for_stream,
+                                "consumer_too_slow",
+                                "consumer too slow",
+                            ))
+                            .await;
+                        break;
+                    }
+                    last_keepalive_at = Instant::now();
                 }
                 continue;
             }
@@ -1254,7 +1266,7 @@ async fn handle_ws_connection(
                                 let wait = match collab_watch_wait_blocking(
                                     watch_collab.clone(),
                                     watch_after_seq,
-                                    WATCH_HEARTBEAT_SECONDS * 1_000,
+                                    WATCH_WAIT_POLL_MS,
                                 )
                                 .await
                                 {
@@ -1403,6 +1415,18 @@ async fn handle_ws_connection(
                                 &payload,
                                 submit.issued_at_ms,
                                 Some(&snapshot),
+                                match parse_submit_durability(submit.durability.as_deref()) {
+                                    Ok(value) => value,
+                                    Err(message) => {
+                                        ws_send_collab_error_sink(
+                                            &mut ws_sink,
+                                            "invalid_argument",
+                                            message,
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
+                                },
                             )
                             .map_err(|err| err.to_string())?;
 
@@ -1705,11 +1729,7 @@ fn parse_cursor(query: Option<&str>) -> Result<Option<String>, Response<BoxBody>
         return Ok(None);
     };
     let decoded = percent_decode(raw);
-    if decoded.is_empty()
-        || decoded
-            .bytes()
-            .any(|b| b == 0 || b.is_ascii_control())
-    {
+    if decoded.is_empty() || decoded.bytes().any(|b| b == 0 || b.is_ascii_control()) {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
@@ -1738,6 +1758,15 @@ fn core_participant_kind(kind: ParticipantKind) -> CoreParticipantKind {
         ParticipantKind::Agent => CoreParticipantKind::Agent,
         ParticipantKind::External => CoreParticipantKind::External,
         ParticipantKind::System => CoreParticipantKind::System,
+    }
+}
+
+fn parse_submit_durability(raw: Option<&str>) -> Result<CoreWatchDurability, &'static str> {
+    match raw {
+        None | Some("strong") => Ok(CoreWatchDurability::Strong),
+        Some("batched") => Ok(CoreWatchDurability::Batched),
+        Some("ephemeral") => Ok(CoreWatchDurability::Ephemeral),
+        Some(_) => Err("durability must be one of: strong, batched, ephemeral"),
     }
 }
 
@@ -1777,7 +1806,10 @@ pub(crate) async fn open_collab_handle(
 }
 
 async fn collab_namespace(collab: &SharedCollabHandle) -> Result<String, String> {
-    collab.summary().map(|summary| summary.namespace).map_err(|err| err.to_string())
+    collab
+        .summary()
+        .map(|summary| summary.namespace)
+        .map_err(|err| err.to_string())
 }
 
 async fn collab_watch_wait_blocking(
@@ -1888,11 +1920,7 @@ where
         .map_err(|err| err.to_string())
 }
 
-async fn ws_send_collab_error_sink<S>(
-    ws: &mut S,
-    code: &str,
-    message: &str,
-) -> Result<(), String>
+async fn ws_send_collab_error_sink<S>(ws: &mut S, code: &str, message: &str) -> Result<(), String>
 where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {

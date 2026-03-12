@@ -193,16 +193,18 @@ pub const ResourceStore = struct {
         self: *ResourceStore,
         op: types.OperationEnvelope,
         snapshot: ?[]const u8,
+        lane: types.StorageLane,
     ) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
         const op_key = try op.key(self.allocator);
         errdefer self.allocator.free(op_key);
 
-        try self.kv.putWithOptions(op_key, op.payload, .{ .durability = .strong });
+        const durability = lane.toKvDurability();
+        try self.kv.putWithOptions(op_key, op.payload, .{ .durability = durability });
 
         if (snapshot) |snapshot_bytes| {
-            try self.kv.putWithOptions(snapshotKey, snapshot_bytes, .{ .durability = .strong });
+            try self.kv.putWithOptions(snapshotKey, snapshot_bytes, .{ .durability = durability });
         }
 
         const checkpoint_json = try jsonStringifyAlloc(self.allocator, .{
@@ -214,7 +216,7 @@ pub const ResourceStore = struct {
             .op_key = op_key,
         });
         defer self.allocator.free(checkpoint_json);
-        try self.kv.putWithOptions(lastOpKey, checkpoint_json, .{ .durability = .strong });
+        try self.kv.putWithOptions(lastOpKey, checkpoint_json, .{ .durability = durability });
         self.watch_cond.broadcast();
 
         return op_key;
@@ -256,7 +258,7 @@ pub const ResourceStore = struct {
             .op_id = op_id,
             .payload = payload,
             .issued_at_ms = issued_at_ms,
-        }, snapshot);
+        }, snapshot, .strong);
     }
 
     pub fn clearSnapshot(
@@ -670,7 +672,7 @@ test "ResourceStore open session, submit op, and history roundtrip" {
         .op_id = "op-1",
         .payload = "hello",
         .issued_at_ms = 1_001,
-    }, "snapshot");
+    }, "snapshot", .strong);
     defer std.testing.allocator.free(op_key);
     try std.testing.expectEqualStrings("ops/human:1:1:op-1", op_key);
 
@@ -757,7 +759,7 @@ test "ResourceStore getHistory paginates forward from cursor key" {
         .op_id = "op-1",
         .payload = "first",
         .issued_at_ms = 4_001,
-    }, null);
+    }, null, .strong);
     defer std.testing.allocator.free(first_key);
 
     const second_key = try store.submitOperation(.{
@@ -766,7 +768,7 @@ test "ResourceStore getHistory paginates forward from cursor key" {
         .op_id = "op-2",
         .payload = "second",
         .issued_at_ms = 4_002,
-    }, null);
+    }, null, .strong);
     defer std.testing.allocator.free(second_key);
 
     const third_key = try store.submitOperation(.{
@@ -775,7 +777,7 @@ test "ResourceStore getHistory paginates forward from cursor key" {
         .op_id = "op-3",
         .payload = "third",
         .issued_at_ms = 4_003,
-    }, null);
+    }, null, .strong);
     defer std.testing.allocator.free(third_key);
 
     const page = try store.getHistory(std.testing.allocator, first_key, 2);
@@ -811,6 +813,34 @@ test "ResourceStore clearSnapshot removes current snapshot and records op" {
     const op_type = try historyOpType(std.testing.allocator, history[1].payload);
     defer std.testing.allocator.free(op_type);
     try std.testing.expectEqualStrings("fs_delete", op_type);
+}
+
+test "ResourceStore submitOperation uses requested durability lane for watch events" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var store = try ResourceStore.init(std.testing.allocator, root, "text_document", "doc-batched");
+    defer store.deinit();
+
+    const op_key = try store.submitOperation(.{
+        .actor_id = "human:1",
+        .actor_seq = 1,
+        .op_id = "op-1",
+        .payload = "hello",
+        .issued_at_ms = 1,
+    }, "snapshot", .batched);
+    defer std.testing.allocator.free(op_key);
+
+    var drained = try store.watchDrain(std.testing.allocator, 0, 16);
+    defer drained.deinit(std.testing.allocator);
+    try std.testing.expectEqual(false, drained.lost);
+    try std.testing.expect(drained.events.len >= 1);
+    const last = drained.events[drained.events.len - 1];
+    try std.testing.expect(last.durability != null);
+    try std.testing.expectEqual(kv_store.DurabilityClass.batched, last.durability.?);
 }
 
 fn historyOpType(allocator: Allocator, payload: []const u8) ![]u8 {
@@ -873,7 +903,7 @@ test "ResourceStore watchWait wakes when a new watch event is published" {
         .op_id = "op-1",
         .payload = "hello",
         .issued_at_ms = 1,
-    }, "snapshot");
+    }, "snapshot", .strong);
     defer allocator.free(op_key);
 
     try done.timedWait(1 * std.time.ns_per_s);

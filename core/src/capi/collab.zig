@@ -407,6 +407,7 @@ pub export fn talu_collab_submit_op(
     snapshot: ?[*]const u8,
     snapshot_len: usize,
     has_snapshot: bool,
+    durability_class: u8,
     out_result: ?*CCollabOpResult,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -438,6 +439,10 @@ pub export fn talu_collab_submit_op(
         (validateBytes(snapshot, snapshot_len) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument))
     else
         null;
+    const durability_lane: collab_types.StorageLane = std.meta.intToEnum(collab_types.StorageLane, durability_class) catch {
+        capi_error.setErrorWithCode(.invalid_argument, "invalid durability_class", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
 
     const op_key = store.submitOperation(.{
         .actor_id = actor,
@@ -445,7 +450,7 @@ pub export fn talu_collab_submit_op(
         .op_id = op,
         .payload = payload_slice,
         .issued_at_ms = if (has_issued_at_ms) issued_at_ms else std.time.milliTimestamp(),
-    }, snapshot_slice) catch |err| {
+    }, snapshot_slice, durability_lane) catch |err| {
         capi_error.setError(err, "failed to submit collab operation", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };

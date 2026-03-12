@@ -119,7 +119,11 @@ fn agent_fs_write_and_edit_sync_workdir_collab_snapshot() {
         ctx.addr(),
         "/v1/collab/resources/workdir_file/notes%2Fmain.txt/snapshot",
     );
-    assert_eq!(snapshot_after_write.status, 200, "body: {}", snapshot_after_write.body);
+    assert_eq!(
+        snapshot_after_write.status, 200,
+        "body: {}",
+        snapshot_after_write.body
+    );
     let snapshot_json = snapshot_after_write.json();
     let snapshot_bytes = base64::engine::general_purpose::STANDARD
         .decode(
@@ -145,7 +149,11 @@ fn agent_fs_write_and_edit_sync_workdir_collab_snapshot() {
         ctx.addr(),
         "/v1/collab/resources/workdir_file/notes%2Fmain.txt/snapshot",
     );
-    assert_eq!(snapshot_after_edit.status, 200, "body: {}", snapshot_after_edit.body);
+    assert_eq!(
+        snapshot_after_edit.status, 200,
+        "body: {}",
+        snapshot_after_edit.body
+    );
     let snapshot_json = snapshot_after_edit.json();
     let snapshot_bytes = base64::engine::general_purpose::STANDARD
         .decode(
@@ -189,13 +197,20 @@ fn agent_fs_remove_and_rename_sync_workdir_collab_snapshots() {
         "/v1/collab/resources/workdir_file/notes%2Fmain.txt/snapshot",
     );
     assert_eq!(old_snapshot.status, 200, "body: {}", old_snapshot.body);
-    assert_eq!(old_snapshot.json()["snapshot_base64"], serde_json::Value::Null);
+    assert_eq!(
+        old_snapshot.json()["snapshot_base64"],
+        serde_json::Value::Null
+    );
 
     let renamed_snapshot = get(
         ctx.addr(),
         "/v1/collab/resources/workdir_file/notes%2Frenamed.txt/snapshot",
     );
-    assert_eq!(renamed_snapshot.status, 200, "body: {}", renamed_snapshot.body);
+    assert_eq!(
+        renamed_snapshot.status, 200,
+        "body: {}",
+        renamed_snapshot.body
+    );
     let renamed_bytes = base64::engine::general_purpose::STANDARD
         .decode(
             renamed_snapshot.json()["snapshot_base64"]
@@ -218,8 +233,72 @@ fn agent_fs_remove_and_rename_sync_workdir_collab_snapshots() {
         ctx.addr(),
         "/v1/collab/resources/workdir_file/notes%2Frenamed.txt/snapshot",
     );
-    assert_eq!(removed_snapshot.status, 200, "body: {}", removed_snapshot.body);
-    assert_eq!(removed_snapshot.json()["snapshot_base64"], serde_json::Value::Null);
+    assert_eq!(
+        removed_snapshot.status, 200,
+        "body: {}",
+        removed_snapshot.body
+    );
+    assert_eq!(
+        removed_snapshot.json()["snapshot_base64"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn agent_fs_binary_write_and_rename_sync_without_snapshot_payload() {
+    let workspace = TempDir::new().expect("workspace");
+    let ctx = ServerTestContext::new(config_with_workspace(&workspace));
+
+    let raw_bytes = [0_u8, 1, 2, 3, 4, 5];
+    let write_resp = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/write",
+        &serde_json::json!({
+            "path": "notes/blob.bin",
+            "content": base64::engine::general_purpose::STANDARD.encode(raw_bytes),
+            "encoding": "base64",
+            "mkdir": true
+        }),
+    );
+    assert_eq!(write_resp.status, 200, "body: {}", write_resp.body);
+
+    let snapshot_after_write = get(
+        ctx.addr(),
+        "/v1/collab/resources/workdir_file/notes%2Fblob.bin/snapshot",
+    );
+    assert_eq!(
+        snapshot_after_write.status, 200,
+        "body: {}",
+        snapshot_after_write.body
+    );
+    assert_eq!(
+        snapshot_after_write.json()["snapshot_base64"],
+        serde_json::Value::Null
+    );
+
+    let rename_resp = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/rename",
+        &serde_json::json!({
+            "from": "notes/blob.bin",
+            "to": "notes/blob-renamed.bin"
+        }),
+    );
+    assert_eq!(rename_resp.status, 200, "body: {}", rename_resp.body);
+
+    let renamed_snapshot = get(
+        ctx.addr(),
+        "/v1/collab/resources/workdir_file/notes%2Fblob-renamed.bin/snapshot",
+    );
+    assert_eq!(
+        renamed_snapshot.status, 200,
+        "body: {}",
+        renamed_snapshot.body
+    );
+    assert_eq!(
+        renamed_snapshot.json()["snapshot_base64"],
+        serde_json::Value::Null
+    );
 }
 
 #[test]

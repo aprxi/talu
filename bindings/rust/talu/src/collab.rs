@@ -143,6 +143,7 @@ unsafe extern "C" {
         snapshot: *const u8,
         snapshot_len: usize,
         has_snapshot: bool,
+        durability_class: u8,
         out_result: *mut CCollabOpResult,
     ) -> c_int;
     #[link_name = "talu_collab_get_history"]
@@ -431,6 +432,7 @@ impl CollabHandle {
         payload: &[u8],
         issued_at_ms: Option<i64>,
         snapshot: Option<&[u8]>,
+        durability: WatchDurability,
     ) -> Result<OpSubmitResult, CollabError> {
         let actor_c = to_cstring(actor_id, "actor_id")?;
         let op_c = to_cstring(op_id, "op_id")?;
@@ -449,6 +451,11 @@ impl CollabHandle {
             })
             .unwrap_or(std::ptr::null());
         let snapshot_len = snapshot.map_or(0, |bytes| bytes.len());
+        let durability_class = match durability {
+            WatchDurability::Strong => 0,
+            WatchDurability::Batched => 1,
+            WatchDurability::Ephemeral => 2,
+        };
 
         let mut out = CCollabOpResult::default();
         let rc = unsafe {
@@ -464,6 +471,7 @@ impl CollabHandle {
                 snapshot_ptr,
                 snapshot_len,
                 snapshot.is_some(),
+                durability_class,
                 &mut out,
             )
         };
@@ -477,7 +485,6 @@ impl CollabHandle {
         unsafe { talu_collab_free_op_result_raw(&mut out) };
         Ok(result)
     }
-
 
     pub fn history(
         &self,
@@ -538,7 +545,10 @@ impl CollabHandle {
             )
         };
         if rc != ERROR_CODE_OK {
-            return Err(CollabError::from_code(rc, "failed to clear collab snapshot"));
+            return Err(CollabError::from_code(
+                rc,
+                "failed to clear collab snapshot",
+            ));
         }
         let result = OpSubmitResult {
             op_key: cstr_to_string(out.op_key, "op_key")?,
@@ -800,14 +810,52 @@ mod tests {
                 br#"{"type":"fs_write"}"#,
                 Some(1),
                 Some(b"hello"),
+                WatchDurability::Strong,
             )
             .expect("submit initial snapshot");
         handle
-            .clear_snapshot("system:agent_fs", ParticipantKind::System, Some("sync"), "fs_delete")
+            .clear_snapshot(
+                "system:agent_fs",
+                ParticipantKind::System,
+                Some("sync"),
+                "fs_delete",
+            )
             .expect("clear snapshot");
 
         let snapshot = handle.snapshot().expect("read snapshot");
         assert!(snapshot.is_none());
     }
 
+    #[test]
+    fn collab_submit_op_with_batched_durability_emits_batched_watch_event() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let db_root = temp.path().join("kv");
+        std::fs::create_dir_all(&db_root).expect("create db root");
+
+        let handle = CollabHandle::open(
+            db_root.to_str().expect("utf8 path"),
+            "text_document",
+            "doc-batched",
+        )
+        .expect("open collab");
+
+        handle
+            .submit_op(
+                "human:1",
+                1,
+                "op-1",
+                br#"{"type":"ui_live"}"#,
+                Some(1),
+                Some(b"hello"),
+                WatchDurability::Batched,
+            )
+            .expect("submit batched op");
+
+        let drained = handle.watch_drain(0, 16).expect("drain watch events");
+        assert!(!drained.events.is_empty());
+        assert!(drained
+            .events
+            .iter()
+            .any(|event| event.durability == Some(WatchDurability::Batched)));
+    }
 }
