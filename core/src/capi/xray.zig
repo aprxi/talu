@@ -686,6 +686,21 @@ pub export fn talu_xray_verify_clear_point_mask_override() callconv(.c) void {
     xray.clearVerifyPointMaskOverride();
 }
 
+/// Restrict verification to one exact built-in checkpoint emission.
+/// This narrows observability only; it must not alter backend compute paths.
+pub export fn talu_xray_verify_set_exact_emission_filter(
+    point: u8,
+    layer: u16,
+    position: u32,
+) callconv(.c) void {
+    xray.setVerifyExactEmissionOverride(@enumFromInt(point), layer, position);
+}
+
+/// Clear exact checkpoint emission override.
+pub export fn talu_xray_verify_clear_exact_emission_filter() callconv(.c) void {
+    xray.clearVerifyExactEmissionOverride();
+}
+
 /// Persist full CPU tensor sidecar captured in recording mode to NPZ.
 /// Returns false on error (check talu_error_message).
 pub export fn talu_xray_verify_capture_save_recording_full_npz(

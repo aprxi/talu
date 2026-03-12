@@ -4,7 +4,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,12 +16,30 @@ use crate::provider::create_backend_for_model;
 use super::repo::resolve_model_path;
 use super::XrayArgs;
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn _exit(status: i32) -> !;
+}
+
 struct VerifyOverrideGuard {
     point_mask_overridden: bool,
+    exact_emission_overridden: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ExactEmissionOverride {
+    point: u8,
+    layer: u16,
+    position: u32,
 }
 
 impl VerifyOverrideGuard {
-    fn new(teacher_forcing: bool, full_capture: bool, point_mask_override: Option<u64>) -> Self {
+    fn new(
+        teacher_forcing: bool,
+        full_capture: bool,
+        point_mask_override: Option<u64>,
+        exact_emission_override: Option<ExactEmissionOverride>,
+    ) -> Self {
         // Verify runner invariant:
         // Any temporary state configured here must remain transcript-level only.
         // Do not add toggles that alter backend execution behavior.
@@ -31,8 +49,16 @@ impl VerifyOverrideGuard {
         if let Some(mask) = point_mask_override {
             talu::xray::VerifyCaptureHandle::set_point_mask(mask);
         }
+        if let Some(target) = exact_emission_override {
+            talu::xray::VerifyCaptureHandle::set_exact_emission_filter(
+                target.point,
+                target.layer,
+                target.position,
+            );
+        }
         Self {
             point_mask_overridden: point_mask_override.is_some(),
+            exact_emission_overridden: exact_emission_override.is_some(),
         }
     }
 }
@@ -44,6 +70,9 @@ impl Drop for VerifyOverrideGuard {
         talu::xray::VerifyCaptureHandle::clear_full_capture_override();
         if self.point_mask_overridden {
             talu::xray::VerifyCaptureHandle::clear_point_mask_override();
+        }
+        if self.exact_emission_overridden {
+            talu::xray::VerifyCaptureHandle::clear_exact_emission_filter();
         }
     }
 }
@@ -152,6 +181,81 @@ impl Drop for TempReferenceBundle {
         let _ = std::fs::remove_file(&self.reference_path);
         let _ = std::fs::remove_file(&self.sidecar_path);
     }
+}
+
+struct ScopedTempJson {
+    path: PathBuf,
+}
+
+impl ScopedTempJson {
+    fn create(prefix: &str) -> Result<(Self, File)> {
+        let temp_dir = std::env::temp_dir();
+        for attempt in 0..32u32 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|err| anyhow!("system clock error while creating temp file: {err}"))?
+                .as_nanos();
+            let path = temp_dir.join(format!(
+                "{}_{}_{}_{}.json",
+                prefix,
+                std::process::id(),
+                nonce,
+                attempt
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok((Self { path }, file)),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(anyhow!(
+                        "failed to create temp JSON file {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Err(anyhow!(
+            "failed to allocate unique temp JSON path after repeated attempts"
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScopedTempJson {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn synchronize_backend(backend: &talu::InferenceBackend) -> Result<()> {
+    let rc = unsafe { talu_sys::talu_backend_synchronize(backend.as_ptr()) };
+    if rc != 0 {
+        let message =
+            last_error_message().unwrap_or_else(|| "backend synchronize failed".to_string());
+        return Err(anyhow!("Error: {} (code {})", message, rc));
+    }
+    Ok(())
+}
+
+fn maybe_hard_exit_after_verify(result: Result<()>) -> Result<()> {
+    if should_process_scope_backend_teardown() {
+        let exit_code = if result.is_ok() { 0 } else { 1 };
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        #[cfg(target_os = "macos")]
+        unsafe {
+            _exit(exit_code);
+        }
+        #[allow(unreachable_code)]
+        return result;
+    }
+    result
 }
 
 /// Kernel usage derived from trace records.
@@ -1194,6 +1298,7 @@ fn cmd_xray_record(model: &str, ref_path: &str, args: &XrayArgs) -> Result<()> {
     let result = talu::router::generate(&chat, &content, &backend, &cfg);
 
     VerifyCaptureHandle::disable();
+    synchronize_backend(&backend)?;
 
     let result = result?;
     if result.error_code() != 0 {
@@ -1220,6 +1325,145 @@ fn cmd_xray_record(model: &str, ref_path: &str, args: &XrayArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_verify_pass_with_backend(
+    backend: &talu::InferenceBackend,
+    prompt_text: &str,
+    seed: u64,
+    tolerance: f32,
+    reference_path: &str,
+    max_tokens: usize,
+    teacher_forcing: bool,
+    full_npz_path: Option<&Path>,
+    point_mask_override: Option<u64>,
+    exact_emission_override: Option<ExactEmissionOverride>,
+) -> Result<(bool, Option<String>)> {
+    use talu::xray::{ReferenceDataHandle, ReferenceVerifierHandle, VerifyCaptureHandle};
+
+    let _override_guard = VerifyOverrideGuard::new(
+        teacher_forcing,
+        full_npz_path.is_some(),
+        point_mask_override,
+        exact_emission_override,
+    );
+
+    let cfg = talu::router::GenerateConfig {
+        temperature: 1.0,
+        max_tokens,
+        seed,
+        ..Default::default()
+    };
+    let reference = ReferenceDataHandle::load(reference_path)?;
+    let verifier = ReferenceVerifierHandle::new(&reference, tolerance)?;
+    let verify_cap = VerifyCaptureHandle::new_verification(&verifier, Some("/tmp/panic_dumps"))?;
+    let chat = ChatHandle::new(None)?;
+    let content = vec![talu::router::ContentPart::Text(prompt_text.to_string())];
+    let active_run_guard = ActiveVerifyRunGuard::activate(teacher_forcing, &verifier, &verify_cap);
+
+    let pass_outcome = {
+        let generation = talu::router::generate(&chat, &content, &backend, &cfg);
+
+        drop(active_run_guard);
+        let sync_result = synchronize_backend(&backend);
+        let result = generation?;
+        sync_result?;
+        if let Some(path) = full_npz_path {
+            if let Some(path_str) = path.to_str() {
+                verify_cap.save_full_npz(path_str)?;
+            }
+        }
+
+        let outcome = if result.error_code() != 0 {
+            if verifier.has_diverged() {
+                let msg = verifier.finish().err().map(|err| err.to_string());
+                Ok((true, msg))
+            } else {
+                let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
+                Err(anyhow!("Error: {} (code {})", message, result.error_code()))
+            }
+        } else if !teacher_forcing {
+            if verifier.has_diverged() {
+                let msg = verifier.finish().err().map(|err| err.to_string());
+                Ok((true, msg))
+            } else if verifier.get_next_token().is_some() {
+                Ok((
+                    true,
+                    Some(
+                        "Token transcript mismatch: generation ended before consuming reference transcript"
+                            .to_string(),
+                    ),
+                ))
+            } else {
+                Ok((false, None))
+            }
+        } else {
+            match verifier.finish() {
+                Ok(()) => Ok((verifier.has_diverged(), None)),
+                Err(err) => {
+                    if verifier.has_diverged() {
+                        Ok((true, Some(err.to_string())))
+                    } else {
+                        Err(err.into())
+                    }
+                }
+            }
+        };
+        drop(result);
+        outcome
+    };
+
+    // XRAY teardown contract:
+    // 1. Disable capture / teacher forcing.
+    // 2. Synchronize backend work.
+    // 3. Finalize and drop xray verifier/capture state.
+    // 4. Drop router state.
+    drop(verify_cap);
+    drop(verifier);
+    drop(reference);
+    drop(content);
+    drop(chat);
+
+    pass_outcome
+}
+
+fn run_verify_pass(
+    model: &str,
+    prompt_text: &str,
+    seed: u64,
+    tolerance: f32,
+    reference_path: &str,
+    max_tokens: usize,
+    teacher_forcing: bool,
+    full_npz_path: Option<&Path>,
+    point_mask_override: Option<u64>,
+    exact_emission_override: Option<ExactEmissionOverride>,
+) -> Result<(bool, Option<String>)> {
+    // Each verify pass must start from a clean inference backend. Reusing the
+    // same backend across free-run and teacher-forced phases leaks backend
+    // state between logically independent inferences and can create false
+    // phase-2 divergences or crashes.
+    let backend = create_backend_for_model(model, None)?;
+    let pass_outcome = run_verify_pass_with_backend(
+        &backend,
+        prompt_text,
+        seed,
+        tolerance,
+        reference_path,
+        max_tokens,
+        teacher_forcing,
+        full_npz_path,
+        point_mask_override,
+        exact_emission_override,
+    );
+
+    if should_process_scope_backend_teardown() {
+        std::mem::forget(backend);
+    } else {
+        drop(backend);
+    }
+
+    pass_outcome
+}
+
 /// Verification mode: load reference and verify generation matches.
 ///
 /// XRAY VERIFY PROCEDURE (contract):
@@ -1236,8 +1480,6 @@ fn cmd_xray_record(model: &str, ref_path: &str, args: &XrayArgs) -> Result<()> {
 /// - Verify is observability-only; it MUST NOT change kernel selection/arithmetic.
 /// - Teacher forcing may control token progression only; it must not alter math paths.
 fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs) -> Result<()> {
-    use talu::xray::{ReferenceDataHandle, ReferenceVerifierHandle, VerifyCaptureHandle};
-
     let reference_json_path = ref_path.to_string();
     let golden_full_npz = PathBuf::from(format!("{}.layers_full.npz", reference_json_path));
 
@@ -1253,248 +1495,161 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
     println!("  Tolerance: {}", tolerance);
     println!("  Prompt: \"{}\"", prompt_text);
 
+    if args.verify_phase1_only {
+        return run_phase1_only_in_current_process(
+            model,
+            &prompt_text,
+            tolerance,
+            &reference_json_path,
+            args,
+        );
+    }
+
+    if args.verify_phase2_only {
+        let phase2_max_tokens = args
+            .verify_phase2_max_tokens
+            .ok_or_else(|| anyhow!("missing internal --verify-phase2-max-tokens"))?
+            as usize;
+        return run_phase2_only_in_current_process(
+            model,
+            &prompt_text,
+            tolerance,
+            &reference_json_path,
+            args,
+            phase2_max_tokens,
+        );
+    }
+
     let checkpoint_target = args
         .verify_checkpoint
         .as_deref()
         .map(parse_verify_checkpoint_target)
         .transpose()?;
+    if let Some(target) = checkpoint_target {
+        if args.verify_checkpoint_stats_only {
+            let max_tokens = (target.token as usize).saturating_add(1).max(1);
+            let target_point_mask = point_mask_for_name(&target.point)?;
+            let filtered_reference = write_filtered_reference_json(&reference_json_path, &target)?;
+            let filtered_reference_path = filtered_reference
+                .path()
+                .to_str()
+                .ok_or_else(|| anyhow!("filtered reference path is not valid UTF-8"))?;
+            let exact_emission_override = exact_emission_override_for_target(&target)?;
+            println!(
+                "Targeted checkpoint stats verification ({}, max_tokens={}):",
+                args.verify_checkpoint
+                    .as_deref()
+                    .unwrap_or("<parsed checkpoint>"),
+                max_tokens
+            );
+            let (diverged, msg) = run_verify_pass(
+                model,
+                &prompt_text,
+                args.seed,
+                tolerance,
+                filtered_reference_path,
+                max_tokens,
+                true,
+                None,
+                Some(target_point_mask),
+                exact_emission_override,
+            )?;
+            if diverged {
+                println!("✗ Verification FAILED");
+                if let Some(msg) = msg {
+                    print_first_divergence_report(&msg);
+                } else {
+                    println!("token=?, layer=?, point=? -> FAILED");
+                    println!();
+                    println!("details:");
+                    println!("  divergence detected but no structured message was provided");
+                }
+                return Err(anyhow!(
+                    "Verification failed: checkpoint divergence detected"
+                ));
+            }
 
-    let run_pass = |teacher_forcing: bool,
-                    reference_path: &str,
-                    max_tokens: usize,
-                    full_npz_path: Option<&Path>,
-                    point_mask_override: Option<u64>|
-     -> Result<(bool, Option<String>)> {
-        let _override_guard = VerifyOverrideGuard::new(
-            teacher_forcing,
-            full_npz_path.is_some(),
-            point_mask_override,
-        );
-
-        if teacher_forcing {
-            // Phase 2: localization run on fixed transcript.
-        } else {
-            // Phase 1: pure free-run transcript parity with token-only capture.
+            let layer_label = match target.layer {
+                VerifyLayerTarget::Global => "global".to_string(),
+                VerifyLayerTarget::Layer(layer) => layer.to_string(),
+            };
+            println!(
+                "token={}, layer={}, point={}, pos={} -> PASSED",
+                target.token,
+                layer_label,
+                target.point,
+                target.position.unwrap_or(0)
+            );
+            println!();
+            println!("details:");
+            println!("  kind=stats");
+            println!("  checkpoint matched within tolerance");
+            return Ok(());
         }
 
-        let run_result = (|| -> Result<(bool, Option<String>)> {
-            let cfg = talu::router::GenerateConfig {
-                temperature: 1.0,
-                max_tokens,
-                seed: args.seed,
-                ..Default::default()
-            };
-            let reference = ReferenceDataHandle::load(reference_path)?;
-            let verifier = ReferenceVerifierHandle::new(&reference, tolerance)?;
-            let verify_cap =
-                VerifyCaptureHandle::new_verification(&verifier, Some("/tmp/panic_dumps"))?;
-            let backend = create_backend_for_model(model, None)?;
-            let chat = ChatHandle::new(None)?;
-            let content = vec![talu::router::ContentPart::Text(prompt_text.clone())];
-            let active_run_guard =
-                ActiveVerifyRunGuard::activate(teacher_forcing, &verifier, &verify_cap);
-
-            let result = talu::router::generate(&chat, &content, &backend, &cfg);
-
-            drop(active_run_guard);
-            if let Some(path) = full_npz_path {
-                if let Some(path_str) = path.to_str() {
-                    verify_cap.save_full_npz(path_str)?;
-                }
-            }
-
-            let result = result?;
-            if result.error_code() != 0 {
-                if verifier.has_diverged() {
-                    let msg = verifier.finish().err().map(|err| err.to_string());
-                    return Ok((true, msg));
-                }
-                let message =
-                    last_error_message().unwrap_or_else(|| "generation failed".to_string());
-                return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
-            }
-
-            if !teacher_forcing {
-                if verifier.has_diverged() {
-                    let msg = verifier.finish().err().map(|err| err.to_string());
-                    return Ok((true, msg));
-                }
-                if verifier.get_next_token().is_some() {
-                    return Ok((
-                        true,
-                        Some(
-                            "Token transcript mismatch: generation ended before consuming reference transcript"
-                                .to_string(),
-                        ),
-                    ));
-                }
-                return Ok((false, None));
-            }
-
-            match verifier.finish() {
-                Ok(()) => Ok((verifier.has_diverged(), None)),
-                Err(err) => {
-                    if verifier.has_diverged() {
-                        Ok((true, Some(err.to_string())))
-                    } else {
-                        Err(err.into())
-                    }
-                }
-            }
-        })();
-
-        run_result
-    };
-
-    if let Some(target) = checkpoint_target {
-        let max_tokens = (target.token as usize).saturating_add(1).max(1);
-        let target_point_mask = point_mask_for_name(&target.point)?;
         println!(
             "Targeted checkpoint verification ({}, max_tokens={}):",
             args.verify_checkpoint
                 .as_deref()
                 .unwrap_or("<parsed checkpoint>"),
-            max_tokens
+            (target.token as usize).saturating_add(1).max(1)
         );
-        let candidate_npz = std::env::temp_dir().join(format!(
-            "talu_xray_verify_candidate_{}_checkpoint.layers_full.npz",
-            std::process::id()
-        ));
-        let _ = run_pass(
-            true,
-            &reference_json_path,
-            max_tokens,
-            Some(&candidate_npz),
-            Some(target_point_mask),
-        )?;
-
-        if !golden_full_npz.exists() {
-            return Err(anyhow!(
-                "golden full sidecar missing: {}. Re-record CPU reference first",
-                golden_full_npz.display()
-            ));
-        }
         let golden_tensors = load_npz_f32(&golden_full_npz)?;
-        let candidate_tensors = load_npz_f32(&candidate_npz)?;
-        let selected = select_checkpoint_key(&golden_tensors, &target, Some(&candidate_tensors))?;
-
-        let expected = golden_tensors.get(&selected.key).ok_or_else(|| {
-            anyhow!(
-                "internal error: selected golden checkpoint '{}' not found",
-                selected.key
-            )
-        })?;
-        let actual = candidate_tensors.get(&selected.key);
-
-        let layer_label = if selected.scope == "global" {
-            "global".to_string()
-        } else {
-            selected.layer_index.to_string()
-        };
-        let actual = match actual {
-            Some(values) => values,
-            None => {
-                println!(
-                    "token={}, layer={}, point={}, pos={} -> FAILED",
-                    selected.token, layer_label, selected.point, selected.position
-                );
-                println!();
-                println!("details:");
-                println!("  kind=coverage");
-                println!("  checkpoint={}", selected.key);
-                println!("  detail=checkpoint missing from candidate sidecar");
-                println!("  golden_sidecar={}", golden_full_npz.display());
-                println!("  candidate_sidecar={}", candidate_npz.display());
-                return Err(anyhow!(
-                    "Verification failed: candidate missing checkpoint {}",
-                    selected.key
-                ));
-            }
-        };
-
-        let (rel_rms, max_abs) = rel_rms_and_max_abs(expected, actual);
-        let len_mismatch = expected.len() != actual.len();
-
-        let expected_rms = if expected.is_empty() {
-            0.0f64
-        } else {
-            let sum_sq = expected
-                .iter()
-                .map(|v| {
-                    let value = *v as f64;
-                    value * value
-                })
-                .sum::<f64>();
-            (sum_sq / expected.len() as f64).sqrt()
-        };
-        let actual_rms = if actual.is_empty() {
-            0.0f64
-        } else {
-            let sum_sq = actual
-                .iter()
-                .map(|v| {
-                    let value = *v as f64;
-                    value * value
-                })
-                .sum::<f64>();
-            (sum_sq / actual.len() as f64).sqrt()
-        };
-        let abs_rms_diff = (actual_rms - expected_rms).abs();
-        let diverged = len_mismatch || exceeds_numeric_tolerance(rel_rms, abs_rms_diff, tolerance);
-
-        println!(
-            "token={}, layer={}, point={}, pos={} -> {}",
-            selected.token,
-            layer_label,
-            selected.point,
-            selected.position,
-            if diverged { "FAILED" } else { "PASSED" }
-        );
-        println!();
-        println!("details:");
-        println!("  kind=checkpoint");
-        println!("  checkpoint={}", selected.key);
-        println!(
-            "  expected_len={} actual_len={}",
-            expected.len(),
-            actual.len()
-        );
-        println!(
-            "  metric=rms expected={:.6} actual={:.6} abs_diff={:.6} rel_diff={:.6}",
-            expected_rms, actual_rms, abs_rms_diff, rel_rms
-        );
-        println!("  metric=max_abs_diff value={:.6}", max_abs);
-        if len_mismatch {
-            println!("  detail=length mismatch");
-        }
-        if diverged {
-            println!("  golden_sidecar={}", golden_full_npz.display());
-            println!("  candidate_sidecar={}", candidate_npz.display());
-            print_targeted_checkpoint_hint(model, &prompt_text, &selected);
+        let result = run_targeted_checkpoint_compare(
+            model,
+            &prompt_text,
+            args.seed,
+            tolerance,
+            &reference_json_path,
+            &golden_full_npz,
+            &golden_tensors,
+            &target,
+        )?;
+        print_targeted_checkpoint_report(model, &prompt_text, &golden_full_npz, &result);
+        if result.diverged {
             return Err(anyhow!(
                 "Verification failed: checkpoint divergence at {} (rel_rms={:.6})",
-                selected.key,
-                rel_rms
+                result.selected.key,
+                result.rel_rms
             ));
         }
-        let _ = std::fs::remove_file(&candidate_npz);
+        let _ = std::fs::remove_file(&result.candidate_sidecar);
         return Ok(());
     }
 
-    println!(
-        "Phase 1/2: Free-run token parity ({} tokens, first divergence only)...",
-        args.tokens
-    );
-    let (diverged, divergence_msg) = run_pass(
-        false,
-        &reference_json_path,
+    run_verify_in_current_process(model, &prompt_text, tolerance, &reference_json_path, args)
+}
+
+struct Phase1ProcessResult {
+    report: String,
+    passed: bool,
+}
+
+fn should_process_scope_backend_teardown() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn run_phase1_only_in_current_process(
+    model: &str,
+    prompt_text: &str,
+    tolerance: f32,
+    reference_json_path: &str,
+    args: &XrayArgs,
+) -> Result<()> {
+    let (diverged, divergence_msg) = run_verify_pass(
+        model,
+        prompt_text,
+        args.seed,
+        tolerance,
+        reference_json_path,
         args.tokens as usize,
+        false,
+        None,
         None,
         None,
     )?;
 
     if diverged {
-        println!("✗ Phase 1 FAILED");
         if let Some(msg) = &divergence_msg {
             print_first_divergence_report(msg);
         } else {
@@ -1503,35 +1658,6 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             println!("details:");
             println!("  divergence detected but no structured message was provided");
         }
-
-        let phase2_max_tokens = divergence_msg
-            .as_deref()
-            .and_then(|msg| parse_u32_after(msg, "token="))
-            .map(|token_idx| token_idx.saturating_add(1) as usize)
-            .map(|count| count.max(1))
-            .unwrap_or(args.tokens as usize)
-            .min(args.tokens as usize)
-            .max(1);
-
-        println!(
-            "Phase 2/2: Teacher-forced numeric localization from token=0 (max_tokens={})...",
-            phase2_max_tokens
-        );
-        let (_, phase2_msg) = run_pass(true, &reference_json_path, phase2_max_tokens, None, None)?;
-
-        println!("✗ Verification FAILED");
-        if let Some(msg) = phase2_msg {
-            print_first_divergence_report(&msg);
-        } else if let Some(msg) = divergence_msg {
-            print_first_divergence_report(&msg);
-        } else {
-            println!("token=?, layer=?, point=? -> FAILED");
-            println!();
-            println!("details:");
-            println!("  divergence detected but no structured message was provided");
-        }
-
-        println!("  Check panic dumps in /tmp/panic_dumps/");
         return Err(anyhow!("Verification failed: divergence detected"));
     }
 
@@ -1543,6 +1669,259 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         args.tokens, args.seed, tolerance
     );
     Ok(())
+}
+
+fn run_phase1_process(
+    exe_path: &Path,
+    model: &str,
+    prompt_text: &str,
+    reference_json_path: &str,
+    tolerance: f32,
+    args: &XrayArgs,
+) -> Result<Phase1ProcessResult> {
+    let mut command = Command::new(exe_path);
+    apply_verify_child_environment(&mut command);
+    command
+        .arg("xray")
+        .arg(model)
+        .arg("--verify")
+        .arg("--verify-phase1-only")
+        .arg("--verify-reference-path")
+        .arg(reference_json_path)
+        .arg("--tokens")
+        .arg(args.tokens.to_string())
+        .arg("--seed")
+        .arg(args.seed.to_string())
+        .arg("--tolerance")
+        .arg(tolerance.to_string())
+        .arg(prompt_text);
+    let (status, stdout, stderr) =
+        run_command_capture_to_temp_files(&mut command, "phase 1 verify child process")?;
+    let combined = if stderr.trim().is_empty() {
+        stdout
+    } else if stdout.trim().is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+    let report = extract_verify_report(&combined).unwrap_or_default();
+
+    if status.success() {
+        return Ok(Phase1ProcessResult {
+            report,
+            passed: true,
+        });
+    }
+
+    if !report.is_empty() {
+        return Ok(Phase1ProcessResult {
+            report,
+            passed: false,
+        });
+    }
+
+    Err(anyhow!(
+        "phase 1 verify child process exited without a structured report: {}",
+        status
+    ))
+}
+
+fn run_verify_in_current_process(
+    model: &str,
+    prompt_text: &str,
+    tolerance: f32,
+    reference_json_path: &str,
+    args: &XrayArgs,
+) -> Result<()> {
+    println!(
+        "Phase 1/2: Free-run token parity ({} tokens, first divergence only)...",
+        args.tokens
+    );
+    let exe_path = std::env::current_exe()
+        .map_err(|err| anyhow!("failed to resolve current executable for phase 1: {err}"))?;
+    let phase1 = run_phase1_process(
+        &exe_path,
+        model,
+        prompt_text,
+        reference_json_path,
+        tolerance,
+        args,
+    )?;
+
+    if !phase1.passed {
+        println!("✗ Phase 1 FAILED");
+        if phase1.report.is_empty() {
+            println!("token=?, layer=?, point=? -> FAILED");
+            println!();
+            println!("details:");
+            println!("  divergence detected but no structured message was provided");
+        } else {
+            println!("{}", phase1.report);
+        }
+        let phase2_max_tokens = parse_u32_after(&phase1.report, "token=")
+            .map(|token_idx| token_idx.saturating_add(1) as usize)
+            .map(|count| count.max(1))
+            .unwrap_or(args.tokens as usize)
+            .min(args.tokens as usize)
+            .max(1);
+        return run_phase2_localization_with_single_process_child(
+            model,
+            prompt_text,
+            tolerance,
+            reference_json_path,
+            args,
+            phase2_max_tokens,
+        );
+    }
+
+    if phase1.report.is_empty() {
+        println!("token=all, layer=all, point=all -> PASSED");
+        println!();
+        println!("details:");
+        println!(
+            "  verified tokens={} seed={} tolerance={}",
+            args.tokens, args.seed, tolerance
+        );
+    } else {
+        println!("{}", phase1.report);
+    }
+    Ok(())
+}
+
+fn run_phase2_only_in_current_process(
+    model: &str,
+    prompt_text: &str,
+    tolerance: f32,
+    reference_json_path: &str,
+    args: &XrayArgs,
+    phase2_max_tokens: usize,
+) -> Result<()> {
+    let filtered_reference = write_phase2_reference_json(reference_json_path, phase2_max_tokens)?;
+    let filtered_reference_path = filtered_reference
+        .path()
+        .to_str()
+        .ok_or_else(|| anyhow!("filtered reference path is not valid UTF-8"))?;
+    println!(
+        "Phase 2/2: Teacher-forced numeric localization from token=0 (max_tokens={})...",
+        phase2_max_tokens
+    );
+
+    let backend = create_backend_for_model(model, None)?;
+    let (diverged, msg) = match run_verify_pass_with_backend(
+        &backend,
+        prompt_text,
+        args.seed,
+        tolerance,
+        filtered_reference_path,
+        phase2_max_tokens,
+        true,
+        None,
+        None,
+        None,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            if should_process_scope_backend_teardown() {
+                std::mem::forget(backend);
+            } else {
+                drop(backend);
+            }
+            println!("token=?, layer=?, point=? -> FAILED");
+            println!();
+            println!("details:");
+            println!("  kind=internal_error");
+            println!("  detail={err}");
+            return Err(err);
+        }
+    };
+
+    if should_process_scope_backend_teardown() {
+        std::mem::forget(backend);
+    } else {
+        drop(backend);
+    }
+
+    if diverged {
+        if let Some(msg) = msg {
+            println!("{}", format_first_divergence_report(&msg));
+        } else {
+            println!("token=?, layer=?, point=? -> FAILED");
+            println!();
+            println!("details:");
+            println!("  divergence detected but no structured message was provided");
+        }
+        return Err(anyhow!("Verification failed: divergence detected"));
+    }
+
+    println!("token=?, layer=?, point=? -> FAILED");
+    println!();
+    println!("details:");
+    println!("  divergence detected but no structured message was provided");
+    println!(
+        "  localization=filtered_phase2_replay_found_no_numeric_divergence checked_default_points=true max_token={}",
+        phase2_max_tokens.saturating_sub(1)
+    );
+    Err(anyhow!(
+        "Verification failed: free-run token mismatch without numeric localization"
+    ))
+}
+
+fn run_phase2_localization_with_single_process_child(
+    model: &str,
+    prompt_text: &str,
+    tolerance: f32,
+    reference_json_path: &str,
+    args: &XrayArgs,
+    phase2_max_tokens: usize,
+) -> Result<()> {
+    println!(
+        "Phase 2/2: Teacher-forced numeric localization from token=0 (max_tokens={})...",
+        phase2_max_tokens
+    );
+
+    let exe_path = std::env::current_exe()
+        .map_err(|err| anyhow!("failed to resolve current executable for phase 2: {err}"))?;
+    let mut command = Command::new(exe_path);
+    apply_verify_child_environment(&mut command);
+    command
+        .arg("xray")
+        .arg(model)
+        .arg("--verify")
+        .arg("--verify-phase2-only")
+        .arg("--verify-phase2-max-tokens")
+        .arg(phase2_max_tokens.to_string())
+        .arg("--verify-reference-path")
+        .arg(reference_json_path)
+        .arg("--tokens")
+        .arg(phase2_max_tokens.to_string())
+        .arg("--seed")
+        .arg(args.seed.to_string())
+        .arg("--tolerance")
+        .arg(tolerance.to_string())
+        .arg(prompt_text);
+
+    let (status, stdout, stderr) =
+        run_command_capture_to_temp_files(&mut command, "phase 2 verify child process")?;
+    let combined = if stderr.trim().is_empty() {
+        stdout
+    } else if stdout.trim().is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+    let report = extract_verify_report(&combined).unwrap_or_default();
+
+    if !status.success() && !report.is_empty() {
+        println!("✗ Verification FAILED");
+        println!("{}", report);
+        println!("  Check panic dumps in /tmp/panic_dumps/");
+        return Err(anyhow!("Verification failed: divergence detected"));
+    }
+
+    Err(anyhow!(
+        "phase 2 verify child process exited without a structured report: {}",
+        status
+    ))
 }
 
 fn sanitize_model_for_filename(model: &str) -> String {
@@ -1705,7 +2084,11 @@ fn default_dev_reference_path(model: &str, args: &XrayArgs) -> Result<PathBuf> {
 }
 
 fn cmd_xray_verify_default(model: &str, args: &XrayArgs) -> Result<()> {
-    let reference_path = default_dev_reference_path(model, args)?;
+    let reference_path = if let Some(path) = &args.verify_reference_path {
+        PathBuf::from(path)
+    } else {
+        default_dev_reference_path(model, args)?
+    };
     let sidecar_path = reference_sidecar_path(&reference_path);
     println!("Using cache bundle: {}", sidecar_path.display());
     let refresh_cache = args.no_cache || !reference_path.exists() || !sidecar_path.exists();
@@ -1781,6 +2164,21 @@ struct ParsedCheckpointKey {
     point: String,
 }
 
+#[derive(Debug)]
+struct TargetedCheckpointResult {
+    selected: ParsedCheckpointKey,
+    diverged: bool,
+    expected_len: usize,
+    actual_len: usize,
+    expected_rms: f64,
+    actual_rms: f64,
+    abs_rms_diff: f64,
+    rel_rms: f64,
+    max_abs: f64,
+    detail: Option<String>,
+    candidate_sidecar: PathBuf,
+}
+
 fn parse_verify_checkpoint_target(raw: &str) -> Result<VerifyCheckpointTarget> {
     let parts: Vec<&str> = raw.split(':').collect();
     if parts.len() != 3 && parts.len() != 4 {
@@ -1833,7 +2231,7 @@ fn parse_verify_checkpoint_target(raw: &str) -> Result<VerifyCheckpointTarget> {
     })
 }
 
-fn point_mask_for_name(point: &str) -> Result<u64> {
+fn point_index_for_name(point: &str) -> Result<u8> {
     let point_idx = match point {
         "embed_tokens" => 0u32,
         "embed_pos" => 1,
@@ -1874,6 +2272,11 @@ fn point_mask_for_name(point: &str) -> Result<u64> {
             ));
         }
     };
+    Ok(point_idx as u8)
+}
+
+fn point_mask_for_name(point: &str) -> Result<u64> {
+    let point_idx = point_index_for_name(point)? as u32;
     Ok(1u64 << point_idx)
 }
 
@@ -1984,7 +2387,389 @@ fn select_checkpoint_key(
     Ok(matches[0].clone())
 }
 
-fn print_first_divergence_report(msg: &str) {
+fn is_default_phase2_point_name(point: &str) -> bool {
+    // Keep this list in lock-step with
+    // core/src/xray/verify.zig:VerifyCapture.defaultVerificationPointSet().
+    matches!(
+        point,
+        "layer_attn_norm" | "block.out" | "lm_head" | "logits_ready" | "token_select" | "gdelta.out"
+    )
+}
+
+fn reference_record_matches_target(
+    record: &serde_json::Value,
+    target: &VerifyCheckpointTarget,
+) -> bool {
+    let token_idx = match record.get("token_idx").and_then(|value| value.as_u64()) {
+        Some(value) => value as u32,
+        None => return false,
+    };
+    if token_idx != target.token {
+        return false;
+    }
+
+    let layer = match record.get("layer").and_then(|value| value.as_u64()) {
+        Some(value) => value as u16,
+        None => return false,
+    };
+    match target.layer {
+        VerifyLayerTarget::Global => {
+            if layer != u16::MAX {
+                return false;
+            }
+        }
+        VerifyLayerTarget::Layer(layer_idx) => {
+            if layer != layer_idx {
+                return false;
+            }
+        }
+    }
+
+    let point = match record.get("point").and_then(|value| value.as_str()) {
+        Some(value) => value,
+        None => return false,
+    };
+    if point != target.point {
+        return false;
+    }
+
+    if let Some(expected_position) = target.position {
+        let position = match record.get("position").and_then(|value| value.as_u64()) {
+            Some(value) => value as u32,
+            None => return false,
+        };
+        if position != expected_position {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn write_filtered_reference_json(
+    reference_json_path: &str,
+    target: &VerifyCheckpointTarget,
+) -> Result<ScopedTempJson> {
+    let file = File::open(reference_json_path)?;
+    let mut reference: serde_json::Value = serde_json::from_reader(file)?;
+    let stats = reference
+        .get_mut("stats")
+        .and_then(|value| value.as_array_mut())
+        .ok_or_else(|| anyhow!("reference JSON missing 'stats' array"))?;
+
+    let filtered_stats: Vec<serde_json::Value> = stats
+        .iter()
+        .filter(|record| reference_record_matches_target(record, target))
+        .cloned()
+        .collect();
+    if filtered_stats.is_empty() {
+        return Err(anyhow!(
+            "checkpoint {} not found in reference JSON {}",
+            format_verify_checkpoint_arg(target),
+            reference_json_path
+        ));
+    }
+
+    *stats = filtered_stats;
+
+    let (temp_json, mut temp_file) = ScopedTempJson::create("talu_xray_filtered_ref")?;
+    serde_json::to_writer(&mut temp_file, &reference)?;
+    temp_file.flush()?;
+    Ok(temp_json)
+}
+
+fn write_phase2_reference_json(
+    reference_json_path: &str,
+    max_tokens: usize,
+) -> Result<ScopedTempJson> {
+    let file = File::open(reference_json_path)?;
+    let mut reference: serde_json::Value = serde_json::from_reader(file)?;
+
+    if let Some(metadata) = reference.get_mut("metadata").and_then(|value| value.as_object_mut()) {
+        metadata.insert("max_tokens".to_string(), serde_json::Value::from(max_tokens as u64));
+    }
+
+    if let Some(tokens) = reference.get_mut("tokens").and_then(|value| value.as_array_mut()) {
+        tokens.truncate(max_tokens);
+    }
+
+    let stats = reference
+        .get_mut("stats")
+        .and_then(|value| value.as_array_mut())
+        .ok_or_else(|| anyhow!("reference JSON missing 'stats' array"))?;
+
+    let filtered_stats: Vec<serde_json::Value> = stats
+        .iter()
+        .filter(|record| {
+            let token_idx = match record.get("token_idx").and_then(|value| value.as_u64()) {
+                Some(value) => value as usize,
+                None => return false,
+            };
+            if token_idx >= max_tokens {
+                return false;
+            }
+
+            let point = match record.get("point").and_then(|value| value.as_str()) {
+                Some(value) => value,
+                None => return false,
+            };
+            is_default_phase2_point_name(point)
+        })
+        .cloned()
+        .collect();
+
+    if filtered_stats.is_empty() {
+        return Err(anyhow!(
+            "reference JSON {} does not contain any default Phase 2 checkpoints within max_tokens={}",
+            reference_json_path,
+            max_tokens
+        ));
+    }
+
+    *stats = filtered_stats;
+
+    let (temp_json, mut temp_file) = ScopedTempJson::create("talu_xray_phase2_ref")?;
+    serde_json::to_writer(&mut temp_file, &reference)?;
+    temp_file.flush()?;
+    Ok(temp_json)
+}
+
+fn run_targeted_checkpoint_compare(
+    model: &str,
+    prompt_text: &str,
+    seed: u64,
+    tolerance: f32,
+    reference_json_path: &str,
+    golden_full_npz: &Path,
+    golden_tensors: &BTreeMap<String, Vec<f32>>,
+    target: &VerifyCheckpointTarget,
+) -> Result<TargetedCheckpointResult> {
+    let max_tokens = (target.token as usize).saturating_add(1).max(1);
+    let target_point_mask = point_mask_for_name(&target.point)?;
+    let exact_emission_override = exact_emission_override_for_target(target)?;
+    let candidate_npz = std::env::temp_dir().join(format!(
+        "talu_xray_verify_candidate_{}_{}_{}_{}.layers_full.npz",
+        std::process::id(),
+        target.token,
+        match target.layer {
+            VerifyLayerTarget::Global => "global".to_string(),
+            VerifyLayerTarget::Layer(layer) => layer.to_string(),
+        },
+        target.point.replace('.', "_"),
+    ));
+
+    let _ = run_verify_pass(
+        model,
+        prompt_text,
+        seed,
+        tolerance,
+        reference_json_path,
+        max_tokens,
+        true,
+        Some(&candidate_npz),
+        Some(target_point_mask),
+        exact_emission_override,
+    )?;
+
+    if !golden_full_npz.exists() {
+        return Err(anyhow!(
+            "golden full sidecar missing: {}. Re-record CPU reference first",
+            golden_full_npz.display()
+        ));
+    }
+
+    let candidate_tensors = load_npz_f32(&candidate_npz)?;
+    let selected = select_checkpoint_key(golden_tensors, target, Some(&candidate_tensors))?;
+    let expected = golden_tensors.get(&selected.key).ok_or_else(|| {
+        anyhow!(
+            "internal error: selected golden checkpoint '{}' not found",
+            selected.key
+        )
+    })?;
+
+    let actual = match candidate_tensors.get(&selected.key) {
+        Some(values) => values,
+        None => {
+            return Ok(TargetedCheckpointResult {
+                selected,
+                diverged: true,
+                expected_len: expected.len(),
+                actual_len: 0,
+                expected_rms: rms(expected),
+                actual_rms: 0.0,
+                abs_rms_diff: rms(expected),
+                rel_rms: f64::INFINITY,
+                max_abs: 0.0,
+                detail: Some("checkpoint missing from candidate sidecar".to_string()),
+                candidate_sidecar: candidate_npz,
+            });
+        }
+    };
+
+    let expected_rms = rms(expected);
+    let actual_rms = rms(actual);
+    let abs_rms_diff = (actual_rms - expected_rms).abs();
+    let (rel_rms, max_abs) = rel_rms_and_max_abs(expected, actual);
+    let len_mismatch = expected.len() != actual.len();
+    let diverged = len_mismatch || exceeds_numeric_tolerance(rel_rms, abs_rms_diff, tolerance);
+
+    Ok(TargetedCheckpointResult {
+        selected,
+        diverged,
+        expected_len: expected.len(),
+        actual_len: actual.len(),
+        expected_rms,
+        actual_rms,
+        abs_rms_diff,
+        rel_rms,
+        max_abs: max_abs.into(),
+        detail: if len_mismatch {
+            Some("length mismatch".to_string())
+        } else {
+            None
+        },
+        candidate_sidecar: candidate_npz,
+    })
+}
+
+fn format_verify_checkpoint_arg(target: &VerifyCheckpointTarget) -> String {
+    match target.layer {
+        VerifyLayerTarget::Global => format!(
+            "{}:global:{}:{}",
+            target.token,
+            target.point,
+            target.position.unwrap_or(0)
+        ),
+        VerifyLayerTarget::Layer(layer) => format!(
+            "{}:{}:{}:{}",
+            target.token,
+            layer,
+            target.point,
+            target.position.unwrap_or(0)
+        ),
+    }
+}
+
+fn exact_emission_override_for_target(
+    target: &VerifyCheckpointTarget,
+) -> Result<Option<ExactEmissionOverride>> {
+    let position = match target.position {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let layer = match target.layer {
+        VerifyLayerTarget::Global => u16::MAX,
+        VerifyLayerTarget::Layer(layer_idx) => layer_idx,
+    };
+    Ok(Some(ExactEmissionOverride {
+        point: point_index_for_name(&target.point)?,
+        layer,
+        position,
+    }))
+}
+
+fn extract_verify_report(output: &str) -> Option<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("token="))
+        .or_else(|| lines.iter().position(|line| line.starts_with("details:")))?;
+    Some(lines[start..].join("\n"))
+}
+
+fn run_command_capture_to_temp_files(
+    command: &mut Command,
+    context: &str,
+) -> Result<(std::process::ExitStatus, String, String)> {
+    let stdout_path = std::env::temp_dir().join(format!(
+        "talu_xray_{}_{}_stdout.log",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let stderr_path = std::env::temp_dir().join(format!(
+        "talu_xray_{}_{}_stderr.log",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let stdout_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stdout_path)
+        .map_err(|err| anyhow!("failed to create stdout temp file for {context}: {err}"))?;
+    let stderr_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stderr_path)
+        .map_err(|err| anyhow!("failed to create stderr temp file for {context}: {err}"))?;
+
+    let status = command
+        .stdout(stdout_writer)
+        .stderr(stderr_writer)
+        .status()
+        .map_err(|err| anyhow!("failed to run {context}: {err}"))?;
+
+    let stdout = std::fs::read(&stdout_path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .map_err(|err| anyhow!("failed to read stdout temp file for {context}: {err}"))?;
+    let stderr = std::fs::read(&stderr_path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .map_err(|err| anyhow!("failed to read stderr temp file for {context}: {err}"))?;
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
+
+    Ok((status, stdout, stderr))
+}
+
+fn apply_verify_child_environment(command: &mut Command) {
+    if let Ok(backend) = std::env::var("BACKEND") {
+        command.env("BACKEND", backend);
+    }
+}
+
+fn print_targeted_checkpoint_report(
+    model: &str,
+    prompt_text: &str,
+    golden_full_npz: &Path,
+    result: &TargetedCheckpointResult,
+) {
+    let layer_label = if result.selected.scope == "global" {
+        "global".to_string()
+    } else {
+        result.selected.layer_index.to_string()
+    };
+
+    println!(
+        "token={}, layer={}, point={}, pos={} -> {}",
+        result.selected.token,
+        layer_label,
+        result.selected.point,
+        result.selected.position,
+        if result.diverged { "FAILED" } else { "PASSED" }
+    );
+    println!();
+    println!("details:");
+    println!("  kind=checkpoint");
+    println!("  checkpoint={}", result.selected.key);
+    println!(
+        "  expected_len={} actual_len={}",
+        result.expected_len, result.actual_len
+    );
+    println!(
+        "  metric=rms expected={:.6} actual={:.6} abs_diff={:.6} rel_diff={:.6}",
+        result.expected_rms, result.actual_rms, result.abs_rms_diff, result.rel_rms
+    );
+    println!("  metric=max_abs_diff value={:.6}", result.max_abs);
+    if let Some(detail) = &result.detail {
+        println!("  detail={detail}");
+    }
+    if result.diverged {
+        println!("  golden_sidecar={}", golden_full_npz.display());
+        println!("  candidate_sidecar={}", result.candidate_sidecar.display());
+        print_targeted_checkpoint_hint(model, prompt_text, &result.selected);
+    }
+}
+
+fn format_first_divergence_report(msg: &str) -> String {
     if msg.starts_with("Stats divergence at token=") {
         let token = parse_u32_after(msg, "token=");
         let layer = parse_u32_after(msg, "layer=");
@@ -1992,8 +2777,7 @@ fn print_first_divergence_report(msg: &str) {
         let position = parse_u32_after(msg, "pos=");
         let expected = parse_f32_after(msg, "RMS expected=");
         let actual = parse_f32_after(msg, "actual=");
-
-        println!(
+        let mut lines = vec![format!(
             "token={}, layer={}, point={}, pos={} -> FAILED",
             token
                 .map(|value| value.to_string())
@@ -2005,12 +2789,12 @@ fn print_first_divergence_report(msg: &str) {
             position
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "?".to_string())
-        );
-        println!();
-        println!("details:");
-        println!("  kind=stats");
+        )];
+        lines.push(String::new());
+        lines.push("details:".to_string());
+        lines.push("  kind=stats".to_string());
         if let Some(position) = position {
-            println!("  position={}", position);
+            lines.push(format!("  position={}", position));
         }
         match (expected, actual) {
             (Some(exp), Some(act)) => {
@@ -2020,39 +2804,39 @@ fn print_first_divergence_report(msg: &str) {
                 } else {
                     abs
                 };
-                println!(
+                lines.push(format!(
                     "  metric=rms expected={:.6} actual={:.6} abs_diff={:.6} rel_diff={:.6}",
                     exp, act, abs, rel
-                );
+                ));
             }
-            _ => println!("  detail={}", msg),
+            _ => lines.push(format!("  detail={}", msg)),
         }
-        return;
+        return lines.join("\n");
     }
 
     if msg.starts_with("Token divergence at token=") {
         let token = parse_u32_after(msg, "token=");
         let expected = parse_u32_after(msg, "expected=");
         let actual = parse_u32_after(msg, "actual=");
-        println!(
+        let mut lines = vec![format!(
             "token={}, layer=global, point=token_select -> FAILED",
             token
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "?".to_string())
-        );
-        println!();
-        println!("details:");
-        println!("  kind=token");
+        )];
+        lines.push(String::new());
+        lines.push("details:".to_string());
+        lines.push("  kind=token".to_string());
         if let Some(token) = token {
-            println!("  token={}", token);
+            lines.push(format!("  token={}", token));
         }
         if let Some(expected) = expected {
-            println!("  expected_token={}", expected);
+            lines.push(format!("  expected_token={}", expected));
         }
         if let Some(actual) = actual {
-            println!("  actual_token={}", actual);
+            lines.push(format!("  actual_token={}", actual));
         }
-        return;
+        return lines.join("\n");
     }
 
     if msg.starts_with("Missing expected stats for token=") {
@@ -2060,7 +2844,7 @@ fn print_first_divergence_report(msg: &str) {
         let layer = parse_u32_after(msg, "layer=");
         let point = parse_point_after(msg, "point=");
         let position = parse_u32_after(msg, "pos=");
-        println!(
+        let mut lines = vec![format!(
             "token={}, layer={}, point={}, pos={} -> FAILED",
             token
                 .map(|value| value.to_string())
@@ -2072,30 +2856,31 @@ fn print_first_divergence_report(msg: &str) {
             position
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "?".to_string())
-        );
-        println!();
-        println!("details:");
-        println!("  kind=coverage");
+        )];
+        lines.push(String::new());
+        lines.push("details:".to_string());
+        lines.push("  kind=coverage".to_string());
         if let Some(token) = token {
-            println!("  token={}", token);
+            lines.push(format!("  token={}", token));
         }
         if let Some(layer) = layer {
-            println!("  layer={}", layer);
+            lines.push(format!("  layer={}", layer));
         }
         if let Some(point) = point {
-            println!("  point={}", point);
+            lines.push(format!("  point={}", point));
         }
         if let Some(position) = position {
-            println!("  position={}", position);
+            lines.push(format!("  position={}", position));
         }
-        println!("  detail=expected checkpoint missing from backend trace");
-        return;
+        lines.push("  detail=expected checkpoint missing from backend trace".to_string());
+        return lines.join("\n");
     }
 
-    println!("token=?, layer=?, point=? -> FAILED");
-    println!();
-    println!("details:");
-    println!("  detail={}", msg);
+    format!("token=?, layer=?, point=? -> FAILED\n\ndetails:\n  detail={}", msg)
+}
+
+fn print_first_divergence_report(msg: &str) {
+    println!("{}", format_first_divergence_report(msg));
 }
 
 #[derive(Debug, Clone)]
@@ -2215,7 +3000,6 @@ fn exceeds_numeric_tolerance(rel_rms: f64, abs_rms_diff: f64, tolerance: f32) ->
     rel_rms > tol && abs_rms_diff > tol
 }
 
-#[cfg(test)]
 fn rms(values: &[f32]) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -2319,10 +3103,12 @@ mod tests {
         ensure_reference_cache_unlocked, find_first_checkpoint_diff, normalize_npz_entry_key,
         parse_checkpoint_key, parse_npy_f32, parse_verify_checkpoint_target, reference_cache_key,
         reference_lock_path, reference_sidecar_path, replace_file_atomically,
-        select_checkpoint_key, temp_reference_path, FirstCheckpointDiffKind,
-        VerifyCheckpointTarget, VerifyLayerTarget,
+        select_checkpoint_key, temp_reference_path, write_filtered_reference_json,
+        write_phase2_reference_json,
+        FirstCheckpointDiffKind, VerifyCheckpointTarget, VerifyLayerTarget,
     };
     use std::collections::BTreeMap;
+    use std::io::Write;
     use std::path::Path;
 
     #[test]
@@ -2378,6 +3164,153 @@ mod tests {
                 position: None,
             }
         );
+    }
+
+    #[test]
+    fn write_filtered_reference_json_keeps_only_exact_target_checkpoint() {
+        let mut source = tempfile::NamedTempFile::new().expect("temp reference");
+        serde_json::to_writer(
+            source.as_file_mut(),
+            &serde_json::json!({
+                "metadata": {
+                    "model_name": "test",
+                    "seed": 42,
+                    "temperature": 1.0,
+                    "max_tokens": 4
+                },
+                "tokens": [11, 22, 33, 44],
+                "stats": [
+                    {
+                        "token_idx": 0,
+                        "layer": 0,
+                        "point": "gdelta.out",
+                        "position": 15,
+                        "stats": { "count": 4, "min": 0.0, "max": 1.0, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
+                        "layer": 22,
+                        "point": "gdelta.out",
+                        "position": 10,
+                        "stats": { "count": 4, "min": 0.0, "max": 1.0, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 1,
+                        "layer": 65535,
+                        "point": "lm_head",
+                        "position": 0,
+                        "stats": { "count": 4, "min": 0.0, "max": 1.0, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    }
+                ]
+            }),
+        )
+        .expect("write reference json");
+        source.as_file_mut().flush().expect("flush reference json");
+
+        let filtered = write_filtered_reference_json(
+            source.path().to_str().expect("utf8 temp path"),
+            &VerifyCheckpointTarget {
+                token: 0,
+                layer: VerifyLayerTarget::Layer(22),
+                point: "gdelta.out".to_string(),
+                position: Some(10),
+            },
+        )
+        .expect("filtered reference");
+
+        let filtered_json: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(filtered.path()).expect("open filtered"))
+                .expect("parse filtered json");
+        let stats = filtered_json["stats"]
+            .as_array()
+            .expect("filtered stats should be array");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0]["token_idx"].as_u64(), Some(0));
+        assert_eq!(stats[0]["layer"].as_u64(), Some(22));
+        assert_eq!(stats[0]["point"].as_str(), Some("gdelta.out"));
+        assert_eq!(stats[0]["position"].as_u64(), Some(10));
+        assert_eq!(
+            filtered_json["tokens"].as_array().expect("tokens array").len(),
+            4
+        );
+    }
+
+    #[test]
+    fn write_phase2_reference_json_keeps_only_default_points_up_to_max_token() {
+        let mut source = tempfile::NamedTempFile::new().expect("temp reference");
+        serde_json::to_writer(
+            source.as_file_mut(),
+            &serde_json::json!({
+                "metadata": {
+                    "model_name": "test",
+                    "seed": 42,
+                    "temperature": 1.0,
+                    "max_tokens": 6
+                },
+                "tokens": [11, 22, 33, 44, 55, 66],
+                "stats": [
+                    {
+                        "token_idx": 0,
+                        "layer": 0,
+                        "point": "layer_attn_norm",
+                        "position": 16,
+                        "stats": { "count": 4, "min": 0.0, "max": 1.0, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
+                        "layer": 0,
+                        "point": "ffn.act",
+                        "position": 16,
+                        "stats": { "count": 4, "min": 0.0, "max": 1.0, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 1,
+                        "layer": 22,
+                        "point": "gdelta.out",
+                        "position": 10,
+                        "stats": { "count": 4, "min": 0.0, "max": 1.0, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 2,
+                        "layer": 65535,
+                        "point": "lm_head",
+                        "position": 0,
+                        "stats": { "count": 4, "min": 0.0, "max": 1.0, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 3,
+                        "layer": 65535,
+                        "point": "token_select",
+                        "position": 0,
+                        "stats": { "count": 4, "min": 0.0, "max": 1.0, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    }
+                ]
+            }),
+        )
+        .expect("write reference json");
+        source.as_file_mut().flush().expect("flush reference json");
+
+        let filtered = write_phase2_reference_json(
+            source.path().to_str().expect("utf8 temp path"),
+            2,
+        )
+        .expect("filtered phase2 reference");
+
+        let filtered_json: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(filtered.path()).expect("open filtered"))
+                .expect("parse filtered json");
+        let stats = filtered_json["stats"]
+            .as_array()
+            .expect("filtered stats should be array");
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0]["point"].as_str(), Some("layer_attn_norm"));
+        assert_eq!(stats[1]["point"].as_str(), Some("gdelta.out"));
+        assert_eq!(stats[1]["token_idx"].as_u64(), Some(1));
+        assert_eq!(
+            filtered_json["tokens"].as_array().expect("tokens array").len(),
+            2
+        );
+        assert_eq!(filtered_json["metadata"]["max_tokens"].as_u64(), Some(2));
     }
 
     #[test]
@@ -2558,7 +3491,7 @@ pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
 
     // Check for verification mode
     if args.verify {
-        return cmd_xray_verify_default(model, &args);
+        return maybe_hard_exit_after_verify(cmd_xray_verify_default(model, &args));
     }
 
     let decode_mode = args.output;

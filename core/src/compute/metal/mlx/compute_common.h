@@ -41,9 +41,6 @@ using namespace mlx::core;
 // NOT between iterative steps. Arrays from step N must stay valid for step N+1.
 // ============================================================================
 
-extern thread_local std::deque<std::optional<array>> g_array_pool;
-extern thread_local size_t g_pool_index;
-
 // Pool an array and return pointer (for returning to Zig).
 void* pool_array(array&& result);
 void* pool_array(const array& result);
@@ -74,6 +71,51 @@ inline void mlx_count_op(size_t n = 1) {
 extern "C" void mlx_weight_transform_cache_clear();
 // Clears cached quantization parameter casts keyed by static handle addresses.
 extern "C" void mlx_quant_param_cast_cache_clear();
+// Clears thread-local gather-index caches used by attention helpers.
+extern "C" void mlx_gqa_index_cache_clear();
+// Explicit end-of-run cleanup for thread-local pooled temporaries and counters.
+// This is safe at request/run boundaries while a backend instance is still
+// alive because it does not destroy persistent weight-transform caches.
+extern "C" void mlx_clear_thread_local_run_state();
+// Explicit end-of-run cleanup for worker-thread MLX state. This is the
+// required lifecycle boundary for pooled arrays and thread-local transform
+// caches; do not rely on thread exit/destructor ordering for correctness.
+extern "C" void mlx_clear_thread_local_state();
+// Synchronize the active MLX default stream. Use this for teardown barriers
+// around MLX-owned array destruction; synchronizing an unrelated Metal queue
+// does not guarantee MLX stream quiescence.
+extern "C" void mlx_synchronize_default_stream();
+// Objective-C autorelease pool helpers. Use these at the exact C++/metal-cpp
+// destruction boundaries where temporary mlx::core::array values may release
+// ARC-managed Metal resources while crossing the Zig/Rust FFI teardown path.
+extern "C" void* objc_autoreleasePoolPush(void);
+extern "C" void objc_autoreleasePoolPop(void* pool);
+
+struct ScopedAutoreleasePool {
+    void* pool = nullptr;
+
+    ScopedAutoreleasePool()
+        : pool(objc_autoreleasePoolPush()) {}
+
+    ~ScopedAutoreleasePool() {
+        objc_autoreleasePoolPop(pool);
+    }
+
+    ScopedAutoreleasePool(const ScopedAutoreleasePool&) = delete;
+    ScopedAutoreleasePool& operator=(const ScopedAutoreleasePool&) = delete;
+};
+
+template <typename T>
+static inline T& tls_never_destroyed() {
+    static thread_local T* value = new T();
+    return *value;
+}
+
+template <typename T, size_t N>
+static inline T* tls_never_destroyed_array() {
+    static thread_local T* values = new T[N]();
+    return values;
+}
 
 // Canonicalize RMSNorm weight tensors to rank-1.
 // Accepts already-1D tensors, and singleton-expanded forms like [1, 1, D].

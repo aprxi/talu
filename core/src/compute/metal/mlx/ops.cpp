@@ -31,12 +31,33 @@ struct QuantParamCastCacheKeyHash {
 };
 
 static inline std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash>& quant_param_cast_cache_store() {
-    static thread_local std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash>>();
 }
 
 static inline void quant_param_cast_cache_clear() {
     quant_param_cast_cache_store().clear();
+}
+
+static array make_owned_embedding_index_array(const uint32_t* indices, size_t n_indices) {
+    static constexpr size_t kIndexAlignment = 16 * 1024;
+    const size_t byte_count = std::max(n_indices * sizeof(int32_t), sizeof(int32_t));
+    void* aligned_ptr = nullptr;
+    if (posix_memalign(&aligned_ptr, kIndexAlignment, byte_count) != 0 || aligned_ptr == nullptr) {
+        throw std::bad_alloc();
+    }
+
+    auto* copied = static_cast<int32_t*>(aligned_ptr);
+    for (size_t i = 0; i < n_indices; ++i) {
+        copied[i] = static_cast<int32_t>(indices[i]);
+    }
+
+    auto owner = std::shared_ptr<void>(aligned_ptr, [](void* ptr) {
+        std::free(ptr);
+    });
+    auto deleter = [owner](void*) {
+        // ownership retained by closure capture
+    };
+    return array(copied, {1, static_cast<int>(n_indices)}, int32, deleter);
 }
 
 static array cast_quant_param_cached(
@@ -84,6 +105,7 @@ size_t mlx_stop_counting() {
 }
 
 void mlx_gqa_index_cache_clear() {
+    ScopedAutoreleasePool pool;
     gqa_index_cache_clear();
 }
 
@@ -96,10 +118,12 @@ size_t mlx_gqa_index_cache_max_entries() {
 }
 
 void mlx_gqa_index_cache_touch(size_t q_heads, size_t kv_heads) {
+    ScopedAutoreleasePool pool;
     (void)gqa_cached_gather_indices(static_cast<int>(q_heads), static_cast<int>(kv_heads));
 }
 
 void mlx_quant_param_cast_cache_clear() {
+    ScopedAutoreleasePool pool;
     quant_param_cast_cache_clear();
 }
 
@@ -528,8 +552,7 @@ void* mlx_lazy_triu(const void* input, int k) {
 
 void* mlx_lazy_embedding(const void* weights, const uint32_t* indices, size_t n_indices) {
     const auto& weights_arr = *static_cast<const array*>(weights);
-    array idx_arr(reinterpret_cast<const int32_t*>(indices),
-                  {1, static_cast<int>(n_indices)}, int32);
+    array idx_arr = make_owned_embedding_index_array(indices, n_indices);
     return pool_array(take(weights_arr, idx_arr, 0));
 }
 

@@ -47,8 +47,7 @@ struct AttentionFusedQkvCacheKeyHash {
 };
 
 static inline std::unordered_map<AttentionFusedQkvCacheKey, array, AttentionFusedQkvCacheKeyHash>& attention_fused_qkv_cache_store() {
-    static thread_local std::unordered_map<AttentionFusedQkvCacheKey, array, AttentionFusedQkvCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<AttentionFusedQkvCacheKey, array, AttentionFusedQkvCacheKeyHash>>();
 }
 
 struct AttentionFusedQkvHotSlot {
@@ -58,8 +57,7 @@ struct AttentionFusedQkvHotSlot {
 };
 
 static inline AttentionFusedQkvHotSlot* attention_fused_qkv_hot_slots_store() {
-    static thread_local AttentionFusedQkvHotSlot slots[kAttentionFusedQkvHotSlots];
-    return slots;
+    return tls_never_destroyed_array<AttentionFusedQkvHotSlot, kAttentionFusedQkvHotSlots>();
 }
 
 static inline void attention_fused_qkv_cache_clear() {
@@ -110,8 +108,7 @@ struct FfnQuantizedGateUpCacheKeyHash {
 };
 
 static inline std::unordered_map<FfnQuantizedGateUpCacheKey, FfnQuantizedGateUpCacheValue, FfnQuantizedGateUpCacheKeyHash>& ffn_quantized_gate_up_cache_store() {
-    static thread_local std::unordered_map<FfnQuantizedGateUpCacheKey, FfnQuantizedGateUpCacheValue, FfnQuantizedGateUpCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<FfnQuantizedGateUpCacheKey, FfnQuantizedGateUpCacheValue, FfnQuantizedGateUpCacheKeyHash>>();
 }
 
 struct FfnQuantizedGateUpHotSlot {
@@ -126,8 +123,11 @@ struct FfnQuantizedGateUpHotSlot {
 };
 
 static inline FfnQuantizedGateUpHotSlot* ffn_quantized_gate_up_hot_slots_store() {
-    static thread_local FfnQuantizedGateUpHotSlot slots[kFfnQuantizedGateUpHotSlots];
-    return slots;
+    return tls_never_destroyed_array<FfnQuantizedGateUpHotSlot, kFfnQuantizedGateUpHotSlots>();
+}
+
+static inline std::optional<FfnQuantizedGateUpCacheValue>& ffn_quantized_gate_up_scratch_store() {
+    return tls_never_destroyed<std::optional<FfnQuantizedGateUpCacheValue>>();
 }
 
 static inline void ffn_quantized_gate_up_cache_clear() {
@@ -136,6 +136,7 @@ static inline void ffn_quantized_gate_up_cache_clear() {
     for (size_t i = 0; i < kFfnQuantizedGateUpHotSlots; ++i) {
         hot_slots[i].valid = false;
     }
+    ffn_quantized_gate_up_scratch_store().reset();
 }
 
 static inline const FfnQuantizedGateUpCacheValue& ffn_quantized_gate_up_cached(
@@ -170,7 +171,7 @@ static inline const FfnQuantizedGateUpCacheValue& ffn_quantized_gate_up_cached(
     }
 
     if (gate_w == nullptr || gate_s == nullptr || gate_b == nullptr || up_w == nullptr || up_s == nullptr || up_b == nullptr) {
-        static thread_local std::optional<FfnQuantizedGateUpCacheValue> scratch;
+        auto& scratch = ffn_quantized_gate_up_scratch_store();
         scratch = FfnQuantizedGateUpCacheValue{
             contiguous(concatenate({gate_w_arr, up_w_arr}, 0)),
             contiguous(concatenate({gate_s_arr, up_s_arr}, 0)),

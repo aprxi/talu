@@ -2929,6 +2929,14 @@ pub const CudaBackend = struct {
         self.* = undefined;
     }
 
+    pub fn synchronize(self: *CudaBackend) !void {
+        if (self.compute_stream) |stream| {
+            try self.device.synchronizeStream(stream);
+            return;
+        }
+        try self.device.synchronize();
+    }
+
     pub fn maxBatchSize(self: *const CudaBackend) usize {
         return self.max_batch_size;
     }

@@ -283,6 +283,46 @@ pub const Backend = union(enum) {
         }
     }
 
+    /// Explicit device/barrier synchronization for correctness-sensitive
+    /// observability flows such as xray capture finalization.
+    ///
+    /// This must never change backend math or route selection. It exists so
+    /// boundary code can guarantee that backend work has finished producing any
+    /// host-visible trace/capture outputs before those outputs are serialized
+    /// or destroyed during teardown.
+    pub fn synchronize(self: *Backend) !void {
+        switch (self.*) {
+            .cpu => {},
+            .metal => |*b| if (has_metal) b.synchronize() else unreachable,
+            .cuda => |*b| if (has_cuda) try b.synchronize() else unreachable,
+        }
+    }
+
+    /// Explicit end-of-run cleanup for backend state that is thread-local to
+    /// the execution thread. This must not change math or route selection; it
+    /// only clears transient per-run resources after a generation completes.
+    pub fn cleanupExecutionThreadState(self: *Backend) void {
+        switch (self.*) {
+            .cpu => {},
+            .metal => |*b| if (has_metal) b.cleanupExecutionThreadState() else unreachable,
+            .cuda => {},
+        }
+    }
+
+    /// Explicit execution-thread teardown barrier.
+    ///
+    /// Call this only on the thread that actually executed backend work and
+    /// only when that thread is about to stop issuing more work. This is
+    /// distinct from per-run cleanup: it is allowed to destroy thread-local
+    /// caches whose contents must not outlive the worker thread lifecycle.
+    pub fn teardownExecutionThreadState(self: *Backend) void {
+        switch (self.*) {
+            .cpu => {},
+            .metal => |*b| if (has_metal) b.teardownExecutionThreadState() else unreachable,
+            .cuda => {},
+        }
+    }
+
     /// Prefill: process all prompt tokens, return logits for last position
     /// This resets the KV cache and processes the full prompt
     pub fn prefill(self: *Backend, tokens: []const u32, logits_out: []f32) !void {

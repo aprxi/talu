@@ -603,6 +603,12 @@ pub const FusedCpuBackend = struct {
         self.* = undefined;
     }
 
+    /// CPU execution is synchronous with host memory visibility, so xray
+    /// teardown does not need an extra device barrier here.
+    pub fn synchronize(self: *FusedCpuBackend) void {
+        _ = self;
+    }
+
     // =========================================================================
     // Slot Management (delegated to KV cache)
     // =========================================================================

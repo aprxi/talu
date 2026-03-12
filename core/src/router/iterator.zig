@@ -522,6 +522,17 @@ pub const TokenIterator = struct {
     // =========================================================================
 
     fn workerThread(self: *TokenIterator) void {
+        defer {
+            if (self.backend_type == .local) {
+                // The iterator worker owns the actual backend execution. Any
+                // thread-local Metal caches created during generation must be
+                // torn down here, on this worker thread, before the thread
+                // exits. Caller-thread backend deinit cannot safely clean up
+                // worker-thread TLS.
+                self.engine.?.backend.teardownExecutionThreadState();
+            }
+        }
+
         self.runGeneration() catch |err| {
             // Store error for caller to retrieve (use -1 as generic error code)
             self.error_code.store(-1, .release);

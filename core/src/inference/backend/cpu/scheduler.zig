@@ -328,7 +328,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 const request_id = entry.key_ptr.*;
                 if (self.requests.get(request_id)) |request_entry| {
                     if (request_entry.slot_index) |slot_index| {
-                        self.backend.unbindSlotStateBlocks(slot_index);
+                        // Scheduler owns the backing storage for both request-
+                        // scoped and slot-persistent state blocks. Before that
+                        // storage is released, backend slot ownership must end
+                        // so no backend can retain detached aliases into freed
+                        // state blocks across independent runs.
+                        self.backend.freeSlot(slot_index);
                     }
                 }
                 entry.value_ptr.deinit(self.allocator);
@@ -337,6 +342,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             var slot_state_iter = self.slot_state_blocks.iterator();
             while (slot_state_iter.next()) |entry| {
+                // `freeSlot()` above can leave a backend with a detached
+                // binding that still references slot-persistent storage until
+                // the next explicit unbind. Scheduler teardown is the lifecycle
+                // boundary where that storage is about to be freed, so clear
+                // the backend view first.
+                self.backend.unbindSlotStateBlocks(entry.key_ptr.*);
                 var state_blocks = entry.value_ptr.*;
                 self.applyLifecycleActionToRequestStateBlocks(&state_blocks, .evict) catch {};
                 state_blocks.deinit(self.allocator);

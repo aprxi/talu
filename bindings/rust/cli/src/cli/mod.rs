@@ -581,6 +581,34 @@ pub(super) struct XrayArgs {
     #[arg(long)]
     pub verify_checkpoint: Option<String>,
 
+    /// Internal use only: targeted checkpoint verification via stats-only
+    /// teacher-forced replay. Hidden because user-facing checkpoint verify
+    /// should remain the richer full-compare path.
+    #[arg(long, hide = true)]
+    pub verify_checkpoint_stats_only: bool,
+
+    /// Internal use only: run only Phase 1 free-run token parity in a fresh
+    /// child process. The user-facing `--verify` coordinator stays single-path
+    /// and delegates backend work to isolated worker processes.
+    #[arg(long, hide = true)]
+    pub verify_phase1_only: bool,
+
+    /// Internal use only: run the full Phase 2 checkpoint-localization loop
+    /// inside one fresh child process. Hidden because user-facing `--verify`
+    /// remains single-path.
+    #[arg(long, hide = true)]
+    pub verify_phase2_only: bool,
+
+    /// Internal use only: maximum transcript length for the dedicated Phase 2
+    /// child process.
+    #[arg(long, hide = true)]
+    pub verify_phase2_max_tokens: Option<u32>,
+
+    /// Internal use only: reuse the exact reference cache path chosen by the
+    /// current verify command when a child helper needs the same cache bundle.
+    #[arg(long, hide = true)]
+    pub verify_reference_path: Option<String>,
+
     /// Tolerance for stats comparison during verification (default: 1e-3)
     #[arg(long, default_value = "0.001")]
     pub tolerance: f32,

@@ -155,6 +155,14 @@ pub const InferenceBackend = struct {
         if (self.model_ref) |ref| allocator.free(ref);
     }
 
+    pub fn synchronize(self: *InferenceBackend) !void {
+        switch (self.backend) {
+            .Local => |engine| try engine.synchronize(),
+            .OpenAICompatible => {},
+            .Unspecified => {},
+        }
+    }
+
     /// Get the LocalEngine if this is a local backend.
     pub fn getLocalEngine(self: *InferenceBackend) ?*local_mod.LocalEngine {
         return switch (self.backend) {

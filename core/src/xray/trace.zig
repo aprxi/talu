@@ -266,19 +266,41 @@ var handler_atomic: std.atomic.Value(?Handler) = std.atomic.Value(?Handler).init
 // not merely on handler presence, otherwise "token-only" verify passes still
 // pay for and can be destabilized by unused trace-copy paths.
 var built_in_point_mask_atomic: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var exact_filter_enabled_atomic: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var exact_filter_point_atomic: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+var exact_filter_layer_atomic: std.atomic.Value(u16) = std.atomic.Value(u16).init(0);
+var exact_filter_position_atomic: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 threadlocal var backend_context: Backend = .cpu;
+
+pub const ExactEmissionFilter = struct {
+    point: TracePoint,
+    layer: u16,
+    position: u32,
+};
 
 /// Set the trace handler. Called by inspection system on setup.
 pub fn setHandler(h: ?Handler) void {
     handler_atomic.store(h, .release);
     if (h == null) {
         built_in_point_mask_atomic.store(0, .release);
+        exact_filter_enabled_atomic.store(false, .release);
     }
 }
 
 /// Set the active built-in trace-point mask for the current handler.
 pub fn setActiveBuiltInPointMask(mask: u64) void {
     built_in_point_mask_atomic.store(mask, .release);
+}
+
+pub fn setActiveExactEmissionFilter(filter: ?ExactEmissionFilter) void {
+    if (filter) |value| {
+        exact_filter_point_atomic.store(@intFromEnum(value.point), .release);
+        exact_filter_layer_atomic.store(value.layer, .release);
+        exact_filter_position_atomic.store(value.position, .release);
+        exact_filter_enabled_atomic.store(true, .release);
+        return;
+    }
+    exact_filter_enabled_atomic.store(false, .release);
 }
 
 /// Get current handler (for inspection system to check if enabled).
@@ -312,6 +334,18 @@ pub inline fn shouldEmit(point: TracePoint) bool {
     if (point_idx >= 64) return true;
     const mask = built_in_point_mask_atomic.load(.acquire);
     return ((mask >> @as(u6, @intCast(point_idx))) & 1) != 0;
+}
+
+/// Check whether a specific emission matches the active exact-emission filter.
+/// This is the correct guard for host materialization in targeted verification
+/// runs: it preserves the production compute path while avoiding host copies
+/// for checkpoints that the verifier will never inspect.
+pub inline fn shouldEmitEmission(point: TracePoint, layer: u16, position: u32) bool {
+    if (!shouldEmit(point)) return false;
+    if (!exact_filter_enabled_atomic.load(.acquire)) return true;
+    return exact_filter_point_atomic.load(.acquire) == @intFromEnum(point) and
+        exact_filter_layer_atomic.load(.acquire) == layer and
+        exact_filter_position_atomic.load(.acquire) == position;
 }
 
 /// Emit a trace point. No-op if handler is null.
@@ -478,6 +512,28 @@ test "shouldEmit honors active built-in point mask" {
     try std.testing.expect(shouldEmit(.lm_head));
     try std.testing.expect(!shouldEmit(.token_select));
     try std.testing.expect(!shouldEmit(.gdelta_out));
+}
+
+test "shouldEmitEmission honors exact checkpoint filter" {
+    const TestCapture = struct {
+        fn handler(_: TraceEmission) void {}
+    };
+
+    setHandler(&TestCapture.handler);
+    defer setHandler(null);
+    setActiveBuiltInPointMask((@as(u64, 1) << @intFromEnum(TracePoint.gdelta_out)));
+    defer setActiveBuiltInPointMask(0);
+    setActiveExactEmissionFilter(.{
+        .point = .gdelta_out,
+        .layer = 22,
+        .position = 10,
+    });
+    defer setActiveExactEmissionFilter(null);
+
+    try std.testing.expect(shouldEmitEmission(.gdelta_out, 22, 10));
+    try std.testing.expect(!shouldEmitEmission(.gdelta_out, 22, 11));
+    try std.testing.expect(!shouldEmitEmission(.gdelta_out, 21, 10));
+    try std.testing.expect(!shouldEmitEmission(.lm_head, TraceEmission.NO_LAYER, 10));
 }
 
 test "TracedTensor calculations" {

@@ -497,6 +497,18 @@ impl VerifyCaptureHandle {
     pub fn clear_point_mask_override() {
         unsafe { talu_sys::talu_xray_verify_clear_point_mask_override() };
     }
+
+    /// Restrict verification to one exact built-in checkpoint emission.
+    pub fn set_exact_emission_filter(point: u8, layer: u16, position: u32) {
+        unsafe {
+            talu_sys::talu_xray_verify_set_exact_emission_filter(point, layer, position)
+        };
+    }
+
+    /// Clear exact checkpoint-emission override.
+    pub fn clear_exact_emission_filter() {
+        unsafe { talu_sys::talu_xray_verify_clear_exact_emission_filter() };
+    }
 }
 
 impl Drop for VerifyCaptureHandle {

@@ -379,6 +379,7 @@ pub const talu_config_free = router.talu_config_free;
 pub const talu_backend_get_capabilities = router.talu_backend_get_capabilities;
 pub const talu_backend_create_from_canonical = router.talu_backend_create_from_canonical;
 pub const talu_backend_free = router.talu_backend_free;
+pub const talu_backend_synchronize = router.talu_backend_synchronize;
 pub const talu_backend_list_models = router.talu_backend_list_models;
 pub const talu_backend_list_models_free = router.talu_backend_list_models_free;
 pub const RemoteModelInfo = router.RemoteModelInfo;

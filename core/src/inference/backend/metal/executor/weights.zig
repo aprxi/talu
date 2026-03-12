@@ -38,7 +38,7 @@ pub const MLXError = error{
 fn tensorToArray(tensor: *const Tensor) MLXError!ArrayHandle {
     const shape = tensor.shape[0..@as(usize, @intCast(tensor.n_dims))];
     switch (tensor.dtype) {
-        .f32 => return mlx_graph.createArrayF32(tensor.asSlice(f32), shape),
+        .f32 => return mlx_graph.createPersistentArrayF32(tensor.asSlice(f32), shape),
         .bf16 => {
             const element_count = tensor.data_size / 2;
             const data_ptr: [*]align(1) const u16 = @ptrCast(tensor.data_ptr);
@@ -60,7 +60,7 @@ fn loadNormWeight(weight: *const Tensor) MLXError!ArrayHandle {
         .f32 => {
             const element_count = weight.data_size / 4;
             const shape = [_]usize{element_count};
-            return mlx_graph.mlx_array_from_float32(@ptrCast(weight.data_ptr), &shape, 1);
+            return mlx_graph.mlx_array_from_float32_persistent(@ptrCast(weight.data_ptr), &shape, 1);
         },
         .f16 => {
             const element_count = weight.data_size / 2;
@@ -921,7 +921,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 weight_handles.embed_tokens = mlx_graph.createArrayF16Unaligned(embedding_ptr, embedding_len, embed_shape);
             },
             .f32 => {
-                weight_handles.embed_tokens = mlx_graph.createArrayF32(loaded.token_embeddings.asSlice(f32), embed_shape);
+                weight_handles.embed_tokens = mlx_graph.createPersistentArrayF32(loaded.token_embeddings.asSlice(f32), embed_shape);
             },
             else => return error.InvalidTensorType,
         }
@@ -1088,11 +1088,11 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
                 // Optional attention biases/sinks are loaded during weight loading
                 // and stored in the loader-stage block weight_handles.
-                if (attn_block.q_bias) |b| weight_handles.layers[layer_idx].q_bias = mlx_graph.createArrayF32(b, &[_]i64{@intCast(b.len)});
-                if (attn_block.k_bias) |b| weight_handles.layers[layer_idx].k_bias = mlx_graph.createArrayF32(b, &[_]i64{@intCast(b.len)});
-                if (attn_block.v_bias) |b| weight_handles.layers[layer_idx].v_bias = mlx_graph.createArrayF32(b, &[_]i64{@intCast(b.len)});
-                if (attn_block.o_bias) |b| weight_handles.layers[layer_idx].o_bias = mlx_graph.createArrayF32(b, &[_]i64{@intCast(b.len)});
-                if (attn_block.sinks) |s| weight_handles.layers[layer_idx].attn_sinks = mlx_graph.createArrayF32(s, &[_]i64{@intCast(s.len)});
+                if (attn_block.q_bias) |b| weight_handles.layers[layer_idx].q_bias = mlx_graph.createPersistentArrayF32(b, &[_]i64{@intCast(b.len)});
+                if (attn_block.k_bias) |b| weight_handles.layers[layer_idx].k_bias = mlx_graph.createPersistentArrayF32(b, &[_]i64{@intCast(b.len)});
+                if (attn_block.v_bias) |b| weight_handles.layers[layer_idx].v_bias = mlx_graph.createPersistentArrayF32(b, &[_]i64{@intCast(b.len)});
+                if (attn_block.o_bias) |b| weight_handles.layers[layer_idx].o_bias = mlx_graph.createPersistentArrayF32(b, &[_]i64{@intCast(b.len)});
+                if (attn_block.sinks) |s| weight_handles.layers[layer_idx].attn_sinks = mlx_graph.createPersistentArrayF32(s, &[_]i64{@intCast(s.len)});
 
                 // QK normalization (optional) - load in native dtype (f32, f16, or bf16)
                 if (attn_block.q_norm) |q_norm_tensor| {
@@ -1400,12 +1400,12 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
             // the dense matmul RHS layout used by the MLX fused MoE router path.
             if (moe_block_weights.router_weight.n_dims != 2 or moe_block_weights.router_weight.dtype != .f32) return error.InvalidShape;
             const router_shape = moe_block_weights.router_weight.shape[0..@intCast(moe_block_weights.router_weight.n_dims)];
-            moe_weights.router_w = mlx_graph.createArrayF32(moe_block_weights.router_weight.asSlice(f32), router_shape);
+            moe_weights.router_w = mlx_graph.createPersistentArrayF32(moe_block_weights.router_weight.asSlice(f32), router_shape);
             moe_weights.router_s = null;
             moe_weights.router_b = null;
 
             if (moe_block_weights.router_bias) |router_bias| {
-                moe_weights.router_bias = mlx_graph.createArrayF32(router_bias, &[_]i64{@intCast(router_bias.len)});
+                moe_weights.router_bias = mlx_graph.createPersistentArrayF32(router_bias, &[_]i64{@intCast(router_bias.len)});
             }
 
             const expert0 = moe_block_weights.experts[0];
@@ -1447,12 +1447,12 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 if (expert0.gate_bias) |gate_bias| {
                     const bias_shape_i64 = [_]i64{ @intCast(num_experts), @intCast(d_ff) };
                     const bias_f32_ptr = @as([*]const f32, @ptrCast(gate_bias.ptr));
-                    moe_weights.gate_bias = mlx_graph.createArrayF32(bias_f32_ptr[0 .. gate_bias.len * num_experts], &bias_shape_i64);
+                    moe_weights.gate_bias = mlx_graph.createPersistentArrayF32(bias_f32_ptr[0 .. gate_bias.len * num_experts], &bias_shape_i64);
                 }
                 if (expert0.up_bias) |up_bias| {
                     const bias_shape_i64 = [_]i64{ @intCast(num_experts), @intCast(d_ff) };
                     const bias_f32_ptr = @as([*]const f32, @ptrCast(up_bias.ptr));
-                    moe_weights.up_bias = mlx_graph.createArrayF32(bias_f32_ptr[0 .. up_bias.len * num_experts], &bias_shape_i64);
+                    moe_weights.up_bias = mlx_graph.createPersistentArrayF32(bias_f32_ptr[0 .. up_bias.len * num_experts], &bias_shape_i64);
                 }
             } else {
                 // HF format: fused gate_up_proj with INTERLEAVED rows (not concatenated!)
@@ -1525,7 +1525,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 if (expert0.gate_up_bias) |gate_up_bias| {
                     const fused_bias_shape_i64 = [_]i64{ @intCast(n_experts_u), @intCast(d_ff_times_2_u) };
                     const bias_f32_ptr = @as([*]const f32, @ptrCast(gate_up_bias.ptr));
-                    const fused_bias = mlx_graph.createArrayF32(bias_f32_ptr[0 .. gate_up_bias.len * num_experts], &fused_bias_shape_i64);
+                    const fused_bias = mlx_graph.createPersistentArrayF32(bias_f32_ptr[0 .. gate_up_bias.len * num_experts], &fused_bias_shape_i64);
 
                     // Reshape [E, 2*D] -> [E, D, 2] then slice
                     const bias_reshaped_shape = [_]usize{ n_experts_u, d_ff_u, 2 };
@@ -1561,7 +1561,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
             if (expert0.down_bias) |down_bias| {
                 const bias_shape_i64 = [_]i64{ @intCast(num_experts), @intCast(down_rows) };
                 const bias_f32_ptr = @as([*]const f32, @ptrCast(down_bias.ptr));
-                moe_weights.down_bias = mlx_graph.createArrayF32(bias_f32_ptr[0 .. down_bias.len * num_experts], &bias_shape_i64);
+                moe_weights.down_bias = mlx_graph.createPersistentArrayF32(bias_f32_ptr[0 .. down_bias.len * num_experts], &bias_shape_i64);
             }
 
             weight_handles.layers[layer_idx].moe = moe_weights;
@@ -1621,7 +1621,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.lm_head = mlx_graph.createArrayF16Unaligned(lm_ptr, lm_len, lm_shape);
                 },
                 .f32 => {
-                    weight_handles.lm_head = mlx_graph.createArrayF32(lm_head_tensor.asSlice(f32), lm_shape);
+                    weight_handles.lm_head = mlx_graph.createPersistentArrayF32(lm_head_tensor.asSlice(f32), lm_shape);
                 },
                 else => return error.InvalidTensorType,
             }

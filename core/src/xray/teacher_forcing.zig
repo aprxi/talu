@@ -43,11 +43,21 @@ pub const TeacherForcingHook = struct {
     }
 };
 
-/// Global teacher forcing hook (thread-local for safety)
-threadlocal var global_hook: TeacherForcingHook = TeacherForcingHook.init();
+/// Global teacher forcing hook.
+///
+/// Verify can execute generation on a dedicated worker thread (for example via
+/// TokenIterator-backed local generation), while the CLI/bindings enable and
+/// disable teacher forcing on the caller thread. The forced-token contract
+/// therefore has to be process-global and synchronized, not thread-local.
+/// This lock is acceptable because teacher forcing is verify-only debug flow,
+/// never the production hot path.
+var hook_mutex: std.Thread.Mutex = .{};
+var global_hook: TeacherForcingHook = TeacherForcingHook.init();
 
 /// Set teacher forcing mode with a token provider
 pub fn enable(get_next_token: *const fn (ctx: ?*anyopaque) ?u32, context: ?*anyopaque) void {
+    hook_mutex.lock();
+    defer hook_mutex.unlock();
     global_hook = .{
         .mode = .forced,
         .get_next_token = get_next_token,
@@ -57,16 +67,22 @@ pub fn enable(get_next_token: *const fn (ctx: ?*anyopaque) ?u32, context: ?*anyo
 
 /// Disable teacher forcing (return to normal sampling)
 pub fn disable() void {
+    hook_mutex.lock();
+    defer hook_mutex.unlock();
     global_hook = TeacherForcingHook.init();
 }
 
 /// Check if teacher forcing is active
 pub fn isEnabled() bool {
+    hook_mutex.lock();
+    defer hook_mutex.unlock();
     return global_hook.mode == .forced;
 }
 
 /// Get next forced token (for use by router/sampler)
 pub fn getNextToken() ?u32 {
+    hook_mutex.lock();
+    defer hook_mutex.unlock();
     return global_hook.getNext();
 }
 
@@ -123,4 +139,51 @@ test "teacher forcing basic flow" {
 
     disable();
     try std.testing.expect(!isEnabled());
+}
+
+test "teacher forcing is visible across threads" {
+    const Provider = struct {
+        const tokens = [_]u32{ 11, 22, 33 };
+
+        fn getNext(_: ?*anyopaque) ?u32 {
+            return null;
+        }
+    };
+
+    const SharedProvider = struct {
+        tokens: []const u32,
+        index: usize = 0,
+
+        fn getNext(ctx: ?*anyopaque) ?u32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return null));
+            if (self.index >= self.tokens.len) return null;
+            const token = self.tokens[self.index];
+            self.index += 1;
+            return token;
+        }
+    };
+
+    const Worker = struct {
+        results: []u32,
+
+        fn run(self: *@This()) void {
+            self.results[0] = getNextToken() orelse 0;
+            self.results[1] = getNextToken() orelse 0;
+            self.results[2] = getNextToken() orelse 0;
+            self.results[3] = getNextToken() orelse 0;
+        }
+    };
+
+    _ = Provider;
+    var provider = SharedProvider{ .tokens = &[_]u32{ 11, 22, 33 } };
+    var results = [_]u32{0} ** 4;
+    var worker = Worker{ .results = results[0..] };
+
+    enable(&SharedProvider.getNext, &provider);
+    defer disable();
+
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    thread.join();
+
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 11, 22, 33, 0 }, &results);
 }

@@ -533,6 +533,11 @@ pub const LocalEngine = struct {
         self.* = undefined;
     }
 
+    /// Explicit backend/device barrier for xray-style capture finalization.
+    pub fn synchronize(self: *LocalEngine) !void {
+        try self.backend.synchronize();
+    }
+
     /// Get EOS token IDs.
     pub fn getEosTokens(self: *const LocalEngine) []const u32 {
         return self.gen_config.eos_token_ids;
@@ -770,6 +775,16 @@ pub const LocalEngine = struct {
         grammar_sampler: ?*ConstrainedSampler,
         is_tool_generation: bool,
     ) !GenerationResult {
+        // Every logical generation run must start from a clean backend
+        // execution-thread state. Non-stream local generation executes on the
+        // caller thread, while streaming uses a dedicated worker thread; both
+        // must observe the same invariant instead of inheriting MLX thread-
+        // local caches or pooled temporaries from earlier work on that thread.
+        self.backend.teardownExecutionThreadState();
+        // After the run, clear transient execution-thread resources once
+        // scheduler teardown has finished.
+        defer self.backend.cleanupExecutionThreadState();
+
         const SchedulerType = inference.scheduler.GenericScheduler(Backend);
 
         log.debug("router", "Collecting vision input", .{}, @src());
@@ -1376,6 +1391,10 @@ pub const LocalEngine = struct {
         prompt: []const u8,
         config: inference_types.InferenceConfig,
     ) !inference_types.InferenceState {
+        // Raw inference runs share the same scheduler path and need the same
+        // explicit execution-thread cleanup boundary as chat generation.
+        defer self.backend.cleanupExecutionThreadState();
+
         // Tokenize prompt
         const encoded_tokens = try self.tok.encode(prompt);
         defer self.allocator.free(encoded_tokens);

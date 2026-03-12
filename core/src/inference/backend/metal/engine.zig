@@ -255,6 +255,11 @@ pub const MetalBackend = struct {
         return 8;
     }
 
+    fn synchronizeDefaultDevice() void {
+        if (!metal_compute.isAvailable()) return;
+        graph.mlx_synchronize_default_stream();
+    }
+
     fn resolveCacheMaxSeqLen(config_max_seq_len: usize) usize {
         // Fixed-capacity KV allocation at very large context lengths can stall
         // decode startup. Switch those models to dynamic cache growth.
@@ -963,6 +968,18 @@ pub const MetalBackend = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel) !MetalBackend {
+        // Establish Metal device availability through the Objective-C wrapper
+        // before MLX array ingestion touches its own implicit device path.
+        // This keeps backend init on one explicit lifecycle boundary and turns
+        // "no device" into a typed failure instead of an Objective-C abort.
+        var init_device = try metal_compute.Device.init();
+        defer init_device.deinit();
+        // Backend init performs MLX weight ingest/transform work on this
+        // thread before the first real generation starts. Clear pooled
+        // run-scoped temporaries before returning so request 0 never inherits
+        // leftover init-time array-pool state.
+        defer graph.mlx_clear_thread_local_run_state();
+
         // Load weights to GPU
         const weight_handles = try weights_trait.loadWeightsToGPU(allocator, loaded);
         errdefer weights_trait.freeWeights(allocator, weight_handles);
@@ -1039,6 +1056,22 @@ pub const MetalBackend = struct {
     }
 
     pub fn deinit(self: *MetalBackend) void {
+        // Shutdown must happen after all queued MLX/Metal work on the default
+        // device has completed. Otherwise array/cache destruction can race the
+        // MLX stream thread and free backend-owned weights while GPU work still
+        // references them. This is a deinit-only barrier, not a hot-path sync.
+        synchronizeDefaultDevice();
+
+        // Run-scoped pooled temporaries can still hold lazy graph references to
+        // backend-owned weights/state at shutdown. Clear those transient arrays
+        // before tearing down slot state objects or weight handles so pooled
+        // temporaries never outlive their dependencies.
+        //
+        // Do not explicitly clear thread-local transform caches here. Those
+        // caches are bounded, intentionally never-destroyed, and on macOS they
+        // may hold ARC-managed Metal resources whose eager teardown has been
+        // crashing verify runs after otherwise-successful execution.
+        graph.mlx_clear_thread_local_run_state();
         if (self.text_runtime_rope) |*rope| rope.deinit(std.heap.c_allocator);
         if (self.vision_runtime) |*rt| rt.deinit();
         if (self.slot0_state_binding.bound) {
@@ -1051,10 +1084,56 @@ pub const MetalBackend = struct {
             }
             slot.state_binding.clear();
         }
+
+        // Cache/state teardown above destroys arrays that can still own the
+        // last references to persistent weights. Wait for those releases to
+        // quiesce before freeing the weight handles themselves.
+        synchronizeDefaultDevice();
+
         self.allocator.free(self.slot_logits_buffer);
         self.allocator.free(self.extra_slots);
         weights_trait.freeWeights(self.allocator, self.weights);
+
+        // Weight destruction can enqueue deferred MLX/Metal release work.
+        // Flush that work before returning, but do not explicitly purge the
+        // global MLX allocator cache here. On macOS, cached Metal buffers are
+        // ARC-managed Objective-C objects and eager cache purges during deinit
+        // have been crashing xray verify inside MLX buffer-cache teardown.
+        //
+        // The verify harness already isolates passes in short-lived child
+        // processes, so letting process teardown reclaim the allocator cache is
+        // the safer lifecycle boundary.
+        synchronizeDefaultDevice();
+        synchronizeDefaultDevice();
+
         self.* = undefined;
+    }
+
+    /// Barrier for xray/teardown code that needs MLX default-stream work to be
+    /// fully visible to host-side capture serializers before they inspect or
+    /// destroy traced tensors.
+    pub fn synchronize(self: *MetalBackend) void {
+        _ = self;
+        synchronizeDefaultDevice();
+    }
+
+    /// Clear per-thread MLX transient state after a full generation run.
+    /// This is an explicit lifecycle barrier for pooled temporaries on the
+    /// thread that executed the run; persistent transform caches are cleared at
+    /// backend shutdown, not between live runs.
+    pub fn cleanupExecutionThreadState(self: *MetalBackend) void {
+        _ = self;
+        graph.mlx_clear_thread_local_run_state();
+    }
+
+    /// Reset thread-local MLX transient state on the execution thread before a
+    /// new logical run begins. Persistent transform caches remain live across
+    /// runs on purpose: they are bounded, keyed by backend-owned weights, and
+    /// explicit cache destruction on macOS has proven unsafe during verify
+    /// teardown.
+    pub fn teardownExecutionThreadState(self: *MetalBackend) void {
+        _ = self;
+        graph.mlx_clear_thread_local_run_state();
     }
 
     /// Prefill: process all prompt tokens, return logits for last position
