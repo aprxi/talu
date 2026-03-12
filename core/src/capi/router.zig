@@ -583,6 +583,20 @@ pub export fn talu_backend_free(backend: ?*TaluInferenceBackend) callconv(.c) vo
     allocator.destroy(boxed);
 }
 
+pub export fn talu_backend_synchronize(backend: ?*TaluInferenceBackend) callconv(.c) c_int {
+    capi_error.clearError();
+    const backend_ptr = backend orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "backend is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const boxed: *spec_mod.InferenceBackend = @ptrCast(@alignCast(backend_ptr));
+    boxed.synchronize() catch |err| {
+        capi_error.setError(err, "backend synchronize failed: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    return 0;
+}
+
 // =============================================================================
 // Remote Model Listing
 // =============================================================================

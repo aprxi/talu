@@ -15,6 +15,7 @@ const teacher_forcing = @import("teacher_forcing.zig");
 const dump_capture_mod = @import("dump/capture.zig");
 const dump_npz_mod = @import("dump/npz.zig");
 const core_dtype = @import("../dtype.zig");
+const handler_slot_mod = @import("handler_slot.zig");
 
 const TraceEmission = trace.TraceEmission;
 const TensorStats = stats_mod.TensorStats;
@@ -27,6 +28,10 @@ var ignore_token_parity_enabled: std.atomic.Value(bool) = std.atomic.Value(bool)
 var token_only_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var verification_full_capture_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var verification_point_mask_override: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var verification_exact_filter_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var verification_exact_filter_point: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+var verification_exact_filter_layer: std.atomic.Value(u16) = std.atomic.Value(u16).init(0);
+var verification_exact_filter_position: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 var stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 /// XRAY VERIFY CONTROL:
@@ -62,6 +67,21 @@ pub fn setVerificationPointMaskOverride(mask: u64) void {
 
 pub fn clearVerificationPointMaskOverride() void {
     verification_point_mask_override.store(0, .release);
+}
+
+pub fn setVerificationExactEmissionOverride(
+    point: trace.TracePoint,
+    layer: u16,
+    position: u32,
+) void {
+    verification_exact_filter_point.store(@intFromEnum(point), .release);
+    verification_exact_filter_layer.store(layer, .release);
+    verification_exact_filter_position.store(position, .release);
+    verification_exact_filter_enabled.store(true, .release);
+}
+
+pub fn clearVerificationExactEmissionOverride() void {
+    verification_exact_filter_enabled.store(false, .release);
 }
 
 pub fn isStopRequested() bool {
@@ -131,6 +151,15 @@ pub const VerifyCapture = struct {
 
     fn verificationFullCaptureEnabled() bool {
         return verification_full_capture_enabled.load(.acquire);
+    }
+
+    fn configuredExactEmissionFilter() ?trace.ExactEmissionFilter {
+        if (!verification_exact_filter_enabled.load(.acquire)) return null;
+        return .{
+            .point = @enumFromInt(verification_exact_filter_point.load(.acquire)),
+            .layer = verification_exact_filter_layer.load(.acquire),
+            .position = verification_exact_filter_position.load(.acquire),
+        };
     }
 
     fn effectivePointSet(self: *const VerifyCapture) capture_mod.TracePointSet {
@@ -462,26 +491,34 @@ pub const VerifyCapture = struct {
     }
 };
 
-/// Global verify capture for handler integration
-var global_verify_capture: ?*VerifyCapture = null;
+/// Global verify capture for handler integration.
+///
+/// Verification can emit from backend-managed worker threads while Rust/CLI
+/// enables/disables capture around a generation run. Disable must therefore
+/// wait for any in-flight callback before verifier/capture teardown proceeds.
+var global_verify_capture_slot: handler_slot_mod.HandlerSlot(VerifyCapture) = .{};
 
 fn globalVerifyHandler(emission: TraceEmission) void {
-    if (global_verify_capture) |cap| {
+    var locked = global_verify_capture_slot.acquire();
+    defer locked.release();
+    if (locked.ptr) |cap| {
         cap.handleEmission(emission);
     }
 }
 
 pub fn enableVerifyCapture(cap: *VerifyCapture) void {
-    global_verify_capture = cap;
+    global_verify_capture_slot.set(cap);
     stop_requested.store(false, .release);
     trace.setActiveBuiltInPointMask(cap.effectivePointSet().builtinMask());
+    trace.setActiveExactEmissionFilter(VerifyCapture.configuredExactEmissionFilter());
     trace.setHandler(&globalVerifyHandler);
 }
 
 pub fn disableVerifyCapture() void {
-    global_verify_capture = null;
+    global_verify_capture_slot.set(null);
     stop_requested.store(false, .release);
     trace.setHandler(null);
+    trace.setActiveExactEmissionFilter(null);
 }
 
 // ============================================================================
@@ -1124,4 +1161,59 @@ test "VerifyCapture recording token_select u32 updates transcript without stats 
     try std.testing.expectEqual(@as(u32, 321), recorder.token_transcript.items[0]);
     try std.testing.expectEqual(@as(u32, 1), recorder.current_token_idx);
     try std.testing.expectEqual(@as(usize, 0), recorder.stats_records.items.len);
+}
+
+test "enableVerifyCapture routes emissions and disableVerifyCapture stops them" {
+    const allocator = std.testing.allocator;
+
+    var recorder = try ReferenceRecorder.init(allocator, "test_model", 42, 1.0, 10);
+    defer recorder.deinit();
+
+    var verify_cap = VerifyCapture.initRecording(allocator, &recorder);
+    defer verify_cap.deinit();
+
+    enableVerifyCapture(&verify_cap);
+    defer disableVerifyCapture();
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const emission = TraceEmission{
+        .point = .lm_head,
+        .layer = trace.TraceEmission.NO_LAYER,
+        .token = 0,
+        .position = 0,
+        .backend = .cpu,
+        .tensor = .{
+            .ptr = @ptrCast(data[0..].ptr),
+            .dtype = .f32,
+            .shape = .{ 4, 0, 0, 0 },
+            .ndim = 1,
+        },
+        .timestamp_ns = 0,
+        .kernel_name = std.mem.zeroes([48]u8),
+    };
+
+    trace.emitFinal(
+        .lm_head,
+        0,
+        0,
+        emission.tensor.ptr,
+        .f32,
+        .{ 4, 0, 0, 0 },
+        1,
+        "unit_test_host",
+    );
+    try std.testing.expectEqual(@as(usize, 1), recorder.stats_records.items.len);
+
+    disableVerifyCapture();
+    trace.emitFinal(
+        .lm_head,
+        0,
+        0,
+        emission.tensor.ptr,
+        .f32,
+        .{ 4, 0, 0, 0 },
+        1,
+        "unit_test_host",
+    );
+    try std.testing.expectEqual(@as(usize, 1), recorder.stats_records.items.len);
 }

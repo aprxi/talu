@@ -31,8 +31,7 @@ struct FfnFusedGateUpCacheKeyHash {
 };
 
 static inline std::unordered_map<FfnFusedGateUpCacheKey, array, FfnFusedGateUpCacheKeyHash>& ffn_fused_gate_up_cache_store() {
-    static thread_local std::unordered_map<FfnFusedGateUpCacheKey, array, FfnFusedGateUpCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<FfnFusedGateUpCacheKey, array, FfnFusedGateUpCacheKeyHash>>();
 }
 
 static inline void ffn_fused_gate_up_cache_clear() {
@@ -70,8 +69,7 @@ struct FfnFusedDenseRhsCacheValue {
 };
 
 static inline std::unordered_map<FfnFusedDenseRhsCacheKey, FfnFusedDenseRhsCacheValue, FfnFusedDenseRhsCacheKeyHash>& ffn_fused_dense_rhs_cache_store() {
-    static thread_local std::unordered_map<FfnFusedDenseRhsCacheKey, FfnFusedDenseRhsCacheValue, FfnFusedDenseRhsCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<FfnFusedDenseRhsCacheKey, FfnFusedDenseRhsCacheValue, FfnFusedDenseRhsCacheKeyHash>>();
 }
 
 struct FfnFusedDenseRhsHotSlot {
@@ -85,8 +83,7 @@ struct FfnFusedDenseRhsHotSlot {
 };
 
 static inline FfnFusedDenseRhsHotSlot* ffn_fused_dense_rhs_hot_slots_store() {
-    static thread_local FfnFusedDenseRhsHotSlot slots[kFfnFusedDenseRhsHotSlots];
-    return slots;
+    return tls_never_destroyed_array<FfnFusedDenseRhsHotSlot, kFfnFusedDenseRhsHotSlots>();
 }
 
 struct FfnFusedDenseRhsLastHit {
@@ -100,8 +97,11 @@ struct FfnFusedDenseRhsLastHit {
 };
 
 static inline FfnFusedDenseRhsLastHit& ffn_fused_dense_rhs_last_hit_store() {
-    static thread_local FfnFusedDenseRhsLastHit last_hit;
-    return last_hit;
+    return tls_never_destroyed<FfnFusedDenseRhsLastHit>();
+}
+
+static inline std::optional<FfnFusedDenseRhsCacheValue>& ffn_fused_dense_rhs_scratch_store() {
+    return tls_never_destroyed<std::optional<FfnFusedDenseRhsCacheValue>>();
 }
 
 static inline void ffn_fused_dense_rhs_cache_clear() {
@@ -111,6 +111,7 @@ static inline void ffn_fused_dense_rhs_cache_clear() {
         hot_slots[i].valid = false;
     }
     ffn_fused_dense_rhs_last_hit_store().valid = false;
+    ffn_fused_dense_rhs_scratch_store().reset();
 }
 
 static inline FfnFusedDenseRhsCacheValue ffn_fused_dense_rhs_uncached(
@@ -143,7 +144,7 @@ static inline const FfnFusedDenseRhsCacheValue& ffn_fused_dense_rhs_cached(
     int in_features
 ) {
     if (gate_w == nullptr || up_w == nullptr || down_w == nullptr) {
-        static thread_local std::optional<FfnFusedDenseRhsCacheValue> scratch;
+        auto& scratch = ffn_fused_dense_rhs_scratch_store();
         scratch = ffn_fused_dense_rhs_uncached(
             gate_w,
             up_w,

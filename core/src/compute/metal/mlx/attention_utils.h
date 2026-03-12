@@ -16,8 +16,7 @@ static inline uint64_t gqa_index_cache_key(int q_heads, int kv_heads) {
 }
 
 static inline std::unordered_map<uint64_t, array>& gqa_index_cache_store() {
-    static thread_local std::unordered_map<uint64_t, array> gqa_index_cache;
-    return gqa_index_cache;
+    return tls_never_destroyed<std::unordered_map<uint64_t, array>>();
 }
 
 static inline void gqa_index_cache_clear() {
@@ -30,6 +29,28 @@ static inline size_t gqa_index_cache_size() {
 
 static inline size_t gqa_index_cache_max_entries() {
     return kGqaIndexCacheMaxEntries;
+}
+
+static inline array gqa_owned_index_array(const std::vector<int32_t>& gather_idx) {
+    static constexpr size_t kIndexAlignment = 16 * 1024;
+    const size_t byte_count = std::max(gather_idx.size() * sizeof(int32_t), sizeof(int32_t));
+    void* aligned_ptr = nullptr;
+    if (posix_memalign(&aligned_ptr, kIndexAlignment, byte_count) != 0 || aligned_ptr == nullptr) {
+        throw std::bad_alloc();
+    }
+
+    auto* copied = static_cast<int32_t*>(aligned_ptr);
+    if (!gather_idx.empty()) {
+        std::memcpy(copied, gather_idx.data(), gather_idx.size() * sizeof(int32_t));
+    }
+
+    auto owner = std::shared_ptr<void>(aligned_ptr, [](void* ptr) {
+        std::free(ptr);
+    });
+    auto deleter = [owner](void*) {
+        // ownership retained by closure capture
+    };
+    return array(copied, {static_cast<int>(gather_idx.size())}, int32, deleter);
 }
 
 static inline array gqa_cached_gather_indices(int q_heads, int kv_heads) {
@@ -52,7 +73,7 @@ static inline array gqa_cached_gather_indices(int q_heads, int kv_heads) {
     for (int head_idx = 0; head_idx < q_heads; head_idx++) {
         gather_idx[static_cast<size_t>(head_idx)] = static_cast<int32_t>(head_idx / heads_per_kv);
     }
-    array idx = array(gather_idx.data(), {q_heads}, int32);
+    array idx = gqa_owned_index_array(gather_idx);
     auto [inserted_it, _] = gqa_index_cache.emplace(key, idx);
     return inserted_it->second;
 }

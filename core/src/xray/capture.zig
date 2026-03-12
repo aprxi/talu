@@ -6,6 +6,7 @@
 const std = @import("std");
 const trace = @import("trace.zig");
 const stats_mod = @import("stats.zig");
+const handler_slot_mod = @import("handler_slot.zig");
 
 pub const TensorStats = stats_mod.TensorStats;
 
@@ -534,32 +535,36 @@ pub const TraceCapture = struct {
 };
 
 /// Global capture instance used by trace handler callbacks.
-/// Must be atomic because backend emissions can race with enable/disable.
-var global_capture_atomic: std.atomic.Value(?*TraceCapture) = std.atomic.Value(?*TraceCapture).init(null);
+/// Handler lifetime must be serialized with enable/disable so teardown cannot
+/// free capture storage while a backend worker thread is still inside the
+/// callback.
+var global_capture_slot: handler_slot_mod.HandlerSlot(TraceCapture) = .{};
 
 /// Handler function that routes to global capture.
 fn globalHandler(emission: trace.TraceEmission) void {
-    if (global_capture_atomic.load(.acquire)) |cap| {
+    var locked = global_capture_slot.acquire();
+    defer locked.release();
+    if (locked.ptr) |cap| {
         cap.handleEmission(emission);
     }
 }
 
 /// Enable capturing with the given capture instance.
 pub fn enable(cap: *TraceCapture) void {
-    global_capture_atomic.store(cap, .release);
+    global_capture_slot.set(cap);
     trace.setActiveBuiltInPointMask(cap.config.points.builtinMask());
     trace.setHandler(&globalHandler);
 }
 
 /// Disable capturing.
 pub fn disable() void {
-    global_capture_atomic.store(null, .release);
+    global_capture_slot.set(null);
     trace.setHandler(null);
 }
 
 /// Check if capturing is enabled.
 pub fn isEnabled() bool {
-    return global_capture_atomic.load(.acquire) != null;
+    return global_capture_slot.isEnabled();
 }
 
 // ============================================================================

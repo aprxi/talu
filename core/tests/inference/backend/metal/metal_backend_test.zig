@@ -8,6 +8,8 @@ const main = @import("main");
 
 const has_metal = builtin.os.tag == .macos;
 const metal = if (has_metal) main.inference.backend.metal else void;
+const backend_root = main.inference.backend.root;
+const backend_scheduler = main.inference.scheduler;
 const runtime_contract = main.inference.runtime_contract;
 const weights = if (has_metal) main.inference.backend.metal.executor.weights else void;
 const xray = main.xray;
@@ -215,5 +217,90 @@ test "metal backend xray record+verify capture path is stable under repeated run
             try backend.decode(6, backend.getPosition(0), logits);
         }
         try verifier.finish();
+    }
+}
+
+test "metal backend remains stable across repeated scheduler lifecycles on one backend" {
+    if (!canRunMetalRuntime()) return;
+
+    const allocator = std.testing.allocator;
+    const Scheduler = backend_scheduler.GenericScheduler(backend_root.Backend);
+
+    const loaded = try weights.createTestLoadedModel(allocator);
+    defer weights.destroyTestLoadedModel(allocator, loaded);
+    loaded.runtime.architecture_id = "qwen3";
+
+    var backend = backend_root.Backend{
+        .metal = try metal.MetalBackend.init(allocator, loaded),
+    };
+    defer backend.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3, 4 };
+    const iterations: usize = 8;
+
+    for (0..iterations) |_| {
+        var scheduler = try Scheduler.init(allocator, &backend, .{
+            .state_descriptors = backend.stateDescriptors(),
+        });
+        defer scheduler.deinit();
+
+        var result = try scheduler.generateSync(prompt[0..], 2, null);
+        defer result.deinit(allocator);
+
+        try std.testing.expect(result.tokens.len > 0);
+    }
+}
+
+test "metal backend explicit worker-thread teardown is stable across repeated runs" {
+    if (!canRunMetalRuntime()) return;
+
+    const allocator = std.testing.allocator;
+    const Scheduler = backend_scheduler.GenericScheduler(backend_root.Backend);
+
+    const loaded = try weights.createTestLoadedModel(allocator);
+    defer weights.destroyTestLoadedModel(allocator, loaded);
+    loaded.runtime.architecture_id = "qwen3";
+
+    var backend = backend_root.Backend{
+        .metal = try metal.MetalBackend.init(allocator, loaded),
+    };
+    defer backend.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3, 4 };
+    const iterations: usize = 8;
+
+    const WorkerCtx = struct {
+        allocator: std.mem.Allocator,
+        backend: *backend_root.Backend,
+        prompt: []const u32,
+        runError: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer self.backend.teardownExecutionThreadState();
+            self.runError = self.runOnce() catch |err| err;
+        }
+
+        fn runOnce(self: *@This()) !void {
+            var scheduler = try Scheduler.init(self.allocator, self.backend, .{
+                .state_descriptors = self.backend.stateDescriptors(),
+            });
+            defer scheduler.deinit();
+
+            var result = try scheduler.generateSync(self.prompt, 2, null);
+            defer result.deinit(self.allocator);
+
+            try std.testing.expect(result.tokens.len > 0);
+        }
+    };
+
+    for (0..iterations) |_| {
+        var ctx = WorkerCtx{
+            .allocator = allocator,
+            .backend = &backend,
+            .prompt = prompt[0..],
+        };
+        const thread = try std.Thread.spawn(.{}, WorkerCtx.run, .{&ctx});
+        thread.join();
+        if (ctx.runError) |err| return err;
     }
 }

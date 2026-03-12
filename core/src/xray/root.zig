@@ -50,6 +50,8 @@ pub const setVerifyFullCaptureOverride = verify.setVerificationFullCaptureOverri
 pub const clearVerifyFullCaptureOverride = verify.clearVerificationFullCaptureOverride;
 pub const setVerifyPointMaskOverride = verify.setVerificationPointMaskOverride;
 pub const clearVerifyPointMaskOverride = verify.clearVerificationPointMaskOverride;
+pub const setVerifyExactEmissionOverride = verify.setVerificationExactEmissionOverride;
+pub const clearVerifyExactEmissionOverride = verify.clearVerificationExactEmissionOverride;
 pub const isVerifyStopRequested = verify.isStopRequested;
 
 // Teacher forcing (for verification)

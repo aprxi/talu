@@ -14,6 +14,7 @@ const http_engine_mod = @import("http_engine.zig");
 const iterator_mod = @import("iterator.zig");
 const commit_mod = @import("commit.zig");
 const responses_mod = @import("../responses/root.zig");
+const inference_types = @import("../inference/root.zig").types;
 const sampler = @import("../inference/root.zig").sampling;
 const tokenizer_mod = @import("../tokenizer/root.zig");
 const error_codes = @import("../capi/error_codes.zig");
@@ -26,6 +27,7 @@ const InferenceBackend = spec.InferenceBackend;
 const GenerateOptions = local.GenerateOptions;
 const Chat = responses_mod.Chat;
 const ContentType = responses_mod.ContentType;
+const FinishReason = inference_types.FinishReason;
 
 // =============================================================================
 // C-Compatible Input Types
@@ -356,7 +358,11 @@ pub fn generate(
         return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
     };
 
-    // Keep local non-stream generation on the same iterator-backed execution route.
+    // Local generation uses the iterator-backed worker path for both
+    // streaming and non-streaming requests. Metal execution owns thread-local
+    // MLX state on the thread that performs generation; routing public local
+    // generation through one worker-owned path keeps that lifecycle explicit
+    // and avoids split execution semantics between stream and no-stream.
     return generateWithLocalEngine(allocator, chat, engine, config);
 }
 
@@ -423,59 +429,53 @@ fn generateWithLocalEngine(
     var built = buildOptions(allocator, config, local_engine) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
     defer built.deinit(allocator);
 
-    log.debug("router", "LocalEngine generate (iterator route)", .{
+    log.debug("router", "LocalEngine generate (iterator-backed route)", .{
         .max_tokens = built.options.max_tokens orelse 0,
         .has_tools = @as(u8, @intFromBool(built.options.tools_json != null)),
     }, @src());
 
-    // Non-stream generation must execute through the same iterator route as stream.
-    var iter = iterator_mod.TokenIterator.init(allocator, local_engine, chat, built.options) catch |err| {
-        capi_error.setError(err, "Failed to create iterator", .{});
+    var iterator = iterator_mod.TokenIterator.init(allocator, local_engine, chat, built.options) catch |err| {
+        capi_error.setError(err, "Generation failed", .{});
         return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
     };
-    defer iter.deinit();
+    defer iterator.deinit();
 
-    while (iter.next()) |_| {}
+    while (iterator.next() != null) {}
 
-    if (iter.hasError()) {
-        if (iter.getErrorMsg()) |msg| {
-            capi_error.set_last_error(msg);
+    if (iterator.hasError()) {
+        if (iterator.getErrorMsg()) |msg| {
+            capi_error.setErrorWithCode(.generation_failed, "{s}", .{msg});
         } else {
-            capi_error.set_last_error("Generation failed");
+            capi_error.setErrorWithCode(.generation_failed, "Generation failed", .{});
         }
         return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
     }
 
-    const tool_calls = iter.takeLocalToolCalls();
-
-    const final_slice: []const u8 = if (iter.getFinalText()) |z_text| std.mem.span(z_text) else "";
-    const final_text = allocator.dupe(u8, final_slice) catch {
-        freeToolCallRefs(allocator, tool_calls);
-        return .{
-            .text = null,
-            .token_count = iter.getCompletionTokens(),
-            .prompt_tokens = iter.getPromptTokens(),
-            .completion_tokens = iter.getCompletionTokens(),
-            .prefill_ns = iter.getPrefillNs(),
-            .generation_ns = iter.getGenerationNs(),
-            .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory),
-        };
+    const finish_reason: CFinishReason = switch (iterator.getFinishReason()) {
+        @intFromEnum(FinishReason.eos_token) => .eos_token,
+        @intFromEnum(FinishReason.length) => .length,
+        @intFromEnum(FinishReason.stop_sequence) => .stop_sequence,
+        @intFromEnum(FinishReason.tool_calls) => .tool_calls,
+        @intFromEnum(FinishReason.content_filter) => .content_filter,
+        @intFromEnum(FinishReason.cancelled) => .cancelled,
+        else => .eos_token,
     };
 
-    const finish_reason = std.meta.intToEnum(CFinishReason, iter.getFinishReason()) catch CFinishReason.eos_token;
+    const tool_calls = iterator.takeLocalToolCalls();
+    errdefer freeToolCallRefs(allocator, tool_calls);
 
-    log.debug("router", "LocalEngine iterator route completed", .{
-        .prompt_tokens = iter.getPromptTokens(),
-        .completion_tokens = iter.getCompletionTokens(),
-    }, @src());
+    const final_text = if (iterator.getFinalText()) |text_z|
+        allocator.dupe(u8, std.mem.sliceTo(text_z, 0)) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) }
+    else
+        allocator.dupe(u8, "") catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
 
     return .{
         .text = final_text,
-        .token_count = iter.getCompletionTokens(),
-        .prompt_tokens = iter.getPromptTokens(),
-        .completion_tokens = iter.getCompletionTokens(),
-        .prefill_ns = iter.getPrefillNs(),
-        .generation_ns = iter.getGenerationNs(),
+        .token_count = iterator.getCompletionTokens(),
+        .prompt_tokens = iterator.getPromptTokens(),
+        .completion_tokens = iterator.getCompletionTokens(),
+        .prefill_ns = iterator.getPrefillNs(),
+        .generation_ns = iterator.getGenerationNs(),
         .error_code = 0,
         .finish_reason = finish_reason,
         .tool_calls = tool_calls,

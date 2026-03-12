@@ -93,8 +93,7 @@ struct OrientedRhsCacheKeyHash {
 };
 
 static inline std::unordered_map<OrientedRhsCacheKey, array, OrientedRhsCacheKeyHash>& oriented_rhs_cache_store() {
-    static thread_local std::unordered_map<OrientedRhsCacheKey, array, OrientedRhsCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<OrientedRhsCacheKey, array, OrientedRhsCacheKeyHash>>();
 }
 
 struct OrientedRhsHotSlot {
@@ -104,8 +103,7 @@ struct OrientedRhsHotSlot {
 };
 
 static inline OrientedRhsHotSlot* oriented_rhs_hot_slots_store() {
-    static thread_local OrientedRhsHotSlot slots[kOrientedRhsHotSlots];
-    return slots;
+    return tls_never_destroyed_array<OrientedRhsHotSlot, kOrientedRhsHotSlots>();
 }
 
 struct OrientedRhsLastHit {
@@ -115,8 +113,7 @@ struct OrientedRhsLastHit {
 };
 
 static inline OrientedRhsLastHit& oriented_rhs_last_hit_store() {
-    static thread_local OrientedRhsLastHit last_hit;
-    return last_hit;
+    return tls_never_destroyed<OrientedRhsLastHit>();
 }
 
 static inline void oriented_rhs_cache_clear() {
@@ -156,8 +153,7 @@ struct StateSpaceConvKernelCacheKeyHash {
 };
 
 static inline std::unordered_map<StateSpaceConvKernelCacheKey, array, StateSpaceConvKernelCacheKeyHash>& state_space_conv_kernel_cache_store() {
-    static thread_local std::unordered_map<StateSpaceConvKernelCacheKey, array, StateSpaceConvKernelCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<StateSpaceConvKernelCacheKey, array, StateSpaceConvKernelCacheKeyHash>>();
 }
 
 static inline void state_space_conv_kernel_cache_clear() {
@@ -189,8 +185,7 @@ struct CausalConvKernelCacheKeyHash {
 };
 
 static inline std::unordered_map<CausalConvKernelCacheKey, array, CausalConvKernelCacheKeyHash>& causal_conv_kernel_cache_store() {
-    static thread_local std::unordered_map<CausalConvKernelCacheKey, array, CausalConvKernelCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<CausalConvKernelCacheKey, array, CausalConvKernelCacheKeyHash>>();
 }
 
 static inline void causal_conv_kernel_cache_clear() {
@@ -219,8 +214,7 @@ struct CausalConvBiasCacheKeyHash {
 };
 
 static inline std::unordered_map<CausalConvBiasCacheKey, array, CausalConvBiasCacheKeyHash>& causal_conv_bias_cache_store() {
-    static thread_local std::unordered_map<CausalConvBiasCacheKey, array, CausalConvBiasCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<CausalConvBiasCacheKey, array, CausalConvBiasCacheKeyHash>>();
 }
 
 static inline void causal_conv_bias_cache_clear() {
@@ -246,8 +240,7 @@ struct BiasCastCacheKeyHash {
 };
 
 static inline std::unordered_map<BiasCastCacheKey, array, BiasCastCacheKeyHash>& bias_cast_cache_store() {
-    static thread_local std::unordered_map<BiasCastCacheKey, array, BiasCastCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<BiasCastCacheKey, array, BiasCastCacheKeyHash>>();
 }
 
 static inline void bias_cast_cache_clear() {
@@ -278,8 +271,7 @@ static constexpr size_t kStateSpaceRowCacheMaxEntries = 1024;
 static constexpr size_t kGatedDeltaStaticCacheMaxEntries = 1024;
 
 static inline std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash>& quant_param_cast_cache_store() {
-    static thread_local std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash>>();
 }
 
 static inline void quant_param_cast_cache_clear() {
@@ -316,8 +308,7 @@ struct StateSpaceStaticTerms {
 };
 
 static inline std::unordered_map<StateSpaceStaticCacheKey, StateSpaceStaticTerms, StateSpaceStaticCacheKeyHash>& state_space_static_cache_store() {
-    static thread_local std::unordered_map<StateSpaceStaticCacheKey, StateSpaceStaticTerms, StateSpaceStaticCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<StateSpaceStaticCacheKey, StateSpaceStaticTerms, StateSpaceStaticCacheKeyHash>>();
 }
 
 static inline void state_space_static_cache_clear() {
@@ -349,8 +340,7 @@ struct StateSpaceRowCacheKeyHash {
 };
 
 static inline std::unordered_map<StateSpaceRowCacheKey, array, StateSpaceRowCacheKeyHash>& state_space_row_cache_store() {
-    static thread_local std::unordered_map<StateSpaceRowCacheKey, array, StateSpaceRowCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<StateSpaceRowCacheKey, array, StateSpaceRowCacheKeyHash>>();
 }
 
 static inline void state_space_row_cache_clear() {
@@ -389,8 +379,7 @@ struct GatedDeltaStaticTerms {
 static inline array ensure_float32(const array& arr);
 
 static inline std::unordered_map<GatedDeltaStaticCacheKey, GatedDeltaStaticTerms, GatedDeltaStaticCacheKeyHash>& gated_delta_static_cache_store() {
-    static thread_local std::unordered_map<GatedDeltaStaticCacheKey, GatedDeltaStaticTerms, GatedDeltaStaticCacheKeyHash> cache;
-    return cache;
+    return tls_never_destroyed<std::unordered_map<GatedDeltaStaticCacheKey, GatedDeltaStaticTerms, GatedDeltaStaticCacheKeyHash>>();
 }
 
 static inline void gated_delta_static_cache_clear() {

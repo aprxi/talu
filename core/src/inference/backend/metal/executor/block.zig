@@ -276,11 +276,14 @@ pub const TransformerBlock = struct {
         if (point == .block_out) return;
         var marker = [_]f32{0.0};
         const seq_len = inferTraceSeqLen(state);
+        const token_idx = traceTokenIndex(seq_len);
+        const position = tracePositionForPoint(point, state.pos_offset, seq_len);
+        if (!trace.shouldEmitEmission(point, @intCast(state.layer_idx), position)) return;
         trace.emit(
             point,
             @intCast(state.layer_idx),
-            traceTokenIndex(seq_len),
-            tracePositionForPoint(point, state.pos_offset, seq_len),
+            token_idx,
+            position,
             @ptrCast(marker[0..].ptr),
             .f32,
             shape,
@@ -340,17 +343,22 @@ pub const TransformerBlock = struct {
         const seq_len_u32: u32 = @intCast(@min(mapped.seq_len, @as(usize, std.math.maxInt(u32))));
         const batch_u32: u32 = @intCast(@min(mapped.batch, @as(usize, std.math.maxInt(u32))));
         const width_u32: u32 = @intCast(@min(mapped.width, @as(usize, std.math.maxInt(u32))));
+        const token_idx = traceTokenIndex(seq_len_u32);
+        const position = tracePositionForPoint(point, state.pos_offset, seq_len_u32);
+        if (!trace.shouldEmitEmission(point, @intCast(state.layer_idx), position)) return;
 
-        mlx_graph.eval(&.{output});
         const host_buf = std.heap.c_allocator.alloc(f32, element_count) catch return;
         defer std.heap.c_allocator.free(host_buf);
+        // copyToHost materializes the lazy MLX array. Avoid a redundant eval()
+        // here: the extra materialization doubles temporary MLX lifetime churn
+        // in the xray host-trace path without changing the observed tensor.
         mlx_graph.copyToHost(output, host_buf);
 
         trace.emit(
             point,
             @intCast(state.layer_idx),
-            traceTokenIndex(seq_len_u32),
-            tracePositionForPoint(point, state.pos_offset, seq_len_u32),
+            token_idx,
+            position,
             @ptrCast(host_buf.ptr),
             .f32,
             .{ batch_u32, seq_len_u32, width_u32, 0 },
@@ -397,13 +405,27 @@ pub const TransformerBlock = struct {
         }
         if (seq_len == 0 or width == 0) return;
 
+        var should_materialize = false;
+        for (0..seq_len) |token_idx| {
+            if (trace.shouldEmitEmission(point, @intCast(state.layer_idx), @intCast(token_idx))) {
+                should_materialize = true;
+                break;
+            }
+        }
+        if (!should_materialize) return;
+
         const element_count = seq_len * width;
-        mlx_graph.eval(&.{output});
         const host_buf = std.heap.c_allocator.alloc(f32, element_count) catch return;
         defer std.heap.c_allocator.free(host_buf);
+        // copyToHost materializes the lazy MLX array. Avoid a redundant eval()
+        // here: the extra materialization doubles temporary MLX lifetime churn
+        // in the xray host-trace path without changing the observed tensor.
         mlx_graph.copyToHost(output, host_buf);
 
         for (0..seq_len) |token_idx| {
+            if (!trace.shouldEmitEmission(point, @intCast(state.layer_idx), @intCast(token_idx))) {
+                continue;
+            }
             const token_values = host_buf[(token_idx * width)..][0..width];
 
             trace.emit(
@@ -453,13 +475,27 @@ pub const TransformerBlock = struct {
         }
         if (seq_len == 0 or width == 0) return;
 
+        var should_materialize = false;
+        for (0..seq_len) |token_idx| {
+            if (trace.shouldEmitEmission(point, @intCast(state.layer_idx), @intCast(token_idx))) {
+                should_materialize = true;
+                break;
+            }
+        }
+        if (!should_materialize) return;
+
         const element_count = seq_len * width;
-        mlx_graph.eval(&.{output});
         const host_buf = std.heap.c_allocator.alloc(f32, element_count) catch return;
         defer std.heap.c_allocator.free(host_buf);
+        // copyToHost materializes the lazy MLX array. Avoid a redundant eval()
+        // here: the extra materialization doubles temporary MLX lifetime churn
+        // in the xray host-trace path without changing the observed tensor.
         mlx_graph.copyToHost(output, host_buf);
 
         for (0..seq_len) |token_idx| {
+            if (!trace.shouldEmitEmission(point, @intCast(state.layer_idx), @intCast(token_idx))) {
+                continue;
+            }
             const token_values = host_buf[(token_idx * width)..][0..width];
 
             trace.emit(

@@ -25,6 +25,14 @@ pub inline fn beginForwardGraphBuild() void {
 
 /// Clear MLX memory cache - call periodically to prevent fragmentation
 pub extern fn mlx_clear_memory_cache() void;
+/// Synchronize the active MLX default stream.
+pub extern fn mlx_synchronize_default_stream() void;
+/// Clear MLX thread-local pooled temporaries at a request/run boundary.
+/// This does not destroy persistent weight-transform caches.
+pub extern fn mlx_clear_thread_local_run_state() void;
+/// Clear MLX thread-local pooled arrays and transform caches at an explicit
+/// backend-shutdown lifecycle boundary on the executing thread.
+pub extern fn mlx_clear_thread_local_state() void;
 
 /// Get pool stats (for debugging)
 pub extern fn mlx_pool_stats(pool_size: *usize, used: *usize) void;
@@ -56,9 +64,25 @@ pub extern fn mlx_array_from_float32(
     ndim: usize,
 ) ArrayHandle;
 
+/// Create MLX array from float32 data using caller-persistent host storage.
+/// The caller must guarantee the backing store outlives the MLX array handle.
+pub extern fn mlx_array_from_float32_persistent(
+    data: *const anyopaque,
+    shape: [*]const usize,
+    ndim: usize,
+) ArrayHandle;
+
 /// Create MLX array from uint32 data (accepts unaligned pointers from mmap)
 /// C++ signature: void* mlx_array_from_uint32(const void* data, ...)
 pub extern fn mlx_array_from_uint32(
+    data: *const anyopaque,
+    shape: [*]const usize,
+    ndim: usize,
+) ArrayHandle;
+
+/// Create MLX array from uint32 data using caller-persistent host storage.
+/// The caller must guarantee the backing store outlives the MLX array handle.
+pub extern fn mlx_array_from_uint32_persistent(
     data: *const anyopaque,
     shape: [*]const usize,
     ndim: usize,
@@ -606,10 +630,20 @@ fn shapeToUsize(shape_i64: []const i64) struct { shape: [8]usize, len: usize } {
     return .{ .shape = shape, .len = shape_i64.len };
 }
 
-/// Create MLX array from Zig slice (float32)
+/// Create MLX array from Zig slice (float32).
+/// This always copies into compute-owned storage so request-scoped buffers are
+/// safe regardless of alignment.
 pub fn createArrayF32(data: []const f32, shape: []const i64) ArrayHandle {
     const shape_usize = shapeToUsize(shape);
     return mlx_array_from_float32(@ptrCast(data.ptr), &shape_usize.shape, shape_usize.len);
+}
+
+/// Create MLX array from caller-persistent float32 storage.
+/// Use only for model weights or other buffers whose host lifetime is explicit
+/// and guaranteed to outlive the MLX array handle.
+pub fn createPersistentArrayF32(data: []const f32, shape: []const i64) ArrayHandle {
+    const shape_usize = shapeToUsize(shape);
+    return mlx_array_from_float32_persistent(@ptrCast(data.ptr), &shape_usize.shape, shape_usize.len);
 }
 
 /// Create MLX array from Zig slice (uint32)
@@ -624,6 +658,15 @@ pub fn createArrayU32Unaligned(data: [*]align(1) const u32, len: usize, shape: [
     const shape_usize = shapeToUsize(shape);
     // Cast to *const anyopaque to avoid alignment checks - C++ uses memcpy internally
     return mlx_array_from_uint32(@ptrCast(data), &shape_usize.shape, shape_usize.len);
+}
+
+/// Create MLX array from caller-persistent unaligned uint32 storage.
+/// Use only when the source host buffer lifetime is explicitly tied to the
+/// resulting MLX handle (for example persistent model weights).
+pub fn createPersistentArrayU32Unaligned(data: [*]align(1) const u32, len: usize, shape: []const i64) ArrayHandle {
+    _ = len;
+    const shape_usize = shapeToUsize(shape);
+    return mlx_array_from_uint32_persistent(@ptrCast(data), &shape_usize.shape, shape_usize.len);
 }
 
 /// Create MLX array from Zig slice (bfloat16 as u16)
@@ -1998,7 +2041,71 @@ test "gqa index cache is bounded and resettable" {
     try std.testing.expect(mlx_gqa_index_cache_size() == 0);
 }
 
-test "array ingest uses zero-copy for aligned pointers and copy for unaligned pointers" {
+test "mlx_clear_thread_local_run_state clears pool but preserves gqa cache" {
+    if (comptime builtin.os.tag != .macos) return;
+
+    mlx_gqa_index_cache_clear();
+    mlx_gqa_index_cache_touch(8, 4);
+    try std.testing.expect(mlx_gqa_index_cache_size() > 0);
+
+    const a = createArrayF32(&.{ 1.0, 2.0 }, &[_]i64{2});
+    defer freeArray(a);
+    const b = createArrayF32(&.{ 3.0, 4.0 }, &[_]i64{2});
+    defer freeArray(b);
+    const out = mlx_lazy_add(a, b);
+    defer freeArray(out);
+
+    var pool_size: usize = 0;
+    var used: usize = 0;
+    mlx_pool_stats(&pool_size, &used);
+    try std.testing.expect(pool_size > 0);
+    try std.testing.expect(used > 0);
+
+    mlx_clear_thread_local_run_state();
+
+    mlx_pool_stats(&pool_size, &used);
+    try std.testing.expectEqual(@as(usize, 0), pool_size);
+    try std.testing.expectEqual(@as(usize, 0), used);
+    try std.testing.expect(mlx_gqa_index_cache_size() > 0);
+
+    // Cleanup must remain safe and idempotent.
+    mlx_clear_thread_local_run_state();
+    mlx_pool_stats(&pool_size, &used);
+    try std.testing.expectEqual(@as(usize, 0), pool_size);
+    try std.testing.expectEqual(@as(usize, 0), used);
+}
+
+test "mlx_clear_thread_local_state clears pool and gqa cache" {
+    if (comptime builtin.os.tag != .macos) return;
+
+    mlx_gqa_index_cache_clear();
+    mlx_gqa_index_cache_touch(8, 4);
+    try std.testing.expect(mlx_gqa_index_cache_size() > 0);
+
+    const a = createArrayF32(&.{ 1.0, 2.0 }, &[_]i64{2});
+    defer freeArray(a);
+    const b = createArrayF32(&.{ 3.0, 4.0 }, &[_]i64{2});
+    defer freeArray(b);
+    const out = mlx_lazy_add(a, b);
+    defer freeArray(out);
+
+    mlx_clear_thread_local_state();
+
+    var pool_size: usize = 0;
+    var used: usize = 0;
+    mlx_pool_stats(&pool_size, &used);
+    try std.testing.expectEqual(@as(usize, 0), pool_size);
+    try std.testing.expectEqual(@as(usize, 0), used);
+    try std.testing.expectEqual(@as(usize, 0), mlx_gqa_index_cache_size());
+
+    // Cleanup must remain safe and idempotent.
+    mlx_clear_thread_local_state();
+    mlx_pool_stats(&pool_size, &used);
+    try std.testing.expectEqual(@as(usize, 0), pool_size);
+    try std.testing.expectEqual(@as(usize, 0), used);
+}
+
+test "generic array ingest copies aligned and unaligned pointers" {
     if (comptime builtin.os.tag != .macos) return;
 
     const shape = [_]usize{ 2, 2 };
@@ -2016,11 +2123,56 @@ test "array ingest uses zero-copy for aligned pointers and copy for unaligned po
 
     const aligned_arr = mlx_array_from_float32(@ptrCast(aligned_f32.ptr), &shape, shape.len);
     defer freeArray(aligned_arr);
+    aligned_f32[0] = 99.0;
 
     var unaligned_storage: [bytes_len + 1]u8 = undefined;
     @memcpy(unaligned_storage[1 .. 1 + bytes_len], aligned_bytes[0..bytes_len]);
     const unaligned_ptr: *const anyopaque = @ptrCast(unaligned_storage[1 .. 1 + bytes_len].ptr);
     const unaligned_arr = mlx_array_from_float32(unaligned_ptr, &shape, shape.len);
+    defer freeArray(unaligned_arr);
+    const unaligned_f32 = std.mem.bytesAsSlice(f32, unaligned_storage[1 .. 1 + bytes_len]);
+    unaligned_f32[0] = 77.0;
+
+    var zero_copy_count: usize = 0;
+    var copy_count: usize = 0;
+    mlx_array_ingest_stats(&zero_copy_count, &copy_count);
+
+    try std.testing.expectEqual(@as(usize, 0), zero_copy_count);
+    try std.testing.expect(copy_count >= 2);
+
+    const handles = [_]ArrayHandle{ aligned_arr, unaligned_arr };
+    mlx_eval(@ptrCast(@constCast(&handles)), handles.len);
+    var aligned_host: [4]f32 = undefined;
+    var unaligned_host: [4]f32 = undefined;
+    copyToHost(aligned_arr, &aligned_host);
+    copyToHost(unaligned_arr, &unaligned_host);
+    try std.testing.expectEqual(@as(f32, 1.0), aligned_host[0]);
+    try std.testing.expectEqual(@as(f32, 1.0), unaligned_host[0]);
+}
+
+test "persistent array ingest zero-copies aligned pointers and copies unaligned pointers" {
+    if (comptime builtin.os.tag != .macos) return;
+
+    const shape = [_]usize{ 2, 2 };
+    const bytes_len = shape[0] * shape[1] * @sizeOf(f32);
+    mlx_array_ingest_stats_reset();
+
+    const page_align = std.heap.page_size_min;
+    const aligned_bytes = try std.heap.c_allocator.alignedAlloc(u8, .fromByteUnits(page_align), bytes_len);
+    defer std.heap.c_allocator.free(aligned_bytes);
+    const aligned_f32 = std.mem.bytesAsSlice(f32, aligned_bytes[0..bytes_len]);
+    aligned_f32[0] = 1.0;
+    aligned_f32[1] = 2.0;
+    aligned_f32[2] = 3.0;
+    aligned_f32[3] = 4.0;
+
+    const aligned_arr = mlx_array_from_float32_persistent(@ptrCast(aligned_f32.ptr), &shape, shape.len);
+    defer freeArray(aligned_arr);
+
+    var unaligned_storage: [bytes_len + 1]u8 = undefined;
+    @memcpy(unaligned_storage[1 .. 1 + bytes_len], aligned_bytes[0..bytes_len]);
+    const unaligned_ptr: *const anyopaque = @ptrCast(unaligned_storage[1 .. 1 + bytes_len].ptr);
+    const unaligned_arr = mlx_array_from_float32_persistent(unaligned_ptr, &shape, shape.len);
     defer freeArray(unaligned_arr);
 
     var zero_copy_count: usize = 0;
@@ -2029,4 +2181,32 @@ test "array ingest uses zero-copy for aligned pointers and copy for unaligned po
 
     try std.testing.expect(zero_copy_count >= 1);
     try std.testing.expect(copy_count >= 1);
+}
+
+test "lazy embedding owns token indices beyond caller mutation" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const weight_data = [_]f32{
+        1.0, 2.0,
+        3.0, 4.0,
+        5.0, 6.0,
+    };
+    const weight_shape = [_]i64{ 3, 2 };
+    const weights = createArrayF32(&weight_data, &weight_shape);
+    defer freeArray(weights);
+
+    var token_ids = [_]u32{ 2, 0 };
+    const embedded = mlx_lazy_embedding(weights, &token_ids, token_ids.len);
+    defer freeArray(embedded);
+
+    token_ids[0] = 0;
+    token_ids[1] = 1;
+
+    const handles = [_]ArrayHandle{embedded};
+    mlx_eval(@ptrCast(@constCast(&handles)), handles.len);
+
+    var host: [4]f32 = undefined;
+    copyToHost(embedded, &host);
+    try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0, 1.0, 2.0 }, &host);
 }
