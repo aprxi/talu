@@ -1,9 +1,5 @@
 static constexpr unsigned int TALU_WARP_SIZE = 32;
-<<<<<<< HEAD
 static constexpr unsigned int TALU_MATMUL_TILE_K = 2048;
-=======
-static constexpr unsigned int TALU_MATMUL_TILE_K = 1024;
->>>>>>> 4e37ffa939a5d32b994ada9dec2cafacd906af8e
 
 static __device__ __forceinline__ float talu_warp_sum_f32(float value) {
     value += __shfl_down_sync(0xFFFFFFFFu, value, 16);
@@ -12,6 +8,80 @@ static __device__ __forceinline__ float talu_warp_sum_f32(float value) {
     value += __shfl_down_sync(0xFFFFFFFFu, value, 2);
     value += __shfl_down_sync(0xFFFFFFFFu, value, 1);
     return value;
+}
+
+static __device__ __forceinline__ float talu_dot_f16_u16_vec8(
+    const float* input,
+    const unsigned short* row,
+    unsigned int in_dim,
+    unsigned int lane
+) {
+    float acc = 0.0f;
+    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u);
+    if (!can_vec8) {
+        for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
+            acc = fmaf(input[i], talu_decode_f16_u16(row[i]), acc);
+        }
+        return acc;
+    }
+    const unsigned int vec_elems = in_dim & ~7u;
+    const uint4* row_vec = reinterpret_cast<const uint4*>(row);
+    for (unsigned int i = lane * 8u; i < vec_elems; i += TALU_WARP_SIZE * 8u) {
+        const uint4 packed = row_vec[i >> 3];
+        const unsigned int w0 = packed.x;
+        const unsigned int w1 = packed.y;
+        const unsigned int w2 = packed.z;
+        const unsigned int w3 = packed.w;
+        acc = fmaf(input[i + 0], talu_decode_f16_u16((unsigned short)(w0 & 0xFFFFu)), acc);
+        acc = fmaf(input[i + 1], talu_decode_f16_u16((unsigned short)(w0 >> 16)), acc);
+        acc = fmaf(input[i + 2], talu_decode_f16_u16((unsigned short)(w1 & 0xFFFFu)), acc);
+        acc = fmaf(input[i + 3], talu_decode_f16_u16((unsigned short)(w1 >> 16)), acc);
+        acc = fmaf(input[i + 4], talu_decode_f16_u16((unsigned short)(w2 & 0xFFFFu)), acc);
+        acc = fmaf(input[i + 5], talu_decode_f16_u16((unsigned short)(w2 >> 16)), acc);
+        acc = fmaf(input[i + 6], talu_decode_f16_u16((unsigned short)(w3 & 0xFFFFu)), acc);
+        acc = fmaf(input[i + 7], talu_decode_f16_u16((unsigned short)(w3 >> 16)), acc);
+    }
+    for (unsigned int i = vec_elems + lane; i < in_dim; i += TALU_WARP_SIZE) {
+        acc = fmaf(input[i], talu_decode_f16_u16(row[i]), acc);
+    }
+    return acc;
+}
+
+static __device__ __forceinline__ float talu_dot_bf16_u16_vec8(
+    const float* input,
+    const unsigned short* row,
+    unsigned int in_dim,
+    unsigned int lane
+) {
+    float acc = 0.0f;
+    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u);
+    if (!can_vec8) {
+        for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
+            acc = fmaf(input[i], talu_decode_bf16_u16(row[i]), acc);
+        }
+        return acc;
+    }
+    const unsigned int vec_elems = in_dim & ~7u;
+    const uint4* row_vec = reinterpret_cast<const uint4*>(row);
+    for (unsigned int i = lane * 8u; i < vec_elems; i += TALU_WARP_SIZE * 8u) {
+        const uint4 packed = row_vec[i >> 3];
+        const unsigned int w0 = packed.x;
+        const unsigned int w1 = packed.y;
+        const unsigned int w2 = packed.z;
+        const unsigned int w3 = packed.w;
+        acc = fmaf(input[i + 0], talu_decode_bf16_u16((unsigned short)(w0 & 0xFFFFu)), acc);
+        acc = fmaf(input[i + 1], talu_decode_bf16_u16((unsigned short)(w0 >> 16)), acc);
+        acc = fmaf(input[i + 2], talu_decode_bf16_u16((unsigned short)(w1 & 0xFFFFu)), acc);
+        acc = fmaf(input[i + 3], talu_decode_bf16_u16((unsigned short)(w1 >> 16)), acc);
+        acc = fmaf(input[i + 4], talu_decode_bf16_u16((unsigned short)(w2 & 0xFFFFu)), acc);
+        acc = fmaf(input[i + 5], talu_decode_bf16_u16((unsigned short)(w2 >> 16)), acc);
+        acc = fmaf(input[i + 6], talu_decode_bf16_u16((unsigned short)(w3 & 0xFFFFu)), acc);
+        acc = fmaf(input[i + 7], talu_decode_bf16_u16((unsigned short)(w3 >> 16)), acc);
+    }
+    for (unsigned int i = vec_elems + lane; i < in_dim; i += TALU_WARP_SIZE) {
+        acc = fmaf(input[i], talu_decode_bf16_u16(row[i]), acc);
+    }
+    return acc;
 }
 
 extern "C" __global__ void talu_matmul_f16_f32(
@@ -111,10 +181,7 @@ extern "C" __global__ void talu_matvec_f16_f32(
     const unsigned int out_idx = blockIdx.x * warps_per_block + warp_id;
     if (out_idx >= out_dim) return;
     const unsigned short* row = weight + (unsigned long long)out_idx * in_dim;
-    float acc = 0.0f;
-    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
-        acc = fmaf(input[i], talu_decode_f16_u16(row[i]), acc);
-    }
+    float acc = talu_dot_f16_u16_vec8(input, row, in_dim, lane);
     acc = talu_warp_sum_f32(acc);
     if (lane == 0) out[out_idx] = acc;
 }
@@ -132,10 +199,7 @@ extern "C" __global__ void talu_matvec_bf16_f32(
     const unsigned int out_idx = blockIdx.x * warps_per_block + warp_id;
     if (out_idx >= out_dim) return;
     const unsigned short* row = weight + (unsigned long long)out_idx * in_dim;
-    float acc = 0.0f;
-    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
-        acc = fmaf(input[i], talu_decode_bf16_u16(row[i]), acc);
-    }
+    float acc = talu_dot_bf16_u16_vec8(input, row, in_dim, lane);
     acc = talu_warp_sum_f32(acc);
     if (lane == 0) out[out_idx] = acc;
 }
@@ -178,10 +242,7 @@ extern "C" __global__ void talu_matvec_qkv_f16_f32(
         out_ptr = v_out + out_row;
     }
 
-    float acc = 0.0f;
-    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
-        acc = fmaf(input[i], talu_decode_f16_u16(row[i]), acc);
-    }
+    float acc = talu_dot_f16_u16_vec8(input, row, in_dim, lane);
     acc = talu_warp_sum_f32(acc);
     if (lane == 0) *out_ptr = acc;
 }
@@ -224,10 +285,7 @@ extern "C" __global__ void talu_matvec_qkv_bf16_f32(
         out_ptr = v_out + out_row;
     }
 
-    float acc = 0.0f;
-    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
-        acc = fmaf(input[i], talu_decode_bf16_u16(row[i]), acc);
-    }
+    float acc = talu_dot_bf16_u16_vec8(input, row, in_dim, lane);
     acc = talu_warp_sum_f32(acc);
     if (lane == 0) *out_ptr = acc;
 }
@@ -262,10 +320,7 @@ extern "C" __global__ void talu_matvec_gate_up_f16_f32(
         out_ptr = up_out + out_row;
     }
 
-    float acc = 0.0f;
-    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
-        acc = fmaf(input[i], talu_decode_f16_u16(row[i]), acc);
-    }
+    float acc = talu_dot_f16_u16_vec8(input, row, in_dim, lane);
     acc = talu_warp_sum_f32(acc);
     if (lane == 0) *out_ptr = acc;
 }
@@ -300,10 +355,7 @@ extern "C" __global__ void talu_matvec_gate_up_bf16_f32(
         out_ptr = up_out + out_row;
     }
 
-    float acc = 0.0f;
-    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
-        acc = fmaf(input[i], talu_decode_bf16_u16(row[i]), acc);
-    }
+    float acc = talu_dot_bf16_u16_vec8(input, row, in_dim, lane);
     acc = talu_warp_sum_f32(acc);
     if (lane == 0) *out_ptr = acc;
 }
@@ -324,13 +376,8 @@ extern "C" __global__ void talu_matvec_gate_up_silu_f16_f32(
 
     const unsigned short* gate_row = gate_weight + (unsigned long long)out_idx * in_dim;
     const unsigned short* up_row = up_weight + (unsigned long long)out_idx * in_dim;
-    float gate_acc = 0.0f;
-    float up_acc = 0.0f;
-    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
-        const float in = input[i];
-        gate_acc = fmaf(in, talu_decode_f16_u16(gate_row[i]), gate_acc);
-        up_acc = fmaf(in, talu_decode_f16_u16(up_row[i]), up_acc);
-    }
+    float gate_acc = talu_dot_f16_u16_vec8(input, gate_row, in_dim, lane);
+    float up_acc = talu_dot_f16_u16_vec8(input, up_row, in_dim, lane);
     gate_acc = talu_warp_sum_f32(gate_acc);
     up_acc = talu_warp_sum_f32(up_acc);
     if (lane == 0) {
@@ -355,13 +402,8 @@ extern "C" __global__ void talu_matvec_gate_up_silu_bf16_f32(
 
     const unsigned short* gate_row = gate_weight + (unsigned long long)out_idx * in_dim;
     const unsigned short* up_row = up_weight + (unsigned long long)out_idx * in_dim;
-    float gate_acc = 0.0f;
-    float up_acc = 0.0f;
-    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
-        const float in = input[i];
-        gate_acc = fmaf(in, talu_decode_bf16_u16(gate_row[i]), gate_acc);
-        up_acc = fmaf(in, talu_decode_bf16_u16(up_row[i]), up_acc);
-    }
+    float gate_acc = talu_dot_bf16_u16_vec8(input, gate_row, in_dim, lane);
+    float up_acc = talu_dot_bf16_u16_vec8(input, up_row, in_dim, lane);
     gate_acc = talu_warp_sum_f32(gate_acc);
     up_acc = talu_warp_sum_f32(up_acc);
     if (lane == 0) {

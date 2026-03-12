@@ -41,7 +41,8 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, d_head);
     try arg_pack.appendScalar(u32, if (dt_bias != null) 1 else 0);
 
-    const block_x: u32 = 256;
+    // Match thread count to head width to avoid idle warps on d_head=64/128.
+    const block_x: u32 = @min(d_head, 256);
     const shared_bytes = std.math.mul(usize, 2 * @as(usize, d_head) + @as(usize, block_x), @sizeOf(f32)) catch return error.InvalidArgument;
     try launch_mod.launch(device, function, .{
         .grid_x = n_v_heads,

@@ -19,7 +19,7 @@ pub const op_name_f16: []const u8 = "matmul_f16_f32";
 pub const op_name_bf16: []const u8 = "matmul_bf16_f32";
 
 const block_x: u32 = 32;
-const block_y: u32 = 8;
+const block_y: u32 = 24;
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,
