@@ -5554,8 +5554,6 @@ pub const CudaBackend = struct {
             const a_bytes = beta_bytes;
 
             var qkv_dev = try bufferSlice(&proj_row_dev, 0, qkv_bytes);
-            var query_dev = try bufferSlice(&qkv_dev, 0, std.math.mul(usize, qk_inner, @sizeOf(f32)) catch return error.InvalidArgument);
-            var key_dev = try bufferSlice(&qkv_dev, std.math.mul(usize, qk_inner, @sizeOf(f32)) catch return error.InvalidArgument, std.math.mul(usize, qk_inner, @sizeOf(f32)) catch return error.InvalidArgument);
             try compute.cuda.gated_delta_conv.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
@@ -5598,16 +5596,6 @@ pub const CudaBackend = struct {
                 &qkv_dev,
                 @intCast(qkv_len),
             );
-            try compute.cuda.gated_delta_qk_norm.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.gated_delta_qk_norm_function orelse return error.CudaKernelUnavailable,
-                &query_dev,
-                &key_dev,
-                @intCast(n_qk_heads),
-                @intCast(d_head),
-            );
-
             var z_dev = try bufferSlice(&proj_row_dev, qkv_bytes, z_bytes);
             var beta_dev = try bufferSlice(&proj_row_dev, qkv_bytes + z_bytes, beta_bytes);
             var a_dev = try bufferSlice(&proj_row_dev, qkv_bytes + z_bytes + beta_bytes, a_bytes);
