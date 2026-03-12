@@ -6,7 +6,7 @@ import { renderEmptyState } from "../../render/common.ts";
 import { getRepoDom } from "./dom.ts";
 import { repoState } from "./state.ts";
 import { addProvider, removeProvider, updateProvider, testProvider } from "./providers-data.ts";
-import { addChatModel, browseProviderModels, browseLocalModels } from "./chat-models-data.ts";
+import { addChatModel, browseProviderModels } from "./chat-models-data.ts";
 import { renderChatModels } from "./chat-models-render.ts";
 import { syncRepoTabs, updateRepoToolbar } from "./render.ts";
 import { loadModels } from "./data.ts";
@@ -72,10 +72,6 @@ function buildLocalRow(): HTMLElement {
 
   const actions = el("div", "repo-provider-row-actions");
 
-  const browseBtn = el("button", "btn btn-ghost btn-sm", "Browse");
-  browseBtn.dataset["action"] = "browse";
-  actions.appendChild(browseBtn);
-
   const manageBtn = el("button", "btn btn-ghost btn-sm", "Manage");
   manageBtn.dataset["action"] = "manage-local";
   actions.appendChild(manageBtn);
@@ -83,13 +79,8 @@ function buildLocalRow(): HTMLElement {
   top.appendChild(actions);
   row.appendChild(top);
 
-  const meta = el("div", "repo-provider-row-meta", "Cached managed models");
+  const meta = el("div", "repo-provider-row-meta", "Pin models to add them to chat");
   row.appendChild(meta);
-
-  // Browse expansion (hidden).
-  const browseList = el("div", "repo-browse-list hidden");
-  browseList.dataset["browseFor"] = "local";
-  row.appendChild(browseList);
 
   return row;
 }
@@ -289,8 +280,7 @@ export function wireProviderEvents(container: HTMLElement): void {
       browseList.innerHTML = "";
       browseList.appendChild(el("div", "repo-browse-loading", "Loading\u2026"));
 
-      const fetchModels = name === "local" ? browseLocalModels() : browseProviderModels(name);
-      fetchModels.then((models) => {
+      browseProviderModels(name).then((models) => {
         renderBrowseModels(browseList, name, models);
       });
       return;

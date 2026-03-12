@@ -411,33 +411,65 @@
   flex-direction: column;
 }
 
-.repo-chat-model-item {
+/* ── Chat model family rows ──────────────────────────────────────────── */
+
+.repo-chat-model-family {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  position: relative;
+  background: var(--bg);
+  user-select: none;
+}
+
+.repo-chat-model-family.dragging {
+  z-index: 10;
+  opacity: 0.95;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.repo-chat-model-family.displaced {
+  transition: transform 150ms ease;
+}
+
+.repo-chat-model-top {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--border);
 }
 
-.repo-chat-model-move {
+.repo-chat-model-grip {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
-  height: 20px;
-  font-size: 10px;
-  padding: 0;
-  border: none;
-  background: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  border-radius: 3px;
+  width: 18px;
+  height: 18px;
   flex-shrink: 0;
+  color: var(--text-muted);
+  opacity: 0.4;
+  cursor: grab;
+  touch-action: none;
 }
 
-.repo-chat-model-move:hover {
-  color: var(--text);
+.repo-chat-model-grip:active {
+  cursor: grabbing;
+}
+
+.repo-chat-model-family:hover .repo-chat-model-grip {
+  opacity: 0.8;
+}
+
+.repo-chat-model-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  font-family: var(--font-mono);
   background: var(--bg-code);
+  color: var(--text-muted);
+  flex-shrink: 0;
 }
 
 .repo-chat-model-name {
@@ -449,19 +481,6 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
-}
-
-.repo-chat-model-provider {
-  display: inline-block;
-  font-size: 10px;
-  font-weight: 500;
-  padding: 1px 6px;
-  border-radius: 3px;
-  text-transform: uppercase;
-  letter-spacing: 0.02em;
-  background: var(--bg-code);
-  color: var(--text-muted);
-  flex-shrink: 0;
 }
 
 .repo-chat-model-remove {
@@ -476,11 +495,54 @@
   cursor: pointer;
   border-radius: 4px;
   flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 100ms ease;
+}
+
+.repo-chat-model-family:hover .repo-chat-model-remove {
+  opacity: 1;
 }
 
 .repo-chat-model-remove:hover {
   color: var(--danger, #e55);
   background: var(--bg-hover);
+}
+
+/* ── Variant pills ──────────────────────────────────────────────────── */
+
+.repo-chat-model-variants {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 0 2px 26px; /* align under name (grip width + gap) */
+}
+
+.repo-chat-model-variant {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 500;
+  font-family: var(--font-mono);
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-code);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease, border-color 100ms ease;
+  white-space: nowrap;
+}
+
+.repo-chat-model-variant:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.repo-chat-model-variant.active {
+  background: var(--accent, #4a9eff);
+  color: #fff;
+  border-color: var(--accent, #4a9eff);
+  font-weight: 600;
 }
 
 .repo-chat-models-divider {

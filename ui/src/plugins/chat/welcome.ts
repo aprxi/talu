@@ -68,6 +68,13 @@ export function startNewConversation(projectId?: string | null): void {
   clearAttachments();
   dom.welcomeInput.value = "";
   dom.welcomeInput.style.height = "auto";
+  // Reset inline advanced options.
+  dom.welcomeAdvanced.classList.add("hidden");
+  dom.welcomeSettings.classList.remove("active");
+  dom.welcomeTemperature.value = "";
+  dom.welcomeTopP.value = "";
+  dom.welcomeTopK.value = "";
+  dom.welcomeMaxTokens.value = "";
   dom.welcomeInput.focus();
 }
 

@@ -103,7 +103,7 @@ export function populateModelSelect(sel: HTMLSelectElement, models: ModelEntry[]
   for (const m of models) {
     const sep = m.id.indexOf("::");
     const group = sep >= 0 ? m.id.substring(0, sep) : "Local";
-    const label = sep >= 0 ? m.id.substring(sep + 2) : m.id;
+    const label = sep >= 0 ? m.id.substring(sep + 2) : (m.display_name ?? m.id);
     if (!groups.has(group)) groups.set(group, []);
     groups.get(group)!.push({ value: m.id, label });
   }
@@ -134,6 +134,10 @@ export function populateModelSelect(sel: HTMLSelectElement, models: ModelEntry[]
 
   if (selected && models.some((m) => m.id === selected)) {
     sel.value = selected;
+  } else if (selected) {
+    // Selected might be a variant of a family entry — select the family.
+    const familyEntry = models.find((m) => m.variants?.some((v) => v.id === selected));
+    sel.value = familyEntry ? familyEntry.id : (models[0]?.id ?? "");
   } else if (models.length > 0 && models[0]) {
     sel.value = models[0].id;
   }
