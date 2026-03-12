@@ -9,7 +9,13 @@ const device_mod = @import("device.zig");
 const cublas_status_success: c_int = 0;
 const cublas_status_alloc_failed: c_int = 3;
 const cublas_op_n: c_int = 0;
+const cublas_op_t: c_int = 1;
+const cublas_gemm_default: c_int = -1;
 const cublas_pedantic_math: c_int = 2;
+const cublas_compute_32f_pedantic: c_int = 69;
+const cuda_r_32f: c_int = 0;
+const cuda_r_16f: c_int = 2;
+const cuda_r_16bf: c_int = 14;
 
 const CublasCreateFn = *const fn (*?*anyopaque) callconv(.c) c_int;
 const CublasDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
@@ -31,6 +37,27 @@ const CublasSgemmFn = *const fn (
     [*]f32,
     c_int,
 ) callconv(.c) c_int;
+const CublasGemmExFn = *const fn (
+    ?*anyopaque,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    ?*const anyopaque,
+    ?*const anyopaque,
+    c_int,
+    c_int,
+    ?*const anyopaque,
+    c_int,
+    c_int,
+    ?*const anyopaque,
+    ?*anyopaque,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+) callconv(.c) c_int;
 
 const CublasApi = struct {
     cublas_create: CublasCreateFn,
@@ -38,9 +65,15 @@ const CublasApi = struct {
     cublas_set_math_mode: CublasSetMathModeFn,
     cublas_set_stream: CublasSetStreamFn,
     cublas_sgemm: CublasSgemmFn,
+    cublas_gemm_ex: CublasGemmExFn,
 };
 
 pub const Blas = struct {
+    pub const U16Payload = enum {
+        f16,
+        bf16,
+    };
+
     lib: std.DynLib,
     api: CublasApi,
     handle: ?*anyopaque,
@@ -129,6 +162,72 @@ pub const Blas = struct {
         if (status == cublas_status_alloc_failed) return error.OutOfMemory;
         if (status != cublas_status_success) return error.CublasMatmulFailed;
     }
+
+    /// Mixed-precision matrix multiplication:
+    /// C = input_f32 @ weight_u16^T
+    /// input_f32: [rows x in_dim] row-major f32
+    /// weight_u16: [out_dim x in_dim] row-major u16 payload (f16/bf16)
+    /// out_f32: [rows x out_dim] row-major f32
+    pub fn matmulU16F32(
+        self: *Blas,
+        device: *device_mod.Device,
+        input_f32: *const device_mod.Buffer,
+        rows: usize,
+        in_dim: usize,
+        weight_u16: *const device_mod.Buffer,
+        out_dim: usize,
+        out_f32: *device_mod.Buffer,
+        payload: U16Payload,
+    ) !void {
+        if (self.handle == null) return error.CublasHandleInvalid;
+        if (!dimsFitCublas(rows, out_dim, in_dim)) return error.InvalidArgument;
+        if (input_f32.size < rows * in_dim * @sizeOf(f32)) return error.InvalidArgument;
+        if (weight_u16.size < out_dim * in_dim * @sizeOf(u16)) return error.InvalidArgument;
+        if (out_f32.size < rows * out_dim * @sizeOf(f32)) return error.InvalidArgument;
+
+        try device.makeCurrent();
+        if (self.api.cublas_set_stream(self.handle, device.getLaunchStream()) != cublas_status_success) {
+            return error.CublasStreamSetFailed;
+        }
+
+        const alpha: f32 = 1.0;
+        const beta: f32 = 0.0;
+        const weight_type: c_int = switch (payload) {
+            .f16 => cuda_r_16f,
+            .bf16 => cuda_r_16bf,
+        };
+
+        const weight_dev: ?*const anyopaque = @ptrFromInt(weight_u16.pointer);
+        const input_dev: ?*const anyopaque = @ptrFromInt(input_f32.pointer);
+        const out_dev: ?*anyopaque = @ptrFromInt(out_f32.pointer);
+
+        // Row-major C = A @ W^T is computed as column-major C^T = W @ A^T.
+        // W row-major [out_dim x in_dim] is column-major [in_dim x out_dim], so
+        // use transa=T to interpret it as [out_dim x in_dim].
+        const status = self.api.cublas_gemm_ex(
+            self.handle,
+            cublas_op_t, // W^T view -> [out_dim x in_dim]
+            cublas_op_n, // A^T view is already column-major [in_dim x rows]
+            @intCast(out_dim),
+            @intCast(rows),
+            @intCast(in_dim),
+            @ptrCast(&alpha),
+            weight_dev,
+            weight_type,
+            @intCast(in_dim),
+            input_dev,
+            cuda_r_32f,
+            @intCast(in_dim),
+            @ptrCast(&beta),
+            out_dev,
+            cuda_r_32f,
+            @intCast(out_dim),
+            cublas_compute_32f_pedantic,
+            cublas_gemm_default,
+        );
+        if (status == cublas_status_alloc_failed) return error.OutOfMemory;
+        if (status != cublas_status_success) return error.CublasMatmulFailed;
+    }
 };
 
 fn dimsFitCublas(m: usize, n: usize, k: usize) bool {
@@ -165,6 +264,7 @@ fn loadCublasApi(lib: *std.DynLib) !CublasApi {
         .cublas_set_math_mode = try lookupRequiredAny(CublasSetMathModeFn, lib, &.{ "cublasSetMathMode_v2", "cublasSetMathMode" }),
         .cublas_set_stream = try lookupRequiredAny(CublasSetStreamFn, lib, &.{ "cublasSetStream_v2", "cublasSetStream" }),
         .cublas_sgemm = try lookupRequired(CublasSgemmFn, lib, "cublasSgemm_v2"),
+        .cublas_gemm_ex = try lookupRequired(CublasGemmExFn, lib, "cublasGemmEx"),
     };
 }
 

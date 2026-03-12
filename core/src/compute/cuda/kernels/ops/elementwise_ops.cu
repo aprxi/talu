@@ -132,3 +132,49 @@ extern "C" __global__ void talu_embedding_lookup_u16_f32(
     }
     out[index] = value * multiplier;
 }
+
+extern "C" __global__ void talu_embedding_lookup_u16_rows_f32(
+    float* out,
+    const unsigned short* embeddings,
+    const unsigned int* tokens,
+    unsigned int rows,
+    unsigned int dim0,
+    unsigned int dim1,
+    unsigned int hidden_dim,
+    unsigned int layout_tag,
+    unsigned int dtype_tag,
+    float multiplier
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = rows * hidden_dim;
+    if (index >= total) return;
+
+    const unsigned int row = index / hidden_dim;
+    const unsigned int col = index - row * hidden_dim;
+    if (row >= rows) return;
+    const unsigned int token = tokens[row];
+
+    unsigned long long src_index = 0;
+    if (layout_tag == 0) {
+        // Layout: [vocab, hidden]
+        if (token >= dim0 || col >= dim1) return;
+        src_index = (unsigned long long)token * dim1 + col;
+    } else if (layout_tag == 1) {
+        // Layout: [hidden, vocab]
+        if (token >= dim1 || col >= dim0) return;
+        src_index = (unsigned long long)col * dim1 + token;
+    } else {
+        return;
+    }
+
+    const unsigned short raw = embeddings[src_index];
+    float value = 0.0f;
+    if (dtype_tag == 0) {
+        value = __half2float(__ushort_as_half(raw));
+    } else if (dtype_tag == 1) {
+        value = talu_bf16_to_f32(raw);
+    } else {
+        return;
+    }
+    out[index] = value * multiplier;
+}

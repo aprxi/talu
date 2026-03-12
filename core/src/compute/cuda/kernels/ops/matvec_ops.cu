@@ -1,4 +1,5 @@
 static constexpr unsigned int TALU_WARP_SIZE = 32;
+static constexpr unsigned int TALU_MATMUL_TILE_K = 256;
 
 static __device__ __forceinline__ float talu_warp_sum_f32(float value) {
     value += __shfl_down_sync(0xFFFFFFFFu, value, 16);
@@ -26,9 +27,24 @@ extern "C" __global__ void talu_matmul_f16_f32(
 
     const float* input_row = input + (unsigned long long)row_idx * in_dim;
     const unsigned short* weight_row = weight + (unsigned long long)out_idx * in_dim;
+    __shared__ float input_tile[TALU_MATMUL_TILE_K];
+    const unsigned int threads_per_block = TALU_WARP_SIZE * warps_per_block;
+    const unsigned int linear_tid = warp_id * TALU_WARP_SIZE + lane;
     float acc = 0.0f;
-    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
-        acc = fmaf(input_row[i], talu_decode_f16_u16(weight_row[i]), acc);
+
+    for (unsigned int base = 0; base < in_dim; base += TALU_MATMUL_TILE_K) {
+        for (unsigned int t = linear_tid; t < TALU_MATMUL_TILE_K; t += threads_per_block) {
+            const unsigned int idx = base + t;
+            input_tile[t] = (idx < in_dim) ? input_row[idx] : 0.0f;
+        }
+        __syncthreads();
+
+        const unsigned int tile_elems = min(TALU_MATMUL_TILE_K, in_dim - base);
+        for (unsigned int i = lane; i < tile_elems; i += TALU_WARP_SIZE) {
+            const unsigned int idx = base + i;
+            acc = fmaf(input_tile[i], talu_decode_f16_u16(weight_row[idx]), acc);
+        }
+        __syncthreads();
     }
     acc = talu_warp_sum_f32(acc);
     if (lane == 0) {
@@ -53,9 +69,24 @@ extern "C" __global__ void talu_matmul_bf16_f32(
 
     const float* input_row = input + (unsigned long long)row_idx * in_dim;
     const unsigned short* weight_row = weight + (unsigned long long)out_idx * in_dim;
+    __shared__ float input_tile[TALU_MATMUL_TILE_K];
+    const unsigned int threads_per_block = TALU_WARP_SIZE * warps_per_block;
+    const unsigned int linear_tid = warp_id * TALU_WARP_SIZE + lane;
     float acc = 0.0f;
-    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
-        acc = fmaf(input_row[i], talu_decode_bf16_u16(weight_row[i]), acc);
+
+    for (unsigned int base = 0; base < in_dim; base += TALU_MATMUL_TILE_K) {
+        for (unsigned int t = linear_tid; t < TALU_MATMUL_TILE_K; t += threads_per_block) {
+            const unsigned int idx = base + t;
+            input_tile[t] = (idx < in_dim) ? input_row[idx] : 0.0f;
+        }
+        __syncthreads();
+
+        const unsigned int tile_elems = min(TALU_MATMUL_TILE_K, in_dim - base);
+        for (unsigned int i = lane; i < tile_elems; i += TALU_WARP_SIZE) {
+            const unsigned int idx = base + i;
+            acc = fmaf(input_tile[i], talu_decode_bf16_u16(weight_row[idx]), acc);
+        }
+        __syncthreads();
     }
     acc = talu_warp_sum_f32(acc);
     if (lane == 0) {
@@ -271,4 +302,66 @@ extern "C" __global__ void talu_matvec_gate_up_bf16_f32(
     }
     acc = talu_warp_sum_f32(acc);
     if (lane == 0) *out_ptr = acc;
+}
+
+extern "C" __global__ void talu_matvec_gate_up_silu_f16_f32(
+    const float* input,
+    const unsigned short* gate_weight,
+    const unsigned short* up_weight,
+    float* out,
+    unsigned int out_dim,
+    unsigned int in_dim
+) {
+    const unsigned int lane = threadIdx.x & (TALU_WARP_SIZE - 1u);
+    const unsigned int warp_id = threadIdx.x / TALU_WARP_SIZE;
+    const unsigned int warps_per_block = blockDim.x / TALU_WARP_SIZE;
+    const unsigned int out_idx = blockIdx.x * warps_per_block + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const unsigned short* gate_row = gate_weight + (unsigned long long)out_idx * in_dim;
+    const unsigned short* up_row = up_weight + (unsigned long long)out_idx * in_dim;
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
+        const float in = input[i];
+        gate_acc = fmaf(in, talu_decode_f16_u16(gate_row[i]), gate_acc);
+        up_acc = fmaf(in, talu_decode_f16_u16(up_row[i]), up_acc);
+    }
+    gate_acc = talu_warp_sum_f32(gate_acc);
+    up_acc = talu_warp_sum_f32(up_acc);
+    if (lane == 0) {
+        const float sigma = 1.0f / (1.0f + expf(-gate_acc));
+        out[out_idx] = gate_acc * sigma * up_acc;
+    }
+}
+
+extern "C" __global__ void talu_matvec_gate_up_silu_bf16_f32(
+    const float* input,
+    const unsigned short* gate_weight,
+    const unsigned short* up_weight,
+    float* out,
+    unsigned int out_dim,
+    unsigned int in_dim
+) {
+    const unsigned int lane = threadIdx.x & (TALU_WARP_SIZE - 1u);
+    const unsigned int warp_id = threadIdx.x / TALU_WARP_SIZE;
+    const unsigned int warps_per_block = blockDim.x / TALU_WARP_SIZE;
+    const unsigned int out_idx = blockIdx.x * warps_per_block + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const unsigned short* gate_row = gate_weight + (unsigned long long)out_idx * in_dim;
+    const unsigned short* up_row = up_weight + (unsigned long long)out_idx * in_dim;
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
+        const float in = input[i];
+        gate_acc = fmaf(in, talu_decode_bf16_u16(gate_row[i]), gate_acc);
+        up_acc = fmaf(in, talu_decode_bf16_u16(up_row[i]), up_acc);
+    }
+    gate_acc = talu_warp_sum_f32(gate_acc);
+    up_acc = talu_warp_sum_f32(up_acc);
+    if (lane == 0) {
+        const float sigma = 1.0f / (1.0f + expf(-gate_acc));
+        out[out_idx] = gate_acc * sigma * up_acc;
+    }
 }

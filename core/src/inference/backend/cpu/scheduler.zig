@@ -907,6 +907,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 backend_supports_greedy_streaming and
                 self.backend.supportsSchedulerBackendDecodeStreamingRoute();
             if (can_use_greedy_streaming) {
+                log.debug("inference", "Scheduler decode route selected", .{
+                    .route = "greedy_streaming",
+                    .strategy = @tagName(effective_sampling.strategy),
+                    .top_k = effective_sampling.top_k,
+                    .temperature = effective_sampling.temperature,
+                    .has_callback = @as(u8, @intFromBool(submit_config.callback != null)),
+                }, @src());
                 return self.generateSyncGreedyStreamingRoute(prompt_tokens, max_tokens, &submit_config, &effective_sampling);
             }
             const can_use_top_k_candidate_route = prompt_tokens.len > 0 and
@@ -918,8 +925,23 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 backend_supports_top_k_candidates and
                 self.backend.supportsSchedulerBackendTopKDecodeRoute(&effective_sampling);
             if (can_use_top_k_candidate_route) {
+                log.debug("inference", "Scheduler decode route selected", .{
+                    .route = "topk_candidate",
+                    .strategy = @tagName(effective_sampling.strategy),
+                    .top_k = effective_sampling.top_k,
+                    .temperature = effective_sampling.temperature,
+                    .has_callback = @as(u8, @intFromBool(submit_config.callback != null)),
+                }, @src());
                 return self.generateSyncTopKCandidateRoute(prompt_tokens, max_tokens, &submit_config, &effective_sampling);
             }
+
+            log.debug("inference", "Scheduler decode route selected", .{
+                .route = "queued",
+                .strategy = @tagName(effective_sampling.strategy),
+                .top_k = effective_sampling.top_k,
+                .temperature = effective_sampling.temperature,
+                .has_callback = @as(u8, @intFromBool(submit_config.callback != null)),
+            }, @src());
 
             // Always use the standard queued scheduler path.
             const request_id = try self.submit(prompt_tokens, max_tokens, options);
@@ -1079,6 +1101,41 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const generated_tail = try self.allocator.alloc(u32, remaining_token_budget);
             defer self.allocator.free(generated_tail);
 
+            const StreamingDecodeCallback = struct {
+                callback: *const fn (u64, u32, bool, ?*anyopaque) void,
+                callback_data: ?*anyopaque,
+                eos_token_ids: []const u32,
+                remaining_budget: usize,
+                emitted_count: usize = 0,
+
+                fn isEosToken(ctx: *const @This(), token: u32) bool {
+                    for (ctx.eos_token_ids) |eos_id| {
+                        if (token == eos_id) return true;
+                    }
+                    return false;
+                }
+
+                fn onToken(token: u32, user_data: ?*anyopaque) void {
+                    const ctx: *@This() = @ptrCast(@alignCast(user_data.?));
+                    ctx.emitted_count += 1;
+                    const is_final = ctx.isEosToken(token) or ctx.emitted_count >= ctx.remaining_budget;
+                    ctx.callback(0, token, is_final, ctx.callback_data);
+                }
+            };
+            var decode_streaming_callback_fn: ?*const fn (u32, ?*anyopaque) void = null;
+            var decode_streaming_callback_data: ?*anyopaque = null;
+            var streaming_decode_callback: StreamingDecodeCallback = undefined;
+            if (submit_config.callback) |cb| {
+                streaming_decode_callback = .{
+                    .callback = cb,
+                    .callback_data = submit_config.callback_data,
+                    .eos_token_ids = eos_token_ids,
+                    .remaining_budget = remaining_token_budget,
+                };
+                decode_streaming_callback_fn = StreamingDecodeCallback.onToken;
+                decode_streaming_callback_data = &streaming_decode_callback;
+            }
+
             var decode_timer = std.time.Timer.start() catch unreachable;
             if (generationShouldStop(submit_config.stop_flag)) {
                 return .{
@@ -1095,16 +1152,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 remaining_token_budget,
                 eos_token_ids,
                 generated_tail,
-                null,
-                null,
+                decode_streaming_callback_fn,
+                decode_streaming_callback_data,
             );
             try generated.appendSlice(self.allocator, generated_tail[0..tail_count]);
-
-            if (submit_config.callback) |cb| {
-                for (generated_tail[0..tail_count], 0..) |token_id, idx| {
-                    cb(0, token_id, idx + 1 == tail_count, submit_config.callback_data);
-                }
-            }
 
             const decode_ns = decode_timer.read();
             const finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
@@ -2801,11 +2852,10 @@ const MockStreamingBackend = struct {
         callback_data: ?*anyopaque,
     ) !usize {
         _ = eos_token_ids;
-        _ = callback;
-        _ = callback_data;
         self.decode_streaming_calls += 1;
         for (output_tokens[0..max_tokens], 0..) |*out_token, idx| {
             out_token.* = first_token + @as(u32, @intCast(start_position + idx));
+            if (callback) |cb| cb(out_token.*, callback_data);
         }
         return max_tokens;
     }
@@ -2877,6 +2927,48 @@ test "generateSync uses backend decode-streaming route for greedy sampling" {
     try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
     try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
     try std.testing.expectEqualSlices(u32, &.{ 42, 44, 45, 46 }, result.tokens);
+}
+
+test "generateSync callback uses backend decode-streaming route for greedy sampling" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .greedy,
+        },
+    });
+    defer scheduler.deinit();
+
+    const CallbackData = struct {
+        token_count: usize = 0,
+        final_count: usize = 0,
+    };
+    var callback_data = CallbackData{};
+
+    const callback = struct {
+        fn cb(_: u64, _: u32, is_final: bool, user_data: ?*anyopaque) void {
+            const data: *CallbackData = @ptrCast(@alignCast(user_data.?));
+            data.token_count += 1;
+            if (is_final) data.final_count += 1;
+        }
+    }.cb;
+
+    var result = try scheduler.generateSync(&[_]u32{ 11, 12 }, 4, .{
+        .sampling = .{
+            .strategy = .greedy,
+        },
+        .callback = callback,
+        .callback_data = &callback_data,
+        .eos_token_ids = &[_]u32{9999},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), backend.decode_streaming_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
+    try std.testing.expectEqual(@as(usize, 4), callback_data.token_count);
+    try std.testing.expectEqual(@as(usize, 1), callback_data.final_count);
 }
 
 test "generateSync uses decodeBatch route with vision input" {

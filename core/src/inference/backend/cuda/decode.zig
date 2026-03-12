@@ -139,6 +139,12 @@ pub fn decodeStreaming(
     var generated: usize = 0;
     var position = self.slot_position;
     const budget = @min(max_tokens, output_tokens.len);
+    if (comptime @hasDecl(SelfType, "ensureKvCapacity")) {
+        if (budget > 0) {
+            const required_capacity = std.math.add(usize, position, budget) catch return error.InvalidArgument;
+            try self.ensureKvCapacity(required_capacity);
+        }
+    }
     while (generated < budget) : (generated += 1) {
         const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_delta);
         try self.computeGpuPrototypeLogitsWithLayerLimit(
@@ -149,7 +155,7 @@ pub fn decodeStreaming(
             self.block_runtime.blocks.len,
             true,
             false,
-            true,
+            false,
             1,
             position,
             null,
