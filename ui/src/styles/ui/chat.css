@@ -641,6 +641,16 @@
   color: var(--text);
 }
 
+/* Real-time tok/s indicator during streaming */
+.stream-speed {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  padding: 2px 0;
+  opacity: 0.6;
+}
+.stream-speed-final { opacity: 0.8; }
+
 .assistant-msg-actions {
   display: flex;
   align-items: center;
@@ -788,6 +798,30 @@
 }
 
 /* Events panel (right side) */
+/* HTTP curl section */
+.chat-http-controls {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 0.25rem;
+}
+
+.chat-http-curl {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-code);
+  padding: 0.5rem;
+  max-height: 10rem;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+  user-select: all;
+}
+
 .chat-events-controls {
   display: flex;
   align-items: center;

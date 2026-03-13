@@ -743,9 +743,11 @@ pub const LocalEngine = struct {
         else
             null;
 
-        // Install prefill progress callback (cleared after generation)
+        // Install prefill progress callback and stop flag (cleared after generation)
         self.backend.setPrefillProgress(opts.prefill_progress_fn, opts.prefill_progress_data);
         defer self.backend.setPrefillProgress(null, null);
+        self.backend.setStopFlag(opts.stop_flag);
+        defer self.backend.setStopFlag(null);
 
         log.debug("router", "Generation params", .{
             .max_tokens = max_tokens,

@@ -7,6 +7,7 @@ import { setInputEnabled, showInputBar, hideWelcome } from "./welcome.ts";
 import { appendUserMessage, appendAssistantPlaceholder, addAssistantActionButtons, appendStoppedIndicator, scrollToBottom, removeGeneratingIndicator, removeProgressBar } from "./messages.ts";
 import { readSSEStream } from "./streaming.ts";
 import { clearEventsLog, startResponseEventsStream, stopResponseEventsStream } from "./events.ts";
+import { getChatPanelDom } from "./chat-panel-dom.ts";
 import { ensureChatHeader, renderChatView } from "./selection.ts";
 import {
   clearAttachments,
@@ -190,6 +191,12 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       return;
     }
     requestBody = hookResult as CreateResponseRequest;
+
+    // Populate the HTTP panel with the equivalent curl command.
+    const curlPayload = JSON.stringify({ ...requestBody, stream: true, store: true });
+    const curlCmd = `curl -s -N ${location.origin}/v1/responses \\\n  -H 'Content-Type: application/json' \\\n  -d '${curlPayload.replace(/'/g, "'\\''")}'`;
+    getChatPanelDom().panelHttpCurl.textContent = curlCmd;
+
     const resp = await api.createResponse(requestBody, chatState.streamAbort.signal);
 
     if (!resp.ok) {

@@ -312,7 +312,7 @@ export function createPluginContext(
     },
     format: new FormatAccessImpl(),
     clipboard: {
-      writeText: (text) => { requirePermission("clipboard"); return navigator.clipboard.writeText(text); },
+      writeText: (text) => navigator.clipboard.writeText(text),
     },
     download: {
       save: (blob, filename) => {

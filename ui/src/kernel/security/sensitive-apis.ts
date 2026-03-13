@@ -21,24 +21,8 @@ export function installSensitiveApiInterception(): Disposable {
   const cleanups: (() => void)[] = [];
 
   // --- Clipboard ---
-  if (navigator.clipboard) {
-    const originalWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
-
-    navigator.clipboard.writeText = async function (data: string): Promise<void> {
-      // Built-in Kernel operations bypass the dialog by calling originalWriteText directly.
-      // For plugin code, show a confirm.
-      const preview = data.length > 200 ? data.slice(0, 200) + "..." : data;
-      const allowed = window.confirm(
-        `A plugin wants to copy data to your clipboard.\n\nPreview: "${preview}"\n\nAllow?`,
-      );
-      if (!allowed) throw new DOMException("User denied clipboard write", "NotAllowedError");
-      return originalWriteText(data);
-    };
-
-    cleanups.push(() => {
-      navigator.clipboard.writeText = originalWriteText;
-    });
-  }
+  // No interception — clipboard writes are not a meaningful exfil risk
+  // in a local-first app, and the confirm dialog disrupts normal copy UX.
 
   // --- Downloads (capture-phase click handler for <a download>) ---
   const downloadHandler = (e: MouseEvent) => {

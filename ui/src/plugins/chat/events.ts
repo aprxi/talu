@@ -126,34 +126,41 @@ async function runResponseEventsStream(
   let buffer = "";
   let currentEvent = "";
 
-  while (!signal.aborted) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try {
+    while (!signal.aborted) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
 
-    for (const raw of lines) {
-      const line = raw.trimEnd();
-      if (line.startsWith(":")) continue;
-      if (line.startsWith("event: ")) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith("data: ")) {
-        const data = line.slice(6);
-        if (currentEvent === "event") {
-          try {
-            const envelope = JSON.parse(data) as EventEnvelope;
-            handleEventEnvelope(envelope, isActive);
-          } catch {
-            // Ignore malformed event payloads.
+      for (const raw of lines) {
+        const line = raw.trimEnd();
+        if (line.startsWith(":")) continue;
+        if (line.startsWith("event: ")) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith("data: ")) {
+          const data = line.slice(6);
+          if (currentEvent === "event") {
+            try {
+              const envelope = JSON.parse(data) as EventEnvelope;
+              handleEventEnvelope(envelope, isActive);
+            } catch {
+              // Ignore malformed event payloads.
+            }
+          } else {
+            handleNonEnvelopeEvent(currentEvent, data);
           }
-        } else {
-          handleNonEnvelopeEvent(currentEvent, data);
+        } else if (line === "") {
+          currentEvent = "";
         }
-      } else if (line === "") {
-        currentEvent = "";
       }
+    }
+  } catch (err) {
+    // AbortError is expected when stopResponseEventsStream() cancels the stream.
+    if (!(err instanceof DOMException && err.name === "AbortError")) {
+      appendEventsLine(`events stream error: ${err instanceof Error ? err.message : String(err)}`, "error");
     }
   }
 }

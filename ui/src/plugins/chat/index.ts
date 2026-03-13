@@ -85,6 +85,11 @@ export const chatPlugin: PluginDefinition = {
 
     // Register the default text renderer using sanitizedMarkdown.
     // Third-party renderers scoring higher will override this.
+    //
+    // Two-tier rendering for streaming performance:
+    //   Fast path (every rAF): append new delta as raw textContent span — O(delta)
+    //   Slow path (throttled ~150ms): full sanitizedMarkdown re-render — O(N) but ~7/sec
+    //   Final (isFinal=true): clean sanitizedMarkdown + highlightCodeBlocks
     ctx.renderers.register({
       kinds: ["text"],
       canRender(part) {
@@ -94,13 +99,53 @@ export const chatPlugin: PluginDefinition = {
         const text = part.type === "text" ? part.text : "";
         container.innerHTML = sanitizedMarkdown(text);
         highlightCodeBlocks(container);
+
+        // Streaming state for two-tier rendering.
+        // `currentText` is the mutable ref the slow-path timer reads so it
+        // always renders the freshest accumulated text, not a stale capture.
+        let currentText = text;
+        let lastRenderedLen = text.length;
+        let rawTail: HTMLSpanElement | null = null;
+        let slowTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const fullRender = (t: string) => {
+          if (rawTail) { rawTail.remove(); rawTail = null; }
+          container.innerHTML = sanitizedMarkdown(t);
+          lastRenderedLen = t.length;
+        };
+
         return {
           update(p, isFinal) {
             const t = p.type === "text" ? p.text : "";
-            container.innerHTML = sanitizedMarkdown(t);
-            if (isFinal) highlightCodeBlocks(container);
+            currentText = t;
+            if (isFinal) {
+              if (slowTimer) { clearTimeout(slowTimer); slowTimer = null; }
+              fullRender(t);
+              highlightCodeBlocks(container);
+              return;
+            }
+            // Fast path: append only the new delta as raw text.
+            const delta = t.slice(lastRenderedLen);
+            if (delta) {
+              if (!rawTail) {
+                rawTail = document.createElement("span");
+                rawTail.className = "streaming-raw";
+                container.appendChild(rawTail);
+              }
+              rawTail.textContent += delta;
+              lastRenderedLen = t.length;
+            }
+            // Slow path: schedule a full markdown re-render.
+            // Reads `currentText` at fire time so it always has the latest.
+            if (!slowTimer) {
+              slowTimer = setTimeout(() => {
+                slowTimer = null;
+                fullRender(currentText);
+              }, 150);
+            }
           },
           unmount() {
+            if (slowTimer) { clearTimeout(slowTimer); slowTimer = null; }
             container.innerHTML = "";
           },
         };
@@ -147,6 +192,16 @@ export const chatPlugin: PluginDefinition = {
     // Set up all event handlers.
     setupInputEvents();
     setupEventsPanelEvents();
+    // Wire up HTTP panel copy button.
+    const pd = getChatPanelDom();
+    pd.panelHttpCopy.addEventListener("click", () => {
+      const text = pd.panelHttpCurl.textContent ?? "";
+      if (text && text !== "No request yet") {
+        void navigator.clipboard.writeText(text);
+        pd.panelHttpCopy.title = "Copied!";
+        setTimeout(() => { pd.panelHttpCopy.title = "Copy curl"; }, 1500);
+      }
+    });
     setupAttachmentEvents();
     setupTranscriptEvents();
     setupSidebarEvents();

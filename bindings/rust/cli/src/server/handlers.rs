@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -1186,9 +1186,13 @@ async fn stream_response(
         None
     };
 
-    // Create a stop flag for cancellation on client disconnect.
+    // Create a stop flag for cancellation on client disconnect or server shutdown.
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_for_gen = stop_flag.clone();
+    if let Ok(mut flags) = state.active_stop_flags.lock() {
+        flags.retain(|w| w.strong_count() > 0);
+        flags.push(Arc::downgrade(&stop_flag));
+    }
 
     // Prepare input for the blocking task.
     let input_json = input_value
@@ -1474,6 +1478,12 @@ async fn stream_response(
             frequency_penalty: frequency_penalty.unwrap_or(0.0),
             reasoning_effort: reasoning_for_events.effort.clone(),
             reasoning_summary: reasoning_for_events.summary.clone(),
+            coalesce_buf: String::new(),
+            coalesce_event: String::new(),
+            coalesce_start: None,
+            coalesce_text_start: 0,
+            last_tokens_generated: 0,
+            last_elapsed_ns: 0,
         }));
         let ctx_for_complete = ctx.clone();
 
@@ -1637,6 +1647,8 @@ fn run_streaming_generation(
     cfg.tool_choice = tool_choice_json.map(|v| v.to_string());
 
     // Pass the stop flag for cooperative cancellation.
+    // Clone before moving into cfg so the callback can also check it.
+    let stop_flag_for_cb = stop_flag.clone();
     cfg.stop_flag = Some(stop_flag);
 
     cfg.prefill_progress = Some(Box::new(move |completed: usize, total: usize| {
@@ -1656,6 +1668,10 @@ fn run_streaming_generation(
 
     let ctx_clone = ctx.clone();
     let callback: talu::router::StreamCallback = Box::new(move |token| {
+        // Check stop flag before sending — stop immediately on Ctrl+C or client disconnect.
+        if stop_flag_for_cb.load(Ordering::Acquire) {
+            return false;
+        }
         if let Ok(mut guard) = ctx_clone.lock() {
             let _ = guard.send_delta(token);
         }
@@ -1848,12 +1864,39 @@ struct StreamCtx {
     /// Reasoning config echoed in response resources.
     reasoning_effort: Option<String>,
     reasoning_summary: Option<String>,
+
+    // -- Token coalescing: buffer text deltas and flush periodically --
+    /// Accumulated delta text since last flush.
+    coalesce_buf: String,
+    /// SSE event name for the buffered deltas (e.g. "response.output_text.delta"
+    /// or "response.reasoning.delta"). Empty when buffer is empty.
+    coalesce_event: String,
+    /// Timestamp of the first token in the current coalescing window (handler-level).
+    coalesce_start: Option<Instant>,
+    /// Byte offset in `accumulated_text` where the current coalesce window started.
+    /// Used for URL annotation lookback across flush boundaries.
+    coalesce_text_start: usize,
+    /// Cumulative token count from the engine (updated per send_delta call).
+    last_tokens_generated: usize,
+    /// Nanoseconds elapsed since first token from the engine (updated per send_delta call).
+    last_elapsed_ns: u64,
 }
 
 impl StreamCtx {
+    /// Coalescing window for text deltas (ms). Tokens arriving within this
+    /// window are batched into a single SSE event to reduce per-token JSON
+    /// serialization and network overhead.
+    const COALESCE_WINDOW_MS: u64 = 30;
+
     fn send_delta(&mut self, token: &talu::router::StreamToken) -> Result<()> {
         let item_changed = self.cur_item_type != Some(token.item_type);
         let content_changed = item_changed || self.cur_content_type != Some(token.content_type);
+
+        // Flush any coalesced text deltas before closing content/items on
+        // type transition — the buffered deltas belong to the previous type.
+        if (content_changed || item_changed) && !self.coalesce_buf.is_empty() {
+            self.flush_coalesce()?;
+        }
 
         // Close the previous content part and output item on transition.
         if content_changed && self.cur_content_type.is_some() {
@@ -1888,25 +1931,36 @@ impl StreamCtx {
 
         self.accumulated_text.push_str(token.text);
 
-        // Emit the delta event.
+        // Capture engine-level cumulative timing for tok/s.
+        self.last_tokens_generated = token.tokens_generated;
+        self.last_elapsed_ns = token.elapsed_ns;
+
         let event_name =
             talu::responses::stream_delta_event_name(token.item_type, token.content_type);
-        let delta_logprobs = self.delta_logprobs(token);
-        if event_name == "response.output_text.delta" && !delta_logprobs.is_empty() {
-            self.accumulated_logprobs
-                .extend(delta_logprobs.iter().cloned());
+
+        // Coalesce output_text and reasoning deltas: buffer and flush periodically.
+        let coalesceable = event_name == "response.output_text.delta"
+            || event_name == "response.reasoning.delta";
+        if coalesceable {
+            // If the event type changed (e.g. reasoning → text), flush first.
+            if !self.coalesce_buf.is_empty() && self.coalesce_event != event_name {
+                self.flush_coalesce()?;
+            }
+            if self.coalesce_buf.is_empty() {
+                self.coalesce_start = Some(Instant::now());
+                self.coalesce_event.clear();
+                self.coalesce_event.push_str(event_name);
+                self.coalesce_text_start = self.accumulated_text.len().saturating_sub(token.text.len());
+            }
+            self.coalesce_buf.push_str(token.text);
+            if self.coalesce_start.map_or(false, |t| t.elapsed().as_millis() as u64 >= Self::COALESCE_WINDOW_MS) {
+                self.flush_coalesce()?;
+            }
+            return Ok(());
         }
+
+        // Non-coalesceable deltas: emit immediately via json! (these are infrequent).
         let payload = match event_name {
-            "response.output_text.delta" => json!({
-                "type": event_name,
-                "sequence_number": self.seq,
-                "item_id": self.cur_item_id,
-                "output_index": self.output_index,
-                "content_index": self.content_index,
-                "delta": token.text,
-                "logprobs": delta_logprobs,
-                "obfuscation": ""
-            }),
             "response.function_call_arguments.delta" => json!({
                 "type": event_name,
                 "sequence_number": self.seq,
@@ -1954,13 +2008,93 @@ impl StreamCtx {
         };
         self.seq += 1;
 
-        // Detect client disconnect: if send fails, the client has disconnected.
-        // Signal the stop flag to halt generation gracefully.
         if send_event(&self.tx, event_name, payload).is_err() {
             self.stop_flag.store(true, Ordering::Release);
             return Err(anyhow!("client disconnected"));
         }
         self.emit_output_text_annotations(token)?;
+        Ok(())
+    }
+
+    /// Flush the coalesced delta buffer as a single SSE event.
+    /// Uses pre-formatted SSE strings to avoid `json!` / `serde_json::Value`
+    /// tree allocation on the hot path.
+    fn flush_coalesce(&mut self) -> Result<()> {
+        if self.coalesce_buf.is_empty() {
+            return Ok(());
+        }
+        // JSON-escape only the delta text; all other fields are numeric or
+        // known-safe alphanumeric identifiers.
+        let delta_json = serde_json::to_string(&self.coalesce_buf)?;
+        let elapsed_ms = self.last_elapsed_ns / 1_000_000;
+        let is_output_text = self.coalesce_event == "response.output_text.delta";
+        let formatted = if is_output_text {
+            format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":{},\"item_id\":\"{}\",\"output_index\":{},\"content_index\":{},\"delta\":{},\"logprobs\":[],\"obfuscation\":\"\",\"tokens_generated\":{},\"elapsed_ms\":{}}}\n\n",
+                self.seq, self.cur_item_id, self.output_index, self.content_index, delta_json, self.last_tokens_generated, elapsed_ms,
+            )
+        } else {
+            format!(
+                "event: response.reasoning.delta\ndata: {{\"type\":\"response.reasoning.delta\",\"sequence_number\":{},\"item_id\":\"{}\",\"output_index\":{},\"content_index\":{},\"delta\":{},\"obfuscation\":\"\",\"tokens_generated\":{},\"elapsed_ms\":{}}}\n\n",
+                self.seq, self.cur_item_id, self.output_index, self.content_index, delta_json, self.last_tokens_generated, elapsed_ms,
+            )
+        };
+        self.seq += 1;
+
+        if self.tx.send(Bytes::from(formatted)).is_err() {
+            self.stop_flag.store(true, Ordering::Release);
+            self.coalesce_buf.clear();
+            self.coalesce_event.clear();
+            self.coalesce_start = None;
+            return Err(anyhow!("client disconnected"));
+        }
+
+        // Run URL-citation annotation detection on output_text deltas.
+        // Scan a lookback window from accumulated_text to catch URLs that
+        // straddle the boundary of the previous flush (e.g. "https://exa" |
+        // "mple.com/"). The window covers up to 256 bytes before the current
+        // coalesce chunk start plus the chunk itself.
+        if is_output_text
+            && self.cur_item_type == Some(ItemType::Message)
+            && self.cur_content_type == Some(ContentType::OutputText)
+        {
+            const LOOKBACK: usize = 256;
+            let window_start = self.coalesce_text_start.saturating_sub(LOOKBACK);
+            if let Some(window) = self.accumulated_text.get(window_start..) {
+                for (local_start, local_end, url) in extract_urls_with_offsets(window) {
+                    let start_index = window_start + local_start;
+                    let end_index = window_start + local_end;
+                    let dedupe_key = format!("{start_index}:{end_index}:{url}");
+                    if !self.annotation_keys.insert(dedupe_key) {
+                        continue;
+                    }
+                    let annotation = json!({
+                        "type": "url_citation",
+                        "url": url,
+                        "start_index": start_index,
+                        "end_index": end_index,
+                        "title": ""
+                    });
+                    let annotation_index = self.accumulated_annotations.len();
+                    self.accumulated_annotations.push(annotation.clone());
+                    let payload = json!({
+                        "type": "response.output_text.annotation.added",
+                        "sequence_number": self.seq,
+                        "item_id": self.cur_item_id,
+                        "output_index": self.output_index,
+                        "content_index": self.content_index,
+                        "annotation_index": annotation_index,
+                        "annotation": annotation
+                    });
+                    self.seq += 1;
+                    self.try_send("response.output_text.annotation.added", payload)?;
+                }
+            }
+        }
+
+        self.coalesce_buf.clear();
+        self.coalesce_event.clear();
+        self.coalesce_start = None;
         Ok(())
     }
 
@@ -2197,11 +2331,6 @@ impl StreamCtx {
         Ok(())
     }
 
-    fn delta_logprobs(&self, token: &talu::router::StreamToken) -> Vec<serde_json::Value> {
-        let _ = token;
-        Vec::new()
-    }
-
     fn emit_output_text_annotations(&mut self, token: &talu::router::StreamToken) -> Result<()> {
         if token.item_type != ItemType::Message || token.content_type != ContentType::OutputText {
             return Ok(());
@@ -2249,6 +2378,8 @@ impl StreamCtx {
         top_p: f64,
         result: Result<StreamGenResult>,
     ) -> Result<()> {
+        // Flush any remaining coalesced text deltas before closing.
+        let _ = self.flush_coalesce();
         // Close the last content part and output item (if any tokens were emitted).
         let _ = self.emit_content_done();
         let _ = self.emit_item_done();

@@ -53,6 +53,14 @@ const TokenSlot = struct {
     item_type: u8,
     /// Content type discriminator (responses/items.zig ContentType).
     content_type: u8,
+    /// Nanosecond timestamp (std.time.nanoTimestamp) captured when this token
+    /// was pushed to the ring buffer. Used to compute elapsed generation time.
+    timestamp_ns: i128,
+    /// Cumulative engine token count at the time this slot was pushed.
+    /// Counts actual model tokens (one per tokenCallback/pushToken call),
+    /// not ring buffer slots (which can be multiple per token due to
+    /// reasoning tag splitting in filterAndPush).
+    cumulative_tokens: usize,
 };
 
 /// Filter state for reasoning tag parsing during streaming.
@@ -97,6 +105,16 @@ pub const TokenIterator = struct {
     return_buffer: [MAX_TOKEN_LEN]u8,
     return_item_type: u8,
     return_content_type: u8,
+    return_timestamp_ns: i128,
+    return_cumulative_tokens: usize,
+
+    // Timing: nanoTimestamp of the first streamed token (set once in pushSlot).
+    first_token_ns: i128,
+
+    // Engine token counter: incremented once per pushToken call (after EOS check).
+    // Counts actual model tokens, unlike streamed_slot_count which counts ring
+    // buffer slots (multiple per token due to reasoning tag splitting).
+    engine_token_count: usize,
 
     // State
     done: std.atomic.Value(bool), // Generation complete
@@ -198,6 +216,10 @@ pub const TokenIterator = struct {
             .return_buffer = undefined,
             .return_item_type = @intFromEnum(ItemType.unknown),
             .return_content_type = @intFromEnum(ContentType.unknown),
+            .return_timestamp_ns = 0,
+            .return_cumulative_tokens = 0,
+            .first_token_ns = 0,
+            .engine_token_count = 0,
             .done = std.atomic.Value(bool).init(false),
             .cancelled = std.atomic.Value(bool).init(false),
             .worker_exited = std.atomic.Value(bool).init(false),
@@ -238,6 +260,7 @@ pub const TokenIterator = struct {
             slot.text[0] = 0;
             slot.item_type = @intFromEnum(ItemType.unknown);
             slot.content_type = @intFromEnum(ContentType.unknown);
+            slot.cumulative_tokens = 0;
         }
 
         // Start worker thread
@@ -288,6 +311,10 @@ pub const TokenIterator = struct {
             .return_buffer = undefined,
             .return_item_type = @intFromEnum(ItemType.unknown),
             .return_content_type = @intFromEnum(ContentType.unknown),
+            .return_timestamp_ns = 0,
+            .return_cumulative_tokens = 0,
+            .first_token_ns = 0,
+            .engine_token_count = 0,
             .done = std.atomic.Value(bool).init(false),
             .cancelled = std.atomic.Value(bool).init(false),
             .worker_exited = std.atomic.Value(bool).init(false),
@@ -328,6 +355,7 @@ pub const TokenIterator = struct {
             slot.text[0] = 0;
             slot.item_type = @intFromEnum(ItemType.unknown);
             slot.content_type = @intFromEnum(ContentType.unknown);
+            slot.cumulative_tokens = 0;
         }
 
         // Start worker thread
@@ -370,6 +398,8 @@ pub const TokenIterator = struct {
                 @memcpy(self.return_buffer[0..copy_len], slot.text[0..copy_len]);
                 self.return_item_type = slot.item_type;
                 self.return_content_type = slot.content_type;
+                self.return_timestamp_ns = slot.timestamp_ns;
+                self.return_cumulative_tokens = slot.cumulative_tokens;
 
                 // NOW advance read index - slot is free for producer
                 self.read_idx.store(read + 1, .release);
@@ -424,6 +454,26 @@ pub const TokenIterator = struct {
     /// Returns ContentType discriminator (u8). 255 = unknown (no token returned yet).
     pub fn getContentType(self: *TokenIterator) u8 {
         return self.return_content_type;
+    }
+
+    /// Get the nanosecond timestamp of the most recently returned token.
+    /// Captured via std.time.nanoTimestamp() when the token was pushed to the
+    /// ring buffer. Returns 0 if no token has been returned yet.
+    pub fn getTokenTimestampNs(self: *TokenIterator) i128 {
+        return self.return_timestamp_ns;
+    }
+
+    /// Get cumulative engine token count from the most recently returned slot.
+    /// Counts actual model tokens (one per pushToken call), not ring buffer
+    /// slots (which can be multiple per token due to reasoning tag splitting).
+    pub fn getStreamedTokenCount(self: *TokenIterator) usize {
+        return self.return_cumulative_tokens;
+    }
+
+    /// Get the nanosecond timestamp of the first streamed token.
+    /// Returns 0 if no tokens have been streamed yet.
+    pub fn getFirstTokenTimestampNs(self: *TokenIterator) i128 {
+        return self.first_token_ns;
     }
 
     /// Get prompt token count (available after generation completes).
@@ -534,12 +584,18 @@ pub const TokenIterator = struct {
         }
 
         self.runGeneration() catch |err| {
-            // Store error for caller to retrieve (use -1 as generic error code)
-            self.error_code.store(-1, .release);
-            self.error_msg = (if (err == error.UnsupportedContentType)
-                std.fmt.allocPrint(self.allocator, "This model does not support images. Use a vision-language model (e.g. LFM2-VL-450M).", .{})
-            else
-                std.fmt.allocPrint(self.allocator, "Generation failed: {s}", .{@errorName(err)})) catch null;
+            // Cancellation (Ctrl+C, client disconnect, or stop flag during prefill)
+            // is not an error — treat it as normal completion.
+            if (err == error.Cancelled) {
+                self.cancelled.store(true, .release);
+            } else {
+                // Store error for caller to retrieve (use -1 as generic error code)
+                self.error_code.store(-1, .release);
+                self.error_msg = (if (err == error.UnsupportedContentType)
+                    std.fmt.allocPrint(self.allocator, "This model does not support images. Use a vision-language model (e.g. LFM2-VL-450M).", .{})
+                else
+                    std.fmt.allocPrint(self.allocator, "Generation failed: {s}", .{@errorName(err)})) catch null;
+            }
         };
 
         // Signal completion - order matters for correctness:
@@ -587,9 +643,10 @@ pub const TokenIterator = struct {
         opts.token_callback = tokenCallback;
         opts.callback_data = self;
 
-        // Use internal cancellation flag as stop flag for Zig generation
-        // We check the external flag in tokenCallback and set cancelled accordingly
-        opts.stop_flag = @ptrCast(&self.cancelled);
+        // Keep the external stop_flag (from Rust/Ctrl+C/client disconnect) as-is.
+        // It is installed on the backend by local.generate() → setStopFlag() and
+        // checked per-layer during the prefill forward pass. The tokenCallback
+        // also checks it during decode and sets self.cancelled accordingly.
 
         const engine = self.engine.?;
 
@@ -773,6 +830,11 @@ pub const TokenIterator = struct {
         // decoded text; the streaming path must do the same.
         if (gen_config_mod.isEosToken(self.engine.?.gen_config.eos_token_ids, token_id))
             return;
+
+        // Count actual engine tokens (one per tokenCallback/pushToken call).
+        // This is the authoritative count — unlike streamed_slot_count which
+        // counts ring buffer slots (inflated by reasoning tag splitting).
+        self.engine_token_count += 1;
 
         // Decode token to raw bytes (no UTF-8 sanitization).
         //
@@ -1082,6 +1144,12 @@ pub const TokenIterator = struct {
         slot.token_id = token_id;
         slot.item_type = item_type;
         slot.content_type = content_type;
+        slot.cumulative_tokens = self.engine_token_count;
+        const now = std.time.nanoTimestamp();
+        slot.timestamp_ns = now;
+        if (self.first_token_ns == 0) {
+            self.first_token_ns = now;
+        }
 
         _ = self.streamed_slot_count.fetchAdd(1, .acq_rel);
         var non_ws: usize = 0;
@@ -1204,6 +1272,8 @@ test "TokenSlot has type fields" {
         .token_id = 0,
         .item_type = @intFromEnum(ItemType.reasoning),
         .content_type = @intFromEnum(ContentType.reasoning_text),
+        .timestamp_ns = 0,
+        .cumulative_tokens = 0,
     };
     try std.testing.expectEqual(@as(u8, 3), slot.item_type); // reasoning = 3
     try std.testing.expectEqual(@as(u8, 8), slot.content_type); // reasoning_text = 8
@@ -1340,6 +1410,10 @@ fn makeTestIterator(start_marker: []const u8, end_marker: []const u8) TokenItera
     iter.not_full = .{};
     iter.final_text_z = null;
     iter.cancelled = std.atomic.Value(bool).init(false);
+    iter.return_timestamp_ns = 0;
+    iter.return_cumulative_tokens = 0;
+    iter.first_token_ns = 0;
+    iter.engine_token_count = 0;
 
     // Initialize ring slots
     for (&iter.ring) |*slot| {
@@ -1348,6 +1422,8 @@ fn makeTestIterator(start_marker: []const u8, end_marker: []const u8) TokenItera
         slot.text[0] = 0;
         slot.item_type = 0;
         slot.content_type = 0;
+        slot.timestamp_ns = 0;
+        slot.cumulative_tokens = 0;
     }
 
     // Filter state
@@ -1569,4 +1645,57 @@ test "pushSlot drops pure NUL chunks" {
     var slots: [4]TestSlot = undefined;
     const n = drainSlots(&iter, &slots);
     try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "pushSlot records timestamp_ns" {
+    var iter = makeTestIterator("<think>", "</think>");
+    const before = std.time.nanoTimestamp();
+    try iter.pushSlot(
+        "hello",
+        1,
+        @intFromEnum(ItemType.message),
+        @intFromEnum(ContentType.output_text),
+    );
+    const after = std.time.nanoTimestamp();
+
+    const slot = &iter.ring[0];
+    try std.testing.expect(slot.timestamp_ns >= before);
+    try std.testing.expect(slot.timestamp_ns <= after);
+}
+
+test "cumulative_tokens tracks engine token count not slot count" {
+    var iter = makeTestIterator("<think>", "</think>");
+
+    // Simulate engine_token_count = 1 (one pushToken call).
+    iter.engine_token_count = 1;
+
+    // filterAndPush may produce multiple slots per engine token.
+    try iter.pushSlot("a", 1, @intFromEnum(ItemType.message), @intFromEnum(ContentType.output_text));
+    try iter.pushSlot("b", 1, @intFromEnum(ItemType.message), @intFromEnum(ContentType.output_text));
+
+    // Both slots carry the same cumulative engine token count.
+    try std.testing.expectEqual(@as(usize, 1), iter.ring[0].cumulative_tokens);
+    try std.testing.expectEqual(@as(usize, 1), iter.ring[1].cumulative_tokens);
+
+    // Simulate second engine token.
+    iter.engine_token_count = 2;
+    try iter.pushSlot("c", 2, @intFromEnum(ItemType.message), @intFromEnum(ContentType.output_text));
+    try std.testing.expectEqual(@as(usize, 2), iter.ring[2].cumulative_tokens);
+
+    // streamed_slot_count still counts actual slots pushed (3), not engine tokens.
+    try std.testing.expectEqual(@as(usize, 3), iter.streamed_slot_count.load(.acquire));
+}
+
+test "getFirstTokenTimestampNs set on first push" {
+    var iter = makeTestIterator("<think>", "</think>");
+    try std.testing.expectEqual(@as(i128, 0), iter.getFirstTokenTimestampNs());
+
+    const before = std.time.nanoTimestamp();
+    try iter.pushSlot("a", 1, @intFromEnum(ItemType.message), @intFromEnum(ContentType.output_text));
+    const first_ns = iter.getFirstTokenTimestampNs();
+    try std.testing.expect(first_ns >= before);
+
+    // Second push does not change first_token_ns.
+    try iter.pushSlot("b", 2, @intFromEnum(ItemType.message), @intFromEnum(ContentType.output_text));
+    try std.testing.expectEqual(first_ns, iter.getFirstTokenTimestampNs());
 }

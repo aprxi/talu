@@ -249,6 +249,10 @@ pub const Transformer = struct {
     prefill_progress_fn: ?PrefillProgressFn = null,
     prefill_progress_ctx: ?*anyopaque = null,
 
+    // Optional stop flag checked per-layer during prefill forward pass.
+    // Set transiently by prefillSlot alongside the progress callback.
+    stop_flag: ?*const std.atomic.Value(bool) = null,
+
     tensor_count: usize = 0,
 
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
@@ -454,6 +458,11 @@ pub const Transformer = struct {
             // Prefill progress (fires once per layer, outside hot path)
             if (self.prefill_progress_fn) |progress_fn| {
                 progress_fn(layer_idx + 1, self.num_hidden_layers, self.prefill_progress_ctx);
+            }
+
+            // Check stop flag after each layer for responsive cancellation.
+            if (self.stop_flag) |flag| {
+                if (flag.load(.acquire)) return error.Cancelled;
             }
         }
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Weak};
 
 use tokio::sync::Mutex;
 
@@ -142,4 +143,6 @@ pub struct AppState {
     pub sandbox_backend: SandboxBackend,
     /// PubSub relay state for cross-client topic messaging.
     pub pubsub: Mutex<crate::server::pubsub::PubSubState>,
+    /// Active generation stop flags. Set all on shutdown for immediate cancellation.
+    pub active_stop_flags: std::sync::Mutex<Vec<Weak<AtomicBool>>>,
 }

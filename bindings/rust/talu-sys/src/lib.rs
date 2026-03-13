@@ -5021,6 +5021,8 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_router_iterator_finish_reason(iterator: *mut c_void) -> u8;
     // core/src/capi/router.zig
+    pub fn talu_router_iterator_first_token_ns(iterator: *mut c_void) -> i128;
+    // core/src/capi/router.zig
     pub fn talu_router_iterator_free(iterator: *mut c_void);
     // core/src/capi/router.zig
     pub fn talu_router_iterator_generation_ns(iterator: *mut c_void) -> u64;
@@ -5036,6 +5038,10 @@ extern "C" {
     pub fn talu_router_iterator_prefill_ns(iterator: *mut c_void) -> u64;
     // core/src/capi/router.zig
     pub fn talu_router_iterator_prompt_tokens(iterator: *mut c_void) -> usize;
+    // core/src/capi/router.zig
+    pub fn talu_router_iterator_streamed_token_count(iterator: *mut c_void) -> usize;
+    // core/src/capi/router.zig
+    pub fn talu_router_iterator_token_timestamp_ns(iterator: *mut c_void) -> i128;
     // core/src/capi/router.zig
     pub fn talu_router_result_free(result: *mut CGenerateResult);
     // core/src/capi/validate.zig

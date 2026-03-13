@@ -307,6 +307,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         agent_runtime_mode: args.agent_runtime_mode,
         sandbox_backend,
         pubsub: tokio::sync::Mutex::new(pubsub::PubSubState::new()),
+        active_stop_flags: std::sync::Mutex::new(Vec::new()),
     };
 
     let addr = SocketAddr::new(args.host, args.port);
@@ -375,6 +376,9 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         .enable_all()
         .build()?;
     runtime.block_on(listen::serve(state, addr, socket_path))?;
+    // Give spawn_blocking tasks up to 3 seconds to respond to stop flags,
+    // then forcefully shut down so the process exits promptly on Ctrl+C.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(3));
     Ok(())
 }
 

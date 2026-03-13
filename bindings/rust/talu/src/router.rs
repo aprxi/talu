@@ -91,6 +91,10 @@ pub struct StreamToken<'a> {
     pub item_type: talu_sys::ItemType,
     /// Content type (e.g. OutputText, ReasoningText).
     pub content_type: talu_sys::ContentType,
+    /// Cumulative count of tokens streamed so far (from engine).
+    pub tokens_generated: usize,
+    /// Nanoseconds elapsed since first token (from engine timestamps).
+    pub elapsed_ns: u64,
 }
 
 /// Streaming callback for token-by-token generation.
@@ -468,10 +472,26 @@ pub fn generate_stream(
             talu_sys::talu_router_iterator_content_type(iterator)
         });
 
+        // Read engine-level timing for cumulative tok/s
+        // SAFETY: iterator is valid
+        let tokens_generated =
+            unsafe { talu_sys::talu_router_iterator_streamed_token_count(iterator) };
+        let first_ns =
+            unsafe { talu_sys::talu_router_iterator_first_token_ns(iterator) };
+        let token_ns =
+            unsafe { talu_sys::talu_router_iterator_token_timestamp_ns(iterator) };
+        let elapsed_ns = if first_ns > 0 && token_ns > first_ns {
+            (token_ns - first_ns) as u64
+        } else {
+            0
+        };
+
         let stream_token = StreamToken {
             text: token_text.as_ref(),
             item_type,
             content_type,
+            tokens_generated,
+            elapsed_ns,
         };
         if !emitted_visible_text && has_visible_text(stream_token.text) {
             emitted_visible_text = true;
@@ -495,6 +515,8 @@ pub fn generate_stream(
                     text: final_text.as_ref(),
                     item_type: talu_sys::ItemType::Message,
                     content_type: talu_sys::ContentType::OutputText,
+                    tokens_generated: 0,
+                    elapsed_ns: 0,
                 };
                 let _ = callback(&fallback);
                 emitted_visible_text = true;
@@ -509,6 +531,8 @@ pub fn generate_stream(
                     text: text.as_str(),
                     item_type: talu_sys::ItemType::Message,
                     content_type: talu_sys::ContentType::OutputText,
+                    tokens_generated: 0,
+                    elapsed_ns: 0,
                 };
                 let _ = callback(&fallback);
             }

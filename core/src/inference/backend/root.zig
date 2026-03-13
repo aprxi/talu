@@ -607,6 +607,15 @@ pub const Backend = union(enum) {
         }
     }
 
+    /// Set stop flag for cancellation during prefill (checked per-layer).
+    pub fn setStopFlag(self: *Backend, flag: ?*const std.atomic.Value(bool)) void {
+        switch (self.*) {
+            .cpu => |*b| b.stop_flag = flag,
+            .metal => {},
+            .cuda => {},
+        }
+    }
+
     /// Maximum pixel count the vision encoder can handle efficiently.
     pub fn visionMaxPixels(self: *const Backend) u64 {
         return switch (self.*) {

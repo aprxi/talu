@@ -141,6 +141,9 @@ pub const FusedCpuBackend = struct {
     prefill_progress_fn: ?PrefillProgressFn = null,
     prefill_progress_ctx: ?*anyopaque = null,
 
+    // Optional stop flag for cancellation during prefill (checked per-layer).
+    stop_flag: ?*const std.atomic.Value(bool) = null,
+
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
     pub const PrefillVisionInput = vision_runtime_mod.PrefillVisionInput;
 
@@ -1181,12 +1184,14 @@ pub const FusedCpuBackend = struct {
         // use_cache=false triggers prefill mode which populates the cache
         log.debug("inference", "Prefill: forward start", .{ .prompt_len = prompt_len }, @src());
 
-        // Install prefill progress callback (if set), cleared after forward pass
+        // Install prefill progress callback and stop flag (if set), cleared after forward pass
         self.model.prefill_progress_fn = self.prefill_progress_fn;
         self.model.prefill_progress_ctx = self.prefill_progress_ctx;
+        self.model.stop_flag = self.stop_flag;
         defer {
             self.model.prefill_progress_fn = null;
             self.model.prefill_progress_ctx = null;
+            self.model.stop_flag = null;
         }
 
         log.debug("scheduler", "Transformer forward start", .{

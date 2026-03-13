@@ -368,6 +368,40 @@ pub export fn talu_router_iterator_finish_reason(
     return iter.getFinishReason();
 }
 
+/// Gets the nanosecond timestamp of the most recently returned token.
+///
+/// Returns std.time.nanoTimestamp() captured when the token was pushed to the
+/// ring buffer during generation. Call after talu_router_iterator_next().
+/// Returns 0 if iterator is null or no token has been returned yet.
+pub export fn talu_router_iterator_token_timestamp_ns(
+    iterator: ?*TaluTokenIterator,
+) callconv(.c) i128 {
+    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
+    return iter.getTokenTimestampNs();
+}
+
+/// Gets the cumulative count of tokens streamed so far.
+///
+/// Live counter incremented each time a decoded token is pushed to the ring
+/// buffer. Safe to call during generation (atomic read).
+/// Returns 0 if iterator is null.
+pub export fn talu_router_iterator_streamed_token_count(
+    iterator: ?*TaluTokenIterator,
+) callconv(.c) usize {
+    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
+    return iter.getStreamedTokenCount();
+}
+
+/// Gets the nanosecond timestamp of the first streamed token.
+///
+/// Returns 0 if iterator is null or no tokens have been streamed yet.
+pub export fn talu_router_iterator_first_token_ns(
+    iterator: ?*TaluTokenIterator,
+) callconv(.c) i128 {
+    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
+    return iter.getFirstTokenTimestampNs();
+}
+
 // =============================================================================
 // Embedding API
 // =============================================================================

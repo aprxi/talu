@@ -184,7 +184,9 @@ pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result
         tokio::select! {
             _ = tcp_task => {},
             _ = uds_task => {},
-            _ = tokio::signal::ctrl_c() => {},
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("[shutdown] Ctrl+C received");
+            },
         }
     }
 
@@ -192,8 +194,28 @@ pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result
     {
         tokio::select! {
             _ = tcp_task => {},
-            _ = tokio::signal::ctrl_c() => {},
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("[shutdown] Ctrl+C received");
+            },
         }
+    }
+
+    // Cancel all active generations so spawn_blocking tasks exit promptly.
+    eprintln!("[shutdown] setting stop flags...");
+    if let Ok(flags) = state.active_stop_flags.lock() {
+        let mut set_count = 0usize;
+        let total = flags.len();
+        for weak in flags.iter() {
+            if let Some(flag) = weak.upgrade() {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+                set_count += 1;
+            }
+        }
+        eprintln!("[shutdown] set {}/{} active stop flags", set_count, total);
+        log::info!(target: "server::listen", "shutdown: set {}/{} active stop flags", set_count, total);
+    } else {
+        eprintln!("[shutdown] FAILED to lock active_stop_flags");
+        log::warn!(target: "server::listen", "shutdown: failed to lock active_stop_flags");
     }
 
     #[cfg(unix)]

@@ -23,6 +23,8 @@ export interface ChatPanelDom {
   panelInfoCreated: HTMLElement;
   panelInfoForkedRow: HTMLElement;
   panelInfoForked: HTMLElement;
+  panelHttpCurl: HTMLElement;
+  panelHttpCopy: HTMLButtonElement;
   panelEventsVerbosity: HTMLSelectElement;
   panelEventsClear: HTMLButtonElement;
   panelEventsLog: HTMLElement;
@@ -160,6 +162,22 @@ export function getChatPanelDom(): ChatPanelDom {
 
   root.appendChild(panelChatInfo);
 
+  // ── HTTP section ───────────────────────────────────────────────────────
+  root.appendChild(el("div", { className: "panel-divider" }));
+  const httpHeading = el("h3", { className: "panel-heading" });
+  httpHeading.textContent = "HTTP";
+  root.appendChild(httpHeading);
+
+  const httpControls = el("div", { className: "chat-http-controls" });
+  const panelHttpCopy = el("button", { className: "btn btn-ghost btn-icon", title: "Copy curl" }) as HTMLButtonElement;
+  panelHttpCopy.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  httpControls.appendChild(panelHttpCopy);
+  root.appendChild(httpControls);
+
+  const panelHttpCurl = el("pre", { className: "chat-http-curl" });
+  panelHttpCurl.textContent = "No request yet";
+  root.appendChild(panelHttpCurl);
+
   // ── Events section ────────────────────────────────────────────────────
   root.appendChild(el("div", { className: "panel-divider" }));
   const eventsHeading = el("h3", { className: "panel-heading" });
@@ -202,6 +220,8 @@ export function getChatPanelDom(): ChatPanelDom {
     panelInfoCreated,
     panelInfoForkedRow,
     panelInfoForked,
+    panelHttpCurl,
+    panelHttpCopy,
     panelEventsVerbosity,
     panelEventsClear,
     panelEventsLog,
