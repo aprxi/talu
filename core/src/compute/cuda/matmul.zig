@@ -11,8 +11,8 @@ const cublas_status_alloc_failed: c_int = 3;
 const cublas_op_n: c_int = 0;
 const cublas_op_t: c_int = 1;
 const cublas_gemm_default: c_int = -1;
-const cublas_pedantic_math: c_int = 2;
-const cublas_compute_32f_pedantic: c_int = 69;
+const cublas_default_math: c_int = 0;
+const cublas_compute_32f: c_int = 68;
 const cuda_r_32f: c_int = 0;
 const cuda_r_16f: c_int = 2;
 const cuda_r_16bf: c_int = 14;
@@ -90,7 +90,7 @@ pub const Blas = struct {
         const create_status = api.cublas_create(&handle);
         if (create_status == cublas_status_alloc_failed) return error.OutOfMemory;
         if (create_status != cublas_status_success or handle == null) return error.CublasCreateFailed;
-        if (api.cublas_set_math_mode(handle, cublas_pedantic_math) != cublas_status_success) {
+        if (api.cublas_set_math_mode(handle, cublas_default_math) != cublas_status_success) {
             _ = api.cublas_destroy(handle);
             return error.CublasMathModeFailed;
         }
@@ -222,7 +222,76 @@ pub const Blas = struct {
             out_dev,
             cuda_r_32f,
             @intCast(out_dim),
-            cublas_compute_32f_pedantic,
+            cublas_compute_32f,
+            cublas_gemm_default,
+        );
+        if (status == cublas_status_alloc_failed) return error.OutOfMemory;
+        if (status != cublas_status_success) return error.CublasMatmulFailed;
+    }
+
+    /// Tensor-core path:
+    /// C = input_u16 @ weight_u16^T
+    /// input_u16: [rows x in_dim] row-major u16 payload (f16/bf16)
+    /// weight_u16: [out_dim x in_dim] row-major u16 payload (f16/bf16)
+    /// out_f32: [rows x out_dim] row-major f32
+    pub fn matmulU16U16F32(
+        self: *Blas,
+        device: *device_mod.Device,
+        input_u16: *const device_mod.Buffer,
+        input_payload: U16Payload,
+        rows: usize,
+        in_dim: usize,
+        weight_u16: *const device_mod.Buffer,
+        weight_payload: U16Payload,
+        out_dim: usize,
+        out_f32: *device_mod.Buffer,
+    ) !void {
+        if (self.handle == null) return error.CublasHandleInvalid;
+        if (!dimsFitCublas(rows, out_dim, in_dim)) return error.InvalidArgument;
+        if (input_u16.size < rows * in_dim * @sizeOf(u16)) return error.InvalidArgument;
+        if (weight_u16.size < out_dim * in_dim * @sizeOf(u16)) return error.InvalidArgument;
+        if (out_f32.size < rows * out_dim * @sizeOf(f32)) return error.InvalidArgument;
+
+        try device.makeCurrent();
+        if (self.api.cublas_set_stream(self.handle, device.getLaunchStream()) != cublas_status_success) {
+            return error.CublasStreamSetFailed;
+        }
+
+        const alpha: f32 = 1.0;
+        const beta: f32 = 0.0;
+        const input_type: c_int = switch (input_payload) {
+            .f16 => cuda_r_16f,
+            .bf16 => cuda_r_16bf,
+        };
+        const weight_type: c_int = switch (weight_payload) {
+            .f16 => cuda_r_16f,
+            .bf16 => cuda_r_16bf,
+        };
+
+        const input_dev: ?*const anyopaque = @ptrFromInt(input_u16.pointer);
+        const weight_dev: ?*const anyopaque = @ptrFromInt(weight_u16.pointer);
+        const out_dev: ?*anyopaque = @ptrFromInt(out_f32.pointer);
+
+        // Row-major C = A @ W^T is computed as column-major C^T = W @ A^T.
+        const status = self.api.cublas_gemm_ex(
+            self.handle,
+            cublas_op_t, // W^T view -> [out_dim x in_dim]
+            cublas_op_n, // A^T view -> [in_dim x rows]
+            @intCast(out_dim),
+            @intCast(rows),
+            @intCast(in_dim),
+            @ptrCast(&alpha),
+            weight_dev,
+            weight_type,
+            @intCast(in_dim),
+            input_dev,
+            input_type,
+            @intCast(in_dim),
+            @ptrCast(&beta),
+            out_dev,
+            cuda_r_32f,
+            @intCast(out_dim),
+            cublas_compute_32f,
             cublas_gemm_default,
         );
         if (status == cublas_status_alloc_failed) return error.OutOfMemory;

@@ -63,6 +63,22 @@ extern "C" __global__ void talu_cast_f32_to_f16(
     out[index] = __half_as_ushort(h);
 }
 
+extern "C" __global__ void talu_cast_f32_to_bf16(
+    unsigned short* out,
+    const float* input,
+    unsigned int count
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+
+    const float value = input[index];
+    const unsigned int bits = __float_as_uint(value);
+    // Round-to-nearest-even for bf16 truncation.
+    const unsigned int lsb = (bits >> 16) & 1u;
+    const unsigned int rounding_bias = 0x7FFFu + lsb;
+    out[index] = (unsigned short)((bits + rounding_bias) >> 16);
+}
+
 extern "C" __global__ void talu_embedding_lookup_f32(
     float* out,
     const float* embeddings,

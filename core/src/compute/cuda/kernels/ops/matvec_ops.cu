@@ -10,6 +10,11 @@ static __device__ __forceinline__ float talu_warp_sum_f32(float value) {
     return value;
 }
 
+static __device__ __forceinline__ float2 talu_decode_f16_pair_u32(unsigned int packed) {
+    const __half2 pair = *reinterpret_cast<const __half2*>(&packed);
+    return __half22float2(pair);
+}
+
 static __device__ __forceinline__ float talu_dot_f16_u16_vec8(
     const float* input,
     const unsigned short* row,
@@ -17,7 +22,8 @@ static __device__ __forceinline__ float talu_dot_f16_u16_vec8(
     unsigned int lane
 ) {
     float acc = 0.0f;
-    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u);
+    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) and
+        ((((unsigned long long)input) & 0xFu) == 0u);
     if (!can_vec8) {
         for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
             acc = fmaf(input[i], talu_decode_f16_u16(row[i]), acc);
@@ -26,20 +32,32 @@ static __device__ __forceinline__ float talu_dot_f16_u16_vec8(
     }
     const unsigned int vec_elems = in_dim & ~7u;
     const uint4* row_vec = reinterpret_cast<const uint4*>(row);
+    const float4* input_vec = reinterpret_cast<const float4*>(input);
     for (unsigned int i = lane * 8u; i < vec_elems; i += TALU_WARP_SIZE * 8u) {
-        const uint4 packed = row_vec[i >> 3];
+        uint4 packed;
+        asm volatile(
+            "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(packed.x), "=r"(packed.y), "=r"(packed.z), "=r"(packed.w)
+            : "l"(row_vec + (i >> 3)));
         const unsigned int w0 = packed.x;
         const unsigned int w1 = packed.y;
         const unsigned int w2 = packed.z;
         const unsigned int w3 = packed.w;
-        acc = fmaf(input[i + 0], talu_decode_f16_u16((unsigned short)(w0 & 0xFFFFu)), acc);
-        acc = fmaf(input[i + 1], talu_decode_f16_u16((unsigned short)(w0 >> 16)), acc);
-        acc = fmaf(input[i + 2], talu_decode_f16_u16((unsigned short)(w1 & 0xFFFFu)), acc);
-        acc = fmaf(input[i + 3], talu_decode_f16_u16((unsigned short)(w1 >> 16)), acc);
-        acc = fmaf(input[i + 4], talu_decode_f16_u16((unsigned short)(w2 & 0xFFFFu)), acc);
-        acc = fmaf(input[i + 5], talu_decode_f16_u16((unsigned short)(w2 >> 16)), acc);
-        acc = fmaf(input[i + 6], talu_decode_f16_u16((unsigned short)(w3 & 0xFFFFu)), acc);
-        acc = fmaf(input[i + 7], talu_decode_f16_u16((unsigned short)(w3 >> 16)), acc);
+        const unsigned int input_vec_idx = i >> 2;
+        const float4 in0 = input_vec[input_vec_idx];
+        const float4 in1 = input_vec[input_vec_idx + 1];
+        const float2 f0 = talu_decode_f16_pair_u32(w0);
+        const float2 f1 = talu_decode_f16_pair_u32(w1);
+        const float2 f2 = talu_decode_f16_pair_u32(w2);
+        const float2 f3 = talu_decode_f16_pair_u32(w3);
+        acc = fmaf(in0.x, f0.x, acc);
+        acc = fmaf(in0.y, f0.y, acc);
+        acc = fmaf(in0.z, f1.x, acc);
+        acc = fmaf(in0.w, f1.y, acc);
+        acc = fmaf(in1.x, f2.x, acc);
+        acc = fmaf(in1.y, f2.y, acc);
+        acc = fmaf(in1.z, f3.x, acc);
+        acc = fmaf(in1.w, f3.y, acc);
     }
     for (unsigned int i = vec_elems + lane; i < in_dim; i += TALU_WARP_SIZE) {
         acc = fmaf(input[i], talu_decode_f16_u16(row[i]), acc);
@@ -54,7 +72,8 @@ static __device__ __forceinline__ float talu_dot_bf16_u16_vec8(
     unsigned int lane
 ) {
     float acc = 0.0f;
-    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u);
+    const bool can_vec8 = ((((unsigned long long)row) & 0xFu) == 0u) and
+        ((((unsigned long long)input) & 0xFu) == 0u);
     if (!can_vec8) {
         for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
             acc = fmaf(input[i], talu_decode_bf16_u16(row[i]), acc);
@@ -63,20 +82,28 @@ static __device__ __forceinline__ float talu_dot_bf16_u16_vec8(
     }
     const unsigned int vec_elems = in_dim & ~7u;
     const uint4* row_vec = reinterpret_cast<const uint4*>(row);
+    const float4* input_vec = reinterpret_cast<const float4*>(input);
     for (unsigned int i = lane * 8u; i < vec_elems; i += TALU_WARP_SIZE * 8u) {
-        const uint4 packed = row_vec[i >> 3];
+        uint4 packed;
+        asm volatile(
+            "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(packed.x), "=r"(packed.y), "=r"(packed.z), "=r"(packed.w)
+            : "l"(row_vec + (i >> 3)));
         const unsigned int w0 = packed.x;
         const unsigned int w1 = packed.y;
         const unsigned int w2 = packed.z;
         const unsigned int w3 = packed.w;
-        acc = fmaf(input[i + 0], talu_decode_bf16_u16((unsigned short)(w0 & 0xFFFFu)), acc);
-        acc = fmaf(input[i + 1], talu_decode_bf16_u16((unsigned short)(w0 >> 16)), acc);
-        acc = fmaf(input[i + 2], talu_decode_bf16_u16((unsigned short)(w1 & 0xFFFFu)), acc);
-        acc = fmaf(input[i + 3], talu_decode_bf16_u16((unsigned short)(w1 >> 16)), acc);
-        acc = fmaf(input[i + 4], talu_decode_bf16_u16((unsigned short)(w2 & 0xFFFFu)), acc);
-        acc = fmaf(input[i + 5], talu_decode_bf16_u16((unsigned short)(w2 >> 16)), acc);
-        acc = fmaf(input[i + 6], talu_decode_bf16_u16((unsigned short)(w3 & 0xFFFFu)), acc);
-        acc = fmaf(input[i + 7], talu_decode_bf16_u16((unsigned short)(w3 >> 16)), acc);
+        const unsigned int input_vec_idx = i >> 2;
+        const float4 in0 = input_vec[input_vec_idx];
+        const float4 in1 = input_vec[input_vec_idx + 1];
+        acc = fmaf(in0.x, talu_decode_bf16_u16((unsigned short)(w0 & 0xFFFFu)), acc);
+        acc = fmaf(in0.y, talu_decode_bf16_u16((unsigned short)(w0 >> 16)), acc);
+        acc = fmaf(in0.z, talu_decode_bf16_u16((unsigned short)(w1 & 0xFFFFu)), acc);
+        acc = fmaf(in0.w, talu_decode_bf16_u16((unsigned short)(w1 >> 16)), acc);
+        acc = fmaf(in1.x, talu_decode_bf16_u16((unsigned short)(w2 & 0xFFFFu)), acc);
+        acc = fmaf(in1.y, talu_decode_bf16_u16((unsigned short)(w2 >> 16)), acc);
+        acc = fmaf(in1.z, talu_decode_bf16_u16((unsigned short)(w3 & 0xFFFFu)), acc);
+        acc = fmaf(in1.w, talu_decode_bf16_u16((unsigned short)(w3 >> 16)), acc);
     }
     for (unsigned int i = vec_elems + lane; i < in_dim; i += TALU_WARP_SIZE) {
         acc = fmaf(input[i], talu_decode_bf16_u16(row[i]), acc);

@@ -77,6 +77,7 @@ const KernelSlot = enum {
     copy,
     copy_u16,
     cast_f32_to_f16,
+    cast_f32_to_bf16,
     embedding_lookup_f32,
     embedding_lookup_u16,
     embedding_lookup_u16_rows,
@@ -100,8 +101,13 @@ const KernelSlot = enum {
     gated_attention_compact_q,
     gated_attention_output_gate,
     gated_delta_conv,
+    gated_delta_conv_silu,
+    gated_delta_conv_silu_rows,
     gated_delta_qk_norm,
     gated_delta_ssm,
+    gated_delta_ssm_rows,
+    gated_delta_rmsnorm_silu_mul,
+    gated_delta_rmsnorm_silu_mul_rows,
     argmax,
     matmul_f16,
     matmul_bf16,
@@ -152,6 +158,7 @@ const required_kernels = [_]RequiredKernel{
     .{ .slot = .copy, .op_name = compute.cuda.copy.op_name, .embedded_symbol = compute.cuda.copy.embedded_symbol },
     .{ .slot = .copy_u16, .op_name = compute.cuda.copy_u16.op_name, .embedded_symbol = compute.cuda.copy_u16.embedded_symbol },
     .{ .slot = .cast_f32_to_f16, .op_name = compute.cuda.cast_f32_to_f16.op_name, .embedded_symbol = compute.cuda.cast_f32_to_f16.embedded_symbol },
+    .{ .slot = .cast_f32_to_bf16, .op_name = compute.cuda.cast_f32_to_bf16.op_name, .embedded_symbol = compute.cuda.cast_f32_to_bf16.embedded_symbol },
     .{ .slot = .embedding_lookup_f32, .op_name = compute.cuda.embedding_lookup_f32.op_name, .embedded_symbol = compute.cuda.embedding_lookup_f32.embedded_symbol },
     .{ .slot = .embedding_lookup_u16, .op_name = compute.cuda.embedding_lookup_u16.op_name, .embedded_symbol = compute.cuda.embedding_lookup_u16.embedded_symbol },
     .{ .slot = .embedding_lookup_u16_rows, .op_name = compute.cuda.embedding_lookup_u16_rows.op_name, .embedded_symbol = compute.cuda.embedding_lookup_u16_rows.embedded_symbol },
@@ -175,8 +182,13 @@ const required_kernels = [_]RequiredKernel{
     .{ .slot = .gated_attention_compact_q, .op_name = compute.cuda.gated_attention_compact_q.op_name, .embedded_symbol = compute.cuda.gated_attention_compact_q.embedded_symbol },
     .{ .slot = .gated_attention_output_gate, .op_name = compute.cuda.gated_attention_output_gate.op_name, .embedded_symbol = compute.cuda.gated_attention_output_gate.embedded_symbol },
     .{ .slot = .gated_delta_conv, .op_name = compute.cuda.gated_delta_conv.op_name, .embedded_symbol = compute.cuda.gated_delta_conv.embedded_symbol },
+    .{ .slot = .gated_delta_conv_silu, .op_name = compute.cuda.gated_delta_conv_silu.op_name, .embedded_symbol = compute.cuda.gated_delta_conv_silu.embedded_symbol },
+    .{ .slot = .gated_delta_conv_silu_rows, .op_name = compute.cuda.gated_delta_conv_silu_rows.op_name, .embedded_symbol = compute.cuda.gated_delta_conv_silu_rows.embedded_symbol },
     .{ .slot = .gated_delta_qk_norm, .op_name = compute.cuda.gated_delta_qk_norm.op_name, .embedded_symbol = compute.cuda.gated_delta_qk_norm.embedded_symbol },
     .{ .slot = .gated_delta_ssm, .op_name = compute.cuda.gated_delta_ssm.op_name, .embedded_symbol = compute.cuda.gated_delta_ssm.embedded_symbol },
+    .{ .slot = .gated_delta_ssm_rows, .op_name = compute.cuda.gated_delta_ssm_rows.op_name, .embedded_symbol = compute.cuda.gated_delta_ssm_rows.embedded_symbol },
+    .{ .slot = .gated_delta_rmsnorm_silu_mul, .op_name = compute.cuda.gated_delta_rmsnorm_silu_mul.op_name, .embedded_symbol = compute.cuda.gated_delta_rmsnorm_silu_mul.embedded_symbol },
+    .{ .slot = .gated_delta_rmsnorm_silu_mul_rows, .op_name = compute.cuda.gated_delta_rmsnorm_silu_mul_rows.op_name, .embedded_symbol = compute.cuda.gated_delta_rmsnorm_silu_mul_rows.embedded_symbol },
     .{ .slot = .argmax, .op_name = compute.cuda.argmax.op_name, .embedded_symbol = compute.cuda.argmax.embedded_symbol },
     .{ .slot = .matmul_f16, .op_name = compute.cuda.matmul_u16.op_name_f16, .embedded_symbol = compute.cuda.matmul_u16.embedded_symbol_f16 },
     .{ .slot = .matmul_bf16, .op_name = compute.cuda.matmul_u16.op_name_bf16, .embedded_symbol = compute.cuda.matmul_u16.embedded_symbol_bf16 },
@@ -330,6 +342,7 @@ const RuntimeBuffers = struct {
     input_dev: compute.cuda.Buffer,
     norm_weight_dev: compute.cuda.Buffer,
     norm_out_dev: compute.cuda.Buffer,
+    activation_u16_dev: compute.cuda.Buffer,
     attn_q_dev: compute.cuda.Buffer,
     query_gate_proj_dev: compute.cuda.Buffer,
     attn_k_dev: compute.cuda.Buffer,
@@ -376,6 +389,8 @@ const RuntimeBuffers = struct {
         const d_attn_bytes = std.math.mul(usize, max_attn, @sizeOf(f32)) catch return error.InvalidArgument;
         const d_kv_bytes = std.math.mul(usize, max_kv, @sizeOf(f32)) catch return error.InvalidArgument;
         const d_gdelta_proj_bytes = std.math.mul(usize, max_gdelta_proj, @sizeOf(f32)) catch return error.InvalidArgument;
+        const max_linear_in_dim = @max(@max(d_model, max_dff), @max(max_attn, max_gdelta_proj));
+        const activation_u16_bytes = std.math.mul(usize, max_linear_in_dim, @sizeOf(u16)) catch return error.InvalidArgument;
         const shortconv_dim = if (max_shortconv_dim > 0) max_shortconv_dim else 1;
         const shortconv_proj_bytes = std.math.mul(usize, shortconv_dim * 3, @sizeOf(f32)) catch return error.InvalidArgument;
         const shortconv_conv_bytes = std.math.mul(usize, shortconv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
@@ -456,6 +471,8 @@ const RuntimeBuffers = struct {
         errdefer norm_weight_dev.deinit(device);
         var norm_out_dev = try device.allocBuffer(d_model_bytes);
         errdefer norm_out_dev.deinit(device);
+        var activation_u16_dev = try device.allocBuffer(activation_u16_bytes);
+        errdefer activation_u16_dev.deinit(device);
         var attn_q_dev = try device.allocBuffer(d_attn_bytes);
         errdefer attn_q_dev.deinit(device);
         var query_gate_proj_dev = try device.allocBuffer(d_attn_bytes);
@@ -522,6 +539,7 @@ const RuntimeBuffers = struct {
             .input_dev = input_dev,
             .norm_weight_dev = norm_weight_dev,
             .norm_out_dev = norm_out_dev,
+            .activation_u16_dev = activation_u16_dev,
             .attn_q_dev = attn_q_dev,
             .query_gate_proj_dev = query_gate_proj_dev,
             .attn_k_dev = attn_k_dev,
@@ -568,6 +586,7 @@ const RuntimeBuffers = struct {
         self.attn_q_dev.deinit(device);
         self.norm_out_dev.deinit(device);
         self.norm_weight_dev.deinit(device);
+        self.activation_u16_dev.deinit(device);
         self.input_dev.deinit(device);
         self.deepstack_add_dev.deinit(device);
         self.prefill_tokens_dev.deinit(device);
@@ -580,6 +599,7 @@ const RuntimeBuffers = struct {
             self.prefill_tokens_dev.size +
             self.norm_weight_dev.size +
             self.norm_out_dev.size +
+            self.activation_u16_dev.size +
             self.attn_q_dev.size +
             self.query_gate_proj_dev.size +
             self.attn_k_dev.size +
@@ -633,11 +653,14 @@ const RuntimeBuffers = struct {
         const d_attn_bytes = std.math.mul(usize, self.max_attn, @sizeOf(f32)) catch return error.InvalidArgument;
         const d_kv_bytes = std.math.mul(usize, self.max_kv, @sizeOf(f32)) catch return error.InvalidArgument;
         const d_gdelta_proj_bytes = std.math.mul(usize, self.max_gdelta_proj, @sizeOf(f32)) catch return error.InvalidArgument;
+        const max_linear_in_dim = @max(@max(self.hidden_host.len, self.max_dff), @max(self.max_attn, self.max_gdelta_proj));
+        const activation_u16_bytes = std.math.mul(usize, max_linear_in_dim, @sizeOf(u16)) catch return error.InvalidArgument;
         const shortconv_proj_bytes = std.math.mul(usize, self.shortconv_dim * 3, @sizeOf(f32)) catch return error.InvalidArgument;
         const shortconv_conv_bytes = std.math.mul(usize, self.shortconv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
 
         try resizeScratchBuffer(device, &self.input_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
         try resizeScratchBuffer(device, &self.norm_out_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
+        try resizeScratchBuffer(device, &self.activation_u16_dev, std.math.mul(usize, activation_u16_bytes, new_capacity) catch return error.InvalidArgument);
         try resizeScratchBuffer(device, &self.attn_q_dev, std.math.mul(usize, d_attn_bytes, new_capacity) catch return error.InvalidArgument);
         try resizeScratchBuffer(device, &self.query_gate_proj_dev, std.math.mul(usize, d_attn_bytes, new_capacity) catch return error.InvalidArgument);
         try resizeScratchBuffer(device, &self.attn_k_dev, std.math.mul(usize, d_kv_bytes, new_capacity) catch return error.InvalidArgument);
@@ -2545,6 +2568,8 @@ pub const CudaBackend = struct {
     copy_u16_source: ?compute.cuda.registry.KernelSource = null,
     cast_f32_to_f16_function: ?compute.cuda.Function = null,
     cast_f32_to_f16_source: ?compute.cuda.registry.KernelSource = null,
+    cast_f32_to_bf16_function: ?compute.cuda.Function = null,
+    cast_f32_to_bf16_source: ?compute.cuda.registry.KernelSource = null,
     embedding_lookup_f32_function: ?compute.cuda.Function = null,
     embedding_lookup_f32_source: ?compute.cuda.registry.KernelSource = null,
     embedding_lookup_u16_function: ?compute.cuda.Function = null,
@@ -2591,10 +2616,20 @@ pub const CudaBackend = struct {
     gated_attention_output_gate_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_conv_function: ?compute.cuda.Function = null,
     gated_delta_conv_source: ?compute.cuda.registry.KernelSource = null,
+    gated_delta_conv_silu_function: ?compute.cuda.Function = null,
+    gated_delta_conv_silu_source: ?compute.cuda.registry.KernelSource = null,
+    gated_delta_conv_silu_rows_function: ?compute.cuda.Function = null,
+    gated_delta_conv_silu_rows_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_qk_norm_function: ?compute.cuda.Function = null,
     gated_delta_qk_norm_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_ssm_function: ?compute.cuda.Function = null,
     gated_delta_ssm_source: ?compute.cuda.registry.KernelSource = null,
+    gated_delta_ssm_rows_function: ?compute.cuda.Function = null,
+    gated_delta_ssm_rows_source: ?compute.cuda.registry.KernelSource = null,
+    gated_delta_rmsnorm_silu_mul_function: ?compute.cuda.Function = null,
+    gated_delta_rmsnorm_silu_mul_source: ?compute.cuda.registry.KernelSource = null,
+    gated_delta_rmsnorm_silu_mul_rows_function: ?compute.cuda.Function = null,
+    gated_delta_rmsnorm_silu_mul_rows_source: ?compute.cuda.registry.KernelSource = null,
     argmax_function: ?compute.cuda.Function = null,
     argmax_source: ?compute.cuda.registry.KernelSource = null,
     matmul_f16_function: ?compute.cuda.Function = null,
@@ -2626,6 +2661,8 @@ pub const CudaBackend = struct {
     gaffine_sequence_rows_supported: bool = false,
     gaffine_sequence_fused_qkv_supported: bool = false,
     gaffine_sequence_fused_gate_up_supported: bool = false,
+    u16_blas_f16_supported: bool = true,
+    u16_blas_bf16_supported: bool = true,
     kernel_arg_pack: compute.cuda.ArgPack,
     blas: compute.cuda.Blas,
     runtime_buffers: RuntimeBuffers,
@@ -4592,6 +4629,90 @@ pub const CudaBackend = struct {
                     .f16 => self.matmul_f16_function orelse return error.CudaKernelUnavailable,
                     .bf16 => self.matmul_bf16_function orelse return error.CudaKernelUnavailable,
                 };
+                const blas_payload: compute.cuda.Blas.U16Payload = switch (w.dtype) {
+                    .f16 => .f16,
+                    .bf16 => .bf16,
+                };
+                const blas_supported = switch (w.dtype) {
+                    .f16 => self.u16_blas_f16_supported,
+                    .bf16 => self.u16_blas_bf16_supported,
+                };
+                if (blas_supported) {
+                    const input_u16_count = std.math.mul(usize, rows, w.rows) catch return error.InvalidArgument;
+                    const input_u16_bytes = std.math.mul(usize, input_u16_count, @sizeOf(u16)) catch return error.InvalidArgument;
+                    if (self.runtime_buffers.activation_u16_dev.size < input_u16_bytes) return error.InvalidInstructionBinding;
+                    var input_u16_dev = try bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, input_u16_bytes);
+                    const cast_kernel = switch (w.dtype) {
+                        .f16 => self.cast_f32_to_f16_function orelse null,
+                        .bf16 => self.cast_f32_to_bf16_function orelse null,
+                    };
+                    if (cast_kernel) |cast_fn| {
+                        switch (w.dtype) {
+                            .f16 => try compute.cuda.cast_f32_to_f16.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                cast_fn,
+                                &packed_input,
+                                &input_u16_dev,
+                                @intCast(input_u16_count),
+                            ),
+                            .bf16 => try compute.cuda.cast_f32_to_bf16.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                cast_fn,
+                                &packed_input,
+                                &input_u16_dev,
+                                @intCast(input_u16_count),
+                            ),
+                        }
+                    } else {
+                        switch (w.dtype) {
+                            .f16 => self.u16_blas_f16_supported = false,
+                            .bf16 => self.u16_blas_bf16_supported = false,
+                        }
+                        try compute.cuda.matmul_u16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            matmul_kernel,
+                            &packed_input,
+                            &w.buffer,
+                            &packed_out,
+                            @intCast(rows),
+                            @intCast(w.rows),
+                            @intCast(w.cols),
+                        );
+                        return;
+                    }
+
+                    self.blas.matmulU16U16F32(
+                        &self.device,
+                        &input_u16_dev,
+                        blas_payload,
+                        rows,
+                        w.rows,
+                        &w.buffer,
+                        blas_payload,
+                        w.cols,
+                        &packed_out,
+                    ) catch {
+                        switch (w.dtype) {
+                            .f16 => self.u16_blas_f16_supported = false,
+                            .bf16 => self.u16_blas_bf16_supported = false,
+                        }
+                        try compute.cuda.matmul_u16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            matmul_kernel,
+                            &packed_input,
+                            &w.buffer,
+                            &packed_out,
+                            @intCast(rows),
+                            @intCast(w.rows),
+                            @intCast(w.cols),
+                        );
+                    };
+                    return;
+                }
                 try compute.cuda.matmul_u16.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
@@ -5536,41 +5657,140 @@ pub const CudaBackend = struct {
             }
         }
 
-        for (0..seq_len) |t| {
-            const ssm_host_row = block.scratch.getSsmOutput(d_inner);
+        if (qkv_len <= d_inner) return error.InvalidShape;
+        const qk_total = qkv_len - d_inner;
+        if ((qk_total % 2) != 0) return error.InvalidShape;
+        const qk_inner = qk_total / 2;
+        if ((qk_inner % d_head) != 0) return error.InvalidShape;
+        const n_qk_heads = qk_inner / d_head;
+        if (n_qk_heads == 0 or (n_v_heads % n_qk_heads) != 0) return error.InvalidShape;
 
-            if (qkv_len <= d_inner) return error.InvalidShape;
-            const qk_total = qkv_len - d_inner;
-            if ((qk_total % 2) != 0) return error.InvalidShape;
-            const qk_inner = qk_total / 2;
-            if ((qk_inner % d_head) != 0) return error.InvalidShape;
-            const n_qk_heads = qk_inner / d_head;
-            if (n_qk_heads == 0 or (n_v_heads % n_qk_heads) != 0) return error.InvalidShape;
+        const qkv_bytes = std.math.mul(usize, qkv_len, @sizeOf(f32)) catch return error.InvalidArgument;
+        const z_bytes = std.math.mul(usize, d_inner, @sizeOf(f32)) catch return error.InvalidArgument;
+        const beta_bytes = std.math.mul(usize, n_v_heads, @sizeOf(f32)) catch return error.InvalidArgument;
+        const a_bytes = beta_bytes;
+        const beta_offset_elems = qkv_len + d_inner;
+        const a_offset_elems = beta_offset_elems + n_v_heads;
+        const use_rows_conv_silu = seq_len > 1 and self.gated_delta_conv_silu_rows_function != null;
+        const use_token_conv_silu = !trace_enabled and self.gated_delta_conv_silu_function != null;
+        const use_rows_ssm = seq_len > 1 and self.gated_delta_ssm_rows_function != null;
+        const head_bytes = std.math.mul(usize, d_head, @sizeOf(f32)) catch return error.InvalidArgument;
+        const fused_norm_gate_supported = self.gated_delta_rmsnorm_silu_mul_function != null and
+            ((block.norm_weight.buffer.size == head_bytes) or (block.norm_weight.buffer.size == ssm_bytes));
+        const rows_norm_weight_stride: u32 = if (block.norm_weight.buffer.size == head_bytes)
+            0
+        else
+            @intCast(d_head);
+        const use_rows_norm_gate = use_rows_ssm and
+            fused_norm_gate_supported and
+            self.gated_delta_rmsnorm_silu_mul_rows_function != null;
 
-            var proj_row_dev = try logicalF32RowSlice(&proj_dev, seq_len, t, proj_len);
-            const qkv_bytes = std.math.mul(usize, qkv_len, @sizeOf(f32)) catch return error.InvalidArgument;
-            const z_bytes = std.math.mul(usize, d_inner, @sizeOf(f32)) catch return error.InvalidArgument;
-            const beta_bytes = std.math.mul(usize, n_v_heads, @sizeOf(f32)) catch return error.InvalidArgument;
-            const a_bytes = beta_bytes;
-
-            var qkv_dev = try bufferSlice(&proj_row_dev, 0, qkv_bytes);
-            try compute.cuda.gated_delta_conv.runWithFunction(
+        if (use_rows_conv_silu) {
+            var qkv_all_dev = try bufferSlice(&proj_dev, 0, proj_bytes);
+            try compute.cuda.gated_delta_conv_silu_rows.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
-                self.gated_delta_conv_function orelse return error.CudaKernelUnavailable,
-                &qkv_dev,
+                self.gated_delta_conv_silu_rows_function.?,
+                &qkv_all_dev,
                 &block.conv_state_dev,
                 &block.conv_weight_time_major.buffer,
                 if (block.conv_bias) |*bias| &bias.buffer else null,
-                &qkv_dev,
+                &qkv_all_dev,
                 @intCast(qkv_len),
                 @intCast(d_conv),
                 block.conv_ring_head,
+                @intCast(seq_len),
+                @intCast(proj_len),
             );
-            block.conv_ring_head = if (block.conv_ring_head + 1 >= @as(u32, @intCast(d_conv)))
-                0
-            else
-                block.conv_ring_head + 1;
+            block.conv_ring_head = @intCast((@as(usize, block.conv_ring_head) + seq_len) % d_conv);
+        }
+        if (use_rows_ssm) {
+            var qkv_all_dev = try bufferSlice(&proj_dev, 0, proj_bytes);
+            try compute.cuda.gated_delta_ssm_rows.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.gated_delta_ssm_rows_function.?,
+                &qkv_all_dev,
+                &block.a_log.buffer,
+                if (block.dt_bias) |*bias| &bias.buffer else null,
+                &block.ssm_state_dev,
+                &norm_stage_dev,
+                @intCast(n_qk_heads),
+                @intCast(n_v_heads),
+                @intCast(d_head),
+                @intCast(seq_len),
+                @intCast(proj_len),
+                @intCast(beta_offset_elems),
+                @intCast(a_offset_elems),
+                @intCast(d_inner),
+            );
+        }
+        if (use_rows_norm_gate) {
+            const rows_total = std.math.mul(usize, seq_len, n_v_heads) catch return error.InvalidArgument;
+            try compute.cuda.gated_delta_rmsnorm_silu_mul_rows.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.gated_delta_rmsnorm_silu_mul_rows_function.?,
+                &norm_stage_dev,
+                &proj_dev,
+                &block.norm_weight.buffer,
+                &norm_stage_dev,
+                @intCast(rows_total),
+                @intCast(d_head),
+                @intCast(n_v_heads),
+                @intCast(proj_len),
+                @intCast(qkv_len),
+                1.0e-6,
+                rows_norm_weight_stride,
+            );
+        }
+        const use_fully_batched_gdelta = !trace_enabled and use_rows_conv_silu and use_rows_ssm and use_rows_norm_gate;
+        if (use_fully_batched_gdelta) {
+            try self.linearForwardRows(&norm_stage_dev, seq_len, &block.out_proj, output);
+            return;
+        }
+
+        for (0..seq_len) |t| {
+            const ssm_host_row = block.scratch.getSsmOutput(d_inner);
+
+            var proj_row_dev = try logicalF32RowSlice(&proj_dev, seq_len, t, proj_len);
+
+            var qkv_dev = try bufferSlice(&proj_row_dev, 0, qkv_bytes);
+            if (!use_rows_conv_silu) {
+                if (use_token_conv_silu) {
+                    try compute.cuda.gated_delta_conv_silu.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        self.gated_delta_conv_silu_function.?,
+                        &qkv_dev,
+                        &block.conv_state_dev,
+                        &block.conv_weight_time_major.buffer,
+                        if (block.conv_bias) |*bias| &bias.buffer else null,
+                        &qkv_dev,
+                        @intCast(qkv_len),
+                        @intCast(d_conv),
+                        block.conv_ring_head,
+                    );
+                } else {
+                    try compute.cuda.gated_delta_conv.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        self.gated_delta_conv_function orelse return error.CudaKernelUnavailable,
+                        &qkv_dev,
+                        &block.conv_state_dev,
+                        &block.conv_weight_time_major.buffer,
+                        if (block.conv_bias) |*bias| &bias.buffer else null,
+                        &qkv_dev,
+                        @intCast(qkv_len),
+                        @intCast(d_conv),
+                        block.conv_ring_head,
+                    );
+                }
+                block.conv_ring_head = if (block.conv_ring_head + 1 >= @as(u32, @intCast(d_conv)))
+                    0
+                else
+                    block.conv_ring_head + 1;
+            }
             if (trace_enabled) {
                 const conv_host = self.gated_delta_stage_input_host[0..qkv_len];
                 try qkv_dev.download(&self.device, std.mem.sliceAsBytes(conv_host));
@@ -5588,34 +5808,38 @@ pub const CudaBackend = struct {
                     null,
                 );
             }
-            try compute.cuda.silu.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.silu_function orelse return error.CudaKernelUnavailable,
-                &qkv_dev,
-                &qkv_dev,
-                @intCast(qkv_len),
-            );
+            if (!use_rows_conv_silu and !use_token_conv_silu) {
+                try compute.cuda.silu.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    self.silu_function orelse return error.CudaKernelUnavailable,
+                    &qkv_dev,
+                    &qkv_dev,
+                    @intCast(qkv_len),
+                );
+            }
             var z_dev = try bufferSlice(&proj_row_dev, qkv_bytes, z_bytes);
             var beta_dev = try bufferSlice(&proj_row_dev, qkv_bytes + z_bytes, beta_bytes);
             var a_dev = try bufferSlice(&proj_row_dev, qkv_bytes + z_bytes + beta_bytes, a_bytes);
             const norm_stage_offset = std.math.mul(usize, t, ssm_bytes) catch return error.InvalidArgument;
             var norm_dev = try bufferSlice(&norm_stage_dev, norm_stage_offset, ssm_bytes);
-            try compute.cuda.gated_delta_ssm.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.gated_delta_ssm_function orelse return error.CudaKernelUnavailable,
-                &qkv_dev,
-                &beta_dev,
-                &a_dev,
-                &block.a_log.buffer,
-                if (block.dt_bias) |*bias| &bias.buffer else null,
-                &block.ssm_state_dev,
-                &norm_dev,
-                @intCast(n_qk_heads),
-                @intCast(n_v_heads),
-                @intCast(d_head),
-            );
+            if (!use_rows_ssm) {
+                try compute.cuda.gated_delta_ssm.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    self.gated_delta_ssm_function orelse return error.CudaKernelUnavailable,
+                    &qkv_dev,
+                    &beta_dev,
+                    &a_dev,
+                    &block.a_log.buffer,
+                    if (block.dt_bias) |*bias| &bias.buffer else null,
+                    &block.ssm_state_dev,
+                    &norm_dev,
+                    @intCast(n_qk_heads),
+                    @intCast(n_v_heads),
+                    @intCast(d_head),
+                );
+            }
             if (trace_enabled) {
                 try norm_dev.download(&self.device, std.mem.sliceAsBytes(ssm_host_row));
                 const prev_gpu_backend = trace.setBackendContext(.cuda);
@@ -5633,50 +5857,65 @@ pub const CudaBackend = struct {
                 );
             }
 
-            const head_bytes = std.math.mul(usize, d_head, @sizeOf(f32)) catch return error.InvalidArgument;
-            if (block.norm_weight.buffer.size == head_bytes) {
-                try compute.cuda.rmsnorm.runWithFunction(
+            if (fused_norm_gate_supported and !use_rows_norm_gate) {
+                try compute.cuda.gated_delta_rmsnorm_silu_mul.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
-                    self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                    self.gated_delta_rmsnorm_silu_mul_function.?,
                     &norm_dev,
+                    &z_dev,
                     &block.norm_weight.buffer,
                     &norm_dev,
                     @intCast(n_v_heads),
                     @intCast(d_head),
                     1.0e-6,
-                    0.0,
+                    rows_norm_weight_stride,
                 );
-            } else if (block.norm_weight.buffer.size == ssm_bytes) {
-                for (0..n_v_heads) |head_idx| {
-                    const head_offset_bytes = std.math.mul(usize, head_idx * d_head, @sizeOf(f32)) catch return error.InvalidArgument;
-                    var norm_head_dev = try bufferSlice(&norm_dev, head_offset_bytes, head_bytes);
-                    var weight_head_dev = try bufferSlice(&block.norm_weight.buffer, head_offset_bytes, head_bytes);
+            } else if (!fused_norm_gate_supported) {
+                if (block.norm_weight.buffer.size == head_bytes) {
                     try compute.cuda.rmsnorm.runWithFunction(
                         &self.kernel_arg_pack,
                         &self.device,
                         self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                        &norm_head_dev,
-                        &weight_head_dev,
-                        &norm_head_dev,
-                        1,
+                        &norm_dev,
+                        &block.norm_weight.buffer,
+                        &norm_dev,
+                        @intCast(n_v_heads),
                         @intCast(d_head),
                         1.0e-6,
                         0.0,
                     );
+                } else if (block.norm_weight.buffer.size == ssm_bytes) {
+                    for (0..n_v_heads) |head_idx| {
+                        const head_offset_bytes = std.math.mul(usize, head_idx * d_head, @sizeOf(f32)) catch return error.InvalidArgument;
+                        var norm_head_dev = try bufferSlice(&norm_dev, head_offset_bytes, head_bytes);
+                        var weight_head_dev = try bufferSlice(&block.norm_weight.buffer, head_offset_bytes, head_bytes);
+                        try compute.cuda.rmsnorm.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                            &norm_head_dev,
+                            &weight_head_dev,
+                            &norm_head_dev,
+                            1,
+                            @intCast(d_head),
+                            1.0e-6,
+                            0.0,
+                        );
+                    }
+                } else {
+                    return error.InvalidShape;
                 }
-            } else {
-                return error.InvalidShape;
+                try compute.cuda.silu_mul.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    self.silu_mul_function orelse return error.CudaKernelUnavailable,
+                    &z_dev,
+                    &norm_dev,
+                    &norm_dev,
+                    @intCast(d_inner),
+                );
             }
-            try compute.cuda.silu_mul.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.silu_mul_function orelse return error.CudaKernelUnavailable,
-                &z_dev,
-                &norm_dev,
-                &norm_dev,
-                @intCast(d_inner),
-            );
             if (trace_enabled) {
                 try norm_dev.download(&self.device, std.mem.sliceAsBytes(ssm_host_row));
                 const prev_gpu_backend = trace.setBackendContext(.cuda);
@@ -6228,6 +6467,23 @@ pub const CudaBackend = struct {
         };
     }
 
+    test "tracePositionForPoint prefill uses sequence length across points" {
+        const pos_offset: usize = 13;
+        const seq_len: u32 = 14;
+        try std.testing.expectEqual(@as(u32, 14), tracePositionForPoint(.layer_attn_norm, pos_offset, seq_len));
+        try std.testing.expectEqual(@as(u32, 14), tracePositionForPoint(.attn_q, pos_offset, seq_len));
+        try std.testing.expectEqual(@as(u32, 14), tracePositionForPoint(.attn_out, pos_offset, seq_len));
+    }
+
+    test "tracePositionForPoint decode matches CPU trace semantics" {
+        const pos_offset: usize = 13;
+        const seq_len: u32 = 1;
+        try std.testing.expectEqual(@as(u32, 1), tracePositionForPoint(.layer_attn_norm, pos_offset, seq_len));
+        try std.testing.expectEqual(@as(u32, 13), tracePositionForPoint(.attn_q, pos_offset, seq_len));
+        try std.testing.expectEqual(@as(u32, 14), tracePositionForPoint(.attn_out, pos_offset, seq_len));
+        try std.testing.expectEqual(@as(u32, 1), tracePositionForPoint(.ffn_down, pos_offset, seq_len));
+    }
+
     fn ensureParityPrefillBufferCapacity(self: *CudaBackend, buffer: *[]f32, elements: usize) !void {
         if (buffer.*.len >= elements) return;
         if (buffer.*.len > 0) self.allocator.free(buffer.*);
@@ -6334,21 +6590,8 @@ pub const CudaBackend = struct {
                         const dst_start = ctx.layer_index * per_layer;
                         @memcpy(prefill_buffer[dst_start .. dst_start + per_layer], layer_host);
                         emit_kernel_name = std.fmt.bufPrint(&host_kernel_name_buf, "{s}_host", .{kernel_name}) catch kernel_name;
-                        for (0..parity_seq_len) |token_idx| {
-                            const row = layer_host[token_idx * width ..][0..width];
-                            trace.emit(
-                                point,
-                                @intCast(ctx.layer_index),
-                                0,
-                                @intCast(token_idx),
-                                @ptrCast(row.ptr),
-                                .f32,
-                                .{ 1, 1, @intCast(width), 0 },
-                                3,
-                                emit_kernel_name,
-                            );
-                        }
-                        return;
+                        data_ptr = @ptrCast(layer_host.ptr);
+                        emit_dtype = .f32;
                     }
                 } else {
                     return;
@@ -7887,6 +8130,10 @@ pub const CudaBackend = struct {
                 self.cast_f32_to_f16_function = resolved.function;
                 self.cast_f32_to_f16_source = resolved.source;
             },
+            .cast_f32_to_bf16 => {
+                self.cast_f32_to_bf16_function = resolved.function;
+                self.cast_f32_to_bf16_source = resolved.source;
+            },
             .embedding_lookup_f32 => {
                 self.embedding_lookup_f32_function = resolved.function;
                 self.embedding_lookup_f32_source = resolved.source;
@@ -7979,6 +8226,14 @@ pub const CudaBackend = struct {
                 self.gated_delta_conv_function = resolved.function;
                 self.gated_delta_conv_source = resolved.source;
             },
+            .gated_delta_conv_silu => {
+                self.gated_delta_conv_silu_function = resolved.function;
+                self.gated_delta_conv_silu_source = resolved.source;
+            },
+            .gated_delta_conv_silu_rows => {
+                self.gated_delta_conv_silu_rows_function = resolved.function;
+                self.gated_delta_conv_silu_rows_source = resolved.source;
+            },
             .gated_delta_qk_norm => {
                 self.gated_delta_qk_norm_function = resolved.function;
                 self.gated_delta_qk_norm_source = resolved.source;
@@ -7986,6 +8241,18 @@ pub const CudaBackend = struct {
             .gated_delta_ssm => {
                 self.gated_delta_ssm_function = resolved.function;
                 self.gated_delta_ssm_source = resolved.source;
+            },
+            .gated_delta_ssm_rows => {
+                self.gated_delta_ssm_rows_function = resolved.function;
+                self.gated_delta_ssm_rows_source = resolved.source;
+            },
+            .gated_delta_rmsnorm_silu_mul => {
+                self.gated_delta_rmsnorm_silu_mul_function = resolved.function;
+                self.gated_delta_rmsnorm_silu_mul_source = resolved.source;
+            },
+            .gated_delta_rmsnorm_silu_mul_rows => {
+                self.gated_delta_rmsnorm_silu_mul_rows_function = resolved.function;
+                self.gated_delta_rmsnorm_silu_mul_rows_source = resolved.source;
             },
             .argmax => {
                 self.argmax_function = resolved.function;

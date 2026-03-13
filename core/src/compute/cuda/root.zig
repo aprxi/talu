@@ -18,6 +18,7 @@ pub const mul = @import("mul.zig");
 pub const copy = @import("copy.zig");
 pub const copy_u16 = @import("copy_u16.zig");
 pub const cast_f32_to_f16 = @import("cast_f32_to_f16.zig");
+pub const cast_f32_to_bf16 = @import("cast_f32_to_bf16.zig");
 pub const embedding_lookup_f32 = @import("embedding_lookup_f32.zig");
 pub const embedding_lookup_u16 = @import("embedding_lookup_u16.zig");
 pub const embedding_lookup_u16_rows = @import("embedding_lookup_u16_rows.zig");
@@ -49,8 +50,13 @@ pub const shortconv_step = @import("shortconv_step.zig");
 pub const gated_attention_compact_q = @import("gated_attention_compact_q.zig");
 pub const gated_attention_output_gate = @import("gated_attention_output_gate.zig");
 pub const gated_delta_conv = @import("gated_delta_conv.zig");
+pub const gated_delta_conv_silu = @import("gated_delta_conv_silu.zig");
+pub const gated_delta_conv_silu_rows = @import("gated_delta_conv_silu_rows.zig");
 pub const gated_delta_qk_norm = @import("gated_delta_qk_norm.zig");
 pub const gated_delta_ssm = @import("gated_delta_ssm.zig");
+pub const gated_delta_ssm_rows = @import("gated_delta_ssm_rows.zig");
+pub const gated_delta_rmsnorm_silu_mul = @import("gated_delta_rmsnorm_silu_mul.zig");
+pub const gated_delta_rmsnorm_silu_mul_rows = @import("gated_delta_rmsnorm_silu_mul_rows.zig");
 pub const matmul_u16 = @import("matmul_u16.zig");
 
 pub const Device = device.Device;
@@ -81,6 +87,7 @@ test {
     _ = copy;
     _ = copy_u16;
     _ = cast_f32_to_f16;
+    _ = cast_f32_to_bf16;
     _ = embedding_lookup_f32;
     _ = embedding_lookup_u16;
     _ = embedding_lookup_u16_rows;
@@ -112,7 +119,12 @@ test {
     _ = gated_attention_compact_q;
     _ = gated_attention_output_gate;
     _ = gated_delta_conv;
+    _ = gated_delta_conv_silu;
+    _ = gated_delta_conv_silu_rows;
     _ = gated_delta_qk_norm;
     _ = gated_delta_ssm;
+    _ = gated_delta_ssm_rows;
+    _ = gated_delta_rmsnorm_silu_mul;
+    _ = gated_delta_rmsnorm_silu_mul_rows;
     _ = matmul_u16;
 }
