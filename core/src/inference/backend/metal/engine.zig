@@ -277,6 +277,13 @@ pub const MetalBackend = struct {
             @intCast(loaded.config.head_dim);
         if (rope_dim == 0) return null;
 
+        // Standard RoPE (no scaling) is handled by MLX fast::rope which is a
+        // single fused Metal kernel. Only build runtime tables for non-standard
+        // scaling (llama3, yarn, linear) where fast::rope cannot reproduce the
+        // modified inverse frequencies.
+        const rs = loaded.config.rope_scaling;
+        if (rs.rope_type == .none) return null;
+
         var freqs = try rope_scaling.materializeInverseFrequencies(
             rope_allocator,
             rope_dim,
