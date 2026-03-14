@@ -563,10 +563,10 @@ extern "C" __global__ void talu_gaffine_u8_matvec_gate_up_silu_f32(
 }
 
 extern "C" __global__ void talu_gaffine_u8_dequantize_to_f16(
-    const unsigned int* packed_weight,
-    const unsigned short* scales,
-    const unsigned short* biases,
-    unsigned short* out_f16,
+    const unsigned int* __restrict__ packed_weight,
+    const unsigned short* __restrict__ scales,
+    const unsigned short* __restrict__ biases,
+    unsigned short* __restrict__ out_f16,
     unsigned int out_dim,
     unsigned int in_dim,
     unsigned int group_size,
@@ -574,30 +574,406 @@ extern "C" __global__ void talu_gaffine_u8_dequantize_to_f16(
 ) {
     const unsigned int row = blockIdx.x;
     if (row >= out_dim) return;
-    if (group_size == 0 || (in_dim % group_size) != 0 || (in_dim % 4) != 0 || (group_size % 4) != 0) return;
 
-    const unsigned int words_per_row = in_dim / 4;
+    const unsigned int words_per_row = in_dim >> 2;
     const unsigned int groups_per_row = in_dim / group_size;
     const unsigned int* weight_row = packed_weight + (unsigned long long)row * words_per_row;
     const unsigned short* scale_row = scales + (unsigned long long)row * groups_per_row;
     const unsigned short* bias_row = biases + (unsigned long long)row * groups_per_row;
     unsigned short* out_row = out_f16 + (unsigned long long)row * in_dim;
 
-    for (unsigned int i = threadIdx.x * 4; i < in_dim; i += blockDim.x * 4) {
-        const unsigned int packed = weight_row[i >> 2];
+    // Process 16 U8 values per thread via 128-bit loads and stores.
+    for (unsigned int i = threadIdx.x * 16; i < in_dim; i += blockDim.x * 16) {
+        // 128-bit streaming load: 4 uint32 words = 16 packed U8 values.
+        uint4 p;
+        asm volatile("ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(p.x), "=r"(p.y), "=r"(p.z), "=r"(p.w)
+            : "l"(&weight_row[i >> 2]));
 
-        const unsigned int group_idx = i / group_size;
-        const float scale = talu_decode_scale_bias_u16(scale_row[group_idx], scales_dtype_tag);
-        const float bias = talu_decode_scale_bias_u16(bias_row[group_idx], scales_dtype_tag);
+        float4 store0, store1;
+        unsigned int g;
+        float s, b;
 
-        const float v0 = static_cast<float>(packed & 0xFFu) * scale + bias;
-        const float v1 = static_cast<float>((packed >> 8) & 0xFFu) * scale + bias;
-        const float v2 = static_cast<float>((packed >> 16) & 0xFFu) * scale + bias;
-        const float v3 = static_cast<float>(packed >> 24) * scale + bias;
+        // Elements i..i+3 (word 0)
+        g = i / group_size;
+        s = talu_decode_scale_bias_u16(scale_row[g], scales_dtype_tag);
+        b = talu_decode_scale_bias_u16(bias_row[g], scales_dtype_tag);
+        reinterpret_cast<__half2*>(&store0)[0] = __floats2half2_rn(
+            static_cast<float>(p.x & 0xFFu) * s + b,
+            static_cast<float>((p.x >> 8) & 0xFFu) * s + b);
+        reinterpret_cast<__half2*>(&store0)[1] = __floats2half2_rn(
+            static_cast<float>((p.x >> 16) & 0xFFu) * s + b,
+            static_cast<float>(p.x >> 24) * s + b);
 
-        __half2 h01 = __floats2half2_rn(v0, v1);
-        __half2 h23 = __floats2half2_rn(v2, v3);
-        *reinterpret_cast<__half2*>(&out_row[i]) = h01;
-        *reinterpret_cast<__half2*>(&out_row[i + 2]) = h23;
+        // Elements i+4..i+7 (word 1)
+        g = (i + 4) / group_size;
+        s = talu_decode_scale_bias_u16(scale_row[g], scales_dtype_tag);
+        b = talu_decode_scale_bias_u16(bias_row[g], scales_dtype_tag);
+        reinterpret_cast<__half2*>(&store0)[2] = __floats2half2_rn(
+            static_cast<float>(p.y & 0xFFu) * s + b,
+            static_cast<float>((p.y >> 8) & 0xFFu) * s + b);
+        reinterpret_cast<__half2*>(&store0)[3] = __floats2half2_rn(
+            static_cast<float>((p.y >> 16) & 0xFFu) * s + b,
+            static_cast<float>(p.y >> 24) * s + b);
+
+        // 128-bit store for first 8 F16 values.
+        *reinterpret_cast<float4*>(&out_row[i]) = store0;
+
+        // Elements i+8..i+11 (word 2)
+        g = (i + 8) / group_size;
+        s = talu_decode_scale_bias_u16(scale_row[g], scales_dtype_tag);
+        b = talu_decode_scale_bias_u16(bias_row[g], scales_dtype_tag);
+        reinterpret_cast<__half2*>(&store1)[0] = __floats2half2_rn(
+            static_cast<float>(p.z & 0xFFu) * s + b,
+            static_cast<float>((p.z >> 8) & 0xFFu) * s + b);
+        reinterpret_cast<__half2*>(&store1)[1] = __floats2half2_rn(
+            static_cast<float>((p.z >> 16) & 0xFFu) * s + b,
+            static_cast<float>(p.z >> 24) * s + b);
+
+        // Elements i+12..i+15 (word 3)
+        g = (i + 12) / group_size;
+        s = talu_decode_scale_bias_u16(scale_row[g], scales_dtype_tag);
+        b = talu_decode_scale_bias_u16(bias_row[g], scales_dtype_tag);
+        reinterpret_cast<__half2*>(&store1)[2] = __floats2half2_rn(
+            static_cast<float>(p.w & 0xFFu) * s + b,
+            static_cast<float>((p.w >> 8) & 0xFFu) * s + b);
+        reinterpret_cast<__half2*>(&store1)[3] = __floats2half2_rn(
+            static_cast<float>((p.w >> 16) & 0xFFu) * s + b,
+            static_cast<float>(p.w >> 24) * s + b);
+
+        // 128-bit store for next 8 F16 values.
+        *reinterpret_cast<float4*>(&out_row[i + 8]) = store1;
+    }
+}
+
+// ─── INT8 GEMM support for grouped-affine U8 prefill ───
+
+// Quantize F32 input to I8 with per-row absmax scaling.
+// Also computes per-group input sums (F32) for bias correction.
+// Launch: grid=(rows), block=(256)
+// out_i8:          [rows × in_dim] signed int8
+// out_row_scales:  [rows] float — scale per row (absmax / 127)
+// out_group_sums:  [rows × num_groups] float — per-group sums of the original F32 input
+extern "C" __global__ void talu_quantize_f32_to_i8(
+    const float* __restrict__ input,
+    signed char* __restrict__ out_i8,
+    float* __restrict__ out_row_scales,
+    float* __restrict__ out_group_sums,
+    unsigned int in_dim,
+    unsigned int group_size
+) {
+    const unsigned int row = blockIdx.x;
+    const float* row_in = input + (unsigned long long)row * in_dim;
+    signed char* row_out = out_i8 + (unsigned long long)row * in_dim;
+    const unsigned int num_groups = in_dim / group_size;
+
+    // Phase 1: find per-row absmax via block reduction.
+    __shared__ float smem[8]; // 256/32 = 8 warps
+    float local_max = 0.0f;
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(row_in[i]));
+    }
+    // Warp reduce.
+    for (int offset = 16; offset >= 1; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFFu, local_max, offset));
+    if ((threadIdx.x & 31) == 0) smem[threadIdx.x >> 5] = local_max;
+    __syncthreads();
+    if (threadIdx.x < 8) {
+        local_max = smem[threadIdx.x];
+        for (int offset = 4; offset >= 1; offset >>= 1)
+            local_max = fmaxf(local_max, __shfl_down_sync(0xFFu, local_max, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) smem[0] = local_max;
+    __syncthreads();
+    const float absmax = smem[0];
+    const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale;
+    if (threadIdx.x == 0) out_row_scales[row] = scale;
+
+    // Phase 2: quantize to I8 and compute per-group sums.
+    // Each thread handles a strided subset of elements.
+    // Use shared memory for group sum accumulation.
+    extern __shared__ float group_smem[]; // num_groups floats per warp → too complex
+    // Simpler: each thread accumulates its own group sums, then warp/block reduce.
+    // But num_groups can be up to ~80. Use a different approach:
+    // Two-pass or combined pass.
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        float val = row_in[i];
+        int q = __float2int_rn(val * inv_scale);
+        q = max(-128, min(127, q));
+        row_out[i] = static_cast<signed char>(q);
+    }
+
+    // Per-group sums: each thread accumulates sums for each group.
+    // With group_size typically 128 and blockDim=256, 2 threads per group element.
+    float* row_gsums = out_group_sums + (unsigned long long)row * num_groups;
+    for (unsigned int g = 0; g < num_groups; g++) {
+        float gsum = 0.0f;
+        const unsigned int base = g * group_size;
+        for (unsigned int j = threadIdx.x; j < group_size; j += blockDim.x) {
+            gsum += row_in[base + j];
+        }
+        // Block reduce this group sum.
+        gsum = talu_block_reduce_sum_128(gsum, smem);
+        if (threadIdx.x == 0) row_gsums[g] = gsum;
+        __syncthreads();
+    }
+}
+
+// Dequantize I32 GEMM output to F32 with grouped-affine correction.
+// gemm_i32[m][n] = sum_k(input_i8[m][k] * weight_i8[n][k])
+//   where weight_i8 = weight_u8 - 128 (XOR 0x80).
+//
+// Reconstruct: y[m][n] = sum_g(scale[n][g] * group_dot_u8x[m][n][g]) + bias_term[m][n]
+//
+// Since we only have the TOTAL dot product (not per-group), we use:
+//   y[m][n] ≈ mean_scale[n] * (gemm_i32[m][n] + 128 * i8_rowsum[m]) * row_scale[m]
+//            + bias_term[m][n]
+//
+// Where bias_term[m][n] = sum_g(bias[n][g] * group_input_sum[m][g])
+//
+// Launch: grid=(out_dim), block=(256)
+extern "C" __global__ void talu_dequant_i32_gaffine(
+    const int* __restrict__ gemm_i32,       // [rows × out_dim]
+    const float* __restrict__ row_scales,    // [rows]
+    const int* __restrict__ i8_rowsums,      // [rows]
+    const float* __restrict__ group_sums,    // [rows × num_groups]
+    const unsigned short* __restrict__ scales, // [out_dim × num_groups]
+    const unsigned short* __restrict__ biases, // [out_dim × num_groups]
+    float* __restrict__ output,              // [rows × out_dim]
+    unsigned int rows,
+    unsigned int out_dim,
+    unsigned int num_groups,
+    unsigned int scales_dtype_tag
+) {
+    const unsigned int n = blockIdx.x; // output dimension index
+    if (n >= out_dim) return;
+    const unsigned short* scale_row = scales + (unsigned long long)n * num_groups;
+    const unsigned short* bias_row = biases + (unsigned long long)n * num_groups;
+
+    // Compute mean scale for this output row.
+    float mean_scale = 0.0f;
+    for (unsigned int g = 0; g < num_groups; g++) {
+        mean_scale += talu_decode_scale_bias_u16(scale_row[g], scales_dtype_tag);
+    }
+    mean_scale /= static_cast<float>(num_groups);
+
+    for (unsigned int m = threadIdx.x; m < rows; m += blockDim.x) {
+        const float rs = row_scales[m];
+        const int raw = gemm_i32[(unsigned long long)m * out_dim + n];
+        const int i8sum = i8_rowsums[m];
+
+        // Main term: mean_scale * (raw + 128 * i8_rowsum) * input_scale
+        float result = mean_scale * static_cast<float>(raw + 128 * i8sum) * rs;
+
+        // Bias correction: sum_g(bias[n][g] * group_input_sum[m][g])
+        const float* m_gsums = group_sums + (unsigned long long)m * num_groups;
+        for (unsigned int g = 0; g < num_groups; g++) {
+            result += talu_decode_scale_bias_u16(bias_row[g], scales_dtype_tag) * m_gsums[g];
+        }
+
+        output[(unsigned long long)m * out_dim + n] = result;
+    }
+}
+
+// Compute per-row I8 sums (for U8→I8 offset correction).
+// Launch: grid=(rows), block=(256)
+extern "C" __global__ void talu_i8_rowsum(
+    const signed char* __restrict__ input_i8,
+    int* __restrict__ out_rowsums,
+    unsigned int in_dim
+) {
+    const unsigned int row = blockIdx.x;
+    const signed char* row_in = input_i8 + (unsigned long long)row * in_dim;
+    __shared__ float smem[8];
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        sum += static_cast<float>(row_in[i]);
+    }
+    sum = talu_block_reduce_sum_128(sum, smem);
+    if (threadIdx.x == 0) out_rowsums[row] = __float2int_rn(sum);
+}
+
+// Convert U8 weights to I8 by XOR'ing each byte with 0x80 (subtract 128).
+// Launch: grid=ceil(num_words/256), block=(256)
+extern "C" __global__ void talu_u8_xor_to_i8(
+    const unsigned int* __restrict__ in,
+    unsigned int* __restrict__ out,
+    unsigned int num_words
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_words) out[idx] = in[idx] ^ 0x80808080u;
+}
+
+// ─── Symmetric INT8 GEMM support ───
+
+// Fused grouped-affine U8 dequant → I8 requant with per-row absmax scaling.
+// Reads packed U8 weights + per-group scales/biases, dequantizes in registers,
+// finds per-row absmax, and requantizes to I8. No F16 intermediate needed.
+// Launch: grid=(out_dim), block=(256)
+extern "C" __global__ void talu_gaffine_u8_to_i8(
+    const unsigned char* __restrict__ packed_u8,    // [out_dim × in_dim]
+    const unsigned short* __restrict__ scales,      // [out_dim × num_groups]
+    const unsigned short* __restrict__ biases,      // [out_dim × num_groups]
+    signed char* __restrict__ out_i8,               // [out_dim × in_dim]
+    float* __restrict__ out_row_scales,             // [out_dim]
+    unsigned int in_dim,
+    unsigned int group_size,
+    unsigned int scales_dtype_tag
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned char* row_u8 = packed_u8 + (unsigned long long)row * in_dim;
+    signed char* row_out = out_i8 + (unsigned long long)row * in_dim;
+    const unsigned int num_groups = in_dim / group_size;
+    const unsigned short* scale_row = scales + (unsigned long long)row * num_groups;
+    const unsigned short* bias_row = biases + (unsigned long long)row * num_groups;
+
+    // Pass 1: dequant to F32 in registers and find per-row absmax.
+    __shared__ float smem[8];
+    float local_max = 0.0f;
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const unsigned int g = i / group_size;
+        const float s = talu_decode_scale_bias_u16(scale_row[g], scales_dtype_tag);
+        const float b = talu_decode_scale_bias_u16(bias_row[g], scales_dtype_tag);
+        const float val = s * static_cast<float>(row_u8[i]) + b;
+        local_max = fmaxf(local_max, fabsf(val));
+    }
+    for (int offset = 16; offset >= 1; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFFu, local_max, offset));
+    if ((threadIdx.x & 31) == 0) smem[threadIdx.x >> 5] = local_max;
+    __syncthreads();
+    if (threadIdx.x < 8) {
+        local_max = smem[threadIdx.x];
+        for (int offset = 4; offset >= 1; offset >>= 1)
+            local_max = fmaxf(local_max, __shfl_down_sync(0xFFu, local_max, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) smem[0] = local_max;
+    __syncthreads();
+    const float absmax = smem[0];
+    const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale;
+    if (threadIdx.x == 0) out_row_scales[row] = scale;
+
+    // Pass 2: dequant + quantize to I8.
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const unsigned int g = i / group_size;
+        const float s = talu_decode_scale_bias_u16(scale_row[g], scales_dtype_tag);
+        const float b = talu_decode_scale_bias_u16(bias_row[g], scales_dtype_tag);
+        const float val = s * static_cast<float>(row_u8[i]) + b;
+        int q = __float2int_rn(val * inv_scale);
+        q = max(-128, min(127, q));
+        row_out[i] = static_cast<signed char>(q);
+    }
+}
+
+// ─── F16→I8 and F32→I8 quantization kernels ───
+
+// Quantize F16 weight rows to I8 with per-row absmax scaling.
+// Each block handles one output row of the weight matrix.
+// Launch: grid=(num_rows), block=(256)
+extern "C" __global__ void talu_quantize_f16_to_i8(
+    const unsigned short* __restrict__ weight_f16,  // [num_rows × in_dim] as raw __half bits
+    signed char* __restrict__ out_i8,               // [num_rows × in_dim]
+    float* __restrict__ out_row_scales,             // [num_rows]
+    unsigned int in_dim
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned short* row_in = weight_f16 + (unsigned long long)row * in_dim;
+    signed char* row_out = out_i8 + (unsigned long long)row * in_dim;
+
+    // Phase 1: find per-row absmax.
+    __shared__ float smem[8];
+    float local_max = 0.0f;
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(__half2float(*reinterpret_cast<const __half*>(&row_in[i]))));
+    }
+    for (int offset = 16; offset >= 1; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFFu, local_max, offset));
+    if ((threadIdx.x & 31) == 0) smem[threadIdx.x >> 5] = local_max;
+    __syncthreads();
+    if (threadIdx.x < 8) {
+        local_max = smem[threadIdx.x];
+        for (int offset = 4; offset >= 1; offset >>= 1)
+            local_max = fmaxf(local_max, __shfl_down_sync(0xFFu, local_max, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) smem[0] = local_max;
+    __syncthreads();
+    const float absmax = smem[0];
+    const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale;
+    if (threadIdx.x == 0) out_row_scales[row] = scale;
+
+    // Phase 2: quantize to I8.
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        float val = __half2float(*reinterpret_cast<const __half*>(&row_in[i]));
+        int q = __float2int_rn(val * inv_scale);
+        q = max(-128, min(127, q));
+        row_out[i] = static_cast<signed char>(q);
+    }
+}
+
+// Quantize F32 input rows to I8 with per-row absmax scaling (no group sums).
+// Launch: grid=(rows), block=(256)
+extern "C" __global__ void talu_quantize_f32_to_i8_simple(
+    const float* __restrict__ input,        // [rows × in_dim]
+    signed char* __restrict__ out_i8,       // [rows × in_dim]
+    float* __restrict__ out_row_scales,     // [rows]
+    unsigned int in_dim
+) {
+    const unsigned int row = blockIdx.x;
+    const float* row_in = input + (unsigned long long)row * in_dim;
+    signed char* row_out = out_i8 + (unsigned long long)row * in_dim;
+
+    __shared__ float smem[8];
+    float local_max = 0.0f;
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(row_in[i]));
+    }
+    for (int offset = 16; offset >= 1; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFFu, local_max, offset));
+    if ((threadIdx.x & 31) == 0) smem[threadIdx.x >> 5] = local_max;
+    __syncthreads();
+    if (threadIdx.x < 8) {
+        local_max = smem[threadIdx.x];
+        for (int offset = 4; offset >= 1; offset >>= 1)
+            local_max = fmaxf(local_max, __shfl_down_sync(0xFFu, local_max, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) smem[0] = local_max;
+    __syncthreads();
+    const float absmax = smem[0];
+    const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale;
+    if (threadIdx.x == 0) out_row_scales[row] = scale;
+
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        float val = row_in[i];
+        int q = __float2int_rn(val * inv_scale);
+        q = max(-128, min(127, q));
+        row_out[i] = static_cast<signed char>(q);
+    }
+}
+
+// Dequantize I32 GEMM output to F32 using per-row input and weight scales.
+// output[m][n] = gemm_i32[m][n] * input_scale[m] * weight_scale[n]
+// Launch: grid=(out_dim), block=(256)
+extern "C" __global__ void talu_dequant_i32_scales(
+    const int* __restrict__ gemm_i32,           // [rows × out_dim]
+    const float* __restrict__ input_scales,     // [rows]
+    const float* __restrict__ weight_scales,    // [out_dim]
+    float* __restrict__ output,                 // [rows × out_dim]
+    unsigned int rows,
+    unsigned int out_dim
+) {
+    const unsigned int n = blockIdx.x;
+    if (n >= out_dim) return;
+    const float ws = weight_scales[n];
+    for (unsigned int m = threadIdx.x; m < rows; m += blockDim.x) {
+        const float is = input_scales[m];
+        output[(unsigned long long)m * out_dim + n] =
+            static_cast<float>(gemm_i32[(unsigned long long)m * out_dim + n]) * is * ws;
     }
 }

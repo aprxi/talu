@@ -56,7 +56,7 @@ fn validateArgs(
     scales_dtype_tag: u32,
 ) !void {
     if (in_dim == 0 or out_dim == 0 or group_size == 0) return error.InvalidArgument;
-    if ((in_dim % 4) != 0 or (group_size % 4) != 0) return error.InvalidArgument;
+    if ((in_dim % 16) != 0 or (group_size % 4) != 0) return error.InvalidArgument;
     if ((in_dim % group_size) != 0) return error.InvalidArgument;
     if (scales_dtype_tag != gaffine.scales_dtype_f16 and scales_dtype_tag != gaffine.scales_dtype_bf16) return error.InvalidArgument;
 
@@ -83,9 +83,12 @@ test "validateArgs rejects zero dimensions" {
     try std.testing.expectError(error.InvalidArgument, validateArgs(&b, &b, &b, &out, 8, 32, 0, gaffine.scales_dtype_f16));
 }
 
-test "validateArgs rejects invalid group alignment" {
+test "validateArgs rejects invalid alignment" {
     const b = device_mod.Buffer{ .pointer = 0, .size = 8192 };
     var out = b;
+    // in_dim must be multiple of 16 for 128-bit loads.
+    try std.testing.expectError(error.InvalidArgument, validateArgs(&b, &b, &b, &out, 8, 12, 4, gaffine.scales_dtype_bf16));
+    // group_size must be multiple of 4.
     try std.testing.expectError(error.InvalidArgument, validateArgs(&b, &b, &b, &out, 8, 32, 6, gaffine.scales_dtype_bf16));
 }
 

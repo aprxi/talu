@@ -266,15 +266,22 @@ const GaffineU4LinearWeight = struct {
     biases: compute.cuda.Buffer,
     group_size: u32,
     scales_dtype_tag: u32,
+    dequant_f16_cache: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
+    dequant_i8_cache: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
+    mean_scale_cache: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
 
     fn deinit(self: *GaffineU4LinearWeight, device: *compute.cuda.Device) void {
+        if (self.mean_scale_cache.pointer != 0) self.mean_scale_cache.deinit(device);
+        if (self.dequant_i8_cache.pointer != 0) self.dequant_i8_cache.deinit(device);
+        if (self.dequant_f16_cache.pointer != 0) self.dequant_f16_cache.deinit(device);
         self.biases.deinit(device);
         self.scales.deinit(device);
         self.packed_data.deinit(device);
     }
 
     fn byteSize(self: *const GaffineU4LinearWeight) usize {
-        return self.packed_data.size + self.scales.size + self.biases.size;
+        return self.packed_data.size + self.scales.size + self.biases.size +
+            self.dequant_f16_cache.size + self.dequant_i8_cache.size + self.mean_scale_cache.size;
     }
 };
 
@@ -2693,6 +2700,15 @@ pub const CudaBackend = struct {
     gaffine_u8_matvec_gate_up_silu_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u8_dequant_f16_function: ?compute.cuda.Function = null,
     gaffine_u8_dequant_f16_source: ?compute.cuda.registry.KernelSource = null,
+    quantize_f32_to_i8_function: ?compute.cuda.Function = null,
+    dequant_i32_gaffine_function: ?compute.cuda.Function = null,
+    i8_rowsum_function: ?compute.cuda.Function = null,
+    u8_xor_to_i8_function: ?compute.cuda.Function = null,
+    gaffine_u8_to_i8_function: ?compute.cuda.Function = null,
+    quantize_f16_to_i8_function: ?compute.cuda.Function = null,
+    quantize_f32_to_i8_simple_function: ?compute.cuda.Function = null,
+    dequant_i32_scales_function: ?compute.cuda.Function = null,
+    i8_blas_supported: bool = true,
     gaffine_sequence_rows_supported: bool = false,
     gaffine_sequence_fused_qkv_supported: bool = false,
     gaffine_sequence_fused_gate_up_supported: bool = false,
@@ -2890,6 +2906,7 @@ pub const CudaBackend = struct {
         try backend.initLayerProgramSlotBuffers();
         errdefer backend.deinitLayerProgramSlotBuffers();
         try backend.initKernelFunctions();
+        try backend.warmupDequantF16Cache();
 
         if (loaded.original_weight_dtype == .grouped_affine_u4) {
             backend.gaffine_sequence_rows_supported = smoke_checks.probeGaffineU4SequenceRowsSupport(&backend) catch false;
@@ -4828,19 +4845,94 @@ pub const CudaBackend = struct {
                     return;
                 }
 
-                // Prefill (rows > 1): dequantize weight to F16, cast input to F16, cuBLAS GEMM.
-                if (self.gaffine_u8_dequant_f16_function) |dequant_fn| {
-                    if (self.cast_f32_to_f16_function) |cast_fn| {
-                        if (self.u16_blas_f16_supported) dequant_blas: {
-                            const weight_elems = std.math.mul(usize, w.rows, w.cols) catch break :dequant_blas;
-                            const weight_f16_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch break :dequant_blas;
+                // Symmetric INT8 tensor core path for prefill (2x throughput vs F16).
+                // Weight is pre-quantized F16→I8 with per-output-row scales at warmup.
+                // y[m][n] = gemm_i32[m][n] * x_scale[m] * w_scale[n]
+                if (w.dequant_i8_cache.pointer != 0 and
+                    w.mean_scale_cache.pointer != 0 and
+                    self.i8_blas_supported) i8_blas:
+                {
+                    const quant_fn = self.quantize_f32_to_i8_simple_function orelse break :i8_blas;
+                    const dequant_fn = self.dequant_i32_scales_function orelse break :i8_blas;
+
+                    const in_dim = w.rows;
+                    const out_dim = w.cols;
+
+                    // Scratch layout in activation_u16_dev:
+                    //   [0                   .. rows*in_dim)     → I8 quantized input
+                    //   [rows*in_dim         .. +rows*4)         → input row_scales (f32)
+                    const i8_input_bytes = std.math.mul(usize, rows, in_dim) catch break :i8_blas;
+                    const row_scales_bytes = std.math.mul(usize, rows, @sizeOf(f32)) catch break :i8_blas;
+                    const total_scratch = i8_input_bytes + row_scales_bytes;
+                    if (self.runtime_buffers.activation_u16_dev.size < total_scratch) break :i8_blas;
+
+                    // I32 GEMM output in dequant_f16_dev (not needed when F16 cache is active).
+                    const i32_out_bytes = std.math.mul(usize, std.math.mul(usize, rows, out_dim) catch break :i8_blas, @sizeOf(i32)) catch break :i8_blas;
+                    if (self.runtime_buffers.dequant_f16_dev.size < i32_out_bytes) break :i8_blas;
+
+                    var i8_input_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, i8_input_bytes) catch break :i8_blas;
+                    var row_scales_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, i8_input_bytes, row_scales_bytes) catch break :i8_blas;
+                    var i32_out_buf = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, i32_out_bytes) catch break :i8_blas;
+
+                    // Step 1: Quantize F32 input → I8 + per-row scales.
+                    self.kernel_arg_pack.reset();
+                    self.kernel_arg_pack.appendBufferPtr(&packed_input) catch break :i8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&i8_input_buf) catch break :i8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&row_scales_buf) catch break :i8_blas;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch break :i8_blas;
+                    compute.cuda.launch.launchWithFamily(&self.device, quant_fn, .{
+                        .grid_x = @intCast(rows),
+                        .block_x = 256,
+                    }, &self.kernel_arg_pack, .other) catch break :i8_blas;
+
+                    // Step 2: INT8 GEMM — I8 input × I8 weight → I32 output.
+                    self.blas.matmulI8I8I32(
+                        &self.device,
+                        &i8_input_buf,
+                        rows,
+                        in_dim,
+                        &w.dequant_i8_cache,
+                        out_dim,
+                        &i32_out_buf,
+                    ) catch {
+                        self.i8_blas_supported = false;
+                        break :i8_blas;
+                    };
+
+                    // Step 3: Dequantize I32 → F32 with per-row scales.
+                    self.kernel_arg_pack.reset();
+                    self.kernel_arg_pack.appendBufferPtr(&i32_out_buf) catch break :i8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&row_scales_buf) catch break :i8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&w.mean_scale_cache) catch break :i8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&packed_out) catch break :i8_blas;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(rows)) catch break :i8_blas;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(out_dim)) catch break :i8_blas;
+                    compute.cuda.launch.launchWithFamily(&self.device, dequant_fn, .{
+                        .grid_x = @intCast(out_dim),
+                        .block_x = 256,
+                    }, &self.kernel_arg_pack, .other) catch break :i8_blas;
+
+                    return;
+                }
+
+                // Prefill (rows > 1): use cached F16 weights or dequantize, cast input to F16, cuBLAS GEMM.
+                if (self.cast_f32_to_f16_function) |cast_fn| {
+                    if (self.u16_blas_f16_supported) dequant_blas: {
+                        const weight_elems = std.math.mul(usize, w.rows, w.cols) catch break :dequant_blas;
+                        const weight_f16_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch break :dequant_blas;
+
+                        const input_elems = std.math.mul(usize, rows, w.rows) catch break :dequant_blas;
+                        const input_u16_bytes = std.math.mul(usize, input_elems, @sizeOf(u16)) catch break :dequant_blas;
+                        if (self.runtime_buffers.activation_u16_dev.size < input_u16_bytes) break :dequant_blas;
+
+                        // Use pre-dequantized F16 cache if available, otherwise dequant on the fly.
+                        var dequant_weight: compute.cuda.Buffer = undefined;
+                        if (w.dequant_f16_cache.pointer != 0 and w.dequant_f16_cache.size >= weight_f16_bytes) {
+                            dequant_weight = bufferSlice(&w.dequant_f16_cache, 0, weight_f16_bytes) catch break :dequant_blas;
+                        } else {
+                            const dequant_fn = self.gaffine_u8_dequant_f16_function orelse break :dequant_blas;
                             if (self.runtime_buffers.dequant_f16_dev.size < weight_f16_bytes) break :dequant_blas;
-
-                            const input_elems = std.math.mul(usize, rows, w.rows) catch break :dequant_blas;
-                            const input_u16_bytes = std.math.mul(usize, input_elems, @sizeOf(u16)) catch break :dequant_blas;
-                            if (self.runtime_buffers.activation_u16_dev.size < input_u16_bytes) break :dequant_blas;
-
-                            var dequant_weight = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, weight_f16_bytes) catch break :dequant_blas;
+                            dequant_weight = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, weight_f16_bytes) catch break :dequant_blas;
                             compute.cuda.gaffine_u8_dequantize_f16.runWithFunction(
                                 &self.kernel_arg_pack,
                                 &self.device,
@@ -4854,33 +4946,33 @@ pub const CudaBackend = struct {
                                 w.group_size,
                                 w.scales_dtype_tag,
                             ) catch break :dequant_blas;
-
-                            var input_u16_dev = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, input_u16_bytes) catch break :dequant_blas;
-                            compute.cuda.cast_f32_to_f16.runWithFunction(
-                                &self.kernel_arg_pack,
-                                &self.device,
-                                cast_fn,
-                                &packed_input,
-                                &input_u16_dev,
-                                @intCast(input_elems),
-                            ) catch break :dequant_blas;
-
-                            self.blas.matmulU16U16F32(
-                                &self.device,
-                                &input_u16_dev,
-                                .f16,
-                                rows,
-                                w.rows,
-                                &dequant_weight,
-                                .f16,
-                                w.cols,
-                                &packed_out,
-                            ) catch {
-                                self.u16_blas_f16_supported = false;
-                                break :dequant_blas;
-                            };
-                            return;
                         }
+
+                        var input_u16_dev = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, input_u16_bytes) catch break :dequant_blas;
+                        compute.cuda.cast_f32_to_f16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            cast_fn,
+                            &packed_input,
+                            &input_u16_dev,
+                            @intCast(input_elems),
+                        ) catch break :dequant_blas;
+
+                        self.blas.matmulU16U16F32(
+                            &self.device,
+                            &input_u16_dev,
+                            .f16,
+                            rows,
+                            w.rows,
+                            &dequant_weight,
+                            .f16,
+                            w.cols,
+                            &packed_out,
+                        ) catch {
+                            self.u16_blas_f16_supported = false;
+                            break :dequant_blas;
+                        };
+                        return;
                     }
                 }
 
@@ -6457,6 +6549,292 @@ pub const CudaBackend = struct {
         try self.linearForwardRows(&attn_context_stage, stage_rows, o_proj, output);
     }
 
+    fn runAttentionMixerPrefillBatchedWithQueryGate(
+        self: *CudaBackend,
+        cfg: *const LayerAttentionExecConfig,
+        k_cache: *const compute.cuda.Buffer,
+        v_cache: *const compute.cuda.Buffer,
+        q_proj: *const LinearWeight,
+        k_proj: *const LinearWeight,
+        v_proj: *const LinearWeight,
+        o_proj: *const LinearWeight,
+        q_norm_weight: ?*const DeviceTensor,
+        k_norm_weight: ?*const DeviceTensor,
+        input: *const compute.cuda.Buffer,
+        output: *compute.cuda.Buffer,
+        d_model_u32: u32,
+        head_dim_u32: u32,
+        rope_dim_u32: u32,
+        n_heads_u32: u32,
+        n_kv_heads_u32: u32,
+        seq_len_u32: u32,
+        global_rope_theta: f32,
+        local_rope_theta: f32,
+        rope_function: compute.cuda.Function,
+        copy_function: compute.cuda.Function,
+        cast_f32_to_f16_function: ?compute.cuda.Function,
+        kv_write_f16_function: ?compute.cuda.Function,
+        rope_store_f16_function: ?compute.cuda.Function,
+        attention_kernels: AttentionKernelSet,
+    ) !void {
+        if (!cfg.query_gate) return error.InvalidInstructionBinding;
+
+        const stage_rows = try bufferF32RowCount(input, @intCast(d_model_u32));
+        if (stage_rows <= 1) return error.InvalidInstructionBinding;
+        if (stage_rows != @as(usize, seq_len_u32)) return error.InvalidInstructionBinding;
+
+        const layer_rope_theta = if (cfg.sliding_window > 0) local_rope_theta else global_rope_theta;
+
+        // Q projection output goes into query_gate_proj_dev (q_projection_dim per row).
+        const q_proj_stage_bytes = std.math.mul(usize, stage_rows, cfg.q_projection_dim * @sizeOf(f32)) catch return error.InvalidArgument;
+        var q_projection_stage = try bufferSlice(&self.runtime_buffers.query_gate_proj_dev, 0, q_proj_stage_bytes);
+
+        // After compact, Q values (q_dim per row) go into attn_q_dev.
+        const q_values_bytes = std.math.mul(usize, stage_rows, cfg.q_dim * @sizeOf(f32)) catch return error.InvalidArgument;
+        const kv_stage_bytes = std.math.mul(usize, stage_rows, cfg.kv_dim * @sizeOf(f32)) catch return error.InvalidArgument;
+        const context_stage_bytes = std.math.mul(usize, stage_rows, o_proj.rows() * @sizeOf(f32)) catch return error.InvalidArgument;
+        var attn_q_stage = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, q_values_bytes);
+        var attn_k_stage = try bufferSlice(&self.runtime_buffers.attn_k_dev, 0, kv_stage_bytes);
+        var attn_v_stage = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, kv_stage_bytes);
+        var attn_context_stage = try bufferSlice(&self.runtime_buffers.attn_context_dev, 0, context_stage_bytes);
+
+        // Batched QKV projection — Q output goes into query_gate_proj_dev.
+        _ = try self.runQkvProjection(input, q_proj, k_proj, v_proj, stage_rows, &self.runtime_buffers.query_gate_proj_dev);
+
+        // Extract Q values and save gate for later.
+        try self.compactQueryGateProjection(stage_rows, cfg.q_dim, cfg.q_projection_dim, &q_projection_stage, &attn_q_stage);
+
+        if (q_norm_weight) |q_norm_value| {
+            const q_norm_rows = std.math.mul(u32, @intCast(stage_rows), n_heads_u32) catch return error.InvalidArgument;
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                &attn_q_stage,
+                &q_norm_value.buffer,
+                &attn_q_stage,
+                q_norm_rows,
+                head_dim_u32,
+                self.norm_eps,
+                self.loaded.runtime.qk_norm_weight_offset,
+            );
+        }
+        if (k_norm_weight) |k_norm_value| {
+            const k_norm_rows = std.math.mul(u32, @intCast(stage_rows), n_kv_heads_u32) catch return error.InvalidArgument;
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                &attn_k_stage,
+                &k_norm_value.buffer,
+                &attn_k_stage,
+                k_norm_rows,
+                head_dim_u32,
+                self.norm_eps,
+                self.loaded.runtime.qk_norm_weight_offset,
+            );
+        }
+
+        const kv_row_f32_bytes = std.math.mul(usize, cfg.kv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
+        const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
+        const kv_row_bytes = std.math.mul(usize, cfg.kv_dim, kv_elem_bytes) catch return error.InvalidArgument;
+        const kv_dim_u32: u32 = @intCast(cfg.kv_dim);
+        const kv_groups_u32: u32 = @intCast(self.n_heads / self.n_kv_heads);
+        const use_k_write_fused = kv_cache_dtype_fp16 and (kv_write_f16_function != null or rope_store_f16_function != null);
+        const can_fused_prefill_attn = kv_cache_dtype_fp16 and
+            cfg.is_causal and
+            attention_kernels.attn_fused_prefill_heads_f16_kv_function != null;
+        const can_batched_kv_write_prefill = can_fused_prefill_attn and
+            kv_write_f16_function != null and
+            self.kv_write_f16_rows_function != null;
+
+        if (can_batched_kv_write_prefill) {
+            var k_cache_out = k_cache.*;
+            var v_cache_out = v_cache.*;
+            try compute.cuda.kv_write_f16_rows.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.kv_write_f16_rows_function.?,
+                &attn_k_stage,
+                &attn_v_stage,
+                &k_cache_out,
+                &v_cache_out,
+                n_kv_heads_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                @intCast(stage_rows),
+                @intCast(cfg.kv_dim),
+                0,
+                layer_rope_theta,
+            );
+        } else {
+            var row_idx: usize = 0;
+            while (row_idx < stage_rows) : (row_idx += 1) {
+                const kv_offset_f32 = std.math.mul(usize, row_idx, kv_row_f32_bytes) catch return error.InvalidArgument;
+                var k_row_in = try bufferSlice(&attn_k_stage, kv_offset_f32, kv_row_f32_bytes);
+                var v_row_in = try bufferSlice(&attn_v_stage, kv_offset_f32, kv_row_f32_bytes);
+
+                const position_u32: u32 = @intCast(row_idx);
+                if (!use_k_write_fused) {
+                    try compute.cuda.rope.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        rope_function,
+                        &k_row_in,
+                        n_kv_heads_u32,
+                        head_dim_u32,
+                        rope_dim_u32,
+                        position_u32,
+                        layer_rope_theta,
+                    );
+                }
+
+                const kv_offset = std.math.mul(usize, row_idx, kv_row_bytes) catch return error.InvalidArgument;
+                var k_row_out = try bufferSlice(k_cache, kv_offset, kv_row_bytes);
+                var v_row_out = try bufferSlice(v_cache, kv_offset, kv_row_bytes);
+
+                if (kv_cache_dtype_fp16) {
+                    if (kv_write_f16_function) |kv_write_f16| {
+                        try compute.cuda.kv_write_f16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            kv_write_f16,
+                            &k_row_in,
+                            &v_row_in,
+                            &k_row_out,
+                            &v_row_out,
+                            n_kv_heads_u32,
+                            head_dim_u32,
+                            rope_dim_u32,
+                            position_u32,
+                            layer_rope_theta,
+                        );
+                    } else if (rope_store_f16_function) |rope_store_f16| {
+                        try compute.cuda.rope_store_f16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            rope_store_f16,
+                            &k_row_in,
+                            &k_row_out,
+                            n_kv_heads_u32,
+                            head_dim_u32,
+                            rope_dim_u32,
+                            position_u32,
+                            layer_rope_theta,
+                        );
+                        try compute.cuda.cast_f32_to_f16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                            &v_row_in,
+                            &v_row_out,
+                            @intCast(cfg.kv_dim),
+                        );
+                    } else {
+                        try compute.cuda.cast_f32_to_f16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                            &k_row_in,
+                            &k_row_out,
+                            @intCast(cfg.kv_dim),
+                        );
+                        try compute.cuda.cast_f32_to_f16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                            &v_row_in,
+                            &v_row_out,
+                            @intCast(cfg.kv_dim),
+                        );
+                    }
+                } else {
+                    try compute.cuda.copy.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        copy_function,
+                        &k_row_in,
+                        &k_row_out,
+                        @intCast(cfg.kv_dim),
+                    );
+                    try compute.cuda.copy.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        copy_function,
+                        &v_row_in,
+                        &v_row_out,
+                        @intCast(cfg.kv_dim),
+                    );
+                }
+                if (!can_fused_prefill_attn) {
+                    const q_row_bytes = std.math.mul(usize, cfg.q_dim, @sizeOf(f32)) catch return error.InvalidArgument;
+                    const ctx_row_bytes = std.math.mul(usize, o_proj.rows(), @sizeOf(f32)) catch return error.InvalidArgument;
+                    const q_offset = std.math.mul(usize, row_idx, q_row_bytes) catch return error.InvalidArgument;
+                    const ctx_offset = std.math.mul(usize, row_idx, ctx_row_bytes) catch return error.InvalidArgument;
+                    var q_row = try bufferSlice(&attn_q_stage, q_offset, q_row_bytes);
+                    var ctx_row = try bufferSlice(&attn_context_stage, ctx_offset, ctx_row_bytes);
+                    const effective_seq_len_u32: u32 = @intCast(row_idx + 1);
+                    // For query_gate, always apply RoPE on Q — the fused single-head
+                    // attention path is not used when query_gate is true.
+                    try compute.cuda.rope.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        rope_function,
+                        &q_row,
+                        n_heads_u32,
+                        head_dim_u32,
+                        rope_dim_u32,
+                        position_u32,
+                        layer_rope_theta,
+                    );
+                    _ = try self.runAttentionContext(
+                        cfg,
+                        &q_row,
+                        &ctx_row,
+                        k_cache,
+                        v_cache,
+                        attention_kernels,
+                        effective_seq_len_u32,
+                        head_dim_u32,
+                        kv_dim_u32,
+                        kv_groups_u32,
+                        rope_dim_u32,
+                        position_u32,
+                        layer_rope_theta,
+                    );
+                }
+            }
+        }
+
+        if (can_fused_prefill_attn) {
+            try compute.cuda.attn_fused_prefill_heads_f16_kv.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                attention_kernels.attn_fused_prefill_heads_f16_kv_function.?,
+                &attn_q_stage,
+                k_cache,
+                v_cache,
+                &attn_context_stage,
+                @intCast(self.n_heads),
+                @intCast(stage_rows),
+                @intCast(stage_rows),
+                @intCast(cfg.kv_dim),
+                @intCast(self.n_heads / self.n_kv_heads),
+                head_dim_u32,
+                self.attention_scale,
+                rope_dim_u32,
+                0,
+                std.math.cast(u32, cfg.sliding_window) orelse std.math.maxInt(u32),
+                layer_rope_theta,
+            );
+        }
+
+        // Apply output gate before O projection.
+        try self.applyQueryGateToContextInPlace(stage_rows, cfg.q_dim, cfg.q_projection_dim);
+
+        try self.linearForwardRows(&attn_context_stage, stage_rows, o_proj, output);
+    }
+
     fn attentionFallbackUsesCache(seq_len: usize) bool {
         return seq_len == 1;
     }
@@ -7249,50 +7627,33 @@ pub const CudaBackend = struct {
             return;
         }
 
-        var row_idx: usize = 0;
-        while (row_idx < ctx.active_rows_u32) : (row_idx += 1) {
-            var input_row = try logicalF32RowSlice(
-                input,
-                @intCast(ctx.active_rows_u32),
-                row_idx,
-                @intCast(ctx.d_model_u32),
-            );
-            var output_row = try logicalF32RowSlice(
-                output,
-                @intCast(ctx.active_rows_u32),
-                row_idx,
-                @intCast(ctx.d_model_u32),
-            );
-            try self.runAttentionMixerStep(
-                cfg,
-                &attention_binding.k_cache,
-                &attention_binding.v_cache,
-                &q_proj,
-                &k_proj,
-                &v_proj,
-                &o_proj,
-                q_norm_weight,
-                k_norm_weight,
-                &input_row,
-                &output_row,
-                ctx.d_model_u32,
-                ctx.head_dim_u32,
-                ctx.rope_dim_u32,
-                ctx.n_heads_u32,
-                ctx.n_kv_heads_u32,
-                @intCast(row_idx + 1),
-                row_idx,
-                @intCast(row_idx),
-                ctx.global_rope_theta,
-                ctx.local_rope_theta,
-                ctx.rope_function,
-                ctx.copy_function,
-                ctx.cast_f32_to_f16_function,
-                ctx.kv_write_f16_function,
-                ctx.rope_store_f16_function,
-                ctx.attention_kernels,
-            );
-        }
+        try self.runAttentionMixerPrefillBatchedWithQueryGate(
+            cfg,
+            &attention_binding.k_cache,
+            &attention_binding.v_cache,
+            &q_proj,
+            &k_proj,
+            &v_proj,
+            &o_proj,
+            q_norm_weight,
+            k_norm_weight,
+            input,
+            output,
+            ctx.d_model_u32,
+            ctx.head_dim_u32,
+            ctx.rope_dim_u32,
+            ctx.n_heads_u32,
+            ctx.n_kv_heads_u32,
+            ctx.seq_len_u32,
+            ctx.global_rope_theta,
+            ctx.local_rope_theta,
+            ctx.rope_function,
+            ctx.copy_function,
+            ctx.cast_f32_to_f16_function,
+            ctx.kv_write_f16_function,
+            ctx.rope_store_f16_function,
+            ctx.attention_kernels,
+        );
     }
 
     fn layerProgramShortConvAdapter(
@@ -8445,6 +8806,222 @@ pub const CudaBackend = struct {
         }
 
         try self.resolveRequiredKernels();
+    }
+
+    /// Pre-dequantize all gaffine_u8 weights to persistent F16 and I8 device buffers.
+    /// F16 cache: eliminates per-prefill dequant kernel overhead.
+    /// I8 cache: enables cuBLAS INT8 tensor core GEMM for prefill.
+    fn warmupDequantF16Cache(self: *CudaBackend) !void {
+        const dequant_fn = self.gaffine_u8_dequant_f16_function orelse return;
+
+        // Resolve INT8 GEMM helper kernels (optional — graceful degradation to F16 path).
+        if (self.kernel_registry.resolveFunction("quantize_f32_to_i8", "talu_quantize_f32_to_i8")) |resolved| {
+            self.quantize_f32_to_i8_function = resolved.function;
+        } else |_| {}
+        if (self.kernel_registry.resolveFunction("dequant_i32_gaffine", "talu_dequant_i32_gaffine")) |resolved| {
+            self.dequant_i32_gaffine_function = resolved.function;
+        } else |_| {}
+        if (self.kernel_registry.resolveFunction("i8_rowsum", "talu_i8_rowsum")) |resolved| {
+            self.i8_rowsum_function = resolved.function;
+        } else |_| {}
+        if (self.kernel_registry.resolveFunction("u8_xor_to_i8", "talu_u8_xor_to_i8")) |resolved| {
+            self.u8_xor_to_i8_function = resolved.function;
+        } else |_| {}
+        // Symmetric INT8 GEMM kernels.
+        if (self.kernel_registry.resolveFunction("gaffine_u8_to_i8", "talu_gaffine_u8_to_i8")) |resolved| {
+            self.gaffine_u8_to_i8_function = resolved.function;
+        } else |_| {}
+        if (self.kernel_registry.resolveFunction("quantize_f16_to_i8", "talu_quantize_f16_to_i8")) |resolved| {
+            self.quantize_f16_to_i8_function = resolved.function;
+        } else |_| {}
+        if (self.kernel_registry.resolveFunction("quantize_f32_to_i8_simple", "talu_quantize_f32_to_i8_simple")) |resolved| {
+            self.quantize_f32_to_i8_simple_function = resolved.function;
+        } else |_| {}
+        if (self.kernel_registry.resolveFunction("dequant_i32_scales", "talu_dequant_i32_scales")) |resolved| {
+            self.dequant_i32_scales_function = resolved.function;
+        } else |_| {}
+
+        var total_bytes: usize = 0;
+        var weight_count: usize = 0;
+
+        // Helper to create I8 cache for a single gaffine_u8 weight.
+        // Prefers fused U8→I8 kernel (no F16 intermediate), falls back to F16→I8.
+        const dequantWeight = struct {
+            fn run(
+                backend: *CudaBackend,
+                dequant_f16_fn: compute.cuda.Function,
+                w: *GaffineU8LinearWeight,
+                bytes_out: *usize,
+            ) !void {
+                const weight_elems = std.math.mul(usize, w.rows, w.cols) catch return;
+                if (weight_elems == 0) return;
+                const i8_bytes = weight_elems;
+                const scale_bytes = std.math.mul(usize, w.cols, @sizeOf(f32)) catch return;
+
+                // Try fused U8→I8 path (no F16 intermediate, saves ~50% VRAM).
+                if (backend.gaffine_u8_to_i8_function) |fused_fn| {
+                    var i8_buf = backend.device.allocBuffer(i8_bytes) catch return;
+                    errdefer i8_buf.deinit(&backend.device);
+                    var scale_buf = backend.device.allocBuffer(scale_bytes) catch {
+                        i8_buf.deinit(&backend.device);
+                        return;
+                    };
+                    errdefer scale_buf.deinit(&backend.device);
+
+                    // Launch: grid=(out_dim=w.cols), block=(256)
+                    backend.kernel_arg_pack.reset();
+                    backend.kernel_arg_pack.appendBufferPtr(&w.packed_data) catch {
+                        scale_buf.deinit(&backend.device);
+                        i8_buf.deinit(&backend.device);
+                        return;
+                    };
+                    backend.kernel_arg_pack.appendBufferPtr(&w.scales) catch {
+                        scale_buf.deinit(&backend.device);
+                        i8_buf.deinit(&backend.device);
+                        return;
+                    };
+                    backend.kernel_arg_pack.appendBufferPtr(&w.biases) catch {
+                        scale_buf.deinit(&backend.device);
+                        i8_buf.deinit(&backend.device);
+                        return;
+                    };
+                    backend.kernel_arg_pack.appendBufferPtr(&i8_buf) catch {
+                        scale_buf.deinit(&backend.device);
+                        i8_buf.deinit(&backend.device);
+                        return;
+                    };
+                    backend.kernel_arg_pack.appendBufferPtr(&scale_buf) catch {
+                        scale_buf.deinit(&backend.device);
+                        i8_buf.deinit(&backend.device);
+                        return;
+                    };
+                    backend.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch {
+                        scale_buf.deinit(&backend.device);
+                        i8_buf.deinit(&backend.device);
+                        return;
+                    };
+                    backend.kernel_arg_pack.appendScalar(u32, w.group_size) catch {
+                        scale_buf.deinit(&backend.device);
+                        i8_buf.deinit(&backend.device);
+                        return;
+                    };
+                    backend.kernel_arg_pack.appendScalar(u32, w.scales_dtype_tag) catch {
+                        scale_buf.deinit(&backend.device);
+                        i8_buf.deinit(&backend.device);
+                        return;
+                    };
+                    compute.cuda.launch.launchWithFamily(&backend.device, fused_fn, .{
+                        .grid_x = @intCast(w.cols),
+                        .block_x = 256,
+                    }, &backend.kernel_arg_pack, .other) catch {
+                        scale_buf.deinit(&backend.device);
+                        i8_buf.deinit(&backend.device);
+                        return;
+                    };
+
+                    w.dequant_i8_cache = i8_buf;
+                    w.mean_scale_cache = scale_buf;
+                    bytes_out.* += i8_bytes + scale_bytes;
+                    return;
+                }
+
+                // Fallback: dequant to F16 cache (for F16 GEMM path).
+                const weight_f16_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch return;
+                var cache_buf = backend.device.allocBuffer(weight_f16_bytes) catch return;
+                errdefer cache_buf.deinit(&backend.device);
+
+                compute.cuda.gaffine_u8_dequantize_f16.runWithFunction(
+                    &backend.kernel_arg_pack,
+                    &backend.device,
+                    dequant_f16_fn,
+                    &w.packed_data,
+                    &w.scales,
+                    &w.biases,
+                    &cache_buf,
+                    @intCast(w.cols),
+                    @intCast(w.rows),
+                    w.group_size,
+                    w.scales_dtype_tag,
+                ) catch {
+                    cache_buf.deinit(&backend.device);
+                    return;
+                };
+
+                w.dequant_f16_cache = cache_buf;
+                bytes_out.* += weight_f16_bytes;
+            }
+        }.run;
+
+        // Helper to process a LinearWeight if it is gaffine_u8.
+        const maybeProcess = struct {
+            fn run(
+                backend: *CudaBackend,
+                function: compute.cuda.Function,
+                weight: *LinearWeight,
+                bytes_out: *usize,
+                count_out: *usize,
+            ) !void {
+                switch (weight.*) {
+                    .gaffine_u8 => |*w| {
+                        try dequantWeight(backend, function, w, bytes_out);
+                        count_out.* += 1;
+                    },
+                    else => {},
+                }
+            }
+        }.run;
+
+        // Helper to process an optional LinearWeight.
+        const maybeProcessOpt = struct {
+            fn run(
+                backend: *CudaBackend,
+                function: compute.cuda.Function,
+                weight_opt: *?LinearWeight,
+                bytes_out: *usize,
+                count_out: *usize,
+            ) !void {
+                if (weight_opt.*) |*w| {
+                    try maybeProcess(backend, function, w, bytes_out, count_out);
+                }
+            }
+        }.run;
+
+        for (self.block_runtime.blocks) |*layer| {
+            if (layer.attention_runtime) |*attn| {
+                try maybeProcess(self, dequant_fn, &attn.q_proj, &total_bytes, &weight_count);
+                try maybeProcess(self, dequant_fn, &attn.k_proj, &total_bytes, &weight_count);
+                try maybeProcess(self, dequant_fn, &attn.v_proj, &total_bytes, &weight_count);
+                try maybeProcess(self, dequant_fn, &attn.o_proj, &total_bytes, &weight_count);
+                try maybeProcess(self, dequant_fn, &attn.w1, &total_bytes, &weight_count);
+                try maybeProcess(self, dequant_fn, &attn.w2, &total_bytes, &weight_count);
+                try maybeProcess(self, dequant_fn, &attn.w3, &total_bytes, &weight_count);
+            }
+            if (layer.shortconv_runtime) |*sc| {
+                try maybeProcess(self, dequant_fn, &sc.in_proj, &total_bytes, &weight_count);
+                try maybeProcess(self, dequant_fn, &sc.out_proj, &total_bytes, &weight_count);
+                try maybeProcessOpt(self, dequant_fn, &sc.ffn_w1, &total_bytes, &weight_count);
+                try maybeProcessOpt(self, dequant_fn, &sc.ffn_w2, &total_bytes, &weight_count);
+                try maybeProcessOpt(self, dequant_fn, &sc.ffn_w3, &total_bytes, &weight_count);
+            }
+            if (layer.gated_delta_runtime) |*gd| {
+                try maybeProcess(self, dequant_fn, &gd.in_proj, &total_bytes, &weight_count);
+                try maybeProcess(self, dequant_fn, &gd.out_proj, &total_bytes, &weight_count);
+                try maybeProcessOpt(self, dequant_fn, &gd.ffn_w1, &total_bytes, &weight_count);
+                try maybeProcessOpt(self, dequant_fn, &gd.ffn_w2, &total_bytes, &weight_count);
+                try maybeProcessOpt(self, dequant_fn, &gd.ffn_w3, &total_bytes, &weight_count);
+            }
+        }
+
+        // Projection weight (lm_head).
+        try maybeProcess(self, dequant_fn, &self.runtime_buffers.projection_weight, &total_bytes, &weight_count);
+
+        if (weight_count > 0) {
+            try self.device.synchronize();
+            log.info("inference", "CUDA gaffine U8 dequant cache ready", .{
+                .weights = weight_count,
+                .cache_mib = total_bytes / (1024 * 1024),
+            });
+        }
     }
 
     fn resolveRequiredKernels(self: *CudaBackend) !void {
