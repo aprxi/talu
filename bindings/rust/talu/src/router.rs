@@ -114,6 +114,8 @@ pub struct StreamResult {
     pub prefill_ns: u64,
     /// Generation time in nanoseconds.
     pub generation_ns: u64,
+    /// Time-to-first-token in nanoseconds.
+    pub ttft_ns: u64,
     /// Reason generation stopped.
     pub finish_reason: crate::FinishReason,
 }
@@ -546,6 +548,7 @@ pub fn generate_stream(
         completion_tokens: unsafe { talu_sys::talu_router_iterator_completion_tokens(iterator) },
         prefill_ns: unsafe { talu_sys::talu_router_iterator_prefill_ns(iterator) },
         generation_ns: unsafe { talu_sys::talu_router_iterator_generation_ns(iterator) },
+        ttft_ns: unsafe { talu_sys::talu_router_iterator_ttft_ns(iterator) },
         finish_reason: crate::FinishReason::from(talu_sys::CFinishReason::from(unsafe {
             talu_sys::talu_router_iterator_finish_reason(iterator)
         })),

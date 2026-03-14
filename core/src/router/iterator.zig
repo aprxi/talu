@@ -129,6 +129,7 @@ pub const TokenIterator = struct {
     completion_tokens: std.atomic.Value(usize),
     prefill_ns: std.atomic.Value(u64),
     generation_ns: std.atomic.Value(u64),
+    ttft_ns: std.atomic.Value(u64),
     finish_reason: std.atomic.Value(u8), // FinishReason discriminator
     // Final decoded output text as a NUL-terminated buffer for C-API fallback.
     final_text_z: ?[]u8,
@@ -230,6 +231,7 @@ pub const TokenIterator = struct {
             .completion_tokens = std.atomic.Value(usize).init(0),
             .prefill_ns = std.atomic.Value(u64).init(0),
             .generation_ns = std.atomic.Value(u64).init(0),
+            .ttft_ns = std.atomic.Value(u64).init(0),
             .finish_reason = std.atomic.Value(u8).init(@intFromEnum(FinishReason.eos_token)),
             .final_text_z = null,
             .local_tool_calls = null,
@@ -325,6 +327,7 @@ pub const TokenIterator = struct {
             .completion_tokens = std.atomic.Value(usize).init(0),
             .prefill_ns = std.atomic.Value(u64).init(0),
             .generation_ns = std.atomic.Value(u64).init(0),
+            .ttft_ns = std.atomic.Value(u64).init(0),
             .finish_reason = std.atomic.Value(u8).init(@intFromEnum(FinishReason.eos_token)),
             .final_text_z = null,
             .local_tool_calls = null,
@@ -495,6 +498,12 @@ pub const TokenIterator = struct {
     /// Get generation time in nanoseconds (available after generation completes).
     pub fn getGenerationNs(self: *TokenIterator) u64 {
         return self.generation_ns.load(.acquire);
+    }
+
+    /// Get time-to-first-token in nanoseconds (available after generation completes).
+    /// Measures wall-clock time from generation start to first token pushed.
+    pub fn getTtftNs(self: *TokenIterator) u64 {
+        return self.ttft_ns.load(.acquire);
     }
 
     /// Get finish reason (available after generation completes).
@@ -668,6 +677,8 @@ pub const TokenIterator = struct {
 
         const engine = self.engine.?;
 
+        const start_time = std.time.nanoTimestamp();
+
         // Run generation (this blocks until complete)
         var result = try engine.generate(self.chat.?, opts);
         // Use engine's allocator for result cleanup since generate() allocated with it
@@ -721,6 +732,13 @@ pub const TokenIterator = struct {
         self.prefill_ns.store(result.prefill_ns, .release);
         self.generation_ns.store(result.decode_ns, .release);
         self.finish_reason.store(@intFromEnum(result.finish_reason), .release);
+
+        // TTFT = wall-clock time from generation start to first token pushed.
+        const ttft: u64 = if (self.first_token_ns > 0 and self.first_token_ns >= start_time)
+            @intCast(self.first_token_ns - start_time)
+        else
+            0;
+        self.ttft_ns.store(ttft, .release);
     }
 
     fn runHttpGeneration(self: *TokenIterator) !void {
@@ -752,6 +770,13 @@ pub const TokenIterator = struct {
         self.finish_reason.store(@intFromEnum(
             httpFinishReasonToLocal(result.finish_reason),
         ), .release);
+
+        // TTFT = wall-clock time from generation start to first token pushed.
+        const ttft: u64 = if (self.first_token_ns > 0 and self.first_token_ns >= start_time)
+            @intCast(self.first_token_ns - start_time)
+        else
+            0;
+        self.ttft_ns.store(ttft, .release);
 
         // Phase B: Shared commit (SAME function as local path).
         // Convert HttpEngine.ToolCall → commit.ToolCallInput

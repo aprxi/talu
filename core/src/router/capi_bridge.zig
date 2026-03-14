@@ -172,6 +172,7 @@ pub const GenerateResult = struct {
     completion_tokens: usize = 0,
     prefill_ns: u64 = 0,
     generation_ns: u64 = 0,
+    ttft_ns: u64 = 0,
     error_code: i32 = 0,
     finish_reason: CFinishReason = .eos_token,
     tool_calls: ?[]const local.ToolCallRef = null,
@@ -190,6 +191,7 @@ pub const CGenerateResult = extern struct {
     completion_tokens: usize,
     prefill_ns: u64,
     generation_ns: u64,
+    ttft_ns: u64,
     error_code: i32,
     /// Why generation stopped (CFinishReason enum value).
     finish_reason: u8 = 0,
@@ -222,6 +224,7 @@ pub fn toCResult(allocator: std.mem.Allocator, result: GenerateResult) CGenerate
         ret.completion_tokens = result.completion_tokens;
         ret.prefill_ns = result.prefill_ns;
         ret.generation_ns = result.generation_ns;
+        ret.ttft_ns = result.ttft_ns;
         ret.error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory);
         return ret;
     };
@@ -243,6 +246,7 @@ pub fn toCResult(allocator: std.mem.Allocator, result: GenerateResult) CGenerate
                 ret.completion_tokens = result.completion_tokens;
                 ret.prefill_ns = result.prefill_ns;
                 ret.generation_ns = result.generation_ns;
+                ret.ttft_ns = result.ttft_ns;
                 ret.finish_reason = @intFromEnum(result.finish_reason);
                 return ret;
             };
@@ -265,6 +269,7 @@ pub fn toCResult(allocator: std.mem.Allocator, result: GenerateResult) CGenerate
     ret.completion_tokens = result.completion_tokens;
     ret.prefill_ns = result.prefill_ns;
     ret.generation_ns = result.generation_ns;
+    ret.ttft_ns = result.ttft_ns;
     ret.finish_reason = @intFromEnum(result.finish_reason);
     ret.tool_calls = c_tool_calls;
     ret.tool_call_count = tool_call_count;
@@ -476,6 +481,7 @@ fn generateWithLocalEngine(
         .completion_tokens = iterator.getCompletionTokens(),
         .prefill_ns = iterator.getPrefillNs(),
         .generation_ns = iterator.getGenerationNs(),
+        .ttft_ns = iterator.getTtftNs(),
         .error_code = 0,
         .finish_reason = finish_reason,
         .tool_calls = tool_calls,
@@ -604,6 +610,7 @@ fn generateWithHttpEngine(
         .completion_tokens = result.completion_tokens,
         .prefill_ns = 0, // Remote API doesn't report prefill time
         .generation_ns = generation_ns,
+        .ttft_ns = 0, // Remote API doesn't report TTFT
         .finish_reason = finish_reason,
         .tool_calls = tool_refs,
         .error_code = 0,

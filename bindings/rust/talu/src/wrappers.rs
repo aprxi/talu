@@ -822,6 +822,12 @@ impl InferenceBackend {
         self.ptr
     }
 
+    /// Return static model metadata from a local backend.
+    /// Returns a zero struct for remote backends.
+    pub fn model_info(&self) -> talu_sys::CModelInfo {
+        unsafe { talu_sys::talu_backend_model_info(self.ptr) }
+    }
+
     /// List models available on a remote backend.
     /// Only works for OpenAI-compatible backends.
     pub fn list_models(&self) -> Result<Vec<RemoteModelInfo>> {
@@ -972,6 +978,11 @@ impl GenerateResult {
     /// Returns the generation time in nanoseconds.
     pub fn generation_ns(&self) -> u64 {
         self.inner.generation_ns
+    }
+
+    /// Returns the time-to-first-token in nanoseconds.
+    pub fn ttft_ns(&self) -> u64 {
+        self.inner.ttft_ns
     }
 
     /// Returns the generated text, if any.

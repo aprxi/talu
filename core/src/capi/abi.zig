@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const capi_bridge = @import("../router/capi_bridge.zig");
 const responses = @import("responses.zig");
 const capi_types = @import("types.zig");
+const router = @import("router.zig");
 
 // Ensure 64-bit architecture (x86_64 or aarch64)
 comptime {
@@ -36,7 +37,7 @@ comptime {
 pub const EXPECTED_SIZES = struct {
     // Router/generation structs
     pub const RouterGenerateConfig = 128;  // Added extra_body_json pointer (8 bytes)
-    pub const RouterGenerateResult = 72;
+    pub const RouterGenerateResult = 80;
     pub const CToolCallRef = 24;
     pub const CLogitBiasEntry = 8;
     pub const GenerateContentPart = 32;
@@ -53,6 +54,9 @@ pub const EXPECTED_SIZES = struct {
     // Spec structs (from types.zig)
     pub const TaluModelSpec = 88;
     pub const TaluCapabilities = 48;
+
+    // Backend info struct (from router.zig)
+    pub const CModelInfo = 56;
 };
 
 // =============================================================================
@@ -90,6 +94,9 @@ comptime {
     // Spec structs
     assertSize("TaluModelSpec", capi_types.TaluModelSpec, EXPECTED_SIZES.TaluModelSpec);
     assertSize("TaluCapabilities", capi_types.TaluCapabilities, EXPECTED_SIZES.TaluCapabilities);
+
+    // Backend info struct
+    assertSize("CModelInfo", router.CModelInfo, EXPECTED_SIZES.CModelInfo);
 }
 
 test "abi sizes are validated at comptime" {

@@ -2462,6 +2462,7 @@ pub struct CGenerateResult {
     pub completion_tokens: usize,
     pub prefill_ns: u64,
     pub generation_ns: u64,
+    pub ttft_ns: u64,
     pub error_code: c_int,
     pub finish_reason: u8,
     pub _padding: [u8; 3],
@@ -2478,6 +2479,7 @@ impl Default for CGenerateResult {
             completion_tokens: 0,
             prefill_ns: 0,
             generation_ns: 0,
+            ttft_ns: 0,
             error_code: 0,
             finish_reason: 0,
             _padding: [0; 3],
@@ -2485,6 +2487,25 @@ impl Default for CGenerateResult {
             tool_call_count: 0,
         }
     }
+}
+
+/// Static model metadata from a local backend.
+/// Source: core/src/capi/router.zig
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct CModelInfo {
+    pub file_size: u64,
+    pub tensor_count: u64,
+    pub vocab_size: i32,
+    pub d_model: i32,
+    pub n_layers: i32,
+    pub n_heads: i32,
+    pub n_kv_groups: i32,
+    pub d_ff: i32,
+    pub max_seq_len: i32,
+    pub gaffine_group_size: i32,
+    pub weight_dtype: u8,
+    pub _pad: [u8; 7],
 }
 
 /// Source: core/src/capi/db/table.zig
@@ -4231,6 +4252,8 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_backend_list_models_free(result: *mut c_void);
     // core/src/capi/router.zig
+    pub fn talu_backend_model_info(backend: *mut c_void) -> CModelInfo;
+    // core/src/capi/router.zig
     pub fn talu_backend_synchronize(backend: *mut c_void) -> c_int;
     // core/src/capi/tokenizer.zig
     pub fn talu_batch_encode_result_free(ids: *mut u32, offsets: *mut usize, total_tokens: usize, num_sequences: usize);
@@ -5026,6 +5049,8 @@ extern "C" {
     pub fn talu_router_iterator_free(iterator: *mut c_void);
     // core/src/capi/router.zig
     pub fn talu_router_iterator_generation_ns(iterator: *mut c_void) -> u64;
+    // core/src/capi/router.zig
+    pub fn talu_router_iterator_ttft_ns(iterator: *mut c_void) -> u64;
     // core/src/capi/router.zig
     pub fn talu_router_iterator_has_error(iterator: *mut c_void) -> bool;
     // core/src/capi/router.zig

@@ -790,7 +790,7 @@ async fn generate_response(
     let project_id_for_task = project_id.clone();
     let tools_json_for_generation = effective_tools.as_ref().map(|v| v.to_string());
     let tool_choice_for_generation = effective_tool_choice.as_ref().map(|v| v.to_string());
-    let (output_items, prompt_tokens, completion_tokens, responses_json) =
+    let (output_items, prompt_tokens, completion_tokens, prefill_ns, result_ttft_ns, responses_json, model_info_json) =
         tokio::task::spawn_blocking(move || {
             let mut backend = backend.blocking_lock();
             let backend = backend
@@ -878,6 +878,8 @@ async fn generate_response(
 
             let prompt_tokens = result.prompt_tokens();
             let completion_tokens = result.completion_tokens();
+            let prefill_ns = result.prefill_ns();
+            let ttft_ns = result.ttft_ns();
             log::debug!(target: "server::gen", "completed: prompt_tokens={} completion_tokens={}",
                 prompt_tokens, completion_tokens);
 
@@ -895,12 +897,16 @@ async fn generate_response(
 
             // Store full conversation for chaining.
             let responses_json = all_json;
+            let model_info_json = build_model_info_json(backend);
 
             Ok::<_, anyhow::Error>((
                 output_items,
                 prompt_tokens,
                 completion_tokens,
+                prefill_ns,
+                ttft_ns,
                 responses_json,
+                model_info_json,
             ))
         })
         .await
@@ -926,6 +932,8 @@ async fn generate_response(
     let usage = UsageStats {
         input_tokens: prompt_tokens,
         output_tokens: completion_tokens,
+        prefill_ns,
+        ttft_ns: result_ttft_ns,
     };
     let mut response_value = build_response_resource_value(
         &response_id,
@@ -953,6 +961,9 @@ async fn generate_response(
     // Set previous_response_id on the response resource.
     if let Some(ref prev_id) = previous_response_id {
         response_value["previous_response_id"] = json!(prev_id);
+    }
+    if !model_info_json.is_null() {
+        response_value["model_info"] = model_info_json;
     }
 
     if !strict_responses {
@@ -1729,14 +1740,19 @@ fn run_streaming_generation(
     log::debug!(target: "server::gen", "completed: prompt_tokens={} completion_tokens={}",
         stream_result.prompt_tokens, stream_result.completion_tokens);
 
+    let model_info_json = build_model_info_json(backend);
+
     Ok(StreamGenResult {
         output_items,
         usage: UsageStats {
             input_tokens: stream_result.prompt_tokens,
             output_tokens: stream_result.completion_tokens,
+            prefill_ns: stream_result.prefill_ns,
+            ttft_ns: stream_result.ttft_ns,
         },
         finish_reason: stream_result.finish_reason,
         responses_json: all_json,
+        model_info_json,
     })
 }
 
@@ -1815,6 +1831,8 @@ struct StreamGenResult {
     finish_reason: FinishReason,
     /// Full conversation JSON for chaining via response_store.
     responses_json: String,
+    /// Static model metadata (null for remote backends).
+    model_info_json: serde_json::Value,
 }
 
 struct StreamCtx {
@@ -2436,6 +2454,9 @@ impl StreamCtx {
                 if let Some(ref prev_id) = self.previous_response_id {
                     response["previous_response_id"] = json!(prev_id);
                 }
+                if !r.model_info_json.is_null() {
+                    response["model_info"] = r.model_info_json;
+                }
                 if status == "incomplete" {
                     let reason = match r.finish_reason {
                         FinishReason::Cancelled => "cancelled",
@@ -2631,6 +2652,41 @@ fn response_text_format_value(text_format: Option<&TextFormatConfig>) -> serde_j
 struct UsageStats {
     input_tokens: usize,
     output_tokens: usize,
+    prefill_ns: u64,
+    ttft_ns: u64,
+}
+
+fn dtype_name(val: u8) -> &'static str {
+    match val {
+        0 => "F32",
+        4 => "F16",
+        5 => "BF16",
+        25 => "GAF4",
+        26 => "GAF8",
+        27 => "MXFP4",
+        28 => "F8E4M3",
+        _ => "unknown",
+    }
+}
+
+fn build_model_info_json(backend: &talu::InferenceBackend) -> serde_json::Value {
+    let info = backend.model_info();
+    if info.file_size == 0 && info.d_model == 0 {
+        return serde_json::Value::Null;
+    }
+    json!({
+        "weight_dtype": dtype_name(info.weight_dtype),
+        "file_size_bytes": info.file_size,
+        "tensor_count": info.tensor_count,
+        "vocab_size": info.vocab_size,
+        "d_model": info.d_model,
+        "n_layers": info.n_layers,
+        "n_heads": info.n_heads,
+        "n_kv_groups": info.n_kv_groups,
+        "d_ff": info.d_ff,
+        "max_seq_len": info.max_seq_len,
+        "gaffine_group_size": info.gaffine_group_size,
+    })
 }
 
 fn build_response_resource_value(
@@ -2656,17 +2712,26 @@ fn build_response_resource_value(
     text_format: Option<&TextFormatConfig>,
 ) -> serde_json::Value {
     let usage_value = match usage {
-        Some(u) => json!({
-            "input_tokens": u.input_tokens,
-            "output_tokens": u.output_tokens,
-            "total_tokens": u.input_tokens + u.output_tokens,
-            "input_tokens_details": {
-                "cached_tokens": 0
-            },
-            "output_tokens_details": {
-                "reasoning_tokens": 0
+        Some(u) => {
+            let mut v = json!({
+                "input_tokens": u.input_tokens,
+                "output_tokens": u.output_tokens,
+                "total_tokens": u.input_tokens + u.output_tokens,
+                "input_tokens_details": {
+                    "cached_tokens": 0
+                },
+                "output_tokens_details": {
+                    "reasoning_tokens": 0
+                }
+            });
+            if u.prefill_ns > 0 {
+                v["prefill_ms"] = json!(u.prefill_ns as f64 / 1_000_000.0);
             }
-        }),
+            if u.ttft_ns > 0 {
+                v["ttft_ms"] = json!(u.ttft_ns as f64 / 1_000_000.0);
+            }
+            v
+        }
         None => serde_json::Value::Null,
     };
 

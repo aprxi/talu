@@ -382,8 +382,10 @@ pub const talu_backend_free = router.talu_backend_free;
 pub const talu_backend_synchronize = router.talu_backend_synchronize;
 pub const talu_backend_list_models = router.talu_backend_list_models;
 pub const talu_backend_list_models_free = router.talu_backend_list_models_free;
+pub const talu_backend_model_info = router.talu_backend_model_info;
 pub const RemoteModelInfo = router.RemoteModelInfo;
 pub const RemoteModelListResult = router.RemoteModelListResult;
+pub const CModelInfo = router.CModelInfo;
 
 // Re-export config types.
 pub const BackendType = types.BackendType;
@@ -519,6 +521,7 @@ pub const talu_router_iterator_prompt_tokens = router.talu_router_iterator_promp
 pub const talu_router_iterator_completion_tokens = router.talu_router_iterator_completion_tokens;
 pub const talu_router_iterator_prefill_ns = router.talu_router_iterator_prefill_ns;
 pub const talu_router_iterator_generation_ns = router.talu_router_iterator_generation_ns;
+pub const talu_router_iterator_ttft_ns = router.talu_router_iterator_ttft_ns;
 pub const talu_router_iterator_output_text = router.talu_router_iterator_output_text;
 pub const TaluTokenIterator = router.TaluTokenIterator;
 

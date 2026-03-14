@@ -312,6 +312,18 @@ pub export fn talu_router_iterator_generation_ns(
     return iter.getGenerationNs();
 }
 
+/// Gets the time-to-first-token in nanoseconds from a completed iterator.
+///
+/// Measures wall-clock time from generation start to first token pushed.
+/// Returns 0 if generation is not yet complete, iterator is null, or no tokens
+/// were produced.
+pub export fn talu_router_iterator_ttft_ns(
+    iterator: ?*TaluTokenIterator,
+) callconv(.c) u64 {
+    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
+    return iter.getTtftNs();
+}
+
 /// Gets the final decoded output text after generation completes.
 ///
 /// Returns null if iterator is null or no final text is available.
@@ -655,6 +667,53 @@ pub export fn talu_backend_list_models(backend: ?*TaluInferenceBackend) callconv
 pub export fn talu_backend_list_models_free(result: ?*RemoteModelListResult) callconv(.c) void {
     const ptr = result orelse return;
     capi_bridge.freeModelListResult(allocator, ptr);
+}
+
+// =============================================================================
+// Model Info
+// =============================================================================
+
+/// Static model metadata returned by talu_backend_model_info.
+/// All fields are zero when the backend is null or remote (no local engine).
+pub const CModelInfo = extern struct {
+    file_size: u64,
+    tensor_count: u64,
+    vocab_size: i32,
+    d_model: i32,
+    n_layers: i32,
+    n_heads: i32,
+    n_kv_groups: i32,
+    d_ff: i32,
+    max_seq_len: i32,
+    gaffine_group_size: i32,
+    weight_dtype: u8,
+    _pad: [7]u8 = .{0} ** 7,
+};
+
+/// Return static model metadata from a local backend.
+/// Returns a zero struct if the backend is null or remote.
+pub export fn talu_backend_model_info(
+    backend: ?*TaluInferenceBackend,
+) callconv(.c) CModelInfo {
+    const backend_ptr = backend orelse return std.mem.zeroes(CModelInfo);
+    const boxed: *spec_mod.InferenceBackend = @ptrCast(@alignCast(backend_ptr));
+    const engine = boxed.getLocalEngine() orelse return std.mem.zeroes(CModelInfo);
+    const loaded = engine.loaded;
+    const cfg = loaded.config;
+    return .{
+        .file_size = @intCast(loaded.file_size),
+        .tensor_count = @intCast(loaded.tensor_count),
+        .vocab_size = cfg.vocab_size,
+        .d_model = cfg.d_model,
+        .n_layers = cfg.n_layers,
+        .n_heads = cfg.n_heads,
+        .n_kv_groups = cfg.n_kv_groups,
+        .d_ff = cfg.d_ff,
+        .max_seq_len = cfg.max_seq_len,
+        .gaffine_group_size = cfg.gaffine_group_size,
+        .weight_dtype = @intFromEnum(loaded.original_weight_dtype),
+        ._pad = .{0} ** 7,
+    };
 }
 
 // =============================================================================
