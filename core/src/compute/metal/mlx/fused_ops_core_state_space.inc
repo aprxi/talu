@@ -637,8 +637,8 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0) {
-      const float q_scale = (1.0f / sqrt(stats_shared[0].x + eps)) * (1.0f / sqrt((float)D_HEAD));
-      const float k_scale = 1.0f / sqrt(stats_shared[0].y + eps);
+      const float q_scale = rsqrt(stats_shared[0].x + eps) * rsqrt((float)D_HEAD);
+      const float k_scale = rsqrt(stats_shared[0].y + eps);
       scalar_shared[0] = stats_shared[0].z * q_scale * k_scale;
       scalar_shared[1] = k_scale;
       const float a = a_raw[head] + dt_bias[head];
@@ -674,15 +674,17 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
       next_state[state_index] = scaled + k_shared[i] * kv_mem;
     }
 
-    out_shared[lane] = out_value;
+    threadgroup float reduce_shared[D_HEAD];
+    reduce_shared[lane] = out_value * out_value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0) {
-      float sum_sq = 0.0f;
-      for (uint i = 0; i < D_HEAD; ++i) {
-        const float v = out_shared[i];
-        sum_sq += v * v;
+    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
+      if (lane < offset) {
+        reduce_shared[lane] += reduce_shared[lane + offset];
       }
-      scalar_shared[1] = 1.0f / sqrt((sum_sq / (float)D_HEAD) + eps);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+      scalar_shared[1] = rsqrt((reduce_shared[0] / (float)D_HEAD) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -752,7 +754,6 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
     threadgroup float3 stats_shared[D_HEAD];
-    threadgroup float out_shared[D_HEAD];
     threadgroup float scalar_shared[4];
 
     const uint vec_base = head * D_HEAD;
@@ -770,8 +771,8 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0) {
-      const float q_scale = (1.0f / sqrt(stats_shared[0].x + eps)) * (1.0f / sqrt((float)D_HEAD));
-      const float k_scale = 1.0f / sqrt(stats_shared[0].y + eps);
+      const float q_scale = rsqrt(stats_shared[0].x + eps) * rsqrt((float)D_HEAD);
+      const float k_scale = rsqrt(stats_shared[0].y + eps);
       scalar_shared[0] = stats_shared[0].z * q_scale * k_scale;
       scalar_shared[1] = k_scale;
       const float a = a_raw[head] + dt_bias[head];
@@ -808,15 +809,17 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
       next_state[state_index] = scaled + k_shared[i] * kv_mem;
     }
 
-    out_shared[lane] = out_value;
+    threadgroup float reduce_shared[D_HEAD];
+    reduce_shared[lane] = out_value * out_value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0) {
-      float sum_sq = 0.0f;
-      for (uint i = 0; i < D_HEAD; ++i) {
-        const float v = out_shared[i];
-        sum_sq += v * v;
+    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
+      if (lane < offset) {
+        reduce_shared[lane] += reduce_shared[lane + offset];
       }
-      scalar_shared[1] = 1.0f / sqrt((sum_sq / (float)D_HEAD) + eps);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+      scalar_shared[1] = rsqrt((reduce_shared[0] / (float)D_HEAD) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1009,8 +1012,8 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_ssm_probe_kerne
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0) {
-      const float q_scale = (1.0f / sqrt(stats_shared[0].x + eps)) * (1.0f / sqrt((float)D_HEAD));
-      const float k_scale = 1.0f / sqrt(stats_shared[0].y + eps);
+      const float q_scale = rsqrt(stats_shared[0].x + eps) * rsqrt((float)D_HEAD);
+      const float k_scale = rsqrt(stats_shared[0].y + eps);
       scalar_shared[0] = stats_shared[0].z * q_scale * k_scale;
       scalar_shared[1] = k_scale;
       const float a = a_raw[head] + dt_bias[head];
@@ -1295,7 +1298,7 @@ static array layer_norm_last_dim(
     const auto x_mean = mean(x, -1, true);
     const auto centered = x - x_mean;
     const auto variance = mean(centered * centered, -1, true);
-    const auto inv_std = 1.0f / sqrt(variance + eps);
+    const auto inv_std = rsqrt(variance + eps);
     const auto normed = centered * inv_std;
     return normed * weight + bias;
 }
@@ -1456,10 +1459,8 @@ static array quantized_linear_no_bias(
     const void* scales_handle = nullptr,
     const void* biases_handle = nullptr
 ) {
-    // Keep compute in the caller's activation dtype (often FP32 for recurrent
-    // state-space paths) and only cast quant params to that dtype.
-    const Dtype compute_dtype = input.dtype();
-    if (scales.dtype() == compute_dtype && biases.dtype() == compute_dtype) {
+    const Dtype param_dtype = scales.dtype();
+    if (input.dtype() == param_dtype && biases.dtype() == param_dtype) {
         return quantized_matmul_lastdim(
             input,
             weights,
@@ -1469,10 +1470,11 @@ static array quantized_linear_no_bias(
             bits
         );
     }
-    const array scales_cast = cast_tensor_cached(scales_handle, scales, compute_dtype);
-    const array biases_cast = cast_tensor_cached(biases_handle, biases, compute_dtype);
+    const array input_cast = (input.dtype() == param_dtype) ? input : astype(input, param_dtype);
+    const array scales_cast = cast_tensor_cached(scales_handle, scales, param_dtype);
+    const array biases_cast = cast_tensor_cached(biases_handle, biases, param_dtype);
     return quantized_matmul_lastdim(
-        input,
+        input_cast,
         weights,
         scales_cast,
         biases_cast,
@@ -1492,7 +1494,7 @@ static array resolve_state_space_conv_kernel_uncached(
         kernel.shape(1) == d_conv &&
         kernel.shape(2) == xbc_len) {
         // Precomputed setup-time layout [1, d_conv, xbc_len].
-        return ensure_float32(kernel);
+        return kernel;
     }
     if (kernel.ndim() == 3) {
         // [xbc_len, 1, d_conv] -> [xbc_len, d_conv]
@@ -1961,16 +1963,15 @@ static inline array gated_delta_mixer_forward_core(
         throw std::invalid_argument("[gated_delta] invalid config dims");
     }
 
-    // Match CPU gated-delta numerics: run recurrent-path projections from FP32
-    // activations to avoid BF16/F16 quantized matmul drift at token 0.
-    const array input_f32 = ensure_float32(input);
-    const array proj_all = state_space_call(in_proj_fn, input_f32);
+    // Projection matmuls stay in model dtype for bf16/f16 tensor-core throughput.
+    // FP32 upcasting happens after projection, before recurrent state math.
+    const array proj_all = state_space_call(in_proj_fn, input);
     if (proj_all.shape(2) < proj_len) {
         throw std::invalid_argument("[gated_delta] in_proj output too small");
     }
 
-    // Recurrent conv path runs in FP32 to match CPU state accumulation behavior.
-    array qkv_all = ensure_float32(slice(proj_all, {0, 0, 0}, {1, seq_len, qkv_len}));
+    // Slice projections in model dtype; upcast to FP32 only for recurrent state math.
+    array qkv_all = slice(proj_all, {0, 0, 0}, {1, seq_len, qkv_len});
     const array z_all = ensure_float32(slice(proj_all, {0, 0, qkv_len}, {1, seq_len, qkv_len + d_inner}));
     const array beta_raw_all = ensure_float32(slice(
         proj_all,
@@ -1996,15 +1997,13 @@ static inline array gated_delta_mixer_forward_core(
     if (conv_bias_row) {
         conv_seq = conv_seq + reshape(*conv_bias_row, {1, 1, qkv_len});
     }
-    const array conv_seq_f32 = ensure_float32(conv_seq);
     if (capture_out != nullptr) {
         capture_out->in_proj = proj_all;
-        // gdelta.conv captures the raw depthwise-conv output prior to SiLU so
-        // tap-order/state math can be isolated from activation effects.
-        capture_out->conv = conv_seq_f32;
+        capture_out->conv = conv_seq;
     }
-    // Keep SiLU numerics aligned with CPU: x * sigmoid(x) on FP32 activations.
-    const array qkv_conv_all = conv_seq_f32 * sigmoid(conv_seq_f32);
+    // SiLU then upcast to FP32 once for the entire sequence. This avoids
+    // per-token ensure_float32 calls inside the recurrence loop.
+    const array qkv_conv_all = ensure_float32(conv_seq * sigmoid(conv_seq));
 
     const std::optional<array> dt_bias_heads = dt_bias_row
         ? std::optional<array>(reshape(*dt_bias_row, {n_heads}))
@@ -2099,10 +2098,11 @@ static inline array gated_delta_mixer_forward_core(
             out = normed_out;
         }
 
-        // Keep recurrent-path projection input in FP32 to match CPU gated-delta
-        // semantics and avoid bf16/f16 round-trip loss before quantized matmul.
-        // quantized_linear_no_bias will cast to parameter dtype if needed.
+        // Cast back to model dtype for out_proj matmul to use bf16 tensor cores.
         array out_proj_in = reshape(out, {1, 1, d_inner});
+        if (out_proj_in.dtype() != model_dtype) {
+            out_proj_in = astype(out_proj_in, model_dtype);
+        }
         outputs.emplace_back(state_space_call(out_proj_fn, out_proj_in));
     }
 
@@ -2385,10 +2385,6 @@ void* mlx_lazy_state_space_block_bf16(
     );
 
     if (layer_state != nullptr) {
-        // Materialize recurrent states before caching so decode reuses concrete
-        // tensors, not graph fragments tied to prior prefill DAGs.
-        eval(conv_state);
-        eval(ssm_state);
         *layer_state->conv_state = conv_state;
         *layer_state->ssm_state = ssm_state;
     }
@@ -2436,11 +2432,9 @@ void* mlx_lazy_gated_delta_mixer_bf16(
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
     }
-    const array conv_kernel_broadcast = ensure_float32(
-        resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len)
-    );
+    const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
-        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, float32, 0))
+        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, input_arr.dtype(), 0))
         : std::nullopt;
     const std::optional<array> dt_bias_row = (dt_b != nullptr)
         ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
@@ -2457,21 +2451,21 @@ void* mlx_lazy_gated_delta_mixer_bf16(
         d_head_i
     );
 
-    // Recurrent conv history is kept in FP32 for parity with CPU.
-    array conv_state(0.0f, float32);
+    const Dtype model_dtype = input_arr.dtype();
+    array conv_state(0.0f, model_dtype);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
             layer_state->conv_state->shape(2) != qkv_len ||
-            layer_state->conv_state->dtype() != float32;
+            layer_state->conv_state->dtype() != model_dtype;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, float32));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, model_dtype));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, qkv_len}, float32);
+        conv_state = zeros({1, d_conv_i, qkv_len}, model_dtype);
     }
 
     array ssm_state(0.0f, float32);
@@ -2490,8 +2484,8 @@ void* mlx_lazy_gated_delta_mixer_bf16(
         ssm_state = zeros({1, n_heads_i, d_head_i, d_head_i}, float32);
     }
 
-    array in_proj_rhs(0.0f, input_arr.dtype());
-    array out_proj_rhs(0.0f, input_arr.dtype());
+    array in_proj_rhs(0.0f, model_dtype);
+    array out_proj_rhs(0.0f, model_dtype);
     if (layer_state != nullptr) {
         const bool need_proj_rhs_refresh =
             layer_state->in_proj_rhs == nullptr ||
@@ -2501,11 +2495,8 @@ void* mlx_lazy_gated_delta_mixer_bf16(
             layer_state->hidden_dim != hidden_dim ||
             layer_state->d_inner != d_inner;
         if (need_proj_rhs_refresh) {
-            // CPU BF16 linear kernels multiply f32 activations with BF16 weights
-            // while accumulating in f32. Keep parity by materializing RHS in f32
-            // so recurrent-path matmuls stay f32 end-to-end.
-            in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
-            out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
+            in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
+            out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
             delete layer_state->in_proj_rhs;
             delete layer_state->out_proj_rhs;
             layer_state->in_proj_rhs = new array(in_proj_rhs);
@@ -2519,8 +2510,8 @@ void* mlx_lazy_gated_delta_mixer_bf16(
             out_proj_rhs = *layer_state->out_proj_rhs;
         }
     } else {
-        in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
-        out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
+        in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
+        out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
     }
     StateSpaceCallable in_proj_fn{
         .fn = state_space_apply_matmul_rhs,
@@ -2549,10 +2540,6 @@ void* mlx_lazy_gated_delta_mixer_bf16(
     );
 
     if (layer_state != nullptr) {
-        // Materialize recurrent states before caching so decode reuses concrete
-        // tensors, not graph fragments tied to prior prefill DAGs.
-        eval(conv_state);
-        eval(ssm_state);
         *layer_state->conv_state = conv_state;
         *layer_state->ssm_state = ssm_state;
     }
@@ -2611,11 +2598,9 @@ void* mlx_lazy_gated_delta_mixer_quantized(
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
     }
-    const array conv_kernel_broadcast = ensure_float32(
-        resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len)
-    );
+    const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
-        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, float32, 0))
+        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, input_arr.dtype(), 0))
         : std::nullopt;
     const std::optional<array> dt_bias_row = (dt_b != nullptr)
         ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
@@ -2632,21 +2617,21 @@ void* mlx_lazy_gated_delta_mixer_quantized(
         d_head_i
     );
 
-    // Recurrent conv history is kept in FP32 for parity with CPU.
-    array conv_state(0.0f, float32);
+    const Dtype model_dtype = input_arr.dtype();
+    array conv_state(0.0f, model_dtype);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
             layer_state->conv_state->shape(2) != qkv_len ||
-            layer_state->conv_state->dtype() != float32;
+            layer_state->conv_state->dtype() != model_dtype;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, float32));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, model_dtype));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, qkv_len}, float32);
+        conv_state = zeros({1, d_conv_i, qkv_len}, model_dtype);
     }
 
     array ssm_state(0.0f, float32);
@@ -2710,10 +2695,6 @@ void* mlx_lazy_gated_delta_mixer_quantized(
     );
 
     if (layer_state != nullptr) {
-        // Materialize recurrent states before caching so decode reuses concrete
-        // tensors, not graph fragments tied to prior prefill DAGs.
-        eval(conv_state);
-        eval(ssm_state);
         *layer_state->conv_state = conv_state;
         *layer_state->ssm_state = ssm_state;
     }
@@ -2768,11 +2749,9 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
     }
-    const array conv_kernel_broadcast = ensure_float32(
-        resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len)
-    );
+    const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
-        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, float32, 0))
+        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, input_arr.dtype(), 0))
         : std::nullopt;
     const std::optional<array> dt_bias_row = (dt_b != nullptr)
         ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
@@ -2789,20 +2768,21 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
         d_head_i
     );
 
-    array conv_state(0.0f, float32);
+    const Dtype model_dtype = input_arr.dtype();
+    array conv_state(0.0f, model_dtype);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
             layer_state->conv_state->shape(2) != qkv_len ||
-            layer_state->conv_state->dtype() != float32;
+            layer_state->conv_state->dtype() != model_dtype;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, float32));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, model_dtype));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, qkv_len}, float32);
+        conv_state = zeros({1, d_conv_i, qkv_len}, model_dtype);
     }
 
     array ssm_state(0.0f, float32);
@@ -2821,8 +2801,8 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
         ssm_state = zeros({1, n_heads_i, d_head_i, d_head_i}, float32);
     }
 
-    array in_proj_rhs(0.0f, input_arr.dtype());
-    array out_proj_rhs(0.0f, input_arr.dtype());
+    array in_proj_rhs(0.0f, model_dtype);
+    array out_proj_rhs(0.0f, model_dtype);
     if (layer_state != nullptr) {
         const bool need_proj_rhs_refresh =
             layer_state->in_proj_rhs == nullptr ||
@@ -2832,10 +2812,8 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
             layer_state->hidden_dim != hidden_dim ||
             layer_state->d_inner != d_inner;
         if (need_proj_rhs_refresh) {
-            // Keep capture path numerically identical to non-capture BF16 path:
-            // recurrent-path projections use f32 activations and f32 RHS.
-            in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
-            out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
+            in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
+            out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
             delete layer_state->in_proj_rhs;
             delete layer_state->out_proj_rhs;
             layer_state->in_proj_rhs = new array(in_proj_rhs);
@@ -2849,8 +2827,8 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
             out_proj_rhs = *layer_state->out_proj_rhs;
         }
     } else {
-        in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
-        out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
+        in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
+        out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
     }
     StateSpaceCallable in_proj_fn{
         .fn = state_space_apply_matmul_rhs,
@@ -2951,11 +2929,9 @@ void* mlx_lazy_gated_delta_mixer_quantized_capture(
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
     }
-    const array conv_kernel_broadcast = ensure_float32(
-        resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len)
-    );
+    const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
-        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, float32, 0))
+        ? std::optional<array>(resolve_state_space_row_cached(conv_bias, *conv_b, qkv_len, input_arr.dtype(), 0))
         : std::nullopt;
     const std::optional<array> dt_bias_row = (dt_b != nullptr)
         ? std::optional<array>(resolve_state_space_row_cached(dt_bias, *dt_b, n_heads_i, float32, 1))
@@ -2972,20 +2948,21 @@ void* mlx_lazy_gated_delta_mixer_quantized_capture(
         d_head_i
     );
 
-    array conv_state(0.0f, float32);
+    const Dtype model_dtype = input_arr.dtype();
+    array conv_state(0.0f, model_dtype);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
             layer_state->conv_state->shape(2) != qkv_len ||
-            layer_state->conv_state->dtype() != float32;
+            layer_state->conv_state->dtype() != model_dtype;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, float32));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, model_dtype));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, qkv_len}, float32);
+        conv_state = zeros({1, d_conv_i, qkv_len}, model_dtype);
     }
 
     array ssm_state(0.0f, float32);

@@ -152,8 +152,6 @@ extern "C" {
 void mlx_array_free(void* arr);
 
 void mlx_pool_reset() {
-    // reset is the explicit eval-complete barrier for pooled temporaries
-    ScopedAutoreleasePool pool;
     auto& g_pool_index = pool_index_store();
     auto& g_array_pool = array_pool_store();
     g_pool_index = 0;
@@ -317,11 +315,6 @@ void mlx_array_free(void* arr) {
     // Transform caches are keyed by persistent weight handles and must be
     // cleared only at explicit backend/run lifecycle barriers. Clearing them on
     // every owned-array delete destabilizes teardown and defeats caching.
-    //
-    // MLX Metal arrays ultimately release ARC-managed Objective-C resources.
-    // Draining an autorelease pool at this exact destruction boundary keeps
-    // their lifetime deterministic across the Zig/Rust/FFI teardown path.
-    ScopedAutoreleasePool pool;
     delete owned;
 }
 
@@ -330,7 +323,6 @@ void mlx_array_free(void* arr) {
 // ============================================================================
 
 void mlx_eval(void** handles, size_t n) {
-    ScopedAutoreleasePool pool;
     if (n == 1) {
         eval(*static_cast<array*>(handles[0]));
         return;
@@ -344,7 +336,6 @@ void mlx_eval(void** handles, size_t n) {
 }
 
 void mlx_async_eval(void** handles, size_t n) {
-    ScopedAutoreleasePool pool;
     if (n == 1) {
         async_eval(*static_cast<array*>(handles[0]));
         return;
@@ -362,7 +353,6 @@ void mlx_async_eval(void** handles, size_t n) {
 // ============================================================================
 
 void mlx_array_to_float32(const void* handle, float* out, size_t size) {
-    ScopedAutoreleasePool pool;
     const auto& array_ref = *static_cast<const array*>(handle);
     auto converted = (array_ref.dtype() != float32) ? astype(array_ref, float32) : array_ref;
     eval(converted);
@@ -370,7 +360,6 @@ void mlx_array_to_float32(const void* handle, float* out, size_t size) {
 }
 
 void mlx_array_to_uint32(const void* handle, uint32_t* out, size_t size) {
-    ScopedAutoreleasePool pool;
     const auto& array_ref = *static_cast<const array*>(handle);
     auto converted = (array_ref.dtype() != uint32) ? astype(array_ref, uint32) : array_ref;
     eval(converted);
@@ -378,7 +367,6 @@ void mlx_array_to_uint32(const void* handle, uint32_t* out, size_t size) {
 }
 
 uint32_t mlx_array_item_u32(const void* handle) {
-    ScopedAutoreleasePool pool;
     const auto& array_ref = *static_cast<const array*>(handle);
     return static_cast<uint32_t>(array_ref.item<int32_t>());
 }

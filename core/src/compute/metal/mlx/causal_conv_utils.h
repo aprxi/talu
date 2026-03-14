@@ -22,6 +22,16 @@ inline array causal_conv_run_sequence(
         throw std::invalid_argument("[causal_conv] seq_len must be > 0");
     }
 
+    // Decode fast path (seq_len == 1): avoid a full conv1d launch and compute
+    // the same depthwise update with direct tensor ops.
+    if (seq_len == 1) {
+        const array shifted = slice(*conv_state, {0, 1, 0}, {1, d_conv_i, conv_dim_i});
+        const array next_state = concatenate({shifted, bx}, 1);
+        const array conv_token = sum(next_state * conv_kernel_broadcast, 1);
+        *conv_state = next_state;
+        return reshape(conv_token, {1, 1, conv_dim_i});
+    }
+
     // Build [history, new_tokens] and run grouped depthwise conv1d in one op.
     const array history = concatenate({*conv_state, bx}, 1);
     const array weight = transpose(conv_kernel_broadcast, {2, 1, 0}); // [conv_dim, d_conv, 1]
