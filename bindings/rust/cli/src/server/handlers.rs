@@ -34,6 +34,7 @@ struct GenerationRequest {
     top_p: Option<f64>,
     presence_penalty: Option<f64>,
     frequency_penalty: Option<f64>,
+    seed: Option<u64>,
     logprobs: LogprobConfig,
     reasoning: ReasoningConfig,
     instructions: Option<String>,
@@ -231,6 +232,7 @@ async fn handle_generate(
         top_p: parsed.top_p,
         presence_penalty: parsed.presence_penalty,
         frequency_penalty: parsed.frequency_penalty,
+        seed: parsed.seed,
         logprobs,
         reasoning,
         instructions: parsed.instructions.clone(),
@@ -599,6 +601,7 @@ async fn generate_response(
     let top_p = request.top_p;
     let presence_penalty = request.presence_penalty;
     let frequency_penalty = request.frequency_penalty;
+    let seed = request.seed;
     let logprobs = request.logprobs;
     let reasoning = request.reasoning;
     let instructions = request.instructions;
@@ -860,11 +863,14 @@ async fn generate_response(
             if let Some(top_p) = top_p {
                 cfg.top_p = top_p as f32;
             }
+            if let Some(seed) = seed {
+                cfg.seed = seed;
+            }
             cfg.tools_json = tools_json_for_generation;
             cfg.tool_choice = tool_choice_for_generation;
 
-            log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?}",
-                model_id_for_task, max_output_tokens, temperature, top_p);
+            log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?} seed={:?}",
+                model_id_for_task, max_output_tokens, temperature, top_p, seed);
             log::trace!(target: "server::gen", "generate(items={}, cfg={{max_tokens={}, temp={}, top_p={}}})",
                 pre_gen_count, cfg.max_tokens, cfg.temperature, cfg.top_p);
             let result = talu::router::generate(&chat, &[], backend, &cfg)
@@ -1003,6 +1009,7 @@ async fn stream_response(
     let top_p = request.top_p;
     let presence_penalty = request.presence_penalty;
     let frequency_penalty = request.frequency_penalty;
+    let seed = request.seed;
     let logprobs = request.logprobs;
     let reasoning = request.reasoning;
     let instructions = request.instructions;
@@ -1501,6 +1508,7 @@ async fn stream_response(
             max_output_tokens,
             temperature,
             top_p,
+            seed,
             presence_penalty,
             frequency_penalty,
             effective_system_prompt,
@@ -1576,6 +1584,7 @@ fn run_streaming_generation(
     max_output_tokens: Option<i64>,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    seed: Option<u64>,
     _presence_penalty: Option<f64>,
     _frequency_penalty: Option<f64>,
     system_prompt: Option<String>,
@@ -1642,6 +1651,9 @@ fn run_streaming_generation(
     }
     if let Some(top_p) = top_p {
         cfg.top_p = top_p as f32;
+    }
+    if let Some(seed) = seed {
+        cfg.seed = seed;
     }
     cfg.tools_json = tools_json.map(|v| v.to_string());
     cfg.tool_choice = tool_choice_json.map(|v| v.to_string());

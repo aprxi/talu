@@ -24,6 +24,7 @@ pub struct CreateResponseBody {
     pub prompt_cache_key: Option<String>,
     pub reasoning: Option<serde_json::Value>,
     pub safety_identifier: Option<String>,
+    pub seed: Option<u64>,
     pub service_tier: Option<String>,
     pub store: Option<bool>,
     pub stream: Option<bool>,
