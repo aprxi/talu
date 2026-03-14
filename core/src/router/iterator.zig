@@ -30,6 +30,7 @@ const inference_types = @import("../inference/root.zig").types;
 const FinishReason = inference_types.FinishReason;
 const gen_config_mod = @import("../inference/config/generation.zig");
 const log = @import("../log.zig");
+const error_context = @import("../error_context.zig");
 
 /// Maximum length of a single decoded token in bytes.
 const MAX_TOKEN_LEN: usize = 512;
@@ -591,10 +592,13 @@ pub const TokenIterator = struct {
             } else {
                 // Store error for caller to retrieve (use -1 as generic error code)
                 self.error_code.store(-1, .release);
-                self.error_msg = (if (err == error.UnsupportedContentType)
-                    std.fmt.allocPrint(self.allocator, "This model does not support images. Use a vision-language model (e.g. LFM2-VL-450M).", .{})
-                else
-                    std.fmt.allocPrint(self.allocator, "Generation failed: {s}", .{@errorName(err)})) catch null;
+                if (err == error.UnsupportedContentType) {
+                    self.setErrorMsg("This model does not support images. Use a vision-language model (e.g. LFM2-VL-450M).");
+                } else if (error_context.consumeContext()) |ctx| {
+                    self.setErrorMsg(ctx);
+                } else {
+                    self.setErrorMsg(@errorName(err));
+                }
             }
         };
 
@@ -616,6 +620,20 @@ pub const TokenIterator = struct {
             .local => try self.runLocalGeneration(),
             .http => try self.runHttpGeneration(),
         }
+    }
+
+    /// Store an error message as a null-terminated string (for C API).
+    fn setErrorMsg(self: *TokenIterator, msg: []const u8) void {
+        if (self.error_msg) |existing| {
+            self.allocator.free(existing);
+        }
+        const buf = self.allocator.alloc(u8, msg.len + 1) catch {
+            self.error_msg = null;
+            return;
+        };
+        @memcpy(buf[0..msg.len], msg);
+        buf[msg.len] = 0;
+        self.error_msg = buf;
     }
 
     fn setFinalText(self: *TokenIterator, text: []const u8) !void {
@@ -718,11 +736,7 @@ pub const TokenIterator = struct {
 
         const result = engine.stream(chat, opts) catch |err| {
             self.error_code.store(-1, .release);
-            self.error_msg = std.fmt.allocPrint(
-                self.allocator,
-                "HTTP streaming failed: {s}",
-                .{@errorName(err)},
-            ) catch null;
+            self.setErrorMsg(@errorName(err));
             return err;
         };
         defer result.deinit(engine.allocator);
@@ -758,11 +772,7 @@ pub const TokenIterator = struct {
             .finish_reason = finish_reason_str,
         }) catch |err| {
             self.error_code.store(-1, .release);
-            self.error_msg = std.fmt.allocPrint(
-                self.allocator,
-                "Commit failed: {s}",
-                .{@errorName(err)},
-            ) catch null;
+            self.setErrorMsg(@errorName(err));
             return err;
         };
     }

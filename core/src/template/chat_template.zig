@@ -6,6 +6,7 @@
 const std = @import("std");
 const io = @import("../io/root.zig");
 const template_engine = @import("root.zig");
+const error_context = @import("../error_context.zig");
 
 pub const Error = template_engine.Error || error{InvalidMessages};
 
@@ -114,7 +115,14 @@ pub fn renderWithContext(
         }
     }
 
-    return template_engine.render(allocator, template, &template_context);
+    return template_engine.render(allocator, template, &template_context) catch |err| {
+        if (err == error.RaiseException) {
+            if (template_context.raise_exception_message) |m| {
+                error_context.setContext("{s}", .{m});
+            }
+        }
+        return err;
+    };
 }
 
 /// Convert std.json.Value to template_engine.TemplateInput
@@ -549,6 +557,69 @@ test "renderWithContext with invalid extra context JSON returns error" {
 
     const result = renderWithContext(allocator, template, messages_json, "", "", false, invalid_json);
     try std.testing.expectError(error.InvalidMessages, result);
+}
+
+test "Qwen3.5 template with macro and namespace" {
+    const allocator = std.testing.allocator;
+
+    // Minimal Qwen3.5 template with render_content macro and namespace validation
+    const template =
+        \\{%- macro render_content(content, do_vision_count, is_system_content=false) %}
+        \\    {%- if content is string %}
+        \\        {{- content }}
+        \\    {%- elif content is none or content is undefined %}
+        \\        {{- '' }}
+        \\    {%- else %}
+        \\        {{- raise_exception('Unexpected content type.') }}
+        \\    {%- endif %}
+        \\{%- endmacro %}
+        \\{%- if not messages %}
+        \\    {{- raise_exception('No messages provided.') }}
+        \\{%- endif %}
+        \\{%- if messages[0].role == 'system' %}
+        \\    {%- set content = render_content(messages[0].content, false, true)|trim %}
+        \\    {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}
+        \\{%- endif %}
+        \\{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+        \\{%- for message in messages[::-1] %}
+        \\    {%- set index = (messages|length - 1) - loop.index0 %}
+        \\    {%- if ns.multi_step_tool and message.role == "user" %}
+        \\        {%- set content = render_content(message.content, false)|trim %}
+        \\        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+        \\            {%- set ns.multi_step_tool = false %}
+        \\            {%- set ns.last_query_index = index %}
+        \\        {%- endif %}
+        \\    {%- endif %}
+        \\{%- endfor %}
+        \\{%- if ns.multi_step_tool %}
+        \\    {{- raise_exception('No user query found in messages.') }}
+        \\{%- endif %}
+        \\{%- for message in messages %}
+        \\    {%- if message.role == "user" %}
+        \\        {{- '<|im_start|>user\n' + message.content + '<|im_end|>\n' }}
+        \\    {%- elif message.role != "system" %}
+        \\        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}
+        \\    {%- endif %}
+        \\{%- endfor %}
+        \\{%- if add_generation_prompt %}
+        \\    {{- '<|im_start|>assistant\n<think>\n\n</think>\n\n' }}
+        \\{%- endif %}
+    ;
+    const messages_json =
+        \\[{"role": "system", "content": "ok"}, {"role": "user", "content": "hello"}]
+    ;
+
+    const result = try render(allocator, template, messages_json, "", "", true);
+    defer allocator.free(result);
+
+    // Should contain system message
+    try std.testing.expect(std.mem.indexOf(u8, result, "<|im_start|>system") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ok") != null);
+    // Should contain user message (not raise "No user query found")
+    try std.testing.expect(std.mem.indexOf(u8, result, "<|im_start|>user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "hello") != null);
+    // Should have generation prompt
+    try std.testing.expect(std.mem.indexOf(u8, result, "<|im_start|>assistant") != null);
 }
 
 test "renderWithContext with array extra context returns error" {

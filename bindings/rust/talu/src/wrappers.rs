@@ -256,11 +256,11 @@ impl ChatHandle {
             return Err(error_from_last_or("Chat has no conversation"));
         }
         // SAFETY: conv_ptr is non-null; content ptr/len are valid for the str.
-        // MessageRole::User = 0.
+        // Role codes: 0=system, 1=user, 2=assistant, 3=developer.
         let result = unsafe {
             talu_sys::talu_responses_append_message(
                 conv_ptr,
-                0, // User
+                1, // User
                 content.as_ptr(),
                 content.len(),
             )

@@ -246,13 +246,8 @@ pub export fn talu_router_iterator_error_msg(
     capi_error.clearError();
     const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return null));
     const msg = iter.getErrorMsg() orelse return null;
-    // The error message is a slice; we need to return a null-terminated string.
-    // Check if the byte after the slice is already null (since allocPrint adds it).
-    if (msg.len > 0 and msg.ptr[msg.len] == 0) {
-        return @ptrCast(msg.ptr);
-    }
-    // Otherwise return null - can't safely expose without null terminator
-    return null;
+    // msg is allocated with a trailing null byte by setErrorMsg().
+    return @ptrCast(msg.ptr);
 }
 
 /// Cancels generation early.

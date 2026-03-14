@@ -105,7 +105,8 @@ pub fn append_user_message(chat: *mut c_void, content: &str) {
     let conv = unsafe { talu_sys::talu_chat_get_conversation(chat) };
     assert!(!conv.is_null(), "chat has no conversation");
     let result = unsafe {
-        talu_sys::talu_responses_append_message(conv, 0, content.as_ptr(), content.len())
+        // Role codes: 0=system, 1=user, 2=assistant, 3=developer.
+        talu_sys::talu_responses_append_message(conv, 1, content.as_ptr(), content.len())
     };
     assert!(result >= 0, "append_user_message failed");
 }
