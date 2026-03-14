@@ -120,8 +120,13 @@ const KernelSlot = enum {
     matvec_qkv_f16,
     matvec_qkv_bf16,
     gaffine_u4_matvec,
+    gaffine_u8_matvec,
     gaffine_u4_matvec_gate_up,
     gaffine_u4_matvec_qkv,
+    gaffine_u8_matvec_qkv,
+    gaffine_u8_matvec_gate_up,
+    gaffine_u8_matvec_gate_up_silu,
+    gaffine_u8_dequant_f16,
 };
 
 const RequiredKernel = struct {
@@ -201,8 +206,13 @@ const required_kernels = [_]RequiredKernel{
     .{ .slot = .matvec_qkv_f16, .op_name = compute.cuda.matvec_u16_qkv.op_name_f16, .embedded_symbol = compute.cuda.matvec_u16_qkv.embedded_symbol_f16 },
     .{ .slot = .matvec_qkv_bf16, .op_name = compute.cuda.matvec_u16_qkv.op_name_bf16, .embedded_symbol = compute.cuda.matvec_u16_qkv.embedded_symbol_bf16 },
     .{ .slot = .gaffine_u4_matvec, .op_name = compute.cuda.gaffine_u4_matvec.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec.embedded_symbol },
+    .{ .slot = .gaffine_u8_matvec, .op_name = compute.cuda.gaffine_u8_matvec.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec.embedded_symbol },
     .{ .slot = .gaffine_u4_matvec_gate_up, .op_name = compute.cuda.gaffine_u4_matvec_gate_up.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec_gate_up.embedded_symbol },
     .{ .slot = .gaffine_u4_matvec_qkv, .op_name = compute.cuda.gaffine_u4_matvec_qkv.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec_qkv.embedded_symbol },
+    .{ .slot = .gaffine_u8_matvec_qkv, .op_name = compute.cuda.gaffine_u8_matvec_qkv.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec_qkv.embedded_symbol },
+    .{ .slot = .gaffine_u8_matvec_gate_up, .op_name = compute.cuda.gaffine_u8_matvec_gate_up.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec_gate_up.embedded_symbol },
+    .{ .slot = .gaffine_u8_matvec_gate_up_silu, .op_name = compute.cuda.gaffine_u8_matvec_gate_up_silu.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec_gate_up_silu.embedded_symbol },
+    .{ .slot = .gaffine_u8_dequant_f16, .op_name = compute.cuda.gaffine_u8_dequantize_f16.op_name, .embedded_symbol = compute.cuda.gaffine_u8_dequantize_f16.embedded_symbol },
 };
 
 const DeviceTensor = struct {
@@ -268,6 +278,8 @@ const GaffineU4LinearWeight = struct {
     }
 };
 
+const GaffineU8LinearWeight = GaffineU4LinearWeight;
+
 const U16LinearWeight = struct {
     rows: usize,
     cols: usize,
@@ -287,12 +299,14 @@ const LinearWeight = union(enum) {
     dense_f32: DeviceTensor,
     dense_u16: U16LinearWeight,
     gaffine_u4: GaffineU4LinearWeight,
+    gaffine_u8: GaffineU8LinearWeight,
 
     fn deinit(self: *LinearWeight, device: *compute.cuda.Device) void {
         switch (self.*) {
             .dense_f32 => |*w| w.deinit(device),
             .dense_u16 => |*w| w.deinit(device),
             .gaffine_u4 => |*w| w.deinit(device),
+            .gaffine_u8 => |*w| w.deinit(device),
         }
     }
 
@@ -301,6 +315,7 @@ const LinearWeight = union(enum) {
             .dense_f32 => |w| w.rows,
             .dense_u16 => |w| w.rows,
             .gaffine_u4 => |w| w.rows,
+            .gaffine_u8 => |w| w.rows,
         };
     }
 
@@ -309,6 +324,7 @@ const LinearWeight = union(enum) {
             .dense_f32 => |w| w.cols,
             .dense_u16 => |w| w.cols,
             .gaffine_u4 => |w| w.cols,
+            .gaffine_u8 => |w| w.cols,
         };
     }
 
@@ -317,6 +333,7 @@ const LinearWeight = union(enum) {
             .dense_f32 => |w| w.buffer.size,
             .dense_u16 => |w| w.byteSize(),
             .gaffine_u4 => |w| w.byteSize(),
+            .gaffine_u8 => |w| w.byteSize(),
         };
     }
 };
@@ -363,6 +380,7 @@ const RuntimeBuffers = struct {
     projection_weight: LinearWeight,
     logits_dev: compute.cuda.Buffer,
     topk_logits_dev: compute.cuda.Buffer,
+    dequant_f16_dev: compute.cuda.Buffer,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -515,6 +533,10 @@ const RuntimeBuffers = struct {
         errdefer logits_dev.deinit(device);
         var topk_logits_dev = try device.allocBuffer(logits_bytes);
         errdefer topk_logits_dev.deinit(device);
+        const max_dequant_dim = @max(@max(max_dff, max_attn), @max(max_kv, max_gdelta_proj));
+        const dequant_f16_bytes = std.math.mul(usize, std.math.mul(usize, d_model, max_dequant_dim) catch return error.InvalidArgument, @sizeOf(u16)) catch return error.InvalidArgument;
+        var dequant_f16_dev = try device.allocBuffer(dequant_f16_bytes);
+        errdefer dequant_f16_dev.deinit(device);
 
         try norm_weight_dev.upload(device, std.mem.sliceAsBytes(norm_weight_host));
 
@@ -560,10 +582,12 @@ const RuntimeBuffers = struct {
             .projection_weight = projection_weight,
             .logits_dev = logits_dev,
             .topk_logits_dev = topk_logits_dev,
+            .dequant_f16_dev = dequant_f16_dev,
         };
     }
 
     fn deinit(self: *RuntimeBuffers, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
+        self.dequant_f16_dev.deinit(device);
         self.topk_logits_dev.deinit(device);
         self.logits_dev.deinit(device);
         self.projection_weight.deinit(device);
@@ -618,6 +642,7 @@ const RuntimeBuffers = struct {
             self.gdelta_proj_dev.size +
             self.gdelta_ssm_dev.size +
             self.topk_logits_dev.size +
+            self.dequant_f16_dev.size +
             self.logits_dev.size +
             (if (self.embedding_lookup) |lookup| lookup.byteSize() else 0) +
             self.projection_weight.byteSize();
@@ -2654,10 +2679,20 @@ pub const CudaBackend = struct {
     matvec_qkv_bf16_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_function: ?compute.cuda.Function = null,
     gaffine_u4_matvec_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_u8_matvec_function: ?compute.cuda.Function = null,
+    gaffine_u8_matvec_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_gate_up_function: ?compute.cuda.Function = null,
     gaffine_u4_matvec_gate_up_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_qkv_function: ?compute.cuda.Function = null,
     gaffine_u4_matvec_qkv_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_u8_matvec_qkv_function: ?compute.cuda.Function = null,
+    gaffine_u8_matvec_qkv_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_u8_matvec_gate_up_function: ?compute.cuda.Function = null,
+    gaffine_u8_matvec_gate_up_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_u8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
+    gaffine_u8_matvec_gate_up_silu_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_u8_dequant_f16_function: ?compute.cuda.Function = null,
+    gaffine_u8_dequant_f16_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_sequence_rows_supported: bool = false,
     gaffine_sequence_fused_qkv_supported: bool = false,
     gaffine_sequence_fused_gate_up_supported: bool = false,
@@ -2936,8 +2971,12 @@ pub const CudaBackend = struct {
             .matvec_qkv_f16_kernel = @as(u8, @intFromBool(backend.matvec_qkv_f16_function != null)),
             .matvec_qkv_bf16_kernel = @as(u8, @intFromBool(backend.matvec_qkv_bf16_function != null)),
             .gaffine_u4_matvec_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_function != null)),
+            .gaffine_u8_matvec_kernel = @as(u8, @intFromBool(backend.gaffine_u8_matvec_function != null)),
             .gaffine_u4_matvec_gate_up_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_gate_up_function != null)),
             .gaffine_u4_matvec_qkv_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_qkv_function != null)),
+            .gaffine_u8_matvec_qkv_kernel = @as(u8, @intFromBool(backend.gaffine_u8_matvec_qkv_function != null)),
+            .gaffine_u8_matvec_gate_up_kernel = @as(u8, @intFromBool(backend.gaffine_u8_matvec_gate_up_function != null)),
+            .gaffine_u8_matvec_gate_up_silu_kernel = @as(u8, @intFromBool(backend.gaffine_u8_matvec_gate_up_silu_function != null)),
             .gaffine_sequence_rows_supported = @as(u8, @intFromBool(backend.gaffine_sequence_rows_supported)),
             .gaffine_sequence_fused_qkv_supported = @as(u8, @intFromBool(backend.gaffine_sequence_fused_qkv_supported)),
             .gaffine_sequence_fused_gate_up_supported = @as(u8, @intFromBool(backend.gaffine_sequence_fused_gate_up_supported)),
@@ -3573,6 +3612,7 @@ pub const CudaBackend = struct {
             self.matmul_f16_function != null,
             self.matmul_bf16_function != null,
             self.gaffine_u4_matvec_function != null,
+            self.gaffine_u8_matvec_function != null,
         );
     }
 
@@ -3581,6 +3621,7 @@ pub const CudaBackend = struct {
         matmul_f16_available: bool,
         matmul_bf16_available: bool,
         gaffine_matvec_available: bool,
+        gaffine_u8_matvec_available: bool,
     ) bool {
         return switch (weight.*) {
             .dense_f32 => true,
@@ -3589,6 +3630,7 @@ pub const CudaBackend = struct {
                 .bf16 => matmul_bf16_available,
             },
             .gaffine_u4 => gaffine_matvec_available,
+            .gaffine_u8 => gaffine_u8_matvec_available,
         };
     }
 
@@ -3989,6 +4031,7 @@ pub const CudaBackend = struct {
                     .f16 => "matmul_lm_head_f16_host",
                 },
                 .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
+                .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
             };
             trace.emitFinalWithWork(
                 .lm_head,
@@ -4326,6 +4369,7 @@ pub const CudaBackend = struct {
                     .f16 => "matmul_lm_head_f16_host",
                 },
                 .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
+                .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
             };
             trace.emitFinalWithWork(
                 .lm_head,
@@ -4762,6 +4806,126 @@ pub const CudaBackend = struct {
                     );
                 }
             },
+            .gaffine_u8 => |w| {
+                const kernel = self.gaffine_u8_matvec_function orelse return error.CudaKernelUnavailable;
+
+                if (rows == 1) {
+                    try compute.cuda.gaffine_u8_matvec.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &packed_input,
+                        &w.packed_data,
+                        &w.scales,
+                        &w.biases,
+                        &packed_out,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                        w.group_size,
+                        w.scales_dtype_tag,
+                        1,
+                    );
+                    return;
+                }
+
+                // Prefill (rows > 1): dequantize weight to F16, cast input to F16, cuBLAS GEMM.
+                if (self.gaffine_u8_dequant_f16_function) |dequant_fn| {
+                    if (self.cast_f32_to_f16_function) |cast_fn| {
+                        if (self.u16_blas_f16_supported) dequant_blas: {
+                            const weight_elems = std.math.mul(usize, w.rows, w.cols) catch break :dequant_blas;
+                            const weight_f16_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch break :dequant_blas;
+                            if (self.runtime_buffers.dequant_f16_dev.size < weight_f16_bytes) break :dequant_blas;
+
+                            const input_elems = std.math.mul(usize, rows, w.rows) catch break :dequant_blas;
+                            const input_u16_bytes = std.math.mul(usize, input_elems, @sizeOf(u16)) catch break :dequant_blas;
+                            if (self.runtime_buffers.activation_u16_dev.size < input_u16_bytes) break :dequant_blas;
+
+                            var dequant_weight = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, weight_f16_bytes) catch break :dequant_blas;
+                            compute.cuda.gaffine_u8_dequantize_f16.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                dequant_fn,
+                                &w.packed_data,
+                                &w.scales,
+                                &w.biases,
+                                &dequant_weight,
+                                @intCast(w.cols),
+                                @intCast(w.rows),
+                                w.group_size,
+                                w.scales_dtype_tag,
+                            ) catch break :dequant_blas;
+
+                            var input_u16_dev = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, input_u16_bytes) catch break :dequant_blas;
+                            compute.cuda.cast_f32_to_f16.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                cast_fn,
+                                &packed_input,
+                                &input_u16_dev,
+                                @intCast(input_elems),
+                            ) catch break :dequant_blas;
+
+                            self.blas.matmulU16U16F32(
+                                &self.device,
+                                &input_u16_dev,
+                                .f16,
+                                rows,
+                                w.rows,
+                                &dequant_weight,
+                                .f16,
+                                w.cols,
+                                &packed_out,
+                            ) catch {
+                                self.u16_blas_f16_supported = false;
+                                break :dequant_blas;
+                            };
+                            return;
+                        }
+                    }
+                }
+
+                // Fallback: row-by-row GEMV.
+                if (self.gaffine_sequence_rows_supported) {
+                    try compute.cuda.gaffine_u8_matvec.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &packed_input,
+                        &w.packed_data,
+                        &w.scales,
+                        &w.biases,
+                        &packed_out,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                        w.group_size,
+                        w.scales_dtype_tag,
+                        @intCast(rows),
+                    );
+                    return;
+                }
+
+                var row_index: usize = 0;
+                while (row_index < rows) : (row_index += 1) {
+                    var input_row = try logicalF32RowSlice(&packed_input, rows, row_index, w.rows);
+                    var out_row = try logicalF32RowSlice(&packed_out, rows, row_index, w.cols);
+                    try compute.cuda.gaffine_u8_matvec.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &input_row,
+                        &w.packed_data,
+                        &w.scales,
+                        &w.biases,
+                        &out_row,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                        w.group_size,
+                        w.scales_dtype_tag,
+                        1,
+                    );
+                }
+                return;
+            },
         }
     }
 
@@ -4778,9 +4942,8 @@ pub const CudaBackend = struct {
         const k_bytes = std.math.mul(usize, rows, k_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
         const v_bytes = std.math.mul(usize, rows, v_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
         if (rows == 1 and
-            q_out_dest.pointer == self.runtime_buffers.attn_q_dev.pointer and
             q_out_dest.size >= q_bytes and
-            try self.tryFusedQkvForward(input, q_proj, k_proj, v_proj))
+            try self.tryFusedQkvForward(input, q_proj, k_proj, v_proj, q_out_dest))
         {
             return .fused;
         }
@@ -6335,13 +6498,19 @@ pub const CudaBackend = struct {
     ) !void {
         const activation_count = std.math.mul(u32, @intCast(rows), d_ff) catch return error.InvalidArgument;
         const activation_bytes = std.math.mul(usize, @as(usize, activation_count), @sizeOf(f32)) catch return error.InvalidArgument;
-        const fused_gate_up_silu = gate_bias == null and try self.tryFusedDenseU16GateUpSiluForward(
+        const fused_gate_up_silu = gate_bias == null and ((try self.tryFusedDenseU16GateUpSiluForward(
             input,
             gate_weight,
             up_weight,
             rows,
             d_ff,
-        );
+        )) or (try self.tryFusedGaffineU8GateUpSiluForward(
+            input,
+            gate_weight,
+            up_weight,
+            rows,
+            d_ff,
+        )));
         if (!fused_gate_up_silu) {
             _ = try self.runGateUpProjectionWithWeights(input, gate_weight, up_weight, rows);
             if (gate_bias) |bias| {
@@ -7858,9 +8027,21 @@ pub const CudaBackend = struct {
         q_proj: *const LinearWeight,
         k_proj: *const LinearWeight,
         v_proj: *const LinearWeight,
+        q_out_dest: *compute.cuda.Buffer,
     ) !bool {
-        if (try self.tryFusedDenseU16QkvForward(input, q_proj, k_proj, v_proj)) return true;
+        if (try self.tryFusedDenseU16QkvForward(input, q_proj, k_proj, v_proj, q_out_dest)) return true;
+        if (try self.tryFusedGaffineU4QkvForward(input, q_proj, k_proj, v_proj, q_out_dest)) return true;
+        return self.tryFusedGaffineU8QkvForward(input, q_proj, k_proj, v_proj, q_out_dest);
+    }
 
+    fn tryFusedGaffineU4QkvForward(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        q_proj: *const LinearWeight,
+        k_proj: *const LinearWeight,
+        v_proj: *const LinearWeight,
+        q_out_dest: *compute.cuda.Buffer,
+    ) !bool {
         const fused_kernel = self.gaffine_u4_matvec_qkv_function orelse return false;
         const q = switch (q_proj.*) {
             .gaffine_u4 => |w| w,
@@ -7874,16 +8055,7 @@ pub const CudaBackend = struct {
             .gaffine_u4 => |w| w,
             else => return false,
         };
-
-        if (q.rows != self.d_model or k.rows != self.d_model or v.rows != self.d_model) return false;
-        if (q.scales_dtype_tag != k.scales_dtype_tag or q.scales_dtype_tag != v.scales_dtype_tag) return false;
-        if (q.cols > std.math.maxInt(u32) or
-            k.cols > std.math.maxInt(u32) or
-            v.cols > std.math.maxInt(u32) or
-            q.rows > std.math.maxInt(u32))
-        {
-            return false;
-        }
+        if (!canFuseGaffineQkvWeights(self.d_model, q, k, v)) return false;
 
         try compute.cuda.gaffine_u4_matvec_qkv.runWithFunction(
             &self.kernel_arg_pack,
@@ -7893,7 +8065,62 @@ pub const CudaBackend = struct {
             &q.packed_data,
             &q.scales,
             &q.biases,
-            &self.runtime_buffers.attn_q_dev,
+            q_out_dest,
+            @intCast(q.cols),
+            q.group_size,
+            q.scales_dtype_tag,
+            &k.packed_data,
+            &k.scales,
+            &k.biases,
+            &self.runtime_buffers.attn_k_dev,
+            @intCast(k.cols),
+            k.group_size,
+            k.scales_dtype_tag,
+            &v.packed_data,
+            &v.scales,
+            &v.biases,
+            &self.runtime_buffers.attn_v_dev,
+            @intCast(v.cols),
+            v.group_size,
+            v.scales_dtype_tag,
+            @intCast(q.rows),
+            1,
+        );
+        return true;
+    }
+
+    fn tryFusedGaffineU8QkvForward(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        q_proj: *const LinearWeight,
+        k_proj: *const LinearWeight,
+        v_proj: *const LinearWeight,
+        q_out_dest: *compute.cuda.Buffer,
+    ) !bool {
+        const fused_kernel = self.gaffine_u8_matvec_qkv_function orelse return false;
+        const q = switch (q_proj.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        const k = switch (k_proj.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        const v = switch (v_proj.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        if (!canFuseGaffineQkvWeights(self.d_model, q, k, v)) return false;
+
+        try compute.cuda.gaffine_u8_matvec_qkv.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &q.packed_data,
+            &q.scales,
+            &q.biases,
+            q_out_dest,
             @intCast(q.cols),
             q.group_size,
             q.scales_dtype_tag,
@@ -7923,6 +8150,7 @@ pub const CudaBackend = struct {
         q_proj: *const LinearWeight,
         k_proj: *const LinearWeight,
         v_proj: *const LinearWeight,
+        q_out_dest: *compute.cuda.Buffer,
     ) !bool {
         const q = switch (q_proj.*) {
             .dense_u16 => |w| w,
@@ -7948,7 +8176,7 @@ pub const CudaBackend = struct {
             fused_kernel,
             input,
             &q.buffer,
-            &self.runtime_buffers.attn_q_dev,
+            q_out_dest,
             @intCast(q.cols),
             &k.buffer,
             &self.runtime_buffers.attn_k_dev,
@@ -7974,6 +8202,89 @@ pub const CudaBackend = struct {
         return true;
     }
 
+    fn canFuseGaffineQkvWeights(
+        d_model: usize,
+        q: anytype,
+        k: anytype,
+        v: anytype,
+    ) bool {
+        if (q.rows != d_model or k.rows != d_model or v.rows != d_model) return false;
+        if (q.scales_dtype_tag != k.scales_dtype_tag or q.scales_dtype_tag != v.scales_dtype_tag) return false;
+        if (q.cols > std.math.maxInt(u32) or
+            k.cols > std.math.maxInt(u32) or
+            v.cols > std.math.maxInt(u32) or
+            q.rows > std.math.maxInt(u32))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    fn canFuseGaffineGateUpWeights(
+        d_model: usize,
+        gate: anytype,
+        up: anytype,
+    ) bool {
+        if (gate.rows != d_model or up.rows != d_model) return false;
+        if (gate.scales_dtype_tag != up.scales_dtype_tag) return false;
+        if (gate.cols > std.math.maxInt(u32) or
+            up.cols > std.math.maxInt(u32) or
+            gate.rows > std.math.maxInt(u32))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    fn tryFusedGaffineU8GateUpSiluForward(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        gate_weight: *const LinearWeight,
+        up_weight: *const LinearWeight,
+        rows: usize,
+        expected_out_dim: u32,
+    ) !bool {
+        if (self.loaded.config.use_gelu) return false;
+        if (rows != 1) return false;
+
+        const gate = switch (gate_weight.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        const up = switch (up_weight.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        if (!canFuseGaffineGateUpWeights(self.d_model, gate, up)) return false;
+        if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
+
+        const row_count = bufferF32RowCount(input, gate.rows) catch return false;
+        if (row_count != 1) return false;
+
+        const fused_kernel = self.gaffine_u8_matvec_gate_up_silu_function orelse return false;
+        try compute.cuda.gaffine_u8_matvec_gate_up_silu.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &gate.packed_data,
+            &gate.scales,
+            &gate.biases,
+            &up.packed_data,
+            &up.scales,
+            &up.biases,
+            &self.runtime_buffers.ffn_mul_dev,
+            @intCast(gate.cols),
+            gate.group_size,
+            gate.scales_dtype_tag,
+            up.group_size,
+            up.scales_dtype_tag,
+            @intCast(gate.rows),
+            1,
+        );
+        return true;
+    }
+
     fn tryFusedGateUpForward(
         self: *CudaBackend,
         input: *const compute.cuda.Buffer,
@@ -7981,10 +8292,51 @@ pub const CudaBackend = struct {
         up_weight: *const LinearWeight,
     ) !bool {
         if (try self.tryFusedDenseU16GateUpForward(input, gate_weight, up_weight)) return true;
-        // The grouped-affine fused gate/up path is still not numerically aligned with
-        // CPU on Qwen3.5 parity verification. Use the shared unfused matvec path until
-        // the fused kernel has a model-true regression guard.
-        return false;
+        return self.tryFusedGaffineU8GateUpForward(input, gate_weight, up_weight);
+    }
+
+    fn tryFusedGaffineU8GateUpForward(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        gate_weight: *const LinearWeight,
+        up_weight: *const LinearWeight,
+    ) !bool {
+        const gate = switch (gate_weight.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        const up = switch (up_weight.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        if (!canFuseGaffineGateUpWeights(self.d_model, gate, up)) return false;
+        const rows = bufferF32RowCount(input, gate.rows) catch return false;
+        if (rows != 1) return false;
+
+        const fused_kernel = self.gaffine_u8_matvec_gate_up_function orelse return false;
+        try compute.cuda.gaffine_u8_matvec_gate_up.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &gate.packed_data,
+            &gate.scales,
+            &gate.biases,
+            &self.runtime_buffers.ffn_gate_dev,
+            @intCast(gate.cols),
+            gate.group_size,
+            gate.scales_dtype_tag,
+            &up.packed_data,
+            &up.scales,
+            &up.biases,
+            &self.runtime_buffers.ffn_up_dev,
+            @intCast(up.cols),
+            up.group_size,
+            up.scales_dtype_tag,
+            @intCast(gate.rows),
+            1,
+        );
+        return true;
     }
 
     fn tryFusedDenseU16GateUpForward(
@@ -8314,6 +8666,10 @@ pub const CudaBackend = struct {
                 self.gaffine_u4_matvec_function = resolved.function;
                 self.gaffine_u4_matvec_source = resolved.source;
             },
+            .gaffine_u8_matvec => {
+                self.gaffine_u8_matvec_function = resolved.function;
+                self.gaffine_u8_matvec_source = resolved.source;
+            },
             .gaffine_u4_matvec_gate_up => {
                 self.gaffine_u4_matvec_gate_up_function = resolved.function;
                 self.gaffine_u4_matvec_gate_up_source = resolved.source;
@@ -8321,6 +8677,22 @@ pub const CudaBackend = struct {
             .gaffine_u4_matvec_qkv => {
                 self.gaffine_u4_matvec_qkv_function = resolved.function;
                 self.gaffine_u4_matvec_qkv_source = resolved.source;
+            },
+            .gaffine_u8_matvec_qkv => {
+                self.gaffine_u8_matvec_qkv_function = resolved.function;
+                self.gaffine_u8_matvec_qkv_source = resolved.source;
+            },
+            .gaffine_u8_matvec_gate_up => {
+                self.gaffine_u8_matvec_gate_up_function = resolved.function;
+                self.gaffine_u8_matvec_gate_up_source = resolved.source;
+            },
+            .gaffine_u8_matvec_gate_up_silu => {
+                self.gaffine_u8_matvec_gate_up_silu_function = resolved.function;
+                self.gaffine_u8_matvec_gate_up_silu_source = resolved.source;
+            },
+            .gaffine_u8_dequant_f16 => {
+                self.gaffine_u8_dequant_f16_function = resolved.function;
+                self.gaffine_u8_dequant_f16_source = resolved.source;
             },
         }
     }
@@ -8685,6 +9057,9 @@ fn uploadLinearWeight(
 ) !LinearWeight {
     if (src.dtype == .grouped_affine_u4) {
         return uploadLinearWeightGroupedAffineU4(device, src, input_dim);
+    }
+    if (src.dtype == .grouped_affine_u8) {
+        return uploadLinearWeightGroupedAffineU8(device, src, input_dim);
     }
     return uploadLinearWeightDense(device, allocator, src, input_dim);
 }
@@ -9151,6 +9526,72 @@ fn uploadLinearWeightGroupedAffineU4(
 
     return .{
         .gaffine_u4 = .{
+            .rows = in_dim,
+            .cols = out_dim,
+            .packed_data = packed_dev,
+            .scales = scales_dev,
+            .biases = biases_dev,
+            .group_size = @intCast(gaffine.group_size),
+            .scales_dtype_tag = scales_dtype_tag,
+        },
+    };
+}
+
+fn uploadLinearWeightGroupedAffineU8(
+    device: *compute.cuda.Device,
+    src: *const Tensor,
+    input_dim: usize,
+) !LinearWeight {
+    if (src.n_dims != 2) return error.UnsupportedModel;
+    if (src.shape[0] <= 0 or src.shape[1] <= 0) return error.InvalidArgument;
+    if (src.data_ptr == null) return error.InvalidArgument;
+    const gaffine = src.gaffine orelse return error.UnsupportedModel;
+    const out_dim: usize = @intCast(src.shape[0]);
+    const in_dim: usize = @intCast(src.shape[1]);
+
+    if (in_dim != input_dim) {
+        log.warn("inference", "CUDA grouped-affine U8 orientation unsupported", .{
+            .rows = out_dim,
+            .cols = in_dim,
+            .input_dim = input_dim,
+        });
+        return error.UnsupportedModel;
+    }
+    if (in_dim == 0 or out_dim == 0) return error.InvalidArgument;
+    if ((in_dim % 4) != 0) return error.UnsupportedModel;
+    if (gaffine.group_size == 0 or (in_dim % gaffine.group_size) != 0 or (gaffine.group_size % 4) != 0) {
+        return error.UnsupportedModel;
+    }
+
+    const packed_words_per_row = in_dim / 4;
+    const groups_per_row = in_dim / gaffine.group_size;
+    const packed_words = std.math.mul(usize, out_dim, packed_words_per_row) catch return error.InvalidArgument;
+    const packed_bytes = std.math.mul(usize, packed_words, @sizeOf(u32)) catch return error.InvalidArgument;
+    const sb_count = std.math.mul(usize, out_dim, groups_per_row) catch return error.InvalidArgument;
+    const sb_bytes = std.math.mul(usize, sb_count, @sizeOf(u16)) catch return error.InvalidArgument;
+    if (src.data_size < packed_bytes) return error.InvalidArgument;
+    if (gaffine.scales.len < sb_bytes or gaffine.biases.len < sb_bytes) return error.InvalidArgument;
+
+    const scales_dtype_tag: u32 = switch (gaffine.scales_dtype) {
+        .f16 => gaffine_scales_dtype_f16,
+        .bf16 => gaffine_scales_dtype_bf16,
+        else => return error.UnsupportedModel,
+    };
+
+    var packed_dev = try device.allocBuffer(packed_bytes);
+    errdefer packed_dev.deinit(device);
+    var scales_dev = try device.allocBuffer(sb_bytes);
+    errdefer scales_dev.deinit(device);
+    var biases_dev = try device.allocBuffer(sb_bytes);
+    errdefer biases_dev.deinit(device);
+
+    const packed_host = src.data()[0..packed_bytes];
+    try packed_dev.upload(device, packed_host);
+    try scales_dev.upload(device, gaffine.scales[0..sb_bytes]);
+    try biases_dev.upload(device, gaffine.biases[0..sb_bytes]);
+
+    return .{
+        .gaffine_u8 = .{
             .rows = in_dim,
             .cols = out_dim,
             .packed_data = packed_dev,
@@ -10331,8 +10772,8 @@ test "linearWeightSupportsSequenceRows allows gaffine when matvec kernel is load
         },
     };
 
-    try std.testing.expect(!CudaBackend.linearWeightSupportsSequenceRowsForKernels(&weight, false, false, false));
-    try std.testing.expect(CudaBackend.linearWeightSupportsSequenceRowsForKernels(&weight, false, false, true));
+    try std.testing.expect(!CudaBackend.linearWeightSupportsSequenceRowsForKernels(&weight, false, false, false, false));
+    try std.testing.expect(CudaBackend.linearWeightSupportsSequenceRowsForKernels(&weight, false, false, true, false));
 }
 
 test "canFuseDenseU16QkvWeights supports GQA-style unequal output dims" {
@@ -10496,6 +10937,102 @@ test "materializeDenseOutInF32 handles out-in and in-out source layouts" {
         4, 8, 12,
     };
     try std.testing.expectEqualSlices(f32, expected[0..], in_out_view.values);
+}
+
+test "gaffineValueAt decodes grouped_affine_u8 values" {
+    var packed_words = [_]u32{
+        0x0302_0100,
+        0x0706_0504,
+    };
+    const packed_bytes = std.mem.sliceAsBytes(packed_words[0..]);
+
+    var scales_u16 = [_]u16{
+        dtype.f32ToBf16(1.0),
+        dtype.f32ToBf16(1.0),
+    };
+    var biases_u16 = [_]u16{
+        dtype.f32ToBf16(0.0),
+        dtype.f32ToBf16(0.0),
+    };
+    const scales_bytes = std.mem.sliceAsBytes(scales_u16[0..]);
+    const biases_bytes = std.mem.sliceAsBytes(biases_u16[0..]);
+
+    var weight = Tensor.view(packed_bytes.ptr, &.{ 1, 8 }, .grouped_affine_u8, packed_bytes.len);
+    weight.gaffine = .{
+        .scales = scales_bytes,
+        .biases = biases_bytes,
+        .group_size = 4,
+        .scales_dtype = .bf16,
+    };
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), try gaffineValueAt(&weight, 0, 0), 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), try gaffineValueAt(&weight, 0, 3), 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), try gaffineValueAt(&weight, 0, 7), 0.0);
+}
+
+test "canFuseGaffineGateUpWeights accepts grouped-affine u8 weights with matching metadata" {
+    const buf = compute.cuda.Buffer{ .pointer = 0, .size = 0 };
+    const gate = GaffineU8LinearWeight{
+        .rows = 4096,
+        .cols = 11008,
+        .packed_data = buf,
+        .scales = buf,
+        .biases = buf,
+        .group_size = 32,
+        .scales_dtype_tag = compute.cuda.gaffine_u8_matvec.scales_dtype_bf16,
+    };
+    const up = GaffineU8LinearWeight{
+        .rows = 4096,
+        .cols = 11008,
+        .packed_data = buf,
+        .scales = buf,
+        .biases = buf,
+        .group_size = 32,
+        .scales_dtype_tag = compute.cuda.gaffine_u8_matvec.scales_dtype_bf16,
+    };
+
+    try std.testing.expect(CudaBackend.canFuseGaffineGateUpWeights(4096, gate, up));
+
+    var bad_up = up;
+    bad_up.scales_dtype_tag = compute.cuda.gaffine_u8_matvec.scales_dtype_f16;
+    try std.testing.expect(!CudaBackend.canFuseGaffineGateUpWeights(4096, gate, bad_up));
+}
+
+test "canFuseGaffineQkvWeights accepts grouped-affine u8 weights with matching metadata" {
+    const buf = compute.cuda.Buffer{ .pointer = 0, .size = 0 };
+    const q = GaffineU8LinearWeight{
+        .rows = 4096,
+        .cols = 8192,
+        .packed_data = buf,
+        .scales = buf,
+        .biases = buf,
+        .group_size = 32,
+        .scales_dtype_tag = compute.cuda.gaffine_u8_matvec.scales_dtype_bf16,
+    };
+    const k = GaffineU8LinearWeight{
+        .rows = 4096,
+        .cols = 1024,
+        .packed_data = buf,
+        .scales = buf,
+        .biases = buf,
+        .group_size = 32,
+        .scales_dtype_tag = compute.cuda.gaffine_u8_matvec.scales_dtype_bf16,
+    };
+    const v = GaffineU8LinearWeight{
+        .rows = 4096,
+        .cols = 1024,
+        .packed_data = buf,
+        .scales = buf,
+        .biases = buf,
+        .group_size = 32,
+        .scales_dtype_tag = compute.cuda.gaffine_u8_matvec.scales_dtype_bf16,
+    };
+
+    try std.testing.expect(CudaBackend.canFuseGaffineQkvWeights(4096, q, k, v));
+
+    var bad_v = v;
+    bad_v.scales_dtype_tag = compute.cuda.gaffine_u8_matvec.scales_dtype_f16;
+    try std.testing.expect(!CudaBackend.canFuseGaffineQkvWeights(4096, q, k, bad_v));
 }
 
 test "BlockRuntimeLayer.rebuildInstructionMetadata binds per-op runtime metadata" {
