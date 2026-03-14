@@ -42,13 +42,13 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, in_dim);
     try arg_pack.appendScalar(u32, out_dim);
 
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = ceilDiv(out_dim, block_y),
         .grid_y = rows,
         .block_x = block_x,
         .block_y = block_y,
         .shared_mem_bytes = 0,
-    }, arg_pack);
+    }, arg_pack, .matmul);
 }
 
 fn validateArgs(

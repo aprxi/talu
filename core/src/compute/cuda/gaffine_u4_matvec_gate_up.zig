@@ -77,11 +77,11 @@ pub fn runWithFunction(
 
     const total_out = std.math.add(u32, gate_out_dim, up_out_dim) catch return error.InvalidArgument;
     const rows_per_block = block_x / warp_size;
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = ceilDiv(total_out, rows_per_block),
         .grid_y = batch_rows,
         .block_x = block_x,
-    }, arg_pack);
+    }, arg_pack, .matvec_gate_up_silu);
 }
 
 fn validateArgs(

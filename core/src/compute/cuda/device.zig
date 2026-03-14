@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const log = @import("../../log.zig");
 
 const cuda_success: c_int = 0;
 const cuda_error_out_of_memory: c_int = 2;
@@ -35,8 +36,12 @@ const CuModuleUnloadFn = *const fn (?*anyopaque) callconv(.c) c_int;
 const CuStreamCreateFn = *const fn (*?*anyopaque, u32) callconv(.c) c_int;
 const CuStreamDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
 const CuStreamSynchronizeFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CuStreamBeginCaptureFn = *const fn (?*anyopaque, c_int) callconv(.c) c_int;
+const CuStreamEndCaptureFn = *const fn (?*anyopaque, *?*anyopaque) callconv(.c) c_int;
 const CuGraphInstantiateWithFlagsFn = *const fn (*?*anyopaque, ?*anyopaque, u64) callconv(.c) c_int;
+const CuGraphDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
 const CuGraphExecDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CuGraphExecUpdateFn = *const fn (?*anyopaque, ?*anyopaque, *?*anyopaque, *c_int) callconv(.c) c_int;
 const CuGraphLaunchFn = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int;
 const CuLaunchKernelFn = *const fn (
     ?*anyopaque,
@@ -88,18 +93,80 @@ const DriverApi = struct {
     cu_stream_create: ?CuStreamCreateFn,
     cu_stream_destroy: ?CuStreamDestroyFn,
     cu_stream_synchronize: ?CuStreamSynchronizeFn,
+    cu_stream_begin_capture: ?CuStreamBeginCaptureFn,
+    cu_stream_end_capture: ?CuStreamEndCaptureFn,
     cu_graph_instantiate_with_flags: ?CuGraphInstantiateWithFlagsFn,
+    cu_graph_destroy: ?CuGraphDestroyFn,
     cu_graph_exec_destroy: ?CuGraphExecDestroyFn,
+    cu_graph_exec_update: ?CuGraphExecUpdateFn,
     cu_graph_launch: ?CuGraphLaunchFn,
     cu_launch_kernel: ?CuLaunchKernelFn,
 };
 
 const cu_device_attribute_compute_capability_major: c_int = 75;
 const cu_device_attribute_compute_capability_minor: c_int = 76;
+const cu_stream_capture_mode_global: c_int = 0;
+
+pub const LaunchFamily = enum(u8) {
+    other = 0,
+    matvec = 1,
+    matvec_qkv = 2,
+    matvec_gate_up_silu = 3,
+    matmul = 4,
+    attention = 5,
+    gated_delta = 6,
+    norm = 7,
+    rope = 8,
+    kv_write = 9,
+    copy_cast = 10,
+    embedding = 11,
+    pointwise = 12,
+};
+
+const launch_family_names = [_][]const u8{
+    "other",
+    "matvec",
+    "matvec_qkv",
+    "matvec_gate_up_silu",
+    "matmul",
+    "attention",
+    "gated_delta",
+    "norm",
+    "rope",
+    "kv_write",
+    "copy_cast",
+    "embedding",
+    "pointwise",
+};
+const launch_family_count = launch_family_names.len;
+
+threadlocal var tls_current_context: ?*anyopaque = null;
+var stats_launch_calls = std.atomic.Value(u64).init(0);
+var stats_launch_ns = std.atomic.Value(u64).init(0);
+var stats_launch_calls_prefill = std.atomic.Value(u64).init(0);
+var stats_launch_ns_prefill = std.atomic.Value(u64).init(0);
+var stats_launch_calls_decode = std.atomic.Value(u64).init(0);
+var stats_launch_ns_decode = std.atomic.Value(u64).init(0);
+var stats_make_current_calls = std.atomic.Value(u64).init(0);
+var stats_make_current_fastpath_hits = std.atomic.Value(u64).init(0);
+var stats_set_current_calls = std.atomic.Value(u64).init(0);
+var stats_set_current_ns = std.atomic.Value(u64).init(0);
+var stats_family_calls = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** launch_family_count;
+var stats_family_ns = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** launch_family_count;
+var stats_family_calls_prefill = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** launch_family_count;
+var stats_family_ns_prefill = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** launch_family_count;
+var stats_family_calls_decode = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** launch_family_count;
+var stats_family_ns_decode = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** launch_family_count;
 
 pub const ComputeCapability = struct {
     major: u32,
     minor: u32,
+};
+
+pub const LaunchPhase = enum(u8) {
+    none = 0,
+    prefill = 1,
+    decode = 2,
 };
 
 pub fn isRuntimeSupported() bool {
@@ -130,6 +197,9 @@ pub const Device = struct {
     device_index: c_int,
     name_buffer: [128]u8,
     launch_stream: ?StreamHandle,
+    launch_stats_enabled: bool,
+    launch_phase: LaunchPhase,
+    launch_family: LaunchFamily,
 
     pub fn init() !Device {
         if (!isRuntimeSupported()) return error.CudaNotEnabled;
@@ -168,15 +238,121 @@ pub const Device = struct {
             .device_index = device_index,
             .name_buffer = name_buffer,
             .launch_stream = null,
+            .launch_stats_enabled = launchStatsEnabledForCurrentLogLevel(),
+            .launch_phase = .none,
+            .launch_family = .other,
         };
     }
 
     pub fn deinit(self: *Device) void {
+        self.logLaunchStatsSnapshot("deinit");
         if (self.context) |ctx| {
+            if (tls_current_context == ctx) tls_current_context = null;
             _ = self.api.cu_ctx_destroy(ctx);
             self.context = null;
         }
         self.lib.close();
+    }
+
+    pub fn launchStatsEnabled(self: *const Device) bool {
+        return self.launch_stats_enabled;
+    }
+
+    pub fn setLaunchPhase(self: *Device, phase: LaunchPhase) LaunchPhase {
+        const previous = self.launch_phase;
+        self.launch_phase = phase;
+        return previous;
+    }
+
+    pub fn setLaunchFamily(self: *Device, family: LaunchFamily) LaunchFamily {
+        const previous = self.launch_family;
+        self.launch_family = family;
+        return previous;
+    }
+
+    pub fn logLaunchStatsSnapshot(self: *const Device, phase: []const u8) void {
+        if (!self.launch_stats_enabled) return;
+        const launch_calls = stats_launch_calls.load(.monotonic);
+        const launch_ns = stats_launch_ns.load(.monotonic);
+        const launch_calls_prefill = stats_launch_calls_prefill.load(.monotonic);
+        const launch_ns_prefill = stats_launch_ns_prefill.load(.monotonic);
+        const launch_calls_decode = stats_launch_calls_decode.load(.monotonic);
+        const launch_ns_decode = stats_launch_ns_decode.load(.monotonic);
+        const make_current_calls = stats_make_current_calls.load(.monotonic);
+        const make_current_fastpath_hits = stats_make_current_fastpath_hits.load(.monotonic);
+        const set_current_calls = stats_set_current_calls.load(.monotonic);
+        const set_current_ns = stats_set_current_ns.load(.monotonic);
+        const avg_launch_us: f64 = if (launch_calls == 0)
+            0.0
+        else
+            @as(f64, @floatFromInt(launch_ns)) / @as(f64, @floatFromInt(launch_calls)) / 1000.0;
+        const avg_set_current_us: f64 = if (set_current_calls == 0)
+            0.0
+        else
+            @as(f64, @floatFromInt(set_current_ns)) / @as(f64, @floatFromInt(set_current_calls)) / 1000.0;
+        var body_buf: [192]u8 = undefined;
+        const body = std.fmt.bufPrint(
+            &body_buf,
+            "CUDA launch stats {s}: launches={d} launch_ms={d:.3} launch_us={d:.3} make_current={d} fastpath={d} set_current={d} set_current_ms={d:.3} set_current_us={d:.3}",
+            .{
+                phase,
+                launch_calls,
+                @as(f64, @floatFromInt(launch_ns)) / 1_000_000.0,
+                avg_launch_us,
+                make_current_calls,
+                make_current_fastpath_hits,
+                set_current_calls,
+                @as(f64, @floatFromInt(set_current_ns)) / 1_000_000.0,
+                avg_set_current_us,
+            },
+        ) catch "CUDA launch stats";
+        log.info("inference", body, .{});
+        var phase_body_buf: [192]u8 = undefined;
+        const phase_body = std.fmt.bufPrint(
+            &phase_body_buf,
+            "CUDA launch phase stats {s}: prefill_launches={d} prefill_ms={d:.3} decode_launches={d} decode_ms={d:.3}",
+            .{
+                phase,
+                launch_calls_prefill,
+                @as(f64, @floatFromInt(launch_ns_prefill)) / 1_000_000.0,
+                launch_calls_decode,
+                @as(f64, @floatFromInt(launch_ns_decode)) / 1_000_000.0,
+            },
+        ) catch "CUDA launch phase stats";
+        log.info("inference", phase_body, .{});
+        self.logLaunchFamilyStats(phase);
+    }
+
+    fn logLaunchFamilyStats(self: *const Device, phase: []const u8) void {
+        _ = self;
+        var idx: usize = 0;
+        while (idx < launch_family_count) : (idx += 1) {
+            const calls = stats_family_calls[idx].load(.monotonic);
+            if (calls == 0) continue;
+            const ns_total = stats_family_ns[idx].load(.monotonic);
+            const calls_prefill = stats_family_calls_prefill[idx].load(.monotonic);
+            const ns_prefill = stats_family_ns_prefill[idx].load(.monotonic);
+            const calls_decode = stats_family_calls_decode[idx].load(.monotonic);
+            const ns_decode = stats_family_ns_decode[idx].load(.monotonic);
+            const avg_us: f64 = @as(f64, @floatFromInt(ns_total)) / @as(f64, @floatFromInt(calls)) / 1000.0;
+            var family_buf: [224]u8 = undefined;
+            const family_body = std.fmt.bufPrint(
+                &family_buf,
+                "CUDA launch family stats {s}: family={s} launches={d} launch_ms={d:.3} launch_us={d:.3} prefill_launches={d} prefill_ms={d:.3} decode_launches={d} decode_ms={d:.3}",
+                .{
+                    phase,
+                    launch_family_names[idx],
+                    calls,
+                    @as(f64, @floatFromInt(ns_total)) / 1_000_000.0,
+                    avg_us,
+                    calls_prefill,
+                    @as(f64, @floatFromInt(ns_prefill)) / 1_000_000.0,
+                    calls_decode,
+                    @as(f64, @floatFromInt(ns_decode)) / 1_000_000.0,
+                },
+            ) catch "CUDA launch family stats";
+            log.info("inference", family_body, .{});
+        }
     }
 
     pub fn name(self: *const Device) []const u8 {
@@ -237,8 +413,22 @@ pub const Device = struct {
     }
 
     pub fn makeCurrent(self: *Device) !void {
+        if (self.launch_stats_enabled) _ = stats_make_current_calls.fetchAdd(1, .monotonic);
         if (self.context == null) return error.CudaContextLost;
-        if (self.api.cu_ctx_set_current(self.context) != cuda_success) return error.CudaContextLost;
+        if (tls_current_context == self.context) {
+            if (self.launch_stats_enabled) _ = stats_make_current_fastpath_hits.fetchAdd(1, .monotonic);
+            return;
+        }
+        const set_start_ns: u64 = if (self.launch_stats_enabled) monotonicNowNs() else 0;
+        if (self.api.cu_ctx_set_current(self.context) != cuda_success) {
+            tls_current_context = null;
+            return error.CudaContextLost;
+        }
+        tls_current_context = self.context;
+        if (self.launch_stats_enabled) {
+            _ = stats_set_current_calls.fetchAdd(1, .monotonic);
+            _ = stats_set_current_ns.fetchAdd(monotonicNowNs() - set_start_ns, .monotonic);
+        }
     }
 
     pub fn supportsModuleLaunch(self: *const Device) bool {
@@ -255,9 +445,28 @@ pub const Device = struct {
     }
 
     pub fn supportsGraphLaunch(self: *const Device) bool {
-        return self.api.cu_graph_instantiate_with_flags != null and
+        return self.api.cu_stream_begin_capture != null and
+            self.api.cu_stream_end_capture != null and
+            self.api.cu_graph_instantiate_with_flags != null and
+            self.api.cu_graph_destroy != null and
             self.api.cu_graph_exec_destroy != null and
+            self.api.cu_graph_exec_update != null and
             self.api.cu_graph_launch != null;
+    }
+
+    pub fn streamBeginCapture(self: *Device, stream: StreamHandle) !void {
+        const cu_stream_begin_capture = self.api.cu_stream_begin_capture orelse return error.CudaGraphApiUnavailable;
+        try self.makeCurrent();
+        if (cu_stream_begin_capture(stream, cu_stream_capture_mode_global) != cuda_success) return error.CudaGraphCaptureFailed;
+    }
+
+    pub fn streamEndCapture(self: *Device, stream: StreamHandle) !GraphHandle {
+        const cu_stream_end_capture = self.api.cu_stream_end_capture orelse return error.CudaGraphApiUnavailable;
+        try self.makeCurrent();
+
+        var graph: ?*anyopaque = null;
+        if (cu_stream_end_capture(stream, &graph) != cuda_success or graph == null) return error.CudaGraphCaptureFailed;
+        return graph.?;
     }
 
     pub fn createStream(self: *Device) !StreamHandle {
@@ -294,10 +503,28 @@ pub const Device = struct {
         return exec.?;
     }
 
+    pub fn graphDestroy(self: *Device, graph: GraphHandle) void {
+        const cu_graph_destroy = self.api.cu_graph_destroy orelse return;
+        self.makeCurrent() catch return;
+        _ = cu_graph_destroy(graph);
+    }
+
     pub fn graphExecDestroy(self: *Device, exec: GraphExecHandle) void {
         const cu_graph_exec_destroy = self.api.cu_graph_exec_destroy orelse return;
         self.makeCurrent() catch return;
         _ = cu_graph_exec_destroy(exec);
+    }
+
+    pub fn graphExecUpdate(self: *Device, exec: GraphExecHandle, graph: GraphHandle) !void {
+        const cu_graph_exec_update = self.api.cu_graph_exec_update orelse return error.CudaGraphApiUnavailable;
+        try self.makeCurrent();
+
+        var error_node: ?*anyopaque = null;
+        var update_result: c_int = 0;
+        if (cu_graph_exec_update(exec, graph, &error_node, &update_result) != cuda_success) {
+            return error.CudaGraphUpdateFailed;
+        }
+        if (update_result != 0) return error.CudaGraphUpdateFailed;
     }
 
     pub fn graphLaunch(self: *Device, exec: GraphExecHandle, stream: ?StreamHandle) !void {
@@ -377,6 +604,7 @@ pub const Device = struct {
     ) !void {
         const cu_launch_kernel = self.api.cu_launch_kernel orelse return error.CudaModuleApiUnavailable;
         try self.makeCurrent();
+        const launch_start_ns: u64 = if (self.launch_stats_enabled) monotonicNowNs() else 0;
 
         const params_ptr: ?*anyopaque = if (kernel_params) |params|
             @ptrCast(@constCast(params))
@@ -398,8 +626,39 @@ pub const Device = struct {
         ) != cuda_success) {
             return error.CudaKernelLaunchFailed;
         }
+        if (self.launch_stats_enabled) {
+            const launch_elapsed_ns = monotonicNowNs() - launch_start_ns;
+            const family_idx: usize = @intFromEnum(self.launch_family);
+            _ = stats_launch_calls.fetchAdd(1, .monotonic);
+            _ = stats_launch_ns.fetchAdd(launch_elapsed_ns, .monotonic);
+            _ = stats_family_calls[family_idx].fetchAdd(1, .monotonic);
+            _ = stats_family_ns[family_idx].fetchAdd(launch_elapsed_ns, .monotonic);
+            switch (self.launch_phase) {
+                .prefill => {
+                    _ = stats_launch_calls_prefill.fetchAdd(1, .monotonic);
+                    _ = stats_launch_ns_prefill.fetchAdd(launch_elapsed_ns, .monotonic);
+                    _ = stats_family_calls_prefill[family_idx].fetchAdd(1, .monotonic);
+                    _ = stats_family_ns_prefill[family_idx].fetchAdd(launch_elapsed_ns, .monotonic);
+                },
+                .decode => {
+                    _ = stats_launch_calls_decode.fetchAdd(1, .monotonic);
+                    _ = stats_launch_ns_decode.fetchAdd(launch_elapsed_ns, .monotonic);
+                    _ = stats_family_calls_decode[family_idx].fetchAdd(1, .monotonic);
+                    _ = stats_family_ns_decode[family_idx].fetchAdd(launch_elapsed_ns, .monotonic);
+                },
+                .none => {},
+            }
+        }
     }
 };
+
+fn launchStatsEnabledForCurrentLogLevel() bool {
+    return @intFromEnum(log.getLogLevel()) <= @intFromEnum(log.Level.info);
+}
+
+fn monotonicNowNs() u64 {
+    return @as(u64, @intCast(std.time.nanoTimestamp()));
+}
 
 pub const Buffer = struct {
     pointer: u64,
@@ -494,8 +753,12 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_stream_create = lookupOptional(CuStreamCreateFn, lib, "cuStreamCreate"),
         .cu_stream_destroy = lookupOptionalAny(CuStreamDestroyFn, lib, &.{ "cuStreamDestroy_v2", "cuStreamDestroy" }),
         .cu_stream_synchronize = lookupOptional(CuStreamSynchronizeFn, lib, "cuStreamSynchronize"),
+        .cu_stream_begin_capture = lookupOptional(CuStreamBeginCaptureFn, lib, "cuStreamBeginCapture"),
+        .cu_stream_end_capture = lookupOptional(CuStreamEndCaptureFn, lib, "cuStreamEndCapture"),
         .cu_graph_instantiate_with_flags = lookupOptional(CuGraphInstantiateWithFlagsFn, lib, "cuGraphInstantiateWithFlags"),
+        .cu_graph_destroy = lookupOptional(CuGraphDestroyFn, lib, "cuGraphDestroy"),
         .cu_graph_exec_destroy = lookupOptional(CuGraphExecDestroyFn, lib, "cuGraphExecDestroy"),
+        .cu_graph_exec_update = lookupOptional(CuGraphExecUpdateFn, lib, "cuGraphExecUpdate"),
         .cu_graph_launch = lookupOptional(CuGraphLaunchFn, lib, "cuGraphLaunch"),
         .cu_launch_kernel = lookupOptional(CuLaunchKernelFn, lib, "cuLaunchKernel"),
     };

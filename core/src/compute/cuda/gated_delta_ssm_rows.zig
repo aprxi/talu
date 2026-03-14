@@ -51,11 +51,11 @@ pub fn runWithFunction(
     const block_x: u32 = @min(d_head, out_tile);
     const tiles_per_head = ceilDiv(d_head, out_tile);
     const shared_bytes = std.math.mul(usize, 2 * @as(usize, d_head), @sizeOf(f32)) catch return error.InvalidArgument;
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = std.math.mul(u32, n_v_heads, tiles_per_head) catch return error.InvalidArgument,
         .block_x = block_x,
         .shared_mem_bytes = @intCast(shared_bytes),
-    }, arg_pack);
+    }, arg_pack, .gated_delta);
 }
 
 fn validateArgs(

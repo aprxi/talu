@@ -39,11 +39,11 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(f32, scale);
 
     const block_x: u32 = 128;
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = ceilDiv(seq_len, warpsPerBlock(block_x)),
         .grid_y = n_heads,
         .block_x = block_x,
-    }, arg_pack);
+    }, arg_pack, .attention);
 }
 
 fn validateArgs(

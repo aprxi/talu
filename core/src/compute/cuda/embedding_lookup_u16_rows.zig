@@ -48,10 +48,10 @@ pub fn runWithFunction(
     const total = std.math.mul(u32, rows, hidden_dim) catch return error.InvalidArgument;
     const block_x: u32 = 256;
     const grid_x: u32 = ceilDiv(total, block_x);
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = grid_x,
         .block_x = block_x,
-    }, arg_pack);
+    }, arg_pack, .embedding);
 }
 
 fn validateArgs(

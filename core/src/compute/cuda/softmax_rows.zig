@@ -29,10 +29,10 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, cols);
 
     const block_x: u32 = 128;
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = rows,
         .block_x = block_x,
-    }, arg_pack);
+    }, arg_pack, .attention);
 }
 
 fn validateArgs(

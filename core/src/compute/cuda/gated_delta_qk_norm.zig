@@ -28,10 +28,10 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, n_heads);
     try arg_pack.appendScalar(u32, d_head);
 
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = n_heads,
         .block_x = 256,
-    }, arg_pack);
+    }, arg_pack, .gated_delta);
 }
 
 fn validateArgs(

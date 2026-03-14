@@ -86,11 +86,11 @@ pub fn runWithFunction(
 
     const rows_per_block = block_x / warp_size;
     const grid_x: u32 = ceilDiv(out_dim, rows_per_block);
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = grid_x,
         .grid_y = batch_rows,
         .block_x = block_x,
-    }, arg_pack);
+    }, arg_pack, .matvec);
 }
 
 fn validateArgs(

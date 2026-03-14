@@ -42,10 +42,10 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(f32, eps);
     try arg_pack.appendScalar(u32, weight_row_stride);
 
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = rows_total,
         .block_x = 256,
-    }, arg_pack);
+    }, arg_pack, .gated_delta);
 }
 
 fn validateArgs(

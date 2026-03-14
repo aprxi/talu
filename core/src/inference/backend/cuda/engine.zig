@@ -3651,6 +3651,8 @@ pub const CudaBackend = struct {
         deepstack_layer_features_opt: ?[]const []const f32,
         deepstack_feature_index_opt: ?usize,
     ) !void {
+        const previous_launch_phase = self.device.setLaunchPhase(.decode);
+        defer _ = self.device.setLaunchPhase(previous_launch_phase);
         if (!compute_logits and download_logits) return error.InvalidArgument;
         if (deepstack_feature_index_opt != null and deepstack_layer_features_opt == null) return error.InvalidArgument;
         if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
@@ -3937,7 +3939,6 @@ pub const CudaBackend = struct {
                 }
             }
         }
-
         if (!compute_logits) return;
 
         try compute.cuda.rmsnorm.runWithFunction(
@@ -4034,6 +4035,8 @@ pub const CudaBackend = struct {
         logits_out: []f32,
         layer_limit: usize,
     ) !void {
+        const previous_launch_phase = self.device.setLaunchPhase(.prefill);
+        defer _ = self.device.setLaunchPhase(previous_launch_phase);
         if (tokens.len == 0) return error.InvalidArgument;
         if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
         if (logits_out.len != self.vocab_size) return error.InvalidArgument;
@@ -4496,33 +4499,24 @@ pub const CudaBackend = struct {
         }
     }
 
-    fn compactQueryGateProjectionInPlace(
+    fn compactQueryGateProjection(
         self: *CudaBackend,
         seq_len: usize,
         q_dim: usize,
         q_projection_dim: usize,
+        q_projection_stage: *const compute.cuda.Buffer,
+        q_values_stage: *compute.cuda.Buffer,
     ) !void {
         const projection_elements = std.math.mul(usize, seq_len, q_projection_dim) catch return error.InvalidArgument;
         const query_elements = std.math.mul(usize, seq_len, q_dim) catch return error.InvalidArgument;
-        const projection_bytes = std.math.mul(usize, projection_elements, @sizeOf(f32)) catch return error.InvalidArgument;
-        const query_bytes = std.math.mul(usize, query_elements, @sizeOf(f32)) catch return error.InvalidArgument;
-        var q_projection_stage = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, projection_bytes);
-        var projection_scratch = try bufferSlice(&self.runtime_buffers.query_gate_proj_dev, 0, projection_bytes);
-        try compute.cuda.copy.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            self.copy_function orelse return error.CudaKernelUnavailable,
-            &q_projection_stage,
-            &projection_scratch,
-            @intCast(projection_elements),
-        );
-        var q_values_stage = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, query_bytes);
+        _ = projection_elements;
+        _ = query_elements;
         try compute.cuda.gated_attention_compact_q.runWithFunction(
             &self.kernel_arg_pack,
             &self.device,
             self.gated_attention_compact_q_function orelse return error.CudaKernelUnavailable,
-            &projection_scratch,
-            &q_values_stage,
+            q_projection_stage,
+            q_values_stage,
             @intCast(seq_len),
             @intCast(q_dim),
             @intCast(q_projection_dim),
@@ -4778,13 +4772,22 @@ pub const CudaBackend = struct {
         k_proj: *const LinearWeight,
         v_proj: *const LinearWeight,
         rows: usize,
+        q_out_dest: *compute.cuda.Buffer,
     ) !ProjectionPath {
-        if (rows == 1 and try self.tryFusedQkvForward(input, q_proj, k_proj, v_proj)) return .fused;
-
         const q_bytes = std.math.mul(usize, rows, q_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
         const k_bytes = std.math.mul(usize, rows, k_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
         const v_bytes = std.math.mul(usize, rows, v_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
-        var q_out = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, q_bytes);
+        if (rows == 1 and
+            q_out_dest.pointer == self.runtime_buffers.attn_q_dev.pointer and
+            q_out_dest.size >= q_bytes and
+            try self.tryFusedQkvForward(input, q_proj, k_proj, v_proj))
+        {
+            return .fused;
+        }
+        var q_out = if (q_out_dest.size == q_bytes)
+            q_out_dest.*
+        else
+            try bufferSlice(q_out_dest, 0, q_bytes);
         var k_out = try bufferSlice(&self.runtime_buffers.attn_k_dev, 0, k_bytes);
         var v_out = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, v_bytes);
         try self.linearForwardRows(input, rows, q_proj, &q_out);
@@ -5114,13 +5117,19 @@ pub const CudaBackend = struct {
             return err;
         };
         const q_stage_bytes = std.math.mul(usize, stage_rows, cfg.q_projection_dim * @sizeOf(f32)) catch return error.InvalidArgument;
+        const q_values_bytes = std.math.mul(usize, stage_rows, cfg.q_dim * @sizeOf(f32)) catch return error.InvalidArgument;
         const kv_stage_bytes = std.math.mul(usize, stage_rows, cfg.kv_dim * @sizeOf(f32)) catch return error.InvalidArgument;
         const context_stage_bytes = std.math.mul(usize, stage_rows, o_proj.rows() * @sizeOf(f32)) catch return error.InvalidArgument;
-        var attn_q_stage = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, q_stage_bytes);
+        var q_projection_stage = if (cfg.query_gate)
+            try bufferSlice(&self.runtime_buffers.query_gate_proj_dev, 0, q_stage_bytes)
+        else
+            try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, q_stage_bytes);
+        var attn_q_stage = q_projection_stage;
+        var q_values_stage = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, q_values_bytes);
         var attn_k_stage = try bufferSlice(&self.runtime_buffers.attn_k_dev, 0, kv_stage_bytes);
         var attn_v_stage = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, kv_stage_bytes);
         var attn_context_stage = try bufferSlice(&self.runtime_buffers.attn_context_dev, 0, context_stage_bytes);
-        _ = self.runQkvProjection(input, q_proj, k_proj, v_proj, stage_rows) catch |err| {
+        _ = self.runQkvProjection(input, q_proj, k_proj, v_proj, stage_rows, &q_projection_stage) catch |err| {
             log.warn("inference", "CUDA attention qkv projection failed", .{
                 .seq_len = seq_len_u32,
                 .stage_rows = stage_rows,
@@ -5133,10 +5142,12 @@ pub const CudaBackend = struct {
             return err;
         };
         if (cfg.query_gate) {
-            self.compactQueryGateProjectionInPlace(
+            self.compactQueryGateProjection(
                 stage_rows,
                 cfg.q_dim,
                 cfg.q_projection_dim,
+                &q_projection_stage,
+                &q_values_stage,
             ) catch |err| {
                 log.warn("inference", "CUDA attention query-gate compact failed", .{
                     .seq_len = seq_len_u32,
@@ -5147,6 +5158,7 @@ pub const CudaBackend = struct {
                 });
                 return err;
             };
+            attn_q_stage = q_values_stage;
         }
 
         if (q_norm_weight) |q_norm_value| {
@@ -6044,7 +6056,7 @@ pub const CudaBackend = struct {
         var attn_v_stage = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, kv_stage_bytes);
         var attn_context_stage = try bufferSlice(&self.runtime_buffers.attn_context_dev, 0, context_stage_bytes);
 
-        _ = try self.runQkvProjection(input, q_proj, k_proj, v_proj, stage_rows);
+        _ = try self.runQkvProjection(input, q_proj, k_proj, v_proj, stage_rows, &self.runtime_buffers.attn_q_dev);
 
         if (q_norm_weight) |q_norm_value| {
             const q_norm_rows = std.math.mul(u32, @intCast(stage_rows), n_heads_u32) catch return error.InvalidArgument;

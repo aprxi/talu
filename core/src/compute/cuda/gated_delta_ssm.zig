@@ -44,11 +44,11 @@ pub fn runWithFunction(
     // Match thread count to head width to avoid idle warps on d_head=64/128.
     const block_x: u32 = @min(d_head, 256);
     const shared_bytes = std.math.mul(usize, 2 * @as(usize, d_head) + @as(usize, block_x), @sizeOf(f32)) catch return error.InvalidArgument;
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = n_v_heads,
         .block_x = block_x,
         .shared_mem_bytes = @intCast(shared_bytes),
-    }, arg_pack);
+    }, arg_pack, .gated_delta);
 }
 
 fn validateArgs(

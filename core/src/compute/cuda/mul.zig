@@ -60,10 +60,10 @@ pub fn runWithFunction(
 
     const block_x: u32 = 256;
     const grid_x: u32 = ceilDiv(count, block_x);
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = grid_x,
         .block_x = block_x,
-    }, arg_pack);
+    }, arg_pack, .pointwise);
 }
 
 fn ceilDiv(numerator: u32, denominator: u32) u32 {

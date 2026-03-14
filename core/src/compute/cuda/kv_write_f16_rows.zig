@@ -56,10 +56,10 @@ pub fn runWithFunction(
     const row_width = std.math.mul(u32, n_heads, head_dim) catch return error.InvalidArgument;
     const count = std.math.mul(u32, q_rows, row_width) catch return error.InvalidArgument;
     const block_x: u32 = 256;
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = ceilDiv(count, block_x),
         .block_x = block_x,
-    }, arg_pack);
+    }, arg_pack, .kv_write);
 }
 
 fn validateArgs(

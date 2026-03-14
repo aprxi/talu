@@ -71,11 +71,11 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(f32, eps);
     try arg_pack.appendScalar(f32, weight_offset);
 
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = rows,
         .block_x = 256,
         .shared_mem_bytes = 256 * @sizeOf(f32),
-    }, arg_pack);
+    }, arg_pack, .norm);
 }
 
 test "run validates rows and cols" {

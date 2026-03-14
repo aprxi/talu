@@ -65,11 +65,11 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, sliding_window);
     try arg_pack.appendScalar(f32, theta);
 
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = n_heads,
         .grid_y = q_rows,
         .block_x = 32,
-    }, arg_pack);
+    }, arg_pack, .attention);
 }
 
 fn validateArgs(

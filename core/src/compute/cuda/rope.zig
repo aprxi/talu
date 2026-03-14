@@ -59,10 +59,10 @@ pub fn runWithFunction(
 
     const block_x: u32 = 256;
     const grid_x: u32 = ceilDiv(total_pairs, block_x);
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = grid_x,
         .block_x = block_x,
-    }, arg_pack);
+    }, arg_pack, .rope);
 }
 
 fn validateArgs(io: *const device_mod.Buffer, n_heads: u32, head_dim: u32, rope_dim: u32, theta: f32) !void {

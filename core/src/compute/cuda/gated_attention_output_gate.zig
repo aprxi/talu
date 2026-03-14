@@ -36,10 +36,10 @@ pub fn runWithFunction(
 
     const context_elements = std.math.mul(u32, seq_len, query_dim) catch return error.InvalidArgument;
     const block_x: u32 = 256;
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = ceilDiv(context_elements, block_x),
         .block_x = block_x,
-    }, arg_pack);
+    }, arg_pack, .attention);
 }
 
 fn validateArgs(

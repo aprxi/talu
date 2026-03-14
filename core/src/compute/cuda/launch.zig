@@ -26,7 +26,19 @@ pub fn launch(
     config: LaunchConfig,
     arg_pack: *const args_mod.ArgPack,
 ) !void {
+    return launchWithFamily(device, function, config, arg_pack, .other);
+}
+
+pub fn launchWithFamily(
+    device: *device_mod.Device,
+    function: module_mod.Function,
+    config: LaunchConfig,
+    arg_pack: *const args_mod.ArgPack,
+    family: device_mod.LaunchFamily,
+) !void {
     try config.validate();
+    const previous_family = device.setLaunchFamily(family);
+    defer _ = device.setLaunchFamily(previous_family);
     try device.launchKernel(
         function.handle,
         config.grid_x,

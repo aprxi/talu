@@ -28,10 +28,10 @@ pub fn runWithFunction(
 
     const block_x: u32 = 256;
     const grid_x: u32 = ceilDiv(count, block_x);
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = grid_x,
         .block_x = block_x,
-    }, arg_pack);
+    }, arg_pack, .copy_cast);
 }
 
 fn validateArgs(src_f32: *const device_mod.Buffer, dst_bf16: *device_mod.Buffer, count: u32) !void {

@@ -49,10 +49,10 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, count);
     try arg_pack.appendBufferPtr(out_index);
 
-    try launch_mod.launch(device, function, .{
+    try launch_mod.launchWithFamily(device, function, .{
         .grid_x = 1,
         .block_x = 256,
-    }, arg_pack);
+    }, arg_pack, .pointwise);
 }
 
 test "run rejects zero count" {
