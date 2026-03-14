@@ -165,46 +165,51 @@ class TaluServer:
             )
 
     def _find_talu_serve_pids(self) -> list[int]:
-        """Return PIDs of running talu serve processes (excludes self and zombies).
+        """Return PIDs of running ``talu serve`` processes (excludes self).
 
-        Matches processes where argv[0] ends with '/talu' (or is 'talu')
-        and argv[1] is 'serve'.  This avoids false positives from unrelated
-        processes that happen to have 'talu' in a path argument.
+        Uses ``pgrep`` + ``ps`` which work on both Linux and macOS,
+        avoiding the Linux-only ``/proc`` filesystem.
         """
-        pids: list[int] = []
-        my_pid = os.getpid()
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            if pid == my_pid:
-                continue
-            try:
-                raw = (entry / "cmdline").read_bytes()
-            except (OSError, PermissionError):
-                continue
-            args = raw.decode(errors="replace").split("\0")
-            # Need at least argv[0] and argv[1].
-            if len(args) < 2:
-                continue
-            binary = args[0].rsplit("/", 1)[-1]  # basename
-            if binary != "talu" or args[1] != "serve":
-                continue
-            if self._is_zombie(pid):
-                continue
-            pids.append(pid)
-        return pids
-
-    @staticmethod
-    def _is_zombie(pid: int) -> bool:
         try:
-            status = Path(f"/proc/{pid}/status").read_text()
-            for line in status.splitlines():
-                if line.startswith("State:"):
-                    return "Z" in line
-        except OSError:
-            pass
-        return False
+            result = subprocess.run(
+                ["pgrep", "-f", "talu.*serve"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+
+        if result.returncode != 0:
+            return []
+
+        my_pid = os.getpid()
+        candidates = []
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pid = int(line)
+                if pid != my_pid:
+                    candidates.append(pid)
+
+        # Verify each candidate's command line to avoid false positives.
+        pids: list[int] = []
+        for pid in candidates:
+            try:
+                ps = subprocess.run(
+                    ["ps", "-o", "args=", "-p", str(pid)],
+                    capture_output=True, text=True, timeout=5,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+            if ps.returncode != 0:
+                continue
+            cmdline = ps.stdout.strip()
+            parts = cmdline.split()
+            if len(parts) < 2:
+                continue
+            binary = parts[0].rsplit("/", 1)[-1]
+            if binary == "talu" and parts[1] == "serve":
+                pids.append(pid)
+        return pids
 
     def _wait_port_free(self, *, timeout: float) -> None:
         """Block until nothing is listening on our port."""
