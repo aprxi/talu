@@ -119,6 +119,24 @@ static constexpr unsigned int U4_WARPS_PER_BLOCK = 4;
 static constexpr unsigned int U4_WARP_ELEMS_PER_THREAD = 32;
 static constexpr unsigned int U4_WARP_STEP = TALU_QUANT_WARP_SIZE * U4_WARP_ELEMS_PER_THREAD; // 1024
 
+// Process one word (8 U4 nibbles) against 8 F32 input values using factored
+// accumulation: accumulate raw nibble*input products, then apply scale/bias
+// once per word.  Uses 2-way ILP accumulators (r0, r1).
+#define U4_PROCESS_WORD(word, in_lo, in_hi, s, b, acc) do { \
+    float r0 = 0.0f, r1 = 0.0f; \
+    r0 = fmaf((in_lo).x, static_cast<float>(((word)      ) & 0xFu), r0); \
+    r1 = fmaf((in_lo).y, static_cast<float>(((word) >>  4) & 0xFu), r1); \
+    r0 = fmaf((in_lo).z, static_cast<float>(((word) >>  8) & 0xFu), r0); \
+    r1 = fmaf((in_lo).w, static_cast<float>(((word) >> 12) & 0xFu), r1); \
+    r0 = fmaf((in_hi).x, static_cast<float>(((word) >> 16) & 0xFu), r0); \
+    r1 = fmaf((in_hi).y, static_cast<float>(((word) >> 20) & 0xFu), r1); \
+    r0 = fmaf((in_hi).z, static_cast<float>(((word) >> 24) & 0xFu), r0); \
+    r1 = fmaf((in_hi).w, static_cast<float>(((word) >> 28) & 0xFu), r1); \
+    const float isum = ((in_lo).x + (in_lo).y) + ((in_lo).z + (in_lo).w) \
+                     + ((in_hi).x + (in_hi).y) + ((in_hi).z + (in_hi).w); \
+    (acc) = fmaf(r0 + r1, (s), fmaf(isum, (b), (acc))); \
+} while (0)
+
 static __device__ __forceinline__ float talu_gaffine_u4_dot_row_warp_v(
     const float* input,
     const unsigned int* packed_weight,
@@ -137,44 +155,32 @@ static __device__ __forceinline__ float talu_gaffine_u4_dot_row_warp_v(
     const unsigned short* scale_row = scales + (unsigned long long)out_idx * groups_per_row;
     const unsigned short* bias_row = biases + (unsigned long long)out_idx * groups_per_row;
 
+    // 64-bit weight loads: 2 words per iteration → 5 iterations per row for
+    // in_dim=2560 (matching I8's DRAM request rate).  Each warp issues more
+    // DRAM requests than with 128-bit loads, improving memory pipeline utilization.
+    // Hardware coalesces 32 consecutive 64-bit loads into full cache line fills.
     float acc = 0.0f;
-    for (unsigned int w = lane << 2; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 2) {
-        uint4 p;
+    for (unsigned int w = lane << 1; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 1) {
+        unsigned int w0, w1;
         asm volatile(
-            "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
-            : "=r"(p.x), "=r"(p.y), "=r"(p.z), "=r"(p.w)
+            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(w0), "=r"(w1)
             : "l"(&weight_row[w]));
 
         const unsigned int base_elem = w << 3;
+        const unsigned int g0 = w / words_per_group;
+        const float s0 = talu_decode_scale_bias_u16(scale_row[g0], scales_dtype_tag);
+        const float b0 = talu_decode_scale_bias_u16(bias_row[g0], scales_dtype_tag);
+        const float4 i0 = *reinterpret_cast<const float4*>(&input[base_elem]);
+        const float4 i1 = *reinterpret_cast<const float4*>(&input[base_elem + 4]);
+        U4_PROCESS_WORD(w0, i0, i1, s0, b0, acc);
 
-        #pragma unroll
-        for (unsigned int wj = 0; wj < 4; ++wj) {
-            const unsigned int word = (wj == 0) ? p.x : (wj == 1) ? p.y : (wj == 2) ? p.z : p.w;
-            const unsigned int g = (w + wj) / words_per_group;
-            const float s = talu_decode_scale_bias_u16(scale_row[g], scales_dtype_tag);
-            const float b = talu_decode_scale_bias_u16(bias_row[g], scales_dtype_tag);
-
-            const unsigned int elem = base_elem + (wj << 3);
-            const float4 in0 = *reinterpret_cast<const float4*>(&input[elem]);
-            const float4 in1 = *reinterpret_cast<const float4*>(&input[elem + 4]);
-
-            // Factored: accumulate raw nibble*input products with 2-way ILP,
-            // then apply scale/bias once per word (8 elements).
-            // output += scale * sum(input*nibble) + bias * sum(input)
-            float r0 = 0.0f, r1 = 0.0f;
-            r0 = fmaf(in0.x, static_cast<float>((word      ) & 0xFu), r0);
-            r1 = fmaf(in0.y, static_cast<float>((word >>  4) & 0xFu), r1);
-            r0 = fmaf(in0.z, static_cast<float>((word >>  8) & 0xFu), r0);
-            r1 = fmaf(in0.w, static_cast<float>((word >> 12) & 0xFu), r1);
-            r0 = fmaf(in1.x, static_cast<float>((word >> 16) & 0xFu), r0);
-            r1 = fmaf(in1.y, static_cast<float>((word >> 20) & 0xFu), r1);
-            r0 = fmaf(in1.z, static_cast<float>((word >> 24) & 0xFu), r0);
-            r1 = fmaf(in1.w, static_cast<float>((word >> 28) & 0xFu), r1);
-
-            const float isum = (in0.x + in0.y) + (in0.z + in0.w)
-                             + (in1.x + in1.y) + (in1.z + in1.w);
-            acc = fmaf(r0 + r1, s, fmaf(isum, b, acc));
-        }
+        const unsigned int g1 = (w + 1) / words_per_group;
+        const float s1 = talu_decode_scale_bias_u16(scale_row[g1], scales_dtype_tag);
+        const float b1 = talu_decode_scale_bias_u16(bias_row[g1], scales_dtype_tag);
+        const float4 i2 = *reinterpret_cast<const float4*>(&input[base_elem + 8]);
+        const float4 i3 = *reinterpret_cast<const float4*>(&input[base_elem + 12]);
+        U4_PROCESS_WORD(w1, i2, i3, s1, b1, acc);
     }
     return talu_quant_warp_sum_f32(acc);
 }
@@ -706,64 +712,51 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up
     const unsigned short* us_row = up_scales + (unsigned long long)out_index * up_gpr;
     const unsigned short* ub_row = up_biases + (unsigned long long)out_index * up_gpr;
 
+    // 64-bit weight loads for both gate and up: 2 words per load → 5 iterations
+    // per row for in_dim=2560.  4 DRAM loads per iteration (2 gate + 2 up words
+    // via two v2.u32 loads) doubles the DRAM request rate vs 128-bit loads.
     float gate_acc = 0.0f;
     float up_acc = 0.0f;
-    for (unsigned int w = lane << 2; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 2) {
-        uint4 gp;
+    for (unsigned int w = lane << 1; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 1) {
+        unsigned int gw0, gw1;
         asm volatile(
-            "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
-            : "=r"(gp.x), "=r"(gp.y), "=r"(gp.z), "=r"(gp.w)
+            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(gw0), "=r"(gw1)
             : "l"(&g_row[w]));
 
-        uint4 up4;
+        unsigned int uw0, uw1;
         asm volatile(
-            "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
-            : "=r"(up4.x), "=r"(up4.y), "=r"(up4.z), "=r"(up4.w)
+            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(uw0), "=r"(uw1)
             : "l"(&u_row[w]));
 
         const unsigned int base_elem = w << 3;
 
-        #pragma unroll
-        for (unsigned int wj = 0; wj < 4; ++wj) {
-            const unsigned int gword = (wj == 0) ? gp.x : (wj == 1) ? gp.y : (wj == 2) ? gp.z : gp.w;
-            const unsigned int uword = (wj == 0) ? up4.x : (wj == 1) ? up4.y : (wj == 2) ? up4.z : up4.w;
-
-            const unsigned int gg = (w + wj) / gate_wpg;
+        // Word 0: shared input, sequential gate then up.
+        {
+            const float4 in_lo = *reinterpret_cast<const float4*>(&input_row[base_elem]);
+            const float4 in_hi = *reinterpret_cast<const float4*>(&input_row[base_elem + 4]);
+            const unsigned int gg = w / gate_wpg;
             const float gs = talu_decode_scale_bias_u16(gs_row[gg], gate_scales_dtype_tag);
             const float gb = talu_decode_scale_bias_u16(gb_row[gg], gate_scales_dtype_tag);
-            const unsigned int ug = (w + wj) / up_wpg;
+            U4_PROCESS_WORD(gw0, in_lo, in_hi, gs, gb, gate_acc);
+            const unsigned int ug = w / up_wpg;
             const float us = talu_decode_scale_bias_u16(us_row[ug], up_scales_dtype_tag);
             const float ub = talu_decode_scale_bias_u16(ub_row[ug], up_scales_dtype_tag);
-
-            const unsigned int elem = base_elem + (wj << 3);
-            const float4 in0 = *reinterpret_cast<const float4*>(&input_row[elem]);
-            const float4 in1 = *reinterpret_cast<const float4*>(&input_row[elem + 4]);
-
-            // Factored: 2-way ILP for raw nibble*input, shared input sum.
-            float gr0 = 0.0f, gr1 = 0.0f;
-            gr0 = fmaf(in0.x, static_cast<float>((gword      ) & 0xFu), gr0);
-            gr1 = fmaf(in0.y, static_cast<float>((gword >>  4) & 0xFu), gr1);
-            gr0 = fmaf(in0.z, static_cast<float>((gword >>  8) & 0xFu), gr0);
-            gr1 = fmaf(in0.w, static_cast<float>((gword >> 12) & 0xFu), gr1);
-            gr0 = fmaf(in1.x, static_cast<float>((gword >> 16) & 0xFu), gr0);
-            gr1 = fmaf(in1.y, static_cast<float>((gword >> 20) & 0xFu), gr1);
-            gr0 = fmaf(in1.z, static_cast<float>((gword >> 24) & 0xFu), gr0);
-            gr1 = fmaf(in1.w, static_cast<float>((gword >> 28) & 0xFu), gr1);
-
-            float ur0 = 0.0f, ur1 = 0.0f;
-            ur0 = fmaf(in0.x, static_cast<float>((uword      ) & 0xFu), ur0);
-            ur1 = fmaf(in0.y, static_cast<float>((uword >>  4) & 0xFu), ur1);
-            ur0 = fmaf(in0.z, static_cast<float>((uword >>  8) & 0xFu), ur0);
-            ur1 = fmaf(in0.w, static_cast<float>((uword >> 12) & 0xFu), ur1);
-            ur0 = fmaf(in1.x, static_cast<float>((uword >> 16) & 0xFu), ur0);
-            ur1 = fmaf(in1.y, static_cast<float>((uword >> 20) & 0xFu), ur1);
-            ur0 = fmaf(in1.z, static_cast<float>((uword >> 24) & 0xFu), ur0);
-            ur1 = fmaf(in1.w, static_cast<float>((uword >> 28) & 0xFu), ur1);
-
-            const float isum = (in0.x + in0.y) + (in0.z + in0.w)
-                             + (in1.x + in1.y) + (in1.z + in1.w);
-            gate_acc = fmaf(gr0 + gr1, gs, fmaf(isum, gb, gate_acc));
-            up_acc = fmaf(ur0 + ur1, us, fmaf(isum, ub, up_acc));
+            U4_PROCESS_WORD(uw0, in_lo, in_hi, us, ub, up_acc);
+        }
+        // Word 1: shared input, sequential gate then up.
+        {
+            const float4 in_lo = *reinterpret_cast<const float4*>(&input_row[base_elem + 8]);
+            const float4 in_hi = *reinterpret_cast<const float4*>(&input_row[base_elem + 12]);
+            const unsigned int gg = (w + 1) / gate_wpg;
+            const float gs = talu_decode_scale_bias_u16(gs_row[gg], gate_scales_dtype_tag);
+            const float gb = talu_decode_scale_bias_u16(gb_row[gg], gate_scales_dtype_tag);
+            U4_PROCESS_WORD(gw1, in_lo, in_hi, gs, gb, gate_acc);
+            const unsigned int ug = (w + 1) / up_wpg;
+            const float us = talu_decode_scale_bias_u16(us_row[ug], up_scales_dtype_tag);
+            const float ub = talu_decode_scale_bias_u16(ub_row[ug], up_scales_dtype_tag);
+            U4_PROCESS_WORD(uw1, in_lo, in_hi, us, ub, up_acc);
         }
     }
 
