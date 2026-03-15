@@ -425,7 +425,15 @@ pub fn loadModelWithArchitecture(
 
     // Detect original weight dtype from declarative architecture metadata.
     // This is used to determine if model is BF16 for MLX GPU path.
-    const original_weight_dtype = try detectOriginalWeightDType(arch, model_config.layer_types, &safetensors_file);
+    const original_weight_dtype = blk: {
+        const detected = try detectOriginalWeightDType(arch, model_config.layer_types, &safetensors_file);
+        // SafeTensors maps U32 to grouped_affine_u4 by default. Correct
+        // based on config's authoritative gaffine_bits when it says 8-bit.
+        if (detected == .grouped_affine_u4 and model_config.gaffine_bits == 8) {
+            break :blk DType.grouped_affine_u8;
+        }
+        break :blk detected;
+    };
 
     var block_time_ns: i128 = 0;
 

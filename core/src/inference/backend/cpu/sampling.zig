@@ -35,6 +35,14 @@ pub const SamplingConfig = struct {
     /// Repetition penalty applied to tokens in the context.
     /// 1.0 = no penalty (default), >1.0 = discourage repetition.
     repetition_penalty: f32 = 1.0,
+    /// Additive presence penalty. Subtracts this value from logits of tokens
+    /// that appear in context_tokens (once per unique token).
+    /// 0.0 = disabled (default). Typical range: [-2.0, 2.0].
+    presence_penalty: f32 = 0.0,
+    /// Additive frequency penalty. Subtracts penalty * count from logits
+    /// where count is the number of times the token appears in context_tokens.
+    /// 0.0 = disabled (default). Typical range: [-2.0, 2.0].
+    frequency_penalty: f32 = 0.0,
     /// Token IDs to apply repetition penalty to (typically recent context).
     /// If null, no penalty is applied.
     context_tokens: ?[]const u32 = null,
@@ -131,6 +139,18 @@ pub const Sampler = struct {
         // Apply logit bias if configured
         if (config.logit_bias) |bias_entries| {
             cpu_sampling_ops.applyIndexBias(logits, bias_entries);
+        }
+
+        // Apply additive penalties (presence + frequency) if configured
+        if (config.presence_penalty != 0.0 or config.frequency_penalty != 0.0) {
+            if (config.context_tokens) |tokens| {
+                cpu_sampling_ops.applyAdditivePenalties(
+                    logits,
+                    tokens,
+                    config.presence_penalty,
+                    config.frequency_penalty,
+                );
+            }
         }
 
         return self.sampleImpl(logits, config);
@@ -1616,4 +1636,98 @@ test "Sampler.sample partition subrange" {
     for (items[pivot_idx + 1 .. 5]) |item| {
         try std.testing.expect(item.value <= pivot_val);
     }
+}
+
+// ----------------------------------------------------------------------------
+// Presence penalty tests
+// ----------------------------------------------------------------------------
+
+test "sampleMut presence penalty shifts distribution away from penalized tokens" {
+    var sampler_state = try Sampler.init(std.testing.allocator, 5050, 16);
+    defer sampler_state.deinit();
+
+    const context_tokens = [_]u32{ 0, 1 };
+
+    const config = SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 4,
+        .temperature = 1.0,
+        .presence_penalty = 2.0,
+        .context_tokens = &context_tokens,
+    };
+
+    var counts = [_]usize{0} ** 4;
+    for (0..500) |_| {
+        var logits = [_]f32{ 5.0, 5.0, 5.0, 5.0 };
+        const sampled_index = try sampler_state.sampleMut(&logits, config);
+        counts[sampled_index] += 1;
+    }
+
+    // Tokens 2 and 3 (not in context) should be sampled more
+    try std.testing.expect(counts[2] + counts[3] > counts[0] + counts[1]);
+}
+
+// ----------------------------------------------------------------------------
+// Frequency penalty tests
+// ----------------------------------------------------------------------------
+
+test "sampleMut frequency penalty proportional to count" {
+    var sampler_state = try Sampler.init(std.testing.allocator, 5151, 16);
+    defer sampler_state.deinit();
+
+    // Token 0 appears 3 times, token 1 appears 1 time
+    const context_tokens = [_]u32{ 0, 0, 0, 1 };
+
+    const config = SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 4,
+        .temperature = 1.0,
+        .frequency_penalty = 1.0,
+        .context_tokens = &context_tokens,
+    };
+
+    var counts = [_]usize{0} ** 4;
+    for (0..500) |_| {
+        var logits = [_]f32{ 5.0, 5.0, 5.0, 5.0 };
+        const sampled_index = try sampler_state.sampleMut(&logits, config);
+        counts[sampled_index] += 1;
+    }
+
+    // Token 0 (count=3) should be sampled less than token 1 (count=1)
+    try std.testing.expect(counts[1] > counts[0]);
+    // Tokens 2 and 3 (not in context) should be sampled most
+    try std.testing.expect(counts[2] + counts[3] > counts[0] + counts[1]);
+}
+
+// ----------------------------------------------------------------------------
+// Combined penalty tests
+// ----------------------------------------------------------------------------
+
+test "sampleMut combined presence frequency and repetition penalties" {
+    var sampler_state = try Sampler.init(std.testing.allocator, 5252, 16);
+    defer sampler_state.deinit();
+
+    const context_tokens = [_]u32{ 0, 0, 1 };
+
+    const config = SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 4,
+        .temperature = 1.0,
+        .repetition_penalty = 1.5,
+        .presence_penalty = 0.5,
+        .frequency_penalty = 0.5,
+        .context_tokens = &context_tokens,
+    };
+
+    var counts = [_]usize{0} ** 4;
+    for (0..500) |_| {
+        var logits = [_]f32{ 5.0, 5.0, 5.0, 5.0 };
+        const sampled_index = try sampler_state.sampleMut(&logits, config);
+        counts[sampled_index] += 1;
+    }
+
+    // Tokens 2 and 3 (not in context) should dominate
+    try std.testing.expect(counts[2] + counts[3] > counts[0] + counts[1]);
+    // Token 0 (2x count, more penalized) should be less than token 1 (1x count)
+    try std.testing.expect(counts[1] > counts[0]);
 }

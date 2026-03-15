@@ -1,7 +1,7 @@
 """Scenario base class, registry, config loading, and HTTP helpers.
 
-Scenario naming:  <endpoint_group>/<name>
-Config files:     scenarios/<endpoint_group>/conf/<config_name>.json
+Scenario naming:  <endpoint>/<kind>/<name>   e.g. responses/perf/hello
+Config files:     <endpoint>/conf/<config_name>.json
 
 Config model fields:
     model_uri:   List of base model IDs (or comma-separated string via CLI).
@@ -19,7 +19,7 @@ import socket
 import time
 from pathlib import Path
 
-_SCENARIOS_DIR = Path(__file__).resolve().parent / "scenarios"
+_SCENARIOS_DIR = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -48,17 +48,28 @@ def scenario_names() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Sampling presets (mirrors core/src/models/sampling_presets.zig)
+# ---------------------------------------------------------------------------
+
+SAMPLING_PRESETS: dict[str, dict[str, float | int]] = {
+    "general":       {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
+    "coding":        {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "presence_penalty": 0.0},
+    "instruct":      {"temperature": 0.7, "top_p": 0.8,  "top_k": 20, "presence_penalty": 1.5},
+    "deterministic": {"temperature": 0.0, "top_p": 1.0,  "top_k": 1,  "presence_penalty": 0.0},
+}
+
+# ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
 
 _DEFAULT_CONFIG: dict = {
-    "model_uri": ["Qwen/Qwen3-0.6B"],
-    "precision": ["original"],
+    "model_uri": ["Qwen/Qwen3.5-0.8B"],
+    "precision": ["original", "GAF8", "GAF4"],
     "env": {},
     "max_tokens": 256,
-    "streaming": True,
-    "temperature": 1.0,
+    "streaming": False,
     "seed": 42,
+    **SAMPLING_PRESETS["general"],
 }
 
 
@@ -78,7 +89,7 @@ def load_config(
     config["env"] = dict(config.get("env", {}))
 
     if config_name is not None:
-        group = scenario_name.rsplit("/", 1)[0] if "/" in scenario_name else scenario_name
+        group = scenario_name.split("/")[0]
         conf_path = _SCENARIOS_DIR / group / "conf" / f"{config_name}.json"
 
         if not conf_path.exists():
@@ -96,12 +107,26 @@ def load_config(
             config["env"].update(file_overrides.pop("env"))
         config.update(file_overrides)
 
-    # Apply CLI --set overrides.
+    # Apply CLI --set overrides (track which keys were explicitly set).
+    explicit_keys: set[str] = set()
     for item in overrides or []:
         if "=" not in item:
             raise ValueError(f"--set requires key=value format, got: {item!r}")
         key, val_str = item.split("=", 1)
         config[key] = _parse_value(val_str)
+        explicit_keys.add(key)
+
+    # Resolve preset: apply preset values for keys not explicitly overridden.
+    preset_name = config.pop("preset", None)
+    if isinstance(preset_name, str):
+        if preset_name not in SAMPLING_PRESETS:
+            avail = ", ".join(sorted(SAMPLING_PRESETS))
+            raise ValueError(
+                f"unknown preset {preset_name!r} (available: {avail})"
+            )
+        for k, v in SAMPLING_PRESETS[preset_name].items():
+            if k not in explicit_keys:
+                config[k] = v
 
     # Apply CLI --env overrides.
     for item in env_overrides or []:
@@ -129,7 +154,7 @@ def _parse_value(s: str) -> object:
 
 def list_configs(scenario_name: str) -> list[str]:
     """List available config names for a scenario's endpoint group."""
-    group = scenario_name.rsplit("/", 1)[0] if "/" in scenario_name else scenario_name
+    group = scenario_name.split("/")[0]
     conf_dir = _SCENARIOS_DIR / group / "conf"
     if not conf_dir.is_dir():
         return []
@@ -157,6 +182,7 @@ class Scenario:
     name: str = ""
     description: str = ""
     endpoint: str = ""
+    family: str = ""
 
     def server_args(self, config: dict) -> list[str]:
         """Extra CLI args for talu serve, derived from config."""
@@ -254,6 +280,16 @@ def http_post_stream(
         elif line == "":
             current_event = ""
 
+    # Non-streaming: body is a single JSON response, not SSE events.
+    if not events and body_str.strip():
+        try:
+            resp = json.loads(body_str.strip())
+            status = resp.get("status", "completed")
+            event_type = "response.completed" if status == "completed" else "response.incomplete"
+            events.append({"event": event_type, "data": {"response": resp}})
+        except json.JSONDecodeError:
+            pass
+
     return events, wall_s
 
 
@@ -264,6 +300,7 @@ def extract_generation_metrics(events: list[dict]) -> dict:
     input_tokens = 0
     output_tokens = 0
     prefill_ms = 0
+    generation_ms = 0.0
     ttft_ms = 0
     model_info: dict = {}
 
@@ -281,6 +318,7 @@ def extract_generation_metrics(events: list[dict]) -> dict:
             input_tokens = usage.get("input_tokens", 0)
             output_tokens = usage.get("output_tokens", 0)
             prefill_ms = usage.get("prefill_ms", 0)
+            generation_ms = usage.get("generation_ms", 0)
             ttft_ms = usage.get("ttft_ms", 0)
             model_info = resp.get("model_info", {})
         elif ev["event"] == "error":
@@ -293,8 +331,12 @@ def extract_generation_metrics(events: list[dict]) -> dict:
             msg = err.get("message", "unknown error") if isinstance(err, dict) else err
             print(f"\n    FAILED: {msg}", flush=True)
 
+    # Streaming: per-delta elapsed_ms. Non-streaming: usage.generation_ms.
+    decode_ms = last_elapsed_ms if last_elapsed_ms > 0 else generation_ms
+    decode_tokens = last_tokens_gen if last_tokens_gen > 0 else output_tokens
+
     engine_tok_s = (
-        last_tokens_gen / (last_elapsed_ms / 1000) if last_elapsed_ms > 0 else 0.0
+        decode_tokens / (decode_ms / 1000) if decode_ms > 0 else 0.0
     )
     prefill_tok_s = (
         input_tokens / (prefill_ms / 1000) if prefill_ms > 0 else 0.0
@@ -304,7 +346,7 @@ def extract_generation_metrics(events: list[dict]) -> dict:
         "engine_tok_s": round(engine_tok_s, 1),
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "decode_s": round(last_elapsed_ms / 1000, 3),
+        "decode_s": round(decode_ms / 1000, 3),
         "prefill_tok_s": round(prefill_tok_s, 1),
         "prefill_ms": round(prefill_ms, 1),
         "ttft_ms": round(ttft_ms, 1),

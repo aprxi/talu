@@ -4,6 +4,7 @@ const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const layer_ops = @import("../layer_ops.zig");
 const perf = @import("../perf_hints.zig");
+const sp = @import("../sampling_presets.zig");
 const types = @import("../op_types.zig");
 const config_hooks = @import("../config/hook_utils.zig");
 const vision_shared = @import("../vision_shared.zig");
@@ -301,11 +302,18 @@ const qwen3_5_perf_hints = perf.PerfHints{
     .decode_hidden_rows = perf.qwen3_5_hidden_rows[0..],
     .role_dims = perf.qwen3_5_role_dims[0..],
 };
+const qwen3_5_sampling_presets: sp.SamplingPresets = .{
+    .general = .{ .temperature = 1.0, .top_p = 0.95, .top_k = 20, .presence_penalty = 1.5 },
+    .coding = .{ .temperature = 0.6, .top_p = 0.95, .top_k = 20, .presence_penalty = 0.0 },
+    .instruct = .{ .temperature = 0.7, .top_p = 0.8, .top_k = 20, .presence_penalty = 1.5 },
+    .deterministic = .{ .temperature = 0.0, .top_p = 1.0, .top_k = 1, .presence_penalty = 0.0 },
+};
 
 pub var arch: types.Architecture = .{
     .name = "qwen3_5",
     .model_types = &qwen3_5_model_types,
     .performance_hints = &qwen3_5_perf_hints,
+    .sampling_presets = &qwen3_5_sampling_presets,
     .parse_config_hook = parseConfigHook,
     .block_variants = &qwen3_5_block_variants,
     .layer_map = &qwen3_5_layer_map,

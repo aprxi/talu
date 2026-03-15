@@ -32,6 +32,7 @@ pub struct CreateResponseBody {
     pub temperature: Option<f64>,
     pub text: Option<serde_json::Value>,
     pub tool_choice: Option<serde_json::Value>,
+    pub top_k: Option<u32>,
     pub tools: Option<serde_json::Value>,
     pub top_logprobs: Option<i64>,
     pub top_p: Option<f64>,

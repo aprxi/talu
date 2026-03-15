@@ -7,6 +7,7 @@ const std = @import("std");
 const tensor = @import("../tensor.zig");
 const runtime_contract = @import("../inference/runtime_contract/root.zig");
 const perf_hints = @import("perf_hints.zig");
+const sampling_presets = @import("sampling_presets.zig");
 
 /// Operation types that can appear in model block metadata.
 /// High-level ops (norm, multihead_attention, mlp) are preferred.
@@ -359,6 +360,9 @@ pub const Architecture = struct {
     /// compute-facing bench rows. Consumers MUST read this metadata instead of
     /// hardcoding architecture-specific performance mappings outside `models/`.
     performance_hints: ?*const perf_hints.PerfHints = null,
+    /// Recommended sampling parameters per use-case category.
+    /// Consumers look up presets via `registry.samplingPresetsByName()`.
+    sampling_presets: ?*const sampling_presets.SamplingPresets = null,
     kernel_meta: KernelMeta = .{},
     parse_config_hook: ?ConfigParseHook = null,
     /// Per-architecture state descriptor specs keyed by state id.

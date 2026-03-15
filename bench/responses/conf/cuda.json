@@ -2,10 +2,10 @@
   "model_uri": ["Qwen/Qwen3-0.6B"],
   "precision": ["original", "GAF4"],
   "env": {
-    "BACKEND": "cpu"
+    "BACKEND": "cuda"
   },
   "max_tokens": 256,
-  "streaming": true,
+  "streaming": false,
   "temperature": 1.0,
   "seed": 42
 }

@@ -154,6 +154,12 @@ pub const GenerateOptions = struct {
     /// Override chat's repetition_penalty.
     repetition_penalty: ?f32 = null,
 
+    /// Additive presence penalty (0.0 = disabled).
+    presence_penalty: ?f32 = null,
+
+    /// Additive frequency penalty (0.0 = disabled).
+    frequency_penalty: ?f32 = null,
+
     /// Optional callback for streaming output. Called after each token is sampled.
     token_callback: ?TokenCallback = null,
 
@@ -720,8 +726,10 @@ pub const LocalEngine = struct {
         const top_p = opts.top_p orelse chat.top_p;
         const min_p = opts.min_p orelse chat.min_p;
         const repetition_penalty = opts.repetition_penalty orelse chat.repetition_penalty;
+        const presence_penalty = opts.presence_penalty orelse 0.0;
+        const frequency_penalty = opts.frequency_penalty orelse 0.0;
         // Build sampling config
-        var sampling_config = sampler.SamplingConfig{ .strategy = .greedy, .logit_bias = opts.logit_bias, .seed = opts.seed };
+        var sampling_config = sampler.SamplingConfig{ .strategy = .greedy, .logit_bias = opts.logit_bias, .seed = opts.seed, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty };
         if (temperature > 0 and (self.gen_config.do_sample or opts.temperature != null)) {
             sampling_config = .{
                 .strategy = .top_k,
@@ -730,6 +738,8 @@ pub const LocalEngine = struct {
                 .top_p = top_p,
                 .min_p = min_p,
                 .repetition_penalty = repetition_penalty,
+                .presence_penalty = presence_penalty,
+                .frequency_penalty = frequency_penalty,
                 .logit_bias = opts.logit_bias,
                 .seed = opts.seed,
             };

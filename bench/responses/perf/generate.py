@@ -1,26 +1,42 @@
-"""Simple short-prompt scenario for POST /v1/responses."""
+"""Token-generation (decode) scenarios for POST /v1/responses.
+
+Registers tg128, tg256, tg512, tg1024.  Each sends the same short prompt
+(64 input tokens on Qwen3-0.6B) and varies max_output_tokens.
+The key metric is generation t/s.
+"""
 
 from scenario import Scenario, http_post_stream, extract_generation_metrics, model_uri
 
-# Config keys that map to /v1/responses request body fields.
 _API_FIELDS = {
-    "max_tokens": "max_output_tokens",
     "temperature": "temperature",
+    "top_p": "top_p",
+    "top_k": "top_k",
     "seed": "seed",
     "frequency_penalty": "frequency_penalty",
     "presence_penalty": "presence_penalty",
 }
 
+_INPUT = (
+    "Write a detailed story about a knight exploring a vast underground"
+    " kingdom. Describe the caverns, the creatures, the ancient ruins,"
+    " and a mysterious queen in vivid detail."
+)
+_INSTRUCTIONS = (
+    "You are a novelist. Write in flowing prose."
+    " Never summarize. Never use bullet points."
+)
 
-class Hello(Scenario):
-    name = "responses/hello"
-    description = "Short prompt, free-form reply — raw decode throughput."
-    endpoint = "POST /v1/responses"
+_SIZES = [128, 256, 512]
+
+
+def _make_run(max_out: int):
+    """Return a run() method closed over *max_out*."""
 
     def run(self, base_url: str, rounds: int, config: dict) -> list[dict]:
         url = f"{base_url}/v1/responses"
-        model_uris: list[str] = config.get("model_uri", [])
+        model_uris: list[str] = config.get("model_uri", ["Qwen/Qwen3.5-0.8B"])
         precisions: list[str] = config.get("precision", ["original"])
+        config["max_tokens"] = max_out
         all_results: list[dict] = []
 
         for base_model in model_uris:
@@ -31,10 +47,11 @@ class Hello(Scenario):
 
                 body: dict = {
                     "model": uri,
-                    "input": "hello",
-                    "instructions": "ok",
+                    "input": _INPUT,
+                    "instructions": _INSTRUCTIONS,
                     "stream": config.get("streaming", True),
                     "store": True,
+                    "max_output_tokens": max_out,
                 }
                 for cfg_key, api_key in _API_FIELDS.items():
                     if cfg_key in config:
@@ -53,3 +70,16 @@ class Hello(Scenario):
                     print(f" {m['engine_tok_s']} tok/s")
 
         return all_results
+
+    return run
+
+
+# Dynamically register one Scenario subclass per size.
+for _size in _SIZES:
+    _cls = type(f"Tg{_size}", (Scenario,), {
+        "name": f"responses/perf/tg{_size}",
+        "family": "tg",
+        "description": "Decode throughput — 64-token prompt.",
+        "endpoint": "POST /v1/responses",
+        "run": _make_run(_size),
+    })

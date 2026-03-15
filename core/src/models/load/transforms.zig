@@ -77,6 +77,7 @@ fn inferGaffineParams(
     name: []const u8,
     t: *Tensor,
     expected_dim: usize,
+    config_gaffine_bits: i32,
 ) ?GaffineInferResult {
     if (t.dtype != .grouped_affine_u4 and t.dtype != .grouped_affine_u8) return null;
 
@@ -122,10 +123,11 @@ fn inferGaffineParams(
     const unpacked_4bit = in_packed * 8;
     const unpacked_8bit = in_packed * 4;
 
-    // Use expected_dim to disambiguate when both group sizes are valid
-    // This handles mixed quantization models (e.g. 8-bit attn/embed, 4-bit MoE)
+    // Disambiguate when both group sizes are valid:
+    // 1. Config's gaffine_bits is authoritative when available
+    // 2. Fall back to expected_dim matching for mixed quantization models
     const is_4bit = if (valid_4bit and valid_8bit)
-        (unpacked_4bit == expected_dim) // Match expected dimension
+        if (config_gaffine_bits == 4) true else if (config_gaffine_bits == 8) false else (unpacked_4bit == expected_dim)
     else
         valid_4bit; // Only one is valid, use that
 
@@ -352,7 +354,6 @@ pub fn buildGatedDeltaSplitInProj(
 }
 
 pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTensors, name: []const u8, expected_in: usize, config: ModelConfig) !Tensor {
-    _ = config; // Not used currently - we use expected_in for disambiguation
     var weight_tensor = try st.getTensor(name, null);
     log.debug("load", "Orient weight", .{
         .name = name,
@@ -367,7 +368,7 @@ pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTens
 
     // U32 from safetensors maps to grouped_affine_u4 by default
     // For models with mixed quantization, auto-detect bits from scales shape
-    if (inferGaffineParams(st, name, &weight_tensor, expected_in)) |params| {
+    if (inferGaffineParams(st, name, &weight_tensor, expected_in, config.gaffine_bits)) |params| {
         try applyGaffineParams(&weight_tensor, params, name);
         return weight_tensor;
     } else if (weight_tensor.dtype == .grouped_affine_u4 or weight_tensor.dtype == .grouped_affine_u8) {
@@ -631,7 +632,7 @@ pub fn orientEmbedding(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeT
     // U32 from safetensors maps to grouped_affine_u4 by default
     // For models with mixed quantization, auto-detect bits from scales shape
     const expected_dim: usize = @intCast(config.d_model);
-    if (inferGaffineParams(st, name, &embed_tensor, expected_dim)) |params| {
+    if (inferGaffineParams(st, name, &embed_tensor, expected_dim, config.gaffine_bits)) |params| {
         try applyGaffineParams(&embed_tensor, params, name);
         return embed_tensor;
     } else if (embed_tensor.dtype == .grouped_affine_u4 or embed_tensor.dtype == .grouped_affine_u8) {

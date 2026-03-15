@@ -6,6 +6,7 @@ const layer_ops = @import("../layer_ops.zig");
 const types = @import("../op_types.zig");
 const config_hooks = @import("../config/hook_utils.zig");
 const perf = @import("../perf_hints.zig");
+const sp = @import("../sampling_presets.zig");
 const vision_shared = @import("../vision_shared.zig");
 
 pub const id: []const u8 = "lfm2";
@@ -151,6 +152,12 @@ const lfm2_global_weights = [_]types.WeightSpec{
     .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "model.language_model.lm_head.weight", "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
 const lfm2_perf_hints = perf.standardAttentionMlpShortConvHints("lfm2");
+const lfm2_sampling_presets: sp.SamplingPresets = .{
+    .general = .{ .temperature = 0.3, .top_p = 0.9, .top_k = 40, .presence_penalty = 0.0 },
+    .coding = .{ .temperature = 0.2, .top_p = 0.9, .top_k = 40, .presence_penalty = 0.0 },
+    .instruct = .{ .temperature = 0.3, .top_p = 0.9, .top_k = 40, .presence_penalty = 0.0 },
+    .deterministic = .{ .temperature = 0.0, .top_p = 1.0, .top_k = 1, .presence_penalty = 0.0 },
+};
 pub var arch: types.Architecture = .{
     .name = "lfm2",
     .model_types = &lfm2_model_types,
@@ -180,4 +187,5 @@ pub var arch: types.Architecture = .{
     .embedding_multiplier = 1.0,
     .vision = vision_shared.metadata,
     .performance_hints = &lfm2_perf_hints,
+    .sampling_presets = &lfm2_sampling_presets,
 };

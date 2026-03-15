@@ -7,19 +7,22 @@ Usage:
 
 Examples:
     python bench/run.py list
-    python bench/run.py responses/hello --config cuda
-    python bench/run.py responses/hello --config cuda --rounds 3
-    python bench/run.py responses/hello --config cuda --set precision=original,GAF4
-    python bench/run.py responses/hello --config cuda --set model_uri=Qwen/Qwen3-0.6B,Qwen/Qwen3.5-2B
-    python bench/run.py responses/hello --config cuda --env BACKEND=cpu
+    python bench/run.py responses/perf/hello --config cuda
+    python bench/run.py responses/perf/hello --config cuda --rounds 3
+    python bench/run.py responses/perf/hello --config cuda --set precision=original,GAF4
+    python bench/run.py responses/perf/hello --config cuda --set model_uri=Qwen/Qwen3-0.6B,Qwen/Qwen3.5-2B
+    python bench/run.py responses/perf/hello --config cuda --env BACKEND=cpu
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime
+import platform
+import subprocess
 import sys
 from collections import defaultdict
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -29,7 +32,7 @@ from rich import box
 from server import TaluServer
 
 # Import scenarios — triggers registration via __init_subclass__.
-import scenarios  # noqa: F401
+import responses  # noqa: F401
 
 from scenario import (
     list_scenarios,
@@ -42,22 +45,143 @@ from scenario import (
 console = Console()
 
 
+# ---------------------------------------------------------------------------
+# Version & hardware detection
+# ---------------------------------------------------------------------------
+
+def _run_quiet(*args: str) -> str:
+    """Run a command, return stdout or empty string on failure."""
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+
+def _get_version(binary: Path) -> str:
+    """Get talu version from binary -V output."""
+    return _run_quiet(str(binary), "-V") or "unknown"
+
+
+def _detect_hardware(env: dict[str, str]) -> str:
+    """Return compact one-line hardware summary: CPU (· GPU when BACKEND=cuda)."""
+    parts: list[str] = []
+
+    # CPU.
+    cpu = ""
+    if platform.system() == "Darwin":
+        cpu = _run_quiet("sysctl", "-n", "machdep.cpu.brand_string")
+    else:
+        for line in _run_quiet("lscpu").splitlines():
+            if line.strip().startswith("Model name:"):
+                cpu = line.split(":", 1)[1].strip()
+                break
+    if cpu:
+        # Strip common noise suffixes.
+        import re
+        cpu = re.sub(r"\s+\d+-Core Processor$", "", cpu)
+        parts.append(cpu)
+
+    # GPU — only when the benchmark actually uses it.
+    if env.get("BACKEND") == "cuda":
+        gpu_name = _run_quiet(
+            "nvidia-smi", "--query-gpu=name",
+            "--format=csv,noheader", "--id=0",
+        )
+        if gpu_name:
+            parts.append(gpu_name)
+
+    return " · ".join(parts) if parts else "unknown"
+
+
 def cmd_list() -> None:
-    """Print available scenarios and configs grouped by endpoint."""
+    """Print available scenarios, defaults, and usage examples."""
+    from scenario import _DEFAULT_CONFIG
+
     groups = list_scenarios()
     if not groups:
         print("No scenarios registered.")
         return
 
+    # Scenarios.
+    print("Scenarios:")
     for group, items in groups.items():
         configs = list_configs(items[0].name)
         conf_str = f"  configs: {', '.join(configs)}" if configs else ""
-        print(f"{group}/{conf_str}")
+        print(f"  {group}/{conf_str}")
+
+        # Collapse scenarios that share a family into one line.
+        families: dict[str, list[type]] = {}
+        standalone: list[type] = []
         for cls in items:
+            if cls.family:
+                families.setdefault(cls.family, []).append(cls)
+            else:
+                standalone.append(cls)
+
+        for fam, members in sorted(families.items()):
+            suffixes = sorted(
+                (c.name.rsplit("/", 1)[-1][len(fam):] for c in members),
+                key=lambda s: (int(s) if s.isdigit() else s),
+            )
+            label = f"{fam}{{{','.join(suffixes)}}}"
+            desc = members[0].description
+            print(f"    {label:<26s} {desc}")
+
+        for cls in standalone:
             short = cls.name.rsplit("/", 1)[-1]
-            ep = f"  [{cls.endpoint}]" if cls.endpoint else ""
-            print(f"  {short:<20s} {cls.description}{ep}")
-        print()
+            print(f"    {short:<26s} {cls.description}")
+
+    # Sampling presets.
+    from scenario import SAMPLING_PRESETS
+    print()
+    print("Sampling presets:")
+    for name, params in SAMPLING_PRESETS.items():
+        parts = " ".join(f"{k}={v}" for k, v in params.items())
+        marker = " (default)" if name == "general" else ""
+        print(f"  {name:<15s} {parts}{marker}")
+
+    # Defaults.
+    cfg = _DEFAULT_CONFIG
+    models = ",".join(cfg["model_uri"])
+    precs = ",".join(cfg["precision"])
+    print()
+    print("Defaults:")
+    print(f"  model_uri={models}  precision={precs}")
+    print(f"  seed={cfg['seed']}  temperature={cfg['temperature']}  top_p={cfg['top_p']}  top_k={cfg['top_k']}")
+
+    # Usage.
+    first = next(iter(scenario_names()), "responses/perf/pp512")
+    print()
+    print("Usage:")
+    argv0 = sys.argv[0]
+    print(f"  python {argv0} {first}")
+    print(f"  python {argv0} {first} --config cuda --rounds 3")
+    print(f"  python {argv0} {first} --set model_uri=Qwen/Qwen3-0.6B,Qwen/Qwen3.5-0.8B")
+    print(f"  python {argv0} {first} --set precision=original,GAF4")
+    print(f"  python {argv0} {first} --set preset=coding")
+    print(f"  python {argv0} {first} --set preset=coding --set temperature=0.3")
+    print()
+
+
+def _print_expanded_cmd(args: argparse.Namespace, config: dict) -> None:
+    """Print the full CLI command with all resolved defaults."""
+    parts = [f"python {sys.argv[0]}", args.scenario]
+    if args.config:
+        parts.append(f"--config {args.config}")
+    parts.append(f"--rounds {args.rounds}")
+    models = ",".join(config.get("model_uri", []))
+    precs = ",".join(config.get("precision", []))
+    parts.append(f"--set model_uri={models}")
+    parts.append(f"--set precision={precs}")
+    for key in ("seed", "temperature", "top_p", "top_k", "presence_penalty"):
+        if key in config:
+            parts.append(f"--set {key}={config[key]}")
+    env_vars = config.get("env", {})
+    for k, v in sorted(env_vars.items()):
+        parts.append(f"--env {k}={v}")
+    print(" \\\n    ".join(parts), flush=True)
+    print()
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -70,9 +194,15 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     config = load_config(args.scenario, args.config, args.set, args.env)
 
+    # Show the fully-expanded CLI command so users can reproduce/modify.
+    _print_expanded_cmd(args, config)
+
     scenario = cls()
     env_vars = config.get("env", {})
     srv = TaluServer(port=args.port, extra_args=scenario.server_args(config), env=env_vars)
+
+    version = _get_version(srv.binary)
+    hardware = _detect_hardware(env_vars)
 
     results: list[dict] = []
     try:
@@ -88,7 +218,8 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     if results:
         print()
-        print_report(args.scenario, args.config, config, args.rounds, results)
+        print_report(args.scenario, args.config, config, args.rounds, results,
+                     version, hardware)
 
 
 # ---------------------------------------------------------------------------
@@ -101,40 +232,32 @@ def print_report(
     config: dict,
     rounds: int,
     results: list[dict],
+    version: str,
+    hardware: str,
 ) -> None:
     """Print a presentable benchmark report using Rich tables."""
     env_vars = config.get("env", {})
     date = datetime.date.today().isoformat()
 
-    # -- Header / metadata --
+    # -- Header --
     console.print()
     console.rule(f"[bold]talu bench · {scenario_name}[/bold]", style="bright_blue")
     console.print()
 
-    meta = Table(show_header=False, box=None, padding=(0, 2))
-    meta.add_column("key", style="dim", min_width=14)
-    meta.add_column("value")
+    # Line 1: essentials.
+    info_parts = [version, hardware, date]
+    if config_name:
+        info_parts.append(f"config={config_name}")
+    console.print(f"  [dim]{' · '.join(info_parts)}[/]")
 
-    # Bench params (CLI flags, not passed to API).
-    meta.add_row("config", config_name or "(defaults)")
-    meta.add_row("date", date)
-    meta.add_row("rounds", str(rounds))
-    meta.add_row("", "")
-
-    # API params (passed in the request body via --set).
-    for key in ("seed", "temperature", "max_tokens", "streaming"):
+    # Line 2: parameters.
+    param_parts = [f"rounds={rounds}"]
+    for key in ("seed", "temperature", "top_p", "top_k", "presence_penalty", "max_tokens"):
         if key in config:
-            meta.add_row(key, str(config[key]))
-    meta.add_row("", "")
-
-    # Env vars (passed to the server process via --env).
-    if env_vars:
-        for k, v in sorted(env_vars.items()):
-            meta.add_row(k, v)
-    else:
-        meta.add_row("[dim](no env vars)[/dim]", "")
-
-    console.print(meta)
+            param_parts.append(f"{key}={config[key]}")
+    for k, v in sorted(env_vars.items()):
+        param_parts.append(f"{k}={v}")
+    console.print(f"  [dim]{' · '.join(param_parts)}[/]")
     console.print()
 
     # -- Group results by model, then by quant --
@@ -157,7 +280,9 @@ def _print_model_table(
         ("Precision", "",               False),
         ("Size",  "",               True),
         ("tok",   "Prefill",    False),
-        ("t/s",   "Prefill",    True),
+        ("avg t/s", "Prefill",  True),
+        ("min",   "Prefill",    True),
+        ("max",   "Prefill",    True),
         ("tok",   "Generate", True),
         ("avg t/s", "Generate", True),
         ("min",   "Generate", True),
@@ -191,7 +316,12 @@ def _print_model_table(
         else:
             avg = mn = mx = "—"
         prefill_rates = [r["prefill_tok_s"] for r in rows if r.get("prefill_tok_s", 0) > 0]
-        prefill_ts = f"{sum(prefill_rates)/len(prefill_rates):.1f}" if prefill_rates else "—"
+        if prefill_rates:
+            prefill_avg = f"{sum(prefill_rates)/len(prefill_rates):.1f}"
+            prefill_mn = f"{min(prefill_rates):.1f}"
+            prefill_mx = f"{max(prefill_rates):.1f}"
+        else:
+            prefill_avg = prefill_mn = prefill_mx = "—"
         ttft_vals = [r["ttft_ms"] for r in rows if r.get("ttft_ms", 0) > 0]
         if ttft_vals:
             ttft_avg = f"{sum(ttft_vals)/len(ttft_vals):.0f}ms"
@@ -208,7 +338,7 @@ def _print_model_table(
             label = dtype
         else:
             label = scheme if scheme != "original" else "n/a"
-        data_rows.append([label, size_str, in_tok, prefill_ts, out_tok, avg, mn, mx, ttft_avg, ttft_mn, ttft_mx])
+        data_rows.append([label, size_str, in_tok, prefill_avg, prefill_mn, prefill_mx, out_tok, avg, mn, mx, ttft_avg, ttft_mn, ttft_mx])
 
     # Compute per-column gaps: wider between groups, tighter within.
     gaps = []
@@ -290,9 +420,9 @@ def _print_model_table(
             cell = f"{val:>{w}}" if col_defs[i][2] else f"{val:<{w}}"
             if i == 0:
                 cell = f"[cyan bold]{cell}[/]"
-            elif i == 5:
+            elif i in (3, 7):
                 cell = f"[green bold]{cell}[/]"
-            elif i in (6, 7):
+            elif i in (4, 5, 8, 9):
                 cell = f"[dim]{cell}[/]"
             parts.append(cell)
         content_lines.append(join_parts(parts))
@@ -323,9 +453,9 @@ def main() -> None:
     sub.add_parser("list", help="List available scenarios and configs.")
 
     run_p = sub.add_parser("run", help="Run a scenario.")
-    run_p.add_argument("scenario", help="Scenario name (e.g. responses/hello).")
+    run_p.add_argument("scenario", help="Scenario name (e.g. responses/perf/hello).")
     run_p.add_argument("--config", "-c", default=None, help="Config name (e.g. cpu).")
-    run_p.add_argument("--port", type=int, default=8258, help="Server port (default: 8258).")
+    run_p.add_argument("--port", type=int, default=18258, help="Server port (default: 18258).")
     run_p.add_argument("--rounds", "-n", type=int, default=5, help="Rounds per variant (default: 5).")
     run_p.add_argument("--set", "-s", action="append", default=[], metavar="KEY=VALUE",
                         help="Override config value. Parsed as JSON, fallback to string. Repeatable.")

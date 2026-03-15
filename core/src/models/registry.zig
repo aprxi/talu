@@ -7,6 +7,7 @@ const common_types = @import("common/types.zig");
 const layer_ops = @import("layer_ops.zig");
 const op_types = @import("op_types.zig");
 const perf_hints = @import("perf_hints.zig");
+const sampling_presets = @import("sampling_presets.zig");
 const runtime_contract = @import("../inference/runtime_contract/root.zig");
 const runtime_architectures = @import("runtime_architectures.zig");
 const minilm = @import("bert/minilm.zig");
@@ -240,9 +241,22 @@ pub fn performanceHintsByName(name: []const u8) ?*const perf_hints.PerfHints {
     return null;
 }
 
+/// Resolve model-owned sampling presets by architecture id or model_type.
+pub fn samplingPresetsByName(name: []const u8) ?*const sampling_presets.SamplingPresets {
+    if (runtimeArchitectureById(name)) |arch| return arch.sampling_presets;
+    if (runtimeArchitectureByModelType(name)) |arch| return arch.sampling_presets;
+    return null;
+}
+
 test "all registered architectures export performance hints" {
     for (entries) |entry| {
         try std.testing.expect(performanceHintsByName(entry.id) != null);
+    }
+}
+
+test "all registered architectures export sampling presets" {
+    for (entries) |entry| {
+        try std.testing.expect(samplingPresetsByName(entry.id) != null);
     }
 }
 

@@ -394,7 +394,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }
             }
 
-            const sampled = try self.sampler.sample(logits, sampling_config);
+            const sampled = try self.sampler.sampleMut(logits, sampling_config);
             return @intCast(sampled);
         }
 
@@ -763,9 +763,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }
 
                 // Sample next token using optimized sampler (SIMD, pre-allocated workspace)
+                var sample_cfg = request_entry.sampling_config;
+                sample_cfg.context_tokens = request_entry.generated_tokens.items;
                 const next_token = self.sampleToken(
                     result.logits,
-                    request_entry.sampling_config,
+                    sample_cfg,
                     request_entry.grammar_sampler,
                 ) catch 0;
                 self.parityLogits(
@@ -1072,7 +1074,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
 
             const eos_token_ids = submit_config.eos_token_ids orelse self.config.default_eos_token_ids;
-            const current_token = self.sampleToken(self.logits_buffer, sampling_config.*, null) catch 0;
+            var sync_sample_cfg = sampling_config.*;
+            sync_sample_cfg.context_tokens = &.{};
+            const current_token = self.sampleToken(self.logits_buffer, sync_sample_cfg, null) catch 0;
 
             var generated = try std.ArrayList(u32).initCapacity(self.allocator, max_tokens);
             errdefer generated.deinit(self.allocator);
@@ -1250,7 +1254,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
 
             const eos_token_ids = submit_config.eos_token_ids orelse self.config.default_eos_token_ids;
-            var current_token = self.sampleToken(self.logits_buffer, sampling_config.*, null) catch 0;
+            var topk_sample_cfg = sampling_config.*;
+            topk_sample_cfg.context_tokens = &.{};
+            var current_token = self.sampleToken(self.logits_buffer, topk_sample_cfg, null) catch 0;
 
             var generated = try std.ArrayList(u32).initCapacity(self.allocator, max_tokens);
             errdefer generated.deinit(self.allocator);
@@ -1321,10 +1327,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 );
                 if (candidate_count == 0) return error.InvalidArgument;
 
+                topk_sample_cfg.context_tokens = generated.items;
                 current_token = try self.sampleTopKCandidateToken(
                     candidate_logits[0..candidate_count],
                     candidate_ids[0..candidate_count],
-                    sampling_config.*,
+                    topk_sample_cfg,
                 );
                 try generated.append(self.allocator, current_token);
 
@@ -1610,9 +1617,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 request_entry.state = .generating;
 
                 // Sample first token from prefill logits
+                var prefill_sample_cfg = request_entry.sampling_config;
+                prefill_sample_cfg.context_tokens = request_entry.generated_tokens.items;
                 const first_token_id = self.sampleToken(
                     self.logits_buffer,
-                    request_entry.sampling_config,
+                    prefill_sample_cfg,
                     request_entry.grammar_sampler,
                 ) catch 0;
                 self.parityLogits(

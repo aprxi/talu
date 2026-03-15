@@ -32,6 +32,7 @@ struct GenerationRequest {
     max_output_tokens: Option<i64>,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    top_k: Option<u32>,
     presence_penalty: Option<f64>,
     frequency_penalty: Option<f64>,
     seed: Option<u64>,
@@ -230,6 +231,7 @@ async fn handle_generate(
         max_output_tokens: parsed.max_output_tokens,
         temperature: parsed.temperature,
         top_p: parsed.top_p,
+        top_k: parsed.top_k,
         presence_penalty: parsed.presence_penalty,
         frequency_penalty: parsed.frequency_penalty,
         seed: parsed.seed,
@@ -599,6 +601,7 @@ async fn generate_response(
     let request_max_output_tokens = request.max_output_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
+    let top_k = request.top_k;
     let presence_penalty = request.presence_penalty;
     let frequency_penalty = request.frequency_penalty;
     let seed = request.seed;
@@ -790,7 +793,7 @@ async fn generate_response(
     let project_id_for_task = project_id.clone();
     let tools_json_for_generation = effective_tools.as_ref().map(|v| v.to_string());
     let tool_choice_for_generation = effective_tool_choice.as_ref().map(|v| v.to_string());
-    let (output_items, prompt_tokens, completion_tokens, prefill_ns, result_ttft_ns, responses_json, model_info_json) =
+    let (output_items, prompt_tokens, completion_tokens, prefill_ns, generation_ns, result_ttft_ns, responses_json, model_info_json) =
         tokio::task::spawn_blocking(move || {
             let mut backend = backend.blocking_lock();
             let backend = backend
@@ -863,8 +866,17 @@ async fn generate_response(
             if let Some(top_p) = top_p {
                 cfg.top_p = top_p as f32;
             }
+            if let Some(top_k) = top_k {
+                cfg.top_k = top_k as usize;
+            }
             if let Some(seed) = seed {
                 cfg.seed = seed;
+            }
+            if let Some(pp) = presence_penalty {
+                cfg.presence_penalty = pp as f32;
+            }
+            if let Some(fp) = frequency_penalty {
+                cfg.frequency_penalty = fp as f32;
             }
             cfg.tools_json = tools_json_for_generation;
             cfg.tool_choice = tool_choice_for_generation;
@@ -879,6 +891,7 @@ async fn generate_response(
             let prompt_tokens = result.prompt_tokens();
             let completion_tokens = result.completion_tokens();
             let prefill_ns = result.prefill_ns();
+            let generation_ns = result.generation_ns();
             let ttft_ns = result.ttft_ns();
             log::debug!(target: "server::gen", "completed: prompt_tokens={} completion_tokens={}",
                 prompt_tokens, completion_tokens);
@@ -904,6 +917,7 @@ async fn generate_response(
                 prompt_tokens,
                 completion_tokens,
                 prefill_ns,
+                generation_ns,
                 ttft_ns,
                 responses_json,
                 model_info_json,
@@ -933,6 +947,7 @@ async fn generate_response(
         input_tokens: prompt_tokens,
         output_tokens: completion_tokens,
         prefill_ns,
+        generation_ns,
         ttft_ns: result_ttft_ns,
     };
     let mut response_value = build_response_resource_value(
@@ -944,6 +959,7 @@ async fn generate_response(
         max_output_tokens,
         temperature.unwrap_or(0.0),
         top_p.unwrap_or(1.0),
+        top_k,
         presence_penalty.unwrap_or(0.0),
         frequency_penalty.unwrap_or(0.0),
         logprobs.top_logprobs as i64,
@@ -1018,6 +1034,7 @@ async fn stream_response(
     let request_max_output_tokens = request.max_output_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
+    let top_k = request.top_k;
     let presence_penalty = request.presence_penalty;
     let frequency_penalty = request.frequency_penalty;
     let seed = request.seed;
@@ -1296,6 +1313,7 @@ async fn stream_response(
                         "parallel_tool_calls": false,
                         "text": { "format": response_text_format_value(text_format_for_events.as_ref()) },
                         "top_p": top_p.unwrap_or(1.0),
+                        "top_k": top_k.unwrap_or(0),
                         "presence_penalty": presence_penalty.unwrap_or(0.0),
                         "frequency_penalty": frequency_penalty.unwrap_or(0.0),
                         "top_logprobs": logprobs.top_logprobs as i64,
@@ -1418,6 +1436,7 @@ async fn stream_response(
             max_output_tokens,
             temperature.unwrap_or(0.0),
             top_p.unwrap_or(1.0),
+            top_k,
             presence_penalty.unwrap_or(0.0),
             frequency_penalty.unwrap_or(0.0),
             logprobs.top_logprobs as i64,
@@ -1492,6 +1511,7 @@ async fn stream_response(
             text_format: text_format_for_events.clone(),
             project_id: project_id.clone(),
             top_logprobs: logprobs.top_logprobs,
+            top_k,
             presence_penalty: presence_penalty.unwrap_or(0.0),
             frequency_penalty: frequency_penalty.unwrap_or(0.0),
             reasoning_effort: reasoning_for_events.effort.clone(),
@@ -1519,6 +1539,7 @@ async fn stream_response(
             max_output_tokens,
             temperature,
             top_p,
+            top_k,
             seed,
             presence_penalty,
             frequency_penalty,
@@ -1595,9 +1616,10 @@ fn run_streaming_generation(
     max_output_tokens: Option<i64>,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    top_k: Option<u32>,
     seed: Option<u64>,
-    _presence_penalty: Option<f64>,
-    _frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
     system_prompt: Option<String>,
     prompt_id: Option<String>,
     project_id: Option<String>,
@@ -1663,8 +1685,17 @@ fn run_streaming_generation(
     if let Some(top_p) = top_p {
         cfg.top_p = top_p as f32;
     }
+    if let Some(top_k) = top_k {
+        cfg.top_k = top_k as usize;
+    }
     if let Some(seed) = seed {
         cfg.seed = seed;
+    }
+    if let Some(pp) = presence_penalty {
+        cfg.presence_penalty = pp as f32;
+    }
+    if let Some(fp) = frequency_penalty {
+        cfg.frequency_penalty = fp as f32;
     }
     cfg.tools_json = tools_json.map(|v| v.to_string());
     cfg.tool_choice = tool_choice_json.map(|v| v.to_string());
@@ -1748,6 +1779,7 @@ fn run_streaming_generation(
             input_tokens: stream_result.prompt_tokens,
             output_tokens: stream_result.completion_tokens,
             prefill_ns: stream_result.prefill_ns,
+            generation_ns: stream_result.generation_ns,
             ttft_ns: stream_result.ttft_ns,
         },
         finish_reason: stream_result.finish_reason,
@@ -1889,6 +1921,7 @@ struct StreamCtx {
     /// Requested top_logprobs count from the API request.
     top_logprobs: usize,
     /// Request sampling penalties echoed in response resources.
+    top_k: Option<u32>,
     presence_penalty: f64,
     frequency_penalty: f64,
     /// Reasoning config echoed in response resources.
@@ -2438,6 +2471,7 @@ impl StreamCtx {
                     max_output_tokens,
                     temperature,
                     top_p,
+                    self.top_k,
                     self.presence_penalty,
                     self.frequency_penalty,
                     self.top_logprobs as i64,
@@ -2507,6 +2541,7 @@ impl StreamCtx {
                     max_output_tokens,
                     temperature,
                     top_p,
+                    self.top_k,
                     self.presence_penalty,
                     self.frequency_penalty,
                     self.top_logprobs as i64,
@@ -2653,6 +2688,7 @@ struct UsageStats {
     input_tokens: usize,
     output_tokens: usize,
     prefill_ns: u64,
+    generation_ns: u64,
     ttft_ns: u64,
 }
 
@@ -2698,6 +2734,7 @@ fn build_response_resource_value(
     max_output_tokens: Option<i64>,
     temperature: f64,
     top_p: f64,
+    top_k: Option<u32>,
     presence_penalty: f64,
     frequency_penalty: f64,
     top_logprobs: i64,
@@ -2726,6 +2763,9 @@ fn build_response_resource_value(
             });
             if u.prefill_ns > 0 {
                 v["prefill_ms"] = json!(u.prefill_ns as f64 / 1_000_000.0);
+            }
+            if u.generation_ns > 0 {
+                v["generation_ms"] = json!(u.generation_ns as f64 / 1_000_000.0);
             }
             if u.ttft_ns > 0 {
                 v["ttft_ms"] = json!(u.ttft_ns as f64 / 1_000_000.0);
@@ -2756,6 +2796,7 @@ fn build_response_resource_value(
         "parallel_tool_calls": false,
         "text": { "format": response_text_format_value(text_format) },
         "top_p": top_p,
+        "top_k": top_k.unwrap_or(0),
         "presence_penalty": presence_penalty,
         "frequency_penalty": frequency_penalty,
         "top_logprobs": top_logprobs,
@@ -3085,8 +3126,8 @@ fn validate_max_output_tokens(max_output_tokens: Option<i64>) -> std::result::Re
     let Some(max_output_tokens) = max_output_tokens else {
         return Ok(());
     };
-    if max_output_tokens < 16 {
-        return Err("`max_output_tokens` must be at least 16".to_string());
+    if max_output_tokens < 1 {
+        return Err("`max_output_tokens` must be at least 1".to_string());
     }
     Ok(())
 }

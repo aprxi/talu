@@ -4,6 +4,7 @@ const layer_ops = @import("../layer_ops.zig");
 const types = @import("../op_types.zig");
 const config_hooks = @import("../config/hook_utils.zig");
 const perf = @import("../perf_hints.zig");
+const sp = @import("../sampling_presets.zig");
 
 pub const id: []const u8 = "gpt_oss";
 pub const family: []const u8 = "gpt_oss";
@@ -108,6 +109,7 @@ const gpt_oss_global_weights = [_]types.WeightSpec{
     .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
 const gpt_oss_perf_hints = perf.attentionOnlyHints("gpt_oss");
+const gpt_oss_sampling_presets: sp.SamplingPresets = sp.default;
 pub var arch: types.Architecture = .{
     .name = "gpt_oss",
     .model_types = &gpt_oss_model_types,
@@ -134,4 +136,5 @@ pub var arch: types.Architecture = .{
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
     .performance_hints = &gpt_oss_perf_hints,
+    .sampling_presets = &gpt_oss_sampling_presets,
 };

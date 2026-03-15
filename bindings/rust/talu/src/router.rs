@@ -56,6 +56,10 @@ pub struct GenerateConfig {
     pub min_p: f32,
     /// Repetition penalty.
     pub repetition_penalty: f32,
+    /// Additive presence penalty (0.0 = disabled).
+    pub presence_penalty: f32,
+    /// Additive frequency penalty (0.0 = disabled).
+    pub frequency_penalty: f32,
     /// Random seed (0 = random).
     pub seed: u64,
     /// Override the chat template.
@@ -321,6 +325,8 @@ impl ConfigHolder {
         c_config.top_p = cfg.top_p;
         c_config.min_p = cfg.min_p;
         c_config.repetition_penalty = cfg.repetition_penalty;
+        c_config.presence_penalty = cfg.presence_penalty;
+        c_config.frequency_penalty = cfg.frequency_penalty;
         c_config.seed = cfg.seed;
         c_config.raw_output = if cfg.raw_output { 1 } else { 0 };
 
