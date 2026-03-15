@@ -1729,6 +1729,24 @@ struct GatedDeltaCaptureOutputs {
     std::optional<array> norm;
 };
 
+static inline void materialize_gated_delta_capture_outputs(GatedDeltaCaptureOutputs* capture_out) {
+    if (capture_out == nullptr) {
+        return;
+    }
+    if (capture_out->in_proj.has_value()) {
+        eval(*capture_out->in_proj);
+    }
+    if (capture_out->conv.has_value()) {
+        eval(*capture_out->conv);
+    }
+    if (capture_out->ssm.has_value()) {
+        eval(*capture_out->ssm);
+    }
+    if (capture_out->norm.has_value()) {
+        eval(*capture_out->norm);
+    }
+}
+
 static inline array gated_delta_mixer_forward_core(
     const array& input,
     const StateSpaceCallable& in_proj_fn,
@@ -2856,6 +2874,7 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
         ssm_state,
         &capture_outputs
     );
+    materialize_gated_delta_capture_outputs(&capture_outputs);
 
     if (layer_state != nullptr) {
         eval(conv_state);
@@ -3025,6 +3044,7 @@ void* mlx_lazy_gated_delta_mixer_quantized_capture(
         ssm_state,
         &capture_outputs
     );
+    materialize_gated_delta_capture_outputs(&capture_outputs);
 
     if (layer_state != nullptr) {
         eval(conv_state);

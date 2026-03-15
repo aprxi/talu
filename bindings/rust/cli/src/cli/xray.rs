@@ -5,15 +5,18 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use zip::write::SimpleFileOptions;
 
 use talu::error::last_error_message;
 use talu::{ChatHandle, XrayCaptureHandle};
 
 use crate::provider::create_backend_for_model;
 
-use super::repo::resolve_model_path;
+use super::ask::{latest_visible_text, DEFAULT_SYSTEM_MESSAGE};
+use super::repo::{resolve_model_for_inference, resolve_model_path};
 use super::XrayArgs;
 
 #[cfg(target_os = "macos")]
@@ -21,9 +24,20 @@ unsafe extern "C" {
     fn _exit(status: i32) -> !;
 }
 
+#[cfg(target_family = "unix")]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
 struct VerifyOverrideGuard {
     point_mask_overridden: bool,
     exact_emission_overridden: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifyBackendPair {
+    source: String,
+    target: String,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +95,79 @@ struct ActiveVerifyRunGuard {
     teacher_forcing_enabled: bool,
 }
 
+#[derive(Deserialize)]
+struct ReferenceTokensJson {
+    tokens: Vec<u32>,
+}
+
+fn parse_env_f32(name: &str) -> Option<f32> {
+    std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
+}
+
+fn parse_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok())
+}
+
+fn resolve_xray_model(model: &str) -> Result<String> {
+    resolve_model_for_inference(model)
+}
+
+fn reference_visible_text_path(reference_path: &Path) -> PathBuf {
+    reference_path.with_extension("visible.txt")
+}
+
+fn save_reference_visible_text(reference_path: &Path, text: &str) -> Result<()> {
+    let final_path = reference_visible_text_path(reference_path);
+    let temp_path = temp_reference_path(&final_path, std::process::id());
+    std::fs::write(&temp_path, text)?;
+    replace_file_atomically(&temp_path, &final_path)
+}
+
+fn load_reference_visible_text(reference_path: &Path) -> Result<String> {
+    Ok(std::fs::read_to_string(reference_visible_text_path(reference_path))?)
+}
+
+/// Get effective generation config for xray using the core-owned policy.
+///
+/// This uses talu::model::resolve_effective_generation_config to ensure xray
+/// uses identical config resolution as normal inference (ask, shell, etc).
+fn xray_generate_config(model: &str, max_tokens: usize, seed: u64) -> Result<talu::router::GenerateConfig> {
+    let resolved_model = resolve_xray_model(model)?;
+    // Parse optional environment overrides
+    let env_temperature = parse_env_f32("TEMPERATURE");
+    let env_top_k = parse_env_usize("TOP_K");
+    let env_top_p = parse_env_f32("TOP_P");
+
+    // Use core-owned policy to resolve effective config
+    let effective = talu::model::resolve_effective_generation_config(
+        &resolved_model,
+        &talu::EffectiveGenConfigRequest {
+            temperature: env_temperature,
+            top_k: env_top_k,
+            top_p: env_top_p,
+            seed,
+            max_tokens,
+            ..Default::default()
+        },
+    )?;
+
+    // Validate top_p range (core doesn't validate, bindings should)
+    if !(0.0..=1.0).contains(&effective.top_p) {
+        return Err(anyhow!("Error: TOP_P must be in range [0.0, 1.0], got {}", effective.top_p));
+    }
+
+    Ok(talu::router::GenerateConfig {
+        max_tokens: effective.max_tokens,
+        temperature: effective.temperature,
+        top_k: effective.top_k,
+        top_p: effective.top_p,
+        min_p: effective.min_p,
+        repetition_penalty: effective.repetition_penalty,
+        seed: effective.seed,
+        ..Default::default()
+    })
+}
+
 impl ActiveVerifyRunGuard {
     fn activate(
         teacher_forcing: bool,
@@ -106,6 +193,215 @@ impl Drop for ActiveVerifyRunGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerifyCliMode {
+    Tokens,
+    Stats,
+    Full,
+    Tensors,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReferenceCaptureMode {
+    Full,
+    TranscriptOnly,
+}
+
+fn display_token_index(token_idx: u32) -> u32 {
+    token_idx.saturating_add(1)
+}
+
+fn display_tensor_contract_token(idx: usize, parsed: &ParsedCheckpointKey, prefill_boundary: usize) -> u32 {
+    if idx < prefill_boundary {
+        0
+    } else {
+        display_token_index(parsed.token)
+    }
+}
+
+fn format_token_text_for_report(model: &str, token_id: u32) -> Option<String> {
+    let resolved_model = resolve_xray_model(model).ok()?;
+    let tokenizer = talu::TokenizerHandle::new(&resolved_model).ok()?;
+    let options = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    let result = unsafe {
+        talu_sys::talu_tokenizer_decode(tokenizer.as_ptr(), &token_id, 1, &options)
+    };
+    if !result.error_msg.is_null() || result.text.is_null() {
+        return None;
+    }
+    let text = unsafe {
+        let bytes = std::slice::from_raw_parts(result.text, result.text_len);
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    unsafe {
+        talu_sys::talu_decode_result_free(result.text, result.text_len);
+    }
+    let escaped: String = text.chars().flat_map(|ch| ch.escape_default()).collect();
+    Some(format!("'{}'", escaped))
+}
+
+fn decode_token_sequence_for_report(model: &str, tokens: &[u32]) -> Option<String> {
+    if tokens.is_empty() {
+        return Some(String::new());
+    }
+    let resolved_model = resolve_xray_model(model).ok()?;
+    let tokenizer = talu::TokenizerHandle::new(&resolved_model).ok()?;
+    let options = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
+    let result =
+        unsafe { talu_sys::talu_tokenizer_decode(tokenizer.as_ptr(), tokens.as_ptr(), tokens.len(), &options) };
+    if !result.error_msg.is_null() || result.text.is_null() {
+        return None;
+    }
+    let text = unsafe {
+        let bytes = std::slice::from_raw_parts(result.text, result.text_len);
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    unsafe {
+        talu_sys::talu_decode_result_free(result.text, result.text_len);
+    }
+    Some(text)
+}
+
+fn load_reference_tokens(path: &str) -> Result<Vec<u32>> {
+    let file = File::open(path)?;
+    let data: ReferenceTokensJson = serde_json::from_reader(file)?;
+    Ok(data.tokens)
+}
+
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    let mut prefix = 0usize;
+    let mut left_iter = left.char_indices();
+    let mut right_iter = right.char_indices();
+    loop {
+        match (left_iter.next(), right_iter.next()) {
+            (Some((li, lc)), Some((ri, rc))) if lc == rc => {
+                let _ = ri;
+                prefix = li + lc.len_utf8();
+            }
+            _ => break,
+        }
+    }
+    prefix
+}
+
+fn format_transcript_block(label: &str, text: &str, prefix_len: usize, use_ansi: bool) -> String {
+    let prefix_len = prefix_len.min(text.len());
+    let (prefix, suffix) = text.split_at(prefix_len);
+    if use_ansi && !prefix.is_empty() {
+        format!("{label}:\n\x1b[2m{prefix}\x1b[0m{suffix}")
+    } else {
+        format!("{label}:\n{text}")
+    }
+}
+
+fn format_phase1_token_divergence_report(
+    model: &str,
+    reference_json_path: &str,
+    msg: &str,
+    actual_text: Option<&str>,
+) -> Option<String> {
+    if !msg.starts_with("Token divergence at token=") {
+        return None;
+    }
+    let token = parse_u32_after(msg, "token=")?;
+    let reference_tokens = load_reference_tokens(reference_json_path).ok()?;
+    let expected_count = (token as usize).saturating_add(1).min(reference_tokens.len());
+    let expected_text =
+        decode_token_sequence_for_report(model, &reference_tokens[..expected_count])?;
+    let actual_text = actual_text?;
+    let use_ansi = std::env::var_os("TALU_XRAY_VERIFY_TTY").is_some() || std::io::stdout().is_terminal();
+    let prefix_len = common_prefix_len(&expected_text, actual_text);
+    Some(format!(
+        "token={} -> FAILED\n\n{}\n\n{}",
+        display_token_index(token),
+        format_transcript_block("cpu", &expected_text, prefix_len, use_ansi),
+        format_transcript_block("metal", actual_text, prefix_len, use_ansi)
+    ))
+}
+
+struct TokenTranscriptComparison {
+    passed: bool,
+    report: String,
+}
+
+fn format_shared_prefix_block(shared_text: &str, use_ansi: bool) -> String {
+    if use_ansi && !shared_text.is_empty() {
+        format!("shared:\n\x1b[2m{shared_text}\x1b[0m")
+    } else {
+        format!("shared:\n{shared_text}")
+    }
+}
+
+fn compare_full_token_transcripts(
+    model: &str,
+    source_json_path: &Path,
+    target_json_path: &Path,
+    max_tokens: usize,
+) -> Result<TokenTranscriptComparison> {
+    let source_tokens = load_reference_tokens(
+        source_json_path
+            .to_str()
+            .ok_or_else(|| anyhow!("source reference path is not valid UTF-8"))?,
+    )?;
+    let target_tokens = load_reference_tokens(
+        target_json_path
+            .to_str()
+            .ok_or_else(|| anyhow!("target reference path is not valid UTF-8"))?,
+    )?;
+
+    let source_clipped = &source_tokens[..source_tokens.len().min(max_tokens)];
+    let target_clipped = &target_tokens[..target_tokens.len().min(max_tokens)];
+
+    let first_divergence = source_clipped
+        .iter()
+        .zip(target_clipped.iter())
+        .position(|(left, right)| left != right)
+        .or_else(|| {
+            if source_clipped.len() != target_clipped.len() {
+                Some(source_clipped.len().min(target_clipped.len()))
+            } else {
+                None
+            }
+        });
+
+    if first_divergence.is_none() {
+        return Ok(TokenTranscriptComparison {
+            passed: true,
+            report: "token=all -> PASSED\n\nverified full token transcript".to_string(),
+        });
+    }
+
+    let divergence_idx = first_divergence.unwrap();
+    let source_text = load_reference_visible_text(source_json_path).unwrap_or_else(|_| {
+        decode_token_sequence_for_report(model, source_clipped)
+            .unwrap_or_else(|| "<failed to decode cpu transcript>".to_string())
+    });
+    let target_text = load_reference_visible_text(target_json_path).unwrap_or_else(|_| {
+        decode_token_sequence_for_report(model, target_clipped)
+            .unwrap_or_else(|| "<failed to decode metal transcript>".to_string())
+    });
+    let shared_count = divergence_idx.min(source_clipped.len()).min(target_clipped.len());
+    let shared_text = decode_token_sequence_for_report(model, &source_clipped[..shared_count])
+        .unwrap_or_default();
+    let use_ansi =
+        std::env::var_os("TALU_XRAY_VERIFY_TTY").is_some() || std::io::stdout().is_terminal();
+
+    Ok(TokenTranscriptComparison {
+        passed: false,
+        report: format!(
+            "token={} -> FAILED\n\n{}\n\ncpu:\n{}\n\nmetal:\n{}",
+            display_token_index(divergence_idx as u32),
+            format_shared_prefix_block(&shared_text, use_ansi),
+            source_text,
+            target_text,
+        ),
+    })
+}
+
 struct CacheRefreshLock {
     path: PathBuf,
     _file: File,
@@ -114,16 +410,22 @@ struct CacheRefreshLock {
 impl CacheRefreshLock {
     fn acquire(reference_path: &Path) -> Result<Self> {
         let path = reference_lock_path(reference_path);
+        reclaim_orphaned_reference_lock(&path)?;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .map_err(|err| {
                 anyhow!(
-                    "xray CPU reference cache is already being refreshed: {} ({err})",
+                    "xray reference cache is already being refreshed: {} ({err})",
                     path.display()
                 )
             })?;
+        {
+            let mut writer = std::io::BufWriter::new(&file);
+            write!(writer, "{}", std::process::id())?;
+            writer.flush()?;
+        }
         Ok(Self { path, _file: file })
     }
 }
@@ -132,6 +434,62 @@ impl Drop for CacheRefreshLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+fn read_lock_pid(lock_path: &Path) -> Result<Option<u32>> {
+    let Ok(contents) = std::fs::read_to_string(lock_path) else {
+        return Ok(None);
+    };
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let pid = trimmed.parse::<u32>().map_err(|err| {
+        anyhow!(
+            "invalid xray reference cache lock contents in {}: {} ({err})",
+            lock_path.display(),
+            trimmed
+        )
+    })?;
+    Ok(Some(pid))
+}
+
+#[cfg(target_family = "unix")]
+fn process_exists(pid: u32) -> bool {
+    let rc = unsafe { kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code) => code != 3,
+        None => false,
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn process_exists(_pid: u32) -> bool {
+    true
+}
+
+fn reclaim_orphaned_reference_lock(lock_path: &Path) -> Result<()> {
+    if !lock_path.exists() {
+        return Ok(());
+    }
+    let lock_pid = read_lock_pid(lock_path)?;
+    let should_remove = match lock_pid {
+        Some(pid) => !process_exists(pid),
+        None => true,
+    };
+    if should_remove {
+        std::fs::remove_file(lock_path).map_err(|err| {
+            anyhow!(
+                "failed to remove orphaned xray reference cache lock {} ({err})",
+                lock_path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 struct TempReferenceBundle {
@@ -154,13 +512,13 @@ impl TempReferenceBundle {
     fn persist(&mut self, final_reference_path: &Path) -> Result<()> {
         if !self.reference_path.exists() {
             return Err(anyhow!(
-                "CPU reference refresh did not produce JSON cache: {}",
+                "reference refresh did not produce JSON cache: {}",
                 self.reference_path.display()
             ));
         }
         if !self.sidecar_path.exists() {
             return Err(anyhow!(
-                "CPU reference refresh did not produce NPZ sidecar: {}",
+                "reference refresh did not produce NPZ sidecar: {}",
                 self.sidecar_path.display()
             ));
         }
@@ -245,12 +603,12 @@ fn synchronize_backend(backend: &talu::InferenceBackend) -> Result<()> {
 
 fn maybe_hard_exit_after_verify(result: Result<()>) -> Result<()> {
     if should_process_scope_backend_teardown() {
-        let _exit_code = if result.is_ok() { 0 } else { 1 };
+        let exit_code = if result.is_ok() { 0 } else { 1 };
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
         #[cfg(target_os = "macos")]
         unsafe {
-            _exit(_exit_code);
+            _exit(exit_code);
         }
         #[allow(unreachable_code)]
         return result;
@@ -1256,8 +1614,34 @@ fn print_checkpoint_consistency_warnings(point_rows: &[PointUsageRow]) {
     }
 }
 
-/// Recording mode: generate tokens and save reference stats to JSON
-fn cmd_xray_record(model: &str, ref_path: &str, args: &XrayArgs) -> Result<()> {
+fn with_backend_env_override<T>(
+    backend_name: &str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let previous = std::env::var_os("BACKEND");
+    // Backend selection still flows through core's single backend-selection
+    // contract. Override only around backend creation/recording, then restore.
+    unsafe {
+        std::env::set_var("BACKEND", backend_name);
+    }
+    let result = f();
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("BACKEND", value),
+            None => std::env::remove_var("BACKEND"),
+        }
+    }
+    result
+}
+
+/// Internal cache refresh: generate a canonical reference bundle for one backend.
+fn record_reference_bundle(
+    model: &str,
+    ref_path: &str,
+    args: &XrayArgs,
+    reference_backend: &str,
+    capture_mode: ReferenceCaptureMode,
+) -> Result<()> {
     use talu::xray::{ReferenceRecorderHandle, VerifyCaptureHandle};
 
     let prompt_text = if args.prompt.is_empty() {
@@ -1266,66 +1650,57 @@ fn cmd_xray_record(model: &str, ref_path: &str, args: &XrayArgs) -> Result<()> {
         args.prompt.join(" ")
     };
 
-    println!("Recording reference for model: {}", model);
-    println!("  Tokens: {}", args.tokens);
-    println!("  Seed: {}", args.seed);
-    println!("  Prompt: \"{}\"", prompt_text);
+    with_backend_env_override(reference_backend, || {
+        let max_tokens = args.tokens;
+        let resolved_model = resolve_xray_model(model)?;
+        let point_mask_override = match capture_mode {
+            ReferenceCaptureMode::Full => None,
+            ReferenceCaptureMode::TranscriptOnly => Some(point_mask_for_name("token_select")?),
+        };
+        let _override_guard = VerifyOverrideGuard::new(
+            false,
+            false,
+            point_mask_override,
+            None,
+        );
 
-    let max_tokens = args.tokens;
+        let cfg = xray_generate_config(&resolved_model, max_tokens as usize, args.seed)?;
+        let recorder =
+            ReferenceRecorderHandle::new(&resolved_model, args.seed, cfg.temperature, max_tokens)?;
+        let verify_cap = VerifyCaptureHandle::new_recording(&recorder)?;
+        let backend = create_backend_for_model(&resolved_model, None)?;
+        let chat = ChatHandle::new(Some(DEFAULT_SYSTEM_MESSAGE))?;
 
-    // Create reference recorder (use seed from args)
-    let recorder = ReferenceRecorderHandle::new(model, args.seed, 1.0, max_tokens)?;
+        verify_cap.enable();
 
-    // Create verify capture in recording mode
-    let verify_cap = VerifyCaptureHandle::new_recording(&recorder)?;
+        let content = vec![talu::router::ContentPart::Text(prompt_text)];
 
-    // Create backend and chat
-    let backend = create_backend_for_model(model, None)?;
-    let chat = ChatHandle::new(None)?;
+        let result = talu::router::generate(&chat, &content, &backend, &cfg);
 
-    // Enable capture AFTER backend initialization to skip warmup passes
-    verify_cap.enable();
+        VerifyCaptureHandle::disable();
+        synchronize_backend(&backend)?;
 
-    let content = vec![talu::router::ContentPart::Text(prompt_text)];
+        let result = result?;
+        if result.error_code() != 0 {
+            let message =
+                last_error_message().unwrap_or_else(|| "generation failed".to_string());
+            return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
+        }
 
-    let cfg = talu::router::GenerateConfig {
-        temperature: 1.0,
-        max_tokens: max_tokens as usize,
-        seed: args.seed,
-        ..Default::default()
-    };
-
-    let result = talu::router::generate(&chat, &content, &backend, &cfg);
-
-    VerifyCaptureHandle::disable();
-    synchronize_backend(&backend)?;
-
-    let result = result?;
-    if result.error_code() != 0 {
-        let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
-        return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
-    }
-
-    if let Some(_text) = result.text() {
-        println!("\nGenerated {} tokens.", result.completion_tokens());
-    } else {
-        println!("Warning: No text generated, reference will have empty token transcript");
-    }
-
-    // Finalize and save
-    println!("Finalizing reference...");
-    let full_dump_path = format!("{}.layers_full.npz", ref_path);
-    verify_cap.save_full_npz(&full_dump_path)?;
-    let reference = recorder.finalize()?;
-    reference.save(ref_path)?;
-
-    let _ = ref_path;
-    let _ = full_dump_path;
-    println!("✓ Reference cache updated");
-    Ok(())
+        let full_dump_path = format!("{}.layers_full.npz", ref_path);
+        verify_cap.save_full_npz(&full_dump_path)?;
+        let reference = recorder.finalize()?;
+        reference.save(ref_path)?;
+        if let Some(text) = latest_visible_text(&chat, true)? {
+            save_reference_visible_text(Path::new(ref_path), &text)?;
+        }
+        canonicalize_reference_bundle(Path::new(ref_path))?;
+        Ok(())
+    })
 }
 
 fn run_verify_pass_with_backend(
+    model: &str,
     backend: &talu::InferenceBackend,
     prompt_text: &str,
     seed: u64,
@@ -1336,7 +1711,7 @@ fn run_verify_pass_with_backend(
     full_npz_path: Option<&Path>,
     point_mask_override: Option<u64>,
     exact_emission_override: Option<ExactEmissionOverride>,
-) -> Result<(bool, Option<String>)> {
+) -> Result<(bool, Option<String>, Option<String>)> {
     use talu::xray::{ReferenceDataHandle, ReferenceVerifierHandle, VerifyCaptureHandle};
 
     let _override_guard = VerifyOverrideGuard::new(
@@ -1346,16 +1721,12 @@ fn run_verify_pass_with_backend(
         exact_emission_override,
     );
 
-    let cfg = talu::router::GenerateConfig {
-        temperature: 1.0,
-        max_tokens,
-        seed,
-        ..Default::default()
-    };
+    let resolved_model = resolve_xray_model(model)?;
+    let cfg = xray_generate_config(&resolved_model, max_tokens, seed)?;
     let reference = ReferenceDataHandle::load(reference_path)?;
     let verifier = ReferenceVerifierHandle::new(&reference, tolerance)?;
     let verify_cap = VerifyCaptureHandle::new_verification(&verifier, Some("/tmp/panic_dumps"))?;
-    let chat = ChatHandle::new(None)?;
+    let chat = ChatHandle::new(Some(DEFAULT_SYSTEM_MESSAGE))?;
     let content = vec![talu::router::ContentPart::Text(prompt_text.to_string())];
     let active_run_guard = ActiveVerifyRunGuard::activate(teacher_forcing, &verifier, &verify_cap);
 
@@ -1372,10 +1743,11 @@ fn run_verify_pass_with_backend(
             }
         }
 
+        let output_text = result.text();
         let outcome = if result.error_code() != 0 {
             if verifier.has_diverged() {
                 let msg = verifier.finish().err().map(|err| err.to_string());
-                Ok((true, msg))
+                Ok((true, msg, output_text))
             } else {
                 let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
                 Err(anyhow!("Error: {} (code {})", message, result.error_code()))
@@ -1383,7 +1755,7 @@ fn run_verify_pass_with_backend(
         } else if !teacher_forcing {
             if verifier.has_diverged() {
                 let msg = verifier.finish().err().map(|err| err.to_string());
-                Ok((true, msg))
+                Ok((true, msg, output_text))
             } else if verifier.get_next_token().is_some() {
                 Ok((
                     true,
@@ -1391,16 +1763,17 @@ fn run_verify_pass_with_backend(
                         "Token transcript mismatch: generation ended before consuming reference transcript"
                             .to_string(),
                     ),
+                    output_text,
                 ))
             } else {
-                Ok((false, None))
+                Ok((false, None, output_text))
             }
         } else {
             match verifier.finish() {
-                Ok(()) => Ok((verifier.has_diverged(), None)),
+                Ok(()) => Ok((verifier.has_diverged(), None, output_text)),
                 Err(err) => {
                     if verifier.has_diverged() {
-                        Ok((true, Some(err.to_string())))
+                        Ok((true, Some(err.to_string()), output_text))
                     } else {
                         Err(err.into())
                     }
@@ -1436,13 +1809,15 @@ fn run_verify_pass(
     full_npz_path: Option<&Path>,
     point_mask_override: Option<u64>,
     exact_emission_override: Option<ExactEmissionOverride>,
-) -> Result<(bool, Option<String>)> {
+) -> Result<(bool, Option<String>, Option<String>)> {
     // Each verify pass must start from a clean inference backend. Reusing the
     // same backend across free-run and teacher-forced phases leaks backend
     // state between logically independent inferences and can create false
     // phase-2 divergences or crashes.
-    let backend = create_backend_for_model(model, None)?;
+    let resolved_model = resolve_xray_model(model)?;
+    let backend = create_backend_for_model(&resolved_model, None)?;
     let pass_outcome = run_verify_pass_with_backend(
+        &resolved_model,
         &backend,
         prompt_text,
         seed,
@@ -1479,7 +1854,13 @@ fn run_verify_pass(
 /// - Verify is observability-only; it MUST NOT change fusion policy.
 /// - Verify is observability-only; it MUST NOT change kernel selection/arithmetic.
 /// - Teacher forcing may control token progression only; it must not alter math paths.
-fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs) -> Result<()> {
+fn cmd_xray_verify(
+    model: &str,
+    ref_path: &str,
+    tolerance: f32,
+    args: &XrayArgs,
+    backend_pair: &VerifyBackendPair,
+) -> Result<()> {
     let reference_json_path = ref_path.to_string();
     let golden_full_npz = PathBuf::from(format!("{}.layers_full.npz", reference_json_path));
 
@@ -1489,20 +1870,18 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         args.prompt.join(" ")
     };
 
-    println!("Verifying model {} against cached CPU reference", model);
+    println!(
+        "Verifying model {} against cached {} reference",
+        model,
+        backend_pair.source
+    );
     println!("  Tokens: {}", args.tokens);
     println!("  Seed: {}", args.seed);
     println!("  Tolerance: {}", tolerance);
     println!("  Prompt: \"{}\"", prompt_text);
 
     if args.verify_phase1_only {
-        return run_phase1_only_in_current_process(
-            model,
-            &prompt_text,
-            tolerance,
-            &reference_json_path,
-            args,
-        );
+        return run_phase1_only_in_current_process(model, &prompt_text, tolerance, &reference_json_path, args);
     }
 
     if args.verify_phase2_only {
@@ -1510,14 +1889,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             .verify_phase2_max_tokens
             .ok_or_else(|| anyhow!("missing internal --verify-phase2-max-tokens"))?
             as usize;
-        return run_phase2_only_in_current_process(
-            model,
-            &prompt_text,
-            tolerance,
-            &reference_json_path,
-            args,
-            phase2_max_tokens,
-        );
+        return run_phase2_only_in_current_process(model, &prompt_text, tolerance, &reference_json_path, args, phase2_max_tokens);
     }
 
     let checkpoint_target = args
@@ -1542,7 +1914,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
                     .unwrap_or("<parsed checkpoint>"),
                 max_tokens
             );
-            let (diverged, msg) = run_verify_pass(
+            let (diverged, msg, _) = run_verify_pass(
                 model,
                 &prompt_text,
                 args.seed,
@@ -1557,7 +1929,7 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
             if diverged {
                 println!("✗ Verification FAILED");
                 if let Some(msg) = msg {
-                    print_first_divergence_report(&msg);
+                    print_first_divergence_report_for_model(model, &msg);
                 } else {
                     println!("token=?, layer=?, point=? -> FAILED");
                     println!();
@@ -1617,7 +1989,14 @@ fn cmd_xray_verify(model: &str, ref_path: &str, tolerance: f32, args: &XrayArgs)
         return Ok(());
     }
 
-    run_verify_in_current_process(model, &prompt_text, tolerance, &reference_json_path, args)
+    run_verify_in_current_process(
+        model,
+        &prompt_text,
+        tolerance,
+        &reference_json_path,
+        args,
+        backend_pair,
+    )
 }
 
 struct Phase1ProcessResult {
@@ -1636,7 +2015,7 @@ fn run_phase1_only_in_current_process(
     reference_json_path: &str,
     args: &XrayArgs,
 ) -> Result<()> {
-    let (diverged, divergence_msg) = run_verify_pass(
+    let (diverged, divergence_msg, output_text) = run_verify_pass(
         model,
         prompt_text,
         args.seed,
@@ -1651,7 +2030,13 @@ fn run_phase1_only_in_current_process(
 
     if diverged {
         if let Some(msg) = &divergence_msg {
-            print_first_divergence_report(msg);
+            if let Some(report) =
+                format_phase1_token_divergence_report(model, reference_json_path, msg, output_text.as_deref())
+            {
+                println!("{report}");
+            } else {
+                print_first_divergence_report_for_model(model, msg);
+            }
         } else {
             println!("token=?, layer=?, point=? -> FAILED");
             println!();
@@ -1678,13 +2063,15 @@ fn run_phase1_process(
     reference_json_path: &str,
     tolerance: f32,
     args: &XrayArgs,
+    backend_pair: &VerifyBackendPair,
 ) -> Result<Phase1ProcessResult> {
     let mut command = Command::new(exe_path);
-    apply_verify_child_environment(&mut command);
+    apply_verify_child_environment(&mut command, &backend_pair.target);
     command
         .arg("xray")
         .arg(model)
         .arg("--verify")
+        .arg(format!("{}:{}", backend_pair.source, backend_pair.target))
         .arg("--verify-phase1-only")
         .arg("--verify-reference-path")
         .arg(reference_json_path)
@@ -1732,6 +2119,7 @@ fn run_verify_in_current_process(
     tolerance: f32,
     reference_json_path: &str,
     args: &XrayArgs,
+    backend_pair: &VerifyBackendPair,
 ) -> Result<()> {
     println!(
         "Phase 1/2: Free-run token parity ({} tokens, first divergence only)...",
@@ -1746,6 +2134,7 @@ fn run_verify_in_current_process(
         reference_json_path,
         tolerance,
         args,
+        backend_pair,
     )?;
 
     if !phase1.passed {
@@ -1771,6 +2160,7 @@ fn run_verify_in_current_process(
             reference_json_path,
             args,
             phase2_max_tokens,
+            backend_pair,
         );
     }
 
@@ -1806,8 +2196,10 @@ fn run_phase2_only_in_current_process(
         phase2_max_tokens
     );
 
-    let backend = create_backend_for_model(model, None)?;
-    let (diverged, msg) = match run_verify_pass_with_backend(
+    let resolved_model = resolve_xray_model(model)?;
+    let backend = create_backend_for_model(&resolved_model, None)?;
+    let (diverged, msg, _) = match run_verify_pass_with_backend(
+        &resolved_model,
         &backend,
         prompt_text,
         args.seed,
@@ -1843,7 +2235,7 @@ fn run_phase2_only_in_current_process(
 
     if diverged {
         if let Some(msg) = msg {
-            println!("{}", format_first_divergence_report(&msg));
+            println!("{}", format_first_divergence_report(&msg, Some(model)));
         } else {
             println!("token=?, layer=?, point=? -> FAILED");
             println!();
@@ -1873,6 +2265,7 @@ fn run_phase2_localization_with_single_process_child(
     reference_json_path: &str,
     args: &XrayArgs,
     phase2_max_tokens: usize,
+    backend_pair: &VerifyBackendPair,
 ) -> Result<()> {
     println!(
         "Phase 2/2: Teacher-forced numeric localization from token=0 (max_tokens={})...",
@@ -1882,11 +2275,12 @@ fn run_phase2_localization_with_single_process_child(
     let exe_path = std::env::current_exe()
         .map_err(|err| anyhow!("failed to resolve current executable for phase 2: {err}"))?;
     let mut command = Command::new(exe_path);
-    apply_verify_child_environment(&mut command);
+    apply_verify_child_environment(&mut command, &backend_pair.target);
     command
         .arg("xray")
         .arg(model)
         .arg("--verify")
+        .arg(format!("{}:{}", backend_pair.source, backend_pair.target))
         .arg("--verify-phase2-only")
         .arg("--verify-phase2-max-tokens")
         .arg(phase2_max_tokens.to_string())
@@ -1945,15 +2339,73 @@ fn effective_prompt_text(args: &XrayArgs) -> String {
     }
 }
 
-fn reference_cache_key(model: &str, prompt: &str, seed: u64, tokens: u32) -> String {
+fn normalize_backend_name(raw: &str) -> Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "cpu" | "metal" | "cuda" => Ok(normalized),
+        _ => Err(anyhow!(
+            "unsupported verify backend '{}': expected one of cpu, metal, cuda",
+            raw
+        )),
+    }
+}
+
+fn parse_verify_backend_pair(raw: &str) -> Result<VerifyBackendPair> {
+    let mut parts = raw.split(':');
+    let source = parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid backend pair '{}': expected '<source>:<target>'", raw))?;
+    let target = parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid backend pair '{}': expected '<source>:<target>'", raw))?;
+    if parts.next().is_some() {
+        return Err(anyhow!(
+            "invalid backend pair '{}': expected exactly one ':' separator",
+            raw
+        ));
+    }
+    Ok(VerifyBackendPair {
+        source: normalize_backend_name(source)?,
+        target: normalize_backend_name(target)?,
+    })
+}
+
+fn selected_verify_mode_and_pair(args: &XrayArgs) -> Result<Option<(VerifyCliMode, VerifyBackendPair)>> {
+    let mut selected: Option<(VerifyCliMode, &str)> = None;
+    for (mode, raw) in [
+        (VerifyCliMode::Full, args.verify.as_deref()),
+        (VerifyCliMode::Tokens, args.verify_tokens.as_deref()),
+        (VerifyCliMode::Stats, args.verify_stats.as_deref()),
+        (VerifyCliMode::Tensors, args.verify_tensors.as_deref()),
+    ] {
+        if let Some(pair) = raw {
+            if selected.is_some() {
+                return Err(anyhow!(
+                    "xray verify mode is ambiguous: choose exactly one of --verify, --verify-tokens, --verify-stats, or --verify-tensors"
+                ));
+            }
+            selected = Some((mode, pair));
+        }
+    }
+    selected
+        .map(|(mode, raw)| Ok((mode, parse_verify_backend_pair(raw)?)))
+        .transpose()
+}
+
+fn reference_cache_key(
+    model: &str,
+    prompt: &str,
+    seed: u64,
+    tokens: u32,
+    reference_backend: &str,
+) -> String {
     // Cache contract marker:
-    // - ties default verify cache to CPU-recorded references only
-    // - invalidates stale cache bundles created before backend-scoped keys
-    const CACHE_SCHEMA_VERSION: u32 = 3;
-    const REFERENCE_BACKEND: &str = "cpu";
+    // - ties default verify cache to the selected reference-recording backend
+    // - invalidates stale cache bundles when the canonical checkpoint contract changes
+    const CACHE_SCHEMA_VERSION: u32 = 6;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     CACHE_SCHEMA_VERSION.hash(&mut hasher);
-    REFERENCE_BACKEND.hash(&mut hasher);
+    reference_backend.hash(&mut hasher);
     model.hash(&mut hasher);
     prompt.hash(&mut hasher);
     seed.hash(&mut hasher);
@@ -1969,11 +2421,12 @@ fn reference_lock_path(reference_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.lock", reference_path.display()))
 }
 
-fn ensure_reference_cache_unlocked(reference_path: &Path) -> Result<()> {
+fn ensure_reference_cache_unlocked(reference_path: &Path, reference_backend: &str) -> Result<()> {
     let lock_path = reference_lock_path(reference_path);
     if lock_path.exists() {
         return Err(anyhow!(
-            "xray CPU reference cache refresh is in progress: {}",
+            "xray {} reference cache refresh is in progress: {}",
+            reference_backend,
             lock_path.display()
         ));
     }
@@ -2018,25 +2471,52 @@ fn replace_file_atomically(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn refresh_cpu_reference_cache(model: &str, reference_path: &Path, args: &XrayArgs) -> Result<()> {
+fn refresh_reference_cache(
+    model: &str,
+    reference_path: &Path,
+    args: &XrayArgs,
+    reference_backend: &str,
+    capture_mode: ReferenceCaptureMode,
+) -> Result<()> {
     // Refresh must never leave a half-written cache bundle behind. Record into a
     // temp bundle in the same directory, then replace the final bundle only
     // after both JSON and NPZ are present.
     let _lock = CacheRefreshLock::acquire(reference_path)?;
     let mut temp_bundle = TempReferenceBundle::new(reference_path);
 
-    let exe_path = std::env::current_exe().map_err(|err| {
-        anyhow!("failed to resolve current executable for CPU cache refresh: {err}")
-    })?;
+    let exe_path = std::env::current_exe()
+        .map_err(|err| anyhow!("failed to resolve current executable for xray cache refresh: {err}"))?;
+    run_reference_refresh_process(
+        &exe_path,
+        model,
+        temp_bundle.reference_path.as_path(),
+        args,
+        reference_backend,
+        capture_mode,
+    )?;
+    temp_bundle.persist(reference_path)?;
+    Ok(())
+}
 
-    let mut cmd = Command::new(&exe_path);
-    cmd.env("BACKEND", "cpu");
-    cmd.arg("xray")
+fn run_reference_refresh_process(
+    exe_path: &Path,
+    model: &str,
+    reference_path: &Path,
+    args: &XrayArgs,
+    reference_backend: &str,
+    capture_mode: ReferenceCaptureMode,
+) -> Result<()> {
+    let prompt_text = effective_prompt_text(args);
+    let mut command = Command::new(exe_path);
+    command
+        .arg("xray")
         .arg(model)
-        .arg("--record-reference")
+        .arg("--verify-record-reference-only")
+        .arg("--verify-record-backend")
+        .arg(reference_backend)
+        .arg("--verify-reference-path")
         .arg(
-            temp_bundle
-                .reference_path
+            reference_path
                 .to_str()
                 .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
         )
@@ -2044,73 +2524,243 @@ fn refresh_cpu_reference_cache(model: &str, reference_path: &Path, args: &XrayAr
         .arg(args.tokens.to_string())
         .arg("--seed")
         .arg(args.seed.to_string());
-
-    if !args.prompt.is_empty() {
-        for prompt_part in &args.prompt {
-            cmd.arg(prompt_part);
-        }
+    if matches!(capture_mode, ReferenceCaptureMode::TranscriptOnly) {
+        command.arg("--verify-record-transcript-only");
     }
+    command.arg(prompt_text);
 
-    let output = cmd
-        .output()
-        .map_err(|err| anyhow!("failed to spawn CPU reference recorder: {err}"))?;
-    if output.status.success() {
-        temp_bundle.persist(reference_path)?;
+    let (status, stdout, stderr) =
+        run_command_capture_to_temp_files(&mut command, "reference cache refresh child process")?;
+    if status.success() {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(anyhow!(
-        "CPU reference refresh failed (status={}):\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        stdout.trim(),
-        stderr.trim()
-    ))
+    let mut detail = String::new();
+    if !stdout.trim().is_empty() {
+        detail.push_str(stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        if !detail.is_empty() {
+            detail.push('\n');
+        }
+        detail.push_str(stderr.trim());
+    }
+
+    if detail.is_empty() {
+        Err(anyhow!(
+            "reference cache refresh child process failed: {}",
+            status
+        ))
+    } else {
+        Err(anyhow!(
+            "reference cache refresh child process failed: {}\n{}",
+            status,
+            detail
+        ))
+    }
 }
 
-fn default_dev_reference_path(model: &str, args: &XrayArgs) -> Result<PathBuf> {
+fn run_reference_record_only_in_current_process(model: &str, args: &XrayArgs) -> Result<()> {
+    let reference_backend = args
+        .verify_record_backend
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing internal --verify-record-backend"))?;
+    let reference_path = args
+        .verify_reference_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing internal --verify-reference-path"))?;
+    let capture_mode = if args.verify_record_transcript_only {
+        ReferenceCaptureMode::TranscriptOnly
+    } else {
+        ReferenceCaptureMode::Full
+    };
+    record_reference_bundle(model, reference_path, args, reference_backend, capture_mode)
+}
+
+fn default_dev_reference_path(
+    model: &str,
+    args: &XrayArgs,
+    reference_backend: &str,
+    capture_mode: ReferenceCaptureMode,
+) -> Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow!("failed to resolve home directory for xray dev cache path"))?;
     let dir = home.join(".cache").join("talu").join("dev");
     std::fs::create_dir_all(&dir)?;
     let prompt_text = effective_prompt_text(args);
-    let key = reference_cache_key(model, &prompt_text, args.seed, args.tokens);
+    let key = reference_cache_key(
+        model,
+        &prompt_text,
+        args.seed,
+        args.tokens,
+        reference_backend,
+    );
     Ok(dir.join(format!(
-        "xray_{}_{}.json",
+        "xray_{}_{}_{}_{}.json",
+        match capture_mode {
+            ReferenceCaptureMode::Full => "full",
+            ReferenceCaptureMode::TranscriptOnly => "tokens",
+        },
+        reference_backend,
         sanitize_model_for_filename(model),
         key
     )))
 }
 
-fn cmd_xray_verify_default(model: &str, args: &XrayArgs) -> Result<()> {
+fn ensure_reference_bundle(
+    model: &str,
+    args: &XrayArgs,
+    reference_backend: &str,
+    capture_mode: ReferenceCaptureMode,
+) -> Result<PathBuf> {
     let reference_path = if let Some(path) = &args.verify_reference_path {
         PathBuf::from(path)
     } else {
-        default_dev_reference_path(model, args)?
+        default_dev_reference_path(model, args, &reference_backend, capture_mode)?
     };
     let sidecar_path = reference_sidecar_path(&reference_path);
-    println!("Using cache bundle: {}", sidecar_path.display());
-    let refresh_cache = args.no_cache || !reference_path.exists() || !sidecar_path.exists();
+    let visible_text_path = reference_visible_text_path(&reference_path);
+    let refresh_cache =
+        args.no_cache || !reference_path.exists() || !sidecar_path.exists() || !visible_text_path.exists();
     if refresh_cache {
         if args.no_cache {
-            println!("Refreshing CPU reference cache (--no-cache)...");
+            println!(
+                "Refreshing {} reference cache (--no-cache)...",
+                reference_backend
+            );
         } else {
-            println!("CPU reference cache missing, generating it first...");
+            println!(
+                "{} reference cache missing, generating it first...",
+                reference_backend
+            );
         }
-        refresh_cpu_reference_cache(model, &reference_path, args)?;
+        refresh_reference_cache(
+            model,
+            &reference_path,
+            args,
+            &reference_backend,
+            capture_mode,
+        )?;
     } else {
-        ensure_reference_cache_unlocked(&reference_path)?;
+        ensure_reference_cache_unlocked(&reference_path, &reference_backend)?;
+    }
+    Ok(reference_path)
+}
+
+fn cmd_xray_verify_default(
+    model: &str,
+    args: &XrayArgs,
+    mode: VerifyCliMode,
+    backend_pair: &VerifyBackendPair,
+) -> Result<()> {
+    let source_path = ensure_reference_bundle(
+        model,
+        args,
+        &backend_pair.source,
+        match mode {
+            VerifyCliMode::Tokens => ReferenceCaptureMode::TranscriptOnly,
+            VerifyCliMode::Stats | VerifyCliMode::Full | VerifyCliMode::Tensors => {
+                ReferenceCaptureMode::Full
+            }
+        },
+    )?;
+    println!("Using cache bundle: {}", reference_sidecar_path(&source_path).display());
+
+    if matches!(mode, VerifyCliMode::Full | VerifyCliMode::Tensors)
+        && backend_pair.target != backend_pair.source
+        && !args.verify_phase1_only
+        && !args.verify_phase2_only
+        && args.verify_reference_path.is_none()
+    {
+        let target_path = ensure_reference_bundle(
+            model,
+            args,
+            &backend_pair.target,
+            ReferenceCaptureMode::Full,
+        )?;
+        println!(
+            "Using target cache bundle: {}",
+            reference_sidecar_path(&target_path).display()
+        );
     }
 
-    cmd_xray_verify(
-        model,
-        reference_path
-            .to_str()
-            .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
-        args.tolerance,
-        args,
-    )
+    match mode {
+        VerifyCliMode::Full => cmd_xray_verify(
+            model,
+            source_path
+                .to_str()
+                .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
+            args.tolerance,
+            args,
+            backend_pair,
+        ),
+        VerifyCliMode::Tokens => {
+            let prompt_text = effective_prompt_text(args);
+            println!(
+                "Verifying model {} token parity ({} -> {})",
+                model, backend_pair.source, backend_pair.target
+            );
+            println!("  Tokens: {}", args.tokens);
+            println!("  Seed: {}", args.seed);
+            println!("  Tolerance: {}", args.tolerance);
+            println!("  Prompt: \"{}\"", prompt_text);
+            let target_path = ensure_reference_bundle(
+                model,
+                args,
+                &backend_pair.target,
+                ReferenceCaptureMode::TranscriptOnly,
+            )?;
+            println!(
+                "Using target cache bundle: {}",
+                reference_sidecar_path(&target_path).display()
+            );
+            let result = compare_full_token_transcripts(
+                model,
+                &source_path,
+                &target_path,
+                args.tokens as usize,
+            )?;
+            if result.passed {
+                println!("{}", result.report);
+                Ok(())
+            } else {
+                println!("✗ Verification FAILED");
+                println!("{}", result.report);
+                Err(anyhow!("Verification failed: token divergence detected"))
+            }
+        }
+        VerifyCliMode::Stats => {
+            let prompt_text = effective_prompt_text(args);
+            println!(
+                "Verifying model {} stats parity ({} -> {})",
+                model, backend_pair.source, backend_pair.target
+            );
+            println!("  Tokens: {}", args.tokens);
+            println!("  Seed: {}", args.seed);
+            println!("  Tolerance: {}", args.tolerance);
+            println!("  Prompt: \"{}\"", prompt_text);
+            run_phase2_localization_with_single_process_child(
+                model,
+                &prompt_text,
+                args.tolerance,
+                source_path
+                    .to_str()
+                    .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
+                args,
+                (args.tokens as usize).max(1),
+                backend_pair,
+            )
+        }
+        VerifyCliMode::Tensors => {
+            let target_path = default_dev_reference_path(
+                model,
+                args,
+                &backend_pair.target,
+                ReferenceCaptureMode::Full,
+            )?;
+            run_tensor_bundle_diff(model, args, backend_pair, &source_path, &target_path)
+        }
+    }
 }
 
 fn parse_u32_after(msg: &str, marker: &str) -> Option<u32> {
@@ -2392,8 +3042,160 @@ fn is_default_phase2_point_name(point: &str) -> bool {
     // core/src/xray/verify.zig:VerifyCapture.defaultVerificationPointSet().
     matches!(
         point,
-        "layer_attn_norm" | "block.out" | "lm_head" | "logits_ready" | "token_select" | "gdelta.out"
+        "embed_tokens"
+            | "layer_input"
+            | "layer_attn_norm"
+            | "gdelta.in_proj"
+            | "gdelta.conv"
+            | "gdelta.ssm"
+            | "gdelta.norm"
+            | "gdelta.out"
+            | "block.out"
+            | "lm_head"
+            | "token_select"
     )
+}
+
+fn canonical_reference_point_name(point: &str) -> bool {
+    is_default_phase2_point_name(point)
+}
+
+fn canonical_reference_record(record: &serde_json::Value) -> bool {
+    let Some(point) = record.get("point").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if !canonical_reference_point_name(point) {
+        return false;
+    }
+    // Contract rule:
+    // `embed_tokens` is the prefill embedding boundary only. Decode-step token
+    // gathers are backend-internal and must not enter the canonical verify
+    // bundle, otherwise backends with different decode orchestration will
+    // appear structurally different before any real math divergence.
+    if point == "embed_tokens" {
+        return record
+            .get("token_idx")
+            .and_then(|v| v.as_u64())
+            .map(|token_idx| token_idx == 0)
+            .unwrap_or(false);
+    }
+    true
+}
+
+fn rewrite_reference_json_to_canonical(reference_path: &Path) -> Result<()> {
+    let file = File::open(reference_path)?;
+    let mut value: serde_json::Value = serde_json::from_reader(file)?;
+    let stats = value["stats"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("reference json missing stats array: {}", reference_path.display()))?;
+
+    let mut filtered = Vec::with_capacity(stats.len());
+    for record in stats.iter() {
+        if !canonical_reference_record(record) {
+            continue;
+        }
+        filtered.push(record.clone());
+    }
+    *stats = filtered;
+
+    let pid = std::process::id();
+    let temp_path = temp_reference_path(reference_path, pid);
+    serde_json::to_writer(File::create(&temp_path)?, &value)?;
+    replace_file_atomically(&temp_path, reference_path)?;
+    Ok(())
+}
+
+fn checkpoint_key_from_reference_record(record: &serde_json::Value) -> Result<String> {
+    let token_idx = record
+        .get("token_idx")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("reference json record missing token_idx"))? as u32;
+    let layer = record
+        .get("layer")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("reference json record missing layer"))? as u16;
+    let position = record
+        .get("position")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("reference json record missing position"))? as u32;
+    let point = record
+        .get("point")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("reference json record missing point"))?;
+    let scope = if layer == u16::MAX {
+        "global_0".to_string()
+    } else {
+        format!("layer_{}", layer)
+    };
+    Ok(format!("tok{}_pos{}_{}_{}", token_idx, position, scope, point))
+}
+
+fn load_reference_checkpoint_order(reference_path: &Path) -> Result<Vec<String>> {
+    let file = File::open(reference_path)?;
+    let value: serde_json::Value = serde_json::from_reader(file)?;
+    let stats = value["stats"]
+        .as_array()
+        .ok_or_else(|| anyhow!("reference json missing stats array: {}", reference_path.display()))?;
+    let mut keys = Vec::with_capacity(stats.len());
+    for record in stats {
+        keys.push(checkpoint_key_from_reference_record(record)?);
+    }
+    Ok(keys)
+}
+
+fn rewrite_reference_npz_to_canonical(reference_path: &Path) -> Result<()> {
+    let sidecar_path = reference_sidecar_path(reference_path);
+    let file = File::open(&sidecar_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let checkpoint_order = load_reference_checkpoint_order(reference_path)?;
+    let mut entries: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+
+    for idx in 0..archive.len() {
+        let mut entry = archive.by_index(idx)?;
+        let original_name = entry.name().to_string();
+        if !original_name.ends_with(".npy") {
+            continue;
+        }
+        let parsed = match parse_checkpoint_key(&original_name) {
+            Some(parsed) if canonical_reference_point_name(&parsed.point) => parsed,
+            _ => continue,
+        };
+        if parsed.point == "embed_tokens" && parsed.token != 0 {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        entries.insert(parsed.key, bytes);
+    }
+
+    let pid = std::process::id();
+    let temp_path = temp_reference_path(&sidecar_path, pid);
+    {
+        let temp_file = File::create(&temp_path)?;
+        let mut writer = zip::ZipWriter::new(temp_file);
+        let options = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(
+                zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
+                    .expect("static zip timestamp must be valid"),
+            );
+        for (idx, key) in checkpoint_order.into_iter().enumerate() {
+            let bytes = entries
+                .get(&key)
+                .ok_or_else(|| anyhow!("reference npz missing canonical checkpoint {}", key))?;
+            writer.start_file(format!("{}_{}.npy", idx, key), options)?;
+            writer.write_all(bytes)?;
+        }
+        writer.finish()?;
+    }
+    replace_file_atomically(&temp_path, &sidecar_path)?;
+    Ok(())
+}
+
+fn canonicalize_reference_bundle(reference_path: &Path) -> Result<()> {
+    rewrite_reference_json_to_canonical(reference_path)?;
+    rewrite_reference_npz_to_canonical(reference_path)?;
+    Ok(())
 }
 
 fn reference_record_matches_target(
@@ -2573,7 +3375,7 @@ fn run_targeted_checkpoint_compare(
 
     if !golden_full_npz.exists() {
         return Err(anyhow!(
-            "golden full sidecar missing: {}. Re-record CPU reference first",
+            "golden full sidecar missing: {}. Re-record the source reference first",
             golden_full_npz.display()
         ));
     }
@@ -2720,9 +3522,10 @@ fn run_command_capture_to_temp_files(
     Ok((status, stdout, stderr))
 }
 
-fn apply_verify_child_environment(command: &mut Command) {
-    if let Ok(backend) = std::env::var("BACKEND") {
-        command.env("BACKEND", backend);
+fn apply_verify_child_environment(command: &mut Command, target_backend: &str) {
+    command.env("BACKEND", target_backend);
+    if std::io::stdout().is_terminal() {
+        command.env("TALU_XRAY_VERIFY_TTY", "1");
     }
 }
 
@@ -2740,7 +3543,7 @@ fn print_targeted_checkpoint_report(
 
     println!(
         "token={}, layer={}, point={}, pos={} -> {}",
-        result.selected.token,
+        display_token_index(result.selected.token),
         layer_label,
         result.selected.point,
         result.selected.position,
@@ -2769,7 +3572,7 @@ fn print_targeted_checkpoint_report(
     }
 }
 
-fn format_first_divergence_report(msg: &str) -> String {
+fn format_first_divergence_report(msg: &str, model: Option<&str>) -> String {
     if msg.starts_with("Stats divergence at token=") {
         let token = parse_u32_after(msg, "token=");
         let layer = parse_u32_after(msg, "layer=");
@@ -2780,7 +3583,7 @@ fn format_first_divergence_report(msg: &str) -> String {
         let mut lines = vec![format!(
             "token={}, layer={}, point={}, pos={} -> FAILED",
             token
-                .map(|value| value.to_string())
+                .map(|value| display_token_index(value).to_string())
                 .unwrap_or_else(|| "?".to_string()),
             layer
                 .map(|value| value.to_string())
@@ -2818,25 +3621,30 @@ fn format_first_divergence_report(msg: &str) -> String {
         let token = parse_u32_after(msg, "token=");
         let expected = parse_u32_after(msg, "expected=");
         let actual = parse_u32_after(msg, "actual=");
-        let mut lines = vec![format!(
-            "token={}, layer=global, point=token_select -> FAILED",
-            token
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "?".to_string())
-        )];
-        lines.push(String::new());
-        lines.push("details:".to_string());
-        lines.push("  kind=token".to_string());
-        if let Some(token) = token {
-            lines.push(format!("  token={}", token));
-        }
-        if let Some(expected) = expected {
-            lines.push(format!("  expected_token={}", expected));
-        }
-        if let Some(actual) = actual {
-            lines.push(format!("  actual_token={}", actual));
-        }
-        return lines.join("\n");
+        let expected_text =
+            expected.and_then(|token_id| model.and_then(|m| format_token_text_for_report(m, token_id)));
+        let actual_text =
+            actual.and_then(|token_id| model.and_then(|m| format_token_text_for_report(m, token_id)));
+        let token_display = token
+            .map(display_token_index)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let expected_label = match (expected, expected_text.as_deref()) {
+            (Some(id), Some(text)) => format!("{text} [{id}]"),
+            (Some(id), None) => format!("[{id}]"),
+            (None, Some(text)) => text.to_string(),
+            (None, None) => "?".to_string(),
+        };
+        let actual_label = match (actual, actual_text.as_deref()) {
+            (Some(id), Some(text)) => format!("{text} [{id}]"),
+            (Some(id), None) => format!("[{id}]"),
+            (None, Some(text)) => text.to_string(),
+            (None, None) => "?".to_string(),
+        };
+        return format!(
+            "token={}, layer=global, point=token_select -> FAILED\nexpected {} but got {}",
+            token_display, expected_label, actual_label
+        );
     }
 
     if msg.starts_with("Missing expected stats for token=") {
@@ -2847,7 +3655,7 @@ fn format_first_divergence_report(msg: &str) -> String {
         let mut lines = vec![format!(
             "token={}, layer={}, point={}, pos={} -> FAILED",
             token
-                .map(|value| value.to_string())
+                .map(|value| display_token_index(value).to_string())
                 .unwrap_or_else(|| "?".to_string()),
             layer
                 .map(|value| value.to_string())
@@ -2861,7 +3669,7 @@ fn format_first_divergence_report(msg: &str) -> String {
         lines.push("details:".to_string());
         lines.push("  kind=coverage".to_string());
         if let Some(token) = token {
-            lines.push(format!("  token={}", token));
+            lines.push(format!("  token={}", display_token_index(token)));
         }
         if let Some(layer) = layer {
             lines.push(format!("  layer={}", layer));
@@ -2879,12 +3687,11 @@ fn format_first_divergence_report(msg: &str) -> String {
     format!("token=?, layer=?, point=? -> FAILED\n\ndetails:\n  detail={}", msg)
 }
 
-fn print_first_divergence_report(msg: &str) {
-    println!("{}", format_first_divergence_report(msg));
+fn print_first_divergence_report_for_model(model: &str, msg: &str) {
+    println!("{}", format_first_divergence_report(msg, Some(model)));
 }
 
 #[derive(Debug, Clone)]
-#[cfg(test)]
 enum FirstCheckpointDiffKind {
     Missing,
     LengthMismatch,
@@ -2892,10 +3699,33 @@ enum FirstCheckpointDiffKind {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(test)]
 struct FirstCheckpointDiff {
     parsed: ParsedCheckpointKey,
     kind: FirstCheckpointDiffKind,
+}
+
+#[derive(Debug, Clone)]
+struct TensorCheckpointFailure {
+    idx: usize,
+    diff: FirstCheckpointDiff,
+}
+
+fn failures_for_first_logical_token(
+    failures: &[TensorCheckpointFailure],
+    prefill_boundary: usize,
+) -> Vec<TensorCheckpointFailure> {
+    let Some(first) = failures.first() else {
+        return Vec::new();
+    };
+    let target_token = display_tensor_contract_token(first.idx, &first.diff.parsed, prefill_boundary);
+    failures
+        .iter()
+        .filter(|failure| {
+            display_tensor_contract_token(failure.idx, &failure.diff.parsed, prefill_boundary)
+                == target_token
+        })
+        .cloned()
+        .collect()
 }
 
 fn normalize_npz_entry_key(name: &str) -> String {
@@ -2965,6 +3795,24 @@ fn load_npz_f32(path: &Path) -> Result<BTreeMap<String, Vec<f32>>> {
     Ok(tensors)
 }
 
+fn load_npz_raw(path: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    let file = File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut tensors: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for idx in 0..archive.len() {
+        let mut entry = archive.by_index(idx)?;
+        let name = entry.name().to_string();
+        if !name.ends_with(".npy") {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        let key = normalize_npz_entry_key(&name);
+        tensors.insert(key, bytes);
+    }
+    Ok(tensors)
+}
+
 fn rel_rms_and_max_abs(expected: &[f32], actual: &[f32]) -> (f64, f32) {
     let count = expected.len().min(actual.len());
     if count == 0 {
@@ -3014,7 +3862,7 @@ fn rms(values: &[f32]) -> f64 {
     (sum_sq / values.len() as f64).sqrt()
 }
 
-#[cfg(test)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn find_first_checkpoint_diff(
     expected: &BTreeMap<String, Vec<f32>>,
     actual: &BTreeMap<String, Vec<f32>>,
@@ -3081,6 +3929,182 @@ fn find_first_checkpoint_diff(
     None
 }
 
+fn file_fingerprint(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn run_tensor_bundle_diff(
+    model: &str,
+    args: &XrayArgs,
+    backend_pair: &VerifyBackendPair,
+    source_path: &Path,
+    target_path: &Path,
+) -> Result<()> {
+    let source_sidecar = reference_sidecar_path(source_path);
+    let target_sidecar = reference_sidecar_path(target_path);
+    println!(
+        "Comparing canonical tensor bundles for {} ({} -> {})",
+        model, backend_pair.source, backend_pair.target
+    );
+    println!("  Tokens: {}", args.tokens);
+    println!("  Seed: {}", args.seed);
+    println!("  Tolerance: {}", args.tolerance);
+    println!("  Prompt: \"{}\"", effective_prompt_text(args));
+    println!("  Source: {}", source_sidecar.display());
+    println!("  Target: {}", target_sidecar.display());
+
+    let source_raw = load_npz_raw(&source_sidecar)?;
+    let target_raw = load_npz_raw(&target_sidecar)?;
+    let ordered = load_reference_checkpoint_order(source_path)?;
+    let source_hash = file_fingerprint(&source_sidecar)?;
+    let target_hash = file_fingerprint(&target_sidecar)?;
+
+    if source_hash == target_hash {
+        println!("phase=prefill, status=PASSED");
+        println!("token=all, layer=all, point=all, pos=all, status=PASSED");
+        return Ok(());
+    }
+
+    let ordered: Vec<ParsedCheckpointKey> = ordered
+        .iter()
+        .filter_map(|key| parse_checkpoint_key(key))
+        .collect();
+    let prefill_boundary = ordered
+        .iter()
+        .position(|parsed| parsed.point == "token_select")
+        .unwrap_or(ordered.len());
+    let mut failures: Vec<TensorCheckpointFailure> = Vec::new();
+    for (idx, parsed) in ordered.iter().cloned().enumerate() {
+        let diff = match (source_raw.get(&parsed.key), target_raw.get(&parsed.key)) {
+            (Some(expected), Some(actual)) if expected == actual => None,
+            (Some(expected), Some(actual)) if expected.len() != actual.len() => {
+                Some(FirstCheckpointDiff {
+                    parsed,
+                    kind: FirstCheckpointDiffKind::LengthMismatch,
+                })
+            }
+            (Some(expected), Some(actual)) => {
+                let expected_vals = parse_npy_f32(expected)?;
+                let actual_vals = parse_npy_f32(actual)?;
+                let expected_rms = rms(&expected_vals);
+                let actual_rms = rms(&actual_vals);
+                let abs_rms_diff = (actual_rms - expected_rms).abs();
+                let (rel_rms, _) = rel_rms_and_max_abs(&expected_vals, &actual_vals);
+                if exceeds_numeric_tolerance(rel_rms, abs_rms_diff, args.tolerance) {
+                    Some(FirstCheckpointDiff {
+                        parsed,
+                        kind: FirstCheckpointDiffKind::Numeric,
+                    })
+                } else {
+                    None
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                Some(FirstCheckpointDiff {
+                    parsed,
+                    kind: FirstCheckpointDiffKind::Missing,
+                })
+            }
+            (None, None) => None,
+        };
+        if let Some(diff) = diff {
+            failures.push(TensorCheckpointFailure { idx, diff });
+        }
+    }
+    let Some(first_failure) = failures.first().cloned() else {
+        println!("phase=prefill, status=PASSED");
+        println!("token=all, layer=all, point=all, pos=all, status=PASSED");
+        println!(
+            "detail=tensor bundles differ by raw bytes but all checkpoints matched within tolerance"
+        );
+        return Ok(());
+    };
+    let diff_idx = first_failure.idx;
+    let same_token_failures = failures_for_first_logical_token(&failures, prefill_boundary);
+    println!("✗ Verification FAILED");
+    if diff_idx == 0 {
+        println!(
+            "token=0, layer=0, point=None, pos=0, status=UNKNOWN, detail=NO EARLIER CHECKPOINT FOUND"
+        );
+    } else {
+        let prev = &ordered[diff_idx - 1];
+        let prev_layer_label = if prev.scope == "global" {
+            "global".to_string()
+        } else {
+            prev.layer_index.to_string()
+        };
+        let prev_expected_raw = source_raw
+            .get(&prev.key)
+            .ok_or_else(|| anyhow!("source tensor missing for previous key {}", prev.key))?;
+        let prev_actual_raw = target_raw
+            .get(&prev.key)
+            .ok_or_else(|| anyhow!("target tensor missing for previous key {}", prev.key))?;
+        let prev_expected = parse_npy_f32(prev_expected_raw)?;
+        let prev_actual = parse_npy_f32(prev_actual_raw)?;
+        let prev_expected_rms = rms(&prev_expected);
+        let prev_actual_rms = rms(&prev_actual);
+        let prev_abs_rms_diff = (prev_actual_rms - prev_expected_rms).abs();
+        let (prev_rel_rms, prev_max_abs) = rel_rms_and_max_abs(&prev_expected, &prev_actual);
+        println!(
+            "token={}, layer={}, point={}, pos={}, status=PASSED, metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+            display_tensor_contract_token(diff_idx - 1, prev, prefill_boundary),
+            prev_layer_label,
+            prev.point,
+            prev.position,
+            prev_expected_rms,
+            prev_actual_rms,
+            prev_abs_rms_diff,
+            prev_rel_rms,
+            prev_max_abs
+        );
+    }
+    let mut error_details: Vec<String> = Vec::new();
+    for failure in &same_token_failures {
+        let layer_label = if failure.diff.parsed.scope == "global" {
+            "global".to_string()
+        } else {
+            failure.diff.parsed.layer_index.to_string()
+        };
+        let detail = match failure.diff.kind {
+            FirstCheckpointDiffKind::Missing =>
+                "detail=checkpoint missing from target bundle".to_string(),
+            FirstCheckpointDiffKind::LengthMismatch =>
+                "detail=checkpoint tensor length mismatch".to_string(),
+            FirstCheckpointDiffKind::Numeric => {
+                let expected_raw = source_raw
+                    .get(&failure.diff.parsed.key)
+                    .ok_or_else(|| anyhow!("source tensor missing for diff key {}", failure.diff.parsed.key))?;
+                let actual_raw = target_raw
+                    .get(&failure.diff.parsed.key)
+                    .ok_or_else(|| anyhow!("target tensor missing for diff key {}", failure.diff.parsed.key))?;
+                let expected = parse_npy_f32(expected_raw)?;
+                let actual = parse_npy_f32(actual_raw)?;
+                let expected_rms = rms(&expected);
+                let actual_rms = rms(&actual);
+                let abs_rms_diff = (actual_rms - expected_rms).abs();
+                let (rel_rms, max_abs) = rel_rms_and_max_abs(&expected, &actual);
+                format!(
+                    "metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                    expected_rms, actual_rms, abs_rms_diff, rel_rms, max_abs
+                )
+            }
+        };
+        println!(
+            "token={}, layer={}, point={}, pos={}, status=FAILED, {}",
+            display_tensor_contract_token(failure.idx, &failure.diff.parsed, prefill_boundary),
+            layer_label,
+            failure.diff.parsed.point,
+            failure.diff.parsed.position,
+            detail
+        );
+        error_details.push(detail);
+    }
+    Err(anyhow!(error_details.join("\n")))
+}
+
 fn print_targeted_checkpoint_hint(model: &str, prompt_text: &str, parsed: &ParsedCheckpointKey) {
     let layer_arg = if parsed.scope == "global" {
         "global".to_string()
@@ -3100,16 +4124,25 @@ fn print_targeted_checkpoint_hint(model: &str, prompt_text: &str, parsed: &Parse
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_reference_cache_unlocked, find_first_checkpoint_diff, normalize_npz_entry_key,
-        parse_checkpoint_key, parse_npy_f32, parse_verify_checkpoint_target, reference_cache_key,
-        reference_lock_path, reference_sidecar_path, replace_file_atomically,
+        compare_full_token_transcripts,
+        canonicalize_reference_bundle, ensure_reference_cache_unlocked,
+        default_dev_reference_path,
+        failures_for_first_logical_token,
+        find_first_checkpoint_diff, normalize_npz_entry_key,
+        format_first_divergence_report,
+        parse_checkpoint_key, parse_npy_f32, parse_verify_backend_pair,
+        parse_verify_checkpoint_target, reference_cache_key,
+        reclaim_orphaned_reference_lock, reference_lock_path, reference_sidecar_path, replace_file_atomically,
         select_checkpoint_key, temp_reference_path, write_filtered_reference_json,
         write_phase2_reference_json,
-        FirstCheckpointDiffKind, VerifyCheckpointTarget, VerifyLayerTarget,
+        FirstCheckpointDiff, FirstCheckpointDiffKind, ParsedCheckpointKey, TensorCheckpointFailure,
+        ReferenceCaptureMode, VerifyBackendPair, VerifyCheckpointTarget, VerifyLayerTarget,
     };
+    use crate::cli::XrayArgs;
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::Path;
+    use zip::write::SimpleFileOptions;
 
     #[test]
     fn normalize_npz_entry_key_strips_index_prefix() {
@@ -3165,6 +4198,27 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn parse_verify_backend_pair_accepts_supported_backends() {
+        assert_eq!(
+            parse_verify_backend_pair("cpu:metal").expect("pair should parse"),
+            VerifyBackendPair {
+                source: "cpu".to_string(),
+                target: "metal".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_verify_backend_pair_rejects_invalid_shape() {
+        assert!(parse_verify_backend_pair("cpu").is_err());
+        assert!(parse_verify_backend_pair("cpu:metal:cuda").is_err());
+        assert!(parse_verify_backend_pair("cpu:auto").is_err());
+    }
+
+    // Note: Generation config policy tests were removed because policy is now
+    // core-owned. See core/src/capi/session.zig for the policy tests.
 
     #[test]
     fn write_filtered_reference_json_keeps_only_exact_target_checkpoint() {
@@ -3251,6 +4305,20 @@ mod tests {
                 "stats": [
                     {
                         "token_idx": 0,
+                        "layer": 65535,
+                        "point": "embed_tokens",
+                        "position": 16,
+                        "stats": { "count": 4, "min": 0.25, "max": 1.25, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
+                        "layer": 0,
+                        "point": "layer_input",
+                        "position": 16,
+                        "stats": { "count": 4, "min": 0.0, "max": 1.0, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
                         "layer": 0,
                         "point": "layer_attn_norm",
                         "position": 16,
@@ -3302,15 +4370,163 @@ mod tests {
         let stats = filtered_json["stats"]
             .as_array()
             .expect("filtered stats should be array");
-        assert_eq!(stats.len(), 2);
-        assert_eq!(stats[0]["point"].as_str(), Some("layer_attn_norm"));
-        assert_eq!(stats[1]["point"].as_str(), Some("gdelta.out"));
-        assert_eq!(stats[1]["token_idx"].as_u64(), Some(1));
+        assert_eq!(stats.len(), 4);
+        assert_eq!(stats[0]["point"].as_str(), Some("embed_tokens"));
+        assert_eq!(stats[1]["point"].as_str(), Some("layer_input"));
+        assert_eq!(stats[2]["point"].as_str(), Some("layer_attn_norm"));
+        assert_eq!(stats[3]["point"].as_str(), Some("gdelta.out"));
+        assert_eq!(stats[3]["token_idx"].as_u64(), Some(1));
         assert_eq!(
             filtered_json["tokens"].as_array().expect("tokens array").len(),
             2
         );
         assert_eq!(filtered_json["metadata"]["max_tokens"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn canonicalize_reference_bundle_filters_and_renumbers_json_and_npz() {
+        fn npy_bytes(values: &[f32]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"\x93NUMPY");
+            bytes.push(1);
+            bytes.push(0);
+            let header =
+                format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({},), }}", values.len());
+            let mut header_bytes = header.into_bytes();
+            let preamble_len = 10usize;
+            while (preamble_len + header_bytes.len() + 1) % 16 != 0 {
+                header_bytes.push(b' ');
+            }
+            header_bytes.push(b'\n');
+            let header_len = header_bytes.len() as u16;
+            bytes.extend_from_slice(&header_len.to_le_bytes());
+            bytes.extend_from_slice(&header_bytes);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let reference_path = dir.path().join("reference.json");
+        std::fs::write(
+            &reference_path,
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {
+                    "model_name": "test",
+                    "seed": 42,
+                    "temperature": 1.0,
+                    "max_tokens": 1
+                },
+                "tokens": [11],
+                "stats": [
+                    {
+                        "token_idx": 0,
+                        "layer": 65535,
+                        "point": "logits_ready",
+                        "position": 16,
+                        "stats": { "count": 1, "min": 0.0, "max": 0.0, "sum": 0.0, "sum_sq": 0.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
+                        "layer": 65535,
+                        "point": "embed_tokens",
+                        "position": 16,
+                        "stats": { "count": 1, "min": 0.25, "max": 0.25, "sum": 0.25, "sum_sq": 0.0625, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 1,
+                        "layer": 65535,
+                        "point": "embed_tokens",
+                        "position": 1,
+                        "stats": { "count": 1, "min": 0.75, "max": 0.75, "sum": 0.75, "sum_sq": 0.5625, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
+                        "layer": 0,
+                        "point": "layer_input",
+                        "position": 16,
+                        "stats": { "count": 1, "min": 0.5, "max": 0.5, "sum": 0.5, "sum_sq": 0.25, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
+                        "layer": 0,
+                        "point": "layer_attn_norm",
+                        "position": 16,
+                        "stats": { "count": 1, "min": 1.0, "max": 1.0, "sum": 1.0, "sum_sq": 1.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
+                        "layer": 65535,
+                        "point": "token_select",
+                        "position": 0,
+                        "stats": { "count": 1, "min": 2.0, "max": 2.0, "sum": 2.0, "sum_sq": 4.0, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
+                        "layer": 0,
+                        "point": "ffn.act",
+                        "position": 16,
+                        "stats": { "count": 1, "min": 3.0, "max": 3.0, "sum": 3.0, "sum_sq": 9.0, "nan_count": 0, "inf_count": 0 }
+                    }
+                ]
+            }))
+            .expect("json bytes"),
+        )
+        .expect("write json");
+
+        let npz_path = reference_sidecar_path(&reference_path);
+        {
+            let file = std::fs::File::create(&npz_path).expect("create npz");
+            let mut zip = zip::ZipWriter::new(file);
+            let options = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .last_modified_time(
+                    zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
+                        .expect("valid timestamp"),
+                );
+            for (name, values) in [
+                ("9_tok0_pos16_global_0_logits_ready.npy", vec![9.0f32]),
+                ("0_tok0_pos16_global_0_embed_tokens.npy", vec![0.25f32]),
+                ("8_tok1_pos1_global_0_embed_tokens.npy", vec![0.75f32]),
+                ("3_tok0_pos0_global_0_token_select.npy", vec![2.0f32]),
+                ("1_tok0_pos16_layer_0_layer_attn_norm.npy", vec![1.0f32]),
+                ("2_tok0_pos16_layer_0_layer_input.npy", vec![0.5f32]),
+                ("7_tok0_pos16_layer_0_ffn.act.npy", vec![7.0f32]),
+            ] {
+                zip.start_file(name, options).expect("start file");
+                zip.write_all(&npy_bytes(&values)).expect("write npy");
+            }
+            zip.finish().expect("finish npz");
+        }
+
+        canonicalize_reference_bundle(&reference_path).expect("canonicalize bundle");
+
+        let rewritten_json: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&reference_path).expect("open json"))
+                .expect("parse json");
+        let stats = rewritten_json["stats"].as_array().expect("stats array");
+        assert_eq!(stats.len(), 4);
+        assert_eq!(stats[0]["point"].as_str(), Some("embed_tokens"));
+        assert_eq!(stats[1]["point"].as_str(), Some("layer_input"));
+        assert_eq!(stats[2]["point"].as_str(), Some("layer_attn_norm"));
+        assert_eq!(stats[3]["point"].as_str(), Some("token_select"));
+
+        let file = std::fs::File::open(&npz_path).expect("open npz");
+        let mut archive = zip::ZipArchive::new(file).expect("zip archive");
+        let mut names = Vec::new();
+        for idx in 0..archive.len() {
+            names.push(archive.by_index(idx).expect("zip entry").name().to_string());
+        }
+        assert_eq!(
+            names,
+            vec![
+                "0_tok0_pos16_global_0_embed_tokens.npy".to_string(),
+                "1_tok0_pos16_layer_0_layer_input.npy".to_string(),
+                "2_tok0_pos16_layer_0_layer_attn_norm.npy".to_string(),
+                "3_tok0_pos0_global_0_token_select.npy".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3399,17 +4615,142 @@ mod tests {
     }
 
     #[test]
+    fn find_first_checkpoint_diff_ignores_numeric_drift_within_tolerance() {
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "tok0_pos0_layer_0_gdelta.in_proj".to_string(),
+            vec![1.0f32, 0.0f32, 7.246_089e-36f32],
+        );
+
+        let mut actual = BTreeMap::new();
+        actual.insert(
+            "tok0_pos0_layer_0_gdelta.in_proj".to_string(),
+            vec![1.0f32, 0.0f32, 7.241_444e-36f32],
+        );
+
+        let diff = find_first_checkpoint_diff(&expected, &actual, 1e-3);
+        assert!(diff.is_none(), "sub-measurable numeric drift should pass");
+    }
+
+    #[test]
+    fn format_first_divergence_report_uses_consistent_display_token_index() {
+        let report = format_first_divergence_report(
+            "Token divergence at token=0: expected=20740 actual=28180",
+            None,
+        );
+        assert!(report.contains("token=1, layer=global, point=token_select -> FAILED"));
+        assert!(report.contains("expected [20740] but got [28180]"));
+        assert!(!report.contains("token=0, layer=global"));
+    }
+
+    #[test]
+    fn failures_for_first_logical_token_stops_at_same_display_token() {
+        let failures = vec![
+            TensorCheckpointFailure {
+                idx: 1,
+                diff: FirstCheckpointDiff {
+                    parsed: ParsedCheckpointKey {
+                        key: "tok0_pos0_layer_0_gdelta.in_proj".to_string(),
+                        token: 0,
+                        position: 0,
+                        scope: "layer".to_string(),
+                        layer_index: 0,
+                        point: "gdelta.in_proj".to_string(),
+                    },
+                    kind: FirstCheckpointDiffKind::Numeric,
+                },
+            },
+            TensorCheckpointFailure {
+                idx: 2,
+                diff: FirstCheckpointDiff {
+                    parsed: ParsedCheckpointKey {
+                        key: "tok0_pos1_layer_0_gdelta.conv".to_string(),
+                        token: 0,
+                        position: 1,
+                        scope: "layer".to_string(),
+                        layer_index: 0,
+                        point: "gdelta.conv".to_string(),
+                    },
+                    kind: FirstCheckpointDiffKind::Numeric,
+                },
+            },
+            TensorCheckpointFailure {
+                idx: 5,
+                diff: FirstCheckpointDiff {
+                    parsed: ParsedCheckpointKey {
+                        key: "tok1_pos0_global_0_lm_head".to_string(),
+                        token: 1,
+                        position: 0,
+                        scope: "global".to_string(),
+                        layer_index: 0,
+                        point: "lm_head".to_string(),
+                    },
+                    kind: FirstCheckpointDiffKind::Numeric,
+                },
+            },
+        ];
+        let filtered = failures_for_first_logical_token(&failures, 3);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].diff.parsed.point, "gdelta.in_proj");
+        assert_eq!(filtered[1].diff.parsed.point, "gdelta.conv");
+    }
+
+    #[test]
+    fn compare_full_token_transcripts_reports_full_outputs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("source.json");
+        let target = dir.path().join("target.json");
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": { "model_name": "test", "seed": 42, "temperature": 0.0, "max_tokens": 3 },
+                "tokens": [20740, 466],
+                "stats": []
+            }))
+            .expect("json"),
+        )
+        .expect("write source");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": { "model_name": "test", "seed": 42, "temperature": 0.0, "max_tokens": 3 },
+                "tokens": [20740, 1576],
+                "stats": []
+            }))
+            .expect("json"),
+        )
+        .expect("write target");
+
+        let result =
+            compare_full_token_transcripts("Qwen/Qwen3.5-0.8B-GAF4", &source, &target, 2)
+                .expect("compare should succeed");
+        assert!(!result.passed);
+        assert!(result.report.contains("shared:"));
+        assert!(result.report.contains("cpu:"));
+        assert!(result.report.contains("metal:"));
+        assert!(result.report.contains("token=2 -> FAILED"));
+    }
+
+    #[test]
     fn reference_cache_key_changes_when_prompt_changes() {
-        let a = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100);
-        let b = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a poem", 42, 100);
+        let a = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "cpu");
+        let b = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a poem", 42, 100, "cpu");
         assert_ne!(a, b);
     }
 
     #[test]
     fn reference_cache_key_changes_when_seed_changes() {
-        let a = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100);
-        let b = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 43, 100);
+        let a = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "cpu");
+        let b = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 43, 100, "cpu");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn reference_cache_key_changes_when_reference_backend_changes() {
+        let cpu = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "cpu");
+        let metal =
+            reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "metal");
+        assert_ne!(cpu, metal);
     }
 
     #[test]
@@ -3419,6 +4760,61 @@ mod tests {
             path,
             Path::new("/tmp/xray_qwen.json.layers_full.npz").to_path_buf()
         );
+    }
+
+    #[test]
+    fn default_dev_reference_path_separates_full_and_token_caches() {
+        let args = XrayArgs {
+            model: "Qwen/Qwen3.5-0.8B-GAF4".to_string(),
+            input: false,
+            output: false,
+            json: false,
+            table: false,
+            debug: false,
+            verify: None,
+            verify_tokens: None,
+            verify_stats: None,
+            verify_tensors: None,
+            no_cache: false,
+            verify_checkpoint: None,
+            verify_checkpoint_stats_only: false,
+            verify_phase1_only: false,
+            verify_phase2_only: false,
+            verify_phase2_max_tokens: None,
+            verify_reference_path: None,
+            verify_record_reference_only: false,
+            verify_record_backend: None,
+            verify_record_transcript_only: false,
+            tolerance: 0.001,
+            tokens: 10,
+            seed: 42,
+            prompt: vec!["what".to_string(), "is".to_string(), "a".to_string(), "dice".to_string()],
+        };
+
+        let full = default_dev_reference_path(
+            &args.model,
+            &args,
+            "metal",
+            ReferenceCaptureMode::Full,
+        )
+        .expect("full path");
+        let tokens = default_dev_reference_path(
+            &args.model,
+            &args,
+            "metal",
+            ReferenceCaptureMode::TranscriptOnly,
+        )
+        .expect("token path");
+
+        assert_ne!(full, tokens);
+        assert!(full
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("xray_full_metal_")));
+        assert!(tokens
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("xray_tokens_metal_")));
     }
 
     #[test]
@@ -3438,12 +4834,48 @@ mod tests {
         let lock_path = reference_lock_path(&reference_path);
         std::fs::write(&lock_path, "locked").expect("write lock");
 
-        let err = ensure_reference_cache_unlocked(&reference_path).expect_err("lock should fail");
+        let err =
+            ensure_reference_cache_unlocked(&reference_path, "cpu").expect_err("lock should fail");
         assert!(
             err.to_string().contains("refresh is in progress"),
             "unexpected error: {err}"
         );
 
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn reclaim_orphaned_reference_lock_removes_legacy_empty_lock() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be monotonic enough for test naming")
+            .as_nanos();
+        let reference_path =
+            std::env::temp_dir().join(format!("talu_xray_reclaim_lock_test_{}.json", nonce));
+        let lock_path = reference_lock_path(&reference_path);
+        std::fs::write(&lock_path, "").expect("write empty lock");
+
+        reclaim_orphaned_reference_lock(&lock_path).expect("reclaim should succeed");
+
+        assert!(!lock_path.exists(), "legacy empty lock should be removed");
+    }
+
+    #[test]
+    fn reclaim_orphaned_reference_lock_keeps_live_pid_lock() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be monotonic enough for test naming")
+            .as_nanos();
+        let reference_path = std::env::temp_dir().join(format!(
+            "talu_xray_live_pid_lock_test_{}.json",
+            nonce
+        ));
+        let lock_path = reference_lock_path(&reference_path);
+        std::fs::write(&lock_path, std::process::id().to_string()).expect("write live pid lock");
+
+        reclaim_orphaned_reference_lock(&lock_path).expect("reclaim should succeed");
+
+        assert!(lock_path.exists(), "live pid lock must be preserved");
         let _ = std::fs::remove_file(&lock_path);
     }
 
@@ -3485,27 +4917,35 @@ mod tests {
 pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
     let model = &args.model;
 
-    if let Some(ref_path) = &args.record_reference {
-        return cmd_xray_record(model, ref_path, &args);
+    if args.verify_record_reference_only {
+        return maybe_hard_exit_after_verify(run_reference_record_only_in_current_process(
+            model, &args,
+        ));
     }
 
     // Check for verification mode
-    if args.verify {
-        return maybe_hard_exit_after_verify(cmd_xray_verify_default(model, &args));
+    if let Some((mode, backend_pair)) = selected_verify_mode_and_pair(&args)? {
+        return maybe_hard_exit_after_verify(cmd_xray_verify_default(
+            model,
+            &args,
+            mode,
+            &backend_pair,
+        ));
     }
 
     let decode_mode = args.output;
+    let resolved_model = resolve_xray_model(model)?;
 
     let capture = if args.json {
         XrayCaptureHandle::new()?
     } else {
         XrayCaptureHandle::new_timing()?
     };
-    let backend = create_backend_for_model(model, None)?;
+    let backend = create_backend_for_model(&resolved_model, None)?;
     capture.enable();
     // Drop backend init / warmup emissions so xray reflects route execution only.
     capture.clear();
-    let chat = ChatHandle::new(None)?;
+    let chat = ChatHandle::new(Some(DEFAULT_SYSTEM_MESSAGE))?;
     let prompt = if args.prompt.is_empty() {
         "xray".to_string()
     } else {

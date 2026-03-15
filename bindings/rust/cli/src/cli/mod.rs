@@ -563,16 +563,23 @@ pub(super) struct XrayArgs {
     #[arg(long)]
     pub debug: bool,
 
-    /// Verify against cached CPU reference (auto-record if missing)
-    #[arg(long)]
-    pub verify: bool,
+    /// Run token+stats verification for a backend pair: `<source>:<target>`
+    #[arg(long, value_name = "SRC:TARGET", group = "xray_verify_mode")]
+    pub verify: Option<String>,
 
-    /// Internal use only: record a reference bundle to a specific path.
-    /// Hidden to keep user-facing xray workflow single-path (`--verify`).
-    #[arg(long, hide = true)]
-    pub record_reference: Option<String>,
+    /// Run token-only verification for a backend pair: `<source>:<target>`
+    #[arg(long, value_name = "SRC:TARGET", group = "xray_verify_mode")]
+    pub verify_tokens: Option<String>,
 
-    /// Ignore cache and regenerate CPU golden reference before verify
+    /// Run stats-only verification for a backend pair: `<source>:<target>`
+    #[arg(long, value_name = "SRC:TARGET", group = "xray_verify_mode")]
+    pub verify_stats: Option<String>,
+
+    /// Run full canonical tensor-bundle diff for a backend pair: `<source>:<target>`
+    #[arg(long, value_name = "SRC:TARGET", group = "xray_verify_mode")]
+    pub verify_tensors: Option<String>,
+
+    /// Ignore cache and regenerate the source backend reference before verify
     #[arg(long)]
     pub no_cache: bool,
 
@@ -608,6 +615,20 @@ pub(super) struct XrayArgs {
     /// current verify command when a child helper needs the same cache bundle.
     #[arg(long, hide = true)]
     pub verify_reference_path: Option<String>,
+
+    /// Internal use only: record one backend reference bundle in a fresh child
+    /// process to keep backend state isolated during xray cache refresh.
+    #[arg(long, hide = true)]
+    pub verify_record_reference_only: bool,
+
+    /// Internal use only: backend name for child reference recording.
+    #[arg(long, hide = true)]
+    pub verify_record_backend: Option<String>,
+
+    /// Internal use only: restrict child reference recording to transcript-only
+    /// token_select capture.
+    #[arg(long, hide = true)]
+    pub verify_record_transcript_only: bool,
 
     /// Tolerance for stats comparison during verification (default: 1e-3)
     #[arg(long, default_value = "0.001")]
@@ -1244,6 +1265,43 @@ mod tests {
             .expect("parse should succeed");
         match cli_flag.command {
             Some(Commands::Xray(args)) => assert_eq!(args.tokens, 23),
+            _ => panic!("expected xray command"),
+        }
+    }
+
+    #[test]
+    fn parse_xray_verify_backend_pair_modes() {
+        let cli = parse(&[
+            "talu",
+            "xray",
+            "Qwen/Qwen3.5-0.8B",
+            "--verify",
+            "cpu:metal",
+        ])
+        .expect("parse should succeed");
+        match cli.command {
+            Some(Commands::Xray(args)) => {
+                assert_eq!(args.verify.as_deref(), Some("cpu:metal"));
+                assert!(args.verify_tokens.is_none());
+                assert!(args.verify_stats.is_none());
+                assert!(args.verify_tensors.is_none());
+            }
+            _ => panic!("expected xray command"),
+        }
+
+        let cli = parse(&[
+            "talu",
+            "xray",
+            "Qwen/Qwen3.5-0.8B",
+            "--verify-tensors",
+            "cpu:metal",
+        ])
+        .expect("parse should succeed");
+        match cli.command {
+            Some(Commands::Xray(args)) => {
+                assert_eq!(args.verify_tensors.as_deref(), Some("cpu:metal"));
+                assert!(args.verify.is_none());
+            }
             _ => panic!("expected xray command"),
         }
     }

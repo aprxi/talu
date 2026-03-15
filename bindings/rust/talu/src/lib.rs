@@ -104,7 +104,9 @@ pub use file::{
 pub use fs::{FsEditResult, FsError, FsHandle, FsReadResult, FsStat, FsWriteResult};
 pub use kv::{KvDurability, KvEntry, KvError, KvHandle, KvNamespaceStats, KvPutOptions, KvValue};
 pub use logging::{LogFormat, LogLevel};
-pub use model::{GenerationConfigInfo, ModelInfo, QuantMethod};
+pub use model::{
+    EffectiveGenConfig, EffectiveGenConfigRequest, GenerationConfigInfo, ModelInfo, QuantMethod,
+};
 pub use process::{ProcessError, ProcessSession};
 pub use provider::{
     provider_config_health, provider_config_list, provider_config_list_provider_models,

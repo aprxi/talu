@@ -7,7 +7,7 @@ use talu::{ChatHandle, InferenceBackend};
 
 use crate::provider::{get_provider, parse_model_target, ModelTarget};
 
-use super::repo::{generation_config, resolve_model_for_inference};
+use super::repo::resolve_model_for_inference;
 use super::util::DEFAULT_MAX_TOKENS;
 use super::AgentArgs;
 
@@ -132,28 +132,36 @@ pub(super) fn cmd_agent(args: AgentArgs, stdin_is_pipe: bool) -> Result<()> {
         }
         ModelTarget::Local(_) => {
             let resolved_model = resolve_model_for_inference(&model_arg)?;
-            let gen_cfg = generation_config(&resolved_model)?;
 
+            // Parse environment overrides
             let temperature_from_env = env::var("TEMPERATURE")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok());
-            let temperature = temperature_from_env.unwrap_or(gen_cfg.temperature);
-            let top_k = env::var("TOP_K")
+            let top_k_from_env = env::var("TOP_K")
                 .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(gen_cfg.top_k);
-            let top_p = env::var("TOP_P")
+                .and_then(|v| v.parse::<usize>().ok());
+            let top_p_from_env = env::var("TOP_P")
                 .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(gen_cfg.top_p);
+                .and_then(|v| v.parse::<f32>().ok());
 
-            if (gen_cfg.do_sample || temperature_from_env.is_some()) && temperature > 0.0 {
-                cfg.temperature = temperature;
-                cfg.top_k = top_k;
-                cfg.top_p = top_p;
-            } else {
-                cfg.temperature = 0.0;
-            }
+            // Use core-owned policy to resolve effective generation config
+            let effective = talu::model::resolve_effective_generation_config(
+                &resolved_model,
+                &talu::EffectiveGenConfigRequest {
+                    temperature: temperature_from_env,
+                    top_k: top_k_from_env,
+                    top_p: top_p_from_env,
+                    seed,
+                    max_tokens,
+                    ..Default::default()
+                },
+            )?;
+
+            cfg.temperature = effective.temperature;
+            cfg.top_k = effective.top_k;
+            cfg.top_p = effective.top_p;
+            cfg.min_p = effective.min_p;
+            cfg.repetition_penalty = effective.repetition_penalty;
 
             model_display_name = std::path::Path::new(&resolved_model)
                 .file_name()

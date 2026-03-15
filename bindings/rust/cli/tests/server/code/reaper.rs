@@ -32,6 +32,7 @@ fn build_app_zero_ttl() -> (Router, Arc<AppState>) {
         agent_runtime_mode: talu_cli::server::AgentRuntimeMode::Host,
         sandbox_backend: talu_cli::server::SandboxBackend::LinuxLocal,
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
+        active_stop_flags: std::sync::Mutex::new(Vec::new()),
     });
     let router = Router::new(state.clone());
     (router, state)

@@ -132,10 +132,15 @@ pub const VerifyCapture = struct {
         // tensors on the production execution path. Marker-only points and
         // backend-private internals do not belong in the default parity contract.
         return .{
+            .embed = true,
+            .layer_input = true,
             .layer_attn_norm = true,
+            .gdelta_in_proj = true,
+            .gdelta_conv = true,
+            .gdelta_ssm = true,
+            .gdelta_norm = true,
             .block_out = true,
             .lm_head = true,
-            .logits_ready = true,
             .token_select = true,
             .gdelta_out = true,
         };
@@ -175,7 +180,7 @@ pub const VerifyCapture = struct {
     ) VerifyCapture {
         const config = TraceCaptureConfig{
             .mode = .stats,
-            .points = defaultVerificationPointSet(),
+            .points = configuredVerificationPointSet(),
             .allow_non_cpu_host_data = true,
         };
 
@@ -603,6 +608,24 @@ test "VerifyCapture recording mode writes full tensor NPZ sidecar" {
     defer file.close();
     const stat = try file.stat();
     try std.testing.expect(stat.size > 0);
+}
+
+test "VerifyCapture recording mode honors point-mask override" {
+    const allocator = std.testing.allocator;
+    const point_set = capture_mod.TracePointSet{ .token_select = true };
+
+    setVerificationPointMaskOverride(point_set.builtinMask());
+    defer clearVerificationPointMaskOverride();
+
+    var recorder = try ReferenceRecorder.init(allocator, "test_model", 42, 1.0, 10);
+    defer recorder.deinit();
+
+    var verify_cap = VerifyCapture.initRecording(allocator, &recorder);
+    defer verify_cap.deinit();
+
+    try std.testing.expect(verify_cap.capture.config.points.token_select);
+    try std.testing.expect(!verify_cap.capture.config.points.lm_head);
+    try std.testing.expect(!verify_cap.capture.config.points.gdelta_in_proj);
 }
 
 test "VerifyCapture skips non-host Metal emissions" {
@@ -1099,20 +1122,22 @@ test "VerifyCapture token_select f32 does not advance verifier" {
 
 test "VerifyCapture verification point set is complete" {
     const points = VerifyCapture.defaultVerificationPointSet();
+    try std.testing.expect(points.contains(.embed));
+    try std.testing.expect(points.contains(.layer_input));
     try std.testing.expect(points.contains(.layer_attn_norm));
     try std.testing.expect(points.contains(.block_out));
     try std.testing.expect(points.contains(.lm_head));
-    try std.testing.expect(points.contains(.logits_ready));
+    try std.testing.expect(!points.contains(.logits_ready));
     try std.testing.expect(points.contains(.token_select));
+    try std.testing.expect(points.contains(.gdelta_in_proj));
+    try std.testing.expect(points.contains(.gdelta_conv));
+    try std.testing.expect(points.contains(.gdelta_ssm));
+    try std.testing.expect(points.contains(.gdelta_norm));
     try std.testing.expect(points.contains(.gdelta_out));
     try std.testing.expect(!points.contains(.layer_ffn_norm));
     try std.testing.expect(!points.contains(.ffn_act));
     try std.testing.expect(!points.contains(.ffn_act_map));
     try std.testing.expect(!points.contains(.ffn_act_mix));
-    try std.testing.expect(!points.contains(.gdelta_in_proj));
-    try std.testing.expect(!points.contains(.gdelta_conv));
-    try std.testing.expect(!points.contains(.gdelta_ssm));
-    try std.testing.expect(!points.contains(.gdelta_norm));
     try std.testing.expect(!points.contains(.conv_out_proj));
     try std.testing.expect(!points.contains(.mamba_out));
     try std.testing.expect(!points.contains(.final_norm));

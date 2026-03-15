@@ -14,6 +14,11 @@ pub const GatedDeltaCache = runtime_graph.GatedDeltaCache;
 pub const GatedDeltaState = struct {
     cache: ?GatedDeltaCache = null,
     layer_idx: usize = 0,
+    capture_enabled: bool = false,
+    capture_in_proj: ArrayHandle = null,
+    capture_conv: ArrayHandle = null,
+    capture_ssm: ArrayHandle = null,
+    capture_norm: ArrayHandle = null,
 };
 
 pub const GatedDeltaScratch = struct {};
@@ -62,6 +67,10 @@ pub const GatedDeltaKernel = struct {
         // XRAY CONTRACT:
         // Verification is observability-only. This kernel must stay on the
         // production path regardless of tracing/verification state.
+        state.capture_in_proj = null;
+        state.capture_conv = null;
+        state.capture_ssm = null;
+        state.capture_norm = null;
 
         if (has_quantized_core) {
             const in_proj = self.in_proj.?;
@@ -69,21 +78,91 @@ pub const GatedDeltaKernel = struct {
             if (in_proj.group_size != out_proj.group_size or in_proj.bits != out_proj.bits) {
                 return error.InvalidTensorType;
             }
-            output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_quantized(
+            if (state.capture_enabled) {
+                output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_quantized_capture(
+                    input_tensor,
+                    in_proj.weights,
+                    in_proj.scales,
+                    in_proj.biases,
+                    self.conv_weight,
+                    if (self.conv_bias) |bias| bias else null,
+                    self.a_log,
+                    if (self.dt_bias) |bias| bias else null,
+                    if (self.norm_weight) |weight| weight else null,
+                    out_proj.weights,
+                    out_proj.scales,
+                    out_proj.biases,
+                    in_proj.group_size,
+                    in_proj.bits,
+                    cache_handle,
+                    state.layer_idx,
+                    self.d_conv,
+                    self.n_heads,
+                    self.n_key_heads,
+                    self.d_head,
+                    &state.capture_in_proj,
+                    &state.capture_conv,
+                    &state.capture_ssm,
+                    &state.capture_norm,
+                );
+            } else {
+                output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_quantized(
+                    input_tensor,
+                    in_proj.weights,
+                    in_proj.scales,
+                    in_proj.biases,
+                    self.conv_weight,
+                    if (self.conv_bias) |bias| bias else null,
+                    self.a_log,
+                    if (self.dt_bias) |bias| bias else null,
+                    if (self.norm_weight) |weight| weight else null,
+                    out_proj.weights,
+                    out_proj.scales,
+                    out_proj.biases,
+                    in_proj.group_size,
+                    in_proj.bits,
+                    cache_handle,
+                    state.layer_idx,
+                    self.d_conv,
+                    self.n_heads,
+                    self.n_key_heads,
+                    self.d_head,
+                );
+            }
+            return;
+        }
+
+        if (state.capture_enabled) {
+            output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_bf16_capture(
                 input_tensor,
-                in_proj.weights,
-                in_proj.scales,
-                in_proj.biases,
+                self.in_proj_bf16.?,
                 self.conv_weight,
                 if (self.conv_bias) |bias| bias else null,
                 self.a_log,
                 if (self.dt_bias) |bias| bias else null,
                 if (self.norm_weight) |weight| weight else null,
-                out_proj.weights,
-                out_proj.scales,
-                out_proj.biases,
-                in_proj.group_size,
-                in_proj.bits,
+                self.out_proj_bf16.?,
+                cache_handle,
+                state.layer_idx,
+                self.d_conv,
+                self.n_heads,
+                self.n_key_heads,
+                self.d_head,
+                &state.capture_in_proj,
+                &state.capture_conv,
+                &state.capture_ssm,
+                &state.capture_norm,
+            );
+        } else {
+            output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_bf16(
+                input_tensor,
+                self.in_proj_bf16.?,
+                self.conv_weight,
+                if (self.conv_bias) |bias| bias else null,
+                self.a_log,
+                if (self.dt_bias) |bias| bias else null,
+                if (self.norm_weight) |weight| weight else null,
+                self.out_proj_bf16.?,
                 cache_handle,
                 state.layer_idx,
                 self.d_conv,
@@ -91,24 +170,6 @@ pub const GatedDeltaKernel = struct {
                 self.n_key_heads,
                 self.d_head,
             );
-            return;
         }
-
-        output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_bf16(
-            input_tensor,
-            self.in_proj_bf16.?,
-            self.conv_weight,
-            if (self.conv_bias) |bias| bias else null,
-            self.a_log,
-            if (self.dt_bias) |bias| bias else null,
-            if (self.norm_weight) |weight| weight else null,
-            self.out_proj_bf16.?,
-            cache_handle,
-            state.layer_idx,
-            self.d_conv,
-            self.n_heads,
-            self.n_key_heads,
-            self.d_head,
-        );
     }
 };

@@ -122,6 +122,27 @@ pub extern fn mlx_lazy_gated_delta_mixer_bf16(
     d_head: usize,
 ) ArrayHandle;
 
+pub extern fn mlx_lazy_gated_delta_mixer_bf16_capture(
+    input: ArrayHandle,
+    in_proj: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    a_log: ArrayHandle,
+    dt_bias: ArrayHandle,
+    norm_weight: ArrayHandle,
+    out_proj: ArrayHandle,
+    gated_delta_cache: GatedDeltaCacheHandle,
+    layer_idx: usize,
+    d_conv: usize,
+    n_heads: usize,
+    n_key_heads: usize,
+    d_head: usize,
+    out_in_proj: *ArrayHandle,
+    out_conv: *ArrayHandle,
+    out_ssm: *ArrayHandle,
+    out_norm: *ArrayHandle,
+) ArrayHandle;
+
 pub extern fn mlx_lazy_gated_delta_mixer_quantized(
     input: ArrayHandle,
     in_w: ArrayHandle,
@@ -143,6 +164,33 @@ pub extern fn mlx_lazy_gated_delta_mixer_quantized(
     n_heads: usize,
     n_key_heads: usize,
     d_head: usize,
+) ArrayHandle;
+
+pub extern fn mlx_lazy_gated_delta_mixer_quantized_capture(
+    input: ArrayHandle,
+    in_w: ArrayHandle,
+    in_s: ArrayHandle,
+    in_b: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    a_log: ArrayHandle,
+    dt_bias: ArrayHandle,
+    norm_weight: ArrayHandle,
+    out_w: ArrayHandle,
+    out_s: ArrayHandle,
+    out_b: ArrayHandle,
+    group_size: usize,
+    bits: usize,
+    gated_delta_cache: GatedDeltaCacheHandle,
+    layer_idx: usize,
+    d_conv: usize,
+    n_heads: usize,
+    n_key_heads: usize,
+    d_head: usize,
+    out_in_proj: *ArrayHandle,
+    out_conv: *ArrayHandle,
+    out_ssm: *ArrayHandle,
+    out_norm: *ArrayHandle,
 ) ArrayHandle;
 
 pub extern fn mlx_lazy_fused_attention(

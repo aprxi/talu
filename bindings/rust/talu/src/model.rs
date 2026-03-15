@@ -422,3 +422,106 @@ pub fn apply_chat_template(
 
     Ok(result)
 }
+
+/// Request for resolving effective generation config.
+///
+/// Uses Option to represent "unset" values. When None, the model's default is used.
+/// This is the idiomatic Rust API that wraps the C API sentinel-based interface.
+#[derive(Debug, Clone, Default)]
+pub struct EffectiveGenConfigRequest {
+    /// Temperature override. None = use model default.
+    pub temperature: Option<f32>,
+    /// Top-k override. None = use model default.
+    pub top_k: Option<usize>,
+    /// Top-p override. None = use model default.
+    pub top_p: Option<f32>,
+    /// Min-p override. None = use default (0.0).
+    pub min_p: Option<f32>,
+    /// Repetition penalty override. None = use default (1.0).
+    pub repetition_penalty: Option<f32>,
+    /// Seed (0 = random).
+    pub seed: u64,
+    /// Max tokens to generate.
+    pub max_tokens: usize,
+}
+
+/// Resolved effective generation config after applying policy.
+///
+/// This is the output of resolve_effective_generation_config.
+/// The policy matches core/src/router/local.zig sampling decision:
+/// - Sampling is enabled if: temperature > 0 AND (model.do_sample OR user provided override)
+/// - If not sampling, temperature is forced to 0.0 (greedy decoding)
+#[derive(Debug, Clone)]
+pub struct EffectiveGenConfig {
+    /// Effective temperature (0.0 = greedy).
+    pub temperature: f32,
+    /// Effective top_k.
+    pub top_k: usize,
+    /// Effective top_p.
+    pub top_p: f32,
+    /// Effective min_p.
+    pub min_p: f32,
+    /// Effective repetition_penalty.
+    pub repetition_penalty: f32,
+    /// Seed.
+    pub seed: u64,
+    /// Max tokens.
+    pub max_tokens: usize,
+    /// Whether sampling is enabled (true) or greedy (false).
+    pub do_sample: bool,
+}
+
+/// Resolve effective generation config by applying model defaults and overrides.
+///
+/// This is the SINGLE source of truth for generation config policy. All entrypoints
+/// (CLI ask, xray, shell, server) must use this function instead of implementing
+/// their own policy logic.
+///
+/// The policy matches core/src/router/local.zig sampling decision:
+/// - Apply user overrides over model defaults (None means "use model default")
+/// - Sampling is enabled if: temperature > 0 AND (model.do_sample OR user provided temperature override)
+/// - If not sampling, temperature is forced to 0.0 (greedy decoding)
+pub fn resolve_effective_generation_config(
+    model_dir: &str,
+    request: &EffectiveGenConfigRequest,
+) -> Result<EffectiveGenConfig> {
+    let c_path = CString::new(model_dir)?;
+
+    // Convert Option-based request to C API sentinel-based request
+    // Sentinel values: -1.0 for floats means "unset", 0 for top_k means "unset"
+    let c_request = talu_sys::EffectiveGenConfigRequest {
+        temperature: request.temperature.unwrap_or(-1.0),
+        top_k: request.top_k.unwrap_or(0),
+        top_p: request.top_p.unwrap_or(-1.0),
+        min_p: request.min_p.unwrap_or(-1.0),
+        repetition_penalty: request.repetition_penalty.unwrap_or(-1.0),
+        seed: request.seed,
+        max_tokens: request.max_tokens,
+    };
+
+    let mut out_config = talu_sys::EffectiveGenConfig::default();
+
+    // SAFETY: c_path is valid, c_request and out_config are valid pointers.
+    let rc = unsafe {
+        talu_sys::talu_resolve_effective_generation_config(
+            c_path.as_ptr(),
+            &c_request,
+            &mut out_config,
+        )
+    };
+
+    if rc != 0 {
+        return Err(error_from_last_or("Failed to resolve effective generation config"));
+    }
+
+    Ok(EffectiveGenConfig {
+        temperature: out_config.temperature,
+        top_k: out_config.top_k,
+        top_p: out_config.top_p,
+        min_p: out_config.min_p,
+        repetition_penalty: out_config.repetition_penalty,
+        seed: out_config.seed,
+        max_tokens: out_config.max_tokens,
+        do_sample: out_config.do_sample,
+    })
+}

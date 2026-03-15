@@ -125,7 +125,9 @@ const KernelSlot = enum {
     gaffine_u4_matvec_qkv,
     gaffine_u8_matvec_qkv,
     gaffine_u8_matvec_gate_up,
+    gaffine_u4_matvec_gate_up_silu,
     gaffine_u8_matvec_gate_up_silu,
+    gaffine_u4_dequant_f16,
     gaffine_u8_dequant_f16,
 };
 
@@ -211,7 +213,9 @@ const required_kernels = [_]RequiredKernel{
     .{ .slot = .gaffine_u4_matvec_qkv, .op_name = compute.cuda.gaffine_u4_matvec_qkv.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec_qkv.embedded_symbol },
     .{ .slot = .gaffine_u8_matvec_qkv, .op_name = compute.cuda.gaffine_u8_matvec_qkv.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec_qkv.embedded_symbol },
     .{ .slot = .gaffine_u8_matvec_gate_up, .op_name = compute.cuda.gaffine_u8_matvec_gate_up.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec_gate_up.embedded_symbol },
+    .{ .slot = .gaffine_u4_matvec_gate_up_silu, .op_name = compute.cuda.gaffine_u4_matvec_gate_up_silu.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec_gate_up_silu.embedded_symbol },
     .{ .slot = .gaffine_u8_matvec_gate_up_silu, .op_name = compute.cuda.gaffine_u8_matvec_gate_up_silu.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec_gate_up_silu.embedded_symbol },
+    .{ .slot = .gaffine_u4_dequant_f16, .op_name = compute.cuda.gaffine_u4_dequantize_f16.op_name, .embedded_symbol = compute.cuda.gaffine_u4_dequantize_f16.embedded_symbol },
     .{ .slot = .gaffine_u8_dequant_f16, .op_name = compute.cuda.gaffine_u8_dequantize_f16.op_name, .embedded_symbol = compute.cuda.gaffine_u8_dequantize_f16.embedded_symbol },
 };
 
@@ -2587,6 +2591,7 @@ pub const CudaBackend = struct {
     vision_runtime: ?vision_runtime_mod.VisionRuntime = null,
     device: compute.cuda.Device,
     compute_stream: ?compute.cuda.StreamHandle = null,
+    decode_graph_exec: ?compute.cuda.GraphExecHandle = null,
     kernel_registry: compute.cuda.Registry,
     vector_add_function: ?compute.cuda.Function = null,
     vector_add_source: ?compute.cuda.registry.KernelSource = null,
@@ -2696,15 +2701,23 @@ pub const CudaBackend = struct {
     gaffine_u8_matvec_qkv_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u8_matvec_gate_up_function: ?compute.cuda.Function = null,
     gaffine_u8_matvec_gate_up_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_u4_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
+    gaffine_u4_matvec_gate_up_silu_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
     gaffine_u8_matvec_gate_up_silu_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_u4_dequant_f16_function: ?compute.cuda.Function = null,
+    gaffine_u4_dequant_f16_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u8_dequant_f16_function: ?compute.cuda.Function = null,
     gaffine_u8_dequant_f16_source: ?compute.cuda.registry.KernelSource = null,
     quantize_f32_to_i8_function: ?compute.cuda.Function = null,
     dequant_i32_gaffine_function: ?compute.cuda.Function = null,
     i8_rowsum_function: ?compute.cuda.Function = null,
     u8_xor_to_i8_function: ?compute.cuda.Function = null,
+    i8_matvec_function: ?compute.cuda.Function = null,
+    i8_matvec_qkv_function: ?compute.cuda.Function = null,
+    i8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
     gaffine_u8_to_i8_function: ?compute.cuda.Function = null,
+    gaffine_u4_to_i8_function: ?compute.cuda.Function = null,
     quantize_f16_to_i8_function: ?compute.cuda.Function = null,
     quantize_f32_to_i8_simple_function: ?compute.cuda.Function = null,
     dequant_i32_scales_function: ?compute.cuda.Function = null,
@@ -2993,6 +3006,7 @@ pub const CudaBackend = struct {
             .gaffine_u4_matvec_qkv_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_qkv_function != null)),
             .gaffine_u8_matvec_qkv_kernel = @as(u8, @intFromBool(backend.gaffine_u8_matvec_qkv_function != null)),
             .gaffine_u8_matvec_gate_up_kernel = @as(u8, @intFromBool(backend.gaffine_u8_matvec_gate_up_function != null)),
+            .gaffine_u4_matvec_gate_up_silu_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_gate_up_silu_function != null)),
             .gaffine_u8_matvec_gate_up_silu_kernel = @as(u8, @intFromBool(backend.gaffine_u8_matvec_gate_up_silu_function != null)),
             .gaffine_sequence_rows_supported = @as(u8, @intFromBool(backend.gaffine_sequence_rows_supported)),
             .gaffine_sequence_fused_qkv_supported = @as(u8, @intFromBool(backend.gaffine_sequence_fused_qkv_supported)),
@@ -3026,6 +3040,10 @@ pub const CudaBackend = struct {
 
     pub fn deinit(self: *CudaBackend) void {
         if (self.vision_runtime) |*rt| rt.deinit();
+        if (self.decode_graph_exec) |exec| {
+            self.device.graphExecDestroy(exec);
+            self.decode_graph_exec = null;
+        }
         self.device.setLaunchStream(null);
         if (self.compute_stream) |stream| {
             _ = self.device.synchronizeStream(stream) catch {};
@@ -3913,6 +3931,22 @@ pub const CudaBackend = struct {
             }
         }
 
+        // CUDA graph capture: record all GPU kernels (layer loop + final norm + lm_head)
+        // into a graph, then replay with near-zero scheduling gaps between kernels.
+        // Requires: named stream, no tracing (trace downloads break capture), no deepstack
+        // (sync memcpy during capture is not stream-ordered).
+        var graph_capture_active = false;
+        if (self.compute_stream != null and compute_logits and
+            !trace.isEnabled() and deepstack_layer_features_opt == null)
+        {
+            if (self.device.streamBeginCapture(self.compute_stream.?)) {
+                graph_capture_active = true;
+            } else |_| {}
+        }
+        errdefer if (graph_capture_active) {
+            _ = self.device.streamEndCapture(self.compute_stream.?) catch {};
+        };
+
         var final_hidden = input_row;
         var layer_idx: usize = 0;
         while (layer_idx < layer_limit) : (layer_idx += 1) {
@@ -4027,6 +4061,27 @@ pub const CudaBackend = struct {
         }
 
         try self.linearForwardRows(&norm_out_row, 1, &self.runtime_buffers.projection_weight, &self.runtime_buffers.logits_dev);
+
+        // End graph capture: instantiate/update exec, then launch the captured graph.
+        if (graph_capture_active) {
+            const new_graph = self.device.streamEndCapture(self.compute_stream.?) catch
+                return error.CudaGraphCaptureFailed;
+            defer self.device.graphDestroy(new_graph);
+
+            if (self.decode_graph_exec) |exec| {
+                self.device.graphExecUpdate(exec, new_graph) catch {
+                    // Topology changed — re-instantiate.
+                    self.device.graphExecDestroy(exec);
+                    self.decode_graph_exec = self.device.graphInstantiate(new_graph) catch
+                        return error.CudaGraphInstantiateFailed;
+                };
+            } else {
+                self.decode_graph_exec = self.device.graphInstantiate(new_graph) catch
+                    return error.CudaGraphInstantiateFailed;
+            }
+            try self.device.graphLaunch(self.decode_graph_exec.?, self.compute_stream);
+        }
+
         if (!download_logits) return;
 
         const logits_out = logits_out_opt.?;
@@ -4783,7 +4838,89 @@ pub const CudaBackend = struct {
             },
             .gaffine_u4 => |w| {
                 const kernel = self.gaffine_u4_matvec_function orelse return error.CudaKernelUnavailable;
-                if (rows == 1 or self.gaffine_sequence_rows_supported) {
+
+                if (rows == 1) {
+                    try compute.cuda.gaffine_u4_matvec.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &packed_input,
+                        &w.packed_data,
+                        &w.scales,
+                        &w.biases,
+                        &packed_out,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                        w.group_size,
+                        w.scales_dtype_tag,
+                        1,
+                    );
+                    return;
+                }
+
+                // F16 dequant + cuBLAS GEMM path for prefill.
+                if (self.cast_f32_to_f16_function) |cast_fn| {
+                    if (self.u16_blas_f16_supported) dequant_blas: {
+                        const weight_elems = std.math.mul(usize, w.rows, w.cols) catch break :dequant_blas;
+                        const weight_f16_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch break :dequant_blas;
+
+                        const input_elems = std.math.mul(usize, rows, w.rows) catch break :dequant_blas;
+                        const input_u16_bytes = std.math.mul(usize, input_elems, @sizeOf(u16)) catch break :dequant_blas;
+                        if (self.runtime_buffers.activation_u16_dev.size < input_u16_bytes) break :dequant_blas;
+
+                        // Use pre-dequantized F16 cache if available, otherwise dequant on the fly.
+                        var dequant_weight: compute.cuda.Buffer = undefined;
+                        if (w.dequant_f16_cache.pointer != 0 and w.dequant_f16_cache.size >= weight_f16_bytes) {
+                            dequant_weight = bufferSlice(&w.dequant_f16_cache, 0, weight_f16_bytes) catch break :dequant_blas;
+                        } else {
+                            const dequant_fn = self.gaffine_u4_dequant_f16_function orelse break :dequant_blas;
+                            if (self.runtime_buffers.dequant_f16_dev.size < weight_f16_bytes) break :dequant_blas;
+                            dequant_weight = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, weight_f16_bytes) catch break :dequant_blas;
+                            compute.cuda.gaffine_u4_dequantize_f16.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                dequant_fn,
+                                &w.packed_data,
+                                &w.scales,
+                                &w.biases,
+                                &dequant_weight,
+                                @intCast(w.cols),
+                                @intCast(w.rows),
+                                w.group_size,
+                                w.scales_dtype_tag,
+                            ) catch break :dequant_blas;
+                        }
+
+                        var input_u16_dev = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, input_u16_bytes) catch break :dequant_blas;
+                        compute.cuda.cast_f32_to_f16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            cast_fn,
+                            &packed_input,
+                            &input_u16_dev,
+                            @intCast(input_elems),
+                        ) catch break :dequant_blas;
+
+                        self.blas.matmulU16U16F32(
+                            &self.device,
+                            &input_u16_dev,
+                            .f16,
+                            rows,
+                            w.rows,
+                            &dequant_weight,
+                            .f16,
+                            w.cols,
+                            &packed_out,
+                        ) catch {
+                            self.u16_blas_f16_supported = false;
+                            break :dequant_blas;
+                        };
+                        return;
+                    }
+                }
+
+                // Fallback: row-by-row U4 GEMV.
+                if (self.gaffine_sequence_rows_supported) {
                     try compute.cuda.gaffine_u4_matvec.runWithFunction(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -4827,6 +4964,28 @@ pub const CudaBackend = struct {
                 const kernel = self.gaffine_u8_matvec_function orelse return error.CudaKernelUnavailable;
 
                 if (rows == 1) {
+                    // Try I8 GEMV: warp-per-row kernel, 4 output rows per block.
+                    if (w.dequant_i8_cache.pointer != 0 and
+                        w.mean_scale_cache.pointer != 0) i8_decode:
+                    {
+                        const i8_fn = self.i8_matvec_function orelse break :i8_decode;
+                        const out_cols: u32 = @intCast(w.cols);
+                        self.kernel_arg_pack.reset();
+                        self.kernel_arg_pack.appendBufferPtr(&packed_input) catch break :i8_decode;
+                        self.kernel_arg_pack.appendBufferPtr(&w.dequant_i8_cache) catch break :i8_decode;
+                        self.kernel_arg_pack.appendBufferPtr(&w.mean_scale_cache) catch break :i8_decode;
+                        self.kernel_arg_pack.appendBufferPtr(&packed_out) catch break :i8_decode;
+                        self.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch break :i8_decode;
+                        self.kernel_arg_pack.appendScalar(u32, out_cols) catch break :i8_decode;
+                        self.kernel_arg_pack.appendScalar(u32, 1) catch break :i8_decode;
+                        compute.cuda.launch.launchWithFamily(&self.device, i8_fn, .{
+                            .grid_x = (out_cols + 3) / 4,
+                            .grid_y = 1,
+                            .block_x = 128,
+                        }, &self.kernel_arg_pack, .matvec) catch break :i8_decode;
+                        return;
+                    }
+                    // Fallback: U8 GEMV with per-group dequant.
                     try compute.cuda.gaffine_u8_matvec.runWithFunction(
                         &self.kernel_arg_pack,
                         &self.device,
@@ -6882,6 +7041,18 @@ pub const CudaBackend = struct {
             up_weight,
             rows,
             d_ff,
+        )) or (try self.tryFusedGaffineU4GateUpSiluForward(
+            input,
+            gate_weight,
+            up_weight,
+            rows,
+            d_ff,
+        )) or (try self.tryFusedI8GateUpSiluForward(
+            input,
+            gate_weight,
+            up_weight,
+            rows,
+            d_ff,
         )) or (try self.tryFusedGaffineU8GateUpSiluForward(
             input,
             gate_weight,
@@ -8392,6 +8563,7 @@ pub const CudaBackend = struct {
     ) !bool {
         if (try self.tryFusedDenseU16QkvForward(input, q_proj, k_proj, v_proj, q_out_dest)) return true;
         if (try self.tryFusedGaffineU4QkvForward(input, q_proj, k_proj, v_proj, q_out_dest)) return true;
+        if (try self.tryFusedI8QkvForward(input, q_proj, k_proj, v_proj, q_out_dest)) return true;
         return self.tryFusedGaffineU8QkvForward(input, q_proj, k_proj, v_proj, q_out_dest);
     }
 
@@ -8447,6 +8619,64 @@ pub const CudaBackend = struct {
             @intCast(q.rows),
             1,
         );
+        return true;
+    }
+
+    fn tryFusedI8QkvForward(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        q_proj: *const LinearWeight,
+        k_proj: *const LinearWeight,
+        v_proj: *const LinearWeight,
+        q_out_dest: *compute.cuda.Buffer,
+    ) !bool {
+        const i8_fn = self.i8_matvec_qkv_function orelse return false;
+        const q = switch (q_proj.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        const k = switch (k_proj.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        const v = switch (v_proj.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        // All three projections must have I8 caches populated.
+        if (q.dequant_i8_cache.pointer == 0 or q.mean_scale_cache.pointer == 0) return false;
+        if (k.dequant_i8_cache.pointer == 0 or k.mean_scale_cache.pointer == 0) return false;
+        if (v.dequant_i8_cache.pointer == 0 or v.mean_scale_cache.pointer == 0) return false;
+        if (!canFuseGaffineQkvWeights(self.d_model, q, k, v)) return false;
+
+        const q_out_dim: u32 = @intCast(q.cols);
+        const k_out_dim: u32 = @intCast(k.cols);
+        const v_out_dim: u32 = @intCast(v.cols);
+        const in_dim: u32 = @intCast(q.rows);
+        const total_out = std.math.add(u32, q_out_dim, std.math.add(u32, k_out_dim, v_out_dim) catch return error.InvalidArgument) catch return error.InvalidArgument;
+
+        self.kernel_arg_pack.reset();
+        try self.kernel_arg_pack.appendBufferPtr(input);
+        try self.kernel_arg_pack.appendBufferPtr(&q.dequant_i8_cache);
+        try self.kernel_arg_pack.appendBufferPtr(&q.mean_scale_cache);
+        try self.kernel_arg_pack.appendBufferPtr(q_out_dest);
+        try self.kernel_arg_pack.appendScalar(u32, q_out_dim);
+        try self.kernel_arg_pack.appendBufferPtr(&k.dequant_i8_cache);
+        try self.kernel_arg_pack.appendBufferPtr(&k.mean_scale_cache);
+        try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.attn_k_dev);
+        try self.kernel_arg_pack.appendScalar(u32, k_out_dim);
+        try self.kernel_arg_pack.appendBufferPtr(&v.dequant_i8_cache);
+        try self.kernel_arg_pack.appendBufferPtr(&v.mean_scale_cache);
+        try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.attn_v_dev);
+        try self.kernel_arg_pack.appendScalar(u32, v_out_dim);
+        try self.kernel_arg_pack.appendScalar(u32, in_dim);
+        try self.kernel_arg_pack.appendScalar(u32, 1);
+
+        try compute.cuda.launch.launchWithFamily(&self.device, i8_fn, .{
+            .grid_x = (total_out + 3) / 4,
+            .grid_y = 1,
+            .block_x = 128,
+        }, &self.kernel_arg_pack, .matvec_qkv);
         return true;
     }
 
@@ -8597,6 +8827,57 @@ pub const CudaBackend = struct {
         return true;
     }
 
+    fn tryFusedI8GateUpSiluForward(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        gate_weight: *const LinearWeight,
+        up_weight: *const LinearWeight,
+        rows: usize,
+        expected_out_dim: u32,
+    ) !bool {
+        if (self.loaded.config.use_gelu) return false;
+        if (rows != 1) return false;
+        const i8_fn = self.i8_matvec_gate_up_silu_function orelse return false;
+
+        const gate = switch (gate_weight.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        const up = switch (up_weight.*) {
+            .gaffine_u8 => |w| w,
+            else => return false,
+        };
+        // Both must have I8 caches populated.
+        if (gate.dequant_i8_cache.pointer == 0 or gate.mean_scale_cache.pointer == 0) return false;
+        if (up.dequant_i8_cache.pointer == 0 or up.mean_scale_cache.pointer == 0) return false;
+        if (!canFuseGaffineGateUpWeights(self.d_model, gate, up)) return false;
+        if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
+
+        const row_count = bufferF32RowCount(input, gate.rows) catch return false;
+        if (row_count != 1) return false;
+
+        const out_dim: u32 = @intCast(gate.cols);
+        const in_dim: u32 = @intCast(gate.rows);
+
+        self.kernel_arg_pack.reset();
+        try self.kernel_arg_pack.appendBufferPtr(input);
+        try self.kernel_arg_pack.appendBufferPtr(&gate.dequant_i8_cache);
+        try self.kernel_arg_pack.appendBufferPtr(&gate.mean_scale_cache);
+        try self.kernel_arg_pack.appendBufferPtr(&up.dequant_i8_cache);
+        try self.kernel_arg_pack.appendBufferPtr(&up.mean_scale_cache);
+        try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_mul_dev);
+        try self.kernel_arg_pack.appendScalar(u32, out_dim);
+        try self.kernel_arg_pack.appendScalar(u32, in_dim);
+        try self.kernel_arg_pack.appendScalar(u32, 1);
+
+        try compute.cuda.launch.launchWithFamily(&self.device, i8_fn, .{
+            .grid_x = (out_dim + 3) / 4,
+            .grid_y = 1,
+            .block_x = 128,
+        }, &self.kernel_arg_pack, .matvec_gate_up_silu);
+        return true;
+    }
+
     fn tryFusedGaffineU8GateUpSiluForward(
         self: *CudaBackend,
         input: *const compute.cuda.Buffer,
@@ -8624,6 +8905,55 @@ pub const CudaBackend = struct {
 
         const fused_kernel = self.gaffine_u8_matvec_gate_up_silu_function orelse return false;
         try compute.cuda.gaffine_u8_matvec_gate_up_silu.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &gate.packed_data,
+            &gate.scales,
+            &gate.biases,
+            &up.packed_data,
+            &up.scales,
+            &up.biases,
+            &self.runtime_buffers.ffn_mul_dev,
+            @intCast(gate.cols),
+            gate.group_size,
+            gate.scales_dtype_tag,
+            up.group_size,
+            up.scales_dtype_tag,
+            @intCast(gate.rows),
+            1,
+        );
+        return true;
+    }
+
+    fn tryFusedGaffineU4GateUpSiluForward(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        gate_weight: *const LinearWeight,
+        up_weight: *const LinearWeight,
+        rows: usize,
+        expected_out_dim: u32,
+    ) !bool {
+        if (self.loaded.config.use_gelu) return false;
+        if (rows != 1) return false;
+
+        const gate = switch (gate_weight.*) {
+            .gaffine_u4 => |w| w,
+            else => return false,
+        };
+        const up = switch (up_weight.*) {
+            .gaffine_u4 => |w| w,
+            else => return false,
+        };
+        if (!canFuseGaffineGateUpWeights(self.d_model, gate, up)) return false;
+        if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
+
+        const row_count = bufferF32RowCount(input, gate.rows) catch return false;
+        if (row_count != 1) return false;
+
+        const fused_kernel = self.gaffine_u4_matvec_gate_up_silu_function orelse return false;
+        try compute.cuda.gaffine_u4_matvec_gate_up_silu.runWithFunction(
             &self.kernel_arg_pack,
             &self.device,
             fused_kernel,
@@ -8812,8 +9142,6 @@ pub const CudaBackend = struct {
     /// F16 cache: eliminates per-prefill dequant kernel overhead.
     /// I8 cache: enables cuBLAS INT8 tensor core GEMM for prefill.
     fn warmupDequantF16Cache(self: *CudaBackend) !void {
-        const dequant_fn = self.gaffine_u8_dequant_f16_function orelse return;
-
         // Resolve INT8 GEMM helper kernels (optional — graceful degradation to F16 path).
         if (self.kernel_registry.resolveFunction("quantize_f32_to_i8", "talu_quantize_f32_to_i8")) |resolved| {
             self.quantize_f32_to_i8_function = resolved.function;
@@ -8827,9 +9155,21 @@ pub const CudaBackend = struct {
         if (self.kernel_registry.resolveFunction("u8_xor_to_i8", "talu_u8_xor_to_i8")) |resolved| {
             self.u8_xor_to_i8_function = resolved.function;
         } else |_| {}
-        // Symmetric INT8 GEMM kernels.
+        // Symmetric INT8 kernels.
+        if (self.kernel_registry.resolveFunction("i8_matvec_f32", "talu_i8_matvec_f32")) |resolved| {
+            self.i8_matvec_function = resolved.function;
+        } else |_| {}
+        if (self.kernel_registry.resolveFunction("i8_matvec_qkv_f32", "talu_i8_matvec_qkv_f32")) |resolved| {
+            self.i8_matvec_qkv_function = resolved.function;
+        } else |_| {}
+        if (self.kernel_registry.resolveFunction("i8_matvec_gate_up_silu_f32", "talu_i8_matvec_gate_up_silu_f32")) |resolved| {
+            self.i8_matvec_gate_up_silu_function = resolved.function;
+        } else |_| {}
         if (self.kernel_registry.resolveFunction("gaffine_u8_to_i8", "talu_gaffine_u8_to_i8")) |resolved| {
             self.gaffine_u8_to_i8_function = resolved.function;
+        } else |_| {}
+        if (self.kernel_registry.resolveFunction("gaffine_u4_to_i8", "talu_gaffine_u4_to_i8")) |resolved| {
+            self.gaffine_u4_to_i8_function = resolved.function;
         } else |_| {}
         if (self.kernel_registry.resolveFunction("quantize_f16_to_i8", "talu_quantize_f16_to_i8")) |resolved| {
             self.quantize_f16_to_i8_function = resolved.function;
@@ -8841,91 +9181,110 @@ pub const CudaBackend = struct {
             self.dequant_i32_scales_function = resolved.function;
         } else |_| {}
 
+        const has_u8_dequant = self.gaffine_u8_dequant_f16_function != null;
+        const has_u4_dequant = self.gaffine_u4_dequant_f16_function != null;
+        const has_u4_to_i8 = self.gaffine_u4_to_i8_function != null;
+        const has_u8_to_i8 = self.gaffine_u8_to_i8_function != null;
+        if (!has_u8_dequant and !has_u4_dequant and !has_u4_to_i8 and !has_u8_to_i8) return;
+
         var total_bytes: usize = 0;
         var weight_count: usize = 0;
 
-        // Helper to create I8 cache for a single gaffine_u8 weight.
-        // Prefers fused U8→I8 kernel (no F16 intermediate), falls back to F16→I8.
-        const dequantWeight = struct {
+        // Helper to launch a fused gaffine→I8 dequant kernel for a single weight.
+        // Shared by both U8 and U4 paths — only the kernel function differs.
+        const launchFusedToI8 = struct {
             fn run(
                 backend: *CudaBackend,
-                dequant_f16_fn: compute.cuda.Function,
-                w: *GaffineU8LinearWeight,
+                fused_fn: compute.cuda.Function,
+                w: *GaffineU4LinearWeight,
                 bytes_out: *usize,
-            ) !void {
+            ) void {
                 const weight_elems = std.math.mul(usize, w.rows, w.cols) catch return;
                 if (weight_elems == 0) return;
                 const i8_bytes = weight_elems;
                 const scale_bytes = std.math.mul(usize, w.cols, @sizeOf(f32)) catch return;
 
+                var i8_buf = backend.device.allocBuffer(i8_bytes) catch return;
+                var scale_buf = backend.device.allocBuffer(scale_bytes) catch {
+                    i8_buf.deinit(&backend.device);
+                    return;
+                };
+
+                // Launch: grid=(out_dim=w.cols), block=(256)
+                backend.kernel_arg_pack.reset();
+                backend.kernel_arg_pack.appendBufferPtr(&w.packed_data) catch {
+                    scale_buf.deinit(&backend.device);
+                    i8_buf.deinit(&backend.device);
+                    return;
+                };
+                backend.kernel_arg_pack.appendBufferPtr(&w.scales) catch {
+                    scale_buf.deinit(&backend.device);
+                    i8_buf.deinit(&backend.device);
+                    return;
+                };
+                backend.kernel_arg_pack.appendBufferPtr(&w.biases) catch {
+                    scale_buf.deinit(&backend.device);
+                    i8_buf.deinit(&backend.device);
+                    return;
+                };
+                backend.kernel_arg_pack.appendBufferPtr(&i8_buf) catch {
+                    scale_buf.deinit(&backend.device);
+                    i8_buf.deinit(&backend.device);
+                    return;
+                };
+                backend.kernel_arg_pack.appendBufferPtr(&scale_buf) catch {
+                    scale_buf.deinit(&backend.device);
+                    i8_buf.deinit(&backend.device);
+                    return;
+                };
+                backend.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch {
+                    scale_buf.deinit(&backend.device);
+                    i8_buf.deinit(&backend.device);
+                    return;
+                };
+                backend.kernel_arg_pack.appendScalar(u32, w.group_size) catch {
+                    scale_buf.deinit(&backend.device);
+                    i8_buf.deinit(&backend.device);
+                    return;
+                };
+                backend.kernel_arg_pack.appendScalar(u32, w.scales_dtype_tag) catch {
+                    scale_buf.deinit(&backend.device);
+                    i8_buf.deinit(&backend.device);
+                    return;
+                };
+                compute.cuda.launch.launchWithFamily(&backend.device, fused_fn, .{
+                    .grid_x = @intCast(w.cols),
+                    .block_x = 256,
+                }, &backend.kernel_arg_pack, .other) catch {
+                    scale_buf.deinit(&backend.device);
+                    i8_buf.deinit(&backend.device);
+                    return;
+                };
+
+                w.dequant_i8_cache = i8_buf;
+                w.mean_scale_cache = scale_buf;
+                bytes_out.* += i8_bytes + scale_bytes;
+            }
+        }.run;
+
+        // Helper to create I8 cache for a single gaffine_u8 weight.
+        // Prefers fused U8→I8 kernel (no F16 intermediate), falls back to F16→I8.
+        const dequantU8Weight = struct {
+            fn run(
+                backend: *CudaBackend,
+                w: *GaffineU8LinearWeight,
+                bytes_out: *usize,
+            ) void {
                 // Try fused U8→I8 path (no F16 intermediate, saves ~50% VRAM).
                 if (backend.gaffine_u8_to_i8_function) |fused_fn| {
-                    var i8_buf = backend.device.allocBuffer(i8_bytes) catch return;
-                    errdefer i8_buf.deinit(&backend.device);
-                    var scale_buf = backend.device.allocBuffer(scale_bytes) catch {
-                        i8_buf.deinit(&backend.device);
-                        return;
-                    };
-                    errdefer scale_buf.deinit(&backend.device);
-
-                    // Launch: grid=(out_dim=w.cols), block=(256)
-                    backend.kernel_arg_pack.reset();
-                    backend.kernel_arg_pack.appendBufferPtr(&w.packed_data) catch {
-                        scale_buf.deinit(&backend.device);
-                        i8_buf.deinit(&backend.device);
-                        return;
-                    };
-                    backend.kernel_arg_pack.appendBufferPtr(&w.scales) catch {
-                        scale_buf.deinit(&backend.device);
-                        i8_buf.deinit(&backend.device);
-                        return;
-                    };
-                    backend.kernel_arg_pack.appendBufferPtr(&w.biases) catch {
-                        scale_buf.deinit(&backend.device);
-                        i8_buf.deinit(&backend.device);
-                        return;
-                    };
-                    backend.kernel_arg_pack.appendBufferPtr(&i8_buf) catch {
-                        scale_buf.deinit(&backend.device);
-                        i8_buf.deinit(&backend.device);
-                        return;
-                    };
-                    backend.kernel_arg_pack.appendBufferPtr(&scale_buf) catch {
-                        scale_buf.deinit(&backend.device);
-                        i8_buf.deinit(&backend.device);
-                        return;
-                    };
-                    backend.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch {
-                        scale_buf.deinit(&backend.device);
-                        i8_buf.deinit(&backend.device);
-                        return;
-                    };
-                    backend.kernel_arg_pack.appendScalar(u32, w.group_size) catch {
-                        scale_buf.deinit(&backend.device);
-                        i8_buf.deinit(&backend.device);
-                        return;
-                    };
-                    backend.kernel_arg_pack.appendScalar(u32, w.scales_dtype_tag) catch {
-                        scale_buf.deinit(&backend.device);
-                        i8_buf.deinit(&backend.device);
-                        return;
-                    };
-                    compute.cuda.launch.launchWithFamily(&backend.device, fused_fn, .{
-                        .grid_x = @intCast(w.cols),
-                        .block_x = 256,
-                    }, &backend.kernel_arg_pack, .other) catch {
-                        scale_buf.deinit(&backend.device);
-                        i8_buf.deinit(&backend.device);
-                        return;
-                    };
-
-                    w.dequant_i8_cache = i8_buf;
-                    w.mean_scale_cache = scale_buf;
-                    bytes_out.* += i8_bytes + scale_bytes;
+                    launchFusedToI8(backend, fused_fn, w, bytes_out);
                     return;
                 }
 
                 // Fallback: dequant to F16 cache (for F16 GEMM path).
+                const dequant_f16_fn = backend.gaffine_u8_dequant_f16_function orelse return;
+                const weight_elems = std.math.mul(usize, w.rows, w.cols) catch return;
+                if (weight_elems == 0) return;
                 const weight_f16_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch return;
                 var cache_buf = backend.device.allocBuffer(weight_f16_bytes) catch return;
                 errdefer cache_buf.deinit(&backend.device);
@@ -8953,17 +9312,18 @@ pub const CudaBackend = struct {
         }.run;
 
         // Helper to process a LinearWeight if it is gaffine_u8.
+        // gaffine_u4 weights use native U4 GEMV kernels for decode and
+        // on-the-fly F16 dequant for prefill, so no I8 cache is needed.
         const maybeProcess = struct {
             fn run(
                 backend: *CudaBackend,
-                function: compute.cuda.Function,
                 weight: *LinearWeight,
                 bytes_out: *usize,
                 count_out: *usize,
-            ) !void {
+            ) void {
                 switch (weight.*) {
                     .gaffine_u8 => |*w| {
-                        try dequantWeight(backend, function, w, bytes_out);
+                        dequantU8Weight(backend, w, bytes_out);
                         count_out.* += 1;
                     },
                     else => {},
@@ -8975,49 +9335,48 @@ pub const CudaBackend = struct {
         const maybeProcessOpt = struct {
             fn run(
                 backend: *CudaBackend,
-                function: compute.cuda.Function,
                 weight_opt: *?LinearWeight,
                 bytes_out: *usize,
                 count_out: *usize,
-            ) !void {
+            ) void {
                 if (weight_opt.*) |*w| {
-                    try maybeProcess(backend, function, w, bytes_out, count_out);
+                    maybeProcess(backend, w, bytes_out, count_out);
                 }
             }
         }.run;
 
         for (self.block_runtime.blocks) |*layer| {
             if (layer.attention_runtime) |*attn| {
-                try maybeProcess(self, dequant_fn, &attn.q_proj, &total_bytes, &weight_count);
-                try maybeProcess(self, dequant_fn, &attn.k_proj, &total_bytes, &weight_count);
-                try maybeProcess(self, dequant_fn, &attn.v_proj, &total_bytes, &weight_count);
-                try maybeProcess(self, dequant_fn, &attn.o_proj, &total_bytes, &weight_count);
-                try maybeProcess(self, dequant_fn, &attn.w1, &total_bytes, &weight_count);
-                try maybeProcess(self, dequant_fn, &attn.w2, &total_bytes, &weight_count);
-                try maybeProcess(self, dequant_fn, &attn.w3, &total_bytes, &weight_count);
+                maybeProcess(self, &attn.q_proj, &total_bytes, &weight_count);
+                maybeProcess(self, &attn.k_proj, &total_bytes, &weight_count);
+                maybeProcess(self, &attn.v_proj, &total_bytes, &weight_count);
+                maybeProcess(self, &attn.o_proj, &total_bytes, &weight_count);
+                maybeProcess(self, &attn.w1, &total_bytes, &weight_count);
+                maybeProcess(self, &attn.w2, &total_bytes, &weight_count);
+                maybeProcess(self, &attn.w3, &total_bytes, &weight_count);
             }
             if (layer.shortconv_runtime) |*sc| {
-                try maybeProcess(self, dequant_fn, &sc.in_proj, &total_bytes, &weight_count);
-                try maybeProcess(self, dequant_fn, &sc.out_proj, &total_bytes, &weight_count);
-                try maybeProcessOpt(self, dequant_fn, &sc.ffn_w1, &total_bytes, &weight_count);
-                try maybeProcessOpt(self, dequant_fn, &sc.ffn_w2, &total_bytes, &weight_count);
-                try maybeProcessOpt(self, dequant_fn, &sc.ffn_w3, &total_bytes, &weight_count);
+                maybeProcess(self, &sc.in_proj, &total_bytes, &weight_count);
+                maybeProcess(self, &sc.out_proj, &total_bytes, &weight_count);
+                maybeProcessOpt(self, &sc.ffn_w1, &total_bytes, &weight_count);
+                maybeProcessOpt(self, &sc.ffn_w2, &total_bytes, &weight_count);
+                maybeProcessOpt(self, &sc.ffn_w3, &total_bytes, &weight_count);
             }
             if (layer.gated_delta_runtime) |*gd| {
-                try maybeProcess(self, dequant_fn, &gd.in_proj, &total_bytes, &weight_count);
-                try maybeProcess(self, dequant_fn, &gd.out_proj, &total_bytes, &weight_count);
-                try maybeProcessOpt(self, dequant_fn, &gd.ffn_w1, &total_bytes, &weight_count);
-                try maybeProcessOpt(self, dequant_fn, &gd.ffn_w2, &total_bytes, &weight_count);
-                try maybeProcessOpt(self, dequant_fn, &gd.ffn_w3, &total_bytes, &weight_count);
+                maybeProcess(self, &gd.in_proj, &total_bytes, &weight_count);
+                maybeProcess(self, &gd.out_proj, &total_bytes, &weight_count);
+                maybeProcessOpt(self, &gd.ffn_w1, &total_bytes, &weight_count);
+                maybeProcessOpt(self, &gd.ffn_w2, &total_bytes, &weight_count);
+                maybeProcessOpt(self, &gd.ffn_w3, &total_bytes, &weight_count);
             }
         }
 
         // Projection weight (lm_head).
-        try maybeProcess(self, dequant_fn, &self.runtime_buffers.projection_weight, &total_bytes, &weight_count);
+        maybeProcess(self, &self.runtime_buffers.projection_weight, &total_bytes, &weight_count);
 
         if (weight_count > 0) {
             try self.device.synchronize();
-            log.info("inference", "CUDA gaffine U8 dequant cache ready", .{
+            log.info("inference", "CUDA gaffine dequant cache ready", .{
                 .weights = weight_count,
                 .cache_mib = total_bytes / (1024 * 1024),
             });
@@ -9263,9 +9622,17 @@ pub const CudaBackend = struct {
                 self.gaffine_u8_matvec_gate_up_function = resolved.function;
                 self.gaffine_u8_matvec_gate_up_source = resolved.source;
             },
+            .gaffine_u4_matvec_gate_up_silu => {
+                self.gaffine_u4_matvec_gate_up_silu_function = resolved.function;
+                self.gaffine_u4_matvec_gate_up_silu_source = resolved.source;
+            },
             .gaffine_u8_matvec_gate_up_silu => {
                 self.gaffine_u8_matvec_gate_up_silu_function = resolved.function;
                 self.gaffine_u8_matvec_gate_up_silu_source = resolved.source;
+            },
+            .gaffine_u4_dequant_f16 => {
+                self.gaffine_u4_dequant_f16_function = resolved.function;
+                self.gaffine_u4_dequant_f16_source = resolved.source;
             },
             .gaffine_u8_dequant_f16 => {
                 self.gaffine_u8_dequant_f16_function = resolved.function;

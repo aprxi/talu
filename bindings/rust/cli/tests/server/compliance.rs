@@ -134,6 +134,7 @@ fn build_app_with_model(model: &str) -> Router {
         agent_runtime_mode: AgentRuntimeMode::Host,
         sandbox_backend: SandboxBackend::LinuxLocal,
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
+        active_stop_flags: std::sync::Mutex::new(Vec::new()),
     };
 
     Router::new(Arc::new(state))
@@ -169,6 +170,7 @@ fn build_app_no_model() -> Router {
         agent_runtime_mode: AgentRuntimeMode::Host,
         sandbox_backend: SandboxBackend::LinuxLocal,
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
+        active_stop_flags: std::sync::Mutex::new(Vec::new()),
     };
 
     Router::new(Arc::new(state))

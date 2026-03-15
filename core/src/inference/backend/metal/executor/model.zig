@@ -148,10 +148,12 @@ fn traceLastHiddenVector(
     }
 }
 
-fn emitBlockOutHostTrace(
+fn emitLayerActivationHostTrace(
     allocator: std.mem.Allocator,
     hidden: ArrayHandle,
-    layer_idx: usize,
+    point: trace.TracePoint,
+    kernel_name: ?[]const u8,
+    layer_idx: ?usize,
     fallback_seq_len: usize,
     fallback_d_model: usize,
 ) !void {
@@ -196,8 +198,8 @@ fn emitBlockOutHostTrace(
     mlx_graph.copyToHost(hidden, host_buf);
 
     trace.emit(
-        .block_out,
-        @intCast(layer_idx),
+        point,
+        if (layer_idx) |idx| @intCast(idx) else trace.TraceEmission.NO_LAYER,
         0,
         @intCast(mapped.seq),
         @ptrCast(host_buf.ptr),
@@ -209,7 +211,7 @@ fn emitBlockOutHostTrace(
             0,
         },
         3,
-        "metal_block_out_host",
+        kernel_name,
     );
 }
 
@@ -359,12 +361,35 @@ pub const Model = struct {
             break :blk mlx_graph.createArrayF32(hidden_values, &hidden_shape);
         } else try gatherTokenEmbeddingsLazy(weight_handles, input_ids);
 
+        if (pos_offset == 0 and trace.shouldEmit(.embed)) {
+            try emitLayerActivationHostTrace(
+                allocator,
+                hidden,
+                .embed,
+                "metal_embed_tokens_host",
+                null,
+                sequence_len,
+                @intCast(weight_handles.d_model),
+            );
+        }
+
         if (trace_hidden_debug) {
             try traceLastHiddenVector(allocator, "metal", phase, null, hidden, sequence_len, @intCast(weight_handles.d_model));
         }
 
         for (0..layer_count) |layer_idx| {
             const layer_start_ns: i128 = if (trace_layer_timing) std.time.nanoTimestamp() else 0;
+            if (trace.shouldEmit(.layer_input)) {
+                try emitLayerActivationHostTrace(
+                    allocator,
+                    hidden,
+                    .layer_input,
+                    "metal_layer_input_host",
+                    layer_idx,
+                    sequence_len,
+                    @intCast(weight_handles.d_model),
+                );
+            }
             hidden = try block_executor.TransformerBlock.forward(
                 hidden,
                 &weight_handles.layers[layer_idx],
@@ -397,9 +422,11 @@ pub const Model = struct {
             }
 
             if (trace.shouldEmit(.block_out)) {
-                try emitBlockOutHostTrace(
+                try emitLayerActivationHostTrace(
                     allocator,
                     hidden,
+                    .block_out,
+                    "metal_block_out_host",
                     layer_idx,
                     sequence_len,
                     @intCast(weight_handles.d_model),
