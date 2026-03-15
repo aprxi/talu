@@ -91,10 +91,12 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
     // Basic integer types
     if (eql(zig_type, "i32") or eql(zig_type, "c_int")) return "c_int";
     if (eql(zig_type, "i64")) return "i64";
+    if (eql(zig_type, "i128")) return "i128";
     if (eql(zig_type, "u8")) return "u8";
     if (eql(zig_type, "u16")) return "u16";
     if (eql(zig_type, "u32")) return "u32";
     if (eql(zig_type, "u64")) return "u64";
+    if (eql(zig_type, "u128")) return "u128";
     if (eql(zig_type, "usize")) return "usize";
     if (eql(zig_type, "isize")) return "isize";
 

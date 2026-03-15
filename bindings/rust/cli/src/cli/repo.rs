@@ -775,39 +775,45 @@ fn sample_model_raw_no_stream(
     prompt: &str,
     max_tokens: usize,
 ) -> Result<PinSampleResult> {
-    let gen_cfg = generation_config(model_path)?;
+    // Parse environment overrides
     let temperature_from_env = env::var("TEMPERATURE")
         .ok()
         .and_then(|v| v.parse::<f32>().ok());
-    let temperature = temperature_from_env.unwrap_or(gen_cfg.temperature);
-    let top_k = env::var("TOP_K")
+    let top_k_from_env = env::var("TOP_K")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(gen_cfg.top_k);
-    let top_p = env::var("TOP_P")
+        .and_then(|v| v.parse::<usize>().ok());
+    let top_p_from_env = env::var("TOP_P")
         .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(gen_cfg.top_p);
+        .and_then(|v| v.parse::<f32>().ok());
 
-    if temperature < 0.0 {
-        bail!("Error: TEMPERATURE must be >= 0, got {}", temperature);
-    }
-    if !(0.0..=1.0).contains(&top_p) {
-        bail!("Error: TOP_P must be in range [0.0, 1.0], got {}", top_p);
+    // Use core-owned policy to resolve effective generation config
+    let effective = talu::model::resolve_effective_generation_config(
+        model_path,
+        &talu::EffectiveGenConfigRequest {
+            temperature: temperature_from_env,
+            top_k: top_k_from_env,
+            top_p: top_p_from_env,
+            max_tokens,
+            ..Default::default()
+        },
+    )?;
+
+    // Validate top_p range
+    if !(0.0..=1.0).contains(&effective.top_p) {
+        bail!("Error: TOP_P must be in range [0.0, 1.0], got {}", effective.top_p);
     }
 
-    let mut cfg = talu::router::GenerateConfig {
-        max_tokens,
+    let cfg = talu::router::GenerateConfig {
+        max_tokens: effective.max_tokens,
+        temperature: effective.temperature,
+        top_k: effective.top_k,
+        top_p: effective.top_p,
+        min_p: effective.min_p,
+        repetition_penalty: effective.repetition_penalty,
+        seed: effective.seed,
         raw_output: true,
         ..Default::default()
     };
-    if (gen_cfg.do_sample || temperature_from_env.is_some()) && temperature > 0.0 {
-        cfg.temperature = temperature;
-        cfg.top_k = top_k;
-        cfg.top_p = top_p;
-    } else {
-        cfg.temperature = 0.0;
-    }
 
     let chat = ChatHandle::new(Some("You are a helpful assistant."))?;
     let content = vec![talu::router::ContentPart::Text(prompt.to_string())];
@@ -1298,10 +1304,6 @@ pub(super) fn resolve_model_for_inference(model_arg: &str) -> Result<String> {
 
     repo_fetch_with_progress(model_arg, false, None)?;
     resolve_model_path(model_arg)
-}
-
-pub(super) fn generation_config(model_dir: &str) -> Result<talu::GenerationConfigInfo> {
-    talu::model::get_generation_config(model_dir).map_err(|e| anyhow!("{}", e))
 }
 
 /// Result type for cache path lookup - distinguishes "not cached" from errors.

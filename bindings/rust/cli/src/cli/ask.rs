@@ -12,13 +12,14 @@ use talu::{ChatHandle, InferenceBackend, StorageError, StorageHandle};
 
 use crate::provider::{get_provider, parse_model_target, ModelTarget};
 
-use super::repo::{generation_config, resolve_model_for_inference, UnifiedProgressCtx};
+use super::repo::{resolve_model_for_inference, UnifiedProgressCtx};
 use super::sessions::{print_sessions_with_stats, resolve_session_target, show_session_transcript};
 use super::util::{truncate_str, DEFAULT_MAX_TOKENS};
 use super::{AskArgs, AskOutputFormat};
 
 use super::models::list_provider_models;
 
+pub(super) const DEFAULT_SYSTEM_MESSAGE: &str = "You are a helpful assistant.";
 const DEFAULT_STDIN_IMAGE_PROMPT: &str = "Describe this image.";
 
 fn has_visible_text(text: &str) -> bool {
@@ -95,7 +96,7 @@ impl StreamCtx {
     }
 }
 
-fn reasoning_text_for_item(conv: &impl ResponsesView, index: usize) -> Result<String> {
+pub(super) fn reasoning_text_for_item(conv: &impl ResponsesView, index: usize) -> Result<String> {
     let reasoning = conv.get_reasoning(index)?;
     let mut out = String::new();
     for part_index in 0..reasoning.content_count {
@@ -105,7 +106,7 @@ fn reasoning_text_for_item(conv: &impl ResponsesView, index: usize) -> Result<St
     Ok(out)
 }
 
-fn latest_visible_text(chat: &ChatHandle, include_reasoning: bool) -> Result<Option<String>> {
+pub(super) fn latest_visible_text(chat: &ChatHandle, include_reasoning: bool) -> Result<Option<String>> {
     let conv = chat.responses();
     let count = conv.item_count();
     if count == 0 {
@@ -590,8 +591,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     // Local inference path
     let resolved_model = resolve_model_for_inference(&model_arg)?;
 
-    let gen_cfg = generation_config(&resolved_model)?;
-
+    // Parse environment overrides
     let max_tokens = env::var("TOKENS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -599,21 +599,29 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     let temperature_from_env = env::var("TEMPERATURE")
         .ok()
         .and_then(|v| v.parse::<f32>().ok());
-    let temperature = temperature_from_env.unwrap_or(gen_cfg.temperature);
-    let top_k = env::var("TOP_K")
+    let top_k_from_env = env::var("TOP_K")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(gen_cfg.top_k);
-    let top_p = env::var("TOP_P")
+        .and_then(|v| v.parse::<usize>().ok());
+    let top_p_from_env = env::var("TOP_P")
         .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(gen_cfg.top_p);
+        .and_then(|v| v.parse::<f32>().ok());
 
-    if temperature < 0.0 {
-        bail!("Error: TEMPERATURE must be >= 0, got {}", temperature);
-    }
-    if !(0.0..=1.0).contains(&top_p) {
-        bail!("Error: TOP_P must be in range [0.0, 1.0], got {}", top_p);
+    // Use core-owned policy to resolve effective generation config
+    let effective = talu::model::resolve_effective_generation_config(
+        &resolved_model,
+        &talu::EffectiveGenConfigRequest {
+            temperature: temperature_from_env,
+            top_k: top_k_from_env,
+            top_p: top_p_from_env,
+            seed,
+            max_tokens,
+            ..Default::default()
+        },
+    )?;
+
+    // Validate top_p range
+    if !(0.0..=1.0).contains(&effective.top_p) {
+        bail!("Error: TOP_P must be in range [0.0, 1.0], got {}", effective.top_p);
     }
 
     if no_chat {
@@ -646,18 +654,16 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     }
 
     let mut cfg = talu::router::GenerateConfig {
-        max_tokens,
-        seed,
+        max_tokens: effective.max_tokens,
+        temperature: effective.temperature,
+        top_k: effective.top_k,
+        top_p: effective.top_p,
+        min_p: effective.min_p,
+        repetition_penalty: effective.repetition_penalty,
+        seed: effective.seed,
         raw_output,
         ..Default::default()
     };
-    if (gen_cfg.do_sample || temperature_from_env.is_some()) && temperature > 0.0 {
-        cfg.temperature = temperature;
-        cfg.top_k = top_k;
-        cfg.top_p = top_p;
-    } else {
-        cfg.temperature = 0.0;
-    }
 
     if no_chat {
         cfg.template_override = Some("{{ messages[-1].content }}".to_string());

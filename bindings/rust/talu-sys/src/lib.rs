@@ -765,6 +765,43 @@ impl Default for CTransformerConfig {
     }
 }
 
+/// Source: core/src/capi/router.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CModelInfo {
+    pub file_size: u64,
+    pub tensor_count: u64,
+    pub vocab_size: c_int,
+    pub d_model: c_int,
+    pub n_layers: c_int,
+    pub n_heads: c_int,
+    pub n_kv_groups: c_int,
+    pub d_ff: c_int,
+    pub max_seq_len: c_int,
+    pub gaffine_group_size: c_int,
+    pub weight_dtype: u8,
+    pub _pad: [u8; 7],
+}
+
+impl Default for CModelInfo {
+    fn default() -> Self {
+        Self {
+            file_size: 0,
+            tensor_count: 0,
+            vocab_size: 0,
+            d_model: 0,
+            n_layers: 0,
+            n_heads: 0,
+            n_kv_groups: 0,
+            d_ff: 0,
+            max_seq_len: 0,
+            gaffine_group_size: 0,
+            weight_dtype: 0,
+            _pad: [0; 7],
+        }
+    }
+}
+
 /// Source: core/src/capi/provider_config.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1714,6 +1751,35 @@ impl Default for CCollabSummary {
     }
 }
 
+/// Source: core/src/capi/session.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EffectiveGenConfig {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub repetition_penalty: f32,
+    pub seed: u64,
+    pub max_tokens: usize,
+    pub do_sample: bool,
+}
+
+impl Default for EffectiveGenConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 0.0,
+            min_p: 0.0,
+            repetition_penalty: 0.0,
+            seed: 0,
+            max_tokens: 0,
+            do_sample: false,
+        }
+    }
+}
+
 /// Source: core/src/capi/provider_config.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -2487,25 +2553,6 @@ impl Default for CGenerateResult {
             tool_call_count: 0,
         }
     }
-}
-
-/// Static model metadata from a local backend.
-/// Source: core/src/capi/router.zig
-#[repr(C)]
-#[derive(Copy, Clone, Default)]
-pub struct CModelInfo {
-    pub file_size: u64,
-    pub tensor_count: u64,
-    pub vocab_size: i32,
-    pub d_model: i32,
-    pub n_layers: i32,
-    pub n_heads: i32,
-    pub n_kv_groups: i32,
-    pub d_ff: i32,
-    pub max_seq_len: i32,
-    pub gaffine_group_size: i32,
-    pub weight_dtype: u8,
-    pub _pad: [u8; 7],
 }
 
 /// Source: core/src/capi/db/table.zig
@@ -3906,6 +3953,33 @@ impl Default for DLManagedTensor {
     }
 }
 
+/// Source: core/src/capi/session.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EffectiveGenConfigRequest {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub repetition_penalty: f32,
+    pub seed: u64,
+    pub max_tokens: usize,
+}
+
+impl Default for EffectiveGenConfigRequest {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 0.0,
+            min_p: 0.0,
+            repetition_penalty: 0.0,
+            seed: 0,
+            max_tokens: 0,
+        }
+    }
+}
+
 /// Source: core/src/capi/db/kv.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -4930,6 +5004,8 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_total_size() -> u64;
     // core/src/capi/session.zig
+    pub fn talu_resolve_effective_generation_config(model_dir: *const c_char, request: *const EffectiveGenConfigRequest, out_config: *mut EffectiveGenConfig) -> c_int;
+    // core/src/capi/session.zig
     pub fn talu_resolve_model_path(model_path: *const c_char, out_path: *mut c_void) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_responses_append_function_call(handle: *mut ResponsesHandle, call_id: *const c_char, name: *const c_char, arguments_ptr: *const u8, arguments_len: usize) -> i64;
@@ -5050,8 +5126,6 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_router_iterator_generation_ns(iterator: *mut c_void) -> u64;
     // core/src/capi/router.zig
-    pub fn talu_router_iterator_ttft_ns(iterator: *mut c_void) -> u64;
-    // core/src/capi/router.zig
     pub fn talu_router_iterator_has_error(iterator: *mut c_void) -> bool;
     // core/src/capi/router.zig
     pub fn talu_router_iterator_item_type(iterator: *mut c_void) -> u8;
@@ -5067,6 +5141,8 @@ extern "C" {
     pub fn talu_router_iterator_streamed_token_count(iterator: *mut c_void) -> usize;
     // core/src/capi/router.zig
     pub fn talu_router_iterator_token_timestamp_ns(iterator: *mut c_void) -> i128;
+    // core/src/capi/router.zig
+    pub fn talu_router_iterator_ttft_ns(iterator: *mut c_void) -> u64;
     // core/src/capi/router.zig
     pub fn talu_router_result_free(result: *mut CGenerateResult);
     // core/src/capi/validate.zig

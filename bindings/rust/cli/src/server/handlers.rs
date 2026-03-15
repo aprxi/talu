@@ -3737,6 +3737,7 @@ mod tests {
             reasoning: None,
             safety_identifier: None,
             service_tier: None,
+            seed: None,
             store: None,
             stream: None,
             stream_options: None,

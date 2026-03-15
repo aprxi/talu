@@ -1183,19 +1183,26 @@ pub const TransformerBlock = struct {
         gated_delta: gated_delta_kernel.GatedDeltaKernel,
         layer_idx: usize,
         gated_delta_cache: ?GatedDeltaCache,
+        capture_enabled: bool,
+        capture_state: ?*gated_delta_kernel.GatedDeltaState,
     ) !mlx_graph.ArrayHandle {
         var kernel = gated_delta;
-        var gd_state = gated_delta_kernel.GatedDeltaState{
+        var local_state = gated_delta_kernel.GatedDeltaState{
             .cache = gated_delta_cache,
             .layer_idx = layer_idx,
+            .capture_enabled = capture_enabled,
         };
+        const gd_state = capture_state orelse &local_state;
+        gd_state.cache = gated_delta_cache;
+        gd_state.layer_idx = layer_idx;
+        gd_state.capture_enabled = capture_enabled;
         var gd_scratch = gated_delta_kernel.GatedDeltaScratch{};
         var gd_matmul = gated_delta_kernel.MatmulScratch{};
         var gd_out: mlx_graph.ArrayHandle = undefined;
         try kernel.forward(
             input,
             &gd_out,
-            &gd_state,
+            gd_state,
             &gd_scratch,
             &gd_matmul,
         );
@@ -1756,13 +1763,35 @@ pub const TransformerBlock = struct {
         gated_delta_binding.conv_bias = optionalArrayWeightFromHandle(weight_handles[4]);
         gated_delta_binding.dt_bias = optionalArrayWeightFromHandle(weight_handles[5]);
         gated_delta_binding.norm_weight = optionalArrayWeightFromHandle(weight_handles[6]);
+        const capture_enabled =
+            trace.shouldEmit(.gdelta_in_proj) or
+            trace.shouldEmit(.gdelta_conv) or
+            trace.shouldEmit(.gdelta_ssm) or
+            trace.shouldEmit(.gdelta_norm);
+        var gd_capture_state: gated_delta_kernel.GatedDeltaState = .{};
         const output = try runGatedDeltaKernel(
             input,
             gated_delta_binding,
             state.layer_idx,
             gated_delta_cache,
+            capture_enabled,
+            if (capture_enabled) &gd_capture_state else null,
         );
         arraySlotFromHandle(io.outputs[0]).* = output;
+        if (capture_enabled) {
+            if (trace.shouldEmit(.gdelta_in_proj) and gd_capture_state.capture_in_proj != null) {
+                emitArrayPerTokenHostTracePoint(state, gd_capture_state.capture_in_proj, .gdelta_in_proj, "metal_gdelta_in_proj_host");
+            }
+            if (trace.shouldEmit(.gdelta_conv) and gd_capture_state.capture_conv != null) {
+                emitArrayPerTokenHostTracePoint(state, gd_capture_state.capture_conv, .gdelta_conv, "metal_gdelta_conv_host");
+            }
+            if (trace.shouldEmit(.gdelta_ssm) and gd_capture_state.capture_ssm != null) {
+                emitArrayPerTokenHostTracePoint(state, gd_capture_state.capture_ssm, .gdelta_ssm, "metal_gdelta_ssm_host");
+            }
+            if (trace.shouldEmit(.gdelta_norm) and gd_capture_state.capture_norm != null) {
+                emitArrayPerTokenHostTracePoint(state, gd_capture_state.capture_norm, .gdelta_norm, "metal_gdelta_norm_host");
+            }
+        }
         if (trace.shouldEmit(.gdelta_out)) {
             emitArrayPerTokenHostTracePoint(state, output, .gdelta_out, "metal_gdelta_out_host");
         }
