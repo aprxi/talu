@@ -12,7 +12,7 @@ pub const embedded_module = cuda_assets.kernels_fatbin;
 pub const embedded_symbol: [:0]const u8 = "talu_gaffine_u4_matvec_gate_up_f32";
 pub const op_name: []const u8 = "gaffine_u4_matvec_gate_up_f32";
 const warp_size: u32 = 32;
-const block_x: u32 = 256;
+const block_x: u32 = 128;
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,
@@ -143,7 +143,7 @@ fn validateOne(
     batch_rows: u32,
 ) !void {
     if (in_dim == 0 or out_dim == 0 or group_size == 0) return error.InvalidArgument;
-    if ((in_dim % 8) != 0 or (group_size % 8) != 0) return error.InvalidArgument;
+    if ((in_dim % 32) != 0 or (group_size % 8) != 0) return error.InvalidArgument;
     if ((in_dim % group_size) != 0) return error.InvalidArgument;
     if (scales_dtype_tag != gaffine.scales_dtype_f16 and scales_dtype_tag != gaffine.scales_dtype_bf16) {
         return error.InvalidArgument;
@@ -200,7 +200,7 @@ test "validateArgs rejects invalid group alignment" {
             8,
             8,
             gaffine.scales_dtype_bf16,
-            16,
+            32,
             1,
         ),
     );
@@ -227,7 +227,7 @@ test "validateArgs rejects zero batch rows" {
             8,
             8,
             gaffine.scales_dtype_bf16,
-            16,
+            32,
             0,
         ),
     );

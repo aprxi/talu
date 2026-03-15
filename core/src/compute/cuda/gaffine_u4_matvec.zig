@@ -14,7 +14,7 @@ pub const op_name: []const u8 = "gaffine_u4_matvec_f32";
 pub const scales_dtype_f16: u32 = 0;
 pub const scales_dtype_bf16: u32 = 1;
 const warp_size: u32 = 32;
-const block_x: u32 = 256;
+const block_x: u32 = 128;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -106,7 +106,7 @@ fn validateArgs(
     batch_rows: u32,
 ) !void {
     if (in_dim == 0 or out_dim == 0 or group_size == 0 or batch_rows == 0) return error.InvalidArgument;
-    if ((in_dim % 8) != 0 or (group_size % 8) != 0) return error.InvalidArgument;
+    if ((in_dim % 32) != 0 or (group_size % 8) != 0) return error.InvalidArgument;
     if ((in_dim % group_size) != 0) return error.InvalidArgument;
     if (scales_dtype_tag != scales_dtype_f16 and scales_dtype_tag != scales_dtype_bf16) return error.InvalidArgument;
 
@@ -145,7 +145,7 @@ test "validateArgs rejects invalid group alignment" {
     var out = b;
     try std.testing.expectError(
         error.InvalidArgument,
-        validateArgs(&b, &b, &b, &b, &out, 16, 8, 12, scales_dtype_bf16, 1),
+        validateArgs(&b, &b, &b, &b, &out, 32, 8, 12, scales_dtype_bf16, 1),
     );
 }
 
@@ -154,7 +154,7 @@ test "validateArgs rejects invalid scales dtype tag" {
     var out = b;
     try std.testing.expectError(
         error.InvalidArgument,
-        validateArgs(&b, &b, &b, &b, &out, 16, 8, 8, 7, 1),
+        validateArgs(&b, &b, &b, &b, &out, 32, 8, 8, 7, 1),
     );
 }
 
@@ -163,6 +163,6 @@ test "validateArgs rejects zero batch rows" {
     var out = b;
     try std.testing.expectError(
         error.InvalidArgument,
-        validateArgs(&b, &b, &b, &b, &out, 16, 8, 8, scales_dtype_bf16, 0),
+        validateArgs(&b, &b, &b, &b, &out, 32, 8, 8, scales_dtype_bf16, 0),
     );
 }
