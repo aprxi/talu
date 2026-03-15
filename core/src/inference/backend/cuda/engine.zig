@@ -740,6 +740,9 @@ const LayerAttentionRuntime = struct {
     k_cache: compute.cuda.Buffer,
     v_cache: compute.cuda.Buffer,
     kv_capacity: usize,
+    qkv_i8_concat: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
+    qkv_scales_concat: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
+    qkv_concat_dims: [3]u32 = .{ 0, 0, 0 },
     cpu_kernel: ?cpu_kernels.MultiHeadAttention = null,
     cpu_cache: ?cpu_kernels.AttnCache = null,
     cpu_scratch: ?cpu_kernels.AttnTemp = null,
@@ -749,6 +752,8 @@ const LayerAttentionRuntime = struct {
         if (self.cpu_matmul_scratch) |*scratch| scratch.deinit();
         if (self.cpu_scratch) |*scratch| scratch.deinit(self.cpu_kernel.?.allocator);
         if (self.cpu_cache) |*cache| cache.deinit(self.cpu_kernel.?.allocator);
+        if (self.qkv_scales_concat.pointer != 0) self.qkv_scales_concat.deinit(device);
+        if (self.qkv_i8_concat.pointer != 0) self.qkv_i8_concat.deinit(device);
         self.v_cache.deinit(device);
         self.k_cache.deinit(device);
         if (self.post_ffn_norm_weight) |*w| w.deinit(device);
@@ -823,6 +828,12 @@ fn logicalF32RowSlice(
     const row_offset = std.math.mul(usize, row_index, row_stride) catch return error.InvalidArgument;
     return bufferSlice(buffer, row_offset, row_bytes);
 }
+
+const QkvI8ConcatRef = struct {
+    i8_buf: compute.cuda.Buffer,
+    scales_buf: compute.cuda.Buffer,
+    dims: [3]u32,
+};
 
 const AttentionWeightRefs = struct {
     q_proj: ?*const LinearWeight = null,
@@ -2721,7 +2732,10 @@ pub const CudaBackend = struct {
     quantize_f16_to_i8_function: ?compute.cuda.Function = null,
     quantize_f32_to_i8_simple_function: ?compute.cuda.Function = null,
     dequant_i32_scales_function: ?compute.cuda.Function = null,
+    dequant_i32_scales_split3_function: ?compute.cuda.Function = null,
     i8_blas_supported: bool = true,
+    // Transient: set before QKV projection to provide concat cache for fused I8 prefill.
+    active_qkv_concat: ?QkvI8ConcatRef = null,
     gaffine_sequence_rows_supported: bool = false,
     gaffine_sequence_fused_qkv_supported: bool = false,
     gaffine_sequence_fused_gate_up_supported: bool = false,
@@ -4858,7 +4872,71 @@ pub const CudaBackend = struct {
                     return;
                 }
 
-                // F16 dequant + cuBLAS GEMM path for prefill.
+                // INT8 tensor core path for prefill (2x throughput vs F16).
+                if (w.dequant_i8_cache.pointer != 0 and
+                    w.mean_scale_cache.pointer != 0 and
+                    self.i8_blas_supported) i8_blas:
+                {
+                    const quant_fn = self.quantize_f32_to_i8_simple_function orelse break :i8_blas;
+                    const dequant_fn = self.dequant_i32_scales_function orelse break :i8_blas;
+
+                    const in_dim = w.rows;
+                    const out_dim = w.cols;
+
+                    const i8_input_bytes = std.math.mul(usize, rows, in_dim) catch break :i8_blas;
+                    const row_scales_bytes = std.math.mul(usize, rows, @sizeOf(f32)) catch break :i8_blas;
+                    const total_scratch = i8_input_bytes + row_scales_bytes;
+                    if (self.runtime_buffers.activation_u16_dev.size < total_scratch) break :i8_blas;
+
+                    const i32_out_bytes = std.math.mul(usize, std.math.mul(usize, rows, out_dim) catch break :i8_blas, @sizeOf(i32)) catch break :i8_blas;
+                    if (self.runtime_buffers.dequant_f16_dev.size < i32_out_bytes) break :i8_blas;
+
+                    var i8_input_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, i8_input_bytes) catch break :i8_blas;
+                    var row_scales_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, i8_input_bytes, row_scales_bytes) catch break :i8_blas;
+                    var i32_out_buf = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, i32_out_bytes) catch break :i8_blas;
+
+                    // Step 1: Quantize F32 input → I8 + per-row scales.
+                    self.kernel_arg_pack.reset();
+                    self.kernel_arg_pack.appendBufferPtr(&packed_input) catch break :i8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&i8_input_buf) catch break :i8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&row_scales_buf) catch break :i8_blas;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch break :i8_blas;
+                    compute.cuda.launch.launchWithFamily(&self.device, quant_fn, .{
+                        .grid_x = @intCast(rows),
+                        .block_x = 256,
+                    }, &self.kernel_arg_pack, .other) catch break :i8_blas;
+
+                    // Step 2: INT8 GEMM — I8 input × I8 weight → I32 output.
+                    self.blas.matmulI8I8I32(
+                        &self.device,
+                        &i8_input_buf,
+                        rows,
+                        in_dim,
+                        &w.dequant_i8_cache,
+                        out_dim,
+                        &i32_out_buf,
+                    ) catch {
+                        self.i8_blas_supported = false;
+                        break :i8_blas;
+                    };
+
+                    // Step 3: Dequantize I32 → F32 with per-row scales.
+                    self.kernel_arg_pack.reset();
+                    self.kernel_arg_pack.appendBufferPtr(&i32_out_buf) catch break :i8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&row_scales_buf) catch break :i8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&w.mean_scale_cache) catch break :i8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&packed_out) catch break :i8_blas;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(rows)) catch break :i8_blas;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(out_dim)) catch break :i8_blas;
+                    compute.cuda.launch.launchWithFamily(&self.device, dequant_fn, .{
+                        .grid_x = @intCast(out_dim),
+                        .block_x = 256,
+                    }, &self.kernel_arg_pack, .other) catch break :i8_blas;
+
+                    return;
+                }
+
+                // Fallback: F16 dequant + cuBLAS GEMM path for prefill.
                 if (self.cast_f32_to_f16_function) |cast_fn| {
                     if (self.u16_blas_f16_supported) dequant_blas: {
                         const weight_elems = std.math.mul(usize, w.rows, w.cols) catch break :dequant_blas;
@@ -5204,6 +5282,76 @@ pub const CudaBackend = struct {
             try bufferSlice(q_out_dest, 0, q_bytes);
         var k_out = try bufferSlice(&self.runtime_buffers.attn_k_dev, 0, k_bytes);
         var v_out = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, v_bytes);
+
+        // Fused I8 QKV prefill: single GEMM with concatenated I8 weights.
+        if (self.active_qkv_concat) |concat| {
+            if (rows > 1 and self.i8_blas_supported) fused_i8_qkv: {
+                const quant_fn = self.quantize_f32_to_i8_simple_function orelse break :fused_i8_qkv;
+                const split_fn = self.dequant_i32_scales_split3_function orelse break :fused_i8_qkv;
+
+                const in_dim = q_proj.rows();
+                const total_out_dim: usize = @as(usize, concat.dims[0]) + concat.dims[1] + concat.dims[2];
+
+                // Scratch: I8 input + row_scales in activation_u16_dev.
+                const i8_input_bytes = std.math.mul(usize, rows, in_dim) catch break :fused_i8_qkv;
+                const row_scales_bytes = std.math.mul(usize, rows, @sizeOf(f32)) catch break :fused_i8_qkv;
+                const total_scratch = i8_input_bytes + row_scales_bytes;
+                if (self.runtime_buffers.activation_u16_dev.size < total_scratch) break :fused_i8_qkv;
+
+                // I32 GEMM output in dequant_f16_dev.
+                const i32_out_bytes = std.math.mul(usize, std.math.mul(usize, rows, total_out_dim) catch break :fused_i8_qkv, @sizeOf(i32)) catch break :fused_i8_qkv;
+                if (self.runtime_buffers.dequant_f16_dev.size < i32_out_bytes) break :fused_i8_qkv;
+
+                var i8_input_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, i8_input_bytes) catch break :fused_i8_qkv;
+                var row_scales_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, i8_input_bytes, row_scales_bytes) catch break :fused_i8_qkv;
+                var i32_out_buf = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, i32_out_bytes) catch break :fused_i8_qkv;
+
+                // Step 1: Quantize F32 input → I8 + per-row scales.
+                self.kernel_arg_pack.reset();
+                self.kernel_arg_pack.appendBufferPtr(input) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendBufferPtr(&i8_input_buf) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendBufferPtr(&row_scales_buf) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch break :fused_i8_qkv;
+                compute.cuda.launch.launchWithFamily(&self.device, quant_fn, .{
+                    .grid_x = @intCast(rows),
+                    .block_x = 256,
+                }, &self.kernel_arg_pack, .other) catch break :fused_i8_qkv;
+
+                // Step 2: Single I8 GEMM — I8 input × concat I8 QKV weights → I32.
+                self.blas.matmulI8I8I32(
+                    &self.device,
+                    &i8_input_buf,
+                    rows,
+                    in_dim,
+                    &concat.i8_buf,
+                    total_out_dim,
+                    &i32_out_buf,
+                ) catch {
+                    self.i8_blas_supported = false;
+                    break :fused_i8_qkv;
+                };
+
+                // Step 3: Dequant I32 → split F32 into Q/K/V outputs.
+                self.kernel_arg_pack.reset();
+                self.kernel_arg_pack.appendBufferPtr(&i32_out_buf) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendBufferPtr(&row_scales_buf) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendBufferPtr(&concat.scales_buf) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendBufferPtr(&q_out) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendBufferPtr(&k_out) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendBufferPtr(&v_out) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(rows)) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendScalar(u32, concat.dims[0]) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendScalar(u32, concat.dims[1]) catch break :fused_i8_qkv;
+                self.kernel_arg_pack.appendScalar(u32, concat.dims[2]) catch break :fused_i8_qkv;
+                compute.cuda.launch.launchWithFamily(&self.device, split_fn, .{
+                    .grid_x = @intCast(total_out_dim),
+                    .block_x = 256,
+                }, &self.kernel_arg_pack, .other) catch break :fused_i8_qkv;
+
+                return .unfused;
+            }
+        }
+
         try self.linearForwardRows(input, rows, q_proj, &q_out);
         try self.linearForwardRows(input, rows, k_proj, &k_out);
         try self.linearForwardRows(input, rows, v_proj, &v_out);
@@ -7767,6 +7915,13 @@ pub const CudaBackend = struct {
             return;
         }
 
+        // Provide concat I8 QKV cache for fused prefill GEMM.
+        self.active_qkv_concat = if (attention_binding.qkv_i8_concat.pointer != 0)
+            .{ .i8_buf = attention_binding.qkv_i8_concat, .scales_buf = attention_binding.qkv_scales_concat, .dims = attention_binding.qkv_concat_dims }
+        else
+            null;
+        defer self.active_qkv_concat = null;
+
         if (!cfg.query_gate) {
             try self.runAttentionMixerPrefillBatchedNoQueryGate(
                 cfg,
@@ -9180,6 +9335,9 @@ pub const CudaBackend = struct {
         if (self.kernel_registry.resolveFunction("dequant_i32_scales", "talu_dequant_i32_scales")) |resolved| {
             self.dequant_i32_scales_function = resolved.function;
         } else |_| {}
+        if (self.kernel_registry.resolveFunction("dequant_i32_scales_split3", "talu_dequant_i32_scales_split3")) |resolved| {
+            self.dequant_i32_scales_split3_function = resolved.function;
+        } else |_| {}
 
         const has_u8_dequant = self.gaffine_u8_dequant_f16_function != null;
         const has_u4_dequant = self.gaffine_u4_dequant_f16_function != null;
@@ -9311,9 +9469,8 @@ pub const CudaBackend = struct {
             }
         }.run;
 
-        // Helper to process a LinearWeight if it is gaffine_u8.
-        // gaffine_u4 weights use native U4 GEMV kernels for decode and
-        // on-the-fly F16 dequant for prefill, so no I8 cache is needed.
+        // Helper to process a LinearWeight if it is gaffine_u8 or gaffine_u4.
+        // Both get I8 caches for INT8 tensor core prefill (2x vs F16 GEMM).
         const maybeProcess = struct {
             fn run(
                 backend: *CudaBackend,
@@ -9325,6 +9482,12 @@ pub const CudaBackend = struct {
                     .gaffine_u8 => |*w| {
                         dequantU8Weight(backend, w, bytes_out);
                         count_out.* += 1;
+                    },
+                    .gaffine_u4 => |*w| {
+                        if (backend.gaffine_u4_to_i8_function) |fused_fn| {
+                            launchFusedToI8(backend, fused_fn, w, bytes_out);
+                            count_out.* += 1;
+                        }
                     },
                     else => {},
                 }
@@ -9373,6 +9536,86 @@ pub const CudaBackend = struct {
 
         // Projection weight (lm_head).
         maybeProcess(self, &self.runtime_buffers.projection_weight, &total_bytes, &weight_count);
+
+        // Build concatenated I8 QKV caches for fused prefill GEMM.
+        // This merges Q+K+V I8 weights into one contiguous buffer so prefill
+        // can run a single large GEMM instead of 3 separate ones.
+        const I8CacheRef = struct { i8_buf: compute.cuda.Buffer, scales_buf: compute.cuda.Buffer };
+        const getI8Cache = struct {
+            fn get(weight: *const LinearWeight) ?I8CacheRef {
+                return switch (weight.*) {
+                    .gaffine_u4 => |w| if (w.dequant_i8_cache.pointer != 0 and w.mean_scale_cache.pointer != 0)
+                        .{ .i8_buf = w.dequant_i8_cache, .scales_buf = w.mean_scale_cache }
+                    else
+                        null,
+                    .gaffine_u8 => |w| if (w.dequant_i8_cache.pointer != 0 and w.mean_scale_cache.pointer != 0)
+                        .{ .i8_buf = w.dequant_i8_cache, .scales_buf = w.mean_scale_cache }
+                    else
+                        null,
+                    else => null,
+                };
+            }
+        }.get;
+
+        for (self.block_runtime.blocks) |*layer| {
+            const attn = &(layer.attention_runtime orelse continue);
+            const q_ref = getI8Cache(&attn.q_proj) orelse continue;
+            const k_ref = getI8Cache(&attn.k_proj) orelse continue;
+            const v_ref = getI8Cache(&attn.v_proj) orelse continue;
+
+            const in_dim = attn.q_proj.rows();
+            if (in_dim != attn.k_proj.rows() or in_dim != attn.v_proj.rows()) continue;
+            if (in_dim == 0) continue;
+
+            const q_dim: u32 = @intCast(attn.q_proj.cols());
+            const k_dim: u32 = @intCast(attn.k_proj.cols());
+            const v_dim: u32 = @intCast(attn.v_proj.cols());
+
+            const total_dim: usize = @as(usize, q_dim) + k_dim + v_dim;
+            const i8_bytes = std.math.mul(usize, total_dim, in_dim) catch continue;
+            const scales_bytes = std.math.mul(usize, total_dim, @sizeOf(f32)) catch continue;
+
+            var concat_i8 = self.device.allocBuffer(i8_bytes) catch continue;
+            var concat_scales = self.device.allocBuffer(scales_bytes) catch {
+                concat_i8.deinit(&self.device);
+                continue;
+            };
+
+            // D2D copy each weight's I8 cache into the concatenated buffer.
+            const q_i8_bytes = @as(usize, q_dim) * in_dim;
+            const k_i8_bytes = @as(usize, k_dim) * in_dim;
+            const v_i8_bytes = @as(usize, v_dim) * in_dim;
+            const q_scale_bytes = @as(usize, q_dim) * @sizeOf(f32);
+            const k_scale_bytes = @as(usize, k_dim) * @sizeOf(f32);
+            const v_scale_bytes = @as(usize, v_dim) * @sizeOf(f32);
+
+            const ok = blk: {
+                var dst = bufferSlice(&concat_i8, 0, q_i8_bytes) catch break :blk false;
+                dst.copyFrom(&self.device, &q_ref.i8_buf, q_i8_bytes) catch break :blk false;
+                dst = bufferSlice(&concat_i8, q_i8_bytes, k_i8_bytes) catch break :blk false;
+                dst.copyFrom(&self.device, &k_ref.i8_buf, k_i8_bytes) catch break :blk false;
+                dst = bufferSlice(&concat_i8, q_i8_bytes + k_i8_bytes, v_i8_bytes) catch break :blk false;
+                dst.copyFrom(&self.device, &v_ref.i8_buf, v_i8_bytes) catch break :blk false;
+
+                dst = bufferSlice(&concat_scales, 0, q_scale_bytes) catch break :blk false;
+                dst.copyFrom(&self.device, &q_ref.scales_buf, q_scale_bytes) catch break :blk false;
+                dst = bufferSlice(&concat_scales, q_scale_bytes, k_scale_bytes) catch break :blk false;
+                dst.copyFrom(&self.device, &k_ref.scales_buf, k_scale_bytes) catch break :blk false;
+                dst = bufferSlice(&concat_scales, q_scale_bytes + k_scale_bytes, v_scale_bytes) catch break :blk false;
+                dst.copyFrom(&self.device, &v_ref.scales_buf, v_scale_bytes) catch break :blk false;
+                break :blk true;
+            };
+
+            if (ok) {
+                attn.qkv_i8_concat = concat_i8;
+                attn.qkv_scales_concat = concat_scales;
+                attn.qkv_concat_dims = .{ q_dim, k_dim, v_dim };
+                total_bytes += i8_bytes + scales_bytes;
+            } else {
+                concat_scales.deinit(&self.device);
+                concat_i8.deinit(&self.device);
+            }
+        }
 
         if (weight_count > 0) {
             try self.device.synchronize();

@@ -27,6 +27,7 @@ const CuMemAllocFn = *const fn (*u64, usize) callconv(.c) c_int;
 const CuMemFreeFn = *const fn (u64) callconv(.c) c_int;
 const CuMemcpyHtoDFn = *const fn (u64, *const anyopaque, usize) callconv(.c) c_int;
 const CuMemcpyDtoHFn = *const fn (*anyopaque, u64, usize) callconv(.c) c_int;
+const CuMemcpyDtoDFn = *const fn (u64, u64, usize) callconv(.c) c_int;
 const CuDeviceGetNameFn = *const fn ([*]u8, c_int, c_int) callconv(.c) c_int;
 const CuDeviceTotalMemFn = *const fn (*usize, c_int) callconv(.c) c_int;
 const CuDeviceGetAttributeFn = *const fn (*c_int, c_int, c_int) callconv(.c) c_int;
@@ -84,6 +85,7 @@ const DriverApi = struct {
     cu_mem_free: CuMemFreeFn,
     cu_memcpy_htod: CuMemcpyHtoDFn,
     cu_memcpy_dtoh: CuMemcpyDtoHFn,
+    cu_memcpy_dtod: CuMemcpyDtoDFn,
     cu_device_get_name: CuDeviceGetNameFn,
     cu_device_total_mem: ?CuDeviceTotalMemFn,
     cu_device_get_attribute: ?CuDeviceGetAttributeFn,
@@ -682,6 +684,15 @@ pub const Buffer = struct {
         }
     }
 
+    pub fn copyFrom(self: *const Buffer, device: *Device, src: *const Buffer, byte_count: usize) !void {
+        if (byte_count > self.size or byte_count > src.size) return error.InvalidArgument;
+        if (byte_count == 0) return;
+        try device.makeCurrent();
+        if (device.api.cu_memcpy_dtod(self.pointer, src.pointer, byte_count) != cuda_success) {
+            return error.CudaCopyFailed;
+        }
+    }
+
     pub fn download(self: *const Buffer, device: *Device, data: []u8) !void {
         if (data.len > self.size) return error.InvalidArgument;
         if (data.len == 0) return;
@@ -744,6 +755,7 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_mem_free = try lookupRequiredAny(CuMemFreeFn, lib, &.{ "cuMemFree_v2", "cuMemFree" }),
         .cu_memcpy_htod = try lookupRequiredAny(CuMemcpyHtoDFn, lib, &.{ "cuMemcpyHtoD_v2", "cuMemcpyHtoD" }),
         .cu_memcpy_dtoh = try lookupRequiredAny(CuMemcpyDtoHFn, lib, &.{ "cuMemcpyDtoH_v2", "cuMemcpyDtoH" }),
+        .cu_memcpy_dtod = try lookupRequiredAny(CuMemcpyDtoDFn, lib, &.{ "cuMemcpyDtoD_v2", "cuMemcpyDtoD" }),
         .cu_device_get_name = try lookupRequired(CuDeviceGetNameFn, lib, "cuDeviceGetName"),
         .cu_device_total_mem = lookupOptionalAny(CuDeviceTotalMemFn, lib, &.{ "cuDeviceTotalMem_v2", "cuDeviceTotalMem" }),
         .cu_device_get_attribute = lookupOptional(CuDeviceGetAttributeFn, lib, "cuDeviceGetAttribute"),

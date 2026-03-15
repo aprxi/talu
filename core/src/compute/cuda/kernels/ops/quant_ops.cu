@@ -288,10 +288,10 @@ extern "C" __global__ __launch_bounds__(128) void talu_i8_matvec_f32(
             : "=r"(w4.x), "=r"(w4.y), "=r"(w4.z), "=r"(w4.w)
             : "l"(waddr));
 
-        const float4 in0 = *reinterpret_cast<const float4*>(&input[i]);
-        const float4 in1 = *reinterpret_cast<const float4*>(&input[i + 4]);
-        const float4 in2 = *reinterpret_cast<const float4*>(&input[i + 8]);
-        const float4 in3 = *reinterpret_cast<const float4*>(&input[i + 12]);
+        const float4 in0 = *reinterpret_cast<const float4*>(&input_row[i]);
+        const float4 in1 = *reinterpret_cast<const float4*>(&input_row[i + 4]);
+        const float4 in2 = *reinterpret_cast<const float4*>(&input_row[i + 8]);
+        const float4 in3 = *reinterpret_cast<const float4*>(&input_row[i + 12]);
 
         #pragma unroll
         for (unsigned int j = 0; j < 4; ++j) {
@@ -1421,5 +1421,43 @@ extern "C" __global__ void talu_dequant_i32_scales(
         const float is = input_scales[m];
         output[(unsigned long long)m * out_dim + n] =
             static_cast<float>(gemm_i32[(unsigned long long)m * out_dim + n]) * is * ws;
+    }
+}
+
+// Dequantize I32 GEMM concat output and split into separate contiguous F32 destinations.
+// gemm_i32 layout: [rows × total_dim] where total_dim = dim_a + dim_b + dim_c.
+// Columns [0, dim_a) → out_a[rows × dim_a], [dim_a, dim_a+dim_b) → out_b, remainder → out_c.
+// Grid: (total_dim), Block: (256). One block per output column.
+extern "C" __global__ void talu_dequant_i32_scales_split3(
+    const int* __restrict__ gemm_i32,           // [rows × total_dim]
+    const float* __restrict__ input_scales,     // [rows]
+    const float* __restrict__ weight_scales,    // [total_dim]
+    float* __restrict__ out_a,                  // [rows × dim_a]
+    float* __restrict__ out_b,                  // [rows × dim_b]
+    float* __restrict__ out_c,                  // [rows × dim_c]
+    unsigned int rows,
+    unsigned int dim_a,
+    unsigned int dim_b,
+    unsigned int dim_c
+) {
+    const unsigned int total_dim = dim_a + dim_b + dim_c;
+    const unsigned int n = blockIdx.x;
+    if (n >= total_dim) return;
+    const float ws = weight_scales[n];
+
+    float* out;
+    unsigned int out_stride, local_n;
+    if (n < dim_a) {
+        out = out_a; out_stride = dim_a; local_n = n;
+    } else if (n < dim_a + dim_b) {
+        out = out_b; out_stride = dim_b; local_n = n - dim_a;
+    } else {
+        out = out_c; out_stride = dim_c; local_n = n - dim_a - dim_b;
+    }
+
+    for (unsigned int m = threadIdx.x; m < rows; m += blockDim.x) {
+        const float is = input_scales[m];
+        out[(unsigned long long)m * out_stride + local_n] =
+            static_cast<float>(gemm_i32[(unsigned long long)m * total_dim + n]) * is * ws;
     }
 }

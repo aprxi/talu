@@ -403,10 +403,69 @@ extern "C" __global__ void talu_matvec_gate_up_silu_f16_f32(
 
     const unsigned short* gate_row = gate_weight + (unsigned long long)out_idx * in_dim;
     const unsigned short* up_row = up_weight + (unsigned long long)out_idx * in_dim;
-    float gate_acc = talu_dot_f16_u16_vec8(input, gate_row, in_dim, lane);
-    float up_acc = talu_dot_f16_u16_vec8(input, up_row, in_dim, lane);
-    gate_acc = talu_warp_sum_f32(gate_acc);
-    up_acc = talu_warp_sum_f32(up_acc);
+    float gr0 = 0.0f, gr1 = 0.0f, ur0 = 0.0f, ur1 = 0.0f;
+    const bool can_vec8 = ((((unsigned long long)gate_row) & 0xFu) == 0u) and
+        ((((unsigned long long)up_row) & 0xFu) == 0u) and
+        ((((unsigned long long)input) & 0xFu) == 0u);
+    if (can_vec8) {
+        const unsigned int vec_elems = in_dim & ~7u;
+        const uint4* gate_vec = reinterpret_cast<const uint4*>(gate_row);
+        const uint4* up_vec = reinterpret_cast<const uint4*>(up_row);
+        const float4* input_vec = reinterpret_cast<const float4*>(input);
+        for (unsigned int i = lane * 8u; i < vec_elems; i += TALU_WARP_SIZE * 8u) {
+            const unsigned int vi = i >> 3;
+            uint4 g_packed;
+            asm volatile(
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+                : "=r"(g_packed.x), "=r"(g_packed.y), "=r"(g_packed.z), "=r"(g_packed.w)
+                : "l"(gate_vec + vi));
+            uint4 u_packed;
+            asm volatile(
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+                : "=r"(u_packed.x), "=r"(u_packed.y), "=r"(u_packed.z), "=r"(u_packed.w)
+                : "l"(up_vec + vi));
+            const unsigned int input_vec_idx = i >> 2;
+            const float4 in0 = input_vec[input_vec_idx];
+            const float4 in1 = input_vec[input_vec_idx + 1];
+            const float2 gf0 = talu_decode_f16_pair_u32(g_packed.x);
+            const float2 gf1 = talu_decode_f16_pair_u32(g_packed.y);
+            const float2 gf2 = talu_decode_f16_pair_u32(g_packed.z);
+            const float2 gf3 = talu_decode_f16_pair_u32(g_packed.w);
+            const float2 uf0 = talu_decode_f16_pair_u32(u_packed.x);
+            const float2 uf1 = talu_decode_f16_pair_u32(u_packed.y);
+            const float2 uf2 = talu_decode_f16_pair_u32(u_packed.z);
+            const float2 uf3 = talu_decode_f16_pair_u32(u_packed.w);
+            gr0 = fmaf(in0.x, gf0.x, gr0);
+            gr1 = fmaf(in0.y, gf0.y, gr1);
+            gr0 = fmaf(in0.z, gf1.x, gr0);
+            gr1 = fmaf(in0.w, gf1.y, gr1);
+            gr0 = fmaf(in1.x, gf2.x, gr0);
+            gr1 = fmaf(in1.y, gf2.y, gr1);
+            gr0 = fmaf(in1.z, gf3.x, gr0);
+            gr1 = fmaf(in1.w, gf3.y, gr1);
+            ur0 = fmaf(in0.x, uf0.x, ur0);
+            ur1 = fmaf(in0.y, uf0.y, ur1);
+            ur0 = fmaf(in0.z, uf1.x, ur0);
+            ur1 = fmaf(in0.w, uf1.y, ur1);
+            ur0 = fmaf(in1.x, uf2.x, ur0);
+            ur1 = fmaf(in1.y, uf2.y, ur1);
+            ur0 = fmaf(in1.z, uf3.x, ur0);
+            ur1 = fmaf(in1.w, uf3.y, ur1);
+        }
+        for (unsigned int i = vec_elems + lane; i < in_dim; i += TALU_WARP_SIZE) {
+            const float in_val = input[i];
+            gr0 = fmaf(in_val, talu_decode_f16_u16(gate_row[i]), gr0);
+            ur0 = fmaf(in_val, talu_decode_f16_u16(up_row[i]), ur0);
+        }
+    } else {
+        for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
+            const float in_val = input[i];
+            gr0 = fmaf(in_val, talu_decode_f16_u16(gate_row[i]), gr0);
+            ur0 = fmaf(in_val, talu_decode_f16_u16(up_row[i]), ur0);
+        }
+    }
+    float gate_acc = talu_warp_sum_f32(gr0 + gr1);
+    float up_acc = talu_warp_sum_f32(ur0 + ur1);
     if (lane == 0) {
         const float sigma = 1.0f / (1.0f + expf(-gate_acc));
         out[out_idx] = gate_acc * sigma * up_acc;
@@ -429,10 +488,61 @@ extern "C" __global__ void talu_matvec_gate_up_silu_bf16_f32(
 
     const unsigned short* gate_row = gate_weight + (unsigned long long)out_idx * in_dim;
     const unsigned short* up_row = up_weight + (unsigned long long)out_idx * in_dim;
-    float gate_acc = talu_dot_bf16_u16_vec8(input, gate_row, in_dim, lane);
-    float up_acc = talu_dot_bf16_u16_vec8(input, up_row, in_dim, lane);
-    gate_acc = talu_warp_sum_f32(gate_acc);
-    up_acc = talu_warp_sum_f32(up_acc);
+    float gr0 = 0.0f, gr1 = 0.0f, ur0 = 0.0f, ur1 = 0.0f;
+    const bool can_vec8 = ((((unsigned long long)gate_row) & 0xFu) == 0u) and
+        ((((unsigned long long)up_row) & 0xFu) == 0u) and
+        ((((unsigned long long)input) & 0xFu) == 0u);
+    if (can_vec8) {
+        const unsigned int vec_elems = in_dim & ~7u;
+        const uint4* gate_vec = reinterpret_cast<const uint4*>(gate_row);
+        const uint4* up_vec = reinterpret_cast<const uint4*>(up_row);
+        const float4* input_vec = reinterpret_cast<const float4*>(input);
+        for (unsigned int i = lane * 8u; i < vec_elems; i += TALU_WARP_SIZE * 8u) {
+            const unsigned int vi = i >> 3;
+            uint4 g_packed;
+            asm volatile(
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+                : "=r"(g_packed.x), "=r"(g_packed.y), "=r"(g_packed.z), "=r"(g_packed.w)
+                : "l"(gate_vec + vi));
+            uint4 u_packed;
+            asm volatile(
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+                : "=r"(u_packed.x), "=r"(u_packed.y), "=r"(u_packed.z), "=r"(u_packed.w)
+                : "l"(up_vec + vi));
+            const unsigned int input_vec_idx = i >> 2;
+            const float4 in0 = input_vec[input_vec_idx];
+            const float4 in1 = input_vec[input_vec_idx + 1];
+            gr0 = fmaf(in0.x, __uint_as_float(g_packed.x << 16), gr0);
+            gr1 = fmaf(in0.y, __uint_as_float(g_packed.x & 0xFFFF0000u), gr1);
+            gr0 = fmaf(in0.z, __uint_as_float(g_packed.y << 16), gr0);
+            gr1 = fmaf(in0.w, __uint_as_float(g_packed.y & 0xFFFF0000u), gr1);
+            gr0 = fmaf(in1.x, __uint_as_float(g_packed.z << 16), gr0);
+            gr1 = fmaf(in1.y, __uint_as_float(g_packed.z & 0xFFFF0000u), gr1);
+            gr0 = fmaf(in1.z, __uint_as_float(g_packed.w << 16), gr0);
+            gr1 = fmaf(in1.w, __uint_as_float(g_packed.w & 0xFFFF0000u), gr1);
+            ur0 = fmaf(in0.x, __uint_as_float(u_packed.x << 16), ur0);
+            ur1 = fmaf(in0.y, __uint_as_float(u_packed.x & 0xFFFF0000u), ur1);
+            ur0 = fmaf(in0.z, __uint_as_float(u_packed.y << 16), ur0);
+            ur1 = fmaf(in0.w, __uint_as_float(u_packed.y & 0xFFFF0000u), ur1);
+            ur0 = fmaf(in1.x, __uint_as_float(u_packed.z << 16), ur0);
+            ur1 = fmaf(in1.y, __uint_as_float(u_packed.z & 0xFFFF0000u), ur1);
+            ur0 = fmaf(in1.z, __uint_as_float(u_packed.w << 16), ur0);
+            ur1 = fmaf(in1.w, __uint_as_float(u_packed.w & 0xFFFF0000u), ur1);
+        }
+        for (unsigned int i = vec_elems + lane; i < in_dim; i += TALU_WARP_SIZE) {
+            const float in_val = input[i];
+            gr0 = fmaf(in_val, talu_decode_bf16_u16(gate_row[i]), gr0);
+            ur0 = fmaf(in_val, talu_decode_bf16_u16(up_row[i]), ur0);
+        }
+    } else {
+        for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
+            const float in_val = input[i];
+            gr0 = fmaf(in_val, talu_decode_bf16_u16(gate_row[i]), gr0);
+            ur0 = fmaf(in_val, talu_decode_bf16_u16(up_row[i]), ur0);
+        }
+    }
+    float gate_acc = talu_warp_sum_f32(gr0 + gr1);
+    float up_acc = talu_warp_sum_f32(ur0 + ur1);
     if (lane == 0) {
         const float sigma = 1.0f / (1.0f + expf(-gate_acc));
         out[out_idx] = gate_acc * sigma * up_acc;
