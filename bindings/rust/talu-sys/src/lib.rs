@@ -1760,6 +1760,8 @@ pub struct EffectiveGenConfig {
     pub top_p: f32,
     pub min_p: f32,
     pub repetition_penalty: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
     pub seed: u64,
     pub max_tokens: usize,
     pub do_sample: bool,
@@ -1773,6 +1775,8 @@ impl Default for EffectiveGenConfig {
             top_p: 0.0,
             min_p: 0.0,
             repetition_penalty: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: 0,
             max_tokens: 0,
             do_sample: false,
@@ -3966,6 +3970,8 @@ pub struct EffectiveGenConfigRequest {
     pub top_p: f32,
     pub min_p: f32,
     pub repetition_penalty: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
     pub seed: u64,
     pub max_tokens: usize,
 }
@@ -3973,11 +3979,13 @@ pub struct EffectiveGenConfigRequest {
 impl Default for EffectiveGenConfigRequest {
     fn default() -> Self {
         Self {
-            temperature: 0.0,
+            temperature: -1.0, // sentinel for "use model default"
             top_k: 0,
-            top_p: 0.0,
-            min_p: 0.0,
-            repetition_penalty: 0.0,
+            top_p: -1.0,
+            min_p: -1.0,
+            repetition_penalty: -1.0,
+            presence_penalty: -1.0,
+            frequency_penalty: -1.0,
             seed: 0,
             max_tokens: 0,
         }

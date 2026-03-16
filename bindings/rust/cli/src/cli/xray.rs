@@ -163,6 +163,8 @@ fn xray_generate_config(model: &str, max_tokens: usize, seed: u64) -> Result<tal
         top_p: effective.top_p,
         min_p: effective.min_p,
         repetition_penalty: effective.repetition_penalty,
+        presence_penalty: effective.presence_penalty,
+        frequency_penalty: effective.frequency_penalty,
         seed: effective.seed,
         ..Default::default()
     })

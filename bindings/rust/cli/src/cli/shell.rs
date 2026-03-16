@@ -162,6 +162,8 @@ pub(super) fn cmd_agent(args: AgentArgs, stdin_is_pipe: bool) -> Result<()> {
             cfg.top_p = effective.top_p;
             cfg.min_p = effective.min_p;
             cfg.repetition_penalty = effective.repetition_penalty;
+            cfg.presence_penalty = effective.presence_penalty;
+            cfg.frequency_penalty = effective.frequency_penalty;
 
             model_display_name = std::path::Path::new(&resolved_model)
                 .file_name()

@@ -6,12 +6,14 @@
 
 const std = @import("std");
 const gen_config_mod = @import("../inference/config/generation.zig");
+const cfg_root = @import("../models/config/root.zig");
 const io = @import("../io/root.zig");
 const repository = io.repository;
 const transport = io.transport;
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 const log = @import("../log.zig");
+const models_registry = @import("../models/registry.zig");
 
 // Import tokenizer types and functions
 const tokenizer_mod = @import("tokenizer.zig");
@@ -81,6 +83,10 @@ pub const EffectiveGenConfigRequest = extern struct {
     min_p: f32 = -1.0,
     /// Repetition penalty override. -1.0 = use model default.
     repetition_penalty: f32 = -1.0,
+    /// Presence penalty override. -1.0 = use model default from sampling presets.
+    presence_penalty: f32 = -1.0,
+    /// Frequency penalty override. -1.0 = use model default.
+    frequency_penalty: f32 = -1.0,
     /// Seed (0 = random).
     seed: u64 = 0,
     /// Max tokens to generate.
@@ -106,6 +112,10 @@ pub const EffectiveGenConfig = extern struct {
     min_p: f32,
     /// Effective repetition_penalty.
     repetition_penalty: f32,
+    /// Effective presence_penalty (from model sampling presets).
+    presence_penalty: f32,
+    /// Effective frequency_penalty.
+    frequency_penalty: f32,
     /// Seed.
     seed: u64,
     /// Max tokens.
@@ -268,19 +278,60 @@ pub export fn talu_resolve_effective_generation_config(
     };
     defer model_config.deinit(allocator);
 
-    // Apply overrides: use request value if not sentinel, else use model default
-    const user_set_temperature = request.temperature >= 0.0;
-    const temperature = if (user_set_temperature) request.temperature else model_config.temperature;
-    const top_k = if (request.top_k > 0) request.top_k else model_config.top_k;
-    const top_p = if (request.top_p >= 0.0) request.top_p else model_config.top_p;
-    // min_p default is 0.0, so use sentinel -1.0 to distinguish "unset" from "set to 0"
-    const min_p = if (request.min_p >= 0.0) request.min_p else 0.0;
-    // repetition_penalty default is 1.0, use sentinel -1.0 for "unset"
-    const repetition_penalty = if (request.repetition_penalty >= 0.0) request.repetition_penalty else 1.0;
+    // Precedence order (lowest to highest):
+    // 1. core/src/models/ sampling_presets (architecture defaults)
+    // 2. generation_config.json (model-specific, if present)
+    // 3. User request values (per-request override)
 
-    // Apply the sampling policy (matches local.zig:725)
-    // Only sample if: temperature > 0 AND (model.do_sample OR user explicitly set temperature)
-    const do_sample = temperature > 0 and (model_config.do_sample or user_set_temperature);
+    // Start with sampling_presets as base defaults
+    var default_temperature: f32 = 1.0; // fallback if no presets
+    var default_top_k: usize = 40;
+    var default_top_p: f32 = 0.95;
+    var default_presence_penalty: f32 = 0.0;
+    var presets_found = false;
+
+    // Read model_type from config.json to look up sampling presets
+    const config_path = std.fs.path.join(allocator, &.{ resolved_path, "config.json" }) catch null;
+    defer if (config_path) |p| allocator.free(p);
+
+    if (config_path) |cpath| {
+        const model_type_opt = cfg_root.readModelType(allocator, cpath) catch null;
+        if (model_type_opt) |model_type| {
+            defer allocator.free(model_type);
+            if (models_registry.samplingPresetsByName(model_type)) |presets| {
+                // Layer 1: sampling_presets from core/src/models/
+                presets_found = true;
+                default_temperature = presets.general.temperature;
+                default_top_k = presets.general.top_k;
+                default_top_p = presets.general.top_p;
+                default_presence_penalty = presets.general.presence_penalty;
+            }
+        }
+    }
+
+    // Layer 2: generation_config.json overrides presets (if present and has explicit values)
+    // model_config comes from generation_config.json - only override if it has non-default values
+    // Note: generation_config.json uses temperature=1.0 and do_sample=false as defaults,
+    // so we check do_sample to determine if the config intends sampling
+    if (model_config.do_sample) {
+        // generation_config.json explicitly enables sampling, use its values
+        default_temperature = model_config.temperature;
+        default_top_k = model_config.top_k;
+        default_top_p = model_config.top_p;
+    }
+
+    // Layer 3: User request overrides everything
+    const user_set_temperature = request.temperature >= 0.0;
+    const temperature = if (user_set_temperature) request.temperature else default_temperature;
+    const top_k = if (request.top_k > 0) request.top_k else default_top_k;
+    const top_p = if (request.top_p >= 0.0) request.top_p else default_top_p;
+    const min_p = if (request.min_p >= 0.0) request.min_p else 0.0;
+    const repetition_penalty = if (request.repetition_penalty >= 0.0) request.repetition_penalty else 1.0;
+    const presence_penalty = if (request.presence_penalty >= 0.0) request.presence_penalty else default_presence_penalty;
+    const frequency_penalty = if (request.frequency_penalty >= 0.0) request.frequency_penalty else 0.0;
+
+    // Sampling policy: enable when presets/config recommend it OR user explicitly sets temperature
+    const do_sample = temperature > 0 and (presets_found or model_config.do_sample or user_set_temperature);
 
     // If not sampling, force greedy (temperature = 0)
     const effective_temperature = if (do_sample) temperature else 0.0;
@@ -291,6 +342,8 @@ pub export fn talu_resolve_effective_generation_config(
         .top_p = top_p,
         .min_p = min_p,
         .repetition_penalty = repetition_penalty,
+        .presence_penalty = presence_penalty,
+        .frequency_penalty = frequency_penalty,
         .seed = request.seed,
         .max_tokens = request.max_tokens,
         .do_sample = do_sample,

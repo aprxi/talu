@@ -42,6 +42,7 @@ void mlx_cache_reset(void* cache_ptr) {
     if (cache_state == nullptr) return;
     for (auto& layer : cache_state->layers) {
         layer.offset = 0;
+        layer.shapes_initialized = false;
     }
 }
 
@@ -106,27 +107,55 @@ void mlx_cache_update_and_fetch_bfloat16(
     }
 
     // Slice update: cache[..., prev:offset, :] = new_data
-    size_t offset = prev + num_steps;
-    Shape start = {0, 0, static_cast<int>(prev), 0};
-    Shape stop_k = {batch, n_kv_heads, static_cast<int>(offset), k_head_dim};
-    Shape stop_v = {batch, n_kv_heads, static_cast<int>(offset), v_head_dim};
-    *layer.k_bfloat16 = slice_update(*layer.k_bfloat16, k_new_arr, start, stop_k);
-    *layer.v_bfloat16 = slice_update(*layer.v_bfloat16, v_new_arr, start, stop_v);
+    // Use cached shapes to avoid heap allocations on decode hot path.
+    const size_t offset = prev + num_steps;
+    const int offset_int = static_cast<int>(offset);
+
+    if (!layer.shapes_initialized) {
+        // First call: initialize cached shapes with constant dimensions.
+        layer.update_start = {0, 0, static_cast<int>(prev), 0};
+        layer.update_stop_k = {batch, n_kv_heads, offset_int, k_head_dim};
+        layer.update_stop_v = {batch, n_kv_heads, offset_int, v_head_dim};
+        layer.view_stop_k = {batch, n_kv_heads, offset_int, k_head_dim};
+        layer.view_stop_v = {batch, n_kv_heads, offset_int, v_head_dim};
+        layer.shapes_initialized = true;
+    } else {
+        // Subsequent calls: only update the sequence indices (position 2).
+        layer.update_start[2] = static_cast<int>(prev);
+        layer.update_stop_k[2] = offset_int;
+        layer.update_stop_v[2] = offset_int;
+        layer.view_stop_k[2] = offset_int;
+        layer.view_stop_v[2] = offset_int;
+    }
+
+    *layer.k_bfloat16 = slice_update(*layer.k_bfloat16, k_new_arr, layer.update_start, layer.update_stop_k);
+    *layer.v_bfloat16 = slice_update(*layer.v_bfloat16, v_new_arr, layer.update_start, layer.update_stop_v);
 
     layer.offset = offset;
 
-    // Return slice [0:offset]
-    Shape view_start = {0, 0, 0, 0};
-    Shape view_stop_k = {batch, n_kv_heads, static_cast<int>(offset), k_head_dim};
-    Shape view_stop_v = {batch, n_kv_heads, static_cast<int>(offset), v_head_dim};
-
-    // Reuse view arrays to avoid allocation
-    if (layer.k_view == nullptr) {
-        layer.k_view = new array(slice(*layer.k_bfloat16, view_start, view_stop_k));
-        layer.v_view = new array(slice(*layer.v_bfloat16, view_start, view_stop_v));
+    // Return slice [0:offset] as fresh array objects.
+    //
+    // CRITICAL: We must create NEW array objects each call, not reuse via
+    // assignment. The previous code did `*layer.k_view = slice(...)` which
+    // modified the array object's internal state. This caused lazy graphs
+    // that referenced the old array to see the new slice bounds, leading to:
+    // - Non-deterministic behavior (same seed, different output)
+    // - Rapid token repetition (attention reading wrong cache regions)
+    //
+    // Solution: Use placement new to reconstruct arrays in existing memory.
+    // This creates genuinely new array objects (with new shared state) while
+    // reusing the allocated memory. Callers who copied the previous arrays
+    // retain valid references via their own shared state.
+    if (layer.k_view != nullptr) {
+        // Destroy old arrays and reconstruct in same memory (zero allocation).
+        layer.k_view->~array();
+        layer.v_view->~array();
+        new (layer.k_view) array(slice(*layer.k_bfloat16, g_slice_start, layer.view_stop_k));
+        new (layer.v_view) array(slice(*layer.v_bfloat16, g_slice_start, layer.view_stop_v));
     } else {
-        *layer.k_view = slice(*layer.k_bfloat16, view_start, view_stop_k);
-        *layer.v_view = slice(*layer.v_bfloat16, view_start, view_stop_v);
+        // First call: allocate memory.
+        layer.k_view = new array(slice(*layer.k_bfloat16, g_slice_start, layer.view_stop_k));
+        layer.v_view = new array(slice(*layer.v_bfloat16, g_slice_start, layer.view_stop_v));
     }
 
     *k_out = layer.k_view;

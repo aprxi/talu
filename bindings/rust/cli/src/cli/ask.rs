@@ -660,6 +660,8 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         top_p: effective.top_p,
         min_p: effective.min_p,
         repetition_penalty: effective.repetition_penalty,
+        presence_penalty: effective.presence_penalty,
+        frequency_penalty: effective.frequency_penalty,
         seed: effective.seed,
         raw_output,
         ..Default::default()
