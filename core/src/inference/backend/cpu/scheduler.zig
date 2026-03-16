@@ -604,6 +604,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             vision_input: ?*const anyopaque = null,
             /// Capture final-step logits in generateSync result.
             return_final_logits: bool = false,
+            /// Maximum tokens to spend in thinking mode (0 = unlimited).
+            /// When exceeded, thinking_end_tokens are force-injected to close the
+            /// <think> block, then normal generation continues for the answer.
+            max_thinking_tokens: usize = 0,
+            /// Token IDs to inject when thinking budget is exceeded (e.g. </think>\n\n).
+            /// Only used when max_thinking_tokens > 0.
+            thinking_end_tokens: []const u32 = &.{},
         };
 
         /// Cancel a request.
@@ -916,6 +923,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 submit_config.stop_sequences.len == 0 and
                 submit_config.grammar_sampler == null and
                 !submit_config.return_final_logits and
+                submit_config.max_thinking_tokens == 0 and // thinking budget needs per-token control
                 effective_sampling.strategy == .greedy and
                 backend_supports_greedy_streaming and
                 self.backend.supportsSchedulerBackendDecodeStreamingRoute();
@@ -1307,6 +1315,16 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             var candidate_ids = try self.allocator.alloc(u32, max_candidate_count);
             defer self.allocator.free(candidate_ids);
 
+            // Thinking budget tracking: when max_thinking_tokens > 0, generation
+            // starts in thinking mode (template prefills <think>\n). Once the budget
+            // is exhausted, we force-inject the end sequence (</think>\n\n) then
+            // resume normal sampling for the answer.
+            const thinking_budget = submit_config.max_thinking_tokens;
+            const thinking_end = submit_config.thinking_end_tokens;
+            var thinking_tokens: usize = 0;
+            var in_thinking: bool = thinking_budget > 0 and thinking_end.len > 0;
+            var inject_pos: usize = 0; // position within thinking_end_tokens being injected
+
             var decode_timer = std.time.Timer.start() catch unreachable;
             while (generated.items.len < max_tokens) {
                 if (generationShouldStop(submit_config.stop_flag)) {
@@ -1318,6 +1336,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     };
                 }
 
+                // Run forward pass (updates KV cache with current_token).
                 const candidate_count = try self.backend.decodeTopKCandidates(
                     slot_index,
                     current_token,
@@ -1327,12 +1346,36 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 );
                 if (candidate_count == 0) return error.InvalidArgument;
 
-                topk_sample_cfg.context_tokens = generated.items;
-                current_token = try self.sampleTopKCandidateToken(
-                    candidate_logits[0..candidate_count],
-                    candidate_ids[0..candidate_count],
-                    topk_sample_cfg,
-                );
+                if (in_thinking and inject_pos > 0) {
+                    // Injecting end-thinking tokens: force the next token instead of sampling.
+                    current_token = thinking_end[inject_pos];
+                    inject_pos += 1;
+                    if (inject_pos >= thinking_end.len) {
+                        in_thinking = false;
+                    }
+                } else if (in_thinking and thinking_tokens >= thinking_budget) {
+                    // Budget exceeded: start injecting end sequence.
+                    current_token = thinking_end[0];
+                    inject_pos = 1;
+                    if (thinking_end.len == 1) {
+                        in_thinking = false;
+                    }
+                } else {
+                    // Normal sampling.
+                    topk_sample_cfg.context_tokens = generated.items;
+                    current_token = try self.sampleTopKCandidateToken(
+                        candidate_logits[0..candidate_count],
+                        candidate_ids[0..candidate_count],
+                        topk_sample_cfg,
+                    );
+                    if (in_thinking) {
+                        thinking_tokens += 1;
+                        // Check if model naturally produced the end-thinking token.
+                        if (thinking_end.len > 0 and current_token == thinking_end[0]) {
+                            in_thinking = false;
+                        }
+                    }
+                }
                 try generated.append(self.allocator, current_token);
 
                 finish_reason = .in_progress;

@@ -188,6 +188,11 @@ pub const GenerateOptions = struct {
     /// These variables become available in the template alongside messages, bos_token, etc.
     extra_context_json: ?[]const u8 = null,
 
+    /// Reasoning effort level: "none", "low", "medium", "high", "xhigh".
+    /// When non-null, the router maps this to template context variables
+    /// (e.g. enable_thinking=true for effort != "none").
+    reasoning_effort: ?[]const u8 = null,
+
     /// Tool definitions as JSON array of OpenAI-compatible tool schemas.
     /// When provided, enables grammar-based constrained sampling to enforce
     /// valid tool call JSON, and triggers auto-commit of FunctionCallItem
@@ -228,6 +233,54 @@ pub const GenerateOptions = struct {
 
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
 };
+
+/// Build effective template context by merging explicit extra_context_json with
+/// reasoning-effort-derived variables. Maps reasoning_effort to enable_thinking:
+///   - effort "none" → enable_thinking: false
+///   - any other effort (or no effort) → enable_thinking: true
+/// Caller owns returned memory (if non-null).
+fn buildEffectiveContext(allocator: std.mem.Allocator, opts: GenerateOptions) !?[]const u8 {
+    // Determine enable_thinking from reasoning_effort.
+    // Default (null effort) = true, matching Qwen3.5 documented default behavior.
+    const enable_thinking: bool = if (opts.reasoning_effort) |effort|
+        !std.mem.eql(u8, effort, "none")
+    else
+        true;
+
+    const val: []const u8 = if (enable_thinking) "true" else "false";
+
+    if (opts.extra_context_json) |existing| {
+        // Merge: inject enable_thinking into existing context JSON.
+        // Replace trailing '}' with the additional field.
+        const trimmed = std.mem.trimRight(u8, existing, " \t\n\r");
+        if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '}') {
+            const inner = std.mem.trimRight(u8, trimmed[0 .. trimmed.len - 1], " \t\n\r");
+            const separator: []const u8 = if (inner.len > 1) ", " else " ";
+            const result = try std.fmt.allocPrint(allocator, "{s}{s}\"enable_thinking\": {s} }}", .{
+                inner, separator, val,
+            });
+            return @as(?[]const u8, result);
+        }
+        // Can't merge — return as-is (don't override).
+        return null;
+    }
+
+    // No existing context — build from scratch.
+    const result = try std.fmt.allocPrint(allocator, "{{\"enable_thinking\": {s}}}", .{val});
+    return @as(?[]const u8, result);
+}
+
+/// Map reasoning effort level to a max thinking token budget.
+/// Returns 0 when thinking is disabled ("none").
+fn maxThinkingTokensForEffort(effort: ?[]const u8) usize {
+    const e = effort orelse return 4096; // default = medium
+    if (std.mem.eql(u8, e, "none")) return 0;
+    if (std.mem.eql(u8, e, "low")) return 512;
+    if (std.mem.eql(u8, e, "medium")) return 4096;
+    if (std.mem.eql(u8, e, "high")) return 16384;
+    if (std.mem.eql(u8, e, "xhigh")) return 32768;
+    return 4096; // unknown → medium
+}
 
 /// Callback function type for streaming token output.
 pub const TokenCallback = inference_types.TokenCallback;
@@ -629,6 +682,14 @@ pub const LocalEngine = struct {
         );
         defer self.allocator.free(messages_json);
 
+        // Build effective template context: merge explicit extra_context_json with
+        // reasoning-effort-derived variables (e.g. enable_thinking for Qwen3.5).
+        const effective_context = buildEffectiveContext(self.allocator, opts) catch |err| {
+            log.err("inference", "Failed to build template context", .{ .err = @errorName(err) }, @src());
+            return err;
+        };
+        defer if (effective_context) |ctx| self.allocator.free(ctx);
+
         // Apply chat template with optional overrides
         log.debug("inference", "Applying chat template", .{ .messages_len = messages_json.len }, @src());
         const prompt = gen_config_mod.applyChatTemplateWithOverrides(
@@ -637,7 +698,7 @@ pub const LocalEngine = struct {
             messages_json,
             true, // add_generation_prompt
             opts.template_override,
-            opts.extra_context_json,
+            effective_context,
         ) catch |err| {
             // If no chat template or template render fails, fall back to just using the last user message
             if (err == error.MissingChatTemplate or err == error.FileNotFound) {
@@ -717,10 +778,17 @@ pub const LocalEngine = struct {
         // Use tool grammar if created, otherwise fall back to chat's grammar
         const effective_grammar = tool_grammar_sampler orelse chat.grammar_sampler;
 
-        const max_tokens = if (effective_grammar != null and base_max_tokens > 0)
-            base_max_tokens + grammar_slack
-        else
-            base_max_tokens;
+        // Compute thinking token budget from reasoning effort.
+        const thinking_budget = maxThinkingTokensForEffort(opts.reasoning_effort);
+        const max_tokens = blk: {
+            var m = if (effective_grammar != null and base_max_tokens > 0)
+                base_max_tokens + grammar_slack
+            else
+                base_max_tokens;
+            // Thinking tokens are additive: total = answer budget + thinking budget.
+            m += thinking_budget;
+            break :blk m;
+        };
         const temperature = opts.temperature orelse chat.temperature;
         const top_k = opts.top_k orelse chat.top_k;
         const top_p = opts.top_p orelse chat.top_p;
@@ -881,10 +949,19 @@ pub const LocalEngine = struct {
             .image_count = if (vision_prompt) |*vp| vp.prefill.images.len else 0,
         }, @src());
 
+        // Tokenize thinking end sequence if thinking budget is active.
+        const thinking_budget = maxThinkingTokensForEffort(opts.reasoning_effort);
+        const thinking_end_tokens = if (thinking_budget > 0)
+            self.tok.encode("</think>\n\n") catch null
+        else
+            null;
+        defer if (thinking_end_tokens) |t| self.allocator.free(t);
+
         // Generate synchronously
         log.debug("router", "generateSync starting", .{
             .prompt_tokens = prompt_tokens.len,
             .max_tokens = max_tokens,
+            .thinking_budget = thinking_budget,
         }, @src());
         var result = scheduler.generateSync(prompt_tokens, max_tokens, .{
             .eos_token_ids = self.gen_config.eos_token_ids,
@@ -895,6 +972,8 @@ pub const LocalEngine = struct {
             .grammar_sampler = grammar_sampler,
             .stop_flag = opts.stop_flag,
             .vision_input = vision_input_ptr,
+            .max_thinking_tokens = thinking_budget,
+            .thinking_end_tokens = if (thinking_end_tokens) |t| t else &.{},
         }) catch |err| {
             const err_ctx = error_context.consumeContext();
             log.warn("inference", "Scheduler generation failed", .{
@@ -2015,4 +2094,49 @@ test "expandImagePadTokens rejects placeholder mismatch" {
         error.InvalidPromptImageTokens,
         LocalEngine.expandImagePadTokens(allocator, &tokens, 99, &token_counts, .{}),
     );
+}
+
+test "maxThinkingTokensForEffort maps effort levels correctly" {
+    try std.testing.expectEqual(@as(usize, 4096), maxThinkingTokensForEffort(null));
+    try std.testing.expectEqual(@as(usize, 0), maxThinkingTokensForEffort("none"));
+    try std.testing.expectEqual(@as(usize, 512), maxThinkingTokensForEffort("low"));
+    try std.testing.expectEqual(@as(usize, 4096), maxThinkingTokensForEffort("medium"));
+    try std.testing.expectEqual(@as(usize, 16384), maxThinkingTokensForEffort("high"));
+    try std.testing.expectEqual(@as(usize, 32768), maxThinkingTokensForEffort("xhigh"));
+    try std.testing.expectEqual(@as(usize, 4096), maxThinkingTokensForEffort("unknown"));
+}
+
+test "buildEffectiveContext default enables thinking" {
+    const allocator = std.testing.allocator;
+    const ctx = try buildEffectiveContext(allocator, GenerateOptions{});
+    defer if (ctx) |c| allocator.free(c);
+    try std.testing.expect(ctx != null);
+    try std.testing.expectEqualStrings("{\"enable_thinking\": true}", ctx.?);
+}
+
+test "buildEffectiveContext none disables thinking" {
+    const allocator = std.testing.allocator;
+    const ctx = try buildEffectiveContext(allocator, GenerateOptions{ .reasoning_effort = "none" });
+    defer if (ctx) |c| allocator.free(c);
+    try std.testing.expect(ctx != null);
+    try std.testing.expectEqualStrings("{\"enable_thinking\": false}", ctx.?);
+}
+
+test "buildEffectiveContext medium enables thinking" {
+    const allocator = std.testing.allocator;
+    const ctx = try buildEffectiveContext(allocator, GenerateOptions{ .reasoning_effort = "medium" });
+    defer if (ctx) |c| allocator.free(c);
+    try std.testing.expect(ctx != null);
+    try std.testing.expectEqualStrings("{\"enable_thinking\": true}", ctx.?);
+}
+
+test "buildEffectiveContext merges with existing extra_context_json" {
+    const allocator = std.testing.allocator;
+    const ctx = try buildEffectiveContext(allocator, GenerateOptions{
+        .extra_context_json = "{\"tools\": []}",
+        .reasoning_effort = "high",
+    });
+    defer if (ctx) |c| allocator.free(c);
+    try std.testing.expect(ctx != null);
+    try std.testing.expectEqualStrings("{\"tools\": [], \"enable_thinking\": true }", ctx.?);
 }

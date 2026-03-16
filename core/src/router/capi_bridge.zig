@@ -88,6 +88,9 @@ pub const CGenerateConfig = extern struct {
     seed: u64 = 0,
     template_override: ?[*:0]const u8 = null,
     extra_context_json: ?[*:0]const u8 = null,
+    /// Reasoning effort level: "none", "low", "medium", "high", "xhigh".
+    /// Mapped to template variables (e.g. enable_thinking) by the router.
+    reasoning_effort: ?[*:0]const u8 = null,
     /// Tool definitions as JSON array. Format: [{"type":"function","function":{...}}]
     tools_json: ?[*:0]const u8 = null,
     /// Tool choice strategy: "auto", "required", "none", or specific function name.
@@ -757,6 +760,7 @@ pub fn configToGenerateOptions(config: ?*const CGenerateConfig) GenerateOptions 
 
     if (cfg.template_override) |t| opts.template_override = std.mem.sliceTo(t, 0);
     if (cfg.extra_context_json) |j| opts.extra_context_json = std.mem.sliceTo(j, 0);
+    if (cfg.reasoning_effort) |r| opts.reasoning_effort = std.mem.sliceTo(r, 0);
     if (cfg.tools_json) |t| opts.tools_json = std.mem.sliceTo(t, 0);
     if (cfg.tool_choice) |c| opts.tool_choice = std.mem.sliceTo(c, 0);
     opts.raw_output = cfg.raw_output != 0;
@@ -888,6 +892,7 @@ fn buildOptions(
 
     if (cfg.template_override) |t| result.options.template_override = std.mem.sliceTo(t, 0);
     if (cfg.extra_context_json) |j| result.options.extra_context_json = std.mem.sliceTo(j, 0);
+    if (cfg.reasoning_effort) |r| result.options.reasoning_effort = std.mem.sliceTo(r, 0);
     if (cfg.tools_json) |t| result.options.tools_json = std.mem.sliceTo(t, 0);
     if (cfg.tool_choice) |c| result.options.tool_choice = std.mem.sliceTo(c, 0);
     result.options.raw_output = cfg.raw_output != 0;

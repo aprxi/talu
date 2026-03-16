@@ -70,6 +70,9 @@ pub struct GenerateConfig {
     pub tool_choice: Option<String>,
     /// Extra body JSON for API requests.
     pub extra_body_json: Option<String>,
+    /// Reasoning effort level (e.g. "none", "low", "medium", "high").
+    /// Passed through to the Zig core which maps it to template variables like `enable_thinking`.
+    pub reasoning_effort: Option<String>,
     /// Optional stop flag for cancellation (pointer to AtomicBool).
     /// When set to true, generation will stop gracefully.
     pub stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -283,6 +286,7 @@ extern "C" fn prefill_progress_trampoline(completed: usize, total: usize, userda
 /// Holds C strings for the GenerateConfig.
 struct ConfigHolder {
     _template_override: Option<CString>,
+    _extra_context: Option<CString>,
     _tools_json: Option<CString>,
     _tool_choice: Option<CString>,
     _extra_body: Option<CString>,
@@ -312,6 +316,12 @@ impl ConfigHolder {
 
         let extra_body = cfg
             .extra_body_json
+            .as_ref()
+            .map(|s| CString::new(s.as_str()))
+            .transpose()?;
+
+        let reasoning_effort = cfg
+            .reasoning_effort
             .as_ref()
             .map(|s| CString::new(s.as_str()))
             .transpose()?;
@@ -346,6 +356,10 @@ impl ConfigHolder {
             c_config.extra_body_json = extra.as_ptr();
         }
 
+        if let Some(ref effort) = reasoning_effort {
+            c_config.reasoning_effort = effort.as_ptr();
+        }
+
         if let Some(ref flag) = stop_flag {
             // SAFETY: We store a reference to the Arc's inner AtomicBool.
             // The Arc is kept alive in _stop_flag for the duration of this struct.
@@ -362,6 +376,7 @@ impl ConfigHolder {
 
         Ok(Self {
             _template_override: template_override,
+            _extra_context: reasoning_effort,
             _tools_json: tools_json,
             _tool_choice: tool_choice,
             _extra_body: extra_body,

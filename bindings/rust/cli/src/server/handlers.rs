@@ -26,6 +26,28 @@ use talu::{ChatHandle, FinishReason};
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
+/// Guard that sets an `AtomicBool` flag when dropped.
+///
+/// Used to signal cooperative cancellation to a `spawn_blocking` generation
+/// task when the HTTP handler future is dropped (client disconnect).
+/// Call [`defuse`](CancelOnDrop::defuse) after the task completes so the
+/// flag is not set unnecessarily.
+struct CancelOnDrop(Option<Arc<AtomicBool>>);
+
+impl CancelOnDrop {
+    fn defuse(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(ref flag) = self.0 {
+            flag.store(true, Ordering::Release);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct GenerationRequest {
     model: Option<String>,
@@ -785,6 +807,17 @@ async fn generate_response(
         None => base.to_path_buf(),
     });
 
+    // Create a stop flag so the generation can be cancelled when the client
+    // disconnects (hyper drops the handler future).  The guard sets the flag
+    // on drop; we defuse it after a successful result.
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    if let Ok(mut flags) = state.active_stop_flags.lock() {
+        flags.retain(|w| w.strong_count() > 0);
+        flags.push(Arc::downgrade(&stop_flag));
+    }
+    let stop_flag_for_gen = stop_flag.clone();
+    let cancel_guard = CancelOnDrop(Some(stop_flag));
+
     let session_id_for_task = session_id.clone();
     let bucket_for_task = bucket_path.clone();
     let model_id_for_task = model_id.clone();
@@ -793,6 +826,7 @@ async fn generate_response(
     let project_id_for_task = project_id.clone();
     let tools_json_for_generation = effective_tools.as_ref().map(|v| v.to_string());
     let tool_choice_for_generation = effective_tool_choice.as_ref().map(|v| v.to_string());
+    let reasoning_effort_for_generation = reasoning.effort.clone();
     let (output_items, prompt_tokens, completion_tokens, prefill_ns, generation_ns, result_ttft_ns, responses_json, model_info_json) =
         tokio::task::spawn_blocking(move || {
             let mut backend = backend.blocking_lock();
@@ -880,6 +914,8 @@ async fn generate_response(
             }
             cfg.tools_json = tools_json_for_generation;
             cfg.tool_choice = tool_choice_for_generation;
+            cfg.reasoning_effort = reasoning_effort_for_generation;
+            cfg.stop_flag = Some(stop_flag_for_gen);
 
             log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?} seed={:?}",
                 model_id_for_task, max_output_tokens, temperature, top_p, seed);
@@ -925,6 +961,10 @@ async fn generate_response(
         })
         .await
         .context("Generation task failed")??;
+
+    // Generation completed; defuse the cancel guard so it does not signal
+    // the (now-finished) blocking task.
+    cancel_guard.defuse();
 
     // Store conversation for future `previous_response_id` lookups.
     let session_id_for_response = session_id.clone();
@@ -1549,6 +1589,7 @@ async fn stream_response(
             file_storage_path,
             ctx,
             stop_flag_for_gen,
+            reasoning_for_events.effort.clone(),
             events_tenant_id.clone(),
             Some(events_request_id.clone()),
             Some(events_response_id.clone()),
@@ -1626,6 +1667,7 @@ fn run_streaming_generation(
     file_storage_path: Option<std::path::PathBuf>,
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
+    reasoning_effort: Option<String>,
     event_tenant_id: Option<String>,
     event_request_id: Option<String>,
     event_response_id: Option<String>,
@@ -1699,6 +1741,7 @@ fn run_streaming_generation(
     }
     cfg.tools_json = tools_json.map(|v| v.to_string());
     cfg.tool_choice = tool_choice_json.map(|v| v.to_string());
+    cfg.reasoning_effort = reasoning_effort;
 
     // Pass the stop flag for cooperative cancellation.
     // Clone before moving into cfg so the callback can also check it.

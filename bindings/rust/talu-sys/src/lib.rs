@@ -2892,6 +2892,9 @@ pub struct CGenerateConfig {
     pub seed: u64,
     pub template_override: *const c_char,
     pub extra_context_json: *const c_char,
+    /// Reasoning effort level: "none", "low", "medium", "high", "xhigh".
+    /// Mapped to template variables (e.g. enable_thinking) by the Zig core.
+    pub reasoning_effort: *const c_char,
     pub tools_json: *const c_char,
     pub tool_choice: *const c_char,
     pub stop_flag: *mut c_void,
@@ -2919,6 +2922,7 @@ impl Default for CGenerateConfig {
             seed: 0,
             template_override: std::ptr::null(),
             extra_context_json: std::ptr::null(),
+            reasoning_effort: std::ptr::null(),
             tools_json: std::ptr::null(),
             tool_choice: std::ptr::null(),
             stop_flag: std::ptr::null_mut(),
