@@ -10,6 +10,27 @@ const error_context = @import("../error_context.zig");
 
 pub const Error = template_engine.Error || error{InvalidMessages};
 
+/// Check whether a rendered prompt ends with an opening reasoning tag.
+///
+/// When a chat template injects `<tag>` (optionally followed by whitespace)
+/// as a generation prefix, the model's output starts inside the reasoning
+/// block and will not contain the opening tag itself.  The ReasoningParser
+/// must be initialized in `.reasoning` state to handle this correctly.
+///
+/// This is a pure string check on the rendered template output — it works
+/// across all model families without hardcoding template-specific logic.
+pub fn promptEndsWithReasoningTag(rendered_prompt: []const u8, tag_name: ?[]const u8) bool {
+    const tag = tag_name orelse "think";
+    // Trim trailing whitespace/newlines to find the last meaningful content.
+    const trimmed = std.mem.trimRight(u8, rendered_prompt, " \t\n\r");
+    // Need at least `<` + tag + `>` characters.
+    if (trimmed.len < tag.len + 2) return false;
+    const expected_start = trimmed.len - tag.len - 2;
+    return trimmed[expected_start] == '<' and
+        trimmed[trimmed.len - 1] == '>' and
+        std.mem.eql(u8, trimmed[expected_start + 1 .. trimmed.len - 1], tag);
+}
+
 /// Render a chat template with a JSON array of messages.
 ///
 /// Supports full multi-turn conversations:
@@ -634,4 +655,37 @@ test "renderWithContext with array extra context returns error" {
 
     const result = renderWithContext(allocator, template, messages_json, "", "", false, array_json);
     try std.testing.expectError(error.InvalidMessages, result);
+}
+
+// ============================================================================
+// promptEndsWithReasoningTag tests
+// ============================================================================
+
+test "promptEndsWithReasoningTag: prompt ending with <think> returns true" {
+    try std.testing.expect(promptEndsWithReasoningTag("...<|im_start|>assistant\n<think>\n", null));
+}
+
+test "promptEndsWithReasoningTag: prompt ending with <think> no trailing whitespace" {
+    try std.testing.expect(promptEndsWithReasoningTag("prefix<think>", null));
+}
+
+test "promptEndsWithReasoningTag: prompt ending with </think> returns false" {
+    try std.testing.expect(!promptEndsWithReasoningTag("...<think>\n\n</think>\n\n", null));
+}
+
+test "promptEndsWithReasoningTag: empty string returns false" {
+    try std.testing.expect(!promptEndsWithReasoningTag("", null));
+}
+
+test "promptEndsWithReasoningTag: short string returns false" {
+    try std.testing.expect(!promptEndsWithReasoningTag("<t>", null));
+}
+
+test "promptEndsWithReasoningTag: custom tag name" {
+    try std.testing.expect(promptEndsWithReasoningTag("prefix<thought>\n", "thought"));
+    try std.testing.expect(!promptEndsWithReasoningTag("prefix<think>\n", "thought"));
+}
+
+test "promptEndsWithReasoningTag: no reasoning tag at end" {
+    try std.testing.expect(!promptEndsWithReasoningTag("<|im_start|>assistant\n", null));
 }

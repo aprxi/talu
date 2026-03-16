@@ -48,6 +48,7 @@ const GrammarConfig = validate_mod.sampler.GrammarConfig;
 const tool_schema_mod = @import("tool_schema.zig");
 const reasoning_parser_mod = responses_mod.reasoning_parser;
 const commit_mod = @import("commit.zig");
+const chat_template = @import("../template/chat_template.zig");
 const progress_mod = @import("../capi/progress.zig");
 const runtime_contract = inference.runtime_contract;
 
@@ -230,6 +231,13 @@ pub const GenerateOptions = struct {
     /// Default false keeps parsing `<think>...</think>` into typed items and
     /// returns only the assistant response text to callers.
     raw_output: bool = false,
+
+    /// Output flag: set to true by generateFromPrompt when the rendered prompt
+    /// ends with the reasoning tag (e.g. `<think>\n`), indicating that the
+    /// model's output starts inside a reasoning block.  Used by the streaming
+    /// iterator to set its filter state before the first token callback fires.
+    /// Callers that need this information should point it at a bool they own.
+    starts_in_reasoning_out: ?*bool = null,
 
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
 };
@@ -736,6 +744,13 @@ pub const LocalEngine = struct {
         prompt: []const u8,
         opts: GenerateOptions,
     ) !GenerationResult {
+        // Check whether the rendered prompt ends with the reasoning tag
+        // (e.g. `<think>\n`).  Publish via output flag so streaming callers
+        // (iterator) can set their filter state before the first token fires.
+        if (opts.starts_in_reasoning_out) |out| {
+            out.* = chat_template.promptEndsWithReasoningTag(prompt, opts.reasoning_tag);
+        }
+
         // Use chat settings with optional overrides
         const base_max_tokens = opts.max_tokens orelse chat.max_tokens;
         const grammar_slack: usize = 64;
@@ -778,7 +793,7 @@ pub const LocalEngine = struct {
         // Use tool grammar if created, otherwise fall back to chat's grammar
         const effective_grammar = tool_grammar_sampler orelse chat.grammar_sampler;
 
-        // max_tokens is the total generation budget (including any thinking tokens).
+        // max_tokens is the hard generation limit — never exceeded.
         const max_tokens = if (effective_grammar != null and base_max_tokens > 0)
             base_max_tokens + grammar_slack
         else
@@ -943,8 +958,18 @@ pub const LocalEngine = struct {
             .image_count = if (vision_prompt) |*vp| vp.prefill.images.len else 0,
         }, @src());
 
+        // Thinking budget: carved from max_tokens, never exceeds it.
+        // Reserve 25% of max_tokens (floor 256) for the answer so the model
+        // always has room to respond after </think>.  This follows the
+        // OpenAI-style inclusive model where max_tokens is the hard ceiling.
+        const raw_thinking_budget = maxThinkingTokensForEffort(opts.reasoning_effort);
+        const answer_reserve = @max(@as(usize, 256), max_tokens / 4);
+        const thinking_budget = if (raw_thinking_budget > 0)
+            @min(raw_thinking_budget, max_tokens -| answer_reserve)
+        else
+            @as(usize, 0);
+
         // Tokenize thinking end sequence if thinking budget is active.
-        const thinking_budget = maxThinkingTokensForEffort(opts.reasoning_effort);
         const thinking_end_tokens = if (thinking_budget > 0)
             self.tok.encode("</think>\n\n") catch null
         else
@@ -1088,6 +1113,13 @@ pub const LocalEngine = struct {
         const generation_json = try self.buildGenerationJson(chat, opts, max_tokens);
         defer self.allocator.free(generation_json);
 
+        // Detect whether the rendered prompt ends with an opening reasoning
+        // tag (e.g. `<think>\n`).  When the template injects this as a
+        // generation prefix, the model's output starts inside the reasoning
+        // block (no opening `<think>` tag), so the parser must begin in
+        // reasoning state to correctly separate reasoning / response.
+        const starts_in_reasoning = chat_template.promptEndsWithReasoningTag(prompt, opts.reasoning_tag);
+
         try commit_mod.commitGenerationResult(self.allocator, chat, .{
             .text = generated_text,
             .prompt_tokens = prompt_len,
@@ -1097,10 +1129,11 @@ pub const LocalEngine = struct {
             .finish_reason = finish_reason_str,
             .reasoning_tag = opts.reasoning_tag,
             .generation_json = generation_json,
+            .starts_in_reasoning = starts_in_reasoning,
         });
 
         // Return clean text (strip reasoning tags for caller)
-        var parser = try reasoning_parser_mod.ReasoningParser.init(self.allocator, opts.reasoning_tag);
+        var parser = try reasoning_parser_mod.ReasoningParser.initWithState(self.allocator, opts.reasoning_tag, starts_in_reasoning);
         defer parser.deinit();
         try parser.processChunk(generated_text);
         const parsed = try parser.finalize();

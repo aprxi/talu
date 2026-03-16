@@ -69,7 +69,16 @@ pub const ReasoningParser = struct {
     const DEFAULT_TAG = "think";
 
     /// Initialize with optional tag name.  `null` defaults to `"think"`.
+    ///
+    /// When `starts_in_reasoning` is true, the parser begins in `.reasoning`
+    /// state.  Use this when the chat template has already injected an opening
+    /// tag (e.g. `<think>\n`) as a generation prefix — the model's output
+    /// will not contain the opening tag, only the closing one.
     pub fn init(allocator: std.mem.Allocator, tag_name: ?[]const u8) !ReasoningParser {
+        return initWithState(allocator, tag_name, false);
+    }
+
+    pub fn initWithState(allocator: std.mem.Allocator, tag_name: ?[]const u8, starts_in_reasoning: bool) !ReasoningParser {
         const tag = tag_name orelse DEFAULT_TAG;
         const start = try std.fmt.allocPrint(allocator, "<{s}>", .{tag});
         errdefer allocator.free(start);
@@ -78,6 +87,8 @@ pub const ReasoningParser = struct {
             .allocator = allocator,
             .start_marker = start,
             .end_marker = end,
+            .state = if (starts_in_reasoning) .reasoning else .normal,
+            .format = if (starts_in_reasoning) .xml_tags else .none,
         };
     }
 
@@ -381,6 +392,43 @@ test "ReasoningParser.processChunk swallows newline across chunks" {
 test "ReasoningParser.processChunk preserves non-newline after end tag" {
     const alloc = std.testing.allocator;
     var p = try ReasoningParser.init(alloc, null);
+    defer p.deinit();
+
+    try p.processChunk("<think>reasoning</think>response");
+    const r = try p.finalize();
+    try std.testing.expectEqualStrings("reasoning", r.reasoning.?);
+    try std.testing.expectEqualStrings("response", r.response.?);
+}
+
+test "ReasoningParser.initWithState starts in reasoning state" {
+    const alloc = std.testing.allocator;
+    var p = try ReasoningParser.initWithState(alloc, null, true);
+    defer p.deinit();
+
+    // Simulates model output when template added <think>\n as prefix.
+    // Generated text has no opening <think>, just reasoning + </think> + answer.
+    try p.processChunk("deep reasoning here\n</think>\nFinal answer.");
+    const r = try p.finalize();
+    try std.testing.expectEqualStrings("deep reasoning here\n", r.reasoning.?);
+    try std.testing.expectEqualStrings("Final answer.", r.response.?);
+    try std.testing.expectEqual(ReasoningFormat.xml_tags, p.format);
+}
+
+test "ReasoningParser.initWithState reasoning only (no close tag)" {
+    const alloc = std.testing.allocator;
+    var p = try ReasoningParser.initWithState(alloc, null, true);
+    defer p.deinit();
+
+    // Model ran out of tokens before producing </think>.
+    try p.processChunk("reasoning without close");
+    const r = try p.finalize();
+    try std.testing.expectEqualStrings("reasoning without close", r.reasoning.?);
+    try std.testing.expect(r.response == null);
+}
+
+test "ReasoningParser.initWithState false behaves like init" {
+    const alloc = std.testing.allocator;
+    var p = try ReasoningParser.initWithState(alloc, null, false);
     defer p.deinit();
 
     try p.processChunk("<think>reasoning</think>response");

@@ -638,3 +638,92 @@ fn twenty_messages() {
         );
     }
 }
+
+// ===========================================================================
+// Reasoning tag generation prefix (Qwen3.5 regression)
+// ===========================================================================
+//
+// Qwen3.5 templates add `<think>\n` as a generation prefix when
+// enable_thinking=true. The model's output then starts inside a reasoning
+// block without an opening `<think>` tag. The ReasoningParser must detect
+// this from the rendered prompt to correctly split reasoning / response.
+
+/// Qwen3.5-style template with enable_thinking=true ends with `<think>\n`.
+///
+/// Regression: without this, the ReasoningParser starts in .normal state
+/// and never sees `<think>`, causing all reasoning content to appear as
+/// response text.
+#[test]
+fn qwen35_enable_thinking_true_ends_with_think_tag() {
+    use crate::capi::template::common::render_template;
+    // Mirrors the real Qwen3.5 chat template pattern: uses {{ '...' }}
+    // expression blocks to output text verbatim (including \n), so Jinja2
+    // whitespace trimming does not eat the trailing newline.
+    let tmpl = concat!(
+        "{%- for message in messages -%}",
+        "{{- '<|im_start|>' }}{{ message.role }}\n",
+        "{{ message.content }}{{- '<|im_end|>\n' }}",
+        "{%- endfor -%}",
+        "{%- if add_generation_prompt %}\n",
+        "{{- '<|im_start|>assistant\n' }}",
+        "{%- if enable_thinking is defined and enable_thinking is true %}",
+        "{{- '<think>\n' }}",
+        "{%- else %}",
+        "{{- '<think>\n\n</think>\n\n' }}",
+        "{%- endif %}",
+        "{%- endif %}",
+    );
+    let vars = r#"{
+        "messages": [{"role": "user", "content": "Hello"}],
+        "add_generation_prompt": true,
+        "enable_thinking": true
+    }"#;
+    let result = render_template(tmpl, vars, false).unwrap();
+    // The rendered prompt must end with `<think>\n` (the generation prefix).
+    assert!(
+        result.ends_with("<think>\n"),
+        "enable_thinking=true must end with <think>\\n, got: ...{}",
+        &result[result.len().saturating_sub(40)..],
+    );
+    // Must NOT end with </think> (that's the enable_thinking=false path).
+    assert!(
+        !result.ends_with("</think>\n\n"),
+        "must not have closing </think> when enable_thinking=true"
+    );
+}
+
+/// Qwen3.5-style template with enable_thinking=false ends with `</think>`.
+///
+/// When thinking is disabled, the template adds both opening and closing
+/// tags as a no-op block. The prompt should NOT trigger starts_in_reasoning.
+#[test]
+fn qwen35_enable_thinking_false_ends_with_close_tag() {
+    use crate::capi::template::common::render_template;
+    // Same template as the enable_thinking=true test but with false.
+    let tmpl = concat!(
+        "{%- for message in messages -%}",
+        "{{- '<|im_start|>' }}{{ message.role }}\n",
+        "{{ message.content }}{{- '<|im_end|>\n' }}",
+        "{%- endfor -%}",
+        "{%- if add_generation_prompt %}\n",
+        "{{- '<|im_start|>assistant\n' }}",
+        "{%- if enable_thinking is defined and enable_thinking is true %}",
+        "{{- '<think>\n' }}",
+        "{%- else %}",
+        "{{- '<think>\n\n</think>\n\n' }}",
+        "{%- endif %}",
+        "{%- endif %}",
+    );
+    let vars = r#"{
+        "messages": [{"role": "user", "content": "Hello"}],
+        "add_generation_prompt": true,
+        "enable_thinking": false
+    }"#;
+    let result = render_template(tmpl, vars, false).unwrap();
+    // Must end with </think>\n\n (the closed no-op block).
+    assert!(
+        result.ends_with("</think>\n\n"),
+        "enable_thinking=false must end with </think>\\n\\n, got: ...{}",
+        &result[result.len().saturating_sub(40)..],
+    );
+}

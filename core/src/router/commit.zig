@@ -61,6 +61,11 @@ pub const CommitParams = struct {
     /// Generation parameters JSON (model, temperature, top_p, etc.).
     /// Set on assistant message items for tracking what settings produced them.
     generation_json: ?[]const u8 = null,
+
+    /// When true, the parser starts inside a reasoning block because the
+    /// chat template injected an opening tag (e.g. `<think>\n`) as a
+    /// generation prefix — the generated text won't contain it.
+    starts_in_reasoning: bool = false,
 };
 
 /// Commit a generation result to chat history.
@@ -126,9 +131,10 @@ pub fn commitGenerationResult(
         .completion_tokens = params.completion_tokens,
     }, @src());
 
-    var parser = try reasoning_parser_mod.ReasoningParser.init(
+    var parser = try reasoning_parser_mod.ReasoningParser.initWithState(
         allocator,
         params.reasoning_tag,
+        params.starts_in_reasoning,
     );
     defer parser.deinit();
 
@@ -390,6 +396,34 @@ test "commitGenerationResult: custom reasoning tag" {
         .completion_tokens = 12,
         .finish_reason = "stop",
         .reasoning_tag = "thought",
+    });
+
+    // Should have created ReasoningItem + AssistantMessage
+    try std.testing.expectEqual(@as(usize, 2), chat.conv.len());
+
+    const reasoning_item = chat.conv.getItem(0).?;
+    try std.testing.expect(reasoning_item.data == .reasoning);
+
+    const msg_item = chat.conv.getItem(1).?;
+    const msg = msg_item.asMessage().?;
+    try std.testing.expectEqualStrings("Final answer.", msg.getFirstText());
+}
+
+test "commitGenerationResult: starts_in_reasoning splits text without opening tag" {
+    const allocator = std.testing.allocator;
+
+    var chat = try Chat.init(allocator);
+    defer chat.deinit();
+
+    // Simulates Qwen3.5 with enable_thinking=true: the template adds
+    // <think>\n as a generation prefix, so the model's output lacks the
+    // opening tag.  Only the closing </think> and answer are present.
+    try commitGenerationResult(allocator, &chat, .{
+        .text = "Deep reasoning here.\n</think>\nFinal answer.",
+        .prompt_tokens = 8,
+        .completion_tokens = 12,
+        .finish_reason = "stop",
+        .starts_in_reasoning = true,
     });
 
     // Should have created ReasoningItem + AssistantMessage

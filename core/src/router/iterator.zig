@@ -146,6 +146,10 @@ pub const TokenIterator = struct {
     end_marker: []const u8, // e.g. "</think>" (owned)
     is_tool_generation: bool,
     raw_output: bool,
+    // Set by the engine (via starts_in_reasoning_out) after template rendering
+    // but before the first token callback.  pushToken reads this on the first
+    // token and promotes filter_state to .reasoning when true.
+    starts_in_reasoning: bool,
 
     // UTF-8 streaming buffer (worker thread only).
     //
@@ -243,6 +247,7 @@ pub const TokenIterator = struct {
             .end_marker = end_marker,
             .is_tool_generation = is_tool_gen,
             .raw_output = options.raw_output,
+            .starts_in_reasoning = false,
             .utf8_pending = undefined,
             .utf8_pending_len = 0,
             .decode_context_token = null,
@@ -339,6 +344,7 @@ pub const TokenIterator = struct {
             .end_marker = end_marker,
             .is_tool_generation = is_tool_gen,
             .raw_output = options.raw_output,
+            .starts_in_reasoning = false,
             .utf8_pending = undefined,
             .utf8_pending_len = 0,
             .decode_context_token = null,
@@ -670,6 +676,12 @@ pub const TokenIterator = struct {
         opts.token_callback = tokenCallback;
         opts.callback_data = self;
 
+        // Ask the engine to tell us whether the rendered prompt ends with
+        // a reasoning tag (e.g. `<think>\n`).  generateFromPrompt writes
+        // this flag before the decode loop starts, so by the time our
+        // tokenCallback fires, starts_in_reasoning is already set.
+        opts.starts_in_reasoning_out = &self.starts_in_reasoning;
+
         // Keep the external stop_flag (from Rust/Ctrl+C/client disconnect) as-is.
         // It is installed on the backend by local.generate() → setStopFlag() and
         // checked per-layer during the prefill forward pass. The tokenCallback
@@ -865,6 +877,16 @@ pub const TokenIterator = struct {
         // decoded text; the streaming path must do the same.
         if (gen_config_mod.isEosToken(self.engine.?.gen_config.eos_token_ids, token_id))
             return;
+
+        // On the first non-EOS token, check whether the engine detected
+        // that the rendered prompt ends with a reasoning tag (e.g. <think>).
+        // If so, the model's output starts inside a reasoning block and the
+        // filter must begin in .reasoning state to classify tokens correctly.
+        // This flag was written by generateFromPrompt (via starts_in_reasoning_out)
+        // before the decode loop, so it is already set by the time we get here.
+        if (self.engine_token_count == 0 and self.starts_in_reasoning) {
+            self.filter_state = .reasoning;
+        }
 
         // Count actual engine tokens (one per tokenCallback/pushToken call).
         // This is the authoritative count — unlike streamed_slot_count which
