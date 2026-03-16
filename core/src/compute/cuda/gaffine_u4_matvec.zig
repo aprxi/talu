@@ -51,6 +51,7 @@ pub fn run(
         group_size,
         scales_dtype_tag,
         batch_rows,
+        0,
     );
     return resolved.source;
 }
@@ -69,6 +70,7 @@ pub fn runWithFunction(
     group_size: u32,
     scales_dtype_tag: u32,
     batch_rows: u32,
+    residual_ptr: u64,
 ) !void {
     try validateArgs(input, packed_weight, scales, biases, out, in_dim, out_dim, group_size, scales_dtype_tag, batch_rows);
 
@@ -83,6 +85,7 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, group_size);
     try arg_pack.appendScalar(u32, scales_dtype_tag);
     try arg_pack.appendScalar(u32, batch_rows);
+    try arg_pack.appendDevicePtr(residual_ptr);
 
     const rows_per_block = block_x / warp_size;
     const grid_x: u32 = ceilDiv(out_dim, rows_per_block);

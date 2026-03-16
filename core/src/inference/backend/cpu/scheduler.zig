@@ -916,6 +916,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKDecodeRoute")) break :blk false;
                 break :blk true;
             };
+            // Disable greedy streaming when additive penalties are configured.
+            // decodeStreaming uses argmax without applying penalties, so we must
+            // fall back to the queued route that applies penalties via sampleToken.
+            const has_additive_penalties = effective_sampling.presence_penalty != 0.0 or
+                effective_sampling.frequency_penalty != 0.0;
             const can_use_greedy_streaming = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
@@ -925,6 +930,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 !submit_config.return_final_logits and
                 submit_config.max_thinking_tokens == 0 and // thinking budget needs per-token control
                 effective_sampling.strategy == .greedy and
+                !has_additive_penalties and
                 backend_supports_greedy_streaming and
                 self.backend.supportsSchedulerBackendDecodeStreamingRoute();
             if (can_use_greedy_streaming) {
@@ -937,6 +943,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }, @src());
                 return self.generateSyncGreedyStreamingRoute(prompt_tokens, max_tokens, &submit_config, &effective_sampling);
             }
+            // Top-k candidate route: penalties are applied AFTER top-k selection,
+            // which is imperfect but works well for presence_penalty since repeated
+            // tokens are likely in the top-K anyway for repetitive models.
             const can_use_top_k_candidate_route = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
@@ -1658,6 +1667,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
                 request_entry.token_position = request_entry.prompt_tokens.len;
                 request_entry.state = .generating;
+
+                // Reseed sampler if seed specified (ensures deterministic output with same seed)
+                if (request_entry.sampling_config.seed != 0) {
+                    self.sampler.reseed(request_entry.sampling_config.seed);
+                }
 
                 // Sample first token from prefill logits
                 var prefill_sample_cfg = request_entry.sampling_config;

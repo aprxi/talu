@@ -454,8 +454,7 @@ static inline StateSpaceStaticTerms resolve_state_space_static_terms(
 
     StateSpaceStaticTerms terms = uncached();
     // Materialize once so repeated decode steps reuse static terms.
-    eval(terms.a_log_exp_group);
-    eval(terms.d_skip_group);
+    eval({terms.a_log_exp_group, terms.d_skip_group});
     auto [inserted, _] = cache.emplace(key, std::move(terms));
     return inserted->second;
 }
@@ -618,9 +617,8 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     }
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
-    threadgroup float3 stats_shared[D_HEAD];
     threadgroup float out_shared[D_HEAD];
-    threadgroup float scalar_shared[4];
+    threadgroup float scalar_shared[8];
 
     const uint vec_base = head * D_HEAD;
     const uint state_base = head * D_HEAD * D_HEAD;
@@ -628,67 +626,73 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     float q = query[vec_base + lane];
     float k = key[vec_base + lane];
 
-    stats_shared[lane] = float3(q * q, k * k, q * k);
+    // Store q*q, k*k for sequential reduction (matches CPU precision)
+    q_shared[lane] = q * q;
+    k_shared[lane] = k * k;
+    out_shared[lane] = q * k;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
-      if (lane < offset) {
-        stats_shared[lane] += stats_shared[lane + offset];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+
+    // Sequential reduction by lane 0 for exact CPU match
+    // (tiny cost: D_HEAD iterations vs D_HEAD^2 state operations)
     if (lane == 0) {
-      const float q_scale = rsqrt(stats_shared[0].x + eps) * rsqrt((float)D_HEAD);
-      const float k_scale = rsqrt(stats_shared[0].y + eps);
-      scalar_shared[0] = stats_shared[0].z * q_scale * k_scale;
+      float q_sq = 0.0f, k_sq = 0.0f, qk = 0.0f;
+      for (uint i = 0; i < D_HEAD; ++i) {
+        q_sq += q_shared[i];
+        k_sq += k_shared[i];
+        qk += out_shared[i];
+      }
+      const float q_scale = rsqrt(q_sq + eps) * rsqrt((float)D_HEAD);
+      const float k_scale = rsqrt(k_sq + eps);
+      scalar_shared[0] = qk * q_scale * k_scale;  // qk_dot
       scalar_shared[1] = k_scale;
+      scalar_shared[4] = q_scale;
       const float a = a_raw[head] + dt_bias[head];
       const float a_log_exp_value = fast_exp(a_log_exp[head]);
       scalar_shared[2] = fast_sigmoid(beta_raw[head]);
       scalar_shared[3] = fast_exp((-a_log_exp_value) * fast_softplus(a));
-      stats_shared[0].x = q_scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    q *= stats_shared[0].x;
+    q *= scalar_shared[4];
     k *= scalar_shared[1];
     q_shared[lane] = q;
     k_shared[lane] = k;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float beta = scalar_shared[2];
     const float decay = scalar_shared[3];
     float kv_mem = 0.0f;
     float out_value = 0.0f;
+    // Use fma for higher precision accumulation (matches CPU @mulAdd)
     for (uint i = 0; i < D_HEAD; ++i) {
       const uint state_index = state_base + (i * D_HEAD) + lane;
       const float scaled = state[state_index] * decay;
-      kv_mem += scaled * k_shared[i];
-      out_value += scaled * q_shared[i];
+      kv_mem = fma(scaled, k_shared[i], kv_mem);
+      out_value = fma(scaled, q_shared[i], out_value);
     }
 
     kv_mem = (value[vec_base + lane] - kv_mem) * beta;
-    out_value += kv_mem * scalar_shared[0];
+    out_value = fma(kv_mem, scalar_shared[0], out_value);
 
     for (uint i = 0; i < D_HEAD; ++i) {
       const uint state_index = state_base + (i * D_HEAD) + lane;
       const float scaled = state[state_index] * decay;
-      next_state[state_index] = scaled + k_shared[i] * kv_mem;
+      next_state[state_index] = fma(k_shared[i], kv_mem, scaled);
     }
 
-    threadgroup float reduce_shared[D_HEAD];
-    reduce_shared[lane] = out_value * out_value;
+    // RMS norm: sequential reduction for exact CPU match
+    out_shared[lane] = out_value * out_value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
-      if (lane < offset) {
-        reduce_shared[lane] += reduce_shared[lane + offset];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
     if (lane == 0) {
-      scalar_shared[1] = rsqrt((reduce_shared[0] / (float)D_HEAD) + eps);
+      float sum_sq = 0.0f;
+      for (uint i = 0; i < D_HEAD; ++i) {
+        sum_sq += out_shared[i];
+      }
+      scalar_shared[5] = rsqrt((sum_sq / (float)D_HEAD) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    out_value *= scalar_shared[1];
+    out_value *= scalar_shared[5];
     out_value *= norm_weight[vec_base + lane];
     const float z_value = z[vec_base + lane];
     out[vec_base + lane] = out_value * (z_value * fast_sigmoid(z_value));
@@ -753,8 +757,8 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
     }
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
-    threadgroup float3 stats_shared[D_HEAD];
-    threadgroup float scalar_shared[4];
+    threadgroup float out_shared[D_HEAD];
+    threadgroup float scalar_shared[8];
 
     const uint vec_base = head * D_HEAD;
     const uint state_base = head * D_HEAD * D_HEAD;
@@ -762,68 +766,73 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
     float q = query[vec_base + lane];
     float k = key[vec_base + lane];
 
-    stats_shared[lane] = float3(q * q, k * k, q * k);
+    // Store q*q, k*k for sequential reduction (matches CPU precision)
+    q_shared[lane] = q * q;
+    k_shared[lane] = k * k;
+    out_shared[lane] = q * k;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
-      if (lane < offset) {
-        stats_shared[lane] += stats_shared[lane + offset];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+
+    // Sequential reduction by lane 0 for exact CPU match
     if (lane == 0) {
-      const float q_scale = rsqrt(stats_shared[0].x + eps) * rsqrt((float)D_HEAD);
-      const float k_scale = rsqrt(stats_shared[0].y + eps);
-      scalar_shared[0] = stats_shared[0].z * q_scale * k_scale;
+      float q_sq = 0.0f, k_sq = 0.0f, qk = 0.0f;
+      for (uint i = 0; i < D_HEAD; ++i) {
+        q_sq += q_shared[i];
+        k_sq += k_shared[i];
+        qk += out_shared[i];
+      }
+      const float q_scale = rsqrt(q_sq + eps) * rsqrt((float)D_HEAD);
+      const float k_scale = rsqrt(k_sq + eps);
+      scalar_shared[0] = qk * q_scale * k_scale;
       scalar_shared[1] = k_scale;
+      scalar_shared[4] = q_scale;
       const float a = a_raw[head] + dt_bias[head];
       const float a_log_exp_value = fast_exp(a_log_exp[head]);
       scalar_shared[2] = fast_sigmoid(beta_raw[head]);
       scalar_shared[3] = fast_exp((-a_log_exp_value) * fast_softplus(a));
-      stats_shared[0].x = q_scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    q *= stats_shared[0].x;
+    q *= scalar_shared[4];
     k *= scalar_shared[1];
     q_shared[lane] = q;
     k_shared[lane] = k;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float beta = scalar_shared[2];
     const float decay = scalar_shared[3];
     float kv_mem = 0.0f;
     float out_value = 0.0f;
+    // Use fma for higher precision accumulation (matches CPU @mulAdd)
     for (uint i = 0; i < D_HEAD; ++i) {
       const uint state_index = state_base + (i * D_HEAD) + lane;
       const float scaled = state[state_index] * decay;
-      kv_mem += scaled * k_shared[i];
-      out_value += scaled * q_shared[i];
+      kv_mem = fma(scaled, k_shared[i], kv_mem);
+      out_value = fma(scaled, q_shared[i], out_value);
     }
 
     kv_mem = (value[vec_base + lane] - kv_mem) * beta;
-    out_value += kv_mem * scalar_shared[0];
+    out_value = fma(kv_mem, scalar_shared[0], out_value);
     out_ssm[vec_base + lane] = out_value;
 
     for (uint i = 0; i < D_HEAD; ++i) {
       const uint state_index = state_base + (i * D_HEAD) + lane;
       const float scaled = state[state_index] * decay;
-      next_state[state_index] = scaled + k_shared[i] * kv_mem;
+      next_state[state_index] = fma(k_shared[i], kv_mem, scaled);
     }
 
-    threadgroup float reduce_shared[D_HEAD];
-    reduce_shared[lane] = out_value * out_value;
+    // RMS norm: sequential reduction for exact CPU match
+    out_shared[lane] = out_value * out_value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
-      if (lane < offset) {
-        reduce_shared[lane] += reduce_shared[lane + offset];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
     if (lane == 0) {
-      scalar_shared[1] = rsqrt((reduce_shared[0] / (float)D_HEAD) + eps);
+      float sum_sq = 0.0f;
+      for (uint i = 0; i < D_HEAD; ++i) {
+        sum_sq += out_shared[i];
+      }
+      scalar_shared[5] = rsqrt((sum_sq / (float)D_HEAD) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    out_value *= scalar_shared[1];
+    out_value *= scalar_shared[5];
     out_value *= norm_weight[vec_base + lane];
     const float z_value = z[vec_base + lane];
     out_norm[vec_base + lane] = out_value * (z_value * fast_sigmoid(z_value));
@@ -994,8 +1003,8 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_ssm_probe_kerne
     }
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
-    threadgroup float3 stats_shared[D_HEAD];
-    threadgroup float scalar_shared[4];
+    threadgroup float out_shared[D_HEAD];
+    threadgroup float scalar_shared[8];
 
     const uint vec_base = head * D_HEAD;
     const uint state_base = head * D_HEAD * D_HEAD;
@@ -1003,45 +1012,52 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_ssm_probe_kerne
     float q = query[vec_base + lane];
     float k = key[vec_base + lane];
 
-    stats_shared[lane] = float3(q * q, k * k, q * k);
+    // Store q*q, k*k for sequential reduction (matches CPU precision)
+    q_shared[lane] = q * q;
+    k_shared[lane] = k * k;
+    out_shared[lane] = q * k;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = D_HEAD >> 1; offset > 0; offset >>= 1) {
-      if (lane < offset) {
-        stats_shared[lane] += stats_shared[lane + offset];
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+
+    // Sequential reduction by lane 0 for exact CPU match
     if (lane == 0) {
-      const float q_scale = rsqrt(stats_shared[0].x + eps) * rsqrt((float)D_HEAD);
-      const float k_scale = rsqrt(stats_shared[0].y + eps);
-      scalar_shared[0] = stats_shared[0].z * q_scale * k_scale;
+      float q_sq = 0.0f, k_sq = 0.0f, qk = 0.0f;
+      for (uint i = 0; i < D_HEAD; ++i) {
+        q_sq += q_shared[i];
+        k_sq += k_shared[i];
+        qk += out_shared[i];
+      }
+      const float q_scale = rsqrt(q_sq + eps) * rsqrt((float)D_HEAD);
+      const float k_scale = rsqrt(k_sq + eps);
+      scalar_shared[0] = qk * q_scale * k_scale;
       scalar_shared[1] = k_scale;
+      scalar_shared[4] = q_scale;
       const float a = a_raw[head] + dt_bias[head];
       const float a_log_exp_value = fast_exp(a_log_exp[head]);
       scalar_shared[2] = fast_sigmoid(beta_raw[head]);
       scalar_shared[3] = fast_exp((-a_log_exp_value) * fast_softplus(a));
-      stats_shared[0].x = q_scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    q *= stats_shared[0].x;
+    q *= scalar_shared[4];
     k *= scalar_shared[1];
     q_shared[lane] = q;
     k_shared[lane] = k;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float beta = scalar_shared[2];
     const float decay = scalar_shared[3];
     float kv_mem = 0.0f;
     float out_value = 0.0f;
+    // Use fma for higher precision accumulation (matches CPU @mulAdd)
     for (uint i = 0; i < D_HEAD; ++i) {
       const uint state_index = state_base + (i * D_HEAD) + lane;
       const float scaled = state[state_index] * decay;
-      kv_mem += scaled * k_shared[i];
-      out_value += scaled * q_shared[i];
+      kv_mem = fma(scaled, k_shared[i], kv_mem);
+      out_value = fma(scaled, q_shared[i], out_value);
     }
 
     kv_mem = (value[vec_base + lane] - kv_mem) * beta;
-    out_value += kv_mem * scalar_shared[0];
+    out_value = fma(kv_mem, scalar_shared[0], out_value);
     out_ssm[vec_base + lane] = out_value;
         )",
         "",
@@ -1733,18 +1749,14 @@ static inline void materialize_gated_delta_capture_outputs(GatedDeltaCaptureOutp
     if (capture_out == nullptr) {
         return;
     }
-    if (capture_out->in_proj.has_value()) {
-        eval(*capture_out->in_proj);
-    }
-    if (capture_out->conv.has_value()) {
-        eval(*capture_out->conv);
-    }
-    if (capture_out->ssm.has_value()) {
-        eval(*capture_out->ssm);
-    }
-    if (capture_out->norm.has_value()) {
-        eval(*capture_out->norm);
-    }
+    // Batch eval all present captures for efficiency.
+    std::vector<array> to_eval;
+    to_eval.reserve(4);
+    if (capture_out->in_proj.has_value()) to_eval.push_back(*capture_out->in_proj);
+    if (capture_out->conv.has_value()) to_eval.push_back(*capture_out->conv);
+    if (capture_out->ssm.has_value()) to_eval.push_back(*capture_out->ssm);
+    if (capture_out->norm.has_value()) to_eval.push_back(*capture_out->norm);
+    if (!to_eval.empty()) eval(to_eval);
 }
 
 static inline array gated_delta_mixer_forward_core(
@@ -2877,8 +2889,7 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
     materialize_gated_delta_capture_outputs(&capture_outputs);
 
     if (layer_state != nullptr) {
-        eval(conv_state);
-        eval(ssm_state);
+        eval({conv_state, ssm_state});
         *layer_state->conv_state = conv_state;
         *layer_state->ssm_state = ssm_state;
     }
@@ -3047,8 +3058,7 @@ void* mlx_lazy_gated_delta_mixer_quantized_capture(
     materialize_gated_delta_capture_outputs(&capture_outputs);
 
     if (layer_state != nullptr) {
-        eval(conv_state);
-        eval(ssm_state);
+        eval({conv_state, ssm_state});
         *layer_state->conv_state = conv_state;
         *layer_state->ssm_state = ssm_state;
     }

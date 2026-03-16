@@ -24,6 +24,7 @@ pub fn runWithFunction(
     out: *device_mod.Buffer,
     in_dim: u32,
     out_dim: u32,
+    residual_ptr: u64,
 ) !void {
     try validateArgs(input, weight_u16, out, in_dim, out_dim);
 
@@ -33,6 +34,7 @@ pub fn runWithFunction(
     try arg_pack.appendBufferPtr(out);
     try arg_pack.appendScalar(u32, in_dim);
     try arg_pack.appendScalar(u32, out_dim);
+    try arg_pack.appendDevicePtr(residual_ptr);
 
     const rows_per_block = block_x / warp_size;
     try launch_mod.launchWithFamily(device, function, .{

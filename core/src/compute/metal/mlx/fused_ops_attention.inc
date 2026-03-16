@@ -219,9 +219,7 @@ static inline const FfnQuantizedGateUpCacheValue& ffn_quantized_gate_up_cached(
         d_ff,
     };
     // Materialize once so repeated decode steps reuse concrete fused tensors.
-    eval(fused.weights);
-    eval(fused.scales);
-    eval(fused.biases);
+    eval({fused.weights, fused.scales, fused.biases});
     auto [inserted, _] = cache.emplace(key, std::move(fused));
     hot_slot.valid = true;
     hot_slot.key = key;

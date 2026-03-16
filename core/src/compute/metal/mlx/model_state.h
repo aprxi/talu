@@ -16,13 +16,26 @@ struct CacheLayer {
     array* k_bfloat16 = nullptr;
     array* v_bfloat16 = nullptr;
 
-    // View arrays for returning slices (avoid allocation per call).
+    // View arrays returned to callers. These are recreated (via placement new)
+    // on each updateAndFetch call to avoid lazy graph reference invalidation.
+    // Memory is reused but array objects are reconstructed to ensure old
+    // references remain valid via their shared state.
     array* k_view = nullptr;
     array* v_view = nullptr;
 
     size_t offset = 0; // Current position in cache.
     size_t max_seq_len = 0; // Optional preallocated cache capacity.
     static constexpr int step = 256; // Pre-allocation chunk size.
+
+    // Cached shapes for decode hot path. Initialized on first use, then only
+    // the sequence index (position 2) is updated on subsequent calls. This
+    // eliminates 5 std::vector heap allocations per layer per decode step.
+    bool shapes_initialized = false;
+    Shape update_start = {0, 0, 0, 0};   // [0, 0, prev, 0]
+    Shape update_stop_k = {0, 0, 0, 0};  // [batch, n_kv_heads, offset, k_head_dim]
+    Shape update_stop_v = {0, 0, 0, 0};  // [batch, n_kv_heads, offset, v_head_dim]
+    Shape view_stop_k = {0, 0, 0, 0};    // [batch, n_kv_heads, offset, k_head_dim]
+    Shape view_stop_v = {0, 0, 0, 0};    // [batch, n_kv_heads, offset, v_head_dim]
 };
 
 // ============================================================================

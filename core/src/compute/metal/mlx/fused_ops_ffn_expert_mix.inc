@@ -208,8 +208,7 @@ static inline const FfnFusedDenseRhsCacheValue& ffn_fused_dense_rhs_cached(
         in_features
     );
     // Materialize once so dense decode reuses concrete fused rhs tensors.
-    eval(rhs.gate_up_wt);
-    eval(rhs.down_wt);
+    eval({rhs.gate_up_wt, rhs.down_wt});
     auto [inserted, _] = cache.emplace(key, std::move(rhs));
     hot_slot.valid = true;
     hot_slot.key = key;

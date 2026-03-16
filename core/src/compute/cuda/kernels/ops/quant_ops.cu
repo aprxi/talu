@@ -155,10 +155,7 @@ static __device__ __forceinline__ float talu_gaffine_u4_dot_row_warp_v(
     const unsigned short* scale_row = scales + (unsigned long long)out_idx * groups_per_row;
     const unsigned short* bias_row = biases + (unsigned long long)out_idx * groups_per_row;
 
-    // 64-bit weight loads: 2 words per iteration → 5 iterations per row for
-    // in_dim=2560 (matching I8's DRAM request rate).  Each warp issues more
-    // DRAM requests than with 128-bit loads, improving memory pipeline utilization.
-    // Hardware coalesces 32 consecutive 64-bit loads into full cache line fills.
+    // 64-bit weight loads: 2 words (16 nibbles) per iteration via v2.u32.
     float acc = 0.0f;
     for (unsigned int w = lane << 1; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 1) {
         unsigned int w0, w1;
@@ -195,7 +192,8 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_f32(
     unsigned int out_dim,
     unsigned int group_size,
     unsigned int scales_dtype_tag,
-    unsigned int batch_rows
+    unsigned int batch_rows,
+    const float* residual
 ) {
     const unsigned int batch = blockIdx.y;
     if (batch >= batch_rows) return;
@@ -213,7 +211,7 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_f32(
         input_row, packed_weight, scales, biases,
         in_dim, out_idx, group_size, scales_dtype_tag, lane);
 
-    if (lane == 0) out_row[out_idx] = acc;
+    if (lane == 0) out_row[out_idx] = residual ? acc + residual[out_idx] : acc;
 }
 
 extern "C" __global__ void talu_gaffine_u8_matvec_f32(
@@ -226,7 +224,8 @@ extern "C" __global__ void talu_gaffine_u8_matvec_f32(
     unsigned int out_dim,
     unsigned int group_size,
     unsigned int scales_dtype_tag,
-    unsigned int batch_rows
+    unsigned int batch_rows,
+    const float* residual
 ) {
     const unsigned int batch = blockIdx.y;
     const unsigned int out_idx = blockIdx.x;
@@ -246,7 +245,7 @@ extern "C" __global__ void talu_gaffine_u8_matvec_f32(
             in_dim, out_idx, group_size, scales_dtype_tag),
         smem);
 
-    if (threadIdx.x == 0) out_row[out_idx] = acc;
+    if (threadIdx.x == 0) out_row[out_idx] = residual ? acc + residual[out_idx] : acc;
 }
 
 // Symmetric I8 GEMV: warp-per-row design with 4 output rows per block.
@@ -265,7 +264,8 @@ extern "C" __global__ __launch_bounds__(128) void talu_i8_matvec_f32(
     float* out,
     unsigned int in_dim,
     unsigned int out_dim,
-    unsigned int batch_rows
+    unsigned int batch_rows,
+    const float* residual
 ) {
     const unsigned int batch = blockIdx.y;
     if (batch >= batch_rows) return;
@@ -306,7 +306,10 @@ extern "C" __global__ __launch_bounds__(128) void talu_i8_matvec_f32(
 
     // Warp-level reduction (no shared memory, no __syncthreads).
     acc = talu_quant_warp_sum_f32(acc);
-    if (lane == 0) out_row[out_idx] = acc * weight_scales[out_idx];
+    if (lane == 0) {
+        const float result = acc * weight_scales[out_idx];
+        out_row[out_idx] = residual ? result + residual[out_idx] : result;
+    }
 }
 
 // Fused I8 QKV matvec: single kernel launch for Q, K, V projections.
@@ -670,7 +673,7 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up
 // Fused U4 gate/up + SiLU matvec: interleaved design where each warp reads
 // both gate and up weights in the same loop iteration, sharing the input load.
 // Grid: (ceil(out_dim/4), batch_rows), Block: (128 = 4 warps)
-extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up_silu_f32(
+extern "C" __global__ __launch_bounds__(128, 12) void talu_gaffine_u4_matvec_gate_up_silu_f32(
     const float* input,
     const unsigned int* gate_packed_weight,
     const unsigned short* gate_scales,
@@ -712,9 +715,9 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up
     const unsigned short* us_row = up_scales + (unsigned long long)out_index * up_gpr;
     const unsigned short* ub_row = up_biases + (unsigned long long)out_index * up_gpr;
 
-    // 64-bit weight loads for both gate and up: 2 words per load → 5 iterations
-    // per row for in_dim=2560.  4 DRAM loads per iteration (2 gate + 2 up words
-    // via two v2.u32 loads) doubles the DRAM request rate vs 128-bit loads.
+    // 64-bit weight loads for both gate and up: two v2.u32 loads per iteration
+    // give 512 bytes/warp matching U8's single-projection bandwidth, while
+    // sharing input loads between gate and up within each word.
     float gate_acc = 0.0f;
     float up_acc = 0.0f;
     for (unsigned int w = lane << 1; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 1) {
@@ -732,7 +735,7 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up
 
         const unsigned int base_elem = w << 3;
 
-        // Word 0: shared input, sequential gate then up.
+        // Word 0: shared input between gate and up.
         {
             const float4 in_lo = *reinterpret_cast<const float4*>(&input_row[base_elem]);
             const float4 in_hi = *reinterpret_cast<const float4*>(&input_row[base_elem + 4]);
@@ -745,7 +748,7 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up
             const float ub = talu_decode_scale_bias_u16(ub_row[ug], up_scales_dtype_tag);
             U4_PROCESS_WORD(uw0, in_lo, in_hi, us, ub, up_acc);
         }
-        // Word 1: shared input, sequential gate then up.
+        // Word 1: shared input between gate and up.
         {
             const float4 in_lo = *reinterpret_cast<const float4*>(&input_row[base_elem + 8]);
             const float4 in_hi = *reinterpret_cast<const float4*>(&input_row[base_elem + 12]);

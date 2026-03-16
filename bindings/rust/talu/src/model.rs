@@ -439,6 +439,10 @@ pub struct EffectiveGenConfigRequest {
     pub min_p: Option<f32>,
     /// Repetition penalty override. None = use default (1.0).
     pub repetition_penalty: Option<f32>,
+    /// Presence penalty override. None = use model sampling preset default.
+    pub presence_penalty: Option<f32>,
+    /// Frequency penalty override. None = use default (0.0).
+    pub frequency_penalty: Option<f32>,
     /// Seed (0 = random).
     pub seed: u64,
     /// Max tokens to generate.
@@ -463,6 +467,10 @@ pub struct EffectiveGenConfig {
     pub min_p: f32,
     /// Effective repetition_penalty.
     pub repetition_penalty: f32,
+    /// Effective presence_penalty (from model sampling presets).
+    pub presence_penalty: f32,
+    /// Effective frequency_penalty.
+    pub frequency_penalty: f32,
     /// Seed.
     pub seed: u64,
     /// Max tokens.
@@ -495,6 +503,8 @@ pub fn resolve_effective_generation_config(
         top_p: request.top_p.unwrap_or(-1.0),
         min_p: request.min_p.unwrap_or(-1.0),
         repetition_penalty: request.repetition_penalty.unwrap_or(-1.0),
+        presence_penalty: request.presence_penalty.unwrap_or(-1.0),
+        frequency_penalty: request.frequency_penalty.unwrap_or(-1.0),
         seed: request.seed,
         max_tokens: request.max_tokens,
     };
@@ -520,6 +530,8 @@ pub fn resolve_effective_generation_config(
         top_p: out_config.top_p,
         min_p: out_config.min_p,
         repetition_penalty: out_config.repetition_penalty,
+        presence_penalty: out_config.presence_penalty,
+        frequency_penalty: out_config.frequency_penalty,
         seed: out_config.seed,
         max_tokens: out_config.max_tokens,
         do_sample: out_config.do_sample,
