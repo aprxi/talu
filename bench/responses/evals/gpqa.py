@@ -81,8 +81,12 @@ def _build_body(sample: dict, uri: str, config: dict) -> dict:
         "instructions": _INSTRUCTIONS,
         "stream": False,
         "store": False,
-        "max_output_tokens": config.get("max_tokens", 4096),
     }
+    # Only send max_output_tokens when explicitly configured; otherwise the
+    # server defaults to its own value (8192) which gives enough room for
+    # thinking + answer.
+    if "max_tokens" in config:
+        body["max_output_tokens"] = config["max_tokens"]
     for cfg_key, api_key in _API_FIELDS.items():
         if cfg_key in config:
             body[api_key] = config[cfg_key]

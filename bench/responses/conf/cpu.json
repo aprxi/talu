@@ -4,7 +4,6 @@
   "env": {
     "BACKEND": "cpu"
   },
-  "max_tokens": 4096,
   "streaming": false,
   "temperature": 1.0,
   "seed": 42

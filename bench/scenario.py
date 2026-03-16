@@ -66,7 +66,6 @@ _DEFAULT_CONFIG: dict = {
     "model_uri": ["Qwen/Qwen3.5-0.8B"],
     "precision": ["original", "GAF8", "GAF4"],
     "env": {},
-    "max_tokens": 4096,
     "streaming": False,
     "seed": 42,
     **SAMPLING_PRESETS["general"],

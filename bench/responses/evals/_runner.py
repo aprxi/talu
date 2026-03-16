@@ -246,6 +246,7 @@ def run_eval(
                     model=uri,
                     raw_output=raw,
                     reasoning=reasoning,
+                    question=sample.get("prompt", ""),
                     input_tokens=metrics.get("input_tokens", 0),
                     output_tokens=metrics.get("output_tokens", 0),
                     prefill_tok_s=metrics.get("prefill_tok_s", 0),
