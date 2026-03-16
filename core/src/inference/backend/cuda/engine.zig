@@ -3310,47 +3310,49 @@ pub const CudaBackend = struct {
         const k = @min(top_k, projected_vocab);
         if (candidate_logits_out.len < k or candidate_ids_out.len < k) return error.InvalidArgument;
 
-        const copy_function = self.copy_function orelse return error.CudaKernelUnavailable;
-        const argmax_function = self.argmax_function orelse return error.CudaKernelUnavailable;
-        const count_u32: u32 = @intCast(projected_vocab);
-        try compute.cuda.copy.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            copy_function,
-            &self.runtime_buffers.logits_dev,
-            &self.runtime_buffers.topk_logits_dev,
-            count_u32,
-        );
+        // Bulk download logits to host — one transfer replaces K iterations of
+        // GPU argmax + 3 sync round-trips each (copy kernel + K*(argmax + download + upload)).
+        try self.runtime_buffers.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host));
+        const logits_host = self.runtime_buffers.projected_logits_host;
+        const logits_scaling = self.loaded.config.logits_scaling;
 
-        var selected: usize = 0;
-        while (selected < k) : (selected += 1) {
-            try compute.cuda.argmax.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                argmax_function,
-                &self.runtime_buffers.topk_logits_dev,
-                &self.argmax_index_dev,
-                count_u32,
-            );
-
-            var candidate_id: u32 = 0;
-            try self.argmax_index_dev.download(&self.device, std.mem.asBytes(&candidate_id));
-            const candidate_index: usize = @intCast(candidate_id);
-
-            const value_offset = std.math.mul(usize, candidate_index, @sizeOf(f32)) catch return error.InvalidArgument;
-            var value_view = try bufferSlice(&self.runtime_buffers.topk_logits_dev, value_offset, @sizeOf(f32));
-
-            var candidate_logit: f32 = 0.0;
-            try value_view.download(&self.device, std.mem.asBytes(&candidate_logit));
-            if (self.loaded.config.logits_scaling != 1.0) {
-                candidate_logit /= self.loaded.config.logits_scaling;
-            }
-            candidate_ids_out[selected] = candidate_id;
-            candidate_logits_out[selected] = candidate_logit;
-
-            var neg_inf: f32 = -std.math.inf(f32);
-            try value_view.upload(&self.device, std.mem.asBytes(&neg_inf));
+        // CPU top-K selection: maintain K candidates with tracked minimum.
+        // O(N) average for logit distributions (replacements rare after initial K).
+        for (0..k) |i| {
+            candidate_ids_out[i] = @intCast(i);
+            candidate_logits_out[i] = logits_host[i];
         }
+        var min_pos: usize = 0;
+        var min_val: f32 = candidate_logits_out[0];
+        for (1..k) |i| {
+            if (candidate_logits_out[i] < min_val) {
+                min_val = candidate_logits_out[i];
+                min_pos = i;
+            }
+        }
+        for (k..projected_vocab) |i| {
+            const v = logits_host[i];
+            if (v > min_val) {
+                candidate_ids_out[min_pos] = @intCast(i);
+                candidate_logits_out[min_pos] = v;
+                // Re-find minimum among K candidates.
+                min_val = candidate_logits_out[0];
+                min_pos = 0;
+                for (1..k) |j| {
+                    if (candidate_logits_out[j] < min_val) {
+                        min_val = candidate_logits_out[j];
+                        min_pos = j;
+                    }
+                }
+            }
+        }
+        if (logits_scaling != 1.0) {
+            const inv_scale: f32 = 1.0 / logits_scaling;
+            for (candidate_logits_out[0..k]) |*v| {
+                v.* *= inv_scale;
+            }
+        }
+        const selected = k;
 
         self.slot_position += 1;
         return selected;
