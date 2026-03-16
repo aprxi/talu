@@ -60,11 +60,13 @@ def _build_body(sample: dict, uri: str, config: dict) -> dict:
         "instructions": _INSTRUCTIONS,
         "stream": False,
         "store": False,
-        "max_output_tokens": config.get("max_tokens", 64),
+        "max_output_tokens": config.get("max_tokens", 4096),
     }
     for cfg_key, api_key in _API_FIELDS.items():
         if cfg_key in config:
             body[api_key] = config[cfg_key]
+    if "reasoning_effort" in config:
+        body["reasoning"] = {"effort": config["reasoning_effort"]}
     return body
 
 

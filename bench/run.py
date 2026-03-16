@@ -180,9 +180,19 @@ def _print_expanded_cmd(args: argparse.Namespace, config: dict) -> None:
     precs = ",".join(config.get("precision", []))
     parts.append(f"--set model_uri={models}")
     parts.append(f"--set precision={precs}")
-    for key in ("seed", "temperature", "top_p", "top_k", "presence_penalty"):
-        if key in config:
-            parts.append(f"--set {key}={config[key]}")
+    # Show all tunable params — explicit values and discoverable defaults.
+    _EVAL_DEFAULTS = {
+        "reasoning_effort": "medium",
+        "seed": None,
+        "temperature": None,
+        "top_p": None,
+        "top_k": None,
+        "presence_penalty": None,
+    }
+    for key, default in _EVAL_DEFAULTS.items():
+        val = config.get(key, default if is_eval else None)
+        if val is not None:
+            parts.append(f"--set {key}={val}")
     env_vars = config.get("env", {})
     for k, v in sorted(env_vars.items()):
         parts.append(f"--env {k}={v}")
@@ -509,6 +519,9 @@ def print_eval_report(
     for key in ("seed", "temperature", "max_tokens"):
         if key in config:
             param_parts.append(f"{key}={config[key]}")
+    # Always show reasoning effort — server defaults to medium when omitted.
+    effort = config.get("reasoning_effort", "medium")
+    param_parts.append(f"reasoning={effort}")
     for k, v in sorted(env_vars.items()):
         param_parts.append(f"{k}={v}")
     if param_parts:

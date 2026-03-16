@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import http.client
+import json
 import time
+import urllib.parse
 from collections import deque
 
-from scenario import http_post_stream, extract_generation_metrics, model_uri
+from scenario import extract_generation_metrics, model_uri
 from extract import extract_answer
 from log import eval_log_path, load_completed, EvalLogger
 
@@ -13,7 +16,7 @@ _MAX_RETRIES = 3
 
 
 def _extract_text(events: list[dict]) -> str:
-    """Extract generated text from response events."""
+    """Extract generated answer text from response events (excludes reasoning)."""
     for ev in events:
         if ev["event"] in ("response.completed", "response.incomplete"):
             resp = ev["data"].get("response", {})
@@ -22,6 +25,105 @@ def _extract_text(events: list[dict]) -> str:
                     if part.get("type") in ("output_text", "text"):
                         return part.get("text", "").strip()
     return ""
+
+
+def _extract_reasoning(events: list[dict]) -> str:
+    """Extract thinking/reasoning text from response events."""
+    for ev in events:
+        if ev["event"] in ("response.completed", "response.incomplete"):
+            resp = ev["data"].get("response", {})
+            for item in resp.get("output", []):
+                if item.get("type") == "reasoning":
+                    # Reasoning summary parts.
+                    for s in item.get("summary", []):
+                        if s.get("type") == "summary_text":
+                            return s.get("text", "")
+                    # Direct content (reasoning_text parts).
+                    for part in item.get("content", []):
+                        if part.get("type") in ("reasoning_text", "text"):
+                            return part.get("text", "")
+    return ""
+
+
+def _parse_sse(body_str: str) -> list[dict]:
+    """Parse SSE event stream or plain JSON into event list."""
+    events: list[dict] = []
+    current_event = ""
+    for line in body_str.split("\n"):
+        line = line.rstrip("\r")
+        if line.startswith("event: "):
+            current_event = line[7:].strip()
+        elif line.startswith("data: "):
+            try:
+                parsed_data = json.loads(line[6:])
+                events.append({"event": current_event, "data": parsed_data})
+            except json.JSONDecodeError:
+                pass
+        elif line == "":
+            current_event = ""
+    # Non-streaming: body is a single JSON response.
+    if not events and body_str.strip():
+        try:
+            resp = json.loads(body_str.strip())
+            status = resp.get("status", "completed")
+            ev_type = "response.completed" if status == "completed" else "response.incomplete"
+            events.append({"event": ev_type, "data": {"response": resp}})
+        except json.JSONDecodeError:
+            pass
+    return events
+
+
+class _PersistentClient:
+    """HTTP/1.1 keep-alive client. One TCP connection reused across requests."""
+
+    def __init__(self, base_url: str, timeout: float = 180) -> None:
+        parsed = urllib.parse.urlparse(base_url)
+        self._host = parsed.hostname or "127.0.0.1"
+        self._port = parsed.port or 80
+        self._timeout = timeout
+        self._conn: http.client.HTTPConnection | None = None
+
+    def _connect(self) -> http.client.HTTPConnection:
+        if self._conn is None:
+            self._conn = http.client.HTTPConnection(
+                self._host, self._port, timeout=self._timeout,
+            )
+        return self._conn
+
+    def _reset(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def post(self, path: str, body: dict) -> tuple[list[dict], float]:
+        """POST JSON, return (events, wall_seconds). Reconnects on failure."""
+        payload = json.dumps(body).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+        }
+        t0 = time.monotonic()
+        conn = self._connect()
+        try:
+            conn.request("POST", path, body=payload, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read().decode(errors="replace")
+        except Exception:
+            self._reset()
+            raise
+        wall_s = time.monotonic() - t0
+
+        if resp.status != 200:
+            print(f"\n    HTTP {resp.status}: {raw[:200]}", flush=True)
+
+        events = _parse_sse(raw)
+        return events, wall_s
+
+    def close(self) -> None:
+        self._reset()
 
 
 def run_eval(
@@ -45,7 +147,6 @@ def run_eval(
     Returns:
         List of result dicts (one per model × precision).
     """
-    url = f"{base_url}/v1/responses"
     model_uris: list[str] = config.get("model_uri", ["Qwen/Qwen3.5-0.8B"])
     precisions: list[str] = config.get("precision", ["original"])
     samples_n: int | None = config.get("samples")
@@ -53,6 +154,7 @@ def run_eval(
         samples_n = int(samples_n)
     total = len(samples)
 
+    client = _PersistentClient(base_url)
     all_results: list[dict] = []
 
     for base_model in model_uris:
@@ -97,11 +199,11 @@ def run_eval(
                 # Build request body (scenario-specific).
                 body = build_body(sample, uri, config)
 
-                # Retry loop.
+                # Retry loop with persistent connection.
                 events: list[dict] = []
                 for attempt in range(_MAX_RETRIES):
                     try:
-                        events, _ = http_post_stream(url, body, timeout=180)
+                        events, _ = client.post("/v1/responses", body)
                         if events:
                             break
                     except Exception as exc:
@@ -114,6 +216,7 @@ def run_eval(
                             errors += 1
 
                 raw = _extract_text(events)
+                reasoning = _extract_reasoning(events)
                 predicted = extract_answer(raw)
                 is_correct = predicted == sample["correct"]
                 if is_correct:
@@ -142,6 +245,7 @@ def run_eval(
                     correct=sample["correct"],
                     model=uri,
                     raw_output=raw,
+                    reasoning=reasoning,
                     input_tokens=metrics.get("input_tokens", 0),
                     output_tokens=metrics.get("output_tokens", 0),
                     prefill_tok_s=metrics.get("prefill_tok_s", 0),
@@ -213,4 +317,5 @@ def run_eval(
                 "total_output_tokens": total_output_tokens,
             })
 
+    client.close()
     return all_results

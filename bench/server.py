@@ -77,7 +77,7 @@ class TaluServer:
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             env=proc_env,
             # Own process group so we can signal just our server.
             preexec_fn=os.setsid,
@@ -240,12 +240,9 @@ class TaluServer:
         while time.monotonic() < deadline:
             # Check if process died.
             if self._proc and self._proc.poll() is not None:
-                stderr = ""
-                if self._proc.stderr:
-                    stderr = self._proc.stderr.read().decode(errors="replace")
                 raise ServerError(
                     f"server exited with code {self._proc.returncode} "
-                    f"during startup.\nstderr:\n{stderr}"
+                    f"during startup."
                 )
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
