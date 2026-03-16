@@ -78,9 +78,9 @@ pub const CGenerateConfig = extern struct {
     top_k: usize = 0,
     top_p: f32 = -1.0,
     min_p: f32 = -1.0,
-    repetition_penalty: f32 = 0.0,
-    presence_penalty: f32 = 0.0,
-    frequency_penalty: f32 = 0.0,
+    repetition_penalty: f32 = -1.0,
+    presence_penalty: f32 = -1.0,
+    frequency_penalty: f32 = -1.0,
     stop_sequences: ?[*]const [*:0]const u8 = null,
     stop_sequence_count: usize = 0,
     logit_bias: ?[*]const CLogitBiasEntry = null,
@@ -753,9 +753,9 @@ pub fn configToGenerateOptions(config: ?*const CGenerateConfig) GenerateOptions 
     if (cfg.top_k > 0) opts.top_k = cfg.top_k;
     if (cfg.top_p >= 0) opts.top_p = cfg.top_p;
     if (cfg.min_p >= 0) opts.min_p = cfg.min_p;
-    if (cfg.repetition_penalty > 0) opts.repetition_penalty = cfg.repetition_penalty;
-    if (cfg.presence_penalty != 0.0) opts.presence_penalty = cfg.presence_penalty;
-    if (cfg.frequency_penalty != 0.0) opts.frequency_penalty = cfg.frequency_penalty;
+    if (cfg.repetition_penalty >= 0) opts.repetition_penalty = cfg.repetition_penalty;
+    if (cfg.presence_penalty >= 0) opts.presence_penalty = cfg.presence_penalty;
+    if (cfg.frequency_penalty >= 0) opts.frequency_penalty = cfg.frequency_penalty;
     if (cfg.seed != 0) opts.seed = cfg.seed;
 
     if (cfg.template_override) |t| opts.template_override = std.mem.sliceTo(t, 0);
@@ -887,7 +887,9 @@ fn buildOptions(
     if (cfg.top_k > 0) result.options.top_k = cfg.top_k;
     if (cfg.top_p >= 0) result.options.top_p = cfg.top_p;
     if (cfg.min_p >= 0) result.options.min_p = cfg.min_p;
-    if (cfg.repetition_penalty > 0) result.options.repetition_penalty = cfg.repetition_penalty;
+    if (cfg.repetition_penalty >= 0) result.options.repetition_penalty = cfg.repetition_penalty;
+    if (cfg.presence_penalty >= 0) result.options.presence_penalty = cfg.presence_penalty;
+    if (cfg.frequency_penalty >= 0) result.options.frequency_penalty = cfg.frequency_penalty;
     if (cfg.seed != 0) result.options.seed = cfg.seed;
 
     if (cfg.template_override) |t| result.options.template_override = std.mem.sliceTo(t, 0);
@@ -983,7 +985,9 @@ test "CGenerateConfig defaults" {
     try std.testing.expectEqual(@as(usize, 0), cfg.top_k);
     try std.testing.expectEqual(@as(f32, -1.0), cfg.top_p);
     try std.testing.expectEqual(@as(f32, -1.0), cfg.min_p);
-    try std.testing.expectEqual(@as(f32, 0.0), cfg.repetition_penalty);
+    try std.testing.expectEqual(@as(f32, -1.0), cfg.repetition_penalty);
+    try std.testing.expectEqual(@as(f32, -1.0), cfg.presence_penalty);
+    try std.testing.expectEqual(@as(f32, -1.0), cfg.frequency_penalty);
     try std.testing.expect(cfg.stop_sequences == null);
     try std.testing.expectEqual(@as(usize, 0), cfg.stop_sequence_count);
     try std.testing.expect(cfg.logit_bias == null);
