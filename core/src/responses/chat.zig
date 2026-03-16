@@ -68,8 +68,8 @@ pub const Chat = struct {
     /// Sampling temperature (0.0-2.0).
     temperature: f32 = 0.7,
 
-    /// Maximum tokens to generate.
-    max_tokens: usize = 4096,
+    /// Maximum tokens to generate (total budget including thinking tokens).
+    max_tokens: usize = 8192,
 
     /// Top-k sampling parameter.
     top_k: usize = 50,
@@ -424,7 +424,7 @@ pub const Chat = struct {
     pub fn reset(self: *Chat) void {
         self.conv.clear();
         self.temperature = 0.7;
-        self.max_tokens = 4096;
+        self.max_tokens = 8192;
         self.top_k = 50;
         self.top_p = 0.9;
         self.min_p = 0.0;
@@ -804,7 +804,7 @@ test "Chat.reset clears all settings" {
     try std.testing.expectEqual(@as(usize, 0), chat_session.len());
     try std.testing.expect(chat_session.getSystem() == null);
     try std.testing.expectEqual(@as(f32, 0.7), chat_session.temperature);
-    try std.testing.expectEqual(@as(usize, 4096), chat_session.max_tokens);
+    try std.testing.expectEqual(@as(usize, 8192), chat_session.max_tokens);
     try std.testing.expectEqual(@as(usize, 50), chat_session.top_k);
     try std.testing.expectEqual(@as(f32, 0.9), chat_session.top_p);
     try std.testing.expectEqual(@as(f32, 0.0), chat_session.min_p);

@@ -778,17 +778,11 @@ pub const LocalEngine = struct {
         // Use tool grammar if created, otherwise fall back to chat's grammar
         const effective_grammar = tool_grammar_sampler orelse chat.grammar_sampler;
 
-        // Compute thinking token budget from reasoning effort.
-        const thinking_budget = maxThinkingTokensForEffort(opts.reasoning_effort);
-        const max_tokens = blk: {
-            var m = if (effective_grammar != null and base_max_tokens > 0)
-                base_max_tokens + grammar_slack
-            else
-                base_max_tokens;
-            // Thinking tokens are additive: total = answer budget + thinking budget.
-            m += thinking_budget;
-            break :blk m;
-        };
+        // max_tokens is the total generation budget (including any thinking tokens).
+        const max_tokens = if (effective_grammar != null and base_max_tokens > 0)
+            base_max_tokens + grammar_slack
+        else
+            base_max_tokens;
         const temperature = opts.temperature orelse chat.temperature;
         const top_k = opts.top_k orelse chat.top_k;
         const top_p = opts.top_p orelse chat.top_p;

@@ -713,6 +713,26 @@ async fn generate_response(
     let temperature = temperature.or_else(|| model_overrides.as_ref().and_then(|o| o.temperature));
     let top_p = top_p.or_else(|| model_overrides.as_ref().and_then(|o| o.top_p));
 
+    // Resolve effective generation config using model sampling presets.
+    // Applies 3-layer precedence: model presets → generation_config.json → API request.
+    // For remote/provider models this may fail — fall back to raw request params.
+    let effective_gen = talu::model::resolve_effective_generation_config(
+        &model_id,
+        &talu::EffectiveGenConfigRequest {
+            temperature: temperature.map(|t| t as f32),
+            top_k: top_k.map(|k| k as usize),
+            top_p: top_p.map(|p| p as f32),
+            presence_penalty: presence_penalty.map(|p| p as f32),
+            frequency_penalty: frequency_penalty.map(|p| p as f32),
+            seed: seed.unwrap_or(0),
+            max_tokens: max_output_tokens.map(|t| t as usize).unwrap_or(8192),
+            ..Default::default()
+        },
+    );
+    if let Err(ref e) = effective_gen {
+        log::warn!(target: "server::gen", "resolve_effective_generation_config: {e} (using raw request params)");
+    }
+
     // If prompt_id is provided, fetch the document and extract system prompt.
     let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
         if let Some(ref bp) = bucket_path {
@@ -818,6 +838,9 @@ async fn generate_response(
     let stop_flag_for_gen = stop_flag.clone();
     let cancel_guard = CancelOnDrop(Some(stop_flag));
 
+    let effective_config = effective_gen.ok();
+    let effective_config_for_task = effective_config.clone();
+
     let session_id_for_task = session_id.clone();
     let bucket_for_task = bucket_path.clone();
     let model_id_for_task = model_id.clone();
@@ -891,34 +914,45 @@ async fn generate_response(
             }
 
             let mut cfg = talu::router::GenerateConfig::default();
-            if let Some(max_tokens) = max_output_tokens {
-                cfg.max_tokens = max_tokens as usize;
-            }
-            if let Some(temp) = temperature {
-                cfg.temperature = temp as f32;
-            }
-            if let Some(top_p) = top_p {
-                cfg.top_p = top_p as f32;
-            }
-            if let Some(top_k) = top_k {
-                cfg.top_k = top_k as usize;
-            }
-            if let Some(seed) = seed {
-                cfg.seed = seed;
-            }
-            if let Some(pp) = presence_penalty {
-                cfg.presence_penalty = pp as f32;
-            }
-            if let Some(fp) = frequency_penalty {
-                cfg.frequency_penalty = fp as f32;
+            if let Some(ref eff) = effective_config_for_task {
+                cfg.max_tokens = eff.max_tokens;
+                cfg.temperature = eff.temperature;
+                cfg.top_k = eff.top_k;
+                cfg.top_p = eff.top_p;
+                cfg.presence_penalty = eff.presence_penalty;
+                cfg.frequency_penalty = eff.frequency_penalty;
+                cfg.seed = eff.seed;
+            } else {
+                // Fallback for remote/provider models where presets are unavailable.
+                if let Some(max_tokens) = max_output_tokens {
+                    cfg.max_tokens = max_tokens as usize;
+                }
+                if let Some(temp) = temperature {
+                    cfg.temperature = temp as f32;
+                }
+                if let Some(top_p) = top_p {
+                    cfg.top_p = top_p as f32;
+                }
+                if let Some(top_k) = top_k {
+                    cfg.top_k = top_k as usize;
+                }
+                if let Some(seed) = seed {
+                    cfg.seed = seed;
+                }
+                if let Some(pp) = presence_penalty {
+                    cfg.presence_penalty = pp as f32;
+                }
+                if let Some(fp) = frequency_penalty {
+                    cfg.frequency_penalty = fp as f32;
+                }
             }
             cfg.tools_json = tools_json_for_generation;
             cfg.tool_choice = tool_choice_for_generation;
             cfg.reasoning_effort = reasoning_effort_for_generation;
             cfg.stop_flag = Some(stop_flag_for_gen);
 
-            log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?} seed={:?}",
-                model_id_for_task, max_output_tokens, temperature, top_p, seed);
+            log::debug!(target: "server::gen", "generating: model={} max_tokens={} temp={} top_p={} seed={}",
+                model_id_for_task, cfg.max_tokens, cfg.temperature, cfg.top_p, cfg.seed);
             log::trace!(target: "server::gen", "generate(items={}, cfg={{max_tokens={}, temp={}, top_p={}}})",
                 pre_gen_count, cfg.max_tokens, cfg.temperature, cfg.top_p);
             let result = talu::router::generate(&chat, &[], backend, &cfg)
@@ -996,12 +1030,12 @@ async fn generate_response(
         created_at,
         Some(now_unix_seconds()),
         output_items,
-        max_output_tokens,
-        temperature.unwrap_or(0.0),
-        top_p.unwrap_or(1.0),
-        top_k,
-        presence_penalty.unwrap_or(0.0),
-        frequency_penalty.unwrap_or(0.0),
+        effective_config.as_ref().map(|e| e.max_tokens as i64).or(max_output_tokens),
+        effective_config.as_ref().map(|e| e.temperature as f64).unwrap_or_else(|| temperature.unwrap_or(0.0)),
+        effective_config.as_ref().map(|e| e.top_p as f64).unwrap_or_else(|| top_p.unwrap_or(1.0)),
+        effective_config.as_ref().map(|e| Some(e.top_k as u32)).unwrap_or(top_k),
+        effective_config.as_ref().map(|e| e.presence_penalty as f64).unwrap_or_else(|| presence_penalty.unwrap_or(0.0)),
+        effective_config.as_ref().map(|e| e.frequency_penalty as f64).unwrap_or_else(|| frequency_penalty.unwrap_or(0.0)),
         logprobs.top_logprobs as i64,
         reasoning.effort.as_deref(),
         reasoning.summary.as_deref(),
@@ -1176,6 +1210,25 @@ async fn stream_response(
         .and_then(|s| s.models.get(&model_id).cloned());
     let temperature = temperature.or_else(|| model_overrides.as_ref().and_then(|o| o.temperature));
     let top_p = top_p.or_else(|| model_overrides.as_ref().and_then(|o| o.top_p));
+
+    // Resolve effective generation config using model sampling presets.
+    let effective_gen = talu::model::resolve_effective_generation_config(
+        &model_id,
+        &talu::EffectiveGenConfigRequest {
+            temperature: temperature.map(|t| t as f32),
+            top_k: top_k.map(|k| k as usize),
+            top_p: top_p.map(|p| p as f32),
+            presence_penalty: presence_penalty.map(|p| p as f32),
+            frequency_penalty: frequency_penalty.map(|p| p as f32),
+            seed: seed.unwrap_or(0),
+            max_tokens: max_output_tokens.map(|t| t as usize).unwrap_or(8192),
+            ..Default::default()
+        },
+    );
+    if let Err(ref e) = effective_gen {
+        log::warn!(target: "server::gen", "resolve_effective_generation_config: {e} (using raw request params)");
+    }
+    let effective_config = effective_gen.ok();
 
     // If prompt_id is provided, fetch the document and extract system prompt.
     let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
@@ -1551,9 +1604,9 @@ async fn stream_response(
             text_format: text_format_for_events.clone(),
             project_id: project_id.clone(),
             top_logprobs: logprobs.top_logprobs,
-            top_k,
-            presence_penalty: presence_penalty.unwrap_or(0.0),
-            frequency_penalty: frequency_penalty.unwrap_or(0.0),
+            top_k: effective_config.as_ref().map(|e| Some(e.top_k as u32)).unwrap_or(top_k),
+            presence_penalty: effective_config.as_ref().map(|e| e.presence_penalty as f64).unwrap_or_else(|| presence_penalty.unwrap_or(0.0)),
+            frequency_penalty: effective_config.as_ref().map(|e| e.frequency_penalty as f64).unwrap_or_else(|| frequency_penalty.unwrap_or(0.0)),
             reasoning_effort: reasoning_for_events.effort.clone(),
             reasoning_summary: reasoning_for_events.summary.clone(),
             coalesce_buf: String::new(),
@@ -1594,6 +1647,7 @@ async fn stream_response(
             Some(events_request_id.clone()),
             Some(events_response_id.clone()),
             Some(events_session_id.clone()),
+            effective_config,
         );
 
         // Store conversation for chaining after streaming completes.
@@ -1672,6 +1726,7 @@ fn run_streaming_generation(
     event_request_id: Option<String>,
     event_response_id: Option<String>,
     event_session_id: Option<String>,
+    effective_config: Option<talu::model::EffectiveGenConfig>,
 ) -> Result<StreamGenResult> {
     let mut backend = backend.blocking_lock();
     let backend = backend
@@ -1718,26 +1773,37 @@ fn run_streaming_generation(
             .map_err(|e| anyhow!("failed to append user message: {}", e))?;
     }
     let mut cfg = talu::router::GenerateConfig::default();
-    if let Some(max_tokens) = max_output_tokens {
-        cfg.max_tokens = max_tokens as usize;
-    }
-    if let Some(temp) = temperature {
-        cfg.temperature = temp as f32;
-    }
-    if let Some(top_p) = top_p {
-        cfg.top_p = top_p as f32;
-    }
-    if let Some(top_k) = top_k {
-        cfg.top_k = top_k as usize;
-    }
-    if let Some(seed) = seed {
-        cfg.seed = seed;
-    }
-    if let Some(pp) = presence_penalty {
-        cfg.presence_penalty = pp as f32;
-    }
-    if let Some(fp) = frequency_penalty {
-        cfg.frequency_penalty = fp as f32;
+    if let Some(ref eff) = effective_config {
+        cfg.max_tokens = eff.max_tokens;
+        cfg.temperature = eff.temperature;
+        cfg.top_k = eff.top_k;
+        cfg.top_p = eff.top_p;
+        cfg.presence_penalty = eff.presence_penalty;
+        cfg.frequency_penalty = eff.frequency_penalty;
+        cfg.seed = eff.seed;
+    } else {
+        // Fallback for remote/provider models where presets are unavailable.
+        if let Some(max_tokens) = max_output_tokens {
+            cfg.max_tokens = max_tokens as usize;
+        }
+        if let Some(temp) = temperature {
+            cfg.temperature = temp as f32;
+        }
+        if let Some(top_p) = top_p {
+            cfg.top_p = top_p as f32;
+        }
+        if let Some(top_k) = top_k {
+            cfg.top_k = top_k as usize;
+        }
+        if let Some(seed) = seed {
+            cfg.seed = seed;
+        }
+        if let Some(pp) = presence_penalty {
+            cfg.presence_penalty = pp as f32;
+        }
+        if let Some(fp) = frequency_penalty {
+            cfg.frequency_penalty = fp as f32;
+        }
     }
     cfg.tools_json = tools_json.map(|v| v.to_string());
     cfg.tool_choice = tool_choice_json.map(|v| v.to_string());
