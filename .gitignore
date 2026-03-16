@@ -45,6 +45,8 @@ src/tinyllmc/test_tinyllmc_profile
 src/tinyllmc/test_tinyllmc
 
 tmp/
+temp/
+debug/
 /archive/
 /taludb
 

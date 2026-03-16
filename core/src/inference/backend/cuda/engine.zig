@@ -2736,6 +2736,11 @@ pub const CudaBackend = struct {
     i8_blas_supported: bool = true,
     // Transient: set before QKV projection to provide concat cache for fused I8 prefill.
     active_qkv_concat: ?QkvI8ConcatRef = null,
+    // Transient: set before linearForwardRows to fuse residual add into GEMV output.
+    // Consumed (cleared) inside linearForwardRows for rows==1.
+    pending_residual_add_buf: ?compute.cuda.Buffer = null,
+    // Set when fused GEMV+residual succeeded; checked/cleared by residual add adapter.
+    skip_next_residual_add: bool = false,
     gaffine_sequence_rows_supported: bool = false,
     gaffine_sequence_fused_qkv_supported: bool = false,
     gaffine_sequence_fused_gate_up_supported: bool = false,
@@ -4707,14 +4712,32 @@ pub const CudaBackend = struct {
         if (input.size < packed_input_bytes or out.size < packed_output_bytes) {
             return error.InvalidInstructionBinding;
         }
+        // Consume pending residual fusion: redirect output to residual buffer
+        // and pass its pointer to the GEMV kernel for fused residual add.
+        var residual_ptr: u64 = 0;
+        var fused_out_buf: compute.cuda.Buffer = undefined;
+        const effective_out: *compute.cuda.Buffer = if (rows == 1) blk: {
+            if (self.pending_residual_add_buf) |res_buf| {
+                self.pending_residual_add_buf = null;
+                residual_ptr = res_buf.pointer;
+                fused_out_buf = res_buf;
+                self.skip_next_residual_add = true;
+                break :blk &fused_out_buf;
+            }
+            break :blk out;
+        } else blk: {
+            self.pending_residual_add_buf = null;
+            break :blk out;
+        };
+
         var packed_input = if (input.size == packed_input_bytes)
             input.*
         else
             try bufferSlice(input, 0, packed_input_bytes);
-        var packed_out = if (out.size == packed_output_bytes)
-            out.*
+        var packed_out = if (effective_out.size == packed_output_bytes)
+            effective_out.*
         else
-            try bufferSlice(out, 0, packed_output_bytes);
+            try bufferSlice(effective_out, 0, packed_output_bytes);
 
         switch (weight.*) {
             .dense_f32 => |w| {
@@ -4745,6 +4768,7 @@ pub const CudaBackend = struct {
                         &out_row,
                         @intCast(w.rows),
                         @intCast(w.cols),
+                        residual_ptr,
                     );
                     return;
                 }
@@ -4868,6 +4892,7 @@ pub const CudaBackend = struct {
                         w.group_size,
                         w.scales_dtype_tag,
                         1,
+                        residual_ptr,
                     );
                     return;
                 }
@@ -5013,6 +5038,7 @@ pub const CudaBackend = struct {
                         w.group_size,
                         w.scales_dtype_tag,
                         @intCast(rows),
+                        0,
                     );
                     return;
                 }
@@ -5035,6 +5061,7 @@ pub const CudaBackend = struct {
                         w.group_size,
                         w.scales_dtype_tag,
                         1,
+                        0,
                     );
                 }
             },
@@ -5056,6 +5083,7 @@ pub const CudaBackend = struct {
                         self.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch break :i8_decode;
                         self.kernel_arg_pack.appendScalar(u32, out_cols) catch break :i8_decode;
                         self.kernel_arg_pack.appendScalar(u32, 1) catch break :i8_decode;
+                        self.kernel_arg_pack.appendDevicePtr(residual_ptr) catch break :i8_decode;
                         compute.cuda.launch.launchWithFamily(&self.device, i8_fn, .{
                             .grid_x = (out_cols + 3) / 4,
                             .grid_y = 1,
@@ -5078,6 +5106,7 @@ pub const CudaBackend = struct {
                         w.group_size,
                         w.scales_dtype_tag,
                         1,
+                        residual_ptr,
                     );
                     return;
                 }
@@ -5229,6 +5258,7 @@ pub const CudaBackend = struct {
                         w.group_size,
                         w.scales_dtype_tag,
                         @intCast(rows),
+                        0,
                     );
                     return;
                 }
@@ -5251,6 +5281,7 @@ pub const CudaBackend = struct {
                         w.group_size,
                         w.scales_dtype_tag,
                         1,
+                        0,
                     );
                 }
                 return;
@@ -5667,6 +5698,7 @@ pub const CudaBackend = struct {
         kv_write_f16_function: ?compute.cuda.Function,
         rope_store_f16_function: ?compute.cuda.Function,
         attention_kernels: AttentionKernelSet,
+        residual_buf: ?compute.cuda.Buffer,
     ) !void {
         const layer_rope_theta = if (cfg.sliding_window > 0) local_rope_theta else global_rope_theta;
         const stage_rows = bufferF32RowCount(input, @intCast(d_model_u32)) catch |err| {
@@ -6042,6 +6074,9 @@ pub const CudaBackend = struct {
                 });
                 return err;
             };
+        }
+        if (residual_buf) |rb| {
+            self.pending_residual_add_buf = rb;
         }
         self.linearForwardRows(&attn_context_stage, stage_rows, o_proj, output) catch |err| {
             log.warn("inference", "CUDA attention output projection failed", .{
@@ -7180,6 +7215,7 @@ pub const CudaBackend = struct {
         down_bias: ?*const DeviceTensor,
         d_ff: u32,
         output: *compute.cuda.Buffer,
+        residual_buf: ?compute.cuda.Buffer,
     ) !void {
         const activation_count = std.math.mul(u32, @intCast(rows), d_ff) catch return error.InvalidArgument;
         const activation_bytes = std.math.mul(usize, @as(usize, activation_count), @sizeOf(f32)) catch return error.InvalidArgument;
@@ -7217,6 +7253,9 @@ pub const CudaBackend = struct {
             try self.runFfnActivationMul(activation_count);
         }
         var mul_in = try bufferSlice(&self.runtime_buffers.ffn_mul_dev, 0, activation_bytes);
+        if (residual_buf) |rb| {
+            self.pending_residual_add_buf = rb;
+        }
         try self.linearForwardRows(&mul_in, rows, down_weight, output);
         if (down_bias) |bias| {
             if (rows != 1) return error.UnsupportedModel;
@@ -7883,6 +7922,8 @@ pub const CudaBackend = struct {
         }
         const attention_binding = try requireAttentionRuntimeBinding(kv_state, ctx.layer_index);
         if (ctx.active_rows_u32 <= 1) {
+            const residual_buf: ?compute.cuda.Buffer =
+                if (self.loaded.config.residual_multiplier == 1.0) ctx.input_view else null;
             try self.runAttentionMixerStep(
                 cfg,
                 &attention_binding.k_cache,
@@ -7911,6 +7952,7 @@ pub const CudaBackend = struct {
                 ctx.kv_write_f16_function,
                 ctx.rope_store_f16_function,
                 ctx.attention_kernels,
+                residual_buf,
             );
             return;
         }
@@ -8117,6 +8159,11 @@ pub const CudaBackend = struct {
         if (up_weight.cols() != d_ff) return error.InvalidInstructionBinding;
         if (down_weight.rows() != d_ff) return error.InvalidInstructionBinding;
         const d_ff_u32: u32 = @intCast(d_ff);
+        const residual_buf: ?compute.cuda.Buffer =
+            if (ctx.active_rows_u32 <= 1 and self.loaded.config.residual_multiplier == 1.0)
+                ctx.input_view
+            else
+                null;
         try self.runFfnStep(
             input,
             @intCast(ctx.active_rows_u32),
@@ -8127,6 +8174,7 @@ pub const CudaBackend = struct {
             down_bias,
             d_ff_u32,
             output,
+            residual_buf,
         );
     }
 
@@ -8137,6 +8185,10 @@ pub const CudaBackend = struct {
         scale: layer_ops.ResidualScale,
         ctx: *LayerProgramExecutionContext,
     ) !void {
+        if (self.skip_next_residual_add) {
+            self.skip_next_residual_add = false;
+            return;
+        }
         const io = try instructionIoSlices(insn, registers);
         if (io.inputs.len < 2 or io.outputs.len == 0) return error.InvalidInstructionBinding;
         const residual_src = bufferFromTensorHandle(io.inputs[0]);

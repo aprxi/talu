@@ -200,7 +200,8 @@ extern "C" __global__ void talu_matvec_f16_f32(
     const unsigned short* weight,
     float* out,
     unsigned int in_dim,
-    unsigned int out_dim
+    unsigned int out_dim,
+    const float* residual
 ) {
     const unsigned int lane = threadIdx.x & (TALU_WARP_SIZE - 1u);
     const unsigned int warp_id = threadIdx.x / TALU_WARP_SIZE;
@@ -210,7 +211,7 @@ extern "C" __global__ void talu_matvec_f16_f32(
     const unsigned short* row = weight + (unsigned long long)out_idx * in_dim;
     float acc = talu_dot_f16_u16_vec8(input, row, in_dim, lane);
     acc = talu_warp_sum_f32(acc);
-    if (lane == 0) out[out_idx] = acc;
+    if (lane == 0) out[out_idx] = residual ? acc + residual[out_idx] : acc;
 }
 
 extern "C" __global__ void talu_matvec_bf16_f32(
@@ -218,7 +219,8 @@ extern "C" __global__ void talu_matvec_bf16_f32(
     const unsigned short* weight,
     float* out,
     unsigned int in_dim,
-    unsigned int out_dim
+    unsigned int out_dim,
+    const float* residual
 ) {
     const unsigned int lane = threadIdx.x & (TALU_WARP_SIZE - 1u);
     const unsigned int warp_id = threadIdx.x / TALU_WARP_SIZE;
@@ -228,7 +230,7 @@ extern "C" __global__ void talu_matvec_bf16_f32(
     const unsigned short* row = weight + (unsigned long long)out_idx * in_dim;
     float acc = talu_dot_bf16_u16_vec8(input, row, in_dim, lane);
     acc = talu_warp_sum_f32(acc);
-    if (lane == 0) out[out_idx] = acc;
+    if (lane == 0) out[out_idx] = residual ? acc + residual[out_idx] : acc;
 }
 
 extern "C" __global__ void talu_matvec_qkv_f16_f32(

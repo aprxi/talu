@@ -304,6 +304,7 @@ pub fn probeGaffineU4SequenceRowsSupport(backend: anytype) !bool {
         group_size,
         gaffine_scales_dtype_bf16,
         batch_rows,
+        0,
     );
     try out_dev.download(&backend.device, std.mem.sliceAsBytes(actual[0..]));
 
@@ -1606,6 +1607,7 @@ fn runMatvecU16Smoke(
         &out_bf16_dev,
         in_dim,
         out_dim,
+        0,
     );
     try compute.cuda.matvec_u16.runWithFunction(
         arg_pack,
@@ -1616,6 +1618,7 @@ fn runMatvecU16Smoke(
         &out_f16_dev,
         in_dim,
         out_dim,
+        0,
     );
     try out_bf16_dev.download(device, std.mem.sliceAsBytes(actual_bf16[0..]));
     try out_f16_dev.download(device, std.mem.sliceAsBytes(actual_f16[0..]));
@@ -1660,6 +1663,7 @@ fn runMatvecU16Smoke(
         &out_unaligned_dev,
         in_dim,
         out_dim,
+        0,
     );
     try out_unaligned_dev.download(device, std.mem.sliceAsBytes(actual_unaligned[0..]));
     for (expected, actual_unaligned) |want, got| {
@@ -2278,6 +2282,7 @@ fn runGaffineU4MatvecSmoke(
         group_size,
         gaffine_scales_dtype_bf16,
         1,
+        0,
     );
     try out_dev.download(device, std.mem.sliceAsBytes(actual[0..]));
 
