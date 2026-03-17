@@ -255,7 +255,7 @@ fn responses_rejects_too_small_max_output_tokens() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({
         "input": "hello",
-        "max_output_tokens": 15
+        "max_output_tokens": 0
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 400, "body: {}", resp.body);

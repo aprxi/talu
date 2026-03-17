@@ -44,6 +44,7 @@ fn build_app() -> Router {
             backend: None,
             current_model: None,
         })),
+        batch_scheduler: None,
         configured_model: None,
         response_store: Mutex::new(HashMap::new()),
         gateway_secret: None,

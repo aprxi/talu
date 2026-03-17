@@ -136,6 +136,7 @@ pub const protocol = @import("protocol/root.zig");
 pub const tool_schema = @import("tool_schema.zig");
 pub const commit = @import("commit.zig");
 pub const iterator = @import("iterator.zig");
+pub const batch = @import("batch.zig");
 const inference_mod = @import("../inference/root.zig");
 
 // Model specification exports (from spec.zig)
@@ -216,6 +217,12 @@ pub const ToolCallInput = commit.ToolCallInput;
 
 // Token iterator for pull-based streaming (no callbacks)
 pub const TokenIterator = iterator.TokenIterator;
+
+// Batch API (responses-aware continuous batching)
+pub const BatchWrapper = batch.BatchWrapper;
+pub const BatchEvent = batch.BatchEvent;
+pub const BatchResult = batch.BatchResult;
+pub const BatchEventType = batch.EventType;
 
 // =============================================================================
 // Model Classification

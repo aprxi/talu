@@ -326,6 +326,17 @@ comptime {
     _ = &capi.talu_scheduler_has_active;
     _ = &capi.talu_scheduler_active_count;
 
+    // Batch API (responses-aware continuous batching)
+    _ = &capi.talu_batch_create;
+    _ = &capi.talu_batch_destroy;
+    _ = &capi.talu_batch_submit;
+    _ = &capi.talu_batch_cancel;
+    _ = &capi.talu_batch_step;
+    _ = &capi.talu_batch_has_active;
+    _ = &capi.talu_batch_active_count;
+    _ = &capi.talu_batch_take_result;
+    _ = &capi.talu_batch_result_free;
+
     // X-Ray API (tensor inspection during inference)
     _ = &capi.talu_xray_capture_create;
     _ = &capi.talu_xray_capture_create_all;

@@ -605,7 +605,7 @@ fn install_request_schemas(schemas: &mut Map<String, Value>) {
                     ]
                 })),
                 "instructions": nullable(json!({ "type": "string" })),
-                "max_output_tokens": nullable(json!({ "type": "integer", "minimum": 16 })),
+                "max_output_tokens": nullable(json!({ "type": "integer", "minimum": 1 })),
                 "max_tool_calls": nullable(json!({ "type": "integer", "minimum": 1 })),
                 "metadata": nullable(json!({
                     "type": "object",

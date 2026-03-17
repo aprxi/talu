@@ -9,6 +9,7 @@ use talu::blobs::BlobsHandle;
 
 pub mod agent;
 pub mod auth_gateway;
+pub mod batch_scheduler;
 pub mod code;
 pub mod code_ws;
 pub mod collab;
@@ -282,8 +283,28 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         }
     }
 
+    // Create batch scheduler for local backends (enables concurrent GPU decode).
+    // Remote/provider backends do not support scheduling and will fail here —
+    // those use the direct generate path instead.
+    let batch_scheduler = backend_state
+        .backend
+        .as_ref()
+        .and_then(|b| {
+            match batch_scheduler::SchedulerState::new(b, None) {
+                Ok(s) => {
+                    log::info!(target: "server::init", "batch scheduler created for local backend");
+                    Some(Arc::new(s))
+                }
+                Err(e) => {
+                    log::debug!(target: "server::init", "batch scheduler not available: {e} (expected for remote/provider backends)");
+                    None
+                }
+            }
+        });
+
     let state = state::AppState {
         backend: Arc::new(tokio::sync::Mutex::new(backend_state)),
+        batch_scheduler,
         configured_model: model,
         response_store: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         gateway_secret,

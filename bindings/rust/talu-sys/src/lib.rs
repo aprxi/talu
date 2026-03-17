@@ -148,6 +148,26 @@ impl From<u8> for CItemType {
     }
 }
 
+/// Source: core/src/router/batch.zig
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EventType {
+    TextDelta = 0,
+    Completed = 1,
+    Err = 2,
+}
+
+impl From<u8> for EventType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => EventType::TextDelta,
+            1 => EventType::Completed,
+            2 => EventType::Err,
+            _ => EventType::Err,
+        }
+    }
+}
+
 /// Source: core/src/router/capi_bridge.zig
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1560,6 +1580,43 @@ impl Default for ChatCreateOptions {
     }
 }
 
+/// Source: core/src/capi/batch.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CBatchEvent {
+    pub request_id: u64,
+    pub event_type: u8,
+    pub item_type: u8,
+    pub content_type: u8,
+    pub is_final: u8,
+    pub _pad: [u8; 4],
+    pub text_ptr: *const u8,
+    pub text_len: usize,
+    pub token_id: u32,
+    pub _pad2: [u8; 4],
+    pub tokens_generated: usize,
+    pub timestamp_ns: i64,
+}
+
+impl Default for CBatchEvent {
+    fn default() -> Self {
+        Self {
+            request_id: 0,
+            event_type: 0,
+            item_type: 0,
+            content_type: 0,
+            is_final: 0,
+            _pad: [0; 4],
+            text_ptr: std::ptr::null(),
+            text_len: 0,
+            token_id: 0,
+            _pad2: [0; 4],
+            tokens_generated: 0,
+            timestamp_ns: 0,
+        }
+    }
+}
+
 /// Source: core/src/capi/db/ops.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1772,6 +1829,43 @@ impl Default for SamplingParams {
             min_p: 0.0,
             repetition_penalty: 0.0,
             seed: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/batch.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CBatchResult {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub prefill_ns: u64,
+    pub generation_ns: u64,
+    pub ttft_ns: u64,
+    pub finish_reason: u8,
+    pub _pad: [u8; 7],
+    pub text: *const c_char,
+    pub tool_calls: *const CToolCallRef,
+    pub tool_call_count: usize,
+    pub error_code: c_int,
+    pub _pad2: [u8; 4],
+}
+
+impl Default for CBatchResult {
+    fn default() -> Self {
+        Self {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            prefill_ns: 0,
+            generation_ns: 0,
+            ttft_ns: 0,
+            finish_reason: 0,
+            _pad: [0; 7],
+            text: std::ptr::null(),
+            tool_calls: std::ptr::null(),
+            tool_call_count: 0,
+            error_code: 0,
+            _pad2: [0; 4],
         }
     }
 }
@@ -3133,6 +3227,21 @@ impl Default for CRagConfig {
     }
 }
 
+/// Source: core/src/capi/batch.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CBatchConfig {
+    pub max_concurrent: usize,
+}
+
+impl Default for CBatchConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 0,
+        }
+    }
+}
+
 /// Source: core/src/capi/db/kv.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -4416,10 +4525,28 @@ extern "C" {
     pub fn talu_backend_model_info(backend: *mut c_void) -> CModelInfo;
     // core/src/capi/router.zig
     pub fn talu_backend_synchronize(backend: *mut c_void) -> c_int;
+    // core/src/capi/batch.zig
+    pub fn talu_batch_active_count(handle: *mut c_void) -> usize;
+    // core/src/capi/batch.zig
+    pub fn talu_batch_cancel(handle: *mut c_void, request_id: u64) -> u8;
+    // core/src/capi/batch.zig
+    pub fn talu_batch_create(backend: *mut c_void, config: *const CBatchConfig) -> *mut c_void;
+    // core/src/capi/batch.zig
+    pub fn talu_batch_destroy(handle: *mut c_void);
     // core/src/capi/tokenizer.zig
     pub fn talu_batch_encode_result_free(ids: *mut u32, offsets: *mut usize, total_tokens: usize, num_sequences: usize);
+    // core/src/capi/batch.zig
+    pub fn talu_batch_has_active(handle: *mut c_void) -> u8;
     // core/src/capi/dlpack.zig
     pub fn talu_batch_mask_to_dlpack(ids: *const u32, offsets: *const usize, num_sequences: usize, max_length: usize, padding_side: u8) -> *mut DLManagedTensor;
+    // core/src/capi/batch.zig
+    pub fn talu_batch_result_free(result: *mut CBatchResult);
+    // core/src/capi/batch.zig
+    pub fn talu_batch_step(handle: *mut c_void, events_out: *mut CBatchEvent, max_events: usize) -> usize;
+    // core/src/capi/batch.zig
+    pub fn talu_batch_submit(handle: *mut c_void, chat_handle: *mut c_void, config: *const CGenerateConfig) -> u64;
+    // core/src/capi/batch.zig
+    pub fn talu_batch_take_result(handle: *mut c_void, request_id: u64) -> *mut CBatchResult;
     // core/src/capi/dlpack.zig
     pub fn talu_batch_to_dlpack(ids: *const u32, offsets: *const usize, num_sequences: usize, pad_id: u32, max_length: usize, padding_side: u8) -> *mut DLManagedTensor;
     // core/src/capi/tokenizer.zig

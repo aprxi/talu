@@ -47,6 +47,7 @@
 //!
 //! Both implement [`responses::ResponsesView`] for read access to items.
 
+pub mod batch;
 pub mod blobs;
 pub mod collab;
 pub mod convert;
@@ -74,6 +75,7 @@ pub mod vector;
 mod wrappers;
 pub mod xray;
 
+pub use batch::{BatchConfig, BatchEvent, BatchHandle, BatchResult, EventType};
 pub use error::Error;
 pub use wrappers::{
     CanonicalSpec, ChatHandle, EncodeResult, FinishReason, GenerateResult, InferenceBackend,

@@ -856,13 +856,9 @@ async fn generate_response(
     let tools_json_for_generation = effective_tools.as_ref().map(|v| v.to_string());
     let tool_choice_for_generation = effective_tool_choice.as_ref().map(|v| v.to_string());
     let reasoning_effort_for_generation = reasoning.effort.clone();
+    let batch_scheduler_for_task = state.batch_scheduler.clone();
     let (output_items, prompt_tokens, completion_tokens, prefill_ns, generation_ns, result_ttft_ns, responses_json, model_info_json) =
         tokio::task::spawn_blocking(move || {
-            let mut backend = backend.blocking_lock();
-            let backend = backend
-                .backend
-                .as_mut()
-                .ok_or_else(|| anyhow!("no backend available"))?;
             // Create ChatHandle with system prompt if prompt_id was provided
             log::trace!(target: "server::gen", "ChatHandle::new(system_prompt={})", system_prompt_for_task.is_some());
             let chat = ChatHandle::new(system_prompt_for_task.as_deref())?;
@@ -961,49 +957,115 @@ async fn generate_response(
             if let Some(mrt) = request_max_reasoning_tokens {
                 cfg.max_reasoning_tokens = Some(mrt as usize);
             }
-            cfg.stop_flag = Some(stop_flag_for_gen);
+            cfg.stop_flag = Some(stop_flag_for_gen.clone());
 
             log::debug!(target: "server::gen", "generating: model={} max_tokens={} temp={} top_p={} seed={}",
                 model_id_for_task, cfg.max_tokens, cfg.temperature, cfg.top_p, cfg.seed);
             log::trace!(target: "server::gen", "generate(items={}, cfg={{max_tokens={}, temp={}, top_p={}}})",
                 pre_gen_count, cfg.max_tokens, cfg.temperature, cfg.top_p);
-            let result = talu::router::generate(&chat, &[], backend, &cfg)
-                .map_err(|e| anyhow!("generation failed: {}", e))?;
 
-            let prompt_tokens = result.prompt_tokens();
-            let completion_tokens = result.completion_tokens();
-            let prefill_ns = result.prefill_ns();
-            let generation_ns = result.generation_ns();
-            let ttft_ns = result.ttft_ns();
-            log::debug!(target: "server::gen", "completed: prompt_tokens={} completion_tokens={}",
-                prompt_tokens, completion_tokens);
+            if let Some(ref sched) = batch_scheduler_for_task {
+                // --- Batch scheduler path (concurrent GPU decode) ---
+                let (request_id, event_rx) = sched
+                    .submit(&chat, cfg, stop_flag_for_gen)
+                    .map_err(|e| anyhow!("batch submit failed: {}", e))?;
 
-            // Serialize ALL items (response direction), then slice to output only.
-            let all_json = chat
-                .to_responses_json(1)
-                .map_err(|e| anyhow!("failed to serialize output: {}", e))?;
-            let all_items: serde_json::Value =
-                serde_json::from_str(&all_json).unwrap_or_else(|_| json!([]));
-            let output_items = if let Some(arr) = all_items.as_array() {
-                serde_json::Value::Array(arr[pre_gen_count..].to_vec())
+                // Drain events until final.
+                loop {
+                    match event_rx.recv() {
+                        Ok(event) => {
+                            if event.is_final {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let batch_result = sched.take_result(request_id);
+                let (prompt_tokens, completion_tokens, prefill_ns, generation_ns, ttft_ns) =
+                    if let Some(ref r) = batch_result {
+                        (r.prompt_tokens, r.completion_tokens, r.prefill_ns, r.generation_ns, r.ttft_ns)
+                    } else {
+                        (0, 0, 0, 0, 0)
+                    };
+
+                log::debug!(target: "server::gen", "completed (batch): prompt_tokens={} completion_tokens={}",
+                    prompt_tokens, completion_tokens);
+
+                // Reconstruct conversation for chaining: append generated output
+                // to the ChatHandle.
+                if let Some(ref r) = batch_result {
+                    if let Some(ref text) = r.text {
+                        if !text.is_empty() {
+                            let output_json = build_batch_output_json(text, &r.tool_calls);
+                            let _ = chat.load_responses_json(&output_json);
+                        }
+                    }
+                }
+
+                let all_json = chat
+                    .to_responses_json(1)
+                    .map_err(|e| anyhow!("failed to serialize output: {}", e))?;
+                let all_items: serde_json::Value =
+                    serde_json::from_str(&all_json).unwrap_or_else(|_| json!([]));
+                let output_items = if let Some(arr) = all_items.as_array() {
+                    serde_json::Value::Array(arr[pre_gen_count..].to_vec())
+                } else {
+                    json!([])
+                };
+
+                let model_info_json = {
+                    let guard = backend.blocking_lock();
+                    if let Some(ref b) = guard.backend {
+                        build_model_info_json(b)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                };
+
+                Ok::<_, anyhow::Error>((
+                    output_items, prompt_tokens, completion_tokens,
+                    prefill_ns, generation_ns, ttft_ns, all_json, model_info_json,
+                ))
             } else {
-                json!([])
-            };
+                // --- Remote provider path (direct generate with backend mutex) ---
+                let mut backend = backend.blocking_lock();
+                let backend = backend
+                    .backend
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("no backend available"))?;
 
-            // Store full conversation for chaining.
-            let responses_json = all_json;
-            let model_info_json = build_model_info_json(backend);
+                let result = talu::router::generate(&chat, &[], backend, &cfg)
+                    .map_err(|e| anyhow!("generation failed: {}", e))?;
 
-            Ok::<_, anyhow::Error>((
-                output_items,
-                prompt_tokens,
-                completion_tokens,
-                prefill_ns,
-                generation_ns,
-                ttft_ns,
-                responses_json,
-                model_info_json,
-            ))
+                let prompt_tokens = result.prompt_tokens();
+                let completion_tokens = result.completion_tokens();
+                let prefill_ns = result.prefill_ns();
+                let generation_ns = result.generation_ns();
+                let ttft_ns = result.ttft_ns();
+                log::debug!(target: "server::gen", "completed: prompt_tokens={} completion_tokens={}",
+                    prompt_tokens, completion_tokens);
+
+                let all_json = chat
+                    .to_responses_json(1)
+                    .map_err(|e| anyhow!("failed to serialize output: {}", e))?;
+                let all_items: serde_json::Value =
+                    serde_json::from_str(&all_json).unwrap_or_else(|_| json!([]));
+                let output_items = if let Some(arr) = all_items.as_array() {
+                    serde_json::Value::Array(arr[pre_gen_count..].to_vec())
+                } else {
+                    json!([])
+                };
+
+                let responses_json = all_json;
+                let model_info_json = build_model_info_json(backend);
+
+                Ok::<_, anyhow::Error>((
+                    output_items, prompt_tokens, completion_tokens,
+                    prefill_ns, generation_ns, ttft_ns, responses_json, model_info_json,
+                ))
+            }
         })
         .await
         .context("Generation task failed")??;
@@ -1632,39 +1694,76 @@ async fn stream_response(
         }));
         let ctx_for_complete = ctx.clone();
 
-        let gen_result = run_streaming_generation(
-            backend,
-            input_json,
-            input_string,
-            store_tools.clone(),
-            store_tool_choice.clone(),
-            text_format_for_events.clone(),
-            prev_json,
-            bucket_path,
-            session_id,
-            model_id.clone(),
-            max_output_tokens,
-            request_max_completion_tokens,
-            request_max_reasoning_tokens,
-            temperature,
-            top_p,
-            top_k,
-            seed,
-            presence_penalty,
-            frequency_penalty,
-            effective_system_prompt,
-            prompt_id,
-            project_id_for_stream,
-            file_storage_path,
-            ctx,
-            stop_flag_for_gen,
-            reasoning_for_events.effort.clone(),
-            events_tenant_id.clone(),
-            Some(events_request_id.clone()),
-            Some(events_response_id.clone()),
-            Some(events_session_id.clone()),
-            effective_config,
-        );
+        let gen_result = if let Some(ref sched) = state_for_store.batch_scheduler {
+            run_batch_streaming_generation(
+                sched,
+                backend,
+                input_json,
+                input_string,
+                store_tools.clone(),
+                store_tool_choice.clone(),
+                text_format_for_events.clone(),
+                prev_json,
+                bucket_path,
+                session_id,
+                model_id.clone(),
+                max_output_tokens,
+                request_max_completion_tokens,
+                request_max_reasoning_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                presence_penalty,
+                frequency_penalty,
+                effective_system_prompt,
+                prompt_id,
+                project_id_for_stream,
+                file_storage_path,
+                ctx,
+                stop_flag_for_gen,
+                reasoning_for_events.effort.clone(),
+                events_tenant_id.clone(),
+                Some(events_request_id.clone()),
+                Some(events_response_id.clone()),
+                Some(events_session_id.clone()),
+                effective_config,
+            )
+        } else {
+            run_streaming_generation(
+                backend,
+                input_json,
+                input_string,
+                store_tools.clone(),
+                store_tool_choice.clone(),
+                text_format_for_events.clone(),
+                prev_json,
+                bucket_path,
+                session_id,
+                model_id.clone(),
+                max_output_tokens,
+                request_max_completion_tokens,
+                request_max_reasoning_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                presence_penalty,
+                frequency_penalty,
+                effective_system_prompt,
+                prompt_id,
+                project_id_for_stream,
+                file_storage_path,
+                ctx,
+                stop_flag_for_gen,
+                reasoning_for_events.effort.clone(),
+                events_tenant_id.clone(),
+                Some(events_request_id.clone()),
+                Some(events_response_id.clone()),
+                Some(events_session_id.clone()),
+                effective_config,
+            )
+        };
 
         // Store conversation for chaining after streaming completes.
         if let Ok(ref r) = gen_result {
@@ -1713,6 +1812,10 @@ async fn stream_response(
         .unwrap()
 }
 
+/// Run streaming generation via the direct `talu::router::generate_stream` path.
+///
+/// Used for remote/provider backends that do not support the batch scheduler.
+/// Local backends use [`run_batch_streaming_generation`] instead.
 fn run_streaming_generation(
     backend: Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,
     input_json: Option<String>,
@@ -1919,6 +2022,280 @@ fn run_streaming_generation(
         responses_json: all_json,
         model_info_json,
     })
+}
+
+/// Run streaming generation via the batch scheduler (concurrent GPU decode).
+///
+/// Used for local backends. Same contract as [`run_streaming_generation`]
+/// (used for remote/provider backends) but routes through the batch scheduler
+/// instead of acquiring the backend mutex. The ChatHandle is borrowed (not
+/// consumed) so it remains available for post-generation serialization.
+fn run_batch_streaming_generation(
+    scheduler: &crate::server::batch_scheduler::SchedulerState,
+    backend: Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,
+    input_json: Option<String>,
+    input_string: Option<String>,
+    tools_json: Option<serde_json::Value>,
+    tool_choice_json: Option<serde_json::Value>,
+    _text_format: Option<TextFormatConfig>,
+    prev_json: Option<String>,
+    bucket_path: Option<std::path::PathBuf>,
+    session_id: String,
+    model_id: String,
+    max_output_tokens: Option<i64>,
+    max_completion_tokens: Option<i64>,
+    max_reasoning_tokens: Option<i64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<u32>,
+    seed: Option<u64>,
+    presence_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    system_prompt: Option<String>,
+    prompt_id: Option<String>,
+    project_id: Option<String>,
+    file_storage_path: Option<std::path::PathBuf>,
+    ctx: Arc<std::sync::Mutex<StreamCtx>>,
+    stop_flag: Arc<AtomicBool>,
+    reasoning_effort: Option<String>,
+    _event_tenant_id: Option<String>,
+    _event_request_id: Option<String>,
+    _event_response_id: Option<String>,
+    _event_session_id: Option<String>,
+    effective_config: Option<talu::model::EffectiveGenConfig>,
+) -> Result<StreamGenResult> {
+    // --- Conversation setup (same as run_streaming_generation) ---
+    let chat = ChatHandle::new(system_prompt.as_deref())?;
+
+    if let Some(ref bp) = bucket_path {
+        if let Some(bp_str) = bp.to_str() {
+            chat.set_storage_db(bp_str, &session_id)
+                .map_err(|e| anyhow!("failed to set storage: {}", e))?;
+        }
+    }
+
+    if let Some(ref prev) = prev_json {
+        chat.load_responses_json(prev)
+            .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
+    }
+
+    if let Some(ref json) = input_json {
+        let resolved = match file_storage_path.as_deref() {
+            Some(sp) => resolve_file_references(json, sp)?,
+            None => json.clone(),
+        };
+        chat.load_responses_json(&resolved)
+            .map_err(|e| anyhow!("failed to load input: {}", e))?;
+    } else if let Some(ref text) = input_string {
+        chat.append_user_message(text)
+            .map_err(|e| anyhow!("failed to append user message: {}", e))?;
+    }
+
+    let pre_gen_count = chat.item_count();
+
+    if bucket_path.is_some() && pre_gen_count <= 2 {
+        let t = input_string.as_deref().unwrap_or("Untitled");
+        let title: String = t.chars().take(47).collect();
+        let _ = chat.notify_session_update_ex(
+            Some(&model_id),
+            Some(&title),
+            Some("active"),
+            prompt_id.as_deref(),
+            project_id.as_deref(),
+        );
+    }
+
+    // --- Build GenerateConfig ---
+    let mut cfg = talu::router::GenerateConfig::default();
+    if let Some(ref eff) = effective_config {
+        cfg.max_tokens = eff.max_tokens;
+        cfg.temperature = eff.temperature;
+        cfg.top_k = eff.top_k;
+        cfg.top_p = eff.top_p;
+        cfg.presence_penalty = eff.presence_penalty;
+        cfg.frequency_penalty = eff.frequency_penalty;
+        cfg.seed = eff.seed;
+    } else {
+        if let Some(max_tokens) = max_output_tokens {
+            cfg.max_tokens = max_tokens as usize;
+        }
+        if let Some(temp) = temperature {
+            cfg.temperature = temp as f32;
+        }
+        if let Some(top_p) = top_p {
+            cfg.top_p = top_p as f32;
+        }
+        if let Some(top_k) = top_k {
+            cfg.top_k = top_k as usize;
+        }
+        if let Some(seed) = seed {
+            cfg.seed = seed;
+        }
+        if let Some(pp) = presence_penalty {
+            cfg.presence_penalty = pp as f32;
+        }
+        if let Some(fp) = frequency_penalty {
+            cfg.frequency_penalty = fp as f32;
+        }
+    }
+    cfg.tools_json = tools_json.map(|v| v.to_string());
+    cfg.tool_choice = tool_choice_json.map(|v| v.to_string());
+    cfg.reasoning_effort = reasoning_effort;
+    if let Some(mct) = max_completion_tokens {
+        cfg.max_completion_tokens = Some(mct as usize);
+    }
+    if let Some(mrt) = max_reasoning_tokens {
+        cfg.max_reasoning_tokens = Some(mrt as usize);
+    }
+    cfg.stop_flag = Some(stop_flag.clone());
+
+    // --- Submit to batch scheduler ---
+    let (request_id, event_rx) = scheduler
+        .submit(&chat, cfg, stop_flag.clone())
+        .map_err(|e| anyhow!("batch submit failed: {}", e))?;
+
+    // --- Consume events, feed to StreamCtx ---
+    loop {
+        if stop_flag.load(Ordering::Acquire) {
+            scheduler.cancel(request_id);
+            break;
+        }
+        match event_rx.recv() {
+            Ok(event) => {
+                let is_final = event.is_final;
+
+                // Map BatchEvent to StreamToken for StreamCtx.
+                if !event.text.is_empty() {
+                    let item_type = talu_sys::ItemType::from(event.item_type);
+                    let content_type = talu_sys::ContentType::from(event.content_type);
+                    let token = talu::router::StreamToken {
+                        text: &event.text,
+                        item_type,
+                        content_type,
+                        tokens_generated: event.tokens_generated,
+                        elapsed_ns: event.timestamp_ns as u64,
+                    };
+                    if let Ok(mut guard) = ctx.lock() {
+                        let _ = guard.send_delta(&token);
+                    }
+                }
+
+                if is_final {
+                    break;
+                }
+            }
+            Err(_) => break, // Channel closed
+        }
+    }
+
+    // --- Build result from BatchResult ---
+    let batch_result = scheduler.take_result(request_id);
+
+    let (prompt_tokens, completion_tokens, prefill_ns, generation_ns, ttft_ns, finish_reason) =
+        if let Some(ref r) = batch_result {
+            (
+                r.prompt_tokens,
+                r.completion_tokens,
+                r.prefill_ns,
+                r.generation_ns,
+                r.ttft_ns,
+                match r.finish_reason {
+                    0 => FinishReason::EosToken,
+                    1 => FinishReason::Length,
+                    2 => FinishReason::StopSequence,
+                    3 => FinishReason::ToolCalls,
+                    4 => FinishReason::ContentFilter,
+                    5 => FinishReason::Cancelled,
+                    _ => FinishReason::EosToken,
+                },
+            )
+        } else {
+            (0, 0, 0, 0, 0, FinishReason::EosToken)
+        };
+
+    // Serialize output items from the ChatHandle. The batch API adds generated
+    // items to the conversation internally, so to_responses_json returns the
+    // complete state. However, since the batch API only borrows the ChatHandle
+    // for tokenization (it doesn't modify the conversation), we reconstruct
+    // output items from the StreamCtx accumulated state instead.
+    let output_items = if let Ok(guard) = ctx.lock() {
+        if !guard.output_items.is_empty() {
+            serde_json::Value::Array(guard.output_items.clone())
+        } else {
+            json!([])
+        }
+    } else {
+        json!([])
+    };
+
+    // For conversation chaining, reconstruct responses_json. The pre-gen items
+    // come from the ChatHandle; the generated output comes from the batch result.
+    // We append the generated text as an assistant message to the conversation
+    // so that load_responses_json in chained requests restores the full state.
+    if let Some(ref r) = batch_result {
+        if let Some(ref text) = r.text {
+            if !text.is_empty() {
+                // Build output items JSON and load them into the chat.
+                let output_json = build_batch_output_json(text, &r.tool_calls);
+                let _ = chat.load_responses_json(&output_json);
+            }
+        }
+    }
+
+    let all_json = chat
+        .to_responses_json(1)
+        .map_err(|e| anyhow!("failed to serialize output: {}", e))?;
+
+    // Get model info from the backend (quick metadata read, no generation lock).
+    let model_info_json = {
+        let guard = backend.blocking_lock();
+        if let Some(ref b) = guard.backend {
+            build_model_info_json(b)
+        } else {
+            serde_json::Value::Null
+        }
+    };
+
+    Ok(StreamGenResult {
+        output_items,
+        usage: UsageStats {
+            input_tokens: prompt_tokens,
+            output_tokens: completion_tokens,
+            prefill_ns,
+            generation_ns,
+            ttft_ns,
+        },
+        finish_reason,
+        responses_json: all_json,
+        model_info_json,
+    })
+}
+
+/// Build Open Responses JSON for batch-generated output items.
+///
+/// Constructs the JSON array that can be loaded into a ChatHandle via
+/// `load_responses_json` for conversation chaining.
+fn build_batch_output_json(text: &str, tool_calls: &[talu::ToolCall]) -> String {
+    let mut items = Vec::new();
+
+    if !text.is_empty() {
+        items.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]
+        }));
+    }
+
+    for tc in tool_calls {
+        items.push(json!({
+            "type": "function_call",
+            "call_id": tc.id,
+            "name": tc.name,
+            "arguments": tc.arguments
+        }));
+    }
+
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Generate a short descriptive title for a conversation using the model.
@@ -3920,8 +4297,11 @@ mod tests {
             tool_choice: None,
             tools: None,
             top_logprobs: None,
+            top_k: None,
             top_p: None,
             truncation: None,
+            max_completion_tokens: None,
+            max_reasoning_tokens: None,
         }
     }
 
@@ -4079,8 +4459,9 @@ mod tests {
 
     #[test]
     fn validate_max_output_tokens_rejects_values_below_minimum() {
-        assert!(validate_max_output_tokens(Some(15)).is_err());
-        assert!(validate_max_output_tokens(Some(16)).is_ok());
+        assert!(validate_max_output_tokens(Some(0)).is_err());
+        assert!(validate_max_output_tokens(Some(-1)).is_err());
+        assert!(validate_max_output_tokens(Some(1)).is_ok());
     }
 
     #[test]

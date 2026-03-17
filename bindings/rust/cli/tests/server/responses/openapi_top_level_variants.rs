@@ -361,7 +361,7 @@ fn top_level_cases() -> Vec<Case> {
         },
         Case {
             name: "max_output_tokens_below_min",
-            extra: serde_json::json!({ "max_output_tokens": 15 }),
+            extra: serde_json::json!({ "max_output_tokens": 0 }),
             schema_valid: false,
             expect: Expectation::MustBe400,
             tags: &["invalid:max_output_tokens:min"],

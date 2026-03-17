@@ -58,6 +58,7 @@ pub const treesitter = @import("code.zig");
 
 pub const router = @import("router.zig");
 pub const scheduler = @import("scheduler.zig");
+pub const batch = @import("batch.zig");
 pub const agent = @import("agent/root.zig");
 pub const train = @import("train.zig");
 pub const train_full = @import("train_full.zig");
@@ -538,6 +539,21 @@ pub const TaluScheduler = scheduler.TaluScheduler;
 pub const CSchedulerConfig = scheduler.CSchedulerConfig;
 pub const CSchedulerSubmitOptions = scheduler.CSubmitOptions;
 pub const CSchedulerTokenEvent = scheduler.CTokenEvent;
+
+// Re-export Batch C API functions (responses-aware continuous batching).
+pub const talu_batch_create = batch.talu_batch_create;
+pub const talu_batch_destroy = batch.talu_batch_destroy;
+pub const talu_batch_submit = batch.talu_batch_submit;
+pub const talu_batch_cancel = batch.talu_batch_cancel;
+pub const talu_batch_step = batch.talu_batch_step;
+pub const talu_batch_has_active = batch.talu_batch_has_active;
+pub const talu_batch_active_count = batch.talu_batch_active_count;
+pub const talu_batch_take_result = batch.talu_batch_take_result;
+pub const talu_batch_result_free = batch.talu_batch_result_free;
+pub const TaluBatch = batch.TaluBatch;
+pub const CBatchConfig = batch.CBatchConfig;
+pub const CBatchEvent = batch.CBatchEvent;
+pub const CBatchResult = batch.CBatchResult;
 
 // Re-export X-Ray C API functions (tensor inspection during inference).
 pub const talu_xray_capture_create = xray.talu_xray_capture_create;

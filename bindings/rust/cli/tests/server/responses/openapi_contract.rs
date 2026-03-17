@@ -223,14 +223,14 @@ fn contract_cases() -> Vec<Case> {
         Case {
             name: "max_output_tokens_valid_min",
             field: "max_output_tokens",
-            extra: serde_json::json!({ "max_output_tokens": 16 }),
+            extra: serde_json::json!({ "max_output_tokens": 1 }),
             expect: Expectation::NotStatus(400),
         },
         Case {
             name: "max_output_tokens_invalid_below_min",
             field: "max_output_tokens",
-            extra: serde_json::json!({ "max_output_tokens": 15 }),
-            expect: Expectation::StatusContains(400, "at least 16"),
+            extra: serde_json::json!({ "max_output_tokens": 0 }),
+            expect: Expectation::StatusContains(400, "at least 1"),
         },
         // max_tool_calls
         Case {

@@ -9,6 +9,7 @@ fn build_app_zero_ttl() -> (Router, Arc<AppState>) {
             backend: None,
             current_model: None,
         })),
+        batch_scheduler: None,
         configured_model: None,
         response_store: Mutex::new(HashMap::new()),
         gateway_secret: None,
