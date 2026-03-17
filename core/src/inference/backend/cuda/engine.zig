@@ -1980,6 +1980,12 @@ const BlockRuntime = struct {
                         .{
                             .size_floor = d_model,
                             .state_descriptor_entry = entry,
+                            .gated_delta_config_override = .{
+                                .d_conv = @intCast(gated_delta.config.d_conv),
+                                .n_heads = @intCast(gated_delta.config.n_heads),
+                                .d_head = @intCast(gated_delta.config.d_head),
+                                .d_inner = @intCast(@as(usize, gated_delta.config.n_heads) * @as(usize, gated_delta.config.d_head)),
+                            },
                         },
                     );
                     try validateCompiledLayerPlanForCuda(&blocks[layer_idx].compiled_plan.?, layer_idx, .gated_delta);
@@ -2098,6 +2104,7 @@ const BlockRuntime = struct {
                         .d_conv = gated_delta.config.d_conv,
                         .n_heads = gated_delta.config.n_heads,
                         .d_head = gated_delta.config.d_head,
+                        .n_key_heads = gated_delta.config.n_key_heads,
                     };
                     const conv_values = try materializeTensorF32(allocator, gated_delta.weights.conv1d_weight);
                     defer allocator.free(conv_values);
@@ -2178,6 +2185,7 @@ const BlockRuntime = struct {
                             .d_conv = gated_delta.config.d_conv,
                             .n_heads = gated_delta.config.n_heads,
                             .d_head = gated_delta.config.d_head,
+                            .n_key_heads = gated_delta.config.n_key_heads,
                         },
                     );
                     errdefer gated_delta_state.deinit();
@@ -2203,6 +2211,7 @@ const BlockRuntime = struct {
                             .d_conv = gated_delta.config.d_conv,
                             .n_heads = gated_delta.config.n_heads,
                             .d_head = gated_delta.config.d_head,
+                            .n_key_heads = gated_delta.config.n_key_heads,
                         },
                     );
                     errdefer gated_delta_scratch.deinit();

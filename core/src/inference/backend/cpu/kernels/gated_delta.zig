@@ -463,7 +463,25 @@ test "normWeightForHead rejects invalid norm shape" {
     );
 }
 
-test "GatedDeltaScratch.init accounts for asymmetric key/value heads" {
+test "GatedDeltaState.init symmetric heads defaults n_key_heads to n_heads" {
+    const cfg = GatedDeltaConfig{
+        .d_model = 1024,
+        .d_conv = 4,
+        .n_heads = 16,
+        .d_head = 128,
+        // n_key_heads defaults to 0, should fall back to n_heads=16
+    };
+    var state = try GatedDeltaState.init(std.testing.allocator, 1, cfg);
+    defer state.deinit();
+    // n_qk_heads = 16, d_inner = 16*128 = 2048
+    // qkv_len = 2*16*128 + 2048 = 6144
+    // conv_state = 1 * 6144 * 4 = 24576
+    // ssm_state = 1 * 2048 * 128 = 262144
+    try std.testing.expectEqual(@as(usize, 24576), state.conv_state.len);
+    try std.testing.expectEqual(@as(usize, 262144), state.ssm_state.len);
+}
+
+test "GatedDeltaState.init asymmetric heads uses n_key_heads for conv sizing" {
     const cfg = GatedDeltaConfig{
         .d_model = 1024,
         .d_conv = 4,
@@ -471,7 +489,41 @@ test "GatedDeltaScratch.init accounts for asymmetric key/value heads" {
         .n_key_heads = 8,
         .d_head = 128,
     };
-    var scratch = try GatedDeltaScratch.init(std.testing.allocator, cfg);
-    defer scratch.deinit();
-    try std.testing.expect(scratch.buffer.len >= 0);
+    var state = try GatedDeltaState.init(std.testing.allocator, 1, cfg);
+    defer state.deinit();
+    // n_qk_heads = 8, d_inner = 16*128 = 2048
+    // qkv_len = 2*8*128 + 2048 = 4096
+    // conv_state = 1 * 4096 * 4 = 16384  (smaller than symmetric)
+    // ssm_state = 1 * 2048 * 128 = 262144  (unchanged, uses n_heads)
+    try std.testing.expectEqual(@as(usize, 16384), state.conv_state.len);
+    try std.testing.expectEqual(@as(usize, 262144), state.ssm_state.len);
+}
+
+test "GatedDeltaScratch.init asymmetric heads sizes buffer for actual projection split" {
+    const asym_cfg = GatedDeltaConfig{
+        .d_model = 1024,
+        .d_conv = 4,
+        .n_heads = 16,
+        .n_key_heads = 8,
+        .d_head = 128,
+    };
+    var asym_scratch = try GatedDeltaScratch.init(std.testing.allocator, asym_cfg);
+    defer asym_scratch.deinit();
+
+    const sym_cfg = GatedDeltaConfig{
+        .d_model = 1024,
+        .d_conv = 4,
+        .n_heads = 16,
+        .d_head = 128,
+        // n_key_heads=0 defaults to n_heads=16
+    };
+    var sym_scratch = try GatedDeltaScratch.init(std.testing.allocator, sym_cfg);
+    defer sym_scratch.deinit();
+
+    // Asymmetric: qkv_len=4096, proj_len=4096+2048+32=6176, total=6176+2048+2048=10272
+    // Symmetric:  qkv_len=6144, proj_len=6144+2048+32=8224, total=8224+2048+2048=12320
+    try std.testing.expectEqual(@as(usize, 10272), asym_scratch.buffer.len);
+    try std.testing.expectEqual(@as(usize, 12320), sym_scratch.buffer.len);
+    // Asymmetric must be smaller due to fewer key/query heads in projection
+    try std.testing.expect(asym_scratch.buffer.len < sym_scratch.buffer.len);
 }
