@@ -52,6 +52,7 @@ impl Drop for CancelOnDrop {
 struct GenerationRequest {
     model: Option<String>,
     max_output_tokens: Option<i64>,
+    max_completion_tokens: Option<i64>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     top_k: Option<u32>,
@@ -251,6 +252,7 @@ async fn handle_generate(
     let request = GenerationRequest {
         model: parsed.model.clone(),
         max_output_tokens: parsed.max_output_tokens,
+        max_completion_tokens: parsed.max_completion_tokens,
         temperature: parsed.temperature,
         top_p: parsed.top_p,
         top_k: parsed.top_k,
@@ -621,6 +623,7 @@ async fn generate_response(
     auth_ctx: Option<&AuthContext>,
 ) -> Result<serde_json::Value, ResponseError> {
     let request_max_output_tokens = request.max_output_tokens;
+    let request_max_completion_tokens = request.max_completion_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
     let top_k = request.top_k;
@@ -949,6 +952,9 @@ async fn generate_response(
             cfg.tools_json = tools_json_for_generation;
             cfg.tool_choice = tool_choice_for_generation;
             cfg.reasoning_effort = reasoning_effort_for_generation;
+            if let Some(mct) = request_max_completion_tokens {
+                cfg.max_completion_tokens = Some(mct as usize);
+            }
             cfg.stop_flag = Some(stop_flag_for_gen);
 
             log::debug!(target: "server::gen", "generating: model={} max_tokens={} temp={} top_p={} seed={}",
@@ -1106,6 +1112,7 @@ async fn stream_response(
     let created_at = now_unix_seconds();
 
     let request_max_output_tokens = request.max_output_tokens;
+    let request_max_completion_tokens = request.max_completion_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
     let top_k = request.top_k;
@@ -1630,6 +1637,7 @@ async fn stream_response(
             session_id,
             model_id.clone(),
             max_output_tokens,
+            request_max_completion_tokens,
             temperature,
             top_p,
             top_k,
@@ -1709,6 +1717,7 @@ fn run_streaming_generation(
     session_id: String,
     model_id: String,
     max_output_tokens: Option<i64>,
+    max_completion_tokens: Option<i64>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     top_k: Option<u32>,
@@ -1808,6 +1817,9 @@ fn run_streaming_generation(
     cfg.tools_json = tools_json.map(|v| v.to_string());
     cfg.tool_choice = tool_choice_json.map(|v| v.to_string());
     cfg.reasoning_effort = reasoning_effort;
+    if let Some(mct) = max_completion_tokens {
+        cfg.max_completion_tokens = Some(mct as usize);
+    }
 
     // Pass the stop flag for cooperative cancellation.
     // Clone before moving into cfg so the callback can also check it.

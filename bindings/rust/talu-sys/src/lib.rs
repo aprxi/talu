@@ -2882,6 +2882,7 @@ impl Default for GenerationConfigInfo {
 #[derive(Copy, Clone)]
 pub struct CGenerateConfig {
     pub max_tokens: usize,
+    pub max_completion_tokens: usize,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
@@ -2912,6 +2913,7 @@ impl Default for CGenerateConfig {
     fn default() -> Self {
         Self {
             max_tokens: 0,
+            max_completion_tokens: 0,
             temperature: -1.0,
             top_k: 0,
             top_p: -1.0,

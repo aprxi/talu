@@ -611,6 +611,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             /// Token IDs to inject when thinking budget is exceeded (e.g. </think>\n\n).
             /// Only used when max_thinking_tokens > 0.
             thinking_end_tokens: []const u32 = &.{},
+            /// Maximum tokens for the answer/completion (0 = unlimited).
+            /// Only tokens after thinking ends are counted. Injected end-thinking
+            /// tokens (</think>\n\n) are excluded from the count.
+            max_completion_tokens: usize = 0,
         };
 
         /// Cancel a request.
@@ -1334,6 +1338,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             var in_thinking: bool = thinking_budget > 0 and thinking_end.len > 0;
             var inject_pos: usize = 0; // position within thinking_end_tokens being injected
 
+            // Completion token tracking: counts answer tokens after thinking ends.
+            // Transitions one iteration after in_thinking becomes false so that
+            // injected end-thinking tokens (</think>\n\n) are excluded.
+            const max_completion_tokens = submit_config.max_completion_tokens;
+            var completion_tokens: usize = 0;
+            var generating_answer: bool = !in_thinking;
+
             var decode_timer = std.time.Timer.start() catch unreachable;
             while (generated.items.len < max_tokens) {
                 if (generationShouldStop(submit_config.stop_flag)) {
@@ -1386,6 +1397,21 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     }
                 }
                 try generated.append(self.allocator, current_token);
+
+                // Completion token limit enforcement.
+                if (generating_answer) {
+                    completion_tokens += 1;
+                    if (max_completion_tokens > 0 and completion_tokens >= max_completion_tokens) {
+                        finish_reason = .length;
+                        if (submit_config.callback) |cb| {
+                            cb(0, current_token, true, submit_config.callback_data);
+                        }
+                        break;
+                    }
+                }
+                if (!in_thinking and !generating_answer) {
+                    generating_answer = true;
+                }
 
                 finish_reason = .in_progress;
                 for (eos_token_ids) |eos_id| {

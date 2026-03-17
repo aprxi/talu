@@ -44,8 +44,10 @@ pub enum ContentPart {
 /// Configuration for text generation.
 #[derive(Default)]
 pub struct GenerateConfig {
-    /// Maximum number of tokens to generate.
+    /// Maximum number of tokens to generate (total: thinking + answer).
     pub max_tokens: usize,
+    /// Maximum tokens for the answer/completion only (excludes thinking).
+    pub max_completion_tokens: Option<usize>,
     /// Sampling temperature (0.0 = deterministic).
     pub temperature: f32,
     /// Top-k sampling parameter.
@@ -330,6 +332,9 @@ impl ConfigHolder {
 
         let mut c_config = talu_sys::CGenerateConfig::default();
         c_config.max_tokens = cfg.max_tokens;
+        if let Some(mct) = cfg.max_completion_tokens {
+            c_config.max_completion_tokens = mct;
+        }
         c_config.temperature = cfg.temperature;
         c_config.top_k = cfg.top_k;
         c_config.top_p = cfg.top_p;

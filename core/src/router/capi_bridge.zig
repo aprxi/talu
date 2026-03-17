@@ -74,6 +74,8 @@ pub const CLogitBiasEntry = extern struct {
 /// Generation configuration from C API.
 pub const CGenerateConfig = extern struct {
     max_tokens: usize = 0,
+    /// Maximum tokens for the answer/completion only (0 = unlimited).
+    max_completion_tokens: usize = 0,
     temperature: f32 = -1.0,
     top_k: usize = 0,
     top_p: f32 = -1.0,
@@ -749,6 +751,7 @@ pub fn configToGenerateOptions(config: ?*const CGenerateConfig) GenerateOptions 
     const cfg = config orelse return opts;
 
     if (cfg.max_tokens > 0) opts.max_tokens = cfg.max_tokens;
+    if (cfg.max_completion_tokens > 0) opts.max_completion_tokens = cfg.max_completion_tokens;
     if (cfg.temperature >= 0) opts.temperature = cfg.temperature;
     if (cfg.top_k > 0) opts.top_k = cfg.top_k;
     if (cfg.top_p >= 0) opts.top_p = cfg.top_p;

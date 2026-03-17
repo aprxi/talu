@@ -137,8 +137,13 @@ pub const GenerationResult = struct {
 
 /// Generation options that override Chat defaults.
 pub const GenerateOptions = struct {
-    /// Override chat's max_tokens.
+    /// Override chat's max_tokens (total hard ceiling: thinking + answer).
     max_tokens: ?usize = null,
+
+    /// Maximum tokens for the answer/completion only (excludes thinking).
+    /// When set with max_tokens: answer is capped, thinking gets the rest.
+    /// When set without max_tokens: auto-computes max_tokens = thinking_budget + this.
+    max_completion_tokens: ?usize = null,
 
     /// Override chat's temperature.
     temperature: ?f32 = null,
@@ -751,8 +756,13 @@ pub const LocalEngine = struct {
             out.* = chat_template.promptEndsWithReasoningTag(prompt, opts.reasoning_tag);
         }
 
-        // Use chat settings with optional overrides
-        const base_max_tokens = opts.max_tokens orelse chat.max_tokens;
+        // Use chat settings with optional overrides.
+        // When max_completion_tokens is set without explicit max_tokens,
+        // auto-compute: max_tokens = thinking_budget + max_completion_tokens.
+        const base_max_tokens = if (opts.max_completion_tokens != null and opts.max_tokens == null) blk: {
+            const raw_budget = maxThinkingTokensForEffort(opts.reasoning_effort);
+            break :blk raw_budget + opts.max_completion_tokens.?;
+        } else opts.max_tokens orelse chat.max_tokens;
         const grammar_slack: usize = 64;
 
         // Determine if we're using tools (create grammar sampler if so)
@@ -959,11 +969,13 @@ pub const LocalEngine = struct {
         }, @src());
 
         // Thinking budget: carved from max_tokens, never exceeds it.
-        // Reserve 25% of max_tokens (floor 256) for the answer so the model
-        // always has room to respond after </think>.  This follows the
-        // OpenAI-style inclusive model where max_tokens is the hard ceiling.
+        // When max_completion_tokens is set, use it as the answer reserve.
+        // Otherwise fall back to 25% heuristic (floor 256).
         const raw_thinking_budget = maxThinkingTokensForEffort(opts.reasoning_effort);
-        const answer_reserve = @max(@as(usize, 256), max_tokens / 4);
+        const answer_reserve = if (opts.max_completion_tokens) |mct|
+            mct
+        else
+            @max(@as(usize, 256), max_tokens / 4);
         const thinking_budget = if (raw_thinking_budget > 0)
             @min(raw_thinking_budget, max_tokens -| answer_reserve)
         else
@@ -993,6 +1005,7 @@ pub const LocalEngine = struct {
             .vision_input = vision_input_ptr,
             .max_thinking_tokens = thinking_budget,
             .thinking_end_tokens = if (thinking_end_tokens) |t| t else &.{},
+            .max_completion_tokens = opts.max_completion_tokens orelse 0,
         }) catch |err| {
             const err_ctx = error_context.consumeContext();
             log.warn("inference", "Scheduler generation failed", .{

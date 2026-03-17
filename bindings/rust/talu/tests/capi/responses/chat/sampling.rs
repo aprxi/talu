@@ -21,7 +21,7 @@ fn default_temperature() {
 fn default_max_tokens() {
     let c = chat();
     let max = unsafe { talu_sys::talu_chat_get_max_tokens(c.as_ptr()) };
-    assert_eq!(max, 4096, "default max_tokens should be 4096");
+    assert_eq!(max, 8192, "default max_tokens should be 8192");
 }
 
 #[test]
