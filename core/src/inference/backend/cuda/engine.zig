@@ -2803,14 +2803,16 @@ pub const CudaBackend = struct {
 
     const max_state_bindings_per_slot: usize = runtime_contract.max_state_descriptors;
 
-    /// Per-slot KV cache and gated delta state buffer pointers.
+    /// Per-slot KV cache, gated delta, and shortconv state buffer pointers.
     /// Buffer handles are swapped into block_runtime via activateKvSlot().
     const SlotKvStates = struct {
         const KvEntry = struct { k: compute.cuda.Buffer, v: compute.cuda.Buffer, capacity: usize };
         const GdEntry = struct { conv: compute.cuda.Buffer, ssm: compute.cuda.Buffer, conv_ring_head: u32 };
+        const ScEntry = struct { conv: compute.cuda.Buffer };
 
         kv: []KvEntry,
         gd: []GdEntry,
+        sc: []ScEntry,
     };
 
     const SlotStateBinding = struct {
@@ -3157,35 +3159,63 @@ pub const CudaBackend = struct {
         return self.slot_logits[offset .. offset + self.vocab_size];
     }
 
-    /// Initialize per-slot KV and gated delta state buffers.
+    /// Initialize per-slot KV, gated delta, and shortconv state buffers.
     /// Called after block_runtime is initialized.
     fn initSlotKvStates(self: *CudaBackend) !void {
         const n_attn = self.block_runtime.attention_block_count;
         const n_gd = self.block_runtime.gated_delta_block_count;
+        const n_sc = self.block_runtime.shortconv_block_count;
         self.slot_kv_states = try self.allocator.alloc(SlotKvStates, self.max_batch_size);
         errdefer self.allocator.free(self.slot_kv_states);
         var initialized_slots: usize = 0;
         errdefer {
-            for (self.slot_kv_states[0..initialized_slots]) |*sks| {
-                for (sks.kv) |*kv| {
-                    kv.k.deinit(&self.device);
-                    kv.v.deinit(&self.device);
+            // Slot 0's device buffers are aliases of block_runtime — skip deinit.
+            for (self.slot_kv_states[0..initialized_slots], 0..) |*sks, err_slot_idx| {
+                if (err_slot_idx > 0) {
+                    for (sks.kv) |*kv| {
+                        kv.k.deinit(&self.device);
+                        kv.v.deinit(&self.device);
+                    }
+                    for (sks.gd) |*gd| {
+                        gd.conv.deinit(&self.device);
+                        gd.ssm.deinit(&self.device);
+                    }
+                    for (sks.sc) |*sc| {
+                        sc.conv.deinit(&self.device);
+                    }
                 }
                 self.allocator.free(sks.kv);
-                for (sks.gd) |*gd| {
-                    gd.conv.deinit(&self.device);
-                    gd.ssm.deinit(&self.device);
-                }
                 self.allocator.free(sks.gd);
+                self.allocator.free(sks.sc);
             }
         }
         // Slot 0 takes the existing buffers from block_runtime.
         // Slots 1..N-1 allocate fresh buffers.
         for (self.slot_kv_states, 0..) |*sks, slot_idx| {
             sks.kv = try self.allocator.alloc(SlotKvStates.KvEntry, n_attn);
+            errdefer self.allocator.free(sks.kv);
             sks.gd = try self.allocator.alloc(SlotKvStates.GdEntry, n_gd);
+            errdefer self.allocator.free(sks.gd);
+            sks.sc = try self.allocator.alloc(SlotKvStates.ScEntry, n_sc);
+            errdefer self.allocator.free(sks.sc);
             var attn_i: usize = 0;
             var gd_i: usize = 0;
+            var sc_i: usize = 0;
+            // Clean up device buffers stored in this slot's entries so far.
+            // Slot 0 entries are block_runtime aliases — only free for slot > 0.
+            errdefer if (slot_idx > 0) {
+                for (sks.kv[0..attn_i]) |*kv| {
+                    kv.k.deinit(&self.device);
+                    kv.v.deinit(&self.device);
+                }
+                for (sks.gd[0..gd_i]) |*gd| {
+                    gd.conv.deinit(&self.device);
+                    gd.ssm.deinit(&self.device);
+                }
+                for (sks.sc[0..sc_i]) |*sc| {
+                    sc.conv.deinit(&self.device);
+                }
+            };
             for (self.block_runtime.blocks) |*layer| {
                 if (layer.attention_binding) |block| {
                     if (slot_idx == 0) {
@@ -3213,6 +3243,21 @@ pub const CudaBackend = struct {
                     }
                     gd_i += 1;
                 }
+                if (layer.shortconv_binding) |block| {
+                    if (slot_idx == 0) {
+                        sks.sc[sc_i] = .{ .conv = block.conv_state };
+                    } else {
+                        var conv = try self.device.allocBuffer(block.conv_state.size);
+                        errdefer conv.deinit(&self.device);
+                        const elems = std.math.divExact(usize, conv.size, @sizeOf(f32)) catch return error.InvalidArgument;
+                        const zeros = try self.allocator.alloc(f32, elems);
+                        defer self.allocator.free(zeros);
+                        @memset(zeros, 0.0);
+                        try conv.upload(&self.device, std.mem.sliceAsBytes(zeros));
+                        sks.sc[sc_i] = .{ .conv = conv };
+                    }
+                    sc_i += 1;
+                }
             }
             initialized_slots += 1;
         }
@@ -3230,9 +3275,13 @@ pub const CudaBackend = struct {
                     gd.conv.deinit(&self.device);
                     gd.ssm.deinit(&self.device);
                 }
+                for (sks.sc) |*sc| {
+                    sc.conv.deinit(&self.device);
+                }
             }
             self.allocator.free(sks.kv);
             self.allocator.free(sks.gd);
+            self.allocator.free(sks.sc);
         }
         if (self.slot_kv_states.len > 0) self.allocator.free(self.slot_kv_states);
     }
@@ -3250,6 +3299,7 @@ pub const CudaBackend = struct {
         const sks = &self.slot_kv_states[self.active_kv_slot];
         var attn_i: usize = 0;
         var gd_i: usize = 0;
+        var sc_i: usize = 0;
         for (self.block_runtime.blocks) |*layer| {
             if (layer.attention_binding) |block| {
                 sks.kv[attn_i] = .{ .k = block.k_cache, .v = block.v_cache, .capacity = block.kv_capacity };
@@ -3259,6 +3309,10 @@ pub const CudaBackend = struct {
                 sks.gd[gd_i] = .{ .conv = block.conv_state_dev, .ssm = block.ssm_state_dev, .conv_ring_head = block.conv_ring_head };
                 gd_i += 1;
             }
+            if (layer.shortconv_binding) |block| {
+                sks.sc[sc_i] = .{ .conv = block.conv_state };
+                sc_i += 1;
+            }
         }
     }
 
@@ -3266,6 +3320,7 @@ pub const CudaBackend = struct {
         const sks = &self.slot_kv_states[slot_index];
         var attn_i: usize = 0;
         var gd_i: usize = 0;
+        var sc_i: usize = 0;
         for (self.block_runtime.blocks) |*layer| {
             if (layer.attention_binding) |block| {
                 block.k_cache = sks.kv[attn_i].k;
@@ -3278,6 +3333,10 @@ pub const CudaBackend = struct {
                 block.ssm_state_dev = sks.gd[gd_i].ssm;
                 block.conv_ring_head = sks.gd[gd_i].conv_ring_head;
                 gd_i += 1;
+            }
+            if (layer.shortconv_binding) |block| {
+                block.conv_state = sks.sc[sc_i].conv;
+                sc_i += 1;
             }
         }
     }
@@ -4356,12 +4415,17 @@ pub const CudaBackend = struct {
         const previous_launch_phase = self.device.setLaunchPhase(.decode);
         defer _ = self.device.setLaunchPhase(previous_launch_phase);
 
-        // Validate all slots and positions.
+        // Validate all slots, positions, and state block bindings.
         for (slot_indices) |slot_idx| {
             if (!self.slotIndexSupported(slot_idx)) return error.InvalidArgument;
         }
         for (positions) |pos| {
             if (pos >= self.max_seq_len) return error.InvalidArgument;
+        }
+        if (self.state_descriptor_count > 0) {
+            for (slot_indices) |slot_idx| {
+                try self.ensureSlotStateBlocksBoundForScheduler(slot_idx);
+            }
         }
 
         // Ensure scratch buffers fit N rows.
@@ -4527,6 +4591,7 @@ pub const CudaBackend = struct {
             .seq_lens = seq_lens,
             .attn_layer_index = 0,
             .gd_layer_index = 0,
+            .sc_layer_index = 0,
         };
 
         // Layer loop with N active rows and batch_info.
@@ -4535,7 +4600,7 @@ pub const CudaBackend = struct {
         for (0..layer_limit) |layer_idx| {
             const layer = &self.block_runtime.blocks[layer_idx];
             final_hidden = try self.tryExecuteLayerProgram(
-                layer, 0, layer_idx,
+                layer, slot_indices[0], layer_idx,
                 d_model_u32, head_dim_u32, rope_dim_u32,
                 n_heads_u32, n_kv_heads_u32,
                 n, // active_rows_u32
@@ -4555,6 +4620,9 @@ pub const CudaBackend = struct {
             }
             if (layer.gated_delta_binding != null) {
                 batch_info.gd_layer_index += 1;
+            }
+            if (layer.shortconv_binding != null) {
+                batch_info.sc_layer_index += 1;
             }
         }
 
@@ -8038,6 +8106,7 @@ pub const CudaBackend = struct {
         seq_lens: []const u32,
         attn_layer_index: usize,
         gd_layer_index: usize,
+        sc_layer_index: usize,
     };
 
     const LayerProgramExecutionContext = struct {
@@ -8837,6 +8906,41 @@ pub const CudaBackend = struct {
             return error.InvalidStateDescriptorBinding;
         }
         const shortconv_binding = try requireShortConvRuntimeBinding(shortconv_state, ctx.layer_index);
+
+        // Batched decode path: per-slot shortconv state from slot_kv_states.
+        if (ctx.batch_info) |batch| {
+            var row_idx: usize = 0;
+            while (row_idx < ctx.active_rows_u32) : (row_idx += 1) {
+                const slot_idx = batch.slot_indices[row_idx];
+                var sc_state = &self.slot_kv_states[slot_idx].sc[batch.sc_layer_index];
+                var input_row = try logicalF32RowSlice(
+                    input,
+                    @intCast(ctx.active_rows_u32),
+                    row_idx,
+                    in_proj.rows(),
+                );
+                var output_row = try logicalF32RowSlice(
+                    output,
+                    @intCast(ctx.active_rows_u32),
+                    row_idx,
+                    out_proj.cols(),
+                );
+                try self.runShortConvMixerStep(
+                    cfg,
+                    &sc_state.conv,
+                    &in_proj,
+                    &out_proj,
+                    &conv_weight,
+                    conv_bias,
+                    &input_row,
+                    &output_row,
+                    ctx.shortconv_step_function,
+                );
+            }
+            return;
+        }
+
+        // Single-row fast path (decode, single token).
         if (ctx.active_rows_u32 <= 1) {
             try self.runShortConvMixerStep(
                 cfg,
@@ -8852,6 +8956,7 @@ pub const CudaBackend = struct {
             return;
         }
 
+        // Non-batched multi-row path (prefill): row loop with layer-local state.
         var row_idx: usize = 0;
         while (row_idx < ctx.active_rows_u32) : (row_idx += 1) {
             var input_row = try logicalF32RowSlice(
