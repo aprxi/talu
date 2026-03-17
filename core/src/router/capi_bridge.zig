@@ -76,6 +76,8 @@ pub const CGenerateConfig = extern struct {
     max_tokens: usize = 0,
     /// Maximum tokens for the answer/completion only (0 = unlimited).
     max_completion_tokens: usize = 0,
+    /// Maximum thinking/reasoning tokens. maxInt = unset (use effort), 0 = no thinking.
+    max_reasoning_tokens: usize = std.math.maxInt(usize),
     temperature: f32 = -1.0,
     top_k: usize = 0,
     top_p: f32 = -1.0,
@@ -752,6 +754,7 @@ pub fn configToGenerateOptions(config: ?*const CGenerateConfig) GenerateOptions 
 
     if (cfg.max_tokens > 0) opts.max_tokens = cfg.max_tokens;
     if (cfg.max_completion_tokens > 0) opts.max_completion_tokens = cfg.max_completion_tokens;
+    if (cfg.max_reasoning_tokens != std.math.maxInt(usize)) opts.max_reasoning_tokens = cfg.max_reasoning_tokens;
     if (cfg.temperature >= 0) opts.temperature = cfg.temperature;
     if (cfg.top_k > 0) opts.top_k = cfg.top_k;
     if (cfg.top_p >= 0) opts.top_p = cfg.top_p;
@@ -886,6 +889,8 @@ fn buildOptions(
     const cfg = config orelse return result;
 
     if (cfg.max_tokens > 0) result.options.max_tokens = cfg.max_tokens;
+    if (cfg.max_completion_tokens > 0) result.options.max_completion_tokens = cfg.max_completion_tokens;
+    if (cfg.max_reasoning_tokens != std.math.maxInt(usize)) result.options.max_reasoning_tokens = cfg.max_reasoning_tokens;
     if (cfg.temperature >= 0) result.options.temperature = cfg.temperature;
     if (cfg.top_k > 0) result.options.top_k = cfg.top_k;
     if (cfg.top_p >= 0) result.options.top_p = cfg.top_p;
