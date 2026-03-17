@@ -140,6 +140,13 @@ def load_config(
         if isinstance(val, str):
             config[key] = [v.strip() for v in val.split(",")]
 
+    # Normalize max_reasoning_tokens: comma-separated → list of ints.
+    mrt = config.get("max_reasoning_tokens")
+    if isinstance(mrt, str):
+        config["max_reasoning_tokens"] = [int(v.strip()) for v in mrt.split(",")]
+    elif isinstance(mrt, (int, float)):
+        config["max_reasoning_tokens"] = [int(mrt)]
+
     return config
 
 

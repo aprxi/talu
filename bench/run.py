@@ -182,7 +182,7 @@ def _print_expanded_cmd(args: argparse.Namespace, config: dict) -> None:
     parts.append(f"--set precision={precs}")
     # Show all tunable params — explicit values and discoverable defaults.
     _EVAL_DEFAULTS = {
-        "reasoning_effort": "medium",
+        "max_reasoning_tokens": 0,
         "seed": None,
         "temperature": None,
         "top_p": None,
@@ -192,6 +192,9 @@ def _print_expanded_cmd(args: argparse.Namespace, config: dict) -> None:
     for key, default in _EVAL_DEFAULTS.items():
         val = config.get(key, default if is_eval else None)
         if val is not None:
+            # Format lists as comma-separated (e.g. max_reasoning_tokens=10,20).
+            if isinstance(val, list):
+                val = ",".join(str(v) for v in val)
             parts.append(f"--set {key}={val}")
     env_vars = config.get("env", {})
     for k, v in sorted(env_vars.items()):
@@ -497,14 +500,16 @@ def print_eval_report(
     from log import eval_log_path
     log_paths: list[Path] = []
     for r in results:
+        r_mrt = int(r.get("max_reasoning_tokens", 0))
         lp = eval_log_path(bench_name, r.get("model_uri", r["model"]),
-                           config.get("samples"))
+                           config.get("samples"), r_mrt)
         if lp not in log_paths:
             log_paths.append(lp)
 
     # -- Header --
+    bench_label = results[0].get("bench", scenario_name.rsplit("/", 1)[-1]).upper() if results else scenario_name
     console.print()
-    console.rule(f"[bold]talu eval · {scenario_name}[/bold]", style="bright_blue")
+    console.rule(f"[bold]talu eval · {bench_label}[/bold]", style="bright_blue")
     console.print()
 
     info_parts = [version, hardware, date]
@@ -519,9 +524,10 @@ def print_eval_report(
     for key in ("seed", "temperature", "max_tokens"):
         if key in config:
             param_parts.append(f"{key}={config[key]}")
-    # Always show reasoning effort — server defaults to medium when omitted.
-    effort = config.get("reasoning_effort", "medium")
-    param_parts.append(f"reasoning={effort}")
+    # Show reasoning budgets from actual results (config may be stale after runner loop).
+    mrt_vals = sorted(set(r.get("max_reasoning_tokens", 0) for r in results))
+    mrt_str = ",".join(str(v) for v in mrt_vals)
+    param_parts.append(f"reasoning={mrt_str}")
     for k, v in sorted(env_vars.items()):
         param_parts.append(f"{k}={v}")
     if param_parts:
@@ -534,7 +540,7 @@ def print_eval_report(
         by_model[r["model"]].append(r)
 
     for model, rows in by_model.items():
-        _print_eval_model_table(console, model, rows)
+        _print_eval_model_table(console, model, rows, bench_label)
 
     for lp in log_paths:
         console.print(f"  [dim]Log: {lp}[/]")
@@ -545,6 +551,7 @@ def _print_eval_model_table(
     console: Console,
     model: str,
     rows: list[dict],
+    bench_label: str = "",
 ) -> None:
     """Print an accuracy table for one model across precision variants.
 
@@ -557,6 +564,7 @@ def _print_eval_model_table(
     col_defs: list[tuple[str, str, bool]] = [
         ("Precision", "",          False),
         ("Size",      "",          True),
+        ("Reasoning", "",          True),
         ("Score",     "Accuracy",  True),
         ("%",         "Accuracy",  True),
     ]
@@ -595,13 +603,16 @@ def _print_eval_model_table(
             size_str = f"{fs / (1 << 20):.0f} MB"
         else:
             size_str = "—"
+        # Reasoning budget.
+        budget = r.get("max_reasoning_tokens", 0)
+        reasoning_str = f"{budget:,}" if budget > 0 else "—"
         # Accuracy.
         correct = r.get("correct_count", 0)
         total = r.get("total", 0)
         pct = r.get("accuracy", 0)
         score_str = f"{correct}/{total}"
         pct_str = f"{pct:.1f}%"
-        row_data = [label, size_str, score_str, pct_str]
+        row_data = [label, size_str, reasoning_str, score_str, pct_str]
         if has_perf:
             # Prefill.
             in_tok = r.get("total_input_tokens", 0)
@@ -680,9 +691,9 @@ def _print_eval_model_table(
     sep_line = join_parts(["─" * w for w in widths])
 
     # Find column indices for styling.
-    accuracy_pct_idx = 3
-    prefill_avg_idx = 5 if has_perf else -1
-    gen_avg_idx = 7 if has_perf else -1
+    accuracy_pct_idx = 4
+    prefill_avg_idx = 6 if has_perf else -1
+    gen_avg_idx = 8 if has_perf else -1
     errors_idx = len(col_defs) - 1 if has_errors else -1
 
     content_lines = [
@@ -705,9 +716,23 @@ def _print_eval_model_table(
             parts.append(cell)
         content_lines.append(join_parts(parts))
 
+    # Compute visible content width (strip Rich markup for measurement).
+    import re
+    _strip_markup = re.compile(r"\[/?[^\]]*\]").sub
+    content_width = max(len(_strip_markup("", line)) for line in content_lines)
+    # Build title: model left, bench label right on the top border.
+    if bench_label:
+        # -6 accounts for border decoration + spaces around the dash fill.
+        pad = content_width - len(model) - len(bench_label) - 6
+        if pad < 1:
+            pad = 1
+        title = f"[bold]{model}[/bold] [blue]{'─' * pad}[/] [bold]{bench_label}[/bold]"
+    else:
+        title = f"[bold]{model}[/bold]"
+
     panel = Panel(
         "\n".join(content_lines),
-        title=f"[bold]{model}[/bold]",
+        title=title,
         title_align="left",
         border_style="blue",
         padding=(0, 1),

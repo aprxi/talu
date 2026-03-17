@@ -10,16 +10,23 @@ from pathlib import Path
 EVALS_DIR = Path(__file__).resolve().parent.parent / "temp" / "evals"
 
 
-def eval_log_path(bench: str, model: str, samples: int | None = None) -> Path:
-    """Stable log path for a bench + model combination.
+def eval_log_path(
+    bench: str,
+    model: str,
+    samples: int | None = None,
+    max_reasoning_tokens: int = 0,
+) -> Path:
+    """Stable log path for a bench + model + reasoning combination.
 
-    Format: evals/<bench>_<model_slug>[_n<samples>].jsonl
+    Format: evals/<bench>_<model_slug>[_n<samples>][_r<budget>].jsonl
     Re-running the same combo appends to / resumes from this file.
     """
     slug = model.replace("/", "_").replace(" ", "_")
     name = f"{bench}_{slug}"
     if samples is not None:
         name += f"_n{samples}"
+    if max_reasoning_tokens > 0:
+        name += f"_r{max_reasoning_tokens}"
     EVALS_DIR.mkdir(parents=True, exist_ok=True)
     return EVALS_DIR / f"{name}.jsonl"
 
@@ -38,6 +45,7 @@ def load_completed(path: Path) -> tuple[set[tuple[str, int]], dict]:
         "total_output_tokens": 0,
         "prefill_tok_s": [],
         "gen_tok_s": [],
+        "meta": {},
     }
     if not path.exists():
         return completed, stats
@@ -48,6 +56,9 @@ def load_completed(path: Path) -> tuple[set[tuple[str, int]], dict]:
                 continue
             try:
                 rec = json.loads(line)
+                if rec.get("type") == "meta":
+                    stats["meta"] = rec
+                    continue
                 completed.add((rec["model"], rec["index"]))
                 if rec.get("match", False):
                     stats["cached_correct"] += 1
@@ -104,6 +115,22 @@ class EvalLogger:
             "output_tokens": output_tokens,
             "prefill_tok_s": round(prefill_tok_s, 1),
             "gen_tok_s": round(gen_tok_s, 1),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._fh.write(json.dumps(record) + "\n")
+        self._fh.flush()
+
+    def write_meta(
+        self,
+        *,
+        model_info: dict,
+        max_reasoning_tokens: int = 0,
+    ) -> None:
+        """Write a meta record (once per log file, after first successful response)."""
+        record = {
+            "type": "meta",
+            "model_info": model_info,
+            "max_reasoning_tokens": max_reasoning_tokens,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._fh.write(json.dumps(record) + "\n")

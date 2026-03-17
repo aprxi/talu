@@ -90,8 +90,8 @@ def _build_body(sample: dict, uri: str, config: dict) -> dict:
     for cfg_key, api_key in _API_FIELDS.items():
         if cfg_key in config:
             body[api_key] = config[cfg_key]
-    if "reasoning_effort" in config:
-        body["reasoning"] = {"effort": config["reasoning_effort"]}
+    mrt = int(config.get("max_reasoning_tokens", 0))
+    body["max_reasoning_tokens"] = mrt
     return body
 
 
@@ -104,6 +104,10 @@ class Gpqa(Scenario):
         samples_n: int | None = config.get("samples")
         if isinstance(samples_n, str):
             samples_n = int(samples_n)
+
+        # Default to non-thinking mode (user can override with --set max_reasoning_tokens=N).
+        if "max_reasoning_tokens" not in config:
+            config["max_reasoning_tokens"] = 0
 
         print("  Loading GPQA Diamond dataset ...", flush=True)
         samples = _load_dataset(samples_n)

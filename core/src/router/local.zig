@@ -145,6 +145,10 @@ pub const GenerateOptions = struct {
     /// When set without max_tokens: auto-computes max_tokens = thinking_budget + this.
     max_completion_tokens: ?usize = null,
 
+    /// Maximum thinking/reasoning tokens. When set, overrides the budget
+    /// derived from reasoning_effort. 0 = no thinking.
+    max_reasoning_tokens: ?usize = null,
+
     /// Override chat's temperature.
     temperature: ?f32 = null,
 
@@ -253,9 +257,13 @@ pub const GenerateOptions = struct {
 ///   - any other effort (or no effort) → enable_thinking: true
 /// Caller owns returned memory (if non-null).
 fn buildEffectiveContext(allocator: std.mem.Allocator, opts: GenerateOptions) !?[]const u8 {
-    // Determine enable_thinking from reasoning_effort.
-    // Default (null effort) = true, matching Qwen3.5 documented default behavior.
-    const enable_thinking: bool = if (opts.reasoning_effort) |effort|
+    // Determine enable_thinking from max_reasoning_tokens and reasoning_effort.
+    // max_reasoning_tokens=0 explicitly disables thinking (overrides effort).
+    // When max_reasoning_tokens is null, fall back to reasoning_effort
+    // (default = true, matching Qwen3.5 documented default behavior).
+    const enable_thinking: bool = if (opts.max_reasoning_tokens) |mrt|
+        mrt > 0
+    else if (opts.reasoning_effort) |effort|
         !std.mem.eql(u8, effort, "none")
     else
         true;
@@ -760,7 +768,10 @@ pub const LocalEngine = struct {
         // When max_completion_tokens is set without explicit max_tokens,
         // auto-compute: max_tokens = thinking_budget + max_completion_tokens.
         const base_max_tokens = if (opts.max_completion_tokens != null and opts.max_tokens == null) blk: {
-            const raw_budget = maxThinkingTokensForEffort(opts.reasoning_effort);
+            const raw_budget = if (opts.max_reasoning_tokens) |mrt|
+                mrt
+            else
+                maxThinkingTokensForEffort(opts.reasoning_effort);
             break :blk raw_budget + opts.max_completion_tokens.?;
         } else opts.max_tokens orelse chat.max_tokens;
         const grammar_slack: usize = 64;
@@ -971,7 +982,10 @@ pub const LocalEngine = struct {
         // Thinking budget: carved from max_tokens, never exceeds it.
         // When max_completion_tokens is set, use it as the answer reserve.
         // Otherwise fall back to 25% heuristic (floor 256).
-        const raw_thinking_budget = maxThinkingTokensForEffort(opts.reasoning_effort);
+        const raw_thinking_budget = if (opts.max_reasoning_tokens) |mrt|
+            mrt
+        else
+            maxThinkingTokensForEffort(opts.reasoning_effort);
         const answer_reserve = if (opts.max_completion_tokens) |mct|
             mct
         else
@@ -2171,6 +2185,34 @@ test "buildEffectiveContext medium enables thinking" {
     defer if (ctx) |c| allocator.free(c);
     try std.testing.expect(ctx != null);
     try std.testing.expectEqualStrings("{\"enable_thinking\": true}", ctx.?);
+}
+
+test "buildEffectiveContext max_reasoning_tokens=0 disables thinking" {
+    const allocator = std.testing.allocator;
+    const ctx = try buildEffectiveContext(allocator, GenerateOptions{ .max_reasoning_tokens = 0 });
+    defer if (ctx) |c| allocator.free(c);
+    try std.testing.expect(ctx != null);
+    try std.testing.expectEqualStrings("{\"enable_thinking\": false}", ctx.?);
+}
+
+test "buildEffectiveContext max_reasoning_tokens>0 enables thinking" {
+    const allocator = std.testing.allocator;
+    const ctx = try buildEffectiveContext(allocator, GenerateOptions{ .max_reasoning_tokens = 128 });
+    defer if (ctx) |c| allocator.free(c);
+    try std.testing.expect(ctx != null);
+    try std.testing.expectEqualStrings("{\"enable_thinking\": true}", ctx.?);
+}
+
+test "buildEffectiveContext max_reasoning_tokens=0 overrides effort" {
+    const allocator = std.testing.allocator;
+    // Even with reasoning_effort="high", max_reasoning_tokens=0 wins.
+    const ctx = try buildEffectiveContext(allocator, GenerateOptions{
+        .max_reasoning_tokens = 0,
+        .reasoning_effort = "high",
+    });
+    defer if (ctx) |c| allocator.free(c);
+    try std.testing.expect(ctx != null);
+    try std.testing.expectEqualStrings("{\"enable_thinking\": false}", ctx.?);
 }
 
 test "buildEffectiveContext merges with existing extra_context_json" {

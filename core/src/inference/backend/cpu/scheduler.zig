@@ -111,6 +111,24 @@ pub const Request = struct {
     /// Captured final-step logits (owned when non-empty).
     final_logits: []f32 = &.{},
 
+    // -- Thinking budget enforcement (queued route) --
+    /// Maximum thinking tokens before force-injecting end sequence. 0 = no limit.
+    max_thinking_tokens: usize = 0,
+    /// Token IDs to inject when thinking budget is exceeded (e.g. </think>\n\n).
+    thinking_end_tokens: []const u32 = &.{},
+    /// Number of thinking tokens generated so far.
+    thinking_token_count: usize = 0,
+    /// Whether the model is currently in thinking mode.
+    in_thinking: bool = false,
+    /// Position within thinking_end_tokens being injected (0 = not injecting).
+    thinking_inject_pos: usize = 0,
+    /// Maximum answer tokens after thinking ends. 0 = no limit.
+    max_completion_tokens_limit: usize = 0,
+    /// Number of answer tokens generated so far.
+    completion_token_count: usize = 0,
+    /// Whether we have transitioned to answer generation.
+    generating_answer: bool = true,
+
     pub fn deinit(self: *Request, alloc: std.mem.Allocator) void {
         self.generated_tokens.deinit(alloc);
         if (self.final_logits.len > 0) {
@@ -570,6 +588,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .submit_time = std.time.milliTimestamp(),
                 .finish_reason = .in_progress,
                 .capture_final_logits = submit_config.return_final_logits,
+                .max_thinking_tokens = submit_config.max_thinking_tokens,
+                .thinking_end_tokens = submit_config.thinking_end_tokens,
+                .in_thinking = submit_config.max_thinking_tokens > 0 and submit_config.thinking_end_tokens.len > 0,
+                .generating_answer = !(submit_config.max_thinking_tokens > 0 and submit_config.thinking_end_tokens.len > 0),
+                .max_completion_tokens_limit = submit_config.max_completion_tokens,
             };
 
             try self.requests.put(request_entry.id, request_entry);
@@ -776,7 +799,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 // Sample next token using optimized sampler (SIMD, pre-allocated workspace)
                 var sample_cfg = request_entry.sampling_config;
                 sample_cfg.context_tokens = request_entry.generated_tokens.items;
-                const next_token = self.sampleToken(
+                var next_token = self.sampleToken(
                     result.logits,
                     sample_cfg,
                     request_entry.grammar_sampler,
@@ -788,6 +811,42 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     next_token,
                     result.slot_index,
                 );
+
+                // Thinking budget enforcement: when the budget is exhausted,
+                // force-inject the end-thinking sequence (e.g. </think>\n\n)
+                // then resume normal sampling for the answer.
+                if (request_entry.in_thinking) {
+                    if (request_entry.thinking_inject_pos > 0) {
+                        // Continue injecting end-thinking tokens.
+                        next_token = request_entry.thinking_end_tokens[request_entry.thinking_inject_pos];
+                        request_entry.thinking_inject_pos += 1;
+                        if (request_entry.thinking_inject_pos >= request_entry.thinking_end_tokens.len) {
+                            request_entry.in_thinking = false;
+                            request_entry.generating_answer = true;
+                        }
+                    } else if (request_entry.thinking_token_count >= request_entry.max_thinking_tokens) {
+                        // Budget exceeded: start injecting end sequence.
+                        next_token = request_entry.thinking_end_tokens[0];
+                        request_entry.thinking_inject_pos = 1;
+                        if (request_entry.thinking_end_tokens.len == 1) {
+                            request_entry.in_thinking = false;
+                            request_entry.generating_answer = true;
+                        }
+                    } else {
+                        request_entry.thinking_token_count += 1;
+                        // Check if model naturally produced the end-thinking token.
+                        if (request_entry.thinking_end_tokens.len > 0 and
+                            next_token == request_entry.thinking_end_tokens[0])
+                        {
+                            request_entry.in_thinking = false;
+                            request_entry.generating_answer = true;
+                        }
+                    }
+                } else if (!request_entry.generating_answer) {
+                    // Transition to answer mode one iteration after thinking ends,
+                    // so injected end-thinking tokens are excluded from the count.
+                    request_entry.generating_answer = true;
+                }
 
                 if (trace.isEnabled()) {
                     var selected_token = [_]f32{@floatFromInt(next_token)};
@@ -826,6 +885,16 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                         finish_reason = .stop_sequence;
                         // Trim the stop sequence from generated tokens
                         request_entry.generated_tokens.shrinkRetainingCapacity(request_entry.generated_tokens.items.len - stop_len);
+                    }
+                }
+
+                // Completion token limit enforcement (answer tokens only).
+                if (finish_reason == .in_progress and request_entry.generating_answer and
+                    request_entry.max_completion_tokens_limit > 0)
+                {
+                    request_entry.completion_token_count += 1;
+                    if (request_entry.completion_token_count >= request_entry.max_completion_tokens_limit) {
+                        finish_reason = .length;
                     }
                 }
 

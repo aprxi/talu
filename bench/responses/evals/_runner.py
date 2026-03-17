@@ -134,7 +134,7 @@ def run_eval(
     samples: list[dict],
     build_body,
 ) -> list[dict]:
-    """Run an evaluation loop over samples for each model × precision.
+    """Run an evaluation loop over samples for each model × precision × reasoning budget.
 
     Args:
         bench_name: Benchmark identifier (e.g. "mmlu").
@@ -145,10 +145,13 @@ def run_eval(
                     For multimodal, this handles image upload etc.
 
     Returns:
-        List of result dicts (one per model × precision).
+        List of result dicts (one per model × precision × reasoning budget).
     """
     model_uris: list[str] = config.get("model_uri", ["Qwen/Qwen3.5-0.8B"])
     precisions: list[str] = config.get("precision", ["original"])
+    mrt_values: list[int] = config.get("max_reasoning_tokens", [0])
+    if not isinstance(mrt_values, list):
+        mrt_values = [int(mrt_values)]
     samples_n: int | None = config.get("samples")
     if isinstance(samples_n, str):
         samples_n = int(samples_n)
@@ -162,161 +165,170 @@ def run_eval(
             is_original = scheme == "original"
             uri = model_uri(base_model, None if is_original else scheme)
 
-            # Resume support.
-            log_path = eval_log_path(bench_name, uri, samples_n)
-            completed, cached_stats = load_completed(log_path)
-            logger = EvalLogger(log_path)
-            cached = sum(1 for (m, _) in completed if m == uri)
-            cached_correct = cached_stats["cached_correct"]
-            if cached:
-                print(f"\n  {uri}  (resuming, {cached} cached)")
-            else:
-                print(f"\n  {uri}")
-            # Print static header for live progress.
-            print(f"    {'Progress':<20s}  {'Accuracy':<18s}  "
-                  f"{'Prefill':<26s}  {'Generate'}", flush=True)
+            for mrt in mrt_values:
+                # Set current reasoning budget in config for build_body.
+                config["max_reasoning_tokens"] = mrt
 
-            correct_count = 0
-            per_question: list[dict] = []
-            model_info: dict = {}
-            errors = 0
-            total_input_tokens = cached_stats["total_input_tokens"]
-            total_output_tokens = cached_stats["total_output_tokens"]
+                # Resume support.
+                log_path = eval_log_path(bench_name, uri, samples_n, mrt)
+                completed, cached_stats = load_completed(log_path)
+                logger = EvalLogger(log_path)
+                cached = sum(1 for (m, _) in completed if m == uri)
+                cached_correct = cached_stats["cached_correct"]
+                mrt_label = f"  r={mrt}" if mrt > 0 else ""
+                if cached:
+                    print(f"\n  {uri}{mrt_label}  (resuming, {cached} cached)")
+                else:
+                    print(f"\n  {uri}{mrt_label}")
+                # Print static header for live progress.
+                print(f"    {'Progress':<20s}  {'Accuracy':<18s}  "
+                      f"{'Prefill':<26s}  {'Generate'}", flush=True)
 
-            # Throughput tracking — generate (seed with cached data).
-            all_gen_toks: list[float] = list(cached_stats["gen_tok_s"])
-            recent_gen_toks: deque[float] = deque(maxlen=10)
-            last_gen_toks: float = 0.0
-            # Throughput tracking — prefill (seed with cached data).
-            all_prefill_toks: list[float] = list(cached_stats["prefill_tok_s"])
-            recent_prefill_toks: deque[float] = deque(maxlen=10)
-            last_prefill_toks: float = 0.0
+                correct_count = 0
+                per_question: list[dict] = []
+                cached_meta = cached_stats.get("meta", {})
+                model_info: dict = cached_meta.get("model_info", {})
+                errors = 0
+                total_input_tokens = cached_stats["total_input_tokens"]
+                total_output_tokens = cached_stats["total_output_tokens"]
 
-            for i, sample in enumerate(samples):
-                if (uri, sample["index"]) in completed:
-                    continue
+                # Throughput tracking — generate (seed with cached data).
+                all_gen_toks: list[float] = list(cached_stats["gen_tok_s"])
+                recent_gen_toks: deque[float] = deque(maxlen=10)
+                last_gen_toks: float = 0.0
+                # Throughput tracking — prefill (seed with cached data).
+                all_prefill_toks: list[float] = list(cached_stats["prefill_tok_s"])
+                recent_prefill_toks: deque[float] = deque(maxlen=10)
+                last_prefill_toks: float = 0.0
 
-                # Build request body (scenario-specific).
-                body = build_body(sample, uri, config)
+                for i, sample in enumerate(samples):
+                    if (uri, sample["index"]) in completed:
+                        continue
 
-                # Retry loop with persistent connection.
-                events: list[dict] = []
-                for attempt in range(_MAX_RETRIES):
-                    try:
-                        events, _ = client.post("/v1/responses", body)
-                        if events:
-                            break
-                    except Exception as exc:
-                        if attempt < _MAX_RETRIES - 1:
-                            wait = 2 ** attempt
-                            print(f"\n    retry {attempt+1} after error: {exc}", flush=True)
-                            time.sleep(wait)
-                        else:
-                            print(f"\n    failed after {_MAX_RETRIES} retries: {exc}", flush=True)
-                            errors += 1
+                    # Build request body (scenario-specific).
+                    body = build_body(sample, uri, config)
 
-                raw = _extract_text(events)
-                reasoning = _extract_reasoning(events)
-                predicted = extract_answer(raw)
-                is_correct = predicted == sample["correct"]
-                if is_correct:
-                    correct_count += 1
+                    # Retry loop with persistent connection.
+                    events: list[dict] = []
+                    for attempt in range(_MAX_RETRIES):
+                        try:
+                            events, _ = client.post("/v1/responses", body)
+                            if events:
+                                break
+                        except Exception as exc:
+                            if attempt < _MAX_RETRIES - 1:
+                                wait = 2 ** attempt
+                                print(f"\n    retry {attempt+1} after error: {exc}", flush=True)
+                                time.sleep(wait)
+                            else:
+                                print(f"\n    failed after {_MAX_RETRIES} retries: {exc}", flush=True)
+                                errors += 1
 
-                per_question.append({
-                    "index": sample["index"],
-                    "question_hash": sample["question_hash"],
-                    "predicted": predicted,
-                    "correct": sample["correct"],
-                    "match": is_correct,
-                    "raw_output": raw[:500],
-                })
+                    raw = _extract_text(events)
+                    reasoning = _extract_reasoning(events)
+                    predicted = extract_answer(raw)
+                    is_correct = predicted == sample["correct"]
+                    if is_correct:
+                        correct_count += 1
 
-                if not model_info:
-                    model_info = extract_generation_metrics(events).get("model_info", {})
+                    per_question.append({
+                        "index": sample["index"],
+                        "question_hash": sample["question_hash"],
+                        "predicted": predicted,
+                        "correct": sample["correct"],
+                        "match": is_correct,
+                        "raw_output": raw[:500],
+                    })
 
-                # Throughput from this request.
-                metrics = extract_generation_metrics(events)
+                    if not model_info:
+                        model_info = extract_generation_metrics(events).get("model_info", {})
+                        if model_info and not cached_meta:
+                            logger.write_meta(model_info=model_info, max_reasoning_tokens=mrt)
 
-                logger.log(
-                    bench=bench_name,
-                    index=sample["index"],
-                    question_hash=sample["question_hash"],
-                    predicted=predicted,
-                    correct=sample["correct"],
-                    model=uri,
-                    raw_output=raw,
-                    reasoning=reasoning,
-                    question=sample.get("prompt", ""),
-                    input_tokens=metrics.get("input_tokens", 0),
-                    output_tokens=metrics.get("output_tokens", 0),
-                    prefill_tok_s=metrics.get("prefill_tok_s", 0),
-                    gen_tok_s=metrics.get("engine_tok_s", 0),
-                )
-                gen_ts = metrics.get("engine_tok_s", 0)
-                if gen_ts > 0:
-                    all_gen_toks.append(gen_ts)
-                    recent_gen_toks.append(gen_ts)
-                    last_gen_toks = gen_ts
-                pre_ts = metrics.get("prefill_tok_s", 0)
-                if pre_ts > 0:
-                    all_prefill_toks.append(pre_ts)
-                    recent_prefill_toks.append(pre_ts)
-                    last_prefill_toks = pre_ts
+                    # Throughput from this request.
+                    metrics = extract_generation_metrics(events)
 
-                # Token counts.
-                total_input_tokens += metrics.get("input_tokens", 0)
-                total_output_tokens += metrics.get("output_tokens", 0)
+                    logger.log(
+                        bench=bench_name,
+                        index=sample["index"],
+                        question_hash=sample["question_hash"],
+                        predicted=predicted,
+                        correct=sample["correct"],
+                        model=uri,
+                        raw_output=raw,
+                        reasoning=reasoning,
+                        question=sample.get("prompt", ""),
+                        input_tokens=metrics.get("input_tokens", 0),
+                        output_tokens=metrics.get("output_tokens", 0),
+                        prefill_tok_s=metrics.get("prefill_tok_s", 0),
+                        gen_tok_s=metrics.get("engine_tok_s", 0),
+                    )
+                    gen_ts = metrics.get("engine_tok_s", 0)
+                    if gen_ts > 0:
+                        all_gen_toks.append(gen_ts)
+                        recent_gen_toks.append(gen_ts)
+                        last_gen_toks = gen_ts
+                    pre_ts = metrics.get("prefill_tok_s", 0)
+                    if pre_ts > 0:
+                        all_prefill_toks.append(pre_ts)
+                        recent_prefill_toks.append(pre_ts)
+                        last_prefill_toks = pre_ts
 
-                # Progress line.
-                done = cached + len(per_question)
+                    # Token counts.
+                    total_input_tokens += metrics.get("input_tokens", 0)
+                    total_output_tokens += metrics.get("output_tokens", 0)
+
+                    # Progress line.
+                    done = cached + len(per_question)
+                    total_correct = cached_correct + correct_count
+                    pct = total_correct / done * 100 if done > 0 else 0
+
+                    progress = f"{done}/{total}"
+                    acc = f"{total_correct}/{done} ({pct:.1f}%)"
+
+                    if all_prefill_toks:
+                        pp_avg = sum(all_prefill_toks) / len(all_prefill_toks)
+                        pp_str = f"{total_input_tokens:,} tok  {pp_avg:.0f} t/s"
+                    else:
+                        pp_str = "—"
+                    if all_gen_toks:
+                        tg_avg = sum(all_gen_toks) / len(all_gen_toks)
+                        tg_str = f"{total_output_tokens:,} tok  {tg_avg:.0f} t/s"
+                    else:
+                        tg_str = "—"
+
+                    print(
+                        f"\r    {progress:<20s}  {acc:<18s}  {pp_str:<26s}  {tg_str}   ",
+                        end="", flush=True,
+                    )
+
+                logger.close()
+                print()
+                evaluated = cached + len(per_question)
                 total_correct = cached_correct + correct_count
-                pct = total_correct / done * 100 if done > 0 else 0
+                accuracy = total_correct / evaluated * 100 if evaluated > 0 else 0
 
-                progress = f"{done}/{total}"
-                acc = f"{total_correct}/{done} ({pct:.1f}%)"
+                # Aggregate throughput.
+                avg_gen = sum(all_gen_toks) / len(all_gen_toks) if all_gen_toks else 0
+                avg_prefill = sum(all_prefill_toks) / len(all_prefill_toks) if all_prefill_toks else 0
 
-                if all_prefill_toks:
-                    pp_avg = sum(all_prefill_toks) / len(all_prefill_toks)
-                    pp_str = f"{total_input_tokens:,} tok  {pp_avg:.0f} t/s"
-                else:
-                    pp_str = "—"
-                if all_gen_toks:
-                    tg_avg = sum(all_gen_toks) / len(all_gen_toks)
-                    tg_str = f"{total_output_tokens:,} tok  {tg_avg:.0f} t/s"
-                else:
-                    tg_str = "—"
-
-                print(
-                    f"\r    {progress:<20s}  {acc:<18s}  {pp_str:<26s}  {tg_str}   ",
-                    end="", flush=True,
-                )
-
-            logger.close()
-            print()
-            evaluated = cached + len(per_question)
-            total_correct = cached_correct + correct_count
-            accuracy = total_correct / evaluated * 100 if evaluated > 0 else 0
-
-            # Aggregate throughput.
-            avg_gen = sum(all_gen_toks) / len(all_gen_toks) if all_gen_toks else 0
-            avg_prefill = sum(all_prefill_toks) / len(all_prefill_toks) if all_prefill_toks else 0
-
-            all_results.append({
-                "model": base_model,
-                "scheme": scheme,
-                "model_uri": uri,
-                "correct_count": total_correct,
-                "total": total,
-                "accuracy": accuracy,
-                "model_info": model_info,
-                "results": per_question,
-                "bench": bench_name,
-                "errors": errors,
-                "avg_gen_tok_s": round(avg_gen, 1),
-                "avg_prefill_tok_s": round(avg_prefill, 1),
-                "total_input_tokens": total_input_tokens,
-                "total_output_tokens": total_output_tokens,
-            })
+                all_results.append({
+                    "model": base_model,
+                    "scheme": scheme,
+                    "model_uri": uri,
+                    "correct_count": total_correct,
+                    "total": total,
+                    "accuracy": accuracy,
+                    "model_info": model_info,
+                    "results": per_question,
+                    "bench": bench_name,
+                    "errors": errors,
+                    "avg_gen_tok_s": round(avg_gen, 1),
+                    "avg_prefill_tok_s": round(avg_prefill, 1),
+                    "total_input_tokens": total_input_tokens,
+                    "total_output_tokens": total_output_tokens,
+                    "max_reasoning_tokens": mrt,
+                })
 
     client.close()
     return all_results

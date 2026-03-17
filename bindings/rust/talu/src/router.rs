@@ -48,6 +48,8 @@ pub struct GenerateConfig {
     pub max_tokens: usize,
     /// Maximum tokens for the answer/completion only (excludes thinking).
     pub max_completion_tokens: Option<usize>,
+    /// Maximum thinking/reasoning tokens. Overrides effort-derived budget when set.
+    pub max_reasoning_tokens: Option<usize>,
     /// Sampling temperature (0.0 = deterministic).
     pub temperature: f32,
     /// Top-k sampling parameter.
@@ -334,6 +336,9 @@ impl ConfigHolder {
         c_config.max_tokens = cfg.max_tokens;
         if let Some(mct) = cfg.max_completion_tokens {
             c_config.max_completion_tokens = mct;
+        }
+        if let Some(mrt) = cfg.max_reasoning_tokens {
+            c_config.max_reasoning_tokens = mrt;
         }
         c_config.temperature = cfg.temperature;
         c_config.top_k = cfg.top_k;

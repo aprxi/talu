@@ -16,6 +16,7 @@ pub struct CreateResponseBody {
     pub instructions: Option<String>,
     pub max_output_tokens: Option<i64>,
     pub max_completion_tokens: Option<i64>,
+    pub max_reasoning_tokens: Option<i64>,
     pub max_tool_calls: Option<i64>,
     pub metadata: Option<serde_json::Value>,
     pub model: Option<String>,

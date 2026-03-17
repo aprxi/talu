@@ -53,6 +53,7 @@ struct GenerationRequest {
     model: Option<String>,
     max_output_tokens: Option<i64>,
     max_completion_tokens: Option<i64>,
+    max_reasoning_tokens: Option<i64>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     top_k: Option<u32>,
@@ -253,6 +254,7 @@ async fn handle_generate(
         model: parsed.model.clone(),
         max_output_tokens: parsed.max_output_tokens,
         max_completion_tokens: parsed.max_completion_tokens,
+        max_reasoning_tokens: parsed.max_reasoning_tokens,
         temperature: parsed.temperature,
         top_p: parsed.top_p,
         top_k: parsed.top_k,
@@ -624,6 +626,7 @@ async fn generate_response(
 ) -> Result<serde_json::Value, ResponseError> {
     let request_max_output_tokens = request.max_output_tokens;
     let request_max_completion_tokens = request.max_completion_tokens;
+    let request_max_reasoning_tokens = request.max_reasoning_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
     let top_k = request.top_k;
@@ -955,6 +958,9 @@ async fn generate_response(
             if let Some(mct) = request_max_completion_tokens {
                 cfg.max_completion_tokens = Some(mct as usize);
             }
+            if let Some(mrt) = request_max_reasoning_tokens {
+                cfg.max_reasoning_tokens = Some(mrt as usize);
+            }
             cfg.stop_flag = Some(stop_flag_for_gen);
 
             log::debug!(target: "server::gen", "generating: model={} max_tokens={} temp={} top_p={} seed={}",
@@ -1113,6 +1119,7 @@ async fn stream_response(
 
     let request_max_output_tokens = request.max_output_tokens;
     let request_max_completion_tokens = request.max_completion_tokens;
+    let request_max_reasoning_tokens = request.max_reasoning_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
     let top_k = request.top_k;
@@ -1638,6 +1645,7 @@ async fn stream_response(
             model_id.clone(),
             max_output_tokens,
             request_max_completion_tokens,
+            request_max_reasoning_tokens,
             temperature,
             top_p,
             top_k,
@@ -1718,6 +1726,7 @@ fn run_streaming_generation(
     model_id: String,
     max_output_tokens: Option<i64>,
     max_completion_tokens: Option<i64>,
+    max_reasoning_tokens: Option<i64>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     top_k: Option<u32>,
@@ -1819,6 +1828,9 @@ fn run_streaming_generation(
     cfg.reasoning_effort = reasoning_effort;
     if let Some(mct) = max_completion_tokens {
         cfg.max_completion_tokens = Some(mct as usize);
+    }
+    if let Some(mrt) = max_reasoning_tokens {
+        cfg.max_reasoning_tokens = Some(mrt as usize);
     }
 
     // Pass the stop flag for cooperative cancellation.
