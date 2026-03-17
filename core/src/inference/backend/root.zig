@@ -729,7 +729,7 @@ fn initCuda(
         log.info("inference", "CUDA runtime unavailable", .{ .reason = cudaProbeName(probe) });
         return error.CudaUnavailable;
     }
-    const cuda_backend_state = try cuda.BackendType.init(allocator, loaded);
+    const cuda_backend_state = try cuda.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE);
     log.info("inference", "Backend selected: cuda", .{ .reason = reason });
     return .{ .cuda = cuda_backend_state };
 }

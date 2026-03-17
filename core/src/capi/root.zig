@@ -57,6 +57,7 @@ pub const file_api = @import("file.zig");
 pub const treesitter = @import("code.zig");
 
 pub const router = @import("router.zig");
+pub const scheduler = @import("scheduler.zig");
 pub const agent = @import("agent/root.zig");
 pub const train = @import("train.zig");
 pub const train_full = @import("train_full.zig");
@@ -524,6 +525,19 @@ pub const talu_router_iterator_generation_ns = router.talu_router_iterator_gener
 pub const talu_router_iterator_ttft_ns = router.talu_router_iterator_ttft_ns;
 pub const talu_router_iterator_output_text = router.talu_router_iterator_output_text;
 pub const TaluTokenIterator = router.TaluTokenIterator;
+
+// Re-export Scheduler C API functions (continuous batching).
+pub const talu_scheduler_create = scheduler.talu_scheduler_create;
+pub const talu_scheduler_destroy = scheduler.talu_scheduler_destroy;
+pub const talu_scheduler_submit = scheduler.talu_scheduler_submit;
+pub const talu_scheduler_cancel = scheduler.talu_scheduler_cancel;
+pub const talu_scheduler_step = scheduler.talu_scheduler_step;
+pub const talu_scheduler_has_active = scheduler.talu_scheduler_has_active;
+pub const talu_scheduler_active_count = scheduler.talu_scheduler_active_count;
+pub const TaluScheduler = scheduler.TaluScheduler;
+pub const CSchedulerConfig = scheduler.CSchedulerConfig;
+pub const CSchedulerSubmitOptions = scheduler.CSubmitOptions;
+pub const CSchedulerTokenEvent = scheduler.CTokenEvent;
 
 // Re-export X-Ray C API functions (tensor inspection during inference).
 pub const talu_xray_capture_create = xray.talu_xray_capture_create;

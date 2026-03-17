@@ -2826,7 +2826,7 @@ pub const CudaBackend = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel) !CudaBackend {
+    pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel, max_batch_size: usize) !CudaBackend {
         var device = try compute.cuda.Device.init();
         errdefer device.deinit();
 
@@ -2850,6 +2850,7 @@ pub const CudaBackend = struct {
             .max_seq_len = @intCast(loaded.config.max_seq_len),
             .rope_dim = 0,
             .attention_scale = 0.0,
+            .max_batch_size = max_batch_size,
             .norm_eps = prototype_eps,
             .cpu_rope_global = null,
             .cpu_rope_local = null,

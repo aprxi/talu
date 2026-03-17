@@ -317,6 +317,15 @@ comptime {
     _ = &capi.talu_router_iterator_generation_ns;
     _ = &capi.talu_router_iterator_output_text;
 
+    // Scheduler API (continuous batching)
+    _ = &capi.talu_scheduler_create;
+    _ = &capi.talu_scheduler_destroy;
+    _ = &capi.talu_scheduler_submit;
+    _ = &capi.talu_scheduler_cancel;
+    _ = &capi.talu_scheduler_step;
+    _ = &capi.talu_scheduler_has_active;
+    _ = &capi.talu_scheduler_active_count;
+
     // X-Ray API (tensor inspection during inference)
     _ = &capi.talu_xray_capture_create;
     _ = &capi.talu_xray_capture_create_all;

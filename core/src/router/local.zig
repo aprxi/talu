@@ -1640,6 +1640,9 @@ pub const LocalEngine = struct {
         if (merged_config.default_eos_token_ids.len == 0) {
             merged_config.default_eos_token_ids = self.gen_config.eos_token_ids;
         }
+        if (merged_config.tokenizer == null) {
+            merged_config.tokenizer = &self.tok;
+        }
         if (merged_config.state_descriptors.len == 0) {
             merged_config.state_descriptors = self.scheduler_state_descriptors;
         }
