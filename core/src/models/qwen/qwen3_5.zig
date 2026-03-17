@@ -286,8 +286,6 @@ const qwen3_5_conversion_fusions = [_]types.ConversionFusion{
             "linear_attn.in_proj_qkv.weight",
             "linear_attn.in_proj_z.weight",
             "linear_attn.in_proj_b.weight",
-        },
-        .optional_input_suffixes = &.{
             "linear_attn.in_proj_a.weight",
         },
         .output_suffix = "mixer.in_proj.weight",

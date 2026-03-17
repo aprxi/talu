@@ -752,8 +752,6 @@ test "buildConversionFusionMap expands structural fusions per layer prefix" {
                 "linear_attn.in_proj_qkv.weight",
                 "linear_attn.in_proj_z.weight",
                 "linear_attn.in_proj_b.weight",
-            },
-            .optional_input_suffixes = &.{
                 "linear_attn.in_proj_a.weight",
             },
             .output_suffix = "mixer.in_proj.weight",
@@ -773,8 +771,9 @@ test "buildConversionFusionMap expands structural fusions per layer prefix" {
     const plan = map.planForTrigger(trigger) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(op_types.ConversionFusionKind.gated_delta_split_in_proj, plan.kind);
     try std.testing.expectEqualStrings("model.layers.1.mixer.in_proj.weight", plan.output_name);
-    try std.testing.expectEqual(@as(usize, 3), plan.required_inputs.len);
+    try std.testing.expectEqual(@as(usize, 4), plan.required_inputs.len);
     try std.testing.expectEqualStrings("model.layers.1.linear_attn.in_proj_z.weight", plan.required_inputs[1]);
+    try std.testing.expectEqualStrings("model.layers.1.linear_attn.in_proj_a.weight", plan.required_inputs[3]);
     try std.testing.expect(map.isConsumedNonTrigger("model.layers.1.linear_attn.in_proj_a.weight"));
     try std.testing.expect(!map.isConsumedNonTrigger(trigger));
 }

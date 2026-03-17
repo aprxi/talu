@@ -409,6 +409,7 @@ inline fn toKernelGatedDeltaConfig(cfg: runtime_blocks.GatedDeltaConfig) gated_d
         .d_conv = cfg.d_conv,
         .n_heads = cfg.n_heads,
         .d_head = cfg.d_head,
+        .n_key_heads = cfg.n_key_heads,
     };
 }
 

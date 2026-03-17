@@ -80,21 +80,18 @@ fn maybeWriteFusedTensorForPlan(
 ) !bool {
     switch (plan.kind) {
         .gated_delta_split_in_proj => {
-            if (plan.required_inputs.len != 3) return error.InvalidWeightTransform;
+            if (plan.required_inputs.len != 4) return error.InvalidWeightTransform;
             const qkv = try source_tensors.getTensor(plan.required_inputs[0], null);
             const z = try source_tensors.getTensor(plan.required_inputs[1], null);
             const b = try source_tensors.getTensor(plan.required_inputs[2], null);
-            var a = if (plan.optional_inputs.len > 0)
-                source_tensors.getTensor(plan.optional_inputs[0], null) catch null
-            else
-                null;
+            const a = try source_tensors.getTensor(plan.required_inputs[3], null);
 
             const fused = try load_transforms.buildGatedDeltaSplitInProj(
                 allocator,
                 &qkv,
                 &z,
                 &b,
-                if (a) |*t| t else null,
+                &a,
             );
             defer @constCast(fused).deinit(allocator);
 

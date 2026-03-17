@@ -44,6 +44,7 @@ pub const GatedDeltaConfig = struct {
     d_conv: u32,
     n_heads: u32,
     d_head: u32,
+    n_key_heads: u32 = 0,
 };
 
 pub const GatedDeltaWeights = struct {
@@ -64,6 +65,7 @@ pub const GatedDeltaState = struct {
     d_inner: usize,
     d_conv: usize,
     n_heads: usize,
+    n_key_heads: usize,
     d_head: usize,
 
     pub fn init(
@@ -71,15 +73,21 @@ pub const GatedDeltaState = struct {
         batch_size: usize,
         config: GatedDeltaConfig,
     ) !GatedDeltaState {
-        const d_inner = @as(usize, config.n_heads) * @as(usize, config.d_head);
-        // Allocate for the maximal historical qkv packing (3*d_inner). Some
-        // architectures (e.g. Qwen3.5 4B/9B) use asymmetric q/k vs v widths
-        // and consume a smaller runtime qkv_len.
-        const qkv_len = d_inner * 3;
+        const n_v_heads: usize = @as(usize, config.n_heads);
+        const n_qk_heads: usize = if (config.n_key_heads > 0) @as(usize, config.n_key_heads) else n_v_heads;
+        if (n_v_heads == 0 or n_qk_heads == 0 or config.d_head == 0 or config.d_conv == 0) return error.InvalidShape;
+
+        const d_head: usize = @as(usize, config.d_head);
+        const d_inner = std.math.mul(usize, n_v_heads, d_head) catch return error.InvalidShape;
+        const qkv_len = blk: {
+            const qk_inner = std.math.mul(usize, n_qk_heads, d_head) catch return error.InvalidShape;
+            const qk_total = std.math.mul(usize, qk_inner, 2) catch return error.InvalidShape;
+            break :blk std.math.add(usize, qk_total, d_inner) catch return error.InvalidShape;
+        };
         // Time-major state layout: [batch, d_conv, qkv_len].
         // This matches the SIMD-friendly conv1d_depthwise.runTimeMajor path.
-        const conv_state_size = batch_size * qkv_len * config.d_conv;
-        const ssm_state_size = batch_size * config.n_heads * config.d_head * config.d_head;
+        const conv_state_size = std.math.mul(usize, batch_size, std.math.mul(usize, qkv_len, @as(usize, config.d_conv)) catch return error.InvalidShape) catch return error.InvalidShape;
+        const ssm_state_size = std.math.mul(usize, batch_size, std.math.mul(usize, d_inner, d_head) catch return error.InvalidShape) catch return error.InvalidShape;
 
         const conv_state = try allocator.alloc(f32, conv_state_size);
         errdefer allocator.free(conv_state);
@@ -96,6 +104,7 @@ pub const GatedDeltaState = struct {
             .d_inner = d_inner,
             .d_conv = config.d_conv,
             .n_heads = config.n_heads,
+            .n_key_heads = n_qk_heads,
             .d_head = config.d_head,
         };
     }
@@ -120,11 +129,28 @@ pub const GatedDeltaScratch = struct {
     ssm_offset: usize,
 
     pub fn init(allocator: std.mem.Allocator, config: GatedDeltaConfig) !GatedDeltaScratch {
-        const d_inner: usize = @as(usize, config.n_heads) * @as(usize, config.d_head);
-        const proj_len = 4 * d_inner + 2 * @as(usize, config.n_heads);
+        const n_v_heads: usize = @as(usize, config.n_heads);
+        const n_qk_heads: usize = if (config.n_key_heads > 0) @as(usize, config.n_key_heads) else n_v_heads;
+        if (n_v_heads == 0 or n_qk_heads == 0 or config.d_head == 0) return error.InvalidShape;
+
+        const d_head: usize = @as(usize, config.d_head);
+        const d_inner = std.math.mul(usize, n_v_heads, d_head) catch return error.InvalidShape;
+        const qkv_len = blk: {
+            const qk_inner = std.math.mul(usize, n_qk_heads, d_head) catch return error.InvalidShape;
+            const qk_total = std.math.mul(usize, qk_inner, 2) catch return error.InvalidShape;
+            break :blk std.math.add(usize, qk_total, d_inner) catch return error.InvalidShape;
+        };
+        const proj_len = blk: {
+            const qkv_z = std.math.add(usize, qkv_len, d_inner) catch return error.InvalidShape;
+            const ba = std.math.mul(usize, n_v_heads, 2) catch return error.InvalidShape;
+            break :blk std.math.add(usize, qkv_z, ba) catch return error.InvalidShape;
+        };
         const conv_len = d_inner;
         const ssm_len = d_inner;
-        const total = proj_len + conv_len + ssm_len;
+        const total = blk: {
+            const proj_conv = std.math.add(usize, proj_len, conv_len) catch return error.InvalidShape;
+            break :blk std.math.add(usize, proj_conv, ssm_len) catch return error.InvalidShape;
+        };
         const buffer = try allocator.alloc(f32, total);
         @memset(buffer, 0);
         return .{
@@ -244,7 +270,9 @@ pub const GatedDeltaKernel = struct {
         const d_inner: usize = @as(usize, cfg.n_heads) * @as(usize, cfg.d_head);
         const d_conv: usize = cfg.d_conv;
         const n_v_heads: usize = cfg.n_heads;
+        const n_qk_heads_expected: usize = if (cfg.n_key_heads > 0) @as(usize, cfg.n_key_heads) else n_v_heads;
         const d_head: usize = cfg.d_head;
+        if (n_v_heads == 0 or n_qk_heads_expected == 0 or d_head == 0 or d_conv == 0) return error.InvalidShape;
 
         const batch_size: usize = if (input.n_dims == 3) @intCast(input.shape[0]) else 1;
         if (batch_size != 1) return error.InvalidShape;
@@ -257,10 +285,20 @@ pub const GatedDeltaKernel = struct {
 
         const weight_proj_len = try projectionOutputDim(w.in_proj, d_model);
         const qkv_len = try convChannelDim(w.conv1d_weight, d_conv);
-        const minimum_proj = d_inner + (2 * n_v_heads);
-        if (weight_proj_len <= minimum_proj) return error.InvalidShape;
-        if (state.conv_state.len < qkv_len * d_conv) return error.InvalidShape;
-        const proj_len = weight_proj_len;
+        const qkv_expected = blk: {
+            const qk_inner = std.math.mul(usize, n_qk_heads_expected, d_head) catch return error.InvalidShape;
+            const qk_total = std.math.mul(usize, qk_inner, 2) catch return error.InvalidShape;
+            break :blk std.math.add(usize, qk_total, d_inner) catch return error.InvalidShape;
+        };
+        if (qkv_len != qkv_expected) return error.InvalidShape;
+
+        const proj_len = blk: {
+            const qkv_z = std.math.add(usize, qkv_expected, d_inner) catch return error.InvalidShape;
+            const ba = std.math.mul(usize, n_v_heads, 2) catch return error.InvalidShape;
+            break :blk std.math.add(usize, qkv_z, ba) catch return error.InvalidShape;
+        };
+        if (weight_proj_len != proj_len) return error.InvalidShape;
+        if (state.conv_state.len < qkv_expected * d_conv) return error.InvalidShape;
         const proj_out = scratch.getProjection(proj_len);
         const temp = scratch.getConvOutput(d_inner);
         const ssm_out = scratch.getSsmOutput(d_inner);
@@ -324,6 +362,7 @@ pub const GatedDeltaKernel = struct {
             const qk_inner = qk_total / 2;
             if ((qk_inner % d_head) != 0) return error.InvalidShape;
             const n_qk_heads = qk_inner / d_head;
+            if (n_qk_heads != n_qk_heads_expected) return error.InvalidShape;
             if (n_qk_heads == 0 or (n_v_heads % n_qk_heads) != 0) return error.InvalidShape;
 
             cpu_conv1d.runTimeMajorValues(qkv, conv_state, conv_weight_t, qkv, conv_bias, qkv_len, d_conv);
@@ -422,4 +461,17 @@ test "normWeightForHead rejects invalid norm shape" {
         error.InvalidShape,
         cpu_gated_delta.normWeightSlice(&invalid, 0, 4, 8),
     );
+}
+
+test "GatedDeltaScratch.init accounts for asymmetric key/value heads" {
+    const cfg = GatedDeltaConfig{
+        .d_model = 1024,
+        .d_conv = 4,
+        .n_heads = 16,
+        .n_key_heads = 8,
+        .d_head = 128,
+    };
+    var scratch = try GatedDeltaScratch.init(std.testing.allocator, cfg);
+    defer scratch.deinit();
+    try std.testing.expect(scratch.buffer.len >= 0);
 }

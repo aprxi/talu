@@ -555,9 +555,12 @@ pub fn blockWeightsFromMap(
             const split_b = getOptionalWeight(map, "linear_attn.in_proj_b.weight");
             const in_proj = blk: {
                 if (getOptionalWeight(map, "mixer.in_proj.weight")) |weight| break :blk weight;
-                if (split_qkv != null and split_z != null and split_b != null) {
+                if (split_qkv != null or split_z != null or split_b != null or split_a != null) {
+                    if (split_qkv == null or split_z == null or split_b == null or split_a == null) {
+                        return error.MissingWeight;
+                    }
                     const allocator = try requiredRuntimeAllocator(context);
-                    break :blk try transforms.buildGatedDeltaSplitInProj(allocator, split_qkv.?, split_z.?, split_b.?, split_a);
+                    break :blk try transforms.buildGatedDeltaSplitInProj(allocator, split_qkv.?, split_z.?, split_b.?, split_a.?);
                 }
                 return error.MissingWeight;
             };
@@ -789,4 +792,62 @@ test "blockWeightsFromMap gated_delta accepts qwen3.5 split linear attention wei
     try std.testing.expect(gated_delta.w1 != null);
     try std.testing.expect(gated_delta.w2 != null);
     try std.testing.expect(gated_delta.w3 != null);
+}
+
+test "blockWeightsFromMap gated_delta rejects split in_proj missing in_proj_a" {
+    const allocator = std.testing.allocator;
+    var map = WeightMap{};
+    defer map.deinit(allocator);
+
+    var ln1_data = [_]f32{ 1, 1 };
+    var in_proj_qkv_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var in_proj_z_data = [_]f32{ 9, 10, 11, 12 };
+    var in_proj_b_data = [_]f32{ 13, 14 };
+    var conv_data = [_]f32{ 0, 1, 2, 3, 4, 5 };
+    var a_log_data = [_]f32{ 0.1, 0.2 };
+    var dt_bias_data = [_]f32{ 0.3, 0.4 };
+    var norm_data = [_]f32{ 1, 1 };
+    var out_proj_data = [_]f32{ 1, 0, 0, 1 };
+    var mlp_gate_data = [_]f32{ 1, 2, 3, 4 };
+    var mlp_up_data = [_]f32{ 5, 6, 7, 8 };
+    var mlp_down_data = [_]f32{ 9, 10, 11, 12 };
+
+    var ln1 = Tensor.view2DSlice(ln1_data[0..], 1, 2);
+    var in_proj_qkv = Tensor.view2DSlice(in_proj_qkv_data[0..], 4, 2);
+    var in_proj_z = Tensor.view2DSlice(in_proj_z_data[0..], 2, 2);
+    var in_proj_b = Tensor.view2DSlice(in_proj_b_data[0..], 1, 2);
+    var conv = Tensor.view(@ptrCast(conv_data[0..].ptr), &.{ 6, 1, 1 }, .f32, null);
+    var a_log = Tensor.view(@ptrCast(a_log_data[0..].ptr), &.{2}, .f32, null);
+    var dt_bias = Tensor.view(@ptrCast(dt_bias_data[0..].ptr), &.{2}, .f32, null);
+    var norm = Tensor.view(@ptrCast(norm_data[0..].ptr), &.{2}, .f32, null);
+    var out_proj = Tensor.view2DSlice(out_proj_data[0..], 2, 2);
+    var mlp_gate = Tensor.view2DSlice(mlp_gate_data[0..], 2, 2);
+    var mlp_up = Tensor.view2DSlice(mlp_up_data[0..], 2, 2);
+    var mlp_down = Tensor.view2DSlice(mlp_down_data[0..], 2, 2);
+
+    try map.put(allocator, "input_layernorm.weight", &ln1);
+    try map.put(allocator, "linear_attn.in_proj_qkv.weight", &in_proj_qkv);
+    try map.put(allocator, "linear_attn.in_proj_z.weight", &in_proj_z);
+    try map.put(allocator, "linear_attn.in_proj_b.weight", &in_proj_b);
+    try map.put(allocator, "linear_attn.conv1d.weight", &conv);
+    try map.put(allocator, "linear_attn.A_log", &a_log);
+    try map.put(allocator, "linear_attn.dt_bias", &dt_bias);
+    try map.put(allocator, "linear_attn.norm.weight", &norm);
+    try map.put(allocator, "linear_attn.out_proj.weight", &out_proj);
+    try map.put(allocator, "mlp.gate_proj.weight", &mlp_gate);
+    try map.put(allocator, "mlp.up_proj.weight", &mlp_up);
+    try map.put(allocator, "mlp.down_proj.weight", &mlp_down);
+
+    try std.testing.expectError(
+        error.MissingWeight,
+        blockWeightsFromMap(&map, .gated_delta, .{
+            .gated_delta_config = .{
+                .d_model = 2,
+                .d_conv = 1,
+                .n_heads = 2,
+                .d_head = 1,
+            },
+            .allocator = allocator,
+        }),
+    );
 }
