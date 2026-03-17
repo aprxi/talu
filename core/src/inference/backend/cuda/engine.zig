@@ -2762,10 +2762,14 @@ pub const CudaBackend = struct {
     cpu_rope_global: ?*cpu_kernels.RoPE = null,
     cpu_rope_local: ?*cpu_kernels.RoPE = null,
     max_batch_size: usize = 1,
-    slot_in_use: bool = false,
-    slot_position: usize = 0,
-    slot_rope_position_delta: isize = 0,
+    slot_in_use: []bool,
+    slot_positions: []usize,
+    slot_rope_position_deltas: []isize,
     slot_logits: []f32,
+    /// Which slot's KV/state buffers are currently loaded into block_runtime.
+    /// Call activateKvSlot() before accessing per-slot KV or gated delta state.
+    active_kv_slot: usize = 0,
+    slot_kv_states: []SlotKvStates,
     state_descriptors_storage: [runtime_contract.max_state_descriptors]runtime_contract.StateDescriptor = undefined,
     state_descriptor_count: u8 = 0,
     slot_state_bindings: []SlotStateBinding = &.{},
@@ -2789,6 +2793,16 @@ pub const CudaBackend = struct {
     parity_checkpoint_warned: [256]bool,
 
     const max_state_bindings_per_slot: usize = runtime_contract.max_state_descriptors;
+
+    /// Per-slot KV cache and gated delta state buffer pointers.
+    /// Buffer handles are swapped into block_runtime via activateKvSlot().
+    const SlotKvStates = struct {
+        const KvEntry = struct { k: compute.cuda.Buffer, v: compute.cuda.Buffer, capacity: usize };
+        const GdEntry = struct { conv: compute.cuda.Buffer, ssm: compute.cuda.Buffer, conv_ring_head: u32 };
+
+        kv: []KvEntry,
+        gd: []GdEntry,
+    };
 
     const SlotStateBinding = struct {
         handles: [max_state_bindings_per_slot]runtime_contract.StateBlockHandle = undefined,
@@ -2828,7 +2842,11 @@ pub const CudaBackend = struct {
             .norm_eps = prototype_eps,
             .cpu_rope_global = null,
             .cpu_rope_local = null,
-            .slot_logits = undefined,
+            .slot_in_use = &.{},
+            .slot_positions = &.{},
+            .slot_rope_position_deltas = &.{},
+            .slot_logits = &.{},
+            .slot_kv_states = &.{},
             .state_descriptors_storage = undefined,
             .state_descriptor_count = 0,
             .slot_state_bindings = &.{},
@@ -2882,7 +2900,16 @@ pub const CudaBackend = struct {
         }
         backend.kernel_registry = compute.cuda.Registry.init(allocator, &backend.device);
         errdefer backend.kernel_registry.deinit();
-        backend.slot_logits = try allocator.alloc(f32, backend.vocab_size);
+        backend.slot_in_use = try allocator.alloc(bool, backend.max_batch_size);
+        errdefer allocator.free(backend.slot_in_use);
+        @memset(backend.slot_in_use, false);
+        backend.slot_positions = try allocator.alloc(usize, backend.max_batch_size);
+        errdefer allocator.free(backend.slot_positions);
+        @memset(backend.slot_positions, 0);
+        backend.slot_rope_position_deltas = try allocator.alloc(isize, backend.max_batch_size);
+        errdefer allocator.free(backend.slot_rope_position_deltas);
+        @memset(backend.slot_rope_position_deltas, 0);
+        backend.slot_logits = try allocator.alloc(f32, backend.max_batch_size * backend.vocab_size);
         errdefer allocator.free(backend.slot_logits);
         backend.slot_state_bindings = try allocator.alloc(SlotStateBinding, backend.max_batch_size);
         errdefer allocator.free(backend.slot_state_bindings);
@@ -2892,6 +2919,8 @@ pub const CudaBackend = struct {
         backend.block_runtime = try BlockRuntime.init(allocator, &backend.device, loaded);
         errdefer backend.block_runtime.deinit(allocator, &backend.device);
         backend.assignCpuRuntimeRopeToAttentionFallbacks();
+        try backend.initSlotKvStates();
+        errdefer backend.deinitSlotKvStates();
         for (backend.block_runtime.blocks) |*layer| {
             if (layer.compiled_plan) |*compiled_plan| {
                 try runtime_contract.appendUniquePlanStateDescriptors(
@@ -3087,6 +3116,10 @@ pub const CudaBackend = struct {
             self.allocator.destroy(rope);
         }
         self.allocator.free(self.slot_logits);
+        if (self.slot_in_use.len > 0) self.allocator.free(self.slot_in_use);
+        if (self.slot_positions.len > 0) self.allocator.free(self.slot_positions);
+        if (self.slot_rope_position_deltas.len > 0) self.allocator.free(self.slot_rope_position_deltas);
+        self.deinitSlotKvStates();
         self.deinitLayerProgramSlotBuffers();
         self.block_runtime.deinit(self.allocator, &self.device);
         self.runtime_buffers.deinit(self.allocator, &self.device);
@@ -3107,6 +3140,137 @@ pub const CudaBackend = struct {
 
     pub fn maxBatchSize(self: *const CudaBackend) usize {
         return self.max_batch_size;
+    }
+
+    /// Returns a per-slot logits slice for the given slot index.
+    pub fn slotLogits(self: *CudaBackend, slot_index: usize) []f32 {
+        const offset = slot_index * self.vocab_size;
+        return self.slot_logits[offset .. offset + self.vocab_size];
+    }
+
+    /// Initialize per-slot KV and gated delta state buffers.
+    /// Called after block_runtime is initialized.
+    fn initSlotKvStates(self: *CudaBackend) !void {
+        const n_attn = self.block_runtime.attention_block_count;
+        const n_gd = self.block_runtime.gated_delta_block_count;
+        self.slot_kv_states = try self.allocator.alloc(SlotKvStates, self.max_batch_size);
+        errdefer self.allocator.free(self.slot_kv_states);
+        var initialized_slots: usize = 0;
+        errdefer {
+            for (self.slot_kv_states[0..initialized_slots]) |*sks| {
+                for (sks.kv) |*kv| {
+                    kv.k.deinit(&self.device);
+                    kv.v.deinit(&self.device);
+                }
+                self.allocator.free(sks.kv);
+                for (sks.gd) |*gd| {
+                    gd.conv.deinit(&self.device);
+                    gd.ssm.deinit(&self.device);
+                }
+                self.allocator.free(sks.gd);
+            }
+        }
+        // Slot 0 takes the existing buffers from block_runtime.
+        // Slots 1..N-1 allocate fresh buffers.
+        for (self.slot_kv_states, 0..) |*sks, slot_idx| {
+            sks.kv = try self.allocator.alloc(SlotKvStates.KvEntry, n_attn);
+            sks.gd = try self.allocator.alloc(SlotKvStates.GdEntry, n_gd);
+            var attn_i: usize = 0;
+            var gd_i: usize = 0;
+            for (self.block_runtime.blocks) |*layer| {
+                if (layer.attention_binding) |block| {
+                    if (slot_idx == 0) {
+                        sks.kv[attn_i] = .{ .k = block.k_cache, .v = block.v_cache, .capacity = block.kv_capacity };
+                    } else {
+                        const elem_size: usize = if (block.k_cache.size > block.kv_capacity * block.kv_dim * @sizeOf(f32)) @sizeOf(u16) else @sizeOf(f32);
+                        const kv_bytes = std.math.mul(usize, block.kv_capacity, block.kv_dim * elem_size) catch return error.InvalidArgument;
+                        var k = try self.device.allocBuffer(kv_bytes);
+                        errdefer k.deinit(&self.device);
+                        var v = try self.device.allocBuffer(kv_bytes);
+                        errdefer v.deinit(&self.device);
+                        sks.kv[attn_i] = .{ .k = k, .v = v, .capacity = block.kv_capacity };
+                    }
+                    attn_i += 1;
+                }
+                if (layer.gated_delta_binding) |block| {
+                    if (slot_idx == 0) {
+                        sks.gd[gd_i] = .{ .conv = block.conv_state_dev, .ssm = block.ssm_state_dev, .conv_ring_head = block.conv_ring_head };
+                    } else {
+                        var conv = try self.device.allocBuffer(block.conv_state_dev.size);
+                        errdefer conv.deinit(&self.device);
+                        var ssm = try self.device.allocBuffer(block.ssm_state_dev.size);
+                        errdefer ssm.deinit(&self.device);
+                        sks.gd[gd_i] = .{ .conv = conv, .ssm = ssm, .conv_ring_head = 0 };
+                    }
+                    gd_i += 1;
+                }
+            }
+            initialized_slots += 1;
+        }
+    }
+
+    fn deinitSlotKvStates(self: *CudaBackend) void {
+        // Slot 0's buffers are owned by block_runtime — skip them.
+        for (self.slot_kv_states, 0..) |*sks, slot_idx| {
+            if (slot_idx > 0) {
+                for (sks.kv) |*kv| {
+                    kv.k.deinit(&self.device);
+                    kv.v.deinit(&self.device);
+                }
+                for (sks.gd) |*gd| {
+                    gd.conv.deinit(&self.device);
+                    gd.ssm.deinit(&self.device);
+                }
+            }
+            self.allocator.free(sks.kv);
+            self.allocator.free(sks.gd);
+        }
+        if (self.slot_kv_states.len > 0) self.allocator.free(self.slot_kv_states);
+    }
+
+    /// Swap the active slot's KV/state buffer pointers out of block_runtime
+    /// and load the target slot's buffers in.
+    fn activateKvSlot(self: *CudaBackend, slot_index: usize) void {
+        if (self.active_kv_slot == slot_index) return;
+        self.saveActiveKvSlot();
+        self.loadKvSlot(slot_index);
+        self.active_kv_slot = slot_index;
+    }
+
+    fn saveActiveKvSlot(self: *CudaBackend) void {
+        const sks = &self.slot_kv_states[self.active_kv_slot];
+        var attn_i: usize = 0;
+        var gd_i: usize = 0;
+        for (self.block_runtime.blocks) |*layer| {
+            if (layer.attention_binding) |block| {
+                sks.kv[attn_i] = .{ .k = block.k_cache, .v = block.v_cache, .capacity = block.kv_capacity };
+                attn_i += 1;
+            }
+            if (layer.gated_delta_binding) |block| {
+                sks.gd[gd_i] = .{ .conv = block.conv_state_dev, .ssm = block.ssm_state_dev, .conv_ring_head = block.conv_ring_head };
+                gd_i += 1;
+            }
+        }
+    }
+
+    fn loadKvSlot(self: *CudaBackend, slot_index: usize) void {
+        const sks = &self.slot_kv_states[slot_index];
+        var attn_i: usize = 0;
+        var gd_i: usize = 0;
+        for (self.block_runtime.blocks) |*layer| {
+            if (layer.attention_binding) |block| {
+                block.k_cache = sks.kv[attn_i].k;
+                block.v_cache = sks.kv[attn_i].v;
+                block.kv_capacity = sks.kv[attn_i].capacity;
+                attn_i += 1;
+            }
+            if (layer.gated_delta_binding) |block| {
+                block.conv_state_dev = sks.gd[gd_i].conv;
+                block.ssm_state_dev = sks.gd[gd_i].ssm;
+                block.conv_ring_head = sks.gd[gd_i].conv_ring_head;
+                gd_i += 1;
+            }
+        }
     }
 
     fn layerProgramRequiredSlotCount(self: *const CudaBackend) usize {
@@ -3284,10 +3448,11 @@ pub const CudaBackend = struct {
         candidate_ids_out: []u32,
     ) !usize {
         if (top_k == 0) return error.InvalidArgument;
-        if (!self.slot_in_use or !self.slotIndexSupported(slot_index)) return error.InvalidArgument;
+        if (!self.slot_in_use[slot_index] or !self.slotIndexSupported(slot_index)) return error.InvalidArgument;
         try self.ensureSlotStateBlocksBoundForScheduler(slot_index);
+        self.activateKvSlot(slot_index);
 
-        const effective_position = try common_mrope.applyPositionDelta(self.slot_position, self.slot_rope_position_delta);
+        const effective_position = try common_mrope.applyPositionDelta(self.slot_positions[slot_index], self.slot_rope_position_deltas[slot_index]);
         try self.computeGpuPrototypeLogitsWithLayerLimit(
             token,
             effective_position,
@@ -3298,7 +3463,7 @@ pub const CudaBackend = struct {
             false,
             true,
             1,
-            self.slot_position,
+            self.slot_positions[slot_index],
             null,
             null,
             null,
@@ -3354,7 +3519,7 @@ pub const CudaBackend = struct {
         }
         const selected = k;
 
-        self.slot_position += 1;
+        self.slot_positions[slot_index] += 1;
         return selected;
     }
 
@@ -3526,11 +3691,11 @@ pub const CudaBackend = struct {
             });
             return error.InvalidArgument;
         }
-        if (!self.slot_in_use or !self.slotIndexSupported(slot_index)) {
+        if (!self.slot_in_use[slot_index] or !self.slotIndexSupported(slot_index)) {
             log.warn("inference", "CUDA prefillSlotWithVision invalid args", .{
                 .reason = "slot_state",
                 .slot_index = slot_index,
-                .slot_in_use = @as(u8, @intFromBool(self.slot_in_use)),
+                .slot_in_use = @as(u8, @intFromBool(self.slot_in_use[slot_index])),
             });
             return error.InvalidArgument;
         }
@@ -3579,7 +3744,8 @@ pub const CudaBackend = struct {
             }
         }
 
-        self.slot_rope_position_delta = 0;
+        self.slot_rope_position_deltas[slot_index] = 0;
+        self.activateKvSlot(slot_index);
         self.beginPrefillDispatchWindow();
         const prefill_start_ns: i128 = std.time.nanoTimestamp();
         try self.ensureKvCapacity(tokens.len);
@@ -3633,7 +3799,7 @@ pub const CudaBackend = struct {
                 tokens[i],
                 i,
                 slot_index,
-                if (download_logits) self.slot_logits else null,
+                if (download_logits) self.slotLogits(slot_index) else null,
                 self.block_runtime.blocks.len,
                 download_logits,
                 download_logits,
@@ -3658,8 +3824,8 @@ pub const CudaBackend = struct {
 
         const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
         self.logPrefillTimingImpl("prefill_slot_vision", tokens.len, prefill_elapsed_ns);
-        @memcpy(logits_out, self.slot_logits);
-        self.slot_position = tokens.len;
+        @memcpy(logits_out, self.slotLogits(slot_index));
+        self.slot_positions[slot_index] = tokens.len;
     }
 
     fn linearWeightSupportsSequenceRows(self: *const CudaBackend, weight: *const LinearWeight) bool {
@@ -4005,6 +4171,7 @@ pub const CudaBackend = struct {
                 rope_store_f16_function,
                 shortconv_step_function,
                 attention_kernels,
+                null,
             );
             // Deepstack: per-request feature vector addition between layer program
             // dispatches. Operates outside the per-instruction adapter table — same
@@ -4160,6 +4327,256 @@ pub const CudaBackend = struct {
                     1,
                     null,
                 );
+            }
+        }
+    }
+
+    /// Batched decode: process N tokens at different positions/slots together.
+    /// Uses GEMM (not GEMV) for layer projections, sharing weight reads
+    /// across sequences for ~Nx throughput.
+    pub fn computeBatchedDecodeLogits(
+        self: *CudaBackend,
+        tokens: []const u32,
+        slot_indices: []const usize,
+        positions: []const usize,
+    ) !void {
+        const n_usize = tokens.len;
+        if (n_usize == 0) return;
+        if (n_usize > self.max_batch_size) return error.InvalidArgument;
+        const n: u32 = @intCast(n_usize);
+        const previous_launch_phase = self.device.setLaunchPhase(.decode);
+        defer _ = self.device.setLaunchPhase(previous_launch_phase);
+
+        // Validate all slots and positions.
+        for (slot_indices) |slot_idx| {
+            if (!self.slotIndexSupported(slot_idx)) return error.InvalidArgument;
+        }
+        for (positions) |pos| {
+            if (pos >= self.max_seq_len) return error.InvalidArgument;
+        }
+
+        // Ensure scratch buffers fit N rows.
+        try self.runtime_buffers.ensureRowCapacity(&self.device, n_usize);
+        try self.ensureLayerProgramSlotRowCapacity(n_usize);
+
+        // Ensure KV capacity for each slot via activate/ensure/save.
+        for (0..n_usize) |i| {
+            self.activateKvSlot(slot_indices[i]);
+            try self.ensureKvCapacity(positions[i] + 1);
+        }
+        self.saveActiveKvSlot();
+
+        // Extract kernel functions (same set as single-token path).
+        const shortconv_step_function = self.shortconv_step_function orelse return error.CudaKernelUnavailable;
+        const copy_function = self.copy_function orelse return error.CudaKernelUnavailable;
+        const cast_f32_to_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
+        else
+            null;
+        const kv_write_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            self.kv_write_f16_function
+        else
+            null;
+        const rope_store_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            self.rope_store_f16_function
+        else
+            null;
+        const rope_function = self.rope_function orelse return error.CudaKernelUnavailable;
+        const attn_scores_heads_f32_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            null
+        else
+            (self.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable);
+        const attn_scores_heads_f16_kv_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            (self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
+        else
+            null;
+        const attn_fused_heads_f16_kv_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            self.attn_fused_heads_f16_kv_function
+        else
+            null;
+        const softmax_rows_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            (self.softmax_rows_function orelse return error.CudaKernelUnavailable)
+        else
+            self.softmax_rows_function;
+        const attn_weighted_sum_heads_f32_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            null
+        else
+            (self.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable);
+        const attn_weighted_sum_heads_f16_kv_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            (self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
+        else
+            null;
+        const d_model_u32: u32 = @intCast(self.d_model);
+        const head_dim_u32: u32 = @intCast(self.head_dim);
+        const rope_dim_u32: u32 = @intCast(self.rope_dim);
+        const n_heads_u32: u32 = @intCast(self.n_heads);
+        const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
+        const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+        const global_rope_theta: f32 = if (self.loaded.config.rope_theta > 1.0) self.loaded.config.rope_theta else 10000.0;
+        const local_rope_theta: f32 = if (self.loaded.config.rope_local_theta > 1.0 and self.loaded.config.sliding_window > 0)
+            self.loaded.config.rope_local_theta
+        else
+            global_rope_theta;
+        const attention_kernels = AttentionKernelSet{
+            .attn_scores_heads_f32_function = attn_scores_heads_f32_function,
+            .attn_weighted_sum_heads_f32_function = attn_weighted_sum_heads_f32_function,
+            .attn_scores_heads_f16_kv_function = attn_scores_heads_f16_kv_function,
+            .softmax_rows_function = softmax_rows_function,
+            .attn_weighted_sum_heads_f16_kv_function = attn_weighted_sum_heads_f16_kv_function,
+            .attn_fused_heads_f16_kv_function = attn_fused_heads_f16_kv_function,
+            .attn_fused_prefill_heads_f16_kv_function = null,
+        };
+
+        // Embedding lookup: N tokens → N rows of input_dev.
+        const embedding_lookup_f32_function = self.embedding_lookup_f32_function;
+        const embedding_lookup_u16_function = self.embedding_lookup_u16_function;
+        const embedding_lookup_gaffine_u4_function = self.embedding_lookup_gaffine_u4_function;
+        for (0..n_usize) |i| {
+            var input_row = try bufferSlice(&self.runtime_buffers.input_dev, i * row_bytes, row_bytes);
+            var used_device_lookup = false;
+            if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
+                const lookup = &self.runtime_buffers.embedding_lookup.?;
+                switch (lookup.kind) {
+                    .f32 => {
+                        if (embedding_lookup_f32_function) |kernel| {
+                            try compute.cuda.embedding_lookup_f32.runWithFunction(
+                                &self.kernel_arg_pack, &self.device, kernel,
+                                &input_row, &lookup.buffer,
+                                lookup.dim0, lookup.dim1, lookup.hidden_dim,
+                                tokens[i], lookup.layout_tag, lookup.multiplier,
+                            );
+                            used_device_lookup = true;
+                        }
+                    },
+                    .f16 => {
+                        if (embedding_lookup_u16_function) |kernel| {
+                            try compute.cuda.embedding_lookup_u16.runWithFunction(
+                                &self.kernel_arg_pack, &self.device, kernel,
+                                &input_row, &lookup.buffer,
+                                lookup.dim0, lookup.dim1, lookup.hidden_dim,
+                                tokens[i], lookup.layout_tag,
+                                compute.cuda.embedding_lookup_u16.dtype_f16, lookup.multiplier,
+                            );
+                            used_device_lookup = true;
+                        }
+                    },
+                    .bf16 => {
+                        if (embedding_lookup_u16_function) |kernel| {
+                            try compute.cuda.embedding_lookup_u16.runWithFunction(
+                                &self.kernel_arg_pack, &self.device, kernel,
+                                &input_row, &lookup.buffer,
+                                lookup.dim0, lookup.dim1, lookup.hidden_dim,
+                                tokens[i], lookup.layout_tag,
+                                compute.cuda.embedding_lookup_u16.dtype_bf16, lookup.multiplier,
+                            );
+                            used_device_lookup = true;
+                        }
+                    },
+                    .gaffine_u4 => {
+                        if (embedding_lookup_gaffine_u4_function) |kernel| {
+                            if (lookup.scales) |*scales_buf| {
+                                if (lookup.biases) |*biases_buf| {
+                                    try compute.cuda.embedding_lookup_gaffine_u4.runWithFunction(
+                                        &self.kernel_arg_pack, &self.device, kernel,
+                                        &input_row, &lookup.buffer,
+                                        scales_buf, biases_buf,
+                                        lookup.dim0, lookup.hidden_dim,
+                                        tokens[i], lookup.group_size,
+                                        lookup.scales_dtype_tag, lookup.multiplier,
+                                    );
+                                    used_device_lookup = true;
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+            if (!used_device_lookup) {
+                const used_model = tryPopulateHiddenFromToken(self.loaded, tokens[i], self.runtime_buffers.hidden_host) catch |err| switch (err) {
+                    error.InvalidArgument => return error.InvalidArgument,
+                    else => return err,
+                };
+                if (!used_model) return error.UnsupportedModel;
+                if (self.loaded.config.embedding_multiplier != 1.0) {
+                    for (self.runtime_buffers.hidden_host) |*v| {
+                        v.* *= self.loaded.config.embedding_multiplier;
+                    }
+                }
+                try input_row.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
+            }
+        }
+
+        // Build BatchDecodeInfo with per-row seq_lens.
+        const seq_lens = try self.allocator.alloc(u32, n_usize);
+        defer self.allocator.free(seq_lens);
+        for (0..n_usize) |i| {
+            seq_lens[i] = @intCast(positions[i] + 1);
+        }
+        var batch_info = BatchDecodeInfo{
+            .slot_indices = slot_indices,
+            .positions = positions,
+            .seq_lens = seq_lens,
+            .attn_layer_index = 0,
+            .gd_layer_index = 0,
+        };
+
+        // Layer loop with N active rows and batch_info.
+        var final_hidden = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
+        const layer_limit = self.block_runtime.blocks.len;
+        for (0..layer_limit) |layer_idx| {
+            const layer = &self.block_runtime.blocks[layer_idx];
+            final_hidden = try self.tryExecuteLayerProgram(
+                layer, 0, layer_idx,
+                d_model_u32, head_dim_u32, rope_dim_u32,
+                n_heads_u32, n_kv_heads_u32,
+                n, // active_rows_u32
+                1, 1, 0, 0, 0,
+                global_rope_theta, local_rope_theta,
+                rope_function, copy_function,
+                cast_f32_to_f16_function,
+                kv_write_f16_function,
+                rope_store_f16_function,
+                shortconv_step_function,
+                attention_kernels,
+                &batch_info,
+            );
+            // Advance state layer indices for the type of mixer this layer used.
+            if (layer.attention_binding != null) {
+                batch_info.attn_layer_index += 1;
+            }
+            if (layer.gated_delta_binding != null) {
+                batch_info.gd_layer_index += 1;
+            }
+        }
+
+        // Final norm for all N rows.
+        const norm_out_bytes = n_usize * self.d_model * @sizeOf(f32);
+        var norm_out = try bufferSlice(&self.runtime_buffers.norm_out_dev, 0, norm_out_bytes);
+        try compute.cuda.rmsnorm.runWithFunction(
+            &self.kernel_arg_pack, &self.device,
+            self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+            &final_hidden, &self.runtime_buffers.norm_weight_dev, &norm_out,
+            n, d_model_u32, self.norm_eps,
+            self.loaded.runtime.weight_offset,
+        );
+
+        // LM head + download per row (logits_dev is sized for 1 row).
+        const vocab = self.runtime_buffers.projected_vocab;
+        for (0..n_usize) |i| {
+            var norm_row = try logicalF32RowSlice(&norm_out, n_usize, i, self.d_model);
+            try self.linearForwardRows(&norm_row, 1, &self.runtime_buffers.projection_weight, &self.runtime_buffers.logits_dev);
+            try self.runtime_buffers.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host));
+            const slot_logits = self.slotLogits(slot_indices[i]);
+            if (vocab == slot_logits.len) {
+                @memcpy(slot_logits, self.runtime_buffers.projected_logits_host);
+            } else {
+                @memset(slot_logits, -1.0e9);
+                @memcpy(slot_logits[0..vocab], self.runtime_buffers.projected_logits_host);
+            }
+            if (self.loaded.config.logits_scaling != 1.0) {
+                for (slot_logits) |*v| {
+                    v.* /= self.loaded.config.logits_scaling;
+                }
             }
         }
     }
@@ -4411,6 +4828,7 @@ pub const CudaBackend = struct {
                 if (kv_cache_dtype_fp16) self.rope_store_f16_function else null,
                 self.shortconv_step_function orelse return error.CudaKernelUnavailable,
                 attention_kernels,
+                null,
             );
         }
 
@@ -6094,6 +6512,177 @@ pub const CudaBackend = struct {
         };
     }
 
+    /// Batched decode attention: QKV GEMM for N rows, per-row RoPE + KV write + attention,
+    /// then O GEMM for N rows. Each row uses its own slot's KV cache.
+    fn runBatchedDecodeAttentionMixer(
+        self: *CudaBackend,
+        cfg: *const LayerAttentionExecConfig,
+        q_proj: *const LinearWeight,
+        k_proj: *const LinearWeight,
+        v_proj: *const LinearWeight,
+        o_proj: *const LinearWeight,
+        q_norm_weight: ?*const DeviceTensor,
+        k_norm_weight: ?*const DeviceTensor,
+        input: *const compute.cuda.Buffer,
+        output: *compute.cuda.Buffer,
+        ctx: *LayerProgramExecutionContext,
+        batch: *const BatchDecodeInfo,
+    ) !void {
+        const n_rows = ctx.active_rows_u32;
+        const n: usize = @intCast(n_rows);
+        const layer_rope_theta = if (cfg.sliding_window > 0) ctx.local_rope_theta else ctx.global_rope_theta;
+        const q_stage_bytes = n * cfg.q_projection_dim * @sizeOf(f32);
+        const q_values_bytes = n * cfg.q_dim * @sizeOf(f32);
+        const kv_stage_bytes = n * cfg.kv_dim * @sizeOf(f32);
+        const context_stage_bytes = n * o_proj.rows() * @sizeOf(f32);
+        var q_projection_stage = if (cfg.query_gate)
+            try bufferSlice(&self.runtime_buffers.query_gate_proj_dev, 0, q_stage_bytes)
+        else
+            try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, q_stage_bytes);
+        var attn_q_stage = q_projection_stage;
+        var q_values_stage = try bufferSlice(&self.runtime_buffers.attn_q_dev, 0, q_values_bytes);
+        var attn_k_stage = try bufferSlice(&self.runtime_buffers.attn_k_dev, 0, kv_stage_bytes);
+        var attn_v_stage = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, kv_stage_bytes);
+        var attn_context_stage = try bufferSlice(&self.runtime_buffers.attn_context_dev, 0, context_stage_bytes);
+
+        // Step 1: QKV GEMM for all N rows.
+        _ = try self.runQkvProjection(input, q_proj, k_proj, v_proj, n, &q_projection_stage);
+        if (cfg.query_gate) {
+            try self.compactQueryGateProjection(n, cfg.q_dim, cfg.q_projection_dim, &q_projection_stage, &q_values_stage);
+            attn_q_stage = q_values_stage;
+        }
+
+        // Step 2: Q/K norms for all N rows (position-independent).
+        if (q_norm_weight) |q_norm_value| {
+            const q_norm_rows = @as(u32, @intCast(n)) * ctx.n_heads_u32;
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack, &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                &attn_q_stage, &q_norm_value.buffer, &attn_q_stage,
+                q_norm_rows, ctx.head_dim_u32, self.norm_eps,
+                self.loaded.runtime.qk_norm_weight_offset,
+            );
+        }
+        if (k_norm_weight) |k_norm_value| {
+            const k_norm_rows = @as(u32, @intCast(n)) * ctx.n_kv_heads_u32;
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack, &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                &attn_k_stage, &k_norm_value.buffer, &attn_k_stage,
+                k_norm_rows, ctx.head_dim_u32, self.norm_eps,
+                self.loaded.runtime.qk_norm_weight_offset,
+            );
+        }
+
+        // Step 3: Per-row RoPE, KV write, and attention.
+        const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
+        const kv_row_bytes = cfg.kv_dim * kv_elem_bytes;
+        const kv_groups: u32 = @intCast(self.n_heads / self.n_kv_heads);
+        const kv_dim_u32: u32 = @intCast(cfg.kv_dim);
+        const use_k_write_fused = kv_cache_dtype_fp16 and
+            (ctx.kv_write_f16_function != null or ctx.rope_store_f16_function != null);
+
+        for (0..n) |row_i| {
+            const slot_idx = batch.slot_indices[row_i];
+            const position = batch.positions[row_i];
+            const position_u32: u32 = @intCast(position);
+            const seq_len_u32 = batch.seq_lens[row_i];
+
+            // Get per-row Q, K, V slices.
+            var q_row = try logicalF32RowSlice(&attn_q_stage, n, row_i, cfg.q_dim);
+            var k_row_stage = try logicalF32RowSlice(&attn_k_stage, n, row_i, cfg.kv_dim);
+            var v_row_stage = try logicalF32RowSlice(&attn_v_stage, n, row_i, cfg.kv_dim);
+            var context_row = try logicalF32RowSlice(&attn_context_stage, n, row_i, o_proj.rows());
+
+            // RoPE on Q (per-row position).
+            const use_fused_attention_heads_f16_kv = (!cfg.query_gate) and attention_mod.useFusedHeadsF16Kv(
+                attention_policy_config, seq_len_u32, cfg.sliding_window, cfg.is_causal,
+                ctx.head_dim_u32, ctx.attention_kernels.attn_fused_heads_f16_kv_function != null,
+            );
+            if (!use_fused_attention_heads_f16_kv) {
+                try compute.cuda.rope.runWithFunction(
+                    &self.kernel_arg_pack, &self.device, ctx.rope_function,
+                    &q_row, ctx.n_heads_u32, ctx.head_dim_u32, ctx.rope_dim_u32,
+                    position_u32, layer_rope_theta,
+                );
+            }
+
+            // RoPE on K (per-row position).
+            if (!use_k_write_fused) {
+                try compute.cuda.rope.runWithFunction(
+                    &self.kernel_arg_pack, &self.device, ctx.rope_function,
+                    &k_row_stage, ctx.n_kv_heads_u32, ctx.head_dim_u32, ctx.rope_dim_u32,
+                    position_u32, layer_rope_theta,
+                );
+            }
+
+            // KV cache write for this slot.
+            const kv_entry = self.slot_kv_states[slot_idx].kv[batch.attn_layer_index];
+            const kv_offset = position * kv_row_bytes;
+            var k_cache_row = try bufferSlice(&kv_entry.k, kv_offset, kv_row_bytes);
+            var v_cache_row = try bufferSlice(&kv_entry.v, kv_offset, kv_row_bytes);
+            if (kv_cache_dtype_fp16) {
+                if (ctx.kv_write_f16_function) |kv_write_f16| {
+                    try compute.cuda.kv_write_f16.runWithFunction(
+                        &self.kernel_arg_pack, &self.device, kv_write_f16,
+                        &k_row_stage, &v_row_stage, &k_cache_row, &v_cache_row,
+                        ctx.n_kv_heads_u32, ctx.head_dim_u32, ctx.rope_dim_u32,
+                        position_u32, layer_rope_theta,
+                    );
+                } else if (ctx.rope_store_f16_function) |rope_store_f16| {
+                    try compute.cuda.rope_store_f16.runWithFunction(
+                        &self.kernel_arg_pack, &self.device, rope_store_f16,
+                        &k_row_stage, &k_cache_row,
+                        ctx.n_kv_heads_u32, ctx.head_dim_u32, ctx.rope_dim_u32,
+                        position_u32, layer_rope_theta,
+                    );
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack, &self.device,
+                        ctx.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                        &v_row_stage, &v_cache_row, @intCast(cfg.kv_dim),
+                    );
+                } else {
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack, &self.device,
+                        ctx.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                        &k_row_stage, &k_cache_row, @intCast(cfg.kv_dim),
+                    );
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack, &self.device,
+                        ctx.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                        &v_row_stage, &v_cache_row, @intCast(cfg.kv_dim),
+                    );
+                }
+            } else {
+                try compute.cuda.copy.runWithFunction(
+                    &self.kernel_arg_pack, &self.device, ctx.copy_function,
+                    &k_row_stage, &k_cache_row, @intCast(cfg.kv_dim),
+                );
+                try compute.cuda.copy.runWithFunction(
+                    &self.kernel_arg_pack, &self.device, ctx.copy_function,
+                    &v_row_stage, &v_cache_row, @intCast(cfg.kv_dim),
+                );
+            }
+
+            // Attention computation for this row.
+            _ = try self.runAttentionContext(
+                cfg, &q_row, &context_row,
+                &kv_entry.k, &kv_entry.v,
+                ctx.attention_kernels, seq_len_u32,
+                ctx.head_dim_u32, kv_dim_u32, kv_groups,
+                ctx.rope_dim_u32, position_u32, layer_rope_theta,
+            );
+        }
+
+        // Step 4: Query gate output (if applicable).
+        if (cfg.query_gate) {
+            try self.applyQueryGateToContextInPlace(n, cfg.q_dim, cfg.q_projection_dim);
+        }
+
+        // Step 5: O projection GEMM for all N rows.
+        try self.linearForwardRows(&attn_context_stage, n, o_proj, output);
+    }
+
     fn runShortConvMixerStep(
         self: *CudaBackend,
         cfg: *const ShortConvExecConfig,
@@ -6575,6 +7164,172 @@ pub const CudaBackend = struct {
         }
     }
 
+    /// Batched decode path for gated delta layers: N slots × 1 token each.
+    /// in_proj and out_proj use GEMM for N rows; conv/SSM/norm run per-row
+    /// with per-slot state from slot_kv_states.
+    fn runBatchedDecodeGatedDeltaMixer(
+        self: *CudaBackend,
+        block: *GatedDeltaBlockRuntime,
+        input: *const compute.cuda.Buffer,
+        output: *compute.cuda.Buffer,
+        ctx: *LayerProgramExecutionContext,
+        batch: *const BatchDecodeInfo,
+    ) !void {
+        const n_rows = ctx.active_rows_u32;
+        const n: usize = @intCast(n_rows);
+        const cfg = block.kernel.config;
+        const d_inner: usize = @as(usize, cfg.n_heads) * @as(usize, cfg.d_head);
+        const d_conv: usize = cfg.d_conv;
+        const n_v_heads: usize = cfg.n_heads;
+        const d_head: usize = cfg.d_head;
+        const proj_len = block.in_proj.cols();
+        const qkv_len = blk: {
+            const values = block.kernel.weights.conv1d_weight.asSlice(f32);
+            if (values.len == 0 or d_conv == 0 or (values.len % d_conv) != 0) return error.InvalidShape;
+            break :blk values.len / d_conv;
+        };
+        const minimum_proj = d_inner + (2 * n_v_heads);
+        if (proj_len <= minimum_proj) return error.InvalidShape;
+
+        // Buffer sizes for N rows.
+        const proj_element_count = std.math.mul(usize, n, proj_len) catch return error.InvalidArgument;
+        const proj_bytes = std.math.mul(usize, proj_element_count, @sizeOf(f32)) catch return error.InvalidArgument;
+        const ssm_bytes = std.math.mul(usize, d_inner, @sizeOf(f32)) catch return error.InvalidArgument;
+        const norm_total_bytes = std.math.mul(usize, n * d_inner, @sizeOf(f32)) catch return error.InvalidArgument;
+
+        var proj_dev = try bufferSlice(&self.runtime_buffers.gdelta_proj_dev, 0, proj_bytes);
+        var norm_stage_dev = try bufferSlice(&self.runtime_buffers.gdelta_ssm_dev, 0, norm_total_bytes);
+
+        // Step 1: in_proj GEMM for all N rows.
+        try self.linearForwardRows(input, n, &block.in_proj, &proj_dev);
+
+        // QKV shape validation.
+        if (qkv_len <= d_inner) return error.InvalidShape;
+        const qk_total = qkv_len - d_inner;
+        if ((qk_total % 2) != 0) return error.InvalidShape;
+        const qk_inner = qk_total / 2;
+        if ((qk_inner % d_head) != 0) return error.InvalidShape;
+        const n_qk_heads = qk_inner / d_head;
+        if (n_qk_heads == 0 or (n_v_heads % n_qk_heads) != 0) return error.InvalidShape;
+
+        const qkv_bytes = std.math.mul(usize, qkv_len, @sizeOf(f32)) catch return error.InvalidArgument;
+        const z_bytes = std.math.mul(usize, d_inner, @sizeOf(f32)) catch return error.InvalidArgument;
+        const beta_bytes = std.math.mul(usize, n_v_heads, @sizeOf(f32)) catch return error.InvalidArgument;
+        const a_bytes = beta_bytes;
+        const use_token_conv_silu = self.gated_delta_conv_silu_function != null;
+        const head_bytes = std.math.mul(usize, d_head, @sizeOf(f32)) catch return error.InvalidArgument;
+        const fused_norm_gate_supported = self.gated_delta_rmsnorm_silu_mul_function != null and
+            ((block.norm_weight.buffer.size == head_bytes) or (block.norm_weight.buffer.size == ssm_bytes));
+        const rows_norm_weight_stride: u32 = if (block.norm_weight.buffer.size == head_bytes)
+            0
+        else
+            @intCast(d_head);
+
+        // Step 2: Per-row conv + SSM + norm/gate with per-slot state.
+        for (0..n) |row_i| {
+            const slot_idx = batch.slot_indices[row_i];
+            var gd_state = &self.slot_kv_states[slot_idx].gd[batch.gd_layer_index];
+
+            var proj_row_dev = try logicalF32RowSlice(&proj_dev, n, row_i, proj_len);
+            var qkv_dev = try bufferSlice(&proj_row_dev, 0, qkv_bytes);
+
+            // Conv + SiLU with this slot's conv state.
+            if (use_token_conv_silu) {
+                try compute.cuda.gated_delta_conv_silu.runWithFunction(
+                    &self.kernel_arg_pack, &self.device,
+                    self.gated_delta_conv_silu_function.?,
+                    &qkv_dev, &gd_state.conv,
+                    &block.conv_weight_time_major.buffer,
+                    if (block.conv_bias) |*bias| &bias.buffer else null,
+                    &qkv_dev, @intCast(qkv_len), @intCast(d_conv),
+                    gd_state.conv_ring_head,
+                );
+            } else {
+                try compute.cuda.gated_delta_conv.runWithFunction(
+                    &self.kernel_arg_pack, &self.device,
+                    self.gated_delta_conv_function orelse return error.CudaKernelUnavailable,
+                    &qkv_dev, &gd_state.conv,
+                    &block.conv_weight_time_major.buffer,
+                    if (block.conv_bias) |*bias| &bias.buffer else null,
+                    &qkv_dev, @intCast(qkv_len), @intCast(d_conv),
+                    gd_state.conv_ring_head,
+                );
+                try compute.cuda.silu.runWithFunction(
+                    &self.kernel_arg_pack, &self.device,
+                    self.silu_function orelse return error.CudaKernelUnavailable,
+                    &qkv_dev, &qkv_dev, @intCast(qkv_len),
+                );
+            }
+            gd_state.conv_ring_head = if (gd_state.conv_ring_head + 1 >= @as(u32, @intCast(d_conv)))
+                0
+            else
+                gd_state.conv_ring_head + 1;
+
+            // SSM with this slot's SSM state.
+            var z_dev = try bufferSlice(&proj_row_dev, qkv_bytes, z_bytes);
+            var beta_dev = try bufferSlice(&proj_row_dev, qkv_bytes + z_bytes, beta_bytes);
+            var a_dev = try bufferSlice(&proj_row_dev, qkv_bytes + z_bytes + beta_bytes, a_bytes);
+            const norm_offset = std.math.mul(usize, row_i, ssm_bytes) catch return error.InvalidArgument;
+            var norm_dev = try bufferSlice(&norm_stage_dev, norm_offset, ssm_bytes);
+
+            try compute.cuda.gated_delta_ssm.runWithFunction(
+                &self.kernel_arg_pack, &self.device,
+                self.gated_delta_ssm_function orelse return error.CudaKernelUnavailable,
+                &qkv_dev, &beta_dev, &a_dev,
+                &block.a_log.buffer,
+                if (block.dt_bias) |*bias| &bias.buffer else null,
+                &gd_state.ssm,
+                &norm_dev,
+                @intCast(n_qk_heads), @intCast(n_v_heads), @intCast(d_head),
+            );
+
+            // Norm + gate for this row.
+            if (fused_norm_gate_supported) {
+                try compute.cuda.gated_delta_rmsnorm_silu_mul.runWithFunction(
+                    &self.kernel_arg_pack, &self.device,
+                    self.gated_delta_rmsnorm_silu_mul_function.?,
+                    &norm_dev, &z_dev,
+                    &block.norm_weight.buffer,
+                    &norm_dev,
+                    @intCast(n_v_heads), @intCast(d_head),
+                    1.0e-6, rows_norm_weight_stride,
+                );
+            } else {
+                if (block.norm_weight.buffer.size == head_bytes) {
+                    try compute.cuda.rmsnorm.runWithFunction(
+                        &self.kernel_arg_pack, &self.device,
+                        self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                        &norm_dev, &block.norm_weight.buffer, &norm_dev,
+                        @intCast(n_v_heads), @intCast(d_head), 1.0e-6, 0.0,
+                    );
+                } else if (block.norm_weight.buffer.size == ssm_bytes) {
+                    for (0..n_v_heads) |head_idx| {
+                        const head_offset_bytes = std.math.mul(usize, head_idx * d_head, @sizeOf(f32)) catch return error.InvalidArgument;
+                        var norm_head_dev = try bufferSlice(&norm_dev, head_offset_bytes, head_bytes);
+                        var weight_head_dev = try bufferSlice(&block.norm_weight.buffer, head_offset_bytes, head_bytes);
+                        try compute.cuda.rmsnorm.runWithFunction(
+                            &self.kernel_arg_pack, &self.device,
+                            self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                            &norm_head_dev, &weight_head_dev, &norm_head_dev,
+                            1, @intCast(d_head), 1.0e-6, 0.0,
+                        );
+                    }
+                } else {
+                    return error.InvalidShape;
+                }
+                try compute.cuda.silu_mul.runWithFunction(
+                    &self.kernel_arg_pack, &self.device,
+                    self.silu_mul_function orelse return error.CudaKernelUnavailable,
+                    &z_dev, &norm_dev, &norm_dev,
+                    @intCast(d_inner),
+                );
+            }
+        }
+
+        // Step 3: out_proj GEMM for all N rows.
+        try self.linearForwardRows(&norm_stage_dev, n, &block.out_proj, output);
+    }
+
     fn runAttentionMixerStepCpu(
         self: *CudaBackend,
         block: *LayerAttentionRuntime,
@@ -6592,7 +7347,7 @@ pub const CudaBackend = struct {
         const output_host = self.gated_delta_stage_output_host[0..element_count];
         try self.device.synchronize();
         try self.downloadRowsF32StrideAware(input, seq_len, self.d_model, input_host);
-        kernel.position_delta = self.slot_rope_position_delta;
+        kernel.position_delta = self.slot_rope_position_deltas[self.active_kv_slot];
         var input_view = Tensor.view3DSlice(input_host, seq_len, self.d_model);
         var output_view = Tensor.view3DSlice(output_host, seq_len, self.d_model);
         const use_cache = attentionFallbackUsesCache(seq_len);
@@ -7266,6 +8021,16 @@ pub const CudaBackend = struct {
         }
     }
 
+    /// Per-row batch info for batched decode (N tokens at different positions/slots).
+    /// Null for single-token decode and prefill.
+    const BatchDecodeInfo = struct {
+        slot_indices: []const usize,
+        positions: []const usize,
+        seq_lens: []const u32,
+        attn_layer_index: usize,
+        gd_layer_index: usize,
+    };
+
     const LayerProgramExecutionContext = struct {
         backend: *CudaBackend,
         layer: *BlockRuntimeLayer,
@@ -7297,6 +8062,7 @@ pub const CudaBackend = struct {
         slot_buffers: []compute.cuda.Buffer,
         instruction_handles: []runtime_contract.TensorHandle,
         instruction_views: []runtime_contract.TensorViewDesc,
+        batch_info: ?*const BatchDecodeInfo = null,
     };
 
     const BuiltLayerProgramHandles = struct {
@@ -7959,6 +8725,15 @@ pub const CudaBackend = struct {
             return;
         }
 
+        // Batched decode: N tokens at different positions/slots, GEMM projections.
+        if (ctx.batch_info) |batch| {
+            try self.runBatchedDecodeAttentionMixer(
+                cfg, &q_proj, &k_proj, &v_proj, &o_proj,
+                q_norm_weight, k_norm_weight, input, output, ctx, batch,
+            );
+            return;
+        }
+
         // Provide concat I8 QKV cache for fused prefill GEMM.
         self.active_qkv_concat = if (attention_binding.qkv_i8_concat.pointer != 0)
             .{ .i8_buf = attention_binding.qkv_i8_concat, .scales_buf = attention_binding.qkv_scales_concat, .dims = attention_binding.qkv_concat_dims }
@@ -8129,6 +8904,13 @@ pub const CudaBackend = struct {
                 .d_model = self.d_model,
             });
             return error.InvalidInstructionBinding;
+        }
+        if (ctx.batch_info) |batch| {
+            try self.runBatchedDecodeGatedDeltaMixer(
+                binding, input, output, ctx, batch,
+            );
+            _ = layer;
+            return;
         }
         try self.runGatedDeltaMixerStep(
             binding,
@@ -8488,6 +9270,7 @@ pub const CudaBackend = struct {
         rope_store_f16_function: ?compute.cuda.Function,
         shortconv_step_function: compute.cuda.Function,
         attention_kernels: AttentionKernelSet,
+        batch_info: ?*const BatchDecodeInfo,
     ) !compute.cuda.Buffer {
         const prev_backend = trace.setBackendContext(.cuda);
         defer _ = trace.setBackendContext(prev_backend);
@@ -8547,6 +9330,7 @@ pub const CudaBackend = struct {
             .slot_buffers = slot_buffer_views,
             .instruction_handles = instruction_handles,
             .instruction_views = instruction_views,
+            .batch_info = batch_info,
         };
 
         for (compiled_plan.plan.instructions, 0..) |insn, op_index| {

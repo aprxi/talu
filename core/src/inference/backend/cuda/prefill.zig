@@ -33,7 +33,7 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
         return error.InvalidArgument;
     }
     if (tokens.len > self.max_seq_len) return error.InvalidArgument;
-    self.slot_rope_position_delta = 0;
+    self.slot_rope_position_deltas[0] = 0;
     try self.beginParityPrefillCapture(tokens.len);
     defer self.endParityPrefillCapture();
     const prefill_start_ns: i128 = std.time.nanoTimestamp();
@@ -41,7 +41,7 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     self.computeGpuPrototypePrefillLogitsWithLayerLimit(
         tokens,
         0,
-        self.slot_logits,
+        self.slotLogits(0),
         self.block_runtime.blocks.len,
     ) catch |err| {
         log.warn("inference", "CUDA prefill batched path failed", .{
@@ -52,7 +52,7 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     };
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
     self.logPrefillTimingImpl("prefill", tokens.len, prefill_elapsed_ns);
-    @memcpy(logits_out, self.slot_logits);
+    @memcpy(logits_out, self.slotLogits(0));
     trace.emitFinal(
         .logits_ready,
         0,
@@ -63,7 +63,7 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
         1,
         "cuda_logits_host",
     );
-    self.slot_position = tokens.len;
+    self.slot_positions[0] = tokens.len;
 }
 
 pub fn prefillSlot(
@@ -94,16 +94,19 @@ pub fn prefillSlot(
         });
         return error.InvalidArgument;
     }
-    if (!self.slot_in_use or !slotIndexSupported(self, slot_index)) {
+    if (!self.slot_in_use[slot_index] or !slotIndexSupported(self, slot_index)) {
         log.warn("inference", "CUDA prefillSlot invalid args", .{
             .reason = "slot_state",
             .slot_index = slot_index,
-            .slot_in_use = @as(u8, @intFromBool(self.slot_in_use)),
+            .slot_in_use = @as(u8, @intFromBool(self.slot_in_use[slot_index])),
         });
         return error.InvalidArgument;
     }
     if (tokens.len > self.max_seq_len) return error.InvalidArgument;
-    self.slot_rope_position_delta = 0;
+    self.slot_rope_position_deltas[slot_index] = 0;
+    if (comptime @hasDecl(SelfType, "activateKvSlot")) {
+        self.activateKvSlot(slot_index);
+    }
     try self.beginParityPrefillCapture(tokens.len);
     defer self.endParityPrefillCapture();
     const prefill_start_ns: i128 = std.time.nanoTimestamp();
@@ -111,7 +114,7 @@ pub fn prefillSlot(
     self.computeGpuPrototypePrefillLogitsWithLayerLimit(
         tokens,
         slot_index,
-        self.slot_logits,
+        self.slotLogits(slot_index),
         self.block_runtime.blocks.len,
     ) catch |err| {
         log.warn("inference", "CUDA prefillSlot batched path failed", .{
@@ -119,11 +122,17 @@ pub fn prefillSlot(
             .token_count = tokens.len,
             .reason = @errorName(err),
         });
+        if (comptime @hasDecl(SelfType, "saveActiveKvSlot")) {
+            self.saveActiveKvSlot();
+        }
         return err;
     };
+    if (comptime @hasDecl(SelfType, "saveActiveKvSlot")) {
+        self.saveActiveKvSlot();
+    }
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
     self.logPrefillTimingImpl("prefill_slot", tokens.len, prefill_elapsed_ns);
-    @memcpy(logits_out, self.slot_logits);
+    @memcpy(logits_out, self.slotLogits(slot_index));
     trace.emitFinal(
         .logits_ready,
         0,
@@ -134,7 +143,7 @@ pub fn prefillSlot(
         1,
         "cuda_logits_host",
     );
-    self.slot_position = tokens.len;
+    self.slot_positions[slot_index] = tokens.len;
 }
 
 const testing = std.testing;
@@ -143,14 +152,15 @@ const MockBackend = struct {
     const MockBlockRuntime = struct {
         blocks: [1]u8 = .{0},
     };
+    const max_batch_size: usize = 2;
 
     vocab_size: usize = 8,
     max_seq_len: usize = 64,
     block_runtime: MockBlockRuntime = .{},
-    slot_rope_position_delta: isize = 0,
-    slot_position: usize = 0,
-    slot_in_use: bool = true,
-    slot_logits_storage: [8]f32 = [_]f32{0.0} ** 8,
+    slot_rope_position_deltas: [max_batch_size]isize = .{ 0, 0 },
+    slot_positions: [max_batch_size]usize = .{ 0, 0 },
+    slot_in_use: [max_batch_size]bool = .{ true, false },
+    slot_logits_storage: [max_batch_size * 8]f32 = [_]f32{0.0} ** (max_batch_size * 8),
     slot_logits: []f32 = undefined,
     ensure_kv_capacity_calls: usize = 0,
     ensure_state_binding_calls: usize = 0,
@@ -163,6 +173,11 @@ const MockBackend = struct {
         var backend = MockBackend{};
         backend.slot_logits = backend.slot_logits_storage[0..];
         return backend;
+    }
+
+    fn slotLogits(self: *MockBackend, slot_index: usize) []f32 {
+        const offset = slot_index * self.vocab_size;
+        return self.slot_logits[offset .. offset + self.vocab_size];
     }
 
     fn ensureKvCapacity(self: *MockBackend, required_tokens: usize) !void {
@@ -220,7 +235,7 @@ test "prefill executes batched prefill path" {
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
     try testing.expectEqual(@as(usize, 1), backend.compute_calls);
-    try testing.expectEqual(tokens.len, backend.slot_position);
+    try testing.expectEqual(tokens.len, backend.slot_positions[0]);
 }
 
 test "prefillSlot executes batched prefill path" {
@@ -233,7 +248,7 @@ test "prefillSlot executes batched prefill path" {
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
     try testing.expectEqual(@as(usize, 1), backend.compute_calls);
-    try testing.expectEqual(tokens.len, backend.slot_position);
+    try testing.expectEqual(tokens.len, backend.slot_positions[0]);
 }
 
 test "prefill fails when slot state blocks are unbound" {

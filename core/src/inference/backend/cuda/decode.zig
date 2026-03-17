@@ -1,5 +1,6 @@
 //! Decode path entrypoints extracted from CUDA engine.
 
+const std = @import("std");
 const contract = @import("../contract.zig");
 const common_mrope = @import("../../vision_mrope.zig");
 const log = @import("../../../log.zig");
@@ -27,7 +28,7 @@ pub fn decode(self: anytype, token: u32, position: usize, logits_out: []f32) !vo
         });
         return error.InvalidArgument;
     }
-    const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_delta);
+    const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_deltas[0]);
     try self.computeGpuPrototypeLogits(token, effective_position, logits_out);
     trace.emitFinal(
         .logits_ready,
@@ -39,7 +40,7 @@ pub fn decode(self: anytype, token: u32, position: usize, logits_out: []f32) !vo
         1,
         "cuda_logits_host",
     );
-    self.slot_position = position + 1;
+    self.slot_positions[0] = position + 1;
 }
 
 pub fn decodeBatch(
@@ -59,58 +60,110 @@ pub fn decodeBatch(
         return error.InvalidArgument;
     }
     if (requests.len == 0) return;
-    if (requests.len > 1) {
-        log.warn("inference", "CUDA decodeBatch invalid args", .{
-            .reason = "batch_gt_one",
-            .requests = requests.len,
-        });
-        return error.InvalidArgument;
+
+    // Validate all slots upfront.
+    for (requests) |req| {
+        if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
+            try self.ensureSlotStateBlocksBoundForScheduler(req.slot_index);
+        }
+        if (!self.slot_in_use[req.slot_index] or !slotIndexSupported(self, req.slot_index)) {
+            log.warn("inference", "CUDA decodeBatch invalid args", .{
+                .reason = "slot_state",
+                .slot_index = req.slot_index,
+                .slot_in_use = @as(u8, @intFromBool(self.slot_in_use[req.slot_index])),
+            });
+            return error.InvalidArgument;
+        }
     }
 
-    const req = requests[0];
-    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
-        try self.ensureSlotStateBlocksBoundForScheduler(req.slot_index);
+    // Batched path: N > 1 with GEMM-based forward pass.
+    const use_batched = requests.len > 1 and comptime @hasDecl(SelfType, "computeBatchedDecodeLogits");
+    if (use_batched) {
+        const max_n = 128;
+        if (requests.len > max_n) return error.InvalidArgument;
+        var tokens_buf: [max_n]u32 = undefined;
+        var slot_indices_buf: [max_n]usize = undefined;
+        var positions_buf: [max_n]usize = undefined;
+        for (requests, 0..) |req, i| {
+            const position = self.slot_positions[req.slot_index];
+            const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_deltas[req.slot_index]);
+            tokens_buf[i] = req.token;
+            slot_indices_buf[i] = req.slot_index;
+            positions_buf[i] = effective_position;
+        }
+        try self.computeBatchedDecodeLogits(
+            tokens_buf[0..requests.len],
+            slot_indices_buf[0..requests.len],
+            positions_buf[0..requests.len],
+        );
+        for (requests, results[0..requests.len]) |req, *result| {
+            const position = self.slot_positions[req.slot_index];
+            const slot_logits = self.slotLogits(req.slot_index);
+            result.* = .{
+                .slot_index = req.slot_index,
+                .logits = slot_logits,
+            };
+            trace.emitFinal(
+                .logits_ready,
+                0,
+                @intCast(position + 1),
+                @ptrCast(slot_logits.ptr),
+                .f32,
+                .{ @intCast(self.vocab_size), 0, 0, 0 },
+                1,
+                "cuda_logits_host",
+            );
+            self.slot_positions[req.slot_index] = position + 1;
+        }
+        return;
     }
-    if (!self.slot_in_use or !slotIndexSupported(self, req.slot_index)) {
-        log.warn("inference", "CUDA decodeBatch invalid args", .{
-            .reason = "slot_state",
+
+    // Sequential path: N == 1 or backend lacks batched support.
+    for (requests, results[0..requests.len]) |req, *result| {
+        const position = self.slot_positions[req.slot_index];
+        const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_deltas[req.slot_index]);
+        const slot_logits = self.slotLogits(req.slot_index);
+
+        if (comptime @hasDecl(SelfType, "activateKvSlot")) {
+            self.activateKvSlot(req.slot_index);
+        }
+
+        try self.computeGpuPrototypeLogitsWithLayerLimit(
+            req.token,
+            effective_position,
+            req.slot_index,
+            slot_logits,
+            self.block_runtime.blocks.len,
+            true,
+            true,
+            true,
+            1,
+            position,
+            null,
+            null,
+            null,
+        );
+
+        if (comptime @hasDecl(SelfType, "saveActiveKvSlot")) {
+            self.saveActiveKvSlot();
+        }
+
+        result.* = .{
             .slot_index = req.slot_index,
-            .slot_in_use = @as(u8, @intFromBool(self.slot_in_use)),
-        });
-        return error.InvalidArgument;
+            .logits = slot_logits,
+        };
+        trace.emitFinal(
+            .logits_ready,
+            0,
+            @intCast(position + 1),
+            @ptrCast(slot_logits.ptr),
+            .f32,
+            .{ @intCast(self.vocab_size), 0, 0, 0 },
+            1,
+            "cuda_logits_host",
+        );
+        self.slot_positions[req.slot_index] = position + 1;
     }
-
-    const effective_position = try common_mrope.applyPositionDelta(self.slot_position, self.slot_rope_position_delta);
-    try self.computeGpuPrototypeLogitsWithLayerLimit(
-        req.token,
-        effective_position,
-        req.slot_index,
-        self.slot_logits,
-        self.block_runtime.blocks.len,
-        true,
-        true,
-        true,
-        1,
-        self.slot_position,
-        null,
-        null,
-        null,
-    );
-    results[0] = .{
-        .slot_index = req.slot_index,
-        .logits = self.slot_logits,
-    };
-    trace.emitFinal(
-        .logits_ready,
-        0,
-        @intCast(self.slot_position + 1),
-        @ptrCast(self.slot_logits.ptr),
-        .f32,
-        .{ @intCast(self.vocab_size), 0, 0, 0 },
-        1,
-        "cuda_logits_host",
-    );
-    self.slot_position += 1;
 }
 
 pub fn decodeStreaming(
@@ -130,14 +183,14 @@ pub fn decodeStreaming(
         try self.ensureSlotStateBlocksBoundForScheduler(0);
     }
     if (max_tokens == 0 or output_tokens.len == 0) return 0;
-    if (!self.slot_in_use) {
-        self.slot_in_use = true;
-        self.slot_position = start_position;
+    if (!self.slot_in_use[0]) {
+        self.slot_in_use[0] = true;
+        self.slot_positions[0] = start_position;
     }
 
     var current_token = first_token;
     var generated: usize = 0;
-    var position = self.slot_position;
+    var position = self.slot_positions[0];
     const budget = @min(max_tokens, output_tokens.len);
     if (comptime @hasDecl(SelfType, "ensureKvCapacity")) {
         if (budget > 0) {
@@ -146,7 +199,7 @@ pub fn decodeStreaming(
         }
     }
     while (generated < budget) : (generated += 1) {
-        const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_delta);
+        const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_deltas[0]);
         try self.computeGpuPrototypeLogitsWithLayerLimit(
             current_token,
             effective_position,
@@ -175,7 +228,7 @@ pub fn decodeStreaming(
         );
         output_tokens[generated] = next_token;
         position += 1;
-        self.slot_position = position;
+        self.slot_positions[0] = position;
         if (callback) |cb| cb(next_token, callback_data);
 
         for (eos_token_ids) |eos_id| {
@@ -189,55 +242,49 @@ pub fn decodeStreaming(
 }
 
 pub fn allocSlot(self: anytype) ?usize {
-    const SelfType = @TypeOf(self.*);
-    if (self.slot_in_use) return null;
-    self.slot_in_use = true;
-    self.slot_position = 0;
-    self.slot_rope_position_delta = 0;
-    if (comptime @hasField(SelfType, "slot_state_bound")) {
-        self.slot_state_bound = false;
-        self.slot_state_block_count = 0;
+    for (self.slot_in_use, 0..) |in_use, i| {
+        if (!in_use) {
+            self.slot_in_use[i] = true;
+            self.slot_positions[i] = 0;
+            self.slot_rope_position_deltas[i] = 0;
+            return i;
+        }
     }
-    return 0;
+    return null;
 }
 
 pub fn freeSlot(self: anytype, slot_index: usize) void {
-    const SelfType = @TypeOf(self.*);
     if (!slotIndexSupported(self, slot_index)) return;
-    self.slot_in_use = false;
-    self.slot_position = 0;
-    self.slot_rope_position_delta = 0;
-    if (comptime @hasField(SelfType, "slot_state_bound")) {
-        self.slot_state_bound = false;
-        self.slot_state_block_count = 0;
-    }
+    self.slot_in_use[slot_index] = false;
+    self.slot_positions[slot_index] = 0;
+    self.slot_rope_position_deltas[slot_index] = 0;
 }
 
 pub fn resetSlot(self: anytype, slot_index: usize) void {
     if (!slotIndexSupported(self, slot_index)) return;
-    self.slot_position = 0;
-    self.slot_rope_position_delta = 0;
+    self.slot_positions[slot_index] = 0;
+    self.slot_rope_position_deltas[slot_index] = 0;
 }
 
 pub fn getPosition(self: anytype, slot_index: usize) usize {
     if (!slotIndexSupported(self, slot_index)) return 0;
-    return self.slot_position;
+    return self.slot_positions[slot_index];
 }
 
-const std = @import("std");
 const testing = std.testing;
 
 const MockDecodeBackend = struct {
     const MockBlockRuntime = struct {
         blocks: [1]u8 = .{0},
     };
+    const max_batch_size: usize = 2;
 
     vocab_size: usize = 8,
-    slot_rope_position_delta: isize = 0,
-    slot_position: usize = 0,
-    slot_in_use: bool = true,
+    slot_rope_position_deltas: [max_batch_size]isize = .{ 0, 0 },
+    slot_positions: [max_batch_size]usize = .{ 0, 0 },
+    slot_in_use: [max_batch_size]bool = .{ true, false },
     block_runtime: MockBlockRuntime = .{},
-    slot_logits_storage: [8]f32 = [_]f32{0.0} ** 8,
+    slot_logits_storage: [max_batch_size * 8]f32 = [_]f32{0.0} ** (max_batch_size * 8),
     slot_logits: []f32 = undefined,
     ensure_state_binding_calls: usize = 0,
     slot_state_bound: bool = true,
@@ -250,9 +297,18 @@ const MockDecodeBackend = struct {
         return backend;
     }
 
+    fn slotLogits(self: *MockDecodeBackend, slot_index: usize) []f32 {
+        const offset = slot_index * self.vocab_size;
+        return self.slot_logits[offset .. offset + self.vocab_size];
+    }
+
+    fn slotIndexSupported(_: *const MockDecodeBackend, slot_index: usize) bool {
+        return slot_index < max_batch_size;
+    }
+
     fn ensureSlotStateBlocksBoundForScheduler(self: *MockDecodeBackend, slot_index: usize) !void {
         self.ensure_state_binding_calls += 1;
-        if (!slotIndexSupported(self, slot_index)) return error.InvalidArgument;
+        if (slot_index >= max_batch_size) return error.InvalidArgument;
         if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
     }
 
@@ -289,7 +345,6 @@ const MockDecodeBackend = struct {
         _ = token;
         _ = position;
         _ = slot_index;
-        _ = logits_out_opt;
         _ = layer_limit;
         _ = compute_logits;
         _ = download_logits;
@@ -300,6 +355,12 @@ const MockDecodeBackend = struct {
         _ = deepstack_layer_features_opt;
         _ = deepstack_feature_index_opt;
         self.compute_calls += 1;
+        // Fill logits if provided so tests can verify content.
+        if (logits_out_opt) |logits_out| {
+            for (logits_out, 0..) |*value, idx| {
+                value.* = @floatFromInt(idx);
+            }
+        }
     }
 
     fn selectNextTokenFromDeviceLogitsImpl(self: *MockDecodeBackend) !u32 {
@@ -340,4 +401,58 @@ test "decodeStreaming enforces state binding guard" {
     );
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(@as(usize, 0), backend.compute_calls);
+}
+
+test "allocSlot returns first free slot" {
+    var backend = MockDecodeBackend.init();
+    // slot 0 is in_use by default, slot 1 is free
+    const slot = allocSlot(&backend);
+    try testing.expectEqual(@as(?usize, 1), slot);
+    try testing.expect(backend.slot_in_use[1]);
+    try testing.expectEqual(@as(usize, 0), backend.slot_positions[1]);
+}
+
+test "allocSlot returns null when all slots used" {
+    var backend = MockDecodeBackend.init();
+    backend.slot_in_use = .{ true, true };
+    try testing.expectEqual(@as(?usize, null), allocSlot(&backend));
+}
+
+test "freeSlot releases slot" {
+    var backend = MockDecodeBackend.init();
+    backend.slot_positions[0] = 42;
+    freeSlot(&backend, 0);
+    try testing.expect(!backend.slot_in_use[0]);
+    try testing.expectEqual(@as(usize, 0), backend.slot_positions[0]);
+}
+
+test "decodeBatch processes single request" {
+    var backend = MockDecodeBackend.init();
+    const requests = [_]contract.DecodeRequest{.{ .slot_index = 0, .token = 5 }};
+    var results: [1]contract.DecodeResult = undefined;
+
+    try decodeBatch(&backend, requests[0..], results[0..]);
+
+    try testing.expectEqual(@as(usize, 1), backend.compute_calls);
+    try testing.expectEqual(@as(usize, 0), results[0].slot_index);
+    try testing.expectEqual(@as(usize, 1), backend.slot_positions[0]);
+}
+
+test "decodeBatch processes multiple requests" {
+    var backend = MockDecodeBackend.init();
+    backend.slot_in_use = .{ true, true };
+    backend.slot_positions = .{ 10, 20 };
+    const requests = [_]contract.DecodeRequest{
+        .{ .slot_index = 0, .token = 5 },
+        .{ .slot_index = 1, .token = 9 },
+    };
+    var results: [2]contract.DecodeResult = undefined;
+
+    try decodeBatch(&backend, requests[0..], results[0..]);
+
+    try testing.expectEqual(@as(usize, 2), backend.compute_calls);
+    try testing.expectEqual(@as(usize, 0), results[0].slot_index);
+    try testing.expectEqual(@as(usize, 1), results[1].slot_index);
+    try testing.expectEqual(@as(usize, 11), backend.slot_positions[0]);
+    try testing.expectEqual(@as(usize, 21), backend.slot_positions[1]);
 }
