@@ -13,6 +13,17 @@ use talu::InferenceBackend;
 use crate::server::tenant::TenantRegistry;
 use crate::server::{AgentRuntimeMode, SandboxBackend};
 
+/// Result of an in-flight model load, broadcast to waiters via `watch` channel.
+#[derive(Clone, Debug)]
+pub enum ModelLoadResult {
+    /// Load still in progress.
+    Pending,
+    /// Load succeeded — backend installed.
+    Ok,
+    /// Load failed with this error message.
+    Err(String),
+}
+
 pub struct BackendState {
     pub backend: Option<InferenceBackend>,
     pub current_model: Option<String>,
@@ -151,4 +162,8 @@ pub struct AppState {
     /// Previous scheduler drain thread. Joined before spawning a new one
     /// on model switch to prevent unbounded drain thread accumulation.
     pub drain_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Singleflight guard for model loading. Maps model_id to an in-progress
+    /// load's watch receiver. Waiters clone the receiver and await completion.
+    pub model_load_inflight:
+        std::sync::Mutex<HashMap<String, tokio::sync::watch::Receiver<ModelLoadResult>>>,
 }

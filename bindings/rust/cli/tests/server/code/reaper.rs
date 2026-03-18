@@ -35,6 +35,7 @@ fn build_app_zero_ttl() -> (Router, Arc<AppState>) {
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
         drain_thread: std::sync::Mutex::new(None),
+        model_load_inflight: std::sync::Mutex::new(HashMap::new()),
     });
     let router = Router::new(state.clone());
     (router, state)

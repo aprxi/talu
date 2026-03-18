@@ -330,6 +330,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         pubsub: tokio::sync::Mutex::new(pubsub::PubSubState::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
         drain_thread: std::sync::Mutex::new(None),
+        model_load_inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let addr = SocketAddr::new(args.host, args.port);

@@ -75,6 +75,7 @@ fn build_app() -> Router {
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
         drain_thread: std::sync::Mutex::new(None),
+        model_load_inflight: std::sync::Mutex::new(HashMap::new()),
     };
     Router::new(Arc::new(state))
 }
@@ -111,6 +112,7 @@ fn build_app_with_inspect_limit(limit: u64) -> Router {
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
         drain_thread: std::sync::Mutex::new(None),
+        model_load_inflight: std::sync::Mutex::new(HashMap::new()),
     };
     Router::new(Arc::new(state))
 }

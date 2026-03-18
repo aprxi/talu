@@ -100,6 +100,7 @@ fn build_app_with_storage(temp_dir: &TempDir) -> Router {
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
         drain_thread: std::sync::Mutex::new(None),
+        model_load_inflight: std::sync::Mutex::new(HashMap::new()),
     };
 
     Router::new(Arc::new(state))
@@ -138,6 +139,7 @@ fn build_app_no_storage() -> Router {
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
         drain_thread: std::sync::Mutex::new(None),
+        model_load_inflight: std::sync::Mutex::new(HashMap::new()),
     };
 
     Router::new(Arc::new(state))

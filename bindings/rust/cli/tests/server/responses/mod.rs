@@ -11,6 +11,7 @@ mod parameters;
 mod responses_target_conformance_gaps;
 mod routing;
 mod schema;
+mod singleflight;
 mod streaming;
 mod target_compliance;
 mod target_polymorphic_compliance;

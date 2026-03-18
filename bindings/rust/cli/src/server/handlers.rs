@@ -19,7 +19,7 @@ use crate::provider;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::events;
 use crate::server::responses_types;
-use crate::server::state::{AppState, StoredResponse};
+use crate::server::state::{AppState, ModelLoadResult, StoredResponse};
 use talu::documents::{DocumentError, DocumentsHandle};
 use talu::responses::{ContentType, ItemType};
 use talu::{ChatHandle, FinishReason};
@@ -3600,6 +3600,7 @@ async fn list_backend_models(state: Arc<AppState>) -> Result<Vec<talu::RemoteMod
 }
 
 async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Result<()> {
+    // 1. Fast path: model already loaded.
     {
         let guard = state.backend.lock().await;
         if guard
@@ -3613,18 +3614,101 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
         }
     }
 
+    // 2. Singleflight: check if another task is already loading this model.
+    //    The std::sync::Mutex is safe here — critical section is a HashMap
+    //    lookup/insert/clone (nanoseconds), never held across .await.
+    let maybe_rx = {
+        let inflight = state.model_load_inflight.lock().unwrap();
+        inflight.get(model_id).cloned()
+    };
+
+    if let Some(mut rx) = maybe_rx {
+        // Another task is loading this model — wait for its result.
+        log::info!(target: "server::gen",
+            "waiting for in-flight load of model {}", model_id);
+        let _ = rx.changed().await;
+        return match &*rx.borrow() {
+            ModelLoadResult::Ok => Ok(()),
+            ModelLoadResult::Err(msg) => Err(anyhow!("{}", msg)),
+            ModelLoadResult::Pending => {
+                Err(anyhow!("model load abandoned (loader disappeared)"))
+            }
+        };
+    }
+
+    // 3. No in-flight load — we become the loader.
+    //    Atomically check-and-register under the inflight mutex.
+    let (tx, rx) = tokio::sync::watch::channel(ModelLoadResult::Pending);
+    let lost_race_rx = {
+        let mut inflight = state.model_load_inflight.lock().unwrap();
+        // Double-check: another task may have registered between our read
+        // and this write (two callers passed step 2 concurrently).
+        if let Some(existing_rx) = inflight.get(model_id) {
+            Some(existing_rx.clone())
+        } else {
+            inflight.insert(model_id.to_string(), rx);
+            None
+        }
+    };
+    if let Some(mut rx) = lost_race_rx {
+        // Lost the race — fall back to waiter path.
+        let _ = rx.changed().await;
+        return match &*rx.borrow() {
+            ModelLoadResult::Ok => Ok(()),
+            ModelLoadResult::Err(msg) => Err(anyhow!("{}", msg)),
+            ModelLoadResult::Pending => {
+                Err(anyhow!("model load abandoned (loader disappeared)"))
+            }
+        };
+    }
+
+    // 4. Re-check fast path — the model may have been loaded by a streaming
+    //    handler between our first check and registering as the loader.
+    {
+        let guard = state.backend.lock().await;
+        if guard
+            .current_model
+            .as_deref()
+            .map(|current| current == model_id)
+            .unwrap_or(false)
+            && guard.backend.is_some()
+        {
+            let _ = tx.send(ModelLoadResult::Ok);
+            state.model_load_inflight.lock().unwrap().remove(model_id);
+            return Ok(());
+        }
+    }
+
+    // 5. Load the model.
     log::info!(target: "server::gen", "loading backend for model {}", model_id);
     let model = model_id.to_string();
+    let model_key = model_id.to_string();
     let db_root = state
         .bucket_path
         .as_ref()
         .map(|b| b.join("kv").to_string_lossy().into_owned());
-    let backend = tokio::task::spawn_blocking(move || {
+    let load_result = tokio::task::spawn_blocking(move || {
         provider::create_backend_for_model(&model, db_root.as_deref())
     })
-    .await??;
+    .await;
 
-    // Recreate batch scheduler for new backend.
+    let backend = match load_result {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            let msg = format!("{e}");
+            let _ = tx.send(ModelLoadResult::Err(msg.clone()));
+            state.model_load_inflight.lock().unwrap().remove(&model_key);
+            return Err(e);
+        }
+        Err(e) => {
+            let msg = format!("model load task panicked: {e}");
+            let _ = tx.send(ModelLoadResult::Err(msg.clone()));
+            state.model_load_inflight.lock().unwrap().remove(&model_key);
+            return Err(anyhow!("{}", msg));
+        }
+    };
+
+    // 6. Install backend + scheduler, drain old.
     let new_sched =
         crate::server::batch_scheduler::SchedulerState::new(&backend, None)
             .ok()
@@ -3642,10 +3726,14 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
     // scheduler's step thread (BatchHandle holds an engine pointer).
     let old_backend = guard.backend.take();
     guard.backend = Some(backend);
-    guard.current_model = Some(model_id.to_string());
+    guard.current_model = Some(model_key.clone());
     drop(guard); // Release backend lock before blocking drain.
 
-    // Drain old scheduler in background.
+    // 7. Signal waiters and clean up inflight entry.
+    let _ = tx.send(ModelLoadResult::Ok);
+    state.model_load_inflight.lock().unwrap().remove(&model_key);
+
+    // 8. Drain old scheduler in background.
     if old_sched.is_some() || old_backend.is_some() {
         // Join any previous drain thread before spawning a new one.
         if let Ok(mut dt) = state.drain_thread.lock() {
