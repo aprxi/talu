@@ -133,6 +133,7 @@ def run_eval(
     config: dict,
     samples: list[dict],
     build_body,
+    score_fn=None,
 ) -> list[dict]:
     """Run an evaluation loop over samples for each model × precision × reasoning budget.
 
@@ -143,6 +144,10 @@ def run_eval(
         samples: List of sample dicts with at least: prompt, correct, question_hash, index.
         build_body: Callable(sample, uri, config) -> request body dict.
                     For multimodal, this handles image upload etc.
+        score_fn: Optional Callable(raw_text, sample) -> dict.
+                  When provided, replaces the default extract_answer + equality check.
+                  Must return {"predicted": str, "is_correct": bool, ...extra}.
+                  Extra keys are merged into per-question results.
 
     Returns:
         List of result dicts (one per model × precision × reasoning budget).
@@ -226,8 +231,18 @@ def run_eval(
 
                     raw = _extract_text(events)
                     reasoning = _extract_reasoning(events)
-                    predicted = extract_answer(raw)
-                    is_correct = predicted == sample["correct"]
+
+                    if score_fn:
+                        score = score_fn(raw, sample)
+                        predicted = score.get("predicted", "")
+                        is_correct = score.get("is_correct", False)
+                        extra = {k: v for k, v in score.items()
+                                 if k not in ("predicted", "is_correct")}
+                    else:
+                        predicted = extract_answer(raw)
+                        is_correct = predicted == sample["correct"]
+                        extra = {}
+
                     if is_correct:
                         correct_count += 1
 
@@ -238,6 +253,7 @@ def run_eval(
                         "correct": sample["correct"],
                         "match": is_correct,
                         "raw_output": raw[:500],
+                        **extra,
                     })
 
                     if not model_info:
@@ -262,6 +278,8 @@ def run_eval(
                         output_tokens=metrics.get("output_tokens", 0),
                         prefill_tok_s=metrics.get("prefill_tok_s", 0),
                         gen_tok_s=metrics.get("engine_tok_s", 0),
+                        match=is_correct,
+                        extras=extra if extra else None,
                     )
                     gen_ts = metrics.get("engine_tok_s", 0)
                     if gen_ts > 0:

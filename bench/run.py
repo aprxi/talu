@@ -124,7 +124,7 @@ def cmd_list() -> None:
         for fam, members in sorted(families.items()):
             suffixes = sorted(
                 (c.name.rsplit("/", 1)[-1][len(fam):] for c in members),
-                key=lambda s: (int(s) if s.isdigit() else s),
+                key=lambda s: (0, int(s)) if s.isdigit() else (1, s),
             )
             label = f"{fam}{{{','.join(suffixes)}}}"
             desc = members[0].description
@@ -235,22 +235,43 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     scenario = cls()
     env_vars = config.get("env", {})
-    srv = TaluServer(port=args.port, extra_args=scenario.server_args(config), env=env_vars)
 
-    version = _get_version(srv.binary)
+    # Version and hardware detection (no server needed).
+    _probe = TaluServer(port=args.port)
+    version = _get_version(_probe.binary)
     hardware = _detect_hardware(env_vars)
+
+    # Restart the server for each model × precision combo so the previous
+    # model is fully unloaded from GPU memory before the next one loads.
+    model_uris: list[str] = config.get("model_uri", ["Qwen/Qwen3.5-0.8B"])
+    precisions: list[str] = config.get("precision", ["original"])
 
     results: list[dict] = []
     try:
-        print(f"Starting server (port {args.port}) ...", flush=True)
-        srv.start(timeout=30)
-        print(f"Server ready (pid={srv.pid}).\n", flush=True)
-        results = scenario.run(srv.base_url, args.rounds, config)
+        for model in model_uris:
+            for precision in precisions:
+                combo_config = dict(config)
+                combo_config["model_uri"] = [model]
+                combo_config["precision"] = [precision]
+
+                srv = TaluServer(
+                    port=args.port,
+                    extra_args=scenario.server_args(combo_config),
+                    env=env_vars,
+                )
+                try:
+                    print(f"Starting server (port {args.port}) ...", flush=True)
+                    srv.start(timeout=30)
+                    print(f"Server ready (pid={srv.pid}).\n", flush=True)
+                    combo_results = scenario.run(
+                        srv.base_url, args.rounds, combo_config,
+                    )
+                    results.extend(combo_results)
+                finally:
+                    print("\nStopping server ...", flush=True)
+                    srv.stop()
     except KeyboardInterrupt:
         print("\nInterrupted.")
-    finally:
-        print("\nStopping server ...", flush=True)
-        srv.stop()
 
     if results:
         print()
@@ -559,15 +580,24 @@ def _print_eval_model_table(
     """
     has_perf = any(r.get("avg_gen_tok_s", 0) > 0 for r in rows)
     has_errors = any(r.get("errors", 0) > 0 for r in rows)
+    has_ifeval = any("prompt_strict_acc" in r for r in rows)
 
     # Column definitions: (header, group, right-align).
     col_defs: list[tuple[str, str, bool]] = [
         ("Precision", "",          False),
         ("Size",      "",          True),
         ("Reasoning", "",          True),
-        ("Score",     "Accuracy",  True),
-        ("%",         "Accuracy",  True),
     ]
+    if has_ifeval:
+        col_defs += [
+            ("Prompt",      "Accuracy",  True),
+            ("Instruction", "Accuracy",  True),
+        ]
+    else:
+        col_defs += [
+            ("Score",     "Accuracy",  True),
+            ("%",         "Accuracy",  True),
+        ]
     if has_perf:
         col_defs += [
             ("tokens",  "Prefill",   True),
@@ -606,13 +636,18 @@ def _print_eval_model_table(
         # Reasoning budget.
         budget = r.get("max_reasoning_tokens", 0)
         reasoning_str = f"{budget:,}" if budget > 0 else "—"
-        # Accuracy.
-        correct = r.get("correct_count", 0)
-        total = r.get("total", 0)
-        pct = r.get("accuracy", 0)
-        score_str = f"{correct}/{total}"
-        pct_str = f"{pct:.1f}%"
-        row_data = [label, size_str, reasoning_str, score_str, pct_str]
+        # Accuracy columns.
+        if has_ifeval:
+            row_data = [
+                label, size_str, reasoning_str,
+                f"{r.get('prompt_strict_acc', 0):.1f}%",
+                f"{r.get('inst_strict_acc', 0):.1f}%",
+            ]
+        else:
+            correct = r.get("correct_count", 0)
+            total = r.get("total", 0)
+            pct = r.get("accuracy", 0)
+            row_data = [label, size_str, reasoning_str, f"{correct}/{total}", f"{pct:.1f}%"]
         if has_perf:
             # Prefill.
             in_tok = r.get("total_input_tokens", 0)
@@ -691,9 +726,16 @@ def _print_eval_model_table(
     sep_line = join_parts(["─" * w for w in widths])
 
     # Find column indices for styling.
-    accuracy_pct_idx = 4
-    prefill_avg_idx = 6 if has_perf else -1
-    gen_avg_idx = 8 if has_perf else -1
+    if has_ifeval:
+        # IFEval: 2 accuracy columns (Prompt %, Instruction %).
+        accuracy_indices = {3, 4}
+        perf_offset = 5
+    else:
+        # MCQ evals: single "%" column.
+        accuracy_indices = {4}
+        perf_offset = 5
+    prefill_avg_idx = perf_offset + 1 if has_perf else -1
+    gen_avg_idx = perf_offset + 3 if has_perf else -1
     errors_idx = len(col_defs) - 1 if has_errors else -1
 
     content_lines = [
@@ -707,7 +749,7 @@ def _print_eval_model_table(
             cell = f"{val:>{w}}" if col_defs[i][2] else f"{val:<{w}}"
             if i == 0:
                 cell = f"[cyan bold]{cell}[/]"
-            elif i == accuracy_pct_idx:
+            elif i in accuracy_indices:
                 cell = f"[green bold]{cell}[/]"
             elif i in (prefill_avg_idx, gen_avg_idx):
                 cell = f"[green bold]{cell}[/]"

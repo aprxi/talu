@@ -99,6 +99,8 @@ class EvalLogger:
         output_tokens: int = 0,
         prefill_tok_s: float = 0,
         gen_tok_s: float = 0,
+        match: bool | None = None,
+        extras: dict | None = None,
     ) -> None:
         record = {
             "bench": bench,
@@ -107,7 +109,7 @@ class EvalLogger:
             "question": question,
             "predicted": predicted,
             "correct": correct,
-            "match": predicted == correct,
+            "match": match if match is not None else (predicted == correct),
             "model": model,
             "raw_output": raw_output,
             "reasoning": reasoning,
@@ -117,6 +119,8 @@ class EvalLogger:
             "gen_tok_s": round(gen_tok_s, 1),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        if extras:
+            record.update(extras)
         self._fh.write(json.dumps(record) + "\n")
         self._fh.flush()
 
