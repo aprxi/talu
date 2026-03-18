@@ -25,6 +25,7 @@ const CuCtxSetCurrentFn = *const fn (?*anyopaque) callconv(.c) c_int;
 const CuCtxSynchronizeFn = *const fn () callconv(.c) c_int;
 const CuMemAllocFn = *const fn (*u64, usize) callconv(.c) c_int;
 const CuMemFreeFn = *const fn (u64) callconv(.c) c_int;
+const CuMemGetInfoFn = *const fn (*usize, *usize) callconv(.c) c_int;
 const CuMemcpyHtoDFn = *const fn (u64, *const anyopaque, usize) callconv(.c) c_int;
 const CuMemcpyDtoHFn = *const fn (*anyopaque, u64, usize) callconv(.c) c_int;
 const CuMemcpyDtoDFn = *const fn (u64, u64, usize) callconv(.c) c_int;
@@ -83,6 +84,7 @@ const DriverApi = struct {
     cu_ctx_synchronize: CuCtxSynchronizeFn,
     cu_mem_alloc: CuMemAllocFn,
     cu_mem_free: CuMemFreeFn,
+    cu_mem_get_info: ?CuMemGetInfoFn,
     cu_memcpy_htod: CuMemcpyHtoDFn,
     cu_memcpy_dtoh: CuMemcpyDtoHFn,
     cu_memcpy_dtod: CuMemcpyDtoDFn,
@@ -380,6 +382,21 @@ pub const Device = struct {
         var total: usize = 0;
         if (cu_device_total_mem(&total, self.device_index) != cuda_success) return error.CudaQueryFailed;
         return total;
+    }
+
+    pub fn memoryInfo(self: *Device) !struct { free: usize, total: usize } {
+        const cu_mem_get_info = self.api.cu_mem_get_info orelse return error.CudaQueryUnavailable;
+        try self.makeCurrent();
+        var free: usize = 0;
+        var total: usize = 0;
+        if (cu_mem_get_info(&free, &total) != cuda_success) return error.CudaQueryFailed;
+        return .{ .free = free, .total = total };
+    }
+
+    pub fn usedMemory(self: *Device) !usize {
+        const info = try self.memoryInfo();
+        if (info.total >= info.free) return info.total - info.free;
+        return 0;
     }
 
     pub fn computeCapability(self: *Device) !ComputeCapability {
@@ -753,6 +770,7 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_ctx_synchronize = try lookupRequired(CuCtxSynchronizeFn, lib, "cuCtxSynchronize"),
         .cu_mem_alloc = try lookupRequiredAny(CuMemAllocFn, lib, &.{ "cuMemAlloc_v2", "cuMemAlloc" }),
         .cu_mem_free = try lookupRequiredAny(CuMemFreeFn, lib, &.{ "cuMemFree_v2", "cuMemFree" }),
+        .cu_mem_get_info = lookupOptionalAny(CuMemGetInfoFn, lib, &.{ "cuMemGetInfo_v2", "cuMemGetInfo" }),
         .cu_memcpy_htod = try lookupRequiredAny(CuMemcpyHtoDFn, lib, &.{ "cuMemcpyHtoD_v2", "cuMemcpyHtoD" }),
         .cu_memcpy_dtoh = try lookupRequiredAny(CuMemcpyDtoHFn, lib, &.{ "cuMemcpyDtoH_v2", "cuMemcpyDtoH" }),
         .cu_memcpy_dtod = try lookupRequiredAny(CuMemcpyDtoDFn, lib, &.{ "cuMemcpyDtoD_v2", "cuMemcpyDtoD" }),
@@ -831,6 +849,23 @@ test "Device.totalMemory reports non-zero bytes when available" {
         return;
     };
     try std.testing.expect(bytes > 0);
+}
+
+test "Device.usedMemory is bounded by Device.totalMemory when available" {
+    if (probeRuntime() != .available) return error.SkipZigTest;
+
+    var device = try Device.init();
+    defer device.deinit();
+
+    const total = device.totalMemory() catch |err| {
+        try std.testing.expect(err == error.CudaQueryUnavailable);
+        return;
+    };
+    const used = device.usedMemory() catch |err| {
+        try std.testing.expect(err == error.CudaQueryUnavailable or err == error.CudaQueryFailed);
+        return;
+    };
+    try std.testing.expect(used <= total);
 }
 
 test "Device.supportsModuleLaunch reports availability after Device.init" {

@@ -76,6 +76,28 @@ struct CompletedEntry {
 /// 60 seconds is generous enough for any realistic retrieval delay.
 const COMPLETED_ENTRY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Maximum total in-flight requests (active + pending) accepted by the
+/// server-side scheduler wrapper. `0` means unbounded.
+///
+/// This caps host-side request accumulation under overload independently of
+/// backend slot capacity. It is a queueing/backpressure control and does NOT
+/// by itself guarantee any specific GPU memory bound.
+fn resolve_batch_max_inflight() -> usize {
+    let raw = match std::env::var("TALU_BATCH_MAX_INFLIGHT") {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let trimmed = raw.trim();
+    match trimmed.parse::<usize>() {
+        Ok(v) => v,
+        Err(_) => {
+            log::warn!(target: "batch_scheduler",
+                "invalid TALU_BATCH_MAX_INFLIGHT='{}'; using 0 (unbounded)", trimmed);
+            0
+        }
+    }
+}
+
 // =============================================================================
 // Public API
 // =============================================================================
@@ -101,10 +123,17 @@ impl SchedulerState {
     pub fn new(backend: &InferenceBackend, config: Option<&BatchConfig>) -> Result<Self> {
         let batch = BatchHandle::new(backend, config)
             .map_err(|e| anyhow!("failed to create batch handle: {}", e))?;
+        let max_inflight = resolve_batch_max_inflight();
+        if max_inflight > 0 {
+            log::info!(target: "batch_scheduler",
+                "TALU_BATCH_MAX_INFLIGHT={} (server in-flight cap)", max_inflight);
+        } else {
+            log::info!(target: "batch_scheduler",
+                "TALU_BATCH_MAX_INFLIGHT=0 (unbounded in-flight)");
+        }
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SchedulerCommand>();
-        let requests: Arc<Mutex<HashMap<u64, RequestSlot>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let requests: Arc<Mutex<HashMap<u64, RequestSlot>>> = Arc::new(Mutex::new(HashMap::new()));
         let completed: Arc<Mutex<HashMap<u64, CompletedEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let completed_clone = completed.clone();
@@ -112,7 +141,7 @@ impl SchedulerState {
         let handle = std::thread::Builder::new()
             .name("batch-scheduler".into())
             .spawn(move || {
-                step_loop(batch, cmd_rx, requests, completed_clone);
+                step_loop(batch, cmd_rx, requests, completed_clone, max_inflight);
             })
             .map_err(|e| anyhow!("failed to spawn scheduler thread: {}", e))?;
 
@@ -173,7 +202,11 @@ impl SchedulerState {
     ///
     /// Returns `None` if the request hasn't completed or was already taken.
     pub fn take_result(&self, request_id: u64) -> Option<BatchResult> {
-        self.completed.lock().ok()?.remove(&request_id).map(|e| e.result)
+        self.completed
+            .lock()
+            .ok()?
+            .remove(&request_id)
+            .map(|e| e.result)
     }
 
     /// Shut down the scheduler. Blocks until the step thread exits.
@@ -207,6 +240,7 @@ fn step_loop(
     cmd_rx: std::sync::mpsc::Receiver<SchedulerCommand>,
     requests: Arc<Mutex<HashMap<u64, RequestSlot>>>,
     completed: Arc<Mutex<HashMap<u64, CompletedEntry>>>,
+    max_inflight: usize,
 ) {
     let mut events_buf = vec![BatchEvent::default(); 64];
     let mut draining = false;
@@ -221,15 +255,27 @@ fn step_loop(
                     if !batch.has_active() {
                         return;
                     }
+                    log_scheduler_snapshot(&batch, &requests, &completed, max_inflight);
                     draining = true;
                     break; // Stop processing commands, start draining.
                 }
                 Ok(SchedulerCommand::Submit { reply, .. }) if draining => {
                     // Reject new submits during drain.
-                    let _ = reply.send(Err(anyhow!("scheduler is shutting down")));
+                    let tracked = requests.lock().ok().map(|r| r.len()).unwrap_or(0);
+                    let active = batch.active_count();
+                    let pending = tracked.saturating_sub(active);
+                    log::warn!(target: "batch_scheduler",
+                        "rejecting submit during drain (tracked={}, active={}, pending={})",
+                        tracked, active, pending);
+                    let _ = reply.send(Err(anyhow!(
+                        "scheduler is shutting down (tracked={}, active={}, pending={})",
+                        tracked,
+                        active,
+                        pending
+                    )));
                 }
                 Ok(cmd) => {
-                    handle_command(&batch, cmd, &requests);
+                    handle_command(&batch, cmd, &requests, max_inflight);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -237,6 +283,7 @@ fn step_loop(
                     if !batch.has_active() {
                         return;
                     }
+                    log_scheduler_snapshot(&batch, &requests, &completed, max_inflight);
                     draining = true;
                     break;
                 }
@@ -258,7 +305,7 @@ fn step_loop(
             match cmd_rx.recv() {
                 Ok(SchedulerCommand::Shutdown) => return,
                 Ok(cmd) => {
-                    handle_command(&batch, cmd, &requests);
+                    handle_command(&batch, cmd, &requests, max_inflight);
                 }
                 Err(_) => return, // Channel disconnected
             }
@@ -295,10 +342,13 @@ fn step_loop(
                         // final event via the channel.
                         if let Some(result) = batch.take_result(event.request_id) {
                             if let Ok(mut comp) = completed.lock() {
-                                comp.insert(event.request_id, CompletedEntry {
-                                    result,
-                                    inserted_at: std::time::Instant::now(),
-                                });
+                                comp.insert(
+                                    event.request_id,
+                                    CompletedEntry {
+                                        result,
+                                        inserted_at: std::time::Instant::now(),
+                                    },
+                                );
                             }
                         }
                     } else {
@@ -324,6 +374,7 @@ fn handle_command(
     batch: &BatchHandle,
     cmd: SchedulerCommand,
     requests: &Arc<Mutex<HashMap<u64, RequestSlot>>>,
+    max_inflight: usize,
 ) {
     match cmd {
         SchedulerCommand::Submit {
@@ -335,6 +386,33 @@ fn handle_command(
         } => {
             // SAFETY: chat_ptr is a valid ChatHandle pointer borrowed from the
             // caller, who blocks on reply_rx.recv() until we send the reply.
+            if max_inflight > 0 {
+                let tracked = match requests.lock() {
+                    Ok(reqs) => reqs.len(),
+                    Err(_) => {
+                        let _ = reply.send(Err(anyhow!(
+                            "scheduler internal error: request registry unavailable"
+                        )));
+                        return;
+                    }
+                };
+                if tracked >= max_inflight {
+                    let active = batch.active_count();
+                    let pending = tracked.saturating_sub(active);
+                    log::warn!(target: "batch_scheduler",
+                        "rejecting submit: in-flight limit reached \
+                         (limit={}, tracked={}, active={}, pending={})",
+                        max_inflight, tracked, active, pending);
+                    let _ = reply.send(Err(anyhow!(
+                        "batch queue is full (limit={}, tracked={}, active={}, pending={})",
+                        max_inflight,
+                        tracked,
+                        active,
+                        pending
+                    )));
+                    return;
+                }
+            }
             let result = batch
                 .submit_raw(chat_ptr, &config)
                 .map_err(|e| anyhow!("batch submit failed: {}", e));
@@ -376,6 +454,22 @@ fn sweep_stale_completed(completed: &Arc<Mutex<HashMap<u64, CompletedEntry>>>) {
                 "evicted {evicted} stale completed entries");
         }
     }
+}
+
+/// Debug snapshot of scheduler occupancy.
+fn log_scheduler_snapshot(
+    batch: &BatchHandle,
+    requests: &Arc<Mutex<HashMap<u64, RequestSlot>>>,
+    completed: &Arc<Mutex<HashMap<u64, CompletedEntry>>>,
+    max_inflight: usize,
+) {
+    let tracked = requests.lock().ok().map(|r| r.len()).unwrap_or(0);
+    let active = batch.active_count();
+    let pending = tracked.saturating_sub(active);
+    let completed_entries = completed.lock().ok().map(|c| c.len()).unwrap_or(0);
+    log::debug!(target: "batch_scheduler",
+        "snapshot: tracked={} active={} pending={} completed_cache={} inflight_cap={}",
+        tracked, active, pending, completed_entries, max_inflight);
 }
 
 /// Check stop flags set by CancelOnDrop / client disconnect.

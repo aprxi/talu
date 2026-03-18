@@ -111,6 +111,10 @@ fn resolveCudaRequireFitCheck() bool {
     return resolveEnvBool("TALU_CUDA_REQUIRE_FIT", false);
 }
 
+fn resolveCudaStrictMemoryMode() bool {
+    return resolveEnvBool("TALU_CUDA_STRICT_MEMORY", false);
+}
+
 fn resolveCudaMemoryReserveBytes() usize {
     const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_MEMORY_RESERVE_MIB") catch {
         return 0;
@@ -125,6 +129,21 @@ fn resolveCudaMemoryReserveBytes() usize {
         return 0;
     };
     return std.math.mul(usize, reserve_mib, 1024 * 1024) catch std.math.maxInt(usize);
+}
+
+fn resolveCudaExternalOverheadCapBytes() ?usize {
+    const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_EXTERNAL_OVERHEAD_MIB") catch {
+        return null;
+    };
+    defer std.heap.c_allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const cap_mib = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+        log.warn("inference", "Invalid TALU_CUDA_EXTERNAL_OVERHEAD_MIB; ignoring", .{
+            .value = trimmed,
+        });
+        return null;
+    };
+    return std.math.mul(usize, cap_mib, 1024 * 1024) catch std.math.maxInt(usize);
 }
 
 fn resolveCudaMaxSeqLen(model_max_seq_len: usize) usize {
@@ -839,7 +858,6 @@ const RuntimeBuffers = struct {
         if (required_rows > self.max_seq_len) return error.InvalidArgument;
         if (fixed_alloc_mode) return error.OutOfMemory;
 
-        const old_capacity = self.row_capacity;
         var new_capacity = self.row_capacity;
         if (new_capacity == 0) new_capacity = 1;
         while (new_capacity < required_rows) {
@@ -859,12 +877,6 @@ const RuntimeBuffers = struct {
         const activation_u16_bytes = std.math.mul(usize, max_linear_in_dim, @sizeOf(u16)) catch return error.InvalidArgument;
         const shortconv_proj_bytes = std.math.mul(usize, self.shortconv_dim * 3, @sizeOf(f32)) catch return error.InvalidArgument;
         const shortconv_conv_bytes = std.math.mul(usize, self.shortconv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
-        log.debug("inference", "CUDA runtime row capacity growth", .{
-            .old_rows = old_capacity,
-            .new_rows = new_capacity,
-            .required_rows = required_rows,
-        }, @src());
-
         try resizeScratchBuffer(device, &self.input_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
         try resizeScratchBuffer(device, &self.norm_out_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
         try resizeScratchBuffer(device, &self.activation_u16_dev, std.math.mul(usize, activation_u16_bytes, new_capacity) catch return error.InvalidArgument);
@@ -2834,6 +2846,9 @@ pub const CudaBackend = struct {
     attn_scores_workspace_dev: ?compute.cuda.Buffer = null,
     /// Workspace buffer for f16 copies of Q and probs used by GEMM attention (lazy allocation).
     attn_u16_workspace_dev: ?compute.cuda.Buffer = null,
+    /// Optional guard allocation used by strict-memory mode to reserve the
+    /// allowed external-overhead envelope and fail closed on drift.
+    strict_external_guard_dev: ?compute.cuda.Buffer = null,
     softmax_rows_function: ?compute.cuda.Function = null,
     softmax_rows_source: ?compute.cuda.registry.KernelSource = null,
     attn_weighted_sum_heads_f32_function: ?compute.cuda.Function = null,
@@ -2957,8 +2972,13 @@ pub const CudaBackend = struct {
     max_batch_size: usize = 1,
     fixed_alloc_mode: bool = false,
     require_fit_check: bool = false,
+    strict_memory_mode: bool = false,
     memory_reserve_bytes: usize = 0,
+    external_overhead_cap_bytes: ?usize = null,
     model_max_seq_len: usize = 0,
+    dequant_cache_bytes: usize = 0,
+    strict_guard_bytes: usize = 0,
+    measured_external_overhead_bytes: usize = 0,
     slot_in_use: []bool,
     slot_positions: []usize,
     slot_rope_position_deltas: []isize,
@@ -3022,6 +3042,8 @@ pub const CudaBackend = struct {
         shortconv_state_bytes: usize,
         layer_program_bytes: usize,
         workspace_bytes: usize,
+        dequant_cache_bytes: usize,
+        strict_guard_bytes: usize,
         misc_bytes: usize,
 
         fn slotStateBytes(self: *const DeviceMemoryBudget) usize {
@@ -3039,6 +3061,8 @@ pub const CudaBackend = struct {
             total = saturatingAddUsize(total, self.slotStateBytes());
             total = saturatingAddUsize(total, self.layer_program_bytes);
             total = saturatingAddUsize(total, self.workspace_bytes);
+            total = saturatingAddUsize(total, self.dequant_cache_bytes);
+            total = saturatingAddUsize(total, self.strict_guard_bytes);
             total = saturatingAddUsize(total, self.misc_bytes);
             return total;
         }
@@ -3053,7 +3077,9 @@ pub const CudaBackend = struct {
         const resolved_kv_init_tokens = resolveCudaInitialKvCacheTokens(resolved_max_seq_len);
         const resolved_prefill_chunk_rows_cap = resolveCudaPrefillChunkRowsCap(resolved_max_seq_len);
         const resolved_require_fit_check = resolveCudaRequireFitCheck();
+        const resolved_strict_memory_mode = resolveCudaStrictMemoryMode();
         const resolved_memory_reserve_bytes = resolveCudaMemoryReserveBytes();
+        const resolved_external_overhead_cap_bytes = resolveCudaExternalOverheadCapBytes();
 
         log.info("inference", "CUDA device ready", .{ .name = device.name() });
         var backend = CudaBackend{
@@ -3081,8 +3107,13 @@ pub const CudaBackend = struct {
             .max_batch_size = max_batch_size,
             .fixed_alloc_mode = resolveCudaFixedAllocMode(),
             .require_fit_check = resolved_require_fit_check,
+            .strict_memory_mode = resolved_strict_memory_mode,
             .memory_reserve_bytes = resolved_memory_reserve_bytes,
+            .external_overhead_cap_bytes = resolved_external_overhead_cap_bytes,
             .model_max_seq_len = model_max_seq_len,
+            .dequant_cache_bytes = 0,
+            .strict_guard_bytes = 0,
+            .measured_external_overhead_bytes = 0,
             .norm_eps = prototype_eps,
             .cpu_rope_global = null,
             .cpu_rope_local = null,
@@ -3114,6 +3145,21 @@ pub const CudaBackend = struct {
             .parity_checkpoint_warned = [_]bool{false} ** 256,
         };
         if (backend.n_heads == 0 or backend.n_kv_heads == 0 or backend.head_dim == 0 or backend.max_seq_len == 0) {
+            return error.InvalidArgument;
+        }
+        if (backend.strict_memory_mode and !backend.fixed_alloc_mode) {
+            // Strict memory mode is only meaningful with fixed allocations.
+            backend.fixed_alloc_mode = true;
+            log.info("inference", "Enabling TALU_CUDA_FIXED_ALLOC because TALU_CUDA_STRICT_MEMORY is set", .{});
+        }
+        if (backend.fixed_alloc_mode and !backend.require_fit_check) {
+            // Fixed-allocation mode is intended to provide a deterministic
+            // startup envelope. Enforce fit-check in this mode by default.
+            backend.require_fit_check = true;
+            log.info("inference", "Enabling TALU_CUDA_REQUIRE_FIT because TALU_CUDA_FIXED_ALLOC is set", .{});
+        }
+        if (backend.strict_memory_mode and backend.external_overhead_cap_bytes == null) {
+            log.err("inference", "TALU_CUDA_STRICT_MEMORY requires TALU_CUDA_EXTERNAL_OVERHEAD_MIB", .{}, @src());
             return error.InvalidArgument;
         }
         if (backend.n_heads % backend.n_kv_heads != 0) return error.UnsupportedModel;
@@ -3219,17 +3265,68 @@ pub const CudaBackend = struct {
         try backend.initKernelFunctions();
         try backend.preallocateFixedAllocBuffers();
         try backend.warmupDequantF16Cache();
-        const memory_budget = backend.computeDeviceMemoryBudget();
+        var memory_budget = backend.computeDeviceMemoryBudget();
         const slot_state_bytes = memory_budget.slotStateBytes();
         const slot_state_per_slot_bytes: usize = if (backend.max_batch_size > 0)
             slot_state_bytes / backend.max_batch_size
         else
             0;
-        const known_device_bytes = memory_budget.totalBytes();
+        var known_device_bytes = memory_budget.totalBytes();
         const reserve_device_bytes = backend.memory_reserve_bytes;
         const require_fit_check = backend.require_fit_check;
-        const required_with_reserve_bytes = saturatingAddUsize(known_device_bytes, reserve_device_bytes);
         const total_device_bytes = backend.device.totalMemory() catch 0;
+        const external_overhead_cap_bytes = backend.external_overhead_cap_bytes orelse 0;
+        var used_device_bytes: usize = 0;
+        var used_device_query_available = false;
+
+        if (backend.strict_memory_mode) {
+            const overhead_cap_bytes = backend.external_overhead_cap_bytes.?;
+            const used_before_guard = backend.device.usedMemory() catch |err| {
+                log.err("inference", "TALU_CUDA_STRICT_MEMORY failed to query device used memory", .{
+                    .err = @errorName(err),
+                }, @src());
+                return err;
+            };
+            used_device_query_available = true;
+            backend.measured_external_overhead_bytes = if (used_before_guard > known_device_bytes)
+                used_before_guard - known_device_bytes
+            else
+                0;
+            if (backend.measured_external_overhead_bytes > overhead_cap_bytes) {
+                log.err("inference", "CUDA strict-memory external overhead exceeds configured cap", .{
+                    .external_overhead_mib = bytesToMiB(backend.measured_external_overhead_bytes),
+                    .external_overhead_cap_mib = bytesToMiB(overhead_cap_bytes),
+                    .known_device_mib = bytesToMiB(known_device_bytes),
+                    .used_device_mib = bytesToMiB(used_before_guard),
+                }, @src());
+                return error.OutOfMemory;
+            }
+            const guard_bytes = overhead_cap_bytes - backend.measured_external_overhead_bytes;
+            if (guard_bytes > 0) {
+                backend.strict_external_guard_dev = try backend.device.allocBuffer(guard_bytes);
+                errdefer if (backend.strict_external_guard_dev) |*buf| buf.deinit(&backend.device);
+                backend.strict_guard_bytes = backend.strict_external_guard_dev.?.size;
+                memory_budget = backend.computeDeviceMemoryBudget();
+                known_device_bytes = memory_budget.totalBytes();
+            }
+            used_device_bytes = backend.device.usedMemory() catch used_before_guard;
+        } else {
+            const maybe_used = backend.device.usedMemory() catch null;
+            if (maybe_used) |used| {
+                used_device_query_available = true;
+                used_device_bytes = used;
+                backend.measured_external_overhead_bytes = if (used > known_device_bytes)
+                    used - known_device_bytes
+                else
+                    0;
+            }
+        }
+
+        const required_with_reserve_bytes = saturatingAddUsize(known_device_bytes, reserve_device_bytes);
+        const headroom_after_reserve_bytes: usize = if (total_device_bytes > required_with_reserve_bytes)
+            total_device_bytes - required_with_reserve_bytes
+        else
+            0;
         const known_device_pct: f32 = if (total_device_bytes > 0)
             (@as(f32, @floatFromInt(known_device_bytes)) * 100.0) / @as(f32, @floatFromInt(total_device_bytes))
         else
@@ -3250,10 +3347,16 @@ pub const CudaBackend = struct {
             .shortconv_state_mib = bytesToMiB(memory_budget.shortconv_state_bytes),
             .layer_program_mib = bytesToMiB(memory_budget.layer_program_bytes),
             .workspace_mib = bytesToMiB(memory_budget.workspace_bytes),
+            .dequant_cache_mib = bytesToMiB(memory_budget.dequant_cache_bytes),
+            .strict_guard_mib = bytesToMiB(memory_budget.strict_guard_bytes),
             .misc_mib = bytesToMiB(memory_budget.misc_bytes),
             .device_total_mib = bytesToMiB(total_device_bytes),
+            .used_device_mib = bytesToMiB(used_device_bytes),
             .known_device_pct = known_device_pct,
             .required_with_reserve_pct = required_with_reserve_pct,
+            .external_overhead_mib = bytesToMiB(backend.measured_external_overhead_bytes),
+            .external_overhead_cap_mib = bytesToMiB(external_overhead_cap_bytes),
+            .headroom_after_reserve_mib = bytesToMiB(headroom_after_reserve_bytes),
             .reserve_mib = bytesToMiB(reserve_device_bytes),
             .kv_storage = @tagName(backend.kv_storage_mode),
             .kv_init_tokens = backend.kv_init_tokens,
@@ -3263,6 +3366,8 @@ pub const CudaBackend = struct {
             .model_max_seq = backend.model_max_seq_len,
             .fixed_alloc = @as(u8, @intFromBool(backend.fixed_alloc_mode)),
             .require_fit = @as(u8, @intFromBool(require_fit_check)),
+            .strict_memory = @as(u8, @intFromBool(backend.strict_memory_mode)),
+            .used_query = @as(u8, @intFromBool(used_device_query_available)),
         });
         if (total_device_bytes > 0 and required_with_reserve_bytes > total_device_bytes) {
             log.warn("inference", "CUDA known device allocations exceed fit envelope", .{
@@ -3415,6 +3520,10 @@ pub const CudaBackend = struct {
             self.device.destroyStream(stream);
             self.compute_stream = null;
         }
+        if (self.strict_external_guard_dev) |*buf| {
+            buf.deinit(&self.device);
+            self.strict_external_guard_dev = null;
+        }
         self.argmax_index_dev.deinit(&self.device);
         if (self.slot_state_bindings.len > 0) self.allocator.free(self.slot_state_bindings);
         if (self.trace_checkpoint_host.len > 0) self.allocator.free(self.trace_checkpoint_host);
@@ -3515,6 +3624,8 @@ pub const CudaBackend = struct {
             .shortconv_state_bytes = shortconv_state_bytes,
             .layer_program_bytes = layer_program_bytes,
             .workspace_bytes = workspace_bytes,
+            .dequant_cache_bytes = self.dequant_cache_bytes,
+            .strict_guard_bytes = self.strict_guard_bytes,
             .misc_bytes = misc_bytes,
         };
     }
@@ -3778,7 +3889,6 @@ pub const CudaBackend = struct {
         if (self.layer_program_slot_buffers.len == 0) return;
         if (fixed_alloc_mode) return error.OutOfMemory;
 
-        const old_capacity = self.layer_program_row_capacity;
         var new_capacity = self.layer_program_row_capacity;
         if (new_capacity == 0) new_capacity = 1;
         while (new_capacity < required_rows) {
@@ -3788,13 +3898,6 @@ pub const CudaBackend = struct {
             if (new_capacity == self.max_seq_len) break;
         }
         if (new_capacity < required_rows) return error.InvalidArgument;
-        log.debug("inference", "CUDA layer-program row capacity growth", .{
-            .old_rows = old_capacity,
-            .new_rows = new_capacity,
-            .required_rows = required_rows,
-            .slots = self.layer_program_slot_buffers.len,
-        }, @src());
-
         for (self.layer_program_slot_buffers, 0..) |*buf, idx| {
             const width = self.layer_program_slot_widths[idx];
             const row_bytes = std.math.mul(usize, width, @sizeOf(f32)) catch return error.InvalidArgument;
@@ -5501,13 +5604,11 @@ pub const CudaBackend = struct {
         else
             null;
 
-        var logged_growth = false;
         for (self.block_runtime.blocks) |*layer| {
             const block = layer.attention_binding orelse continue;
             if (required_tokens <= block.kv_capacity) continue;
             if (self.fixed_alloc_mode) return error.OutOfMemory;
 
-            const old_capacity = block.kv_capacity;
             var new_capacity = block.kv_capacity;
             if (new_capacity == 0) new_capacity = 1;
             while (new_capacity < required_tokens) {
@@ -5517,17 +5618,6 @@ pub const CudaBackend = struct {
                 if (new_capacity == self.max_seq_len) break;
             }
             if (new_capacity < required_tokens) return error.InvalidArgument;
-            if (!logged_growth) {
-                log.debug("inference", "CUDA KV capacity growth", .{
-                    .old_tokens = old_capacity,
-                    .new_tokens = new_capacity,
-                    .required_tokens = required_tokens,
-                    .kv_dim = block.kv_dim,
-                    .attention_layers = self.block_runtime.attention_block_count,
-                    .kv_storage = @tagName(self.kv_storage_mode),
-                }, @src());
-                logged_growth = true;
-            }
 
             var new_kv_pair = try self.allocKvPair(new_capacity, block.kv_dim);
             errdefer {
@@ -11605,6 +11695,7 @@ pub const CudaBackend = struct {
             }
         }
 
+        self.dequant_cache_bytes = total_bytes;
         if (weight_count > 0) {
             try self.device.synchronize();
             log.info("inference", "CUDA gaffine dequant cache ready", .{
