@@ -715,8 +715,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         /// 3. Samples next tokens
         /// 4. Returns token events for this step
         pub fn step(self: *Self) ![]TokenEvent {
+            // Snapshot completed queue length so we can detect requests that
+            // finish during prefill (e.g. max_tokens ≤ 1 or first token is EOS).
+            const completed_before = self.completed_queue.items.len;
+
             // First, prefill any requests that need it
             try self.runPrefills();
+
+            const prefill_completed = self.completed_queue.items.len - completed_before;
 
             // Build batch of decode requests
             var decode_batch_size: usize = 0;
@@ -742,6 +748,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             if (decode_batch_size == 0) {
                 // Slots may have been freed during prefill - try to activate pending
                 try self.activatePending();
+                // Emit final events for requests completed during prefill.
+                // Without this, batch callers that rely on step() events
+                // (rather than generateSync) would never observe completion.
+                if (prefill_completed > 0) {
+                    return try self.buildPrefillCompletedEvents(completed_before);
+                }
                 return &.{};
             }
 
@@ -927,6 +939,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     }
                     self.completeRequest(request_entry, finish_reason);
                 }
+            }
+
+            // Include events for requests completed during prefill (mixed case:
+            // some requests finished on first token while others are still generating).
+            if (prefill_completed > 0) {
+                try self.appendPrefillCompletedEvents(&token_events, completed_before);
             }
 
             // Try to activate pending requests (slots may have freed)
@@ -1849,6 +1867,39 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             // Add to completed queue
             self.completed_queue.append(self.allocator, request_entry.id) catch {};
+        }
+
+        /// Build final TokenEvents for requests that completed during runPrefills.
+        ///
+        /// When max_tokens ≤ 1 or the first token is EOS, runPrefills completes
+        /// the request and moves it to completed_queue without producing events.
+        /// Batch callers (as opposed to generateSync) rely on step() events to
+        /// observe completion, so we synthesize them here.
+        fn buildPrefillCompletedEvents(self: *Self, completed_before: usize) ![]TokenEvent {
+            var events: std.ArrayList(TokenEvent) = .{};
+            defer events.deinit(self.allocator);
+            try self.appendPrefillCompletedEvents(&events, completed_before);
+            return try events.toOwnedSlice(self.allocator);
+        }
+
+        fn appendPrefillCompletedEvents(
+            self: *Self,
+            events: *std.ArrayList(TokenEvent),
+            completed_before: usize,
+        ) !void {
+            for (self.completed_queue.items[completed_before..]) |cid| {
+                const req = self.requests.get(cid) orelse continue;
+                const last_token = if (req.generated_tokens.items.len > 0)
+                    req.generated_tokens.items[req.generated_tokens.items.len - 1]
+                else
+                    0;
+                try events.append(self.allocator, .{
+                    .request_id = cid,
+                    .token = last_token,
+                    .is_final = true,
+                    .slot_index = 0,
+                });
+            }
         }
 
         /// Check if the generated tokens end with any stop sequence.

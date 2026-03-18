@@ -2810,8 +2810,9 @@ test "copyTensorToF32 dequantizes grouped-affine tensors and transposes when exp
     try std.testing.expectEqual(tensor.DType.f32, copied.dtype);
     try std.testing.expectEqual(@as(i64, 4), copied.shape[0]);
     try std.testing.expectEqual(@as(i64, 8), copied.shape[1]);
+    // Transposed output (4×8): row 0 = source column 0 = [1,5,9,13,17,21,25,29].
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), copied.asSlice(f32)[0], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), copied.asSlice(f32)[4], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 17.0), copied.asSlice(f32)[4], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 29.0), copied.asSlice(f32)[7], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 32.0), copied.asSlice(f32)[31], 1e-5);
 }

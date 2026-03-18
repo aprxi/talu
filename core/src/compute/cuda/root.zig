@@ -32,6 +32,8 @@ pub const attn_scores_heads_f32 = @import("attn_scores_heads_f32.zig");
 pub const attn_scores_heads_f16_kv = @import("attn_scores_heads_f16_kv.zig");
 pub const attn_fused_heads_f16_kv = @import("attn_fused_heads_f16_kv.zig");
 pub const attn_fused_prefill_heads_f16_kv = @import("attn_fused_prefill_heads_f16_kv.zig");
+pub const attn_fused_prefill_heads_f16_kv_gqa = @import("attn_fused_prefill_heads_f16_kv_gqa.zig");
+pub const causal_attn_softmax_f32 = @import("causal_attn_softmax_f32.zig");
 pub const softmax_rows = @import("softmax_rows.zig");
 pub const attn_weighted_sum_heads_f32 = @import("attn_weighted_sum_heads_f32.zig");
 pub const attn_weighted_sum_heads_f16_kv = @import("attn_weighted_sum_heads_f16_kv.zig");
@@ -110,6 +112,8 @@ test {
     _ = attn_scores_heads_f16_kv;
     _ = attn_fused_heads_f16_kv;
     _ = attn_fused_prefill_heads_f16_kv;
+    _ = attn_fused_prefill_heads_f16_kv_gqa;
+    _ = causal_attn_softmax_f32;
     _ = softmax_rows;
     _ = attn_weighted_sum_heads_f32;
     _ = attn_weighted_sum_heads_f16_kv;

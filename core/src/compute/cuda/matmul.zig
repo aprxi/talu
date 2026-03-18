@@ -61,6 +61,31 @@ const CublasGemmExFn = *const fn (
     c_int,
     c_int,
 ) callconv(.c) c_int;
+const CublasGemmStridedBatchedExFn = *const fn (
+    ?*anyopaque, // handle
+    c_int, // transa
+    c_int, // transb
+    c_int, // m
+    c_int, // n
+    c_int, // k
+    ?*const anyopaque, // alpha
+    ?*const anyopaque, // A
+    c_int, // Atype
+    c_int, // lda
+    c_longlong, // strideA
+    ?*const anyopaque, // B
+    c_int, // Btype
+    c_int, // ldb
+    c_longlong, // strideB
+    ?*const anyopaque, // beta
+    ?*anyopaque, // C
+    c_int, // Ctype
+    c_int, // ldc
+    c_longlong, // strideC
+    c_int, // batchCount
+    c_int, // computeType
+    c_int, // algo
+) callconv(.c) c_int;
 
 const CublasApi = struct {
     cublas_create: CublasCreateFn,
@@ -69,6 +94,7 @@ const CublasApi = struct {
     cublas_set_stream: CublasSetStreamFn,
     cublas_sgemm: CublasSgemmFn,
     cublas_gemm_ex: CublasGemmExFn,
+    cublas_gemm_strided_batched_ex: CublasGemmStridedBatchedExFn,
 };
 
 pub const Blas = struct {
@@ -359,6 +385,68 @@ pub const Blas = struct {
         if (status == cublas_status_alloc_failed) return error.OutOfMemory;
         if (status != cublas_status_success) return error.CublasMatmulFailed;
     }
+
+    /// Strided batched mixed-precision GEMM for attention.
+    /// C[i] = alpha * op(A[i]) @ op(B[i]) + beta * C[i], i in [0, batch_count).
+    /// A is u16 (f16/bf16), B and C are f32.
+    /// Column-major convention: op(A) is [m x k], op(B) is [k x n], C is [m x n].
+    /// Strides are in elements of the respective type.
+
+
+    /// Non-batched GEMM with explicit leading dimensions, both inputs u16.
+    /// C = alpha * op(A) @ B + beta * C.
+    /// A and B are u16 (f16), C is f32.  Leverages tensor cores.
+    /// Column-major: op(A) is [m x k], B is [k x n], C is [m x n].
+    pub fn gemmU16(
+        self: *Blas,
+        device: *device_mod.Device,
+        transa: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a_ptr: usize,
+        lda: usize,
+        b_ptr: usize,
+        ldb: usize,
+        beta: f32,
+        c_ptr: usize,
+        ldc: usize,
+    ) !void {
+        if (self.handle == null) return error.CublasHandleInvalid;
+        if (!dimsFitCublas(m, n, k)) return error.InvalidArgument;
+
+        try device.makeCurrent();
+        if (self.api.cublas_set_stream(self.handle, device.getLaunchStream()) != cublas_status_success) {
+            return error.CublasStreamSetFailed;
+        }
+
+        const op_a: c_int = if (transa) cublas_op_t else cublas_op_n;
+
+        const status = self.api.cublas_gemm_ex(
+            self.handle,
+            op_a,
+            cublas_op_n,
+            @intCast(m),
+            @intCast(n),
+            @intCast(k),
+            @ptrCast(&alpha),
+            @ptrFromInt(a_ptr),
+            cuda_r_16f,
+            @intCast(lda),
+            @ptrFromInt(b_ptr),
+            cuda_r_16f,
+            @intCast(ldb),
+            @ptrCast(&beta),
+            @ptrFromInt(c_ptr),
+            cuda_r_32f,
+            @intCast(ldc),
+            cublas_compute_32f,
+            cublas_gemm_default,
+        );
+        if (status == cublas_status_alloc_failed) return error.OutOfMemory;
+        if (status != cublas_status_success) return error.CublasMatmulFailed;
+    }
 };
 
 fn dimsFitCublas(m: usize, n: usize, k: usize) bool {
@@ -396,6 +484,7 @@ fn loadCublasApi(lib: *std.DynLib) !CublasApi {
         .cublas_set_stream = try lookupRequiredAny(CublasSetStreamFn, lib, &.{ "cublasSetStream_v2", "cublasSetStream" }),
         .cublas_sgemm = try lookupRequired(CublasSgemmFn, lib, "cublasSgemm_v2"),
         .cublas_gemm_ex = try lookupRequired(CublasGemmExFn, lib, "cublasGemmEx"),
+        .cublas_gemm_strided_batched_ex = try lookupRequired(CublasGemmStridedBatchedExFn, lib, "cublasGemmStridedBatchedEx"),
     };
 }
 
