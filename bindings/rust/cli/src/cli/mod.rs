@@ -1271,14 +1271,8 @@ mod tests {
 
     #[test]
     fn parse_xray_verify_backend_pair_modes() {
-        let cli = parse(&[
-            "talu",
-            "xray",
-            "Qwen/Qwen3.5-0.8B",
-            "--verify",
-            "cpu:metal",
-        ])
-        .expect("parse should succeed");
+        let cli = parse(&["talu", "xray", "Qwen/Qwen3.5-0.8B", "--verify", "cpu:metal"])
+            .expect("parse should succeed");
         match cli.command {
             Some(Commands::Xray(args)) => {
                 assert_eq!(args.verify.as_deref(), Some("cpu:metal"));

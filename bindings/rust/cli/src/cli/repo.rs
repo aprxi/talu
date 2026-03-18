@@ -779,12 +779,8 @@ fn sample_model_raw_no_stream(
     let temperature_from_env = env::var("TEMPERATURE")
         .ok()
         .and_then(|v| v.parse::<f32>().ok());
-    let top_k_from_env = env::var("TOP_K")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok());
-    let top_p_from_env = env::var("TOP_P")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok());
+    let top_k_from_env = env::var("TOP_K").ok().and_then(|v| v.parse::<usize>().ok());
+    let top_p_from_env = env::var("TOP_P").ok().and_then(|v| v.parse::<f32>().ok());
 
     // Use core-owned policy to resolve effective generation config
     let effective = talu::model::resolve_effective_generation_config(
@@ -800,7 +796,10 @@ fn sample_model_raw_no_stream(
 
     // Validate top_p range
     if !(0.0..=1.0).contains(&effective.top_p) {
-        bail!("Error: TOP_P must be in range [0.0, 1.0], got {}", effective.top_p);
+        bail!(
+            "Error: TOP_P must be in range [0.0, 1.0], got {}",
+            effective.top_p
+        );
     }
 
     let cfg = talu::router::GenerateConfig {

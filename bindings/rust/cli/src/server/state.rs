@@ -113,7 +113,8 @@ pub struct AppState {
     pub backend: Arc<Mutex<BackendState>>,
     /// Batch scheduler for concurrent local GPU decode (None for remote-only).
     /// Behind a Mutex so it can be replaced when the backend changes (model switch).
-    pub batch_scheduler: std::sync::Mutex<Option<Arc<crate::server::batch_scheduler::SchedulerState>>>,
+    pub batch_scheduler:
+        std::sync::Mutex<Option<Arc<crate::server::batch_scheduler::SchedulerState>>>,
     pub configured_model: Option<String>,
     /// In-memory response store for `previous_response_id` conversation chaining.
     pub response_store: Mutex<HashMap<String, StoredResponse>>,

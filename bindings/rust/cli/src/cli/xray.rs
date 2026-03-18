@@ -4,8 +4,8 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
 use std::io::IsTerminal;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use zip::write::SimpleFileOptions;
@@ -105,7 +105,9 @@ fn parse_env_f32(name: &str) -> Option<f32> {
 }
 
 fn parse_env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok())
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
 }
 
 fn resolve_xray_model(model: &str) -> Result<String> {
@@ -124,14 +126,20 @@ fn save_reference_visible_text(reference_path: &Path, text: &str) -> Result<()> 
 }
 
 fn load_reference_visible_text(reference_path: &Path) -> Result<String> {
-    Ok(std::fs::read_to_string(reference_visible_text_path(reference_path))?)
+    Ok(std::fs::read_to_string(reference_visible_text_path(
+        reference_path,
+    ))?)
 }
 
 /// Get effective generation config for xray using the core-owned policy.
 ///
 /// This uses talu::model::resolve_effective_generation_config to ensure xray
 /// uses identical config resolution as normal inference (ask, shell, etc).
-fn xray_generate_config(model: &str, max_tokens: usize, seed: u64) -> Result<talu::router::GenerateConfig> {
+fn xray_generate_config(
+    model: &str,
+    max_tokens: usize,
+    seed: u64,
+) -> Result<talu::router::GenerateConfig> {
     let resolved_model = resolve_xray_model(model)?;
     // Parse optional environment overrides
     let env_temperature = parse_env_f32("TEMPERATURE");
@@ -153,7 +161,10 @@ fn xray_generate_config(model: &str, max_tokens: usize, seed: u64) -> Result<tal
 
     // Validate top_p range (core doesn't validate, bindings should)
     if !(0.0..=1.0).contains(&effective.top_p) {
-        return Err(anyhow!("Error: TOP_P must be in range [0.0, 1.0], got {}", effective.top_p));
+        return Err(anyhow!(
+            "Error: TOP_P must be in range [0.0, 1.0], got {}",
+            effective.top_p
+        ));
     }
 
     Ok(talu::router::GenerateConfig {
@@ -213,7 +224,11 @@ fn display_token_index(token_idx: u32) -> u32 {
     token_idx.saturating_add(1)
 }
 
-fn display_tensor_contract_token(idx: usize, parsed: &ParsedCheckpointKey, prefill_boundary: usize) -> u32 {
+fn display_tensor_contract_token(
+    idx: usize,
+    parsed: &ParsedCheckpointKey,
+    prefill_boundary: usize,
+) -> u32 {
     if idx < prefill_boundary {
         0
     } else {
@@ -227,9 +242,8 @@ fn format_token_text_for_report(model: &str, token_id: u32) -> Option<String> {
     let options = talu_sys::DecodeOptionsC {
         skip_special_tokens: 0,
     };
-    let result = unsafe {
-        talu_sys::talu_tokenizer_decode(tokenizer.as_ptr(), &token_id, 1, &options)
-    };
+    let result =
+        unsafe { talu_sys::talu_tokenizer_decode(tokenizer.as_ptr(), &token_id, 1, &options) };
     if !result.error_msg.is_null() || result.text.is_null() {
         return None;
     }
@@ -253,8 +267,9 @@ fn decode_token_sequence_for_report(model: &str, tokens: &[u32]) -> Option<Strin
     let options = talu_sys::DecodeOptionsC {
         skip_special_tokens: 0,
     };
-    let result =
-        unsafe { talu_sys::talu_tokenizer_decode(tokenizer.as_ptr(), tokens.as_ptr(), tokens.len(), &options) };
+    let result = unsafe {
+        talu_sys::talu_tokenizer_decode(tokenizer.as_ptr(), tokens.as_ptr(), tokens.len(), &options)
+    };
     if !result.error_msg.is_null() || result.text.is_null() {
         return None;
     }
@@ -311,11 +326,14 @@ fn format_phase1_token_divergence_report(
     }
     let token = parse_u32_after(msg, "token=")?;
     let reference_tokens = load_reference_tokens(reference_json_path).ok()?;
-    let expected_count = (token as usize).saturating_add(1).min(reference_tokens.len());
+    let expected_count = (token as usize)
+        .saturating_add(1)
+        .min(reference_tokens.len());
     let expected_text =
         decode_token_sequence_for_report(model, &reference_tokens[..expected_count])?;
     let actual_text = actual_text?;
-    let use_ansi = std::env::var_os("TALU_XRAY_VERIFY_TTY").is_some() || std::io::stdout().is_terminal();
+    let use_ansi =
+        std::env::var_os("TALU_XRAY_VERIFY_TTY").is_some() || std::io::stdout().is_terminal();
     let prefix_len = common_prefix_len(&expected_text, actual_text);
     Some(format!(
         "token={} -> FAILED\n\n{}\n\n{}",
@@ -386,7 +404,9 @@ fn compare_full_token_transcripts(
         decode_token_sequence_for_report(model, target_clipped)
             .unwrap_or_else(|| "<failed to decode metal transcript>".to_string())
     });
-    let shared_count = divergence_idx.min(source_clipped.len()).min(target_clipped.len());
+    let shared_count = divergence_idx
+        .min(source_clipped.len())
+        .min(target_clipped.len());
     let shared_text = decode_token_sequence_for_report(model, &source_clipped[..shared_count])
         .unwrap_or_default();
     let use_ansi =
@@ -1616,10 +1636,7 @@ fn print_checkpoint_consistency_warnings(point_rows: &[PointUsageRow]) {
     }
 }
 
-fn with_backend_env_override<T>(
-    backend_name: &str,
-    f: impl FnOnce() -> Result<T>,
-) -> Result<T> {
+fn with_backend_env_override<T>(backend_name: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let previous = std::env::var_os("BACKEND");
     // Backend selection still flows through core's single backend-selection
     // contract. Override only around backend creation/recording, then restore.
@@ -1659,12 +1676,7 @@ fn record_reference_bundle(
             ReferenceCaptureMode::Full => None,
             ReferenceCaptureMode::TranscriptOnly => Some(point_mask_for_name("token_select")?),
         };
-        let _override_guard = VerifyOverrideGuard::new(
-            false,
-            false,
-            point_mask_override,
-            None,
-        );
+        let _override_guard = VerifyOverrideGuard::new(false, false, point_mask_override, None);
 
         let cfg = xray_generate_config(&resolved_model, max_tokens as usize, args.seed)?;
         let recorder =
@@ -1684,8 +1696,7 @@ fn record_reference_bundle(
 
         let result = result?;
         if result.error_code() != 0 {
-            let message =
-                last_error_message().unwrap_or_else(|| "generation failed".to_string());
+            let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
             return Err(anyhow!("Error: {} (code {})", message, result.error_code()));
         }
 
@@ -1751,7 +1762,8 @@ fn run_verify_pass_with_backend(
                 let msg = verifier.finish().err().map(|err| err.to_string());
                 Ok((true, msg, output_text))
             } else {
-                let message = last_error_message().unwrap_or_else(|| "generation failed".to_string());
+                let message =
+                    last_error_message().unwrap_or_else(|| "generation failed".to_string());
                 Err(anyhow!("Error: {} (code {})", message, result.error_code()))
             }
         } else if !teacher_forcing {
@@ -1874,8 +1886,7 @@ fn cmd_xray_verify(
 
     println!(
         "Verifying model {} against cached {} reference",
-        model,
-        backend_pair.source
+        model, backend_pair.source
     );
     println!("  Tokens: {}", args.tokens);
     println!("  Seed: {}", args.seed);
@@ -1883,7 +1894,13 @@ fn cmd_xray_verify(
     println!("  Prompt: \"{}\"", prompt_text);
 
     if args.verify_phase1_only {
-        return run_phase1_only_in_current_process(model, &prompt_text, tolerance, &reference_json_path, args);
+        return run_phase1_only_in_current_process(
+            model,
+            &prompt_text,
+            tolerance,
+            &reference_json_path,
+            args,
+        );
     }
 
     if args.verify_phase2_only {
@@ -1891,7 +1908,14 @@ fn cmd_xray_verify(
             .verify_phase2_max_tokens
             .ok_or_else(|| anyhow!("missing internal --verify-phase2-max-tokens"))?
             as usize;
-        return run_phase2_only_in_current_process(model, &prompt_text, tolerance, &reference_json_path, args, phase2_max_tokens);
+        return run_phase2_only_in_current_process(
+            model,
+            &prompt_text,
+            tolerance,
+            &reference_json_path,
+            args,
+            phase2_max_tokens,
+        );
     }
 
     let checkpoint_target = args
@@ -2032,9 +2056,12 @@ fn run_phase1_only_in_current_process(
 
     if diverged {
         if let Some(msg) = &divergence_msg {
-            if let Some(report) =
-                format_phase1_token_divergence_report(model, reference_json_path, msg, output_text.as_deref())
-            {
+            if let Some(report) = format_phase1_token_divergence_report(
+                model,
+                reference_json_path,
+                msg,
+                output_text.as_deref(),
+            ) {
                 println!("{report}");
             } else {
                 print_first_divergence_report_for_model(model, msg);
@@ -2354,12 +2381,18 @@ fn normalize_backend_name(raw: &str) -> Result<String> {
 
 fn parse_verify_backend_pair(raw: &str) -> Result<VerifyBackendPair> {
     let mut parts = raw.split(':');
-    let source = parts
-        .next()
-        .ok_or_else(|| anyhow!("invalid backend pair '{}': expected '<source>:<target>'", raw))?;
-    let target = parts
-        .next()
-        .ok_or_else(|| anyhow!("invalid backend pair '{}': expected '<source>:<target>'", raw))?;
+    let source = parts.next().ok_or_else(|| {
+        anyhow!(
+            "invalid backend pair '{}': expected '<source>:<target>'",
+            raw
+        )
+    })?;
+    let target = parts.next().ok_or_else(|| {
+        anyhow!(
+            "invalid backend pair '{}': expected '<source>:<target>'",
+            raw
+        )
+    })?;
     if parts.next().is_some() {
         return Err(anyhow!(
             "invalid backend pair '{}': expected exactly one ':' separator",
@@ -2372,7 +2405,9 @@ fn parse_verify_backend_pair(raw: &str) -> Result<VerifyBackendPair> {
     })
 }
 
-fn selected_verify_mode_and_pair(args: &XrayArgs) -> Result<Option<(VerifyCliMode, VerifyBackendPair)>> {
+fn selected_verify_mode_and_pair(
+    args: &XrayArgs,
+) -> Result<Option<(VerifyCliMode, VerifyBackendPair)>> {
     let mut selected: Option<(VerifyCliMode, &str)> = None;
     for (mode, raw) in [
         (VerifyCliMode::Full, args.verify.as_deref()),
@@ -2486,8 +2521,9 @@ fn refresh_reference_cache(
     let _lock = CacheRefreshLock::acquire(reference_path)?;
     let mut temp_bundle = TempReferenceBundle::new(reference_path);
 
-    let exe_path = std::env::current_exe()
-        .map_err(|err| anyhow!("failed to resolve current executable for xray cache refresh: {err}"))?;
+    let exe_path = std::env::current_exe().map_err(|err| {
+        anyhow!("failed to resolve current executable for xray cache refresh: {err}")
+    })?;
     run_reference_refresh_process(
         &exe_path,
         model,
@@ -2622,8 +2658,10 @@ fn ensure_reference_bundle(
     };
     let sidecar_path = reference_sidecar_path(&reference_path);
     let visible_text_path = reference_visible_text_path(&reference_path);
-    let refresh_cache =
-        args.no_cache || !reference_path.exists() || !sidecar_path.exists() || !visible_text_path.exists();
+    let refresh_cache = args.no_cache
+        || !reference_path.exists()
+        || !sidecar_path.exists()
+        || !visible_text_path.exists();
     if refresh_cache {
         if args.no_cache {
             println!(
@@ -2666,7 +2704,10 @@ fn cmd_xray_verify_default(
             }
         },
     )?;
-    println!("Using cache bundle: {}", reference_sidecar_path(&source_path).display());
+    println!(
+        "Using cache bundle: {}",
+        reference_sidecar_path(&source_path).display()
+    );
 
     if matches!(mode, VerifyCliMode::Full | VerifyCliMode::Tensors)
         && backend_pair.target != backend_pair.source
@@ -3087,9 +3128,12 @@ fn canonical_reference_record(record: &serde_json::Value) -> bool {
 fn rewrite_reference_json_to_canonical(reference_path: &Path) -> Result<()> {
     let file = File::open(reference_path)?;
     let mut value: serde_json::Value = serde_json::from_reader(file)?;
-    let stats = value["stats"]
-        .as_array_mut()
-        .ok_or_else(|| anyhow!("reference json missing stats array: {}", reference_path.display()))?;
+    let stats = value["stats"].as_array_mut().ok_or_else(|| {
+        anyhow!(
+            "reference json missing stats array: {}",
+            reference_path.display()
+        )
+    })?;
 
     let mut filtered = Vec::with_capacity(stats.len());
     for record in stats.iter() {
@@ -3111,7 +3155,8 @@ fn checkpoint_key_from_reference_record(record: &serde_json::Value) -> Result<St
     let token_idx = record
         .get("token_idx")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("reference json record missing token_idx"))? as u32;
+        .ok_or_else(|| anyhow!("reference json record missing token_idx"))?
+        as u32;
     let layer = record
         .get("layer")
         .and_then(|v| v.as_u64())
@@ -3119,7 +3164,8 @@ fn checkpoint_key_from_reference_record(record: &serde_json::Value) -> Result<St
     let position = record
         .get("position")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("reference json record missing position"))? as u32;
+        .ok_or_else(|| anyhow!("reference json record missing position"))?
+        as u32;
     let point = record
         .get("point")
         .and_then(|v| v.as_str())
@@ -3129,15 +3175,21 @@ fn checkpoint_key_from_reference_record(record: &serde_json::Value) -> Result<St
     } else {
         format!("layer_{}", layer)
     };
-    Ok(format!("tok{}_pos{}_{}_{}", token_idx, position, scope, point))
+    Ok(format!(
+        "tok{}_pos{}_{}_{}",
+        token_idx, position, scope, point
+    ))
 }
 
 fn load_reference_checkpoint_order(reference_path: &Path) -> Result<Vec<String>> {
     let file = File::open(reference_path)?;
     let value: serde_json::Value = serde_json::from_reader(file)?;
-    let stats = value["stats"]
-        .as_array()
-        .ok_or_else(|| anyhow!("reference json missing stats array: {}", reference_path.display()))?;
+    let stats = value["stats"].as_array().ok_or_else(|| {
+        anyhow!(
+            "reference json missing stats array: {}",
+            reference_path.display()
+        )
+    })?;
     let mut keys = Vec::with_capacity(stats.len());
     for record in stats {
         keys.push(checkpoint_key_from_reference_record(record)?);
@@ -3289,11 +3341,20 @@ fn write_phase2_reference_json(
     let file = File::open(reference_json_path)?;
     let mut reference: serde_json::Value = serde_json::from_reader(file)?;
 
-    if let Some(metadata) = reference.get_mut("metadata").and_then(|value| value.as_object_mut()) {
-        metadata.insert("max_tokens".to_string(), serde_json::Value::from(max_tokens as u64));
+    if let Some(metadata) = reference
+        .get_mut("metadata")
+        .and_then(|value| value.as_object_mut())
+    {
+        metadata.insert(
+            "max_tokens".to_string(),
+            serde_json::Value::from(max_tokens as u64),
+        );
     }
 
-    if let Some(tokens) = reference.get_mut("tokens").and_then(|value| value.as_array_mut()) {
+    if let Some(tokens) = reference
+        .get_mut("tokens")
+        .and_then(|value| value.as_array_mut())
+    {
         tokens.truncate(max_tokens);
     }
 
@@ -3623,10 +3684,10 @@ fn format_first_divergence_report(msg: &str, model: Option<&str>) -> String {
         let token = parse_u32_after(msg, "token=");
         let expected = parse_u32_after(msg, "expected=");
         let actual = parse_u32_after(msg, "actual=");
-        let expected_text =
-            expected.and_then(|token_id| model.and_then(|m| format_token_text_for_report(m, token_id)));
-        let actual_text =
-            actual.and_then(|token_id| model.and_then(|m| format_token_text_for_report(m, token_id)));
+        let expected_text = expected
+            .and_then(|token_id| model.and_then(|m| format_token_text_for_report(m, token_id)));
+        let actual_text = actual
+            .and_then(|token_id| model.and_then(|m| format_token_text_for_report(m, token_id)));
         let token_display = token
             .map(display_token_index)
             .map(|value| value.to_string())
@@ -3686,7 +3747,10 @@ fn format_first_divergence_report(msg: &str, model: Option<&str>) -> String {
         return lines.join("\n");
     }
 
-    format!("token=?, layer=?, point=? -> FAILED\n\ndetails:\n  detail={}", msg)
+    format!(
+        "token=?, layer=?, point=? -> FAILED\n\ndetails:\n  detail={}",
+        msg
+    )
 }
 
 fn print_first_divergence_report_for_model(model: &str, msg: &str) {
@@ -3719,7 +3783,8 @@ fn failures_for_first_logical_token(
     let Some(first) = failures.first() else {
         return Vec::new();
     };
-    let target_token = display_tensor_contract_token(first.idx, &first.diff.parsed, prefill_boundary);
+    let target_token =
+        display_tensor_contract_token(first.idx, &first.diff.parsed, prefill_boundary);
     failures
         .iter()
         .filter(|failure| {
@@ -4004,12 +4069,10 @@ fn run_tensor_bundle_diff(
                     None
                 }
             }
-            (Some(_), None) | (None, Some(_)) => {
-                Some(FirstCheckpointDiff {
-                    parsed,
-                    kind: FirstCheckpointDiffKind::Missing,
-                })
-            }
+            (Some(_), None) | (None, Some(_)) => Some(FirstCheckpointDiff {
+                parsed,
+                kind: FirstCheckpointDiffKind::Missing,
+            }),
             (None, None) => None,
         };
         if let Some(diff) = diff {
@@ -4071,17 +4134,25 @@ fn run_tensor_bundle_diff(
             failure.diff.parsed.layer_index.to_string()
         };
         let detail = match failure.diff.kind {
-            FirstCheckpointDiffKind::Missing =>
-                "detail=checkpoint missing from target bundle".to_string(),
-            FirstCheckpointDiffKind::LengthMismatch =>
-                "detail=checkpoint tensor length mismatch".to_string(),
+            FirstCheckpointDiffKind::Missing => {
+                "detail=checkpoint missing from target bundle".to_string()
+            }
+            FirstCheckpointDiffKind::LengthMismatch => {
+                "detail=checkpoint tensor length mismatch".to_string()
+            }
             FirstCheckpointDiffKind::Numeric => {
-                let expected_raw = source_raw
-                    .get(&failure.diff.parsed.key)
-                    .ok_or_else(|| anyhow!("source tensor missing for diff key {}", failure.diff.parsed.key))?;
-                let actual_raw = target_raw
-                    .get(&failure.diff.parsed.key)
-                    .ok_or_else(|| anyhow!("target tensor missing for diff key {}", failure.diff.parsed.key))?;
+                let expected_raw = source_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
+                    anyhow!(
+                        "source tensor missing for diff key {}",
+                        failure.diff.parsed.key
+                    )
+                })?;
+                let actual_raw = target_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
+                    anyhow!(
+                        "target tensor missing for diff key {}",
+                        failure.diff.parsed.key
+                    )
+                })?;
                 let expected = parse_npy_f32(expected_raw)?;
                 let actual = parse_npy_f32(actual_raw)?;
                 let expected_rms = rms(&expected);
@@ -4126,19 +4197,16 @@ fn print_targeted_checkpoint_hint(model: &str, prompt_text: &str, parsed: &Parse
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_full_token_transcripts,
-        canonicalize_reference_bundle, ensure_reference_cache_unlocked,
-        default_dev_reference_path,
-        failures_for_first_logical_token,
-        find_first_checkpoint_diff, normalize_npz_entry_key,
-        format_first_divergence_report,
+        canonicalize_reference_bundle, compare_full_token_transcripts, default_dev_reference_path,
+        ensure_reference_cache_unlocked, failures_for_first_logical_token,
+        find_first_checkpoint_diff, format_first_divergence_report, normalize_npz_entry_key,
         parse_checkpoint_key, parse_npy_f32, parse_verify_backend_pair,
-        parse_verify_checkpoint_target, reference_cache_key,
-        reclaim_orphaned_reference_lock, reference_lock_path, reference_sidecar_path, replace_file_atomically,
+        parse_verify_checkpoint_target, reclaim_orphaned_reference_lock, reference_cache_key,
+        reference_lock_path, reference_sidecar_path, replace_file_atomically,
         select_checkpoint_key, temp_reference_path, write_filtered_reference_json,
-        write_phase2_reference_json,
-        FirstCheckpointDiff, FirstCheckpointDiffKind, ParsedCheckpointKey, TensorCheckpointFailure,
-        ReferenceCaptureMode, VerifyBackendPair, VerifyCheckpointTarget, VerifyLayerTarget,
+        write_phase2_reference_json, FirstCheckpointDiff, FirstCheckpointDiffKind,
+        ParsedCheckpointKey, ReferenceCaptureMode, TensorCheckpointFailure, VerifyBackendPair,
+        VerifyCheckpointTarget, VerifyLayerTarget,
     };
     use crate::cli::XrayArgs;
     use std::collections::BTreeMap;
@@ -4286,7 +4354,10 @@ mod tests {
         assert_eq!(stats[0]["point"].as_str(), Some("gdelta.out"));
         assert_eq!(stats[0]["position"].as_u64(), Some(10));
         assert_eq!(
-            filtered_json["tokens"].as_array().expect("tokens array").len(),
+            filtered_json["tokens"]
+                .as_array()
+                .expect("tokens array")
+                .len(),
             4
         );
     }
@@ -4360,11 +4431,9 @@ mod tests {
         .expect("write reference json");
         source.as_file_mut().flush().expect("flush reference json");
 
-        let filtered = write_phase2_reference_json(
-            source.path().to_str().expect("utf8 temp path"),
-            2,
-        )
-        .expect("filtered phase2 reference");
+        let filtered =
+            write_phase2_reference_json(source.path().to_str().expect("utf8 temp path"), 2)
+                .expect("filtered phase2 reference");
 
         let filtered_json: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(filtered.path()).expect("open filtered"))
@@ -4379,7 +4448,10 @@ mod tests {
         assert_eq!(stats[3]["point"].as_str(), Some("gdelta.out"));
         assert_eq!(stats[3]["token_idx"].as_u64(), Some(1));
         assert_eq!(
-            filtered_json["tokens"].as_array().expect("tokens array").len(),
+            filtered_json["tokens"]
+                .as_array()
+                .expect("tokens array")
+                .len(),
             2
         );
         assert_eq!(filtered_json["metadata"]["max_tokens"].as_u64(), Some(2));
@@ -4392,8 +4464,10 @@ mod tests {
             bytes.extend_from_slice(b"\x93NUMPY");
             bytes.push(1);
             bytes.push(0);
-            let header =
-                format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({},), }}", values.len());
+            let header = format!(
+                "{{'descr': '<f4', 'fortran_order': False, 'shape': ({},), }}",
+                values.len()
+            );
             let mut header_bytes = header.into_bytes();
             let preamble_len = 10usize;
             while (preamble_len + header_bytes.len() + 1) % 16 != 0 {
@@ -4723,9 +4797,8 @@ mod tests {
         )
         .expect("write target");
 
-        let result =
-            compare_full_token_transcripts("Qwen/Qwen3.5-0.8B-GAF4", &source, &target, 2)
-                .expect("compare should succeed");
+        let result = compare_full_token_transcripts("Qwen/Qwen3.5-0.8B-GAF4", &source, &target, 2)
+            .expect("compare should succeed");
         assert!(!result.passed);
         assert!(result.report.contains("shared:"));
         assert!(result.report.contains("cpu:"));
@@ -4750,8 +4823,13 @@ mod tests {
     #[test]
     fn reference_cache_key_changes_when_reference_backend_changes() {
         let cpu = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "cpu");
-        let metal =
-            reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "metal");
+        let metal = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "metal",
+        );
         assert_ne!(cpu, metal);
     }
 
@@ -4790,16 +4868,17 @@ mod tests {
             tolerance: 0.001,
             tokens: 10,
             seed: 42,
-            prompt: vec!["what".to_string(), "is".to_string(), "a".to_string(), "dice".to_string()],
+            prompt: vec![
+                "what".to_string(),
+                "is".to_string(),
+                "a".to_string(),
+                "dice".to_string(),
+            ],
         };
 
-        let full = default_dev_reference_path(
-            &args.model,
-            &args,
-            "metal",
-            ReferenceCaptureMode::Full,
-        )
-        .expect("full path");
+        let full =
+            default_dev_reference_path(&args.model, &args, "metal", ReferenceCaptureMode::Full)
+                .expect("full path");
         let tokens = default_dev_reference_path(
             &args.model,
             &args,
@@ -4868,10 +4947,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock should be monotonic enough for test naming")
             .as_nanos();
-        let reference_path = std::env::temp_dir().join(format!(
-            "talu_xray_live_pid_lock_test_{}.json",
-            nonce
-        ));
+        let reference_path =
+            std::env::temp_dir().join(format!("talu_xray_live_pid_lock_test_{}.json", nonce));
         let lock_path = reference_lock_path(&reference_path);
         std::fs::write(&lock_path, std::process::id().to_string()).expect("write live pid lock");
 

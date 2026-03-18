@@ -106,7 +106,10 @@ pub(super) fn reasoning_text_for_item(conv: &impl ResponsesView, index: usize) -
     Ok(out)
 }
 
-pub(super) fn latest_visible_text(chat: &ChatHandle, include_reasoning: bool) -> Result<Option<String>> {
+pub(super) fn latest_visible_text(
+    chat: &ChatHandle,
+    include_reasoning: bool,
+) -> Result<Option<String>> {
     let conv = chat.responses();
     let count = conv.item_count();
     if count == 0 {
@@ -599,12 +602,8 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     let temperature_from_env = env::var("TEMPERATURE")
         .ok()
         .and_then(|v| v.parse::<f32>().ok());
-    let top_k_from_env = env::var("TOP_K")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok());
-    let top_p_from_env = env::var("TOP_P")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok());
+    let top_k_from_env = env::var("TOP_K").ok().and_then(|v| v.parse::<usize>().ok());
+    let top_p_from_env = env::var("TOP_P").ok().and_then(|v| v.parse::<f32>().ok());
     let presence_penalty_from_env = env::var("PRESENCE_PENALTY")
         .ok()
         .and_then(|v| v.parse::<f32>().ok());
@@ -614,9 +613,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     let repetition_penalty_from_env = env::var("REPETITION_PENALTY")
         .ok()
         .and_then(|v| v.parse::<f32>().ok());
-    let min_p_from_env = env::var("MIN_P")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok());
+    let min_p_from_env = env::var("MIN_P").ok().and_then(|v| v.parse::<f32>().ok());
 
     // Use core-owned policy to resolve effective generation config
     let effective = talu::model::resolve_effective_generation_config(
@@ -636,7 +633,10 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
 
     // Validate top_p range
     if !(0.0..=1.0).contains(&effective.top_p) {
-        bail!("Error: TOP_P must be in range [0.0, 1.0], got {}", effective.top_p);
+        bail!(
+            "Error: TOP_P must be in range [0.0, 1.0], got {}",
+            effective.top_p
+        );
     }
 
     if no_chat {

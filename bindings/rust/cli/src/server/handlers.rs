@@ -1142,12 +1142,30 @@ async fn generate_response(
         created_at,
         Some(now_unix_seconds()),
         output_items,
-        effective_config.as_ref().map(|e| e.max_tokens as i64).or(max_output_tokens),
-        effective_config.as_ref().map(|e| e.temperature as f64).unwrap_or_else(|| temperature.unwrap_or(0.0)),
-        effective_config.as_ref().map(|e| e.top_p as f64).unwrap_or_else(|| top_p.unwrap_or(1.0)),
-        effective_config.as_ref().map(|e| Some(e.top_k as u32)).unwrap_or(top_k),
-        effective_config.as_ref().map(|e| e.presence_penalty as f64).unwrap_or_else(|| presence_penalty.unwrap_or(0.0)),
-        effective_config.as_ref().map(|e| e.frequency_penalty as f64).unwrap_or_else(|| frequency_penalty.unwrap_or(0.0)),
+        effective_config
+            .as_ref()
+            .map(|e| e.max_tokens as i64)
+            .or(max_output_tokens),
+        effective_config
+            .as_ref()
+            .map(|e| e.temperature as f64)
+            .unwrap_or_else(|| temperature.unwrap_or(0.0)),
+        effective_config
+            .as_ref()
+            .map(|e| e.top_p as f64)
+            .unwrap_or_else(|| top_p.unwrap_or(1.0)),
+        effective_config
+            .as_ref()
+            .map(|e| Some(e.top_k as u32))
+            .unwrap_or(top_k),
+        effective_config
+            .as_ref()
+            .map(|e| e.presence_penalty as f64)
+            .unwrap_or_else(|| presence_penalty.unwrap_or(0.0)),
+        effective_config
+            .as_ref()
+            .map(|e| e.frequency_penalty as f64)
+            .unwrap_or_else(|| frequency_penalty.unwrap_or(0.0)),
         logprobs.top_logprobs as i64,
         reasoning.effort.as_deref(),
         reasoning.summary.as_deref(),
@@ -1578,16 +1596,18 @@ async fn stream_response(
                 ) {
                     Ok(new_backend) => {
                         // Recreate batch scheduler for new backend.
-                        let new_sched = crate::server::batch_scheduler::SchedulerState::new(
-                            &new_backend, None,
-                        ).ok().map(Arc::new);
-                        let old_sched = if let Ok(mut sched_guard) = state_for_store.batch_scheduler.lock() {
-                            let old = sched_guard.take();
-                            *sched_guard = new_sched;
-                            old
-                        } else {
-                            None
-                        };
+                        let new_sched =
+                            crate::server::batch_scheduler::SchedulerState::new(&new_backend, None)
+                                .ok()
+                                .map(Arc::new);
+                        let old_sched =
+                            if let Ok(mut sched_guard) = state_for_store.batch_scheduler.lock() {
+                                let old = sched_guard.take();
+                                *sched_guard = new_sched;
+                                old
+                            } else {
+                                None
+                            };
                         // Take old backend before replacing — it must outlive the
                         // old scheduler's step thread (BatchHandle holds an engine
                         // pointer into it).
@@ -1595,9 +1615,9 @@ async fn stream_response(
                         guard.backend = Some(new_backend);
                         guard.current_model = Some(model_id.clone());
                         drop(guard); // Release backend lock before blocking drain.
-                        // Drain old scheduler in background: the step thread
-                        // finishes active requests, then shuts down. The old
-                        // backend is kept alive until after the join.
+                                     // Drain old scheduler in background: the step thread
+                                     // finishes active requests, then shuts down. The old
+                                     // backend is kept alive until after the join.
                         if old_sched.is_some() || old_backend.is_some() {
                             // Join any previous drain thread before spawning
                             // a new one to prevent unbounded accumulation.
@@ -1770,9 +1790,18 @@ async fn stream_response(
             text_format: text_format_for_events.clone(),
             project_id: project_id.clone(),
             top_logprobs: logprobs.top_logprobs,
-            top_k: effective_config.as_ref().map(|e| Some(e.top_k as u32)).unwrap_or(top_k),
-            presence_penalty: effective_config.as_ref().map(|e| e.presence_penalty as f64).unwrap_or_else(|| presence_penalty.unwrap_or(0.0)),
-            frequency_penalty: effective_config.as_ref().map(|e| e.frequency_penalty as f64).unwrap_or_else(|| frequency_penalty.unwrap_or(0.0)),
+            top_k: effective_config
+                .as_ref()
+                .map(|e| Some(e.top_k as u32))
+                .unwrap_or(top_k),
+            presence_penalty: effective_config
+                .as_ref()
+                .map(|e| e.presence_penalty as f64)
+                .unwrap_or_else(|| presence_penalty.unwrap_or(0.0)),
+            frequency_penalty: effective_config
+                .as_ref()
+                .map(|e| e.frequency_penalty as f64)
+                .unwrap_or_else(|| frequency_penalty.unwrap_or(0.0)),
             reasoning_effort: reasoning_for_events.effort.clone(),
             reasoning_summary: reasoning_for_events.summary.clone(),
             coalesce_buf: String::new(),
@@ -2350,8 +2379,8 @@ fn run_batch_streaming_generation(
     // carry only output text; function_call items have full metadata.
     if let Ok(guard) = ctx.lock() {
         if !guard.output_items.is_empty() {
-            let items_json = serde_json::to_string(&guard.output_items)
-                .unwrap_or_else(|_| "[]".to_string());
+            let items_json =
+                serde_json::to_string(&guard.output_items).unwrap_or_else(|_| "[]".to_string());
             if let Err(e) = chat.load_responses_json(&items_json) {
                 log::warn!(target: "server::gen",
                     "batch stream chaining: load_responses_json failed: {e}");
@@ -2696,8 +2725,8 @@ impl StreamCtx {
             talu::responses::stream_delta_event_name(token.item_type, token.content_type);
 
         // Coalesce output_text and reasoning deltas: buffer and flush periodically.
-        let coalesceable = event_name == "response.output_text.delta"
-            || event_name == "response.reasoning.delta";
+        let coalesceable =
+            event_name == "response.output_text.delta" || event_name == "response.reasoning.delta";
         if coalesceable {
             // If the event type changed (e.g. reasoning → text), flush first.
             if !self.coalesce_buf.is_empty() && self.coalesce_event != event_name {
@@ -2707,10 +2736,13 @@ impl StreamCtx {
                 self.coalesce_start = Some(Instant::now());
                 self.coalesce_event.clear();
                 self.coalesce_event.push_str(event_name);
-                self.coalesce_text_start = self.accumulated_text.len().saturating_sub(token.text.len());
+                self.coalesce_text_start =
+                    self.accumulated_text.len().saturating_sub(token.text.len());
             }
             self.coalesce_buf.push_str(token.text);
-            if self.coalesce_start.map_or(false, |t| t.elapsed().as_millis() as u64 >= Self::COALESCE_WINDOW_MS) {
+            if self.coalesce_start.map_or(false, |t| {
+                t.elapsed().as_millis() as u64 >= Self::COALESCE_WINDOW_MS
+            }) {
                 self.flush_coalesce()?;
             }
             return Ok(());
@@ -3630,9 +3662,7 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
         return match &*rx.borrow() {
             ModelLoadResult::Ok => Ok(()),
             ModelLoadResult::Err(msg) => Err(anyhow!("{}", msg)),
-            ModelLoadResult::Pending => {
-                Err(anyhow!("model load abandoned (loader disappeared)"))
-            }
+            ModelLoadResult::Pending => Err(anyhow!("model load abandoned (loader disappeared)")),
         };
     }
 
@@ -3656,9 +3686,7 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
         return match &*rx.borrow() {
             ModelLoadResult::Ok => Ok(()),
             ModelLoadResult::Err(msg) => Err(anyhow!("{}", msg)),
-            ModelLoadResult::Pending => {
-                Err(anyhow!("model load abandoned (loader disappeared)"))
-            }
+            ModelLoadResult::Pending => Err(anyhow!("model load abandoned (loader disappeared)")),
         };
     }
 
@@ -3709,10 +3737,9 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
     };
 
     // 6. Install backend + scheduler, drain old.
-    let new_sched =
-        crate::server::batch_scheduler::SchedulerState::new(&backend, None)
-            .ok()
-            .map(Arc::new);
+    let new_sched = crate::server::batch_scheduler::SchedulerState::new(&backend, None)
+        .ok()
+        .map(Arc::new);
     let old_sched = if let Ok(mut sched_guard) = state.batch_scheduler.lock() {
         let old = sched_guard.take();
         *sched_guard = new_sched;

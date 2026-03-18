@@ -152,12 +152,16 @@ pub(super) fn cmd_convert(args: ConvertArgs) -> Result<()> {
         Ok(convert_result) => {
             // Write talu_meta.json with source model info (best-effort).
             if is_model_id(&model_arg) {
-                let meta_path = std::path::Path::new(&convert_result.output_path).join("talu_meta.json");
+                let meta_path =
+                    std::path::Path::new(&convert_result.output_path).join("talu_meta.json");
                 let meta = serde_json::json!({
                     "source_model_id": model_arg,
                     "scheme": args.scheme,
                 });
-                let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default());
+                let _ = std::fs::write(
+                    &meta_path,
+                    serde_json::to_string_pretty(&meta).unwrap_or_default(),
+                );
             }
 
             // Output based on flags

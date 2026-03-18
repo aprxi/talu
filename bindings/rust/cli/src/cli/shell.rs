@@ -137,12 +137,8 @@ pub(super) fn cmd_agent(args: AgentArgs, stdin_is_pipe: bool) -> Result<()> {
             let temperature_from_env = env::var("TEMPERATURE")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok());
-            let top_k_from_env = env::var("TOP_K")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok());
-            let top_p_from_env = env::var("TOP_P")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok());
+            let top_k_from_env = env::var("TOP_K").ok().and_then(|v| v.parse::<usize>().ok());
+            let top_p_from_env = env::var("TOP_P").ok().and_then(|v| v.parse::<f32>().ok());
             let presence_penalty_from_env = env::var("PRESENCE_PENALTY")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok());
@@ -152,9 +148,7 @@ pub(super) fn cmd_agent(args: AgentArgs, stdin_is_pipe: bool) -> Result<()> {
             let repetition_penalty_from_env = env::var("REPETITION_PENALTY")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok());
-            let min_p_from_env = env::var("MIN_P")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok());
+            let min_p_from_env = env::var("MIN_P").ok().and_then(|v| v.parse::<f32>().ok());
 
             // Use core-owned policy to resolve effective generation config
             let effective = talu::model::resolve_effective_generation_config(
