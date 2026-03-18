@@ -171,6 +171,29 @@ fn probeCudaRuntime() CudaProbe {
     return compute.cuda.probeRuntime();
 }
 
+fn resolveCudaMaxBatchSize() usize {
+    const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_MAX_BATCH_SIZE") catch {
+        return DEFAULT_MAX_BATCH_SIZE;
+    };
+    defer std.heap.c_allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+        log.warn("inference", "Invalid TALU_CUDA_MAX_BATCH_SIZE; using default", .{
+            .value = trimmed,
+            .default = DEFAULT_MAX_BATCH_SIZE,
+        });
+        return DEFAULT_MAX_BATCH_SIZE;
+    };
+    if (parsed == 0) {
+        log.warn("inference", "TALU_CUDA_MAX_BATCH_SIZE must be >= 1; clamping", .{
+            .value = parsed,
+            .clamped = 1,
+        });
+        return 1;
+    }
+    return parsed;
+}
+
 /// Backend type - tagged union of available backends
 pub const Backend = union(enum) {
     /// Fused CPU backend for graph ops (production inference)
@@ -729,7 +752,11 @@ fn initCuda(
         log.info("inference", "CUDA runtime unavailable", .{ .reason = cudaProbeName(probe) });
         return error.CudaUnavailable;
     }
-    const cuda_backend_state = try cuda.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE);
+    const cuda_max_batch_size = resolveCudaMaxBatchSize();
+    log.info("inference", "CUDA backend init config", .{
+        .max_batch = cuda_max_batch_size,
+    });
+    const cuda_backend_state = try cuda.BackendType.init(allocator, loaded, cuda_max_batch_size);
     log.info("inference", "Backend selected: cuda", .{ .reason = reason });
     return .{ .cuda = cuda_backend_state };
 }

@@ -40,6 +40,7 @@ const initial_kv_cache_tokens: usize = 256;
 const kv_cache_dtype_fp16: bool = true;
 const enable_fused_attention_f16_kv: bool = true;
 const max_fused_attention_f16_kv_seq_len: u32 = 384;
+const default_prefill_chunk_rows_cap: usize = 1024;
 const enable_device_embedding_lookup: bool = true;
 const max_supported_fused_f16_kv_head_dim = 512;
 // Optional dispatch observability. Keep disabled by default so production
@@ -68,6 +69,140 @@ const EmbeddingLookupKind = enum(u8) {
 
 fn saturatingU64FromU128(value: u128) u64 {
     return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
+}
+
+fn saturatingAddUsize(a: usize, b: usize) usize {
+    return std.math.add(usize, a, b) catch std.math.maxInt(usize);
+}
+
+fn parseEnvBoolValue(raw: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(raw, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "on")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "no")) return false;
+    if (std.ascii.eqlIgnoreCase(raw, "off")) return false;
+    return null;
+}
+
+fn resolveEnvBool(name: []const u8, default_value: bool) bool {
+    const raw = std.process.getEnvVarOwned(std.heap.c_allocator, name) catch {
+        return default_value;
+    };
+    defer std.heap.c_allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return parseEnvBoolValue(trimmed) orelse blk: {
+        log.warn("inference", "Invalid boolean env; using default", .{
+            .name = name,
+            .value = trimmed,
+            .default = @as(u8, @intFromBool(default_value)),
+        });
+        break :blk default_value;
+    };
+}
+
+fn resolveCudaFixedAllocMode() bool {
+    return resolveEnvBool("TALU_CUDA_FIXED_ALLOC", false);
+}
+
+fn resolveCudaRequireFitCheck() bool {
+    return resolveEnvBool("TALU_CUDA_REQUIRE_FIT", false);
+}
+
+fn resolveCudaMemoryReserveBytes() usize {
+    const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_MEMORY_RESERVE_MIB") catch {
+        return 0;
+    };
+    defer std.heap.c_allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const reserve_mib = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+        log.warn("inference", "Invalid TALU_CUDA_MEMORY_RESERVE_MIB; using default", .{
+            .value = trimmed,
+            .default_mib = 0,
+        });
+        return 0;
+    };
+    return std.math.mul(usize, reserve_mib, 1024 * 1024) catch std.math.maxInt(usize);
+}
+
+fn resolveCudaMaxSeqLen(model_max_seq_len: usize) usize {
+    const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_MAX_SEQ_LEN") catch {
+        return model_max_seq_len;
+    };
+    defer std.heap.c_allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+        log.warn("inference", "Invalid TALU_CUDA_MAX_SEQ_LEN; using model max", .{
+            .value = trimmed,
+            .model_max_seq = model_max_seq_len,
+        });
+        return model_max_seq_len;
+    };
+    if (parsed == 0) {
+        log.warn("inference", "TALU_CUDA_MAX_SEQ_LEN must be >= 1; using model max", .{
+            .value = parsed,
+            .model_max_seq = model_max_seq_len,
+        });
+        return model_max_seq_len;
+    }
+    const resolved = @min(model_max_seq_len, parsed);
+    if (resolved != model_max_seq_len) {
+        log.info("inference", "CUDA max_seq_len clamped by TALU_CUDA_MAX_SEQ_LEN", .{
+            .model_max_seq = model_max_seq_len,
+            .effective_max_seq = resolved,
+        });
+    }
+    return resolved;
+}
+
+fn resolveCudaInitialKvCacheTokens(max_seq_len: usize) usize {
+    const fallback = @min(max_seq_len, initial_kv_cache_tokens);
+    const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_KV_INIT_TOKENS") catch {
+        return fallback;
+    };
+    defer std.heap.c_allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+        log.warn("inference", "Invalid TALU_CUDA_KV_INIT_TOKENS; using fallback", .{
+            .value = trimmed,
+            .fallback = fallback,
+        });
+        return fallback;
+    };
+    if (parsed == 0) {
+        log.warn("inference", "TALU_CUDA_KV_INIT_TOKENS must be >= 1; using fallback", .{
+            .value = parsed,
+            .fallback = fallback,
+        });
+        return fallback;
+    }
+    return @min(max_seq_len, parsed);
+}
+
+fn resolveCudaPrefillChunkRowsCap(max_seq_len: usize) usize {
+    const fallback = @min(max_seq_len, default_prefill_chunk_rows_cap);
+    const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_PREFILL_CHUNK_ROWS") catch {
+        return fallback;
+    };
+    defer std.heap.c_allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+        log.warn("inference", "Invalid TALU_CUDA_PREFILL_CHUNK_ROWS; using fallback", .{
+            .value = trimmed,
+            .fallback = fallback,
+        });
+        return fallback;
+    };
+    if (parsed == 0) {
+        log.warn("inference", "TALU_CUDA_PREFILL_CHUNK_ROWS must be >= 1; using fallback", .{
+            .value = parsed,
+            .fallback = fallback,
+        });
+        return fallback;
+    }
+    return @min(max_seq_len, parsed);
 }
 
 const KernelSlot = enum {
@@ -149,6 +284,24 @@ const AttentionPath = enum {
     heads_f16_kv,
     heads_f32_kv,
 };
+
+const KvCacheStorageMode = enum(u8) {
+    device,
+};
+
+fn resolveCudaKvStorageMode() KvCacheStorageMode {
+    const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_KV_STORAGE") catch {
+        return .device;
+    };
+    defer std.heap.c_allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "device")) return .device;
+    log.warn("inference", "Invalid TALU_CUDA_KV_STORAGE; using default", .{
+        .value = trimmed,
+        .default = "device",
+    });
+    return .device;
+}
 
 const AttentionKernelSet = struct {
     attn_scores_heads_f32_function: ?compute.cuda.Function,
@@ -675,11 +828,18 @@ const RuntimeBuffers = struct {
         return error.CudaKernelUnavailable;
     }
 
-    fn ensureRowCapacity(self: *RuntimeBuffers, device: *compute.cuda.Device, required_rows: usize) !void {
+    fn ensureRowCapacity(
+        self: *RuntimeBuffers,
+        device: *compute.cuda.Device,
+        required_rows: usize,
+        fixed_alloc_mode: bool,
+    ) !void {
         if (required_rows == 0) return error.InvalidArgument;
         if (required_rows <= self.row_capacity) return;
         if (required_rows > self.max_seq_len) return error.InvalidArgument;
+        if (fixed_alloc_mode) return error.OutOfMemory;
 
+        const old_capacity = self.row_capacity;
         var new_capacity = self.row_capacity;
         if (new_capacity == 0) new_capacity = 1;
         while (new_capacity < required_rows) {
@@ -699,6 +859,11 @@ const RuntimeBuffers = struct {
         const activation_u16_bytes = std.math.mul(usize, max_linear_in_dim, @sizeOf(u16)) catch return error.InvalidArgument;
         const shortconv_proj_bytes = std.math.mul(usize, self.shortconv_dim * 3, @sizeOf(f32)) catch return error.InvalidArgument;
         const shortconv_conv_bytes = std.math.mul(usize, self.shortconv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
+        log.debug("inference", "CUDA runtime row capacity growth", .{
+            .old_rows = old_capacity,
+            .new_rows = new_capacity,
+            .required_rows = required_rows,
+        }, @src());
 
         try resizeScratchBuffer(device, &self.input_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
         try resizeScratchBuffer(device, &self.norm_out_dev, std.math.mul(usize, d_model_bytes, new_capacity) catch return error.InvalidArgument);
@@ -1552,14 +1717,16 @@ const BlockRuntime = struct {
         allocator: std.mem.Allocator,
         device: *compute.cuda.Device,
         loaded: *const LoadedModel,
+        max_seq_len: usize,
+        kv_init_tokens: usize,
     ) !BlockRuntime {
         const d_model: usize = @intCast(loaded.config.d_model);
         const n_heads: usize = @intCast(loaded.config.n_heads);
         const n_kv_heads: usize = @intCast(loaded.config.n_kv_groups);
         const head_dim: usize = @intCast(loaded.config.head_dim);
-        const max_seq_len: usize = @intCast(loaded.config.max_seq_len);
         if (n_heads == 0 or n_kv_heads == 0 or head_dim == 0 or max_seq_len == 0) return error.InvalidArgument;
         if (n_heads % n_kv_heads != 0) return error.UnsupportedModel;
+        const initial_kv_tokens = @min(max_seq_len, @max(@as(usize, 1), kv_init_tokens));
         const arena_allocator = @constCast(&loaded.arena).allocator();
         const static_entry = if (loaded.runtime.architecture_id) |arch_id|
             models.registry.detectByArchitectureId(arch_id)
@@ -1902,15 +2069,14 @@ const BlockRuntime = struct {
                         return error.UnsupportedModel;
                     }
 
-                    const kv_capacity = @min(max_seq_len, initial_kv_cache_tokens);
+                    const kv_capacity = initial_kv_tokens;
                     if (kv_capacity == 0) return error.InvalidArgument;
-                    const kv_cache_elems = std.math.mul(usize, kv_capacity, k_proj_dev.cols()) catch return error.InvalidArgument;
-                    const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
-                    const kv_cache_bytes_per_buffer = std.math.mul(usize, kv_cache_elems, kv_elem_bytes) catch return error.InvalidArgument;
-                    var k_cache = try device.allocBuffer(kv_cache_bytes_per_buffer);
-                    errdefer k_cache.deinit(device);
-                    var v_cache = try device.allocBuffer(kv_cache_bytes_per_buffer);
-                    errdefer v_cache.deinit(device);
+                    const kv_cache_bytes_per_buffer = try kvCacheBytesForCapacity(kv_capacity, k_proj_dev.cols());
+                    var kv_pair = try allocDeviceKvPair(device, kv_capacity, k_proj_dev.cols());
+                    errdefer {
+                        kv_pair.v.deinit(device);
+                        kv_pair.k.deinit(device);
+                    }
 
                     const layer_norm_bytes = ln1_weight.byteSize() +
                         ln2_weight.byteSize() +
@@ -1953,8 +2119,8 @@ const BlockRuntime = struct {
                         .w1 = w1_dev,
                         .w2 = w2_dev,
                         .w3 = w3_dev,
-                        .k_cache = k_cache,
-                        .v_cache = v_cache,
+                        .k_cache = kv_pair.k,
+                        .v_cache = kv_pair.v,
                         .kv_capacity = kv_capacity,
                         .cpu_kernel = cpu_attention_kernel,
                         .cpu_cache = cpu_attention_cache,
@@ -2785,7 +2951,14 @@ pub const CudaBackend = struct {
     norm_eps: f32,
     cpu_rope_global: ?*cpu_kernels.RoPE = null,
     cpu_rope_local: ?*cpu_kernels.RoPE = null,
+    kv_storage_mode: KvCacheStorageMode = .device,
+    kv_init_tokens: usize = initial_kv_cache_tokens,
+    prefill_chunk_rows_cap: usize = default_prefill_chunk_rows_cap,
     max_batch_size: usize = 1,
+    fixed_alloc_mode: bool = false,
+    require_fit_check: bool = false,
+    memory_reserve_bytes: usize = 0,
+    model_max_seq_len: usize = 0,
     slot_in_use: []bool,
     slot_positions: []usize,
     slot_rope_position_deltas: []isize,
@@ -2841,9 +3014,46 @@ pub const CudaBackend = struct {
         }
     };
 
+    const DeviceMemoryBudget = struct {
+        weights_bytes: usize,
+        runtime_bytes: usize,
+        kv_state_bytes: usize,
+        gated_delta_state_bytes: usize,
+        shortconv_state_bytes: usize,
+        layer_program_bytes: usize,
+        workspace_bytes: usize,
+        misc_bytes: usize,
+
+        fn slotStateBytes(self: *const DeviceMemoryBudget) usize {
+            var total: usize = 0;
+            total = saturatingAddUsize(total, self.kv_state_bytes);
+            total = saturatingAddUsize(total, self.gated_delta_state_bytes);
+            total = saturatingAddUsize(total, self.shortconv_state_bytes);
+            return total;
+        }
+
+        fn totalBytes(self: *const DeviceMemoryBudget) usize {
+            var total: usize = 0;
+            total = saturatingAddUsize(total, self.weights_bytes);
+            total = saturatingAddUsize(total, self.runtime_bytes);
+            total = saturatingAddUsize(total, self.slotStateBytes());
+            total = saturatingAddUsize(total, self.layer_program_bytes);
+            total = saturatingAddUsize(total, self.workspace_bytes);
+            total = saturatingAddUsize(total, self.misc_bytes);
+            return total;
+        }
+    };
+
     pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel, max_batch_size: usize) !CudaBackend {
         var device = try compute.cuda.Device.init();
         errdefer device.deinit();
+        if (max_batch_size == 0) return error.InvalidArgument;
+        const model_max_seq_len: usize = @intCast(loaded.config.max_seq_len);
+        const resolved_max_seq_len = resolveCudaMaxSeqLen(model_max_seq_len);
+        const resolved_kv_init_tokens = resolveCudaInitialKvCacheTokens(resolved_max_seq_len);
+        const resolved_prefill_chunk_rows_cap = resolveCudaPrefillChunkRowsCap(resolved_max_seq_len);
+        const resolved_require_fit_check = resolveCudaRequireFitCheck();
+        const resolved_memory_reserve_bytes = resolveCudaMemoryReserveBytes();
 
         log.info("inference", "CUDA device ready", .{ .name = device.name() });
         var backend = CudaBackend{
@@ -2862,10 +3072,17 @@ pub const CudaBackend = struct {
             .n_heads = @intCast(loaded.config.n_heads),
             .n_kv_heads = @intCast(loaded.config.n_kv_groups),
             .head_dim = @intCast(loaded.config.head_dim),
-            .max_seq_len = @intCast(loaded.config.max_seq_len),
+            .max_seq_len = resolved_max_seq_len,
             .rope_dim = 0,
             .attention_scale = 0.0,
+            .kv_storage_mode = resolveCudaKvStorageMode(),
+            .kv_init_tokens = resolved_kv_init_tokens,
+            .prefill_chunk_rows_cap = resolved_prefill_chunk_rows_cap,
             .max_batch_size = max_batch_size,
+            .fixed_alloc_mode = resolveCudaFixedAllocMode(),
+            .require_fit_check = resolved_require_fit_check,
+            .memory_reserve_bytes = resolved_memory_reserve_bytes,
+            .model_max_seq_len = model_max_seq_len,
             .norm_eps = prototype_eps,
             .cpu_rope_global = null,
             .cpu_rope_local = null,
@@ -2943,7 +3160,13 @@ pub const CudaBackend = struct {
         for (backend.slot_state_bindings) |*binding| binding.* = .{};
         backend.argmax_index_dev = try backend.device.allocBuffer(@sizeOf(u32));
         errdefer backend.argmax_index_dev.deinit(&backend.device);
-        backend.block_runtime = try BlockRuntime.init(allocator, &backend.device, loaded);
+        backend.block_runtime = try BlockRuntime.init(
+            allocator,
+            &backend.device,
+            loaded,
+            backend.max_seq_len,
+            backend.kv_init_tokens,
+        );
         errdefer backend.block_runtime.deinit(allocator, &backend.device);
         backend.assignCpuRuntimeRopeToAttentionFallbacks();
         try backend.initSlotKvStates();
@@ -2994,7 +3217,67 @@ pub const CudaBackend = struct {
         try backend.initLayerProgramSlotBuffers();
         errdefer backend.deinitLayerProgramSlotBuffers();
         try backend.initKernelFunctions();
+        try backend.preallocateFixedAllocBuffers();
         try backend.warmupDequantF16Cache();
+        const memory_budget = backend.computeDeviceMemoryBudget();
+        const slot_state_bytes = memory_budget.slotStateBytes();
+        const slot_state_per_slot_bytes: usize = if (backend.max_batch_size > 0)
+            slot_state_bytes / backend.max_batch_size
+        else
+            0;
+        const known_device_bytes = memory_budget.totalBytes();
+        const reserve_device_bytes = backend.memory_reserve_bytes;
+        const require_fit_check = backend.require_fit_check;
+        const required_with_reserve_bytes = saturatingAddUsize(known_device_bytes, reserve_device_bytes);
+        const total_device_bytes = backend.device.totalMemory() catch 0;
+        const known_device_pct: f32 = if (total_device_bytes > 0)
+            (@as(f32, @floatFromInt(known_device_bytes)) * 100.0) / @as(f32, @floatFromInt(total_device_bytes))
+        else
+            0.0;
+        const required_with_reserve_pct: f32 = if (total_device_bytes > 0)
+            (@as(f32, @floatFromInt(required_with_reserve_bytes)) * 100.0) / @as(f32, @floatFromInt(total_device_bytes))
+        else
+            0.0;
+        log.info("inference", "CUDA device memory budget", .{
+            .known_device_mib = bytesToMiB(known_device_bytes),
+            .required_with_reserve_mib = bytesToMiB(required_with_reserve_bytes),
+            .weights_mib = bytesToMiB(memory_budget.weights_bytes),
+            .runtime_mib = bytesToMiB(memory_budget.runtime_bytes),
+            .slot_state_mib = bytesToMiB(slot_state_bytes),
+            .slot_state_per_slot_mib = bytesToMiB(slot_state_per_slot_bytes),
+            .kv_state_mib = bytesToMiB(memory_budget.kv_state_bytes),
+            .gated_delta_state_mib = bytesToMiB(memory_budget.gated_delta_state_bytes),
+            .shortconv_state_mib = bytesToMiB(memory_budget.shortconv_state_bytes),
+            .layer_program_mib = bytesToMiB(memory_budget.layer_program_bytes),
+            .workspace_mib = bytesToMiB(memory_budget.workspace_bytes),
+            .misc_mib = bytesToMiB(memory_budget.misc_bytes),
+            .device_total_mib = bytesToMiB(total_device_bytes),
+            .known_device_pct = known_device_pct,
+            .required_with_reserve_pct = required_with_reserve_pct,
+            .reserve_mib = bytesToMiB(reserve_device_bytes),
+            .kv_storage = @tagName(backend.kv_storage_mode),
+            .kv_init_tokens = backend.kv_init_tokens,
+            .prefill_chunk_rows = backend.prefill_chunk_rows_cap,
+            .max_batch = backend.max_batch_size,
+            .max_seq = backend.max_seq_len,
+            .model_max_seq = backend.model_max_seq_len,
+            .fixed_alloc = @as(u8, @intFromBool(backend.fixed_alloc_mode)),
+            .require_fit = @as(u8, @intFromBool(require_fit_check)),
+        });
+        if (total_device_bytes > 0 and required_with_reserve_bytes > total_device_bytes) {
+            log.warn("inference", "CUDA known device allocations exceed fit envelope", .{
+                .known_device_mib = bytesToMiB(known_device_bytes),
+                .required_with_reserve_mib = bytesToMiB(required_with_reserve_bytes),
+                .reserve_mib = bytesToMiB(reserve_device_bytes),
+                .device_total_mib = bytesToMiB(total_device_bytes),
+                .max_batch = backend.max_batch_size,
+                .max_seq = backend.max_seq_len,
+                .model_max_seq = backend.model_max_seq_len,
+                .fixed_alloc = @as(u8, @intFromBool(backend.fixed_alloc_mode)),
+                .require_fit = @as(u8, @intFromBool(require_fit_check)),
+            });
+            if (require_fit_check) return error.OutOfMemory;
+        }
 
         if (loaded.original_weight_dtype == .grouped_affine_u4) {
             backend.gaffine_sequence_rows_supported = smoke_checks.probeGaffineU4SequenceRowsSupport(&backend) catch false;
@@ -3030,6 +3313,9 @@ pub const CudaBackend = struct {
             .max_attn = backend.runtime_buffers.max_attn,
             .max_kv = backend.runtime_buffers.max_kv,
             .max_seq = backend.max_seq_len,
+            .kv_storage = @tagName(backend.kv_storage_mode),
+            .kv_init_tokens = backend.kv_init_tokens,
+            .prefill_chunk_rows = backend.prefill_chunk_rows_cap,
             .kv_capacity_init = backend.initialKvCapacity(),
             .n_heads = backend.n_heads,
             .n_kv = backend.n_kv_heads,
@@ -3087,6 +3373,10 @@ pub const CudaBackend = struct {
             .gaffine_sequence_fused_qkv_supported = @as(u8, @intFromBool(backend.gaffine_sequence_fused_qkv_supported)),
             .gaffine_sequence_fused_gate_up_supported = @as(u8, @intFromBool(backend.gaffine_sequence_fused_gate_up_supported)),
             .kv_dtype = if (kv_cache_dtype_fp16) "f16" else "f32",
+            .fixed_alloc = @as(u8, @intFromBool(backend.fixed_alloc_mode)),
+            .require_fit = @as(u8, @intFromBool(backend.require_fit_check)),
+            .reserve_mib = bytesToMiB(backend.memory_reserve_bytes),
+            .model_max_seq = backend.model_max_seq_len,
             .linear_weight_mib = bytesToMiB(backend.block_runtime.linear_weight_bytes),
             .norm_weight_mib = bytesToMiB(backend.block_runtime.norm_weight_bytes),
             .kv_cache_mib = bytesToMiB(backend.block_runtime.kv_cache_bytes),
@@ -3171,6 +3461,64 @@ pub const CudaBackend = struct {
         return self.max_batch_size;
     }
 
+    /// Central KV allocation seam for future storage backends.
+    fn allocKvPair(self: *CudaBackend, capacity: usize, kv_dim: usize) !DeviceKvPair {
+        return switch (self.kv_storage_mode) {
+            .device => allocDeviceKvPair(&self.device, capacity, kv_dim),
+        };
+    }
+
+    fn computeDeviceMemoryBudget(self: *const CudaBackend) DeviceMemoryBudget {
+        const weights_bytes = saturatingAddUsize(
+            self.block_runtime.linear_weight_bytes,
+            self.block_runtime.norm_weight_bytes,
+        );
+        const runtime_bytes = self.runtime_buffers.deviceByteSize();
+
+        var kv_state_bytes: usize = 0;
+        var gated_delta_state_bytes: usize = 0;
+        var shortconv_state_bytes: usize = 0;
+        for (self.slot_kv_states) |slot| {
+            for (slot.kv) |entry| {
+                kv_state_bytes = saturatingAddUsize(kv_state_bytes, entry.k.size);
+                kv_state_bytes = saturatingAddUsize(kv_state_bytes, entry.v.size);
+            }
+            for (slot.gd) |entry| {
+                gated_delta_state_bytes = saturatingAddUsize(gated_delta_state_bytes, entry.conv.size);
+                gated_delta_state_bytes = saturatingAddUsize(gated_delta_state_bytes, entry.ssm.size);
+            }
+            for (slot.sc) |entry| {
+                shortconv_state_bytes = saturatingAddUsize(shortconv_state_bytes, entry.conv.size);
+            }
+        }
+
+        var layer_program_bytes: usize = 0;
+        for (self.layer_program_slot_buffers) |buf| {
+            layer_program_bytes = saturatingAddUsize(layer_program_bytes, buf.size);
+        }
+
+        var workspace_bytes: usize = 0;
+        if (self.attn_scores_workspace_dev) |buf| {
+            workspace_bytes = saturatingAddUsize(workspace_bytes, buf.size);
+        }
+        if (self.attn_u16_workspace_dev) |buf| {
+            workspace_bytes = saturatingAddUsize(workspace_bytes, buf.size);
+        }
+
+        const misc_bytes = self.argmax_index_dev.size;
+
+        return .{
+            .weights_bytes = weights_bytes,
+            .runtime_bytes = runtime_bytes,
+            .kv_state_bytes = kv_state_bytes,
+            .gated_delta_state_bytes = gated_delta_state_bytes,
+            .shortconv_state_bytes = shortconv_state_bytes,
+            .layer_program_bytes = layer_program_bytes,
+            .workspace_bytes = workspace_bytes,
+            .misc_bytes = misc_bytes,
+        };
+    }
+
     /// Returns a per-slot logits slice for the given slot index.
     pub fn slotLogits(self: *CudaBackend, slot_index: usize) []f32 {
         const offset = slot_index * self.vocab_size;
@@ -3239,13 +3587,12 @@ pub const CudaBackend = struct {
                     if (slot_idx == 0) {
                         sks.kv[attn_i] = .{ .k = block.k_cache, .v = block.v_cache, .capacity = block.kv_capacity };
                     } else {
-                        const elem_size: usize = if (block.k_cache.size > block.kv_capacity * block.kv_dim * @sizeOf(f32)) @sizeOf(u16) else @sizeOf(f32);
-                        const kv_bytes = std.math.mul(usize, block.kv_capacity, block.kv_dim * elem_size) catch return error.InvalidArgument;
-                        var k = try self.device.allocBuffer(kv_bytes);
-                        errdefer k.deinit(&self.device);
-                        var v = try self.device.allocBuffer(kv_bytes);
-                        errdefer v.deinit(&self.device);
-                        sks.kv[attn_i] = .{ .k = k, .v = v, .capacity = block.kv_capacity };
+                        var kv_pair = try self.allocKvPair(block.kv_capacity, block.kv_dim);
+                        errdefer {
+                            kv_pair.v.deinit(&self.device);
+                            kv_pair.k.deinit(&self.device);
+                        }
+                        sks.kv[attn_i] = .{ .k = kv_pair.k, .v = kv_pair.v, .capacity = block.kv_capacity };
                     }
                     attn_i += 1;
                 }
@@ -3420,12 +3767,18 @@ pub const CudaBackend = struct {
         self.layer_program_row_capacity = 1;
     }
 
-    fn ensureLayerProgramSlotRowCapacity(self: *CudaBackend, required_rows: usize) !void {
+    fn ensureLayerProgramSlotRowCapacity(
+        self: *CudaBackend,
+        required_rows: usize,
+        fixed_alloc_mode: bool,
+    ) !void {
         if (required_rows == 0) return error.InvalidArgument;
         if (required_rows <= self.layer_program_row_capacity) return;
         if (required_rows > self.max_seq_len) return error.InvalidArgument;
         if (self.layer_program_slot_buffers.len == 0) return;
+        if (fixed_alloc_mode) return error.OutOfMemory;
 
+        const old_capacity = self.layer_program_row_capacity;
         var new_capacity = self.layer_program_row_capacity;
         if (new_capacity == 0) new_capacity = 1;
         while (new_capacity < required_rows) {
@@ -3435,6 +3788,12 @@ pub const CudaBackend = struct {
             if (new_capacity == self.max_seq_len) break;
         }
         if (new_capacity < required_rows) return error.InvalidArgument;
+        log.debug("inference", "CUDA layer-program row capacity growth", .{
+            .old_rows = old_capacity,
+            .new_rows = new_capacity,
+            .required_rows = required_rows,
+            .slots = self.layer_program_slot_buffers.len,
+        }, @src());
 
         for (self.layer_program_slot_buffers, 0..) |*buf, idx| {
             const width = self.layer_program_slot_widths[idx];
@@ -3442,6 +3801,51 @@ pub const CudaBackend = struct {
             try resizeScratchBuffer(&self.device, buf, std.math.mul(usize, row_bytes, new_capacity) catch return error.InvalidArgument);
         }
         self.layer_program_row_capacity = new_capacity;
+    }
+
+    fn preallocateFixedAllocBuffers(self: *CudaBackend) !void {
+        if (!self.fixed_alloc_mode) return;
+
+        // Preallocate all grow-only CUDA buffers to their configured maxima.
+        // After this point, fixed_alloc_mode enforces "no growth at runtime".
+        const prev_fixed_mode = self.fixed_alloc_mode;
+        self.fixed_alloc_mode = false;
+        defer self.fixed_alloc_mode = prev_fixed_mode;
+
+        var slot_index: usize = 0;
+        while (slot_index < self.max_batch_size) : (slot_index += 1) {
+            self.activateKvSlot(slot_index);
+            try self.ensureKvCapacity(self.max_seq_len);
+        }
+        self.saveActiveKvSlot();
+        self.activateKvSlot(0);
+
+        try self.runtime_buffers.ensureRowCapacity(&self.device, self.max_seq_len, false);
+        try self.ensureLayerProgramSlotRowCapacity(self.max_seq_len, false);
+
+        const kv_groups_u32: u32 = @intCast(self.n_heads / self.n_kv_heads);
+        const prefill_rows: usize = @min(self.max_seq_len, self.prefill_chunk_rows_cap);
+        const prefill_rows_u32: u32 = @intCast(prefill_rows);
+        const max_seq_len_u32: u32 = @intCast(self.max_seq_len);
+
+        _ = try self.ensureAttnScoresWorkspace(
+            kv_groups_u32,
+            prefill_rows_u32,
+            max_seq_len_u32,
+        );
+
+        const q_f16_elems = std.math.mul(usize, prefill_rows, self.runtime_buffers.max_attn) catch return error.InvalidArgument;
+        const probs_f16_elems = std.math.mul(
+            usize,
+            std.math.mul(usize, @as(usize, kv_groups_u32), prefill_rows) catch return error.InvalidArgument,
+            self.max_seq_len,
+        ) catch return error.InvalidArgument;
+        const u16_workspace_bytes = std.math.mul(
+            usize,
+            q_f16_elems + probs_f16_elems,
+            @sizeOf(u16),
+        ) catch return error.InvalidArgument;
+        _ = try self.ensureAttnU16Workspace(u16_workspace_bytes);
     }
 
     fn deinitLayerProgramSlotBuffers(self: *CudaBackend) void {
@@ -4449,8 +4853,8 @@ pub const CudaBackend = struct {
         }
 
         // Ensure scratch buffers fit N rows.
-        try self.runtime_buffers.ensureRowCapacity(&self.device, n_usize);
-        try self.ensureLayerProgramSlotRowCapacity(n_usize);
+        try self.runtime_buffers.ensureRowCapacity(&self.device, n_usize, self.fixed_alloc_mode);
+        try self.ensureLayerProgramSlotRowCapacity(n_usize, self.fixed_alloc_mode);
 
         // Ensure KV capacity for each slot via activate/ensure/save.
         for (0..n_usize) |i| {
@@ -4794,13 +5198,12 @@ pub const CudaBackend = struct {
 
         // Chunked prefill: process in chunks through all layers, building
         // KV cache incrementally. Keeps scratch buffer allocations bounded.
-        const prefill_chunk_cap: usize = 1024;
         var pos_base: usize = 0;
         while (pos_base < total_rows) {
-            const rows = @min(total_rows - pos_base, prefill_chunk_cap);
+            const rows = @min(total_rows - pos_base, self.prefill_chunk_rows_cap);
             const chunk_tokens = tokens[pos_base .. pos_base + rows];
-            try self.runtime_buffers.ensureRowCapacity(&self.device, rows);
-            try self.ensureLayerProgramSlotRowCapacity(rows);
+            try self.runtime_buffers.ensureRowCapacity(&self.device, rows, self.fixed_alloc_mode);
+            try self.ensureLayerProgramSlotRowCapacity(rows, self.fixed_alloc_mode);
             var used_device_lookup = false;
             if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
                 const lookup = &self.runtime_buffers.embedding_lookup.?;
@@ -5098,10 +5501,13 @@ pub const CudaBackend = struct {
         else
             null;
 
+        var logged_growth = false;
         for (self.block_runtime.blocks) |*layer| {
             const block = layer.attention_binding orelse continue;
             if (required_tokens <= block.kv_capacity) continue;
+            if (self.fixed_alloc_mode) return error.OutOfMemory;
 
+            const old_capacity = block.kv_capacity;
             var new_capacity = block.kv_capacity;
             if (new_capacity == 0) new_capacity = 1;
             while (new_capacity < required_tokens) {
@@ -5111,14 +5517,23 @@ pub const CudaBackend = struct {
                 if (new_capacity == self.max_seq_len) break;
             }
             if (new_capacity < required_tokens) return error.InvalidArgument;
+            if (!logged_growth) {
+                log.debug("inference", "CUDA KV capacity growth", .{
+                    .old_tokens = old_capacity,
+                    .new_tokens = new_capacity,
+                    .required_tokens = required_tokens,
+                    .kv_dim = block.kv_dim,
+                    .attention_layers = self.block_runtime.attention_block_count,
+                    .kv_storage = @tagName(self.kv_storage_mode),
+                }, @src());
+                logged_growth = true;
+            }
 
-            const new_elems = std.math.mul(usize, new_capacity, block.kv_dim) catch return error.InvalidArgument;
-            const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
-            const new_bytes = std.math.mul(usize, new_elems, kv_elem_bytes) catch return error.InvalidArgument;
-            var new_k_cache = try self.device.allocBuffer(new_bytes);
-            errdefer new_k_cache.deinit(&self.device);
-            var new_v_cache = try self.device.allocBuffer(new_bytes);
-            errdefer new_v_cache.deinit(&self.device);
+            var new_kv_pair = try self.allocKvPair(new_capacity, block.kv_dim);
+            errdefer {
+                new_kv_pair.v.deinit(&self.device);
+                new_kv_pair.k.deinit(&self.device);
+            }
 
             if (block.kv_capacity > 0) {
                 const old_elems = std.math.mul(usize, block.kv_capacity, block.kv_dim) catch return error.InvalidArgument;
@@ -5129,7 +5544,7 @@ pub const CudaBackend = struct {
                         &self.device,
                         copy_u16_function.?,
                         &block.k_cache,
-                        &new_k_cache,
+                        &new_kv_pair.k,
                         old_count_u32,
                     );
                     try compute.cuda.copy_u16.runWithFunction(
@@ -5137,7 +5552,7 @@ pub const CudaBackend = struct {
                         &self.device,
                         copy_u16_function.?,
                         &block.v_cache,
-                        &new_v_cache,
+                        &new_kv_pair.v,
                         old_count_u32,
                     );
                 } else {
@@ -5146,7 +5561,7 @@ pub const CudaBackend = struct {
                         &self.device,
                         copy_function.?,
                         &block.k_cache,
-                        &new_k_cache,
+                        &new_kv_pair.k,
                         old_count_u32,
                     );
                     try compute.cuda.copy.runWithFunction(
@@ -5154,7 +5569,7 @@ pub const CudaBackend = struct {
                         &self.device,
                         copy_function.?,
                         &block.v_cache,
-                        &new_v_cache,
+                        &new_kv_pair.v,
                         old_count_u32,
                     );
                 }
@@ -5162,8 +5577,8 @@ pub const CudaBackend = struct {
 
             block.k_cache.deinit(&self.device);
             block.v_cache.deinit(&self.device);
-            block.k_cache = new_k_cache;
-            block.v_cache = new_v_cache;
+            block.k_cache = new_kv_pair.k;
+            block.v_cache = new_kv_pair.v;
             block.kv_capacity = new_capacity;
         }
     }
@@ -8470,12 +8885,18 @@ pub const CudaBackend = struct {
                     while (g < kv_groups_u32) : (g += 1) {
                         try self.blas.gemmU16(
                             &self.device,
-                            true, sl, qr, hd,
+                            true,
+                            sl,
+                            qr,
+                            hd,
                             self.attention_scale,
-                            k_ptr, kv_ld,
-                            q_f16_ptr + @as(usize, g) * hd * @sizeOf(u16), q_ld,
+                            k_ptr,
+                            kv_ld,
+                            q_f16_ptr + @as(usize, g) * hd * @sizeOf(u16),
+                            q_ld,
                             0.0,
-                            scores_buf.pointer + @as(usize, g) * qr * sl * @sizeOf(f32), sl,
+                            scores_buf.pointer + @as(usize, g) * qr * sl * @sizeOf(f32),
+                            sl,
                         );
                     }
 
@@ -8507,12 +8928,18 @@ pub const CudaBackend = struct {
                     while (g < kv_groups_u32) : (g += 1) {
                         try self.blas.gemmU16(
                             &self.device,
-                            false, hd, qr, sl,
+                            false,
+                            hd,
+                            qr,
+                            sl,
                             1.0,
-                            v_ptr, kv_ld,
-                            probs_f16_buf.pointer + @as(usize, g) * qr * sl * @sizeOf(u16), sl,
+                            v_ptr,
+                            kv_ld,
+                            probs_f16_buf.pointer + @as(usize, g) * qr * sl * @sizeOf(u16),
+                            sl,
                             0.0,
-                            out_ptr + @as(usize, g) * hd * @sizeOf(f32), ctx_ld,
+                            out_ptr + @as(usize, g) * hd * @sizeOf(f32),
+                            ctx_ld,
                         );
                     }
                 }
@@ -8581,6 +9008,7 @@ pub const CudaBackend = struct {
         const required_bytes = std.math.mul(usize, total_elems, @sizeOf(f32)) catch return error.InvalidArgument;
 
         if (self.attn_scores_workspace_dev == null or self.attn_scores_workspace_dev.?.size < required_bytes) {
+            if (self.fixed_alloc_mode) return error.OutOfMemory;
             if (self.attn_scores_workspace_dev) |*buf| buf.deinit(&self.device);
             self.attn_scores_workspace_dev = try self.device.allocBuffer(required_bytes);
         }
@@ -8594,6 +9022,7 @@ pub const CudaBackend = struct {
     /// Returns a buffer of at least `required_bytes`.
     fn ensureAttnU16Workspace(self: *CudaBackend, required_bytes: usize) !compute.cuda.Buffer {
         if (self.attn_u16_workspace_dev == null or self.attn_u16_workspace_dev.?.size < required_bytes) {
+            if (self.fixed_alloc_mode) return error.OutOfMemory;
             if (self.attn_u16_workspace_dev) |*buf| buf.deinit(&self.device);
             self.attn_u16_workspace_dev = try self.device.allocBuffer(required_bytes);
         }
@@ -9256,7 +9685,7 @@ pub const CudaBackend = struct {
         global_rope.* = try cpu_kernels.RoPE.initFromInvFreq(
             self.allocator,
             self.rope_dim,
-            @intCast(self.loaded.config.max_seq_len),
+            @intCast(self.max_seq_len),
             global_freqs.inv_freq,
             global_freqs.attention_scaling,
         );
@@ -9276,7 +9705,7 @@ pub const CudaBackend = struct {
             local_rope.* = try cpu_kernels.RoPE.initFromInvFreq(
                 self.allocator,
                 self.rope_dim,
-                @intCast(self.loaded.config.max_seq_len),
+                @intCast(self.max_seq_len),
                 local_freqs.inv_freq,
                 local_freqs.attention_scaling,
             );
@@ -11606,6 +12035,38 @@ fn bufferSlice(buffer: *const compute.cuda.Buffer, byte_offset: usize, byte_len:
         .pointer = ptr,
         .size = byte_len,
     };
+}
+
+/// Device KV pair allocation seam.
+///
+/// Keep all CUDA KV size/allocation logic centralized here so future KV
+/// backends (host/offloaded/paged) can replace this path without broad
+/// call-site churn.
+const DeviceKvPair = struct {
+    k: compute.cuda.Buffer,
+    v: compute.cuda.Buffer,
+};
+
+fn kvCacheElementBytes() usize {
+    return if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
+}
+
+fn kvCacheBytesForCapacity(capacity: usize, kv_dim: usize) !usize {
+    const elems = std.math.mul(usize, capacity, kv_dim) catch return error.InvalidArgument;
+    return std.math.mul(usize, elems, kvCacheElementBytes()) catch return error.InvalidArgument;
+}
+
+fn allocDeviceKvPair(
+    device: *compute.cuda.Device,
+    capacity: usize,
+    kv_dim: usize,
+) !DeviceKvPair {
+    const bytes = try kvCacheBytesForCapacity(capacity, kv_dim);
+    var k = try device.allocBuffer(bytes);
+    errdefer k.deinit(device);
+    var v = try device.allocBuffer(bytes);
+    errdefer v.deinit(device);
+    return .{ .k = k, .v = v };
 }
 
 fn resizeScratchBuffer(device: *compute.cuda.Device, buffer: *compute.cuda.Buffer, new_size: usize) !void {
