@@ -304,7 +304,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
 
     let state = state::AppState {
         backend: Arc::new(tokio::sync::Mutex::new(backend_state)),
-        batch_scheduler,
+        batch_scheduler: std::sync::Mutex::new(batch_scheduler),
         configured_model: model,
         response_store: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         gateway_secret,
@@ -329,6 +329,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         sandbox_backend,
         pubsub: tokio::sync::Mutex::new(pubsub::PubSubState::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
+        drain_thread: std::sync::Mutex::new(None),
     };
 
     let addr = SocketAddr::new(args.host, args.port);

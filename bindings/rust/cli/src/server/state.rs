@@ -101,7 +101,8 @@ pub struct CollabHandleEntry {
 pub struct AppState {
     pub backend: Arc<Mutex<BackendState>>,
     /// Batch scheduler for concurrent local GPU decode (None for remote-only).
-    pub batch_scheduler: Option<Arc<crate::server::batch_scheduler::SchedulerState>>,
+    /// Behind a Mutex so it can be replaced when the backend changes (model switch).
+    pub batch_scheduler: std::sync::Mutex<Option<Arc<crate::server::batch_scheduler::SchedulerState>>>,
     pub configured_model: Option<String>,
     /// In-memory response store for `previous_response_id` conversation chaining.
     pub response_store: Mutex<HashMap<String, StoredResponse>>,
@@ -147,4 +148,7 @@ pub struct AppState {
     pub pubsub: Mutex<crate::server::pubsub::PubSubState>,
     /// Active generation stop flags. Set all on shutdown for immediate cancellation.
     pub active_stop_flags: std::sync::Mutex<Vec<Weak<AtomicBool>>>,
+    /// Previous scheduler drain thread. Joined before spawning a new one
+    /// on model switch to prevent unbounded drain thread accumulation.
+    pub drain_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }

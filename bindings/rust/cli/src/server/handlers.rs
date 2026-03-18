@@ -856,8 +856,8 @@ async fn generate_response(
     let tools_json_for_generation = effective_tools.as_ref().map(|v| v.to_string());
     let tool_choice_for_generation = effective_tool_choice.as_ref().map(|v| v.to_string());
     let reasoning_effort_for_generation = reasoning.effort.clone();
-    let batch_scheduler_for_task = state.batch_scheduler.clone();
-    let (output_items, prompt_tokens, completion_tokens, prefill_ns, generation_ns, result_ttft_ns, responses_json, model_info_json) =
+    let batch_scheduler_for_task = state.batch_scheduler.lock().unwrap().clone();
+    let (output_items, prompt_tokens, completion_tokens, prefill_ns, generation_ns, result_ttft_ns, responses_json, model_info_json, response_status, incomplete_reason) =
         tokio::task::spawn_blocking(move || {
             // Create ChatHandle with system prompt if prompt_id was provided
             log::trace!(target: "server::gen", "ChatHandle::new(system_prompt={})", system_prompt_for_task.is_some());
@@ -970,10 +970,28 @@ async fn generate_response(
                     .submit(&chat, cfg, stop_flag_for_gen)
                     .map_err(|e| anyhow!("batch submit failed: {}", e))?;
 
-                // Drain events until final.
+                // Drain events until final. Track (item_type, content_type)
+                // segments to preserve content-type fidelity (e.g. refusal
+                // vs output_text) in the reconstructed output.
+                let mut segments: Vec<OutputSegment> = Vec::new();
                 loop {
                     match event_rx.recv() {
                         Ok(event) => {
+                            if !event.text.is_empty() {
+                                let needs_new = segments.last().map_or(true, |s| {
+                                    s.item_type != event.item_type
+                                        || s.content_type != event.content_type
+                                });
+                                if needs_new {
+                                    segments.push(OutputSegment {
+                                        item_type: event.item_type,
+                                        content_type: event.content_type,
+                                        text: event.text.clone(),
+                                    });
+                                } else if let Some(last) = segments.last_mut() {
+                                    last.text.push_str(&event.text);
+                                }
+                            }
                             if event.is_final {
                                 break;
                             }
@@ -983,24 +1001,42 @@ async fn generate_response(
                 }
 
                 let batch_result = sched.take_result(request_id);
-                let (prompt_tokens, completion_tokens, prefill_ns, generation_ns, ttft_ns) =
+                // Derive response status from BatchResult. Missing result →
+                // cancelled; present result → inspect finish_reason for
+                // length/cancelled which map to "incomplete".
+                let (prompt_tokens, completion_tokens, prefill_ns, generation_ns, ttft_ns,
+                     batch_status, batch_incomplete_reason) =
                     if let Some(ref r) = batch_result {
-                        (r.prompt_tokens, r.completion_tokens, r.prefill_ns, r.generation_ns, r.ttft_ns)
+                        let (status, reason) = match r.finish_reason {
+                            1 => ("incomplete", Some("max_output_tokens")),
+                            5 => ("incomplete", Some("cancelled")),
+                            _ => ("completed", None),
+                        };
+                        (r.prompt_tokens, r.completion_tokens, r.prefill_ns,
+                         r.generation_ns, r.ttft_ns, status, reason)
                     } else {
-                        (0, 0, 0, 0, 0)
+                        log::warn!(target: "server::gen",
+                            "batch request {request_id}: take_result returned None \
+                             (cancelled or internal fault)");
+                        (0, 0, 0, 0, 0, "incomplete", Some("cancelled"))
                     };
 
                 log::debug!(target: "server::gen", "completed (batch): prompt_tokens={} completion_tokens={}",
                     prompt_tokens, completion_tokens);
 
-                // Reconstruct conversation for chaining: append generated output
-                // to the ChatHandle.
-                if let Some(ref r) = batch_result {
-                    if let Some(ref text) = r.text {
-                        if !text.is_empty() {
-                            let output_json = build_batch_output_json(text, &r.tool_calls);
-                            let _ = chat.load_responses_json(&output_json);
-                        }
+                // Reconstruct conversation for chaining from segments.
+                // Reasoning (item_type 3) and function_call args (item_type 1)
+                // are excluded — tool calls come from BatchResult instead.
+                let tool_calls = batch_result.as_ref()
+                    .map(|r| r.tool_calls.as_slice())
+                    .unwrap_or(&[]);
+                let has_output = segments.iter().any(|s| s.item_type == 0)
+                    || !tool_calls.is_empty();
+                if has_output {
+                    let output_json = build_segmented_output_json(&segments, tool_calls);
+                    if let Err(e) = chat.load_responses_json(&output_json) {
+                        log::warn!(target: "server::gen",
+                            "batch chaining: load_responses_json failed: {e}");
                     }
                 }
 
@@ -1027,6 +1063,7 @@ async fn generate_response(
                 Ok::<_, anyhow::Error>((
                     output_items, prompt_tokens, completion_tokens,
                     prefill_ns, generation_ns, ttft_ns, all_json, model_info_json,
+                    batch_status, batch_incomplete_reason,
                 ))
             } else {
                 // --- Remote provider path (direct generate with backend mutex) ---
@@ -1064,6 +1101,7 @@ async fn generate_response(
                 Ok::<_, anyhow::Error>((
                     output_items, prompt_tokens, completion_tokens,
                     prefill_ns, generation_ns, ttft_ns, responses_json, model_info_json,
+                    "completed", None::<&str>, // remote providers always complete
                 ))
             }
         })
@@ -1113,7 +1151,7 @@ async fn generate_response(
         logprobs.top_logprobs as i64,
         reasoning.effort.as_deref(),
         reasoning.summary.as_deref(),
-        "completed",
+        response_status,
         Some(&usage),
         effective_tools.as_ref(),
         effective_tool_choice.as_ref(),
@@ -1128,6 +1166,11 @@ async fn generate_response(
     }
     if !model_info_json.is_null() {
         response_value["model_info"] = model_info_json;
+    }
+    if let Some(reason) = incomplete_reason {
+        response_value["incomplete_details"] = json!({
+            "reason": reason
+        });
     }
 
     if !strict_responses {
@@ -1534,8 +1577,55 @@ async fn stream_response(
                     callback,
                 ) {
                     Ok(new_backend) => {
+                        // Recreate batch scheduler for new backend.
+                        let new_sched = crate::server::batch_scheduler::SchedulerState::new(
+                            &new_backend, None,
+                        ).ok().map(Arc::new);
+                        let old_sched = if let Ok(mut sched_guard) = state_for_store.batch_scheduler.lock() {
+                            let old = sched_guard.take();
+                            *sched_guard = new_sched;
+                            old
+                        } else {
+                            None
+                        };
+                        // Take old backend before replacing — it must outlive the
+                        // old scheduler's step thread (BatchHandle holds an engine
+                        // pointer into it).
+                        let old_backend = guard.backend.take();
                         guard.backend = Some(new_backend);
                         guard.current_model = Some(model_id.clone());
+                        drop(guard); // Release backend lock before blocking drain.
+                        // Drain old scheduler in background: the step thread
+                        // finishes active requests, then shuts down. The old
+                        // backend is kept alive until after the join.
+                        if old_sched.is_some() || old_backend.is_some() {
+                            // Join any previous drain thread before spawning
+                            // a new one to prevent unbounded accumulation.
+                            if let Ok(mut dt) = state_for_store.drain_thread.lock() {
+                                if let Some(prev) = dt.take() {
+                                    let _ = prev.join();
+                                }
+                            }
+                            let drain_handle = std::thread::Builder::new()
+                                .name("sched-drain".into())
+                                .spawn(move || {
+                                    if let Some(s) = old_sched {
+                                        s.shutdown();
+                                    }
+                                    drop(old_backend);
+                                });
+                            match drain_handle {
+                                Ok(handle) => {
+                                    if let Ok(mut dt) = state_for_store.drain_thread.lock() {
+                                        *dt = Some(handle);
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!(target: "server::gen",
+                                        "failed to spawn drain thread: {e}");
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         if strict_responses {
@@ -1694,7 +1784,8 @@ async fn stream_response(
         }));
         let ctx_for_complete = ctx.clone();
 
-        let gen_result = if let Some(ref sched) = state_for_store.batch_scheduler {
+        let batch_sched = state_for_store.batch_scheduler.lock().unwrap().clone();
+        let gen_result = if let Some(ref sched) = batch_sched {
             run_batch_streaming_generation(
                 sched,
                 backend,
@@ -2210,14 +2301,40 @@ fn run_batch_streaming_generation(
                 },
             )
         } else {
-            (0, 0, 0, 0, 0, FinishReason::EosToken)
+            // No result means cancellation or scheduler drain — surface as
+            // incomplete/cancelled rather than masking under EOS.
+            log::warn!(target: "server::gen",
+                "batch request {request_id}: take_result returned None \
+                 (cancelled or internal fault)");
+            (0, 0, 0, 0, 0, FinishReason::Cancelled)
         };
 
-    // Serialize output items from the ChatHandle. The batch API adds generated
-    // items to the conversation internally, so to_responses_json returns the
-    // complete state. However, since the batch API only borrows the ChatHandle
-    // for tokenization (it doesn't modify the conversation), we reconstruct
-    // output items from the StreamCtx accumulated state instead.
+    // Patch function_call items in StreamCtx with metadata from BatchResult.
+    // StreamCtx emits function_call items with empty call_id/name (the batch
+    // events only carry the arguments text). The real metadata comes from
+    // BatchResult.tool_calls which are parsed from the full generated text.
+    // Invariant: tool_calls order matches output_items function_call order
+    // (both from the same left-to-right parse of generated text).
+    if let Some(ref r) = batch_result {
+        if !r.tool_calls.is_empty() {
+            if let Ok(mut guard) = ctx.lock() {
+                let mut tc_idx = 0;
+                for item in &mut guard.output_items {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                        if let Some(tc) = r.tool_calls.get(tc_idx) {
+                            item["call_id"] = json!(tc.id);
+                            item["name"] = json!(tc.name);
+                            item["arguments"] = json!(tc.arguments);
+                            tc_idx += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build output items from StreamCtx (properly structured with item_type
+    // segmentation and now-patched function_call metadata).
     let output_items = if let Ok(guard) = ctx.lock() {
         if !guard.output_items.is_empty() {
             serde_json::Value::Array(guard.output_items.clone())
@@ -2228,16 +2345,16 @@ fn run_batch_streaming_generation(
         json!([])
     };
 
-    // For conversation chaining, reconstruct responses_json. The pre-gen items
-    // come from the ChatHandle; the generated output comes from the batch result.
-    // We append the generated text as an assistant message to the conversation
-    // so that load_responses_json in chained requests restores the full state.
-    if let Some(ref r) = batch_result {
-        if let Some(ref text) = r.text {
-            if !text.is_empty() {
-                // Build output items JSON and load them into the chat.
-                let output_json = build_batch_output_json(text, &r.tool_calls);
-                let _ = chat.load_responses_json(&output_json);
+    // For conversation chaining, load the output_items into the ChatHandle.
+    // Reasoning items (no text) are skipped by the parser; message items
+    // carry only output text; function_call items have full metadata.
+    if let Ok(guard) = ctx.lock() {
+        if !guard.output_items.is_empty() {
+            let items_json = serde_json::to_string(&guard.output_items)
+                .unwrap_or_else(|_| "[]".to_string());
+            if let Err(e) = chat.load_responses_json(&items_json) {
+                log::warn!(target: "server::gen",
+                    "batch stream chaining: load_responses_json failed: {e}");
             }
         }
     }
@@ -2271,22 +2388,89 @@ fn run_batch_streaming_generation(
     })
 }
 
-/// Build Open Responses JSON for batch-generated output items.
+/// A segment of generated output with item/content type metadata.
 ///
-/// Constructs the JSON array that can be loaded into a ChatHandle via
-/// `load_responses_json` for conversation chaining.
-fn build_batch_output_json(text: &str, tool_calls: &[talu::ToolCall]) -> String {
-    let mut items = Vec::new();
+/// Accumulated during non-streaming batch event processing to preserve
+/// content-type fidelity (e.g. refusal vs output_text) across item
+/// boundaries in the reconstructed output.
+struct OutputSegment {
+    item_type: u8,
+    content_type: u8,
+    text: String,
+}
 
-    if !text.is_empty() {
-        items.push(json!({
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text}]
-        }));
+/// Build Open Responses JSON from typed output segments.
+///
+/// Constructs the JSON array loadable into a ChatHandle via
+/// `load_responses_json` for conversation chaining. Preserves content-type
+/// fidelity: refusal content stays as refusal parts, multi-part messages
+/// keep their structure. Reasoning segments (item_type 3) are excluded
+/// since the parser skips them.
+///
+/// **Invariant:** `tool_calls` must be in the same left-to-right order as
+/// function-call segments (item_type 1) appear in `segments`. Both are
+/// produced by the same sequential parse of the generated text, so their
+/// ordering is guaranteed to match. If a future parser ever reorders tool
+/// calls (e.g. by sorting on name), this function's positional pairing
+/// will break and must be updated to match by call_id instead.
+fn build_segmented_output_json(
+    segments: &[OutputSegment],
+    tool_calls: &[talu::ToolCall],
+) -> String {
+    let mut items = Vec::new();
+    let mut i = 0;
+    let mut tc_idx = 0;
+
+    while i < segments.len() {
+        let seg = &segments[i];
+        match seg.item_type {
+            0 => {
+                // Message: collect consecutive message segments as content parts.
+                let mut content_parts = Vec::new();
+                while i < segments.len() && segments[i].item_type == 0 {
+                    let s = &segments[i];
+                    content_parts.push(match s.content_type {
+                        6 => json!({"type": "refusal", "refusal": s.text}),
+                        _ => json!({"type": "output_text", "text": s.text}),
+                    });
+                    i += 1;
+                }
+                items.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": content_parts
+                }));
+            }
+            1 => {
+                // Function call: emit at its actual position using BatchResult
+                // metadata for call_id/name/arguments. The segment text contains
+                // the raw arguments string, but BatchResult has the parsed triple.
+                if let Some(tc) = tool_calls.get(tc_idx) {
+                    items.push(json!({
+                        "type": "function_call",
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": tc.arguments
+                    }));
+                    tc_idx += 1;
+                }
+                // Skip consecutive function_call segments for the same call
+                // (they share the same item_type=1 for argument tokens).
+                while i < segments.len() && segments[i].item_type == 1 {
+                    i += 1;
+                }
+            }
+            // Reasoning (3): skip for chaining.
+            _ => {
+                i += 1;
+            }
+        }
     }
 
-    for tc in tool_calls {
+    // Append any remaining tool calls not matched by segments (edge case:
+    // BatchResult may report more calls than segments tracked, e.g. if the
+    // final call was detected during post-processing without segment events).
+    for tc in &tool_calls[tc_idx..] {
         items.push(json!({
             "type": "function_call",
             "call_id": tc.id,
@@ -3440,9 +3624,55 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
     })
     .await??;
 
+    // Recreate batch scheduler for new backend.
+    let new_sched =
+        crate::server::batch_scheduler::SchedulerState::new(&backend, None)
+            .ok()
+            .map(Arc::new);
+    let old_sched = if let Ok(mut sched_guard) = state.batch_scheduler.lock() {
+        let old = sched_guard.take();
+        *sched_guard = new_sched;
+        old
+    } else {
+        None
+    };
+
     let mut guard = state.backend.lock().await;
+    // Take old backend before replacing — it must outlive the old
+    // scheduler's step thread (BatchHandle holds an engine pointer).
+    let old_backend = guard.backend.take();
     guard.backend = Some(backend);
     guard.current_model = Some(model_id.to_string());
+    drop(guard); // Release backend lock before blocking drain.
+
+    // Drain old scheduler in background.
+    if old_sched.is_some() || old_backend.is_some() {
+        // Join any previous drain thread before spawning a new one.
+        if let Ok(mut dt) = state.drain_thread.lock() {
+            if let Some(prev) = dt.take() {
+                let _ = prev.join();
+            }
+        }
+        let drain_handle = std::thread::Builder::new()
+            .name("sched-drain".into())
+            .spawn(move || {
+                if let Some(s) = old_sched {
+                    s.shutdown();
+                }
+                drop(old_backend);
+            });
+        match drain_handle {
+            Ok(handle) => {
+                if let Ok(mut dt) = state.drain_thread.lock() {
+                    *dt = Some(handle);
+                }
+            }
+            Err(e) => {
+                log::error!(target: "server::gen",
+                    "failed to spawn drain thread: {e}");
+            }
+        }
+    }
     Ok(())
 }
 

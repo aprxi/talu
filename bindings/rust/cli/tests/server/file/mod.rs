@@ -49,7 +49,7 @@ fn build_app() -> Router {
             backend: None,
             current_model: None,
         })),
-        batch_scheduler: None,
+        batch_scheduler: std::sync::Mutex::new(None),
         configured_model: None,
         response_store: Mutex::new(HashMap::new()),
         gateway_secret: None,
@@ -74,6 +74,7 @@ fn build_app() -> Router {
         sandbox_backend: SandboxBackend::LinuxLocal,
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
+        drain_thread: std::sync::Mutex::new(None),
     };
     Router::new(Arc::new(state))
 }
@@ -84,7 +85,7 @@ fn build_app_with_inspect_limit(limit: u64) -> Router {
             backend: None,
             current_model: None,
         })),
-        batch_scheduler: None,
+        batch_scheduler: std::sync::Mutex::new(None),
         configured_model: None,
         response_store: Mutex::new(HashMap::new()),
         gateway_secret: None,
@@ -109,6 +110,7 @@ fn build_app_with_inspect_limit(limit: u64) -> Router {
         sandbox_backend: SandboxBackend::LinuxLocal,
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
+        drain_thread: std::sync::Mutex::new(None),
     };
     Router::new(Arc::new(state))
 }

@@ -138,6 +138,9 @@ const RequestState = struct {
     filter_state: FilterState = .normal,
     filter_partial_buf: [MAX_TAG_LEN]u8 = undefined,
     filter_partial_len: u8 = 0,
+    /// Stable output buffer for filterReasoningTags results. Lives in the
+    /// RequestState so returned slices remain valid for the caller's scope.
+    filter_out_buf: [MAX_TOKEN_LEN + MAX_TAG_LEN]u8 = undefined,
     swallow_next_newline: bool = false,
     start_marker: []const u8 = "<think>",
     end_marker: []const u8 = "</think>",
@@ -789,9 +792,8 @@ const FilterResult = struct {
 /// Simplified from iterator.zig filterAndPush: instead of pushing to
 /// a ring buffer, we return the filtered text. The caller accumulates.
 fn filterReasoningTags(state: *RequestState, decoded: []const u8) FilterResult {
-    // We accumulate filtered output into state.delta_buf temporarily.
-    // But since the caller also writes to delta_buf, we use a local buffer.
-    var filtered_buf: [MAX_TOKEN_LEN + MAX_TAG_LEN]u8 = undefined;
+    // Use state-owned buffer so returned slices remain valid after return.
+    const filtered_buf = &state.filter_out_buf;
     var filtered_len: usize = 0;
 
     var i: usize = 0;
@@ -880,27 +882,14 @@ fn filterReasoningTags(state: *RequestState, decoded: []const u8) FilterResult {
         i += 1;
     }
 
-    // Return a slice of the valid decoded text from the input.
-    // We must return a stable pointer — use a subset of the input or
-    // write into the delta_buf. Since we wrote into filtered_buf (stack),
-    // we need to copy to a stable location. We reuse the delta_buf for this.
     if (filtered_len == 0) return .{ .text = "" };
 
-    // Since we're called from step() which already uses delta_buf,
-    // and the text will be appended to delta_buf by the caller,
-    // we return a view into our stack buffer. The caller copies immediately.
-    // Actually, let's return a slice from decoded if no filtering happened.
+    // If filtering didn't change the text, return the original slice directly.
     if (filtered_len == decoded.len and std.mem.eql(u8, filtered_buf[0..filtered_len], decoded)) {
         return .{ .text = decoded };
     }
 
-    // Filtering modified the text. We need to return it from a stable location.
-    // Write into the state's text_buf as a temporary, since the caller will
-    // copy via appendSlice anyway.
-    // Actually, we need a different approach: return the stack data and have
-    // the caller handle it. Since `decoded` is on the stack too (combined_buf),
-    // and the caller immediately copies, this is fine — both are stack-valid
-    // for the duration of the step() iteration body.
+    // Return a slice from state.filter_out_buf — stable for the caller's scope.
     return .{ .text = filtered_buf[0..filtered_len] };
 }
 

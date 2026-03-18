@@ -9,7 +9,7 @@ fn build_app_zero_ttl() -> (Router, Arc<AppState>) {
             backend: None,
             current_model: None,
         })),
-        batch_scheduler: None,
+        batch_scheduler: std::sync::Mutex::new(None),
         configured_model: None,
         response_store: Mutex::new(HashMap::new()),
         gateway_secret: None,
@@ -34,6 +34,7 @@ fn build_app_zero_ttl() -> (Router, Arc<AppState>) {
         sandbox_backend: talu_cli::server::SandboxBackend::LinuxLocal,
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),
         active_stop_flags: std::sync::Mutex::new(Vec::new()),
+        drain_thread: std::sync::Mutex::new(None),
     });
     let router = Router::new(state.clone());
     (router, state)

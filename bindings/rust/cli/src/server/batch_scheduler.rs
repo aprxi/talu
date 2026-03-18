@@ -12,7 +12,10 @@
 //! ```
 //!
 //! The step thread owns the `BatchHandle` (which is NOT thread-safe) and
-//! serializes all operations: submit, cancel, step, take_result.
+//! serializes all operations: submit, cancel, step.
+//!
+//! Completed results are stored in a shared map accessible to handlers
+//! without going through the step thread, so results survive shutdown.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -34,14 +37,14 @@ enum SchedulerCommand {
         /// duration of the submit because the caller blocks on reply_rx.
         chat_ptr: *mut c_void,
         config: GenerateConfig,
+        /// Event sender for this request — registered by the step thread
+        /// before any step() call, preventing lost events.
+        event_tx: std::sync::mpsc::Sender<BatchEvent>,
+        stop_flag: Arc<AtomicBool>,
         reply: std::sync::mpsc::Sender<Result<u64>>,
     },
     Cancel {
         request_id: u64,
-    },
-    TakeResult {
-        request_id: u64,
-        reply: std::sync::mpsc::Sender<Option<BatchResult>>,
     },
     Shutdown,
 }
@@ -62,6 +65,17 @@ struct RequestSlot {
     stop_flag: Arc<AtomicBool>,
 }
 
+/// Entry in the completed-results map, with insertion time for stale eviction.
+struct CompletedEntry {
+    result: BatchResult,
+    inserted_at: std::time::Instant,
+}
+
+/// Entries older than this are evicted from the completed map during idle sweeps.
+/// Handlers normally call take_result() within milliseconds of the final event;
+/// 60 seconds is generous enough for any realistic retrieval delay.
+const COMPLETED_ENTRY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 // =============================================================================
 // Public API
 // =============================================================================
@@ -72,8 +86,12 @@ struct RequestSlot {
 /// The actual scheduler runs on a dedicated OS thread.
 pub struct SchedulerState {
     cmd_tx: std::sync::mpsc::Sender<SchedulerCommand>,
-    requests: Arc<Mutex<HashMap<u64, RequestSlot>>>,
     step_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Completed request results. Populated by the step thread when a
+    /// request's final event is dispatched; read by handlers via
+    /// `take_result()`. This decouples result retrieval from the step
+    /// thread's lifetime, so results survive graceful shutdown.
+    completed: Arc<Mutex<HashMap<u64, CompletedEntry>>>,
 }
 
 impl SchedulerState {
@@ -87,19 +105,21 @@ impl SchedulerState {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SchedulerCommand>();
         let requests: Arc<Mutex<HashMap<u64, RequestSlot>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let requests_clone = requests.clone();
+        let completed: Arc<Mutex<HashMap<u64, CompletedEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let completed_clone = completed.clone();
 
         let handle = std::thread::Builder::new()
             .name("batch-scheduler".into())
             .spawn(move || {
-                step_loop(batch, cmd_rx, requests_clone);
+                step_loop(batch, cmd_rx, requests, completed_clone);
             })
             .map_err(|e| anyhow!("failed to spawn scheduler thread: {}", e))?;
 
         Ok(Self {
             cmd_tx,
-            requests,
             step_thread: Mutex::new(Some(handle)),
+            completed,
         })
     }
 
@@ -117,14 +137,16 @@ impl SchedulerState {
         stop_flag: Arc<AtomicBool>,
     ) -> Result<(u64, std::sync::mpsc::Receiver<BatchEvent>)> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-
-        // Create the event channel before submitting so events can't be missed.
         let (event_tx, event_rx) = std::sync::mpsc::channel();
 
+        // Send submit command with event_tx/stop_flag so the step thread
+        // registers the slot BEFORE any step() can produce events.
         self.cmd_tx
             .send(SchedulerCommand::Submit {
                 chat_ptr: chat.as_ptr(),
                 config,
+                event_tx,
+                stop_flag,
                 reply: reply_tx,
             })
             .map_err(|_| anyhow!("scheduler thread has shut down"))?;
@@ -134,17 +156,6 @@ impl SchedulerState {
         let request_id = reply_rx
             .recv()
             .map_err(|_| anyhow!("scheduler thread died before replying"))??;
-
-        // Register the event channel for this request.
-        if let Ok(mut reqs) = self.requests.lock() {
-            reqs.insert(
-                request_id,
-                RequestSlot {
-                    tx: event_tx,
-                    stop_flag,
-                },
-            );
-        }
 
         Ok((request_id, event_rx))
     }
@@ -156,19 +167,20 @@ impl SchedulerState {
 
     /// Take the completion result for a finished request.
     ///
+    /// Reads from the shared completed-results map, which is populated by
+    /// the step thread on final events. This does NOT require the step
+    /// thread to be alive — results survive scheduler shutdown.
+    ///
     /// Returns `None` if the request hasn't completed or was already taken.
     pub fn take_result(&self, request_id: u64) -> Option<BatchResult> {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::TakeResult {
-                request_id,
-                reply: reply_tx,
-            })
-            .ok()?;
-        reply_rx.recv().ok()?
+        self.completed.lock().ok()?.remove(&request_id).map(|e| e.result)
     }
 
     /// Shut down the scheduler. Blocks until the step thread exits.
+    ///
+    /// The step thread performs a graceful drain: it finishes all active
+    /// requests before exiting, so in-flight handlers receive their
+    /// final events and results.
     pub fn shutdown(&self) {
         let _ = self.cmd_tx.send(SchedulerCommand::Shutdown);
         if let Ok(mut guard) = self.step_thread.lock() {
@@ -194,40 +206,66 @@ fn step_loop(
     batch: BatchHandle,
     cmd_rx: std::sync::mpsc::Receiver<SchedulerCommand>,
     requests: Arc<Mutex<HashMap<u64, RequestSlot>>>,
+    completed: Arc<Mutex<HashMap<u64, CompletedEntry>>>,
 ) {
     let mut events_buf = vec![BatchEvent::default(); 64];
+    let mut draining = false;
+    let mut step_count: u64 = 0;
 
     loop {
         // 1. Drain all pending commands (non-blocking).
         loop {
             match cmd_rx.try_recv() {
-                Ok(cmd) => {
-                    if handle_command(&batch, cmd, &requests) {
-                        return; // Shutdown
+                Ok(SchedulerCommand::Shutdown) => {
+                    // Graceful drain: finish active requests before exiting.
+                    if !batch.has_active() {
+                        return;
                     }
+                    draining = true;
+                    break; // Stop processing commands, start draining.
+                }
+                Ok(SchedulerCommand::Submit { reply, .. }) if draining => {
+                    // Reject new submits during drain.
+                    let _ = reply.send(Err(anyhow!("scheduler is shutting down")));
+                }
+                Ok(cmd) => {
+                    handle_command(&batch, cmd, &requests);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // All senders dropped. Drain remaining active requests.
+                    if !batch.has_active() {
+                        return;
+                    }
+                    draining = true;
+                    break;
+                }
             }
         }
 
         // 2. Check for cancelled requests (stop_flag set by client disconnect).
         check_stop_flags(&batch, &requests);
 
-        // 3. If idle, block waiting for next command.
+        // 3. If draining and no more active requests, exit.
+        if draining && !batch.has_active() {
+            return;
+        }
+
+        // 4. If idle (no active requests, not draining), sweep stale
+        //    completed entries then block waiting for the next command.
         if !batch.has_active() {
+            sweep_stale_completed(&completed);
             match cmd_rx.recv() {
+                Ok(SchedulerCommand::Shutdown) => return,
                 Ok(cmd) => {
-                    if handle_command(&batch, cmd, &requests) {
-                        return; // Shutdown
-                    }
+                    handle_command(&batch, cmd, &requests);
                 }
                 Err(_) => return, // Channel disconnected
             }
             continue; // Re-drain commands before stepping
         }
 
-        // 4. One decode step — produces events for all active requests.
+        // 5. One decode step — produces events for all active requests.
         let count = match batch.step(&mut events_buf) {
             Ok(n) => n,
             Err(e) => {
@@ -235,21 +273,44 @@ fn step_loop(
                 0
             }
         };
+        step_count += 1;
 
-        // 5. Dispatch events to per-request channels.
+        // 5b. Periodic sweep under sustained load (every 256 steps).
+        if step_count % 256 == 0 {
+            sweep_stale_completed(&completed);
+        }
+
+        // 6. Dispatch events and clean up completed requests.
+        //
+        // For final events: store the result in `completed` BEFORE
+        // dispatching the event. This guarantees that when the handler
+        // receives is_final and calls take_result(), the result is
+        // already available.
         if count > 0 {
-            let reqs = requests.lock().unwrap();
+            let mut reqs = requests.lock().unwrap();
             for event in &events_buf[..count] {
+                if event.is_final {
+                    if reqs.contains_key(&event.request_id) {
+                        // Store result before the handler can observe the
+                        // final event via the channel.
+                        if let Some(result) = batch.take_result(event.request_id) {
+                            if let Ok(mut comp) = completed.lock() {
+                                comp.insert(event.request_id, CompletedEntry {
+                                    result,
+                                    inserted_at: std::time::Instant::now(),
+                                });
+                            }
+                        }
+                    } else {
+                        // Slot already removed (cancelled/disconnected).
+                        // Consume the result from batch to free it, but
+                        // don't store — no handler will call take_result().
+                        let _ = batch.take_result(event.request_id);
+                    }
+                }
                 if let Some(slot) = reqs.get(&event.request_id) {
                     let _ = slot.tx.send(event.clone());
                 }
-            }
-        }
-
-        // 6. Clean up completed requests.
-        {
-            let mut reqs = requests.lock().unwrap();
-            for event in &events_buf[..count] {
                 if event.is_final {
                     reqs.remove(&event.request_id);
                 }
@@ -258,16 +319,18 @@ fn step_loop(
     }
 }
 
-/// Handle a single command. Returns `true` if the loop should exit (Shutdown).
+/// Handle a single non-Shutdown command.
 fn handle_command(
     batch: &BatchHandle,
     cmd: SchedulerCommand,
     requests: &Arc<Mutex<HashMap<u64, RequestSlot>>>,
-) -> bool {
+) {
     match cmd {
         SchedulerCommand::Submit {
             chat_ptr,
             config,
+            event_tx,
+            stop_flag,
             reply,
         } => {
             // SAFETY: chat_ptr is a valid ChatHandle pointer borrowed from the
@@ -275,6 +338,19 @@ fn handle_command(
             let result = batch
                 .submit_raw(chat_ptr, &config)
                 .map_err(|e| anyhow!("batch submit failed: {}", e));
+            // Register the event slot BEFORE replying, so no step() can
+            // produce events for this request before the slot exists.
+            if let Ok(request_id) = &result {
+                if let Ok(mut reqs) = requests.lock() {
+                    reqs.insert(
+                        *request_id,
+                        RequestSlot {
+                            tx: event_tx,
+                            stop_flag,
+                        },
+                    );
+                }
+            }
             let _ = reply.send(result);
         }
         SchedulerCommand::Cancel { request_id } => {
@@ -283,15 +359,23 @@ fn handle_command(
                 reqs.remove(&request_id);
             }
         }
-        SchedulerCommand::TakeResult { request_id, reply } => {
-            let result = batch.take_result(request_id);
-            let _ = reply.send(result);
-        }
         SchedulerCommand::Shutdown => {
-            return true;
+            // Handled in step_loop directly, not here.
         }
     }
-    false
+}
+
+/// Evict stale entries from the completed-results map.
+fn sweep_stale_completed(completed: &Arc<Mutex<HashMap<u64, CompletedEntry>>>) {
+    if let Ok(mut comp) = completed.lock() {
+        let before = comp.len();
+        comp.retain(|_, entry| entry.inserted_at.elapsed() < COMPLETED_ENTRY_TTL);
+        let evicted = before - comp.len();
+        if evicted > 0 {
+            log::debug!(target: "batch_scheduler",
+                "evicted {evicted} stale completed entries");
+        }
+    }
 }
 
 /// Check stop flags set by CancelOnDrop / client disconnect.
