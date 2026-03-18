@@ -1025,15 +1025,16 @@ async fn generate_response(
                     prompt_tokens, completion_tokens);
 
                 // Reconstruct conversation for chaining from segments.
-                // Reasoning (item_type 3) and function_call args (item_type 1)
-                // are excluded — tool calls come from BatchResult instead.
+                // Tool calls come from BatchResult (parsed from generated text).
                 let tool_calls = batch_result.as_ref()
                     .map(|r| r.tool_calls.as_slice())
                     .unwrap_or(&[]);
-                let has_output = segments.iter().any(|s| s.item_type == 0)
-                    || !tool_calls.is_empty();
+                let has_output = !segments.is_empty() || !tool_calls.is_empty();
                 if has_output {
                     let output_json = build_segmented_output_json(&segments, tool_calls);
+                    log::debug!(target: "server::gen",
+                        "batch output: segments={} tool_calls={} output_json_len={}",
+                        segments.len(), tool_calls.len(), output_json.len());
                     if let Err(e) = chat.load_responses_json(&output_json) {
                         log::warn!(target: "server::gen",
                             "batch chaining: load_responses_json failed: {e}");
@@ -2482,11 +2483,27 @@ fn build_segmented_output_json(
                         "arguments": tc.arguments
                     }));
                     tc_idx += 1;
-                }
-                // Skip consecutive function_call segments for the same call
-                // (they share the same item_type=1 for argument tokens).
-                while i < segments.len() && segments[i].item_type == 1 {
-                    i += 1;
+                    // Skip consecutive function_call segments for the same call
+                    // (they share the same item_type=1 for argument tokens).
+                    while i < segments.len() && segments[i].item_type == 1 {
+                        i += 1;
+                    }
+                } else {
+                    // No parsed tool call metadata — fallback: collect the raw
+                    // function_call segment text and include it as a message so
+                    // the generated content is not silently lost.
+                    let mut text = String::new();
+                    while i < segments.len() && segments[i].item_type == 1 {
+                        text.push_str(&segments[i].text);
+                        i += 1;
+                    }
+                    if !text.is_empty() {
+                        items.push(json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}]
+                        }));
+                    }
                 }
             }
             // Reasoning (3): skip for chaining.

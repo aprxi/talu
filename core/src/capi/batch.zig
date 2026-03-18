@@ -155,7 +155,7 @@ pub export fn talu_batch_submit(
     }));
 
     return wrapper.submit(chat, config) catch |err| {
-        capi_error.setError(err, "batch submit failed", .{});
+        capi_error.setError(err, "batch submit failed: {s}", .{@errorName(err)});
         return 0;
     };
 }

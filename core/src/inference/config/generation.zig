@@ -1482,3 +1482,55 @@ test "getChatTemplateSource returns error when tokenizer_config.json missing" {
     const result = getChatTemplateSource(allocator, tmp_path);
     try std.testing.expectError(error.FileNotFound, result);
 }
+
+test "applyChatTemplateWithOverrides renders tools context as valid UTF-8" {
+    // Uses a Qwen3.5-style template that references tools
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Qwen3.5-style template with tools support (simplified but representative)
+    const tokenizer_config_json =
+        \\{
+        \\  "chat_template": "{%- if tools and tools is iterable and tools is not mapping -%}<|im_start|>system\n# Tools\n\n<tools>\n{%- for tool in tools -%}\n{{ tool | tojson }}\n{%- endfor -%}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n{%- endif -%}{%- for message in messages -%}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{%- endfor -%}<|im_start|>assistant\n",
+        \\  "bos_token": "",
+        \\  "eos_token": "<|endoftext|>"
+        \\}
+    ;
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "tokenizer_config.json", .data = tokenizer_config_json });
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const messages_json =
+        \\[{"role": "user", "content": "What is the area?"}]
+    ;
+
+    const extra_context =
+        \\{"enable_thinking": true, "tools": [{"type":"function","name":"calc_area","description":"Calculate area","parameters":{"type":"object","properties":{"base":{"type":"number"}},"required":["base"]}}]}
+    ;
+
+    const result = try applyChatTemplateWithOverrides(
+        allocator,
+        tmp_path,
+        messages_json,
+        true,
+        null,
+        extra_context,
+    );
+    defer allocator.free(result);
+
+    // Must be valid UTF-8.
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+
+    // Must contain tool name.
+    try std.testing.expect(std.mem.indexOf(u8, result, "calc_area") != null);
+
+    // Must contain user message.
+    try std.testing.expect(std.mem.indexOf(u8, result, "What is the area?") != null);
+
+    // Must not contain null bytes.
+    try std.testing.expect(std.mem.indexOfScalar(u8, result, 0) == null);
+}

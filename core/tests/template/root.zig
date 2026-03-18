@@ -16,6 +16,7 @@ pub const custom_filter_set = @import("custom_filter_set_test.zig");
 pub const render_result = @import("render_result_test.zig");
 pub const render_debug_result = @import("render_debug_result_test.zig");
 pub const c_output_span_list = @import("c_output_span_list_test.zig");
+pub const qwen35_tools = @import("qwen35_tools_test.zig");
 
 test {
     std.testing.refAllDecls(@This());

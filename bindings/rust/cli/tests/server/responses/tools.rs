@@ -1,6 +1,6 @@
 //! `/v1/responses` tools and tool_choice round-trip tests.
 
-use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
+use crate::server::common::{model_config, post_json, require_model, ServerConfig, ServerTestContext};
 
 fn tool_definition() -> serde_json::Value {
     serde_json::json!([{
@@ -233,4 +233,231 @@ fn responses_streaming_events_include_tools_on_created_and_terminal() {
     let terminal_tools = terminal["tools"].as_array().expect("terminal tools array");
     assert_eq!(terminal_tools.len(), 1);
     assert_eq!(terminal["tool_choice"].as_str(), Some("auto"));
+}
+
+// =========================================================================
+// API validation tests (no model required)
+// =========================================================================
+
+/// Flat-format tool definitions (as sent by BFCL bench) must be accepted.
+#[test]
+fn responses_accepts_flat_format_tools() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "calculate_area",
+            "description": "Calculate the area of a shape",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "base": { "type": "number" },
+                    "height": { "type": "number" }
+                },
+                "required": ["base", "height"]
+            }
+        }]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    // Without a model, we won't get 200, but we must NOT get 400 (validation error).
+    assert_ne!(resp.status, 400, "flat-format tools should pass validation: {}", resp.body);
+}
+
+/// Multiple flat-format tools accepted (parallel call scenario).
+#[test]
+fn responses_accepts_multiple_flat_tools() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
+            },
+            {
+                "type": "function",
+                "name": "search_web",
+                "description": "Search the web",
+                "parameters": { "type": "object", "properties": { "query": { "type": "string" } } }
+            }
+        ]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_ne!(resp.status, 400, "multiple flat tools should pass validation: {}", resp.body);
+}
+
+/// Tool names with dots must be rejected (server enforces ^[a-zA-Z0-9_-]{1,64}$).
+#[test]
+fn responses_rejects_tool_name_with_dots() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "math.factorial",
+            "description": "Compute factorial",
+            "parameters": { "type": "object", "properties": {} }
+        }]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "dot in tool name should be rejected: {}", resp.body);
+}
+
+/// Tool names with underscores are accepted (sanitized BFCL names).
+#[test]
+fn responses_accepts_tool_name_with_underscores() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "math_factorial",
+            "description": "Compute factorial",
+            "parameters": { "type": "object", "properties": {} }
+        }]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_ne!(resp.status, 400, "underscore tool name should pass: {}", resp.body);
+}
+
+/// Tool names with hyphens are accepted.
+#[test]
+fn responses_accepts_tool_name_with_hyphens() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "get-weather",
+            "description": "Get weather",
+            "parameters": { "type": "object", "properties": {} }
+        }]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_ne!(resp.status, 400, "hyphen tool name should pass: {}", resp.body);
+}
+
+/// Tool name exceeding 64 chars is rejected.
+#[test]
+fn responses_rejects_tool_name_too_long() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let long_name = "a".repeat(65);
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": long_name,
+            "description": "Too long",
+            "parameters": { "type": "object", "properties": {} }
+        }]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "65-char tool name should be rejected: {}", resp.body);
+}
+
+/// Empty tool name is rejected.
+#[test]
+fn responses_rejects_empty_tool_name() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "",
+            "description": "Empty name",
+            "parameters": { "type": "object", "properties": {} }
+        }]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "empty tool name should be rejected: {}", resp.body);
+}
+
+/// Tool missing name field is rejected.
+#[test]
+fn responses_rejects_tool_missing_name() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "description": "No name field"
+        }]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "tool without name should be rejected: {}", resp.body);
+}
+
+/// tool_choice "none" with tools is accepted (model should not call tools).
+#[test]
+fn responses_accepts_tool_choice_none_with_tools() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": { "type": "object", "properties": {} }
+        }],
+        "tool_choice": "none"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_ne!(resp.status, 400, "tool_choice none with tools should pass: {}", resp.body);
+}
+
+/// tool_choice "auto" is accepted.
+#[test]
+fn responses_accepts_tool_choice_auto() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "search",
+            "description": "Search",
+            "parameters": { "type": "object", "properties": {} }
+        }],
+        "tool_choice": "auto"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_ne!(resp.status, 400, "tool_choice auto should pass: {}", resp.body);
+}
+
+/// tool_choice "required" is accepted.
+#[test]
+fn responses_accepts_tool_choice_required() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "search",
+            "description": "Search",
+            "parameters": { "type": "object", "properties": {} }
+        }],
+        "tool_choice": "required"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_ne!(resp.status, 400, "tool_choice required should pass: {}", resp.body);
+}
+
+/// Invalid tool_choice string is rejected.
+#[test]
+fn responses_rejects_invalid_tool_choice_string() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "search",
+            "description": "Search",
+            "parameters": { "type": "object", "properties": {} }
+        }],
+        "tool_choice": "always"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "invalid tool_choice 'always' should be rejected: {}", resp.body);
 }

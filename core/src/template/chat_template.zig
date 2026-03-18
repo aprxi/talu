@@ -105,9 +105,15 @@ pub fn renderWithContext(
     // This allows templates to check `if strftime_now is defined`
     try template_context.set("strftime_now", .{ .boolean = true });
 
-    // Parse and merge extra context if provided
+    // Parse and merge extra context if provided.
+    // IMPORTANT: parsed_extra must outlive render() because jsonToValue borrows
+    // string pointers from the parsed JSON — freeing it before render would
+    // cause use-after-free when the template accesses tools/enable_thinking.
+    var parsed_extra: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_extra) |*pe| pe.deinit();
+
     if (extra_context_json) |extra_json| {
-        const parsed_extra = io.json.parseValue(allocator, extra_json, .{
+        parsed_extra = io.json.parseValue(allocator, extra_json, .{
             .max_size_bytes = 50 * 1024 * 1024,
             .max_value_bytes = 50 * 1024 * 1024,
             .max_string_bytes = 50 * 1024 * 1024,
@@ -120,15 +126,14 @@ pub fn renderWithContext(
                 error.OutOfMemory => error.OutOfMemory,
             };
         };
-        defer parsed_extra.deinit();
 
         // Extra context must be an object
-        if (parsed_extra.value != .object) {
+        if (parsed_extra.?.value != .object) {
             return error.InvalidMessages;
         }
 
         // Merge each key-value pair into the template context
-        var iter = parsed_extra.value.object.iterator();
+        var iter = parsed_extra.?.value.object.iterator();
         while (iter.next()) |entry| {
             const key = entry.key_ptr.*;
             const value = try jsonToValue(arena_alloc, entry.value_ptr.*);
@@ -688,4 +693,58 @@ test "promptEndsWithReasoningTag: custom tag name" {
 
 test "promptEndsWithReasoningTag: no reasoning tag at end" {
     try std.testing.expect(!promptEndsWithReasoningTag("<|im_start|>assistant\n", null));
+}
+
+test "renderWithContext tools context produces valid UTF-8" {
+    const allocator = std.testing.allocator;
+
+    // Minimal Qwen-style template that uses tools
+    const template =
+        \\{%- if tools and tools is iterable and tools is not mapping -%}
+        \\<|im_start|>system
+        \\# Tools
+        \\
+        \\<tools>
+        \\{%- for tool in tools %}
+        \\{{ tool | tojson }}
+        \\{%- endfor %}
+        \\</tools>
+        \\<|im_end|>
+        \\{%- endif -%}
+        \\{%- for message in messages -%}
+        \\<|im_start|>{{ message.role }}
+        \\{{ message.content }}<|im_end|>
+        \\{%- endfor -%}
+        \\<|im_start|>assistant
+        \\
+    ;
+
+    const messages_json =
+        \\[{"role": "user", "content": "What is the area?"}]
+    ;
+
+    // Build context with tools (same as buildEffectiveContext)
+    const extra_context =
+        \\{"enable_thinking": true, "tools": [{"type":"function","name":"calc_area","description":"Calc area","parameters":{"type":"object","properties":{"base":{"type":"number"}},"required":["base"]}}]}
+    ;
+
+    const result = try renderWithContext(
+        allocator,
+        template,
+        messages_json,
+        "",
+        "",
+        true,
+        extra_context,
+    );
+    defer allocator.free(result);
+
+    // Output must be valid UTF-8
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+
+    // Should contain tool definition
+    try std.testing.expect(std.mem.indexOf(u8, result, "calc_area") != null);
+
+    // Should contain the user message
+    try std.testing.expect(std.mem.indexOf(u8, result, "What is the area?") != null);
 }

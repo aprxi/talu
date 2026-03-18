@@ -31,6 +31,7 @@ const chat_template = @import("../template/chat_template.zig");
 const backend_root = @import("../inference/backend/root.zig");
 const Backend = backend_root.Backend;
 const log = @import("../log.zig");
+const error_context = @import("../error_context.zig");
 
 const LocalEngine = local_mod.LocalEngine;
 const BackendScheduler = local_mod.BackendScheduler;
@@ -277,8 +278,11 @@ pub const BatchWrapper = struct {
         );
         defer self.engine.allocator.free(messages_json);
 
-        // Build effective template context (reasoning effort → enable_thinking).
-        const effective_context = try buildEffectiveContext(self.engine.allocator, opts);
+        // Build effective template context (reasoning effort → enable_thinking + tools).
+        const effective_context = buildEffectiveContext(self.engine.allocator, opts) catch |err| {
+            error_context.setContext("buildEffectiveContext failed: {s}", .{@errorName(err)});
+            return err;
+        };
         defer if (effective_context) |ctx| self.engine.allocator.free(ctx);
 
         // Apply chat template.
@@ -290,7 +294,7 @@ pub const BatchWrapper = struct {
             opts.template_override,
             effective_context,
         ) catch |err| {
-            log.warn("batch", "Chat template failed", .{ .err = @errorName(err) });
+            error_context.setContext("applyChatTemplate failed: {s}", .{@errorName(err)});
             return err;
         };
         defer self.engine.allocator.free(prompt);
@@ -299,8 +303,43 @@ pub const BatchWrapper = struct {
         starts_in_reasoning = chat_template.promptEndsWithReasoningTag(prompt, opts.reasoning_tag);
         state.starts_in_reasoning = starts_in_reasoning;
 
+        // Validate prompt is valid UTF-8 before encoding (diagnostic for Utf8ProcFailed).
+        if (!std.unicode.utf8ValidateSlice(prompt)) {
+            // Find first invalid byte position.
+            var bad_pos: usize = 0;
+            var vi: usize = 0;
+            while (vi < prompt.len) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(prompt[vi]) catch {
+                    bad_pos = vi;
+                    break;
+                };
+                if (vi + seq_len > prompt.len) {
+                    bad_pos = vi;
+                    break;
+                }
+                if (!std.unicode.utf8ValidateSlice(prompt[vi .. vi + seq_len])) {
+                    bad_pos = vi;
+                    break;
+                }
+                vi += seq_len;
+            } else {
+                bad_pos = vi;
+            }
+            // Report the byte value and surrounding context as decimal bytes.
+            const b0 = prompt[bad_pos];
+            const b1: u8 = if (bad_pos + 1 < prompt.len) prompt[bad_pos + 1] else 0;
+            const b2: u8 = if (bad_pos + 2 < prompt.len) prompt[bad_pos + 2] else 0;
+            const b3: u8 = if (bad_pos + 3 < prompt.len) prompt[bad_pos + 3] else 0;
+            error_context.setContext("invalid UTF-8 at byte {d}/{d}, bytes=[0x{X:0>2},0x{X:0>2},0x{X:0>2},0x{X:0>2}]", .{ bad_pos, prompt.len, b0, b1, b2, b3 });
+            return error.EncodeFailed;
+        }
+
         // Tokenize prompt.
-        const encoded = try self.engine.tok.encode(prompt);
+        const encoded = self.engine.tok.encode(prompt) catch |err| {
+            const tok_msg = self.engine.tok.lastError() orelse "unknown";
+            error_context.setContext("tok.encode: {s}, prompt_len={d}, detail={s}", .{ @errorName(err), prompt.len, tok_msg });
+            return err;
+        };
         defer self.engine.allocator.free(encoded);
 
         // Prepend BOS if configured.
@@ -342,21 +381,10 @@ pub const BatchWrapper = struct {
             (opts.tool_choice == null or !std.mem.eql(u8, opts.tool_choice.?, "none"));
 
         if (use_tools) {
-            state.grammar_schema = try tool_schema_mod.toolsToGrammarSchema(
-                allocator,
-                opts.tools_json.?,
-            );
-            const gs = try allocator.create(ConstrainedSampler);
-            errdefer allocator.destroy(gs);
-            gs.* = try ConstrainedSampler.init(
-                allocator,
-                state.grammar_schema.?,
-                GrammarConfig{},
-                self.engine.gen_config.eos_token_ids,
-                null,
-                null,
-            );
-            state.grammar_sampler = gs;
+            // Mark as tool generation for post-processing (finish reason +
+            // tool call extraction). No constrained sampler — the model
+            // generates freely in its native tool call format (e.g. Qwen3.5
+            // uses <tool_call> XML tags). Parsing happens after generation.
             state.is_tool_generation = true;
         }
 
@@ -545,18 +573,20 @@ pub const BatchWrapper = struct {
             var content_type: u8 = @intFromEnum(ContentType.output_text);
             var emit_text: []const u8 = valid;
 
-            if (state.is_tool_generation) {
-                item_type = @intFromEnum(ItemType.function_call);
-                content_type = @intFromEnum(ContentType.output_text);
-            } else if (state.raw_output) {
+            if (state.raw_output) {
                 // Raw mode: no filtering.
             } else {
                 // Reasoning tag filter: classify and strip tags.
+                // Applies to tool generations too — models think first,
+                // then output tool calls in their native format.
                 const filter_result = filterReasoningTags(state, valid);
                 emit_text = filter_result.text;
                 if (state.filter_state == .reasoning) {
                     item_type = @intFromEnum(ItemType.reasoning);
                     content_type = @intFromEnum(ContentType.reasoning_text);
+                } else if (state.is_tool_generation) {
+                    item_type = @intFromEnum(ItemType.function_call);
+                    content_type = @intFromEnum(ContentType.output_text);
                 }
             }
 
@@ -694,10 +724,24 @@ pub const BatchWrapper = struct {
         errdefer if (text) |t| allocator.free(t);
 
         // Parse tool calls if this was a tool generation.
+        // Always attempt parsing when is_tool_generation — not just when grammar
+        // formally completed. The grammar may not reach .complete (e.g. max_tokens
+        // hit) but the generated text may still contain a valid tool call JSON.
         var tool_calls: ?[]CToolCallRef = null;
-        if (finish_reason == .tool_calls) {
+        var actual_finish_reason = finish_reason;
+        if (state.is_tool_generation) {
             if (text) |generated_text| {
-                tool_calls = parseToolCalls(generated_text) catch null;
+                tool_calls = parseToolCalls(generated_text) catch |err| blk: {
+                    log.warn("batch", "parseToolCalls failed for tool generation", .{
+                        .err = @errorName(err),
+                        .text_len = generated_text.len,
+                        .finish_reason = @tagName(finish_reason),
+                    });
+                    break :blk null;
+                };
+                if (tool_calls != null and finish_reason != .tool_calls) {
+                    actual_finish_reason = .tool_calls;
+                }
             }
         }
 
@@ -707,7 +751,7 @@ pub const BatchWrapper = struct {
             .prefill_ns = ttft_ns, // Approximation: ttft ≈ prefill.
             .generation_ns = generation_ns,
             .ttft_ns = ttft_ns,
-            .finish_reason = finish_reason,
+            .finish_reason = actual_finish_reason,
             .text = text,
             .tool_calls = tool_calls,
         };
@@ -906,20 +950,28 @@ fn buildEffectiveContext(alloc: std.mem.Allocator, opts: GenerateOptions) !?[]co
 
     const val: []const u8 = if (enable_thinking) "true" else "false";
 
+    const tools_fragment: ?[]const u8 = if (opts.tools_json) |tj|
+        try std.fmt.allocPrint(alloc, ", \"tools\": {s}", .{tj})
+    else
+        null;
+    defer if (tools_fragment) |tf| alloc.free(tf);
+
     if (opts.extra_context_json) |existing| {
         const trimmed = std.mem.trimRight(u8, existing, " \t\n\r");
         if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '}') {
             const inner = std.mem.trimRight(u8, trimmed[0 .. trimmed.len - 1], " \t\n\r");
             const separator: []const u8 = if (inner.len > 1) ", " else " ";
-            const result = try std.fmt.allocPrint(alloc, "{s}{s}\"enable_thinking\": {s} }}", .{
-                inner, separator, val,
+            const result = try std.fmt.allocPrint(alloc, "{s}{s}\"enable_thinking\": {s}{s} }}", .{
+                inner, separator, val, tools_fragment orelse "",
             });
             return @as(?[]const u8, result);
         }
         return null;
     }
 
-    const result = try std.fmt.allocPrint(alloc, "{{\"enable_thinking\": {s}}}", .{val});
+    const result = try std.fmt.allocPrint(alloc, "{{\"enable_thinking\": {s}{s}}}", .{
+        val, tools_fragment orelse "",
+    });
     return @as(?[]const u8, result);
 }
 
@@ -982,27 +1034,34 @@ fn longestCommonPrefixLen(a: []const u8, b: []const u8) usize {
     return i;
 }
 
-/// Parse tool call JSON into C-compatible tool call refs.
+/// Parse tool calls from generated text into C-compatible refs.
+///
+/// Delegates to tool_schema_mod.parseToolCallsFromText which handles
+/// both XML format (Qwen3.5) and JSON format.
 fn parseToolCalls(generated_text: []const u8) ![]CToolCallRef {
-    const parsed = try tool_schema_mod.parseToolCall(allocator, generated_text);
+    const parsed_calls = try tool_schema_mod.parseToolCallsFromText(allocator, generated_text);
     defer {
-        allocator.free(parsed.name);
-        allocator.free(parsed.arguments);
+        for (parsed_calls) |*c| {
+            var call = c.*;
+            call.deinit(allocator);
+        }
+        allocator.free(parsed_calls);
     }
 
-    const calls = try allocator.alloc(CToolCallRef, 1);
-    errdefer allocator.free(calls);
+    const refs = try allocator.alloc(CToolCallRef, parsed_calls.len);
+    errdefer allocator.free(refs);
 
-    // Generate a call_id for the tool call.
-    const call_id_slice = try tool_schema_mod.generateCallId(allocator);
-    defer allocator.free(call_id_slice);
+    for (parsed_calls, 0..) |pc, i| {
+        const call_id_slice = try tool_schema_mod.generateCallId(allocator);
+        defer allocator.free(call_id_slice);
 
-    var call = std.mem.zeroes(CToolCallRef);
-    call.item_index = 0;
-    call.call_id = allocator.dupeZ(u8, call_id_slice) catch null;
-    call.name = allocator.dupeZ(u8, parsed.name) catch null;
-    call.arguments = allocator.dupeZ(u8, parsed.arguments) catch null;
-    calls[0] = call;
+        var ref = std.mem.zeroes(CToolCallRef);
+        ref.item_index = @intCast(i);
+        ref.call_id = allocator.dupeZ(u8, call_id_slice) catch null;
+        ref.name = allocator.dupeZ(u8, pc.name) catch null;
+        ref.arguments = allocator.dupeZ(u8, pc.arguments) catch null;
+        refs[i] = ref;
+    }
 
-    return calls;
+    return refs;
 }

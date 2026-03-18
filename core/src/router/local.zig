@@ -270,15 +270,22 @@ fn buildEffectiveContext(allocator: std.mem.Allocator, opts: GenerateOptions) !?
 
     const val: []const u8 = if (enable_thinking) "true" else "false";
 
+    // Build tools fragment if present.
+    const tools_fragment: ?[]const u8 = if (opts.tools_json) |tj|
+        try std.fmt.allocPrint(allocator, ", \"tools\": {s}", .{tj})
+    else
+        null;
+    defer if (tools_fragment) |tf| allocator.free(tf);
+
     if (opts.extra_context_json) |existing| {
-        // Merge: inject enable_thinking into existing context JSON.
-        // Replace trailing '}' with the additional field.
+        // Merge: inject enable_thinking (and tools) into existing context JSON.
+        // Replace trailing '}' with the additional fields.
         const trimmed = std.mem.trimRight(u8, existing, " \t\n\r");
         if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '}') {
             const inner = std.mem.trimRight(u8, trimmed[0 .. trimmed.len - 1], " \t\n\r");
             const separator: []const u8 = if (inner.len > 1) ", " else " ";
-            const result = try std.fmt.allocPrint(allocator, "{s}{s}\"enable_thinking\": {s} }}", .{
-                inner, separator, val,
+            const result = try std.fmt.allocPrint(allocator, "{s}{s}\"enable_thinking\": {s}{s} }}", .{
+                inner, separator, val, tools_fragment orelse "",
             });
             return @as(?[]const u8, result);
         }
@@ -287,7 +294,9 @@ fn buildEffectiveContext(allocator: std.mem.Allocator, opts: GenerateOptions) !?
     }
 
     // No existing context — build from scratch.
-    const result = try std.fmt.allocPrint(allocator, "{{\"enable_thinking\": {s}}}", .{val});
+    const result = try std.fmt.allocPrint(allocator, "{{\"enable_thinking\": {s}{s}}}", .{
+        val, tools_fragment orelse "",
+    });
     return @as(?[]const u8, result);
 }
 
@@ -776,43 +785,13 @@ pub const LocalEngine = struct {
         } else opts.max_tokens orelse chat.max_tokens;
         const grammar_slack: usize = 64;
 
-        // Determine if we're using tools (create grammar sampler if so)
-        var tool_grammar_sampler: ?*ConstrainedSampler = null;
-        var tool_grammar_schema: ?[]u8 = null;
-        defer {
-            if (tool_grammar_sampler) |gs| {
-                gs.deinit();
-                self.allocator.destroy(gs);
-            }
-            if (tool_grammar_schema) |schema| {
-                self.allocator.free(schema);
-            }
-        }
-
-        // If tools_json is provided (and tool_choice != "none"), create grammar sampler
+        // If tools_json is provided (and tool_choice != "none"), mark tool generation.
+        // No constrained sampler — the model generates freely in its native
+        // tool call format (e.g. Qwen3.5 <tool_call> XML). Parsed after generation.
         const use_tools = opts.tools_json != null and
             (opts.tool_choice == null or !std.mem.eql(u8, opts.tool_choice.?, "none"));
 
-        if (use_tools) {
-            // Convert tools to grammar schema
-            tool_grammar_schema = try tool_schema_mod.toolsToGrammarSchema(self.allocator, opts.tools_json.?);
-
-            // Create constrained sampler
-            const gs = try self.allocator.create(ConstrainedSampler);
-            errdefer self.allocator.destroy(gs);
-            gs.* = try ConstrainedSampler.init(
-                self.allocator,
-                tool_grammar_schema.?,
-                GrammarConfig{}, // Default config
-                self.gen_config.eos_token_ids,
-                null, // prefix_tokens
-                null, // prefix_token_ids
-            );
-            tool_grammar_sampler = gs;
-        }
-
-        // Use tool grammar if created, otherwise fall back to chat's grammar
-        const effective_grammar = tool_grammar_sampler orelse chat.grammar_sampler;
+        const effective_grammar = chat.grammar_sampler;
 
         // max_tokens is the hard generation limit — never exceeded.
         const max_tokens = if (effective_grammar != null and base_max_tokens > 0)
@@ -1056,56 +1035,42 @@ pub const LocalEngine = struct {
         const owned_tokens = try self.allocator.dupe(u32, result.tokens);
         errdefer self.allocator.free(owned_tokens);
 
-        // Check if this is a tool call (grammar completed with tool schema)
-        const is_tool_call = is_tool_generation and grammar_sampler != null and
-            grammar_sampler.?.state == .complete;
+        // Try to parse tool calls from generated text (supports XML and JSON).
+        // If parsing fails, fall through to the normal text path.
+        if (is_tool_generation and generated_text.len > 0) tool_call_blk: {
+            const parsed_calls = tool_schema_mod.parseToolCallsFromText(self.allocator, generated_text) catch
+                break :tool_call_blk;
+            defer {
+                for (parsed_calls) |*pc| {
+                    var call = pc.*;
+                    call.deinit(self.allocator);
+                }
+                self.allocator.free(parsed_calls);
+            }
+            if (parsed_calls.len == 0) break :tool_call_blk;
 
-        // Map scheduler finish reason to session finish reason
-        const finish_reason: FinishReason = if (is_tool_call) .tool_calls else switch (result.finish_reason) {
-            .in_progress => .eos_token, // Shouldn't happen for sync
-            .eos_token => .eos_token,
-            .length => .length,
-            .stop_sequence => .stop_sequence,
-            .cancelled => .cancelled,
-        };
-        const finish_reason_str = finishReasonToString(finish_reason);
+            // Generate call IDs and build commit inputs.
+            const tc_inputs = try self.allocator.alloc(commit_mod.ToolCallInput, parsed_calls.len);
+            defer self.allocator.free(tc_inputs);
+            var call_ids = try self.allocator.alloc([]u8, parsed_calls.len);
+            defer {
+                for (call_ids[0..parsed_calls.len]) |cid| self.allocator.free(cid);
+                self.allocator.free(call_ids);
+            }
 
-        if (is_tool_call) {
-            // Local-only: parse grammar-constrained JSON into tool call fields
-            var parsed_call = tool_schema_mod.parseToolCall(self.allocator, generated_text) catch {
-                // If parsing fails, fall through to text commit
-                try commit_mod.commitGenerationResult(self.allocator, chat, .{
-                    .text = generated_text,
-                    .prompt_tokens = prompt_len,
-                    .completion_tokens = result.tokens.len,
-                    .prefill_ns = result.prefill_ns,
-                    .generation_ns = result.decode_ns,
-                    .finish_reason = finishReasonToString(.eos_token),
-                });
-                return GenerationResult{
-                    .text = generated_text,
-                    .tokens = owned_tokens,
-                    .prompt_tokens = prompt_len,
-                    .generated_tokens = result.tokens.len,
-                    .prefill_ns = result.prefill_ns,
-                    .decode_ns = result.decode_ns,
-                    .finish_reason = .eos_token,
+            for (parsed_calls, 0..) |pc, i| {
+                call_ids[i] = try tool_schema_mod.generateCallId(self.allocator);
+                tc_inputs[i] = .{
+                    .id = call_ids[i],
+                    .name = pc.name,
+                    .arguments = pc.arguments,
                 };
-            };
-            defer parsed_call.deinit(self.allocator);
+            }
 
-            const call_id = try tool_schema_mod.generateCallId(self.allocator);
-            defer self.allocator.free(call_id);
-
-            const tc_input = [_]commit_mod.ToolCallInput{.{
-                .id = call_id,
-                .name = parsed_call.name,
-                .arguments = parsed_call.arguments,
-            }};
-
+            const finish_reason_str = finishReasonToString(.tool_calls);
             try commit_mod.commitGenerationResult(self.allocator, chat, .{
                 .text = generated_text,
-                .tool_calls = &tc_input,
+                .tool_calls = tc_inputs,
                 .prompt_tokens = prompt_len,
                 .completion_tokens = result.tokens.len,
                 .prefill_ns = result.prefill_ns,
@@ -1113,16 +1078,19 @@ pub const LocalEngine = struct {
                 .finish_reason = finish_reason_str,
             });
 
-            // Build ToolCallRef for the caller
-            var tool_calls = try self.allocator.alloc(ToolCallRef, 1);
+            // Build ToolCallRef array for the caller.
+            const tool_calls = try self.allocator.alloc(ToolCallRef, parsed_calls.len);
             errdefer self.allocator.free(tool_calls);
 
-            tool_calls[0] = ToolCallRef{
-                .item_index = chat.conv.len() - 1,
-                .call_id = try self.allocator.dupe(u8, call_id),
-                .name = try self.allocator.dupe(u8, parsed_call.name),
-                .arguments = try self.allocator.dupe(u8, parsed_call.arguments),
-            };
+            const item_index = chat.conv.len() - 1;
+            for (parsed_calls, 0..) |pc, i| {
+                tool_calls[i] = ToolCallRef{
+                    .item_index = item_index,
+                    .call_id = try self.allocator.dupe(u8, call_ids[i]),
+                    .name = try self.allocator.dupe(u8, pc.name),
+                    .arguments = try self.allocator.dupe(u8, pc.arguments),
+                };
+            }
 
             return GenerationResult{
                 .text = generated_text,
@@ -1135,6 +1103,16 @@ pub const LocalEngine = struct {
                 .tool_calls = tool_calls,
             };
         }
+
+        // Map scheduler finish reason to session finish reason (text path).
+        const finish_reason: FinishReason = switch (result.finish_reason) {
+            .in_progress => .eos_token, // Shouldn't happen for sync
+            .eos_token => .eos_token,
+            .length => .length,
+            .stop_sequence => .stop_sequence,
+            .cancelled => .cancelled,
+        };
+        const finish_reason_str = finishReasonToString(finish_reason);
 
         // Text path: commit reasoning + assistant message via shared path
         const generation_json = try self.buildGenerationJson(chat, opts, max_tokens);

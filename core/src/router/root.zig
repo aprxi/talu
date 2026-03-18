@@ -188,6 +188,7 @@ pub const ToolCallRef = local.ToolCallRef;
 pub const toolsToGrammarSchema = tool_schema.toolsToGrammarSchema;
 pub const generateCallId = tool_schema.generateCallId;
 pub const parseToolCall = tool_schema.parseToolCall;
+pub const parseToolCallsFromText = tool_schema.parseToolCallsFromText;
 pub const ParsedToolCall = tool_schema.ParsedToolCall;
 pub const ToolSchemaError = tool_schema.ToolSchemaError;
 

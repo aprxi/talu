@@ -4,3 +4,4 @@ mod chat;
 mod common;
 mod memory;
 mod render;
+mod tool_calls;
