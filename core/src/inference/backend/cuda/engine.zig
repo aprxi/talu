@@ -308,12 +308,7 @@ pub const CudaBackend = struct {
     /// Layer index at which stage 0 ends and stage 1 begins (pipeline2 only).
     split_layer: usize = 0,
     /// Second-device state for pipeline2 mode. Null for single-device mode.
-    pipeline_device1: ?compute.cuda.Device = null,
-    pipeline_stream1: ?compute.cuda.StreamHandle = null,
-    pipeline_block_runtime1: ?BlockRuntime = null,
-    pipeline_runtime_buffers1: ?RuntimeBuffers = null,
-    pipeline_kernel_registry1: ?compute.cuda.Registry = null,
-    pipeline_blas1: ?compute.cuda.Blas = null,
+    pipeline_backend1: ?*CudaBackend = null,
     /// Activation transfer mechanism (pipeline2 only).
     pipeline_transfer_mode: PipelineTransferMode = .none,
     pipeline_host_staging: ?[]align(4096) u8 = null,
@@ -378,7 +373,10 @@ pub const CudaBackend = struct {
     };
 
     pub const SlotStateBinding = struct {
+        const local_state_block_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+
         handles: [max_state_bindings_per_slot]runtime_contract.StateBlockHandle = undefined,
+        local_blocks: [max_state_bindings_per_slot][local_state_block_bytes]u8 align(64) = undefined,
         count: u8 = 0,
         bound: bool = false,
 
@@ -785,83 +783,51 @@ pub const CudaBackend = struct {
         if (init_options.topology_mode == .pipeline2) {
             backend.topology_mode = .pipeline2;
             const total_layers = loaded.blocks.len;
+            if (total_layers < 2) return error.InvalidTopologyConfig;
             const split = total_layers / 2;
+            if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
             backend.split_layer = split;
 
-            // Stage 0 (this backend) keeps layers [0, split).
-            // Re-init block_runtime with only stage 0 layers.
-            backend.block_runtime.deinit(allocator, &backend.device);
-            backend.block_runtime = try BlockRuntime.initRange(
-                allocator,
-                &backend.device,
-                loaded,
-                backend.max_seq_len,
-                backend.kv_init_tokens,
-                0,
-                split,
-                CudaBackend.layer_program_adapter_table,
-            );
-            // Re-init slot KV states for the reduced layer count.
-            backend.deinitSlotKvStates();
-            try backend.initSlotKvStates();
+            // Stage 0 (this backend): keep layers [0, split).
+            try backend.repartitionLayerRange(0, split);
 
-            // Stage 1: second device with layers [split, total_layers).
-            var device1 = try compute.cuda.Device.initAt(init_options.stage_device_ordinals[1]);
-            errdefer device1.deinit();
+            // Stage 1: dedicated backend on device1 with layers [split, total_layers).
+            const stage1_ptr = try allocator.create(CudaBackend);
+            errdefer allocator.destroy(stage1_ptr);
+            stage1_ptr.* = try CudaBackend.init(
+                allocator,
+                loaded,
+                max_batch_size,
+                .{
+                    .device_ordinal = init_options.stage_device_ordinals[1],
+                    .topology_mode = .single,
+                    .stage_device_ordinals = init_options.stage_device_ordinals,
+                },
+            );
+            errdefer {
+                stage1_ptr.deinit();
+                allocator.destroy(stage1_ptr);
+            }
+            try stage1_ptr.repartitionLayerRange(split, total_layers);
+            stage1_ptr.topology_mode = .single;
+            stage1_ptr.split_layer = 0;
+            backend.pipeline_backend1 = stage1_ptr;
+
             log.info("inference", "CUDA pipeline2 stage 1 device ready", .{
-                .name = device1.name(),
-                .ordinal = device1.ordinal(),
+                .name = stage1_ptr.device.name(),
+                .ordinal = stage1_ptr.device.ordinal(),
                 .split_layer = split,
                 .total_layers = total_layers,
             });
-            if (device1.supportsStreams()) {
-                const stream1 = try device1.createStream();
-                device1.setLaunchStream(stream1);
-                backend.pipeline_stream1 = stream1;
-            }
-            var block_runtime1 = try BlockRuntime.initRange(
-                allocator,
-                &device1,
-                loaded,
-                backend.max_seq_len,
-                backend.kv_init_tokens,
-                split,
-                total_layers,
-                CudaBackend.layer_program_adapter_table,
-            );
-            errdefer block_runtime1.deinit(allocator, &device1);
-            const max_dff1 = block_runtime1.maxDff();
-            const max_attn1 = block_runtime1.maxAttn();
-            const max_kv1 = block_runtime1.maxKv();
-            const max_gdelta_proj1 = block_runtime1.maxGatedDeltaProj();
-            const max_shortconv_dim1 = block_runtime1.maxShortConvDim();
-            var blas1 = try compute.cuda.Blas.init(&device1);
-            errdefer blas1.deinit(&device1);
-            var runtime_buffers1 = try RuntimeBuffers.init(
-                allocator,
-                &device1,
-                loaded,
-                max_dff1,
-                max_attn1,
-                max_kv1,
-                max_gdelta_proj1,
-                max_shortconv_dim1,
-                backend.max_seq_len,
-                backend.n_heads,
-                backend.head_dim,
-            );
-            errdefer runtime_buffers1.deinit(allocator, &device1);
-            var kernel_registry1 = compute.cuda.Registry.init(allocator, &device1);
-            errdefer kernel_registry1.deinit();
 
             // Determine transfer mode.
-            if (backend.device.canAccessPeer(&device1)) {
-                backend.device.enablePeerAccess(&device1) catch {};
-                device1.enablePeerAccess(&backend.device) catch {};
+            if (backend.device.canAccessPeer(&stage1_ptr.device)) {
+                backend.device.enablePeerAccess(&stage1_ptr.device) catch {};
+                stage1_ptr.device.enablePeerAccess(&backend.device) catch {};
                 backend.pipeline_transfer_mode = .peer_to_peer;
                 log.info("inference", "CUDA pipeline2 using peer-to-peer transfer", .{});
             } else {
-                const transfer_bytes = backend.d_model * @sizeOf(f32) * backend.max_seq_len;
+                const transfer_bytes = backend.d_model * @sizeOf(f32);
                 backend.pipeline_host_staging = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer_bytes);
                 backend.pipeline_transfer_mode = .host_staged;
                 log.info("inference", "CUDA pipeline2 using host-staged transfer", .{
@@ -869,11 +835,31 @@ pub const CudaBackend = struct {
                 });
             }
 
-            backend.pipeline_device1 = device1;
-            backend.pipeline_block_runtime1 = block_runtime1;
-            backend.pipeline_runtime_buffers1 = runtime_buffers1;
-            backend.pipeline_kernel_registry1 = kernel_registry1;
-            backend.pipeline_blas1 = blas1;
+            const stage0_budget = backend.computeDeviceMemoryBudget();
+            const stage1_budget = stage1_ptr.computeDeviceMemoryBudget();
+            log.info("inference", "CUDA pipeline2 topology", .{
+                .stage0_ordinal = backend.device.ordinal(),
+                .stage1_ordinal = stage1_ptr.device.ordinal(),
+                .stage0_layers_start = @as(usize, 0),
+                .stage0_layers_end = split,
+                .stage1_layers_start = split,
+                .stage1_layers_end = total_layers,
+                .transfer_mode = @tagName(backend.pipeline_transfer_mode),
+                .stage0_known_mib = bytesToMiB(stage0_budget.totalBytes()),
+                .stage1_known_mib = bytesToMiB(stage1_budget.totalBytes()),
+                .stage0_weights_mib = bytesToMiB(stage0_budget.weights_bytes),
+                .stage1_weights_mib = bytesToMiB(stage1_budget.weights_bytes),
+                .stage0_runtime_mib = bytesToMiB(stage0_budget.runtime_bytes),
+                .stage1_runtime_mib = bytesToMiB(stage1_budget.runtime_bytes),
+                .stage0_slot_state_mib = bytesToMiB(stage0_budget.slotStateBytes()),
+                .stage1_slot_state_mib = bytesToMiB(stage1_budget.slotStateBytes()),
+                .stage0_workspace_mib = bytesToMiB(stage0_budget.workspace_bytes),
+                .stage1_workspace_mib = bytesToMiB(stage1_budget.workspace_bytes),
+                .stage0_fixed_alloc = @as(u8, @intFromBool(backend.fixed_alloc_mode)),
+                .stage1_fixed_alloc = @as(u8, @intFromBool(stage1_ptr.fixed_alloc_mode)),
+                .stage0_strict_memory = @as(u8, @intFromBool(backend.strict_memory_mode)),
+                .stage1_strict_memory = @as(u8, @intFromBool(stage1_ptr.strict_memory_mode)),
+            });
         }
 
         log.info("inference", "CUDA layered decode path ready", .{
@@ -973,6 +959,72 @@ pub const CudaBackend = struct {
         return backend;
     }
 
+    fn repartitionLayerRange(self: *CudaBackend, layer_start: usize, layer_end: usize) !void {
+        if (layer_end < layer_start or layer_end > self.loaded.blocks.len) return error.InvalidArgument;
+
+        self.block_runtime.deinit(self.allocator, &self.device);
+        self.block_runtime = try BlockRuntime.initRange(
+            self.allocator,
+            &self.device,
+            self.loaded,
+            self.max_seq_len,
+            self.kv_init_tokens,
+            layer_start,
+            layer_end,
+            CudaBackend.layer_program_adapter_table,
+        );
+        engine_layer_program.assignCpuRuntimeRopeToAttentionFallbacks(self);
+
+        const max_dff = self.block_runtime.maxDff();
+        const max_attn = self.block_runtime.maxAttn();
+        const max_kv = self.block_runtime.maxKv();
+        const max_gdelta_proj = self.block_runtime.maxGatedDeltaProj();
+        const max_shortconv_dim = self.block_runtime.maxShortConvDim();
+        const repartitioned_runtime_buffers = try RuntimeBuffers.init(
+            self.allocator,
+            &self.device,
+            self.loaded,
+            max_dff,
+            max_attn,
+            max_kv,
+            max_gdelta_proj,
+            max_shortconv_dim,
+            self.max_seq_len,
+            self.n_heads,
+            self.head_dim,
+        );
+        self.runtime_buffers.deinit(self.allocator, &self.device);
+        self.runtime_buffers = repartitioned_runtime_buffers;
+        if (self.attn_scores_workspace_dev) |*buf| {
+            buf.deinit(&self.device);
+            self.attn_scores_workspace_dev = null;
+        }
+        if (self.attn_u16_workspace_dev) |*buf| {
+            buf.deinit(&self.device);
+            self.attn_u16_workspace_dev = null;
+        }
+
+        self.deinitSlotKvStates();
+        try self.initSlotKvStates();
+        self.active_kv_slot = 0;
+
+        self.deinitLayerProgramSlotBuffers();
+        try self.initLayerProgramSlotBuffers();
+
+        self.state_descriptor_count = 0;
+        for (self.block_runtime.blocks) |*layer| {
+            if (layer.compiled_plan) |*compiled_plan| {
+                try runtime_contract.appendUniquePlanStateDescriptors(
+                    self.state_descriptors_storage[0..],
+                    &self.state_descriptor_count,
+                    &compiled_plan.plan,
+                );
+            }
+        }
+
+        try self.preallocateFixedAllocBuffers();
+    }
+
     pub fn deinit(self: *CudaBackend) void {
         if (self.vision_runtime) |*rt| rt.deinit();
         if (self.decode_graph_exec) |exec| {
@@ -1014,37 +1066,15 @@ pub const CudaBackend = struct {
         self.deinitLayerProgramSlotBuffers();
         if (self.attn_scores_workspace_dev) |*buf| buf.deinit(&self.device);
         if (self.attn_u16_workspace_dev) |*buf| buf.deinit(&self.device);
+        if (self.pipeline_backend1) |stage1| {
+            stage1.deinit();
+            self.allocator.destroy(stage1);
+            self.pipeline_backend1 = null;
+        }
         // Pipeline2: release stage 1 resources before stage 0 (reverse init order).
         if (self.pipeline_host_staging) |buf| {
             self.allocator.free(buf);
             self.pipeline_host_staging = null;
-        }
-        if (self.pipeline_blas1) |*b| {
-            if (self.pipeline_device1) |*d| b.deinit(d);
-            self.pipeline_blas1 = null;
-        }
-        if (self.pipeline_kernel_registry1) |*r| {
-            r.deinit();
-            self.pipeline_kernel_registry1 = null;
-        }
-        if (self.pipeline_runtime_buffers1) |*rb| {
-            if (self.pipeline_device1) |*d| rb.deinit(self.allocator, d);
-            self.pipeline_runtime_buffers1 = null;
-        }
-        if (self.pipeline_block_runtime1) |*br| {
-            if (self.pipeline_device1) |*d| br.deinit(self.allocator, d);
-            self.pipeline_block_runtime1 = null;
-        }
-        if (self.pipeline_stream1) |stream1| {
-            if (self.pipeline_device1) |*d| {
-                _ = d.synchronizeStream(stream1) catch {};
-                d.destroyStream(stream1);
-            }
-            self.pipeline_stream1 = null;
-        }
-        if (self.pipeline_device1) |*d| {
-            d.deinit();
-            self.pipeline_device1 = null;
         }
         self.block_runtime.deinit(self.allocator, &self.device);
         self.runtime_buffers.deinit(self.allocator, &self.device);
@@ -1061,6 +1091,38 @@ pub const CudaBackend = struct {
             return;
         }
         try self.device.synchronize();
+    }
+
+    pub fn pipelineStage1(self: *CudaBackend) ?*CudaBackend {
+        return self.pipeline_backend1;
+    }
+
+    pub fn transferPipelineActivation(self: *CudaBackend, dst: *CudaBackend, byte_count: usize) !void {
+        if (byte_count == 0) return;
+        switch (self.pipeline_transfer_mode) {
+            .peer_to_peer => {
+                try self.device.memcpyPeerAsync(
+                    dst.runtime_buffers.input_dev.pointer,
+                    dst.device.context,
+                    self.runtime_buffers.input_dev.pointer,
+                    self.device.context,
+                    byte_count,
+                    self.compute_stream,
+                );
+                if (self.compute_stream) |stream| {
+                    try self.device.synchronizeStream(stream);
+                } else {
+                    try self.device.synchronize();
+                }
+            },
+            .host_staged => {
+                const staging = self.pipeline_host_staging orelse return error.PipelineTransferNotInitialized;
+                if (byte_count > staging.len) return error.PipelineTransferBufferTooSmall;
+                try self.runtime_buffers.input_dev.download(&self.device, staging[0..byte_count]);
+                try dst.runtime_buffers.input_dev.upload(&dst.device, staging[0..byte_count]);
+            },
+            .none => return error.InvalidTopologyConfig,
+        }
     }
 
     pub fn maxBatchSize(self: *const CudaBackend) usize {
@@ -1415,7 +1477,7 @@ pub const CudaBackend = struct {
         var slot_index: usize = 0;
         while (slot_index < self.max_batch_size) : (slot_index += 1) {
             self.activateKvSlot(slot_index);
-            try engine_forward.ensureKvCapacity(self,self.max_seq_len);
+            try engine_forward.ensureKvCapacity(self, self.max_seq_len);
         }
         self.saveActiveKvSlot();
         self.activateKvSlot(0);
@@ -1428,7 +1490,8 @@ pub const CudaBackend = struct {
         const prefill_rows_u32: u32 = @intCast(prefill_rows);
         const max_seq_len_u32: u32 = @intCast(self.max_seq_len);
 
-        _ = try engine_mixers.ensureAttnScoresWorkspace(self,
+        _ = try engine_mixers.ensureAttnScoresWorkspace(
+            self,
             kv_groups_u32,
             prefill_rows_u32,
             max_seq_len_u32,
@@ -1445,7 +1508,7 @@ pub const CudaBackend = struct {
             q_f16_elems + probs_f16_elems,
             @sizeOf(u16),
         ) catch return error.InvalidArgument;
-        _ = try engine_mixers.ensureAttnU16Workspace(self,u16_workspace_bytes);
+        _ = try engine_mixers.ensureAttnU16Workspace(self, u16_workspace_bytes);
     }
 
     fn deinitLayerProgramSlotBuffers(self: *CudaBackend) void {
@@ -1543,7 +1606,8 @@ pub const CudaBackend = struct {
         self.activateKvSlot(slot_index);
 
         const effective_position = try common_mrope.applyPositionDelta(self.slot_positions[slot_index], self.slot_rope_position_deltas[slot_index]);
-        try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(self,
+        try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+            self,
             token,
             effective_position,
             slot_index,
@@ -1557,6 +1621,7 @@ pub const CudaBackend = struct {
             null,
             null,
             null,
+            false,
         );
 
         const projected_vocab = self.runtime_buffers.projected_vocab;
@@ -1677,6 +1742,36 @@ pub const CudaBackend = struct {
         };
     }
 
+    fn synthesizeRuntimeStateBlockForDescriptor(
+        self: *CudaBackend,
+        binding: *SlotStateBinding,
+        descriptor: runtime_contract.StateDescriptor,
+        slot_index: usize,
+        binding_index: usize,
+    ) !runtime_contract.StateBlockHandle {
+        const block_storage = &binding.local_blocks[binding_index];
+        switch (descriptor.runtime_kind) {
+            runtime_contract.state_runtime_kind_kv_cache,
+            runtime_contract.state_runtime_kind_shortconv_cache,
+            runtime_contract.state_runtime_kind_mamba_cache,
+            runtime_contract.state_runtime_kind_gated_delta_cache,
+            => {},
+            else => return error.InvalidStateDescriptorBinding,
+        }
+        if (descriptor.align_bytes > 64) return error.InvalidStateDescriptorBinding;
+        if (descriptor.size_bytes > block_storage.len) return error.InvalidStateDescriptorBinding;
+        if (descriptor.zero_init) @memset(block_storage, 0);
+
+        var local_handle: runtime_contract.StateBlockHandle = .{
+            .id = descriptor.id,
+            .ptr = block_storage[0..].ptr,
+            .size = block_storage.len,
+            .align_bytes = 64,
+        };
+        try bindRuntimeState(self, slot_index, descriptor.runtime_kind, &local_handle);
+        return local_handle;
+    }
+
     pub fn bindSlotStateBlocks(
         self: *CudaBackend,
         slot_index: usize,
@@ -1719,6 +1814,49 @@ pub const CudaBackend = struct {
             };
         }
         binding.count = @intCast(state_blocks.len);
+        binding.bound = true;
+    }
+
+    pub fn mirrorSlotStateBlocksFrom(
+        self: *CudaBackend,
+        source: *const CudaBackend,
+        slot_index: usize,
+    ) !void {
+        if (!self.slotIndexSupported(slot_index) or !source.slotIndexSupported(slot_index)) return error.InvalidArgument;
+        if (self.state_descriptor_count == 0) return;
+        const source_binding = &source.slot_state_bindings[slot_index];
+
+        var binding = &self.slot_state_bindings[slot_index];
+        binding.reset();
+        const source_blocks: []const runtime_contract.StateBlockHandle = if (source_binding.bound)
+            source.slotStateBlocks(slot_index)
+        else
+            &.{};
+        for (self.stateDescriptors(), 0..) |descriptor, idx| {
+            if (descriptor.runtime_kind != runtime_contract.state_runtime_kind_none) {
+                // Runtime descriptors are always rebound into stage-local wrapper blocks.
+                // Rebinding shared source blocks mutates their payload and can alias state
+                // across stages, so stage1 must never reuse stage0 runtime block pointers.
+                binding.handles[idx] = try synthesizeRuntimeStateBlockForDescriptor(
+                    self,
+                    binding,
+                    descriptor,
+                    slot_index,
+                    idx,
+                );
+                continue;
+            }
+            const incoming = runtime_contract.findStateBlock(source_blocks, descriptor.id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            binding.handles[idx] = .{
+                .id = descriptor.id,
+                .ptr = incoming.ptr,
+                .size = incoming.size,
+                .align_bytes = incoming.align_bytes,
+            };
+        }
+        binding.count = self.state_descriptor_count;
         binding.bound = true;
     }
 
@@ -1838,7 +1976,7 @@ pub const CudaBackend = struct {
         self.activateKvSlot(slot_index);
         self.beginPrefillDispatchWindow();
         const prefill_start_ns: i128 = std.time.nanoTimestamp();
-        try engine_forward.ensureKvCapacity(self,tokens.len);
+        try engine_forward.ensureKvCapacity(self, tokens.len);
 
         const hidden_count = std.math.mul(usize, tokens.len, self.d_model) catch return error.InvalidArgument;
         const hidden_host = try self.allocator.alloc(f32, hidden_count);
@@ -1885,7 +2023,8 @@ pub const CudaBackend = struct {
                 findPositionIndex(image_token_positions, i)
             else
                 null;
-            engine_forward.computeGpuPrototypeLogitsWithLayerLimit(self,
+            engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+                self,
                 tokens[i],
                 i,
                 slot_index,
@@ -1899,6 +2038,7 @@ pub const CudaBackend = struct {
                 hidden_override,
                 deepstack_layer_features_opt,
                 deepstack_feature_index,
+                false,
             ) catch |err| {
                 log.warn("inference", "CUDA vision token prefill step failed", .{
                     .slot_index = slot_index,
@@ -1972,7 +2112,8 @@ pub const CudaBackend = struct {
     }
 
     pub fn computeGpuPrototypeLogits(self: *CudaBackend, token: u32, position: usize, logits_out: []f32) !void {
-        return engine_forward.computeGpuPrototypeLogitsWithLayerLimit(self,
+        return engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+            self,
             token,
             position,
             0,
@@ -1986,10 +2127,9 @@ pub const CudaBackend = struct {
             null,
             null,
             null,
+            false,
         );
     }
-
-
 
     // --- Delegation to engine_forward.zig ---
     pub fn computeGpuPrototypeLogitsWithLayerLimit(
@@ -2007,8 +2147,9 @@ pub const CudaBackend = struct {
         hidden_override: ?[]const f32,
         deepstack_layer_features_opt: ?[]const []const f32,
         deepstack_feature_index_opt: ?usize,
+        use_preloaded_input: bool,
     ) !void {
-        return engine_forward.computeGpuPrototypeLogitsWithLayerLimit(self, token, position, slot_index, logits_out_opt, layer_limit, compute_logits, download_logits, ensure_kv_capacity, trace_seq_len_u32, trace_pos_offset, hidden_override, deepstack_layer_features_opt, deepstack_feature_index_opt);
+        return engine_forward.computeGpuPrototypeLogitsWithLayerLimit(self, token, position, slot_index, logits_out_opt, layer_limit, compute_logits, download_logits, ensure_kv_capacity, trace_seq_len_u32, trace_pos_offset, hidden_override, deepstack_layer_features_opt, deepstack_feature_index_opt, use_preloaded_input);
     }
 
     pub fn computeBatchedDecodeLogits(
@@ -2288,7 +2429,7 @@ pub const CudaBackend = struct {
             state_blocks,
         );
         const layer = try engine_layer_program.requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
-        try engine_layer_program.layerProgramNormAdapter(exec_ctx.backend,layer, insn, registers, exec_ctx);
+        try engine_layer_program.layerProgramNormAdapter(exec_ctx.backend, layer, insn, registers, exec_ctx);
         if (trace.isEnabled()) {
             engine_layer_program.emitLayerProgramTracePoint(
                 exec_ctx,
@@ -2333,7 +2474,7 @@ pub const CudaBackend = struct {
             }
             break :blk cfg.query_gate;
         } else |_| false else false;
-        try engine_layer_program.layerProgramAttentionAdapter(exec_ctx.backend,layer, insn, registers, state_blocks, exec_ctx);
+        try engine_layer_program.layerProgramAttentionAdapter(exec_ctx.backend, layer, insn, registers, state_blocks, exec_ctx);
         const io = try engine_layer_program.instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         if (trace_enabled and !emits_traced_inside_cpu_fallback) {
@@ -2375,7 +2516,7 @@ pub const CudaBackend = struct {
                 );
             } else |_| {}
         }
-        try engine_layer_program.layerProgramShortConvAdapter(exec_ctx.backend,layer, insn, registers, state_blocks, exec_ctx);
+        try engine_layer_program.layerProgramShortConvAdapter(exec_ctx.backend, layer, insn, registers, state_blocks, exec_ctx);
         const io = try engine_layer_program.instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         if (trace.isEnabled()) {
@@ -2405,7 +2546,7 @@ pub const CudaBackend = struct {
             state_blocks,
         );
         const layer = try engine_layer_program.requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
-        try engine_layer_program.layerProgramGatedDeltaAdapter(exec_ctx.backend,layer, insn, registers, state_blocks, params, exec_ctx);
+        try engine_layer_program.layerProgramGatedDeltaAdapter(exec_ctx.backend, layer, insn, registers, state_blocks, params, exec_ctx);
     }
 
     fn layerProgramSwiGluRuntimeAdapter(
@@ -2435,7 +2576,7 @@ pub const CudaBackend = struct {
                 null,
             );
         }
-        try engine_layer_program.layerProgramSwiGluAdapter(exec_ctx.backend,layer, insn, registers, exec_ctx);
+        try engine_layer_program.layerProgramSwiGluAdapter(exec_ctx.backend, layer, insn, registers, exec_ctx);
         const io = try engine_layer_program.instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         if (trace.isEnabled()) {
@@ -2466,7 +2607,7 @@ pub const CudaBackend = struct {
         );
         _ = try engine_layer_program.requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
         const scale = try engine_layer_program.decodeResidualScaleFromParams(params);
-        try engine_layer_program.layerProgramResidualAddAdapter(exec_ctx.backend,insn, registers, scale, exec_ctx);
+        try engine_layer_program.layerProgramResidualAddAdapter(exec_ctx.backend, insn, registers, scale, exec_ctx);
         const io = try engine_layer_program.instructionIoSlices(insn, registers);
         if (io.inputs.len != 2 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         if (trace.isEnabled()) {
@@ -2480,9 +2621,7 @@ pub const CudaBackend = struct {
             );
         }
     }
-
 };
-
 
 // --- Free functions from engine_weights.zig ---
 const engine_weights = @import("engine_weights.zig");
@@ -2539,4 +2678,3 @@ const gaffineValueAt = engine_weights.gaffineValueAt;
 test {
     _ = @import("engine_tests.zig");
 }
-

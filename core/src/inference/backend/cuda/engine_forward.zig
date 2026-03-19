@@ -30,7 +30,6 @@ const tryPopulateHiddenFromToken = engine_weights.tryPopulateHiddenFromToken;
 const saturatingU64FromU128 = engine_types.saturatingU64FromU128;
 const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 
-
 pub fn computeGpuPrototypeLogitsWithLayerLimit(
     self: anytype,
     token: u32,
@@ -46,10 +45,90 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     hidden_override: ?[]const f32,
     deepstack_layer_features_opt: ?[]const []const f32,
     deepstack_feature_index_opt: ?usize,
+    use_preloaded_input: bool,
 ) !void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "topology_mode") and
+        @hasDecl(SelfType, "pipelineStage1") and
+        @hasDecl(SelfType, "transferPipelineActivation"))
+    {
+        if (self.topology_mode == .pipeline2 and
+            layer_limit == self.block_runtime.blocks.len and
+            compute_logits and
+            !use_preloaded_input)
+        {
+            var stage1_deepstack_layer_features_opt: ?[]const []const f32 = null;
+            if (deepstack_layer_features_opt) |deepstack_layer_features| {
+                if (self.split_layer < deepstack_layer_features.len) {
+                    stage1_deepstack_layer_features_opt = deepstack_layer_features[self.split_layer..];
+                }
+            }
+            var stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
+            if (stage1.state_descriptor_count > 0) {
+                try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
+            }
+            stage1.activateKvSlot(slot_index);
+            try computeGpuPrototypeLogitsWithLayerLimit(
+                self,
+                token,
+                position,
+                slot_index,
+                null,
+                layer_limit,
+                false,
+                false,
+                ensure_kv_capacity,
+                trace_seq_len_u32,
+                trace_pos_offset,
+                hidden_override,
+                deepstack_layer_features_opt,
+                deepstack_feature_index_opt,
+                false,
+            );
+            const activation_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+            try self.transferPipelineActivation(stage1, activation_bytes);
+            return computeGpuPrototypeLogitsWithLayerLimit(
+                stage1,
+                token,
+                position,
+                slot_index,
+                logits_out_opt,
+                stage1.block_runtime.blocks.len,
+                compute_logits,
+                download_logits,
+                ensure_kv_capacity,
+                trace_seq_len_u32,
+                trace_pos_offset,
+                null,
+                stage1_deepstack_layer_features_opt,
+                deepstack_feature_index_opt,
+                true,
+            );
+        }
+    }
+    if (comptime @hasDecl(SelfType, "computeGpuPrototypeLogitsWithLayerLimitTestHook")) {
+        return self.computeGpuPrototypeLogitsWithLayerLimitTestHook(
+            token,
+            position,
+            slot_index,
+            logits_out_opt,
+            layer_limit,
+            compute_logits,
+            download_logits,
+            ensure_kv_capacity,
+            trace_seq_len_u32,
+            trace_pos_offset,
+            hidden_override,
+            deepstack_layer_features_opt,
+            deepstack_feature_index_opt,
+            use_preloaded_input,
+        );
+    }
+
     const previous_launch_phase = self.device.setLaunchPhase(.decode);
     defer _ = self.device.setLaunchPhase(previous_launch_phase);
     if (!compute_logits and download_logits) return error.InvalidArgument;
+    if (use_preloaded_input and hidden_override != null) return error.InvalidArgument;
     if (deepstack_feature_index_opt != null and deepstack_layer_features_opt == null) return error.InvalidArgument;
     if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
     if (download_logits) {
@@ -59,9 +138,15 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     if (position >= self.max_seq_len) return error.InvalidArgument;
     if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
     if (position == 0) {
-        try resetShortConvStates(self,);
-        resetAttentionCpuStates(self,);
-        resetGatedDeltaStates(self,);
+        try resetShortConvStates(
+            self,
+        );
+        resetAttentionCpuStates(
+            self,
+        );
+        resetGatedDeltaStates(
+            self,
+        );
     }
     if (ensure_kv_capacity) {
         try ensureKvCapacity(self, position + 1);
@@ -135,7 +220,9 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     else
         global_rope_theta;
 
-    if (hidden_override) |hidden| {
+    if (use_preloaded_input) {
+        // Stage boundary handoff path: input_dev is already populated by caller.
+    } else if (hidden_override) |hidden| {
         if (hidden.len != self.d_model) return error.InvalidArgument;
         @memcpy(self.runtime_buffers.hidden_host, hidden);
         try input_row.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
@@ -354,7 +441,14 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             }
         }
     }
-    if (!compute_logits) return;
+    if (!compute_logits) {
+        // Stage handoff invariant: when skipping logits, publish the final hidden
+        // row to input_dev so the next stage can consume a deterministic buffer.
+        if (final_hidden.pointer != self.runtime_buffers.input_dev.pointer) {
+            try self.runtime_buffers.input_dev.copyFrom(&self.device, &final_hidden, row_bytes);
+        }
+        return;
+    }
 
     try compute.cuda.rmsnorm.runWithFunction(
         &self.kernel_arg_pack,
@@ -474,10 +568,37 @@ pub fn computeBatchedDecodeLogits(
     slot_indices: []const usize,
     positions: []const usize,
 ) !void {
+    const SelfType = @TypeOf(self.*);
     const n_usize = tokens.len;
     if (n_usize == 0) return;
     if (n_usize > self.max_batch_size) return error.InvalidArgument;
     const n: u32 = @intCast(n_usize);
+    if (comptime @hasField(SelfType, "topology_mode")) {
+        if (self.topology_mode == .pipeline2) {
+            for (0..n_usize) |i| {
+                self.activateKvSlot(slot_indices[i]);
+                try computeGpuPrototypeLogitsWithLayerLimit(
+                    self,
+                    tokens[i],
+                    positions[i],
+                    slot_indices[i],
+                    self.slotLogits(slot_indices[i]),
+                    self.block_runtime.blocks.len,
+                    true,
+                    true,
+                    true,
+                    1,
+                    positions[i],
+                    null,
+                    null,
+                    null,
+                    false,
+                );
+            }
+            return;
+        }
+    }
+    if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
     const previous_launch_phase = self.device.setLaunchPhase(.decode);
     defer _ = self.device.setLaunchPhase(previous_launch_phase);
 
@@ -777,6 +898,40 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
     logits_out: []f32,
     layer_limit: usize,
 ) !void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "topology_mode")) {
+        if (self.topology_mode == .pipeline2 and layer_limit == self.block_runtime.blocks.len) {
+            if (tokens.len == 0) return error.InvalidArgument;
+            if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
+            if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+            if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+
+            var token_index: usize = 0;
+            while (token_index < tokens.len) : (token_index += 1) {
+                const should_download = token_index + 1 == tokens.len;
+                try computeGpuPrototypeLogitsWithLayerLimit(
+                    self,
+                    tokens[token_index],
+                    token_index,
+                    slot_index,
+                    if (should_download) logits_out else null,
+                    layer_limit,
+                    true,
+                    should_download,
+                    true,
+                    @intCast(token_index + 1),
+                    token_index,
+                    null,
+                    null,
+                    null,
+                    false,
+                );
+            }
+            return;
+        }
+    }
+
+    if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
     const previous_launch_phase = self.device.setLaunchPhase(.prefill);
     defer _ = self.device.setLaunchPhase(previous_launch_phase);
     if (tokens.len == 0) return error.InvalidArgument;
@@ -787,9 +942,15 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
 
     const total_rows = tokens.len;
     try ensureKvCapacity(self, total_rows);
-    try resetShortConvStates(self,);
-    resetAttentionCpuStates(self,);
-    resetGatedDeltaStates(self,);
+    try resetShortConvStates(
+        self,
+    );
+    resetAttentionCpuStates(
+        self,
+    );
+    resetGatedDeltaStates(
+        self,
+    );
 
     const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
     const d_model_u32: u32 = @intCast(self.d_model);

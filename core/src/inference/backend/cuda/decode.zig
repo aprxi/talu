@@ -142,6 +142,7 @@ pub fn decodeBatch(
             null,
             null,
             null,
+            false,
         );
 
         if (comptime @hasDecl(SelfType, "saveActiveKvSlot")) {
@@ -214,6 +215,7 @@ pub fn decodeStreaming(
             null,
             null,
             null,
+            false,
         );
         const next_token = try self.selectNextTokenFromDeviceLogitsImpl();
         trace.emitFinal(
@@ -341,6 +343,7 @@ const MockDecodeBackend = struct {
         hidden_override: ?[]const f32,
         deepstack_layer_features_opt: ?[]const []const f32,
         deepstack_feature_index_opt: ?usize,
+        use_preloaded_input: bool,
     ) !void {
         _ = token;
         _ = position;
@@ -354,6 +357,7 @@ const MockDecodeBackend = struct {
         _ = hidden_override;
         _ = deepstack_layer_features_opt;
         _ = deepstack_feature_index_opt;
+        _ = use_preloaded_input;
         self.compute_calls += 1;
         // Fill logits if provided so tests can verify content.
         if (logits_out_opt) |logits_out| {

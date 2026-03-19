@@ -20,13 +20,59 @@ pub const CudaStage = struct {
     /// Each stage owns its own backend with its own device and layer range.
     backend: *@import("root.zig").BackendType,
 
+    pub const layer_execution_input_magic: u32 = 0x32475550; // "PUG2" little-endian marker
+
+    /// Internal stage execution payload.
+    /// This is process-local and build-local only; it is not a stable wire ABI.
+    pub const LayerExecutionInput = extern struct {
+        abi_magic: u32 = layer_execution_input_magic,
+        abi_size: u32 = @sizeOf(LayerExecutionInput),
+        token: u32,
+        position: usize,
+        slot_index: usize,
+        trace_seq_len_u32: u32,
+        trace_pos_offset: usize,
+        logits_out_ptr: ?[*]f32 = null,
+        logits_out_len: usize = 0,
+        compute_logits: bool = false,
+        download_logits: bool = false,
+        ensure_kv_capacity: bool = true,
+        use_preloaded_input: bool = false,
+    };
+
     /// Execute decoder layers [layer_start, layer_end) through this stage's backend.
-    /// The `input` pointer is unused in the current implementation — layer execution
-    /// reads from the backend's internal runtime buffers.
-    pub fn executeLayers(self: *CudaStage, _: [*]const u8, _: usize, _: usize) !void {
-        _ = self;
-        // Delegation to backend.computeLayerRange() will be wired in Phase 4.
-        return error.NotImplemented;
+    /// The input pointer carries a LayerExecutionInput payload for stage execution.
+    pub fn executeLayers(self: *CudaStage, input: []const u8, layer_start: usize, layer_end: usize) !void {
+        if (input.len != @sizeOf(LayerExecutionInput)) return error.InvalidArgument;
+        var exec_input: LayerExecutionInput = undefined;
+        @memcpy(std.mem.asBytes(&exec_input), input);
+        if (exec_input.abi_magic != layer_execution_input_magic or exec_input.abi_size != @sizeOf(LayerExecutionInput)) {
+            return error.InvalidArgument;
+        }
+        if ((exec_input.logits_out_ptr == null) != (exec_input.logits_out_len == 0)) return error.InvalidArgument;
+        if (layer_end < layer_start) return error.InvalidArgument;
+        const local_layer_limit = layer_end - layer_start;
+        if (local_layer_limit > self.backend.block_runtime.blocks.len) return error.InvalidArgument;
+        const logits_out_opt: ?[]f32 = if (exec_input.logits_out_ptr) |ptr|
+            ptr[0..exec_input.logits_out_len]
+        else
+            null;
+        try self.backend.computeGpuPrototypeLogitsWithLayerLimit(
+            exec_input.token,
+            exec_input.position,
+            exec_input.slot_index,
+            logits_out_opt,
+            local_layer_limit,
+            exec_input.compute_logits,
+            exec_input.download_logits,
+            exec_input.ensure_kv_capacity,
+            exec_input.trace_seq_len_u32,
+            exec_input.trace_pos_offset,
+            null,
+            null,
+            null,
+            exec_input.use_preloaded_input,
+        );
     }
 
     /// Download this stage's output activation from device to host.
@@ -123,3 +169,31 @@ pub const CudaP2PTransfer = struct {
 
 /// CUDA pipeline type: PipelineRuntime specialized for CudaStage + CudaP2PTransfer.
 pub const CudaPipeline = pipeline.PipelineRuntime(CudaStage, CudaP2PTransfer);
+
+test "CudaStage.executeLayers rejects payload with incorrect byte length" {
+    var stage = CudaStage{
+        .backend = @ptrFromInt(64),
+    };
+    const too_small = [_]u8{0} ** (@sizeOf(CudaStage.LayerExecutionInput) - 1);
+    try std.testing.expectError(error.InvalidArgument, stage.executeLayers(too_small[0..], 0, 0));
+}
+
+test "CudaStage.executeLayers rejects payload with invalid ABI marker" {
+    var stage = CudaStage{
+        .backend = @ptrFromInt(64),
+    };
+    var payload = CudaStage.LayerExecutionInput{};
+    payload.abi_magic = 0;
+    const bytes = std.mem.asBytes(&payload);
+    try std.testing.expectError(error.InvalidArgument, stage.executeLayers(bytes, 0, 0));
+}
+
+test "CudaStage.executeLayers rejects payload with logits pointer length mismatch" {
+    var stage = CudaStage{
+        .backend = @ptrFromInt(64),
+    };
+    var payload = CudaStage.LayerExecutionInput{};
+    payload.logits_out_len = 4;
+    const bytes = std.mem.asBytes(&payload);
+    try std.testing.expectError(error.InvalidArgument, stage.executeLayers(bytes, 0, 0));
+}

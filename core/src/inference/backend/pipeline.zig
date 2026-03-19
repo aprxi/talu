@@ -52,7 +52,7 @@ fn assertTransferContract(comptime T: type, comptime S: type) void {
 /// inference. Each stage executes a disjoint range of decoder layers.
 ///
 /// StageType must provide:
-///   fn executeLayers(self: *StageType, input: [*]const u8, layer_start: usize, layer_end: usize) !void
+///   fn executeLayers(self: *StageType, input: []const u8, layer_start: usize, layer_end: usize) !void
 ///   fn downloadActivation(self: *StageType, host_buf: []u8, byte_count: usize) !void
 ///   fn uploadActivation(self: *StageType, host_buf: []const u8, byte_count: usize) !void
 ///   fn synchronize(self: *StageType) !void
@@ -82,11 +82,20 @@ pub fn PipelineRuntime(comptime StageType: type, comptime TransferType: ?type) t
         /// 1. Stage 0 runs layers [0, split_layer) on its device.
         /// 2. Activation is transferred from stage 0 to stage 1.
         /// 3. Stage 1 runs layers [split_layer, total_layers) on its device.
-        pub fn executeForward(self: *Self, input: [*]const u8, byte_count: usize) !void {
-            try self.stage0.executeLayers(input, 0, self.split_layer);
+        ///
+        /// `stage0_input` and `stage1_input` are opaque execution payloads for each stage.
+        /// Keeping these separate prevents accidental stage-ambiguous control flags.
+        /// `activation_byte_count` is the boundary activation transfer size.
+        pub fn executeForward(
+            self: *Self,
+            stage0_input: []const u8,
+            stage1_input: []const u8,
+            activation_byte_count: usize,
+        ) !void {
+            try self.stage0.executeLayers(stage0_input, 0, self.split_layer);
             try self.stage0.synchronize();
-            try self.transferActivation(byte_count);
-            try self.stage1.executeLayers(input, self.split_layer, self.total_layers);
+            try self.transferActivation(activation_byte_count);
+            try self.stage1.executeLayers(stage1_input, self.split_layer, self.total_layers);
         }
 
         fn transferActivation(self: *Self, byte_count: usize) !void {
@@ -141,8 +150,10 @@ const TestLog = struct {
 const MockStage = struct {
     stage_id: usize,
     log: *TestLog,
+    input_len_out: ?*usize = null,
 
-    pub fn executeLayers(self: *MockStage, _: [*]const u8, layer_start: usize, layer_end: usize) !void {
+    pub fn executeLayers(self: *MockStage, input: []const u8, layer_start: usize, layer_end: usize) !void {
+        if (self.input_len_out) |out| out.* = input.len;
         _ = layer_start;
         self.log.append(.execute, layer_end);
     }
@@ -186,8 +197,8 @@ test "PipelineRuntime executeForward calls stages in correct order with host-sta
         .custom_transfer = {},
     };
 
-    const dummy_input: [1]u8 = .{0};
-    try pipeline.executeForward(&dummy_input, 64);
+    var dummy_input: [64]u8 = [_]u8{0} ** 64;
+    try pipeline.executeForward(dummy_input[0..], dummy_input[0..], 64);
 
     // Expected order: stage0.execute → stage0.sync → download → upload → stage1.execute
     try std.testing.expectEqual(@as(usize, 5), test_log.count);
@@ -216,8 +227,8 @@ test "PipelineRuntime executeForward calls custom transfer when provided" {
         .custom_transfer = .{ .log = &test_log },
     };
 
-    const dummy_input: [1]u8 = .{0};
-    try pipeline.executeForward(&dummy_input, 128);
+    var dummy_input: [128]u8 = [_]u8{0} ** 128;
+    try pipeline.executeForward(dummy_input[0..], dummy_input[0..], 128);
 
     // Expected: stage0.execute → stage0.sync → custom_transfer → stage1.execute
     try std.testing.expectEqual(@as(usize, 4), test_log.count);
@@ -261,4 +272,27 @@ test "PipelineRuntime transferActivation returns error when byte_count exceeds s
 
     const result = pipeline.transferActivation(64);
     try std.testing.expectError(error.PipelineTransferBufferTooSmall, result);
+}
+
+test "PipelineRuntime executeForward forwards stage-specific payloads" {
+    var test_log = TestLog{};
+    var stage0_input_len: usize = 0;
+    var stage1_input_len: usize = 0;
+    const HostPipeline = PipelineRuntime(MockStage, null);
+    var staging_buf: [64]u8 align(64) = undefined;
+    var stage0_payload: [12]u8 = [_]u8{0} ** 12;
+    var stage1_payload: [24]u8 = [_]u8{0} ** 24;
+
+    var pipeline = HostPipeline{
+        .stage0 = .{ .stage_id = 0, .log = &test_log, .input_len_out = &stage0_input_len },
+        .stage1 = .{ .stage_id = 1, .log = &test_log, .input_len_out = &stage1_input_len },
+        .split_layer = 4,
+        .total_layers = 8,
+        .host_staging = &staging_buf,
+        .custom_transfer = {},
+    };
+
+    try pipeline.executeForward(stage0_payload[0..], stage1_payload[0..], 32);
+    try std.testing.expectEqual(stage0_payload.len, stage0_input_len);
+    try std.testing.expectEqual(stage1_payload.len, stage1_input_len);
 }

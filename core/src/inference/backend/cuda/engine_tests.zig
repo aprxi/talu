@@ -65,6 +65,7 @@ const engine_ops = @import("engine_ops.zig");
 
 // --- Functions from engine_mixers.zig ---
 const engine_mixers = @import("engine_mixers.zig");
+const engine_forward = @import("engine_forward.zig");
 
 test "resolveDenseInOutLayout keeps [in,out] orientation" {
     const layout = try resolveDenseInOutLayout(128, 256, 128);
@@ -1270,6 +1271,177 @@ test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind n
     try std.testing.expectEqual(state_blocks[0].align_bytes, bound[0].align_bytes);
 }
 
+test "mirrorSlotStateBlocksFrom synthesizes stage-local runtime descriptors without aliasing source" {
+    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+
+    var source: CudaBackend = undefined;
+    source.max_batch_size = 1;
+    source.block_runtime = undefined;
+    source.state_descriptor_count = 1;
+    source.state_descriptors_storage[0] = .{
+        .id = 201,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+    };
+    var source_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    source.slot_state_bindings = source_slot_bindings[0..];
+
+    var target: CudaBackend = undefined;
+    target.max_batch_size = 1;
+    target.block_runtime = undefined;
+    target.state_descriptor_count = 2;
+    target.state_descriptors_storage[0] = .{
+        .id = 201,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+    };
+    target.state_descriptors_storage[1] = .{
+        .id = 202,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = true,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_mamba_cache,
+    };
+    var target_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    target.slot_state_bindings = target_slot_bindings[0..];
+
+    var source_kv_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    const source_blocks = [_]runtime_contract.StateBlockHandle{
+        .{
+            .id = 201,
+            .ptr = source_kv_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+    };
+    try source.bindSlotStateBlocks(0, source_blocks[0..]);
+    defer source.unbindSlotStateBlocks(0);
+    const source_before = source.slotStateBlocks(0);
+    const source_before_kv = runtime_contract.findStateBlock(source_before, 201) orelse return error.TestUnexpectedResult;
+    const source_before_kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, source_before_kv) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@intFromPtr(&source.block_runtime), @intFromPtr(source_before_kv_state.block_runtime));
+
+    try target.mirrorSlotStateBlocksFrom(&source, 0);
+    defer target.unbindSlotStateBlocks(0);
+
+    const mirrored = target.slotStateBlocks(0);
+    try std.testing.expectEqual(@as(usize, 2), mirrored.len);
+
+    const mirrored_kv = runtime_contract.findStateBlock(mirrored, 201) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(@intFromPtr(source_blocks[0].ptr) != @intFromPtr(mirrored_kv.ptr));
+    const kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, mirrored_kv) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_kv_cache, kv_state.runtime_kind);
+    try std.testing.expectEqual(@as(usize, 0), kv_state.slot_index);
+    try std.testing.expectEqual(@intFromPtr(&target.block_runtime), @intFromPtr(kv_state.block_runtime));
+    const source_after = source.slotStateBlocks(0);
+    const source_after_kv = runtime_contract.findStateBlock(source_after, 201) orelse return error.TestUnexpectedResult;
+    const source_after_kv_state = runtime_contract.stateValueFromBlock(*KvRuntimeState, source_after_kv) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@intFromPtr(&source.block_runtime), @intFromPtr(source_after_kv_state.block_runtime));
+
+    const mirrored_mamba = runtime_contract.findStateBlock(mirrored, 202) orelse return error.TestUnexpectedResult;
+    const mamba_state = runtime_contract.stateValueFromBlock(*MambaRuntimeState, mirrored_mamba) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_mamba_cache, mamba_state.runtime_kind);
+    try std.testing.expectEqual(@as(usize, 0), mamba_state.slot_index);
+    try std.testing.expectEqual(@intFromPtr(&target.block_runtime), @intFromPtr(mamba_state.block_runtime));
+}
+
+test "mirrorSlotStateBlocksFrom rejects missing opaque descriptor without runtime synthesis" {
+    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+
+    var source: CudaBackend = undefined;
+    source.max_batch_size = 1;
+    source.block_runtime = undefined;
+    source.state_descriptor_count = 1;
+    source.state_descriptors_storage[0] = .{
+        .id = 211,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+    };
+    var source_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    source.slot_state_bindings = source_slot_bindings[0..];
+
+    var target: CudaBackend = undefined;
+    target.max_batch_size = 1;
+    target.block_runtime = undefined;
+    target.state_descriptor_count = 2;
+    target.state_descriptors_storage[0] = .{
+        .id = 211,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_kv_cache,
+    };
+    target.state_descriptors_storage[1] = .{
+        .id = 212,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_none,
+    };
+    var target_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    target.slot_state_bindings = target_slot_bindings[0..];
+
+    var source_kv_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    const source_blocks = [_]runtime_contract.StateBlockHandle{
+        .{
+            .id = 211,
+            .ptr = source_kv_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+    };
+    try source.bindSlotStateBlocks(0, source_blocks[0..]);
+    defer source.unbindSlotStateBlocks(0);
+
+    try std.testing.expectError(error.InvalidStateDescriptorBinding, target.mirrorSlotStateBlocksFrom(&source, 0));
+}
+
+test "mirrorSlotStateBlocksFrom synthesizes runtime descriptors when source slot is unbound" {
+    var source: CudaBackend = undefined;
+    source.max_batch_size = 1;
+    source.block_runtime = undefined;
+    source.state_descriptor_count = 0;
+    var source_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    source.slot_state_bindings = source_slot_bindings[0..];
+
+    var target: CudaBackend = undefined;
+    target.max_batch_size = 1;
+    target.block_runtime = undefined;
+    target.state_descriptor_count = 1;
+    target.state_descriptors_storage[0] = .{
+        .id = 221,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = true,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_mamba_cache,
+    };
+    var target_slot_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    target.slot_state_bindings = target_slot_bindings[0..];
+
+    try target.mirrorSlotStateBlocksFrom(&source, 0);
+    defer target.unbindSlotStateBlocks(0);
+
+    const mirrored = target.slotStateBlocks(0);
+    try std.testing.expectEqual(@as(usize, 1), mirrored.len);
+    const mamba_state = runtime_contract.stateValueFromBlock(*MambaRuntimeState, &mirrored[0]) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_contract.state_runtime_kind_mamba_cache, mamba_state.runtime_kind);
+    try std.testing.expectEqual(@as(usize, 0), mamba_state.slot_index);
+    try std.testing.expectEqual(@intFromPtr(&target.block_runtime), @intFromPtr(mamba_state.block_runtime));
+}
+
 test "expectedAttentionQProjectionDim uses packed query width only for query-gated attention" {
     const plain = LayerAttentionExecConfig{
         .q_dim = 2048,
@@ -1332,4 +1504,452 @@ test "attentionFallbackUsesCache uses decode mode only for single-row execution"
     try std.testing.expect(engine_mixers.attentionFallbackUsesCache(1));
     try std.testing.expect(!engine_mixers.attentionFallbackUsesCache(2));
     try std.testing.expect(!engine_mixers.attentionFallbackUsesCache(15));
+}
+
+test "computeBatchedDecodeLogits routes pipeline2 decode per request through single-token path" {
+    const Mock = struct {
+        const BlockRuntimeMock = struct {
+            blocks: [3]u8 = [_]u8{0} ** 3,
+        };
+
+        max_batch_size: usize = 4,
+        topology_mode: enum { single, pipeline2 } = .pipeline2,
+        block_runtime: BlockRuntimeMock = .{},
+        vocab_size: usize = 5,
+        slot_logits_storage: [20]f32 = [_]f32{0.0} ** 20,
+        activate_calls: usize = 0,
+        activated_slots: [8]usize = [_]usize{0} ** 8,
+        compute_calls: usize = 0,
+        recorded_tokens: [8]u32 = [_]u32{0} ** 8,
+        recorded_positions: [8]usize = [_]usize{0} ** 8,
+        recorded_slots: [8]usize = [_]usize{0} ** 8,
+        recorded_layer_limits: [8]usize = [_]usize{0} ** 8,
+        recorded_compute_logits: [8]bool = [_]bool{false} ** 8,
+        recorded_download_logits: [8]bool = [_]bool{false} ** 8,
+        recorded_use_preloaded_input: [8]bool = [_]bool{false} ** 8,
+
+        pub fn activateKvSlot(self: *@This(), slot_index: usize) void {
+            self.activated_slots[self.activate_calls] = slot_index;
+            self.activate_calls += 1;
+        }
+
+        pub fn slotLogits(self: *@This(), slot_index: usize) []f32 {
+            const offset = slot_index * self.vocab_size;
+            return self.slot_logits_storage[offset .. offset + self.vocab_size];
+        }
+
+        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+            self: *@This(),
+            token: u32,
+            position: usize,
+            slot_index: usize,
+            logits_out_opt: ?[]f32,
+            layer_limit: usize,
+            compute_logits: bool,
+            download_logits: bool,
+            ensure_kv_capacity: bool,
+            trace_seq_len_u32: u32,
+            trace_pos_offset: usize,
+            hidden_override: ?[]const f32,
+            deepstack_layer_features_opt: ?[]const []const f32,
+            deepstack_feature_index_opt: ?usize,
+            use_preloaded_input: bool,
+        ) !void {
+            _ = ensure_kv_capacity;
+            _ = trace_seq_len_u32;
+            _ = trace_pos_offset;
+            _ = hidden_override;
+            _ = deepstack_layer_features_opt;
+            _ = deepstack_feature_index_opt;
+            const idx = self.compute_calls;
+            self.compute_calls += 1;
+            self.recorded_tokens[idx] = token;
+            self.recorded_positions[idx] = position;
+            self.recorded_slots[idx] = slot_index;
+            self.recorded_layer_limits[idx] = layer_limit;
+            self.recorded_compute_logits[idx] = compute_logits;
+            self.recorded_download_logits[idx] = download_logits;
+            self.recorded_use_preloaded_input[idx] = use_preloaded_input;
+            if (logits_out_opt) |logits_out| {
+                for (logits_out, 0..) |*logit, i| {
+                    logit.* = @floatFromInt(i);
+                }
+            }
+        }
+    };
+
+    var mock = Mock{};
+    const tokens = [_]u32{ 11, 22, 33 };
+    const slot_indices = [_]usize{ 2, 0, 3 };
+    const positions = [_]usize{ 7, 8, 9 };
+
+    try engine_forward.computeBatchedDecodeLogits(&mock, tokens[0..], slot_indices[0..], positions[0..]);
+
+    try std.testing.expectEqual(tokens.len, mock.activate_calls);
+    try std.testing.expectEqual(tokens.len, mock.compute_calls);
+    for (0..tokens.len) |i| {
+        try std.testing.expectEqual(slot_indices[i], mock.activated_slots[i]);
+        try std.testing.expectEqual(tokens[i], mock.recorded_tokens[i]);
+        try std.testing.expectEqual(positions[i], mock.recorded_positions[i]);
+        try std.testing.expectEqual(slot_indices[i], mock.recorded_slots[i]);
+        try std.testing.expectEqual(mock.block_runtime.blocks.len, mock.recorded_layer_limits[i]);
+        try std.testing.expect(mock.recorded_compute_logits[i]);
+        try std.testing.expect(mock.recorded_download_logits[i]);
+        try std.testing.expect(!mock.recorded_use_preloaded_input[i]);
+    }
+}
+
+test "computeGpuPrototypePrefillLogitsWithLayerLimit routes pipeline2 prefill through staged token loop" {
+    const Mock = struct {
+        const BlockRuntimeMock = struct {
+            blocks: [4]u8 = [_]u8{0} ** 4,
+        };
+
+        topology_mode: enum { single, pipeline2 } = .pipeline2,
+        block_runtime: BlockRuntimeMock = .{},
+        vocab_size: usize = 6,
+        max_seq_len: usize = 32,
+        compute_calls: usize = 0,
+        recorded_download_logits: [16]bool = [_]bool{false} ** 16,
+        recorded_trace_seq_lens: [16]u32 = [_]u32{0} ** 16,
+        recorded_trace_positions: [16]usize = [_]usize{0} ** 16,
+        recorded_logits_out_present: [16]bool = [_]bool{false} ** 16,
+
+        pub fn slotIndexSupported(_: *const @This(), slot_index: usize) bool {
+            return slot_index < 2;
+        }
+
+        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+            self: *@This(),
+            token: u32,
+            position: usize,
+            slot_index: usize,
+            logits_out_opt: ?[]f32,
+            layer_limit: usize,
+            compute_logits: bool,
+            download_logits: bool,
+            ensure_kv_capacity: bool,
+            trace_seq_len_u32: u32,
+            trace_pos_offset: usize,
+            hidden_override: ?[]const f32,
+            deepstack_layer_features_opt: ?[]const []const f32,
+            deepstack_feature_index_opt: ?usize,
+            use_preloaded_input: bool,
+        ) !void {
+            _ = token;
+            _ = position;
+            _ = slot_index;
+            _ = layer_limit;
+            _ = compute_logits;
+            _ = ensure_kv_capacity;
+            _ = hidden_override;
+            _ = deepstack_layer_features_opt;
+            _ = deepstack_feature_index_opt;
+            _ = use_preloaded_input;
+            const idx = self.compute_calls;
+            self.compute_calls += 1;
+            self.recorded_download_logits[idx] = download_logits;
+            self.recorded_trace_seq_lens[idx] = trace_seq_len_u32;
+            self.recorded_trace_positions[idx] = trace_pos_offset;
+            self.recorded_logits_out_present[idx] = logits_out_opt != null;
+            if (logits_out_opt) |logits_out| {
+                for (logits_out, 0..) |*logit, i| {
+                    logit.* = @floatFromInt(i);
+                }
+            }
+        }
+    };
+
+    var mock = Mock{};
+    const tokens = [_]u32{ 100, 101, 102, 103 };
+    var logits_out: [6]f32 = undefined;
+
+    try engine_forward.computeGpuPrototypePrefillLogitsWithLayerLimit(
+        &mock,
+        tokens[0..],
+        0,
+        logits_out[0..],
+        mock.block_runtime.blocks.len,
+    );
+
+    try std.testing.expectEqual(tokens.len, mock.compute_calls);
+    for (0..tokens.len) |i| {
+        const is_last = i + 1 == tokens.len;
+        try std.testing.expectEqual(is_last, mock.recorded_download_logits[i]);
+        try std.testing.expectEqual(is_last, mock.recorded_logits_out_present[i]);
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), mock.recorded_trace_seq_lens[i]);
+        try std.testing.expectEqual(i, mock.recorded_trace_positions[i]);
+    }
+}
+
+test "computeGpuPrototypeLogitsWithLayerLimit orchestrates pipeline2 stage0 transfer and stage1" {
+    const TraceStep = enum(u8) {
+        mirror,
+        activate,
+        stage0_compute,
+        transfer,
+        stage1_compute,
+    };
+    const SharedTrace = struct {
+        steps: [16]TraceStep = undefined,
+        step_count: usize = 0,
+        mirror_calls: usize = 0,
+        mirror_slot: usize = 0,
+        activate_calls: usize = 0,
+        activated_slot: usize = 0,
+        transfer_calls: usize = 0,
+        transfer_bytes: usize = 0,
+        stage0_compute_calls: usize = 0,
+        stage1_compute_calls: usize = 0,
+        stage0_layer_limit: usize = 0,
+        stage1_layer_limit: usize = 0,
+        stage0_compute_logits: bool = true,
+        stage1_compute_logits: bool = false,
+        stage0_download_logits: bool = true,
+        stage1_download_logits: bool = false,
+        stage0_use_preloaded_input: bool = true,
+        stage1_use_preloaded_input: bool = false,
+        stage0_deepstack_len: usize = 0,
+        stage1_deepstack_len: usize = 0,
+        stage1_logits_out_present: bool = false,
+        stage0_logits_out_present: bool = false,
+
+        fn push(self: *@This(), step: TraceStep) void {
+            self.steps[self.step_count] = step;
+            self.step_count += 1;
+        }
+    };
+
+    const Mock = struct {
+        const BlockRuntimeMock = struct {
+            blocks: []const u8 = &.{},
+        };
+
+        trace: *SharedTrace,
+        is_stage1: bool = false,
+        split_layer: usize = 2,
+        d_model: usize = 8,
+        state_descriptor_count: usize = 0,
+        topology_mode: enum { single, pipeline2 } = .single,
+        block_runtime: BlockRuntimeMock = .{},
+        pipeline_backend1: ?*@This() = null,
+
+        pub fn pipelineStage1(self: *@This()) ?*@This() {
+            return self.pipeline_backend1;
+        }
+
+        pub fn mirrorSlotStateBlocksFrom(self: *@This(), source: *const @This(), slot_index: usize) !void {
+            _ = source;
+            self.trace.mirror_calls += 1;
+            self.trace.mirror_slot = slot_index;
+            self.trace.push(.mirror);
+        }
+
+        pub fn activateKvSlot(self: *@This(), slot_index: usize) void {
+            self.trace.activate_calls += 1;
+            self.trace.activated_slot = slot_index;
+            self.trace.push(.activate);
+        }
+
+        pub fn transferPipelineActivation(self: *@This(), stage1: *@This(), byte_count: usize) !void {
+            _ = stage1;
+            self.trace.transfer_calls += 1;
+            self.trace.transfer_bytes = byte_count;
+            self.trace.push(.transfer);
+        }
+
+        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+            self: *@This(),
+            token: u32,
+            position: usize,
+            slot_index: usize,
+            logits_out_opt: ?[]f32,
+            layer_limit: usize,
+            compute_logits: bool,
+            download_logits: bool,
+            ensure_kv_capacity: bool,
+            trace_seq_len_u32: u32,
+            trace_pos_offset: usize,
+            hidden_override: ?[]const f32,
+            deepstack_layer_features_opt: ?[]const []const f32,
+            deepstack_feature_index_opt: ?usize,
+            use_preloaded_input: bool,
+        ) !void {
+            _ = token;
+            _ = position;
+            _ = slot_index;
+            _ = ensure_kv_capacity;
+            _ = trace_seq_len_u32;
+            _ = trace_pos_offset;
+            _ = hidden_override;
+            _ = deepstack_feature_index_opt;
+            if (self.is_stage1) {
+                self.trace.stage1_compute_calls += 1;
+                self.trace.stage1_layer_limit = layer_limit;
+                self.trace.stage1_compute_logits = compute_logits;
+                self.trace.stage1_download_logits = download_logits;
+                self.trace.stage1_use_preloaded_input = use_preloaded_input;
+                self.trace.stage1_deepstack_len = if (deepstack_layer_features_opt) |features| features.len else 0;
+                self.trace.stage1_logits_out_present = logits_out_opt != null;
+                self.trace.push(.stage1_compute);
+            } else {
+                self.trace.stage0_compute_calls += 1;
+                self.trace.stage0_layer_limit = layer_limit;
+                self.trace.stage0_compute_logits = compute_logits;
+                self.trace.stage0_download_logits = download_logits;
+                self.trace.stage0_use_preloaded_input = use_preloaded_input;
+                self.trace.stage0_deepstack_len = if (deepstack_layer_features_opt) |features| features.len else 0;
+                self.trace.stage0_logits_out_present = logits_out_opt != null;
+                self.trace.push(.stage0_compute);
+            }
+        }
+    };
+
+    var trace_state = SharedTrace{};
+    var stage1 = Mock{
+        .trace = &trace_state,
+        .is_stage1 = true,
+        .split_layer = 0,
+        .d_model = 8,
+        .state_descriptor_count = 1,
+        .topology_mode = .single,
+        .block_runtime = .{ .blocks = &[_]u8{ 0, 0 } },
+        .pipeline_backend1 = null,
+    };
+    var stage0 = Mock{
+        .trace = &trace_state,
+        .is_stage1 = false,
+        .split_layer = 2,
+        .d_model = 8,
+        .state_descriptor_count = 0,
+        .topology_mode = .pipeline2,
+        .block_runtime = .{ .blocks = &[_]u8{ 0, 0, 0, 0 } },
+        .pipeline_backend1 = &stage1,
+    };
+
+    var logits: [7]f32 = undefined;
+    const deepstack_features = [_][]const f32{
+        &[_]f32{ 0.1, 0.2 },
+        &[_]f32{ 0.3, 0.4 },
+        &[_]f32{ 0.5, 0.6 },
+        &[_]f32{ 0.7, 0.8 },
+    };
+    try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+        &stage0,
+        123,
+        9,
+        1,
+        logits[0..],
+        stage0.block_runtime.blocks.len,
+        true,
+        true,
+        true,
+        10,
+        9,
+        null,
+        deepstack_features[0..],
+        null,
+        false,
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), trace_state.step_count);
+    try std.testing.expectEqual(TraceStep.mirror, trace_state.steps[0]);
+    try std.testing.expectEqual(TraceStep.activate, trace_state.steps[1]);
+    try std.testing.expectEqual(TraceStep.stage0_compute, trace_state.steps[2]);
+    try std.testing.expectEqual(TraceStep.transfer, trace_state.steps[3]);
+    try std.testing.expectEqual(TraceStep.stage1_compute, trace_state.steps[4]);
+
+    try std.testing.expectEqual(@as(usize, 1), trace_state.mirror_calls);
+    try std.testing.expectEqual(@as(usize, 1), trace_state.mirror_slot);
+    try std.testing.expectEqual(@as(usize, 1), trace_state.activate_calls);
+    try std.testing.expectEqual(@as(usize, 1), trace_state.activated_slot);
+    try std.testing.expectEqual(@as(usize, 1), trace_state.transfer_calls);
+    try std.testing.expectEqual(stage0.d_model * @sizeOf(f32), trace_state.transfer_bytes);
+
+    try std.testing.expectEqual(@as(usize, 1), trace_state.stage0_compute_calls);
+    try std.testing.expectEqual(@as(usize, 1), trace_state.stage1_compute_calls);
+    try std.testing.expectEqual(stage0.block_runtime.blocks.len, trace_state.stage0_layer_limit);
+    try std.testing.expectEqual(stage1.block_runtime.blocks.len, trace_state.stage1_layer_limit);
+
+    try std.testing.expect(!trace_state.stage0_compute_logits);
+    try std.testing.expect(!trace_state.stage0_download_logits);
+    try std.testing.expect(!trace_state.stage0_use_preloaded_input);
+    try std.testing.expectEqual(deepstack_features.len, trace_state.stage0_deepstack_len);
+    try std.testing.expect(!trace_state.stage0_logits_out_present);
+
+    try std.testing.expect(trace_state.stage1_compute_logits);
+    try std.testing.expect(trace_state.stage1_download_logits);
+    try std.testing.expect(trace_state.stage1_use_preloaded_input);
+    try std.testing.expectEqual(deepstack_features.len - stage0.split_layer, trace_state.stage1_deepstack_len);
+    try std.testing.expect(trace_state.stage1_logits_out_present);
+}
+
+test "computeGpuPrototypeLogitsWithLayerLimit pipeline2 returns error when stage1 is missing" {
+    const Mock = struct {
+        const BlockRuntimeMock = struct {
+            blocks: [4]u8 = [_]u8{0} ** 4,
+        };
+        topology_mode: enum { single, pipeline2 } = .pipeline2,
+        split_layer: usize = 2,
+        d_model: usize = 8,
+        state_descriptor_count: usize = 0,
+        block_runtime: BlockRuntimeMock = .{},
+
+        pub fn pipelineStage1(_: *@This()) ?*@This() {
+            return null;
+        }
+
+        pub fn mirrorSlotStateBlocksFrom(_: *@This(), _: *const @This(), _: usize) !void {
+            return;
+        }
+
+        pub fn activateKvSlot(_: *@This(), _: usize) void {}
+
+        pub fn transferPipelineActivation(_: *@This(), _: *@This(), _: usize) !void {
+            return;
+        }
+
+        pub fn computeGpuPrototypeLogitsWithLayerLimitTestHook(
+            _: *@This(),
+            _: u32,
+            _: usize,
+            _: usize,
+            _: ?[]f32,
+            _: usize,
+            _: bool,
+            _: bool,
+            _: bool,
+            _: u32,
+            _: usize,
+            _: ?[]const f32,
+            _: ?[]const []const f32,
+            _: ?usize,
+            _: bool,
+        ) !void {
+            return;
+        }
+    };
+
+    var mock = Mock{};
+    var logits: [5]f32 = undefined;
+    try std.testing.expectError(
+        error.InvalidTopologyConfig,
+        engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
+            &mock,
+            1,
+            0,
+            0,
+            logits[0..],
+            mock.block_runtime.blocks.len,
+            true,
+            true,
+            true,
+            1,
+            0,
+            null,
+            null,
+            null,
+            false,
+        ),
+    );
 }
