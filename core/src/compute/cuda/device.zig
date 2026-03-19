@@ -59,6 +59,10 @@ const CuLaunchKernelFn = *const fn (
     ?*anyopaque,
 ) callconv(.c) c_int;
 
+const CuDeviceCanAccessPeerFn = *const fn (*c_int, c_int, c_int) callconv(.c) c_int;
+const CuCtxEnablePeerAccessFn = *const fn (?*anyopaque, u32) callconv(.c) c_int;
+const CuMemcpyPeerAsyncFn = *const fn (u64, ?*anyopaque, u64, ?*anyopaque, usize, ?*anyopaque) callconv(.c) c_int;
+
 pub const ModuleHandle = *anyopaque;
 pub const FunctionHandle = *anyopaque;
 pub const StreamHandle = *anyopaque;
@@ -105,6 +109,9 @@ const DriverApi = struct {
     cu_graph_exec_update: ?CuGraphExecUpdateFn,
     cu_graph_launch: ?CuGraphLaunchFn,
     cu_launch_kernel: ?CuLaunchKernelFn,
+    cu_device_can_access_peer: ?CuDeviceCanAccessPeerFn,
+    cu_ctx_enable_peer_access: ?CuCtxEnablePeerAccessFn,
+    cu_memcpy_peer_async: ?CuMemcpyPeerAsyncFn,
 };
 
 const cu_device_attribute_compute_capability_major: c_int = 75;
@@ -199,6 +206,7 @@ pub const Device = struct {
     api: DriverApi,
     context: ?*anyopaque,
     device_index: c_int,
+    ordinal_index: usize,
     name_buffer: [128]u8,
     launch_stream: ?StreamHandle,
     launch_stats_enabled: bool,
@@ -209,7 +217,8 @@ pub const Device = struct {
         return initAt(0);
     }
 
-    /// Initialize a CUDA device by ordinal (0-based).
+    /// Initialize a CUDA device+context for a specific GPU ordinal.
+    /// Validates that the ordinal is within the range of available devices.
     pub fn initAt(device_ordinal: usize) !Device {
         if (!isRuntimeSupported()) return error.CudaNotEnabled;
 
@@ -222,11 +231,12 @@ pub const Device = struct {
         var device_count: c_int = 0;
         if (api.cu_device_get_count(&device_count) != cuda_success) return error.CudaInitFailed;
         if (device_count <= 0) return error.CudaNoDevices;
-        if (device_ordinal >= @as(usize, @intCast(device_count))) return error.InvalidArgument;
 
-        const requested_ordinal: c_int = @intCast(device_ordinal);
+        const ordinal_c: c_int = std.math.cast(c_int, device_ordinal) orelse return error.CudaInvalidDevice;
+        if (ordinal_c >= device_count) return error.CudaInvalidDevice;
+
         var device_index: c_int = 0;
-        if (api.cu_device_get(&device_index, requested_ordinal) != cuda_success) return error.CudaInitFailed;
+        if (api.cu_device_get(&device_index, ordinal_c) != cuda_success) return error.CudaInitFailed;
 
         var context: ?*anyopaque = null;
         if (api.cu_ctx_create(&context, 0, device_index) != cuda_success or context == null) {
@@ -237,7 +247,8 @@ pub const Device = struct {
         var name_buffer = [_]u8{0} ** 128;
         const name_status = api.cu_device_get_name(name_buffer[0..].ptr, @intCast(name_buffer.len), device_index);
         if (name_status != cuda_success or name_buffer[0] == 0) {
-            const fallback_name = "cuda:0";
+            var fallback_buf: [16]u8 = undefined;
+            const fallback_name = std.fmt.bufPrint(&fallback_buf, "cuda:{d}", .{device_ordinal}) catch "cuda:?";
             @memcpy(name_buffer[0..fallback_name.len], fallback_name);
             name_buffer[fallback_name.len] = 0;
         }
@@ -247,12 +258,36 @@ pub const Device = struct {
             .api = api,
             .context = context,
             .device_index = device_index,
+            .ordinal_index = device_ordinal,
             .name_buffer = name_buffer,
             .launch_stream = null,
             .launch_stats_enabled = launchStatsEnabledForCurrentLogLevel(),
             .launch_phase = .none,
             .launch_family = .other,
         };
+    }
+
+    pub fn ordinal(self: *const Device) usize {
+        return self.ordinal_index;
+    }
+
+    /// Query the number of available CUDA devices.
+    /// Requires a working CUDA driver; opens and closes its own library handle.
+    pub fn deviceCount() !usize {
+        if (!isRuntimeSupported()) return error.CudaNotEnabled;
+
+        var lib = try openDriverLibrary();
+        defer lib.close();
+
+        const cu_init_fn = try lookupRequired(CuInitFn, &lib, "cuInit");
+        const cu_device_get_count_fn = try lookupRequired(CuDeviceGetCountFn, &lib, "cuDeviceGetCount");
+
+        if (cu_init_fn(0) != cuda_success) return error.CudaInitFailed;
+
+        var count: c_int = 0;
+        if (cu_device_get_count_fn(&count) != cuda_success) return error.CudaInitFailed;
+        if (count < 0) return error.CudaInitFailed;
+        return @intCast(count);
     }
 
     pub fn deinit(self: *Device) void {
@@ -369,10 +404,6 @@ pub const Device = struct {
     pub fn name(self: *const Device) []const u8 {
         const end = std.mem.indexOfScalar(u8, self.name_buffer[0..], 0) orelse self.name_buffer.len;
         return self.name_buffer[0..end];
-    }
-
-    pub fn ordinal(self: *const Device) usize {
-        return @intCast(self.device_index);
     }
 
     pub fn setLaunchStream(self: *Device, stream: ?StreamHandle) void {
@@ -680,6 +711,42 @@ pub const Device = struct {
             }
         }
     }
+
+    /// Probe whether this device can directly access memory on a peer device via P2P.
+    pub fn canAccessPeer(self: *Device, peer: *Device) bool {
+        const cu_fn = self.api.cu_device_can_access_peer orelse return false;
+        var can_access: c_int = 0;
+        if (cu_fn(&can_access, self.device_index, peer.device_index) != cuda_success) return false;
+        return can_access != 0;
+    }
+
+    /// Enable P2P memory access from this device's context to a peer device's context.
+    /// Both devices must support P2P (check with canAccessPeer first).
+    pub fn enablePeerAccess(self: *Device, peer: *Device) !void {
+        const cu_fn = self.api.cu_ctx_enable_peer_access orelse return error.CudaPeerAccessUnavailable;
+        try self.makeCurrent();
+        const rc = cu_fn(peer.context, 0);
+        // CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED (704) is harmless.
+        if (rc != cuda_success and rc != 704) return error.CudaPeerAccessFailed;
+    }
+
+    /// Async copy between two device contexts. The copy is enqueued on the given stream
+    /// (which must belong to the source context).
+    pub fn memcpyPeerAsync(
+        self: *Device,
+        dst_ptr: u64,
+        dst_context: ?*anyopaque,
+        src_ptr: u64,
+        src_context: ?*anyopaque,
+        byte_count: usize,
+        stream: ?StreamHandle,
+    ) !void {
+        const cu_fn = self.api.cu_memcpy_peer_async orelse return error.CudaPeerAccessUnavailable;
+        try self.makeCurrent();
+        if (cu_fn(dst_ptr, dst_context, src_ptr, src_context, byte_count, if (stream) |s| s else null) != cuda_success) {
+            return error.CudaCopyFailed;
+        }
+    }
 };
 
 fn launchStatsEnabledForCurrentLogLevel() bool {
@@ -802,6 +869,9 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_graph_exec_update = lookupOptional(CuGraphExecUpdateFn, lib, "cuGraphExecUpdate"),
         .cu_graph_launch = lookupOptional(CuGraphLaunchFn, lib, "cuGraphLaunch"),
         .cu_launch_kernel = lookupOptional(CuLaunchKernelFn, lib, "cuLaunchKernel"),
+        .cu_device_can_access_peer = lookupOptional(CuDeviceCanAccessPeerFn, lib, "cuDeviceCanAccessPeer"),
+        .cu_ctx_enable_peer_access = lookupOptional(CuCtxEnablePeerAccessFn, lib, "cuCtxEnablePeerAccess"),
+        .cu_memcpy_peer_async = lookupOptionalAny(CuMemcpyPeerAsyncFn, lib, &.{ "cuMemcpyPeerAsync_v2", "cuMemcpyPeerAsync" }),
     };
 }
 
@@ -824,15 +894,6 @@ test "Device.init Device.deinit Device.name work when probeRuntime is available"
     defer device.deinit();
 
     try std.testing.expect(device.name().len > 0);
-}
-
-test "Device.initAt uses requested ordinal when runtime is available" {
-    if (probeRuntime() != .available) return error.SkipZigTest;
-
-    var device = try Device.initAt(0);
-    defer device.deinit();
-
-    try std.testing.expectEqual(@as(usize, 0), device.ordinal());
 }
 
 test "Device.allocBuffer Buffer.upload Buffer.download Buffer.deinit roundtrip" {
@@ -918,4 +979,55 @@ test "Device.computeCapability returns non-zero major when available" {
         return;
     };
     try std.testing.expect(capability.major > 0);
+}
+
+test "Device.initAt returns CudaInvalidDevice for out-of-range ordinal" {
+    if (probeRuntime() != .available) return error.SkipZigTest;
+
+    const count = try Device.deviceCount();
+    const result = Device.initAt(count);
+    try std.testing.expectError(error.CudaInvalidDevice, result);
+}
+
+test "Device.ordinal matches initAt argument" {
+    if (probeRuntime() != .available) return error.SkipZigTest;
+
+    var device = try Device.initAt(0);
+    defer device.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), device.ordinal());
+}
+
+test "Device.deviceCount returns at least one when runtime is available" {
+    if (probeRuntime() != .available) return error.SkipZigTest;
+
+    const count = try Device.deviceCount();
+    try std.testing.expect(count >= 1);
+}
+
+test "Device.canAccessPeer returns without error for same device" {
+    if (probeRuntime() != .available) return error.SkipZigTest;
+
+    var device = try Device.initAt(0);
+    defer device.deinit();
+
+    // P2P to self may or may not be supported; just verify no crash.
+    _ = device.canAccessPeer(&device);
+}
+
+test "Device.initAt creates independent contexts for different ordinals" {
+    if (probeRuntime() != .available) return error.SkipZigTest;
+
+    const count = try Device.deviceCount();
+    if (count < 2) return error.SkipZigTest;
+
+    var dev0 = try Device.initAt(0);
+    defer dev0.deinit();
+
+    var dev1 = try Device.initAt(1);
+    defer dev1.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), dev0.ordinal());
+    try std.testing.expectEqual(@as(usize, 1), dev1.ordinal());
+    try std.testing.expect(dev0.context != dev1.context);
 }

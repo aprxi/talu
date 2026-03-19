@@ -32,6 +32,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 pub const contract = @import("contract.zig");
+pub const pipeline = @import("pipeline.zig");
 
 const models = @import("../../models/root.zig");
 const log = @import("../../log.zig");
@@ -844,13 +845,32 @@ fn initCuda(
         return error.CudaUnavailable;
     }
     const topology = resolveCudaTopology(allocator, topology_override);
-    if (topology.mode != .single) {
-        log.err("inference", "CUDA topology mode is configured but not yet implemented", .{
-            .mode = @tagName(topology.mode),
-            .stage0 = topology.stage_device_ordinals[0],
-            .stage1 = topology.stage_device_ordinals[1],
-        }, @src());
-        return error.NotImplemented;
+    if (topology.mode == .pipeline2) {
+        if (topology.stage_device_ordinals[0] == topology.stage_device_ordinals[1]) {
+            log.err("inference", "Pipeline2 requires two distinct CUDA device ordinals", .{
+                .ordinal0 = topology.stage_device_ordinals[0],
+                .ordinal1 = topology.stage_device_ordinals[1],
+            }, @src());
+            return error.InvalidTopologyConfig;
+        }
+        if (has_cuda) {
+            const device_count = compute.cuda.Device.deviceCount() catch |err| {
+                log.err("inference", "Failed to query CUDA device count for pipeline2 validation", .{
+                    .err = @errorName(err),
+                }, @src());
+                return err;
+            };
+            if (topology.stage_device_ordinals[0] >= device_count or
+                topology.stage_device_ordinals[1] >= device_count)
+            {
+                log.err("inference", "Pipeline2 device ordinal out of range", .{
+                    .ordinal0 = topology.stage_device_ordinals[0],
+                    .ordinal1 = topology.stage_device_ordinals[1],
+                    .device_count = device_count,
+                }, @src());
+                return error.CudaInvalidDevice;
+            }
+        }
     }
     const cuda_max_batch_size = resolveCudaMaxBatchSize();
     log.info("inference", "CUDA backend init config", .{
@@ -861,6 +881,8 @@ fn initCuda(
     const cuda_backend_state = if (has_cuda)
         try cuda.BackendType.init(allocator, loaded, cuda_max_batch_size, .{
             .device_ordinal = topology.primaryDeviceOrdinal(),
+            .topology_mode = topology.mode,
+            .stage_device_ordinals = topology.stage_device_ordinals,
         })
     else
         unreachable;
