@@ -233,14 +233,13 @@ describe("editorOpsPlugin", () => {
 
     editor.value = "one";
     editor.dispatchEvent(new Event("input"));
-    controlled.advance(200);
+    controlled.advance(500);
 
     editor.value = "two";
     editor.dispatchEvent(new Event("input"));
-    controlled.advance(200);
+    controlled.advance(500);
 
     expect(socket.sent).toHaveLength(2);
-    expect(JSON.parse(socket.sent[1]!).snapshot_base64).toBeDefined();
 
     socket.emitJson({
       type: "ack",

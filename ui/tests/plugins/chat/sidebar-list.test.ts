@@ -9,7 +9,7 @@ import { chatState } from "../../../src/plugins/chat/state.ts";
 import { initChatDeps } from "../../../src/plugins/chat/deps.ts";
 import { initChatDom, getChatDom } from "../../../src/plugins/chat/dom.ts";
 import { createDomRoot, CHAT_DOM_IDS } from "../../helpers/dom.ts";
-import { mockNotifications } from "../../helpers/mocks.ts";
+import { mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 
 /**
  * Tests for chat sidebar list — pagination (append semantics), rendering
@@ -455,7 +455,7 @@ describe("setupInfiniteScroll", () => {
 
     observerCallback!([{ isIntersecting: true }]);
     // loadSessions is async — give it a tick.
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(apiCalls.length).toBe(1);
     expect(apiCalls[0]!.method).toBe("listConversations");
@@ -464,7 +464,7 @@ describe("setupInfiniteScroll", () => {
   test("ignores non-intersecting entries", async () => {
     setupInfiniteScroll();
     observerCallback!([{ isIntersecting: false }]);
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
     expect(apiCalls.length).toBe(0);
   });
 });

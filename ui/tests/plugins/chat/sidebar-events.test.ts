@@ -4,7 +4,7 @@ import { chatState } from "../../../src/plugins/chat/state.ts";
 import { initChatDom, getChatDom } from "../../../src/plugins/chat/dom.ts";
 import { initChatDeps } from "../../../src/plugins/chat/deps.ts";
 import { createDomRoot, CHAT_DOM_IDS, CHAT_DOM_TAGS } from "../../helpers/dom.ts";
-import { mockTimers, mockNotifications } from "../../helpers/mocks.ts";
+import { mockTimers, mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 import type { Conversation } from "../../../src/types.ts";
 
 /**
@@ -73,7 +73,7 @@ beforeEach(() => {
     observe: { onResize: () => ({ dispose() {} }) } as any,
     format: { dateTime: () => "" } as any,
     upload: { upload: async () => ({}) } as any,
-    layout: { setTitle: () => {} } as any,
+    layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
     menus: { registerItem: () => ({ dispose() {} }), renderSlot: () => ({ dispose() {} }) } as any,
   });
 
@@ -90,7 +90,7 @@ describe("setupSidebarEvents — pin", () => {
     dom.sidebarList.appendChild(pinBtn);
 
     pinBtn.click();
-    await new Promise((r) => setTimeout(r, 0));
+    await flushAsync();
 
     expect(apiCalls.some((c) => c.method === "patchConversation")).toBe(true);
   });
@@ -107,7 +107,7 @@ describe("setupSidebarEvents — pin", () => {
     dom.sidebarList.appendChild(item);
 
     pinBtn.click();
-    await new Promise((r) => setTimeout(r, 0));
+    await flushAsync();
 
     // Should have called patchConversation (pin) but NOT getConversation (selection)
     expect(apiCalls.some((c) => c.method === "patchConversation")).toBe(true);
@@ -120,13 +120,13 @@ describe("setupSidebarEvents — pin", () => {
 describe("setupSidebarEvents — chat selection", () => {
   test("clicking sidebar-item calls selectChat", async () => {
     const dom = getChatDom();
-    const item = document.createElement("div");
+    const item = document.createElement("a");
     item.className = "sidebar-item";
     item.dataset["id"] = "chat-2";
     dom.sidebarList.appendChild(item);
 
     item.click();
-    await new Promise((r) => setTimeout(r, 0));
+    await flushAsync();
 
     expect(chatState.activeSessionId).toBe("chat-2");
     expect(apiCalls.some((c) => c.method === "getConversation")).toBe(true);

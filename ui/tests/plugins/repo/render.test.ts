@@ -13,7 +13,7 @@ import {
 import { repoState } from "../../../src/plugins/repo/state.ts";
 import { initRepoDom, getRepoDom } from "../../../src/plugins/repo/dom.ts";
 import { initRepoDeps } from "../../../src/plugins/repo/deps.ts";
-import { createDomRoot, REPO_DOM_IDS, REPO_DOM_TAGS } from "../../helpers/dom.ts";
+import { createDomRoot, REPO_DOM_EXTRAS, REPO_DOM_IDS, REPO_DOM_TAGS } from "../../helpers/dom.ts";
 import { mockTimers } from "../../helpers/mocks.ts";
 
 /**
@@ -39,13 +39,17 @@ beforeEach(() => {
   repoState.discoverSize = "8";
   repoState.discoverTask = "text-generation";
   repoState.discoverLibrary = "safetensors";
+  repoState.subPage = null;
+  repoState.manageLocalTab = "local";
 
   // DOM.
-  initRepoDom(createDomRoot(REPO_DOM_IDS, undefined, REPO_DOM_TAGS));
+  initRepoDom(createDomRoot(REPO_DOM_IDS, REPO_DOM_EXTRAS, REPO_DOM_TAGS));
 
   // Deps.
   initRepoDeps({
-    api: {} as any,
+    api: {
+      kvPut: async () => ({ ok: true }),
+    } as any,
     notifications: { info: () => {}, error: () => {}, warn: () => {}, success: () => {} } as any,
     dialogs: {} as any,
     events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
@@ -561,7 +565,7 @@ describe("renderDiscoverResults", () => {
 
     const dom = getRepoDom();
     const item = dom.discoverResults.querySelector(".repo-discover-item")!;
-    expect(item.querySelector(".repo-downloading-label")).toBeTruthy();
+    expect(item.querySelector(".repo-downloading-label")?.textContent).toBe("Downloading…");
     expect(item.querySelector("[data-action='delete']")).toBeNull();
   });
 });
@@ -793,7 +797,8 @@ describe("updateRepoToolbar", () => {
 
 describe("syncRepoTabs", () => {
   test("discover tab shows discover view and toolbar", () => {
-    repoState.tab = "discover";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "discover";
     syncRepoTabs();
     const dom = getRepoDom();
     expect(dom.discoverView.classList.contains("hidden")).toBe(false);
@@ -803,7 +808,8 @@ describe("syncRepoTabs", () => {
   });
 
   test("local tab shows local view and toolbar", () => {
-    repoState.tab = "local";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "local";
     syncRepoTabs();
     const dom = getRepoDom();
     expect(dom.discoverView.classList.contains("hidden")).toBe(true);

@@ -1,6 +1,57 @@
 import { describe, test, expect, spyOn } from "bun:test";
 import { ManagedObserversImpl } from "../../../src/kernel/system/observers.ts";
 
+interface FakeMutationObserverInstance {
+  callback: MutationCallback;
+  target: Node | null;
+  options: MutationObserverInit | undefined;
+  disconnected: boolean;
+}
+
+function installFakeMutationObserver(): {
+  instances: FakeMutationObserverInstance[];
+  restore(): void;
+} {
+  const instances: FakeMutationObserverInstance[] = [];
+  const OriginalMutationObserver = globalThis.MutationObserver;
+
+  class FakeMutationObserver {
+    private instance: FakeMutationObserverInstance;
+
+    constructor(callback: MutationCallback) {
+      this.instance = {
+        callback,
+        target: null,
+        options: undefined,
+        disconnected: false,
+      };
+      instances.push(this.instance);
+    }
+
+    observe(target: Node, options?: MutationObserverInit): void {
+      this.instance.target = target;
+      this.instance.options = options;
+    }
+
+    disconnect(): void {
+      this.instance.disconnected = true;
+    }
+
+    takeRecords(): MutationRecord[] {
+      return [];
+    }
+  }
+
+  (globalThis as { MutationObserver: typeof MutationObserver }).MutationObserver = FakeMutationObserver as any;
+
+  return {
+    instances,
+    restore() {
+      (globalThis as { MutationObserver: typeof MutationObserver }).MutationObserver = OriginalMutationObserver;
+    },
+  };
+}
+
 describe("ManagedObserversImpl", () => {
   test("resize returns disposable and tracks observer", () => {
     const observers = new ManagedObserversImpl("test.plugin");
@@ -34,21 +85,20 @@ describe("ManagedObserversImpl", () => {
     observers.dispose();
   });
 
-  test("callback error is caught and logged", async () => {
+  test("callback error is caught and logged", () => {
+    const fake = installFakeMutationObserver();
     const spy = spyOn(console, "error").mockImplementation(() => {});
     const observers = new ManagedObserversImpl("test.plugin");
     const el = document.createElement("div");
     document.body.appendChild(el);
     // MutationObserver with a throwing callback.
     observers.mutation(el, () => { throw new Error("observer boom"); }, { childList: true });
-    // Trigger mutation.
-    el.appendChild(document.createElement("span"));
-    // MutationObserver fires async — wait for microtask.
-    await new Promise((r) => setTimeout(r, 50));
+    fake.instances[0]!.callback([] as MutationRecord[], {} as MutationObserver);
     expect(spy).toHaveBeenCalled();
     expect(spy.mock.calls.some((c) => String(c[0]).includes("test.plugin"))).toBe(true);
     spy.mockRestore();
     observers.dispose();
+    fake.restore();
   });
 
   test("dispose clears all active observers", () => {

@@ -52,9 +52,10 @@ describe("setupAccessibility", () => {
     expect(btn.getAttribute("aria-label")).toBe("my custom view");
   });
 
-  test("no-op when elements missing", () => {
+  test("no-op when elements missing leaves the document untouched", () => {
     document.body.innerHTML = "";
-    expect(() => setupAccessibility()).not.toThrow();
+    setupAccessibility();
+    expect(document.body.childElementCount).toBe(0);
   });
 });
 
@@ -104,8 +105,9 @@ describe("updateActiveTab", () => {
     expect(items[1]!.getAttribute("aria-selected")).toBe("true");
   });
 
-  test("no-op when activity bar missing", () => {
+  test("no-op when activity bar missing leaves tabs unchanged", () => {
     document.body.innerHTML = "";
-    expect(() => updateActiveTab("chat")).not.toThrow();
+    updateActiveTab("chat");
+    expect(document.body.childElementCount).toBe(0);
   });
 });

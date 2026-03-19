@@ -28,8 +28,7 @@ describe("importWithWatchdog", () => {
     try {
       // Import a non-existent module with a very short timeout.
       await importWithWatchdog("data:text/javascript,await new Promise(()=>{})", 50);
-      // Should not reach here.
-      expect(true).toBe(false);
+      throw new Error("Expected importWithWatchdog timeout to reject");
     } catch (err) {
       expect(err instanceof ImportTimeoutError).toBe(true);
     }

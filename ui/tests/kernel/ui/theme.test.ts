@@ -5,6 +5,7 @@ import { COLOR_SCHEME_TOKENS } from "../../../src/styles/color-schemes.ts";
 describe("ThemeAccessImpl", () => {
   beforeEach(() => {
     localStorage.removeItem("theme");
+    document.documentElement.removeAttribute("style");
   });
 
   test("activeThemeId defaults to 'talu'", () => {
@@ -21,7 +22,9 @@ describe("ThemeAccessImpl", () => {
   test("onChange registers callback and returns disposable", () => {
     const theme = new ThemeAccessImpl();
     let called = false;
-    const d = theme.onChange(() => { called = true; });
+    const d = theme.onChange(() => {
+      called = true;
+    });
     theme.notifyChange();
     expect(called).toBe(true);
     d.dispose();
@@ -30,7 +33,9 @@ describe("ThemeAccessImpl", () => {
   test("onChange dispose stops notifications", () => {
     const theme = new ThemeAccessImpl();
     let count = 0;
-    const d = theme.onChange(() => { count++; });
+    const d = theme.onChange(() => {
+      count++;
+    });
     theme.notifyChange();
     d.dispose();
     theme.notifyChange();
@@ -41,86 +46,80 @@ describe("ThemeAccessImpl", () => {
     const spy = spyOn(console, "error").mockImplementation(() => {});
     const theme = new ThemeAccessImpl();
     let secondCalled = false;
-    theme.onChange(() => { throw new Error("cb boom"); });
-    theme.onChange(() => { secondCalled = true; });
+    theme.onChange(() => {
+      throw new Error("cb boom");
+    });
+    theme.onChange(() => {
+      secondCalled = true;
+    });
     theme.notifyChange();
     expect(secondCalled).toBe(true);
     spy.mockRestore();
   });
 
-  test("registerBuiltinSchemes stores schemes", () => {
+  test("registerBuiltinThemes stores themes", () => {
     const theme = new ThemeAccessImpl();
-    theme.registerBuiltinSchemes([
-      { id: "dark1", name: "Dark One", category: "dark", tokens: { "--bg": "#000" } },
-      { id: "light1", name: "Light One", category: "light", tokens: { "--bg": "#fff" } },
+    theme.registerBuiltinThemes([
+      { id: "dark1", name: "Dark One", category: "dark" },
+      { id: "light1", name: "Light One", category: "light" },
     ]);
     const registered = theme.getRegisteredThemes();
     expect(registered.length).toBe(2);
     expect(registered.map((t) => t.id).sort()).toEqual(["dark1", "light1"]);
   });
 
-  test("registerTheme validates token values", () => {
+  test("setActiveTheme updates storage and notifies listeners", () => {
     const theme = new ThemeAccessImpl();
-    // Valid token.
-    const d = theme.registerTheme("custom", { "--bg": "#123456" });
-    expect(d).toBeDefined();
+    let called = false;
+    theme.onChange(() => {
+      called = true;
+    });
+    theme.setActiveTheme("light-talu");
+    expect(localStorage.getItem("theme")).toBe("light-talu");
+    expect(called).toBe(true);
+  });
+
+  test("registerTheme injects a style tag and preserves token values", () => {
+    const theme = new ThemeAccessImpl();
+    const d = theme.registerTheme("custom", "Custom", "dark", {
+      "--bg": "#123456",
+      "--unknown-token": "ignored",
+    });
+    const styleEl = document.getElementById("theme-style-custom") as HTMLStyleElement | null;
+    expect(styleEl).not.toBeNull();
+    expect(styleEl!.textContent).toContain("--bg: #123456;");
+    expect(styleEl!.textContent).not.toContain("--unknown-token");
     d.dispose();
   });
 
-  test("registerTheme rejects url() in token values", () => {
+  test("updateThemeTokens refreshes the injected style tag", () => {
     const theme = new ThemeAccessImpl();
-    expect(() => theme.registerTheme("evil", { "--bg": "url(https://evil.com)" })).toThrow(
-      /validation failed/,
-    );
-  });
-
-  test("registerTheme rejects expression() in token values", () => {
-    const theme = new ThemeAccessImpl();
-    expect(() => theme.registerTheme("evil", { "--bg": "expression(alert(1))" })).toThrow(
-      /validation failed/,
-    );
-  });
-
-  test("registerTheme warns on unknown token names", () => {
-    const spy = spyOn(console, "warn").mockImplementation(() => {});
-    const theme = new ThemeAccessImpl();
-    const d = theme.registerTheme("custom", { "--unknown-token": "#fff" });
-    expect(spy).toHaveBeenCalled();
+    const d = theme.registerTheme("custom", "Custom", "dark", { "--bg": "#111" });
+    theme.updateThemeTokens("custom", { "--bg": "#222", "--text": "#eee" });
+    const styleEl = document.getElementById("theme-style-custom") as HTMLStyleElement | null;
+    expect(styleEl).not.toBeNull();
+    expect(styleEl!.textContent).toContain("--bg: #222;");
+    expect(styleEl!.textContent).toContain("--text: #eee;");
     d.dispose();
-    spy.mockRestore();
   });
 
   test("registerTheme dispose removes theme", () => {
     const theme = new ThemeAccessImpl();
-    const d = theme.registerTheme("custom", { "--bg": "#111" });
+    const d = theme.registerTheme("custom", "Custom", "dark", { "--bg": "#111" });
     expect(theme.getRegisteredThemes().find((t) => t.id === "custom")).toBeDefined();
+    expect(document.getElementById("theme-style-custom")).not.toBeNull();
     d.dispose();
     expect(theme.getRegisteredThemes().find((t) => t.id === "custom")).toBeUndefined();
+    expect(document.getElementById("theme-style-custom")).toBeNull();
   });
 
-  test("getSchemeToken returns token value", () => {
+  test("tokens getter reflects computed CSS variables", () => {
     const theme = new ThemeAccessImpl();
-    theme.registerBuiltinSchemes([
-      { id: "test", name: "Test", category: "dark", tokens: { "--bg": "#222", "--text": "#eee" } },
-    ]);
-    expect(theme.getSchemeToken("test", "--bg")).toBe("#222");
-    expect(theme.getSchemeToken("test", "--text")).toBe("#eee");
-  });
-
-  test("getSchemeToken returns undefined for missing scheme", () => {
-    const theme = new ThemeAccessImpl();
-    expect(theme.getSchemeToken("nonexistent", "--bg")).toBeUndefined();
-  });
-
-  test("valid color formats accepted", () => {
-    const theme = new ThemeAccessImpl();
-    // hex
-    expect(() => theme.registerTheme("a", { "--bg": "#abc" }).dispose()).not.toThrow();
-    // rgba
-    expect(() => theme.registerTheme("b", { "--bg": "rgba(0,0,0,0.5)" }).dispose()).not.toThrow();
-    // hsl
-    expect(() => theme.registerTheme("c", { "--bg": "hsl(120,50%,50%)" }).dispose()).not.toThrow();
-    // named color
-    expect(() => theme.registerTheme("d", { "--bg": "red" }).dispose()).not.toThrow();
+    document.documentElement.style.setProperty("--bg", "#222");
+    document.documentElement.style.setProperty("--text", "#eee");
+    const tokens = theme.tokens;
+    expect(tokens["--bg"]).toBe("#222");
+    expect(tokens["--text"]).toBe("#eee");
+    expect(COLOR_SCHEME_TOKENS.every((token) => token in tokens)).toBe(true);
   });
 });

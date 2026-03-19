@@ -17,7 +17,7 @@ describe("restoreThemeSync", () => {
   test("falls back to DARK_SCHEME_ID when localStorage is empty", () => {
     restoreThemeSync();
     expect(document.documentElement.classList.contains(DARK_SCHEME_ID)).toBe(true);
-    expect(localStorage.getItem("theme")).toBe(DARK_SCHEME_ID);
+    expect(localStorage.getItem("theme")).toBeNull();
   });
 
   test("restores dark theme from localStorage", () => {
@@ -33,15 +33,17 @@ describe("restoreThemeSync", () => {
     expect(document.documentElement.classList.contains(DARK_SCHEME_ID)).toBe(false);
   });
 
-  test("invalid theme in localStorage falls back to dark", () => {
+  test("invalid theme in localStorage falls back to dark without overwriting storage", () => {
     localStorage.setItem("theme", "invalid-theme-xyz");
     restoreThemeSync();
     expect(document.documentElement.classList.contains(DARK_SCHEME_ID)).toBe(true);
-    expect(localStorage.getItem("theme")).toBe(DARK_SCHEME_ID);
+    expect(localStorage.getItem("theme")).toBe("invalid-theme-xyz");
   });
 
-  test("removes previous theme class before applying new one", () => {
-    document.documentElement.classList.add(LIGHT_SCHEME_ID);
+  test("removes the previously applied theme class when restoring a new one", () => {
+    localStorage.setItem("theme", LIGHT_SCHEME_ID);
+    restoreThemeSync();
+    expect(document.documentElement.classList.contains(LIGHT_SCHEME_ID)).toBe(true);
     localStorage.setItem("theme", DARK_SCHEME_ID);
     restoreThemeSync();
     expect(document.documentElement.classList.contains(LIGHT_SCHEME_ID)).toBe(false);

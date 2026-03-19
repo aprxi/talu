@@ -1,36 +1,22 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import type { PluginContext } from "../../../src/kernel/types.ts";
+import type { AgentShellSession, PluginContext } from "../../../src/kernel/types.ts";
 import { workspaceOpsPlugin } from "../../../src/plugins/workspace-ops/index.ts";
 import { flushAsync } from "../../helpers/mocks.ts";
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 function createContext(overrides: Partial<PluginContext> = {}): PluginContext {
   const container = document.createElement("div");
   const baseAgent = {
     cwd: ".",
-    fs: {
-      readFile: async () => ({ path: "notes.txt", content: "hello", encoding: "utf-8", size: 5, truncated: false }),
-      writeFile: async () => ({ path: "notes.txt", bytesWritten: 5 }),
-      editFile: async () => ({ path: "notes.txt", replacements: 1 }),
-      stat: async () => ({
-        path: "notes.txt",
-        exists: true,
-        isFile: true,
-        isDir: false,
-        isSymlink: false,
-        size: 5,
-        mode: "644",
-        modifiedAt: 0,
-        createdAt: 0,
-      }),
-      ls: async () => ({
-        path: ".",
-        entries: [{ name: "a.txt", path: "a.txt", isDir: false, isSymlink: false, size: 1, modifiedAt: 0 }],
-        truncated: false,
-      }),
-      rm: async () => {},
-      mkdir: async () => {},
-      rename: async () => {},
-    },
     shell: {
       open: async () => ({
         id: "shell-default",
@@ -49,6 +35,9 @@ function createContext(overrides: Partial<PluginContext> = {}): PluginContext {
   };
 
   const overrideAgent = overrides.agent as any;
+  const { agent: _agentOverride, ...restOverrides } = overrides as Partial<PluginContext> & {
+    agent?: unknown;
+  };
 
   const ctx = {
     container,
@@ -65,16 +54,12 @@ function createContext(overrides: Partial<PluginContext> = {}): PluginContext {
     agent: {
       ...baseAgent,
       ...(overrideAgent ?? {}),
-      fs: {
-        ...baseAgent.fs,
-        ...(overrideAgent?.fs ?? {}),
-      },
       shell: {
         ...baseAgent.shell,
         ...(overrideAgent?.shell ?? {}),
       },
     },
-    ...overrides,
+    ...restOverrides,
   };
 
   return ctx as unknown as PluginContext;
@@ -85,151 +70,77 @@ beforeEach(() => {
 });
 
 describe("workspaceOpsPlugin", () => {
-  test("registers and activates with expected manifest capabilities", async () => {
+  test("registers and renders the current hosts shell UI", async () => {
     expect(workspaceOpsPlugin.manifest.permissions).toEqual(["filesystem", "exec"]);
     expect(workspaceOpsPlugin.manifest.requiresCapabilities).toEqual(["filesystem", "exec"]);
 
     const ctx = createContext();
+    const expectedHostname = window.location.hostname || "localhost";
     workspaceOpsPlugin.register(ctx);
     await workspaceOpsPlugin.run(ctx, new AbortController().signal);
 
-    expect(ctx.container.querySelector("#wop-path")).not.toBeNull();
-    expect(ctx.container.querySelector("#wop-ls-btn")).not.toBeNull();
-    expect(ctx.container.querySelector("#wop-read-btn")).not.toBeNull();
-    expect(ctx.container.querySelector("#wop-write-btn")).not.toBeNull();
-    expect(ctx.container.querySelector("#wop-edit-btn")).not.toBeNull();
-    expect(ctx.container.querySelector("#wop-terminal-host")).not.toBeNull();
-    const text = ctx.container.textContent ?? "";
-    expect(text).toContain("Terminal");
-    expect(text.indexOf("Terminal")).toBeLessThan(text.indexOf("Write / Edit"));
+    expect(ctx.container.querySelectorAll("#wop-host-list .sidebar-item")).toHaveLength(1);
+    const hostButton = ctx.container.querySelector<HTMLButtonElement>("#wop-host-list .sidebar-item")!;
+    const spans = hostButton.querySelectorAll("span");
+    expect(ctx.container.querySelector("#wop-shell-state")?.textContent).toBe("connecting");
+    expect(ctx.container.querySelector("#wop-terminal-area")).not.toBeNull();
+    expect(spans).toHaveLength(3);
+    expect(spans[1]!.textContent).toBe(expectedHostname);
+    expect(spans[2]!.textContent).toBe("primary");
   });
 
-  test("fs.ls success path renders output", async () => {
-    const ctx = createContext({
-      agent: {
-        fs: {
-          ls: async () => ({
-            path: ".",
-            entries: [{ name: "src", path: "src", isDir: true, isSymlink: false, size: 0, modifiedAt: 1 }],
-            truncated: false,
-          }),
-        },
-      },
-    } as unknown as PluginContext);
-
-    await workspaceOpsPlugin.run(ctx, new AbortController().signal);
-
-    const pathInput = ctx.container.querySelector<HTMLInputElement>("#wop-path")!;
-    const lsBtn = ctx.container.querySelector<HTMLButtonElement>("#wop-ls-btn")!;
-    const output = ctx.container.querySelector<HTMLElement>("#wop-output")!;
-    const status = ctx.container.querySelector<HTMLElement>("#wop-status")!;
-
-    pathInput.value = ".";
-    lsBtn.click();
-    await flushAsync();
-
-    expect(status.dataset["state"]).toBe("success");
-    expect(output.textContent).toContain("\"operation\": \"fs.ls\"");
-    expect(output.textContent).toContain("\"name\": \"src\"");
-  });
-
-  test("fs.readFile error path renders structured code and message", async () => {
-    const ctx = createContext({
-      agent: {
-        fs: {
-          readFile: async () => {
-            throw new Error("policy_denied_file_read: file read blocked");
-          },
-        },
-      },
-    } as unknown as PluginContext);
-
-    await workspaceOpsPlugin.run(ctx, new AbortController().signal);
-
-    const pathInput = ctx.container.querySelector<HTMLInputElement>("#wop-path")!;
-    const readBtn = ctx.container.querySelector<HTMLButtonElement>("#wop-read-btn")!;
-    const output = ctx.container.querySelector<HTMLElement>("#wop-output")!;
-
-    pathInput.value = "notes.txt";
-    readBtn.click();
-    await flushAsync();
-
-    const payload = JSON.parse(output.textContent ?? "{}");
-    expect(payload.ok).toBe(false);
-    expect(payload.error.code).toBe("policy_denied_file_read");
-    expect(payload.error.message).toBe("file read blocked");
-  });
-
-  test("fs.writeFile on directory path returns invalid_request before network call", async () => {
-    const writeSpy = { called: 0 };
-    const ctx = createContext({
-      agent: {
-        fs: {
-          writeFile: async () => {
-            writeSpy.called += 1;
-            return { path: "x", bytesWritten: 1 };
-          },
-        },
-      },
-    } as unknown as PluginContext);
-
-    await workspaceOpsPlugin.run(ctx, new AbortController().signal);
-
-    const pathInput = ctx.container.querySelector<HTMLInputElement>("#wop-path")!;
-    const writeBtn = ctx.container.querySelector<HTMLButtonElement>("#wop-write-btn")!;
-    const output = ctx.container.querySelector<HTMLElement>("#wop-output")!;
-
-    pathInput.value = ".";
-    writeBtn.click();
-    await flushAsync();
-
-    const payload = JSON.parse(output.textContent ?? "{}");
-    expect(writeSpy.called).toBe(0);
-    expect(payload.ok).toBe(false);
-    expect(payload.error.code).toBe("invalid_request");
-  });
-
-  test("terminal auto-opens and handles stream events", async () => {
-    let onEventHandler: ((event: { type: "data" | "exit" | "error"; data?: string; code?: number; message?: string }) => void) | null = null;
+  test("auto-opens the primary shell and reacts to shell events", async () => {
+    const openArgs: Array<{ cwd?: string; cols?: number; rows?: number }> = [];
+    let shellEventHandler: ((event: { type: "data" | "exit" | "error"; data?: string; code?: number; message?: string }) => void) | null = null;
+    const openRequested = createDeferred<void>();
+    const releaseShell = createDeferred<AgentShellSession>();
 
     const ctx = createContext({
       agent: {
         shell: {
-          open: async () => ({
-            id: "shell-1",
-            cols: 120,
-            rows: 32,
-            cwd: ".",
-            send(): void {},
-            resize(): void {},
-            signal(): void {},
-            onEvent(handler: (event: { type: "data" | "exit" | "error"; data?: string; code?: number; message?: string }) => void) {
-              onEventHandler = handler;
-              return { dispose() {} };
-            },
-            async close(): Promise<void> {},
-          }),
+          open: async (opts?: { cwd?: string; cols?: number; rows?: number }) => {
+            openArgs.push(opts ?? {});
+            openRequested.resolve();
+            return releaseShell.promise;
+          },
         },
       },
     } as unknown as PluginContext);
 
-    await workspaceOpsPlugin.run(ctx, new AbortController().signal);
-    await flushAsync();
+    workspaceOpsPlugin.register(ctx);
+    const runPromise = workspaceOpsPlugin.run(ctx, new AbortController().signal);
+    await openRequested.promise;
 
     const shellState = ctx.container.querySelector<HTMLElement>("#wop-shell-state")!;
-    const output = ctx.container.querySelector<HTMLElement>("#wop-output")!;
-    const status = ctx.container.querySelector<HTMLElement>("#wop-status")!;
+    expect(openArgs[0]!.cwd).toBe(".");
+    expect(openArgs[0]!.cols).toBeGreaterThan(0);
+    expect(openArgs[0]!.rows).toBeGreaterThan(0);
+    expect(shellState.textContent).toBe("connecting");
 
-    expect(shellState.textContent).toContain("connected");
-    expect(status.dataset["state"]).toBe("success");
-    expect(JSON.parse(output.textContent ?? "{}").operation).toBe("shell.open");
+    releaseShell.resolve({
+      id: "shell-1",
+      cols: 120,
+      rows: 32,
+      cwd: ".",
+      send(): void {},
+      resize(): void {},
+      signal(): void {},
+      onEvent(handler) {
+        shellEventHandler = handler;
+        return { dispose() {} };
+      },
+      async close(): Promise<void> {},
+    });
 
-    onEventHandler?.({ type: "data", data: "file-a\n" });
-    onEventHandler?.({ type: "exit", code: 0 });
+    await flushAsync();
+    await runPromise;
+
+    expect(shellState.textContent).toBe("connected (shell-1)");
+    shellEventHandler?.({ type: "exit", code: 0 });
     expect(shellState.textContent).toBe("disconnected");
   });
 
-  test("terminal open failure is reported", async () => {
+  test("reports shell open failure in the status line", async () => {
     const ctx = createContext({
       agent: {
         shell: {
@@ -239,15 +150,14 @@ describe("workspaceOpsPlugin", () => {
         },
       },
     } as unknown as PluginContext);
+
+    workspaceOpsPlugin.register(ctx);
     await workspaceOpsPlugin.run(ctx, new AbortController().signal);
     await flushAsync();
 
-    const output = ctx.container.querySelector<HTMLElement>("#wop-output")!;
-    const status = ctx.container.querySelector<HTMLElement>("#wop-status")!;
-
-    const payload = JSON.parse(output.textContent ?? "{}");
-    expect(status.dataset["state"]).toBe("error");
-    expect(payload.ok).toBe(false);
-    expect(payload.error.code).toBe("open_failed");
+    const shellState = ctx.container.querySelector<HTMLElement>("#wop-shell-state")!;
+    const terminalArea = ctx.container.querySelector<HTMLElement>("#wop-terminal-area")!;
+    expect(shellState.textContent).toBe("error");
+    expect(terminalArea.querySelector(".xterm, pre")).not.toBeNull();
   });
 });

@@ -3,7 +3,7 @@ import { wireRepoEvents } from "../../../src/plugins/repo/events.ts";
 import { repoState } from "../../../src/plugins/repo/state.ts";
 import { initRepoDom, getRepoDom } from "../../../src/plugins/repo/dom.ts";
 import { initRepoDeps } from "../../../src/plugins/repo/deps.ts";
-import { createDomRoot, REPO_DOM_IDS, REPO_DOM_TAGS } from "../../helpers/dom.ts";
+import { createDomRoot, REPO_DOM_EXTRAS, REPO_DOM_IDS, REPO_DOM_TAGS } from "../../helpers/dom.ts";
 import { mockControllableTimers, mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 
 /**
@@ -39,9 +39,11 @@ beforeEach(() => {
   repoState.discoverSize = "8";
   repoState.discoverTask = "text-generation";
   repoState.discoverLibrary = "safetensors";
+  repoState.subPage = null;
+  repoState.manageLocalTab = "local";
 
   // DOM.
-  const root = createDomRoot(REPO_DOM_IDS, undefined, REPO_DOM_TAGS);
+  const root = createDomRoot(REPO_DOM_IDS, REPO_DOM_EXTRAS, REPO_DOM_TAGS);
   // Set data-tab attributes on tab buttons (events.ts reads these).
   root.querySelector("#rp-tab-discover")!.setAttribute("data-tab", "discover");
   root.querySelector("#rp-tab-local")!.setAttribute("data-tab", "local");
@@ -71,6 +73,7 @@ beforeEach(() => {
         apiCalls.push({ method: "listRepoModels", args: [query] });
         return { ok: true, data: { models: [], total_size_bytes: 0 } };
       },
+      kvPut: async () => ({ ok: true }),
       searchRepoModels: async (query: string, opts?: any) => {
         apiCalls.push({ method: "searchRepoModels", args: [query, opts] });
         return { ok: true, data: { results: [] } };
@@ -228,7 +231,8 @@ describe("Search debouncing", () => {
   });
 
   test("search clear on discover tab reloads trending models", async () => {
-    repoState.tab = "discover";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "discover";
     repoState.searchQuery = "llama";
     repoState.searchResults = [{ model_id: "r1" } as any];
     wireRepoEvents();
@@ -244,7 +248,8 @@ describe("Search debouncing", () => {
   });
 
   test("search clear bumps searchGeneration to discard in-flight results", () => {
-    repoState.tab = "discover";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "discover";
     repoState.searchQuery = "llama";
     repoState.searchGeneration = 5;
     wireRepoEvents();
@@ -259,7 +264,8 @@ describe("Search debouncing", () => {
   });
 
   test("search clear cancels pending debounce timer", async () => {
-    repoState.tab = "discover";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "discover";
     wireRepoEvents();
     const dom = getRepoDom();
 
@@ -566,7 +572,8 @@ describe("Bulk actions", () => {
 
 describe("Discover filter selects", () => {
   test("changing sort select updates state and triggers search", () => {
-    repoState.tab = "discover";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "discover";
     repoState.searchQuery = "llama";
     wireRepoEvents();
 
@@ -578,7 +585,8 @@ describe("Discover filter selects", () => {
   });
 
   test("changing task filter updates state", () => {
-    repoState.tab = "discover";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "discover";
     repoState.searchQuery = "llama";
     wireRepoEvents();
 
@@ -590,7 +598,8 @@ describe("Discover filter selects", () => {
   });
 
   test("changing library filter updates state", () => {
-    repoState.tab = "discover";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "discover";
     repoState.searchQuery = "llama";
     wireRepoEvents();
 
@@ -602,7 +611,8 @@ describe("Discover filter selects", () => {
   });
 
   test("changing size filter updates state without API call", () => {
-    repoState.tab = "discover";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "discover";
     repoState.searchQuery = "llama";
     wireRepoEvents();
 
@@ -616,7 +626,8 @@ describe("Discover filter selects", () => {
   });
 
   test("sort/task/library changes with no query still trigger API for trending", async () => {
-    repoState.tab = "discover";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "discover";
     repoState.searchQuery = "";
     wireRepoEvents();
 

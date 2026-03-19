@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import { ModeManager } from "../../../src/kernel/ui/mode-manager.ts";
 import { EventBusImpl } from "../../../src/kernel/system/event-bus.ts";
+import { navigate } from "../../../src/kernel/system/router.ts";
 
 describe("ModeManager", () => {
   let eventBus: EventBusImpl;
@@ -19,7 +20,7 @@ describe("ModeManager", () => {
         </div>
       </div>
     `;
-    localStorage.removeItem("talu-last-active-mode");
+    navigate({ mode: "chat", sub: null, resource: null }, { replace: true });
   });
 
   test("initial mode from active button in DOM", () => {
@@ -27,17 +28,8 @@ describe("ModeManager", () => {
     expect(mgr.getActiveMode()).toBe("chat");
   });
 
-  test("registerMode stores mode info", () => {
-    const mgr = new ModeManager(eventBus);
-    mgr.registerMode("chat", "Chat", "talu.chat");
-    mgr.registerMode("settings", "Settings", "talu.settings");
-    // No direct getter for modes, but restoreLastMode uses it.
-    expect(mgr.getActiveMode()).toBe("chat");
-  });
-
   test("switchMode changes active mode", () => {
     const mgr = new ModeManager(eventBus);
-    mgr.registerMode("settings", "Settings", "talu.settings");
     mgr.switchMode("settings");
     expect(mgr.getActiveMode()).toBe("settings");
   });
@@ -73,25 +65,25 @@ describe("ModeManager", () => {
     expect(layout.getAttribute("data-mode")).toBe("settings");
   });
 
-  test("switchMode persists to localStorage", () => {
-    const mgr = new ModeManager(eventBus);
-    mgr.switchMode("settings");
-    expect(localStorage.getItem("talu-last-active-mode")).toBe("settings");
-  });
-
-  test("restoreLastMode restores saved mode", async () => {
+  test("initFromRoute switches to a registered route mode", () => {
     const mgr = new ModeManager(eventBus);
     mgr.registerMode("settings", "Settings", "talu.settings");
-    localStorage.setItem("talu-last-active-mode", "settings");
-    await mgr.restoreLastMode();
+    navigate({ mode: "settings", sub: null, resource: null }, { replace: true });
+    const d = mgr.initFromRoute();
     expect(mgr.getActiveMode()).toBe("settings");
+    d.dispose();
   });
 
-  test("restoreLastMode ignores unknown mode", () => {
+  test("initFromRoute falls back to chat for unknown route modes", () => {
+    document.querySelector('.activity-btn[data-mode="chat"]')?.classList.remove("active");
+    document.querySelector('.activity-btn[data-mode="settings"]')?.classList.add("active");
+    document.querySelector(".app-layout")?.setAttribute("data-mode", "settings");
     const mgr = new ModeManager(eventBus);
-    localStorage.setItem("talu-last-active-mode", "nonexistent");
-    mgr.restoreLastMode();
+    mgr.registerMode("settings", "Settings", "talu.settings");
+    navigate({ mode: "unknown", sub: null, resource: null }, { replace: true });
+    const d = mgr.initFromRoute();
     expect(mgr.getActiveMode()).toBe("chat");
+    d.dispose();
   });
 
   test("installActivityBarListeners handles clicks", () => {
@@ -114,7 +106,6 @@ describe("ModeManager", () => {
 
     const settingsBtn = document.querySelectorAll(".activity-btn")[1]! as HTMLElement;
     settingsBtn.click();
-    // Mode should NOT change after dispose.
     expect(mgr.getActiveMode()).toBe("chat");
   });
 });

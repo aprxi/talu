@@ -20,6 +20,13 @@ function setupKernelDOM(): void {
         <div id="chat-mode" class="mode-view"></div>
       </div>
     </div>
+    <aside id="app-panel" class="app-panel hidden">
+      <div class="app-panel-header">
+        <span id="app-panel-title" class="app-panel-title"></span>
+        <button id="app-panel-close" class="btn btn-ghost btn-icon" title="Close"></button>
+      </div>
+      <div id="app-panel-content" class="app-panel-content"></div>
+    </aside>
     <div id="status-bar"></div>
     <div class="topbar"><span id="topbar-title"></span></div>
     <div id="toast-container"></div>

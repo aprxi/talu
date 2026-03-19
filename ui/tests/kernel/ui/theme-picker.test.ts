@@ -1,20 +1,23 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import { setupThemePicker } from "../../../src/kernel/ui/theme-picker.ts";
 import { ThemeAccessImpl } from "../../../src/kernel/ui/theme.ts";
-import { BUILTIN_SCHEMES, DARK_SCHEME_ID, LIGHT_SCHEME_ID } from "../../../src/styles/color-schemes.ts";
+import { BUILTIN_THEMES, DARK_SCHEME_ID, LIGHT_SCHEME_ID } from "../../../src/styles/color-schemes.ts";
 
 describe("setupThemePicker", () => {
   let themeAccess: ThemeAccessImpl;
 
   beforeEach(() => {
     themeAccess = new ThemeAccessImpl();
-    themeAccess.registerBuiltinSchemes(BUILTIN_SCHEMES);
+    themeAccess.registerBuiltinThemes(BUILTIN_THEMES);
     document.body.innerHTML = `
       <button class="theme-toggle-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
         <span class="theme-preview-dot"></span>
       </button>
     `;
     localStorage.removeItem("theme");
+    localStorage.removeItem("theme-mode");
+    localStorage.removeItem("theme-dark");
+    localStorage.removeItem("theme-light");
     document.documentElement.classList.remove(DARK_SCHEME_ID, LIGHT_SCHEME_ID);
   });
 
@@ -24,16 +27,17 @@ describe("setupThemePicker", () => {
     d.dispose();
   });
 
-  test("initializes button state from current theme", () => {
-    localStorage.setItem("theme", DARK_SCHEME_ID);
+  test("initializes button state from the current mode", () => {
+    localStorage.setItem("theme-mode", "dark");
     const d = setupThemePicker(themeAccess);
     const btn = document.getElementById("theme-toggle")!;
-    expect(btn.getAttribute("aria-label")).toContain("light");
+    expect(btn.getAttribute("aria-label")).toBe("Switch to light mode");
+    expect(btn.getAttribute("aria-pressed")).toBe("false");
     d.dispose();
   });
 
   test("click toggles from dark to light", () => {
-    localStorage.setItem("theme", DARK_SCHEME_ID);
+    localStorage.setItem("theme-mode", "dark");
     const d = setupThemePicker(themeAccess);
     const btn = document.getElementById("theme-toggle") as HTMLButtonElement;
     btn.click();
@@ -43,7 +47,7 @@ describe("setupThemePicker", () => {
   });
 
   test("click toggles from light to dark", () => {
-    localStorage.setItem("theme", LIGHT_SCHEME_ID);
+    localStorage.setItem("theme-mode", "light");
     document.documentElement.classList.add(LIGHT_SCHEME_ID);
     const d = setupThemePicker(themeAccess);
     const btn = document.getElementById("theme-toggle") as HTMLButtonElement;

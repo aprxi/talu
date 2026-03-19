@@ -81,9 +81,10 @@ describe("StatusBarManager", () => {
     expect(item.textContent).toBe("Updated");
   });
 
-  test("updateLabel no-op for unknown item", () => {
+  test("updateLabel no-op for unknown item leaves items untouched", () => {
     const mgr = new StatusBarManager();
-    expect(() => mgr.updateLabel("nonexistent", "value")).not.toThrow();
+    mgr.updateLabel("nonexistent", "value");
+    expect(document.querySelectorAll(".status-bar-item").length).toBe(0);
   });
 
   test("dispose removes items from DOM", () => {
@@ -97,14 +98,15 @@ describe("StatusBarManager", () => {
     expect(document.querySelector(".status-bar-item")).toBeNull();
   });
 
-  test("no-op for empty manifest contributes", () => {
+  test("no-op for empty manifest contributes returns a disposable without items", () => {
     const mgr = new StatusBarManager();
     const d = mgr.registerFromManifest("test.plugin", {
       id: "test.plugin",
       name: "Test",
       version: "1.0.0",
     } as PluginManifest);
-    expect(() => d.dispose()).not.toThrow();
+    d.dispose();
+    expect(document.querySelectorAll(".status-bar-item").length).toBe(0);
   });
 
   test("duplicate item IDs are skipped", () => {

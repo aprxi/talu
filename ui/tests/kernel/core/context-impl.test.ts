@@ -137,7 +137,7 @@ describe("createPluginContext — permission gates", () => {
     const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
     try {
       await ctx.network.fetch("/api/test");
-      expect(true).toBe(false); // Should not reach.
+      throw new Error("Expected fetch without network permission to throw");
     } catch (err) {
       expect((err as Error).message).toContain("network");
       expect((err as Error).message).toContain("ext.test");
@@ -160,7 +160,7 @@ describe("createPluginContext — permission gates", () => {
     const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
     try {
       await ctx.storage.get("key");
-      expect(true).toBe(false);
+      throw new Error("Expected storage.get without storage permission to throw");
     } catch (err) {
       expect((err as Error).message).toContain("storage");
     }
@@ -179,15 +179,14 @@ describe("createPluginContext — permission gates", () => {
     }
   });
 
-  test("third-party without 'clipboard' permission → throws on writeText", async () => {
+  test("third-party without 'clipboard' permission → writeText is still delegated", async () => {
     const disposables = new DisposableStore();
     const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
-    try {
-      await ctx.clipboard.writeText("data");
-      expect(true).toBe(false);
-    } catch (err) {
-      expect((err as Error).message).toContain("clipboard");
-    }
+    const writeTextSpy = spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+
+    await expect(ctx.clipboard.writeText("data")).resolves.toBeUndefined();
+    expect(writeTextSpy).toHaveBeenCalledWith("data");
+    writeTextSpy.mockRestore();
   });
 
   test("third-party without 'hooks' permission → throws on hooks.on", () => {

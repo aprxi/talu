@@ -152,14 +152,22 @@ describe("readSSEStream — text delta", () => {
     expect(updatedParts.length).toBeGreaterThanOrEqual(1);
   });
 
-  test("text passes through applyPreProcessors", async () => {
+  test("final text passes through applyPreProcessors", async () => {
     const resp = sseResponse(
       sseEvent("response.output_text.delta", { delta: "processed text" }),
+      sseEvent("response.completed", {
+        response: {
+          id: "resp-final",
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        },
+      }),
     );
     const { bodyEl, textEl } = makeDomEls();
     await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
-    expect(preProcessorCalled.length).toBeGreaterThanOrEqual(1);
-    expect(preProcessorCalled.some((t) => t.includes("processed text"))).toBe(true);
+    expect(preProcessorCalled).toEqual(["processed text"]);
+    const finalUpdate = updatedParts.find((u) => u.isFinal);
+    expect(finalUpdate).not.toBeUndefined();
+    expect(finalUpdate!.part.text).toBe("processed text");
   });
 
   test("non-string delta is ignored", async () => {
@@ -188,9 +196,15 @@ describe("readSSEStream — reasoning delta", () => {
     expect(summary!.textContent).toBe("Thought process");
   });
 
-  test("reasoning content is rendered as markdown", async () => {
+  test("final reasoning content is rendered as markdown", async () => {
     const resp = sseResponse(
       sseEvent("response.reasoning.delta", { delta: "**bold reasoning**" }),
+      sseEvent("response.completed", {
+        response: {
+          id: "resp-reasoning",
+          usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+        },
+      }),
     );
     const { bodyEl, textEl } = makeDomEls();
     await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
@@ -198,6 +212,7 @@ describe("readSSEStream — reasoning delta", () => {
     const reasoningBody = bodyEl.querySelector(".reasoning-body");
     expect(reasoningBody).not.toBeNull();
     expect(reasoningBody!.innerHTML).toContain("<strong>");
+    expect(reasoningBody!.innerHTML).not.toContain("streaming-raw");
   });
 
   test("non-string reasoning delta is ignored", async () => {
@@ -365,7 +380,7 @@ describe("readSSEStream — chunk splitting", () => {
     const { bodyEl, textEl } = makeDomEls();
     await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(mountedParts.length).toBe(1);
-    expect(preProcessorCalled.some((t) => t.includes("split-test"))).toBe(true);
+    expect(mountedParts[0]!.part.text).toBe("split-test");
   });
 
   test("multiple events in a single chunk are all processed", async () => {
@@ -391,7 +406,7 @@ describe("readSSEStream — chunk splitting", () => {
     const { bodyEl, textEl } = makeDomEls();
     await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(mountedParts.length).toBe(1);
-    expect(preProcessorCalled.some((t) => t.includes("boundary"))).toBe(true);
+    expect(mountedParts[0]!.part.text).toBe("boundary");
   });
 
   test("trailing data without newline is flushed on stream end", async () => {
@@ -402,7 +417,7 @@ describe("readSSEStream — chunk splitting", () => {
     const { bodyEl, textEl } = makeDomEls();
     await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(mountedParts.length).toBe(1);
-    expect(preProcessorCalled.some((t) => t.includes("flush"))).toBe(true);
+    expect(mountedParts[0]!.part.text).toBe("flush");
   });
 });
 
