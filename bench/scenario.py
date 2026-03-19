@@ -189,6 +189,9 @@ class Scenario:
     description: str = ""
     endpoint: str = ""
     family: str = ""
+    report_type: str = "responses"
+    requires_storage: bool = False
+    uses_model_matrix: bool = True
 
     def server_args(self, config: dict) -> list[str]:
         """Extra CLI args for talu serve, derived from config."""

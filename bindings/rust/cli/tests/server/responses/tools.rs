@@ -444,6 +444,82 @@ fn responses_accepts_tool_choice_required() {
     assert_ne!(resp.status, 400, "tool_choice required should pass: {}", resp.body);
 }
 
+/// Tools + max_reasoning_tokens=0 (thinking disabled) must not crash.
+///
+/// Regression: the combination of tools in the template context with
+/// enable_thinking=false triggered a "double free or corruption (out)"
+/// crash during CUDA decode after prefill.
+#[test]
+fn responses_tools_with_thinking_disabled() {
+    let model = require_model!();
+    let ctx = ServerTestContext::new(model_config());
+    let body = serde_json::json!({
+        "model": model,
+        "input": "What is the weather in San Francisco?",
+        "max_output_tokens": 64,
+        "max_reasoning_tokens": 0,
+        "tools": tool_definition(),
+        "tool_choice": "auto"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 200, "tools + thinking disabled must not crash: {}", resp.body);
+}
+
+/// Tools + max_reasoning_tokens=0 streaming must not crash.
+#[test]
+fn responses_tools_with_thinking_disabled_streaming() {
+    let model = require_model!();
+    let ctx = ServerTestContext::new(model_config());
+    let body = serde_json::json!({
+        "model": model,
+        "input": "What is the weather in San Francisco?",
+        "stream": true,
+        "max_output_tokens": 64,
+        "max_reasoning_tokens": 0,
+        "tools": tool_definition(),
+        "tool_choice": "auto"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 200, "tools + thinking disabled streaming must not crash: {}", resp.body);
+    let events = parse_sse_events(&resp.body);
+    let terminal = events
+        .iter()
+        .find(|(t, _)| t == "response.completed" || t == "response.incomplete");
+    assert!(terminal.is_some(), "must have a terminal event");
+}
+
+/// Tools + max_reasoning_tokens=0 must pass validation (no 400 error).
+///
+/// Regression: this combination must be accepted by the API regardless of
+/// backend. The server must not reject it as invalid input.
+#[test]
+fn responses_accepts_tools_with_thinking_disabled() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "What is the weather in San Francisco?",
+        "max_reasoning_tokens": 0,
+        "tools": tool_definition(),
+        "tool_choice": "auto"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_ne!(resp.status, 400, "tools + max_reasoning_tokens=0 should pass validation: {}", resp.body);
+}
+
+/// Tools + max_reasoning_tokens=0 streaming must pass validation.
+#[test]
+fn responses_accepts_tools_with_thinking_disabled_streaming() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "What is the weather in San Francisco?",
+        "stream": true,
+        "max_reasoning_tokens": 0,
+        "tools": tool_definition(),
+        "tool_choice": "auto"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_ne!(resp.status, 400, "tools + max_reasoning_tokens=0 streaming should pass validation: {}", resp.body);
+}
+
 /// Invalid tool_choice string is rejected.
 #[test]
 fn responses_rejects_invalid_tool_choice_string() {

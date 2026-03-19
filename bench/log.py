@@ -94,6 +94,7 @@ class EvalLogger:
         model: str,
         raw_output: str,
         reasoning: str = "",
+        response_output: list | None = None,
         question: str = "",
         input_tokens: int = 0,
         output_tokens: int = 0,
@@ -119,6 +120,8 @@ class EvalLogger:
             "gen_tok_s": round(gen_tok_s, 1),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        if response_output is not None:
+            record["response_output"] = response_output
         if extras:
             record.update(extras)
         self._fh.write(json.dumps(record) + "\n")

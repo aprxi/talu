@@ -15,6 +15,15 @@ from log import eval_log_path, load_completed, EvalLogger
 _MAX_RETRIES = 3
 
 
+def _extract_response_output(events: list[dict]) -> list[dict]:
+    """Extract the full output array from the terminal response event."""
+    for ev in events:
+        if ev.get("event") in ("response.completed", "response.incomplete"):
+            resp = ev.get("data", {}).get("response", {})
+            return resp.get("output", [])
+    return []
+
+
 def _extract_text(events: list[dict]) -> str:
     """Extract generated answer text from response events (excludes reasoning)."""
     for ev in events:
@@ -118,6 +127,7 @@ class _PersistentClient:
 
         if resp.status != 200:
             print(f"\n    HTTP {resp.status}: {raw[:200]}", flush=True)
+            raise RuntimeError(f"HTTP {resp.status}: {raw[:200]}")
 
         events = _parse_sse(raw)
         return events, wall_s
@@ -144,10 +154,11 @@ def run_eval(
         samples: List of sample dicts with at least: prompt, correct, question_hash, index.
         build_body: Callable(sample, uri, config) -> request body dict.
                     For multimodal, this handles image upload etc.
-        score_fn: Optional Callable(raw_text, sample) -> dict.
+        score_fn: Optional Callable(raw_text, sample, events) -> dict.
                   When provided, replaces the default extract_answer + equality check.
                   Must return {"predicted": str, "is_correct": bool, ...extra}.
                   Extra keys are merged into per-question results.
+                  *events* is the parsed SSE event list (for extracting tool calls etc).
 
     Returns:
         List of result dicts (one per model × precision × reasoning budget).
@@ -233,7 +244,7 @@ def run_eval(
                     reasoning = _extract_reasoning(events)
 
                     if score_fn:
-                        score = score_fn(raw, sample)
+                        score = score_fn(raw, sample, events)
                         predicted = score.get("predicted", "")
                         is_correct = score.get("is_correct", False)
                         extra = {k: v for k, v in score.items()
@@ -264,6 +275,8 @@ def run_eval(
                     # Throughput from this request.
                     metrics = extract_generation_metrics(events)
 
+                    response_output = _extract_response_output(events)
+
                     logger.log(
                         bench=bench_name,
                         index=sample["index"],
@@ -273,6 +286,7 @@ def run_eval(
                         model=uri,
                         raw_output=raw,
                         reasoning=reasoning,
+                        response_output=response_output,
                         question=sample.get("prompt", ""),
                         input_tokens=metrics.get("input_tokens", 0),
                         output_tokens=metrics.get("output_tokens", 0),

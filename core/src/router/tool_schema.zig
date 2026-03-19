@@ -283,7 +283,7 @@ fn parseXmlToolCalls(allocator: std.mem.Allocator, text: []const u8) ![]ParsedTo
     }
 
     if (ci == 0) {
-        allocator.free(calls);
+        // errdefer handles freeing `calls` on error return.
         return ToolSchemaError.InvalidToolsJson;
     }
 
@@ -414,6 +414,85 @@ fn extractJsonObject(text: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Normalize a tools JSON array from flat format to nested OpenAI format.
+///
+/// Chat templates render tools with `{{ tool | tojson }}`, so the JSON
+/// structure must match what the model was trained on.  OpenAI format nests
+/// the function definition under a `"function"` key:
+///
+///   Flat:   [{"type": "function", "name": "f", "parameters": {...}}]
+///   Nested: [{"type": "function", "function": {"name": "f", "parameters": {...}}}]
+///
+/// If all tools already have a `"function"` key, returns a copy unchanged.
+/// Caller owns returned memory.
+pub fn normalizeToolsJson(allocator: std.mem.Allocator, tools_json: []const u8) ![]u8 {
+    // Use an arena for all internal work (JSON parsing, temp serialization,
+    // ArrayList growth) so we never do individual frees on the caller's heap.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, a, tools_json, .{}) catch {
+        // Not valid JSON — return unchanged.
+        return try allocator.dupe(u8, tools_json);
+    };
+    // No explicit deinit needed — arena handles cleanup.
+
+    if (parsed.value != .array) {
+        return try allocator.dupe(u8, tools_json);
+    }
+
+    // Check whether any tool needs normalization.
+    var needs_normalization = false;
+    for (parsed.value.array.items) |tool| {
+        if (tool != .object) continue;
+        if (tool.object.get("function") == null and tool.object.get("name") != null) {
+            needs_normalization = true;
+            break;
+        }
+    }
+    if (!needs_normalization) {
+        return try allocator.dupe(u8, tools_json);
+    }
+
+    // Rebuild the array with flat tools wrapped in {"type":"function","function":{...}}.
+    // All temp allocations go through the arena (free is a no-op).
+    var out = std.ArrayList(u8).empty;
+    const writer = out.writer(a);
+
+    try writer.writeByte('[');
+    for (parsed.value.array.items, 0..) |tool, i| {
+        if (i > 0) try writer.writeByte(',');
+
+        if (tool != .object or tool.object.get("function") != null or tool.object.get("name") == null) {
+            // Already nested or not a recognizable tool — serialize as-is.
+            const s = try std.json.Stringify.valueAlloc(a, tool, .{});
+            try writer.writeAll(s);
+            continue;
+        }
+
+        // Flat format → wrap non-"type" keys in a "function" sub-object.
+        try writer.writeAll("{\"type\":\"function\",\"function\":{");
+        var first = true;
+        var iter = tool.object.iterator();
+        while (iter.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "type")) continue;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.writeByte('"');
+            try writer.writeAll(entry.key_ptr.*);
+            try writer.writeAll("\":");
+            const val_str = try std.json.Stringify.valueAlloc(a, entry.value_ptr.*, .{});
+            try writer.writeAll(val_str);
+        }
+        try writer.writeAll("}}");
+    }
+    try writer.writeByte(']');
+
+    // Copy the result to the caller's allocator (arena freed on return).
+    return try allocator.dupe(u8, out.items);
 }
 
 // ============================================================================
@@ -825,6 +904,16 @@ test "parseXmlToolCalls with reasoning prefix" {
     try std.testing.expectEqualStrings("calculate_triangle_area", calls[0].name);
 }
 
+test "parseXmlToolCalls repeated tags without content returns error" {
+    // Regression: repeated <tool_call> tags without closing tags or function
+    // content must not double-free the calls array.  Previously the ci==0
+    // path freed calls explicitly, then the errdefer freed it again.
+    const allocator = std.testing.allocator;
+    const text = "<tool_call>" ** 63;
+    const result = parseXmlToolCalls(allocator, text);
+    try std.testing.expectError(ToolSchemaError.InvalidToolsJson, result);
+}
+
 test "extractJsonObject finds first complete object" {
     try std.testing.expectEqualStrings(
         "{\"name\":\"test\"}",
@@ -862,4 +951,102 @@ test "fuzz parseToolCall" {
             } else |_| {}
         }
     }.testOne, .{});
+}
+
+// ============================================================================
+// normalizeToolsJson tests
+// ============================================================================
+
+test "normalizeToolsJson converts flat to nested" {
+    const allocator = std.testing.allocator;
+    const flat =
+        \\[{"type":"function","name":"get_weather","description":"Get weather","parameters":{"type":"object"}}]
+    ;
+    const result = try normalizeToolsJson(allocator, flat);
+    defer allocator.free(result);
+
+    // Parse result and verify nested structure.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .array);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    const tool = parsed.value.array.items[0];
+    try std.testing.expect(tool == .object);
+
+    // Must have "type" and "function" keys.
+    const type_val = tool.object.get("type").?;
+    try std.testing.expectEqualStrings("function", type_val.string);
+    const func = tool.object.get("function").?;
+    try std.testing.expect(func == .object);
+    try std.testing.expectEqualStrings("get_weather", func.object.get("name").?.string);
+    try std.testing.expectEqualStrings("Get weather", func.object.get("description").?.string);
+    try std.testing.expect(func.object.get("parameters").? == .object);
+}
+
+test "normalizeToolsJson leaves nested unchanged" {
+    const allocator = std.testing.allocator;
+    const nested =
+        \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]
+    ;
+    const result = try normalizeToolsJson(allocator, nested);
+    defer allocator.free(result);
+
+    // Parse and verify structure is preserved.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+
+    const tool = parsed.value.array.items[0];
+    try std.testing.expect(tool.object.get("function") != null);
+    // Top-level should NOT have "name" (it's inside "function").
+    try std.testing.expect(tool.object.get("name") == null);
+}
+
+test "normalizeToolsJson handles multiple flat tools" {
+    const allocator = std.testing.allocator;
+    const flat =
+        \\[{"type":"function","name":"a","parameters":{}},{"type":"function","name":"b","parameters":{}}]
+    ;
+    const result = try normalizeToolsJson(allocator, flat);
+    defer allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings("a", parsed.value.array.items[0].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("b", parsed.value.array.items[1].object.get("function").?.object.get("name").?.string);
+}
+
+test "normalizeToolsJson handles mixed format" {
+    const allocator = std.testing.allocator;
+    // First tool is nested, second is flat.
+    const mixed =
+        \\[{"type":"function","function":{"name":"nested_fn","parameters":{}}},{"type":"function","name":"flat_fn","parameters":{}}]
+    ;
+    const result = try normalizeToolsJson(allocator, mixed);
+    defer allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+
+    // Both should be nested.
+    try std.testing.expect(parsed.value.array.items[0].object.get("function") != null);
+    try std.testing.expect(parsed.value.array.items[1].object.get("function") != null);
+    try std.testing.expectEqualStrings("nested_fn", parsed.value.array.items[0].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("flat_fn", parsed.value.array.items[1].object.get("function").?.object.get("name").?.string);
+}
+
+test "normalizeToolsJson preserves invalid JSON" {
+    const allocator = std.testing.allocator;
+    const result = try normalizeToolsJson(allocator, "not json");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("not json", result);
+}
+
+test "normalizeToolsJson preserves non-array" {
+    const allocator = std.testing.allocator;
+    const result = try normalizeToolsJson(allocator, "{}");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("{}", result);
 }

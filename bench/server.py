@@ -1,7 +1,7 @@
 """Reliable talu server lifecycle management for benchmarking.
 
 Guarantees:
-- Refuses to start if an existing talu serve process or port listener exists.
+- Refuses to start only when the requested port is already in use.
 - Only ever manages the process it started (never kills foreign processes).
 - Health-checked readiness before returning from start().
 - Graceful SIGINT shutdown with SIGKILL fallback for its own process.
@@ -38,25 +38,38 @@ class TaluServer:
         binary: str | Path = _DEFAULT_BINARY,
         host: str = "127.0.0.1",
         port: int = 8258,
+        no_bucket: bool = True,
+        bucket: str | Path | None = None,
         extra_args: list[str] | None = None,
         env: dict[str, str] | None = None,
     ) -> None:
         self.binary = Path(binary)
         self.host = host
         self.port = port
+        self.no_bucket = no_bucket
+        self.bucket = Path(bucket) if bucket is not None else None
         self.extra_args = extra_args or []
         self.env = env or {}
         self._proc: subprocess.Popen | None = None  # type: ignore[type-arg]
+        self._socket_path: Path | None = None
+        self._owns_socket_path: bool = False
+
+        if self.no_bucket and self.bucket is not None:
+            raise ValueError("no_bucket=True cannot be combined with bucket=...")
 
     # -- Public API ----------------------------------------------------------
 
     def start(self, *, timeout: float = _START_TIMEOUT) -> None:
         """Check for conflicts, launch server, wait for /health.
 
-        Raises ServerError if another talu serve process or port listener
-        already exists.  Never kills foreign processes.
+        Raises ServerError when the requested port is unavailable.
+        Never kills foreign processes.
         """
+        socket_path, owns_socket = self._resolve_socket_path()
+        self._socket_path = socket_path
+        self._owns_socket_path = owns_socket
         self._assert_no_conflicts()
+        self._prepare_socket_path(socket_path)
 
         if not self.binary.exists():
             raise ServerError(f"binary not found: {self.binary}")
@@ -66,9 +79,14 @@ class TaluServer:
             "serve",
             "--host", self.host,
             "--port", str(self.port),
-            "--no-bucket",
-            *self.extra_args,
+            "--socket", str(socket_path),
         ]
+        if self.no_bucket:
+            cmd.append("--no-bucket")
+        elif self.bucket is not None:
+            self.bucket.mkdir(parents=True, exist_ok=True)
+            cmd.extend(["--bucket", str(self.bucket)])
+        cmd.extend(self.extra_args)
 
         # Inherit current env, overlay config env vars.
         proc_env = os.environ.copy()
@@ -121,6 +139,7 @@ class TaluServer:
 
         # Wait for port to be released by the OS.
         self._wait_port_free(timeout=5)
+        self._cleanup_owned_socket_path()
 
     @property
     def base_url(self) -> str:
@@ -145,17 +164,7 @@ class TaluServer:
     # -- Internals ------------------------------------------------------------
 
     def _assert_no_conflicts(self) -> None:
-        """Refuse to start if a talu serve process or port listener exists."""
-        # Check for existing talu serve processes.
-        existing = self._find_talu_serve_pids()
-        if existing:
-            pids_str = ", ".join(str(p) for p in existing)
-            raise ServerError(
-                f"existing talu serve process(es) found: pid {pids_str}\n"
-                f"Stop them before running benchmarks:\n"
-                f"  kill -INT {pids_str}"
-            )
-
+        """Refuse to start only if the target port is already in use."""
         # Check for anything else on our port.
         if self._port_in_use():
             raise ServerError(
@@ -164,52 +173,61 @@ class TaluServer:
                 f"Stop it with:  kill -INT $(lsof -ti :{self.port})"
             )
 
-    def _find_talu_serve_pids(self) -> list[int]:
-        """Return PIDs of running ``talu serve`` processes (excludes self).
+    def _resolve_socket_path(self) -> tuple[Path, bool]:
+        """Resolve socket path from args, or create an isolated bench default."""
+        explicit = self._extract_arg_value("--socket")
+        if explicit:
+            return Path(explicit).expanduser(), False
+        return Path(f"/tmp/talu-bench-{self.port}.sock"), True
 
-        Uses ``pgrep`` + ``ps`` which work on both Linux and macOS,
-        avoiding the Linux-only ``/proc`` filesystem.
-        """
+    def _extract_arg_value(self, key: str) -> str | None:
+        """Extract a CLI argument value from ``extra_args``."""
+        for i, arg in enumerate(self.extra_args):
+            if arg == key and i + 1 < len(self.extra_args):
+                return self.extra_args[i + 1]
+            prefix = f"{key}="
+            if arg.startswith(prefix):
+                return arg[len(prefix):]
+        return None
+
+    def _prepare_socket_path(self, path: Path) -> None:
+        """Remove stale socket files while refusing active socket collisions."""
+        if not path.exists():
+            return
+        if self._socket_in_use(path):
+            raise ServerError(f"socket {path} is already in use by another process.")
         try:
-            result = subprocess.run(
-                ["pgrep", "-f", "talu.*serve"],
-                capture_output=True, text=True, timeout=5,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return []
+            path.unlink()
+        except OSError as e:
+            raise ServerError(f"failed to remove stale socket {path}: {e}") from e
 
-        if result.returncode != 0:
-            return []
+    def _cleanup_owned_socket_path(self) -> None:
+        """Best-effort cleanup for auto-managed socket paths."""
+        path = self._socket_path
+        owns = self._owns_socket_path
+        self._socket_path = None
+        self._owns_socket_path = False
+        if not path or not owns:
+            return
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
 
-        my_pid = os.getpid()
-        candidates = []
-        for line in result.stdout.strip().splitlines():
-            line = line.strip()
-            if line.isdigit():
-                pid = int(line)
-                if pid != my_pid:
-                    candidates.append(pid)
-
-        # Verify each candidate's command line to avoid false positives.
-        pids: list[int] = []
-        for pid in candidates:
-            try:
-                ps = subprocess.run(
-                    ["ps", "-o", "args=", "-p", str(pid)],
-                    capture_output=True, text=True, timeout=5,
-                )
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                continue
-            if ps.returncode != 0:
-                continue
-            cmdline = ps.stdout.strip()
-            parts = cmdline.split()
-            if len(parts) < 2:
-                continue
-            binary = parts[0].rsplit("/", 1)[-1]
-            if binary == "talu" and parts[1] == "serve":
-                pids.append(pid)
-        return pids
+    def _socket_in_use(self, path: Path) -> bool:
+        """Check if a Unix domain socket path is accepting connections."""
+        if not path.exists():
+            return False
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(0.2)
+        try:
+            sock.connect(str(path))
+            return True
+        except OSError:
+            return False
+        finally:
+            sock.close()
 
     def _wait_port_free(self, *, timeout: float) -> None:
         """Block until nothing is listening on our port."""

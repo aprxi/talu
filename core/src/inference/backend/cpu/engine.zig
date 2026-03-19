@@ -1480,7 +1480,6 @@ pub const FusedCpuBackend = struct {
                 if (self.model.norm) |*n| n.forward(&hidden_tensor_view, &hidden_tensor_view);
             }
         }
-
         // 3) Batched LM-head logits in one matmul over compact hidden rows.
         self.computeLogitsFromHiddenRows(compact_hidden, request_total, compact_logits) catch return;
 

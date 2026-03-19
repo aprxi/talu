@@ -6,14 +6,43 @@ const simd = @import("simd/arch/root.zig");
 const VEC_LEN = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;
 
+/// Heap overflow diagnostic: when true, ensureF32Slice and ensureAligned64F32Slice
+/// append a guard zone of GUARD_PATTERN after each buffer. Use verifyF32Guard() to
+/// detect overflows. Set to false for zero overhead in production.
+pub const heap_debug = false;
+
+pub const GUARD_F32S: usize = if (heap_debug) 64 else 0;
+pub const GUARD_PATTERN: u32 = 0xDEADBEEF;
+
+fn fillGuard(buf: []f32, data_len: usize) void {
+    for (buf[data_len..]) |*slot| {
+        slot.* = @bitCast(GUARD_PATTERN);
+    }
+}
+
+/// Returns true if the guard zone appended by ensureF32Slice / ensureAligned64F32Slice
+/// is intact. Always returns true when heap_debug is false.
+pub fn verifyF32Guard(buf: []const f32) bool {
+    if (!heap_debug) return true;
+    if (buf.len < GUARD_F32S) return true;
+    const guard_start = buf.len - GUARD_F32S;
+    for (buf[guard_start..]) |val| {
+        if (@as(u32, @bitCast(val)) != GUARD_PATTERN) return false;
+    }
+    return true;
+}
+
 /// Ensure a reusable f32 buffer has at least `needed` elements.
+/// When heap_debug is true, appends a guard zone after the data region.
 pub fn ensureF32Slice(allocator: std.mem.Allocator, storage: *[]f32, needed: usize) !void {
-    if (storage.*.len >= needed) return;
+    const total = needed + GUARD_F32S;
+    if (storage.*.len >= total) return;
     if (storage.*.len > 0) {
         allocator.free(storage.*);
         storage.* = &.{};
     }
-    storage.* = try allocator.alloc(f32, needed);
+    storage.* = try allocator.alloc(f32, total);
+    if (heap_debug) fillGuard(storage.*, needed);
 }
 
 /// Ensure a reusable u32 buffer has at least `needed` elements.
@@ -28,14 +57,17 @@ pub fn ensureU32Slice(allocator: std.mem.Allocator, storage: *[]u32, needed: usi
 
 /// Ensure a reusable f32 buffer with 64-byte alignment (cache-line / SIMD).
 /// Free via freeAligned64F32Slice.
+/// When heap_debug is true, appends a guard zone after the data region.
 pub fn ensureAligned64F32Slice(allocator: std.mem.Allocator, storage: *[]f32, needed: usize) !void {
-    if (storage.*.len >= needed) return;
+    const total = needed + GUARD_F32S;
+    if (storage.*.len >= total) return;
     if (storage.*.len > 0) {
         freeAligned64F32Slice(allocator, storage.*);
         storage.* = &.{};
     }
-    const aligned = try allocator.alignedAlloc(f32, .@"64", needed);
+    const aligned = try allocator.alignedAlloc(f32, .@"64", total);
     storage.* = aligned;
+    if (heap_debug) fillGuard(storage.*, needed);
 }
 
 /// Free a []f32 that was allocated with 64-byte alignment.
@@ -150,4 +182,34 @@ test "ensureAligned64F32Slice clears storage on allocation failure" {
 
     try std.testing.expectError(error.OutOfMemory, ensureAligned64F32Slice(alloc, &storage, 64));
     try std.testing.expectEqual(@as(usize, 0), storage.len);
+}
+
+test "verifyF32Guard detects overflow past ensureF32Slice data region" {
+    const allocator = std.testing.allocator;
+    var storage: []f32 = &.{};
+    defer if (storage.len > 0) allocator.free(storage);
+
+    try ensureF32Slice(allocator, &storage, 16);
+    // Guard zone intact after allocation.
+    try std.testing.expect(verifyF32Guard(storage));
+
+    if (heap_debug) {
+        // Corrupt the first guard element and verify detection.
+        storage[16] = 0.0;
+        try std.testing.expect(!verifyF32Guard(storage));
+    }
+}
+
+test "verifyF32Guard detects overflow past ensureAligned64F32Slice data region" {
+    const allocator = std.testing.allocator;
+    var storage: []f32 = &.{};
+    defer if (storage.len > 0) freeAligned64F32Slice(allocator, storage);
+
+    try ensureAligned64F32Slice(allocator, &storage, 32);
+    try std.testing.expect(verifyF32Guard(storage));
+
+    if (heap_debug) {
+        storage[32] = 0.0;
+        try std.testing.expect(!verifyF32Guard(storage));
+    }
 }

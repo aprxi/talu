@@ -950,8 +950,14 @@ fn buildEffectiveContext(alloc: std.mem.Allocator, opts: GenerateOptions) !?[]co
 
     const val: []const u8 = if (enable_thinking) "true" else "false";
 
-    const tools_fragment: ?[]const u8 = if (opts.tools_json) |tj|
-        try std.fmt.allocPrint(alloc, ", \"tools\": {s}", .{tj})
+    // Normalize flat-format tools to nested OpenAI format for the template.
+    const normalized_tools: ?[]const u8 = if (opts.tools_json) |tj|
+        try tool_schema_mod.normalizeToolsJson(alloc, tj)
+    else
+        null;
+    defer if (normalized_tools) |nt| alloc.free(nt);
+    const tools_fragment: ?[]const u8 = if (normalized_tools) |nt|
+        try std.fmt.allocPrint(alloc, ", \"tools\": {s}", .{nt})
     else
         null;
     defer if (tools_fragment) |tf| alloc.free(tf);

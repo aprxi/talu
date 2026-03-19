@@ -695,43 +695,50 @@ test "promptEndsWithReasoningTag: no reasoning tag at end" {
     try std.testing.expect(!promptEndsWithReasoningTag("<|im_start|>assistant\n", null));
 }
 
+// Qwen-style template fragment used by tool rendering tests.
+const qwen_tools_template =
+    \\{%- if tools and tools is iterable and tools is not mapping -%}
+    \\<|im_start|>system
+    \\# Tools
+    \\
+    \\<tools>
+    \\{%- for tool in tools %}
+    \\{{ tool | tojson }}
+    \\{%- endfor %}
+    \\</tools>
+    \\<|im_end|>
+    \\{%- endif -%}
+    \\{%- for message in messages -%}
+    \\<|im_start|>{{ message.role }}
+    \\{{ message.content }}<|im_end|>
+    \\{%- endfor -%}
+    \\{%- if enable_thinking -%}
+    \\<|im_start|>assistant
+    \\<think>
+    \\{% else -%}
+    \\<|im_start|>assistant
+    \\{% endif -%}
+;
+
+const tool_messages_json =
+    \\[{"role": "user", "content": "What is the weather in San Francisco?"}]
+;
+
+const tool_context_json =
+    \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
+;
+
 test "renderWithContext tools context produces valid UTF-8" {
     const allocator = std.testing.allocator;
 
-    // Minimal Qwen-style template that uses tools
-    const template =
-        \\{%- if tools and tools is iterable and tools is not mapping -%}
-        \\<|im_start|>system
-        \\# Tools
-        \\
-        \\<tools>
-        \\{%- for tool in tools %}
-        \\{{ tool | tojson }}
-        \\{%- endfor %}
-        \\</tools>
-        \\<|im_end|>
-        \\{%- endif -%}
-        \\{%- for message in messages -%}
-        \\<|im_start|>{{ message.role }}
-        \\{{ message.content }}<|im_end|>
-        \\{%- endfor -%}
-        \\<|im_start|>assistant
-        \\
-    ;
-
-    const messages_json =
-        \\[{"role": "user", "content": "What is the area?"}]
-    ;
-
-    // Build context with tools (same as buildEffectiveContext)
     const extra_context =
         \\{"enable_thinking": true, "tools": [{"type":"function","name":"calc_area","description":"Calc area","parameters":{"type":"object","properties":{"base":{"type":"number"}},"required":["base"]}}]}
     ;
 
     const result = try renderWithContext(
         allocator,
-        template,
-        messages_json,
+        qwen_tools_template,
+        tool_messages_json,
         "",
         "",
         true,
@@ -739,12 +746,54 @@ test "renderWithContext tools context produces valid UTF-8" {
     );
     defer allocator.free(result);
 
-    // Output must be valid UTF-8
     try std.testing.expect(std.unicode.utf8ValidateSlice(result));
-
-    // Should contain tool definition
     try std.testing.expect(std.mem.indexOf(u8, result, "calc_area") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "weather") != null);
+}
 
-    // Should contain the user message
-    try std.testing.expect(std.mem.indexOf(u8, result, "What is the area?") != null);
+test "renderWithContext tools with thinking disabled" {
+    // Regression: tools + enable_thinking=false (max_reasoning_tokens=0)
+    // triggered "double free or corruption (out)".
+    const allocator = std.testing.allocator;
+
+    const extra_context = "{\"enable_thinking\": false, \"tools\": " ++ tool_context_json ++ "}";
+
+    const result = try renderWithContext(
+        allocator,
+        qwen_tools_template,
+        tool_messages_json,
+        "",
+        "",
+        true,
+        extra_context,
+    );
+    defer allocator.free(result);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+    // Should contain tool definition
+    try std.testing.expect(std.mem.indexOf(u8, result, "get_weather") != null);
+    // Should NOT contain <think> tag (thinking disabled)
+    try std.testing.expect(std.mem.indexOf(u8, result, "<think>") == null);
+}
+
+test "renderWithContext tools with thinking enabled" {
+    const allocator = std.testing.allocator;
+
+    const extra_context = "{\"enable_thinking\": true, \"tools\": " ++ tool_context_json ++ "}";
+
+    const result = try renderWithContext(
+        allocator,
+        qwen_tools_template,
+        tool_messages_json,
+        "",
+        "",
+        true,
+        extra_context,
+    );
+    defer allocator.free(result);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+    try std.testing.expect(std.mem.indexOf(u8, result, "get_weather") != null);
+    // Should contain <think> tag (thinking enabled)
+    try std.testing.expect(std.mem.indexOf(u8, result, "<think>") != null);
 }

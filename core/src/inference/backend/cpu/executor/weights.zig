@@ -15,6 +15,7 @@ const cpu_linalg = compute.cpu.linalg;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_copy = compute.cpu.memory.copy;
 const cpu_layout = compute.cpu.layout;
+const cpu_common = compute.cpu.common;
 const layer_ops = @import("../../../../models/layer_ops.zig");
 const fmt = @import("../kernels/describe_fmt.zig");
 const runtime_mod = @import("runtime.zig");
@@ -1930,8 +1931,8 @@ test "ScratchBuffer: ensure allocates layer_tmp correctly" {
     // Expected buffer length: seq_len * compiler/plan-provided width hint.
     const expected_buffer_len = seq_len * max_dim;
 
-    // layer_tmp (slot 0) should be allocated to registered layout size.
-    try std.testing.expectEqual(expected_buffer_len, scratch.tmp[0].len);
+    // layer_tmp (slot 0) should be allocated to registered layout size + guard zone.
+    try std.testing.expectEqual(expected_buffer_len + cpu_common.GUARD_F32S, scratch.tmp[0].len);
 }
 
 test "ScratchBuffer: ensure allocates layer_tmp before layout registration" {
@@ -1947,7 +1948,7 @@ test "ScratchBuffer: ensure allocates layer_tmp before layout registration" {
     // Model.forward consumes tmp[0] even before per-block register layouts are
     // registered. Ensure must allocate layer_tmp in this state.
     try scratch.ensure(seq_len);
-    try std.testing.expectEqual(seq_len * d_model, scratch.tmp[0].len);
+    try std.testing.expectEqual(seq_len * d_model + cpu_common.GUARD_F32S, scratch.tmp[0].len);
 }
 
 test "ScratchBuffer: ensure handles fused projection size (2x d_ff)" {
@@ -1967,7 +1968,7 @@ test "ScratchBuffer: ensure handles fused projection size (2x d_ff)" {
 
     // With d_ff * 2 > d_model, registered layout width should drive sizing.
     const expected_buffer_len = seq_len * (d_ff * 2);
-    try std.testing.expectEqual(expected_buffer_len, scratch.tmp[0].len);
+    try std.testing.expectEqual(expected_buffer_len + cpu_common.GUARD_F32S, scratch.tmp[0].len);
 }
 
 test "ScratchBuffer: ensure is idempotent" {

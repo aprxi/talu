@@ -270,9 +270,17 @@ fn buildEffectiveContext(allocator: std.mem.Allocator, opts: GenerateOptions) !?
 
     const val: []const u8 = if (enable_thinking) "true" else "false";
 
-    // Build tools fragment if present.
-    const tools_fragment: ?[]const u8 = if (opts.tools_json) |tj|
-        try std.fmt.allocPrint(allocator, ", \"tools\": {s}", .{tj})
+    // Normalize and build tools fragment if present.
+    // Flat-format tools ({"type":"function","name":...}) are converted to nested
+    // OpenAI format ({"type":"function","function":{"name":...}}) so the template
+    // renders the structure the model was trained on.
+    const normalized_tools: ?[]const u8 = if (opts.tools_json) |tj|
+        try tool_schema_mod.normalizeToolsJson(allocator, tj)
+    else
+        null;
+    defer if (normalized_tools) |nt| allocator.free(nt);
+    const tools_fragment: ?[]const u8 = if (normalized_tools) |nt|
+        try std.fmt.allocPrint(allocator, ", \"tools\": {s}", .{nt})
     else
         null;
     defer if (tools_fragment) |tf| allocator.free(tf);
@@ -2202,4 +2210,53 @@ test "buildEffectiveContext merges with existing extra_context_json" {
     defer if (ctx) |c| allocator.free(c);
     try std.testing.expect(ctx != null);
     try std.testing.expectEqualStrings("{\"tools\": [], \"enable_thinking\": true }", ctx.?);
+}
+
+test "buildEffectiveContext normalizes flat tools to nested" {
+    const allocator = std.testing.allocator;
+    const flat_tools =
+        \\[{"type":"function","name":"calc","parameters":{"type":"object"}}]
+    ;
+    const ctx = try buildEffectiveContext(allocator, GenerateOptions{
+        .tools_json = flat_tools,
+    });
+    defer if (ctx) |c| allocator.free(c);
+    try std.testing.expect(ctx != null);
+    // The context must contain the nested "function" wrapper.
+    const result = ctx.?;
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"function\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"calc\"") != null);
+}
+
+test "buildEffectiveContext flat tools with thinking disabled" {
+    const allocator = std.testing.allocator;
+    const flat_tools =
+        \\[{"type":"function","name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]
+    ;
+    const ctx = try buildEffectiveContext(allocator, GenerateOptions{
+        .tools_json = flat_tools,
+        .max_reasoning_tokens = 0,
+    });
+    defer if (ctx) |c| allocator.free(c);
+    try std.testing.expect(ctx != null);
+    const result = ctx.?;
+    // Must have enable_thinking: false AND nested tool format.
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"function\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"get_weather\"") != null);
+}
+
+test "buildEffectiveContext preserves nested tools" {
+    const allocator = std.testing.allocator;
+    const nested_tools =
+        \\[{"type":"function","function":{"name":"calc","parameters":{"type":"object"}}}]
+    ;
+    const ctx = try buildEffectiveContext(allocator, GenerateOptions{
+        .tools_json = nested_tools,
+    });
+    defer if (ctx) |c| allocator.free(c);
+    try std.testing.expect(ctx != null);
+    const result = ctx.?;
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"function\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"calc\"") != null);
 }

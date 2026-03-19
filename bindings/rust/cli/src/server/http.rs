@@ -436,6 +436,39 @@ impl Service<Request<Incoming>> for Router {
                 (Method::GET, "/assets/main.js") => {
                     serve_ui_asset(&state, "main.js", "application/javascript")
                 }
+                (Method::GET, p)
+                    if p == "/bench"
+                        || p == "/bench/"
+                        || p == "/bench/index.html"
+                        || p.starts_with("/bench/") =>
+                {
+                    let mut resp = serve_ui_asset(
+                        &state,
+                        "bench/index.html",
+                        "text/html; charset=utf-8",
+                    );
+                    if resp.status() == StatusCode::OK {
+                        resp.headers_mut().insert(
+                            "content-security-policy",
+                            hyper::header::HeaderValue::from_static(
+                                "default-src 'self'; \
+                                 script-src 'self' 'unsafe-inline'; \
+                                 style-src 'self' 'unsafe-inline'; \
+                                 connect-src 'self'; \
+                                 img-src 'self' data: blob:; \
+                                 font-src 'self'; \
+                                 media-src 'self' blob:; \
+                                 object-src 'none'; \
+                                 frame-src 'none'",
+                            ),
+                        );
+                        resp.headers_mut().insert(
+                            "referrer-policy",
+                            hyper::header::HeaderValue::from_static("no-referrer"),
+                        );
+                    }
+                    resp
+                }
                 // Plugin assets (auth-exempt — JS loads before auth context exists)
                 (Method::GET, p)
                     if (p.starts_with("/v1/plugins/") || p.starts_with("/plugins/"))

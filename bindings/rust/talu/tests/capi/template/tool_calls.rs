@@ -218,3 +218,61 @@ fn tools_with_generation_prompt() {
         &result[result.len().saturating_sub(60)..],
     );
 }
+
+// ===========================================================================
+// Flat → nested tool format normalization
+// ===========================================================================
+
+/// Flat-format tools (our API format) must produce the same template output
+/// as nested OpenAI format, since the model was trained on nested format.
+///
+/// The server normalizes flat → nested in `buildEffectiveContext` before
+/// passing tools to the template.  This test verifies that the *nested*
+/// format renders the expected `<tools>` block content — i.e. the structure
+/// the model was trained on.
+#[test]
+fn nested_format_tools_render_function_key() {
+    let vars = r#"{
+        "messages": [{"role": "user", "content": "Hello"}],
+        "tools": [
+            {"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}
+        ],
+        "add_generation_prompt": true
+    }"#;
+    let result = render_template(QWEN35_TOOLS_TEMPLATE, vars, false).unwrap();
+    // Template renders `{{ tool | tojson }}` which includes the nested "function" key.
+    assert!(
+        result.contains("\"function\""),
+        "nested format must contain \"function\" key in rendered output, got: {result:?}"
+    );
+    assert!(
+        result.contains("get_weather"),
+        "must contain tool name"
+    );
+}
+
+/// Flat-format tools render WITHOUT the "function" wrapper — confirming that
+/// the template does NOT normalize on its own.  The engine must normalize
+/// before the template sees the tools.
+#[test]
+fn flat_format_tools_lack_function_wrapper() {
+    let vars = r#"{
+        "messages": [{"role": "user", "content": "Hello"}],
+        "tools": [
+            {"type": "function", "name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
+        ],
+        "add_generation_prompt": true
+    }"#;
+    let result = render_template(QWEN35_TOOLS_TEMPLATE, vars, false).unwrap();
+    // Without normalization the template renders flat JSON (no "function" wrapper).
+    assert!(
+        result.contains("get_weather"),
+        "flat format must still contain tool name"
+    );
+    // The rendered JSON has "name" at the top level (flat), not nested under
+    // a "function" key.  `"function": {` would indicate the nested wrapper.
+    assert!(
+        !result.contains("\"function\": {") && !result.contains("\"function\":{"),
+        "flat format must NOT contain nested \"function\" wrapper (template doesn't normalize), got: {result:?}"
+    );
+}

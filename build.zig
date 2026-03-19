@@ -866,6 +866,10 @@ pub fn build(b: *std.Build) void {
         "TableAdapter",
         "responses",
         "storage",
+        "toolsToGrammarSchema",
+        "normalizeToolsJson",
+        "generateCallId",
+        "parseToolCall",
     });
     ut.addLazy("converter", b.path("core/src/lib.zig"), &.{
         "QuantConfig",

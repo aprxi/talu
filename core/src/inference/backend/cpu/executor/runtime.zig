@@ -256,9 +256,66 @@ pub const ScratchBuffer = struct {
             const keep_len = @max(decode_target_len * keep_factor, width_hint);
             cpu_common.freeAligned64F32Slice(self.allocator, temp_slice.*);
             temp_slice.* = &.{};
-            const aligned = try self.allocator.alignedAlloc(f32, .@"64", keep_len);
-            temp_slice.* = aligned;
+            try cpu_common.ensureAligned64F32Slice(self.allocator, temp_slice, keep_len);
         }
+    }
+
+    /// Verify guard zones on all scratch buffers. Panics with the offending
+    /// buffer name and layer index when an overflow is detected.
+    /// Zero-cost when cpu_common.heap_debug is false.
+    pub fn verifyAllGuardZones(self: *const ScratchBuffer, layer_idx: usize) void {
+        if (!cpu_common.heap_debug) return;
+
+        for (self.tmp, 0..) |temp_slice, idx| {
+            if (!self.tmp_slot_active[idx]) continue;
+            if (!cpu_common.verifyF32Guard(temp_slice)) {
+                // Print corruption details before panicking.
+                const guard_start = temp_slice.len - cpu_common.GUARD_F32S;
+                std.debug.print("\n=== GUARD ZONE CORRUPTION ===\n", .{});
+                std.debug.print("scratch.tmp[{d}] after layer {d}\n", .{ idx, layer_idx });
+                std.debug.print("buf.len={d} guard_start={d} ptr=0x{x}\n", .{
+                    temp_slice.len,
+                    guard_start,
+                    @intFromPtr(temp_slice.ptr),
+                });
+                for (0..cpu_common.GUARD_F32S) |gi| {
+                    const val: u32 = @bitCast(temp_slice[guard_start + gi]);
+                    if (val != cpu_common.GUARD_PATTERN) {
+                        std.debug.print("  [guard+{d}] = 0x{x:0>8} (f32={d:.6})\n", .{
+                            gi,
+                            val,
+                            temp_slice[guard_start + gi],
+                        });
+                    }
+                }
+                std.debug.print("=== END ===\n", .{});
+                std.debug.panic("heap_debug: scratch.tmp[{d}] overflow after layer {d}", .{ idx, layer_idx });
+            }
+        }
+
+        const as = &self.attn_scratch;
+        if (!cpu_common.verifyF32Guard(as.q))
+            std.debug.panic("heap_debug: attn_scratch.q overflow after layer {d}", .{layer_idx});
+        if (!cpu_common.verifyF32Guard(as.k))
+            std.debug.panic("heap_debug: attn_scratch.k overflow after layer {d}", .{layer_idx});
+        if (!cpu_common.verifyF32Guard(as.v))
+            std.debug.panic("heap_debug: attn_scratch.v overflow after layer {d}", .{layer_idx});
+        if (!cpu_common.verifyF32Guard(as.qkv))
+            std.debug.panic("heap_debug: attn_scratch.qkv overflow after layer {d}", .{layer_idx});
+        if (!cpu_common.verifyF32Guard(as.scores))
+            std.debug.panic("heap_debug: attn_scratch.scores overflow after layer {d}", .{layer_idx});
+        if (!cpu_common.verifyF32Guard(as.context_values))
+            std.debug.panic("heap_debug: attn_scratch.context_values overflow after layer {d}", .{layer_idx});
+
+        const fs = &self.ffn_scratch;
+        if (!cpu_common.verifyF32Guard(fs.gate))
+            std.debug.panic("heap_debug: ffn_scratch.gate overflow after layer {d}", .{layer_idx});
+        if (!cpu_common.verifyF32Guard(fs.gate_act))
+            std.debug.panic("heap_debug: ffn_scratch.gate_act overflow after layer {d}", .{layer_idx});
+        if (!cpu_common.verifyF32Guard(fs.up))
+            std.debug.panic("heap_debug: ffn_scratch.up overflow after layer {d}", .{layer_idx});
+        if (!cpu_common.verifyF32Guard(fs.hidden))
+            std.debug.panic("heap_debug: ffn_scratch.hidden overflow after layer {d}", .{layer_idx});
     }
 
     pub fn ensureForMode(self: *ScratchBuffer, mode: runtime_contract.ExecutionMode, seq_len: usize) !void {

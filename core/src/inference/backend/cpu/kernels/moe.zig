@@ -868,17 +868,17 @@ test "forward scratch buffer" {
 
     // Test allocation
     try cpu_common.ensureF32Slice(alloc, &scratch.router_logits, 10);
-    try std.testing.expectEqual(@as(usize, 10), scratch.router_logits.len);
+    try std.testing.expectEqual(@as(usize, 10 + cpu_common.GUARD_F32S), scratch.router_logits.len);
 
     // Test no reallocation when sufficient
     const ptr = scratch.router_logits.ptr;
     try cpu_common.ensureF32Slice(alloc, &scratch.router_logits, 5);
-    try std.testing.expectEqual(@as(usize, 10), scratch.router_logits.len);
+    try std.testing.expectEqual(@as(usize, 10 + cpu_common.GUARD_F32S), scratch.router_logits.len);
     try std.testing.expectEqual(ptr, scratch.router_logits.ptr);
 
     // Test reallocation when needed
     try cpu_common.ensureF32Slice(alloc, &scratch.router_logits, 20);
-    try std.testing.expectEqual(@as(usize, 20), scratch.router_logits.len);
+    try std.testing.expectEqual(@as(usize, 20 + cpu_common.GUARD_F32S), scratch.router_logits.len);
 }
 
 test "forward top-k tie breaking" {
@@ -970,13 +970,13 @@ test "deinit frees scratch buffers" {
     try cpu_common.ensureF32Slice(alloc, &scratch.gate_up_values, 150);
     try cpu_common.ensureF32Slice(alloc, &scratch.hidden_values, 75);
 
-    // Verify buffers are allocated
-    try std.testing.expectEqual(@as(usize, 100), scratch.router_logits.len);
-    try std.testing.expectEqual(@as(usize, 50), scratch.expert_weights.len);
+    // Verify buffers are allocated (f32 buffers include guard zone, u32 does not).
+    try std.testing.expectEqual(@as(usize, 100 + cpu_common.GUARD_F32S), scratch.router_logits.len);
+    try std.testing.expectEqual(@as(usize, 50 + cpu_common.GUARD_F32S), scratch.expert_weights.len);
     try std.testing.expectEqual(@as(usize, 50), scratch.expert_indices.len);
-    try std.testing.expectEqual(@as(usize, 200), scratch.expert_outputs.len);
-    try std.testing.expectEqual(@as(usize, 150), scratch.gate_up_values.len);
-    try std.testing.expectEqual(@as(usize, 75), scratch.hidden_values.len);
+    try std.testing.expectEqual(@as(usize, 200 + cpu_common.GUARD_F32S), scratch.expert_outputs.len);
+    try std.testing.expectEqual(@as(usize, 150 + cpu_common.GUARD_F32S), scratch.gate_up_values.len);
+    try std.testing.expectEqual(@as(usize, 75 + cpu_common.GUARD_F32S), scratch.hidden_values.len);
 
     // Call deinit
     scratch.deinit(alloc);

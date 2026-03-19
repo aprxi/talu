@@ -1,0 +1,8 @@
+{
+  "requests": 200,
+  "concurrency": 8,
+  "batch_size": 100,
+  "seed_rows": 500,
+  "scan_limit": 100,
+  "env": {}
+}

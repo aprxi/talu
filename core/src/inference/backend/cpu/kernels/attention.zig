@@ -2849,10 +2849,10 @@ test "MultiHeadAttention.ensureTemp: allocates buffers on first call" {
 
     try mha.ensureTemp(&scratch, sequence_len, false, query_dim, kv_total_dim, false);
 
-    // Verify buffers are allocated
-    try std.testing.expectEqual(sequence_len * query_dim, scratch.q.len);
-    try std.testing.expectEqual(sequence_len * kv_total_dim, scratch.k.len);
-    try std.testing.expectEqual(sequence_len * kv_total_dim, scratch.v.len);
+    // Verify buffers are allocated (includes guard zone from ensureF32Slice).
+    try std.testing.expectEqual(sequence_len * query_dim + cpu_common.GUARD_F32S, scratch.q.len);
+    try std.testing.expectEqual(sequence_len * kv_total_dim + cpu_common.GUARD_F32S, scratch.k.len);
+    try std.testing.expectEqual(sequence_len * kv_total_dim + cpu_common.GUARD_F32S, scratch.v.len);
     try std.testing.expectEqual(@as(usize, 0), scratch.qkv.len); // Not using fused
     try std.testing.expect(scratch.scores.len > 0);
     try std.testing.expect(scratch.context_values.len > 0);
@@ -2953,7 +2953,7 @@ test "MultiHeadAttention.ensureTemp: allocates fused qkv buffer when needed" {
 
     // QKV buffer should be allocated (2x size for temporary + rearranged)
     const expected_qkv_size = 2 * sequence_len * (query_dim + 2 * kv_total_dim);
-    try std.testing.expectEqual(expected_qkv_size, scratch.qkv.len);
+    try std.testing.expectEqual(expected_qkv_size + cpu_common.GUARD_F32S, scratch.qkv.len);
 }
 
 test "MultiHeadAttention.ensureTemp: decode mode allocates correct scores size" {
@@ -2984,7 +2984,7 @@ test "MultiHeadAttention.ensureTemp: decode mode allocates correct scores size" 
 
     // Scores should be sized for n_heads * max_seq_len
     const expected_scores = 4 * max_seq;
-    try std.testing.expectEqual(expected_scores, scratch.scores.len);
+    try std.testing.expectEqual(expected_scores + cpu_common.GUARD_F32S, scratch.scores.len);
 }
 
 // =============================================================================

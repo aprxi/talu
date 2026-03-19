@@ -94,7 +94,7 @@ def _build_body(sample: dict, uri: str, config: dict) -> dict:
     return body
 
 
-def _score_fn(raw: str, sample: dict) -> dict:
+def _score_fn(raw: str, sample: dict, events: list[dict] | None = None) -> dict:
     """Score a single IFEval response using instruction checkers."""
     instruction_ids = sample["instruction_id_list"]
     kwargs_list = sample["kwargs"]

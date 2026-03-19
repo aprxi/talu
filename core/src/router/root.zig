@@ -189,6 +189,7 @@ pub const toolsToGrammarSchema = tool_schema.toolsToGrammarSchema;
 pub const generateCallId = tool_schema.generateCallId;
 pub const parseToolCall = tool_schema.parseToolCall;
 pub const parseToolCallsFromText = tool_schema.parseToolCallsFromText;
+pub const normalizeToolsJson = tool_schema.normalizeToolsJson;
 pub const ParsedToolCall = tool_schema.ParsedToolCall;
 pub const ToolSchemaError = tool_schema.ToolSchemaError;
 

@@ -1014,10 +1014,10 @@ test "FfnScratch deinit cleanup" {
     try cpu_common.ensureF32Slice(allocator, &scratch.up, 100);
     try cpu_common.ensureF32Slice(allocator, &scratch.hidden, 100);
 
-    try std.testing.expect(scratch.gate.len == 100);
-    try std.testing.expect(scratch.gate_act.len == 100);
-    try std.testing.expect(scratch.up.len == 100);
-    try std.testing.expect(scratch.hidden.len == 100);
+    try std.testing.expect(scratch.gate.len == 100 + cpu_common.GUARD_F32S);
+    try std.testing.expect(scratch.gate_act.len == 100 + cpu_common.GUARD_F32S);
+    try std.testing.expect(scratch.up.len == 100 + cpu_common.GUARD_F32S);
+    try std.testing.expect(scratch.hidden.len == 100 + cpu_common.GUARD_F32S);
 
     scratch.deinit(allocator);
 
@@ -1033,15 +1033,15 @@ test "SwiGLU.forward ensureSlice buffer growth" {
     var storage: []f32 = &.{};
 
     try cpu_common.ensureF32Slice(allocator, &storage, 10);
-    try std.testing.expectEqual(@as(usize, 10), storage.len);
+    try std.testing.expectEqual(@as(usize, 10 + cpu_common.GUARD_F32S), storage.len);
 
     // Request larger size - should reallocate
     try cpu_common.ensureF32Slice(allocator, &storage, 20);
-    try std.testing.expectEqual(@as(usize, 20), storage.len);
+    try std.testing.expectEqual(@as(usize, 20 + cpu_common.GUARD_F32S), storage.len);
 
     // Request smaller size - should keep existing buffer
     try cpu_common.ensureF32Slice(allocator, &storage, 15);
-    try std.testing.expectEqual(@as(usize, 20), storage.len);
+    try std.testing.expectEqual(@as(usize, 20 + cpu_common.GUARD_F32S), storage.len);
 
     allocator.free(storage);
 }
