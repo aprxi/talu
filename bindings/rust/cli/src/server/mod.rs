@@ -163,6 +163,8 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     if args.max_file_upload_bytes == 0 {
         bail!("--max-file-upload-bytes must be greater than zero");
     }
+    tokenizer::validate_path_source_policy_env()
+        .map_err(|e| anyhow::anyhow!("invalid tokenizer path-source policy configuration: {e}"))?;
 
     let model = args.model.clone();
     let profile = args.profile.clone();

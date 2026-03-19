@@ -23,6 +23,7 @@ use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
+type TokenizerInstanceHandle = Arc<tokio::sync::Mutex<TokenizerInstance>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenizerBackend {
@@ -220,6 +221,8 @@ struct EncodeRequest {
     return_fields: Option<ReturnFields>,
     #[serde(default)]
     benchmark: Option<bool>,
+    #[serde(default)]
+    include_hash: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,6 +239,8 @@ struct EncodeBatchRequest {
     return_fields: Option<ReturnFields>,
     #[serde(default)]
     benchmark: Option<bool>,
+    #[serde(default)]
+    include_hash: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,6 +278,17 @@ struct ReturnFields {
 }
 
 impl ReturnFields {
+    fn ids_only() -> Self {
+        Self {
+            ids: Some(true),
+            tokens: Some(false),
+            type_ids: Some(false),
+            attention_mask: Some(false),
+            special_tokens_mask: Some(false),
+            offsets: Some(false),
+        }
+    }
+
     fn include_ids(&self) -> bool {
         self.ids.unwrap_or(true)
     }
@@ -483,7 +499,8 @@ struct EncodingPayload {
 #[derive(Debug, Serialize)]
 struct EncodeResponse {
     encoding: EncodingPayload,
-    sha256_ids: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256_ids: Option<String>,
     #[serde(rename = "impl")]
     impl_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -511,7 +528,8 @@ struct BatchEncodingPayload {
 #[derive(Debug, Serialize)]
 struct EncodeBatchResponse {
     batch_encoding: BatchEncodingPayload,
-    sha256_ids_batch: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256_ids_batch: Option<Vec<String>>,
     #[serde(rename = "impl")]
     impl_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -526,6 +544,37 @@ struct MutableEncoding {
     attention_mask: Vec<u32>,
     special_tokens_mask: Vec<u32>,
     offsets: Vec<[u32; 2]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EncodeBuildFlags {
+    include_tokens: bool,
+    include_type_ids: bool,
+    include_attention_mask: bool,
+    include_special_tokens_mask: bool,
+    include_offsets: bool,
+}
+
+impl EncodeBuildFlags {
+    fn from_return_fields(return_fields: &ReturnFields) -> Self {
+        Self {
+            include_tokens: return_fields.include_tokens(),
+            include_type_ids: return_fields.include_type_ids(),
+            include_attention_mask: return_fields.include_attention_mask(),
+            include_special_tokens_mask: return_fields.include_special_tokens_mask(),
+            include_offsets: return_fields.include_offsets(),
+        }
+    }
+}
+
+fn ids_only_build_flags() -> EncodeBuildFlags {
+    EncodeBuildFlags {
+        include_tokens: false,
+        include_type_ids: false,
+        include_attention_mask: false,
+        include_special_tokens_mask: false,
+        include_offsets: false,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -559,10 +608,15 @@ pub async fn handle_create_instance(
         Some(v) => v,
         None => {
             return json_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 "unsupported_backend",
                 "backend must be one of: tokenizers, talu",
-                Some(json!({ "field": "backend" })),
+                Some(json!({
+                    "field": "backend",
+                    "reason": "unsupported_backend",
+                    "expected": "one of: tokenizers, talu",
+                    "endpoint": "/v1/tokenizer/instances"
+                })),
             )
         }
     };
@@ -577,6 +631,12 @@ pub async fn handle_create_instance(
             "source.kind must be one of: path, json",
             Some(json!({ "field": "source.kind" })),
         );
+    }
+
+    if source_kind == "path" {
+        if let Err(resp) = enforce_path_source_policy(&source_value) {
+            return resp;
+        }
     }
 
     let (tokenizer_id, tokenizer_sha256, vocab_size, instance) = {
@@ -649,7 +709,10 @@ pub async fn handle_create_instance(
     };
 
     let mut instances = state.tokenizer_instances.lock().await;
-    instances.insert(tokenizer_id.clone(), instance);
+    instances.insert(
+        tokenizer_id.clone(),
+        Arc::new(tokio::sync::Mutex::new(instance)),
+    );
 
     json_response(
         StatusCode::OK,
@@ -679,15 +742,18 @@ pub async fn handle_get_instance(
         }
     };
 
-    let instances = state.tokenizer_instances.lock().await;
-    let Some(instance) = instances.get(tokenizer_id) else {
-        return json_error(
-            StatusCode::NOT_FOUND,
-            "tokenizer_not_found",
-            "tokenizer instance not found",
-            Some(json!({ "tokenizer_id": tokenizer_id })),
-        );
+    let instance_handle = match find_tokenizer_instance(&state, tokenizer_id).await {
+        Some(handle) => handle,
+        None => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "tokenizer_not_found",
+                "tokenizer instance not found",
+                Some(json!({ "tokenizer_id": tokenizer_id })),
+            );
+        }
     };
+    let instance = instance_handle.lock().await;
 
     let truncation = instance.truncation.as_ref().map(|t| TruncationResponse {
         max_length: t.max_length,
@@ -761,6 +827,7 @@ pub async fn handle_encode(
     req: Request<Incoming>,
     _auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    let wants_binary = request_wants_binary_response(req.headers());
     let request: EncodeRequest = match parse_json_body(req).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -768,23 +835,20 @@ pub async fn handle_encode(
 
     if request.pair.as_ref().is_some_and(|v| !v.is_null()) {
         return json_error(
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported_option",
             "pair encoding is not supported by /v1/tokenizer/encode in this build",
-            Some(json!({ "field": "pair" })),
+            Some(json!({
+                "field": "pair",
+                "reason": "pair_encoding_unsupported",
+                "expected": "pair must be null or omitted",
+                "endpoint": "/v1/tokenizer/encode"
+            })),
         );
     }
 
-    if request.is_pretokenized.unwrap_or(false) {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_option",
-            "is_pretokenized=true is not supported",
-            Some(json!({ "field": "is_pretokenized" })),
-        );
-    }
-
-    let sequence = match normalize_input_sequence(&request.sequence) {
+    let is_pretokenized = request.is_pretokenized.unwrap_or(false);
+    let sequence = match normalize_input_sequence_with_mode(&request.sequence, is_pretokenized) {
         Ok(s) => s,
         Err(msg) => {
             return json_error(
@@ -797,14 +861,43 @@ pub async fn handle_encode(
     };
 
     let add_special_tokens = request.add_special_tokens.unwrap_or(true);
-    let return_fields = request.return_fields.unwrap_or_default();
+    let return_fields = request.return_fields.unwrap_or_else(|| {
+        if wants_binary {
+            ReturnFields::ids_only()
+        } else {
+            ReturnFields::default()
+        }
+    });
     let include_timing = request.benchmark.unwrap_or(false);
+    if wants_binary && request.include_hash == Some(true) {
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_option",
+            "include_hash=true is not supported for binary tokenizer responses",
+            Some(json!({
+                "field": "include_hash",
+                "endpoint": "/v1/tokenizer/encode"
+            })),
+        );
+    }
+    if wants_binary {
+        if let Err(resp) =
+            validate_binary_ids_only_return_fields(&return_fields, "/v1/tokenizer/encode")
+        {
+            return resp;
+        }
+    }
+    let include_hash = request.include_hash.unwrap_or(!wants_binary);
+    let build_flags = if wants_binary {
+        ids_only_build_flags()
+    } else {
+        EncodeBuildFlags::from_return_fields(&return_fields)
+    };
 
     let total_start = Instant::now();
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -814,11 +907,19 @@ pub async fn handle_encode(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
     let encode_start = Instant::now();
-    let mut encoding = match encode_one(instance, &sequence, add_special_tokens) {
+    let mut encoding = match encode_one(&mut instance, &sequence, add_special_tokens, build_flags) {
         Ok(v) => v,
-        Err(msg) => return json_error(StatusCode::BAD_REQUEST, "encode_failed", &msg, None),
+        Err(msg) => {
+            return json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "encode_failed",
+                &msg,
+                Some(json!({ "endpoint": "/v1/tokenizer/encode" })),
+            )
+        }
     };
 
     if let Some(config) = instance.padding.clone() {
@@ -827,8 +928,40 @@ pub async fn handle_encode(
 
     let encode_ms = elapsed_ms(encode_start);
     let total_ms = elapsed_ms(total_start);
-    let payload = encoding_payload_from_mutable(&encoding, &return_fields);
-    let sha256_ids = sha256_ids(&encoding.ids);
+    if wants_binary {
+        let ids_count = encoding.ids.len();
+        let body = encode_ids_binary_v1(&encoding.ids);
+
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/octet-stream")
+            .header("x-talu-binary-format", "ids_le_u32_v1")
+            .header("x-talu-ids-count", ids_count.to_string())
+            .header(
+                "x-talu-impl",
+                format!("{}.encode", instance.backend.as_str()),
+            );
+
+        if include_timing {
+            response = response
+                .header("x-talu-timing-encode-ms", format!("{encode_ms:.3}"))
+                .header("x-talu-timing-total-ms", format!("{total_ms:.3}"));
+        }
+
+        return response
+            .body(Full::new(Bytes::from(body)).boxed())
+            .unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "failed to build binary tokenizer response",
+                    Some(json!({ "endpoint": "/v1/tokenizer/encode" })),
+                )
+            });
+    }
+
+    let sha256_ids = include_hash.then(|| sha256_ids(&encoding.ids));
+    let payload = encoding_payload_from_owned(encoding, &return_fields);
 
     json_response(
         StatusCode::OK,
@@ -849,21 +982,14 @@ pub async fn handle_encode_batch(
     req: Request<Incoming>,
     _auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    let wants_binary = request_wants_binary_response(req.headers());
     let request: EncodeBatchRequest = match parse_json_body(req).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
 
-    if request.is_pretokenized.unwrap_or(false) {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_option",
-            "is_pretokenized=true is not supported",
-            Some(json!({ "field": "is_pretokenized" })),
-        );
-    }
-
-    let inputs = match normalize_batch_inputs(&request.inputs) {
+    let is_pretokenized = request.is_pretokenized.unwrap_or(false);
+    let inputs = match normalize_batch_inputs_with_mode(&request.inputs, is_pretokenized) {
         Ok(v) => v,
         Err(msg) => {
             return json_error(
@@ -876,14 +1002,43 @@ pub async fn handle_encode_batch(
     };
 
     let add_special_tokens = request.add_special_tokens.unwrap_or(true);
-    let return_fields = request.return_fields.unwrap_or_default();
+    let return_fields = request.return_fields.unwrap_or_else(|| {
+        if wants_binary {
+            ReturnFields::ids_only()
+        } else {
+            ReturnFields::default()
+        }
+    });
     let include_timing = request.benchmark.unwrap_or(false);
+    if wants_binary && request.include_hash == Some(true) {
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_option",
+            "include_hash=true is not supported for binary tokenizer responses",
+            Some(json!({
+                "field": "include_hash",
+                "endpoint": "/v1/tokenizer/encode_batch"
+            })),
+        );
+    }
+    if wants_binary {
+        if let Err(resp) =
+            validate_binary_ids_only_return_fields(&return_fields, "/v1/tokenizer/encode_batch")
+        {
+            return resp;
+        }
+    }
+    let include_hash = request.include_hash.unwrap_or(!wants_binary);
+    let build_flags = if wants_binary {
+        ids_only_build_flags()
+    } else {
+        EncodeBuildFlags::from_return_fields(&return_fields)
+    };
 
     let total_start = Instant::now();
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -893,8 +1048,9 @@ pub async fn handle_encode_batch(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
-    let effective_padding = match build_effective_padding(instance, request.padding) {
+    let effective_padding = match build_effective_padding(&mut instance, request.padding) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -902,20 +1058,21 @@ pub async fn handle_encode_batch(
     let encode_start = Instant::now();
     let mut rows = Vec::with_capacity(inputs.len());
     for text in &inputs {
-        let encoding = match encode_one(instance, text, add_special_tokens) {
+        let encoding = match encode_one(&mut instance, text, add_special_tokens, build_flags) {
             Ok(v) => v,
-            Err(msg) => return json_error(StatusCode::BAD_REQUEST, "encode_failed", &msg, None),
+            Err(msg) => {
+                return json_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "encode_failed",
+                    &msg,
+                    Some(json!({ "endpoint": "/v1/tokenizer/encode_batch" })),
+                )
+            }
         };
         rows.push(encoding);
     }
 
-    // We need mutable rows for padding and payload output.
     let mut mutable_rows: Vec<MutableEncoding> = rows;
-
-    let lengths: Vec<usize> = mutable_rows
-        .iter()
-        .map(|row| row.attention_mask.iter().filter(|&&v| v != 0).count())
-        .collect();
 
     if let Some(config) = effective_padding.as_ref() {
         apply_padding_to_batch(&mut mutable_rows, config);
@@ -923,11 +1080,43 @@ pub async fn handle_encode_batch(
 
     let encode_ms = elapsed_ms(encode_start);
     let total_ms = elapsed_ms(total_start);
+    if wants_binary {
+        let num_sequences = mutable_rows.len();
+        let total_ids = mutable_rows.iter().map(|row| row.ids.len()).sum::<usize>();
+        let body = encode_batch_ids_binary_v1(&mutable_rows);
 
-    let encodings: Vec<EncodingPayload> = mutable_rows
-        .iter()
-        .map(|row| encoding_payload_from_mutable(row, &return_fields))
-        .collect();
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/octet-stream")
+            .header("x-talu-binary-format", "ids_batch_le_u32_v1")
+            .header("x-talu-num-sequences", num_sequences.to_string())
+            .header("x-talu-total-ids", total_ids.to_string())
+            .header(
+                "x-talu-impl",
+                format!("{}.encode_batch", instance.backend.as_str()),
+            );
+
+        if include_timing {
+            response = response
+                .header("x-talu-timing-encode-ms", format!("{encode_ms:.3}"))
+                .header("x-talu-timing-total-ms", format!("{total_ms:.3}"));
+        }
+
+        return response
+            .body(Full::new(Bytes::from(body)).boxed())
+            .unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "failed to build binary tokenizer batch response",
+                    Some(json!({ "endpoint": "/v1/tokenizer/encode_batch" })),
+                )
+            });
+    }
+
+    let lengths: Vec<usize> = mutable_rows.iter().map(|row| row.ids.len()).collect();
+
+    let num_sequences = mutable_rows.len();
 
     let input_ids = return_fields.include_ids().then(|| {
         mutable_rows
@@ -955,9 +1144,15 @@ pub async fn handle_encode_batch(
     });
 
     let total_tokens = lengths.iter().sum();
-    let sha256_ids_batch: Vec<String> = mutable_rows
-        .iter()
-        .map(|row| sha256_ids(&row.ids))
+    let sha256_ids_batch = include_hash.then(|| {
+        mutable_rows
+            .iter()
+            .map(|row| sha256_ids(&row.ids))
+            .collect::<Vec<_>>()
+    });
+    let encodings: Vec<EncodingPayload> = mutable_rows
+        .into_iter()
+        .map(|row| encoding_payload_from_owned(row, &return_fields))
         .collect();
 
     let (padding_side, pad_token_id) = if let Some(config) = effective_padding {
@@ -976,7 +1171,7 @@ pub async fn handle_encode_batch(
                 type_ids,
                 special_tokens_mask,
                 lengths,
-                num_sequences: mutable_rows.len(),
+                num_sequences,
                 total_tokens,
                 padding_side,
                 pad_token_id,
@@ -1003,9 +1198,8 @@ pub async fn handle_decode(
 
     let skip_special_tokens = request.skip_special_tokens.unwrap_or(false);
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1015,10 +1209,18 @@ pub async fn handle_decode(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
-    let text = match decode_ids_with_added_fallback(instance, &request.ids, skip_special_tokens) {
+    let text = match decode_ids(&mut instance, &request.ids, skip_special_tokens) {
         Ok(v) => v,
-        Err(msg) => return json_error(StatusCode::BAD_REQUEST, "decode_failed", &msg, None),
+        Err(msg) => {
+            return json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "decode_failed",
+                &msg,
+                Some(json!({ "endpoint": "/v1/tokenizer/decode" })),
+            )
+        }
     };
 
     json_response(StatusCode::OK, &json!({ "text": text }))
@@ -1036,9 +1238,8 @@ pub async fn handle_decode_batch(
 
     let skip_special_tokens = request.skip_special_tokens.unwrap_or(false);
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1048,12 +1249,20 @@ pub async fn handle_decode_batch(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
     let mut texts = Vec::with_capacity(request.ids_batch.len());
     for ids in &request.ids_batch {
-        let text = match decode_ids_with_added_fallback(instance, ids, skip_special_tokens) {
+        let text = match decode_ids(&mut instance, ids, skip_special_tokens) {
             Ok(v) => v,
-            Err(msg) => return json_error(StatusCode::BAD_REQUEST, "decode_failed", &msg, None),
+            Err(msg) => {
+                return json_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "decode_failed",
+                    &msg,
+                    Some(json!({ "endpoint": "/v1/tokenizer/decode_batch" })),
+                )
+            }
         };
         texts.push(text);
     }
@@ -1083,9 +1292,8 @@ pub async fn handle_vocab(
         }
     };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1095,6 +1303,7 @@ pub async fn handle_vocab(
             )
         }
     };
+    let instance = instance_handle.lock().await;
 
     // SAFETY: tokenizer handle is valid while instance is held.
     let vocab = unsafe { talu_sys::talu_tokenizer_get_vocab(instance.handle.as_ptr()) };
@@ -1158,9 +1367,8 @@ pub async fn handle_vocab_size(
         .map(|v| v == "true")
         .unwrap_or(true);
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1170,6 +1378,7 @@ pub async fn handle_vocab_size(
             )
         }
     };
+    let instance = instance_handle.lock().await;
 
     // SAFETY: tokenizer handle is valid while instance is held.
     let base_vocab_size =
@@ -1199,9 +1408,8 @@ pub async fn handle_token_to_id(
         Err(resp) => return resp,
     };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1211,6 +1419,7 @@ pub async fn handle_token_to_id(
             )
         }
     };
+    let instance = instance_handle.lock().await;
 
     if let Some(added) = instance
         .added_tokens
@@ -1246,9 +1455,8 @@ pub async fn handle_id_to_token(
         Err(resp) => return resp,
     };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1258,8 +1466,9 @@ pub async fn handle_id_to_token(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
-    let token = match id_to_token_with_added(instance, request.token_id) {
+    let token = match id_to_token_with_added(&mut instance, request.token_id) {
         Ok(v) => v,
         Err(msg) => return json_error(StatusCode::BAD_REQUEST, "invalid_request", &msg, None),
     };
@@ -1292,20 +1501,31 @@ pub async fn handle_enable_truncation(
 
     if request.stride.unwrap_or(0) != 0 {
         return json_error(
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported_option",
             "stride is not supported by this tokenizer backend",
-            Some(json!({ "field": "stride" })),
+            Some(json!({
+                "field": "stride",
+                "reason": "unsupported_option",
+                "expected": "stride must be 0 or omitted",
+                "endpoint": "/v1/tokenizer/enable_truncation"
+            })),
         );
     }
 
     if let Some(strategy) = request.strategy.as_deref() {
         if strategy != "longest_first" {
             return json_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 "unsupported_option",
                 "only strategy=longest_first is supported",
-                Some(json!({ "field": "strategy" })),
+                Some(json!({
+                    "field": "strategy",
+                    "reason": "unsupported_option",
+                    "expected": "strategy=longest_first",
+                    "got": strategy,
+                    "endpoint": "/v1/tokenizer/enable_truncation"
+                })),
             );
         }
     }
@@ -1323,9 +1543,8 @@ pub async fn handle_enable_truncation(
         }
     };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1335,6 +1554,7 @@ pub async fn handle_enable_truncation(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
     instance.truncation = Some(InstanceTruncationConfig {
         max_length: request.max_length,
@@ -1363,9 +1583,8 @@ pub async fn handle_disable_truncation(
         Err(resp) => return resp,
     };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1375,6 +1594,7 @@ pub async fn handle_disable_truncation(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
     instance.truncation = None;
     json_response(StatusCode::OK, &json!({ "ok": true }))
@@ -1412,9 +1632,8 @@ pub async fn handle_enable_padding(
         }
     };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1424,15 +1643,16 @@ pub async fn handle_enable_padding(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
-    let special = special_tokens(instance);
+    let special = special_tokens(&mut instance);
     let pad_id = request
         .pad_id
         .or_else(|| u32::try_from(special.pad_token_id).ok())
         .unwrap_or(0);
     let pad_token = match request.pad_token {
         Some(v) => v,
-        None => id_to_token(instance, i32::try_from(pad_id).unwrap_or(-1))
+        None => id_to_token(&mut instance, i32::try_from(pad_id).unwrap_or(-1))
             .unwrap_or_else(|_| "<PAD>".to_string()),
     };
 
@@ -1471,9 +1691,8 @@ pub async fn handle_disable_padding(
         Err(resp) => return resp,
     };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1483,6 +1702,7 @@ pub async fn handle_disable_padding(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
     instance.padding = None;
     json_response(StatusCode::OK, &json!({ "ok": true }))
@@ -1511,9 +1731,8 @@ pub async fn handle_add_tokens(
         );
     }
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1523,6 +1742,7 @@ pub async fn handle_add_tokens(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
     let mut added = 0usize;
     for token_req in request.tokens {
@@ -1538,11 +1758,11 @@ pub async fn handle_add_tokens(
             }
         };
 
-        if token_exists(instance, &parsed.content) {
+        if token_exists(&mut instance, &parsed.content) {
             continue;
         }
 
-        let id = next_added_token_id(instance);
+        let id = next_added_token_id(&instance);
         instance.added_tokens.push(AddedTokenEntry {
             content: parsed.content,
             id,
@@ -1559,7 +1779,7 @@ pub async fn handle_add_tokens(
         StatusCode::OK,
         &json!({
             "added": added,
-            "vocab_size": effective_vocab_size(instance)
+            "vocab_size": effective_vocab_size(&instance)
         }),
     )
 }
@@ -1614,9 +1834,8 @@ pub async fn handle_add_special_tokens(
         );
     }
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1626,13 +1845,14 @@ pub async fn handle_add_special_tokens(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
     let mut added = 0usize;
     for parsed in parsed_tokens {
-        if token_exists(instance, &parsed.content) {
+        if token_exists(&mut instance, &parsed.content) {
             continue;
         }
-        let id = next_added_token_id(instance);
+        let id = next_added_token_id(&instance);
         instance.added_tokens.push(AddedTokenEntry {
             content: parsed.content,
             id,
@@ -1649,7 +1869,7 @@ pub async fn handle_add_special_tokens(
         StatusCode::OK,
         &json!({
             "added": added,
-            "vocab_size": effective_vocab_size(instance)
+            "vocab_size": effective_vocab_size(&instance)
         }),
     )
 }
@@ -1669,9 +1889,8 @@ pub async fn handle_train(
         Err(msg) => return json_error(StatusCode::BAD_REQUEST, "invalid_request", &msg, None),
     };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1681,10 +1900,18 @@ pub async fn handle_train(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
-    let trained = match train_from_texts(instance, &texts, request.trainer.as_ref()) {
+    let trained = match train_from_texts(&mut instance, &texts, request.trainer.as_ref()) {
         Ok(v) => v,
-        Err(msg) => return json_error(StatusCode::BAD_REQUEST, "train_failed", &msg, None),
+        Err(msg) => {
+            return json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "train_failed",
+                &msg,
+                Some(json!({ "endpoint": "/v1/tokenizer/train" })),
+            )
+        }
     };
 
     json_response(
@@ -1693,7 +1920,7 @@ pub async fn handle_train(
             "trained": true,
             "added": trained.added_tokens,
             "added_special_tokens": trained.added_special_tokens,
-            "vocab_size": effective_vocab_size(instance)
+            "vocab_size": effective_vocab_size(&instance)
         }),
     )
 }
@@ -1713,9 +1940,8 @@ pub async fn handle_train_from_iterator(
         Err(msg) => return json_error(StatusCode::BAD_REQUEST, "invalid_request", &msg, None),
     };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1725,10 +1951,18 @@ pub async fn handle_train_from_iterator(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
-    let trained = match train_from_texts(instance, &texts, request.trainer.as_ref()) {
+    let trained = match train_from_texts(&mut instance, &texts, request.trainer.as_ref()) {
         Ok(v) => v,
-        Err(msg) => return json_error(StatusCode::BAD_REQUEST, "train_failed", &msg, None),
+        Err(msg) => {
+            return json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "train_failed",
+                &msg,
+                Some(json!({ "endpoint": "/v1/tokenizer/train_from_iterator" })),
+            )
+        }
     };
 
     json_response(
@@ -1737,7 +1971,7 @@ pub async fn handle_train_from_iterator(
             "trained": true,
             "added": trained.added_tokens,
             "added_special_tokens": trained.added_special_tokens,
-            "vocab_size": effective_vocab_size(instance)
+            "vocab_size": effective_vocab_size(&instance)
         }),
     )
 }
@@ -1752,9 +1986,8 @@ pub async fn handle_save(
         Err(resp) => return resp,
     };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let instance = match instances.get_mut(&request.tokenizer_id) {
-        Some(v) => v,
+    let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
+        Some(handle) => handle,
         None => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -1764,12 +1997,13 @@ pub async fn handle_save(
             )
         }
     };
+    let mut instance = instance_handle.lock().await;
 
-    let mut tokenizer_json = match load_tokenizer_json(instance) {
+    let mut tokenizer_json = match load_tokenizer_json(&instance) {
         Ok(v) => v,
         Err(msg) => {
             return json_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 "save_failed",
                 &msg,
                 Some(json!({ "tokenizer_id": request.tokenizer_id })),
@@ -1778,7 +2012,7 @@ pub async fn handle_save(
     };
 
     if let Err(msg) = merge_added_tokens_into_json(&mut tokenizer_json, &instance.added_tokens) {
-        return json_error(StatusCode::BAD_REQUEST, "save_failed", &msg, None);
+        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "save_failed", &msg, None);
     }
 
     let pretty = request.pretty.unwrap_or(false);
@@ -1787,7 +2021,7 @@ pub async fn handle_save(
             Ok(v) => v,
             Err(e) => {
                 return json_error(
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::UNPROCESSABLE_ENTITY,
                     "save_failed",
                     &format!("failed to serialize tokenizer JSON: {e}"),
                     None,
@@ -1799,7 +2033,7 @@ pub async fn handle_save(
             Ok(v) => v,
             Err(e) => {
                 return json_error(
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::UNPROCESSABLE_ENTITY,
                     "save_failed",
                     &format!("failed to serialize tokenizer JSON: {e}"),
                     None,
@@ -1810,35 +2044,60 @@ pub async fn handle_save(
 
     let save_path = match resolve_save_path(&request.path) {
         Ok(v) => v,
-        Err(msg) => return json_error(StatusCode::BAD_REQUEST, "save_failed", &msg, None),
+        Err(msg) => {
+            return json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "save_failed",
+                &msg,
+                Some(json!({
+                    "field": "path",
+                    "endpoint": "/v1/tokenizer/save"
+                })),
+            )
+        }
     };
 
     if save_path.exists() && !request.overwrite.unwrap_or(true) {
         return json_error(
-            StatusCode::BAD_REQUEST,
-            "save_failed",
+            StatusCode::CONFLICT,
+            "conflict",
             "target path already exists and overwrite=false",
-            Some(json!({ "path": save_path.to_string_lossy() })),
+            Some(json!({
+                "field": "path",
+                "reason": "path_exists_overwrite_false",
+                "got": save_path.to_string_lossy(),
+                "endpoint": "/v1/tokenizer/save"
+            })),
         );
     }
 
     if let Some(parent) = save_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return json_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 "save_failed",
                 &format!("failed to create parent directory: {e}"),
-                Some(json!({ "path": save_path.to_string_lossy() })),
+                Some(json!({
+                    "field": "path",
+                    "reason": "create_parent_failed",
+                    "got": save_path.to_string_lossy(),
+                    "endpoint": "/v1/tokenizer/save"
+                })),
             );
         }
     }
 
     if let Err(e) = std::fs::write(&save_path, &serialized) {
         return json_error(
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNPROCESSABLE_ENTITY,
             "save_failed",
             &format!("failed to write tokenizer JSON: {e}"),
-            Some(json!({ "path": save_path.to_string_lossy() })),
+            Some(json!({
+                "field": "path",
+                "reason": "write_failed",
+                "got": save_path.to_string_lossy(),
+                "endpoint": "/v1/tokenizer/save"
+            })),
         );
     }
 
@@ -1873,46 +2132,83 @@ pub async fn handle_compare(
 
     let add_special_tokens = request.add_special_tokens.unwrap_or(true);
     let window = request.window.unwrap_or(8);
+    let compare_build_flags = EncodeBuildFlags {
+        include_tokens: false,
+        include_type_ids: false,
+        include_attention_mask: false,
+        include_special_tokens_mask: false,
+        include_offsets: false,
+    };
 
-    let mut instances = state.tokenizer_instances.lock().await;
-    let (left_backend, left_ids, left_hash) = {
-        let Some(left) = instances.get_mut(&request.left_tokenizer_id) else {
+    let left_handle = match find_tokenizer_instance(&state, &request.left_tokenizer_id).await {
+        Some(handle) => handle,
+        None => {
             return json_error(
                 StatusCode::NOT_FOUND,
                 "tokenizer_not_found",
                 "left tokenizer instance not found",
                 Some(json!({ "tokenizer_id": request.left_tokenizer_id })),
-            );
-        };
-        let left_encoding = match encode_one(left, &request.sequence, add_special_tokens) {
-            Ok(v) => v,
-            Err(msg) => return json_error(StatusCode::BAD_REQUEST, "encode_failed", &msg, None),
-        };
-        (
-            left.backend.as_str().to_string(),
-            left_encoding.ids.clone(),
-            sha256_ids(&left_encoding.ids),
-        )
+            )
+        }
     };
-
-    let (right_backend, right_ids, right_hash) = {
-        let Some(right) = instances.get_mut(&request.right_tokenizer_id) else {
+    let right_handle = match find_tokenizer_instance(&state, &request.right_tokenizer_id).await {
+        Some(handle) => handle,
+        None => {
             return json_error(
                 StatusCode::NOT_FOUND,
                 "tokenizer_not_found",
                 "right tokenizer instance not found",
                 Some(json!({ "tokenizer_id": request.right_tokenizer_id })),
-            );
-        };
-        let right_encoding = match encode_one(right, &request.sequence, add_special_tokens) {
+            )
+        }
+    };
+
+    let (left_backend, left_ids, left_hash) = {
+        let mut left = left_handle.lock().await;
+        let left_encoding = match encode_one(
+            &mut left,
+            &request.sequence,
+            add_special_tokens,
+            compare_build_flags,
+        ) {
             Ok(v) => v,
-            Err(msg) => return json_error(StatusCode::BAD_REQUEST, "encode_failed", &msg, None),
+            Err(msg) => {
+                return json_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "encode_failed",
+                    &msg,
+                    Some(json!({ "endpoint": "/v1/tokenizer/compare" })),
+                )
+            }
         };
-        (
-            right.backend.as_str().to_string(),
-            right_encoding.ids.clone(),
-            sha256_ids(&right_encoding.ids),
-        )
+        let ids = left_encoding.ids;
+        let hash = sha256_ids(&ids);
+        (left.backend.as_str().to_string(), ids, hash)
+    };
+
+    let (right_backend, right_ids, right_hash) = if Arc::ptr_eq(&left_handle, &right_handle) {
+        (left_backend.clone(), left_ids.clone(), left_hash.clone())
+    } else {
+        let mut right = right_handle.lock().await;
+        let right_encoding = match encode_one(
+            &mut right,
+            &request.sequence,
+            add_special_tokens,
+            compare_build_flags,
+        ) {
+            Ok(v) => v,
+            Err(msg) => {
+                return json_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "encode_failed",
+                    &msg,
+                    Some(json!({ "endpoint": "/v1/tokenizer/compare" })),
+                )
+            }
+        };
+        let ids = right_encoding.ids;
+        let hash = sha256_ids(&ids);
+        (right.backend.as_str().to_string(), ids, hash)
     };
 
     let common_prefix = common_prefix_len(&left_ids, &right_ids);
@@ -1969,8 +2265,8 @@ pub async fn handle_capabilities(
             "supported_options": {
                 "tokenizers": {
                     "instances": ["create", "get", "delete"],
-                    "encode": ["sequence", "add_special_tokens"],
-                    "encode_batch": ["inputs", "add_special_tokens", "padding"],
+                    "encode": ["sequence", "is_pretokenized", "add_special_tokens", "return", "include_hash", "benchmark", "accept:application/octet-stream(ids_only)"],
+                    "encode_batch": ["inputs", "is_pretokenized", "add_special_tokens", "padding", "return", "include_hash", "benchmark", "accept:application/octet-stream(ids_only)"],
                     "decode": ["ids", "skip_special_tokens"],
                     "decode_batch": ["ids_batch", "skip_special_tokens"],
                     "vocab": true,
@@ -1985,8 +2281,8 @@ pub async fn handle_capabilities(
                 },
                 "talu": {
                     "instances": ["create", "get", "delete"],
-                    "encode": ["sequence", "add_special_tokens"],
-                    "encode_batch": ["inputs", "add_special_tokens", "padding"],
+                    "encode": ["sequence", "is_pretokenized", "add_special_tokens", "return", "include_hash", "benchmark", "accept:application/octet-stream(ids_only)"],
+                    "encode_batch": ["inputs", "is_pretokenized", "add_special_tokens", "padding", "return", "include_hash", "benchmark", "accept:application/octet-stream(ids_only)"],
                     "decode": ["ids", "skip_special_tokens"],
                     "decode_batch": ["ids_batch", "skip_special_tokens"],
                     "vocab": true,
@@ -2002,11 +2298,9 @@ pub async fn handle_capabilities(
             },
             "unsupported_feature_matrix": {
                 "tokenizers": [
-                    "is_pretokenized=true",
                     "pair encoding"
                 ],
                 "talu": [
-                    "is_pretokenized=true",
                     "pair encoding"
                 ]
             },
@@ -2026,6 +2320,83 @@ fn extract_instance_id(path: &str) -> Option<&str> {
     path.strip_prefix("/v1/tokenizer/instances/")
         .and_then(|tail| tail.split('/').next())
         .filter(|s| !s.is_empty())
+}
+
+async fn find_tokenizer_instance(
+    state: &AppState,
+    tokenizer_id: &str,
+) -> Option<TokenizerInstanceHandle> {
+    let instances = state.tokenizer_instances.lock().await;
+    instances.get(tokenizer_id).cloned()
+}
+
+fn validate_binary_ids_only_return_fields(
+    return_fields: &ReturnFields,
+    endpoint: &str,
+) -> Result<(), Response<BoxBody>> {
+    let valid = return_fields.include_ids()
+        && !return_fields.include_tokens()
+        && !return_fields.include_type_ids()
+        && !return_fields.include_attention_mask()
+        && !return_fields.include_special_tokens_mask()
+        && !return_fields.include_offsets();
+
+    if valid {
+        return Ok(());
+    }
+
+    Err(json_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_option",
+        "binary tokenizer responses only support return.ids=true with all other return fields false",
+        Some(json!({
+            "field": "return",
+            "expected": {
+                "ids": true,
+                "tokens": false,
+                "type_ids": false,
+                "attention_mask": false,
+                "special_tokens_mask": false,
+                "offsets": false
+            },
+            "endpoint": endpoint
+        })),
+    ))
+}
+
+fn request_wants_binary_response(headers: &hyper::HeaderMap) -> bool {
+    let Some(accept) = headers.get(hyper::header::ACCEPT) else {
+        return false;
+    };
+    let Ok(accept) = accept.to_str() else {
+        return false;
+    };
+    accept_header_allows_mime(accept, "application/octet-stream")
+}
+
+fn accept_header_allows_mime(accept_header: &str, target_mime: &str) -> bool {
+    accept_header.split(',').any(|entry| {
+        let mut parts = entry.trim().split(';');
+        let Some(mime) = parts.next() else {
+            return false;
+        };
+        if !mime.trim().eq_ignore_ascii_case(target_mime) {
+            return false;
+        }
+        let q = parts
+            .filter_map(parse_accept_q_parameter)
+            .next_back()
+            .unwrap_or(1.0);
+        q > 0.0
+    })
+}
+
+fn parse_accept_q_parameter(param: &str) -> Option<f32> {
+    let (key, value) = param.split_once('=')?;
+    if !key.trim().eq_ignore_ascii_case("q") {
+        return None;
+    }
+    value.trim().parse::<f32>().ok()
 }
 
 fn parse_query(query: Option<&str>) -> HashMap<String, String> {
@@ -2092,29 +2463,172 @@ fn json_error(
     )
 }
 
-fn normalize_input_sequence(value: &Value) -> Result<String, String> {
-    match value {
-        Value::String(s) => Ok(s.clone()),
-        Value::Array(parts) => {
-            let mut tokens = Vec::with_capacity(parts.len());
-            for part in parts {
-                let Some(token) = part.as_str() else {
-                    return Err("sequence array must contain only strings".to_string());
-                };
-                tokens.push(token);
+fn normalize_input_sequence_with_mode(
+    value: &Value,
+    is_pretokenized: bool,
+) -> Result<String, String> {
+    if is_pretokenized {
+        match value {
+            Value::Array(parts) => {
+                let mut tokens = Vec::with_capacity(parts.len());
+                for part in parts {
+                    let Some(token) = part.as_str() else {
+                        return Err(
+                            "sequence must be an array of strings when is_pretokenized=true"
+                                .to_string(),
+                        );
+                    };
+                    tokens.push(token);
+                }
+                Ok(tokens.join(" "))
             }
-            Ok(tokens.join(" "))
+            _ => Err("sequence must be an array of strings when is_pretokenized=true".to_string()),
         }
-        _ => Err("sequence must be a string or array of strings".to_string()),
+    } else {
+        match value {
+            Value::String(s) => Ok(s.clone()),
+            Value::Array(_) => {
+                Err("sequence must be a string when is_pretokenized=false".to_string())
+            }
+            _ => Err("sequence must be a string when is_pretokenized=false".to_string()),
+        }
     }
 }
 
-fn normalize_batch_inputs(inputs: &[Value]) -> Result<Vec<String>, String> {
+fn normalize_batch_inputs_with_mode(
+    inputs: &[Value],
+    is_pretokenized: bool,
+) -> Result<Vec<String>, String> {
     let mut out = Vec::with_capacity(inputs.len());
     for item in inputs {
-        out.push(normalize_input_sequence(item)?);
+        out.push(normalize_input_sequence_with_mode(item, is_pretokenized)?);
     }
     Ok(out)
+}
+
+fn enforce_path_source_policy(path_value: &str) -> Result<(), Response<BoxBody>> {
+    if !path_source_allowed() {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "path_not_allowed",
+            "source.kind=path is disabled by server policy; use source.kind=json or enable TALU_TOKENIZER_ALLOW_PATH_SOURCE=1 and TALU_TOKENIZER_ALLOWED_PATH_ROOTS",
+            Some(json!({
+                "field": "source.kind",
+                "reason": "path_source_disabled",
+                "expected": "source.kind=json or TALU_TOKENIZER_ALLOW_PATH_SOURCE=1",
+                "endpoint": "/v1/tokenizer/instances"
+            })),
+        ));
+    }
+
+    let requested = std::fs::canonicalize(Path::new(path_value)).map_err(|e| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("failed to canonicalize source.value path: {e}"),
+            Some(json!({
+                "field": "source.value",
+                "reason": "canonicalize_failed",
+                "got": path_value,
+                "endpoint": "/v1/tokenizer/instances"
+            })),
+        )
+    })?;
+
+    let allowed_roots = tokenizer_path_allowlist_roots()?;
+    if allowed_roots.is_empty() {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "path_not_allowed",
+            "source.kind=path requires TALU_TOKENIZER_ALLOWED_PATH_ROOTS",
+            Some(json!({
+                "field": "source.value",
+                "reason": "allowlist_required",
+                "expected": "TALU_TOKENIZER_ALLOWED_PATH_ROOTS must contain one or more canonical roots",
+                "endpoint": "/v1/tokenizer/instances"
+            })),
+        ));
+    }
+
+    if !allowed_roots.iter().any(|root| requested.starts_with(root)) {
+        let roots = allowed_roots
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "path_not_allowed",
+            "source.value path is outside configured allowlist roots",
+            Some(json!({
+                "field": "source.value",
+                "reason": "path_outside_allowlist",
+                "expected": roots,
+                "got": requested.to_string_lossy(),
+                "endpoint": "/v1/tokenizer/instances"
+            })),
+        ));
+    }
+
+    Ok(())
+}
+
+fn path_source_allowed() -> bool {
+    std::env::var("TALU_TOKENIZER_ALLOW_PATH_SOURCE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+        || std::env::var("TALU_TOKENIZER_ALLOW_PATH_SOURCE_FOR_AUTH")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+}
+
+fn tokenizer_path_allowlist_roots() -> Result<Vec<std::path::PathBuf>, Response<BoxBody>> {
+    tokenizer_path_allowlist_roots_raw().map_err(|(segment, err)| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_config_error",
+            &format!("invalid TALU_TOKENIZER_ALLOWED_PATH_ROOTS entry `{segment}`: {err}"),
+            Some(json!({
+                "field": "TALU_TOKENIZER_ALLOWED_PATH_ROOTS",
+                "reason": "invalid_allowlist_root",
+                "got": segment,
+                "endpoint": "/v1/tokenizer/instances"
+            })),
+        )
+    })
+}
+
+fn tokenizer_path_allowlist_roots_raw() -> Result<Vec<std::path::PathBuf>, (String, String)> {
+    let raw = std::env::var("TALU_TOKENIZER_ALLOWED_PATH_ROOTS").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut roots = Vec::new();
+    for segment in raw.split(':').map(str::trim).filter(|s| !s.is_empty()) {
+        let canonical = std::fs::canonicalize(Path::new(segment))
+            .map_err(|e| (segment.to_string(), e.to_string()))?;
+        roots.push(canonical);
+    }
+
+    Ok(roots)
+}
+
+pub fn validate_path_source_policy_env() -> Result<(), String> {
+    if !path_source_allowed() {
+        return Ok(());
+    }
+
+    let roots = tokenizer_path_allowlist_roots_raw().map_err(|(segment, err)| {
+        format!("invalid TALU_TOKENIZER_ALLOWED_PATH_ROOTS entry `{segment}`: {err}")
+    })?;
+
+    if roots.is_empty() {
+        return Err(
+            "path-source policy enabled (TALU_TOKENIZER_ALLOW_PATH_SOURCE=1 or TALU_TOKENIZER_ALLOW_PATH_SOURCE_FOR_AUTH=1) requires TALU_TOKENIZER_ALLOWED_PATH_ROOTS".to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 fn parse_added_token_request(
@@ -2503,6 +3017,7 @@ fn encode_one(
     instance: &mut TokenizerInstance,
     text: &str,
     add_special_tokens: bool,
+    build_flags: EncodeBuildFlags,
 ) -> Result<MutableEncoding, String> {
     let options = build_encode_options(add_special_tokens, instance.truncation.as_ref());
 
@@ -2521,15 +3036,35 @@ fn encode_one(
     }
 
     let ids = copy_u32_slice(result.ids, result.num_tokens);
-    let attention_mask = copy_u32_slice(result.attention_mask, result.num_tokens);
-    let special_tokens_mask = copy_u32_slice(result.special_tokens_mask, result.num_tokens);
-    let offsets = copy_offsets_slice(result.offsets, result.num_tokens);
+    let attention_mask = if build_flags.include_attention_mask {
+        copy_u32_slice(result.attention_mask, result.num_tokens)
+    } else {
+        Vec::new()
+    };
+    let special_tokens_mask = if build_flags.include_special_tokens_mask {
+        copy_u32_slice(result.special_tokens_mask, result.num_tokens)
+    } else {
+        Vec::new()
+    };
+    let offsets = if build_flags.include_offsets {
+        copy_offsets_slice(result.offsets, result.num_tokens)
+    } else {
+        Vec::new()
+    };
 
     // SAFETY: result was returned by talu_tokenizer_encode and must be freed once.
     unsafe { talu_sys::talu_encode_result_free(result) };
 
-    let tokens = ids_to_tokens(instance, &ids)?;
-    let type_ids = vec![0u32; ids.len()];
+    let tokens = if build_flags.include_tokens {
+        ids_to_tokens(instance, &ids)?
+    } else {
+        Vec::new()
+    };
+    let type_ids = if build_flags.include_type_ids {
+        vec![0u32; ids.len()]
+    } else {
+        Vec::new()
+    };
 
     Ok(MutableEncoding {
         ids,
@@ -2567,33 +3102,6 @@ fn decode_ids(
     unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
 
     Ok(text)
-}
-
-fn decode_ids_with_added_fallback(
-    instance: &mut TokenizerInstance,
-    ids: &[u32],
-    skip_special_tokens: bool,
-) -> Result<String, String> {
-    match decode_ids(instance, ids, skip_special_tokens) {
-        Ok(text) => Ok(text),
-        Err(primary_err) => {
-            let mut out = String::new();
-            for &id in ids {
-                let id_i32 = i32::try_from(id).map_err(|_| primary_err.clone())?;
-                if let Some(added) = instance.added_tokens.iter().find(|t| t.id == id) {
-                    if skip_special_tokens && added.special {
-                        continue;
-                    }
-                    out.push_str(&added.content);
-                    continue;
-                }
-
-                let token = id_to_token(instance, id_i32).map_err(|_| primary_err.clone())?;
-                out.push_str(&token);
-            }
-            Ok(out)
-        }
-    }
 }
 
 fn ids_to_tokens(instance: &mut TokenizerInstance, ids: &[u32]) -> Result<Vec<String>, String> {
@@ -2780,22 +3288,42 @@ fn apply_padding_to_row(
         PaddingDirection::Right => {
             row.ids
                 .extend(std::iter::repeat_n(config.pad_id, pad_count));
-            row.tokens
-                .extend(std::iter::repeat_n(config.pad_token.clone(), pad_count));
-            row.type_ids
-                .extend(std::iter::repeat_n(config.pad_type_id, pad_count));
-            row.attention_mask.extend(std::iter::repeat_n(0, pad_count));
-            row.special_tokens_mask
-                .extend(std::iter::repeat_n(1, pad_count));
-            row.offsets.extend(std::iter::repeat_n([0, 0], pad_count));
+            if !row.tokens.is_empty() {
+                row.tokens
+                    .extend(std::iter::repeat_n(config.pad_token.clone(), pad_count));
+            }
+            if !row.type_ids.is_empty() {
+                row.type_ids
+                    .extend(std::iter::repeat_n(config.pad_type_id, pad_count));
+            }
+            if !row.attention_mask.is_empty() {
+                row.attention_mask.extend(std::iter::repeat_n(0, pad_count));
+            }
+            if !row.special_tokens_mask.is_empty() {
+                row.special_tokens_mask
+                    .extend(std::iter::repeat_n(1, pad_count));
+            }
+            if !row.offsets.is_empty() {
+                row.offsets.extend(std::iter::repeat_n([0, 0], pad_count));
+            }
         }
         PaddingDirection::Left => {
             prepend_repeat(&mut row.ids, config.pad_id, pad_count);
-            prepend_repeat(&mut row.tokens, config.pad_token.clone(), pad_count);
-            prepend_repeat(&mut row.type_ids, config.pad_type_id, pad_count);
-            prepend_repeat(&mut row.attention_mask, 0, pad_count);
-            prepend_repeat(&mut row.special_tokens_mask, 1, pad_count);
-            prepend_repeat(&mut row.offsets, [0, 0], pad_count);
+            if !row.tokens.is_empty() {
+                prepend_repeat(&mut row.tokens, config.pad_token.clone(), pad_count);
+            }
+            if !row.type_ids.is_empty() {
+                prepend_repeat(&mut row.type_ids, config.pad_type_id, pad_count);
+            }
+            if !row.attention_mask.is_empty() {
+                prepend_repeat(&mut row.attention_mask, 0, pad_count);
+            }
+            if !row.special_tokens_mask.is_empty() {
+                prepend_repeat(&mut row.special_tokens_mask, 1, pad_count);
+            }
+            if !row.offsets.is_empty() {
+                prepend_repeat(&mut row.offsets, [0, 0], pad_count);
+            }
         }
     }
 }
@@ -2809,23 +3337,30 @@ fn prepend_repeat<T: Clone>(vec: &mut Vec<T>, value: T, count: usize) {
     *vec = prefix;
 }
 
-fn encoding_payload_from_mutable(
-    row: &MutableEncoding,
+fn encoding_payload_from_owned(
+    row: MutableEncoding,
     return_fields: &ReturnFields,
 ) -> EncodingPayload {
+    let MutableEncoding {
+        ids,
+        tokens,
+        type_ids,
+        attention_mask,
+        special_tokens_mask,
+        offsets,
+    } = row;
+
     EncodingPayload {
-        ids: return_fields.include_ids().then(|| row.ids.clone()),
-        tokens: return_fields.include_tokens().then(|| row.tokens.clone()),
-        type_ids: return_fields
-            .include_type_ids()
-            .then(|| row.type_ids.clone()),
+        ids: return_fields.include_ids().then_some(ids),
+        tokens: return_fields.include_tokens().then_some(tokens),
+        type_ids: return_fields.include_type_ids().then_some(type_ids),
         attention_mask: return_fields
             .include_attention_mask()
-            .then(|| row.attention_mask.clone()),
+            .then_some(attention_mask),
         special_tokens_mask: return_fields
             .include_special_tokens_mask()
-            .then(|| row.special_tokens_mask.clone()),
-        offsets: return_fields.include_offsets().then(|| row.offsets.clone()),
+            .then_some(special_tokens_mask),
+        offsets: return_fields.include_offsets().then_some(offsets),
     }
 }
 
@@ -2846,6 +3381,31 @@ fn copy_offsets_slice(ptr: *mut talu_sys::TokenOffset, len: usize) -> Vec<[u32; 
         .iter()
         .map(|off| [off.start, off.end])
         .collect()
+}
+
+fn encode_ids_binary_v1(ids: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + ids.len() * 4);
+    out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    for &id in ids {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+
+fn encode_batch_ids_binary_v1(rows: &[MutableEncoding]) -> Vec<u8> {
+    let num_rows = rows.len() as u32;
+    let total_ids = rows.iter().map(|row| row.ids.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(4 + rows.len() * 4 + total_ids * 4);
+    out.extend_from_slice(&num_rows.to_le_bytes());
+    for row in rows {
+        out.extend_from_slice(&(row.ids.len() as u32).to_le_bytes());
+    }
+    for row in rows {
+        for &id in &row.ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+    out
 }
 
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {

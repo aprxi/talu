@@ -443,11 +443,8 @@ impl Service<Request<Incoming>> for Router {
                         || p == "/bench/index.html"
                         || p.starts_with("/bench/") =>
                 {
-                    let mut resp = serve_ui_asset(
-                        &state,
-                        "bench/index.html",
-                        "text/html; charset=utf-8",
-                    );
+                    let mut resp =
+                        serve_ui_asset(&state, "bench/index.html", "text/html; charset=utf-8");
                     if resp.status() == StatusCode::OK {
                         resp.headers_mut().insert(
                             "content-security-policy",

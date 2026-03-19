@@ -508,7 +508,11 @@ fn responses_tools_with_thinking_disabled() {
         "tool_choice": "auto"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 200, "tools + thinking disabled must not crash: {}", resp.body);
+    assert_eq!(
+        resp.status, 200,
+        "tools + thinking disabled must not crash: {}",
+        resp.body
+    );
 }
 
 /// Tools + max_reasoning_tokens=0 streaming must not crash.
@@ -526,7 +530,11 @@ fn responses_tools_with_thinking_disabled_streaming() {
         "tool_choice": "auto"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 200, "tools + thinking disabled streaming must not crash: {}", resp.body);
+    assert_eq!(
+        resp.status, 200,
+        "tools + thinking disabled streaming must not crash: {}",
+        resp.body
+    );
     let events = parse_sse_events(&resp.body);
     let terminal = events
         .iter()
@@ -548,7 +556,11 @@ fn responses_accepts_tools_with_thinking_disabled() {
         "tool_choice": "auto"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "tools + max_reasoning_tokens=0 should pass validation: {}", resp.body);
+    assert_ne!(
+        resp.status, 400,
+        "tools + max_reasoning_tokens=0 should pass validation: {}",
+        resp.body
+    );
 }
 
 /// Tools + max_reasoning_tokens=0 streaming must pass validation.
@@ -563,7 +575,11 @@ fn responses_accepts_tools_with_thinking_disabled_streaming() {
         "tool_choice": "auto"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "tools + max_reasoning_tokens=0 streaming should pass validation: {}", resp.body);
+    assert_ne!(
+        resp.status, 400,
+        "tools + max_reasoning_tokens=0 streaming should pass validation: {}",
+        resp.body
+    );
 }
 
 /// Invalid tool_choice string is rejected.

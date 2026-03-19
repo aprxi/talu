@@ -45,6 +45,29 @@ fn create_instance_with_json(
     resp.json()
 }
 
+fn post_json_with_headers(
+    addr: std::net::SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &serde_json::Value,
+) -> HttpResponse {
+    let json = serde_json::to_string(body).expect("serialize json");
+    send_request(addr, "POST", path, headers, Some(json.as_str()))
+}
+
+fn path_source_enabled_config(allow_root: &std::path::Path) -> ServerConfig {
+    let mut cfg = ServerConfig::new();
+    cfg.env_vars.push((
+        "TALU_TOKENIZER_ALLOW_PATH_SOURCE".to_string(),
+        "1".to_string(),
+    ));
+    cfg.env_vars.push((
+        "TALU_TOKENIZER_ALLOWED_PATH_ROOTS".to_string(),
+        allow_root.to_string_lossy().to_string(),
+    ));
+    cfg
+}
+
 fn assert_error(resp: HttpResponse, status: u16, code: &str) -> serde_json::Value {
     assert_eq!(resp.status, status, "body: {}", resp.body);
     let content_type = resp.header("content-type").unwrap_or("");
@@ -61,6 +84,62 @@ fn assert_error(resp: HttpResponse, status: u16, code: &str) -> serde_json::Valu
         resp.body
     );
     body
+}
+
+fn decode_ids_binary_v1(body: &str) -> Vec<u32> {
+    let bytes = body.as_bytes();
+    assert!(bytes.len() >= 4, "binary body too short");
+    let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    assert_eq!(bytes.len(), 4 + count * 4, "binary body length mismatch");
+    let mut ids = Vec::with_capacity(count);
+    let mut offset = 4usize;
+    for _ in 0..count {
+        ids.push(u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]));
+        offset += 4;
+    }
+    ids
+}
+
+fn decode_batch_ids_binary_v1(body: &str) -> Vec<Vec<u32>> {
+    let bytes = body.as_bytes();
+    assert!(bytes.len() >= 4, "binary batch body too short");
+    let num_rows = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let mut offset = 4usize;
+    let mut row_lengths = Vec::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        assert!(offset + 4 <= bytes.len(), "missing row length");
+        row_lengths.push(u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize);
+        offset += 4;
+    }
+
+    let mut rows = Vec::with_capacity(num_rows);
+    for row_len in row_lengths {
+        assert!(offset + row_len * 4 <= bytes.len(), "missing row ids");
+        let mut row = Vec::with_capacity(row_len);
+        for _ in 0..row_len {
+            row.push(u32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]));
+            offset += 4;
+        }
+        rows.push(row);
+    }
+
+    assert_eq!(offset, bytes.len(), "unexpected trailing bytes");
+    rows
 }
 
 #[test]
@@ -537,7 +616,12 @@ fn create_instance_rejects_unsupported_backend() {
             "source": { "kind": "json", "value": tokenizer_fixture_json() }
         }),
     );
-    assert_error(resp, 400, "unsupported_backend");
+    let body = assert_error(resp, 422, "unsupported_backend");
+    assert_eq!(body["error"]["details"]["field"], "backend");
+    assert_eq!(
+        body["error"]["details"]["endpoint"],
+        "/v1/tokenizer/instances"
+    );
 }
 
 #[test]
@@ -569,7 +653,7 @@ fn create_instance_rejects_invalid_json_source() {
 }
 
 #[test]
-fn encode_rejects_pair_and_pretokenized_and_invalid_sequence() {
+fn encode_rejects_pair_and_validates_pretokenized_shape() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let created = create_instance(ctx.addr(), "talu");
     let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
@@ -583,7 +667,7 @@ fn encode_rejects_pair_and_pretokenized_and_invalid_sequence() {
             "pair": "world"
         }),
     );
-    assert_error(pair, 400, "unsupported_option");
+    assert_error(pair, 422, "unsupported_option");
 
     let pretokenized = post_json(
         ctx.addr(),
@@ -594,7 +678,19 @@ fn encode_rejects_pair_and_pretokenized_and_invalid_sequence() {
             "is_pretokenized": true
         }),
     );
-    assert_error(pretokenized, 400, "unsupported_option");
+    assert_eq!(pretokenized.status, 200, "body: {}", pretokenized.body);
+    assert!(pretokenized.json()["encoding"]["ids"].is_array());
+
+    let mismatch = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/encode",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "sequence": ["hello", "world"],
+            "is_pretokenized": false
+        }),
+    );
+    assert_error(mismatch, 400, "invalid_request");
 
     let invalid_sequence = post_json(
         ctx.addr(),
@@ -654,7 +750,7 @@ fn encode_not_found_and_return_projection_and_benchmark_toggle() {
 }
 
 #[test]
-fn encode_batch_rejects_invalid_inputs_and_pretokenized_and_projection() {
+fn encode_batch_rejects_invalid_inputs_and_enforces_mode_shape() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let created = create_instance(ctx.addr(), "talu");
     let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
@@ -668,7 +764,34 @@ fn encode_batch_rejects_invalid_inputs_and_pretokenized_and_projection() {
             "is_pretokenized": true
         }),
     );
-    assert_error(pretokenized, 400, "unsupported_option");
+    assert_error(pretokenized, 400, "invalid_request");
+
+    let valid_pretokenized = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/encode_batch",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "inputs": [["hello"], ["world"]],
+            "is_pretokenized": true
+        }),
+    );
+    assert_eq!(
+        valid_pretokenized.status, 200,
+        "body: {}",
+        valid_pretokenized.body
+    );
+    assert!(valid_pretokenized.json()["batch_encoding"]["input_ids"].is_array());
+
+    let mixed_mode = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/encode_batch",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "inputs": ["hello", ["world"]],
+            "is_pretokenized": false
+        }),
+    );
+    assert_error(mixed_mode, 400, "invalid_request");
 
     let invalid_inputs = post_json(
         ctx.addr(),
@@ -706,6 +829,233 @@ fn encode_batch_rejects_invalid_inputs_and_pretokenized_and_projection() {
     let row0 = body["batch_encoding"]["encodings"][0].as_object().unwrap();
     assert!(row0.contains_key("ids"));
     assert!(!row0.contains_key("tokens"));
+}
+
+#[test]
+fn encode_and_encode_batch_support_include_hash_false() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let encode = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/encode",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "sequence": "hello world",
+            "include_hash": false
+        }),
+    );
+    assert_eq!(encode.status, 200, "body: {}", encode.body);
+    let encode_json = encode.json();
+    let encode_obj = encode_json.as_object().expect("encode response object");
+    assert!(!encode_obj.contains_key("sha256_ids"));
+
+    let batch = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/encode_batch",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "inputs": ["hello", "world"],
+            "include_hash": false
+        }),
+    );
+    assert_eq!(batch.status, 200, "body: {}", batch.body);
+    let batch_json = batch.json();
+    let batch_obj = batch_json.as_object().expect("batch response object");
+    assert!(!batch_obj.contains_key("sha256_ids_batch"));
+}
+
+#[test]
+fn encode_accept_octet_stream_returns_ids_le_u32_v1_payload() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let payload = serde_json::json!({
+        "tokenizer_id": tokenizer_id,
+        "sequence": "hello world",
+        "add_special_tokens": false,
+        "return": {
+            "ids": true,
+            "tokens": false,
+            "type_ids": false,
+            "attention_mask": false,
+            "special_tokens_mask": false,
+            "offsets": false
+        }
+    });
+
+    let expected_json = post_json(ctx.addr(), "/v1/tokenizer/encode", &payload);
+    assert_eq!(expected_json.status, 200, "body: {}", expected_json.body);
+    let expected_ids: Vec<u32> = expected_json.json()["encoding"]["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+
+    let raw_body = serde_json::to_string(&payload).unwrap();
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/encode",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(&raw_body),
+    );
+    assert_eq!(raw.status, 200, "body: {}", raw.body);
+    assert!(raw
+        .header("content-type")
+        .unwrap_or("")
+        .starts_with("application/octet-stream"));
+    assert_eq!(raw.header("x-talu-binary-format"), Some("ids_le_u32_v1"));
+    assert_eq!(
+        raw.header("x-talu-ids-count")
+            .and_then(|v| v.parse::<usize>().ok()),
+        Some(expected_ids.len())
+    );
+
+    let decoded_ids = decode_ids_binary_v1(&raw.body);
+    assert_eq!(decoded_ids, expected_ids);
+}
+
+#[test]
+fn encode_batch_accept_octet_stream_returns_ids_batch_le_u32_v1_payload() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let payload = serde_json::json!({
+        "tokenizer_id": tokenizer_id,
+        "inputs": ["hello", "world"],
+        "add_special_tokens": false,
+        "return": {
+            "ids": true,
+            "tokens": false,
+            "type_ids": false,
+            "attention_mask": false,
+            "special_tokens_mask": false,
+            "offsets": false
+        }
+    });
+
+    let expected_json = post_json(ctx.addr(), "/v1/tokenizer/encode_batch", &payload);
+    assert_eq!(expected_json.status, 200, "body: {}", expected_json.body);
+    let expected_rows: Vec<Vec<u32>> = expected_json.json()["batch_encoding"]["input_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let raw_body = serde_json::to_string(&payload).unwrap();
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/encode_batch",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(&raw_body),
+    );
+    assert_eq!(raw.status, 200, "body: {}", raw.body);
+    assert!(raw
+        .header("content-type")
+        .unwrap_or("")
+        .starts_with("application/octet-stream"));
+    assert_eq!(
+        raw.header("x-talu-binary-format"),
+        Some("ids_batch_le_u32_v1")
+    );
+    assert_eq!(
+        raw.header("x-talu-num-sequences")
+            .and_then(|v| v.parse::<usize>().ok()),
+        Some(expected_rows.len())
+    );
+
+    let decoded_rows = decode_batch_ids_binary_v1(&raw.body);
+    assert_eq!(decoded_rows, expected_rows);
+}
+
+#[test]
+fn encode_accept_octet_stream_rejects_non_ids_return_projection() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let invalid_projection = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/encode",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "sequence": "hello world",
+            "return": {
+                "ids": true,
+                "tokens": true
+            }
+        }),
+    );
+    assert_eq!(
+        invalid_projection.status, 200,
+        "body: {}",
+        invalid_projection.body
+    );
+    let raw_body = serde_json::json!({
+        "tokenizer_id": tokenizer_id,
+        "sequence": "hello world",
+        "return": {
+            "ids": true,
+            "tokens": true
+        }
+    })
+    .to_string();
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/encode",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(&raw_body),
+    );
+    assert_error(raw, 422, "unsupported_option");
+}
+
+#[test]
+fn encode_accept_octet_stream_rejects_include_hash_true() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/encode",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(
+            &serde_json::json!({
+                "tokenizer_id": tokenizer_id,
+                "sequence": "hello world",
+                "include_hash": true
+            })
+            .to_string(),
+        ),
+    );
+    assert_error(raw, 422, "unsupported_option");
 }
 
 #[test]
@@ -787,7 +1137,7 @@ fn truncation_and_padding_endpoints_validate_parameters() {
             "stride": 1
         }),
     );
-    assert_error(trunc_stride, 400, "unsupported_option");
+    assert_error(trunc_stride, 422, "unsupported_option");
 
     let trunc_strategy = post_json(
         ctx.addr(),
@@ -798,7 +1148,7 @@ fn truncation_and_padding_endpoints_validate_parameters() {
             "strategy": "only_second"
         }),
     );
-    assert_error(trunc_strategy, 400, "unsupported_option");
+    assert_error(trunc_strategy, 422, "unsupported_option");
 
     let trunc_direction = post_json(
         ctx.addr(),
@@ -905,7 +1255,7 @@ fn training_endpoints_add_tokens_deterministically() {
         }),
     );
     if train.status != 200 {
-        assert_error(train, 400, "train_failed");
+        assert_error(train, 422, "train_failed");
         return;
     }
     let train_json = train.json();
@@ -1063,7 +1413,7 @@ fn save_rejects_existing_target_when_overwrite_false() {
             "overwrite": false
         }),
     );
-    assert_error(save, 400, "save_failed");
+    assert_error(save, 409, "conflict");
 }
 
 #[test]
@@ -1084,8 +1434,8 @@ fn capabilities_response_has_expected_structure() {
 
 #[test]
 fn create_instance_from_path_source_roundtrip() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
     let tmp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(path_source_enabled_config(tmp.path()));
     let model_dir = tmp.path().join("model_dir");
     std::fs::create_dir_all(&model_dir).expect("create model dir");
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -1119,7 +1469,8 @@ fn create_instance_from_path_source_roundtrip() {
 
 #[test]
 fn create_instance_path_not_found_returns_invalid_request() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
+    let tmp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(path_source_enabled_config(tmp.path()));
     let resp = post_json(
         ctx.addr(),
         "/v1/tokenizer/instances",
@@ -1129,6 +1480,155 @@ fn create_instance_path_not_found_returns_invalid_request() {
         }),
     );
     assert_error(resp, 400, "invalid_request");
+}
+
+#[test]
+fn create_instance_path_source_is_disabled_by_default_for_unauthenticated_requests() {
+    let tmp = TempDir::new().expect("temp dir");
+    let model_dir = tmp.path().join("model_dir");
+    std::fs::create_dir_all(&model_dir).expect("create model dir");
+    std::fs::write(
+        model_dir.join("tokenizer.json"),
+        tokenizer_fixture_json().as_bytes(),
+    )
+    .expect("write tokenizer.json");
+
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/instances",
+        &serde_json::json!({
+            "backend": "talu",
+            "source": { "kind": "path", "value": model_dir }
+        }),
+    );
+    let body = assert_error(resp, 403, "path_not_allowed");
+    assert_eq!(body["error"]["details"]["reason"], "path_source_disabled");
+}
+
+#[test]
+fn create_instance_path_source_requires_explicit_policy_enablement_for_authenticated_requests() {
+    let tmp = TempDir::new().expect("temp dir");
+    let model_dir = tmp.path().join("model_dir");
+    std::fs::create_dir_all(&model_dir).expect("create model dir");
+    std::fs::write(
+        model_dir.join("tokenizer.json"),
+        tokenizer_fixture_json().as_bytes(),
+    )
+    .expect("write tokenizer.json");
+
+    let mut cfg = ServerConfig::new();
+    cfg.gateway_secret = Some("secret".to_string());
+    cfg.tenants = vec![TenantSpec {
+        id: "acme".to_string(),
+        storage_prefix: "acme".to_string(),
+        allowed_models: vec![],
+    }];
+    let ctx = ServerTestContext::new(cfg);
+
+    let resp = post_json_with_headers(
+        ctx.addr(),
+        "/v1/tokenizer/instances",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+        ],
+        &serde_json::json!({
+            "backend": "talu",
+            "source": { "kind": "path", "value": model_dir }
+        }),
+    );
+    let body = assert_error(resp, 403, "path_not_allowed");
+    assert_eq!(body["error"]["details"]["reason"], "path_source_disabled");
+}
+
+#[test]
+fn create_instance_path_source_requires_allowlist_roots_for_authenticated_requests() {
+    let mut cfg = ServerConfig::new();
+    cfg.gateway_secret = Some("secret".to_string());
+    cfg.tenants = vec![TenantSpec {
+        id: "acme".to_string(),
+        storage_prefix: "acme".to_string(),
+        allowed_models: vec![],
+    }];
+    cfg.env_vars.push((
+        "TALU_TOKENIZER_ALLOW_PATH_SOURCE".to_string(),
+        "1".to_string(),
+    ));
+    assert_server_startup_fails(cfg, "requires TALU_TOKENIZER_ALLOWED_PATH_ROOTS");
+}
+
+#[test]
+fn startup_fails_when_path_source_is_enabled_without_allowlist_roots() {
+    let mut cfg = ServerConfig::new();
+    cfg.env_vars.push((
+        "TALU_TOKENIZER_ALLOW_PATH_SOURCE".to_string(),
+        "1".to_string(),
+    ));
+    assert_server_startup_fails(cfg, "requires TALU_TOKENIZER_ALLOWED_PATH_ROOTS");
+}
+
+#[test]
+fn startup_fails_when_allowlist_contains_invalid_root() {
+    let mut cfg = ServerConfig::new();
+    cfg.env_vars.push((
+        "TALU_TOKENIZER_ALLOW_PATH_SOURCE".to_string(),
+        "1".to_string(),
+    ));
+    cfg.env_vars.push((
+        "TALU_TOKENIZER_ALLOWED_PATH_ROOTS".to_string(),
+        "/definitely/not/here/tokenizer_root".to_string(),
+    ));
+    assert_server_startup_fails(cfg, "invalid tokenizer path-source policy configuration");
+}
+
+#[test]
+fn create_instance_path_source_allows_allowlisted_root_for_authenticated_requests() {
+    let tmp = TempDir::new().expect("temp dir");
+    let model_dir = tmp.path().join("model_dir");
+    std::fs::create_dir_all(&model_dir).expect("create model dir");
+    std::fs::write(
+        model_dir.join("tokenizer.json"),
+        tokenizer_fixture_json().as_bytes(),
+    )
+    .expect("write tokenizer.json");
+
+    let mut cfg = ServerConfig::new();
+    cfg.gateway_secret = Some("secret".to_string());
+    cfg.tenants = vec![TenantSpec {
+        id: "acme".to_string(),
+        storage_prefix: "acme".to_string(),
+        allowed_models: vec![],
+    }];
+    cfg.env_vars.push((
+        "TALU_TOKENIZER_ALLOW_PATH_SOURCE".to_string(),
+        "1".to_string(),
+    ));
+    cfg.env_vars.push((
+        "TALU_TOKENIZER_ALLOWED_PATH_ROOTS".to_string(),
+        tmp.path().to_string_lossy().to_string(),
+    ));
+    let ctx = ServerTestContext::new(cfg);
+
+    let created = post_json_with_headers(
+        ctx.addr(),
+        "/v1/tokenizer/instances",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+        ],
+        &serde_json::json!({
+            "backend": "talu",
+            "source": { "kind": "path", "value": model_dir }
+        }),
+    );
+    assert_eq!(created.status, 200, "body: {}", created.body);
+    let created_json = created.json();
+    assert_eq!(created_json["backend"], "talu");
+    assert!(created_json["tokenizer_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("tok_"));
 }
 
 #[test]
@@ -1218,8 +1718,8 @@ fn create_instance_json_source_reports_sha256_of_source() {
 
 #[test]
 fn create_instance_path_source_hash_is_deterministic_for_same_input() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
     let tmp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(path_source_enabled_config(tmp.path()));
     let model_dir = tmp.path().join("model_dir");
     std::fs::create_dir_all(&model_dir).expect("create model dir");
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -1256,7 +1756,8 @@ fn create_instance_path_source_hash_is_deterministic_for_same_input() {
 
 #[test]
 fn create_instance_rejects_path_with_nul_byte() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
+    let tmp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(path_source_enabled_config(tmp.path()));
     let path_with_nul = format!("{}{}", "/tmp/tokenizer", '\0');
     let resp = post_json(
         ctx.addr(),

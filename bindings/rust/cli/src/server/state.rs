@@ -154,7 +154,9 @@ pub struct AppState {
     /// Shared long-lived collab resource handles keyed by `<root>\0<kind>\0<id>`.
     pub collab_handles: Mutex<HashMap<String, CollabHandleEntry>>,
     /// Stateful tokenizer handles keyed by `tokenizer_id` for `/v1/tokenizer/*`.
-    pub tokenizer_instances: Mutex<HashMap<String, TokenizerInstance>>,
+    /// Map access is protected separately from per-instance operations to avoid
+    /// global serialization across independent tokenizer instances.
+    pub tokenizer_instances: Mutex<HashMap<String, Arc<Mutex<TokenizerInstance>>>>,
     /// Agent terminal runtime mode (`host` vs `strict`).
     pub agent_runtime_mode: AgentRuntimeMode,
     /// Selected sandbox backend.
