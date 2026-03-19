@@ -4810,3 +4810,52 @@ test "Scheduler step-scoped state blocks are zeroed at each step boundary" {
         }
     }
 }
+
+test "Scheduler.step - thinking disabled with tool-generation flags" {
+    // Regression: tools + max_reasoning_tokens=0 triggered "double free or
+    // corruption (out)". This test reproduces the exact submission flags the
+    // router sends for that combination: thinking_budget=0,
+    // thinking_end_tokens=&.{}, max_completion_tokens set.
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 4);
+    defer backend.deinit();
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{});
+    defer scheduler.deinit();
+
+    // Simulate a prompt with tool definitions (longer than usual).
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const eos_ids = [_]u32{151645}; // Qwen3.5 EOS
+
+    const request_id = try scheduler.submit(&prompt, 64, .{
+        .eos_token_ids = &eos_ids,
+        .max_thinking_tokens = 0, // thinking disabled
+        .thinking_end_tokens = &.{}, // empty (no thinking)
+        .max_completion_tokens = 64,
+    });
+
+    // Step 1: prefill
+    {
+        const events = try scheduler.step();
+        defer alloc.free(events);
+    }
+
+    // Step 2+: decode several tokens
+    var total_tokens: usize = 0;
+    while (scheduler.hasActive()) {
+        const events = try scheduler.step();
+        defer alloc.free(events);
+        for (events) |ev| {
+            total_tokens += 1;
+            if (ev.is_final) break;
+        }
+        if (total_tokens >= 10) break;
+    }
+
+    // Request should have generated tokens without crashing.
+    const req = scheduler.requests.get(request_id).?;
+    try std.testing.expect(req.generated_tokens.items.len > 0);
+
+    // Clean up: remove completed request.
+    scheduler.remove(request_id);
+}

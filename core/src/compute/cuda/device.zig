@@ -206,6 +206,11 @@ pub const Device = struct {
     launch_family: LaunchFamily,
 
     pub fn init() !Device {
+        return initAt(0);
+    }
+
+    /// Initialize a CUDA device by ordinal (0-based).
+    pub fn initAt(device_ordinal: usize) !Device {
         if (!isRuntimeSupported()) return error.CudaNotEnabled;
 
         var lib = try openDriverLibrary();
@@ -217,9 +222,11 @@ pub const Device = struct {
         var device_count: c_int = 0;
         if (api.cu_device_get_count(&device_count) != cuda_success) return error.CudaInitFailed;
         if (device_count <= 0) return error.CudaNoDevices;
+        if (device_ordinal >= @as(usize, @intCast(device_count))) return error.InvalidArgument;
 
+        const requested_ordinal: c_int = @intCast(device_ordinal);
         var device_index: c_int = 0;
-        if (api.cu_device_get(&device_index, 0) != cuda_success) return error.CudaInitFailed;
+        if (api.cu_device_get(&device_index, requested_ordinal) != cuda_success) return error.CudaInitFailed;
 
         var context: ?*anyopaque = null;
         if (api.cu_ctx_create(&context, 0, device_index) != cuda_success or context == null) {
@@ -362,6 +369,10 @@ pub const Device = struct {
     pub fn name(self: *const Device) []const u8 {
         const end = std.mem.indexOfScalar(u8, self.name_buffer[0..], 0) orelse self.name_buffer.len;
         return self.name_buffer[0..end];
+    }
+
+    pub fn ordinal(self: *const Device) usize {
+        return @intCast(self.device_index);
     }
 
     pub fn setLaunchStream(self: *Device, stream: ?StreamHandle) void {
@@ -813,6 +824,15 @@ test "Device.init Device.deinit Device.name work when probeRuntime is available"
     defer device.deinit();
 
     try std.testing.expect(device.name().len > 0);
+}
+
+test "Device.initAt uses requested ordinal when runtime is available" {
+    if (probeRuntime() != .available) return error.SkipZigTest;
+
+    var device = try Device.initAt(0);
+    defer device.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), device.ordinal());
 }
 
 test "Device.allocBuffer Buffer.upload Buffer.download Buffer.deinit roundtrip" {

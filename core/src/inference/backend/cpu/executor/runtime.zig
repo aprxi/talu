@@ -255,6 +255,7 @@ pub const ScratchBuffer = struct {
             if (temp_slice.len <= decode_target_len * shrink_factor) continue;
             const keep_len = @max(decode_target_len * keep_factor, width_hint);
             cpu_common.freeAligned64F32Slice(self.allocator, temp_slice.*);
+            temp_slice.* = &.{};
             const aligned = try self.allocator.alignedAlloc(f32, .@"64", keep_len);
             temp_slice.* = aligned;
         }
@@ -695,6 +696,28 @@ test "CpuKernel.forward returns typed error when attention cache is missing" {
     const fake_attention = @as(*const attn.MultiHeadAttention, @ptrFromInt(@as(usize, @alignOf(attn.MultiHeadAttention))));
     const kernel = CpuKernel{ .attention = fake_attention };
     try std.testing.expectError(SlotContextError.MissingAttentionCache, kernel.forward(&input, &output, ctx));
+}
+
+test "ScratchBuffer.ensureForMode clears tmp on decode-transition allocation failure" {
+    // Regression: shrinkForDecodeTransition frees old buffers then re-allocs.
+    // Before the fix, a failed realloc left tmp entries pointing to freed
+    // memory. deinit() would then double-free.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var scratch = try ScratchBuffer.init(failing.allocator(), 8, 16, 1);
+    defer scratch.deinit();
+
+    // Grow scratch for prefill — creates large buffers in tmp[0].
+    try scratch.ensureForMode(.prefill, 64);
+    try std.testing.expect(scratch.tmp[0].len >= 64 * 8);
+
+    // Make the next allocation fail, then trigger decode transition.
+    // shrinkForDecodeTransition frees the large buffer then tries to alloc
+    // a smaller one. The alloc fails, so tmp[0] must be left empty (not dangling).
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, scratch.ensureForMode(.decode, 1));
+
+    // With the fix, tmp[0] is safely empty. deinit() in defer won't double-free.
+    try std.testing.expectEqual(@as(usize, 0), scratch.tmp[0].len);
 }
 
 test "ScratchBuffer.resetSlotCaches resets only target slot recurrent state" {
