@@ -2,9 +2,10 @@ import { describe, test, expect, beforeEach } from "bun:test";
 import { setupTranscriptEvents } from "../../../src/plugins/chat/transcript-events.ts";
 import { chatState } from "../../../src/plugins/chat/state.ts";
 import { initChatDom, getChatDom } from "../../../src/plugins/chat/dom.ts";
+import { getChatPanelDom } from "../../../src/plugins/chat/chat-panel-dom.ts";
 import { initChatDeps } from "../../../src/plugins/chat/deps.ts";
 import { createDomRoot, CHAT_DOM_IDS, CHAT_DOM_TAGS } from "../../helpers/dom.ts";
-import { mockTimers, mockNotifications } from "../../helpers/mocks.ts";
+import { mockTimers, mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 import type { Conversation, OutputTextPart } from "../../../src/types.ts";
 
 /**
@@ -16,6 +17,13 @@ import type { Conversation, OutputTextPart } from "../../../src/types.ts";
 let notifs: ReturnType<typeof mockNotifications>;
 let clipboardText: string | null;
 let domRoot: HTMLElement;
+let showPanelCalls: Array<{
+  title: string;
+  content: HTMLElement;
+  owner?: string;
+  onHide?: () => void;
+}>;
+let hidePanelCalls: Array<string | undefined>;
 
 function makeConvo(items: any[] = []): Conversation {
   return {
@@ -34,6 +42,8 @@ function makeConvo(items: any[] = []): Conversation {
 beforeEach(() => {
   notifs = mockNotifications();
   clipboardText = null;
+  showPanelCalls = [];
+  hidePanelCalls = [];
 
   domRoot = createDomRoot(CHAT_DOM_IDS, undefined, CHAT_DOM_TAGS);
   initChatDom(domRoot);
@@ -65,6 +75,21 @@ beforeEach(() => {
     observe: { onResize: () => ({ dispose() {} }) } as any,
     format: { dateTime: () => "2024-01-01" } as any,
     upload: { upload: async () => ({}) } as any,
+    layout: {
+      setTitle: () => {},
+      showPanel: (options: {
+        title: string;
+        content: HTMLElement;
+        owner?: string;
+        onHide?: () => void;
+      }) => {
+        showPanelCalls.push(options);
+        return { dispose() {} };
+      },
+      hidePanel: (owner?: string) => {
+        hidePanelCalls.push(owner);
+      },
+    } as any,
     menus: { registerItem: () => ({ dispose() {} }), renderSlot: () => ({ dispose() {} }) } as any,
   });
 
@@ -170,14 +195,18 @@ describe("setupTranscriptEvents — user actions", () => {
     const { btn } = setupUserMsg("hello world");
     btn.dataset["action"] = "copy";
     btn.click();
-    await new Promise((r) => setTimeout(r, 0));
+    await flushAsync();
     expect(clipboardText).toBe("hello world");
   });
 
-  test("unknown action does not throw", () => {
+  test("unknown action leaves unrelated state untouched", () => {
     const { btn } = setupUserMsg("hello");
     btn.dataset["action"] = "unknown";
-    expect(() => btn.click()).not.toThrow();
+    clipboardText = "sentinel";
+    btn.click();
+    expect(clipboardText).toBe("sentinel");
+    expect(showPanelCalls.length).toBe(0);
+    expect(hidePanelCalls.length).toBe(0);
   });
 });
 
@@ -207,7 +236,7 @@ describe("setupTranscriptEvents — assistant actions", () => {
     const { btn } = setupAssistantMsg("assistant reply");
     btn.dataset["action"] = "copy";
     btn.click();
-    await new Promise((r) => setTimeout(r, 0));
+    await flushAsync();
     expect(clipboardText).toBe("assistant reply");
   });
 
@@ -217,8 +246,12 @@ describe("setupTranscriptEvents — assistant actions", () => {
     btn.dataset["generation"] = JSON.stringify({ model: "gpt-4", temperature: 0.5 });
     btn.dataset["usage"] = JSON.stringify({ output_tokens: 100 });
     btn.click();
-    const dom = getChatDom();
-    expect(dom.rightPanel.classList.contains("read-only")).toBe(true);
+    const panelDom = getChatPanelDom().root;
+    expect(showPanelCalls).toHaveLength(1);
+    expect(showPanelCalls[0]!.title).toBe("Chat");
+    expect(showPanelCalls[0]!.owner).toBe("chat");
+    expect(showPanelCalls[0]!.content).toBe(panelDom);
+    expect(panelDom.classList.contains("read-only")).toBe(true);
   });
 });
 
@@ -260,14 +293,15 @@ describe("setupTranscriptEvents — chat actions", () => {
 
   test("toggle-tuning opens right panel", () => {
     const dom = getChatDom();
-    dom.rightPanel.classList.add("hidden");
-
     const btn = document.createElement("button");
     btn.className = "chat-action";
     btn.dataset["action"] = "toggle-tuning";
     dom.transcriptContainer.appendChild(btn);
 
     btn.click();
-    expect(dom.rightPanel.classList.contains("hidden")).toBe(false);
+    expect(showPanelCalls).toHaveLength(1);
+    expect(showPanelCalls[0]!.title).toBe("Chat");
+    expect(showPanelCalls[0]!.owner).toBe("chat");
+    expect(btn.classList.contains("active")).toBe(true);
   });
 });

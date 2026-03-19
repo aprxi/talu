@@ -20,6 +20,28 @@ let apiCalls: { method: string; args: unknown[] }[];
 let notif: ReturnType<typeof mockNotifications>;
 let createResponseResult: Response | null;
 
+const SEND_TEST_EXTRA_IDS = [
+  "welcome-settings",
+  "welcome-advanced",
+  "welcome-variant-row",
+  "welcome-variant-pills",
+  "welcome-temperature",
+  "welcome-top-p",
+  "welcome-top-k",
+  "welcome-max-tokens",
+];
+
+const SEND_TEST_EXTRA_TAGS: Record<string, string> = {
+  "welcome-settings": "button",
+  "welcome-advanced": "div",
+  "welcome-variant-row": "div",
+  "welcome-variant-pills": "div",
+  "welcome-temperature": "input",
+  "welcome-top-p": "input",
+  "welcome-top-k": "input",
+  "welcome-max-tokens": "input",
+};
+
 beforeEach(() => {
   apiCalls = [];
   notif = mockNotifications();
@@ -37,7 +59,11 @@ beforeEach(() => {
   chatState.pagination = { offset: 0, hasMore: true, isLoading: false };
 
   // DOM with proper element types.
-  const root = createDomRoot(CHAT_DOM_IDS, undefined, CHAT_DOM_TAGS);
+  const root = createDomRoot(
+    [...CHAT_DOM_IDS, ...SEND_TEST_EXTRA_IDS],
+    undefined,
+    { ...CHAT_DOM_TAGS, ...SEND_TEST_EXTRA_TAGS },
+  );
   const list = root.querySelector("#sidebar-list")!;
   const sentinel = root.querySelector("#loader-sentinel")!;
   list.appendChild(sentinel);
@@ -53,7 +79,22 @@ beforeEach(() => {
       },
       listConversations: async (params?: any) => {
         apiCalls.push({ method: "listConversations", args: [params] });
-        return { ok: true, data: { data: [{ id: "conv-1" }], has_more: false } };
+        return {
+          ok: true,
+          data: {
+            data: [{
+              id: "conv-1",
+              object: "session",
+              title: "Conversation 1",
+              created_at: 1000,
+              updated_at: 1000,
+              model: "gpt-4",
+              marker: "",
+              metadata: {},
+            }],
+            has_more: false,
+          },
+        };
       },
       getConversation: async (id: string) => {
         apiCalls.push({ method: "getConversation", args: [id] });
@@ -75,7 +116,7 @@ beforeEach(() => {
       },
     } as any,
     events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-    layout: { setTitle: () => {} } as any,
+    layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
     clipboard: { writeText: async () => {} } as any,
     download: { save: () => {} } as any,
     upload: {} as any,
@@ -266,7 +307,7 @@ describe("streamResponse", () => {
       notifications: notif.mock as any,
       services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
       upload: {} as any,
@@ -313,7 +354,7 @@ describe("streamResponse", () => {
       notifications: notif.mock as any,
       services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
       upload: {} as any,
@@ -356,6 +397,10 @@ describe("streamResponse", () => {
     const dom = getChatDom();
     const assistantMsg = dom.transcriptContainer.querySelector(".assistant-msg");
     expect(assistantMsg).not.toBeNull();
+    expect(assistantMsg!.querySelector(".assistant-body")).not.toBeNull();
+    expect(assistantMsg!.querySelector(".markdown-body")).not.toBeNull();
+    expect(assistantMsg!.querySelector(".markdown-body")!.textContent).toBe("Error: mock");
+    expect(assistantMsg!.querySelector(".markdown-body")!.classList.contains("text-danger")).toBe(true);
   });
 
   test("discovers session when discoverSession is true", async () => {
@@ -384,7 +429,7 @@ describe("streamResponse", () => {
       notifications: notif.mock as any,
       services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
       upload: {} as any,
@@ -429,7 +474,7 @@ describe("streamResponse", () => {
       notifications: notif.mock as any,
       services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
       upload: {} as any,
@@ -470,7 +515,7 @@ describe("chat.send.before hook", () => {
       notifications: notif.mock as any,
       services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
       upload: {} as any,
@@ -570,7 +615,7 @@ describe("chat.receive.after hook", () => {
       notifications: notif.mock as any,
       services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
       upload: {} as any,
@@ -620,7 +665,7 @@ describe("chat.receive.after hook", () => {
       notifications: notif.mock as any,
       services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
       upload: {} as any,
@@ -669,7 +714,7 @@ describe("chat.receive.after hook", () => {
       notifications: notif.mock as any,
       services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
       upload: {} as any,
@@ -756,7 +801,7 @@ describe("optimistic sidebar add", () => {
       notifications: notif.mock as any,
       services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
       upload: {} as any,
@@ -805,7 +850,7 @@ describe("optimistic sidebar add", () => {
       notifications: notif.mock as any,
       services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
       upload: {} as any,

@@ -125,7 +125,7 @@ describe("NetworkAccessImpl", () => {
 
     try {
       await net.fetch("/api/test");
-      expect(true).toBe(false); // Should not reach here.
+      throw new Error("Expected net.fetch to throw NetworkError");
     } catch (err) {
       expect(err instanceof NetworkError).toBe(true);
       expect((err as NetworkError).message).toContain("my.plugin");

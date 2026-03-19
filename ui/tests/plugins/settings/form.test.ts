@@ -14,6 +14,7 @@ import { initSettingsDeps } from "../../../src/plugins/settings/deps.ts";
 import { initSettingsDom, getSettingsDom } from "../../../src/plugins/settings/dom.ts";
 import { createDomRoot, SETTINGS_DOM_IDS, SETTINGS_DOM_TAGS } from "../../helpers/dom.ts";
 import type { Disposable } from "../../../src/kernel/types.ts";
+import { flushAsync } from "../../helpers/mocks.ts";
 
 /**
  * Tests for settings form — population, auto-save debouncing, model
@@ -63,6 +64,9 @@ beforeEach(() => {
     events: {
       emit: (event: string, data: unknown) => { emittedEvents.push({ event, data }); },
       on: () => ({ dispose() {} }),
+    } as any,
+    theme: {
+      onChange: () => ({ dispose() {} }),
     } as any,
     timers: {
       setTimeout(fn: () => void, ms: number): Disposable {
@@ -500,7 +504,7 @@ describe("wireEvents — debouncing", () => {
   test("system prompt enabled change triggers immediate save", async () => {
     wireEvents();
     getSettingsDom().systemPromptEnabled.dispatchEvent(new Event("change"));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
     expect(apiCalls[0]!.method).toBe("patchSettings");
   });
 
@@ -546,7 +550,7 @@ describe("wireEvents — debouncing", () => {
     dom.maxOutputTokens.dispatchEvent(new Event("input"));
     // Fire the debounced callback manually.
     timerCallbacks[0]!.fn();
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
     expect(apiCalls[0]!.method).toBe("patchSettings");
   });
 
@@ -554,7 +558,7 @@ describe("wireEvents — debouncing", () => {
     settingsState.activeModel = "gpt-4";
     wireEvents();
     getSettingsDom().resetModel.dispatchEvent(new Event("click"));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
     expect(apiCalls[0]!.method).toBe("resetModelOverrides");
   });
 });

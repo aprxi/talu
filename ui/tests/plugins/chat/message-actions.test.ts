@@ -3,7 +3,7 @@ import { chatState } from "../../../src/plugins/chat/state.ts";
 import { initChatDom, getChatDom } from "../../../src/plugins/chat/dom.ts";
 import { initChatDeps } from "../../../src/plugins/chat/deps.ts";
 import { createDomRoot, CHAT_DOM_IDS, CHAT_DOM_TAGS } from "../../helpers/dom.ts";
-import { mockTimers, mockNotifications } from "../../helpers/mocks.ts";
+import { mockTimers, mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 import type {
   Conversation,
   MessageItem,
@@ -97,7 +97,7 @@ describe("handleCopyUserMessage", () => {
     chatState.activeSessionId = "sess-1";
     handleCopyUserMessage(1);
     // Allow async clipboard promise to resolve
-    await new Promise((r) => setTimeout(r, 0));
+    await flushAsync();
     expect(clipboardText).toBe("second message");
   });
 });
@@ -113,7 +113,7 @@ describe("handleCopyAssistantMessage", () => {
     ]);
     chatState.activeSessionId = "sess-1";
     handleCopyAssistantMessage(0);
-    await new Promise((r) => setTimeout(r, 0));
+    await flushAsync();
     expect(clipboardText).toBe("I am an assistant");
   });
 
@@ -127,7 +127,7 @@ describe("handleCopyAssistantMessage", () => {
     ]);
     chatState.activeSessionId = "sess-1";
     handleCopyAssistantMessage(1);
-    await new Promise((r) => setTimeout(r, 0));
+    await flushAsync();
     expect(clipboardText).toBe("second");
   });
 
@@ -135,7 +135,7 @@ describe("handleCopyAssistantMessage", () => {
     const { handleCopyAssistantMessage } = await import("../../../src/plugins/chat/message-actions.ts");
     chatState.activeChat = null;
     handleCopyAssistantMessage(0);
-    await new Promise((r) => setTimeout(r, 0));
+    await flushAsync();
     expect(clipboardText).toBeNull();
   });
 });

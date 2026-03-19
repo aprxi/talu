@@ -421,7 +421,7 @@ impl Service<Request<Incoming>> for Router {
                                  font-src 'self'; \
                                  media-src 'self' blob:; \
                                  object-src 'none'; \
-                                 frame-src 'none'",
+                                 frame-src 'self'",
                             ),
                         );
                         resp.headers_mut().insert(
@@ -457,7 +457,7 @@ impl Service<Request<Incoming>> for Router {
                                  font-src 'self'; \
                                  media-src 'self' blob:; \
                                  object-src 'none'; \
-                                 frame-src 'none'",
+                                 frame-src 'self'",
                             ),
                         );
                         resp.headers_mut().insert(

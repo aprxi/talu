@@ -10,7 +10,7 @@ import { promptsState, DEFAULT_PROMPT_KEY } from "../../../src/plugins/prompts/s
 import { initPromptsDeps } from "../../../src/plugins/prompts/deps.ts";
 import { initPromptsDom, getPromptsDom } from "../../../src/plugins/prompts/dom.ts";
 import { createDomRoot, PROMPTS_DOM_IDS } from "../../helpers/dom.ts";
-import { mockNotifications } from "../../helpers/mocks.ts";
+import { mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 import type { Disposable } from "../../../src/kernel/types.ts";
 
 /**
@@ -263,7 +263,7 @@ describe("handleDelete", () => {
     handleDelete(); // Second click → doDelete()
 
     // Give the async doDelete() a tick to complete.
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(apiCalls.length).toBe(1);
     expect(apiCalls[0]!.method).toBe("deleteDocument");
@@ -276,7 +276,7 @@ describe("handleDelete", () => {
 
     handleDelete();
     handleDelete();
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(promptsState.prompts.length).toBe(0);
     expect(promptsState.selectedId).toBeNull();
@@ -290,7 +290,7 @@ describe("handleDelete", () => {
 
     handleDelete();
     handleDelete();
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(promptsState.defaultId).toBeNull();
     expect(apiCalls.some((c) => c.method === "patchSettings" && (c.args[0] as any).default_prompt_id === null)).toBe(true);
@@ -303,7 +303,7 @@ describe("handleDelete", () => {
 
     handleDelete();
     handleDelete();
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(promptsState.defaultId).toBeNull();
   });
@@ -422,7 +422,7 @@ describe("copyPrompt", () => {
     dom.contentInput.value = "System prompt content";
     copyPrompt();
     // Let the promise resolve.
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
     expect(clipboardText).toBe("System prompt content");
   });
 
@@ -430,7 +430,7 @@ describe("copyPrompt", () => {
     const dom = getPromptsDom();
     dom.contentInput.value = "content";
     copyPrompt();
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
     expect(notif.messages.some((m) => m.type === "success" && m.msg.includes("clipboard"))).toBe(true);
   });
 

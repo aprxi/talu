@@ -4,7 +4,7 @@ import { bState, search } from "../../../src/plugins/browser/state.ts";
 import { initBrowserDom, getBrowserDom } from "../../../src/plugins/browser/dom.ts";
 import { initBrowserDeps } from "../../../src/plugins/browser/deps.ts";
 import { createDomRoot, BROWSER_DOM_IDS, BROWSER_DOM_EXTRAS } from "../../helpers/dom.ts";
-import { mockControllableTimers } from "../../helpers/mocks.ts";
+import { mockControllableTimers, flushAsync } from "../../helpers/mocks.ts";
 
 /**
  * Tests for browser event wiring — search input debouncing, tab switching,
@@ -157,7 +157,7 @@ describe("Search debouncing", () => {
 
     // Fire the debounced callback.
     ct.pending[0]!.fn();
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(search.query).toBe("new query");
     expect(bState.pagination.currentPage).toBe(1);
@@ -172,7 +172,7 @@ describe("Search debouncing", () => {
     dom.searchInput.dispatchEvent(new Event("input"));
 
     ct.pending[0]!.fn();
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     // No API call because query didn't change.
     expect(apiCalls.length).toBe(0);

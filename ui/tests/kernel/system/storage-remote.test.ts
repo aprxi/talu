@@ -146,7 +146,7 @@ describe("StorageFacadeImpl — set", () => {
     const oversized = "x".repeat(MAX_DOCUMENT_BYTES + 1);
     try {
       await storage.set("big", oversized);
-      expect(true).toBe(false); // Should not reach.
+      throw new Error("Expected oversized payload to throw before fetch");
     } catch (err) {
       expect((err as Error).message).toContain("size limit");
       expect((err as Error).message).toContain(String(MAX_DOCUMENT_BYTES));

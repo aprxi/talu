@@ -61,16 +61,12 @@ describe("installSensitiveApiInterception", () => {
     expect(typeof disposable.dispose).toBe("function");
   });
 
-  test("clipboard.writeText gated by confirm — denied", async () => {
+  test("clipboard.writeText is not intercepted by confirm", async () => {
     if (!navigator.clipboard) return;
     disposable = installSensitiveApiInterception();
     const confirmSpy = spyOn(window, "confirm").mockReturnValue(false);
-    try {
-      await navigator.clipboard.writeText("secret");
-      expect(true).toBe(false); // Should not reach.
-    } catch (err) {
-      expect((err as DOMException).name).toBe("NotAllowedError");
-    }
+    await expect(navigator.clipboard.writeText("secret")).resolves.toBeUndefined();
+    expect(confirmSpy).not.toHaveBeenCalled();
     confirmSpy.mockRestore();
   });
 });

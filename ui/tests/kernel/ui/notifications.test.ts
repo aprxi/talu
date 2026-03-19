@@ -53,9 +53,10 @@ describe("NotificationsImpl", () => {
     expect((container.children[2] as HTMLElement).textContent).toBe("three");
   });
 
-  test("no-op when toast container missing", () => {
+  test("no-op when toast container missing leaves the document untouched", () => {
     document.body.innerHTML = "";
     const notif = new NotificationsImpl();
-    expect(() => notif.info("message")).not.toThrow();
+    notif.info("message");
+    expect(document.body.childElementCount).toBe(0);
   });
 });

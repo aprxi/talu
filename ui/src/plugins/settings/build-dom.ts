@@ -6,7 +6,7 @@
 
 export function buildSettingsDOM(root: HTMLElement): void {
   root.innerHTML = `
-    <div class="settings-content scroll-thin">
+    <div id="sp-settings-content" class="settings-content scroll-thin">
 
       <!-- Tab: Model (default visible) -->
       <div data-settings-tab="model" class="settings-page">
@@ -124,6 +124,15 @@ export function buildSettingsDOM(root: HTMLElement): void {
             <div class="settings-row-control">
               <input id="sp-context-length" type="number" step="1" min="1" placeholder="4096" class="form-input">
             </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: Bench -->
+      <div data-settings-tab="bench" class="settings-page settings-page-bench" style="display: none;">
+        <div class="settings-section">
+          <div class="settings-bench-main">
+            <iframe id="sp-bench-frame" class="settings-bench-frame" src="/bench/" title="Bench"></iframe>
           </div>
         </div>
       </div>

@@ -13,7 +13,7 @@ import { initChatDeps } from "../../../src/plugins/chat/deps.ts";
 import { initChatDom, getChatDom } from "../../../src/plugins/chat/dom.ts";
 import { initThinkingState } from "../../../src/render/helpers.ts";
 import { createDomRoot, CHAT_DOM_IDS } from "../../helpers/dom.ts";
-import { mockNotifications, mockControllableTimers } from "../../helpers/mocks.ts";
+import { mockNotifications, mockControllableTimers, flushAsync } from "../../helpers/mocks.ts";
 
 /**
  * Tests for chat actions — toggle thinking, copy, export, fork,
@@ -96,7 +96,7 @@ beforeEach(() => {
     notifications: notif.mock as any,
     services: { get: () => undefined } as any,
     events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-    layout: { setTitle: () => {} } as any,
+    layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
     clipboard: {
       writeText: async (text: string) => { clipboardText = text; },
     } as any,
@@ -208,7 +208,7 @@ describe("handleChatCopy", () => {
       notifications: notif.mock as any,
       services: { get: () => undefined } as any,
       events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       clipboard: { writeText: async () => { throw new Error("denied"); } } as any,
       download: {} as any,
       upload: {} as any,
@@ -439,7 +439,7 @@ describe("handleChatDelete", () => {
 
     handleChatDelete(btn); // First click → confirmation
     handleChatDelete(btn); // Second click → delete
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(apiCalls.length).toBe(1);
     expect(apiCalls[0]!.method).toBe("deleteConversation");
@@ -454,7 +454,7 @@ describe("handleChatDelete", () => {
 
     handleChatDelete(btn);
     handleChatDelete(btn);
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(chatState.activeSessionId).toBeNull();
     expect(chatState.activeChat).toBeNull();
@@ -468,7 +468,7 @@ describe("handleChatDelete", () => {
 
     handleChatDelete(btn);
     handleChatDelete(btn);
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(notif.messages.some((m) => m.type === "info" && m.msg.includes("Deleted"))).toBe(true);
   });
@@ -481,7 +481,7 @@ describe("handleChatDelete", () => {
 
     handleChatDelete(btn);
     handleChatDelete(btn);
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(notif.messages.some((m) => m.type === "error" && m.msg.includes("Forbidden"))).toBe(true);
   });

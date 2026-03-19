@@ -9,7 +9,7 @@
 /** Create a root element with child elements for each ID (default: div). */
 export function createDomRoot(
   elementIds: string[],
-  extras?: { tag?: string; className?: string }[],
+  extras?: { tag?: string; className?: string; attrs?: Record<string, string> }[],
   tagOverrides?: Record<string, string>,
 ): HTMLElement {
   const root = document.createElement("div");
@@ -19,9 +19,12 @@ export function createDomRoot(
     el.id = id;
     root.appendChild(el);
   }
-  for (const { tag = "div", className = "" } of extras ?? []) {
+  for (const { tag = "div", className = "", attrs = {} } of extras ?? []) {
     const el = document.createElement(tag);
     if (className) el.className = className;
+    for (const [key, value] of Object.entries(attrs)) {
+      el.setAttribute(key, value);
+    }
     root.appendChild(el);
   }
   return root;
@@ -112,6 +115,7 @@ export const SETTINGS_DOM_IDS = [
   "sp-temperature", "sp-top-p", "sp-top-k",
   "sp-temperature-default", "sp-top-p-default", "sp-top-k-default",
   "sp-model-label", "sp-reset-model", "sp-status",
+  "sp-theme-dark", "sp-theme-light", "sp-theme-new", "sp-theme-import", "sp-theme-list", "sp-theme-editor",
 ];
 
 /** Element IDs expected by getFilesDom(). */
@@ -158,6 +162,10 @@ export const SETTINGS_DOM_TAGS: Record<string, string> = {
   "sp-top-p": "input",
   "sp-top-k": "input",
   "sp-reset-model": "button",
+  "sp-theme-dark": "select",
+  "sp-theme-light": "select",
+  "sp-theme-new": "button",
+  "sp-theme-import": "button",
 };
 
 /** Element IDs expected by getRepoDom(). */
@@ -172,6 +180,14 @@ export const REPO_DOM_IDS = [
   "rp-count", "rp-select-all", "rp-pin-all", "rp-delete", "rp-cancel",
   "rp-bulk-actions",
   "rp-sort", "rp-size-filter", "rp-task-filter", "rp-library-filter",
+  "rp-providers-view", "rp-providers-list", "rp-add-provider", "rp-chat-models-list",
+  "rp-routing-main", "rp-manage-local", "rp-manage-back", "rp-hosts-list",
+  "rp-terminal-page", "rp-terminal-back", "rp-terminal-title", "rp-terminal-host",
+];
+
+export const REPO_DOM_EXTRAS: { tag: string; attrs: Record<string, string> }[] = [
+  { tag: "button", attrs: { "data-manage-tab": "local" } },
+  { tag: "button", attrs: { "data-manage-tab": "discover" } },
 ];
 
 /** Tag overrides for repo DOM elements that need specific types. */
@@ -193,4 +209,7 @@ export const REPO_DOM_TAGS: Record<string, string> = {
   "rp-size-filter": "select",
   "rp-task-filter": "select",
   "rp-library-filter": "select",
+  "rp-add-provider": "select",
+  "rp-manage-back": "button",
+  "rp-terminal-back": "button",
 };

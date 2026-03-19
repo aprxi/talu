@@ -92,26 +92,44 @@ export const settingsPlugin: PluginDefinition = {
     wireEvents();
 
     // Tab switching: show/hide settings tab pages via subnav buttons.
-    const SETTINGS_TABS = ["model", "appearance", "generation"] as const;
-    ctx.events.on<{ tab: string }>("subnav.tab", ({ tab }) => {
-      if (!(SETTINGS_TABS as readonly string[]).includes(tab)) return;
+    const SETTINGS_TABS = ["model", "appearance", "generation", "bench"] as const;
+    type SettingsTab = (typeof SETTINGS_TABS)[number];
+
+    const isSettingsTab = (tab: string): tab is SettingsTab =>
+      (SETTINGS_TABS as readonly string[]).includes(tab);
+
+    const syncSettingsSubnav = (tab: SettingsTab): void => {
+      const buttons = document.querySelectorAll<HTMLElement>(
+        '.subnav-group[data-subnav-group="settings"] .subnav-btn[data-nav-tab]',
+      );
+      buttons.forEach((button) => {
+        button.classList.toggle("active", button.getAttribute("data-nav-tab") === tab);
+      });
+    };
+
+    const showSettingsTab = (tab: SettingsTab): void => {
       for (const t of SETTINGS_TABS) {
         const el = ctx.container.querySelector<HTMLElement>(`[data-settings-tab="${t}"]`);
         if (el) el.style.display = t === tab ? "" : "none";
       }
+      const settingsContent = ctx.container.querySelector<HTMLElement>("#sp-settings-content");
+      settingsContent?.classList.toggle("is-bench-active", tab === "bench");
+      syncSettingsSubnav(tab);
+    };
+
+    ctx.events.on<{ tab: string }>("subnav.tab", ({ tab }) => {
+      if (!isSettingsTab(tab)) return;
+      showSettingsTab(tab);
       navigate({ mode: "settings", sub: tab === "model" ? null : tab, resource: null }, { replace: true });
     });
 
     // Route-driven tab switching (Back/Forward + deep links).
     ctx.subscriptions.add(onRouteChange((route) => {
       if (route.mode !== "settings") return;
-      const tab = (SETTINGS_TABS as readonly string[]).includes(route.sub ?? "")
-        ? route.sub!
+      const tab: SettingsTab = isSettingsTab(route.sub ?? "")
+        ? (route.sub as SettingsTab)
         : "model";
-      for (const t of SETTINGS_TABS) {
-        const el = ctx.container.querySelector<HTMLElement>(`[data-settings-tab="${t}"]`);
-        if (el) el.style.display = t === tab ? "" : "none";
-      }
+      showSettingsTab(tab);
     }));
 
     // Load persisted custom themes and register with kernel.

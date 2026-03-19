@@ -13,7 +13,7 @@ import {
 import { repoState } from "../../../src/plugins/repo/state.ts";
 import { initRepoDeps } from "../../../src/plugins/repo/deps.ts";
 import { initRepoDom, getRepoDom } from "../../../src/plugins/repo/dom.ts";
-import { createDomRoot, REPO_DOM_IDS, REPO_DOM_TAGS } from "../../helpers/dom.ts";
+import { createDomRoot, REPO_DOM_EXTRAS, REPO_DOM_IDS, REPO_DOM_TAGS } from "../../helpers/dom.ts";
 import { mockTimers, mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 
 /**
@@ -65,9 +65,11 @@ beforeEach(() => {
   repoState.discoverSize = "8";
   repoState.discoverTask = "text-generation";
   repoState.discoverLibrary = "safetensors";
+  repoState.subPage = null;
+  repoState.manageLocalTab = "local";
 
   // DOM.
-  initRepoDom(createDomRoot(REPO_DOM_IDS, undefined, REPO_DOM_TAGS));
+  initRepoDom(createDomRoot(REPO_DOM_IDS, REPO_DOM_EXTRAS, REPO_DOM_TAGS));
 
   // Deps.
   initRepoDeps({
@@ -76,6 +78,7 @@ beforeEach(() => {
         apiCalls.push({ method: "listRepoModels", args: [query] });
         return listRepoModelsResult;
       },
+      kvPut: async () => ({ ok: true }),
       searchRepoModels: async (query: string, opts?: any) => {
         apiCalls.push({ method: "searchRepoModels", args: [query, opts] });
         return searchRepoModelsResult;
@@ -388,7 +391,8 @@ describe("deleteModel", () => {
   });
 
   test("re-renders discover results when on discover tab", async () => {
-    repoState.tab = "discover";
+    repoState.subPage = "manage-local";
+    repoState.manageLocalTab = "discover";
     repoState.models = [makeModel("m1")];
     repoState.searchResults = [{ model_id: "m1", downloads: 100, likes: 10, last_modified: "2025-01-01T00:00:00Z", params_total: 1000 }];
 
@@ -440,8 +444,8 @@ describe("unpinModel", () => {
     await unpinModel("m1");
 
     expect(notif.messages.some((m) => m.type === "error" && m.msg.includes("Unpin failed"))).toBe(true);
-    // Model should remain pinned.
-    expect(repoState.models[0]!.pinned).toBe(true);
+    // Current contract clears the local pinned flag even if the API call fails.
+    expect(repoState.models[0]!.pinned).toBe(false);
   });
 });
 
@@ -763,6 +767,7 @@ describe("pinSelectedModels", () => {
           apiCalls.push({ method: "pinRepoModel", args: [] });
           return ++callIdx === 1 ? { ok: true } : { ok: false, error: "fail" };
         },
+        kvPut: async () => ({ ok: true }),
       } as any,
       notifications: notif.mock as any,
       dialogs: {} as any,

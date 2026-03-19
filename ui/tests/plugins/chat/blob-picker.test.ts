@@ -1,7 +1,7 @@
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, spyOn } from "bun:test";
 import { openBlobPicker } from "../../../src/plugins/chat/blob-picker.ts";
 import { initChatDeps } from "../../../src/plugins/chat/deps.ts";
-import { mockTimers, mockNotifications } from "../../helpers/mocks.ts";
+import { mockTimers, mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 import type { FileObject } from "../../../src/types.ts";
 
 /**
@@ -59,7 +59,7 @@ beforeEach(() => {
 
 /** Flush the async API call that happens on open. */
 async function flushOpen(): Promise<void> {
-  await new Promise((r) => setTimeout(r, 0));
+  await flushAsync();
 }
 
 // ── Open and dismiss ────────────────────────────────────────────────────────
@@ -252,10 +252,18 @@ describe("openBlobPicker — search", () => {
     const promise = openBlobPicker();
     await flushOpen();
     const search = document.querySelector<HTMLInputElement>(".blob-picker-search")!;
+    let pendingSearch: (() => void) | null = null;
+    const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation((fn: TimerHandler) => {
+      pendingSearch = fn as () => void;
+      return 1 as any;
+    });
+    const clearTimeoutSpy = spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
     search.value = "img1";
     search.dispatchEvent(new Event("input"));
-    // Wait for debounce (150ms)
-    await new Promise((r) => setTimeout(r, 200));
+    expect(pendingSearch).not.toBeNull();
+    pendingSearch!();
+    clearTimeoutSpy.mockRestore();
+    setTimeoutSpy.mockRestore();
     const rows = document.querySelectorAll(".files-row");
     expect(rows.length).toBe(1);
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));

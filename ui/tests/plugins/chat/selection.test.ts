@@ -65,7 +65,7 @@ beforeEach(() => {
     observe: { onResize: () => ({ dispose() {} }) } as any,
     format: { dateTime: () => "2024-01-01" } as any,
     upload: { upload: async () => ({}) } as any,
-    layout: { setTitle: (t: string) => { titleSet = t; } } as any,
+    layout: { setTitle: (t: string) => { titleSet = t; }, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
     menus: { registerItem: () => ({ dispose() {} }), renderSlot: () => ({ dispose() {} }) } as any,
   });
 });
@@ -141,7 +141,7 @@ describe("selectChat", () => {
       observe: { onResize: () => ({ dispose() {} }) } as any,
       format: { dateTime: () => "" } as any,
       upload: { upload: async () => ({}) } as any,
-      layout: { setTitle: () => {} } as any,
+      layout: { setTitle: () => {}, showPanel: () => ({ dispose() {} }), hidePanel: () => {} } as any,
       menus: { registerItem: () => ({ dispose() {} }), renderSlot: () => ({ dispose() {} }) } as any,
     });
 
