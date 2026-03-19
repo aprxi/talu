@@ -121,9 +121,20 @@ pub const Selection = enum {
     cuda,
 };
 
+pub const CudaTopologyMode = enum {
+    single,
+    pipeline2,
+};
+
+pub const CudaTopologyConfig = struct {
+    mode: CudaTopologyMode = .single,
+    stage_device_ordinals: [2]usize = .{ 0, 1 },
+};
+
 /// Backend initialization options selected at startup/config layer.
 pub const InitOptions = struct {
     selection: Selection = .auto,
+    cuda_topology: ?CudaTopologyConfig = null,
 };
 
 fn shouldPreserveNativeNormDType(selection: Selection) bool {
@@ -162,6 +173,15 @@ fn optionalSelectionName(selection: ?Selection) []const u8 {
 
 const CudaProbe = compute.cuda.Probe;
 
+const CudaTopology = struct {
+    mode: CudaTopologyMode = .single,
+    stage_device_ordinals: [2]usize = .{ 0, 1 },
+
+    fn primaryDeviceOrdinal(self: *const CudaTopology) usize {
+        return self.stage_device_ordinals[0];
+    }
+};
+
 fn cudaProbeName(probe: CudaProbe) []const u8 {
     return @tagName(probe);
 }
@@ -169,6 +189,76 @@ fn cudaProbeName(probe: CudaProbe) []const u8 {
 fn probeCudaRuntime() CudaProbe {
     if (!has_cuda) return .disabled;
     return compute.cuda.probeRuntime();
+}
+
+fn parseCudaTopologyMode(raw: []const u8) ?CudaTopologyMode {
+    const token = std.mem.trim(u8, raw, " \t\r\n");
+    if (token.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(token, "single")) return .single;
+    if (std.ascii.eqlIgnoreCase(token, "pipeline2")) return .pipeline2;
+    if (std.ascii.eqlIgnoreCase(token, "pipeline_2")) return .pipeline2;
+    if (std.ascii.eqlIgnoreCase(token, "pipeline_2way")) return .pipeline2;
+    return null;
+}
+
+fn parseTwoDeviceOrdinals(raw: []const u8) ?[2]usize {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    var iter = std.mem.splitScalar(u8, trimmed, ',');
+    const left_raw = iter.next() orelse return null;
+    const right_raw = iter.next() orelse return null;
+    if (iter.next() != null) return null;
+    const left = std.fmt.parseUnsigned(usize, std.mem.trim(u8, left_raw, " \t\r\n"), 10) catch return null;
+    const right = std.fmt.parseUnsigned(usize, std.mem.trim(u8, right_raw, " \t\r\n"), 10) catch return null;
+    return .{ left, right };
+}
+
+fn resolveCudaTopology(
+    allocator: std.mem.Allocator,
+    topology_override: ?CudaTopologyConfig,
+) CudaTopology {
+    var topology = CudaTopology{};
+    if (topology_override) |cfg| {
+        topology.mode = cfg.mode;
+        topology.stage_device_ordinals = cfg.stage_device_ordinals;
+        return topology;
+    }
+
+    const mode_raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_TOPOLOGY") catch null;
+    if (mode_raw) |value| {
+        defer allocator.free(value);
+        if (parseCudaTopologyMode(value)) |mode| {
+            topology.mode = mode;
+        } else {
+            log.warn("inference", "Invalid TALU_CUDA_TOPOLOGY; using single", .{ .value = value });
+        }
+    }
+
+    const devices_raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_STAGE_DEVICES") catch null;
+    if (devices_raw) |value| {
+        defer allocator.free(value);
+        if (parseTwoDeviceOrdinals(value)) |ordinals| {
+            topology.stage_device_ordinals = ordinals;
+        } else {
+            log.warn("inference", "Invalid TALU_CUDA_STAGE_DEVICES; expected '<gpu0>,<gpu1>'", .{ .value = value });
+        }
+    }
+
+    const single_device_raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_DEVICE") catch null;
+    if (single_device_raw) |value| {
+        defer allocator.free(value);
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+            log.warn("inference", "Invalid TALU_CUDA_DEVICE; keeping topology primary device", .{
+                .value = trimmed,
+                .current = topology.stage_device_ordinals[0],
+            });
+            return topology;
+        };
+        topology.stage_device_ordinals[0] = parsed;
+    }
+
+    return topology;
 }
 
 fn resolveCudaMaxBatchSize() usize {
@@ -264,7 +354,7 @@ pub const Backend = union(enum) {
         switch (selected) {
             .cpu => return initCpu(allocator, loaded, "configured", progress),
             .metal => return initMetal(allocator, loaded, "configured"),
-            .cuda => return initCuda(allocator, loaded, "configured", cuda_probe),
+            .cuda => return initCuda(allocator, loaded, "configured", cuda_probe, init_options.cuda_topology),
             .auto => {},
         }
 
@@ -744,6 +834,7 @@ fn initCuda(
     loaded: *LoadedModel,
     reason: []const u8,
     probe: CudaProbe,
+    topology_override: ?CudaTopologyConfig,
 ) !Backend {
     if (!has_cuda) {
         return error.CudaNotEnabled;
@@ -752,11 +843,27 @@ fn initCuda(
         log.info("inference", "CUDA runtime unavailable", .{ .reason = cudaProbeName(probe) });
         return error.CudaUnavailable;
     }
+    const topology = resolveCudaTopology(allocator, topology_override);
+    if (topology.mode != .single) {
+        log.err("inference", "CUDA topology mode is configured but not yet implemented", .{
+            .mode = @tagName(topology.mode),
+            .stage0 = topology.stage_device_ordinals[0],
+            .stage1 = topology.stage_device_ordinals[1],
+        }, @src());
+        return error.NotImplemented;
+    }
     const cuda_max_batch_size = resolveCudaMaxBatchSize();
     log.info("inference", "CUDA backend init config", .{
         .max_batch = cuda_max_batch_size,
+        .topology = @tagName(topology.mode),
+        .device = topology.primaryDeviceOrdinal(),
     });
-    const cuda_backend_state = try cuda.BackendType.init(allocator, loaded, cuda_max_batch_size);
+    const cuda_backend_state = if (has_cuda)
+        try cuda.BackendType.init(allocator, loaded, cuda_max_batch_size, .{
+            .device_ordinal = topology.primaryDeviceOrdinal(),
+        })
+    else
+        unreachable;
     log.info("inference", "Backend selected: cuda", .{ .reason = reason });
     return .{ .cuda = cuda_backend_state };
 }
@@ -855,6 +962,34 @@ test "parseSelectionToken rejects unsupported values" {
     try std.testing.expectEqual(@as(?Selection, null), parseSelectionToken("rocm"));
 }
 
+test "parseCudaTopologyMode parses supported modes" {
+    try std.testing.expectEqual(CudaTopologyMode.single, parseCudaTopologyMode("single").?);
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("pipeline2").?);
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("pipeline_2way").?);
+}
+
+test "parseCudaTopologyMode rejects unsupported modes" {
+    try std.testing.expectEqual(@as(?CudaTopologyMode, null), parseCudaTopologyMode(""));
+    try std.testing.expectEqual(@as(?CudaTopologyMode, null), parseCudaTopologyMode("mesh"));
+}
+
+test "parseTwoDeviceOrdinals parses gpu pairs" {
+    try std.testing.expectEqualDeep(@as([2]usize, .{ 0, 1 }), parseTwoDeviceOrdinals("0,1").?);
+    try std.testing.expectEqualDeep(@as([2]usize, .{ 3, 9 }), parseTwoDeviceOrdinals(" 3 , 9 ").?);
+    try std.testing.expectEqual(@as(?[2]usize, null), parseTwoDeviceOrdinals("0"));
+    try std.testing.expectEqual(@as(?[2]usize, null), parseTwoDeviceOrdinals("a,1"));
+    try std.testing.expectEqual(@as(?[2]usize, null), parseTwoDeviceOrdinals("0,1,2"));
+}
+
+test "resolveCudaTopology honors explicit override" {
+    const topology = resolveCudaTopology(std.testing.allocator, .{
+        .mode = .pipeline2,
+        .stage_device_ordinals = .{ 4, 5 },
+    });
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, topology.mode);
+    try std.testing.expectEqualDeep(@as([2]usize, .{ 4, 5 }), topology.stage_device_ordinals);
+}
+
 test "optionalSelectionName returns tag or unset" {
     try std.testing.expectEqualStrings("unset", optionalSelectionName(null));
     try std.testing.expectEqualStrings("cpu", optionalSelectionName(.cpu));
@@ -877,7 +1012,7 @@ test "initCuda returns CudaNotEnabled when build target has no CUDA backend" {
     const undefined_loaded: *LoadedModel = undefined;
     try std.testing.expectError(
         error.CudaNotEnabled,
-        initCuda(std.testing.allocator, undefined_loaded, "test", .disabled),
+        initCuda(std.testing.allocator, undefined_loaded, "test", .disabled, null),
     );
 }
 
@@ -886,7 +1021,7 @@ test "initCuda returns CudaUnavailable when runtime probe is unavailable" {
     const undefined_loaded: *LoadedModel = undefined;
     try std.testing.expectError(
         error.CudaUnavailable,
-        initCuda(std.testing.allocator, undefined_loaded, "test", .driver_not_found),
+        initCuda(std.testing.allocator, undefined_loaded, "test", .driver_not_found, null),
     );
 }
 

@@ -3068,8 +3068,17 @@ pub const CudaBackend = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel, max_batch_size: usize) !CudaBackend {
-        var device = try compute.cuda.Device.init();
+    pub const InitOptions = struct {
+        device_ordinal: usize = 0,
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        loaded: *LoadedModel,
+        max_batch_size: usize,
+        init_options: InitOptions,
+    ) !CudaBackend {
+        var device = try compute.cuda.Device.initAt(init_options.device_ordinal);
         errdefer device.deinit();
         if (max_batch_size == 0) return error.InvalidArgument;
         const model_max_seq_len: usize = @intCast(loaded.config.max_seq_len);
@@ -3081,7 +3090,10 @@ pub const CudaBackend = struct {
         const resolved_memory_reserve_bytes = resolveCudaMemoryReserveBytes();
         const resolved_external_overhead_cap_bytes = resolveCudaExternalOverheadCapBytes();
 
-        log.info("inference", "CUDA device ready", .{ .name = device.name() });
+        log.info("inference", "CUDA device ready", .{
+            .name = device.name(),
+            .ordinal = device.ordinal(),
+        });
         var backend = CudaBackend{
             .allocator = allocator,
             .loaded = loaded,
