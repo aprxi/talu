@@ -37,6 +37,7 @@ pub mod settings;
 pub mod state;
 pub mod tags;
 pub mod tenant;
+pub mod tokenizer;
 
 const DEFAULT_MAX_FILE_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_MAX_FILE_INSPECT_BYTES: u64 = 50 * 1024 * 1024;
@@ -325,6 +326,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         process_session_ttl: listen::PROCESS_SESSION_TTL,
         kv_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         collab_handles: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        tokenizer_instances: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         agent_runtime_mode: args.agent_runtime_mode,
         sandbox_backend,
         pubsub: tokio::sync::Mutex::new(pubsub::PubSubState::new()),

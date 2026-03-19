@@ -30,6 +30,7 @@ fn build_app_zero_ttl() -> (Router, Arc<AppState>) {
         process_session_ttl: std::time::Duration::from_secs(15 * 60),
         kv_handles: Mutex::new(HashMap::new()),
         collab_handles: Mutex::new(HashMap::new()),
+        tokenizer_instances: Mutex::new(HashMap::new()),
         agent_runtime_mode: talu_cli::server::AgentRuntimeMode::Host,
         sandbox_backend: talu_cli::server::SandboxBackend::LinuxLocal,
         pubsub: Mutex::new(talu_cli::server::pubsub::PubSubState::new()),

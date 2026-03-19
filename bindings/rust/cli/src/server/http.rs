@@ -45,6 +45,7 @@ use crate::server::settings;
 use crate::server::state::AppState;
 use crate::server::state::PluginTokenEntry;
 use crate::server::tags;
+use crate::server::tokenizer;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
@@ -502,6 +503,72 @@ impl Service<Request<Incoming>> for Router {
                         }
                         (Method::POST, "/v1/responses") => {
                             responses::handle_create(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/instances") => {
+                            tokenizer::handle_create_instance(state, req, auth).await
+                        }
+                        (Method::GET, p) if p.starts_with("/v1/tokenizer/instances/") => {
+                            tokenizer::handle_get_instance(state, req, auth).await
+                        }
+                        (Method::DELETE, p) if p.starts_with("/v1/tokenizer/instances/") => {
+                            tokenizer::handle_delete_instance(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/encode") => {
+                            tokenizer::handle_encode(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/encode_batch") => {
+                            tokenizer::handle_encode_batch(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/decode") => {
+                            tokenizer::handle_decode(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/decode_batch") => {
+                            tokenizer::handle_decode_batch(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/tokenizer/vocab") => {
+                            tokenizer::handle_vocab(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/tokenizer/vocab_size") => {
+                            tokenizer::handle_vocab_size(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/token_to_id") => {
+                            tokenizer::handle_token_to_id(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/id_to_token") => {
+                            tokenizer::handle_id_to_token(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/add_tokens") => {
+                            tokenizer::handle_add_tokens(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/add_special_tokens") => {
+                            tokenizer::handle_add_special_tokens(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/enable_truncation") => {
+                            tokenizer::handle_enable_truncation(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/disable_truncation") => {
+                            tokenizer::handle_disable_truncation(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/enable_padding") => {
+                            tokenizer::handle_enable_padding(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/disable_padding") => {
+                            tokenizer::handle_disable_padding(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/train") => {
+                            tokenizer::handle_train(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/train_from_iterator") => {
+                            tokenizer::handle_train_from_iterator(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/save") => {
+                            tokenizer::handle_save(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tokenizer/compare") => {
+                            tokenizer::handle_compare(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/tokenizer/capabilities") => {
+                            tokenizer::handle_capabilities(state, req, auth).await
                         }
                         (Method::POST, "/v1/agent/fs/read") => {
                             if let Some(resp) = enforce_plugin_agent_capability(

@@ -565,19 +565,19 @@ fn drain_available_logs(rx: &Receiver<String>, logs: &mut Vec<String>) {
 }
 
 fn talu_bin_path() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_talu") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return path;
-        }
-    }
-
     if let Ok(path) = std::env::var("TALU_CLI_BIN") {
         let path = PathBuf::from(path);
         if path.exists() {
             return path;
         }
         panic!("TALU_CLI_BIN set but not found: {}", path.display());
+    }
+
+    if let Some(path) = option_env!("CARGO_BIN_EXE_talu") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return path;
+        }
     }
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

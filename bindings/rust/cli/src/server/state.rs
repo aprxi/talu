@@ -11,6 +11,7 @@ use talu::policy::Policy;
 use talu::InferenceBackend;
 
 use crate::server::tenant::TenantRegistry;
+use crate::server::tokenizer::TokenizerInstance;
 use crate::server::{AgentRuntimeMode, SandboxBackend};
 
 /// Result of an in-flight model load, broadcast to waiters via `watch` channel.
@@ -152,6 +153,8 @@ pub struct AppState {
     pub kv_handles: Mutex<HashMap<String, Arc<Mutex<KvHandle>>>>,
     /// Shared long-lived collab resource handles keyed by `<root>\0<kind>\0<id>`.
     pub collab_handles: Mutex<HashMap<String, CollabHandleEntry>>,
+    /// Stateful tokenizer handles keyed by `tokenizer_id` for `/v1/tokenizer/*`.
+    pub tokenizer_instances: Mutex<HashMap<String, TokenizerInstance>>,
     /// Agent terminal runtime mode (`host` vs `strict`).
     pub agent_runtime_mode: AgentRuntimeMode,
     /// Selected sandbox backend.

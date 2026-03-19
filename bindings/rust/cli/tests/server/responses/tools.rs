@@ -1,6 +1,8 @@
 //! `/v1/responses` tools and tool_choice round-trip tests.
 
-use crate::server::common::{model_config, post_json, require_model, ServerConfig, ServerTestContext};
+use crate::server::common::{
+    model_config, post_json, require_model, ServerConfig, ServerTestContext,
+};
 
 fn tool_definition() -> serde_json::Value {
     serde_json::json!([{
@@ -261,7 +263,11 @@ fn responses_accepts_flat_format_tools() {
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     // Without a model, we won't get 200, but we must NOT get 400 (validation error).
-    assert_ne!(resp.status, 400, "flat-format tools should pass validation: {}", resp.body);
+    assert_ne!(
+        resp.status, 400,
+        "flat-format tools should pass validation: {}",
+        resp.body
+    );
 }
 
 /// Multiple flat-format tools accepted (parallel call scenario).
@@ -286,7 +292,11 @@ fn responses_accepts_multiple_flat_tools() {
         ]
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "multiple flat tools should pass validation: {}", resp.body);
+    assert_ne!(
+        resp.status, 400,
+        "multiple flat tools should pass validation: {}",
+        resp.body
+    );
 }
 
 /// Tool names with dots must be rejected (server enforces ^[a-zA-Z0-9_-]{1,64}$).
@@ -303,7 +313,11 @@ fn responses_rejects_tool_name_with_dots() {
         }]
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "dot in tool name should be rejected: {}", resp.body);
+    assert_eq!(
+        resp.status, 400,
+        "dot in tool name should be rejected: {}",
+        resp.body
+    );
 }
 
 /// Tool names with underscores are accepted (sanitized BFCL names).
@@ -320,7 +334,11 @@ fn responses_accepts_tool_name_with_underscores() {
         }]
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "underscore tool name should pass: {}", resp.body);
+    assert_ne!(
+        resp.status, 400,
+        "underscore tool name should pass: {}",
+        resp.body
+    );
 }
 
 /// Tool names with hyphens are accepted.
@@ -337,7 +355,11 @@ fn responses_accepts_tool_name_with_hyphens() {
         }]
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "hyphen tool name should pass: {}", resp.body);
+    assert_ne!(
+        resp.status, 400,
+        "hyphen tool name should pass: {}",
+        resp.body
+    );
 }
 
 /// Tool name exceeding 64 chars is rejected.
@@ -355,7 +377,11 @@ fn responses_rejects_tool_name_too_long() {
         }]
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "65-char tool name should be rejected: {}", resp.body);
+    assert_eq!(
+        resp.status, 400,
+        "65-char tool name should be rejected: {}",
+        resp.body
+    );
 }
 
 /// Empty tool name is rejected.
@@ -372,7 +398,11 @@ fn responses_rejects_empty_tool_name() {
         }]
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "empty tool name should be rejected: {}", resp.body);
+    assert_eq!(
+        resp.status, 400,
+        "empty tool name should be rejected: {}",
+        resp.body
+    );
 }
 
 /// Tool missing name field is rejected.
@@ -387,7 +417,11 @@ fn responses_rejects_tool_missing_name() {
         }]
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "tool without name should be rejected: {}", resp.body);
+    assert_eq!(
+        resp.status, 400,
+        "tool without name should be rejected: {}",
+        resp.body
+    );
 }
 
 /// tool_choice "none" with tools is accepted (model should not call tools).
@@ -405,7 +439,11 @@ fn responses_accepts_tool_choice_none_with_tools() {
         "tool_choice": "none"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "tool_choice none with tools should pass: {}", resp.body);
+    assert_ne!(
+        resp.status, 400,
+        "tool_choice none with tools should pass: {}",
+        resp.body
+    );
 }
 
 /// tool_choice "auto" is accepted.
@@ -423,7 +461,11 @@ fn responses_accepts_tool_choice_auto() {
         "tool_choice": "auto"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "tool_choice auto should pass: {}", resp.body);
+    assert_ne!(
+        resp.status, 400,
+        "tool_choice auto should pass: {}",
+        resp.body
+    );
 }
 
 /// tool_choice "required" is accepted.
@@ -441,7 +483,11 @@ fn responses_accepts_tool_choice_required() {
         "tool_choice": "required"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "tool_choice required should pass: {}", resp.body);
+    assert_ne!(
+        resp.status, 400,
+        "tool_choice required should pass: {}",
+        resp.body
+    );
 }
 
 /// Tools + max_reasoning_tokens=0 (thinking disabled) must not crash.
@@ -535,5 +581,9 @@ fn responses_rejects_invalid_tool_choice_string() {
         "tool_choice": "always"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "invalid tool_choice 'always' should be rejected: {}", resp.body);
+    assert_eq!(
+        resp.status, 400,
+        "invalid tool_choice 'always' should be rejected: {}",
+        resp.body
+    );
 }
