@@ -597,7 +597,52 @@
 
 .settings-content {
   height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   overflow-y: auto;
+}
+
+.settings-content.is-bench-active {
+  overflow: hidden;
+}
+
+.settings-content.is-bench-active #sp-status {
+  display: none;
+}
+
+.settings-page.settings-page-bench {
+  max-width: none;
+  height: auto;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+
+.settings-page.settings-page-bench .settings-section {
+  margin: 0;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-bench-main {
+  margin-top: 0;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.settings-bench-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: none;
+  border-radius: 0;
+  background: var(--bg);
 }
 
 /* =============================================================================
