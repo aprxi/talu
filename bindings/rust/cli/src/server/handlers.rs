@@ -856,7 +856,11 @@ async fn generate_response(
     let tools_json_for_generation = effective_tools.as_ref().map(|v| v.to_string());
     let tool_choice_for_generation = effective_tool_choice.as_ref().map(|v| v.to_string());
     let reasoning_effort_for_generation = reasoning.effort.clone();
-    let batch_scheduler_for_task = state.batch_scheduler.lock().unwrap().clone();
+    let batch_scheduler_for_task = if std::env::var("TALU_DISABLE_BATCH").is_ok() {
+        None
+    } else {
+        state.batch_scheduler.lock().unwrap().clone()
+    };
     let (output_items, prompt_tokens, completion_tokens, prefill_ns, generation_ns, result_ttft_ns, responses_json, model_info_json, response_status, incomplete_reason) =
         tokio::task::spawn_blocking(move || {
             // Create ChatHandle with system prompt if prompt_id was provided
@@ -921,6 +925,8 @@ async fn generate_response(
                 cfg.temperature = eff.temperature;
                 cfg.top_k = eff.top_k;
                 cfg.top_p = eff.top_p;
+                cfg.min_p = eff.min_p;
+                cfg.repetition_penalty = eff.repetition_penalty;
                 cfg.presence_penalty = eff.presence_penalty;
                 cfg.frequency_penalty = eff.frequency_penalty;
                 cfg.seed = eff.seed;
@@ -1814,7 +1820,11 @@ async fn stream_response(
         }));
         let ctx_for_complete = ctx.clone();
 
-        let batch_sched = state_for_store.batch_scheduler.lock().unwrap().clone();
+        let batch_sched = if std::env::var("TALU_DISABLE_BATCH").is_ok() {
+            None
+        } else {
+            state_for_store.batch_scheduler.lock().unwrap().clone()
+        };
         let gen_result = if let Some(ref sched) = batch_sched {
             run_batch_streaming_generation(
                 sched,
@@ -2020,6 +2030,8 @@ fn run_streaming_generation(
         cfg.temperature = eff.temperature;
         cfg.top_k = eff.top_k;
         cfg.top_p = eff.top_p;
+        cfg.min_p = eff.min_p;
+        cfg.repetition_penalty = eff.repetition_penalty;
         cfg.presence_penalty = eff.presence_penalty;
         cfg.frequency_penalty = eff.frequency_penalty;
         cfg.seed = eff.seed;
@@ -2233,6 +2245,8 @@ fn run_batch_streaming_generation(
         cfg.temperature = eff.temperature;
         cfg.top_k = eff.top_k;
         cfg.top_p = eff.top_p;
+        cfg.min_p = eff.min_p;
+        cfg.repetition_penalty = eff.repetition_penalty;
         cfg.presence_penalty = eff.presence_penalty;
         cfg.frequency_penalty = eff.frequency_penalty;
         cfg.seed = eff.seed;

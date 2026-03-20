@@ -61,6 +61,10 @@ const MAX_TAG_LEN = 64;
 /// Maximum text accumulation per request (64 KiB delta buffer).
 const MAX_DELTA_BUF = 65536;
 
+/// Maximum number of typed text segments emitted from one decoded chunk after
+/// reasoning-tag filtering.
+const MAX_FILTER_SEGMENTS = 64;
+
 // =============================================================================
 // Event Types
 // =============================================================================
@@ -299,6 +303,19 @@ pub const BatchWrapper = struct {
         };
         defer self.engine.allocator.free(prompt);
 
+        {
+            const tail_len = @min(prompt.len, 200);
+            const tail_start = prompt.len - tail_len;
+            log.info("batch", "submit", .{
+                .prompt_len = prompt.len,
+                .prompt_tail = prompt[tail_start..],
+                .effective_context = effective_context orelse "(null)",
+                .temperature = opts.temperature orelse -99.0,
+                .top_k = opts.top_k orelse 999999,
+                .max_tokens = opts.max_tokens orelse 0,
+            });
+        }
+
         // Detect reasoning start state.
         starts_in_reasoning = chat_template.promptEndsWithReasoningTag(prompt, opts.reasoning_tag);
         state.starts_in_reasoning = starts_in_reasoning;
@@ -490,6 +507,11 @@ pub const BatchWrapper = struct {
                 if (raw.is_final) {
                     try self.completeRequest(raw.request_id, state, .eos_token);
                     if (event_count < events_out.len) {
+                        const now_ns = std.time.nanoTimestamp();
+                        const elapsed_ns: i128 = if (now_ns > state.start_ns)
+                            now_ns - state.start_ns
+                        else
+                            0;
                         events_out[event_count] = .{
                             .request_id = raw.request_id,
                             .event_type = .completed,
@@ -499,7 +521,7 @@ pub const BatchWrapper = struct {
                             .text = "",
                             .token_id = raw.token,
                             .tokens_generated = state.engine_token_count,
-                            .timestamp_ns = std.time.nanoTimestamp(),
+                            .timestamp_ns = elapsed_ns,
                         };
                         event_count += 1;
                     }
@@ -521,6 +543,15 @@ pub const BatchWrapper = struct {
             // Decode token to raw bytes with context.
             const decoded_raw = try decodeTokenWithContext(self.engine, state, raw.token);
             defer self.engine.allocator.free(decoded_raw);
+
+            if (state.engine_token_count <= 20) {
+                log.info("batch", "token", .{
+                    .n = state.engine_token_count,
+                    .id = raw.token,
+                    .text = decoded_raw,
+                    .is_final = raw.is_final,
+                });
+            }
 
             if (decoded_raw.len > 0) {
                 state.decode_context_token = raw.token;
@@ -569,46 +600,56 @@ pub const BatchWrapper = struct {
             if (valid.len == 0 and !raw.is_final) continue;
 
             // Classify text via reasoning filter / tool mode.
-            var item_type: u8 = @intFromEnum(ItemType.message);
-            var content_type: u8 = @intFromEnum(ContentType.output_text);
-            var emit_text: []const u8 = valid;
-
-            if (state.raw_output) {
-                // Raw mode: no filtering.
-            } else {
-                // Reasoning tag filter: classify and strip tags.
-                // Applies to tool generations too — models think first,
-                // then output tool calls in their native format.
-                const filter_result = filterReasoningTags(state, valid);
-                emit_text = filter_result.text;
-                if (state.filter_state == .reasoning) {
-                    item_type = @intFromEnum(ItemType.reasoning);
-                    content_type = @intFromEnum(ContentType.reasoning_text);
-                } else if (state.is_tool_generation) {
-                    item_type = @intFromEnum(ItemType.function_call);
-                    content_type = @intFromEnum(ContentType.output_text);
-                }
+            // A decoded chunk can cross reasoning boundaries (e.g.
+            // "reasoning</think>answer"), so we emit per-segment typed deltas
+            // instead of assigning one type to the whole chunk.
+            var filter_segments: [MAX_FILTER_SEGMENTS]FilteredSegment = undefined;
+            var filtered_text: []const u8 = valid;
+            var segments: []const FilteredSegment = &.{};
+            if (!state.raw_output) {
+                const filter_result = filterReasoningTags(state, valid, &filter_segments);
+                filtered_text = filter_result.text;
+                segments = filter_result.segments;
+            } else if (valid.len > 0) {
+                filter_segments[0] = .{
+                    .start = 0,
+                    .len = valid.len,
+                    .filter_state = .normal,
+                };
+                segments = filter_segments[0..1];
             }
 
-            // Accumulate text.
-            if (emit_text.len > 0) {
-                try state.text_buf.appendSlice(allocator, emit_text);
-                const delta_start = state.delta_buf.items.len;
-                try state.delta_buf.appendSlice(allocator, emit_text);
+            var final_types = classifySegment(state, state.filter_state);
 
-                if (event_count < events_out.len) {
-                    events_out[event_count] = .{
-                        .request_id = raw.request_id,
-                        .event_type = .text_delta,
-                        .item_type = item_type,
-                        .content_type = content_type,
-                        .is_final = false,
-                        .text = state.delta_buf.items[delta_start..],
-                        .token_id = raw.token,
-                        .tokens_generated = state.engine_token_count,
-                        .timestamp_ns = std.time.nanoTimestamp(),
-                    };
-                    event_count += 1;
+            // Accumulate text once, then emit per-segment events.
+            if (filtered_text.len > 0) {
+                try state.text_buf.appendSlice(allocator, filtered_text);
+                const delta_base = state.delta_buf.items.len;
+                try state.delta_buf.appendSlice(allocator, filtered_text);
+
+                for (segments) |seg| {
+                    if (seg.len == 0) continue;
+                    const seg_types = classifySegment(state, seg.filter_state);
+                    final_types = seg_types;
+                    if (event_count < events_out.len) {
+                        const now_ns = std.time.nanoTimestamp();
+                        const elapsed_ns: i128 = if (now_ns > state.start_ns)
+                            now_ns - state.start_ns
+                        else
+                            0;
+                        events_out[event_count] = .{
+                            .request_id = raw.request_id,
+                            .event_type = .text_delta,
+                            .item_type = seg_types.item_type,
+                            .content_type = seg_types.content_type,
+                            .is_final = false,
+                            .text = state.delta_buf.items[delta_base + seg.start .. delta_base + seg.start + seg.len],
+                            .token_id = raw.token,
+                            .tokens_generated = state.engine_token_count,
+                            .timestamp_ns = elapsed_ns,
+                        };
+                        event_count += 1;
+                    }
                 }
             }
 
@@ -619,16 +660,21 @@ pub const BatchWrapper = struct {
                 try self.completeRequest(raw.request_id, state, finish_reason);
 
                 if (event_count < events_out.len) {
+                    const now_ns = std.time.nanoTimestamp();
+                    const elapsed_ns: i128 = if (now_ns > state.start_ns)
+                        now_ns - state.start_ns
+                    else
+                        0;
                     events_out[event_count] = .{
                         .request_id = raw.request_id,
                         .event_type = .completed,
-                        .item_type = item_type,
-                        .content_type = content_type,
+                        .item_type = final_types.item_type,
+                        .content_type = final_types.content_type,
                         .is_final = true,
                         .text = "",
                         .token_id = raw.token,
                         .tokens_generated = state.engine_token_count,
-                        .timestamp_ns = std.time.nanoTimestamp(),
+                        .timestamp_ns = elapsed_ns,
                     };
                     event_count += 1;
                 }
@@ -824,21 +870,98 @@ fn decodeTokenWithContext(engine: *LocalEngine, state: *const RequestState, toke
     );
 }
 
+/// Typed text segment emitted by reasoning-tag filtering.
+const FilteredSegment = struct {
+    start: usize,
+    len: usize,
+    filter_state: FilterState,
+};
+
 /// Result of reasoning tag filtering.
 const FilterResult = struct {
     /// Text to emit (may be empty if all text was tag content).
     text: []const u8,
+    /// Per-segment filter states for `text`.
+    segments: []const FilteredSegment,
 };
+
+fn classifySegment(
+    state: *const RequestState,
+    filter_state: FilterState,
+) struct { item_type: u8, content_type: u8 } {
+    if (state.raw_output) {
+        return .{
+            .item_type = @intFromEnum(ItemType.message),
+            .content_type = @intFromEnum(ContentType.output_text),
+        };
+    }
+    if (filter_state == .reasoning) {
+        return .{
+            .item_type = @intFromEnum(ItemType.reasoning),
+            .content_type = @intFromEnum(ContentType.reasoning_text),
+        };
+    }
+    if (state.is_tool_generation) {
+        return .{
+            .item_type = @intFromEnum(ItemType.function_call),
+            .content_type = @intFromEnum(ContentType.output_text),
+        };
+    }
+    return .{
+        .item_type = @intFromEnum(ItemType.message),
+        .content_type = @intFromEnum(ContentType.output_text),
+    };
+}
+
+fn appendFilteredSegment(
+    filtered_buf: []u8,
+    filtered_len: *usize,
+    segments_out: []FilteredSegment,
+    segment_count: *usize,
+    text: []const u8,
+    filter_state: FilterState,
+) void {
+    if (text.len == 0) return;
+    const avail = filtered_buf.len - filtered_len.*;
+    if (avail == 0) return;
+
+    const copy_len = @min(text.len, avail);
+    const start = filtered_len.*;
+    @memcpy(filtered_buf[start..][0..copy_len], text[0..copy_len]);
+    filtered_len.* += copy_len;
+
+    if (segment_count.* > 0) {
+        var last = &segments_out[segment_count.* - 1];
+        if (last.filter_state == filter_state and last.start + last.len == start) {
+            last.len += copy_len;
+            return;
+        }
+    }
+
+    if (segment_count.* < segments_out.len) {
+        segments_out[segment_count.*] = .{
+            .start = start,
+            .len = copy_len,
+            .filter_state = filter_state,
+        };
+        segment_count.* += 1;
+    }
+}
 
 /// Run reasoning tag filter on decoded text. Updates state inline.
 /// Returns the text to emit (tag bytes are consumed, not emitted).
 ///
 /// Simplified from iterator.zig filterAndPush: instead of pushing to
 /// a ring buffer, we return the filtered text. The caller accumulates.
-fn filterReasoningTags(state: *RequestState, decoded: []const u8) FilterResult {
+fn filterReasoningTags(
+    state: *RequestState,
+    decoded: []const u8,
+    segments_out: []FilteredSegment,
+) FilterResult {
     // Use state-owned buffer so returned slices remain valid after return.
     const filtered_buf = &state.filter_out_buf;
     var filtered_len: usize = 0;
+    var segment_count: usize = 0;
 
     var i: usize = 0;
     while (i < decoded.len) {
@@ -848,11 +971,14 @@ fn filterReasoningTags(state: *RequestState, decoded: []const u8) FilterResult {
         if (byte >= 0x80) {
             // Flush any pending tag-match buffer as content.
             if (state.filter_partial_len > 0) {
-                const plen: usize = state.filter_partial_len;
-                const avail = filtered_buf.len - filtered_len;
-                const copy_len = @min(plen, avail);
-                @memcpy(filtered_buf[filtered_len..][0..copy_len], state.filter_partial_buf[0..copy_len]);
-                filtered_len += copy_len;
+                appendFilteredSegment(
+                    filtered_buf,
+                    &filtered_len,
+                    segments_out,
+                    &segment_count,
+                    state.filter_partial_buf[0..state.filter_partial_len],
+                    state.filter_state,
+                );
                 state.filter_partial_len = 0;
             }
 
@@ -861,21 +987,28 @@ fn filterReasoningTags(state: *RequestState, decoded: []const u8) FilterResult {
             while (i < decoded.len and decoded[i] >= 0x80) : (i += 1) {}
             const run = decoded[run_start..i];
             state.swallow_next_newline = false;
-            const avail = filtered_buf.len - filtered_len;
-            const copy_len = @min(run.len, avail);
-            @memcpy(filtered_buf[filtered_len..][0..copy_len], run[0..copy_len]);
-            filtered_len += copy_len;
+            appendFilteredSegment(
+                filtered_buf,
+                &filtered_len,
+                segments_out,
+                &segment_count,
+                run,
+                state.filter_state,
+            );
             continue;
         }
 
         // ASCII byte: run tag-matching state machine.
         if (state.filter_partial_len >= MAX_TAG_LEN) {
             // Overflow: flush as literal.
-            const plen: usize = state.filter_partial_len;
-            const avail = filtered_buf.len - filtered_len;
-            const copy_len = @min(plen, avail);
-            @memcpy(filtered_buf[filtered_len..][0..copy_len], state.filter_partial_buf[0..copy_len]);
-            filtered_len += copy_len;
+            appendFilteredSegment(
+                filtered_buf,
+                &filtered_len,
+                segments_out,
+                &segment_count,
+                state.filter_partial_buf[0..state.filter_partial_len],
+                state.filter_state,
+            );
             state.filter_partial_len = 0;
         }
         state.filter_partial_buf[state.filter_partial_len] = byte;
@@ -915,26 +1048,24 @@ fn filterReasoningTags(state: *RequestState, decoded: []const u8) FilterResult {
                     continue;
                 }
             }
-            const plen: usize = state.filter_partial_len;
-            const avail = filtered_buf.len - filtered_len;
-            const copy_len = @min(plen, avail);
-            @memcpy(filtered_buf[filtered_len..][0..copy_len], state.filter_partial_buf[0..copy_len]);
-            filtered_len += copy_len;
+            appendFilteredSegment(
+                filtered_buf,
+                &filtered_len,
+                segments_out,
+                &segment_count,
+                state.filter_partial_buf[0..state.filter_partial_len],
+                state.filter_state,
+            );
             state.filter_partial_len = 0;
         }
 
         i += 1;
     }
 
-    if (filtered_len == 0) return .{ .text = "" };
-
-    // If filtering didn't change the text, return the original slice directly.
-    if (filtered_len == decoded.len and std.mem.eql(u8, filtered_buf[0..filtered_len], decoded)) {
-        return .{ .text = decoded };
-    }
-
-    // Return a slice from state.filter_out_buf — stable for the caller's scope.
-    return .{ .text = filtered_buf[0..filtered_len] };
+    return .{
+        .text = filtered_buf[0..filtered_len],
+        .segments = segments_out[0..segment_count],
+    };
 }
 
 /// Build effective template context (reasoning effort → enable_thinking).
@@ -1038,6 +1169,42 @@ fn longestCommonPrefixLen(a: []const u8, b: []const u8) usize {
     var i: usize = 0;
     while (i < n and a[i] == b[i]) : (i += 1) {}
     return i;
+}
+
+test "filterReasoningTags splits reasoning and response in one chunk" {
+    var state = RequestState.init();
+    defer state.deinit();
+    state.filter_state = .reasoning;
+
+    var segments: [MAX_FILTER_SEGMENTS]FilteredSegment = undefined;
+    const result = filterReasoningTags(&state, "abc</think>\nXYZ", &segments);
+
+    try std.testing.expectEqualStrings("abcXYZ", result.text);
+    try std.testing.expectEqual(@as(usize, 2), result.segments.len);
+    try std.testing.expectEqual(@as(usize, 0), result.segments[0].start);
+    try std.testing.expectEqual(@as(usize, 3), result.segments[0].len);
+    try std.testing.expectEqual(FilterState.reasoning, result.segments[0].filter_state);
+    try std.testing.expectEqual(@as(usize, 3), result.segments[1].start);
+    try std.testing.expectEqual(@as(usize, 3), result.segments[1].len);
+    try std.testing.expectEqual(FilterState.normal, result.segments[1].filter_state);
+    try std.testing.expectEqual(FilterState.normal, state.filter_state);
+}
+
+test "filterReasoningTags preserves alternating normal and reasoning segments" {
+    var state = RequestState.init();
+    defer state.deinit();
+
+    var segments: [MAX_FILTER_SEGMENTS]FilteredSegment = undefined;
+    const result = filterReasoningTags(&state, "P<think>R</think>A", &segments);
+
+    try std.testing.expectEqualStrings("PRA", result.text);
+    try std.testing.expectEqual(@as(usize, 3), result.segments.len);
+    try std.testing.expectEqual(FilterState.normal, result.segments[0].filter_state);
+    try std.testing.expectEqualStrings("P", result.text[result.segments[0].start .. result.segments[0].start + result.segments[0].len]);
+    try std.testing.expectEqual(FilterState.reasoning, result.segments[1].filter_state);
+    try std.testing.expectEqualStrings("R", result.text[result.segments[1].start .. result.segments[1].start + result.segments[1].len]);
+    try std.testing.expectEqual(FilterState.normal, result.segments[2].filter_state);
+    try std.testing.expectEqualStrings("A", result.text[result.segments[2].start .. result.segments[2].start + result.segments[2].len]);
 }
 
 /// Parse tool calls from generated text into C-compatible refs.

@@ -811,6 +811,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 // Sample next token using optimized sampler (SIMD, pre-allocated workspace)
                 var sample_cfg = request_entry.sampling_config;
                 sample_cfg.context_tokens = request_entry.generated_tokens.items;
+
+
+
                 var next_token = self.sampleToken(
                     result.logits,
                     sample_cfg,
@@ -877,6 +880,18 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 // Add to generated tokens
                 try request_entry.generated_tokens.append(self.allocator, next_token);
                 request_entry.token_position += 1;
+
+                // Log first few decode tokens for diagnostics.
+                if (request_entry.generated_tokens.items.len <= 10) {
+                    var tok_buf: [16]u8 = undefined;
+                    const tok_str = std.fmt.bufPrint(&tok_buf, "{d}", .{next_token}) catch "?";
+                    var step_buf: [16]u8 = undefined;
+                    const step_str = std.fmt.bufPrint(&step_buf, "{d}", .{request_entry.generated_tokens.items.len}) catch "?";
+                    log.info("scheduler", "decode_token", .{
+                        .step = step_str,
+                        .token = tok_str,
+                    });
+                }
 
                 // Check for EOS token
                 var finish_reason: FinishReason = .in_progress;
@@ -1801,6 +1816,60 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     first_token_id,
                     request_entry.slot_index.?,
                 );
+
+                // Log prefill result: prompt tokens and first generated token.
+                {
+                    var prompt_head_buf: [128]u8 = undefined;
+                    var prompt_head_len: usize = 0;
+                    const show_n = @min(request_entry.prompt_tokens.len, 8);
+                    for (request_entry.prompt_tokens[0..show_n]) |tid| {
+                        const wrote = std.fmt.bufPrint(prompt_head_buf[prompt_head_len..], "{d},", .{tid}) catch break;
+                        prompt_head_len += wrote.len;
+                    }
+                    var first_id_buf: [16]u8 = undefined;
+                    const first_id_str = std.fmt.bufPrint(&first_id_buf, "{d}", .{first_token_id}) catch "?";
+                    // Top-5 logits for debugging sampling correctness
+                    var top5_buf: [256]u8 = undefined;
+                    var top5_len: usize = 0;
+                    if (self.logits_buffer.len > 0) {
+                        // Find top-5 by scanning
+                        var top_ids: [5]u32 = .{ 0, 0, 0, 0, 0 };
+                        var top_vals: [5]f32 = .{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) };
+                        for (self.logits_buffer, 0..) |v, idx| {
+                            if (v > top_vals[4]) {
+                                top_vals[4] = v;
+                                top_ids[4] = @intCast(idx);
+                                // bubble up
+                                var k: usize = 4;
+                                while (k > 0 and top_vals[k] > top_vals[k - 1]) : (k -= 1) {
+                                    const tv = top_vals[k];
+                                    top_vals[k] = top_vals[k - 1];
+                                    top_vals[k - 1] = tv;
+                                    const ti = top_ids[k];
+                                    top_ids[k] = top_ids[k - 1];
+                                    top_ids[k - 1] = ti;
+                                }
+                            }
+                        }
+                        for (top_ids, top_vals) |tid, tv| {
+                            const wrote = std.fmt.bufPrint(top5_buf[top5_len..], "{d}:{d:.2},", .{ tid, tv }) catch break;
+                            top5_len += wrote.len;
+                        }
+                    }
+                    var meta_buf: [32]u8 = undefined;
+                    const meta_str = std.fmt.bufPrint(&meta_buf, "slot={d} n={d} strat={s}", .{
+                        request_entry.slot_index.?,
+                        request_entry.prompt_tokens.len,
+                        @tagName(prefill_sample_cfg.strategy),
+                    }) catch "?";
+                    log.info("scheduler", "prefill_result", .{
+                        .meta = meta_str,
+                        .prompt_head = prompt_head_buf[0..prompt_head_len],
+                        .first_token = first_id_str,
+                        .top5_logits = top5_buf[0..top5_len],
+                    });
+                }
+
                 try request_entry.generated_tokens.append(self.allocator, first_token_id);
 
                 // Check for EOS token

@@ -828,6 +828,35 @@ body,
   text-overflow: ellipsis;
 }
 
+.bench-results-group-clear {
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 0.15s;
+  padding: 0.125rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  background: none;
+  border: none;
+}
+.bench-results-group-clear:hover {
+  color: var(--danger, #f38ba8);
+}
+.sidebar-group-label:hover .bench-results-group-clear {
+  opacity: 1;
+}
+.bench-results-group-clear svg {
+  width: 14px;
+  height: 14px;
+}
+
+.bench-results-delete-all-btn {
+  margin-left: auto;
+  color: var(--text-secondary);
+}
+.bench-results-delete-all-btn:hover {
+  color: var(--danger, #f38ba8);
+}
+
 .bench-results-empty {
   padding: 0.75rem;
   color: var(--text-muted);

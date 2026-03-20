@@ -42,7 +42,10 @@ pub enum ContentPart {
 }
 
 /// Configuration for text generation.
-#[derive(Default)]
+///
+/// Sampling parameters default to `-1.0` (unset), matching the C API sentinel.
+/// The Zig core treats negative values as "use model/chat defaults". Callers
+/// must explicitly set any parameter they want to override.
 pub struct GenerateConfig {
     /// Maximum number of tokens to generate (total: thinking + answer).
     pub max_tokens: usize,
@@ -50,19 +53,19 @@ pub struct GenerateConfig {
     pub max_completion_tokens: Option<usize>,
     /// Maximum thinking/reasoning tokens. Overrides effort-derived budget when set.
     pub max_reasoning_tokens: Option<usize>,
-    /// Sampling temperature (0.0 = deterministic).
+    /// Sampling temperature (0.0 = deterministic, -1.0 = unset).
     pub temperature: f32,
     /// Top-k sampling parameter.
     pub top_k: usize,
-    /// Top-p (nucleus) sampling parameter.
+    /// Top-p (nucleus) sampling parameter (-1.0 = unset).
     pub top_p: f32,
-    /// Min-p sampling parameter.
+    /// Min-p sampling parameter (-1.0 = unset).
     pub min_p: f32,
-    /// Repetition penalty.
+    /// Repetition penalty (multiplicative, 1.0 = neutral, -1.0 = unset).
     pub repetition_penalty: f32,
-    /// Additive presence penalty (0.0 = disabled).
+    /// Additive presence penalty (0.0 = disabled, -1.0 = unset).
     pub presence_penalty: f32,
-    /// Additive frequency penalty (0.0 = disabled).
+    /// Additive frequency penalty (0.0 = disabled, -1.0 = unset).
     pub frequency_penalty: f32,
     /// Random seed (0 = random).
     pub seed: u64,
@@ -85,6 +88,32 @@ pub struct GenerateConfig {
     /// Optional prefill progress callback. Called once per transformer layer
     /// during prefill (not decode). Arguments: (completed_layers, total_layers).
     pub prefill_progress: Option<PrefillProgressCallback>,
+}
+
+impl Default for GenerateConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: 0,
+            max_completion_tokens: None,
+            max_reasoning_tokens: None,
+            temperature: -1.0,
+            top_k: 0,
+            top_p: -1.0,
+            min_p: -1.0,
+            repetition_penalty: -1.0,
+            presence_penalty: -1.0,
+            frequency_penalty: -1.0,
+            seed: 0,
+            template_override: None,
+            tools_json: None,
+            tool_choice: None,
+            extra_body_json: None,
+            reasoning_effort: None,
+            stop_flag: None,
+            raw_output: false,
+            prefill_progress: None,
+        }
+    }
 }
 
 /// Callback for prefill progress. Called once per transformer layer.

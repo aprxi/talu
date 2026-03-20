@@ -1273,6 +1273,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
 
     const logits_out = logits_out_opt.?;
     try self.runtime_buffers.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host));
+
     if (trace.isEnabled()) {
         const rows128: u128 = 1;
         const d_model128: u128 = @intCast(self.d_model);
