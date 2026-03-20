@@ -2114,10 +2114,21 @@ pub const CudaBackend = struct {
         binding.count = @intCast(state_blocks.len);
         binding.bound = true;
         if (self.pipeline_backend1) |stage1| {
-            try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
+            stage1.mirrorSlotStateBlocksFrom(self, slot_index) catch |err| {
+                // Rollback: unbind self before propagating.
+                self.slot_state_bindings[slot_index].reset();
+                return err;
+            };
         }
         if (self.pipeline_backend0_cpu) |stage0_cpu| {
-            try stage0_cpu.bindSlotStateBlocks(slot_index, state_blocks);
+            stage0_cpu.bindSlotStateBlocks(slot_index, state_blocks) catch |err| {
+                // Rollback: unbind stage1 mirror and self before propagating.
+                if (self.pipeline_backend1) |stage1| {
+                    stage1.unbindSlotStateBlocks(slot_index);
+                }
+                self.slot_state_bindings[slot_index].reset();
+                return err;
+            };
         }
     }
 

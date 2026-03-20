@@ -1235,6 +1235,47 @@ test "bindSlotStateBlocks preserves bound slot index in runtime states" {
     try std.testing.expectEqual(@as(usize, 1), gated_delta_state.slot_index);
 }
 
+test "bindSlotStateBlocks rolls back self on cpu stage bind failure" {
+    const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+    var backend: CudaBackend = undefined;
+    backend.max_batch_size = 1;
+    backend.block_runtime = undefined;
+    backend.state_descriptor_count = 1;
+    backend.pipeline_backend1 = null;
+    backend.state_descriptors_storage[0] = .{
+        .id = 111,
+        .size_bytes = runtime_contract.builtin_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+        .runtime_kind = runtime_contract.state_runtime_kind_none,
+    };
+    var slot_state_bindings: [1]CudaBackend.SlotStateBinding = .{.{}};
+    backend.slot_state_bindings = slot_state_bindings[0..];
+
+    // Zero-initialized CPU backend stub: all bytes deterministic, slot_state_bindings.len == 0
+    // triggers the bounds check in CPU bindSlotStateBlocks before any other field access.
+    const cpu_backend = @import("../cpu/root.zig");
+    var cpu_stage0_bytes = [_]u8{0} ** @sizeOf(cpu_backend.BackendType);
+    const cpu_stage0: *cpu_backend.BackendType = @ptrCast(@alignCast(&cpu_stage0_bytes));
+    backend.pipeline_backend0_cpu = cpu_stage0;
+
+    var state_storage: [payload_bytes]u8 align(64) = [_]u8{0} ** payload_bytes;
+    const state_blocks = [_]runtime_contract.StateBlockHandle{
+        .{
+            .id = 111,
+            .ptr = state_storage[0..].ptr,
+            .size = runtime_contract.builtin_state_block_bytes,
+            .align_bytes = 64,
+        },
+    };
+
+    // Bind should fail because CPU stage rejects slot_index 0 (empty bindings slice).
+    try std.testing.expectError(error.InvalidArgument, backend.bindSlotStateBlocks(0, state_blocks[0..]));
+    // Self-binding must be rolled back: slot should not be marked bound.
+    try std.testing.expect(!backend.slot_state_bindings[0].bound);
+}
+
 test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind none" {
     const payload_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
     var backend: CudaBackend = undefined;

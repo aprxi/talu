@@ -968,6 +968,8 @@ pub const FusedCpuBackend = struct {
         ensure_kv_capacity: bool,
         use_preloaded_input: bool,
     ) !void {
+        // KV capacity is pre-allocated within slot state blocks on CPU; no
+        // dynamic growth is needed, so ensure_kv_capacity is intentionally a no-op.
         _ = ensure_kv_capacity;
         if (!compute_logits and download_logits) return error.InvalidArgument;
         if (layer_end < layer_start or layer_end > self.model.layers.len) return error.InvalidArgument;
@@ -2584,6 +2586,7 @@ test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind n
 }
 
 test "computePrototypeLogitsWithLayerRange rejects download request without logits compute" {
+    // Safe: parameter validation returns error before any field access on self.
     var backend: FusedCpuBackend = undefined;
     try std.testing.expectError(
         error.InvalidArgument,
@@ -2604,6 +2607,7 @@ test "computePrototypeLogitsWithLayerRange rejects download request without logi
 
 test "slotActivationBytes and slotActivationBytesMut expose slot hidden storage" {
     var hidden_storage = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    // Safe: only d_model and hidden_buffers are accessed (set immediately below).
     var backend: FusedCpuBackend = undefined;
     backend.d_model = 4;
     backend.hidden_buffers = hidden_storage[0..];
