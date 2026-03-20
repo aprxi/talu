@@ -21,6 +21,9 @@ pub const CudaStage = struct {
     backend: *@import("root.zig").BackendType,
 
     pub const layer_execution_input_magic: u32 = 0x32475550; // "PUG2" little-endian marker
+    pub const supported_boundary_dtypes = [_]pipeline.BoundaryDType{
+        .f32,
+    };
 
     /// Internal stage execution payload.
     /// This is process-local and build-local only; it is not a stable wire ABI.
@@ -168,7 +171,7 @@ pub const CudaP2PTransfer = struct {
 };
 
 /// CUDA pipeline type: PipelineRuntime specialized for CudaStage + CudaP2PTransfer.
-pub const CudaPipeline = pipeline.PipelineRuntime(CudaStage, CudaP2PTransfer);
+pub const CudaPipeline = pipeline.PipelineRuntime(CudaStage, CudaStage, CudaP2PTransfer);
 
 test "CudaStage.executeLayers rejects payload with incorrect byte length" {
     var stage = CudaStage{
@@ -182,7 +185,13 @@ test "CudaStage.executeLayers rejects payload with invalid ABI marker" {
     var stage = CudaStage{
         .backend = @ptrFromInt(64),
     };
-    var payload = CudaStage.LayerExecutionInput{};
+    var payload = CudaStage.LayerExecutionInput{
+        .token = 0,
+        .position = 0,
+        .slot_index = 0,
+        .trace_seq_len_u32 = 1,
+        .trace_pos_offset = 0,
+    };
     payload.abi_magic = 0;
     const bytes = std.mem.asBytes(&payload);
     try std.testing.expectError(error.InvalidArgument, stage.executeLayers(bytes, 0, 0));
@@ -192,7 +201,13 @@ test "CudaStage.executeLayers rejects payload with logits pointer length mismatc
     var stage = CudaStage{
         .backend = @ptrFromInt(64),
     };
-    var payload = CudaStage.LayerExecutionInput{};
+    var payload = CudaStage.LayerExecutionInput{
+        .token = 0,
+        .position = 0,
+        .slot_index = 0,
+        .trace_seq_len_u32 = 1,
+        .trace_pos_offset = 0,
+    };
     payload.logits_out_len = 4;
     const bytes = std.mem.asBytes(&payload);
     try std.testing.expectError(error.InvalidArgument, stage.executeLayers(bytes, 0, 0));

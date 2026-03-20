@@ -357,7 +357,7 @@ pub const Transformer = struct {
         slot_index: usize,
         use_cache: bool,
     ) !void {
-        return self.forwardWithBatchedCacheWithDeepstack(
+        return self.forwardWithBatchedCacheWithDeepstackLayerRange(
             input_tensor,
             output_tensor,
             scratch,
@@ -365,6 +365,34 @@ pub const Transformer = struct {
             slot_index,
             use_cache,
             null,
+            0,
+            self.layers.len,
+        );
+    }
+
+    /// Forward pass through a subset of transformer layers using batched KV cache.
+    /// Executes layers in the half-open range [layer_start, layer_end).
+    pub fn forwardWithBatchedCacheLayerRange(
+        self: *const Transformer,
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        scratch: *ScratchBuffer,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+        slot_index: usize,
+        use_cache: bool,
+        layer_start: usize,
+        layer_end: usize,
+    ) !void {
+        return self.forwardWithBatchedCacheWithDeepstackLayerRange(
+            input_tensor,
+            output_tensor,
+            scratch,
+            state_blocks,
+            slot_index,
+            use_cache,
+            null,
+            layer_start,
+            layer_end,
         );
     }
 
@@ -386,13 +414,41 @@ pub const Transformer = struct {
         use_cache: bool,
         deepstack: ?*const DeepstackAdditions,
     ) !void {
+        return self.forwardWithBatchedCacheWithDeepstackLayerRange(
+            input_tensor,
+            output_tensor,
+            scratch,
+            state_blocks,
+            slot_index,
+            use_cache,
+            deepstack,
+            0,
+            self.layers.len,
+        );
+    }
+
+    /// Forward pass through a subset of transformer layers using batched KV cache.
+    /// Executes layers in the half-open range [layer_start, layer_end).
+    pub fn forwardWithBatchedCacheWithDeepstackLayerRange(
+        self: *const Transformer,
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        scratch: *ScratchBuffer,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+        slot_index: usize,
+        use_cache: bool,
+        deepstack: ?*const DeepstackAdditions,
+        layer_start: usize,
+        layer_end: usize,
+    ) !void {
+        if (layer_end < layer_start or layer_end > self.layers.len) return error.InvalidArgument;
         const layered_cache = resolveLayeredCache(state_blocks);
-        if (!use_cache) {
+        if (!use_cache and layer_start == 0) {
             if (layered_cache) |cache| cache.resetSlot(slot_index);
             scratch.resetSlotCaches(slot_index);
         }
         const seq_len: usize = @intCast(input_tensor.shape[1]);
-        for (self.layers) |*layer| {
+        for (self.layers[layer_start..layer_end]) |*layer| {
             try layer.registerScratchLayout(scratch);
         }
         try scratch.ensureForMode(if (use_cache) .decode else .prefill, seq_len);
@@ -402,7 +458,8 @@ pub const Transformer = struct {
         var current_input_tensor: *const Tensor = input_tensor;
         var write_to_scratch_view = false;
 
-        for (self.layers, 0..) |*layer, layer_idx| {
+        for (self.layers[layer_start..layer_end], 0..) |*layer, local_layer_idx| {
+            const layer_idx = layer_start + local_layer_idx;
             // Emit trace point for layer input (if handler installed)
             trace.emit(
                 .layer_input,
@@ -420,16 +477,16 @@ pub const Transformer = struct {
                 try layer.forwardWithBatchedCache(current_input_tensor, &scratch_tensor_view, scratch, state_blocks, slot_index, use_cache);
                 current_input_tensor = &scratch_tensor_view;
                 if (deepstack) |ctx| {
-                    if (layer_idx < ctx.layer_features.len) {
-                        try applyDeepstackAdditions(&scratch_tensor_view, seq_len, self.hidden_size, ctx.positions, ctx.layer_features[layer_idx]);
+                    if (local_layer_idx < ctx.layer_features.len) {
+                        try applyDeepstackAdditions(&scratch_tensor_view, seq_len, self.hidden_size, ctx.positions, ctx.layer_features[local_layer_idx]);
                     }
                 }
             } else {
                 try layer.forwardWithBatchedCache(current_input_tensor, output_tensor, scratch, state_blocks, slot_index, use_cache);
                 current_input_tensor = output_tensor;
                 if (deepstack) |ctx| {
-                    if (layer_idx < ctx.layer_features.len) {
-                        try applyDeepstackAdditions(output_tensor, seq_len, self.hidden_size, ctx.positions, ctx.layer_features[layer_idx]);
+                    if (local_layer_idx < ctx.layer_features.len) {
+                        try applyDeepstackAdditions(output_tensor, seq_len, self.hidden_size, ctx.positions, ctx.layer_features[local_layer_idx]);
                     }
                 }
             }
@@ -1236,4 +1293,67 @@ test "forwardWithBatchedCache resets only target slot recurrent state when use_c
     for (slot1_state.ssm_state) |value| {
         try std.testing.expectEqual(@as(f32, 2.0), value);
     }
+}
+
+test "forwardWithBatchedCacheLayerRange rejects invalid layer ranges" {
+    const allocator = std.testing.allocator;
+    const model = createMockTransformer(0, 8, 16);
+    var scratch = try ScratchBuffer.init(allocator, 8, 16, 1);
+    defer scratch.deinit();
+
+    var input_storage = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var output_storage = [_]f32{0} ** 8;
+    const input_tensor = Tensor.view3DSlice(input_storage[0..], 1, 8);
+    var output_tensor = Tensor.view3DSlice(output_storage[0..], 1, 8);
+
+    try std.testing.expectError(
+        error.InvalidArgument,
+        model.forwardWithBatchedCacheLayerRange(
+            &input_tensor,
+            &output_tensor,
+            &scratch,
+            &.{},
+            0,
+            true,
+            1,
+            0,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidArgument,
+        model.forwardWithBatchedCacheLayerRange(
+            &input_tensor,
+            &output_tensor,
+            &scratch,
+            &.{},
+            0,
+            true,
+            0,
+            1,
+        ),
+    );
+}
+
+test "forwardWithBatchedCacheLayerRange processes valid empty range" {
+    const allocator = std.testing.allocator;
+    const model = createMockTransformer(0, 8, 16);
+    var scratch = try ScratchBuffer.init(allocator, 8, 16, 1);
+    defer scratch.deinit();
+
+    var input_storage = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var output_storage = [_]f32{0} ** 8;
+    const input_tensor = Tensor.view3DSlice(input_storage[0..], 1, 8);
+    var output_tensor = Tensor.view3DSlice(output_storage[0..], 1, 8);
+
+    try model.forwardWithBatchedCacheLayerRange(
+        &input_tensor,
+        &output_tensor,
+        &scratch,
+        &.{},
+        0,
+        true,
+        0,
+        0,
+    );
+    try std.testing.expectEqualSlices(f32, input_storage[0..], output_storage[0..]);
 }

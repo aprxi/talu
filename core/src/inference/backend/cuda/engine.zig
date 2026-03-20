@@ -27,6 +27,10 @@ const attention_policy = @import("attention_policy.zig");
 const attention_mod = @import("attention.zig");
 const decode_mod = @import("decode.zig");
 const prefill_mod = @import("prefill.zig");
+const cpu_backend = @import("../cpu/root.zig");
+const cuda_stage = @import("stage.zig");
+const cpu_stage = @import("../cpu/stage.zig");
+const progress_mod = @import("../../../progress.zig");
 const sampling_mod = @import("sampling.zig");
 const vision_runtime_mod = @import("vision/root.zig");
 const cpu_kernels = @import("../cpu/kernels/root.zig");
@@ -307,11 +311,24 @@ pub const CudaBackend = struct {
     topology_mode: backend_root.CudaTopologyMode = .single,
     /// Layer index at which stage 0 ends and stage 1 begins (pipeline2 only).
     split_layer: usize = 0,
+    /// Layer index at which stage 1 ends and stage 2 begins (cpu+gpu+gpu only).
+    split_layer_stage2: usize = 0,
+    /// CPU stage backend for cpu+gpu topology mode.
+    pipeline_backend0_cpu: ?*cpu_backend.BackendType = null,
     /// Second-device state for pipeline2 mode. Null for single-device mode.
     pipeline_backend1: ?*CudaBackend = null,
     /// Activation transfer mechanism (pipeline2 only).
     pipeline_transfer_mode: PipelineTransferMode = .none,
     pipeline_host_staging: ?[]align(4096) u8 = null,
+    pipeline_host_staging_stage12: ?[]align(4096) u8 = null,
+    pipeline_boundary_dtype: backend_root.pipeline.BoundaryDType = .f32,
+    pipeline_boundary_layout: backend_root.pipeline.BoundaryLayout = .row_major,
+    pipeline_stage0_boundary_conversion: bool = false,
+    pipeline_stage1_boundary_conversion: bool = false,
+    pipeline_boundary_dtype_stage12: backend_root.pipeline.BoundaryDType = .f32,
+    pipeline_boundary_layout_stage12: backend_root.pipeline.BoundaryLayout = .row_major,
+    pipeline_stage1_boundary_conversion_stage12: bool = false,
+    pipeline_stage2_boundary_conversion_stage12: bool = false,
 
     kv_storage_mode: KvCacheStorageMode = .device,
     kv_init_tokens: usize = initial_kv_cache_tokens,
@@ -424,6 +441,8 @@ pub const CudaBackend = struct {
         device_ordinal: usize = 0,
         topology_mode: backend_root.CudaTopologyMode = .single,
         stage_device_ordinals: [2]usize = .{ 0, 1 },
+        split_layer: ?usize = null,
+        split_layer_stage2: ?usize = null,
     };
 
     pub fn init(
@@ -779,87 +798,280 @@ pub const CudaBackend = struct {
             try smoke_checks.runKernelSmoke(&backend);
         }
 
-        // Pipeline2: initialize second device and split layers.
-        if (init_options.topology_mode == .pipeline2) {
-            backend.topology_mode = .pipeline2;
-            const total_layers = loaded.blocks.len;
-            if (total_layers < 2) return error.InvalidTopologyConfig;
-            const split = total_layers / 2;
-            if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
-            backend.split_layer = split;
+        switch (init_options.topology_mode) {
+            .single => {},
+            .pipeline2 => {
+                backend.topology_mode = .pipeline2;
+                const total_layers = loaded.blocks.len;
+                if (total_layers < 2) return error.InvalidTopologyConfig;
+                const split = init_options.split_layer orelse total_layers / 2;
+                if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
+                backend.split_layer = split;
 
-            // Stage 0 (this backend): keep layers [0, split).
-            try backend.repartitionLayerRange(0, split);
+                // Stage 0 (this backend): keep layers [0, split).
+                try backend.repartitionLayerRange(0, split);
 
-            // Stage 1: dedicated backend on device1 with layers [split, total_layers).
-            const stage1_ptr = try allocator.create(CudaBackend);
-            errdefer allocator.destroy(stage1_ptr);
-            stage1_ptr.* = try CudaBackend.init(
-                allocator,
-                loaded,
-                max_batch_size,
-                .{
-                    .device_ordinal = init_options.stage_device_ordinals[1],
-                    .topology_mode = .single,
-                    .stage_device_ordinals = init_options.stage_device_ordinals,
-                },
-            );
-            errdefer {
-                stage1_ptr.deinit();
-                allocator.destroy(stage1_ptr);
-            }
-            try stage1_ptr.repartitionLayerRange(split, total_layers);
-            stage1_ptr.topology_mode = .single;
-            stage1_ptr.split_layer = 0;
-            backend.pipeline_backend1 = stage1_ptr;
+                // Stage 1: dedicated backend on device1 with layers [split, total_layers).
+                const stage1_ptr = try allocator.create(CudaBackend);
+                errdefer allocator.destroy(stage1_ptr);
+                stage1_ptr.* = try CudaBackend.init(
+                    allocator,
+                    loaded,
+                    max_batch_size,
+                    .{
+                        .device_ordinal = init_options.stage_device_ordinals[1],
+                        .topology_mode = .single,
+                        .stage_device_ordinals = init_options.stage_device_ordinals,
+                    },
+                );
+                errdefer {
+                    stage1_ptr.deinit();
+                    allocator.destroy(stage1_ptr);
+                }
+                try stage1_ptr.repartitionLayerRange(split, total_layers);
+                stage1_ptr.topology_mode = .single;
+                stage1_ptr.split_layer = 0;
+                backend.pipeline_backend1 = stage1_ptr;
 
-            log.info("inference", "CUDA pipeline2 stage 1 device ready", .{
-                .name = stage1_ptr.device.name(),
-                .ordinal = stage1_ptr.device.ordinal(),
-                .split_layer = split,
-                .total_layers = total_layers,
-            });
+                const boundary = try backend_root.pipeline.negotiateBoundaryContract(.{
+                    .stage0_native_dtype = .f32,
+                    .stage1_native_dtype = .f32,
+                    .stage0_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
+                    .stage1_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
+                });
+                backend.pipeline_boundary_dtype = boundary.boundary_dtype;
+                backend.pipeline_boundary_layout = boundary.layout;
+                backend.pipeline_stage0_boundary_conversion = boundary.stage0_requires_conversion;
+                backend.pipeline_stage1_boundary_conversion = boundary.stage1_requires_conversion;
 
-            // Determine transfer mode.
-            if (backend.device.canAccessPeer(&stage1_ptr.device)) {
-                backend.device.enablePeerAccess(&stage1_ptr.device) catch {};
-                stage1_ptr.device.enablePeerAccess(&backend.device) catch {};
-                backend.pipeline_transfer_mode = .peer_to_peer;
-                log.info("inference", "CUDA pipeline2 using peer-to-peer transfer", .{});
-            } else {
-                const transfer_bytes = backend.d_model * @sizeOf(f32);
+                log.info("inference", "CUDA pipeline2 stage 1 device ready", .{
+                    .name = stage1_ptr.device.name(),
+                    .ordinal = stage1_ptr.device.ordinal(),
+                    .split_layer = split,
+                    .total_layers = total_layers,
+                });
+
+                // Determine transfer mode.
+                if (backend.device.canAccessPeer(&stage1_ptr.device)) {
+                    backend.device.enablePeerAccess(&stage1_ptr.device) catch {};
+                    stage1_ptr.device.enablePeerAccess(&backend.device) catch {};
+                    backend.pipeline_transfer_mode = .peer_to_peer;
+                    log.info("inference", "CUDA pipeline2 using peer-to-peer transfer", .{});
+                } else {
+                    const transfer_bytes = try backend.pipelineActivationByteCount();
+                    backend.pipeline_host_staging = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer_bytes);
+                    backend.pipeline_transfer_mode = .host_staged;
+                    log.info("inference", "CUDA pipeline2 using host-staged transfer", .{
+                        .staging_mib = bytesToMiB(transfer_bytes),
+                    });
+                }
+
+                const stage0_budget = backend.computeDeviceMemoryBudget();
+                const stage1_budget = stage1_ptr.computeDeviceMemoryBudget();
+                log.info("inference", "CUDA pipeline2 topology", .{
+                    .stage0_ordinal = backend.device.ordinal(),
+                    .stage1_ordinal = stage1_ptr.device.ordinal(),
+                    .stage0_layers_start = @as(usize, 0),
+                    .stage0_layers_end = split,
+                    .stage1_layers_start = split,
+                    .stage1_layers_end = total_layers,
+                    .transfer_mode = @tagName(backend.pipeline_transfer_mode),
+                    .stage0_known_mib = bytesToMiB(stage0_budget.totalBytes()),
+                    .stage1_known_mib = bytesToMiB(stage1_budget.totalBytes()),
+                    .stage0_weights_mib = bytesToMiB(stage0_budget.weights_bytes),
+                    .stage1_weights_mib = bytesToMiB(stage1_budget.weights_bytes),
+                    .stage0_runtime_mib = bytesToMiB(stage0_budget.runtime_bytes),
+                    .stage1_runtime_mib = bytesToMiB(stage1_budget.runtime_bytes),
+                    .stage0_slot_state_mib = bytesToMiB(stage0_budget.slotStateBytes()),
+                    .stage1_slot_state_mib = bytesToMiB(stage1_budget.slotStateBytes()),
+                    .stage0_workspace_mib = bytesToMiB(stage0_budget.workspace_bytes),
+                    .stage1_workspace_mib = bytesToMiB(stage1_budget.workspace_bytes),
+                    .stage0_fixed_alloc = @as(u8, @intFromBool(backend.fixed_alloc_mode)),
+                    .stage1_fixed_alloc = @as(u8, @intFromBool(stage1_ptr.fixed_alloc_mode)),
+                    .stage0_strict_memory = @as(u8, @intFromBool(backend.strict_memory_mode)),
+                    .stage1_strict_memory = @as(u8, @intFromBool(stage1_ptr.strict_memory_mode)),
+                });
+            },
+            .cpu_gpu => {
+                backend.topology_mode = .cpu_gpu;
+                const total_layers = loaded.blocks.len;
+                if (total_layers < 2) return error.InvalidTopologyConfig;
+                const split = init_options.split_layer orelse total_layers / 2;
+                if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
+                backend.split_layer = split;
+
+                // CPU stage 0 executes layers [0, split).
+                const stage0_cpu_ptr = try allocator.create(cpu_backend.BackendType);
+                errdefer allocator.destroy(stage0_cpu_ptr);
+                stage0_cpu_ptr.* = try cpu_backend.BackendType.init(
+                    allocator,
+                    loaded,
+                    max_batch_size,
+                    progress_mod.Context.NONE,
+                );
+                errdefer {
+                    stage0_cpu_ptr.deinit();
+                    allocator.destroy(stage0_cpu_ptr);
+                }
+                backend.pipeline_backend0_cpu = stage0_cpu_ptr;
+
+                const boundary = try backend_root.pipeline.negotiateBoundaryContract(.{
+                    .stage0_native_dtype = .f32,
+                    .stage1_native_dtype = .f32,
+                    .stage0_supported_boundary_dtypes = cpu_stage.CpuStage.supported_boundary_dtypes[0..],
+                    .stage1_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
+                });
+                backend.pipeline_boundary_dtype = boundary.boundary_dtype;
+                backend.pipeline_boundary_layout = boundary.layout;
+                backend.pipeline_stage0_boundary_conversion = boundary.stage0_requires_conversion;
+                backend.pipeline_stage1_boundary_conversion = boundary.stage1_requires_conversion;
+                if (boundary.stage0_requires_conversion or boundary.stage1_requires_conversion) {
+                    return error.InvalidTopologyConfig;
+                }
+
+                // CUDA stage 1 (this backend) executes layers [split, total_layers).
+                try backend.repartitionLayerRange(split, total_layers);
+
+                const transfer_bytes = try backend.pipelineActivationByteCount();
                 backend.pipeline_host_staging = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer_bytes);
                 backend.pipeline_transfer_mode = .host_staged;
-                log.info("inference", "CUDA pipeline2 using host-staged transfer", .{
-                    .staging_mib = bytesToMiB(transfer_bytes),
-                });
-            }
 
-            const stage0_budget = backend.computeDeviceMemoryBudget();
-            const stage1_budget = stage1_ptr.computeDeviceMemoryBudget();
-            log.info("inference", "CUDA pipeline2 topology", .{
-                .stage0_ordinal = backend.device.ordinal(),
-                .stage1_ordinal = stage1_ptr.device.ordinal(),
-                .stage0_layers_start = @as(usize, 0),
-                .stage0_layers_end = split,
-                .stage1_layers_start = split,
-                .stage1_layers_end = total_layers,
-                .transfer_mode = @tagName(backend.pipeline_transfer_mode),
-                .stage0_known_mib = bytesToMiB(stage0_budget.totalBytes()),
-                .stage1_known_mib = bytesToMiB(stage1_budget.totalBytes()),
-                .stage0_weights_mib = bytesToMiB(stage0_budget.weights_bytes),
-                .stage1_weights_mib = bytesToMiB(stage1_budget.weights_bytes),
-                .stage0_runtime_mib = bytesToMiB(stage0_budget.runtime_bytes),
-                .stage1_runtime_mib = bytesToMiB(stage1_budget.runtime_bytes),
-                .stage0_slot_state_mib = bytesToMiB(stage0_budget.slotStateBytes()),
-                .stage1_slot_state_mib = bytesToMiB(stage1_budget.slotStateBytes()),
-                .stage0_workspace_mib = bytesToMiB(stage0_budget.workspace_bytes),
-                .stage1_workspace_mib = bytesToMiB(stage1_budget.workspace_bytes),
-                .stage0_fixed_alloc = @as(u8, @intFromBool(backend.fixed_alloc_mode)),
-                .stage1_fixed_alloc = @as(u8, @intFromBool(stage1_ptr.fixed_alloc_mode)),
-                .stage0_strict_memory = @as(u8, @intFromBool(backend.strict_memory_mode)),
-                .stage1_strict_memory = @as(u8, @intFromBool(stage1_ptr.strict_memory_mode)),
-            });
+                const stage1_budget = backend.computeDeviceMemoryBudget();
+                log.info("inference", "CUDA cpu+gpu topology", .{
+                    .cpu_stage_layers_start = @as(usize, 0),
+                    .cpu_stage_layers_end = split,
+                    .gpu_stage_layers_start = split,
+                    .gpu_stage_layers_end = total_layers,
+                    .gpu_ordinal = backend.device.ordinal(),
+                    .transfer_mode = @tagName(backend.pipeline_transfer_mode),
+                    .boundary_dtype = @tagName(backend.pipeline_boundary_dtype),
+                    .boundary_layout = @tagName(backend.pipeline_boundary_layout),
+                    .stage0_boundary_conversion = @as(u8, @intFromBool(backend.pipeline_stage0_boundary_conversion)),
+                    .stage1_boundary_conversion = @as(u8, @intFromBool(backend.pipeline_stage1_boundary_conversion)),
+                    .gpu_known_mib = bytesToMiB(stage1_budget.totalBytes()),
+                    .gpu_weights_mib = bytesToMiB(stage1_budget.weights_bytes),
+                    .gpu_runtime_mib = bytesToMiB(stage1_budget.runtime_bytes),
+                    .gpu_slot_state_mib = bytesToMiB(stage1_budget.slotStateBytes()),
+                    .gpu_workspace_mib = bytesToMiB(stage1_budget.workspace_bytes),
+                });
+            },
+            .cpu_gpu_gpu => {
+                backend.topology_mode = .cpu_gpu_gpu;
+                const total_layers = loaded.blocks.len;
+                if (total_layers < 3) return error.InvalidTopologyConfig;
+
+                const split_default = @max(@as(usize, 1), total_layers / 3);
+                const split = init_options.split_layer orelse split_default;
+                if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
+
+                const split_stage2_default = split + @max(@as(usize, 1), (total_layers - split) / 2);
+                const split_stage2 = init_options.split_layer_stage2 orelse split_stage2_default;
+                if (split_stage2 <= split or split_stage2 >= total_layers) return error.InvalidTopologyConfig;
+
+                backend.split_layer = split;
+                backend.split_layer_stage2 = split_stage2;
+
+                // CPU stage 0 executes layers [0, split).
+                const stage0_cpu_ptr = try allocator.create(cpu_backend.BackendType);
+                errdefer allocator.destroy(stage0_cpu_ptr);
+                stage0_cpu_ptr.* = try cpu_backend.BackendType.init(
+                    allocator,
+                    loaded,
+                    max_batch_size,
+                    progress_mod.Context.NONE,
+                );
+                errdefer {
+                    stage0_cpu_ptr.deinit();
+                    allocator.destroy(stage0_cpu_ptr);
+                }
+                backend.pipeline_backend0_cpu = stage0_cpu_ptr;
+
+                // GPU stage 1 executes layers [split, split_stage2).
+                const stage1_ptr = try allocator.create(CudaBackend);
+                errdefer allocator.destroy(stage1_ptr);
+                stage1_ptr.* = try CudaBackend.init(
+                    allocator,
+                    loaded,
+                    max_batch_size,
+                    .{
+                        .device_ordinal = init_options.stage_device_ordinals[0],
+                        .topology_mode = .single,
+                        .stage_device_ordinals = init_options.stage_device_ordinals,
+                    },
+                );
+                errdefer {
+                    stage1_ptr.deinit();
+                    allocator.destroy(stage1_ptr);
+                }
+                try stage1_ptr.repartitionLayerRange(split, split_stage2);
+                stage1_ptr.topology_mode = .single;
+                stage1_ptr.split_layer = 0;
+                stage1_ptr.split_layer_stage2 = 0;
+                backend.pipeline_backend1 = stage1_ptr;
+
+                // GPU stage 2 (this backend) executes layers [split_stage2, total_layers).
+                try backend.repartitionLayerRange(split_stage2, total_layers);
+
+                // Boundary 0->1 (CPU->GPU1) contract.
+                const boundary_01 = try backend_root.pipeline.negotiateBoundaryContract(.{
+                    .stage0_native_dtype = .f32,
+                    .stage1_native_dtype = .f32,
+                    .stage0_supported_boundary_dtypes = cpu_stage.CpuStage.supported_boundary_dtypes[0..],
+                    .stage1_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
+                });
+                backend.pipeline_boundary_dtype = boundary_01.boundary_dtype;
+                backend.pipeline_boundary_layout = boundary_01.layout;
+                backend.pipeline_stage0_boundary_conversion = boundary_01.stage0_requires_conversion;
+                backend.pipeline_stage1_boundary_conversion = boundary_01.stage1_requires_conversion;
+                if (boundary_01.stage0_requires_conversion or boundary_01.stage1_requires_conversion) {
+                    return error.InvalidTopologyConfig;
+                }
+
+                // Boundary 1->2 (GPU1->GPU2) contract.
+                const boundary_12 = try backend_root.pipeline.negotiateBoundaryContract(.{
+                    .stage0_native_dtype = .f32,
+                    .stage1_native_dtype = .f32,
+                    .stage0_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
+                    .stage1_supported_boundary_dtypes = cuda_stage.CudaStage.supported_boundary_dtypes[0..],
+                });
+                backend.pipeline_boundary_dtype_stage12 = boundary_12.boundary_dtype;
+                backend.pipeline_boundary_layout_stage12 = boundary_12.layout;
+                backend.pipeline_stage1_boundary_conversion_stage12 = boundary_12.stage0_requires_conversion;
+                backend.pipeline_stage2_boundary_conversion_stage12 = boundary_12.stage1_requires_conversion;
+                if (boundary_12.stage0_requires_conversion or boundary_12.stage1_requires_conversion) {
+                    return error.InvalidTopologyConfig;
+                }
+
+                const transfer01_bytes = try backend.pipelineActivationByteCount();
+                backend.pipeline_host_staging = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer01_bytes);
+                backend.pipeline_host_staging_stage12 = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer01_bytes);
+                backend.pipeline_transfer_mode = .host_staged;
+
+                const stage1_budget = stage1_ptr.computeDeviceMemoryBudget();
+                const stage2_budget = backend.computeDeviceMemoryBudget();
+                log.info("inference", "CUDA cpu+gpu+gpu topology", .{
+                    .cpu_stage_layers_start = @as(usize, 0),
+                    .cpu_stage_layers_end = split,
+                    .gpu_stage1_layers_start = split,
+                    .gpu_stage1_layers_end = split_stage2,
+                    .gpu_stage2_layers_start = split_stage2,
+                    .gpu_stage2_layers_end = total_layers,
+                    .gpu_stage1_ordinal = stage1_ptr.device.ordinal(),
+                    .gpu_stage2_ordinal = backend.device.ordinal(),
+                    .boundary01_dtype = @tagName(backend.pipeline_boundary_dtype),
+                    .boundary12_dtype = @tagName(backend.pipeline_boundary_dtype_stage12),
+                    .boundary01_layout = @tagName(backend.pipeline_boundary_layout),
+                    .boundary12_layout = @tagName(backend.pipeline_boundary_layout_stage12),
+                    .gpu_stage1_known_mib = bytesToMiB(stage1_budget.totalBytes()),
+                    .gpu_stage2_known_mib = bytesToMiB(stage2_budget.totalBytes()),
+                    .gpu_stage1_weights_mib = bytesToMiB(stage1_budget.weights_bytes),
+                    .gpu_stage2_weights_mib = bytesToMiB(stage2_budget.weights_bytes),
+                    .gpu_stage1_runtime_mib = bytesToMiB(stage1_budget.runtime_bytes),
+                    .gpu_stage2_runtime_mib = bytesToMiB(stage2_budget.runtime_bytes),
+                    .gpu_stage1_slot_state_mib = bytesToMiB(stage1_budget.slotStateBytes()),
+                    .gpu_stage2_slot_state_mib = bytesToMiB(stage2_budget.slotStateBytes()),
+                });
+            },
         }
 
         log.info("inference", "CUDA layered decode path ready", .{
@@ -1071,7 +1283,16 @@ pub const CudaBackend = struct {
             self.allocator.destroy(stage1);
             self.pipeline_backend1 = null;
         }
+        if (self.pipeline_backend0_cpu) |stage0_cpu| {
+            stage0_cpu.deinit();
+            self.allocator.destroy(stage0_cpu);
+            self.pipeline_backend0_cpu = null;
+        }
         // Pipeline2: release stage 1 resources before stage 0 (reverse init order).
+        if (self.pipeline_host_staging_stage12) |buf| {
+            self.allocator.free(buf);
+            self.pipeline_host_staging_stage12 = null;
+        }
         if (self.pipeline_host_staging) |buf| {
             self.allocator.free(buf);
             self.pipeline_host_staging = null;
@@ -1095,6 +1316,26 @@ pub const CudaBackend = struct {
 
     pub fn pipelineStage1(self: *CudaBackend) ?*CudaBackend {
         return self.pipeline_backend1;
+    }
+
+    pub fn pipelineCpuStage0(self: *CudaBackend) ?*cpu_backend.BackendType {
+        return self.pipeline_backend0_cpu;
+    }
+
+    pub fn pipelineSplitLayer(self: *const CudaBackend) usize {
+        return self.split_layer;
+    }
+
+    pub fn pipelineSplitLayerStage2(self: *const CudaBackend) usize {
+        return self.split_layer_stage2;
+    }
+
+    pub fn pipelineActivationByteCount(self: *const CudaBackend) !usize {
+        const element_bytes: usize = switch (self.pipeline_boundary_dtype) {
+            .bf16, .f16 => @sizeOf(u16),
+            .f32 => @sizeOf(f32),
+        };
+        return std.math.mul(usize, self.d_model, element_bytes) catch error.InvalidArgument;
     }
 
     pub fn transferPipelineActivation(self: *CudaBackend, dst: *CudaBackend, byte_count: usize) !void {
@@ -1123,6 +1364,21 @@ pub const CudaBackend = struct {
             },
             .none => return error.InvalidTopologyConfig,
         }
+    }
+
+    pub fn transferPipelineActivationFromCpu(
+        self: *CudaBackend,
+        src: *cpu_backend.BackendType,
+        slot_index: usize,
+        byte_count: usize,
+    ) !void {
+        if (byte_count == 0) return;
+        const staging = self.pipeline_host_staging orelse return error.PipelineTransferNotInitialized;
+        if (byte_count > staging.len) return error.PipelineTransferBufferTooSmall;
+        const src_activation = src.slotActivationBytes(slot_index);
+        if (byte_count > src_activation.len) return error.InvalidArgument;
+        @memcpy(staging[0..byte_count], src_activation[0..byte_count]);
+        try self.runtime_buffers.input_dev.upload(&self.device, staging[0..byte_count]);
     }
 
     pub fn maxBatchSize(self: *const CudaBackend) usize {
@@ -1680,17 +1936,59 @@ pub const CudaBackend = struct {
 
     pub fn allocSlot(self: *CudaBackend) ?usize {
         const slot_index = decode_mod.allocSlot(self) orelse return null;
+        if (self.pipeline_backend1) |stage1| {
+            const stage1_slot_index = stage1.allocSlot() orelse {
+                decode_mod.freeSlot(self, slot_index);
+                self.unbindSlotStateBlocks(slot_index);
+                return null;
+            };
+            if (stage1_slot_index != slot_index) {
+                stage1.freeSlot(stage1_slot_index);
+                decode_mod.freeSlot(self, slot_index);
+                self.unbindSlotStateBlocks(slot_index);
+                return null;
+            }
+            stage1.unbindSlotStateBlocks(slot_index);
+        }
+        if (self.pipeline_backend0_cpu) |stage0_cpu| {
+            const cpu_slot_index = stage0_cpu.allocSlot() orelse {
+                if (self.pipeline_backend1) |stage1| stage1.freeSlot(slot_index);
+                decode_mod.freeSlot(self, slot_index);
+                self.unbindSlotStateBlocks(slot_index);
+                return null;
+            };
+            if (cpu_slot_index != slot_index) {
+                stage0_cpu.freeSlot(cpu_slot_index);
+                if (self.pipeline_backend1) |stage1| stage1.freeSlot(slot_index);
+                decode_mod.freeSlot(self, slot_index);
+                self.unbindSlotStateBlocks(slot_index);
+                return null;
+            }
+            stage0_cpu.unbindSlotStateBlocks(slot_index);
+        }
         self.unbindSlotStateBlocks(slot_index);
         return slot_index;
     }
 
     pub fn freeSlot(self: *CudaBackend, slot_index: usize) void {
         decode_mod.freeSlot(self, slot_index);
+        if (self.pipeline_backend1) |stage1| {
+            stage1.freeSlot(slot_index);
+        }
+        if (self.pipeline_backend0_cpu) |stage0_cpu| {
+            stage0_cpu.freeSlot(slot_index);
+        }
         self.unbindSlotStateBlocks(slot_index);
     }
 
     pub fn resetSlot(self: *CudaBackend, slot_index: usize) void {
         decode_mod.resetSlot(self, slot_index);
+        if (self.pipeline_backend1) |stage1| {
+            stage1.resetSlot(slot_index);
+        }
+        if (self.pipeline_backend0_cpu) |stage0_cpu| {
+            stage0_cpu.resetSlot(slot_index);
+        }
         if (self.state_descriptor_count == 0) return;
         if (!self.slotIndexSupported(slot_index)) return;
         if (!self.slot_state_bindings[slot_index].bound) return;
@@ -1815,6 +2113,12 @@ pub const CudaBackend = struct {
         }
         binding.count = @intCast(state_blocks.len);
         binding.bound = true;
+        if (self.pipeline_backend1) |stage1| {
+            try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
+        }
+        if (self.pipeline_backend0_cpu) |stage0_cpu| {
+            try stage0_cpu.bindSlotStateBlocks(slot_index, state_blocks);
+        }
     }
 
     pub fn mirrorSlotStateBlocksFrom(
@@ -1862,6 +2166,12 @@ pub const CudaBackend = struct {
 
     pub fn unbindSlotStateBlocks(self: *CudaBackend, slot_index: usize) void {
         if (!self.slotIndexSupported(slot_index)) return;
+        if (self.pipeline_backend1) |stage1| {
+            stage1.unbindSlotStateBlocks(slot_index);
+        }
+        if (self.pipeline_backend0_cpu) |stage0_cpu| {
+            stage0_cpu.unbindSlotStateBlocks(slot_index);
+        }
         self.slot_state_bindings[slot_index].reset();
     }
 

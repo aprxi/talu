@@ -9,6 +9,7 @@ const compute = @import("../../../compute/root.zig");
 const tensor = @import("../../../tensor.zig");
 const log = @import("../../../log.zig");
 const trace = @import("../../../xray/trace.zig");
+const staged_orchestrator = @import("../staged_orchestrator.zig");
 
 // --- Shared types from engine_types.zig ---
 const engine_types = @import("engine_types.zig");
@@ -30,6 +31,595 @@ const tryPopulateHiddenFromToken = engine_weights.tryPopulateHiddenFromToken;
 const saturatingU64FromU128 = engine_types.saturatingU64FromU128;
 const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 
+fn topologyModeTag(self: anytype) ?[]const u8 {
+    const SelfType = @TypeOf(self.*);
+    if (comptime !@hasField(SelfType, "topology_mode")) return null;
+    return @tagName(self.topology_mode);
+}
+
+fn topologyModeIs(self: anytype, comptime expected: []const u8) bool {
+    const tag = topologyModeTag(self) orelse return false;
+    return std.mem.eql(u8, tag, expected);
+}
+
+fn typeHasDecl(comptime T: type, comptime name: []const u8) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, name),
+        else => false,
+    };
+}
+
+fn executeCpuStage0LayerRange(
+    stage0: anytype,
+    token: u32,
+    position: usize,
+    slot_index: usize,
+    split_layer: usize,
+    ensure_kv_capacity: bool,
+) !void {
+    const Stage0Type = @TypeOf(stage0.*);
+    if (comptime !typeHasDecl(Stage0Type, "computePrototypeLogitsWithLayerRange")) {
+        return error.InvalidTopologyConfig;
+    }
+    try stage0.computePrototypeLogitsWithLayerRange(
+        token,
+        position,
+        slot_index,
+        null,
+        0,
+        split_layer,
+        false,
+        false,
+        ensure_kv_capacity,
+        false,
+    );
+}
+
+fn pipelineActivationByteCountFor(self: anytype) !usize {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasDecl(SelfType, "pipelineActivationByteCount")) {
+        return self.pipelineActivationByteCount();
+    }
+    return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
+}
+
+fn runPipeline2WithPipelineRuntime(
+    self: anytype,
+    stage1_backend: anytype,
+    token: u32,
+    position: usize,
+    slot_index: usize,
+    logits_out_opt: ?[]f32,
+    compute_logits: bool,
+    download_logits: bool,
+    ensure_kv_capacity: bool,
+    trace_seq_len_u32: u32,
+    trace_pos_offset: usize,
+    activation_byte_count: usize,
+) !void {
+    const Ctx = struct {
+        token: u32,
+        position: usize,
+        slot_index: usize,
+        logits_out_opt: ?[]f32,
+        compute_logits: bool,
+        download_logits: bool,
+        ensure_kv_capacity: bool,
+        trace_seq_len_u32: u32,
+        trace_pos_offset: usize,
+    };
+    const Stage0 = struct {
+        backend: @TypeOf(self),
+        ctx: *const Ctx,
+
+        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            if (input.len != 0) return error.InvalidArgument;
+            if (layer_end < layer_start) return error.InvalidArgument;
+            const local_layer_limit = layer_end - layer_start;
+            try computeGpuPrototypeLogitsWithLayerLimit(
+                stage.backend,
+                stage.ctx.token,
+                stage.ctx.position,
+                stage.ctx.slot_index,
+                null,
+                local_layer_limit,
+                false,
+                false,
+                stage.ctx.ensure_kv_capacity,
+                stage.ctx.trace_seq_len_u32,
+                stage.ctx.trace_pos_offset,
+                null,
+                null,
+                null,
+                false,
+            );
+        }
+
+        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            try stage.backend.runtime_buffers.input_dev.download(&stage.backend.device, host_buf[0..byte_count]);
+        }
+
+        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const BackendType = @TypeOf(stage.backend.*);
+            if (comptime @hasDecl(BackendType, "uploadPipelineActivationFromHost")) {
+                return stage.backend.uploadPipelineActivationFromHost(stage.ctx.slot_index, host_buf[0..byte_count], byte_count);
+            }
+            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
+                return stage.backend.runtime_buffers.input_dev.upload(&stage.backend.device, host_buf[0..byte_count]);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn synchronize(stage: *@This()) anyerror!void {
+            if (stage.backend.compute_stream) |stream| {
+                try stage.backend.device.synchronizeStream(stream);
+                return;
+            }
+            try stage.backend.device.synchronize();
+        }
+
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    const Stage1 = struct {
+        backend: @TypeOf(stage1_backend),
+        ctx: *const Ctx,
+
+        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            if (input.len != 0) return error.InvalidArgument;
+            if (layer_end < layer_start) return error.InvalidArgument;
+            const local_layer_limit = layer_end - layer_start;
+            try computeGpuPrototypeLogitsWithLayerLimit(
+                stage.backend,
+                stage.ctx.token,
+                stage.ctx.position,
+                stage.ctx.slot_index,
+                stage.ctx.logits_out_opt,
+                local_layer_limit,
+                stage.ctx.compute_logits,
+                stage.ctx.download_logits,
+                stage.ctx.ensure_kv_capacity,
+                stage.ctx.trace_seq_len_u32,
+                stage.ctx.trace_pos_offset,
+                null,
+                null,
+                null,
+                true,
+            );
+        }
+
+        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const BackendType = @TypeOf(stage.backend.*);
+            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
+                return stage.backend.runtime_buffers.input_dev.download(&stage.backend.device, host_buf[0..byte_count]);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const BackendType = @TypeOf(stage.backend.*);
+            if (comptime @hasDecl(BackendType, "uploadPipelineActivationFromHost")) {
+                return stage.backend.uploadPipelineActivationFromHost(stage.ctx.slot_index, host_buf[0..byte_count], byte_count);
+            }
+            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
+                return stage.backend.runtime_buffers.input_dev.upload(&stage.backend.device, host_buf[0..byte_count]);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn synchronize(stage: *@This()) anyerror!void {
+            if (stage.backend.compute_stream) |stream| {
+                try stage.backend.device.synchronizeStream(stream);
+                return;
+            }
+            try stage.backend.device.synchronize();
+        }
+
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    const Transfer = struct {
+        owner: @TypeOf(self),
+
+        pub fn transfer(t: *@This(), src: *Stage0, dst: *Stage1, byte_count: usize) anyerror!void {
+            _ = src;
+            try t.owner.transferPipelineActivation(dst.backend, byte_count);
+        }
+
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    var ctx = Ctx{
+        .token = token,
+        .position = position,
+        .slot_index = slot_index,
+        .logits_out_opt = logits_out_opt,
+        .compute_logits = compute_logits,
+        .download_logits = download_logits,
+        .ensure_kv_capacity = ensure_kv_capacity,
+        .trace_seq_len_u32 = trace_seq_len_u32,
+        .trace_pos_offset = trace_pos_offset,
+    };
+    try staged_orchestrator.executeTwoStageForward(
+        Stage0,
+        Stage1,
+        Transfer,
+        .{ .backend = self, .ctx = &ctx },
+        .{ .backend = stage1_backend, .ctx = &ctx },
+        self.split_layer,
+        self.split_layer + stage1_backend.block_runtime.blocks.len,
+        &.{},
+        &.{},
+        activation_byte_count,
+        null,
+        .{ .owner = self },
+    );
+}
+
+fn runCpuGpuWithPipelineRuntime(
+    self: anytype,
+    cpu_stage0_backend: anytype,
+    token: u32,
+    position: usize,
+    slot_index: usize,
+    logits_out_opt: ?[]f32,
+    compute_logits: bool,
+    download_logits: bool,
+    ensure_kv_capacity: bool,
+    trace_seq_len_u32: u32,
+    trace_pos_offset: usize,
+    activation_byte_count: usize,
+) !void {
+    const Ctx = struct {
+        token: u32,
+        position: usize,
+        slot_index: usize,
+        logits_out_opt: ?[]f32,
+        compute_logits: bool,
+        download_logits: bool,
+        ensure_kv_capacity: bool,
+        trace_seq_len_u32: u32,
+        trace_pos_offset: usize,
+    };
+    const Stage0 = struct {
+        backend: @TypeOf(cpu_stage0_backend),
+        ctx: *const Ctx,
+
+        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            if (input.len != 0) return error.InvalidArgument;
+            if (layer_end < layer_start) return error.InvalidArgument;
+            try stage.backend.computePrototypeLogitsWithLayerRange(
+                stage.ctx.token,
+                stage.ctx.position,
+                stage.ctx.slot_index,
+                null,
+                layer_start,
+                layer_end,
+                false,
+                false,
+                stage.ctx.ensure_kv_capacity,
+                false,
+            );
+        }
+
+        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const src = stage.backend.slotActivationBytes(stage.ctx.slot_index);
+            if (byte_count > src.len) return error.InvalidArgument;
+            @memcpy(host_buf[0..byte_count], src[0..byte_count]);
+        }
+
+        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const dst = stage.backend.slotActivationBytesMut(stage.ctx.slot_index);
+            if (byte_count > dst.len) return error.InvalidArgument;
+            @memcpy(dst[0..byte_count], host_buf[0..byte_count]);
+        }
+
+        pub fn synchronize(_: *@This()) anyerror!void {}
+
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    const Stage1 = struct {
+        backend: @TypeOf(self),
+        ctx: *const Ctx,
+
+        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            if (input.len != 0) return error.InvalidArgument;
+            if (layer_end < layer_start) return error.InvalidArgument;
+            const local_layer_limit = layer_end - layer_start;
+            try computeGpuPrototypeLogitsWithLayerLimit(
+                stage.backend,
+                stage.ctx.token,
+                stage.ctx.position,
+                stage.ctx.slot_index,
+                stage.ctx.logits_out_opt,
+                local_layer_limit,
+                stage.ctx.compute_logits,
+                stage.ctx.download_logits,
+                stage.ctx.ensure_kv_capacity,
+                stage.ctx.trace_seq_len_u32,
+                stage.ctx.trace_pos_offset,
+                null,
+                null,
+                null,
+                true,
+            );
+        }
+
+        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const BackendType = @TypeOf(stage.backend.*);
+            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
+                return stage.backend.runtime_buffers.input_dev.download(&stage.backend.device, host_buf[0..byte_count]);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const BackendType = @TypeOf(stage.backend.*);
+            if (comptime @hasDecl(BackendType, "uploadPipelineActivationFromHost")) {
+                return stage.backend.uploadPipelineActivationFromHost(stage.ctx.slot_index, host_buf[0..byte_count], byte_count);
+            }
+            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
+                return stage.backend.runtime_buffers.input_dev.upload(&stage.backend.device, host_buf[0..byte_count]);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn synchronize(stage: *@This()) anyerror!void {
+            if (stage.backend.compute_stream) |stream| {
+                try stage.backend.device.synchronizeStream(stream);
+                return;
+            }
+            try stage.backend.device.synchronize();
+        }
+
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    var ctx = Ctx{
+        .token = token,
+        .position = position,
+        .slot_index = slot_index,
+        .logits_out_opt = logits_out_opt,
+        .compute_logits = compute_logits,
+        .download_logits = download_logits,
+        .ensure_kv_capacity = ensure_kv_capacity,
+        .trace_seq_len_u32 = trace_seq_len_u32,
+        .trace_pos_offset = trace_pos_offset,
+    };
+    try staged_orchestrator.executeTwoStageForward(
+        Stage0,
+        Stage1,
+        null,
+        .{ .backend = cpu_stage0_backend, .ctx = &ctx },
+        .{ .backend = self, .ctx = &ctx },
+        self.split_layer,
+        self.split_layer + self.block_runtime.blocks.len,
+        &.{},
+        &.{},
+        activation_byte_count,
+        self.pipeline_host_staging,
+        {},
+    );
+}
+
+fn runCpuGpuGpuWithPipelineRuntime(
+    self: anytype,
+    cpu_stage0_backend: anytype,
+    gpu_stage1_backend: anytype,
+    token: u32,
+    position: usize,
+    slot_index: usize,
+    logits_out_opt: ?[]f32,
+    compute_logits: bool,
+    download_logits: bool,
+    ensure_kv_capacity: bool,
+    trace_seq_len_u32: u32,
+    trace_pos_offset: usize,
+    activation01_byte_count: usize,
+    activation12_byte_count: usize,
+) !void {
+    const Ctx = struct {
+        token: u32,
+        position: usize,
+        slot_index: usize,
+        logits_out_opt: ?[]f32,
+        compute_logits: bool,
+        download_logits: bool,
+        ensure_kv_capacity: bool,
+        trace_seq_len_u32: u32,
+        trace_pos_offset: usize,
+    };
+    const Stage0 = struct {
+        backend: @TypeOf(cpu_stage0_backend),
+        ctx: *const Ctx,
+
+        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            if (input.len != 0) return error.InvalidArgument;
+            if (layer_end < layer_start) return error.InvalidArgument;
+            try stage.backend.computePrototypeLogitsWithLayerRange(
+                stage.ctx.token,
+                stage.ctx.position,
+                stage.ctx.slot_index,
+                null,
+                layer_start,
+                layer_end,
+                false,
+                false,
+                stage.ctx.ensure_kv_capacity,
+                false,
+            );
+        }
+
+        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const src = stage.backend.slotActivationBytes(stage.ctx.slot_index);
+            if (byte_count > src.len) return error.InvalidArgument;
+            @memcpy(host_buf[0..byte_count], src[0..byte_count]);
+        }
+
+        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const dst = stage.backend.slotActivationBytesMut(stage.ctx.slot_index);
+            if (byte_count > dst.len) return error.InvalidArgument;
+            @memcpy(dst[0..byte_count], host_buf[0..byte_count]);
+        }
+
+        pub fn synchronize(_: *@This()) anyerror!void {}
+
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    const Stage1 = struct {
+        backend: @TypeOf(gpu_stage1_backend),
+        ctx: *const Ctx,
+
+        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            if (input.len != 0) return error.InvalidArgument;
+            if (layer_end < layer_start) return error.InvalidArgument;
+            const local_layer_limit = layer_end - layer_start;
+            try computeGpuPrototypeLogitsWithLayerLimit(
+                stage.backend,
+                stage.ctx.token,
+                stage.ctx.position,
+                stage.ctx.slot_index,
+                null,
+                local_layer_limit,
+                false,
+                false,
+                stage.ctx.ensure_kv_capacity,
+                stage.ctx.trace_seq_len_u32,
+                stage.ctx.trace_pos_offset,
+                null,
+                null,
+                null,
+                true,
+            );
+        }
+
+        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const BackendType = @TypeOf(stage.backend.*);
+            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
+                return stage.backend.runtime_buffers.input_dev.download(&stage.backend.device, host_buf[0..byte_count]);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const BackendType = @TypeOf(stage.backend.*);
+            if (comptime @hasDecl(BackendType, "uploadPipelineActivationFromHost")) {
+                return stage.backend.uploadPipelineActivationFromHost(stage.ctx.slot_index, host_buf[0..byte_count], byte_count);
+            }
+            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
+                return stage.backend.runtime_buffers.input_dev.upload(&stage.backend.device, host_buf[0..byte_count]);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn synchronize(stage: *@This()) anyerror!void {
+            if (stage.backend.compute_stream) |stream| {
+                try stage.backend.device.synchronizeStream(stream);
+                return;
+            }
+            try stage.backend.device.synchronize();
+        }
+
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    const Stage2 = struct {
+        backend: @TypeOf(self),
+        ctx: *const Ctx,
+
+        pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            if (input.len != 0) return error.InvalidArgument;
+            if (layer_end < layer_start) return error.InvalidArgument;
+            const local_layer_limit = layer_end - layer_start;
+            try computeGpuPrototypeLogitsWithLayerLimit(
+                stage.backend,
+                stage.ctx.token,
+                stage.ctx.position,
+                stage.ctx.slot_index,
+                stage.ctx.logits_out_opt,
+                local_layer_limit,
+                stage.ctx.compute_logits,
+                stage.ctx.download_logits,
+                stage.ctx.ensure_kv_capacity,
+                stage.ctx.trace_seq_len_u32,
+                stage.ctx.trace_pos_offset,
+                null,
+                null,
+                null,
+                true,
+            );
+        }
+
+        pub fn downloadActivation(stage: *@This(), host_buf: []u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const BackendType = @TypeOf(stage.backend.*);
+            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
+                return stage.backend.runtime_buffers.input_dev.download(&stage.backend.device, host_buf[0..byte_count]);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn uploadActivation(stage: *@This(), host_buf: []const u8, byte_count: usize) anyerror!void {
+            if (byte_count > host_buf.len) return error.InvalidArgument;
+            const BackendType = @TypeOf(stage.backend.*);
+            if (comptime @hasDecl(BackendType, "uploadPipelineActivationFromHost")) {
+                return stage.backend.uploadPipelineActivationFromHost(stage.ctx.slot_index, host_buf[0..byte_count], byte_count);
+            }
+            if (comptime @hasField(BackendType, "runtime_buffers") and @hasField(BackendType, "device")) {
+                return stage.backend.runtime_buffers.input_dev.upload(&stage.backend.device, host_buf[0..byte_count]);
+            }
+            return error.InvalidTopologyConfig;
+        }
+
+        pub fn synchronize(stage: *@This()) anyerror!void {
+            if (stage.backend.compute_stream) |stream| {
+                try stage.backend.device.synchronizeStream(stream);
+                return;
+            }
+            try stage.backend.device.synchronize();
+        }
+
+        pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+    };
+
+    var ctx = Ctx{
+        .token = token,
+        .position = position,
+        .slot_index = slot_index,
+        .logits_out_opt = logits_out_opt,
+        .compute_logits = compute_logits,
+        .download_logits = download_logits,
+        .ensure_kv_capacity = ensure_kv_capacity,
+        .trace_seq_len_u32 = trace_seq_len_u32,
+        .trace_pos_offset = trace_pos_offset,
+    };
+    try staged_orchestrator.executeThreeStageForward(
+        Stage0,
+        Stage1,
+        Stage2,
+        .{ .backend = cpu_stage0_backend, .ctx = &ctx },
+        .{ .backend = gpu_stage1_backend, .ctx = &ctx },
+        .{ .backend = self, .ctx = &ctx },
+        self.split_layer,
+        self.pipelineSplitLayerStage2(),
+        self.pipelineSplitLayerStage2() + self.block_runtime.blocks.len,
+        &.{},
+        &.{},
+        &.{},
+        activation01_byte_count,
+        activation12_byte_count,
+        self.pipeline_host_staging,
+        self.pipeline_host_staging_stage12,
+    );
+}
+
 pub fn computeGpuPrototypeLogitsWithLayerLimit(
     self: anytype,
     token: u32,
@@ -48,15 +638,39 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     use_preloaded_input: bool,
 ) !void {
     const SelfType = @TypeOf(self.*);
-    if (comptime @hasField(SelfType, "topology_mode") and
-        @hasDecl(SelfType, "pipelineStage1") and
+    if (comptime @hasDecl(SelfType, "pipelineStage1") and
         @hasDecl(SelfType, "transferPipelineActivation"))
     {
-        if (self.topology_mode == .pipeline2 and
+        if (topologyModeIs(self, "pipeline2") and
             layer_limit == self.block_runtime.blocks.len and
             compute_logits and
             !use_preloaded_input)
         {
+            if (comptime @hasDecl(SelfType, "pipelineActivationByteCount")) {
+                if (hidden_override == null and deepstack_layer_features_opt == null and deepstack_feature_index_opt == null) {
+                    var runtime_stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
+                    if (runtime_stage1.state_descriptor_count > 0) {
+                        try runtime_stage1.mirrorSlotStateBlocksFrom(self, slot_index);
+                    }
+                    runtime_stage1.activateKvSlot(slot_index);
+                    const runtime_activation_bytes = try pipelineActivationByteCountFor(self);
+                    try runPipeline2WithPipelineRuntime(
+                        self,
+                        runtime_stage1,
+                        token,
+                        position,
+                        slot_index,
+                        logits_out_opt,
+                        compute_logits,
+                        download_logits,
+                        ensure_kv_capacity,
+                        trace_seq_len_u32,
+                        trace_pos_offset,
+                        runtime_activation_bytes,
+                    );
+                    return;
+                }
+            }
             var stage1_deepstack_layer_features_opt: ?[]const []const f32 = null;
             if (deepstack_layer_features_opt) |deepstack_layer_features| {
                 if (self.split_layer < deepstack_layer_features.len) {
@@ -85,7 +699,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 deepstack_feature_index_opt,
                 false,
             );
-            const activation_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+            const activation_bytes = try pipelineActivationByteCountFor(self);
             try self.transferPipelineActivation(stage1, activation_bytes);
             return computeGpuPrototypeLogitsWithLayerLimit(
                 stage1,
@@ -102,6 +716,163 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 null,
                 stage1_deepstack_layer_features_opt,
                 deepstack_feature_index_opt,
+                true,
+            );
+        }
+    }
+    if (comptime @hasDecl(SelfType, "pipelineCpuStage0") and
+        @hasDecl(SelfType, "pipelineSplitLayer") and
+        @hasDecl(SelfType, "transferPipelineActivationFromCpu"))
+    {
+        if (comptime @hasDecl(SelfType, "pipelineStage1") and
+            @hasDecl(SelfType, "pipelineSplitLayerStage2") and
+            @hasField(SelfType, "pipeline_host_staging_stage12"))
+        {
+            if (topologyModeIs(self, "cpu_gpu_gpu") and
+                layer_limit == self.block_runtime.blocks.len and
+                compute_logits and
+                !use_preloaded_input)
+            {
+                if (hidden_override != null or deepstack_layer_features_opt != null or deepstack_feature_index_opt != null) {
+                    return error.InvalidTopologyConfig;
+                }
+                const stage0 = self.pipelineCpuStage0() orelse return error.InvalidTopologyConfig;
+                var stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
+                const split_layer = self.pipelineSplitLayer();
+                const split_layer_stage2 = self.pipelineSplitLayerStage2();
+                if (split_layer == 0 or split_layer_stage2 <= split_layer) return error.InvalidTopologyConfig;
+                if (stage1.state_descriptor_count > 0) {
+                    try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
+                }
+                stage1.activateKvSlot(slot_index);
+                self.activateKvSlot(slot_index);
+                if (comptime @hasDecl(SelfType, "pipelineActivationByteCount")) {
+                    const runtime_activation01_bytes = try pipelineActivationByteCountFor(self);
+                    try runCpuGpuGpuWithPipelineRuntime(
+                        self,
+                        stage0,
+                        stage1,
+                        token,
+                        position,
+                        slot_index,
+                        logits_out_opt,
+                        compute_logits,
+                        download_logits,
+                        ensure_kv_capacity,
+                        trace_seq_len_u32,
+                        trace_pos_offset,
+                        runtime_activation01_bytes,
+                        runtime_activation01_bytes,
+                    );
+                    return;
+                }
+                if (comptime !@hasDecl(@TypeOf(stage1.*), "transferPipelineActivationFromCpu") or
+                    !@hasDecl(@TypeOf(stage1.*), "transferPipelineActivation"))
+                {
+                    return error.InvalidTopologyConfig;
+                }
+                try executeCpuStage0LayerRange(
+                    stage0,
+                    token,
+                    position,
+                    slot_index,
+                    split_layer,
+                    ensure_kv_capacity,
+                );
+                const activation_bytes = try pipelineActivationByteCountFor(self);
+                try stage1.transferPipelineActivationFromCpu(stage0, slot_index, activation_bytes);
+                try computeGpuPrototypeLogitsWithLayerLimit(
+                    stage1,
+                    token,
+                    position,
+                    slot_index,
+                    null,
+                    stage1.block_runtime.blocks.len,
+                    false,
+                    false,
+                    ensure_kv_capacity,
+                    trace_seq_len_u32,
+                    trace_pos_offset,
+                    null,
+                    null,
+                    null,
+                    true,
+                );
+                try stage1.transferPipelineActivation(self, activation_bytes);
+                return computeGpuPrototypeLogitsWithLayerLimit(
+                    self,
+                    token,
+                    position,
+                    slot_index,
+                    logits_out_opt,
+                    self.block_runtime.blocks.len,
+                    compute_logits,
+                    download_logits,
+                    ensure_kv_capacity,
+                    trace_seq_len_u32,
+                    trace_pos_offset,
+                    null,
+                    null,
+                    null,
+                    true,
+                );
+            }
+        }
+        if (topologyModeIs(self, "cpu_gpu") and
+            layer_limit == self.block_runtime.blocks.len and
+            compute_logits and
+            !use_preloaded_input)
+        {
+            if (hidden_override != null or deepstack_layer_features_opt != null or deepstack_feature_index_opt != null) {
+                return error.InvalidTopologyConfig;
+            }
+            const stage0 = self.pipelineCpuStage0() orelse return error.InvalidTopologyConfig;
+            const split_layer = self.pipelineSplitLayer();
+            if (split_layer == 0) return error.InvalidTopologyConfig;
+            if (comptime @hasDecl(SelfType, "pipelineActivationByteCount")) {
+                self.activateKvSlot(slot_index);
+                const runtime_activation_bytes = try pipelineActivationByteCountFor(self);
+                try runCpuGpuWithPipelineRuntime(
+                    self,
+                    stage0,
+                    token,
+                    position,
+                    slot_index,
+                    logits_out_opt,
+                    compute_logits,
+                    download_logits,
+                    ensure_kv_capacity,
+                    trace_seq_len_u32,
+                    trace_pos_offset,
+                    runtime_activation_bytes,
+                );
+                return;
+            }
+            try executeCpuStage0LayerRange(
+                stage0,
+                token,
+                position,
+                slot_index,
+                split_layer,
+                ensure_kv_capacity,
+            );
+            const activation_bytes = try pipelineActivationByteCountFor(self);
+            try self.transferPipelineActivationFromCpu(stage0, slot_index, activation_bytes);
+            return computeGpuPrototypeLogitsWithLayerLimit(
+                self,
+                token,
+                position,
+                slot_index,
+                logits_out_opt,
+                layer_limit,
+                compute_logits,
+                download_logits,
+                ensure_kv_capacity,
+                trace_seq_len_u32,
+                trace_pos_offset,
+                null,
+                null,
+                null,
                 true,
             );
         }
@@ -573,30 +1344,28 @@ pub fn computeBatchedDecodeLogits(
     if (n_usize == 0) return;
     if (n_usize > self.max_batch_size) return error.InvalidArgument;
     const n: u32 = @intCast(n_usize);
-    if (comptime @hasField(SelfType, "topology_mode")) {
-        if (self.topology_mode == .pipeline2) {
-            for (0..n_usize) |i| {
-                self.activateKvSlot(slot_indices[i]);
-                try computeGpuPrototypeLogitsWithLayerLimit(
-                    self,
-                    tokens[i],
-                    positions[i],
-                    slot_indices[i],
-                    self.slotLogits(slot_indices[i]),
-                    self.block_runtime.blocks.len,
-                    true,
-                    true,
-                    true,
-                    1,
-                    positions[i],
-                    null,
-                    null,
-                    null,
-                    false,
-                );
-            }
-            return;
+    if (topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) {
+        for (0..n_usize) |i| {
+            self.activateKvSlot(slot_indices[i]);
+            try computeGpuPrototypeLogitsWithLayerLimit(
+                self,
+                tokens[i],
+                positions[i],
+                slot_indices[i],
+                self.slotLogits(slot_indices[i]),
+                self.block_runtime.blocks.len,
+                true,
+                true,
+                true,
+                1,
+                positions[i],
+                null,
+                null,
+                null,
+                false,
+            );
         }
+        return;
     }
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
     const previous_launch_phase = self.device.setLaunchPhase(.decode);
@@ -899,36 +1668,36 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
     layer_limit: usize,
 ) !void {
     const SelfType = @TypeOf(self.*);
-    if (comptime @hasField(SelfType, "topology_mode")) {
-        if (self.topology_mode == .pipeline2 and layer_limit == self.block_runtime.blocks.len) {
-            if (tokens.len == 0) return error.InvalidArgument;
-            if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
-            if (logits_out.len != self.vocab_size) return error.InvalidArgument;
-            if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+    if ((topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) and
+        layer_limit == self.block_runtime.blocks.len)
+    {
+        if (tokens.len == 0) return error.InvalidArgument;
+        if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
+        if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
 
-            var token_index: usize = 0;
-            while (token_index < tokens.len) : (token_index += 1) {
-                const should_download = token_index + 1 == tokens.len;
-                try computeGpuPrototypeLogitsWithLayerLimit(
-                    self,
-                    tokens[token_index],
-                    token_index,
-                    slot_index,
-                    if (should_download) logits_out else null,
-                    layer_limit,
-                    true,
-                    should_download,
-                    true,
-                    @intCast(token_index + 1),
-                    token_index,
-                    null,
-                    null,
-                    null,
-                    false,
-                );
-            }
-            return;
+        var token_index: usize = 0;
+        while (token_index < tokens.len) : (token_index += 1) {
+            const should_download = token_index + 1 == tokens.len;
+            try computeGpuPrototypeLogitsWithLayerLimit(
+                self,
+                tokens[token_index],
+                token_index,
+                slot_index,
+                if (should_download) logits_out else null,
+                layer_limit,
+                true,
+                should_download,
+                true,
+                @intCast(token_index + 1),
+                token_index,
+                null,
+                null,
+                null,
+                false,
+            );
         }
+        return;
     }
 
     if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;

@@ -10,6 +10,7 @@ fn slotIndexSupported(self: anytype, slot_index: usize) bool {
     const SelfType = @TypeOf(self.*);
     if (comptime @hasDecl(SelfType, "slotIndexSupported")) return self.slotIndexSupported(slot_index);
     if (comptime @hasField(SelfType, "max_batch_size")) return slot_index < self.max_batch_size;
+    if (comptime @hasDecl(SelfType, "max_batch_size")) return slot_index < SelfType.max_batch_size;
     return slot_index == 0;
 }
 
@@ -459,4 +460,51 @@ test "decodeBatch processes multiple requests" {
     try testing.expectEqual(@as(usize, 1), results[1].slot_index);
     try testing.expectEqual(@as(usize, 11), backend.slot_positions[0]);
     try testing.expectEqual(@as(usize, 21), backend.slot_positions[1]);
+}
+
+test "decodeBatch lifecycle stress remains deterministic under interleaved slot operations" {
+    var backend = MockDecodeBackend.init();
+    backend.slot_in_use = .{ false, false };
+    var results: [2]contract.DecodeResult = undefined;
+    var requests: [2]contract.DecodeRequest = undefined;
+    var expected_compute_calls: usize = 0;
+
+    for (0..80) |iter| {
+        if (!backend.slot_in_use[0]) _ = allocSlot(&backend);
+        if (!backend.slot_in_use[1] and iter % 2 == 0) _ = allocSlot(&backend);
+
+        var req_count: usize = 0;
+        for (backend.slot_in_use, 0..) |in_use, slot_index| {
+            if (!in_use) continue;
+            requests[req_count] = .{
+                .slot_index = slot_index,
+                .token = @intCast(100 + iter + slot_index),
+            };
+            req_count += 1;
+        }
+        if (req_count > 0) {
+            try decodeBatch(&backend, requests[0..req_count], results[0..req_count]);
+            expected_compute_calls += req_count;
+        }
+
+        if (iter % 5 == 0 and backend.slot_in_use[1]) {
+            resetSlot(&backend, 1);
+        }
+        if (iter % 7 == 0 and backend.slot_in_use[1]) {
+            freeSlot(&backend, 1);
+        }
+        if (iter % 11 == 0) {
+            backend.slot_state_bound = false;
+            if (backend.slot_in_use[0]) {
+                requests[0] = .{ .slot_index = 0, .token = @intCast(iter) };
+                try testing.expectError(
+                    error.InvalidStateDescriptorBinding,
+                    decodeBatch(&backend, requests[0..1], results[0..1]),
+                );
+            }
+            backend.slot_state_bound = true;
+        }
+    }
+
+    try testing.expectEqual(expected_compute_calls, backend.compute_calls);
 }

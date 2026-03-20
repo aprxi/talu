@@ -953,6 +953,94 @@ pub const FusedCpuBackend = struct {
         return logits_buffer;
     }
 
+    /// Execute a decode-style layer range [layer_start, layer_end) for one slot.
+    /// Used by staged heterogeneous topology orchestration.
+    pub fn computePrototypeLogitsWithLayerRange(
+        self: *FusedCpuBackend,
+        token: u32,
+        position: usize,
+        slot_index: usize,
+        logits_out_opt: ?[]f32,
+        layer_start: usize,
+        layer_end: usize,
+        compute_logits: bool,
+        download_logits: bool,
+        ensure_kv_capacity: bool,
+        use_preloaded_input: bool,
+    ) !void {
+        _ = ensure_kv_capacity;
+        if (!compute_logits and download_logits) return error.InvalidArgument;
+        if (layer_end < layer_start or layer_end > self.model.layers.len) return error.InvalidArgument;
+        if (download_logits and logits_out_opt == null) return error.InvalidArgument;
+        if (logits_out_opt) |logits_out| {
+            if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+        }
+
+        try self.ensureSlotStateBlocksBound(slot_index);
+        try self.scratch.ensureForMode(.decode, 1);
+        if (position == 0 and layer_start == 0 and !use_preloaded_input) {
+            if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
+                layered_cache.resetSlot(slot_index);
+            } else |err| switch (err) {
+                error.UnknownStateDescriptorId => {},
+                else => return err,
+            }
+            self.scratch.resetSlotCaches(slot_index);
+        }
+
+        self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[slot_index]);
+        defer self.setPositionDeltaForTextLayers(0);
+
+        const hidden_buffer = self.getHiddenBuffer(slot_index);
+        var hidden_view_3d = Tensor.view3D(
+            std.mem.sliceAsBytes(hidden_buffer),
+            1,
+            self.d_model,
+        );
+        if (!use_preloaded_input) {
+            const token_ids = &[_]u32{token};
+            try self.model.embed_tokens.forward(token_ids, &hidden_view_3d);
+            cpu_rowwise.scaleInPlace(hidden_buffer, self.loaded.config.embedding_multiplier);
+            if (trace.isEnabled()) {
+                trace.emit(
+                    .embed,
+                    trace.TraceEmission.NO_LAYER,
+                    0,
+                    @intCast(position),
+                    hidden_view_3d.data().ptr,
+                    .f32,
+                    .{ 1, 1, @intCast(self.d_model), 0 },
+                    3,
+                    "gatherEmbeddings",
+                );
+            }
+        }
+
+        try self.model.forwardWithBatchedCacheLayerRange(
+            &hidden_view_3d,
+            &hidden_view_3d,
+            &self.scratch,
+            self.slotStateBlocks(slot_index),
+            slot_index,
+            true,
+            layer_start,
+            layer_end,
+        );
+        if (!compute_logits) return;
+
+        if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
+        const logits_target = if (logits_out_opt) |target| target else self.getLogitsBuffer(slot_index);
+        try self.computeLogitsFromHiddenRows(hidden_buffer, 1, logits_target);
+    }
+
+    pub fn slotActivationBytes(self: *FusedCpuBackend, slot_index: usize) []const u8 {
+        return std.mem.sliceAsBytes(self.getHiddenBuffer(slot_index));
+    }
+
+    pub fn slotActivationBytesMut(self: *FusedCpuBackend, slot_index: usize) []u8 {
+        return std.mem.sliceAsBytes(self.getHiddenBuffer(slot_index));
+    }
+
     /// Warmup: do a dummy forward pass to pull weights into CPU cache.
     pub fn warmup(self: *FusedCpuBackend) !void {
         // Suppress trace during warmup so xray doesn't capture warmup records
@@ -2493,4 +2581,37 @@ test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind n
     try std.testing.expectEqual(@intFromPtr(state_blocks[0].ptr), @intFromPtr(bound[0].ptr));
     try std.testing.expectEqual(state_blocks[0].size, bound[0].size);
     try std.testing.expectEqual(state_blocks[0].align_bytes, bound[0].align_bytes);
+}
+
+test "computePrototypeLogitsWithLayerRange rejects download request without logits compute" {
+    var backend: FusedCpuBackend = undefined;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        backend.computePrototypeLogitsWithLayerRange(
+            0,
+            0,
+            0,
+            null,
+            0,
+            0,
+            false,
+            true,
+            false,
+            false,
+        ),
+    );
+}
+
+test "slotActivationBytes and slotActivationBytesMut expose slot hidden storage" {
+    var hidden_storage = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    var backend: FusedCpuBackend = undefined;
+    backend.d_model = 4;
+    backend.hidden_buffers = hidden_storage[0..];
+
+    const bytes = backend.slotActivationBytes(0);
+    try std.testing.expectEqual(@as(usize, hidden_storage.len * @sizeOf(f32)), bytes.len);
+
+    var bytes_mut = backend.slotActivationBytesMut(0);
+    bytes_mut[0] = 0;
+    try std.testing.expect(bytes_mut.len == bytes.len);
 }

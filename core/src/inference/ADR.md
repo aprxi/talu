@@ -207,6 +207,15 @@ CUDA backend:
 2. A single-slot request MUST execute as batch size `1`.
 3. Batch capability validation MUST enforce any CUDA batch-size restrictions.
 
+Mixed-backend staged topologies (`cpu+gpu`, `gpu+gpu`, `cpu+gpu+gpu` roadmap):
+1. Topology capability/split validation MUST complete successfully before backend runtime initialization starts.
+2. Stage-boundary activation dtype/layout MUST be negotiated from stage-advertised support sets.
+3. Any boundary conversion MUST be explicit and accounted for in the selected topology plan; implicit widening/narrowing in hot paths is forbidden.
+4. KV/state blocks MUST remain backend-local to the stage that owns the executed layer range.
+5. Inter-stage KV/state migration over PCIe MUST NOT occur in v1 staged routes.
+6. Slot lifecycle operations (alloc, bind, reset, unbind, free) MUST fan out deterministically to every stage participating in the topology.
+7. Cross-stage runtime-state pointer aliasing MUST NOT occur; stages requiring runtime payload rebinding MUST synthesize stage-local wrapper blocks.
+
 ## Vision Staged Plan Contract
 Multimodal-capable models MUST represent staged plans through `ModelPlans`:
 1. `vision_encode` stage

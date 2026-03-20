@@ -8,6 +8,7 @@ fn slotIndexSupported(self: anytype, slot_index: usize) bool {
     const SelfType = @TypeOf(self.*);
     if (comptime @hasDecl(SelfType, "slotIndexSupported")) return self.slotIndexSupported(slot_index);
     if (comptime @hasField(SelfType, "max_batch_size")) return slot_index < self.max_batch_size;
+    if (comptime @hasDecl(SelfType, "max_batch_size")) return slot_index < SelfType.max_batch_size;
     return slot_index == 0;
 }
 
@@ -263,4 +264,46 @@ test "prefill fails when slot state blocks are unbound" {
     );
     try testing.expectEqual(@as(usize, 1), backend.ensure_state_binding_calls);
     try testing.expectEqual(@as(usize, 0), backend.compute_calls);
+}
+
+test "prefillSlot lifecycle stress across repeated windows and slots remains deterministic" {
+    var backend = MockBackend.init();
+    backend.slot_in_use = .{ true, true };
+    var logits_out: [8]f32 = undefined;
+    var expected_compute_calls: usize = 0;
+
+    const token_windows = [_][]const u32{
+        &[_]u32{ 1, 2 },
+        &[_]u32{ 3, 4, 5 },
+        &[_]u32{6},
+    };
+
+    for (0..60) |iter| {
+        const slot_index: usize = iter % 2;
+        const window = token_windows[iter % token_windows.len];
+        if (!backend.slot_in_use[slot_index]) {
+            backend.slot_in_use[slot_index] = true;
+            backend.slot_positions[slot_index] = 0;
+        }
+        try prefillSlot(&backend, slot_index, window, logits_out[0..]);
+        expected_compute_calls += 1;
+
+        if (iter % 4 == 0) {
+            backend.slot_positions[slot_index] = 0;
+        }
+        if (iter % 9 == 0) {
+            backend.slot_in_use[slot_index] = false;
+        }
+        if (iter % 13 == 0) {
+            backend.slot_state_bound = false;
+            backend.slot_in_use[0] = true;
+            try testing.expectError(
+                error.InvalidStateDescriptorBinding,
+                prefillSlot(&backend, 0, token_windows[0], logits_out[0..]),
+            );
+            backend.slot_state_bound = true;
+        }
+    }
+
+    try testing.expectEqual(expected_compute_calls, backend.compute_calls);
 }

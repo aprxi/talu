@@ -33,6 +33,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 pub const contract = @import("contract.zig");
 pub const pipeline = @import("pipeline.zig");
+pub const staged_orchestrator = @import("staged_orchestrator.zig");
 
 const models = @import("../../models/root.zig");
 const log = @import("../../log.zig");
@@ -125,11 +126,15 @@ pub const Selection = enum {
 pub const CudaTopologyMode = enum {
     single,
     pipeline2,
+    cpu_gpu,
+    cpu_gpu_gpu,
 };
 
 pub const CudaTopologyConfig = struct {
     mode: CudaTopologyMode = .single,
     stage_device_ordinals: [2]usize = .{ 0, 1 },
+    split_layer: ?usize = null,
+    split_layer_stage2: ?usize = null,
 };
 
 /// Backend initialization options selected at startup/config layer.
@@ -177,11 +182,103 @@ const CudaProbe = compute.cuda.Probe;
 const CudaTopology = struct {
     mode: CudaTopologyMode = .single,
     stage_device_ordinals: [2]usize = .{ 0, 1 },
+    split_layer: ?usize = null,
+    split_layer_stage2: ?usize = null,
 
     fn primaryDeviceOrdinal(self: *const CudaTopology) usize {
-        return self.stage_device_ordinals[0];
+        return switch (self.mode) {
+            .cpu_gpu_gpu => self.stage_device_ordinals[1],
+            else => self.stage_device_ordinals[0],
+        };
     }
 };
+
+const CudaTopologyCapabilities = struct {
+    supports_pipeline2: bool = true,
+    supports_cpu_gpu: bool = true,
+    supports_cpu_gpu_gpu: bool = true,
+    min_pipeline2_layers: usize = 2,
+    min_cpu_gpu_layers: usize = 2,
+    min_cpu_gpu_gpu_layers: usize = 3,
+    requires_distinct_stage_devices: bool = true,
+};
+
+const cuda_topology_capabilities = CudaTopologyCapabilities{};
+
+const CudaTopologyValidationError = error{
+    Pipeline2Unsupported,
+    Pipeline2InsufficientLayers,
+    Pipeline2InvalidSplitLayer,
+    Pipeline2RequiresDistinctDevices,
+    Pipeline2DeviceOrdinalOutOfRange,
+    CpuGpuUnsupported,
+    CpuGpuInsufficientLayers,
+    CpuGpuInvalidSplitLayer,
+    CpuGpuDeviceOrdinalOutOfRange,
+    CpuGpuGpuUnsupported,
+    CpuGpuGpuInsufficientLayers,
+    CpuGpuGpuInvalidSplitLayer,
+    CpuGpuGpuInvalidSplitLayerStage2,
+    CpuGpuGpuSplitOrderInvalid,
+    CpuGpuGpuRequiresDistinctDevices,
+    CpuGpuGpuDeviceOrdinalOutOfRange,
+};
+
+fn validateCudaTopologyConfig(
+    topology: CudaTopology,
+    total_layers: usize,
+    device_count: usize,
+) CudaTopologyValidationError!void {
+    switch (topology.mode) {
+        .single => return,
+        .pipeline2 => {
+            if (!cuda_topology_capabilities.supports_pipeline2) return error.Pipeline2Unsupported;
+            if (total_layers < cuda_topology_capabilities.min_pipeline2_layers) return error.Pipeline2InsufficientLayers;
+            if (topology.split_layer) |split| {
+                if (split == 0 or split >= total_layers) return error.Pipeline2InvalidSplitLayer;
+            }
+            if (cuda_topology_capabilities.requires_distinct_stage_devices and
+                topology.stage_device_ordinals[0] == topology.stage_device_ordinals[1])
+            {
+                return error.Pipeline2RequiresDistinctDevices;
+            }
+            if (topology.stage_device_ordinals[0] >= device_count or
+                topology.stage_device_ordinals[1] >= device_count)
+            {
+                return error.Pipeline2DeviceOrdinalOutOfRange;
+            }
+        },
+        .cpu_gpu => {
+            if (!cuda_topology_capabilities.supports_cpu_gpu) return error.CpuGpuUnsupported;
+            if (total_layers < cuda_topology_capabilities.min_cpu_gpu_layers) return error.CpuGpuInsufficientLayers;
+            if (topology.split_layer) |split| {
+                if (split == 0 or split >= total_layers) return error.CpuGpuInvalidSplitLayer;
+            }
+            if (topology.stage_device_ordinals[0] >= device_count) return error.CpuGpuDeviceOrdinalOutOfRange;
+        },
+        .cpu_gpu_gpu => {
+            if (!cuda_topology_capabilities.supports_cpu_gpu_gpu) return error.CpuGpuGpuUnsupported;
+            if (total_layers < cuda_topology_capabilities.min_cpu_gpu_gpu_layers) return error.CpuGpuGpuInsufficientLayers;
+            const split_default = @max(@as(usize, 1), total_layers / 3);
+            const split = topology.split_layer orelse split_default;
+            if (split == 0 or split >= total_layers) return error.CpuGpuGpuInvalidSplitLayer;
+            const split2_default = split + @max(@as(usize, 1), (total_layers - split) / 2);
+            const split2 = topology.split_layer_stage2 orelse split2_default;
+            if (split2 == 0 or split2 >= total_layers) return error.CpuGpuGpuInvalidSplitLayerStage2;
+            if (split2 <= split) return error.CpuGpuGpuSplitOrderInvalid;
+            if (cuda_topology_capabilities.requires_distinct_stage_devices and
+                topology.stage_device_ordinals[0] == topology.stage_device_ordinals[1])
+            {
+                return error.CpuGpuGpuRequiresDistinctDevices;
+            }
+            if (topology.stage_device_ordinals[0] >= device_count or
+                topology.stage_device_ordinals[1] >= device_count)
+            {
+                return error.CpuGpuGpuDeviceOrdinalOutOfRange;
+            }
+        },
+    }
+}
 
 fn cudaProbeName(probe: CudaProbe) []const u8 {
     return @tagName(probe);
@@ -199,6 +296,12 @@ fn parseCudaTopologyMode(raw: []const u8) ?CudaTopologyMode {
     if (std.ascii.eqlIgnoreCase(token, "pipeline2")) return .pipeline2;
     if (std.ascii.eqlIgnoreCase(token, "pipeline_2")) return .pipeline2;
     if (std.ascii.eqlIgnoreCase(token, "pipeline_2way")) return .pipeline2;
+    if (std.ascii.eqlIgnoreCase(token, "cpu_gpu")) return .cpu_gpu;
+    if (std.ascii.eqlIgnoreCase(token, "cpu+gpu")) return .cpu_gpu;
+    if (std.ascii.eqlIgnoreCase(token, "pipeline_cpu_gpu")) return .cpu_gpu;
+    if (std.ascii.eqlIgnoreCase(token, "cpu_gpu_gpu")) return .cpu_gpu_gpu;
+    if (std.ascii.eqlIgnoreCase(token, "cpu+gpu+gpu")) return .cpu_gpu_gpu;
+    if (std.ascii.eqlIgnoreCase(token, "pipeline_cpu_gpu_gpu")) return .cpu_gpu_gpu;
     return null;
 }
 
@@ -222,6 +325,8 @@ fn resolveCudaTopology(
     if (topology_override) |cfg| {
         topology.mode = cfg.mode;
         topology.stage_device_ordinals = cfg.stage_device_ordinals;
+        topology.split_layer = cfg.split_layer;
+        topology.split_layer_stage2 = cfg.split_layer_stage2;
         return topology;
     }
 
@@ -252,11 +357,41 @@ fn resolveCudaTopology(
         const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
             log.warn("inference", "Invalid TALU_CUDA_DEVICE; keeping topology primary device", .{
                 .value = trimmed,
-                .current = topology.stage_device_ordinals[0],
+                .current = topology.primaryDeviceOrdinal(),
             });
             return topology;
         };
-        topology.stage_device_ordinals[0] = parsed;
+        if (topology.mode == .cpu_gpu_gpu) {
+            topology.stage_device_ordinals[1] = parsed;
+        } else {
+            topology.stage_device_ordinals[0] = parsed;
+        }
+    }
+
+    const split_layer_raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_SPLIT_LAYER") catch null;
+    if (split_layer_raw) |value| {
+        defer allocator.free(value);
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+            log.warn("inference", "Invalid TALU_CUDA_SPLIT_LAYER; using default split", .{
+                .value = trimmed,
+            });
+            return topology;
+        };
+        topology.split_layer = parsed;
+    }
+
+    const split_layer_stage2_raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_SPLIT_LAYER_STAGE2") catch null;
+    if (split_layer_stage2_raw) |value| {
+        defer allocator.free(value);
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+            log.warn("inference", "Invalid TALU_CUDA_SPLIT_LAYER_STAGE2; using default split", .{
+                .value = trimmed,
+            });
+            return topology;
+        };
+        topology.split_layer_stage2 = parsed;
     }
 
     return topology;
@@ -845,44 +980,146 @@ fn initCuda(
         return error.CudaUnavailable;
     }
     const topology = resolveCudaTopology(allocator, topology_override);
-    if (topology.mode == .pipeline2) {
-        if (topology.stage_device_ordinals[0] == topology.stage_device_ordinals[1]) {
-            log.err("inference", "Pipeline2 requires two distinct CUDA device ordinals", .{
-                .ordinal0 = topology.stage_device_ordinals[0],
-                .ordinal1 = topology.stage_device_ordinals[1],
-            }, @src());
-            return error.InvalidTopologyConfig;
-        }
-        if (has_cuda) {
-            const device_count = compute.cuda.Device.deviceCount() catch |err| {
-                log.err("inference", "Failed to query CUDA device count for pipeline2 validation", .{
+    if (topology.mode != .single) {
+        const device_count = if (has_cuda)
+            compute.cuda.Device.deviceCount() catch |err| {
+                log.err("inference", "Failed to query CUDA device count for topology validation", .{
                     .err = @errorName(err),
                 }, @src());
                 return err;
-            };
-            if (topology.stage_device_ordinals[0] >= device_count or
-                topology.stage_device_ordinals[1] >= device_count)
-            {
+            }
+        else
+            0;
+        validateCudaTopologyConfig(topology, loaded.blocks.len, device_count) catch |err| switch (err) {
+            error.Pipeline2Unsupported => {
+                log.err("inference", "Pipeline2 topology is not supported by current capability envelope", .{
+                    .total_layers = loaded.blocks.len,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.Pipeline2InsufficientLayers => {
+                log.err("inference", "Pipeline2 requires at least two decoder layers", .{
+                    .total_layers = loaded.blocks.len,
+                    .required = cuda_topology_capabilities.min_pipeline2_layers,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.Pipeline2InvalidSplitLayer => {
+                log.err("inference", "Pipeline2 split layer is out of range", .{
+                    .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
+                    .total_layers = loaded.blocks.len,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.Pipeline2RequiresDistinctDevices => {
+                log.err("inference", "Pipeline2 requires two distinct CUDA device ordinals", .{
+                    .ordinal0 = topology.stage_device_ordinals[0],
+                    .ordinal1 = topology.stage_device_ordinals[1],
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.Pipeline2DeviceOrdinalOutOfRange => {
                 log.err("inference", "Pipeline2 device ordinal out of range", .{
                     .ordinal0 = topology.stage_device_ordinals[0],
                     .ordinal1 = topology.stage_device_ordinals[1],
                     .device_count = device_count,
                 }, @src());
                 return error.CudaInvalidDevice;
-            }
-        }
+            },
+            error.CpuGpuUnsupported => {
+                log.err("inference", "CPU+GPU topology is not supported by current capability envelope", .{
+                    .total_layers = loaded.blocks.len,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.CpuGpuInsufficientLayers => {
+                log.err("inference", "CPU+GPU topology requires at least two decoder layers", .{
+                    .total_layers = loaded.blocks.len,
+                    .required = cuda_topology_capabilities.min_cpu_gpu_layers,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.CpuGpuInvalidSplitLayer => {
+                log.err("inference", "CPU+GPU split layer is out of range", .{
+                    .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
+                    .total_layers = loaded.blocks.len,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.CpuGpuDeviceOrdinalOutOfRange => {
+                log.err("inference", "CPU+GPU topology device ordinal out of range", .{
+                    .ordinal0 = topology.stage_device_ordinals[0],
+                    .device_count = device_count,
+                }, @src());
+                return error.CudaInvalidDevice;
+            },
+            error.CpuGpuGpuUnsupported => {
+                log.err("inference", "CPU+GPU+GPU topology is not supported by current capability envelope", .{
+                    .total_layers = loaded.blocks.len,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.CpuGpuGpuInsufficientLayers => {
+                log.err("inference", "CPU+GPU+GPU topology requires at least three decoder layers", .{
+                    .total_layers = loaded.blocks.len,
+                    .required = cuda_topology_capabilities.min_cpu_gpu_gpu_layers,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.CpuGpuGpuInvalidSplitLayer => {
+                log.err("inference", "CPU+GPU+GPU first split layer is out of range", .{
+                    .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
+                    .total_layers = loaded.blocks.len,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.CpuGpuGpuInvalidSplitLayerStage2 => {
+                log.err("inference", "CPU+GPU+GPU second split layer is out of range", .{
+                    .split_layer_stage2 = if (topology.split_layer_stage2) |split| split else std.math.maxInt(usize),
+                    .total_layers = loaded.blocks.len,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.CpuGpuGpuSplitOrderInvalid => {
+                log.err("inference", "CPU+GPU+GPU split layers must satisfy split0 < split1 < total", .{
+                    .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
+                    .split_layer_stage2 = if (topology.split_layer_stage2) |split| split else std.math.maxInt(usize),
+                    .total_layers = loaded.blocks.len,
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.CpuGpuGpuRequiresDistinctDevices => {
+                log.err("inference", "CPU+GPU+GPU requires two distinct CUDA device ordinals for gpu stages", .{
+                    .ordinal0 = topology.stage_device_ordinals[0],
+                    .ordinal1 = topology.stage_device_ordinals[1],
+                }, @src());
+                return error.InvalidTopologyConfig;
+            },
+            error.CpuGpuGpuDeviceOrdinalOutOfRange => {
+                log.err("inference", "CPU+GPU+GPU topology device ordinal out of range", .{
+                    .ordinal0 = topology.stage_device_ordinals[0],
+                    .ordinal1 = topology.stage_device_ordinals[1],
+                    .device_count = device_count,
+                }, @src());
+                return error.CudaInvalidDevice;
+            },
+        };
     }
     const cuda_max_batch_size = resolveCudaMaxBatchSize();
     log.info("inference", "CUDA backend init config", .{
         .max_batch = cuda_max_batch_size,
         .topology = @tagName(topology.mode),
         .device = topology.primaryDeviceOrdinal(),
+        .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
+        .split_layer_stage2 = if (topology.split_layer_stage2) |split| split else std.math.maxInt(usize),
     });
     const cuda_backend_state = if (has_cuda)
         try cuda.BackendType.init(allocator, loaded, cuda_max_batch_size, .{
             .device_ordinal = topology.primaryDeviceOrdinal(),
             .topology_mode = topology.mode,
             .stage_device_ordinals = topology.stage_device_ordinals,
+            .split_layer = topology.split_layer,
+            .split_layer_stage2 = topology.split_layer_stage2,
         })
     else
         unreachable;
@@ -988,6 +1225,11 @@ test "parseCudaTopologyMode parses supported modes" {
     try std.testing.expectEqual(CudaTopologyMode.single, parseCudaTopologyMode("single").?);
     try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("pipeline2").?);
     try std.testing.expectEqual(CudaTopologyMode.pipeline2, parseCudaTopologyMode("pipeline_2way").?);
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, parseCudaTopologyMode("cpu_gpu").?);
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, parseCudaTopologyMode("cpu+gpu").?);
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, parseCudaTopologyMode("cpu_gpu_gpu").?);
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, parseCudaTopologyMode("cpu+gpu+gpu").?);
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, parseCudaTopologyMode("pipeline_cpu_gpu_gpu").?);
 }
 
 test "parseCudaTopologyMode rejects unsupported modes" {
@@ -1007,9 +1249,163 @@ test "resolveCudaTopology honors explicit override" {
     const topology = resolveCudaTopology(std.testing.allocator, .{
         .mode = .pipeline2,
         .stage_device_ordinals = .{ 4, 5 },
+        .split_layer = 7,
+        .split_layer_stage2 = 11,
     });
     try std.testing.expectEqual(CudaTopologyMode.pipeline2, topology.mode);
     try std.testing.expectEqualDeep(@as([2]usize, .{ 4, 5 }), topology.stage_device_ordinals);
+    try std.testing.expectEqual(@as(?usize, 7), topology.split_layer);
+    try std.testing.expectEqual(@as(?usize, 11), topology.split_layer_stage2);
+}
+
+test "validateCudaTopologyConfig accepts single topology" {
+    const topology = CudaTopology{
+        .mode = .single,
+        .stage_device_ordinals = .{ 0, 0 },
+    };
+    try validateCudaTopologyConfig(topology, 1, 1);
+}
+
+test "validateCudaTopologyConfig rejects pipeline2 with insufficient layers" {
+    const topology = CudaTopology{
+        .mode = .pipeline2,
+        .stage_device_ordinals = .{ 0, 1 },
+    };
+    try std.testing.expectError(
+        error.Pipeline2InsufficientLayers,
+        validateCudaTopologyConfig(topology, 1, 2),
+    );
+}
+
+test "validateCudaTopologyConfig rejects pipeline2 with duplicate device ordinals" {
+    const topology = CudaTopology{
+        .mode = .pipeline2,
+        .stage_device_ordinals = .{ 1, 1 },
+    };
+    try std.testing.expectError(
+        error.Pipeline2RequiresDistinctDevices,
+        validateCudaTopologyConfig(topology, 8, 4),
+    );
+}
+
+test "validateCudaTopologyConfig rejects pipeline2 when ordinal is out of range" {
+    const topology = CudaTopology{
+        .mode = .pipeline2,
+        .stage_device_ordinals = .{ 0, 3 },
+    };
+    try std.testing.expectError(
+        error.Pipeline2DeviceOrdinalOutOfRange,
+        validateCudaTopologyConfig(topology, 8, 2),
+    );
+}
+
+test "validateCudaTopologyConfig rejects pipeline2 split layer out of range" {
+    const topology = CudaTopology{
+        .mode = .pipeline2,
+        .stage_device_ordinals = .{ 0, 1 },
+        .split_layer = 8,
+    };
+    try std.testing.expectError(
+        error.Pipeline2InvalidSplitLayer,
+        validateCudaTopologyConfig(topology, 8, 2),
+    );
+}
+
+test "validateCudaTopologyConfig rejects cpu_gpu with insufficient layers" {
+    const topology = CudaTopology{
+        .mode = .cpu_gpu,
+        .stage_device_ordinals = .{ 0, 0 },
+    };
+    try std.testing.expectError(
+        error.CpuGpuInsufficientLayers,
+        validateCudaTopologyConfig(topology, 1, 1),
+    );
+}
+
+test "validateCudaTopologyConfig rejects cpu_gpu split layer out of range" {
+    const topology = CudaTopology{
+        .mode = .cpu_gpu,
+        .stage_device_ordinals = .{ 0, 0 },
+        .split_layer = 0,
+    };
+    try std.testing.expectError(
+        error.CpuGpuInvalidSplitLayer,
+        validateCudaTopologyConfig(topology, 8, 2),
+    );
+}
+
+test "validateCudaTopologyConfig rejects cpu_gpu when gpu ordinal is out of range" {
+    const topology = CudaTopology{
+        .mode = .cpu_gpu,
+        .stage_device_ordinals = .{ 3, 0 },
+    };
+    try std.testing.expectError(
+        error.CpuGpuDeviceOrdinalOutOfRange,
+        validateCudaTopologyConfig(topology, 8, 2),
+    );
+}
+
+test "validateCudaTopologyConfig rejects cpu_gpu_gpu with insufficient layers" {
+    const topology = CudaTopology{
+        .mode = .cpu_gpu_gpu,
+        .stage_device_ordinals = .{ 0, 1 },
+    };
+    try std.testing.expectError(
+        error.CpuGpuGpuInsufficientLayers,
+        validateCudaTopologyConfig(topology, 2, 2),
+    );
+}
+
+test "validateCudaTopologyConfig rejects cpu_gpu_gpu split layer ordering" {
+    const topology = CudaTopology{
+        .mode = .cpu_gpu_gpu,
+        .stage_device_ordinals = .{ 0, 1 },
+        .split_layer = 5,
+        .split_layer_stage2 = 4,
+    };
+    try std.testing.expectError(
+        error.CpuGpuGpuSplitOrderInvalid,
+        validateCudaTopologyConfig(topology, 12, 2),
+    );
+}
+
+test "validateCudaTopologyConfig rejects cpu_gpu_gpu with duplicate gpu ordinals" {
+    const topology = CudaTopology{
+        .mode = .cpu_gpu_gpu,
+        .stage_device_ordinals = .{ 1, 1 },
+        .split_layer = 3,
+        .split_layer_stage2 = 6,
+    };
+    try std.testing.expectError(
+        error.CpuGpuGpuRequiresDistinctDevices,
+        validateCudaTopologyConfig(topology, 10, 4),
+    );
+}
+
+test "validateCudaTopologyConfig rejects cpu_gpu_gpu second split out of range" {
+    const topology = CudaTopology{
+        .mode = .cpu_gpu_gpu,
+        .stage_device_ordinals = .{ 0, 1 },
+        .split_layer = 2,
+        .split_layer_stage2 = 10,
+    };
+    try std.testing.expectError(
+        error.CpuGpuGpuInvalidSplitLayerStage2,
+        validateCudaTopologyConfig(topology, 10, 2),
+    );
+}
+
+test "validateCudaTopologyConfig rejects cpu_gpu_gpu when any gpu ordinal is out of range" {
+    const topology = CudaTopology{
+        .mode = .cpu_gpu_gpu,
+        .stage_device_ordinals = .{ 0, 3 },
+        .split_layer = 2,
+        .split_layer_stage2 = 7,
+    };
+    try std.testing.expectError(
+        error.CpuGpuGpuDeviceOrdinalOutOfRange,
+        validateCudaTopologyConfig(topology, 12, 2),
+    );
 }
 
 test "optionalSelectionName returns tag or unset" {
