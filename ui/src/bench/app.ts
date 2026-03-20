@@ -1,3 +1,15 @@
+import {
+  CHECK_ICON as ICON_CHECK,
+  COPY_ICON as ICON_COPY,
+  DELETE_ICON as ICON_DELETE,
+  SEARCH_ICON as ICON_SEARCH,
+  SETTINGS_ICON as ICON_SETTINGS,
+  CHEVRON_DOWN_ICON,
+  CHEVRON_RIGHT_ICON,
+} from "../icons.ts";
+import { populateModelSelect, relativeTime } from "../render/helpers.ts";
+import type { ModelEntry } from "../types.ts";
+
 type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 type MajorGroupId = "responses" | "db";
@@ -80,6 +92,16 @@ type BenchEventEnvelope = {
   data?: Record<string, unknown> | null;
 };
 
+const BENCH_EVENT_LEVELS = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"] as const;
+type BenchEventLevel = (typeof BENCH_EVENT_LEVELS)[number];
+
+type BenchEventLine = {
+  level: BenchEventLevel;
+  topic: string;
+  message: string;
+  text: string;
+};
+
 type BenchScenario = {
   id: string;
   title: string;
@@ -135,11 +157,186 @@ type ResolvedBenchPage =
 
 const TEXT_ENCODER = new TextEncoder();
 const MAX_BENCH_EVENT_LINES = 180;
-const benchEventLines: string[] = [];
+const benchEventLines: BenchEventLine[] = [];
+const benchEventSelectedLevels = new Set<BenchEventLevel>(BENCH_EVENT_LEVELS);
+const benchEventDiscoveredTopics: string[] = [];
+const benchEventSelectedTopics = new Set<string>();
+let benchEventSearchText = "";
 let benchEventsAbort: AbortController | null = null;
-let benchSettingsEscHandler: ((event: KeyboardEvent) => void) | null = null;
+let benchAvailableModels: ModelEntry[] = [];
+let benchSelectedVariant = "";
 const BENCH_TREE_OPEN_KEY = "bench:tree-open:v1";
 const BENCH_PENDING_SCENARIO_KEY = "bench:pending-scenario:v1";
+
+function deduplicateByFamily(models: ModelEntry[]): ModelEntry[] {
+  const families = new Map<string, { entry: ModelEntry; variants: { id: string; label: string; size_bytes?: number }[] }>();
+  for (const m of models) {
+    let familyKey = m.id;
+    if (m.source === "managed") {
+      const stripped = m.id.replace(/-GAF\d+(-G\d+)?$/, "");
+      if (stripped !== m.id) familyKey = stripped;
+    }
+    const label = familyKey !== m.id
+      ? m.id.slice(familyKey.length + 1)
+      : (m.id.split("/").pop() ?? m.id);
+    if (!families.has(familyKey)) {
+      families.set(familyKey, {
+        entry: { ...m, display_name: familyKey !== m.id ? familyKey : undefined },
+        variants: [],
+      });
+    }
+    families.get(familyKey)!.variants.push({ id: m.id, label });
+  }
+  return [...families.values()].map(({ entry, variants }) => ({
+    ...entry,
+    variants,
+  }));
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const val = bytes / Math.pow(1024, i);
+  return `${val < 10 ? val.toFixed(1) : Math.round(val)} ${units[i]}`;
+}
+
+function renderBenchModelVariants(entry: ModelEntry | undefined): void {
+  const container = document.getElementById("bench-model-variants");
+  if (!container) return;
+  container.innerHTML = "";
+  if (!entry?.variants || entry.variants.length === 0) {
+    container.classList.add("hidden");
+    return;
+  }
+  container.classList.remove("hidden");
+  const multiVariant = entry.variants.length > 1;
+  for (const v of entry.variants) {
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "bench-model-variant";
+    let text = v.label;
+    if (v.size_bytes && v.size_bytes > 0) {
+      text += ` \u00b7 ${formatBytes(v.size_bytes)}`;
+    }
+    pill.textContent = text;
+    pill.title = v.id;
+    if (v.id === benchSelectedVariant) pill.classList.add("active");
+    if (multiVariant) {
+      pill.addEventListener("click", () => {
+        benchSelectedVariant = v.id;
+        for (const p of container.children) {
+          (p as HTMLElement).classList.toggle("active", p === pill);
+        }
+      });
+    }
+    container.appendChild(pill);
+  }
+}
+
+async function fetchBenchModels(): Promise<void> {
+  const baseUrl = window.location.origin.replace(/\/$/, "");
+  try {
+    // 1. Fetch settings for active model and the full managed model catalog.
+    const settingsResp = await request(baseUrl, "GET", "/v1/settings");
+    if (!settingsResp.ok) return;
+    const settings = (await settingsResp.json()) as { model?: string; available_models?: ModelEntry[] };
+    const allManaged = Array.isArray(settings.available_models) ? settings.available_models : [];
+    const activeModel = typeof settings.model === "string" ? settings.model.trim() : "";
+
+    // 2. Read user-curated chat models list from KV (same source as Chat > Router).
+    //    The KV API returns { value_hex: "..." } — hex-encoded UTF-8.
+    let chatModelIds: string[] = [];
+    try {
+      const kvResp = await request(baseUrl, "GET", "/v1/db/kv/namespaces/chat_models/entries/models");
+      if (kvResp.ok) {
+        const kvPayload = (await kvResp.json()) as { value_hex?: string };
+        if (kvPayload.value_hex) {
+          const bytes = new Uint8Array(kvPayload.value_hex.length / 2);
+          for (let i = 0; i < kvPayload.value_hex.length; i += 2) {
+            bytes[i / 2] = parseInt(kvPayload.value_hex.substring(i, i + 2), 16);
+          }
+          const decoded = new TextDecoder().decode(bytes);
+          const parsed = JSON.parse(decoded);
+          if (Array.isArray(parsed)) {
+            chatModelIds = parsed.filter((x): x is string => typeof x === "string");
+          }
+        }
+      }
+    } catch { /* KV not available — fall back to all managed models */ }
+
+    // 3. Build model list: if user curated a chat models list, use exactly that.
+    //    Otherwise fall back to all managed models (same as chat with no curation).
+    if (chatModelIds.length > 0) {
+      // Build family map for local models (mirrors chat-models-data.ts emitChanged).
+      const familyMap = new Map<string, { defaultVariant: string; variants: { id: string; label: string; size_bytes?: number }[] }>();
+      for (const id of chatModelIds) {
+        if (id.includes("::")) continue; // remote models handled separately
+        const managed = allManaged.find((m) => m.id === id);
+        // Infer family key: strip -GAF\d+(-G\d+)? suffix.
+        let familyKey = id;
+        const stripped = id.replace(/-GAF\d+(-G\d+)?$/, "");
+        if (stripped !== id) familyKey = stripped;
+        if (!familyMap.has(familyKey)) {
+          familyMap.set(familyKey, { defaultVariant: id, variants: [] });
+        }
+        const label = familyKey !== id ? id.slice(familyKey.length + 1) : (id.split("/").pop() ?? id);
+        familyMap.get(familyKey)!.variants.push({
+          id,
+          label: managed?.variants?.find((v) => v.id === id)?.label ?? label,
+          size_bytes: managed?.variants?.find((v) => v.id === id)?.size_bytes,
+        });
+      }
+
+      // Local family entries.
+      const localEntries: ModelEntry[] = [...familyMap.entries()].map(([familyId, data]) => ({
+        id: data.defaultVariant,
+        display_name: familyId !== data.defaultVariant ? familyId : undefined,
+        source: "managed" as const,
+        defaults: { temperature: 1.0, top_k: 50, top_p: 1.0, do_sample: true },
+        overrides: {},
+        variants: data.variants,
+      }));
+      // Remote model entries (e.g. vllm::model-name).
+      const remoteEntries: ModelEntry[] = chatModelIds
+        .filter((id) => id.includes("::"))
+        .map((id) => ({
+          id,
+          source: "hub" as const,
+          defaults: { temperature: 1.0, top_k: 50, top_p: 1.0, do_sample: true },
+          overrides: {},
+        }));
+      benchAvailableModels = [...localEntries, ...remoteEntries];
+    } else {
+      // No curated list — use all managed models (same as chat default).
+      benchAvailableModels = deduplicateByFamily(allManaged);
+    }
+
+    // 4. Populate the <select> and variant pills.
+    const sel = document.getElementById("bench-responses-model") as HTMLSelectElement | null;
+    if (!sel) return;
+
+    if (!benchSelectedVariant && activeModel) {
+      benchSelectedVariant = activeModel;
+    }
+    populateModelSelect(sel, benchAvailableModels, benchSelectedVariant || activeModel);
+
+    if (!benchSelectedVariant) {
+      if (activeModel) {
+        benchSelectedVariant = activeModel;
+      } else if (benchAvailableModels.length > 0) {
+        const first = benchAvailableModels[0]!;
+        benchSelectedVariant = first.variants?.[0]?.id ?? first.id;
+      }
+    }
+
+    const selectedEntry = benchAvailableModels.find((m) => m.id === sel.value)
+      ?? benchAvailableModels.find((m) => m.variants?.some((v) => v.id === benchSelectedVariant));
+    renderBenchModelVariants(selectedEntry);
+  } catch (_) {
+    // Silently fail — the model can still be resolved at run time.
+  }
+}
 
 function toBase64(text: string): string {
   return btoa(text);
@@ -691,10 +888,19 @@ async function persistBenchRun(
     };
     const docResp = await requestJson(baseUrl, "POST", "/v1/db/tables/documents", {
       type: "bench_run",
-      title: `Bench ${scenario.id} ${ts.toISOString().slice(0, 19)}`,
+      title: scenario.id,
       content,
-      marker: "active",
+      marker: scenario.scope,
+      group_id: scenario.scope,
       tags_text: `bench,${scenario.scope.replace("/", "_")}`,
+      meta_f1: parseFloat(round2(avgGenTokS)) || undefined,
+      meta_f2: parseFloat(round2(avgTtftMs)) || undefined,
+      meta_f3: parseFloat(round2(avgPrefillTokS)) || undefined,
+      meta_f4: parseFloat(round2(avgRps)) || undefined,
+      meta_f5: parseFloat(round2(successPct)) || undefined,
+      meta_i1: Math.round(totalInputTokens) || undefined,
+      meta_i2: Math.round(totalOutputTokens) || undefined,
+      meta_i3: rows.length || undefined,
     });
     if (docResp.ok) {
       const payload = (await docResp.json()) as { id?: string };
@@ -1972,22 +2178,6 @@ const PAGE_DEFS: Record<string, PageDef> = {
     subtitle: "bench/results",
     description: "Browse and compare historical benchmark runs.",
     parent: "",
-    children: ["results/responses", "results/db"],
-  },
-  "results/responses": {
-    slug: "results/responses",
-    title: "Results: Responses",
-    subtitle: "bench/results/responses",
-    description: "Historical runs for responses perf and eval suites.",
-    parent: "results",
-    children: [],
-  },
-  "results/db": {
-    slug: "results/db",
-    title: "Results: DB",
-    subtitle: "bench/results/db",
-    description: "Historical runs for DB scenario suites.",
-    parent: "results",
     children: [],
   },
 };
@@ -2334,22 +2524,35 @@ function renderRunner(page: PageDef, scenarios: BenchScenario[]): string {
   return `
     <section id="bench-runner" class="bench-runner">
       <section class="bench-step-card bench-output">
-        <header class="bench-panel-header bench-step-header">
-          <h2>Run</h2>
-        </header>
-        <div class="bench-run-toolbar">
-          <div class="bench-buttons bench-buttons-primary">
-            <button id="bench-run" class="btn btn-primary btn-sm">Start</button>
-            <button id="bench-pause" class="btn btn-ghost btn-sm" disabled>Pause</button>
-            <button id="bench-stop" class="btn btn-danger btn-sm" disabled>Stop</button>
-            <button id="bench-clear" class="btn btn-ghost btn-sm" type="button">Clear</button>
-          </div>
-          <button id="bench-settings-toggle" class="btn btn-ghost btn-sm bench-settings-toggle" type="button" aria-expanded="false">
-            Settings
-          </button>
+        <div class="bench-run-bar">
+          <select id="bench-responses-model" class="form-select form-select-inline" data-param="responses">
+            <option value="">Loading...</option>
+          </select>
+          <button id="bench-settings-toggle" class="btn btn-ghost btn-icon" title="Settings">${ICON_SETTINGS}</button>
+          <div class="flex-1"></div>
+          <button id="bench-pause" class="btn btn-ghost btn-sm" disabled>Pause</button>
+          <button id="bench-run" class="btn btn-primary btn-sm bench-run-btn">Start</button>
         </div>
-        <div id="bench-run-selected" class="bench-run-selected">No scenario selected.</div>
-        <div id="bench-run-status" class="bench-run-status">Idle</div>
+        <div id="bench-model-variants" class="bench-model-variants hidden" data-param="responses"></div>
+        <div id="bench-run-selected" class="bench-run-selected"></div>
+        <div id="bench-settings-panel" class="bench-inline-settings-panel" style="display: none;">
+          <div class="bench-grid bench-grid-primary">
+            <label>Requests <input id="bench-requests" class="form-input form-input-sm bench-input-num" type="number" min="1" value="1" /></label>
+            <label>Concurrency <input id="bench-concurrency" class="form-input form-input-sm bench-input-num" type="number" min="1" value="1" /></label>
+            <label>Rounds <input id="bench-rounds" class="form-input form-input-sm bench-input-num" type="number" min="1" value="1" /></label>
+            <label data-param="responses">Max Tokens <input id="bench-responses-max-output-tokens" class="form-input form-input-sm bench-input-num" type="number" min="1" value="1" /></label>
+          </div>
+          <div class="bench-grid bench-grid-advanced">
+            <label class="bench-param" data-param="kv">KV Batch Size <input id="bench-kv-batch-size" class="form-input form-input-sm bench-input-num" type="number" min="1" value="1" /></label>
+            <label class="bench-param" data-param="tables">Seed Rows <input id="bench-table-seed-rows" class="form-input form-input-sm bench-input-num" type="number" min="1" value="1" /></label>
+            <label class="bench-param" data-param="vectors">Vector Dims <input id="bench-vector-dims" class="form-input form-input-sm bench-input-num" type="number" min="1" value="1" /></label>
+          </div>
+        </div>
+        <div class="bench-run-toolbar">
+          <div id="bench-run-status" class="bench-run-status">Idle</div>
+          <div class="flex-1"></div>
+          <button id="bench-clear" class="btn btn-ghost btn-icon bench-run-clear-icon" type="button" title="Clear run output">${ICON_DELETE}</button>
+        </div>
         <section id="bench-progress-strip" class="bench-progress-strip" data-state="idle">
           <div class="bench-progress-strip-head">
             <strong id="bench-progress-phase">Idle</strong>
@@ -2400,103 +2603,71 @@ function renderRunner(page: PageDef, scenarios: BenchScenario[]): string {
         </section>
 
         <section class="bench-log-wrap">
+          <div class="bench-log-header">
+            <button id="bench-log-copy" type="button" class="btn btn-ghost btn-icon bench-events-toolbar-btn" title="Copy log">${ICON_COPY}</button>
+          </div>
           <pre id="bench-log" class="bench-log"></pre>
         </section>
 
         <section id="bench-events-wrap" class="bench-events-wrap">
-          <div class="bench-events-head">
-            <strong>Server Events</strong>
-            <button id="bench-events-clear" type="button" class="btn btn-ghost btn-sm bench-events-clear">Clear</button>
+          <header class="bench-events-header">
+            <div class="bench-events-header-top">
+              <h2>Server Events</h2>
+              <button id="bench-events-clear" type="button" class="btn btn-ghost btn-icon bench-events-toolbar-btn" title="Clear">${ICON_DELETE}</button>
+            </div>
+            <div class="search-wrapper">
+              ${ICON_SEARCH}
+              <input id="bench-events-search" type="text" class="search-input" placeholder="Search events\u2026" />
+            </div>
+          </header>
+          <div class="bench-events-log-wrap">
+            <pre id="bench-events-log" class="bench-events-log">No events yet.</pre>
+            <button id="bench-events-copy" type="button" class="btn btn-ghost btn-icon bench-events-copy-btn" title="Copy">${ICON_COPY}</button>
           </div>
-          <pre id="bench-events-log" class="bench-events-log">No events yet.</pre>
+          <div id="bench-events-levels-row" class="bench-events-filter-row is-dimmed">
+            <input id="bench-events-levels-toggle" type="checkbox" class="bench-events-filter-master" title="Toggle all levels" />
+            <div class="bench-events-filter-pills">
+              ${BENCH_EVENT_LEVELS.map(
+                (level) => `<button type="button" class="bench-events-pill" data-event-level="${level}" aria-pressed="false">${level} <span class="bench-events-pill-count">0</span></button>`,
+              ).join("")}
+            </div>
+          </div>
+          <div id="bench-events-topics-row" class="bench-events-filter-row" hidden>
+            <input id="bench-events-topics-toggle" type="checkbox" class="bench-events-filter-master" title="Toggle all topics" />
+            <div id="bench-events-topics-list" class="bench-events-filter-pills"></div>
+          </div>
         </section>
       </section>
-
-      <aside id="bench-settings-panel" class="bench-controls bench-step-card bench-controls-side">
-        <header class="bench-panel-header bench-step-header bench-settings-head">
-          <div>
-            <h2>Settings</h2>
-          </div>
-          <button id="bench-settings-close" class="btn btn-ghost btn-sm bench-settings-close" type="button" aria-label="Close settings panel">
-            ×
-          </button>
-        </header>
-        <div id="bench-active-scenario" class="bench-active-scenario"></div>
-        <div class="bench-grid bench-grid-primary">
-          <label>Requests <input id="bench-requests" class="form-input form-input-sm" type="number" min="1" value="1" /></label>
-          <label>Concurrency <input id="bench-concurrency" class="form-input form-input-sm" type="number" min="1" value="1" /></label>
-          <label>Rounds <input id="bench-rounds" class="form-input form-input-sm" type="number" min="1" value="1" /></label>
-        </div>
-        <details class="bench-advanced bench-controls-more">
-          <summary>Scenario-Specific Settings</summary>
-          <div class="bench-grid bench-grid-advanced">
-            <label class="bench-param" data-param="kv">KV Batch Size <input id="bench-kv-batch-size" class="form-input form-input-sm" type="number" min="1" value="1" /></label>
-            <label class="bench-param" data-param="tables">Seed Rows <input id="bench-table-seed-rows" class="form-input form-input-sm" type="number" min="1" value="1" /></label>
-            <label class="bench-param" data-param="vectors">Vector Dims <input id="bench-vector-dims" class="form-input form-input-sm" type="number" min="1" value="1" /></label>
-            <label class="bench-param" data-param="responses">Model (optional) <input id="bench-responses-model" class="form-input form-input-sm" value="" placeholder="Qwen/Qwen3.5-0.8B" /></label>
-            <label class="bench-param" data-param="responses">Max Output Tokens <input id="bench-responses-max-output-tokens" class="form-input form-input-sm" type="number" min="1" value="1" /></label>
-          </div>
-        </details>
-      </aside>
     </section>
   `;
 }
 
 function renderResultsBrowser(page: PageDef): string {
-  if (!page.slug.startsWith("results")) {
+  if (page.slug !== "results") {
     return "";
   }
-  const scope =
-    page.slug === "results/responses" ? "responses/" : page.slug === "results/db" ? "db/" : "";
 
   return `
-    <section id="bench-results-browser" class="bench-results-browser" data-results-scope="${scope}">
-      <header class="bench-results-browser-head">
-        <h2>Run History</h2>
-        <p>Browse saved runs, inspect details, and compare two runs side by side.</p>
-        <div class="bench-results-browser-actions">
-          <input id="bench-results-search" class="form-input form-input-sm" placeholder="Filter by scenario or scope..." />
-          <button id="bench-results-refresh" class="btn btn-ghost btn-sm">Refresh</button>
-          <button id="bench-results-clear-filter" class="btn btn-ghost btn-sm" type="button">Clear</button>
-        </div>
-      </header>
-      <section class="bench-results-stats">
-        <article class="bench-stat-pill">
-          <span>Runs shown</span>
-          <strong id="bench-results-stat-count">0</strong>
-        </article>
-        <article class="bench-stat-pill">
-          <span>Avg RPS</span>
-          <strong id="bench-results-stat-rps">—</strong>
-        </article>
-        <article class="bench-stat-pill">
-          <span>Avg p95</span>
-          <strong id="bench-results-stat-p95">—</strong>
-        </article>
-        <article class="bench-stat-pill">
-          <span>Success avg</span>
-          <strong id="bench-results-stat-success">—</strong>
-        </article>
-      </section>
-      <div class="bench-results-browser-body">
-        <aside class="bench-results-list-wrap">
-          <div class="bench-results-list-head">
-            <span>Saved Runs</span>
+    <section id="bench-results-browser" class="bench-results-browser" data-results-scope="">
+      <section class="bench-layout bench-results-layout">
+        <aside class="bench-sidebar bench-results-sidebar">
+          <div class="bench-results-toolbar">
+            <input id="bench-results-search" class="form-input form-input-sm" placeholder="Filter..." />
             <span id="bench-results-count" class="bench-results-count">0</span>
           </div>
           <div id="bench-results-list" class="bench-results-list"></div>
+          <div class="bench-results-sidebar-actions">
+            <button id="bench-results-refresh" class="btn btn-ghost btn-sm">Refresh</button>
+            <button id="bench-results-clear-filter" class="btn btn-ghost btn-sm" type="button">Clear</button>
+            <button id="bench-results-delete-all" class="btn btn-ghost btn-sm bench-results-delete-all-btn">Delete All</button>
+          </div>
         </aside>
-        <section class="bench-results-detail-wrap">
+        <div class="bench-main">
           <article id="bench-results-detail" class="bench-results-detail">
-            <h3>Run Detail</h3>
-            <p>Select a run to inspect metadata and summary KPIs.</p>
+            <p class="bench-results-placeholder">Select a run to view details.</p>
           </article>
-          <article id="bench-results-compare" class="bench-results-compare">
-            <h3>Compare</h3>
-            <p>Select exactly two runs in the list to compare.</p>
-          </article>
-        </section>
-      </div>
+        </div>
+      </section>
     </section>
   `;
 }
@@ -2547,7 +2718,6 @@ const DEFAULT_CHILD_PAGE: Record<string, string> = {
   responses: "responses/perf",
   "responses/evals": "responses/evals/mmlu",
   db: "db/kv",
-  results: "results/responses",
 };
 
 function render(): { page: PageDef | null; scenarios: BenchScenario[] } {
@@ -2579,7 +2749,7 @@ function render(): { page: PageDef | null; scenarios: BenchScenario[] } {
   const scenarios = scenariosForPage(page);
   const isResultsPage = page.slug.startsWith("results");
   const isRunnerPage = !isResultsPage && page.children.length === 0 && scenarios.length > 0;
-  const showSidebar = sectionRootForPage(page) !== null;
+  const showSidebar = !isResultsPage && sectionRootForPage(page) !== null;
 
   root.innerHTML = `
     <main class="bench-shell${isRunnerPage ? " is-runner" : ""}${embedded ? " is-embedded" : ""}">
@@ -2597,7 +2767,6 @@ function render(): { page: PageDef | null; scenarios: BenchScenario[] } {
       <section class="bench-layout">
         ${renderSectionSidebar(page, scenarios)}
         <div class="bench-main">
-          ${renderResultsBrowser(page)}
           ${renderRunner(page, scenarios)}
         </div>
       </section>` : `
@@ -2665,25 +2834,246 @@ function appendLog(message: string): void {
   el.scrollTop = el.scrollHeight;
 }
 
-function clearBenchEventsLog(): void {
-  benchEventLines.length = 0;
-  const el = document.getElementById("bench-events-log");
-  if (!el) return;
-  el.textContent = "No events yet.";
+function normalizeBenchEventLevel(value: string | null | undefined): BenchEventLevel {
+  const upper = String(value ?? "").trim().toUpperCase();
+  if (upper === "TRACE" || upper === "DEBUG" || upper === "INFO" || upper === "WARN" || upper === "ERROR") {
+    return upper;
+  }
+  if (upper === "WARNING") {
+    return "WARN";
+  }
+  return "INFO";
 }
 
-function appendBenchEventLine(text: string): void {
+function renderBenchEventsLog(): void {
   const el = document.getElementById("bench-events-log");
   if (!el) return;
-  if (benchEventLines.length === 0 && el.textContent?.trim() === "No events yet.") {
-    el.textContent = "";
+
+  if (benchEventLines.length === 0) {
+    el.textContent = "No events yet.";
+    return;
   }
-  benchEventLines.push(text);
+
+  const needle = benchEventSearchText.toLowerCase();
+  const visible = benchEventLines.filter(
+    (line) =>
+      benchEventSelectedLevels.has(line.level) &&
+      benchEventSelectedTopics.has(line.topic) &&
+      (needle.length === 0 || line.message.toLowerCase().includes(needle)),
+  );
+  if (visible.length === 0) {
+    el.textContent = "No events match current filters.";
+    return;
+  }
+
+  let topicW = 0;
+  for (const line of visible) {
+    if (line.topic.length > topicW) topicW = line.topic.length;
+  }
+
+  el.textContent = visible
+    .map((line) => {
+      const time = line.text.slice(0, 8);
+      const lvl = line.level.padEnd(5);
+      const topic = line.topic.padEnd(topicW);
+      return `${time}  ${lvl}  ${topic}  ${line.message}`;
+    })
+    .join("\n");
+  el.scrollTop = el.scrollHeight;
+  updatePillCounts();
+}
+
+function updatePillCounts(): void {
+  const levelCounts = new Map<string, number>();
+  const topicCounts = new Map<string, number>();
+  for (const line of benchEventLines) {
+    levelCounts.set(line.level, (levelCounts.get(line.level) ?? 0) + 1);
+    topicCounts.set(line.topic, (topicCounts.get(line.topic) ?? 0) + 1);
+  }
+  document.querySelectorAll<HTMLButtonElement>(".bench-events-pill[data-event-level]").forEach((btn) => {
+    const countEl = btn.querySelector(".bench-events-pill-count");
+    if (countEl) countEl.textContent = String(levelCounts.get(btn.dataset.eventLevel ?? "") ?? 0);
+  });
+  document.querySelectorAll<HTMLButtonElement>(".bench-events-pill[data-event-topic]").forEach((btn) => {
+    const countEl = btn.querySelector(".bench-events-pill-count");
+    if (countEl) countEl.textContent = String(topicCounts.get(btn.dataset.eventTopic ?? "") ?? 0);
+  });
+}
+
+function clearBenchEventsLog(): void {
+  benchEventLines.length = 0;
+  benchEventDiscoveredTopics.length = 0;
+  benchEventSelectedTopics.clear();
+  benchEventSearchText = "";
+  const searchInput = document.getElementById("bench-events-search") as HTMLInputElement | null;
+  if (searchInput) searchInput.value = "";
+  document.getElementById("bench-events-topics-row")?.setAttribute("hidden", "");
+  document.getElementById("bench-events-levels-row")?.classList.add("is-dimmed");
+  renderBenchEventsLog();
+}
+
+async function copyBenchEventsLog(): Promise<boolean> {
+  const el = document.getElementById("bench-events-log");
+  const text = el?.textContent?.trim() ?? "";
+  if (!text || text === "No events yet." || text === "No events match current filters.") {
+    return false;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
+function discoverTopic(topic: string): void {
+  if (benchEventDiscoveredTopics.includes(topic)) return;
+  benchEventDiscoveredTopics.push(topic);
+  benchEventSelectedTopics.add(topic);
+  renderBenchEventsTopics();
+}
+
+function renderBenchEventsTopics(): void {
+  const row = document.getElementById("bench-events-topics-row");
+  const levelsRow = document.getElementById("bench-events-levels-row");
+  const list = document.getElementById("bench-events-topics-list");
+  if (!list) return;
+  if (benchEventDiscoveredTopics.length === 0) {
+    row?.setAttribute("hidden", "");
+    levelsRow?.classList.add("is-dimmed");
+    list.innerHTML = "";
+    return;
+  }
+  row?.removeAttribute("hidden");
+  levelsRow?.classList.remove("is-dimmed");
+  syncLevelPills();
+  list.innerHTML = benchEventDiscoveredTopics
+    .map((t) => {
+      const active = benchEventSelectedTopics.has(t);
+      return `<button type="button" class="bench-events-pill${active ? " is-active" : ""}" data-event-topic="${t}" aria-pressed="${active}">${t} <span class="bench-events-pill-count">0</span></button>`;
+    })
+    .join("");
+  list.querySelectorAll<HTMLButtonElement>("[data-event-topic]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const topic = btn.dataset.eventTopic ?? "";
+      if (benchEventSelectedTopics.has(topic)) {
+        benchEventSelectedTopics.delete(topic);
+      } else {
+        benchEventSelectedTopics.add(topic);
+      }
+      btn.classList.toggle("is-active", benchEventSelectedTopics.has(topic));
+      btn.setAttribute("aria-pressed", benchEventSelectedTopics.has(topic) ? "true" : "false");
+      syncTopicCheckbox();
+      renderBenchEventsLog();
+    });
+  });
+  syncTopicCheckbox();
+}
+
+function appendBenchEventLine(text: string, level?: string, topic?: string, message?: string): void {
+  const resolvedTopic = topic ?? "events.log";
+  const wasEmpty = benchEventLines.length === 0;
+  discoverTopic(resolvedTopic);
+  if (wasEmpty) {
+    syncLevelPills();
+  }
+  benchEventLines.push({
+    level: normalizeBenchEventLevel(level),
+    topic: resolvedTopic,
+    message: message ?? text,
+    text,
+  });
   while (benchEventLines.length > MAX_BENCH_EVENT_LINES) {
     benchEventLines.shift();
   }
-  el.textContent = benchEventLines.join("\n");
-  el.scrollTop = el.scrollHeight;
+  renderBenchEventsLog();
+}
+
+function syncLevelCheckbox(): void {
+  const cb = document.getElementById("bench-events-levels-toggle") as HTMLInputElement | null;
+  if (!cb) return;
+  const selected = benchEventSelectedLevels.size;
+  const total = BENCH_EVENT_LEVELS.length;
+  cb.checked = selected === total;
+  cb.indeterminate = selected > 0 && selected < total;
+}
+
+function syncLevelPills(): void {
+  document.querySelectorAll<HTMLButtonElement>(".bench-events-pill[data-event-level]").forEach((btn) => {
+    const level = normalizeBenchEventLevel(btn.dataset.eventLevel ?? "");
+    const active = benchEventSelectedLevels.has(level);
+    btn.classList.toggle("is-active", active);
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  syncLevelCheckbox();
+}
+
+function wireBenchEventLevelFilters(): void {
+  const buttons = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(".bench-events-pill[data-event-level]"),
+  );
+  const cb = document.getElementById("bench-events-levels-toggle") as HTMLInputElement | null;
+  if (buttons.length === 0) return;
+
+  buttons.forEach((button) => {
+    const level = normalizeBenchEventLevel(button.dataset.eventLevel ?? "");
+    button.classList.toggle("is-active", benchEventSelectedLevels.has(level));
+    button.addEventListener("click", () => {
+      if (benchEventSelectedLevels.has(level)) {
+        benchEventSelectedLevels.delete(level);
+      } else {
+        benchEventSelectedLevels.add(level);
+      }
+      button.classList.toggle("is-active", benchEventSelectedLevels.has(level));
+      button.setAttribute("aria-pressed", benchEventSelectedLevels.has(level) ? "true" : "false");
+      syncLevelCheckbox();
+      renderBenchEventsLog();
+    });
+  });
+
+  cb?.addEventListener("change", () => {
+    benchEventSelectedLevels.clear();
+    if (cb.checked) {
+      BENCH_EVENT_LEVELS.forEach((l) => benchEventSelectedLevels.add(l));
+    }
+    cb.indeterminate = false;
+    syncLevelPills();
+    renderBenchEventsLog();
+  });
+
+  syncLevelCheckbox();
+  renderBenchEventsLog();
+}
+
+function syncTopicCheckbox(): void {
+  const cb = document.getElementById("bench-events-topics-toggle") as HTMLInputElement | null;
+  if (!cb) return;
+  const selected = benchEventSelectedTopics.size;
+  const total = benchEventDiscoveredTopics.length;
+  cb.checked = total > 0 && selected === total;
+  cb.indeterminate = selected > 0 && selected < total;
+}
+
+function wireBenchEventTopicFilters(): void {
+  const cb = document.getElementById("bench-events-topics-toggle") as HTMLInputElement | null;
+  cb?.addEventListener("change", () => {
+    benchEventSelectedTopics.clear();
+    if (cb.checked) {
+      benchEventDiscoveredTopics.forEach((t) => benchEventSelectedTopics.add(t));
+    }
+    cb.indeterminate = false;
+    renderBenchEventsTopics();
+    renderBenchEventsLog();
+  });
+}
+
+function wireBenchEventSearch(): void {
+  const input = document.getElementById("bench-events-search") as HTMLInputElement | null;
+  if (!input) return;
+  input.addEventListener("input", () => {
+    benchEventSearchText = input.value.trim();
+    renderBenchEventsLog();
+  });
 }
 
 function formatEventTime(tsMs?: number): string {
@@ -2708,19 +3098,23 @@ async function runBenchEventsStream(baseUrl: string, signal: AbortSignal): Promi
     if (!signal.aborted) {
       appendBenchEventLine(
         `${formatEventTime()} ERROR events stream: ${err instanceof Error ? err.message : String(err)}`,
+        "ERROR",
       );
     }
     return;
   }
 
   if (!resp.ok) {
-    appendBenchEventLine(`${formatEventTime()} WARN events stream failed: ${resp.status} ${resp.statusText}`);
+    appendBenchEventLine(
+      `${formatEventTime()} WARN events stream failed: ${resp.status} ${resp.statusText}`,
+      "WARN",
+    );
     return;
   }
 
   const reader = resp.body?.getReader();
   if (!reader) {
-    appendBenchEventLine(`${formatEventTime()} WARN events stream unavailable (empty body)`);
+    appendBenchEventLine(`${formatEventTime()} WARN events stream unavailable (empty body)`, "WARN");
     return;
   }
 
@@ -2749,15 +3143,16 @@ async function runBenchEventsStream(baseUrl: string, signal: AbortSignal): Promi
             try {
               const envelope = JSON.parse(payload) as BenchEventEnvelope;
               const time = formatEventTime(envelope.ts_ms);
-              const level = typeof envelope.level === "string" ? envelope.level.toUpperCase() : "INFO";
-              const topic = typeof envelope.topic === "string" ? envelope.topic : "events";
+              const level = normalizeBenchEventLevel(envelope.level);
+              const topic = typeof envelope.topic === "string" ? envelope.topic : "events.log";
               const message = typeof envelope.message === "string" ? envelope.message : "";
-              appendBenchEventLine(`${time} ${level} ${topic} ${message}`.trim());
+              appendBenchEventLine(`${time} ${level} ${topic} ${message}`.trim(), level, topic, message);
             } catch {
               // ignore malformed payloads
             }
           } else {
-            appendBenchEventLine(`${formatEventTime()} ${currentEvent || "EVENT"} ${payload}`);
+            const level = normalizeBenchEventLevel(currentEvent);
+            appendBenchEventLine(`${formatEventTime()} ${currentEvent || "EVENT"} ${payload}`, level);
           }
           continue;
         }
@@ -2770,6 +3165,7 @@ async function runBenchEventsStream(baseUrl: string, signal: AbortSignal): Promi
     if (!(err instanceof DOMException && err.name === "AbortError")) {
       appendBenchEventLine(
         `${formatEventTime()} ERROR events stream: ${err instanceof Error ? err.message : String(err)}`,
+        "ERROR",
       );
     }
   }
@@ -2779,7 +3175,7 @@ function startBenchEventsStream(baseUrl: string): void {
   stopBenchEventsStream();
   const controller = new AbortController();
   benchEventsAbort = controller;
-  appendBenchEventLine(`${formatEventTime()} INFO subscribed to /v1/events/stream`);
+  appendBenchEventLine(`${formatEventTime()} INFO subscribed to /v1/events/stream`, "INFO");
   void runBenchEventsStream(baseUrl, controller.signal);
 }
 
@@ -2831,6 +3227,7 @@ async function runLoad(
   ) => boolean | Promise<boolean>,
   control?: RunControlState,
   onProgress?: (completed: number, total: number) => void,
+  onError?: (status: number, body: string) => void,
 ): Promise<LoadMetrics> {
   let next = 0;
   let ok = 0;
@@ -2890,6 +3287,7 @@ async function runLoad(
         if (isOk) {
           ok += 1;
         } else {
+          if (errors === 0) onError?.(resp.status, bodyText);
           errors += 1;
         }
       } catch (_err) {
@@ -3034,6 +3432,10 @@ async function runScenario(
             tone: control.stopRequested ? "error" : "running",
           });
         },
+        (status, body) => {
+          console.error(`[bench] ${scenario.id} round=${round} HTTP ${status}:`, body);
+          appendLog(`error: ${status} ${body.slice(0, 300)}`);
+        },
       );
       appendResultRow(scenario, round, cfg, metrics);
       roundResults.push({ round, metrics });
@@ -3091,21 +3493,15 @@ function setParamVisibility(name: string, visible: boolean): void {
 }
 
 function updateActiveScenarioUi(scenario: BenchScenario | null): void {
-  const info = document.getElementById("bench-active-scenario");
   const runSelected = document.getElementById("bench-run-selected");
-  if (!info) return;
   if (!scenario) {
+    setParamVisibility("responses", false);
+    setParamVisibility("kv", false);
+    setParamVisibility("tables", false);
+    setParamVisibility("vectors", false);
     if (runSelected) {
       runSelected.textContent = "No scenario selected.";
     }
-    info.innerHTML = `
-      <section class="bench-scenario-brief">
-        <article class="bench-brief-card">
-          <h3>Selected Scenario</h3>
-          <p class="bench-active-scenario-empty">Choose one scenario from the list.</p>
-        </article>
-      </section>
-    `;
     return;
   }
 
@@ -3118,18 +3514,18 @@ function updateActiveScenarioUi(scenario: BenchScenario | null): void {
   setParamVisibility("kv", needsKv);
   setParamVisibility("tables", needsTables);
   setParamVisibility("vectors", needsVectors);
-  if (runSelected) {
-    runSelected.textContent = `${scenario.title} · ${scenario.method} ${scenario.pathTemplate}`;
+
+  // Show/hide the "More Settings" details — only when it has visible params.
+  const details = document.querySelector<HTMLDetailsElement>(".bench-advanced");
+  if (details) {
+    const hasAdvanced = needsKv || needsTables || needsVectors;
+    details.style.display = hasAdvanced ? "" : "none";
+    if (hasAdvanced) details.open = true;
   }
 
-  info.innerHTML = `
-    <div class="bench-active-scenario-title">${scenario.title}</div>
-    <div class="bench-active-scenario-route">
-      <span class="bench-method method-${scenario.method.toLowerCase()}">${scenario.method}</span>
-      ${scenario.pathTemplate}
-    </div>
-    <div class="bench-active-scenario-desc">${scenario.description}</div>
-  `;
+  if (runSelected) {
+    runSelected.textContent = "";
+  }
 }
 
 function setRunStatus(message: string, tone: "idle" | "running" | "ok" | "error"): void {
@@ -3339,14 +3735,21 @@ function clearRerunSeed(): void {
   }
 }
 
+const EMPTY_SUMMARY = {
+  successPct: 0, avgRps: 0, avgP95Ms: 0, avgP99Ms: 0, avgWallS: 0,
+  totalInputTokens: 0, totalOutputTokens: 0, avgPrefillTokS: 0,
+  avgGenTokS: 0, avgTtftMs: 0,
+};
+
+/** Load bench runs with full content in a single request. */
 async function loadPersistedBenchRuns(
   baseUrl: string,
   scopePrefix: string,
 ): Promise<PersistedBenchRun[]> {
-  const listResp = await request(baseUrl, "GET", "/v1/db/tables/documents?type=bench_run");
-  if (!listResp.ok) {
-    return [];
-  }
+  const listResp = await request(
+    baseUrl, "GET", "/v1/db/tables/documents?include=content&type=bench_run&limit=120",
+  );
+  if (!listResp.ok) return [];
   let listPayload: { data?: Array<Record<string, unknown>> } = {};
   try {
     listPayload = (await listResp.json()) as { data?: Array<Record<string, unknown>> };
@@ -3356,48 +3759,37 @@ async function loadPersistedBenchRuns(
   const docs = Array.isArray(listPayload.data) ? listPayload.data : [];
   const details: PersistedBenchRun[] = [];
 
-  for (const doc of docs.slice(0, 120)) {
+  for (const doc of docs) {
     const docId = typeof doc.id === "string" ? doc.id : "";
     if (!docId) continue;
-    const detailResp = await request(baseUrl, "GET", `/v1/db/tables/documents/${encodeURIComponent(docId)}`);
-    if (!detailResp.ok) continue;
-    let detail: Record<string, unknown>;
-    try {
-      detail = (await detailResp.json()) as Record<string, unknown>;
-    } catch (_err) {
-      continue;
-    }
-    const contentRaw = detail.content;
-    const content =
+    const marker = typeof doc.marker === "string" ? doc.marker : "";
+    const scope = marker && marker !== "active" ? marker : "";
+    if (scopePrefix.length > 0 && !scope.startsWith(scopePrefix)) continue;
+    const title = typeof doc.title === "string" ? doc.title : "Bench Run";
+
+    // Parse content (available via ?include=content).
+    const contentRaw = doc.content;
+    const contentObj =
       contentRaw && typeof contentRaw === "object" && !Array.isArray(contentRaw)
         ? (contentRaw as Record<string, unknown>)
         : {};
-    const scope = typeof content.scope === "string" ? content.scope : "";
-    if (scopePrefix.length > 0 && !scope.startsWith(scopePrefix)) {
-      continue;
-    }
-    const summaryRaw = content.summary;
+    const summaryRaw = contentObj.summary;
     const summaryObj =
       summaryRaw && typeof summaryRaw === "object" && !Array.isArray(summaryRaw)
         ? (summaryRaw as Record<string, unknown>)
         : {};
-    const cfgRaw = content.cfg;
-    const cfg =
-      cfgRaw && typeof cfgRaw === "object" && !Array.isArray(cfgRaw)
-        ? (cfgRaw as Record<string, unknown>)
-        : {};
+    const cfgRaw = contentObj.cfg;
 
     details.push({
       id: docId,
-      title: typeof detail.title === "string" ? detail.title : "Bench Run",
-      updatedAt: numberFromUnknown(detail.updated_at),
-      createdAt: numberFromUnknown(detail.created_at),
-      scenario: typeof content.scenario === "string" ? content.scenario : "",
-      pythonScenario:
-        typeof content.python_scenario === "string" ? content.python_scenario : null,
-      scope,
-      stopped: Boolean(content.stopped),
-      rounds: numberFromUnknown(content.rounds),
+      title,
+      updatedAt: numberFromUnknown(doc.updated_at),
+      createdAt: numberFromUnknown(doc.created_at),
+      scenario: typeof contentObj.scenario === "string" ? contentObj.scenario : title,
+      pythonScenario: typeof contentObj.python_scenario === "string" ? contentObj.python_scenario : null,
+      scope: typeof contentObj.scope === "string" ? contentObj.scope : scope,
+      stopped: Boolean(contentObj.stopped),
+      rounds: numberFromUnknown(contentObj.rounds),
       summary: {
         successPct: numberFromUnknown(summaryObj.success_pct),
         avgRps: numberFromUnknown(summaryObj.avg_rps),
@@ -3410,15 +3802,29 @@ async function loadPersistedBenchRuns(
         avgGenTokS: numberFromUnknown(summaryObj.avg_gen_tok_s),
         avgTtftMs: numberFromUnknown(summaryObj.avg_ttft_ms),
       },
-      fileId: typeof content.file_id === "string" ? content.file_id : null,
-      fileName: typeof content.file_name === "string" ? content.file_name : null,
-      generatedAt: typeof content.generated_at === "string" ? content.generated_at : null,
-      cfg,
+      fileId: typeof contentObj.file_id === "string" ? contentObj.file_id : null,
+      fileName: typeof contentObj.file_name === "string" ? contentObj.file_name : null,
+      generatedAt: typeof contentObj.generated_at === "string" ? contentObj.generated_at : null,
+      cfg: cfgRaw && typeof cfgRaw === "object" && !Array.isArray(cfgRaw)
+        ? (cfgRaw as Record<string, unknown>)
+        : {},
     });
   }
 
   details.sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
   return details;
+}
+
+/** Delete documents by ID in parallel. Returns count of successful deletions. */
+async function deleteRuns(baseUrl: string, ids: string[]): Promise<number> {
+  const results = await Promise.all(
+    ids.map((id) =>
+      request(baseUrl, "DELETE", `/v1/db/tables/documents/${encodeURIComponent(id)}`)
+        .then((r) => r.ok)
+        .catch(() => false),
+    ),
+  );
+  return results.filter(Boolean).length;
 }
 
 function wireResultsUi(): void {
@@ -3430,15 +3836,10 @@ function wireResultsUi(): void {
   const listEl = document.getElementById("bench-results-list");
   const countEl = document.getElementById("bench-results-count");
   const detailEl = document.getElementById("bench-results-detail");
-  const compareEl = document.getElementById("bench-results-compare");
   const searchInput = document.getElementById("bench-results-search") as HTMLInputElement | null;
   const refreshBtn = document.getElementById("bench-results-refresh") as HTMLButtonElement | null;
   const clearFilterBtn = document.getElementById("bench-results-clear-filter") as HTMLButtonElement | null;
-  const statCountEl = document.getElementById("bench-results-stat-count");
-  const statRpsEl = document.getElementById("bench-results-stat-rps");
-  const statP95El = document.getElementById("bench-results-stat-p95");
-  const statSuccessEl = document.getElementById("bench-results-stat-success");
-  if (!listEl || !countEl || !detailEl || !compareEl) {
+  if (!listEl || !countEl || !detailEl) {
     return;
   }
 
@@ -3446,7 +3847,8 @@ function wireResultsUi(): void {
   let runs: PersistedBenchRun[] = [];
   let activeId: string | null = null;
   let searchText = "";
-  const compareSet = new Set<string>();
+  const collapsedGroups = new Set<string>();
+  let initialCollapseApplied = false;
 
   const filteredRuns = (): PersistedBenchRun[] => {
     const query = searchText.trim().toLowerCase();
@@ -3459,42 +3861,21 @@ function wireResultsUi(): void {
     });
   };
 
-  const updateStats = (visibleRuns: PersistedBenchRun[]): void => {
-    if (statCountEl) {
-      statCountEl.textContent = String(visibleRuns.length);
-    }
-    if (visibleRuns.length === 0) {
-      if (statRpsEl) statRpsEl.textContent = "—";
-      if (statP95El) statP95El.textContent = "—";
-      if (statSuccessEl) statSuccessEl.textContent = "—";
-      return;
-    }
-    const avgRps =
-      visibleRuns.reduce((sum, run) => sum + run.summary.avgRps, 0) / visibleRuns.length;
-    const avgP95 =
-      visibleRuns.reduce((sum, run) => sum + run.summary.avgP95Ms, 0) / visibleRuns.length;
-    const avgSuccess =
-      visibleRuns.reduce((sum, run) => sum + run.summary.successPct, 0) / visibleRuns.length;
-    if (statRpsEl) statRpsEl.textContent = round2(avgRps);
-    if (statP95El) statP95El.textContent = `${round2(avgP95)} ms`;
-    if (statSuccessEl) statSuccessEl.textContent = `${round2(avgSuccess)}%`;
-  };
-
-  const renderDetail = (): void => {
-    if (!activeId) {
-      detailEl.innerHTML = "<h3>Run Detail</h3><p>Select a run to inspect metadata and summary KPIs.</p>";
-      return;
-    }
-    const run = runs.find((item) => item.id === activeId);
-    if (!run) return;
+  const showDetail = (run: PersistedBenchRun): void => {
     const cfgRows = Object.entries(run.cfg)
       .map(([key, value]) => `<div><span>${escapeHtml(key)}</span><span>${escapeHtml(String(value))}</span></div>`)
       .join("");
     detailEl.innerHTML = `
-      <h3>${escapeHtml(run.title)}</h3>
+      <div class="bench-results-detail-head">
+        <h3>${escapeHtml(run.title)}</h3>
+        <div class="bench-results-detail-actions">
+          <button class="bench-rerun-btn btn btn-ghost btn-sm" data-run-id="${run.id}">Re-run</button>
+          ${run.fileId ? `<a class="btn btn-ghost btn-sm" href="/v1/files/${encodeURIComponent(run.fileId)}/content" target="_blank" rel="noopener noreferrer">JSONL</a>` : ""}
+          <button class="bench-delete-run-btn btn btn-ghost btn-sm">Delete</button>
+        </div>
+      </div>
       <div class="bench-results-meta-grid">
         <div><span>Scenario</span><span>${escapeHtml(run.scenario)}</span></div>
-        <div><span>Python Scenario</span><span>${escapeHtml(run.pythonScenario ?? "n/a")}</span></div>
         <div><span>Scope</span><span>${escapeHtml(run.scope)}</span></div>
         <div><span>Status</span><span>${run.stopped ? "Stopped" : "Complete"}</span></div>
         <div><span>Timestamp</span><span>${escapeHtml(formatRunTimestamp(run.updatedAt || run.createdAt))}</span></div>
@@ -3510,185 +3891,212 @@ function wireResultsUi(): void {
         <div><span>TTFT ms</span><span>${round2(run.summary.avgTtftMs)}</span></div>
       </div>
       ${cfgRows.length > 0 ? `<div class="bench-results-cfg">${cfgRows}</div>` : ""}
-      <div class="bench-results-browser-actions">
-        <button class="bench-rerun-btn" data-run-id="${run.id}">Re-run This Scenario</button>
-      </div>
-      ${run.fileId ? `<a class="bench-results-file-link" href="/v1/files/${encodeURIComponent(run.fileId)}/content" target="_blank" rel="noopener noreferrer">Open JSONL Artifact</a>` : ""}
     `;
     detailEl.querySelector<HTMLButtonElement>(".bench-rerun-btn")?.addEventListener("click", () => {
       const targetSlug = toScenarioPage(run.scope);
-      if (!targetSlug) {
-        return;
-      }
+      if (!targetSlug) return;
       writeRerunSeed(run);
       window.location.href = toBenchPath(targetSlug);
     });
+    detailEl.querySelector<HTMLButtonElement>(".bench-delete-run-btn")?.addEventListener("click", async () => {
+      if (!window.confirm(`Delete run "${run.title}"?`)) return;
+      const deleted = await deleteRuns(baseUrl, [run.id]);
+      if (deleted > 0) {
+        runs = runs.filter((r) => r.id !== run.id);
+        activeId = null;
+        renderList();
+        renderDetail();
+      }
+    });
   };
 
-  const renderCompare = (): void => {
-    const selected = Array.from(compareSet)
-      .map((id) => runs.find((item) => item.id === id))
-      .filter((item): item is PersistedBenchRun => Boolean(item));
-    if (selected.length !== 2) {
-      compareEl.innerHTML = "<h3>Compare</h3><p>Select exactly two runs in the list to compare.</p>";
+  const renderDetail = (): void => {
+    if (!activeId) {
+      detailEl.innerHTML = '<p class="bench-results-placeholder">Select a run to view details.</p>';
       return;
     }
-    const [a, b] = selected;
-    const row = (label: string, va: number, vb: number, lowerIsBetter: boolean = false): string => {
-      const delta = vb - va;
-      const better =
-        delta === 0
-          ? "equal"
-          : lowerIsBetter
-            ? delta < 0
-              ? "improved"
-              : "regressed"
-            : delta > 0
-              ? "improved"
-              : "regressed";
-      return `
-        <tr>
-          <td>${label}</td>
-          <td class="bench-num">${round2(va)}</td>
-          <td class="bench-num">${round2(vb)}</td>
-          <td class="bench-num ${better}">${delta >= 0 ? "+" : ""}${round2(delta)}</td>
-        </tr>
-      `;
-    };
-    compareEl.innerHTML = `
-      <h3>Compare</h3>
-      <p><strong>A:</strong> ${escapeHtml(a.scenario)} · ${escapeHtml(formatRunTimestamp(a.updatedAt || a.createdAt))}<br/>
-      <strong>B:</strong> ${escapeHtml(b.scenario)} · ${escapeHtml(formatRunTimestamp(b.updatedAt || b.createdAt))}</p>
-      <table class="bench-compare-table">
-        <thead>
-          <tr><th>Metric</th><th>A</th><th>B</th><th>Delta (B-A)</th></tr>
-        </thead>
-        <tbody>
-          ${row("Success %", a.summary.successPct, b.summary.successPct)}
-          ${row("RPS avg", a.summary.avgRps, b.summary.avgRps)}
-          ${row("p95 ms", a.summary.avgP95Ms, b.summary.avgP95Ms, true)}
-          ${row("p99 ms", a.summary.avgP99Ms, b.summary.avgP99Ms, true)}
-          ${row("Wall s", a.summary.avgWallS, b.summary.avgWallS, true)}
-          ${row("Input tok", a.summary.totalInputTokens, b.summary.totalInputTokens)}
-          ${row("Output tok", a.summary.totalOutputTokens, b.summary.totalOutputTokens)}
-          ${row("Prefill t/s", a.summary.avgPrefillTokS, b.summary.avgPrefillTokS)}
-          ${row("Gen t/s", a.summary.avgGenTokS, b.summary.avgGenTokS)}
-          ${row("TTFT ms", a.summary.avgTtftMs, b.summary.avgTtftMs, true)}
-        </tbody>
-      </table>
-    `;
+    const run = runs.find((item) => item.id === activeId);
+    if (!run) {
+      detailEl.innerHTML = '<p class="bench-results-placeholder">Select a run to view details.</p>';
+      return;
+    }
+    showDetail(run);
   };
 
   const renderList = (): void => {
     const visibleRuns = filteredRuns();
-    const visibleIds = new Set(visibleRuns.map((run) => run.id));
-    Array.from(compareSet).forEach((id) => {
-      if (!visibleIds.has(id)) {
-        compareSet.delete(id);
-      }
-    });
     countEl.textContent =
       visibleRuns.length === runs.length
         ? String(visibleRuns.length)
         : `${visibleRuns.length}/${runs.length}`;
-    updateStats(visibleRuns);
     if (visibleRuns.length === 0) {
       listEl.innerHTML = runs.length
         ? '<div class="bench-results-empty">No runs match the current filter.</div>'
-        : '<div class="bench-results-empty">No saved runs yet. Execute a scenario to create one.</div>';
-      detailEl.innerHTML = runs.length
-        ? "<h3>Run Detail</h3><p>No runs match this filter.</p>"
-        : "<h3>Run Detail</h3><p>No runs available yet.</p>";
-      compareEl.innerHTML = runs.length
-        ? "<h3>Compare</h3><p>No runs match this filter.</p>"
-        : "<h3>Compare</h3><p>No runs available yet.</p>";
+        : '<div class="bench-results-empty">No saved runs yet.</div>';
+      detailEl.innerHTML = '<p class="bench-results-placeholder">No runs to display.</p>';
       return;
     }
-    if (!activeId || !visibleRuns.some((item) => item.id === activeId)) {
-      activeId = visibleRuns[0]!.id;
+    if (activeId && !visibleRuns.some((item) => item.id === activeId)) {
+      activeId = null;
     }
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-    const groups = [
-      {
-        title: "Recent",
-        hint: "Updated within the last 24 hours",
-        items: visibleRuns.filter((run) => (run.updatedAt || run.createdAt) >= cutoff),
-      },
-      {
-        title: "Older",
-        hint: "Everything before the last 24 hours",
-        items: visibleRuns.filter((run) => (run.updatedAt || run.createdAt) < cutoff),
-      },
-    ].filter((group) => group.items.length > 0);
 
-    const renderRunCard = (run: PersistedBenchRun): string => {
-        const checked = compareSet.has(run.id) ? "checked" : "";
-        const active = activeId === run.id ? " is-active" : "";
-        const ts = formatRunTimestamp(run.updatedAt || run.createdAt);
-        return `
-          <article class="bench-results-item${active}" data-run-id="${run.id}">
-            <div class="bench-results-item-head">
-              <div class="bench-results-item-head-main">
-                <input class="bench-run-compare-check" type="checkbox" data-run-id="${run.id}" ${checked} />
-                <button class="bench-run-open" data-run-id="${run.id}">${escapeHtml(run.scenario || run.title)}</button>
-              </div>
-              <div class="bench-results-item-badges">
-                <span class="bench-results-status" data-status="${run.stopped ? "stopped" : "complete"}">${run.stopped ? "Stopped" : "Complete"}</span>
-                <span class="bench-badge">${escapeHtml(run.scope)}</span>
-              </div>
-            </div>
-            <div class="bench-results-item-meta">
-              <span>${escapeHtml(ts)}</span>
-              <span>${Math.max(1, run.rounds)} rounds</span>
-              <span>RPS ${round2(run.summary.avgRps)}</span>
-              <span>p95 ${round2(run.summary.avgP95Ms)} ms</span>
-              <span>success ${round2(run.summary.successPct)}%</span>
-            </div>
-          </article>
-        `;
-      };
-    listEl.innerHTML = groups
-      .map(
-        (group) => `
-          <section class="bench-results-group">
-            <div class="bench-results-group-head">
-              <h4>${group.title}</h4>
-              <span class="bench-results-count">${group.items.length} shown</span>
-            </div>
-            <p>${group.hint}</p>
-            ${group.items.map((run) => renderRunCard(run)).join("")}
-          </section>
-        `,
-      )
-      .join("");
+    // Group by scope (benchmark category).
+    const groupMap = new Map<string, PersistedBenchRun[]>();
+    for (const run of visibleRuns) {
+      const key = run.scope || "other";
+      let group = groupMap.get(key);
+      if (!group) {
+        group = [];
+        groupMap.set(key, group);
+      }
+      group.push(run);
+    }
 
-    listEl.querySelectorAll<HTMLButtonElement>(".bench-run-open").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const runId = btn.dataset.runId ?? "";
-        if (!runId) return;
-        activeId = runId;
-        renderList();
-        renderDetail();
-        renderCompare();
-      });
+    // Sort groups by most recent activity (like chat sidebar).
+    const groupMaxUpdated = new Map<string, number>();
+    for (const [key, items] of groupMap) {
+      groupMaxUpdated.set(key, Math.max(...items.map((r) => r.updatedAt || r.createdAt)));
+    }
+    const sortedKeys = [...groupMap.keys()].sort((a, b) => {
+      return (groupMaxUpdated.get(b) ?? 0) - (groupMaxUpdated.get(a) ?? 0);
     });
 
-    listEl.querySelectorAll<HTMLInputElement>(".bench-run-compare-check").forEach((cb) => {
-      cb.addEventListener("change", () => {
-        const runId = cb.dataset.runId ?? "";
-        if (!runId) return;
-        if (cb.checked) {
-          if (compareSet.size >= 2 && !compareSet.has(runId)) {
-            cb.checked = false;
-            return;
+    const multiGroup = sortedKeys.length > 1;
+
+    // Collapse all groups by default except the most recent.
+    if (!initialCollapseApplied && multiGroup) {
+      for (const key of sortedKeys.slice(1)) {
+        collapsedGroups.add(key);
+      }
+      initialCollapseApplied = true;
+    }
+
+    // Build DOM (same pattern as chat sidebar-list.ts).
+    listEl.innerHTML = "";
+
+    for (const scope of sortedKeys) {
+      const items = groupMap.get(scope)!;
+      const isOpen = !collapsedGroups.has(scope);
+
+      // -- Group header: [chevron] name [time] --
+      const label = document.createElement("div");
+      label.className = "sidebar-group-label";
+
+      if (multiGroup) {
+        const chevron = document.createElement("button");
+        chevron.className = "sidebar-group-collapse";
+        chevron.innerHTML = isOpen ? CHEVRON_DOWN_ICON : CHEVRON_RIGHT_ICON;
+        chevron.title = isOpen ? "Collapse" : "Expand";
+        chevron.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (isOpen) {
+            collapsedGroups.add(scope);
+          } else {
+            collapsedGroups.delete(scope);
           }
-          compareSet.add(runId);
-        } else {
-          compareSet.delete(runId);
+          renderList();
+        });
+        label.appendChild(chevron);
+      }
+
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "sidebar-group-name";
+      nameSpan.textContent = scope;
+      label.appendChild(nameSpan);
+
+      const maxUpdated = groupMaxUpdated.get(scope);
+      if (maxUpdated) {
+        const timeSpan = document.createElement("span");
+        timeSpan.className = "sidebar-group-time";
+        timeSpan.textContent = relativeTime(maxUpdated);
+        label.appendChild(timeSpan);
+      }
+
+      const clearBtn = document.createElement("button");
+      clearBtn.className = "bench-results-group-clear";
+      clearBtn.title = `Delete all runs in ${scope}`;
+      clearBtn.innerHTML = ICON_DELETE;
+      clearBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const ids = items.map((r) => r.id);
+        if (!window.confirm(`Delete all ${ids.length} run${ids.length > 1 ? "s" : ""} in "${scope}"?`)) return;
+        const deleted = await deleteRuns(baseUrl, ids);
+        if (deleted > 0) {
+          const deletedSet = new Set(ids);
+          runs = runs.filter((r) => !deletedSet.has(r.id));
+          if (activeId && deletedSet.has(activeId)) activeId = null;
+          renderList();
+          renderDetail();
         }
-        renderCompare();
       });
-    });
+      label.appendChild(clearBtn);
+
+      // Click header to expand if collapsed.
+      label.style.cursor = "pointer";
+      label.addEventListener("click", () => {
+        if (!isOpen) {
+          collapsedGroups.delete(scope);
+          renderList();
+        }
+      });
+
+      listEl.appendChild(label);
+
+      // -- Items (skip if collapsed) --
+      if (!isOpen) continue;
+
+      for (const run of items) {
+        const item = document.createElement("a");
+        item.className = "sidebar-item" + (activeId === run.id ? " active" : "");
+        item.dataset.runId = run.id;
+
+        const content = document.createElement("div");
+        content.className = "sidebar-item-content";
+
+        const titleRow = document.createElement("div");
+        titleRow.className = "sidebar-item-title-row";
+        if (run.stopped) {
+          const dot = document.createElement("span");
+          dot.className = "bench-results-stopped-dot";
+          titleRow.appendChild(dot);
+        }
+        const title = document.createElement("span");
+        title.className = "sidebar-item-title truncate";
+        title.textContent = run.scenario || run.title;
+        titleRow.appendChild(title);
+        content.appendChild(titleRow);
+
+        const meta = document.createElement("div");
+        meta.className = "sidebar-item-meta";
+        const ago = document.createElement("span");
+        ago.className = "shrink-0";
+        ago.textContent = relativeTime(run.updatedAt || run.createdAt);
+        meta.appendChild(ago);
+        content.appendChild(meta);
+
+        if (run.summary.avgGenTokS > 0 || run.summary.avgTtftMs > 0) {
+          const metrics = document.createElement("div");
+          metrics.className = "sidebar-item-metrics";
+          const parts: string[] = [];
+          if (run.summary.avgGenTokS > 0) parts.push(`${round2(run.summary.avgGenTokS)} t/s`);
+          if (run.summary.avgTtftMs > 0) parts.push(`${round2(run.summary.avgTtftMs)}ms TTFT`);
+          if (run.summary.avgPrefillTokS > 0) parts.push(`${round2(run.summary.avgPrefillTokS)} pp/s`);
+          metrics.textContent = parts.join(" \u00b7 ");
+          content.appendChild(metrics);
+        }
+
+        item.appendChild(content);
+
+        item.addEventListener("click", (e) => {
+          e.preventDefault();
+          activeId = run.id;
+          renderList();
+          renderDetail();
+        });
+
+        listEl.appendChild(item);
+      }
+    }
   };
 
   const refresh = async (): Promise<void> => {
@@ -3699,13 +4107,10 @@ function wireResultsUi(): void {
       runs = await loadPersistedBenchRuns(baseUrl, scopePrefix);
       renderList();
       renderDetail();
-      renderCompare();
     } catch (_err) {
       runs = [];
-      listEl.innerHTML = '<div class="bench-results-empty">Unable to load saved runs for this scope.</div>';
-      detailEl.innerHTML = "<h3>Run Detail</h3><p>Failed to load run history.</p>";
-      compareEl.innerHTML = "<h3>Compare</h3><p>Failed to load run history.</p>";
-      updateStats([]);
+      listEl.innerHTML = '<div class="bench-results-empty">Unable to load saved runs.</div>';
+      detailEl.innerHTML = '<p class="bench-results-placeholder">Failed to load run history.</p>';
     }
     if (refreshBtn) refreshBtn.disabled = false;
     if (clearFilterBtn) clearFilterBtn.disabled = false;
@@ -3718,17 +4123,28 @@ function wireResultsUi(): void {
     searchText = searchInput.value;
     renderList();
     renderDetail();
-    renderCompare();
   });
   clearFilterBtn?.addEventListener("click", () => {
     if (searchInput) {
       searchInput.value = "";
     }
     searchText = "";
-    compareSet.clear();
     renderList();
     renderDetail();
-    renderCompare();
+  });
+
+  const deleteAllBtn = document.getElementById("bench-results-delete-all") as HTMLButtonElement | null;
+  deleteAllBtn?.addEventListener("click", async () => {
+    if (runs.length === 0) return;
+    if (!window.confirm(`Delete all ${runs.length} saved run${runs.length > 1 ? "s" : ""}? This cannot be undone.`)) return;
+    deleteAllBtn.disabled = true;
+    const ids = runs.map((r) => r.id);
+    await deleteRuns(baseUrl, ids);
+    runs = [];
+    activeId = null;
+    renderList();
+    renderDetail();
+    deleteAllBtn.disabled = false;
   });
 
   refresh();
@@ -3772,13 +4188,11 @@ function wireSidebarUi(): void {
 function wireUi(activeScenarios: BenchScenario[]): void {
   const runBtn = document.getElementById("bench-run") as HTMLButtonElement | null;
   const pauseBtn = document.getElementById("bench-pause") as HTMLButtonElement | null;
-  const stopBtn = document.getElementById("bench-stop") as HTMLButtonElement | null;
   const clearBtn = document.getElementById("bench-clear") as HTMLButtonElement | null;
   const settingsToggleBtn = document.getElementById("bench-settings-toggle") as HTMLButtonElement | null;
-  const settingsCloseBtn = document.getElementById("bench-settings-close") as HTMLButtonElement | null;
-  const runnerEl = document.getElementById("bench-runner");
   const settingsPanel = document.getElementById("bench-settings-panel");
   const eventsClearBtn = document.getElementById("bench-events-clear") as HTMLButtonElement | null;
+  const eventsCopyBtn = document.getElementById("bench-events-copy") as HTMLButtonElement | null;
   if (!runBtn) {
     return;
   }
@@ -3789,13 +4203,8 @@ function wireUi(activeScenarios: BenchScenario[]): void {
 
   const setSettingsOpen = (open: boolean): void => {
     settingsOpen = open;
-    runnerEl?.classList.toggle("has-settings", open);
     if (settingsPanel) settingsPanel.style.display = open ? "" : "none";
-    if (settingsToggleBtn) {
-      settingsToggleBtn.textContent = open ? "Close" : "Options";
-      settingsToggleBtn.setAttribute("aria-expanded", open ? "true" : "false");
-      settingsToggleBtn.classList.toggle("is-active", open);
-    }
+    settingsToggleBtn?.classList.toggle("is-active", open);
   };
 
   const updateRunButtons = (): void => {
@@ -3808,10 +4217,6 @@ function wireUi(activeScenarios: BenchScenario[]): void {
     if (pauseBtn) {
       pauseBtn.disabled = !running;
       pauseBtn.textContent = running && activeControl?.paused ? "Resume" : "Pause";
-    }
-    if (stopBtn) {
-      stopBtn.disabled = !running;
-      stopBtn.textContent = "Stop";
     }
   };
 
@@ -3856,7 +4261,18 @@ function wireUi(activeScenarios: BenchScenario[]): void {
     if (cfg.kvBatchSize !== undefined) setInputValue("bench-kv-batch-size", cfg.kvBatchSize);
     if (cfg.tableSeedRows !== undefined) setInputValue("bench-table-seed-rows", cfg.tableSeedRows);
     if (cfg.vectorDims !== undefined) setInputValue("bench-vector-dims", cfg.vectorDims);
-    if (cfg.responsesModel !== undefined) setInputValue("bench-responses-model", cfg.responsesModel);
+    if (cfg.responsesModel !== undefined) {
+      // If the model matches a known variant, select the family and variant.
+      const variantEntry = benchAvailableModels.find((m) => m.variants?.some((v) => v.id === cfg.responsesModel));
+      if (variantEntry) {
+        setInputValue("bench-responses-model", variantEntry.id);
+        benchSelectedVariant = cfg.responsesModel;
+      } else {
+        setInputValue("bench-responses-model", cfg.responsesModel);
+        benchSelectedVariant = cfg.responsesModel ?? "";
+      }
+      renderBenchModelVariants(variantEntry ?? benchAvailableModels.find((m) => m.id === cfg.responsesModel));
+    }
     if (cfg.responsesMaxOutputTokens !== undefined) {
       setInputValue("bench-responses-max-output-tokens", cfg.responsesMaxOutputTokens);
     }
@@ -3909,21 +4325,31 @@ function wireUi(activeScenarios: BenchScenario[]): void {
   settingsToggleBtn?.addEventListener("click", () => {
     setSettingsOpen(!settingsOpen);
   });
-  settingsCloseBtn?.addEventListener("click", () => {
-    setSettingsOpen(false);
-  });
   eventsClearBtn?.addEventListener("click", () => {
     clearBenchEventsLog();
   });
-  if (benchSettingsEscHandler) {
-    document.removeEventListener("keydown", benchSettingsEscHandler);
-  }
-  benchSettingsEscHandler = (event: KeyboardEvent) => {
-    if (event.key === "Escape" && settingsOpen) {
-      setSettingsOpen(false);
+  eventsCopyBtn?.addEventListener("click", async () => {
+    await copyBenchEventsLog();
+  });
+  document.getElementById("bench-log-copy")?.addEventListener("click", async () => {
+    const el = document.getElementById("bench-log");
+    const text = el?.textContent?.trim() ?? "";
+    if (text) {
+      try { await navigator.clipboard.writeText(text); } catch (_) { /* noop */ }
     }
-  };
-  document.addEventListener("keydown", benchSettingsEscHandler);
+  });
+  wireBenchEventLevelFilters();
+  wireBenchEventTopicFilters();
+  wireBenchEventSearch();
+
+  // Wire model select + variant pills.
+  const modelSelect = document.getElementById("bench-responses-model") as HTMLSelectElement | null;
+  modelSelect?.addEventListener("change", () => {
+    const entry = benchAvailableModels.find((m) => m.id === modelSelect.value);
+    benchSelectedVariant = entry?.variants?.[0]?.id ?? modelSelect.value;
+    renderBenchModelVariants(entry);
+  });
+  fetchBenchModels();
 
   pauseBtn?.addEventListener("click", () => {
     if (!activeControl) {
@@ -3942,17 +4368,6 @@ function wireUi(activeScenarios: BenchScenario[]): void {
     }
   });
 
-  stopBtn?.addEventListener("click", () => {
-    if (!activeControl) {
-      return;
-    }
-    activeControl.stopRequested = true;
-    activeControl.paused = false;
-    updateRunButtons();
-    appendLog("stop requested: finishing in-flight requests");
-    syncProgress({ phase: "Stopping", note: "Stop requested. Waiting for in-flight requests to finish.", tone: "error" });
-    setRunStatus("Stopping...", "error");
-  });
   clearBtn?.addEventListener("click", () => {
     if (activeControl) {
       activeControl.stopRequested = true;
@@ -3977,7 +4392,6 @@ function wireUi(activeScenarios: BenchScenario[]): void {
   ) {
     scenarioButtons[0]!.classList.add("is-active");
   }
-  setSettingsOpen(false);
   refreshActiveScenario({ applyDefaults: true });
   const rerunSeed = readRerunSeed();
   if (rerunSeed) {
@@ -4039,15 +4453,11 @@ function wireUi(activeScenarios: BenchScenario[]): void {
         kvBatchSize: parsePositiveInt("bench-kv-batch-size", 1),
         tableSeedRows: parsePositiveInt("bench-table-seed-rows", 1),
         vectorDims: parsePositiveInt("bench-vector-dims", 1),
-        responsesModel: parseString("bench-responses-model", ""),
+        responsesModel: benchSelectedVariant || parseString("bench-responses-model", ""),
         responsesMaxOutputTokens: parsePositiveInt("bench-responses-max-output-tokens", 1),
       };
       if (scenarioResolved.scope.startsWith("responses/")) {
         cfg.responsesModel = await resolveResponsesModel(baseUrl, cfg.responsesModel);
-        const modelInput = document.getElementById("bench-responses-model") as HTMLInputElement | null;
-        if (modelInput && modelInput.value.trim().length === 0) {
-          modelInput.value = cfg.responsesModel;
-        }
       }
 
       syncProgress({
@@ -4191,7 +4601,25 @@ function mountBenchApp(logReady: boolean): void {
   }
 }
 
+let benchActiveThemeClass = "";
+
+/** Sync the theme class from localStorage to this document's :root.
+ *  The bench runs in an iframe — the parent sets the class on its own :root,
+ *  but the iframe has a separate document that needs the same class. */
+function syncBenchTheme(): void {
+  const theme = localStorage.getItem("theme") || "talu";
+  if (theme === benchActiveThemeClass) return;
+  const root = document.documentElement;
+  if (benchActiveThemeClass) root.classList.remove(benchActiveThemeClass);
+  root.classList.add(theme);
+  benchActiveThemeClass = theme;
+}
+
 export function bootBenchApp(): void {
+  syncBenchTheme();
+  window.addEventListener("storage", (e) => {
+    if (e.key === "theme") syncBenchTheme();
+  });
   mountBenchApp(true);
   if (!benchRouteListenerBound) {
     window.addEventListener("hashchange", () => {

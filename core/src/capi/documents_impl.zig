@@ -48,6 +48,18 @@ pub const CDocumentRecord = extern struct {
     content_hash: u64,
     /// CDC sequence number.
     seq_num: u64,
+    /// Sparse integer meta columns (0 = null/unset).
+    meta_i1: i64 = 0,
+    meta_i2: i64 = 0,
+    meta_i3: i64 = 0,
+    meta_i4: i64 = 0,
+    meta_i5: i64 = 0,
+    /// Sparse float meta columns (0.0 = null/unset).
+    meta_f1: f64 = 0.0,
+    meta_f2: f64 = 0.0,
+    meta_f3: f64 = 0.0,
+    meta_f4: f64 = 0.0,
+    meta_f5: f64 = 0.0,
     /// Reserved for future expansion.
     _reserved: [8]u8 = [_]u8{0} ** 8,
 };
@@ -66,12 +78,38 @@ pub const CDocumentSummary = extern struct {
     created_at_ms: i64,
     /// Marker (null-terminated, may be null).
     marker: ?[*:0]const u8,
+    /// Group ID (null-terminated, may be null).
+    group_id: ?[*:0]const u8,
+    /// Sparse integer meta columns (0 = null/unset).
+    meta_i1: i64 = 0,
+    meta_i2: i64 = 0,
+    meta_i3: i64 = 0,
+    meta_i4: i64 = 0,
+    meta_i5: i64 = 0,
+    /// Sparse float meta columns (0.0 = null/unset).
+    meta_f1: f64 = 0.0,
+    meta_f2: f64 = 0.0,
+    meta_f3: f64 = 0.0,
+    meta_f4: f64 = 0.0,
+    meta_f5: f64 = 0.0,
 };
 
 /// Document list container for C API.
 pub const CDocumentList = extern struct {
     /// Array of document summaries.
     items: ?[*]CDocumentSummary,
+    /// Number of documents in the array.
+    count: usize,
+    /// Whether there are more results beyond this page.
+    has_more: bool,
+    /// Internal: backing arena for string data.
+    _arena: ?*anyopaque,
+};
+
+/// Full document list container for C API (includes content, unlike CDocumentList).
+pub const CDocumentFullList = extern struct {
+    /// Array of full document records.
+    items: ?[*]CDocumentRecord,
     /// Number of documents in the array.
     count: usize,
     /// Whether there are more results beyond this page.
@@ -204,11 +242,48 @@ fn buildDocumentList(records: []documents.DocumentRecord, limit: usize) !*CDocum
             (arena.dupeZ(u8, m) catch return error.OutOfMemory).ptr
         else
             null;
+        items_buf[i].group_id = if (record.group_id) |g|
+            (arena.dupeZ(u8, g) catch return error.OutOfMemory).ptr
+        else
+            null;
+        items_buf[i].meta_i1 = record.meta_i1 orelse 0;
+        items_buf[i].meta_i2 = record.meta_i2 orelse 0;
+        items_buf[i].meta_i3 = record.meta_i3 orelse 0;
+        items_buf[i].meta_i4 = record.meta_i4 orelse 0;
+        items_buf[i].meta_i5 = record.meta_i5 orelse 0;
+        items_buf[i].meta_f1 = record.meta_f1 orelse 0.0;
+        items_buf[i].meta_f2 = record.meta_f2 orelse 0.0;
+        items_buf[i].meta_f3 = record.meta_f3 orelse 0.0;
+        items_buf[i].meta_f4 = record.meta_f4 orelse 0.0;
+        items_buf[i].meta_f5 = record.meta_f5 orelse 0.0;
     }
 
     list.* = .{
         .items = if (effective_count > 0) items_buf.ptr else null,
         .count = effective_count,
+        .has_more = records.len > limit,
+        ._arena = @ptrCast(arena_ptr),
+    };
+
+    return list;
+}
+
+/// Build a CDocumentFullList from scanned document records (includes content).
+fn buildDocumentFullList(records: []documents.DocumentRecord, limit: usize) !*CDocumentFullList {
+    const list = allocator.create(CDocumentFullList) catch return error.OutOfMemory;
+    errdefer allocator.destroy(list);
+
+    const arena_ptr = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
+    errdefer allocator.destroy(arena_ptr);
+    arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena_ptr.deinit();
+
+    const effective_count = @min(records.len, limit);
+    const c_records = try convertToCRecords(arena_ptr.allocator(), records[0..effective_count]);
+
+    list.* = .{
+        .items = if (c_records.len > 0) c_records.ptr else null,
+        .count = c_records.len,
         .has_more = records.len > limit,
         ._arena = @ptrCast(arena_ptr),
     };
@@ -371,6 +446,56 @@ pub fn talu_documents_create(
         .owner_id = optSlice(owner_id),
         .created_at_ms = now_ms,
         .updated_at_ms = now_ms,
+    };
+
+    documents.createDocument(allocator, db_path_slice, record) catch |err| {
+        capi_error.setErrorWithCode(.storage_error, "Failed to create document: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+
+    return 0;
+}
+
+/// Create a document with all fields including meta columns.
+/// Takes a CDocumentRecord pointer for the full field set.
+pub fn talu_documents_create_ex(
+    db_path: ?[*:0]const u8,
+    in_doc: ?*const CDocumentRecord,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    const doc = in_doc orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "in_doc is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const doc_id_slice = validateRequiredArg(doc.doc_id, "doc_id") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    const doc_type_slice = validateRequiredArg(doc.doc_type, "doc_type") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    const title_slice = validateRequiredArg(doc.title, "title") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    const doc_json_slice = validateRequiredArg(doc.doc_json, "doc_json") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+
+    const now_ms = std.time.milliTimestamp();
+    const record = documents.DocumentRecord{
+        .doc_id = doc_id_slice,
+        .doc_type = doc_type_slice,
+        .title = title_slice,
+        .doc_json = doc_json_slice,
+        .tags_text = optSlice(doc.tags_text),
+        .parent_id = optSlice(doc.parent_id),
+        .marker = optSlice(doc.marker),
+        .group_id = optSlice(doc.group_id),
+        .owner_id = optSlice(doc.owner_id),
+        .created_at_ms = now_ms,
+        .updated_at_ms = now_ms,
+        .meta_i1 = if (doc.meta_i1 != 0) doc.meta_i1 else null,
+        .meta_i2 = if (doc.meta_i2 != 0) doc.meta_i2 else null,
+        .meta_i3 = if (doc.meta_i3 != 0) doc.meta_i3 else null,
+        .meta_i4 = if (doc.meta_i4 != 0) doc.meta_i4 else null,
+        .meta_i5 = if (doc.meta_i5 != 0) doc.meta_i5 else null,
+        .meta_f1 = if (doc.meta_f1 != 0.0) doc.meta_f1 else null,
+        .meta_f2 = if (doc.meta_f2 != 0.0) doc.meta_f2 else null,
+        .meta_f3 = if (doc.meta_f3 != 0.0) doc.meta_f3 else null,
+        .meta_f4 = if (doc.meta_f4 != 0.0) doc.meta_f4 else null,
+        .meta_f5 = if (doc.meta_f5 != 0.0) doc.meta_f5 else null,
     };
 
     documents.createDocument(allocator, db_path_slice, record) catch |err| {
@@ -719,6 +844,61 @@ pub fn talu_documents_list(
 /// Parameters:
 ///   - list: Document list handle to free (may be null)
 pub fn talu_documents_free_list(list: ?*CDocumentList) callconv(.c) void {
+    capi_error.clearError();
+    const l = list orelse return;
+
+    if (l._arena) |arena_ptr| {
+        const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(arena_ptr));
+        arena.deinit();
+        allocator.destroy(arena);
+    }
+
+    allocator.destroy(l);
+}
+
+/// List documents returning full records (including content).
+pub fn talu_documents_list_full(
+    db_path: ?[*:0]const u8,
+    doc_type: ?[*:0]const u8,
+    group_id: ?[*:0]const u8,
+    owner_id: ?[*:0]const u8,
+    marker: ?[*:0]const u8,
+    limit: u32,
+    out_list: ?*?*CDocumentFullList,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const out = out_list orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_list is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    out.* = null;
+    const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+
+    const effective_limit: usize = if (limit == 0) 100 else @intCast(limit);
+
+    const records = documents.listDocuments(
+        allocator,
+        db_path_slice,
+        optSlice(doc_type),
+        optSlice(group_id),
+        optSlice(owner_id),
+        optSlice(marker),
+    ) catch |err| {
+        capi_error.setErrorWithCode(.storage_error, "Failed to list documents: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    defer documents.freeDocumentRecords(allocator, @constCast(records));
+
+    const list = buildDocumentFullList(records, effective_limit) catch |err| {
+        capi_error.setErrorWithCode(.out_of_memory, "Failed to build full document list: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+
+    out.* = list;
+    return 0;
+}
+
+pub fn talu_documents_free_full_list(list: ?*CDocumentFullList) callconv(.c) void {
     capi_error.clearError();
     const l = list orelse return;
 
@@ -1550,6 +1730,16 @@ fn populateDocumentRecord(out: *CDocumentRecord, record: documents.DocumentRecor
     out.expires_at_ms = record.expires_at_ms;
     out.content_hash = record.content_hash;
     out.seq_num = record.seq_num;
+    out.meta_i1 = record.meta_i1 orelse 0;
+    out.meta_i2 = record.meta_i2 orelse 0;
+    out.meta_i3 = record.meta_i3 orelse 0;
+    out.meta_i4 = record.meta_i4 orelse 0;
+    out.meta_i5 = record.meta_i5 orelse 0;
+    out.meta_f1 = record.meta_f1 orelse 0.0;
+    out.meta_f2 = record.meta_f2 orelse 0.0;
+    out.meta_f3 = record.meta_f3 orelse 0.0;
+    out.meta_f4 = record.meta_f4 orelse 0.0;
+    out.meta_f5 = record.meta_f5 orelse 0.0;
 }
 
 fn copyToStaticBuf(buf: []u8, src: []const u8) ?[*:0]const u8 {
@@ -1598,6 +1788,16 @@ fn convertToCRecords(arena: std.mem.Allocator, chain_records: []const documents.
             .expires_at_ms = rec.expires_at_ms,
             .content_hash = rec.content_hash,
             .seq_num = rec.seq_num,
+            .meta_i1 = rec.meta_i1 orelse 0,
+            .meta_i2 = rec.meta_i2 orelse 0,
+            .meta_i3 = rec.meta_i3 orelse 0,
+            .meta_i4 = rec.meta_i4 orelse 0,
+            .meta_i5 = rec.meta_i5 orelse 0,
+            .meta_f1 = rec.meta_f1 orelse 0.0,
+            .meta_f2 = rec.meta_f2 orelse 0.0,
+            .meta_f3 = rec.meta_f3 orelse 0.0,
+            .meta_f4 = rec.meta_f4 orelse 0.0,
+            .meta_f5 = rec.meta_f5 orelse 0.0,
         };
     }
     return c_records;

@@ -653,6 +653,7 @@ pub const CCompactionStats = db_table.CCompactionStats;
 
 // Re-export document API symbols (talu_db_docs_*).
 pub const talu_db_docs_create = db_table.talu_db_docs_create;
+pub const talu_db_docs_create_ex = db_table.talu_db_docs_create_ex;
 pub const talu_db_docs_get = db_table.talu_db_docs_get;
 pub const talu_db_docs_get_blob_ref = db_table.talu_db_docs_get_blob_ref;
 pub const talu_db_docs_update = db_table.talu_db_docs_update;
@@ -661,6 +662,8 @@ pub const talu_db_docs_delete_batch = db_table.talu_db_docs_delete_batch;
 pub const talu_db_docs_set_marker_batch = db_table.talu_db_docs_set_marker_batch;
 pub const talu_db_docs_list = db_table.talu_db_docs_list;
 pub const talu_db_docs_free_list = db_table.talu_db_docs_free_list;
+pub const talu_db_docs_list_full = db_table.talu_db_docs_list_full;
+pub const talu_db_docs_free_full_list = db_table.talu_db_docs_free_full_list;
 pub const talu_db_docs_search = db_table.talu_db_docs_search;
 pub const talu_db_docs_free_search_results = db_table.talu_db_docs_free_search_results;
 pub const talu_db_docs_search_batch = db_table.talu_db_docs_search_batch;

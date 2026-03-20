@@ -41,11 +41,11 @@ describe("bench route hierarchy", () => {
     }
   });
 
-  test("results section has responses and db history pages", () => {
+  test("results page is a flat listing with no sub-pages", () => {
     const page = inspectBenchPage("/bench/results/");
     expect(page.status).toBe("ok");
     if (page.status !== "ok") return;
-    expect(page.childSlugs).toEqual(["results/responses", "results/db"]);
+    expect(page.childSlugs).toEqual([]);
   });
 
   test("responses perf page exposes canonical pp/tg scenario matrix", () => {

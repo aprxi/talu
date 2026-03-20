@@ -103,6 +103,16 @@ pub struct DocumentRecord {
     pub expires_at_ms: i64,
     pub content_hash: u64,
     pub seq_num: u64,
+    pub meta_i1: Option<i64>,
+    pub meta_i2: Option<i64>,
+    pub meta_i3: Option<i64>,
+    pub meta_i4: Option<i64>,
+    pub meta_i5: Option<i64>,
+    pub meta_f1: Option<f64>,
+    pub meta_f2: Option<f64>,
+    pub meta_f3: Option<f64>,
+    pub meta_f4: Option<f64>,
+    pub meta_f5: Option<f64>,
 }
 
 /// A document summary (for list results).
@@ -112,8 +122,19 @@ pub struct DocumentSummary {
     pub doc_type: String,
     pub title: String,
     pub marker: Option<String>,
+    pub group_id: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub meta_i1: Option<i64>,
+    pub meta_i2: Option<i64>,
+    pub meta_i3: Option<i64>,
+    pub meta_i4: Option<i64>,
+    pub meta_i5: Option<i64>,
+    pub meta_f1: Option<f64>,
+    pub meta_f2: Option<f64>,
+    pub meta_f3: Option<f64>,
+    pub meta_f4: Option<f64>,
+    pub meta_f5: Option<f64>,
 }
 
 /// A search result.
@@ -232,6 +253,77 @@ impl DocumentsHandle {
                 opt_ptr(&group_c),
                 opt_ptr(&owner_c),
             )
+        };
+
+        if code != ERROR_CODE_OK {
+            return Err(DocumentError::from_code(code, doc_id));
+        }
+        Ok(())
+    }
+
+    /// Create a document with all fields including meta columns.
+    pub fn create_with_meta(
+        &self,
+        doc_id: &str,
+        doc_type: &str,
+        title: &str,
+        doc_json: &str,
+        tags_text: Option<&str>,
+        parent_id: Option<&str>,
+        marker: Option<&str>,
+        group_id: Option<&str>,
+        owner_id: Option<&str>,
+        meta_i1: Option<i64>,
+        meta_i2: Option<i64>,
+        meta_i3: Option<i64>,
+        meta_i4: Option<i64>,
+        meta_i5: Option<i64>,
+        meta_f1: Option<f64>,
+        meta_f2: Option<f64>,
+        meta_f3: Option<f64>,
+        meta_f4: Option<f64>,
+        meta_f5: Option<f64>,
+    ) -> Result<(), DocumentError> {
+        let doc_id_c = to_cstring(doc_id)?;
+        let doc_type_c = to_cstring(doc_type)?;
+        let title_c = to_cstring(title)?;
+        let doc_json_c = to_cstring(doc_json)?;
+        let tags_c = to_optional_cstring(tags_text)?;
+        let parent_c = to_optional_cstring(parent_id)?;
+        let marker_c = to_optional_cstring(marker)?;
+        let group_c = to_optional_cstring(group_id)?;
+        let owner_c = to_optional_cstring(owner_id)?;
+
+        let c_doc = talu_sys::CDocumentRecord {
+            doc_id: doc_id_c.as_ptr(),
+            doc_type: doc_type_c.as_ptr(),
+            title: title_c.as_ptr(),
+            doc_json: doc_json_c.as_ptr(),
+            tags_text: opt_ptr(&tags_c),
+            parent_id: opt_ptr(&parent_c),
+            marker: opt_ptr(&marker_c),
+            group_id: opt_ptr(&group_c),
+            owner_id: opt_ptr(&owner_c),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            expires_at_ms: 0,
+            content_hash: 0,
+            seq_num: 0,
+            meta_i1: meta_i1.unwrap_or(0),
+            meta_i2: meta_i2.unwrap_or(0),
+            meta_i3: meta_i3.unwrap_or(0),
+            meta_i4: meta_i4.unwrap_or(0),
+            meta_i5: meta_i5.unwrap_or(0),
+            meta_f1: meta_f1.unwrap_or(0.0),
+            meta_f2: meta_f2.unwrap_or(0.0),
+            meta_f3: meta_f3.unwrap_or(0.0),
+            meta_f4: meta_f4.unwrap_or(0.0),
+            meta_f5: meta_f5.unwrap_or(0.0),
+            _reserved: [0; 8],
+        };
+
+        let code = unsafe {
+            talu_sys::talu_db_docs_create_ex(self.path_cstr.as_ptr(), &c_doc)
         };
 
         if code != ERROR_CODE_OK {
@@ -425,6 +517,58 @@ impl DocumentsHandle {
                     }
                 }
                 talu_sys::talu_db_docs_free_list(out_list);
+                docs
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// List documents with full content (not just summaries).
+    pub fn list_full(
+        &self,
+        doc_type: Option<&str>,
+        group_id: Option<&str>,
+        owner_id: Option<&str>,
+        marker: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<DocumentRecord>, DocumentError> {
+        let type_c = to_optional_cstring(doc_type)?;
+        let group_c = to_optional_cstring(group_id)?;
+        let owner_c = to_optional_cstring(owner_id)?;
+        let marker_c = to_optional_cstring(marker)?;
+
+        let mut out_list: *mut talu_sys::CDocumentFullList = ptr::null_mut();
+
+        let code = unsafe {
+            talu_sys::talu_db_docs_list_full(
+                self.path_cstr.as_ptr(),
+                opt_ptr(&type_c),
+                opt_ptr(&group_c),
+                opt_ptr(&owner_c),
+                opt_ptr(&marker_c),
+                limit,
+                &mut out_list as *mut _,
+            )
+        };
+
+        if code != ERROR_CODE_OK {
+            return Err(DocumentError::from_code(code, "list_full"));
+        }
+
+        let result = if out_list.is_null() {
+            Vec::new()
+        } else {
+            unsafe {
+                let list = &*out_list;
+                let mut docs = Vec::with_capacity(list.count);
+                if !list.items.is_null() {
+                    for i in 0..list.count {
+                        let item = &*list.items.add(i);
+                        docs.push(document_from_c(item));
+                    }
+                }
+                talu_sys::talu_db_docs_free_full_list(out_list);
                 docs
             }
         };
@@ -899,6 +1043,14 @@ fn cstr_to_opt_string(ptr: *const c_char) -> Option<String> {
     }
 }
 
+fn i64_opt(v: i64) -> Option<i64> {
+    if v != 0 { Some(v) } else { None }
+}
+
+fn f64_opt(v: f64) -> Option<f64> {
+    if v != 0.0 { Some(v) } else { None }
+}
+
 fn document_from_c(c: &talu_sys::CDocumentRecord) -> DocumentRecord {
     DocumentRecord {
         doc_id: cstr_to_string(c.doc_id),
@@ -915,6 +1067,16 @@ fn document_from_c(c: &talu_sys::CDocumentRecord) -> DocumentRecord {
         expires_at_ms: c.expires_at_ms,
         content_hash: c.content_hash,
         seq_num: c.seq_num,
+        meta_i1: i64_opt(c.meta_i1),
+        meta_i2: i64_opt(c.meta_i2),
+        meta_i3: i64_opt(c.meta_i3),
+        meta_i4: i64_opt(c.meta_i4),
+        meta_i5: i64_opt(c.meta_i5),
+        meta_f1: f64_opt(c.meta_f1),
+        meta_f2: f64_opt(c.meta_f2),
+        meta_f3: f64_opt(c.meta_f3),
+        meta_f4: f64_opt(c.meta_f4),
+        meta_f5: f64_opt(c.meta_f5),
     }
 }
 
@@ -924,8 +1086,19 @@ fn summary_from_c(c: &talu_sys::CDocumentSummary) -> DocumentSummary {
         doc_type: cstr_to_string(c.doc_type),
         title: cstr_to_string(c.title),
         marker: cstr_to_opt_string(c.marker),
+        group_id: cstr_to_opt_string(c.group_id),
         created_at_ms: c.created_at_ms,
         updated_at_ms: c.updated_at_ms,
+        meta_i1: i64_opt(c.meta_i1),
+        meta_i2: i64_opt(c.meta_i2),
+        meta_i3: i64_opt(c.meta_i3),
+        meta_i4: i64_opt(c.meta_i4),
+        meta_i5: i64_opt(c.meta_i5),
+        meta_f1: f64_opt(c.meta_f1),
+        meta_f2: f64_opt(c.meta_f2),
+        meta_f3: f64_opt(c.meta_f3),
+        meta_f4: f64_opt(c.meta_f4),
+        meta_f5: f64_opt(c.meta_f5),
     }
 }
 

@@ -1228,6 +1228,17 @@ pub struct CDocumentSummary {
     pub updated_at_ms: i64,
     pub created_at_ms: i64,
     pub marker: *const c_char,
+    pub group_id: *const c_char,
+    pub meta_i1: i64,
+    pub meta_i2: i64,
+    pub meta_i3: i64,
+    pub meta_i4: i64,
+    pub meta_i5: i64,
+    pub meta_f1: f64,
+    pub meta_f2: f64,
+    pub meta_f3: f64,
+    pub meta_f4: f64,
+    pub meta_f5: f64,
 }
 
 impl Default for CDocumentSummary {
@@ -1239,6 +1250,17 @@ impl Default for CDocumentSummary {
             updated_at_ms: 0,
             created_at_ms: 0,
             marker: std::ptr::null(),
+            group_id: std::ptr::null(),
+            meta_i1: 0,
+            meta_i2: 0,
+            meta_i3: 0,
+            meta_i4: 0,
+            meta_i5: 0,
+            meta_f1: 0.0,
+            meta_f2: 0.0,
+            meta_f3: 0.0,
+            meta_f4: 0.0,
+            meta_f5: 0.0,
         }
     }
 }
@@ -1383,6 +1405,15 @@ impl Default for CDocumentList {
             _arena: std::ptr::null_mut(),
         }
     }
+}
+
+/// Source: core/src/capi/documents_impl.zig
+#[repr(C)]
+pub struct CDocumentFullList {
+    pub items: *mut CDocumentRecord,
+    pub count: usize,
+    pub has_more: bool,
+    pub _arena: *mut c_void,
 }
 
 /// Source: core/src/capi/xray.zig
@@ -2203,6 +2234,16 @@ pub struct CDocumentRecord {
     pub expires_at_ms: i64,
     pub content_hash: u64,
     pub seq_num: u64,
+    pub meta_i1: i64,
+    pub meta_i2: i64,
+    pub meta_i3: i64,
+    pub meta_i4: i64,
+    pub meta_i5: i64,
+    pub meta_f1: f64,
+    pub meta_f2: f64,
+    pub meta_f3: f64,
+    pub meta_f4: f64,
+    pub meta_f5: f64,
     pub _reserved: [u8; 8],
 }
 
@@ -2223,6 +2264,16 @@ impl Default for CDocumentRecord {
             expires_at_ms: 0,
             content_hash: 0,
             seq_num: 0,
+            meta_i1: 0,
+            meta_i2: 0,
+            meta_i3: 0,
+            meta_i4: 0,
+            meta_i5: 0,
+            meta_f1: 0.0,
+            meta_f2: 0.0,
+            meta_f3: 0.0,
+            meta_f4: 0.0,
+            meta_f5: 0.0,
             _reserved: [0; 8],
         }
     }
@@ -4740,6 +4791,8 @@ extern "C" {
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_create(db_path: *const c_char, doc_id: *const c_char, doc_type: *const c_char, title: *const c_char, doc_json: *const c_char, tags_text: *const c_char, parent_id: *const c_char, marker: *const c_char, group_id: *const c_char, owner_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
+    pub fn talu_db_docs_create_ex(db_path: *const c_char, in_doc: *const CDocumentRecord) -> c_int;
+    // core/src/capi/db/table.zig
     pub fn talu_db_docs_create_delta(db_path: *const c_char, base_doc_id: *const c_char, new_doc_id: *const c_char, delta_json: *const c_char, title: *const c_char, tags_text: *const c_char, marker: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_delete(db_path: *const c_char, doc_id: *const c_char) -> c_int;
@@ -4753,6 +4806,8 @@ extern "C" {
     pub fn talu_db_docs_free_json(ptr: *mut u8, len: usize);
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_free_list(list: *mut CDocumentList);
+    // core/src/capi/db/table.zig
+    pub fn talu_db_docs_free_full_list(list: *mut CDocumentFullList);
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_free_search_results(list: *mut CSearchResultList);
     // core/src/capi/db/table.zig
@@ -4779,6 +4834,8 @@ extern "C" {
     pub fn talu_db_docs_is_delta(db_path: *const c_char, doc_id: *const c_char, out_is_delta: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_list(db_path: *const c_char, doc_type: *const c_char, group_id: *const c_char, owner_id: *const c_char, marker: *const c_char, limit: u32, out_list: *mut *mut CDocumentList) -> c_int;
+    // core/src/capi/db/table.zig
+    pub fn talu_db_docs_list_full(db_path: *const c_char, doc_type: *const c_char, group_id: *const c_char, owner_id: *const c_char, marker: *const c_char, limit: u32, out_list: *mut *mut CDocumentFullList) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_purge_expired(db_path: *const c_char, out_count: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig

@@ -46,6 +46,26 @@ pub(crate) struct DocumentResponse {
     updated_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_i1: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_i2: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_i3: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_i4: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_i5: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_f1: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_f2: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_f3: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_f4: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_f5: Option<f64>,
 }
 
 impl From<DocumentRecord> for DocumentResponse {
@@ -72,6 +92,16 @@ impl From<DocumentRecord> for DocumentResponse {
             } else {
                 None
             },
+            meta_i1: r.meta_i1,
+            meta_i2: r.meta_i2,
+            meta_i3: r.meta_i3,
+            meta_i4: r.meta_i4,
+            meta_i5: r.meta_i5,
+            meta_f1: r.meta_f1,
+            meta_f2: r.meta_f2,
+            meta_f3: r.meta_f3,
+            meta_f4: r.meta_f4,
+            meta_f5: r.meta_f5,
         }
     }
 }
@@ -84,8 +114,30 @@ pub(crate) struct DocumentSummaryResponse {
     title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_id: Option<String>,
     created_at: i64,
     updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_i1: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_i2: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_i3: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_i4: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_i5: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_f1: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_f2: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_f3: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_f4: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_f5: Option<f64>,
 }
 
 impl From<DocumentSummary> for DocumentSummaryResponse {
@@ -95,8 +147,19 @@ impl From<DocumentSummary> for DocumentSummaryResponse {
             doc_type: s.doc_type,
             title: s.title,
             marker: s.marker,
+            group_id: s.group_id,
             created_at: s.created_at_ms,
             updated_at: s.updated_at_ms,
+            meta_i1: s.meta_i1,
+            meta_i2: s.meta_i2,
+            meta_i3: s.meta_i3,
+            meta_i4: s.meta_i4,
+            meta_i5: s.meta_i5,
+            meta_f1: s.meta_f1,
+            meta_f2: s.meta_f2,
+            meta_f3: s.meta_f3,
+            meta_f4: s.meta_f4,
+            meta_f5: s.meta_f5,
         }
     }
 }
@@ -104,6 +167,12 @@ impl From<DocumentSummary> for DocumentSummaryResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct DocumentListResponse {
     data: Vec<DocumentSummaryResponse>,
+    has_more: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DocumentFullListResponse {
+    data: Vec<DocumentResponse>,
     has_more: bool,
 }
 
@@ -154,6 +223,26 @@ pub(crate) struct CreateDocumentRequest {
     owner_id: Option<String>,
     #[serde(default)]
     ttl_seconds: Option<u64>,
+    #[serde(default)]
+    meta_i1: Option<i64>,
+    #[serde(default)]
+    meta_i2: Option<i64>,
+    #[serde(default)]
+    meta_i3: Option<i64>,
+    #[serde(default)]
+    meta_i4: Option<i64>,
+    #[serde(default)]
+    meta_i5: Option<i64>,
+    #[serde(default)]
+    meta_f1: Option<f64>,
+    #[serde(default)]
+    meta_f2: Option<f64>,
+    #[serde(default)]
+    meta_f3: Option<f64>,
+    #[serde(default)]
+    meta_f4: Option<f64>,
+    #[serde(default)]
+    meta_f5: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -235,32 +324,57 @@ pub async fn handle_list(
         parse_query_param(query_str, "owner_id")
     };
 
+    let include_content = parse_query_param(query_str, "include")
+        .map(|s| s == "content")
+        .unwrap_or(false);
+
     let handle = match DocumentsHandle::open(&table_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
 
-    let docs = match handle.list(
-        doc_type.as_deref(),
-        group_id.as_deref(),
-        owner_id.as_deref(),
-        marker.as_deref(),
-        limit,
-    ) {
-        Ok(d) => d,
-        Err(e) => return document_error_response(e),
-    };
+    if include_content {
+        let docs = match handle.list_full(
+            doc_type.as_deref(),
+            group_id.as_deref(),
+            owner_id.as_deref(),
+            marker.as_deref(),
+            limit,
+        ) {
+            Ok(d) => d,
+            Err(e) => return document_error_response(e),
+        };
 
-    let has_more = docs.len() >= limit as usize;
-    let response = DocumentListResponse {
-        data: docs
-            .into_iter()
-            .map(DocumentSummaryResponse::from)
-            .collect(),
-        has_more,
-    };
+        let has_more = docs.len() >= limit as usize;
+        let response = DocumentFullListResponse {
+            data: docs.into_iter().map(DocumentResponse::from).collect(),
+            has_more,
+        };
 
-    json_response(StatusCode::OK, &response)
+        json_response(StatusCode::OK, &response)
+    } else {
+        let docs = match handle.list(
+            doc_type.as_deref(),
+            group_id.as_deref(),
+            owner_id.as_deref(),
+            marker.as_deref(),
+            limit,
+        ) {
+            Ok(d) => d,
+            Err(e) => return document_error_response(e),
+        };
+
+        let has_more = docs.len() >= limit as usize;
+        let response = DocumentListResponse {
+            data: docs
+                .into_iter()
+                .map(DocumentSummaryResponse::from)
+                .collect(),
+            has_more,
+        };
+
+        json_response(StatusCode::OK, &response)
+    }
 }
 
 #[utoipa::path(get, path = "/v1/db/tables/{table}/{doc_id}", tag = "DB::Tables",
@@ -408,18 +522,55 @@ pub async fn handle_create(
     // Plugin storage: force owner_id to the authenticated plugin_id.
     let owner_id = plugin_owner_id.or(create_req.owner_id);
 
-    if let Err(e) = handle.create(
-        &doc_id,
-        &create_req.doc_type,
-        &title,
-        &content_json,
-        create_req.tags_text.as_deref(),
-        create_req.parent_id.as_deref(),
-        create_req.marker.as_deref(),
-        group_id.as_deref(),
-        owner_id.as_deref(),
-    ) {
-        return document_error_response(e);
+    let has_meta = create_req.meta_i1.is_some()
+        || create_req.meta_i2.is_some()
+        || create_req.meta_i3.is_some()
+        || create_req.meta_i4.is_some()
+        || create_req.meta_i5.is_some()
+        || create_req.meta_f1.is_some()
+        || create_req.meta_f2.is_some()
+        || create_req.meta_f3.is_some()
+        || create_req.meta_f4.is_some()
+        || create_req.meta_f5.is_some();
+
+    if has_meta {
+        if let Err(e) = handle.create_with_meta(
+            &doc_id,
+            &create_req.doc_type,
+            &title,
+            &content_json,
+            create_req.tags_text.as_deref(),
+            create_req.parent_id.as_deref(),
+            create_req.marker.as_deref(),
+            group_id.as_deref(),
+            owner_id.as_deref(),
+            create_req.meta_i1,
+            create_req.meta_i2,
+            create_req.meta_i3,
+            create_req.meta_i4,
+            create_req.meta_i5,
+            create_req.meta_f1,
+            create_req.meta_f2,
+            create_req.meta_f3,
+            create_req.meta_f4,
+            create_req.meta_f5,
+        ) {
+            return document_error_response(e);
+        }
+    } else {
+        if let Err(e) = handle.create(
+            &doc_id,
+            &create_req.doc_type,
+            &title,
+            &content_json,
+            create_req.tags_text.as_deref(),
+            create_req.parent_id.as_deref(),
+            create_req.marker.as_deref(),
+            group_id.as_deref(),
+            owner_id.as_deref(),
+        ) {
+            return document_error_response(e);
+        }
     }
 
     // Set TTL if specified

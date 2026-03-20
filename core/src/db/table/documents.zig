@@ -375,7 +375,11 @@ pub const DocumentAdapter = struct {
             n_filters = 1;
         }
 
-        const extra = [_]u32{ col_group_hash, col_owner_hash };
+        const extra = [_]u32{
+            col_group_hash,    col_owner_hash,
+            col_meta_i1,       col_meta_i2,       col_meta_i3,       col_meta_i4,       col_meta_i5,
+            col_meta_f1,       col_meta_f2,       col_meta_f3,       col_meta_f4,       col_meta_f5,
+        };
         const result = try self.table.scan(allocator, .{
             .schema_id = schema_documents,
             .delete_schema_id = schema_document_deletes,
@@ -405,18 +409,18 @@ pub const DocumentAdapter = struct {
                 if (row_owner != target and row_owner != 0) continue;
             }
 
-            const record = decodeDocumentRecordWithBlobStore(allocator, row.payload, &self.blob_store) catch continue orelse continue;
+            var record = decodeDocumentRecordWithBlobStore(allocator, row.payload, &self.blob_store) catch continue orelse continue;
 
             // Post-dedup marker filter
             if (target_marker_hash) |target| {
                 const rm: u64 = if (record.marker) |m| computeHash(m) else 0;
                 if (rm != target) {
-                    var r = record;
-                    r.deinit(allocator);
+                    record.deinit(allocator);
                     continue;
                 }
             }
 
+            populateMetaFromScalars(&record, row.scalars);
             try results.append(allocator, record);
         }
 
@@ -429,7 +433,10 @@ pub const DocumentAdapter = struct {
         const target_hash = computeHash(doc_id);
         const row = try self.table.get(allocator, schema_documents, target_hash, null) orelse return null;
         defer generic.freeRow(allocator, row);
-        return decodeDocumentRecordWithBlobStore(allocator, row.payload, &self.blob_store) catch null;
+        const maybe_record = decodeDocumentRecordWithBlobStore(allocator, row.payload, &self.blob_store) catch return null;
+        var record = maybe_record orelse return null;
+        populateMetaFromScalars(&record, row.scalars);
+        return record;
     }
 
     /// Get a single document header by ID without loading externalized doc_json.
@@ -2275,6 +2282,28 @@ fn findScalarValue(scalars: []const generic.ColumnData, column_id: u32) ?u64 {
         if (s.column_id == column_id) return s.value_u64;
     }
     return null;
+}
+
+/// Populate meta_i1..5 and meta_f1..5 from scalar column values.
+/// Convention: 0 means null/unset.
+fn populateMetaFromScalars(record: *DocumentRecord, scalars: []const generic.ColumnData) void {
+    const i_cols = [_]u32{ col_meta_i1, col_meta_i2, col_meta_i3, col_meta_i4, col_meta_i5 };
+    const i_ptrs = [_]*?i64{ &record.meta_i1, &record.meta_i2, &record.meta_i3, &record.meta_i4, &record.meta_i5 };
+    for (i_cols, i_ptrs) |col, ptr| {
+        if (findScalarValue(scalars, col)) |v| {
+            const iv: i64 = @bitCast(v);
+            if (iv != 0) ptr.* = iv;
+        }
+    }
+
+    const f_cols = [_]u32{ col_meta_f1, col_meta_f2, col_meta_f3, col_meta_f4, col_meta_f5 };
+    const f_ptrs = [_]*?f64{ &record.meta_f1, &record.meta_f2, &record.meta_f3, &record.meta_f4, &record.meta_f5 };
+    for (f_cols, f_ptrs) |col, ptr| {
+        if (findScalarValue(scalars, col)) |v| {
+            const fv: f64 = @bitCast(v);
+            if (fv != 0.0) ptr.* = fv;
+        }
+    }
 }
 
 fn findColumn(descs: []const types.ColumnDesc, col_id: u32) ?types.ColumnDesc {

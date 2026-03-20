@@ -118,6 +118,13 @@ pub export fn talu_db_docs_create(
     );
 }
 
+pub export fn talu_db_docs_create_ex(
+    db_path: ?[*:0]const u8,
+    in_doc: ?*const docs.CDocumentRecord,
+) callconv(.c) i32 {
+    return docs.talu_documents_create_ex(db_path, in_doc);
+}
+
 pub export fn talu_db_docs_get(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
@@ -208,6 +215,22 @@ pub export fn talu_db_docs_list(
 
 pub export fn talu_db_docs_free_list(list: ?*docs.CDocumentList) callconv(.c) void {
     docs.talu_documents_free_list(list);
+}
+
+pub export fn talu_db_docs_list_full(
+    db_path: ?[*:0]const u8,
+    doc_type: ?[*:0]const u8,
+    group_id: ?[*:0]const u8,
+    owner_id: ?[*:0]const u8,
+    marker: ?[*:0]const u8,
+    limit: u32,
+    out_list: ?*?*docs.CDocumentFullList,
+) callconv(.c) i32 {
+    return docs.talu_documents_list_full(db_path, doc_type, group_id, owner_id, marker, limit, out_list);
+}
+
+pub export fn talu_db_docs_free_full_list(list: ?*docs.CDocumentFullList) callconv(.c) void {
+    docs.talu_documents_free_full_list(list);
 }
 
 pub export fn talu_db_docs_search(

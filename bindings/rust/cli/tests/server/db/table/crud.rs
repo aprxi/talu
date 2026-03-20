@@ -1388,3 +1388,284 @@ fn list_has_more_reflects_total_vs_limit() {
         "has_more should be false when all returned"
     );
 }
+
+// =============================================================================
+// group_id in summary
+// =============================================================================
+
+#[test]
+fn list_returns_group_id_in_summary() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "bench_run",
+            "title": "perf test",
+            "content": {},
+            "group_id": "responses/perf"
+        }),
+    );
+    assert_eq!(resp.status, 201, "create: {}", resp.body);
+
+    let resp = get(ctx.addr(), "/v1/db/tables/documents");
+    assert_eq!(resp.status, 200, "list: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["group_id"], "responses/perf");
+}
+
+// =============================================================================
+// include=content
+// =============================================================================
+
+#[test]
+fn list_with_include_content_returns_full_records() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "bench_run",
+            "title": "full test",
+            "content": {"score": 42},
+            "group_id": "db/vectors",
+            "tags_text": "bench perf"
+        }),
+    );
+    assert_eq!(resp.status, 201, "create: {}", resp.body);
+
+    let resp = get(
+        ctx.addr(),
+        "/v1/db/tables/documents?include=content",
+    );
+    assert_eq!(resp.status, 200, "list full: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["title"], "full test");
+    assert_eq!(data[0]["group_id"], "db/vectors");
+    assert_eq!(data[0]["content"]["score"], 42);
+    assert_eq!(data[0]["tags_text"], "bench perf");
+}
+
+#[test]
+fn list_without_include_omits_content() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "note",
+            "title": "summary only",
+            "content": {"secret": "data"}
+        }),
+    );
+    assert_eq!(resp.status, 201, "create: {}", resp.body);
+
+    let resp = get(ctx.addr(), "/v1/db/tables/documents");
+    assert_eq!(resp.status, 200, "list: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1);
+    assert!(
+        data[0].get("content").is_none(),
+        "summary should not include content"
+    );
+}
+
+// =============================================================================
+// meta columns
+// =============================================================================
+
+#[test]
+fn create_with_meta_columns_round_trips() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "bench_run",
+            "title": "with meta",
+            "content": {},
+            "meta_i1": 42,
+            "meta_i2": -100,
+            "meta_f1": 3.14,
+            "meta_f3": 99.5
+        }),
+    );
+    assert_eq!(resp.status, 201, "create: {}", resp.body);
+    let doc_id = resp.json()["id"].as_str().unwrap().to_string();
+
+    let resp = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}", doc_id),
+    );
+    assert_eq!(resp.status, 200, "get: {}", resp.body);
+
+    let json = resp.json();
+    assert_eq!(json["meta_i1"], 42);
+    assert_eq!(json["meta_i2"], -100);
+    assert_eq!(json["meta_f1"], 3.14);
+    assert_eq!(json["meta_f3"], 99.5);
+    // Unset meta fields should be absent
+    assert!(json.get("meta_i3").is_none() || json["meta_i3"].is_null());
+    assert!(json.get("meta_f2").is_none() || json["meta_f2"].is_null());
+}
+
+#[test]
+fn list_returns_meta_columns_in_summary() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "bench_run",
+            "title": "meta in list",
+            "content": {},
+            "meta_i1": 1000,
+            "meta_f1": 2.5
+        }),
+    );
+    assert_eq!(resp.status, 201, "create: {}", resp.body);
+
+    let resp = get(ctx.addr(), "/v1/db/tables/documents");
+    assert_eq!(resp.status, 200, "list: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["meta_i1"], 1000);
+    assert_eq!(data[0]["meta_f1"], 2.5);
+}
+
+#[test]
+fn meta_zero_is_omitted_from_response() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "note",
+            "title": "no meta",
+            "content": {}
+        }),
+    );
+    assert_eq!(resp.status, 201, "create: {}", resp.body);
+    let doc_id = resp.json()["id"].as_str().unwrap().to_string();
+
+    let resp = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}", doc_id),
+    );
+    assert_eq!(resp.status, 200, "get: {}", resp.body);
+
+    let json = resp.json();
+    // All meta fields should be absent when not set
+    for field in &[
+        "meta_i1", "meta_i2", "meta_i3", "meta_i4", "meta_i5",
+        "meta_f1", "meta_f2", "meta_f3", "meta_f4", "meta_f5",
+    ] {
+        assert!(
+            json.get(*field).is_none() || json[*field].is_null(),
+            "{} should be absent when not set",
+            field
+        );
+    }
+}
+
+#[test]
+fn list_full_returns_meta_columns() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "bench_run",
+            "title": "meta full",
+            "content": {},
+            "meta_i1": 500,
+            "meta_f1": 12.34
+        }),
+    );
+    assert_eq!(resp.status, 201, "create: {}", resp.body);
+
+    let resp = get(
+        ctx.addr(),
+        "/v1/db/tables/documents?include=content",
+    );
+    assert_eq!(resp.status, 200, "list full: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["meta_i1"], 500);
+    assert_eq!(data[0]["meta_f1"], 12.34);
+    // Unset meta fields should be absent in full response too
+    assert!(
+        data[0].get("meta_i2").is_none() || data[0]["meta_i2"].is_null(),
+        "unset meta_i2 should be absent"
+    );
+}
+
+#[test]
+fn list_multiple_group_ids() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "bench_run",
+            "title": "run A",
+            "content": {},
+            "group_id": "responses/perf"
+        }),
+    );
+    assert_eq!(resp.status, 201, "create A: {}", resp.body);
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "bench_run",
+            "title": "run B",
+            "content": {},
+            "group_id": "db/kv"
+        }),
+    );
+    assert_eq!(resp.status, 201, "create B: {}", resp.body);
+
+    let resp = get(ctx.addr(), "/v1/db/tables/documents");
+    assert_eq!(resp.status, 200, "list: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data");
+    assert_eq!(data.len(), 2);
+
+    let group_ids: Vec<&str> = data
+        .iter()
+        .filter_map(|d| d["group_id"].as_str())
+        .collect();
+    assert!(group_ids.contains(&"responses/perf"), "should contain responses/perf");
+    assert!(group_ids.contains(&"db/kv"), "should contain db/kv");
+}

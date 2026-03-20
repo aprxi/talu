@@ -13,6 +13,10 @@ document.addEventListener("DOMContentLoaded", () => {
     window.location.pathname === "/bench" ||
     window.location.pathname.startsWith("/bench/")
   ) {
+    if (window.self === window.top) {
+      window.location.replace("/#/settings/bench");
+      return;
+    }
     bootBenchApp();
     return;
   }
