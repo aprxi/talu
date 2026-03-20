@@ -142,6 +142,56 @@ fn decode_batch_ids_binary_v1(body: &str) -> Vec<Vec<u32>> {
     rows
 }
 
+fn decode_text_utf8_binary_v1(body: &str) -> String {
+    let bytes = body.as_bytes();
+    assert!(bytes.len() >= 4, "binary decode body too short");
+    let text_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    assert_eq!(
+        bytes.len(),
+        4 + text_len,
+        "binary decode body length mismatch"
+    );
+    String::from_utf8(bytes[4..].to_vec()).expect("utf8 decoded text")
+}
+
+fn decode_text_batch_utf8_binary_v1(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    assert!(bytes.len() >= 4, "binary decode_batch body too short");
+    let num_rows = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let mut offset = 4usize;
+    let mut row_lengths = Vec::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        assert!(offset + 4 <= bytes.len(), "missing text length");
+        row_lengths.push(u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize);
+        offset += 4;
+    }
+
+    let mut rows = Vec::with_capacity(num_rows);
+    for row_len in row_lengths {
+        assert!(offset + row_len <= bytes.len(), "missing text bytes");
+        let row =
+            String::from_utf8(bytes[offset..offset + row_len].to_vec()).expect("utf8 row text");
+        rows.push(row);
+        offset += row_len;
+    }
+
+    assert_eq!(offset, bytes.len(), "unexpected trailing bytes");
+    rows
+}
+
+fn sha256_ids(ids: &[u32]) -> String {
+    let mut hasher = Sha256::new();
+    for id in ids {
+        hasher.update(id.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 #[test]
 fn instance_lifecycle_create_get_delete() {
     let ctx = ServerTestContext::new(ServerConfig::new());
@@ -215,6 +265,81 @@ fn encode_decode_roundtrip_basic() {
     let dec = dec_resp.json();
     let text = dec["text"].as_str().unwrap_or("");
     assert!(!text.is_empty(), "decoded text should be non-empty");
+}
+
+#[test]
+fn decode_accept_octet_stream_returns_text_utf8_v1_payload() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let enc_resp = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/encode",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "sequence": "hello world",
+            "add_special_tokens": false
+        }),
+    );
+    assert_eq!(enc_resp.status, 200, "body: {}", enc_resp.body);
+    let ids_vec: Vec<u32> = enc_resp.json()["encoding"]["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+
+    let json_decode = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/decode",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "ids": ids_vec,
+            "skip_special_tokens": false
+        }),
+    );
+    assert_eq!(json_decode.status, 200, "body: {}", json_decode.body);
+    let expected = json_decode.json()["text"].as_str().unwrap().to_string();
+
+    let raw_body = serde_json::json!({
+        "tokenizer_id": tokenizer_id,
+        "ids": ids_vec,
+        "skip_special_tokens": false,
+        "benchmark": true
+    })
+    .to_string();
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/decode",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(&raw_body),
+    );
+    assert_eq!(raw.status, 200, "body: {}", raw.body);
+    assert!(raw
+        .header("content-type")
+        .unwrap_or("")
+        .starts_with("application/octet-stream"));
+    assert_eq!(raw.header("x-talu-binary-format"), Some("text_utf8_v1"));
+    assert_eq!(
+        raw.header("x-talu-bytes-len")
+            .and_then(|v| v.parse::<usize>().ok()),
+        Some(expected.len())
+    );
+    assert_eq!(raw.header("x-talu-impl"), Some("talu.decode"));
+    assert!(raw
+        .header("x-talu-timing-decode-ms")
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some());
+    assert!(raw
+        .header("x-talu-timing-total-ms")
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some());
+    assert_eq!(decode_text_utf8_binary_v1(&raw.body), expected);
 }
 
 #[test]
@@ -500,6 +625,105 @@ fn decode_batch_returns_texts_for_multiple_rows() {
     assert_eq!(texts.len(), 2);
     assert!(texts[0].as_str().unwrap_or("").len() > 0);
     assert!(texts[1].as_str().unwrap_or("").len() > 0);
+}
+
+#[test]
+fn decode_batch_accept_octet_stream_returns_text_batch_utf8_v1_payload() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let hello = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/encode",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "sequence": "hello",
+            "add_special_tokens": false
+        }),
+    );
+    assert_eq!(hello.status, 200, "body: {}", hello.body);
+    let hello_ids = hello.json()["encoding"]["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect::<Vec<_>>();
+
+    let world = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/encode",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "sequence": "world",
+            "add_special_tokens": false
+        }),
+    );
+    assert_eq!(world.status, 200, "body: {}", world.body);
+    let world_ids = world.json()["encoding"]["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect::<Vec<_>>();
+
+    let payload = serde_json::json!({
+        "tokenizer_id": tokenizer_id,
+        "ids_batch": [hello_ids, world_ids],
+        "skip_special_tokens": false,
+        "benchmark": true
+    });
+    let expected_json = post_json(ctx.addr(), "/v1/tokenizer/decode_batch", &payload);
+    assert_eq!(expected_json.status, 200, "body: {}", expected_json.body);
+    let expected_texts: Vec<String> = expected_json.json()["texts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/decode_batch",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(&payload.to_string()),
+    );
+    assert_eq!(raw.status, 200, "body: {}", raw.body);
+    assert!(raw
+        .header("content-type")
+        .unwrap_or("")
+        .starts_with("application/octet-stream"));
+    assert_eq!(
+        raw.header("x-talu-binary-format"),
+        Some("text_batch_utf8_v1")
+    );
+    assert_eq!(
+        raw.header("x-talu-num-texts")
+            .and_then(|v| v.parse::<usize>().ok()),
+        Some(expected_texts.len())
+    );
+    let expected_total_bytes: usize = expected_texts.iter().map(String::len).sum();
+    assert_eq!(
+        raw.header("x-talu-total-bytes")
+            .and_then(|v| v.parse::<usize>().ok()),
+        Some(expected_total_bytes)
+    );
+    assert_eq!(raw.header("x-talu-impl"), Some("talu.decode_batch"));
+    assert!(raw
+        .header("x-talu-timing-decode-ms")
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some());
+    assert!(raw
+        .header("x-talu-timing-total-ms")
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some());
+
+    let decoded_texts = decode_text_batch_utf8_binary_v1(&raw.body);
+    assert_eq!(decoded_texts, expected_texts);
 }
 
 #[test]
@@ -912,6 +1136,7 @@ fn encode_accept_octet_stream_returns_ids_le_u32_v1_payload() {
         .unwrap_or("")
         .starts_with("application/octet-stream"));
     assert_eq!(raw.header("x-talu-binary-format"), Some("ids_le_u32_v1"));
+    assert_eq!(raw.header("x-talu-impl"), Some("talu.encode"));
     assert_eq!(
         raw.header("x-talu-ids-count")
             .and_then(|v| v.parse::<usize>().ok()),
@@ -920,6 +1145,46 @@ fn encode_accept_octet_stream_returns_ids_le_u32_v1_payload() {
 
     let decoded_ids = decode_ids_binary_v1(&raw.body);
     assert_eq!(decoded_ids, expected_ids);
+}
+
+#[test]
+fn encode_accept_octet_stream_benchmark_includes_timing_headers() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/encode",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(
+            &serde_json::json!({
+                "tokenizer_id": tokenizer_id,
+                "sequence": "hello world",
+                "add_special_tokens": false,
+                "benchmark": true
+            })
+            .to_string(),
+        ),
+    );
+    assert_eq!(raw.status, 200, "body: {}", raw.body);
+    assert!(raw
+        .header("content-type")
+        .unwrap_or("")
+        .starts_with("application/octet-stream"));
+    assert_eq!(raw.header("x-talu-impl"), Some("talu.encode"));
+    assert!(raw
+        .header("x-talu-timing-encode-ms")
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some());
+    assert!(raw
+        .header("x-talu-timing-total-ms")
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some());
 }
 
 #[test]
@@ -982,9 +1247,56 @@ fn encode_batch_accept_octet_stream_returns_ids_batch_le_u32_v1_payload() {
             .and_then(|v| v.parse::<usize>().ok()),
         Some(expected_rows.len())
     );
+    let expected_total_ids: usize = expected_rows.iter().map(Vec::len).sum();
+    assert_eq!(
+        raw.header("x-talu-total-ids")
+            .and_then(|v| v.parse::<usize>().ok()),
+        Some(expected_total_ids)
+    );
+    assert_eq!(raw.header("x-talu-impl"), Some("talu.encode_batch"));
 
     let decoded_rows = decode_batch_ids_binary_v1(&raw.body);
     assert_eq!(decoded_rows, expected_rows);
+}
+
+#[test]
+fn encode_batch_accept_octet_stream_benchmark_includes_timing_headers() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/encode_batch",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(
+            &serde_json::json!({
+                "tokenizer_id": tokenizer_id,
+                "inputs": ["hello", "world"],
+                "add_special_tokens": false,
+                "benchmark": true
+            })
+            .to_string(),
+        ),
+    );
+    assert_eq!(raw.status, 200, "body: {}", raw.body);
+    assert!(raw
+        .header("content-type")
+        .unwrap_or("")
+        .starts_with("application/octet-stream"));
+    assert_eq!(raw.header("x-talu-impl"), Some("talu.encode_batch"));
+    assert!(raw
+        .header("x-talu-timing-encode-ms")
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some());
+    assert!(raw
+        .header("x-talu-timing-total-ms")
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some());
 }
 
 #[test]
@@ -1029,7 +1341,7 @@ fn encode_accept_octet_stream_rejects_non_ids_return_projection() {
         ],
         Some(&raw_body),
     );
-    assert_error(raw, 422, "unsupported_option");
+    assert_error(raw, 406, "binary_not_supported");
 }
 
 #[test]
@@ -1055,7 +1367,226 @@ fn encode_accept_octet_stream_rejects_include_hash_true() {
             .to_string(),
         ),
     );
-    assert_error(raw, 422, "unsupported_option");
+    assert_error(raw, 406, "binary_not_supported");
+}
+
+#[test]
+fn encode_accept_octet_stream_q_zero_falls_back_to_json() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/encode",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream;q=0, application/json"),
+        ],
+        Some(
+            &serde_json::json!({
+                "tokenizer_id": tokenizer_id,
+                "sequence": "hello world"
+            })
+            .to_string(),
+        ),
+    );
+    assert_eq!(raw.status, 200, "body: {}", raw.body);
+    assert!(raw
+        .header("content-type")
+        .unwrap_or("")
+        .starts_with("application/json"));
+    let body = raw.json();
+    assert!(body["encoding"]["ids"].is_array(), "body: {}", raw.body);
+}
+
+#[test]
+fn encode_batch_accept_octet_stream_rejects_non_ids_return_projection() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let invalid_projection = post_json(
+        ctx.addr(),
+        "/v1/tokenizer/encode_batch",
+        &serde_json::json!({
+            "tokenizer_id": tokenizer_id,
+            "inputs": ["hello", "world"],
+            "return": {
+                "ids": true,
+                "tokens": true
+            }
+        }),
+    );
+    assert_eq!(
+        invalid_projection.status, 200,
+        "body: {}",
+        invalid_projection.body
+    );
+
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/encode_batch",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(
+            &serde_json::json!({
+                "tokenizer_id": tokenizer_id,
+                "inputs": ["hello", "world"],
+                "return": {
+                    "ids": true,
+                    "tokens": true
+                }
+            })
+            .to_string(),
+        ),
+    );
+    assert_error(raw, 406, "binary_not_supported");
+}
+
+#[test]
+fn encode_batch_accept_octet_stream_rejects_include_hash_true() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let raw = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/encode_batch",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(
+            &serde_json::json!({
+                "tokenizer_id": tokenizer_id,
+                "inputs": ["hello", "world"],
+                "include_hash": true
+            })
+            .to_string(),
+        ),
+    );
+    assert_error(raw, 406, "binary_not_supported");
+}
+
+#[test]
+fn binary_accept_errors_remain_json_for_encode_and_decode() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+
+    let encode_err = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/encode",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(
+            &serde_json::json!({
+                "tokenizer_id": "tok_missing",
+                "sequence": "hello"
+            })
+            .to_string(),
+        ),
+    );
+    assert_error(encode_err, 404, "tokenizer_not_found");
+
+    let decode_err = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tokenizer/decode",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/octet-stream"),
+        ],
+        Some(
+            &serde_json::json!({
+                "tokenizer_id": "tok_missing",
+                "ids": [1, 2, 3]
+            })
+            .to_string(),
+        ),
+    );
+    assert_error(decode_err, 404, "tokenizer_not_found");
+}
+
+#[test]
+fn encode_batch_ids_only_json_shape_and_hashes_are_stable() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let created = create_instance(ctx.addr(), "talu");
+    let tokenizer_id = created["tokenizer_id"].as_str().unwrap();
+
+    let payload = serde_json::json!({
+        "tokenizer_id": tokenizer_id,
+        "inputs": ["hello world", "world hello"],
+        "add_special_tokens": false,
+        "return": {
+            "ids": true,
+            "tokens": false,
+            "type_ids": false,
+            "attention_mask": false,
+            "special_tokens_mask": false,
+            "offsets": false
+        }
+    });
+
+    let first = post_json(ctx.addr(), "/v1/tokenizer/encode_batch", &payload);
+    assert_eq!(first.status, 200, "body: {}", first.body);
+    let first_json = first.json();
+    let be = first_json["batch_encoding"]
+        .as_object()
+        .expect("batch_encoding");
+    assert!(be.contains_key("input_ids"));
+    assert!(!be.contains_key("attention_mask"));
+    assert!(!be.contains_key("type_ids"));
+    assert!(!be.contains_key("special_tokens_mask"));
+    for row in first_json["batch_encoding"]["encodings"]
+        .as_array()
+        .expect("encodings")
+    {
+        let row_obj = row.as_object().expect("row object");
+        assert!(row_obj.contains_key("ids"));
+        assert!(!row_obj.contains_key("tokens"));
+        assert!(!row_obj.contains_key("offsets"));
+    }
+
+    let ids_rows: Vec<Vec<u32>> = first_json["batch_encoding"]["input_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let expected_hashes: Vec<String> = ids_rows.iter().map(|row| sha256_ids(row)).collect();
+    let first_hashes: Vec<String> = first_json["sha256_ids_batch"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(first_hashes, expected_hashes);
+
+    let second = post_json(ctx.addr(), "/v1/tokenizer/encode_batch", &payload);
+    assert_eq!(second.status, 200, "body: {}", second.body);
+    let second_json = second.json();
+    assert_eq!(
+        first_json["batch_encoding"]["input_ids"],
+        second_json["batch_encoding"]["input_ids"]
+    );
+    assert_eq!(
+        first_json["sha256_ids_batch"],
+        second_json["sha256_ids_batch"]
+    );
 }
 
 #[test]

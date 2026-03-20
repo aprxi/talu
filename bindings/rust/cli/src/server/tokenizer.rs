@@ -328,6 +328,8 @@ struct DecodeRequest {
     ids: Vec<u32>,
     #[serde(default)]
     skip_special_tokens: Option<bool>,
+    #[serde(default)]
+    benchmark: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +338,8 @@ struct DecodeBatchRequest {
     ids_batch: Vec<Vec<u32>>,
     #[serde(default)]
     skip_special_tokens: Option<bool>,
+    #[serde(default)]
+    benchmark: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -871,11 +875,12 @@ pub async fn handle_encode(
     let include_timing = request.benchmark.unwrap_or(false);
     if wants_binary && request.include_hash == Some(true) {
         return json_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported_option",
-            "include_hash=true is not supported for binary tokenizer responses",
+            StatusCode::NOT_ACCEPTABLE,
+            "binary_not_supported",
+            "binary tokenizer responses do not support include_hash=true",
             Some(json!({
                 "field": "include_hash",
+                "expected": false,
                 "endpoint": "/v1/tokenizer/encode"
             })),
         );
@@ -1012,11 +1017,12 @@ pub async fn handle_encode_batch(
     let include_timing = request.benchmark.unwrap_or(false);
     if wants_binary && request.include_hash == Some(true) {
         return json_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported_option",
-            "include_hash=true is not supported for binary tokenizer responses",
+            StatusCode::NOT_ACCEPTABLE,
+            "binary_not_supported",
+            "binary tokenizer responses do not support include_hash=true",
             Some(json!({
                 "field": "include_hash",
+                "expected": false,
                 "endpoint": "/v1/tokenizer/encode_batch"
             })),
         );
@@ -1056,9 +1062,10 @@ pub async fn handle_encode_batch(
     };
 
     let encode_start = Instant::now();
-    let mut rows = Vec::with_capacity(inputs.len());
-    for text in &inputs {
-        let encoding = match encode_one(&mut instance, text, add_special_tokens, build_flags) {
+    let use_native_batch_ids_path =
+        instance.backend == TokenizerBackend::Talu && is_ids_only_return_fields(&return_fields);
+    let mut mutable_rows: Vec<MutableEncoding> = if use_native_batch_ids_path {
+        match encode_batch_ids_only_native(&mut instance, &inputs, add_special_tokens) {
             Ok(v) => v,
             Err(msg) => {
                 return json_error(
@@ -1068,11 +1075,25 @@ pub async fn handle_encode_batch(
                     Some(json!({ "endpoint": "/v1/tokenizer/encode_batch" })),
                 )
             }
-        };
-        rows.push(encoding);
-    }
-
-    let mut mutable_rows: Vec<MutableEncoding> = rows;
+        }
+    } else {
+        let mut rows = Vec::with_capacity(inputs.len());
+        for text in &inputs {
+            let encoding = match encode_one(&mut instance, text, add_special_tokens, build_flags) {
+                Ok(v) => v,
+                Err(msg) => {
+                    return json_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "encode_failed",
+                        &msg,
+                        Some(json!({ "endpoint": "/v1/tokenizer/encode_batch" })),
+                    )
+                }
+            };
+            rows.push(encoding);
+        }
+        rows
+    };
 
     if let Some(config) = effective_padding.as_ref() {
         apply_padding_to_batch(&mut mutable_rows, config);
@@ -1191,12 +1212,15 @@ pub async fn handle_decode(
     req: Request<Incoming>,
     _auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    let wants_binary = request_wants_binary_response(req.headers());
     let request: DecodeRequest = match parse_json_body(req).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
 
     let skip_special_tokens = request.skip_special_tokens.unwrap_or(false);
+    let include_timing = request.benchmark.unwrap_or(false);
+    let total_start = Instant::now();
 
     let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
         Some(handle) => handle,
@@ -1211,6 +1235,7 @@ pub async fn handle_decode(
     };
     let mut instance = instance_handle.lock().await;
 
+    let decode_start = Instant::now();
     let text = match decode_ids(&mut instance, &request.ids, skip_special_tokens) {
         Ok(v) => v,
         Err(msg) => {
@@ -1222,6 +1247,46 @@ pub async fn handle_decode(
             )
         }
     };
+    let decode_ms = elapsed_ms(decode_start);
+    let total_ms = elapsed_ms(total_start);
+
+    if wants_binary {
+        let body = match encode_text_utf8_binary_v1(&text) {
+            Ok(v) => v,
+            Err(msg) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    &msg,
+                    Some(json!({ "endpoint": "/v1/tokenizer/decode" })),
+                )
+            }
+        };
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/octet-stream")
+            .header("x-talu-binary-format", "text_utf8_v1")
+            .header("x-talu-bytes-len", text.len().to_string())
+            .header(
+                "x-talu-impl",
+                format!("{}.decode", instance.backend.as_str()),
+            );
+        if include_timing {
+            response = response
+                .header("x-talu-timing-decode-ms", format!("{decode_ms:.3}"))
+                .header("x-talu-timing-total-ms", format!("{total_ms:.3}"));
+        }
+        return response
+            .body(Full::new(Bytes::from(body)).boxed())
+            .unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "failed to build binary tokenizer decode response",
+                    Some(json!({ "endpoint": "/v1/tokenizer/decode" })),
+                )
+            });
+    }
 
     json_response(StatusCode::OK, &json!({ "text": text }))
 }
@@ -1231,12 +1296,15 @@ pub async fn handle_decode_batch(
     req: Request<Incoming>,
     _auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    let wants_binary = request_wants_binary_response(req.headers());
     let request: DecodeBatchRequest = match parse_json_body(req).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
 
     let skip_special_tokens = request.skip_special_tokens.unwrap_or(false);
+    let include_timing = request.benchmark.unwrap_or(false);
+    let total_start = Instant::now();
 
     let instance_handle = match find_tokenizer_instance(&state, &request.tokenizer_id).await {
         Some(handle) => handle,
@@ -1251,6 +1319,7 @@ pub async fn handle_decode_batch(
     };
     let mut instance = instance_handle.lock().await;
 
+    let decode_start = Instant::now();
     let mut texts = Vec::with_capacity(request.ids_batch.len());
     for ids in &request.ids_batch {
         let text = match decode_ids(&mut instance, ids, skip_special_tokens) {
@@ -1265,6 +1334,49 @@ pub async fn handle_decode_batch(
             }
         };
         texts.push(text);
+    }
+    let decode_ms = elapsed_ms(decode_start);
+    let total_ms = elapsed_ms(total_start);
+
+    if wants_binary {
+        let total_bytes = texts.iter().map(String::len).sum::<usize>();
+        let body = match encode_text_batch_utf8_binary_v1(&texts) {
+            Ok(v) => v,
+            Err(msg) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    &msg,
+                    Some(json!({ "endpoint": "/v1/tokenizer/decode_batch" })),
+                )
+            }
+        };
+
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/octet-stream")
+            .header("x-talu-binary-format", "text_batch_utf8_v1")
+            .header("x-talu-num-texts", texts.len().to_string())
+            .header("x-talu-total-bytes", total_bytes.to_string())
+            .header(
+                "x-talu-impl",
+                format!("{}.decode_batch", instance.backend.as_str()),
+            );
+        if include_timing {
+            response = response
+                .header("x-talu-timing-decode-ms", format!("{decode_ms:.3}"))
+                .header("x-talu-timing-total-ms", format!("{total_ms:.3}"));
+        }
+        return response
+            .body(Full::new(Bytes::from(body)).boxed())
+            .unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "failed to build binary tokenizer decode_batch response",
+                    Some(json!({ "endpoint": "/v1/tokenizer/decode_batch" })),
+                )
+            });
     }
 
     json_response(StatusCode::OK, &json!({ "texts": texts }))
@@ -2267,8 +2379,8 @@ pub async fn handle_capabilities(
                     "instances": ["create", "get", "delete"],
                     "encode": ["sequence", "is_pretokenized", "add_special_tokens", "return", "include_hash", "benchmark", "accept:application/octet-stream(ids_only)"],
                     "encode_batch": ["inputs", "is_pretokenized", "add_special_tokens", "padding", "return", "include_hash", "benchmark", "accept:application/octet-stream(ids_only)"],
-                    "decode": ["ids", "skip_special_tokens"],
-                    "decode_batch": ["ids_batch", "skip_special_tokens"],
+                    "decode": ["ids", "skip_special_tokens", "benchmark", "accept:application/octet-stream(text_utf8_v1)"],
+                    "decode_batch": ["ids_batch", "skip_special_tokens", "benchmark", "accept:application/octet-stream(text_batch_utf8_v1)"],
                     "vocab": true,
                     "vocab_size": true,
                     "token_to_id": true,
@@ -2283,8 +2395,8 @@ pub async fn handle_capabilities(
                     "instances": ["create", "get", "delete"],
                     "encode": ["sequence", "is_pretokenized", "add_special_tokens", "return", "include_hash", "benchmark", "accept:application/octet-stream(ids_only)"],
                     "encode_batch": ["inputs", "is_pretokenized", "add_special_tokens", "padding", "return", "include_hash", "benchmark", "accept:application/octet-stream(ids_only)"],
-                    "decode": ["ids", "skip_special_tokens"],
-                    "decode_batch": ["ids_batch", "skip_special_tokens"],
+                    "decode": ["ids", "skip_special_tokens", "benchmark", "accept:application/octet-stream(text_utf8_v1)"],
+                    "decode_batch": ["ids_batch", "skip_special_tokens", "benchmark", "accept:application/octet-stream(text_batch_utf8_v1)"],
                     "vocab": true,
                     "vocab_size": true,
                     "token_to_id": true,
@@ -2334,23 +2446,19 @@ fn validate_binary_ids_only_return_fields(
     return_fields: &ReturnFields,
     endpoint: &str,
 ) -> Result<(), Response<BoxBody>> {
-    let valid = return_fields.include_ids()
-        && !return_fields.include_tokens()
-        && !return_fields.include_type_ids()
-        && !return_fields.include_attention_mask()
-        && !return_fields.include_special_tokens_mask()
-        && !return_fields.include_offsets();
+    let valid = is_ids_only_return_fields(return_fields);
 
     if valid {
         return Ok(());
     }
 
     Err(json_error(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "unsupported_option",
-        "binary tokenizer responses only support return.ids=true with all other return fields false",
+        StatusCode::NOT_ACCEPTABLE,
+        "binary_not_supported",
+        "binary tokenizer responses only support ids-only return projection",
         Some(json!({
             "field": "return",
+            "reason": "ids_only_required_for_binary",
             "expected": {
                 "ids": true,
                 "tokens": false,
@@ -2362,6 +2470,15 @@ fn validate_binary_ids_only_return_fields(
             "endpoint": endpoint
         })),
     ))
+}
+
+fn is_ids_only_return_fields(return_fields: &ReturnFields) -> bool {
+    return_fields.include_ids()
+        && !return_fields.include_tokens()
+        && !return_fields.include_type_ids()
+        && !return_fields.include_attention_mask()
+        && !return_fields.include_special_tokens_mask()
+        && !return_fields.include_offsets()
 }
 
 fn request_wants_binary_response(headers: &hyper::HeaderMap) -> bool {
@@ -3076,6 +3193,93 @@ fn encode_one(
     })
 }
 
+fn encode_batch_ids_only_native(
+    instance: &mut TokenizerInstance,
+    texts: &[String],
+    add_special_tokens: bool,
+) -> Result<Vec<MutableEncoding>, String> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let options = build_encode_options(add_special_tokens, instance.truncation.as_ref());
+    let text_ptrs: Vec<*const u8> = texts.iter().map(|text| text.as_bytes().as_ptr()).collect();
+    let lengths: Vec<usize> = texts.iter().map(String::len).collect();
+
+    // SAFETY: tokenizer handle is valid while instance lock is held; text pointers
+    // and length arrays stay alive for the duration of the FFI call.
+    let result = unsafe {
+        talu_sys::talu_tokenizer_encode_batch(
+            instance.handle.as_ptr(),
+            text_ptrs.as_ptr(),
+            lengths.as_ptr(),
+            texts.len(),
+            &options,
+        )
+    };
+
+    if !result.error_msg.is_null() {
+        return Err(ffi_message(result.error_msg, "batch encode failed"));
+    }
+
+    let num_sequences = result.num_sequences;
+    if num_sequences != texts.len() {
+        // SAFETY: result was returned by talu_tokenizer_encode_batch.
+        unsafe {
+            talu_sys::talu_batch_encode_result_free(
+                result.ids,
+                result.offsets,
+                result.total_tokens,
+                result.num_sequences,
+            );
+        }
+        return Err("batch encode returned mismatched sequence count".to_string());
+    }
+
+    let ids = copy_u32_slice(result.ids, result.total_tokens);
+    let offsets = copy_usize_slice(result.offsets, num_sequences.saturating_add(1));
+
+    // SAFETY: result was returned by talu_tokenizer_encode_batch.
+    unsafe {
+        talu_sys::talu_batch_encode_result_free(
+            result.ids,
+            result.offsets,
+            result.total_tokens,
+            result.num_sequences,
+        );
+    }
+
+    if offsets.len() != num_sequences.saturating_add(1) {
+        return Err("batch encode returned invalid offsets".to_string());
+    }
+    if offsets.first().copied().unwrap_or(usize::MAX) != 0 {
+        return Err("batch encode returned invalid offsets".to_string());
+    }
+    if offsets.last().copied().unwrap_or(usize::MAX) != ids.len() {
+        return Err("batch encode returned invalid offsets".to_string());
+    }
+
+    let mut rows = Vec::with_capacity(num_sequences);
+    for pair in offsets.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        if start > end || end > ids.len() {
+            return Err("batch encode returned invalid offsets".to_string());
+        }
+
+        rows.push(MutableEncoding {
+            ids: ids[start..end].to_vec(),
+            tokens: Vec::new(),
+            type_ids: Vec::new(),
+            attention_mask: Vec::new(),
+            special_tokens_mask: Vec::new(),
+            offsets: Vec::new(),
+        });
+    }
+
+    Ok(rows)
+}
+
 fn decode_ids(
     instance: &mut TokenizerInstance,
     ids: &[u32],
@@ -3372,6 +3576,14 @@ fn copy_u32_slice(ptr: *mut u32, len: usize) -> Vec<u32> {
     unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
 }
 
+fn copy_usize_slice(ptr: *mut usize, len: usize) -> Vec<usize> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    // SAFETY: caller guarantees ptr points to len elements.
+    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+}
+
 fn copy_offsets_slice(ptr: *mut talu_sys::TokenOffset, len: usize) -> Vec<[u32; 2]> {
     if ptr.is_null() || len == 0 {
         return Vec::new();
@@ -3406,6 +3618,32 @@ fn encode_batch_ids_binary_v1(rows: &[MutableEncoding]) -> Vec<u8> {
         }
     }
     out
+}
+
+fn encode_text_utf8_binary_v1(text: &str) -> Result<Vec<u8>, String> {
+    let len_u32 = u32::try_from(text.len())
+        .map_err(|_| "decoded text too large for text_utf8_v1 framing".to_string())?;
+    let mut out = Vec::with_capacity(4 + text.len());
+    out.extend_from_slice(&len_u32.to_le_bytes());
+    out.extend_from_slice(text.as_bytes());
+    Ok(out)
+}
+
+fn encode_text_batch_utf8_binary_v1(texts: &[String]) -> Result<Vec<u8>, String> {
+    let num_texts_u32 = u32::try_from(texts.len())
+        .map_err(|_| "too many decode_batch rows for text_batch_utf8_v1 framing".to_string())?;
+    let total_bytes = texts.iter().map(String::len).sum::<usize>();
+    let mut out = Vec::with_capacity(4 + texts.len() * 4 + total_bytes);
+    out.extend_from_slice(&num_texts_u32.to_le_bytes());
+    for text in texts {
+        let len_u32 = u32::try_from(text.len())
+            .map_err(|_| "decoded text too large for text_batch_utf8_v1 framing".to_string())?;
+        out.extend_from_slice(&len_u32.to_le_bytes());
+    }
+    for text in texts {
+        out.extend_from_slice(text.as_bytes());
+    }
+    Ok(out)
 }
 
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
