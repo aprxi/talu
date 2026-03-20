@@ -123,6 +123,12 @@ pub const Selection = enum {
     cuda,
 };
 
+/// Execution topology for CUDA-capable backends.
+///
+/// - `single`: All layers on one GPU (default).
+/// - `pipeline2`: Two CUDA GPUs, layers split at `split_layer`.
+/// - `cpu_gpu`: CPU executes layers [0, split_layer), GPU executes [split_layer, N).
+/// - `cpu_gpu_gpu`: CPU [0, split_layer), GPU0 [split_layer, split_layer_stage2), GPU1 [split_layer_stage2, N).
 pub const CudaTopologyMode = enum {
     single,
     pipeline2,
@@ -130,6 +136,16 @@ pub const CudaTopologyMode = enum {
     cpu_gpu_gpu,
 };
 
+/// Configuration for multi-stage execution topologies.
+///
+/// `mode` selects the topology. `split_layer` sets the first stage boundary
+/// (layer index where stage 0 ends and stage 1 begins). For 3-stage modes,
+/// `split_layer_stage2` sets the second boundary. `stage_device_ordinals`
+/// identifies which CUDA devices to use for GPU stages.
+///
+/// When `split_layer` is null, the runtime uses a default heuristic (n/2 for
+/// 2-stage, n/3 for 3-stage). Explicit values are validated against the model's
+/// layer count at init.
 pub const CudaTopologyConfig = struct {
     mode: CudaTopologyMode = .single,
     stage_device_ordinals: [2]usize = .{ 0, 1 },
@@ -140,6 +156,7 @@ pub const CudaTopologyConfig = struct {
 /// Backend initialization options selected at startup/config layer.
 pub const InitOptions = struct {
     selection: Selection = .auto,
+    /// Multi-stage topology for CUDA backends. When null, single-GPU execution is used.
     cuda_topology: ?CudaTopologyConfig = null,
 };
 

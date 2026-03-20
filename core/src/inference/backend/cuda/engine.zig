@@ -443,6 +443,9 @@ pub const CudaBackend = struct {
         stage_device_ordinals: [2]usize = .{ 0, 1 },
         split_layer: ?usize = null,
         split_layer_stage2: ?usize = null,
+        /// Internal: restricts layer-dependent allocations to [start, end).
+        /// Used by topology init to create stage backends without full-model allocation.
+        init_layer_range: ?struct { start: usize, end: usize } = null,
     };
 
     pub fn init(
@@ -591,15 +594,24 @@ pub const CudaBackend = struct {
         for (backend.slot_state_bindings) |*binding| binding.* = .{};
         backend.argmax_index_dev = try backend.device.allocBuffer(@sizeOf(u32));
         errdefer backend.argmax_index_dev.deinit(&backend.device);
-        backend.block_runtime = try BlockRuntime.init(
+        // Determine layer range for this backend instance. Stage backends
+        // receive an explicit range; topology backends compute their own range
+        // from the split points so BlockRuntime only allocates the needed layers.
+        const total_layers = loaded.blocks.len;
+        const layer_range = try computeInitLayerRange(init_options, total_layers);
+        backend.block_runtime = try BlockRuntime.initRange(
             allocator,
             &backend.device,
             loaded,
             backend.max_seq_len,
             backend.kv_init_tokens,
+            layer_range.start,
+            layer_range.end,
             CudaBackend.layer_program_adapter_table,
         );
         errdefer backend.block_runtime.deinit(allocator, &backend.device);
+        // A10 invariant: BlockRuntime must hold exactly the requested layer count.
+        std.debug.assert(backend.block_runtime.blocks.len == layer_range.end - layer_range.start);
         engine_layer_program.assignCpuRuntimeRopeToAttentionFallbacks(&backend);
         try backend.initSlotKvStates();
         errdefer backend.deinitSlotKvStates();
@@ -802,14 +814,8 @@ pub const CudaBackend = struct {
             .single => {},
             .pipeline2 => {
                 backend.topology_mode = .pipeline2;
-                const total_layers = loaded.blocks.len;
-                if (total_layers < 2) return error.InvalidTopologyConfig;
-                const split = init_options.split_layer orelse total_layers / 2;
-                if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
+                const split = layer_range.split_layer;
                 backend.split_layer = split;
-
-                // Stage 0 (this backend): keep layers [0, split).
-                try backend.repartitionLayerRange(0, split);
 
                 // Stage 1: dedicated backend on device1 with layers [split, total_layers).
                 const stage1_ptr = try allocator.create(CudaBackend);
@@ -822,15 +828,13 @@ pub const CudaBackend = struct {
                         .device_ordinal = init_options.stage_device_ordinals[1],
                         .topology_mode = .single,
                         .stage_device_ordinals = init_options.stage_device_ordinals,
+                        .init_layer_range = .{ .start = split, .end = total_layers },
                     },
                 );
                 errdefer {
                     stage1_ptr.deinit();
                     allocator.destroy(stage1_ptr);
                 }
-                try stage1_ptr.repartitionLayerRange(split, total_layers);
-                stage1_ptr.topology_mode = .single;
-                stage1_ptr.split_layer = 0;
                 backend.pipeline_backend1 = stage1_ptr;
 
                 const boundary = try backend_root.pipeline.negotiateBoundaryContract(.{
@@ -865,6 +869,10 @@ pub const CudaBackend = struct {
                         .staging_mib = bytesToMiB(transfer_bytes),
                     });
                 }
+                errdefer if (backend.pipeline_host_staging) |buf| {
+                    allocator.free(buf);
+                    backend.pipeline_host_staging = null;
+                };
 
                 const stage0_budget = backend.computeDeviceMemoryBudget();
                 const stage1_budget = stage1_ptr.computeDeviceMemoryBudget();
@@ -891,13 +899,11 @@ pub const CudaBackend = struct {
                     .stage0_strict_memory = @as(u8, @intFromBool(backend.strict_memory_mode)),
                     .stage1_strict_memory = @as(u8, @intFromBool(stage1_ptr.strict_memory_mode)),
                 });
+
             },
             .cpu_gpu => {
                 backend.topology_mode = .cpu_gpu;
-                const total_layers = loaded.blocks.len;
-                if (total_layers < 2) return error.InvalidTopologyConfig;
-                const split = init_options.split_layer orelse total_layers / 2;
-                if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
+                const split = layer_range.split_layer;
                 backend.split_layer = split;
 
                 // CPU stage 0 executes layers [0, split).
@@ -929,11 +935,15 @@ pub const CudaBackend = struct {
                     return error.InvalidTopologyConfig;
                 }
 
-                // CUDA stage 1 (this backend) executes layers [split, total_layers).
-                try backend.repartitionLayerRange(split, total_layers);
+                // CUDA stage 1 (this backend) already initialized with layers [split, total_layers)
+                // via init_layer_range computed above.
 
                 const transfer_bytes = try backend.pipelineActivationByteCount();
                 backend.pipeline_host_staging = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer_bytes);
+                errdefer {
+                    allocator.free(backend.pipeline_host_staging.?);
+                    backend.pipeline_host_staging = null;
+                }
                 backend.pipeline_transfer_mode = .host_staged;
 
                 const stage1_budget = backend.computeDeviceMemoryBudget();
@@ -954,19 +964,12 @@ pub const CudaBackend = struct {
                     .gpu_slot_state_mib = bytesToMiB(stage1_budget.slotStateBytes()),
                     .gpu_workspace_mib = bytesToMiB(stage1_budget.workspace_bytes),
                 });
+
             },
             .cpu_gpu_gpu => {
                 backend.topology_mode = .cpu_gpu_gpu;
-                const total_layers = loaded.blocks.len;
-                if (total_layers < 3) return error.InvalidTopologyConfig;
-
-                const split_default = @max(@as(usize, 1), total_layers / 3);
-                const split = init_options.split_layer orelse split_default;
-                if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
-
-                const split_stage2_default = split + @max(@as(usize, 1), (total_layers - split) / 2);
-                const split_stage2 = init_options.split_layer_stage2 orelse split_stage2_default;
-                if (split_stage2 <= split or split_stage2 >= total_layers) return error.InvalidTopologyConfig;
+                const split = layer_range.split_layer;
+                const split_stage2 = layer_range.split_layer_stage2;
 
                 backend.split_layer = split;
                 backend.split_layer_stage2 = split_stage2;
@@ -997,20 +1000,17 @@ pub const CudaBackend = struct {
                         .device_ordinal = init_options.stage_device_ordinals[0],
                         .topology_mode = .single,
                         .stage_device_ordinals = init_options.stage_device_ordinals,
+                        .init_layer_range = .{ .start = split, .end = split_stage2 },
                     },
                 );
                 errdefer {
                     stage1_ptr.deinit();
                     allocator.destroy(stage1_ptr);
                 }
-                try stage1_ptr.repartitionLayerRange(split, split_stage2);
-                stage1_ptr.topology_mode = .single;
-                stage1_ptr.split_layer = 0;
-                stage1_ptr.split_layer_stage2 = 0;
                 backend.pipeline_backend1 = stage1_ptr;
 
-                // GPU stage 2 (this backend) executes layers [split_stage2, total_layers).
-                try backend.repartitionLayerRange(split_stage2, total_layers);
+                // GPU stage 2 (this backend) already initialized with layers [split_stage2, total_layers)
+                // via init_layer_range computed above.
 
                 // Boundary 0->1 (CPU->GPU1) contract.
                 const boundary_01 = try backend_root.pipeline.negotiateBoundaryContract(.{
@@ -1044,7 +1044,15 @@ pub const CudaBackend = struct {
 
                 const transfer01_bytes = try backend.pipelineActivationByteCount();
                 backend.pipeline_host_staging = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer01_bytes);
+                errdefer {
+                    allocator.free(backend.pipeline_host_staging.?);
+                    backend.pipeline_host_staging = null;
+                }
                 backend.pipeline_host_staging_stage12 = try allocator.alignedAlloc(u8, .fromByteUnits(4096), transfer01_bytes);
+                errdefer {
+                    allocator.free(backend.pipeline_host_staging_stage12.?);
+                    backend.pipeline_host_staging_stage12 = null;
+                }
                 backend.pipeline_transfer_mode = .host_staged;
 
                 const stage1_budget = stage1_ptr.computeDeviceMemoryBudget();
@@ -1071,6 +1079,7 @@ pub const CudaBackend = struct {
                     .gpu_stage1_slot_state_mib = bytesToMiB(stage1_budget.slotStateBytes()),
                     .gpu_stage2_slot_state_mib = bytesToMiB(stage2_budget.slotStateBytes()),
                 });
+
             },
         }
 
@@ -1171,70 +1180,57 @@ pub const CudaBackend = struct {
         return backend;
     }
 
-    fn repartitionLayerRange(self: *CudaBackend, layer_start: usize, layer_end: usize) !void {
-        if (layer_end < layer_start or layer_end > self.loaded.blocks.len) return error.InvalidArgument;
+    /// Resolved layer range and split points for a backend instance.
+    pub const LayerRangeResult = struct {
+        /// Layer range for this backend instance: [start, end).
+        start: usize,
+        end: usize,
+        /// Resolved first split point. Zero for single topology or explicit range override.
+        split_layer: usize = 0,
+        /// Resolved second split point. Non-zero only for cpu_gpu_gpu.
+        split_layer_stage2: usize = 0,
+    };
 
-        self.block_runtime.deinit(self.allocator, &self.device);
-        self.block_runtime = try BlockRuntime.initRange(
-            self.allocator,
-            &self.device,
-            self.loaded,
-            self.max_seq_len,
-            self.kv_init_tokens,
-            layer_start,
-            layer_end,
-            CudaBackend.layer_program_adapter_table,
-        );
-        engine_layer_program.assignCpuRuntimeRopeToAttentionFallbacks(self);
-
-        const max_dff = self.block_runtime.maxDff();
-        const max_attn = self.block_runtime.maxAttn();
-        const max_kv = self.block_runtime.maxKv();
-        const max_gdelta_proj = self.block_runtime.maxGatedDeltaProj();
-        const max_shortconv_dim = self.block_runtime.maxShortConvDim();
-        const repartitioned_runtime_buffers = try RuntimeBuffers.init(
-            self.allocator,
-            &self.device,
-            self.loaded,
-            max_dff,
-            max_attn,
-            max_kv,
-            max_gdelta_proj,
-            max_shortconv_dim,
-            self.max_seq_len,
-            self.n_heads,
-            self.head_dim,
-        );
-        self.runtime_buffers.deinit(self.allocator, &self.device);
-        self.runtime_buffers = repartitioned_runtime_buffers;
-        if (self.attn_scores_workspace_dev) |*buf| {
-            buf.deinit(&self.device);
-            self.attn_scores_workspace_dev = null;
+    /// Compute the layer range and resolved split points from topology mode,
+    /// split points, and optional explicit range override.
+    /// Pure validation — no GPU or allocator dependencies.
+    pub fn computeInitLayerRange(
+        opts: InitOptions,
+        total_layers: usize,
+    ) error{InvalidTopologyConfig}!LayerRangeResult {
+        if (opts.init_layer_range) |r| {
+            // init_layer_range is internal: used by topology init to create stage
+            // backends which are always .single. Reject staged modes to prevent
+            // the topology switch from consuming zero-valued split metadata.
+            if (opts.topology_mode != .single) return error.InvalidTopologyConfig;
+            if (r.start >= r.end or r.end > total_layers) return error.InvalidTopologyConfig;
+            return .{ .start = r.start, .end = r.end };
         }
-        if (self.attn_u16_workspace_dev) |*buf| {
-            buf.deinit(&self.device);
-            self.attn_u16_workspace_dev = null;
-        }
-
-        self.deinitSlotKvStates();
-        try self.initSlotKvStates();
-        self.active_kv_slot = 0;
-
-        self.deinitLayerProgramSlotBuffers();
-        try self.initLayerProgramSlotBuffers();
-
-        self.state_descriptor_count = 0;
-        for (self.block_runtime.blocks) |*layer| {
-            if (layer.compiled_plan) |*compiled_plan| {
-                try runtime_contract.appendUniquePlanStateDescriptors(
-                    self.state_descriptors_storage[0..],
-                    &self.state_descriptor_count,
-                    &compiled_plan.plan,
-                );
-            }
-        }
-
-        try self.preallocateFixedAllocBuffers();
+        return switch (opts.topology_mode) {
+            .single => .{ .start = 0, .end = total_layers },
+            .pipeline2 => {
+                if (total_layers < 2) return error.InvalidTopologyConfig;
+                const split = opts.split_layer orelse total_layers / 2;
+                if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
+                return .{ .start = 0, .end = split, .split_layer = split };
+            },
+            .cpu_gpu => {
+                if (total_layers < 2) return error.InvalidTopologyConfig;
+                const split = opts.split_layer orelse total_layers / 2;
+                if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
+                return .{ .start = split, .end = total_layers, .split_layer = split };
+            },
+            .cpu_gpu_gpu => {
+                if (total_layers < 3) return error.InvalidTopologyConfig;
+                const split_default = @max(@as(usize, 1), total_layers / 3);
+                const split = opts.split_layer orelse split_default;
+                if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
+                const split_stage2_default = split + @max(@as(usize, 1), (total_layers - split) / 2);
+                const split_stage2 = opts.split_layer_stage2 orelse split_stage2_default;
+                if (split_stage2 <= split or split_stage2 >= total_layers) return error.InvalidTopologyConfig;
+                return .{ .start = split_stage2, .end = total_layers, .split_layer = split, .split_layer_stage2 = split_stage2 };
+            },
+        };
     }
 
     pub fn deinit(self: *CudaBackend) void {

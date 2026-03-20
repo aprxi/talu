@@ -215,6 +215,7 @@ Mixed-backend staged topologies (`cpu+gpu`, `gpu+gpu`, `cpu+gpu+gpu` roadmap):
 5. Inter-stage KV/state migration over PCIe MUST NOT occur in v1 staged routes.
 6. Slot lifecycle operations (alloc, bind, reset, unbind, free) MUST fan out deterministically to every stage participating in the topology.
 7. Cross-stage runtime-state pointer aliasing MUST NOT occur; stages requiring runtime payload rebinding MUST synthesize stage-local wrapper blocks.
+8. CUDA backend init for staged topologies MUST allocate layer-dependent GPU resources (BlockRuntime, KV cache, runtime buffers) only for the stage's assigned layer range via `init_layer_range`; full-model GPU allocation followed by repartition MUST NOT occur. CPU stages are exempt (no GPU memory pressure).
 
 ## Vision Staged Plan Contract
 Multimodal-capable models MUST represent staged plans through `ModelPlans`:
@@ -356,6 +357,13 @@ Every rule entry uses this REQUIRED schema:
 3. Enforcement point: `build`, `test`, `review`
 4. Typed failure mode: gate failure for missing atomic updates
 5. Verification: `zig build release -Drelease`, `make`
+
+### A10 Topology Configuration + Validation
+1. Rule ID: `A10`
+2. Normative statement: topology mode selection and split-point configuration MUST be validated at init before layer-dependent allocation starts; each CUDA backend instance MUST initialize with its assigned layer range via `init_layer_range` to avoid temporary full-model GPU allocation; `init_layer_range` values MUST be validated at the `CudaBackend.init` boundary with `error.InvalidTopologyConfig` on failure; stage count, device ordinals, and split-layer ranges MUST be consistent with the selected `CudaTopologyMode`. CPU stages are exempt from range-scoped init (no GPU memory pressure).
+3. Enforcement point: `init`, `load`
+4. Typed failure mode: `error.OutOfMemory` for fit check failure; `error.InvalidTopologyConfig` for inconsistent split/device/mode settings
+5. Verification: `zig build test-inference -Drelease`
 
 ## Validation and Change Discipline
 1. Validation gates MUST follow repository policy in `AGENTS.md` and `core/POLICY.md`.
