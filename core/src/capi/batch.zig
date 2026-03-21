@@ -194,12 +194,11 @@ pub export fn talu_batch_step(
         return 0;
     }));
 
-    // Allocate temporary internal event buffer.
-    var internal_events = allocator.alloc(batch_mod.BatchEvent, max_events) catch {
-        capi_error.setErrorWithCode(.out_of_memory, "event buffer allocation failed", .{});
-        return 0;
-    };
-    defer allocator.free(internal_events);
+    // Stack-allocated internal event buffer — avoids heap alloc/free per step.
+    const max_step_events = 64;
+    var internal_events_buf: [max_step_events]batch_mod.BatchEvent = undefined;
+    const effective_max = @min(max_events, max_step_events);
+    var internal_events = internal_events_buf[0..effective_max];
 
     const count = wrapper.step(internal_events) catch |err| {
         capi_error.setError(err, "batch step failed", .{});
@@ -352,4 +351,50 @@ pub export fn talu_batch_active_count(
     capi_error.clearError();
     const wrapper: *const BatchWrapper = @ptrCast(@alignCast(handle orelse return 0));
     return wrapper.activeCount();
+}
+
+// =============================================================================
+// Single-Request Fast Path
+// =============================================================================
+
+/// Run a tight decode loop, calling back to the caller for each batch of
+/// events. Eliminates per-token FFI round-trip overhead.
+///
+/// The callback signature is: fn(events: [*]const CEvent, count: usize, userdata: ?*anyopaque) void
+/// Pass the callback as an opaque pointer; it is cast internally.
+///
+/// The loop runs until all requests complete, pending_flag is set
+/// (caller has new commands to process), or an error occurs.
+///
+/// Returns 0 on success, -1 on error (check talu_last_error).
+pub export fn talu_batch_run_loop(
+    handle: ?*anyopaque,
+    pending_flag: ?*anyopaque,
+    callback: ?*anyopaque,
+    callback_data: ?*anyopaque,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const wrapper: *BatchWrapper = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "batch handle is null", .{});
+        return -1;
+    }));
+
+    const cb_ptr = callback orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "callback is null", .{});
+        return -1;
+    };
+
+    // Cast opaque pointer to the expected function pointer type.
+    const RunLoopCallback = *const fn ([*]const BatchWrapper.CEvent, usize, ?*anyopaque) callconv(.c) void;
+    const cb: RunLoopCallback = @ptrCast(cb_ptr);
+
+    const pending: ?*const std.atomic.Value(bool) = if (pending_flag) |pf| @ptrCast(@alignCast(pf)) else null;
+
+    wrapper.runLoop(pending, cb, callback_data) catch |err| {
+        capi_error.setError(err, "batch run_loop failed", .{});
+        return -1;
+    };
+
+    return 0;
 }

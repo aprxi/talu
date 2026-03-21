@@ -1407,15 +1407,6 @@ impl Default for CDocumentList {
     }
 }
 
-/// Source: core/src/capi/documents_impl.zig
-#[repr(C)]
-pub struct CDocumentFullList {
-    pub items: *mut CDocumentRecord,
-    pub count: usize,
-    pub has_more: bool,
-    pub _arena: *mut c_void,
-}
-
 /// Source: core/src/capi/xray.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -2417,6 +2408,43 @@ impl Default for CColumnFilter {
     }
 }
 
+/// Source: core/src/router/batch.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CEvent {
+    pub request_id: u64,
+    pub event_type: u8,
+    pub item_type: u8,
+    pub content_type: u8,
+    pub is_final: u8,
+    pub _pad: [u8; 4],
+    pub text_ptr: *const u8,
+    pub text_len: usize,
+    pub token_id: u32,
+    pub _pad2: [u8; 4],
+    pub tokens_generated: usize,
+    pub timestamp_ns: i64,
+}
+
+impl Default for CEvent {
+    fn default() -> Self {
+        Self {
+            request_id: 0,
+            event_type: 0,
+            item_type: 0,
+            content_type: 0,
+            is_final: 0,
+            _pad: [0; 4],
+            text_ptr: std::ptr::null(),
+            text_len: 0,
+            token_id: 0,
+            _pad2: [0; 4],
+            tokens_generated: 0,
+            timestamp_ns: 0,
+        }
+    }
+}
+
 /// Source: core/src/capi/tokenizer.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3112,14 +3140,14 @@ impl Default for CGenerateConfig {
         Self {
             max_tokens: 0,
             max_completion_tokens: 0,
-            max_reasoning_tokens: usize::MAX,
-            temperature: -1.0,
+            max_reasoning_tokens: usize::MAX, // sentinel: maxInt = unset (matches Zig CGenerateConfig default)
+            temperature: 0.0,
             top_k: 0,
-            top_p: -1.0,
-            min_p: -1.0,
-            repetition_penalty: -1.0,
-            presence_penalty: -1.0,
-            frequency_penalty: -1.0,
+            top_p: 0.0,
+            min_p: 0.0,
+            repetition_penalty: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             stop_sequences: std::ptr::null(),
             stop_sequence_count: 0,
             logit_bias: std::ptr::null(),
@@ -4054,6 +4082,27 @@ impl Default for CRemoteModelListResult {
     }
 }
 
+/// Source: core/src/capi/documents_impl.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CDocumentFullList {
+    pub items: *mut CDocumentRecord,
+    pub count: usize,
+    pub has_more: bool,
+    pub _arena: *mut c_void,
+}
+
+impl Default for CDocumentFullList {
+    fn default() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            count: 0,
+            has_more: false,
+            _arena: std::ptr::null_mut(),
+        }
+    }
+}
+
 /// Source: core/src/capi/tokenizer.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -4214,13 +4263,13 @@ pub struct EffectiveGenConfigRequest {
 impl Default for EffectiveGenConfigRequest {
     fn default() -> Self {
         Self {
-            temperature: -1.0,
+            temperature: 0.0,
             top_k: 0,
-            top_p: -1.0,
-            min_p: -1.0,
-            repetition_penalty: -1.0,
-            presence_penalty: -1.0,
-            frequency_penalty: -1.0,
+            top_p: 0.0,
+            min_p: 0.0,
+            repetition_penalty: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: 0,
             max_tokens: 0,
         }
@@ -4593,6 +4642,8 @@ extern "C" {
     // core/src/capi/batch.zig
     pub fn talu_batch_result_free(result: *mut CBatchResult);
     // core/src/capi/batch.zig
+    pub fn talu_batch_run_loop(handle: *mut c_void, pending_flag: *mut c_void, callback: *mut c_void, callback_data: *mut c_void) -> c_int;
+    // core/src/capi/batch.zig
     pub fn talu_batch_step(handle: *mut c_void, events_out: *mut CBatchEvent, max_events: usize) -> usize;
     // core/src/capi/batch.zig
     pub fn talu_batch_submit(handle: *mut c_void, chat_handle: *mut c_void, config: *const CGenerateConfig) -> u64;
@@ -4791,9 +4842,9 @@ extern "C" {
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_create(db_path: *const c_char, doc_id: *const c_char, doc_type: *const c_char, title: *const c_char, doc_json: *const c_char, tags_text: *const c_char, parent_id: *const c_char, marker: *const c_char, group_id: *const c_char, owner_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
-    pub fn talu_db_docs_create_ex(db_path: *const c_char, in_doc: *const CDocumentRecord) -> c_int;
-    // core/src/capi/db/table.zig
     pub fn talu_db_docs_create_delta(db_path: *const c_char, base_doc_id: *const c_char, new_doc_id: *const c_char, delta_json: *const c_char, title: *const c_char, tags_text: *const c_char, marker: *const c_char) -> c_int;
+    // core/src/capi/db/table.zig
+    pub fn talu_db_docs_create_ex(db_path: *const c_char, in_doc: *const CDocumentRecord) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_delete(db_path: *const c_char, doc_id: *const c_char) -> c_int;
     // core/src/capi/db/table.zig
@@ -4803,11 +4854,11 @@ extern "C" {
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_free_delta_chain(chain: *mut CDeltaChain);
     // core/src/capi/db/table.zig
+    pub fn talu_db_docs_free_full_list(list: *mut CDocumentFullList);
+    // core/src/capi/db/table.zig
     pub fn talu_db_docs_free_json(ptr: *mut u8, len: usize);
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_free_list(list: *mut CDocumentList);
-    // core/src/capi/db/table.zig
-    pub fn talu_db_docs_free_full_list(list: *mut CDocumentFullList);
     // core/src/capi/db/table.zig
     pub fn talu_db_docs_free_search_results(list: *mut CSearchResultList);
     // core/src/capi/db/table.zig

@@ -242,6 +242,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         /// Non-persistent descriptors: request_scoped + step_scoped (subset of state_descriptors).
         non_persistent_descs: []runtime_contract.StateDescriptor,
 
+        /// Persistent buffer for step() token events. Avoids heap alloc/free per step.
+        /// Cleared at the start of each step; valid until the next step() call.
+        step_events: std.ArrayList(TokenEvent) = .{},
+
         const StateBlockStorage = struct {
             bytes: []align(64) u8,
         };
@@ -389,6 +393,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             self.allocator.free(self.decode_results);
             self.allocator.free(self.decode_requests);
             self.allocator.free(self.logits_buffer);
+            self.step_events.deinit(self.allocator);
             self.sampler.deinit();
         }
 
@@ -714,7 +719,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         /// 2. Batches decode for all generating requests
         /// 3. Samples next tokens
         /// 4. Returns token events for this step
-        pub fn step(self: *Self) ![]TokenEvent {
+        ///
+        /// The returned slice is a borrowed view into an internal buffer.
+        /// It is valid until the next step() call. Caller must NOT free it.
+        pub fn step(self: *Self) ![]const TokenEvent {
             // Snapshot completed queue length so we can detect requests that
             // finish during prefill (e.g. max_tokens ≤ 1 or first token is EOS).
             const completed_before = self.completed_queue.items.len;
@@ -757,6 +765,46 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 return &.{};
             }
 
+            // Fast path: when there is exactly one generating request and the
+            // backend supports top-K candidate decode, use it instead of the
+            // general decodeBatch + full-vocab sampleToken path. This matches
+            // the route selection in generateSync() for parity with the non-batch
+            // iterator path, avoiding ~13% overhead from full-vocab sampling.
+            if (decode_batch_size == 1) {
+                const use_topk = comptime blk: {
+                    if (!@hasDecl(BackendType, "decodeTopKCandidates")) break :blk false;
+                    if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKDecodeRoute")) break :blk false;
+                    break :blk true;
+                };
+                if (use_topk) {
+                    // Find the single generating request.
+                    const req = self.decode_requests[0];
+                    var topk_request: ?*Request = null;
+                    for (self.active_requests.items) |aid| {
+                        const re = self.requests.get(aid) orelse continue;
+                        if (re.slot_index == req.slot_index) {
+                            topk_request = re;
+                            break;
+                        }
+                    }
+                    if (topk_request) |request_entry| {
+                        if (request_entry.grammar_sampler == null and
+                            !request_entry.capture_final_logits and
+                            request_entry.sampling_config.top_k <= 256 and
+                            self.backend.supportsSchedulerBackendTopKDecodeRoute(&request_entry.sampling_config))
+                        {
+                            return try self.stepTopKCandidate(
+                                request_entry,
+                                req.slot_index,
+                                req.token,
+                                completed_before,
+                                prefill_completed,
+                            );
+                        }
+                    }
+                }
+            }
+
             // Reset step-scoped state for all generating requests before decode
             for (self.active_requests.items) |active_id| {
                 const req = self.requests.get(active_id) orelse continue;
@@ -778,9 +826,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 request_entry.decode_ns += decode_step_ns;
             }
 
-            // Sample next tokens and build events
-            var token_events: std.ArrayList(TokenEvent) = .{};
-            defer token_events.deinit(self.allocator);
+            // Sample next tokens and build events (reuse persistent buffer).
+            self.step_events.clearRetainingCapacity();
 
             for (self.decode_results[0..decode_batch_size]) |result| {
                 // Find request for this slot
@@ -811,9 +858,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 // Sample next token using optimized sampler (SIMD, pre-allocated workspace)
                 var sample_cfg = request_entry.sampling_config;
                 sample_cfg.context_tokens = request_entry.generated_tokens.items;
-
-
-
                 var next_token = self.sampleToken(
                     result.logits,
                     sample_cfg,
@@ -881,18 +925,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 try request_entry.generated_tokens.append(self.allocator, next_token);
                 request_entry.token_position += 1;
 
-                // Log first few decode tokens for diagnostics.
-                if (request_entry.generated_tokens.items.len <= 10) {
-                    var tok_buf: [16]u8 = undefined;
-                    const tok_str = std.fmt.bufPrint(&tok_buf, "{d}", .{next_token}) catch "?";
-                    var step_buf: [16]u8 = undefined;
-                    const step_str = std.fmt.bufPrint(&step_buf, "{d}", .{request_entry.generated_tokens.items.len}) catch "?";
-                    log.info("scheduler", "decode_token", .{
-                        .step = step_str,
-                        .token = tok_str,
-                    });
-                }
-
                 // Check for EOS token
                 var finish_reason: FinishReason = .in_progress;
                 if (grammarIsComplete(request_entry.grammar_sampler)) {
@@ -940,7 +972,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }
 
                 // Add event
-                try token_events.append(self.allocator, .{
+                try self.step_events.append(self.allocator, .{
                     .request_id = request_entry.id,
                     .token = next_token,
                     .is_final = is_final_token,
@@ -959,13 +991,153 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Include events for requests completed during prefill (mixed case:
             // some requests finished on first token while others are still generating).
             if (prefill_completed > 0) {
-                try self.appendPrefillCompletedEvents(&token_events, completed_before);
+                try self.appendPrefillCompletedEvents(&self.step_events, completed_before);
             }
 
             // Try to activate pending requests (slots may have freed)
             try self.activatePending();
 
-            return try token_events.toOwnedSlice(self.allocator);
+            return self.step_events.items;
+        }
+
+        /// Fast path for step() when there is exactly one generating request
+        /// and the sampling config is eligible for the top-K candidate route.
+        ///
+        /// Uses decodeTopKCandidates + sampleTopKCandidateToken instead of
+        /// decodeBatch + sampleToken, avoiding full-vocab softmax/quickselect
+        /// overhead (~1.2ms per token on 151K vocab).
+        fn stepTopKCandidate(
+            self: *Self,
+            request_entry: *Request,
+            slot_index: usize,
+            last_token: u32,
+            completed_before: usize,
+            prefill_completed: usize,
+        ) ![]const TokenEvent {
+            const top_k = request_entry.sampling_config.top_k;
+
+            // Stack-allocated candidate buffers (2KB total for K ≤ 256).
+            var candidate_logits_buf: [256]f32 = undefined;
+            var candidate_ids_buf: [256]u32 = undefined;
+
+            // Decode: forward pass + bulk logits download + CPU top-K extraction.
+            var decode_timer = std.time.Timer.start() catch unreachable;
+            const candidate_count = try self.backend.decodeTopKCandidates(
+                slot_index,
+                last_token,
+                top_k,
+                candidate_logits_buf[0..top_k],
+                candidate_ids_buf[0..top_k],
+            );
+            request_entry.decode_ns += decode_timer.read();
+
+            // Sample from the K candidates (penalties applied to K entries only).
+            var sample_cfg = request_entry.sampling_config;
+            sample_cfg.context_tokens = request_entry.generated_tokens.items;
+            var next_token = try self.sampleTopKCandidateToken(
+                candidate_logits_buf[0..candidate_count],
+                candidate_ids_buf[0..candidate_count],
+                sample_cfg,
+            );
+
+            // --- Post-processing (identical to step() Phase 6-8) ---
+
+            // Thinking budget enforcement.
+            if (request_entry.in_thinking) {
+                if (request_entry.thinking_inject_pos > 0) {
+                    next_token = request_entry.thinking_end_tokens[request_entry.thinking_inject_pos];
+                    request_entry.thinking_inject_pos += 1;
+                    if (request_entry.thinking_inject_pos >= request_entry.thinking_end_tokens.len) {
+                        request_entry.in_thinking = false;
+                        request_entry.generating_answer = true;
+                    }
+                } else if (request_entry.thinking_token_count >= request_entry.max_thinking_tokens) {
+                    next_token = request_entry.thinking_end_tokens[0];
+                    request_entry.thinking_inject_pos = 1;
+                    if (request_entry.thinking_end_tokens.len == 1) {
+                        request_entry.in_thinking = false;
+                        request_entry.generating_answer = true;
+                    }
+                } else {
+                    request_entry.thinking_token_count += 1;
+                    if (request_entry.thinking_end_tokens.len > 0 and
+                        next_token == request_entry.thinking_end_tokens[0])
+                    {
+                        request_entry.in_thinking = false;
+                        request_entry.generating_answer = true;
+                    }
+                }
+            } else if (!request_entry.generating_answer) {
+                request_entry.generating_answer = true;
+            }
+
+            // Append token.
+            try request_entry.generated_tokens.append(self.allocator, next_token);
+            request_entry.token_position += 1;
+
+            // Check EOS.
+            var finish_reason: FinishReason = .in_progress;
+            for (request_entry.eos_token_ids) |eos_id| {
+                if (next_token == eos_id) {
+                    finish_reason = .eos_token;
+                    break;
+                }
+            }
+
+            // Check stop sequences.
+            if (finish_reason == .in_progress and request_entry.stop_sequences.len > 0) {
+                const stop_len = checkStopSequence(request_entry.generated_tokens.items, request_entry.stop_sequences);
+                if (stop_len > 0) {
+                    finish_reason = .stop_sequence;
+                    request_entry.generated_tokens.shrinkRetainingCapacity(request_entry.generated_tokens.items.len - stop_len);
+                }
+            }
+
+            // Completion token limit enforcement (answer tokens only).
+            if (finish_reason == .in_progress and request_entry.generating_answer and
+                request_entry.max_completion_tokens_limit > 0)
+            {
+                request_entry.completion_token_count += 1;
+                if (request_entry.completion_token_count >= request_entry.max_completion_tokens_limit) {
+                    finish_reason = .length;
+                }
+            }
+
+            // Max tokens.
+            if (finish_reason == .in_progress and request_entry.generated_tokens.items.len >= request_entry.max_tokens) {
+                finish_reason = .length;
+            }
+
+            const is_final = finish_reason != .in_progress;
+
+            // Callback.
+            if (request_entry.callback) |cb| {
+                if (finish_reason != .stop_sequence) {
+                    cb(request_entry.id, next_token, is_final, request_entry.callback_data);
+                }
+            }
+
+            // Build event.
+            self.step_events.clearRetainingCapacity();
+            try self.step_events.append(self.allocator, .{
+                .request_id = request_entry.id,
+                .token = next_token,
+                .is_final = is_final,
+                .slot_index = slot_index,
+            });
+
+            // Handle completion.
+            if (is_final) {
+                self.completeRequest(request_entry, finish_reason);
+            }
+
+            // Include events for requests completed during prefill.
+            if (prefill_completed > 0) {
+                try self.appendPrefillCompletedEvents(&self.step_events, completed_before);
+            }
+
+            try self.activatePending();
+            return self.step_events.items;
         }
 
         /// Pop completed requests from the queue.
@@ -1085,7 +1257,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Run until this request completes
             while (self.hasActive()) {
                 const events = try self.step();
-                defer self.allocator.free(events);
 
                 // Check if our request completed
                 for (events) |event| {
@@ -1817,59 +1988,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     request_entry.slot_index.?,
                 );
 
-                // Log prefill result: prompt tokens and first generated token.
-                {
-                    var prompt_head_buf: [128]u8 = undefined;
-                    var prompt_head_len: usize = 0;
-                    const show_n = @min(request_entry.prompt_tokens.len, 8);
-                    for (request_entry.prompt_tokens[0..show_n]) |tid| {
-                        const wrote = std.fmt.bufPrint(prompt_head_buf[prompt_head_len..], "{d},", .{tid}) catch break;
-                        prompt_head_len += wrote.len;
-                    }
-                    var first_id_buf: [16]u8 = undefined;
-                    const first_id_str = std.fmt.bufPrint(&first_id_buf, "{d}", .{first_token_id}) catch "?";
-                    // Top-5 logits for debugging sampling correctness
-                    var top5_buf: [256]u8 = undefined;
-                    var top5_len: usize = 0;
-                    if (self.logits_buffer.len > 0) {
-                        // Find top-5 by scanning
-                        var top_ids: [5]u32 = .{ 0, 0, 0, 0, 0 };
-                        var top_vals: [5]f32 = .{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) };
-                        for (self.logits_buffer, 0..) |v, idx| {
-                            if (v > top_vals[4]) {
-                                top_vals[4] = v;
-                                top_ids[4] = @intCast(idx);
-                                // bubble up
-                                var k: usize = 4;
-                                while (k > 0 and top_vals[k] > top_vals[k - 1]) : (k -= 1) {
-                                    const tv = top_vals[k];
-                                    top_vals[k] = top_vals[k - 1];
-                                    top_vals[k - 1] = tv;
-                                    const ti = top_ids[k];
-                                    top_ids[k] = top_ids[k - 1];
-                                    top_ids[k - 1] = ti;
-                                }
-                            }
-                        }
-                        for (top_ids, top_vals) |tid, tv| {
-                            const wrote = std.fmt.bufPrint(top5_buf[top5_len..], "{d}:{d:.2},", .{ tid, tv }) catch break;
-                            top5_len += wrote.len;
-                        }
-                    }
-                    var meta_buf: [32]u8 = undefined;
-                    const meta_str = std.fmt.bufPrint(&meta_buf, "slot={d} n={d} strat={s}", .{
-                        request_entry.slot_index.?,
-                        request_entry.prompt_tokens.len,
-                        @tagName(prefill_sample_cfg.strategy),
-                    }) catch "?";
-                    log.info("scheduler", "prefill_result", .{
-                        .meta = meta_str,
-                        .prompt_head = prompt_head_buf[0..prompt_head_len],
-                        .first_token = first_id_str,
-                        .top5_logits = top5_buf[0..top5_len],
-                    });
-                }
-
                 try request_entry.generated_tokens.append(self.allocator, first_token_id);
 
                 // Check for EOS token
@@ -1944,11 +2062,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         /// the request and moves it to completed_queue without producing events.
         /// Batch callers (as opposed to generateSync) rely on step() events to
         /// observe completion, so we synthesize them here.
-        fn buildPrefillCompletedEvents(self: *Self, completed_before: usize) ![]TokenEvent {
-            var events: std.ArrayList(TokenEvent) = .{};
-            defer events.deinit(self.allocator);
-            try self.appendPrefillCompletedEvents(&events, completed_before);
-            return try events.toOwnedSlice(self.allocator);
+        fn buildPrefillCompletedEvents(self: *Self, completed_before: usize) ![]const TokenEvent {
+            self.step_events.clearRetainingCapacity();
+            try self.appendPrefillCompletedEvents(&self.step_events, completed_before);
+            return self.step_events.items;
         }
 
         fn appendPrefillCompletedEvents(
@@ -3893,7 +4010,7 @@ test "Scheduler.step - empty scheduler returns no events" {
     defer scheduler.deinit();
 
     const events = try scheduler.step();
-    defer alloc.free(events);
+
 
     try std.testing.expectEqual(@as(usize, 0), events.len);
 }
@@ -3910,8 +4027,7 @@ test "Scheduler.step - runs prefill for new requests" {
     const request_id = try scheduler.submit(&prompt, 10, null);
 
     // Step should run prefill
-    const events = try scheduler.step();
-    defer alloc.free(events);
+    _ = try scheduler.step();
 
     // Should have called prefillSlot
     try std.testing.expectEqual(@as(usize, 1), backend.prefill_calls.items.len);
@@ -3932,14 +4048,11 @@ test "Scheduler.step - generates tokens for active requests" {
     const request_id = try scheduler.submit(&prompt, 10, null);
 
     // First step: prefill
-    {
-        const events = try scheduler.step();
-        defer alloc.free(events);
-    }
+    _ = try scheduler.step();
 
     // Second step: decode
     const events = try scheduler.step();
-    defer alloc.free(events);
+
     // Logits are now tracked and freed by MockBackend.deinit()
 
     try std.testing.expectEqual(@as(usize, 1), events.len);
@@ -3967,8 +4080,7 @@ test "Scheduler.step - handles EOS token" {
     const request_id = try scheduler.submit(&prompt, 10, opts);
 
     // First step runs prefill, which generates token 100 (EOS)
-    const events = try scheduler.step();
-    defer alloc.free(events);
+    _ = try scheduler.step();
 
     // Request should be completed
     const request_entry = scheduler.requests.get(request_id).?;
@@ -3988,8 +4100,7 @@ test "Scheduler.step - handles max tokens" {
     const request_id = try scheduler.submit(&prompt, 1, null); // max_tokens = 1
 
     // First step runs prefill and generates 1 token (max reached)
-    const events = try scheduler.step();
-    defer alloc.free(events);
+    _ = try scheduler.step();
 
     const request_entry = scheduler.requests.get(request_id).?;
     try std.testing.expectEqual(RequestState.completed, request_entry.state);
@@ -4014,15 +4125,10 @@ test "Scheduler.step - batches multiple decode requests" {
     _ = try scheduler.submit(&prompt, 10, opts);
 
     // Run prefills
-    {
-        const events = try scheduler.step();
-        defer alloc.free(events);
-    }
+    _ = try scheduler.step();
 
     // Run decode step - should batch both
-    const events = try scheduler.step();
-    defer alloc.free(events);
-    // Logits are now tracked and freed by MockBackend.deinit()
+    _ = try scheduler.step();
 
     // Should have called decodeBatch with 2 requests
     try std.testing.expect(backend.decode_calls.items.len > 0);
@@ -4054,8 +4160,7 @@ test "Scheduler.step - activates pending after slot freed" {
     try std.testing.expectEqual(@as(usize, 1), scheduler.pendingCount());
 
     // Step completes first request and should activate queued
-    const events = try scheduler.step();
-    defer alloc.free(events);
+    _ = try scheduler.step();
 
     try std.testing.expectEqual(@as(usize, 0), scheduler.pendingCount());
 
@@ -4904,16 +5009,13 @@ test "Scheduler.step - thinking disabled with tool-generation flags" {
     });
 
     // Step 1: prefill
-    {
-        const events = try scheduler.step();
-        defer alloc.free(events);
-    }
+    _ = try scheduler.step();
 
     // Step 2+: decode several tokens
     var total_tokens: usize = 0;
     while (scheduler.hasActive()) {
         const events = try scheduler.step();
-        defer alloc.free(events);
+    
         for (events) |ev| {
             total_tokens += 1;
             if (ev.is_final) break;

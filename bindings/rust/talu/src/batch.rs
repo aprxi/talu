@@ -54,6 +54,7 @@ use crate::error::error_from_last_or;
 use crate::router::GenerateConfig;
 use crate::{ChatHandle, InferenceBackend, Result};
 use std::ffi::{c_void, CStr, CString};
+use std::sync::atomic::AtomicBool;
 
 // =============================================================================
 // Configuration
@@ -235,15 +236,17 @@ impl BatchHandle {
     ///
     /// Text in events is copied and valid independently of the next step() call.
     pub fn step(&self, events_out: &mut [BatchEvent]) -> Result<usize> {
-        let max_events = events_out.len();
-        let mut c_events = vec![talu_sys::CBatchEvent::default(); max_events];
+        // Stack-allocated C event buffer — avoids heap alloc/free per step.
+        let mut c_events_buf = [talu_sys::CBatchEvent::default(); 64];
+        let max_events = events_out.len().min(64);
 
-        let count =
-            unsafe { talu_sys::talu_batch_step(self.ptr, c_events.as_mut_ptr(), max_events) };
+        let count = unsafe {
+            talu_sys::talu_batch_step(self.ptr, c_events_buf.as_mut_ptr(), max_events)
+        };
 
         // Convert C events to Rust events (copy text).
         for i in 0..count.min(max_events) {
-            let c = &c_events[i];
+            let c = &c_events_buf[i];
             let text = if !c.text_ptr.is_null() && c.text_len > 0 {
                 // SAFETY: text_ptr is valid for text_len bytes until next step().
                 let bytes = unsafe { std::slice::from_raw_parts(c.text_ptr, c.text_len) };
@@ -364,6 +367,80 @@ impl BatchHandle {
     /// Get the number of active requests.
     pub fn active_count(&self) -> usize {
         unsafe { talu_sys::talu_batch_active_count(self.ptr) }
+    }
+
+    /// Run a tight decode loop, calling `callback` for each batch of events.
+    ///
+    /// Keeps the decode loop entirely in Zig, eliminating per-token FFI
+    /// round-trip overhead that occurs when calling `step()` in a Rust loop.
+    ///
+    /// Works for any number of concurrent requests (N=1 or N>1).
+    ///
+    /// The loop runs until:
+    /// - All requests complete
+    /// - `pending_flag` is set (caller has commands to process)
+    /// - An error occurs
+    ///
+    /// Per-request cancellation: the callback can set `pending_flag` to
+    /// break out of the loop. The caller then calls `cancel()` for specific
+    /// requests before re-entering `run_loop`.
+    pub fn run_loop(
+        &self,
+        pending_flag: &AtomicBool,
+        mut callback: impl FnMut(&BatchEvent),
+    ) -> Result<()> {
+        // Trampoline: extern "C" fn that receives a *mut FnMut(&BatchEvent)
+        // through callback_data, converts CEvents to BatchEvents, and invokes it.
+        extern "C" fn trampoline(
+            events: *const talu_sys::CEvent,
+            count: usize,
+            userdata: *mut c_void,
+        ) {
+            if events.is_null() || count == 0 || userdata.is_null() {
+                return;
+            }
+            let cb: &mut &mut dyn FnMut(&BatchEvent) =
+                unsafe { &mut *(userdata as *mut &mut dyn FnMut(&BatchEvent)) };
+            let c_events = unsafe { std::slice::from_raw_parts(events, count) };
+            for c in c_events {
+                let text = if !c.text_ptr.is_null() && c.text_len > 0 {
+                    let bytes = unsafe { std::slice::from_raw_parts(c.text_ptr, c.text_len) };
+                    String::from_utf8_lossy(bytes).into_owned()
+                } else {
+                    String::new()
+                };
+                let event = BatchEvent {
+                    request_id: c.request_id,
+                    event_type: EventType::from(c.event_type),
+                    item_type: c.item_type,
+                    content_type: c.content_type,
+                    is_final: c.is_final != 0,
+                    text,
+                    token_id: c.token_id,
+                    tokens_generated: c.tokens_generated,
+                    timestamp_ns: c.timestamp_ns,
+                };
+                cb(&event);
+            }
+        }
+
+        let mut cb: &mut dyn FnMut(&BatchEvent) = &mut callback;
+        let cb_ptr: *mut c_void = &mut cb as *mut &mut dyn FnMut(&BatchEvent) as *mut c_void;
+
+        let rc = unsafe {
+            talu_sys::talu_batch_run_loop(
+                self.ptr,
+                pending_flag as *const AtomicBool as *mut c_void,
+                trampoline as *mut c_void,
+                cb_ptr,
+            )
+        };
+
+        if rc != 0 {
+            return Err(error_from_last_or("batch run_loop failed"));
+        }
+
+        Ok(())
     }
 }
 

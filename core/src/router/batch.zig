@@ -303,19 +303,6 @@ pub const BatchWrapper = struct {
         };
         defer self.engine.allocator.free(prompt);
 
-        {
-            const tail_len = @min(prompt.len, 200);
-            const tail_start = prompt.len - tail_len;
-            log.info("batch", "submit", .{
-                .prompt_len = prompt.len,
-                .prompt_tail = prompt[tail_start..],
-                .effective_context = effective_context orelse "(null)",
-                .temperature = opts.temperature orelse -99.0,
-                .top_k = opts.top_k orelse 999999,
-                .max_tokens = opts.max_tokens orelse 0,
-            });
-        }
-
         // Detect reasoning start state.
         starts_in_reasoning = chat_template.promptEndsWithReasoningTag(prompt, opts.reasoning_tag);
         state.starts_in_reasoning = starts_in_reasoning;
@@ -493,9 +480,9 @@ pub const BatchWrapper = struct {
             state_ptr.*.delta_buf.clearRetainingCapacity();
         }
 
-        // Run one decode step on the scheduler.
+        // Run one decode step on the scheduler. Returns a borrowed view
+        // into the scheduler's internal buffer (valid until the next step).
         const raw_events = try self.scheduler.step();
-        defer allocator.free(raw_events);
 
         var event_count: usize = 0;
 
@@ -543,15 +530,6 @@ pub const BatchWrapper = struct {
             // Decode token to raw bytes with context.
             const decoded_raw = try decodeTokenWithContext(self.engine, state, raw.token);
             defer self.engine.allocator.free(decoded_raw);
-
-            if (state.engine_token_count <= 20) {
-                log.info("batch", "token", .{
-                    .n = state.engine_token_count,
-                    .id = raw.token,
-                    .text = decoded_raw,
-                    .is_final = raw.is_final,
-                });
-            }
 
             if (decoded_raw.len > 0) {
                 state.decode_context_token = raw.token;
@@ -723,6 +701,81 @@ pub const BatchWrapper = struct {
     /// Get count of active requests.
     pub fn activeCount(self: *const BatchWrapper) usize {
         return self.scheduler.activeCount();
+    }
+
+    /// C-compatible event struct for the runLoop callback.
+    /// Matches capi/batch.zig CBatchEvent layout.
+    pub const CEvent = extern struct {
+        request_id: u64,
+        event_type: u8,
+        item_type: u8,
+        content_type: u8,
+        is_final: u8,
+        _pad: [4]u8 = .{ 0, 0, 0, 0 },
+        text_ptr: ?[*]const u8 = null,
+        text_len: usize = 0,
+        token_id: u32,
+        _pad2: [4]u8 = .{ 0, 0, 0, 0 },
+        tokens_generated: usize = 0,
+        timestamp_ns: i64 = 0,
+    };
+
+    /// Run a tight decode loop, calling back to the caller for each batch
+    /// of events. This eliminates per-token FFI round-trip overhead that
+    /// occurs when calling step() from Rust in a loop.
+    ///
+    /// Works for any number of concurrent requests (N=1 or N>1).
+    ///
+    /// The loop runs until:
+    /// - All requests complete (activeCount + pendingCount == 0)
+    /// - pending_flag is set (new command arrived, caller should process it)
+    /// - An error occurs
+    ///
+    /// The callback receives C-compatible events and is called once per step
+    /// (typically one event per token per active request). The callback must
+    /// NOT call back into the BatchWrapper (not reentrant).
+    ///
+    /// Per-request cancellation: the callback can set pending_flag to break
+    /// out of the loop. The caller then calls cancel() for specific requests
+    /// before re-entering runLoop.
+    pub fn runLoop(
+        self: *BatchWrapper,
+        pending_flag: ?*const std.atomic.Value(bool),
+        callback: *const fn ([*]const CEvent, usize, ?*anyopaque) callconv(.c) void,
+        callback_data: ?*anyopaque,
+    ) !void {
+        // Stack-allocate a reusable events buffer to avoid per-step allocation.
+        const max_events = 64;
+        var events_buf: [max_events]BatchEvent = undefined;
+        var c_events_buf: [max_events]CEvent = undefined;
+
+        while (self.scheduler.activeCount() > 0 or self.scheduler.pendingCount() > 0) {
+            // Check pending flag (caller has commands to process).
+            if (pending_flag) |flag| {
+                if (flag.load(.acquire)) break;
+            }
+
+            const count = try self.step(&events_buf);
+            if (count == 0) continue;
+
+            // Convert to C events and invoke callback.
+            const emit_count = @min(count, max_events);
+            for (events_buf[0..emit_count], 0..) |ev, i| {
+                c_events_buf[i] = .{
+                    .request_id = ev.request_id,
+                    .event_type = @intFromEnum(ev.event_type),
+                    .item_type = ev.item_type,
+                    .content_type = ev.content_type,
+                    .is_final = @intFromBool(ev.is_final),
+                    .text_ptr = if (ev.text.len > 0) ev.text.ptr else null,
+                    .text_len = ev.text.len,
+                    .token_id = ev.token_id,
+                    .tokens_generated = ev.tokens_generated,
+                    .timestamp_ns = @intCast(@min(ev.timestamp_ns, std.math.maxInt(i64))),
+                };
+            }
+            callback(&c_events_buf, emit_count, callback_data);
+        }
     }
 
     // =========================================================================

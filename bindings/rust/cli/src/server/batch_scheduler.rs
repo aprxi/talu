@@ -114,6 +114,10 @@ pub struct SchedulerState {
     /// `take_result()`. This decouples result retrieval from the step
     /// thread's lifetime, so results survive graceful shutdown.
     completed: Arc<Mutex<HashMap<u64, CompletedEntry>>>,
+    /// Signalled by senders (submit/cancel/shutdown) before enqueueing a
+    /// command. The decode-loop callback checks this and sets the Zig
+    /// `pending_flag` to break out, so the step thread can drain commands.
+    cmd_pending: Arc<AtomicBool>,
 }
 
 impl SchedulerState {
@@ -136,12 +140,13 @@ impl SchedulerState {
         let requests: Arc<Mutex<HashMap<u64, RequestSlot>>> = Arc::new(Mutex::new(HashMap::new()));
         let completed: Arc<Mutex<HashMap<u64, CompletedEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let cmd_pending = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
-
+        let cmd_pending_clone = cmd_pending.clone();
         let handle = std::thread::Builder::new()
             .name("batch-scheduler".into())
             .spawn(move || {
-                step_loop(batch, cmd_rx, requests, completed_clone, max_inflight);
+                step_loop(batch, cmd_rx, requests, completed_clone, max_inflight, cmd_pending_clone);
             })
             .map_err(|e| anyhow!("failed to spawn scheduler thread: {}", e))?;
 
@@ -149,6 +154,7 @@ impl SchedulerState {
             cmd_tx,
             step_thread: Mutex::new(Some(handle)),
             completed,
+            cmd_pending,
         })
     }
 
@@ -167,6 +173,10 @@ impl SchedulerState {
     ) -> Result<(u64, std::sync::mpsc::Receiver<BatchEvent>)> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+
+        // Signal the step thread to break out of the Zig decode loop so it
+        // can drain this command promptly.
+        self.cmd_pending.store(true, Ordering::Release);
 
         // Send submit command with event_tx/stop_flag so the step thread
         // registers the slot BEFORE any step() can produce events.
@@ -191,6 +201,7 @@ impl SchedulerState {
 
     /// Cancel a running request.
     pub fn cancel(&self, request_id: u64) {
+        self.cmd_pending.store(true, Ordering::Release);
         let _ = self.cmd_tx.send(SchedulerCommand::Cancel { request_id });
     }
 
@@ -215,6 +226,7 @@ impl SchedulerState {
     /// requests before exiting, so in-flight handlers receive their
     /// final events and results.
     pub fn shutdown(&self) {
+        self.cmd_pending.store(true, Ordering::Release);
         let _ = self.cmd_tx.send(SchedulerCommand::Shutdown);
         if let Ok(mut guard) = self.step_thread.lock() {
             if let Some(handle) = guard.take() {
@@ -227,6 +239,7 @@ impl SchedulerState {
 impl Drop for SchedulerState {
     fn drop(&mut self) {
         // Best-effort shutdown signal; don't block in drop.
+        self.cmd_pending.store(true, Ordering::Release);
         let _ = self.cmd_tx.send(SchedulerCommand::Shutdown);
     }
 }
@@ -241,26 +254,31 @@ fn step_loop(
     requests: Arc<Mutex<HashMap<u64, RequestSlot>>>,
     completed: Arc<Mutex<HashMap<u64, CompletedEntry>>>,
     max_inflight: usize,
+    cmd_pending: Arc<AtomicBool>,
 ) {
-    let mut events_buf = vec![BatchEvent::default(); 64];
+    // Local flag passed into the Zig decode loop. The event callback
+    // sets this to break out of the loop when there are commands to
+    // drain or stop-flagged requests to cancel.
+    let pending_flag = AtomicBool::new(false);
     let mut draining = false;
     let mut step_count: u64 = 0;
 
     loop {
-        // 1. Drain all pending commands (non-blocking).
+        // 1. Clear pending flags, then drain all queued commands.
+        cmd_pending.store(false, Ordering::Release);
+        pending_flag.store(false, Ordering::Release);
+
         loop {
             match cmd_rx.try_recv() {
                 Ok(SchedulerCommand::Shutdown) => {
-                    // Graceful drain: finish active requests before exiting.
                     if !batch.has_active() {
                         return;
                     }
                     log_scheduler_snapshot(&batch, &requests, &completed, max_inflight);
                     draining = true;
-                    break; // Stop processing commands, start draining.
+                    break;
                 }
                 Ok(SchedulerCommand::Submit { reply, .. }) if draining => {
-                    // Reject new submits during drain.
                     let tracked = requests.lock().ok().map(|r| r.len()).unwrap_or(0);
                     let active = batch.active_count();
                     let pending = tracked.saturating_sub(active);
@@ -269,9 +287,7 @@ fn step_loop(
                         tracked, active, pending);
                     let _ = reply.send(Err(anyhow!(
                         "scheduler is shutting down (tracked={}, active={}, pending={})",
-                        tracked,
-                        active,
-                        pending
+                        tracked, active, pending
                     )));
                 }
                 Ok(cmd) => {
@@ -279,7 +295,6 @@ fn step_loop(
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // All senders dropped. Drain remaining active requests.
                     if !batch.has_active() {
                         return;
                     }
@@ -290,15 +305,12 @@ fn step_loop(
             }
         }
 
-        // 2. Check for cancelled requests (stop_flag set by client disconnect).
-        check_stop_flags(&batch, &requests);
-
-        // 3. If draining and no more active requests, exit.
+        // 2. If draining and no more active requests, exit.
         if draining && !batch.has_active() {
             return;
         }
 
-        // 4. If idle (no active requests, not draining), sweep stale
+        // 3. If idle (no active requests, not draining), sweep stale
         //    completed entries then block waiting for the next command.
         if !batch.has_active() {
             sweep_stale_completed(&completed);
@@ -307,39 +319,30 @@ fn step_loop(
                 Ok(cmd) => {
                     handle_command(&batch, cmd, &requests, max_inflight);
                 }
-                Err(_) => return, // Channel disconnected
+                Err(_) => return,
             }
-            continue; // Re-drain commands before stepping
+            continue;
         }
 
-        // 5. One decode step — produces events for all active requests.
-        let count = match batch.step(&mut events_buf) {
-            Ok(n) => n,
-            Err(e) => {
-                log::error!(target: "batch_scheduler", "step error: {}", e);
-                0
-            }
-        };
-        step_count += 1;
-
-        // 5b. Periodic sweep under sustained load (every 256 steps).
-        if step_count % 256 == 0 {
-            sweep_stale_completed(&completed);
-        }
-
-        // 6. Dispatch events and clean up completed requests.
+        // 4. Tight decode loop in Zig — replaces per-token step()+FFI.
         //
-        // For final events: store the result in `completed` BEFORE
-        // dispatching the event. This guarantees that when the handler
-        // receives is_final and calls take_result(), the result is
-        // already available.
-        if count > 0 {
-            let mut reqs = requests.lock().unwrap();
-            for event in &events_buf[..count] {
+        // The callback dispatches events and checks stop flags. When
+        // it detects a cancellation or a new command on the channel,
+        // it sets pending_flag to break the Zig loop. Cancellations
+        // are collected and applied after run_loop returns.
+        {
+            let mut to_cancel: Vec<u64> = Vec::new();
+
+            let result = batch.run_loop(&pending_flag, |event| {
+                step_count += 1;
+
+                // --- Dispatch event + check stop flags ---
+                let mut reqs = requests.lock().unwrap();
+
+                // For final events: store result BEFORE dispatching so
+                // the handler can call take_result() immediately.
                 if event.is_final {
                     if reqs.contains_key(&event.request_id) {
-                        // Store result before the handler can observe the
-                        // final event via the channel.
                         if let Some(result) = batch.take_result(event.request_id) {
                             if let Ok(mut comp) = completed.lock() {
                                 comp.insert(
@@ -352,19 +355,50 @@ fn step_loop(
                             }
                         }
                     } else {
-                        // Slot already removed (cancelled/disconnected).
-                        // Consume the result from batch to free it, but
-                        // don't store — no handler will call take_result().
                         let _ = batch.take_result(event.request_id);
                     }
                 }
+
                 if let Some(slot) = reqs.get(&event.request_id) {
                     let _ = slot.tx.send(event.clone());
                 }
+
                 if event.is_final {
                     reqs.remove(&event.request_id);
                 }
+
+                // Check stop flags for client disconnects.
+                let cancelled: Vec<u64> = reqs
+                    .iter()
+                    .filter(|(_, slot)| slot.stop_flag.load(Ordering::Acquire))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in &cancelled {
+                    reqs.remove(id);
+                    to_cancel.push(*id);
+                }
+
+                // Break the Zig loop if there are cancellations or
+                // new commands waiting on the channel.
+                if !to_cancel.is_empty() || cmd_pending.load(Ordering::Acquire) {
+                    pending_flag.store(true, Ordering::Release);
+                }
+            });
+
+            // Apply collected cancellations now that we're outside
+            // the Zig loop (safe to call cancel on the batch handle).
+            for id in to_cancel {
+                batch.cancel(id);
             }
+
+            if let Err(e) = result {
+                log::error!(target: "batch_scheduler", "run_loop error: {}", e);
+            }
+        }
+
+        // 5. Periodic sweep under sustained load.
+        if step_count % 256 == 0 {
+            sweep_stale_completed(&completed);
         }
     }
 }
@@ -472,20 +506,3 @@ fn log_scheduler_snapshot(
         tracked, active, pending, completed_entries, max_inflight);
 }
 
-/// Check stop flags set by CancelOnDrop / client disconnect.
-fn check_stop_flags(batch: &BatchHandle, requests: &Arc<Mutex<HashMap<u64, RequestSlot>>>) {
-    let to_cancel: Vec<u64> = {
-        let reqs = requests.lock().unwrap();
-        reqs.iter()
-            .filter(|(_, slot)| slot.stop_flag.load(Ordering::Acquire))
-            .map(|(id, _)| *id)
-            .collect()
-    };
-
-    for id in to_cancel {
-        batch.cancel(id);
-        if let Ok(mut reqs) = requests.lock() {
-            reqs.remove(&id);
-        }
-    }
-}
