@@ -1140,6 +1140,149 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             return self.step_events.items;
         }
 
+        /// Tight decode loop for a single active request using the top-K
+        /// candidate route. Eliminates per-step event/dispatch overhead by
+        /// running the decode+sample+callback loop without returning.
+        ///
+        /// The per-token callback is invoked for each generated token with
+        /// (request_id, token, is_final, user_data). It must NOT call back
+        /// into the scheduler (not reentrant).
+        ///
+        /// The loop runs until the request completes, pending_flag is set,
+        /// or an error occurs. On completion, the request is moved to the
+        /// completed queue. Returns error.NotEligible if the request doesn't
+        /// qualify (caller should fall back to the step-based loop).
+        pub fn runDecodeLoop(
+            self: *Self,
+            request_id: u64,
+            pending_flag: ?*const std.atomic.Value(bool),
+            per_token_cb: *const fn (u64, u32, bool, ?*anyopaque) callconv(.c) void,
+            cb_data: ?*anyopaque,
+        ) !void {
+            const re = self.requests.get(request_id) orelse return error.InvalidArgument;
+            if (re.state != .generating) return error.NotEligible;
+            const slot = re.slot_index orelse return error.NotEligible;
+            if (re.grammar_sampler != null) return error.NotEligible;
+            if (re.capture_final_logits) return error.NotEligible;
+            const top_k = re.sampling_config.top_k;
+            if (top_k == 0 or top_k > 256) return error.NotEligible;
+
+            const use_topk = comptime blk: {
+                if (!@hasDecl(BackendType, "decodeTopKCandidates")) break :blk false;
+                if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKDecodeRoute")) break :blk false;
+                break :blk true;
+            };
+            if (!use_topk) return error.NotEligible;
+            if (!self.backend.supportsSchedulerBackendTopKDecodeRoute(&re.sampling_config))
+                return error.NotEligible;
+
+            var candidate_logits: [256]f32 = undefined;
+            var candidate_ids: [256]u32 = undefined;
+
+            while (re.generated_tokens.items.len < re.max_tokens) {
+                if (pending_flag) |f| {
+                    if (f.load(.acquire)) return;
+                }
+
+                const last_token = if (re.generated_tokens.items.len > 0)
+                    re.generated_tokens.items[re.generated_tokens.items.len - 1]
+                else if (re.prompt_tokens.len > 0)
+                    re.prompt_tokens[re.prompt_tokens.len - 1]
+                else
+                    return error.InvalidArgument;
+
+                const count = try self.backend.decodeTopKCandidates(
+                    slot,
+                    last_token,
+                    top_k,
+                    candidate_logits[0..top_k],
+                    candidate_ids[0..top_k],
+                );
+                if (count == 0) return error.InvalidArgument;
+
+                // Thinking budget enforcement.
+                var next_token: u32 = undefined;
+                if (re.in_thinking and re.thinking_inject_pos > 0) {
+                    next_token = re.thinking_end_tokens[re.thinking_inject_pos];
+                    re.thinking_inject_pos += 1;
+                    if (re.thinking_inject_pos >= re.thinking_end_tokens.len) {
+                        re.in_thinking = false;
+                        re.generating_answer = true;
+                    }
+                } else if (re.in_thinking and re.thinking_token_count >= re.max_thinking_tokens) {
+                    next_token = re.thinking_end_tokens[0];
+                    re.thinking_inject_pos = 1;
+                    if (re.thinking_end_tokens.len == 1) {
+                        re.in_thinking = false;
+                        re.generating_answer = true;
+                    }
+                } else {
+                    var sample_cfg = re.sampling_config;
+                    sample_cfg.context_tokens = re.generated_tokens.items;
+                    next_token = try self.sampleTopKCandidateToken(
+                        candidate_logits[0..count],
+                        candidate_ids[0..count],
+                        sample_cfg,
+                    );
+                    if (re.in_thinking) {
+                        re.thinking_token_count += 1;
+                        if (re.thinking_end_tokens.len > 0 and
+                            next_token == re.thinking_end_tokens[0])
+                        {
+                            re.in_thinking = false;
+                            re.generating_answer = true;
+                        }
+                    }
+                }
+
+                try re.generated_tokens.append(self.allocator, next_token);
+                re.token_position += 1;
+
+                var finish_reason: FinishReason = .in_progress;
+                for (re.eos_token_ids) |eos_id| {
+                    if (next_token == eos_id) {
+                        finish_reason = .eos_token;
+                        break;
+                    }
+                }
+                if (finish_reason == .in_progress and re.stop_sequences.len > 0) {
+                    const stop_len = checkStopSequence(re.generated_tokens.items, re.stop_sequences);
+                    if (stop_len > 0) {
+                        finish_reason = .stop_sequence;
+                        re.generated_tokens.shrinkRetainingCapacity(re.generated_tokens.items.len - stop_len);
+                    }
+                }
+                if (finish_reason == .in_progress and re.generating_answer and
+                    re.max_completion_tokens_limit > 0)
+                {
+                    re.completion_token_count += 1;
+                    if (re.completion_token_count >= re.max_completion_tokens_limit) {
+                        finish_reason = .length;
+                    }
+                }
+                if (!re.in_thinking and !re.generating_answer) {
+                    re.generating_answer = true;
+                }
+                if (finish_reason == .in_progress and re.generated_tokens.items.len >= re.max_tokens) {
+                    finish_reason = .length;
+                }
+
+                const is_final = finish_reason != .in_progress;
+                if (finish_reason != .stop_sequence) {
+                    per_token_cb(request_id, next_token, is_final, cb_data);
+                }
+
+                if (is_final) {
+                    self.completeRequest(re, finish_reason);
+                    return;
+                }
+            }
+
+            // Exhausted max_tokens.
+            self.completeRequest(re, .length);
+            per_token_cb(request_id, 0, true, cb_data);
+        }
+
         /// Pop completed requests from the queue.
         ///
         /// Returns request IDs that have finished (completed, cancelled, or failed).

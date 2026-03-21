@@ -113,9 +113,9 @@ def _make_run(max_out: int, concurrency: int):
                     m["wall_s"] = round(wall_s, 3)
                     all_results.append(m)
                     if concurrency == 1:
-                        print(f" {m['engine_tok_s']} tok/s")
+                        print(f" {m['engine_tok_s']} tok/s | wall={round(wall_s, 3)}s decode={m['decode_s']}s tokens={m['output_tokens']}")
                     else:
-                        print(f" {m['engine_tok_s']} tok/s ({concurrency}x)")
+                        print(f" {m['engine_tok_s']} tok/s | wall={round(wall_s, 3)}s decode={m['decode_s']}s tokens={m['output_tokens']} ({concurrency}x)")
 
         return all_results
 

@@ -485,6 +485,7 @@ pub const BatchWrapper = struct {
         const raw_events = try self.scheduler.step();
 
         var event_count: usize = 0;
+        const step_now_ns = std.time.nanoTimestamp();
 
         for (raw_events) |raw| {
             const state = self.requests.get(raw.request_id) orelse continue;
@@ -494,9 +495,8 @@ pub const BatchWrapper = struct {
                 if (raw.is_final) {
                     try self.completeRequest(raw.request_id, state, .eos_token);
                     if (event_count < events_out.len) {
-                        const now_ns = std.time.nanoTimestamp();
-                        const elapsed_ns: i128 = if (now_ns > state.start_ns)
-                            now_ns - state.start_ns
+                        const elapsed_ns: i128 = if (step_now_ns > state.start_ns)
+                            step_now_ns - state.start_ns
                         else
                             0;
                         events_out[event_count] = .{
@@ -524,16 +524,11 @@ pub const BatchWrapper = struct {
 
             // Record first token time.
             if (state.first_token_ns == 0) {
-                state.first_token_ns = std.time.nanoTimestamp();
+                state.first_token_ns = step_now_ns;
             }
 
-            // Decode token to raw bytes with context.
-            const decoded_raw = try decodeTokenWithContext(self.engine, state, raw.token);
-            defer self.engine.allocator.free(decoded_raw);
-
-            if (decoded_raw.len > 0) {
-                state.decode_context_token = raw.token;
-            }
+            // Decode token to raw bytes via pre-computed table (zero-alloc O(1) lookup).
+            const decoded_raw: []const u8 = self.engine.tok.tokenBytes(raw.token) orelse "";
 
             // UTF-8 assembly (same algorithm as iterator.zig).
             var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
@@ -610,9 +605,8 @@ pub const BatchWrapper = struct {
                     const seg_types = classifySegment(state, seg.filter_state);
                     final_types = seg_types;
                     if (event_count < events_out.len) {
-                        const now_ns = std.time.nanoTimestamp();
-                        const elapsed_ns: i128 = if (now_ns > state.start_ns)
-                            now_ns - state.start_ns
+                        const elapsed_ns: i128 = if (step_now_ns > state.start_ns)
+                            step_now_ns - state.start_ns
                         else
                             0;
                         events_out[event_count] = .{
@@ -638,9 +632,8 @@ pub const BatchWrapper = struct {
                 try self.completeRequest(raw.request_id, state, finish_reason);
 
                 if (event_count < events_out.len) {
-                    const now_ns = std.time.nanoTimestamp();
-                    const elapsed_ns: i128 = if (now_ns > state.start_ns)
-                        now_ns - state.start_ns
+                    const elapsed_ns: i128 = if (step_now_ns > state.start_ns)
+                        step_now_ns - state.start_ns
                     else
                         0;
                     events_out[event_count] = .{
@@ -775,6 +768,232 @@ pub const BatchWrapper = struct {
                 };
             }
             callback(&c_events_buf, emit_count, callback_data);
+
+            // After the first step with events (prefill + first token done),
+            // try to switch to the scheduler's tight decode loop for the
+            // remaining tokens. This eliminates per-token event layering.
+            if (self.scheduler.activeCount() == 1 and self.scheduler.pendingCount() == 0) {
+                if (!events_buf[0].is_final) {
+                    const req_id = events_buf[0].request_id;
+                    if (self.requests.get(req_id)) |state| {
+                        self.runDecodeLoopSingle(
+                            req_id,
+                            state,
+                            pending_flag,
+                            callback,
+                            callback_data,
+                            &c_events_buf[0],
+                        ) catch |err| switch (err) {
+                            error.NotEligible => continue,
+                            else => return err,
+                        };
+                        // After tight loop: handle any completion.
+                        const completed = self.scheduler.popCompleted();
+                        if (completed.len > 0) allocator.free(completed);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Single-request tight decode loop. Calls scheduler.runDecodeLoop
+    /// with a per-token callback that does text processing inline.
+    fn runDecodeLoopSingle(
+        self: *BatchWrapper,
+        request_id: u64,
+        state: *RequestState,
+        pending_flag: ?*const std.atomic.Value(bool),
+        outer_cb: *const fn ([*]const CEvent, usize, ?*anyopaque) callconv(.c) void,
+        outer_cb_data: ?*anyopaque,
+        c_event_buf: *CEvent,
+    ) !void {
+        var ctx = DecodeLoopCtx{
+            .engine = self.engine,
+            .state = state,
+            .outer_cb = outer_cb,
+            .outer_cb_data = outer_cb_data,
+            .c_event_buf = c_event_buf,
+            .had_error = false,
+        };
+
+        try self.scheduler.runDecodeLoop(
+            request_id,
+            pending_flag,
+            &decodeLoopTokenCb,
+            @ptrCast(&ctx),
+        );
+
+        // Handle completion after the loop.
+        if (ctx.had_error) return error.OutOfMemory;
+        // If the scheduler finished the request, build the batch-level result
+        // BEFORE sending the completed event (Rust callback calls take_result
+        // inside the callback, so the result must exist first).
+        if (self.scheduler.getFinishReason(request_id)) |fr| {
+            if (fr != .in_progress) {
+                try self.completeRequest(request_id, state, self.determineFinishReason(state));
+            }
+        }
+        // Now send the deferred completed event.
+        if (ctx.completed_event) |*ev| {
+            c_event_buf.* = ev.*;
+            outer_cb(@ptrCast(c_event_buf), 1, outer_cb_data);
+        }
+    }
+
+    const DecodeLoopCtx = struct {
+        engine: *LocalEngine,
+        state: *RequestState,
+        outer_cb: *const fn ([*]const CEvent, usize, ?*anyopaque) callconv(.c) void,
+        outer_cb_data: ?*anyopaque,
+        c_event_buf: *CEvent,
+        had_error: bool,
+        /// Deferred completed event: saved here so runDecodeLoopSingle
+        /// can send it AFTER batch.completeRequest stores the result.
+        /// The Rust callback calls take_result inside the callback, so
+        /// the result must exist before the completed event fires.
+        completed_event: ?CEvent = null,
+    };
+
+    fn decodeLoopTokenCb(
+        req_id: u64,
+        token: u32,
+        is_final: bool,
+        data: ?*anyopaque,
+    ) callconv(.c) void {
+        const ctx: *DecodeLoopCtx = @ptrCast(@alignCast(data));
+        if (ctx.had_error) return;
+
+        const state = ctx.state;
+        const engine = ctx.engine;
+
+        // Skip EOS tokens (don't decode them).
+        if (gen_config_mod.isEosToken(engine.gen_config.eos_token_ids, token)) {
+            if (is_final) {
+                // Defer completed event — sent by runDecodeLoopSingle
+                // after completeRequest stores the BatchResult.
+                var ev = std.mem.zeroes(CEvent);
+                ev.request_id = req_id;
+                ev.event_type = @intFromEnum(EventType.completed);
+                ev.item_type = @intFromEnum(ItemType.message);
+                ev.content_type = @intFromEnum(ContentType.output_text);
+                ev.is_final = 1;
+                ev.token_id = token;
+                ev.tokens_generated = state.engine_token_count;
+                ctx.completed_event = ev;
+            }
+            return;
+        }
+
+        // Reasoning start on first non-EOS token.
+        if (state.engine_token_count == 0 and state.starts_in_reasoning) {
+            state.filter_state = .reasoning;
+        }
+        state.engine_token_count += 1;
+
+        // First token time.
+        if (state.first_token_ns == 0) {
+            state.first_token_ns = std.time.nanoTimestamp();
+        }
+
+        // Decode token to raw bytes (zero-alloc table lookup).
+        const decoded_raw: []const u8 = engine.tok.tokenBytes(token) orelse "";
+
+        // UTF-8 assembly.
+        var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
+        const pending_len: usize = state.utf8_pending_len;
+        @memcpy(combined_buf[0..pending_len], state.utf8_pending[0..pending_len]);
+        const raw_copy_len = @min(decoded_raw.len, combined_buf.len - pending_len);
+        @memcpy(combined_buf[pending_len..][0..raw_copy_len], decoded_raw[0..raw_copy_len]);
+        const total_len = pending_len + raw_copy_len;
+        const combined = combined_buf[0..total_len];
+
+        const valid_end = utf8ValidPrefix(combined);
+        const valid = combined[0..valid_end];
+        const trailing = combined[valid_end..total_len];
+
+        state.utf8_pending_len = 0;
+        if (trailing.len > 0 and trailing.len <= 3) {
+            const lead = trailing[0];
+            const expected_len: usize = if (lead & 0xE0 == 0xC0)
+                2
+            else if (lead & 0xF0 == 0xE0)
+                3
+            else if (lead & 0xF8 == 0xF0)
+                4
+            else
+                0;
+            if (expected_len > 0 and trailing.len < expected_len) {
+                var all_valid = true;
+                for (trailing[1..]) |cb| {
+                    if (cb & 0xC0 != 0x80) {
+                        all_valid = false;
+                        break;
+                    }
+                }
+                if (all_valid) {
+                    state.utf8_pending_len = @intCast(trailing.len);
+                    @memcpy(state.utf8_pending[0..trailing.len], trailing);
+                }
+            }
+        }
+
+        if (valid.len == 0 and !is_final) return;
+
+        // Reasoning tag filtering.
+        var filter_segments: [MAX_FILTER_SEGMENTS]FilteredSegment = undefined;
+        var filtered_text: []const u8 = valid;
+        var segments: []const FilteredSegment = &.{};
+        if (!state.raw_output) {
+            const filter_result = filterReasoningTags(state, valid, &filter_segments);
+            filtered_text = filter_result.text;
+            segments = filter_result.segments;
+        } else if (valid.len > 0) {
+            filter_segments[0] = .{ .start = 0, .len = valid.len, .filter_state = .normal };
+            segments = filter_segments[0..1];
+        }
+
+        var final_types = classifySegment(state, state.filter_state);
+
+        // Accumulate text and emit per-segment events.
+        if (filtered_text.len > 0) {
+            state.text_buf.appendSlice(allocator, filtered_text) catch {
+                ctx.had_error = true;
+                return;
+            };
+
+            // Emit one CEvent per segment directly (no BatchEvent intermediate).
+            for (segments) |seg| {
+                if (seg.len == 0) continue;
+                const seg_types = classifySegment(state, seg.filter_state);
+                final_types = seg_types;
+                const seg_text = filtered_text[seg.start .. seg.start + seg.len];
+                ctx.c_event_buf.* = std.mem.zeroes(CEvent);
+                ctx.c_event_buf.request_id = req_id;
+                ctx.c_event_buf.event_type = @intFromEnum(EventType.text_delta);
+                ctx.c_event_buf.item_type = seg_types.item_type;
+                ctx.c_event_buf.content_type = seg_types.content_type;
+                ctx.c_event_buf.is_final = 0;
+                ctx.c_event_buf.text_ptr = seg_text.ptr;
+                ctx.c_event_buf.text_len = seg_text.len;
+                ctx.c_event_buf.token_id = token;
+                ctx.c_event_buf.tokens_generated = state.engine_token_count;
+                ctx.outer_cb(@ptrCast(ctx.c_event_buf), 1, ctx.outer_cb_data);
+            }
+        }
+
+        if (is_final) {
+            // Defer completed event — sent by runDecodeLoopSingle
+            // after completeRequest stores the BatchResult.
+            var ev = std.mem.zeroes(CEvent);
+            ev.request_id = req_id;
+            ev.event_type = @intFromEnum(EventType.completed);
+            ev.item_type = final_types.item_type;
+            ev.content_type = final_types.content_type;
+            ev.is_final = 1;
+            ev.token_id = token;
+            ev.tokens_generated = state.engine_token_count;
+            ctx.completed_event = ev;
         }
     }
 
@@ -809,7 +1028,10 @@ pub const BatchWrapper = struct {
             @intCast(state.first_token_ns - state.start_ns)
         else
             0;
-        const generation_ns: u64 = @intCast(now - state.start_ns);
+        const generation_ns: u64 = if (state.first_token_ns > 0)
+            @intCast(now - state.first_token_ns)
+        else
+            0;
 
         // Build result.
         const result = try allocator.create(BatchResult);
