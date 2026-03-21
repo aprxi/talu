@@ -135,7 +135,6 @@ pub const provider_config = @import("provider_config.zig");
 pub const protocol = @import("protocol/root.zig");
 pub const tool_schema = @import("tool_schema.zig");
 pub const commit = @import("commit.zig");
-pub const iterator = @import("iterator.zig");
 pub const batch = @import("batch.zig");
 const inference_mod = @import("../inference/root.zig");
 
@@ -216,9 +215,6 @@ pub const ResolutionConfig = local.ResolutionConfig;
 pub const commitGenerationResult = commit.commitGenerationResult;
 pub const CommitParams = commit.CommitParams;
 pub const ToolCallInput = commit.ToolCallInput;
-
-// Token iterator for pull-based streaming (no callbacks)
-pub const TokenIterator = iterator.TokenIterator;
 
 // Batch API (responses-aware continuous batching)
 pub const BatchWrapper = batch.BatchWrapper;

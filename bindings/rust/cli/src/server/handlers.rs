@@ -856,11 +856,7 @@ async fn generate_response(
     let tools_json_for_generation = effective_tools.as_ref().map(|v| v.to_string());
     let tool_choice_for_generation = effective_tool_choice.as_ref().map(|v| v.to_string());
     let reasoning_effort_for_generation = reasoning.effort.clone();
-    let batch_scheduler_for_task = if std::env::var("TALU_DISABLE_BATCH").is_ok() {
-        None
-    } else {
-        state.batch_scheduler.lock().unwrap().clone()
-    };
+    let batch_scheduler_for_task = state.batch_scheduler.lock().unwrap().clone();
     let (output_items, prompt_tokens, completion_tokens, prefill_ns, generation_ns, result_ttft_ns, responses_json, model_info_json, response_status, incomplete_reason) =
         tokio::task::spawn_blocking(move || {
             // Create ChatHandle with system prompt if prompt_id was provided
@@ -1820,11 +1816,7 @@ async fn stream_response(
         }));
         let ctx_for_complete = ctx.clone();
 
-        let batch_sched = if std::env::var("TALU_DISABLE_BATCH").is_ok() {
-            None
-        } else {
-            state_for_store.batch_scheduler.lock().unwrap().clone()
-        };
+        let batch_sched = state_for_store.batch_scheduler.lock().unwrap().clone();
         let gen_result = if let Some(ref sched) = batch_sched {
             run_batch_streaming_generation(
                 sched,
@@ -1943,9 +1935,9 @@ async fn stream_response(
         .unwrap()
 }
 
-/// Run streaming generation via the direct `talu::router::generate_stream` path.
+/// Run streaming generation via `talu::router::generate_stream` (callback API).
 ///
-/// Used for remote/provider backends that do not support the batch scheduler.
+/// Used for remote/provider backends that do not have a batch scheduler.
 /// Local backends use [`run_batch_streaming_generation`] instead.
 fn run_streaming_generation(
     backend: Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,
@@ -2159,10 +2151,9 @@ fn run_streaming_generation(
 
 /// Run streaming generation via the batch scheduler (concurrent GPU decode).
 ///
-/// Used for local backends. Same contract as [`run_streaming_generation`]
-/// (used for remote/provider backends) but routes through the batch scheduler
-/// instead of acquiring the backend mutex. The ChatHandle is borrowed (not
-/// consumed) so it remains available for post-generation serialization.
+/// Used for local backends. Routes through the batch scheduler instead of
+/// acquiring the backend mutex. The ChatHandle is borrowed (not consumed)
+/// so it remains available for post-generation serialization.
 fn run_batch_streaming_generation(
     scheduler: &crate::server::batch_scheduler::SchedulerState,
     backend: Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,

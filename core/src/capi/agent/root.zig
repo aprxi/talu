@@ -618,7 +618,7 @@ pub const CAgentLoopConfig = extern struct {
     stop_flag: ?*const std.atomic.Value(bool) = null,
 
     /// Token streaming callback (null = synchronous generation).
-    /// When set, generation uses the TokenIterator and forwards each token.
+    /// When set, generation uses the streaming API and forwards each token.
     on_token: ?OnTokenFn = null,
     on_token_data: ?*anyopaque = null,
 

@@ -200,7 +200,6 @@ pub const AgentConfig = struct {
 pub const AgentError = error{
     OutOfMemory,
     GenerationFailed,
-    IteratorCreationFailed,
     InvalidAgentState,
     UnsupportedAgentStateVersion,
 };

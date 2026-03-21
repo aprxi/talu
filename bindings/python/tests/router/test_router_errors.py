@@ -70,7 +70,7 @@ def mock_lib():
         generation_ns=2000000,
         error_code=0,
     )
-    lib.talu_router_stream_with_backend.return_value = _create_mock_result(
+    lib.talu_router_generate_streaming.return_value = _create_mock_result(
         text=b"",
         token_count=0,
         prefill_ns=0,
@@ -279,44 +279,28 @@ class TestGenerateErrorCodes:
 class TestStreamErrorCodes:
     """Tests for Router.stream() error code handling.
 
-    Note: Router.stream() now uses the iterator API (talu_router_create_iterator,
-    talu_router_iterator_next, etc.) instead of the callback-based streaming API.
+    Router.stream() uses the callback-based talu_router_generate_streaming C API.
     """
 
-    def test_stream_iterator_creation_fails(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Iterator creation failure raises GenerationError."""
-        # Mock iterator creation to fail (return None)
-        mock_lib.talu_router_create_iterator.return_value = None
+    def test_stream_generation_error_code(self, router_with_mock_lib, mock_chat, mock_lib):
+        """Error code from streaming generation raises GenerationError."""
+        mock_lib.talu_router_generate_streaming.return_value = _create_mock_result(
+            error_code=-6,
+        )
 
-        with patch("talu._bindings.get_last_error", return_value="chat_handle is null"):
+        with patch("talu._bindings.get_last_error", return_value=None):
             with pytest.raises(GenerationError) as exc:
                 list(router_with_mock_lib.stream(mock_chat, "Hello", model="test-model"))
 
-            assert "Router.stream() failed to create iterator" in str(exc.value)
-            assert "chat_handle is null" in str(exc.value)
+            assert "error code -6" in str(exc.value)
 
-    def test_stream_error_code_generation_failed(self, router_with_mock_lib, mock_chat, mock_lib):
-        """Error during iteration raises GenerationError in stream."""
-        # Mock iterator to be created successfully
-        mock_iterator = ctypes.c_void_p(0xABCDEF)
-        mock_lib.talu_router_create_iterator.return_value = mock_iterator
-
-        # First call returns None (end of stream), and has_error returns True
-        mock_lib.talu_router_iterator_next.return_value = None
-        mock_lib.talu_router_iterator_has_error.return_value = True
-        mock_lib.talu_router_iterator_error_code.return_value = -6
-        mock_lib.talu_router_iterator_free.return_value = None
-
-        with pytest.raises(GenerationError) as exc:
-            list(router_with_mock_lib.stream(mock_chat, "Hello", model="test-model"))
-
-        assert "Router.stream() failed with error code -6" in str(exc.value)
-
-    def test_stream_iterator_creation_fails_with_zig_error(
+    def test_stream_generation_error_with_zig_message(
         self, router_with_mock_lib, mock_chat, mock_lib
     ):
-        """Zig error message is used when iterator creation fails."""
-        mock_lib.talu_router_create_iterator.return_value = None
+        """Zig error message is surfaced when streaming generation fails."""
+        mock_lib.talu_router_generate_streaming.return_value = _create_mock_result(
+            error_code=-4,
+        )
 
         with patch(
             "talu._bindings.get_last_error", return_value="Failed to load model: file not found"

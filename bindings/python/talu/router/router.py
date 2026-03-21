@@ -173,10 +173,6 @@ class Router:
         self._active_threads: set[threading.Thread] = set()
         self._active_threads_lock = threading.Lock()
 
-        # Track active iterators for safe shutdown (sync stream calls)
-        self._active_iterators: set[int] = set()  # Iterator handle addresses
-        self._active_iterators_lock = threading.Lock()
-        self._iterator_done = threading.Condition(self._active_iterators_lock)
 
     def _is_external_api(self, model: str) -> bool:
         """Check if model is an external API (openai::, vllm::, etc.).
@@ -575,9 +571,6 @@ class Router:
         Submits request to Zig C API. Zig handles all message management.
         Tokens are yielded in real-time as they are generated.
 
-        Uses a pull-based iterator API internally for reliable streaming
-        without callback lifetime issues.
-
         Each yielded ``StreamToken`` carries ``text``, ``item_type``, and
         ``content_type`` metadata for content classification.
 
@@ -604,9 +597,16 @@ class Router:
             ValidationError: If the specified model is not found in targets.
             StateError: If the router has been closed.
         """
-        from ._bindings import RouterGenerateConfig
+        import ctypes
+        import queue
+        import threading
+
+        from ._bindings import RouterGenerateConfig, StopFlag, StreamCallbackType
 
         model = self._resolve_model(model)
+
+        # Use caller's stop flag or create an internal one for cancellation
+        internal_stop = stop_flag or StopFlag()
 
         # Build C config struct
         chat_template_str = self._resolve_chat_template(config.chat_template) if config else None
@@ -624,7 +624,7 @@ class Router:
             extra_context=config.extra_context if config else None,
             tools_json=config.tools_json if config else None,
             tool_choice=config.tool_choice if config else None,
-            stop_flag=stop_flag,  # Allow async callers to pass stop_flag for cancellation
+            stop_flag=internal_stop,
             extra_body=config.extra_body if config else None,
         )
 
@@ -642,61 +642,76 @@ class Router:
         # Get or create backend handle for this model
         backend_handle = self._get_or_create_backend(model)
 
-        # Create iterator
-        iterator = _c.iterator_create(
-            self._lib,
-            chat._chat_ptr,
-            parts,
-            len(parts_list),
-            backend_handle,
-            c_config,
-        )
+        # Token queue: callback pushes StreamToken, generator pulls.
+        # None sentinel signals end of generation.
+        token_queue: queue.Queue[StreamToken | None] = queue.Queue()
+        gen_error: list[BaseException | None] = [None]
 
-        if not iterator:
-            from talu._bindings import get_last_error
+        # Define the C callback that receives tokens from Zig.
+        # Must be kept alive for the duration of the call.
+        @StreamCallbackType
+        def on_token(text_ptr, text_len, item_type, content_type, is_final, _userdata):
+            if is_final:
+                return 1
+            if text_len > 0:
+                text = ctypes.string_at(text_ptr, text_len).decode("utf-8", errors="replace")
+                token_queue.put(StreamToken(text, item_type, content_type))
+            return 0 if internal_stop.is_set() else 1
 
-            zig_error = get_last_error()
-            raise GenerationError(
-                f"Router.stream() failed to create iterator: {zig_error or 'unknown error'}",
-                code="ITERATOR_CREATE_FAILED",
-            )
+        def run_generation():
+            try:
+                result = _c.router_generate_streaming(
+                    self._lib,
+                    chat._chat_ptr,
+                    parts,
+                    len(parts_list),
+                    backend_handle,
+                    c_config,
+                    on_token,
+                )
+                if result.error_code != 0:
+                    from talu._bindings import get_last_error
 
-        # Track this iterator so close() can wait for it
-        iterator_id = id(iterator)
-        with self._active_iterators_lock:
-            self._active_iterators.add(iterator_id)
+                    zig_error = get_last_error()
+                    gen_error[0] = GenerationError(
+                        f"Router.stream() failed: {zig_error or f'error code {result.error_code}'}",
+                        code="GENERATION_FAILED",
+                        details={"error_code": result.error_code},
+                    )
+            except BaseException as e:
+                gen_error[0] = e
+            finally:
+                token_queue.put(None)
+
+        gen_thread = threading.Thread(target=run_generation, daemon=True)
+
+        # Track thread for safe shutdown
+        with self._active_threads_lock:
+            self._active_threads.add(gen_thread)
+
+        gen_thread.start()
 
         try:
-            # Poll for tokens
             while True:
-                text = _c.iterator_next(self._lib, iterator)
-                if text is None:
-                    # Check for errors
-                    if _c.iterator_has_error(self._lib, iterator):
-                        error_code = _c.iterator_error_code(self._lib, iterator)
-                        raise GenerationError(
-                            f"Router.stream() failed with error code {error_code}",
-                            code="GENERATION_FAILED",
-                            details={"error_code": error_code},
-                        )
+                token = token_queue.get()
+                if token is None:
                     break
-                # Read content classification for this token
-                item_type = _c.iterator_item_type(self._lib, iterator)
-                content_type = _c.iterator_content_type(self._lib, iterator)
-                yield StreamToken(text, item_type, content_type)
+                yield token
         except GeneratorExit:
-            # Generator was closed early (e.g., break in for loop)
-            _c.iterator_cancel(self._lib, iterator)
+            # Generator closed early (e.g., break in for loop) — cancel generation
+            internal_stop.signal()
+            gen_thread.join()
             raise
         finally:
-            # Always free the iterator
-            _c.iterator_free(self._lib, iterator)
-            # Keep data_refs alive until here
+            gen_thread.join()
+            # Keep data_refs and on_token alive until generation thread completes
             del data_refs
-            # Untrack iterator and notify waiters
-            with self._active_iterators_lock:
-                self._active_iterators.discard(iterator_id)
-                self._iterator_done.notify_all()
+            del on_token
+            # Untrack thread
+            with self._active_threads_lock:
+                self._active_threads.discard(gen_thread)
+            if gen_error[0] is not None:
+                raise gen_error[0]
 
     async def stream_async(
         self,
@@ -885,11 +900,6 @@ class Router:
                 threads_to_wait = list(self._active_threads)
             for thread in threads_to_wait:
                 thread.join()  # Blocking wait - generation must complete
-
-            # Wait for all active sync stream iterators to complete
-            with self._active_iterators_lock:
-                while self._active_iterators:
-                    self._iterator_done.wait()
 
             # Free this router's backend and canonical handles only.
             # Do NOT call talu_router_close_all() - that clears the GLOBAL

@@ -212,7 +212,7 @@ impl From<i32> for LogFormat {
     }
 }
 
-/// Source: core/src/router/iterator.zig
+/// Source: core/src/router/spec.zig
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BackendType {
@@ -5420,8 +5420,6 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_router_close_all();
     // core/src/capi/router.zig
-    pub fn talu_router_create_iterator(chat_handle: *mut c_void, parts: *const GenerateContentPart, num_parts: usize, backend: *mut c_void, config: *const CGenerateConfig) -> *mut c_void;
-    // core/src/capi/router.zig
     pub fn talu_router_embed(model: *const c_char, text: *const c_char, pooling: CPoolingStrategy, normalize: bool, out_embedding: *mut c_void, out_dim: *mut c_void) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_router_embedding_dim(model: *const c_char) -> usize;
@@ -5429,42 +5427,8 @@ extern "C" {
     pub fn talu_router_embedding_free(embedding: *const f32, dim: usize);
     // core/src/capi/router.zig
     pub fn talu_router_generate_with_backend(chat_handle: *mut c_void, parts: *const GenerateContentPart, num_parts: usize, backend: *mut c_void, config: *const CGenerateConfig) -> CGenerateResult;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_cancel(iterator: *mut c_void);
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_completion_tokens(iterator: *mut c_void) -> usize;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_content_type(iterator: *mut c_void) -> u8;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_error_code(iterator: *mut c_void) -> c_int;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_error_msg(iterator: *mut c_void) -> *const c_char;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_finish_reason(iterator: *mut c_void) -> u8;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_first_token_ns(iterator: *mut c_void) -> i128;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_free(iterator: *mut c_void);
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_generation_ns(iterator: *mut c_void) -> u64;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_has_error(iterator: *mut c_void) -> bool;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_item_type(iterator: *mut c_void) -> u8;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_next(iterator: *mut c_void) -> *const c_char;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_output_text(iterator: *mut c_void) -> *const c_char;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_prefill_ns(iterator: *mut c_void) -> u64;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_prompt_tokens(iterator: *mut c_void) -> usize;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_streamed_token_count(iterator: *mut c_void) -> usize;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_token_timestamp_ns(iterator: *mut c_void) -> i128;
-    // core/src/capi/router.zig
-    pub fn talu_router_iterator_ttft_ns(iterator: *mut c_void) -> u64;
+    // core/src/capi/router.zig (manually added - callback param mapped to *mut c_void)
+    pub fn talu_router_generate_streaming(chat_handle: *mut c_void, parts: *const GenerateContentPart, num_parts: usize, backend: *mut c_void, config: *const CGenerateConfig, stream_cb: *mut c_void, stream_cb_data: *mut c_void) -> CGenerateResult;
     // core/src/capi/router.zig
     pub fn talu_router_result_free(result: *mut CGenerateResult);
     // core/src/capi/scheduler.zig

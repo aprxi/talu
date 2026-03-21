@@ -458,10 +458,11 @@ pub fn generate(
     Ok(GenerateResult::new(result))
 }
 
-/// Generates text using the specified backend with streaming via iterator API.
+/// Generates text using the specified backend with streaming via callback API.
 ///
-/// Uses a pull-based iterator internally for reliable streaming without
-/// callback lifetime issues. Returns stats after streaming completes.
+/// Uses the Zig core's callback-based streaming: token decoding and reasoning-tag
+/// filtering happen Zig-side, with rich (text, item_type, content_type) callbacks
+/// delivered synchronously. Blocks until generation completes.
 pub fn generate_stream(
     chat: &ChatHandle,
     content: &[ContentPart],
@@ -472,121 +473,92 @@ pub fn generate_stream(
     let parts_holder = ContentPartsHolder::new(content)?;
     let config_holder = ConfigHolder::new(config)?;
 
-    // Create iterator
-    // SAFETY: All pointers are valid. chat, backend are valid handles.
-    // parts_holder and config_holder keep the underlying data alive.
-    let iterator = unsafe {
-        talu_sys::talu_router_create_iterator(
+    // State shared between the C callback and this function.
+    struct CallbackState<'a> {
+        callback: &'a mut StreamCallback,
+        emitted_visible: bool,
+        token_count: usize,
+    }
+
+    let mut state = CallbackState {
+        callback: &mut callback,
+        emitted_visible: false,
+        token_count: 0,
+    };
+
+    // C-compatible callback that bridges to the Rust StreamCallback.
+    unsafe extern "C" fn stream_trampoline(
+        text_ptr: *const u8,
+        text_len: usize,
+        item_type: u8,
+        content_type: u8,
+        is_final: u8,
+        userdata: *mut c_void,
+    ) -> u8 {
+        let state = &mut *(userdata as *mut CallbackState);
+        if is_final != 0 || text_len == 0 {
+            return 1; // continue (final is just a signal)
+        }
+
+        let text_bytes = std::slice::from_raw_parts(text_ptr, text_len);
+        let text = std::str::from_utf8(text_bytes).unwrap_or_else(|_| {
+            // Lossy fallback for non-UTF8 (byte-level tokenizers)
+            std::str::from_utf8(&text_bytes[..text_bytes.len().min(0)]).unwrap_or("")
+        });
+
+        // If we got valid text, use String::from_utf8_lossy for non-UTF8
+        let text_owned;
+        let text_ref = if text.is_empty() && text_len > 0 {
+            text_owned = String::from_utf8_lossy(text_bytes);
+            text_owned.as_ref()
+        } else {
+            text
+        };
+
+        if !state.emitted_visible && has_visible_text(text_ref) {
+            state.emitted_visible = true;
+        }
+        state.token_count += 1;
+
+        let stream_token = StreamToken {
+            text: text_ref,
+            item_type: talu_sys::ItemType::from(item_type),
+            content_type: talu_sys::ContentType::from(content_type),
+            tokens_generated: state.token_count,
+            elapsed_ns: 0,
+        };
+
+        if (state.callback)(&stream_token) {
+            1 // continue
+        } else {
+            0 // stop
+        }
+    }
+
+    // C callback function pointer type matching the Zig StreamCallback.
+    type CStreamCb = unsafe extern "C" fn(*const u8, usize, u8, u8, u8, *mut c_void) -> u8;
+    let cb_ptr: CStreamCb = stream_trampoline;
+
+    // SAFETY: All pointers valid. The callback state lives on our stack frame
+    // and talu_router_generate_streaming blocks until complete.
+    let result = unsafe {
+        talu_sys::talu_router_generate_streaming(
             chat.as_ptr(),
             parts_holder.as_ptr(),
             parts_holder.len(),
             backend.as_ptr(),
             config_holder.as_ptr(),
+            cb_ptr as *mut c_void,
+            &mut state as *mut CallbackState as *mut c_void,
         )
     };
 
-    if iterator.is_null() {
-        return Err(error_from_last_or("Failed to create iterator"));
+    if result.error_code != 0 {
+        return Err(error_from_last_or("Streaming generation failed"));
     }
 
-    let mut emitted_visible_text = false;
-
-    // Poll for tokens
-    loop {
-        // SAFETY: iterator is valid (checked above)
-        let token_ptr = unsafe { talu_sys::talu_router_iterator_next(iterator) };
-
-        if token_ptr.is_null() {
-            // Check for errors
-            // SAFETY: iterator is valid
-            if unsafe { talu_sys::talu_router_iterator_has_error(iterator) } {
-                // Try to get error message first, fall back to error code
-                let error_msg_ptr = unsafe { talu_sys::talu_router_iterator_error_msg(iterator) };
-                let error_message = if !error_msg_ptr.is_null() {
-                    // SAFETY: error_msg_ptr is valid C string from the iterator
-                    unsafe { CStr::from_ptr(error_msg_ptr) }
-                        .to_str()
-                        .ok()
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                };
-                let error_code = unsafe { talu_sys::talu_router_iterator_error_code(iterator) };
-                // SAFETY: iterator is valid
-                unsafe { talu_sys::talu_router_iterator_free(iterator) };
-                return Err(crate::error::Error::generic(error_message.unwrap_or_else(
-                    || format!("Generation failed with error code {}", error_code),
-                )));
-            }
-            break;
-        }
-
-        // SAFETY: token_ptr is valid C string from the iterator.
-        // Stream chunks can contain non-UTF8 byte sequences for byte-level
-        // tokenizers; preserve them lossily instead of dropping the chunk.
-        let token_text = unsafe { CStr::from_ptr(token_ptr) }.to_string_lossy();
-
-        // Read content classification for this token
-        // SAFETY: iterator is valid
-        let item_type =
-            talu_sys::ItemType::from(unsafe { talu_sys::talu_router_iterator_item_type(iterator) });
-        let content_type = talu_sys::ContentType::from(unsafe {
-            talu_sys::talu_router_iterator_content_type(iterator)
-        });
-
-        // Read engine-level timing for cumulative tok/s
-        // SAFETY: iterator is valid
-        let tokens_generated =
-            unsafe { talu_sys::talu_router_iterator_streamed_token_count(iterator) };
-        let first_ns =
-            unsafe { talu_sys::talu_router_iterator_first_token_ns(iterator) };
-        let token_ns =
-            unsafe { talu_sys::talu_router_iterator_token_timestamp_ns(iterator) };
-        let elapsed_ns = if first_ns > 0 && token_ns > first_ns {
-            (token_ns - first_ns) as u64
-        } else {
-            0
-        };
-
-        let stream_token = StreamToken {
-            text: token_text.as_ref(),
-            item_type,
-            content_type,
-            tokens_generated,
-            elapsed_ns,
-        };
-        if !emitted_visible_text && has_visible_text(stream_token.text) {
-            emitted_visible_text = true;
-        }
-
-        // Call user callback
-        if !callback(&stream_token) {
-            // User requested stop
-            // SAFETY: iterator is valid
-            unsafe { talu_sys::talu_router_iterator_cancel(iterator) };
-            break;
-        }
-    }
-
-    if !emitted_visible_text {
-        let final_text_ptr = unsafe { talu_sys::talu_router_iterator_output_text(iterator) };
-        if !final_text_ptr.is_null() {
-            let final_text = unsafe { CStr::from_ptr(final_text_ptr) }.to_string_lossy();
-            if has_visible_text(final_text.as_ref()) {
-                let fallback = StreamToken {
-                    text: final_text.as_ref(),
-                    item_type: talu_sys::ItemType::Message,
-                    content_type: talu_sys::ContentType::OutputText,
-                    tokens_generated: 0,
-                    elapsed_ns: 0,
-                };
-                let _ = callback(&fallback);
-                emitted_visible_text = true;
-            }
-        }
-    }
-
-    if !emitted_visible_text {
+    // If no visible text was streamed, try fallback from conversation.
+    if !state.emitted_visible {
         if let Ok(Some(text)) = chat.responses().last_assistant_message_text() {
             if has_visible_text(&text) {
                 let fallback = StreamToken {
@@ -601,24 +573,16 @@ pub fn generate_stream(
         }
     }
 
-    // Get stats before freeing iterator
-    // SAFETY: iterator is valid
-    let result = StreamResult {
-        prompt_tokens: unsafe { talu_sys::talu_router_iterator_prompt_tokens(iterator) },
-        completion_tokens: unsafe { talu_sys::talu_router_iterator_completion_tokens(iterator) },
-        prefill_ns: unsafe { talu_sys::talu_router_iterator_prefill_ns(iterator) },
-        generation_ns: unsafe { talu_sys::talu_router_iterator_generation_ns(iterator) },
-        ttft_ns: unsafe { talu_sys::talu_router_iterator_ttft_ns(iterator) },
-        finish_reason: crate::FinishReason::from(talu_sys::CFinishReason::from(unsafe {
-            talu_sys::talu_router_iterator_finish_reason(iterator)
-        })),
-    };
-
-    // Free iterator
-    // SAFETY: iterator is valid
-    unsafe { talu_sys::talu_router_iterator_free(iterator) };
-
-    Ok(result)
+    Ok(StreamResult {
+        prompt_tokens: result.prompt_tokens,
+        completion_tokens: result.completion_tokens,
+        prefill_ns: result.prefill_ns,
+        generation_ns: result.generation_ns,
+        ttft_ns: result.ttft_ns,
+        finish_reason: crate::FinishReason::from(talu_sys::CFinishReason::from(
+            result.finish_reason,
+        )),
+    })
 }
 
 /// Serializes the chat conversation to an OpenAI Completions-format JSON string.

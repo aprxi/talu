@@ -4,7 +4,7 @@
 //! to inference backends (local engines or remote APIs).
 //!
 //! Architecture:
-//!   - Generation: sync and iterator-based streaming via InferenceBackend
+//!   - Generation: sync and callback-based streaming via InferenceBackend
 //!   - Embeddings: text embedding extraction with configurable pooling
 //!   - Config: model spec validation, canonicalization, and backend creation
 //!   - Backend: lifecycle management for inference backends
@@ -147,266 +147,56 @@ pub export fn talu_router_generate_with_backend(
 }
 
 // =============================================================================
-// Iterator API (Pull-based Streaming)
+// Streaming Callback API
 // =============================================================================
 
-/// Opaque handle to a token iterator.
-pub const TaluTokenIterator = opaque {};
+/// Streaming callback type.
+/// Called per decoded text segment: (text_ptr, text_len, item_type, content_type, is_final, userdata).
+/// Return 1 to continue, 0 to stop generation.
+pub const StreamCallback = capi_bridge.StreamCallback;
 
-/// Creates a token iterator for pull-based streaming generation.
+/// Generates a response with per-token streaming via callback.
 ///
-/// The iterator manages a background thread that generates tokens into a ring
-/// buffer. Use talu_router_iterator_next() to poll for tokens.
+/// The callback fires once per decoded text segment (after UTF-8 assembly and
+/// reasoning-tag filtering). Blocks until generation completes or callback
+/// returns 0. Returns the same result struct as talu_router_generate_with_backend.
 ///
-/// Returns null on error (check talu_last_error() for details).
-/// Caller must free with talu_router_iterator_free().
-pub export fn talu_router_create_iterator(
+/// Only supported for local backends. Returns error for remote/HTTP backends.
+pub export fn talu_router_generate_streaming(
     chat_handle: ?*ChatHandle,
     parts: ?[*]const GenerateContentPart,
     num_parts: usize,
     backend: ?*TaluInferenceBackend,
     config: ?*const RouterGenerateConfig,
-) callconv(.c) ?*TaluTokenIterator {
+    stream_cb: ?StreamCallback,
+    stream_cb_data: ?*anyopaque,
+) callconv(.c) RouterGenerateResult {
     capi_error.clearError();
 
-    // Validate inputs
     const chat: *Chat = @ptrCast(@alignCast(chat_handle orelse {
         capi_error.setErrorWithCode(.invalid_argument, "chat_handle is null", .{});
-        return null;
+        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
     }));
-    // Allow null parts with num_parts==0 for continuation calls (agent loop).
-    // When parts are null/empty, the iterator continues from the existing
-    // conversation state without appending a new user message.
     const empty_parts: [0]GenerateContentPart = .{};
-    const content_parts: []const GenerateContentPart = if (parts) |p|
+    const effective_parts: []const GenerateContentPart = if (parts) |p|
         p[0..num_parts]
     else if (num_parts == 0)
         &empty_parts
     else {
         capi_error.setErrorWithCode(.invalid_argument, "parts is null but num_parts > 0", .{});
-        return null;
+        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
     };
     const backend_ptr: *spec_mod.InferenceBackend = @ptrCast(@alignCast(backend orelse {
         capi_error.setErrorWithCode(.invalid_argument, "backend is null", .{});
-        return null;
+        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
     }));
-
-    // Delegate to bridge module
-    const iter = capi_bridge.createIterator(allocator, chat, content_parts, backend_ptr, config) catch |err| {
-        switch (err) {
-            error.InvalidArgument => capi_error.setErrorWithCode(.invalid_argument, "backend is unspecified or invalid", .{}),
-            error.OutOfMemory => capi_error.setErrorWithCode(.out_of_memory, "failed to allocate memory", .{}),
-            error.IteratorCreationFailed => capi_error.setErrorWithCode(.internal_error, "failed to create iterator", .{}),
-        }
-        return null;
+    const cb = stream_cb orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "stream_cb is null", .{});
+        return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
     };
 
-    return @ptrCast(iter);
-}
-
-/// Gets the next token from the iterator.
-///
-/// Blocks until a token is available or generation completes.
-/// Returns null when generation is complete (EOS, max_tokens, or cancelled).
-/// The returned string is valid until the next talu_router_iterator_next() call.
-pub export fn talu_router_iterator_next(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) ?[*:0]const u8 {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return null));
-    return iter.next();
-}
-
-/// Checks if the iterator encountered an error.
-///
-/// Call this after talu_router_iterator_next() returns null to check if
-/// generation completed normally or due to an error.
-pub export fn talu_router_iterator_has_error(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) bool {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return false));
-    return iter.hasError();
-}
-
-/// Gets the error code from the iterator (0 = no error).
-pub export fn talu_router_iterator_error_code(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) i32 {
-    capi_error.clearError();
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return -1));
-    return iter.getErrorCode();
-}
-
-/// Gets the error message from the iterator (null if no error).
-///
-/// The returned pointer is valid until the iterator is freed.
-/// Returns null if no error occurred or iterator is null.
-pub export fn talu_router_iterator_error_msg(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) ?[*:0]const u8 {
-    capi_error.clearError();
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return null));
-    const msg = iter.getErrorMsg() orelse return null;
-    // msg is allocated with a trailing null byte by setErrorMsg().
-    return @ptrCast(msg.ptr);
-}
-
-/// Cancels generation early.
-///
-/// Signals the background thread to stop. talu_router_iterator_next() will
-/// return null after any buffered tokens are consumed.
-pub export fn talu_router_iterator_cancel(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) void {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return));
-    iter.cancel();
-}
-
-/// Frees the iterator and all associated resources.
-///
-/// Waits for the background thread to complete (cancels if still running).
-/// Must only be called once per iterator.
-pub export fn talu_router_iterator_free(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) void {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return));
-    iter.deinit();
-}
-
-/// Gets the prompt token count from a completed iterator.
-///
-/// Returns 0 if generation is not yet complete or iterator is null.
-pub export fn talu_router_iterator_prompt_tokens(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) usize {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
-    return iter.getPromptTokens();
-}
-
-/// Gets the completion token count from a completed iterator.
-///
-/// Returns 0 if generation is not yet complete or iterator is null.
-pub export fn talu_router_iterator_completion_tokens(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) usize {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
-    return iter.getCompletionTokens();
-}
-
-/// Gets the prefill time in nanoseconds from a completed iterator.
-///
-/// Returns 0 if generation is not yet complete or iterator is null.
-pub export fn talu_router_iterator_prefill_ns(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) u64 {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
-    return iter.getPrefillNs();
-}
-
-/// Gets the generation time in nanoseconds from a completed iterator.
-///
-/// Returns 0 if generation is not yet complete or iterator is null.
-pub export fn talu_router_iterator_generation_ns(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) u64 {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
-    return iter.getGenerationNs();
-}
-
-/// Gets the time-to-first-token in nanoseconds from a completed iterator.
-///
-/// Measures wall-clock time from generation start to first token pushed.
-/// Returns 0 if generation is not yet complete, iterator is null, or no tokens
-/// were produced.
-pub export fn talu_router_iterator_ttft_ns(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) u64 {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
-    return iter.getTtftNs();
-}
-
-/// Gets the final decoded output text after generation completes.
-///
-/// Returns null if iterator is null or no final text is available.
-/// Pointer remains valid until talu_router_iterator_free().
-pub export fn talu_router_iterator_output_text(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) ?[*:0]const u8 {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return null));
-    return iter.getFinalText();
-}
-
-/// Gets the item type of the most recently returned token.
-///
-/// Returns a responses ItemType discriminator (u8).
-/// Values: 0=message, 1=function_call, 3=reasoning, 255=unknown.
-/// Call after talu_router_iterator_next() to classify the token.
-/// Returns 255 if iterator is null or no token has been returned yet.
-pub export fn talu_router_iterator_item_type(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) u8 {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 255));
-    return iter.getItemType();
-}
-
-/// Gets the content type of the most recently returned token.
-///
-/// Returns a responses ContentType discriminator (u8).
-/// Values: 5=output_text, 8=reasoning_text, 255=unknown.
-/// Call after talu_router_iterator_next() to classify the token.
-/// Returns 255 if iterator is null or no token has been returned yet.
-pub export fn talu_router_iterator_content_type(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) u8 {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 255));
-    return iter.getContentType();
-}
-
-/// Gets the finish reason after generation completes.
-///
-/// Returns a FinishReason discriminator (u8).
-/// Values: 0=eos_token, 1=length, 2=stop_sequence, 3=tool_calls,
-///         4=content_filter, 5=cancelled, 255=not_finished.
-/// Call after talu_router_iterator_next() returns null.
-/// Returns 255 if iterator is null or generation is still running.
-pub export fn talu_router_iterator_finish_reason(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) u8 {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 255));
-    return iter.getFinishReason();
-}
-
-/// Gets the nanosecond timestamp of the most recently returned token.
-///
-/// Returns std.time.nanoTimestamp() captured when the token was pushed to the
-/// ring buffer during generation. Call after talu_router_iterator_next().
-/// Returns 0 if iterator is null or no token has been returned yet.
-pub export fn talu_router_iterator_token_timestamp_ns(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) i128 {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
-    return iter.getTokenTimestampNs();
-}
-
-/// Gets the cumulative count of tokens streamed so far.
-///
-/// Live counter incremented each time a decoded token is pushed to the ring
-/// buffer. Safe to call during generation (atomic read).
-/// Returns 0 if iterator is null.
-pub export fn talu_router_iterator_streamed_token_count(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) usize {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
-    return iter.getStreamedTokenCount();
-}
-
-/// Gets the nanosecond timestamp of the first streamed token.
-///
-/// Returns 0 if iterator is null or no tokens have been streamed yet.
-pub export fn talu_router_iterator_first_token_ns(
-    iterator: ?*TaluTokenIterator,
-) callconv(.c) i128 {
-    const iter: *router_mod.TokenIterator = @ptrCast(@alignCast(iterator orelse return 0));
-    return iter.getFirstTokenTimestampNs();
+    const result = capi_bridge.generateStreamingWithBackend(allocator, chat, effective_parts, backend_ptr, config, cb, stream_cb_data);
+    return capi_bridge.toCResult(allocator, result);
 }
 
 // =============================================================================

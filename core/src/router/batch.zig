@@ -52,10 +52,10 @@ const allocator = std.heap.c_allocator;
 // Constants
 // =============================================================================
 
-/// Maximum decoded bytes per token (matches iterator.zig).
+/// Maximum decoded bytes per token.
 const MAX_TOKEN_LEN = 512;
 
-/// Maximum tag length for reasoning filter (matches iterator.zig).
+/// Maximum tag length for reasoning filter.
 const MAX_TAG_LEN = 64;
 
 /// Maximum text accumulation per request (64 KiB delta buffer).
@@ -530,7 +530,7 @@ pub const BatchWrapper = struct {
             // Decode token to raw bytes via pre-computed table (zero-alloc O(1) lookup).
             const decoded_raw: []const u8 = self.engine.tok.tokenBytes(raw.token) orelse "";
 
-            // UTF-8 assembly (same algorithm as iterator.zig).
+            // UTF-8 assembly (same algorithm as capi_bridge.zig).
             var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
             const pending_len: usize = state.utf8_pending_len;
             @memcpy(combined_buf[0..pending_len], state.utf8_pending[0..pending_len]);
@@ -1094,7 +1094,7 @@ pub const BatchWrapper = struct {
 // =============================================================================
 
 /// Decode a token to raw bytes using context-aware pair decoding.
-/// Same algorithm as iterator.zig decodeRawWithContext.
+/// Same algorithm as capi_bridge.zig decodeRawWithContext.
 fn decodeTokenWithContext(engine: *LocalEngine, state: *const RequestState, token_id: u32) ![]u8 {
     if (state.decode_context_token) |ctx_token| {
         const ctx_raw = engine.tok.decodeRawBytes(
@@ -1226,7 +1226,7 @@ fn appendFilteredSegment(
 /// Run reasoning tag filter on decoded text. Updates state inline.
 /// Returns the text to emit (tag bytes are consumed, not emitted).
 ///
-/// Simplified from iterator.zig filterAndPush: instead of pushing to
+/// Simplified from capi_bridge.zig filterAndPush: instead of pushing to
 /// a ring buffer, we return the filtered text. The caller accumulates.
 fn filterReasoningTags(
     state: *RequestState,

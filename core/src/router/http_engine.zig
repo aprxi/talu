@@ -124,7 +124,7 @@ pub const GenerateOptions = struct {
     tool_choice: ?[]const u8 = null,
 
     /// When true, preserve raw stream content without reasoning-tag filtering.
-    /// This is consumed by router/iterator.zig.
+    /// This is consumed by the streaming generation wrapper.
     raw_output: bool = false,
 };
 

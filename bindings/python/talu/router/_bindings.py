@@ -7,7 +7,7 @@ methods that handle Python-to-C conversion with proper reference counting
 for stop sequences and logit bias arrays. CBackendUnion (ctypes.Union) for
 model spec backend configuration. Model spec FFI functions (build_c_spec,
 config_canonicalize, config_get_view, backend_get_capabilities).
-Response format FFI functions. Router generation and iterator FFI functions.
+Response format FFI functions. Router generation and streaming FFI functions.
 """
 
 import ctypes
@@ -890,22 +890,35 @@ def router_embed(
 
 
 # =============================================================================
-# Iterator API (Pull-based Streaming)
+# Streaming Callback API
 # =============================================================================
 
-# Opaque handle type for token iterator
-TaluTokenIteratorHandle = ctypes.c_void_p
+# Callback type: fn(text_ptr, text_len, item_type, content_type, is_final, userdata) -> continue(1)/stop(0)
+StreamCallbackType = ctypes.CFUNCTYPE(
+    ctypes.c_uint8,                    # return: 1=continue, 0=stop
+    ctypes.POINTER(ctypes.c_char),     # text_ptr
+    ctypes.c_size_t,                   # text_len
+    ctypes.c_uint8,                    # item_type
+    ctypes.c_uint8,                    # content_type
+    ctypes.c_uint8,                    # is_final
+    ctypes.c_void_p,                   # userdata
+)
 
 
-def iterator_create(
+def router_generate_streaming(
     lib: Any,
     chat_ptr: Any,
     content_parts: "ctypes.Array",
     parts_count: int,
     backend_handle: "TaluInferenceBackendHandle",
-    config: "RouterGenerateConfig | None",
-) -> TaluTokenIteratorHandle:
-    """Create a token iterator for pull-based streaming.
+    config: "RouterGenerateConfig",
+    callback: Any,
+) -> Any:
+    """Call talu_router_generate_streaming C API.
+
+    Blocks until generation completes. The callback is invoked for each
+    token/segment during generation with (text, item_type, content_type).
+    The final invocation has is_final=1.
 
     Args:
         lib: The loaded talu shared library.
@@ -913,135 +926,36 @@ def iterator_create(
         content_parts: CContentPart array.
         parts_count: Number of content parts.
         backend_handle: Backend handle.
-        config: Optional RouterGenerateConfig.
+        config: RouterGenerateConfig (must include stop_flag for cancellation).
+        callback: StreamCallbackType ctypes callback function.
 
     Returns
     -------
-        Iterator handle, or None on error.
+        CGenerateResult struct from C API.
     """
-    return lib.talu_router_create_iterator(
+    # Set up argtypes/restype if not already configured (the auto-generated
+    # _native.py maps the callback param as c_void_p).
+    from .._native import CGenerateResult
+
+    if not hasattr(lib.talu_router_generate_streaming, '_streaming_configured'):
+        lib.talu_router_generate_streaming.argtypes = [
+            ctypes.c_void_p,  # chat_handle
+            ctypes.c_void_p,  # parts
+            ctypes.c_size_t,  # num_parts
+            ctypes.c_void_p,  # backend
+            ctypes.c_void_p,  # config
+            ctypes.c_void_p,  # stream_cb (function pointer as void*)
+            ctypes.c_void_p,  # stream_cb_data
+        ]
+        lib.talu_router_generate_streaming.restype = CGenerateResult
+        lib.talu_router_generate_streaming._streaming_configured = True
+
+    return lib.talu_router_generate_streaming(
         chat_ptr,
         content_parts,
         parts_count,
         backend_handle,
-        ctypes.byref(config) if config else None,
+        ctypes.byref(config),
+        ctypes.cast(callback, ctypes.c_void_p),
+        None,  # userdata (unused — callback captures state via closure)
     )
-
-
-def iterator_next(lib: Any, iterator: TaluTokenIteratorHandle) -> str | None:
-    """Get the next token from the iterator.
-
-    Blocks until a token is available or generation completes.
-
-    Args:
-        lib: The loaded talu shared library.
-        iterator: Iterator handle.
-
-    Returns
-    -------
-        Token string, or None when generation is complete.
-    """
-    result = lib.talu_router_iterator_next(iterator)
-    if result:
-        return ctypes.string_at(result).decode("utf-8", errors="replace")
-    return None
-
-
-def iterator_has_error(lib: Any, iterator: TaluTokenIteratorHandle) -> bool:
-    """Check if the iterator encountered an error.
-
-    Args:
-        lib: The loaded talu shared library.
-        iterator: Iterator handle.
-
-    Returns
-    -------
-        True if an error occurred.
-    """
-    return lib.talu_router_iterator_has_error(iterator)
-
-
-def iterator_error_code(lib: Any, iterator: TaluTokenIteratorHandle) -> int:
-    """Get the error code from the iterator.
-
-    Args:
-        lib: The loaded talu shared library.
-        iterator: Iterator handle.
-
-    Returns
-    -------
-        Error code (0 = no error).
-    """
-    return lib.talu_router_iterator_error_code(iterator)
-
-
-def iterator_cancel(lib: Any, iterator: TaluTokenIteratorHandle) -> None:
-    """Cancel generation early.
-
-    Args:
-        lib: The loaded talu shared library.
-        iterator: Iterator handle.
-    """
-    lib.talu_router_iterator_cancel(iterator)
-
-
-def iterator_free(lib: Any, iterator: TaluTokenIteratorHandle) -> None:
-    """Free the iterator and all associated resources.
-
-    Args:
-        lib: The loaded talu shared library.
-        iterator: Iterator handle.
-    """
-    lib.talu_router_iterator_free(iterator)
-
-
-def iterator_item_type(lib: Any, iterator: TaluTokenIteratorHandle) -> int:
-    """Get the item type of the most recently returned token.
-
-    Returns an ItemType discriminator (u8).
-    Values: 0=message, 1=function_call, 3=reasoning, 255=unknown.
-
-    Args:
-        lib: The loaded talu shared library.
-        iterator: Iterator handle.
-
-    Returns
-    -------
-        Item type discriminator.
-    """
-    return lib.talu_router_iterator_item_type(iterator)
-
-
-def iterator_content_type(lib: Any, iterator: TaluTokenIteratorHandle) -> int:
-    """Get the content type of the most recently returned token.
-
-    Returns a ContentType discriminator (u8).
-    Values: 5=output_text, 8=reasoning_text, 255=unknown.
-
-    Args:
-        lib: The loaded talu shared library.
-        iterator: Iterator handle.
-
-    Returns
-    -------
-        Content type discriminator.
-    """
-    return lib.talu_router_iterator_content_type(iterator)
-
-
-def iterator_finish_reason(lib: Any, iterator: TaluTokenIteratorHandle) -> int:
-    """Get the finish reason after generation completes.
-
-    Returns a FinishReason discriminator (u8).
-    Values: 0=eos_token, 1=length, 2=stop_sequence, 3=tool_calls,
-            4=content_filter, 5=cancelled, 255=not_finished.
-
-    Args:
-        lib: The loaded talu shared library.
-        iterator: Iterator handle.
-
-    Returns
-    -------
-        Finish reason discriminator.
-    """
-    return lib.talu_router_iterator_finish_reason(iterator)

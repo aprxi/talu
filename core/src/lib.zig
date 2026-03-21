@@ -297,25 +297,12 @@ comptime {
 
     // Router API (backend-based)
     _ = &capi.talu_router_generate_with_backend;
+    _ = &capi.talu_router_generate_streaming;
     _ = &capi.talu_router_result_free;
     _ = &capi.talu_router_close_all;
     _ = &capi.talu_router_embedding_dim;
     _ = &capi.talu_router_embed;
     _ = &capi.talu_router_embedding_free;
-
-    // Iterator API (pull-based streaming)
-    _ = &capi.talu_router_create_iterator;
-    _ = &capi.talu_router_iterator_next;
-    _ = &capi.talu_router_iterator_has_error;
-    _ = &capi.talu_router_iterator_error_code;
-    _ = &capi.talu_router_iterator_error_msg;
-    _ = &capi.talu_router_iterator_cancel;
-    _ = &capi.talu_router_iterator_free;
-    _ = &capi.talu_router_iterator_prompt_tokens;
-    _ = &capi.talu_router_iterator_completion_tokens;
-    _ = &capi.talu_router_iterator_prefill_ns;
-    _ = &capi.talu_router_iterator_generation_ns;
-    _ = &capi.talu_router_iterator_output_text;
 
     // Scheduler API (continuous batching)
     _ = &capi.talu_scheduler_create;

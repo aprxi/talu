@@ -502,6 +502,7 @@ pub const talu_db_ops_snapshot_release = db_ops.talu_db_ops_snapshot_release;
 
 // Re-export Router C API functions (routes generation to inference backends).
 pub const talu_router_generate_with_backend = router.talu_router_generate_with_backend;
+pub const talu_router_generate_streaming = router.talu_router_generate_streaming;
 pub const talu_router_result_free = router.talu_router_result_free;
 pub const talu_router_close_all = router.talu_router_close_all;
 pub const talu_router_embedding_dim = router.talu_router_embedding_dim;
@@ -510,22 +511,6 @@ pub const talu_router_embedding_free = router.talu_router_embedding_free;
 pub const RouterGenerateResult = router.RouterGenerateResult;
 pub const RouterGenerateConfig = router.RouterGenerateConfig;
 pub const GenerateContentPart = router.GenerateContentPart;
-
-// Re-export Iterator API functions (pull-based streaming).
-pub const talu_router_create_iterator = router.talu_router_create_iterator;
-pub const talu_router_iterator_next = router.talu_router_iterator_next;
-pub const talu_router_iterator_has_error = router.talu_router_iterator_has_error;
-pub const talu_router_iterator_error_code = router.talu_router_iterator_error_code;
-pub const talu_router_iterator_error_msg = router.talu_router_iterator_error_msg;
-pub const talu_router_iterator_cancel = router.talu_router_iterator_cancel;
-pub const talu_router_iterator_free = router.talu_router_iterator_free;
-pub const talu_router_iterator_prompt_tokens = router.talu_router_iterator_prompt_tokens;
-pub const talu_router_iterator_completion_tokens = router.talu_router_iterator_completion_tokens;
-pub const talu_router_iterator_prefill_ns = router.talu_router_iterator_prefill_ns;
-pub const talu_router_iterator_generation_ns = router.talu_router_iterator_generation_ns;
-pub const talu_router_iterator_ttft_ns = router.talu_router_iterator_ttft_ns;
-pub const talu_router_iterator_output_text = router.talu_router_iterator_output_text;
-pub const TaluTokenIterator = router.TaluTokenIterator;
 
 // Re-export Scheduler C API functions (continuous batching).
 pub const talu_scheduler_create = scheduler.talu_scheduler_create;

@@ -5,5 +5,4 @@ pub mod common;
 pub mod config;
 pub mod embed;
 pub mod generate;
-pub mod iterator;
 pub mod scheduler;

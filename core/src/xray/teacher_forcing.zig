@@ -46,7 +46,7 @@ pub const TeacherForcingHook = struct {
 /// Global teacher forcing hook.
 ///
 /// Verify can execute generation on a dedicated worker thread (for example via
-/// TokenIterator-backed local generation), while the CLI/bindings enable and
+/// batch-scheduler or callback-backed local generation), while the CLI/bindings enable and
 /// disable teacher forcing on the caller thread. The forced-token contract
 /// therefore has to be process-global and synchronized, not thread-local.
 /// This lock is acceptable because teacher forcing is verify-only debug flow,

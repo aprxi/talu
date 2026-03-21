@@ -11,7 +11,6 @@ const local = @import("local.zig");
 const root = @import("root.zig");
 const spec = @import("spec.zig");
 const http_engine_mod = @import("http_engine.zig");
-const iterator_mod = @import("iterator.zig");
 const commit_mod = @import("commit.zig");
 const responses_mod = @import("../responses/root.zig");
 const inference_types = @import("../inference/root.zig").types;
@@ -372,11 +371,7 @@ pub fn generate(
         return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
     };
 
-    // Local generation uses the iterator-backed worker path for both
-    // streaming and non-streaming requests. Metal execution owns thread-local
-    // MLX state on the thread that performs generation; routing public local
-    // generation through one worker-owned path keeps that lifecycle explicit
-    // and avoids split execution semantics between stream and no-stream.
+    // Local generation calls engine.generate() directly.
     return generateWithLocalEngine(allocator, chat, engine, config);
 }
 
@@ -432,69 +427,504 @@ pub fn generateWithBackend(
     }
 }
 
-/// Generate using LocalEngine (native inference).
+/// Generate using LocalEngine (native inference, non-streaming).
 fn generateWithLocalEngine(
-    allocator: std.mem.Allocator,
+    allocator_: std.mem.Allocator,
     chat: *Chat,
     local_engine: *LocalEngine,
     config: ?*const CGenerateConfig,
 ) GenerateResult {
-    // Build options
-    var built = buildOptions(allocator, config, local_engine) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-    defer built.deinit(allocator);
+    var built = buildOptions(allocator_, config, local_engine) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
+    defer built.deinit(allocator_);
 
-    log.debug("router", "LocalEngine generate (iterator-backed route)", .{
+    log.debug("router", "LocalEngine generate (direct route)", .{
         .max_tokens = built.options.max_tokens orelse 0,
         .has_tools = @as(u8, @intFromBool(built.options.tools_json != null)),
     }, @src());
 
-    var iterator = iterator_mod.TokenIterator.init(allocator, local_engine, chat, built.options) catch |err| {
+    var gen_result = local_engine.generate(chat, built.options) catch |err| {
         capi_error.setError(err, "Generation failed", .{});
         return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
     };
-    defer iterator.deinit();
+    defer gen_result.deinit(local_engine.allocator);
 
-    while (iterator.next() != null) {}
-
-    if (iterator.hasError()) {
-        if (iterator.getErrorMsg()) |msg| {
-            capi_error.setErrorWithCode(.generation_failed, "{s}", .{msg});
-        } else {
-            capi_error.setErrorWithCode(.generation_failed, "Generation failed", .{});
-        }
-        return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
-    }
-
-    const finish_reason: CFinishReason = switch (iterator.getFinishReason()) {
-        @intFromEnum(FinishReason.eos_token) => .eos_token,
-        @intFromEnum(FinishReason.length) => .length,
-        @intFromEnum(FinishReason.stop_sequence) => .stop_sequence,
-        @intFromEnum(FinishReason.tool_calls) => .tool_calls,
-        @intFromEnum(FinishReason.content_filter) => .content_filter,
-        @intFromEnum(FinishReason.cancelled) => .cancelled,
-        else => .eos_token,
+    const finish_reason: CFinishReason = switch (gen_result.finish_reason) {
+        .eos_token => .eos_token,
+        .length => .length,
+        .stop_sequence => .stop_sequence,
+        .tool_calls => .tool_calls,
+        .content_filter => .content_filter,
+        .cancelled => .cancelled,
     };
 
-    const tool_calls = iterator.takeLocalToolCalls();
-    errdefer freeToolCallRefs(allocator, tool_calls);
+    // Transfer tool call ownership from gen_result to our return value.
+    var tool_calls: ?[]const local.ToolCallRef = null;
+    if (gen_result.tool_calls) |tc| {
+        tool_calls = tc;
+        gen_result.tool_calls = null;
+    }
 
-    const final_text = if (iterator.getFinalText()) |text_z|
-        allocator.dupe(u8, std.mem.sliceTo(text_z, 0)) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) }
-    else
-        allocator.dupe(u8, "") catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
+    const result_text = allocator_.dupe(u8, gen_result.text) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
 
     return .{
-        .text = final_text,
-        .token_count = iterator.getCompletionTokens(),
-        .prompt_tokens = iterator.getPromptTokens(),
-        .completion_tokens = iterator.getCompletionTokens(),
-        .prefill_ns = iterator.getPrefillNs(),
-        .generation_ns = iterator.getGenerationNs(),
-        .ttft_ns = iterator.getTtftNs(),
+        .text = result_text,
+        .token_count = gen_result.generated_tokens,
+        .prompt_tokens = gen_result.prompt_tokens,
+        .completion_tokens = gen_result.generated_tokens,
+        .prefill_ns = gen_result.prefill_ns,
+        .generation_ns = gen_result.decode_ns,
+        .ttft_ns = 0,
         .error_code = 0,
         .finish_reason = finish_reason,
         .tool_calls = tool_calls,
     };
+}
+
+// =============================================================================
+// Streaming Generation (callback-based)
+// =============================================================================
+
+/// C callback type for streaming generation.
+/// Returns 1 to continue, 0 to stop.
+pub const StreamCallback = *const fn ([*]const u8, usize, u8, u8, u8, ?*anyopaque) callconv(.c) u8;
+
+/// Maximum decoded bytes per token.
+const MAX_TOKEN_LEN = 512;
+/// Maximum reasoning tag length.
+const MAX_TAG_LEN = 64;
+/// Maximum segments per decoded chunk.
+const MAX_FILTER_SEGMENTS = 64;
+
+/// Filter state for reasoning tag parsing (matches batch.zig).
+const StreamFilterState = enum { normal, reasoning };
+
+/// Typed text segment from reasoning-tag filtering.
+const StreamFilteredSegment = struct {
+    start: usize,
+    len: usize,
+    filter_state: StreamFilterState,
+};
+
+/// Per-token streaming wrapper. Held on the stack during generation.
+/// Decodes tokens, applies UTF-8 assembly and reasoning-tag filtering,
+/// then calls the user's rich C callback with (text, item_type, content_type).
+const StreamingWrapper = struct {
+    tok: *const tokenizer_mod.Tokenizer,
+    user_cb: StreamCallback,
+    user_data: ?*anyopaque,
+    stop_flag: *std.atomic.Value(bool),
+
+    // Reasoning filter state
+    filter_state: StreamFilterState = .normal,
+    filter_partial_buf: [MAX_TAG_LEN]u8 = undefined,
+    filter_partial_len: u8 = 0,
+    filter_out_buf: [MAX_TOKEN_LEN + MAX_TAG_LEN]u8 = undefined,
+    swallow_next_newline: bool = false,
+    start_marker: []const u8 = "<think>",
+    end_marker: []const u8 = "</think>",
+    raw_output: bool = false,
+    is_tool_generation: bool = false,
+
+    // UTF-8 pending bytes
+    utf8_pending: [3]u8 = .{ 0, 0, 0 },
+    utf8_pending_len: u8 = 0,
+
+    // Lazy init: set filter_state from starts_in_reasoning on first token
+    initialized: bool = false,
+    starts_in_reasoning: *bool,
+
+    /// TokenCallback-compatible entry point: fn(token_id, userdata) void.
+    fn onToken(token_id: u32, user_data: ?*anyopaque) void {
+        const self: *StreamingWrapper = @ptrCast(@alignCast(user_data));
+
+        // Lazy init: read starts_in_reasoning (written by generateFromPrompt before decode loop)
+        if (!self.initialized) {
+            self.initialized = true;
+            if (self.starts_in_reasoning.*) {
+                self.filter_state = .reasoning;
+            }
+        }
+
+        // Decode token to raw bytes (zero-alloc O(1) lookup).
+        const decoded_raw: []const u8 = self.tok.tokenBytes(token_id) orelse return;
+
+        // UTF-8 assembly (same algorithm as batch.zig).
+        var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
+        const pending_len: usize = self.utf8_pending_len;
+        @memcpy(combined_buf[0..pending_len], self.utf8_pending[0..pending_len]);
+        const raw_copy_len = @min(decoded_raw.len, combined_buf.len - pending_len);
+        @memcpy(combined_buf[pending_len..][0..raw_copy_len], decoded_raw[0..raw_copy_len]);
+        const total_len = pending_len + raw_copy_len;
+        const combined = combined_buf[0..total_len];
+
+        const valid_end = utf8ValidPrefix(combined);
+        const valid = combined[0..valid_end];
+        const trailing = combined[valid_end..total_len];
+
+        // Store trailing incomplete UTF-8 bytes.
+        self.utf8_pending_len = 0;
+        if (trailing.len > 0 and trailing.len <= 3) {
+            const lead = trailing[0];
+            const expected_len: usize = if (lead & 0xE0 == 0xC0)
+                2
+            else if (lead & 0xF0 == 0xE0)
+                3
+            else if (lead & 0xF8 == 0xF0)
+                4
+            else
+                0;
+            if (expected_len > 0 and trailing.len < expected_len) {
+                var all_valid = true;
+                for (trailing[1..]) |cb| {
+                    if (cb & 0xC0 != 0x80) {
+                        all_valid = false;
+                        break;
+                    }
+                }
+                if (all_valid) {
+                    self.utf8_pending_len = @intCast(trailing.len);
+                    @memcpy(self.utf8_pending[0..trailing.len], trailing);
+                }
+            }
+        }
+
+        if (valid.len == 0) return;
+
+        // Apply reasoning-tag filtering.
+        var filter_segments: [MAX_FILTER_SEGMENTS]StreamFilteredSegment = undefined;
+        var filtered_text: []const u8 = valid;
+        var segments: []const StreamFilteredSegment = &.{};
+        if (!self.raw_output) {
+            const fr = self.filterReasoningTags(valid, &filter_segments);
+            filtered_text = fr.text;
+            segments = fr.segments;
+        }
+
+        if (filtered_text.len == 0) return;
+
+        // Emit per-segment callbacks.
+        if (segments.len == 0) {
+            // No filtering or raw mode — single segment.
+            const cls = self.classifySegment(self.filter_state);
+            const cont = self.user_cb(filtered_text.ptr, filtered_text.len, cls.item_type, cls.content_type, 0, self.user_data);
+            if (cont == 0) self.stop_flag.store(true, .release);
+        } else {
+            for (segments) |seg| {
+                const cls = self.classifySegment(seg.filter_state);
+                const seg_text = filtered_text[seg.start..][0..seg.len];
+                const cont = self.user_cb(seg_text.ptr, seg_text.len, cls.item_type, cls.content_type, 0, self.user_data);
+                if (cont == 0) {
+                    self.stop_flag.store(true, .release);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn classifySegment(self: *const StreamingWrapper, filter_state: StreamFilterState) struct { item_type: u8, content_type: u8 } {
+        if (self.raw_output) {
+            return .{
+                .item_type = @intFromEnum(responses_mod.ItemType.message),
+                .content_type = @intFromEnum(ContentType.output_text),
+            };
+        }
+        if (filter_state == .reasoning) {
+            return .{
+                .item_type = @intFromEnum(responses_mod.ItemType.reasoning),
+                .content_type = @intFromEnum(ContentType.reasoning_text),
+            };
+        }
+        if (self.is_tool_generation) {
+            return .{
+                .item_type = @intFromEnum(responses_mod.ItemType.function_call),
+                .content_type = @intFromEnum(ContentType.output_text),
+            };
+        }
+        return .{
+            .item_type = @intFromEnum(responses_mod.ItemType.message),
+            .content_type = @intFromEnum(ContentType.output_text),
+        };
+    }
+
+    /// Reasoning tag filter (ported from batch.zig filterReasoningTags).
+    fn filterReasoningTags(
+        self: *StreamingWrapper,
+        decoded: []const u8,
+        segments_out: []StreamFilteredSegment,
+    ) struct { text: []const u8, segments: []const StreamFilteredSegment } {
+        const filtered_buf = &self.filter_out_buf;
+        var filtered_len: usize = 0;
+        var segment_count: usize = 0;
+
+        var i: usize = 0;
+        while (i < decoded.len) {
+            const byte = decoded[i];
+
+            if (byte >= 0x80) {
+                if (self.filter_partial_len > 0) {
+                    appendStreamSegment(filtered_buf, &filtered_len, segments_out, &segment_count, self.filter_partial_buf[0..self.filter_partial_len], self.filter_state);
+                    self.filter_partial_len = 0;
+                }
+                const run_start = i;
+                while (i < decoded.len and decoded[i] >= 0x80) : (i += 1) {}
+                self.swallow_next_newline = false;
+                appendStreamSegment(filtered_buf, &filtered_len, segments_out, &segment_count, decoded[run_start..i], self.filter_state);
+                continue;
+            }
+
+            if (self.filter_partial_len >= MAX_TAG_LEN) {
+                appendStreamSegment(filtered_buf, &filtered_len, segments_out, &segment_count, self.filter_partial_buf[0..self.filter_partial_len], self.filter_state);
+                self.filter_partial_len = 0;
+            }
+            self.filter_partial_buf[self.filter_partial_len] = byte;
+            self.filter_partial_len += 1;
+
+            const buf = self.filter_partial_buf[0..self.filter_partial_len];
+
+            if (self.filter_state == .normal and std.mem.eql(u8, buf, self.start_marker)) {
+                self.filter_partial_len = 0;
+                self.filter_state = .reasoning;
+                self.swallow_next_newline = false;
+                i += 1;
+                continue;
+            }
+            if (self.filter_state == .reasoning and std.mem.eql(u8, buf, self.end_marker)) {
+                self.filter_partial_len = 0;
+                self.filter_state = .normal;
+                self.swallow_next_newline = true;
+                i += 1;
+                continue;
+            }
+
+            const is_prefix = switch (self.filter_state) {
+                .normal => std.mem.startsWith(u8, self.start_marker, buf),
+                .reasoning => std.mem.startsWith(u8, self.end_marker, buf),
+            };
+
+            if (!is_prefix) {
+                if (self.swallow_next_newline) {
+                    self.swallow_next_newline = false;
+                    if (self.filter_partial_len == 1 and buf[0] == '\n') {
+                        self.filter_partial_len = 0;
+                        i += 1;
+                        continue;
+                    }
+                }
+                appendStreamSegment(filtered_buf, &filtered_len, segments_out, &segment_count, self.filter_partial_buf[0..self.filter_partial_len], self.filter_state);
+                self.filter_partial_len = 0;
+            }
+
+            i += 1;
+        }
+
+        return .{
+            .text = filtered_buf[0..filtered_len],
+            .segments = segments_out[0..segment_count],
+        };
+    }
+};
+
+/// Find the boundary of complete UTF-8 codepoints in a byte slice.
+fn utf8ValidPrefix(bytes: []const u8) usize {
+    var last_valid: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const b = bytes[i];
+        const seq_len: usize = if (b < 0x80)
+            1
+        else if (b & 0xE0 == 0xC0)
+            2
+        else if (b & 0xF0 == 0xE0)
+            3
+        else if (b & 0xF8 == 0xF0)
+            4
+        else {
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > bytes.len) break;
+        var valid = true;
+        var j: usize = 1;
+        while (j < seq_len) : (j += 1) {
+            if (bytes[i + j] & 0xC0 != 0x80) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            i += 1;
+            continue;
+        }
+        i += seq_len;
+        last_valid = i;
+    }
+    return last_valid;
+}
+
+fn appendStreamSegment(
+    filtered_buf: []u8,
+    filtered_len: *usize,
+    segments_out: []StreamFilteredSegment,
+    segment_count: *usize,
+    text: []const u8,
+    filter_state: StreamFilterState,
+) void {
+    if (text.len == 0) return;
+    const avail = filtered_buf.len - filtered_len.*;
+    if (avail == 0) return;
+
+    const copy_len = @min(text.len, avail);
+    const start = filtered_len.*;
+    @memcpy(filtered_buf[start..][0..copy_len], text[0..copy_len]);
+    filtered_len.* += copy_len;
+
+    if (segment_count.* > 0) {
+        var last = &segments_out[segment_count.* - 1];
+        if (last.filter_state == filter_state and last.start + last.len == start) {
+            last.len += copy_len;
+            return;
+        }
+    }
+
+    if (segment_count.* < segments_out.len) {
+        segments_out[segment_count.*] = .{
+            .start = start,
+            .len = copy_len,
+            .filter_state = filter_state,
+        };
+        segment_count.* += 1;
+    }
+}
+
+/// Generate with streaming callback using LocalEngine.
+/// Calls engine.generate with a TokenCallback wrapper that decodes tokens,
+/// applies reasoning-tag filtering, and invokes the user's rich callback.
+fn generateStreamingWithLocalEngine(
+    allocator_: std.mem.Allocator,
+    chat: *Chat,
+    local_engine: *LocalEngine,
+    config: ?*const CGenerateConfig,
+    stream_cb: StreamCallback,
+    stream_cb_data: ?*anyopaque,
+) GenerateResult {
+    var built = buildOptions(allocator_, config, local_engine) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
+    defer built.deinit(allocator_);
+
+    // Determine tool generation mode.
+    const is_tool_generation = built.options.tools_json != null;
+
+    // Raw output mode.
+    const raw_output = if (config) |cfg| cfg.raw_output != 0 else false;
+
+    // Create a local stop flag if none provided (for callback→stop signaling).
+    var local_stop_flag = std.atomic.Value(bool).init(false);
+    const stop_flag_ptr: *std.atomic.Value(bool) = if (built.options.stop_flag) |sf|
+        @constCast(sf)
+    else
+        &local_stop_flag;
+    built.options.stop_flag = stop_flag_ptr;
+
+    // Output flag for starts_in_reasoning detection (written by generateFromPrompt).
+    var starts_in_reasoning: bool = false;
+    built.options.starts_in_reasoning_out = &starts_in_reasoning;
+
+    // Set up streaming wrapper.
+    var wrapper = StreamingWrapper{
+        .tok = &local_engine.tok,
+        .user_cb = stream_cb,
+        .user_data = stream_cb_data,
+        .stop_flag = stop_flag_ptr,
+        .raw_output = raw_output,
+        .is_tool_generation = is_tool_generation,
+        .starts_in_reasoning = &starts_in_reasoning,
+    };
+
+    // Wire the token callback.
+    built.options.token_callback = StreamingWrapper.onToken;
+    built.options.callback_data = @ptrCast(&wrapper);
+
+    log.debug("router", "LocalEngine generate (streaming callback route)", .{
+        .max_tokens = built.options.max_tokens orelse 0,
+        .has_tools = @as(u8, @intFromBool(is_tool_generation)),
+    }, @src());
+
+    // Run synchronous generation. Token callback fires per token.
+    var gen_result = local_engine.generate(chat, built.options) catch |err| {
+        capi_error.setError(err, "Generation failed", .{});
+        return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
+    };
+    defer gen_result.deinit(local_engine.allocator);
+
+    // Send final callback.
+    const final_cls = wrapper.classifySegment(wrapper.filter_state);
+    _ = stream_cb("".ptr, 0, final_cls.item_type, final_cls.content_type, 1, stream_cb_data);
+
+    // Map finish reason.
+    const finish_reason: CFinishReason = switch (gen_result.finish_reason) {
+        .eos_token => .eos_token,
+        .length => .length,
+        .stop_sequence => .stop_sequence,
+        .tool_calls => .tool_calls,
+        .content_filter => .content_filter,
+        .cancelled => .cancelled,
+    };
+
+    // Build tool call refs if present.
+    var tool_calls: ?[]const local.ToolCallRef = null;
+    if (gen_result.tool_calls) |tc| {
+        tool_calls = tc;
+        gen_result.tool_calls = null; // Transfer ownership to result
+    }
+
+    // Duplicate text for the result (gen_result.deinit will free its copy).
+    const result_text = allocator_.dupe(u8, gen_result.text) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
+
+    return .{
+        .text = result_text,
+        .token_count = gen_result.generated_tokens,
+        .prompt_tokens = gen_result.prompt_tokens,
+        .completion_tokens = gen_result.generated_tokens,
+        .prefill_ns = gen_result.prefill_ns,
+        .generation_ns = gen_result.decode_ns,
+        .ttft_ns = 0, // TTFT not tracked in direct generate path
+        .error_code = 0,
+        .finish_reason = finish_reason,
+        .tool_calls = tool_calls,
+    };
+}
+
+/// Generate with streaming callback. Dispatches to local or HTTP backend.
+pub fn generateStreamingWithBackend(
+    allocator_: std.mem.Allocator,
+    chat: *Chat,
+    parts: []const GenerateContentPart,
+    backend: *InferenceBackend,
+    config: ?*const CGenerateConfig,
+    stream_cb: StreamCallback,
+    stream_cb_data: ?*anyopaque,
+) GenerateResult {
+    // Append user message if parts are provided.
+    if (parts.len > 0) {
+        appendUserMessageFromParts(chat, parts) catch {
+            return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
+        };
+    } else if (chat.conv.len() == 0) {
+        return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_empty_prompt) };
+    }
+
+    switch (backend.backend) {
+        .Local => |local_engine| {
+            return generateStreamingWithLocalEngine(allocator_, chat, local_engine, config, stream_cb, stream_cb_data);
+        },
+        .OpenAICompatible => {
+            // HTTP streaming not supported through callback API.
+            capi_error.setErrorWithCode(.invalid_argument, "Streaming callback not supported for remote backends", .{});
+            return .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) };
+        },
+        .Unspecified => {
+            return .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) };
+        },
+    }
 }
 
 /// Generate using HttpEngine (remote OpenAI-compatible inference).
@@ -524,7 +954,7 @@ fn generateWithHttpEngine(
         }
     }
 
-    // Call HttpEngine (non-streaming mode only - streaming uses iterator API)
+    // Call HttpEngine (non-streaming mode)
     const start_time = std.time.nanoTimestamp();
 
     const result = http_engine.generate(chat, http_opts) catch |err| {
@@ -744,7 +1174,7 @@ fn freeSentinelString(allocator: std.mem.Allocator, ptr: [*:0]u8) void {
 
 /// Convert C config to GenerateOptions (basic fields only, no allocations).
 ///
-/// This is a lightweight conversion for the iterator API. It copies scalar
+/// This is a lightweight conversion for the non-streaming API. It copies scalar
 /// fields and string slices (which point to C-owned memory). It does NOT
 /// tokenize stop sequences or convert logit bias - those require allocation.
 pub fn configToGenerateOptions(config: ?*const CGenerateConfig) GenerateOptions {
@@ -800,61 +1230,6 @@ pub fn configToHttpGenerateOptions(config: ?*const CGenerateConfig) http_engine_
     opts.raw_output = cfg.raw_output != 0;
 
     return opts;
-}
-
-/// Error type for iterator creation.
-pub const CreateIteratorError = error{
-    InvalidArgument,
-    OutOfMemory,
-    IteratorCreationFailed,
-};
-
-/// Creates a token iterator for pull-based streaming generation.
-///
-/// This is the core implementation called by the C API. It handles:
-/// - Validation of all input parameters
-/// - Building content from multipart input
-/// - Adding user message to chat
-/// - Creating the background generation iterator
-pub fn createIterator(
-    allocator: std.mem.Allocator,
-    chat: *Chat,
-    content_parts: []const GenerateContentPart,
-    backend_ptr: *InferenceBackend,
-    config: ?*const CGenerateConfig,
-) CreateIteratorError!*iterator_mod.TokenIterator {
-    log.debug("router", "createIterator", .{
-        .parts = content_parts.len,
-        .conv_items = chat.conv.len(),
-        .backend = @as(u8, switch (backend_ptr.backend) {
-            .Local => 0,
-            .OpenAICompatible => 1,
-            .Unspecified => 2,
-        }),
-    }, @src());
-
-    if (content_parts.len > 0) {
-        appendUserMessageFromParts(chat, content_parts) catch {
-            return error.OutOfMemory;
-        };
-    }
-
-    // Dispatch based on backend type
-    switch (backend_ptr.backend) {
-        .Local => |local_engine| {
-            const opts = configToGenerateOptions(config);
-            return iterator_mod.TokenIterator.init(allocator, local_engine, chat, opts) catch {
-                return error.IteratorCreationFailed;
-            };
-        },
-        .OpenAICompatible => |http_engine| {
-            const opts = configToHttpGenerateOptions(config);
-            return iterator_mod.TokenIterator.initWithHttpEngine(allocator, http_engine, chat, opts) catch {
-                return error.IteratorCreationFailed;
-            };
-        },
-        .Unspecified => return error.InvalidArgument,
-    }
 }
 
 // =============================================================================

@@ -46,7 +46,6 @@ const GenerateContentPart = capi_bridge.GenerateContentPart;
 const CGenerateConfig = capi_bridge.CGenerateConfig;
 const InferenceBackend = router.InferenceBackend;
 const ToolCallRef = router.ToolCallRef;
-const TokenIterator = router.TokenIterator;
 const FinishReason = router.FinishReason;
 
 // =============================================================================
@@ -301,8 +300,8 @@ const PendingToolCall = struct {
 /// max_iterations is reached, a tool error occurs (if abort_on_tool_error), or
 /// the stop_flag / callback cancellation is triggered.
 ///
-/// When `config.on_token` is set, generation uses the pull-based TokenIterator
-/// for streaming. Otherwise, uses synchronous `generateWithBackend()`.
+/// When `config.on_token` is set, generation uses the callback-based streaming
+/// API. Otherwise, uses synchronous `generateWithBackend()`.
 ///
 /// The caller owns Chat, backend, and registry lifecycles. This function does
 /// not free them.
@@ -438,7 +437,6 @@ pub fn run(
 pub const RunError = error{
     GenerationFailed,
     OutOfMemory,
-    IteratorCreationFailed,
 };
 
 // =============================================================================
@@ -483,8 +481,8 @@ fn generateSync(
     return true;
 }
 
-/// Streaming generation via TokenIterator.
-/// Polls tokens and forwards them to on_token callback.
+/// Streaming generation via callback-based generateStreamingWithBackend.
+/// Forwards each decoded token to the on_token callback.
 /// Returns true if tool calls were produced, false if completed normally.
 fn generateStreaming(
     allocator: Allocator,
@@ -494,41 +492,77 @@ fn generateStreaming(
 ) !bool {
     const on_token = config.on_token.?;
 
-    var iter = capi_bridge.createIterator(
+    // Bridge context: adapts the rich streaming callback to the agent's
+    // simple on_token(text_z, userdata) -> bool interface.
+    const BridgeCtx = struct {
+        on_token_fn: OnTokenFn,
+        on_token_data: ?*anyopaque,
+        stop_flag: ?*const std.atomic.Value(bool),
+        cancelled: bool = false,
+        buf: [513]u8 = undefined, // 512 max token bytes + null terminator
+
+        fn streamCb(
+            text_ptr: [*]const u8,
+            text_len: usize,
+            _: u8,
+            _: u8,
+            is_final: u8,
+            userdata: ?*anyopaque,
+        ) callconv(.c) u8 {
+            if (is_final != 0 or text_len == 0) return 1;
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+
+            // Null-terminate the token text for the on_token callback.
+            const copy_len = @min(text_len, self.buf.len - 1);
+            @memcpy(self.buf[0..copy_len], text_ptr[0..copy_len]);
+            self.buf[copy_len] = 0;
+            const text_z: [*:0]const u8 = @ptrCast(&self.buf);
+
+            if (!self.on_token_fn(text_z, self.on_token_data)) {
+                self.cancelled = true;
+                return 0;
+            }
+
+            if (self.stop_flag) |flag| {
+                if (flag.load(.acquire)) {
+                    self.cancelled = true;
+                    return 0;
+                }
+            }
+            return 1;
+        }
+    };
+
+    var bridge = BridgeCtx{
+        .on_token_fn = on_token,
+        .on_token_data = config.on_token_data,
+        .stop_flag = config.stop_flag,
+    };
+
+    var result = capi_bridge.generateStreamingWithBackend(
         allocator,
         chat,
         &.{},
         backend,
         config.generate_config,
-    ) catch {
-        return error.IteratorCreationFailed;
-    };
-    defer iter.deinit();
+        BridgeCtx.streamCb,
+        @ptrCast(&bridge),
+    );
 
-    // Poll tokens and forward to callback
-    while (iter.next()) |token_ptr| {
-        if (!on_token(token_ptr, config.on_token_data)) {
-            iter.cancel();
-            return error.GenerationFailed;
-        }
-
-        // Check external stop_flag
-        if (config.stop_flag) |flag| {
-            if (flag.load(.acquire)) {
-                iter.cancel();
-                return error.GenerationFailed;
-            }
-        }
-    }
-
-    // Check for iterator error
-    if (iter.hasError()) {
+    if (result.error_code != 0) {
         return error.GenerationFailed;
     }
 
-    // Check finish reason — tool_calls means we have pending calls
-    const finish = iter.getFinishReason();
-    return finish == @intFromEnum(FinishReason.tool_calls);
+    if (bridge.cancelled) {
+        result.deinit(allocator);
+        return error.GenerationFailed;
+    }
+
+    const has_tool_calls = result.finish_reason == .tool_calls and
+        result.tool_calls != null and result.tool_calls.?.len > 0;
+    result.tool_calls = null;
+    result.deinit(allocator);
+    return has_tool_calls;
 }
 
 // =============================================================================
