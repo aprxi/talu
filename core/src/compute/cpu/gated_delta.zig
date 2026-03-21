@@ -195,6 +195,49 @@ pub fn runStateSpaceStep(
     }
 }
 
+/// Single-head state-space step for parallel execution.
+/// Caller is responsible for providing correctly-sized per-head slices.
+/// Does not return errors — shape validation is the caller's responsibility.
+pub fn runStateSpaceStepOneHead(
+    kv_mem_head: []f32,
+    out_head: []f32,
+    state_head: []f32,
+    query_head: []const f32,
+    key_head: []const f32,
+    value_head: []const f32,
+    beta_raw_val: f32,
+    a_raw_val: f32,
+    a_log_val: f32,
+    dt_bias_val: f32,
+    d_head: usize,
+) void {
+    const beta = fastSigmoidScalar(beta_raw_val);
+    const g = -math.fastExpScalar(a_log_val) * fastSoftplusScalar(a_raw_val + dt_bias_val);
+    const g_exp = math.fastExpScalar(g);
+    const qk_dot = reduction.dotRow(query_head[0..d_head], key_head[0..d_head]);
+
+    @memset(kv_mem_head[0..d_head], 0.0);
+    @memset(out_head[0..d_head], 0.0);
+    for (0..d_head) |k_idx| {
+        const state_row = state_head[k_idx * d_head ..][0..d_head];
+        scaleStateAndAccumulateAndProjectRow(
+            state_row,
+            kv_mem_head[0..d_head],
+            out_head[0..d_head],
+            g_exp,
+            key_head[k_idx],
+            query_head[k_idx],
+        );
+    }
+
+    applyResidualUpdateInPlace(kv_mem_head[0..d_head], value_head[0..d_head], beta);
+    rowwise.addScaledInPlace(out_head[0..d_head], kv_mem_head[0..d_head], qk_dot);
+    for (0..d_head) |k_idx| {
+        const state_row = state_head[k_idx * d_head ..][0..d_head];
+        updateStateRow(state_row, kv_mem_head[0..d_head], key_head[k_idx]);
+    }
+}
+
 pub fn normWeightSlice(
     norm_weight: ?[]const f32,
     head_idx: usize,

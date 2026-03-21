@@ -13,6 +13,7 @@ const compute = @import("../../../../compute/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_gated_delta = compute.cpu.gated_delta;
+const parallel = @import("../../../../system/parallel.zig");
 const trace = @import("../../../../xray/root.zig").trace;
 
 fn saturatingU64FromU128(value: u128) u64 {
@@ -37,6 +38,76 @@ fn matmulWork(rows: usize, k: usize, n: usize, weight: *const Tensor) trace.Work
     const output_bytes = rows128 * n128 * @sizeOf(f32);
     const bytes = saturatingU64FromU128(input_bytes + output_bytes + @as(u128, tensorStorageBytes(weight)));
     return .{ .flops = flops, .bytes = bytes };
+}
+
+/// Context for parallel SSM execution over heads.
+/// Each head's state, kv_mem, and output slices are non-overlapping,
+/// so heads can safely execute concurrently across threads.
+const SsmParallelCtx = struct {
+    proj_buf: []f32,
+    ssm_buf: []f32,
+    kv_mem: []f32,
+    ssm_state: []f32,
+    A_log: []const f32,
+    dt_bias: ?[]const f32,
+    norm_data: ?[]const f32,
+    seq_len: usize,
+    proj_len: usize,
+    qkv_len: usize,
+    qk_inner: usize,
+    d_inner: usize,
+    d_head: usize,
+    n_qk_heads: usize,
+    n_v_heads: usize,
+};
+
+/// parallelFor task: process a range of heads for all tokens.
+/// Item count is inflated by INFLATE (16) to survive parallelFor's
+/// cache-line alignment rounding with small head counts.
+fn ssmHeadTask(start: usize, end: usize, ctx: *SsmParallelCtx) void {
+    const INFLATE = 16;
+    const head_start = start / INFLATE;
+    const head_end = @min((end + INFLATE - 1) / INFLATE, ctx.n_v_heads);
+    const qk_repeat = ctx.n_v_heads / ctx.n_qk_heads;
+
+    for (head_start..head_end) |head_idx| {
+        const qk_head_idx = head_idx / qk_repeat;
+        const state_base = head_idx * ctx.d_head * ctx.d_head;
+        const state_head = ctx.ssm_state[state_base..][0 .. ctx.d_head * ctx.d_head];
+        const kv_mem_head = ctx.kv_mem[head_idx * ctx.d_head ..][0..ctx.d_head];
+        const dt_bias_val: f32 = if (ctx.dt_bias) |bias| bias[head_idx] else 0.0;
+        const norm_head: ?[]const f32 = if (ctx.norm_data) |nd| blk: {
+            if (nd.len == ctx.d_head) break :blk nd;
+            if (nd.len == ctx.d_inner) break :blk nd[head_idx * ctx.d_head ..][0..ctx.d_head];
+            break :blk null;
+        } else null;
+
+        for (0..ctx.seq_len) |t| {
+            const proj_t = ctx.proj_buf[t * ctx.proj_len ..];
+            const qkv = proj_t[0..ctx.qkv_len];
+            const query_head = qkv[qk_head_idx * ctx.d_head ..][0..ctx.d_head];
+            const key_head = qkv[ctx.qk_inner + qk_head_idx * ctx.d_head ..][0..ctx.d_head];
+            const value_head = qkv[2 * ctx.qk_inner + head_idx * ctx.d_head ..][0..ctx.d_head];
+            const out_head = ctx.ssm_buf[t * ctx.d_inner + head_idx * ctx.d_head ..][0..ctx.d_head];
+
+            cpu_gated_delta.runStateSpaceStepOneHead(
+                kv_mem_head,
+                out_head,
+                state_head,
+                query_head,
+                key_head,
+                value_head,
+                proj_t[ctx.qkv_len + ctx.d_inner + head_idx],
+                proj_t[ctx.qkv_len + ctx.d_inner + ctx.n_v_heads + head_idx],
+                ctx.A_log[head_idx],
+                dt_bias_val,
+                ctx.d_head,
+            );
+
+            const z_head = proj_t[ctx.qkv_len + head_idx * ctx.d_head ..][0..ctx.d_head];
+            cpu_gated_delta.applyGatedRmsNormInPlace(out_head, z_head, norm_head) catch unreachable;
+        }
+    }
 }
 
 pub const GatedDeltaConfig = struct {
@@ -366,85 +437,38 @@ pub const GatedDeltaKernel = struct {
                 }
             }
 
-            // Sequential conv1d + SSM (state-dependent, cannot batch).
+            // Phase 1: Conv1d + SiLU + QK normalization (sequential — conv1d has cross-token state).
             for (0..seq_len) |t| {
                 const proj_t = proj_buf[t * proj_len ..][0..proj_len];
                 const qkv = proj_t[0..qkv_len];
-                const z = proj_t[qkv_len..][0..d_inner];
-                const beta_raw = proj_t[qkv_len + d_inner ..][0..n_v_heads];
-                const a_raw = proj_t[qkv_len + d_inner + n_v_heads ..][0..n_v_heads];
-
                 cpu_conv1d.runTimeMajorValues(qkv, conv_state, conv_weight_t, qkv, conv_bias, qkv_len, d_conv);
-                if (trace_enabled) {
-                    trace.emit(
-                        .gdelta_conv,
-                        self.layer_idx,
-                        0,
-                        @intCast(self.trace_position_offset + t),
-                        @ptrCast(qkv.ptr),
-                        .f32,
-                        .{ 1, 1, @intCast(qkv_len), 0 },
-                        3,
-                        null,
-                    );
-                }
                 cpu_gated_delta.applySiluInPlace(qkv);
-
                 const query = qkv[0..qk_inner];
                 const key = qkv[qk_inner .. 2 * qk_inner];
-                const value = qkv[2 * qk_inner .. 2 * qk_inner + d_inner];
                 try cpu_gated_delta.normalizeQueryKeyInPlace(query, key, n_qk_heads, d_head);
-
-                const token_ssm_out = ssm_buf[t * d_inner ..][0..d_inner];
-                try cpu_gated_delta.runStateSpaceStep(
-                    temp,
-                    token_ssm_out,
-                    ssm_state,
-                    query,
-                    key,
-                    value,
-                    beta_raw,
-                    a_raw,
-                    A_log,
-                    dt_bias,
-                    n_qk_heads,
-                    n_v_heads,
-                    d_head,
-                );
-                if (trace_enabled) {
-                    trace.emit(
-                        .gdelta_ssm,
-                        self.layer_idx,
-                        0,
-                        @intCast(self.trace_position_offset + t),
-                        @ptrCast(token_ssm_out.ptr),
-                        .f32,
-                        .{ 1, 1, @intCast(d_inner), 0 },
-                        3,
-                        null,
-                    );
-                }
-
-                for (0..n_v_heads) |head_idx| {
-                    const out_head = token_ssm_out[head_idx * d_head ..][0..d_head];
-                    const z_head = z[head_idx * d_head ..][0..d_head];
-                    const norm_head = try cpu_gated_delta.normWeightSlice(norm_data, head_idx, d_head, d_inner);
-                    try cpu_gated_delta.applyGatedRmsNormInPlace(out_head, z_head, norm_head);
-                }
-                if (trace_enabled) {
-                    trace.emit(
-                        .gdelta_norm,
-                        self.layer_idx,
-                        0,
-                        @intCast(self.trace_position_offset + t),
-                        @ptrCast(token_ssm_out.ptr),
-                        .f32,
-                        .{ 1, 1, @intCast(d_inner), 0 },
-                        3,
-                        null,
-                    );
-                }
             }
+
+            // Phase 2: SSM state step + gated RMS norm (parallel over heads).
+            // Each head has independent state, kv_mem, and output slices.
+            // One parallelFor per layer — each thread processes ~2 heads × all 510 tokens.
+            var ssm_ctx = SsmParallelCtx{
+                .proj_buf = proj_buf,
+                .ssm_buf = ssm_buf,
+                .kv_mem = temp,
+                .ssm_state = ssm_state,
+                .A_log = A_log,
+                .dt_bias = dt_bias,
+                .norm_data = norm_data,
+                .seq_len = seq_len,
+                .proj_len = proj_len,
+                .qkv_len = qkv_len,
+                .qk_inner = qk_inner,
+                .d_inner = d_inner,
+                .d_head = d_head,
+                .n_qk_heads = n_qk_heads,
+                .n_v_heads = n_v_heads,
+            };
+            parallel.global().parallelFor(n_v_heads * 16, ssmHeadTask, &ssm_ctx);
 
             // Batched out_proj: [seq_len × d_inner] → [seq_len × d_model]
             {
