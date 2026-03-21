@@ -328,6 +328,148 @@ pub const GatedDeltaKernel = struct {
         const norm_data = if (w.norm_weight) |norm_w| norm_w.asSlice(f32) else null;
         const trace_enabled = trace.isEnabled();
 
+        // Validate shape invariants (independent of seq_len).
+        if (qkv_len <= d_inner) return error.InvalidShape;
+        const qk_total = qkv_len - d_inner;
+        if ((qk_total % 2) != 0) return error.InvalidShape;
+        const qk_inner = qk_total / 2;
+        if ((qk_inner % d_head) != 0) return error.InvalidShape;
+        const n_qk_heads = qk_inner / d_head;
+        if (n_qk_heads != n_qk_heads_expected) return error.InvalidShape;
+        if (n_qk_heads == 0 or (n_v_heads % n_qk_heads) != 0) return error.InvalidShape;
+
+        if (seq_len > 1) {
+            // Batched prefill: batch in_proj and out_proj, keep conv+SSM sequential.
+            const proj_buf = try scratch.allocator.alloc(f32, seq_len * proj_len);
+            defer scratch.allocator.free(proj_buf);
+            const ssm_buf = try scratch.allocator.alloc(f32, seq_len * d_inner);
+            defer scratch.allocator.free(ssm_buf);
+
+            // Batched in_proj: [seq_len × d_model] → [seq_len × proj_len]
+            {
+                var batch_input = Tensor.view2DSlice(full_input_data, seq_len, d_model);
+                var batch_proj = Tensor.view2DSlice(proj_buf, seq_len, proj_len);
+                self.matmul_in_proj(&batch_input, w.in_proj, &batch_proj, matmul_scratch);
+                if (trace_enabled) {
+                    trace.emitWithWork(
+                        .gdelta_in_proj,
+                        self.layer_idx,
+                        0,
+                        @intCast(self.trace_position_offset),
+                        batch_proj.data().ptr,
+                        .f32,
+                        .{ 1, @intCast(seq_len), @intCast(proj_len), 0 },
+                        3,
+                        null,
+                        matmulWork(seq_len, d_model, proj_len, w.in_proj),
+                    );
+                }
+            }
+
+            // Sequential conv1d + SSM (state-dependent, cannot batch).
+            for (0..seq_len) |t| {
+                const proj_t = proj_buf[t * proj_len ..][0..proj_len];
+                const qkv = proj_t[0..qkv_len];
+                const z = proj_t[qkv_len..][0..d_inner];
+                const beta_raw = proj_t[qkv_len + d_inner ..][0..n_v_heads];
+                const a_raw = proj_t[qkv_len + d_inner + n_v_heads ..][0..n_v_heads];
+
+                cpu_conv1d.runTimeMajorValues(qkv, conv_state, conv_weight_t, qkv, conv_bias, qkv_len, d_conv);
+                if (trace_enabled) {
+                    trace.emit(
+                        .gdelta_conv,
+                        self.layer_idx,
+                        0,
+                        @intCast(self.trace_position_offset + t),
+                        @ptrCast(qkv.ptr),
+                        .f32,
+                        .{ 1, 1, @intCast(qkv_len), 0 },
+                        3,
+                        null,
+                    );
+                }
+                cpu_gated_delta.applySiluInPlace(qkv);
+
+                const query = qkv[0..qk_inner];
+                const key = qkv[qk_inner .. 2 * qk_inner];
+                const value = qkv[2 * qk_inner .. 2 * qk_inner + d_inner];
+                try cpu_gated_delta.normalizeQueryKeyInPlace(query, key, n_qk_heads, d_head);
+
+                const token_ssm_out = ssm_buf[t * d_inner ..][0..d_inner];
+                try cpu_gated_delta.runStateSpaceStep(
+                    temp,
+                    token_ssm_out,
+                    ssm_state,
+                    query,
+                    key,
+                    value,
+                    beta_raw,
+                    a_raw,
+                    A_log,
+                    dt_bias,
+                    n_qk_heads,
+                    n_v_heads,
+                    d_head,
+                );
+                if (trace_enabled) {
+                    trace.emit(
+                        .gdelta_ssm,
+                        self.layer_idx,
+                        0,
+                        @intCast(self.trace_position_offset + t),
+                        @ptrCast(token_ssm_out.ptr),
+                        .f32,
+                        .{ 1, 1, @intCast(d_inner), 0 },
+                        3,
+                        null,
+                    );
+                }
+
+                for (0..n_v_heads) |head_idx| {
+                    const out_head = token_ssm_out[head_idx * d_head ..][0..d_head];
+                    const z_head = z[head_idx * d_head ..][0..d_head];
+                    const norm_head = try cpu_gated_delta.normWeightSlice(norm_data, head_idx, d_head, d_inner);
+                    try cpu_gated_delta.applyGatedRmsNormInPlace(out_head, z_head, norm_head);
+                }
+                if (trace_enabled) {
+                    trace.emit(
+                        .gdelta_norm,
+                        self.layer_idx,
+                        0,
+                        @intCast(self.trace_position_offset + t),
+                        @ptrCast(token_ssm_out.ptr),
+                        .f32,
+                        .{ 1, 1, @intCast(d_inner), 0 },
+                        3,
+                        null,
+                    );
+                }
+            }
+
+            // Batched out_proj: [seq_len × d_inner] → [seq_len × d_model]
+            {
+                var batch_ssm = Tensor.view2DSlice(ssm_buf, seq_len, d_inner);
+                var batch_out = Tensor.view2DSlice(full_output_data, seq_len, d_model);
+                self.matmul_out_proj(&batch_ssm, w.out_proj, &batch_out, matmul_scratch);
+                if (trace_enabled) {
+                    trace.emitWithWork(
+                        .gdelta_out,
+                        self.layer_idx,
+                        0,
+                        @intCast(self.trace_position_offset),
+                        batch_out.data().ptr,
+                        .f32,
+                        .{ 1, @intCast(seq_len), @intCast(d_model), 0 },
+                        3,
+                        null,
+                        matmulWork(seq_len, d_inner, d_model, w.out_proj),
+                    );
+                }
+            }
+            return;
+        }
+
+        // Single-token decode path (seq_len ≤ 1).
         for (0..seq_len) |t| {
             const token_offset = t * d_model;
             const input_data = full_input_data[token_offset..][0..d_model];
@@ -355,15 +497,6 @@ pub const GatedDeltaKernel = struct {
             const z = proj_out[qkv_len .. qkv_len + d_inner];
             const beta_raw = proj_out[qkv_len + d_inner .. qkv_len + d_inner + n_v_heads];
             const a_raw = proj_out[qkv_len + d_inner + n_v_heads .. qkv_len + d_inner + 2 * n_v_heads];
-
-            if (qkv_len <= d_inner) return error.InvalidShape;
-            const qk_total = qkv_len - d_inner;
-            if ((qk_total % 2) != 0) return error.InvalidShape;
-            const qk_inner = qk_total / 2;
-            if ((qk_inner % d_head) != 0) return error.InvalidShape;
-            const n_qk_heads = qk_inner / d_head;
-            if (n_qk_heads != n_qk_heads_expected) return error.InvalidShape;
-            if (n_qk_heads == 0 or (n_v_heads % n_qk_heads) != 0) return error.InvalidShape;
 
             cpu_conv1d.runTimeMajorValues(qkv, conv_state, conv_weight_t, qkv, conv_bias, qkv_len, d_conv);
             if (trace_enabled) {
