@@ -16,7 +16,6 @@ pub const fastExp = _fast_math.fastExp;
 pub const fastExpScalar = _fast_math.fastExpScalar;
 
 // Activations
-pub const siluScalarReference = _activations.siluScalarReference;
 pub const siluContiguous = _activations.siluContiguous;
 pub const geluContiguous = _activations.geluContiguous;
 pub const reluContiguous = _activations.reluContiguous;

@@ -19,11 +19,13 @@ pub inline fn softplus(x: f32) f32 {
 }
 
 /// GELU approximation used by CPU FFN paths.
+/// Uses tanh(z) = 1 - 2/(1 + exp(2z)) via fastExp for vectorizable computation.
 pub fn geluApprox(x: f32) f32 {
     const sqrt_2_over_pi: f32 = 0.7978845608;
     const x3 = x * x * x;
     const inner = sqrt_2_over_pi * (x + 0.044715 * x3);
-    return x * 0.5 * (1.0 + std.math.tanh(inner));
+    const tanh_val = 1.0 - 2.0 / (1.0 + math_ops.fastExpScalar(2.0 * inner));
+    return x * 0.5 * (1.0 + tanh_val);
 }
 
 /// SwiGLU variant with alpha=1.702, clipping, and (up+1) formulation.
@@ -34,22 +36,6 @@ pub fn swigluVariantScalar(gate_value: f32, up_value: f32) f32 {
     const up_clipped = std.math.clamp(up_value, -limit, limit);
     const sigmoid_value = 1.0 / (1.0 + @exp(-alpha * gate_clipped));
     return (gate_clipped * sigmoid_value) * (up_clipped + 1.0);
-}
-
-/// Apply SiLU pointwise from `src` into `dst`.
-pub fn siluMap(src: []const f32, dst: []f32) void {
-    std.debug.assert(src.len == dst.len);
-    for (src, dst) |in, *out| {
-        out.* = silu(in);
-    }
-}
-
-/// Apply GELU pointwise from `src` into `dst`.
-pub fn geluMap(src: []const f32, dst: []f32) void {
-    std.debug.assert(src.len == dst.len);
-    for (src, dst) |in, *out| {
-        out.* = geluApprox(in);
-    }
 }
 
 /// Elementwise multiply `a * b` into `out`.
@@ -68,8 +54,25 @@ pub fn elementwiseMul(a: []const f32, b: []const f32, out: []f32) void {
 
 /// Compute `gelu(gate) * up` over split buffers.
 pub fn geluMulSplit(gate_values: []const f32, up_values: []const f32, out: []f32) void {
+    @setFloatMode(.optimized);
     std.debug.assert(gate_values.len == up_values.len and gate_values.len == out.len);
-    for (0..out.len) |idx| {
+
+    const sqrt_2_over_pi: F32Vec = @splat(0.7978845608);
+    const coeff: F32Vec = @splat(0.044715);
+    const half: F32Vec = @splat(0.5);
+    const one: F32Vec = @splat(1.0);
+    const two: F32Vec = @splat(2.0);
+
+    var idx: usize = 0;
+    while (idx + VEC_LEN - 1 < out.len) : (idx += VEC_LEN) {
+        const gate_vec: F32Vec = gate_values[idx..][0..VEC_LEN].*;
+        const up_vec: F32Vec = up_values[idx..][0..VEC_LEN].*;
+        const x3 = gate_vec * gate_vec * gate_vec;
+        const inner = sqrt_2_over_pi * (gate_vec + coeff * x3);
+        const tanh_val = one - two / (one + math_ops.fastExp(two * inner));
+        out[idx..][0..VEC_LEN].* = (half * gate_vec * (one + tanh_val)) * up_vec;
+    }
+    while (idx < out.len) : (idx += 1) {
         out[idx] = geluApprox(gate_values[idx]) * up_values[idx];
     }
 }
@@ -111,8 +114,30 @@ pub fn swigluVariantSplit(gate_values: []const f32, up_values: []const f32, out:
 
 /// Compute `gelu(gate) * up` over interleaved `[gate, up]` rows.
 pub fn geluMulInterleaved(gate_up_values: []const f32, out: []f32) void {
+    @setFloatMode(.optimized);
     std.debug.assert(gate_up_values.len == out.len * 2);
-    for (0..out.len) |idx| {
+
+    const sqrt_2_over_pi: F32Vec = @splat(0.7978845608);
+    const coeff: F32Vec = @splat(0.044715);
+    const half: F32Vec = @splat(0.5);
+    const one: F32Vec = @splat(1.0);
+    const two: F32Vec = @splat(2.0);
+
+    var idx: usize = 0;
+    while (idx + VEC_LEN - 1 < out.len) : (idx += VEC_LEN) {
+        // Deinterleave: load 2*VEC_LEN floats and extract gate/up lanes.
+        var gate_vec: F32Vec = undefined;
+        var up_vec: F32Vec = undefined;
+        inline for (0..VEC_LEN) |lane| {
+            gate_vec[lane] = gate_up_values[(idx + lane) * 2];
+            up_vec[lane] = gate_up_values[(idx + lane) * 2 + 1];
+        }
+        const x3 = gate_vec * gate_vec * gate_vec;
+        const inner = sqrt_2_over_pi * (gate_vec + coeff * x3);
+        const tanh_val = one - two / (one + math_ops.fastExp(two * inner));
+        out[idx..][0..VEC_LEN].* = (half * gate_vec * (one + tanh_val)) * up_vec;
+    }
+    while (idx < out.len) : (idx += 1) {
         out[idx] = geluApprox(gate_up_values[idx * 2]) * gate_up_values[idx * 2 + 1];
     }
 }
@@ -159,24 +184,6 @@ test "swigluVariantInterleaved matches scalar helper" {
 
 test "geluApprox matches zero crossing" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), geluApprox(0.0), 1e-6);
-}
-
-test "siluMap maps source into destination" {
-    const src = [_]f32{ -1.0, 0.0, 1.0 };
-    var dst = [_]f32{ 0.0, 0.0, 0.0 };
-    siluMap(&src, &dst);
-    try std.testing.expectApproxEqAbs(silu(-1.0), dst[0], 1e-6);
-    try std.testing.expectApproxEqAbs(silu(0.0), dst[1], 1e-6);
-    try std.testing.expectApproxEqAbs(silu(1.0), dst[2], 1e-6);
-}
-
-test "geluMap maps source into destination" {
-    const src = [_]f32{ -1.0, 0.0, 1.0 };
-    var dst = [_]f32{ 0.0, 0.0, 0.0 };
-    geluMap(&src, &dst);
-    try std.testing.expectApproxEqAbs(geluApprox(-1.0), dst[0], 1e-6);
-    try std.testing.expectApproxEqAbs(geluApprox(0.0), dst[1], 1e-6);
-    try std.testing.expectApproxEqAbs(geluApprox(1.0), dst[2], 1e-6);
 }
 
 test "elementwiseMul multiplies element pairs" {

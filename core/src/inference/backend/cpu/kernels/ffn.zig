@@ -12,6 +12,7 @@ const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_activation = compute.cpu.activation;
+const cpu_math = compute.cpu.math;
 const cpu_common = compute.cpu.common;
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
@@ -263,7 +264,7 @@ pub const SwiGLU = struct {
             if (self.use_gelu) {
                 const gate_values = gate_output.asSlice(f32);
                 const gate_activation_values = gate_activation_view.asSlice(f32);
-                cpu_activation.geluMap(gate_values, gate_activation_values);
+                cpu_math.geluContiguous(gate_activation_values, gate_values);
                 if (trace_enabled) {
                     trace.emit(
                         .ffn_act_map,
@@ -330,7 +331,7 @@ pub const SwiGLU = struct {
                 }
                 return;
             } else {
-                cpu_activation.siluMap(gate_output.asSlice(f32), gate_activation_view.asSlice(f32));
+                cpu_math.siluContiguous(gate_activation_view.asSlice(f32), gate_output.asSlice(f32));
                 if (trace_enabled) {
                     trace.emit(
                         .ffn_act_map,

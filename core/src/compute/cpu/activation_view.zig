@@ -209,7 +209,8 @@ pub fn gelu(out: TensorView, input: TensorView) void {
             const coeff: f32 = 0.044715;
             const x3 = x * x * x;
             const inner = sqrt_2_over_pi * (x + coeff * x3);
-            return 0.5 * x * (1.0 + std.math.tanh(inner));
+            const tanh_val = 1.0 - 2.0 / (1.0 + fastExpScalar(2.0 * inner));
+            return 0.5 * x * (1.0 + tanh_val);
         }
     }.apply;
 
@@ -272,7 +273,7 @@ pub fn tanh(out: TensorView, input: TensorView) void {
 
     const tanhFn = struct {
         fn apply(x: f32) f32 {
-            return std.math.tanh(x);
+            return 1.0 - 2.0 / (1.0 + fastExpScalar(2.0 * x));
         }
     }.apply;
 

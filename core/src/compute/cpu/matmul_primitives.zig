@@ -427,29 +427,49 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
         m_rows: usize,
         n_cols: usize,
         k_dim: usize,
+        tiles_per_row: usize,
     };
-    var context = MatmulBF16Ctx{ .a = a_data, .b = b_data, .c = c_data, .m_rows = m_rows, .n_cols = n_cols, .k_dim = k_dim };
 
-    // Unified rows path: tile over columns and reuse each loaded BF16 weight row
-    // across several activation rows before moving on.
+    // 2D tiling: row_blocks × col_tiles flattened into a 1D task stream.
+    // Each task processes ROW_BLOCK_SIZE rows × tile_size columns.
+    // This distributes A-matrix reads across threads so they don't all
+    // contend for the same L3 cache lines.
+    const ROW_BLOCK_SIZE: usize = 64;
     const tile_size = fp16ColTileSize(k_dim);
     const tiles_per_row = (n_cols + tile_size - 1) / tile_size;
+    const row_blocks = (m_rows + ROW_BLOCK_SIZE - 1) / ROW_BLOCK_SIZE;
+    const total_tiles = row_blocks * tiles_per_row;
+
+    var context = MatmulBF16Ctx{
+        .a = a_data,
+        .b = b_data,
+        .c = c_data,
+        .m_rows = m_rows,
+        .n_cols = n_cols,
+        .k_dim = k_dim,
+        .tiles_per_row = tiles_per_row,
+    };
 
     const tiled_task = struct {
-        fn runColTiles(start: usize, end: usize, task_ctx: *MatmulBF16Ctx) void {
+        fn run2DTiles(start: usize, end: usize, task_ctx: *MatmulBF16Ctx) void {
             const k_len = task_ctx.k_dim;
             const n_len = task_ctx.n_cols;
             const tile_size_local = fp16ColTileSize(k_len);
+            const tiles_per_row_local = task_ctx.tiles_per_row;
             const VEC = simd.f32_vec_len;
-            const ROW_BLOCK = 4;
+            const MICRO_ROWS = 4;
             const b_base = task_ctx.b;
 
-            for (start..end) |col_tile| {
+            for (start..end) |tile_idx| {
+                const rb = tile_idx / tiles_per_row_local;
+                const col_tile = tile_idx % tiles_per_row_local;
+                const row_start = rb * ROW_BLOCK_SIZE;
+                const row_end = @min(row_start + ROW_BLOCK_SIZE, task_ctx.m_rows);
                 const col_start = col_tile * tile_size_local;
                 const col_end = @min(col_start + tile_size_local, n_len);
 
-                var row: usize = 0;
-                while (row + ROW_BLOCK <= task_ctx.m_rows) : (row += ROW_BLOCK) {
+                var row = row_start;
+                while (row + MICRO_ROWS <= row_end) : (row += MICRO_ROWS) {
                     const a0 = task_ctx.a[(row + 0) * k_len ..][0..k_len];
                     const a1 = task_ctx.a[(row + 1) * k_len ..][0..k_len];
                     const a2 = task_ctx.a[(row + 2) * k_len ..][0..k_len];
@@ -612,7 +632,7 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
                     }
                 }
 
-                while (row < task_ctx.m_rows) : (row += 1) {
+                while (row < row_end) : (row += 1) {
                     const a_row = task_ctx.a[row * k_len ..][0..k_len];
                     const out_row = task_ctx.c[row * n_len ..][0..n_len];
                     var col_idx = col_start;
@@ -683,9 +703,9 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
                 }
             }
         }
-    }.runColTiles;
+    }.run2DTiles;
 
-    parallel.global().parallelFor(tiles_per_row, tiled_task, &context);
+    parallel.global().parallelFor(total_tiles, tiled_task, &context);
 }
 
 /// F16 matmul kernel - dedicated kernel without runtime dtype branching.

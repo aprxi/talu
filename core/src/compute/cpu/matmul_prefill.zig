@@ -55,7 +55,15 @@ pub fn matmulGaffineU4Prefill(
         k_div_8: usize,
         k_div_group: usize,
         group_u32: usize,
+        num_col_pairs: usize,
     };
+
+    // 2D tiling: row_blocks × col_pairs flattened into a 1D task stream.
+    // Distributes A-matrix reads across threads to reduce L3 contention.
+    const ROW_BLOCK_SIZE: usize = 64;
+    const num_col_pairs = n_cols / 2;
+    const row_blocks = (m_rows + ROW_BLOCK_SIZE - 1) / ROW_BLOCK_SIZE;
+    const total_tiles = row_blocks * num_col_pairs;
 
     var context = MatmulU4PrefillCtx{
         .a = a_data,
@@ -71,33 +79,34 @@ pub fn matmulGaffineU4Prefill(
         .k_div_8 = k_div_8,
         .k_div_group = k_div_group,
         .group_u32 = group_u32,
+        .num_col_pairs = num_col_pairs,
     };
 
-    // Parallelize over column pairs
-    const num_col_pairs = n_cols / 2;
-
-    const col_pair_task = struct {
-        fn runColPairs(start: usize, end: usize, task_ctx: *MatmulU4PrefillCtx) void {
+    const tile_task = struct {
+        fn run2DTiles(start: usize, end: usize, task_ctx: *MatmulU4PrefillCtx) void {
             @setFloatMode(.optimized);
 
-            var col_pair_idx = start;
-            while (col_pair_idx < end) : (col_pair_idx += 1) {
+            for (start..end) |tile_idx| {
+                const rb = tile_idx / task_ctx.num_col_pairs;
+                const col_pair_idx = tile_idx % task_ctx.num_col_pairs;
+                const row_start = rb * ROW_BLOCK_SIZE;
+                const row_end = @min(row_start + ROW_BLOCK_SIZE, task_ctx.m_rows);
                 const col_idx = col_pair_idx * 2;
 
                 // Process rows in groups of 4
-                var row_idx: usize = 0;
-                while (row_idx + 3 < task_ctx.m_rows) : (row_idx += 4) {
+                var row_idx = row_start;
+                while (row_idx + 3 < row_end) : (row_idx += 4) {
                     kernel4x2(task_ctx, row_idx, col_idx);
                 }
                 // Remainder rows
-                while (row_idx < task_ctx.m_rows) : (row_idx += 1) {
+                while (row_idx < row_end) : (row_idx += 1) {
                     kernel1x2(task_ctx, row_idx, col_idx);
                 }
             }
         }
-    }.runColPairs;
+    }.run2DTiles;
 
-    parallel.global().parallelFor(num_col_pairs, col_pair_task, &context);
+    parallel.global().parallelFor(total_tiles, tile_task, &context);
 
     // Handle odd column at end
     if (n_cols % 2 == 1) {
@@ -515,7 +524,14 @@ pub fn matmulGaffineU8Prefill(
         k_div_4: usize,
         k_div_group: usize,
         group_u32: usize,
+        num_col_pairs: usize,
     };
+
+    // 2D tiling: row_blocks × col_pairs flattened into a 1D task stream.
+    const ROW_BLOCK_SIZE: usize = 64;
+    const num_col_pairs = n_cols / 2;
+    const row_blocks = (m_rows + ROW_BLOCK_SIZE - 1) / ROW_BLOCK_SIZE;
+    const total_tiles = row_blocks * num_col_pairs;
 
     var context = MatmulU8PrefillCtx{
         .a = a_data,
@@ -531,33 +547,34 @@ pub fn matmulGaffineU8Prefill(
         .k_div_4 = k_div_4,
         .k_div_group = k_div_group,
         .group_u32 = group_u32,
+        .num_col_pairs = num_col_pairs,
     };
 
-    // Parallelize over column pairs (same as 4-bit)
-    const num_col_pairs = n_cols / 2;
-
-    const col_pair_task = struct {
-        fn runColPairs(start: usize, end: usize, task_ctx: *MatmulU8PrefillCtx) void {
+    const tile_task = struct {
+        fn run2DTiles(start: usize, end: usize, task_ctx: *MatmulU8PrefillCtx) void {
             @setFloatMode(.optimized);
 
-            var col_pair = start;
-            while (col_pair < end) : (col_pair += 1) {
+            for (start..end) |tile_idx| {
+                const rb = tile_idx / task_ctx.num_col_pairs;
+                const col_pair = tile_idx % task_ctx.num_col_pairs;
+                const row_start = rb * ROW_BLOCK_SIZE;
+                const row_end = @min(row_start + ROW_BLOCK_SIZE, task_ctx.m_rows);
                 const col = col_pair * 2;
 
                 // Process rows in groups of 4
-                var row: usize = 0;
-                while (row + 3 < task_ctx.m_rows) : (row += 4) {
+                var row = row_start;
+                while (row + 3 < row_end) : (row += 4) {
                     kernel4x2_8bit(task_ctx, row, col);
                 }
                 // Remainder rows
-                while (row < task_ctx.m_rows) : (row += 1) {
+                while (row < row_end) : (row += 1) {
                     kernel1x2_8bit(task_ctx, row, col);
                 }
             }
         }
-    }.runColPairs;
+    }.run2DTiles;
 
-    parallel.global().parallelFor(num_col_pairs, col_pair_task, &context);
+    parallel.global().parallelFor(total_tiles, tile_task, &context);
 
     // Handle odd column at end
     if (n_cols % 2 == 1) {
