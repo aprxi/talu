@@ -2299,6 +2299,7 @@ pub const Block = struct {
                     .d_conv = meta.config.d_conv,
                     .n_heads = meta.config.n_heads,
                     .d_head = meta.config.d_head,
+                    .n_key_heads = meta.config.n_key_heads,
                 },
                 .weights = .{
                     .in_proj = tensorFromWeightHandle(weight_handles[0]),
@@ -4717,6 +4718,64 @@ test "buildRuntimeMetadata preserves gated-delta time-major conv weight view" {
     const time_major_slice = time_major_tensor.asSlice(f32);
     try testing.expectEqual(conv_weight_time_major_storage.len, time_major_slice.len);
     try testing.expectEqual(@intFromPtr(conv_weight_time_major_storage[0..].ptr), @intFromPtr(time_major_slice.ptr));
+}
+
+test "buildRuntimeMetadata propagates gated-delta n_key_heads" {
+    const dk = try cpu_linalg.matmulKernel(.f32);
+    const gated_delta_binding = gated_delta_kernel.GatedDeltaKernel{
+        .config = .{
+            .d_model = 2560,
+            .d_conv = 4,
+            .n_heads = 32,
+            .d_head = 128,
+            .n_key_heads = 16,
+        },
+        .weights = undefined,
+        .matmul_in_proj = dk.func,
+        .matmul_out_proj = dk.func,
+        .layer_idx = 0,
+    };
+
+    var norm = [_]?NormKernelBinding{null};
+    var attention = [_]?AttentionKernelBinding{null};
+    var mla = [_]?MlaAttentionKernelBinding{null};
+    var swiglu = [_]?SwiGLUKernelBinding{null};
+    var moe = [_]?MoeKernelBinding{null};
+    var mamba = [_]?MambaKernelBinding{null};
+    var gated_delta = [_]?GatedDeltaKernelBinding{&gated_delta_binding};
+    var shortconv = [_]?ShortConvKernelBinding{null};
+    const typed = Block.TypedInstructionKernelRefs{
+        .norm = norm[0..],
+        .attention = attention[0..],
+        .mla_attention = mla[0..],
+        .swiglu = swiglu[0..],
+        .moe = moe[0..],
+        .mamba = mamba[0..],
+        .gated_delta = gated_delta[0..],
+        .shortconv = shortconv[0..],
+    };
+
+    const plan = runtime_contract.ExecutionPlan{
+        .instructions = &.{
+            .{
+                .opcode = .gated_delta_net,
+                .inputs = &.{},
+                .outputs = &.{},
+                .weights = &.{},
+                .param_block_id = null,
+                .state_block_id = null,
+            },
+        },
+        .register_count = 0,
+        .state_descs = &.{},
+    };
+    var runtime_meta = try Block.buildRuntimeMetadata(testing.allocator, typed, &plan);
+    defer runtime_meta.deinit(testing.allocator);
+    const meta = runtime_meta.gated_delta[0] orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 32), meta.config.n_heads);
+    try testing.expectEqual(@as(u32, 16), meta.config.n_key_heads);
+    try testing.expectEqual(@as(u32, 128), meta.config.d_head);
+    try testing.expectEqual(@as(u32, 4), meta.config.d_conv);
 }
 
 test "resolveKernelWeightPtrForSlot routes layernorm bias via norm_bias slot" {
