@@ -13,6 +13,7 @@ const grouped_affine_quant = @import("quant/grouped_affine_quant.zig");
 const multi_row = @import("matmul_prefill.zig");
 const rowwise = @import("rowwise.zig");
 const log = @import("../../log.zig");
+const accelerate = @import("accelerate.zig");
 
 // Re-export types
 pub const Tensor = tensor_mod.Tensor;
@@ -38,6 +39,9 @@ pub const MatmulScratch = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !MatmulScratch {
+        // Detect CPU features at init time (before any matmuls)
+        _ = simd.arm.detectBf16();
+
         return .{
             .allocator = allocator,
         };
@@ -166,6 +170,13 @@ pub fn matmulF32(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Mat
     const a_data = a.asSlice(f32);
     const b_data = b.asSlice(f32);
     const c_data = out.asSlice(f32);
+
+    // Use Apple Accelerate BLAS on macOS for optimized matrix multiply.
+    // cblas_sgemm uses AMX/NEON and is highly tuned for Apple Silicon.
+    if (comptime accelerate.available) {
+        accelerate.sgemm(a_data, b_data, c_data, m_rows, n_cols, k_dim);
+        return;
+    }
 
     const MatmulF32Ctx = struct {
         a: []const f32,
@@ -405,7 +416,6 @@ pub fn matmulF32Accum(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch:
 
 /// BF16 matmul kernel - dedicated kernel for BF16 weights (no runtime dtype branching).
 fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulScratch) void {
-    _ = scratch;
     std.debug.assert(a.dtype == .f32 and b.dtype == .bf16 and out.dtype == .f32);
     std.debug.assert(a.n_dims == 2 and b.n_dims == 2 and out.n_dims == 2);
 
@@ -420,6 +430,235 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
     const b_data = b.asSliceUnaligned(u16);
     const c_data = out.asSlice(f32);
 
+    // Use Apple Accelerate BLAS for large bf16 matmuls.
+    // Convert bf16 weights to f32, then use optimized AMX/NEON sgemm.
+    // Only worth it for larger matrices where AMX speedup offsets conversion cost.
+    if (comptime accelerate.available) {
+        // Threshold: conversion overhead amortized when compute dominates
+        // For M=1 (token gen), stay with SIMD path. For M>=4 or large K*N, use Accelerate.
+        const compute_ops = m_rows * n_cols * k_dim;
+        const conversion_ops = n_cols * k_dim;
+        if (compute_ops >= conversion_ops * 8 and n_cols * k_dim >= 65536) {
+            // Allocate f32 buffer for converted weights
+            const b_f32 = scratch.allocator.alloc(f32, n_cols * k_dim) catch {
+                // Fall through to SIMD path on allocation failure
+                matmulBF16Simd(a_data, b_data, c_data, m_rows, n_cols, k_dim, scratch.allocator);
+                return;
+            };
+            defer scratch.allocator.free(b_f32);
+
+            // Convert bf16 to f32 (vectorized)
+            convertBf16ToF32(b_data, b_f32);
+
+            // B is [N x K], use sgemmTransB: C = A @ B^T
+            accelerate.sgemmTransB(a_data, b_f32, c_data, m_rows, n_cols, k_dim);
+            return;
+        }
+    }
+
+    matmulBF16Simd(a_data, b_data, c_data, m_rows, n_cols, k_dim, scratch.allocator);
+}
+
+/// Vectorized bf16→f32 conversion
+fn convertBf16ToF32(src: []align(1) const u16, dst: []f32) void {
+    const VEC = simd.f32_vec_len;
+    const len = src.len;
+    var i: usize = 0;
+
+    // Vectorized conversion: bf16 is upper 16 bits of f32
+    while (i + VEC <= len) : (i += VEC) {
+        const u16_vec: @Vector(VEC, u16) = src[i..][0..VEC].*;
+        const u32_vec: @Vector(VEC, u32) = u16_vec;
+        dst[i..][0..VEC].* = @bitCast(u32_vec << @as(@Vector(VEC, u5), @splat(16)));
+    }
+
+    // Scalar tail
+    while (i < len) : (i += 1) {
+        dst[i] = bf16ToF32(src[i]);
+    }
+}
+
+/// Vectorized f32→bf16 conversion (for BFDOT path)
+fn convertF32ToBf16(src: []const f32, dst: []u16) void {
+    var i: usize = 0;
+
+    // Process 8 f32 at a time using ARM BFCVTN/BFCVTN2
+    while (i + 8 <= src.len) : (i += 8) {
+        const lo: @Vector(4, f32) = src[i..][0..4].*;
+        const hi: @Vector(4, f32) = src[i + 4 ..][0..4].*;
+        const bf16_vec = simd.arm.f32ToBf16x8(lo, hi);
+        dst[i..][0..8].* = bf16_vec;
+    }
+
+    // Scalar tail
+    while (i < src.len) : (i += 1) {
+        // Truncate f32 to bf16 (drop lower 16 bits)
+        dst[i] = @truncate(@as(u32, @bitCast(src[i])) >> 16);
+    }
+}
+
+/// BFDOT-optimized single-row bf16 matmul for M=1.
+/// Converts f32 activations to bf16 once, then uses BFDOT for all output columns.
+/// This amortizes the conversion cost across all n_cols dot products.
+fn matmulBF16SingleRowBFDOT(
+    a_data: []const f32,
+    b_data: []align(1) const u16,
+    c_data: []f32,
+    n_cols: usize,
+    k_dim: usize,
+    allocator: ?std.mem.Allocator,
+) void {
+    // Convert f32 activations to bf16.
+    // Use stack buffer for common sizes (4096 is safe), heap for larger.
+    const stack_limit = 4096;
+
+    var a_bf16_buf: [stack_limit]u16 = undefined;
+    const heap_buf: ?[]u16 = if (k_dim > stack_limit) blk: {
+        if (allocator) |alloc| {
+            break :blk alloc.alloc(u16, k_dim) catch null;
+        }
+        break :blk null;
+    } else null;
+
+    const a_bf16: []u16 = if (k_dim <= stack_limit)
+        a_bf16_buf[0..k_dim]
+    else if (heap_buf) |buf|
+        buf
+    else {
+        // No allocator or allocation failed - fall back to non-BFDOT path
+        matmulBF16SingleRowFallback(a_data, b_data, c_data, n_cols, k_dim);
+        return;
+    };
+    defer if (heap_buf) |buf| {
+        if (allocator) |alloc| alloc.free(buf);
+    };
+
+    // Convert activations to bf16
+    convertF32ToBf16(a_data[0..k_dim], a_bf16);
+
+    // Parallel over output columns
+    const MatmulBFDOTCtx = struct {
+        a_bf16: []const u16,
+        b: []align(1) const u16,
+        c: []f32,
+        n_cols: usize,
+        k_dim: usize,
+    };
+    var context = MatmulBFDOTCtx{
+        .a_bf16 = a_bf16,
+        .b = b_data,
+        .c = c_data,
+        .n_cols = n_cols,
+        .k_dim = k_dim,
+    };
+
+    const col_task = struct {
+        fn runCols(start: usize, end: usize, ctx: *MatmulBFDOTCtx) void {
+            @setFloatMode(.optimized);
+            const k = ctx.k_dim;
+            const a = ctx.a_bf16;
+
+            for (start..end) |col| {
+                const b_row = ctx.b[col * k ..][0..k];
+
+                // Use 4 accumulators for better instruction-level parallelism
+                var acc0: @Vector(4, f32) = @splat(0);
+                var acc1: @Vector(4, f32) = @splat(0);
+                var acc2: @Vector(4, f32) = @splat(0);
+                var acc3: @Vector(4, f32) = @splat(0);
+
+                var ki: usize = 0;
+                // Unroll 4x: process 32 bf16 pairs per iteration
+                while (ki + 32 <= k) : (ki += 32) {
+                    const a0: @Vector(8, u16) = a[ki..][0..8].*;
+                    const a1: @Vector(8, u16) = a[ki + 8 ..][0..8].*;
+                    const a2: @Vector(8, u16) = a[ki + 16 ..][0..8].*;
+                    const a3: @Vector(8, u16) = a[ki + 24 ..][0..8].*;
+
+                    const b0: @Vector(8, u16) = b_row[ki..][0..8].*;
+                    const b1: @Vector(8, u16) = b_row[ki + 8 ..][0..8].*;
+                    const b2: @Vector(8, u16) = b_row[ki + 16 ..][0..8].*;
+                    const b3: @Vector(8, u16) = b_row[ki + 24 ..][0..8].*;
+
+                    acc0 = simd.arm.bfdot8(acc0, a0, b0);
+                    acc1 = simd.arm.bfdot8(acc1, a1, b1);
+                    acc2 = simd.arm.bfdot8(acc2, a2, b2);
+                    acc3 = simd.arm.bfdot8(acc3, a3, b3);
+                }
+
+                // Handle remaining 8-element chunks
+                while (ki + 8 <= k) : (ki += 8) {
+                    const a_vec: @Vector(8, u16) = a[ki..][0..8].*;
+                    const b_vec: @Vector(8, u16) = b_row[ki..][0..8].*;
+                    acc0 = simd.arm.bfdot8(acc0, a_vec, b_vec);
+                }
+
+                // Combine accumulators and reduce
+                const combined = acc0 + acc1 + acc2 + acc3;
+                var sum = @reduce(.Add, combined);
+
+                // Handle tail (if k not divisible by 8)
+                while (ki < k) : (ki += 1) {
+                    const av = @as(f32, @bitCast(@as(u32, a[ki]) << 16));
+                    const bv = @as(f32, @bitCast(@as(u32, b_row[ki]) << 16));
+                    sum += av * bv;
+                }
+
+                ctx.c[col] = sum;
+            }
+        }
+    }.runCols;
+
+    parallel.global().parallelFor(n_cols, col_task, &context);
+}
+
+/// Fallback single-row kernel when BFDOT can't be used
+fn matmulBF16SingleRowFallback(
+    a_data: []const f32,
+    b_data: []align(1) const u16,
+    c_data: []f32,
+    n_cols: usize,
+    k_dim: usize,
+) void {
+    const VEC = simd.f32_vec_len;
+
+    for (0..n_cols) |col| {
+        const b_row = b_data[col * k_dim ..][0..k_dim];
+        var acc: @Vector(VEC, f32) = @splat(0);
+        var ki: usize = 0;
+
+        while (ki + VEC <= k_dim) : (ki += VEC) {
+            const a_vec: @Vector(VEC, f32) = a_data[ki..][0..VEC].*;
+            const b_u16: @Vector(VEC, u16) = b_row[ki..][0..VEC].*;
+            const b_vec: @Vector(VEC, f32) = @bitCast(@as(@Vector(VEC, u32), b_u16) << @as(@Vector(VEC, u5), @splat(16)));
+            acc = @mulAdd(@Vector(VEC, f32), a_vec, b_vec, acc);
+        }
+
+        var sum = @reduce(.Add, acc);
+        while (ki < k_dim) : (ki += 1) {
+            sum += a_data[ki] * bf16ToF32(b_row[ki]);
+        }
+        c_data[col] = sum;
+    }
+}
+
+/// BF16 matmul SIMD kernel - the actual vectorized implementation.
+fn matmulBF16Simd(
+    a_data: []const f32,
+    b_data: []align(1) const u16,
+    c_data: []f32,
+    m_rows: usize,
+    n_cols: usize,
+    k_dim: usize,
+    allocator: ?std.mem.Allocator,
+) void {
+    // For M=1 with BFDOT available, use optimized single-row kernel.
+    // Convert f32 activations to bf16 once, then use BFDOT for all columns.
+    if (m_rows == 1 and simd.arm.has_bf16 and k_dim % 8 == 0) {
+        matmulBF16SingleRowBFDOT(a_data, b_data, c_data, n_cols, k_dim, allocator);
+        return;
+    }
+
     const MatmulBF16Ctx = struct {
         a: []const f32,
         b: []align(1) const u16,
@@ -427,49 +666,29 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
         m_rows: usize,
         n_cols: usize,
         k_dim: usize,
-        tiles_per_row: usize,
     };
+    var context = MatmulBF16Ctx{ .a = a_data, .b = b_data, .c = c_data, .m_rows = m_rows, .n_cols = n_cols, .k_dim = k_dim };
 
-    // 2D tiling: row_blocks × col_tiles flattened into a 1D task stream.
-    // Each task processes ROW_BLOCK_SIZE rows × tile_size columns.
-    // This distributes A-matrix reads across threads so they don't all
-    // contend for the same L3 cache lines.
-    const ROW_BLOCK_SIZE: usize = 64;
+    // Unified rows path: tile over columns and reuse each loaded BF16 weight row
+    // across several activation rows before moving on.
     const tile_size = fp16ColTileSize(k_dim);
     const tiles_per_row = (n_cols + tile_size - 1) / tile_size;
-    const row_blocks = (m_rows + ROW_BLOCK_SIZE - 1) / ROW_BLOCK_SIZE;
-    const total_tiles = row_blocks * tiles_per_row;
-
-    var context = MatmulBF16Ctx{
-        .a = a_data,
-        .b = b_data,
-        .c = c_data,
-        .m_rows = m_rows,
-        .n_cols = n_cols,
-        .k_dim = k_dim,
-        .tiles_per_row = tiles_per_row,
-    };
 
     const tiled_task = struct {
-        fn run2DTiles(start: usize, end: usize, task_ctx: *MatmulBF16Ctx) void {
+        fn runColTiles(start: usize, end: usize, task_ctx: *MatmulBF16Ctx) void {
             const k_len = task_ctx.k_dim;
             const n_len = task_ctx.n_cols;
             const tile_size_local = fp16ColTileSize(k_len);
-            const tiles_per_row_local = task_ctx.tiles_per_row;
             const VEC = simd.f32_vec_len;
-            const MICRO_ROWS = 4;
+            const ROW_BLOCK = 4;
             const b_base = task_ctx.b;
 
-            for (start..end) |tile_idx| {
-                const rb = tile_idx / tiles_per_row_local;
-                const col_tile = tile_idx % tiles_per_row_local;
-                const row_start = rb * ROW_BLOCK_SIZE;
-                const row_end = @min(row_start + ROW_BLOCK_SIZE, task_ctx.m_rows);
+            for (start..end) |col_tile| {
                 const col_start = col_tile * tile_size_local;
                 const col_end = @min(col_start + tile_size_local, n_len);
 
-                var row = row_start;
-                while (row + MICRO_ROWS <= row_end) : (row += MICRO_ROWS) {
+                var row: usize = 0;
+                while (row + ROW_BLOCK <= task_ctx.m_rows) : (row += ROW_BLOCK) {
                     const a0 = task_ctx.a[(row + 0) * k_len ..][0..k_len];
                     const a1 = task_ctx.a[(row + 1) * k_len ..][0..k_len];
                     const a2 = task_ctx.a[(row + 2) * k_len ..][0..k_len];
@@ -632,7 +851,7 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
                     }
                 }
 
-                while (row < row_end) : (row += 1) {
+                while (row < task_ctx.m_rows) : (row += 1) {
                     const a_row = task_ctx.a[row * k_len ..][0..k_len];
                     const out_row = task_ctx.c[row * n_len ..][0..n_len];
                     var col_idx = col_start;
@@ -703,9 +922,9 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
                 }
             }
         }
-    }.run2DTiles;
+    }.runColTiles;
 
-    parallel.global().parallelFor(total_tiles, tiled_task, &context);
+    parallel.global().parallelFor(tiles_per_row, tiled_task, &context);
 }
 
 /// F16 matmul kernel - dedicated kernel without runtime dtype branching.

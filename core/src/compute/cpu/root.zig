@@ -37,6 +37,7 @@ pub const sdpa_rowwise = @import("sdpa_rowwise.zig");
 pub const linalg_sdpa = @import("linalg_sdpa.zig");
 pub const state_space = @import("state_space.zig");
 pub const matmul = @import("matmul_primitives.zig");
+pub const accelerate = @import("accelerate.zig");
 
 test {
     _ = common;
@@ -70,4 +71,5 @@ test {
     _ = linalg_sdpa;
     _ = state_space;
     _ = matmul;
+    _ = accelerate;
 }

@@ -40,14 +40,21 @@ fn getPhysicalCoreCount() usize {
 }
 
 /// Calculate optimal thread count for LLM inference.
-/// Formula: min(physical_cores, 8 + physical_cores / 4)
-/// This accounts for memory bandwidth being the bottleneck.
+/// For Apple Silicon: use ~60% of cores (P-cores only, avoid E-core contention).
+/// For x86: use physical cores (no E-cores).
+/// Memory bandwidth is the bottleneck, so more threads can hurt performance.
 fn getOptimalThreadCount() usize {
     const physical = getPhysicalCoreCount();
-    // Base of 8 threads + 25% of additional physical cores
-    // But never exceed available physical cores
-    const optimal = @min(physical, 8 + physical / 4);
-    return @max(1, optimal);
+
+    // Apple Silicon: M4 has 6P+4E, M3/M2/M1 have 4P+4E typically.
+    // Using only P-cores (60% of total) avoids E-core contention.
+    if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos) {
+        const p_core_estimate = (physical * 6 + 9) / 10; // ~60%, rounded
+        return @max(1, @min(p_core_estimate, 8));
+    }
+
+    // x86: use physical cores but cap at 8 for memory bandwidth
+    return @max(1, @min(physical, 8));
 }
 
 /// Futex-based wait/wake with aggressive spinning for low-latency synchronization.

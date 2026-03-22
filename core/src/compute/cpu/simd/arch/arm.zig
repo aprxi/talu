@@ -1,7 +1,10 @@
-//! ARM/NEON intrinsics for quantized dot products.
+//! ARM/NEON intrinsics for quantized dot products and bf16 operations.
 //!
 //! Uses SDOT instruction on ARMv8.2-A+ (M1/M2/M3/M4, A76+) for optimal
 //! performance, with scalar fallback for older architectures.
+//!
+//! Uses BFDOT instruction on ARMv8.6-A+ (M2/M3/M4) for bf16 dot products.
+//! Runtime detection is used to ensure binaries work across all Apple Silicon.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11,6 +14,37 @@ const has_dotprod = blk: {
     if (builtin.cpu.arch != .aarch64) break :blk false;
     break :blk std.Target.aarch64.featureSetHas(builtin.cpu.features, .dotprod);
 };
+
+/// Runtime bf16 feature detection (cached).
+/// On macOS aarch64, queries hw.optional.arm.FEAT_BF16 via sysctlbyname.
+/// Result is cached after first call for zero overhead in hot paths.
+pub var has_bf16: bool = false;
+var bf16_detected: bool = false;
+
+pub fn detectBf16() bool {
+    if (bf16_detected) return has_bf16;
+
+    if (comptime builtin.cpu.arch != .aarch64) {
+        bf16_detected = true;
+        has_bf16 = false;
+        return false;
+    }
+
+    if (comptime builtin.os.tag == .macos) {
+        const c = @cImport(@cInclude("sys/sysctl.h"));
+        var value: c_int = 0;
+        var size: usize = @sizeOf(c_int);
+        const result = c.sysctlbyname("hw.optional.arm.FEAT_BF16", &value, &size, null, 0);
+        has_bf16 = (result == 0 and value != 0);
+    } else {
+        // Linux/other: use compile-time detection
+        // TODO: Add Linux runtime detection via getauxval(AT_HWCAP2) & HWCAP2_BF16
+        has_bf16 = std.Target.aarch64.featureSetHas(builtin.cpu.features, .bf16);
+    }
+
+    bf16_detected = true;
+    return has_bf16;
+}
 
 /// Calculate dot product of two 128-bit vectors (16x i8) accumulating into 4x i32.
 /// Uses SDOT instruction if available (M1/M2/M3/M4), falls back to manual calculation.
@@ -157,6 +191,75 @@ pub inline fn mulSumU8I8WithYSum(q4: @Vector(32, u8), y: @Vector(32, i8)) struct
     const dot = @shuffle(i32, res_lo, res_hi, @Vector(8, i32){ 0, 1, 2, 3, -1, -2, -3, -4 });
 
     return .{ .dot = dot, .sum_y = sum_y };
+}
+
+// =============================================================================
+// BF16 Operations (ARMv8.6-A+, M2/M3/M4)
+// =============================================================================
+
+/// BFDOT: bf16 dot product instruction.
+/// Computes dot product of 8 bf16 pairs, accumulating into 4 f32 lanes.
+/// Each output lane gets sum of 2 adjacent bf16×bf16 products.
+/// Available on M2/M3/M4 (ARMv8.6-A with FEAT_BF16).
+/// Uses runtime detection for cross-generation binary compatibility.
+pub inline fn bfdot8(acc: @Vector(4, f32), a: @Vector(8, u16), b: @Vector(8, u16)) @Vector(4, f32) {
+    // On aarch64, use native BFDOT if available (runtime-detected).
+    // The assembly is always compiled but only executed if bf16 is detected.
+    if (comptime builtin.cpu.arch == .aarch64) {
+        if (has_bf16) {
+            // BFDOT: bfloat16 dot product
+            // bfdot Vd.4S, Vn.8H, Vm.8H
+            var result = acc;
+            asm ("bfdot %[acc].4s, %[a].8h, %[b].8h"
+                : [acc] "+w" (result),
+                : [a] "w" (a),
+                  [b] "w" (b),
+            );
+            return result;
+        }
+    }
+
+    // Fallback: convert bf16 to f32 and use FMA
+    var result = acc;
+    inline for (0..4) |lane| {
+        const a0 = @as(f32, @bitCast(@as(u32, a[lane * 2]) << 16));
+        const a1 = @as(f32, @bitCast(@as(u32, a[lane * 2 + 1]) << 16));
+        const b0 = @as(f32, @bitCast(@as(u32, b[lane * 2]) << 16));
+        const b1 = @as(f32, @bitCast(@as(u32, b[lane * 2 + 1]) << 16));
+        result[lane] += a0 * b0 + a1 * b1;
+    }
+    return result;
+}
+
+/// Convert 8 f32 values to 8 bf16 values (truncation).
+/// Uses BFCVTN instruction on ARMv8.6-A+ for optimal performance.
+/// Uses runtime detection for cross-generation binary compatibility.
+pub inline fn f32ToBf16x8(lo: @Vector(4, f32), hi: @Vector(4, f32)) @Vector(8, u16) {
+    if (comptime builtin.cpu.arch == .aarch64) {
+        if (has_bf16) {
+            // BFCVTN/BFCVTN2: convert f32 to bf16
+            var result: @Vector(8, u16) = undefined;
+            // First convert low 4 floats to low 4 bf16
+            asm ("bfcvtn %[out].4h, %[in].4s"
+                : [out] "=w" (result),
+                : [in] "w" (lo),
+            );
+            // Then convert high 4 floats to high 4 bf16
+            asm ("bfcvtn2 %[out].8h, %[in].4s"
+                : [out] "+w" (result),
+                : [in] "w" (hi),
+            );
+            return result;
+        }
+    }
+
+    // Fallback: manual truncation (drop lower 16 bits)
+    var result: @Vector(8, u16) = undefined;
+    inline for (0..4) |i| {
+        result[i] = @truncate(@as(u32, @bitCast(lo[i])) >> 16);
+        result[i + 4] = @truncate(@as(u32, @bitCast(hi[i])) >> 16);
+    }
+    return result;
 }
 
 // =============================================================================

@@ -387,7 +387,7 @@ pub export fn talu_batch_run_loop(
 
     // Cast opaque pointer to the expected function pointer type.
     const RunLoopCallback = *const fn ([*]const BatchWrapper.CEvent, usize, ?*anyopaque) callconv(.c) void;
-    const cb: RunLoopCallback = @ptrCast(cb_ptr);
+    const cb: RunLoopCallback = @ptrCast(@alignCast(cb_ptr));
 
     const pending: ?*const std.atomic.Value(bool) = if (pending_flag) |pf| @ptrCast(@alignCast(pf)) else null;
 
