@@ -19,6 +19,7 @@ const cpu_layout = compute.cpu.layout;
 const cpu_indexing = compute.cpu.indexing;
 const cpu_norm = compute.cpu.normalization;
 const cpu_rotary = compute.cpu.rotary;
+const parallel = @import("../../../../system/parallel.zig");
 const rope_kernel = @import("rope.zig");
 const fmt = @import("describe_fmt.zig");
 const inspect = @import("../../../../xray/root.zig");
@@ -34,6 +35,17 @@ const FlashAttentionFn = flash_attention.FlashAttentionFn;
 
 /// Threshold for using Flash Attention (prefill only).
 const FLASH_ATTENTION_THRESHOLD: usize = 512;
+
+/// Cached environment variable check (avoid per-token syscall).
+var exact_softmax_cached: bool = false;
+var exact_softmax_initialized: bool = false;
+
+fn getExactSoftmax(allocator: std.mem.Allocator) bool {
+    if (exact_softmax_initialized) return exact_softmax_cached;
+    exact_softmax_cached = std.process.hasEnvVar(allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
+    exact_softmax_initialized = true;
+    return exact_softmax_cached;
+}
 
 /// Temporary scratch buffers for attention computation.
 /// These are safe to share across layers because they do not persist state.
@@ -194,7 +206,7 @@ pub const MultiHeadAttention = struct {
         matmul_scratch: *cpu_linalg.MatmulScratch,
         use_cache: bool,
     ) !void {
-        const exact_softmax = std.process.hasEnvVar(self.allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
+        const exact_softmax = getExactSoftmax(self.allocator);
         const query_gate = self.query_gate;
         // Internal invariants: model config must be valid after loading
         std.debug.assert(self.n_heads > 0 and self.n_kv_heads > 0);
@@ -893,7 +905,7 @@ pub const MultiHeadAttention = struct {
         matmul_scratch: *cpu_linalg.MatmulScratch,
         use_cache: bool,
     ) !void {
-        const exact_softmax = std.process.hasEnvVar(self.allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
+        const exact_softmax = getExactSoftmax(self.allocator);
         const query_gate = self.query_gate;
         std.debug.assert(self.n_heads > 0 and self.n_kv_heads > 0);
         std.debug.assert(self.n_heads % self.n_kv_heads == 0);
@@ -1092,35 +1104,126 @@ pub const MultiHeadAttention = struct {
             else
                 0;
 
-            const score_stride = self.max_seq_len;
+            const active_len = kv_sequence_len - start_kv_index;
 
-            // Compute attention for each KV head group
-            for (0..n_kv_heads) |kv_head_idx| {
-                const k_cache_head = cache.getKHead(slot_index, kv_head_idx);
-                const v_cache_head = cache.getVHead(slot_index, kv_head_idx);
+            // Use GQA-optimized batched BLAS for longer contexts
+            // This batches Q @ K^T for all queries sharing the same KV head
+            if (active_len >= 128 and !exact_softmax and n_kv_heads >= 4) {
+                const DecodeKVGroupCtx = struct {
+                    query_values: []const f32,
+                    context_values: []f32,
+                    cache: *BatchedKVCache,
+                    slot_index: usize,
+                    sinks: ?[]const f32,
+                    head_dim: usize,
+                    heads_per_kv_group: usize,
+                    kv_sequence_len: usize,
+                    start_kv_index: usize,
+                    scale: f32,
 
-                const q_head_start = kv_head_idx * heads_per_kv_group;
-                const q_head_end = q_head_start + heads_per_kv_group;
+                    fn processKVGroup(start_group: usize, end_group: usize, ctx: *@This()) void {
+                        for (start_group..end_group) |kv_head_idx| {
+                            const k_cache_head = ctx.cache.getKHead(ctx.slot_index, kv_head_idx);
+                            const v_cache_head = ctx.cache.getVHead(ctx.slot_index, kv_head_idx);
 
-                for (q_head_start..q_head_end) |head_index| {
-                    const query_head = query_values[head_index * head_dim ..][0..head_dim];
-                    const scores_for_head = score_values[head_index * score_stride ..][0..kv_sequence_len];
-                    const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                    const context_for_head = context_values[head_index * head_dim ..][0..head_dim];
-                    cpu_sdpa.computeMaskedRowWeightedSum(
-                        query_head,
-                        k_cache_head,
-                        v_cache_head,
-                        scores_for_head,
-                        context_for_head,
-                        start_kv_index,
-                        kv_sequence_len,
-                        head_dim,
-                        scale,
-                        sink_logit,
-                        exact_softmax,
-                    );
-                }
+                            const first_q_head = kv_head_idx * ctx.heads_per_kv_group;
+                            const queries = ctx.query_values[first_q_head * ctx.head_dim ..][0 .. ctx.heads_per_kv_group * ctx.head_dim];
+                            const outputs = ctx.context_values[first_q_head * ctx.head_dim ..][0 .. ctx.heads_per_kv_group * ctx.head_dim];
+
+                            cpu_sdpa.computeFlashDecodeGQA(
+                                queries,
+                                k_cache_head,
+                                v_cache_head,
+                                outputs,
+                                ctx.heads_per_kv_group,
+                                ctx.start_kv_index,
+                                ctx.kv_sequence_len,
+                                ctx.head_dim,
+                                ctx.scale,
+                                ctx.sinks,
+                                first_q_head,
+                            );
+                        }
+                    }
+                };
+
+                var gqa_ctx = DecodeKVGroupCtx{
+                    .query_values = query_values,
+                    .context_values = context_values,
+                    .cache = cache,
+                    .slot_index = slot_index,
+                    .sinks = self.sinks,
+                    .head_dim = head_dim,
+                    .heads_per_kv_group = heads_per_kv_group,
+                    .kv_sequence_len = kv_sequence_len,
+                    .start_kv_index = start_kv_index,
+                    .scale = scale,
+                };
+
+                parallel.global().parallelFor(n_kv_heads, DecodeKVGroupCtx.processKVGroup, &gqa_ctx);
+            } else {
+                // Short context: use per-head processing
+                const score_stride = self.max_seq_len;
+                const DecodeHeadCtx = struct {
+                    query_values: []const f32,
+                    score_values: []f32,
+                    context_values: []f32,
+                    cache: *BatchedKVCache,
+                    slot_index: usize,
+                    sinks: ?[]const f32,
+                    head_dim: usize,
+                    heads_per_kv_group: usize,
+                    score_stride: usize,
+                    kv_sequence_len: usize,
+                    start_kv_index: usize,
+                    scale: f32,
+                    exact_softmax: bool,
+
+                    fn processHead(start_head: usize, end_head: usize, ctx: *@This()) void {
+                        for (start_head..end_head) |head_index| {
+                            const kv_head_idx = head_index / ctx.heads_per_kv_group;
+                            const k_cache_head = ctx.cache.getKHead(ctx.slot_index, kv_head_idx);
+                            const v_cache_head = ctx.cache.getVHead(ctx.slot_index, kv_head_idx);
+
+                            const query_head = ctx.query_values[head_index * ctx.head_dim ..][0..ctx.head_dim];
+                            const scores_for_head = ctx.score_values[head_index * ctx.score_stride ..][0..ctx.kv_sequence_len];
+                            const sink_logit: ?f32 = if (ctx.sinks) |s| s[head_index] else null;
+                            const context_for_head = ctx.context_values[head_index * ctx.head_dim ..][0..ctx.head_dim];
+
+                            cpu_sdpa.computeMaskedRowWeightedSum(
+                                query_head,
+                                k_cache_head,
+                                v_cache_head,
+                                scores_for_head,
+                                context_for_head,
+                                ctx.start_kv_index,
+                                ctx.kv_sequence_len,
+                                ctx.head_dim,
+                                ctx.scale,
+                                sink_logit,
+                                ctx.exact_softmax,
+                            );
+                        }
+                    }
+                };
+
+                var decode_ctx = DecodeHeadCtx{
+                    .query_values = query_values,
+                    .score_values = score_values,
+                    .context_values = context_values,
+                    .cache = cache,
+                    .slot_index = slot_index,
+                    .sinks = self.sinks,
+                    .head_dim = head_dim,
+                    .heads_per_kv_group = heads_per_kv_group,
+                    .score_stride = score_stride,
+                    .kv_sequence_len = kv_sequence_len,
+                    .start_kv_index = start_kv_index,
+                    .scale = scale,
+                    .exact_softmax = exact_softmax,
+                };
+
+                parallel.global().parallelFor(n_heads, DecodeHeadCtx.processHead, &decode_ctx);
             }
         } else {
             // === PREFILL MODE ===
@@ -1252,7 +1355,7 @@ pub const MultiHeadAttention = struct {
     ) !void {
         if (!use_cache) return error.InvalidArgument;
 
-        const exact_softmax = std.process.hasEnvVar(self.allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
+        const exact_softmax = getExactSoftmax(self.allocator);
         const query_gate = self.query_gate;
         std.debug.assert(self.n_heads > 0 and self.n_kv_heads > 0);
         std.debug.assert(self.n_heads % self.n_kv_heads == 0);

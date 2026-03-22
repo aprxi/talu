@@ -78,6 +78,20 @@ pub fn sgemmTransB(
     n: usize,
     k: usize,
 ) void {
+    sgemmTransBScaled(a, b, c, m, n, k, 1.0);
+}
+
+/// Perform f32 matrix multiplication with transposed B and scaling.
+/// C = alpha * A @ B^T where A is [M x K], B is [N x K], C is [M x N]
+pub fn sgemmTransBScaled(
+    a: []const f32,
+    b: []const f32,
+    c: []f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+) void {
     if (comptime !available) {
         @compileError("Apple Accelerate not available on this platform");
     }
@@ -89,7 +103,7 @@ pub fn sgemmTransB(
         @intCast(m),
         @intCast(n),
         @intCast(k),
-        1.0, // alpha
+        alpha,
         a.ptr,
         @intCast(k), // lda = K for row-major A
         b.ptr,

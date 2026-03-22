@@ -6,40 +6,68 @@ const simd = @import("simd/arch/root.zig");
 const VEC_LEN = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;
 
-/// Dot product between equal-length f32 rows.
+/// Dot product between equal-length f32 rows with 4x unrolling for better ILP.
 pub fn dotRow(a: []const f32, b: []const f32) f32 {
+    @setFloatMode(.optimized);
     std.debug.assert(a.len == b.len);
     var sum0: F32Vec = @splat(0);
     var sum1: F32Vec = @splat(0);
+    var sum2: F32Vec = @splat(0);
+    var sum3: F32Vec = @splat(0);
     var idx: usize = 0;
-    while (idx + 2 * VEC_LEN - 1 < a.len) : (idx += 2 * VEC_LEN) {
+
+    // 4x unrolling for better instruction-level parallelism
+    while (idx + 4 * VEC_LEN <= a.len) : (idx += 4 * VEC_LEN) {
         const a0: F32Vec = a[idx..][0..VEC_LEN].*;
-        const b0: F32Vec = b[idx..][0..VEC_LEN].*;
         const a1: F32Vec = a[idx + VEC_LEN ..][0..VEC_LEN].*;
+        const a2: F32Vec = a[idx + VEC_LEN * 2 ..][0..VEC_LEN].*;
+        const a3: F32Vec = a[idx + VEC_LEN * 3 ..][0..VEC_LEN].*;
+        const b0: F32Vec = b[idx..][0..VEC_LEN].*;
         const b1: F32Vec = b[idx + VEC_LEN ..][0..VEC_LEN].*;
+        const b2: F32Vec = b[idx + VEC_LEN * 2 ..][0..VEC_LEN].*;
+        const b3: F32Vec = b[idx + VEC_LEN * 3 ..][0..VEC_LEN].*;
         sum0 = @mulAdd(F32Vec, a0, b0, sum0);
         sum1 = @mulAdd(F32Vec, a1, b1, sum1);
+        sum2 = @mulAdd(F32Vec, a2, b2, sum2);
+        sum3 = @mulAdd(F32Vec, a3, b3, sum3);
     }
-    while (idx + VEC_LEN - 1 < a.len) : (idx += VEC_LEN) {
+    while (idx + VEC_LEN <= a.len) : (idx += VEC_LEN) {
         const av: F32Vec = a[idx..][0..VEC_LEN].*;
         const bv: F32Vec = b[idx..][0..VEC_LEN].*;
         sum0 = @mulAdd(F32Vec, av, bv, sum0);
     }
 
-    var sum = @reduce(.Add, sum0 + sum1);
+    var sum = @reduce(.Add, sum0 + sum1 + sum2 + sum3);
     while (idx < a.len) : (idx += 1) {
         sum += a[idx] * b[idx];
     }
     return sum;
 }
 
-/// `out += weight * values` with SIMD acceleration.
+/// `out += weight * values` with SIMD acceleration and 4x unrolling.
 pub fn weightedAccumulateRow(out: []f32, values: []const f32, weight: f32) void {
+    @setFloatMode(.optimized);
     std.debug.assert(out.len == values.len);
 
     const weight_vec: F32Vec = @splat(weight);
     var idx: usize = 0;
-    while (idx + VEC_LEN - 1 < out.len) : (idx += VEC_LEN) {
+
+    // 4x unrolling for better ILP
+    while (idx + 4 * VEC_LEN <= out.len) : (idx += 4 * VEC_LEN) {
+        const v0: F32Vec = values[idx..][0..VEC_LEN].*;
+        const v1: F32Vec = values[idx + VEC_LEN ..][0..VEC_LEN].*;
+        const v2: F32Vec = values[idx + VEC_LEN * 2 ..][0..VEC_LEN].*;
+        const v3: F32Vec = values[idx + VEC_LEN * 3 ..][0..VEC_LEN].*;
+        const dst0 = out[idx..][0..VEC_LEN];
+        const dst1 = out[idx + VEC_LEN ..][0..VEC_LEN];
+        const dst2 = out[idx + VEC_LEN * 2 ..][0..VEC_LEN];
+        const dst3 = out[idx + VEC_LEN * 3 ..][0..VEC_LEN];
+        dst0.* = @mulAdd(F32Vec, weight_vec, v0, dst0.*);
+        dst1.* = @mulAdd(F32Vec, weight_vec, v1, dst1.*);
+        dst2.* = @mulAdd(F32Vec, weight_vec, v2, dst2.*);
+        dst3.* = @mulAdd(F32Vec, weight_vec, v3, dst3.*);
+    }
+    while (idx + VEC_LEN <= out.len) : (idx += VEC_LEN) {
         const vv: F32Vec = values[idx..][0..VEC_LEN].*;
         const dst = out[idx..][0..VEC_LEN];
         dst.* = @mulAdd(F32Vec, weight_vec, vv, dst.*);

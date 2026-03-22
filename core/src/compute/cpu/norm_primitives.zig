@@ -57,6 +57,8 @@ fn viewDTypeToTensor(dt: DType) TensorDType {
 /// RMS Normalization: out = x * rsqrt(mean(x^2) + eps) * weight
 pub fn rmsNorm(out: TensorView, input: TensorView, weight: TensorView, eps: f32) void {
     const weight_dtype_ok = weight.dtype == .f32 or weight.dtype == .f16 or weight.dtype == .bf16;
+
+    // Fast path for f32 contiguous
     if (input.dtype == .f32 and out.dtype == .f32 and input.isContiguous() and out.isContiguous() and weight.isContiguous() and weight_dtype_ok) {
         const hidden_size = input.shape[input.ndim - 1];
         const num_tokens = input.numel / hidden_size;
@@ -76,12 +78,132 @@ pub fn rmsNorm(out: TensorView, input: TensorView, weight: TensorView, eps: f32)
         return;
     }
 
+    // Fast path for bf16 contiguous (SIMD optimized)
+    if (input.dtype == .bf16 and out.dtype == .bf16 and input.isContiguous() and out.isContiguous() and weight.isContiguous() and weight_dtype_ok) {
+        const hidden_size = input.shape[input.ndim - 1];
+        const num_tokens = input.numel / hidden_size;
+        rmsNormBf16Simd(out.asSlice(u16), input.asSlice(u16), weight.asSlice(u16), num_tokens, hidden_size, eps);
+        return;
+    }
+
     switch (input.dtype) {
         .f32 => rmsNormTyped(f32, f32Identity, f32Identity, out, input, weight, eps),
         .f16 => rmsNormTyped(u16, fp16ToF32, f32ToFp16, out, input, weight, eps),
         .bf16 => rmsNormTyped(u16, bf16ToF32, f32ToBf16, out, input, weight, eps),
         else => unreachable,
     }
+}
+
+/// SIMD-optimized RMSNorm for bf16.
+fn rmsNormBf16Simd(
+    out: []u16,
+    input: []const u16,
+    weight: []const u16,
+    num_tokens: usize,
+    dim: usize,
+    eps: f32,
+) void {
+    @setFloatMode(.optimized);
+
+    const VEC = simd.f32_vec_len;
+
+    for (0..num_tokens) |token_idx| {
+        const token_offset = token_idx * dim;
+        const x_row = input[token_offset..][0..dim];
+        const out_row = out[token_offset..][0..dim];
+
+        // Compute sum of squares with SIMD
+        var sum_vec0: F32Vec = @splat(0);
+        var sum_vec1: F32Vec = @splat(0);
+        var sum_vec2: F32Vec = @splat(0);
+        var sum_vec3: F32Vec = @splat(0);
+        var vec_idx: usize = 0;
+
+        // Unroll 4x for better ILP
+        while (vec_idx + VEC * 4 <= dim) : (vec_idx += VEC * 4) {
+            const x0 = bf16VecToF32(x_row[vec_idx..][0..VEC].*);
+            const x1 = bf16VecToF32(x_row[vec_idx + VEC ..][0..VEC].*);
+            const x2 = bf16VecToF32(x_row[vec_idx + VEC * 2 ..][0..VEC].*);
+            const x3 = bf16VecToF32(x_row[vec_idx + VEC * 3 ..][0..VEC].*);
+
+            sum_vec0 = @mulAdd(F32Vec, x0, x0, sum_vec0);
+            sum_vec1 = @mulAdd(F32Vec, x1, x1, sum_vec1);
+            sum_vec2 = @mulAdd(F32Vec, x2, x2, sum_vec2);
+            sum_vec3 = @mulAdd(F32Vec, x3, x3, sum_vec3);
+        }
+
+        var sum_vec = sum_vec0 + sum_vec1 + sum_vec2 + sum_vec3;
+        while (vec_idx + VEC <= dim) : (vec_idx += VEC) {
+            const x_vec = bf16VecToF32(x_row[vec_idx..][0..VEC].*);
+            sum_vec = @mulAdd(F32Vec, x_vec, x_vec, sum_vec);
+        }
+
+        var sum = @reduce(.Add, sum_vec);
+        while (vec_idx < dim) : (vec_idx += 1) {
+            const x_val = bf16ToF32(x_row[vec_idx]);
+            sum += x_val * x_val;
+        }
+
+        const inv_rms = 1.0 / @sqrt(sum / @as(f32, @floatFromInt(dim)) + eps);
+        const inv_rms_vec: F32Vec = @splat(inv_rms);
+
+        // Apply normalization with weight
+        vec_idx = 0;
+        while (vec_idx + VEC * 4 <= dim) : (vec_idx += VEC * 4) {
+            const x0 = bf16VecToF32(x_row[vec_idx..][0..VEC].*);
+            const x1 = bf16VecToF32(x_row[vec_idx + VEC ..][0..VEC].*);
+            const x2 = bf16VecToF32(x_row[vec_idx + VEC * 2 ..][0..VEC].*);
+            const x3 = bf16VecToF32(x_row[vec_idx + VEC * 3 ..][0..VEC].*);
+
+            const w0 = bf16VecToF32(weight[vec_idx..][0..VEC].*);
+            const w1 = bf16VecToF32(weight[vec_idx + VEC ..][0..VEC].*);
+            const w2 = bf16VecToF32(weight[vec_idx + VEC * 2 ..][0..VEC].*);
+            const w3 = bf16VecToF32(weight[vec_idx + VEC * 3 ..][0..VEC].*);
+
+            const out0 = x0 * inv_rms_vec * w0;
+            const out1 = x1 * inv_rms_vec * w1;
+            const out2 = x2 * inv_rms_vec * w2;
+            const out3 = x3 * inv_rms_vec * w3;
+
+            out_row[vec_idx..][0..VEC].* = f32VecToBf16(out0);
+            out_row[vec_idx + VEC ..][0..VEC].* = f32VecToBf16(out1);
+            out_row[vec_idx + VEC * 2 ..][0..VEC].* = f32VecToBf16(out2);
+            out_row[vec_idx + VEC * 3 ..][0..VEC].* = f32VecToBf16(out3);
+        }
+
+        while (vec_idx + VEC <= dim) : (vec_idx += VEC) {
+            const x_vec = bf16VecToF32(x_row[vec_idx..][0..VEC].*);
+            const w_vec = bf16VecToF32(weight[vec_idx..][0..VEC].*);
+            const out_vec = x_vec * inv_rms_vec * w_vec;
+            out_row[vec_idx..][0..VEC].* = f32VecToBf16(out_vec);
+        }
+
+        while (vec_idx < dim) : (vec_idx += 1) {
+            const x_val = bf16ToF32(x_row[vec_idx]);
+            const w_val = bf16ToF32(weight[vec_idx]);
+            out_row[vec_idx] = f32ToBf16(x_val * inv_rms * w_val);
+        }
+    }
+}
+
+/// Convert bf16 vector to f32 vector
+inline fn bf16VecToF32(v: @Vector(simd.f32_vec_len, u16)) @Vector(simd.f32_vec_len, f32) {
+    const VEC = simd.f32_vec_len;
+    var result: @Vector(VEC, f32) = undefined;
+    inline for (0..VEC) |i| {
+        result[i] = @as(f32, @bitCast(@as(u32, v[i]) << 16));
+    }
+    return result;
+}
+
+/// Convert f32 vector to bf16 vector (truncation)
+inline fn f32VecToBf16(v: @Vector(simd.f32_vec_len, f32)) @Vector(simd.f32_vec_len, u16) {
+    const VEC = simd.f32_vec_len;
+    var result: @Vector(VEC, u16) = undefined;
+    inline for (0..VEC) |i| {
+        result[i] = @truncate(@as(u32, @bitCast(v[i])) >> 16);
+    }
+    return result;
 }
 
 fn f32Identity(x: f32) f32 {

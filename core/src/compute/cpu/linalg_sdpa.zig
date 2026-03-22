@@ -3,6 +3,7 @@
 const std = @import("std");
 const tv = @import("tensor_view.zig");
 const math = @import("math.zig");
+const parallel = @import("../../system/parallel.zig");
 
 /// Maximum sequence length for stack-allocated score buffers.
 /// Sequences longer than this will use heap allocation.
@@ -437,18 +438,312 @@ fn sdpaHistory(
     sliding_window: usize,
     allocator: ?std.mem.Allocator,
 ) AttentionError!void {
+    const groups_per_source_group = query_group_count / source_group_count;
+    const kv_size = source_group_count * feature_width;
+
+    // Context for parallel head processing
+    const HeadCtx = struct {
+        out_data: [*]f32,
+        out_strides: [4]usize,
+        q_data: [*]const f32,
+        q_strides: [4]usize,
+        key_history: []const f32,
+        value_history: []const f32,
+        query_steps: usize,
+        history_len: usize,
+        feature_width: usize,
+        causal_mask_shift: usize,
+        scale: f32,
+        sinks: ?[]const f32,
+        sliding_window: usize,
+        groups_per_source_group: usize,
+        kv_size: usize,
+
+        fn processHead(start: usize, end: usize, ctx: *@This()) void {
+            const neg_inf = -std.math.inf(f32);
+
+            // Each thread gets its own scores buffer on stack
+            var scores_buf: [MAX_STACK_SEQ]f32 = undefined;
+            const scores = scores_buf[0..ctx.history_len];
+
+            for (start..end) |query_group_idx| {
+                const source_group_idx = query_group_idx / ctx.groups_per_source_group;
+                const sink_logit: ?f32 = if (ctx.sinks) |s| s[query_group_idx] else null;
+
+                for (0..ctx.query_steps) |sq| {
+                    const q_pos = ctx.causal_mask_shift + sq;
+
+                    // Determine attention window
+                    const window_start: usize = if (ctx.sliding_window > 0 and q_pos >= ctx.sliding_window)
+                        q_pos - ctx.sliding_window + 1
+                    else
+                        0;
+
+                    var max_score: f32 = neg_inf;
+
+                    // Get Q vector base pointer (contiguous if q_strides[3] == 1)
+                    const q_base = ctx.q_strides[1] * query_group_idx + ctx.q_strides[2] * sq;
+                    const q_stride = ctx.q_strides[3];
+
+                    // Q @ K^T with causal + sliding window masking
+                    for (0..ctx.history_len) |sk| {
+                        if (sk < window_start or sk > q_pos) {
+                            scores[sk] = neg_inf;
+                            continue;
+                        }
+
+                        const k_ptr = ctx.key_history.ptr + sk * ctx.kv_size + source_group_idx * ctx.feature_width;
+                        const dot = dotProductStrided(ctx.q_data + q_base, q_stride, k_ptr, ctx.feature_width);
+                        scores[sk] = dot * ctx.scale;
+                        max_score = @max(max_score, scores[sk]);
+                    }
+
+                    // Include sink in max calculation
+                    if (sink_logit) |sl| {
+                        max_score = @max(max_score, sl);
+                    }
+
+                    // Softmax with optional sink
+                    math.softmaxMaskedInPlaceWithMax(scores, 0, ctx.history_len, sink_logit, false, max_score, neg_inf + 1.0);
+
+                    // Weighted sum of values (SIMD optimized)
+                    const out_base = query_group_idx * ctx.out_strides[1] + sq * ctx.out_strides[2];
+                    weightedSumValues(
+                        ctx.out_data + out_base,
+                        ctx.out_strides[3],
+                        scores,
+                        ctx.value_history.ptr + source_group_idx * ctx.feature_width,
+                        ctx.kv_size,
+                        ctx.history_len,
+                        ctx.feature_width,
+                    );
+                }
+            }
+        }
+    };
+
+    // Check if history_len exceeds stack buffer - fall back to sequential for heap allocation
+    if (history_len > MAX_STACK_SEQ) {
+        // Fall back to original sequential path for very long sequences
+        return sdpaHistorySequential(
+            out_data, out_strides, q_data, q_strides,
+            key_history, value_history, query_group_count, source_group_count,
+            query_steps, history_len, feature_width, causal_mask_shift,
+            scale, sinks, sliding_window, allocator,
+        );
+    }
+
+    var ctx = HeadCtx{
+        .out_data = out_data,
+        .out_strides = out_strides,
+        .q_data = q_data,
+        .q_strides = q_strides,
+        .key_history = key_history,
+        .value_history = value_history,
+        .query_steps = query_steps,
+        .history_len = history_len,
+        .feature_width = feature_width,
+        .causal_mask_shift = causal_mask_shift,
+        .scale = scale,
+        .sinks = sinks,
+        .sliding_window = sliding_window,
+        .groups_per_source_group = groups_per_source_group,
+        .kv_size = kv_size,
+    };
+
+    // Parallelize over attention heads
+    parallel.global().parallelFor(query_group_count, HeadCtx.processHead, &ctx);
+}
+
+/// SIMD-optimized dot product with strided Q and contiguous K.
+inline fn dotProductStrided(q_ptr: [*]const f32, q_stride: usize, k_ptr: [*]const f32, len: usize) f32 {
+    @setFloatMode(.optimized);
+
+    // Fast path: contiguous Q (stride == 1)
+    if (q_stride == 1) {
+        var acc0: F32Vec = @splat(0);
+        var acc1: F32Vec = @splat(0);
+        var acc2: F32Vec = @splat(0);
+        var acc3: F32Vec = @splat(0);
+        var i: usize = 0;
+
+        // Unroll 4x for better ILP (16 f32 = head_dim 64 in 4 iterations)
+        while (i + VEC_LEN * 4 <= len) : (i += VEC_LEN * 4) {
+            const q0: F32Vec = q_ptr[i..][0..VEC_LEN].*;
+            const q1: F32Vec = q_ptr[i + VEC_LEN ..][0..VEC_LEN].*;
+            const q2: F32Vec = q_ptr[i + VEC_LEN * 2 ..][0..VEC_LEN].*;
+            const q3: F32Vec = q_ptr[i + VEC_LEN * 3 ..][0..VEC_LEN].*;
+
+            const k0: F32Vec = k_ptr[i..][0..VEC_LEN].*;
+            const k1: F32Vec = k_ptr[i + VEC_LEN ..][0..VEC_LEN].*;
+            const k2: F32Vec = k_ptr[i + VEC_LEN * 2 ..][0..VEC_LEN].*;
+            const k3: F32Vec = k_ptr[i + VEC_LEN * 3 ..][0..VEC_LEN].*;
+
+            acc0 = @mulAdd(F32Vec, q0, k0, acc0);
+            acc1 = @mulAdd(F32Vec, q1, k1, acc1);
+            acc2 = @mulAdd(F32Vec, q2, k2, acc2);
+            acc3 = @mulAdd(F32Vec, q3, k3, acc3);
+        }
+
+        // Handle remaining chunks
+        while (i + VEC_LEN <= len) : (i += VEC_LEN) {
+            const q_vec: F32Vec = q_ptr[i..][0..VEC_LEN].*;
+            const k_vec: F32Vec = k_ptr[i..][0..VEC_LEN].*;
+            acc0 = @mulAdd(F32Vec, q_vec, k_vec, acc0);
+        }
+
+        var sum = @reduce(.Add, acc0 + acc1 + acc2 + acc3);
+
+        // Scalar tail
+        while (i < len) : (i += 1) {
+            sum += q_ptr[i] * k_ptr[i];
+        }
+        return sum;
+    }
+
+    // Strided Q fallback (still SIMD K loading)
+    var acc0: F32Vec = @splat(0);
+    var acc1: F32Vec = @splat(0);
+    var i: usize = 0;
+
+    while (i + VEC_LEN * 2 <= len) : (i += VEC_LEN * 2) {
+        var q0: F32Vec = undefined;
+        var q1: F32Vec = undefined;
+        inline for (0..VEC_LEN) |j| {
+            q0[j] = q_ptr[(i + j) * q_stride];
+            q1[j] = q_ptr[(i + VEC_LEN + j) * q_stride];
+        }
+        const k0: F32Vec = k_ptr[i..][0..VEC_LEN].*;
+        const k1: F32Vec = k_ptr[i + VEC_LEN ..][0..VEC_LEN].*;
+        acc0 = @mulAdd(F32Vec, q0, k0, acc0);
+        acc1 = @mulAdd(F32Vec, q1, k1, acc1);
+    }
+
+    while (i + VEC_LEN <= len) : (i += VEC_LEN) {
+        var q_vec: F32Vec = undefined;
+        inline for (0..VEC_LEN) |j| {
+            q_vec[j] = q_ptr[(i + j) * q_stride];
+        }
+        const k_vec: F32Vec = k_ptr[i..][0..VEC_LEN].*;
+        acc0 = @mulAdd(F32Vec, q_vec, k_vec, acc0);
+    }
+
+    var sum = @reduce(.Add, acc0 + acc1);
+    while (i < len) : (i += 1) {
+        sum += q_ptr[i * q_stride] * k_ptr[i];
+    }
+    return sum;
+}
+
+/// SIMD-optimized weighted sum of values.
+/// out[d] = sum(scores[sk] * values[sk * kv_stride + d]) for all sk
+inline fn weightedSumValues(
+    out_ptr: [*]f32,
+    out_stride: usize,
+    scores: []const f32,
+    values_base: [*]const f32,
+    kv_stride: usize,
+    history_len: usize,
+    feature_width: usize,
+) void {
+    @setFloatMode(.optimized);
+
+    // Process 4 SIMD chunks at once for better ILP (16 f32 values = head_dim 64 in 4 iterations)
+    var d: usize = 0;
+    while (d + VEC_LEN * 4 <= feature_width) : (d += VEC_LEN * 4) {
+        var acc0: F32Vec = @splat(0);
+        var acc1: F32Vec = @splat(0);
+        var acc2: F32Vec = @splat(0);
+        var acc3: F32Vec = @splat(0);
+
+        for (0..history_len) |sk| {
+            const score_vec: F32Vec = @splat(scores[sk]);
+            const v_base = values_base + sk * kv_stride + d;
+
+            const v0: F32Vec = v_base[0..VEC_LEN].*;
+            const v1: F32Vec = v_base[VEC_LEN..][0..VEC_LEN].*;
+            const v2: F32Vec = v_base[VEC_LEN * 2 ..][0..VEC_LEN].*;
+            const v3: F32Vec = v_base[VEC_LEN * 3 ..][0..VEC_LEN].*;
+
+            acc0 = @mulAdd(F32Vec, score_vec, v0, acc0);
+            acc1 = @mulAdd(F32Vec, score_vec, v1, acc1);
+            acc2 = @mulAdd(F32Vec, score_vec, v2, acc2);
+            acc3 = @mulAdd(F32Vec, score_vec, v3, acc3);
+        }
+
+        // Write output
+        if (out_stride == 1) {
+            out_ptr[d..][0..VEC_LEN].* = acc0;
+            out_ptr[d + VEC_LEN ..][0..VEC_LEN].* = acc1;
+            out_ptr[d + VEC_LEN * 2 ..][0..VEC_LEN].* = acc2;
+            out_ptr[d + VEC_LEN * 3 ..][0..VEC_LEN].* = acc3;
+        } else {
+            inline for (0..VEC_LEN) |j| {
+                out_ptr[(d + j) * out_stride] = acc0[j];
+                out_ptr[(d + VEC_LEN + j) * out_stride] = acc1[j];
+                out_ptr[(d + VEC_LEN * 2 + j) * out_stride] = acc2[j];
+                out_ptr[(d + VEC_LEN * 3 + j) * out_stride] = acc3[j];
+            }
+        }
+    }
+
+    // Handle remaining chunks (1 at a time)
+    while (d + VEC_LEN <= feature_width) : (d += VEC_LEN) {
+        var acc: F32Vec = @splat(0);
+
+        for (0..history_len) |sk| {
+            const score_vec: F32Vec = @splat(scores[sk]);
+            const v_ptr = values_base + sk * kv_stride + d;
+            const v_vec: F32Vec = v_ptr[0..VEC_LEN].*;
+            acc = @mulAdd(F32Vec, score_vec, v_vec, acc);
+        }
+
+        if (out_stride == 1) {
+            out_ptr[d..][0..VEC_LEN].* = acc;
+        } else {
+            inline for (0..VEC_LEN) |j| {
+                out_ptr[(d + j) * out_stride] = acc[j];
+            }
+        }
+    }
+
+    // Scalar tail
+    while (d < feature_width) : (d += 1) {
+        var acc: f32 = 0;
+        for (0..history_len) |sk| {
+            acc += scores[sk] * values_base[sk * kv_stride + d];
+        }
+        out_ptr[d * out_stride] = acc;
+    }
+}
+
+/// Sequential fallback for very long sequences (> MAX_STACK_SEQ) that need heap allocation.
+fn sdpaHistorySequential(
+    out_data: [*]f32,
+    out_strides: [4]usize,
+    q_data: [*]const f32,
+    q_strides: [4]usize,
+    key_history: []const f32,
+    value_history: []const f32,
+    query_group_count: usize,
+    source_group_count: usize,
+    query_steps: usize,
+    history_len: usize,
+    feature_width: usize,
+    causal_mask_shift: usize,
+    scale: f32,
+    sinks: ?[]const f32,
+    sliding_window: usize,
+    allocator: ?std.mem.Allocator,
+) AttentionError!void {
     const neg_inf = -std.math.inf(f32);
     const groups_per_source_group = query_group_count / source_group_count;
     const kv_size = source_group_count * feature_width;
 
-    // Allocate scores buffer - use stack for small sequences, heap for large
-    var stack_scores: [MAX_STACK_SEQ]f32 = undefined; // Safe: only scores[0..history_len] used, written before read
-    const heap_scores: ?[]f32 = if (history_len > MAX_STACK_SEQ) blk: {
-        const alloc = allocator orelse return error.SequenceTooLong;
-        break :blk alloc.alloc(f32, history_len) catch return error.OutOfMemory;
-    } else null;
-    defer if (heap_scores) |hs| allocator.?.free(hs);
-    const scores = if (heap_scores) |hs| hs else stack_scores[0..history_len];
+    // Allocate scores buffer on heap for large sequences
+    const alloc = allocator orelse return error.SequenceTooLong;
+    const scores = alloc.alloc(f32, history_len) catch return error.OutOfMemory;
+    defer alloc.free(scores);
 
     for (0..query_group_count) |query_group_idx| {
         const source_group_idx = query_group_idx / groups_per_source_group;
@@ -457,49 +752,42 @@ fn sdpaHistory(
         for (0..query_steps) |sq| {
             const q_pos = causal_mask_shift + sq;
 
-            // Determine attention window
             const window_start: usize = if (sliding_window > 0 and q_pos >= sliding_window)
                 q_pos - sliding_window + 1
             else
                 0;
 
             var max_score: f32 = neg_inf;
+            const q_base = q_strides[1] * query_group_idx + q_strides[2] * sq;
 
-            // Q @ K^T with causal + sliding window masking
             for (0..history_len) |sk| {
                 if (sk < window_start or sk > q_pos) {
                     scores[sk] = neg_inf;
                     continue;
                 }
 
-                const key_history_idx = sk * kv_size + source_group_idx * feature_width;
-                var dot: f32 = 0;
-                for (0..feature_width) |d| {
-                    const q_idx = query_group_idx * q_strides[1] + sq * q_strides[2] + d * q_strides[3];
-                    dot += q_data[q_idx] * key_history[key_history_idx + d];
-                }
+                const k_ptr = key_history.ptr + sk * kv_size + source_group_idx * feature_width;
+                const dot = dotProductStrided(q_data + q_base, q_strides[3], k_ptr, feature_width);
                 scores[sk] = dot * scale;
                 max_score = @max(max_score, scores[sk]);
             }
 
-            // Include sink in max calculation
             if (sink_logit) |sl| {
                 max_score = @max(max_score, sl);
             }
 
-            // Softmax with optional sink
-            math.softmaxMaskedInPlaceWithMax(scores[0..history_len], 0, history_len, sink_logit, false, max_score, neg_inf + 1.0);
+            math.softmaxMaskedInPlaceWithMax(scores, 0, history_len, sink_logit, false, max_score, neg_inf + 1.0);
 
-            // Weighted sum of values
-            for (0..feature_width) |d| {
-                var acc: f32 = 0;
-                for (0..history_len) |sk| {
-                    const value_history_idx = sk * kv_size + source_group_idx * feature_width;
-                    acc += scores[sk] * value_history[value_history_idx + d];
-                }
-                const out_idx = query_group_idx * out_strides[1] + sq * out_strides[2] + d * out_strides[3];
-                out_data[out_idx] = acc;
-            }
+            const out_base = query_group_idx * out_strides[1] + sq * out_strides[2];
+            weightedSumValues(
+                out_data + out_base,
+                out_strides[3],
+                scores,
+                value_history.ptr + source_group_idx * feature_width,
+                kv_size,
+                history_len,
+                feature_width,
+            );
         }
     }
 }

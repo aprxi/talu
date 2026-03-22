@@ -434,11 +434,10 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
     // Convert bf16 weights to f32, then use optimized AMX/NEON sgemm.
     // Only worth it for larger matrices where AMX speedup offsets conversion cost.
     if (comptime accelerate.available) {
-        // Threshold: conversion overhead amortized when compute dominates
-        // For M=1 (token gen), stay with SIMD path. For M>=4 or large K*N, use Accelerate.
-        const compute_ops = m_rows * n_cols * k_dim;
-        const conversion_ops = n_cols * k_dim;
-        if (compute_ops >= conversion_ops * 8 and n_cols * k_dim >= 65536) {
+        // Threshold: M >= 2 (prefill) uses Accelerate for large weight matrices.
+        // M=1 (decode) stays with BFDOT path which avoids conversion overhead.
+        // The bf16→f32 conversion is O(N*K), amortized over M rows of compute.
+        if (m_rows >= 2 and n_cols * k_dim >= 32768) {
             // Allocate f32 buffer for converted weights
             const b_f32 = scratch.allocator.alloc(f32, n_cols * k_dim) catch {
                 // Fall through to SIMD path on allocation failure
