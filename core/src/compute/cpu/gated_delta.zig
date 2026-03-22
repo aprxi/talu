@@ -18,7 +18,7 @@ inline fn fastSoftplusScalar(x: f32) f32 {
     return @log(1.0 + math.fastExpScalar(x));
 }
 
-fn scaleStateAndAccumulateAndProjectRow(
+inline fn scaleStateAndAccumulateAndProjectRow(
     state_row: []f32,
     accum_row: []f32,
     out_row: []f32,
@@ -54,7 +54,7 @@ fn scaleStateAndAccumulateAndProjectRow(
     }
 }
 
-fn updateStateRow(
+inline fn updateStateRow(
     state_row: []f32,
     update_values: []const f32,
     update_weight: f32,
@@ -175,6 +175,8 @@ pub fn runStateSpaceStep(
         for (0..d_head) |k_idx| {
             const row_base = state_base + k_idx * d_head;
             const state_row = ssm_state[row_base .. row_base + d_head];
+            if (k_idx + 1 < d_head)
+                @prefetch(@as([*]const u8, @ptrCast(ssm_state.ptr + row_base + d_head)), .{ .locality = 3 });
             scaleStateAndAccumulateAndProjectRow(
                 state_row,
                 kv_mem_head,
@@ -190,6 +192,8 @@ pub fn runStateSpaceStep(
         for (0..d_head) |k_idx| {
             const row_base = state_base + k_idx * d_head;
             const state_row = ssm_state[row_base .. row_base + d_head];
+            if (k_idx + 1 < d_head)
+                @prefetch(@as([*]const u8, @ptrCast(ssm_state.ptr + row_base + d_head)), .{ .locality = 3 });
             updateStateRow(state_row, kv_mem_head, key_head[k_idx]);
         }
     }
@@ -220,6 +224,8 @@ pub fn runStateSpaceStepOneHead(
     @memset(out_head[0..d_head], 0.0);
     for (0..d_head) |k_idx| {
         const state_row = state_head[k_idx * d_head ..][0..d_head];
+        if (k_idx + 1 < d_head)
+            @prefetch(@as([*]const u8, @ptrCast(state_head.ptr + (k_idx + 1) * d_head)), .{ .locality = 3 });
         scaleStateAndAccumulateAndProjectRow(
             state_row,
             kv_mem_head[0..d_head],
@@ -234,6 +240,8 @@ pub fn runStateSpaceStepOneHead(
     rowwise.addScaledInPlace(out_head[0..d_head], kv_mem_head[0..d_head], qk_dot);
     for (0..d_head) |k_idx| {
         const state_row = state_head[k_idx * d_head ..][0..d_head];
+        if (k_idx + 1 < d_head)
+            @prefetch(@as([*]const u8, @ptrCast(state_head.ptr + (k_idx + 1) * d_head)), .{ .locality = 3 });
         updateStateRow(state_row, kv_mem_head[0..d_head], key_head[k_idx]);
     }
 }

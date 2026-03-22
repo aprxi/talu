@@ -422,12 +422,24 @@ pub fn build(b: *std.Build) void {
     // --------------------------------------------------------------------------
     // TARGET CONFIGURATION
     // --------------------------------------------------------------------------
-    // Use host platform by default, but enforce GLIBC 2.28 on Linux for distro
-    // compatibility (RHEL 8, Ubuntu 18.04, etc.).
-    //
-    // On x86_64 Linux, use -Dcpu=x86_64_v3 (via Makefile) for AVX2 support.
-    // This fixes "couldn't allocate output register" errors with SIMD code.
+    // Default to x86_64_v3 (AVX2) on x86_64 Linux for consistent codegen.
+    // Without this, `zig build` without -Dcpu uses native CPU detection, which
+    // can silently enable AVX-512 and produce code that (a) won't run on AVX2-
+    // only machines and (b) gives misleading benchmark results. Users can still
+    // override via -Dcpu=native or any other value.
     var target = b.standardTargetOptions(.{});
+
+    // For Linux x86_64: default to x86_64_v3 when no -Dcpu was provided.
+    // Without this, `zig build -Drelease` uses native CPU detection, which
+    // can silently enable AVX-512 and produce binaries that won't run on
+    // AVX2-only machines (and give misleading benchmark results).
+    if (target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and
+        target.query.cpu_model == .determined_by_arch_os)
+    {
+        var query = target.query;
+        query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
+        target = b.resolveTargetQuery(query);
+    }
 
     // For Linux targets: enforce GLIBC 2.28 for broad distro compatibility
     if (target.result.os.tag == .linux) {
