@@ -414,6 +414,397 @@ fn resolveCudaTopology(
     return topology;
 }
 
+// ---------------------------------------------------------------------------
+// Auto topology selection
+//
+// When no explicit TALU_CUDA_TOPOLOGY is set, automatically choose the best
+// topology based on available GPU memory and estimated model requirements.
+//
+// Scenarios (see also AGENTS.md):
+//
+//   S0  BACKEND=cpu           → CPU backend, no GPU. Handled before we get here.
+//   S1  TALU_CUDA_TOPOLOGY    → User override. Skip auto-detection.
+//   S2  0 GPUs visible        → Error (caller handles).
+//   S3  1 GPU, model fits     → single.
+//   S4  1 GPU, model !fits    → cpu_gpu. Maximize layers on GPU.
+//   S5  2+ GPUs, fits on 1    → single on best GPU. Avoids pipeline overhead.
+//   S6  2+ GPUs, fits on 2    → pipeline2. Split proportional to free memory.
+//   S7  2+ GPUs, !fits on 2   → cpu_gpu_gpu. CPU takes overflow layers.
+//   S8  Too large for all     → Error (caller handles).
+//   S9  3+ GPUs               → Pick best 2 GPUs, apply S5-S7.
+// ---------------------------------------------------------------------------
+
+const GpuMemoryInfo = struct {
+    ordinal: usize,
+    free: usize,
+    total: usize,
+};
+
+/// Constants for auto topology memory estimation.
+/// RUNTIME_OVERHEAD accounts for activations, workspace buffers, CUDA context,
+/// and memory fragmentation beyond raw weights + KV cache.
+const AUTO_TOPO_RUNTIME_OVERHEAD: usize = 120; // percent (1.2x)
+/// FIT_THRESHOLD leaves headroom for other processes and allocation granularity.
+const AUTO_TOPO_FIT_THRESHOLD: usize = 90; // percent
+/// Practical seq_len cap for KV cache estimation. The engine allocates KV cache
+/// dynamically (starting at 256 tokens, doubling up to max_seq_len). Using the
+/// model's theoretical max (e.g. 262K for Qwen) would wildly overestimate.
+/// 8192 is a practical generation context that covers most real-world usage.
+const AUTO_TOPO_KV_SEQ_LEN_CAP: usize = 8192;
+
+/// Probe total memory on each visible CUDA device without creating contexts.
+/// Uses cuDeviceTotalMem which requires no CUDA context, avoiding interference
+/// with later Device.initAt calls during backend initialization.
+/// Caller owns the returned slice.
+fn probeGpuTotalMemory(allocator: std.mem.Allocator, device_count: usize) ![]GpuMemoryInfo {
+    if (device_count == 0) return allocator.alloc(GpuMemoryInfo, 0);
+    const mems = if (has_cuda)
+        try compute.cuda.Device.deviceTotalMemories(allocator)
+    else
+        return allocator.alloc(GpuMemoryInfo, 0);
+    defer allocator.free(mems);
+
+    const n = @min(mems.len, device_count);
+    const infos = try allocator.alloc(GpuMemoryInfo, n);
+    for (0..n) |ord| {
+        infos[ord] = .{ .ordinal = ord, .free = mems[ord], .total = mems[ord] };
+    }
+    return infos;
+}
+
+/// Estimate total GPU memory needed for a model: weights + KV cache + runtime overhead.
+///
+/// weight_bytes = file_size (SafeTensors file ≈ weight data).
+/// kv_cache_bytes = n_kv_heads * head_dim * max_seq_len * 2(K+V) * 2(f16) * n_layers.
+/// Result is scaled by RUNTIME_OVERHEAD (1.2x) for activations/workspace/fragmentation.
+fn estimateModelGpuBytes(
+    file_size: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    n_layers: usize,
+) usize {
+    // KV cache: n_kv_heads * head_dim * max_seq_len * 2(K+V) * 2(f16 bytes) * n_layers
+    const kv_per_layer = n_kv_heads *| head_dim *| max_seq_len *| 4; // 2(K+V) * 2(f16)
+    const kv_total = kv_per_layer *| n_layers;
+    const raw = file_size +| kv_total;
+    return (raw / 100) *| AUTO_TOPO_RUNTIME_OVERHEAD;
+}
+
+/// Resolve max_seq_len for memory estimation.
+/// Uses TALU_CUDA_MAX_SEQ_LEN if set, otherwise caps at AUTO_TOPO_KV_SEQ_LEN_CAP.
+/// The engine allocates KV cache dynamically, so using the model's theoretical max
+/// (which can be 128K-1M) would wildly overestimate actual memory needs.
+fn resolveMaxSeqLenForEstimation(allocator: std.mem.Allocator, model_max: usize) usize {
+    const raw = std.process.getEnvVarOwned(allocator, "TALU_CUDA_MAX_SEQ_LEN") catch {
+        return @min(model_max, AUTO_TOPO_KV_SEQ_LEN_CAP);
+    };
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch
+        return @min(model_max, AUTO_TOPO_KV_SEQ_LEN_CAP);
+    if (parsed == 0) return @min(model_max, AUTO_TOPO_KV_SEQ_LEN_CAP);
+    return @min(model_max, parsed);
+}
+
+/// Select topology automatically based on estimated model size and GPU memory.
+///
+/// Pure logic — no I/O, no side effects. Fully testable with synthetic values.
+/// Returns .single when in doubt (safest default).
+///
+/// gpu_infos must be sorted by ordinal (as returned by probeGpuTotalMemory).
+fn autoSelectTopology(
+    estimated_bytes: usize,
+    total_layers: usize,
+    gpu_infos: []const GpuMemoryInfo,
+) CudaTopology {
+    if (gpu_infos.len == 0 or total_layers < 2) return .{};
+
+    // Find the two GPUs with the most free memory.
+    var best0: usize = 0; // index into gpu_infos
+    var best1: usize = if (gpu_infos.len > 1) @as(usize, 1) else 0;
+    for (gpu_infos, 0..) |info, i| {
+        if (info.free > gpu_infos[best0].free) {
+            best1 = best0;
+            best0 = i;
+        } else if (i != best0 and info.free > gpu_infos[best1].free) {
+            best1 = i;
+        }
+    }
+
+    const best0_budget = gpu_infos[best0].free / 100 * AUTO_TOPO_FIT_THRESHOLD;
+
+    // S3/S5: Model fits on one GPU.
+    if (estimated_bytes <= best0_budget) {
+        return .{
+            .mode = .single,
+            .stage_device_ordinals = .{ gpu_infos[best0].ordinal, gpu_infos[best0].ordinal },
+        };
+    }
+
+    // From here: model doesn't fit on single GPU.
+    if (gpu_infos.len == 1) {
+        // S4: cpu_gpu — offload lower layers to CPU.
+        const bytes_per_layer = if (total_layers > 0) estimated_bytes / total_layers else estimated_bytes;
+        const gpu_layers = if (bytes_per_layer > 0)
+            std.math.clamp(best0_budget / bytes_per_layer, 1, total_layers - 1)
+        else
+            total_layers / 2;
+        return .{
+            .mode = .cpu_gpu,
+            .stage_device_ordinals = .{ gpu_infos[0].ordinal, gpu_infos[0].ordinal },
+            .split_layer = total_layers - gpu_layers,
+        };
+    }
+
+    // 2+ GPUs. Ensure ordinals are ordered (lower first for pipeline2).
+    const ord0 = @min(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
+    const ord1 = @max(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
+    const free0 = if (gpu_infos[best0].ordinal == ord0) gpu_infos[best0].free else gpu_infos[best1].free;
+    const free1 = if (gpu_infos[best0].ordinal == ord0) gpu_infos[best1].free else gpu_infos[best0].free;
+    const combined_budget = (free0 + free1) / 100 * AUTO_TOPO_FIT_THRESHOLD;
+
+    // S6: Model fits across 2 GPUs.
+    if (estimated_bytes <= combined_budget) {
+        const total_free = free0 + free1;
+        const split = if (total_free > 0)
+            std.math.clamp(total_layers * free0 / total_free, 1, total_layers - 1)
+        else
+            total_layers / 2;
+        return .{
+            .mode = .pipeline2,
+            .stage_device_ordinals = .{ ord0, ord1 },
+            .split_layer = split,
+        };
+    }
+
+    // S7: Doesn't fit on 2 GPUs — cpu_gpu_gpu. CPU takes overflow.
+    const total_gpu_free = free0 + free1;
+    const bytes_per_layer = if (total_layers > 0) estimated_bytes / total_layers else estimated_bytes;
+    const gpu_budget = total_gpu_free / 100 * AUTO_TOPO_FIT_THRESHOLD;
+    const gpu_layers_raw = if (bytes_per_layer > 0) gpu_budget / bytes_per_layer else total_layers * 2 / 3;
+    if (gpu_layers_raw < 2) {
+        // S8: Not enough GPU memory even for cpu_gpu_gpu. Return single and let
+        // the caller handle the OOM or error.
+        return .{};
+    }
+    const gpu_layers = std.math.clamp(gpu_layers_raw, 2, total_layers - 1);
+    const cpu_layers = total_layers - gpu_layers;
+    // Split GPU layers proportional to free memory.
+    const gpu0_share = if (total_gpu_free > 0)
+        std.math.clamp(gpu_layers * free0 / total_gpu_free, 1, gpu_layers - 1)
+    else
+        gpu_layers / 2;
+    return .{
+        .mode = .cpu_gpu_gpu,
+        .stage_device_ordinals = .{ ord0, ord1 },
+        .split_layer = cpu_layers,
+        .split_layer_stage2 = cpu_layers + gpu0_share,
+    };
+}
+
+/// Run full auto-detection: probe GPU memory, estimate model requirements, select topology.
+/// Falls back to the provided `fallback` topology on probe failure.
+fn autoDetectTopologyForModel(
+    allocator: std.mem.Allocator,
+    loaded: *const LoadedModel,
+    fallback: CudaTopology,
+) !CudaTopology {
+    const device_count = if (has_cuda)
+        try compute.cuda.Device.deviceCount()
+    else
+        return fallback;
+
+    if (device_count == 0) return fallback;
+
+    const gpu_infos = try probeGpuTotalMemory(allocator, device_count);
+    defer allocator.free(gpu_infos);
+
+    const model_max_seq: usize = @intCast(@max(@as(i32, 1), loaded.config.max_seq_len));
+    const max_seq_len = resolveMaxSeqLenForEstimation(allocator, model_max_seq);
+    const n_kv_heads: usize = @intCast(@max(@as(i32, 0), loaded.config.n_kv_groups));
+    const head_dim: usize = @intCast(@max(@as(i32, 0), loaded.config.head_dim));
+    const n_layers: usize = @intCast(@max(@as(i32, 0), loaded.config.n_layers));
+
+    const estimated = estimateModelGpuBytes(
+        loaded.file_size,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+        n_layers,
+    );
+
+    const result = autoSelectTopology(estimated, loaded.blocks.len, gpu_infos);
+
+    // Log the auto-detection result.
+    const estimated_mib = estimated / (1024 * 1024);
+    switch (result.mode) {
+        .single => {
+            const gpu_free_mib = if (gpu_infos.len > result.stage_device_ordinals[0])
+                gpu_infos[result.stage_device_ordinals[0]].free / (1024 * 1024)
+            else
+                0;
+            log.info("inference", "Auto topology: single", .{
+                .estimated_mib = estimated_mib,
+                .gpu = result.stage_device_ordinals[0],
+                .gpu_free_mib = gpu_free_mib,
+            });
+        },
+        .cpu_gpu => log.info("inference", "Auto topology: cpu_gpu", .{
+            .estimated_mib = estimated_mib,
+            .split_layer = result.split_layer orelse 0,
+            .gpu = result.stage_device_ordinals[0],
+            .gpu_free_mib = if (gpu_infos.len > 0) gpu_infos[result.stage_device_ordinals[0]].free / (1024 * 1024) else 0,
+        }),
+        .pipeline2 => log.info("inference", "Auto topology: pipeline2", .{
+            .estimated_mib = estimated_mib,
+            .split_layer = result.split_layer orelse 0,
+            .gpu0 = result.stage_device_ordinals[0],
+            .gpu1 = result.stage_device_ordinals[1],
+            .gpu0_free_mib = if (result.stage_device_ordinals[0] < gpu_infos.len) gpu_infos[result.stage_device_ordinals[0]].free / (1024 * 1024) else 0,
+            .gpu1_free_mib = if (result.stage_device_ordinals[1] < gpu_infos.len) gpu_infos[result.stage_device_ordinals[1]].free / (1024 * 1024) else 0,
+        }),
+        .cpu_gpu_gpu => log.info("inference", "Auto topology: cpu_gpu_gpu", .{
+            .estimated_mib = estimated_mib,
+            .split_layer = result.split_layer orelse 0,
+            .split_layer_stage2 = result.split_layer_stage2 orelse 0,
+            .gpu0 = result.stage_device_ordinals[0],
+            .gpu1 = result.stage_device_ordinals[1],
+        }),
+    }
+
+    return result;
+}
+
+/// Pure-logic topology selection from a requested CPU layer count.
+///
+/// CPU runs layers [0, cpu_layers), GPU(s) run [cpu_layers, total_layers).
+/// With 2+ GPUs the GPU portion is split proportionally by memory.
+///
+/// Returns null when cpu_layers is 0 (all on GPU → auto-detect) or invalid.
+fn topologyFromCpuLayers(
+    cpu_layers: usize,
+    total_layers: usize,
+    gpu_infos: []const GpuMemoryInfo,
+) ?CudaTopology {
+    if (total_layers < 2 or cpu_layers == 0 or cpu_layers >= total_layers) return null;
+    if (gpu_infos.len == 0) return null;
+
+    const gpu_layers = total_layers - cpu_layers;
+
+    if (gpu_infos.len == 1 or gpu_layers < 2) {
+        // 1 GPU or only 1 GPU layer → cpu_gpu.
+        return .{
+            .mode = .cpu_gpu,
+            .stage_device_ordinals = .{ gpu_infos[0].ordinal, gpu_infos[0].ordinal },
+            .split_layer = cpu_layers,
+        };
+    }
+
+    // 2+ GPUs: cpu_gpu_gpu. Pick best 2 GPUs and split proportionally.
+    var best0: usize = 0;
+    var best1: usize = 1;
+    for (gpu_infos, 0..) |info, i| {
+        if (info.free > gpu_infos[best0].free) {
+            best1 = best0;
+            best0 = i;
+        } else if (i != best0 and info.free > gpu_infos[best1].free) {
+            best1 = i;
+        }
+    }
+    const ord0 = @min(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
+    const ord1 = @max(gpu_infos[best0].ordinal, gpu_infos[best1].ordinal);
+    const free0 = if (gpu_infos[best0].ordinal == ord0) gpu_infos[best0].free else gpu_infos[best1].free;
+    const free1 = if (gpu_infos[best0].ordinal == ord0) gpu_infos[best1].free else gpu_infos[best0].free;
+    const total_free = free0 + free1;
+
+    const gpu0_share = if (total_free > 0)
+        std.math.clamp(gpu_layers * free0 / total_free, 1, gpu_layers - 1)
+    else
+        gpu_layers / 2;
+
+    return .{
+        .mode = .cpu_gpu_gpu,
+        .stage_device_ordinals = .{ ord0, ord1 },
+        .split_layer = cpu_layers,
+        .split_layer_stage2 = cpu_layers + gpu0_share,
+    };
+}
+
+/// Resolve topology from TALU_CPU_LAYERS env var.
+///
+/// Returns null when the env var is not set or 0 (all on GPU → auto-detect).
+///
+/// When set to N (0 < N < total_layers):
+///   CPU runs layers [0, N), GPU(s) run [N, total_layers).
+///   With 2+ GPUs the GPU portion is auto-split proportional to memory.
+fn resolveCpuLayersTopology(
+    allocator: std.mem.Allocator,
+    loaded: *const LoadedModel,
+    current: CudaTopology,
+) ?CudaTopology {
+    const raw = std.process.getEnvVarOwned(allocator, "TALU_CPU_LAYERS") catch return null;
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const cpu_layers_i = std.fmt.parseInt(i32, trimmed, 10) catch {
+        log.warn("inference", "Invalid TALU_CPU_LAYERS; ignoring", .{ .value = trimmed });
+        return null;
+    };
+
+    const total_layers = loaded.blocks.len;
+    if (total_layers < 2) return null;
+    if (cpu_layers_i <= 0 or cpu_layers_i >= @as(i32, @intCast(total_layers))) return null;
+
+    const cpu_layers: usize = @intCast(cpu_layers_i);
+
+    // Query GPU count and memory.
+    const device_count = if (has_cuda)
+        compute.cuda.Device.deviceCount() catch |err| {
+            log.warn("inference", "TALU_CPU_LAYERS: failed to query device count", .{
+                .err = @errorName(err),
+            });
+            return null;
+        }
+    else
+        return null;
+
+    if (device_count == 0) return null;
+
+    const gpu_infos = probeGpuTotalMemory(allocator, device_count) catch |err| {
+        log.warn("inference", "TALU_CPU_LAYERS: failed to probe GPU memory", .{
+            .err = @errorName(err),
+        });
+        // Fallback: assume 1 GPU with unknown memory.
+        return topologyFromCpuLayers(cpu_layers, total_layers, &.{
+            .{ .ordinal = current.stage_device_ordinals[0], .free = 0, .total = 0 },
+        });
+    };
+    defer allocator.free(gpu_infos);
+
+    const result = topologyFromCpuLayers(cpu_layers, total_layers, gpu_infos) orelse return null;
+
+    // Log the resolved topology.
+    const gpu_layers = total_layers - cpu_layers;
+    switch (result.mode) {
+        .cpu_gpu => log.info("inference", "TALU_CPU_LAYERS: cpu_gpu", .{
+            .cpu_layers = cpu_layers,
+            .gpu_layers = gpu_layers,
+            .total_layers = total_layers,
+        }),
+        .cpu_gpu_gpu => log.info("inference", "TALU_CPU_LAYERS: cpu_gpu_gpu", .{
+            .cpu_layers = cpu_layers,
+            .gpu_layers = gpu_layers,
+            .split_layer_stage2 = result.split_layer_stage2 orelse 0,
+            .gpu0 = result.stage_device_ordinals[0],
+            .gpu1 = result.stage_device_ordinals[1],
+            .total_layers = total_layers,
+        }),
+        else => {},
+    }
+
+    return result;
+}
+
 fn resolveCudaMaxBatchSize() usize {
     const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_MAX_BATCH_SIZE") catch {
         return DEFAULT_MAX_BATCH_SIZE;
@@ -996,7 +1387,32 @@ fn initCuda(
         log.info("inference", "CUDA runtime unavailable", .{ .reason = cudaProbeName(probe) });
         return error.CudaUnavailable;
     }
-    const topology = resolveCudaTopology(allocator, topology_override);
+    var topology = resolveCudaTopology(allocator, topology_override);
+
+    // Topology resolution priority:
+    //   1. topology_override (programmatic)
+    //   2. TALU_CUDA_TOPOLOGY env var (explicit mode)
+    //   3. TALU_CPU_LAYERS env var (user preference → auto-determines mode)
+    //   4. Auto-detection (probe GPU memory, estimate model size)
+    if (topology_override == null and topology.mode == .single) {
+        const has_explicit_env = blk: {
+            const v = std.process.getEnvVarOwned(allocator, "TALU_CUDA_TOPOLOGY") catch break :blk false;
+            allocator.free(v);
+            break :blk true;
+        };
+        if (!has_explicit_env) {
+            if (resolveCpuLayersTopology(allocator, loaded, topology)) |from_layers| {
+                topology = from_layers;
+            } else if (autoDetectTopologyForModel(allocator, loaded, topology)) |detected| {
+                topology = detected;
+            } else |err| {
+                log.warn("inference", "Auto topology detection failed; using single GPU", .{
+                    .err = @errorName(err),
+                });
+            }
+        }
+    }
+
     if (topology.mode != .single) {
         const device_count = if (has_cuda)
             compute.cuda.Device.deviceCount() catch |err| {
@@ -1717,4 +2133,215 @@ test "visionMaxPixels dispatches to backend vision module" {
         var cuda_backend = Backend{ .cuda = undefined };
         try std.testing.expectEqual(cuda.vision.maxPixels(), cuda_backend.visionMaxPixels());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Auto topology selection tests
+// ---------------------------------------------------------------------------
+
+fn testGpuInfos(comptime N: usize, pairs: [N][2]usize) [N]GpuMemoryInfo {
+    var infos: [N]GpuMemoryInfo = undefined;
+    for (pairs, 0..) |p, i| {
+        infos[i] = .{ .ordinal = i, .free = p[0], .total = p[1] };
+    }
+    return infos;
+}
+
+test "estimateModelGpuBytes includes weights and KV cache with overhead" {
+    // 1 GB file, 8 KV heads, 128 head_dim, 4096 seq_len, 32 layers.
+    // kv_per_layer = 8 * 128 * 4096 * 4 = 16 MiB
+    // kv_total = 16 MiB * 32 = 512 MiB
+    // raw = 1024 MiB + 512 MiB = 1536 MiB
+    // result = 1536 * 120 / 100 = 1843 MiB
+    const gb = 1024 * 1024 * 1024;
+    const result = estimateModelGpuBytes(gb, 8, 128, 4096, 32);
+    // Should be > raw (1.5 GB) due to overhead.
+    try std.testing.expect(result > gb + 512 * 1024 * 1024);
+    // Should be < 2x raw.
+    try std.testing.expect(result < 2 * (gb + 512 * 1024 * 1024));
+}
+
+test "estimateModelGpuBytes handles zero values" {
+    try std.testing.expectEqual(@as(usize, 0), estimateModelGpuBytes(0, 0, 0, 0, 0));
+}
+
+test "autoSelectTopology S3: 1 GPU, model fits → single" {
+    const infos = testGpuInfos(1, .{.{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 }});
+    const result = autoSelectTopology(2 * 1024 * 1024 * 1024, 32, &infos);
+    try std.testing.expectEqual(CudaTopologyMode.single, result.mode);
+    try std.testing.expectEqual(@as(usize, 0), result.stage_device_ordinals[0]);
+}
+
+test "autoSelectTopology S4: 1 GPU, model too large → cpu_gpu" {
+    // 4 GB free, 10 GB model estimate, 32 layers.
+    const infos = testGpuInfos(1, .{.{ 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 }});
+    const result = autoSelectTopology(10 * 1024 * 1024 * 1024, 32, &infos);
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, result.mode);
+    // split_layer should leave some layers on GPU.
+    try std.testing.expect(result.split_layer != null);
+    try std.testing.expect(result.split_layer.? > 0);
+    try std.testing.expect(result.split_layer.? < 32);
+}
+
+test "autoSelectTopology S5: 2 GPUs, fits on best single → single on best" {
+    // GPU0: 4 GB free, GPU1: 12 GB free. Model needs 5 GB.
+    const infos = testGpuInfos(2, .{
+        .{ 4 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
+        .{ 12 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
+    });
+    const result = autoSelectTopology(5 * 1024 * 1024 * 1024, 32, &infos);
+    try std.testing.expectEqual(CudaTopologyMode.single, result.mode);
+    // Should pick GPU1 (more free memory).
+    try std.testing.expectEqual(@as(usize, 1), result.stage_device_ordinals[0]);
+}
+
+test "autoSelectTopology S6: 2 GPUs, fits across both → pipeline2" {
+    // GPU0: 4 GB free, GPU1: 4 GB free. Model needs 6 GB.
+    const infos = testGpuInfos(2, .{
+        .{ 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
+        .{ 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
+    });
+    const result = autoSelectTopology(6 * 1024 * 1024 * 1024, 32, &infos);
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, result.mode);
+    try std.testing.expect(result.split_layer != null);
+    // Equal memory → split near middle.
+    try std.testing.expect(result.split_layer.? >= 14 and result.split_layer.? <= 18);
+    try std.testing.expectEqual(@as(usize, 0), result.stage_device_ordinals[0]);
+    try std.testing.expectEqual(@as(usize, 1), result.stage_device_ordinals[1]);
+}
+
+test "autoSelectTopology S6: pipeline2 split proportional to unequal GPU memory" {
+    // GPU0: 6 GB free, GPU1: 2 GB free. Model needs 7 GB (doesn't fit on either alone).
+    const infos = testGpuInfos(2, .{
+        .{ 6 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
+        .{ 2 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
+    });
+    const result = autoSelectTopology(7 * 1024 * 1024 * 1024, 32, &infos);
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, result.mode);
+    // GPU0 has 3x more memory → split should put more layers on GPU0 (higher split_layer).
+    try std.testing.expect(result.split_layer.? >= 20);
+}
+
+test "autoSelectTopology S7: 2 GPUs, doesn't fit → cpu_gpu_gpu" {
+    // GPU0: 4 GB, GPU1: 4 GB. Model needs 12 GB.
+    const infos = testGpuInfos(2, .{
+        .{ 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
+        .{ 4 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
+    });
+    const result = autoSelectTopology(12 * 1024 * 1024 * 1024, 32, &infos);
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, result.mode);
+    // CPU takes some layers, rest split across GPUs.
+    try std.testing.expect(result.split_layer != null);
+    try std.testing.expect(result.split_layer.? > 0);
+    try std.testing.expect(result.split_layer_stage2 != null);
+    try std.testing.expect(result.split_layer_stage2.? > result.split_layer.?);
+    try std.testing.expect(result.split_layer_stage2.? < 32);
+}
+
+test "autoSelectTopology S8: too large for everything → falls back to single" {
+    // GPU0: 1 GB, GPU1: 1 GB. Model needs 100 GB.
+    const infos = testGpuInfos(2, .{
+        .{ 1 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024 },
+        .{ 1 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024 },
+    });
+    const result = autoSelectTopology(100 * 1024 * 1024 * 1024, 32, &infos);
+    // Falls back to single (caller handles OOM).
+    try std.testing.expectEqual(CudaTopologyMode.single, result.mode);
+}
+
+test "autoSelectTopology with 0 GPUs returns single" {
+    const infos: []const GpuMemoryInfo = &.{};
+    const result = autoSelectTopology(1024, 32, infos);
+    try std.testing.expectEqual(CudaTopologyMode.single, result.mode);
+}
+
+test "autoSelectTopology with 1 layer returns single" {
+    const infos = testGpuInfos(1, .{.{ 1024, 2048 }});
+    const result = autoSelectTopology(4096, 1, &infos);
+    try std.testing.expectEqual(CudaTopologyMode.single, result.mode);
+}
+
+test "autoSelectTopology S9: 3 GPUs, picks best 2" {
+    // GPU0: 2 GB, GPU1: 6 GB, GPU2: 6 GB. Model needs 8 GB.
+    const infos = testGpuInfos(3, .{
+        .{ 2 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
+        .{ 6 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
+        .{ 6 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 },
+    });
+    const result = autoSelectTopology(8 * 1024 * 1024 * 1024, 32, &infos);
+    // Should use GPU1 and GPU2 (most free memory), as pipeline2.
+    try std.testing.expectEqual(CudaTopologyMode.pipeline2, result.mode);
+    try std.testing.expectEqual(@as(usize, 1), result.stage_device_ordinals[0]);
+    try std.testing.expectEqual(@as(usize, 2), result.stage_device_ordinals[1]);
+}
+
+// ---------------------------------------------------------------------------
+// topologyFromCpuLayers tests
+// ---------------------------------------------------------------------------
+
+test "topologyFromCpuLayers: cpu_layers=0 returns null" {
+    const infos = testGpuInfos(1, .{.{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 }});
+    try std.testing.expect(topologyFromCpuLayers(0, 32, &infos) == null);
+}
+
+test "topologyFromCpuLayers: cpu_layers >= total_layers returns null" {
+    const infos = testGpuInfos(1, .{.{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 }});
+    try std.testing.expect(topologyFromCpuLayers(32, 32, &infos) == null);
+    try std.testing.expect(topologyFromCpuLayers(33, 32, &infos) == null);
+}
+
+test "topologyFromCpuLayers: 1 GPU → cpu_gpu" {
+    const infos = testGpuInfos(1, .{.{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 }});
+    const result = topologyFromCpuLayers(8, 32, &infos).?;
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, result.mode);
+    try std.testing.expectEqual(@as(?usize, 8), result.split_layer);
+}
+
+test "topologyFromCpuLayers: 2 GPUs equal memory → cpu_gpu_gpu even split" {
+    const infos = testGpuInfos(2, .{
+        .{ 16 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
+        .{ 16 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 },
+    });
+    const result = topologyFromCpuLayers(8, 32, &infos).?;
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, result.mode);
+    try std.testing.expectEqual(@as(?usize, 8), result.split_layer);
+    // 24 GPU layers, equal GPUs → gpu0 gets 12, gpu1 gets 12.
+    try std.testing.expectEqual(@as(?usize, 20), result.split_layer_stage2); // 8 + 12 = 20
+}
+
+test "topologyFromCpuLayers: 2 GPUs unequal memory → proportional split" {
+    const gb = 1024 * 1024 * 1024;
+    const infos = testGpuInfos(2, .{
+        .{ 12 * gb, 16 * gb }, // GPU0: 12 GB
+        .{ 4 * gb, 8 * gb }, // GPU1: 4 GB
+    });
+    const result = topologyFromCpuLayers(12, 32, &infos).?;
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu_gpu, result.mode);
+    try std.testing.expectEqual(@as(?usize, 12), result.split_layer);
+    // 20 GPU layers, GPU0 has 3x more memory → gets 15 of 20 layers.
+    const stage2 = result.split_layer_stage2.?;
+    try std.testing.expect(stage2 > 12 and stage2 < 32);
+    try std.testing.expect(stage2 >= 24); // GPU0 share ≈ 15
+}
+
+test "topologyFromCpuLayers: only 1 GPU layer → cpu_gpu even with 2 GPUs" {
+    const gb = 1024 * 1024 * 1024;
+    const infos = testGpuInfos(2, .{
+        .{ 8 * gb, 16 * gb },
+        .{ 8 * gb, 16 * gb },
+    });
+    // cpu_layers=31 → only 1 GPU layer, can't split across 2 GPUs.
+    const result = topologyFromCpuLayers(31, 32, &infos).?;
+    try std.testing.expectEqual(CudaTopologyMode.cpu_gpu, result.mode);
+    try std.testing.expectEqual(@as(?usize, 31), result.split_layer);
+}
+
+test "topologyFromCpuLayers: no GPUs returns null" {
+    const infos = [_]GpuMemoryInfo{};
+    try std.testing.expect(topologyFromCpuLayers(8, 32, &infos) == null);
+}
+
+test "topologyFromCpuLayers: total_layers < 2 returns null" {
+    const infos = testGpuInfos(1, .{.{ 8 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024 }});
+    try std.testing.expect(topologyFromCpuLayers(1, 1, &infos) == null);
 }

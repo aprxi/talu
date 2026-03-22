@@ -150,7 +150,10 @@ pub const FusedCpuBackend = struct {
     const max_state_bindings_per_slot: usize = runtime_contract.max_state_descriptors;
 
     const SlotStateBinding = struct {
+        const local_state_block_bytes: usize = @intCast(runtime_contract.builtin_state_block_bytes);
+
         handles: [max_state_bindings_per_slot]runtime_contract.StateBlockHandle = undefined,
+        local_blocks: [max_state_bindings_per_slot][local_state_block_bytes]u8 align(64) = undefined,
         count: u8 = 0,
         bound: bool = false,
 
@@ -679,14 +682,29 @@ pub const FusedCpuBackend = struct {
             const incoming = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
                 return error.UnknownStateDescriptorId;
             };
-            var bound = incoming.*;
-            try bindRuntimeState(self, slot_index, descriptor.runtime_kind, &bound);
-            binding.handles[idx] = .{
-                .id = bound.id,
-                .ptr = bound.ptr,
-                .size = bound.size,
-                .align_bytes = bound.align_bytes,
-            };
+            if (descriptor.runtime_kind != runtime_contract.state_runtime_kind_none) {
+                // Runtime descriptors use local storage to prevent aliasing when
+                // state blocks are shared with another backend (e.g., cpu_gpu topology).
+                const block_storage = &binding.local_blocks[idx];
+                if (descriptor.zero_init) @memset(block_storage, 0);
+                var local_handle: runtime_contract.StateBlockHandle = .{
+                    .id = descriptor.id,
+                    .ptr = block_storage[0..].ptr,
+                    .size = block_storage.len,
+                    .align_bytes = 64,
+                };
+                try bindRuntimeState(self, slot_index, descriptor.runtime_kind, &local_handle);
+                binding.handles[idx] = local_handle;
+            } else {
+                var bound = incoming.*;
+                try bindRuntimeState(self, slot_index, descriptor.runtime_kind, &bound);
+                binding.handles[idx] = .{
+                    .id = bound.id,
+                    .ptr = bound.ptr,
+                    .size = bound.size,
+                    .align_bytes = bound.align_bytes,
+                };
+            }
         }
         binding.count = @intCast(state_blocks.len);
         binding.bound = true;

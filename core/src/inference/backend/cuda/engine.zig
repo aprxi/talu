@@ -658,6 +658,23 @@ pub const CudaBackend = struct {
             backend.head_dim,
         );
         errdefer backend.runtime_buffers.deinit(allocator, &backend.device);
+
+        // Pipeline stages that don't start at layer 0 receive hidden states
+        // from the preceding stage — they never perform embedding lookup.
+        // Pipeline stages that don't end at the last layer output hidden states
+        // to the next stage — they never compute logits via projection.
+        // Free these unused GPU allocations to reclaim VRAM.
+        if (layer_range.start > 0) {
+            if (backend.runtime_buffers.embedding_lookup) |*lookup| {
+                lookup.deinit(&backend.device);
+                backend.runtime_buffers.embedding_lookup = null;
+            }
+        }
+        if (layer_range.end < total_layers) {
+            backend.runtime_buffers.projection_weight.deinit(&backend.device);
+            backend.runtime_buffers.projection_weight = .{ .dense_f32 = missing_device_tensor };
+        }
+
         try backend.initLayerProgramSlotBuffers();
         errdefer backend.deinitLayerProgramSlotBuffers();
         try engine_layer_program.initKernelFunctions(&backend);

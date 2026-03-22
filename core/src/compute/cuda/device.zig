@@ -290,6 +290,47 @@ pub const Device = struct {
         return @intCast(count);
     }
 
+    /// Query total memory for each visible CUDA device without creating contexts.
+    /// Opens its own library handle; no CUDA contexts are created or destroyed.
+    /// Caller owns the returned slice.
+    pub fn deviceTotalMemories(allocator: std.mem.Allocator) ![]usize {
+        if (!isRuntimeSupported()) return error.CudaNotEnabled;
+
+        var lib = try openDriverLibrary();
+        defer lib.close();
+
+        const cu_init_fn = try lookupRequired(CuInitFn, &lib, "cuInit");
+        const cu_device_get_count_fn = try lookupRequired(CuDeviceGetCountFn, &lib, "cuDeviceGetCount");
+        const cu_device_get_fn = try lookupRequired(CuDeviceGetFn, &lib, "cuDeviceGet");
+        const cu_device_total_mem_fn = lookupOptionalAny(CuDeviceTotalMemFn, &lib, &.{ "cuDeviceTotalMem_v2", "cuDeviceTotalMem" }) orelse
+            return error.CudaQueryUnavailable;
+
+        if (cu_init_fn(0) != cuda_success) return error.CudaInitFailed;
+
+        var count: c_int = 0;
+        if (cu_device_get_count_fn(&count) != cuda_success) return error.CudaInitFailed;
+        if (count <= 0) return error.CudaNoDevices;
+
+        const n: usize = @intCast(count);
+        const mems = try allocator.alloc(usize, n);
+        errdefer allocator.free(mems);
+
+        for (0..n) |i| {
+            var dev_handle: c_int = 0;
+            if (cu_device_get_fn(&dev_handle, @intCast(i)) != cuda_success) {
+                mems[i] = 0;
+                continue;
+            }
+            var total: usize = 0;
+            if (cu_device_total_mem_fn(&total, dev_handle) != cuda_success) {
+                mems[i] = 0;
+                continue;
+            }
+            mems[i] = total;
+        }
+        return mems;
+    }
+
     pub fn deinit(self: *Device) void {
         self.logLaunchStatsSnapshot("deinit");
         if (self.context) |ctx| {

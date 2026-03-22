@@ -15,6 +15,11 @@ Examples:
     python bench/run.py responses/evals/mmlu --samples 100
     python bench/run.py responses/evals/gpqa --samples 50
     python bench/run.py db/perf/sql_select1 --set requests=200 --set concurrency=8
+
+Multi-GPU:
+    python bench/run.py responses/perf/pp512 --config cuda --env TALU_CUDA_TOPOLOGY=pipeline2 --env TALU_CUDA_STAGE_DEVICES=0,1
+    python bench/run.py responses/perf/pp512 --config cuda --env TALU_CUDA_TOPOLOGY=cpu_gpu --env TALU_CUDA_STAGE_DEVICES=0
+    python bench/run.py responses/perf/pp512 --config cuda --env TALU_CUDA_TOPOLOGY=cpu_gpu_gpu --env TALU_CUDA_STAGE_DEVICES=0,1
 """
 
 from __future__ import annotations
@@ -217,6 +222,11 @@ def cmd_list() -> None:
     print(f"  python {argv0} {first} --set preset=coding --set temperature=0.3")
     if first_db:
         print(f"  python {argv0} {first_db} --config local --set requests=200 --set concurrency=8")
+    print()
+    print("Multi-GPU topologies (via --env):")
+    print(f"  python {argv0} {first} --config cuda --env TALU_CUDA_TOPOLOGY=pipeline2 --env TALU_CUDA_STAGE_DEVICES=0,1")
+    print(f"  python {argv0} {first} --config cuda --env TALU_CUDA_TOPOLOGY=cpu_gpu --env TALU_CUDA_STAGE_DEVICES=0")
+    print(f"  python {argv0} {first} --config cuda --env TALU_CUDA_TOPOLOGY=cpu_gpu_gpu --env TALU_CUDA_STAGE_DEVICES=0,1")
     print()
 
 

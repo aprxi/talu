@@ -83,6 +83,503 @@ fn pipelineActivationByteCountFor(self: anytype) !usize {
     return std.math.mul(usize, self.d_model, @sizeOf(f32)) catch error.InvalidArgument;
 }
 
+/// Transfer multiple rows of pipeline activations from self.input_dev to dst.input_dev.
+/// For P2P: single bulk memcpyPeerAsync + sync.
+/// For host-staged: loops row-by-row through the small staging buffer, using
+/// bufferSlice offsets into each engine's input_dev.
+fn transferPipelineActivationMultiRow(self: anytype, dst: anytype, total_bytes: usize, row_bytes: usize) !void {
+    if (total_bytes == 0) return;
+    switch (self.pipeline_transfer_mode) {
+        .peer_to_peer => {
+            try self.device.memcpyPeerAsync(
+                dst.runtime_buffers.input_dev.pointer,
+                dst.device.context,
+                self.runtime_buffers.input_dev.pointer,
+                self.device.context,
+                total_bytes,
+                self.compute_stream,
+            );
+            if (self.compute_stream) |stream| {
+                try self.device.synchronizeStream(stream);
+            } else {
+                try self.device.synchronize();
+            }
+        },
+        .host_staged => {
+            const staging = self.pipeline_host_staging orelse return error.PipelineTransferNotInitialized;
+            // Staging buffer is sized for one row. Transfer row-by-row.
+            if (row_bytes > staging.len) return error.PipelineTransferBufferTooSmall;
+            var offset: usize = 0;
+            while (offset < total_bytes) {
+                const chunk = @min(row_bytes, total_bytes - offset);
+                var src_slice = try bufferSlice(&self.runtime_buffers.input_dev, offset, chunk);
+                try src_slice.download(&self.device, staging[0..chunk]);
+                var dst_slice = try bufferSlice(&dst.runtime_buffers.input_dev, offset, chunk);
+                try dst_slice.upload(&dst.device, staging[0..chunk]);
+                offset += chunk;
+            }
+        },
+        .none => return error.InvalidTopologyConfig,
+    }
+}
+
+/// Batched prefill for pipeline2 topology. Processes all tokens through stage0
+/// layers in chunks, bulk-transfers activations to stage1, then processes through
+/// stage1 layers. Eliminates the per-token sync/transfer of the old path.
+fn computeBatchedPrefillPipeline2(
+    self: anytype,
+    stage1: anytype,
+    tokens: []const u32,
+    slot_index: usize,
+    logits_out: []f32,
+) !void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime !@hasField(SelfType, "device")) return error.InvalidArgument;
+    if (comptime !@hasField(@TypeOf(stage1.*), "device")) return error.InvalidArgument;
+
+    const previous_launch_phase0 = self.device.setLaunchPhase(.prefill);
+    defer _ = self.device.setLaunchPhase(previous_launch_phase0);
+    const previous_launch_phase1 = stage1.device.setLaunchPhase(.prefill);
+    defer _ = stage1.device.setLaunchPhase(previous_launch_phase1);
+
+    const total_rows = tokens.len;
+
+    try ensureKvCapacity(self, total_rows);
+    try ensureKvCapacity(stage1, total_rows);
+    try resetShortConvStates(self);
+    try resetShortConvStates(stage1);
+    resetAttentionCpuStates(self);
+    resetAttentionCpuStates(stage1);
+    resetGatedDeltaStates(self);
+    resetGatedDeltaStates(stage1);
+
+    const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+    const d_model_u32: u32 = @intCast(self.d_model);
+    const head_dim_u32: u32 = @intCast(self.head_dim);
+    const rope_dim_u32: u32 = @intCast(self.rope_dim);
+    const n_heads_u32: u32 = @intCast(self.n_heads);
+    const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
+    const global_rope_theta: f32 = if (self.loaded.config.rope_theta > 1.0) self.loaded.config.rope_theta else 10000.0;
+    const local_rope_theta: f32 = if (self.loaded.config.rope_local_theta > 1.0 and self.loaded.config.sliding_window > 0)
+        self.loaded.config.rope_local_theta
+    else
+        global_rope_theta;
+
+    const attn_kernels_0 = AttentionKernelSet{
+        .attn_scores_heads_f32_function = if (kv_cache_dtype_fp16)
+            null
+        else
+            (self.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable),
+        .attn_weighted_sum_heads_f32_function = if (kv_cache_dtype_fp16)
+            null
+        else
+            (self.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable),
+        .attn_scores_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+            (self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
+        else
+            null,
+        .softmax_rows_function = self.softmax_rows_function,
+        .attn_weighted_sum_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+            (self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
+        else
+            null,
+        .attn_fused_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+            self.attn_fused_heads_f16_kv_function
+        else
+            null,
+        .attn_fused_prefill_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+            self.attn_fused_prefill_heads_f16_kv_function
+        else
+            null,
+        .attn_fused_prefill_heads_f16_kv_gqa_function = if (kv_cache_dtype_fp16)
+            self.attn_fused_prefill_heads_f16_kv_gqa_function
+        else
+            null,
+        .causal_attn_softmax_f32_function = if (kv_cache_dtype_fp16)
+            self.causal_attn_softmax_f32_function
+        else
+            null,
+    };
+    const attn_kernels_1 = AttentionKernelSet{
+        .attn_scores_heads_f32_function = if (kv_cache_dtype_fp16)
+            null
+        else
+            (stage1.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable),
+        .attn_weighted_sum_heads_f32_function = if (kv_cache_dtype_fp16)
+            null
+        else
+            (stage1.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable),
+        .attn_scores_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+            (stage1.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
+        else
+            null,
+        .softmax_rows_function = stage1.softmax_rows_function,
+        .attn_weighted_sum_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+            (stage1.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
+        else
+            null,
+        .attn_fused_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+            stage1.attn_fused_heads_f16_kv_function
+        else
+            null,
+        .attn_fused_prefill_heads_f16_kv_function = if (kv_cache_dtype_fp16)
+            stage1.attn_fused_prefill_heads_f16_kv_function
+        else
+            null,
+        .attn_fused_prefill_heads_f16_kv_gqa_function = if (kv_cache_dtype_fp16)
+            stage1.attn_fused_prefill_heads_f16_kv_gqa_function
+        else
+            null,
+        .causal_attn_softmax_f32_function = if (kv_cache_dtype_fp16)
+            stage1.causal_attn_softmax_f32_function
+        else
+            null,
+    };
+
+    const chunk_cap = @min(self.prefill_chunk_rows_cap, stage1.prefill_chunk_rows_cap);
+
+    var pos_base: usize = 0;
+    while (pos_base < total_rows) {
+        const rows = @min(total_rows - pos_base, chunk_cap);
+        const chunk_tokens = tokens[pos_base .. pos_base + rows];
+
+        // ── Stage 0: embedding + layers on GPU0 ──
+        try self.runtime_buffers.ensureRowCapacity(&self.device, rows, self.fixed_alloc_mode);
+        try self.ensureLayerProgramSlotRowCapacity(rows, self.fixed_alloc_mode);
+
+        // Embedding lookup on stage0 (duplicated from single-GPU prefill path).
+        var used_device_lookup = false;
+        if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
+            const lookup = &self.runtime_buffers.embedding_lookup.?;
+            switch (lookup.kind) {
+                .f16, .bf16 => {
+                    if (self.embedding_lookup_u16_rows_function) |kernel| {
+                        const token_bytes = std.math.mul(usize, rows, @sizeOf(u32)) catch return error.InvalidArgument;
+                        var token_ids_dev = try bufferSlice(&self.runtime_buffers.prefill_tokens_dev, 0, token_bytes);
+                        try token_ids_dev.upload(&self.device, std.mem.sliceAsBytes(chunk_tokens));
+                        try compute.cuda.embedding_lookup_u16_rows.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            kernel,
+                            &self.runtime_buffers.input_dev,
+                            &lookup.buffer,
+                            &token_ids_dev,
+                            @intCast(rows),
+                            lookup.dim0,
+                            lookup.dim1,
+                            lookup.hidden_dim,
+                            lookup.layout_tag,
+                            switch (lookup.kind) {
+                                .f16 => compute.cuda.embedding_lookup_u16_rows.dtype_f16,
+                                .bf16 => compute.cuda.embedding_lookup_u16_rows.dtype_bf16,
+                                else => unreachable,
+                            },
+                            lookup.multiplier,
+                        );
+                        used_device_lookup = true;
+                    }
+                },
+                else => {},
+            }
+
+            if (!used_device_lookup) {
+                var device_lookup_ok = true;
+                var row_idx: usize = 0;
+                fill_rows: while (row_idx < chunk_tokens.len) : (row_idx += 1) {
+                    const row_offset = std.math.mul(usize, row_idx, row_bytes) catch return error.InvalidArgument;
+                    var input_row = try bufferSlice(&self.runtime_buffers.input_dev, row_offset, row_bytes);
+                    const token = chunk_tokens[row_idx];
+                    switch (lookup.kind) {
+                        .f32 => {
+                            if (self.embedding_lookup_f32_function) |kernel| {
+                                try compute.cuda.embedding_lookup_f32.runWithFunction(
+                                    &self.kernel_arg_pack,
+                                    &self.device,
+                                    kernel,
+                                    &input_row,
+                                    &lookup.buffer,
+                                    lookup.dim0,
+                                    lookup.dim1,
+                                    lookup.hidden_dim,
+                                    token,
+                                    lookup.layout_tag,
+                                    lookup.multiplier,
+                                );
+                            } else {
+                                device_lookup_ok = false;
+                                break :fill_rows;
+                            }
+                        },
+                        .f16 => {
+                            if (self.embedding_lookup_u16_function) |kernel| {
+                                try compute.cuda.embedding_lookup_u16.runWithFunction(
+                                    &self.kernel_arg_pack,
+                                    &self.device,
+                                    kernel,
+                                    &input_row,
+                                    &lookup.buffer,
+                                    lookup.dim0,
+                                    lookup.dim1,
+                                    lookup.hidden_dim,
+                                    token,
+                                    lookup.layout_tag,
+                                    compute.cuda.embedding_lookup_u16.dtype_f16,
+                                    lookup.multiplier,
+                                );
+                            } else {
+                                device_lookup_ok = false;
+                                break :fill_rows;
+                            }
+                        },
+                        .bf16 => {
+                            if (self.embedding_lookup_u16_function) |kernel| {
+                                try compute.cuda.embedding_lookup_u16.runWithFunction(
+                                    &self.kernel_arg_pack,
+                                    &self.device,
+                                    kernel,
+                                    &input_row,
+                                    &lookup.buffer,
+                                    lookup.dim0,
+                                    lookup.dim1,
+                                    lookup.hidden_dim,
+                                    token,
+                                    lookup.layout_tag,
+                                    compute.cuda.embedding_lookup_u16.dtype_bf16,
+                                    lookup.multiplier,
+                                );
+                            } else {
+                                device_lookup_ok = false;
+                                break :fill_rows;
+                            }
+                        },
+                        .gaffine_u4 => {
+                            if (self.embedding_lookup_gaffine_u4_function) |kernel| {
+                                if (lookup.scales) |*scales_buf| {
+                                    if (lookup.biases) |*biases_buf| {
+                                        try compute.cuda.embedding_lookup_gaffine_u4.runWithFunction(
+                                            &self.kernel_arg_pack,
+                                            &self.device,
+                                            kernel,
+                                            &input_row,
+                                            &lookup.buffer,
+                                            scales_buf,
+                                            biases_buf,
+                                            lookup.dim0,
+                                            lookup.hidden_dim,
+                                            token,
+                                            lookup.group_size,
+                                            lookup.scales_dtype_tag,
+                                            lookup.multiplier,
+                                        );
+                                    } else {
+                                        device_lookup_ok = false;
+                                        break :fill_rows;
+                                    }
+                                } else {
+                                    device_lookup_ok = false;
+                                    break :fill_rows;
+                                }
+                            } else {
+                                device_lookup_ok = false;
+                                break :fill_rows;
+                            }
+                        },
+                    }
+                }
+                used_device_lookup = device_lookup_ok;
+            }
+        }
+
+        if (!used_device_lookup) {
+            const hidden_count = std.math.mul(usize, rows, self.d_model) catch return error.InvalidArgument;
+            const hidden_host = try self.allocator.alloc(f32, hidden_count);
+            defer self.allocator.free(hidden_host);
+            try populatePrefillHiddenFromTokens(self.loaded, chunk_tokens, self.d_model, hidden_host, null);
+            try self.runtime_buffers.input_dev.upload(&self.device, std.mem.sliceAsBytes(hidden_host));
+        }
+
+        const active_rows_u32: u32 = @intCast(rows);
+        const seq_len_u32: u32 = @intCast(pos_base + rows);
+        const last_position = pos_base + rows - 1;
+        const last_position_u32: u32 = @intCast(last_position);
+
+        // Stage 0 layer loop.
+        {
+            var layer_idx: usize = 0;
+            while (layer_idx < self.block_runtime.blocks.len) : (layer_idx += 1) {
+                const layer = &self.block_runtime.blocks[layer_idx];
+                _ = try self.tryExecuteLayerProgram(
+                    layer,
+                    slot_index,
+                    layer_idx,
+                    d_model_u32,
+                    head_dim_u32,
+                    rope_dim_u32,
+                    n_heads_u32,
+                    n_kv_heads_u32,
+                    active_rows_u32,
+                    seq_len_u32,
+                    seq_len_u32,
+                    pos_base,
+                    last_position,
+                    last_position_u32,
+                    global_rope_theta,
+                    local_rope_theta,
+                    self.rope_function orelse return error.CudaKernelUnavailable,
+                    self.copy_function orelse return error.CudaKernelUnavailable,
+                    if (kv_cache_dtype_fp16)
+                        (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
+                    else
+                        null,
+                    if (kv_cache_dtype_fp16) self.kv_write_f16_function else null,
+                    if (kv_cache_dtype_fp16) self.rope_store_f16_function else null,
+                    self.shortconv_step_function orelse return error.CudaKernelUnavailable,
+                    attn_kernels_0,
+                    null,
+                );
+            }
+        }
+
+        // ── Stage 1 buffer setup (must precede transfer into input_dev) ──
+        try stage1.runtime_buffers.ensureRowCapacity(&stage1.device, rows, stage1.fixed_alloc_mode);
+        try stage1.ensureLayerProgramSlotRowCapacity(rows, stage1.fixed_alloc_mode);
+
+        // ── Bulk transfer stage0 → stage1 ──
+        const transfer_bytes = std.math.mul(usize, rows, row_bytes) catch return error.InvalidArgument;
+        try transferPipelineActivationMultiRow(self, stage1, transfer_bytes, row_bytes);
+
+        var stage1_final_hidden = stage1.runtime_buffers.input_dev;
+        {
+            var layer_idx: usize = 0;
+            while (layer_idx < stage1.block_runtime.blocks.len) : (layer_idx += 1) {
+                const layer = &stage1.block_runtime.blocks[layer_idx];
+                stage1_final_hidden = try stage1.tryExecuteLayerProgram(
+                    layer,
+                    slot_index,
+                    layer_idx,
+                    d_model_u32,
+                    head_dim_u32,
+                    rope_dim_u32,
+                    n_heads_u32,
+                    n_kv_heads_u32,
+                    active_rows_u32,
+                    seq_len_u32,
+                    seq_len_u32,
+                    pos_base,
+                    last_position,
+                    last_position_u32,
+                    global_rope_theta,
+                    local_rope_theta,
+                    stage1.rope_function orelse return error.CudaKernelUnavailable,
+                    stage1.copy_function orelse return error.CudaKernelUnavailable,
+                    if (kv_cache_dtype_fp16)
+                        (stage1.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
+                    else
+                        null,
+                    if (kv_cache_dtype_fp16) stage1.kv_write_f16_function else null,
+                    if (kv_cache_dtype_fp16) stage1.rope_store_f16_function else null,
+                    stage1.shortconv_step_function orelse return error.CudaKernelUnavailable,
+                    attn_kernels_1,
+                    null,
+                );
+            }
+        }
+
+        // ── Logits from last chunk (on stage1) ──
+        if (pos_base + rows >= total_rows) {
+            const last_row_in_chunk = rows - 1;
+            const last_offset = std.math.mul(usize, last_row_in_chunk, row_bytes) catch return error.InvalidArgument;
+            var last_hidden = try bufferSlice(&stage1_final_hidden, last_offset, row_bytes);
+            var last_norm = try bufferSlice(&stage1.runtime_buffers.norm_out_dev, 0, row_bytes);
+            try compute.cuda.rmsnorm.runWithFunction(
+                &stage1.kernel_arg_pack,
+                &stage1.device,
+                stage1.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                &last_hidden,
+                &stage1.runtime_buffers.norm_weight_dev,
+                &last_norm,
+                1,
+                @intCast(stage1.d_model),
+                stage1.norm_eps,
+                stage1.loaded.runtime.weight_offset,
+            );
+            if (trace.isEnabled()) {
+                try last_norm.download(&stage1.device, std.mem.sliceAsBytes(stage1.runtime_buffers.hidden_host));
+                trace.emitFinal(
+                    .final_norm,
+                    @intCast(last_position),
+                    1,
+                    @ptrCast(stage1.runtime_buffers.hidden_host.ptr),
+                    .f32,
+                    .{ @intCast(stage1.d_model), 0, 0, 0 },
+                    1,
+                    "cuda_pipeline2_final_norm_host",
+                );
+            }
+
+            try engine_ops.linearForwardRows(stage1, &last_norm, 1, &stage1.runtime_buffers.projection_weight, &stage1.runtime_buffers.logits_dev);
+            try stage1.runtime_buffers.logits_dev.download(&stage1.device, std.mem.sliceAsBytes(stage1.runtime_buffers.projected_logits_host));
+            if (trace.isEnabled()) {
+                const rows128: u128 = 1;
+                const d_model128: u128 = @intCast(stage1.d_model);
+                const vocab128: u128 = @intCast(stage1.runtime_buffers.projected_vocab);
+                const total_flops = saturatingU64FromU128(2 * rows128 * d_model128 * vocab128);
+                const total_bytes_lm = saturatingU64FromU128(
+                    rows128 * d_model128 * @sizeOf(f32) +
+                        @as(u128, stage1.runtime_buffers.projection_weight.byteSize()) +
+                        rows128 * vocab128 * @sizeOf(f32),
+                );
+                const kernel_name = switch (stage1.runtime_buffers.projection_weight) {
+                    .dense_f32 => "matmul_lm_head_f32_host",
+                    .dense_u16 => |w| switch (w.dtype) {
+                        .bf16 => "matmul_lm_head_bf16_host",
+                        .f16 => "matmul_lm_head_f16_host",
+                    },
+                    .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
+                    .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
+                };
+                trace.emitFinalWithWork(
+                    .lm_head,
+                    @intCast(last_position),
+                    0,
+                    @ptrCast(stage1.runtime_buffers.projected_logits_host.ptr),
+                    .f32,
+                    .{ @intCast(stage1.runtime_buffers.projected_vocab), 0, 0, 0 },
+                    1,
+                    kernel_name,
+                    .{ .flops = total_flops, .bytes = total_bytes_lm },
+                );
+            }
+
+            if (stage1.runtime_buffers.projected_vocab == logits_out.len) {
+                @memcpy(logits_out, stage1.runtime_buffers.projected_logits_host);
+            } else {
+                @memset(logits_out, -1.0e9);
+                @memcpy(logits_out[0..stage1.runtime_buffers.projected_vocab], stage1.runtime_buffers.projected_logits_host);
+            }
+            if (stage1.loaded.config.logits_scaling != 1.0) {
+                for (logits_out) |*v| {
+                    v.* /= stage1.loaded.config.logits_scaling;
+                }
+                if (trace.isEnabled()) {
+                    trace.emitFinal(
+                        .logits_scaled,
+                        @intCast(last_position),
+                        0,
+                        @ptrCast(logits_out.ptr),
+                        .f32,
+                        .{ @intCast(stage1.vocab_size), 0, 0, 0 },
+                        1,
+                        null,
+                    );
+                }
+            }
+        }
+
+        pos_base += rows;
+    }
+}
+
 fn runPipeline2WithPipelineRuntime(
     self: anytype,
     stage1_backend: anytype,
@@ -668,6 +1165,24 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                         trace_pos_offset,
                         runtime_activation_bytes,
                     );
+                    // Stage1 computed logits on stage1's device. When the caller
+                    // keeps logits on-device (download_logits=false, used by
+                    // decodeStreaming + selectNextTokenFromDeviceLogitsImpl),
+                    // copy them to stage0's device buffer.
+                    if (comptime @hasField(SelfType, "runtime_buffers")) {
+                        if (compute_logits and !download_logits) {
+                            const proj_vocab = self.runtime_buffers.projected_vocab;
+                            const host_logits = std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host[0..proj_vocab]);
+                            try runtime_stage1.runtime_buffers.logits_dev.download(
+                                &runtime_stage1.device,
+                                host_logits,
+                            );
+                            try self.runtime_buffers.logits_dev.upload(
+                                &self.device,
+                                host_logits,
+                            );
+                        }
+                    }
                     return;
                 }
             }
@@ -701,7 +1216,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             );
             const activation_bytes = try pipelineActivationByteCountFor(self);
             try self.transferPipelineActivation(stage1, activation_bytes);
-            return computeGpuPrototypeLogitsWithLayerLimit(
+            try computeGpuPrototypeLogitsWithLayerLimit(
                 stage1,
                 token,
                 position,
@@ -718,6 +1233,25 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 deepstack_feature_index_opt,
                 true,
             );
+            // Stage1 computed logits on stage1's device. When the caller
+            // keeps logits on-device (download_logits=false, used by
+            // decodeStreaming + selectNextTokenFromDeviceLogitsImpl),
+            // copy them to stage0's device buffer.
+            if (comptime @hasField(SelfType, "runtime_buffers")) {
+                if (compute_logits and !download_logits) {
+                    const proj_vocab = self.runtime_buffers.projected_vocab;
+                    const host_logits = std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host[0..proj_vocab]);
+                    try stage1.runtime_buffers.logits_dev.download(
+                        &stage1.device,
+                        host_logits,
+                    );
+                    try self.runtime_buffers.logits_dev.upload(
+                        &self.device,
+                        host_logits,
+                    );
+                }
+            }
+            return;
         }
     }
     if (comptime @hasDecl(SelfType, "pipelineCpuStage0") and
@@ -1669,6 +2203,26 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
     layer_limit: usize,
 ) !void {
     const SelfType = @TypeOf(self.*);
+
+    // Pipeline2: batched prefill through stage0 → bulk transfer → stage1.
+    // Uses comptime guard because anytype monomorphization requires all referenced
+    // methods to exist on the type, even in runtime-unreachable branches.
+    if (topologyModeIs(self, "pipeline2") and layer_limit == self.block_runtime.blocks.len) {
+        if (tokens.len == 0) return error.InvalidArgument;
+        if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
+        if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+
+        if (comptime @hasDecl(SelfType, "pipelineStage1")) {
+            var stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
+            if (stage1.state_descriptor_count > 0) try stage1.mirrorSlotStateBlocksFrom(self, slot_index);
+            stage1.activateKvSlot(slot_index);
+            self.activateKvSlot(slot_index);
+            return computeBatchedPrefillPipeline2(self, stage1, tokens, slot_index, logits_out);
+        }
+    }
+
+    // Multi-stage topologies without batched prefill: token-by-token fallback.
     if ((topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) and
         layer_limit == self.block_runtime.blocks.len)
     {
