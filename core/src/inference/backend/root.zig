@@ -898,7 +898,7 @@ pub const Backend = union(enum) {
         switch (selected) {
             .cpu => return initCpu(allocator, loaded, "configured", progress),
             .metal => return initMetal(allocator, loaded, "configured"),
-            .cuda => return initCuda(allocator, loaded, "configured", cuda_probe, init_options.cuda_topology),
+            .cuda => return initCuda(allocator, loaded, "configured", cuda_probe, init_options.cuda_topology, progress),
             .auto => {},
         }
 
@@ -1373,12 +1373,63 @@ fn initMetal(
     return .{ .metal = metal_backend_state };
 }
 
+/// Renders a two-color bar showing CPU vs GPU layer split.
+/// Yellow '#' = CPU layers, cyan '#' = GPU layers. 40-char width matches the Loading bar.
+/// Example output: `[####################████████████████████] 32/32  cpu 20 · gpu 12`
+fn renderColoredBar(
+    buf: *[512]u8,
+    mode: CudaTopologyMode,
+    n_layers: usize,
+    split_layer: ?usize,
+) ?[*:0]const u8 {
+    const bar_width: usize = 40;
+    if (mode == .single or n_layers == 0) return null;
+
+    const cpu_layers: usize = switch (mode) {
+        .cpu_gpu, .cpu_gpu_gpu => split_layer orelse 0,
+        .pipeline2 => 0,
+        .single => unreachable,
+    };
+    const gpu_layers: usize = n_layers - cpu_layers;
+
+    const w_cpu: usize = if (cpu_layers > 0) (cpu_layers * bar_width + n_layers / 2) / n_layers else 0;
+    const w_gpu: usize = bar_width - w_cpu;
+
+    const yellow = "\x1b[33m";
+    const cyan = "\x1b[36m";
+    const reset = "\x1b[0m";
+
+    var stream = std.io.fixedBufferStream(buf);
+    const w = stream.writer();
+
+    w.writeAll("[") catch return null;
+    if (w_cpu > 0) {
+        w.writeAll(yellow) catch return null;
+        for (0..w_cpu) |_| w.writeByte('#') catch return null;
+        w.writeAll(reset) catch return null;
+    }
+    w.writeAll(cyan) catch return null;
+    for (0..w_gpu) |_| w.writeByte('#') catch return null;
+    w.writeAll(reset) catch return null;
+
+    w.print("] {d}/{d}", .{ n_layers, n_layers }) catch return null;
+    if (cpu_layers > 0) {
+        w.print("  {s}cpu {d}{s} \xc2\xb7 {s}gpu {d}{s}", .{ yellow, cpu_layers, reset, cyan, gpu_layers, reset }) catch return null;
+    }
+
+    const pos = stream.pos;
+    if (pos >= buf.len) return null;
+    buf[pos] = 0;
+    return @ptrCast(buf[0..pos :0]);
+}
+
 fn initCuda(
     allocator: std.mem.Allocator,
     loaded: *LoadedModel,
     reason: []const u8,
     probe: CudaProbe,
     topology_override: ?CudaTopologyConfig,
+    progress: progress_mod.Context,
 ) !Backend {
     if (!has_cuda) {
         return error.CudaNotEnabled;
@@ -1546,6 +1597,16 @@ fn initCuda(
         .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
         .split_layer_stage2 = if (topology.split_layer_stage2) |split| split else std.math.maxInt(usize),
     });
+    const total_layers: u64 = @intCast(loaded.blocks.len);
+    const n_layers = loaded.blocks.len;
+
+    // For multi-device topologies, render a colored bar in the message field.
+    // Use spinner mode (total=0) so we control the entire visual via {msg}.
+    // Yellow(\x1b[33m) = CPU, Cyan(\x1b[36m) = GPU0/gpu, Green(\x1b[32m) = GPU1.
+    const use_colored_bar = topology.mode != .single;
+    const bar_total: u64 = if (use_colored_bar) 0 else total_layers;
+
+    progress.addLine(1, "Devices", bar_total, null, null);
     const cuda_backend_state = if (has_cuda)
         try cuda.BackendType.init(allocator, loaded, cuda_max_batch_size, .{
             .device_ordinal = topology.primaryDeviceOrdinal(),
@@ -1553,9 +1614,18 @@ fn initCuda(
             .stage_device_ordinals = topology.stage_device_ordinals,
             .split_layer = topology.split_layer,
             .split_layer_stage2 = topology.split_layer_stage2,
+            .progress = progress,
         })
     else
         unreachable;
+
+    if (use_colored_bar) {
+        var bar_buf: [512]u8 = undefined;
+        if (renderColoredBar(&bar_buf, topology.mode, n_layers, topology.split_layer)) |msg| {
+            progress.updateLine(1, 0, msg);
+        }
+    }
+    progress.completeLine(1);
     log.info("inference", "Backend selected: cuda", .{ .reason = reason });
     return .{ .cuda = cuda_backend_state };
 }
@@ -1863,7 +1933,7 @@ test "initCuda returns CudaNotEnabled when build target has no CUDA backend" {
     const undefined_loaded: *LoadedModel = undefined;
     try std.testing.expectError(
         error.CudaNotEnabled,
-        initCuda(std.testing.allocator, undefined_loaded, "test", .disabled, null),
+        initCuda(std.testing.allocator, undefined_loaded, "test", .disabled, null, progress_mod.Context.NONE),
     );
 }
 
@@ -1872,7 +1942,7 @@ test "initCuda returns CudaUnavailable when runtime probe is unavailable" {
     const undefined_loaded: *LoadedModel = undefined;
     try std.testing.expectError(
         error.CudaUnavailable,
-        initCuda(std.testing.allocator, undefined_loaded, "test", .driver_not_found, null),
+        initCuda(std.testing.allocator, undefined_loaded, "test", .driver_not_found, null, progress_mod.Context.NONE),
     );
 }
 

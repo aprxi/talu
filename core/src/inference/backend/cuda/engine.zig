@@ -446,6 +446,8 @@ pub const CudaBackend = struct {
         /// Internal: restricts layer-dependent allocations to [start, end).
         /// Used by topology init to create stage backends without full-model allocation.
         init_layer_range: ?struct { start: usize, end: usize } = null,
+        /// Progress context for "Devices" progress bar.
+        progress: progress_mod.Context = progress_mod.Context.NONE,
     };
 
     pub fn init(
@@ -828,11 +830,14 @@ pub const CudaBackend = struct {
         }
 
         switch (init_options.topology_mode) {
-            .single => {},
+            .single => {
+                init_options.progress.updateLine(1, @intCast(total_layers), null);
+            },
             .pipeline2 => {
                 backend.topology_mode = .pipeline2;
                 const split = layer_range.split_layer;
                 backend.split_layer = split;
+                init_options.progress.updateLine(1, @intCast(split), null);
 
                 // Stage 1: dedicated backend on device1 with layers [split, total_layers).
                 const stage1_ptr = try allocator.create(CudaBackend);
@@ -846,6 +851,7 @@ pub const CudaBackend = struct {
                         .topology_mode = .single,
                         .stage_device_ordinals = init_options.stage_device_ordinals,
                         .init_layer_range = .{ .start = split, .end = total_layers },
+                        .progress = init_options.progress,
                     },
                 );
                 errdefer {
@@ -916,6 +922,7 @@ pub const CudaBackend = struct {
                     .stage0_strict_memory = @as(u8, @intFromBool(backend.strict_memory_mode)),
                     .stage1_strict_memory = @as(u8, @intFromBool(stage1_ptr.strict_memory_mode)),
                 });
+                init_options.progress.updateLine(1, @intCast(total_layers), null);
 
             },
             .cpu_gpu => {
@@ -937,6 +944,7 @@ pub const CudaBackend = struct {
                     allocator.destroy(stage0_cpu_ptr);
                 }
                 backend.pipeline_backend0_cpu = stage0_cpu_ptr;
+                init_options.progress.updateLine(1, @intCast(split), null);
 
                 const boundary = try backend_root.pipeline.negotiateBoundaryContract(.{
                     .stage0_native_dtype = .f32,
@@ -962,6 +970,7 @@ pub const CudaBackend = struct {
                     backend.pipeline_host_staging = null;
                 }
                 backend.pipeline_transfer_mode = .host_staged;
+                init_options.progress.updateLine(1, @intCast(total_layers), null);
 
                 const stage1_budget = backend.computeDeviceMemoryBudget();
                 log.info("inference", "CUDA cpu+gpu topology", .{
@@ -1005,6 +1014,7 @@ pub const CudaBackend = struct {
                     allocator.destroy(stage0_cpu_ptr);
                 }
                 backend.pipeline_backend0_cpu = stage0_cpu_ptr;
+                init_options.progress.updateLine(1, @intCast(split), null);
 
                 // GPU stage 1 executes layers [split, split_stage2).
                 const stage1_ptr = try allocator.create(CudaBackend);
@@ -1018,6 +1028,7 @@ pub const CudaBackend = struct {
                         .topology_mode = .single,
                         .stage_device_ordinals = init_options.stage_device_ordinals,
                         .init_layer_range = .{ .start = split, .end = split_stage2 },
+                        .progress = init_options.progress,
                     },
                 );
                 errdefer {
@@ -1025,6 +1036,7 @@ pub const CudaBackend = struct {
                     allocator.destroy(stage1_ptr);
                 }
                 backend.pipeline_backend1 = stage1_ptr;
+                init_options.progress.updateLine(1, @intCast(split_stage2), null);
 
                 // GPU stage 2 (this backend) already initialized with layers [split_stage2, total_layers)
                 // via init_layer_range computed above.
@@ -1096,6 +1108,7 @@ pub const CudaBackend = struct {
                     .gpu_stage1_slot_state_mib = bytesToMiB(stage1_budget.slotStateBytes()),
                     .gpu_stage2_slot_state_mib = bytesToMiB(stage2_budget.slotStateBytes()),
                 });
+                init_options.progress.updateLine(1, @intCast(total_layers), null);
 
             },
         }

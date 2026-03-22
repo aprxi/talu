@@ -329,7 +329,7 @@ pub const FusedCpuBackend = struct {
 
         // Progress: n_layers (buildBlocks) + 3 (KV cache, scratch, model build)
         const progress_total: u64 = @intCast(layer_total + 3);
-        progress.addLine(1, "Preparing", progress_total, null, null);
+        progress.addLine(1, "Devices", progress_total, null, null);
 
         var runtime_rope = try initRuntimeRopeHandles(allocator, loaded);
         errdefer deinitRuntimeRopeHandles(allocator, &runtime_rope);
