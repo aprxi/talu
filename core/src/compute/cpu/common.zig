@@ -1,10 +1,21 @@
 //! Shared CPU helpers for compute primitives.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const simd = @import("simd/arch/root.zig");
 
 const VEC_LEN = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;
+
+/// Page size for page-aligned allocations (required for Metal zero-copy buffers).
+/// macOS uses 16KB pages on Apple Silicon, 4KB on Intel.
+pub const page_size: usize = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)
+    16 * 1024
+else
+    std.heap.page_size_min;
+
+/// Alignment in f32 elements for page-aligned buffers.
+const page_align_f32s = page_size / @sizeOf(f32);
 
 /// Heap overflow diagnostic: when true, ensureF32Slice and ensureAligned64F32Slice
 /// append a guard zone of GUARD_PATTERN after each buffer. Use verifyF32Guard() to
@@ -76,6 +87,33 @@ pub fn freeAligned64F32Slice(allocator: std.mem.Allocator, slice: []f32) void {
     allocator.free(aligned);
 }
 
+/// Ensure a reusable f32 buffer with page alignment (for Metal zero-copy buffers).
+/// Free via freePageAlignedF32Slice.
+/// When heap_debug is true, appends a guard zone after the data region.
+pub fn ensurePageAlignedF32Slice(storage: *[]f32, needed: usize) !void {
+    const total = needed + GUARD_F32S;
+    if (storage.*.len >= total) return;
+    if (storage.*.len > 0) {
+        freePageAlignedF32Slice(storage.*);
+        storage.* = &.{};
+    }
+    // Use page_allocator for guaranteed page-aligned memory.
+    const byte_count = total * @sizeOf(f32);
+    const aligned_bytes = std.mem.alignForward(usize, byte_count, page_size);
+    const bytes = try std.heap.page_allocator.alloc(u8, aligned_bytes);
+    storage.* = @as([*]f32, @alignCast(@ptrCast(bytes.ptr)))[0..total];
+    if (heap_debug) fillGuard(storage.*, needed);
+}
+
+/// Free a []f32 that was allocated with page alignment.
+pub fn freePageAlignedF32Slice(slice: []f32) void {
+    if (slice.len == 0) return;
+    const byte_count = slice.len * @sizeOf(f32);
+    const aligned_bytes = std.mem.alignForward(usize, byte_count, page_size);
+    const bytes: [*]u8 = @ptrCast(slice.ptr);
+    std.heap.page_allocator.free(bytes[0..aligned_bytes]);
+}
+
 /// Add a 1-D bias vector to each row of a [rows, dim] f32 buffer.
 pub fn addBiasRows(data: []f32, bias: []const f32, rows: usize, dim: usize) void {
     std.debug.assert(bias.len == dim);
@@ -140,6 +178,33 @@ test "ensureAligned64F32Slice provides 64-byte alignment" {
     try ensureAligned64F32Slice(allocator, &storage, 32);
     try std.testing.expect(storage.len >= 32);
     try std.testing.expect(@intFromPtr(storage.ptr) % 64 == 0);
+}
+
+test "ensurePageAlignedF32Slice provides page alignment" {
+    var storage: []f32 = &.{};
+    defer if (storage.len > 0) freePageAlignedF32Slice(storage);
+
+    try ensurePageAlignedF32Slice(&storage, 1024);
+    try std.testing.expect(storage.len >= 1024);
+    try std.testing.expect(@intFromPtr(storage.ptr) % page_size == 0);
+}
+
+test "ensurePageAlignedF32Slice grows buffer" {
+    var storage: []f32 = &.{};
+    defer if (storage.len > 0) freePageAlignedF32Slice(storage);
+
+    try ensurePageAlignedF32Slice(&storage, 16);
+    try std.testing.expect(storage.len >= 16);
+    const first_ptr = storage.ptr;
+
+    // Asking for same or smaller size reuses buffer
+    try ensurePageAlignedF32Slice(&storage, 8);
+    try std.testing.expectEqual(first_ptr, storage.ptr);
+
+    // Asking for larger size reallocates
+    try ensurePageAlignedF32Slice(&storage, 8192);
+    try std.testing.expect(storage.len >= 8192);
+    try std.testing.expect(@intFromPtr(storage.ptr) % page_size == 0);
 }
 
 test "ensureF32Slice clears storage on allocation failure" {

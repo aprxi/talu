@@ -21,6 +21,7 @@ const cpu_norm = compute.cpu.normalization;
 const cpu_reduction = compute.cpu.reduction;
 const cpu_rotary = compute.cpu.rotary;
 const cpu_softmax = compute.cpu.softmax;
+const cpu_common = compute.cpu.common;
 const rope_kernel = @import("rope.zig");
 const trace = @import("../../../../xray/root.zig").trace;
 
@@ -41,6 +42,9 @@ pub const MLAConfig = struct {
 
 /// Per-layer KV cache for MLA.
 /// Layout differs from standard attention due to split rope/nope K dimensions.
+///
+/// IMPORTANT: Buffers MUST be page-aligned (ensurePageAlignedF32Slice).
+/// Enables zero-copy GPU sharing, mmap offloading, and DMA transfers.
 pub const MLACache = struct {
     /// K cache: [n_kv_heads, seq_capacity, qk_head_dim]
     /// Note: qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -53,9 +57,10 @@ pub const MLACache = struct {
     cache_position: usize = 0,
 
     pub fn deinit(self: *MLACache, allocator: std.mem.Allocator) void {
-        if (self.key_cache.len > 0) allocator.free(self.key_cache);
-        if (self.value_cache.len > 0) allocator.free(self.value_cache);
-        if (self.rope_key_cache.len > 0) allocator.free(self.rope_key_cache);
+        _ = allocator; // Page-aligned buffers use page_allocator directly
+        cpu_common.freePageAlignedF32Slice(self.key_cache);
+        cpu_common.freePageAlignedF32Slice(self.value_cache);
+        cpu_common.freePageAlignedF32Slice(self.rope_key_cache);
         self.* = .{};
     }
 
@@ -65,6 +70,9 @@ pub const MLACache = struct {
 };
 
 /// Scratch buffers for MLA computation.
+///
+/// IMPORTANT: Buffers MUST be page-aligned (ensurePageAlignedF32Slice).
+/// Enables zero-copy GPU sharing, mmap offloading, and DMA transfers.
 pub const MLATemp = struct {
     /// Q after compression: [seq_len, q_lora_rank]
     q_compressed: []f32 = &.{},
@@ -82,13 +90,14 @@ pub const MLATemp = struct {
     context: []f32 = &.{},
 
     pub fn deinit(self: *MLATemp, allocator: std.mem.Allocator) void {
-        if (self.q_compressed.len > 0) allocator.free(self.q_compressed);
-        if (self.q.len > 0) allocator.free(self.q);
-        if (self.kv_compressed.len > 0) allocator.free(self.kv_compressed);
-        if (self.kv_nope.len > 0) allocator.free(self.kv_nope);
-        if (self.kv_expanded.len > 0) allocator.free(self.kv_expanded);
-        if (self.scores.len > 0) allocator.free(self.scores);
-        if (self.context.len > 0) allocator.free(self.context);
+        _ = allocator; // Page-aligned buffers use page_allocator directly
+        cpu_common.freePageAlignedF32Slice(self.q_compressed);
+        cpu_common.freePageAlignedF32Slice(self.q);
+        cpu_common.freePageAlignedF32Slice(self.kv_compressed);
+        cpu_common.freePageAlignedF32Slice(self.kv_nope);
+        cpu_common.freePageAlignedF32Slice(self.kv_expanded);
+        cpu_common.freePageAlignedF32Slice(self.scores);
+        cpu_common.freePageAlignedF32Slice(self.context);
         self.* = .{};
     }
 };
@@ -305,50 +314,17 @@ pub const MLAttention = struct {
     }
 
     fn ensureTemp(self: *const MLAttention, scratch: *MLATemp, seq_len: usize, use_cache: bool) !void {
+        // Use page-aligned allocation for Metal zero-copy buffer compatibility.
         const cfg = self.config;
         _ = use_cache;
 
-        const q_comp_size = seq_len * cfg.q_lora_rank;
-        if (scratch.q_compressed.len < q_comp_size) {
-            if (scratch.q_compressed.len > 0) self.allocator.free(scratch.q_compressed);
-            scratch.q_compressed = try self.allocator.alloc(f32, q_comp_size);
-        }
-
-        const q_size = seq_len * self.n_heads * cfg.qk_head_dim;
-        if (scratch.q.len < q_size) {
-            if (scratch.q.len > 0) self.allocator.free(scratch.q);
-            scratch.q = try self.allocator.alloc(f32, q_size);
-        }
-
-        const kv_comp_size = seq_len * (cfg.kv_lora_rank + cfg.qk_rope_head_dim);
-        if (scratch.kv_compressed.len < kv_comp_size) {
-            if (scratch.kv_compressed.len > 0) self.allocator.free(scratch.kv_compressed);
-            scratch.kv_compressed = try self.allocator.alloc(f32, kv_comp_size);
-        }
-
-        const kv_nope_size = seq_len * cfg.kv_lora_rank;
-        if (scratch.kv_nope.len < kv_nope_size) {
-            if (scratch.kv_nope.len > 0) self.allocator.free(scratch.kv_nope);
-            scratch.kv_nope = try self.allocator.alloc(f32, kv_nope_size);
-        }
-
-        const kv_exp_size = seq_len * self.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim);
-        if (scratch.kv_expanded.len < kv_exp_size) {
-            if (scratch.kv_expanded.len > 0) self.allocator.free(scratch.kv_expanded);
-            scratch.kv_expanded = try self.allocator.alloc(f32, kv_exp_size);
-        }
-
-        const scores_size = self.n_heads * self.max_seq_len;
-        if (scratch.scores.len < scores_size) {
-            if (scratch.scores.len > 0) self.allocator.free(scratch.scores);
-            scratch.scores = try self.allocator.alloc(f32, scores_size);
-        }
-
-        const ctx_size = seq_len * self.n_heads * cfg.v_head_dim;
-        if (scratch.context.len < ctx_size) {
-            if (scratch.context.len > 0) self.allocator.free(scratch.context);
-            scratch.context = try self.allocator.alloc(f32, ctx_size);
-        }
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.q_compressed, seq_len * cfg.q_lora_rank);
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.q, seq_len * self.n_heads * cfg.qk_head_dim);
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.kv_compressed, seq_len * (cfg.kv_lora_rank + cfg.qk_rope_head_dim));
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.kv_nope, seq_len * cfg.kv_lora_rank);
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.kv_expanded, seq_len * self.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim));
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.scores, self.n_heads * self.max_seq_len);
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.context, seq_len * self.n_heads * cfg.v_head_dim);
     }
 
     fn populateCache(
@@ -365,17 +341,21 @@ pub const MLAttention = struct {
         const required_v = self.n_heads * self.max_seq_len * cfg.v_head_dim;
         const required_rope = self.max_seq_len * cfg.qk_rope_head_dim;
 
+        // Use page-aligned allocation for Metal zero-copy buffer compatibility.
         if (cache.key_cache.len < required_k) {
-            if (cache.key_cache.len > 0) self.allocator.free(cache.key_cache);
-            cache.key_cache = try self.allocator.alloc(f32, required_k);
+            cpu_common.freePageAlignedF32Slice(cache.key_cache);
+            cache.key_cache = &.{};
+            try cpu_common.ensurePageAlignedF32Slice(&cache.key_cache, required_k);
         }
         if (cache.value_cache.len < required_v) {
-            if (cache.value_cache.len > 0) self.allocator.free(cache.value_cache);
-            cache.value_cache = try self.allocator.alloc(f32, required_v);
+            cpu_common.freePageAlignedF32Slice(cache.value_cache);
+            cache.value_cache = &.{};
+            try cpu_common.ensurePageAlignedF32Slice(&cache.value_cache, required_v);
         }
         if (cache.rope_key_cache.len < required_rope) {
-            if (cache.rope_key_cache.len > 0) self.allocator.free(cache.rope_key_cache);
-            cache.rope_key_cache = try self.allocator.alloc(f32, required_rope);
+            cpu_common.freePageAlignedF32Slice(cache.rope_key_cache);
+            cache.rope_key_cache = &.{};
+            try cpu_common.ensurePageAlignedF32Slice(&cache.rope_key_cache, required_rope);
         }
         cache.kv_capacity = self.max_seq_len;
 

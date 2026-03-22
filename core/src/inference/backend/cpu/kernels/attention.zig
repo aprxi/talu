@@ -49,6 +49,10 @@ fn getExactSoftmax(allocator: std.mem.Allocator) bool {
 
 /// Temporary scratch buffers for attention computation.
 /// These are safe to share across layers because they do not persist state.
+///
+/// IMPORTANT: All buffers MUST be page-aligned (use ensurePageAlignedF32Slice).
+/// Page alignment enables zero-copy GPU buffer sharing (Metal, CUDA), KV cache
+/// offloading via mmap, and efficient DMA transfers.
 pub const AttnTemp = struct {
     q: []f32 = &.{},
     k: []f32 = &.{},
@@ -58,17 +62,21 @@ pub const AttnTemp = struct {
     context_values: []f32 = &.{},
 
     pub fn deinit(self: *AttnTemp, allocator: std.mem.Allocator) void {
-        if (self.q.len > 0) allocator.free(self.q);
-        if (self.k.len > 0) allocator.free(self.k);
-        if (self.v.len > 0) allocator.free(self.v);
-        if (self.qkv.len > 0) allocator.free(self.qkv);
-        if (self.scores.len > 0) allocator.free(self.scores);
-        if (self.context_values.len > 0) allocator.free(self.context_values);
+        _ = allocator; // Page-aligned buffers use page_allocator directly
+        cpu_common.freePageAlignedF32Slice(self.q);
+        cpu_common.freePageAlignedF32Slice(self.k);
+        cpu_common.freePageAlignedF32Slice(self.v);
+        cpu_common.freePageAlignedF32Slice(self.qkv);
+        cpu_common.freePageAlignedF32Slice(self.scores);
+        cpu_common.freePageAlignedF32Slice(self.context_values);
         self.* = .{};
     }
 };
 
 /// Per-layer KV cache (must persist across calls).
+///
+/// IMPORTANT: Buffers MUST be page-aligned (ensurePageAlignedF32Slice).
+/// Enables zero-copy GPU sharing, mmap offloading, and DMA transfers.
 pub const AttnCache = struct {
     key_cache: []f32 = &.{},
     value_cache: []f32 = &.{},
@@ -76,8 +84,9 @@ pub const AttnCache = struct {
     cache_position: usize = 0,
 
     pub fn deinit(self: *AttnCache, allocator: std.mem.Allocator) void {
-        if (self.key_cache.len > 0) allocator.free(self.key_cache);
-        if (self.value_cache.len > 0) allocator.free(self.value_cache);
+        _ = allocator; // Page-aligned buffers use page_allocator directly
+        cpu_common.freePageAlignedF32Slice(self.key_cache);
+        cpu_common.freePageAlignedF32Slice(self.value_cache);
         self.* = .{};
     }
 
@@ -260,7 +269,7 @@ pub const MultiHeadAttention = struct {
             const key_weights = self.k_proj orelse return error.MissingAttentionWeights;
             const value_weights = self.v_proj orelse return error.MissingAttentionWeights;
             const query_projection_dim = gated_query_projection_dim orelse query_dim;
-            try cpu_common.ensureF32Slice(self.allocator, &scratch.q, sequence_len * query_projection_dim);
+            try cpu_common.ensurePageAlignedF32Slice(&scratch.q, sequence_len * query_projection_dim);
 
             var query_workspace = Tensor.view2DSlice(scratch.q[0 .. sequence_len * query_projection_dim], sequence_len, query_projection_dim);
             var key_workspace = Tensor.view2DSlice(scratch.k[0 .. sequence_len * kv_total_dim], sequence_len, kv_total_dim);
@@ -831,20 +840,21 @@ pub const MultiHeadAttention = struct {
     }
 
     pub fn ensureTemp(self: *const Self, scratch: *AttnTemp, sequence_len: usize, use_cache: bool, query_dim: usize, kv_total_dim: usize, needs_qkv_scratch: bool) !void {
+        // Use page-aligned allocation for Metal zero-copy buffer compatibility.
         // Always allocate separate Q, K, V buffers
-        try cpu_common.ensureF32Slice(self.allocator, &scratch.q, sequence_len * query_dim);
-        try cpu_common.ensureF32Slice(self.allocator, &scratch.k, sequence_len * kv_total_dim);
-        try cpu_common.ensureF32Slice(self.allocator, &scratch.v, sequence_len * kv_total_dim);
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.q, sequence_len * query_dim);
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.k, sequence_len * kv_total_dim);
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.v, sequence_len * kv_total_dim);
         if (needs_qkv_scratch) {
             // Need buffer for fused matmul output + rearranged result (2x size)
             // First half: final rearranged Q/K/V
             // Second half: temporary matmul output before rearrangement
-            try cpu_common.ensureF32Slice(self.allocator, &scratch.qkv, 2 * sequence_len * (query_dim + 2 * kv_total_dim));
+            try cpu_common.ensurePageAlignedF32Slice(&scratch.qkv, 2 * sequence_len * (query_dim + 2 * kv_total_dim));
         }
         // Decode uses scores[head, max_seq_len] for current token; prefill reuses scores[head, sequence_len] per query.
         const scores_needed = if (use_cache) self.n_heads * self.max_seq_len else self.n_heads * sequence_len;
-        try cpu_common.ensureF32Slice(self.allocator, &scratch.scores, scores_needed);
-        try cpu_common.ensureF32Slice(self.allocator, &scratch.context_values, sequence_len * self.n_heads * self.head_dim);
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.scores, scores_needed);
+        try cpu_common.ensurePageAlignedF32Slice(&scratch.context_values, sequence_len * self.n_heads * self.head_dim);
     }
 
     pub fn ensureKvCapacity(self: *const Self, cache: *AttnCache, needed_seq: usize, kv_total_dim: usize) !void {
@@ -857,10 +867,14 @@ pub const MultiHeadAttention = struct {
         // (e.g. vision encoders can exceed num_pos_embeddings via interpolation).
         const target_seq = @max(needed_seq, @min(self.max_seq_len, grow_to));
         const total = target_seq * kv_total_dim;
-        const new_k = try self.allocator.alloc(f32, total);
-        errdefer self.allocator.free(new_k);
-        const new_v = try self.allocator.alloc(f32, total);
-        errdefer self.allocator.free(new_v);
+
+        // Use page-aligned allocation for Metal zero-copy buffer compatibility.
+        var new_k: []f32 = &.{};
+        try cpu_common.ensurePageAlignedF32Slice(&new_k, total);
+        errdefer cpu_common.freePageAlignedF32Slice(new_k);
+        var new_v: []f32 = &.{};
+        try cpu_common.ensurePageAlignedF32Slice(&new_v, total);
+        errdefer cpu_common.freePageAlignedF32Slice(new_v);
 
         if (cache.kv_capacity > 0) {
             const old_stride = cache.kv_capacity;
@@ -875,8 +889,8 @@ pub const MultiHeadAttention = struct {
                     @memcpy(dst_v, src_v);
                 }
             }
-            self.allocator.free(cache.key_cache);
-            self.allocator.free(cache.value_cache);
+            cpu_common.freePageAlignedF32Slice(cache.key_cache);
+            cpu_common.freePageAlignedF32Slice(cache.value_cache);
         }
 
         cache.key_cache = new_k;
@@ -963,7 +977,7 @@ pub const MultiHeadAttention = struct {
             const key_weights = self.k_proj orelse return error.MissingAttentionWeights;
             const value_weights = self.v_proj orelse return error.MissingAttentionWeights;
             const query_projection_dim = gated_query_projection_dim orelse query_dim;
-            try cpu_common.ensureF32Slice(self.allocator, &scratch.q, sequence_len * query_projection_dim);
+            try cpu_common.ensurePageAlignedF32Slice(&scratch.q, sequence_len * query_projection_dim);
 
             var query_workspace = Tensor.view2DSlice(scratch.q[0 .. sequence_len * query_projection_dim], sequence_len, query_projection_dim);
             var key_workspace = Tensor.view2DSlice(scratch.k[0 .. sequence_len * kv_total_dim], sequence_len, kv_total_dim);
@@ -1411,7 +1425,7 @@ pub const MultiHeadAttention = struct {
             const key_weights = self.k_proj orelse return error.MissingAttentionWeights;
             const value_weights = self.v_proj orelse return error.MissingAttentionWeights;
             const query_projection_dim = gated_query_projection_dim orelse query_dim;
-            try cpu_common.ensureF32Slice(self.allocator, &scratch.q, batch_size * query_projection_dim);
+            try cpu_common.ensurePageAlignedF32Slice(&scratch.q, batch_size * query_projection_dim);
 
             var query_workspace = Tensor.view2DSlice(scratch.q[0 .. batch_size * query_projection_dim], batch_size, query_projection_dim);
             var key_workspace = Tensor.view2DSlice(scratch.k[0 .. batch_size * kv_total_dim], batch_size, kv_total_dim);
@@ -1702,6 +1716,9 @@ pub const BatchedDecodeRequest = struct {
 
 /// Temporary scratch for batched attention.
 /// Sized for max_batch_size sequences.
+///
+/// IMPORTANT: Buffers MUST be page-aligned (ensurePageAlignedF32Slice).
+/// Enables zero-copy GPU sharing, mmap offloading, and DMA transfers.
 pub const BatchedAttnTemp = struct {
     allocator: std.mem.Allocator,
     max_batch_size: usize,
@@ -1722,28 +1739,33 @@ pub const BatchedAttnTemp = struct {
         head_dim: usize,
         max_seq_len: usize,
     ) !BatchedAttnTemp {
+        // Use page-aligned allocation for Metal zero-copy buffer compatibility.
         const query_dim = n_heads * head_dim;
         const kv_total_dim = n_kv_heads * head_dim;
 
-        return .{
+        var result = BatchedAttnTemp{
             .allocator = allocator,
             .max_batch_size = max_batch_size,
-            .q = try allocator.alloc(f32, max_batch_size * query_dim),
-            .k = try allocator.alloc(f32, max_batch_size * kv_total_dim),
-            .v = try allocator.alloc(f32, max_batch_size * kv_total_dim),
-            .qkv = try allocator.alloc(f32, 2 * max_batch_size * (query_dim + 2 * kv_total_dim)),
-            .scores = try allocator.alloc(f32, max_batch_size * n_heads * max_seq_len),
-            .context_values = try allocator.alloc(f32, max_batch_size * query_dim),
         };
+        errdefer result.deinit();
+
+        try cpu_common.ensurePageAlignedF32Slice(&result.q, max_batch_size * query_dim);
+        try cpu_common.ensurePageAlignedF32Slice(&result.k, max_batch_size * kv_total_dim);
+        try cpu_common.ensurePageAlignedF32Slice(&result.v, max_batch_size * kv_total_dim);
+        try cpu_common.ensurePageAlignedF32Slice(&result.qkv, 2 * max_batch_size * (query_dim + 2 * kv_total_dim));
+        try cpu_common.ensurePageAlignedF32Slice(&result.scores, max_batch_size * n_heads * max_seq_len);
+        try cpu_common.ensurePageAlignedF32Slice(&result.context_values, max_batch_size * query_dim);
+
+        return result;
     }
 
     pub fn deinit(self: *BatchedAttnTemp) void {
-        if (self.context_values.len > 0) self.allocator.free(self.context_values);
-        if (self.scores.len > 0) self.allocator.free(self.scores);
-        if (self.qkv.len > 0) self.allocator.free(self.qkv);
-        if (self.v.len > 0) self.allocator.free(self.v);
-        if (self.k.len > 0) self.allocator.free(self.k);
-        if (self.q.len > 0) self.allocator.free(self.q);
+        cpu_common.freePageAlignedF32Slice(self.context_values);
+        cpu_common.freePageAlignedF32Slice(self.scores);
+        cpu_common.freePageAlignedF32Slice(self.qkv);
+        cpu_common.freePageAlignedF32Slice(self.v);
+        cpu_common.freePageAlignedF32Slice(self.k);
+        cpu_common.freePageAlignedF32Slice(self.q);
         self.* = undefined;
     }
 

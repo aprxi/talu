@@ -16,6 +16,7 @@ const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 const cpu_indexing = compute.cpu.indexing;
 const cpu_memory = compute.cpu.memory;
+const cpu_common = compute.cpu.common;
 
 /// Per-slot state tracking sequence position and activity.
 pub const SlotState = struct {
@@ -31,6 +32,10 @@ pub const SlotState = struct {
 ///
 /// Unlike the single-sequence AttnCache, this cache pre-allocates slots
 /// for `max_batch_size` sequences and manages their lifecycle.
+///
+/// IMPORTANT: key_cache and value_cache MUST be page-aligned
+/// (ensurePageAlignedF32Slice). Enables zero-copy GPU sharing,
+/// mmap offloading, and DMA transfers.
 pub const BatchedKVCache = struct {
     allocator: std.mem.Allocator,
 
@@ -70,11 +75,14 @@ pub const BatchedKVCache = struct {
         errdefer allocator.free(slot_state_entries);
         @memset(slot_state_entries, SlotState{});
 
-        const key_cache = try allocator.alloc(f32, total_entries);
-        errdefer allocator.free(key_cache);
+        // Use page-aligned allocation for Metal zero-copy buffer compatibility.
+        var key_cache: []f32 = &.{};
+        try cpu_common.ensurePageAlignedF32Slice(&key_cache, total_entries);
+        errdefer cpu_common.freePageAlignedF32Slice(key_cache);
 
-        const value_cache = try allocator.alloc(f32, total_entries);
-        errdefer allocator.free(value_cache);
+        var value_cache: []f32 = &.{};
+        try cpu_common.ensurePageAlignedF32Slice(&value_cache, total_entries);
+        errdefer cpu_common.freePageAlignedF32Slice(value_cache);
 
         return .{
             .allocator = allocator,
@@ -91,8 +99,8 @@ pub const BatchedKVCache = struct {
     }
 
     pub fn deinit(self: *BatchedKVCache) void {
-        self.allocator.free(self.value_cache);
-        self.allocator.free(self.key_cache);
+        cpu_common.freePageAlignedF32Slice(self.value_cache);
+        cpu_common.freePageAlignedF32Slice(self.key_cache);
         self.allocator.free(self.slots);
         self.* = undefined;
     }
