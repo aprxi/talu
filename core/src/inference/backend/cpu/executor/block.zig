@@ -1802,7 +1802,6 @@ pub const Block = struct {
     const batched_decode_unsupported: [256]bool = blk: {
         var table = [_]bool{false} ** 256;
         table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = true;
-        table[@intFromEnum(runtime_contract.Opcode.gated_delta_net)] = true;
         table[@intFromEnum(runtime_contract.Opcode.shortconv)] = true;
         table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = true;
         break :blk table;
@@ -2495,20 +2494,61 @@ pub const Block = struct {
         kernel: *const gated_delta_kernel.GatedDeltaKernel,
     ) !void {
         if (!state.use_batched_dispatch) return error.InvalidStateDescriptorBinding;
-        if (state.mode == .slot_batch) return runtime.BatchedKernelError.UnsupportedBatchedDecodeKernel;
-        const binding = try requireGatedDeltaRuntimeBindingForInstruction(
-            state,
-            insn,
-            state_blocks,
-            state.block.block_idx,
-        );
-        try kernel.forward(
-            input,
-            output,
-            binding.state,
-            binding.scratch,
-            &state.scratch.matmul_scratch,
-        );
+        switch (state.mode) {
+            .single_slot => {
+                const binding = try requireGatedDeltaRuntimeBindingForInstruction(
+                    state,
+                    insn,
+                    state_blocks,
+                    state.block.block_idx,
+                );
+                try kernel.forward(
+                    input,
+                    output,
+                    binding.state,
+                    binding.scratch,
+                    &state.scratch.matmul_scratch,
+                );
+            },
+            .slot_batch => {
+                const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
+                const state_block = runtime_contract.findStateBlock(state_blocks, state_id) orelse {
+                    return error.InvalidStateDescriptorBinding;
+                };
+                const recurrent_state = runtime_contract.stateValueFromBlock(
+                    *state_bindings.RecurrentRuntimeState,
+                    state_block,
+                ) orelse {
+                    return error.InvalidStateDescriptorBinding;
+                };
+                if (recurrent_state.runtime_kind != runtime_contract.state_runtime_kind_gated_delta_cache) {
+                    return error.InvalidStateDescriptorBinding;
+                }
+                const scratch_buf = recurrent_state.scratch;
+                const gd_scratch = scratch_buf.getGatedDeltaScratch() orelse {
+                    return error.InvalidStateDescriptorBinding;
+                };
+
+                const slot_indices = state.slot_indices;
+                var slot_state_ptrs: [64]*gated_delta_kernel.GatedDeltaState = undefined;
+                for (slot_indices, 0..) |slot_idx, i| {
+                    const slot_layer_state = scratch_buf.getSlotLayerState(slot_idx, state.block.block_idx) orelse {
+                        return error.InvalidStateDescriptorBinding;
+                    };
+                    const gd_state = if (slot_layer_state.gated_delta_state) |*s| s else {
+                        return error.InvalidStateDescriptorBinding;
+                    };
+                    slot_state_ptrs[i] = gd_state;
+                }
+                try kernel.forwardBatchedSlots(
+                    input,
+                    output,
+                    slot_state_ptrs[0..slot_indices.len],
+                    gd_scratch,
+                    &state.scratch.matmul_scratch,
+                );
+            },
+        }
     }
 
     fn dispatchShortConvWithMode(

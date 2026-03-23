@@ -851,8 +851,8 @@ pub const MultiHeadAttention = struct {
             // Second half: temporary matmul output before rearrangement
             try cpu_common.ensurePageAlignedF32Slice(&scratch.qkv, 2 * sequence_len * (query_dim + 2 * kv_total_dim));
         }
-        // Decode uses scores[head, max_seq_len] for current token; prefill reuses scores[head, sequence_len] per query.
-        const scores_needed = if (use_cache) self.n_heads * self.max_seq_len else self.n_heads * sequence_len;
+        // Decode uses scores[batch, head, max_seq_len] per token; prefill reuses scores[head, sequence_len] per query.
+        const scores_needed = if (use_cache) sequence_len * self.n_heads * self.max_seq_len else self.n_heads * sequence_len;
         try cpu_common.ensurePageAlignedF32Slice(&scratch.scores, scores_needed);
         try cpu_common.ensurePageAlignedF32Slice(&scratch.context_values, sequence_len * self.n_heads * self.head_dim);
     }

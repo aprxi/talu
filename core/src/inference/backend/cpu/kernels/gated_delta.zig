@@ -610,6 +610,35 @@ pub const GatedDeltaKernel = struct {
             }
         }
     }
+
+    /// Batched decode across multiple scheduler slots.
+    /// Input/output are [1, batch_size, d_model]. Each slot has independent
+    /// conv/SSM state. Matmuls (in_proj, out_proj) are batched; conv1d and
+    /// SSM state updates run per-slot.
+    pub fn forwardBatchedSlots(
+        self: *const GatedDeltaKernel,
+        input: *const Tensor,
+        output: *Tensor,
+        slot_states: []const *GatedDeltaState,
+        scratch: *GatedDeltaScratch,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
+    ) !void {
+        // Sequential per-slot fallback to isolate dispatch vs kernel issues.
+        const d_model: usize = self.config.d_model;
+        const batch_size = slot_states.len;
+        if (batch_size == 0) return;
+
+        const full_input_data = input.asSlice(f32);
+        const full_output_data = output.asSlice(f32);
+
+        for (slot_states, 0..) |slot_state, s| {
+            const row_input = full_input_data[s * d_model ..][0..d_model];
+            const row_output = full_output_data[s * d_model ..][0..d_model];
+            var input_view = Tensor.view2DSlice(@constCast(row_input), 1, d_model);
+            var output_view = Tensor.view2DSlice(row_output, 1, d_model);
+            try self.forward(&input_view, &output_view, slot_state, scratch, matmul_scratch);
+        }
+    }
 };
 
 test "normWeightForHead rejects invalid norm shape" {
