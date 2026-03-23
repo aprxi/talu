@@ -96,7 +96,7 @@ deps:
 	@test -f deps/freetype/build/libfreetype.a || $(MAKE) freetype-build
 	@test -f deps/pdfium/cmake-build/libpdfium.a || $(MAKE) pdfium-build
 ifeq ($(UNAME_S),Darwin)
-	@test -f deps/mlx/lib/libmlx.a || $(MAKE) mlx-build
+	@{ test -f deps/mlx/lib/libmlx.a && test -f deps/mlx/lib/mlx.metallib; } || $(MAKE) mlx-build
 endif
 
 mbedtls-build:
@@ -124,7 +124,7 @@ endif
 
 mlx-build:
 	@echo "Building MLX static library..."
-	@test -d deps/mlx-src || git clone --branch v0.30.1 --depth 1 https://github.com/ml-explore/mlx.git deps/mlx-src
+	@test -d deps/mlx-src || git clone --branch v0.31.1 --depth 1 https://github.com/ml-explore/mlx.git deps/mlx-src
 	@rm -rf deps/mlx-src/build
 	@mkdir -p deps/mlx-src/build
 	@cd deps/mlx-src/build && cmake .. \
@@ -141,9 +141,10 @@ mlx-build:
 	@echo "Installing MLX to deps/mlx..."
 	@mkdir -p deps/mlx/lib deps/mlx/include
 	@cp deps/mlx-src/build/libmlx.a deps/mlx/lib/
+	@cp deps/mlx-src/build/mlx/backend/metal/kernels/mlx.metallib deps/mlx/lib/
 	@rm -rf deps/mlx/include/mlx
 	@cp -r deps/mlx-src/mlx deps/mlx/include/
-	@echo "MLX v0.30.1 (JIT mode) installed to deps/mlx/"
+	@echo "MLX v0.31.1 (JIT mode) installed to deps/mlx/"
 
 curl-build:
 	@echo "Building libcurl with CMake (HTTP-only, minimal)..."

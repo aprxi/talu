@@ -1176,7 +1176,11 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.layers[layer_idx].mamba_dt_bias = try tensorToArray(bias);
                 }
                 if (mamba_block.weights.norm_weight) |norm_w| {
-                    weight_handles.layers[layer_idx].mamba_norm_weight = try loadNormWeight(norm_w);
+                    var norm_arr = try loadNormWeight(norm_w);
+                    if (weight_handles.has_norm_weight_offset) {
+                        norm_arr = try addOnePersistent(norm_arr);
+                    }
+                    weight_handles.layers[layer_idx].mamba_norm_weight = norm_arr;
                 }
 
                 const core_quantized = isGroupedAffineDType(mamba_block.weights.in_proj.dtype) and
@@ -1253,7 +1257,11 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.layers[layer_idx].gated_delta_dt_bias = try tensorToArray(bias);
                 }
                 if (gated_delta_block.weights.norm_weight) |norm_w| {
-                    weight_handles.layers[layer_idx].gated_delta_norm_weight = try loadNormWeight(norm_w);
+                    var norm_arr = try loadNormWeight(norm_w);
+                    if (weight_handles.has_norm_weight_offset) {
+                        norm_arr = try addOnePersistent(norm_arr);
+                    }
+                    weight_handles.layers[layer_idx].gated_delta_norm_weight = norm_arr;
                 }
 
                 const core_quantized = isGroupedAffineDType(gated_delta_block.weights.in_proj.dtype) and

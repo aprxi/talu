@@ -1295,6 +1295,7 @@ pub fn build(b: *std.Build) void {
             .root_module = bench_cpu_compute_mod,
         });
         linkCDependencies(b, bench_cpu_compute_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
+        addMetalSupport(b, bench_cpu_compute_mod, bench_cpu_compute_exe, enable_metal);
         b.installArtifact(bench_cpu_compute_exe);
 
         const run_bench_cpu_compute = b.addRunArtifact(bench_cpu_compute_exe);

@@ -249,6 +249,80 @@ export fn mlx_scaled_dot_product_attention(
     );
 }
 
+// ============================================================================
+// BF16 dense-weight matmul for CPU-backend prefill acceleration
+// ============================================================================
+//
+// Used by the CPU inference backend's prefill path on macOS to offload large
+// GEMM to the GPU without involving the Metal inference backend.  The CPU
+// backend remains the sole inference orchestrator; only the matrix multiply
+// compute is delegated here.
+//
+// C = A @ W^T
+//   A: [m, k]  f32  — activations (CPU memory)
+//   W: [n, k]  bf16 — weights, out-dim-major (CPU/mmap memory)
+//   C: [m, n]  f32  — output (CPU memory)
+
+fn mlx_matmul_bf16_transw_impl(
+    a_data: [*]const f32,
+    m: usize,
+    k: usize,
+    b_data: *const anyopaque, // BF16 weights [n, k]
+    n: usize,
+    c_data: [*]f32,
+) bool {
+    const a_shape = [_]usize{ m, k };
+    const a_array = mlx_graph.mlx_array_from_float32(a_data, &a_shape, 2);
+    defer mlx_graph.mlx_array_free(a_array);
+
+    // Weights stored [n, k] (out-dim major); transpose to [k, n] for matmul.
+    const w_shape = [_]usize{ n, k };
+    const w_array = mlx_graph.mlx_array_from_bfloat16(b_data, &w_shape, 2);
+    defer mlx_graph.mlx_array_free(w_array);
+
+    const axes = [_]usize{ 1, 0 };
+    const w_t = mlx_graph.mlx_lazy_transpose(w_array, &axes, 2);
+    defer mlx_graph.mlx_array_free(w_t);
+
+    // [m, k] @ [k, n] = [m, n]
+    const result = mlx_graph.mlx_lazy_matmul(a_array, w_t);
+    defer mlx_graph.mlx_array_free(result);
+
+    var handles = [_]mlx_graph.ArrayHandle{result};
+    mlx_graph.mlx_eval(&handles, 1);
+    mlx_graph.mlx_array_to_float32(result, c_data, m * n);
+
+    return true;
+}
+
+export fn mlx_matmul_bf16_transw(
+    a_data: [*]const f32,
+    m: usize,
+    k: usize,
+    b_data: *const anyopaque,
+    n: usize,
+    c_data: [*]f32,
+) bool {
+    return mlx_matmul_bf16_transw_impl(a_data, m, k, b_data, n, c_data);
+}
+
+/// BF16-weights prefill GEMM: C = A @ W^T.
+/// Returns true on success, false if MLX is unavailable or fails.
+/// Caller falls back to the CPU Accelerate/SIMD path on false.
+pub fn matmulBF16TransW(
+    a: []const f32,
+    m: usize,
+    k: usize,
+    b: []align(1) const u16,
+    n: usize,
+    c: []f32,
+) bool {
+    std.debug.assert(a.len >= m * k);
+    std.debug.assert(b.len >= n * k);
+    std.debug.assert(c.len >= m * n);
+    return mlx_matmul_bf16_transw(a.ptr, m, k, @ptrCast(b.ptr), n, c.ptr);
+}
+
 /// Grouped-affine u4 quantized matrix multiplication using Metal GPU (MLX backend).
 /// A: [m x k] f32
 /// B: [k x n] grouped-affine u4 (w_data + scales + biases)
