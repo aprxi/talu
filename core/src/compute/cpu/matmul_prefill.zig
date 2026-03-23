@@ -247,8 +247,10 @@ inline fn dequantU4Panel(
         var k_pos = k_start;
         while (k_pos < k_start + k_len) {
             const group_idx = k_pos / group;
-            const s: @Vector(VEC, f32) = @splat(scaleBiasToF32(scales_dtype, s_ptrs[col][group_idx]));
-            const b: @Vector(VEC, f32) = @splat(scaleBiasToF32(scales_dtype, b_ptrs[col][group_idx]));
+            // Nibble extraction always works in units of 8 (one u32 = 4 bytes = 8 nibbles),
+            // independent of the SIMD accumulator width (VEC).
+            const s8: @Vector(8, f32) = @splat(scaleBiasToF32(scales_dtype, s_ptrs[col][group_idx]));
+            const b8: @Vector(8, f32) = @splat(scaleBiasToF32(scales_dtype, b_ptrs[col][group_idx]));
 
             // How many elements left in this group?
             const group_end = (group_idx + 1) * group;
@@ -264,10 +266,10 @@ inline fn dequantU4Panel(
                 const pack_off = elem / 8;
                 const nibs = extract32NibblesToFloat(w_ptr + pack_off);
                 const s_out = scratch[col * K_TILE + out_idx ..];
-                s_out[0..VEC].* = @mulAdd(@Vector(VEC, f32), nibs.n0, s, b);
-                s_out[VEC..][0..VEC].* = @mulAdd(@Vector(VEC, f32), nibs.n1, s, b);
-                s_out[2 * VEC ..][0..VEC].* = @mulAdd(@Vector(VEC, f32), nibs.n2, s, b);
-                s_out[3 * VEC ..][0..VEC].* = @mulAdd(@Vector(VEC, f32), nibs.n3, s, b);
+                s_out[0..8].* = @mulAdd(@Vector(8, f32), nibs.n0, s8, b8);
+                s_out[8..16].* = @mulAdd(@Vector(8, f32), nibs.n1, s8, b8);
+                s_out[16..24].* = @mulAdd(@Vector(8, f32), nibs.n2, s8, b8);
+                s_out[24..32].* = @mulAdd(@Vector(8, f32), nibs.n3, s8, b8);
                 out_idx += 32;
             }
 
@@ -275,7 +277,7 @@ inline fn dequantU4Panel(
             while (elem + 8 <= chunk_len) : (elem += 8) {
                 const pack_off = elem / 8;
                 const nibs_vec = extractNibbles(w_ptr[pack_off]);
-                scratch[col * K_TILE + out_idx ..][0..VEC].* = @mulAdd(@Vector(VEC, f32), nibs_vec, s, b);
+                scratch[col * K_TILE + out_idx ..][0..8].* = @mulAdd(@Vector(8, f32), nibs_vec, s8, b8);
                 out_idx += 8;
             }
 
