@@ -21,6 +21,8 @@ const cpu_norm = compute.cpu.normalization;
 const cpu_rotary = compute.cpu.rotary;
 const parallel = @import("../../../../system/parallel.zig");
 const rope_kernel = @import("rope.zig");
+const kv_cache_module = @import("kv_cache.zig");
+const QuantMode = kv_cache_module.QuantMode;
 const fmt = @import("describe_fmt.zig");
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
@@ -60,6 +62,9 @@ pub const AttnTemp = struct {
     qkv: []f32 = &.{},
     scores: []f32 = &.{},
     context_values: []f32 = &.{},
+    // Dequantized KV cache buffers for INT8 mode (one head at a time)
+    dequant_k: []f32 = &.{},
+    dequant_v: []f32 = &.{},
 
     pub fn deinit(self: *AttnTemp, allocator: std.mem.Allocator) void {
         _ = allocator; // Page-aligned buffers use page_allocator directly
@@ -69,9 +74,69 @@ pub const AttnTemp = struct {
         cpu_common.freePageAlignedF32Slice(self.qkv);
         cpu_common.freePageAlignedF32Slice(self.scores);
         cpu_common.freePageAlignedF32Slice(self.context_values);
+        cpu_common.freePageAlignedF32Slice(self.dequant_k);
+        cpu_common.freePageAlignedF32Slice(self.dequant_v);
         self.* = .{};
     }
 };
+
+/// Dequantize i8 KV cache data to f32 using SIMD.
+/// src: [num_positions * head_dim] i8 values
+/// scales: [num_positions] scale factors (one per position)
+/// dst: [num_positions * head_dim] f32 output
+/// dequantize: f32_val = i8_val * scale[position]
+fn dequantizeKVHead(src: []const i8, scales: []const f32, dst: []f32, num_positions: usize, head_dim: usize) void {
+    std.debug.assert(src.len >= num_positions * head_dim);
+    std.debug.assert(scales.len >= num_positions);
+    std.debug.assert(dst.len >= num_positions * head_dim);
+
+    // SIMD: process 16 i8 values → 16 f32 values per iteration
+    const vec_len = 16;
+
+    for (0..num_positions) |pos| {
+        const scale = scales[pos];
+        const scale_vec: @Vector(4, f32) = @splat(scale);
+        const src_row = src[pos * head_dim ..][0..head_dim];
+        const dst_row = dst[pos * head_dim ..][0..head_dim];
+
+        var i: usize = 0;
+        // Main SIMD loop: process 16 i8 at a time
+        while (i + vec_len <= head_dim) : (i += vec_len) {
+            // Load 16 i8 values
+            const i8_vec: @Vector(vec_len, i8) = src_row[i..][0..vec_len].*;
+
+            // Process in 4 groups of 4 to convert i8 → f32
+            // Group 0: elements 0-3
+            const i8_0: @Vector(4, i8) = .{ i8_vec[0], i8_vec[1], i8_vec[2], i8_vec[3] };
+            const i32_0: @Vector(4, i32) = i8_0;
+            const f32_0: @Vector(4, f32) = @floatFromInt(i32_0);
+            dst_row[i..][0..4].* = f32_0 * scale_vec;
+
+            // Group 1: elements 4-7
+            const i8_1: @Vector(4, i8) = .{ i8_vec[4], i8_vec[5], i8_vec[6], i8_vec[7] };
+            const i32_1: @Vector(4, i32) = i8_1;
+            const f32_1: @Vector(4, f32) = @floatFromInt(i32_1);
+            dst_row[i + 4 ..][0..4].* = f32_1 * scale_vec;
+
+            // Group 2: elements 8-11
+            const i8_2: @Vector(4, i8) = .{ i8_vec[8], i8_vec[9], i8_vec[10], i8_vec[11] };
+            const i32_2: @Vector(4, i32) = i8_2;
+            const f32_2: @Vector(4, f32) = @floatFromInt(i32_2);
+            dst_row[i + 8 ..][0..4].* = f32_2 * scale_vec;
+
+            // Group 3: elements 12-15
+            const i8_3: @Vector(4, i8) = .{ i8_vec[12], i8_vec[13], i8_vec[14], i8_vec[15] };
+            const i32_3: @Vector(4, i32) = i8_3;
+            const f32_3: @Vector(4, f32) = @floatFromInt(i32_3);
+            dst_row[i + 12 ..][0..4].* = f32_3 * scale_vec;
+        }
+
+        // Scalar tail for remaining elements (if head_dim not divisible by 16)
+        while (i < head_dim) : (i += 1) {
+            dst_row[i] = @as(f32, @floatFromInt(src_row[i])) * scale;
+        }
+    }
+}
 
 /// Per-layer KV cache (must persist across calls).
 ///
@@ -1120,9 +1185,72 @@ pub const MultiHeadAttention = struct {
 
             const active_len = kv_sequence_len - start_kv_index;
 
-            // Use GQA-optimized batched BLAS for longer contexts
+            // Check KV cache quantization mode
+            const use_int8 = cache.quant_mode == .int8;
+
+            // Full INT8 mode: use GQA-optimized path that dequants V once per KV head
+            // This amortizes the V dequant cost across heads_per_kv_group Q heads
+            if (use_int8) {
+                const DecodeKVGroupI8Ctx = struct {
+                    query_values: []const f32,
+                    context_values: []f32,
+                    cache: *BatchedKVCache,
+                    slot_index: usize,
+                    sinks: ?[]const f32,
+                    head_dim: usize,
+                    heads_per_kv_group: usize,
+                    kv_sequence_len: usize,
+                    start_kv_index: usize,
+                    scale: f32,
+
+                    fn processKVGroup(start_group: usize, end_group: usize, ctx: *@This()) void {
+                        for (start_group..end_group) |kv_head_idx| {
+                            // K is INT8 with scales, V is f32
+                            const k_cache_head_i8 = ctx.cache.getKHeadI8(ctx.slot_index, kv_head_idx);
+                            const k_scales = ctx.cache.getKScales(ctx.slot_index, kv_head_idx);
+                            const v_cache_head = ctx.cache.getVHead(ctx.slot_index, kv_head_idx);
+
+                            const first_q_head = kv_head_idx * ctx.heads_per_kv_group;
+                            const queries = ctx.query_values[first_q_head * ctx.head_dim ..][0 .. ctx.heads_per_kv_group * ctx.head_dim];
+                            const outputs = ctx.context_values[first_q_head * ctx.head_dim ..][0 .. ctx.heads_per_kv_group * ctx.head_dim];
+
+                            // K-only INT8: SDOT for Q @ K^T, BLAS for scores @ V (f32)
+                            cpu_sdpa.computeFlashDecodeGQA_I8(
+                                queries,
+                                k_cache_head_i8,
+                                k_scales,
+                                v_cache_head,
+                                outputs,
+                                ctx.heads_per_kv_group,
+                                ctx.start_kv_index,
+                                ctx.kv_sequence_len,
+                                ctx.head_dim,
+                                ctx.scale,
+                                ctx.sinks,
+                                first_q_head,
+                            );
+                        }
+                    }
+                };
+
+                var decode_ctx_i8 = DecodeKVGroupI8Ctx{
+                    .query_values = query_values,
+                    .context_values = context_values,
+                    .cache = cache,
+                    .slot_index = slot_index,
+                    .sinks = self.sinks,
+                    .head_dim = head_dim,
+                    .heads_per_kv_group = heads_per_kv_group,
+                    .kv_sequence_len = kv_sequence_len,
+                    .start_kv_index = start_kv_index,
+                    .scale = scale,
+                };
+
+                parallel.global().parallelFor(n_kv_heads, DecodeKVGroupI8Ctx.processKVGroup, &decode_ctx_i8);
+            }
+            // Use GQA-optimized batched BLAS for longer contexts (f32 mode only)
             // This batches Q @ K^T for all queries sharing the same KV head
-            if (active_len >= 128 and !exact_softmax and n_kv_heads >= 4) {
+            else if (active_len >= 128 and !exact_softmax and n_kv_heads >= 4) {
                 const DecodeKVGroupCtx = struct {
                     query_values: []const f32,
                     context_values: []f32,
@@ -1560,30 +1688,65 @@ pub const MultiHeadAttention = struct {
             const scores_base = score_values[scores_base_offset .. scores_base_offset + (n_heads * score_stride)];
             const context_base = context_values[batch_index * query_dim ..][0..query_dim];
 
+            // Check KV cache quantization mode
+            const use_int8 = cache.quant_mode == .int8;
+
             for (0..n_kv_heads) |kv_head_idx| {
-                const k_cache_head = cache.getKHead(slot_index, kv_head_idx);
-                const v_cache_head = cache.getVHead(slot_index, kv_head_idx);
                 const q_head_start = kv_head_idx * heads_per_kv_group;
                 const q_head_end = q_head_start + heads_per_kv_group;
 
-                for (q_head_start..q_head_end) |head_index| {
-                    const query_head = query_row[head_index * head_dim ..][0..head_dim];
-                    const scores_for_head = scores_base[head_index * score_stride ..][0..kv_sequence_len];
-                    const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                    const context_for_head = context_base[head_index * head_dim ..][0..head_dim];
-                    cpu_sdpa.computeMaskedRowWeightedSum(
-                        query_head,
-                        k_cache_head,
-                        v_cache_head,
-                        scores_for_head,
-                        context_for_head,
-                        start_kv_index,
-                        kv_sequence_len,
-                        head_dim,
-                        scale,
-                        sink_logit,
-                        exact_softmax,
-                    );
+                if (use_int8) {
+                    // K-only INT8 path: SDOT for Q @ K^T, BLAS for scores @ V (f32)
+                    const k_cache_head_i8 = cache.getKHeadI8(slot_index, kv_head_idx);
+                    const k_scales = cache.getKScales(slot_index, kv_head_idx);
+                    const v_cache_head = cache.getVHead(slot_index, kv_head_idx);
+
+                    for (q_head_start..q_head_end) |head_index| {
+                        const query_head = query_row[head_index * head_dim ..][0..head_dim];
+                        const scores_for_head = scores_base[head_index * score_stride ..][0..kv_sequence_len];
+                        const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
+                        const context_for_head = context_base[head_index * head_dim ..][0..head_dim];
+
+                        cpu_sdpa.computeMaskedRowWeightedSumI8(
+                            query_head,
+                            k_cache_head_i8,
+                            k_scales,
+                            v_cache_head,
+                            scores_for_head,
+                            context_for_head,
+                            start_kv_index,
+                            kv_sequence_len,
+                            head_dim,
+                            scale,
+                            sink_logit,
+                            exact_softmax,
+                        );
+                    }
+                } else {
+                    // f32 path
+                    const k_cache_head = cache.getKHead(slot_index, kv_head_idx);
+                    const v_cache_head = cache.getVHead(slot_index, kv_head_idx);
+
+                    for (q_head_start..q_head_end) |head_index| {
+                        const query_head = query_row[head_index * head_dim ..][0..head_dim];
+                        const scores_for_head = scores_base[head_index * score_stride ..][0..kv_sequence_len];
+                        const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
+                        const context_for_head = context_base[head_index * head_dim ..][0..head_dim];
+
+                        cpu_sdpa.computeMaskedRowWeightedSum(
+                            query_head,
+                            k_cache_head,
+                            v_cache_head,
+                            scores_for_head,
+                            context_for_head,
+                            start_kv_index,
+                            kv_sequence_len,
+                            head_dim,
+                            scale,
+                            sink_logit,
+                            exact_softmax,
+                        );
+                    }
                 }
             }
         }
@@ -1927,31 +2090,65 @@ fn forwardBatchedDecode(
         const scores_base = scratch.getScores(batch_index, n_heads, max_seq_len);
         const context_base = scratch.getContext(batch_index, query_dim);
 
-        for (0..n_kv_heads) |kv_head_idx| {
-            const k_cache_head = cache.getKHead(slot_index, kv_head_idx);
-            const v_cache_head = cache.getVHead(slot_index, kv_head_idx);
+        // Check KV cache quantization mode
+        const use_int8 = cache.quant_mode == .int8;
 
+        for (0..n_kv_heads) |kv_head_idx| {
             const q_head_start = kv_head_idx * heads_per_kv_group;
             const q_head_end = q_head_start + heads_per_kv_group;
 
-            for (q_head_start..q_head_end) |head_index| {
-                const query_head = query_buffer[head_index * head_dim ..][0..head_dim];
-                const scores_for_head = scores_base[head_index * max_seq_len ..][0..kv_sequence_len];
-                const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                const context_for_head = context_base[head_index * head_dim ..][0..head_dim];
-                cpu_sdpa.computeMaskedRowWeightedSum(
-                    query_head,
-                    k_cache_head,
-                    v_cache_head,
-                    scores_for_head,
-                    context_for_head,
-                    start_kv_index,
-                    kv_sequence_len,
-                    head_dim,
-                    scale,
-                    sink_logit,
-                    false,
-                );
+            if (use_int8) {
+                // K-only INT8 path: SDOT for Q @ K^T, BLAS for scores @ V (f32)
+                const k_cache_head_i8 = cache.getKHeadI8(slot_index, kv_head_idx);
+                const k_scales = cache.getKScales(slot_index, kv_head_idx);
+                const v_cache_head = cache.getVHead(slot_index, kv_head_idx);
+
+                for (q_head_start..q_head_end) |head_index| {
+                    const query_head = query_buffer[head_index * head_dim ..][0..head_dim];
+                    const scores_for_head = scores_base[head_index * max_seq_len ..][0..kv_sequence_len];
+                    const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
+                    const context_for_head = context_base[head_index * head_dim ..][0..head_dim];
+
+                    cpu_sdpa.computeMaskedRowWeightedSumI8(
+                        query_head,
+                        k_cache_head_i8,
+                        k_scales,
+                        v_cache_head,
+                        scores_for_head,
+                        context_for_head,
+                        start_kv_index,
+                        kv_sequence_len,
+                        head_dim,
+                        scale,
+                        sink_logit,
+                        false,
+                    );
+                }
+            } else {
+                // f32 path
+                const k_cache_head = cache.getKHead(slot_index, kv_head_idx);
+                const v_cache_head = cache.getVHead(slot_index, kv_head_idx);
+
+                for (q_head_start..q_head_end) |head_index| {
+                    const query_head = query_buffer[head_index * head_dim ..][0..head_dim];
+                    const scores_for_head = scores_base[head_index * max_seq_len ..][0..kv_sequence_len];
+                    const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
+                    const context_for_head = context_base[head_index * head_dim ..][0..head_dim];
+
+                    cpu_sdpa.computeMaskedRowWeightedSum(
+                        query_head,
+                        k_cache_head,
+                        v_cache_head,
+                        scores_for_head,
+                        context_for_head,
+                        start_kv_index,
+                        kv_sequence_len,
+                        head_dim,
+                        scale,
+                        sink_logit,
+                        false,
+                    );
+                }
             }
         }
 

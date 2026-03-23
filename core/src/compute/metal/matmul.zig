@@ -19,6 +19,29 @@ extern fn metal_matmul_f32(
     c: [*]f32,
 ) bool;
 
+extern fn metal_matmul_f32_transB_scaled(
+    device: *MetalDevice,
+    a: [*]const f32,
+    m: usize,
+    k: usize,
+    b: [*]const f32,
+    n: usize,
+    c: [*]f32,
+    alpha: f32,
+) bool;
+
+extern fn metal_matmul_f32_i8_transB_scaled(
+    device: *MetalDevice,
+    a: [*]const f32,
+    m: usize,
+    k: usize,
+    b: [*]const i8,
+    n: usize,
+    b_scales: [*]const f32,
+    c: [*]f32,
+    alpha: f32,
+) bool;
+
 /// F32 matrix multiplication: C = A @ B.
 /// A: [m x k], B: [k x n], C: [m x n].
 pub fn matmulF32(
@@ -42,6 +65,73 @@ pub fn matmulF32(
         b.ptr,
         n,
         c.ptr,
+    );
+
+    if (!success) return error.MetalMatmulFailed;
+}
+
+/// F32 matrix multiplication with transposed B and scaling: C = alpha * A @ B^T.
+/// A: [m x k], B: [n x k] (stored row-major, will be transposed), C: [m x n].
+/// Optimized for attention: Q @ K^T where Q=[queries, head_dim], K=[history, head_dim].
+pub fn matmulF32TransBScaled(
+    device: *device_mod.Device,
+    a: []const f32,
+    m: usize,
+    k: usize,
+    b: []const f32,
+    n: usize,
+    c: []f32,
+    alpha: f32,
+) !void {
+    std.debug.assert(a.len >= m * k);
+    std.debug.assert(b.len >= n * k);
+    std.debug.assert(c.len >= m * n);
+
+    const success = metal_matmul_f32_transB_scaled(
+        device.handle,
+        a.ptr,
+        m,
+        k,
+        b.ptr,
+        n,
+        c.ptr,
+        alpha,
+    );
+
+    if (!success) return error.MetalMatmulFailed;
+}
+
+/// F32 Q × I8 K matrix multiplication with dequant: C = alpha * A @ dequant(B)^T.
+/// A: [m x k] f32 (queries)
+/// B: [n x k] i8 (keys, will be dequantized and transposed)
+/// B_scales: [n] f32 (per-row scales for K)
+/// C: [m x n] f32 (output scores)
+pub fn matmulF32I8TransBScaled(
+    device: *device_mod.Device,
+    a: []const f32,
+    m: usize,
+    k: usize,
+    b: []const i8,
+    n: usize,
+    b_scales: []const f32,
+    c: []f32,
+    alpha: f32,
+) !void {
+    std.debug.assert(a.len >= m * k);
+    std.debug.assert(b.len >= n * k);
+    std.debug.assert(b_scales.len >= n);
+    std.debug.assert(c.len >= m * n);
+
+    const success = metal_matmul_f32_i8_transB_scaled(
+        device.handle,
+        a.ptr,
+        m,
+        k,
+        b.ptr,
+        n,
+        b_scales.ptr,
+        c.ptr,
+        alpha,
     );
 
     if (!success) return error.MetalMatmulFailed;
@@ -137,8 +227,7 @@ test "matmulGaffineU4 computes quantized matrix product" {
 
     var c: [m * n]f32 = undefined;
 
-    matmulGaffineU4(&device, &a, m, k, &b_data, &b_scales, &b_biases, n, group_size, &c) catch |err| {
-        _ = err;
+    matmulGaffineU4(&device, &a, m, k, &b_data, &b_scales, &b_biases, n, group_size, &c) catch {
         return;
     };
 
@@ -153,4 +242,70 @@ test "matmulGaffineU4 computes quantized matrix product" {
     try std.testing.expectApproxEqAbs(c[0], c[3], 0.1);
     // Row 1 should be ~2x row 0 (input is 2x)
     try std.testing.expectApproxEqAbs(c[4], c[0] * 2.0, c[0] * 0.1);
+}
+
+test "matmulF32TransBScaled matches CPU reference" {
+    if (comptime builtin.os.tag != .macos) return;
+
+    var device = device_mod.Device.init() catch return;
+    defer device.deinit();
+
+    // Realistic attention dimensions: Q @ K^T
+    // Q: [m, k] = [2, 128] (2 queries, head_dim=128)
+    // K: [n, k] = [512, 128] (512 history tokens, head_dim=128)
+    // C: [m, n] = [2, 512] (attention scores)
+    const m: usize = 2;
+    const k: usize = 128;
+    const n: usize = 512;
+    const alpha: f32 = 1.0 / @sqrt(@as(f32, 128.0)); // typical scale
+
+    // Use page-aligned allocator for zero-copy potential
+    const page_alloc = std.heap.page_allocator;
+
+    const a = page_alloc.alloc(f32, m * k) catch return;
+    defer page_alloc.free(a);
+    const b = page_alloc.alloc(f32, n * k) catch return;
+    defer page_alloc.free(b);
+    const c_metal = page_alloc.alloc(f32, m * n) catch return;
+    defer page_alloc.free(c_metal);
+    const c_cpu = page_alloc.alloc(f32, m * n) catch return;
+    defer page_alloc.free(c_cpu);
+
+    // Initialize with deterministic values
+    var rng = std.Random.DefaultPrng.init(42);
+    for (a) |*v| v.* = rng.random().float(f32) * 2.0 - 1.0;
+    for (b) |*v| v.* = rng.random().float(f32) * 2.0 - 1.0;
+
+    // Metal computation: C = alpha * A @ B^T
+    matmulF32TransBScaled(&device, a, m, k, b, n, c_metal, alpha) catch |err| {
+        std.debug.print("Metal matmul failed: {}\n", .{err});
+        return;
+    };
+
+    // CPU reference: C[i,j] = alpha * sum_l(A[i,l] * B[j,l])
+    for (0..m) |i| {
+        for (0..n) |j| {
+            var sum: f32 = 0.0;
+            for (0..k) |l| {
+                sum += a[i * k + l] * b[j * k + l];
+            }
+            c_cpu[i * n + j] = alpha * sum;
+        }
+    }
+
+    // Compare Metal vs CPU
+    var max_diff: f32 = 0.0;
+    var max_rel_diff: f32 = 0.0;
+    for (0..m * n) |i| {
+        const diff = @abs(c_metal[i] - c_cpu[i]);
+        const rel = if (@abs(c_cpu[i]) > 1e-6) diff / @abs(c_cpu[i]) else diff;
+        max_diff = @max(max_diff, diff);
+        max_rel_diff = @max(max_rel_diff, rel);
+    }
+
+    std.debug.print("\nMetal vs CPU: max_abs_diff={d:.6}, max_rel_diff={d:.6}\n", .{ max_diff, max_rel_diff });
+
+    // Tolerance: allow small floating point differences
+    try std.testing.expect(max_diff < 1e-4);
+    try std.testing.expect(max_rel_diff < 1e-4);
 }

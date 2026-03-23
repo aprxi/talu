@@ -35,6 +35,77 @@ const cblas = if (available) struct {
     ) void;
 } else struct {};
 
+/// Perform f32 matrix multiplication with accumulation.
+/// C = alpha * A @ B + beta * C where A is [M x K], B is [K x N], C is [M x N]
+/// All matrices are row-major.
+pub fn sgemmScaled(
+    a: []const f32,
+    b: []const f32,
+    c: []f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    beta: f32,
+) void {
+    if (comptime !available) {
+        @compileError("Apple Accelerate not available on this platform");
+    }
+
+    cblas.cblas_sgemm(
+        cblas.CblasRowMajor,
+        cblas.CblasNoTrans,
+        cblas.CblasNoTrans,
+        @intCast(m),
+        @intCast(n),
+        @intCast(k),
+        alpha,
+        a.ptr,
+        @intCast(k), // lda = K for row-major A
+        b.ptr,
+        @intCast(n), // ldb = N for row-major B
+        beta,
+        c.ptr,
+        @intCast(n), // ldc = N for row-major C
+    );
+}
+
+/// Perform f32 matrix multiplication with custom A stride.
+/// C = alpha * A @ B + beta * C where A is [M x K] with leading dimension lda.
+/// Useful when A has larger stride (e.g., accessing submatrix of larger matrix).
+pub fn sgemmScaledStrided(
+    a: []const f32,
+    b: []const f32,
+    c: []f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize, // Leading dimension of A (stride between rows)
+    alpha: f32,
+    beta: f32,
+) void {
+    if (comptime !available) {
+        @compileError("Apple Accelerate not available on this platform");
+    }
+
+    cblas.cblas_sgemm(
+        cblas.CblasRowMajor,
+        cblas.CblasNoTrans,
+        cblas.CblasNoTrans,
+        @intCast(m),
+        @intCast(n),
+        @intCast(k),
+        alpha,
+        a.ptr,
+        @intCast(lda), // Custom lda for strided access
+        b.ptr,
+        @intCast(n), // ldb = N for row-major B
+        beta,
+        c.ptr,
+        @intCast(n), // ldc = N for row-major C
+    );
+}
+
 /// Perform f32 matrix multiplication using Apple Accelerate.
 /// C = A @ B where A is [M x K], B is [K x N], C is [M x N]
 /// All matrices are row-major.
