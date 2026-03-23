@@ -99,9 +99,17 @@ impl StreamCtx {
 pub(super) fn reasoning_text_for_item(conv: &impl ResponsesView, index: usize) -> Result<String> {
     let reasoning = conv.get_reasoning(index)?;
     let mut out = String::new();
+    // Content parts (populated by direct generation).
     for part_index in 0..reasoning.content_count {
         let part = conv.get_reasoning_content(index, part_index)?;
         out.push_str(&part.data_utf8_lossy());
+    }
+    // Fall back to summary parts (populated by load_responses_json).
+    if out.is_empty() {
+        for part_index in 0..reasoning.summary_count {
+            let part = conv.get_reasoning_summary(index, part_index)?;
+            out.push_str(&part.data_utf8_lossy());
+        }
     }
     Ok(out)
 }
@@ -715,6 +723,158 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     let backend = InferenceBackend::new_with_progress(&resolved_model, callback)?;
     if let Ok(mut ctx) = progress_ctx.lock() {
         ctx.finish();
+    }
+
+    // Batched completions: submit N requests to the batch scheduler.
+    let n_completions = args.completions;
+    if n_completions > 1 {
+        let batch = talu::batch::BatchHandle::new(&backend, None)?;
+        let mut request_ids: Vec<(u64, ChatHandle)> = Vec::new();
+        for i in 0..n_completions {
+            let chat_i = ChatHandle::new(if system_msg.is_empty() {
+                None
+            } else {
+                Some(system_msg.as_str())
+            })?;
+            chat_i.append_user_message(&prompt)?;
+            let mut cfg_i = talu::router::GenerateConfig {
+                max_tokens: cfg.max_tokens,
+                temperature: cfg.temperature,
+                top_k: cfg.top_k,
+                top_p: cfg.top_p,
+                min_p: cfg.min_p,
+                repetition_penalty: cfg.repetition_penalty,
+                presence_penalty: cfg.presence_penalty,
+                frequency_penalty: cfg.frequency_penalty,
+                seed: cfg.seed.wrapping_add(i as u64),
+                raw_output: cfg.raw_output,
+                ..Default::default()
+            };
+            if no_chat {
+                cfg_i.template_override = Some("{{ messages[-1].content }}".to_string());
+            }
+            let rid = batch.submit(&chat_i, &cfg_i)?;
+            request_ids.push((rid, chat_i));
+        }
+
+        // Run decode loop, collect events as segments per request (by item_type/content_type).
+        // This mirrors the server's batch path — segments are later converted to responses JSON
+        // and loaded into each ChatHandle so the responses API handles reasoning/message display.
+        struct Segment {
+            item_type: u8,
+            content_type: u8,
+            text: String,
+        }
+        let mut per_request_segments: Vec<Vec<Segment>> =
+            (0..n_completions).map(|_| Vec::new()).collect();
+        let pending = std::sync::atomic::AtomicBool::new(false);
+        batch.run_loop(&pending, |event| {
+            if let Some(idx) = request_ids.iter().position(|(id, _)| *id == event.request_id) {
+                if !event.text.is_empty() {
+                    let segs = &mut per_request_segments[idx];
+                    let needs_new = segs.last().map_or(true, |s| {
+                        s.item_type != event.item_type || s.content_type != event.content_type
+                    });
+                    if needs_new {
+                        segs.push(Segment {
+                            item_type: event.item_type,
+                            content_type: event.content_type,
+                            text: event.text.clone(),
+                        });
+                    } else if let Some(last) = segs.last_mut() {
+                        last.text.push_str(&event.text);
+                    }
+                }
+            }
+        })?;
+
+        // Display results. Format segments with ANSI like the streaming path.
+        for (i, (rid, chat_i)) in request_ids.iter().enumerate() {
+            let segments = &per_request_segments[i];
+
+            eprintln!("\n--- Completion {} ---", i + 1);
+
+            if use_json {
+                // JSON mode: build responses JSON from segments, load into chat, serialize.
+                let mut items: Vec<serde_json::Value> = Vec::new();
+                let mut si = 0;
+                while si < segments.len() {
+                    match segments[si].item_type {
+                        0 => {
+                            let mut parts = Vec::new();
+                            while si < segments.len() && segments[si].item_type == 0 {
+                                parts.push(serde_json::json!({
+                                    "type": "output_text", "text": segments[si].text
+                                }));
+                                si += 1;
+                            }
+                            items.push(serde_json::json!({
+                                "type": "message", "role": "assistant", "content": parts
+                            }));
+                        }
+                        3 => {
+                            let mut text = String::new();
+                            while si < segments.len() && segments[si].item_type == 3 {
+                                text.push_str(&segments[si].text);
+                                si += 1;
+                            }
+                            items.push(serde_json::json!({
+                                "type": "reasoning",
+                                "summary": [{"type": "summary_text", "text": text}]
+                            }));
+                        }
+                        _ => { si += 1; }
+                    }
+                }
+                if !items.is_empty() {
+                    let output_json = serde_json::to_string(&items)?;
+                    chat_i.load_responses_json(&output_json)?;
+                }
+                let json = chat_i.to_responses_json(1)?;
+                println!("{}", json);
+            } else {
+                // Text mode: format segments with ANSI like the streaming path.
+                let mut in_reasoning = false;
+                for seg in segments {
+                    let is_reasoning = seg.item_type == 3;
+                    if hide_thinking && is_reasoning {
+                        continue;
+                    }
+                    if !raw_output {
+                        if is_reasoning && !in_reasoning {
+                            let _ = io::stdout().write_all(b"\x1b[2;3m");
+                        } else if !is_reasoning && in_reasoning {
+                            let _ = io::stdout().write_all(b"\x1b[0m");
+                        }
+                        in_reasoning = is_reasoning;
+                    }
+                    let _ = io::stdout().write_all(seg.text.as_bytes());
+                }
+                if !raw_output && in_reasoning {
+                    let _ = io::stdout().write_all(b"\x1b[0m");
+                }
+                let _ = io::stdout().write_all(b"\n");
+                let _ = io::stdout().flush();
+            }
+
+            if !quiet && !silent {
+                if let Some(result) = batch.take_result(*rid) {
+                    let tok_per_sec = if result.generation_ns > 0 {
+                        (result.completion_tokens as f64)
+                            / (result.generation_ns as f64 / 1_000_000_000.0)
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "[{:.1} tok/s | {} tokens | {:.2}s]",
+                        tok_per_sec,
+                        result.completion_tokens,
+                        result.generation_ns as f64 / 1_000_000_000.0
+                    );
+                }
+            }
+        }
+        return Ok(());
     }
 
     if no_stream {

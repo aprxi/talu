@@ -19,6 +19,7 @@ const io = @import("../../io/root.zig");
 const responses_mod = @import("../../responses/root.zig");
 const Conversation = responses_mod.Conversation;
 const ContentType = responses_mod.ContentType;
+const ItemType = responses_mod.ItemType;
 const MessageRole = responses_mod.MessageRole;
 
 /// Parse OpenResponses input JSON into a Conversation.
@@ -76,6 +77,8 @@ fn parseItem(conv: *Conversation, value: std.json.Value) !void {
         try parseFunctionCallOutput(conv, obj);
     } else if (std.mem.eql(u8, type_str, "item_reference")) {
         try parseItemReference(conv, obj);
+    } else if (std.mem.eql(u8, type_str, "reasoning")) {
+        try parseReasoning(conv, obj);
     } else {
         // Unknown type — skip rather than fail, for forward compatibility
     }
@@ -209,6 +212,28 @@ fn parseFunctionCallOutput(conv: *Conversation, obj: std.json.ObjectMap) !void {
     _ = try conv.appendFunctionCallOutput(call_id, output);
 }
 
+fn parseReasoning(conv: *Conversation, obj: std.json.ObjectMap) !void {
+    const item = try conv.appendReasoning();
+    if (obj.get("summary")) |summary_value| {
+        const parts = switch (summary_value) {
+            .array => |a| a,
+            else => return error.InvalidJson,
+        };
+        for (parts.items) |part_value| {
+            const part_obj = switch (part_value) {
+                .object => |o| o,
+                else => return error.InvalidJson,
+            };
+            const text = switch (part_obj.get("text") orelse return error.InvalidJson) {
+                .string => |s| s,
+                else => return error.InvalidJson,
+            };
+            try conv.addReasoningSummary(item, text);
+        }
+    }
+    conv.finalizeItem(item);
+}
+
 fn parseItemReference(conv: *Conversation, obj: std.json.ObjectMap) !void {
     const id = switch (obj.get("id") orelse return error.InvalidJson) {
         .string => |s| s,
@@ -313,6 +338,43 @@ test "parse unknown type is skipped" {
         \\  {"type": "unknown_future_type", "data": "whatever"},
         \\  {"type": "message", "role": "user", "content": "Hi"}
         \\]
+    ;
+
+    try parse(conv, json);
+    try std.testing.expectEqual(@as(usize, 1), conv.len());
+}
+
+test "parse reasoning item with summary" {
+    const alloc = std.testing.allocator;
+    const conv = try Conversation.init(alloc);
+    defer conv.deinit();
+
+    const json =
+        \\[
+        \\  {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Let me think..."}]},
+        \\  {"type": "message", "role": "assistant", "content": "The answer is 4."}
+        \\]
+    ;
+
+    try parse(conv, json);
+    try std.testing.expectEqual(@as(usize, 2), conv.len());
+
+    // First item should be reasoning.
+    const item0 = conv.getItem(0).?;
+    try std.testing.expectEqual(ItemType.reasoning, item0.data.getType());
+
+    // Second item should be a message.
+    const item1 = conv.getItem(1).?;
+    try std.testing.expectEqual(ItemType.message, item1.data.getType());
+}
+
+test "parse reasoning item without summary" {
+    const alloc = std.testing.allocator;
+    const conv = try Conversation.init(alloc);
+    defer conv.deinit();
+
+    const json =
+        \\[{"type": "reasoning"}]
     ;
 
     try parse(conv, json);

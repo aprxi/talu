@@ -240,6 +240,10 @@ pub(super) struct AskArgs {
     #[arg(long, env = "SEED")]
     pub seed: Option<u64>,
 
+    /// Number of completions to generate (>1 uses batched decode)
+    #[arg(short = 'n', long = "completions", default_value = "1")]
+    pub completions: usize,
+
     /// Storage profile name
     #[arg(long, env = "TALU_PROFILE", default_value = "default")]
     pub profile: String,
