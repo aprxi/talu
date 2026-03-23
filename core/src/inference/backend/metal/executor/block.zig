@@ -492,6 +492,26 @@ pub const TransformerBlock = struct {
         // in the xray host-trace path without changing the observed tensor.
         mlx_graph.copyToHost(output, host_buf);
 
+        // CPU emits batched prefill tensors for gated-delta in/out projection
+        // checkpoints as one [1, seq, width] emission at position 0.
+        // Mirror that shape/position contract so verifier compares like-for-like.
+        const emit_batched_prefill = seq_len > 1 and (point == .gdelta_in_proj or point == .gdelta_out);
+        if (emit_batched_prefill) {
+            if (!trace.shouldEmitEmission(point, @intCast(state.layer_idx), 0)) return;
+            trace.emit(
+                point,
+                @intCast(state.layer_idx),
+                0,
+                0,
+                @ptrCast(host_buf.ptr),
+                .f32,
+                .{ 1, @intCast(seq_len), @intCast(width), 0 },
+                3,
+                kernel_name,
+            );
+            return;
+        }
+
         for (0..seq_len) |token_idx| {
             if (!trace.shouldEmitEmission(point, @intCast(state.layer_idx), @intCast(token_idx))) {
                 continue;

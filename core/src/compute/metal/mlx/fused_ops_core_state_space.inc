@@ -527,9 +527,9 @@ static inline GatedDeltaStaticTerms resolve_gated_delta_static_terms(
             throw std::invalid_argument("[gated_delta] norm_weight must be rank-1");
         }
         if (weights.shape(0) == d_head) {
-            terms.norm_weight_heads = broadcast_to(reshape(weights, {1, d_head}), {n_heads, d_head});
+            terms.norm_weight_heads = contiguous(broadcast_to(reshape(weights, {1, d_head}), {n_heads, d_head}));
         } else if (weights.shape(0) == d_inner) {
-            terms.norm_weight_heads = reshape(weights, {n_heads, d_head});
+            terms.norm_weight_heads = contiguous(reshape(weights, {n_heads, d_head}));
         } else {
             throw std::invalid_argument("[gated_delta] norm_weight shape incompatible with head dims");
         }
@@ -2000,8 +2000,8 @@ static inline array gated_delta_mixer_forward_core(
         throw std::invalid_argument("[gated_delta] in_proj output too small");
     }
 
-    // Slice projections in model dtype; upcast to FP32 only for recurrent state math.
-    array qkv_all = slice(proj_all, {0, 0, 0}, {1, seq_len, qkv_len});
+    // Slice projections; upcast qkv to FP32 for recurrent state math (matches quantized path).
+    array qkv_all = ensure_float32(slice(proj_all, {0, 0, 0}, {1, seq_len, qkv_len}));
     const array z_all = ensure_float32(slice(proj_all, {0, 0, qkv_len}, {1, seq_len, qkv_len + d_inner}));
     const array beta_raw_all = ensure_float32(slice(
         proj_all,
@@ -2036,7 +2036,7 @@ static inline array gated_delta_mixer_forward_core(
     const array qkv_conv_all = ensure_float32(conv_seq * sigmoid(conv_seq));
 
     const std::optional<array> dt_bias_heads = dt_bias_row
-        ? std::optional<array>(reshape(*dt_bias_row, {n_heads}))
+        ? std::optional<array>(contiguous(reshape(*dt_bias_row, {n_heads})))
         : std::nullopt;
     const Dtype model_dtype = input.dtype();
     const array dt_bias_heads_value = dt_bias_heads.has_value() ? *dt_bias_heads : zeros({n_heads}, float32);
@@ -2071,12 +2071,12 @@ static inline array gated_delta_mixer_forward_core(
     }
 
     for (int token_idx = 0; token_idx < seq_len; ++token_idx) {
-        array query = reshape(slice(query_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
-        array key = reshape(slice(key_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
-        const array value = reshape(slice(value_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
-        const array z = reshape(slice(z_heads_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head});
-        const array beta_raw = reshape(slice(beta_raw_all, {0, token_idx, 0}, {1, token_idx + 1, n_heads}), {n_heads});
-        const array a_raw = reshape(slice(a_raw_all, {0, token_idx, 0}, {1, token_idx + 1, n_heads}), {n_heads});
+        array query = contiguous(reshape(slice(query_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head}));
+        array key = contiguous(reshape(slice(key_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head}));
+        const array value = contiguous(reshape(slice(value_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head}));
+        const array z = contiguous(reshape(slice(z_heads_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head}));
+        const array beta_raw = contiguous(reshape(slice(beta_raw_all, {0, token_idx, 0}, {1, token_idx + 1, n_heads}), {n_heads}));
+        const array a_raw = contiguous(reshape(slice(a_raw_all, {0, token_idx, 0}, {1, token_idx + 1, n_heads}), {n_heads}));
         array out(0.0f, float32);
         if (capture_out != nullptr) {
             const array ssm_probe = gated_delta_recurrence_ssm_probe(
@@ -2482,20 +2482,19 @@ void* mlx_lazy_gated_delta_mixer_bf16(
     );
 
     const Dtype model_dtype = input_arr.dtype();
-    array conv_state(0.0f, model_dtype);
+    array conv_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
-            layer_state->conv_state->shape(2) != qkv_len ||
-            layer_state->conv_state->dtype() != model_dtype;
+            layer_state->conv_state->shape(2) != qkv_len;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, model_dtype));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, float32));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, qkv_len}, model_dtype);
+        conv_state = zeros({1, d_conv_i, qkv_len}, float32);
     }
 
     array ssm_state(0.0f, float32);
@@ -2525,8 +2524,8 @@ void* mlx_lazy_gated_delta_mixer_bf16(
             layer_state->hidden_dim != hidden_dim ||
             layer_state->d_inner != d_inner;
         if (need_proj_rhs_refresh) {
-            in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
-            out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+            in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+            out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
             delete layer_state->in_proj_rhs;
             delete layer_state->out_proj_rhs;
             layer_state->in_proj_rhs = new array(in_proj_rhs);
@@ -2540,8 +2539,8 @@ void* mlx_lazy_gated_delta_mixer_bf16(
             out_proj_rhs = *layer_state->out_proj_rhs;
         }
     } else {
-        in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
-        out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+        in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+        out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
     }
     StateSpaceCallable in_proj_fn{
         .fn = state_space_apply_matmul_rhs,
@@ -2648,20 +2647,19 @@ void* mlx_lazy_gated_delta_mixer_quantized(
     );
 
     const Dtype model_dtype = input_arr.dtype();
-    array conv_state(0.0f, model_dtype);
+    array conv_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
-            layer_state->conv_state->shape(2) != qkv_len ||
-            layer_state->conv_state->dtype() != model_dtype;
+            layer_state->conv_state->shape(2) != qkv_len;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, model_dtype));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, float32));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, qkv_len}, model_dtype);
+        conv_state = zeros({1, d_conv_i, qkv_len}, float32);
     }
 
     array ssm_state(0.0f, float32);
@@ -2799,20 +2797,19 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
     );
 
     const Dtype model_dtype = input_arr.dtype();
-    array conv_state(0.0f, model_dtype);
+    array conv_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
-            layer_state->conv_state->shape(2) != qkv_len ||
-            layer_state->conv_state->dtype() != model_dtype;
+            layer_state->conv_state->shape(2) != qkv_len;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, model_dtype));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, float32));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, qkv_len}, model_dtype);
+        conv_state = zeros({1, d_conv_i, qkv_len}, float32);
     }
 
     array ssm_state(0.0f, float32);
@@ -2842,8 +2839,8 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
             layer_state->hidden_dim != hidden_dim ||
             layer_state->d_inner != d_inner;
         if (need_proj_rhs_refresh) {
-            in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
-            out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+            in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+            out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
             delete layer_state->in_proj_rhs;
             delete layer_state->out_proj_rhs;
             layer_state->in_proj_rhs = new array(in_proj_rhs);
@@ -2857,8 +2854,8 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
             out_proj_rhs = *layer_state->out_proj_rhs;
         }
     } else {
-        in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true);
-        out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true);
+        in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+        out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
     }
     StateSpaceCallable in_proj_fn{
         .fn = state_space_apply_matmul_rhs,
@@ -2979,20 +2976,19 @@ void* mlx_lazy_gated_delta_mixer_quantized_capture(
     );
 
     const Dtype model_dtype = input_arr.dtype();
-    array conv_state(0.0f, model_dtype);
+    array conv_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
-            layer_state->conv_state->shape(2) != qkv_len ||
-            layer_state->conv_state->dtype() != model_dtype;
+            layer_state->conv_state->shape(2) != qkv_len;
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, model_dtype));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, qkv_len}, float32));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, qkv_len}, model_dtype);
+        conv_state = zeros({1, d_conv_i, qkv_len}, float32);
     }
 
     array ssm_state(0.0f, float32);

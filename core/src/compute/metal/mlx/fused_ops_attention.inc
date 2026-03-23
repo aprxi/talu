@@ -1069,7 +1069,13 @@ void* mlx_lazy_fused_attention_bf16(
         q_proj_out,
         kv_out
     );
+    if (qkv_wt.dtype() != float32) {
+        qkv_wt = astype(qkv_wt, float32);
+    }
     auto o_wt = orient_matmul_rhs_cached(o_w, *static_cast<const array*>(o_w), q_out, hidden_dim, true);
+    if (o_wt.dtype() != float32) {
+        o_wt = astype(o_wt, float32);
+    }
 
     auto qkv = matmul_lastdim(x, qkv_wt);
     array q = slice(qkv, {0, 0, 0}, {batch_size, seq_len, q_proj_out});

@@ -864,6 +864,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
     // Architecture features from graph definition
     weight_handles.has_norm_weight_offset = loaded.runtime.weight_offset != 0.0;
+    weight_handles.has_qk_norm_weight_offset = loaded.runtime.qk_norm_weight_offset != 0.0;
     weight_handles.use_sqrt_embedding_scale = false;
     weight_handles.use_gelu = loaded.config.use_gelu;
     weight_handles.use_post_attn_norm = loaded.runtime.weight_offset != 0.0; // architectures with (1+w) norms use post-attn norm before residual
@@ -1097,8 +1098,8 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 // QK normalization (optional) - load in native dtype (f32, f16, or bf16)
                 if (attn_block.q_norm) |q_norm_tensor| {
                     var q_norm_arr = try loadNormWeight(q_norm_tensor);
-                    // (1+w) RMSNorm formulation
-                    if (weight_handles.has_norm_weight_offset) {
+                    // QK norm offset follows attention runtime contract (can differ from generic norm offset).
+                    if (weight_handles.has_qk_norm_weight_offset) {
                         q_norm_arr = try addOnePersistent(q_norm_arr);
                     }
                     weight_handles.layers[layer_idx].q_norm = q_norm_arr;
@@ -1108,8 +1109,8 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
                 if (attn_block.k_norm) |k_norm_tensor| {
                     var k_norm_arr = try loadNormWeight(k_norm_tensor);
-                    // (1+w) RMSNorm formulation
-                    if (weight_handles.has_norm_weight_offset) {
+                    // QK norm offset follows attention runtime contract (can differ from generic norm offset).
+                    if (weight_handles.has_qk_norm_weight_offset) {
                         k_norm_arr = try addOnePersistent(k_norm_arr);
                     }
                     weight_handles.layers[layer_idx].k_norm = k_norm_arr;
@@ -1257,11 +1258,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.layers[layer_idx].gated_delta_dt_bias = try tensorToArray(bias);
                 }
                 if (gated_delta_block.weights.norm_weight) |norm_w| {
-                    var norm_arr = try loadNormWeight(norm_w);
-                    if (weight_handles.has_norm_weight_offset) {
-                        norm_arr = try addOnePersistent(norm_arr);
-                    }
-                    weight_handles.layers[layer_idx].gated_delta_norm_weight = norm_arr;
+                    weight_handles.layers[layer_idx].gated_delta_norm_weight = try loadNormWeight(norm_w);
                 }
 
                 const core_quantized = isGroupedAffineDType(gated_delta_block.weights.in_proj.dtype) and
@@ -1879,6 +1876,8 @@ pub const WeightHandles = struct {
 
     // Norm weight offset: some architectures use (1+w) formulation for RMSNorm
     has_norm_weight_offset: bool = false,
+    // Attention q/k norm offset uses dedicated runtime field.
+    has_qk_norm_weight_offset: bool = false,
     // Embedding scaling: some architectures scale embeddings by sqrt(d_model)
     use_sqrt_embedding_scale: bool = false,
     d_model: usize = 0,
