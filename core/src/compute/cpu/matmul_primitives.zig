@@ -293,7 +293,7 @@ pub fn matmulF32(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Mat
     }.runRowTiles;
 
     if (m_rows >= TILE_THRESHOLD) {
-        parallel.global().parallelFor(m_rows, row_tiles_task, &context);
+        parallel.global().parallelForCompute(m_rows, row_tiles_task, &context);
     } else {
         row_tiles_task(0, m_rows, &context);
     }
@@ -408,7 +408,7 @@ pub fn matmulF32Accum(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch:
     }.runRowTiles;
 
     if (m_rows >= TILE_THRESHOLD) {
-        parallel.global().parallelFor(m_rows, row_tiles_task, &context);
+        parallel.global().parallelForCompute(m_rows, row_tiles_task, &context);
     } else {
         row_tiles_task(0, m_rows, &context);
     }
@@ -923,7 +923,12 @@ fn matmulBF16Simd(
         }
     }.runColTiles;
 
-    parallel.global().parallelFor(tiles_per_row, tiled_task, &context);
+    const pool = parallel.global();
+    if (m_rows > 1) {
+        pool.parallelForCompute(tiles_per_row, tiled_task, &context);
+    } else {
+        pool.parallelFor(tiles_per_row, tiled_task, &context);
+    }
 }
 
 /// F16 matmul kernel - dedicated kernel without runtime dtype branching.
@@ -1015,7 +1020,12 @@ fn matmulF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulS
         }
     }.runRowColTiles;
 
-    parallel.global().parallelFor(total_tiles, tiled_task, &context);
+    const pool = parallel.global();
+    if (m_rows > 1) {
+        pool.parallelForCompute(total_tiles, tiled_task, &context);
+    } else {
+        pool.parallelFor(total_tiles, tiled_task, &context);
+    }
 }
 
 /// Optimized SIMD dot product for grouped-affine u4 with pre-converted scales/biases

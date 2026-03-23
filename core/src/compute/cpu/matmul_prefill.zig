@@ -182,7 +182,12 @@ pub fn matmulGaffineU4Prefill(
     }.runColTiles;
 
     if (num_col_tiles > 0) {
-        parallel.global().parallelFor(num_col_tiles, tile_task, &context);
+        const pool = parallel.global();
+        if (m_rows > 1) {
+            pool.parallelForCompute(num_col_tiles, tile_task, &context);
+        } else {
+            pool.parallelFor(num_col_tiles, tile_task, &context);
+        }
     }
 
     // Handle remainder columns (n_cols % COL_TILE) with existing kernels
@@ -615,7 +620,12 @@ pub fn matmulGaffineU8Prefill(
         }
     }.run2DTiles;
 
-    parallel.global().parallelFor(total_tiles, tile_task, &context);
+    const pool = parallel.global();
+    if (m_rows > 1) {
+        pool.parallelForCompute(total_tiles, tile_task, &context);
+    } else {
+        pool.parallelFor(total_tiles, tile_task, &context);
+    }
 
     // Handle odd column at end
     if (n_cols % 2 == 1) {

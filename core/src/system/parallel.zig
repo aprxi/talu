@@ -100,6 +100,8 @@ pub const ThreadPool = struct {
     allocator: std.mem.Allocator,
     threads: []std.Thread,
     n_threads: usize,
+    /// Bandwidth-sensitive thread limit for decode/attention (computed once at creation).
+    bw_threads: usize = 1,
 
     // Cache-line aligned atomics to prevent false sharing (u32 matches futex requirements)
     n_graph: std.atomic.Value(u32) align(CACHE_LINE) = .init(0),
@@ -114,6 +116,8 @@ pub const ThreadPool = struct {
     task_fn: ?*const fn (usize, usize, *anyopaque) void align(CACHE_LINE) = null,
     task_ctx: *anyopaque = undefined,
     n_items: usize = 0,
+    /// Active thread count for current task (set under submit_mutex before n_graph release).
+    n_active: usize = 0,
 
     pub fn create(allocator: std.mem.Allocator, requested_threads: usize) !*ThreadPool {
         var n_threads = requested_threads;
@@ -127,6 +131,7 @@ pub const ThreadPool = struct {
             .allocator = allocator,
             .threads = &.{},
             .n_threads = n_threads,
+            .bw_threads = @min(n_threads, getOptimalThreadCount()),
         };
 
         if (n_threads <= 1) return tp;
@@ -152,64 +157,70 @@ pub const ThreadPool = struct {
         self.allocator.destroy(self);
     }
 
-    /// Execute a parallel for loop over [0, n_items).
-    /// The range function receives (start, end, ctx) where ctx is a typed pointer.
-    ///
-    /// Thread-safety: Uses tryLock to avoid blocking. If another thread is using
-    /// the pool, falls back to single-threaded execution. This ensures correctness
-    /// without serializing concurrent sessions.
+    /// Bandwidth-sensitive dispatch: uses bw_threads (decode, attention, etc).
+    /// Falls back to single-threaded if the pool is busy.
     pub fn parallelFor(self: *ThreadPool, n_items: usize, comptime range_fn: anytype, ctx: anytype) void {
+        self.dispatchTyped(n_items, range_fn, ctx, self.bw_threads);
+    }
+
+    /// Compute-bound dispatch: uses all pool threads (prefill GEMM M>1).
+    /// Falls back to single-threaded if the pool is busy.
+    pub fn parallelForCompute(self: *ThreadPool, n_items: usize, comptime range_fn: anytype, ctx: anytype) void {
+        self.dispatchTyped(n_items, range_fn, ctx, self.n_threads);
+    }
+
+    fn dispatchTyped(self: *ThreadPool, n_items: usize, comptime range_fn: anytype, ctx: anytype, max_threads: usize) void {
         const CtxPtr = @TypeOf(ctx);
         comptime std.debug.assert(@typeInfo(CtxPtr) == .pointer);
-
-        // Create a wrapper that handles the type cast
         const Wrapper = struct {
             fn runRange(start: usize, end: usize, opaque_ctx: *anyopaque) void {
                 range_fn(start, end, @as(CtxPtr, @ptrCast(@alignCast(opaque_ctx))));
             }
         };
+        self.dispatchWork(n_items, Wrapper.runRange, @ptrCast(@constCast(ctx)), max_threads);
+    }
 
-        if (self.n_threads <= 1 or n_items == 0) {
-            range_fn(0, n_items, ctx);
+    /// Core dispatch: distributes n_items across up to max_threads pool threads.
+    /// Workers with thread_idx >= active skip work but still participate in the barrier.
+    fn dispatchWork(self: *ThreadPool, n_items: usize, task_fn: *const fn (usize, usize, *anyopaque) void, task_ctx: *anyopaque, max_threads: usize) void {
+        const active = @min(max_threads, self.n_threads);
+
+        if (active <= 1 or n_items == 0) {
+            task_fn(0, n_items, task_ctx);
             return;
         }
 
         // Try to acquire the pool. If busy (another session using it), run single-threaded.
-        // This avoids both blocking and data races on task_fn/task_ctx.
         if (!self.submit_mutex.tryLock()) {
-            // Pool is busy - fall back to sequential execution
-            range_fn(0, n_items, ctx);
+            task_fn(0, n_items, task_ctx);
             return;
         }
         defer self.submit_mutex.unlock();
 
-        self.task_fn = Wrapper.runRange;
-        self.task_ctx = @ptrCast(@constCast(ctx));
+        self.task_fn = task_fn;
+        self.task_ctx = task_ctx;
         self.n_items = n_items;
+        self.n_active = active;
 
-        // Signal workers via futex (release ensures task data is visible)
+        // Signal workers via futex (release ensures task data + n_active are visible)
         _ = self.n_graph.fetchAdd(1, .release);
         Futex.wakeAll(&self.n_graph);
 
-        // Main thread does worker 0's share
-        const raw_items = (n_items + self.n_threads - 1) / self.n_threads;
+        // Main thread (idx 0) work range — use 'active' not n_threads
+        const raw_items = (n_items + active - 1) / active;
         const items_per_thread = ((raw_items + FLOATS_PER_CACHE_LINE - 1) / FLOATS_PER_CACHE_LINE) * FLOATS_PER_CACHE_LINE;
-        const start_idx = 0;
-        const end_idx = @min(items_per_thread, n_items);
-        range_fn(start_idx, end_idx, ctx); // Main thread can use typed context directly
+        task_fn(0, @min(items_per_thread, n_items), task_ctx);
 
-        // Barrier: wait for all threads to finish
+        // Barrier: all n_threads participate (including idle workers)
         const n_passed = self.n_barrier_passed.load(.acquire);
         const n_barrier = self.n_barrier.fetchAdd(1, .acq_rel);
         const n_threads_u32: u32 = @intCast(self.n_threads);
 
         if (n_barrier == n_threads_u32 - 1) {
-            // Last thread: reset barrier and wake waiters
             self.n_barrier.store(0, .monotonic);
             _ = self.n_barrier_passed.fetchAdd(1, .release);
             Futex.wakeAll(&self.n_barrier_passed);
         } else {
-            // Wait for barrier - spin aggressively first since barriers are fast
             var spin: usize = 0;
             while (self.n_barrier_passed.load(.acquire) == n_passed) {
                 std.atomic.spinLoopHint();
@@ -241,7 +252,8 @@ fn workerMain(pool: *ThreadPool, thread_idx: usize) void {
         // Calculate work range for this thread
         // Align to cache line boundary (16 floats = 64 bytes) to prevent false sharing
         const n_items = pool.n_items;
-        const raw_items = (n_items + pool.n_threads - 1) / pool.n_threads;
+        const n_active = pool.n_active;
+        const raw_items = (n_items + n_active - 1) / n_active;
         const items_per_thread = ((raw_items + FLOATS_PER_CACHE_LINE - 1) / FLOATS_PER_CACHE_LINE) * FLOATS_PER_CACHE_LINE;
         const start_idx = thread_idx * items_per_thread;
         const end_idx = @min(start_idx + items_per_thread, n_items);
@@ -287,12 +299,13 @@ pub fn global() *ThreadPool {
         global_pool_mutex.lock();
         defer global_pool_mutex.unlock();
         if (!global_pool_once.load(.acquire)) {
-            // THREADS env var takes priority, otherwise use optimal count
+            // THREADS env var takes priority, otherwise use all physical cores.
+            // bw_threads (computed in create()) caps bandwidth-sensitive operations.
             var n_threads: usize = undefined; // Safe: both branches assign before use
             if (std.posix.getenv("THREADS")) |env| {
-                n_threads = std.fmt.parseInt(usize, env, 10) catch getOptimalThreadCount();
+                n_threads = std.fmt.parseInt(usize, env, 10) catch getPhysicalCoreCount();
             } else {
-                n_threads = getOptimalThreadCount();
+                n_threads = getPhysicalCoreCount();
             }
             global_pool = ThreadPool.create(std.heap.page_allocator, n_threads) catch |err| blk: {
                 // Fall back to single-threaded mode on failure
@@ -302,6 +315,8 @@ pub fn global() *ThreadPool {
                     break :blk &single_thread_fallback;
                 };
             };
+            const pool = global_pool.?;
+            log.warn("compute", "Thread pool initialized", .{ .pool_threads = pool.n_threads, .bw_threads = pool.bw_threads });
             global_pool_once.store(true, .release);
         }
     }
@@ -675,4 +690,35 @@ test "deinit cleans up single-threaded pool" {
     const pool = try ThreadPool.create(allocator, 1);
     // deinit should not leak memory
     pool.deinit();
+}
+
+test "ThreadPool: bw_threads <= n_threads" {
+    const allocator = std.testing.allocator;
+    const pool = try ThreadPool.create(allocator, 4);
+    defer pool.deinit();
+
+    try std.testing.expect(pool.bw_threads >= 1);
+    try std.testing.expect(pool.bw_threads <= pool.n_threads);
+}
+
+test "parallelForCompute single-threaded" {
+    const allocator = std.testing.allocator;
+    const pool = try ThreadPool.create(allocator, 1);
+    defer pool.deinit();
+
+    const Context = struct {
+        counter: std.atomic.Value(u32) = .init(0),
+    };
+    var ctx = Context{};
+
+    const incrementRange = struct {
+        fn f(start: usize, end: usize, c: *Context) void {
+            for (start..end) |_| {
+                _ = c.counter.fetchAdd(1, .monotonic);
+            }
+        }
+    }.f;
+
+    pool.parallelForCompute(10, incrementRange, &ctx);
+    try std.testing.expectEqual(@as(u32, 10), ctx.counter.load(.monotonic));
 }
