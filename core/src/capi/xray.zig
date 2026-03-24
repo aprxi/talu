@@ -528,7 +528,8 @@ pub export fn talu_xray_reference_data_destroy(handle: ?*ReferenceDataHandle) ca
 /// Returns null on failure (check talu_error_message).
 pub export fn talu_xray_reference_verifier_create(
     ref_data_handle: ?*ReferenceDataHandle,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
 ) callconv(.c) ?*ReferenceVerifierHandle {
     capi_error.clearError();
     const ref_data = getReferenceData(ref_data_handle) orelse {
@@ -539,7 +540,7 @@ pub export fn talu_xray_reference_verifier_create(
         capi_error.setError(error.OutOfMemory, "failed to allocate reference verifier", .{});
         return null;
     };
-    verifier.* = xray.ReferenceVerifier.init(allocator, ref_data, tolerance);
+    verifier.* = xray.ReferenceVerifier.init(allocator, ref_data, rel_tolerance, abs_tolerance);
     return @ptrCast(verifier);
 }
 

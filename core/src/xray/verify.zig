@@ -135,6 +135,7 @@ pub const VerifyCapture = struct {
             .embed = true,
             .layer_input = true,
             .layer_attn_norm = true,
+            .attn_out = true,
             .gdelta_in_proj = true,
             .gdelta_conv = true,
             .gdelta_ssm = true,
@@ -779,7 +780,7 @@ test "VerifyCapture verification mode detects divergence" {
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
 
     var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
     defer verify_cap.deinit();
@@ -838,7 +839,7 @@ test "VerifyCapture verification mode compares host tensors from non-CPU backend
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
     defer verify_cap.deinit();
 
@@ -880,7 +881,7 @@ test "VerifyCapture verification mode disables full sidecar capture by default" 
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
     defer verify_cap.deinit();
 
@@ -903,7 +904,7 @@ test "VerifyCapture verification mode enables full sidecar capture only when req
     setVerificationFullCaptureOverride(true);
     defer clearVerificationFullCaptureOverride();
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
     defer verify_cap.deinit();
 
@@ -926,7 +927,7 @@ test "VerifyCapture token-only phase narrows effective point set to token_select
     setTokenOnlyOverride(true);
     defer clearTokenOnlyOverride();
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
     defer verify_cap.deinit();
 
@@ -966,7 +967,7 @@ test "VerifyCapture ignores custom trace points outside verification set" {
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
     defer verify_cap.deinit();
 
@@ -1005,7 +1006,7 @@ test "VerifyCapture token_select u32 advances verifier and skips stats compariso
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
     defer verify_cap.deinit();
 
@@ -1045,7 +1046,7 @@ test "VerifyCapture token_select u32 ignores token parity when teacher forcing i
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
     defer verify_cap.deinit();
 
@@ -1093,7 +1094,7 @@ test "VerifyCapture token_select f32 does not advance verifier" {
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     var verify_cap = VerifyCapture.initVerification(allocator, &verifier, null);
     defer verify_cap.deinit();
 
@@ -1125,6 +1126,7 @@ test "VerifyCapture verification point set is complete" {
     try std.testing.expect(points.contains(.embed));
     try std.testing.expect(points.contains(.layer_input));
     try std.testing.expect(points.contains(.layer_attn_norm));
+    try std.testing.expect(points.contains(.attn_out));
     try std.testing.expect(points.contains(.block_out));
     try std.testing.expect(points.contains(.lm_head));
     try std.testing.expect(!points.contains(.logits_ready));

@@ -174,8 +174,11 @@ pub const ReferenceVerifier = struct {
     allocator: std.mem.Allocator,
     reference: *const ReferenceData,
 
-    /// Tolerance for floating-point comparison (epsilon)
-    tolerance: f32,
+    /// Relative tolerance for floating-point comparison.
+    rel_tolerance: f32,
+
+    /// Absolute tolerance for floating-point comparison.
+    abs_tolerance: f32,
 
     /// Current position in token transcript (for teacher forcing)
     token_idx: u32,
@@ -208,12 +211,14 @@ pub const ReferenceVerifier = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         reference: *const ReferenceData,
-        tolerance: f32,
+        rel_tolerance: f32,
+        abs_tolerance: f32,
     ) ReferenceVerifier {
         return .{
             .allocator = allocator,
             .reference = reference,
-            .tolerance = tolerance,
+            .rel_tolerance = rel_tolerance,
+            .abs_tolerance = abs_tolerance,
             .token_idx = 0,
             .expected_record_idx = 0,
             .has_diverged = false,
@@ -430,7 +435,8 @@ pub const ReferenceVerifier = struct {
     }
 
     fn statsMatch(self: *const ReferenceVerifier, expected: TensorStats, actual: TensorStats) bool {
-        const tol = self.tolerance;
+        const rel_tol = self.rel_tolerance;
+        const abs_tol = self.abs_tolerance;
         // Check for anomaly mismatch
         if (expected.nan_count != actual.nan_count) return false;
         if (expected.inf_count != actual.inf_count) return false;
@@ -443,16 +449,16 @@ pub const ReferenceVerifier = struct {
         // magnitudes does not trigger false divergence.
         const rms_diff = @abs(expected.rms() - actual.rms());
         const rms_rel = if (expected.rms() > 0) rms_diff / expected.rms() else rms_diff;
-        if (rms_diff > tol and rms_rel > tol) return false;
+        if (rms_diff > abs_tol and rms_rel > rel_tol) return false;
 
         // Check L2 norm difference with the same abs+rel guard.
         const l2_diff = @abs(expected.l2Norm() - actual.l2Norm());
         const l2_rel = if (expected.l2Norm() > 0) l2_diff / expected.l2Norm() else l2_diff;
-        if (l2_diff > tol and l2_rel > tol) return false;
+        if (l2_diff > abs_tol and l2_rel > rel_tol) return false;
 
         // Mean is already a low-magnitude scalar, keep absolute threshold.
         const mean_diff = @abs(expected.mean() - actual.mean());
-        if (mean_diff > tol) return false;
+        if (mean_diff > abs_tol) return false;
 
         return true;
     }
@@ -742,7 +748,7 @@ test "ReferenceVerifier matches good stats" {
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     defer verifier.deinit();
 
     const emission = trace.TraceEmission{
@@ -795,7 +801,7 @@ test "ReferenceVerifier detects divergence" {
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     defer verifier.deinit();
 
     const emission = trace.TraceEmission{
@@ -844,7 +850,7 @@ test "ReferenceVerifier detects token divergence" {
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
 
     try verifier.checkToken(100);
     verifier.nextToken();
@@ -887,7 +893,7 @@ test "ReferenceVerifier ignores extra emissions but finish enforces completeness
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     defer verifier.deinit();
 
     const extra_emission = trace.TraceEmission{
@@ -956,7 +962,7 @@ test "ReferenceVerifier finish reports last matched and last observed checkpoint
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     defer verifier.deinit();
 
     const attn_emission = trace.TraceEmission{
@@ -1039,7 +1045,7 @@ test "ReferenceVerifier keeps last observed local to missing checkpoint window" 
         .allocator = allocator,
     };
 
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     defer verifier.deinit();
 
     const matched = trace.TraceEmission{
@@ -1113,7 +1119,7 @@ test "ReferenceVerifier statsMatch allows tiny absolute RMS/L2 drift" {
         .stats_records = &[_]StatsRecord{},
         .allocator = allocator,
     };
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     defer verifier.deinit();
 
     // Mirrors observed metal-vs-cpu checkpoint drift:
@@ -1151,7 +1157,7 @@ test "ReferenceVerifier statsMatch rejects large RMS/L2 drift" {
         .stats_records = &[_]StatsRecord{},
         .allocator = allocator,
     };
-    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3);
+    var verifier = ReferenceVerifier.init(allocator, &ref, 1e-3, 1e-3);
     defer verifier.deinit();
 
     const expected = TensorStats{

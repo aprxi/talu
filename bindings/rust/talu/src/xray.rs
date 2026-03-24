@@ -326,9 +326,18 @@ pub struct ReferenceVerifierHandle {
 
 impl ReferenceVerifierHandle {
     /// Create a new reference verifier for verification phase.
-    pub fn new(reference: &ReferenceDataHandle, tolerance: f32) -> Result<Self> {
-        let handle =
-            unsafe { talu_sys::talu_xray_reference_verifier_create(reference.as_ptr(), tolerance) };
+    pub fn new(
+        reference: &ReferenceDataHandle,
+        rel_tolerance: f32,
+        abs_tolerance: f32,
+    ) -> Result<Self> {
+        let handle = unsafe {
+            talu_sys::talu_xray_reference_verifier_create(
+                reference.as_ptr(),
+                rel_tolerance,
+                abs_tolerance,
+            )
+        };
         if handle.is_null() {
             return Err(error_from_last_or("reference verifier create failed"));
         }
@@ -500,9 +509,7 @@ impl VerifyCaptureHandle {
 
     /// Restrict verification to one exact built-in checkpoint emission.
     pub fn set_exact_emission_filter(point: u8, layer: u16, position: u32) {
-        unsafe {
-            talu_sys::talu_xray_verify_set_exact_emission_filter(point, layer, position)
-        };
+        unsafe { talu_sys::talu_xray_verify_set_exact_emission_filter(point, layer, position) };
     }
 
     /// Clear exact checkpoint-emission override.

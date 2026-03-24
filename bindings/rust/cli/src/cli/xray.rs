@@ -517,6 +517,7 @@ fn reclaim_orphaned_reference_lock(lock_path: &Path) -> Result<()> {
 struct TempReferenceBundle {
     reference_path: PathBuf,
     sidecar_path: PathBuf,
+    visible_text_path: PathBuf,
     keep: bool,
 }
 
@@ -524,9 +525,11 @@ impl TempReferenceBundle {
     fn new(final_reference_path: &Path) -> Self {
         let reference_path = temp_reference_path(final_reference_path, std::process::id());
         let sidecar_path = reference_sidecar_path(&reference_path);
+        let visible_text_path = reference_visible_text_path(&reference_path);
         Self {
             reference_path,
             sidecar_path,
+            visible_text_path,
             keep: false,
         }
     }
@@ -544,10 +547,18 @@ impl TempReferenceBundle {
                 self.sidecar_path.display()
             ));
         }
+        if !self.visible_text_path.exists() {
+            return Err(anyhow!(
+                "reference refresh did not produce visible-text sidecar: {}",
+                self.visible_text_path.display()
+            ));
+        }
 
         let final_sidecar_path = reference_sidecar_path(final_reference_path);
+        let final_visible_text_path = reference_visible_text_path(final_reference_path);
         replace_file_atomically(&self.reference_path, final_reference_path)?;
         replace_file_atomically(&self.sidecar_path, &final_sidecar_path)?;
+        replace_file_atomically(&self.visible_text_path, &final_visible_text_path)?;
         self.keep = true;
         Ok(())
     }
@@ -560,6 +571,7 @@ impl Drop for TempReferenceBundle {
         }
         let _ = std::fs::remove_file(&self.reference_path);
         let _ = std::fs::remove_file(&self.sidecar_path);
+        let _ = std::fs::remove_file(&self.visible_text_path);
     }
 }
 
@@ -1704,9 +1716,8 @@ fn record_reference_bundle(
         verify_cap.save_full_npz(&full_dump_path)?;
         let reference = recorder.finalize()?;
         reference.save(ref_path)?;
-        if let Some(text) = latest_visible_text(&chat, true)? {
-            save_reference_visible_text(Path::new(ref_path), &text)?;
-        }
+        let visible_text = latest_visible_text(&chat, true)?.unwrap_or_default();
+        save_reference_visible_text(Path::new(ref_path), &visible_text)?;
         canonicalize_reference_bundle(Path::new(ref_path))?;
         Ok(())
     })
@@ -1717,7 +1728,8 @@ fn run_verify_pass_with_backend(
     backend: &talu::InferenceBackend,
     prompt_text: &str,
     seed: u64,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
     reference_path: &str,
     max_tokens: usize,
     teacher_forcing: bool,
@@ -1737,7 +1749,7 @@ fn run_verify_pass_with_backend(
     let resolved_model = resolve_xray_model(model)?;
     let cfg = xray_generate_config(&resolved_model, max_tokens, seed)?;
     let reference = ReferenceDataHandle::load(reference_path)?;
-    let verifier = ReferenceVerifierHandle::new(&reference, tolerance)?;
+    let verifier = ReferenceVerifierHandle::new(&reference, rel_tolerance, abs_tolerance)?;
     let verify_cap = VerifyCaptureHandle::new_verification(&verifier, Some("/tmp/panic_dumps"))?;
     let chat = ChatHandle::new(Some(DEFAULT_SYSTEM_MESSAGE))?;
     let content = vec![talu::router::ContentPart::Text(prompt_text.to_string())];
@@ -1816,7 +1828,8 @@ fn run_verify_pass(
     model: &str,
     prompt_text: &str,
     seed: u64,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
     reference_path: &str,
     max_tokens: usize,
     teacher_forcing: bool,
@@ -1835,7 +1848,8 @@ fn run_verify_pass(
         &backend,
         prompt_text,
         seed,
-        tolerance,
+        rel_tolerance,
+        abs_tolerance,
         reference_path,
         max_tokens,
         teacher_forcing,
@@ -1871,7 +1885,8 @@ fn run_verify_pass(
 fn cmd_xray_verify(
     model: &str,
     ref_path: &str,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
     args: &XrayArgs,
     backend_pair: &VerifyBackendPair,
 ) -> Result<()> {
@@ -1890,14 +1905,16 @@ fn cmd_xray_verify(
     );
     println!("  Tokens: {}", args.tokens);
     println!("  Seed: {}", args.seed);
-    println!("  Tolerance: {}", tolerance);
+    println!("  Rel tolerance: {}", rel_tolerance);
+    println!("  Abs tolerance: {}", abs_tolerance);
     println!("  Prompt: \"{}\"", prompt_text);
 
     if args.verify_phase1_only {
         return run_phase1_only_in_current_process(
             model,
             &prompt_text,
-            tolerance,
+            rel_tolerance,
+            abs_tolerance,
             &reference_json_path,
             args,
         );
@@ -1911,7 +1928,8 @@ fn cmd_xray_verify(
         return run_phase2_only_in_current_process(
             model,
             &prompt_text,
-            tolerance,
+            rel_tolerance,
+            abs_tolerance,
             &reference_json_path,
             args,
             phase2_max_tokens,
@@ -1944,7 +1962,8 @@ fn cmd_xray_verify(
                 model,
                 &prompt_text,
                 args.seed,
-                tolerance,
+                rel_tolerance,
+                abs_tolerance,
                 filtered_reference_path,
                 max_tokens,
                 true,
@@ -1997,7 +2016,8 @@ fn cmd_xray_verify(
             model,
             &prompt_text,
             args.seed,
-            tolerance,
+            rel_tolerance,
+            abs_tolerance,
             &reference_json_path,
             &golden_full_npz,
             &golden_tensors,
@@ -2018,7 +2038,8 @@ fn cmd_xray_verify(
     run_verify_in_current_process(
         model,
         &prompt_text,
-        tolerance,
+        rel_tolerance,
+        abs_tolerance,
         &reference_json_path,
         args,
         backend_pair,
@@ -2037,7 +2058,8 @@ fn should_process_scope_backend_teardown() -> bool {
 fn run_phase1_only_in_current_process(
     model: &str,
     prompt_text: &str,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
     reference_json_path: &str,
     args: &XrayArgs,
 ) -> Result<()> {
@@ -2045,7 +2067,8 @@ fn run_phase1_only_in_current_process(
         model,
         prompt_text,
         args.seed,
-        tolerance,
+        rel_tolerance,
+        abs_tolerance,
         reference_json_path,
         args.tokens as usize,
         false,
@@ -2079,8 +2102,8 @@ fn run_phase1_only_in_current_process(
     println!();
     println!("details:");
     println!(
-        "  verified tokens={} seed={} tolerance={}",
-        args.tokens, args.seed, tolerance
+        "  verified tokens={} seed={} rel_tolerance={} abs_tolerance={}",
+        args.tokens, args.seed, rel_tolerance, abs_tolerance
     );
     Ok(())
 }
@@ -2090,7 +2113,8 @@ fn run_phase1_process(
     model: &str,
     prompt_text: &str,
     reference_json_path: &str,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
     args: &XrayArgs,
     backend_pair: &VerifyBackendPair,
 ) -> Result<Phase1ProcessResult> {
@@ -2108,8 +2132,10 @@ fn run_phase1_process(
         .arg(args.tokens.to_string())
         .arg("--seed")
         .arg(args.seed.to_string())
-        .arg("--tolerance")
-        .arg(tolerance.to_string())
+        .arg("--rel-tolerance")
+        .arg(rel_tolerance.to_string())
+        .arg("--abs-tolerance")
+        .arg(abs_tolerance.to_string())
         .arg(prompt_text);
     let (status, stdout, stderr) =
         run_command_capture_to_temp_files(&mut command, "phase 1 verify child process")?;
@@ -2145,7 +2171,8 @@ fn run_phase1_process(
 fn run_verify_in_current_process(
     model: &str,
     prompt_text: &str,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
     reference_json_path: &str,
     args: &XrayArgs,
     backend_pair: &VerifyBackendPair,
@@ -2161,7 +2188,8 @@ fn run_verify_in_current_process(
         model,
         prompt_text,
         reference_json_path,
-        tolerance,
+        rel_tolerance,
+        abs_tolerance,
         args,
         backend_pair,
     )?;
@@ -2185,7 +2213,8 @@ fn run_verify_in_current_process(
         return run_phase2_localization_with_single_process_child(
             model,
             prompt_text,
-            tolerance,
+            rel_tolerance,
+            abs_tolerance,
             reference_json_path,
             args,
             phase2_max_tokens,
@@ -2198,8 +2227,8 @@ fn run_verify_in_current_process(
         println!();
         println!("details:");
         println!(
-            "  verified tokens={} seed={} tolerance={}",
-            args.tokens, args.seed, tolerance
+            "  verified tokens={} seed={} rel_tolerance={} abs_tolerance={}",
+            args.tokens, args.seed, rel_tolerance, abs_tolerance
         );
     } else {
         println!("{}", phase1.report);
@@ -2210,7 +2239,8 @@ fn run_verify_in_current_process(
 fn run_phase2_only_in_current_process(
     model: &str,
     prompt_text: &str,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
     reference_json_path: &str,
     args: &XrayArgs,
     phase2_max_tokens: usize,
@@ -2232,7 +2262,8 @@ fn run_phase2_only_in_current_process(
         &backend,
         prompt_text,
         args.seed,
-        tolerance,
+        rel_tolerance,
+        abs_tolerance,
         filtered_reference_path,
         phase2_max_tokens,
         true,
@@ -2290,7 +2321,8 @@ fn run_phase2_only_in_current_process(
 fn run_phase2_localization_with_single_process_child(
     model: &str,
     prompt_text: &str,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
     reference_json_path: &str,
     args: &XrayArgs,
     phase2_max_tokens: usize,
@@ -2319,8 +2351,10 @@ fn run_phase2_localization_with_single_process_child(
         .arg(phase2_max_tokens.to_string())
         .arg("--seed")
         .arg(args.seed.to_string())
-        .arg("--tolerance")
-        .arg(tolerance.to_string())
+        .arg("--rel-tolerance")
+        .arg(rel_tolerance.to_string())
+        .arg("--abs-tolerance")
+        .arg(abs_tolerance.to_string())
         .arg(prompt_text);
 
     let (status, stdout, stderr) =
@@ -2733,7 +2767,8 @@ fn cmd_xray_verify_default(
             source_path
                 .to_str()
                 .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
-            args.tolerance,
+            args.rel_tolerance,
+            args.abs_tolerance,
             args,
             backend_pair,
         ),
@@ -2745,7 +2780,8 @@ fn cmd_xray_verify_default(
             );
             println!("  Tokens: {}", args.tokens);
             println!("  Seed: {}", args.seed);
-            println!("  Tolerance: {}", args.tolerance);
+            println!("  Rel tolerance: {}", args.rel_tolerance);
+            println!("  Abs tolerance: {}", args.abs_tolerance);
             println!("  Prompt: \"{}\"", prompt_text);
             let target_path = ensure_reference_bundle(
                 model,
@@ -2780,12 +2816,14 @@ fn cmd_xray_verify_default(
             );
             println!("  Tokens: {}", args.tokens);
             println!("  Seed: {}", args.seed);
-            println!("  Tolerance: {}", args.tolerance);
+            println!("  Rel tolerance: {}", args.rel_tolerance);
+            println!("  Abs tolerance: {}", args.abs_tolerance);
             println!("  Prompt: \"{}\"", prompt_text);
             run_phase2_localization_with_single_process_child(
                 model,
                 &prompt_text,
-                args.tolerance,
+                args.rel_tolerance,
+                args.abs_tolerance,
                 source_path
                     .to_str()
                     .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
@@ -3088,6 +3126,7 @@ fn is_default_phase2_point_name(point: &str) -> bool {
         "embed_tokens"
             | "layer_input"
             | "layer_attn_norm"
+            | "attn.out"
             | "gdelta.in_proj"
             | "gdelta.conv"
             | "gdelta.ssm"
@@ -3403,7 +3442,8 @@ fn run_targeted_checkpoint_compare(
     model: &str,
     prompt_text: &str,
     seed: u64,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
     reference_json_path: &str,
     golden_full_npz: &Path,
     golden_tensors: &BTreeMap<String, Vec<f32>>,
@@ -3427,7 +3467,8 @@ fn run_targeted_checkpoint_compare(
         model,
         prompt_text,
         seed,
-        tolerance,
+        rel_tolerance,
+        abs_tolerance,
         reference_json_path,
         max_tokens,
         true,
@@ -3476,7 +3517,8 @@ fn run_targeted_checkpoint_compare(
     let abs_rms_diff = (actual_rms - expected_rms).abs();
     let (rel_rms, max_abs) = rel_rms_and_max_abs(expected, actual);
     let len_mismatch = expected.len() != actual.len();
-    let diverged = len_mismatch || exceeds_numeric_tolerance(rel_rms, abs_rms_diff, tolerance);
+    let diverged = len_mismatch
+        || exceeds_numeric_tolerance(rel_rms, abs_rms_diff, rel_tolerance, abs_tolerance);
 
     Ok(TargetedCheckpointResult {
         selected,
@@ -3910,9 +3952,13 @@ fn rel_rms_and_max_abs(expected: &[f32], actual: &[f32]) -> (f64, f32) {
     (rel_rms, max_abs)
 }
 
-fn exceeds_numeric_tolerance(rel_rms: f64, abs_rms_diff: f64, tolerance: f32) -> bool {
-    let tol = tolerance as f64;
-    rel_rms > tol && abs_rms_diff > tol
+fn exceeds_numeric_tolerance(
+    rel_rms: f64,
+    abs_rms_diff: f64,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
+) -> bool {
+    rel_rms > rel_tolerance as f64 && abs_rms_diff > abs_tolerance as f64
 }
 
 fn rms(values: &[f32]) -> f64 {
@@ -3933,7 +3979,8 @@ fn rms(values: &[f32]) -> f64 {
 fn find_first_checkpoint_diff(
     expected: &BTreeMap<String, Vec<f32>>,
     actual: &BTreeMap<String, Vec<f32>>,
-    tolerance: f32,
+    rel_tolerance: f32,
+    abs_tolerance: f32,
 ) -> Option<FirstCheckpointDiff> {
     let mut ordered: Vec<ParsedCheckpointKey> = expected
         .keys()
@@ -3985,7 +4032,7 @@ fn find_first_checkpoint_diff(
         let expected_rms = rms(expected_tensor);
         let actual_rms = rms(actual_tensor);
         let abs_rms_diff = (actual_rms - expected_rms).abs();
-        if exceeds_numeric_tolerance(rel_rms, abs_rms_diff, tolerance) {
+        if exceeds_numeric_tolerance(rel_rms, abs_rms_diff, rel_tolerance, abs_tolerance) {
             let _ = (max_abs, expected_rms, actual_rms);
             return Some(FirstCheckpointDiff {
                 parsed,
@@ -4018,7 +4065,8 @@ fn run_tensor_bundle_diff(
     );
     println!("  Tokens: {}", args.tokens);
     println!("  Seed: {}", args.seed);
-    println!("  Tolerance: {}", args.tolerance);
+    println!("  Rel tolerance: {}", args.rel_tolerance);
+    println!("  Abs tolerance: {}", args.abs_tolerance);
     println!("  Prompt: \"{}\"", effective_prompt_text(args));
     println!("  Source: {}", source_sidecar.display());
     println!("  Target: {}", target_sidecar.display());
@@ -4060,7 +4108,12 @@ fn run_tensor_bundle_diff(
                 let actual_rms = rms(&actual_vals);
                 let abs_rms_diff = (actual_rms - expected_rms).abs();
                 let (rel_rms, _) = rel_rms_and_max_abs(&expected_vals, &actual_vals);
-                if exceeds_numeric_tolerance(rel_rms, abs_rms_diff, args.tolerance) {
+                if exceeds_numeric_tolerance(
+                    rel_rms,
+                    abs_rms_diff,
+                    args.rel_tolerance,
+                    args.abs_tolerance,
+                ) {
                     Some(FirstCheckpointDiff {
                         parsed,
                         kind: FirstCheckpointDiffKind::Numeric,
@@ -4202,11 +4255,11 @@ mod tests {
         find_first_checkpoint_diff, format_first_divergence_report, normalize_npz_entry_key,
         parse_checkpoint_key, parse_npy_f32, parse_verify_backend_pair,
         parse_verify_checkpoint_target, reclaim_orphaned_reference_lock, reference_cache_key,
-        reference_lock_path, reference_sidecar_path, replace_file_atomically,
-        select_checkpoint_key, temp_reference_path, write_filtered_reference_json,
-        write_phase2_reference_json, FirstCheckpointDiff, FirstCheckpointDiffKind,
-        ParsedCheckpointKey, ReferenceCaptureMode, TensorCheckpointFailure, VerifyBackendPair,
-        VerifyCheckpointTarget, VerifyLayerTarget,
+        reference_lock_path, reference_sidecar_path, reference_visible_text_path,
+        replace_file_atomically, select_checkpoint_key, temp_reference_path,
+        write_filtered_reference_json, write_phase2_reference_json, FirstCheckpointDiff,
+        FirstCheckpointDiffKind, ParsedCheckpointKey, ReferenceCaptureMode, TempReferenceBundle,
+        TensorCheckpointFailure, VerifyBackendPair, VerifyCheckpointTarget, VerifyLayerTarget,
     };
     use crate::cli::XrayArgs;
     use std::collections::BTreeMap;
@@ -4684,7 +4737,7 @@ mod tests {
         let mut actual = BTreeMap::new();
         actual.insert("tok0_pos0_global_0_lm_head".to_string(), vec![1.0f32]);
 
-        let diff = find_first_checkpoint_diff(&expected, &actual, 1e-3)
+        let diff = find_first_checkpoint_diff(&expected, &actual, 1e-3, 1e-3)
             .expect("a missing layer checkpoint should be reported");
         assert_eq!(diff.parsed.key, "tok0_pos16_layer_0_layer_attn_norm");
         assert!(matches!(diff.kind, FirstCheckpointDiffKind::Missing));
@@ -4704,7 +4757,7 @@ mod tests {
             vec![1.0f32, 0.0f32, 7.241_444e-36f32],
         );
 
-        let diff = find_first_checkpoint_diff(&expected, &actual, 1e-3);
+        let diff = find_first_checkpoint_diff(&expected, &actual, 1e-3, 1e-3);
         assert!(diff.is_none(), "sub-measurable numeric drift should pass");
     }
 
@@ -4865,7 +4918,8 @@ mod tests {
             verify_record_reference_only: false,
             verify_record_backend: None,
             verify_record_transcript_only: false,
-            tolerance: 0.001,
+            rel_tolerance: 0.001,
+            abs_tolerance: 0.001,
             tokens: 10,
             seed: 42,
             prompt: vec![
@@ -4989,6 +5043,48 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&dst).expect("read dst"), "new");
         assert!(!src.exists());
         let _ = std::fs::remove_file(&dst);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn temp_reference_bundle_persist_moves_visible_text_sidecar() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be monotonic enough for test naming")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "talu_xray_temp_bundle_visible_test_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let final_reference = temp_dir.join("xray_ref.json");
+        let mut bundle = TempReferenceBundle::new(&final_reference);
+
+        std::fs::write(&bundle.reference_path, "{}").expect("write temp reference json");
+        std::fs::write(&bundle.sidecar_path, "npz").expect("write temp sidecar");
+        std::fs::write(&bundle.visible_text_path, "hello").expect("write temp visible text");
+
+        bundle
+            .persist(&final_reference)
+            .expect("persist should succeed");
+
+        let final_visible = reference_visible_text_path(&final_reference);
+        assert!(final_reference.exists(), "final reference JSON should exist");
+        assert!(
+            reference_sidecar_path(&final_reference).exists(),
+            "final sidecar should exist"
+        );
+        assert!(final_visible.exists(), "final visible text should exist");
+        assert_eq!(
+            std::fs::read_to_string(&final_visible).expect("read final visible text"),
+            "hello"
+        );
+
+        let _ = std::fs::remove_file(&final_reference);
+        let _ = std::fs::remove_file(reference_sidecar_path(&final_reference));
+        let _ = std::fs::remove_file(final_visible);
         let _ = std::fs::remove_dir(&temp_dir);
     }
 }

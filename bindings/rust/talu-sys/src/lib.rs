@@ -5780,7 +5780,7 @@ extern "C" {
     // core/src/capi/xray.zig
     pub fn talu_xray_reference_recorder_record_token(handle: *mut c_void, token_id: u32) -> bool;
     // core/src/capi/xray.zig
-    pub fn talu_xray_reference_verifier_create(ref_data_handle: *mut c_void, tolerance: f32) -> *mut c_void;
+    pub fn talu_xray_reference_verifier_create(ref_data_handle: *mut c_void, rel_tolerance: f32, abs_tolerance: f32) -> *mut c_void;
     // core/src/capi/xray.zig
     pub fn talu_xray_reference_verifier_destroy(handle: *mut c_void);
     // core/src/capi/xray.zig

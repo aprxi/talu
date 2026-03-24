@@ -634,9 +634,13 @@ pub(super) struct XrayArgs {
     #[arg(long, hide = true)]
     pub verify_record_transcript_only: bool,
 
-    /// Tolerance for stats comparison during verification (default: 1e-3)
+    /// Relative tolerance for stats/tensor comparison during verification (default: 1e-3)
     #[arg(long, default_value = "0.001")]
-    pub tolerance: f32,
+    pub rel_tolerance: f32,
+
+    /// Absolute tolerance for stats/tensor comparison during verification (default: 1e-3)
+    #[arg(long, default_value = "0.001")]
+    pub abs_tolerance: f32,
 
     /// Number of tokens to generate for recording/verification (default: TOKENS env or 10)
     #[arg(long, env = "TOKENS", default_value_t = 10u32)]

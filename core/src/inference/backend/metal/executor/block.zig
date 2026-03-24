@@ -2058,12 +2058,12 @@ pub const TransformerBlock = struct {
             cache,
             query_gate,
         );
-        emitLayerProgramTracePoint(
+        emitLayerProgramModelWidthHostTracePoint(
             state,
+            insn,
+            registers,
             .attn_out,
-            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
-            3,
-            "metal_attention_out",
+            "metal_attention_out_host",
         );
     }
 
