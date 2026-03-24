@@ -493,6 +493,8 @@ fn writeHumanRecord(
 
             try writer.writeAll(" (");
 
+            const show_full_trace_attrs = level == .trace;
+
             if (comptime has_progress and has_total) {
                 // Loop progress: "134/311"
                 inline for (fields) |field| {
@@ -504,6 +506,26 @@ fn writeHumanRecord(
                 inline for (fields) |field| {
                     if (comptime std.mem.eql(u8, field.name, "total")) {
                         try writer.print("{d}", .{@field(attrs, field.name)});
+                    }
+                }
+            } else if (show_full_trace_attrs) {
+                // Trace diagnostics: print all attributes in human logs.
+                var first = true;
+                inline for (fields) |field| {
+                    if (!first) try writer.writeAll(", ");
+                    first = false;
+                    const value = @field(attrs, field.name);
+                    const FieldType = @TypeOf(value);
+                    if (comptime isStringType(FieldType)) {
+                        try writer.print("{s}={s}", .{ field.name, asString(value) });
+                    } else if (@typeInfo(FieldType) == .int) {
+                        try writer.print("{s}={d}", .{ field.name, value });
+                    } else if (@typeInfo(FieldType) == .float) {
+                        try writer.print("{s}={d}", .{ field.name, value });
+                    } else if (@typeInfo(FieldType) == .bool) {
+                        try writer.print("{s}={s}", .{ field.name, if (value) "true" else "false" });
+                    } else {
+                        try writer.print("{s}={s}", .{ field.name, @typeName(FieldType) });
                     }
                 }
             } else {

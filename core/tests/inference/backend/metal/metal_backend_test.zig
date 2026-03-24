@@ -8,11 +8,11 @@ const main = @import("main");
 
 const has_metal = builtin.os.tag == .macos;
 const metal = if (has_metal) main.inference.backend.metal else void;
-const backend_root = main.inference.backend.root;
 const backend_scheduler = main.inference.scheduler;
 const runtime_contract = main.inference.runtime_contract;
 const weights = if (has_metal) main.inference.backend.metal.executor.weights else void;
 const xray = main.xray;
+const sampling = main.inference.backend.metal.sampling;
 
 fn pathExists(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
@@ -203,7 +203,7 @@ test "metal backend xray record+verify capture path is stable under repeated run
         var ref_data = try recorder.finalize();
         defer ref_data.deinit();
 
-        var verifier = xray.ReferenceVerifier.init(allocator, &ref_data, 1e-3);
+        var verifier = xray.ReferenceVerifier.init(allocator, &ref_data, 1e-3, 1e-3);
         defer verifier.deinit();
         {
             var verify_capture = xray.VerifyCapture.initVerification(allocator, &verifier, null);
@@ -224,15 +224,13 @@ test "metal backend remains stable across repeated scheduler lifecycles on one b
     if (!canRunMetalRuntime()) return;
 
     const allocator = std.testing.allocator;
-    const Scheduler = backend_scheduler.GenericScheduler(backend_root.Backend);
+    const Scheduler = backend_scheduler.GenericScheduler(metal.MetalBackend);
 
     const loaded = try weights.createTestLoadedModel(allocator);
     defer weights.destroyTestLoadedModel(allocator, loaded);
     loaded.runtime.architecture_id = "qwen3";
 
-    var backend = backend_root.Backend{
-        .metal = try metal.MetalBackend.init(allocator, loaded),
-    };
+    var backend = try metal.MetalBackend.init(allocator, loaded);
     defer backend.deinit();
 
     const prompt = [_]u32{ 1, 2, 3, 4 };
@@ -255,15 +253,13 @@ test "metal backend explicit worker-thread teardown is stable across repeated ru
     if (!canRunMetalRuntime()) return;
 
     const allocator = std.testing.allocator;
-    const Scheduler = backend_scheduler.GenericScheduler(backend_root.Backend);
+    const Scheduler = backend_scheduler.GenericScheduler(metal.MetalBackend);
 
     const loaded = try weights.createTestLoadedModel(allocator);
     defer weights.destroyTestLoadedModel(allocator, loaded);
     loaded.runtime.architecture_id = "qwen3";
 
-    var backend = backend_root.Backend{
-        .metal = try metal.MetalBackend.init(allocator, loaded),
-    };
+    var backend = try metal.MetalBackend.init(allocator, loaded);
     defer backend.deinit();
 
     const prompt = [_]u32{ 1, 2, 3, 4 };
@@ -271,13 +267,15 @@ test "metal backend explicit worker-thread teardown is stable across repeated ru
 
     const WorkerCtx = struct {
         allocator: std.mem.Allocator,
-        backend: *backend_root.Backend,
+        backend: *metal.MetalBackend,
         prompt: []const u32,
         runError: ?anyerror = null,
 
         fn run(self: *@This()) void {
             defer self.backend.teardownExecutionThreadState();
-            self.runError = self.runOnce() catch |err| err;
+            self.runOnce() catch |err| {
+                self.runError = err;
+            };
         }
 
         fn runOnce(self: *@This()) !void {
@@ -302,5 +300,47 @@ test "metal backend explicit worker-thread teardown is stable across repeated ru
         const thread = try std.Thread.spawn(.{}, WorkerCtx.run, .{&ctx});
         thread.join();
         if (ctx.runError) |err| return err;
+    }
+}
+
+test "metal backend scheduler top-k route remains stable across repeated runs" {
+    if (!canRunMetalRuntime()) return;
+
+    const allocator = std.testing.allocator;
+    const Scheduler = backend_scheduler.GenericScheduler(metal.MetalBackend);
+
+    const loaded = try weights.createTestLoadedModel(allocator);
+    defer weights.destroyTestLoadedModel(allocator, loaded);
+    // The lightweight test fixture weights are qwen3-shaped. Forcing qwen3_5
+    // metadata here hits deterministic projection-shape mismatch in fused dense
+    // kernels before decode routing logic is exercised.
+    loaded.runtime.architecture_id = "qwen3";
+
+    var backend = try metal.MetalBackend.init(allocator, loaded);
+    defer backend.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3, 4 };
+    const iterations: usize = 16;
+
+    const sampling_config = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .temperature = 0.8,
+        .top_k = 10,
+        .top_p = 1.0,
+    };
+
+    for (0..iterations) |_| {
+        var scheduler = try Scheduler.init(allocator, &backend, .{
+            .state_descriptors = backend.stateDescriptors(),
+            .default_sampling = sampling_config,
+        });
+        defer scheduler.deinit();
+
+        var result = try scheduler.generateSync(prompt[0..], 8, .{
+            .sampling = sampling_config,
+        });
+        defer result.deinit(allocator);
+
+        try std.testing.expect(result.tokens.len > 0);
     }
 }

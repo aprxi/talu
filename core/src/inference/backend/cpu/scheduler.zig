@@ -426,9 +426,32 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             value: f32 = -std.math.inf(f32),
         };
 
-        fn parityTop3(logits: []const f32) [3]ParityTopLogit {
+        const ParityStats = struct {
+            top: [3]ParityTopLogit,
+            min: f32,
+            max: f32,
+            finite_count: usize,
+            non_finite_count: usize,
+            checksum: u64,
+        };
+
+        fn parityStats(logits: []const f32) ParityStats {
             var top = [_]ParityTopLogit{ .{}, .{}, .{} };
+            var min_value = std.math.inf(f32);
+            var max_value = -std.math.inf(f32);
+            var finite_count: usize = 0;
+            var non_finite_count: usize = 0;
+            var checksum: u64 = 0xcbf29ce484222325;
+
             for (logits, 0..) |value, idx| {
+                if (!std.math.isFinite(value)) {
+                    non_finite_count += 1;
+                    continue;
+                }
+                finite_count += 1;
+                min_value = @min(min_value, value);
+                max_value = @max(max_value, value);
+
                 const token_id: u32 = @intCast(idx);
                 if (value > top[0].value) {
                     top[2] = top[1];
@@ -440,8 +463,25 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 } else if (value > top[2].value) {
                     top[2] = .{ .token_id = token_id, .value = value };
                 }
+
+                const bits: u32 = @bitCast(value);
+                checksum ^= (@as(u64, token_id) << 32) ^ bits;
+                checksum *%= 0x100000001b3;
             }
-            return top;
+
+            if (finite_count == 0) {
+                min_value = std.math.nan(f32);
+                max_value = std.math.nan(f32);
+            }
+
+            return .{
+                .top = top,
+                .min = min_value,
+                .max = max_value,
+                .finite_count = finite_count,
+                .non_finite_count = non_finite_count,
+                .checksum = checksum,
+            };
         }
 
         fn parityLogits(
@@ -453,23 +493,30 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             slot_index: usize,
         ) void {
             _ = self;
-            if (std.posix.getenv("TALU_PARITY_LOG") == null) return;
-            const top = parityTop3(logits);
-            std.debug.print(
-                "PARITY backend={s} phase={s} pos={} slot={} selected={} top0={}({d:.6}) top1={}({d:.6}) top2={}({d:.6})\n",
+            if (@intFromEnum(log.Level.trace) < @intFromEnum(log.getLogLevel())) return;
+            const stats = parityStats(logits);
+            log.trace(
+                "inference",
+                "PARITY logits",
                 .{
-                    @typeName(BackendType),
-                    phase,
-                    position,
-                    slot_index,
-                    selected,
-                    top[0].token_id,
-                    top[0].value,
-                    top[1].token_id,
-                    top[1].value,
-                    top[2].token_id,
-                    top[2].value,
+                    .backend = @typeName(BackendType),
+                    .phase = phase,
+                    .pos = position,
+                    .slot = slot_index,
+                    .selected = selected,
+                    .finite = stats.finite_count,
+                    .non_finite = stats.non_finite_count,
+                    .min = stats.min,
+                    .max = stats.max,
+                    .checksum = stats.checksum,
+                    .top0_id = stats.top[0].token_id,
+                    .top0_val = stats.top[0].value,
+                    .top1_id = stats.top[1].token_id,
+                    .top1_val = stats.top[1].value,
+                    .top2_id = stats.top[2].token_id,
+                    .top2_val = stats.top[2].value,
                 },
+                @src(),
             );
         }
 

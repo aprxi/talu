@@ -126,6 +126,45 @@ pub const MetalBackend = struct {
         return @intCast(best_idx);
     }
 
+    const LogitsFingerprint = struct {
+        min: f32,
+        max: f32,
+        finite_count: usize,
+        non_finite_count: usize,
+        checksum: u64,
+    };
+
+    fn fingerprintLogits(logits: []const f32) LogitsFingerprint {
+        var min_value = std.math.inf(f32);
+        var max_value = -std.math.inf(f32);
+        var finite_count: usize = 0;
+        var non_finite_count: usize = 0;
+        var checksum: u64 = 0xcbf29ce484222325;
+        for (logits, 0..) |value, idx| {
+            if (!std.math.isFinite(value)) {
+                non_finite_count += 1;
+                continue;
+            }
+            finite_count += 1;
+            min_value = @min(min_value, value);
+            max_value = @max(max_value, value);
+            const bits: u32 = @bitCast(value);
+            checksum ^= (@as(u64, @intCast(idx)) << 32) ^ bits;
+            checksum *%= 0x100000001b3;
+        }
+        if (finite_count == 0) {
+            min_value = std.math.nan(f32);
+            max_value = std.math.nan(f32);
+        }
+        return .{
+            .min = min_value,
+            .max = max_value,
+            .finite_count = finite_count,
+            .non_finite_count = non_finite_count,
+            .checksum = checksum,
+        };
+    }
+
     fn selectNextTokenFromLogits(self: *const MetalBackend, logits: []const f32) !u32 {
         if (logits.len != self.vocab_size) return error.InvalidArgument;
         return if (self.config.logits_scaling < 0.0) argminHost(logits) else argmaxHost(logits);
@@ -436,6 +475,7 @@ pub const MetalBackend = struct {
     fn initKvCacheState(self: *MetalBackend, state_block: *const runtime_contract.StateBlockHandle) !bool {
         const cache = try stateObjectPtr(runtime_graph_mod.Cache, state_block);
         cache.* = runtime_graph_mod.Cache.init(self.layer_count, true, self.cache_max_seq_len);
+        if (cache.handle == null) return error.OutOfMemory;
         return true;
     }
 
@@ -452,6 +492,7 @@ pub const MetalBackend = struct {
     fn initShortConvState(self: *MetalBackend, state_block: *const runtime_contract.StateBlockHandle) !bool {
         const shortconv = try stateObjectPtr(runtime_graph_mod.ShortConvCache, state_block);
         shortconv.* = runtime_graph_mod.ShortConvCache.init(self.layer_count);
+        if (shortconv.handle == null) return error.OutOfMemory;
         return true;
     }
 
@@ -468,6 +509,7 @@ pub const MetalBackend = struct {
     fn initMambaState(self: *MetalBackend, state_block: *const runtime_contract.StateBlockHandle) !bool {
         const mamba = try stateObjectPtr(runtime_graph_mod.MambaCache, state_block);
         mamba.* = runtime_graph_mod.MambaCache.init(self.layer_count);
+        if (mamba.handle == null) return error.OutOfMemory;
         return true;
     }
 
@@ -484,6 +526,7 @@ pub const MetalBackend = struct {
     fn initGatedDeltaState(self: *MetalBackend, state_block: *const runtime_contract.StateBlockHandle) !bool {
         const gated_delta = try stateObjectPtr(runtime_graph_mod.GatedDeltaCache, state_block);
         gated_delta.* = runtime_graph_mod.GatedDeltaCache.init(self.layer_count);
+        if (gated_delta.handle == null) return error.OutOfMemory;
         return true;
     }
 
@@ -549,7 +592,7 @@ pub const MetalBackend = struct {
     }
 
     fn runtimeHandleLooksValid(handle: ?*anyopaque) bool {
-        if (handle == null) return true;
+        if (handle == null) return false;
         return @intFromPtr(handle.?) >= 4096;
     }
 
@@ -771,16 +814,20 @@ pub const MetalBackend = struct {
     ) !void {
         const prev_backend = trace.setBackendContext(.metal);
         defer _ = trace.setBackendContext(prev_backend);
+        const parity_log = @intFromEnum(log.Level.trace) >= @intFromEnum(log.getLogLevel());
+        const slot_position_ptr = try self.slotPositionPtr(slot_index);
+        const slot_position_before = slot_position_ptr.*;
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
         const runtime_rope_ctx = self.textRuntimeRoPEOverride(effective_position, 1);
+        const state_blocks = try self.slotStateBlocks(slot_index);
         const emit_final_path_points = emitParityFinalPathCheckpoints();
         if (emit_final_path_points) {
             const hidden_handle = try runtime_trait.transformerForwardHiddenLazyWithEmbeddingOverride(
                 self.allocator,
                 self.weights,
                 &[_]u32{token},
-                try self.slotStateBlocks(slot_index),
+                state_blocks,
                 self.config,
                 effective_position,
                 null,
@@ -794,7 +841,7 @@ pub const MetalBackend = struct {
                 self.allocator,
                 self.weights,
                 &[_]u32{token},
-                try self.slotStateBlocks(slot_index),
+                state_blocks,
                 self.config,
                 effective_position,
                 null,
@@ -806,6 +853,27 @@ pub const MetalBackend = struct {
             defer graph.freeArray(logits_handle);
             graph.eval(&[_]graph.ArrayHandle{logits_handle});
             graph.copyToHost(logits_handle, logits_out);
+        }
+        if (parity_log) {
+            const fp = fingerprintLogits(logits_out);
+            log.trace(
+                "inference",
+                "PARITY_METAL decode logits",
+                .{
+                    .slot = slot_index,
+                    .token = token,
+                    .pos_arg = position,
+                    .pos_before = slot_position_before,
+                    .pos_effective = effective_position,
+                    .rope_delta = slot_rope_delta.*,
+                    .finite = fp.finite_count,
+                    .non_finite = fp.non_finite_count,
+                    .min = fp.min,
+                    .max = fp.max,
+                    .checksum = fp.checksum,
+                },
+                @src(),
+            );
         }
         try self.emitLmHeadFromReadyLogits(logits_out);
         if (trace.shouldEmit(.logits_ready)) {
@@ -820,8 +888,7 @@ pub const MetalBackend = struct {
                 "metal_logits_host",
             );
         }
-        const slot_position = try self.slotPositionPtr(slot_index);
-        slot_position.* = position + 1;
+        slot_position_ptr.* = position + 1;
     }
 
     fn decodeSlotGreedy(
@@ -1800,6 +1867,12 @@ test "deriveStateRuntimeRoles rejects unsupported runtime_kind" {
         error.InvalidStateDescriptorBinding,
         MetalBackend.deriveStateRuntimeRoles(descriptors[0..]),
     );
+}
+
+test "runtimeHandleLooksValid rejects null and low-pointer handles" {
+    try std.testing.expect(!MetalBackend.runtimeHandleLooksValid(null));
+    try std.testing.expect(!MetalBackend.runtimeHandleLooksValid(@ptrFromInt(1024)));
+    try std.testing.expect(MetalBackend.runtimeHandleLooksValid(@ptrFromInt(4096)));
 }
 
 test "buildMultimodalMropeTables computes multimodal decode position_delta" {
