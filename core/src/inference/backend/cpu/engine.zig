@@ -51,6 +51,7 @@ const xray = @import("../../../xray/root.zig");
 const PoolingStrategy = contract.PoolingStrategy;
 const LoadedModel = models.LoadedModel;
 const kernels = @import("kernels/root.zig");
+const kv_cache_mod = @import("kernels/kv_cache.zig");
 const BatchedKVCache = kernels.BatchedKVCache;
 const LayeredBatchedKVCache = kernels.LayeredBatchedKVCache;
 const BatchedAttnTemp = kernels.BatchedAttnTemp;
@@ -357,14 +358,16 @@ pub const FusedCpuBackend = struct {
             allocator.free(cpu_block_set);
         }
 
-        // Build batched KV cache
-        var kv_cache = try LayeredBatchedKVCache.init(
+        // Build batched KV cache (check env var for quantization mode)
+        const kv_quant_mode = kv_cache_mod.QuantMode.fromEnv();
+        var kv_cache = try LayeredBatchedKVCache.initWithMode(
             allocator,
             layer_total,
             max_batch_size,
             kv_head_total,
             head_dim,
             max_sequence_len,
+            kv_quant_mode,
         );
         errdefer kv_cache.deinit();
         progress.updateLine(1, @intCast(layer_total + 1), null);

@@ -38,6 +38,7 @@ pub const linalg_sdpa = @import("linalg_sdpa.zig");
 pub const state_space = @import("state_space.zig");
 pub const matmul = @import("matmul_primitives.zig");
 pub const accelerate = @import("accelerate.zig");
+pub const metal_accel = @import("metal_accel.zig");
 
 test {
     _ = common;
@@ -72,4 +73,5 @@ test {
     _ = state_space;
     _ = matmul;
     _ = accelerate;
+    _ = metal_accel;
 }

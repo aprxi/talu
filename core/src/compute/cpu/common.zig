@@ -114,6 +114,27 @@ pub fn freePageAlignedF32Slice(slice: []f32) void {
     std.heap.page_allocator.free(bytes[0..aligned_bytes]);
 }
 
+/// Ensure a reusable i8 buffer with page alignment (for quantized KV cache).
+/// Free via freePageAlignedI8Slice.
+pub fn ensurePageAlignedI8Slice(storage: *[]i8, needed: usize) !void {
+    if (storage.*.len >= needed) return;
+    if (storage.*.len > 0) {
+        freePageAlignedI8Slice(storage.*);
+        storage.* = &.{};
+    }
+    const aligned_bytes = std.mem.alignForward(usize, needed, page_size);
+    const bytes = try std.heap.page_allocator.alloc(u8, aligned_bytes);
+    storage.* = @as([*]i8, @ptrCast(bytes.ptr))[0..needed];
+}
+
+/// Free a []i8 that was allocated with page alignment.
+pub fn freePageAlignedI8Slice(slice: []i8) void {
+    if (slice.len == 0) return;
+    const aligned_bytes = std.mem.alignForward(usize, slice.len, page_size);
+    const bytes: [*]u8 = @ptrCast(slice.ptr);
+    std.heap.page_allocator.free(bytes[0..aligned_bytes]);
+}
+
 /// Add a 1-D bias vector to each row of a [rows, dim] f32 buffer.
 pub fn addBiasRows(data: []f32, bias: []const f32, rows: usize, dim: usize) void {
     std.debug.assert(bias.len == dim);
