@@ -472,6 +472,7 @@ pub extern fn mlx_lazy_causal_conv_mixer_quantized(
 pub extern fn mlx_causal_conv_cache_create(n_layers: usize) CausalConvCacheHandle;
 pub extern fn mlx_causal_conv_cache_reset(cache: CausalConvCacheHandle) void;
 pub extern fn mlx_causal_conv_cache_free(cache: CausalConvCacheHandle) void;
+pub extern fn mlx_causal_conv_cache_is_valid(cache: CausalConvCacheHandle) bool;
 
 /// KV cache lifecycle for fused attention.
 pub extern fn mlx_cache_create(n_layers: usize, max_seq_len: usize) CacheHandle;
@@ -483,6 +484,7 @@ pub extern fn mlx_cache_set_full_bfloat16(
     v_full: ArrayHandle,
 ) void;
 pub extern fn mlx_cache_free(cache: CacheHandle) void;
+pub extern fn mlx_cache_is_valid(cache: CacheHandle) bool;
 
 /// Fused state-space block (dense/bfloat16 path)
 pub extern fn mlx_lazy_state_space_block_bf16(
@@ -558,6 +560,7 @@ pub extern fn mlx_lazy_gated_delta_mixer_quantized(
 pub extern fn mlx_state_space_cache_create(n_layers: usize) StateSpaceCacheHandle;
 pub extern fn mlx_state_space_cache_reset(cache: StateSpaceCacheHandle) void;
 pub extern fn mlx_state_space_cache_free(cache: StateSpaceCacheHandle) void;
+pub extern fn mlx_state_space_cache_is_valid(cache: StateSpaceCacheHandle) bool;
 
 // ============================================================================
 // Graph Execution
@@ -2020,6 +2023,26 @@ test "array pool clear and compact require idle reset barrier" {
     try std.testing.expect(used == 0);
     try std.testing.expect(pool_size <= 1);
     try std.testing.expect(mlx_pool_clear_if_idle());
+}
+
+test "metal cache validity handles track lifecycle" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const kv = mlx_cache_create(1, 16);
+    try std.testing.expect(mlx_cache_is_valid(kv));
+    mlx_cache_free(kv);
+    try std.testing.expect(!mlx_cache_is_valid(kv));
+
+    const shortconv = mlx_causal_conv_cache_create(1);
+    try std.testing.expect(mlx_causal_conv_cache_is_valid(shortconv));
+    mlx_causal_conv_cache_free(shortconv);
+    try std.testing.expect(!mlx_causal_conv_cache_is_valid(shortconv));
+
+    const state_space = mlx_state_space_cache_create(1);
+    try std.testing.expect(mlx_state_space_cache_is_valid(state_space));
+    mlx_state_space_cache_free(state_space);
+    try std.testing.expect(!mlx_state_space_cache_is_valid(state_space));
 }
 
 test "gqa index cache is bounded and resettable" {

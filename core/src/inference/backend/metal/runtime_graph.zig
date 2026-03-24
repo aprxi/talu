@@ -39,6 +39,7 @@ extern fn mlx_cache_set_full_bfloat16(
     v_full: ArrayHandle,
 ) void;
 extern fn mlx_cache_eval_all(cache: CacheHandle, n_layers: usize) void;
+extern fn mlx_cache_is_valid(cache: CacheHandle) bool;
 extern fn mlx_cache_update_and_fetch(
     cache: CacheHandle,
     layer_idx: usize,
@@ -62,9 +63,11 @@ extern fn mlx_cache_get_quantized(
 extern fn mlx_causal_conv_cache_create(n_layers: usize) ShortConvCacheHandle;
 extern fn mlx_causal_conv_cache_reset(cache: ShortConvCacheHandle) void;
 extern fn mlx_causal_conv_cache_free(cache: ShortConvCacheHandle) void;
+extern fn mlx_causal_conv_cache_is_valid(cache: ShortConvCacheHandle) bool;
 extern fn mlx_state_space_cache_create(n_layers: usize) MambaCacheHandle;
 extern fn mlx_state_space_cache_reset(cache: MambaCacheHandle) void;
 extern fn mlx_state_space_cache_free(cache: MambaCacheHandle) void;
+extern fn mlx_state_space_cache_is_valid(cache: MambaCacheHandle) bool;
 
 pub const Cache = struct {
     handle: CacheHandle,
@@ -84,12 +87,19 @@ pub const Cache = struct {
 
     pub fn deinit(self: Cache) void {
         if (self.handle == null) return;
+        if (!self.isValid()) return;
         mlx_cache_free(self.handle);
     }
 
     pub fn reset(self: Cache) void {
         if (self.handle == null) return;
+        if (!self.isValid()) return;
         mlx_cache_reset(self.handle);
+    }
+
+    pub fn isValid(self: Cache) bool {
+        if (self.handle == null) return false;
+        return mlx_cache_is_valid(self.handle);
     }
 
     pub fn updateAndFetch(self: Cache, layer_idx: usize, k_new: ArrayHandle, v_new: ArrayHandle) struct { k: ArrayHandle, v: ArrayHandle, is_prefill: bool } {
@@ -173,12 +183,19 @@ pub const ShortConvCache = struct {
 
     pub fn reset(self: ShortConvCache) void {
         if (self.handle == null) return;
+        if (!self.isValid()) return;
         mlx_causal_conv_cache_reset(self.handle);
     }
 
     pub fn deinit(self: ShortConvCache) void {
         if (self.handle == null) return;
+        if (!self.isValid()) return;
         mlx_causal_conv_cache_free(self.handle);
+    }
+
+    pub fn isValid(self: ShortConvCache) bool {
+        if (self.handle == null) return false;
+        return mlx_causal_conv_cache_is_valid(self.handle);
     }
 };
 
@@ -195,12 +212,19 @@ pub const MambaCache = struct {
 
     pub fn reset(self: MambaCache) void {
         if (self.handle == null) return;
+        if (!self.isValid()) return;
         mlx_state_space_cache_reset(self.handle);
     }
 
     pub fn deinit(self: MambaCache) void {
         if (self.handle == null) return;
+        if (!self.isValid()) return;
         mlx_state_space_cache_free(self.handle);
+    }
+
+    pub fn isValid(self: MambaCache) bool {
+        if (self.handle == null) return false;
+        return mlx_state_space_cache_is_valid(self.handle);
     }
 };
 
@@ -217,11 +241,18 @@ pub const GatedDeltaCache = struct {
 
     pub fn reset(self: GatedDeltaCache) void {
         if (self.handle == null) return;
+        if (!self.isValid()) return;
         mlx_state_space_cache_reset(self.handle);
     }
 
     pub fn deinit(self: GatedDeltaCache) void {
         if (self.handle == null) return;
+        if (!self.isValid()) return;
         mlx_state_space_cache_free(self.handle);
+    }
+
+    pub fn isValid(self: GatedDeltaCache) bool {
+        if (self.handle == null) return false;
+        return mlx_state_space_cache_is_valid(self.handle);
     }
 };

@@ -7,6 +7,7 @@
 #pragma once
 
 #include "compute_common.h"
+#include <cstdint>
 
 // ============================================================================
 // KV Cache Layer - stores K/V tensors for one transformer layer.
@@ -42,6 +43,7 @@ struct CacheLayer {
 // KV Cache - per-model cache containing all layers.
 // ============================================================================
 struct MLXCache {
+    uint64_t magic = 0;
     std::vector<CacheLayer> layers;
 };
 
@@ -54,6 +56,7 @@ struct CausalConvLayer {
 };
 
 struct MLXCausalConvCache {
+    uint64_t magic = 0;
     std::vector<CausalConvLayer> layers;
 };
 
@@ -83,5 +86,6 @@ struct StateSpaceLayer {
 };
 
 struct MLXStateSpaceCache {
+    uint64_t magic = 0;
     std::vector<StateSpaceLayer> layers;
 };

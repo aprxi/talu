@@ -604,19 +604,19 @@ pub const MetalBackend = struct {
             .none => true,
             .kv_cache => blk: {
                 const cache = stateObjectPtr(runtime_graph_mod.Cache, state_block) catch break :blk false;
-                break :blk runtimeHandleLooksValid(cache.handle);
+                break :blk cache.isValid() and runtimeHandleLooksValid(cache.handle);
             },
             .shortconv_cache => blk: {
                 const cache = stateObjectPtr(runtime_graph_mod.ShortConvCache, state_block) catch break :blk false;
-                break :blk runtimeHandleLooksValid(cache.handle);
+                break :blk cache.isValid() and runtimeHandleLooksValid(cache.handle);
             },
             .mamba_cache => blk: {
                 const cache = stateObjectPtr(runtime_graph_mod.MambaCache, state_block) catch break :blk false;
-                break :blk runtimeHandleLooksValid(cache.handle);
+                break :blk cache.isValid() and runtimeHandleLooksValid(cache.handle);
             },
             .gated_delta_cache => blk: {
                 const cache = stateObjectPtr(runtime_graph_mod.GatedDeltaCache, state_block) catch break :blk false;
-                break :blk runtimeHandleLooksValid(cache.handle);
+                break :blk cache.isValid() and runtimeHandleLooksValid(cache.handle);
             },
         };
     }

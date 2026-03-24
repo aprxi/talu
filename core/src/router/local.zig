@@ -571,24 +571,32 @@ pub const LocalEngine = struct {
             timing_start_ns = now;
         }
 
-        // Warmup: full single-token forward pass to load all weights into memory.
-        // Direct backend entrypoints require explicit descriptor bindings.
-        var warmup_bindings = try allocateTemporaryStateBindingsForDescriptors(
-            allocator,
-            scheduler_state_descriptors,
-        );
+        // Warmup: CPU backend performs a real forward pass during warmup.
+        // Metal/CUDA warmup is currently a no-op and does not require state
+        // descriptor binding during engine construction.
+        const warmup_needs_state_bindings = switch (compute_backend) {
+            .cpu => true,
+            .metal, .cuda => false,
+        };
+        var warmup_bindings = TemporaryStateBindings{};
         defer warmup_bindings.deinit(allocator);
         var warmup_slot_bound = false;
         defer if (warmup_slot_bound) compute_backend.unbindSlotStateBlocks(0);
-        if (warmup_bindings.handles.len > 0) {
-            compute_backend.bindSlotStateBlocks(0, warmup_bindings.handles) catch |err| {
-                log.warn("inference", "Warmup state bind failed", .{
-                    .reason = @errorName(err),
-                    .state_blocks = warmup_bindings.handles.len,
-                });
-                return err;
-            };
-            warmup_slot_bound = true;
+        if (warmup_needs_state_bindings and scheduler_state_descriptors.len > 0) {
+            warmup_bindings = try allocateTemporaryStateBindingsForDescriptors(
+                allocator,
+                scheduler_state_descriptors,
+            );
+            if (warmup_bindings.handles.len > 0) {
+                compute_backend.bindSlotStateBlocks(0, warmup_bindings.handles) catch |err| {
+                    log.warn("inference", "Warmup state bind failed", .{
+                        .reason = @errorName(err),
+                        .state_blocks = warmup_bindings.handles.len,
+                    });
+                    return err;
+                };
+                warmup_slot_bound = true;
+            }
         }
         compute_backend.warmup() catch |err| {
             log.warn("inference", "Backend warmup failed", .{
