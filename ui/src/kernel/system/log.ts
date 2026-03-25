@@ -11,6 +11,7 @@ const isDev =
   (location.hostname === "localhost" || location.hostname === "127.0.0.1" || location.protocol === "file:");
 
 async function hashString(s: string): Promise<string> {
+  if (!crypto.subtle) return `string(len=${s.length})`;
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   const hex = Array.from(new Uint8Array(buf))
     .map((b) => b.toString(16).padStart(2, "0"))

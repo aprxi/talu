@@ -39,6 +39,7 @@ import { BUILTIN_THEMES } from "../../styles/color-schemes.ts";
 import { setupThemePicker } from "../ui/theme-picker.ts";
 import { createApiClient } from "../../api.ts";
 import { initKvSettings, migrateLocalStorageToKv } from "../system/kv-settings.ts";
+import { preferences } from "../system/preferences.ts";
 
 // --- Per-plugin state ---
 
@@ -454,6 +455,10 @@ export async function bootKernel(builtinPlugins: PluginDefinition[]): Promise<vo
   const kernelApi = createApiClient(fetch);
   initKvSettings(kernelApi);
   await migrateLocalStorageToKv();
+
+  // Load all UI preferences in one KV GET (migrates from legacy keys on first boot).
+  await preferences.load(kernelApi);
+  window.addEventListener("beforeunload", () => { void preferences.flush(); });
 
   // Load persisted keybinding overrides before plugin registration.
   await loadKeybindingOverrides();

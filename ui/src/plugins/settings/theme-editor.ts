@@ -13,8 +13,7 @@ import type { Disposable } from "../../kernel/types.ts";
 import { theme, layout, storage, download, notifications, dialogs } from "./deps.ts";
 import { settingsState, type CustomTheme } from "./state.ts";
 import { getSettingsDom } from "./dom.ts";
-
-const STORAGE_KEY = "custom_themes";
+import { preferences } from "../../kernel/system/preferences.ts";
 
 // ── Token grouping for the editor ────────────────────────────────────────────
 
@@ -322,12 +321,8 @@ function openColorPicker(
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-async function persistCustomThemes(): Promise<void> {
-  try {
-    await storage.set(STORAGE_KEY, settingsState.customThemes);
-  } catch {
-    notifications.error("Failed to save custom themes");
-  }
+function persistCustomThemes(): void {
+  preferences.set("talu.settings", "custom_themes", settingsState.customThemes);
 }
 
 // ── Populate theme selects (one per mode) ────────────────────────────────────
@@ -622,7 +617,7 @@ export function renderThemeList(): void {
 
 export async function loadCustomThemes(): Promise<void> {
   try {
-    const stored = await storage.get<CustomTheme[]>(STORAGE_KEY);
+    const stored = preferences.get<CustomTheme[]>("talu.settings", "custom_themes");
     if (!stored || !Array.isArray(stored)) return;
 
     for (const ct of stored) {

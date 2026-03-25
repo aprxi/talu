@@ -1,7 +1,7 @@
 import { getChatDom } from "./dom.ts";
 import { chatState, getActiveProjectId } from "./state.ts";
 import { api, notifications, observe } from "./deps.ts";
-import { setSetting, deleteSetting } from "../../kernel/system/kv-settings.ts";
+import { preferences } from "../../kernel/system/preferences.ts";
 import { renderSidebarItem, renderSectionLabel } from "../../render/sidebar.ts";
 import { renderEmptyState } from "../../render/common.ts";
 import { el, isPinned, isArchived, relativeTime } from "../../render/helpers.ts";
@@ -92,22 +92,7 @@ function projectKey(s: Conversation): string {
 }
 
 export function persistCollapsed(): void {
-  const arr = [...chatState.collapsedGroups];
-  const json = arr.length > 0 ? JSON.stringify(arr) : null;
-  // KV primary (fire-and-forget).
-  if (json) {
-    void setSetting("talu-collapsed-groups", json);
-  } else {
-    void deleteSetting("talu-collapsed-groups");
-  }
-  // localStorage sync cache.
-  try {
-    if (json) {
-      localStorage.setItem("talu-collapsed-groups", json);
-    } else {
-      localStorage.removeItem("talu-collapsed-groups");
-    }
-  } catch { /* storage full or unavailable */ }
+  preferences.set("talu.chat", "collapsed_groups", [...chatState.collapsedGroups]);
 }
 
 function renderGroupedList(

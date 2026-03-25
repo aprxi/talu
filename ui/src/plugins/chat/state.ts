@@ -8,7 +8,7 @@
 
 import type { Conversation } from "../../types.ts";
 import type { UploadFileReference } from "../../kernel/types.ts";
-import { getSetting } from "../../kernel/system/kv-settings.ts";
+import { preferences } from "../../kernel/system/preferences.ts";
 
 export interface ChatAttachment {
   file: UploadFileReference;
@@ -53,12 +53,11 @@ export interface ChatState {
   };
 }
 
-/** Load collapsed groups from KV (falls back to localStorage). Call once during chat plugin init. */
+/** Load collapsed groups from unified preferences. Call once during chat plugin init. */
 export async function loadCollapsedGroups(): Promise<void> {
   try {
-    const raw = await getSetting("talu-collapsed-groups");
-    if (raw) {
-      const arr = JSON.parse(raw) as string[];
+    const arr = preferences.get<string[]>("talu.chat", "collapsed_groups");
+    if (arr && Array.isArray(arr)) {
       for (const key of arr) chatState.collapsedGroups.add(key);
     }
   } catch { /* ignore */ }

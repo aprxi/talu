@@ -15,6 +15,7 @@ import type {
   PluginDefinition,
 } from "../../kernel/types.ts";
 import { navigate, onRouteChange, parseHash } from "../../kernel/system/router.ts";
+import { preferences } from "../../kernel/system/preferences.ts";
 
 /* ------------------------------------------------------------------ */
 /*  State                                                              */
@@ -716,7 +717,7 @@ export const editorOpsPlugin: PluginDefinition = {
 
     autoSaveCb.addEventListener("change", () => {
       state.autoSave = autoSaveCb.checked;
-      ctx.storage.set(STORAGE_AUTO_SAVE, state.autoSave).catch(() => {});
+      preferences.set("talu.editorops", "auto_save", state.autoSave);
       if (state.autoSave && state.dirty) {
         scheduleAutoSave();
       }
@@ -766,7 +767,7 @@ export const editorOpsPlugin: PluginDefinition = {
 
     /* --- Restore persisted state --- */
 
-    const savedAutoSave = await ctx.storage.get<boolean>(STORAGE_AUTO_SAVE).catch(() => null);
+    const savedAutoSave = preferences.get<boolean>("talu.editorops", "auto_save");
     if (savedAutoSave === true) {
       state.autoSave = true;
       autoSaveCb.checked = true;

@@ -36,6 +36,7 @@ import { getModelsService, getPromptsService } from "./deps.ts";
 import { initProjectStore, loadApiProjects, migrateLocalStorageProjects } from "../../render/project-combo.ts";
 import { navigate, onRouteChange } from "../../kernel/system/router.ts";
 import { initModelPicker } from "../../render/model-picker.ts";
+import { preferences } from "../../kernel/system/preferences.ts";
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -177,10 +178,10 @@ export const chatPlugin: PluginDefinition = {
     // Load collapsed sidebar groups from KV before first render.
     await loadCollapsedGroups();
 
-    // Initialize thinking state from storage (before any rendering).
-    const thinkingExpanded = await ctx.storage.get<boolean>("thinkingExpanded") ?? false;
+    // Initialize thinking state from unified preferences (before any rendering).
+    const thinkingExpanded = preferences.get<boolean>("talu.chat", "thinking_expanded") ?? false;
     initThinkingState(thinkingExpanded, (v) => {
-      ctx.storage.set("thinkingExpanded", v).catch(() => ctx.log.warn("Failed to save thinking preference"));
+      preferences.set("talu.chat", "thinking_expanded", v);
     });
 
     // Wire renderer pipeline to the streaming layer.

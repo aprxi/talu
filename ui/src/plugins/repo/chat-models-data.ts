@@ -1,11 +1,9 @@
-/** Chat models data operations: load/save from KV, add/remove/reorder. */
+/** Chat models data operations: load/save from preferences, add/remove/reorder. */
 
 import { api, events, notifications } from "./deps.ts";
 import { repoState, inferFamilyKey } from "./state.ts";
 import { renderChatModels } from "./chat-models-render.ts";
-
-const KV_NS = "chat_models";
-const KV_KEY = "models";
+import { preferences } from "../../kernel/system/preferences.ts";
 
 function emitChanged(): void {
   // Build family→defaultVariant mapping with variant lists so the model
@@ -34,20 +32,15 @@ function emitChanged(): void {
 }
 
 export async function loadChatModels(): Promise<void> {
-  const res = await api.kvGet(KV_NS, KV_KEY);
-  if (res.ok && res.data?.value) {
-    try {
-      const parsed = JSON.parse(res.data.value);
-      if (Array.isArray(parsed)) {
-        repoState.chatModels = parsed.filter((x): x is string => typeof x === "string");
-      }
-    } catch { /* ignore parse errors */ }
+  const stored = preferences.get<string[]>("talu.repo", "pinned_models");
+  if (stored && Array.isArray(stored)) {
+    repoState.chatModels = stored.filter((x): x is string => typeof x === "string");
   }
   emitChanged();
 }
 
-async function saveChatModels(): Promise<void> {
-  await api.kvPut(KV_NS, KV_KEY, JSON.stringify(repoState.chatModels));
+function saveChatModels(): void {
+  preferences.set("talu.repo", "pinned_models", repoState.chatModels);
   emitChanged();
 }
 
