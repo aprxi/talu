@@ -1,5 +1,6 @@
 import type { Conversation, ModelEntry } from "../types.ts";
 import { FormatAccessImpl } from "../kernel/system/format.ts";
+import { syncModelPicker } from "./model-picker.ts";
 
 const fmt = new FormatAccessImpl();
 
@@ -91,10 +92,17 @@ export function formatDate(epoch: number): string {
 export function populateModelSelect(sel: HTMLSelectElement, models: ModelEntry[], selected: string): void {
   sel.innerHTML = "";
   if (models.length === 0) {
-    const opt = document.createElement("option");
-    opt.value = "";
-    opt.textContent = "No models available";
-    sel.appendChild(opt);
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "No models available";
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    sel.appendChild(placeholder);
+    const addOpt = document.createElement("option");
+    addOpt.value = "__add_model__";
+    addOpt.textContent = "Add model";
+    sel.appendChild(addOpt);
+    syncModelPicker(sel);
     return;
   }
 
@@ -132,6 +140,15 @@ export function populateModelSelect(sel: HTMLSelectElement, models: ModelEntry[]
     }
   }
 
+  // Add a separator + "Add model" action at the bottom.
+  const sepGroup = document.createElement("optgroup");
+  sepGroup.label = "──────────";
+  const addOpt = document.createElement("option");
+  addOpt.value = "__add_model__";
+  addOpt.textContent = "Add model";
+  sepGroup.appendChild(addOpt);
+  sel.appendChild(sepGroup);
+
   if (selected && models.some((m) => m.id === selected)) {
     sel.value = selected;
   } else if (selected) {
@@ -141,4 +158,5 @@ export function populateModelSelect(sel: HTMLSelectElement, models: ModelEntry[]
   } else if (models.length > 0 && models[0]) {
     sel.value = models[0].id;
   }
+  syncModelPicker(sel);
 }

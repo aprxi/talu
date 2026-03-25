@@ -34,7 +34,8 @@ import { getChatPanelDom } from "./chat-panel-dom.ts";
 import { chatState, getActiveProjectId, loadCollapsedGroups } from "./state.ts";
 import { getModelsService, getPromptsService } from "./deps.ts";
 import { initProjectStore, loadApiProjects, migrateLocalStorageProjects } from "../../render/project-combo.ts";
-import { onRouteChange } from "../../kernel/system/router.ts";
+import { navigate, onRouteChange } from "../../kernel/system/router.ts";
+import { initModelPicker } from "../../render/model-picker.ts";
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -50,10 +51,6 @@ function populatePromptSelect(
   defaultId?: string | null,
 ): void {
   sel.innerHTML = "";
-  const noneOpt = document.createElement("option");
-  noneOpt.value = "";
-  noneOpt.textContent = "None";
-  sel.appendChild(noneOpt);
   for (const p of prompts) {
     const opt = document.createElement("option");
     opt.value = p.id;
@@ -221,21 +218,70 @@ export const chatPlugin: PluginDefinition = {
         const parentRect = dom.welcomeState.getBoundingClientRect();
         dom.welcomeAdvanced.style.top = `${inputRect.bottom - parentRect.top + 8}px`;
       };
-      dom.welcomeSettings.addEventListener("click", () => {
-        const wasHidden = dom.welcomeAdvanced.classList.contains("hidden");
-        dom.welcomeAdvanced.classList.toggle("hidden");
-        dom.welcomeSettings.classList.toggle("active", wasHidden);
-        if (wasHidden) positionAdvanced();
-      });
-      dom.welcomeAdvanced.addEventListener("dblclick", () => {
+      const showAdvancedPanel = (panel: "sampling" | "generation", toggle = false) => {
+        const showPanel = panel === "sampling" ? dom.welcomePanelSampling : dom.welcomePanelGeneration;
+        const hidePanel = panel === "sampling" ? dom.welcomePanelGeneration : dom.welcomePanelSampling;
+
+        const containerHidden = dom.welcomeAdvanced.classList.contains("hidden");
+        const panelAlreadyVisible = !showPanel.classList.contains("hidden");
+
+        if (toggle && !containerHidden && panelAlreadyVisible) {
+          dom.welcomeAdvanced.classList.add("hidden");
+          dom.welcomeGeneration.classList.remove("active");
+          return;
+        }
+
+        showPanel.classList.remove("hidden");
+        hidePanel.classList.add("hidden");
+        dom.welcomeGeneration.classList.toggle("active", panel === "generation");
+        dom.welcomeAdvanced.classList.remove("hidden");
+        positionAdvanced();
+      };
+      const dismissAdvanced = () => {
         dom.welcomeAdvanced.classList.add("hidden");
-        dom.welcomeSettings.classList.remove("active");
+        dom.welcomeGeneration.classList.remove("active");
+      };
+      dom.welcomeGeneration.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showAdvancedPanel("generation", true);
       });
       window.addEventListener("resize", () => {
         if (!dom.welcomeAdvanced.classList.contains("hidden")) positionAdvanced();
       });
 
+      // Clicks inside the advanced panel should not dismiss it.
+      dom.welcomeAdvanced.addEventListener("mousedown", (e) => {
+        e.stopPropagation();
+      });
+
+      // Close settings when clicking outside the advanced panel and trigger area.
+      document.addEventListener("mousedown", (e) => {
+        if (dom.welcomeAdvanced.classList.contains("hidden")) return;
+        const target = e.target as Node;
+        if (dom.welcomeGeneration.contains(target)) return;
+        // Don't dismiss if clicking inside the model picker (it has its own dismiss).
+        const wrap = dom.welcomeModel.closest(".model-select-wrap");
+        if (wrap?.contains(target)) return;
+        dismissAdvanced();
+      });
+
+      // Initialize custom model picker — settings icon opens sampling panel.
+      initModelPicker(dom.welcomeModel, {
+        onSettings: () => showAdvancedPanel("sampling", true),
+        onDismiss: dismissAdvanced,
+      });
     }
+
+    // Gray out sampling controls when no model is selected.
+    const syncSamplingDisabled = (hasModel: boolean) => {
+      const controls = getChatDom().welcomeSamplingControls;
+      if (hasModel) {
+        controls.classList.remove("disabled");
+      } else {
+        controls.classList.add("disabled");
+      }
+    };
 
     // Listen for cross-plugin events.
     ctx.events.on<{ modelId: string; availableModels: ModelEntry[] }>("model.changed", ({ modelId, availableModels }) => {
@@ -244,6 +290,7 @@ export const chatPlugin: PluginDefinition = {
       populateModelSelect(dom.welcomeModel, availableModels, modelId);
       populateModelSelect(pd.panelModel, availableModels, modelId);
       syncRightPanelParams(modelId);
+      syncSamplingDisabled(!!modelId);
 
       // Render variant pills for the active model's family.
       const entry = availableModels.find((m) => m.id === modelId)
@@ -289,6 +336,8 @@ export const chatPlugin: PluginDefinition = {
 
     ctx.events.on<{ enabled: boolean }>("settings.system_prompt_enabled", ({ enabled }) => {
       chatState.systemPromptEnabled = enabled;
+      getChatDom().welcomePromptEnabled.checked = enabled;
+      getChatDom().welcomePrompt.disabled = !enabled;
     });
 
     // Variant pill in repo plugin → open a new chat with that model.
@@ -302,6 +351,24 @@ export const chatPlugin: PluginDefinition = {
       if (from === "chat") hideChatPanel();
     });
 
+    getChatPanelDom().panelModelEdit.addEventListener("click", () => {
+      navigate({ mode: "routing", sub: null, resource: null });
+    });
+    getChatDom().welcomePromptEdit.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      navigate({ mode: "conversations", sub: "context", resource: null });
+    });
+
+    // Sync system prompt toggle with global setting.
+    getChatDom().welcomePromptEnabled.checked = chatState.systemPromptEnabled;
+    getChatDom().welcomePrompt.disabled = !chatState.systemPromptEnabled;
+    getChatDom().welcomePromptEnabled.addEventListener("change", () => {
+      const enabled = getChatDom().welcomePromptEnabled.checked;
+      chatState.systemPromptEnabled = enabled;
+      getChatDom().welcomePrompt.disabled = !enabled;
+    });
+
     // Pull initial state from services (events fired before our listeners existed).
     const models = getModelsService();
     if (models) {
@@ -310,6 +377,9 @@ export const chatPlugin: PluginDefinition = {
       populateModelSelect(getChatDom().welcomeModel, available, modelId);
       populateModelSelect(getChatPanelDom().panelModel, available, modelId);
       syncRightPanelParams(modelId);
+      syncSamplingDisabled(!!modelId);
+    } else {
+      syncSamplingDisabled(false);
     }
 
     const promptsSvc = getPromptsService();

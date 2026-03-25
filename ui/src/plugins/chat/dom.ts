@@ -26,14 +26,20 @@ export interface ChatDom {
   welcomeAttachmentList: HTMLElement;
   welcomeModel: HTMLSelectElement;
   welcomePrompt: HTMLSelectElement;
-  welcomeSettings: HTMLButtonElement;
+  welcomeSamplingControls: HTMLElement;
+  welcomeGeneration: HTMLButtonElement;
   welcomeAdvanced: HTMLElement;
+  welcomePanelSampling: HTMLElement;
+  welcomePanelGeneration: HTMLElement;
   welcomeVariantRow: HTMLElement;
   welcomeVariantPills: HTMLElement;
   welcomeTemperature: HTMLInputElement;
   welcomeTopP: HTMLInputElement;
   welcomeTopK: HTMLInputElement;
   welcomeMaxTokens: HTMLInputElement;
+  welcomeContextLength: HTMLInputElement;
+  welcomePromptEdit: HTMLButtonElement;
+  welcomePromptEnabled: HTMLInputElement;
 
   // Active chat input
   inputBar: HTMLElement;
@@ -80,14 +86,20 @@ export function getChatDom(): ChatDom {
     welcomeAttachmentList: q("#welcome-attachment-list"),
     welcomeModel: q<HTMLSelectElement>("#welcome-model"),
     welcomePrompt: q<HTMLSelectElement>("#welcome-prompt"),
-    welcomeSettings: q<HTMLButtonElement>("#welcome-settings"),
+    welcomeSamplingControls: q("#welcome-sampling-controls"),
+    welcomeGeneration: q<HTMLButtonElement>("#welcome-generation"),
     welcomeAdvanced: q("#welcome-advanced"),
+    welcomePanelSampling: q("#welcome-panel-sampling"),
+    welcomePanelGeneration: q("#welcome-panel-generation"),
     welcomeVariantRow: q("#welcome-variant-row"),
     welcomeVariantPills: q("#welcome-variant-pills"),
     welcomeTemperature: q<HTMLInputElement>("#welcome-temperature"),
     welcomeTopP: q<HTMLInputElement>("#welcome-top-p"),
     welcomeTopK: q<HTMLInputElement>("#welcome-top-k"),
     welcomeMaxTokens: q<HTMLInputElement>("#welcome-max-tokens"),
+    welcomeContextLength: q<HTMLInputElement>("#welcome-context-length"),
+    welcomePromptEdit: q<HTMLButtonElement>("#welcome-prompt-edit"),
+    welcomePromptEnabled: q<HTMLInputElement>("#welcome-prompt-enabled"),
 
     inputBar: q("#input-bar"),
     inputText: q<HTMLTextAreaElement>("#input-text"),

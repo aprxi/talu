@@ -22,8 +22,10 @@ export function hideWelcome(): void {
 }
 
 export function showInputBar(): void {
-  getChatDom().inputBar.classList.remove("hidden");
+  const dom = getChatDom();
+  dom.inputBar.classList.remove("hidden");
   hideWelcome();
+  dom.inputText.focus();
 }
 
 export function hideInputBar(): void {
@@ -70,18 +72,18 @@ export function startNewConversation(projectId?: string | null): void {
   dom.welcomeInput.style.height = "auto";
   // Reset inline advanced options.
   dom.welcomeAdvanced.classList.add("hidden");
-  dom.welcomeSettings.classList.remove("active");
+  dom.welcomeGeneration.classList.remove("active");
   dom.welcomeTemperature.value = "";
   dom.welcomeTopP.value = "";
   dom.welcomeTopK.value = "";
   dom.welcomeMaxTokens.value = "";
+  dom.welcomeContextLength.value = "";
   dom.welcomeInput.focus();
 }
 
 export function setInputEnabled(enabled: boolean): void {
   const dom = getChatDom();
-  dom.inputText.disabled = !enabled;
-  dom.welcomeInput.disabled = !enabled;
+  // Keep text inputs enabled so the user can type ahead during generation.
   dom.welcomeSend.disabled = !enabled;
   dom.welcomeAttach.disabled = !enabled;
   dom.inputAttach.disabled = !enabled;

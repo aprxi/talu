@@ -25,16 +25,16 @@ import { buildPromptsDOM } from "../prompts/build-dom.ts";
 import { initPromptsDom } from "../prompts/dom.ts";
 import { wireEvents as wirePromptsEvents } from "../prompts/editor.ts";
 import { initPage as initPromptsPage } from "../prompts/index.ts";
-import { navigate, onRouteChange } from "../../kernel/system/router.ts";
+import { navigate, onRouteChange, parseHash } from "../../kernel/system/router.ts";
 
-function initConversationsBrowser(): void {
+function initConversationsBrowser(subPage?: "context" | null): void {
   // Cancel any in-flight load so it won't overwrite state.
   bState.loadGeneration++;
   bState.isLoading = false;
 
   const dom = getBrowserDom();
   bState.selectedIds.clear();
-  bState.subPage = null;
+  bState.subPage = subPage ?? null;
   dom.searchInput.value = "";
   search.query = "";
   search.tagFilters = [];
@@ -120,7 +120,13 @@ export const browserPlugin: PluginDefinition = {
 
     ctx.events.on<{ to: string }>("mode.changed", ({ to }) => {
       if (to === "conversations") {
-        initConversationsBrowser();
+        // Check route before init so we don't flash the wrong sub-page.
+        const route = parseHash(window.location.hash);
+        const targetSub = (route.mode === "conversations" && route.sub === "context") ? "context" : null;
+        initConversationsBrowser(targetSub);
+        if (targetSub === "context") {
+          initPromptsPage();
+        }
       }
     });
 

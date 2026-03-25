@@ -175,6 +175,12 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       ...getSamplingParams(),
     };
 
+    // Pass session_id so the server can resume the conversation even without
+    // previous_response_id (e.g. after a page refresh clears in-memory state).
+    if (chatState.activeSessionId && !chatState.activeSessionId.startsWith("__pending_")) {
+      requestBody.metadata = { ...requestBody.metadata, session_id: chatState.activeSessionId };
+    }
+
     // Inject pending project so the server creates the session under that project.
     if (chatState.pendingProjectId) {
       requestBody.metadata = { ...requestBody.metadata, project_id: chatState.pendingProjectId };
@@ -327,7 +333,7 @@ async function handleWelcomeSend(): Promise<void> {
   if (chatState.isGenerating || isAttachmentUploadInProgress()) return;
   if (!text.trim() && !hasAttachments()) return;
 
-  // Explicit selection from dropdown; if "None", auto-apply default when enabled.
+  // Use explicitly selected prompt, or fall back to default when enabled.
   let promptId = dom.welcomePrompt.value || null;
   if (!promptId && chatState.systemPromptEnabled) {
     promptId = getPromptsService()?.getDefaultPromptId() ?? null;
@@ -351,12 +357,28 @@ async function handleWelcomeSend(): Promise<void> {
 async function handleSend(): Promise<void> {
   const dom = getChatDom();
   const text = dom.inputText.value;
-  if (chatState.isGenerating || isAttachmentUploadInProgress()) return;
+  if (isAttachmentUploadInProgress()) return;
   if (!text.trim() && !hasAttachments()) return;
+
+  // Cancel in-progress stream and wait for cleanup before sending.
+  if (chatState.isGenerating) {
+    cancelGeneration();
+    await waitForIdle();
+  }
 
   const input = composeUserInput(text);
   const displayText = typeof input === "string" ? input : text.trim() || "Describe the attached file.";
   await sendAndStream({ text: displayText, input });
+}
+
+function waitForIdle(): Promise<void> {
+  return new Promise((resolve) => {
+    const check = () => {
+      if (!chatState.isGenerating) resolve();
+      else setTimeout(check, 16);
+    };
+    check();
+  });
 }
 
 /**

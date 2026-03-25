@@ -6,9 +6,12 @@
  * Element refs survive DOM detachment (values persist on hidden inputs).
  */
 
+import { EDIT_ICON } from "../../icons.ts";
+
 export interface ChatPanelDom {
   root: HTMLElement;
   panelModel: HTMLSelectElement;
+  panelModelEdit: HTMLButtonElement;
   panelTemperature: HTMLInputElement;
   panelTopP: HTMLInputElement;
   panelTopK: HTMLInputElement;
@@ -100,11 +103,16 @@ export function getChatPanelDom(): ChatPanelDom {
   modelLabel.textContent = "Model";
   modelWrapper.appendChild(modelLabel);
 
-  const panelModel = el("select", { id: "panel-model", className: "form-select form-select-sm" });
+  const modelSelectWrap = el("div", { className: "model-select-wrap", style: "width: 100%" });
+  const panelModelEdit = el("button", { className: "model-select-icon", title: "Manage models" });
+  panelModelEdit.innerHTML = EDIT_ICON;
+  modelSelectWrap.appendChild(panelModelEdit);
+  const panelModel = el("select", { id: "panel-model", className: "form-select form-select-sm model-select-has-icon" });
   const loadingOpt = el("option", { value: "" });
   loadingOpt.textContent = "Loading...";
   panelModel.appendChild(loadingOpt);
-  modelWrapper.appendChild(panelModel);
+  modelSelectWrap.appendChild(panelModel);
+  modelWrapper.appendChild(modelSelectWrap);
   root.appendChild(modelWrapper);
 
   // ── Sampling section ──────────────────────────────────────────────────
@@ -206,6 +214,7 @@ export function getChatPanelDom(): ChatPanelDom {
   cached = {
     root,
     panelModel,
+    panelModelEdit: panelModelEdit as HTMLButtonElement,
     panelTemperature: temp.input,
     panelTopP: topP.input,
     panelTopK: topK.input,

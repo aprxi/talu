@@ -274,7 +274,14 @@ async fn handle_generate(
     let previous_response_id = parsed.previous_response_id.clone();
     let input_value = parsed.input.clone();
     let store = parsed.store.unwrap_or(false);
-    let request_session_id = None;
+    // Extract session_id from metadata (allows clients to resume a conversation
+    // without previous_response_id, e.g. after a page refresh).
+    let request_session_id: Option<String> = parsed
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("session_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let prompt_id = None;
 
     // Internal project scoping hint (if present in metadata).
@@ -865,20 +872,27 @@ async fn generate_response(
 
             // Enable storage persistence if store=true and bucket is configured.
             // set_storage_db auto-loads any existing items for this session.
-            if let Some(ref bp) = bucket_for_task {
+            let has_storage = if let Some(ref bp) = bucket_for_task {
                 if let Some(bp_str) = bp.to_str() {
                     log::trace!(target: "server::gen", "set_storage_db({:?}, {})", bp_str, session_id_for_task);
                     chat.set_storage_db(bp_str, &session_id_for_task)
                         .map_err(|e| anyhow!("failed to set storage: {}", e))?;
+                    true
+                } else {
+                    false
                 }
-            }
+            } else {
+                false
+            };
 
-            // Restore previous conversation from in-memory JSON (only when
-            // storage is not active — set_storage_db already loaded items).
-            if let Some(ref prev) = prev_json {
-                log::trace!(target: "server::gen", "load_responses_json(prev, {} bytes)", prev.len());
-                chat.load_responses_json(prev)
-                    .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
+            // Restore previous conversation from in-memory JSON only when
+            // storage is not active — set_storage_db already loaded persisted items.
+            if !has_storage {
+                if let Some(ref prev) = prev_json {
+                    log::trace!(target: "server::gen", "load_responses_json(prev, {} bytes)", prev.len());
+                    chat.load_responses_json(prev)
+                        .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
+                }
             }
 
             // Load input items into the conversation, resolving file references.
@@ -1983,20 +1997,27 @@ fn run_streaming_generation(
 
     // Enable storage persistence if store=true and bucket is configured.
     // set_storage_db auto-loads any existing items for this session.
-    if let Some(ref bp) = bucket_path {
+    let has_storage = if let Some(ref bp) = bucket_path {
         if let Some(bp_str) = bp.to_str() {
             log::trace!(target: "server::gen", "set_storage_db({:?}, {})", bp_str, session_id);
             chat.set_storage_db(bp_str, &session_id)
                 .map_err(|e| anyhow!("failed to set storage: {}", e))?;
+            true
+        } else {
+            false
         }
-    }
+    } else {
+        false
+    };
 
-    // Restore previous conversation from in-memory JSON (only when
-    // storage is not active — set_storage_db already loaded items).
-    if let Some(ref prev) = prev_json {
-        log::trace!(target: "server::gen", "load_responses_json(prev, {} bytes)", prev.len());
-        chat.load_responses_json(prev)
-            .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
+    // Restore previous conversation from in-memory JSON only when storage
+    // is not active — set_storage_db already loaded persisted items.
+    if !has_storage {
+        if let Some(ref prev) = prev_json {
+            log::trace!(target: "server::gen", "load_responses_json(prev, {} bytes)", prev.len());
+            chat.load_responses_json(prev)
+                .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
+        }
     }
 
     // Load input items into the conversation, resolving file references.
@@ -2191,17 +2212,30 @@ fn run_batch_streaming_generation(
     // --- Conversation setup (same as run_streaming_generation) ---
     let chat = ChatHandle::new(system_prompt.as_deref())?;
 
-    if let Some(ref bp) = bucket_path {
+    let has_storage = if let Some(ref bp) = bucket_path {
         if let Some(bp_str) = bp.to_str() {
             chat.set_storage_db(bp_str, &session_id)
                 .map_err(|e| anyhow!("failed to set storage: {}", e))?;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Restore previous conversation from in-memory JSON only when storage
+    // is not active — set_storage_db already loaded persisted items.
+    if !has_storage {
+        if let Some(ref prev) = prev_json {
+            chat.load_responses_json(prev)
+                .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
         }
     }
 
-    if let Some(ref prev) = prev_json {
-        chat.load_responses_json(prev)
-            .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
-    }
+    log::info!(target: "server::gen",
+        "batch_stream setup: has_storage={} items_after_load={} has_prev={}",
+        has_storage, chat.item_count(), prev_json.is_some());
 
     if let Some(ref json) = input_json {
         let resolved = match file_storage_path.as_deref() {
@@ -2216,6 +2250,8 @@ fn run_batch_streaming_generation(
     }
 
     let pre_gen_count = chat.item_count();
+    log::info!(target: "server::gen",
+        "batch_stream pre-gen: items={}", pre_gen_count);
 
     if bucket_path.is_some() && pre_gen_count <= 2 {
         let t = input_string.as_deref().unwrap_or("Untitled");
@@ -2368,6 +2404,16 @@ fn run_batch_streaming_generation(
         }
     }
 
+    // Flush the last content/item so output_items is fully populated before
+    // we read it for storage persistence and response building.
+    if let Ok(mut guard) = ctx.lock() {
+        let _ = guard.flush_coalesce();
+        let _ = guard.emit_content_done();
+        let _ = guard.emit_item_done();
+        log::info!(target: "server::gen",
+            "batch_stream post-flush: output_items={}", guard.output_items.len());
+    }
+
     // Build output items from StreamCtx (properly structured with item_type
     // segmentation and now-patched function_call metadata).
     let output_items = if let Ok(guard) = ctx.lock() {
@@ -2383,14 +2429,20 @@ fn run_batch_streaming_generation(
     // For conversation chaining, load the output_items into the ChatHandle.
     // Reasoning items (no text) are skipped by the parser; message items
     // carry only output text; function_call items have full metadata.
+    let pre_load_count = chat.item_count();
     if let Ok(guard) = ctx.lock() {
         if !guard.output_items.is_empty() {
             let items_json =
                 serde_json::to_string(&guard.output_items).unwrap_or_else(|_| "[]".to_string());
+            log::debug!(target: "server::gen",
+                "batch stream: loading {} output items ({} bytes) into chat (pre_count={})",
+                guard.output_items.len(), items_json.len(), pre_load_count);
             if let Err(e) = chat.load_responses_json(&items_json) {
                 log::warn!(target: "server::gen",
                     "batch stream chaining: load_responses_json failed: {e}");
             }
+            log::debug!(target: "server::gen",
+                "batch stream: post-load item_count={}", chat.item_count());
         }
     }
 
@@ -3122,6 +3174,9 @@ impl StreamCtx {
             }),
         };
         self.output_items.push(item_object.clone());
+        // Reset to prevent duplicate emission on repeated calls.
+        self.cur_item_type = None;
+        self.cur_content_type = None;
 
         let payload = json!({
             "type": "response.output_item.done",
