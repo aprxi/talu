@@ -146,6 +146,7 @@ pub extern fn mlx_lazy_quantized_matmul(
     transpose: bool,
 ) ArrayHandle;
 
+
 /// RMS norm - >>> Lazy: rms_norm
 pub extern fn mlx_lazy_rms_norm(
     input: ArrayHandle,

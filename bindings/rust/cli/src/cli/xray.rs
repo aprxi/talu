@@ -224,6 +224,14 @@ fn display_token_index(token_idx: u32) -> u32 {
     token_idx.saturating_add(1)
 }
 
+fn display_checkpoint_token_label(token_idx: u32) -> String {
+    if token_idx == 0 {
+        "prefill".to_string()
+    } else {
+        token_idx.to_string()
+    }
+}
+
 fn display_tensor_contract_token(
     idx: usize,
     parsed: &ParsedCheckpointKey,
@@ -232,7 +240,27 @@ fn display_tensor_contract_token(
     if idx < prefill_boundary {
         0
     } else {
-        display_token_index(parsed.token)
+        parsed.token
+    }
+}
+
+fn display_tensor_contract_token_label(token: u32, inferred_prefill_token: u32) -> String {
+    if token == inferred_prefill_token {
+        "prefill".to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+fn effective_xray_tokens(tokens: u32) -> u32 {
+    if tokens == 0 { 1 } else { tokens }
+}
+
+fn effective_tensor_bundle_tokens(tokens: u32) -> u32 {
+    if tokens == 0 {
+        1
+    } else {
+        tokens.saturating_add(1)
     }
 }
 
@@ -1627,6 +1655,8 @@ fn print_checkpoint_consistency_warnings(point_rows: &[PointUsageRow]) {
         "gdelta.ssm",
         "gdelta.norm",
         "gdelta.out",
+        "gdelta.state_conv",
+        "gdelta.state_ssm",
     ];
     let mut present_counts: Vec<(&str, usize)> = Vec::new();
     for p in gdelta_points {
@@ -1682,7 +1712,10 @@ fn record_reference_bundle(
     };
 
     with_backend_env_override(reference_backend, || {
-        let max_tokens = args.tokens;
+        let max_tokens = match capture_mode {
+            ReferenceCaptureMode::Full => effective_tensor_bundle_tokens(args.tokens),
+            ReferenceCaptureMode::TranscriptOnly => effective_xray_tokens(args.tokens),
+        };
         let resolved_model = resolve_xray_model(model)?;
         let point_mask_override = match capture_mode {
             ReferenceCaptureMode::Full => None,
@@ -1718,6 +1751,9 @@ fn record_reference_bundle(
         reference.save(ref_path)?;
         let visible_text = latest_visible_text(&chat, true)?.unwrap_or_default();
         save_reference_visible_text(Path::new(ref_path), &visible_text)?;
+        if matches!(capture_mode, ReferenceCaptureMode::Full) {
+            trim_reference_bundle_to_requested_tokens(Path::new(ref_path), args.tokens)?;
+        }
         canonicalize_reference_bundle(Path::new(ref_path))?;
         Ok(())
     })
@@ -2063,6 +2099,7 @@ fn run_phase1_only_in_current_process(
     reference_json_path: &str,
     args: &XrayArgs,
 ) -> Result<()> {
+    let max_tokens = effective_xray_tokens(args.tokens) as usize;
     let (diverged, divergence_msg, output_text) = run_verify_pass(
         model,
         prompt_text,
@@ -2070,7 +2107,7 @@ fn run_phase1_only_in_current_process(
         rel_tolerance,
         abs_tolerance,
         reference_json_path,
-        args.tokens as usize,
+        max_tokens,
         false,
         None,
         None,
@@ -2103,7 +2140,7 @@ fn run_phase1_only_in_current_process(
     println!("details:");
     println!(
         "  verified tokens={} seed={} rel_tolerance={} abs_tolerance={}",
-        args.tokens, args.seed, rel_tolerance, abs_tolerance
+        max_tokens, args.seed, rel_tolerance, abs_tolerance
     );
     Ok(())
 }
@@ -2129,7 +2166,7 @@ fn run_phase1_process(
         .arg("--verify-reference-path")
         .arg(reference_json_path)
         .arg("--tokens")
-        .arg(args.tokens.to_string())
+        .arg(effective_xray_tokens(args.tokens).to_string())
         .arg("--seed")
         .arg(args.seed.to_string())
         .arg("--rel-tolerance")
@@ -2469,18 +2506,48 @@ fn reference_cache_key(
     seed: u64,
     tokens: u32,
     reference_backend: &str,
+    binary_fingerprint: &str,
 ) -> String {
     // Cache contract marker:
     // - ties default verify cache to the selected reference-recording backend
     // - invalidates stale cache bundles when the canonical checkpoint contract changes
-    const CACHE_SCHEMA_VERSION: u32 = 6;
+    const CACHE_SCHEMA_VERSION: u32 = 7;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     CACHE_SCHEMA_VERSION.hash(&mut hasher);
     reference_backend.hash(&mut hasher);
+    binary_fingerprint.hash(&mut hasher);
     model.hash(&mut hasher);
     prompt.hash(&mut hasher);
     seed.hash(&mut hasher);
     tokens.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn binary_cache_fingerprint() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match std::env::current_exe() {
+        Ok(path) => {
+            path.to_string_lossy().hash(&mut hasher);
+            match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    meta.len().hash(&mut hasher);
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH) {
+                            since_epoch.as_secs().hash(&mut hasher);
+                            since_epoch.subsec_nanos().hash(&mut hasher);
+                        }
+                    }
+                }
+                Err(err) => {
+                    format!("meta_err:{err}").hash(&mut hasher);
+                }
+            }
+        }
+        Err(err) => {
+            format!("exe_err:{err}").hash(&mut hasher);
+        }
+    }
     format!("{:016x}", hasher.finish())
 }
 
@@ -2660,12 +2727,14 @@ fn default_dev_reference_path(
     let dir = home.join(".cache").join("talu").join("dev");
     std::fs::create_dir_all(&dir)?;
     let prompt_text = effective_prompt_text(args);
+    let binary_fingerprint = binary_cache_fingerprint();
     let key = reference_cache_key(
         model,
         &prompt_text,
         args.seed,
         args.tokens,
         reference_backend,
+        &binary_fingerprint,
     );
     Ok(dir.join(format!(
         "xray_{}_{}_{}_{}.json",
@@ -2692,14 +2761,14 @@ fn ensure_reference_bundle(
     };
     let sidecar_path = reference_sidecar_path(&reference_path);
     let visible_text_path = reference_visible_text_path(&reference_path);
-    let refresh_cache = args.no_cache
+    let refresh_cache = !args.use_cache
         || !reference_path.exists()
         || !sidecar_path.exists()
         || !visible_text_path.exists();
     if refresh_cache {
-        if args.no_cache {
+        if !args.use_cache {
             println!(
-                "Refreshing {} reference cache (--no-cache)...",
+                "Refreshing {} reference cache (cache disabled unless --use-cache)...",
                 reference_backend
             );
         } else {
@@ -2971,31 +3040,39 @@ fn point_index_for_name(point: &str) -> Result<u8> {
         "attn.q" => 4,
         "attn.k" => 5,
         "attn.v" => 6,
-        "attn.qk" => 7,
-        "attn.weights" => 8,
-        "attn.out" => 9,
-        "layer_ffn_norm" => 10,
-        "ffn.gate" => 11,
-        "ffn.up" => 12,
-        "ffn.act" => 13,
-        "ffn.down" => 14,
-        "block.out" => 15,
-        "mamba.out" => 16,
-        "conv.in_proj" => 17,
-        "conv.conv" => 18,
-        "conv.out_proj" => 19,
-        "final_norm" => 20,
-        "lm_head" => 21,
-        "logits_scaled" => 22,
-        "logits_ready" => 23,
-        "token_select" => 24,
-        "ffn.act.map" => 25,
-        "ffn.act.mix" => 26,
-        "gdelta.in_proj" => 27,
-        "gdelta.conv" => 28,
-        "gdelta.ssm" => 29,
-        "gdelta.norm" => 30,
-        "gdelta.out" => 31,
+        "attn.q_proj_raw" => 7,
+        "attn.k_proj_raw" => 8,
+        "attn.q_norm" => 9,
+        "attn.k_norm" => 10,
+        "attn.q_rope" => 11,
+        "attn.k_rope" => 12,
+        "attn.qk" => 13,
+        "attn.weights" => 14,
+        "attn.out" => 15,
+        "layer_ffn_norm" => 16,
+        "ffn.gate" => 17,
+        "ffn.up" => 18,
+        "ffn.act" => 19,
+        "ffn.down" => 20,
+        "block.out" => 21,
+        "mamba.out" => 22,
+        "conv.in_proj" => 23,
+        "conv.conv" => 24,
+        "conv.out_proj" => 25,
+        "final_norm" => 26,
+        "lm_head" => 27,
+        "logits_scaled" => 28,
+        "logits_ready" => 29,
+        "token_select" => 30,
+        "ffn.act.map" => 31,
+        "ffn.act.mix" => 32,
+        "gdelta.in_proj" => 33,
+        "gdelta.conv" => 34,
+        "gdelta.ssm" => 35,
+        "gdelta.norm" => 36,
+        "gdelta.out" => 37,
+        "gdelta.state_conv" => 38,
+        "gdelta.state_ssm" => 39,
         _ => {
             return Err(anyhow!(
                 "unsupported checkpoint point '{}': targeted verify currently supports built-in xray points only",
@@ -3126,13 +3203,26 @@ fn is_default_phase2_point_name(point: &str) -> bool {
         "embed_tokens"
             | "layer_input"
             | "layer_attn_norm"
+            | "attn.q"
+            | "attn.k"
+            | "attn.q_proj_raw"
+            | "attn.k_proj_raw"
+            | "attn.q_norm"
+            | "attn.k_norm"
+            | "attn.q_rope"
+            | "attn.k_rope"
+            | "attn.qk"
+            | "attn.weights"
             | "attn.out"
             | "gdelta.in_proj"
             | "gdelta.conv"
             | "gdelta.ssm"
             | "gdelta.norm"
             | "gdelta.out"
+            | "gdelta.state_conv"
+            | "gdelta.state_ssm"
             | "block.out"
+            | "final_norm"
             | "lm_head"
             | "token_select"
     )
@@ -3182,6 +3272,44 @@ fn rewrite_reference_json_to_canonical(reference_path: &Path) -> Result<()> {
         filtered.push(record.clone());
     }
     *stats = filtered;
+
+    let pid = std::process::id();
+    let temp_path = temp_reference_path(reference_path, pid);
+    serde_json::to_writer(File::create(&temp_path)?, &value)?;
+    replace_file_atomically(&temp_path, reference_path)?;
+    Ok(())
+}
+
+fn trim_reference_bundle_to_requested_tokens(reference_path: &Path, requested_tokens: u32) -> Result<()> {
+    let file = File::open(reference_path)?;
+    let mut value: serde_json::Value = serde_json::from_reader(file)?;
+
+    if let Some(metadata) = value
+        .get_mut("metadata")
+        .and_then(|entry| entry.as_object_mut())
+    {
+        metadata.insert(
+            "max_tokens".to_string(),
+            serde_json::Value::from(requested_tokens as u64),
+        );
+    }
+
+    if let Some(tokens) = value.get_mut("tokens").and_then(|entry| entry.as_array_mut()) {
+        tokens.truncate(requested_tokens as usize);
+    }
+
+    let stats = value["stats"].as_array_mut().ok_or_else(|| {
+        anyhow!(
+            "reference json missing stats array: {}",
+            reference_path.display()
+        )
+    })?;
+    stats.retain(|record| {
+        let Some(token_idx) = record.get("token_idx").and_then(|entry| entry.as_u64()) else {
+            return false;
+        };
+        token_idx <= requested_tokens as u64
+    });
 
     let pid = std::process::id();
     let temp_path = temp_reference_path(reference_path, pid);
@@ -3648,7 +3776,7 @@ fn print_targeted_checkpoint_report(
 
     println!(
         "token={}, layer={}, point={}, pos={} -> {}",
-        display_token_index(result.selected.token),
+        display_checkpoint_token_label(result.selected.token),
         layer_label,
         result.selected.point,
         result.selected.position,
@@ -3688,7 +3816,7 @@ fn format_first_divergence_report(msg: &str, model: Option<&str>) -> String {
         let mut lines = vec![format!(
             "token={}, layer={}, point={}, pos={} -> FAILED",
             token
-                .map(|value| display_token_index(value).to_string())
+                .map(display_checkpoint_token_label)
                 .unwrap_or_else(|| "?".to_string()),
             layer
                 .map(|value| value.to_string())
@@ -3760,7 +3888,7 @@ fn format_first_divergence_report(msg: &str, model: Option<&str>) -> String {
         let mut lines = vec![format!(
             "token={}, layer={}, point={}, pos={} -> FAILED",
             token
-                .map(|value| display_token_index(value).to_string())
+                .map(display_checkpoint_token_label)
                 .unwrap_or_else(|| "?".to_string()),
             layer
                 .map(|value| value.to_string())
@@ -3774,7 +3902,7 @@ fn format_first_divergence_report(msg: &str, model: Option<&str>) -> String {
         lines.push("details:".to_string());
         lines.push("  kind=coverage".to_string());
         if let Some(token) = token {
-            lines.push(format!("  token={}", display_token_index(token)));
+            lines.push(format!("  token={}", display_checkpoint_token_label(token)));
         }
         if let Some(layer) = layer {
             lines.push(format!("  layer={}", layer));
@@ -3818,6 +3946,7 @@ struct TensorCheckpointFailure {
     diff: FirstCheckpointDiff,
 }
 
+#[cfg(test)]
 fn failures_for_first_logical_token(
     failures: &[TensorCheckpointFailure],
     prefill_boundary: usize,
@@ -4090,7 +4219,11 @@ fn run_tensor_bundle_diff(
     let prefill_boundary = ordered
         .iter()
         .position(|parsed| parsed.point == "token_select")
-        .unwrap_or(ordered.len());
+        // Tensor bundles may not emit token_select checkpoints. In that case,
+        // treat display token indices as direct checkpoint tokens instead of
+        // collapsing everything to prefill token 0.
+        .unwrap_or(0);
+    let inferred_prefill_token = ordered.iter().map(|parsed| parsed.token).min().unwrap_or(0);
     let mut failures: Vec<TensorCheckpointFailure> = Vec::new();
     for (idx, parsed) in ordered.iter().cloned().enumerate() {
         let diff = match (source_raw.get(&parsed.key), target_raw.get(&parsed.key)) {
@@ -4141,92 +4274,196 @@ fn run_tensor_bundle_diff(
         return Ok(());
     };
     let diff_idx = first_failure.idx;
-    let same_token_failures = failures_for_first_logical_token(&failures, prefill_boundary);
+    let show_all = args.verify_tensors_all_failures;
+    let show_prev = args.verify_tensors_show_previous;
     println!("✗ Verification FAILED");
-    if diff_idx == 0 {
-        println!(
-            "token=0, layer=0, point=None, pos=0, status=UNKNOWN, detail=NO EARLIER CHECKPOINT FOUND"
-        );
-    } else {
-        let prev = &ordered[diff_idx - 1];
-        let prev_layer_label = if prev.scope == "global" {
-            "global".to_string()
+    if !show_all && !show_prev {
+        if diff_idx == 0 {
+            println!(
+                "token=prefill, layer=0, point=None, pos=0, status=UNKNOWN, detail=NO EARLIER CHECKPOINT FOUND"
+            );
         } else {
-            prev.layer_index.to_string()
-        };
-        let prev_expected_raw = source_raw
-            .get(&prev.key)
-            .ok_or_else(|| anyhow!("source tensor missing for previous key {}", prev.key))?;
-        let prev_actual_raw = target_raw
-            .get(&prev.key)
-            .ok_or_else(|| anyhow!("target tensor missing for previous key {}", prev.key))?;
-        let prev_expected = parse_npy_f32(prev_expected_raw)?;
-        let prev_actual = parse_npy_f32(prev_actual_raw)?;
-        let prev_expected_rms = rms(&prev_expected);
-        let prev_actual_rms = rms(&prev_actual);
-        let prev_abs_rms_diff = (prev_actual_rms - prev_expected_rms).abs();
-        let (prev_rel_rms, prev_max_abs) = rel_rms_and_max_abs(&prev_expected, &prev_actual);
-        println!(
-            "token={}, layer={}, point={}, pos={}, status=PASSED, metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
-            display_tensor_contract_token(diff_idx - 1, prev, prefill_boundary),
-            prev_layer_label,
-            prev.point,
-            prev.position,
-            prev_expected_rms,
-            prev_actual_rms,
-            prev_abs_rms_diff,
-            prev_rel_rms,
-            prev_max_abs
-        );
+            let prev = &ordered[diff_idx - 1];
+            let prev_layer_label = if prev.scope == "global" {
+                "global".to_string()
+            } else {
+                prev.layer_index.to_string()
+            };
+            let prev_expected_raw = source_raw
+                .get(&prev.key)
+                .ok_or_else(|| anyhow!("source tensor missing for previous key {}", prev.key))?;
+            let prev_actual_raw = target_raw
+                .get(&prev.key)
+                .ok_or_else(|| anyhow!("target tensor missing for previous key {}", prev.key))?;
+            let prev_expected = parse_npy_f32(prev_expected_raw)?;
+            let prev_actual = parse_npy_f32(prev_actual_raw)?;
+            let prev_expected_rms = rms(&prev_expected);
+            let prev_actual_rms = rms(&prev_actual);
+            let prev_abs_rms_diff = (prev_actual_rms - prev_expected_rms).abs();
+            let (prev_rel_rms, prev_max_abs) = rel_rms_and_max_abs(&prev_expected, &prev_actual);
+            println!(
+                "token={}, layer={}, point={}, pos={}, status=PASSED, metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                display_tensor_contract_token_label(
+                    display_tensor_contract_token(diff_idx - 1, prev, prefill_boundary),
+                    inferred_prefill_token
+                ),
+                prev_layer_label,
+                prev.point,
+                prev.position,
+                prev_expected_rms,
+                prev_actual_rms,
+                prev_abs_rms_diff,
+                prev_rel_rms,
+                prev_max_abs
+            );
+        }
     }
     let mut error_details: Vec<String> = Vec::new();
-    for failure in &same_token_failures {
-        let layer_label = if failure.diff.parsed.scope == "global" {
-            "global".to_string()
+    if show_all || show_prev {
+        let limit = if show_all {
+            ordered.len()
         } else {
-            failure.diff.parsed.layer_index.to_string()
+            diff_idx.saturating_add(1)
         };
-        let detail = match failure.diff.kind {
-            FirstCheckpointDiffKind::Missing => {
-                "detail=checkpoint missing from target bundle".to_string()
+        if show_all {
+            println!("detail=reporting all checkpoints (count={})", limit);
+        } else {
+            println!(
+                "detail=reporting checkpoints up to first failure (count={})",
+                limit
+            );
+        }
+        let mut failure_by_idx: Vec<Option<&TensorCheckpointFailure>> = vec![None; ordered.len()];
+        for failure in &failures {
+            if failure.idx < failure_by_idx.len() {
+                failure_by_idx[failure.idx] = Some(failure);
             }
-            FirstCheckpointDiffKind::LengthMismatch => {
-                "detail=checkpoint tensor length mismatch".to_string()
-            }
-            FirstCheckpointDiffKind::Numeric => {
-                let expected_raw = source_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
-                    anyhow!(
-                        "source tensor missing for diff key {}",
-                        failure.diff.parsed.key
+        }
+        for (idx, parsed) in ordered.iter().enumerate().take(limit) {
+            let layer_label = if parsed.scope == "global" {
+                "global".to_string()
+            } else {
+                parsed.layer_index.to_string()
+            };
+            let token_label = display_tensor_contract_token_label(
+                display_tensor_contract_token(idx, parsed, prefill_boundary),
+                inferred_prefill_token,
+            );
+            let maybe_expected = source_raw.get(&parsed.key);
+            let maybe_actual = target_raw.get(&parsed.key);
+            let status_and_detail = match (maybe_expected, maybe_actual, failure_by_idx[idx]) {
+                (Some(expected_raw), Some(actual_raw), Some(failure)) => match failure.diff.kind {
+                    FirstCheckpointDiffKind::Missing => ("FAILED".to_string(), "detail=checkpoint missing from target bundle".to_string()),
+                    FirstCheckpointDiffKind::LengthMismatch => {
+                        ("FAILED".to_string(), "detail=checkpoint tensor length mismatch".to_string())
+                    }
+                    FirstCheckpointDiffKind::Numeric => {
+                        let expected = parse_npy_f32(expected_raw)?;
+                        let actual = parse_npy_f32(actual_raw)?;
+                        let expected_rms = rms(&expected);
+                        let actual_rms = rms(&actual);
+                        let abs_rms_diff = (actual_rms - expected_rms).abs();
+                        let (rel_rms, max_abs) = rel_rms_and_max_abs(&expected, &actual);
+                        (
+                            "FAILED".to_string(),
+                            format!(
+                                "metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                                expected_rms, actual_rms, abs_rms_diff, rel_rms, max_abs
+                            ),
+                        )
+                    }
+                },
+                (Some(expected_raw), Some(actual_raw), None) => {
+                    let expected = parse_npy_f32(expected_raw)?;
+                    let actual = parse_npy_f32(actual_raw)?;
+                    let expected_rms = rms(&expected);
+                    let actual_rms = rms(&actual);
+                    let abs_rms_diff = (actual_rms - expected_rms).abs();
+                    let (rel_rms, max_abs) = rel_rms_and_max_abs(&expected, &actual);
+                    (
+                        "PASSED".to_string(),
+                        format!(
+                            "metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                            expected_rms, actual_rms, abs_rms_diff, rel_rms, max_abs
+                        ),
                     )
-                })?;
-                let actual_raw = target_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
-                    anyhow!(
-                        "target tensor missing for diff key {}",
-                        failure.diff.parsed.key
-                    )
-                })?;
-                let expected = parse_npy_f32(expected_raw)?;
-                let actual = parse_npy_f32(actual_raw)?;
-                let expected_rms = rms(&expected);
-                let actual_rms = rms(&actual);
-                let abs_rms_diff = (actual_rms - expected_rms).abs();
-                let (rel_rms, max_abs) = rel_rms_and_max_abs(&expected, &actual);
-                format!(
-                    "metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
-                    expected_rms, actual_rms, abs_rms_diff, rel_rms, max_abs
-                )
+                }
+                _ => (
+                    "FAILED".to_string(),
+                    "detail=checkpoint missing from source or target bundle".to_string(),
+                ),
+            };
+            println!(
+                "token={}, layer={}, point={}, pos={}, status={}, {}",
+                token_label,
+                layer_label,
+                parsed.point,
+                parsed.position,
+                status_and_detail.0,
+                status_and_detail.1
+            );
+            if status_and_detail.0 == "FAILED" {
+                error_details.push(status_and_detail.1);
             }
-        };
-        println!(
-            "token={}, layer={}, point={}, pos={}, status=FAILED, {}",
-            display_tensor_contract_token(failure.idx, &failure.diff.parsed, prefill_boundary),
-            layer_label,
-            failure.diff.parsed.point,
-            failure.diff.parsed.position,
-            detail
-        );
-        error_details.push(detail);
+        }
+    } else {
+        let reported_failures = vec![first_failure.clone()];
+        println!("detail=reporting first failing checkpoint (count=1)");
+        for failure in &reported_failures {
+            let layer_label = if failure.diff.parsed.scope == "global" {
+                "global".to_string()
+            } else {
+                failure.diff.parsed.layer_index.to_string()
+            };
+            let detail = match failure.diff.kind {
+                FirstCheckpointDiffKind::Missing => {
+                    "detail=checkpoint missing from target bundle".to_string()
+                }
+                FirstCheckpointDiffKind::LengthMismatch => {
+                    "detail=checkpoint tensor length mismatch".to_string()
+                }
+                FirstCheckpointDiffKind::Numeric => {
+                    let expected_raw = source_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
+                        anyhow!(
+                            "source tensor missing for diff key {}",
+                            failure.diff.parsed.key
+                        )
+                    })?;
+                    let actual_raw = target_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
+                        anyhow!(
+                            "target tensor missing for diff key {}",
+                            failure.diff.parsed.key
+                        )
+                    })?;
+                    let expected = parse_npy_f32(expected_raw)?;
+                    let actual = parse_npy_f32(actual_raw)?;
+                    let expected_rms = rms(&expected);
+                    let actual_rms = rms(&actual);
+                    let abs_rms_diff = (actual_rms - expected_rms).abs();
+                    let (rel_rms, max_abs) = rel_rms_and_max_abs(&expected, &actual);
+                    format!(
+                        "metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                        expected_rms, actual_rms, abs_rms_diff, rel_rms, max_abs
+                    )
+                }
+            };
+            println!(
+                "token={}, layer={}, point={}, pos={}, status=FAILED, {}",
+                display_tensor_contract_token_label(
+                    display_tensor_contract_token(
+                        failure.idx,
+                        &failure.diff.parsed,
+                        prefill_boundary
+                    ),
+                    inferred_prefill_token
+                ),
+                layer_label,
+                failure.diff.parsed.point,
+                failure.diff.parsed.position,
+                detail
+            );
+            error_details.push(detail);
+        }
     }
     Err(anyhow!(error_details.join("\n")))
 }
@@ -4587,6 +4824,13 @@ mod tests {
                     {
                         "token_idx": 0,
                         "layer": 65535,
+                        "point": "final_norm",
+                        "position": 16,
+                        "stats": { "count": 1, "min": 1.5, "max": 1.5, "sum": 1.5, "sum_sq": 2.25, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
+                        "layer": 65535,
                         "point": "token_select",
                         "position": 0,
                         "stats": { "count": 1, "min": 2.0, "max": 2.0, "sum": 2.0, "sum_sq": 4.0, "nan_count": 0, "inf_count": 0 }
@@ -4618,6 +4862,7 @@ mod tests {
                 ("9_tok0_pos16_global_0_logits_ready.npy", vec![9.0f32]),
                 ("0_tok0_pos16_global_0_embed_tokens.npy", vec![0.25f32]),
                 ("8_tok1_pos1_global_0_embed_tokens.npy", vec![0.75f32]),
+                ("4_tok0_pos16_global_0_final_norm.npy", vec![1.5f32]),
                 ("3_tok0_pos0_global_0_token_select.npy", vec![2.0f32]),
                 ("1_tok0_pos16_layer_0_layer_attn_norm.npy", vec![1.0f32]),
                 ("2_tok0_pos16_layer_0_layer_input.npy", vec![0.5f32]),
@@ -4635,11 +4880,12 @@ mod tests {
             serde_json::from_reader(std::fs::File::open(&reference_path).expect("open json"))
                 .expect("parse json");
         let stats = rewritten_json["stats"].as_array().expect("stats array");
-        assert_eq!(stats.len(), 4);
+        assert_eq!(stats.len(), 5);
         assert_eq!(stats[0]["point"].as_str(), Some("embed_tokens"));
         assert_eq!(stats[1]["point"].as_str(), Some("layer_input"));
         assert_eq!(stats[2]["point"].as_str(), Some("layer_attn_norm"));
-        assert_eq!(stats[3]["point"].as_str(), Some("token_select"));
+        assert_eq!(stats[3]["point"].as_str(), Some("final_norm"));
+        assert_eq!(stats[4]["point"].as_str(), Some("token_select"));
 
         let file = std::fs::File::open(&npz_path).expect("open npz");
         let mut archive = zip::ZipArchive::new(file).expect("zip archive");
@@ -4653,7 +4899,8 @@ mod tests {
                 "0_tok0_pos16_global_0_embed_tokens.npy".to_string(),
                 "1_tok0_pos16_layer_0_layer_input.npy".to_string(),
                 "2_tok0_pos16_layer_0_layer_attn_norm.npy".to_string(),
-                "3_tok0_pos0_global_0_token_select.npy".to_string(),
+                "3_tok0_pos16_global_0_final_norm.npy".to_string(),
+                "4_tok0_pos0_global_0_token_select.npy".to_string(),
             ]
         );
     }
@@ -4861,29 +5108,86 @@ mod tests {
 
     #[test]
     fn reference_cache_key_changes_when_prompt_changes() {
-        let a = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "cpu");
-        let b = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a poem", 42, 100, "cpu");
+        let a = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
+        let b = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a poem",
+            42,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
         assert_ne!(a, b);
     }
 
     #[test]
     fn reference_cache_key_changes_when_seed_changes() {
-        let a = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "cpu");
-        let b = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 43, 100, "cpu");
+        let a = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
+        let b = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            43,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
         assert_ne!(a, b);
     }
 
     #[test]
     fn reference_cache_key_changes_when_reference_backend_changes() {
-        let cpu = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "cpu");
+        let cpu = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
         let metal = reference_cache_key(
             "Qwen/Qwen3.5-0.8B-GAF4",
             "tell me a story",
             42,
             100,
             "metal",
+            "bin_fp_a",
         );
         assert_ne!(cpu, metal);
+    }
+
+    #[test]
+    fn reference_cache_key_changes_when_binary_changes() {
+        let a = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
+        let b = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "cpu",
+            "bin_fp_b",
+        );
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -4908,7 +5212,9 @@ mod tests {
             verify_tokens: None,
             verify_stats: None,
             verify_tensors: None,
-            no_cache: false,
+            verify_tensors_all_failures: false,
+            verify_tensors_show_previous: false,
+            use_cache: false,
             verify_checkpoint: None,
             verify_checkpoint_stats_only: false,
             verify_phase1_only: false,

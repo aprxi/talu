@@ -629,6 +629,12 @@ pub const JsonFormat = struct {
             .{ "attn.q", TracePoint.attn_q },
             .{ "attn.k", TracePoint.attn_k },
             .{ "attn.v", TracePoint.attn_v },
+            .{ "attn.q_proj_raw", TracePoint.attn_q_proj_raw },
+            .{ "attn.k_proj_raw", TracePoint.attn_k_proj_raw },
+            .{ "attn.q_norm", TracePoint.attn_q_norm },
+            .{ "attn.k_norm", TracePoint.attn_k_norm },
+            .{ "attn.q_rope", TracePoint.attn_q_rope },
+            .{ "attn.k_rope", TracePoint.attn_k_rope },
             .{ "attn.qk", TracePoint.attn_qk },
             .{ "attn.weights", TracePoint.attn_weights },
             .{ "attn.out", TracePoint.attn_out },
@@ -654,6 +660,8 @@ pub const JsonFormat = struct {
             .{ "gdelta.ssm", TracePoint.gdelta_ssm },
             .{ "gdelta.norm", TracePoint.gdelta_norm },
             .{ "gdelta.out", TracePoint.gdelta_out },
+            .{ "gdelta.state_conv", TracePoint.gdelta_state_conv },
+            .{ "gdelta.state_ssm", TracePoint.gdelta_state_ssm },
         };
 
         inline for (pairs) |pair| {

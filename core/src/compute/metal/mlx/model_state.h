@@ -8,6 +8,7 @@
 
 #include "compute_common.h"
 #include <cstdint>
+#include <mutex>
 
 // ============================================================================
 // KV Cache Layer - stores K/V tensors for one transformer layer.
@@ -87,5 +88,6 @@ struct StateSpaceLayer {
 
 struct MLXStateSpaceCache {
     uint64_t magic = 0;
+    std::mutex mu;
     std::vector<StateSpaceLayer> layers;
 };

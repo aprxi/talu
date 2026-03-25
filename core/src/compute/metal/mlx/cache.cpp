@@ -383,6 +383,7 @@ void mlx_state_space_cache_reset(void* cache_ptr) {
     if (!is_live_cache(g_state_space_cache_mu, g_state_space_cache_live, cache_ptr)) fail_cache_contract(__func__, "state_space", cache_ptr, "handle not live");
     if (cache_state == nullptr) fail_cache_contract(__func__, "state_space", cache_ptr, "null cache state");
     if (cache_state->magic != kMagicState) fail_cache_contract(__func__, "state_space", cache_ptr, "magic mismatch");
+    std::lock_guard<std::mutex> lock(cache_state->mu);
     for (auto& layer : cache_state->layers) {
         if (layer.conv_state != nullptr) {
             const auto shape = layer.conv_state->shape();
@@ -400,6 +401,7 @@ void mlx_state_space_cache_free(void* cache_ptr) {
     if (!unregister_cache(g_state_space_cache_mu, g_state_space_cache_live, cache_ptr)) fail_cache_contract(__func__, "state_space", cache_ptr, "handle not live");
     auto* cache_state = static_cast<MLXStateSpaceCache*>(cache_ptr);
     if (cache_state->magic != kMagicState) fail_cache_contract(__func__, "state_space", cache_ptr, "magic mismatch");
+    std::lock_guard<std::mutex> lock(cache_state->mu);
     cache_state->magic = 0;
     for (auto& layer : cache_state->layers) {
         delete layer.conv_state;

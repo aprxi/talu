@@ -34,6 +34,7 @@ static inline std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCa
     return tls_never_destroyed<std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash>>();
 }
 
+
 static inline void quant_param_cast_cache_clear() {
     quant_param_cast_cache_store().clear();
 }
@@ -457,11 +458,90 @@ void* mlx_lazy_softmax(const void* input, int axis) {
     return pool_array(softmax(input_arr, axis));
 }
 
+static bool use_cpu_like_rmsnorm_reference_mode() {
+    const char* raw = std::getenv("TALU_METAL_ATTN_REFERENCE");
+    if (raw == nullptr || raw[0] == '\0') return false;
+    if (std::strcmp(raw, "0") == 0) return false;
+    if (std::strcmp(raw, "false") == 0 || std::strcmp(raw, "FALSE") == 0) return false;
+    if (std::strcmp(raw, "off") == 0 || std::strcmp(raw, "OFF") == 0) return false;
+    if (std::strcmp(raw, "no") == 0 || std::strcmp(raw, "NO") == 0) return false;
+    return true;
+}
+
+static array owned_f32_array_from_values(const std::vector<float>& values, const Shape& shape) {
+    static constexpr size_t kAlignment = 16 * 1024;
+    const size_t element_count = std::max<size_t>(values.size(), 1);
+    const size_t byte_count = element_count * sizeof(float);
+    void* aligned_ptr = nullptr;
+    if (posix_memalign(&aligned_ptr, kAlignment, byte_count) != 0 || aligned_ptr == nullptr) {
+        throw std::bad_alloc();
+    }
+    auto* copied = static_cast<float*>(aligned_ptr);
+    if (!values.empty()) {
+        std::memcpy(copied, values.data(), values.size() * sizeof(float));
+    } else {
+        copied[0] = 0.0f;
+    }
+    auto owner = std::shared_ptr<void>(aligned_ptr, [](void* ptr) {
+        std::free(ptr);
+    });
+    auto deleter = [owner](void*) {
+        // Ownership retained by closure capture.
+    };
+    return array(copied, shape, float32, deleter);
+}
+
+static array cpu_like_rms_norm_any_rank(const array& input, const array& weight, float eps) {
+    if (input.ndim() < 1) {
+        return fast::rms_norm(input, weight, eps);
+    }
+
+    const int dim = input.shape(input.ndim() - 1);
+    if (dim <= 0) {
+        return fast::rms_norm(input, weight, eps);
+    }
+
+    int rows = 1;
+    for (int axis = 0; axis + 1 < input.ndim(); ++axis) {
+        rows *= input.shape(axis);
+    }
+
+    array input_f32 = (input.dtype() == float32) ? input : astype(input, float32);
+    array weight_f32 = (weight.dtype() == float32) ? weight : astype(weight, float32);
+    array flat_input = reshape(input_f32, {rows * dim});
+    array flat_weight = reshape(weight_f32, {dim});
+    eval(flat_input, flat_weight);
+
+    const float* input_ptr = flat_input.data<float>();
+    const float* weight_ptr = flat_weight.data<float>();
+    std::vector<float> out(static_cast<size_t>(rows) * static_cast<size_t>(dim));
+    const float dim_f = static_cast<float>(dim);
+
+    for (int row = 0; row < rows; ++row) {
+        const size_t row_base = static_cast<size_t>(row) * static_cast<size_t>(dim);
+        float sum_sq = 0.0f;
+        for (int d = 0; d < dim; ++d) {
+            const float x = input_ptr[row_base + static_cast<size_t>(d)];
+            sum_sq += x * x;
+        }
+        const float inv_rms = 1.0f / std::sqrt((sum_sq / dim_f) + eps);
+        for (int d = 0; d < dim; ++d) {
+            out[row_base + static_cast<size_t>(d)] =
+                input_ptr[row_base + static_cast<size_t>(d)] * inv_rms * weight_ptr[static_cast<size_t>(d)];
+        }
+    }
+
+    return owned_f32_array_from_values(out, input.shape());
+}
+
 void* mlx_lazy_rms_norm(const void* input, const void* weight, float eps) {
     const auto& input_arr = *static_cast<const array*>(input);
     const auto& weight_arr = *static_cast<const array*>(weight);
     const int width = input_arr.shape(input_arr.ndim() - 1);
     const array norm_weight = canonicalize_rms_norm_weight(weight_arr, width, "rms_norm");
+    if (use_cpu_like_rmsnorm_reference_mode()) {
+        return pool_array(cpu_like_rms_norm_any_rank(input_arr, norm_weight, eps));
+    }
     return pool_array(fast::rms_norm(
         input_arr,
         norm_weight,

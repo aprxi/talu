@@ -72,6 +72,12 @@ pub const TracePointSet = packed struct {
     attn_q: bool = false,
     attn_k: bool = false,
     attn_v: bool = false,
+    attn_q_proj_raw: bool = false,
+    attn_k_proj_raw: bool = false,
+    attn_q_norm: bool = false,
+    attn_k_norm: bool = false,
+    attn_q_rope: bool = false,
+    attn_k_rope: bool = false,
     attn_qk: bool = false,
     attn_weights: bool = false,
     attn_out: bool = false,
@@ -97,6 +103,8 @@ pub const TracePointSet = packed struct {
     gdelta_ssm: bool = false,
     gdelta_norm: bool = false,
     gdelta_out: bool = false,
+    gdelta_state_conv: bool = false,
+    gdelta_state_ssm: bool = false,
 
     pub fn all() TracePointSet {
         return .{
@@ -107,6 +115,12 @@ pub const TracePointSet = packed struct {
             .attn_q = true,
             .attn_k = true,
             .attn_v = true,
+            .attn_q_proj_raw = true,
+            .attn_k_proj_raw = true,
+            .attn_q_norm = true,
+            .attn_k_norm = true,
+            .attn_q_rope = true,
+            .attn_k_rope = true,
             .attn_qk = true,
             .attn_weights = true,
             .attn_out = true,
@@ -132,6 +146,8 @@ pub const TracePointSet = packed struct {
             .gdelta_ssm = true,
             .gdelta_norm = true,
             .gdelta_out = true,
+            .gdelta_state_conv = true,
+            .gdelta_state_ssm = true,
         };
     }
 
@@ -148,6 +164,12 @@ pub const TracePointSet = packed struct {
             .attn_q => self.attn_q,
             .attn_k => self.attn_k,
             .attn_v => self.attn_v,
+            .attn_q_proj_raw => self.attn_q_proj_raw,
+            .attn_k_proj_raw => self.attn_k_proj_raw,
+            .attn_q_norm => self.attn_q_norm,
+            .attn_k_norm => self.attn_k_norm,
+            .attn_q_rope => self.attn_q_rope,
+            .attn_k_rope => self.attn_k_rope,
             .attn_qk => self.attn_qk,
             .attn_weights => self.attn_weights,
             .attn_out => self.attn_out,
@@ -173,6 +195,8 @@ pub const TracePointSet = packed struct {
             .gdelta_ssm => self.gdelta_ssm,
             .gdelta_norm => self.gdelta_norm,
             .gdelta_out => self.gdelta_out,
+            .gdelta_state_conv => self.gdelta_state_conv,
+            .gdelta_state_ssm => self.gdelta_state_ssm,
             _ => false, // Custom points not in standard set
         };
     }
@@ -186,31 +210,39 @@ pub const TracePointSet = packed struct {
         if (self.attn_q) mask |= @as(u64, 1) << 4;
         if (self.attn_k) mask |= @as(u64, 1) << 5;
         if (self.attn_v) mask |= @as(u64, 1) << 6;
-        if (self.attn_qk) mask |= @as(u64, 1) << 7;
-        if (self.attn_weights) mask |= @as(u64, 1) << 8;
-        if (self.attn_out) mask |= @as(u64, 1) << 9;
-        if (self.layer_ffn_norm) mask |= @as(u64, 1) << 10;
-        if (self.ffn_gate) mask |= @as(u64, 1) << 11;
-        if (self.ffn_up) mask |= @as(u64, 1) << 12;
-        if (self.ffn_act) mask |= @as(u64, 1) << 13;
-        if (self.ffn_down) mask |= @as(u64, 1) << 14;
-        if (self.block_out) mask |= @as(u64, 1) << 15;
-        if (self.mamba_out) mask |= @as(u64, 1) << 16;
-        if (self.conv_in_proj) mask |= @as(u64, 1) << 17;
-        if (self.conv_conv) mask |= @as(u64, 1) << 18;
-        if (self.conv_out_proj) mask |= @as(u64, 1) << 19;
-        if (self.final_norm) mask |= @as(u64, 1) << 20;
-        if (self.lm_head) mask |= @as(u64, 1) << 21;
-        if (self.logits_scaled) mask |= @as(u64, 1) << 22;
-        if (self.logits_ready) mask |= @as(u64, 1) << 23;
-        if (self.token_select) mask |= @as(u64, 1) << 24;
-        if (self.ffn_act_map) mask |= @as(u64, 1) << 25;
-        if (self.ffn_act_mix) mask |= @as(u64, 1) << 26;
-        if (self.gdelta_in_proj) mask |= @as(u64, 1) << 27;
-        if (self.gdelta_conv) mask |= @as(u64, 1) << 28;
-        if (self.gdelta_ssm) mask |= @as(u64, 1) << 29;
-        if (self.gdelta_norm) mask |= @as(u64, 1) << 30;
-        if (self.gdelta_out) mask |= @as(u64, 1) << 31;
+        if (self.attn_q_proj_raw) mask |= @as(u64, 1) << 7;
+        if (self.attn_k_proj_raw) mask |= @as(u64, 1) << 8;
+        if (self.attn_q_norm) mask |= @as(u64, 1) << 9;
+        if (self.attn_k_norm) mask |= @as(u64, 1) << 10;
+        if (self.attn_q_rope) mask |= @as(u64, 1) << 11;
+        if (self.attn_k_rope) mask |= @as(u64, 1) << 12;
+        if (self.attn_qk) mask |= @as(u64, 1) << 13;
+        if (self.attn_weights) mask |= @as(u64, 1) << 14;
+        if (self.attn_out) mask |= @as(u64, 1) << 15;
+        if (self.layer_ffn_norm) mask |= @as(u64, 1) << 16;
+        if (self.ffn_gate) mask |= @as(u64, 1) << 17;
+        if (self.ffn_up) mask |= @as(u64, 1) << 18;
+        if (self.ffn_act) mask |= @as(u64, 1) << 19;
+        if (self.ffn_down) mask |= @as(u64, 1) << 20;
+        if (self.block_out) mask |= @as(u64, 1) << 21;
+        if (self.mamba_out) mask |= @as(u64, 1) << 22;
+        if (self.conv_in_proj) mask |= @as(u64, 1) << 23;
+        if (self.conv_conv) mask |= @as(u64, 1) << 24;
+        if (self.conv_out_proj) mask |= @as(u64, 1) << 25;
+        if (self.final_norm) mask |= @as(u64, 1) << 26;
+        if (self.lm_head) mask |= @as(u64, 1) << 27;
+        if (self.logits_scaled) mask |= @as(u64, 1) << 28;
+        if (self.logits_ready) mask |= @as(u64, 1) << 29;
+        if (self.token_select) mask |= @as(u64, 1) << 30;
+        if (self.ffn_act_map) mask |= @as(u64, 1) << 31;
+        if (self.ffn_act_mix) mask |= @as(u64, 1) << 32;
+        if (self.gdelta_in_proj) mask |= @as(u64, 1) << 33;
+        if (self.gdelta_conv) mask |= @as(u64, 1) << 34;
+        if (self.gdelta_ssm) mask |= @as(u64, 1) << 35;
+        if (self.gdelta_norm) mask |= @as(u64, 1) << 36;
+        if (self.gdelta_out) mask |= @as(u64, 1) << 37;
+        if (self.gdelta_state_conv) mask |= @as(u64, 1) << 38;
+        if (self.gdelta_state_ssm) mask |= @as(u64, 1) << 39;
         return mask;
     }
 
@@ -223,31 +255,39 @@ pub const TracePointSet = packed struct {
             .attn_q = (mask & (@as(u64, 1) << 4)) != 0,
             .attn_k = (mask & (@as(u64, 1) << 5)) != 0,
             .attn_v = (mask & (@as(u64, 1) << 6)) != 0,
-            .attn_qk = (mask & (@as(u64, 1) << 7)) != 0,
-            .attn_weights = (mask & (@as(u64, 1) << 8)) != 0,
-            .attn_out = (mask & (@as(u64, 1) << 9)) != 0,
-            .layer_ffn_norm = (mask & (@as(u64, 1) << 10)) != 0,
-            .ffn_gate = (mask & (@as(u64, 1) << 11)) != 0,
-            .ffn_up = (mask & (@as(u64, 1) << 12)) != 0,
-            .ffn_act = (mask & (@as(u64, 1) << 13)) != 0,
-            .ffn_down = (mask & (@as(u64, 1) << 14)) != 0,
-            .block_out = (mask & (@as(u64, 1) << 15)) != 0,
-            .mamba_out = (mask & (@as(u64, 1) << 16)) != 0,
-            .conv_in_proj = (mask & (@as(u64, 1) << 17)) != 0,
-            .conv_conv = (mask & (@as(u64, 1) << 18)) != 0,
-            .conv_out_proj = (mask & (@as(u64, 1) << 19)) != 0,
-            .final_norm = (mask & (@as(u64, 1) << 20)) != 0,
-            .lm_head = (mask & (@as(u64, 1) << 21)) != 0,
-            .logits_scaled = (mask & (@as(u64, 1) << 22)) != 0,
-            .logits_ready = (mask & (@as(u64, 1) << 23)) != 0,
-            .token_select = (mask & (@as(u64, 1) << 24)) != 0,
-            .ffn_act_map = (mask & (@as(u64, 1) << 25)) != 0,
-            .ffn_act_mix = (mask & (@as(u64, 1) << 26)) != 0,
-            .gdelta_in_proj = (mask & (@as(u64, 1) << 27)) != 0,
-            .gdelta_conv = (mask & (@as(u64, 1) << 28)) != 0,
-            .gdelta_ssm = (mask & (@as(u64, 1) << 29)) != 0,
-            .gdelta_norm = (mask & (@as(u64, 1) << 30)) != 0,
-            .gdelta_out = (mask & (@as(u64, 1) << 31)) != 0,
+            .attn_q_proj_raw = (mask & (@as(u64, 1) << 7)) != 0,
+            .attn_k_proj_raw = (mask & (@as(u64, 1) << 8)) != 0,
+            .attn_q_norm = (mask & (@as(u64, 1) << 9)) != 0,
+            .attn_k_norm = (mask & (@as(u64, 1) << 10)) != 0,
+            .attn_q_rope = (mask & (@as(u64, 1) << 11)) != 0,
+            .attn_k_rope = (mask & (@as(u64, 1) << 12)) != 0,
+            .attn_qk = (mask & (@as(u64, 1) << 13)) != 0,
+            .attn_weights = (mask & (@as(u64, 1) << 14)) != 0,
+            .attn_out = (mask & (@as(u64, 1) << 15)) != 0,
+            .layer_ffn_norm = (mask & (@as(u64, 1) << 16)) != 0,
+            .ffn_gate = (mask & (@as(u64, 1) << 17)) != 0,
+            .ffn_up = (mask & (@as(u64, 1) << 18)) != 0,
+            .ffn_act = (mask & (@as(u64, 1) << 19)) != 0,
+            .ffn_down = (mask & (@as(u64, 1) << 20)) != 0,
+            .block_out = (mask & (@as(u64, 1) << 21)) != 0,
+            .mamba_out = (mask & (@as(u64, 1) << 22)) != 0,
+            .conv_in_proj = (mask & (@as(u64, 1) << 23)) != 0,
+            .conv_conv = (mask & (@as(u64, 1) << 24)) != 0,
+            .conv_out_proj = (mask & (@as(u64, 1) << 25)) != 0,
+            .final_norm = (mask & (@as(u64, 1) << 26)) != 0,
+            .lm_head = (mask & (@as(u64, 1) << 27)) != 0,
+            .logits_scaled = (mask & (@as(u64, 1) << 28)) != 0,
+            .logits_ready = (mask & (@as(u64, 1) << 29)) != 0,
+            .token_select = (mask & (@as(u64, 1) << 30)) != 0,
+            .ffn_act_map = (mask & (@as(u64, 1) << 31)) != 0,
+            .ffn_act_mix = (mask & (@as(u64, 1) << 32)) != 0,
+            .gdelta_in_proj = (mask & (@as(u64, 1) << 33)) != 0,
+            .gdelta_conv = (mask & (@as(u64, 1) << 34)) != 0,
+            .gdelta_ssm = (mask & (@as(u64, 1) << 35)) != 0,
+            .gdelta_norm = (mask & (@as(u64, 1) << 36)) != 0,
+            .gdelta_out = (mask & (@as(u64, 1) << 37)) != 0,
+            .gdelta_state_conv = (mask & (@as(u64, 1) << 38)) != 0,
+            .gdelta_state_ssm = (mask & (@as(u64, 1) << 39)) != 0,
         };
     }
 };

@@ -10,7 +10,10 @@ const contract = @import("../contract.zig");
 const tensor = @import("../../../tensor.zig");
 const common_mrope = @import("vision/mrope.zig");
 const cpu_math_rope = @import("../../../compute/cpu/math_rope.zig");
+const cpu_linalg = @import("../../../compute/cpu/linalg.zig");
+const cpu_rowwise = @import("../../../compute/cpu/rowwise.zig");
 const ModelConfig = tensor.ModelConfig;
+const Tensor = tensor.Tensor;
 const log = @import("../../../log.zig");
 const trace = @import("../../../xray/trace.zig");
 const xray = @import("../../../xray/root.zig");
@@ -56,8 +59,11 @@ pub const MetalBackend = struct {
     pub const PrefillVisionInput = vision_runtime_mod.PrefillVisionInput;
 
     allocator: std.mem.Allocator,
+    loaded: *LoadedModel,
     config: ModelConfig,
     weights: *weights_trait.WeightHandles,
+    cpu_lm_head_scratch: cpu_linalg.MatmulScratch,
+    cpu_lm_head_fallback: bool,
     layer_count: usize,
     cache_max_seq_len: usize,
     vocab_size: usize,
@@ -175,8 +181,23 @@ pub const MetalBackend = struct {
         // Verify is observability-only. It MUST NOT toggle prefill/decode route
         // selection, fusion eligibility, or kernel choice. Keep this disabled
         // unless we can emit final-path probes from the already-selected
-        // production route.
-        return false;
+        // production route. Final norm / lm_head tracing here only forces
+        // materialization and host copies of tensors that the selected route
+        // already computed; it does not alter route or kernel selection.
+        return trace.shouldEmit(.final_norm) or
+            trace.shouldEmit(.lm_head) or
+            trace.shouldEmit(.logits_scaled);
+    }
+
+    fn useReferenceFinalProjection() bool {
+        const raw = std.posix.getenv("TALU_METAL_ATTN_REFERENCE") orelse return false;
+        const value = std.mem.sliceTo(raw, 0);
+        if (value.len == 0) return false;
+        if (std.ascii.eqlIgnoreCase(value, "0")) return false;
+        if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+        if (std.ascii.eqlIgnoreCase(value, "off")) return false;
+        if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+        return true;
     }
 
     fn applyLogitsScalingHandle(self: *MetalBackend, logits_handle: graph.ArrayHandle) graph.ArrayHandle {
@@ -206,6 +227,66 @@ pub const MetalBackend = struct {
         emit_final_path_points: bool,
     ) !void {
         if (logits_out.len < self.vocab_size) return error.InvalidArgument;
+
+        if (self.cpu_lm_head_fallback or useReferenceFinalProjection()) {
+            const final_norm_host = try self.allocator.alloc(f32, self.d_model);
+            defer self.allocator.free(final_norm_host);
+            graph.eval(&[_]graph.ArrayHandle{last_normed_hidden_handle});
+            graph.copyToHost(last_normed_hidden_handle, final_norm_host);
+
+            const lm_head_tensor = self.loaded.lm_head orelse return error.MissingLmHead;
+            if (lm_head_tensor.dtype == .bf16) {
+                cpu_linalg.matmulLmHeadRowsBf16(
+                    final_norm_host,
+                    1,
+                    &lm_head_tensor,
+                    logits_out[0..self.vocab_size],
+                    self.loaded.config.logits_scaling,
+                    &self.cpu_lm_head_scratch,
+                );
+            } else {
+                var hidden_view = Tensor.view2DSlice(final_norm_host, 1, self.d_model);
+                var logits_view = Tensor.view2DSlice(logits_out[0..self.vocab_size], 1, self.vocab_size);
+                try cpu_linalg.matmulAuto(&hidden_view, &lm_head_tensor, &logits_view, &self.cpu_lm_head_scratch);
+                cpu_rowwise.scaleInPlaceReciprocal(logits_out[0..self.vocab_size], self.loaded.config.logits_scaling);
+            }
+
+            if (!emit_final_path_points) return;
+
+            trace.emitFinal(
+                .final_norm,
+                0,
+                1,
+                @ptrCast(final_norm_host.ptr),
+                .f32,
+                .{ @intCast(self.d_model), 0, 0, 0 },
+                1,
+                "metal_final_norm_host",
+            );
+            trace.emitFinal(
+                .lm_head,
+                0,
+                0,
+                @ptrCast(logits_out.ptr),
+                .f32,
+                .{ @intCast(self.vocab_size), 0, 0, 0 },
+                1,
+                "metal_cpu_lm_head_host",
+            );
+            if (self.weights.logits_scaling != 1.0) {
+                trace.emitFinal(
+                    .logits_scaled,
+                    0,
+                    0,
+                    @ptrCast(logits_out.ptr),
+                    .f32,
+                    .{ @intCast(self.vocab_size), 0, 0, 0 },
+                    1,
+                    "metal_cpu_lm_head_host",
+                );
+            }
+            return;
+        }
 
         const lm_head_handle = if (self.weights.lm_head_quantized) |quantized_lm_head| blk: {
             break :blk graph.mlx_lazy_quantized_matmul(
@@ -292,6 +373,17 @@ pub const MetalBackend = struct {
             return @max(@as(usize, 1), parsed);
         }
         return 8;
+    }
+
+    fn resolveCpuLmHeadFallback() bool {
+        const raw = std.posix.getenv("TALU_METAL_CPU_LM_HEAD") orelse return false;
+        const value = std.mem.sliceTo(raw, 0);
+        if (value.len == 0) return false;
+        if (std.ascii.eqlIgnoreCase(value, "0")) return false;
+        if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+        if (std.ascii.eqlIgnoreCase(value, "off")) return false;
+        if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+        return true;
     }
 
     fn synchronizeDefaultDevice() void {
@@ -594,6 +686,98 @@ pub const MetalBackend = struct {
     fn runtimeHandleLooksValid(handle: ?*anyopaque) bool {
         if (handle == null) return false;
         return @intFromPtr(handle.?) >= 4096;
+    }
+
+    fn stateRoleName(role: StateRuntimeRole) []const u8 {
+        return switch (role) {
+            .none => "none",
+            .kv_cache => "kv_cache",
+            .shortconv_cache => "shortconv_cache",
+            .mamba_cache => "mamba_cache",
+            .gated_delta_cache => "gated_delta_cache",
+        };
+    }
+
+    const LayerRoleCounts = struct {
+        attention_layers: usize = 0,
+        shortconv_layers: usize = 0,
+        mamba_layers: usize = 0,
+        gated_delta_layers: usize = 0,
+    };
+
+    fn countLayerRoles(handles: *const weights_trait.WeightHandles) LayerRoleCounts {
+        var counts = LayerRoleCounts{};
+        for (handles.layers) |*layer| {
+            switch (layer.kind) {
+                .attention_mlp => counts.attention_layers += 1,
+                .shortconv => counts.shortconv_layers += 1,
+                .mamba => counts.mamba_layers += 1,
+                .gated_delta => counts.gated_delta_layers += 1,
+            }
+        }
+        return counts;
+    }
+
+    const StateRoleCounts = struct {
+        kv_roles: usize = 0,
+        shortconv_roles: usize = 0,
+        mamba_roles: usize = 0,
+        gated_delta_roles: usize = 0,
+    };
+
+    fn countStateRoles(roles: []const StateRuntimeRole) StateRoleCounts {
+        var counts = StateRoleCounts{};
+        for (roles) |role| {
+            switch (role) {
+                .kv_cache => counts.kv_roles += 1,
+                .shortconv_cache => counts.shortconv_roles += 1,
+                .mamba_cache => counts.mamba_roles += 1,
+                .gated_delta_cache => counts.gated_delta_roles += 1,
+                .none => {},
+            }
+        }
+        return counts;
+    }
+
+    fn validateModelStateTopology(
+        layer_counts: LayerRoleCounts,
+        state_counts: StateRoleCounts,
+    ) !void {
+        if (layer_counts.attention_layers > 0 and state_counts.kv_roles == 0) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        if (layer_counts.shortconv_layers > 0 and state_counts.shortconv_roles == 0) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        if (layer_counts.mamba_layers > 0 and state_counts.mamba_roles == 0) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        if (layer_counts.gated_delta_layers > 0 and state_counts.gated_delta_roles == 0) {
+            return error.InvalidStateDescriptorBinding;
+        }
+    }
+
+    fn panicInvalidSlotState(
+        self: *MetalBackend,
+        slot_index: usize,
+        descriptor_idx: usize,
+        reason: []const u8,
+    ) noreturn {
+        const descriptors = self.stateDescriptors();
+        const descriptor = descriptors[descriptor_idx];
+        const role = self.state_runtime_roles[descriptor_idx];
+        log.warn("inference", "Metal slot state integrity failure (fatal)", .{
+            .slot = slot_index,
+            .descriptor_index = descriptor_idx,
+            .descriptor_id = descriptor.id,
+            .runtime_kind = descriptor.runtime_kind,
+            .role = stateRoleName(role),
+            .reason = reason,
+        });
+        std.debug.panic(
+            "metal slot state integrity failure: slot={} descriptor_index={} descriptor_id={} role={s} reason={s}",
+            .{ slot_index, descriptor_idx, descriptor.id, stateRoleName(role), reason },
+        );
     }
 
     fn stateObjectLooksValid(
@@ -1070,6 +1254,12 @@ pub const MetalBackend = struct {
         const cache_max_seq_len = resolveCacheMaxSeqLen(max_seq_len);
         var text_runtime_rope = try buildTextRuntimeRoPE(allocator, loaded);
         errdefer if (text_runtime_rope) |*rope| rope.deinit(std.heap.c_allocator);
+        var cpu_lm_head_scratch = try cpu_linalg.MatmulScratch.init(allocator);
+        errdefer cpu_lm_head_scratch.deinit();
+        const cpu_lm_head_fallback = resolveCpuLmHeadFallback();
+        if (cpu_lm_head_fallback) {
+            log.warn("inference", "Metal CPU lm_head fallback enabled", .{});
+        }
         log.debug("inference", "Metal cache capacity policy", .{
             .config_max_seq_len = max_seq_len,
             .cache_max_seq_len = cache_max_seq_len,
@@ -1087,6 +1277,33 @@ pub const MetalBackend = struct {
             }
         }
         const state_runtime_roles = try deriveStateRuntimeRoles(state_descriptors_storage[0..state_descriptor_count]);
+        const layer_counts = countLayerRoles(weight_handles);
+        const state_counts = countStateRoles(state_runtime_roles[0..state_descriptor_count]);
+        log.debug("inference", "Metal runtime state topology", .{
+            .attention_layers = layer_counts.attention_layers,
+            .shortconv_layers = layer_counts.shortconv_layers,
+            .mamba_layers = layer_counts.mamba_layers,
+            .gated_delta_layers = layer_counts.gated_delta_layers,
+            .kv_state_roles = state_counts.kv_roles,
+            .shortconv_state_roles = state_counts.shortconv_roles,
+            .mamba_state_roles = state_counts.mamba_roles,
+            .gated_delta_state_roles = state_counts.gated_delta_roles,
+            .state_descriptors = state_descriptor_count,
+        }, @src());
+        validateModelStateTopology(layer_counts, state_counts) catch |err| {
+            log.err("inference", "Metal runtime state topology mismatch (fatal)", .{
+                .attention_layers = layer_counts.attention_layers,
+                .shortconv_layers = layer_counts.shortconv_layers,
+                .mamba_layers = layer_counts.mamba_layers,
+                .gated_delta_layers = layer_counts.gated_delta_layers,
+                .kv_state_roles = state_counts.kv_roles,
+                .shortconv_state_roles = state_counts.shortconv_roles,
+                .mamba_state_roles = state_counts.mamba_roles,
+                .gated_delta_state_roles = state_counts.gated_delta_roles,
+                .reason = @errorName(err),
+            }, @src());
+            return err;
+        };
         var vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
         errdefer if (vision_runtime) |*rt| rt.deinit();
 
@@ -1107,8 +1324,11 @@ pub const MetalBackend = struct {
         errdefer allocator.free(slot_logits_buffer);
         var backend = MetalBackend{
             .allocator = allocator,
+            .loaded = loaded,
             .config = loaded.config,
             .weights = weight_handles,
+            .cpu_lm_head_scratch = cpu_lm_head_scratch,
+            .cpu_lm_head_fallback = cpu_lm_head_fallback,
             .layer_count = layer_count,
             .cache_max_seq_len = cache_max_seq_len,
             .vocab_size = @intCast(loaded.config.vocab_size),
@@ -1146,6 +1366,7 @@ pub const MetalBackend = struct {
         // may hold ARC-managed Metal resources whose eager teardown has been
         // crashing verify runs after otherwise-successful execution.
         graph.mlx_clear_thread_local_run_state();
+        self.cpu_lm_head_scratch.deinit();
         if (self.text_runtime_rope) |*rope| rope.deinit(std.heap.c_allocator);
         if (self.vision_runtime) |*rt| rt.deinit();
         if (self.slot0_state_binding.bound) {
@@ -1351,6 +1572,21 @@ pub const MetalBackend = struct {
         if (self.state_descriptor_count == 0) return;
         const binding = try self.slotStateBinding(slot_index);
         if (!binding.bound) return error.InvalidStateDescriptorBinding;
+        const descriptors = self.stateDescriptors();
+        const count = @as(usize, @intCast(binding.count));
+        if (count != descriptors.len) {
+            self.panicInvalidSlotState(slot_index, 0, "bound descriptor count mismatch");
+        }
+        for (0..count) |idx| {
+            const role = self.state_runtime_roles[idx];
+            if (role == .none) continue;
+            if (!binding.initialized[idx]) {
+                self.panicInvalidSlotState(slot_index, idx, "runtime state object not initialized");
+            }
+            if (!stateObjectLooksValid(role, &binding.handles[idx])) {
+                self.panicInvalidSlotState(slot_index, idx, "runtime state object invalid");
+            }
+        }
         if (comptime std.debug.runtime_safety) {
             try runtime_contract.validateStateBlocksForDescriptors(
                 self.stateDescriptors(),
@@ -1866,6 +2102,36 @@ test "deriveStateRuntimeRoles rejects unsupported runtime_kind" {
     try std.testing.expectError(
         error.InvalidStateDescriptorBinding,
         MetalBackend.deriveStateRuntimeRoles(descriptors[0..]),
+    );
+}
+
+test "countStateRoles tallies runtime descriptor roles" {
+    const roles = [_]MetalBackend.StateRuntimeRole{
+        .kv_cache,
+        .shortconv_cache,
+        .gated_delta_cache,
+        .gated_delta_cache,
+        .none,
+    };
+    const counts = MetalBackend.countStateRoles(roles[0..]);
+    try std.testing.expectEqual(@as(usize, 1), counts.kv_roles);
+    try std.testing.expectEqual(@as(usize, 1), counts.shortconv_roles);
+    try std.testing.expectEqual(@as(usize, 0), counts.mamba_roles);
+    try std.testing.expectEqual(@as(usize, 2), counts.gated_delta_roles);
+}
+
+test "validateModelStateTopology rejects missing recurrent state role" {
+    const layer_counts = MetalBackend.LayerRoleCounts{
+        .attention_layers = 6,
+        .gated_delta_layers = 18,
+    };
+    const state_counts = MetalBackend.StateRoleCounts{
+        .kv_roles = 1,
+        .gated_delta_roles = 0,
+    };
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        MetalBackend.validateModelStateTopology(layer_counts, state_counts),
     );
 }
 

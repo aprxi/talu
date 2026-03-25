@@ -78,6 +78,59 @@ fn findMlxMetallib(b: *std.Build) ?[]const u8 {
     return null;
 }
 
+fn hashBytesFnv1a(seed: u64, bytes: []const u8) u64 {
+    var h = seed;
+    for (bytes) |b| {
+        h ^= @as(u64, b);
+        h *%= 1099511628211;
+    }
+    return h;
+}
+
+fn hasSuffixAny(name: []const u8, suffixes: []const []const u8) bool {
+    for (suffixes) |suffix| {
+        if (std.mem.endsWith(u8, name, suffix)) return true;
+    }
+    return false;
+}
+
+fn mlxIncludeFingerprintFlag(b: *std.Build) []const u8 {
+    const dir_path = "core/src/compute/metal/mlx";
+    const tracked_suffixes = [_][]const u8{ ".inc", ".h" };
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
+        return b.fmt("-DTALU_MLX_INCLUDE_FP=0x0", .{});
+    };
+    defer dir.close();
+
+    var names = std.ArrayList([]const u8){};
+    defer names.deinit(b.allocator);
+
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!hasSuffixAny(entry.name, tracked_suffixes[0..])) continue;
+        names.append(b.allocator, b.dupe(entry.name)) catch @panic("OOM");
+    }
+
+    std.sort.block([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.order(u8, a, c) == .lt;
+        }
+    }.lessThan);
+
+    var h: u64 = 14695981039346656037;
+    for (names.items) |name| {
+        h = hashBytesFnv1a(h, name);
+        const full_path = b.fmt("{s}/{s}", .{ dir_path, name });
+        const contents = std.fs.cwd().readFileAlloc(b.allocator, full_path, 16 * 1024 * 1024) catch continue;
+        defer b.allocator.free(contents);
+        h = hashBytesFnv1a(h, contents);
+    }
+
+    return b.fmt("-DTALU_MLX_INCLUDE_FP=0x{x}", .{h});
+}
+
 // =============================================================================
 // Dependencies — each built from ports/<dep>/build.zig
 // =============================================================================
@@ -356,6 +409,7 @@ fn addMetalSupport(
     artifact.linkFramework("Accelerate");
 
     artifact.addObjectFile(b.path("deps/mlx/lib/libmlx.a"));
+    const mlx_include_fp_flag = mlxIncludeFingerprintFlag(b);
 
     artifact.addCSourceFiles(.{
         .files = &.{
@@ -378,6 +432,7 @@ fn addMetalSupport(
         },
         .flags = &.{
             "-std=c++17",
+            mlx_include_fp_flag,
         },
     });
 

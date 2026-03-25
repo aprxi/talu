@@ -403,12 +403,30 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             sampling_config: sampling.SamplingConfig,
             grammar_sampler: ?*validate.sampler.ConstrainedSampler,
         ) !u32 {
+            const effective_sampling = sampling_config;
+
+            if (@intFromEnum(log.Level.trace) < @intFromEnum(log.getLogLevel())) {
+                // Skip trace payload formatting when trace is disabled.
+            } else {
+                log.trace("inference", "Sampling config", .{
+                    .strategy = @tagName(effective_sampling.strategy),
+                    .temperature = effective_sampling.temperature,
+                    .top_k = effective_sampling.top_k,
+                    .top_p = effective_sampling.top_p,
+                    .min_p = effective_sampling.min_p,
+                    .repetition_penalty = effective_sampling.repetition_penalty,
+                    .presence_penalty = effective_sampling.presence_penalty,
+                    .frequency_penalty = effective_sampling.frequency_penalty,
+                    .context_len = if (effective_sampling.context_tokens) |tokens| tokens.len else 0,
+                    .has_grammar = @as(u8, @intFromBool(grammar_sampler != null)),
+                }, @src());
+            }
             self.sampler.grammar_sampler = grammar_sampler;
             defer self.sampler.grammar_sampler = null;
 
             if (grammar_sampler != null) {
                 if (self.config.tokenizer) |tokenizer| {
-                    const sampled = try self.sampler.sampleConstrained(logits, sampling_config, tokenizer);
+                    const sampled = try self.sampler.sampleConstrained(logits, effective_sampling, tokenizer);
                     const token_id: u32 = @intCast(sampled);
                     if (tokenizer.tokenBytes(@intCast(token_id))) |token_text| {
                         try self.sampler.acceptToken(token_id, token_text);
@@ -417,7 +435,104 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }
             }
 
-            const sampled = try self.sampler.sampleMut(logits, sampling_config);
+            if (logits.len > self.logits_buffer.len) return error.InvalidArgument;
+            var sample_logits = logits;
+            // Never mutate backend-owned logits in place. Some backends reuse
+            // slot buffers across steps; penalties must apply per-step to a
+            // transient sampling view only.
+            if (logits.ptr != self.logits_buffer.ptr) {
+                sample_logits = self.logits_buffer[0..logits.len];
+                @memcpy(sample_logits, logits);
+            }
+
+            const trace_enabled = !(@intFromEnum(log.Level.trace) < @intFromEnum(log.getLogLevel()));
+            const pre_stats = if (trace_enabled) parityStats(sample_logits) else null;
+            const sampled = try self.sampler.sampleMut(sample_logits, effective_sampling);
+            if (trace_enabled and pre_stats != null) {
+                const post_stats = parityStats(sample_logits);
+                const sampled_token: u32 = @intCast(sampled);
+                const sampled_idx: usize = sampled;
+                var selected_count: usize = 0;
+                var suffix_run_len: usize = 0;
+                if (effective_sampling.context_tokens) |tokens| {
+                    for (tokens) |token_id| {
+                        if (token_id == sampled_token) selected_count += 1;
+                    }
+                    var i: usize = tokens.len;
+                    while (i > 0) {
+                        i -= 1;
+                        if (tokens[i] != sampled_token) break;
+                        suffix_run_len += 1;
+                    }
+                }
+                const selected_pre_logit = if (sampled_idx < logits.len) logits[sampled_idx] else std.math.nan(f32);
+                const selected_post_logit = if (sampled_idx < sample_logits.len) sample_logits[sampled_idx] else std.math.nan(f32);
+                var selected_expected_post_logit = selected_pre_logit;
+                if (std.math.isFinite(selected_expected_post_logit) and selected_count > 0) {
+                    // sampleMut order: repetition penalty -> logit bias -> additive penalties.
+                    if (effective_sampling.repetition_penalty != 1.0) {
+                        var repetition_scale: f32 = 1.0;
+                        for (0..selected_count) |_| repetition_scale *= effective_sampling.repetition_penalty;
+                        if (selected_expected_post_logit > 0) {
+                            selected_expected_post_logit /= repetition_scale;
+                        } else {
+                            selected_expected_post_logit *= repetition_scale;
+                        }
+                    }
+                    if (effective_sampling.logit_bias) |bias_entries| {
+                        for (bias_entries) |entry| {
+                            if (entry.token_id == sampled_token) {
+                                selected_expected_post_logit += entry.bias;
+                            }
+                        }
+                    }
+                    if (effective_sampling.presence_penalty != 0.0) {
+                        selected_expected_post_logit -= effective_sampling.presence_penalty;
+                    }
+                    if (effective_sampling.frequency_penalty != 0.0) {
+                        selected_expected_post_logit -= effective_sampling.frequency_penalty * @as(f32, @floatFromInt(selected_count));
+                    }
+                }
+                const selected_penalty_residual = selected_post_logit - selected_expected_post_logit;
+                const has_penalties = effective_sampling.repetition_penalty != 1.0 or
+                    effective_sampling.presence_penalty != 0.0 or
+                    effective_sampling.frequency_penalty != 0.0;
+                const post_top1_val = post_stats.top[1].value;
+                const post_top0_margin = post_stats.top[0].value - post_top1_val;
+                log.trace("inference", "Sampling penalties effect", .{
+                    .strategy = @tagName(effective_sampling.strategy),
+                    .selected = sampled_token,
+                    .context_len = if (effective_sampling.context_tokens) |tokens| tokens.len else 0,
+                    .selected_count = selected_count,
+                    .suffix_run_len = suffix_run_len,
+                    .has_penalties = @as(u8, @intFromBool(has_penalties)),
+                    .pre_checksum = pre_stats.?.checksum,
+                    .post_checksum = post_stats.checksum,
+                    .checksums_equal = @as(u8, @intFromBool(pre_stats.?.checksum == post_stats.checksum)),
+                    .pre_top0_id = pre_stats.?.top[0].token_id,
+                    .post_top0_id = post_stats.top[0].token_id,
+                    .pre_top0_val = pre_stats.?.top[0].value,
+                    .post_top0_val = post_stats.top[0].value,
+                    .selected_pre_logit = selected_pre_logit,
+                    .selected_post_logit = selected_post_logit,
+                    .selected_expected_post_logit = selected_expected_post_logit,
+                    .selected_penalty_residual = selected_penalty_residual,
+                    .post_top1_id = post_stats.top[1].token_id,
+                    .post_top1_val = post_top1_val,
+                    .post_top0_margin = post_top0_margin,
+                }, @src());
+
+                if (suffix_run_len >= 2 and post_top0_margin >= 2.0) {
+                    log.trace("inference", "Sampling collapse sentinel", .{
+                        .selected = sampled_token,
+                        .selected_count = selected_count,
+                        .suffix_run_len = suffix_run_len,
+                        .post_top0_margin = post_top0_margin,
+                        .selected_post_logit = selected_post_logit,
+                        .selected_penalty_residual = selected_penalty_residual,
+                    }, @src());
+                }
+            }
             return @intCast(sampled);
         }
 
@@ -1407,6 +1522,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .strategy = @tagName(effective_sampling.strategy),
                     .top_k = effective_sampling.top_k,
                     .temperature = effective_sampling.temperature,
+                    .top_p = effective_sampling.top_p,
+                    .min_p = effective_sampling.min_p,
+                    .repetition_penalty = effective_sampling.repetition_penalty,
+                    .presence_penalty = effective_sampling.presence_penalty,
+                    .frequency_penalty = effective_sampling.frequency_penalty,
+                    .has_additive_penalties = @as(u8, @intFromBool(has_additive_penalties)),
                     .has_callback = @as(u8, @intFromBool(submit_config.callback != null)),
                 }, @src());
                 return self.generateSyncGreedyStreamingRoute(prompt_tokens, max_tokens, &submit_config, &effective_sampling);
@@ -1428,6 +1549,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .strategy = @tagName(effective_sampling.strategy),
                     .top_k = effective_sampling.top_k,
                     .temperature = effective_sampling.temperature,
+                    .top_p = effective_sampling.top_p,
+                    .min_p = effective_sampling.min_p,
+                    .repetition_penalty = effective_sampling.repetition_penalty,
+                    .presence_penalty = effective_sampling.presence_penalty,
+                    .frequency_penalty = effective_sampling.frequency_penalty,
+                    .has_additive_penalties = @as(u8, @intFromBool(has_additive_penalties)),
                     .has_callback = @as(u8, @intFromBool(submit_config.callback != null)),
                 }, @src());
                 return self.generateSyncTopKCandidateRoute(prompt_tokens, max_tokens, &submit_config, &effective_sampling);
@@ -1438,6 +1565,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .strategy = @tagName(effective_sampling.strategy),
                 .top_k = effective_sampling.top_k,
                 .temperature = effective_sampling.temperature,
+                .top_p = effective_sampling.top_p,
+                .min_p = effective_sampling.min_p,
+                .repetition_penalty = effective_sampling.repetition_penalty,
+                .presence_penalty = effective_sampling.presence_penalty,
+                .frequency_penalty = effective_sampling.frequency_penalty,
+                .has_additive_penalties = @as(u8, @intFromBool(has_additive_penalties)),
                 .has_callback = @as(u8, @intFromBool(submit_config.callback != null)),
             }, @src());
 

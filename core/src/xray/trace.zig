@@ -23,6 +23,12 @@ pub const TracePoint = enum(u8) {
     attn_q, // Q projection output
     attn_k, // K projection output
     attn_v, // V projection output
+    attn_q_proj_raw, // Raw Q projection output before gated-query compaction
+    attn_k_proj_raw, // Raw K projection output before reshape/norm/RoPE
+    attn_q_norm, // Q after QK norm, before RoPE
+    attn_k_norm, // K after QK norm, before RoPE
+    attn_q_rope, // Q after RoPE
+    attn_k_rope, // K after RoPE
     attn_qk, // Q @ K^T (attention scores before softmax)
     attn_weights, // After softmax
     attn_out, // After output projection
@@ -58,6 +64,8 @@ pub const TracePoint = enum(u8) {
     gdelta_ssm, // Gated-Delta state-space step output
     gdelta_norm, // Gated-Delta gated RMS norm output
     gdelta_out, // Gated-Delta output projection
+    gdelta_state_conv, // Gated-Delta conv cache state after update
+    gdelta_state_ssm, // Gated-Delta state-space cache after update
 
     // Extensible - custom points can use values >= 128
     _,
@@ -71,6 +79,12 @@ pub const TracePoint = enum(u8) {
             .attn_q => "attn.q",
             .attn_k => "attn.k",
             .attn_v => "attn.v",
+            .attn_q_proj_raw => "attn.q_proj_raw",
+            .attn_k_proj_raw => "attn.k_proj_raw",
+            .attn_q_norm => "attn.q_norm",
+            .attn_k_norm => "attn.k_norm",
+            .attn_q_rope => "attn.q_rope",
+            .attn_k_rope => "attn.k_rope",
             .attn_qk => "attn.qk",
             .attn_weights => "attn.weights",
             .attn_out => "attn.out",
@@ -96,6 +110,8 @@ pub const TracePoint = enum(u8) {
             .gdelta_ssm => "gdelta.ssm",
             .gdelta_norm => "gdelta.norm",
             .gdelta_out => "gdelta.out",
+            .gdelta_state_conv => "gdelta.state_conv",
+            .gdelta_state_ssm => "gdelta.state_ssm",
             _ => "custom",
         };
     }

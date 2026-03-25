@@ -135,15 +135,28 @@ pub const VerifyCapture = struct {
             .embed = true,
             .layer_input = true,
             .layer_attn_norm = true,
+            .attn_q = true,
+            .attn_k = true,
+            .attn_q_proj_raw = true,
+            .attn_k_proj_raw = true,
+            .attn_q_norm = true,
+            .attn_k_norm = true,
+            .attn_q_rope = true,
+            .attn_k_rope = true,
+            .attn_qk = true,
+            .attn_weights = true,
             .attn_out = true,
             .gdelta_in_proj = true,
             .gdelta_conv = true,
             .gdelta_ssm = true,
             .gdelta_norm = true,
             .block_out = true,
+            .final_norm = true,
             .lm_head = true,
             .token_select = true,
             .gdelta_out = true,
+            .gdelta_state_conv = true,
+            .gdelta_state_ssm = true,
         };
     }
 
@@ -353,6 +366,14 @@ pub const VerifyCapture = struct {
         // verification backend-agnostic and avoids duplicating device-specific
         // stats paths here.
         const tensor_stats = stats_mod.compute(emission.tensor);
+        if (emission.point == .attn_q_norm or emission.point == .attn_k_norm or emission.point == .attn_q_rope or emission.point == .attn_k_rope or emission.point == .attn_qk) {
+            std.log.err("XRAY probe point={s} layer={} pos={} token={}", .{
+                emission.point.name(),
+                emission.layer,
+                emission.position,
+                emission.token,
+            });
+        }
 
         switch (self.mode) {
             .record => {
@@ -1128,6 +1149,7 @@ test "VerifyCapture verification point set is complete" {
     try std.testing.expect(points.contains(.layer_attn_norm));
     try std.testing.expect(points.contains(.attn_out));
     try std.testing.expect(points.contains(.block_out));
+    try std.testing.expect(points.contains(.final_norm));
     try std.testing.expect(points.contains(.lm_head));
     try std.testing.expect(!points.contains(.logits_ready));
     try std.testing.expect(points.contains(.token_select));
@@ -1142,7 +1164,6 @@ test "VerifyCapture verification point set is complete" {
     try std.testing.expect(!points.contains(.ffn_act_mix));
     try std.testing.expect(!points.contains(.conv_out_proj));
     try std.testing.expect(!points.contains(.mamba_out));
-    try std.testing.expect(!points.contains(.final_norm));
     try std.testing.expect(!points.contains(.logits_scaled));
 }
 

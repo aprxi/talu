@@ -18,7 +18,9 @@ const cpu_gated_attention = compute.cpu.gated_attention;
 const cpu_layout = compute.cpu.layout;
 const cpu_indexing = compute.cpu.indexing;
 const cpu_norm = compute.cpu.normalization;
+const cpu_reduction = compute.cpu.reduction;
 const cpu_rotary = compute.cpu.rotary;
+const cpu_softmax = compute.cpu.softmax;
 const parallel = @import("../../../../system/parallel.zig");
 const rope_kernel = @import("rope.zig");
 const kv_cache_module = @import("kv_cache.zig");
@@ -47,6 +49,130 @@ fn getExactSoftmax(allocator: std.mem.Allocator) bool {
     exact_softmax_cached = std.process.hasEnvVar(allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
     exact_softmax_initialized = true;
     return exact_softmax_cached;
+}
+
+fn rewritePrefillTraceRowsAsRawQk(
+    score_values: []f32,
+    query_values: []const f32,
+    key_values: []const f32,
+    sequence_len: usize,
+    n_heads: usize,
+    heads_per_kv_group: usize,
+    head_dim: usize,
+    query_dim: usize,
+    kv_total_dim: usize,
+    sliding_window: usize,
+    scale: f32,
+) void {
+    const last_query_index = sequence_len - 1;
+    const active_end = sequence_len;
+    const active_start: usize = if (sliding_window > 0 and active_end > sliding_window)
+        active_end - sliding_window
+    else
+        0;
+
+    for (0..n_heads) |head_index| {
+        const kv_head_idx = head_index / heads_per_kv_group;
+        const query_head = query_values[last_query_index * query_dim + head_index * head_dim ..][0..head_dim];
+        const scores_for_head = score_values[head_index * sequence_len ..][0..sequence_len];
+
+        for (0..active_start) |row_index| {
+            scores_for_head[row_index] = -std.math.inf(f32);
+        }
+        for (active_start..active_end) |row_index| {
+            const key_row = key_values[row_index * kv_total_dim + kv_head_idx * head_dim ..][0..head_dim];
+            scores_for_head[row_index] = cpu_reduction.dotRow(query_head, key_row) * scale;
+        }
+    }
+}
+
+fn rewriteDecodeTraceRowsAsRawQk(
+    score_values: []f32,
+    query_values: []const f32,
+    key_cache: []const f32,
+    kv_sequence_len: usize,
+    n_heads: usize,
+    heads_per_kv_group: usize,
+    head_dim: usize,
+    kv_stride: usize,
+    start_kv_index: usize,
+    score_stride: usize,
+    scale: f32,
+) void {
+    for (0..n_heads) |head_index| {
+        const kv_head_idx = head_index / heads_per_kv_group;
+        const query_head = query_values[head_index * head_dim ..][0..head_dim];
+        const k_cache_base = key_cache[kv_head_idx * kv_stride * head_dim ..];
+        const scores_for_head = score_values[head_index * score_stride ..][0..kv_sequence_len];
+
+        for (0..start_kv_index) |row_index| {
+            scores_for_head[row_index] = -std.math.inf(f32);
+        }
+        for (start_kv_index..kv_sequence_len) |row_index| {
+            const key_row = k_cache_base[row_index * head_dim ..][0..head_dim];
+            scores_for_head[row_index] = cpu_reduction.dotRow(query_head, key_row) * scale;
+        }
+    }
+}
+
+fn rewriteDecodeTraceRowsAsRawQkBatched(
+    score_values: []f32,
+    query_values: []const f32,
+    cache: *kv_cache_module.BatchedKVCache,
+    slot_index: usize,
+    kv_sequence_len: usize,
+    n_heads: usize,
+    heads_per_kv_group: usize,
+    head_dim: usize,
+    start_kv_index: usize,
+    score_stride: usize,
+    scale: f32,
+) void {
+    for (0..n_heads) |head_index| {
+        const kv_head_idx = head_index / heads_per_kv_group;
+        const query_head = query_values[head_index * head_dim ..][0..head_dim];
+        const key_cache_head = cache.getKHead(slot_index, kv_head_idx);
+        const scores_for_head = score_values[head_index * score_stride ..][0..kv_sequence_len];
+
+        for (0..start_kv_index) |row_index| {
+            scores_for_head[row_index] = -std.math.inf(f32);
+        }
+        for (start_kv_index..kv_sequence_len) |row_index| {
+            const key_row = key_cache_head[row_index * head_dim ..][0..head_dim];
+            scores_for_head[row_index] = cpu_reduction.dotRow(query_head, key_row) * scale;
+        }
+    }
+}
+
+fn normalizeTraceRowsAsWeights(
+    score_values: []f32,
+    row_width: usize,
+    n_heads: usize,
+    active_start: usize,
+    active_end: usize,
+    sinks: ?[]const f32,
+    exact_softmax: bool,
+) void {
+    for (0..n_heads) |head_index| {
+        const scores_for_head = score_values[head_index * row_width ..][0..row_width];
+        var max_score: f32 = -std.math.inf(f32);
+        for (active_start..active_end) |row_index| {
+            max_score = @max(max_score, scores_for_head[row_index]);
+        }
+        const sink_logit: ?f32 = if (sinks) |s| s[head_index] else null;
+        if (sink_logit) |sink| {
+            max_score = @max(max_score, sink);
+        }
+        cpu_softmax.maskedInPlaceWithMax(
+            scores_for_head,
+            active_start,
+            active_end,
+            sink_logit,
+            exact_softmax,
+            max_score,
+            null,
+        );
+    }
 }
 
 /// Temporary scratch buffers for attention computation.
@@ -328,6 +454,31 @@ pub const MultiHeadAttention = struct {
             query_view = views.q;
             key_view = views.k;
             value_view = views.v;
+            if (trace.isEnabled()) {
+                const trace_position: u32 = if (use_cache) @intCast(cache.cache_position) else @intCast(sequence_len);
+                trace.emit(
+                    .attn_q_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    query_view.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(sequence_len), @intCast(query_dim), 0 },
+                    3,
+                    self.kernel_name_qkv_fused orelse self.kernel_name_qkv,
+                );
+                trace.emit(
+                    .attn_k_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    key_view.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 },
+                    3,
+                    self.kernel_name_qkv_fused orelse self.kernel_name_qkv,
+                );
+            }
         } else {
             // Separate Q/K/V projections - must have all three
             const query_weights = self.q_proj orelse return error.MissingAttentionWeights;
@@ -346,6 +497,20 @@ pub const MultiHeadAttention = struct {
                     q_bias_applied = true;
                 }
             }
+            if (trace.isEnabled()) {
+                const trace_position: u32 = if (use_cache) @intCast(cache.cache_position) else @intCast(sequence_len);
+                trace.emit(
+                    .attn_q_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    query_workspace.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(sequence_len), @intCast(query_projection_dim), 0 },
+                    3,
+                    self.kernel_name_qkv,
+                );
+            }
             if (query_gate) {
                 try cpu_gated_attention.compactQueryProjection(
                     scratch.q[0 .. sequence_len * query_projection_dim],
@@ -362,6 +527,20 @@ pub const MultiHeadAttention = struct {
             const matmul_kernel_v = self.matmul_v orelse self.matmul_qkv;
             matmul_kernel_k(&input_view, key_weights, &key_workspace, matmul_scratch);
             matmul_kernel_v(&input_view, value_weights, &value_workspace, matmul_scratch);
+            if (trace.isEnabled()) {
+                const trace_position: u32 = if (use_cache) @intCast(cache.cache_position) else @intCast(sequence_len);
+                trace.emit(
+                    .attn_k_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    key_workspace.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 },
+                    3,
+                    self.kernel_name_k orelse self.kernel_name_qkv,
+                );
+            }
             query_view = if (query_gate)
                 Tensor.view2DSlice(scratch.qkv[0 .. sequence_len * query_dim], sequence_len, query_dim)
             else
@@ -414,6 +593,34 @@ pub const MultiHeadAttention = struct {
         // Apply RoPE to Q/K.
         // pos_offset is the position in the sequence (accounting for cached tokens).
         const pos_offset = if (use_cache) cache.cache_position else 0;
+        if (trace.isEnabled()) {
+            const trace_position: u32 = if (use_cache) @intCast(cache.cache_position) else @intCast(sequence_len);
+            const q_kernel = self.kernel_name_qkv;
+            const k_kernel = self.kernel_name_k orelse q_kernel;
+            trace.emit(
+                .attn_q_norm,
+                self.layer_idx,
+                0,
+                trace_position,
+                query_view.data().ptr,
+                .f32,
+                .{ 1, @intCast(sequence_len), @intCast(query_dim), 0 },
+                3,
+                q_kernel,
+            );
+            trace.emit(
+                .attn_k_norm,
+                self.layer_idx,
+                0,
+                trace_position,
+                key_view.data().ptr,
+                .f32,
+                .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 },
+                3,
+                k_kernel,
+            );
+        }
+
         if (self.runtime_rope) |runtime_rope| {
             if (self.rope_interleaved) {
                 try cpu_rotary.applyRuntimeTablesToPairInterleaved(
@@ -484,6 +691,28 @@ pub const MultiHeadAttention = struct {
             const q_kernel = self.kernel_name_qkv;
             const k_kernel = self.kernel_name_k orelse q_kernel;
             const v_kernel = self.kernel_name_v orelse q_kernel;
+            trace.emit(
+                .attn_q_rope,
+                self.layer_idx,
+                0,
+                trace_position,
+                query_view.data().ptr,
+                .f32,
+                .{ 1, @intCast(sequence_len), @intCast(query_dim), 0 },
+                3,
+                q_kernel,
+            );
+            trace.emit(
+                .attn_k_rope,
+                self.layer_idx,
+                0,
+                trace_position,
+                key_view.data().ptr,
+                .f32,
+                .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 },
+                3,
+                k_kernel,
+            );
             trace.emit(
                 .attn_q,
                 self.layer_idx,
@@ -631,9 +860,24 @@ pub const MultiHeadAttention = struct {
                 }
             }
 
-            // Emit attention scores/weights (decode: scores are [n_heads, kv_sequence_len] post-softmax)
+            // Emit trace rows for the current decode step.
+            // `score_values` holds post-softmax weights after SDPA completes, so
+            // rebuild the raw QK row here for xray before re-normalizing it.
             if (trace.isEnabled()) {
                 const trace_position: u32 = @intCast(cache.cache_position);
+                rewriteDecodeTraceRowsAsRawQk(
+                    score_values,
+                    query_values,
+                    cache.key_cache,
+                    kv_sequence_len,
+                    self.n_heads,
+                    heads_per_kv_group,
+                    head_dim,
+                    kv_stride,
+                    start_kv_index,
+                    score_stride,
+                    scale,
+                );
                 trace.emit(
                     .attn_qk,
                     self.layer_idx,
@@ -644,6 +888,15 @@ pub const MultiHeadAttention = struct {
                     .{ @intCast(self.n_heads), @intCast(kv_sequence_len), 0, 0 },
                     2,
                     null,
+                );
+                normalizeTraceRowsAsWeights(
+                    score_values,
+                    kv_sequence_len,
+                    self.n_heads,
+                    start_kv_index,
+                    kv_sequence_len,
+                    self.sinks,
+                    exact_softmax,
                 );
                 trace.emit(
                     .attn_weights,
@@ -838,8 +1091,24 @@ pub const MultiHeadAttention = struct {
             }
         }
 
-        // Emit attention scores/weights (prefill: scores are [n_heads, sequence_len] post-softmax)
+        // Emit trace rows for the final prefill query.
+        // `score_values` is re-used as a scratch row buffer after attention has
+        // already produced the context, so rebuilding it here does not affect
+        // model behavior.
         if (trace.isEnabled()) {
+            rewritePrefillTraceRowsAsRawQk(
+                score_values,
+                query_values,
+                key_values,
+                sequence_len,
+                self.n_heads,
+                heads_per_kv_group,
+                head_dim,
+                query_dim,
+                kv_total_dim,
+                self.sliding_window,
+                scale,
+            );
             trace.emit(
                 .attn_qk,
                 self.layer_idx,
@@ -850,6 +1119,15 @@ pub const MultiHeadAttention = struct {
                 .{ @intCast(self.n_heads), @intCast(sequence_len), 0, 0 },
                 2,
                 null,
+            );
+            normalizeTraceRowsAsWeights(
+                score_values,
+                sequence_len,
+                self.n_heads,
+                if (self.sliding_window > 0 and sequence_len > self.sliding_window) sequence_len - self.sliding_window else 0,
+                sequence_len,
+                self.sinks,
+                exact_softmax,
             );
             trace.emit(
                 .attn_weights,
@@ -1037,6 +1315,31 @@ pub const MultiHeadAttention = struct {
             query_view = views.q;
             key_view = views.k;
             value_view = views.v;
+            if (trace.isEnabled()) {
+                const trace_position: u32 = if (use_cache) @intCast(cache.getPosition(slot_index)) else @intCast(sequence_len);
+                trace.emit(
+                    .attn_q_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    query_view.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(sequence_len), @intCast(query_dim), 0 },
+                    3,
+                    self.kernel_name_qkv_fused orelse self.kernel_name_qkv,
+                );
+                trace.emit(
+                    .attn_k_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    key_view.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 },
+                    3,
+                    self.kernel_name_qkv_fused orelse self.kernel_name_qkv,
+                );
+            }
         } else {
             const query_weights = self.q_proj orelse return error.MissingAttentionWeights;
             const key_weights = self.k_proj orelse return error.MissingAttentionWeights;
@@ -1055,6 +1358,20 @@ pub const MultiHeadAttention = struct {
                     q_bias_applied = true;
                 }
             }
+            if (trace.isEnabled()) {
+                const trace_position: u32 = if (use_cache) @intCast(cache.getPosition(slot_index)) else @intCast(sequence_len);
+                trace.emit(
+                    .attn_q_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    query_workspace.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(sequence_len), @intCast(query_projection_dim), 0 },
+                    3,
+                    self.kernel_name_qkv,
+                );
+            }
             if (query_gate) {
                 try cpu_gated_attention.compactQueryProjection(
                     scratch.q[0 .. sequence_len * query_projection_dim],
@@ -1070,6 +1387,20 @@ pub const MultiHeadAttention = struct {
             const matmul_kernel_v = self.matmul_v orelse self.matmul_qkv;
             matmul_kernel_k(&input_view, key_weights, &key_workspace, matmul_scratch);
             matmul_kernel_v(&input_view, value_weights, &value_workspace, matmul_scratch);
+            if (trace.isEnabled()) {
+                const trace_position: u32 = if (use_cache) @intCast(cache.getPosition(slot_index)) else @intCast(sequence_len);
+                trace.emit(
+                    .attn_k_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    key_workspace.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 },
+                    3,
+                    self.kernel_name_k orelse self.kernel_name_qkv,
+                );
+            }
 
             query_view = if (query_gate)
                 Tensor.view2DSlice(scratch.qkv[0 .. sequence_len * query_dim], sequence_len, query_dim)
@@ -1112,40 +1443,101 @@ pub const MultiHeadAttention = struct {
             );
         }
 
+        if (trace.isEnabled()) {
+            const trace_position: u32 = if (use_cache) @intCast(cache.getPosition(slot_index)) else @intCast(sequence_len);
+            const q_kernel = self.kernel_name_qkv;
+            const k_kernel = self.kernel_name_k orelse q_kernel;
+            trace.emit(
+                .attn_q_norm,
+                self.layer_idx,
+                0,
+                trace_position,
+                query_view.data().ptr,
+                .f32,
+                .{ 1, @intCast(sequence_len), @intCast(query_dim), 0 },
+                3,
+                q_kernel,
+            );
+            trace.emit(
+                .attn_k_norm,
+                self.layer_idx,
+                0,
+                trace_position,
+                key_view.data().ptr,
+                .f32,
+                .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 },
+                3,
+                k_kernel,
+            );
+        }
+
         // Get current cache position for RoPE
         const cache_position = cache.getPosition(slot_index);
         const pos_offset = if (use_cache) cache_position else 0;
 
         // Apply RoPE (after QKNorm)
         if (self.runtime_rope) |runtime_rope| {
-            try cpu_rotary.applyRuntimeTablesToPair(
-                query_view.asSlice(f32),
-                key_view.asSlice(f32),
-                sequence_len,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                query_dim,
-                kv_total_dim,
-                pos_offset,
-                runtime_rope.cos,
-                runtime_rope.sin,
-                runtime_rope.dim,
-            );
+            if (self.rope_interleaved) {
+                try cpu_rotary.applyRuntimeTablesToPairInterleaved(
+                    query_view.asSlice(f32),
+                    key_view.asSlice(f32),
+                    sequence_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    pos_offset,
+                    runtime_rope.cos,
+                    runtime_rope.sin,
+                    runtime_rope.dim,
+                );
+            } else {
+                try cpu_rotary.applyRuntimeTablesToPair(
+                    query_view.asSlice(f32),
+                    key_view.asSlice(f32),
+                    sequence_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    pos_offset,
+                    runtime_rope.cos,
+                    runtime_rope.sin,
+                    runtime_rope.dim,
+                );
+            }
         } else if (self.rope) |rope| {
-            try cpu_rotary.applyStaticTablesToPair(
-                query_view.asSlice(f32),
-                key_view.asSlice(f32),
-                sequence_len,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                query_dim,
-                kv_total_dim,
-                pos_offset,
-                self.position_delta,
-                rope,
-            );
+            if (self.rope_interleaved) {
+                try cpu_rotary.applyStaticTablesToPairInterleaved(
+                    query_view.asSlice(f32),
+                    key_view.asSlice(f32),
+                    sequence_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    pos_offset,
+                    self.position_delta,
+                    rope,
+                );
+            } else {
+                try cpu_rotary.applyStaticTablesToPair(
+                    query_view.asSlice(f32),
+                    key_view.asSlice(f32),
+                    sequence_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    pos_offset,
+                    self.position_delta,
+                    rope,
+                );
+            }
         }
 
         // Trace Q/K/V after projections and RoPE
@@ -1154,6 +1546,8 @@ pub const MultiHeadAttention = struct {
             const q_kernel = self.kernel_name_qkv;
             const k_kernel = self.kernel_name_k orelse q_kernel;
             const v_kernel = self.kernel_name_v orelse q_kernel;
+            trace.emit(.attn_q_rope, self.layer_idx, 0, trace_pos, query_view.data().ptr, .f32, .{ 1, @intCast(sequence_len), @intCast(query_dim), 0 }, 3, q_kernel);
+            trace.emit(.attn_k_rope, self.layer_idx, 0, trace_pos, key_view.data().ptr, .f32, .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 }, 3, k_kernel);
             trace.emit(.attn_q, self.layer_idx, 0, trace_pos, query_view.data().ptr, .f32, .{ 1, @intCast(sequence_len), @intCast(query_dim), 0 }, 3, q_kernel);
             trace.emit(.attn_k, self.layer_idx, 0, trace_pos, key_view.data().ptr, .f32, .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 }, 3, k_kernel);
             trace.emit(.attn_v, self.layer_idx, 0, trace_pos, value_view.data().ptr, .f32, .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 }, 3, v_kernel);
@@ -1412,10 +1806,41 @@ pub const MultiHeadAttention = struct {
             }
         }
 
-        // Emit attention scores/weights trace points
+        // Emit trace rows for the final query of this step. Rebuild raw QK
+        // scores into `score_values` for xray, then normalize in-place for the
+        // weights checkpoint. Context/output math is already finished.
         if (trace.isEnabled()) {
             const trace_pos_scores: u32 = @intCast(if (use_cache) cache.getPosition(slot_index) else sequence_len);
             const scores_dim1: u32 = if (use_cache) @intCast(cache.getPosition(slot_index)) else @intCast(sequence_len);
+            if (use_cache) {
+                rewriteDecodeTraceRowsAsRawQkBatched(
+                    score_values,
+                    query_values,
+                    cache,
+                    slot_index,
+                    cache.getPosition(slot_index),
+                    n_heads,
+                    heads_per_kv_group,
+                    head_dim,
+                    if (self.sliding_window > 0 and cache.getPosition(slot_index) > self.sliding_window) cache.getPosition(slot_index) - self.sliding_window else 0,
+                    self.max_seq_len,
+                    scale,
+                );
+            } else {
+                rewritePrefillTraceRowsAsRawQk(
+                    score_values,
+                    query_values,
+                    key_values,
+                    sequence_len,
+                    n_heads,
+                    heads_per_kv_group,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    self.sliding_window,
+                    scale,
+                );
+            }
             trace.emit(
                 .attn_qk,
                 self.layer_idx,
@@ -1426,6 +1851,18 @@ pub const MultiHeadAttention = struct {
                 .{ @intCast(n_heads), scores_dim1, 0, 0 },
                 2,
                 null,
+            );
+            normalizeTraceRowsAsWeights(
+                score_values,
+                @intCast(scores_dim1),
+                n_heads,
+                if (use_cache)
+                    (if (self.sliding_window > 0 and cache.getPosition(slot_index) > self.sliding_window) cache.getPosition(slot_index) - self.sliding_window else 0)
+                else
+                    (if (self.sliding_window > 0 and sequence_len > self.sliding_window) sequence_len - self.sliding_window else 0),
+                @intCast(scores_dim1),
+                self.sinks,
+                exact_softmax,
             );
             trace.emit(
                 .attn_weights,
@@ -1548,6 +1985,32 @@ pub const MultiHeadAttention = struct {
             query_view = views.q;
             key_view = views.k;
             value_view = views.v;
+            if (trace.isEnabled()) {
+                const trace_slot_index = if (slot_indices.len > 0) slot_indices[0] else 0;
+                const trace_position: u32 = if (use_cache) @intCast(cache.getPosition(trace_slot_index)) else @intCast(batch_size);
+                trace.emit(
+                    .attn_q_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    query_view.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(batch_size), @intCast(query_dim), 0 },
+                    3,
+                    self.kernel_name_qkv_fused orelse self.kernel_name_qkv,
+                );
+                trace.emit(
+                    .attn_k_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    key_view.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(batch_size), @intCast(kv_total_dim), 0 },
+                    3,
+                    self.kernel_name_qkv_fused orelse self.kernel_name_qkv,
+                );
+            }
         } else {
             const query_weights = self.q_proj orelse return error.MissingAttentionWeights;
             const key_weights = self.k_proj orelse return error.MissingAttentionWeights;
@@ -1566,6 +2029,21 @@ pub const MultiHeadAttention = struct {
                     q_bias_applied = true;
                 }
             }
+            if (trace.isEnabled()) {
+                const trace_slot_index = if (slot_indices.len > 0) slot_indices[0] else 0;
+                const trace_position: u32 = if (use_cache) @intCast(cache.getPosition(trace_slot_index)) else @intCast(batch_size);
+                trace.emit(
+                    .attn_q_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    query_workspace.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(batch_size), @intCast(query_projection_dim), 0 },
+                    3,
+                    self.kernel_name_qkv,
+                );
+            }
             if (query_gate) {
                 try cpu_gated_attention.compactQueryProjection(
                     scratch.q[0 .. batch_size * query_projection_dim],
@@ -1581,6 +2059,21 @@ pub const MultiHeadAttention = struct {
             const matmul_kernel_v = self.matmul_v orelse self.matmul_qkv;
             matmul_kernel_k(&input_view, key_weights, &key_workspace, matmul_scratch);
             matmul_kernel_v(&input_view, value_weights, &value_workspace, matmul_scratch);
+            if (trace.isEnabled()) {
+                const trace_slot_index = if (slot_indices.len > 0) slot_indices[0] else 0;
+                const trace_position: u32 = if (use_cache) @intCast(cache.getPosition(trace_slot_index)) else @intCast(batch_size);
+                trace.emit(
+                    .attn_k_proj_raw,
+                    self.layer_idx,
+                    0,
+                    trace_position,
+                    key_workspace.data().ptr,
+                    .f32,
+                    .{ 1, @intCast(batch_size), @intCast(kv_total_dim), 0 },
+                    3,
+                    self.kernel_name_k orelse self.kernel_name_qkv,
+                );
+            }
 
             query_view = if (query_gate)
                 Tensor.view2DSlice(scratch.qkv[0 .. batch_size * query_dim], batch_size, query_dim)
@@ -1629,39 +2122,72 @@ pub const MultiHeadAttention = struct {
                 const pos_offset = cache.getPosition(slot_index);
                 const q_row = query_values[batch_index * query_dim ..][0..query_dim];
                 const k_row = key_values[batch_index * kv_total_dim ..][0..kv_total_dim];
-                try cpu_rotary.applyRuntimeTablesToPair(
-                    q_row,
-                    k_row,
-                    1,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    query_dim,
-                    kv_total_dim,
-                    pos_offset,
-                    runtime_rope.cos,
-                    runtime_rope.sin,
-                    runtime_rope.dim,
-                );
+                if (self.rope_interleaved) {
+                    try cpu_rotary.applyRuntimeTablesToPairInterleaved(
+                        q_row,
+                        k_row,
+                        1,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        query_dim,
+                        kv_total_dim,
+                        pos_offset,
+                        runtime_rope.cos,
+                        runtime_rope.sin,
+                        runtime_rope.dim,
+                    );
+                } else {
+                    try cpu_rotary.applyRuntimeTablesToPair(
+                        q_row,
+                        k_row,
+                        1,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        query_dim,
+                        kv_total_dim,
+                        pos_offset,
+                        runtime_rope.cos,
+                        runtime_rope.sin,
+                        runtime_rope.dim,
+                    );
+                }
             }
         } else if (self.rope) |rope| {
             for (slot_indices, 0..) |slot_index, batch_index| {
                 const pos_offset = cache.getPosition(slot_index);
                 const q_row = query_values[batch_index * query_dim ..][0..query_dim];
                 const k_row = key_values[batch_index * kv_total_dim ..][0..kv_total_dim];
-                try cpu_rotary.applyStaticTablesToPair(
-                    q_row,
-                    k_row,
-                    1,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    query_dim,
-                    kv_total_dim,
-                    pos_offset,
-                    self.position_delta,
-                    rope,
-                );
+                if (self.rope_interleaved) {
+                    try cpu_rotary.applyStaticTablesToPairInterleaved(
+                        q_row,
+                        k_row,
+                        1,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        query_dim,
+                        kv_total_dim,
+                        pos_offset,
+                        self.position_delta,
+                        rope,
+                    );
+                } else {
+                    try cpu_rotary.applyStaticTablesToPair(
+                        q_row,
+                        k_row,
+                        1,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        query_dim,
+                        kv_total_dim,
+                        pos_offset,
+                        self.position_delta,
+                        rope,
+                    );
+                }
             }
         }
 
@@ -2046,34 +2572,67 @@ fn forwardBatchedDecode(
 
         // Apply RoPE if configured (after QKNorm).
         if (self.runtime_rope) |runtime_rope| {
-            try cpu_rotary.applyRuntimeTablesToPair(
-                query_buffer,
-                key_buffer,
-                1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                query_dim,
-                kv_total_dim,
-                cache_position,
-                runtime_rope.cos,
-                runtime_rope.sin,
-                runtime_rope.dim,
-            );
+            if (self.rope_interleaved) {
+                try cpu_rotary.applyRuntimeTablesToPairInterleaved(
+                    query_buffer,
+                    key_buffer,
+                    1,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    cache_position,
+                    runtime_rope.cos,
+                    runtime_rope.sin,
+                    runtime_rope.dim,
+                );
+            } else {
+                try cpu_rotary.applyRuntimeTablesToPair(
+                    query_buffer,
+                    key_buffer,
+                    1,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    cache_position,
+                    runtime_rope.cos,
+                    runtime_rope.sin,
+                    runtime_rope.dim,
+                );
+            }
         } else if (self.rope) |rope_ptr| {
-            try cpu_rotary.applyStaticTablesToPair(
-                query_buffer,
-                key_buffer,
-                1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                query_dim,
-                kv_total_dim,
-                cache_position,
-                self.position_delta,
-                rope_ptr,
-            );
+            if (self.rope_interleaved) {
+                try cpu_rotary.applyStaticTablesToPairInterleaved(
+                    query_buffer,
+                    key_buffer,
+                    1,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    cache_position,
+                    self.position_delta,
+                    rope_ptr,
+                );
+            } else {
+                try cpu_rotary.applyStaticTablesToPair(
+                    query_buffer,
+                    key_buffer,
+                    1,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    cache_position,
+                    self.position_delta,
+                    rope_ptr,
+                );
+            }
         }
 
         // 2. Append K/V to cache

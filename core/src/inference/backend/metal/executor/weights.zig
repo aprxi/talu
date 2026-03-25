@@ -78,18 +78,42 @@ fn loadNormWeight(weight: *const Tensor) MLXError!ArrayHandle {
     }
 }
 
-fn persistArrayHandle(handle: ArrayHandle) MLXError!ArrayHandle {
-    if (handle == null) return error.InvalidTensorType;
-    var shape: [8]usize = undefined;
-    const rank = mlx_graph.getShape(handle, &shape);
-    if (rank == 0) return handle;
-    return mlx_graph.mlx_persistent_reshape(handle, &shape, rank);
+fn loadNormWeightWithOffsetF32(
+    allocator: std.mem.Allocator,
+    weight: *const Tensor,
+    offset: f32,
+) MLXError!ArrayHandle {
+    const element_size = weight.dtype.elementSize();
+    if (element_size == 0 or (weight.data_size % element_size) != 0) return error.InvalidShape;
+    const element_count = weight.data_size / element_size;
+    const values = try allocator.alloc(f32, element_count);
+    errdefer allocator.free(values);
+    switch (weight.dtype) {
+        .f32 => {
+            const src = weight.asSlice(f32);
+            for (src, values) |value, *dst| dst.* = value + offset;
+        },
+        .f16 => {
+            const src = weight.asSlice(u16);
+            for (src, values) |bits, *dst| dst.* = dtype_mod.fp16ToF32(bits) + offset;
+        },
+        .bf16 => {
+            const src = weight.asSlice(u16);
+            for (src, values) |bits, *dst| dst.* = dtype_mod.bf16ToF32(bits) + offset;
+        },
+        else => return error.UnsupportedDType,
+    }
+    return mlx_graph.createPersistentArrayF32(values, &[_]i64{@intCast(element_count)});
 }
 
-fn addOnePersistent(base: ArrayHandle) MLXError!ArrayHandle {
-    if (base == null) return error.InvalidTensorType;
-    const added = mlx_graph.mlx_add_one(base);
-    return try persistArrayHandle(added);
+fn loadNormWeightWithRuntimeOffset(
+    allocator: std.mem.Allocator,
+    weight: *const Tensor,
+    has_offset: bool,
+    offset: f32,
+) MLXError!ArrayHandle {
+    if (!has_offset) return loadNormWeight(weight);
+    return loadNormWeightWithOffsetF32(allocator, weight, offset);
 }
 
 fn isGroupedAffineDType(dtype: dtype_mod.DType) bool {
@@ -948,20 +972,20 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 const is_mla = attn_block.isMLA();
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
-                var ln1_arr = try loadNormWeight(attn_block.ln1_weight);
-                // (1+w) RMSNorm formulation
-                if (weight_handles.has_norm_weight_offset) {
-                    ln1_arr = try addOnePersistent(ln1_arr);
-                }
-                weight_handles.layers[layer_idx].ln1_weight = ln1_arr;
+                weight_handles.layers[layer_idx].ln1_weight = try loadNormWeightWithRuntimeOffset(
+                    arena_allocator,
+                    attn_block.ln1_weight,
+                    weight_handles.has_norm_weight_offset,
+                    loaded.runtime.weight_offset,
+                );
 
                 // ln2_weight - load in native dtype (bf16, f16, or f32)
-                var ln2_arr = try loadNormWeight(attn_block.ln2_weight);
-                // (1+w) RMSNorm formulation
-                if (weight_handles.has_norm_weight_offset) {
-                    ln2_arr = try addOnePersistent(ln2_arr);
-                }
-                weight_handles.layers[layer_idx].ln2_weight = ln2_arr;
+                weight_handles.layers[layer_idx].ln2_weight = try loadNormWeightWithRuntimeOffset(
+                    arena_allocator,
+                    attn_block.ln2_weight,
+                    weight_handles.has_norm_weight_offset,
+                    loaded.runtime.weight_offset,
+                );
 
                 if (is_mla) {
                     const mla_cfg = attn_block.mla_config orelse return error.MissingField;
@@ -1094,49 +1118,54 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 if (attn_block.v_bias) |b| weight_handles.layers[layer_idx].v_bias = mlx_graph.createPersistentArrayF32(b, &[_]i64{@intCast(b.len)});
                 if (attn_block.o_bias) |b| weight_handles.layers[layer_idx].o_bias = mlx_graph.createPersistentArrayF32(b, &[_]i64{@intCast(b.len)});
                 if (attn_block.sinks) |s| weight_handles.layers[layer_idx].attn_sinks = mlx_graph.createPersistentArrayF32(s, &[_]i64{@intCast(s.len)});
+                weight_handles.layers[layer_idx].sliding_window = attn_block.sliding_window;
 
                 // QK normalization (optional) - load in native dtype (f32, f16, or bf16)
                 if (attn_block.q_norm) |q_norm_tensor| {
-                    var q_norm_arr = try loadNormWeight(q_norm_tensor);
                     // QK norm offset follows attention runtime contract (can differ from generic norm offset).
-                    if (weight_handles.has_qk_norm_weight_offset) {
-                        q_norm_arr = try addOnePersistent(q_norm_arr);
-                    }
-                    weight_handles.layers[layer_idx].q_norm = q_norm_arr;
+                    weight_handles.layers[layer_idx].q_norm = try loadNormWeightWithRuntimeOffset(
+                        arena_allocator,
+                        q_norm_tensor,
+                        weight_handles.has_qk_norm_weight_offset,
+                        loaded.runtime.qk_norm_weight_offset,
+                    );
                 } else {
                     weight_handles.layers[layer_idx].q_norm = null;
                 }
 
                 if (attn_block.k_norm) |k_norm_tensor| {
-                    var k_norm_arr = try loadNormWeight(k_norm_tensor);
                     // QK norm offset follows attention runtime contract (can differ from generic norm offset).
-                    if (weight_handles.has_qk_norm_weight_offset) {
-                        k_norm_arr = try addOnePersistent(k_norm_arr);
-                    }
-                    weight_handles.layers[layer_idx].k_norm = k_norm_arr;
+                    weight_handles.layers[layer_idx].k_norm = try loadNormWeightWithRuntimeOffset(
+                        arena_allocator,
+                        k_norm_tensor,
+                        weight_handles.has_qk_norm_weight_offset,
+                        loaded.runtime.qk_norm_weight_offset,
+                    );
                 } else {
                     weight_handles.layers[layer_idx].k_norm = null;
                 }
 
                 // Extra FFN layer norms (4 norms per block) - optional
                 if (attn_block.pre_ffn_norm) |pre_ffn_norm_tensor| {
-                    var norm_arr = try loadNormWeight(pre_ffn_norm_tensor);
                     // (1+w) RMSNorm formulation
-                    if (weight_handles.has_norm_weight_offset) {
-                        norm_arr = try addOnePersistent(norm_arr);
-                    }
-                    weight_handles.layers[layer_idx].pre_ffn_norm = norm_arr;
+                    weight_handles.layers[layer_idx].pre_ffn_norm = try loadNormWeightWithRuntimeOffset(
+                        arena_allocator,
+                        pre_ffn_norm_tensor,
+                        weight_handles.has_norm_weight_offset,
+                        loaded.runtime.weight_offset,
+                    );
                 } else {
                     weight_handles.layers[layer_idx].pre_ffn_norm = null;
                 }
 
                 if (attn_block.post_ffn_norm) |post_ffn_norm_tensor| {
-                    var norm_arr = try loadNormWeight(post_ffn_norm_tensor);
                     // (1+w) RMSNorm formulation
-                    if (weight_handles.has_norm_weight_offset) {
-                        norm_arr = try addOnePersistent(norm_arr);
-                    }
-                    weight_handles.layers[layer_idx].post_ffn_norm = norm_arr;
+                    weight_handles.layers[layer_idx].post_ffn_norm = try loadNormWeightWithRuntimeOffset(
+                        arena_allocator,
+                        post_ffn_norm_tensor,
+                        weight_handles.has_norm_weight_offset,
+                        loaded.runtime.weight_offset,
+                    );
                 } else {
                     weight_handles.layers[layer_idx].post_ffn_norm = null;
                 }
@@ -1148,18 +1177,20 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 weight_handles.layers[layer_idx].kind = .mamba;
                 try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .mamba, null);
 
-                var ln1_arr = try loadNormWeight(mamba_block.ln1_weight);
-                if (weight_handles.has_norm_weight_offset) {
-                    ln1_arr = try addOnePersistent(ln1_arr);
-                }
-                weight_handles.layers[layer_idx].ln1_weight = ln1_arr;
+                weight_handles.layers[layer_idx].ln1_weight = try loadNormWeightWithRuntimeOffset(
+                    arena_allocator,
+                    mamba_block.ln1_weight,
+                    weight_handles.has_norm_weight_offset,
+                    loaded.runtime.weight_offset,
+                );
 
                 const ln2_tensor = mamba_block.ln2_weight orelse mamba_block.ln1_weight;
-                var ln2_arr = try loadNormWeight(ln2_tensor);
-                if (weight_handles.has_norm_weight_offset) {
-                    ln2_arr = try addOnePersistent(ln2_arr);
-                }
-                weight_handles.layers[layer_idx].ln2_weight = ln2_arr;
+                weight_handles.layers[layer_idx].ln2_weight = try loadNormWeightWithRuntimeOffset(
+                    arena_allocator,
+                    ln2_tensor,
+                    weight_handles.has_norm_weight_offset,
+                    loaded.runtime.weight_offset,
+                );
 
                 weight_handles.layers[layer_idx].mamba_d_state = @intCast(mamba_block.config.d_state);
                 weight_handles.layers[layer_idx].mamba_d_conv = @intCast(mamba_block.config.d_conv);
@@ -1177,11 +1208,12 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.layers[layer_idx].mamba_dt_bias = try tensorToArray(bias);
                 }
                 if (mamba_block.weights.norm_weight) |norm_w| {
-                    var norm_arr = try loadNormWeight(norm_w);
-                    if (weight_handles.has_norm_weight_offset) {
-                        norm_arr = try addOnePersistent(norm_arr);
-                    }
-                    weight_handles.layers[layer_idx].mamba_norm_weight = norm_arr;
+                    weight_handles.layers[layer_idx].mamba_norm_weight = try loadNormWeightWithRuntimeOffset(
+                        arena_allocator,
+                        norm_w,
+                        weight_handles.has_norm_weight_offset,
+                        loaded.runtime.weight_offset,
+                    );
                 }
 
                 const core_quantized = isGroupedAffineDType(mamba_block.weights.in_proj.dtype) and
@@ -1228,18 +1260,20 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     .d_head = @intCast(gated_delta_block.config.d_head),
                     .d_inner = @intCast(gated_delta_block.config.n_heads * gated_delta_block.config.d_head),
                 });
-                var ln1_arr = try loadNormWeight(gated_delta_block.ln1_weight);
-                if (weight_handles.has_norm_weight_offset) {
-                    ln1_arr = try addOnePersistent(ln1_arr);
-                }
-                weight_handles.layers[layer_idx].ln1_weight = ln1_arr;
+                weight_handles.layers[layer_idx].ln1_weight = try loadNormWeightWithRuntimeOffset(
+                    arena_allocator,
+                    gated_delta_block.ln1_weight,
+                    weight_handles.has_norm_weight_offset,
+                    loaded.runtime.weight_offset,
+                );
 
                 const ln2_tensor = gated_delta_block.ln2_weight orelse gated_delta_block.ln1_weight;
-                var ln2_arr = try loadNormWeight(ln2_tensor);
-                if (weight_handles.has_norm_weight_offset) {
-                    ln2_arr = try addOnePersistent(ln2_arr);
-                }
-                weight_handles.layers[layer_idx].ln2_weight = ln2_arr;
+                weight_handles.layers[layer_idx].ln2_weight = try loadNormWeightWithRuntimeOffset(
+                    arena_allocator,
+                    ln2_tensor,
+                    weight_handles.has_norm_weight_offset,
+                    loaded.runtime.weight_offset,
+                );
 
                 weight_handles.layers[layer_idx].gated_delta_d_conv = @intCast(gated_delta_block.config.d_conv);
                 weight_handles.layers[layer_idx].gated_delta_n_heads = @intCast(gated_delta_block.config.n_heads);
@@ -1306,19 +1340,21 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .shortconv, null);
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
-                var ln1_arr = try loadNormWeight(shortconv_block.ln1_weight);
-                if (weight_handles.has_norm_weight_offset) {
-                    ln1_arr = try addOnePersistent(ln1_arr);
-                }
-                weight_handles.layers[layer_idx].ln1_weight = ln1_arr;
+                weight_handles.layers[layer_idx].ln1_weight = try loadNormWeightWithRuntimeOffset(
+                    arena_allocator,
+                    shortconv_block.ln1_weight,
+                    weight_handles.has_norm_weight_offset,
+                    loaded.runtime.weight_offset,
+                );
 
                 // ShortConv uses ffn_norm (ln2 equivalent). Require it for consistent FFN path.
                 const ln2_tensor = shortconv_block.ln2_weight orelse return error.MissingField;
-                var ln2_arr = try loadNormWeight(ln2_tensor);
-                if (weight_handles.has_norm_weight_offset) {
-                    ln2_arr = try addOnePersistent(ln2_arr);
-                }
-                weight_handles.layers[layer_idx].ln2_weight = ln2_arr;
+                weight_handles.layers[layer_idx].ln2_weight = try loadNormWeightWithRuntimeOffset(
+                    arena_allocator,
+                    ln2_tensor,
+                    weight_handles.has_norm_weight_offset,
+                    loaded.runtime.weight_offset,
+                );
 
                 weight_handles.layers[layer_idx].shortconv_d_conv = @intCast(shortconv_block.config.d_conv);
                 weight_handles.layers[layer_idx].shortconv_conv_dim = @intCast(shortconv_block.config.conv_dim);
@@ -1579,12 +1615,13 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
     // Load final layer norm - in native dtype (bf16, f16, or f32)
     if (loaded.ln_final) |ln_f| {
-        var ln_final_arr = try loadNormWeight(&ln_f);
         // (1+w) RMSNorm formulation
-        if (weight_handles.has_norm_weight_offset) {
-            ln_final_arr = try addOnePersistent(ln_final_arr);
-        }
-        weight_handles.ln_final = ln_final_arr;
+        weight_handles.ln_final = try loadNormWeightWithRuntimeOffset(
+            arena_allocator,
+            &ln_f,
+            weight_handles.has_norm_weight_offset,
+            loaded.runtime.weight_offset,
+        );
     }
 
     // Load LM head (optional — embed-only models may not have one)
@@ -2091,6 +2128,7 @@ pub const WeightHandles = struct {
         o_bias: ?ArrayHandle = null,
         // Attention sinks - per-head scaling for attention
         attn_sinks: ?ArrayHandle = null,
+        sliding_window: usize = 0,
         // BF16 weights (non-quantized)
         q_proj_bf16: ?ArrayHandle = null,
         k_proj_bf16: ?ArrayHandle = null,

@@ -612,9 +612,7 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     };
     const uint lane = thread_position_in_grid.x;
     const uint head = thread_position_in_grid.y;
-    if (lane >= D_HEAD) {
-      return;
-    }
+    const bool active = lane < D_HEAD;
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
     threadgroup float out_shared[D_HEAD];
@@ -623,13 +621,16 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     const uint vec_base = head * D_HEAD;
     const uint state_base = head * D_HEAD * D_HEAD;
 
-    float q = query[vec_base + lane];
-    float k = key[vec_base + lane];
-
-    // Store q*q, k*k for sequential reduction (matches CPU precision)
-    q_shared[lane] = q * q;
-    k_shared[lane] = k * k;
-    out_shared[lane] = q * k;
+    float q = 0.0f;
+    float k = 0.0f;
+    if (active) {
+      q = query[vec_base + lane];
+      k = key[vec_base + lane];
+      // Store q*q, k*k for sequential reduction (matches CPU precision)
+      q_shared[lane] = q * q;
+      k_shared[lane] = k * k;
+      out_shared[lane] = q * k;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Sequential reduction by lane 0 for exact CPU match
@@ -653,35 +654,39 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    q *= scalar_shared[4];
-    k *= scalar_shared[1];
-    q_shared[lane] = q;
-    k_shared[lane] = k;
+    if (active) {
+      q *= scalar_shared[4];
+      k *= scalar_shared[1];
+      q_shared[lane] = q;
+      k_shared[lane] = k;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float beta = scalar_shared[2];
-    const float decay = scalar_shared[3];
-    float kv_mem = 0.0f;
     float out_value = 0.0f;
-    // Use fma for higher precision accumulation (matches CPU @mulAdd)
-    for (uint i = 0; i < D_HEAD; ++i) {
-      const uint state_index = state_base + (i * D_HEAD) + lane;
-      const float scaled = state[state_index] * decay;
-      kv_mem = fma(scaled, k_shared[i], kv_mem);
-      out_value = fma(scaled, q_shared[i], out_value);
+    if (active) {
+      const float beta = scalar_shared[2];
+      const float decay = scalar_shared[3];
+      float kv_mem = 0.0f;
+      // Use fma for higher precision accumulation (matches CPU @mulAdd)
+      for (uint i = 0; i < D_HEAD; ++i) {
+        const uint state_index = state_base + (i * D_HEAD) + lane;
+        const float scaled = state[state_index] * decay;
+        kv_mem = fma(scaled, k_shared[i], kv_mem);
+        out_value = fma(scaled, q_shared[i], out_value);
+      }
+
+      kv_mem = (value[vec_base + lane] - kv_mem) * beta;
+      out_value = fma(kv_mem, scalar_shared[0], out_value);
+
+      for (uint i = 0; i < D_HEAD; ++i) {
+        const uint state_index = state_base + (i * D_HEAD) + lane;
+        const float scaled = state[state_index] * decay;
+        next_state[state_index] = fma(k_shared[i], kv_mem, scaled);
+      }
+
+      // RMS norm: sequential reduction for exact CPU match
+      out_shared[lane] = out_value * out_value;
     }
-
-    kv_mem = (value[vec_base + lane] - kv_mem) * beta;
-    out_value = fma(kv_mem, scalar_shared[0], out_value);
-
-    for (uint i = 0; i < D_HEAD; ++i) {
-      const uint state_index = state_base + (i * D_HEAD) + lane;
-      const float scaled = state[state_index] * decay;
-      next_state[state_index] = fma(k_shared[i], kv_mem, scaled);
-    }
-
-    // RMS norm: sequential reduction for exact CPU match
-    out_shared[lane] = out_value * out_value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) {
       float sum_sq = 0.0f;
@@ -692,10 +697,12 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_kernel() {
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    out_value *= scalar_shared[5];
-    out_value *= norm_weight[vec_base + lane];
-    const float z_value = z[vec_base + lane];
-    out[vec_base + lane] = out_value * (z_value * fast_sigmoid(z_value));
+    if (active) {
+      out_value *= scalar_shared[5];
+      out_value *= norm_weight[vec_base + lane];
+      const float z_value = z[vec_base + lane];
+      out[vec_base + lane] = out_value * (z_value * fast_sigmoid(z_value));
+    }
         )",
         "",
         true,
@@ -752,9 +759,7 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
     };
     const uint lane = thread_position_in_grid.x;
     const uint head = thread_position_in_grid.y;
-    if (lane >= D_HEAD) {
-      return;
-    }
+    const bool active = lane < D_HEAD;
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
     threadgroup float out_shared[D_HEAD];
@@ -763,13 +768,16 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
     const uint vec_base = head * D_HEAD;
     const uint state_base = head * D_HEAD * D_HEAD;
 
-    float q = query[vec_base + lane];
-    float k = key[vec_base + lane];
-
-    // Store q*q, k*k for sequential reduction (matches CPU precision)
-    q_shared[lane] = q * q;
-    k_shared[lane] = k * k;
-    out_shared[lane] = q * k;
+    float q = 0.0f;
+    float k = 0.0f;
+    if (active) {
+      q = query[vec_base + lane];
+      k = key[vec_base + lane];
+      // Store q*q, k*k for sequential reduction (matches CPU precision)
+      q_shared[lane] = q * q;
+      k_shared[lane] = k * k;
+      out_shared[lane] = q * k;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Sequential reduction by lane 0 for exact CPU match
@@ -792,36 +800,40 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    q *= scalar_shared[4];
-    k *= scalar_shared[1];
-    q_shared[lane] = q;
-    k_shared[lane] = k;
+    if (active) {
+      q *= scalar_shared[4];
+      k *= scalar_shared[1];
+      q_shared[lane] = q;
+      k_shared[lane] = k;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float beta = scalar_shared[2];
-    const float decay = scalar_shared[3];
-    float kv_mem = 0.0f;
     float out_value = 0.0f;
-    // Use fma for higher precision accumulation (matches CPU @mulAdd)
-    for (uint i = 0; i < D_HEAD; ++i) {
-      const uint state_index = state_base + (i * D_HEAD) + lane;
-      const float scaled = state[state_index] * decay;
-      kv_mem = fma(scaled, k_shared[i], kv_mem);
-      out_value = fma(scaled, q_shared[i], out_value);
+    if (active) {
+      const float beta = scalar_shared[2];
+      const float decay = scalar_shared[3];
+      float kv_mem = 0.0f;
+      // Use fma for higher precision accumulation (matches CPU @mulAdd)
+      for (uint i = 0; i < D_HEAD; ++i) {
+        const uint state_index = state_base + (i * D_HEAD) + lane;
+        const float scaled = state[state_index] * decay;
+        kv_mem = fma(scaled, k_shared[i], kv_mem);
+        out_value = fma(scaled, q_shared[i], out_value);
+      }
+
+      kv_mem = (value[vec_base + lane] - kv_mem) * beta;
+      out_value = fma(kv_mem, scalar_shared[0], out_value);
+      out_ssm[vec_base + lane] = out_value;
+
+      for (uint i = 0; i < D_HEAD; ++i) {
+        const uint state_index = state_base + (i * D_HEAD) + lane;
+        const float scaled = state[state_index] * decay;
+        next_state[state_index] = fma(k_shared[i], kv_mem, scaled);
+      }
+
+      // RMS norm: sequential reduction for exact CPU match
+      out_shared[lane] = out_value * out_value;
     }
-
-    kv_mem = (value[vec_base + lane] - kv_mem) * beta;
-    out_value = fma(kv_mem, scalar_shared[0], out_value);
-    out_ssm[vec_base + lane] = out_value;
-
-    for (uint i = 0; i < D_HEAD; ++i) {
-      const uint state_index = state_base + (i * D_HEAD) + lane;
-      const float scaled = state[state_index] * decay;
-      next_state[state_index] = fma(k_shared[i], kv_mem, scaled);
-    }
-
-    // RMS norm: sequential reduction for exact CPU match
-    out_shared[lane] = out_value * out_value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) {
       float sum_sq = 0.0f;
@@ -832,10 +844,12 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_step_debug_kern
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    out_value *= scalar_shared[5];
-    out_value *= norm_weight[vec_base + lane];
-    const float z_value = z[vec_base + lane];
-    out_norm[vec_base + lane] = out_value * (z_value * fast_sigmoid(z_value));
+    if (active) {
+      out_value *= scalar_shared[5];
+      out_value *= norm_weight[vec_base + lane];
+      const float z_value = z[vec_base + lane];
+      out_norm[vec_base + lane] = out_value * (z_value * fast_sigmoid(z_value));
+    }
         )",
         "",
         true,
@@ -998,9 +1012,7 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_ssm_probe_kerne
     };
     const uint lane = thread_position_in_grid.x;
     const uint head = thread_position_in_grid.y;
-    if (lane >= D_HEAD) {
-      return;
-    }
+    const bool active = lane < D_HEAD;
     threadgroup float q_shared[D_HEAD];
     threadgroup float k_shared[D_HEAD];
     threadgroup float out_shared[D_HEAD];
@@ -1009,13 +1021,16 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_ssm_probe_kerne
     const uint vec_base = head * D_HEAD;
     const uint state_base = head * D_HEAD * D_HEAD;
 
-    float q = query[vec_base + lane];
-    float k = key[vec_base + lane];
-
-    // Store q*q, k*k for sequential reduction (matches CPU precision)
-    q_shared[lane] = q * q;
-    k_shared[lane] = k * k;
-    out_shared[lane] = q * k;
+    float q = 0.0f;
+    float k = 0.0f;
+    if (active) {
+      q = query[vec_base + lane];
+      k = key[vec_base + lane];
+      // Store q*q, k*k for sequential reduction (matches CPU precision)
+      q_shared[lane] = q * q;
+      k_shared[lane] = k * k;
+      out_shared[lane] = q * k;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Sequential reduction by lane 0 for exact CPU match
@@ -1038,27 +1053,31 @@ static inline fast::CustomKernelFunction& gated_delta_recurrence_ssm_probe_kerne
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    q *= scalar_shared[4];
-    k *= scalar_shared[1];
-    q_shared[lane] = q;
-    k_shared[lane] = k;
+    if (active) {
+      q *= scalar_shared[4];
+      k *= scalar_shared[1];
+      q_shared[lane] = q;
+      k_shared[lane] = k;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float beta = scalar_shared[2];
-    const float decay = scalar_shared[3];
-    float kv_mem = 0.0f;
-    float out_value = 0.0f;
-    // Use fma for higher precision accumulation (matches CPU @mulAdd)
-    for (uint i = 0; i < D_HEAD; ++i) {
-      const uint state_index = state_base + (i * D_HEAD) + lane;
-      const float scaled = state[state_index] * decay;
-      kv_mem = fma(scaled, k_shared[i], kv_mem);
-      out_value = fma(scaled, q_shared[i], out_value);
-    }
+    if (active) {
+      const float beta = scalar_shared[2];
+      const float decay = scalar_shared[3];
+      float kv_mem = 0.0f;
+      float out_value = 0.0f;
+      // Use fma for higher precision accumulation (matches CPU @mulAdd)
+      for (uint i = 0; i < D_HEAD; ++i) {
+        const uint state_index = state_base + (i * D_HEAD) + lane;
+        const float scaled = state[state_index] * decay;
+        kv_mem = fma(scaled, k_shared[i], kv_mem);
+        out_value = fma(scaled, q_shared[i], out_value);
+      }
 
-    kv_mem = (value[vec_base + lane] - kv_mem) * beta;
-    out_value = fma(kv_mem, scalar_shared[0], out_value);
-    out_ssm[vec_base + lane] = out_value;
+      kv_mem = (value[vec_base + lane] - kv_mem) * beta;
+      out_value = fma(kv_mem, scalar_shared[0], out_value);
+      out_ssm[vec_base + lane] = out_value;
+    }
         )",
         "",
         true,
@@ -1711,6 +1730,22 @@ static array state_space_apply_matmul_rhs(const array& x, const void* ctx) {
     return matmul_lastdim(x, *rhs);
 }
 
+static array state_space_apply_matmul_rhs_reference(const array& x, const void* ctx) {
+    const auto* rhs = static_cast<const array*>(ctx);
+    if (rhs == nullptr) {
+        throw std::invalid_argument("[state_space] missing matmul rhs");
+    }
+    return state_space_host_matmul_lastdim_reference(x, *rhs);
+}
+
+static array state_space_apply_linear_reference(const array& x, const void* ctx) {
+    const auto* weight = static_cast<const array*>(ctx);
+    if (weight == nullptr) {
+        throw std::invalid_argument("[state_space] missing linear weight");
+    }
+    return state_space_host_linear_reference(x, *weight);
+}
+
 struct StateSpaceQuantLinearCtx {
     const array* w = nullptr;
     const array* s = nullptr;
@@ -1743,6 +1778,8 @@ struct GatedDeltaCaptureOutputs {
     std::optional<array> conv;
     std::optional<array> ssm;
     std::optional<array> norm;
+    std::optional<array> state_conv;
+    std::optional<array> state_ssm;
 };
 
 static inline void materialize_gated_delta_capture_outputs(GatedDeltaCaptureOutputs* capture_out) {
@@ -1756,6 +1793,8 @@ static inline void materialize_gated_delta_capture_outputs(GatedDeltaCaptureOutp
     if (capture_out->conv.has_value()) to_eval.push_back(*capture_out->conv);
     if (capture_out->ssm.has_value()) to_eval.push_back(*capture_out->ssm);
     if (capture_out->norm.has_value()) to_eval.push_back(*capture_out->norm);
+    if (capture_out->state_conv.has_value()) to_eval.push_back(*capture_out->state_conv);
+    if (capture_out->state_ssm.has_value()) to_eval.push_back(*capture_out->state_ssm);
     if (!to_eval.empty()) eval(to_eval);
 }
 
@@ -1970,7 +2009,6 @@ static inline array gated_delta_mixer_forward_core(
     GatedDeltaCaptureOutputs* capture_out
 ) {
     const int seq_len = input.shape(1);
-    (void)n_key_heads; // Keep ABI stable; runtime split is derived from weight shape for CPU parity.
     const int d_inner = n_heads * d_head;
     const int qkv_len = conv_kernel_broadcast.shape(2);
     if (qkv_len <= d_inner) {
@@ -1988,6 +2026,11 @@ static inline array gated_delta_mixer_forward_core(
     if (n_kh <= 0 || (n_heads % n_kh) != 0) {
         throw std::invalid_argument("[gated_delta] conv-derived q heads incompatible with value heads");
     }
+    // CPU treats configured n_key_heads as part of the contract.
+    // Fail loudly if conv-derived projection shape disagrees.
+    if (n_key_heads > 0 && n_kh != n_key_heads) {
+        throw std::invalid_argument("[gated_delta] conv-derived q heads mismatch configured n_key_heads");
+    }
     const int proj_len = qkv_len + d_inner + (2 * n_heads);
     if (n_heads <= 0 || d_head <= 0 || d_conv <= 0) {
         throw std::invalid_argument("[gated_delta] invalid config dims");
@@ -1996,8 +2039,8 @@ static inline array gated_delta_mixer_forward_core(
     // Projection matmuls stay in model dtype for bf16/f16 tensor-core throughput.
     // FP32 upcasting happens after projection, before recurrent state math.
     const array proj_all = state_space_call(in_proj_fn, input);
-    if (proj_all.shape(2) < proj_len) {
-        throw std::invalid_argument("[gated_delta] in_proj output too small");
+    if (proj_all.shape(2) != proj_len) {
+        throw std::invalid_argument("[gated_delta] in_proj output width mismatch");
     }
 
     // Slice projections; upcast qkv to FP32 for recurrent state math (matches quantized path).
@@ -2031,14 +2074,16 @@ static inline array gated_delta_mixer_forward_core(
         capture_out->in_proj = proj_all;
         capture_out->conv = conv_seq;
     }
+    const bool use_reference_recurrence = gated_delta_reference_enabled();
     // SiLU then upcast to FP32 once for the entire sequence. This avoids
     // per-token ensure_float32 calls inside the recurrence loop.
-    const array qkv_conv_all = ensure_float32(conv_seq * sigmoid(conv_seq));
+    const array qkv_conv_all = use_reference_recurrence
+        ? gated_delta_apply_fast_silu_reference(conv_seq)
+        : ensure_float32(conv_seq * sigmoid(conv_seq));
 
     const std::optional<array> dt_bias_heads = dt_bias_row
         ? std::optional<array>(contiguous(reshape(*dt_bias_row, {n_heads})))
         : std::nullopt;
-    const Dtype model_dtype = input.dtype();
     const array dt_bias_heads_value = dt_bias_heads.has_value() ? *dt_bias_heads : zeros({n_heads}, float32);
     const array norm_weight_heads_value = norm_weight_heads.has_value() ? *norm_weight_heads : ones({n_heads, d_head}, float32);
 
@@ -2069,7 +2114,6 @@ static inline array gated_delta_mixer_forward_core(
         ssm_outputs.reserve(static_cast<size_t>(seq_len));
         norm_outputs.reserve(static_cast<size_t>(seq_len));
     }
-
     for (int token_idx = 0; token_idx < seq_len; ++token_idx) {
         array query = contiguous(reshape(slice(query_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head}));
         array key = contiguous(reshape(slice(key_all, {token_idx, 0, 0}, {token_idx + 1, n_heads, d_head}), {n_heads, d_head}));
@@ -2078,7 +2122,28 @@ static inline array gated_delta_mixer_forward_core(
         const array beta_raw = contiguous(reshape(slice(beta_raw_all, {0, token_idx, 0}, {1, token_idx + 1, n_heads}), {n_heads}));
         const array a_raw = contiguous(reshape(slice(a_raw_all, {0, token_idx, 0}, {1, token_idx + 1, n_heads}), {n_heads}));
         array out(0.0f, float32);
-        if (capture_out != nullptr) {
+        if (use_reference_recurrence) {
+            const auto ref_step = gated_delta_recurrence_step_reference(
+                state,
+                query,
+                key,
+                value,
+                z,
+                beta_raw,
+                a_raw,
+                a_log_exp_row,
+                dt_bias_heads_value,
+                norm_weight_heads_value,
+                n_heads,
+                d_head
+            );
+            state = ref_step.next_state;
+            out = ref_step.norm;
+            if (capture_out != nullptr) {
+                ssm_outputs.emplace_back(reshape(ref_step.ssm, {1, 1, d_inner}));
+                norm_outputs.emplace_back(reshape(ref_step.norm, {1, 1, d_inner}));
+            }
+        } else if (capture_out != nullptr) {
             const array ssm_probe = gated_delta_recurrence_ssm_probe(
                 state,
                 query,
@@ -2128,11 +2193,9 @@ static inline array gated_delta_mixer_forward_core(
             out = normed_out;
         }
 
-        // Cast back to model dtype for out_proj matmul to use bf16 tensor cores.
-        array out_proj_in = reshape(out, {1, 1, d_inner});
-        if (out_proj_in.dtype() != model_dtype) {
-            out_proj_in = astype(out_proj_in, model_dtype);
-        }
+        // Keep recurrence output in fp32 for out_proj to avoid precision loss
+        // accumulation across long decode runs.
+        const array out_proj_in = reshape(out, {1, 1, d_inner});
         outputs.emplace_back(state_space_call(out_proj_fn, out_proj_in));
     }
 
@@ -2150,6 +2213,8 @@ static inline array gated_delta_mixer_forward_core(
         capture_out->norm = (norm_outputs.size() == 1)
             ? norm_outputs.front()
             : concatenate(norm_outputs, 1);
+        capture_out->state_conv = conv_state;
+        capture_out->state_ssm = ssm_state;
     }
     if (outputs.size() == 1) {
         return outputs.front();
@@ -2205,6 +2270,7 @@ void* mlx_lazy_state_space_block_bf16(
     const int n_groups_i = static_cast<int>(n_groups);
     const int heads_per_group = n_heads_i / n_groups_i;
     const int d_inner = n_heads_i * d_head_i;
+    const bool use_reference_recurrence = gated_delta_reference_enabled();
     const int xbc_len = d_inner + 2 * n_groups_i * d_state_i;
     const auto static_terms = resolve_state_space_static_terms(
         a_log,
@@ -2230,9 +2296,16 @@ void* mlx_lazy_state_space_block_bf16(
         : std::nullopt;
 
     auto* cache = static_cast<MLXStateSpaceCache*>(state_space_cache_ptr);
+    std::unique_lock<std::mutex> cache_lock;
+    if (cache != nullptr) {
+        cache_lock = std::unique_lock<std::mutex>(cache->mu);
+    }
     StateSpaceLayer* layer_state = nullptr;
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
+    }
+    if (cache != nullptr && layer_state == nullptr) {
+        throw std::invalid_argument("[state_space] cache layer index out of range");
     }
 
     array conv_state(0.0f, float32);
@@ -2415,6 +2488,7 @@ void* mlx_lazy_state_space_block_bf16(
     );
 
     if (layer_state != nullptr) {
+        eval({conv_state, ssm_state});
         *layer_state->conv_state = conv_state;
         *layer_state->ssm_state = ssm_state;
     }
@@ -2454,13 +2528,21 @@ void* mlx_lazy_gated_delta_mixer_bf16(
     const int d_head_i = static_cast<int>(d_head);
     const int hidden_dim = input_arr.shape(2);
     const int d_inner = n_heads_i * d_head_i;
+    const bool use_reference_recurrence = gated_delta_reference_enabled();
     // Derive qkv width from conv weight shape (matches CPU behavior).
     const int qkv_len = infer_state_space_conv_dim_from_weight(conv_w, d_conv_i, "gated_delta");
 
     auto* cache = static_cast<MLXStateSpaceCache*>(gated_delta_cache_ptr);
+    std::unique_lock<std::mutex> cache_lock;
+    if (cache != nullptr) {
+        cache_lock = std::unique_lock<std::mutex>(cache->mu);
+    }
     StateSpaceLayer* layer_state = nullptr;
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
+    }
+    if (cache != nullptr && layer_state == nullptr) {
+        throw std::invalid_argument("[gated_delta] cache layer index out of range");
     }
     const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
@@ -2524,8 +2606,12 @@ void* mlx_lazy_gated_delta_mixer_bf16(
             layer_state->hidden_dim != hidden_dim ||
             layer_state->d_inner != d_inner;
         if (need_proj_rhs_refresh) {
-            in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
-            out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
+            in_proj_rhs = use_reference_recurrence
+                ? orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true)
+                : ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+            out_proj_rhs = use_reference_recurrence
+                ? orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true)
+                : ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
             delete layer_state->in_proj_rhs;
             delete layer_state->out_proj_rhs;
             layer_state->in_proj_rhs = new array(in_proj_rhs);
@@ -2539,8 +2625,12 @@ void* mlx_lazy_gated_delta_mixer_bf16(
             out_proj_rhs = *layer_state->out_proj_rhs;
         }
     } else {
-        in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
-        out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
+        in_proj_rhs = use_reference_recurrence
+            ? orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true)
+            : ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+        out_proj_rhs = use_reference_recurrence
+            ? orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true)
+            : ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
     }
     StateSpaceCallable in_proj_fn{
         .fn = state_space_apply_matmul_rhs,
@@ -2569,6 +2659,7 @@ void* mlx_lazy_gated_delta_mixer_bf16(
     );
 
     if (layer_state != nullptr) {
+        eval({conv_state, ssm_state});
         *layer_state->conv_state = conv_state;
         *layer_state->ssm_state = ssm_state;
     }
@@ -2617,15 +2708,23 @@ void* mlx_lazy_gated_delta_mixer_quantized(
     const int n_key_heads_i = static_cast<int>(n_key_heads > 0 ? n_key_heads : n_heads);
     const int d_head_i = static_cast<int>(d_head);
     const int d_inner = n_heads_i * d_head_i;
+    const bool use_reference_recurrence = gated_delta_reference_enabled();
     // Derive qkv width from conv weight shape (matches CPU behavior).
     const int qkv_len = infer_state_space_conv_dim_from_weight(conv_w, d_conv_i, "gated_delta");
     const int group_size_i = static_cast<int>(group_size);
     const int bits_i = static_cast<int>(bits);
 
     auto* cache = static_cast<MLXStateSpaceCache*>(gated_delta_cache_ptr);
+    std::unique_lock<std::mutex> cache_lock;
+    if (cache != nullptr) {
+        cache_lock = std::unique_lock<std::mutex>(cache->mu);
+    }
     StateSpaceLayer* layer_state = nullptr;
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
+    }
+    if (cache != nullptr && layer_state == nullptr) {
+        throw std::invalid_argument("[gated_delta] cache layer index out of range");
     }
     const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
@@ -2723,6 +2822,7 @@ void* mlx_lazy_gated_delta_mixer_quantized(
     );
 
     if (layer_state != nullptr) {
+        eval({conv_state, ssm_state});
         *layer_state->conv_state = conv_state;
         *layer_state->ssm_state = ssm_state;
     }
@@ -2747,13 +2847,17 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
     void** out_in_proj,
     void** out_conv,
     void** out_ssm,
-    void** out_norm
+    void** out_norm,
+    void** out_state_conv,
+    void** out_state_ssm
 ) {
     mlx_count_op();
     if (out_in_proj != nullptr) *out_in_proj = nullptr;
     if (out_conv != nullptr) *out_conv = nullptr;
     if (out_ssm != nullptr) *out_ssm = nullptr;
     if (out_norm != nullptr) *out_norm = nullptr;
+    if (out_state_conv != nullptr) *out_state_conv = nullptr;
+    if (out_state_ssm != nullptr) *out_state_ssm = nullptr;
 
     const auto& input_arr = *static_cast<const array*>(input);
     const auto& in_proj_w = *static_cast<const array*>(in_proj);
@@ -2770,12 +2874,20 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
     const int d_head_i = static_cast<int>(d_head);
     const int hidden_dim = input_arr.shape(2);
     const int d_inner = n_heads_i * d_head_i;
+    const bool use_reference_recurrence = gated_delta_reference_enabled();
     const int qkv_len = infer_state_space_conv_dim_from_weight(conv_w, d_conv_i, "gated_delta");
 
     auto* cache = static_cast<MLXStateSpaceCache*>(gated_delta_cache_ptr);
+    std::unique_lock<std::mutex> cache_lock;
+    if (cache != nullptr) {
+        cache_lock = std::unique_lock<std::mutex>(cache->mu);
+    }
     StateSpaceLayer* layer_state = nullptr;
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
+    }
+    if (cache != nullptr && layer_state == nullptr) {
+        throw std::invalid_argument("[gated_delta] cache layer index out of range");
     }
     const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
@@ -2839,8 +2951,12 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
             layer_state->hidden_dim != hidden_dim ||
             layer_state->d_inner != d_inner;
         if (need_proj_rhs_refresh) {
-            in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
-            out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
+            in_proj_rhs = use_reference_recurrence
+                ? orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true)
+                : ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+            out_proj_rhs = use_reference_recurrence
+                ? orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true)
+                : ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
             delete layer_state->in_proj_rhs;
             delete layer_state->out_proj_rhs;
             layer_state->in_proj_rhs = new array(in_proj_rhs);
@@ -2854,16 +2970,20 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
             out_proj_rhs = *layer_state->out_proj_rhs;
         }
     } else {
-        in_proj_rhs = ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
-        out_proj_rhs = ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
+        in_proj_rhs = use_reference_recurrence
+            ? orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true)
+            : ensure_float32(orient_matmul_rhs_cached(in_proj, in_proj_w, hidden_dim, std::nullopt, true));
+        out_proj_rhs = use_reference_recurrence
+            ? orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true)
+            : ensure_float32(orient_matmul_rhs_cached(out_proj, out_proj_w, d_inner, hidden_dim, true));
     }
     StateSpaceCallable in_proj_fn{
-        .fn = state_space_apply_matmul_rhs,
-        .ctx = &in_proj_rhs,
+        .fn = use_reference_recurrence ? state_space_apply_linear_reference : state_space_apply_matmul_rhs,
+        .ctx = use_reference_recurrence ? static_cast<const void*>(&in_proj_w) : static_cast<const void*>(&in_proj_rhs),
     };
     StateSpaceCallable out_proj_fn{
-        .fn = state_space_apply_matmul_rhs,
-        .ctx = &out_proj_rhs,
+        .fn = use_reference_recurrence ? state_space_apply_linear_reference : state_space_apply_matmul_rhs,
+        .ctx = use_reference_recurrence ? static_cast<const void*>(&out_proj_w) : static_cast<const void*>(&out_proj_rhs),
     };
     GatedDeltaCaptureOutputs capture_outputs{};
     const array out = gated_delta_mixer_forward_core(
@@ -2894,6 +3014,8 @@ void* mlx_lazy_gated_delta_mixer_bf16_capture(
     if (out_conv != nullptr) *out_conv = capture_outputs.conv.has_value() ? pool_array(*capture_outputs.conv) : nullptr;
     if (out_ssm != nullptr) *out_ssm = capture_outputs.ssm.has_value() ? pool_array(*capture_outputs.ssm) : nullptr;
     if (out_norm != nullptr) *out_norm = capture_outputs.norm.has_value() ? pool_array(*capture_outputs.norm) : nullptr;
+    if (out_state_conv != nullptr) *out_state_conv = capture_outputs.state_conv.has_value() ? pool_array(*capture_outputs.state_conv) : nullptr;
+    if (out_state_ssm != nullptr) *out_state_ssm = capture_outputs.state_ssm.has_value() ? pool_array(*capture_outputs.state_ssm) : nullptr;
     return pool_array(out);
 }
 
@@ -2921,13 +3043,17 @@ void* mlx_lazy_gated_delta_mixer_quantized_capture(
     void** out_in_proj,
     void** out_conv,
     void** out_ssm,
-    void** out_norm
+    void** out_norm,
+    void** out_state_conv,
+    void** out_state_ssm
 ) {
     mlx_count_op();
     if (out_in_proj != nullptr) *out_in_proj = nullptr;
     if (out_conv != nullptr) *out_conv = nullptr;
     if (out_ssm != nullptr) *out_ssm = nullptr;
     if (out_norm != nullptr) *out_norm = nullptr;
+    if (out_state_conv != nullptr) *out_state_conv = nullptr;
+    if (out_state_ssm != nullptr) *out_state_ssm = nullptr;
 
     const auto& input_arr = *static_cast<const array*>(input);
     const auto& in_proj_w = *static_cast<const array*>(in_w);
@@ -2952,9 +3078,16 @@ void* mlx_lazy_gated_delta_mixer_quantized_capture(
     const int bits_i = static_cast<int>(bits);
 
     auto* cache = static_cast<MLXStateSpaceCache*>(gated_delta_cache_ptr);
+    std::unique_lock<std::mutex> cache_lock;
+    if (cache != nullptr) {
+        cache_lock = std::unique_lock<std::mutex>(cache->mu);
+    }
     StateSpaceLayer* layer_state = nullptr;
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
+    }
+    if (cache != nullptr && layer_state == nullptr) {
+        throw std::invalid_argument("[gated_delta] cache layer index out of range");
     }
     const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, qkv_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
@@ -3062,6 +3195,8 @@ void* mlx_lazy_gated_delta_mixer_quantized_capture(
     if (out_conv != nullptr) *out_conv = capture_outputs.conv.has_value() ? pool_array(*capture_outputs.conv) : nullptr;
     if (out_ssm != nullptr) *out_ssm = capture_outputs.ssm.has_value() ? pool_array(*capture_outputs.ssm) : nullptr;
     if (out_norm != nullptr) *out_norm = capture_outputs.norm.has_value() ? pool_array(*capture_outputs.norm) : nullptr;
+    if (out_state_conv != nullptr) *out_state_conv = capture_outputs.state_conv.has_value() ? pool_array(*capture_outputs.state_conv) : nullptr;
+    if (out_state_ssm != nullptr) *out_state_ssm = capture_outputs.state_ssm.has_value() ? pool_array(*capture_outputs.state_ssm) : nullptr;
     return pool_array(out);
 }
 
@@ -3158,9 +3293,16 @@ void* mlx_lazy_state_space_block_quantized(
         : std::nullopt;
 
     auto* cache = static_cast<MLXStateSpaceCache*>(state_space_cache_ptr);
+    std::unique_lock<std::mutex> cache_lock;
+    if (cache != nullptr) {
+        cache_lock = std::unique_lock<std::mutex>(cache->mu);
+    }
     StateSpaceLayer* layer_state = nullptr;
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
+    }
+    if (cache != nullptr && layer_state == nullptr) {
+        throw std::invalid_argument("[state_space] cache layer index out of range");
     }
 
     array conv_state(0.0f, float32);
@@ -3285,6 +3427,7 @@ void* mlx_lazy_state_space_block_quantized(
     );
 
     if (layer_state != nullptr) {
+        eval({conv_state, ssm_state});
         *layer_state->conv_state = conv_state;
         *layer_state->ssm_state = ssm_state;
     }

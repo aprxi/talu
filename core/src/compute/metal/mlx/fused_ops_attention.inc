@@ -6,11 +6,97 @@
 //
 // This reduces ~15 FFI round-trips to 1.
 
+
 struct ProjectedQkv {
     array q;
     array k;
     array v;
 };
+
+static inline bool attention_stage_trace_enabled() {
+    const char* raw = std::getenv("TALU_DBG_ATTN_STAGES");
+    if (raw == nullptr) return false;
+    if (raw[0] == '\0') return false;
+    if ((raw[0] == '0' || raw[0] == 'n' || raw[0] == 'N' || raw[0] == 'f' || raw[0] == 'F') && raw[1] == '\0') {
+        return false;
+    }
+    return true;
+}
+
+static inline int attention_stage_trace_layer() {
+    const char* raw = std::getenv("TALU_DBG_ATTN_LAYER");
+    if (raw == nullptr || raw[0] == '\0') return -1;
+    return std::atoi(raw);
+}
+
+static inline bool should_trace_attention_stage(size_t layer_idx, size_t pos_offset, bool is_prefill, int seq_len) {
+    if (!attention_stage_trace_enabled()) return false;
+    (void)is_prefill;
+    (void)seq_len;
+    if (pos_offset == 0) return false;
+    const int wanted = attention_stage_trace_layer();
+    if (wanted >= 0 && static_cast<int>(layer_idx) != wanted) return false;
+    return true;
+}
+
+static inline uint64_t attention_stage_checksum_sampled(const array& values, float* min_out, float* max_out) {
+    array fp32 = (values.dtype() == float32) ? values : astype(values, float32);
+    int count = 1;
+    for (int axis = 0; axis < fp32.ndim(); ++axis) {
+        count *= fp32.shape(axis);
+    }
+    if (count <= 0) {
+        *min_out = 0.0f;
+        *max_out = 0.0f;
+        return 0xcbf29ce484222325ULL;
+    }
+    fp32 = reshape(fp32, {count});
+    eval(fp32);
+    const float* data = fp32.data<float>();
+    const int sample = std::min(count, 256);
+    uint64_t h = 0xcbf29ce484222325ULL;
+    float mn = std::numeric_limits<float>::infinity();
+    float mx = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < sample; ++i) {
+        const int idx = (sample <= 1) ? 0 : static_cast<int>((static_cast<long long>(i) * static_cast<long long>(count - 1)) / static_cast<long long>(sample - 1));
+        const float v = data[idx];
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(uint32_t));
+        h ^= (static_cast<uint64_t>(idx) << 32) ^ static_cast<uint64_t>(bits);
+        h *= 0x100000001b3ULL;
+    }
+    *min_out = mn;
+    *max_out = mx;
+    return h;
+}
+
+static inline void trace_attention_stage(
+    const char* stage,
+    const array& values,
+    size_t layer_idx,
+    size_t pos_offset,
+    bool is_prefill,
+    int seq_len
+) {
+    if (!should_trace_attention_stage(layer_idx, pos_offset, is_prefill, seq_len)) return;
+    float mn = 0.0f;
+    float mx = 0.0f;
+    const uint64_t checksum = attention_stage_checksum_sampled(values, &mn, &mx);
+    std::fprintf(
+        stderr,
+        "PARITY_ATTN stage=%s layer=%zu pos=%zu prefill=%d seq=%d checksum=0x%016llx min=%.6f max=%.6f\n",
+        stage,
+        layer_idx,
+        pos_offset,
+        is_prefill ? 1 : 0,
+        seq_len,
+        static_cast<unsigned long long>(checksum),
+        static_cast<double>(mn),
+        static_cast<double>(mx)
+    );
+}
 
 static constexpr size_t kAttentionFusedQkvCacheMaxEntries = 2048;
 static constexpr size_t kAttentionFusedQkvHotSlots = 128;
@@ -303,6 +389,427 @@ static float resolve_attention_scale(
     return 1.0f / std::sqrt(static_cast<float>(head_dim));
 }
 
+static inline bool use_attention_reference_mode() {
+    const char* raw = std::getenv("TALU_METAL_ATTN_REFERENCE");
+    if (raw == nullptr || raw[0] == '\0') return false;
+    if (std::strcmp(raw, "0") == 0) return false;
+    if (std::strcmp(raw, "false") == 0 || std::strcmp(raw, "FALSE") == 0) return false;
+    if (std::strcmp(raw, "off") == 0 || std::strcmp(raw, "OFF") == 0) return false;
+    if (std::strcmp(raw, "no") == 0 || std::strcmp(raw, "NO") == 0) return false;
+    return true;
+}
+
+static inline array attention_owned_f32_array(const std::vector<float>& values, const Shape& shape) {
+    static constexpr size_t kAlignment = 16 * 1024;
+    const size_t element_count = std::max<size_t>(values.size(), 1);
+    const size_t byte_count = element_count * sizeof(float);
+    void* aligned_ptr = nullptr;
+    if (posix_memalign(&aligned_ptr, kAlignment, byte_count) != 0 || aligned_ptr == nullptr) {
+        throw std::bad_alloc();
+    }
+    auto* copied = static_cast<float*>(aligned_ptr);
+    if (!values.empty()) {
+        std::memcpy(copied, values.data(), values.size() * sizeof(float));
+    } else {
+        copied[0] = 0.0f;
+    }
+    auto owner = std::shared_ptr<void>(aligned_ptr, [](void* ptr) {
+        std::free(ptr);
+    });
+    auto deleter = [owner](void*) {
+        // Ownership retained by closure capture.
+    };
+    return array(copied, shape, float32, deleter);
+}
+
+static inline array cpu_like_rmsnorm_rows(
+    const array& values,
+    const array& weight,
+    float eps
+) {
+    if (values.ndim() != 4) {
+        return fast::rms_norm(values, weight, eps);
+    }
+    const int bsz = values.shape(0);
+    const int heads = values.shape(1);
+    const int seq_len = values.shape(2);
+    const int dim = values.shape(3);
+    array values_f32 = (values.dtype() == float32) ? values : astype(values, float32);
+    array weight_f32 = (weight.dtype() == float32) ? weight : astype(weight, float32);
+    array flat_values = reshape(values_f32, {bsz * heads * seq_len * dim});
+    array flat_weight = reshape(weight_f32, {dim});
+    eval(flat_values, flat_weight);
+    const float* values_ptr = flat_values.data<float>();
+    const float* weight_ptr = flat_weight.data<float>();
+    std::vector<float> out(static_cast<size_t>(bsz) * static_cast<size_t>(heads) * static_cast<size_t>(seq_len) * static_cast<size_t>(dim));
+    const size_t row_count = static_cast<size_t>(bsz) * static_cast<size_t>(heads) * static_cast<size_t>(seq_len);
+    const float dim_f = static_cast<float>(dim);
+    for (size_t row = 0; row < row_count; ++row) {
+        const size_t row_base = row * static_cast<size_t>(dim);
+        float sum_sq = 0.0f;
+        for (int d = 0; d < dim; ++d) {
+            const float x = values_ptr[row_base + static_cast<size_t>(d)];
+            sum_sq += x * x;
+        }
+        const float inv_rms = 1.0f / std::sqrt((sum_sq / dim_f) + eps);
+        for (int d = 0; d < dim; ++d) {
+            out[row_base + static_cast<size_t>(d)] =
+                values_ptr[row_base + static_cast<size_t>(d)] * inv_rms * weight_ptr[static_cast<size_t>(d)];
+        }
+    }
+    return attention_owned_f32_array(out, Shape{bsz, heads, seq_len, dim});
+}
+
+static inline void cpu_like_apply_static_rope(
+    array* q,
+    array* k,
+    int seq_len,
+    int head_dim,
+    int rope_dim,
+    size_t pos_offset,
+    float rope_theta
+) {
+    if (q == nullptr || k == nullptr) {
+        throw std::invalid_argument("[attention] null qk tensor for cpu_like rope");
+    }
+    if (q->ndim() != 4 || k->ndim() != 4) {
+        throw std::invalid_argument("[attention] cpu_like rope expects rank-4 q/k");
+    }
+    if (rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0) {
+        throw std::invalid_argument("[attention] cpu_like rope invalid rope_dim");
+    }
+    const int bsz = q->shape(0);
+    const int q_heads = q->shape(1);
+    const int q_seq = q->shape(2);
+    const int q_dim = q->shape(3);
+    const int k_heads = k->shape(1);
+    const int k_seq = k->shape(2);
+    const int k_dim = k->shape(3);
+    if (q_seq != seq_len || k_seq != seq_len || q_dim != head_dim || k_dim != head_dim) {
+        throw std::invalid_argument("[attention] cpu_like rope q/k shape mismatch");
+    }
+    array q_f32 = (q->dtype() == float32) ? *q : astype(*q, float32);
+    array k_f32 = (k->dtype() == float32) ? *k : astype(*k, float32);
+    array q_flat = reshape(q_f32, {bsz * q_heads * seq_len * head_dim});
+    array k_flat = reshape(k_f32, {bsz * k_heads * seq_len * head_dim});
+    eval(q_flat, k_flat);
+    const float* q_ptr = q_flat.data<float>();
+    const float* k_ptr = k_flat.data<float>();
+    std::vector<float> q_out(static_cast<size_t>(bsz) * static_cast<size_t>(q_heads) * static_cast<size_t>(seq_len) * static_cast<size_t>(head_dim));
+    std::vector<float> k_out(static_cast<size_t>(bsz) * static_cast<size_t>(k_heads) * static_cast<size_t>(seq_len) * static_cast<size_t>(head_dim));
+    std::memcpy(q_out.data(), q_ptr, q_out.size() * sizeof(float));
+    std::memcpy(k_out.data(), k_ptr, k_out.size() * sizeof(float));
+
+    const int half_dim = rope_dim / 2;
+    std::vector<float> inv_freq(static_cast<size_t>(half_dim));
+    for (int i = 0; i < half_dim; ++i) {
+        const float exponent = static_cast<float>(2 * i) / static_cast<float>(rope_dim);
+        inv_freq[static_cast<size_t>(i)] = 1.0f / std::pow(rope_theta, exponent);
+    }
+
+    for (int s = 0; s < seq_len; ++s) {
+        const size_t pos = pos_offset + static_cast<size_t>(s);
+        for (int i = 0; i < half_dim; ++i) {
+            const float angle = static_cast<float>(pos) * inv_freq[static_cast<size_t>(i)];
+            const float c = std::cos(angle);
+            const float sn = std::sin(angle);
+            for (int b = 0; b < bsz; ++b) {
+                for (int h = 0; h < q_heads; ++h) {
+                    const size_t base = (((static_cast<size_t>(b) * static_cast<size_t>(q_heads) + static_cast<size_t>(h)) * static_cast<size_t>(seq_len) + static_cast<size_t>(s)) * static_cast<size_t>(head_dim));
+                    const size_t a = base + static_cast<size_t>(i);
+                    const size_t bidx = base + static_cast<size_t>(half_dim + i);
+                    const float x0 = q_out[a];
+                    const float x1 = q_out[bidx];
+                    q_out[a] = x0 * c - x1 * sn;
+                    q_out[bidx] = x1 * c + x0 * sn;
+                }
+                for (int h = 0; h < k_heads; ++h) {
+                    const size_t base = (((static_cast<size_t>(b) * static_cast<size_t>(k_heads) + static_cast<size_t>(h)) * static_cast<size_t>(seq_len) + static_cast<size_t>(s)) * static_cast<size_t>(head_dim));
+                    const size_t a = base + static_cast<size_t>(i);
+                    const size_t bidx = base + static_cast<size_t>(half_dim + i);
+                    const float x0 = k_out[a];
+                    const float x1 = k_out[bidx];
+                    k_out[a] = x0 * c - x1 * sn;
+                    k_out[bidx] = x1 * c + x0 * sn;
+                }
+            }
+        }
+    }
+
+    *q = attention_owned_f32_array(q_out, Shape{bsz, q_heads, seq_len, head_dim});
+    *k = attention_owned_f32_array(k_out, Shape{bsz, k_heads, seq_len, head_dim});
+}
+
+static inline void cpu_like_apply_static_rope_interleaved(
+    array* q,
+    array* k,
+    int seq_len,
+    int head_dim,
+    int rope_dim,
+    size_t pos_offset,
+    float rope_theta
+) {
+    if (q == nullptr || k == nullptr) {
+        throw std::invalid_argument("[attention] null qk tensor for cpu_like interleaved rope");
+    }
+    if (q->ndim() != 4 || k->ndim() != 4) {
+        throw std::invalid_argument("[attention] cpu_like interleaved rope expects rank-4 q/k");
+    }
+    if (rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0) {
+        throw std::invalid_argument("[attention] cpu_like interleaved rope invalid rope_dim");
+    }
+    const int bsz = q->shape(0);
+    const int q_heads = q->shape(1);
+    const int q_seq = q->shape(2);
+    const int q_dim = q->shape(3);
+    const int k_heads = k->shape(1);
+    const int k_seq = k->shape(2);
+    const int k_dim = k->shape(3);
+    if (q_seq != seq_len || k_seq != seq_len || q_dim != head_dim || k_dim != head_dim) {
+        throw std::invalid_argument("[attention] cpu_like interleaved rope q/k shape mismatch");
+    }
+    array q_f32 = (q->dtype() == float32) ? *q : astype(*q, float32);
+    array k_f32 = (k->dtype() == float32) ? *k : astype(*k, float32);
+    array q_flat = reshape(q_f32, {bsz * q_heads * seq_len * head_dim});
+    array k_flat = reshape(k_f32, {bsz * k_heads * seq_len * head_dim});
+    eval(q_flat, k_flat);
+    const float* q_ptr = q_flat.data<float>();
+    const float* k_ptr = k_flat.data<float>();
+    std::vector<float> q_out(static_cast<size_t>(bsz) * static_cast<size_t>(q_heads) * static_cast<size_t>(seq_len) * static_cast<size_t>(head_dim));
+    std::vector<float> k_out(static_cast<size_t>(bsz) * static_cast<size_t>(k_heads) * static_cast<size_t>(seq_len) * static_cast<size_t>(head_dim));
+    std::memcpy(q_out.data(), q_ptr, q_out.size() * sizeof(float));
+    std::memcpy(k_out.data(), k_ptr, k_out.size() * sizeof(float));
+
+    const int half_dim = rope_dim / 2;
+    std::vector<float> inv_freq(static_cast<size_t>(half_dim));
+    for (int i = 0; i < half_dim; ++i) {
+        const float exponent = static_cast<float>(2 * i) / static_cast<float>(rope_dim);
+        inv_freq[static_cast<size_t>(i)] = 1.0f / std::pow(rope_theta, exponent);
+    }
+
+    for (int s = 0; s < seq_len; ++s) {
+        const size_t pos = pos_offset + static_cast<size_t>(s);
+        for (int i = 0; i < half_dim; ++i) {
+            const float angle = static_cast<float>(pos) * inv_freq[static_cast<size_t>(i)];
+            const float c = std::cos(angle);
+            const float sn = std::sin(angle);
+            const size_t d0 = static_cast<size_t>(i) * 2;
+            const size_t d1 = d0 + 1;
+            for (int b = 0; b < bsz; ++b) {
+                for (int h = 0; h < q_heads; ++h) {
+                    const size_t base = (((static_cast<size_t>(b) * static_cast<size_t>(q_heads) + static_cast<size_t>(h)) * static_cast<size_t>(seq_len) + static_cast<size_t>(s)) * static_cast<size_t>(head_dim));
+                    const size_t i0 = base + d0;
+                    const size_t i1 = base + d1;
+                    const float x0 = q_out[i0];
+                    const float x1 = q_out[i1];
+                    q_out[i0] = x0 * c - x1 * sn;
+                    q_out[i1] = x1 * c + x0 * sn;
+                }
+                for (int h = 0; h < k_heads; ++h) {
+                    const size_t base = (((static_cast<size_t>(b) * static_cast<size_t>(k_heads) + static_cast<size_t>(h)) * static_cast<size_t>(seq_len) + static_cast<size_t>(s)) * static_cast<size_t>(head_dim));
+                    const size_t i0 = base + d0;
+                    const size_t i1 = base + d1;
+                    const float x0 = k_out[i0];
+                    const float x1 = k_out[i1];
+                    k_out[i0] = x0 * c - x1 * sn;
+                    k_out[i1] = x1 * c + x0 * sn;
+                }
+            }
+        }
+    }
+
+    *q = attention_owned_f32_array(q_out, Shape{bsz, q_heads, seq_len, head_dim});
+    *k = attention_owned_f32_array(k_out, Shape{bsz, k_heads, seq_len, head_dim});
+}
+
+static inline void cpu_like_apply_runtime_rope(
+    array* q,
+    array* k,
+    const array& cos_rows,
+    const array& sin_rows,
+    int seq_len,
+    int head_dim,
+    int rope_dim
+) {
+    if (q == nullptr || k == nullptr) {
+        throw std::invalid_argument("[attention] null qk tensor for cpu_like runtime rope");
+    }
+    if (q->ndim() != 4 || k->ndim() != 4) {
+        throw std::invalid_argument("[attention] cpu_like runtime rope expects rank-4 q/k");
+    }
+    if (cos_rows.ndim() != 2 || sin_rows.ndim() != 2) {
+        throw std::invalid_argument("[attention] cpu_like runtime rope expects rank-2 cos/sin tables");
+    }
+    if (rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0) {
+        throw std::invalid_argument("[attention] cpu_like runtime rope invalid rope_dim");
+    }
+    if (cos_rows.shape(0) != seq_len || sin_rows.shape(0) != seq_len ||
+        cos_rows.shape(1) < rope_dim || sin_rows.shape(1) < rope_dim) {
+        throw std::invalid_argument("[attention] cpu_like runtime rope table shape mismatch");
+    }
+    const int bsz = q->shape(0);
+    const int q_heads = q->shape(1);
+    const int q_seq = q->shape(2);
+    const int q_dim = q->shape(3);
+    const int k_heads = k->shape(1);
+    const int k_seq = k->shape(2);
+    const int k_dim = k->shape(3);
+    if (q_seq != seq_len || k_seq != seq_len || q_dim != head_dim || k_dim != head_dim) {
+        throw std::invalid_argument("[attention] cpu_like runtime rope q/k shape mismatch");
+    }
+
+    array q_f32 = (q->dtype() == float32) ? *q : astype(*q, float32);
+    array k_f32 = (k->dtype() == float32) ? *k : astype(*k, float32);
+    array cos_f32 = (cos_rows.dtype() == float32) ? cos_rows : astype(cos_rows, float32);
+    array sin_f32 = (sin_rows.dtype() == float32) ? sin_rows : astype(sin_rows, float32);
+
+    array q_flat = reshape(q_f32, {bsz * q_heads * seq_len * head_dim});
+    array k_flat = reshape(k_f32, {bsz * k_heads * seq_len * head_dim});
+    array cos_flat = reshape(cos_f32, {seq_len * rope_dim});
+    array sin_flat = reshape(sin_f32, {seq_len * rope_dim});
+    eval(q_flat, k_flat, cos_flat, sin_flat);
+
+    const float* q_ptr = q_flat.data<float>();
+    const float* k_ptr = k_flat.data<float>();
+    const float* cos_ptr = cos_flat.data<float>();
+    const float* sin_ptr = sin_flat.data<float>();
+
+    std::vector<float> q_out(static_cast<size_t>(bsz) * static_cast<size_t>(q_heads) * static_cast<size_t>(seq_len) * static_cast<size_t>(head_dim));
+    std::vector<float> k_out(static_cast<size_t>(bsz) * static_cast<size_t>(k_heads) * static_cast<size_t>(seq_len) * static_cast<size_t>(head_dim));
+    std::memcpy(q_out.data(), q_ptr, q_out.size() * sizeof(float));
+    std::memcpy(k_out.data(), k_ptr, k_out.size() * sizeof(float));
+
+    const int half = rope_dim / 2;
+    for (int s = 0; s < seq_len; ++s) {
+        const size_t table_base = static_cast<size_t>(s) * static_cast<size_t>(rope_dim);
+        for (int idx = 0; idx < half; ++idx) {
+            const float c0 = cos_ptr[table_base + static_cast<size_t>(idx)];
+            const float s0 = sin_ptr[table_base + static_cast<size_t>(idx)];
+            const float c1 = cos_ptr[table_base + static_cast<size_t>(half + idx)];
+            const float s1 = sin_ptr[table_base + static_cast<size_t>(half + idx)];
+            for (int b = 0; b < bsz; ++b) {
+                for (int h = 0; h < q_heads; ++h) {
+                    const size_t base = (((static_cast<size_t>(b) * static_cast<size_t>(q_heads) + static_cast<size_t>(h)) * static_cast<size_t>(seq_len) + static_cast<size_t>(s)) * static_cast<size_t>(head_dim));
+                    const size_t i0 = base + static_cast<size_t>(idx);
+                    const size_t i1 = base + static_cast<size_t>(half + idx);
+                    const float x0 = q_out[i0];
+                    const float x1 = q_out[i1];
+                    q_out[i0] = x0 * c0 - x1 * s0;
+                    q_out[i1] = x1 * c1 + x0 * s1;
+                }
+                for (int h = 0; h < k_heads; ++h) {
+                    const size_t base = (((static_cast<size_t>(b) * static_cast<size_t>(k_heads) + static_cast<size_t>(h)) * static_cast<size_t>(seq_len) + static_cast<size_t>(s)) * static_cast<size_t>(head_dim));
+                    const size_t i0 = base + static_cast<size_t>(idx);
+                    const size_t i1 = base + static_cast<size_t>(half + idx);
+                    const float x0 = k_out[i0];
+                    const float x1 = k_out[i1];
+                    k_out[i0] = x0 * c0 - x1 * s0;
+                    k_out[i1] = x1 * c1 + x0 * s1;
+                }
+            }
+        }
+    }
+
+    *q = attention_owned_f32_array(q_out, Shape{bsz, q_heads, seq_len, head_dim});
+    *k = attention_owned_f32_array(k_out, Shape{bsz, k_heads, seq_len, head_dim});
+}
+
+static inline void cpu_like_apply_runtime_rope_interleaved(
+    array* q,
+    array* k,
+    const array& cos_rows,
+    const array& sin_rows,
+    int seq_len,
+    int head_dim,
+    int rope_dim
+) {
+    if (q == nullptr || k == nullptr) {
+        throw std::invalid_argument("[attention] null qk tensor for cpu_like runtime rope");
+    }
+    if (q->ndim() != 4 || k->ndim() != 4) {
+        throw std::invalid_argument("[attention] cpu_like runtime rope expects rank-4 q/k");
+    }
+    if (cos_rows.ndim() != 2 || sin_rows.ndim() != 2) {
+        throw std::invalid_argument("[attention] cpu_like runtime rope expects rank-2 cos/sin tables");
+    }
+    if (rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0) {
+        throw std::invalid_argument("[attention] cpu_like runtime rope invalid rope_dim");
+    }
+    if (cos_rows.shape(0) != seq_len || sin_rows.shape(0) != seq_len ||
+        cos_rows.shape(1) < rope_dim || sin_rows.shape(1) < rope_dim) {
+        throw std::invalid_argument("[attention] cpu_like runtime rope table shape mismatch");
+    }
+    const int bsz = q->shape(0);
+    const int q_heads = q->shape(1);
+    const int q_seq = q->shape(2);
+    const int q_dim = q->shape(3);
+    const int k_heads = k->shape(1);
+    const int k_seq = k->shape(2);
+    const int k_dim = k->shape(3);
+    if (q_seq != seq_len || k_seq != seq_len || q_dim != head_dim || k_dim != head_dim) {
+        throw std::invalid_argument("[attention] cpu_like runtime rope q/k shape mismatch");
+    }
+
+    array q_f32 = (q->dtype() == float32) ? *q : astype(*q, float32);
+    array k_f32 = (k->dtype() == float32) ? *k : astype(*k, float32);
+    array cos_f32 = (cos_rows.dtype() == float32) ? cos_rows : astype(cos_rows, float32);
+    array sin_f32 = (sin_rows.dtype() == float32) ? sin_rows : astype(sin_rows, float32);
+
+    array q_flat = reshape(q_f32, {bsz * q_heads * seq_len * head_dim});
+    array k_flat = reshape(k_f32, {bsz * k_heads * seq_len * head_dim});
+    array cos_flat = reshape(cos_f32, {seq_len * rope_dim});
+    array sin_flat = reshape(sin_f32, {seq_len * rope_dim});
+    eval(q_flat, k_flat, cos_flat, sin_flat);
+
+    const float* q_ptr = q_flat.data<float>();
+    const float* k_ptr = k_flat.data<float>();
+    const float* cos_ptr = cos_flat.data<float>();
+    const float* sin_ptr = sin_flat.data<float>();
+
+    std::vector<float> q_out(static_cast<size_t>(bsz) * static_cast<size_t>(q_heads) * static_cast<size_t>(seq_len) * static_cast<size_t>(head_dim));
+    std::vector<float> k_out(static_cast<size_t>(bsz) * static_cast<size_t>(k_heads) * static_cast<size_t>(seq_len) * static_cast<size_t>(head_dim));
+    std::memcpy(q_out.data(), q_ptr, q_out.size() * sizeof(float));
+    std::memcpy(k_out.data(), k_ptr, k_out.size() * sizeof(float));
+
+    const int half = rope_dim / 2;
+    for (int s = 0; s < seq_len; ++s) {
+        const size_t table_base = static_cast<size_t>(s) * static_cast<size_t>(rope_dim);
+        for (int pair_idx = 0; pair_idx < half; ++pair_idx) {
+            const float c = cos_ptr[table_base + static_cast<size_t>(pair_idx)];
+            const float sn = sin_ptr[table_base + static_cast<size_t>(pair_idx)];
+            const size_t d0 = static_cast<size_t>(pair_idx) * 2;
+            const size_t d1 = d0 + 1;
+            for (int b = 0; b < bsz; ++b) {
+                for (int h = 0; h < q_heads; ++h) {
+                    const size_t base =
+                        (((static_cast<size_t>(b) * static_cast<size_t>(q_heads) + static_cast<size_t>(h)) * static_cast<size_t>(seq_len) + static_cast<size_t>(s)) *
+                         static_cast<size_t>(head_dim));
+                    const size_t i0 = base + d0;
+                    const size_t i1 = base + d1;
+                    const float x0 = q_out[i0];
+                    const float x1 = q_out[i1];
+                    q_out[i0] = x0 * c - x1 * sn;
+                    q_out[i1] = x1 * c + x0 * sn;
+                }
+                for (int h = 0; h < k_heads; ++h) {
+                    const size_t base =
+                        (((static_cast<size_t>(b) * static_cast<size_t>(k_heads) + static_cast<size_t>(h)) * static_cast<size_t>(seq_len) + static_cast<size_t>(s)) *
+                         static_cast<size_t>(head_dim));
+                    const size_t i0 = base + d0;
+                    const size_t i1 = base + d1;
+                    const float x0 = k_out[i0];
+                    const float x1 = k_out[i1];
+                    k_out[i0] = x0 * c - x1 * sn;
+                    k_out[i1] = x1 * c + x0 * sn;
+                }
+            }
+        }
+    }
+
+    *q = attention_owned_f32_array(q_out, Shape{bsz, q_heads, seq_len, head_dim});
+    *k = attention_owned_f32_array(k_out, Shape{bsz, k_heads, seq_len, head_dim});
+}
+
 static void maybe_add_linear_bias(array* values, const void* bias_ptr) {
     if (values == nullptr) {
         throw std::invalid_argument("[attention] null tensor for bias add");
@@ -483,13 +990,13 @@ static void maybe_apply_qk_norm(
         const auto& q_weight = *static_cast<const array*>(q_norm_w);
         const int q_width = q->shape(q->ndim() - 1);
         const array q_norm = canonicalize_rms_norm_weight(q_weight, q_width, "attention.q_norm");
-        *q = fast::rms_norm(*q, q_norm, rms_eps);
+        *q = use_attention_reference_mode() ? cpu_like_rmsnorm_rows(*q, q_norm, rms_eps) : fast::rms_norm(*q, q_norm, rms_eps);
     }
     if (k_norm_w != nullptr) {
         const auto& k_weight = *static_cast<const array*>(k_norm_w);
         const int k_width = k->shape(k->ndim() - 1);
         const array k_norm = canonicalize_rms_norm_weight(k_weight, k_width, "attention.k_norm");
-        *k = fast::rms_norm(*k, k_norm, rms_eps);
+        *k = use_attention_reference_mode() ? cpu_like_rmsnorm_rows(*k, k_norm, rms_eps) : fast::rms_norm(*k, k_norm, rms_eps);
     }
 }
 
@@ -498,14 +1005,20 @@ static void apply_attention_rope(
     array* k,
     int seq_len,
     int head_dim,
+    int rope_width,
     size_t pos_offset,
     float rope_theta,
+    bool rope_interleaved,
     const void* runtime_rope_cos,
     const void* runtime_rope_sin,
     size_t runtime_rope_dim
 ) {
     if (q == nullptr || k == nullptr) {
         throw std::invalid_argument("[attention] null qk tensor for rope");
+    }
+
+    if (rope_width <= 0 || rope_width > head_dim) {
+        rope_width = head_dim;
     }
 
     bool use_runtime_rope = runtime_rope_cos != nullptr && runtime_rope_sin != nullptr;
@@ -525,15 +1038,63 @@ static void apply_attention_rope(
         if (valid_tables) {
             auto cos_rows = slice(cos_table, {seq_start, 0}, {seq_stop, rope_dim});
             auto sin_rows = slice(sin_table, {seq_start, 0}, {seq_stop, rope_dim});
-            *q = apply_runtime_rope_to_tensor(*q, cos_rows, sin_rows, seq_len, head_dim, rope_dim);
-            *k = apply_runtime_rope_to_tensor(*k, cos_rows, sin_rows, seq_len, head_dim, rope_dim);
+            if (use_attention_reference_mode()) {
+                if (rope_interleaved) {
+                    cpu_like_apply_runtime_rope_interleaved(
+                        q,
+                        k,
+                        cos_rows,
+                        sin_rows,
+                        seq_len,
+                        head_dim,
+                        rope_dim
+                    );
+                } else {
+                    cpu_like_apply_runtime_rope(
+                        q,
+                        k,
+                        cos_rows,
+                        sin_rows,
+                        seq_len,
+                        head_dim,
+                        rope_dim
+                    );
+                }
+            } else {
+                if (rope_interleaved) {
+                    cpu_like_apply_runtime_rope_interleaved(
+                        q,
+                        k,
+                        cos_rows,
+                        sin_rows,
+                        seq_len,
+                        head_dim,
+                        rope_dim
+                    );
+                } else {
+                    *q = apply_runtime_rope_to_tensor(*q, cos_rows, sin_rows, seq_len, head_dim, rope_dim);
+                    *k = apply_runtime_rope_to_tensor(*k, cos_rows, sin_rows, seq_len, head_dim, rope_dim);
+                }
+            }
         } else {
             use_runtime_rope = false;
         }
     }
     if (!use_runtime_rope) {
-        *q = fast::rope(*q, head_dim, false, rope_theta, 1.0f, static_cast<int>(pos_offset));
-        *k = fast::rope(*k, head_dim, false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+        if (use_attention_reference_mode()) {
+            if (rope_interleaved) {
+                cpu_like_apply_static_rope_interleaved(q, k, seq_len, head_dim, rope_width, pos_offset, rope_theta);
+            } else {
+                cpu_like_apply_static_rope(q, k, seq_len, head_dim, rope_width, pos_offset, rope_theta);
+            }
+        } else {
+            if (rope_interleaved) {
+                cpu_like_apply_static_rope_interleaved(q, k, seq_len, head_dim, rope_width, pos_offset, rope_theta);
+            } else {
+                *q = fast::rope(*q, rope_width, false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+                *k = fast::rope(*k, rope_width, false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+            }
+        }
     }
 }
 
@@ -553,8 +1114,88 @@ static void resolve_attention_cache(
     *k_for_attn = *k;
     *v_for_attn = *v;
     *is_prefill = true;
+    const int seq_len = (k->ndim() >= 3) ? k->shape(2) : 0;
+
+    const char* cache_bypass = std::getenv("TALU_METAL_ATTN_BYPASS_CACHE");
+    if (cache_bypass != nullptr && cache_bypass[0] != '\0' &&
+        std::strcmp(cache_bypass, "0") != 0 &&
+        std::strcmp(cache_bypass, "false") != 0 &&
+        std::strcmp(cache_bypass, "FALSE") != 0 &&
+        std::strcmp(cache_bypass, "off") != 0 &&
+        std::strcmp(cache_bypass, "OFF") != 0 &&
+        std::strcmp(cache_bypass, "no") != 0 &&
+        std::strcmp(cache_bypass, "NO") != 0) {
+        return;
+    }
 
     if (cache_ptr == nullptr) {
+        return;
+    }
+
+    const bool use_reference_cache_io = []() -> bool {
+        const char* explicit_ref = std::getenv("TALU_METAL_ATTN_REFERENCE_CACHEIO");
+        if (explicit_ref != nullptr && explicit_ref[0] != '\0' &&
+            std::strcmp(explicit_ref, "0") != 0 &&
+            std::strcmp(explicit_ref, "false") != 0 &&
+            std::strcmp(explicit_ref, "FALSE") != 0 &&
+            std::strcmp(explicit_ref, "off") != 0 &&
+            std::strcmp(explicit_ref, "OFF") != 0 &&
+            std::strcmp(explicit_ref, "no") != 0 &&
+            std::strcmp(explicit_ref, "NO") != 0) {
+            return true;
+        }
+        const char* ref = std::getenv("TALU_METAL_ATTN_REFERENCE");
+        return ref != nullptr && ref[0] != '\0' &&
+            std::strcmp(ref, "0") != 0 &&
+            std::strcmp(ref, "false") != 0 &&
+            std::strcmp(ref, "FALSE") != 0 &&
+            std::strcmp(ref, "off") != 0 &&
+            std::strcmp(ref, "OFF") != 0 &&
+            std::strcmp(ref, "no") != 0 &&
+            std::strcmp(ref, "NO") != 0;
+    }();
+
+    if (use_reference_cache_io) {
+        // Keep prefill attention numerics aligned with CPU: prefill computes
+        // attention directly on the active K/V block (while still updating cache).
+        if (seq_len > 1) {
+            void* k_full_ptr_prefill = nullptr;
+            void* v_full_ptr_prefill = nullptr;
+            mlx_cache_get_bfloat16(cache_ptr, layer_idx, &k_full_ptr_prefill, &v_full_ptr_prefill);
+            if (k_full_ptr_prefill == nullptr || v_full_ptr_prefill == nullptr) {
+                mlx_cache_set_full_bfloat16(cache_ptr, layer_idx, k, v);
+            } else {
+                const auto& k_prev = *static_cast<const array*>(k_full_ptr_prefill);
+                const auto& v_prev = *static_cast<const array*>(v_full_ptr_prefill);
+                array k_next = concatenate(std::vector<array>{k_prev, *k}, 2);
+                array v_next = concatenate(std::vector<array>{v_prev, *v}, 2);
+                mlx_cache_set_full_bfloat16(cache_ptr, layer_idx, &k_next, &v_next);
+            }
+            *is_prefill = true;
+            *k_for_attn = *k;
+            *v_for_attn = *v;
+            return;
+        }
+        void* k_full_ptr = nullptr;
+        void* v_full_ptr = nullptr;
+        mlx_cache_get_bfloat16(cache_ptr, layer_idx, &k_full_ptr, &v_full_ptr);
+        if (k_full_ptr == nullptr || v_full_ptr == nullptr) {
+            mlx_cache_set_full_bfloat16(cache_ptr, layer_idx, k, v);
+            mlx_cache_get_bfloat16(cache_ptr, layer_idx, &k_full_ptr, &v_full_ptr);
+            *is_prefill = true;
+        } else {
+            const auto& k_prev = *static_cast<const array*>(k_full_ptr);
+            const auto& v_prev = *static_cast<const array*>(v_full_ptr);
+            array k_next = concatenate(std::vector<array>{k_prev, *k}, 2);
+            array v_next = concatenate(std::vector<array>{v_prev, *v}, 2);
+            mlx_cache_set_full_bfloat16(cache_ptr, layer_idx, &k_next, &v_next);
+            mlx_cache_get_bfloat16(cache_ptr, layer_idx, &k_full_ptr, &v_full_ptr);
+            *is_prefill = (k_prev.shape(2) == 0);
+        }
+        if (k_full_ptr != nullptr && v_full_ptr != nullptr) {
+            *k_for_attn = *static_cast<array*>(k_full_ptr);
+            *v_for_attn = *static_cast<array*>(v_full_ptr);
+        }
         return;
     }
 
@@ -610,10 +1251,16 @@ static array apply_query_output_gate(
         gate_values = astype(gate_values, float32);
     }
     auto gate = sigmoid(gate_values);
-    if (gate.dtype() != attention_out.dtype()) {
-        gate = astype(gate, attention_out.dtype());
+    // Keep gate application in f32 to match CPU math, then cast back.
+    auto attention_f32 = attention_out;
+    if (attention_f32.dtype() != float32) {
+        attention_f32 = astype(attention_f32, float32);
     }
-    return attention_out * gate;
+    auto gated = attention_f32 * gate;
+    if (gated.dtype() != attention_out.dtype()) {
+        gated = astype(gated, attention_out.dtype());
+    }
+    return gated;
 }
 
 static array reshape_attention_output(
@@ -643,15 +1290,19 @@ void* mlx_lazy_fused_attention(
     const void* attn_sinks,  // [n_heads]
     void* cache_ptr, size_t layer_idx,
     size_t n_heads, size_t n_kv_heads, size_t head_dim,
+    size_t rope_dim,
     size_t pos_offset, float rope_theta,
+    bool rope_interleaved,
     const void* runtime_rope_cos, const void* runtime_rope_sin, size_t runtime_rope_dim,
     float rms_eps,
     size_t group_size, size_t bits,
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
     float attention_multiplier,   // 0 for default, >0 uses this directly as scale
+    size_t sliding_window,
     bool query_gate
 ) {
     mlx_count_op();
+    (void)sliding_window;
     const auto& x = *static_cast<const array*>(input);
     const int group_size_int = static_cast<int>(group_size);
     const int bits_int = static_cast<int>(bits);
@@ -660,6 +1311,7 @@ void* mlx_lazy_fused_attention(
     const int n_heads_int = static_cast<int>(n_heads);
     const int n_kv_heads_int = static_cast<int>(n_kv_heads);
     const int head_dim_int = static_cast<int>(head_dim);
+    const int rope_dim_int = (rope_dim > 0) ? static_cast<int>(rope_dim) : head_dim_int;
     const float scale_value = resolve_attention_scale(query_pre_attn_scalar, attention_multiplier, head_dim_int);
 
     ProjectedQkv projected = project_quantized_qkv(
@@ -673,6 +1325,9 @@ void* mlx_lazy_fused_attention(
         k_bias,
         v_bias
     );
+    trace_attention_stage("qkv_proj.q", projected.q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_proj.k", projected.k, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_proj.v", projected.v, layer_idx, pos_offset, false, seq_len);
 
     const auto query_gate_values = reshape_qkv_to_attention_layout(
         &projected.q,
@@ -685,18 +1340,27 @@ void* mlx_lazy_fused_attention(
         head_dim_int,
         query_gate
     );
+    trace_attention_stage("qkv_layout.q", projected.q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_layout.k", projected.k, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_layout.v", projected.v, layer_idx, pos_offset, false, seq_len);
     maybe_apply_qk_norm(&projected.q, &projected.k, q_norm_w, k_norm_w, rms_eps);
+    trace_attention_stage("qk_norm.q", projected.q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qk_norm.k", projected.k, layer_idx, pos_offset, false, seq_len);
     apply_attention_rope(
         &projected.q,
         &projected.k,
         seq_len,
         head_dim_int,
+        rope_dim_int,
         pos_offset,
         rope_theta,
+        rope_interleaved,
         runtime_rope_cos,
         runtime_rope_sin,
         runtime_rope_dim
     );
+    trace_attention_stage("rope.q", projected.q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("rope.k", projected.k, layer_idx, pos_offset, false, seq_len);
 
     array k_for_attn = projected.k;
     array v_for_attn = projected.v;
@@ -710,6 +1374,8 @@ void* mlx_lazy_fused_attention(
         &v_for_attn,
         &is_prefill
     );
+    trace_attention_stage("cache.k", k_for_attn, layer_idx, pos_offset, is_prefill, seq_len);
+    trace_attention_stage("cache.v", v_for_attn, layer_idx, pos_offset, is_prefill, seq_len);
 
     auto attn_out = run_attention_kernel(
         projected.q,
@@ -719,8 +1385,11 @@ void* mlx_lazy_fused_attention(
         is_prefill,
         attn_sinks
     );
+    trace_attention_stage("sdpa.out", attn_out, layer_idx, pos_offset, is_prefill, seq_len);
     attn_out = apply_query_output_gate(attn_out, query_gate_values);
+    trace_attention_stage("gate.out", attn_out, layer_idx, pos_offset, is_prefill, seq_len);
     attn_out = reshape_attention_output(attn_out, batch_size, seq_len, n_heads_int * head_dim_int);
+    trace_attention_stage("attn.out", attn_out, layer_idx, pos_offset, is_prefill, seq_len);
 
     // Output projection
     auto out = quantized_linear_no_bias(
@@ -739,6 +1408,7 @@ void* mlx_lazy_fused_attention(
         const auto& bias = *static_cast<const array*>(o_bias);
         out = out + cast_bias_cached(o_bias, bias, out.dtype());
     }
+    trace_attention_stage("o_proj.out", out, layer_idx, pos_offset, is_prefill, seq_len);
 
     return pool_array(std::move(out));
 }
@@ -764,15 +1434,19 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
     const void* attn_sinks,  // [n_heads]
     void* cache_ptr, size_t layer_idx,
     size_t n_heads, size_t n_kv_heads, size_t head_dim,
+    size_t rope_dim,
     size_t pos_offset, float rope_theta,
+    bool rope_interleaved,
     const void* runtime_rope_cos, const void* runtime_rope_sin, size_t runtime_rope_dim,
     float rms_eps,
     size_t group_size, size_t bits,
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
     float attention_multiplier,   // 0 for default, >0 uses this directly as scale
+    size_t sliding_window,
     bool query_gate
 ) {
     mlx_count_op();
+    (void)sliding_window;
     const auto& x = *static_cast<const array*>(input);
     const int group_size_int = static_cast<int>(group_size);
     const int bits_int = static_cast<int>(bits);
@@ -781,6 +1455,7 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
     const int n_heads_int = static_cast<int>(n_heads);
     const int n_kv_heads_int = static_cast<int>(n_kv_heads);
     const int head_dim_int = static_cast<int>(head_dim);
+    const int rope_dim_int = (rope_dim > 0) ? static_cast<int>(rope_dim) : head_dim_int;
     const float scale_value = resolve_attention_scale(query_pre_attn_scalar, attention_multiplier, head_dim_int);
 
     ProjectedQkv projected = project_quantized_qkv(
@@ -794,6 +1469,9 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
         k_bias,
         v_bias
     );
+    trace_attention_stage("qkv_proj.q", projected.q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_proj.k", projected.k, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_proj.v", projected.v, layer_idx, pos_offset, false, seq_len);
 
     const auto query_gate_values = reshape_qkv_to_attention_layout(
         &projected.q,
@@ -806,18 +1484,27 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
         head_dim_int,
         query_gate
     );
+    trace_attention_stage("qkv_layout.q", projected.q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_layout.k", projected.k, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_layout.v", projected.v, layer_idx, pos_offset, false, seq_len);
     maybe_apply_qk_norm(&projected.q, &projected.k, q_norm_w, k_norm_w, rms_eps);
+    trace_attention_stage("qk_norm.q", projected.q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qk_norm.k", projected.k, layer_idx, pos_offset, false, seq_len);
     apply_attention_rope(
         &projected.q,
         &projected.k,
         seq_len,
         head_dim_int,
+        rope_dim_int,
         pos_offset,
         rope_theta,
+        rope_interleaved,
         runtime_rope_cos,
         runtime_rope_sin,
         runtime_rope_dim
     );
+    trace_attention_stage("rope.q", projected.q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("rope.k", projected.k, layer_idx, pos_offset, false, seq_len);
 
     array k_for_attn = projected.k;
     array v_for_attn = projected.v;
@@ -831,6 +1518,8 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
         &v_for_attn,
         &is_prefill
     );
+    trace_attention_stage("cache.k", k_for_attn, layer_idx, pos_offset, is_prefill, seq_len);
+    trace_attention_stage("cache.v", v_for_attn, layer_idx, pos_offset, is_prefill, seq_len);
 
     auto attn_out = run_attention_kernel(
         projected.q,
@@ -840,8 +1529,11 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
         is_prefill,
         attn_sinks
     );
+    trace_attention_stage("sdpa.out", attn_out, layer_idx, pos_offset, is_prefill, seq_len);
     attn_out = apply_query_output_gate(attn_out, query_gate_values);
+    trace_attention_stage("gate.out", attn_out, layer_idx, pos_offset, is_prefill, seq_len);
     attn_out = reshape_attention_output(attn_out, batch_size, seq_len, n_heads_int * head_dim_int);
+    trace_attention_stage("attn.out", attn_out, layer_idx, pos_offset, is_prefill, seq_len);
 
     // Dense output projection (o_w stored as [out, in]).
     auto o_wt = orient_matmul_rhs_cached(
@@ -858,6 +1550,7 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
         const auto& bias = *static_cast<const array*>(o_bias);
         out = out + cast_bias_cached(o_bias, bias, out.dtype());
     }
+    trace_attention_stage("o_proj.out", out, layer_idx, pos_offset, is_prefill, seq_len);
 
     return pool_array(std::move(out));
 }
@@ -1035,14 +1728,18 @@ void* mlx_lazy_fused_attention_bf16(
     const void* attn_sinks,
     void* cache_ptr, size_t layer_idx,
     size_t n_heads, size_t n_kv_heads, size_t head_dim,
+    size_t rope_dim,
     size_t pos_offset, float rope_theta,
+    bool rope_interleaved,
     const void* runtime_rope_cos, const void* runtime_rope_sin, size_t runtime_rope_dim,
     float rms_eps,
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
     float attention_multiplier,   // 0 for default, >0 uses this directly as scale
+    size_t sliding_window,
     bool query_gate
 ) {
     mlx_count_op();
+    (void)sliding_window;
     const auto& x = *static_cast<const array*>(input);
     const int batch_size = x.shape(0);
     const int seq_len = x.shape(1);
@@ -1050,6 +1747,7 @@ void* mlx_lazy_fused_attention_bf16(
     const int n_heads_int = static_cast<int>(n_heads);
     const int n_kv_heads_int = static_cast<int>(n_kv_heads);
     const int head_dim_int = static_cast<int>(head_dim);
+    const int rope_dim_int = (rope_dim > 0) ? static_cast<int>(rope_dim) : head_dim_int;
     const int q_out = n_heads_int * head_dim_int;
     const int q_proj_out = query_gate ? (q_out * 2) : q_out;
     const int kv_out = n_kv_heads_int * head_dim_int;
@@ -1069,13 +1767,7 @@ void* mlx_lazy_fused_attention_bf16(
         q_proj_out,
         kv_out
     );
-    if (qkv_wt.dtype() != float32) {
-        qkv_wt = astype(qkv_wt, float32);
-    }
     auto o_wt = orient_matmul_rhs_cached(o_w, *static_cast<const array*>(o_w), q_out, hidden_dim, true);
-    if (o_wt.dtype() != float32) {
-        o_wt = astype(o_wt, float32);
-    }
 
     auto qkv = matmul_lastdim(x, qkv_wt);
     array q = slice(qkv, {0, 0, 0}, {batch_size, seq_len, q_proj_out});
@@ -1085,6 +1777,9 @@ void* mlx_lazy_fused_attention_bf16(
     maybe_add_linear_bias(&q, q_bias);
     maybe_add_linear_bias(&k, k_bias);
     maybe_add_linear_bias(&v, v_bias);
+    trace_attention_stage("qkv_proj.q", q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_proj.k", k, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_proj.v", v, layer_idx, pos_offset, false, seq_len);
 
     const auto query_gate_values = reshape_qkv_to_attention_layout(
         &q,
@@ -1097,7 +1792,12 @@ void* mlx_lazy_fused_attention_bf16(
         head_dim_int,
         query_gate
     );
+    trace_attention_stage("qkv_layout.q", q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_layout.k", k, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qkv_layout.v", v, layer_idx, pos_offset, false, seq_len);
     maybe_apply_qk_norm(&q, &k, q_norm_w, k_norm_w, rms_eps);
+    trace_attention_stage("qk_norm.q", q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("qk_norm.k", k, layer_idx, pos_offset, false, seq_len);
     // Keep dense attention compute on the model projection dtype after optional
     // QK-norm to avoid unintended FP32 SDPA execution.
     const Dtype proj_dtype = qkv.dtype();
@@ -1109,12 +1809,16 @@ void* mlx_lazy_fused_attention_bf16(
         &k,
         seq_len,
         head_dim_int,
+        rope_dim_int,
         pos_offset,
         rope_theta,
+        rope_interleaved,
         runtime_rope_cos,
         runtime_rope_sin,
         runtime_rope_dim
     );
+    trace_attention_stage("rope.q", q, layer_idx, pos_offset, false, seq_len);
+    trace_attention_stage("rope.k", k, layer_idx, pos_offset, false, seq_len);
 
     array k_for_attn = k;
     array v_for_attn = v;
@@ -1128,10 +1832,15 @@ void* mlx_lazy_fused_attention_bf16(
         &v_for_attn,
         &is_prefill
     );
+    trace_attention_stage("cache.k", k_for_attn, layer_idx, pos_offset, is_prefill, seq_len);
+    trace_attention_stage("cache.v", v_for_attn, layer_idx, pos_offset, is_prefill, seq_len);
 
     auto attn_out = run_attention_kernel(q, k_for_attn, v_for_attn, scale_value, is_prefill, attn_sinks);
+    trace_attention_stage("sdpa.out", attn_out, layer_idx, pos_offset, is_prefill, seq_len);
     attn_out = apply_query_output_gate(attn_out, query_gate_values);
+    trace_attention_stage("gate.out", attn_out, layer_idx, pos_offset, is_prefill, seq_len);
     attn_out = reshape_attention_output(attn_out, batch_size, seq_len, q_out);
+    trace_attention_stage("attn.out", attn_out, layer_idx, pos_offset, is_prefill, seq_len);
 
     // Output projection
     auto out = matmul_lastdim(attn_out, o_wt);
@@ -1141,6 +1850,7 @@ void* mlx_lazy_fused_attention_bf16(
         const auto& bias = *static_cast<const array*>(o_bias);
         out = out + cast_bias_cached(o_bias, bias, out.dtype());
     }
+    trace_attention_stage("o_proj.out", out, layer_idx, pos_offset, is_prefill, seq_len);
 
     return pool_array(std::move(out));
 }
