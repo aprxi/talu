@@ -19,7 +19,8 @@ export function showReadOnlyParams(
   usage: UsageStats | null,
 ): void {
   const pd = getChatPanelDom();
-  if (!gen) return;
+  if (!gen && !usage) return;
+  if (!gen) gen = {} as GenerationSettings;
 
   panelReadOnlyMode = true;
 
@@ -51,18 +52,37 @@ export function showReadOnlyParams(
   // Add visual indicator
   pd.root.classList.add("read-only");
 
-  // Update the Info section with stats
-  if (usage) {
+  // Update the Info section with stats from usage or generation data.
+  const genAny = gen as Record<string, unknown>;
+  const inputTokens = usage?.input_tokens ?? genAny?.input_tokens;
+  const outputTokens = usage?.output_tokens ?? genAny?.output_tokens;
+  const prefillMs = genAny?.prefill_ms as number | undefined;
+  const generationMs = genAny?.generation_ms as number | undefined;
+
+  if (inputTokens || outputTokens || usage) {
     const rows: string[] = [];
-    rows.push(`<div class="info-row"><span class="info-label">Output tokens</span><span class="info-value">${usage.output_tokens}</span></div>`);
-    if (usage.input_tokens) {
-      rows.push(`<div class="info-row"><span class="info-label">Input tokens</span><span class="info-value">${usage.input_tokens}</span></div>`);
+    if (outputTokens) {
+      rows.push(`<div class="info-row"><span class="info-label">Output tokens</span><span class="info-value">${outputTokens}</span></div>`);
     }
-    if (usage.tokens_per_second) {
+    if (inputTokens) {
+      rows.push(`<div class="info-row"><span class="info-label">Input tokens</span><span class="info-value">${inputTokens}</span></div>`);
+    }
+    if (usage?.tokens_per_second) {
       rows.push(`<div class="info-row"><span class="info-label">Speed</span><span class="info-value">${usage.tokens_per_second} tok/s</span></div>`);
+    } else if (generationMs && outputTokens) {
+      const tokPerSec = Math.round(((outputTokens as number) / (generationMs / 1000)) * 10) / 10;
+      rows.push(`<div class="info-row"><span class="info-label">Speed</span><span class="info-value">${tokPerSec} tok/s</span></div>`);
     }
-    if (usage.duration_ms) {
+    if (usage?.duration_ms) {
       rows.push(`<div class="info-row"><span class="info-label">Duration</span><span class="info-value">${(usage.duration_ms / 1000).toFixed(2)}s</span></div>`);
+    } else if (generationMs) {
+      rows.push(`<div class="info-row"><span class="info-label">Generation</span><span class="info-value">${(generationMs / 1000).toFixed(2)}s</span></div>`);
+    }
+    if (prefillMs) {
+      rows.push(`<div class="info-row"><span class="info-label">Prefill</span><span class="info-value">${(prefillMs / 1000).toFixed(3)}s</span></div>`);
+    }
+    if (gen?.model) {
+      rows.push(`<div class="info-row"><span class="info-label">Model</span><span class="info-value">${escapeHtml(gen.model)}</span></div>`);
     }
     pd.panelChatInfo.innerHTML = rows.join("\n");
   }

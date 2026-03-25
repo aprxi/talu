@@ -13,6 +13,10 @@ export interface ChatDom {
   sidebarCollapseAll: HTMLButtonElement;
   sidebarSort: HTMLButtonElement;
 
+  // Generation status
+  generationBar: HTMLElement;
+  generationStop: HTMLButtonElement;
+
   // Transcript
   transcriptContainer: HTMLElement;
 
@@ -75,6 +79,8 @@ export function getChatDom(): ChatDom {
     sidebarCollapseAll: q<HTMLButtonElement>("#sidebar-collapse-all-btn"),
     sidebarSort: q<HTMLButtonElement>("#sidebar-sort-btn"),
 
+    generationBar: q("#generation-bar"),
+    generationStop: q<HTMLButtonElement>("#generation-stop"),
     transcriptContainer: q("#transcript"),
 
     welcomeState: q("#welcome-state"),

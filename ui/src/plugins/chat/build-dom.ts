@@ -35,6 +35,14 @@ export function buildChatDOM(container: HTMLElement): void {
 
     <div class="chat-column">
       <div class="content-area">
+        <div id="generation-bar" class="generation-bar hidden">
+          <div class="generation-bar-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <button id="generation-stop" class="generation-bar-stop" title="Stop generating">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6" rx="1" fill="currentColor" stroke="none"/></svg>
+          </button>
+        </div>
         <div id="transcript" class="transcript scroll-thin"></div>
 
         <div id="welcome-state" class="welcome-state">

@@ -176,8 +176,8 @@ function renderGroupedList(
     const projectForNav = pValue === "__default__" ? null : pValue;
     const firstChatId = pinned.length > 0 ? pinned[0].id : (unpinned.length > 0 ? unpinned[0].id : null);
 
-    // Collapse/expand chevron on the left — only way to collapse.
-    if (multiGroup) {
+    // Collapse/expand chevron on the left.
+    {
       const collapseBtn = el("button", "sidebar-group-collapse");
       collapseBtn.innerHTML = isOpen ? CHEVRON_DOWN_ICON : CHEVRON_RIGHT_ICON;
       collapseBtn.title = isOpen ? "Collapse" : "Expand";

@@ -1170,6 +1170,71 @@
   font-style: italic;
 }
 
+/* Top generation status bar */
+.generation-bar {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  margin-top: 10px;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.12);
+}
+
+.generation-bar.hidden {
+  display: none;
+}
+
+.generation-bar-dots {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.generation-bar-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--primary);
+  animation: gen-bounce 1.4s ease-in-out infinite;
+}
+
+.generation-bar-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.generation-bar-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes gen-bounce {
+  0%, 60%, 100% { opacity: 0.25; transform: scale(0.8); }
+  30% { opacity: 1; transform: scale(1.2); }
+}
+
+.generation-bar-stop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.generation-bar-stop:hover {
+  color: var(--text);
+}
+
 /* Stopped indicator */
 .stopped-indicator {
   margin-top: 0.5rem;

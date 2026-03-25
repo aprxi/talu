@@ -94,10 +94,12 @@ export function setInputEnabled(enabled: boolean): void {
     dom.inputSend.disabled = false;
     dom.inputSend.classList.remove("bg-danger", "hover:bg-danger/80");
     dom.inputSend.classList.add("bg-primary", "hover:bg-accent");
+    dom.generationBar.classList.add("hidden");
   } else {
     dom.inputSend.innerHTML = STOP_ICON;
     dom.inputSend.disabled = false;
     dom.inputSend.classList.remove("bg-primary", "hover:bg-accent");
     dom.inputSend.classList.add("bg-danger", "hover:bg-danger/80");
+    dom.generationBar.classList.remove("hidden");
   }
 }

@@ -2311,6 +2311,15 @@ fn run_batch_streaming_generation(
     }
     cfg.stop_flag = Some(stop_flag.clone());
 
+    // Capture generation config before submit moves cfg.
+    let gen_temperature = cfg.temperature;
+    let gen_top_p = cfg.top_p;
+    let gen_top_k = cfg.top_k;
+    let gen_min_p = cfg.min_p;
+    let gen_max_tokens = cfg.max_tokens;
+    let gen_repetition_penalty = cfg.repetition_penalty;
+    let gen_seed = cfg.seed;
+
     // --- Submit to batch scheduler ---
     let (request_id, event_rx) = scheduler
         .submit(&chat, cfg, stop_flag.clone())
@@ -2426,9 +2435,33 @@ fn run_batch_streaming_generation(
         json!([])
     };
 
-    // For conversation chaining, load the output_items into the ChatHandle.
-    // Reasoning items (no text) are skipped by the parser; message items
-    // carry only output text; function_call items have full metadata.
+    // For conversation chaining, inject generation metadata into the last
+    // assistant message so it persists to storage and is available on reload.
+    if let Ok(mut guard) = ctx.lock() {
+        let mut gen_data = json!({
+            "model": model_id,
+            "temperature": gen_temperature,
+            "top_p": gen_top_p,
+            "top_k": gen_top_k,
+            "max_output_tokens": gen_max_tokens,
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+            "prefill_ms": prefill_ns as f64 / 1_000_000.0,
+            "generation_ms": generation_ns as f64 / 1_000_000.0
+        });
+        if gen_min_p > 0.0 { gen_data["min_p"] = serde_json::Value::from(gen_min_p); }
+        if gen_repetition_penalty != 1.0 { gen_data["repetition_penalty"] = serde_json::Value::from(gen_repetition_penalty); }
+        if gen_seed != 0 { gen_data["seed"] = serde_json::Value::from(gen_seed); }
+        for item in guard.output_items.iter_mut().rev() {
+            if item.get("type").and_then(|v| v.as_str()) == Some("message")
+                && item.get("role").and_then(|v| v.as_str()) == Some("assistant")
+            {
+                item["generation"] = gen_data;
+                break;
+            }
+        }
+    }
+
     let pre_load_count = chat.item_count();
     if let Ok(guard) = ctx.lock() {
         if !guard.output_items.is_empty() {
@@ -3140,12 +3173,21 @@ impl StreamCtx {
         };
 
         let item_object = match item_type {
-            ItemType::Reasoning => json!({
-                "type": "reasoning",
-                "id": self.cur_item_id,
-                "summary": [],
-                "status": "completed"
-            }),
+            ItemType::Reasoning => {
+                let mut summary = Vec::new();
+                if !self.accumulated_text.is_empty() {
+                    summary.push(json!({
+                        "type": "summary_text",
+                        "text": self.accumulated_text
+                    }));
+                }
+                json!({
+                    "type": "reasoning",
+                    "id": self.cur_item_id,
+                    "summary": summary,
+                    "status": "completed"
+                })
+            },
             ItemType::FunctionCall => json!({
                 "type": "function_call",
                 "id": self.cur_item_id,

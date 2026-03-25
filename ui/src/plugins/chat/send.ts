@@ -26,6 +26,11 @@ export function setupInputEvents(): void {
   dom.inputSend.addEventListener("click", () => {
     if (chatState.isGenerating) { cancelGeneration(); } else { handleSend(); }
   });
+
+  // Top generation bar stop button.
+  dom.generationStop.addEventListener("click", () => {
+    cancelGeneration();
+  });
   dom.inputText.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
