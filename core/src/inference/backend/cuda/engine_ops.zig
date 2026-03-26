@@ -36,7 +36,7 @@ pub fn compactQueryGateProjection(
     q_projection_dim: usize,
     q_projection_stage: *const compute.cuda.Buffer,
     q_values_stage: *compute.cuda.Buffer,
-    ) !void {
+) !void {
     const projection_elements = std.math.mul(usize, seq_len, q_projection_dim) catch return error.InvalidArgument;
     const query_elements = std.math.mul(usize, seq_len, q_dim) catch return error.InvalidArgument;
     _ = projection_elements;
@@ -53,14 +53,14 @@ pub fn compactQueryGateProjection(
         @intCast(self.n_heads),
         @intCast(self.head_dim),
     );
-    }
+}
 
 pub fn applyQueryGateToContextInPlace(
     self: anytype,
     seq_len: usize,
     q_dim: usize,
     q_projection_dim: usize,
-    ) !void {
+) !void {
     const projection_elements = std.math.mul(usize, seq_len, q_projection_dim) catch return error.InvalidArgument;
     const query_elements = std.math.mul(usize, seq_len, q_dim) catch return error.InvalidArgument;
     const projection_bytes = std.math.mul(usize, projection_elements, @sizeOf(f32)) catch return error.InvalidArgument;
@@ -79,16 +79,16 @@ pub fn applyQueryGateToContextInPlace(
         @intCast(self.n_heads),
         @intCast(self.head_dim),
     );
-    }
+}
 
 pub fn linearForward(
     self: anytype,
     input: *const compute.cuda.Buffer,
     weight: *const LinearWeight,
     out: *compute.cuda.Buffer,
-    ) !void {
-    return linearForwardRows(self,input, try bufferF32RowCount(input, weight.rows()), weight, out);
-    }
+) !void {
+    return linearForwardRows(self, input, try bufferF32RowCount(input, weight.rows()), weight, out);
+}
 
 pub fn linearForwardRows(
     self: anytype,
@@ -96,7 +96,7 @@ pub fn linearForwardRows(
     rows: usize,
     weight: *const LinearWeight,
     out: *compute.cuda.Buffer,
-    ) !void {
+) !void {
     if (rows == 0) return error.InvalidArgument;
     const input_row_width = weight.rows();
     const output_row_width = weight.cols();
@@ -107,32 +107,18 @@ pub fn linearForwardRows(
     if (input.size < packed_input_bytes or out.size < packed_output_bytes) {
         return error.InvalidInstructionBinding;
     }
-    // Consume pending residual fusion: redirect output to residual buffer
-    // and pass its pointer to the GEMV kernel for fused residual add.
-    var residual_ptr: u64 = 0;
-    var fused_out_buf: compute.cuda.Buffer = undefined;
-    const effective_out: *compute.cuda.Buffer = if (rows == 1) blk: {
-        if (self.pending_residual_add_buf) |res_buf| {
-            self.pending_residual_add_buf = null;
-            residual_ptr = res_buf.pointer;
-            fused_out_buf = res_buf;
-            self.skip_next_residual_add = true;
-            break :blk &fused_out_buf;
-        }
-        break :blk out;
-    } else blk: {
-        self.pending_residual_add_buf = null;
-        break :blk out;
-    };
+    // Canonical path: residual add is always handled by the explicit residual op.
+    // Do not fuse residual behavior into projection kernels.
+    self.pending_residual_add_buf = null;
 
     var packed_input = if (input.size == packed_input_bytes)
         input.*
     else
         try bufferSlice(input, 0, packed_input_bytes);
-    var packed_out = if (effective_out.size == packed_output_bytes)
-        effective_out.*
+    var packed_out = if (out.size == packed_output_bytes)
+        out.*
     else
-        try bufferSlice(effective_out, 0, packed_output_bytes);
+        try bufferSlice(out, 0, packed_output_bytes);
 
     switch (weight.*) {
         .dense_f32 => |w| {
@@ -147,30 +133,15 @@ pub fn linearForwardRows(
             );
         },
         .dense_u16 => |w| {
-            if (rows == 1) {
-                const matvec_kernel = switch (w.dtype) {
-                    .f16 => self.matvec_f16_function orelse return error.CudaKernelUnavailable,
-                    .bf16 => self.matvec_bf16_function orelse return error.CudaKernelUnavailable,
-                };
-                var input_row = try bufferSlice(&packed_input, 0, input_row_bytes);
-                var out_row = try bufferSlice(&packed_out, 0, output_row_bytes);
-                try compute.cuda.matvec_u16.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    matvec_kernel,
-                    &input_row,
-                    &w.buffer,
-                    &out_row,
-                    @intCast(w.rows),
-                    @intCast(w.cols),
-                    residual_ptr,
-                );
-                return;
-            }
-
+            // Canonical batched path: treat rows as matrix M dimension for
+            // all row counts (including decode). No batch-specialized kernels.
             const matmul_kernel = switch (w.dtype) {
                 .f16 => self.matmul_f16_function orelse return error.CudaKernelUnavailable,
                 .bf16 => self.matmul_bf16_function orelse return error.CudaKernelUnavailable,
+            };
+            const matvec_kernel = switch (w.dtype) {
+                .f16 => self.matvec_f16_function orelse return error.CudaKernelUnavailable,
+                .bf16 => self.matvec_bf16_function orelse return error.CudaKernelUnavailable,
             };
             const blas_payload: compute.cuda.Blas.U16Payload = switch (w.dtype) {
                 .f16 => .f16,
@@ -180,6 +151,23 @@ pub fn linearForwardRows(
                 .f16 => self.u16_blas_f16_supported,
                 .bf16 => self.u16_blas_bf16_supported,
             };
+            // Small-row decode path: run native batched GEMV directly to avoid
+            // cast-to-u16 + BLAS dispatch overhead on rows typically seen in decode.
+            if (rows >= 2 and rows <= 8) {
+                try compute.cuda.matvec_u16.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    matvec_kernel,
+                    &packed_input,
+                    &w.buffer,
+                    &packed_out,
+                    @intCast(w.rows),
+                    @intCast(w.cols),
+                    @intCast(rows),
+                    0,
+                );
+                return;
+            }
             if (blas_supported) {
                 const input_u16_count = std.math.mul(usize, rows, w.rows) catch return error.InvalidArgument;
                 const input_u16_bytes = std.math.mul(usize, input_u16_count, @sizeOf(u16)) catch return error.InvalidArgument;
@@ -271,7 +259,6 @@ pub fn linearForwardRows(
         },
         .gaffine_u4 => |w| {
             const kernel = self.gaffine_u4_matvec_function orelse return error.CudaKernelUnavailable;
-
             if (rows == 1) {
                 try compute.cuda.gaffine_u4_matvec.runWithFunction(
                     &self.kernel_arg_pack,
@@ -287,7 +274,7 @@ pub fn linearForwardRows(
                     w.group_size,
                     w.scales_dtype_tag,
                     1,
-                    residual_ptr,
+                    0,
                 );
                 return;
             }
@@ -479,7 +466,6 @@ pub fn linearForwardRows(
         },
         .gaffine_u8 => |w| {
             const kernel = self.gaffine_u8_matvec_function orelse return error.CudaKernelUnavailable;
-
             if (rows == 1) {
                 // Try I8 GEMV: warp-per-row kernel, 4 output rows per block.
                 if (w.dequant_i8_cache.pointer != 0 and
@@ -495,7 +481,7 @@ pub fn linearForwardRows(
                     self.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch break :i8_decode;
                     self.kernel_arg_pack.appendScalar(u32, out_cols) catch break :i8_decode;
                     self.kernel_arg_pack.appendScalar(u32, 1) catch break :i8_decode;
-                    self.kernel_arg_pack.appendDevicePtr(residual_ptr) catch break :i8_decode;
+                    self.kernel_arg_pack.appendDevicePtr(0) catch break :i8_decode;
                     compute.cuda.launch.launchWithFamily(&self.device, i8_fn, .{
                         .grid_x = (out_cols + 3) / 4,
                         .grid_y = 1,
@@ -518,7 +504,7 @@ pub fn linearForwardRows(
                     w.group_size,
                     w.scales_dtype_tag,
                     1,
-                    residual_ptr,
+                    0,
                 );
                 return;
             }
@@ -711,7 +697,7 @@ pub fn linearForwardRows(
             return;
         },
     }
-    }
+}
 
 pub fn runQkvProjection(
     self: anytype,
@@ -721,13 +707,12 @@ pub fn runQkvProjection(
     v_proj: *const LinearWeight,
     rows: usize,
     q_out_dest: *compute.cuda.Buffer,
-    ) !ProjectionPath {
+) !ProjectionPath {
     const q_bytes = std.math.mul(usize, rows, q_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     const k_bytes = std.math.mul(usize, rows, k_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     const v_bytes = std.math.mul(usize, rows, v_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
-    if (rows == 1 and
-        q_out_dest.size >= q_bytes and
-        try tryFusedQkvForward(self,input, q_proj, k_proj, v_proj, q_out_dest))
+    if (q_out_dest.size >= q_bytes and
+        try tryFusedQkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest))
     {
         return .fused;
     }
@@ -825,20 +810,20 @@ pub fn runQkvProjection(
         }
     }
 
-    try linearForwardRows(self,input, rows, q_proj, &q_out);
-    try linearForwardRows(self,input, rows, k_proj, &k_out);
-    try linearForwardRows(self,input, rows, v_proj, &v_out);
+    try linearForwardRows(self, input, rows, q_proj, &q_out);
+    try linearForwardRows(self, input, rows, k_proj, &k_out);
+    try linearForwardRows(self, input, rows, v_proj, &v_out);
     return .unfused;
-    }
+}
 
 pub fn runGateUpProjection(
     self: anytype,
     input: *const compute.cuda.Buffer,
     block: *const LayerAttentionRuntime,
     rows: usize,
-    ) !ProjectionPath {
+) !ProjectionPath {
     return runGateUpProjectionWithWeights(self, input, &block.w1, &block.w3, rows);
-    }
+}
 
 pub fn runGateUpProjectionWithWeights(
     self: anytype,
@@ -846,17 +831,17 @@ pub fn runGateUpProjectionWithWeights(
     gate_weight: *const LinearWeight,
     up_weight: *const LinearWeight,
     rows: usize,
-    ) !ProjectionPath {
-    if (rows == 1 and try tryFusedGateUpForward(self,input, gate_weight, up_weight)) return .fused;
+) !ProjectionPath {
+    if (try tryFusedGateUpForward(self, input, gate_weight, up_weight, rows)) return .fused;
 
     const gate_bytes = std.math.mul(usize, rows, gate_weight.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     const up_bytes = std.math.mul(usize, rows, up_weight.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     var gate_out = try bufferSlice(&self.runtime_buffers.ffn_gate_dev, 0, gate_bytes);
     var up_out = try bufferSlice(&self.runtime_buffers.ffn_up_dev, 0, up_bytes);
-    try linearForwardRows(self,input, rows, gate_weight, &gate_out);
-    try linearForwardRows(self,input, rows, up_weight, &up_out);
+    try linearForwardRows(self, input, rows, gate_weight, &gate_out);
+    try linearForwardRows(self, input, rows, up_weight, &up_out);
     return .unfused;
-    }
+}
 
 pub fn runFfnActivationMul(self: anytype, count: u32) !void {
     if (self.loaded.config.use_gelu) {
@@ -883,7 +868,7 @@ pub fn runFfnActivationMul(self: anytype, count: u32) !void {
         &self.runtime_buffers.ffn_mul_dev,
         count,
     );
-    }
+}
 
 pub fn addResidualWithModelScale(
     self: anytype,
@@ -891,7 +876,7 @@ pub fn addResidualWithModelScale(
     residual: *compute.cuda.Buffer,
     branch: *compute.cuda.Buffer,
     count: u32,
-    ) !void {
+) !void {
     if (self.loaded.config.residual_multiplier == 1.0) {
         const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
         try compute.cuda.vector_add.runWithFunction(
@@ -917,7 +902,7 @@ pub fn addResidualWithModelScale(
         self.loaded.config.residual_multiplier,
         count,
     );
-    }
+}
 
 pub fn addResidualWithScale(
     self: anytype,
@@ -926,7 +911,7 @@ pub fn addResidualWithScale(
     branch: *compute.cuda.Buffer,
     count: u32,
     scale: layer_ops.ResidualScale,
-    ) !void {
+) !void {
     switch (scale) {
         .residual_multiplier => return addResidualWithModelScale(self, out, residual, branch, count),
         .one => {
@@ -967,7 +952,7 @@ pub fn addResidualWithScale(
             );
         },
     }
-    }
+}
 
 pub fn addResidualWithScaleRowsStrideAware(
     self: anytype,
@@ -977,12 +962,12 @@ pub fn addResidualWithScaleRowsStrideAware(
     rows: u32,
     cols: u32,
     scale: layer_ops.ResidualScale,
-    ) !void {
+) !void {
     if (rows == 0 or cols == 0) return error.InvalidArgument;
     const packed_count = std.math.mul(u32, rows, cols) catch return error.InvalidArgument;
     const packed_bytes = std.math.mul(usize, @as(usize, packed_count), @sizeOf(f32)) catch return error.InvalidArgument;
     if (out.size == packed_bytes and residual.size == packed_bytes and branch.size == packed_bytes) {
-        return addResidualWithScale(self,out, residual, branch, packed_count, scale);
+        return addResidualWithScale(self, out, residual, branch, packed_count, scale);
     }
     if (out.size < packed_bytes or residual.size < packed_bytes or branch.size < packed_bytes) {
         return error.InvalidInstructionBinding;
@@ -1008,9 +993,9 @@ pub fn addResidualWithScaleRowsStrideAware(
         var out_row = try bufferSlice(out, out_offset, row_bytes);
         var residual_row = try bufferSlice(residual, residual_offset, row_bytes);
         var branch_row = try bufferSlice(branch, branch_offset, row_bytes);
-        try addResidualWithScale(self,&out_row, &residual_row, &branch_row, cols, scale);
+        try addResidualWithScale(self, &out_row, &residual_row, &branch_row, cols, scale);
     }
-    }
+}
 
 pub fn runRmsnormRowsStrideAware(
     self: anytype,
@@ -1019,7 +1004,7 @@ pub fn runRmsnormRowsStrideAware(
     output: *compute.cuda.Buffer,
     rows: u32,
     cols: u32,
-    ) !void {
+) !void {
     if (rows == 0 or cols == 0) return error.InvalidArgument;
     const packed_count = std.math.mul(u32, rows, cols) catch return error.InvalidArgument;
     const packed_bytes = std.math.mul(usize, @as(usize, packed_count), @sizeOf(f32)) catch return error.InvalidArgument;
@@ -1066,7 +1051,7 @@ pub fn runRmsnormRowsStrideAware(
             self.loaded.runtime.weight_offset,
         );
     }
-    }
+}
 
 pub fn programBuffer(self: anytype, reg_idx: usize, ctx: anytype) ?*compute.cuda.Buffer {
     _ = self;
@@ -1075,20 +1060,21 @@ pub fn programBuffer(self: anytype, reg_idx: usize, ctx: anytype) ?*compute.cuda
     const slot_idx = ctx.register_to_slot_map[reg_idx];
     if (slot_idx == BlockRuntimeLayer.invalid_slot or slot_idx >= ctx.slot_buffers.len) return null;
     return @constCast(&ctx.slot_buffers[slot_idx]);
-    }
+}
 pub fn tryFusedQkvForward(
     self: anytype,
     input: *const compute.cuda.Buffer,
     q_proj: *const LinearWeight,
     k_proj: *const LinearWeight,
     v_proj: *const LinearWeight,
+    rows: usize,
     q_out_dest: *compute.cuda.Buffer,
-    ) !bool {
-    if (try tryFusedDenseU16QkvForward(self, input, q_proj, k_proj, v_proj, q_out_dest)) return true;
-    if (try tryFusedGaffineU4QkvForward(self, input, q_proj, k_proj, v_proj, q_out_dest)) return true;
-    if (try tryFusedI8QkvForward(self, input, q_proj, k_proj, v_proj, q_out_dest)) return true;
-    return tryFusedGaffineU8QkvForward(self, input, q_proj, k_proj, v_proj, q_out_dest);
-    }
+) !bool {
+    if (try tryFusedDenseU16QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
+    if (try tryFusedGaffineU4QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
+    if (try tryFusedI8QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
+    return tryFusedGaffineU8QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest);
+}
 
 pub fn tryFusedGaffineU4QkvForward(
     self: anytype,
@@ -1096,8 +1082,10 @@ pub fn tryFusedGaffineU4QkvForward(
     q_proj: *const LinearWeight,
     k_proj: *const LinearWeight,
     v_proj: *const LinearWeight,
+    rows: usize,
     q_out_dest: *compute.cuda.Buffer,
-    ) !bool {
+) !bool {
+    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
     const fused_kernel = self.gaffine_u4_matvec_qkv_function orelse return false;
     const q = switch (q_proj.*) {
         .gaffine_u4 => |w| w,
@@ -1112,6 +1100,7 @@ pub fn tryFusedGaffineU4QkvForward(
         else => return false,
     };
     if (!canFuseGaffineQkvWeights(self.d_model, q, k, v)) return false;
+    const batch_rows: u32 = @intCast(rows);
 
     try compute.cuda.gaffine_u4_matvec_qkv.runWithFunction(
         &self.kernel_arg_pack,
@@ -1140,10 +1129,10 @@ pub fn tryFusedGaffineU4QkvForward(
         v.group_size,
         v.scales_dtype_tag,
         @intCast(q.rows),
-        1,
+        batch_rows,
     );
     return true;
-    }
+}
 
 pub fn tryFusedI8QkvForward(
     self: anytype,
@@ -1151,8 +1140,10 @@ pub fn tryFusedI8QkvForward(
     q_proj: *const LinearWeight,
     k_proj: *const LinearWeight,
     v_proj: *const LinearWeight,
+    rows: usize,
     q_out_dest: *compute.cuda.Buffer,
-    ) !bool {
+) !bool {
+    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
     const i8_fn = self.i8_matvec_qkv_function orelse return false;
     const q = switch (q_proj.*) {
         .gaffine_u8 => |w| w,
@@ -1171,6 +1162,7 @@ pub fn tryFusedI8QkvForward(
     if (k.dequant_i8_cache.pointer == 0 or k.mean_scale_cache.pointer == 0) return false;
     if (v.dequant_i8_cache.pointer == 0 or v.mean_scale_cache.pointer == 0) return false;
     if (!canFuseGaffineQkvWeights(self.d_model, q, k, v)) return false;
+    const batch_rows: u32 = @intCast(rows);
 
     const q_out_dim: u32 = @intCast(q.cols);
     const k_out_dim: u32 = @intCast(k.cols);
@@ -1193,15 +1185,15 @@ pub fn tryFusedI8QkvForward(
     try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.attn_v_dev);
     try self.kernel_arg_pack.appendScalar(u32, v_out_dim);
     try self.kernel_arg_pack.appendScalar(u32, in_dim);
-    try self.kernel_arg_pack.appendScalar(u32, 1);
+    try self.kernel_arg_pack.appendScalar(u32, batch_rows);
 
     try compute.cuda.launch.launchWithFamily(&self.device, i8_fn, .{
         .grid_x = (total_out + 3) / 4,
-        .grid_y = 1,
+        .grid_y = batch_rows,
         .block_x = 128,
     }, &self.kernel_arg_pack, .matvec_qkv);
     return true;
-    }
+}
 
 pub fn tryFusedGaffineU8QkvForward(
     self: anytype,
@@ -1209,8 +1201,10 @@ pub fn tryFusedGaffineU8QkvForward(
     q_proj: *const LinearWeight,
     k_proj: *const LinearWeight,
     v_proj: *const LinearWeight,
+    rows: usize,
     q_out_dest: *compute.cuda.Buffer,
-    ) !bool {
+) !bool {
+    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
     const fused_kernel = self.gaffine_u8_matvec_qkv_function orelse return false;
     const q = switch (q_proj.*) {
         .gaffine_u8 => |w| w,
@@ -1225,6 +1219,7 @@ pub fn tryFusedGaffineU8QkvForward(
         else => return false,
     };
     if (!canFuseGaffineQkvWeights(self.d_model, q, k, v)) return false;
+    const batch_rows: u32 = @intCast(rows);
 
     try compute.cuda.gaffine_u8_matvec_qkv.runWithFunction(
         &self.kernel_arg_pack,
@@ -1253,10 +1248,10 @@ pub fn tryFusedGaffineU8QkvForward(
         v.group_size,
         v.scales_dtype_tag,
         @intCast(q.rows),
-        1,
+        batch_rows,
     );
     return true;
-    }
+}
 
 pub fn tryFusedDenseU16QkvForward(
     self: anytype,
@@ -1264,8 +1259,9 @@ pub fn tryFusedDenseU16QkvForward(
     q_proj: *const LinearWeight,
     k_proj: *const LinearWeight,
     v_proj: *const LinearWeight,
+    rows: usize,
     q_out_dest: *compute.cuda.Buffer,
-    ) !bool {
+) !bool {
     const q = switch (q_proj.*) {
         .dense_u16 => |w| w,
         else => return false,
@@ -1280,28 +1276,36 @@ pub fn tryFusedDenseU16QkvForward(
     };
     if (!canFuseDenseU16QkvWeights(self.d_model, q, k, v)) return false;
 
-    const fused_kernel = switch (q.dtype) {
+    const batch_rows: u32 = @intCast(rows);
+    const in_dim: u32 = @intCast(q.rows);
+    const q_out_dim: u32 = @intCast(q.cols);
+    const k_out_dim: u32 = @intCast(k.cols);
+    const v_out_dim: u32 = @intCast(v.cols);
+
+    const fused_batch_kernel = switch (q.dtype) {
         .f16 => self.matvec_qkv_f16_function orelse return false,
         .bf16 => self.matvec_qkv_bf16_function orelse return false,
     };
-    try compute.cuda.matvec_u16_qkv.runWithFunction(
+
+    try compute.cuda.matvec_u16_qkv.runWithFunctionGridBatch(
         &self.kernel_arg_pack,
         &self.device,
-        fused_kernel,
+        fused_batch_kernel,
         input,
         &q.buffer,
         q_out_dest,
-        @intCast(q.cols),
+        q_out_dim,
         &k.buffer,
         &self.runtime_buffers.attn_k_dev,
-        @intCast(k.cols),
+        k_out_dim,
         &v.buffer,
         &self.runtime_buffers.attn_v_dev,
-        @intCast(v.cols),
-        @intCast(q.rows),
+        v_out_dim,
+        in_dim,
+        batch_rows,
     );
     return true;
-    }
+}
 
 pub fn canFuseDenseU16QkvWeights(d_model: usize, q: U16LinearWeight, k: U16LinearWeight, v: U16LinearWeight) bool {
     if (q.rows != d_model or k.rows != d_model or v.rows != d_model) return false;
@@ -1314,14 +1318,14 @@ pub fn canFuseDenseU16QkvWeights(d_model: usize, q: U16LinearWeight, k: U16Linea
         return false;
     }
     return true;
-    }
+}
 
 pub fn canFuseGaffineQkvWeights(
     d_model: usize,
     q: anytype,
     k: anytype,
     v: anytype,
-    ) bool {
+) bool {
     if (q.rows != d_model or k.rows != d_model or v.rows != d_model) return false;
     if (q.scales_dtype_tag != k.scales_dtype_tag or q.scales_dtype_tag != v.scales_dtype_tag) return false;
     if (q.cols > std.math.maxInt(u32) or
@@ -1332,13 +1336,13 @@ pub fn canFuseGaffineQkvWeights(
         return false;
     }
     return true;
-    }
+}
 
 pub fn canFuseGaffineGateUpWeights(
     d_model: usize,
     gate: anytype,
     up: anytype,
-    ) bool {
+) bool {
     if (gate.rows != d_model or up.rows != d_model) return false;
     if (gate.scales_dtype_tag != up.scales_dtype_tag) return false;
     if (gate.cols > std.math.maxInt(u32) or
@@ -1348,7 +1352,7 @@ pub fn canFuseGaffineGateUpWeights(
         return false;
     }
     return true;
-    }
+}
 
 pub fn tryFusedI8GateUpSiluForward(
     self: anytype,
@@ -1357,9 +1361,9 @@ pub fn tryFusedI8GateUpSiluForward(
     up_weight: *const LinearWeight,
     rows: usize,
     expected_out_dim: u32,
-    ) !bool {
+) !bool {
     if (self.loaded.config.use_gelu) return false;
-    if (rows != 1) return false;
+    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
     const i8_fn = self.i8_matvec_gate_up_silu_function orelse return false;
 
     const gate = switch (gate_weight.*) {
@@ -1377,7 +1381,8 @@ pub fn tryFusedI8GateUpSiluForward(
     if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
 
     const row_count = bufferF32RowCount(input, gate.rows) catch return false;
-    if (row_count != 1) return false;
+    if (row_count != rows) return false;
+    const batch_rows: u32 = @intCast(rows);
 
     const out_dim: u32 = @intCast(gate.cols);
     const in_dim: u32 = @intCast(gate.rows);
@@ -1391,15 +1396,15 @@ pub fn tryFusedI8GateUpSiluForward(
     try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_mul_dev);
     try self.kernel_arg_pack.appendScalar(u32, out_dim);
     try self.kernel_arg_pack.appendScalar(u32, in_dim);
-    try self.kernel_arg_pack.appendScalar(u32, 1);
+    try self.kernel_arg_pack.appendScalar(u32, batch_rows);
 
     try compute.cuda.launch.launchWithFamily(&self.device, i8_fn, .{
         .grid_x = (out_dim + 3) / 4,
-        .grid_y = 1,
+        .grid_y = batch_rows,
         .block_x = 128,
     }, &self.kernel_arg_pack, .matvec_gate_up_silu);
     return true;
-    }
+}
 
 pub fn tryFusedGaffineU8GateUpSiluForward(
     self: anytype,
@@ -1408,9 +1413,9 @@ pub fn tryFusedGaffineU8GateUpSiluForward(
     up_weight: *const LinearWeight,
     rows: usize,
     expected_out_dim: u32,
-    ) !bool {
+) !bool {
     if (self.loaded.config.use_gelu) return false;
-    if (rows != 1) return false;
+    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
 
     const gate = switch (gate_weight.*) {
         .gaffine_u8 => |w| w,
@@ -1424,7 +1429,8 @@ pub fn tryFusedGaffineU8GateUpSiluForward(
     if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
 
     const row_count = bufferF32RowCount(input, gate.rows) catch return false;
-    if (row_count != 1) return false;
+    if (row_count != rows) return false;
+    const batch_rows: u32 = @intCast(rows);
 
     const fused_kernel = self.gaffine_u8_matvec_gate_up_silu_function orelse return false;
     try compute.cuda.gaffine_u8_matvec_gate_up_silu.runWithFunction(
@@ -1445,10 +1451,10 @@ pub fn tryFusedGaffineU8GateUpSiluForward(
         up.group_size,
         up.scales_dtype_tag,
         @intCast(gate.rows),
-        1,
+        batch_rows,
     );
     return true;
-    }
+}
 
 pub fn tryFusedGaffineU4GateUpSiluForward(
     self: anytype,
@@ -1457,9 +1463,9 @@ pub fn tryFusedGaffineU4GateUpSiluForward(
     up_weight: *const LinearWeight,
     rows: usize,
     expected_out_dim: u32,
-    ) !bool {
+) !bool {
     if (self.loaded.config.use_gelu) return false;
-    if (rows != 1) return false;
+    if (rows == 0 or rows > 32) return false;
 
     const gate = switch (gate_weight.*) {
         .gaffine_u4 => |w| w,
@@ -1471,9 +1477,6 @@ pub fn tryFusedGaffineU4GateUpSiluForward(
     };
     if (!canFuseGaffineGateUpWeights(self.d_model, gate, up)) return false;
     if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
-
-    const row_count = bufferF32RowCount(input, gate.rows) catch return false;
-    if (row_count != 1) return false;
 
     const fused_kernel = self.gaffine_u4_matvec_gate_up_silu_function orelse return false;
     try compute.cuda.gaffine_u4_matvec_gate_up_silu.runWithFunction(
@@ -1494,27 +1497,30 @@ pub fn tryFusedGaffineU4GateUpSiluForward(
         up.group_size,
         up.scales_dtype_tag,
         @intCast(gate.rows),
-        1,
+        @intCast(rows),
     );
     return true;
-    }
+}
 
 pub fn tryFusedGateUpForward(
     self: anytype,
     input: *const compute.cuda.Buffer,
     gate_weight: *const LinearWeight,
     up_weight: *const LinearWeight,
-    ) !bool {
-    if (try tryFusedDenseU16GateUpForward(self, input, gate_weight, up_weight)) return true;
-    return tryFusedGaffineU8GateUpForward(self, input, gate_weight, up_weight);
-    }
+    rows: usize,
+) !bool {
+    if (try tryFusedDenseU16GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
+    return tryFusedGaffineU8GateUpForward(self, input, gate_weight, up_weight, rows);
+}
 
 pub fn tryFusedGaffineU8GateUpForward(
     self: anytype,
     input: *const compute.cuda.Buffer,
     gate_weight: *const LinearWeight,
     up_weight: *const LinearWeight,
-    ) !bool {
+    rows: usize,
+) !bool {
+    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
     const gate = switch (gate_weight.*) {
         .gaffine_u8 => |w| w,
         else => return false,
@@ -1524,8 +1530,9 @@ pub fn tryFusedGaffineU8GateUpForward(
         else => return false,
     };
     if (!canFuseGaffineGateUpWeights(self.d_model, gate, up)) return false;
-    const rows = bufferF32RowCount(input, gate.rows) catch return false;
-    if (rows != 1) return false;
+    const row_count = bufferF32RowCount(input, gate.rows) catch return false;
+    if (row_count != rows) return false;
+    const batch_rows: u32 = @intCast(rows);
 
     const fused_kernel = self.gaffine_u8_matvec_gate_up_function orelse return false;
     try compute.cuda.gaffine_u8_matvec_gate_up.runWithFunction(
@@ -1548,17 +1555,18 @@ pub fn tryFusedGaffineU8GateUpForward(
         up.group_size,
         up.scales_dtype_tag,
         @intCast(gate.rows),
-        1,
+        batch_rows,
     );
     return true;
-    }
+}
 
 pub fn tryFusedDenseU16GateUpForward(
     self: anytype,
     input: *const compute.cuda.Buffer,
     gate_weight: *const LinearWeight,
     up_weight: *const LinearWeight,
-    ) !bool {
+    rows: usize,
+) !bool {
     const gate = switch (gate_weight.*) {
         .dense_u16 => |w| w,
         else => return false,
@@ -1575,8 +1583,8 @@ pub fn tryFusedDenseU16GateUpForward(
     {
         return false;
     }
-    const rows = bufferF32RowCount(input, gate.rows) catch return false;
-    if (rows != 1) return false;
+    const row_count = bufferF32RowCount(input, gate.rows) catch return false;
+    if (row_count != rows or rows != 1) return false;
 
     const fused_kernel = switch (gate.dtype) {
         .f16 => self.matvec_gate_up_f16_function orelse return false,
@@ -1596,7 +1604,7 @@ pub fn tryFusedDenseU16GateUpForward(
         @intCast(gate.rows),
     );
     return true;
-    }
+}
 
 pub fn tryFusedDenseU16GateUpSiluForward(
     self: anytype,
@@ -1605,9 +1613,9 @@ pub fn tryFusedDenseU16GateUpSiluForward(
     up_weight: *const LinearWeight,
     rows: usize,
     expected_out_dim: u32,
-    ) !bool {
+) !bool {
     if (self.loaded.config.use_gelu) return false;
-    if (rows != 1) return false;
+    if (rows == 0 or rows > 32) return false;
 
     const gate = switch (gate_weight.*) {
         .dense_u16 => |w| w,
@@ -1623,14 +1631,11 @@ pub fn tryFusedDenseU16GateUpSiluForward(
     if (gate.cols != expected_out_dim) return false;
     if (gate.cols > std.math.maxInt(u32) or gate.rows > std.math.maxInt(u32)) return false;
 
-    const row_count = bufferF32RowCount(input, gate.rows) catch return false;
-    if (row_count != 1) return false;
-
     const fused_kernel = switch (gate.dtype) {
         .f16 => self.matvec_gate_up_silu_f16_function orelse return false,
         .bf16 => self.matvec_gate_up_silu_bf16_function orelse return false,
     };
-    try compute.cuda.matvec_u16_gate_up_silu.runWithFunction(
+    try compute.cuda.matvec_u16_gate_up_silu.runWithFunctionGridBatch(
         &self.kernel_arg_pack,
         &self.device,
         fused_kernel,
@@ -1640,6 +1645,7 @@ pub fn tryFusedDenseU16GateUpSiluForward(
         &self.runtime_buffers.ffn_mul_dev,
         @intCast(gate.cols),
         @intCast(gate.rows),
+        @intCast(rows),
     );
     return true;
-    }
+}

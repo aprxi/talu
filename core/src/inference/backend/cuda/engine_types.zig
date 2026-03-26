@@ -259,12 +259,14 @@ pub const KernelSlot = enum {
     embedding_lookup_gaffine_u4,
     kv_write_f16,
     kv_write_f16_rows,
+    kv_write_f16_rows_ptrs,
     rmsnorm,
     rope,
     rope_store_f16,
     attn_scores_heads_f32,
     attn_scores_heads_f16_kv,
     attn_fused_heads_f16_kv,
+    attn_fused_decode_heads_f16_kv_ptrs,
     attn_fused_prefill_heads_f16_kv,
     attn_fused_prefill_heads_f16_kv_gqa,
     causal_attn_softmax_f32,
@@ -280,9 +282,12 @@ pub const KernelSlot = enum {
     gated_delta_conv,
     gated_delta_conv_silu,
     gated_delta_conv_silu_rows,
+    gated_delta_conv_silu_rows_ptrs,
+    gated_delta_advance_ring_heads,
     gated_delta_qk_norm,
     gated_delta_ssm,
     gated_delta_ssm_rows,
+    gated_delta_ssm_rows_ptrs,
     gated_delta_rmsnorm_silu_mul,
     gated_delta_rmsnorm_silu_mul_rows,
     argmax,
@@ -306,6 +311,10 @@ pub const KernelSlot = enum {
     gaffine_u8_matvec_gate_up_silu,
     gaffine_u4_dequant_f16,
     gaffine_u8_dequant_f16,
+    rope_rows_ptrs,
+    attn_scores_heads_f16_kv_ptrs,
+    softmax_rows_dynamic_cols_ptrs,
+    attn_weighted_sum_heads_f16_kv_ptrs,
 };
 
 pub const RequiredKernel = struct {
@@ -369,12 +378,14 @@ pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .embedding_lookup_gaffine_u4, .op_name = compute.cuda.embedding_lookup_gaffine_u4.op_name, .embedded_symbol = compute.cuda.embedding_lookup_gaffine_u4.embedded_symbol },
     .{ .slot = .kv_write_f16, .op_name = compute.cuda.kv_write_f16.op_name, .embedded_symbol = compute.cuda.kv_write_f16.embedded_symbol },
     .{ .slot = .kv_write_f16_rows, .op_name = compute.cuda.kv_write_f16_rows.op_name, .embedded_symbol = compute.cuda.kv_write_f16_rows.embedded_symbol },
+    .{ .slot = .kv_write_f16_rows_ptrs, .op_name = compute.cuda.kv_write_f16_rows_ptrs.op_name, .embedded_symbol = compute.cuda.kv_write_f16_rows_ptrs.embedded_symbol },
     .{ .slot = .rmsnorm, .op_name = compute.cuda.rmsnorm.op_name, .embedded_symbol = compute.cuda.rmsnorm.embedded_symbol },
     .{ .slot = .rope, .op_name = compute.cuda.rope.op_name, .embedded_symbol = compute.cuda.rope.embedded_symbol },
     .{ .slot = .rope_store_f16, .op_name = compute.cuda.rope_store_f16.op_name, .embedded_symbol = compute.cuda.rope_store_f16.embedded_symbol },
     .{ .slot = .attn_scores_heads_f32, .op_name = compute.cuda.attn_scores_heads_f32.op_name, .embedded_symbol = compute.cuda.attn_scores_heads_f32.embedded_symbol },
     .{ .slot = .attn_scores_heads_f16_kv, .op_name = compute.cuda.attn_scores_heads_f16_kv.op_name, .embedded_symbol = compute.cuda.attn_scores_heads_f16_kv.embedded_symbol },
     .{ .slot = .attn_fused_heads_f16_kv, .op_name = compute.cuda.attn_fused_heads_f16_kv.op_name, .embedded_symbol = compute.cuda.attn_fused_heads_f16_kv.embedded_symbol },
+    .{ .slot = .attn_fused_decode_heads_f16_kv_ptrs, .op_name = compute.cuda.attn_fused_decode_heads_f16_kv_ptrs.op_name, .embedded_symbol = compute.cuda.attn_fused_decode_heads_f16_kv_ptrs.embedded_symbol },
     .{ .slot = .attn_fused_prefill_heads_f16_kv, .op_name = compute.cuda.attn_fused_prefill_heads_f16_kv.op_name, .embedded_symbol = compute.cuda.attn_fused_prefill_heads_f16_kv.embedded_symbol },
     .{ .slot = .attn_fused_prefill_heads_f16_kv_gqa, .op_name = compute.cuda.attn_fused_prefill_heads_f16_kv_gqa.op_name, .embedded_symbol = compute.cuda.attn_fused_prefill_heads_f16_kv_gqa.embedded_symbol },
     .{ .slot = .causal_attn_softmax_f32, .op_name = compute.cuda.causal_attn_softmax_f32.op_name, .embedded_symbol = compute.cuda.causal_attn_softmax_f32.embedded_symbol },
@@ -390,9 +401,12 @@ pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .gated_delta_conv, .op_name = compute.cuda.gated_delta_conv.op_name, .embedded_symbol = compute.cuda.gated_delta_conv.embedded_symbol },
     .{ .slot = .gated_delta_conv_silu, .op_name = compute.cuda.gated_delta_conv_silu.op_name, .embedded_symbol = compute.cuda.gated_delta_conv_silu.embedded_symbol },
     .{ .slot = .gated_delta_conv_silu_rows, .op_name = compute.cuda.gated_delta_conv_silu_rows.op_name, .embedded_symbol = compute.cuda.gated_delta_conv_silu_rows.embedded_symbol },
+    .{ .slot = .gated_delta_conv_silu_rows_ptrs, .op_name = compute.cuda.gated_delta_conv_silu_rows_ptrs.op_name, .embedded_symbol = compute.cuda.gated_delta_conv_silu_rows_ptrs.embedded_symbol },
+    .{ .slot = .gated_delta_advance_ring_heads, .op_name = compute.cuda.gated_delta_conv_silu_rows_ptrs.op_name_advance, .embedded_symbol = compute.cuda.gated_delta_conv_silu_rows_ptrs.embedded_symbol_advance },
     .{ .slot = .gated_delta_qk_norm, .op_name = compute.cuda.gated_delta_qk_norm.op_name, .embedded_symbol = compute.cuda.gated_delta_qk_norm.embedded_symbol },
     .{ .slot = .gated_delta_ssm, .op_name = compute.cuda.gated_delta_ssm.op_name, .embedded_symbol = compute.cuda.gated_delta_ssm.embedded_symbol },
     .{ .slot = .gated_delta_ssm_rows, .op_name = compute.cuda.gated_delta_ssm_rows.op_name, .embedded_symbol = compute.cuda.gated_delta_ssm_rows.embedded_symbol },
+    .{ .slot = .gated_delta_ssm_rows_ptrs, .op_name = compute.cuda.gated_delta_ssm_rows_ptrs.op_name, .embedded_symbol = compute.cuda.gated_delta_ssm_rows_ptrs.embedded_symbol },
     .{ .slot = .gated_delta_rmsnorm_silu_mul, .op_name = compute.cuda.gated_delta_rmsnorm_silu_mul.op_name, .embedded_symbol = compute.cuda.gated_delta_rmsnorm_silu_mul.embedded_symbol },
     .{ .slot = .gated_delta_rmsnorm_silu_mul_rows, .op_name = compute.cuda.gated_delta_rmsnorm_silu_mul_rows.op_name, .embedded_symbol = compute.cuda.gated_delta_rmsnorm_silu_mul_rows.embedded_symbol },
     .{ .slot = .argmax, .op_name = compute.cuda.argmax.op_name, .embedded_symbol = compute.cuda.argmax.embedded_symbol },
@@ -416,6 +430,10 @@ pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .gaffine_u8_matvec_gate_up_silu, .op_name = compute.cuda.gaffine_u8_matvec_gate_up_silu.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec_gate_up_silu.embedded_symbol },
     .{ .slot = .gaffine_u4_dequant_f16, .op_name = compute.cuda.gaffine_u4_dequantize_f16.op_name, .embedded_symbol = compute.cuda.gaffine_u4_dequantize_f16.embedded_symbol },
     .{ .slot = .gaffine_u8_dequant_f16, .op_name = compute.cuda.gaffine_u8_dequantize_f16.op_name, .embedded_symbol = compute.cuda.gaffine_u8_dequantize_f16.embedded_symbol },
+    .{ .slot = .rope_rows_ptrs, .op_name = compute.cuda.rope_rows_ptrs.op_name, .embedded_symbol = compute.cuda.rope_rows_ptrs.embedded_symbol },
+    .{ .slot = .attn_scores_heads_f16_kv_ptrs, .op_name = compute.cuda.attn_scores_heads_f16_kv_ptrs.op_name, .embedded_symbol = compute.cuda.attn_scores_heads_f16_kv_ptrs.embedded_symbol },
+    .{ .slot = .softmax_rows_dynamic_cols_ptrs, .op_name = compute.cuda.softmax_rows_dynamic_cols_ptrs.op_name, .embedded_symbol = compute.cuda.softmax_rows_dynamic_cols_ptrs.embedded_symbol },
+    .{ .slot = .attn_weighted_sum_heads_f16_kv_ptrs, .op_name = compute.cuda.attn_weighted_sum_heads_f16_kv_ptrs.op_name, .embedded_symbol = compute.cuda.attn_weighted_sum_heads_f16_kv_ptrs.embedded_symbol },
 };
 
 pub const DeviceTensor = struct {
@@ -565,6 +583,7 @@ pub const RuntimeBuffers = struct {
     embedding_lookup: ?EmbeddingLookup,
     hidden_host: []f32,
     projected_logits_host: []f32,
+    projected_logits_batch_host: []f32,
     prefill_tokens_dev: compute.cuda.Buffer,
     input_dev: compute.cuda.Buffer,
     norm_weight_dev: compute.cuda.Buffer,
@@ -575,6 +594,24 @@ pub const RuntimeBuffers = struct {
     attn_k_dev: compute.cuda.Buffer,
     attn_v_dev: compute.cuda.Buffer,
     attn_context_dev: compute.cuda.Buffer,
+    decode_key_cache_ptrs_host: []u64,
+    decode_value_cache_ptrs_host: []u64,
+    decode_attn_key_cache_ptrs_table_host: []u64,
+    decode_attn_value_cache_ptrs_table_host: []u64,
+    decode_seq_lens_host: []u32,
+    decode_positions_host: []u32,
+    decode_gd_conv_state_ptrs_table_host: []u64,
+    decode_gd_ssm_state_ptrs_table_host: []u64,
+    decode_gd_conv_ring_heads_table_host: []u32,
+    decode_key_cache_ptrs_dev: compute.cuda.Buffer,
+    decode_value_cache_ptrs_dev: compute.cuda.Buffer,
+    decode_attn_key_cache_ptrs_table_dev: compute.cuda.Buffer,
+    decode_attn_value_cache_ptrs_table_dev: compute.cuda.Buffer,
+    decode_seq_lens_dev: compute.cuda.Buffer,
+    decode_positions_dev: compute.cuda.Buffer,
+    decode_gd_conv_state_ptrs_table_dev: compute.cuda.Buffer,
+    decode_gd_ssm_state_ptrs_table_dev: compute.cuda.Buffer,
+    decode_gd_conv_ring_heads_table_dev: compute.cuda.Buffer,
     attn_scores_dev: ?compute.cuda.Buffer,
     attn_probs_dev: ?compute.cuda.Buffer,
     attn_out_dev: compute.cuda.Buffer,
@@ -589,7 +626,11 @@ pub const RuntimeBuffers = struct {
     gdelta_ssm_dev: compute.cuda.Buffer,
     projection_weight: LinearWeight,
     logits_dev: compute.cuda.Buffer,
-    topk_logits_dev: compute.cuda.Buffer,
+    topk_values_dev: compute.cuda.Buffer,
+    topk_ids_dev: compute.cuda.Buffer,
+    batched_attn_scores_dev: compute.cuda.Buffer,
+    batched_attn_probs_dev: compute.cuda.Buffer,
+    batched_attn_max_seq_len: u32,
     dequant_f16_dev: compute.cuda.Buffer,
 
     pub fn init(
@@ -604,6 +645,9 @@ pub const RuntimeBuffers = struct {
         max_seq_len: usize,
         n_heads: usize,
         head_dim: usize,
+        max_batch_size: usize,
+        max_attn_layers: usize,
+        max_gd_layers: usize,
     ) !RuntimeBuffers {
         const d_model: usize = @intCast(loaded.config.d_model);
         const vocab_size: usize = @intCast(loaded.config.vocab_size);
@@ -611,6 +655,9 @@ pub const RuntimeBuffers = struct {
         if (max_dff == 0) return error.InvalidArgument;
         if (max_attn == 0) return error.InvalidArgument;
         if (max_kv == 0 or max_gdelta_proj == 0 or max_seq_len == 0 or head_dim == 0) return error.InvalidArgument;
+        if (max_batch_size == 0) return error.InvalidArgument;
+        if (max_attn_layers == 0) return error.InvalidArgument;
+        if (max_gd_layers == 0) return error.InvalidArgument;
 
         const d_model_bytes = std.math.mul(usize, d_model, @sizeOf(f32)) catch return error.InvalidArgument;
         const d_ff_bytes = std.math.mul(usize, max_dff, @sizeOf(f32)) catch return error.InvalidArgument;
@@ -675,7 +722,38 @@ pub const RuntimeBuffers = struct {
         const projected_vocab = projection_weight.cols();
         const projected_logits_host = try allocator.alloc(f32, projected_vocab);
         errdefer allocator.free(projected_logits_host);
-        const logits_bytes = std.math.mul(usize, projected_vocab, @sizeOf(f32)) catch return error.InvalidArgument;
+        const projected_logits_batch_count = std.math.mul(usize, projected_vocab, max_batch_size) catch return error.InvalidArgument;
+        const projected_logits_batch_host = try allocator.alloc(f32, projected_logits_batch_count);
+        errdefer allocator.free(projected_logits_batch_host);
+        const decode_key_cache_ptrs_host = try allocator.alloc(u64, max_batch_size);
+        errdefer allocator.free(decode_key_cache_ptrs_host);
+        const decode_value_cache_ptrs_host = try allocator.alloc(u64, max_batch_size);
+        errdefer allocator.free(decode_value_cache_ptrs_host);
+        const decode_attn_table_count = std.math.mul(usize, max_batch_size, max_attn_layers) catch return error.InvalidArgument;
+        const decode_gd_table_count = std.math.mul(usize, max_batch_size, max_gd_layers) catch return error.InvalidArgument;
+        const decode_attn_key_cache_ptrs_table_host = try allocator.alloc(u64, decode_attn_table_count);
+        errdefer allocator.free(decode_attn_key_cache_ptrs_table_host);
+        const decode_attn_value_cache_ptrs_table_host = try allocator.alloc(u64, decode_attn_table_count);
+        errdefer allocator.free(decode_attn_value_cache_ptrs_table_host);
+        const decode_seq_lens_host = try allocator.alloc(u32, max_batch_size);
+        errdefer allocator.free(decode_seq_lens_host);
+        const decode_positions_host = try allocator.alloc(u32, max_batch_size);
+        errdefer allocator.free(decode_positions_host);
+        const decode_gd_conv_state_ptrs_table_host = try allocator.alloc(u64, decode_gd_table_count);
+        errdefer allocator.free(decode_gd_conv_state_ptrs_table_host);
+        const decode_gd_ssm_state_ptrs_table_host = try allocator.alloc(u64, decode_gd_table_count);
+        errdefer allocator.free(decode_gd_ssm_state_ptrs_table_host);
+        const decode_gd_conv_ring_heads_table_host = try allocator.alloc(u32, decode_gd_table_count);
+        errdefer allocator.free(decode_gd_conv_ring_heads_table_host);
+        const logits_bytes = std.math.mul(usize, projected_logits_batch_count, @sizeOf(f32)) catch return error.InvalidArgument;
+        const topk_buffer_count = std.math.mul(usize, max_batch_size, 256) catch return error.InvalidArgument;
+        const topk_values_bytes = std.math.mul(usize, topk_buffer_count, @sizeOf(f32)) catch return error.InvalidArgument;
+        const topk_ids_bytes = std.math.mul(usize, topk_buffer_count, @sizeOf(u32)) catch return error.InvalidArgument;
+        const decode_ptrs_bytes = std.math.mul(usize, max_batch_size, @sizeOf(u64)) catch return error.InvalidArgument;
+        const decode_attn_table_ptrs_bytes = std.math.mul(usize, decode_attn_table_count, @sizeOf(u64)) catch return error.InvalidArgument;
+        const decode_gd_table_ptrs_bytes = std.math.mul(usize, decode_gd_table_count, @sizeOf(u64)) catch return error.InvalidArgument;
+        const decode_gd_table_idx_bytes = std.math.mul(usize, decode_gd_table_count, @sizeOf(u32)) catch return error.InvalidArgument;
+        const decode_idx_bytes = std.math.mul(usize, max_batch_size, @sizeOf(u32)) catch return error.InvalidArgument;
         const using_model_embeddings = canUseModelEmbeddings(loaded, d_model);
         if (!using_model_embeddings) {
             log.warn("inference", "CUDA token embeddings unsupported", .{
@@ -711,6 +789,24 @@ pub const RuntimeBuffers = struct {
         errdefer attn_v_dev.deinit(device);
         var attn_context_dev = try device.allocBuffer(d_attn_bytes);
         errdefer attn_context_dev.deinit(device);
+        var decode_key_cache_ptrs_dev = try device.allocBuffer(decode_ptrs_bytes);
+        errdefer decode_key_cache_ptrs_dev.deinit(device);
+        var decode_value_cache_ptrs_dev = try device.allocBuffer(decode_ptrs_bytes);
+        errdefer decode_value_cache_ptrs_dev.deinit(device);
+        var decode_attn_key_cache_ptrs_table_dev = try device.allocBuffer(decode_attn_table_ptrs_bytes);
+        errdefer decode_attn_key_cache_ptrs_table_dev.deinit(device);
+        var decode_attn_value_cache_ptrs_table_dev = try device.allocBuffer(decode_attn_table_ptrs_bytes);
+        errdefer decode_attn_value_cache_ptrs_table_dev.deinit(device);
+        var decode_seq_lens_dev = try device.allocBuffer(decode_idx_bytes);
+        errdefer decode_seq_lens_dev.deinit(device);
+        var decode_positions_dev = try device.allocBuffer(decode_idx_bytes);
+        errdefer decode_positions_dev.deinit(device);
+        var decode_gd_conv_state_ptrs_table_dev = try device.allocBuffer(decode_gd_table_ptrs_bytes);
+        errdefer decode_gd_conv_state_ptrs_table_dev.deinit(device);
+        var decode_gd_ssm_state_ptrs_table_dev = try device.allocBuffer(decode_gd_table_ptrs_bytes);
+        errdefer decode_gd_ssm_state_ptrs_table_dev.deinit(device);
+        var decode_gd_conv_ring_heads_table_dev = try device.allocBuffer(decode_gd_table_idx_bytes);
+        errdefer decode_gd_conv_ring_heads_table_dev.deinit(device);
         var attn_scores_dev: ?compute.cuda.Buffer = null;
         errdefer if (attn_scores_dev) |*buf| buf.deinit(device);
         var attn_probs_dev: ?compute.cuda.Buffer = null;
@@ -741,8 +837,18 @@ pub const RuntimeBuffers = struct {
         errdefer gdelta_ssm_dev.deinit(device);
         var logits_dev = try device.allocBuffer(logits_bytes);
         errdefer logits_dev.deinit(device);
-        var topk_logits_dev = try device.allocBuffer(logits_bytes);
-        errdefer topk_logits_dev.deinit(device);
+        var topk_values_dev = try device.allocBuffer(topk_values_bytes);
+        errdefer topk_values_dev.deinit(device);
+        var topk_ids_dev = try device.allocBuffer(topk_ids_bytes);
+        errdefer topk_ids_dev.deinit(device);
+        // Batched attention scores/probs buffers: [max_batch_size * n_heads * max_seq_len].
+        const batched_attn_max_seq_len: u32 = @intCast(max_seq_len);
+        const batched_attn_elems = std.math.mul(usize, max_batch_size * n_heads, max_seq_len) catch return error.InvalidArgument;
+        const batched_attn_bytes = std.math.mul(usize, batched_attn_elems, @sizeOf(f32)) catch return error.InvalidArgument;
+        var batched_attn_scores_dev = try device.allocBuffer(batched_attn_bytes);
+        errdefer batched_attn_scores_dev.deinit(device);
+        var batched_attn_probs_dev = try device.allocBuffer(batched_attn_bytes);
+        errdefer batched_attn_probs_dev.deinit(device);
         const max_dequant_dim = @max(@max(max_dff, max_attn), @max(max_kv, max_gdelta_proj));
         const dequant_f16_bytes = std.math.mul(usize, std.math.mul(usize, d_model, max_dequant_dim) catch return error.InvalidArgument, @sizeOf(u16)) catch return error.InvalidArgument;
         var dequant_f16_dev = try device.allocBuffer(dequant_f16_bytes);
@@ -767,6 +873,7 @@ pub const RuntimeBuffers = struct {
             .embedding_lookup = embedding_lookup,
             .hidden_host = hidden_host,
             .projected_logits_host = projected_logits_host,
+            .projected_logits_batch_host = projected_logits_batch_host,
             .prefill_tokens_dev = prefill_tokens_dev,
             .input_dev = input_dev,
             .norm_weight_dev = norm_weight_dev,
@@ -777,6 +884,24 @@ pub const RuntimeBuffers = struct {
             .attn_k_dev = attn_k_dev,
             .attn_v_dev = attn_v_dev,
             .attn_context_dev = attn_context_dev,
+            .decode_key_cache_ptrs_host = decode_key_cache_ptrs_host,
+            .decode_value_cache_ptrs_host = decode_value_cache_ptrs_host,
+            .decode_attn_key_cache_ptrs_table_host = decode_attn_key_cache_ptrs_table_host,
+            .decode_attn_value_cache_ptrs_table_host = decode_attn_value_cache_ptrs_table_host,
+            .decode_seq_lens_host = decode_seq_lens_host,
+            .decode_positions_host = decode_positions_host,
+            .decode_gd_conv_state_ptrs_table_host = decode_gd_conv_state_ptrs_table_host,
+            .decode_gd_ssm_state_ptrs_table_host = decode_gd_ssm_state_ptrs_table_host,
+            .decode_gd_conv_ring_heads_table_host = decode_gd_conv_ring_heads_table_host,
+            .decode_key_cache_ptrs_dev = decode_key_cache_ptrs_dev,
+            .decode_value_cache_ptrs_dev = decode_value_cache_ptrs_dev,
+            .decode_attn_key_cache_ptrs_table_dev = decode_attn_key_cache_ptrs_table_dev,
+            .decode_attn_value_cache_ptrs_table_dev = decode_attn_value_cache_ptrs_table_dev,
+            .decode_seq_lens_dev = decode_seq_lens_dev,
+            .decode_positions_dev = decode_positions_dev,
+            .decode_gd_conv_state_ptrs_table_dev = decode_gd_conv_state_ptrs_table_dev,
+            .decode_gd_ssm_state_ptrs_table_dev = decode_gd_ssm_state_ptrs_table_dev,
+            .decode_gd_conv_ring_heads_table_dev = decode_gd_conv_ring_heads_table_dev,
             .attn_scores_dev = attn_scores_dev,
             .attn_probs_dev = attn_probs_dev,
             .attn_out_dev = attn_out_dev,
@@ -791,14 +916,21 @@ pub const RuntimeBuffers = struct {
             .gdelta_ssm_dev = gdelta_ssm_dev,
             .projection_weight = projection_weight,
             .logits_dev = logits_dev,
-            .topk_logits_dev = topk_logits_dev,
+            .topk_values_dev = topk_values_dev,
+            .topk_ids_dev = topk_ids_dev,
+            .batched_attn_scores_dev = batched_attn_scores_dev,
+            .batched_attn_probs_dev = batched_attn_probs_dev,
+            .batched_attn_max_seq_len = batched_attn_max_seq_len,
             .dequant_f16_dev = dequant_f16_dev,
         };
     }
 
     pub fn deinit(self: *RuntimeBuffers, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
         self.dequant_f16_dev.deinit(device);
-        self.topk_logits_dev.deinit(device);
+        self.batched_attn_probs_dev.deinit(device);
+        self.batched_attn_scores_dev.deinit(device);
+        self.topk_ids_dev.deinit(device);
+        self.topk_values_dev.deinit(device);
         self.logits_dev.deinit(device);
         self.projection_weight.deinit(device);
         if (self.embedding_lookup) |*lookup| lookup.deinit(device);
@@ -814,6 +946,15 @@ pub const RuntimeBuffers = struct {
         if (self.attn_probs_dev) |*buf| buf.deinit(device);
         if (self.attn_scores_dev) |*buf| buf.deinit(device);
         self.attn_context_dev.deinit(device);
+        self.decode_positions_dev.deinit(device);
+        self.decode_seq_lens_dev.deinit(device);
+        self.decode_gd_conv_ring_heads_table_dev.deinit(device);
+        self.decode_gd_ssm_state_ptrs_table_dev.deinit(device);
+        self.decode_gd_conv_state_ptrs_table_dev.deinit(device);
+        self.decode_attn_value_cache_ptrs_table_dev.deinit(device);
+        self.decode_attn_key_cache_ptrs_table_dev.deinit(device);
+        self.decode_value_cache_ptrs_dev.deinit(device);
+        self.decode_key_cache_ptrs_dev.deinit(device);
         self.attn_v_dev.deinit(device);
         self.attn_k_dev.deinit(device);
         self.query_gate_proj_dev.deinit(device);
@@ -824,8 +965,18 @@ pub const RuntimeBuffers = struct {
         self.input_dev.deinit(device);
         self.deepstack_add_dev.deinit(device);
         self.prefill_tokens_dev.deinit(device);
+        allocator.free(self.projected_logits_batch_host);
         allocator.free(self.projected_logits_host);
         allocator.free(self.hidden_host);
+        allocator.free(self.decode_gd_conv_ring_heads_table_host);
+        allocator.free(self.decode_gd_ssm_state_ptrs_table_host);
+        allocator.free(self.decode_gd_conv_state_ptrs_table_host);
+        allocator.free(self.decode_positions_host);
+        allocator.free(self.decode_seq_lens_host);
+        allocator.free(self.decode_attn_value_cache_ptrs_table_host);
+        allocator.free(self.decode_attn_key_cache_ptrs_table_host);
+        allocator.free(self.decode_value_cache_ptrs_host);
+        allocator.free(self.decode_key_cache_ptrs_host);
     }
 
     pub fn deviceByteSize(self: *const RuntimeBuffers) usize {
@@ -839,6 +990,15 @@ pub const RuntimeBuffers = struct {
             self.attn_k_dev.size +
             self.attn_v_dev.size +
             self.attn_context_dev.size +
+            self.decode_key_cache_ptrs_dev.size +
+            self.decode_value_cache_ptrs_dev.size +
+            self.decode_attn_key_cache_ptrs_table_dev.size +
+            self.decode_attn_value_cache_ptrs_table_dev.size +
+            self.decode_seq_lens_dev.size +
+            self.decode_positions_dev.size +
+            self.decode_gd_conv_state_ptrs_table_dev.size +
+            self.decode_gd_ssm_state_ptrs_table_dev.size +
+            self.decode_gd_conv_ring_heads_table_dev.size +
             (if (self.attn_scores_dev) |buf| buf.size else 0) +
             (if (self.attn_probs_dev) |buf| buf.size else 0) +
             self.attn_out_dev.size +
@@ -851,7 +1011,10 @@ pub const RuntimeBuffers = struct {
             self.shortconv_conv_dev.size +
             self.gdelta_proj_dev.size +
             self.gdelta_ssm_dev.size +
-            self.topk_logits_dev.size +
+            self.topk_values_dev.size +
+            self.topk_ids_dev.size +
+            self.batched_attn_scores_dev.size +
+            self.batched_attn_probs_dev.size +
             self.dequant_f16_dev.size +
             self.logits_dev.size +
             (if (self.embedding_lookup) |lookup| lookup.byteSize() else 0) +
@@ -2862,8 +3025,14 @@ pub const BatchDecodeInfo = struct {
     slot_indices: []const usize,
     positions: []const usize,
     seq_lens: []const u32,
+    attn_ptrs_row_stride: usize,
+    attn_key_cache_ptrs_table_dev: *const compute.cuda.Buffer,
+    attn_value_cache_ptrs_table_dev: *const compute.cuda.Buffer,
+    gd_ptrs_row_stride: usize,
+    gd_conv_state_ptrs_table_dev: *const compute.cuda.Buffer,
+    gd_ssm_state_ptrs_table_dev: *const compute.cuda.Buffer,
+    gd_conv_ring_heads_table_dev: *const compute.cuda.Buffer,
     attn_layer_index: usize,
     gd_layer_index: usize,
     sc_layer_index: usize,
 };
-

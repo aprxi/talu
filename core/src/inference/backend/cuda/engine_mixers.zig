@@ -48,7 +48,6 @@ const engine_weights = @import("engine_weights.zig");
 const bufferSlice = engine_weights.bufferSlice;
 const resizeScratchBuffer = engine_weights.resizeScratchBuffer;
 
-
 pub fn runAttentionMixerStep(
     self: anytype,
     cfg: *const LayerAttentionExecConfig,
@@ -116,7 +115,8 @@ pub fn runAttentionMixerStep(
         return err;
     };
     if (cfg.query_gate) {
-        engine_ops.compactQueryGateProjection(self, 
+        engine_ops.compactQueryGateProjection(
+            self,
             stage_rows,
             cfg.q_dim,
             cfg.q_projection_dim,
@@ -440,7 +440,8 @@ pub fn runAttentionMixerStep(
         return err;
     };
     if (cfg.query_gate) {
-        engine_ops.applyQueryGateToContextInPlace(self, 
+        engine_ops.applyQueryGateToContextInPlace(
+            self,
             stage_rows,
             cfg.q_dim,
             cfg.q_projection_dim,
@@ -544,163 +545,323 @@ pub fn runBatchedDecodeAttentionMixer(
         );
     }
 
-    // Step 3: Per-row RoPE, KV write, and attention.
+    // Step 3: Per-row RoPE + KV write, then decode attention.
     const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
     const kv_row_bytes = cfg.kv_dim * kv_elem_bytes;
     const kv_groups: u32 = @intCast(self.n_heads / self.n_kv_heads);
     const kv_dim_u32: u32 = @intCast(cfg.kv_dim);
     const use_k_write_fused = kv_cache_dtype_fp16 and
         (ctx.kv_write_f16_function != null or ctx.rope_store_f16_function != null);
+    const use_batched_kv_write_f16 = kv_cache_dtype_fp16 and
+        (ctx.kv_write_f16_function != null) and
+        (self.kv_write_f16_rows_ptrs_function != null);
+    const use_batched_fused_decode_attention = kv_cache_dtype_fp16 and
+        (self.attn_fused_decode_heads_f16_kv_ptrs_function != null);
+    const use_batched_separate_decode_attention = kv_cache_dtype_fp16 and
+        (self.rope_rows_ptrs_function != null) and
+        (self.attn_scores_heads_f16_kv_ptrs_function != null) and
+        (self.softmax_rows_dynamic_cols_ptrs_function != null) and
+        (self.attn_weighted_sum_heads_f16_kv_ptrs_function != null);
+    const sliding_window_u32: u32 = if (cfg.is_causal and cfg.sliding_window > 0)
+        (std.math.cast(u32, cfg.sliding_window) orelse std.math.maxInt(u32))
+    else
+        0;
+    const ptr_bytes = std.math.mul(usize, n, @sizeOf(u64)) catch return error.InvalidArgument;
+    const idx_bytes = std.math.mul(usize, n, @sizeOf(u32)) catch return error.InvalidArgument;
+    const attn_table_row_offset = std.math.mul(usize, batch.attn_layer_index, batch.attn_ptrs_row_stride) catch return error.InvalidArgument;
+    const attn_table_byte_offset = std.math.mul(usize, attn_table_row_offset, @sizeOf(u64)) catch return error.InvalidArgument;
+    var decode_key_cache_ptrs_dev = try bufferSlice(batch.attn_key_cache_ptrs_table_dev, attn_table_byte_offset, ptr_bytes);
+    var decode_value_cache_ptrs_dev = try bufferSlice(batch.attn_value_cache_ptrs_table_dev, attn_table_byte_offset, ptr_bytes);
+    var decode_positions_dev = try bufferSlice(&self.runtime_buffers.decode_positions_dev, 0, idx_bytes);
+    var decode_seq_lens_dev = try bufferSlice(&self.runtime_buffers.decode_seq_lens_dev, 0, idx_bytes);
 
-    for (0..n) |row_i| {
-        const slot_idx = batch.slot_indices[row_i];
-        const position = batch.positions[row_i];
-        const position_u32: u32 = @intCast(position);
-        const seq_len_u32 = batch.seq_lens[row_i];
+    // Batched separate preferred over fused (matches per-row perf, graph-compatible).
+    const use_batched_decode_attention = use_batched_separate_decode_attention or use_batched_fused_decode_attention;
+    const can_skip_row_decode_prep = use_batched_kv_write_f16 and use_batched_decode_attention;
+    if (!can_skip_row_decode_prep) {
+        for (0..n) |row_i| {
+            const slot_idx = batch.slot_indices[row_i];
+            const position = batch.positions[row_i];
+            const position_u32: u32 = @intCast(position);
+            const seq_len_u32 = batch.seq_lens[row_i];
 
-        // Get per-row Q, K, V slices.
-        var q_row = try logicalF32RowSlice(&attn_q_stage, n, row_i, cfg.q_dim);
-        var k_row_stage = try logicalF32RowSlice(&attn_k_stage, n, row_i, cfg.kv_dim);
-        var v_row_stage = try logicalF32RowSlice(&attn_v_stage, n, row_i, cfg.kv_dim);
-        var context_row = try logicalF32RowSlice(&attn_context_stage, n, row_i, o_proj.rows());
+            // Get per-row Q, K, V slices.
+            var q_row = try logicalF32RowSlice(&attn_q_stage, n, row_i, cfg.q_dim);
+            var k_row_stage = try logicalF32RowSlice(&attn_k_stage, n, row_i, cfg.kv_dim);
+            var v_row_stage = try logicalF32RowSlice(&attn_v_stage, n, row_i, cfg.kv_dim);
+            const use_fused_attention_heads_f16_kv = use_batched_fused_decode_attention or
+                ((!cfg.query_gate) and attention_mod.useFusedHeadsF16Kv(
+                    attention_policy_config,
+                    seq_len_u32,
+                    cfg.sliding_window,
+                    cfg.is_causal,
+                    ctx.head_dim_u32,
+                    ctx.attention_kernels.attn_fused_heads_f16_kv_function != null,
+                ));
 
-        // RoPE on Q (per-row position).
-        const use_fused_attention_heads_f16_kv = (!cfg.query_gate) and attention_mod.useFusedHeadsF16Kv(
-            attention_policy_config,
-            seq_len_u32,
-            cfg.sliding_window,
-            cfg.is_causal,
-            ctx.head_dim_u32,
-            ctx.attention_kernels.attn_fused_heads_f16_kv_function != null,
-        );
-        if (!use_fused_attention_heads_f16_kv) {
-            try compute.cuda.rope.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                ctx.rope_function,
-                &q_row,
-                ctx.n_heads_u32,
-                ctx.head_dim_u32,
-                ctx.rope_dim_u32,
-                position_u32,
-                layer_rope_theta,
-            );
-        }
-
-        // RoPE on K (per-row position).
-        if (!use_k_write_fused) {
-            try compute.cuda.rope.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                ctx.rope_function,
-                &k_row_stage,
-                ctx.n_kv_heads_u32,
-                ctx.head_dim_u32,
-                ctx.rope_dim_u32,
-                position_u32,
-                layer_rope_theta,
-            );
-        }
-
-        // KV cache write for this slot.
-        const kv_entry = self.slot_kv_states[slot_idx].kv[batch.attn_layer_index];
-        const kv_offset = position * kv_row_bytes;
-        var k_cache_row = try bufferSlice(&kv_entry.k, kv_offset, kv_row_bytes);
-        var v_cache_row = try bufferSlice(&kv_entry.v, kv_offset, kv_row_bytes);
-        if (kv_cache_dtype_fp16) {
-            if (ctx.kv_write_f16_function) |kv_write_f16| {
-                try compute.cuda.kv_write_f16.runWithFunction(
+            // RoPE on Q (per-row position).
+            if (!use_fused_attention_heads_f16_kv) {
+                try compute.cuda.rope.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
-                    kv_write_f16,
+                    ctx.rope_function,
+                    &q_row,
+                    ctx.n_heads_u32,
+                    ctx.head_dim_u32,
+                    ctx.rope_dim_u32,
+                    position_u32,
+                    layer_rope_theta,
+                );
+            }
+
+            if (use_batched_kv_write_f16) continue;
+            const kv_entry = self.slot_kv_states[slot_idx].kv[batch.attn_layer_index];
+
+            // RoPE on K (per-row position).
+            if (!use_k_write_fused) {
+                try compute.cuda.rope.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    ctx.rope_function,
                     &k_row_stage,
-                    &v_row_stage,
-                    &k_cache_row,
-                    &v_cache_row,
                     ctx.n_kv_heads_u32,
                     ctx.head_dim_u32,
                     ctx.rope_dim_u32,
                     position_u32,
                     layer_rope_theta,
                 );
-            } else if (ctx.rope_store_f16_function) |rope_store_f16| {
-                try compute.cuda.rope_store_f16.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    rope_store_f16,
-                    &k_row_stage,
-                    &k_cache_row,
-                    ctx.n_kv_heads_u32,
-                    ctx.head_dim_u32,
-                    ctx.rope_dim_u32,
-                    position_u32,
-                    layer_rope_theta,
-                );
-                try compute.cuda.cast_f32_to_f16.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    ctx.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
-                    &v_row_stage,
-                    &v_cache_row,
-                    @intCast(cfg.kv_dim),
-                );
+            }
+
+            // KV cache write for this slot.
+            const kv_offset = position * kv_row_bytes;
+            var k_cache_row = try bufferSlice(&kv_entry.k, kv_offset, kv_row_bytes);
+            var v_cache_row = try bufferSlice(&kv_entry.v, kv_offset, kv_row_bytes);
+            if (kv_cache_dtype_fp16) {
+                if (ctx.kv_write_f16_function) |kv_write_f16| {
+                    try compute.cuda.kv_write_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kv_write_f16,
+                        &k_row_stage,
+                        &v_row_stage,
+                        &k_cache_row,
+                        &v_cache_row,
+                        ctx.n_kv_heads_u32,
+                        ctx.head_dim_u32,
+                        ctx.rope_dim_u32,
+                        position_u32,
+                        layer_rope_theta,
+                    );
+                } else if (ctx.rope_store_f16_function) |rope_store_f16| {
+                    try compute.cuda.rope_store_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        rope_store_f16,
+                        &k_row_stage,
+                        &k_cache_row,
+                        ctx.n_kv_heads_u32,
+                        ctx.head_dim_u32,
+                        ctx.rope_dim_u32,
+                        position_u32,
+                        layer_rope_theta,
+                    );
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        ctx.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                        &v_row_stage,
+                        &v_cache_row,
+                        @intCast(cfg.kv_dim),
+                    );
+                } else {
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        ctx.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                        &k_row_stage,
+                        &k_cache_row,
+                        @intCast(cfg.kv_dim),
+                    );
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        ctx.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                        &v_row_stage,
+                        &v_cache_row,
+                        @intCast(cfg.kv_dim),
+                    );
+                }
             } else {
-                try compute.cuda.cast_f32_to_f16.runWithFunction(
+                try compute.cuda.copy.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
-                    ctx.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                    ctx.copy_function,
                     &k_row_stage,
                     &k_cache_row,
                     @intCast(cfg.kv_dim),
                 );
-                try compute.cuda.cast_f32_to_f16.runWithFunction(
+                try compute.cuda.copy.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
-                    ctx.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                    ctx.copy_function,
                     &v_row_stage,
                     &v_cache_row,
                     @intCast(cfg.kv_dim),
                 );
             }
-        } else {
-            try compute.cuda.copy.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                ctx.copy_function,
-                &k_row_stage,
-                &k_cache_row,
-                @intCast(cfg.kv_dim),
-            );
-            try compute.cuda.copy.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                ctx.copy_function,
-                &v_row_stage,
-                &v_cache_row,
-                @intCast(cfg.kv_dim),
-            );
         }
+    }
 
-        // Attention computation for this row.
-        _ = try self.runAttentionContext(
-            cfg,
-            &q_row,
-            &context_row,
-            &kv_entry.k,
-            &kv_entry.v,
-            ctx.attention_kernels,
-            seq_len_u32,
+    if (use_batched_kv_write_f16) {
+        try compute.cuda.kv_write_f16_rows_ptrs.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.kv_write_f16_rows_ptrs_function orelse return error.CudaKernelUnavailable,
+            &attn_k_stage,
+            &attn_v_stage,
+            &decode_key_cache_ptrs_dev,
+            &decode_value_cache_ptrs_dev,
+            &decode_positions_dev,
+            ctx.n_kv_heads_u32,
             ctx.head_dim_u32,
-            kv_dim_u32,
-            kv_groups,
             ctx.rope_dim_u32,
-            position_u32,
+            n_rows,
+            kv_dim_u32,
             layer_rope_theta,
         );
     }
 
-    // Step 4: Query gate output (if applicable).
-    if (cfg.query_gate) {
+    if (use_batched_separate_decode_attention) {
+        // Batched separate attention: same high-occupancy kernel design as
+        // per-row path, but reads position/seq_len from device buffers and
+        // KV cache from pointer tables — fully graph-compatible.
+        const max_seq_len = self.runtime_buffers.batched_attn_max_seq_len;
+
+        // Q RoPE for all rows (reads positions from device buffer).
+        try compute.cuda.rope_rows_ptrs.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.rope_rows_ptrs_function orelse return error.CudaKernelUnavailable,
+            &attn_q_stage,
+            &decode_positions_dev,
+            n_rows,
+            ctx.n_heads_u32,
+            ctx.head_dim_u32,
+            ctx.rope_dim_u32,
+            layer_rope_theta,
+        );
+
+        // Scores: Q*K dot products with pointer-table KV cache.
+        var scores_dev = self.runtime_buffers.batched_attn_scores_dev;
+        try compute.cuda.attn_scores_heads_f16_kv_ptrs.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.attn_scores_heads_f16_kv_ptrs_function orelse return error.CudaKernelUnavailable,
+            &scores_dev,
+            &attn_q_stage,
+            &decode_key_cache_ptrs_dev,
+            &decode_seq_lens_dev,
+            &decode_positions_dev,
+            n_rows,
+            ctx.n_heads_u32,
+            max_seq_len,
+            kv_dim_u32,
+            kv_groups,
+            ctx.head_dim_u32,
+            self.attention_scale,
+            sliding_window_u32,
+        );
+
+        // Softmax with dynamic per-row column counts.
+        try compute.cuda.softmax_rows_dynamic_cols_ptrs.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.softmax_rows_dynamic_cols_ptrs_function orelse return error.CudaKernelUnavailable,
+            &scores_dev,
+            &decode_seq_lens_dev,
+            &decode_positions_dev,
+            n_rows,
+            ctx.n_heads_u32,
+            max_seq_len,
+            sliding_window_u32,
+        );
+
+        // Weighted sum: probs * V with pointer-table KV cache.
+        try compute.cuda.attn_weighted_sum_heads_f16_kv_ptrs.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.attn_weighted_sum_heads_f16_kv_ptrs_function orelse return error.CudaKernelUnavailable,
+            &attn_context_stage,
+            &scores_dev,
+            &decode_value_cache_ptrs_dev,
+            &decode_seq_lens_dev,
+            &decode_positions_dev,
+            n_rows,
+            ctx.n_heads_u32,
+            max_seq_len,
+            kv_dim_u32,
+            kv_groups,
+            ctx.head_dim_u32,
+            sliding_window_u32,
+        );
+    } else if (use_batched_fused_decode_attention) {
+        // Fused path fallback: single kernel does RoPE + scores + softmax +
+        // weighted_sum + optional gate fusion.
+        const gate_proj: ?*const compute.cuda.Buffer = if (cfg.query_gate) &q_projection_stage else null;
+        const gate_proj_stride: u32 = if (cfg.query_gate) @intCast(cfg.q_projection_dim) else 0;
+
+        try compute.cuda.attn_fused_decode_heads_f16_kv_ptrs.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.attn_fused_decode_heads_f16_kv_ptrs_function orelse return error.CudaKernelUnavailable,
+            &attn_context_stage,
+            &attn_q_stage,
+            &decode_key_cache_ptrs_dev,
+            &decode_value_cache_ptrs_dev,
+            &decode_seq_lens_dev,
+            &decode_positions_dev,
+            n_rows,
+            ctx.n_heads_u32,
+            kv_dim_u32,
+            kv_groups,
+            ctx.head_dim_u32,
+            self.attention_scale,
+            ctx.rope_dim_u32,
+            sliding_window_u32,
+            layer_rope_theta,
+            gate_proj,
+            gate_proj_stride,
+        );
+    } else {
+        for (0..n) |row_i| {
+            const slot_idx = batch.slot_indices[row_i];
+            const position_u32: u32 = @intCast(batch.positions[row_i]);
+            const seq_len_u32 = batch.seq_lens[row_i];
+            const kv_entry = self.slot_kv_states[slot_idx].kv[batch.attn_layer_index];
+            var q_row = try logicalF32RowSlice(&attn_q_stage, n, row_i, cfg.q_dim);
+            var context_row = try logicalF32RowSlice(&attn_context_stage, n, row_i, o_proj.rows());
+            _ = try self.runAttentionContext(
+                cfg,
+                &q_row,
+                &context_row,
+                &kv_entry.k,
+                &kv_entry.v,
+                ctx.attention_kernels,
+                seq_len_u32,
+                ctx.head_dim_u32,
+                kv_dim_u32,
+                kv_groups,
+                ctx.rope_dim_u32,
+                position_u32,
+                layer_rope_theta,
+            );
+        }
+    }
+
+    // Step 4: Query gate — the fused path handles gate internally; batched
+    // separate and per-row paths need a separate gate kernel.
+    const fused_path_active = use_batched_fused_decode_attention and !use_batched_separate_decode_attention;
+    if (cfg.query_gate and !fused_path_active) {
         try engine_ops.applyQueryGateToContextInPlace(self, n, cfg.q_dim, cfg.q_projection_dim);
     }
 
@@ -850,7 +1011,7 @@ pub fn runGatedDeltaMixerStep(
     const trace_pos_offset = block.kernel.trace_position_offset;
     const trace_enabled = trace.isEnabled();
     if (trace_enabled) {
-        try engine_forward.ensureGatedDeltaHostStageCapacity(self,@max(proj_element_count, ssm_element_count));
+        try engine_forward.ensureGatedDeltaHostStageCapacity(self, @max(proj_element_count, ssm_element_count));
         const proj_host = self.gated_delta_stage_input_host[0..proj_element_count];
         try self.device.synchronize();
         downloadRowsF32StrideAware(self, &proj_dev, seq_len, proj_len, proj_host) catch |err| {
@@ -1190,8 +1351,8 @@ pub fn runGatedDeltaMixerStep(
 }
 
 /// Batched decode path for gated delta layers: N slots × 1 token each.
-/// in_proj and out_proj use GEMM for N rows; conv/SSM/norm run per-row
-/// with per-slot state from slot_kv_states.
+/// in_proj and out_proj use GEMM for N rows; conv/SSM/norm run in rows
+/// kernels with per-slot state pointers.
 pub fn runBatchedDecodeGatedDeltaMixer(
     self: anytype,
     block: *GatedDeltaBlockRuntime,
@@ -1237,154 +1398,99 @@ pub fn runBatchedDecodeGatedDeltaMixer(
     const n_qk_heads = qk_inner / d_head;
     if (n_qk_heads == 0 or (n_v_heads % n_qk_heads) != 0) return error.InvalidShape;
 
-    const qkv_bytes = std.math.mul(usize, qkv_len, @sizeOf(f32)) catch return error.InvalidArgument;
-    const z_bytes = std.math.mul(usize, d_inner, @sizeOf(f32)) catch return error.InvalidArgument;
-    const beta_bytes = std.math.mul(usize, n_v_heads, @sizeOf(f32)) catch return error.InvalidArgument;
-    const a_bytes = beta_bytes;
-    const use_token_conv_silu = self.gated_delta_conv_silu_function != null;
+    const beta_offset_elems = qkv_len + d_inner;
+    const a_offset_elems = beta_offset_elems + n_v_heads;
+    const ptr_bytes = std.math.mul(usize, n, @sizeOf(u64)) catch return error.InvalidArgument;
+    const idx_bytes = std.math.mul(usize, n, @sizeOf(u32)) catch return error.InvalidArgument;
+    const gd_table_row_offset = std.math.mul(usize, batch.gd_layer_index, batch.gd_ptrs_row_stride) catch return error.InvalidArgument;
+    const gd_table_ptr_byte_offset = std.math.mul(usize, gd_table_row_offset, @sizeOf(u64)) catch return error.InvalidArgument;
+    const gd_table_idx_byte_offset = std.math.mul(usize, gd_table_row_offset, @sizeOf(u32)) catch return error.InvalidArgument;
     const head_bytes = std.math.mul(usize, d_head, @sizeOf(f32)) catch return error.InvalidArgument;
-    const fused_norm_gate_supported = self.gated_delta_rmsnorm_silu_mul_function != null and
-        ((block.norm_weight.buffer.size == head_bytes) or (block.norm_weight.buffer.size == ssm_bytes));
+    const norm_weight_supported = (block.norm_weight.buffer.size == head_bytes) or (block.norm_weight.buffer.size == ssm_bytes);
+    if (!norm_weight_supported) return error.InvalidShape;
+    const conv_rows_ptrs_function = self.gated_delta_conv_silu_rows_ptrs_function orelse return error.CudaKernelUnavailable;
+    const ssm_rows_ptrs_function = self.gated_delta_ssm_rows_ptrs_function orelse return error.CudaKernelUnavailable;
+    const norm_rows_function = self.gated_delta_rmsnorm_silu_mul_rows_function orelse return error.CudaKernelUnavailable;
     const rows_norm_weight_stride: u32 = if (block.norm_weight.buffer.size == head_bytes)
         0
     else
         @intCast(d_head);
 
-    // Step 2: Per-row conv + SSM + norm/gate with per-slot state.
+    // Step 2: Conv + SSM + norm/gate for all rows with per-slot state pointers.
+    var conv_state_ptrs_dev = try bufferSlice(batch.gd_conv_state_ptrs_table_dev, gd_table_ptr_byte_offset, ptr_bytes);
+    var ssm_state_ptrs_dev = try bufferSlice(batch.gd_ssm_state_ptrs_table_dev, gd_table_ptr_byte_offset, ptr_bytes);
+    var conv_ring_heads_dev = try bufferSlice(batch.gd_conv_ring_heads_table_dev, gd_table_idx_byte_offset, idx_bytes);
+    const conv_ring_heads_host = self.runtime_buffers.decode_gd_conv_ring_heads_table_host[gd_table_row_offset..][0..n];
+
+    try compute.cuda.gated_delta_conv_silu_rows_ptrs.runWithFunction(
+        &self.kernel_arg_pack,
+        &self.device,
+        conv_rows_ptrs_function,
+        &proj_dev,
+        &conv_state_ptrs_dev,
+        &conv_ring_heads_dev,
+        &block.conv_weight_time_major.buffer,
+        if (block.conv_bias) |*bias| &bias.buffer else null,
+        &proj_dev,
+        @intCast(qkv_len),
+        @intCast(d_conv),
+        n_rows,
+        @intCast(proj_len),
+    );
+
+    try compute.cuda.gated_delta_conv_silu_rows_ptrs.runAdvanceWithFunction(
+        &self.kernel_arg_pack,
+        &self.device,
+        self.gated_delta_advance_ring_heads_function orelse return error.CudaKernelUnavailable,
+        &conv_ring_heads_dev,
+        @intCast(d_conv),
+        n_rows,
+    );
+
+    const d_conv_u32: u32 = @intCast(d_conv);
     for (0..n) |row_i| {
         const slot_idx = batch.slot_indices[row_i];
-        var gd_state = &self.slot_kv_states[slot_idx].gd[batch.gd_layer_index];
-
-        var proj_row_dev = try logicalF32RowSlice(&proj_dev, n, row_i, proj_len);
-        var qkv_dev = try bufferSlice(&proj_row_dev, 0, qkv_bytes);
-
-        // Conv + SiLU with this slot's conv state.
-        if (use_token_conv_silu) {
-            try compute.cuda.gated_delta_conv_silu.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.gated_delta_conv_silu_function.?,
-                &qkv_dev,
-                &gd_state.conv,
-                &block.conv_weight_time_major.buffer,
-                if (block.conv_bias) |*bias| &bias.buffer else null,
-                &qkv_dev,
-                @intCast(qkv_len),
-                @intCast(d_conv),
-                gd_state.conv_ring_head,
-            );
-        } else {
-            try compute.cuda.gated_delta_conv.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.gated_delta_conv_function orelse return error.CudaKernelUnavailable,
-                &qkv_dev,
-                &gd_state.conv,
-                &block.conv_weight_time_major.buffer,
-                if (block.conv_bias) |*bias| &bias.buffer else null,
-                &qkv_dev,
-                @intCast(qkv_len),
-                @intCast(d_conv),
-                gd_state.conv_ring_head,
-            );
-            try compute.cuda.silu.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.silu_function orelse return error.CudaKernelUnavailable,
-                &qkv_dev,
-                &qkv_dev,
-                @intCast(qkv_len),
-            );
-        }
-        gd_state.conv_ring_head = if (gd_state.conv_ring_head + 1 >= @as(u32, @intCast(d_conv)))
-            0
-        else
-            gd_state.conv_ring_head + 1;
-
-        // SSM with this slot's SSM state.
-        var z_dev = try bufferSlice(&proj_row_dev, qkv_bytes, z_bytes);
-        var beta_dev = try bufferSlice(&proj_row_dev, qkv_bytes + z_bytes, beta_bytes);
-        var a_dev = try bufferSlice(&proj_row_dev, qkv_bytes + z_bytes + beta_bytes, a_bytes);
-        const norm_offset = std.math.mul(usize, row_i, ssm_bytes) catch return error.InvalidArgument;
-        var norm_dev = try bufferSlice(&norm_stage_dev, norm_offset, ssm_bytes);
-
-        try compute.cuda.gated_delta_ssm.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            self.gated_delta_ssm_function orelse return error.CudaKernelUnavailable,
-            &qkv_dev,
-            &beta_dev,
-            &a_dev,
-            &block.a_log.buffer,
-            if (block.dt_bias) |*bias| &bias.buffer else null,
-            &gd_state.ssm,
-            &norm_dev,
-            @intCast(n_qk_heads),
-            @intCast(n_v_heads),
-            @intCast(d_head),
-        );
-
-        // Norm + gate for this row.
-        if (fused_norm_gate_supported) {
-            try compute.cuda.gated_delta_rmsnorm_silu_mul.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.gated_delta_rmsnorm_silu_mul_function.?,
-                &norm_dev,
-                &z_dev,
-                &block.norm_weight.buffer,
-                &norm_dev,
-                @intCast(n_v_heads),
-                @intCast(d_head),
-                1.0e-6,
-                rows_norm_weight_stride,
-            );
-        } else {
-            if (block.norm_weight.buffer.size == head_bytes) {
-                try compute.cuda.rmsnorm.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                    &norm_dev,
-                    &block.norm_weight.buffer,
-                    &norm_dev,
-                    @intCast(n_v_heads),
-                    @intCast(d_head),
-                    1.0e-6,
-                    0.0,
-                );
-            } else if (block.norm_weight.buffer.size == ssm_bytes) {
-                for (0..n_v_heads) |head_idx| {
-                    const head_offset_bytes = std.math.mul(usize, head_idx * d_head, @sizeOf(f32)) catch return error.InvalidArgument;
-                    var norm_head_dev = try bufferSlice(&norm_dev, head_offset_bytes, head_bytes);
-                    var weight_head_dev = try bufferSlice(&block.norm_weight.buffer, head_offset_bytes, head_bytes);
-                    try compute.cuda.rmsnorm.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                        &norm_head_dev,
-                        &weight_head_dev,
-                        &norm_head_dev,
-                        1,
-                        @intCast(d_head),
-                        1.0e-6,
-                        0.0,
-                    );
-                }
-            } else {
-                return error.InvalidShape;
-            }
-            try compute.cuda.silu_mul.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.silu_mul_function orelse return error.CudaKernelUnavailable,
-                &z_dev,
-                &norm_dev,
-                &norm_dev,
-                @intCast(d_inner),
-            );
-        }
+        const gd_state = &self.slot_kv_states[slot_idx].gd[batch.gd_layer_index];
+        const ring_head = conv_ring_heads_host[row_i];
+        gd_state.conv_ring_head = if (ring_head + 1 >= d_conv_u32) 0 else ring_head + 1;
     }
+
+    try compute.cuda.gated_delta_ssm_rows_ptrs.runWithFunction(
+        &self.kernel_arg_pack,
+        &self.device,
+        ssm_rows_ptrs_function,
+        &proj_dev,
+        &ssm_state_ptrs_dev,
+        &block.a_log.buffer,
+        if (block.dt_bias) |*bias| &bias.buffer else null,
+        &norm_stage_dev,
+        @intCast(n_qk_heads),
+        @intCast(n_v_heads),
+        @intCast(d_head),
+        n_rows,
+        @intCast(proj_len),
+        @intCast(beta_offset_elems),
+        @intCast(a_offset_elems),
+        @intCast(d_inner),
+    );
+
+    const rows_total = std.math.mul(usize, n, n_v_heads) catch return error.InvalidArgument;
+    try compute.cuda.gated_delta_rmsnorm_silu_mul_rows.runWithFunction(
+        &self.kernel_arg_pack,
+        &self.device,
+        norm_rows_function,
+        &norm_stage_dev,
+        &proj_dev,
+        &block.norm_weight.buffer,
+        &norm_stage_dev,
+        @intCast(rows_total),
+        @intCast(d_head),
+        @intCast(n_v_heads),
+        @intCast(proj_len),
+        @intCast(qkv_len),
+        1.0e-6,
+        rows_norm_weight_stride,
+    );
 
     // Step 3: out_proj GEMM for all N rows.
     try engine_ops.linearForwardRows(self, &norm_stage_dev, n, &block.out_proj, output);
@@ -1402,7 +1508,7 @@ pub fn runAttentionMixerStepCpu(
     const scratch = &(block.cpu_scratch orelse return error.InvalidInstructionBinding);
     const matmul_scratch = &(block.cpu_matmul_scratch orelse return error.InvalidInstructionBinding);
     const element_count = std.math.mul(usize, seq_len, self.d_model) catch return error.InvalidArgument;
-    try engine_forward.ensureGatedDeltaHostStageCapacity(self,element_count);
+    try engine_forward.ensureGatedDeltaHostStageCapacity(self, element_count);
     const input_host = self.gated_delta_stage_input_host[0..element_count];
     const output_host = self.gated_delta_stage_output_host[0..element_count];
     try self.device.synchronize();
@@ -1727,7 +1833,8 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
             }
 
             // GEMM-based attention per KV head.
-            var scores_buf = try ensureAttnScoresWorkspace(self, 
+            var scores_buf = try ensureAttnScoresWorkspace(
+                self,
                 kv_groups_u32,
                 @intCast(stage_rows),
                 seq_len_u32,
@@ -2175,7 +2282,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                 );
             }
 
-            var scores_buf = try ensureAttnScoresWorkspace(self, 
+            var scores_buf = try ensureAttnScoresWorkspace(
+                self,
                 kv_groups_u32,
                 @intCast(stage_rows),
                 seq_len_u32,
@@ -2406,25 +2514,29 @@ pub fn runFfnStep(
 ) !void {
     const activation_count = std.math.mul(u32, @intCast(rows), d_ff) catch return error.InvalidArgument;
     const activation_bytes = std.math.mul(usize, @as(usize, activation_count), @sizeOf(f32)) catch return error.InvalidArgument;
-    const fused_gate_up_silu = gate_bias == null and ((try engine_ops.tryFusedDenseU16GateUpSiluForward(self, 
+    const fused_gate_up_silu = gate_bias == null and ((try engine_ops.tryFusedDenseU16GateUpSiluForward(
+        self,
         input,
         gate_weight,
         up_weight,
         rows,
         d_ff,
-    )) or (try engine_ops.tryFusedGaffineU4GateUpSiluForward(self, 
+    )) or (try engine_ops.tryFusedGaffineU4GateUpSiluForward(
+        self,
         input,
         gate_weight,
         up_weight,
         rows,
         d_ff,
-    )) or (try engine_ops.tryFusedI8GateUpSiluForward(self, 
+    )) or (try engine_ops.tryFusedI8GateUpSiluForward(
+        self,
         input,
         gate_weight,
         up_weight,
         rows,
         d_ff,
-    )) or (try engine_ops.tryFusedGaffineU8GateUpSiluForward(self, 
+    )) or (try engine_ops.tryFusedGaffineU8GateUpSiluForward(
+        self,
         input,
         gate_weight,
         up_weight,

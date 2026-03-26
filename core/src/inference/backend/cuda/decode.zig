@@ -14,6 +14,22 @@ fn slotIndexSupported(self: anytype, slot_index: usize) bool {
     return slot_index == 0;
 }
 
+fn markDecodePointerTablesDirty(self: anytype) void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasField(SelfType, "decode_ptr_tables_dirty")) {
+        self.decode_ptr_tables_dirty = true;
+        if (comptime @hasField(SelfType, "decode_ptr_tables_cached_rows")) {
+            self.decode_ptr_tables_cached_rows = 0;
+        }
+    }
+    if (comptime @hasField(SelfType, "batched_decode_graph_exec")) {
+        if (self.batched_decode_graph_exec) |exec| {
+            self.device.graphExecDestroy(exec);
+            self.batched_decode_graph_exec = null;
+        }
+    }
+}
+
 pub fn decode(self: anytype, token: u32, position: usize, logits_out: []f32) !void {
     const prev_backend = trace.setBackendContext(.cuda);
     defer _ = trace.setBackendContext(prev_backend);
@@ -77,8 +93,9 @@ pub fn decodeBatch(
         }
     }
 
-    // Batched path: N > 1 with GEMM-based forward pass.
-    const use_batched = requests.len > 1 and comptime @hasDecl(SelfType, "computeBatchedDecodeLogits");
+    // Canonical path: use batched decode implementation for all batch sizes,
+    // including N=1, so decode behavior stays on one route.
+    const use_batched = comptime @hasDecl(SelfType, "computeBatchedDecodeLogits");
     if (use_batched) {
         const max_n = 128;
         if (requests.len > max_n) return error.InvalidArgument;
@@ -97,20 +114,32 @@ pub fn decodeBatch(
             slot_indices_buf[0..requests.len],
             positions_buf[0..requests.len],
         );
-        for (requests, results[0..requests.len]) |req, *result| {
+        for (requests, results[0..requests.len], 0..) |req, *result, row_i| {
             const position = self.slot_positions[req.slot_index];
             const slot_logits = self.slotLogits(req.slot_index);
+            var result_logits = slot_logits;
+            if (comptime @hasDecl(SelfType, "batchedHostLogitsRow")) {
+                if (self.batchedHostLogitsRow(row_i)) |row_logits| {
+                    if (row_logits.len == self.vocab_size) {
+                        result_logits = row_logits;
+                    } else {
+                        @memset(slot_logits, -1.0e9);
+                        const copy_len = @min(slot_logits.len, row_logits.len);
+                        @memcpy(slot_logits[0..copy_len], row_logits[0..copy_len]);
+                    }
+                }
+            }
             result.* = .{
                 .slot_index = req.slot_index,
-                .logits = slot_logits,
+                .logits = result_logits,
             };
             trace.emitFinal(
                 .logits_ready,
                 0,
                 @intCast(position + 1),
-                @ptrCast(slot_logits.ptr),
+                @ptrCast(result_logits.ptr),
                 .f32,
-                .{ @intCast(self.vocab_size), 0, 0, 0 },
+                .{ @intCast(result_logits.len), 0, 0, 0 },
                 1,
                 "cuda_logits_host",
             );
@@ -250,6 +279,7 @@ pub fn allocSlot(self: anytype) ?usize {
             self.slot_in_use[i] = true;
             self.slot_positions[i] = 0;
             self.slot_rope_position_deltas[i] = 0;
+            markDecodePointerTablesDirty(self);
             return i;
         }
     }
@@ -261,12 +291,14 @@ pub fn freeSlot(self: anytype, slot_index: usize) void {
     self.slot_in_use[slot_index] = false;
     self.slot_positions[slot_index] = 0;
     self.slot_rope_position_deltas[slot_index] = 0;
+    markDecodePointerTablesDirty(self);
 }
 
 pub fn resetSlot(self: anytype, slot_index: usize) void {
     if (!slotIndexSupported(self, slot_index)) return;
     self.slot_positions[slot_index] = 0;
     self.slot_rope_position_deltas[slot_index] = 0;
+    markDecodePointerTablesDirty(self);
 }
 
 pub fn getPosition(self: anytype, slot_index: usize) usize {

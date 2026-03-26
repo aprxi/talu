@@ -327,6 +327,213 @@ extern "C" __global__ void talu_attn_fused_heads_f16_kv(
     }
 }
 
+extern "C" __global__ __launch_bounds__(512)
+void talu_attn_fused_decode_heads_f16_kv_ptrs(
+    float* out,
+    const float* query,
+    const unsigned long long* key_cache_ptrs,
+    const unsigned long long* value_cache_ptrs,
+    const unsigned int* seq_lens,
+    const unsigned int* positions,
+    unsigned int batch_rows,
+    unsigned int n_heads,
+    unsigned int row_stride,
+    unsigned int kv_groups,
+    unsigned int head_dim,
+    float scale,
+    unsigned int rope_dim,
+    unsigned int sliding_window,
+    float theta,
+    const float* gate_proj,
+    unsigned int gate_proj_stride
+) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int row = blockIdx.y;
+    const unsigned int warp_id = threadIdx.x / 32u;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int num_warps = blockDim.x / 32u;
+    if (row >= batch_rows || head >= n_heads || kv_groups == 0 || head_dim == 0) return;
+    if (rope_dim == 0 || rope_dim > head_dim || (rope_dim & 1u) != 0u) return;
+
+    const unsigned int seq_len = seq_lens[row];
+    if (seq_len == 0) return;
+    const unsigned int position = positions[row];
+    const unsigned int effective_seq = min(seq_len, position + 1u);
+    const unsigned int start_t = (sliding_window > 0u && effective_seq > sliding_window)
+        ? (effective_seq - sliding_window)
+        : 0u;
+
+    const unsigned short* key_cache = reinterpret_cast<const unsigned short*>(key_cache_ptrs[row]);
+    const unsigned short* value_cache = reinterpret_cast<const unsigned short*>(value_cache_ptrs[row]);
+    if (key_cache == nullptr || value_cache == nullptr) return;
+
+    const unsigned int kv_head = head / kv_groups;
+    const unsigned int head_offset = kv_head * head_dim;
+    const float* query_head = query + ((unsigned long long)row * n_heads + head) * head_dim;
+    float* out_head = out + ((unsigned long long)row * n_heads + head) * head_dim;
+    const unsigned int wmask = 0xFFFFffffu;
+    const float log2_theta = log2f(theta);
+
+    const unsigned int dims_per_lane = (head_dim + 31u) >> 5;
+    float out_acc[16];
+    float q_rot[16];
+    #pragma unroll
+    for (unsigned int i = 0; i < 16; ++i) {
+        out_acc[i] = 0.0f;
+        q_rot[i] = 0.0f;
+    }
+    if (dims_per_lane > 16u) return;
+
+    // Q RoPE: identical across all warps (same head, same row).
+    const unsigned int half = rope_dim >> 1;
+    #pragma unroll
+    for (unsigned int k = 0; k < 16; ++k) {
+        if (k >= dims_per_lane) break;
+        const unsigned int d = lane + (k << 5);
+        if (d >= head_dim) continue;
+
+        float qv = query_head[d];
+        if (d < rope_dim) {
+            const unsigned int pair = (d < half) ? d : (d - half);
+            const float q_lo = query_head[pair];
+            const float q_hi = query_head[half + pair];
+            const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+            const float angle = (float)position * inv_freq;
+            float sn = 0.0f;
+            float cn = 0.0f;
+            __sincosf(angle, &sn, &cn);
+            qv = (d < half) ? fmaf(q_lo, cn, -q_hi * sn) : fmaf(q_lo, sn, q_hi * cn);
+        }
+        q_rot[k] = qv;
+    }
+
+    // Split token range across warps (FlashDecoding pattern).
+    const unsigned int total_tokens = effective_seq - start_t;
+    const unsigned int tokens_per_warp = (total_tokens + num_warps - 1u) / num_warps;
+    const unsigned int my_start = start_t + warp_id * tokens_per_warp;
+    const unsigned int my_end = min(my_start + tokens_per_warp, effective_seq);
+
+    // Online softmax over this warp's token chunk.
+    float m = -3.402823466e+38f;
+    float s = 0.0f;
+
+    for (unsigned int t = my_start; t < my_end; ++t) {
+        const unsigned short* key_row = key_cache + ((unsigned long long)t * row_stride + head_offset);
+        float partial = 0.0f;
+        #pragma unroll
+        for (unsigned int k = 0; k < 16; ++k) {
+            if (k >= dims_per_lane) break;
+            const unsigned int d = lane + (k << 5);
+            if (d >= head_dim) continue;
+            partial += q_rot[k] * __half2float(*reinterpret_cast<const __half*>(&key_row[d]));
+        }
+        for (unsigned int offset = 16; offset > 0; offset >>= 1) {
+            partial += __shfl_down_sync(wmask, partial, offset);
+        }
+        const float dot = __shfl_sync(wmask, partial, 0);
+        const float score = dot * scale;
+
+        float alpha = 0.0f;
+        float beta = 0.0f;
+        if (lane == 0) {
+            const float m_new = fmaxf(m, score);
+            alpha = expf(m - m_new);
+            beta = expf(score - m_new);
+            s = s * alpha + beta;
+            m = m_new;
+        }
+        alpha = __shfl_sync(wmask, alpha, 0);
+        beta = __shfl_sync(wmask, beta, 0);
+
+        const unsigned short* value_row = value_cache + ((unsigned long long)t * row_stride + head_offset);
+        #pragma unroll
+        for (unsigned int k = 0; k < 16; ++k) {
+            if (k >= dims_per_lane) break;
+            const unsigned int d = lane + (k << 5);
+            if (d < head_dim) {
+                const float v = __half2float(*reinterpret_cast<const __half*>(&value_row[d]));
+                out_acc[k] = out_acc[k] * alpha + v * beta;
+            }
+        }
+    }
+
+    // Broadcast m and s from lane 0 to all lanes within each warp.
+    m = __shfl_sync(wmask, m, 0);
+    s = __shfl_sync(wmask, s, 0);
+
+    // Combine partial results from all warps via shared memory.
+    // Layout: [num_warps] m, [num_warps] s, [num_warps * head_dim] out.
+    extern __shared__ float smem[];
+    float* smem_m = smem;
+    float* smem_s = smem + num_warps;
+    float* smem_out = smem + 2u * num_warps;
+
+    if (lane == 0) {
+        smem_m[warp_id] = m;
+        smem_s[warp_id] = s;
+    }
+    #pragma unroll
+    for (unsigned int k = 0; k < 16; ++k) {
+        if (k >= dims_per_lane) break;
+        const unsigned int d = lane + (k << 5);
+        if (d < head_dim) {
+            smem_out[warp_id * head_dim + d] = out_acc[k];
+        }
+    }
+    __syncthreads();
+
+    // Only warp 0 combines and writes output.
+    if (warp_id != 0) return;
+
+    // Start with warp 0's values.
+    m = smem_m[0];
+    s = smem_s[0];
+    #pragma unroll
+    for (unsigned int k = 0; k < 16; ++k) {
+        if (k >= dims_per_lane) break;
+        const unsigned int d = lane + (k << 5);
+        if (d < head_dim) {
+            out_acc[k] = smem_out[d];
+        }
+    }
+
+    // Merge warps 1..num_warps-1 using online-softmax merge formula.
+    for (unsigned int w = 1; w < num_warps; ++w) {
+        const float mw = smem_m[w];
+        const float sw = smem_s[w];
+        const float m_new = fmaxf(m, mw);
+        const float alpha = expf(m - m_new);
+        const float beta = expf(mw - m_new);
+        s = s * alpha + sw * beta;
+        m = m_new;
+
+        #pragma unroll
+        for (unsigned int k = 0; k < 16; ++k) {
+            if (k >= dims_per_lane) break;
+            const unsigned int d = lane + (k << 5);
+            if (d < head_dim) {
+                out_acc[k] = out_acc[k] * alpha + smem_out[w * head_dim + d] * beta;
+            }
+        }
+    }
+
+    // Normalize and write output.
+    const float inv_s = 1.0f / fmaxf(s, 1.0e-20f);
+    #pragma unroll
+    for (unsigned int k = 0; k < 16; ++k) {
+        if (k >= dims_per_lane) break;
+        const unsigned int d = lane + (k << 5);
+        if (d < head_dim) {
+            float result = out_acc[k] * inv_s;
+            if (gate_proj) {
+                const float gate = gate_proj[(unsigned long long)row * gate_proj_stride + (unsigned long long)head * head_dim * 2u + head_dim + d];
+                result *= 1.0f / (1.0f + expf(-gate));
+            }
+            out_head[d] = result;
+        }
+    }
+}
+
 extern "C" __global__ void talu_attn_fused_prefill_heads_f16_kv(
     float* out,
     const float* query,
@@ -699,3 +906,231 @@ extern "C" __global__ void talu_causal_attn_softmax_f32(
     }
 }
 
+// --- Batched separate attention kernels (graph-compatible) ---
+// These replicate the proven-fast separate kernel design but read position/seq_len
+// from device buffers and KV cache from pointer tables, enabling CUDA graph capture.
+
+// Batched RoPE: apply rotary position embedding to data for multiple rows,
+// reading per-row positions from a device buffer.
+// Grid: (ceil(n_heads * (rope_dim/2) / blockDim.x), batch_rows), Block: 128
+extern "C" __global__ void talu_rope_rows_ptrs(
+    float* io,
+    const unsigned int* positions,
+    unsigned int batch_rows,
+    unsigned int n_heads,
+    unsigned int head_dim,
+    unsigned int rope_dim,
+    float theta
+) {
+    const unsigned int row = blockIdx.y;
+    if (row >= batch_rows) return;
+
+    const unsigned int half = rope_dim >> 1;
+    const unsigned int pair_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total_pairs = n_heads * half;
+    if (pair_index >= total_pairs) return;
+
+    const unsigned int position = positions[row];
+    const unsigned int head = pair_index / half;
+    const unsigned int pair = pair_index % half;
+    const unsigned int base = (row * n_heads + head) * head_dim;
+    const float log2_theta = log2f(theta);
+    const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+    const float angle = (float)position * inv_freq;
+    float s = 0.0f, c = 0.0f;
+    __sincosf(angle, &s, &c);
+
+    const unsigned int lo_idx = base + pair;
+    const unsigned int hi_idx = base + half + pair;
+    const float x0 = io[lo_idx];
+    const float x1 = io[hi_idx];
+    io[lo_idx] = fmaf(x0, c, -x1 * s);
+    io[hi_idx] = fmaf(x0, s, x1 * c);
+}
+
+// Batched attention scores with f16 KV pointer tables.
+// Computes Q*K dot product for each (token, head, row), reading KV cache pointers
+// and seq_lens from device buffers. Out-of-range tokens write -inf for softmax.
+// Grid: (ceil(max_seq_len / warps_per_block), n_heads, batch_rows), Block: 128
+extern "C" __global__ void talu_attn_scores_heads_f16_kv_ptrs(
+    float* scores,
+    const float* query,
+    const unsigned long long* key_cache_ptrs,
+    const unsigned int* seq_lens,
+    const unsigned int* positions,
+    unsigned int n_heads,
+    unsigned int max_seq_len,
+    unsigned int row_stride,
+    unsigned int kv_groups,
+    unsigned int head_dim,
+    float scale,
+    unsigned int sliding_window
+) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp = tid / TALU_ATTN_WARP_SIZE;
+    const unsigned int lane = tid & (TALU_ATTN_WARP_SIZE - 1u);
+    const unsigned int warps_per_block = blockDim.x / TALU_ATTN_WARP_SIZE;
+    const unsigned int token_index = blockIdx.x * warps_per_block + warp;
+    const unsigned int head = blockIdx.y;
+    const unsigned int row = blockIdx.z;
+    if (head >= n_heads || kv_groups == 0) return;
+
+    const unsigned int seq_len = seq_lens[row];
+    const unsigned int position = positions[row];
+    const unsigned int effective_seq = min(seq_len, position + 1u);
+    const unsigned int start_t = (sliding_window > 0u && effective_seq > sliding_window)
+        ? (effective_seq - sliding_window) : 0u;
+    const unsigned int visible_len = effective_seq - start_t;
+
+    // Scores layout: [row, head, max_seq_len]. We write to visible_len slots
+    // starting at offset 0, and -inf beyond.
+    float* scores_head = scores + ((unsigned long long)row * n_heads + head) * max_seq_len;
+
+    if (token_index >= visible_len) {
+        if (token_index < max_seq_len && lane == 0) {
+            scores_head[token_index] = -3.402823466e+38f;
+        }
+        return;
+    }
+
+    const unsigned int kv_head = head / kv_groups;
+    const unsigned int head_offset = kv_head * head_dim;
+    const float* query_head = query + ((unsigned long long)row * n_heads + head) * head_dim;
+    const unsigned short* key_cache = reinterpret_cast<const unsigned short*>(key_cache_ptrs[row]);
+    const unsigned int actual_t = start_t + token_index;
+    const unsigned short* key_row = key_cache + ((unsigned long long)actual_t * row_stride + head_offset);
+
+    float partial = 0.0f;
+    for (unsigned int d = lane; d < head_dim; d += TALU_ATTN_WARP_SIZE) {
+        partial += query_head[d] * __half2float(*reinterpret_cast<const __half*>(&key_row[d]));
+    }
+    const float dot = talu_attn_warp_sum_f32(partial);
+    if (lane == 0) {
+        scores_head[token_index] = dot * scale;
+    }
+}
+
+// Softmax with per-row dynamic column counts read from device buffer.
+// Each block handles one row of the [batch_rows * n_heads, max_cols] matrix.
+// Reads actual column count from seq_lens[row / n_heads] so only real scores
+// are softmaxed (no -inf padding waste).
+// Grid: (batch_rows * n_heads), Block: 128
+extern "C" __global__ void talu_softmax_rows_dynamic_cols_ptrs(
+    float* data,
+    const unsigned int* seq_lens,
+    const unsigned int* positions,
+    unsigned int n_heads,
+    unsigned int max_cols,
+    unsigned int sliding_window
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & (TALU_ATTN_WARP_SIZE - 1u);
+    const unsigned int warp = tid / TALU_ATTN_WARP_SIZE;
+    const unsigned int warp_count = (blockDim.x + TALU_ATTN_WARP_SIZE - 1u) / TALU_ATTN_WARP_SIZE;
+
+    const unsigned int batch_row = row / n_heads;
+    const unsigned int seq_len = seq_lens[batch_row];
+    const unsigned int position = positions[batch_row];
+    const unsigned int effective_seq = min(seq_len, position + 1u);
+    const unsigned int start_t = (sliding_window > 0u && effective_seq > sliding_window)
+        ? (effective_seq - sliding_window) : 0u;
+    const unsigned int cols = effective_seq - start_t;
+    if (cols == 0) return;
+
+    float* row_data = data + (unsigned long long)row * max_cols;
+    __shared__ float warp_max[8];
+    __shared__ float warp_sum[8];
+    __shared__ float row_max;
+    __shared__ float row_inv_sum;
+
+    // Phase 1: find max.
+    float local_max = -3.402823466e+38f;
+    for (unsigned int i = tid; i < cols; i += blockDim.x) {
+        local_max = fmaxf(local_max, row_data[i]);
+    }
+    const float max_lane = talu_attn_warp_max_f32(local_max);
+    if (lane == 0) warp_max[warp] = max_lane;
+    __syncthreads();
+
+    if (warp == 0) {
+        float block_max = (lane < warp_count) ? warp_max[lane] : -3.402823466e+38f;
+        block_max = talu_attn_warp_max_f32(block_max);
+        if (lane == 0) row_max = block_max;
+    }
+    __syncthreads();
+
+    // Phase 2: exp + sum.
+    const float max_v = row_max;
+    float local_sum = 0.0f;
+    for (unsigned int i = tid; i < cols; i += blockDim.x) {
+        const float e = expf(row_data[i] - max_v);
+        row_data[i] = e;
+        local_sum += e;
+    }
+    const float sum_lane = talu_attn_warp_sum_f32(local_sum);
+    if (lane == 0) warp_sum[warp] = sum_lane;
+    __syncthreads();
+
+    if (warp == 0) {
+        float block_sum = (lane < warp_count) ? warp_sum[lane] : 0.0f;
+        block_sum = talu_attn_warp_sum_f32(block_sum);
+        if (lane == 0) row_inv_sum = 1.0f / fmaxf(block_sum, 1.0e-20f);
+    }
+    __syncthreads();
+
+    // Phase 3: normalize.
+    const float inv_sum = row_inv_sum;
+    for (unsigned int i = tid; i < cols; i += blockDim.x) {
+        row_data[i] *= inv_sum;
+    }
+}
+
+// Batched attention weighted sum with f16 KV pointer tables.
+// Each warp computes the weighted sum for one dimension of the output.
+// Grid: (ceil(head_dim / warps_per_block), n_heads, batch_rows), Block: 128
+extern "C" __global__ void talu_attn_weighted_sum_heads_f16_kv_ptrs(
+    float* out,
+    const float* probs,
+    const unsigned long long* value_cache_ptrs,
+    const unsigned int* seq_lens,
+    const unsigned int* positions,
+    unsigned int n_heads,
+    unsigned int max_seq_len,
+    unsigned int row_stride,
+    unsigned int kv_groups,
+    unsigned int head_dim,
+    unsigned int sliding_window
+) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp = tid / TALU_ATTN_WARP_SIZE;
+    const unsigned int lane = tid & (TALU_ATTN_WARP_SIZE - 1u);
+    const unsigned int warps_per_block = blockDim.x / TALU_ATTN_WARP_SIZE;
+    const unsigned int d = blockIdx.x * warps_per_block + warp;
+    const unsigned int head = blockIdx.y;
+    const unsigned int row = blockIdx.z;
+    if (head >= n_heads || d >= head_dim || kv_groups == 0) return;
+
+    const unsigned int seq_len = seq_lens[row];
+    const unsigned int position = positions[row];
+    const unsigned int effective_seq = min(seq_len, position + 1u);
+    const unsigned int start_t = (sliding_window > 0u && effective_seq > sliding_window)
+        ? (effective_seq - sliding_window) : 0u;
+    const unsigned int visible_len = effective_seq - start_t;
+
+    const unsigned int kv_head = head / kv_groups;
+    const unsigned int head_offset = kv_head * head_dim;
+    const float* probs_row = probs + ((unsigned long long)row * n_heads + head) * max_seq_len;
+    const unsigned short* value_cache = reinterpret_cast<const unsigned short*>(value_cache_ptrs[row]);
+
+    float partial = 0.0f;
+    for (unsigned int t = lane; t < visible_len; t += TALU_ATTN_WARP_SIZE) {
+        const unsigned int actual_t = start_t + t;
+        const unsigned long long value_index = (unsigned long long)actual_t * row_stride + head_offset + d;
+        partial += probs_row[t] * __half2float(*reinterpret_cast<const __half*>(&value_cache[value_index]));
+    }
+    const float acc = talu_attn_warp_sum_f32(partial);
+    if (lane == 0) {
+        out[((unsigned long long)row * n_heads + head) * head_dim + d] = acc;
+    }
+}

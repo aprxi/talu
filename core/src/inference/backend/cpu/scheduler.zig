@@ -216,6 +216,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
         /// Active request IDs (have slots, generating)
         active_requests: std.ArrayList(u64),
+        /// Direct slot -> request lookup to avoid per-step slot scans.
+        slot_request_ids: []?u64,
 
         /// Completed request IDs (ready for retrieval)
         completed_queue: std.ArrayList(u64),
@@ -226,6 +228,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         /// Scratch buffers for batched decode
         decode_requests: []DecodeRequest,
         decode_results: []DecodeResult,
+        decode_candidate_logits: []f32,
+        decode_candidate_ids: []u32,
+        decode_candidate_counts: []usize,
         /// Logits buffer for prefill
         logits_buffer: []f32,
 
@@ -280,6 +285,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const decode_result_buffer = try allocator.alloc(DecodeResult, effective_batch_size);
             errdefer allocator.free(decode_result_buffer);
 
+            const decode_candidate_logits = try allocator.alloc(f32, effective_batch_size * 256);
+            errdefer allocator.free(decode_candidate_logits);
+            const decode_candidate_ids = try allocator.alloc(u32, effective_batch_size * 256);
+            errdefer allocator.free(decode_candidate_ids);
+            const decode_candidate_counts = try allocator.alloc(usize, effective_batch_size);
+            errdefer allocator.free(decode_candidate_counts);
+
             // Initialize optimized sampler with pre-allocated workspace
             // Use seed from config if specified (non-zero), otherwise use time-based seed
             const sampler_seed = if (config.default_sampling.seed != 0)
@@ -297,6 +309,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Allocate logits buffer for prefill
             const logits_scratch = try allocator.alloc(f32, vocab);
             errdefer allocator.free(logits_scratch);
+            const slot_request_ids = try allocator.alloc(?u64, max_batch);
+            errdefer allocator.free(slot_request_ids);
+            @memset(slot_request_ids, null);
             const scheduler_state_descriptors = try allocator.alloc(runtime_contract.StateDescriptor, config.state_descriptors.len);
             errdefer allocator.free(scheduler_state_descriptors);
             @memcpy(scheduler_state_descriptors, config.state_descriptors);
@@ -330,10 +345,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .requests = std.AutoHashMap(u64, *Request).init(allocator),
                 .pending_queue = .{},
                 .active_requests = .{},
+                .slot_request_ids = slot_request_ids,
                 .completed_queue = .{},
                 .next_request_id = 1,
                 .decode_requests = decode_request_buffer,
                 .decode_results = decode_result_buffer,
+                .decode_candidate_logits = decode_candidate_logits,
+                .decode_candidate_ids = decode_candidate_ids,
+                .decode_candidate_counts = decode_candidate_counts,
                 .logits_buffer = logits_scratch,
                 .sampler = sampler_instance,
                 .request_state_blocks = std.AutoHashMap(u64, RequestStateBlocks).init(allocator),
@@ -386,12 +405,16 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             self.pending_queue.deinit(self.allocator);
             self.active_requests.deinit(self.allocator);
+            self.allocator.free(self.slot_request_ids);
             self.completed_queue.deinit(self.allocator);
             self.allocator.free(self.state_descriptors);
             self.allocator.free(self.slot_persistent_descs);
             self.allocator.free(self.non_persistent_descs);
             self.allocator.free(self.decode_results);
             self.allocator.free(self.decode_requests);
+            self.allocator.free(self.decode_candidate_counts);
+            self.allocator.free(self.decode_candidate_ids);
+            self.allocator.free(self.decode_candidate_logits);
             self.allocator.free(self.logits_buffer);
             self.step_events.deinit(self.allocator);
             self.sampler.deinit();
@@ -706,6 +729,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Free slot if allocated
             if (request_entry.slot_index) |slot_index| {
                 self.releaseRequestStateBlocks(request_id, slot_index);
+                if (slot_index < self.slot_request_ids.len) {
+                    self.slot_request_ids[slot_index] = null;
+                }
                 self.backend.freeSlot(slot_index);
                 request_entry.slot_index = null;
             }
@@ -759,6 +785,216 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             return self.pending_queue.items.len;
         }
 
+        fn addDecodeTimeToGeneratingRequests(self: *Self, decode_step_ns: u64) void {
+            for (self.active_requests.items) |active_request_id| {
+                const request_entry = self.requests.get(active_request_id) orelse continue;
+                if (request_entry.state != .generating) continue;
+                if (request_entry.slot_index == null) continue;
+                request_entry.decode_ns += decode_step_ns;
+            }
+        }
+
+        fn resolveBatchedTopKRoute(self: *Self, decode_batch_size: usize) ?usize {
+            const use_batched_topk = comptime blk: {
+                if (!@hasDecl(BackendType, "decodeBatchTopKCandidates")) break :blk false;
+                if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKDecodeRoute") and
+                    !@hasDecl(BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
+                {
+                    break :blk false;
+                }
+                break :blk true;
+            };
+            if (!use_batched_topk) return null;
+            if (decode_batch_size == 0) return null;
+
+            var common_top_k: usize = 0;
+            for (self.decode_requests[0..decode_batch_size]) |req| {
+                if (req.slot_index >= self.slot_request_ids.len) return null;
+                const request_id = self.slot_request_ids[req.slot_index] orelse return null;
+                const request_entry = self.requests.get(request_id) orelse return null;
+                if (request_entry.state != .generating) return null;
+                if (request_entry.slot_index == null or request_entry.slot_index.? != req.slot_index) return null;
+                if (request_entry.grammar_sampler != null) return null;
+                if (request_entry.capture_final_logits) return null;
+                if (request_entry.sampling_config.top_k == 0 or request_entry.sampling_config.top_k > 256) return null;
+                const supports_topk = if (comptime @hasDecl(BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
+                    self.backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&request_entry.sampling_config)
+                else
+                    self.backend.supportsSchedulerBackendTopKDecodeRoute(&request_entry.sampling_config);
+                if (!supports_topk) return null;
+                if (common_top_k == 0) {
+                    common_top_k = request_entry.sampling_config.top_k;
+                } else if (common_top_k != request_entry.sampling_config.top_k) {
+                    return null;
+                }
+            }
+            return if (common_top_k > 0) common_top_k else null;
+        }
+
+        fn stepBatchedTopKCandidates(
+            self: *Self,
+            decode_batch_size: usize,
+            top_k: usize,
+            completed_before: usize,
+            prefill_completed: usize,
+        ) ![]const TokenEvent {
+            const use_batched_topk = comptime @hasDecl(BackendType, "decodeBatchTopKCandidates");
+            if (!use_batched_topk) return error.NotEligible;
+            if (decode_batch_size == 0) return &.{};
+            if (top_k == 0 or top_k > 256) return error.InvalidArgument;
+
+            // Reset step-scoped state for all generating requests before decode.
+            for (self.active_requests.items) |active_id| {
+                const req = self.requests.get(active_id) orelse continue;
+                if (req.state != .generating) continue;
+                try self.resetStepScopedBlocks(active_id);
+            }
+
+            const needed_candidates = std.math.mul(usize, decode_batch_size, top_k) catch return error.InvalidArgument;
+            if (needed_candidates > self.decode_candidate_logits.len or
+                needed_candidates > self.decode_candidate_ids.len or
+                decode_batch_size > self.decode_candidate_counts.len)
+            {
+                return error.InvalidArgument;
+            }
+
+            var decode_timer = std.time.Timer.start() catch unreachable;
+            try self.backend.decodeBatchTopKCandidates(
+                self.decode_requests[0..decode_batch_size],
+                top_k,
+                self.decode_candidate_logits[0..needed_candidates],
+                self.decode_candidate_ids[0..needed_candidates],
+                self.decode_candidate_counts[0..decode_batch_size],
+            );
+            const decode_step_ns = decode_timer.read();
+            self.addDecodeTimeToGeneratingRequests(decode_step_ns);
+
+            self.step_events.clearRetainingCapacity();
+
+            for (0..decode_batch_size) |row_idx| {
+                const req = self.decode_requests[row_idx];
+                if (req.slot_index >= self.slot_request_ids.len) continue;
+                const request_id = self.slot_request_ids[req.slot_index] orelse continue;
+                const request_entry = self.requests.get(request_id) orelse continue;
+                if (request_entry.state != .generating) continue;
+                if (request_entry.slot_index == null or request_entry.slot_index.? != req.slot_index) continue;
+
+                const candidate_count = self.decode_candidate_counts[row_idx];
+                if (candidate_count == 0 or candidate_count > top_k) continue;
+                const row_start = std.math.mul(usize, row_idx, top_k) catch return error.InvalidArgument;
+                const row_end = std.math.add(usize, row_start, candidate_count) catch return error.InvalidArgument;
+                var sample_cfg = request_entry.sampling_config;
+                sample_cfg.context_tokens = request_entry.generated_tokens.items;
+                var next_token = self.sampleTopKCandidateToken(
+                    self.decode_candidate_logits[row_start..row_end],
+                    self.decode_candidate_ids[row_start..row_end],
+                    sample_cfg,
+                ) catch 0;
+
+                if (request_entry.in_thinking) {
+                    if (request_entry.thinking_inject_pos > 0) {
+                        next_token = request_entry.thinking_end_tokens[request_entry.thinking_inject_pos];
+                        request_entry.thinking_inject_pos += 1;
+                        if (request_entry.thinking_inject_pos >= request_entry.thinking_end_tokens.len) {
+                            request_entry.in_thinking = false;
+                            request_entry.generating_answer = true;
+                        }
+                    } else if (request_entry.thinking_token_count >= request_entry.max_thinking_tokens) {
+                        next_token = request_entry.thinking_end_tokens[0];
+                        request_entry.thinking_inject_pos = 1;
+                        if (request_entry.thinking_end_tokens.len == 1) {
+                            request_entry.in_thinking = false;
+                            request_entry.generating_answer = true;
+                        }
+                    } else {
+                        request_entry.thinking_token_count += 1;
+                        if (request_entry.thinking_end_tokens.len > 0 and
+                            next_token == request_entry.thinking_end_tokens[0])
+                        {
+                            request_entry.in_thinking = false;
+                            request_entry.generating_answer = true;
+                        }
+                    }
+                } else if (!request_entry.generating_answer) {
+                    request_entry.generating_answer = true;
+                }
+
+                if (trace.isEnabled()) {
+                    var selected_token = [_]f32{@floatFromInt(next_token)};
+                    trace.emitFinal(
+                        .token_select,
+                        @intCast(request_entry.generated_tokens.items.len),
+                        @intCast(request_entry.token_position),
+                        @ptrCast(selected_token[0..].ptr),
+                        .f32,
+                        .{ 1, 0, 0, 0 },
+                        1,
+                        "sampleTopKBatch",
+                    );
+                }
+
+                try request_entry.generated_tokens.append(self.allocator, next_token);
+                request_entry.token_position += 1;
+
+                var finish_reason: FinishReason = .in_progress;
+                if (grammarIsComplete(request_entry.grammar_sampler)) {
+                    finish_reason = .stop_sequence;
+                }
+                for (request_entry.eos_token_ids) |eos_id| {
+                    if (next_token == eos_id) {
+                        finish_reason = if (grammarCompleteOnEos(request_entry.grammar_sampler)) .stop_sequence else .eos_token;
+                        break;
+                    }
+                }
+
+                if (finish_reason == .in_progress and request_entry.stop_sequences.len > 0) {
+                    const stop_len = checkStopSequence(request_entry.generated_tokens.items, request_entry.stop_sequences);
+                    if (stop_len > 0) {
+                        finish_reason = .stop_sequence;
+                        request_entry.generated_tokens.shrinkRetainingCapacity(request_entry.generated_tokens.items.len - stop_len);
+                    }
+                }
+
+                if (finish_reason == .in_progress and request_entry.generating_answer and
+                    request_entry.max_completion_tokens_limit > 0)
+                {
+                    request_entry.completion_token_count += 1;
+                    if (request_entry.completion_token_count >= request_entry.max_completion_tokens_limit) {
+                        finish_reason = .length;
+                    }
+                }
+
+                if (finish_reason == .in_progress and request_entry.generated_tokens.items.len >= request_entry.max_tokens) {
+                    finish_reason = .length;
+                }
+
+                const is_final_token = finish_reason != .in_progress;
+                if (request_entry.callback) |cb| {
+                    if (finish_reason != .stop_sequence) {
+                        cb(request_entry.id, next_token, is_final_token, request_entry.callback_data);
+                    }
+                }
+
+                try self.step_events.append(self.allocator, .{
+                    .request_id = request_entry.id,
+                    .token = next_token,
+                    .is_final = is_final_token,
+                    .slot_index = req.slot_index,
+                });
+
+                if (is_final_token) {
+                    self.completeRequest(request_entry, finish_reason);
+                }
+            }
+
+            if (prefill_completed > 0) {
+                try self.appendPrefillCompletedEvents(&self.step_events, completed_before);
+            }
+
+            try self.activatePending();
+            return self.step_events.items;
+        }
+
         /// Run one generation step for all active requests.
         ///
         /// This is the main scheduler loop body. It:
@@ -810,6 +1046,15 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     return try self.buildPrefillCompletedEvents(completed_before);
                 }
                 return &.{};
+            }
+
+            if (self.resolveBatchedTopKRoute(decode_batch_size)) |top_k| {
+                return try self.stepBatchedTopKCandidates(
+                    decode_batch_size,
+                    top_k,
+                    completed_before,
+                    prefill_completed,
+                );
             }
 
             // Fast path: when there is exactly one generating request and the
@@ -866,28 +1111,17 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 self.decode_results[0..decode_batch_size],
             );
             const decode_step_ns = decode_timer.read();
-            for (self.active_requests.items) |active_request_id| {
-                const request_entry = self.requests.get(active_request_id) orelse continue;
-                if (request_entry.state != .generating) continue;
-                if (request_entry.slot_index == null) continue;
-                request_entry.decode_ns += decode_step_ns;
-            }
+            self.addDecodeTimeToGeneratingRequests(decode_step_ns);
 
             // Sample next tokens and build events (reuse persistent buffer).
             self.step_events.clearRetainingCapacity();
 
             for (self.decode_results[0..decode_batch_size]) |result| {
-                // Find request for this slot
-                var matched_request_entry: ?*Request = null;
-                for (self.active_requests.items) |active_request_id| {
-                    const request_entry = self.requests.get(active_request_id) orelse continue;
-                    if (request_entry.slot_index == result.slot_index) {
-                        matched_request_entry = request_entry;
-                        break;
-                    }
-                }
-                if (matched_request_entry == null) continue;
-                const request_entry = matched_request_entry.?;
+                if (result.slot_index >= self.slot_request_ids.len) continue;
+                const request_id = self.slot_request_ids[result.slot_index] orelse continue;
+                const request_entry = self.requests.get(request_id) orelse continue;
+                if (request_entry.state != .generating) continue;
+                if (request_entry.slot_index == null or request_entry.slot_index.? != result.slot_index) continue;
 
                 if (trace.isEnabled()) {
                     trace.emitFinal(
@@ -2118,6 +2352,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     request_entry.slot_index = slot_index;
                     request_entry.state = .pending_prefill;
                     try self.active_requests.append(self.allocator, pending_request_id);
+                    if (slot_index < self.slot_request_ids.len) {
+                        self.slot_request_ids[slot_index] = pending_request_id;
+                    }
                     _ = self.pending_queue.orderedRemove(0);
                 } else {
                     // No more slots available
@@ -2230,6 +2467,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Free slot
             if (request_entry.slot_index) |slot_index| {
                 self.releaseRequestStateBlocks(request_entry.id, slot_index);
+                if (slot_index < self.slot_request_ids.len) {
+                    self.slot_request_ids[slot_index] = null;
+                }
                 self.backend.freeSlot(slot_index);
                 request_entry.slot_index = null;
             }

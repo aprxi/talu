@@ -112,3 +112,64 @@ extern "C" __global__ void talu_argmax_f32(
         out_index[0] = shared_idx[0];
     }
 }
+
+extern "C" __global__ void talu_topk_rows_f32(
+    float* out_values,
+    unsigned int* out_ids,
+    float* logits_inout,
+    unsigned int rows,
+    unsigned int vocab,
+    unsigned int row_stride,
+    unsigned int k
+) {
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const unsigned int tid = threadIdx.x;
+    float* row_logits = logits_inout + row * vocab;
+    const float mask_value = -3.402823466e+38f;
+
+    __shared__ float shared_val[256];
+    __shared__ unsigned int shared_idx[256];
+
+    for (unsigned int pick = 0; pick < k; ++pick) {
+        float local_best_val = mask_value;
+        unsigned int local_best_idx = 0;
+
+        for (unsigned int col = tid; col < vocab; col += blockDim.x) {
+            const float value = row_logits[col];
+            if (value > local_best_val || (value == local_best_val && col < local_best_idx)) {
+                local_best_val = value;
+                local_best_idx = col;
+            }
+        }
+
+        shared_val[tid] = local_best_val;
+        shared_idx[tid] = local_best_idx;
+        __syncthreads();
+
+        for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                const float other_val = shared_val[tid + stride];
+                const unsigned int other_idx = shared_idx[tid + stride];
+                const float cur_val = shared_val[tid];
+                const unsigned int cur_idx = shared_idx[tid];
+                if (other_val > cur_val || (other_val == cur_val && other_idx < cur_idx)) {
+                    shared_val[tid] = other_val;
+                    shared_idx[tid] = other_idx;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            const unsigned int out_index = row * row_stride + pick;
+            const unsigned int winner_idx = shared_idx[0];
+            const float winner_val = shared_val[0];
+            out_values[out_index] = winner_val;
+            out_ids[out_index] = winner_idx;
+            row_logits[winner_idx] = mask_value;
+        }
+        __syncthreads();
+    }
+}

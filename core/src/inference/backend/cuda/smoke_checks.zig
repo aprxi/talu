@@ -1607,6 +1607,7 @@ fn runMatvecU16Smoke(
         &out_bf16_dev,
         in_dim,
         out_dim,
+        1,
         0,
     );
     try compute.cuda.matvec_u16.runWithFunction(
@@ -1618,6 +1619,7 @@ fn runMatvecU16Smoke(
         &out_f16_dev,
         in_dim,
         out_dim,
+        1,
         0,
     );
     try out_bf16_dev.download(device, std.mem.sliceAsBytes(actual_bf16[0..]));
@@ -1663,6 +1665,7 @@ fn runMatvecU16Smoke(
         &out_unaligned_dev,
         in_dim,
         out_dim,
+        1,
         0,
     );
     try out_unaligned_dev.download(device, std.mem.sliceAsBytes(actual_unaligned[0..]));

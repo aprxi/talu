@@ -79,6 +79,17 @@ extern "C" __global__ void talu_cast_f32_to_bf16(
     out[index] = (unsigned short)((bits + rounding_bias) >> 16);
 }
 
+extern "C" __global__ void talu_decode_u32_increment(
+    unsigned int* seq_lens,
+    unsigned int* positions,
+    unsigned int count
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    seq_lens[index] += 1u;
+    positions[index] += 1u;
+}
+
 extern "C" __global__ void talu_embedding_lookup_f32(
     float* out,
     const float* embeddings,

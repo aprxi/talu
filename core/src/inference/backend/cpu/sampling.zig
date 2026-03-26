@@ -230,25 +230,17 @@ pub const Sampler = struct {
         // For non-greedy strategies, temperature must be positive
         if (config.temperature <= 0) return error.InvalidTemperature;
 
-        // Use workspace buffers (no allocation per sample!)
-        const probabilities = self.workspace.probabilities[0..logits.len];
-
-        // Temperature softmax into workspace
-        for (logits, probabilities) |logit, *probability| probability.* = logit / config.temperature;
-        cpu_softmax.stableInPlace(probabilities);
-
-        // Apply min_p filtering if configured
-        // Tokens with probability < min_p * max_prob are zeroed out
-        cpu_sampling_ops.applyMinP(probabilities, config.min_p);
-
+        var sampled_index: usize = logits.len - 1;
         if (config.strategy == .top_k) {
-            // For top_k: use quick select O(N) to find top K, then sort only those K
+            // For top_k: select top K from scaled logits first, then softmax only K.
+            // This avoids full-vocab softmax for each decode step.
             const sorted_entries = self.workspace.sorted_entries[0..logits.len];
-            for (probabilities, 0..) |probability, token_index| {
-                sorted_entries[token_index] = IndexValue.init(@intCast(token_index), probability);
-            }
-
             const top_k_count = @min(config.top_k, logits.len);
+            if (top_k_count == 0) return error.InvalidInput;
+            for (logits, 0..) |logit, token_index| {
+                const scaled_logit = logit / config.temperature;
+                sorted_entries[token_index] = IndexValue.init(@intCast(token_index), scaled_logit);
+            }
 
             // Quick select partitions so top K are in [0..k), rest are in [k..n)
             cpu_topk.quickSelectTopK(sorted_entries, top_k_count);
@@ -256,15 +248,43 @@ pub const Sampler = struct {
             // Sort only the top K elements (typically 40 vs 152K)
             std.sort.pdq(IndexValue, sorted_entries[0..top_k_count], {}, byProbabilityDesc);
 
-            // Compute sum of top-k
-            var top_k_prob_sum: f32 = 0;
-            for (sorted_entries[0..top_k_count]) |entry| {
-                top_k_prob_sum += probabilities[entry.index];
+            // Softmax only top-k subset.
+            const top_k_probabilities = self.workspace.probabilities[0..top_k_count];
+            for (sorted_entries[0..top_k_count], 0..) |entry, rank| {
+                top_k_probabilities[rank] = entry.value;
             }
-            if (top_k_prob_sum == 0) return error.InvalidInput;
+            cpu_softmax.stableInPlace(top_k_probabilities);
+            cpu_sampling_ops.applyMinP(top_k_probabilities, config.min_p);
 
-            cpu_sampling_ops.renormalizeSubset(probabilities, sorted_entries[0..top_k_count], top_k_prob_sum);
+            var top_k_prob_sum: f32 = 0;
+            for (top_k_probabilities) |probability| top_k_prob_sum += probability;
+            if (top_k_prob_sum == 0) return error.InvalidInput;
+            const top_k_inverse_sum = 1.0 / top_k_prob_sum;
+            for (top_k_probabilities) |*probability| probability.* *= top_k_inverse_sum;
+
+            const random_draw = self.prng.random().float(f32);
+            var cumulative_probability: f32 = 0;
+            var sampled_rank: usize = top_k_count - 1;
+            for (top_k_probabilities, 0..) |probability, rank| {
+                cumulative_probability += probability;
+                if (random_draw < cumulative_probability) {
+                    sampled_rank = rank;
+                    break;
+                }
+            }
+            sampled_index = @intCast(sorted_entries[sampled_rank].index);
         } else if (config.strategy == .top_p) {
+            // Use workspace buffers (no allocation per sample!)
+            const probabilities = self.workspace.probabilities[0..logits.len];
+
+            // Temperature softmax into workspace
+            for (logits, probabilities) |logit, *probability| probability.* = logit / config.temperature;
+            cpu_softmax.stableInPlace(probabilities);
+
+            // Apply min_p filtering if configured
+            // Tokens with probability < min_p * max_prob are zeroed out
+            cpu_sampling_ops.applyMinP(probabilities, config.min_p);
+
             // For top_p: we need full sort since we don't know cutoff ahead of time
             const sorted_entries = self.workspace.sorted_entries[0..logits.len];
             for (probabilities, 0..) |probability, token_index| {
@@ -285,17 +305,16 @@ pub const Sampler = struct {
             if (cumulative_probability == 0) return error.InvalidInput;
 
             cpu_sampling_ops.renormalizeSubset(probabilities, sorted_entries[0..cutoff_len], cumulative_probability);
-        }
 
-        // Sample from multinomial
-        const random_draw = self.prng.random().float(f32);
-        var cumulative_probability: f32 = 0;
-        var sampled_index: usize = logits.len - 1;
-        for (probabilities, 0..) |probability, token_index| {
-            cumulative_probability += probability;
-            if (random_draw < cumulative_probability) {
-                sampled_index = token_index;
-                break;
+            // Sample from multinomial
+            const random_draw = self.prng.random().float(f32);
+            var sample_cumulative_probability: f32 = 0;
+            for (probabilities, 0..) |probability, token_index| {
+                sample_cumulative_probability += probability;
+                if (random_draw < sample_cumulative_probability) {
+                    sampled_index = token_index;
+                    break;
+                }
             }
         }
 

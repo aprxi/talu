@@ -1984,10 +1984,10 @@ test "supportsSchedulerBackendDecodeStreamingRoute: metal delegated" {
     try std.testing.expectEqual(true, metal_backend.supportsSchedulerBackendDecodeStreamingRoute());
 }
 
-test "supportsSchedulerBackendDecodeStreamingRoute: cuda delegated" {
+test "supportsSchedulerBackendDecodeStreamingRoute: cuda disabled" {
     if (!has_cuda) return;
     const cuda_backend: Backend = .{ .cuda = undefined };
-    try std.testing.expectEqual(true, cuda_backend.supportsSchedulerBackendDecodeStreamingRoute());
+    try std.testing.expectEqual(false, cuda_backend.supportsSchedulerBackendDecodeStreamingRoute());
 }
 
 test "supportsSchedulerBackendTopKDecodeRoute: cpu disabled" {
@@ -2001,7 +2001,7 @@ test "supportsSchedulerBackendTopKDecodeRoute: cpu disabled" {
     try std.testing.expectEqual(false, cpu_backend.supportsSchedulerBackendTopKDecodeRoute(&sampling_config));
 }
 
-test "supportsSchedulerBackendTopKDecodeRoute: cuda delegated" {
+test "supportsSchedulerBackendTopKDecodeRoute: cuda disabled" {
     if (!has_cuda) return;
     const cuda_backend: Backend = .{ .cuda = undefined };
     const sampling_config = cpu.sampling.SamplingConfig{
@@ -2010,7 +2010,7 @@ test "supportsSchedulerBackendTopKDecodeRoute: cuda delegated" {
         .temperature = 0.7,
         .min_p = 0.0,
     };
-    try std.testing.expectEqual(true, cuda_backend.supportsSchedulerBackendTopKDecodeRoute(&sampling_config));
+    try std.testing.expectEqual(false, cuda_backend.supportsSchedulerBackendTopKDecodeRoute(&sampling_config));
 }
 
 test "kernel parity: rope cpu vs metal" {

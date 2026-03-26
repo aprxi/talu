@@ -8,12 +8,13 @@ const module_mod = @import("module.zig");
 
 const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
-pub const embedded_symbol_f16: [:0]const u8 = "talu_matvec_qkv_f16_f32";
-pub const embedded_symbol_bf16: [:0]const u8 = "talu_matvec_qkv_bf16_f32";
+pub const embedded_symbol_f16: [:0]const u8 = "talu_matvec_qkv_f16_f32_batch";
+pub const embedded_symbol_bf16: [:0]const u8 = "talu_matvec_qkv_bf16_f32_batch";
 pub const op_name_f16: []const u8 = "matvec_qkv_f16_f32";
 pub const op_name_bf16: []const u8 = "matvec_qkv_bf16_f32";
 const warp_size: u32 = 32;
 const block_x: u32 = 256;
+const inner_batch_rows: u32 = 8;
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,
@@ -31,7 +32,10 @@ pub fn runWithFunction(
     v_out_dim: u32,
     in_dim: u32,
 ) !void {
-    try validateArgs(
+    return runWithFunctionGridBatch(
+        arg_pack,
+        device,
+        function,
         input,
         q_weight_u16,
         q_out,
@@ -43,6 +47,42 @@ pub fn runWithFunction(
         v_out,
         v_out_dim,
         in_dim,
+        1,
+    );
+}
+
+/// Canonical batched launch. The kernel handles multiple batch rows internally
+/// to reuse weight reads.
+pub fn runWithFunctionGridBatch(
+    arg_pack: *args_mod.ArgPack,
+    device: *device_mod.Device,
+    function: module_mod.Function,
+    input: *const device_mod.Buffer,
+    q_weight_u16: *const device_mod.Buffer,
+    q_out: *device_mod.Buffer,
+    q_out_dim: u32,
+    k_weight_u16: *const device_mod.Buffer,
+    k_out: *device_mod.Buffer,
+    k_out_dim: u32,
+    v_weight_u16: *const device_mod.Buffer,
+    v_out: *device_mod.Buffer,
+    v_out_dim: u32,
+    in_dim: u32,
+    batch_rows: u32,
+) !void {
+    try validateArgsBatch(
+        input,
+        q_weight_u16,
+        q_out,
+        q_out_dim,
+        k_weight_u16,
+        k_out,
+        k_out_dim,
+        v_weight_u16,
+        v_out,
+        v_out_dim,
+        in_dim,
+        batch_rows,
     );
 
     arg_pack.reset();
@@ -57,12 +97,12 @@ pub fn runWithFunction(
     try arg_pack.appendBufferPtr(v_out);
     try arg_pack.appendScalar(u32, v_out_dim);
     try arg_pack.appendScalar(u32, in_dim);
-
     const qk = std.math.add(u32, q_out_dim, k_out_dim) catch return error.InvalidArgument;
     const total = std.math.add(u32, qk, v_out_dim) catch return error.InvalidArgument;
     const rows_per_block = block_x / warp_size;
     try launch_mod.launchWithFamily(device, function, .{
         .grid_x = ceilDiv(total, rows_per_block),
+        .grid_y = ceilDiv(batch_rows, inner_batch_rows),
         .block_x = block_x,
     }, arg_pack, .matvec_qkv);
 }
@@ -101,6 +141,47 @@ fn validateOne(
     if (input.size < input_bytes or weight_u16.size < weight_bytes or out.size < out_bytes) return error.InvalidArgument;
 }
 
+fn validateArgsBatch(
+    input: *const device_mod.Buffer,
+    q_weight_u16: *const device_mod.Buffer,
+    q_out: *device_mod.Buffer,
+    q_out_dim: u32,
+    k_weight_u16: *const device_mod.Buffer,
+    k_out: *device_mod.Buffer,
+    k_out_dim: u32,
+    v_weight_u16: *const device_mod.Buffer,
+    v_out: *device_mod.Buffer,
+    v_out_dim: u32,
+    in_dim: u32,
+    batch_rows: u32,
+) !void {
+    if (batch_rows == 0) return error.InvalidArgument;
+
+    try validateOneBatch(input, q_weight_u16, q_out, in_dim, q_out_dim, batch_rows);
+    try validateOneBatch(input, k_weight_u16, k_out, in_dim, k_out_dim, batch_rows);
+    try validateOneBatch(input, v_weight_u16, v_out, in_dim, v_out_dim, batch_rows);
+}
+
+fn validateOneBatch(
+    input: *const device_mod.Buffer,
+    weight_u16: *const device_mod.Buffer,
+    out: *device_mod.Buffer,
+    in_dim: u32,
+    out_dim: u32,
+    batch_rows: u32,
+) !void {
+    if (batch_rows == 0) return error.InvalidArgument;
+
+    const batch_rows_usize: usize = @intCast(batch_rows);
+    const input_row_bytes = std.math.mul(usize, @as(usize, in_dim), @sizeOf(f32)) catch return error.InvalidArgument;
+    const input_bytes = std.math.mul(usize, input_row_bytes, batch_rows_usize) catch return error.InvalidArgument;
+    const weight_elems = std.math.mul(usize, @as(usize, in_dim), @as(usize, out_dim)) catch return error.InvalidArgument;
+    const weight_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch return error.InvalidArgument;
+    const out_row_bytes = std.math.mul(usize, @as(usize, out_dim), @sizeOf(f32)) catch return error.InvalidArgument;
+    const out_bytes = std.math.mul(usize, out_row_bytes, batch_rows_usize) catch return error.InvalidArgument;
+    if (input.size < input_bytes or weight_u16.size < weight_bytes or out.size < out_bytes) return error.InvalidArgument;
+}
+
 fn ceilDiv(numerator: u32, denominator: u32) u32 {
     return (numerator + denominator - 1) / denominator;
 }
@@ -119,5 +200,24 @@ test "validateArgs rejects undersized q weight buffer" {
     try std.testing.expectError(
         error.InvalidArgument,
         validateArgs(&input, &small_weight, &out, 4, &input, &out, 4, &input, &out, 4, 4),
+    );
+}
+
+test "validateArgsBatch rejects zero batch rows" {
+    const b = device_mod.Buffer{ .pointer = 0, .size = 4096 };
+    var out = b;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        validateArgsBatch(&b, &b, &out, 4, &b, &out, 4, &b, &out, 4, 4, 0),
+    );
+}
+
+test "validateArgsBatch rejects undersized batched output" {
+    const input = device_mod.Buffer{ .pointer = 0, .size = 8 * @sizeOf(f32) };
+    const weight = device_mod.Buffer{ .pointer = 0, .size = 4 * 4 * @sizeOf(u16) };
+    var out = device_mod.Buffer{ .pointer = 0, .size = 4 * @sizeOf(f32) };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        validateArgsBatch(&input, &weight, &out, 4, &weight, &out, 4, &weight, &out, 4, 4, 2),
     );
 }

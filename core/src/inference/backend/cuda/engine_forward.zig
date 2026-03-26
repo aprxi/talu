@@ -1868,11 +1868,17 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
 /// Batched decode: process N tokens at different positions/slots together.
 /// Uses GEMM (not GEMV) for layer projections, sharing weight reads
 /// across sequences for ~Nx throughput.
-pub fn computeBatchedDecodeLogits(
+const BatchedDecodeOutputMode = enum {
+    host_logits,
+    device_only,
+};
+
+fn computeBatchedDecodeLogitsWithMode(
     self: anytype,
     tokens: []const u32,
     slot_indices: []const usize,
     positions: []const usize,
+    output_mode: BatchedDecodeOutputMode,
 ) !void {
     const SelfType = @TypeOf(self.*);
     const n_usize = tokens.len;
@@ -1880,6 +1886,7 @@ pub fn computeBatchedDecodeLogits(
     if (n_usize > self.max_batch_size) return error.InvalidArgument;
     const n: u32 = @intCast(n_usize);
     if (topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) {
+        if (output_mode == .device_only) return error.UnsupportedModel;
         for (0..n_usize) |i| {
             self.activateKvSlot(slot_indices[i]);
             try computeGpuPrototypeLogitsWithLayerLimit(
@@ -1923,12 +1930,30 @@ pub fn computeBatchedDecodeLogits(
     try self.runtime_buffers.ensureRowCapacity(&self.device, n_usize, self.fixed_alloc_mode);
     try self.ensureLayerProgramSlotRowCapacity(n_usize, self.fixed_alloc_mode);
 
-    // Ensure KV capacity for each slot via activate/ensure/save.
+    // Ensure KV capacity for each slot only when growth is required.
+    var require_kv_growth = false;
     for (0..n_usize) |i| {
-        self.activateKvSlot(slot_indices[i]);
-        try ensureKvCapacity(self, positions[i] + 1);
+        const required_tokens = positions[i] + 1;
+        const slot_state = &self.slot_kv_states[slot_indices[i]];
+        var slot_min_capacity = self.max_seq_len;
+        if (slot_state.kv.len > 0) {
+            slot_min_capacity = slot_state.kv[0].capacity;
+            for (slot_state.kv[1..]) |kv_entry| {
+                if (kv_entry.capacity < slot_min_capacity) slot_min_capacity = kv_entry.capacity;
+            }
+        }
+        if (required_tokens > slot_min_capacity) {
+            require_kv_growth = true;
+            break;
+        }
     }
-    self.saveActiveKvSlot();
+    if (require_kv_growth) {
+        for (0..n_usize) |i| {
+            self.activateKvSlot(slot_indices[i]);
+            try ensureKvCapacity(self, positions[i] + 1);
+        }
+        self.saveActiveKvSlot();
+    }
 
     // Extract kernel functions (same set as single-token path).
     const shortconv_step_function = self.shortconv_step_function orelse return error.CudaKernelUnavailable;
@@ -1997,202 +2022,471 @@ pub fn computeBatchedDecodeLogits(
     const embedding_lookup_f32_function = self.embedding_lookup_f32_function;
     const embedding_lookup_u16_function = self.embedding_lookup_u16_function;
     const embedding_lookup_gaffine_u4_function = self.embedding_lookup_gaffine_u4_function;
-    for (0..n_usize) |i| {
-        var input_row = try bufferSlice(&self.runtime_buffers.input_dev, i * row_bytes, row_bytes);
-        var used_device_lookup = false;
-        if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
-            const lookup = &self.runtime_buffers.embedding_lookup.?;
-            switch (lookup.kind) {
-                .f32 => {
-                    if (embedding_lookup_f32_function) |kernel| {
-                        try compute.cuda.embedding_lookup_f32.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            kernel,
-                            &input_row,
-                            &lookup.buffer,
-                            lookup.dim0,
-                            lookup.dim1,
-                            lookup.hidden_dim,
-                            tokens[i],
-                            lookup.layout_tag,
-                            lookup.multiplier,
-                        );
-                        used_device_lookup = true;
-                    }
-                },
-                .f16 => {
-                    if (embedding_lookup_u16_function) |kernel| {
-                        try compute.cuda.embedding_lookup_u16.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            kernel,
-                            &input_row,
-                            &lookup.buffer,
-                            lookup.dim0,
-                            lookup.dim1,
-                            lookup.hidden_dim,
-                            tokens[i],
-                            lookup.layout_tag,
-                            compute.cuda.embedding_lookup_u16.dtype_f16,
-                            lookup.multiplier,
-                        );
-                        used_device_lookup = true;
-                    }
-                },
-                .bf16 => {
-                    if (embedding_lookup_u16_function) |kernel| {
-                        try compute.cuda.embedding_lookup_u16.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            kernel,
-                            &input_row,
-                            &lookup.buffer,
-                            lookup.dim0,
-                            lookup.dim1,
-                            lookup.hidden_dim,
-                            tokens[i],
-                            lookup.layout_tag,
-                            compute.cuda.embedding_lookup_u16.dtype_bf16,
-                            lookup.multiplier,
-                        );
-                        used_device_lookup = true;
-                    }
-                },
-                .gaffine_u4 => {
-                    if (embedding_lookup_gaffine_u4_function) |kernel| {
-                        if (lookup.scales) |*scales_buf| {
-                            if (lookup.biases) |*biases_buf| {
-                                try compute.cuda.embedding_lookup_gaffine_u4.runWithFunction(
-                                    &self.kernel_arg_pack,
-                                    &self.device,
-                                    kernel,
-                                    &input_row,
-                                    &lookup.buffer,
-                                    scales_buf,
-                                    biases_buf,
-                                    lookup.dim0,
-                                    lookup.hidden_dim,
-                                    tokens[i],
-                                    lookup.group_size,
-                                    lookup.scales_dtype_tag,
-                                    lookup.multiplier,
-                                );
-                                used_device_lookup = true;
+    var used_rows_device_lookup = false;
+    if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
+        const lookup = &self.runtime_buffers.embedding_lookup.?;
+        switch (lookup.kind) {
+            .f16, .bf16 => {
+                if (self.embedding_lookup_u16_rows_function) |kernel| {
+                    const token_bytes = std.math.mul(usize, n_usize, @sizeOf(u32)) catch return error.InvalidArgument;
+                    var token_ids_dev = try bufferSlice(&self.runtime_buffers.prefill_tokens_dev, 0, token_bytes);
+                    try token_ids_dev.upload(&self.device, std.mem.sliceAsBytes(tokens));
+                    var input_rows = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
+                    try compute.cuda.embedding_lookup_u16_rows.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &input_rows,
+                        &lookup.buffer,
+                        &token_ids_dev,
+                        @intCast(n_usize),
+                        lookup.dim0,
+                        lookup.dim1,
+                        lookup.hidden_dim,
+                        lookup.layout_tag,
+                        switch (lookup.kind) {
+                            .f16 => compute.cuda.embedding_lookup_u16_rows.dtype_f16,
+                            .bf16 => compute.cuda.embedding_lookup_u16_rows.dtype_bf16,
+                            else => unreachable,
+                        },
+                        lookup.multiplier,
+                    );
+                    used_rows_device_lookup = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (!used_rows_device_lookup) {
+        for (0..n_usize) |i| {
+            var input_row = try bufferSlice(&self.runtime_buffers.input_dev, i * row_bytes, row_bytes);
+            var used_device_lookup = false;
+            if (enable_device_embedding_lookup and self.runtime_buffers.embedding_lookup != null) {
+                const lookup = &self.runtime_buffers.embedding_lookup.?;
+                switch (lookup.kind) {
+                    .f32 => {
+                        if (embedding_lookup_f32_function) |kernel| {
+                            try compute.cuda.embedding_lookup_f32.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                kernel,
+                                &input_row,
+                                &lookup.buffer,
+                                lookup.dim0,
+                                lookup.dim1,
+                                lookup.hidden_dim,
+                                tokens[i],
+                                lookup.layout_tag,
+                                lookup.multiplier,
+                            );
+                            used_device_lookup = true;
+                        }
+                    },
+                    .f16 => {
+                        if (embedding_lookup_u16_function) |kernel| {
+                            try compute.cuda.embedding_lookup_u16.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                kernel,
+                                &input_row,
+                                &lookup.buffer,
+                                lookup.dim0,
+                                lookup.dim1,
+                                lookup.hidden_dim,
+                                tokens[i],
+                                lookup.layout_tag,
+                                compute.cuda.embedding_lookup_u16.dtype_f16,
+                                lookup.multiplier,
+                            );
+                            used_device_lookup = true;
+                        }
+                    },
+                    .bf16 => {
+                        if (embedding_lookup_u16_function) |kernel| {
+                            try compute.cuda.embedding_lookup_u16.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                kernel,
+                                &input_row,
+                                &lookup.buffer,
+                                lookup.dim0,
+                                lookup.dim1,
+                                lookup.hidden_dim,
+                                tokens[i],
+                                lookup.layout_tag,
+                                compute.cuda.embedding_lookup_u16.dtype_bf16,
+                                lookup.multiplier,
+                            );
+                            used_device_lookup = true;
+                        }
+                    },
+                    .gaffine_u4 => {
+                        if (embedding_lookup_gaffine_u4_function) |kernel| {
+                            if (lookup.scales) |*scales_buf| {
+                                if (lookup.biases) |*biases_buf| {
+                                    try compute.cuda.embedding_lookup_gaffine_u4.runWithFunction(
+                                        &self.kernel_arg_pack,
+                                        &self.device,
+                                        kernel,
+                                        &input_row,
+                                        &lookup.buffer,
+                                        scales_buf,
+                                        biases_buf,
+                                        lookup.dim0,
+                                        lookup.hidden_dim,
+                                        tokens[i],
+                                        lookup.group_size,
+                                        lookup.scales_dtype_tag,
+                                        lookup.multiplier,
+                                    );
+                                    used_device_lookup = true;
+                                }
                             }
                         }
-                    }
-                },
-            }
-        }
-        if (!used_device_lookup) {
-            const used_model = tryPopulateHiddenFromToken(self.loaded, tokens[i], self.runtime_buffers.hidden_host) catch |err| switch (err) {
-                error.InvalidArgument => return error.InvalidArgument,
-                else => return err,
-            };
-            if (!used_model) return error.UnsupportedModel;
-            if (self.loaded.config.embedding_multiplier != 1.0) {
-                for (self.runtime_buffers.hidden_host) |*v| {
-                    v.* *= self.loaded.config.embedding_multiplier;
+                    },
                 }
             }
-            try input_row.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
-        }
-    }
-
-    // Build BatchDecodeInfo with per-row seq_lens.
-    const seq_lens = try self.allocator.alloc(u32, n_usize);
-    defer self.allocator.free(seq_lens);
-    for (0..n_usize) |i| {
-        seq_lens[i] = @intCast(positions[i] + 1);
-    }
-    var batch_info = BatchDecodeInfo{
-        .slot_indices = slot_indices,
-        .positions = positions,
-        .seq_lens = seq_lens,
-        .attn_layer_index = 0,
-        .gd_layer_index = 0,
-        .sc_layer_index = 0,
-    };
-
-    // Layer loop with N active rows and batch_info.
-    var final_hidden = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
-    const layer_limit = self.block_runtime.blocks.len;
-    for (0..layer_limit) |layer_idx| {
-        const layer = &self.block_runtime.blocks[layer_idx];
-        final_hidden = try self.tryExecuteLayerProgram(
-            layer,
-            slot_indices[0],
-            layer_idx,
-            d_model_u32,
-            head_dim_u32,
-            rope_dim_u32,
-            n_heads_u32,
-            n_kv_heads_u32,
-            n, // active_rows_u32
-            1,
-            1,
-            0,
-            0,
-            0,
-            global_rope_theta,
-            local_rope_theta,
-            rope_function,
-            copy_function,
-            cast_f32_to_f16_function,
-            kv_write_f16_function,
-            rope_store_f16_function,
-            shortconv_step_function,
-            attention_kernels,
-            &batch_info,
-        );
-        // Advance state layer indices for the type of mixer this layer used.
-        if (layer.attention_binding != null) {
-            batch_info.attn_layer_index += 1;
-        }
-        if (layer.gated_delta_binding != null) {
-            batch_info.gd_layer_index += 1;
-        }
-        if (layer.shortconv_binding != null) {
-            batch_info.sc_layer_index += 1;
-        }
-    }
-
-    // Final norm for all N rows.
-    const norm_out_bytes = n_usize * self.d_model * @sizeOf(f32);
-    var norm_out = try bufferSlice(&self.runtime_buffers.norm_out_dev, 0, norm_out_bytes);
-    try compute.cuda.rmsnorm.runWithFunction(
-        &self.kernel_arg_pack,
-        &self.device,
-        self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-        &final_hidden,
-        &self.runtime_buffers.norm_weight_dev,
-        &norm_out,
-        n,
-        d_model_u32,
-        self.norm_eps,
-        self.loaded.runtime.weight_offset,
-    );
-
-    // LM head + download per row (logits_dev is sized for 1 row).
-    const vocab = self.runtime_buffers.projected_vocab;
-    for (0..n_usize) |i| {
-        var norm_row = try logicalF32RowSlice(&norm_out, n_usize, i, self.d_model);
-        try engine_ops.linearForwardRows(self, &norm_row, 1, &self.runtime_buffers.projection_weight, &self.runtime_buffers.logits_dev);
-        try self.runtime_buffers.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host));
-        const slot_logits = self.slotLogits(slot_indices[i]);
-        if (vocab == slot_logits.len) {
-            @memcpy(slot_logits, self.runtime_buffers.projected_logits_host);
-        } else {
-            @memset(slot_logits, -1.0e9);
-            @memcpy(slot_logits[0..vocab], self.runtime_buffers.projected_logits_host);
-        }
-        if (self.loaded.config.logits_scaling != 1.0) {
-            for (slot_logits) |*v| {
-                v.* /= self.loaded.config.logits_scaling;
+            if (!used_device_lookup) {
+                const used_model = tryPopulateHiddenFromToken(self.loaded, tokens[i], self.runtime_buffers.hidden_host) catch |err| switch (err) {
+                    error.InvalidArgument => return error.InvalidArgument,
+                    else => return err,
+                };
+                if (!used_model) return error.UnsupportedModel;
+                if (self.loaded.config.embedding_multiplier != 1.0) {
+                    for (self.runtime_buffers.hidden_host) |*v| {
+                        v.* *= self.loaded.config.embedding_multiplier;
+                    }
+                }
+                try input_row.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
             }
         }
     }
+
+    var slot_set_matches_cache = false;
+    if (comptime @hasField(SelfType, "decode_ptr_tables_cached_rows") and @hasField(SelfType, "decode_ptr_tables_cached_slots")) {
+        if (self.decode_ptr_tables_cached_rows == n_usize and self.decode_ptr_tables_cached_slots.len >= n_usize) {
+            slot_set_matches_cache = true;
+            for (slot_indices, 0..) |slot_idx, i| {
+                if (self.decode_ptr_tables_cached_slots[i] != slot_idx) {
+                    slot_set_matches_cache = false;
+                    break;
+                }
+            }
+        }
+    }
+    const pointer_tables_dirty = if (comptime @hasField(SelfType, "decode_ptr_tables_dirty"))
+        self.decode_ptr_tables_dirty
+    else
+        true;
+    const refresh_pointer_tables = pointer_tables_dirty or !slot_set_matches_cache;
+
+    // Build per-row decode metadata once for this decode step.
+    const seq_lens = self.runtime_buffers.decode_seq_lens_host[0..n_usize];
+    const positions_host = self.runtime_buffers.decode_positions_host[0..n_usize];
+    for (0..n_usize) |i| {
+        seq_lens[i] = @intCast(positions[i] + 1);
+        positions_host[i] = @intCast(positions[i]);
+    }
+    const decode_idx_bytes = std.math.mul(usize, n_usize, @sizeOf(u32)) catch return error.InvalidArgument;
+    var decode_seq_lens_dev = try bufferSlice(&self.runtime_buffers.decode_seq_lens_dev, 0, decode_idx_bytes);
+    var decode_positions_dev = try bufferSlice(&self.runtime_buffers.decode_positions_dev, 0, decode_idx_bytes);
+    if (refresh_pointer_tables) {
+        try decode_seq_lens_dev.upload(&self.device, std.mem.sliceAsBytes(seq_lens));
+        try decode_positions_dev.upload(&self.device, std.mem.sliceAsBytes(positions_host));
+    }
+
+    const attn_layers = self.block_runtime.attention_block_count;
+    const attn_table_entries = std.math.mul(usize, n_usize, attn_layers) catch return error.InvalidArgument;
+    if (attn_table_entries > 0 and refresh_pointer_tables) {
+        var attn_key_ptrs_table_host = self.runtime_buffers.decode_attn_key_cache_ptrs_table_host[0..attn_table_entries];
+        var attn_value_ptrs_table_host = self.runtime_buffers.decode_attn_value_cache_ptrs_table_host[0..attn_table_entries];
+        var attn_layer_idx: usize = 0;
+        for (self.block_runtime.blocks) |layer| {
+            if (layer.attention_binding == null) continue;
+            const table_row_offset = std.math.mul(usize, attn_layer_idx, n_usize) catch return error.InvalidArgument;
+            for (0..n_usize) |row_i| {
+                const slot_idx = slot_indices[row_i];
+                const kv_entry = self.slot_kv_states[slot_idx].kv[attn_layer_idx];
+                const dst_idx = table_row_offset + row_i;
+                attn_key_ptrs_table_host[dst_idx] = kv_entry.k.pointer;
+                attn_value_ptrs_table_host[dst_idx] = kv_entry.v.pointer;
+            }
+            attn_layer_idx += 1;
+        }
+        const attn_table_ptr_bytes = std.math.mul(usize, attn_table_entries, @sizeOf(u64)) catch return error.InvalidArgument;
+        var attn_key_ptrs_table_dev = try bufferSlice(&self.runtime_buffers.decode_attn_key_cache_ptrs_table_dev, 0, attn_table_ptr_bytes);
+        var attn_value_ptrs_table_dev = try bufferSlice(&self.runtime_buffers.decode_attn_value_cache_ptrs_table_dev, 0, attn_table_ptr_bytes);
+        try attn_key_ptrs_table_dev.upload(&self.device, std.mem.sliceAsBytes(attn_key_ptrs_table_host));
+        try attn_value_ptrs_table_dev.upload(&self.device, std.mem.sliceAsBytes(attn_value_ptrs_table_host));
+    }
+
+    const gd_layers = self.block_runtime.gated_delta_block_count;
+    const gd_table_entries = std.math.mul(usize, n_usize, gd_layers) catch return error.InvalidArgument;
+    if (gd_table_entries > 0) {
+        var gd_ring_heads_table_host = self.runtime_buffers.decode_gd_conv_ring_heads_table_host[0..gd_table_entries];
+        // Ring heads table: always populate host-side (needed by engine_mixers
+        // shadow increment), but only upload to device on batch change.  The
+        // conv kernel increments ring heads in-place on device, so successive
+        // steps with the same batch require no transfer.
+        var gd_layer_idx: usize = 0;
+        for (self.block_runtime.blocks) |layer| {
+            if (layer.gated_delta_binding == null) continue;
+            const table_row_offset = std.math.mul(usize, gd_layer_idx, n_usize) catch return error.InvalidArgument;
+            for (0..n_usize) |row_i| {
+                const slot_idx = slot_indices[row_i];
+                const gd_entry = self.slot_kv_states[slot_idx].gd[gd_layer_idx];
+                const dst_idx = table_row_offset + row_i;
+                gd_ring_heads_table_host[dst_idx] = gd_entry.conv_ring_head;
+            }
+            gd_layer_idx += 1;
+        }
+        if (refresh_pointer_tables) {
+            var gd_conv_ptrs_table_host = self.runtime_buffers.decode_gd_conv_state_ptrs_table_host[0..gd_table_entries];
+            var gd_ssm_ptrs_table_host = self.runtime_buffers.decode_gd_ssm_state_ptrs_table_host[0..gd_table_entries];
+            gd_layer_idx = 0;
+            for (self.block_runtime.blocks) |layer_| {
+                if (layer_.gated_delta_binding == null) continue;
+                const table_row_offset = std.math.mul(usize, gd_layer_idx, n_usize) catch return error.InvalidArgument;
+                for (0..n_usize) |row_i| {
+                    const slot_idx = slot_indices[row_i];
+                    const gd_entry = self.slot_kv_states[slot_idx].gd[gd_layer_idx];
+                    const dst_idx = table_row_offset + row_i;
+                    gd_conv_ptrs_table_host[dst_idx] = gd_entry.conv.pointer;
+                    gd_ssm_ptrs_table_host[dst_idx] = gd_entry.ssm.pointer;
+                }
+                gd_layer_idx += 1;
+            }
+            const gd_table_ptr_bytes = std.math.mul(usize, gd_table_entries, @sizeOf(u64)) catch return error.InvalidArgument;
+            const gd_table_idx_bytes = std.math.mul(usize, gd_table_entries, @sizeOf(u32)) catch return error.InvalidArgument;
+            var gd_conv_ptrs_table_dev = try bufferSlice(&self.runtime_buffers.decode_gd_conv_state_ptrs_table_dev, 0, gd_table_ptr_bytes);
+            var gd_ssm_ptrs_table_dev = try bufferSlice(&self.runtime_buffers.decode_gd_ssm_state_ptrs_table_dev, 0, gd_table_ptr_bytes);
+            var gd_ring_heads_table_dev = try bufferSlice(&self.runtime_buffers.decode_gd_conv_ring_heads_table_dev, 0, gd_table_idx_bytes);
+            try gd_conv_ptrs_table_dev.upload(&self.device, std.mem.sliceAsBytes(gd_conv_ptrs_table_host));
+            try gd_ssm_ptrs_table_dev.upload(&self.device, std.mem.sliceAsBytes(gd_ssm_ptrs_table_host));
+            try gd_ring_heads_table_dev.upload(&self.device, std.mem.sliceAsBytes(gd_ring_heads_table_host));
+        }
+    }
+
+    if (refresh_pointer_tables and comptime @hasField(SelfType, "decode_ptr_tables_cached_rows") and @hasField(SelfType, "decode_ptr_tables_cached_slots")) {
+        if (self.decode_ptr_tables_cached_slots.len >= n_usize) {
+            @memcpy(self.decode_ptr_tables_cached_slots[0..n_usize], slot_indices);
+            self.decode_ptr_tables_cached_rows = n_usize;
+        } else {
+            self.decode_ptr_tables_cached_rows = 0;
+        }
+    }
+    if (refresh_pointer_tables and comptime @hasField(SelfType, "decode_ptr_tables_dirty")) {
+        self.decode_ptr_tables_dirty = false;
+    }
+
+    // Logits output setup (common to replay and normal paths).
+    const vocab = self.runtime_buffers.projected_vocab;
+    const logits_elems = std.math.mul(usize, n_usize, vocab) catch return error.InvalidArgument;
+    const logits_bytes = std.math.mul(usize, logits_elems, @sizeOf(f32)) catch return error.InvalidArgument;
+    var logits_batch = try bufferSlice(&self.runtime_buffers.logits_dev, 0, logits_bytes);
+
+    // Compute seq_len tier for batched attention grid dimensions.
+    // Using the model's full max_seq_len would launch millions of empty blocks
+    // and cause poor cache utilization from large output strides. Instead, use
+    // a power-of-2 tier based on the current max seq_len across batch rows.
+    if (comptime @hasField(SelfType, "batched_decode_graph_seq_tier")) {
+        var current_max_seq: u32 = 0;
+        for (0..n_usize) |i| current_max_seq = @max(current_max_seq, seq_lens[i]);
+        if (current_max_seq > self.batched_decode_graph_seq_tier) {
+            // Seq_len exceeded the tier used at graph capture — invalidate.
+            if (comptime @hasField(SelfType, "batched_decode_graph_exec")) {
+                if (self.batched_decode_graph_exec) |exec| {
+                    self.device.graphExecDestroy(exec);
+                    self.batched_decode_graph_exec = null;
+                }
+            }
+            // New tier: next power of 2, capped at model max.
+            // Use self.max_seq_len (immutable) — not batched_attn_max_seq_len
+            // which gets overwritten with the tier value each step.
+            const model_max: u32 = @intCast(self.max_seq_len);
+            self.batched_decode_graph_seq_tier = @min(
+                std.math.ceilPowerOfTwo(u32, current_max_seq) catch model_max,
+                model_max,
+            );
+        }
+        // Set the tier for mixer grid dimensions (buffer is allocated for model max).
+        self.runtime_buffers.batched_attn_max_seq_len = self.batched_decode_graph_seq_tier;
+    }
+
+    // CUDA graph: capture-once-replay-many. Three states:
+    // 1. refresh_pointer_tables=true → run normally, no capture (batch changed).
+    // 2. First steady-state step (no graph exec) → capture + instantiate + launch.
+    // 3. Subsequent steady-state steps → graphLaunch only + host shadow bookkeeping.
+    compute: {
+        // State 3: steady-state replay — cached graph exec + stable batch.
+        if (comptime @hasField(SelfType, "batched_decode_graph_exec")) {
+            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables) {
+                if (self.batched_decode_graph_exec) |exec| {
+                    try self.device.graphLaunch(exec, self.compute_stream.?);
+
+                    // Host shadow: advance GDN ring heads to match device-side advance.
+                    var gd_layer_idx: usize = 0;
+                    for (self.block_runtime.blocks) |blk| {
+                        if (blk.gated_delta_binding == null) continue;
+                        const d_conv: u32 = @intCast(blk.gated_delta_binding.?.kernel.config.d_conv);
+                        for (0..n_usize) |row_i| {
+                            const gd_state = &self.slot_kv_states[slot_indices[row_i]].gd[gd_layer_idx];
+                            gd_state.conv_ring_head = if (gd_state.conv_ring_head + 1 >= d_conv) 0 else gd_state.conv_ring_head + 1;
+                        }
+                        gd_layer_idx += 1;
+                    }
+                    self.loadKvSlot(self.active_kv_slot);
+                    break :compute;
+                }
+            }
+        }
+
+        // States 1 and 2: normal execution with optional graph capture.
+        // Capture only on first steady-state step (state 2).
+        var graph_capture_active = false;
+        if (comptime @hasField(SelfType, "batched_decode_graph_exec")) {
+            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables) {
+                try self.device.streamBeginCapture(self.compute_stream.?);
+                graph_capture_active = true;
+            }
+        }
+        errdefer if (graph_capture_active) {
+            _ = self.device.streamEndCapture(self.compute_stream.?) catch {};
+        };
+
+        var batch_info = BatchDecodeInfo{
+            .slot_indices = slot_indices,
+            .positions = positions,
+            .seq_lens = seq_lens,
+            .attn_ptrs_row_stride = n_usize,
+            .attn_key_cache_ptrs_table_dev = &self.runtime_buffers.decode_attn_key_cache_ptrs_table_dev,
+            .attn_value_cache_ptrs_table_dev = &self.runtime_buffers.decode_attn_value_cache_ptrs_table_dev,
+            .gd_ptrs_row_stride = n_usize,
+            .gd_conv_state_ptrs_table_dev = &self.runtime_buffers.decode_gd_conv_state_ptrs_table_dev,
+            .gd_ssm_state_ptrs_table_dev = &self.runtime_buffers.decode_gd_ssm_state_ptrs_table_dev,
+            .gd_conv_ring_heads_table_dev = &self.runtime_buffers.decode_gd_conv_ring_heads_table_dev,
+            .attn_layer_index = 0,
+            .gd_layer_index = 0,
+            .sc_layer_index = 0,
+        };
+
+        const layer_seq_len_u32: u32 = seq_lens[0];
+        const layer_position: usize = positions[0];
+        const layer_position_u32: u32 = @intCast(layer_position);
+
+        // Multi-row layer loop: all N tokens processed together through each layer.
+        var final_hidden = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
+        const layer_limit = self.block_runtime.blocks.len;
+        for (0..layer_limit) |layer_idx| {
+            const layer = &self.block_runtime.blocks[layer_idx];
+            final_hidden = try self.tryExecuteLayerProgram(
+                layer,
+                slot_indices[0],
+                layer_idx,
+                d_model_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                n_heads_u32,
+                n_kv_heads_u32,
+                n,
+                layer_seq_len_u32,
+                layer_seq_len_u32,
+                0,
+                layer_position,
+                layer_position_u32,
+                global_rope_theta,
+                local_rope_theta,
+                rope_function,
+                copy_function,
+                cast_f32_to_f16_function,
+                kv_write_f16_function,
+                rope_store_f16_function,
+                shortconv_step_function,
+                attention_kernels,
+                &batch_info,
+            );
+            if (layer.attention_binding != null) batch_info.attn_layer_index += 1;
+            if (layer.gated_delta_binding != null) batch_info.gd_layer_index += 1;
+            if (layer.shortconv_binding != null) batch_info.sc_layer_index += 1;
+        }
+
+        // Final norm for all N rows.
+        final_hidden = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
+        const norm_out_bytes = n_usize * self.d_model * @sizeOf(f32);
+        var norm_out = try bufferSlice(&self.runtime_buffers.norm_out_dev, 0, norm_out_bytes);
+        try compute.cuda.rmsnorm.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+            &final_hidden,
+            &self.runtime_buffers.norm_weight_dev,
+            &norm_out,
+            n,
+            d_model_u32,
+            self.norm_eps,
+            self.loaded.runtime.weight_offset,
+        );
+
+        // LM head for all rows.
+        try engine_ops.linearForwardRows(self, &norm_out, n_usize, &self.runtime_buffers.projection_weight, &logits_batch);
+
+        // Keep decode metadata resident on device across token steps.
+        if (comptime @hasDecl(SelfType, "incrementDecodeMetadataInPlace")) {
+            try self.incrementDecodeMetadataInPlace(&decode_seq_lens_dev, &decode_positions_dev, n_usize);
+        }
+
+        // End graph capture: instantiate exec, then launch the captured graph.
+        if (graph_capture_active) {
+            const new_graph = self.device.streamEndCapture(self.compute_stream.?) catch
+                return error.CudaGraphCaptureFailed;
+            graph_capture_active = false;
+            defer self.device.graphDestroy(new_graph);
+
+            if (comptime @hasField(SelfType, "batched_decode_graph_exec")) {
+                self.batched_decode_graph_exec = self.device.graphInstantiate(new_graph) catch
+                    return error.CudaGraphInstantiateFailed;
+                try self.device.graphLaunch(self.batched_decode_graph_exec.?, self.compute_stream.?);
+            }
+        }
+
+        // Sync block_runtime with the active slot's updated state (host operation).
+        self.loadKvSlot(self.active_kv_slot);
+    }
+
+    if (output_mode == .host_logits) {
+        const logits_batch_host = self.runtime_buffers.projected_logits_batch_host[0..logits_elems];
+        try logits_batch.download(&self.device, std.mem.sliceAsBytes(logits_batch_host));
+
+        if (self.loaded.config.logits_scaling != 1.0) {
+            for (0..n_usize) |i| {
+                const row_start = std.math.mul(usize, i, vocab) catch return error.InvalidArgument;
+                const row_end = std.math.add(usize, row_start, vocab) catch return error.InvalidArgument;
+                const row_logits = logits_batch_host[row_start..row_end];
+                for (row_logits) |*v| {
+                    v.* /= self.loaded.config.logits_scaling;
+                }
+            }
+        }
+    }
+}
+
+pub fn computeBatchedDecodeLogits(
+    self: anytype,
+    tokens: []const u32,
+    slot_indices: []const usize,
+    positions: []const usize,
+) !void {
+    return computeBatchedDecodeLogitsWithMode(self, tokens, slot_indices, positions, .host_logits);
+}
+
+pub fn computeBatchedDecodeLogitsDeviceOnly(
+    self: anytype,
+    tokens: []const u32,
+    slot_indices: []const usize,
+    positions: []const usize,
+) !void {
+    return computeBatchedDecodeLogitsWithMode(self, tokens, slot_indices, positions, .device_only);
 }
 
 pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
@@ -2628,6 +2922,7 @@ pub fn ensureKvCapacity(self: anytype, required_tokens: usize) !void {
     else
         null;
 
+    var grew_any = false;
     for (self.block_runtime.blocks) |*layer| {
         const block = layer.attention_binding orelse continue;
         if (required_tokens <= block.kv_capacity) continue;
@@ -2694,6 +2989,16 @@ pub fn ensureKvCapacity(self: anytype, required_tokens: usize) !void {
         block.k_cache = new_kv_pair.k;
         block.v_cache = new_kv_pair.v;
         block.kv_capacity = new_capacity;
+        grew_any = true;
+    }
+    if (grew_any) {
+        const SelfType = @TypeOf(self.*);
+        if (comptime @hasField(SelfType, "decode_ptr_tables_dirty")) {
+            self.decode_ptr_tables_dirty = true;
+            if (comptime @hasField(SelfType, "decode_ptr_tables_cached_rows")) {
+                self.decode_ptr_tables_cached_rows = 0;
+            }
+        }
     }
 }
 

@@ -138,6 +138,8 @@ pub const CudaBackend = struct {
     device: compute.cuda.Device,
     compute_stream: ?compute.cuda.StreamHandle = null,
     decode_graph_exec: ?compute.cuda.GraphExecHandle = null,
+    batched_decode_graph_exec: ?compute.cuda.GraphExecHandle = null,
+    batched_decode_graph_seq_tier: u32 = 0,
     kernel_registry: compute.cuda.Registry,
     vector_add_function: ?compute.cuda.Function = null,
     vector_add_source: ?compute.cuda.registry.KernelSource = null,
@@ -165,6 +167,8 @@ pub const CudaBackend = struct {
     kv_write_f16_source: ?compute.cuda.registry.KernelSource = null,
     kv_write_f16_rows_function: ?compute.cuda.Function = null,
     kv_write_f16_rows_source: ?compute.cuda.registry.KernelSource = null,
+    kv_write_f16_rows_ptrs_function: ?compute.cuda.Function = null,
+    kv_write_f16_rows_ptrs_source: ?compute.cuda.registry.KernelSource = null,
     rmsnorm_function: ?compute.cuda.Function = null,
     rmsnorm_source: ?compute.cuda.registry.KernelSource = null,
     rope_function: ?compute.cuda.Function = null,
@@ -177,6 +181,8 @@ pub const CudaBackend = struct {
     attn_scores_heads_f16_kv_source: ?compute.cuda.registry.KernelSource = null,
     attn_fused_heads_f16_kv_function: ?compute.cuda.Function = null,
     attn_fused_heads_f16_kv_source: ?compute.cuda.registry.KernelSource = null,
+    attn_fused_decode_heads_f16_kv_ptrs_function: ?compute.cuda.Function = null,
+    attn_fused_decode_heads_f16_kv_ptrs_source: ?compute.cuda.registry.KernelSource = null,
     attn_fused_prefill_heads_f16_kv_function: ?compute.cuda.Function = null,
     attn_fused_prefill_heads_f16_kv_source: ?compute.cuda.registry.KernelSource = null,
     attn_fused_prefill_heads_f16_kv_gqa_function: ?compute.cuda.Function = null,
@@ -196,6 +202,14 @@ pub const CudaBackend = struct {
     attn_weighted_sum_heads_f32_source: ?compute.cuda.registry.KernelSource = null,
     attn_weighted_sum_heads_f16_kv_function: ?compute.cuda.Function = null,
     attn_weighted_sum_heads_f16_kv_source: ?compute.cuda.registry.KernelSource = null,
+    rope_rows_ptrs_function: ?compute.cuda.Function = null,
+    rope_rows_ptrs_source: ?compute.cuda.registry.KernelSource = null,
+    attn_scores_heads_f16_kv_ptrs_function: ?compute.cuda.Function = null,
+    attn_scores_heads_f16_kv_ptrs_source: ?compute.cuda.registry.KernelSource = null,
+    softmax_rows_dynamic_cols_ptrs_function: ?compute.cuda.Function = null,
+    softmax_rows_dynamic_cols_ptrs_source: ?compute.cuda.registry.KernelSource = null,
+    attn_weighted_sum_heads_f16_kv_ptrs_function: ?compute.cuda.Function = null,
+    attn_weighted_sum_heads_f16_kv_ptrs_source: ?compute.cuda.registry.KernelSource = null,
     silu_function: ?compute.cuda.Function = null,
     silu_source: ?compute.cuda.registry.KernelSource = null,
     silu_mul_function: ?compute.cuda.Function = null,
@@ -214,18 +228,28 @@ pub const CudaBackend = struct {
     gated_delta_conv_silu_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_conv_silu_rows_function: ?compute.cuda.Function = null,
     gated_delta_conv_silu_rows_source: ?compute.cuda.registry.KernelSource = null,
+    gated_delta_conv_silu_rows_ptrs_function: ?compute.cuda.Function = null,
+    gated_delta_conv_silu_rows_ptrs_source: ?compute.cuda.registry.KernelSource = null,
+    gated_delta_advance_ring_heads_function: ?compute.cuda.Function = null,
+    gated_delta_advance_ring_heads_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_qk_norm_function: ?compute.cuda.Function = null,
     gated_delta_qk_norm_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_ssm_function: ?compute.cuda.Function = null,
     gated_delta_ssm_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_ssm_rows_function: ?compute.cuda.Function = null,
     gated_delta_ssm_rows_source: ?compute.cuda.registry.KernelSource = null,
+    gated_delta_ssm_rows_ptrs_function: ?compute.cuda.Function = null,
+    gated_delta_ssm_rows_ptrs_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_rmsnorm_silu_mul_function: ?compute.cuda.Function = null,
     gated_delta_rmsnorm_silu_mul_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_rmsnorm_silu_mul_rows_function: ?compute.cuda.Function = null,
     gated_delta_rmsnorm_silu_mul_rows_source: ?compute.cuda.registry.KernelSource = null,
     argmax_function: ?compute.cuda.Function = null,
     argmax_source: ?compute.cuda.registry.KernelSource = null,
+    topk_rows_function: ?compute.cuda.Function = null,
+    topk_rows_source: ?compute.cuda.registry.KernelSource = null,
+    decode_u32_increment_function: ?compute.cuda.Function = null,
+    decode_u32_increment_source: ?compute.cuda.registry.KernelSource = null,
     matmul_f16_function: ?compute.cuda.Function = null,
     matmul_f16_source: ?compute.cuda.registry.KernelSource = null,
     matmul_bf16_function: ?compute.cuda.Function = null,
@@ -347,6 +371,11 @@ pub const CudaBackend = struct {
     slot_positions: []usize,
     slot_rope_position_deltas: []isize,
     slot_logits: []f32,
+    /// Cached slot set for batched decode pointer tables.
+    decode_ptr_tables_cached_rows: usize = 0,
+    decode_ptr_tables_cached_slots: []usize = &.{},
+    /// Marks cached pointer tables stale after slot/KV mutations.
+    decode_ptr_tables_dirty: bool = true,
     /// Which slot's KV/state buffers are currently loaded into block_runtime.
     /// Call activateKvSlot() before accessing per-slot KV or gated delta state.
     active_kv_slot: usize = 0,
@@ -511,6 +540,9 @@ pub const CudaBackend = struct {
             .slot_positions = &.{},
             .slot_rope_position_deltas = &.{},
             .slot_logits = &.{},
+            .decode_ptr_tables_cached_rows = 0,
+            .decode_ptr_tables_cached_slots = &.{},
+            .decode_ptr_tables_dirty = true,
             .slot_kv_states = &.{},
             .state_descriptors_storage = undefined,
             .state_descriptor_count = 0,
@@ -589,6 +621,10 @@ pub const CudaBackend = struct {
         backend.slot_rope_position_deltas = try allocator.alloc(isize, backend.max_batch_size);
         errdefer allocator.free(backend.slot_rope_position_deltas);
         @memset(backend.slot_rope_position_deltas, 0);
+        backend.decode_ptr_tables_cached_slots = try allocator.alloc(usize, backend.max_batch_size);
+        errdefer allocator.free(backend.decode_ptr_tables_cached_slots);
+        backend.decode_ptr_tables_cached_rows = 0;
+        backend.decode_ptr_tables_dirty = true;
         backend.slot_logits = try allocator.alloc(f32, backend.max_batch_size * backend.vocab_size);
         errdefer allocator.free(backend.slot_logits);
         backend.slot_state_bindings = try allocator.alloc(SlotStateBinding, backend.max_batch_size);
@@ -658,6 +694,9 @@ pub const CudaBackend = struct {
             backend.max_seq_len,
             backend.n_heads,
             backend.head_dim,
+            backend.max_batch_size,
+            @max(@as(usize, 1), backend.block_runtime.attention_block_count),
+            @max(@as(usize, 1), backend.block_runtime.gated_delta_block_count),
         );
         errdefer backend.runtime_buffers.deinit(allocator, &backend.device);
 
@@ -923,7 +962,6 @@ pub const CudaBackend = struct {
                     .stage1_strict_memory = @as(u8, @intFromBool(stage1_ptr.strict_memory_mode)),
                 });
                 init_options.progress.updateLine(1, @intCast(total_layers), null);
-
             },
             .cpu_gpu => {
                 backend.topology_mode = .cpu_gpu;
@@ -990,7 +1028,6 @@ pub const CudaBackend = struct {
                     .gpu_slot_state_mib = bytesToMiB(stage1_budget.slotStateBytes()),
                     .gpu_workspace_mib = bytesToMiB(stage1_budget.workspace_bytes),
                 });
-
             },
             .cpu_gpu_gpu => {
                 backend.topology_mode = .cpu_gpu_gpu;
@@ -1109,7 +1146,6 @@ pub const CudaBackend = struct {
                     .gpu_stage2_slot_state_mib = bytesToMiB(stage2_budget.slotStateBytes()),
                 });
                 init_options.progress.updateLine(1, @intCast(total_layers), null);
-
             },
         }
 
@@ -1138,6 +1174,16 @@ pub const CudaBackend = struct {
             .max_dff = backend.runtime_buffers.max_dff,
             .max_attn = backend.runtime_buffers.max_attn,
             .max_kv = backend.runtime_buffers.max_kv,
+            .max_seq = backend.max_seq_len,
+            .model_max_seq = backend.model_max_seq_len,
+            .kv_storage = @tagName(backend.kv_storage_mode),
+            .kv_init_tokens = backend.kv_init_tokens,
+            .prefill_chunk_rows = backend.prefill_chunk_rows_cap,
+            .kv_capacity_init = backend.initialKvCapacity(),
+            .n_heads = backend.n_heads,
+            .n_kv = backend.n_kv_heads,
+            .head_dim = backend.head_dim,
+            .kv_dtype = if (kv_cache_dtype_fp16) "f16" else "f32",
             .linear_weight_mib = bytesToMiB(backend.block_runtime.linear_weight_bytes),
             .norm_weight_mib = bytesToMiB(backend.block_runtime.norm_weight_bytes),
             .kv_cache_mib = bytesToMiB(backend.block_runtime.kv_cache_bytes),
@@ -1277,6 +1323,10 @@ pub const CudaBackend = struct {
             self.device.graphExecDestroy(exec);
             self.decode_graph_exec = null;
         }
+        if (self.batched_decode_graph_exec) |exec| {
+            self.device.graphExecDestroy(exec);
+            self.batched_decode_graph_exec = null;
+        }
         self.device.setLaunchStream(null);
         if (self.compute_stream) |stream| {
             _ = self.device.synchronizeStream(stream) catch {};
@@ -1305,6 +1355,7 @@ pub const CudaBackend = struct {
             self.allocator.destroy(rope);
         }
         self.allocator.free(self.slot_logits);
+        if (self.decode_ptr_tables_cached_slots.len > 0) self.allocator.free(self.decode_ptr_tables_cached_slots);
         if (self.slot_in_use.len > 0) self.allocator.free(self.slot_in_use);
         if (self.slot_positions.len > 0) self.allocator.free(self.slot_positions);
         if (self.slot_rope_position_deltas.len > 0) self.allocator.free(self.slot_rope_position_deltas);
@@ -1641,7 +1692,7 @@ pub const CudaBackend = struct {
         }
     }
 
-    fn loadKvSlot(self: *CudaBackend, slot_index: usize) void {
+    pub fn loadKvSlot(self: *CudaBackend, slot_index: usize) void {
         const sks = &self.slot_kv_states[slot_index];
         var attn_i: usize = 0;
         var gd_i: usize = 0;
@@ -1865,9 +1916,9 @@ pub const CudaBackend = struct {
 
     pub fn supportsSchedulerBackendDecodeStreamingRoute(self: *const CudaBackend) bool {
         _ = self;
-        // XRAY ACCEPTABLE USE:
-        // Verify must never disable/enable scheduler routes.
-        return true;
+        // Parity mode: force n=1 and n>1 through queued decodeBatch.
+        // Do not take single-request streaming shortcut route.
+        return false;
     }
 
     pub fn supportsSchedulerBackendTopKDecodeRoute(
@@ -1875,11 +1926,179 @@ pub const CudaBackend = struct {
         sampling_config: *const sampling_mod.SamplingConfig,
     ) bool {
         _ = self;
-        // Match scheduler contract for top-k candidate route.
+        _ = sampling_config;
+        // Keep single-request top-k candidate route disabled for CUDA.
+        // Batched top-k routing is exposed via supportsSchedulerBackendBatchedTopKDecodeRoute().
+        return false;
+    }
+
+    pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
+        self: *const CudaBackend,
+        sampling_config: *const sampling_mod.SamplingConfig,
+    ) bool {
         return sampling_config.strategy == .top_k and
             sampling_config.top_k > 0 and
+            sampling_config.top_k <= 256 and
             sampling_config.temperature > 0.0 and
-            sampling_config.min_p == 0.0;
+            self.loaded.config.logits_scaling > 0.0;
+    }
+
+    pub fn incrementDecodeMetadataInPlace(
+        self: *CudaBackend,
+        decode_seq_lens_dev: *compute.cuda.Buffer,
+        decode_positions_dev: *compute.cuda.Buffer,
+        rows: usize,
+    ) !void {
+        if (rows == 0) return error.InvalidArgument;
+        const rows_u32 = std.math.cast(u32, rows) orelse return error.InvalidArgument;
+        if (self.decode_u32_increment_function == null) {
+            if (self.kernel_registry.embedded_module == null) {
+                try self.kernel_registry.loadEmbeddedModule(compute.cuda.decode_u32_increment.embedded_module);
+            }
+            const resolved = try self.kernel_registry.resolveFunction(
+                compute.cuda.decode_u32_increment.op_name,
+                compute.cuda.decode_u32_increment.embedded_symbol,
+            );
+            self.decode_u32_increment_function = resolved.function;
+            self.decode_u32_increment_source = resolved.source;
+        }
+        try compute.cuda.decode_u32_increment.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.decode_u32_increment_function orelse return error.CudaKernelUnavailable,
+            decode_seq_lens_dev,
+            decode_positions_dev,
+            rows_u32,
+        );
+    }
+
+    fn extractTopKFromBatchedDeviceLogits(
+        self: *CudaBackend,
+        batch_rows: usize,
+        top_k: usize,
+        candidate_logits_out: []f32,
+        candidate_ids_out: []u32,
+        candidate_counts_out: []usize,
+    ) !void {
+        if (batch_rows == 0) return error.InvalidArgument;
+        if (top_k == 0) return error.InvalidArgument;
+        if (candidate_counts_out.len < batch_rows) return error.InvalidArgument;
+        const total_candidates = std.math.mul(usize, batch_rows, top_k) catch return error.InvalidArgument;
+        if (candidate_logits_out.len < total_candidates or candidate_ids_out.len < total_candidates) {
+            return error.InvalidArgument;
+        }
+
+        const vocab = self.runtime_buffers.projected_vocab;
+        if (vocab == 0) return error.InvalidArgument;
+        const per_row_count = @min(top_k, vocab);
+        const logits_scaling = self.loaded.config.logits_scaling;
+        if (logits_scaling <= 0.0) return error.UnsupportedModel;
+        if (top_k > 256) return error.InvalidArgument;
+
+        const total_logits = std.math.mul(usize, batch_rows, vocab) catch return error.InvalidArgument;
+        const total_logits_bytes = std.math.mul(usize, total_logits, @sizeOf(f32)) catch return error.InvalidArgument;
+        var logits_batch = try engine_weights.bufferSlice(&self.runtime_buffers.logits_dev, 0, total_logits_bytes);
+
+        if (self.topk_rows_function == null) {
+            if (self.kernel_registry.embedded_module == null) {
+                try self.kernel_registry.loadEmbeddedModule(compute.cuda.topk_rows_f32.embedded_module);
+            }
+            const resolved = try self.kernel_registry.resolveFunction(
+                compute.cuda.topk_rows_f32.op_name,
+                compute.cuda.topk_rows_f32.embedded_symbol,
+            );
+            self.topk_rows_function = resolved.function;
+            self.topk_rows_source = resolved.source;
+        }
+        const topk_rows_function = self.topk_rows_function orelse return error.CudaKernelUnavailable;
+        const rows_u32 = std.math.cast(u32, batch_rows) orelse return error.InvalidArgument;
+        const vocab_u32 = std.math.cast(u32, vocab) orelse return error.InvalidArgument;
+        const row_stride_u32 = std.math.cast(u32, top_k) orelse return error.InvalidArgument;
+        const per_row_count_u32 = std.math.cast(u32, per_row_count) orelse return error.InvalidArgument;
+
+        try compute.cuda.topk_rows_f32.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            topk_rows_function,
+            &self.runtime_buffers.topk_values_dev,
+            &self.runtime_buffers.topk_ids_dev,
+            &logits_batch,
+            rows_u32,
+            vocab_u32,
+            row_stride_u32,
+            per_row_count_u32,
+        );
+
+        const topk_total = std.math.mul(usize, batch_rows, top_k) catch return error.InvalidArgument;
+        const topk_total_logits = candidate_logits_out[0..topk_total];
+        const topk_total_ids = candidate_ids_out[0..topk_total];
+        try self.runtime_buffers.topk_values_dev.download(&self.device, std.mem.sliceAsBytes(topk_total_logits));
+        try self.runtime_buffers.topk_ids_dev.download(&self.device, std.mem.sliceAsBytes(topk_total_ids));
+
+        for (0..batch_rows) |row_index| {
+            candidate_counts_out[row_index] = per_row_count;
+        }
+        if (logits_scaling != 1.0) {
+            for (0..batch_rows) |row_index| {
+                const row_base = std.math.mul(usize, row_index, top_k) catch return error.InvalidArgument;
+                for (0..per_row_count) |k_index| {
+                    const out_idx = row_base + k_index;
+                    candidate_logits_out[out_idx] /= logits_scaling;
+                }
+            }
+        }
+    }
+
+    pub fn decodeBatchTopKCandidates(
+        self: *CudaBackend,
+        requests: []const contract.DecodeRequest,
+        top_k: usize,
+        candidate_logits_out: []f32,
+        candidate_ids_out: []u32,
+        candidate_counts_out: []usize,
+    ) !void {
+        if (requests.len == 0) return error.InvalidArgument;
+        if (top_k == 0) return error.InvalidArgument;
+        if (top_k > 256) return error.InvalidArgument;
+        if (self.loaded.config.logits_scaling <= 0.0) return error.UnsupportedModel;
+        const max_n = 128;
+        if (requests.len > max_n) return error.InvalidArgument;
+
+        var tokens_buf: [max_n]u32 = undefined;
+        var slot_indices_buf: [max_n]usize = undefined;
+        var positions_buf: [max_n]usize = undefined;
+        var raw_positions_buf: [max_n]usize = undefined;
+        for (requests, 0..) |req, i| {
+            if (!self.slotIndexSupported(req.slot_index) or !self.slot_in_use[req.slot_index]) {
+                return error.InvalidArgument;
+            }
+            try self.ensureSlotStateBlocksBoundForScheduler(req.slot_index);
+            const raw_position = self.slot_positions[req.slot_index];
+            const effective_position = try common_mrope.applyPositionDelta(
+                raw_position,
+                self.slot_rope_position_deltas[req.slot_index],
+            );
+            tokens_buf[i] = req.token;
+            slot_indices_buf[i] = req.slot_index;
+            positions_buf[i] = effective_position;
+            raw_positions_buf[i] = raw_position;
+        }
+        try self.computeBatchedDecodeLogitsDeviceOnly(
+            tokens_buf[0..requests.len],
+            slot_indices_buf[0..requests.len],
+            positions_buf[0..requests.len],
+        );
+        for (requests, 0..) |req, i| {
+            self.slot_positions[req.slot_index] = raw_positions_buf[i] + 1;
+        }
+
+        try self.extractTopKFromBatchedDeviceLogits(
+            requests.len,
+            top_k,
+            candidate_logits_out,
+            candidate_ids_out,
+            candidate_counts_out,
+        );
     }
 
     pub fn decodeTopKCandidates(
@@ -1891,81 +2110,22 @@ pub const CudaBackend = struct {
         candidate_ids_out: []u32,
     ) !usize {
         if (top_k == 0) return error.InvalidArgument;
-        if (!self.slot_in_use[slot_index] or !self.slotIndexSupported(slot_index)) return error.InvalidArgument;
-        try self.ensureSlotStateBlocksBoundForScheduler(slot_index);
-        self.activateKvSlot(slot_index);
-
-        const effective_position = try common_mrope.applyPositionDelta(self.slot_positions[slot_index], self.slot_rope_position_deltas[slot_index]);
-        try engine_forward.computeGpuPrototypeLogitsWithLayerLimit(
-            self,
-            token,
-            effective_position,
-            slot_index,
-            null,
-            self.block_runtime.blocks.len,
-            true,
-            false,
-            true,
-            1,
-            self.slot_positions[slot_index],
-            null,
-            null,
-            null,
-            false,
+        if (candidate_logits_out.len < top_k or candidate_ids_out.len < top_k) return error.InvalidArgument;
+        var counts: [1]usize = .{0};
+        const request = [_]contract.DecodeRequest{
+            .{
+                .slot_index = slot_index,
+                .token = token,
+            },
+        };
+        try self.decodeBatchTopKCandidates(
+            request[0..],
+            top_k,
+            candidate_logits_out[0..top_k],
+            candidate_ids_out[0..top_k],
+            counts[0..],
         );
-
-        const projected_vocab = self.runtime_buffers.projected_vocab;
-        if (projected_vocab == 0) return error.InvalidArgument;
-        if (projected_vocab > std.math.maxInt(u32)) return error.InvalidArgument;
-        const k = @min(top_k, projected_vocab);
-        if (candidate_logits_out.len < k or candidate_ids_out.len < k) return error.InvalidArgument;
-
-        // Bulk download logits to host — one transfer replaces K iterations of
-        // GPU argmax + 3 sync round-trips each (copy kernel + K*(argmax + download + upload)).
-        try self.runtime_buffers.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.projected_logits_host));
-        const logits_host = self.runtime_buffers.projected_logits_host;
-        const logits_scaling = self.loaded.config.logits_scaling;
-
-        // CPU top-K selection: maintain K candidates with tracked minimum.
-        // O(N) average for logit distributions (replacements rare after initial K).
-        for (0..k) |i| {
-            candidate_ids_out[i] = @intCast(i);
-            candidate_logits_out[i] = logits_host[i];
-        }
-        var min_pos: usize = 0;
-        var min_val: f32 = candidate_logits_out[0];
-        for (1..k) |i| {
-            if (candidate_logits_out[i] < min_val) {
-                min_val = candidate_logits_out[i];
-                min_pos = i;
-            }
-        }
-        for (k..projected_vocab) |i| {
-            const v = logits_host[i];
-            if (v > min_val) {
-                candidate_ids_out[min_pos] = @intCast(i);
-                candidate_logits_out[min_pos] = v;
-                // Re-find minimum among K candidates.
-                min_val = candidate_logits_out[0];
-                min_pos = 0;
-                for (1..k) |j| {
-                    if (candidate_logits_out[j] < min_val) {
-                        min_val = candidate_logits_out[j];
-                        min_pos = j;
-                    }
-                }
-            }
-        }
-        if (logits_scaling != 1.0) {
-            const inv_scale: f32 = 1.0 / logits_scaling;
-            for (candidate_logits_out[0..k]) |*v| {
-                v.* *= inv_scale;
-            }
-        }
-        const selected = k;
-
-        self.slot_positions[slot_index] += 1;
-        return selected;
+        return counts[0];
     }
 
     pub fn allocSlot(self: *CudaBackend) ?usize {
@@ -2514,6 +2674,24 @@ pub const CudaBackend = struct {
         positions: []const usize,
     ) !void {
         return engine_forward.computeBatchedDecodeLogits(self, tokens, slot_indices, positions);
+    }
+
+    pub fn computeBatchedDecodeLogitsDeviceOnly(
+        self: *CudaBackend,
+        tokens: []const u32,
+        slot_indices: []const usize,
+        positions: []const usize,
+    ) !void {
+        return engine_forward.computeBatchedDecodeLogitsDeviceOnly(self, tokens, slot_indices, positions);
+    }
+
+    pub fn batchedHostLogitsRow(self: *CudaBackend, row_index: usize) ?[]f32 {
+        const vocab = self.runtime_buffers.projected_vocab;
+        if (vocab == 0) return null;
+        const start = std.math.mul(usize, row_index, vocab) catch return null;
+        const end = std.math.add(usize, start, vocab) catch return null;
+        if (end > self.runtime_buffers.projected_logits_batch_host.len) return null;
+        return self.runtime_buffers.projected_logits_batch_host[start..end];
     }
 
     pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(

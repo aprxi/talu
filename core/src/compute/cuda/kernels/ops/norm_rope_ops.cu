@@ -253,3 +253,54 @@ extern "C" __global__ void talu_kv_write_f16_rows(
     out_k[out_idx] = __float2half_rn(k_out);
     out_v[out_idx] = __float2half_rn(input_v_f32[idx]);
 }
+
+extern "C" __global__ void talu_kv_write_f16_rows_ptrs(
+    const unsigned long long* out_k_ptrs,
+    const unsigned long long* out_v_ptrs,
+    const unsigned int* positions,
+    const float* input_k_f32,
+    const float* input_v_f32,
+    unsigned int n_heads,
+    unsigned int head_dim,
+    unsigned int rope_dim,
+    unsigned int q_rows,
+    unsigned int row_stride,
+    float theta
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int row_width = n_heads * head_dim;
+    const unsigned int total = q_rows * row_width;
+    if (idx >= total) return;
+
+    const unsigned int row = idx / row_width;
+    const unsigned int row_offset = idx - (row * row_width);
+    const unsigned int head = row_offset / head_dim;
+    const unsigned int dim = row_offset % head_dim;
+    const unsigned int row_base = row * row_width;
+    const unsigned int head_base = row_base + (head * head_dim);
+    const float log2_theta = log2f(theta);
+
+    float k_out = input_k_f32[idx];
+    if (dim < rope_dim) {
+        const unsigned int half = rope_dim >> 1;
+        const unsigned int pair = (dim < half) ? dim : (dim - half);
+        const unsigned int lo_idx = head_base + pair;
+        const unsigned int hi_idx = head_base + half + pair;
+        const float x0 = input_k_f32[lo_idx];
+        const float x1 = input_k_f32[hi_idx];
+        const float inv_freq = exp2f(log2_theta * (-2.0f * (float)pair / (float)rope_dim));
+        const float angle = (float)positions[row] * inv_freq;
+        float s = 0.0f;
+        float c = 0.0f;
+        __sincosf(angle, &s, &c);
+        k_out = (dim < half) ? fmaf(x0, c, -x1 * s) : fmaf(x0, s, x1 * c);
+    }
+
+    __half* out_k = reinterpret_cast<__half*>(out_k_ptrs[row]);
+    __half* out_v = reinterpret_cast<__half*>(out_v_ptrs[row]);
+    if (out_k == nullptr || out_v == nullptr) return;
+
+    const unsigned int out_idx = positions[row] * row_stride + row_offset;
+    out_k[out_idx] = __float2half_rn(k_out);
+    out_v[out_idx] = __float2half_rn(input_v_f32[idx]);
+}

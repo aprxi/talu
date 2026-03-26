@@ -81,7 +81,6 @@ const engine_mixers = @import("engine_mixers.zig");
 const engine_weights = @import("engine_weights.zig");
 const bufferSlice = engine_weights.bufferSlice;
 
-
 pub fn emitLayerProgramTracePoint(
     ctx: *LayerProgramExecutionContext,
     point: trace.TracePoint,
@@ -128,7 +127,7 @@ pub fn emitLayerProgramTracePoint(
                     const per_layer = parity_seq_len * width;
                     ctx.backend.ensureTraceCheckpointHostCapacity(per_layer) catch return;
                     const layer_host = ctx.backend.trace_checkpoint_host[0..per_layer];
-                    engine_mixers.downloadRowsF32StrideAware(ctx.backend,buffer, parity_seq_len, width, layer_host) catch |err| {
+                    engine_mixers.downloadRowsF32StrideAware(ctx.backend, buffer, parity_seq_len, width, layer_host) catch |err| {
                         const warn_idx = @intFromEnum(point);
                         if (!ctx.backend.parity_checkpoint_warned[warn_idx]) {
                             ctx.backend.parity_checkpoint_warned[warn_idx] = true;
@@ -562,10 +561,30 @@ pub fn layerProgramAttentionAdapter(
         return error.InvalidStateDescriptorBinding;
     }
     const attention_binding = try requireAttentionRuntimeBinding(kv_state, ctx.layer_index);
+    // Batched decode: N tokens at different positions/slots, GEMM projections.
+    if (ctx.batch_info) |batch| {
+        try engine_mixers.runBatchedDecodeAttentionMixer(
+            self,
+            cfg,
+            &q_proj,
+            &k_proj,
+            &v_proj,
+            &o_proj,
+            q_norm_weight,
+            k_norm_weight,
+            input,
+            output,
+            ctx,
+            batch,
+        );
+        return;
+    }
+
     if (ctx.active_rows_u32 <= 1) {
         const residual_buf: ?compute.cuda.Buffer =
             if (self.loaded.config.residual_multiplier == 1.0) ctx.input_view else null;
-        try engine_mixers.runAttentionMixerStep(self,
+        try engine_mixers.runAttentionMixerStep(
+            self,
             cfg,
             &attention_binding.k_cache,
             &attention_binding.v_cache,
@@ -598,24 +617,6 @@ pub fn layerProgramAttentionAdapter(
         return;
     }
 
-    // Batched decode: N tokens at different positions/slots, GEMM projections.
-    if (ctx.batch_info) |batch| {
-        try engine_mixers.runBatchedDecodeAttentionMixer(self,
-            cfg,
-            &q_proj,
-            &k_proj,
-            &v_proj,
-            &o_proj,
-            q_norm_weight,
-            k_norm_weight,
-            input,
-            output,
-            ctx,
-            batch,
-        );
-        return;
-    }
-
     // Provide concat I8 QKV cache for fused prefill GEMM.
     self.active_qkv_concat = if (attention_binding.qkv_i8_concat.pointer != 0)
         .{ .i8_buf = attention_binding.qkv_i8_concat, .scales_buf = attention_binding.qkv_scales_concat, .dims = attention_binding.qkv_concat_dims }
@@ -624,7 +625,8 @@ pub fn layerProgramAttentionAdapter(
     defer self.active_qkv_concat = null;
 
     if (!cfg.query_gate) {
-        try engine_mixers.runAttentionMixerPrefillBatchedNoQueryGate(self,
+        try engine_mixers.runAttentionMixerPrefillBatchedNoQueryGate(
+            self,
             cfg,
             &attention_binding.k_cache,
             &attention_binding.v_cache,
@@ -654,7 +656,8 @@ pub fn layerProgramAttentionAdapter(
         return;
     }
 
-    try engine_mixers.runAttentionMixerPrefillBatchedWithQueryGate(self,
+    try engine_mixers.runAttentionMixerPrefillBatchedWithQueryGate(
+        self,
         cfg,
         &attention_binding.k_cache,
         &attention_binding.v_cache,
@@ -729,7 +732,8 @@ pub fn layerProgramShortConvAdapter(
                 row_idx,
                 out_proj.cols(),
             );
-            try engine_mixers.runShortConvMixerStep(self,
+            try engine_mixers.runShortConvMixerStep(
+                self,
                 cfg,
                 &sc_state.conv,
                 &in_proj,
@@ -746,7 +750,8 @@ pub fn layerProgramShortConvAdapter(
 
     // Single-row fast path (decode, single token).
     if (ctx.active_rows_u32 <= 1) {
-        try engine_mixers.runShortConvMixerStep(self,
+        try engine_mixers.runShortConvMixerStep(
+            self,
             cfg,
             &shortconv_binding.conv_state,
             &in_proj,
@@ -775,7 +780,8 @@ pub fn layerProgramShortConvAdapter(
             row_idx,
             out_proj.cols(),
         );
-        try engine_mixers.runShortConvMixerStep(self,
+        try engine_mixers.runShortConvMixerStep(
+            self,
             cfg,
             &shortconv_binding.conv_state,
             &in_proj,
@@ -824,7 +830,8 @@ pub fn layerProgramGatedDeltaAdapter(
         return error.InvalidInstructionBinding;
     }
     if (ctx.batch_info) |batch| {
-        try engine_mixers.runBatchedDecodeGatedDeltaMixer(self,
+        try engine_mixers.runBatchedDecodeGatedDeltaMixer(
+            self,
             binding,
             input,
             output,
@@ -834,7 +841,8 @@ pub fn layerProgramGatedDeltaAdapter(
         _ = layer;
         return;
     }
-    try engine_mixers.runGatedDeltaMixerStep(self,
+    try engine_mixers.runGatedDeltaMixerStep(
+        self,
         binding,
         input,
         output,
@@ -870,7 +878,8 @@ pub fn layerProgramSwiGluAdapter(
             ctx.input_view
         else
             null;
-    try engine_mixers.runFfnStep(self,
+    try engine_mixers.runFfnStep(
+        self,
         input,
         @intCast(ctx.active_rows_u32),
         gate_weight,
@@ -900,7 +909,8 @@ pub fn layerProgramResidualAddAdapter(
     const residual_src = bufferFromTensorHandle(io.inputs[0]);
     const residual = bufferFromTensorHandle(io.outputs[0]);
     const branch = bufferFromTensorHandle(io.inputs[1]);
-    try engine_ops.addResidualWithScaleRowsStrideAware(self, 
+    try engine_ops.addResidualWithScaleRowsStrideAware(
+        self,
         residual,
         residual_src,
         branch,
@@ -909,7 +919,6 @@ pub fn layerProgramResidualAddAdapter(
         scale,
     );
 }
-
 
 pub fn dispatchLayerProgramInstruction(
     self: anytype,
@@ -934,7 +943,8 @@ pub fn dispatchLayerProgramInstruction(
         layer_program_adapter_capabilities[@intFromEnum(insn.opcode)],
         rt_ctx.batch_size,
     );
-    const built_handles = try buildLayerProgramInstructionHandles(self, 
+    const built_handles = try buildLayerProgramInstructionHandles(
+        self,
         insn,
         ctx,
         ctx.instruction_handles,
@@ -1259,12 +1269,13 @@ pub fn runAttentionContext(
     return .heads_f32_kv;
 }
 
-
 pub fn initKernelFunctions(self: anytype) !void {
     if (!self.device.supportsModuleLaunch()) return;
 
     try self.kernel_registry.loadEmbeddedModule(compute.cuda.vector_add.embedded_module);
-    const sideload_loaded = tryLoadSideloadModule(self, ) catch |err| blk: {
+    const sideload_loaded = tryLoadSideloadModule(
+        self,
+    ) catch |err| blk: {
         log.warn("inference", "CUDA sideload unavailable; using embedded PTX", .{
             .reason = @errorName(err),
         });
@@ -1274,7 +1285,9 @@ pub fn initKernelFunctions(self: anytype) !void {
         log.info("inference", "CUDA sideload kernel module active", .{});
     }
 
-    try resolveRequiredKernels(self, );
+    try resolveRequiredKernels(
+        self,
+    );
 }
 
 /// Pre-dequantize all gaffine_u8 weights to persistent F16 and I8 device buffers.
@@ -1688,6 +1701,10 @@ pub fn assignResolvedKernel(
             self.kv_write_f16_rows_function = resolved.function;
             self.kv_write_f16_rows_source = resolved.source;
         },
+        .kv_write_f16_rows_ptrs => {
+            self.kv_write_f16_rows_ptrs_function = resolved.function;
+            self.kv_write_f16_rows_ptrs_source = resolved.source;
+        },
         .rmsnorm => {
             self.rmsnorm_function = resolved.function;
             self.rmsnorm_source = resolved.source;
@@ -1712,6 +1729,10 @@ pub fn assignResolvedKernel(
             self.attn_fused_heads_f16_kv_function = resolved.function;
             self.attn_fused_heads_f16_kv_source = resolved.source;
         },
+        .attn_fused_decode_heads_f16_kv_ptrs => {
+            self.attn_fused_decode_heads_f16_kv_ptrs_function = resolved.function;
+            self.attn_fused_decode_heads_f16_kv_ptrs_source = resolved.source;
+        },
         .attn_fused_prefill_heads_f16_kv => {
             self.attn_fused_prefill_heads_f16_kv_function = resolved.function;
             self.attn_fused_prefill_heads_f16_kv_source = resolved.source;
@@ -1735,6 +1756,22 @@ pub fn assignResolvedKernel(
         .attn_weighted_sum_heads_f16_kv => {
             self.attn_weighted_sum_heads_f16_kv_function = resolved.function;
             self.attn_weighted_sum_heads_f16_kv_source = resolved.source;
+        },
+        .rope_rows_ptrs => {
+            self.rope_rows_ptrs_function = resolved.function;
+            self.rope_rows_ptrs_source = resolved.source;
+        },
+        .attn_scores_heads_f16_kv_ptrs => {
+            self.attn_scores_heads_f16_kv_ptrs_function = resolved.function;
+            self.attn_scores_heads_f16_kv_ptrs_source = resolved.source;
+        },
+        .softmax_rows_dynamic_cols_ptrs => {
+            self.softmax_rows_dynamic_cols_ptrs_function = resolved.function;
+            self.softmax_rows_dynamic_cols_ptrs_source = resolved.source;
+        },
+        .attn_weighted_sum_heads_f16_kv_ptrs => {
+            self.attn_weighted_sum_heads_f16_kv_ptrs_function = resolved.function;
+            self.attn_weighted_sum_heads_f16_kv_ptrs_source = resolved.source;
         },
         .silu => {
             self.silu_function = resolved.function;
@@ -1772,6 +1809,14 @@ pub fn assignResolvedKernel(
             self.gated_delta_conv_silu_rows_function = resolved.function;
             self.gated_delta_conv_silu_rows_source = resolved.source;
         },
+        .gated_delta_conv_silu_rows_ptrs => {
+            self.gated_delta_conv_silu_rows_ptrs_function = resolved.function;
+            self.gated_delta_conv_silu_rows_ptrs_source = resolved.source;
+        },
+        .gated_delta_advance_ring_heads => {
+            self.gated_delta_advance_ring_heads_function = resolved.function;
+            self.gated_delta_advance_ring_heads_source = resolved.source;
+        },
         .gated_delta_qk_norm => {
             self.gated_delta_qk_norm_function = resolved.function;
             self.gated_delta_qk_norm_source = resolved.source;
@@ -1783,6 +1828,10 @@ pub fn assignResolvedKernel(
         .gated_delta_ssm_rows => {
             self.gated_delta_ssm_rows_function = resolved.function;
             self.gated_delta_ssm_rows_source = resolved.source;
+        },
+        .gated_delta_ssm_rows_ptrs => {
+            self.gated_delta_ssm_rows_ptrs_function = resolved.function;
+            self.gated_delta_ssm_rows_ptrs_source = resolved.source;
         },
         .gated_delta_rmsnorm_silu_mul => {
             self.gated_delta_rmsnorm_silu_mul_function = resolved.function;
