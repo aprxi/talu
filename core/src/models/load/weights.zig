@@ -129,6 +129,28 @@ fn findWeightSpecById(specs: []const model_types.WeightSpec, id: []const u8) ?*c
     return null;
 }
 
+/// Try to get a tensor by name, with GPTQ .qweight fallback.
+/// When a name ending in .weight is not found, replaces .weight with .qweight.
+fn getTensorOrGptqFallback(
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+    name: []const u8,
+    qweight_buf: []u8,
+) ?DType {
+    if (safetensors_file.getTensor(name, null)) |t| return t.dtype else |_| {}
+    // GPTQ fallback: .weight → .qweight
+    if (std.mem.endsWith(u8, name, ".weight")) {
+        const base_len = name.len - ".weight".len;
+        const qw = ".qweight";
+        const total = base_len + qw.len;
+        if (total <= qweight_buf.len) {
+            @memcpy(qweight_buf[0..base_len], name[0..base_len]);
+            @memcpy(qweight_buf[base_len..total], qw);
+            if (safetensors_file.getTensor(qweight_buf[0..total], null)) |t| return t.dtype else |_| {}
+        }
+    }
+    return null;
+}
+
 fn detectOriginalWeightDType(
     arch: *const model_types.Architecture,
     layer_types: ?[]const u8,
@@ -143,6 +165,7 @@ fn detectOriginalWeightDType(
     if (probe_weight_ids.len == 0) return error.MissingWeightDTypeSourceWeightIds;
     var name_buf: [512]u8 = undefined;
     var prefix_buf: [256]u8 = undefined;
+    var qweight_buf: [512]u8 = undefined;
 
     for (probe_weight_ids) |id| {
         const spec = findWeightSpecById(specs, id) orelse continue;
@@ -151,8 +174,8 @@ fn detectOriginalWeightDType(
             const candidate = if (alias_idx == 0) spec.suffix else spec.aliases[alias_idx - 1];
             if (arch.weight_prefixes.len == 0 or std.mem.indexOf(u8, candidate, "{d}") != null) {
                 const name = generic_weights.expandLayerTemplate(name_buf[0..], candidate, 0) catch continue;
-                const t = safetensors_file.getTensor(name, null) catch continue;
-                return t.dtype;
+                if (getTensorOrGptqFallback(safetensors_file, name, &qweight_buf)) |d| return d;
+                continue;
             }
 
             for (arch.weight_prefixes) |prefix_template| {
@@ -162,8 +185,7 @@ fn detectOriginalWeightDType(
                 @memcpy(name_buf[0..expanded_prefix.len], expanded_prefix);
                 @memcpy(name_buf[expanded_prefix.len..total_len], candidate);
                 const name = name_buf[0..total_len];
-                const t = safetensors_file.getTensor(name, null) catch continue;
-                return t.dtype;
+                if (getTensorOrGptqFallback(safetensors_file, name, &qweight_buf)) |d| return d;
             }
         }
     }

@@ -12,6 +12,7 @@ const op_types = @import("../op_types.zig");
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const DType = dtype.DType;
+const GroupedAffineMeta = dtype.GroupedAffineMeta;
 
 /// Loader-side safety bound for grouped-affine metadata.
 /// Shared contract constant also asserted by CPU inference backend.
@@ -83,6 +84,8 @@ fn inferGaffineParams(
 
     const base = if (std.mem.endsWith(u8, name, ".weight"))
         name[0 .. name.len - ".weight".len]
+    else if (std.mem.endsWith(u8, name, ".qweight"))
+        name[0 .. name.len - ".qweight".len]
     else
         name;
     const packed_shape = t.shape[0..@intCast(t.n_dims)];
@@ -276,6 +279,13 @@ pub fn buildGatedDeltaSplitInProj(
     if (in_proj_a) |a| {
         if (a.dtype != in_proj_z.dtype) return error.InvalidDType;
     }
+
+    // Quantized tensors (GAF): elementSize() is 0, use actual data lengths.
+    const is_quantized = in_proj_z.dtype == .grouped_affine_u4 or in_proj_z.dtype == .grouped_affine_u8;
+    if (is_quantized) {
+        return buildGatedDeltaSplitInProjQuantized(allocator, in_proj_qkv, in_proj_z, in_proj_b, in_proj_a);
+    }
+
     const element_bytes = in_proj_z.dtype.elementSize();
     const qkv_bytes = in_proj_qkv.data();
     const z_bytes = in_proj_z.data();
@@ -353,6 +363,89 @@ pub fn buildGatedDeltaSplitInProj(
     return fused;
 }
 
+/// Fuse split gated-delta projections for quantized (GAF) tensors.
+///
+/// Concatenates along the output dimension (rows): each sub-tensor contributes its
+/// packed weight data, scales, and biases. All sub-tensors must share the same input
+/// dimension (cols), group_size, scales_dtype, and quantization dtype.
+fn buildGatedDeltaSplitInProjQuantized(
+    allocator: std.mem.Allocator,
+    in_proj_qkv: *const Tensor,
+    in_proj_z: *const Tensor,
+    in_proj_b: *const Tensor,
+    in_proj_a: ?*const Tensor,
+) !*const Tensor {
+    // All tensors have shape [out_features, unpacked_in] but data is packed.
+    // Verify gaffine metadata exists and group params match.
+    const qkv_gaf = in_proj_qkv.gaffine orelse return error.MissingScales;
+    const z_gaf = in_proj_z.gaffine orelse return error.MissingScales;
+    const b_gaf = in_proj_b.gaffine orelse return error.MissingScales;
+    if (z_gaf.group_size != qkv_gaf.group_size or b_gaf.group_size != qkv_gaf.group_size) return error.InvalidShape;
+    if (z_gaf.scales_dtype != qkv_gaf.scales_dtype or b_gaf.scales_dtype != qkv_gaf.scales_dtype) return error.InvalidDType;
+    if (in_proj_a) |a| {
+        const a_gaf = a.gaffine orelse return error.MissingScales;
+        if (a_gaf.group_size != qkv_gaf.group_size) return error.InvalidShape;
+        if (a_gaf.scales_dtype != qkv_gaf.scales_dtype) return error.InvalidDType;
+    }
+
+    // Concatenate packed data (row-major along output dim)
+    const total_data_len = in_proj_qkv.data_size + in_proj_z.data_size + in_proj_b.data_size +
+        (if (in_proj_a) |a| a.data_size else 0);
+    const fused_data = try allocator.alloc(u8, total_data_len); // lint:ignore errdefer-alloc - arena freed atomically
+    {
+        var off: usize = 0;
+        @memcpy(fused_data[off .. off + in_proj_qkv.data_size], in_proj_qkv.data());
+        off += in_proj_qkv.data_size;
+        @memcpy(fused_data[off .. off + in_proj_z.data_size], in_proj_z.data());
+        off += in_proj_z.data_size;
+        @memcpy(fused_data[off .. off + in_proj_b.data_size], in_proj_b.data());
+        off += in_proj_b.data_size;
+        if (in_proj_a) |a| @memcpy(fused_data[off .. off + a.data_size], a.data());
+    }
+
+    // Concatenate scales and biases
+    const total_scales_len = qkv_gaf.scales.len + z_gaf.scales.len + b_gaf.scales.len +
+        (if (in_proj_a) |a| (a.gaffine orelse return error.MissingScales).scales.len else 0);
+    const total_biases_len = qkv_gaf.biases.len + z_gaf.biases.len + b_gaf.biases.len +
+        (if (in_proj_a) |a| (a.gaffine orelse return error.MissingScales).biases.len else 0);
+
+    const fused_scales = try allocator.alloc(u8, total_scales_len); // lint:ignore errdefer-alloc - arena freed atomically
+    const fused_biases = try allocator.alloc(u8, total_biases_len); // lint:ignore errdefer-alloc - arena freed atomically
+    {
+        var s_off: usize = 0;
+        var b_off: usize = 0;
+        for ([_]GroupedAffineMeta{ qkv_gaf, z_gaf, b_gaf }) |gaf| {
+            @memcpy(fused_scales[s_off .. s_off + gaf.scales.len], gaf.scales);
+            s_off += gaf.scales.len;
+            @memcpy(fused_biases[b_off .. b_off + gaf.biases.len], gaf.biases);
+            b_off += gaf.biases.len;
+        }
+        if (in_proj_a) |a| {
+            const a_gaf = a.gaffine orelse return error.MissingScales;
+            @memcpy(fused_scales[s_off .. s_off + a_gaf.scales.len], a_gaf.scales);
+            @memcpy(fused_biases[b_off .. b_off + a_gaf.biases.len], a_gaf.biases);
+        }
+    }
+
+    // Build fused tensor
+    const qkv_rows: usize = @intCast(in_proj_qkv.shape[0]);
+    const z_rows: usize = @intCast(in_proj_z.shape[0]);
+    const b_rows: usize = @intCast(in_proj_b.shape[0]);
+    const a_rows: usize = if (in_proj_a) |a| @intCast(a.shape[0]) else 0;
+    const total_rows = qkv_rows + z_rows + b_rows + a_rows;
+    const cols: usize = @intCast(in_proj_qkv.shape[1]);
+
+    const result = try allocator.create(Tensor); // lint:ignore errdefer-alloc - arena freed atomically
+    result.* = Tensor.view(fused_data.ptr, &.{ total_rows, cols }, in_proj_qkv.dtype, fused_data.len);
+    result.gaffine = .{
+        .scales = fused_scales,
+        .biases = fused_biases,
+        .group_size = qkv_gaf.group_size,
+        .scales_dtype = qkv_gaf.scales_dtype,
+    };
+    return result;
+}
+
 pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTensors, name: []const u8, expected_in: usize, config: ModelConfig) !Tensor {
     var weight_tensor = try st.getTensor(name, null);
     log.debug("load", "Orient weight", .{
@@ -366,14 +459,18 @@ pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTens
         .shape_1 = weight_tensor.shape[1],
     }, @src());
 
-    // U32 from safetensors maps to grouped_affine_u4 by default
-    // For models with mixed quantization, auto-detect bits from scales shape
+    // U32/I32 from safetensors maps to grouped_affine_u4 by default.
+    // For models with mixed quantization, auto-detect bits from scales shape.
+    // GAF format (MLX): .weight + .scales + .biases
+    // GPTQ format (AutoRound/AutoGPTQ): .qweight + .scales + .qzeros (transposed layout)
     if (inferGaffineParams(st, name, &weight_tensor, expected_in, config.gaffine_bits)) |params| {
         try applyGaffineParams(&weight_tensor, params, name);
         return weight_tensor;
     } else if (weight_tensor.dtype == .grouped_affine_u4 or weight_tensor.dtype == .grouped_affine_u8) {
-        // Gaffine tensor but inference failed - missing scales/biases
-        return error.MissingScales;
+        // GAF inference failed (no .biases) - try GPTQ conversion
+        return convertGptqToGaffine(allocator, st, name, weight_tensor, expected_in, config.gaffine_bits) catch {
+            return error.MissingScales;
+        };
     }
     // Handle FP8 E4M3 weights - dequantize to BF16
     if (weight_tensor.dtype == .f8_e4m3) {
@@ -419,6 +516,221 @@ pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTens
         .f16, .bf16 => orientWeightTyped(allocator, weight_tensor, expected_in),
         else => weight_tensor,
     };
+}
+
+/// Convert GPTQ/AutoRound packed weights to GAF format at load time.
+///
+/// GPTQ stores quantized weights as three tensors per projection:
+///   .qweight  I32  [packed_in, out]      (packed 4-bit values, transposed vs GAF)
+///   .scales   F16  [n_groups, out]        (per-group scales, transposed vs GAF)
+///   .qzeros   I32  [n_groups, out/pack]   (packed zero points)
+///
+/// GAF expects:
+///   .weight   U32  [out, packed_in]
+///   .scales   F16  [out, n_groups]
+///   .biases   F16  [out, n_groups]  where bias = -scale * (stored_zp + 1)
+///
+/// The +1 offset on qzeros matches the AutoGPTQ packing convention.
+fn convertGptqToGaffine(
+    allocator: std.mem.Allocator,
+    st: *st_loader.UnifiedSafeTensors,
+    name: []const u8,
+    weight_tensor: Tensor,
+    expected_in: usize,
+    config_gaffine_bits: i32,
+) !Tensor {
+    const base = if (std.mem.endsWith(u8, name, ".weight"))
+        name[0 .. name.len - ".weight".len]
+    else if (std.mem.endsWith(u8, name, ".qweight"))
+        name[0 .. name.len - ".qweight".len]
+    else
+        name;
+
+    // GPTQ requires .qzeros (distinguishes from GAF which uses .biases)
+    const qzeros_bytes = st.tryGetBytes(base, ".qzeros") orelse return error.MissingScales;
+    const scales_bytes = st.tryGetBytes(base, ".scales") orelse return error.MissingScales;
+
+    const packed_shape = weight_tensor.shape[0..@intCast(weight_tensor.n_dims)];
+    if (packed_shape.len != 2) return error.InvalidShape;
+
+    const dim0: usize = @intCast(packed_shape[0]);
+    const dim1: usize = @intCast(packed_shape[1]);
+
+    // Get scales tensor to determine dtype (F16 or BF16) and shape.
+    // GPTQ scales shape: [n_groups, out_features] — use scales dim1 to identify out_features
+    // and resolve which weight axis is packed_in vs out.
+    var scales_name_buf: [256]u8 = undefined;
+    const scales_name = std.fmt.bufPrint(&scales_name_buf, "{s}.scales", .{base}) catch return error.InvalidShape;
+    const scales_tensor = st.getTensor(scales_name, null) catch return error.MissingScales;
+    const scales_dtype = scales_tensor.dtype;
+    if (scales_dtype != .f16 and scales_dtype != .bf16) return error.InvalidShape;
+
+    const scales_shape = scales_tensor.shape[0..@intCast(scales_tensor.n_dims)];
+    if (scales_shape.len != 2) return error.InvalidShape;
+    const n_groups: usize = @intCast(scales_shape[0]);
+    const scales_out: usize = @intCast(scales_shape[1]);
+
+    // Detect orientation from scales: GPTQ qweight[packed_in, out], scales[n_groups, out].
+    // If weight dim1 matches scales dim1 → GPTQ orientation [packed_in, out].
+    // If weight dim0 matches scales dim1 → already GAF orientation [out, packed_in].
+    var out_features: usize = undefined;
+    var in_packed: usize = undefined;
+    var needs_transpose: bool = undefined;
+    if (dim1 == scales_out and dim0 != scales_out) {
+        // GPTQ: [packed_in, out]
+        in_packed = dim0;
+        out_features = dim1;
+        needs_transpose = true;
+    } else if (dim0 == scales_out and dim1 != scales_out) {
+        // Already GAF: [out, packed_in]
+        out_features = dim0;
+        in_packed = dim1;
+        needs_transpose = false;
+    } else if (dim0 == scales_out and dim1 == scales_out) {
+        // Square — use expected_in to disambiguate
+        if (dim0 * 8 == expected_in or dim0 * 4 == expected_in) {
+            in_packed = dim0;
+            out_features = dim1;
+            needs_transpose = true;
+        } else {
+            out_features = dim0;
+            in_packed = dim1;
+            needs_transpose = false;
+        }
+    } else {
+        return error.InvalidShape;
+    }
+
+    // Auto-detect bit width from group size validity
+    const unpacked_4bit = in_packed * 8;
+    const unpacked_8bit = in_packed * 4;
+    const group_size_4bit = if (n_groups > 0) unpacked_4bit / n_groups else 0;
+    const group_size_8bit = if (n_groups > 0) unpacked_8bit / n_groups else 0;
+    const valid_4bit = (group_size_4bit == 32 or group_size_4bit == 64 or group_size_4bit == 128);
+    const valid_8bit = (group_size_8bit == 32 or group_size_8bit == 64 or group_size_8bit == 128);
+
+    const is_4bit = if (valid_4bit and valid_8bit)
+        (if (config_gaffine_bits == 8) false else true)
+    else
+        valid_4bit;
+
+    if (!is_4bit and !valid_8bit) return error.InvalidShape;
+
+    const values_per_word: usize = if (is_4bit) 8 else 4;
+    const group_size: usize = if (is_4bit) group_size_4bit else group_size_8bit;
+    const actual_dtype: DType = if (is_4bit) .grouped_affine_u4 else .grouped_affine_u8;
+    const bits_per_val: u5 = if (is_4bit) 4 else 8;
+
+    // --- 1. Transpose weight data: [in_packed, out] → [out, in_packed] ---
+    const weight_data = weight_tensor.data();
+    const weight_u32_count = weight_data.len / 4;
+    if (weight_u32_count != in_packed * out_features) return error.InvalidShape;
+
+    const transposed_weight = try allocator.alloc(u8, weight_data.len); // lint:ignore errdefer-alloc - arena freed atomically
+    {
+        const src: [*]align(1) const u32 = @ptrCast(weight_data.ptr);
+        const dst: [*]align(1) u32 = @ptrCast(transposed_weight.ptr);
+        if (needs_transpose) {
+            for (0..in_packed) |r| {
+                for (0..out_features) |c| {
+                    dst[c * in_packed + r] = src[r * out_features + c];
+                }
+            }
+        } else {
+            @memcpy(transposed_weight, weight_data);
+        }
+    }
+
+    // --- 2. Transpose scales: [n_groups, out] → [out, n_groups] ---
+    const scales_f16_count = scales_bytes.len / 2;
+    if (scales_f16_count != n_groups * out_features) return error.InvalidShape;
+
+    const transposed_scales = try allocator.alloc(u8, scales_bytes.len); // lint:ignore errdefer-alloc - arena freed atomically
+    {
+        const src: [*]align(1) const u16 = @ptrCast(scales_bytes.ptr);
+        const dst: [*]align(1) u16 = @ptrCast(transposed_scales.ptr);
+        if (needs_transpose) {
+            for (0..n_groups) |g| {
+                for (0..out_features) |o| {
+                    dst[o * n_groups + g] = src[g * out_features + o];
+                }
+            }
+        } else {
+            @memcpy(transposed_scales, scales_bytes);
+        }
+    }
+
+    // --- 3. Convert qzeros → biases ---
+    // qzeros: I32 [n_groups, out_features / vals_per_word], packed zero points.
+    // AutoGPTQ convention: actual_zp = stored_zp + 1.
+    // GAF bias = -scale * actual_zp, stored as F16/BF16 [out, n_groups].
+    const zp_per_word: usize = @as(usize, 32) / bits_per_val;
+    const zp_packed_cols = (out_features + zp_per_word - 1) / zp_per_word;
+    const qzeros_u32_count = qzeros_bytes.len / 4;
+    if (qzeros_u32_count != n_groups * zp_packed_cols) return error.InvalidShape;
+
+    const biases_count = n_groups * out_features;
+    const transposed_biases = try allocator.alloc(u8, biases_count * 2); // lint:ignore errdefer-alloc - arena freed atomically
+    {
+        const qz: [*]align(1) const u32 = @ptrCast(qzeros_bytes.ptr);
+        const scales_src: [*]align(1) const u16 = @ptrCast(scales_bytes.ptr);
+        const dst: [*]align(1) u16 = @ptrCast(transposed_biases.ptr);
+        const mask: u32 = (@as(u32, 1) << bits_per_val) - 1;
+
+        for (0..n_groups) |g| {
+            for (0..zp_packed_cols) |j| {
+                const packed_zp = qz[g * zp_packed_cols + j];
+                for (0..zp_per_word) |k| {
+                    const o = j * zp_per_word + k;
+                    if (o >= out_features) break;
+                    const stored_zp: u32 = (packed_zp >> @as(u5, @intCast(k * bits_per_val))) & mask;
+                    const actual_zp_f32: f32 = @floatFromInt(stored_zp + 1);
+                    // scale is in GPTQ layout [g][o]
+                    const scale_u16 = scales_src[g * out_features + o];
+                    const scale_f32 = if (scales_dtype == .f16)
+                        dtype.fp16ToF32(scale_u16)
+                    else
+                        dtype.bf16ToF32(scale_u16);
+                    const bias_f32 = -scale_f32 * actual_zp_f32;
+                    const bias_u16 = if (scales_dtype == .f16)
+                        dtype.f32ToFp16(bias_f32)
+                    else
+                        @as(u16, @truncate(@as(u32, @bitCast(bias_f32)) >> 16));
+                    // Store in GAF layout [o][g]
+                    dst[o * n_groups + g] = bias_u16;
+                }
+            }
+        }
+    }
+
+    // Build result tensor with GAF metadata
+    const k_unpacked = in_packed * values_per_word;
+    const n_groups_actual = k_unpacked / group_size;
+    if (n_groups_actual > MAX_SUPPORTED_GAFFINE_GROUPS) return error.TooManyGroups;
+
+    var result = weight_tensor;
+    result.dtype = actual_dtype;
+    result.shape[0] = @intCast(out_features);
+    result.shape[1] = @intCast(k_unpacked);
+    result.data_ptr = transposed_weight.ptr;
+    result.data_size = transposed_weight.len;
+    result.gaffine = .{
+        .scales = transposed_scales,
+        .biases = transposed_biases,
+        .group_size = group_size,
+        .scales_dtype = scales_dtype,
+    };
+
+    log.info("load", "Converted GPTQ weight to GAF format", .{
+        .name = name,
+        .out_features = out_features,
+        .in_features = k_unpacked,
+        .n_groups = n_groups,
+        .group_size = group_size,
+        .bits = @as(u8, if (is_4bit) 4 else 8),
+    });
+
+    return result;
 }
 
 pub fn orientWeightF32(allocator: std.mem.Allocator, t: Tensor, expected_in: usize) !Tensor {

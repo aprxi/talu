@@ -106,12 +106,28 @@ fn tryLoadCandidate(
     model_config: *const tensor.ModelConfig,
     options: LoadOptions,
 ) !?*const Tensor {
-    const raw_tensor = safetensors.getTensor(name, null) catch return null;
+    // Try primary name, then GPTQ .qweight fallback for quantized models.
+    var qweight_name_buf: [512]u8 = undefined;
+    var effective_name = name;
+    const raw_tensor = safetensors.getTensor(name, null) catch blk: {
+        if (std.mem.endsWith(u8, name, ".weight")) {
+            const base_len = name.len - ".weight".len;
+            const qw_suffix = ".qweight";
+            const total = base_len + qw_suffix.len;
+            if (total <= qweight_name_buf.len) {
+                @memcpy(qweight_name_buf[0..base_len], name[0..base_len]);
+                @memcpy(qweight_name_buf[base_len..total], qw_suffix);
+                effective_name = qweight_name_buf[0..total];
+                break :blk safetensors.getTensor(effective_name, null) catch return null;
+            }
+        }
+        return null;
+    };
 
     const transformed = applySpecTransforms(
         allocator,
         safetensors,
-        name,
+        effective_name,
         raw_tensor,
         spec,
         model_config,
@@ -119,7 +135,7 @@ fn tryLoadCandidate(
     ) catch |err| {
         log.err("load", "Failed to apply weight transforms", .{
             .id = spec.id,
-            .name = name,
+            .name = effective_name,
             .err = @errorName(err),
         }, @src());
         return err;

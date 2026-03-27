@@ -247,10 +247,10 @@ pub const SafeTensors = struct {
 /// Parse SafeTensors dtype string to internal DType.
 ///
 /// NOTE: U8 is mapped to .i8 because SafeTensors uses unsigned, but our
-/// tensor ops treat int8 indices uniformly. U32 is mapped to .grouped_affine_u4
-/// because MLX-quantized models store packed 4-bit weights as U32 with separate
-/// scales/biases tensors. The actual bit-width (4 or 8) is auto-detected at
-/// load time in orientWeight() based on scales shape.
+/// tensor ops treat int8 indices uniformly. U32/I32 are mapped to .grouped_affine_u4
+/// because quantized models store packed 4-bit weights as U32 (MLX/GAF) or I32
+/// (GPTQ/AutoRound) with separate scales tensors. The actual bit-width (4 or 8)
+/// is auto-detected at load time in orientWeight() based on scales shape.
 fn parseDType(value: std.json.Value) ?DType {
     if (value != .string) return null;
     return std.StaticStringMap(DType).initComptime(.{
@@ -259,6 +259,7 @@ fn parseDType(value: std.json.Value) ?DType {
         .{ "BF16", .bf16 },
         .{ "I8", .i8 },
         .{ "U8", .i8 }, // Unsigned treated as signed for index ops
+        .{ "I32", .grouped_affine_u4 }, // GPTQ packed weights; actual bits detected later
         .{ "I64", .i64 },
         .{ "U32", .grouped_affine_u4 }, // MLX packed weights; actual bits detected later
         .{ "F8_E4M3", .f8_e4m3 },
@@ -317,7 +318,8 @@ test "parseDType: valid dtype strings" {
     try testing.expectEqual(DType.i8, parseDType(.{ .string = "I8" }).?);
     try testing.expectEqual(DType.i8, parseDType(.{ .string = "U8" }).?); // U8 maps to i8
     try testing.expectEqual(DType.i64, parseDType(.{ .string = "I64" }).?);
-    try testing.expectEqual(DType.grouped_affine_u4, parseDType(.{ .string = "U32" }).?); // U32 maps to grouped_affine_u4
+    try testing.expectEqual(DType.grouped_affine_u4, parseDType(.{ .string = "I32" }).?); // I32 maps to grouped_affine_u4 (GPTQ)
+    try testing.expectEqual(DType.grouped_affine_u4, parseDType(.{ .string = "U32" }).?); // U32 maps to grouped_affine_u4 (MLX)
 
 }
 
