@@ -118,7 +118,7 @@ extern "C" __global__ void talu_embedding_lookup_gaffine_u4_f32(
 static constexpr unsigned int U4_WARPS_PER_BLOCK = 4;
 static constexpr unsigned int U4_WARP_ELEMS_PER_THREAD = 32;
 static constexpr unsigned int U4_WARP_STEP = TALU_QUANT_WARP_SIZE * U4_WARP_ELEMS_PER_THREAD; // 1024
-static constexpr unsigned int U4_BATCH_TILE = 8;
+static constexpr unsigned int U4_BATCH_TILE = 4;
 
 // Process one word (8 U4 nibbles) against 8 F32 input values using factored
 // accumulation: accumulate raw nibble*input products, then apply scale/bias
@@ -217,7 +217,7 @@ static __device__ __forceinline__ void talu_gaffine_u4_matvec_batched(
     }
 }
 
-extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_f32(
+extern "C" __global__ __launch_bounds__(128, 2) void talu_gaffine_u4_matvec_f32(
     const float* input,
     const unsigned int* packed_weight,
     const unsigned short* scales,
@@ -524,7 +524,7 @@ extern "C" __global__ __launch_bounds__(128) void talu_i8_matvec_gate_up_silu_f3
     }
 }
 
-extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_qkv_f32(
+extern "C" __global__ __launch_bounds__(128, 2) void talu_gaffine_u4_matvec_qkv_f32(
     const float* input,
     const unsigned int* q_packed_weight,
     const unsigned short* q_scales,
@@ -675,7 +675,7 @@ extern "C" __global__ void talu_gaffine_u8_matvec_qkv_f32(
     if (threadIdx.x == 0) v_out_row[v_row] = acc;
 }
 
-extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up_f32(
+extern "C" __global__ __launch_bounds__(128, 2) void talu_gaffine_u4_matvec_gate_up_f32(
     const float* input,
     const unsigned int* gate_packed_weight,
     const unsigned short* gate_scales,
@@ -842,7 +842,7 @@ static __device__ __forceinline__ void talu_gaffine_u4_gate_up_silu_batched(
 }
 
 // Grid: (ceil(out_dim/4), ceil(batch_rows/U4_BATCH_TILE)), Block: (128 = 4 warps)
-extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up_silu_f32(
+extern "C" __global__ __launch_bounds__(128, 2) void talu_gaffine_u4_matvec_gate_up_silu_f32(
     const float* input,
     const unsigned int* gate_packed_weight,
     const unsigned short* gate_scales,

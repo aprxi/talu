@@ -101,6 +101,95 @@ extern "C" __global__ void talu_rmsnorm_f32(
     }
 }
 
+extern "C" __global__ void talu_rmsnorm_rows_strided_f32(
+    float* out,
+    const float* input,
+    const float* weight,
+    unsigned int rows,
+    unsigned int cols,
+    unsigned int input_stride,
+    unsigned int output_stride,
+    float eps,
+    float weight_offset
+) {
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const unsigned int tid = threadIdx.x;
+    const float* row_in = input + (unsigned long long)row * input_stride;
+    float* row_out = out + (unsigned long long)row * output_stride;
+
+    float sum_sq = 0.0f;
+    const unsigned int cols4 = cols / 4;
+    const bool vectorizable = ((reinterpret_cast<uintptr_t>(row_in) & 0xFu) == 0u);
+
+    if (vectorizable) {
+        const float4* row_in4 = reinterpret_cast<const float4*>(row_in);
+        for (unsigned int i = tid; i < cols4; i += blockDim.x) {
+            const float4 v = row_in4[i];
+            sum_sq = fmaf(v.x, v.x, sum_sq);
+            sum_sq = fmaf(v.y, v.y, sum_sq);
+            sum_sq = fmaf(v.z, v.z, sum_sq);
+            sum_sq = fmaf(v.w, v.w, sum_sq);
+        }
+        for (unsigned int i = cols4 * 4 + tid; i < cols; i += blockDim.x) {
+            const float v = row_in[i];
+            sum_sq = fmaf(v, v, sum_sq);
+        }
+    } else {
+        for (unsigned int i = tid; i < cols; i += blockDim.x) {
+            const float v = row_in[i];
+            sum_sq = fmaf(v, v, sum_sq);
+        }
+    }
+
+    const float lane_sum = talu_warp_reduce_sum(sum_sq);
+    __shared__ float warp_sums[32];
+    if ((tid & 31u) == 0u) {
+        warp_sums[tid >> 5] = lane_sum;
+    }
+    __syncthreads();
+
+    const unsigned int warp_count = (blockDim.x + 31u) >> 5;
+    float block_sum = (tid < warp_count) ? warp_sums[tid] : 0.0f;
+    if (tid < 32u) {
+        block_sum = talu_warp_reduce_sum(block_sum);
+    }
+
+    __shared__ float inv_rms;
+    if (tid == 0) {
+        const float mean_sq = block_sum / (float)cols;
+        inv_rms = rsqrtf(mean_sq + eps);
+    }
+    __syncthreads();
+
+    const float irms = inv_rms;
+    if (vectorizable and ((reinterpret_cast<uintptr_t>(row_out) & 0xFu) == 0u) and
+        ((reinterpret_cast<uintptr_t>(weight) & 0xFu) == 0u))
+    {
+        const float4* row_in4 = reinterpret_cast<const float4*>(row_in);
+        float4* row_out4 = reinterpret_cast<float4*>(row_out);
+        const float4* weight4 = reinterpret_cast<const float4*>(weight);
+        for (unsigned int i = tid; i < cols4; i += blockDim.x) {
+            const float4 in_v = row_in4[i];
+            const float4 w_v = weight4[i];
+            float4 out_v;
+            out_v.x = in_v.x * irms * (w_v.x + weight_offset);
+            out_v.y = in_v.y * irms * (w_v.y + weight_offset);
+            out_v.z = in_v.z * irms * (w_v.z + weight_offset);
+            out_v.w = in_v.w * irms * (w_v.w + weight_offset);
+            row_out4[i] = out_v;
+        }
+        for (unsigned int i = cols4 * 4 + tid; i < cols; i += blockDim.x) {
+            row_out[i] = row_in[i] * irms * (weight[i] + weight_offset);
+        }
+    } else {
+        for (unsigned int i = tid; i < cols; i += blockDim.x) {
+            row_out[i] = row_in[i] * irms * (weight[i] + weight_offset);
+        }
+    }
+}
+
 extern "C" __global__ void talu_rope_f32(
     float* io,
     unsigned int n_heads,

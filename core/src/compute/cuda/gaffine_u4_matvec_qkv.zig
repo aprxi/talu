@@ -14,7 +14,7 @@ pub const embedded_symbol: [:0]const u8 = "talu_gaffine_u4_matvec_qkv_f32";
 pub const op_name: []const u8 = "gaffine_u4_matvec_qkv_f32";
 const warp_size: u32 = 32;
 const block_x: u32 = 128;
-const inner_batch_rows: u32 = 8;
+const inner_batch_rows: u32 = 4;
 
 pub fn run(
     allocator: std.mem.Allocator,

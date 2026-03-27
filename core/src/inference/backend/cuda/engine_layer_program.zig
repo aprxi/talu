@@ -563,6 +563,14 @@ pub fn layerProgramAttentionAdapter(
     const attention_binding = try requireAttentionRuntimeBinding(kv_state, ctx.layer_index);
     // Batched decode: N tokens at different positions/slots, GEMM projections.
     if (ctx.batch_info) |batch| {
+        // Reuse the fused concat-I8 QKV cache for batched decode as well.
+        // Previously this was only enabled on non-batched prefill routes,
+        // forcing decode batch rows through slower U4 QKV projection kernels.
+        self.active_qkv_concat = if (attention_binding.qkv_i8_concat.pointer != 0)
+            .{ .i8_buf = attention_binding.qkv_i8_concat, .scales_buf = attention_binding.qkv_scales_concat, .dims = attention_binding.qkv_concat_dims }
+        else
+            null;
+        defer self.active_qkv_concat = null;
         try engine_mixers.runBatchedDecodeAttentionMixer(
             self,
             cfg,
@@ -1712,6 +1720,14 @@ pub fn assignResolvedKernel(
             self.vector_add_scaled_function = resolved.function;
             self.vector_add_scaled_source = resolved.source;
         },
+        .vector_add_rows_strided => {
+            self.vector_add_rows_strided_function = resolved.function;
+            self.vector_add_rows_strided_source = resolved.source;
+        },
+        .vector_add_scaled_rows_strided => {
+            self.vector_add_scaled_rows_strided_function = resolved.function;
+            self.vector_add_scaled_rows_strided_source = resolved.source;
+        },
         .mul => {
             self.mul_function = resolved.function;
             self.mul_source = resolved.source;
@@ -1763,6 +1779,10 @@ pub fn assignResolvedKernel(
         .rmsnorm => {
             self.rmsnorm_function = resolved.function;
             self.rmsnorm_source = resolved.source;
+        },
+        .rmsnorm_rows_strided => {
+            self.rmsnorm_rows_strided_function = resolved.function;
+            self.rmsnorm_rows_strided_source = resolved.source;
         },
         .rope => {
             self.rope_function = resolved.function;

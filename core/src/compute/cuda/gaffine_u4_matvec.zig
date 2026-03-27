@@ -15,7 +15,7 @@ pub const scales_dtype_f16: u32 = 0;
 pub const scales_dtype_bf16: u32 = 1;
 const warp_size: u32 = 32;
 const block_x: u32 = 128;
-const inner_batch_rows: u32 = 8;
+const inner_batch_rows: u32 = 4;
 
 pub fn run(
     allocator: std.mem.Allocator,

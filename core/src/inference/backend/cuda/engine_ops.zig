@@ -714,7 +714,8 @@ pub fn runQkvProjection(
     const q_bytes = std.math.mul(usize, rows, q_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     const k_bytes = std.math.mul(usize, rows, k_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     const v_bytes = std.math.mul(usize, rows, v_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
-    if (q_out_dest.size >= q_bytes and
+    const prefer_i8_concat = self.active_qkv_concat != null and rows > 1 and self.i8_blas_supported;
+    if (!prefer_i8_concat and q_out_dest.size >= q_bytes and
         try tryFusedQkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest))
     {
         return .fused;
@@ -811,6 +812,14 @@ pub fn runQkvProjection(
             }
             return .unfused;
         }
+    }
+
+    // If concat-I8 path is unavailable/failed, retry fused QKV kernel before
+    // falling back to three separate projections.
+    if (q_out_dest.size >= q_bytes and
+        try tryFusedQkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest))
+    {
+        return .fused;
     }
 
     try linearForwardRows(self, input, rows, q_proj, &q_out);
@@ -987,6 +996,85 @@ pub fn addResidualWithScaleRowsStrideAware(
     if (out_stride < row_bytes or residual_stride < row_bytes or branch_stride < row_bytes) {
         return error.InvalidInstructionBinding;
     }
+    if ((out_stride % @sizeOf(f32)) != 0 or
+        (residual_stride % @sizeOf(f32)) != 0 or
+        (branch_stride % @sizeOf(f32)) != 0)
+    {
+        return error.InvalidInstructionBinding;
+    }
+
+    const out_stride_elems_u32 = std.math.cast(u32, out_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
+    const residual_stride_elems_u32 = std.math.cast(u32, residual_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
+    const branch_stride_elems_u32 = std.math.cast(u32, branch_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
+
+    if (self.vector_add_rows_strided_function != null and self.vector_add_scaled_rows_strided_function != null) {
+        switch (scale) {
+            .one => {
+                try compute.cuda.vector_add_rows_strided.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    self.vector_add_rows_strided_function.?,
+                    residual,
+                    branch,
+                    out,
+                    rows,
+                    cols,
+                    residual_stride_elems_u32,
+                    branch_stride_elems_u32,
+                    out_stride_elems_u32,
+                );
+            },
+            .residual_multiplier => {
+                try compute.cuda.vector_add_scaled_rows_strided.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    self.vector_add_scaled_rows_strided_function.?,
+                    residual,
+                    branch,
+                    out,
+                    self.loaded.config.residual_multiplier,
+                    rows,
+                    cols,
+                    residual_stride_elems_u32,
+                    branch_stride_elems_u32,
+                    out_stride_elems_u32,
+                );
+            },
+            .literal => |literal| {
+                if (literal == 1.0) {
+                    try compute.cuda.vector_add_rows_strided.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        self.vector_add_rows_strided_function.?,
+                        residual,
+                        branch,
+                        out,
+                        rows,
+                        cols,
+                        residual_stride_elems_u32,
+                        branch_stride_elems_u32,
+                        out_stride_elems_u32,
+                    );
+                } else {
+                    try compute.cuda.vector_add_scaled_rows_strided.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        self.vector_add_scaled_rows_strided_function.?,
+                        residual,
+                        branch,
+                        out,
+                        literal,
+                        rows,
+                        cols,
+                        residual_stride_elems_u32,
+                        branch_stride_elems_u32,
+                        out_stride_elems_u32,
+                    );
+                }
+            },
+        }
+        return;
+    }
 
     var row_idx: usize = 0;
     while (row_idx < row_count) : (row_idx += 1) {
@@ -1034,6 +1122,29 @@ pub fn runRmsnormRowsStrideAware(
     const input_stride = input.size / row_count;
     const output_stride = output.size / row_count;
     if (input_stride < row_bytes or output_stride < row_bytes) return error.InvalidInstructionBinding;
+    if ((input_stride % @sizeOf(f32)) != 0 or (output_stride % @sizeOf(f32)) != 0) {
+        return error.InvalidInstructionBinding;
+    }
+
+    const input_stride_elems_u32 = std.math.cast(u32, input_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
+    const output_stride_elems_u32 = std.math.cast(u32, output_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
+    if (self.rmsnorm_rows_strided_function) |kernel| {
+        try compute.cuda.rmsnorm_rows_strided.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            kernel,
+            input,
+            weight,
+            output,
+            rows,
+            cols,
+            input_stride_elems_u32,
+            output_stride_elems_u32,
+            self.norm_eps,
+            self.loaded.runtime.weight_offset,
+        );
+        return;
+    }
 
     var row_idx: usize = 0;
     while (row_idx < row_count) : (row_idx += 1) {

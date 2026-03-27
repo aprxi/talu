@@ -21,6 +21,51 @@ extern "C" __global__ void talu_vector_add_scaled_f32(
     out[index] = a[index] + b[index] * scale;
 }
 
+extern "C" __global__ void talu_vector_add_rows_strided_f32(
+    float* out,
+    const float* a,
+    const float* b,
+    unsigned int rows,
+    unsigned int cols,
+    unsigned int out_stride,
+    unsigned int a_stride,
+    unsigned int b_stride
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = rows * cols;
+    if (index >= total) return;
+
+    const unsigned int row = index / cols;
+    const unsigned int col = index - row * cols;
+    const unsigned long long out_idx = (unsigned long long)row * out_stride + col;
+    const unsigned long long a_idx = (unsigned long long)row * a_stride + col;
+    const unsigned long long b_idx = (unsigned long long)row * b_stride + col;
+    out[out_idx] = a[a_idx] + b[b_idx];
+}
+
+extern "C" __global__ void talu_vector_add_scaled_rows_strided_f32(
+    float* out,
+    const float* a,
+    const float* b,
+    float scale,
+    unsigned int rows,
+    unsigned int cols,
+    unsigned int out_stride,
+    unsigned int a_stride,
+    unsigned int b_stride
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = rows * cols;
+    if (index >= total) return;
+
+    const unsigned int row = index / cols;
+    const unsigned int col = index - row * cols;
+    const unsigned long long out_idx = (unsigned long long)row * out_stride + col;
+    const unsigned long long a_idx = (unsigned long long)row * a_stride + col;
+    const unsigned long long b_idx = (unsigned long long)row * b_stride + col;
+    out[out_idx] = a[a_idx] + b[b_idx] * scale;
+}
+
 extern "C" __global__ void talu_mul_f32(
     float* out,
     const float* a,

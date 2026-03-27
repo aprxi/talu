@@ -48,9 +48,12 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, a_offset);
     try arg_pack.appendScalar(u32, out_row_stride);
 
-    const block_x: u32 = @min(d_head, out_tile);
-    const tiles_per_head = ceilDiv(d_head, out_tile);
+    const block_x: u32 = blk: {
+        const multi = @min(d_head, out_tile * 4);
+        break :blk if (multi >= 32) multi else @min(d_head, out_tile);
+    };
     const shared_bytes = std.math.mul(usize, 2 * @as(usize, d_head), @sizeOf(f32)) catch return error.InvalidArgument;
+    const tiles_per_head = ceilDiv(d_head, out_tile);
     try launch_mod.launchWithFamily(device, function, .{
         .grid_x = std.math.mul(u32, n_v_heads, tiles_per_head) catch return error.InvalidArgument,
         .grid_y = rows,

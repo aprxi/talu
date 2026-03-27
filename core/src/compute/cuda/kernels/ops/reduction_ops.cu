@@ -143,6 +143,7 @@ extern "C" __global__ void talu_topk_rows_phase1(
 
     __shared__ float shared_val[256];
     __shared__ unsigned int shared_idx[256];
+    __shared__ unsigned int picked_ids[256];
 
     // Find top-k within this chunk using repeated scans.
     // chunk_size / 256 is small (~19 elements/thread for 32 chunks
@@ -159,10 +160,10 @@ extern "C" __global__ void talu_topk_rows_phase1(
         for (unsigned int col = chunk_start + tid; col < chunk_end; col += blockDim.x) {
             float value = row_logits[col];
             // Check if this index was already picked in an earlier round.
-            // For small k this is cheaper than maintaining a separate mask.
+            // Keep the picked set in shared memory to avoid global reads.
             bool already_picked = false;
             for (unsigned int p = 0; p < pick; ++p) {
-                if (chunk_ids[out_base + p] == col) { already_picked = true; break; }
+                if (picked_ids[p] == col) { already_picked = true; break; }
             }
             if (already_picked) value = mask_value;
             if (value > local_best_val || (value == local_best_val && col < local_best_idx)) {
@@ -192,6 +193,7 @@ extern "C" __global__ void talu_topk_rows_phase1(
         if (tid == 0) {
             chunk_values[out_base + pick] = shared_val[0];
             chunk_ids[out_base + pick] = shared_idx[0];
+            picked_ids[pick] = shared_idx[0];
         }
         __syncthreads();
     }
@@ -217,6 +219,7 @@ extern "C" __global__ void talu_topk_rows_phase2(
 
     __shared__ float shared_val[256];
     __shared__ unsigned int shared_idx[256];
+    __shared__ unsigned int picked_ids[256];
 
     for (unsigned int pick = 0; pick < k; ++pick) {
         float local_best_val = mask_value;
@@ -226,9 +229,10 @@ extern "C" __global__ void talu_topk_rows_phase2(
             const float value = chunk_values[chunk_base + i];
             const unsigned int orig_id = chunk_ids[chunk_base + i];
             // Skip already-picked entries by checking output so far.
+            // Keep picked IDs in shared memory to avoid global reads.
             bool already_picked = false;
             for (unsigned int p = 0; p < pick; ++p) {
-                if (out_ids[row * row_stride + p] == orig_id) { already_picked = true; break; }
+                if (picked_ids[p] == orig_id) { already_picked = true; break; }
             }
             if (already_picked) continue;
             if (value > local_best_val || (value == local_best_val && orig_id < local_best_idx)) {
@@ -258,6 +262,7 @@ extern "C" __global__ void talu_topk_rows_phase2(
         if (tid == 0) {
             out_values[row * row_stride + pick] = shared_val[0];
             out_ids[row * row_stride + pick] = shared_idx[0];
+            picked_ids[pick] = shared_idx[0];
         }
         __syncthreads();
     }

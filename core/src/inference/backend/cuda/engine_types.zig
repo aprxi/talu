@@ -262,6 +262,8 @@ pub fn resolveCudaPrefillChunkRowsCap(max_seq_len: usize) usize {
 pub const KernelSlot = enum {
     vector_add,
     vector_add_scaled,
+    vector_add_rows_strided,
+    vector_add_scaled_rows_strided,
     mul,
     copy,
     copy_u16,
@@ -275,6 +277,7 @@ pub const KernelSlot = enum {
     kv_write_f16_rows,
     kv_write_f16_rows_ptrs,
     rmsnorm,
+    rmsnorm_rows_strided,
     rope,
     rope_store_f16,
     attn_scores_heads_f32,
@@ -400,6 +403,8 @@ pub const AttentionKernelSet = struct {
 pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .vector_add, .op_name = compute.cuda.vector_add.op_name, .embedded_symbol = compute.cuda.vector_add.embedded_symbol },
     .{ .slot = .vector_add_scaled, .op_name = compute.cuda.vector_add_scaled.op_name, .embedded_symbol = compute.cuda.vector_add_scaled.embedded_symbol },
+    .{ .slot = .vector_add_rows_strided, .op_name = compute.cuda.vector_add_rows_strided.op_name, .embedded_symbol = compute.cuda.vector_add_rows_strided.embedded_symbol },
+    .{ .slot = .vector_add_scaled_rows_strided, .op_name = compute.cuda.vector_add_scaled_rows_strided.op_name, .embedded_symbol = compute.cuda.vector_add_scaled_rows_strided.embedded_symbol },
     .{ .slot = .mul, .op_name = compute.cuda.mul.op_name, .embedded_symbol = compute.cuda.mul.embedded_symbol },
     .{ .slot = .copy, .op_name = compute.cuda.copy.op_name, .embedded_symbol = compute.cuda.copy.embedded_symbol },
     .{ .slot = .copy_u16, .op_name = compute.cuda.copy_u16.op_name, .embedded_symbol = compute.cuda.copy_u16.embedded_symbol },
@@ -413,6 +418,7 @@ pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .kv_write_f16_rows, .op_name = compute.cuda.kv_write_f16_rows.op_name, .embedded_symbol = compute.cuda.kv_write_f16_rows.embedded_symbol },
     .{ .slot = .kv_write_f16_rows_ptrs, .op_name = compute.cuda.kv_write_f16_rows_ptrs.op_name, .embedded_symbol = compute.cuda.kv_write_f16_rows_ptrs.embedded_symbol },
     .{ .slot = .rmsnorm, .op_name = compute.cuda.rmsnorm.op_name, .embedded_symbol = compute.cuda.rmsnorm.embedded_symbol },
+    .{ .slot = .rmsnorm_rows_strided, .op_name = compute.cuda.rmsnorm_rows_strided.op_name, .embedded_symbol = compute.cuda.rmsnorm_rows_strided.embedded_symbol },
     .{ .slot = .rope, .op_name = compute.cuda.rope.op_name, .embedded_symbol = compute.cuda.rope.embedded_symbol },
     .{ .slot = .rope_store_f16, .op_name = compute.cuda.rope_store_f16.op_name, .embedded_symbol = compute.cuda.rope_store_f16.embedded_symbol },
     .{ .slot = .attn_scores_heads_f32, .op_name = compute.cuda.attn_scores_heads_f32.op_name, .embedded_symbol = compute.cuda.attn_scores_heads_f32.embedded_symbol },
