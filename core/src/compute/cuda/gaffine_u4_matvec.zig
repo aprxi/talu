@@ -15,6 +15,7 @@ pub const scales_dtype_f16: u32 = 0;
 pub const scales_dtype_bf16: u32 = 1;
 const warp_size: u32 = 32;
 const block_x: u32 = 128;
+const inner_batch_rows: u32 = 8;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -91,7 +92,7 @@ pub fn runWithFunction(
     const grid_x: u32 = ceilDiv(out_dim, rows_per_block);
     try launch_mod.launchWithFamily(device, function, .{
         .grid_x = grid_x,
-        .grid_y = batch_rows,
+        .grid_y = ceilDiv(batch_rows, inner_batch_rows),
         .block_x = block_x,
     }, arg_pack, .matvec);
 }

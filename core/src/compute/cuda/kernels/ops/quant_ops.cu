@@ -118,6 +118,7 @@ extern "C" __global__ void talu_embedding_lookup_gaffine_u4_f32(
 static constexpr unsigned int U4_WARPS_PER_BLOCK = 4;
 static constexpr unsigned int U4_WARP_ELEMS_PER_THREAD = 32;
 static constexpr unsigned int U4_WARP_STEP = TALU_QUANT_WARP_SIZE * U4_WARP_ELEMS_PER_THREAD; // 1024
+static constexpr unsigned int U4_BATCH_TILE = 8;
 
 // Process one word (8 U4 nibbles) against 8 F32 input values using factored
 // accumulation: accumulate raw nibble*input products, then apply scale/bias
@@ -137,16 +138,24 @@ static constexpr unsigned int U4_WARP_STEP = TALU_QUANT_WARP_SIZE * U4_WARP_ELEM
     (acc) = fmaf(r0 + r1, (s), fmaf(isum, (b), (acc))); \
 } while (0)
 
-static __device__ __forceinline__ float talu_gaffine_u4_dot_row_warp_v(
+// Inner-batch U4 GEMV: weight loaded once from DRAM, reused across BATCH input
+// rows from registers. BATCH=1 compiles to identical code as the original
+// single-row kernel. BATCH=2..8 adds one accumulator per extra row.
+template <unsigned int BATCH>
+static __device__ __forceinline__ void talu_gaffine_u4_matvec_batched(
     const float* input,
     const unsigned int* packed_weight,
     const unsigned short* scales,
     const unsigned short* biases,
+    float* out,
     unsigned int in_dim,
+    unsigned int out_dim,
     unsigned int out_idx,
     unsigned int group_size,
     unsigned int scales_dtype_tag,
-    unsigned int lane
+    unsigned int lane,
+    unsigned int batch_rows,
+    const float* residual
 ) {
     const unsigned int words_per_row = in_dim >> 3;
     const unsigned int words_per_group = group_size >> 3;
@@ -155,9 +164,10 @@ static __device__ __forceinline__ float talu_gaffine_u4_dot_row_warp_v(
     const unsigned short* scale_row = scales + (unsigned long long)out_idx * groups_per_row;
     const unsigned short* bias_row = biases + (unsigned long long)out_idx * groups_per_row;
 
-    // 64-bit weight loads: 2 words (16 nibbles) per iteration via v2.u32.
-    float acc = 0.0f;
+    float acc[BATCH] = {};
+
     for (unsigned int w = lane << 1; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 1) {
+        // Weight + scale/bias: loaded ONCE, shared across all batch rows.
         unsigned int w0, w1;
         asm volatile(
             "ld.global.cs.v2.u32 {%0, %1}, [%2];"
@@ -168,18 +178,43 @@ static __device__ __forceinline__ float talu_gaffine_u4_dot_row_warp_v(
         const unsigned int g0 = w / words_per_group;
         const float s0 = talu_decode_scale_bias_u16(scale_row[g0], scales_dtype_tag);
         const float b0 = talu_decode_scale_bias_u16(bias_row[g0], scales_dtype_tag);
-        const float4 i0 = *reinterpret_cast<const float4*>(&input[base_elem]);
-        const float4 i1 = *reinterpret_cast<const float4*>(&input[base_elem + 4]);
-        U4_PROCESS_WORD(w0, i0, i1, s0, b0, acc);
-
         const unsigned int g1 = (w + 1) / words_per_group;
         const float s1 = talu_decode_scale_bias_u16(scale_row[g1], scales_dtype_tag);
         const float b1 = talu_decode_scale_bias_u16(bias_row[g1], scales_dtype_tag);
-        const float4 i2 = *reinterpret_cast<const float4*>(&input[base_elem + 8]);
-        const float4 i3 = *reinterpret_cast<const float4*>(&input[base_elem + 12]);
-        U4_PROCESS_WORD(w1, i2, i3, s1, b1, acc);
+
+        // Word 0: per-batch input load + accumulate.
+        #pragma unroll
+        for (unsigned int b = 0; b < BATCH; b++) {
+            if (b >= batch_rows) break;
+            const float4 i0 = *reinterpret_cast<const float4*>(
+                &input[(unsigned long long)b * in_dim + base_elem]);
+            const float4 i1 = *reinterpret_cast<const float4*>(
+                &input[(unsigned long long)b * in_dim + base_elem + 4]);
+            U4_PROCESS_WORD(w0, i0, i1, s0, b0, acc[b]);
+        }
+        // Word 1: per-batch input load + accumulate.
+        #pragma unroll
+        for (unsigned int b = 0; b < BATCH; b++) {
+            if (b >= batch_rows) break;
+            const float4 i2 = *reinterpret_cast<const float4*>(
+                &input[(unsigned long long)b * in_dim + base_elem + 8]);
+            const float4 i3 = *reinterpret_cast<const float4*>(
+                &input[(unsigned long long)b * in_dim + base_elem + 12]);
+            U4_PROCESS_WORD(w1, i2, i3, s1, b1, acc[b]);
+        }
     }
-    return talu_quant_warp_sum_f32(acc);
+
+    #pragma unroll
+    for (unsigned int b = 0; b < BATCH; b++) {
+        if (b >= batch_rows) break;
+        float result = talu_quant_warp_sum_f32(acc[b]);
+        if (lane == 0) {
+            out[(unsigned long long)b * out_dim + out_idx] =
+                residual
+                    ? result + residual[(unsigned long long)b * out_dim + out_idx]
+                    : result;
+        }
+    }
 }
 
 extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_f32(
@@ -195,8 +230,10 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_f32(
     unsigned int batch_rows,
     const float* residual
 ) {
-    const unsigned int batch = blockIdx.y;
-    if (batch >= batch_rows) return;
+    const unsigned int batch_base = blockIdx.y * U4_BATCH_TILE;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < U4_BATCH_TILE
+        ? batch_rows - batch_base : U4_BATCH_TILE;
 
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
@@ -204,14 +241,22 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_f32(
     if (out_idx >= out_dim) return;
     if (group_size == 0 || (in_dim % group_size) != 0 || (group_size % 8) != 0) return;
 
-    const float* input_row = input + (unsigned long long)batch * in_dim;
-    float* out_row = out + (unsigned long long)batch * out_dim;
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out + (unsigned long long)batch_base * out_dim;
+    const float* res_tile = residual
+        ? residual + (unsigned long long)batch_base * out_dim : nullptr;
 
-    const float acc = talu_gaffine_u4_dot_row_warp_v(
-        input_row, packed_weight, scales, biases,
-        in_dim, out_idx, group_size, scales_dtype_tag, lane);
-
-    if (lane == 0) out_row[out_idx] = residual ? acc + residual[out_idx] : acc;
+    switch (tile_rows) {
+        case 1u: talu_gaffine_u4_matvec_batched<1>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 1u, res_tile); break;
+        case 2u: talu_gaffine_u4_matvec_batched<2>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 2u, res_tile); break;
+        case 3u: talu_gaffine_u4_matvec_batched<3>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 3u, res_tile); break;
+        case 4u: talu_gaffine_u4_matvec_batched<4>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 4u, res_tile); break;
+        case 5u: talu_gaffine_u4_matvec_batched<5>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 5u, res_tile); break;
+        case 6u: talu_gaffine_u4_matvec_batched<6>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 6u, res_tile); break;
+        case 7u: talu_gaffine_u4_matvec_batched<7>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 7u, res_tile); break;
+        case 8u: talu_gaffine_u4_matvec_batched<8>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 8u, res_tile); break;
+        default: return;
+    }
 }
 
 extern "C" __global__ void talu_gaffine_u8_matvec_f32(
@@ -245,7 +290,7 @@ extern "C" __global__ void talu_gaffine_u8_matvec_f32(
             in_dim, out_idx, group_size, scales_dtype_tag),
         smem);
 
-    if (threadIdx.x == 0) out_row[out_idx] = residual ? acc + residual[out_idx] : acc;
+    if (threadIdx.x == 0) out_row[out_idx] = residual ? acc + residual[(unsigned long long)batch * out_dim + out_idx] : acc;
 }
 
 // Symmetric I8 GEMV: warp-per-row design with 4 output rows per block.
@@ -308,7 +353,7 @@ extern "C" __global__ __launch_bounds__(128) void talu_i8_matvec_f32(
     acc = talu_quant_warp_sum_f32(acc);
     if (lane == 0) {
         const float result = acc * weight_scales[out_idx];
-        out_row[out_idx] = residual ? result + residual[out_idx] : result;
+        out_row[out_idx] = residual ? result + residual[(unsigned long long)batch * out_dim + out_idx] : result;
     }
 }
 
@@ -505,13 +550,11 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_qkv_f32
     unsigned int in_dim,
     unsigned int batch_rows
 ) {
-    const unsigned int batch = blockIdx.y;
-    if (batch >= batch_rows) return;
+    const unsigned int batch_base = blockIdx.y * U4_BATCH_TILE;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < U4_BATCH_TILE
+        ? batch_rows - batch_base : U4_BATCH_TILE;
     if (in_dim == 0 || (in_dim % 32) != 0) return;
-    const float* input_row = input + (unsigned long long)batch * in_dim;
-    float* q_out_row = q_out + (unsigned long long)batch * q_out_dim;
-    float* k_out_row = k_out + (unsigned long long)batch * k_out_dim;
-    float* v_out_row = v_out + (unsigned long long)batch * v_out_dim;
 
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
@@ -520,31 +563,42 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_qkv_f32
     const unsigned int total_dim = qk_dim + v_out_dim;
     if (out_index >= total_dim) return;
 
+    // Determine which projection this warp handles.
+    const unsigned int* pw;
+    const unsigned short* sc;
+    const unsigned short* bi;
+    float* out_ptr;
+    unsigned int out_dim_proj, row_idx, grp_size, dtype_tag;
+
     if (out_index < q_out_dim) {
-        if (q_group_size == 0 || (in_dim % q_group_size) != 0 || (q_group_size % 8) != 0) return;
-        const float acc = talu_gaffine_u4_dot_row_warp_v(
-            input_row, q_packed_weight, q_scales, q_biases,
-            in_dim, out_index, q_group_size, q_scales_dtype_tag, lane);
-        if (lane == 0) q_out_row[out_index] = acc;
-        return;
+        pw = q_packed_weight; sc = q_scales; bi = q_biases;
+        out_ptr = q_out; out_dim_proj = q_out_dim;
+        row_idx = out_index; grp_size = q_group_size; dtype_tag = q_scales_dtype_tag;
+    } else if (out_index < qk_dim) {
+        pw = k_packed_weight; sc = k_scales; bi = k_biases;
+        out_ptr = k_out; out_dim_proj = k_out_dim;
+        row_idx = out_index - q_out_dim; grp_size = k_group_size; dtype_tag = k_scales_dtype_tag;
+    } else {
+        pw = v_packed_weight; sc = v_scales; bi = v_biases;
+        out_ptr = v_out; out_dim_proj = v_out_dim;
+        row_idx = out_index - qk_dim; grp_size = v_group_size; dtype_tag = v_scales_dtype_tag;
     }
+    if (grp_size == 0 || (in_dim % grp_size) != 0 || (grp_size % 8) != 0) return;
 
-    if (out_index < qk_dim) {
-        if (k_group_size == 0 || (in_dim % k_group_size) != 0 || (k_group_size % 8) != 0) return;
-        const unsigned int k_row = out_index - q_out_dim;
-        const float acc = talu_gaffine_u4_dot_row_warp_v(
-            input_row, k_packed_weight, k_scales, k_biases,
-            in_dim, k_row, k_group_size, k_scales_dtype_tag, lane);
-        if (lane == 0) k_out_row[k_row] = acc;
-        return;
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out_ptr + (unsigned long long)batch_base * out_dim_proj;
+
+    switch (tile_rows) {
+        case 1u: talu_gaffine_u4_matvec_batched<1>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 1u, nullptr); break;
+        case 2u: talu_gaffine_u4_matvec_batched<2>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 2u, nullptr); break;
+        case 3u: talu_gaffine_u4_matvec_batched<3>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 3u, nullptr); break;
+        case 4u: talu_gaffine_u4_matvec_batched<4>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 4u, nullptr); break;
+        case 5u: talu_gaffine_u4_matvec_batched<5>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 5u, nullptr); break;
+        case 6u: talu_gaffine_u4_matvec_batched<6>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 6u, nullptr); break;
+        case 7u: talu_gaffine_u4_matvec_batched<7>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 7u, nullptr); break;
+        case 8u: talu_gaffine_u4_matvec_batched<8>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 8u, nullptr); break;
+        default: return;
     }
-
-    if (v_group_size == 0 || (in_dim % v_group_size) != 0 || (v_group_size % 8) != 0) return;
-    const unsigned int v_row = out_index - qk_dim;
-    const float acc = talu_gaffine_u4_dot_row_warp_v(
-        input_row, v_packed_weight, v_scales, v_biases,
-        in_dim, v_row, v_group_size, v_scales_dtype_tag, lane);
-    if (lane == 0) v_out_row[v_row] = acc;
 }
 
 extern "C" __global__ void talu_gaffine_u8_matvec_qkv_f32(
@@ -640,12 +694,11 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up
     unsigned int in_dim,
     unsigned int batch_rows
 ) {
-    const unsigned int batch = blockIdx.y;
-    if (batch >= batch_rows) return;
+    const unsigned int batch_base = blockIdx.y * U4_BATCH_TILE;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < U4_BATCH_TILE
+        ? batch_rows - batch_base : U4_BATCH_TILE;
     if (in_dim == 0 || (in_dim % 32) != 0) return;
-    const float* input_row = input + (unsigned long long)batch * in_dim;
-    float* gate_out_row = gate_out + (unsigned long long)batch * gate_out_dim;
-    float* up_out_row = up_out + (unsigned long long)batch * up_out_dim;
 
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
@@ -653,27 +706,143 @@ extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up
     const unsigned int total_dim = gate_out_dim + up_out_dim;
     if (out_index >= total_dim) return;
 
-    if (out_index < gate_out_dim) {
-        if (gate_group_size == 0 || (in_dim % gate_group_size) != 0 || (gate_group_size % 8) != 0) return;
-        const float acc = talu_gaffine_u4_dot_row_warp_v(
-            input_row, gate_packed_weight, gate_scales, gate_biases,
-            in_dim, out_index, gate_group_size, gate_scales_dtype_tag, lane);
-        if (lane == 0) gate_out_row[out_index] = acc;
-        return;
-    }
+    const unsigned int* pw;
+    const unsigned short* sc;
+    const unsigned short* bi;
+    float* out_ptr;
+    unsigned int out_dim_proj, row_idx, grp_size, dtype_tag;
 
-    if (up_group_size == 0 || (in_dim % up_group_size) != 0 || (up_group_size % 8) != 0) return;
-    const unsigned int up_row = out_index - gate_out_dim;
-    const float acc = talu_gaffine_u4_dot_row_warp_v(
-        input_row, up_packed_weight, up_scales, up_biases,
-        in_dim, up_row, up_group_size, up_scales_dtype_tag, lane);
-    if (lane == 0) up_out_row[up_row] = acc;
+    if (out_index < gate_out_dim) {
+        pw = gate_packed_weight; sc = gate_scales; bi = gate_biases;
+        out_ptr = gate_out; out_dim_proj = gate_out_dim;
+        row_idx = out_index; grp_size = gate_group_size; dtype_tag = gate_scales_dtype_tag;
+    } else {
+        pw = up_packed_weight; sc = up_scales; bi = up_biases;
+        out_ptr = up_out; out_dim_proj = up_out_dim;
+        row_idx = out_index - gate_out_dim; grp_size = up_group_size; dtype_tag = up_scales_dtype_tag;
+    }
+    if (grp_size == 0 || (in_dim % grp_size) != 0 || (grp_size % 8) != 0) return;
+
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out_ptr + (unsigned long long)batch_base * out_dim_proj;
+
+    switch (tile_rows) {
+        case 1u: talu_gaffine_u4_matvec_batched<1>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 1u, nullptr); break;
+        case 2u: talu_gaffine_u4_matvec_batched<2>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 2u, nullptr); break;
+        case 3u: talu_gaffine_u4_matvec_batched<3>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 3u, nullptr); break;
+        case 4u: talu_gaffine_u4_matvec_batched<4>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 4u, nullptr); break;
+        case 5u: talu_gaffine_u4_matvec_batched<5>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 5u, nullptr); break;
+        case 6u: talu_gaffine_u4_matvec_batched<6>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 6u, nullptr); break;
+        case 7u: talu_gaffine_u4_matvec_batched<7>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 7u, nullptr); break;
+        case 8u: talu_gaffine_u4_matvec_batched<8>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 8u, nullptr); break;
+        default: return;
+    }
 }
 
-// Fused U4 gate/up + SiLU matvec: interleaved design where each warp reads
-// both gate and up weights in the same loop iteration, sharing the input load.
-// Grid: (ceil(out_dim/4), batch_rows), Block: (128 = 4 warps)
-extern "C" __global__ __launch_bounds__(128, 12) void talu_gaffine_u4_matvec_gate_up_silu_f32(
+// Fused U4 gate/up + SiLU batched template: loads both gate and up weights once
+// from DRAM per iteration, reuses across BATCH input rows. SiLU fusion applied
+// after warp reduction.
+template <unsigned int BATCH>
+static __device__ __forceinline__ void talu_gaffine_u4_gate_up_silu_batched(
+    const float* input,
+    const unsigned int* gate_packed_weight,
+    const unsigned short* gate_scales,
+    const unsigned short* gate_biases,
+    const unsigned int* up_packed_weight,
+    const unsigned short* up_scales,
+    const unsigned short* up_biases,
+    float* out,
+    unsigned int out_dim,
+    unsigned int out_idx,
+    unsigned int gate_group_size,
+    unsigned int gate_scales_dtype_tag,
+    unsigned int up_group_size,
+    unsigned int up_scales_dtype_tag,
+    unsigned int in_dim,
+    unsigned int lane,
+    unsigned int batch_rows
+) {
+    const unsigned int words_per_row = in_dim >> 3;
+    const unsigned int gate_wpg = gate_group_size >> 3;
+    const unsigned int up_wpg = up_group_size >> 3;
+    const unsigned int gate_gpr = in_dim / gate_group_size;
+    const unsigned int up_gpr = in_dim / up_group_size;
+    const unsigned int* g_row = gate_packed_weight + (unsigned long long)out_idx * words_per_row;
+    const unsigned int* u_row = up_packed_weight + (unsigned long long)out_idx * words_per_row;
+    const unsigned short* gs_row = gate_scales + (unsigned long long)out_idx * gate_gpr;
+    const unsigned short* gb_row = gate_biases + (unsigned long long)out_idx * gate_gpr;
+    const unsigned short* us_row = up_scales + (unsigned long long)out_idx * up_gpr;
+    const unsigned short* ub_row = up_biases + (unsigned long long)out_idx * up_gpr;
+
+    float gate_acc[BATCH] = {};
+    float up_acc[BATCH] = {};
+
+    for (unsigned int w = lane << 1; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 1) {
+        // Gate + up weights: loaded ONCE, shared across all batch rows.
+        unsigned int gw0, gw1;
+        asm volatile(
+            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(gw0), "=r"(gw1)
+            : "l"(&g_row[w]));
+
+        unsigned int uw0, uw1;
+        asm volatile(
+            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(uw0), "=r"(uw1)
+            : "l"(&u_row[w]));
+
+        const unsigned int base_elem = w << 3;
+        const unsigned int gg0 = w / gate_wpg;
+        const float gs0 = talu_decode_scale_bias_u16(gs_row[gg0], gate_scales_dtype_tag);
+        const float gb0 = talu_decode_scale_bias_u16(gb_row[gg0], gate_scales_dtype_tag);
+        const unsigned int ug0 = w / up_wpg;
+        const float us0 = talu_decode_scale_bias_u16(us_row[ug0], up_scales_dtype_tag);
+        const float ub0 = talu_decode_scale_bias_u16(ub_row[ug0], up_scales_dtype_tag);
+        const unsigned int gg1 = (w + 1) / gate_wpg;
+        const float gs1 = talu_decode_scale_bias_u16(gs_row[gg1], gate_scales_dtype_tag);
+        const float gb1 = talu_decode_scale_bias_u16(gb_row[gg1], gate_scales_dtype_tag);
+        const unsigned int ug1 = (w + 1) / up_wpg;
+        const float us1 = talu_decode_scale_bias_u16(us_row[ug1], up_scales_dtype_tag);
+        const float ub1 = talu_decode_scale_bias_u16(ub_row[ug1], up_scales_dtype_tag);
+
+        // Word 0: per-batch input load + accumulate gate and up.
+        #pragma unroll
+        for (unsigned int b = 0; b < BATCH; b++) {
+            if (b >= batch_rows) break;
+            const float4 i0 = *reinterpret_cast<const float4*>(
+                &input[(unsigned long long)b * in_dim + base_elem]);
+            const float4 i1 = *reinterpret_cast<const float4*>(
+                &input[(unsigned long long)b * in_dim + base_elem + 4]);
+            U4_PROCESS_WORD(gw0, i0, i1, gs0, gb0, gate_acc[b]);
+            U4_PROCESS_WORD(uw0, i0, i1, us0, ub0, up_acc[b]);
+        }
+        // Word 1: per-batch input load + accumulate gate and up.
+        #pragma unroll
+        for (unsigned int b = 0; b < BATCH; b++) {
+            if (b >= batch_rows) break;
+            const float4 i2 = *reinterpret_cast<const float4*>(
+                &input[(unsigned long long)b * in_dim + base_elem + 8]);
+            const float4 i3 = *reinterpret_cast<const float4*>(
+                &input[(unsigned long long)b * in_dim + base_elem + 12]);
+            U4_PROCESS_WORD(gw1, i2, i3, gs1, gb1, gate_acc[b]);
+            U4_PROCESS_WORD(uw1, i2, i3, us1, ub1, up_acc[b]);
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int b = 0; b < BATCH; b++) {
+        if (b >= batch_rows) break;
+        float g = talu_quant_warp_sum_f32(gate_acc[b]);
+        float u = talu_quant_warp_sum_f32(up_acc[b]);
+        if (lane == 0) {
+            const float sigma = 1.0f / (1.0f + expf(-g));
+            out[(unsigned long long)b * out_dim + out_idx] = g * sigma * u;
+        }
+    }
+}
+
+// Grid: (ceil(out_dim/4), ceil(batch_rows/U4_BATCH_TILE)), Block: (128 = 4 warps)
+extern "C" __global__ __launch_bounds__(128) void talu_gaffine_u4_matvec_gate_up_silu_f32(
     const float* input,
     const unsigned int* gate_packed_weight,
     const unsigned short* gate_scales,
@@ -690,11 +859,11 @@ extern "C" __global__ __launch_bounds__(128, 12) void talu_gaffine_u4_matvec_gat
     unsigned int in_dim,
     unsigned int batch_rows
 ) {
-    const unsigned int batch = blockIdx.y;
-    if (batch >= batch_rows) return;
+    const unsigned int batch_base = blockIdx.y * U4_BATCH_TILE;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < U4_BATCH_TILE
+        ? batch_rows - batch_base : U4_BATCH_TILE;
     if (in_dim == 0 || (in_dim % 32) != 0) return;
-    const float* input_row = input + (unsigned long long)batch * in_dim;
-    float* out_row = out + (unsigned long long)batch * out_dim;
 
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
@@ -703,72 +872,19 @@ extern "C" __global__ __launch_bounds__(128, 12) void talu_gaffine_u4_matvec_gat
     if (gate_group_size == 0 || (in_dim % gate_group_size) != 0 || (gate_group_size % 8) != 0) return;
     if (up_group_size == 0 || (in_dim % up_group_size) != 0 || (up_group_size % 8) != 0) return;
 
-    const unsigned int words_per_row = in_dim >> 3;
-    const unsigned int gate_wpg = gate_group_size >> 3;
-    const unsigned int up_wpg = up_group_size >> 3;
-    const unsigned int gate_gpr = in_dim / gate_group_size;
-    const unsigned int up_gpr = in_dim / up_group_size;
-    const unsigned int* g_row = gate_packed_weight + (unsigned long long)out_index * words_per_row;
-    const unsigned int* u_row = up_packed_weight + (unsigned long long)out_index * words_per_row;
-    const unsigned short* gs_row = gate_scales + (unsigned long long)out_index * gate_gpr;
-    const unsigned short* gb_row = gate_biases + (unsigned long long)out_index * gate_gpr;
-    const unsigned short* us_row = up_scales + (unsigned long long)out_index * up_gpr;
-    const unsigned short* ub_row = up_biases + (unsigned long long)out_index * up_gpr;
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out + (unsigned long long)batch_base * out_dim;
 
-    // 64-bit weight loads for both gate and up: two v2.u32 loads per iteration
-    // give 512 bytes/warp matching U8's single-projection bandwidth, while
-    // sharing input loads between gate and up within each word.
-    float gate_acc = 0.0f;
-    float up_acc = 0.0f;
-    for (unsigned int w = lane << 1; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 1) {
-        unsigned int gw0, gw1;
-        asm volatile(
-            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
-            : "=r"(gw0), "=r"(gw1)
-            : "l"(&g_row[w]));
-
-        unsigned int uw0, uw1;
-        asm volatile(
-            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
-            : "=r"(uw0), "=r"(uw1)
-            : "l"(&u_row[w]));
-
-        const unsigned int base_elem = w << 3;
-
-        // Word 0: shared input between gate and up.
-        {
-            const float4 in_lo = *reinterpret_cast<const float4*>(&input_row[base_elem]);
-            const float4 in_hi = *reinterpret_cast<const float4*>(&input_row[base_elem + 4]);
-            const unsigned int gg = w / gate_wpg;
-            const float gs = talu_decode_scale_bias_u16(gs_row[gg], gate_scales_dtype_tag);
-            const float gb = talu_decode_scale_bias_u16(gb_row[gg], gate_scales_dtype_tag);
-            U4_PROCESS_WORD(gw0, in_lo, in_hi, gs, gb, gate_acc);
-            const unsigned int ug = w / up_wpg;
-            const float us = talu_decode_scale_bias_u16(us_row[ug], up_scales_dtype_tag);
-            const float ub = talu_decode_scale_bias_u16(ub_row[ug], up_scales_dtype_tag);
-            U4_PROCESS_WORD(uw0, in_lo, in_hi, us, ub, up_acc);
-        }
-        // Word 1: shared input between gate and up.
-        {
-            const float4 in_lo = *reinterpret_cast<const float4*>(&input_row[base_elem + 8]);
-            const float4 in_hi = *reinterpret_cast<const float4*>(&input_row[base_elem + 12]);
-            const unsigned int gg = (w + 1) / gate_wpg;
-            const float gs = talu_decode_scale_bias_u16(gs_row[gg], gate_scales_dtype_tag);
-            const float gb = talu_decode_scale_bias_u16(gb_row[gg], gate_scales_dtype_tag);
-            U4_PROCESS_WORD(gw1, in_lo, in_hi, gs, gb, gate_acc);
-            const unsigned int ug = (w + 1) / up_wpg;
-            const float us = talu_decode_scale_bias_u16(us_row[ug], up_scales_dtype_tag);
-            const float ub = talu_decode_scale_bias_u16(ub_row[ug], up_scales_dtype_tag);
-            U4_PROCESS_WORD(uw1, in_lo, in_hi, us, ub, up_acc);
-        }
-    }
-
-    gate_acc = talu_quant_warp_sum_f32(gate_acc);
-    up_acc = talu_quant_warp_sum_f32(up_acc);
-
-    if (lane == 0) {
-        const float sigma = 1.0f / (1.0f + expf(-gate_acc));
-        out_row[out_index] = gate_acc * sigma * up_acc;
+    switch (tile_rows) {
+        case 1u: talu_gaffine_u4_gate_up_silu_batched<1>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 1u); break;
+        case 2u: talu_gaffine_u4_gate_up_silu_batched<2>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 2u); break;
+        case 3u: talu_gaffine_u4_gate_up_silu_batched<3>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 3u); break;
+        case 4u: talu_gaffine_u4_gate_up_silu_batched<4>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 4u); break;
+        case 5u: talu_gaffine_u4_gate_up_silu_batched<5>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 5u); break;
+        case 6u: talu_gaffine_u4_gate_up_silu_batched<6>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 6u); break;
+        case 7u: talu_gaffine_u4_gate_up_silu_batched<7>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 7u); break;
+        case 8u: talu_gaffine_u4_gate_up_silu_batched<8>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 8u); break;
+        default: return;
     }
 }
 

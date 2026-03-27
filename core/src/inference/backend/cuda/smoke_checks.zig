@@ -247,18 +247,16 @@ pub fn probeGaffineU4SequenceRowsSupport(backend: anytype) !bool {
     if (!backend.device.supportsModuleLaunch()) return false;
     const function = backend.gaffine_u4_matvec_function orelse return false;
 
-    const in_dim: u32 = 8;
+    const in_dim: u32 = 32;
     const out_dim: u32 = 2;
-    const group_size: u32 = 8;
+    const group_size: u32 = 32;
     const batch_rows: u32 = 2;
 
-    const input = [_]f32{
-        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
-    };
+    // Row 0: all ones, Row 1: all twos.
+    const input = [_]f32{1.0} ** 32 ++ [_]f32{2.0} ** 32;
     const packed_words = [_]u32{
-        0x7654_3210, // row 0 => 0..7
-        0x0123_4567, // row 1 => 7..0
+        0x1111_1111, 0x1111_1111, 0x1111_1111, 0x1111_1111, // weight row 0: nibble=1
+        0x2222_2222, 0x2222_2222, 0x2222_2222, 0x2222_2222, // weight row 1: nibble=2
     };
     const scales = [_]u16{
         dtype.f32ToBf16(1.0),
@@ -268,9 +266,12 @@ pub fn probeGaffineU4SequenceRowsSupport(backend: anytype) !bool {
         dtype.f32ToBf16(0.0),
         dtype.f32ToBf16(0.0),
     };
+    // dequant = scale * nibble + bias = nibble.
+    // Row0(1.0) × W0(nibble=1): 32 × 1 = 32,  × W1(nibble=2): 32 × 2 = 64
+    // Row1(2.0) × W0(nibble=1): 32 × 2 = 64,  × W1(nibble=2): 32 × 4 = 128
     const expected = [_]f32{
-        28.0,  28.0,
-        168.0, 84.0,
+        32.0,  64.0,
+        64.0,  128.0,
     };
     var actual = [_]f32{0.0} ** (out_dim * batch_rows);
 
@@ -319,18 +320,16 @@ pub fn probeGaffineU4SequenceFusedQkvSupport(backend: anytype) !bool {
     if (!backend.device.supportsModuleLaunch()) return false;
     const function = backend.gaffine_u4_matvec_qkv_function orelse return false;
 
-    const in_dim: u32 = 8;
+    const in_dim: u32 = 32;
     const out_dim: u32 = 2;
-    const group_size: u32 = 8;
+    const group_size: u32 = 32;
     const batch_rows: u32 = 2;
 
-    const input = [_]f32{
-        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
-    };
+    // Row 0: all ones, Row 1: all twos.
+    const input = [_]f32{1.0} ** 32 ++ [_]f32{2.0} ** 32;
     const packed_words = [_]u32{
-        0x7654_3210, // row 0 => 0..7
-        0x0123_4567, // row 1 => 7..0
+        0x1111_1111, 0x1111_1111, 0x1111_1111, 0x1111_1111, // weight row 0: nibble=1
+        0x2222_2222, 0x2222_2222, 0x2222_2222, 0x2222_2222, // weight row 1: nibble=2
     };
     const q_scales = [_]u16{
         dtype.f32ToBf16(1.0),
@@ -356,17 +355,20 @@ pub fn probeGaffineU4SequenceFusedQkvSupport(backend: anytype) !bool {
         dtype.f32ToBf16(1.0),
         dtype.f32ToBf16(1.0),
     };
+    // Q: dequant = nibble. Same as basic probe.
     const expected_q = [_]f32{
-        28.0,  28.0,
-        168.0, 84.0,
+        32.0,  64.0,
+        64.0,  128.0,
     };
+    // K: dequant = 2×nibble. Row0×W0: 32×2=64, Row0×W1: 32×4=128, ...
     const expected_k = [_]f32{
-        56.0,  56.0,
-        336.0, 168.0,
+        64.0,  128.0,
+        128.0, 256.0,
     };
+    // V: dequant = nibble+1. Row0×W0: 32×2=64, Row0×W1: 32×3=96, ...
     const expected_v = [_]f32{
-        36.0,  36.0,
-        204.0, 120.0,
+        64.0,  96.0,
+        128.0, 192.0,
     };
     var actual_q = [_]f32{0.0} ** @as(usize, out_dim * batch_rows);
     var actual_k = [_]f32{0.0} ** @as(usize, out_dim * batch_rows);
@@ -463,18 +465,16 @@ pub fn probeGaffineU4SequenceFusedGateUpSupport(backend: anytype) !bool {
     if (!backend.device.supportsModuleLaunch()) return false;
     const function = backend.gaffine_u4_matvec_gate_up_function orelse return false;
 
-    const in_dim: u32 = 8;
+    const in_dim: u32 = 32;
     const out_dim: u32 = 2;
-    const group_size: u32 = 8;
+    const group_size: u32 = 32;
     const batch_rows: u32 = 2;
 
-    const input = [_]f32{
-        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
-    };
+    // Row 0: all ones, Row 1: all twos.
+    const input = [_]f32{1.0} ** 32 ++ [_]f32{2.0} ** 32;
     const packed_words = [_]u32{
-        0x7654_3210, // row 0 => 0..7
-        0x0123_4567, // row 1 => 7..0
+        0x1111_1111, 0x1111_1111, 0x1111_1111, 0x1111_1111, // weight row 0: nibble=1
+        0x2222_2222, 0x2222_2222, 0x2222_2222, 0x2222_2222, // weight row 1: nibble=2
     };
     const gate_scales = [_]u16{
         dtype.f32ToBf16(1.0),
@@ -492,13 +492,15 @@ pub fn probeGaffineU4SequenceFusedGateUpSupport(backend: anytype) !bool {
         dtype.f32ToBf16(1.0),
         dtype.f32ToBf16(1.0),
     };
+    // Gate: dequant = nibble. Same as basic probe.
     const expected_gate = [_]f32{
-        28.0,  28.0,
-        168.0, 84.0,
+        32.0,  64.0,
+        64.0,  128.0,
     };
+    // Up: dequant = 2×nibble+1. Row0×W0: 32×3=96, Row0×W1: 32×5=160, ...
     const expected_up = [_]f32{
-        64.0,  64.0,
-        372.0, 204.0,
+        96.0,  160.0,
+        192.0, 320.0,
     };
     var actual_gate = [_]f32{0.0} ** @as(usize, out_dim * batch_rows);
     var actual_up = [_]f32{0.0} ** @as(usize, out_dim * batch_rows);
