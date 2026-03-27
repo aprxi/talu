@@ -27,7 +27,6 @@ pub fn useFusedHeadsF16Kv(
 
 test "useFusedHeadsF16Kv respects sliding window and threshold" {
     const cfg = attention_policy.Config{
-        .kv_cache_dtype_fp16 = true,
         .enable_fused_attention_f16_kv = true,
         .max_fused_attention_f16_kv_seq_len = 384,
         .max_supported_fused_f16_kv_head_dim = 512,

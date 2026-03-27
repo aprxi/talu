@@ -105,8 +105,13 @@ comptime {
     }
 }
 
-/// Default batch size for FusedCpuBackend (supports up to N concurrent sequences)
-const DEFAULT_MAX_BATCH_SIZE: usize = 8;
+/// Default max concurrent decode slots per backend.
+/// Override at runtime via TALU_CUDA_MAX_BATCH_SIZE or TALU_METAL_MAX_BATCH_SIZE.
+const MAX_BATCH_SIZE = struct {
+    const cpu: usize = 4;
+    const metal: usize = 4;
+    const cuda: usize = 8;
+};
 
 /// Compute model-load options before backend initialization.
 /// This keeps backend/platform policy out of io/ while preserving optimized execution routes.
@@ -807,16 +812,16 @@ fn resolveCpuLayersTopology(
 
 fn resolveCudaMaxBatchSize() usize {
     const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_MAX_BATCH_SIZE") catch {
-        return DEFAULT_MAX_BATCH_SIZE;
+        return MAX_BATCH_SIZE.cuda;
     };
     defer std.heap.c_allocator.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
         log.warn("inference", "Invalid TALU_CUDA_MAX_BATCH_SIZE; using default", .{
             .value = trimmed,
-            .default = DEFAULT_MAX_BATCH_SIZE,
+            .default = MAX_BATCH_SIZE.cuda,
         });
-        return DEFAULT_MAX_BATCH_SIZE;
+        return MAX_BATCH_SIZE.cuda;
     };
     if (parsed == 0) {
         log.warn("inference", "TALU_CUDA_MAX_BATCH_SIZE must be >= 1; clamping", .{
@@ -1088,6 +1093,38 @@ pub const Backend = union(enum) {
         };
     }
 
+    pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
+        self: *const Backend,
+        sampling_config: *const cpu.sampling.SamplingConfig,
+    ) bool {
+        return switch (self.*) {
+            .cpu => false,
+            .metal => false,
+            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
+                b.supportsSchedulerBackendBatchedTopKDecodeRoute(sampling_config)
+            else
+                false,
+        };
+    }
+
+    pub fn decodeBatchTopKCandidates(
+        self: *Backend,
+        requests: []const contract.DecodeRequest,
+        top_k: usize,
+        candidate_logits_out: []f32,
+        candidate_ids_out: []u32,
+        candidate_counts_out: []usize,
+    ) !void {
+        switch (self.*) {
+            .cpu => return error.InvalidArgument,
+            .metal => if (has_metal) return error.InvalidArgument else unreachable,
+            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "decodeBatchTopKCandidates"))
+                return b.decodeBatchTopKCandidates(requests, top_k, candidate_logits_out, candidate_ids_out, candidate_counts_out)
+            else
+                return error.InvalidArgument,
+        }
+    }
+
     /// Get vocab size for this model
     pub fn vocabSize(self: *const Backend) usize {
         switch (self.*) {
@@ -1335,7 +1372,7 @@ fn initCpu(
     reason: []const u8,
     progress: progress_mod.Context,
 ) !Backend {
-    const cpu_backend_state = cpu.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE, progress) catch |err| {
+    const cpu_backend_state = cpu.BackendType.init(allocator, loaded, MAX_BATCH_SIZE.cpu, progress) catch |err| {
         log.warn("inference", "CPU backend init failed", .{
             .reason = @errorName(err),
             .arch = @tagName(loaded.config.model_arch),

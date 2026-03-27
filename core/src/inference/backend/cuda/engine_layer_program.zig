@@ -58,7 +58,7 @@ const BatchDecodeInfo = engine_types.BatchDecodeInfo;
 const KernelSlot = engine_types.KernelSlot;
 const RequiredKernel = engine_types.RequiredKernel;
 const required_kernels = engine_types.required_kernels;
-const kv_cache_dtype_fp16 = engine_types.kv_cache_dtype_fp16;
+const KvCacheDtype = engine_types.KvCacheDtype;
 const enable_fused_attention_f16_kv = engine_types.enable_fused_attention_f16_kv;
 const max_fused_attention_f16_kv_seq_len = engine_types.max_fused_attention_f16_kv_seq_len;
 const max_supported_fused_f16_kv_head_dim = engine_types.max_supported_fused_f16_kv_head_dim;
@@ -588,6 +588,8 @@ pub fn layerProgramAttentionAdapter(
             cfg,
             &attention_binding.k_cache,
             &attention_binding.v_cache,
+            &attention_binding.k_scale,
+            &attention_binding.v_scale,
             &q_proj,
             &k_proj,
             &v_proj,
@@ -630,6 +632,8 @@ pub fn layerProgramAttentionAdapter(
             cfg,
             &attention_binding.k_cache,
             &attention_binding.v_cache,
+            &attention_binding.k_scale,
+            &attention_binding.v_scale,
             &q_proj,
             &k_proj,
             &v_proj,
@@ -661,6 +665,8 @@ pub fn layerProgramAttentionAdapter(
         cfg,
         &attention_binding.k_cache,
         &attention_binding.v_cache,
+        &attention_binding.k_scale,
+        &attention_binding.v_scale,
         &q_proj,
         &k_proj,
         &v_proj,
@@ -1128,6 +1134,8 @@ pub fn runAttentionContext(
     context_stage: *compute.cuda.Buffer,
     k_cache: *const compute.cuda.Buffer,
     v_cache: *const compute.cuda.Buffer,
+    k_scale: *const compute.cuda.Buffer,
+    v_scale: *const compute.cuda.Buffer,
     kernels: AttentionKernelSet,
     seq_len_u32: u32,
     head_dim_u32: u32,
@@ -1140,35 +1148,91 @@ pub fn runAttentionContext(
     var effective_seq_len_u32 = seq_len_u32;
     var k_cache_view = k_cache.*;
     var v_cache_view = v_cache.*;
+    var k_scale_view = k_scale.*;
+    var v_scale_view = v_scale.*;
 
     if (cfg.sliding_window > 0 and cfg.is_causal) {
         const window_u32 = std.math.cast(u32, cfg.sliding_window) orelse std.math.maxInt(u32);
         if (effective_seq_len_u32 > window_u32) {
-            const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
+            const kv_elem_bytes: usize = self.kv_cache_dtype.elementBytes();
             const row_bytes = std.math.mul(usize, @as(usize, kv_dim_u32), kv_elem_bytes) catch return error.InvalidArgument;
             const start_row = effective_seq_len_u32 - window_u32;
             const start_offset = std.math.mul(usize, @as(usize, start_row), row_bytes) catch return error.InvalidArgument;
             k_cache_view = try bufferSlice(k_cache, start_offset, k_cache.size - start_offset);
             v_cache_view = try bufferSlice(v_cache, start_offset, v_cache.size - start_offset);
+            // Slice scale buffers for i8 KV cache.
+            const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
+            const scale_row_bytes = @as(usize, n_kv_heads_u32) * @sizeOf(f32);
+            const scale_start = std.math.mul(usize, @as(usize, start_row), scale_row_bytes) catch return error.InvalidArgument;
+            if (k_scale.size > scale_start) {
+                k_scale_view = try bufferSlice(k_scale, scale_start, k_scale.size - scale_start);
+                v_scale_view = try bufferSlice(v_scale, scale_start, v_scale.size - scale_start);
+            }
             effective_seq_len_u32 = window_u32;
         }
     }
 
-    if (kv_cache_dtype_fp16) {
-        if (!cfg.query_gate and attention_mod.useFusedHeadsF16Kv(
-            attention_policy_config,
-            seq_len_u32,
-            cfg.sliding_window,
-            cfg.is_causal,
-            head_dim_u32,
-            kernels.attn_fused_heads_f16_kv_function != null,
-        )) {
-            try compute.cuda.attn_fused_heads_f16_kv.runWithFunction(
+    switch (self.kv_cache_dtype) {
+        .f16 => {
+            if (!cfg.query_gate and attention_mod.useFusedHeadsF16Kv(
+                attention_policy_config,
+                seq_len_u32,
+                cfg.sliding_window,
+                cfg.is_causal,
+                head_dim_u32,
+                kernels.attn_fused_heads_f16_kv_function != null,
+            )) {
+                try compute.cuda.attn_fused_heads_f16_kv.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    kernels.attn_fused_heads_f16_kv_function.?,
+                    q_stage,
+                    &k_cache_view,
+                    &v_cache_view,
+                    context_stage,
+                    @intCast(self.n_heads),
+                    effective_seq_len_u32,
+                    kv_dim_u32,
+                    kv_groups_u32,
+                    head_dim_u32,
+                    self.attention_scale,
+                    rope_dim_u32,
+                    position_u32,
+                    theta,
+                );
+                return .fused_heads_f16_kv;
+            }
+
+            const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
+            const attn_probs_dev = try self.runtime_buffers.requireAttentionProbsDev();
+            try compute.cuda.attn_scores_heads_f16_kv.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
-                kernels.attn_fused_heads_f16_kv_function.?,
+                kernels.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
                 q_stage,
                 &k_cache_view,
+                attn_scores_dev,
+                @intCast(self.n_heads),
+                effective_seq_len_u32,
+                kv_dim_u32,
+                kv_groups_u32,
+                head_dim_u32,
+                self.attention_scale,
+            );
+            try compute.cuda.softmax_rows.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                kernels.softmax_rows_function orelse return error.CudaKernelUnavailable,
+                attn_scores_dev,
+                attn_probs_dev,
+                @intCast(self.n_heads),
+                effective_seq_len_u32,
+            );
+            try compute.cuda.attn_weighted_sum_heads_f16_kv.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                kernels.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+                attn_probs_dev,
                 &v_cache_view,
                 context_stage,
                 @intCast(self.n_heads),
@@ -1176,97 +1240,88 @@ pub fn runAttentionContext(
                 kv_dim_u32,
                 kv_groups_u32,
                 head_dim_u32,
-                self.attention_scale,
-                rope_dim_u32,
-                position_u32,
-                theta,
             );
-            return .fused_heads_f16_kv;
-        }
+            return .heads_f16_kv;
+        },
+        .i8 => {
+            const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
+            if (!cfg.query_gate and attention_mod.useFusedHeadsF16Kv(
+                attention_policy_config,
+                seq_len_u32,
+                cfg.sliding_window,
+                cfg.is_causal,
+                head_dim_u32,
+                kernels.attn_fused_heads_i8_kv_function != null,
+            )) {
+                try compute.cuda.attn_fused_heads_i8_kv.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    kernels.attn_fused_heads_i8_kv_function.?,
+                    q_stage,
+                    &k_cache_view,
+                    &v_cache_view,
+                    &k_scale_view,
+                    &v_scale_view,
+                    context_stage,
+                    @intCast(self.n_heads),
+                    n_kv_heads_u32,
+                    effective_seq_len_u32,
+                    kv_dim_u32,
+                    kv_groups_u32,
+                    head_dim_u32,
+                    self.attention_scale,
+                    rope_dim_u32,
+                    position_u32,
+                    theta,
+                );
+                return .fused_heads_i8_kv;
+            }
 
-        const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
-        const attn_probs_dev = try self.runtime_buffers.requireAttentionProbsDev();
-        try compute.cuda.attn_scores_heads_f16_kv.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            kernels.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-            q_stage,
-            &k_cache_view,
-            attn_scores_dev,
-            @intCast(self.n_heads),
-            effective_seq_len_u32,
-            kv_dim_u32,
-            kv_groups_u32,
-            head_dim_u32,
-            self.attention_scale,
-        );
-        try compute.cuda.softmax_rows.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            kernels.softmax_rows_function orelse return error.CudaKernelUnavailable,
-            attn_scores_dev,
-            attn_probs_dev,
-            @intCast(self.n_heads),
-            effective_seq_len_u32,
-        );
-        try compute.cuda.attn_weighted_sum_heads_f16_kv.runWithFunction(
-            &self.kernel_arg_pack,
-            &self.device,
-            kernels.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-            attn_probs_dev,
-            &v_cache_view,
-            context_stage,
-            @intCast(self.n_heads),
-            effective_seq_len_u32,
-            kv_dim_u32,
-            kv_groups_u32,
-            head_dim_u32,
-        );
-        return .heads_f16_kv;
+            const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
+            const attn_probs_dev = try self.runtime_buffers.requireAttentionProbsDev();
+            try compute.cuda.attn_scores_heads_i8_kv.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                kernels.attn_scores_heads_i8_kv_function orelse return error.CudaKernelUnavailable,
+                q_stage,
+                &k_cache_view,
+                &k_scale_view,
+                attn_scores_dev,
+                @intCast(self.n_heads),
+                n_kv_heads_u32,
+                effective_seq_len_u32,
+                kv_dim_u32,
+                kv_groups_u32,
+                head_dim_u32,
+                self.attention_scale,
+            );
+            try compute.cuda.softmax_rows.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                kernels.softmax_rows_function orelse return error.CudaKernelUnavailable,
+                attn_scores_dev,
+                attn_probs_dev,
+                @intCast(self.n_heads),
+                effective_seq_len_u32,
+            );
+            try compute.cuda.attn_weighted_sum_heads_i8_kv.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                kernels.attn_weighted_sum_heads_i8_kv_function orelse return error.CudaKernelUnavailable,
+                attn_probs_dev,
+                &v_cache_view,
+                &v_scale_view,
+                context_stage,
+                @intCast(self.n_heads),
+                n_kv_heads_u32,
+                effective_seq_len_u32,
+                kv_dim_u32,
+                kv_groups_u32,
+                head_dim_u32,
+            );
+            return .heads_i8_kv;
+        },
     }
-
-    const attn_scores_heads_f32_function = kernels.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable;
-    const attn_weighted_sum_heads_f32_function = kernels.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable;
-    const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
-    const attn_probs_dev = try self.runtime_buffers.requireAttentionProbsDev();
-
-    try compute.cuda.attn_scores_heads_f32.runWithFunction(
-        &self.kernel_arg_pack,
-        &self.device,
-        attn_scores_heads_f32_function,
-        q_stage,
-        &k_cache_view,
-        attn_scores_dev,
-        @intCast(self.n_heads),
-        effective_seq_len_u32,
-        kv_dim_u32,
-        kv_groups_u32,
-        head_dim_u32,
-        self.attention_scale,
-    );
-    try compute.cuda.softmax_rows.runWithFunction(
-        &self.kernel_arg_pack,
-        &self.device,
-        kernels.softmax_rows_function orelse return error.CudaKernelUnavailable,
-        attn_scores_dev,
-        attn_probs_dev,
-        @intCast(self.n_heads),
-        effective_seq_len_u32,
-    );
-    try compute.cuda.attn_weighted_sum_heads_f32.runWithFunction(
-        &self.kernel_arg_pack,
-        &self.device,
-        attn_weighted_sum_heads_f32_function,
-        attn_probs_dev,
-        &v_cache_view,
-        context_stage,
-        @intCast(self.n_heads),
-        effective_seq_len_u32,
-        kv_dim_u32,
-        kv_groups_u32,
-        head_dim_u32,
-    );
-    return .heads_f32_kv;
 }
 
 pub fn initKernelFunctions(self: anytype) !void {
@@ -1772,6 +1827,54 @@ pub fn assignResolvedKernel(
         .attn_weighted_sum_heads_f16_kv_ptrs => {
             self.attn_weighted_sum_heads_f16_kv_ptrs_function = resolved.function;
             self.attn_weighted_sum_heads_f16_kv_ptrs_source = resolved.source;
+        },
+        .kv_write_i8 => {
+            self.kv_write_i8_function = resolved.function;
+            self.kv_write_i8_source = resolved.source;
+        },
+        .kv_write_i8_rows => {
+            self.kv_write_i8_rows_function = resolved.function;
+            self.kv_write_i8_rows_source = resolved.source;
+        },
+        .kv_write_i8_rows_ptrs => {
+            self.kv_write_i8_rows_ptrs_function = resolved.function;
+            self.kv_write_i8_rows_ptrs_source = resolved.source;
+        },
+        .rope_store_i8 => {
+            self.rope_store_i8_function = resolved.function;
+            self.rope_store_i8_source = resolved.source;
+        },
+        .attn_scores_heads_i8_kv => {
+            self.attn_scores_heads_i8_kv_function = resolved.function;
+            self.attn_scores_heads_i8_kv_source = resolved.source;
+        },
+        .attn_weighted_sum_heads_i8_kv => {
+            self.attn_weighted_sum_heads_i8_kv_function = resolved.function;
+            self.attn_weighted_sum_heads_i8_kv_source = resolved.source;
+        },
+        .attn_fused_heads_i8_kv => {
+            self.attn_fused_heads_i8_kv_function = resolved.function;
+            self.attn_fused_heads_i8_kv_source = resolved.source;
+        },
+        .attn_fused_decode_heads_i8_kv_ptrs => {
+            self.attn_fused_decode_heads_i8_kv_ptrs_function = resolved.function;
+            self.attn_fused_decode_heads_i8_kv_ptrs_source = resolved.source;
+        },
+        .attn_fused_prefill_heads_i8_kv => {
+            self.attn_fused_prefill_heads_i8_kv_function = resolved.function;
+            self.attn_fused_prefill_heads_i8_kv_source = resolved.source;
+        },
+        .attn_fused_prefill_heads_i8_kv_gqa => {
+            self.attn_fused_prefill_heads_i8_kv_gqa_function = resolved.function;
+            self.attn_fused_prefill_heads_i8_kv_gqa_source = resolved.source;
+        },
+        .attn_scores_heads_i8_kv_ptrs => {
+            self.attn_scores_heads_i8_kv_ptrs_function = resolved.function;
+            self.attn_scores_heads_i8_kv_ptrs_source = resolved.source;
+        },
+        .attn_weighted_sum_heads_i8_kv_ptrs => {
+            self.attn_weighted_sum_heads_i8_kv_ptrs_function = resolved.function;
+            self.attn_weighted_sum_heads_i8_kv_ptrs_source = resolved.source;
         },
         .silu => {
             self.silu_function = resolved.function;

@@ -21,7 +21,7 @@ const Tensor = tensor.Tensor;
 
 // --- Shared types from engine_types.zig ---
 const engine_types = @import("engine_types.zig");
-const kv_cache_dtype_fp16 = engine_types.kv_cache_dtype_fp16;
+const KvCacheDtype = engine_types.KvCacheDtype;
 const gaffine_scales_dtype_f16 = engine_types.gaffine_scales_dtype_f16;
 const gaffine_scales_dtype_bf16 = engine_types.gaffine_scales_dtype_bf16;
 const DenseU16Dtype = engine_types.DenseU16Dtype;
@@ -140,15 +140,33 @@ pub fn bufferSlice(buffer: *const compute.cuda.Buffer, byte_offset: usize, byte_
 pub const DeviceKvPair = struct {
     k: compute.cuda.Buffer,
     v: compute.cuda.Buffer,
+    k_scale: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
+    v_scale: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
 };
 
+/// Element size for f16 KV cache. Use kvCacheElementBytesForDtype for dtype-aware paths.
 pub fn kvCacheElementBytes() usize {
-    return if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
+    return @sizeOf(u16);
+}
+
+pub fn kvCacheElementBytesForDtype(kv_dtype: KvCacheDtype) usize {
+    return kv_dtype.elementBytes();
 }
 
 pub fn kvCacheBytesForCapacity(capacity: usize, kv_dim: usize) !usize {
     const elems = std.math.mul(usize, capacity, kv_dim) catch return error.InvalidArgument;
     return std.math.mul(usize, elems, kvCacheElementBytes()) catch return error.InvalidArgument;
+}
+
+pub fn kvCacheBytesForCapacityDtype(capacity: usize, kv_dim: usize, kv_dtype: KvCacheDtype) !usize {
+    const elems = std.math.mul(usize, capacity, kv_dim) catch return error.InvalidArgument;
+    return std.math.mul(usize, elems, kvCacheElementBytesForDtype(kv_dtype)) catch return error.InvalidArgument;
+}
+
+/// Scale buffer size = capacity × n_kv_heads × sizeof(f32).
+pub fn kvScaleBytesForCapacity(capacity: usize, n_kv_heads: usize) !usize {
+    const elems = std.math.mul(usize, capacity, n_kv_heads) catch return error.InvalidArgument;
+    return std.math.mul(usize, elems, @sizeOf(f32)) catch return error.InvalidArgument;
 }
 
 pub fn allocDeviceKvPair(
@@ -161,6 +179,29 @@ pub fn allocDeviceKvPair(
     errdefer k.deinit(device);
     var v = try device.allocBuffer(bytes);
     errdefer v.deinit(device);
+    return .{ .k = k, .v = v };
+}
+
+pub fn allocDeviceKvPairWithScales(
+    device: *compute.cuda.Device,
+    capacity: usize,
+    kv_dim: usize,
+    n_kv_heads: usize,
+    kv_dtype: KvCacheDtype,
+) !DeviceKvPair {
+    const cache_bytes = try kvCacheBytesForCapacityDtype(capacity, kv_dim, kv_dtype);
+    var k = try device.allocBuffer(cache_bytes);
+    errdefer k.deinit(device);
+    var v = try device.allocBuffer(cache_bytes);
+    errdefer v.deinit(device);
+    if (kv_dtype == .i8) {
+        const scale_bytes = try kvScaleBytesForCapacity(capacity, n_kv_heads);
+        var k_scale = try device.allocBuffer(scale_bytes);
+        errdefer k_scale.deinit(device);
+        var v_scale = try device.allocBuffer(scale_bytes);
+        errdefer v_scale.deinit(device);
+        return .{ .k = k, .v = v, .k_scale = k_scale, .v_scale = v_scale };
+    }
     return .{ .k = k, .v = v };
 }
 

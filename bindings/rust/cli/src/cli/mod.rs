@@ -240,9 +240,13 @@ pub(super) struct AskArgs {
     #[arg(long, env = "SEED")]
     pub seed: Option<u64>,
 
-    /// Number of completions to generate (>1 uses batched decode)
+    /// Number of completions to generate per prompt (>1 uses batched decode)
     #[arg(short = 'n', long = "completions", default_value = "1")]
     pub completions: usize,
+
+    /// Treat each line of stdin as a separate prompt (uses batched decode)
+    #[arg(long = "each-line")]
+    pub each_line: bool,
 
     /// Storage profile name
     #[arg(long, env = "TALU_PROFILE", default_value = "default")]

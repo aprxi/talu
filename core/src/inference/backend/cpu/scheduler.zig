@@ -805,7 +805,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 break :blk true;
             };
             if (!use_batched_topk) return null;
-            if (decode_batch_size == 0) return null;
+            // GPU top-K is faster than full-logits DtoH + CPU sampling for
+            // n >= 2 (DtoH scales linearly with rows, CPU sampling doubles).
+            // For n=1, DtoH of 1 row (~40µs) + CPU SIMD scan (~50µs) beats
+            // the GPU kernel which underutilizes SMs (32 blocks on 128 SMs).
+            if (decode_batch_size < 2) return null;
 
             var common_top_k: usize = 0;
             for (self.decode_requests[0..decode_batch_size]) |req| {
@@ -986,7 +990,6 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     self.completeRequest(request_entry, finish_reason);
                 }
             }
-
             if (prefill_completed > 0) {
                 try self.appendPrefillCompletedEvents(&self.step_events, completed_before);
             }

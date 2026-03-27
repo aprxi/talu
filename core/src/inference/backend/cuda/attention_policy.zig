@@ -5,15 +5,13 @@
 const std = @import("std");
 
 pub const Config = struct {
-    kv_cache_dtype_fp16: bool,
     enable_fused_attention_f16_kv: bool,
     max_fused_attention_f16_kv_seq_len: u32,
     max_supported_fused_f16_kv_head_dim: u32,
 };
 
 pub fn needAttentionScoreBuffers(config: Config, max_seq_len: usize, head_dim: usize) bool {
-    return !config.kv_cache_dtype_fp16 or
-        !config.enable_fused_attention_f16_kv or
+    return !config.enable_fused_attention_f16_kv or
         head_dim > config.max_supported_fused_f16_kv_head_dim or
         max_seq_len > config.max_fused_attention_f16_kv_seq_len;
 }
@@ -30,8 +28,7 @@ pub fn canUseFusedAttentionHeadsF16Kv(
     head_dim_u32: u32,
     fused_kernel_available: bool,
 ) bool {
-    return config.kv_cache_dtype_fp16 and
-        config.enable_fused_attention_f16_kv and
+    return config.enable_fused_attention_f16_kv and
         effective_seq_len_u32 <= config.max_fused_attention_f16_kv_seq_len and
         head_dim_u32 <= config.max_supported_fused_f16_kv_head_dim and
         fused_kernel_available;
@@ -45,7 +42,6 @@ test "effectiveAttentionSeqLen respects sliding causal window" {
 
 test "canUseFusedAttentionHeadsF16Kv enforces sequence threshold" {
     const cfg = Config{
-        .kv_cache_dtype_fp16 = true,
         .enable_fused_attention_f16_kv = true,
         .max_fused_attention_f16_kv_seq_len = 384,
         .max_supported_fused_f16_kv_head_dim = 512,
@@ -58,7 +54,6 @@ test "canUseFusedAttentionHeadsF16Kv enforces sequence threshold" {
 
 test "needAttentionScoreBuffers follows fused policy envelope" {
     const cfg = Config{
-        .kv_cache_dtype_fp16 = true,
         .enable_fused_attention_f16_kv = true,
         .max_fused_attention_f16_kv_seq_len = 384,
         .max_supported_fused_f16_kv_head_dim = 512,

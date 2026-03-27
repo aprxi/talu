@@ -18,7 +18,6 @@ const U16LinearWeight = engine_types.U16LinearWeight;
 const DeviceTensor = engine_types.DeviceTensor;
 const ProjectionPath = engine_types.ProjectionPath;
 const enable_dispatch_observability = engine_types.enable_dispatch_observability;
-const kv_cache_dtype_fp16 = engine_types.kv_cache_dtype_fp16;
 const bufferF32RowCount = engine_types.bufferF32RowCount;
 const logicalF32RowSlice = engine_types.logicalF32RowSlice;
 
@@ -151,9 +150,10 @@ pub fn linearForwardRows(
                 .f16 => self.u16_blas_f16_supported,
                 .bf16 => self.u16_blas_bf16_supported,
             };
-            // Small-row decode path: run native batched GEMV directly to avoid
-            // cast-to-u16 + BLAS dispatch overhead on rows typically seen in decode.
-            if (rows >= 2 and rows <= 8) {
+            // Batched decode path: native batched GEMV avoids cast-to-u16 +
+            // BLAS dispatch overhead. Kernel tiles in groups of 8 rows via
+            // blockIdx.y, so any batch size works.
+            if (rows <= 32) {
                 try compute.cuda.matvec_u16.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
@@ -259,7 +259,10 @@ pub fn linearForwardRows(
         },
         .gaffine_u4 => |w| {
             const kernel = self.gaffine_u4_matvec_function orelse return error.CudaKernelUnavailable;
-            if (rows == 1) {
+            // Native U4 GEMV: reads weights in 4-bit format (half the DRAM
+            // bandwidth of the I8 BLAS path). The kernel tiles batch rows
+            // via grid_y, so any batch_rows value works.
+            if (rows <= 32) {
                 try compute.cuda.gaffine_u4_matvec.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
@@ -273,7 +276,7 @@ pub fn linearForwardRows(
                     @intCast(w.cols),
                     w.group_size,
                     w.scales_dtype_tag,
-                    1,
+                    @intCast(rows),
                     0,
                 );
                 return;

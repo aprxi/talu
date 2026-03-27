@@ -14,7 +14,7 @@ const staged_orchestrator = @import("../staged_orchestrator.zig");
 // --- Shared types from engine_types.zig ---
 const engine_types = @import("engine_types.zig");
 const BatchDecodeInfo = engine_types.BatchDecodeInfo;
-const kv_cache_dtype_fp16 = engine_types.kv_cache_dtype_fp16;
+const KvCacheDtype = engine_types.KvCacheDtype;
 const enable_dispatch_observability = engine_types.enable_dispatch_observability;
 const enable_device_embedding_lookup = engine_types.enable_device_embedding_lookup;
 const AttentionKernelSet = engine_types.AttentionKernelSet;
@@ -165,75 +165,45 @@ fn computeBatchedPrefillPipeline2(
     else
         global_rope_theta;
 
-    const attn_kernels_0 = AttentionKernelSet{
-        .attn_scores_heads_f32_function = if (kv_cache_dtype_fp16)
-            null
-        else
-            (self.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable),
-        .attn_weighted_sum_heads_f32_function = if (kv_cache_dtype_fp16)
-            null
-        else
-            (self.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable),
-        .attn_scores_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            (self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
-        else
-            null,
-        .softmax_rows_function = self.softmax_rows_function,
-        .attn_weighted_sum_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            (self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
-        else
-            null,
-        .attn_fused_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            self.attn_fused_heads_f16_kv_function
-        else
-            null,
-        .attn_fused_prefill_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            self.attn_fused_prefill_heads_f16_kv_function
-        else
-            null,
-        .attn_fused_prefill_heads_f16_kv_gqa_function = if (kv_cache_dtype_fp16)
-            self.attn_fused_prefill_heads_f16_kv_gqa_function
-        else
-            null,
-        .causal_attn_softmax_f32_function = if (kv_cache_dtype_fp16)
-            self.causal_attn_softmax_f32_function
-        else
-            null,
+    const attn_kernels_0 = switch (self.kv_cache_dtype) {
+        .f16 => AttentionKernelSet{
+            .attn_scores_heads_f16_kv_function = self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+            .attn_weighted_sum_heads_f16_kv_function = self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+            .attn_fused_heads_f16_kv_function = self.attn_fused_heads_f16_kv_function,
+            .attn_fused_prefill_heads_f16_kv_function = self.attn_fused_prefill_heads_f16_kv_function,
+            .attn_fused_prefill_heads_f16_kv_gqa_function = self.attn_fused_prefill_heads_f16_kv_gqa_function,
+            .softmax_rows_function = self.softmax_rows_function,
+            .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
+        },
+        .i8 => AttentionKernelSet{
+            .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
+            .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
+            .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
+            .attn_fused_prefill_heads_i8_kv_function = self.attn_fused_prefill_heads_i8_kv_function,
+            .attn_fused_prefill_heads_i8_kv_gqa_function = self.attn_fused_prefill_heads_i8_kv_gqa_function,
+            .softmax_rows_function = self.softmax_rows_function,
+            .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
+        },
     };
-    const attn_kernels_1 = AttentionKernelSet{
-        .attn_scores_heads_f32_function = if (kv_cache_dtype_fp16)
-            null
-        else
-            (stage1.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable),
-        .attn_weighted_sum_heads_f32_function = if (kv_cache_dtype_fp16)
-            null
-        else
-            (stage1.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable),
-        .attn_scores_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            (stage1.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
-        else
-            null,
-        .softmax_rows_function = stage1.softmax_rows_function,
-        .attn_weighted_sum_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            (stage1.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
-        else
-            null,
-        .attn_fused_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            stage1.attn_fused_heads_f16_kv_function
-        else
-            null,
-        .attn_fused_prefill_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            stage1.attn_fused_prefill_heads_f16_kv_function
-        else
-            null,
-        .attn_fused_prefill_heads_f16_kv_gqa_function = if (kv_cache_dtype_fp16)
-            stage1.attn_fused_prefill_heads_f16_kv_gqa_function
-        else
-            null,
-        .causal_attn_softmax_f32_function = if (kv_cache_dtype_fp16)
-            stage1.causal_attn_softmax_f32_function
-        else
-            null,
+    const attn_kernels_1 = switch (self.kv_cache_dtype) {
+        .f16 => AttentionKernelSet{
+            .attn_scores_heads_f16_kv_function = stage1.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+            .attn_weighted_sum_heads_f16_kv_function = stage1.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+            .attn_fused_heads_f16_kv_function = stage1.attn_fused_heads_f16_kv_function,
+            .attn_fused_prefill_heads_f16_kv_function = stage1.attn_fused_prefill_heads_f16_kv_function,
+            .attn_fused_prefill_heads_f16_kv_gqa_function = stage1.attn_fused_prefill_heads_f16_kv_gqa_function,
+            .softmax_rows_function = stage1.softmax_rows_function,
+            .causal_attn_softmax_f32_function = stage1.causal_attn_softmax_f32_function,
+        },
+        .i8 => AttentionKernelSet{
+            .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
+            .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
+            .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
+            .attn_fused_prefill_heads_i8_kv_function = self.attn_fused_prefill_heads_i8_kv_function,
+            .attn_fused_prefill_heads_i8_kv_gqa_function = self.attn_fused_prefill_heads_i8_kv_gqa_function,
+            .softmax_rows_function = stage1.softmax_rows_function,
+            .causal_attn_softmax_f32_function = stage1.causal_attn_softmax_f32_function,
+        },
     };
 
     const chunk_cap = @min(self.prefill_chunk_rows_cap, stage1.prefill_chunk_rows_cap);
@@ -427,12 +397,9 @@ fn computeBatchedPrefillPipeline2(
                     local_rope_theta,
                     self.rope_function orelse return error.CudaKernelUnavailable,
                     self.copy_function orelse return error.CudaKernelUnavailable,
-                    if (kv_cache_dtype_fp16)
-                        (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
-                    else
-                        null,
-                    if (kv_cache_dtype_fp16) self.kv_write_f16_function else null,
-                    if (kv_cache_dtype_fp16) self.rope_store_f16_function else null,
+                    if (self.kv_cache_dtype == .f16) (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable) else null,
+                    if (self.kv_cache_dtype == .f16) self.kv_write_f16_function else null,
+                    if (self.kv_cache_dtype == .f16) self.rope_store_f16_function else null,
                     self.shortconv_step_function orelse return error.CudaKernelUnavailable,
                     attn_kernels_0,
                     null,
@@ -472,12 +439,9 @@ fn computeBatchedPrefillPipeline2(
                     local_rope_theta,
                     stage1.rope_function orelse return error.CudaKernelUnavailable,
                     stage1.copy_function orelse return error.CudaKernelUnavailable,
-                    if (kv_cache_dtype_fp16)
-                        (stage1.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
-                    else
-                        null,
-                    if (kv_cache_dtype_fp16) stage1.kv_write_f16_function else null,
-                    if (kv_cache_dtype_fp16) stage1.rope_store_f16_function else null,
+                    if (self.kv_cache_dtype == .f16) (stage1.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable) else null,
+                    if (self.kv_cache_dtype == .f16) stage1.kv_write_f16_function else null,
+                    if (self.kv_cache_dtype == .f16) stage1.rope_store_f16_function else null,
                     stage1.shortconv_step_function orelse return error.CudaKernelUnavailable,
                     attn_kernels_1,
                     null,
@@ -1471,44 +1435,15 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     const embedding_lookup_f32_function = self.embedding_lookup_f32_function;
     const embedding_lookup_u16_function = self.embedding_lookup_u16_function;
     const embedding_lookup_gaffine_u4_function = self.embedding_lookup_gaffine_u4_function;
-    const cast_f32_to_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+    const is_f16_kv = self.kv_cache_dtype == .f16;
+    const cast_f32_to_f16_function: ?compute.cuda.Function = if (is_f16_kv)
         (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
     else
         null;
-    const kv_write_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        self.kv_write_f16_function
-    else
-        null;
-    const rope_store_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        self.rope_store_f16_function
-    else
-        null;
+    const kv_write_f16_function: ?compute.cuda.Function = if (is_f16_kv) self.kv_write_f16_function else null;
+    const rope_store_f16_function: ?compute.cuda.Function = if (is_f16_kv) self.rope_store_f16_function else null;
     const rope_function = self.rope_function orelse return error.CudaKernelUnavailable;
-    const attn_scores_heads_f32_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        null
-    else
-        (self.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable);
-    const attn_scores_heads_f16_kv_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        (self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
-    else
-        null;
-    const attn_fused_heads_f16_kv_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        self.attn_fused_heads_f16_kv_function
-    else
-        null;
-    const attn_fused_prefill_heads_f16_kv_function: ?compute.cuda.Function = null;
-    const softmax_rows_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        (self.softmax_rows_function orelse return error.CudaKernelUnavailable)
-    else
-        self.softmax_rows_function;
-    const attn_weighted_sum_heads_f32_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        null
-    else
-        (self.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable);
-    const attn_weighted_sum_heads_f16_kv_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        (self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
-    else
-        null;
+    const softmax_rows_function = self.softmax_rows_function;
     const d_model_u32: u32 = @intCast(self.d_model);
     const head_dim_u32: u32 = @intCast(self.head_dim);
     const rope_dim_u32: u32 = @intCast(self.rope_dim);
@@ -1662,16 +1597,19 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     var layer_idx: usize = 0;
     while (layer_idx < layer_limit) : (layer_idx += 1) {
         const layer = &self.block_runtime.blocks[layer_idx];
-        const attention_kernels = AttentionKernelSet{
-            .attn_scores_heads_f32_function = attn_scores_heads_f32_function,
-            .attn_weighted_sum_heads_f32_function = attn_weighted_sum_heads_f32_function,
-            .attn_scores_heads_f16_kv_function = attn_scores_heads_f16_kv_function,
-            .softmax_rows_function = softmax_rows_function,
-            .attn_weighted_sum_heads_f16_kv_function = attn_weighted_sum_heads_f16_kv_function,
-            .attn_fused_heads_f16_kv_function = attn_fused_heads_f16_kv_function,
-            .attn_fused_prefill_heads_f16_kv_function = attn_fused_prefill_heads_f16_kv_function,
-            .attn_fused_prefill_heads_f16_kv_gqa_function = null,
-            .causal_attn_softmax_f32_function = null,
+        const attention_kernels: AttentionKernelSet = switch (self.kv_cache_dtype) {
+            .f16 => .{
+                .attn_scores_heads_f16_kv_function = self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+                .attn_weighted_sum_heads_f16_kv_function = self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+                .attn_fused_heads_f16_kv_function = self.attn_fused_heads_f16_kv_function,
+                .softmax_rows_function = softmax_rows_function,
+            },
+            .i8 => .{
+                .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
+                .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
+                .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
+                .softmax_rows_function = softmax_rows_function,
+            },
         };
         final_hidden = try self.tryExecuteLayerProgram(
             layer,
@@ -1958,43 +1896,15 @@ fn computeBatchedDecodeLogitsWithMode(
     // Extract kernel functions (same set as single-token path).
     const shortconv_step_function = self.shortconv_step_function orelse return error.CudaKernelUnavailable;
     const copy_function = self.copy_function orelse return error.CudaKernelUnavailable;
-    const cast_f32_to_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+    const is_f16_kv_bd = self.kv_cache_dtype == .f16;
+    const cast_f32_to_f16_function: ?compute.cuda.Function = if (is_f16_kv_bd)
         (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
     else
         null;
-    const kv_write_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        self.kv_write_f16_function
-    else
-        null;
-    const rope_store_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        self.rope_store_f16_function
-    else
-        null;
+    const kv_write_f16_function: ?compute.cuda.Function = if (is_f16_kv_bd) self.kv_write_f16_function else null;
+    const rope_store_f16_function: ?compute.cuda.Function = if (is_f16_kv_bd) self.rope_store_f16_function else null;
     const rope_function = self.rope_function orelse return error.CudaKernelUnavailable;
-    const attn_scores_heads_f32_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        null
-    else
-        (self.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable);
-    const attn_scores_heads_f16_kv_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        (self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
-    else
-        null;
-    const attn_fused_heads_f16_kv_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        self.attn_fused_heads_f16_kv_function
-    else
-        null;
-    const softmax_rows_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        (self.softmax_rows_function orelse return error.CudaKernelUnavailable)
-    else
-        self.softmax_rows_function;
-    const attn_weighted_sum_heads_f32_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        null
-    else
-        (self.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable);
-    const attn_weighted_sum_heads_f16_kv_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        (self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
-    else
-        null;
+    const softmax_rows_function = self.softmax_rows_function;
     const d_model_u32: u32 = @intCast(self.d_model);
     const head_dim_u32: u32 = @intCast(self.head_dim);
     const rope_dim_u32: u32 = @intCast(self.rope_dim);
@@ -2006,16 +1916,19 @@ fn computeBatchedDecodeLogitsWithMode(
         self.loaded.config.rope_local_theta
     else
         global_rope_theta;
-    const attention_kernels = AttentionKernelSet{
-        .attn_scores_heads_f32_function = attn_scores_heads_f32_function,
-        .attn_weighted_sum_heads_f32_function = attn_weighted_sum_heads_f32_function,
-        .attn_scores_heads_f16_kv_function = attn_scores_heads_f16_kv_function,
-        .softmax_rows_function = softmax_rows_function,
-        .attn_weighted_sum_heads_f16_kv_function = attn_weighted_sum_heads_f16_kv_function,
-        .attn_fused_heads_f16_kv_function = attn_fused_heads_f16_kv_function,
-        .attn_fused_prefill_heads_f16_kv_function = null,
-        .attn_fused_prefill_heads_f16_kv_gqa_function = null,
-        .causal_attn_softmax_f32_function = null,
+    const attention_kernels: AttentionKernelSet = switch (self.kv_cache_dtype) {
+        .f16 => .{
+            .attn_scores_heads_f16_kv_function = self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+            .attn_weighted_sum_heads_f16_kv_function = self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+            .attn_fused_heads_f16_kv_function = self.attn_fused_heads_f16_kv_function,
+            .softmax_rows_function = softmax_rows_function,
+        },
+        .i8 => .{
+            .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
+            .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
+            .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
+            .softmax_rows_function = softmax_rows_function,
+        },
     };
 
     // Embedding lookup: N tokens → N rows of input_dev.
@@ -2201,6 +2114,8 @@ fn computeBatchedDecodeLogitsWithMode(
     if (attn_table_entries > 0 and refresh_pointer_tables) {
         var attn_key_ptrs_table_host = self.runtime_buffers.decode_attn_key_cache_ptrs_table_host[0..attn_table_entries];
         var attn_value_ptrs_table_host = self.runtime_buffers.decode_attn_value_cache_ptrs_table_host[0..attn_table_entries];
+        var attn_k_scale_ptrs_table_host = self.runtime_buffers.decode_attn_k_scale_ptrs_table_host[0..attn_table_entries];
+        var attn_v_scale_ptrs_table_host = self.runtime_buffers.decode_attn_v_scale_ptrs_table_host[0..attn_table_entries];
         var attn_layer_idx: usize = 0;
         for (self.block_runtime.blocks) |layer| {
             if (layer.attention_binding == null) continue;
@@ -2211,14 +2126,20 @@ fn computeBatchedDecodeLogitsWithMode(
                 const dst_idx = table_row_offset + row_i;
                 attn_key_ptrs_table_host[dst_idx] = kv_entry.k.pointer;
                 attn_value_ptrs_table_host[dst_idx] = kv_entry.v.pointer;
+                attn_k_scale_ptrs_table_host[dst_idx] = kv_entry.k_scale.pointer;
+                attn_v_scale_ptrs_table_host[dst_idx] = kv_entry.v_scale.pointer;
             }
             attn_layer_idx += 1;
         }
         const attn_table_ptr_bytes = std.math.mul(usize, attn_table_entries, @sizeOf(u64)) catch return error.InvalidArgument;
         var attn_key_ptrs_table_dev = try bufferSlice(&self.runtime_buffers.decode_attn_key_cache_ptrs_table_dev, 0, attn_table_ptr_bytes);
         var attn_value_ptrs_table_dev = try bufferSlice(&self.runtime_buffers.decode_attn_value_cache_ptrs_table_dev, 0, attn_table_ptr_bytes);
+        var attn_k_scale_ptrs_table_dev = try bufferSlice(&self.runtime_buffers.decode_attn_k_scale_ptrs_table_dev, 0, attn_table_ptr_bytes);
+        var attn_v_scale_ptrs_table_dev = try bufferSlice(&self.runtime_buffers.decode_attn_v_scale_ptrs_table_dev, 0, attn_table_ptr_bytes);
         try attn_key_ptrs_table_dev.upload(&self.device, std.mem.sliceAsBytes(attn_key_ptrs_table_host));
         try attn_value_ptrs_table_dev.upload(&self.device, std.mem.sliceAsBytes(attn_value_ptrs_table_host));
+        try attn_k_scale_ptrs_table_dev.upload(&self.device, std.mem.sliceAsBytes(attn_k_scale_ptrs_table_host));
+        try attn_v_scale_ptrs_table_dev.upload(&self.device, std.mem.sliceAsBytes(attn_v_scale_ptrs_table_host));
     }
 
     const gd_layers = self.block_runtime.gated_delta_block_count;
@@ -2366,6 +2287,8 @@ fn computeBatchedDecodeLogitsWithMode(
             .gd_conv_state_ptrs_table_dev = &self.runtime_buffers.decode_gd_conv_state_ptrs_table_dev,
             .gd_ssm_state_ptrs_table_dev = &self.runtime_buffers.decode_gd_ssm_state_ptrs_table_dev,
             .gd_conv_ring_heads_table_dev = &self.runtime_buffers.decode_gd_conv_ring_heads_table_dev,
+            .attn_k_scale_ptrs_table_dev = &self.runtime_buffers.decode_attn_k_scale_ptrs_table_dev,
+            .attn_v_scale_ptrs_table_dev = &self.runtime_buffers.decode_attn_v_scale_ptrs_table_dev,
             .attn_layer_index = 0,
             .gd_layer_index = 0,
             .sc_layer_index = 0,
@@ -2581,40 +2504,25 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
         self.loaded.config.rope_local_theta
     else
         global_rope_theta;
-    const attention_kernels = AttentionKernelSet{
-        .attn_scores_heads_f32_function = if (kv_cache_dtype_fp16)
-            null
-        else
-            (self.attn_scores_heads_f32_function orelse return error.CudaKernelUnavailable),
-        .attn_weighted_sum_heads_f32_function = if (kv_cache_dtype_fp16)
-            null
-        else
-            (self.attn_weighted_sum_heads_f32_function orelse return error.CudaKernelUnavailable),
-        .attn_scores_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            (self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
-        else
-            null,
-        .softmax_rows_function = self.softmax_rows_function,
-        .attn_weighted_sum_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            (self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
-        else
-            null,
-        .attn_fused_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            self.attn_fused_heads_f16_kv_function
-        else
-            null,
-        .attn_fused_prefill_heads_f16_kv_function = if (kv_cache_dtype_fp16)
-            self.attn_fused_prefill_heads_f16_kv_function
-        else
-            null,
-        .attn_fused_prefill_heads_f16_kv_gqa_function = if (kv_cache_dtype_fp16)
-            self.attn_fused_prefill_heads_f16_kv_gqa_function
-        else
-            null,
-        .causal_attn_softmax_f32_function = if (kv_cache_dtype_fp16)
-            self.causal_attn_softmax_f32_function
-        else
-            null,
+    const attention_kernels: AttentionKernelSet = switch (self.kv_cache_dtype) {
+        .f16 => .{
+            .attn_scores_heads_f16_kv_function = self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+            .attn_weighted_sum_heads_f16_kv_function = self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
+            .attn_fused_heads_f16_kv_function = self.attn_fused_heads_f16_kv_function,
+            .attn_fused_prefill_heads_f16_kv_function = self.attn_fused_prefill_heads_f16_kv_function,
+            .attn_fused_prefill_heads_f16_kv_gqa_function = self.attn_fused_prefill_heads_f16_kv_gqa_function,
+            .softmax_rows_function = self.softmax_rows_function,
+            .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
+        },
+        .i8 => .{
+            .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
+            .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
+            .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
+            .attn_fused_prefill_heads_i8_kv_function = self.attn_fused_prefill_heads_i8_kv_function,
+            .attn_fused_prefill_heads_i8_kv_gqa_function = self.attn_fused_prefill_heads_i8_kv_gqa_function,
+            .softmax_rows_function = self.softmax_rows_function,
+            .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
+        },
     };
 
     // Chunked prefill: process in chunks through all layers, building
@@ -2803,12 +2711,9 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
                 local_rope_theta,
                 self.rope_function orelse return error.CudaKernelUnavailable,
                 self.copy_function orelse return error.CudaKernelUnavailable,
-                if (kv_cache_dtype_fp16)
-                    (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
-                else
-                    null,
-                if (kv_cache_dtype_fp16) self.kv_write_f16_function else null,
-                if (kv_cache_dtype_fp16) self.rope_store_f16_function else null,
+                if (self.kv_cache_dtype == .f16) (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable) else null,
+                if (self.kv_cache_dtype == .f16) self.kv_write_f16_function else null,
+                if (self.kv_cache_dtype == .f16) self.rope_store_f16_function else null,
                 self.shortconv_step_function orelse return error.CudaKernelUnavailable,
                 attention_kernels,
                 null,
@@ -2913,14 +2818,8 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
 pub fn ensureKvCapacity(self: anytype, required_tokens: usize) !void {
     if (required_tokens == 0) return;
     if (required_tokens > self.max_seq_len) return error.InvalidArgument;
-    const copy_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        null
-    else
-        (self.copy_function orelse return error.CudaKernelUnavailable);
-    const copy_u16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
-        (self.copy_u16_function orelse return error.CudaKernelUnavailable)
-    else
-        null;
+    const copy_function = self.copy_function orelse return error.CudaKernelUnavailable;
+    const copy_u16_function = self.copy_u16_function orelse return error.CudaKernelUnavailable;
 
     var grew_any = false;
     for (self.block_runtime.blocks) |*layer| {
@@ -2940,54 +2839,84 @@ pub fn ensureKvCapacity(self: anytype, required_tokens: usize) !void {
 
         var new_kv_pair = try self.allocKvPair(new_capacity, block.kv_dim);
         errdefer {
+            if (new_kv_pair.v_scale.pointer != 0) new_kv_pair.v_scale.deinit(&self.device);
+            if (new_kv_pair.k_scale.pointer != 0) new_kv_pair.k_scale.deinit(&self.device);
             new_kv_pair.v.deinit(&self.device);
             new_kv_pair.k.deinit(&self.device);
         }
 
         if (block.kv_capacity > 0) {
             const old_elems = std.math.mul(usize, block.kv_capacity, block.kv_dim) catch return error.InvalidArgument;
-            const old_count_u32: u32 = @intCast(old_elems);
-            if (kv_cache_dtype_fp16) {
-                try compute.cuda.copy_u16.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    copy_u16_function.?,
-                    &block.k_cache,
-                    &new_kv_pair.k,
-                    old_count_u32,
-                );
-                try compute.cuda.copy_u16.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    copy_u16_function.?,
-                    &block.v_cache,
-                    &new_kv_pair.v,
-                    old_count_u32,
-                );
-            } else {
-                try compute.cuda.copy.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    copy_function.?,
-                    &block.k_cache,
-                    &new_kv_pair.k,
-                    old_count_u32,
-                );
-                try compute.cuda.copy.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    copy_function.?,
-                    &block.v_cache,
-                    &new_kv_pair.v,
-                    old_count_u32,
-                );
+            switch (self.kv_cache_dtype) {
+                .f16 => {
+                    const old_count_u32: u32 = @intCast(old_elems);
+                    try compute.cuda.copy_u16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        copy_u16_function,
+                        &block.k_cache,
+                        &new_kv_pair.k,
+                        old_count_u32,
+                    );
+                    try compute.cuda.copy_u16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        copy_u16_function,
+                        &block.v_cache,
+                        &new_kv_pair.v,
+                        old_count_u32,
+                    );
+                },
+                .i8 => {
+                    // i8 cache: copy bytes via copy_u16 with halved count.
+                    const old_u16_count: u32 = @intCast((old_elems + 1) / 2);
+                    try compute.cuda.copy_u16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        copy_u16_function,
+                        &block.k_cache,
+                        &new_kv_pair.k,
+                        old_u16_count,
+                    );
+                    try compute.cuda.copy_u16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        copy_u16_function,
+                        &block.v_cache,
+                        &new_kv_pair.v,
+                        old_u16_count,
+                    );
+                    // Copy scale buffers (f32 elements: capacity * n_kv_heads).
+                    const old_scale_elems = std.math.mul(usize, block.kv_capacity, self.n_kv_heads) catch return error.InvalidArgument;
+                    const old_scale_count_u32: u32 = @intCast(old_scale_elems);
+                    try compute.cuda.copy.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        copy_function,
+                        &block.k_scale,
+                        &new_kv_pair.k_scale,
+                        old_scale_count_u32,
+                    );
+                    try compute.cuda.copy.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        copy_function,
+                        &block.v_scale,
+                        &new_kv_pair.v_scale,
+                        old_scale_count_u32,
+                    );
+                },
             }
         }
 
+        if (block.v_scale.pointer != 0) block.v_scale.deinit(&self.device);
+        if (block.k_scale.pointer != 0) block.k_scale.deinit(&self.device);
         block.k_cache.deinit(&self.device);
         block.v_cache.deinit(&self.device);
         block.k_cache = new_kv_pair.k;
         block.v_cache = new_kv_pair.v;
+        block.k_scale = new_kv_pair.k_scale;
+        block.v_scale = new_kv_pair.v_scale;
         block.kv_capacity = new_capacity;
         grew_any = true;
     }

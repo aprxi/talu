@@ -1058,6 +1058,8 @@ test "bindSlotStateBlocks stores typed runtime states by runtime_kind" {
     var backend: CudaBackend = undefined;
     backend.max_batch_size = 1;
     backend.block_runtime = undefined;
+    backend.pipeline_backend1 = null;
+    backend.pipeline_backend0_cpu = null;
     backend.state_descriptor_count = 4;
     backend.state_descriptors_storage[0] = .{
         .id = 91,
@@ -1151,6 +1153,8 @@ test "bindSlotStateBlocks preserves bound slot index in runtime states" {
     var backend: CudaBackend = undefined;
     backend.max_batch_size = 2;
     backend.block_runtime = undefined;
+    backend.pipeline_backend1 = null;
+    backend.pipeline_backend0_cpu = null;
     backend.state_descriptor_count = 4;
     backend.state_descriptors_storage[0] = .{
         .id = 101,
@@ -1282,6 +1286,8 @@ test "bindSlotStateBlocks preserves opaque descriptor blocks with runtime_kind n
     var backend: CudaBackend = undefined;
     backend.max_batch_size = 1;
     backend.block_runtime = undefined;
+    backend.pipeline_backend1 = null;
+    backend.pipeline_backend0_cpu = null;
     backend.state_descriptor_count = 1;
     backend.state_descriptors_storage[0] = .{
         .id = 111,

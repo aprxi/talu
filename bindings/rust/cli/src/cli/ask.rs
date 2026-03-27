@@ -390,14 +390,33 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         Ok(())
     };
 
+    // --each-line: collect stdin lines as separate prompts for batched decode.
+    let mut each_line_prompts: Vec<String> = Vec::new();
+
     if stdin_is_pipe {
         let mut stdin_buf = Vec::new();
         if io::stdin().read_to_end(&mut stdin_buf).is_ok() && !stdin_buf.is_empty() {
-            let parsed = parse_stdin_content(stdin_buf)?;
-            if let Some(text) = parsed.text {
-                prompt_parts.push(text);
+            if args.each_line {
+                // Each non-empty line becomes a separate prompt.
+                let text = String::from_utf8_lossy(&stdin_buf);
+                let suffix = prompt_parts.join(" ");
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        if suffix.is_empty() {
+                            each_line_prompts.push(trimmed.to_string());
+                        } else {
+                            each_line_prompts.push(format!("{}\n{}", trimmed, suffix));
+                        }
+                    }
+                }
+            } else {
+                let parsed = parse_stdin_content(stdin_buf)?;
+                if let Some(text) = parsed.text {
+                    prompt_parts.push(text);
+                }
+                stdin_image_parts = parsed.images;
             }
-            stdin_image_parts = parsed.images;
         }
     }
 
@@ -725,18 +744,41 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         ctx.finish();
     }
 
-    // Batched completions: submit N requests to the batch scheduler.
+    // Batched completions: submit requests to the batch scheduler.
+    // --each-line: each stdin line is a unique prompt, batched up to max_batch_size.
+    // -n N:        N completions of the same prompt (different seeds).
     let n_completions = args.completions;
-    if n_completions > 1 {
+    let use_batch = n_completions > 1 || !each_line_prompts.is_empty();
+    if use_batch {
+        if each_line_prompts.is_empty() && n_completions < 2 {
+            bail!("Error: --each-line requires piped stdin with at least one non-empty line.");
+        }
+        // Build list of (prompt, label) pairs.
+        let prompts: Vec<(String, String)> = if each_line_prompts.is_empty() {
+            // -n only: same prompt, N completions.
+            (0..n_completions)
+                .map(|i| (prompt.clone(), format!("Completion {}", i + 1)))
+                .collect()
+        } else {
+            // --each-line: each line is a unique prompt.
+            each_line_prompts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.clone(), format!("Line {}", i + 1)))
+                .collect()
+        };
+
+        // Scheduler auto-clamps to backend's max_batch_size (default 8,
+        // override via TALU_CUDA_MAX_BATCH_SIZE). No explicit config needed.
         let batch = talu::batch::BatchHandle::new(&backend, None)?;
-        let mut request_ids: Vec<(u64, ChatHandle)> = Vec::new();
-        for i in 0..n_completions {
+        let mut request_ids: Vec<(u64, ChatHandle, String)> = Vec::new();
+        for (i, (prompt_text, label)) in prompts.iter().enumerate() {
             let chat_i = ChatHandle::new(if system_msg.is_empty() {
                 None
             } else {
                 Some(system_msg.as_str())
             })?;
-            chat_i.append_user_message(&prompt)?;
+            chat_i.append_user_message(prompt_text)?;
             let mut cfg_i = talu::router::GenerateConfig {
                 max_tokens: cfg.max_tokens,
                 temperature: cfg.temperature,
@@ -754,7 +796,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
                 cfg_i.template_override = Some("{{ messages[-1].content }}".to_string());
             }
             let rid = batch.submit(&chat_i, &cfg_i)?;
-            request_ids.push((rid, chat_i));
+            request_ids.push((rid, chat_i, label.clone()));
         }
 
         // Run decode loop, collect events as segments per request (by item_type/content_type).
@@ -765,11 +807,12 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
             content_type: u8,
             text: String,
         }
+        let total_requests = request_ids.len();
         let mut per_request_segments: Vec<Vec<Segment>> =
-            (0..n_completions).map(|_| Vec::new()).collect();
+            (0..total_requests).map(|_| Vec::new()).collect();
         let pending = std::sync::atomic::AtomicBool::new(false);
         batch.run_loop(&pending, |event| {
-            if let Some(idx) = request_ids.iter().position(|(id, _)| *id == event.request_id) {
+            if let Some(idx) = request_ids.iter().position(|(id, _, _)| *id == event.request_id) {
                 if !event.text.is_empty() {
                     let segs = &mut per_request_segments[idx];
                     let needs_new = segs.last().map_or(true, |s| {
@@ -789,10 +832,10 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         })?;
 
         // Display results. Format segments with ANSI like the streaming path.
-        for (i, (rid, chat_i)) in request_ids.iter().enumerate() {
+        for (i, (rid, chat_i, label)) in request_ids.iter().enumerate() {
             let segments = &per_request_segments[i];
 
-            eprintln!("\n--- Completion {} ---", i + 1);
+            eprintln!("\n--- {} ---", label);
 
             if use_json {
                 // JSON mode: build responses JSON from segments, load into chat, serialize.

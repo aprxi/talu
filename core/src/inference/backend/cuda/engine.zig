@@ -45,7 +45,8 @@ const Tensor = tensor.Tensor;
 const engine_types = @import("engine_types.zig");
 const prototype_eps = engine_types.prototype_eps;
 const initial_kv_cache_tokens = engine_types.initial_kv_cache_tokens;
-const kv_cache_dtype_fp16 = engine_types.kv_cache_dtype_fp16;
+const KvCacheDtype = engine_types.KvCacheDtype;
+const resolveKvCacheDtype = engine_types.resolveKvCacheDtype;
 const enable_fused_attention_f16_kv = engine_types.enable_fused_attention_f16_kv;
 const max_fused_attention_f16_kv_seq_len = engine_types.max_fused_attention_f16_kv_seq_len;
 const default_prefill_chunk_rows_cap = engine_types.default_prefill_chunk_rows_cap;
@@ -169,12 +170,20 @@ pub const CudaBackend = struct {
     kv_write_f16_rows_source: ?compute.cuda.registry.KernelSource = null,
     kv_write_f16_rows_ptrs_function: ?compute.cuda.Function = null,
     kv_write_f16_rows_ptrs_source: ?compute.cuda.registry.KernelSource = null,
+    kv_write_i8_function: ?compute.cuda.Function = null,
+    kv_write_i8_source: ?compute.cuda.registry.KernelSource = null,
+    kv_write_i8_rows_function: ?compute.cuda.Function = null,
+    kv_write_i8_rows_source: ?compute.cuda.registry.KernelSource = null,
+    kv_write_i8_rows_ptrs_function: ?compute.cuda.Function = null,
+    kv_write_i8_rows_ptrs_source: ?compute.cuda.registry.KernelSource = null,
     rmsnorm_function: ?compute.cuda.Function = null,
     rmsnorm_source: ?compute.cuda.registry.KernelSource = null,
     rope_function: ?compute.cuda.Function = null,
     rope_source: ?compute.cuda.registry.KernelSource = null,
     rope_store_f16_function: ?compute.cuda.Function = null,
     rope_store_f16_source: ?compute.cuda.registry.KernelSource = null,
+    rope_store_i8_function: ?compute.cuda.Function = null,
+    rope_store_i8_source: ?compute.cuda.registry.KernelSource = null,
     attn_scores_heads_f32_function: ?compute.cuda.Function = null,
     attn_scores_heads_f32_source: ?compute.cuda.registry.KernelSource = null,
     attn_scores_heads_f16_kv_function: ?compute.cuda.Function = null,
@@ -187,6 +196,16 @@ pub const CudaBackend = struct {
     attn_fused_prefill_heads_f16_kv_source: ?compute.cuda.registry.KernelSource = null,
     attn_fused_prefill_heads_f16_kv_gqa_function: ?compute.cuda.Function = null,
     attn_fused_prefill_heads_f16_kv_gqa_source: ?compute.cuda.registry.KernelSource = null,
+    attn_scores_heads_i8_kv_function: ?compute.cuda.Function = null,
+    attn_scores_heads_i8_kv_source: ?compute.cuda.registry.KernelSource = null,
+    attn_fused_heads_i8_kv_function: ?compute.cuda.Function = null,
+    attn_fused_heads_i8_kv_source: ?compute.cuda.registry.KernelSource = null,
+    attn_fused_decode_heads_i8_kv_ptrs_function: ?compute.cuda.Function = null,
+    attn_fused_decode_heads_i8_kv_ptrs_source: ?compute.cuda.registry.KernelSource = null,
+    attn_fused_prefill_heads_i8_kv_function: ?compute.cuda.Function = null,
+    attn_fused_prefill_heads_i8_kv_source: ?compute.cuda.registry.KernelSource = null,
+    attn_fused_prefill_heads_i8_kv_gqa_function: ?compute.cuda.Function = null,
+    attn_fused_prefill_heads_i8_kv_gqa_source: ?compute.cuda.registry.KernelSource = null,
     causal_attn_softmax_f32_function: ?compute.cuda.Function = null,
     causal_attn_softmax_f32_source: ?compute.cuda.registry.KernelSource = null,
     /// Workspace buffer for GEMM-based attention scores/probs (lazy allocation, f32).
@@ -202,14 +221,20 @@ pub const CudaBackend = struct {
     attn_weighted_sum_heads_f32_source: ?compute.cuda.registry.KernelSource = null,
     attn_weighted_sum_heads_f16_kv_function: ?compute.cuda.Function = null,
     attn_weighted_sum_heads_f16_kv_source: ?compute.cuda.registry.KernelSource = null,
+    attn_weighted_sum_heads_i8_kv_function: ?compute.cuda.Function = null,
+    attn_weighted_sum_heads_i8_kv_source: ?compute.cuda.registry.KernelSource = null,
     rope_rows_ptrs_function: ?compute.cuda.Function = null,
     rope_rows_ptrs_source: ?compute.cuda.registry.KernelSource = null,
     attn_scores_heads_f16_kv_ptrs_function: ?compute.cuda.Function = null,
     attn_scores_heads_f16_kv_ptrs_source: ?compute.cuda.registry.KernelSource = null,
+    attn_scores_heads_i8_kv_ptrs_function: ?compute.cuda.Function = null,
+    attn_scores_heads_i8_kv_ptrs_source: ?compute.cuda.registry.KernelSource = null,
     softmax_rows_dynamic_cols_ptrs_function: ?compute.cuda.Function = null,
     softmax_rows_dynamic_cols_ptrs_source: ?compute.cuda.registry.KernelSource = null,
     attn_weighted_sum_heads_f16_kv_ptrs_function: ?compute.cuda.Function = null,
     attn_weighted_sum_heads_f16_kv_ptrs_source: ?compute.cuda.registry.KernelSource = null,
+    attn_weighted_sum_heads_i8_kv_ptrs_function: ?compute.cuda.Function = null,
+    attn_weighted_sum_heads_i8_kv_ptrs_source: ?compute.cuda.registry.KernelSource = null,
     silu_function: ?compute.cuda.Function = null,
     silu_source: ?compute.cuda.registry.KernelSource = null,
     silu_mul_function: ?compute.cuda.Function = null,
@@ -246,8 +271,10 @@ pub const CudaBackend = struct {
     gated_delta_rmsnorm_silu_mul_rows_source: ?compute.cuda.registry.KernelSource = null,
     argmax_function: ?compute.cuda.Function = null,
     argmax_source: ?compute.cuda.registry.KernelSource = null,
-    topk_rows_function: ?compute.cuda.Function = null,
-    topk_rows_source: ?compute.cuda.registry.KernelSource = null,
+    topk_phase1_function: ?compute.cuda.Function = null,
+    topk_phase2_function: ?compute.cuda.Function = null,
+    topk_scratch_vals_dev: ?compute.cuda.Buffer = null,
+    topk_scratch_ids_dev: ?compute.cuda.Buffer = null,
     decode_u32_increment_function: ?compute.cuda.Function = null,
     decode_u32_increment_source: ?compute.cuda.registry.KernelSource = null,
     matmul_f16_function: ?compute.cuda.Function = null,
@@ -379,6 +406,7 @@ pub const CudaBackend = struct {
     /// Which slot's KV/state buffers are currently loaded into block_runtime.
     /// Call activateKvSlot() before accessing per-slot KV or gated delta state.
     active_kv_slot: usize = 0,
+    kv_cache_dtype: KvCacheDtype = .f16,
     slot_kv_states: []SlotKvStates,
     state_descriptors_storage: [runtime_contract.max_state_descriptors]runtime_contract.StateDescriptor = undefined,
     state_descriptor_count: u8 = 0,
@@ -409,7 +437,13 @@ pub const CudaBackend = struct {
     /// Per-slot KV cache, gated delta, and shortconv state buffer pointers.
     /// Buffer handles are swapped into block_runtime via activateKvSlot().
     const SlotKvStates = struct {
-        const KvEntry = struct { k: compute.cuda.Buffer, v: compute.cuda.Buffer, capacity: usize };
+        const KvEntry = struct {
+            k: compute.cuda.Buffer,
+            v: compute.cuda.Buffer,
+            k_scale: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
+            v_scale: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
+            capacity: usize,
+        };
         const GdEntry = struct { conv: compute.cuda.Buffer, ssm: compute.cuda.Buffer, conv_ring_head: u32 };
         const ScEntry = struct { conv: compute.cuda.Buffer };
 
@@ -598,6 +632,7 @@ pub const CudaBackend = struct {
             1.0 / std.math.sqrt(loaded.config.query_pre_attn_scalar)
         else
             1.0 / std.math.sqrt(@as(f32, @floatFromInt(backend.head_dim)));
+        backend.kv_cache_dtype = resolveKvCacheDtype();
         try engine_layer_program.initCpuRuntimeRopeHandles(&backend);
         backend.norm_eps = if (loaded.config.norm_eps > 0.0) loaded.config.norm_eps else prototype_eps;
         if (backend.device.supportsStreams()) {
@@ -646,6 +681,7 @@ pub const CudaBackend = struct {
             layer_range.start,
             layer_range.end,
             CudaBackend.layer_program_adapter_table,
+            backend.kv_cache_dtype,
         );
         errdefer backend.block_runtime.deinit(allocator, &backend.device);
         // A10 invariant: BlockRuntime must hold exactly the requested layer count.
@@ -1157,7 +1193,7 @@ pub const CudaBackend = struct {
             .max_seq = backend.max_seq_len,
             .model_max_seq = backend.model_max_seq_len,
             .kv_storage = @tagName(backend.kv_storage_mode),
-            .kv_dtype = if (kv_cache_dtype_fp16) "f16" else "f32",
+            .kv_dtype = @tagName(backend.kv_cache_dtype),
             .kv_init_tokens = backend.kv_init_tokens,
             .kv_capacity_init = backend.initialKvCapacity(),
             .prefill_chunk_rows = backend.prefill_chunk_rows_cap,
@@ -1183,7 +1219,7 @@ pub const CudaBackend = struct {
             .n_heads = backend.n_heads,
             .n_kv = backend.n_kv_heads,
             .head_dim = backend.head_dim,
-            .kv_dtype = if (kv_cache_dtype_fp16) "f16" else "f32",
+            .kv_dtype = @tagName(backend.kv_cache_dtype),
             .linear_weight_mib = bytesToMiB(backend.block_runtime.linear_weight_bytes),
             .norm_weight_mib = bytesToMiB(backend.block_runtime.norm_weight_bytes),
             .kv_cache_mib = bytesToMiB(backend.block_runtime.kv_cache_bytes),
@@ -1361,6 +1397,8 @@ pub const CudaBackend = struct {
         if (self.slot_rope_position_deltas.len > 0) self.allocator.free(self.slot_rope_position_deltas);
         self.deinitSlotKvStates();
         self.deinitLayerProgramSlotBuffers();
+        if (self.topk_scratch_vals_dev) |*buf| buf.deinit(&self.device);
+        if (self.topk_scratch_ids_dev) |*buf| buf.deinit(&self.device);
         if (self.attn_scores_workspace_dev) |*buf| buf.deinit(&self.device);
         if (self.attn_u16_workspace_dev) |*buf| buf.deinit(&self.device);
         if (self.pipeline_backend1) |stage1| {
@@ -1473,7 +1511,7 @@ pub const CudaBackend = struct {
     /// Central KV allocation seam for future storage backends.
     pub fn allocKvPair(self: *CudaBackend, capacity: usize, kv_dim: usize) !DeviceKvPair {
         return switch (self.kv_storage_mode) {
-            .device => allocDeviceKvPair(&self.device, capacity, kv_dim),
+            .device => allocDeviceKvPairWithScales(&self.device, capacity, kv_dim, self.n_kv_heads, self.kv_cache_dtype),
         };
     }
 
@@ -1491,6 +1529,8 @@ pub const CudaBackend = struct {
             for (slot.kv) |entry| {
                 kv_state_bytes = saturatingAddUsize(kv_state_bytes, entry.k.size);
                 kv_state_bytes = saturatingAddUsize(kv_state_bytes, entry.v.size);
+                kv_state_bytes = saturatingAddUsize(kv_state_bytes, entry.k_scale.size);
+                kv_state_bytes = saturatingAddUsize(kv_state_bytes, entry.v_scale.size);
             }
             for (slot.gd) |entry| {
                 gated_delta_state_bytes = saturatingAddUsize(gated_delta_state_bytes, entry.conv.size);
@@ -1550,6 +1590,8 @@ pub const CudaBackend = struct {
             for (self.slot_kv_states[0..initialized_slots], 0..) |*sks, err_slot_idx| {
                 if (err_slot_idx > 0) {
                     for (sks.kv) |*kv| {
+                        if (kv.v_scale.pointer != 0) kv.v_scale.deinit(&self.device);
+                        if (kv.k_scale.pointer != 0) kv.k_scale.deinit(&self.device);
                         kv.k.deinit(&self.device);
                         kv.v.deinit(&self.device);
                     }
@@ -1582,6 +1624,8 @@ pub const CudaBackend = struct {
             // Slot 0 entries are block_runtime aliases — only free for slot > 0.
             errdefer if (slot_idx > 0) {
                 for (sks.kv[0..attn_i]) |*kv| {
+                    if (kv.v_scale.pointer != 0) kv.v_scale.deinit(&self.device);
+                    if (kv.k_scale.pointer != 0) kv.k_scale.deinit(&self.device);
                     kv.k.deinit(&self.device);
                     kv.v.deinit(&self.device);
                 }
@@ -1596,14 +1640,28 @@ pub const CudaBackend = struct {
             for (self.block_runtime.blocks) |*layer| {
                 if (layer.attention_binding) |block| {
                     if (slot_idx == 0) {
-                        sks.kv[attn_i] = .{ .k = block.k_cache, .v = block.v_cache, .capacity = block.kv_capacity };
+                        sks.kv[attn_i] = .{
+                            .k = block.k_cache,
+                            .v = block.v_cache,
+                            .k_scale = block.k_scale,
+                            .v_scale = block.v_scale,
+                            .capacity = block.kv_capacity,
+                        };
                     } else {
                         var kv_pair = try self.allocKvPair(block.kv_capacity, block.kv_dim);
                         errdefer {
+                            if (kv_pair.v_scale.pointer != 0) kv_pair.v_scale.deinit(&self.device);
+                            if (kv_pair.k_scale.pointer != 0) kv_pair.k_scale.deinit(&self.device);
                             kv_pair.v.deinit(&self.device);
                             kv_pair.k.deinit(&self.device);
                         }
-                        sks.kv[attn_i] = .{ .k = kv_pair.k, .v = kv_pair.v, .capacity = block.kv_capacity };
+                        sks.kv[attn_i] = .{
+                            .k = kv_pair.k,
+                            .v = kv_pair.v,
+                            .k_scale = kv_pair.k_scale,
+                            .v_scale = kv_pair.v_scale,
+                            .capacity = block.kv_capacity,
+                        };
                     }
                     attn_i += 1;
                 }
@@ -1644,6 +1702,8 @@ pub const CudaBackend = struct {
         for (self.slot_kv_states, 0..) |*sks, slot_idx| {
             if (slot_idx > 0) {
                 for (sks.kv) |*kv| {
+                    if (kv.v_scale.pointer != 0) kv.v_scale.deinit(&self.device);
+                    if (kv.k_scale.pointer != 0) kv.k_scale.deinit(&self.device);
                     kv.k.deinit(&self.device);
                     kv.v.deinit(&self.device);
                 }
@@ -1678,7 +1738,13 @@ pub const CudaBackend = struct {
         var sc_i: usize = 0;
         for (self.block_runtime.blocks) |*layer| {
             if (layer.attention_binding) |block| {
-                sks.kv[attn_i] = .{ .k = block.k_cache, .v = block.v_cache, .capacity = block.kv_capacity };
+                sks.kv[attn_i] = .{
+                    .k = block.k_cache,
+                    .v = block.v_cache,
+                    .k_scale = block.k_scale,
+                    .v_scale = block.v_scale,
+                    .capacity = block.kv_capacity,
+                };
                 attn_i += 1;
             }
             if (layer.gated_delta_binding) |block| {
@@ -1701,6 +1767,8 @@ pub const CudaBackend = struct {
             if (layer.attention_binding) |block| {
                 block.k_cache = sks.kv[attn_i].k;
                 block.v_cache = sks.kv[attn_i].v;
+                block.k_scale = sks.kv[attn_i].k_scale;
+                block.v_scale = sks.kv[attn_i].v_scale;
                 block.kv_capacity = sks.kv[attn_i].capacity;
                 attn_i += 1;
             }
@@ -1999,34 +2067,59 @@ pub const CudaBackend = struct {
         const total_logits_bytes = std.math.mul(usize, total_logits, @sizeOf(f32)) catch return error.InvalidArgument;
         var logits_batch = try engine_weights.bufferSlice(&self.runtime_buffers.logits_dev, 0, total_logits_bytes);
 
-        if (self.topk_rows_function == null) {
+        // Lazy-resolve phase 1 and phase 2 kernel functions.
+        if (self.topk_phase1_function == null or self.topk_phase2_function == null) {
             if (self.kernel_registry.embedded_module == null) {
                 try self.kernel_registry.loadEmbeddedModule(compute.cuda.topk_rows_f32.embedded_module);
             }
-            const resolved = try self.kernel_registry.resolveFunction(
-                compute.cuda.topk_rows_f32.op_name,
-                compute.cuda.topk_rows_f32.embedded_symbol,
+            const r1 = try self.kernel_registry.resolveFunction(
+                compute.cuda.topk_rows_f32.phase1_op_name,
+                compute.cuda.topk_rows_f32.phase1_symbol,
             );
-            self.topk_rows_function = resolved.function;
-            self.topk_rows_source = resolved.source;
+            const r2 = try self.kernel_registry.resolveFunction(
+                compute.cuda.topk_rows_f32.phase2_op_name,
+                compute.cuda.topk_rows_f32.phase2_symbol,
+            );
+            self.topk_phase1_function = r1.function;
+            self.topk_phase2_function = r2.function;
         }
-        const topk_rows_function = self.topk_rows_function orelse return error.CudaKernelUnavailable;
+        const phase1_fn = self.topk_phase1_function orelse return error.CudaKernelUnavailable;
+        const phase2_fn = self.topk_phase2_function orelse return error.CudaKernelUnavailable;
+
+        // Lazy-allocate scratch buffers for phase 1 intermediate results.
+        const chunks: u32 = compute.cuda.topk_rows_f32.CHUNKS;
+        const scratch_entries = @as(usize, self.max_batch_size) * @as(usize, chunks) * 256;
+        const scratch_bytes = scratch_entries * @sizeOf(f32);
+        if (self.topk_scratch_vals_dev == null) {
+            self.topk_scratch_vals_dev = try self.device.allocBuffer(scratch_bytes);
+        }
+        if (self.topk_scratch_ids_dev == null) {
+            self.topk_scratch_ids_dev = try self.device.allocBuffer(scratch_bytes);
+        }
+
         const rows_u32 = std.math.cast(u32, batch_rows) orelse return error.InvalidArgument;
         const vocab_u32 = std.math.cast(u32, vocab) orelse return error.InvalidArgument;
         const row_stride_u32 = std.math.cast(u32, top_k) orelse return error.InvalidArgument;
         const per_row_count_u32 = std.math.cast(u32, per_row_count) orelse return error.InvalidArgument;
+        _ = per_row_count_u32;
 
-        try compute.cuda.topk_rows_f32.runWithFunction(
+        var scratch_vals = self.topk_scratch_vals_dev orelse return error.CudaKernelUnavailable;
+        var scratch_ids = self.topk_scratch_ids_dev orelse return error.CudaKernelUnavailable;
+
+        try compute.cuda.topk_rows_f32.runTwoPhase(
             &self.kernel_arg_pack,
             &self.device,
-            topk_rows_function,
+            phase1_fn,
+            phase2_fn,
             &self.runtime_buffers.topk_values_dev,
             &self.runtime_buffers.topk_ids_dev,
             &logits_batch,
+            &scratch_vals,
+            &scratch_ids,
             rows_u32,
             vocab_u32,
             row_stride_u32,
-            per_row_count_u32,
+            row_stride_u32,
         );
 
         const topk_total = std.math.mul(usize, batch_rows, top_k) catch return error.InvalidArgument;
@@ -2745,6 +2838,8 @@ pub const CudaBackend = struct {
         context_stage: *compute.cuda.Buffer,
         k_cache: *const compute.cuda.Buffer,
         v_cache: *const compute.cuda.Buffer,
+        k_scale: *const compute.cuda.Buffer,
+        v_scale: *const compute.cuda.Buffer,
         kernels: AttentionKernelSet,
         seq_len_u32: u32,
         head_dim_u32: u32,
@@ -2754,7 +2849,7 @@ pub const CudaBackend = struct {
         position_u32: u32,
         theta: f32,
     ) !AttentionPath {
-        return engine_layer_program.runAttentionContext(self, cfg, q_stage, context_stage, k_cache, v_cache, kernels, seq_len_u32, head_dim_u32, kv_dim_u32, kv_groups_u32, rope_dim_u32, position_u32, theta);
+        return engine_layer_program.runAttentionContext(self, cfg, q_stage, context_stage, k_cache, v_cache, k_scale, v_scale, kernels, seq_len_u32, head_dim_u32, kv_dim_u32, kv_groups_u32, rope_dim_u32, position_u32, theta);
     }
 
     pub fn prefillDispatchDelta(self: *const CudaBackend, opcode: opcode_map.Opcode) u64 {
@@ -3169,6 +3264,8 @@ const DeviceKvPair = engine_weights.DeviceKvPair;
 const kvCacheElementBytes = engine_weights.kvCacheElementBytes;
 const kvCacheBytesForCapacity = engine_weights.kvCacheBytesForCapacity;
 const allocDeviceKvPair = engine_weights.allocDeviceKvPair;
+const allocDeviceKvPairWithScales = engine_weights.allocDeviceKvPairWithScales;
+const kvScaleBytesForCapacity = engine_weights.kvScaleBytesForCapacity;
 const resizeScratchBuffer = engine_weights.resizeScratchBuffer;
 const freeOwnedTensorView = engine_weights.freeOwnedTensorView;
 const shouldDownloadPrefillLogits = engine_weights.shouldDownloadPrefillLogits;

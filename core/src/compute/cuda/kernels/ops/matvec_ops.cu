@@ -1,5 +1,6 @@
 static constexpr unsigned int TALU_WARP_SIZE = 32;
 static constexpr unsigned int TALU_MATMUL_TILE_K = 2048;
+static constexpr unsigned int TALU_BATCH_TILE = 8;
 
 static __device__ __forceinline__ float talu_warp_sum_f32(float value) {
     value += __shfl_down_sync(0xFFFFFFFFu, value, 16);
@@ -223,7 +224,7 @@ static __device__ void talu_matvec_f16_batched(
         for (unsigned int i = lane * 8u; i < vec_elems; i += TALU_WARP_SIZE * 8u) {
             uint4 packed;
             asm volatile(
-                "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
                 : "=r"(packed.x), "=r"(packed.y), "=r"(packed.z), "=r"(packed.w)
                 : "l"(row_vec + (i >> 3)));
             const float2 f0 = talu_decode_f16_pair_u32(packed.x);
@@ -325,7 +326,7 @@ static __device__ void talu_matvec_bf16_batched(
         for (unsigned int i = lane * 8u; i < vec_elems; i += TALU_WARP_SIZE * 8u) {
             uint4 packed;
             asm volatile(
-                "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
                 : "=r"(packed.x), "=r"(packed.y), "=r"(packed.z), "=r"(packed.w)
                 : "l"(row_vec + (i >> 3)));
             const float w0 = talu_decode_bf16_u16((unsigned short)(packed.x & 0xFFFFu));
@@ -400,15 +401,16 @@ extern "C" __global__ void talu_matvec_bf16_f32(
     talu_matvec_bf16_batched<1>(input_row, weight, out_row, in_dim, out_dim, 1, residual_row);
 }
 
-extern "C" __global__ void talu_matvec_f16_f32_batch(
+extern "C" __global__
+void talu_matvec_f16_f32_batch(
     const float* input, const unsigned short* weight, float* out,
     unsigned int in_dim, unsigned int out_dim, unsigned int batch_rows,
     const float* residual
 ) {
-    const unsigned int batch_base = blockIdx.y * 8u;
+    const unsigned int batch_base = blockIdx.y * TALU_BATCH_TILE;
     if (batch_base >= batch_rows) return;
     const unsigned int rows_remaining = batch_rows - batch_base;
-    const unsigned int tile_rows = rows_remaining < 8u ? rows_remaining : 8u;
+    const unsigned int tile_rows = rows_remaining < TALU_BATCH_TILE ? rows_remaining : TALU_BATCH_TILE;
 
     const float* input_tile = input + (unsigned long long)batch_base * in_dim;
     float* out_tile = out + (unsigned long long)batch_base * out_dim;
@@ -427,15 +429,16 @@ extern "C" __global__ void talu_matvec_f16_f32_batch(
     }
 }
 
-extern "C" __global__ void talu_matvec_bf16_f32_batch(
+extern "C" __global__
+void talu_matvec_bf16_f32_batch(
     const float* input, const unsigned short* weight, float* out,
     unsigned int in_dim, unsigned int out_dim, unsigned int batch_rows,
     const float* residual
 ) {
-    const unsigned int batch_base = blockIdx.y * 8u;
+    const unsigned int batch_base = blockIdx.y * TALU_BATCH_TILE;
     if (batch_base >= batch_rows) return;
     const unsigned int rows_remaining = batch_rows - batch_base;
-    const unsigned int tile_rows = rows_remaining < 8u ? rows_remaining : 8u;
+    const unsigned int tile_rows = rows_remaining < TALU_BATCH_TILE ? rows_remaining : TALU_BATCH_TILE;
 
     const float* input_tile = input + (unsigned long long)batch_base * in_dim;
     float* out_tile = out + (unsigned long long)batch_base * out_dim;
@@ -509,7 +512,7 @@ __device__ __forceinline__ void talu_matvec_qkv_u16_batched(
         for (unsigned int i = lane * 8u; i < vec_elems; i += TALU_WARP_SIZE * 8u) {
             uint4 packed;
             asm volatile(
-                "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
                 : "=r"(packed.x), "=r"(packed.y), "=r"(packed.z), "=r"(packed.w)
                 : "l"(row_vec + (i >> 3)));
             const unsigned int input_vec_idx = i >> 2;
@@ -623,7 +626,8 @@ extern "C" __global__ void talu_matvec_qkv_f16_f32(
     );
 }
 
-extern "C" __global__ void talu_matvec_qkv_f16_f32_batch(
+extern "C" __global__
+void talu_matvec_qkv_f16_f32_batch(
     const float* input,
     const unsigned short* q_weight,
     float* q_out,
@@ -637,10 +641,10 @@ extern "C" __global__ void talu_matvec_qkv_f16_f32_batch(
     unsigned int in_dim,
     unsigned int batch_rows
 ) {
-    const unsigned int batch_base = blockIdx.y * 8u;
+    const unsigned int batch_base = blockIdx.y * TALU_BATCH_TILE;
     if (batch_base >= batch_rows) return;
     const unsigned int rows_remaining = batch_rows - batch_base;
-    const unsigned int tile_rows = rows_remaining < 8u ? rows_remaining : 8u;
+    const unsigned int tile_rows = rows_remaining < TALU_BATCH_TILE ? rows_remaining : TALU_BATCH_TILE;
 
     const float* input_tile = input + (unsigned long long)batch_base * in_dim;
     float* q_out_tile = q_out + (unsigned long long)batch_base * q_out_dim;
@@ -694,7 +698,8 @@ extern "C" __global__ void talu_matvec_qkv_bf16_f32(
     );
 }
 
-extern "C" __global__ void talu_matvec_qkv_bf16_f32_batch(
+extern "C" __global__
+void talu_matvec_qkv_bf16_f32_batch(
     const float* input,
     const unsigned short* q_weight,
     float* q_out,
@@ -708,10 +713,10 @@ extern "C" __global__ void talu_matvec_qkv_bf16_f32_batch(
     unsigned int in_dim,
     unsigned int batch_rows
 ) {
-    const unsigned int batch_base = blockIdx.y * 8u;
+    const unsigned int batch_base = blockIdx.y * TALU_BATCH_TILE;
     if (batch_base >= batch_rows) return;
     const unsigned int rows_remaining = batch_rows - batch_base;
-    const unsigned int tile_rows = rows_remaining < 8u ? rows_remaining : 8u;
+    const unsigned int tile_rows = rows_remaining < TALU_BATCH_TILE ? rows_remaining : TALU_BATCH_TILE;
 
     const float* input_tile = input + (unsigned long long)batch_base * in_dim;
     float* q_out_tile = q_out + (unsigned long long)batch_base * q_out_dim;
@@ -835,12 +840,12 @@ static __device__ void talu_gate_up_silu_f16_inner(
             const unsigned int vi = i >> 3;
             uint4 g_packed;
             asm volatile(
-                "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
                 : "=r"(g_packed.x), "=r"(g_packed.y), "=r"(g_packed.z), "=r"(g_packed.w)
                 : "l"(gate_vec + vi));
             uint4 u_packed;
             asm volatile(
-                "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
                 : "=r"(u_packed.x), "=r"(u_packed.y), "=r"(u_packed.z), "=r"(u_packed.w)
                 : "l"(up_vec + vi));
             const float2 gf0 = talu_decode_f16_pair_u32(g_packed.x);
@@ -916,14 +921,15 @@ extern "C" __global__ void talu_matvec_gate_up_silu_f16_f32(
     talu_gate_up_silu_f16_inner<1>(input_row, gate_weight, up_weight, out_row, out_dim, in_dim, 1);
 }
 
-extern "C" __global__ void talu_matvec_gate_up_silu_f16_f32_batch(
+extern "C" __global__
+void talu_matvec_gate_up_silu_f16_f32_batch(
     const float* input, const unsigned short* gate_weight, const unsigned short* up_weight,
     float* out, unsigned int out_dim, unsigned int in_dim, unsigned int batch_rows
 ) {
-    const unsigned int batch_base = blockIdx.y * 8u;
+    const unsigned int batch_base = blockIdx.y * TALU_BATCH_TILE;
     if (batch_base >= batch_rows) return;
     const unsigned int rows_remaining = batch_rows - batch_base;
-    const unsigned int tile_rows = rows_remaining < 8u ? rows_remaining : 8u;
+    const unsigned int tile_rows = rows_remaining < TALU_BATCH_TILE ? rows_remaining : TALU_BATCH_TILE;
 
     const float* input_tile = input + (unsigned long long)batch_base * in_dim;
     float* out_tile = out + (unsigned long long)batch_base * out_dim;
@@ -974,12 +980,12 @@ static __device__ void talu_gate_up_silu_bf16_inner(
             const unsigned int vi = i >> 3;
             uint4 g_packed;
             asm volatile(
-                "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
                 : "=r"(g_packed.x), "=r"(g_packed.y), "=r"(g_packed.z), "=r"(g_packed.w)
                 : "l"(gate_vec + vi));
             uint4 u_packed;
             asm volatile(
-                "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
                 : "=r"(u_packed.x), "=r"(u_packed.y), "=r"(u_packed.z), "=r"(u_packed.w)
                 : "l"(up_vec + vi));
             const float gw0 = __uint_as_float(g_packed.x << 16);
@@ -1063,14 +1069,15 @@ extern "C" __global__ void talu_matvec_gate_up_silu_bf16_f32(
     talu_gate_up_silu_bf16_inner<1>(input_row, gate_weight, up_weight, out_row, out_dim, in_dim, 1);
 }
 
-extern "C" __global__ void talu_matvec_gate_up_silu_bf16_f32_batch(
+extern "C" __global__
+void talu_matvec_gate_up_silu_bf16_f32_batch(
     const float* input, const unsigned short* gate_weight, const unsigned short* up_weight,
     float* out, unsigned int out_dim, unsigned int in_dim, unsigned int batch_rows
 ) {
-    const unsigned int batch_base = blockIdx.y * 8u;
+    const unsigned int batch_base = blockIdx.y * TALU_BATCH_TILE;
     if (batch_base >= batch_rows) return;
     const unsigned int rows_remaining = batch_rows - batch_base;
-    const unsigned int tile_rows = rows_remaining < 8u ? rows_remaining : 8u;
+    const unsigned int tile_rows = rows_remaining < TALU_BATCH_TILE ? rows_remaining : TALU_BATCH_TILE;
 
     const float* input_tile = input + (unsigned long long)batch_base * in_dim;
     float* out_tile = out + (unsigned long long)batch_base * out_dim;
