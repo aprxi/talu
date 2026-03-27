@@ -119,6 +119,46 @@ extern "C" __global__ void talu_argmax_f32(
 //
 // Phase 1 grid: (rows * chunks, 1, 1)   block: (256, 1, 1)
 // Phase 2 grid: (rows, 1, 1)            block: (256, 1, 1)
+static __device__ __forceinline__ bool talu_u32_contains_sorted(
+    const unsigned int* sorted_ids,
+    unsigned int len,
+    unsigned int value
+) {
+    unsigned int lo = 0;
+    unsigned int hi = len;
+    while (lo < hi) {
+        const unsigned int mid = lo + ((hi - lo) >> 1);
+        const unsigned int probe = sorted_ids[mid];
+        if (probe < value) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < len && sorted_ids[lo] == value;
+}
+
+static __device__ __forceinline__ void talu_u32_insert_sorted(
+    unsigned int* sorted_ids,
+    unsigned int len,
+    unsigned int value
+) {
+    unsigned int pos = len;
+    while (pos > 0 && sorted_ids[pos - 1] > value) {
+        sorted_ids[pos] = sorted_ids[pos - 1];
+        --pos;
+    }
+    sorted_ids[pos] = value;
+}
+
+static __device__ __forceinline__ bool talu_value_id_better(
+    float lhs_value,
+    unsigned int lhs_id,
+    float rhs_value,
+    unsigned int rhs_id
+) {
+    return (lhs_value > rhs_value) || (lhs_value == rhs_value && lhs_id < rhs_id);
+}
 
 extern "C" __global__ void talu_topk_rows_phase1(
     float* chunk_values,       // [rows, chunks, k]
@@ -145,28 +185,96 @@ extern "C" __global__ void talu_topk_rows_phase1(
     __shared__ unsigned int shared_idx[256];
     __shared__ unsigned int picked_ids[256];
 
-    // Find top-k within this chunk using repeated scans.
-    // chunk_size / 256 is small (~19 elements/thread for 32 chunks
-    // over 152K vocab), so k scans are cheap.
+    // Fast path: each thread pre-sorts its own strided candidates once, then
+    // the block performs a k-way merge across thread heads.
+    //
+    // For common decode settings (vocab ~152K, chunks=32, block=256), each
+    // thread sees ~19 elements; this avoids rescanning the same chunk k times.
     const unsigned int out_base = (row * chunks + chunk) * k;
+    const unsigned int max_thread_elems = (chunk_size + blockDim.x - 1) / blockDim.x;
+    if (max_thread_elems <= 32u) {
+        static constexpr unsigned int TALU_TOPK_THREAD_CAP = 32u;
+        float local_vals[TALU_TOPK_THREAD_CAP];
+        unsigned int local_ids[TALU_TOPK_THREAD_CAP];
+        unsigned int local_count = 0u;
 
-    // Copy chunk to shared-memory scan range for masking.
-    // We mask in the output buffer rather than the input logits
-    // (which are read-only to allow graph capture).
+        // Build sorted descending per-thread candidate list once.
+        for (unsigned int col = chunk_start + tid; col < chunk_end; col += blockDim.x) {
+            const float value = row_logits[col];
+            unsigned int pos = local_count;
+            while (pos > 0u &&
+                   talu_value_id_better(value, col, local_vals[pos - 1u], local_ids[pos - 1u])) {
+                --pos;
+            }
+            if (local_count < TALU_TOPK_THREAD_CAP) {
+                for (unsigned int move = local_count; move > pos; --move) {
+                    local_vals[move] = local_vals[move - 1u];
+                    local_ids[move] = local_ids[move - 1u];
+                }
+                local_vals[pos] = value;
+                local_ids[pos] = col;
+                ++local_count;
+            } else if (pos < TALU_TOPK_THREAD_CAP) {
+                for (unsigned int move = TALU_TOPK_THREAD_CAP - 1u; move > pos; --move) {
+                    local_vals[move] = local_vals[move - 1u];
+                    local_ids[move] = local_ids[move - 1u];
+                }
+                local_vals[pos] = value;
+                local_ids[pos] = col;
+            }
+        }
+
+        unsigned int local_head = 0u;
+        for (unsigned int pick = 0; pick < k; ++pick) {
+            float local_best_val = mask_value;
+            unsigned int local_best_idx = 0u;
+            if (local_head < local_count) {
+                local_best_val = local_vals[local_head];
+                local_best_idx = local_ids[local_head];
+            }
+
+            shared_val[tid] = local_best_val;
+            shared_idx[tid] = local_best_idx;
+            __syncthreads();
+
+            for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    const float other_val = shared_val[tid + stride];
+                    const unsigned int other_idx = shared_idx[tid + stride];
+                    const float cur_val = shared_val[tid];
+                    const unsigned int cur_idx = shared_idx[tid];
+                    if (talu_value_id_better(other_val, other_idx, cur_val, cur_idx)) {
+                        shared_val[tid] = other_val;
+                        shared_idx[tid] = other_idx;
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                chunk_values[out_base + pick] = shared_val[0];
+                chunk_ids[out_base + pick] = shared_idx[0];
+            }
+            __syncthreads();
+
+            if (local_head < local_count && local_ids[local_head] == shared_idx[0]) {
+                ++local_head;
+            }
+            __syncthreads();
+        }
+        return;
+    }
+
+    // Slow-path fallback for large per-thread chunk spans.
     for (unsigned int pick = 0; pick < k; ++pick) {
         float local_best_val = mask_value;
-        unsigned int local_best_idx = 0;
+        unsigned int local_best_idx = 0u;
 
         for (unsigned int col = chunk_start + tid; col < chunk_end; col += blockDim.x) {
             float value = row_logits[col];
-            // Check if this index was already picked in an earlier round.
-            // Keep the picked set in shared memory to avoid global reads.
-            bool already_picked = false;
-            for (unsigned int p = 0; p < pick; ++p) {
-                if (picked_ids[p] == col) { already_picked = true; break; }
-            }
+            const bool already_picked = talu_u32_contains_sorted(picked_ids, pick, col);
             if (already_picked) value = mask_value;
-            if (value > local_best_val || (value == local_best_val && col < local_best_idx)) {
+            if (talu_value_id_better(value, col, local_best_val, local_best_idx)) {
                 local_best_val = value;
                 local_best_idx = col;
             }
@@ -182,7 +290,7 @@ extern "C" __global__ void talu_topk_rows_phase1(
                 const unsigned int other_idx = shared_idx[tid + stride];
                 const float cur_val = shared_val[tid];
                 const unsigned int cur_idx = shared_idx[tid];
-                if (other_val > cur_val || (other_val == cur_val && other_idx < cur_idx)) {
+                if (talu_value_id_better(other_val, other_idx, cur_val, cur_idx)) {
                     shared_val[tid] = other_val;
                     shared_idx[tid] = other_idx;
                 }
@@ -193,7 +301,7 @@ extern "C" __global__ void talu_topk_rows_phase1(
         if (tid == 0) {
             chunk_values[out_base + pick] = shared_val[0];
             chunk_ids[out_base + pick] = shared_idx[0];
-            picked_ids[pick] = shared_idx[0];
+            talu_u32_insert_sorted(picked_ids, pick, shared_idx[0]);
         }
         __syncthreads();
     }
@@ -228,12 +336,9 @@ extern "C" __global__ void talu_topk_rows_phase2(
         for (unsigned int i = tid; i < total_candidates; i += blockDim.x) {
             const float value = chunk_values[chunk_base + i];
             const unsigned int orig_id = chunk_ids[chunk_base + i];
-            // Skip already-picked entries by checking output so far.
-            // Keep picked IDs in shared memory to avoid global reads.
-            bool already_picked = false;
-            for (unsigned int p = 0; p < pick; ++p) {
-                if (picked_ids[p] == orig_id) { already_picked = true; break; }
-            }
+            // Picked IDs are maintained in sorted order so duplicate checks
+            // are O(log k) instead of O(k).
+            const bool already_picked = talu_u32_contains_sorted(picked_ids, pick, orig_id);
             if (already_picked) continue;
             if (value > local_best_val || (value == local_best_val && orig_id < local_best_idx)) {
                 local_best_val = value;
@@ -262,7 +367,7 @@ extern "C" __global__ void talu_topk_rows_phase2(
         if (tid == 0) {
             out_values[row * row_stride + pick] = shared_val[0];
             out_ids[row * row_stride + pick] = shared_idx[0];
-            picked_ids[pick] = shared_idx[0];
+            talu_u32_insert_sorted(picked_ids, pick, shared_idx[0]);
         }
         __syncthreads();
     }

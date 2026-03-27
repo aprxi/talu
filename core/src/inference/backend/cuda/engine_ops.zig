@@ -353,8 +353,12 @@ pub fn linearForwardRows(
                     self.kernel_arg_pack.appendBufferPtr(&chunk_output) catch break :i8_blas;
                     self.kernel_arg_pack.appendScalar(u32, @intCast(chunk)) catch break :i8_blas;
                     self.kernel_arg_pack.appendScalar(u32, @intCast(out_dim)) catch break :i8_blas;
+                    const dequant_blocks_x_usize = std.math.divCeil(usize, out_dim, 256) catch break :i8_blas;
+                    const dequant_blocks_x = std.math.cast(u32, dequant_blocks_x_usize) orelse break :i8_blas;
+                    const dequant_rows = std.math.cast(u32, chunk) orelse break :i8_blas;
                     compute.cuda.launch.launchWithFamily(&self.device, dequant_fn, .{
-                        .grid_x = @intCast(out_dim),
+                        .grid_x = dequant_blocks_x,
+                        .grid_y = dequant_rows,
                         .block_x = 256,
                     }, &self.kernel_arg_pack, .other) catch break :i8_blas;
 
@@ -584,8 +588,12 @@ pub fn linearForwardRows(
                     self.kernel_arg_pack.appendBufferPtr(&chunk_output) catch break :i8_blas;
                     self.kernel_arg_pack.appendScalar(u32, @intCast(chunk)) catch break :i8_blas;
                     self.kernel_arg_pack.appendScalar(u32, @intCast(out_dim)) catch break :i8_blas;
+                    const dequant_blocks_x_usize = std.math.divCeil(usize, out_dim, 256) catch break :i8_blas;
+                    const dequant_blocks_x = std.math.cast(u32, dequant_blocks_x_usize) orelse break :i8_blas;
+                    const dequant_rows = std.math.cast(u32, chunk) orelse break :i8_blas;
                     compute.cuda.launch.launchWithFamily(&self.device, dequant_fn, .{
-                        .grid_x = @intCast(out_dim),
+                        .grid_x = dequant_blocks_x,
+                        .grid_y = dequant_rows,
                         .block_x = 256,
                     }, &self.kernel_arg_pack, .other) catch break :i8_blas;
 
@@ -803,8 +811,12 @@ pub fn runQkvProjection(
                 self.kernel_arg_pack.appendScalar(u32, concat.dims[0]) catch break :fused_i8_qkv;
                 self.kernel_arg_pack.appendScalar(u32, concat.dims[1]) catch break :fused_i8_qkv;
                 self.kernel_arg_pack.appendScalar(u32, concat.dims[2]) catch break :fused_i8_qkv;
+                const split_blocks_x_usize = std.math.divCeil(usize, total_out_dim, 256) catch break :fused_i8_qkv;
+                const split_blocks_x = std.math.cast(u32, split_blocks_x_usize) orelse break :fused_i8_qkv;
+                const split_rows = std.math.cast(u32, chunk) orelse break :fused_i8_qkv;
                 compute.cuda.launch.launchWithFamily(&self.device, split_fn, .{
-                    .grid_x = @intCast(total_out_dim),
+                    .grid_x = split_blocks_x,
+                    .grid_y = split_rows,
                     .block_x = 256,
                 }, &self.kernel_arg_pack, .other) catch break :fused_i8_qkv;
 

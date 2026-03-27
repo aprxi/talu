@@ -1524,7 +1524,7 @@ extern "C" __global__ void talu_quantize_f32_to_i8_simple(
 
 // Dequantize I32 GEMM output to F32 using per-row input and weight scales.
 // output[m][n] = gemm_i32[m][n] * input_scale[m] * weight_scale[n]
-// Launch: grid=(out_dim), block=(256)
+// Launch: grid=(ceil(out_dim/256), rows), block=(256)
 extern "C" __global__ void talu_dequant_i32_scales(
     const int* __restrict__ gemm_i32,           // [rows × out_dim]
     const float* __restrict__ input_scales,     // [rows]
@@ -1533,20 +1533,19 @@ extern "C" __global__ void talu_dequant_i32_scales(
     unsigned int rows,
     unsigned int out_dim
 ) {
-    const unsigned int n = blockIdx.x;
-    if (n >= out_dim) return;
+    const unsigned int m = blockIdx.y;
+    const unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= rows || n >= out_dim) return;
+    const unsigned long long idx = (unsigned long long)m * out_dim + n;
+    const float is = input_scales[m];
     const float ws = weight_scales[n];
-    for (unsigned int m = threadIdx.x; m < rows; m += blockDim.x) {
-        const float is = input_scales[m];
-        output[(unsigned long long)m * out_dim + n] =
-            static_cast<float>(gemm_i32[(unsigned long long)m * out_dim + n]) * is * ws;
-    }
+    output[idx] = static_cast<float>(gemm_i32[idx]) * is * ws;
 }
 
 // Dequantize I32 GEMM concat output and split into separate contiguous F32 destinations.
 // gemm_i32 layout: [rows × total_dim] where total_dim = dim_a + dim_b + dim_c.
 // Columns [0, dim_a) → out_a[rows × dim_a], [dim_a, dim_a+dim_b) → out_b, remainder → out_c.
-// Grid: (total_dim), Block: (256). One block per output column.
+// Grid: (ceil(total_dim/256), rows), Block: (256). Threads map contiguous columns.
 extern "C" __global__ void talu_dequant_i32_scales_split3(
     const int* __restrict__ gemm_i32,           // [rows × total_dim]
     const float* __restrict__ input_scales,     // [rows]
@@ -1560,8 +1559,10 @@ extern "C" __global__ void talu_dequant_i32_scales_split3(
     unsigned int dim_c
 ) {
     const unsigned int total_dim = dim_a + dim_b + dim_c;
-    const unsigned int n = blockIdx.x;
-    if (n >= total_dim) return;
+    const unsigned int m = blockIdx.y;
+    const unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= rows || n >= total_dim) return;
+    const float is = input_scales[m];
     const float ws = weight_scales[n];
 
     float* out;
@@ -1574,9 +1575,6 @@ extern "C" __global__ void talu_dequant_i32_scales_split3(
         out = out_c; out_stride = dim_c; local_n = n - dim_a - dim_b;
     }
 
-    for (unsigned int m = threadIdx.x; m < rows; m += blockDim.x) {
-        const float is = input_scales[m];
-        out[(unsigned long long)m * out_stride + local_n] =
-            static_cast<float>(gemm_i32[(unsigned long long)m * total_dim + n]) * is * ws;
-    }
+    out[(unsigned long long)m * out_stride + local_n] =
+        static_cast<float>(gemm_i32[(unsigned long long)m * total_dim + n]) * is * ws;
 }

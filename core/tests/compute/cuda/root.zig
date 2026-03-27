@@ -10,6 +10,8 @@ pub const vector_add = @import("vector_add_test.zig");
 pub const module = @import("module_test.zig");
 pub const launch = @import("launch_test.zig");
 pub const rmsnorm = @import("rmsnorm_test.zig");
+pub const topk_rows = @import("topk_rows_test.zig");
+pub const dequant_i32_scales = @import("dequant_i32_scales_test.zig");
 
 const std = @import("std");
 test {
