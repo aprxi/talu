@@ -859,6 +859,7 @@ pub const BatchWrapper = struct {
         req_id: u64,
         token: u32,
         is_final: bool,
+        _: bool,
         data: ?*anyopaque,
     ) callconv(.c) void {
         const ctx: *DecodeLoopCtx = @ptrCast(@alignCast(data));
@@ -1032,6 +1033,10 @@ pub const BatchWrapper = struct {
             @intCast(now - state.first_token_ns)
         else
             0;
+        // Use the scheduler's per-request prefill timing (measures only the
+        // actual prefill computation) instead of TTFT, which also includes
+        // model loading and queue wait time.
+        const prefill_ns: u64 = self.scheduler.getPrefillNs(request_id) orelse ttft_ns;
 
         // Build result.
         const result = try allocator.create(BatchResult);
@@ -1069,7 +1074,7 @@ pub const BatchWrapper = struct {
         result.* = .{
             .prompt_tokens = state.prompt_tokens,
             .completion_tokens = state.engine_token_count,
-            .prefill_ns = ttft_ns, // Approximation: ttft ≈ prefill.
+            .prefill_ns = prefill_ns,
             .generation_ns = generation_ns,
             .ttft_ns = ttft_ns,
             .finish_reason = actual_finish_reason,

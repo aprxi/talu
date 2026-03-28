@@ -496,6 +496,7 @@ pub fn generate_stream(
         userdata: *mut c_void,
     ) -> u8 {
         let state = &mut *(userdata as *mut CallbackState);
+
         if is_final != 0 || text_len == 0 {
             return 1; // continue (final is just a signal)
         }

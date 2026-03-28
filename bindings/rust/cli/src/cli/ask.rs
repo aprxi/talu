@@ -695,6 +695,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         content.push(talu::router::ContentPart::Text(prompt.clone()));
     }
 
+    let no_think = args.no_think;
     let mut cfg = talu::router::GenerateConfig {
         max_tokens: effective.max_tokens,
         temperature: effective.temperature,
@@ -706,6 +707,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         frequency_penalty: effective.frequency_penalty,
         seed: effective.seed,
         raw_output,
+        max_reasoning_tokens: if no_think { Some(0) } else { None },
         ..Default::default()
     };
 

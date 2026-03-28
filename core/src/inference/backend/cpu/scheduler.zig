@@ -85,8 +85,8 @@ pub const Request = struct {
     /// Stop sequences (tokenized). Generation stops when any sequence matches.
     stop_sequences: []const []const u32,
     /// Optional callback for streaming tokens.
-    /// Signature: fn(request_id: u64, token: u32, is_final: bool, user_data: ?*anyopaque) void
-    callback: ?*const fn (u64, u32, bool, ?*anyopaque) void,
+    /// Signature: fn(request_id: u64, token: u32, is_final: bool, in_thinking: bool, user_data: ?*anyopaque) void
+    callback: ?*const fn (u64, u32, bool, bool, ?*anyopaque) void,
     callback_data: ?*anyopaque,
     /// Sampling configuration
     sampling_config: sampling.SamplingConfig,
@@ -686,8 +686,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             eos_token_ids: ?[]const u32 = null,
             /// Stop sequences (tokenized). Generation stops when any sequence matches.
             stop_sequences: []const []const u32 = &.{},
-            /// Callback invoked for each token. Signature: fn(request_id, token, is_final, user_data)
-            callback: ?*const fn (u64, u32, bool, ?*anyopaque) void = null,
+            /// Callback invoked for each token. Signature: fn(request_id, token, is_final, in_thinking, user_data)
+            callback: ?*const fn (u64, u32, bool, bool, ?*anyopaque) void = null,
             callback_data: ?*anyopaque = null,
             sampling: ?sampling.SamplingConfig = null,
             /// Optional grammar sampler for constrained decoding.
@@ -975,7 +975,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 const is_final_token = finish_reason != .in_progress;
                 if (request_entry.callback) |cb| {
                     if (finish_reason != .stop_sequence) {
-                        cb(request_entry.id, next_token, is_final_token, request_entry.callback_data);
+                        cb(request_entry.id, next_token, is_final_token, request_entry.in_thinking, request_entry.callback_data);
                     }
                 }
 
@@ -1251,7 +1251,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 // Invoke callback if set (don't callback for stop sequence tokens that were trimmed)
                 if (request_entry.callback) |cb| {
                     if (finish_reason != .stop_sequence) {
-                        cb(request_entry.id, next_token, is_final_token, request_entry.callback_data);
+                        cb(request_entry.id, next_token, is_final_token, request_entry.in_thinking, request_entry.callback_data);
                     }
                 }
 
@@ -1397,7 +1397,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Callback.
             if (request_entry.callback) |cb| {
                 if (finish_reason != .stop_sequence) {
-                    cb(request_entry.id, next_token, is_final, request_entry.callback_data);
+                    cb(request_entry.id, next_token, is_final, request_entry.in_thinking, request_entry.callback_data);
                 }
             }
 
@@ -1440,7 +1440,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             self: *Self,
             request_id: u64,
             pending_flag: ?*const std.atomic.Value(bool),
-            per_token_cb: *const fn (u64, u32, bool, ?*anyopaque) callconv(.c) void,
+            per_token_cb: *const fn (u64, u32, bool, bool, ?*anyopaque) callconv(.c) void,
             cb_data: ?*anyopaque,
         ) !void {
             const re = self.requests.get(request_id) orelse return error.InvalidArgument;
@@ -1553,7 +1553,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
                 const is_final = finish_reason != .in_progress;
                 if (finish_reason != .stop_sequence) {
-                    per_token_cb(request_id, next_token, is_final, cb_data);
+                    per_token_cb(request_id, next_token, is_final, re.in_thinking, cb_data);
                 }
 
                 if (is_final) {
@@ -1564,7 +1564,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             // Exhausted max_tokens.
             self.completeRequest(re, .length);
-            per_token_cb(request_id, 0, true, cb_data);
+            per_token_cb(request_id, 0, true, false, cb_data);
         }
 
         /// Pop completed requests from the queue.
@@ -1595,6 +1595,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         pub fn getFinishReason(self: *const Self, request_id: u64) ?FinishReason {
             const request_entry = self.requests.get(request_id) orelse return null;
             return request_entry.finish_reason;
+        }
+
+        /// Get the prefill time in nanoseconds for a request.
+        pub fn getPrefillNs(self: *const Self, request_id: u64) ?u64 {
+            const request_entry = self.requests.get(request_id) orelse return null;
+            return request_entry.prefill_ns;
         }
 
         /// Synchronous single-request generation.
@@ -1813,7 +1819,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             if (submit_config.callback) |cb| {
                 const is_final = finished or max_tokens == 1;
-                cb(0, current_token, is_final, submit_config.callback_data);
+                cb(0, current_token, is_final, false, submit_config.callback_data);
             }
 
             if (finished) {
@@ -1838,7 +1844,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             defer self.allocator.free(generated_tail);
 
             const StreamingDecodeCallback = struct {
-                callback: *const fn (u64, u32, bool, ?*anyopaque) void,
+                callback: *const fn (u64, u32, bool, bool, ?*anyopaque) void,
                 callback_data: ?*anyopaque,
                 eos_token_ids: []const u32,
                 remaining_budget: usize,
@@ -1855,7 +1861,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     const ctx: *@This() = @ptrCast(@alignCast(user_data.?));
                     ctx.emitted_count += 1;
                     const is_final = ctx.isEosToken(token) or ctx.emitted_count >= ctx.remaining_budget;
-                    ctx.callback(0, token, is_final, ctx.callback_data);
+                    ctx.callback(0, token, is_final, false, ctx.callback_data);
                 }
             };
             var decode_streaming_callback_fn: ?*const fn (u32, ?*anyopaque) void = null;
@@ -2001,7 +2007,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             if (submit_config.callback) |cb| {
                 const is_final = finish_reason != .in_progress or max_tokens == 1;
                 if (finish_reason != .stop_sequence) {
-                    cb(0, current_token, is_final, submit_config.callback_data);
+                    cb(0, current_token, is_final, submit_config.max_thinking_tokens > 0 and submit_config.thinking_end_tokens.len > 0, submit_config.callback_data);
                 }
             }
 
@@ -2104,7 +2110,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     if (max_completion_tokens > 0 and completion_tokens >= max_completion_tokens) {
                         finish_reason = .length;
                         if (submit_config.callback) |cb| {
-                            cb(0, current_token, true, submit_config.callback_data);
+                            cb(0, current_token, true, in_thinking, submit_config.callback_data);
                         }
                         break;
                     }
@@ -2133,7 +2139,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
                 if (submit_config.callback) |cb| {
                     if (finish_reason != .stop_sequence) {
-                        cb(0, current_token, finish_reason != .in_progress, submit_config.callback_data);
+                        cb(0, current_token, finish_reason != .in_progress, in_thinking, submit_config.callback_data);
                     }
                 }
                 if (finish_reason != .in_progress) break;
@@ -2450,7 +2456,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
                 if (request_entry.callback) |cb| {
                     if (finish_reason != .stop_sequence) {
-                        cb(request_entry.id, first_token_id, is_final_token, request_entry.callback_data);
+                        cb(request_entry.id, first_token_id, is_final_token, request_entry.in_thinking, request_entry.callback_data);
                     }
                 }
 
@@ -3790,7 +3796,7 @@ test "generateSync callback uses backend decode-streaming route for greedy sampl
     var callback_data = CallbackData{};
 
     const callback = struct {
-        fn cb(_: u64, _: u32, is_final: bool, user_data: ?*anyopaque) void {
+        fn cb(_: u64, _: u32, is_final: bool, _: bool, user_data: ?*anyopaque) void {
             const data: *CallbackData = @ptrCast(@alignCast(user_data.?));
             data.token_count += 1;
             if (is_final) data.final_count += 1;
@@ -4444,7 +4450,6 @@ test "Scheduler.step - empty scheduler returns no events" {
 
     const events = try scheduler.step();
 
-
     try std.testing.expectEqual(@as(usize, 0), events.len);
 }
 
@@ -4882,7 +4887,7 @@ test "step callback invocation" {
     var callback_data = CallbackData{};
 
     const callback = struct {
-        fn cb(request_id: u64, token: u32, is_final: bool, user_data: ?*anyopaque) void {
+        fn cb(request_id: u64, token: u32, is_final: bool, _: bool, user_data: ?*anyopaque) void {
             _ = request_id;
             const data: *CallbackData = @ptrCast(@alignCast(user_data.?));
             data.called = true;
@@ -5147,7 +5152,7 @@ test "generateSync queued route - callback invocation" {
     var callback_data = CallbackData{};
 
     const callback = struct {
-        fn cb(_: u64, token: u32, _: bool, user_data: ?*anyopaque) void {
+        fn cb(_: u64, token: u32, _: bool, _: bool, user_data: ?*anyopaque) void {
             const data: *CallbackData = @ptrCast(@alignCast(user_data.?));
             data.token_count += 1;
             data.final_token = token;
@@ -5448,7 +5453,7 @@ test "Scheduler.step - thinking disabled with tool-generation flags" {
     var total_tokens: usize = 0;
     while (scheduler.hasActive()) {
         const events = try scheduler.step();
-    
+
         for (events) |ev| {
             total_tokens += 1;
             if (ev.is_final) break;

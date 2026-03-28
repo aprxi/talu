@@ -57,12 +57,17 @@ def _run_parallel_round(url: str, body: dict, concurrency: int) -> tuple[dict, f
     )
     model_info = req_metrics[0].get("model_info", {}) if req_metrics else {}
 
+    # Use the server-reported decode time (max across concurrent requests)
+    # instead of Python wall time, which includes HTTP/ThreadPool overhead.
+    max_decode_s = max((m.get("decode_s", 0) for m in req_metrics), default=0)
+    decode_s = max_decode_s if max_decode_s > 0 else wall_s
+
     agg = {
-        "engine_tok_s": round(total_output_tokens / wall_s, 1) if wall_s > 0 else 0.0,
+        "engine_tok_s": round(total_output_tokens / decode_s, 1) if decode_s > 0 else 0.0,
         "input_tokens": total_input_tokens,
         "output_tokens": total_output_tokens,
-        "decode_s": round(wall_s, 3),
-        "prefill_tok_s": round(total_input_tokens / wall_s, 1) if wall_s > 0 else 0.0,
+        "decode_s": round(decode_s, 3),
+        "prefill_tok_s": round(total_input_tokens / decode_s, 1) if decode_s > 0 else 0.0,
         "prefill_ms": 0.0,
         "ttft_ms": round(avg_ttft_ms, 1),
         "model_info": model_info,

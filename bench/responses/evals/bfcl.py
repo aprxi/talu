@@ -337,11 +337,7 @@ class Bfcl(Scenario):
     description = "BFCL — function-calling accuracy (AST matching)."
     endpoint = "POST /v1/responses"
 
-    def run(self, base_url: str, rounds: int, config: dict) -> list[dict]:
-        samples_n: int | None = config.get("samples")
-        if isinstance(samples_n, str):
-            samples_n = int(samples_n)
-
+    def prepare_config(self, config: dict) -> None:
         # BFCL tool calls are fragile with thinking disabled on small models.
         # Use a modest default budget unless the user overrides it.
         if "max_reasoning_tokens" not in config:
@@ -360,6 +356,11 @@ class Bfcl(Scenario):
             config["top_p"] = 1.0
             config["top_k"] = 1
             config["presence_penalty"] = 0.0
+
+    def run(self, base_url: str, rounds: int, config: dict) -> list[dict]:
+        samples_n: int | None = config.get("samples")
+        if isinstance(samples_n, str):
+            samples_n = int(samples_n)
 
         print("  Loading BFCL v4 dataset ...", flush=True)
         samples = _load_dataset(n=samples_n)

@@ -18,7 +18,7 @@ pub const runtime_contract = @import("runtime_contract/root.zig");
 pub const types = struct {
     /// Callback function type for streaming token output.
     /// Called with each newly generated token ID and optional user data.
-    pub const TokenCallback = *const fn (token_id: u32, user_data: ?*anyopaque) void;
+    pub const TokenCallback = *const fn (token_id: u32, in_thinking: bool, user_data: ?*anyopaque) void;
 
     /// Request configuration for single generation runs.
     pub const InferenceConfig = struct {

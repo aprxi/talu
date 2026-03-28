@@ -490,38 +490,15 @@ pub const StreamCallback = *const fn ([*]const u8, usize, u8, u8, u8, ?*anyopaqu
 
 /// Maximum decoded bytes per token.
 const MAX_TOKEN_LEN = 512;
-/// Maximum reasoning tag length.
-const MAX_TAG_LEN = 64;
-/// Maximum segments per decoded chunk.
-const MAX_FILTER_SEGMENTS = 64;
-
-/// Filter state for reasoning tag parsing (matches batch.zig).
-const StreamFilterState = enum { normal, reasoning };
-
-/// Typed text segment from reasoning-tag filtering.
-const StreamFilteredSegment = struct {
-    start: usize,
-    len: usize,
-    filter_state: StreamFilterState,
-};
 
 /// Per-token streaming wrapper. Held on the stack during generation.
-/// Decodes tokens, applies UTF-8 assembly and reasoning-tag filtering,
-/// then calls the user's rich C callback with (text, item_type, content_type).
+/// Decodes tokens, applies UTF-8 assembly, classifies based on scheduler's
+/// `in_thinking` state, then calls the user's rich C callback.
 const StreamingWrapper = struct {
     tok: *const tokenizer_mod.Tokenizer,
     user_cb: StreamCallback,
     user_data: ?*anyopaque,
     stop_flag: *std.atomic.Value(bool),
-
-    // Reasoning filter state
-    filter_state: StreamFilterState = .normal,
-    filter_partial_buf: [MAX_TAG_LEN]u8 = undefined,
-    filter_partial_len: u8 = 0,
-    filter_out_buf: [MAX_TOKEN_LEN + MAX_TAG_LEN]u8 = undefined,
-    swallow_next_newline: bool = false,
-    start_marker: []const u8 = "<think>",
-    end_marker: []const u8 = "</think>",
     raw_output: bool = false,
     is_tool_generation: bool = false,
 
@@ -529,21 +506,9 @@ const StreamingWrapper = struct {
     utf8_pending: [3]u8 = .{ 0, 0, 0 },
     utf8_pending_len: u8 = 0,
 
-    // Lazy init: set filter_state from starts_in_reasoning on first token
-    initialized: bool = false,
-    starts_in_reasoning: *bool,
-
-    /// TokenCallback-compatible entry point: fn(token_id, userdata) void.
-    fn onToken(token_id: u32, user_data: ?*anyopaque) void {
+    /// TokenCallback-compatible entry point: fn(token_id, in_thinking, userdata) void.
+    fn onToken(token_id: u32, in_thinking: bool, user_data: ?*anyopaque) void {
         const self: *StreamingWrapper = @ptrCast(@alignCast(user_data));
-
-        // Lazy init: read starts_in_reasoning (written by generateFromPrompt before decode loop)
-        if (!self.initialized) {
-            self.initialized = true;
-            if (self.starts_in_reasoning.*) {
-                self.filter_state = .reasoning;
-            }
-        }
 
         // Decode token to raw bytes (zero-alloc O(1) lookup).
         const decoded_raw: []const u8 = self.tok.tokenBytes(token_id) orelse return;
@@ -575,8 +540,8 @@ const StreamingWrapper = struct {
                 0;
             if (expected_len > 0 and trailing.len < expected_len) {
                 var all_valid = true;
-                for (trailing[1..]) |cb| {
-                    if (cb & 0xC0 != 0x80) {
+                for (trailing[1..]) |byte| {
+                    if (byte & 0xC0 != 0x80) {
                         all_valid = false;
                         break;
                     }
@@ -590,137 +555,20 @@ const StreamingWrapper = struct {
 
         if (valid.len == 0) return;
 
-        // Apply reasoning-tag filtering.
-        var filter_segments: [MAX_FILTER_SEGMENTS]StreamFilteredSegment = undefined;
-        var filtered_text: []const u8 = valid;
-        var segments: []const StreamFilteredSegment = &.{};
+        // Classify based on in_thinking parameter from scheduler.
+        var item_type: u8 = @intFromEnum(responses_mod.ItemType.message);
+        var content_type: u8 = @intFromEnum(ContentType.output_text);
         if (!self.raw_output) {
-            const fr = self.filterReasoningTags(valid, &filter_segments);
-            filtered_text = fr.text;
-            segments = fr.segments;
-        }
-
-        if (filtered_text.len == 0) return;
-
-        // Emit per-segment callbacks.
-        if (segments.len == 0) {
-            // No filtering or raw mode — single segment.
-            const cls = self.classifySegment(self.filter_state);
-            const cont = self.user_cb(filtered_text.ptr, filtered_text.len, cls.item_type, cls.content_type, 0, self.user_data);
-            if (cont == 0) self.stop_flag.store(true, .release);
-        } else {
-            for (segments) |seg| {
-                const cls = self.classifySegment(seg.filter_state);
-                const seg_text = filtered_text[seg.start..][0..seg.len];
-                const cont = self.user_cb(seg_text.ptr, seg_text.len, cls.item_type, cls.content_type, 0, self.user_data);
-                if (cont == 0) {
-                    self.stop_flag.store(true, .release);
-                    return;
-                }
+            if (in_thinking) {
+                item_type = @intFromEnum(responses_mod.ItemType.reasoning);
+                content_type = @intFromEnum(ContentType.reasoning_text);
+            } else if (self.is_tool_generation) {
+                item_type = @intFromEnum(responses_mod.ItemType.function_call);
             }
         }
-    }
 
-    fn classifySegment(self: *const StreamingWrapper, filter_state: StreamFilterState) struct { item_type: u8, content_type: u8 } {
-        if (self.raw_output) {
-            return .{
-                .item_type = @intFromEnum(responses_mod.ItemType.message),
-                .content_type = @intFromEnum(ContentType.output_text),
-            };
-        }
-        if (filter_state == .reasoning) {
-            return .{
-                .item_type = @intFromEnum(responses_mod.ItemType.reasoning),
-                .content_type = @intFromEnum(ContentType.reasoning_text),
-            };
-        }
-        if (self.is_tool_generation) {
-            return .{
-                .item_type = @intFromEnum(responses_mod.ItemType.function_call),
-                .content_type = @intFromEnum(ContentType.output_text),
-            };
-        }
-        return .{
-            .item_type = @intFromEnum(responses_mod.ItemType.message),
-            .content_type = @intFromEnum(ContentType.output_text),
-        };
-    }
-
-    /// Reasoning tag filter (ported from batch.zig filterReasoningTags).
-    fn filterReasoningTags(
-        self: *StreamingWrapper,
-        decoded: []const u8,
-        segments_out: []StreamFilteredSegment,
-    ) struct { text: []const u8, segments: []const StreamFilteredSegment } {
-        const filtered_buf = &self.filter_out_buf;
-        var filtered_len: usize = 0;
-        var segment_count: usize = 0;
-
-        var i: usize = 0;
-        while (i < decoded.len) {
-            const byte = decoded[i];
-
-            if (byte >= 0x80) {
-                if (self.filter_partial_len > 0) {
-                    appendStreamSegment(filtered_buf, &filtered_len, segments_out, &segment_count, self.filter_partial_buf[0..self.filter_partial_len], self.filter_state);
-                    self.filter_partial_len = 0;
-                }
-                const run_start = i;
-                while (i < decoded.len and decoded[i] >= 0x80) : (i += 1) {}
-                self.swallow_next_newline = false;
-                appendStreamSegment(filtered_buf, &filtered_len, segments_out, &segment_count, decoded[run_start..i], self.filter_state);
-                continue;
-            }
-
-            if (self.filter_partial_len >= MAX_TAG_LEN) {
-                appendStreamSegment(filtered_buf, &filtered_len, segments_out, &segment_count, self.filter_partial_buf[0..self.filter_partial_len], self.filter_state);
-                self.filter_partial_len = 0;
-            }
-            self.filter_partial_buf[self.filter_partial_len] = byte;
-            self.filter_partial_len += 1;
-
-            const buf = self.filter_partial_buf[0..self.filter_partial_len];
-
-            if (self.filter_state == .normal and std.mem.eql(u8, buf, self.start_marker)) {
-                self.filter_partial_len = 0;
-                self.filter_state = .reasoning;
-                self.swallow_next_newline = false;
-                i += 1;
-                continue;
-            }
-            if (self.filter_state == .reasoning and std.mem.eql(u8, buf, self.end_marker)) {
-                self.filter_partial_len = 0;
-                self.filter_state = .normal;
-                self.swallow_next_newline = true;
-                i += 1;
-                continue;
-            }
-
-            const is_prefix = switch (self.filter_state) {
-                .normal => std.mem.startsWith(u8, self.start_marker, buf),
-                .reasoning => std.mem.startsWith(u8, self.end_marker, buf),
-            };
-
-            if (!is_prefix) {
-                if (self.swallow_next_newline) {
-                    self.swallow_next_newline = false;
-                    if (self.filter_partial_len == 1 and buf[0] == '\n') {
-                        self.filter_partial_len = 0;
-                        i += 1;
-                        continue;
-                    }
-                }
-                appendStreamSegment(filtered_buf, &filtered_len, segments_out, &segment_count, self.filter_partial_buf[0..self.filter_partial_len], self.filter_state);
-                self.filter_partial_len = 0;
-            }
-
-            i += 1;
-        }
-
-        return .{
-            .text = filtered_buf[0..filtered_len],
-            .segments = segments_out[0..segment_count],
-        };
+        const cont = self.user_cb(valid.ptr, valid.len, item_type, content_type, 0, self.user_data);
+        if (cont == 0) self.stop_flag.store(true, .release);
     }
 };
 
@@ -761,41 +609,6 @@ fn utf8ValidPrefix(bytes: []const u8) usize {
     return last_valid;
 }
 
-fn appendStreamSegment(
-    filtered_buf: []u8,
-    filtered_len: *usize,
-    segments_out: []StreamFilteredSegment,
-    segment_count: *usize,
-    text: []const u8,
-    filter_state: StreamFilterState,
-) void {
-    if (text.len == 0) return;
-    const avail = filtered_buf.len - filtered_len.*;
-    if (avail == 0) return;
-
-    const copy_len = @min(text.len, avail);
-    const start = filtered_len.*;
-    @memcpy(filtered_buf[start..][0..copy_len], text[0..copy_len]);
-    filtered_len.* += copy_len;
-
-    if (segment_count.* > 0) {
-        var last = &segments_out[segment_count.* - 1];
-        if (last.filter_state == filter_state and last.start + last.len == start) {
-            last.len += copy_len;
-            return;
-        }
-    }
-
-    if (segment_count.* < segments_out.len) {
-        segments_out[segment_count.*] = .{
-            .start = start,
-            .len = copy_len,
-            .filter_state = filter_state,
-        };
-        segment_count.* += 1;
-    }
-}
-
 /// Generate with streaming callback using LocalEngine.
 /// Calls engine.generate with a TokenCallback wrapper that decodes tokens,
 /// applies reasoning-tag filtering, and invokes the user's rich callback.
@@ -824,10 +637,6 @@ fn generateStreamingWithLocalEngine(
         &local_stop_flag;
     built.options.stop_flag = stop_flag_ptr;
 
-    // Output flag for starts_in_reasoning detection (written by generateFromPrompt).
-    var starts_in_reasoning: bool = false;
-    built.options.starts_in_reasoning_out = &starts_in_reasoning;
-
     // Set up streaming wrapper.
     var wrapper = StreamingWrapper{
         .tok = &local_engine.tok,
@@ -836,7 +645,6 @@ fn generateStreamingWithLocalEngine(
         .stop_flag = stop_flag_ptr,
         .raw_output = raw_output,
         .is_tool_generation = is_tool_generation,
-        .starts_in_reasoning = &starts_in_reasoning,
     };
 
     // Wire the token callback.
@@ -855,9 +663,8 @@ fn generateStreamingWithLocalEngine(
     };
     defer gen_result.deinit(local_engine.allocator);
 
-    // Send final callback.
-    const final_cls = wrapper.classifySegment(wrapper.filter_state);
-    _ = stream_cb("".ptr, 0, final_cls.item_type, final_cls.content_type, 1, stream_cb_data);
+    // Send final callback (empty text, is_final=1).
+    _ = stream_cb("".ptr, 0, @intFromEnum(responses_mod.ItemType.message), @intFromEnum(ContentType.output_text), 1, stream_cb_data);
 
     // Map finish reason.
     const finish_reason: CFinishReason = switch (gen_result.finish_reason) {
@@ -1284,6 +1091,10 @@ fn buildOptions(
 
     // Pass through stop flag for cancellation support
     result.options.stop_flag = cfg.stop_flag;
+
+    // Pass through prefill progress callback
+    result.options.prefill_progress_fn = cfg.prefill_progress_fn;
+    result.options.prefill_progress_data = cfg.prefill_progress_data;
 
     // Tokenize stop sequences
     if (cfg.stop_sequences != null and cfg.stop_sequence_count > 0) {

@@ -235,18 +235,20 @@ def _print_expanded_cmd(args: argparse.Namespace, config: dict) -> None:
     parts = [f"python {sys.argv[0]}", args.scenario]
     if args.config:
         parts.append(f"--config {args.config}")
-    if args.samples is not None:
-        parts.append(f"--samples {args.samples}")
     is_eval = "evals/" in args.scenario
-    if not is_eval:
-        parts.append(f"--rounds {args.rounds}")
+    if is_eval:
+        samples_display = args.samples if args.samples is not None and args.samples >= 0 else -1
+        parts.append(f"--samples {samples_display}")
+    elif args.samples is not None:
+        parts.append(f"--samples {args.samples}")
+    parts.append(f"--rounds {args.rounds}")
     models = ",".join(config.get("model_uri", []))
     precs = ",".join(config.get("precision", []))
     parts.append(f"--set model_uri={models}")
     parts.append(f"--set precision={precs}")
     # Show all tunable params — explicit values and discoverable defaults.
     _EVAL_DEFAULTS = {
-        "max_reasoning_tokens": 0,
+        "max_reasoning_tokens": None,
         "seed": None,
         "temperature": None,
         "top_p": None,
@@ -296,7 +298,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # Eval scenarios: default to original precision, rounds=1, pass --samples.
     if "evals/" in args.scenario:
-        if args.samples is not None:
+        if args.samples is not None and args.samples >= 0:
             config["samples"] = args.samples
         # Default to original only (user can override with --set precision=...).
         precision_explicit = any(s.startswith("precision=") for s in args.set)
@@ -358,6 +360,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             )
 
     scenario = cls()
+    scenario.prepare_config(config)
     if not scenario.uses_model_matrix:
         # DB scenarios benchmark endpoint behavior, not model variants.
         config["model_uri"] = ["n/a"]
@@ -1039,7 +1042,7 @@ def main() -> None:
     run_p.add_argument("--port", type=int, default=18258, help="Server port (default: 18258).")
     run_p.add_argument("--rounds", "-r", type=int, default=5, help="Rounds per variant (default: 5).")
     run_p.add_argument("--samples", "-n", type=int, default=None,
-                        help="Number of eval samples (default: all). For eval scenarios only.")
+                        help="Number of eval samples (-1 = all, default: all). For eval scenarios only.")
     run_p.add_argument("--set", "-s", action="append", default=[], metavar="KEY=VALUE",
                         help="Override config value. Parsed as JSON, fallback to string. Repeatable.")
     run_p.add_argument("--env", "-e", action="append", default=[], metavar="KEY=VALUE",

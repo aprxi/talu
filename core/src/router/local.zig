@@ -950,12 +950,12 @@ pub const LocalEngine = struct {
             original_callback: ?inference_types.TokenCallback,
             original_data: ?*anyopaque,
 
-            fn wrap(request_id: u64, token: u32, is_final: bool, user_data: ?*anyopaque) void {
+            fn wrap(request_id: u64, token: u32, is_final: bool, in_thinking: bool, user_data: ?*anyopaque) void {
                 _ = request_id;
                 _ = is_final;
                 const wrapper: *@This() = @ptrCast(@alignCast(user_data));
                 if (wrapper.original_callback) |cb| {
-                    cb(token, wrapper.original_data);
+                    cb(token, in_thinking, wrapper.original_data);
                 }
             }
         };
@@ -1567,12 +1567,12 @@ pub const LocalEngine = struct {
             original_callback: ?inference_types.TokenCallback,
             original_data: ?*anyopaque,
 
-            fn wrap(request_id: u64, token: u32, is_final: bool, user_data: ?*anyopaque) void {
+            fn wrap(request_id: u64, token: u32, is_final: bool, in_thinking: bool, user_data: ?*anyopaque) void {
                 _ = request_id;
                 _ = is_final;
                 const wrapper: *@This() = @ptrCast(@alignCast(user_data));
                 if (wrapper.original_callback) |cb| {
-                    cb(token, wrapper.original_data);
+                    cb(token, in_thinking, wrapper.original_data);
                 }
             }
         };
@@ -1968,7 +1968,7 @@ test "GenerateOptions struct overrides" {
 
 test "GenerateOptions struct callback" {
     const TestCallback = struct {
-        fn callback(token_id: u32, user_data: ?*anyopaque) void {
+        fn callback(token_id: u32, _: bool, user_data: ?*anyopaque) void {
             if (user_data) |ptr| {
                 const count: *usize = @ptrCast(@alignCast(ptr));
                 count.* += 1;
@@ -1988,10 +1988,10 @@ test "GenerateOptions struct callback" {
     try std.testing.expect(opts.callback_data != null);
 
     // Call the callback to verify it works
-    opts.token_callback.?(42, opts.callback_data);
+    opts.token_callback.?(42, false, opts.callback_data);
     try std.testing.expectEqual(@as(usize, 1), call_count);
 
-    opts.token_callback.?(43, opts.callback_data);
+    opts.token_callback.?(43, false, opts.callback_data);
     try std.testing.expectEqual(@as(usize, 2), call_count);
 }
 

@@ -183,14 +183,15 @@ class Mmmu(Scenario):
     description = "MMMU — multimodal reasoning accuracy."
     endpoint = "POST /v1/responses"
 
+    def prepare_config(self, config: dict) -> None:
+        # Default to non-thinking mode (user can override with --set max_reasoning_tokens=N).
+        if "max_reasoning_tokens" not in config:
+            config["max_reasoning_tokens"] = 0
+
     def run(self, base_url: str, rounds: int, config: dict) -> list[dict]:
         samples_n: int | None = config.get("samples")
         if isinstance(samples_n, str):
             samples_n = int(samples_n)
-
-        # Default to non-thinking mode (user can override with --set max_reasoning_tokens=N).
-        if "max_reasoning_tokens" not in config:
-            config["max_reasoning_tokens"] = 0
 
         print("  Loading MMMU dataset ...", flush=True)
         samples = _load_dataset(samples_n)

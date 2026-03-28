@@ -2596,7 +2596,21 @@ fn build_segmented_output_json(
                     }
                 }
             }
-            // Reasoning (3): skip for chaining.
+            3 => {
+                // Reasoning: collect consecutive reasoning segments into a
+                // single reasoning item so the output includes thinking text.
+                let mut summary_text = String::new();
+                while i < segments.len() && segments[i].item_type == 3 {
+                    summary_text.push_str(&segments[i].text);
+                    i += 1;
+                }
+                if !summary_text.is_empty() {
+                    items.push(json!({
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": summary_text}]
+                    }));
+                }
+            }
             _ => {
                 i += 1;
             }

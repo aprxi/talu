@@ -197,6 +197,13 @@ class Scenario:
         """Extra CLI args for talu serve, derived from config."""
         return []
 
+    def prepare_config(self, config: dict) -> None:
+        """Apply scenario-specific defaults before the expanded command is printed.
+
+        Called once before run(). Subclasses override to inject defaults that
+        should be visible in the printed command line.
+        """
+
     def run(self, base_url: str, rounds: int, config: dict) -> list[dict]:
         """Execute the scenario. Return list of result dicts (one per round)."""
         raise NotImplementedError
