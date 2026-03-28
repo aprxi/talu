@@ -242,14 +242,29 @@ pub fn parseToolCallsFromText(allocator: std.mem.Allocator, text: []const u8) ![
     return result;
 }
 
-/// Parse Qwen3.5-style XML tool calls from text.
+/// Parse XML tool calls from model output.
 ///
-/// Format: <tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n...</function>\n</tool_call>
+/// Supports two formats:
+///   1. Wrapped:   <tool_call>\n<function=NAME>\n<parameter=P>V</parameter>\n</function>\n</tool_call>
+///   2. Unwrapped: <function=NAME>\n<parameter=P>V</parameter>\n</function>
+///
+/// Wrapped format is tried first. If no <tool_call> tags are found,
+/// falls back to scanning for bare <function=...> blocks directly.
 fn parseXmlToolCalls(allocator: std.mem.Allocator, text: []const u8) ![]ParsedToolCall {
+    // Try wrapped format first (<tool_call>...</tool_call>).
+    if (parseXmlWrapped(allocator, text)) |calls| {
+        if (calls.len > 0) return calls;
+    } else |_| {}
+
+    // Fallback: bare <function=...>...</function> blocks.
+    return parseXmlBare(allocator, text);
+}
+
+/// Parse <tool_call>-wrapped XML blocks.
+fn parseXmlWrapped(allocator: std.mem.Allocator, text: []const u8) ![]ParsedToolCall {
     const tag_start = "<tool_call>";
     const tag_end = "</tool_call>";
 
-    // Count tool_call blocks.
     var count: usize = 0;
     {
         var search = text;
@@ -282,12 +297,54 @@ fn parseXmlToolCalls(allocator: std.mem.Allocator, text: []const u8) ![]ParsedTo
         rest = rest[@min(block_end + tag_end.len, rest.len)..];
     }
 
-    if (ci == 0) {
-        // errdefer handles freeing `calls` on error return.
-        return ToolSchemaError.InvalidToolsJson;
+    if (ci == 0) return ToolSchemaError.InvalidToolsJson;
+
+    if (ci < count) {
+        const shrunk = try allocator.alloc(ParsedToolCall, ci);
+        @memcpy(shrunk, calls[0..ci]);
+        allocator.free(calls);
+        return shrunk;
+    }
+    return calls;
+}
+
+/// Parse bare <function=NAME>...</function> blocks (no <tool_call> wrapper).
+fn parseXmlBare(allocator: std.mem.Allocator, text: []const u8) ![]ParsedToolCall {
+    const func_open = "<function=";
+    const func_close = "</function>";
+
+    var count: usize = 0;
+    {
+        var search = text;
+        while (std.mem.indexOf(u8, search, func_open)) |pos| {
+            count += 1;
+            search = search[pos + func_open.len ..];
+        }
+    }
+    if (count == 0) return ToolSchemaError.InvalidToolsJson;
+
+    const calls = try allocator.alloc(ParsedToolCall, count);
+    var ci: usize = 0;
+    errdefer {
+        for (calls[0..ci]) |*c| c.deinit(allocator);
+        allocator.free(calls);
     }
 
-    // Shrink to actual count if fewer than expected.
+    var rest = text;
+    while (std.mem.indexOf(u8, rest, func_open)) |start_pos| {
+        const block_end_rel = std.mem.indexOf(u8, rest[start_pos..], func_close) orelse rest.len - start_pos;
+        const block = rest[start_pos .. start_pos + block_end_rel + func_close.len];
+
+        if (try parseOneXmlBlock(allocator, block)) |parsed| {
+            calls[ci] = parsed;
+            ci += 1;
+        }
+
+        rest = rest[@min(start_pos + block_end_rel + func_close.len, rest.len)..];
+    }
+
+    if (ci == 0) return ToolSchemaError.InvalidToolsJson;
+
     if (ci < count) {
         const shrunk = try allocator.alloc(ParsedToolCall, ci);
         @memcpy(shrunk, calls[0..ci]);
@@ -819,6 +876,57 @@ test "parseXmlToolCalls no tool_call tags returns error" {
     const allocator = std.testing.allocator;
     const result = parseXmlToolCalls(allocator, "Just some text without tool calls.");
     try std.testing.expectError(ToolSchemaError.InvalidToolsJson, result);
+}
+
+test "parseXmlToolCalls bare function block without tool_call wrapper" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\<function=solve_quadratic>
+        \\<parameter=a>2</parameter>
+        \\<parameter=b>6</parameter>
+        \\<parameter=c>5</parameter>
+        \\</function>
+    ;
+
+    const calls = try parseXmlToolCalls(allocator, text);
+    defer {
+        for (calls) |*c| {
+            var call = c.*;
+            call.deinit(allocator);
+        }
+        allocator.free(calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("solve_quadratic", calls[0].name);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 2), obj.get("a").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), obj.get("b").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), obj.get("c").?.integer);
+}
+
+test "parseXmlToolCalls multiple bare function blocks" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\<function=add><parameter=x>1</parameter></function>
+        \\<function=multiply><parameter=x>2</parameter></function>
+    ;
+
+    const calls = try parseXmlToolCalls(allocator, text);
+    defer {
+        for (calls) |*c| {
+            var call = c.*;
+            call.deinit(allocator);
+        }
+        allocator.free(calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), calls.len);
+    try std.testing.expectEqualStrings("add", calls[0].name);
+    try std.testing.expectEqualStrings("multiply", calls[1].name);
 }
 
 test "parseToolCallsFromText prefers XML over JSON" {
