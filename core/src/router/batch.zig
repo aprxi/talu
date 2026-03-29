@@ -155,6 +155,8 @@ const RequestState = struct {
     raw_output: bool = false,
     starts_in_reasoning: bool = false,
     engine_token_count: usize = 0,
+    chat: ?*Chat = null,
+    reasoning_tag: ?[]const u8 = null,
 
     // --- Text accumulation ---
     /// Full generated text (grows over lifetime of request).
@@ -267,6 +269,10 @@ pub const BatchWrapper = struct {
 
         // Check for raw output mode.
         state.raw_output = opts.raw_output;
+
+        // Store chat reference for commitGenerationResult in completeRequest.
+        state.chat = chat;
+        state.reasoning_tag = opts.reasoning_tag;
 
         // Pass through stop flag.
         state.stop_flag = opts.stop_flag;
@@ -530,6 +536,7 @@ pub const BatchWrapper = struct {
             // Decode token to raw bytes via pre-computed table (zero-alloc O(1) lookup).
             const decoded_raw: []const u8 = self.engine.tok.tokenBytes(raw.token) orelse "";
 
+
             // UTF-8 assembly (same algorithm as capi_bridge.zig).
             var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
             const pending_len: usize = state.utf8_pending_len;
@@ -572,56 +579,33 @@ pub const BatchWrapper = struct {
 
             if (valid.len == 0 and !raw.is_final) continue;
 
-            // Classify text via reasoning filter / tool mode.
-            // A decoded chunk can cross reasoning boundaries (e.g.
-            // "reasoning</think>answer"), so we emit per-segment typed deltas
-            // instead of assigning one type to the whole chunk.
-            var filter_segments: [MAX_FILTER_SEGMENTS]FilteredSegment = undefined;
-            var filtered_text: []const u8 = valid;
-            var segments: []const FilteredSegment = &.{};
-            if (!state.raw_output) {
-                const filter_result = filterReasoningTags(state, valid, &filter_segments);
-                filtered_text = filter_result.text;
-                segments = filter_result.segments;
-            } else if (valid.len > 0) {
-                filter_segments[0] = .{
-                    .start = 0,
-                    .len = valid.len,
-                    .filter_state = .normal,
-                };
-                segments = filter_segments[0..1];
-            }
+            // Classify using scheduler's in_thinking state (from TokenEvent).
+            // This is the single source of truth — no text-level tag parsing.
+            const token_types = classifyFromThinking(state, raw.in_thinking);
 
-            var final_types = classifySegment(state, state.filter_state);
-
-            // Accumulate text once, then emit per-segment events.
-            if (filtered_text.len > 0) {
-                try state.text_buf.appendSlice(allocator, filtered_text);
+            // Emit event for visible text.
+            if (valid.len > 0) {
+                try state.text_buf.appendSlice(allocator, valid);
                 const delta_base = state.delta_buf.items.len;
-                try state.delta_buf.appendSlice(allocator, filtered_text);
+                try state.delta_buf.appendSlice(allocator, valid);
 
-                for (segments) |seg| {
-                    if (seg.len == 0) continue;
-                    const seg_types = classifySegment(state, seg.filter_state);
-                    final_types = seg_types;
-                    if (event_count < events_out.len) {
-                        const elapsed_ns: i128 = if (step_now_ns > state.start_ns)
-                            step_now_ns - state.start_ns
-                        else
-                            0;
-                        events_out[event_count] = .{
-                            .request_id = raw.request_id,
-                            .event_type = .text_delta,
-                            .item_type = seg_types.item_type,
-                            .content_type = seg_types.content_type,
-                            .is_final = false,
-                            .text = state.delta_buf.items[delta_base + seg.start .. delta_base + seg.start + seg.len],
-                            .token_id = raw.token,
-                            .tokens_generated = state.engine_token_count,
-                            .timestamp_ns = elapsed_ns,
-                        };
-                        event_count += 1;
-                    }
+                if (event_count < events_out.len) {
+                    const elapsed_ns: i128 = if (step_now_ns > state.start_ns)
+                        step_now_ns - state.start_ns
+                    else
+                        0;
+                    events_out[event_count] = .{
+                        .request_id = raw.request_id,
+                        .event_type = .text_delta,
+                        .item_type = token_types.item_type,
+                        .content_type = token_types.content_type,
+                        .is_final = false,
+                        .text = state.delta_buf.items[delta_base..],
+                        .token_id = raw.token,
+                        .tokens_generated = state.engine_token_count,
+                        .timestamp_ns = elapsed_ns,
+                    };
+                    event_count += 1;
                 }
             }
 
@@ -639,8 +623,8 @@ pub const BatchWrapper = struct {
                     events_out[event_count] = .{
                         .request_id = raw.request_id,
                         .event_type = .completed,
-                        .item_type = final_types.item_type,
-                        .content_type = final_types.content_type,
+                        .item_type = token_types.item_type,
+                        .content_type = token_types.content_type,
                         .is_final = true,
                         .text = "",
                         .token_id = raw.token,
@@ -859,7 +843,7 @@ pub const BatchWrapper = struct {
         req_id: u64,
         token: u32,
         is_final: bool,
-        _: bool,
+        in_thinking: bool,
         data: ?*anyopaque,
     ) callconv(.c) void {
         const ctx: *DecodeLoopCtx = @ptrCast(@alignCast(data));
@@ -941,56 +925,35 @@ pub const BatchWrapper = struct {
 
         if (valid.len == 0 and !is_final) return;
 
-        // Reasoning tag filtering.
-        var filter_segments: [MAX_FILTER_SEGMENTS]FilteredSegment = undefined;
-        var filtered_text: []const u8 = valid;
-        var segments: []const FilteredSegment = &.{};
-        if (!state.raw_output) {
-            const filter_result = filterReasoningTags(state, valid, &filter_segments);
-            filtered_text = filter_result.text;
-            segments = filter_result.segments;
-        } else if (valid.len > 0) {
-            filter_segments[0] = .{ .start = 0, .len = valid.len, .filter_state = .normal };
-            segments = filter_segments[0..1];
-        }
+        // Classify using scheduler's in_thinking (single source of truth).
+        const token_types = classifyFromThinking(state, in_thinking);
 
-        var final_types = classifySegment(state, state.filter_state);
-
-        // Accumulate text and emit per-segment events.
-        if (filtered_text.len > 0) {
-            state.text_buf.appendSlice(allocator, filtered_text) catch {
+        // Accumulate text and emit event.
+        if (valid.len > 0) {
+            state.text_buf.appendSlice(allocator, valid) catch {
                 ctx.had_error = true;
                 return;
             };
 
-            // Emit one CEvent per segment directly (no BatchEvent intermediate).
-            for (segments) |seg| {
-                if (seg.len == 0) continue;
-                const seg_types = classifySegment(state, seg.filter_state);
-                final_types = seg_types;
-                const seg_text = filtered_text[seg.start .. seg.start + seg.len];
-                ctx.c_event_buf.* = std.mem.zeroes(CEvent);
-                ctx.c_event_buf.request_id = req_id;
-                ctx.c_event_buf.event_type = @intFromEnum(EventType.text_delta);
-                ctx.c_event_buf.item_type = seg_types.item_type;
-                ctx.c_event_buf.content_type = seg_types.content_type;
-                ctx.c_event_buf.is_final = 0;
-                ctx.c_event_buf.text_ptr = seg_text.ptr;
-                ctx.c_event_buf.text_len = seg_text.len;
-                ctx.c_event_buf.token_id = token;
-                ctx.c_event_buf.tokens_generated = state.engine_token_count;
-                ctx.outer_cb(@ptrCast(ctx.c_event_buf), 1, ctx.outer_cb_data);
-            }
+            ctx.c_event_buf.* = std.mem.zeroes(CEvent);
+            ctx.c_event_buf.request_id = req_id;
+            ctx.c_event_buf.event_type = @intFromEnum(EventType.text_delta);
+            ctx.c_event_buf.item_type = token_types.item_type;
+            ctx.c_event_buf.content_type = token_types.content_type;
+            ctx.c_event_buf.is_final = 0;
+            ctx.c_event_buf.text_ptr = valid.ptr;
+            ctx.c_event_buf.text_len = valid.len;
+            ctx.c_event_buf.token_id = token;
+            ctx.c_event_buf.tokens_generated = state.engine_token_count;
+            ctx.outer_cb(@ptrCast(ctx.c_event_buf), 1, ctx.outer_cb_data);
         }
 
         if (is_final) {
-            // Defer completed event — sent by runDecodeLoopSingle
-            // after completeRequest stores the BatchResult.
             var ev = std.mem.zeroes(CEvent);
             ev.request_id = req_id;
             ev.event_type = @intFromEnum(EventType.completed);
-            ev.item_type = final_types.item_type;
-            ev.content_type = final_types.content_type;
+            ev.item_type = token_types.item_type;
+            ev.content_type = token_types.content_type;
             ev.is_final = 1;
             ev.token_id = token;
             ev.tokens_generated = state.engine_token_count;
@@ -1042,9 +1005,21 @@ pub const BatchWrapper = struct {
         const result = try allocator.create(BatchResult);
         errdefer allocator.destroy(result);
 
-        // Copy accumulated text.
-        const text = if (state.text_buf.items.len > 0)
-            try allocator.dupe(u8, state.text_buf.items)
+        // Decode generated tokens using the full tokenizer pipeline.
+        // This produces text with reasoning tags (<think>/</ think>) intact
+        // (they have special=false so skip_special_tokens=true keeps them),
+        // while stripping truly special tokens (<|im_end|> etc.).
+        // commitGenerationResult's ReasoningParser needs the tags to
+        // correctly separate reasoning from response content.
+        const generated_tokens = self.scheduler.getGeneratedTokens(request_id) orelse &.{};
+        const text = if (generated_tokens.len > 0)
+            self.engine.tok.decode(generated_tokens) catch |err| blk: {
+                log.warn("batch", "tok.decode failed, falling back to text_buf", .{ .err = @errorName(err) });
+                break :blk if (state.text_buf.items.len > 0)
+                    try allocator.dupe(u8, state.text_buf.items)
+                else
+                    null;
+            }
         else
             null;
         errdefer if (text) |t| allocator.free(t);
@@ -1068,6 +1043,45 @@ pub const BatchWrapper = struct {
                 if (tool_calls != null and finish_reason != .tool_calls) {
                     actual_finish_reason = .tool_calls;
                 }
+            }
+        }
+
+        // Commit to conversation using the SAME path as CLI (local.zig).
+        // commitGenerationResult uses ReasoningParser to create proper
+        // reasoning + message items from the generated text.
+        if (state.chat) |chat| {
+            if (text) |generated_text| {
+                const fr_str = switch (actual_finish_reason) {
+                    .eos_token => "stop",
+                    .length => "length",
+                    .stop_sequence => "stop",
+                    .tool_calls => "tool_calls",
+                    .content_filter => "content_filter",
+                    .cancelled => "cancelled",
+                };
+                commit_mod.commitGenerationResult(self.engine.allocator, chat, .{
+                    .text = generated_text,
+                    .prompt_tokens = state.prompt_tokens,
+                    .completion_tokens = state.engine_token_count,
+                    .prefill_ns = prefill_ns,
+                    .generation_ns = generation_ns,
+                    .finish_reason = @ptrCast(fr_str),
+                    .reasoning_tag = state.reasoning_tag,
+                    .starts_in_reasoning = state.starts_in_reasoning,
+                    .tool_calls = if (tool_calls) |tc| blk: {
+                        var inputs = try allocator.alloc(commit_mod.ToolCallInput, tc.len);
+                        for (tc, 0..) |call, i| {
+                            inputs[i] = .{
+                                .id = if (call.call_id) |c| std.mem.sliceTo(c, 0) else "",
+                                .name = if (call.name) |n| std.mem.sliceTo(n, 0) else "",
+                                .arguments = if (call.arguments) |a| std.mem.sliceTo(a, 0) else "",
+                            };
+                        }
+                        break :blk inputs;
+                    } else &.{},
+                }) catch |err| {
+                    log.warn("batch", "commitGenerationResult failed", .{ .err = @errorName(err) });
+                };
             }
         }
 
@@ -1165,9 +1179,11 @@ const FilterResult = struct {
     segments: []const FilteredSegment,
 };
 
-fn classifySegment(
+/// Classify a token using the scheduler's in_thinking flag.
+/// Single source of truth — matches capi_bridge.zig StreamingWrapper.
+fn classifyFromThinking(
     state: *const RequestState,
-    filter_state: FilterState,
+    in_thinking: bool,
 ) struct { item_type: u8, content_type: u8 } {
     if (state.raw_output) {
         return .{
@@ -1175,7 +1191,7 @@ fn classifySegment(
             .content_type = @intFromEnum(ContentType.output_text),
         };
     }
-    if (filter_state == .reasoning) {
+    if (in_thinking) {
         return .{
             .item_type = @intFromEnum(ItemType.reasoning),
             .content_type = @intFromEnum(ContentType.reasoning_text),

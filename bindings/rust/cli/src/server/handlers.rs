@@ -1040,22 +1040,10 @@ async fn generate_response(
                 log::debug!(target: "server::gen", "completed (batch): prompt_tokens={} completion_tokens={}",
                     prompt_tokens, completion_tokens);
 
-                // Reconstruct conversation for chaining from segments.
-                // Tool calls come from BatchResult (parsed from generated text).
-                let tool_calls = batch_result.as_ref()
-                    .map(|r| r.tool_calls.as_slice())
-                    .unwrap_or(&[]);
-                let has_output = !segments.is_empty() || !tool_calls.is_empty();
-                if has_output {
-                    let output_json = build_segmented_output_json(&segments, tool_calls);
-                    log::debug!(target: "server::gen",
-                        "batch output: segments={} tool_calls={} output_json_len={}",
-                        segments.len(), tool_calls.len(), output_json.len());
-                    if let Err(e) = chat.load_responses_json(&output_json) {
-                        log::warn!(target: "server::gen",
-                            "batch chaining: load_responses_json failed: {e}");
-                    }
-                }
+                // The Zig batch path's completeRequest already called
+                // commitGenerationResult which populated the conversation
+                // with correct reasoning + message items. Read from the
+                // conversation directly — no segment-based reconstruction.
 
                 let all_json = chat
                     .to_responses_json(1)
@@ -2462,22 +2450,6 @@ fn run_batch_streaming_generation(
         }
     }
 
-    let pre_load_count = chat.item_count();
-    if let Ok(guard) = ctx.lock() {
-        if !guard.output_items.is_empty() {
-            let items_json =
-                serde_json::to_string(&guard.output_items).unwrap_or_else(|_| "[]".to_string());
-            log::debug!(target: "server::gen",
-                "batch stream: loading {} output items ({} bytes) into chat (pre_count={})",
-                guard.output_items.len(), items_json.len(), pre_load_count);
-            if let Err(e) = chat.load_responses_json(&items_json) {
-                log::warn!(target: "server::gen",
-                    "batch stream chaining: load_responses_json failed: {e}");
-            }
-            log::debug!(target: "server::gen",
-                "batch stream: post-load item_count={}", chat.item_count());
-        }
-    }
 
     let all_json = chat
         .to_responses_json(1)

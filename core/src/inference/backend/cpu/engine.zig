@@ -1117,8 +1117,10 @@ pub const FusedCpuBackend = struct {
             return err;
         };
 
-        // Reset after warmup so recurrent slot state never leaks into first user prefill.
-        self.resetSlot(0);
+        // Free slot after warmup so KV cache data from warmup never leaks
+        // into the first user prefill. freeSlot resets position AND marks
+        // the slot as inactive for clean reallocation.
+        self.freeSlot(0);
     }
 
     // =========================================================================

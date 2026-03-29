@@ -792,6 +792,8 @@ pub const LocalEngine = struct {
         // Use chat settings with optional overrides.
         // When max_completion_tokens is set without explicit max_tokens,
         // auto-compute: max_tokens = thinking_budget + max_completion_tokens.
+        // When max_completion_tokens is set without explicit max_tokens,
+        // auto-compute: max_tokens = thinking_budget + max_completion_tokens.
         const base_max_tokens = if (opts.max_completion_tokens != null and opts.max_tokens == null) blk: {
             const raw_budget = if (opts.max_reasoning_tokens) |mrt|
                 mrt
@@ -933,6 +935,7 @@ pub const LocalEngine = struct {
         defer self.allocator.free(prompt_tokens);
 
         const prompt_len = prompt_tokens.len;
+
         log.debug("inference", "Tokenization complete", .{ .prompt_tokens = prompt_len }, @src());
 
         // Create scheduler for this request
@@ -996,6 +999,7 @@ pub const LocalEngine = struct {
         else
             null;
         defer if (thinking_end_tokens) |t| self.allocator.free(t);
+
 
         // Generate synchronously
         log.debug("router", "generateSync starting", .{

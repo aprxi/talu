@@ -178,18 +178,22 @@ def _format_samples(ds) -> list[dict]:
 
 
 def _build_body(sample: dict, uri: str, config: dict) -> dict:
+    mrt = int(config.get("max_reasoning_tokens", 0))
+    # With reasoning enabled, the answer follows </think>\n\n so more
+    # completion tokens are needed. Default 1 is for no-think mode only.
+    mct_default = 10 if mrt > 0 else 1
+    mct = int(config.get("max_completion_tokens", mct_default))
     body: dict = {
         "model": uri,
         "input": sample["prompt"],
         "instructions": _INSTRUCTIONS,
-        "max_completion_tokens": 1,
+        "max_completion_tokens": mct,
+        "max_reasoning_tokens": mrt,
         "stream": False,
         "store": False,
     }
     if "max_tokens" in config:
         body["max_output_tokens"] = config["max_tokens"]
-    mrt = int(config.get("max_reasoning_tokens", 0))
-    body["max_reasoning_tokens"] = mrt
     for cfg_key, api_key in _API_FIELDS.items():
         if cfg_key in config:
             body[api_key] = config[cfg_key]

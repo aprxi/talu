@@ -249,6 +249,7 @@ def _print_expanded_cmd(args: argparse.Namespace, config: dict) -> None:
     # Show all tunable params — explicit values and discoverable defaults.
     _EVAL_DEFAULTS = {
         "max_reasoning_tokens": None,
+        "max_completion_tokens": None,
         "seed": None,
         "temperature": None,
         "top_p": None,
@@ -467,7 +468,7 @@ def print_report(
 
     # Line 2: parameters.
     param_parts = [f"rounds={rounds}"]
-    for key in ("seed", "temperature", "top_p", "top_k", "presence_penalty", "max_tokens"):
+    for key in ("seed", "temperature", "top_p", "top_k", "presence_penalty", "max_tokens", "max_completion_tokens"):
         if key in config:
             param_parts.append(f"{key}={config[key]}")
     for k, v in sorted(env_vars.items()):

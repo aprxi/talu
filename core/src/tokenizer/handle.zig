@@ -81,6 +81,7 @@ pub const TokenizerHandle = struct {
         // Add model-specific EOS tokens
         gen_config_mod.addEosFromTokenizer(allocator, tok.tokenizer_handle, &gen_config, "<end_of_turn>");
         gen_config_mod.addEosFromTokenizer(allocator, tok.tokenizer_handle, &gen_config, "<eos>");
+        gen_config_mod.addEosFromTokenizer(allocator, tok.tokenizer_handle, &gen_config, "<|im_end|>");
 
         // Resolve BOS token ID from string if configured
         const resolved_bos_id: ?i32 = if (gen_config.bos_token_str) |bos|

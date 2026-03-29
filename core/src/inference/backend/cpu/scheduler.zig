@@ -162,6 +162,8 @@ pub const TokenEvent = struct {
     token: u32,
     /// Whether this is the final token (EOS or max reached)
     is_final: bool,
+    /// Whether the token was generated during thinking/reasoning
+    in_thinking: bool,
     /// Slot index (for debugging)
     slot_index: usize,
 };
@@ -873,7 +875,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const decode_step_ns = decode_timer.read();
             self.addDecodeTimeToGeneratingRequests(decode_step_ns);
 
-            self.step_events.clearRetainingCapacity();
+            // Don't clear step_events — prefill first-token events were
+            // already appended by runPrefills() and must be preserved.
 
             for (0..decode_batch_size) |row_idx| {
                 const req = self.decode_requests[row_idx];
@@ -962,9 +965,18 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (finish_reason == .in_progress and request_entry.generating_answer and
                     request_entry.max_completion_tokens_limit > 0)
                 {
-                    request_entry.completion_token_count += 1;
-                    if (request_entry.completion_token_count >= request_entry.max_completion_tokens_limit) {
-                        finish_reason = .length;
+                    // Only count tokens that produce visible output.
+                    // Special tokens (e.g. <think>) decode to empty bytes
+                    // and should not consume the completion budget.
+                    const has_visible = if (self.config.tokenizer) |tok|
+                        (tok.tokenBytes(next_token) orelse &.{}).len > 0
+                    else
+                        true;
+                    if (has_visible) {
+                        request_entry.completion_token_count += 1;
+                        if (request_entry.completion_token_count >= request_entry.max_completion_tokens_limit) {
+                            finish_reason = .length;
+                        }
                     }
                 }
 
@@ -983,6 +995,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .request_id = request_entry.id,
                     .token = next_token,
                     .is_final = is_final_token,
+                    .in_thinking = request_entry.in_thinking,
                     .slot_index = req.slot_index,
                 });
 
@@ -1013,7 +1026,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // finish during prefill (e.g. max_tokens ≤ 1 or first token is EOS).
             const completed_before = self.completed_queue.items.len;
 
-            // First, prefill any requests that need it
+            // First, prefill any requests that need it.
+            // Collect first-token events for just-prefilled requests so they
+            // can be included in the step results (the decode methods clear
+            // step_events and would lose them otherwise).
+            self.step_events.clearRetainingCapacity();
             try self.runPrefills();
 
             const prefill_completed = self.completed_queue.items.len - completed_before;
@@ -1116,8 +1133,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const decode_step_ns = decode_timer.read();
             self.addDecodeTimeToGeneratingRequests(decode_step_ns);
 
-            // Sample next tokens and build events (reuse persistent buffer).
-            self.step_events.clearRetainingCapacity();
+            // Sample next tokens and build events.
+            // Don't clear step_events — prefill first-token events must be preserved.
 
             for (self.decode_results[0..decode_batch_size]) |result| {
                 if (result.slot_index >= self.slot_request_ids.len) continue;
@@ -1232,12 +1249,19 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }
 
                 // Completion token limit enforcement (answer tokens only).
+                // Special tokens that decode to empty bytes are not counted.
                 if (finish_reason == .in_progress and request_entry.generating_answer and
                     request_entry.max_completion_tokens_limit > 0)
                 {
-                    request_entry.completion_token_count += 1;
-                    if (request_entry.completion_token_count >= request_entry.max_completion_tokens_limit) {
-                        finish_reason = .length;
+                    const has_visible = if (self.config.tokenizer) |tok|
+                        (tok.tokenBytes(next_token) orelse &.{}).len > 0
+                    else
+                        true;
+                    if (has_visible) {
+                        request_entry.completion_token_count += 1;
+                        if (request_entry.completion_token_count >= request_entry.max_completion_tokens_limit) {
+                            finish_reason = .length;
+                        }
                     }
                 }
 
@@ -1260,6 +1284,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .request_id = request_entry.id,
                     .token = next_token,
                     .is_final = is_final_token,
+                    .in_thinking = request_entry.in_thinking,
                     .slot_index = result.slot_index,
                 });
 
@@ -1378,10 +1403,15 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
 
             // Completion token limit enforcement (answer tokens only).
+            // Special tokens that decode to empty bytes are not counted.
             if (finish_reason == .in_progress and request_entry.generating_answer and
                 request_entry.max_completion_tokens_limit > 0)
             {
-                request_entry.completion_token_count += 1;
+                const has_visible = if (self.config.tokenizer) |tok|
+                    (tok.tokenBytes(next_token) orelse &.{}).len > 0
+                else
+                    true;
+                if (has_visible) request_entry.completion_token_count += 1;
                 if (request_entry.completion_token_count >= request_entry.max_completion_tokens_limit) {
                     finish_reason = .length;
                 }
@@ -1401,12 +1431,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }
             }
 
-            // Build event.
-            self.step_events.clearRetainingCapacity();
+            // Build event. Don't clear — prefill first-token events must be preserved.
             try self.step_events.append(self.allocator, .{
                 .request_id = request_entry.id,
                 .token = next_token,
                 .is_final = is_final,
+                .in_thinking = false,
                 .slot_index = slot_index,
             });
 
@@ -1539,9 +1569,15 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (finish_reason == .in_progress and re.generating_answer and
                     re.max_completion_tokens_limit > 0)
                 {
-                    re.completion_token_count += 1;
-                    if (re.completion_token_count >= re.max_completion_tokens_limit) {
-                        finish_reason = .length;
+                    const has_visible = if (self.config.tokenizer) |tok|
+                        (tok.tokenBytes(next_token) orelse &.{}).len > 0
+                    else
+                        true;
+                    if (has_visible) {
+                        re.completion_token_count += 1;
+                        if (re.completion_token_count >= re.max_completion_tokens_limit) {
+                            finish_reason = .length;
+                        }
                     }
                 }
                 if (!re.in_thinking and !re.generating_answer) {
@@ -2105,8 +2141,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 try generated.append(self.allocator, current_token);
 
                 // Completion token limit enforcement.
+                // Special tokens that decode to empty bytes are not counted.
                 if (generating_answer) {
-                    completion_tokens += 1;
+                    const has_visible = if (self.config.tokenizer) |tok|
+                        (tok.tokenBytes(@intCast(current_token)) orelse &.{}).len > 0
+                    else
+                        true;
+                    if (has_visible) completion_tokens += 1;
                     if (max_completion_tokens > 0 and completion_tokens >= max_completion_tokens) {
                         finish_reason = .length;
                         if (submit_config.callback) |cb| {
@@ -2460,6 +2501,18 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     }
                 }
 
+                // Emit step event for the first token so batch consumers
+                // (which read step_events rather than callbacks) see it.
+                if (finish_reason != .stop_sequence) {
+                    try self.step_events.append(self.allocator, .{
+                        .request_id = request_entry.id,
+                        .token = first_token_id,
+                        .is_final = is_final_token,
+                        .in_thinking = request_entry.in_thinking,
+                        .slot_index = request_entry.slot_index orelse 0,
+                    });
+                }
+
                 if (is_final_token) {
                     if (request_entry.capture_final_logits and request_entry.final_logits.len == 0) {
                         request_entry.final_logits = try self.captureFinalLogits(true, self.logits_buffer);
@@ -2522,6 +2575,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .request_id = cid,
                     .token = last_token,
                     .is_final = true,
+                    .in_thinking = false,
                     .slot_index = 0,
                 });
             }
@@ -2612,6 +2666,7 @@ test "init Scheduler types" {
         .request_id = 1,
         .token = 42,
         .is_final = false,
+        .in_thinking = false,
         .slot_index = 0,
     };
     try std.testing.expectEqual(@as(u64, 1), event.request_id);
@@ -2682,6 +2737,7 @@ test "TokenEvent struct fields" {
         .request_id = std.math.maxInt(u64),
         .token = std.math.maxInt(u32),
         .is_final = true,
+        .in_thinking = true,
         .slot_index = std.math.maxInt(usize),
     };
 
@@ -2696,6 +2752,7 @@ test "TokenEvent struct is_final flag" {
         .request_id = 1,
         .token = 100,
         .is_final = false,
+        .in_thinking = false,
         .slot_index = 0,
     };
 
@@ -2703,6 +2760,7 @@ test "TokenEvent struct is_final flag" {
         .request_id = 1,
         .token = 0, // EOS token
         .is_final = true,
+        .in_thinking = false,
         .slot_index = 0,
     };
 
