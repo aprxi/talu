@@ -1398,6 +1398,24 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     if (self.kernel_registry.resolveFunction("dequant_i32_scales_split3", "talu_dequant_i32_scales_split3")) |resolved| {
         self.dequant_i32_scales_split3_function = resolved.function;
     } else |_| {}
+    if (self.kernel_registry.resolveFunction("quantize_f32_to_fp8_e4m3", "talu_quantize_f32_to_fp8_e4m3")) |resolved| {
+        self.quantize_f32_to_fp8_function = resolved.function;
+    } else |_| {}
+    if (self.kernel_registry.resolveFunction("scale_rows_f32", "talu_scale_rows_f32")) |resolved| {
+        self.scale_rows_f32_function = resolved.function;
+    } else |_| {}
+    if (self.kernel_registry.resolveFunction("fp8_e4m3_matvec_f32", "talu_fp8_e4m3_matvec_f32")) |resolved| {
+        self.fp8_matvec_function = resolved.function;
+    } else |_| {}
+    if (self.kernel_registry.resolveFunction("dequant_fp8_e4m3_to_bf16", "talu_dequant_fp8_e4m3_to_bf16")) |resolved| {
+        self.fp8_dequant_to_bf16_function = resolved.function;
+    } else |_| {}
+    if (self.kernel_registry.resolveFunction("fp8_e4m3_matvec_gate_up_silu_f32", "talu_fp8_e4m3_matvec_gate_up_silu_f32")) |resolved| {
+        self.fp8_matvec_gate_up_silu_function = resolved.function;
+    } else |_| {}
+    if (self.kernel_registry.resolveFunction("fp8_e4m3_matvec_gate_up_f32", "talu_fp8_e4m3_matvec_gate_up_f32")) |resolved| {
+        self.fp8_matvec_gate_up_function = resolved.function;
+    } else |_| {}
 
     const has_u8_dequant = self.gaffine_u8_dequant_f16_function != null;
     const has_u4_dequant = self.gaffine_u4_dequant_f16_function != null;
@@ -1956,6 +1974,14 @@ pub fn assignResolvedKernel(
             self.gated_delta_ssm_rows_ptrs_function = resolved.function;
             self.gated_delta_ssm_rows_ptrs_source = resolved.source;
         },
+        .gated_delta_ssm_rows_i8 => {
+            self.gated_delta_ssm_rows_i8_function = resolved.function;
+            self.gated_delta_ssm_rows_i8_source = resolved.source;
+        },
+        .gated_delta_ssm_rows_ptrs_i8 => {
+            self.gated_delta_ssm_rows_ptrs_i8_function = resolved.function;
+            self.gated_delta_ssm_rows_ptrs_i8_source = resolved.source;
+        },
         .gated_delta_rmsnorm_silu_mul => {
             self.gated_delta_rmsnorm_silu_mul_function = resolved.function;
             self.gated_delta_rmsnorm_silu_mul_source = resolved.source;
@@ -2012,6 +2038,10 @@ pub fn assignResolvedKernel(
             self.gaffine_u4_matvec_function = resolved.function;
             self.gaffine_u4_matvec_source = resolved.source;
         },
+        .gaffine_u4_matvec_tile8 => {
+            self.gaffine_u4_matvec_tile8_function = resolved.function;
+            self.gaffine_u4_matvec_tile8_source = resolved.source;
+        },
         .gaffine_u8_matvec => {
             self.gaffine_u8_matvec_function = resolved.function;
             self.gaffine_u8_matvec_source = resolved.source;
@@ -2024,6 +2054,10 @@ pub fn assignResolvedKernel(
             self.gaffine_u4_matvec_qkv_function = resolved.function;
             self.gaffine_u4_matvec_qkv_source = resolved.source;
         },
+        .gaffine_u4_matvec_qkv_tile8 => {
+            self.gaffine_u4_matvec_qkv_tile8_function = resolved.function;
+            self.gaffine_u4_matvec_qkv_tile8_source = resolved.source;
+        },
         .gaffine_u8_matvec_qkv => {
             self.gaffine_u8_matvec_qkv_function = resolved.function;
             self.gaffine_u8_matvec_qkv_source = resolved.source;
@@ -2035,6 +2069,10 @@ pub fn assignResolvedKernel(
         .gaffine_u4_matvec_gate_up_silu => {
             self.gaffine_u4_matvec_gate_up_silu_function = resolved.function;
             self.gaffine_u4_matvec_gate_up_silu_source = resolved.source;
+        },
+        .gaffine_u4_matvec_gate_up_silu_tile8 => {
+            self.gaffine_u4_matvec_gate_up_silu_tile8_function = resolved.function;
+            self.gaffine_u4_matvec_gate_up_silu_tile8_source = resolved.source;
         },
         .gaffine_u8_matvec_gate_up_silu => {
             self.gaffine_u8_matvec_gate_up_silu_function = resolved.function;

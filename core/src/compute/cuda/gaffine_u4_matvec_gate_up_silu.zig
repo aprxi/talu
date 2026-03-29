@@ -11,9 +11,12 @@ const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
 pub const embedded_symbol: [:0]const u8 = "talu_gaffine_u4_matvec_gate_up_silu_f32";
 pub const op_name: []const u8 = "gaffine_u4_matvec_gate_up_silu_f32";
+pub const embedded_symbol_tile8: [:0]const u8 = "talu_gaffine_u4_matvec_gate_up_silu_f32_tile8";
+pub const op_name_tile8: []const u8 = "gaffine_u4_matvec_gate_up_silu_f32_tile8";
 const warp_size: u32 = 32;
 const block_x: u32 = 128;
 const inner_batch_rows: u32 = 4;
+const inner_batch_rows_tile8: u32 = 8;
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,
@@ -35,7 +38,95 @@ pub fn runWithFunction(
     in_dim: u32,
     batch_rows: u32,
 ) !void {
+    return runWithFunctionBatchTile(
+        arg_pack,
+        device,
+        function,
+        input,
+        gate_packed_weight,
+        gate_scales,
+        gate_biases,
+        up_packed_weight,
+        up_scales,
+        up_biases,
+        out,
+        out_dim,
+        gate_group_size,
+        gate_scales_dtype_tag,
+        up_group_size,
+        up_scales_dtype_tag,
+        in_dim,
+        batch_rows,
+        inner_batch_rows,
+    );
+}
+
+pub fn runWithFunctionTile8(
+    arg_pack: *args_mod.ArgPack,
+    device: *device_mod.Device,
+    function: module_mod.Function,
+    input: *const device_mod.Buffer,
+    gate_packed_weight: *const device_mod.Buffer,
+    gate_scales: *const device_mod.Buffer,
+    gate_biases: *const device_mod.Buffer,
+    up_packed_weight: *const device_mod.Buffer,
+    up_scales: *const device_mod.Buffer,
+    up_biases: *const device_mod.Buffer,
+    out: *device_mod.Buffer,
+    out_dim: u32,
+    gate_group_size: u32,
+    gate_scales_dtype_tag: u32,
+    up_group_size: u32,
+    up_scales_dtype_tag: u32,
+    in_dim: u32,
+    batch_rows: u32,
+) !void {
+    return runWithFunctionBatchTile(
+        arg_pack,
+        device,
+        function,
+        input,
+        gate_packed_weight,
+        gate_scales,
+        gate_biases,
+        up_packed_weight,
+        up_scales,
+        up_biases,
+        out,
+        out_dim,
+        gate_group_size,
+        gate_scales_dtype_tag,
+        up_group_size,
+        up_scales_dtype_tag,
+        in_dim,
+        batch_rows,
+        inner_batch_rows_tile8,
+    );
+}
+
+fn runWithFunctionBatchTile(
+    arg_pack: *args_mod.ArgPack,
+    device: *device_mod.Device,
+    function: module_mod.Function,
+    input: *const device_mod.Buffer,
+    gate_packed_weight: *const device_mod.Buffer,
+    gate_scales: *const device_mod.Buffer,
+    gate_biases: *const device_mod.Buffer,
+    up_packed_weight: *const device_mod.Buffer,
+    up_scales: *const device_mod.Buffer,
+    up_biases: *const device_mod.Buffer,
+    out: *device_mod.Buffer,
+    out_dim: u32,
+    gate_group_size: u32,
+    gate_scales_dtype_tag: u32,
+    up_group_size: u32,
+    up_scales_dtype_tag: u32,
+    in_dim: u32,
+    batch_rows: u32,
+    batch_tile_rows: u32,
+) !void {
     try validateArgs(input, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out, out_dim, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, batch_rows);
+    if (batch_tile_rows == 0) return error.InvalidArgument;
 
     arg_pack.reset();
     try arg_pack.appendBufferPtr(input);
@@ -57,7 +148,7 @@ pub fn runWithFunction(
     const rows_per_block = block_x / warp_size;
     try launch_mod.launchWithFamily(device, function, .{
         .grid_x = ceilDiv(out_dim, rows_per_block),
-        .grid_y = ceilDiv(batch_rows, inner_batch_rows),
+        .grid_y = ceilDiv(batch_rows, batch_tile_rows),
         .block_x = block_x,
     }, arg_pack, .matvec_gate_up_silu);
 }

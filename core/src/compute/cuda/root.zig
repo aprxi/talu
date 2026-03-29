@@ -89,6 +89,8 @@ pub const gated_delta_qk_norm = @import("gated_delta_qk_norm.zig");
 pub const gated_delta_ssm = @import("gated_delta_ssm.zig");
 pub const gated_delta_ssm_rows = @import("gated_delta_ssm_rows.zig");
 pub const gated_delta_ssm_rows_ptrs = @import("gated_delta_ssm_rows_ptrs.zig");
+pub const gated_delta_ssm_rows_i8 = @import("gated_delta_ssm_rows_i8.zig");
+pub const gated_delta_ssm_rows_ptrs_i8 = @import("gated_delta_ssm_rows_ptrs_i8.zig");
 pub const gated_delta_rmsnorm_silu_mul = @import("gated_delta_rmsnorm_silu_mul.zig");
 pub const gated_delta_rmsnorm_silu_mul_rows = @import("gated_delta_rmsnorm_silu_mul_rows.zig");
 pub const matmul_u16 = @import("matmul_u16.zig");
@@ -188,6 +190,8 @@ test {
     _ = gated_delta_ssm;
     _ = gated_delta_ssm_rows;
     _ = gated_delta_ssm_rows_ptrs;
+    _ = gated_delta_ssm_rows_i8;
+    _ = gated_delta_ssm_rows_ptrs_i8;
     _ = gated_delta_rmsnorm_silu_mul;
     _ = gated_delta_rmsnorm_silu_mul_rows;
     _ = matmul_u16;

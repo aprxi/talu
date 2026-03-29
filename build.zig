@@ -970,7 +970,6 @@ pub fn build(b: *std.Build) void {
         "TrainingSession",
         "capi_bridge",
     });
-
     // Build integration tests against a separate copy of core/src/lib.zig.
     // Keep integration on CPU-only to avoid MLX/Metal runtime coupling and
     // ensure deterministic behavior across host GPU setups.

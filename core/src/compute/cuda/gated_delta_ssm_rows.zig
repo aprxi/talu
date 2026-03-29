@@ -11,6 +11,7 @@ pub const embedded_module = cuda_assets.kernels_fatbin;
 pub const embedded_symbol: [:0]const u8 = "talu_gated_delta_ssm_rows_f32";
 pub const op_name: []const u8 = "gated_delta_ssm_rows_f32";
 const out_tile: u32 = 32;
+const warp_size: u32 = 32;
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,
@@ -48,10 +49,7 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, a_offset);
     try arg_pack.appendScalar(u32, out_row_stride);
 
-    const block_x: u32 = blk: {
-        const multi = @min(d_head, out_tile * 4);
-        break :blk if (multi >= 32) multi else @min(d_head, out_tile);
-    };
+    const block_x = blockSizeForDHead(d_head);
     const shared_bytes = std.math.mul(usize, 2 * @as(usize, d_head), @sizeOf(f32)) catch return error.InvalidArgument;
     const tiles_per_head = ceilDiv(d_head, out_tile);
     try launch_mod.launchWithFamily(device, function, .{
@@ -109,7 +107,19 @@ fn ceilDiv(numerator: u32, denominator: u32) u32 {
     return (numerator + denominator - 1) / denominator;
 }
 
+fn blockSizeForDHead(d_head: u32) u32 {
+    _ = d_head;
+    return warp_size * 4;
+}
+
 test "validateArgs rejects invalid row stride and offsets" {
     const buf = device_mod.Buffer{ .pointer = 0, .size = 4096 };
     try std.testing.expectError(error.InvalidArgument, validateArgs(&buf, &buf, null, &buf, &buf, 1, 2, 8, 2, 8, 7, 9, 16));
+}
+
+test "blockSizeForDHead rounds up to full warps" {
+    try std.testing.expectEqual(@as(u32, 128), blockSizeForDHead(1));
+    try std.testing.expectEqual(@as(u32, 128), blockSizeForDHead(32));
+    try std.testing.expectEqual(@as(u32, 128), blockSizeForDHead(80));
+    try std.testing.expectEqual(@as(u32, 128), blockSizeForDHead(128));
 }

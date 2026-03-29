@@ -150,6 +150,22 @@ pub fn resolveCudaStrictMemoryMode() bool {
     return resolveEnvBool("TALU_CUDA_STRICT_MEMORY", false);
 }
 
+pub fn resolveCudaGaffineU4Tile8Decode() bool {
+    return resolveEnvBool("TALU_CUDA_GAFFINE_U4_TILE8", false);
+}
+
+pub fn resolveCudaGaffineU4DecodeI8() bool {
+    return resolveEnvBool("TALU_CUDA_GAFFINE_U4_DECODE_I8", true);
+}
+
+pub fn resolveCudaGatedDeltaSsmI8State(default_value: bool) bool {
+    return resolveEnvBool("TALU_CUDA_GD_SSM_I8_STATE", default_value);
+}
+
+pub fn resolveCudaQuantizeFp8() bool {
+    return resolveEnvBool("TALU_CUDA_QUANTIZE_FP8", false);
+}
+
 pub fn resolveCudaMemoryReserveBytes() usize {
     const raw = std.process.getEnvVarOwned(std.heap.c_allocator, "TALU_CUDA_MEMORY_RESERVE_MIB") catch {
         return 0;
@@ -305,6 +321,8 @@ pub const KernelSlot = enum {
     gated_delta_ssm,
     gated_delta_ssm_rows,
     gated_delta_ssm_rows_ptrs,
+    gated_delta_ssm_rows_i8,
+    gated_delta_ssm_rows_ptrs_i8,
     gated_delta_rmsnorm_silu_mul,
     gated_delta_rmsnorm_silu_mul_rows,
     argmax,
@@ -319,12 +337,15 @@ pub const KernelSlot = enum {
     matvec_qkv_f16,
     matvec_qkv_bf16,
     gaffine_u4_matvec,
+    gaffine_u4_matvec_tile8,
     gaffine_u8_matvec,
     gaffine_u4_matvec_gate_up,
     gaffine_u4_matvec_qkv,
+    gaffine_u4_matvec_qkv_tile8,
     gaffine_u8_matvec_qkv,
     gaffine_u8_matvec_gate_up,
     gaffine_u4_matvec_gate_up_silu,
+    gaffine_u4_matvec_gate_up_silu_tile8,
     gaffine_u8_matvec_gate_up_silu,
     gaffine_u4_dequant_f16,
     gaffine_u8_dequant_f16,
@@ -446,6 +467,8 @@ pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .gated_delta_ssm, .op_name = compute.cuda.gated_delta_ssm.op_name, .embedded_symbol = compute.cuda.gated_delta_ssm.embedded_symbol },
     .{ .slot = .gated_delta_ssm_rows, .op_name = compute.cuda.gated_delta_ssm_rows.op_name, .embedded_symbol = compute.cuda.gated_delta_ssm_rows.embedded_symbol },
     .{ .slot = .gated_delta_ssm_rows_ptrs, .op_name = compute.cuda.gated_delta_ssm_rows_ptrs.op_name, .embedded_symbol = compute.cuda.gated_delta_ssm_rows_ptrs.embedded_symbol },
+    .{ .slot = .gated_delta_ssm_rows_i8, .op_name = compute.cuda.gated_delta_ssm_rows_i8.op_name, .embedded_symbol = compute.cuda.gated_delta_ssm_rows_i8.embedded_symbol },
+    .{ .slot = .gated_delta_ssm_rows_ptrs_i8, .op_name = compute.cuda.gated_delta_ssm_rows_ptrs_i8.op_name, .embedded_symbol = compute.cuda.gated_delta_ssm_rows_ptrs_i8.embedded_symbol },
     .{ .slot = .gated_delta_rmsnorm_silu_mul, .op_name = compute.cuda.gated_delta_rmsnorm_silu_mul.op_name, .embedded_symbol = compute.cuda.gated_delta_rmsnorm_silu_mul.embedded_symbol },
     .{ .slot = .gated_delta_rmsnorm_silu_mul_rows, .op_name = compute.cuda.gated_delta_rmsnorm_silu_mul_rows.op_name, .embedded_symbol = compute.cuda.gated_delta_rmsnorm_silu_mul_rows.embedded_symbol },
     .{ .slot = .argmax, .op_name = compute.cuda.argmax.op_name, .embedded_symbol = compute.cuda.argmax.embedded_symbol },
@@ -460,12 +483,15 @@ pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .matvec_qkv_f16, .op_name = compute.cuda.matvec_u16_qkv.op_name_f16, .embedded_symbol = compute.cuda.matvec_u16_qkv.embedded_symbol_f16 },
     .{ .slot = .matvec_qkv_bf16, .op_name = compute.cuda.matvec_u16_qkv.op_name_bf16, .embedded_symbol = compute.cuda.matvec_u16_qkv.embedded_symbol_bf16 },
     .{ .slot = .gaffine_u4_matvec, .op_name = compute.cuda.gaffine_u4_matvec.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec.embedded_symbol },
+    .{ .slot = .gaffine_u4_matvec_tile8, .op_name = compute.cuda.gaffine_u4_matvec.op_name_tile8, .embedded_symbol = compute.cuda.gaffine_u4_matvec.embedded_symbol_tile8 },
     .{ .slot = .gaffine_u8_matvec, .op_name = compute.cuda.gaffine_u8_matvec.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec.embedded_symbol },
     .{ .slot = .gaffine_u4_matvec_gate_up, .op_name = compute.cuda.gaffine_u4_matvec_gate_up.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec_gate_up.embedded_symbol },
     .{ .slot = .gaffine_u4_matvec_qkv, .op_name = compute.cuda.gaffine_u4_matvec_qkv.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec_qkv.embedded_symbol },
+    .{ .slot = .gaffine_u4_matvec_qkv_tile8, .op_name = compute.cuda.gaffine_u4_matvec_qkv.op_name_tile8, .embedded_symbol = compute.cuda.gaffine_u4_matvec_qkv.embedded_symbol_tile8 },
     .{ .slot = .gaffine_u8_matvec_qkv, .op_name = compute.cuda.gaffine_u8_matvec_qkv.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec_qkv.embedded_symbol },
     .{ .slot = .gaffine_u8_matvec_gate_up, .op_name = compute.cuda.gaffine_u8_matvec_gate_up.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec_gate_up.embedded_symbol },
     .{ .slot = .gaffine_u4_matvec_gate_up_silu, .op_name = compute.cuda.gaffine_u4_matvec_gate_up_silu.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec_gate_up_silu.embedded_symbol },
+    .{ .slot = .gaffine_u4_matvec_gate_up_silu_tile8, .op_name = compute.cuda.gaffine_u4_matvec_gate_up_silu.op_name_tile8, .embedded_symbol = compute.cuda.gaffine_u4_matvec_gate_up_silu.embedded_symbol_tile8 },
     .{ .slot = .gaffine_u8_matvec_gate_up_silu, .op_name = compute.cuda.gaffine_u8_matvec_gate_up_silu.op_name, .embedded_symbol = compute.cuda.gaffine_u8_matvec_gate_up_silu.embedded_symbol },
     .{ .slot = .gaffine_u4_dequant_f16, .op_name = compute.cuda.gaffine_u4_dequantize_f16.op_name, .embedded_symbol = compute.cuda.gaffine_u4_dequantize_f16.embedded_symbol },
     .{ .slot = .gaffine_u8_dequant_f16, .op_name = compute.cuda.gaffine_u8_dequantize_f16.op_name, .embedded_symbol = compute.cuda.gaffine_u8_dequantize_f16.embedded_symbol },
@@ -574,11 +600,34 @@ pub const U16LinearWeight = struct {
     }
 };
 
+pub const Fp8LinearWeight = struct {
+    rows: usize,
+    cols: usize,
+    buffer: compute.cuda.Buffer,
+    /// GPU buffer holding BF16 per-block scales [scale_rows × scale_cols]
+    scales_buffer: compute.cuda.Buffer,
+    scale_rows: u32,
+    scale_cols: u32,
+    block_size: u32,
+    /// Per-tensor scale (used only when scale_rows == 1 && scale_cols == 1)
+    weight_scale_inv: f32,
+
+    pub fn deinit(self: *Fp8LinearWeight, device: *compute.cuda.Device) void {
+        if (self.scales_buffer.size > 0) self.scales_buffer.deinit(device);
+        self.buffer.deinit(device);
+    }
+
+    pub fn byteSize(self: *const Fp8LinearWeight) usize {
+        return self.buffer.size + self.scales_buffer.size;
+    }
+};
+
 pub const LinearWeight = union(enum) {
     dense_f32: DeviceTensor,
     dense_u16: U16LinearWeight,
     gaffine_u4: GaffineU4LinearWeight,
     gaffine_u8: GaffineU8LinearWeight,
+    fp8: Fp8LinearWeight,
 
     pub fn deinit(self: *LinearWeight, device: *compute.cuda.Device) void {
         switch (self.*) {
@@ -586,6 +635,7 @@ pub const LinearWeight = union(enum) {
             .dense_u16 => |*w| w.deinit(device),
             .gaffine_u4 => |*w| w.deinit(device),
             .gaffine_u8 => |*w| w.deinit(device),
+            .fp8 => |*w| w.deinit(device),
         }
     }
 
@@ -595,6 +645,7 @@ pub const LinearWeight = union(enum) {
             .dense_u16 => |w| w.rows,
             .gaffine_u4 => |w| w.rows,
             .gaffine_u8 => |w| w.rows,
+            .fp8 => |w| w.rows,
         };
     }
 
@@ -604,6 +655,7 @@ pub const LinearWeight = union(enum) {
             .dense_u16 => |w| w.cols,
             .gaffine_u4 => |w| w.cols,
             .gaffine_u8 => |w| w.cols,
+            .fp8 => |w| w.cols,
         };
     }
 
@@ -613,6 +665,7 @@ pub const LinearWeight = union(enum) {
             .dense_u16 => |w| w.byteSize(),
             .gaffine_u4 => |w| w.byteSize(),
             .gaffine_u8 => |w| w.byteSize(),
+            .fp8 => |w| w.byteSize(),
         };
     }
 };
@@ -1318,6 +1371,11 @@ pub const ShortConvBlockRuntime = struct {
     }
 };
 
+pub const GatedDeltaSsmStateFormat = enum(u8) {
+    f32,
+    i8_per_column_scale,
+};
+
 pub const GatedDeltaBlockRuntime = struct {
     d_ff: usize,
     ln1_weight: DeviceTensor,
@@ -1335,6 +1393,8 @@ pub const GatedDeltaBlockRuntime = struct {
     dt_bias: ?DeviceTensor = null,
     norm_weight: DeviceTensor,
     ssm_state_dev: compute.cuda.Buffer,
+    ssm_state_format: GatedDeltaSsmStateFormat = .f32,
+    ssm_state_scales_offset: u32 = 0,
     kernel: cpu_kernels.GatedDeltaKernel,
     state: cpu_kernels.GatedDeltaState,
     scratch: cpu_kernels.GatedDeltaScratch,
@@ -1360,6 +1420,23 @@ pub const GatedDeltaBlockRuntime = struct {
         self.matmul_scratch.deinit();
         if (self.ln2_weight) |*w| w.deinit(device);
         self.ln1_weight.deinit(device);
+    }
+
+    pub fn ssmStateDataBytes(self: *const GatedDeltaBlockRuntime) !usize {
+        const d_head = @as(usize, self.kernel.config.d_head);
+        const d_inner = @as(usize, self.kernel.config.n_heads) * d_head;
+        const elems = std.math.mul(usize, d_inner, d_head) catch return error.InvalidArgument;
+        return switch (self.ssm_state_format) {
+            .f32 => std.math.mul(usize, elems, @sizeOf(f32)) catch return error.InvalidArgument,
+            .i8_per_column_scale => elems,
+        };
+    }
+
+    pub fn ssmStateScalesCount(self: *const GatedDeltaBlockRuntime) usize {
+        return switch (self.ssm_state_format) {
+            .f32 => 0,
+            .i8_per_column_scale => @as(usize, self.kernel.config.n_heads) * @as(usize, self.kernel.config.d_head),
+        };
     }
 };
 
@@ -2027,9 +2104,22 @@ pub const BlockRuntime = struct {
         loaded: *const LoadedModel,
         max_seq_len: usize,
         kv_init_tokens: usize,
+        gated_delta_ssm_i8_state: bool,
         adapter_table: anytype,
+        kv_cache_dtype: KvCacheDtype,
     ) !BlockRuntime {
-        return initRange(allocator, device, loaded, max_seq_len, kv_init_tokens, 0, loaded.blocks.len, adapter_table);
+        return initRange(
+            allocator,
+            device,
+            loaded,
+            max_seq_len,
+            kv_init_tokens,
+            0,
+            loaded.blocks.len,
+            gated_delta_ssm_i8_state,
+            adapter_table,
+            kv_cache_dtype,
+        );
     }
 
     /// Initialize a BlockRuntime for a contiguous range of decoder layers
@@ -2043,6 +2133,7 @@ pub const BlockRuntime = struct {
         kv_init_tokens: usize,
         layer_start: usize,
         layer_end: usize,
+        gated_delta_ssm_i8_state: bool,
         adapter_table: anytype,
         kv_cache_dtype: KvCacheDtype,
     ) !BlockRuntime {
@@ -2663,8 +2754,13 @@ pub const BlockRuntime = struct {
                         norm.deinit(device);
                     }
 
-                    const in_proj_dispatch = try compute.cpu.linalg.matmulKernel(gated_delta.weights.in_proj.dtype);
-                    const out_proj_dispatch = try compute.cpu.linalg.matmulKernel(gated_delta.weights.out_proj.dtype);
+                    // CPU matmul dispatchers for the GatedDeltaKernel struct. The CUDA engine
+                    // never calls these (GPU handles all matmul), but the struct requires them.
+                    // Fall back to matmulF32 for dtypes without a CPU kernel (e.g. FP8).
+                    const in_proj_fn = (compute.cpu.linalg.matmulKernel(gated_delta.weights.in_proj.dtype) catch
+                        compute.cpu.linalg.DispatchedKernel{ .func = compute.cpu.linalg.matmulF32, .name = "matmulF32" }).func;
+                    const out_proj_fn = (compute.cpu.linalg.matmulKernel(gated_delta.weights.out_proj.dtype) catch
+                        compute.cpu.linalg.DispatchedKernel{ .func = compute.cpu.linalg.matmulF32, .name = "matmulF32" }).func;
                     var gated_delta_kernel = cpu_kernels.GatedDeltaKernel.init(
                         gated_delta_kernel_config,
                         .{
@@ -2676,8 +2772,8 @@ pub const BlockRuntime = struct {
                             .norm_weight = gated_delta.weights.norm_weight,
                             .out_proj = gated_delta.weights.out_proj,
                         },
-                        in_proj_dispatch.func,
-                        out_proj_dispatch.func,
+                        in_proj_fn,
+                        out_proj_fn,
                     );
                     gated_delta_kernel.layer_idx = @intCast(layer_idx);
                     try gated_delta_kernel.initTransposedWeights(allocator);
@@ -2702,13 +2798,50 @@ pub const BlockRuntime = struct {
                     defer allocator.free(zero_conv);
                     @memset(zero_conv, 0.0);
                     try conv_state_dev.upload(device, std.mem.sliceAsBytes(zero_conv));
-                    const ssm_state_bytes = gated_delta_state.ssm_state.len * @sizeOf(f32);
-                    var ssm_state_dev = try device.allocBuffer(ssm_state_bytes);
-                    errdefer ssm_state_dev.deinit(device);
-                    const zero_ssm = try allocator.alloc(f32, gated_delta_state.ssm_state.len);
-                    defer allocator.free(zero_ssm);
-                    @memset(zero_ssm, 0.0);
-                    try ssm_state_dev.upload(device, std.mem.sliceAsBytes(zero_ssm));
+                    const ssm_state_format: GatedDeltaSsmStateFormat = if (gated_delta_ssm_i8_state)
+                        .i8_per_column_scale
+                    else
+                        .f32;
+                    var ssm_state_scales_offset_bytes: usize = 0;
+                    var ssm_state_storage_bytes: usize = 0;
+                    var ssm_state_dev: compute.cuda.Buffer = undefined;
+                    switch (ssm_state_format) {
+                        .f32 => {
+                            const ssm_state_bytes = gated_delta_state.ssm_state.len * @sizeOf(f32);
+                            ssm_state_storage_bytes = ssm_state_bytes;
+                            ssm_state_dev = try device.allocBuffer(ssm_state_bytes);
+                            errdefer ssm_state_dev.deinit(device);
+                            const zero_ssm = try allocator.alloc(f32, gated_delta_state.ssm_state.len);
+                            defer allocator.free(zero_ssm);
+                            @memset(zero_ssm, 0.0);
+                            try ssm_state_dev.upload(device, std.mem.sliceAsBytes(zero_ssm));
+                        },
+                        .i8_per_column_scale => {
+                            const d_inner = @as(usize, gated_delta.config.n_heads) * @as(usize, gated_delta.config.d_head);
+                            const ssm_state_i8_bytes = gated_delta_state.ssm_state.len;
+                            const ssm_scales_bytes = std.math.mul(usize, d_inner, @sizeOf(f32)) catch return error.InvalidArgument;
+                            ssm_state_scales_offset_bytes = std.mem.alignForward(usize, ssm_state_i8_bytes, @alignOf(f32));
+                            ssm_state_storage_bytes = std.math.add(
+                                usize,
+                                ssm_state_scales_offset_bytes,
+                                ssm_scales_bytes,
+                            ) catch return error.InvalidArgument;
+                            ssm_state_dev = try device.allocBuffer(ssm_state_storage_bytes);
+                            errdefer ssm_state_dev.deinit(device);
+
+                            const zero_ssm = try allocator.alloc(i8, gated_delta_state.ssm_state.len);
+                            defer allocator.free(zero_ssm);
+                            @memset(zero_ssm, 0);
+                            var ssm_state_i8_dev = try bufferSlice(&ssm_state_dev, 0, ssm_state_i8_bytes);
+                            try ssm_state_i8_dev.upload(device, std.mem.sliceAsBytes(zero_ssm));
+
+                            const init_scales = try allocator.alloc(f32, d_inner);
+                            defer allocator.free(init_scales);
+                            @memset(init_scales, 1.0);
+                            var ssm_state_scales_dev = try bufferSlice(&ssm_state_dev, ssm_state_scales_offset_bytes, ssm_scales_bytes);
+                            try ssm_state_scales_dev.upload(device, std.mem.sliceAsBytes(init_scales));
+                        },
+                    }
 
                     var gated_delta_scratch = try cpu_kernels.GatedDeltaScratch.init(
                         allocator,
@@ -2737,7 +2870,7 @@ pub const BlockRuntime = struct {
                     const gated_delta_state_bytes_layer = std.math.add(
                         usize,
                         conv_state_bytes,
-                        ssm_state_bytes,
+                        ssm_state_storage_bytes,
                     ) catch return error.InvalidArgument;
                     gated_delta_state_bytes = std.math.add(usize, gated_delta_state_bytes, gated_delta_state_bytes_layer) catch return error.InvalidArgument;
 
@@ -2758,6 +2891,8 @@ pub const BlockRuntime = struct {
                         .dt_bias = dt_bias_dev,
                         .norm_weight = norm_weight_dev,
                         .ssm_state_dev = ssm_state_dev,
+                        .ssm_state_format = ssm_state_format,
+                        .ssm_state_scales_offset = @intCast(ssm_state_scales_offset_bytes),
                         .kernel = gated_delta_kernel,
                         .state = gated_delta_state,
                         .scratch = gated_delta_scratch,

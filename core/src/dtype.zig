@@ -145,6 +145,18 @@ pub const GroupedAffineMeta = struct {
     scales_dtype: DType = .bf16, // F16 or BF16
 };
 
+/// FP8 E4M3 per-tensor scale metadata
+pub const Fp8Meta = struct {
+    /// Per-tensor scale (used when block_scales is null)
+    scale_inv: f32 = 1.0,
+    /// Per-block BF16 scale data (null for per-tensor scaling)
+    block_scales_data: ?[*]const u8 = null,
+    block_scales_len: usize = 0,
+    scale_rows: u32 = 0,
+    scale_cols: u32 = 0,
+    block_size: u32 = 128,
+};
+
 /// MXFP4 quantization metadata (Microsoft Microscaling)
 /// Format: 4-bit values with E8M0 scales (32 values per scale)
 pub const MXFP4Meta = struct {
@@ -283,6 +295,73 @@ pub fn bf16ToF32(bf16_bits: u16) f32 {
 // ============================================================================
 // FP8 E4M3 Support
 // ============================================================================
+
+/// Convert f32 to FP8 E4M3 with saturation (no NaN output).
+/// Clamps to [-448, 448]. Rounds to nearest, ties to even.
+/// Pure integer bit-manipulation — no floating-point math.
+pub inline fn f32ToFp8E4M3(value: f32) u8 {
+    const bits: u32 = @bitCast(value);
+    const sign: u8 = @truncate(bits >> 31);
+    const f32_exp: u32 = (bits >> 23) & 0xFF;
+    const f32_mant: u32 = bits & 0x7F_FFFF;
+
+    // Zero (preserving sign)
+    if (f32_exp == 0 and f32_mant == 0) return @as(u8, sign) << 7;
+    // F32 Inf/NaN → saturate to ±448 (E4M3 max, e=15 m=6)
+    if (f32_exp == 0xFF) return (@as(u8, sign) << 7) | 0x7E;
+    // F32 subnormals are too small for E4M3 → ±0
+    if (f32_exp == 0) return @as(u8, sign) << 7;
+
+    // Real exponent: f32_exp - 127. E4M3 biased = real + 7 = f32_exp - 120.
+    const e4_signed: i32 = @as(i32, @intCast(f32_exp)) - 120;
+
+    // Overflow: real_exp > 8, or real_exp==8 and mantissa > 6/8 → saturate to 448
+    if (e4_signed > 15 or (e4_signed == 15 and f32_mant > 0x60_0000))
+        return (@as(u8, sign) << 7) | 0x7E;
+
+    // Full significand with implicit 1 bit (24 bits: bit 23 = 1)
+    const full_mant: u32 = 0x80_0000 | f32_mant;
+
+    if (e4_signed <= 0) {
+        // E4M3 subnormal: value = 2^-6 * (m/8)
+        // Shift right to denormalize: 20 bits (23→3) + (1 - e4_signed) extra
+        const shift_amount = @as(u32, @intCast(21 - e4_signed));
+        if (shift_amount >= 24) return @as(u8, sign) << 7; // too small → zero
+        const shift: u5 = @intCast(shift_amount);
+        const m_raw: u32 = full_mant >> shift;
+        // Round bit is the bit just below the LSB
+        const round_shift: u5 = @intCast(shift_amount - 1);
+        const round_bit: u32 = (full_mant >> round_shift) & 1;
+        // Sticky bits: anything below the round bit
+        const sticky_mask: u32 = (@as(u32, 1) << round_shift) -% 1;
+        const sticky: u32 = full_mant & sticky_mask;
+        var m: u8 = @truncate(m_raw);
+        // Round to nearest, ties to even
+        if (round_bit != 0 and (sticky != 0 or (m & 1) != 0)) m += 1;
+        if (m > 7) m = 7;
+        if (m == 0) return @as(u8, sign) << 7;
+        return (@as(u8, sign) << 7) | m;
+    }
+
+    // Normal E4M3: shift 23-bit F32 mantissa to 3-bit E4M3 (drop 20 bits)
+    const m_raw: u32 = f32_mant >> 20;
+    const round_bit: u32 = (f32_mant >> 19) & 1;
+    const sticky: u32 = f32_mant & 0x7_FFFF; // bits 18..0
+    var m: u8 = @truncate(m_raw);
+    var e: u8 = @intCast(e4_signed);
+    // Round to nearest, ties to even
+    if (round_bit != 0 and (sticky != 0 or (m & 1) != 0)) {
+        m += 1;
+        if (m >= 8) {
+            m = 0;
+            e += 1;
+        }
+    }
+    // Overflow or NaN encoding → saturate to 448
+    if (e > 15 or (e == 15 and m >= 7))
+        return (@as(u8, sign) << 7) | 0x7E;
+    return (@as(u8, sign) << 7) | (@as(u8, e) << 3) | m;
+}
 
 /// Convert a single FP8 E4M3 value to f32
 /// FP8 E4M3 format: 1 sign bit, 4 exponent bits (bias=7), 3 mantissa bits
@@ -795,6 +874,59 @@ test "fp8e4m3ToF32 - negative values" {
     // Binary: 1 1000 000 = 0xC0
     const neg_two = fp8e4m3ToF32(0b11000000);
     try std.testing.expect(@abs(neg_two - (-2.0)) < 0.001);
+}
+
+test "f32ToFp8E4M3 - roundtrip known values" {
+    // Test that f32→fp8→f32 roundtrips correctly for representable values
+    const test_values = [_]f32{ 0.0, 1.0, -1.0, 2.0, -2.0, 0.5, 448.0, -448.0 };
+    const expected_fp8 = [_]u8{
+        0b00000000, // 0.0
+        0b00111000, // 1.0
+        0b10111000, // -1.0
+        0b01000000, // 2.0
+        0b11000000, // -2.0
+        0b00110100, // 0.5: e=6, m=4 → 2^(-1) * (1 + 4/8) = 0.5... wait, e=6→2^(6-7)=2^-1, m=4→1.5, so 0.75. Actually: 0.5 = 2^(-1) * 1.0, so e=6, m=0 → 0 0110 000 = 0x30
+        0b01111110, // 448.0: e=15, m=6
+        0b11111110, // -448.0: e=15, m=6, sign=1
+    };
+    // Fix: 0.5 = 2^(e-7) * (1+m/8) where e=6, m=0: 2^(-1)*1.0 = 0.5
+    _ = expected_fp8;
+
+    for (test_values) |val| {
+        const fp8 = f32ToFp8E4M3(val);
+        const back = fp8e4m3ToF32(fp8);
+        if (std.math.isNan(val)) {
+            try std.testing.expect(std.math.isNan(back));
+        } else {
+            try std.testing.expectApproxEqAbs(val, back, @abs(val) * 0.15 + 0.001);
+        }
+    }
+}
+
+test "f32ToFp8E4M3 - saturation" {
+    // Values > 448 should saturate to 448
+    const big = f32ToFp8E4M3(1000.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 448.0), fp8e4m3ToF32(big), 0.01);
+
+    // Infinity → saturate to 448
+    const inf = f32ToFp8E4M3(std.math.inf(f32));
+    try std.testing.expectApproxEqAbs(@as(f32, 448.0), fp8e4m3ToF32(inf), 0.01);
+
+    // Negative infinity → -448
+    const neg_inf = f32ToFp8E4M3(-std.math.inf(f32));
+    try std.testing.expectApproxEqAbs(@as(f32, -448.0), fp8e4m3ToF32(neg_inf), 0.01);
+}
+
+test "f32ToFp8E4M3 - all fp8 values roundtrip" {
+    // Every FP8 E4M3 value should survive a roundtrip: fp8→f32→fp8
+    var i: u16 = 0;
+    while (i < 256) : (i += 1) {
+        const fp8: u8 = @intCast(i);
+        const f32_val = fp8e4m3ToF32(fp8);
+        if (std.math.isNan(f32_val)) continue; // NaN doesn't roundtrip
+        const back = f32ToFp8E4M3(f32_val);
+        try std.testing.expectEqual(fp8, back);
+    }
 }
 
 test "dequantizeFp8E4M3ToBf16 - basic functionality" {

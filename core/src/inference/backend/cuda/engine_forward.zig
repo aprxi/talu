@@ -501,6 +501,7 @@ fn computeBatchedPrefillPipeline2(
                     },
                     .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
                     .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
+                    .fp8 => "matmul_lm_head_fp8_host",
                 };
                 trace.emitFinalWithWork(
                     .lm_head,
@@ -1764,6 +1765,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             },
             .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
             .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
+            .fp8 => "matmul_lm_head_fp8_host",
         };
         trace.emitFinalWithWork(
             .lm_head,
@@ -2772,6 +2774,7 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
                     },
                     .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
                     .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
+                    .fp8 => "matmul_lm_head_fp8_host",
                 };
                 trace.emitFinalWithWork(
                     .lm_head,
@@ -2952,11 +2955,46 @@ pub fn resetGatedDeltaStates(self: anytype) void {
         defer self.allocator.free(conv_zeros);
         @memset(conv_zeros, 0.0);
         block.conv_state_dev.upload(&self.device, std.mem.sliceAsBytes(conv_zeros)) catch {};
-        const ssm_elems = std.math.divExact(usize, block.ssm_state_dev.size, @sizeOf(f32)) catch continue;
-        const zeros = self.allocator.alloc(f32, ssm_elems) catch continue;
-        defer self.allocator.free(zeros);
-        @memset(zeros, 0.0);
-        block.ssm_state_dev.upload(&self.device, std.mem.sliceAsBytes(zeros)) catch {};
+        const BlockType = @TypeOf(block.*);
+        if (comptime @hasDecl(BlockType, "ssmStateDataBytes") and
+            @hasDecl(BlockType, "ssmStateScalesCount") and
+            @hasField(BlockType, "ssm_state_format") and
+            @hasField(BlockType, "ssm_state_scales_offset"))
+        {
+            const ssm_data_bytes = block.ssmStateDataBytes() catch continue;
+            switch (block.ssm_state_format) {
+                .f32 => {
+                    const ssm_elems = std.math.divExact(usize, ssm_data_bytes, @sizeOf(f32)) catch continue;
+                    const zeros = self.allocator.alloc(f32, ssm_elems) catch continue;
+                    defer self.allocator.free(zeros);
+                    @memset(zeros, 0.0);
+                    block.ssm_state_dev.upload(&self.device, std.mem.sliceAsBytes(zeros)) catch {};
+                },
+                .i8_per_column_scale => {
+                    const zeros_i8 = self.allocator.alloc(i8, ssm_data_bytes) catch continue;
+                    defer self.allocator.free(zeros_i8);
+                    @memset(zeros_i8, 0);
+                    var ssm_i8_dev = bufferSlice(&block.ssm_state_dev, 0, ssm_data_bytes) catch continue;
+                    ssm_i8_dev.upload(&self.device, std.mem.sliceAsBytes(zeros_i8)) catch {};
+
+                    const scale_count = block.ssmStateScalesCount();
+                    if (scale_count > 0) {
+                        const scale_bytes = std.math.mul(usize, scale_count, @sizeOf(f32)) catch continue;
+                        const scales = self.allocator.alloc(f32, scale_count) catch continue;
+                        defer self.allocator.free(scales);
+                        @memset(scales, 1.0);
+                        var scales_dev = bufferSlice(&block.ssm_state_dev, @as(usize, block.ssm_state_scales_offset), scale_bytes) catch continue;
+                        scales_dev.upload(&self.device, std.mem.sliceAsBytes(scales)) catch {};
+                    }
+                },
+            }
+        } else {
+            const ssm_elems = std.math.divExact(usize, block.ssm_state_dev.size, @sizeOf(f32)) catch continue;
+            const zeros = self.allocator.alloc(f32, ssm_elems) catch continue;
+            defer self.allocator.free(zeros);
+            @memset(zeros, 0.0);
+            block.ssm_state_dev.upload(&self.device, std.mem.sliceAsBytes(zeros)) catch {};
+        }
     }
 }
 

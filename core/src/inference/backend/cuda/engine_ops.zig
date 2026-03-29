@@ -258,27 +258,56 @@ pub fn linearForwardRows(
             return;
         },
         .gaffine_u4 => |w| {
-            const kernel = self.gaffine_u4_matvec_function orelse return error.CudaKernelUnavailable;
-            // Native U4 GEMV: reads weights in 4-bit format (half the DRAM
-            // bandwidth of the I8 BLAS path). The kernel tiles batch rows
-            // via grid_y, so any batch_rows value works.
-            if (rows <= 32) {
-                try compute.cuda.gaffine_u4_matvec.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    kernel,
-                    &packed_input,
-                    &w.packed_data,
-                    &w.scales,
-                    &w.biases,
-                    &packed_out,
-                    @intCast(w.rows),
-                    @intCast(w.cols),
-                    w.group_size,
-                    w.scales_dtype_tag,
-                    @intCast(rows),
-                    0,
-                );
+            var kernel = self.gaffine_u4_matvec_function orelse return error.CudaKernelUnavailable;
+            var use_tile8 = false;
+            if (self.gaffine_u4_tile8_enabled and rows > 4) {
+                if (self.gaffine_u4_matvec_tile8_function) |tile8_kernel| {
+                    kernel = tile8_kernel;
+                    use_tile8 = true;
+                }
+            }
+            // Native U4 GEMV stays default for single-row decode and prefill.
+            // Optional TALU_CUDA_GAFFINE_U4_DECODE_I8 reroutes batched decode
+            // rows with enough parallelism (4..max_batch_size) to tensor-core
+            // I8 GEMM.
+            const prefer_i8_decode = self.gaffine_u4_decode_i8_enabled and
+                rows >= 4 and rows <= self.max_batch_size;
+            if (rows <= 32 and !prefer_i8_decode) {
+                if (use_tile8) {
+                    try compute.cuda.gaffine_u4_matvec.runWithFunctionTile8(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &packed_input,
+                        &w.packed_data,
+                        &w.scales,
+                        &w.biases,
+                        &packed_out,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                        w.group_size,
+                        w.scales_dtype_tag,
+                        @intCast(rows),
+                        0,
+                    );
+                } else {
+                    try compute.cuda.gaffine_u4_matvec.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &packed_input,
+                        &w.packed_data,
+                        &w.scales,
+                        &w.biases,
+                        &packed_out,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                        w.group_size,
+                        w.scales_dtype_tag,
+                        @intCast(rows),
+                        0,
+                    );
+                }
                 return;
             }
 
@@ -430,22 +459,41 @@ pub fn linearForwardRows(
 
             // Fallback: row-by-row U4 GEMV.
             if (self.gaffine_sequence_rows_supported) {
-                try compute.cuda.gaffine_u4_matvec.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    kernel,
-                    &packed_input,
-                    &w.packed_data,
-                    &w.scales,
-                    &w.biases,
-                    &packed_out,
-                    @intCast(w.rows),
-                    @intCast(w.cols),
-                    w.group_size,
-                    w.scales_dtype_tag,
-                    @intCast(rows),
-                    0,
-                );
+                if (use_tile8) {
+                    try compute.cuda.gaffine_u4_matvec.runWithFunctionTile8(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &packed_input,
+                        &w.packed_data,
+                        &w.scales,
+                        &w.biases,
+                        &packed_out,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                        w.group_size,
+                        w.scales_dtype_tag,
+                        @intCast(rows),
+                        0,
+                    );
+                } else {
+                    try compute.cuda.gaffine_u4_matvec.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &packed_input,
+                        &w.packed_data,
+                        &w.scales,
+                        &w.biases,
+                        &packed_out,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                        w.group_size,
+                        w.scales_dtype_tag,
+                        @intCast(rows),
+                        0,
+                    );
+                }
                 return;
             }
 
@@ -706,6 +754,162 @@ pub fn linearForwardRows(
                 );
             }
             return;
+        },
+        .fp8 => |w| {
+            // Decode path: FP8 GEMV with per-block BF16 scales (DRAM-bound, 1 byte/weight).
+            if (rows <= 32) fp8_gemv: {
+                if (w.scales_buffer.pointer == 0 or w.scales_buffer.size == 0) break :fp8_gemv;
+                const fp8_fn = self.fp8_matvec_function orelse break :fp8_gemv;
+
+                const out_cols: u32 = @intCast(w.cols);
+                self.kernel_arg_pack.reset();
+                self.kernel_arg_pack.appendBufferPtr(&packed_input) catch break :fp8_gemv;
+                self.kernel_arg_pack.appendBufferPtr(&w.buffer) catch break :fp8_gemv;
+                self.kernel_arg_pack.appendBufferPtr(&w.scales_buffer) catch break :fp8_gemv;
+                self.kernel_arg_pack.appendBufferPtr(&packed_out) catch break :fp8_gemv;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch break :fp8_gemv;
+                self.kernel_arg_pack.appendScalar(u32, out_cols) catch break :fp8_gemv;
+                self.kernel_arg_pack.appendScalar(u32, w.block_size) catch break :fp8_gemv;
+                self.kernel_arg_pack.appendScalar(u32, w.scale_cols) catch break :fp8_gemv;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(rows)) catch break :fp8_gemv;
+                compute.cuda.launch.launchWithFamily(&self.device, fp8_fn, .{
+                    .grid_x = (out_cols + 3) / 4,
+                    .grid_y = 1,
+                    .grid_z = @intCast(rows),
+                    .block_x = 128,
+                }, &self.kernel_arg_pack, .matvec) catch break :fp8_gemv;
+                return;
+            }
+
+            // Prefill path: dequant FP8→BF16, then cuBLAS BF16 tensor core GEMM.
+            if (w.scales_buffer.pointer != 0 and w.scales_buffer.size > 0) fp8_dequant_blas: {
+                const dequant_fn = self.fp8_dequant_to_bf16_function orelse break :fp8_dequant_blas;
+                const cast_fn = self.cast_f32_to_bf16_function orelse break :fp8_dequant_blas;
+                if (!self.u16_blas_bf16_supported) break :fp8_dequant_blas;
+
+                const weight_elems = std.math.mul(usize, w.rows, w.cols) catch break :fp8_dequant_blas;
+                const weight_bf16_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch break :fp8_dequant_blas;
+                if (self.runtime_buffers.dequant_f16_dev.size < weight_bf16_bytes) break :fp8_dequant_blas;
+
+                const input_elems = std.math.mul(usize, rows, w.rows) catch break :fp8_dequant_blas;
+                const input_bf16_bytes = std.math.mul(usize, input_elems, @sizeOf(u16)) catch break :fp8_dequant_blas;
+                if (self.runtime_buffers.activation_u16_dev.size < input_bf16_bytes) break :fp8_dequant_blas;
+
+                // Step 1: Dequant FP8 weights → BF16 in scratch buffer.
+                var dequant_weight = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, weight_bf16_bytes) catch break :fp8_dequant_blas;
+                const grid_x = std.math.cast(u32, std.math.divCeil(usize, w.rows, 256) catch break :fp8_dequant_blas) orelse break :fp8_dequant_blas;
+                const grid_y = std.math.cast(u32, w.cols) orelse break :fp8_dequant_blas;
+                self.kernel_arg_pack.reset();
+                self.kernel_arg_pack.appendBufferPtr(&w.buffer) catch break :fp8_dequant_blas;
+                self.kernel_arg_pack.appendBufferPtr(&w.scales_buffer) catch break :fp8_dequant_blas;
+                self.kernel_arg_pack.appendBufferPtr(&dequant_weight) catch break :fp8_dequant_blas;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch break :fp8_dequant_blas;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(w.cols)) catch break :fp8_dequant_blas;
+                self.kernel_arg_pack.appendScalar(u32, w.block_size) catch break :fp8_dequant_blas;
+                self.kernel_arg_pack.appendScalar(u32, w.scale_cols) catch break :fp8_dequant_blas;
+                compute.cuda.launch.launchWithFamily(&self.device, dequant_fn, .{
+                    .grid_x = grid_x,
+                    .grid_y = grid_y,
+                    .block_x = 256,
+                }, &self.kernel_arg_pack, .other) catch break :fp8_dequant_blas;
+
+                // Step 2: Cast F32 input → BF16.
+                var input_bf16_dev = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, input_bf16_bytes) catch break :fp8_dequant_blas;
+                try compute.cuda.cast_f32_to_bf16.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    cast_fn,
+                    &packed_input,
+                    &input_bf16_dev,
+                    @intCast(input_elems),
+                );
+
+                // Step 3: cuBLAS BF16 × BF16 → F32 GEMM (tensor cores).
+                self.blas.matmulU16U16F32(
+                    &self.device,
+                    &input_bf16_dev,
+                    .bf16,
+                    rows,
+                    w.rows,
+                    &dequant_weight,
+                    .bf16,
+                    w.cols,
+                    &packed_out,
+                ) catch {
+                    self.u16_blas_bf16_supported = false;
+                    break :fp8_dequant_blas;
+                };
+                return;
+            }
+
+            // Per-tensor scalar scale: cuBLAS FP8×FP8→F32 W8A8 path.
+            if (w.weight_scale_inv != 0 and self.fp8_blas_supported) fp8_blas: {
+                const quant_fn = self.quantize_f32_to_fp8_function orelse break :fp8_blas;
+                const scale_fn = self.scale_rows_f32_function orelse break :fp8_blas;
+
+                const in_dim = w.rows;
+                const out_dim = w.cols;
+                const act_per_row = in_dim + @sizeOf(f32);
+                const max_chunk = self.runtime_buffers.activation_u16_dev.size / act_per_row;
+                if (max_chunk == 0) break :fp8_blas;
+
+                var done: usize = 0;
+                while (done < rows) {
+                    const chunk = @min(rows - done, max_chunk);
+                    const fp8_input_bytes = chunk * in_dim;
+                    const row_scales_bytes = chunk * @sizeOf(f32);
+
+                    var fp8_input_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, fp8_input_bytes) catch break :fp8_blas;
+                    var row_scales_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, fp8_input_bytes, row_scales_bytes) catch break :fp8_blas;
+
+                    const in_off = done * in_dim * @sizeOf(f32);
+                    const out_off = done * out_dim * @sizeOf(f32);
+                    var chunk_input = bufferSlice(&packed_input, in_off, chunk * in_dim * @sizeOf(f32)) catch break :fp8_blas;
+                    var chunk_output = bufferSlice(&packed_out, out_off, chunk * out_dim * @sizeOf(f32)) catch break :fp8_blas;
+
+                    self.kernel_arg_pack.reset();
+                    self.kernel_arg_pack.appendBufferPtr(&chunk_input) catch break :fp8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&fp8_input_buf) catch break :fp8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&row_scales_buf) catch break :fp8_blas;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch break :fp8_blas;
+                    compute.cuda.launch.launchWithFamily(&self.device, quant_fn, .{
+                        .grid_x = @intCast(chunk),
+                        .block_x = 256,
+                    }, &self.kernel_arg_pack, .other) catch break :fp8_blas;
+
+                    self.blas.matmulFp8Fp8F32(
+                        &self.device,
+                        &fp8_input_buf,
+                        chunk,
+                        in_dim,
+                        &w.buffer,
+                        out_dim,
+                        &chunk_output,
+                        w.weight_scale_inv,
+                    ) catch {
+                        self.fp8_blas_supported = false;
+                        break :fp8_blas;
+                    };
+
+                    self.kernel_arg_pack.reset();
+                    self.kernel_arg_pack.appendBufferPtr(&chunk_output) catch break :fp8_blas;
+                    self.kernel_arg_pack.appendBufferPtr(&row_scales_buf) catch break :fp8_blas;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(chunk)) catch break :fp8_blas;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(out_dim)) catch break :fp8_blas;
+                    const scale_blocks_x = std.math.cast(u32, std.math.divCeil(usize, out_dim, 256) catch break :fp8_blas) orelse break :fp8_blas;
+                    const scale_rows_y = std.math.cast(u32, chunk) orelse break :fp8_blas;
+                    compute.cuda.launch.launchWithFamily(&self.device, scale_fn, .{
+                        .grid_x = scale_blocks_x,
+                        .grid_y = scale_rows_y,
+                        .block_x = 256,
+                    }, &self.kernel_arg_pack, .other) catch break :fp8_blas;
+
+                    done += chunk;
+                }
+                return;
+            }
+
+            return error.CudaKernelUnavailable;
         },
     }
 }
@@ -1212,7 +1416,14 @@ pub fn tryFusedGaffineU4QkvForward(
     q_out_dest: *compute.cuda.Buffer,
 ) !bool {
     if (rows == 0 or rows > std.math.maxInt(u32)) return false;
-    const fused_kernel = self.gaffine_u4_matvec_qkv_function orelse return false;
+    var fused_kernel = self.gaffine_u4_matvec_qkv_function orelse return false;
+    var use_tile8 = false;
+    if (self.gaffine_u4_tile8_enabled and rows > 4) {
+        if (self.gaffine_u4_matvec_qkv_tile8_function) |tile8_kernel| {
+            fused_kernel = tile8_kernel;
+            use_tile8 = true;
+        }
+    }
     const q = switch (q_proj.*) {
         .gaffine_u4 => |w| w,
         else => return false,
@@ -1228,35 +1439,67 @@ pub fn tryFusedGaffineU4QkvForward(
     if (!canFuseGaffineQkvWeights(self.d_model, q, k, v)) return false;
     const batch_rows: u32 = @intCast(rows);
 
-    try compute.cuda.gaffine_u4_matvec_qkv.runWithFunction(
-        &self.kernel_arg_pack,
-        &self.device,
-        fused_kernel,
-        input,
-        &q.packed_data,
-        &q.scales,
-        &q.biases,
-        q_out_dest,
-        @intCast(q.cols),
-        q.group_size,
-        q.scales_dtype_tag,
-        &k.packed_data,
-        &k.scales,
-        &k.biases,
-        &self.runtime_buffers.attn_k_dev,
-        @intCast(k.cols),
-        k.group_size,
-        k.scales_dtype_tag,
-        &v.packed_data,
-        &v.scales,
-        &v.biases,
-        &self.runtime_buffers.attn_v_dev,
-        @intCast(v.cols),
-        v.group_size,
-        v.scales_dtype_tag,
-        @intCast(q.rows),
-        batch_rows,
-    );
+    if (use_tile8) {
+        try compute.cuda.gaffine_u4_matvec_qkv.runWithFunctionTile8(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &q.packed_data,
+            &q.scales,
+            &q.biases,
+            q_out_dest,
+            @intCast(q.cols),
+            q.group_size,
+            q.scales_dtype_tag,
+            &k.packed_data,
+            &k.scales,
+            &k.biases,
+            &self.runtime_buffers.attn_k_dev,
+            @intCast(k.cols),
+            k.group_size,
+            k.scales_dtype_tag,
+            &v.packed_data,
+            &v.scales,
+            &v.biases,
+            &self.runtime_buffers.attn_v_dev,
+            @intCast(v.cols),
+            v.group_size,
+            v.scales_dtype_tag,
+            @intCast(q.rows),
+            batch_rows,
+        );
+    } else {
+        try compute.cuda.gaffine_u4_matvec_qkv.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &q.packed_data,
+            &q.scales,
+            &q.biases,
+            q_out_dest,
+            @intCast(q.cols),
+            q.group_size,
+            q.scales_dtype_tag,
+            &k.packed_data,
+            &k.scales,
+            &k.biases,
+            &self.runtime_buffers.attn_k_dev,
+            @intCast(k.cols),
+            k.group_size,
+            k.scales_dtype_tag,
+            &v.packed_data,
+            &v.scales,
+            &v.biases,
+            &self.runtime_buffers.attn_v_dev,
+            @intCast(v.cols),
+            v.group_size,
+            v.scales_dtype_tag,
+            @intCast(q.rows),
+            batch_rows,
+        );
+    }
     return true;
 }
 
@@ -1480,6 +1723,14 @@ pub fn canFuseGaffineGateUpWeights(
     return true;
 }
 
+pub fn linearWeightHasI8Cache(weight: *const LinearWeight) bool {
+    return switch (weight.*) {
+        .gaffine_u4 => |w| w.dequant_i8_cache.pointer != 0 and w.mean_scale_cache.pointer != 0,
+        .gaffine_u8 => |w| w.dequant_i8_cache.pointer != 0 and w.mean_scale_cache.pointer != 0,
+        else => false,
+    };
+}
+
 pub fn tryFusedI8GateUpSiluForward(
     self: anytype,
     input: *const compute.cuda.Buffer,
@@ -1604,27 +1855,163 @@ pub fn tryFusedGaffineU4GateUpSiluForward(
     if (!canFuseGaffineGateUpWeights(self.d_model, gate, up)) return false;
     if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
 
-    const fused_kernel = self.gaffine_u4_matvec_gate_up_silu_function orelse return false;
-    try compute.cuda.gaffine_u4_matvec_gate_up_silu.runWithFunction(
-        &self.kernel_arg_pack,
-        &self.device,
-        fused_kernel,
-        input,
-        &gate.packed_data,
-        &gate.scales,
-        &gate.biases,
-        &up.packed_data,
-        &up.scales,
-        &up.biases,
-        &self.runtime_buffers.ffn_mul_dev,
-        @intCast(gate.cols),
-        gate.group_size,
-        gate.scales_dtype_tag,
-        up.group_size,
-        up.scales_dtype_tag,
-        @intCast(gate.rows),
-        @intCast(rows),
-    );
+    var fused_kernel = self.gaffine_u4_matvec_gate_up_silu_function orelse return false;
+    var use_tile8 = false;
+    if (self.gaffine_u4_tile8_enabled and rows > 4) {
+        if (self.gaffine_u4_matvec_gate_up_silu_tile8_function) |tile8_kernel| {
+            fused_kernel = tile8_kernel;
+            use_tile8 = true;
+        }
+    }
+    if (use_tile8) {
+        try compute.cuda.gaffine_u4_matvec_gate_up_silu.runWithFunctionTile8(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &gate.packed_data,
+            &gate.scales,
+            &gate.biases,
+            &up.packed_data,
+            &up.scales,
+            &up.biases,
+            &self.runtime_buffers.ffn_mul_dev,
+            @intCast(gate.cols),
+            gate.group_size,
+            gate.scales_dtype_tag,
+            up.group_size,
+            up.scales_dtype_tag,
+            @intCast(gate.rows),
+            @intCast(rows),
+        );
+    } else {
+        try compute.cuda.gaffine_u4_matvec_gate_up_silu.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &gate.packed_data,
+            &gate.scales,
+            &gate.biases,
+            &up.packed_data,
+            &up.scales,
+            &up.biases,
+            &self.runtime_buffers.ffn_mul_dev,
+            @intCast(gate.cols),
+            gate.group_size,
+            gate.scales_dtype_tag,
+            up.group_size,
+            up.scales_dtype_tag,
+            @intCast(gate.rows),
+            @intCast(rows),
+        );
+    }
+    return true;
+}
+
+pub fn tryFusedFp8GateUpSiluForward(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    gate_weight: *const LinearWeight,
+    up_weight: *const LinearWeight,
+    rows: usize,
+    expected_out_dim: u32,
+) !bool {
+    if (self.loaded.config.use_gelu) return false;
+    if (rows == 0 or rows > 32) return false;
+
+    const gate = switch (gate_weight.*) {
+        .fp8 => |w| w,
+        else => return false,
+    };
+    const up = switch (up_weight.*) {
+        .fp8 => |w| w,
+        else => return false,
+    };
+    // Both projections must share in_dim and have matching out_dim.
+    if (gate.rows != up.rows) return false;
+    if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
+    if (gate.rows != self.d_model) return false;
+    if (gate.scales_buffer.pointer == 0 or up.scales_buffer.pointer == 0) return false;
+
+    const fused_fn = self.fp8_matvec_gate_up_silu_function orelse return false;
+
+    const out_dim: u32 = @intCast(gate.cols);
+    const in_dim: u32 = @intCast(gate.rows);
+
+    self.kernel_arg_pack.reset();
+    try self.kernel_arg_pack.appendBufferPtr(input);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_mul_dev);
+    try self.kernel_arg_pack.appendScalar(u32, out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, in_dim);
+    try self.kernel_arg_pack.appendScalar(u32, gate.block_size);
+    try self.kernel_arg_pack.appendScalar(u32, gate.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, up.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, @intCast(rows));
+
+    try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
+        .grid_x = (out_dim + 3) / 4,
+        .grid_y = 1,
+        .grid_z = @intCast(rows),
+        .block_x = 128,
+    }, &self.kernel_arg_pack, .matvec_gate_up_silu);
+    return true;
+}
+
+pub fn tryFusedFp8GateUpForward(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    gate_weight: *const LinearWeight,
+    up_weight: *const LinearWeight,
+    rows: usize,
+) !bool {
+    if (rows == 0 or rows > 32) return false;
+
+    const gate = switch (gate_weight.*) {
+        .fp8 => |w| w,
+        else => return false,
+    };
+    const up = switch (up_weight.*) {
+        .fp8 => |w| w,
+        else => return false,
+    };
+    if (gate.rows != up.rows) return false;
+    if (gate.rows != self.d_model) return false;
+    if (gate.scales_buffer.pointer == 0 or up.scales_buffer.pointer == 0) return false;
+
+    const fused_fn = self.fp8_matvec_gate_up_function orelse return false;
+
+    const gate_out_dim: u32 = @intCast(gate.cols);
+    const up_out_dim: u32 = @intCast(up.cols);
+    const in_dim: u32 = @intCast(gate.rows);
+    const total_dim = gate_out_dim + up_out_dim;
+
+    self.kernel_arg_pack.reset();
+    try self.kernel_arg_pack.appendBufferPtr(input);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_gate_dev);
+    try self.kernel_arg_pack.appendScalar(u32, gate_out_dim);
+    try self.kernel_arg_pack.appendBufferPtr(&up.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_up_dev);
+    try self.kernel_arg_pack.appendScalar(u32, up_out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, in_dim);
+    try self.kernel_arg_pack.appendScalar(u32, gate.block_size);
+    try self.kernel_arg_pack.appendScalar(u32, gate.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, up.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, @intCast(rows));
+
+    try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
+        .grid_x = (total_dim + 3) / 4,
+        .grid_y = 1,
+        .grid_z = @intCast(rows),
+        .block_x = 128,
+    }, &self.kernel_arg_pack, .matvec);
     return true;
 }
 
@@ -1636,6 +2023,9 @@ pub fn tryFusedGateUpForward(
     rows: usize,
 ) !bool {
     if (try tryFusedDenseU16GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
+    if (try tryFusedFp8GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
+    // The U4 fused gate/up+silu path is currently unstable for quality-sensitive
+    // generation; keep the established U8 path as the default correctness path.
     return tryFusedGaffineU8GateUpForward(self, input, gate_weight, up_weight, rows);
 }
 

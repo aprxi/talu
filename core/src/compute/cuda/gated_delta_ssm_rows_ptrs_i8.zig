@@ -1,10 +1,4 @@
-//! Gated-delta state-space rows kernel wrapper with per-row state pointers.
-//!
-//! Uses 4 tile-blocks per head (OUT_TILE=32, d_head=128). This decomposition
-//! is near DRAM bandwidth saturation: micro-benchmarks show ~94% peak at n=2
-//! and the kernel scales linearly with batch size. A head-wide (1 block/head)
-//! variant was benchmarked and lost by 2-3x due to insufficient occupancy.
-//! See debug/cuda-ssm/ for detailed analysis.
+//! Gated-delta state-space rows kernel wrapper (ptrs) with int8 state + f32 scales.
 
 const std = @import("std");
 const device_mod = @import("device.zig");
@@ -14,8 +8,8 @@ const module_mod = @import("module.zig");
 
 const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
-pub const embedded_symbol: [:0]const u8 = "talu_gated_delta_ssm_rows_ptrs_f32";
-pub const op_name: []const u8 = "gated_delta_ssm_rows_ptrs_f32";
+pub const embedded_symbol: [:0]const u8 = "talu_gated_delta_ssm_rows_ptrs_i8_f32";
+pub const op_name: []const u8 = "gated_delta_ssm_rows_ptrs_i8_f32";
 const out_tile: u32 = 32;
 const warp_size: u32 = 32;
 
@@ -36,8 +30,9 @@ pub fn runWithFunction(
     beta_offset: u32,
     a_offset: u32,
     out_row_stride: u32,
+    state_scales_offset: u32,
 ) !void {
-    try validateArgs(qkv_rows, state_ptrs, a_log, dt_bias, out, n_qk_heads, n_v_heads, d_head, rows, row_stride, beta_offset, a_offset, out_row_stride);
+    try validateArgs(qkv_rows, state_ptrs, a_log, dt_bias, out, n_qk_heads, n_v_heads, d_head, rows, row_stride, beta_offset, a_offset, out_row_stride, state_scales_offset);
 
     arg_pack.reset();
     try arg_pack.appendBufferPtr(out);
@@ -54,6 +49,7 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, beta_offset);
     try arg_pack.appendScalar(u32, a_offset);
     try arg_pack.appendScalar(u32, out_row_stride);
+    try arg_pack.appendScalar(u32, state_scales_offset);
 
     const block_x = blockSizeForDHead(d_head);
     const shared_bytes = std.math.mul(usize, 2 * @as(usize, d_head), @sizeOf(f32)) catch return error.InvalidArgument;
@@ -80,10 +76,12 @@ fn validateArgs(
     beta_offset: u32,
     a_offset: u32,
     out_row_stride: u32,
+    state_scales_offset: u32,
 ) !void {
     if (n_qk_heads == 0 or n_v_heads == 0 or d_head == 0 or rows == 0) return error.InvalidArgument;
     if ((n_v_heads % n_qk_heads) != 0) return error.InvalidArgument;
     if (row_stride == 0 or out_row_stride == 0) return error.InvalidArgument;
+    if ((state_scales_offset % @as(u32, @intCast(@sizeOf(f32)))) != 0) return error.InvalidArgument;
 
     const qk_inner = std.math.mul(usize, @as(usize, n_qk_heads), @as(usize, d_head)) catch return error.InvalidArgument;
     const d_inner = std.math.mul(usize, @as(usize, n_v_heads), @as(usize, d_head)) catch return error.InvalidArgument;
@@ -121,7 +119,7 @@ fn blockSizeForDHead(d_head: u32) u32 {
 
 test "validateArgs rejects invalid row stride and offsets" {
     const buf = device_mod.Buffer{ .pointer = 0, .size = 4096 };
-    try std.testing.expectError(error.InvalidArgument, validateArgs(&buf, &buf, &buf, null, &buf, 1, 2, 8, 2, 8, 7, 9, 16));
+    try std.testing.expectError(error.InvalidArgument, validateArgs(&buf, &buf, &buf, null, &buf, 1, 2, 8, 2, 8, 7, 9, 16, 258));
 }
 
 test "blockSizeForDHead rounds up to full warps" {

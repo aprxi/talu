@@ -97,6 +97,9 @@ const saturatingAddUsize = engine_types.saturatingAddUsize;
 const resolveCudaFixedAllocMode = engine_types.resolveCudaFixedAllocMode;
 const resolveCudaRequireFitCheck = engine_types.resolveCudaRequireFitCheck;
 const resolveCudaStrictMemoryMode = engine_types.resolveCudaStrictMemoryMode;
+const resolveCudaGaffineU4Tile8Decode = engine_types.resolveCudaGaffineU4Tile8Decode;
+const resolveCudaGaffineU4DecodeI8 = engine_types.resolveCudaGaffineU4DecodeI8;
+const resolveCudaGatedDeltaSsmI8State = engine_types.resolveCudaGatedDeltaSsmI8State;
 const resolveCudaMemoryReserveBytes = engine_types.resolveCudaMemoryReserveBytes;
 const resolveCudaExternalOverheadCapBytes = engine_types.resolveCudaExternalOverheadCapBytes;
 const resolveCudaMaxSeqLen = engine_types.resolveCudaMaxSeqLen;
@@ -271,6 +274,10 @@ pub const CudaBackend = struct {
     gated_delta_ssm_rows_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_ssm_rows_ptrs_function: ?compute.cuda.Function = null,
     gated_delta_ssm_rows_ptrs_source: ?compute.cuda.registry.KernelSource = null,
+    gated_delta_ssm_rows_i8_function: ?compute.cuda.Function = null,
+    gated_delta_ssm_rows_i8_source: ?compute.cuda.registry.KernelSource = null,
+    gated_delta_ssm_rows_ptrs_i8_function: ?compute.cuda.Function = null,
+    gated_delta_ssm_rows_ptrs_i8_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_rmsnorm_silu_mul_function: ?compute.cuda.Function = null,
     gated_delta_rmsnorm_silu_mul_source: ?compute.cuda.registry.KernelSource = null,
     gated_delta_rmsnorm_silu_mul_rows_function: ?compute.cuda.Function = null,
@@ -305,18 +312,24 @@ pub const CudaBackend = struct {
     matvec_qkv_bf16_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_function: ?compute.cuda.Function = null,
     gaffine_u4_matvec_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_u4_matvec_tile8_function: ?compute.cuda.Function = null,
+    gaffine_u4_matvec_tile8_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u8_matvec_function: ?compute.cuda.Function = null,
     gaffine_u8_matvec_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_gate_up_function: ?compute.cuda.Function = null,
     gaffine_u4_matvec_gate_up_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_qkv_function: ?compute.cuda.Function = null,
     gaffine_u4_matvec_qkv_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_u4_matvec_qkv_tile8_function: ?compute.cuda.Function = null,
+    gaffine_u4_matvec_qkv_tile8_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u8_matvec_qkv_function: ?compute.cuda.Function = null,
     gaffine_u8_matvec_qkv_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u8_matvec_gate_up_function: ?compute.cuda.Function = null,
     gaffine_u8_matvec_gate_up_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
     gaffine_u4_matvec_gate_up_silu_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_u4_matvec_gate_up_silu_tile8_function: ?compute.cuda.Function = null,
+    gaffine_u4_matvec_gate_up_silu_tile8_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
     gaffine_u8_matvec_gate_up_silu_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_dequant_f16_function: ?compute.cuda.Function = null,
@@ -336,7 +349,14 @@ pub const CudaBackend = struct {
     quantize_f32_to_i8_simple_function: ?compute.cuda.Function = null,
     dequant_i32_scales_function: ?compute.cuda.Function = null,
     dequant_i32_scales_split3_function: ?compute.cuda.Function = null,
+    quantize_f32_to_fp8_function: ?compute.cuda.Function = null,
+    scale_rows_f32_function: ?compute.cuda.Function = null,
+    fp8_matvec_function: ?compute.cuda.Function = null,
+    fp8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
+    fp8_matvec_gate_up_function: ?compute.cuda.Function = null,
+    fp8_dequant_to_bf16_function: ?compute.cuda.Function = null,
     i8_blas_supported: bool = true,
+    fp8_blas_supported: bool = true,
     // Transient: set before QKV projection to provide concat cache for fused I8 prefill.
     active_qkv_concat: ?QkvI8ConcatRef = null,
     // Transient: set before linearForwardRows to fuse residual add into GEMV output.
@@ -394,6 +414,9 @@ pub const CudaBackend = struct {
     fixed_alloc_mode: bool = false,
     require_fit_check: bool = false,
     strict_memory_mode: bool = false,
+    gaffine_u4_tile8_enabled: bool = false,
+    gaffine_u4_decode_i8_enabled: bool = false,
+    gated_delta_ssm_i8_state_enabled: bool = false,
     memory_reserve_bytes: usize = 0,
     external_overhead_cap_bytes: ?usize = null,
     model_max_seq_len: usize = 0,
@@ -536,6 +559,7 @@ pub const CudaBackend = struct {
         const resolved_strict_memory_mode = resolveCudaStrictMemoryMode();
         const resolved_memory_reserve_bytes = resolveCudaMemoryReserveBytes();
         const resolved_external_overhead_cap_bytes = resolveCudaExternalOverheadCapBytes();
+        const default_gated_delta_ssm_i8_state = false;
 
         log.info("inference", "CUDA device ready", .{
             .name = device.name(),
@@ -567,6 +591,9 @@ pub const CudaBackend = struct {
             .fixed_alloc_mode = resolveCudaFixedAllocMode(),
             .require_fit_check = resolved_require_fit_check,
             .strict_memory_mode = resolved_strict_memory_mode,
+            .gaffine_u4_tile8_enabled = resolveCudaGaffineU4Tile8Decode(),
+            .gaffine_u4_decode_i8_enabled = resolveCudaGaffineU4DecodeI8(),
+            .gated_delta_ssm_i8_state_enabled = resolveCudaGatedDeltaSsmI8State(default_gated_delta_ssm_i8_state),
             .memory_reserve_bytes = resolved_memory_reserve_bytes,
             .external_overhead_cap_bytes = resolved_external_overhead_cap_bytes,
             .model_max_seq_len = model_max_seq_len,
@@ -686,6 +713,7 @@ pub const CudaBackend = struct {
             backend.kv_init_tokens,
             layer_range.start,
             layer_range.end,
+            backend.gated_delta_ssm_i8_state_enabled,
             CudaBackend.layer_program_adapter_table,
             backend.kv_cache_dtype,
         );
@@ -1677,8 +1705,42 @@ pub const CudaBackend = struct {
                     } else {
                         var conv = try self.device.allocBuffer(block.conv_state_dev.size);
                         errdefer conv.deinit(&self.device);
+                        const conv_elems = std.math.divExact(usize, conv.size, @sizeOf(f32)) catch return error.InvalidArgument;
+                        const conv_zeros = try self.allocator.alloc(f32, conv_elems);
+                        defer self.allocator.free(conv_zeros);
+                        @memset(conv_zeros, 0.0);
+                        try conv.upload(&self.device, std.mem.sliceAsBytes(conv_zeros));
+
                         var ssm = try self.device.allocBuffer(block.ssm_state_dev.size);
                         errdefer ssm.deinit(&self.device);
+                        const ssm_state_data_bytes = try block.ssmStateDataBytes();
+                        switch (block.ssm_state_format) {
+                            .f32 => {
+                                const ssm_elems = std.math.divExact(usize, ssm_state_data_bytes, @sizeOf(f32)) catch return error.InvalidArgument;
+                                const ssm_zeros = try self.allocator.alloc(f32, ssm_elems);
+                                defer self.allocator.free(ssm_zeros);
+                                @memset(ssm_zeros, 0.0);
+                                var ssm_data_dev = try bufferSlice(&ssm, 0, ssm_state_data_bytes);
+                                try ssm_data_dev.upload(&self.device, std.mem.sliceAsBytes(ssm_zeros));
+                            },
+                            .i8_per_column_scale => {
+                                const ssm_zeros = try self.allocator.alloc(i8, ssm_state_data_bytes);
+                                defer self.allocator.free(ssm_zeros);
+                                @memset(ssm_zeros, 0);
+                                var ssm_data_dev = try bufferSlice(&ssm, 0, ssm_state_data_bytes);
+                                try ssm_data_dev.upload(&self.device, std.mem.sliceAsBytes(ssm_zeros));
+
+                                const scale_count = block.ssmStateScalesCount();
+                                if (scale_count > 0) {
+                                    const scale_bytes = std.math.mul(usize, scale_count, @sizeOf(f32)) catch return error.InvalidArgument;
+                                    const scales = try self.allocator.alloc(f32, scale_count);
+                                    defer self.allocator.free(scales);
+                                    @memset(scales, 1.0);
+                                    var ssm_scales_dev = try bufferSlice(&ssm, @as(usize, block.ssm_state_scales_offset), scale_bytes);
+                                    try ssm_scales_dev.upload(&self.device, std.mem.sliceAsBytes(scales));
+                                }
+                            },
+                        }
                         sks.gd[gd_i] = .{ .conv = conv, .ssm = ssm, .conv_ring_head = 0 };
                     }
                     gd_i += 1;
@@ -2697,6 +2759,7 @@ pub const CudaBackend = struct {
             },
             .gaffine_u4 => gaffine_matvec_available,
             .gaffine_u8 => gaffine_u8_matvec_available,
+            .fp8 => true,
         };
     }
 

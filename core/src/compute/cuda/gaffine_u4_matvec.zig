@@ -11,11 +11,14 @@ const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
 pub const embedded_symbol: [:0]const u8 = "talu_gaffine_u4_matvec_f32";
 pub const op_name: []const u8 = "gaffine_u4_matvec_f32";
+pub const embedded_symbol_tile8: [:0]const u8 = "talu_gaffine_u4_matvec_f32_tile8";
+pub const op_name_tile8: []const u8 = "gaffine_u4_matvec_f32_tile8";
 pub const scales_dtype_f16: u32 = 0;
 pub const scales_dtype_bf16: u32 = 1;
 const warp_size: u32 = 32;
 const block_x: u32 = 128;
 const inner_batch_rows: u32 = 4;
+const inner_batch_rows_tile8: u32 = 8;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -73,7 +76,79 @@ pub fn runWithFunction(
     batch_rows: u32,
     residual_ptr: u64,
 ) !void {
+    return runWithFunctionBatchTile(
+        arg_pack,
+        device,
+        function,
+        input,
+        packed_weight,
+        scales,
+        biases,
+        out,
+        in_dim,
+        out_dim,
+        group_size,
+        scales_dtype_tag,
+        batch_rows,
+        residual_ptr,
+        inner_batch_rows,
+    );
+}
+
+pub fn runWithFunctionTile8(
+    arg_pack: *args_mod.ArgPack,
+    device: *device_mod.Device,
+    function: module_mod.Function,
+    input: *const device_mod.Buffer,
+    packed_weight: *const device_mod.Buffer,
+    scales: *const device_mod.Buffer,
+    biases: *const device_mod.Buffer,
+    out: *device_mod.Buffer,
+    in_dim: u32,
+    out_dim: u32,
+    group_size: u32,
+    scales_dtype_tag: u32,
+    batch_rows: u32,
+    residual_ptr: u64,
+) !void {
+    return runWithFunctionBatchTile(
+        arg_pack,
+        device,
+        function,
+        input,
+        packed_weight,
+        scales,
+        biases,
+        out,
+        in_dim,
+        out_dim,
+        group_size,
+        scales_dtype_tag,
+        batch_rows,
+        residual_ptr,
+        inner_batch_rows_tile8,
+    );
+}
+
+fn runWithFunctionBatchTile(
+    arg_pack: *args_mod.ArgPack,
+    device: *device_mod.Device,
+    function: module_mod.Function,
+    input: *const device_mod.Buffer,
+    packed_weight: *const device_mod.Buffer,
+    scales: *const device_mod.Buffer,
+    biases: *const device_mod.Buffer,
+    out: *device_mod.Buffer,
+    in_dim: u32,
+    out_dim: u32,
+    group_size: u32,
+    scales_dtype_tag: u32,
+    batch_rows: u32,
+    residual_ptr: u64,
+    batch_tile_rows: u32,
+) !void {
     try validateArgs(input, packed_weight, scales, biases, out, in_dim, out_dim, group_size, scales_dtype_tag, batch_rows);
+    if (batch_tile_rows == 0) return error.InvalidArgument;
 
     arg_pack.reset();
     try arg_pack.appendBufferPtr(input);
@@ -92,7 +167,7 @@ pub fn runWithFunction(
     const grid_x: u32 = ceilDiv(out_dim, rows_per_block);
     try launch_mod.launchWithFamily(device, function, .{
         .grid_x = grid_x,
-        .grid_y = ceilDiv(batch_rows, inner_batch_rows),
+        .grid_y = ceilDiv(batch_rows, batch_tile_rows),
         .block_x = block_x,
     }, arg_pack, .matvec);
 }

@@ -275,6 +275,43 @@ pub fn buildGatedDeltaSplitInProj(
         if (s.rows != b_shape.rows) return error.InvalidShape;
     }
     if (z_shape.cols != qkv_shape.cols or z_shape.cols != b_shape.cols) return error.InvalidShape;
+    // Mixed FP8 + BF16: dequant FP8 tensors to BF16, then fuse as dense.
+    // Common in FP8 models where small projections (A, B) stay BF16.
+    const has_fp8 = in_proj_qkv.dtype == .f8_e4m3 or in_proj_z.dtype == .f8_e4m3 or
+        in_proj_b.dtype == .f8_e4m3 or (if (in_proj_a) |a| a.dtype == .f8_e4m3 else false);
+    const all_fp8 = in_proj_qkv.dtype == .f8_e4m3 and in_proj_z.dtype == .f8_e4m3 and
+        in_proj_b.dtype == .f8_e4m3 and
+        (if (in_proj_a) |a| a.dtype == .f8_e4m3 else true);
+
+    if (has_fp8 and all_fp8) {
+        return buildGatedDeltaSplitInProjFp8(allocator, in_proj_qkv, in_proj_z, in_proj_b, in_proj_a);
+    }
+
+    if (has_fp8 and !all_fp8) {
+        // Dequant FP8 tensors to BF16, keep BF16 as-is, then fuse as BF16.
+        const qkv_bf16 = if (in_proj_qkv.dtype == .f8_e4m3)
+            try dequantFp8ToBf16ForFusion(allocator, in_proj_qkv)
+        else
+            in_proj_qkv;
+        const z_bf16 = if (in_proj_z.dtype == .f8_e4m3)
+            try dequantFp8ToBf16ForFusion(allocator, in_proj_z)
+        else
+            in_proj_z;
+        const b_bf16 = if (in_proj_b.dtype == .f8_e4m3)
+            try dequantFp8ToBf16ForFusion(allocator, in_proj_b)
+        else
+            in_proj_b;
+        var a_bf16: ?*const Tensor = null;
+        if (in_proj_a) |a| {
+            a_bf16 = if (a.dtype == .f8_e4m3)
+                try dequantFp8ToBf16ForFusion(allocator, a)
+            else
+                a;
+        }
+        // Recurse with all-BF16 tensors
+        return buildGatedDeltaSplitInProj(allocator, qkv_bf16, z_bf16, b_bf16, a_bf16);
+    }
+
     if (in_proj_z.dtype != in_proj_qkv.dtype or in_proj_z.dtype != in_proj_b.dtype) return error.InvalidDType;
     if (in_proj_a) |a| {
         if (a.dtype != in_proj_z.dtype) return error.InvalidDType;
@@ -446,6 +483,132 @@ fn buildGatedDeltaSplitInProjQuantized(
     return result;
 }
 
+/// Dequantize an FP8 tensor with per-block scales to BF16 for fusion with BF16 tensors.
+/// Returns a pointer to a heap-allocated BF16 tensor (arena-managed).
+fn dequantFp8ToBf16ForFusion(allocator: std.mem.Allocator, t: *const Tensor) !*const Tensor {
+    if (t.n_dims != 2) return error.InvalidShape;
+    const fp8_meta = t.fp8 orelse return error.MissingScales;
+    const rows: usize = @intCast(t.shape[0]);
+    const cols: usize = @intCast(t.shape[1]);
+    const owned = try tensor.OwnedTensor.init(allocator, .bf16, &.{ rows, cols });
+    const src_bytes = t.data()[0 .. rows * cols];
+    const dst_u16 = owned.asSlice(u16);
+
+    if (fp8_meta.block_scales_data) |scales_ptr| {
+        const scale_data = @as([*]const u16, @ptrCast(@alignCast(scales_ptr)))[0 .. @as(usize, fp8_meta.scale_rows) * @as(usize, fp8_meta.scale_cols)];
+        const block_size: usize = fp8_meta.block_size;
+        const s_cols: usize = fp8_meta.scale_cols;
+        for (0..rows) |r| {
+            const sr = r / block_size;
+            for (0..cols) |c| {
+                const sc = c / block_size;
+                const scale_inv = dtype.bf16ToF32(scale_data[sr * s_cols + sc]);
+                const fp8_value = src_bytes[r * cols + c];
+                dst_u16[r * cols + c] = dtype.f32ToBf16(dtype.fp8e4m3ToF32(fp8_value) * scale_inv);
+            }
+        }
+    } else {
+        // Per-tensor scale
+        const scale_inv = fp8_meta.scale_inv;
+        for (0..rows * cols) |i| {
+            dst_u16[i] = dtype.f32ToBf16(dtype.fp8e4m3ToF32(src_bytes[i]) * scale_inv);
+        }
+    }
+
+    const result = try allocator.create(Tensor);
+    result.* = owned.view();
+    return result;
+}
+
+/// Fuse split gated-delta projections for FP8 E4M3 tensors with per-block scales.
+///
+/// Concatenates along the output dimension (rows). Each sub-tensor contributes
+/// its FP8 weight bytes and BF16 per-block scales. All must share the same
+/// input dimension, block_size, and scale_cols.
+fn buildGatedDeltaSplitInProjFp8(
+    allocator: std.mem.Allocator,
+    in_proj_qkv: *const Tensor,
+    in_proj_z: *const Tensor,
+    in_proj_b: *const Tensor,
+    in_proj_a: ?*const Tensor,
+) !*const Tensor {
+    const qkv_fp8 = in_proj_qkv.fp8 orelse return error.MissingScales;
+    const z_fp8 = in_proj_z.fp8 orelse return error.MissingScales;
+    const b_fp8 = in_proj_b.fp8 orelse return error.MissingScales;
+
+    // Validate compatible per-block metadata
+    if (qkv_fp8.block_size != z_fp8.block_size or qkv_fp8.block_size != b_fp8.block_size)
+        return error.InvalidShape;
+    if (qkv_fp8.scale_cols != z_fp8.scale_cols or qkv_fp8.scale_cols != b_fp8.scale_cols)
+        return error.InvalidShape;
+
+    var a_fp8: ?dtype.Fp8Meta = null;
+    if (in_proj_a) |a| {
+        a_fp8 = a.fp8 orelse return error.MissingScales;
+        if (a_fp8.?.block_size != qkv_fp8.block_size or a_fp8.?.scale_cols != qkv_fp8.scale_cols)
+            return error.InvalidShape;
+    }
+
+    const qkv_rows: usize = @intCast(in_proj_qkv.shape[0]);
+    const z_rows: usize = @intCast(in_proj_z.shape[0]);
+    const b_rows: usize = @intCast(in_proj_b.shape[0]);
+    const a_rows: usize = if (in_proj_a) |a| @intCast(a.shape[0]) else 0;
+    const total_rows = qkv_rows + z_rows + b_rows + a_rows;
+    const cols: usize = @intCast(in_proj_z.shape[1]);
+
+    // Fuse FP8 weight bytes (1 byte per element, concatenate rows)
+    const total_bytes = total_rows * cols;
+    const fused_data = try allocator.alloc(u8, total_bytes);
+    var dst_off: usize = 0;
+    const qkv_bytes = in_proj_qkv.data()[0 .. qkv_rows * cols];
+    @memcpy(fused_data[dst_off .. dst_off + qkv_bytes.len], qkv_bytes);
+    dst_off += qkv_bytes.len;
+    const z_bytes = in_proj_z.data()[0 .. z_rows * cols];
+    @memcpy(fused_data[dst_off .. dst_off + z_bytes.len], z_bytes);
+    dst_off += z_bytes.len;
+    const b_bytes_data = in_proj_b.data()[0 .. b_rows * cols];
+    @memcpy(fused_data[dst_off .. dst_off + b_bytes_data.len], b_bytes_data);
+    dst_off += b_bytes_data.len;
+    if (in_proj_a) |a| {
+        const a_bytes = a.data()[0 .. a_rows * cols];
+        @memcpy(fused_data[dst_off .. dst_off + a_bytes.len], a_bytes);
+    }
+
+    // Fuse per-block BF16 scales (concatenate scale rows)
+    const total_scale_rows = qkv_fp8.scale_rows + z_fp8.scale_rows + b_fp8.scale_rows +
+        (if (a_fp8) |a| a.scale_rows else 0);
+    const scale_cols = qkv_fp8.scale_cols;
+    const scale_entry_bytes = @sizeOf(u16);
+    const total_scale_bytes = @as(usize, total_scale_rows) * @as(usize, scale_cols) * scale_entry_bytes;
+    const fused_scales = try allocator.alloc(u8, total_scale_bytes);
+
+    var scale_off: usize = 0;
+    inline for (.{ qkv_fp8, z_fp8, b_fp8 }) |fp8| {
+        if (fp8.block_scales_data) |sdata| {
+            const slen = @as(usize, fp8.scale_rows) * @as(usize, fp8.scale_cols) * scale_entry_bytes;
+            @memcpy(fused_scales[scale_off .. scale_off + slen], sdata[0..slen]);
+            scale_off += slen;
+        }
+    }
+    if (a_fp8) |fp8| {
+        if (fp8.block_scales_data) |sdata| {
+            const slen = @as(usize, fp8.scale_rows) * @as(usize, fp8.scale_cols) * scale_entry_bytes;
+            @memcpy(fused_scales[scale_off .. scale_off + slen], sdata[0..slen]);
+        }
+    }
+
+    const result = try allocator.create(Tensor);
+    result.* = Tensor.view(fused_data.ptr, &.{ total_rows, cols }, .f8_e4m3, total_bytes);
+    result.fp8 = .{
+        .block_scales_data = fused_scales.ptr,
+        .block_scales_len = total_scale_bytes,
+        .scale_rows = total_scale_rows,
+        .scale_cols = scale_cols,
+        .block_size = qkv_fp8.block_size,
+    };
+    return result;
+}
+
 pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTensors, name: []const u8, expected_in: usize, config: ModelConfig) !Tensor {
     var weight_tensor = try st.getTensor(name, null);
     log.debug("load", "Orient weight", .{
@@ -472,7 +635,7 @@ pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTens
             return error.MissingScales;
         };
     }
-    // Handle FP8 E4M3 weights - dequantize to BF16
+    // Handle FP8 E4M3 weights — keep native when possible for tensor-core GEMM
     if (weight_tensor.dtype == .f8_e4m3) {
         const base = if (std.mem.endsWith(u8, name, ".weight"))
             name[0 .. name.len - ".weight".len]
@@ -482,33 +645,58 @@ pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTens
         // Try to get scale tensor (need shape info for per-block detection)
         var scale_name_buf: [256]u8 = undefined;
         const scale_name = std.fmt.bufPrint(&scale_name_buf, "{s}.weight_scale_inv", .{base}) catch {
-            return dequantizeFp8Weight(allocator, weight_tensor, 1.0, expected_in);
+            weight_tensor.fp8 = .{ .scale_inv = 1.0 };
+            return weight_tensor;
         };
 
         const scale_tensor = st.getTensor(scale_name, null) catch {
             log.trace("load", "FP8: no weight_scale_inv found, using 1.0", .{}, @src());
-            return dequantizeFp8Weight(allocator, weight_tensor, 1.0, expected_in);
+            weight_tensor.fp8 = .{ .scale_inv = 1.0 };
+            return weight_tensor;
         };
 
-        // Check if scale is 2D (per-block) or scalar/1D
+        // Per-block (2D) scales: keep FP8 native with per-block scale metadata
         if (scale_tensor.n_dims == 2) {
-            // Per-block FP8 quantization (e.g., Qwen3 MoE FP8 models)
-            const dequantized = try dequantizeFp8WeightPerBlock(allocator, weight_tensor, scale_tensor, expected_in);
-            // Apply same orientation as regular BF16 weights
-            return orientWeightTyped(allocator, dequantized, expected_in);
+            const s_rows: usize = @intCast(scale_tensor.shape[0]);
+            const s_cols: usize = @intCast(scale_tensor.shape[1]);
+            const w_rows: usize = @intCast(weight_tensor.shape[0]);
+            const w_cols: usize = @intCast(weight_tensor.shape[1]);
+            if (w_rows % s_rows != 0 or w_cols % s_cols != 0) {
+                const dequantized = try dequantizeFp8WeightPerBlock(allocator, weight_tensor, scale_tensor, expected_in);
+                return orientWeightTyped(allocator, dequantized, expected_in);
+            }
+            const block_size = w_rows / s_rows;
+            if (block_size != w_cols / s_cols) {
+                // Non-square blocks — fall back to BF16 dequant
+                const dequantized = try dequantizeFp8WeightPerBlock(allocator, weight_tensor, scale_tensor, expected_in);
+                return orientWeightTyped(allocator, dequantized, expected_in);
+            }
+            const scale_data = scale_tensor.data();
+            const scale_byte_len = s_rows * s_cols * @sizeOf(u16);
+            if (scale_data.len < scale_byte_len) {
+                const dequantized = try dequantizeFp8WeightPerBlock(allocator, weight_tensor, scale_tensor, expected_in);
+                return orientWeightTyped(allocator, dequantized, expected_in);
+            }
+            weight_tensor.fp8 = .{
+                .block_scales_data = scale_data.ptr,
+                .block_scales_len = scale_byte_len,
+                .scale_rows = @intCast(s_rows),
+                .scale_cols = @intCast(s_cols),
+                .block_size = @intCast(block_size),
+            };
+            return weight_tensor;
         }
 
-        // Scalar scale (1D or 0D)
+        // Scalar scale (1D or 0D): keep FP8 native with per-tensor scale metadata
+        var scale_inv: f32 = 1.0;
         const scale_inv_bytes = scale_tensor.data();
         if (scale_inv_bytes.len >= 2) {
             const scale_inv_bf16 = std.mem.bytesAsValue(u16, scale_inv_bytes[0..2]).*;
-            const scale_inv = dtype.bf16ToF32(scale_inv_bf16);
-            log.trace("load", "FP8 scale", .{ .scale_inv = scale_inv }, @src());
-            const dequantized = try dequantizeFp8Weight(allocator, weight_tensor, scale_inv, expected_in);
-            return orientWeightTyped(allocator, dequantized, expected_in);
+            scale_inv = dtype.bf16ToF32(scale_inv_bf16);
         }
-        const dequantized = try dequantizeFp8Weight(allocator, weight_tensor, 1.0, expected_in);
-        return orientWeightTyped(allocator, dequantized, expected_in);
+        log.trace("load", "FP8 native", .{ .scale_inv = scale_inv }, @src());
+        weight_tensor.fp8 = .{ .scale_inv = scale_inv };
+        return weight_tensor;
     }
 
     return switch (weight_tensor.dtype) {

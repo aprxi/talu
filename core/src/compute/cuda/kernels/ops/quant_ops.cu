@@ -119,6 +119,7 @@ static constexpr unsigned int U4_WARPS_PER_BLOCK = 4;
 static constexpr unsigned int U4_WARP_ELEMS_PER_THREAD = 32;
 static constexpr unsigned int U4_WARP_STEP = TALU_QUANT_WARP_SIZE * U4_WARP_ELEMS_PER_THREAD; // 1024
 static constexpr unsigned int U4_BATCH_TILE = 4;
+static constexpr unsigned int U4_BATCH_TILE_X8 = 8;
 
 // Process one word (8 U4 nibbles) against 8 F32 input values using factored
 // accumulation: accumulate raw nibble*input products, then apply scale/bias
@@ -234,6 +235,50 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_gaffine_u4_matvec_f32(
     if (batch_base >= batch_rows) return;
     const unsigned int tile_rows = batch_rows - batch_base < U4_BATCH_TILE
         ? batch_rows - batch_base : U4_BATCH_TILE;
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_idx = blockIdx.x * U4_WARPS_PER_BLOCK + warp_id;
+    if (out_idx >= out_dim) return;
+    if (group_size == 0 || (in_dim % group_size) != 0 || (group_size % 8) != 0) return;
+
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out + (unsigned long long)batch_base * out_dim;
+    const float* res_tile = residual
+        ? residual + (unsigned long long)batch_base * out_dim : nullptr;
+
+    switch (tile_rows) {
+        case 1u: talu_gaffine_u4_matvec_batched<1>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 1u, res_tile); break;
+        case 2u: talu_gaffine_u4_matvec_batched<2>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 2u, res_tile); break;
+        case 3u: talu_gaffine_u4_matvec_batched<3>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 3u, res_tile); break;
+        case 4u: talu_gaffine_u4_matvec_batched<4>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 4u, res_tile); break;
+        case 5u: talu_gaffine_u4_matvec_batched<5>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 5u, res_tile); break;
+        case 6u: talu_gaffine_u4_matvec_batched<6>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 6u, res_tile); break;
+        case 7u: talu_gaffine_u4_matvec_batched<7>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 7u, res_tile); break;
+        case 8u: talu_gaffine_u4_matvec_batched<8>(input_tile, packed_weight, scales, biases, out_tile, in_dim, out_dim, out_idx, group_size, scales_dtype_tag, lane, 8u, res_tile); break;
+        default: return;
+    }
+}
+
+// Tile-8 decode-specialized variant. Keeps the default tile-4 kernel hot path
+// unchanged for n<=4 while enabling single-pass weight reuse at n>4.
+extern "C" __global__ __launch_bounds__(128, 4) void talu_gaffine_u4_matvec_f32_tile8(
+    const float* input,
+    const unsigned int* packed_weight,
+    const unsigned short* scales,
+    const unsigned short* biases,
+    float* out,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int group_size,
+    unsigned int scales_dtype_tag,
+    unsigned int batch_rows,
+    const float* residual
+) {
+    const unsigned int batch_base = blockIdx.y * U4_BATCH_TILE_X8;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < U4_BATCH_TILE_X8
+        ? batch_rows - batch_base : U4_BATCH_TILE_X8;
 
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
@@ -601,6 +646,83 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_gaffine_u4_matvec_qkv_
     }
 }
 
+extern "C" __global__ __launch_bounds__(128, 4) void talu_gaffine_u4_matvec_qkv_f32_tile8(
+    const float* input,
+    const unsigned int* q_packed_weight,
+    const unsigned short* q_scales,
+    const unsigned short* q_biases,
+    float* q_out,
+    unsigned int q_out_dim,
+    unsigned int q_group_size,
+    unsigned int q_scales_dtype_tag,
+    const unsigned int* k_packed_weight,
+    const unsigned short* k_scales,
+    const unsigned short* k_biases,
+    float* k_out,
+    unsigned int k_out_dim,
+    unsigned int k_group_size,
+    unsigned int k_scales_dtype_tag,
+    const unsigned int* v_packed_weight,
+    const unsigned short* v_scales,
+    const unsigned short* v_biases,
+    float* v_out,
+    unsigned int v_out_dim,
+    unsigned int v_group_size,
+    unsigned int v_scales_dtype_tag,
+    unsigned int in_dim,
+    unsigned int batch_rows
+) {
+    const unsigned int batch_base = blockIdx.y * U4_BATCH_TILE_X8;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < U4_BATCH_TILE_X8
+        ? batch_rows - batch_base : U4_BATCH_TILE_X8;
+    if (in_dim == 0 || (in_dim % 32) != 0) return;
+
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int out_index = blockIdx.x * U4_WARPS_PER_BLOCK + warp_id;
+    const unsigned int qk_dim = q_out_dim + k_out_dim;
+    const unsigned int total_dim = qk_dim + v_out_dim;
+    if (out_index >= total_dim) return;
+
+    // Determine which projection this warp handles.
+    const unsigned int* pw;
+    const unsigned short* sc;
+    const unsigned short* bi;
+    float* out_ptr;
+    unsigned int out_dim_proj, row_idx, grp_size, dtype_tag;
+
+    if (out_index < q_out_dim) {
+        pw = q_packed_weight; sc = q_scales; bi = q_biases;
+        out_ptr = q_out; out_dim_proj = q_out_dim;
+        row_idx = out_index; grp_size = q_group_size; dtype_tag = q_scales_dtype_tag;
+    } else if (out_index < qk_dim) {
+        pw = k_packed_weight; sc = k_scales; bi = k_biases;
+        out_ptr = k_out; out_dim_proj = k_out_dim;
+        row_idx = out_index - q_out_dim; grp_size = k_group_size; dtype_tag = k_scales_dtype_tag;
+    } else {
+        pw = v_packed_weight; sc = v_scales; bi = v_biases;
+        out_ptr = v_out; out_dim_proj = v_out_dim;
+        row_idx = out_index - qk_dim; grp_size = v_group_size; dtype_tag = v_scales_dtype_tag;
+    }
+    if (grp_size == 0 || (in_dim % grp_size) != 0 || (grp_size % 8) != 0) return;
+
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out_ptr + (unsigned long long)batch_base * out_dim_proj;
+
+    switch (tile_rows) {
+        case 1u: talu_gaffine_u4_matvec_batched<1>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 1u, nullptr); break;
+        case 2u: talu_gaffine_u4_matvec_batched<2>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 2u, nullptr); break;
+        case 3u: talu_gaffine_u4_matvec_batched<3>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 3u, nullptr); break;
+        case 4u: talu_gaffine_u4_matvec_batched<4>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 4u, nullptr); break;
+        case 5u: talu_gaffine_u4_matvec_batched<5>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 5u, nullptr); break;
+        case 6u: talu_gaffine_u4_matvec_batched<6>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 6u, nullptr); break;
+        case 7u: talu_gaffine_u4_matvec_batched<7>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 7u, nullptr); break;
+        case 8u: talu_gaffine_u4_matvec_batched<8>(input_tile, pw, sc, bi, out_tile, in_dim, out_dim_proj, row_idx, grp_size, dtype_tag, lane, 8u, nullptr); break;
+        default: return;
+    }
+}
+
 extern "C" __global__ void talu_gaffine_u8_matvec_qkv_f32(
     const float* input,
     const unsigned int* q_packed_weight,
@@ -863,6 +985,52 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_gaffine_u4_matvec_gate
     if (batch_base >= batch_rows) return;
     const unsigned int tile_rows = batch_rows - batch_base < U4_BATCH_TILE
         ? batch_rows - batch_base : U4_BATCH_TILE;
+    if (in_dim == 0 || (in_dim % 32) != 0) return;
+
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int out_index = blockIdx.x * U4_WARPS_PER_BLOCK + warp_id;
+    if (out_index >= out_dim) return;
+    if (gate_group_size == 0 || (in_dim % gate_group_size) != 0 || (gate_group_size % 8) != 0) return;
+    if (up_group_size == 0 || (in_dim % up_group_size) != 0 || (up_group_size % 8) != 0) return;
+
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out + (unsigned long long)batch_base * out_dim;
+
+    switch (tile_rows) {
+        case 1u: talu_gaffine_u4_gate_up_silu_batched<1>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 1u); break;
+        case 2u: talu_gaffine_u4_gate_up_silu_batched<2>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 2u); break;
+        case 3u: talu_gaffine_u4_gate_up_silu_batched<3>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 3u); break;
+        case 4u: talu_gaffine_u4_gate_up_silu_batched<4>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 4u); break;
+        case 5u: talu_gaffine_u4_gate_up_silu_batched<5>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 5u); break;
+        case 6u: talu_gaffine_u4_gate_up_silu_batched<6>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 6u); break;
+        case 7u: talu_gaffine_u4_gate_up_silu_batched<7>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 7u); break;
+        case 8u: talu_gaffine_u4_gate_up_silu_batched<8>(input_tile, gate_packed_weight, gate_scales, gate_biases, up_packed_weight, up_scales, up_biases, out_tile, out_dim, out_index, gate_group_size, gate_scales_dtype_tag, up_group_size, up_scales_dtype_tag, in_dim, lane, 8u); break;
+        default: return;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 4) void talu_gaffine_u4_matvec_gate_up_silu_f32_tile8(
+    const float* input,
+    const unsigned int* gate_packed_weight,
+    const unsigned short* gate_scales,
+    const unsigned short* gate_biases,
+    const unsigned int* up_packed_weight,
+    const unsigned short* up_scales,
+    const unsigned short* up_biases,
+    float* out,
+    unsigned int out_dim,
+    unsigned int gate_group_size,
+    unsigned int gate_scales_dtype_tag,
+    unsigned int up_group_size,
+    unsigned int up_scales_dtype_tag,
+    unsigned int in_dim,
+    unsigned int batch_rows
+) {
+    const unsigned int batch_base = blockIdx.y * U4_BATCH_TILE_X8;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < U4_BATCH_TILE_X8
+        ? batch_rows - batch_base : U4_BATCH_TILE_X8;
     if (in_dim == 0 || (in_dim % 32) != 0) return;
 
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
@@ -1577,4 +1745,431 @@ extern "C" __global__ void talu_dequant_i32_scales_split3(
 
     out[(unsigned long long)m * out_stride + local_n] =
         static_cast<float>(gemm_i32[(unsigned long long)m * total_dim + n]) * is * ws;
+}
+
+// ---------------------------------------------------------------------------
+// FP8 E4M3 quantization / dequantization kernels (sm_89+)
+// ---------------------------------------------------------------------------
+
+#if __CUDA_ARCH__ >= 890
+
+// Quantize F32 input rows to FP8 E4M3 with per-row absmax scaling.
+// Launch: grid=(rows), block=(256)
+extern "C" __global__ void talu_quantize_f32_to_fp8_e4m3(
+    const float* __restrict__ input,        // [rows × in_dim]
+    unsigned char* __restrict__ out_fp8,    // [rows × in_dim] FP8 E4M3 bytes
+    float* __restrict__ out_row_scales,     // [rows]
+    unsigned int in_dim
+) {
+    const unsigned int row = blockIdx.x;
+    const float* row_in = input + (unsigned long long)row * in_dim;
+    unsigned char* row_out = out_fp8 + (unsigned long long)row * in_dim;
+
+    // Phase 1: per-row absmax via shared memory reduction.
+    __shared__ float smem[8];
+    float local_max = 0.0f;
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(row_in[i]));
+    }
+    for (int offset = 16; offset >= 1; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFFu, local_max, offset));
+    if ((threadIdx.x & 31) == 0) smem[threadIdx.x >> 5] = local_max;
+    __syncthreads();
+    if (threadIdx.x < 8) {
+        local_max = smem[threadIdx.x];
+        for (int offset = 4; offset >= 1; offset >>= 1)
+            local_max = fmaxf(local_max, __shfl_down_sync(0xFFu, local_max, offset));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) smem[0] = local_max;
+    __syncthreads();
+    const float absmax = smem[0];
+    // E4M3 max representable value = 448.0
+    const float scale = (absmax > 0.0f) ? (absmax / 448.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale;
+    if (threadIdx.x == 0) out_row_scales[row] = scale;
+
+    // Phase 2: quantize to FP8 E4M3.
+    for (unsigned int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        float val = row_in[i] * inv_scale;
+        row_out[i] = __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+#else
+
+// Stub for architectures below sm_89 — kernel symbol exists but should never be called.
+extern "C" __global__ void talu_quantize_f32_to_fp8_e4m3(
+    const float* __restrict__ input,
+    void* __restrict__ out_fp8,
+    float* __restrict__ out_row_scales,
+    unsigned int in_dim
+) {}
+
+#endif // __CUDA_ARCH__ >= 890
+
+// ---------------------------------------------------------------------------
+// FP8 E4M3 per-block GEMV kernel
+// ---------------------------------------------------------------------------
+
+// FP8 E4M3 matrix-vector product with per-block BF16 scales.
+// Warp-per-row design: 4 warps per block, each computes one output row.
+// Weight layout: [out_dim, in_dim] in FP8 E4M3 (1 byte per element).
+// Scales layout: [scale_rows, scale_cols] in BF16, where
+//   scale_rows = out_dim / block_size, scale_cols = in_dim / block_size.
+// Each block_size×block_size tile of weights shares one scale.
+// Grid: (ceil(out_dim/4), 1, batch_rows), Block: (128 = 4 warps)
+static constexpr unsigned int FP8_WARPS_PER_BLOCK = 4;
+static constexpr unsigned int FP8_BLOCK_ELEMS = 128; // elements per block tile along K
+
+#if __CUDA_ARCH__ >= 890
+
+// Convert FP8 E4M3 byte to float via half intermediate.
+static __device__ __forceinline__ float fp8e4m3_to_f32(__nv_fp8_storage_t x) {
+    __half_raw hr = __nv_cvt_fp8_to_halfraw(x, __NV_E4M3);
+    __half h;
+    memcpy(&h, &hr, sizeof(h));
+    return __half2float(h);
+}
+
+// Convert BF16 (stored as unsigned short) to float.
+static __device__ __forceinline__ float fp8_bf16_to_f32(unsigned short raw) {
+    return __uint_as_float(static_cast<unsigned int>(raw) << 16);
+}
+
+// FP8 E4M3 GEMV: factored accumulation with 2-way ILP.
+// Accumulate raw input*weight products to r0/r1 (no scale), then apply scale
+// once per 4-element group.  Saves 6 multiplies per 8 elements and halves the
+// dependency chain depth vs naive fmaf(in, fp8*scale, acc).
+// 128-bit streaming weight loads (v4.u32 = 16 FP8 bytes per lane per iter).
+#define FP8_PROCESS_WORD(word, inp, r0, r1) do { \
+    (r0) = fmaf((inp).x, fp8e4m3_to_f32(static_cast<__nv_fp8_storage_t>((word) & 0xFFu)), (r0)); \
+    (r1) = fmaf((inp).y, fp8e4m3_to_f32(static_cast<__nv_fp8_storage_t>(((word) >> 8) & 0xFFu)), (r1)); \
+    (r0) = fmaf((inp).z, fp8e4m3_to_f32(static_cast<__nv_fp8_storage_t>(((word) >> 16) & 0xFFu)), (r0)); \
+    (r1) = fmaf((inp).w, fp8e4m3_to_f32(static_cast<__nv_fp8_storage_t>((word) >> 24)), (r1)); \
+} while (0)
+
+// Inner loop for FP8 E4M3 GEMV: one warp computes one dot product (one output row).
+// Uses 64-bit streaming loads and factored accumulation with 2-way ILP.
+static __device__ __forceinline__ void talu_fp8_e4m3_dot(
+    const float* __restrict__ input_row,
+    const unsigned int* __restrict__ weight_words,
+    const unsigned short* __restrict__ scales,
+    unsigned int scale_row_off,
+    unsigned int words_per_row,
+    unsigned int block_size,
+    unsigned int lane,
+    float& acc
+) {
+    for (unsigned int w = lane << 1; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 1) {
+        unsigned int w0, w1;
+        asm volatile(
+            "ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(w0), "=r"(w1)
+            : "l"(&weight_words[w]));
+
+        const unsigned int base_elem = w << 2;
+
+        const float s0 = fp8_bf16_to_f32(scales[scale_row_off + base_elem / block_size]);
+        const float s1 = fp8_bf16_to_f32(scales[scale_row_off + (base_elem + 4) / block_size]);
+
+        float r0, r1;
+
+        // Word 0: factored accumulation (4 FMA + 1 scale FMA vs 4 mul + 4 FMA).
+        r0 = 0.0f; r1 = 0.0f;
+        const float4 inp0 = *reinterpret_cast<const float4*>(&input_row[base_elem]);
+        FP8_PROCESS_WORD(w0, inp0, r0, r1);
+        acc = fmaf(r0 + r1, s0, acc);
+
+        // Word 1
+        r0 = 0.0f; r1 = 0.0f;
+        const float4 inp1 = *reinterpret_cast<const float4*>(&input_row[base_elem + 4]);
+        FP8_PROCESS_WORD(w1, inp1, r0, r1);
+        acc = fmaf(r0 + r1, s1, acc);
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 3) void talu_fp8_e4m3_matvec_f32(
+    const float* __restrict__ input,                // [batch_rows × in_dim]
+    const unsigned char* __restrict__ weight,        // [out_dim × in_dim] FP8 E4M3 bytes
+    const unsigned short* __restrict__ scales,       // [scale_rows × scale_cols] BF16
+    float* __restrict__ out,                         // [batch_rows × out_dim]
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int block_size,
+    unsigned int scale_cols,
+    unsigned int batch_rows
+) {
+    const unsigned int batch = blockIdx.z;
+    if (batch >= batch_rows) return;
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const float* input_row = input + (unsigned long long)batch * in_dim;
+    const unsigned int* weight_words = reinterpret_cast<const unsigned int*>(
+        weight + (unsigned long long)out_idx * in_dim);
+    const unsigned int scale_row_off = (out_idx / block_size) * scale_cols;
+    const unsigned int words_per_row = in_dim >> 2;
+
+    float acc = 0.0f;
+    talu_fp8_e4m3_dot(input_row, weight_words, scales, scale_row_off,
+                      words_per_row, block_size, lane, acc);
+
+    acc = talu_quant_warp_sum_f32(acc);
+    if (lane == 0) {
+        out[(unsigned long long)batch * out_dim + out_idx] = acc;
+    }
+}
+
+// Fused FP8 gate+up+SiLU: each warp reads BOTH gate and up weights per iteration,
+// reuses input from L2 cache, and fuses silu(gate)*up after warp reduction.
+// Grid: (ceil(out_dim/4), 1, batch_rows), Block: (128 = 4 warps)
+extern "C" __global__ __launch_bounds__(128, 8) void talu_fp8_e4m3_matvec_gate_up_silu_f32(
+    const float* __restrict__ input,           // [batch_rows × in_dim]
+    const unsigned char* __restrict__ gate_weight, // [out_dim × in_dim] FP8
+    const unsigned short* __restrict__ gate_scales,// [scale_rows × scale_cols] BF16
+    const unsigned char* __restrict__ up_weight,   // [out_dim × in_dim] FP8
+    const unsigned short* __restrict__ up_scales,  // [scale_rows × scale_cols] BF16
+    float* __restrict__ out,                       // [batch_rows × out_dim]
+    unsigned int out_dim,
+    unsigned int in_dim,
+    unsigned int block_size,
+    unsigned int gate_scale_cols,
+    unsigned int up_scale_cols,
+    unsigned int batch_rows
+) {
+    const unsigned int batch = blockIdx.z;
+    if (batch >= batch_rows) return;
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const float* input_row = input + (unsigned long long)batch * in_dim;
+    const unsigned int* gw = reinterpret_cast<const unsigned int*>(
+        gate_weight + (unsigned long long)out_idx * in_dim);
+    const unsigned int* uw = reinterpret_cast<const unsigned int*>(
+        up_weight + (unsigned long long)out_idx * in_dim);
+    const unsigned int g_sro = (out_idx / block_size) * gate_scale_cols;
+    const unsigned int u_sro = (out_idx / block_size) * up_scale_cols;
+    const unsigned int words_per_row = in_dim >> 2;
+
+    float gate_acc = 0.0f, up_acc = 0.0f;
+
+    for (unsigned int w = lane << 1; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 1) {
+        // Load gate + up weights (2 DRAM reads, input from L2).
+        unsigned int gw0, gw1;
+        asm volatile("ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(gw0), "=r"(gw1) : "l"(&gw[w]));
+        unsigned int uw0, uw1;
+        asm volatile("ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(uw0), "=r"(uw1) : "l"(&uw[w]));
+
+        const unsigned int base = w << 2;
+        const float gs0 = fp8_bf16_to_f32(gate_scales[g_sro + base / block_size]);
+        const float gs1 = fp8_bf16_to_f32(gate_scales[g_sro + (base + 4) / block_size]);
+        const float us0 = fp8_bf16_to_f32(up_scales[u_sro + base / block_size]);
+        const float us1 = fp8_bf16_to_f32(up_scales[u_sro + (base + 4) / block_size]);
+
+        float r0, r1;
+
+        // Word 0: gate + up against same input (L2-cached).
+        const float4 inp0 = *reinterpret_cast<const float4*>(&input_row[base]);
+        r0 = 0.0f; r1 = 0.0f;
+        FP8_PROCESS_WORD(gw0, inp0, r0, r1);
+        gate_acc = fmaf(r0 + r1, gs0, gate_acc);
+        r0 = 0.0f; r1 = 0.0f;
+        FP8_PROCESS_WORD(uw0, inp0, r0, r1);
+        up_acc = fmaf(r0 + r1, us0, up_acc);
+
+        // Word 1: gate + up.
+        const float4 inp1 = *reinterpret_cast<const float4*>(&input_row[base + 4]);
+        r0 = 0.0f; r1 = 0.0f;
+        FP8_PROCESS_WORD(gw1, inp1, r0, r1);
+        gate_acc = fmaf(r0 + r1, gs1, gate_acc);
+        r0 = 0.0f; r1 = 0.0f;
+        FP8_PROCESS_WORD(uw1, inp1, r0, r1);
+        up_acc = fmaf(r0 + r1, us1, up_acc);
+    }
+
+    float g = talu_quant_warp_sum_f32(gate_acc);
+    float u = talu_quant_warp_sum_f32(up_acc);
+    if (lane == 0) {
+        const float sigma = 1.0f / (1.0f + expf(-g));
+        out[(unsigned long long)batch * out_dim + out_idx] = g * sigma * u;
+    }
+}
+
+// Fused FP8 gate+up (separate outputs, no SiLU): warps handle either gate or up
+// rows in a single grid. Halves kernel launch overhead.
+// Grid: (ceil(total_dim/4), 1, batch_rows), Block: (128 = 4 warps)
+extern "C" __global__ __launch_bounds__(128, 8) void talu_fp8_e4m3_matvec_gate_up_f32(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ gate_weight,
+    const unsigned short* __restrict__ gate_scales,
+    float* __restrict__ gate_out,
+    unsigned int gate_out_dim,
+    const unsigned char* __restrict__ up_weight,
+    const unsigned short* __restrict__ up_scales,
+    float* __restrict__ up_out,
+    unsigned int up_out_dim,
+    unsigned int in_dim,
+    unsigned int block_size,
+    unsigned int gate_scale_cols,
+    unsigned int up_scale_cols,
+    unsigned int batch_rows
+) {
+    const unsigned int batch = blockIdx.z;
+    if (batch >= batch_rows) return;
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_index = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
+    const unsigned int total_dim = gate_out_dim + up_out_dim;
+    if (out_index >= total_dim) return;
+
+    const unsigned char* wt;
+    const unsigned short* sc;
+    float* out_ptr;
+    unsigned int out_dim_proj, row_idx, sc_cols;
+
+    if (out_index < gate_out_dim) {
+        wt = gate_weight; sc = gate_scales; out_ptr = gate_out;
+        out_dim_proj = gate_out_dim; row_idx = out_index; sc_cols = gate_scale_cols;
+    } else {
+        wt = up_weight; sc = up_scales; out_ptr = up_out;
+        out_dim_proj = up_out_dim; row_idx = out_index - gate_out_dim; sc_cols = up_scale_cols;
+    }
+
+    const float* input_row = input + (unsigned long long)batch * in_dim;
+    const unsigned int* weight_words = reinterpret_cast<const unsigned int*>(
+        wt + (unsigned long long)row_idx * in_dim);
+    const unsigned int scale_row_off = (row_idx / block_size) * sc_cols;
+    const unsigned int words_per_row = in_dim >> 2;
+
+    float acc = 0.0f;
+    talu_fp8_e4m3_dot(input_row, weight_words, sc, scale_row_off,
+                      words_per_row, block_size, lane, acc);
+
+    acc = talu_quant_warp_sum_f32(acc);
+    if (lane == 0) {
+        out_ptr[(unsigned long long)batch * out_dim_proj + row_idx] = acc;
+    }
+}
+
+#else
+
+extern "C" __global__ void talu_fp8_e4m3_matvec_f32(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ weight,
+    const unsigned short* __restrict__ scales,
+    float* __restrict__ out,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int block_size,
+    unsigned int scale_cols,
+    unsigned int batch_rows
+) {}
+
+extern "C" __global__ void talu_fp8_e4m3_matvec_gate_up_silu_f32(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ gate_weight,
+    const unsigned short* __restrict__ gate_scales,
+    const unsigned char* __restrict__ up_weight,
+    const unsigned short* __restrict__ up_scales,
+    float* __restrict__ out,
+    unsigned int out_dim,
+    unsigned int in_dim,
+    unsigned int block_size,
+    unsigned int gate_scale_cols,
+    unsigned int up_scale_cols,
+    unsigned int batch_rows
+) {}
+
+extern "C" __global__ void talu_fp8_e4m3_matvec_gate_up_f32(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ gate_weight,
+    const unsigned short* __restrict__ gate_scales,
+    float* __restrict__ gate_out,
+    unsigned int gate_out_dim,
+    const unsigned char* __restrict__ up_weight,
+    const unsigned short* __restrict__ up_scales,
+    float* __restrict__ up_out,
+    unsigned int up_out_dim,
+    unsigned int in_dim,
+    unsigned int block_size,
+    unsigned int gate_scale_cols,
+    unsigned int up_scale_cols,
+    unsigned int batch_rows
+) {}
+
+#endif // __CUDA_ARCH__ >= 890
+
+// ---------------------------------------------------------------------------
+// FP8 E4M3 → BF16 dequantization with per-block scales (for prefill via cuBLAS)
+// ---------------------------------------------------------------------------
+// Converts FP8 E4M3 weights to BF16 by applying per-block BF16 scales.
+// Launch: grid=(ceil(in_dim/256), out_dim), block=(256)
+
+#if __CUDA_ARCH__ >= 890
+
+extern "C" __global__ void talu_dequant_fp8_e4m3_to_bf16(
+    const unsigned char* __restrict__ weight,   // [out_dim × in_dim] FP8 E4M3 bytes
+    const unsigned short* __restrict__ scales,  // [scale_rows × scale_cols] BF16
+    unsigned short* __restrict__ out_bf16,      // [out_dim × in_dim] BF16
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int block_size,
+    unsigned int scale_cols
+) {
+    const unsigned int row = blockIdx.y;
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= out_dim || col >= in_dim) return;
+
+    const unsigned long long idx = (unsigned long long)row * in_dim + col;
+    const unsigned int scale_row = row / block_size;
+    const unsigned int scale_col = col / block_size;
+    const float block_scale = fp8_bf16_to_f32(scales[scale_row * scale_cols + scale_col]);
+
+    // FP8 → F32 → scale → BF16
+    const float val = fp8e4m3_to_f32(static_cast<__nv_fp8_storage_t>(weight[idx])) * block_scale;
+    // F32 → BF16: round-to-nearest-even
+    unsigned int fbits;
+    memcpy(&fbits, &val, sizeof(fbits));
+    const unsigned int lsb = (fbits >> 16) & 1u;
+    const unsigned int rounding_bias = 0x7FFFu + lsb;
+    out_bf16[idx] = static_cast<unsigned short>((fbits + rounding_bias) >> 16);
+}
+
+#else
+
+extern "C" __global__ void talu_dequant_fp8_e4m3_to_bf16(
+    const unsigned char* __restrict__ weight,
+    const unsigned short* __restrict__ scales,
+    unsigned short* __restrict__ out_bf16,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int block_size,
+    unsigned int scale_cols
+) {}
+
+#endif // __CUDA_ARCH__ >= 890
+
+// Scale F32 output rows by per-row activation scales (FP8 dequant step).
+// Launch: grid=(ceil(out_dim/256), rows), block=(256)
+extern "C" __global__ void talu_scale_rows_f32(
+    float* __restrict__ output,             // [rows × out_dim]
+    const float* __restrict__ row_scales,   // [rows]
+    unsigned int rows,
+    unsigned int out_dim
+) {
+    const unsigned int m = blockIdx.y;
+    const unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= rows || n >= out_dim) return;
+    const unsigned long long idx = (unsigned long long)m * out_dim + n;
+    output[idx] *= row_scales[m];
 }

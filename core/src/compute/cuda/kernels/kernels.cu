@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 
 // Aggregation unit for CUDA kernel symbols compiled into kernels.fatbin.

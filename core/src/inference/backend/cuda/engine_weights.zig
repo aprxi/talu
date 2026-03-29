@@ -412,7 +412,171 @@ pub fn uploadLinearWeight(
     if (src.dtype == .grouped_affine_u8) {
         return uploadLinearWeightGroupedAffineU8(device, src, input_dim);
     }
+    if (src.dtype == .f8_e4m3) {
+        return uploadLinearWeightFp8(device, src, input_dim);
+    }
+    // TALU_CUDA_QUANTIZE_FP8=1: runtime-quantize BF16 weights to FP8 E4M3
+    // with per-block [128,128] scales. Halves DRAM bandwidth for decode.
+    if (src.dtype == .bf16 and engine_types.resolveCudaQuantizeFp8()) {
+        return uploadLinearWeightBf16AsFp8(device, allocator, src, input_dim) catch
+            uploadLinearWeightDense(device, allocator, src, input_dim);
+    }
     return uploadLinearWeightDense(device, allocator, src, input_dim);
+}
+
+fn uploadLinearWeightFp8(
+    device: *compute.cuda.Device,
+    src: *const Tensor,
+    input_dim: usize,
+) !LinearWeight {
+    if (src.n_dims != 2) return error.UnsupportedModel;
+    const fp8_meta = src.fp8 orelse return error.UnsupportedModel;
+
+    const dim0: usize = @intCast(src.shape[0]);
+    const dim1: usize = @intCast(src.shape[1]);
+
+    // Expect [out_dim, in_dim] layout (standard for HF FP8 models)
+    var out_dim: usize = undefined;
+    var in_dim: usize = undefined;
+    if (dim1 == input_dim) {
+        out_dim = dim0;
+        in_dim = dim1;
+    } else if (dim0 == input_dim) {
+        // Transposed layout not supported for raw FP8 bytes
+        return error.UnsupportedModel;
+    } else {
+        return error.UnsupportedModel;
+    }
+
+    const byte_count = std.math.mul(usize, out_dim, in_dim) catch return error.InvalidArgument;
+    const src_bytes = src.data();
+    if (src_bytes.len < byte_count) return error.InvalidArgument;
+
+    var buffer = try device.allocBuffer(byte_count);
+    errdefer buffer.deinit(device);
+    try buffer.upload(device, src_bytes[0..byte_count]);
+
+    // Upload per-block BF16 scales if present
+    var scales_buffer: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 };
+    if (fp8_meta.block_scales_data) |scales_ptr| {
+        if (fp8_meta.block_scales_len > 0) {
+            scales_buffer = try device.allocBuffer(fp8_meta.block_scales_len);
+            errdefer scales_buffer.deinit(device);
+            try scales_buffer.upload(device, scales_ptr[0..fp8_meta.block_scales_len]);
+        }
+    }
+
+    return .{ .fp8 = .{
+        .rows = in_dim,
+        .cols = out_dim,
+        .buffer = buffer,
+        .scales_buffer = scales_buffer,
+        .scale_rows = fp8_meta.scale_rows,
+        .scale_cols = fp8_meta.scale_cols,
+        .block_size = fp8_meta.block_size,
+        .weight_scale_inv = fp8_meta.scale_inv,
+    } };
+}
+
+/// Quantize a BF16 weight tensor to FP8 E4M3 with per-block scales on CPU,
+/// then upload FP8 bytes + BF16 scales to GPU. Halves DRAM bandwidth per token
+/// at the cost of minor quantization error.
+fn uploadLinearWeightBf16AsFp8(
+    device: *compute.cuda.Device,
+    allocator: std.mem.Allocator,
+    src: *const Tensor,
+    input_dim: usize,
+) !LinearWeight {
+    if (src.n_dims != 2) return error.UnsupportedModel;
+    if (src.dtype != .bf16) return error.UnsupportedModel;
+    if (src.shape[0] <= 0 or src.shape[1] <= 0) return error.InvalidArgument;
+
+    const rows: usize = @intCast(src.shape[0]);
+    const cols: usize = @intCast(src.shape[1]);
+    const elem_count = std.math.mul(usize, rows, cols) catch return error.InvalidArgument;
+
+    const host_u16 = src.asSliceUnaligned(u16);
+    if (host_u16.len < elem_count) return error.InvalidArgument;
+    const view = host_u16[0..elem_count];
+
+    // Resolve layout: BF16 weights come in [out_dim, in_dim]
+    const layout = resolveDenseOutInLayout(rows, cols, input_dim) catch return error.UnsupportedModel;
+    if (layout.needs_transpose) {
+        // FP8 upload expects [out_dim, in_dim] row-major; transpose not yet supported
+        return error.UnsupportedModel;
+    }
+    const out_dim = layout.out_dim;
+    const in_dim = layout.in_dim;
+
+    // Per-block quantization with block_size=128
+    const block_size: u32 = 128;
+    const bs: usize = @intCast(block_size);
+    const scale_rows: u32 = @intCast((out_dim + bs - 1) / bs);
+    const scale_cols: u32 = @intCast((in_dim + bs - 1) / bs);
+    const n_blocks = @as(usize, scale_rows) * @as(usize, scale_cols);
+
+    // Allocate output buffers
+    const fp8_bytes = try allocator.alloc(u8, elem_count);
+    defer allocator.free(fp8_bytes);
+    const scale_u16s = try allocator.alloc(u16, n_blocks);
+    defer allocator.free(scale_u16s);
+
+    // Quantize each block
+    for (0..scale_rows) |br| {
+        const row_start = br * bs;
+        const row_end = @min(row_start + bs, out_dim);
+        for (0..scale_cols) |bc| {
+            const col_start = bc * bs;
+            const col_end = @min(col_start + bs, in_dim);
+
+            // Find absmax in this block
+            var block_max: f32 = 0;
+            for (row_start..row_end) |r| {
+                const row_offset = r * in_dim;
+                for (col_start..col_end) |c| {
+                    const f = dtype.bf16ToF32(view[row_offset + c]);
+                    const a = @abs(f);
+                    if (a > block_max) block_max = a;
+                }
+            }
+
+            // scale_inv = max / 448, stored as BF16
+            const scale_inv: f32 = if (block_max > 0) block_max / 448.0 else 1.0;
+            const inv_scale: f32 = 1.0 / scale_inv;
+            scale_u16s[br * @as(usize, scale_cols) + bc] = dtype.f32ToBf16(scale_inv);
+
+            // Quantize block values
+            for (row_start..row_end) |r| {
+                const row_offset = r * in_dim;
+                for (col_start..col_end) |c| {
+                    const f = dtype.bf16ToF32(view[row_offset + c]);
+                    fp8_bytes[row_offset + c] = dtype.f32ToFp8E4M3(f * inv_scale);
+                }
+            }
+        }
+    }
+
+    // Upload FP8 weight bytes
+    var buffer = try device.allocBuffer(elem_count);
+    errdefer buffer.deinit(device);
+    try buffer.upload(device, fp8_bytes);
+
+    // Upload BF16 per-block scales
+    const scales_byte_len = n_blocks * @sizeOf(u16);
+    var scales_buffer = try device.allocBuffer(scales_byte_len);
+    errdefer scales_buffer.deinit(device);
+    try scales_buffer.upload(device, std.mem.sliceAsBytes(scale_u16s));
+
+    return .{ .fp8 = .{
+        .rows = in_dim,
+        .cols = out_dim,
+        .buffer = buffer,
+        .scales_buffer = scales_buffer,
+        .scale_rows = scale_rows,
+        .scale_cols = scale_cols,
+        .block_size = block_size,
+        .weight_scale_inv = 1.0,
+    } };
 }
 
 pub fn uploadLinearWeightWithContext(
