@@ -1416,6 +1416,15 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     if (self.kernel_registry.resolveFunction("fp8_e4m3_matvec_gate_up_f32", "talu_fp8_e4m3_matvec_gate_up_f32")) |resolved| {
         self.fp8_matvec_gate_up_function = resolved.function;
     } else |_| {}
+    if (self.kernel_registry.resolveFunction("fp8_e4m3_matvec_f32_tile8", "talu_fp8_e4m3_matvec_f32_tile8")) |resolved| {
+        self.fp8_matvec_tile8_function = resolved.function;
+    } else |_| {}
+    if (self.kernel_registry.resolveFunction("fp8_e4m3_matvec_gate_up_silu_f32_tile8", "talu_fp8_e4m3_matvec_gate_up_silu_f32_tile8")) |resolved| {
+        self.fp8_matvec_gate_up_silu_tile8_function = resolved.function;
+    } else |_| {}
+    if (self.kernel_registry.resolveFunction("fp8_e4m3_matvec_gate_up_f32_tile8", "talu_fp8_e4m3_matvec_gate_up_f32_tile8")) |resolved| {
+        self.fp8_matvec_gate_up_tile8_function = resolved.function;
+    } else |_| {}
 
     const has_u8_dequant = self.gaffine_u8_dequant_f16_function != null;
     const has_u4_dequant = self.gaffine_u4_dequant_f16_function != null;

@@ -66,6 +66,7 @@ pub const QuantMethodEnum = enum(i32) {
     gaffine = 1,
     mxfp4 = 2,
     native = 3,
+    fp8 = 4,
 };
 
 /// Model information returned by describe.
@@ -407,6 +408,7 @@ pub export fn talu_execution_plan(info: *const ModelInfo) callconv(.c) Execution
         .none, .native => .none,
         .gaffine => .gaffine,
         .mxfp4 => .mxfp4,
+        .fp8 => .fp8,
     };
     const config = execution_plan.configFromDescribe(.{
         .model_type = if (info.model_type) |mt| std.mem.sliceTo(mt, 0) else null,

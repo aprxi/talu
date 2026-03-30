@@ -578,6 +578,7 @@ pub const QuantMethod = enum {
     gaffine,
     mxfp4,
     native, // reserved, not currently used
+    fp8,
 };
 
 pub const RopeScaling = struct {

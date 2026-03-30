@@ -757,11 +757,21 @@ pub fn linearForwardRows(
         },
         .fp8 => |w| {
             // Decode path: FP8 GEMV with per-block BF16 scales (DRAM-bound, 1 byte/weight).
+            // Uses batched template: tile4 for rows<=4, tile8 for rows>4.
+            // Weight loaded once from DRAM, reused across batch rows.
             if (rows <= 32) fp8_gemv: {
                 if (w.scales_buffer.pointer == 0 or w.scales_buffer.size == 0) break :fp8_gemv;
-                const fp8_fn = self.fp8_matvec_function orelse break :fp8_gemv;
+                var fp8_fn = self.fp8_matvec_function orelse break :fp8_gemv;
+                var fp8_batch_tile: u32 = 4;
+                if (rows > 4) {
+                    if (self.fp8_matvec_tile8_function) |tile8_fn| {
+                        fp8_fn = tile8_fn;
+                        fp8_batch_tile = 8;
+                    }
+                }
 
                 const out_cols: u32 = @intCast(w.cols);
+                const batch_rows: u32 = @intCast(rows);
                 self.kernel_arg_pack.reset();
                 self.kernel_arg_pack.appendBufferPtr(&packed_input) catch break :fp8_gemv;
                 self.kernel_arg_pack.appendBufferPtr(&w.buffer) catch break :fp8_gemv;
@@ -771,11 +781,10 @@ pub fn linearForwardRows(
                 self.kernel_arg_pack.appendScalar(u32, out_cols) catch break :fp8_gemv;
                 self.kernel_arg_pack.appendScalar(u32, w.block_size) catch break :fp8_gemv;
                 self.kernel_arg_pack.appendScalar(u32, w.scale_cols) catch break :fp8_gemv;
-                self.kernel_arg_pack.appendScalar(u32, @intCast(rows)) catch break :fp8_gemv;
+                self.kernel_arg_pack.appendScalar(u32, batch_rows) catch break :fp8_gemv;
                 compute.cuda.launch.launchWithFamily(&self.device, fp8_fn, .{
                     .grid_x = (out_cols + 3) / 4,
-                    .grid_y = 1,
-                    .grid_z = @intCast(rows),
+                    .grid_y = (batch_rows + fp8_batch_tile - 1) / fp8_batch_tile,
                     .block_x = 128,
                 }, &self.kernel_arg_pack, .matvec) catch break :fp8_gemv;
                 return;
@@ -1934,7 +1943,14 @@ pub fn tryFusedFp8GateUpSiluForward(
     if (gate.rows != self.d_model) return false;
     if (gate.scales_buffer.pointer == 0 or up.scales_buffer.pointer == 0) return false;
 
-    const fused_fn = self.fp8_matvec_gate_up_silu_function orelse return false;
+    var fused_fn = self.fp8_matvec_gate_up_silu_function orelse return false;
+    var fp8_batch_tile: u32 = 4;
+    if (rows > 4) {
+        if (self.fp8_matvec_gate_up_silu_tile8_function) |tile8_fn| {
+            fused_fn = tile8_fn;
+            fp8_batch_tile = 8;
+        }
+    }
 
     const out_dim: u32 = @intCast(gate.cols);
     const in_dim: u32 = @intCast(gate.rows);
@@ -1953,10 +1969,10 @@ pub fn tryFusedFp8GateUpSiluForward(
     try self.kernel_arg_pack.appendScalar(u32, up.scale_cols);
     try self.kernel_arg_pack.appendScalar(u32, @intCast(rows));
 
+    const batch_rows: u32 = @intCast(rows);
     try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
         .grid_x = (out_dim + 3) / 4,
-        .grid_y = 1,
-        .grid_z = @intCast(rows),
+        .grid_y = (batch_rows + fp8_batch_tile - 1) / fp8_batch_tile,
         .block_x = 128,
     }, &self.kernel_arg_pack, .matvec_gate_up_silu);
     return true;
@@ -1983,7 +1999,14 @@ pub fn tryFusedFp8GateUpForward(
     if (gate.rows != self.d_model) return false;
     if (gate.scales_buffer.pointer == 0 or up.scales_buffer.pointer == 0) return false;
 
-    const fused_fn = self.fp8_matvec_gate_up_function orelse return false;
+    var fused_fn = self.fp8_matvec_gate_up_function orelse return false;
+    var fp8_batch_tile: u32 = 4;
+    if (rows > 4) {
+        if (self.fp8_matvec_gate_up_tile8_function) |tile8_fn| {
+            fused_fn = tile8_fn;
+            fp8_batch_tile = 8;
+        }
+    }
 
     const gate_out_dim: u32 = @intCast(gate.cols);
     const up_out_dim: u32 = @intCast(up.cols);
@@ -2006,10 +2029,10 @@ pub fn tryFusedFp8GateUpForward(
     try self.kernel_arg_pack.appendScalar(u32, up.scale_cols);
     try self.kernel_arg_pack.appendScalar(u32, @intCast(rows));
 
+    const fp8_batch_rows: u32 = @intCast(rows);
     try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
         .grid_x = (total_dim + 3) / 4,
-        .grid_y = 1,
-        .grid_z = @intCast(rows),
+        .grid_y = (fp8_batch_rows + fp8_batch_tile - 1) / fp8_batch_tile,
         .block_x = 128,
     }, &self.kernel_arg_pack, .matvec);
     return true;

@@ -122,6 +122,7 @@ fn format_quant(method: talu::QuantMethod, bits: i32, group_size: i32) -> String
             format!("GAF{}_{}", bits, group_size)
         }
         talu::QuantMethod::Mxfp4 => "MXFP4".into(),
+        talu::QuantMethod::Fp8 => "FP8".into(),
     }
 }
 

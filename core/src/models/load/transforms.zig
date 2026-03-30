@@ -661,16 +661,19 @@ pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTens
             const s_cols: usize = @intCast(scale_tensor.shape[1]);
             const w_rows: usize = @intCast(weight_tensor.shape[0]);
             const w_cols: usize = @intCast(weight_tensor.shape[1]);
-            if (w_rows % s_rows != 0 or w_cols % s_cols != 0) {
+            if (s_rows == 0 or s_cols == 0) {
                 const dequantized = try dequantizeFp8WeightPerBlock(allocator, weight_tensor, scale_tensor, expected_in);
                 return orientWeightTyped(allocator, dequantized, expected_in);
             }
-            const block_size = w_rows / s_rows;
-            if (block_size != w_cols / s_cols) {
+            // Derive block size via ceil division (handles non-aligned last blocks)
+            const block_row_size = (w_rows + s_rows - 1) / s_rows;
+            const block_col_size = (w_cols + s_cols - 1) / s_cols;
+            if (block_row_size != block_col_size) {
                 // Non-square blocks — fall back to BF16 dequant
                 const dequantized = try dequantizeFp8WeightPerBlock(allocator, weight_tensor, scale_tensor, expected_in);
                 return orientWeightTyped(allocator, dequantized, expected_in);
             }
+            const block_size = block_row_size;
             const scale_data = scale_tensor.data();
             const scale_byte_len = s_rows * s_cols * @sizeOf(u16);
             if (scale_data.len < scale_byte_len) {
@@ -1026,19 +1029,11 @@ fn dequantizeFp8WeightPerBlock(
         return error.InvalidShape;
     }
 
-    // Calculate block size (each scale value covers a block)
-    if (rows % scale_rows != 0 or cols % scale_cols != 0) {
-        log.trace("load", "FP8 per-block: scale shape doesn't divide weight shape", .{
-            .weight_rows = rows,
-            .weight_cols = cols,
-            .scale_rows = scale_rows,
-            .scale_cols = scale_cols,
-        }, @src());
-        return error.InvalidShape;
-    }
-
-    const block_row_size = rows / scale_rows;
-    const block_col_size = cols / scale_cols;
+    // Derive block size from scale grid (handles non-aligned dimensions via ceil division).
+    // scale_rows = ceil(rows / block_size), so block_size = ceil(rows / scale_rows).
+    if (scale_rows == 0 or scale_cols == 0) return error.InvalidShape;
+    const block_row_size = (rows + scale_rows - 1) / scale_rows;
+    const block_col_size = (cols + scale_cols - 1) / scale_cols;
 
     log.trace("load", "FP8 per-block dequantizing", .{
         .weight_rows = rows,

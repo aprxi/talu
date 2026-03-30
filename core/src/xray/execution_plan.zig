@@ -35,6 +35,7 @@ pub const QuantMethod = enum(u8) {
     none = 0,
     gaffine = 1, // Grouped affine (MLX-style Q4/Q8)
     mxfp4 = 2, // MXFP4 block floating point
+    fp8 = 3, // FP8 E4M3 per-block quantization
 };
 
 /// Model configuration for execution plan analysis.

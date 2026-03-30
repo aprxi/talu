@@ -198,8 +198,23 @@ pub fn convertToGroupedAffine(
         }
     }
 
+    // For heterogeneous models, parse layer_types from config.json so we use
+    // the correct variant for each layer (avoids falling off a short static layer_map).
+    var layer_types_override: ?[]const u8 = null;
+    defer if (layer_types_override) |lt| allocator.free(lt);
+
     if (runtime_arch) |arch| {
-        layout_map = convert.buildWeightLayoutMap(allocator, arch, @intCast(model_config.n_layers)) catch |err| blk: {
+        if (arch.isHeterogeneous()) {
+            if (arch.block_variants) |variants| {
+                const variant_names = try allocator.alloc([]const u8, variants.len);
+                defer allocator.free(variant_names);
+                for (variants, 0..) |variant, i| {
+                    variant_names[i] = variant.name;
+                }
+                layer_types_override = config_loader.parseLayerTypes(allocator, model_bundle.config_path(), variant_names, arch.variant_aliases) catch null;
+            }
+        }
+        layout_map = convert.buildWeightLayoutMapWithOverride(allocator, arch, @intCast(model_config.n_layers), layer_types_override) catch |err| blk: {
             log.warn("converter", "Failed to build layout map", .{ .err = @errorName(err), .arch = arch.name });
             break :blk null;
         };

@@ -216,11 +216,15 @@ Grouped Affine (DEFAULT):
   gaf8_64    8-bit, group_size=64
   gaf8_128   8-bit, group_size=128
 
+Floating Point 8-bit:
+  fp8        FP8 E4M3, block_size=128x128
+
 Output naming:
   Models are saved with hierarchical paths: {output_dir}/{org}/{model}-{SUFFIX}
   Examples:
     Qwen/Qwen3-0.6B + gaf4_64 -> models/Qwen/Qwen3-0.6B-GAF4
     Qwen/Qwen3-0.6B + gaf8_64 -> models/Qwen/Qwen3-0.6B-GAF8
+    Qwen/Qwen3-0.6B + fp8     -> models/Qwen/Qwen3-0.6B-FP8
 
 Environment Variables:
   THREADS=N         Number of threads for quantization (default: CPU count)
@@ -256,6 +260,9 @@ fn print_available_schemes() {
     gaf8_32    8-bit, group_size=32
     gaf8_64    8-bit, group_size=64
     gaf8_128   8-bit, group_size=128
+
+  Floating Point 8-bit:
+    fp8        FP8 E4M3, block_size=128x128
 
 Usage: talu convert -m <model> --scheme <SCHEME>
 "#;

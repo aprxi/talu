@@ -16,6 +16,8 @@ pub enum QuantMethod {
     Mxfp4,
     /// Native format (reserved, not currently used)
     Native,
+    /// FP8 E4M3 per-block quantization
+    Fp8,
 }
 
 impl From<talu_sys::QuantMethodEnum> for QuantMethod {
@@ -25,6 +27,7 @@ impl From<talu_sys::QuantMethodEnum> for QuantMethod {
             talu_sys::QuantMethodEnum::Gaffine => QuantMethod::Gaffine,
             talu_sys::QuantMethodEnum::Mxfp4 => QuantMethod::Mxfp4,
             talu_sys::QuantMethodEnum::Native => QuantMethod::Native,
+            talu_sys::QuantMethodEnum::Fp8 => QuantMethod::Fp8,
         }
     }
 }

@@ -17,6 +17,7 @@ const models_registry = @import("../models/registry.zig");
 
 pub const mapping = @import("mapping.zig");
 pub const grouped_affine = @import("grouped_affine.zig");
+pub const fp8 = @import("fp8.zig");
 pub const gaf_paths = @import("gaf_paths.zig");
 pub const scheme = @import("scheme.zig");
 pub const model_card = @import("model_card.zig");
@@ -202,6 +203,15 @@ pub fn buildWeightLayoutMap(
     arch: *const op_types.Architecture,
     num_layers: usize,
 ) !WeightLayoutMap {
+    return buildWeightLayoutMapWithOverride(allocator, arch, num_layers, null);
+}
+
+pub fn buildWeightLayoutMapWithOverride(
+    allocator: std.mem.Allocator,
+    arch: *const op_types.Architecture,
+    num_layers: usize,
+    layer_types_override: ?[]const u8,
+) !WeightLayoutMap {
     var layout_map = WeightLayoutMap.init(allocator);
     errdefer layout_map.deinit();
 
@@ -226,7 +236,7 @@ pub fn buildWeightLayoutMap(
     // Add block weights for each layer
     for (0..num_layers) |layer_idx| {
         // Get the weights for this layer (handles heterogeneous models)
-        const weights = getWeightsForLayer(arch, layer_idx);
+        const weights = getWeightsForLayerWithOverride(arch, layer_idx, layer_types_override);
 
         for (weights) |weight_spec| {
             var alias_idx: usize = 0;
@@ -340,9 +350,13 @@ fn addConversionFusionsForPrefix(
 
 /// Get the weight specs for a given layer (handles heterogeneous models).
 fn getWeightsForLayer(arch: *const op_types.Architecture, layer_idx: usize) []const op_types.WeightSpec {
+    return getWeightsForLayerWithOverride(arch, layer_idx, null);
+}
+
+fn getWeightsForLayerWithOverride(arch: *const op_types.Architecture, layer_idx: usize, layer_types_override: ?[]const u8) []const op_types.WeightSpec {
     if (arch.block_variants) |variants| {
-        // Heterogeneous model - get weights from the appropriate variant
-        const variant_idx = arch.getVariantIndex(layer_idx);
+        // Heterogeneous model - use override (from config.json) when available
+        const variant_idx = arch.getVariantIndexWithOverride(layer_idx, layer_types_override);
         if (variant_idx < variants.len) {
             return variants[variant_idx].weights;
         }

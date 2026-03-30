@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const grouped_affine = @import("grouped_affine.zig");
+const fp8_converter = @import("fp8.zig");
 const progress_api = @import("../capi/progress.zig");
 
 // =============================================================================
@@ -581,7 +582,30 @@ pub fn convert(
 
             return .{ .output_path = output_path };
         },
-        .fp8, .mxfp4, .nvfp4 => {
+        .fp8 => {
+            const output_path = fp8_converter.convertToFp8(allocator, model_path, .{
+                .output_dir = output_dir,
+                .destination = destination,
+                .output_suffix = scheme.toOutputSuffix(),
+                .force = options.force,
+                .max_shard_size = options.max_shard_size,
+                .progress = options.progressContext(),
+            }) catch |err| {
+                return .{ .err = err };
+            };
+
+            if (options.return_model_id) {
+                const model_id = fp8_converter.modelIdFromOutputPath(allocator, output_path) catch {
+                    allocator.free(output_path);
+                    return .{ .err = error.InvalidOutputPath };
+                };
+                allocator.free(output_path);
+                return .{ .output_path = model_id };
+            }
+
+            return .{ .output_path = output_path };
+        },
+        .mxfp4, .nvfp4 => {
             return .{ .err = error.UnsupportedFormat };
         },
     }

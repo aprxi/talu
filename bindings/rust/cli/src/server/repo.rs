@@ -1424,5 +1424,6 @@ fn format_quant_scheme(method: talu::model::QuantMethod, bits: i32, group_size: 
         talu::model::QuantMethod::Gaffine => format!("GAF{}_{}", bits, group_size),
         talu::model::QuantMethod::Mxfp4 => "MXFP4".to_string(),
         talu::model::QuantMethod::Native => format!("GAF{}_{}", bits, group_size),
+        talu::model::QuantMethod::Fp8 => "FP8".to_string(),
     }
 }

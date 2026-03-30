@@ -562,6 +562,7 @@ pub fn loadConfigForArchitectureWithHook(
         // Check quantization_config first (both quant_method and mode fields)
         if (config_json.quantization_config) |quant_config| {
             if (quant_config.quant_method) |method| {
+                if (std.mem.eql(u8, method, "fp8")) break :blk .fp8;
                 if (std.mem.eql(u8, method, "mxfp4")) break :blk .mxfp4;
                 if (std.mem.eql(u8, method, "talu")) break :blk .native;
             }
@@ -758,6 +759,7 @@ pub const QuantMethod = enum(c_int) {
     gaffine = 1,
     mxfp4 = 2,
     native = 3,
+    fp8 = 4,
 };
 
 /// C-compatible model description with null-terminated strings.
@@ -815,6 +817,7 @@ pub const ModelDescription = struct {
             .gaffine => config.gaffine_bits,
             .mxfp4 => 4,
             .native => 4,
+            .fp8 => 8,
         };
 
         // Allocate null-terminated strings for C interop
@@ -851,6 +854,7 @@ pub const ModelDescription = struct {
                 .gaffine => .gaffine,
                 .mxfp4 => .mxfp4,
                 .native => .native,
+                .fp8 => .fp8,
             },
             .model_type = model_type,
             .architecture = architecture,
