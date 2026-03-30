@@ -122,3 +122,56 @@ fn document_incorrect_signature() {
     // The compile-time assertions in this file catch the wrong signature
     // by failing to compile when the types don't match.
 }
+
+// =============================================================================
+// CGenerateConfig default values must match Zig sentinel conventions
+// =============================================================================
+// The Zig side uses sentinel values to distinguish "not set" from "set to zero":
+//   max_reasoning_tokens = maxInt(usize) means "unset" (use default budget)
+//   temperature = -1.0 means "unset" (use model default)
+//
+// If the generator produces 0/0.0 defaults, the Zig side interprets them as
+// "explicitly disabled" — breaking thinking, forcing greedy sampling, etc.
+
+#[test]
+fn generate_config_defaults_match_zig_sentinels() {
+    let cfg = talu_sys::CGenerateConfig::default();
+
+    assert_eq!(
+        cfg.max_reasoning_tokens,
+        usize::MAX,
+        "max_reasoning_tokens must default to usize::MAX (unset sentinel)"
+    );
+    assert_eq!(
+        cfg.temperature, -1.0_f32,
+        "temperature must default to -1.0 (unset sentinel)"
+    );
+    assert_eq!(
+        cfg.top_p, -1.0_f32,
+        "top_p must default to -1.0 (unset sentinel)"
+    );
+    assert_eq!(
+        cfg.min_p, -1.0_f32,
+        "min_p must default to -1.0 (unset sentinel)"
+    );
+    assert_eq!(
+        cfg.repetition_penalty, -1.0_f32,
+        "repetition_penalty must default to -1.0 (unset sentinel)"
+    );
+    assert_eq!(
+        cfg.presence_penalty, -1.0_f32,
+        "presence_penalty must default to -1.0 (unset sentinel)"
+    );
+    assert_eq!(
+        cfg.frequency_penalty, -1.0_f32,
+        "frequency_penalty must default to -1.0 (unset sentinel)"
+    );
+    assert_eq!(
+        cfg.completions_mode, 0,
+        "completions_mode must default to 0 (off)"
+    );
+    assert_eq!(
+        cfg.raw_output, 0,
+        "raw_output must default to 0 (off)"
+    );
+}
