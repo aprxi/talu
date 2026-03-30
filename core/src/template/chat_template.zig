@@ -797,3 +797,65 @@ test "renderWithContext tools with thinking enabled" {
     // Should contain <think> tag (thinking enabled)
     try std.testing.expect(std.mem.indexOf(u8, result, "<think>") != null);
 }
+
+test "render Qwen3.5-style tool continuation" {
+    // Minimal reproduction of the Qwen3.5 template patterns that handle
+    // tool_calls on assistant messages and tool role responses.
+    // This template uses: messages[::-1], loop.previtem, loop.nextitem,
+    // namespace, content.startswith, tool_call.function.
+    const allocator = std.testing.allocator;
+
+    const template =
+        \\{%- set ns = namespace(last_query_index=messages|length - 1) -%}
+        \\{%- for message in messages[::-1] -%}
+        \\{%- set index = (messages|length - 1) - loop.index0 -%}
+        \\{%- if message.role == "user" -%}
+        \\{%- set ns.last_query_index = index -%}
+        \\{%- endif -%}
+        \\{%- endfor -%}
+        \\{%- for message in messages -%}
+        \\{%- if message.role == "user" -%}
+        \\<|user|>{{ message.content }}
+        \\{%- elif message.role == "assistant" -%}
+        \\{%- set content = message.content if message.content else "" -%}
+        \\<|assistant|>{{ content }}
+        \\{%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping -%}
+        \\{%- for tool_call in message.tool_calls -%}
+        \\{%- if tool_call.function is defined -%}
+        \\{%- set tool_call = tool_call.function -%}
+        \\{%- endif -%}
+        \\<tool_call>{{ tool_call.name }}({{ tool_call.arguments }})</tool_call>
+        \\{%- endfor -%}
+        \\{%- endif -%}
+        \\{%- elif message.role == "tool" -%}
+        \\{%- if loop.previtem and loop.previtem.role != "tool" -%}
+        \\<|tool_start|>
+        \\{%- endif -%}
+        \\<tool_response>{{ message.content }}</tool_response>
+        \\{%- if loop.last or loop.nextitem.role != "tool" -%}
+        \\<|tool_end|>
+        \\{%- endif -%}
+        \\{%- endif -%}
+        \\{%- endfor -%}
+        \\<|assistant|>
+    ;
+
+    const messages_json =
+        \\[
+        \\  {"role": "user", "content": "Weather?"},
+        \\  {"role": "assistant", "content": "", "tool_calls": [
+        \\    {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"NYC\"}"}}
+        \\  ]},
+        \\  {"role": "tool", "tool_call_id": "call_1", "content": "72F sunny"}
+        \\]
+    ;
+
+    const result = try render(allocator, template, messages_json, "", "", true);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Weather?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "get_weather") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "72F sunny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<tool_call>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<tool_response>") != null);
+}

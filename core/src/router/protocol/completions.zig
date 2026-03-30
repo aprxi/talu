@@ -435,7 +435,10 @@ fn flushPendingAssistant(
                 tc.id,
                 tc.name,
             });
-            try writer.print("{f}", .{std.json.fmt(tc.arguments, .{})});
+            // Write arguments as a raw JSON object (not a string).
+            // Templates like Qwen3.5 iterate arguments with |items, which
+            // requires a mapping — a JSON string would cause EvalError.
+            try writer.writeAll(tc.arguments);
             try writer.writeAll("}}");
         }
         try writer.writeByte(']');
@@ -483,7 +486,7 @@ fn writeToolCallsMessage(writer: anytype, tool_calls: []const PendingToolCall) !
             tc.id,
             tc.name,
         });
-        try writer.print("{f}", .{std.json.fmt(tc.arguments, .{})});
+        try writer.writeAll(tc.arguments);
         try writer.writeAll("}}");
     }
     try writer.writeAll("]}");
