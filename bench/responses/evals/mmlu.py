@@ -178,26 +178,23 @@ def _format_samples(ds) -> list[dict]:
 
 
 def _build_body(sample: dict, uri: str, config: dict) -> dict:
+    """Build canonical request dict. API format translation is handled by _api.py."""
     mrt = int(config.get("max_reasoning_tokens", 0))
-    # With reasoning enabled, the answer follows </think>\n\n so more
-    # completion tokens are needed. Default 1 is for no-think mode only.
     mct_default = 10 if mrt > 0 else 1
     mct = int(config.get("max_completion_tokens", mct_default))
-    body: dict = {
+    canonical: dict = {
         "model": uri,
         "input": sample["prompt"],
-        "instructions": _INSTRUCTIONS,
+        "system": _INSTRUCTIONS,
         "max_completion_tokens": mct,
         "max_reasoning_tokens": mrt,
-        "stream": False,
-        "store": False,
     }
     if "max_tokens" in config:
-        body["max_output_tokens"] = config["max_tokens"]
-    for cfg_key, api_key in _API_FIELDS.items():
-        if cfg_key in config:
-            body[api_key] = config[cfg_key]
-    return body
+        canonical["max_output_tokens"] = config["max_tokens"]
+    for key in _API_FIELDS:
+        if key in config:
+            canonical[key] = config[key]
+    return canonical
 
 
 class Mmlu(Scenario):
@@ -232,4 +229,5 @@ class Mmlu(Scenario):
             config=config,
             samples=samples,
             build_body=_build_body,
+            completions=config.get("_completions", False),
         )

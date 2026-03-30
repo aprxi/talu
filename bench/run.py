@@ -232,7 +232,12 @@ def cmd_list() -> None:
 
 def _print_expanded_cmd(args: argparse.Namespace, config: dict) -> None:
     """Print the full CLI command with all resolved defaults."""
-    parts = [f"python {sys.argv[0]}", args.scenario]
+    parts = [f"python {sys.argv[0]}"]
+    if hasattr(args, "command") and args.command:
+        parts.append(args.command)
+    parts.append(args.scenario)
+    if getattr(args, "endpoint", None):
+        parts.append(f"--endpoint {args.endpoint}")
     if args.config:
         parts.append(f"--config {args.config}")
     is_eval = "evals/" in args.scenario
@@ -393,6 +398,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     model_uris: list[str] = config.get("model_uri", ["Qwen/Qwen3.5-0.8B"])
     precisions: list[str] = config.get("precision", ["original"])
 
+    use_external = args.endpoint is not None
+    if use_external:
+        config["_completions"] = True
+        config["_endpoint"] = args.endpoint
+
     results: list[dict] = []
     try:
         for model in model_uris:
@@ -401,24 +411,33 @@ def cmd_run(args: argparse.Namespace) -> None:
                 combo_config["model_uri"] = [model]
                 combo_config["precision"] = [precision]
 
-                srv = TaluServer(
-                    port=args.port,
-                    no_bucket=not scenario.requires_storage,
-                    bucket=bucket_path,
-                    extra_args=scenario.server_args(combo_config),
-                    env=env_vars,
-                )
-                try:
-                    print(f"Starting server (port {args.port}) ...", flush=True)
-                    srv.start(timeout=30)
-                    print(f"Server ready (pid={srv.pid}).\n", flush=True)
+                if use_external:
+                    # External endpoint — no server startup.
+                    base_url = args.endpoint.rstrip("/")
+                    print(f"Using external endpoint: {base_url}\n", flush=True)
                     combo_results = scenario.run(
-                        srv.base_url, args.rounds, combo_config,
+                        base_url, args.rounds, combo_config,
                     )
                     results.extend(combo_results)
-                finally:
-                    print("\nStopping server ...", flush=True)
-                    srv.stop()
+                else:
+                    srv = TaluServer(
+                        port=args.port,
+                        no_bucket=not scenario.requires_storage,
+                        bucket=bucket_path,
+                        extra_args=scenario.server_args(combo_config),
+                        env=env_vars,
+                    )
+                    try:
+                        print(f"Starting server (port {args.port}) ...", flush=True)
+                        srv.start(timeout=30)
+                        print(f"Server ready (pid={srv.pid}).\n", flush=True)
+                        combo_results = scenario.run(
+                            srv.base_url, args.rounds, combo_config,
+                        )
+                        results.extend(combo_results)
+                    finally:
+                        print("\nStopping server ...", flush=True)
+                        srv.stop()
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
@@ -746,10 +765,11 @@ def print_eval_report(
     bench_name = results[0].get("bench", scenario_name.rsplit("/", 1)[-1]) if results else "eval"
     from log import eval_log_path
     log_paths: list[Path] = []
+    endpoint_url = config.get("_endpoint")
     for r in results:
         r_mrt = int(r.get("max_reasoning_tokens", 0))
         lp = eval_log_path(bench_name, r.get("model_uri", r["model"]),
-                           config.get("samples"), r_mrt)
+                           config.get("samples"), r_mrt, endpoint=endpoint_url)
         if lp not in log_paths:
             log_paths.append(lp)
 
@@ -1048,6 +1068,9 @@ def main() -> None:
                         help="Override config value. Parsed as JSON, fallback to string. Repeatable.")
     run_p.add_argument("--env", "-e", action="append", default=[], metavar="KEY=VALUE",
                         help="Set environment variable for the server process. Repeatable.")
+    run_p.add_argument("--endpoint", default=None, metavar="URL",
+                        help="External OpenAI-compatible endpoint (e.g. http://localhost:8000/v1). "
+                             "Uses v1/chat/completions API. Skips talu server startup.")
 
     args = parser.parse_args()
 

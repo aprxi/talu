@@ -10,19 +10,32 @@ from pathlib import Path
 EVALS_DIR = Path(__file__).resolve().parent.parent / "temp" / "evals"
 
 
+def _endpoint_tag(endpoint: str | None) -> str:
+    """Short stable tag for an external endpoint URL."""
+    if not endpoint:
+        return ""
+    import base64, hashlib
+    h = hashlib.sha256(endpoint.encode()).digest()[:6]
+    return "ep-" + base64.urlsafe_b64encode(h).decode().rstrip("=")
+
+
 def eval_log_path(
     bench: str,
     model: str,
     samples: int | None = None,
     max_reasoning_tokens: int = 0,
+    endpoint: str | None = None,
 ) -> Path:
     """Stable log path for a bench + model + reasoning combination.
 
-    Format: evals/<bench>_<model_slug>[_n<samples>][_r<budget>].jsonl
+    Format: evals/<bench>_<model_slug>[_ep-<hash>][_n<samples>][_r<budget>].jsonl
     Re-running the same combo appends to / resumes from this file.
     """
     slug = model.replace("/", "_").replace(" ", "_")
     name = f"{bench}_{slug}"
+    tag = _endpoint_tag(endpoint)
+    if tag:
+        name += f"_{tag}"
     if samples is not None:
         name += f"_n{samples}"
     if max_reasoning_tokens > 0:

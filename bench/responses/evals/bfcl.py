@@ -199,35 +199,31 @@ def _load_dataset(
 
 
 def _build_body(sample: dict, uri: str, config: dict) -> dict:
-    """Build POST /v1/responses body with tool definitions."""
-    body: dict = {
+    """Build canonical request dict. API format translation is handled by _api.py."""
+    canonical: dict = {
         "model": uri,
         "input": sample["prompt"],
-        "stream": False,
-        "store": False,
     }
 
     # Convert and attach tools.
     functions = sample.get("tools", [])
     if functions:
-        body["tools"] = _convert_tools(functions)
-        # BFCL expects function calls for all non-irrelevance categories.
-        # Keep irrelevance on auto so "no tool call" remains scoreable.
+        canonical["tools"] = _convert_tools(functions)
         if sample.get("scoring_mode") == "irrelevance":
-            body["tool_choice"] = "auto"
+            canonical["tool_choice"] = "auto"
         else:
-            body["tool_choice"] = "required"
+            canonical["tool_choice"] = "required"
 
     if "max_tokens" in config:
-        body["max_output_tokens"] = config["max_tokens"]
+        canonical["max_output_tokens"] = config["max_tokens"]
     if "max_reasoning_tokens" in config and config.get("max_reasoning_tokens") is not None:
-        body["max_reasoning_tokens"] = int(config["max_reasoning_tokens"])
+        canonical["max_reasoning_tokens"] = int(config["max_reasoning_tokens"])
 
-    for cfg_key, api_key in _API_FIELDS.items():
-        if cfg_key in config:
-            body[api_key] = config[cfg_key]
+    for key in _API_FIELDS:
+        if key in config:
+            canonical[key] = config[key]
 
-    return body
+    return canonical
 
 
 def _extract_tool_calls(events: list[dict]) -> list[dict]:
@@ -378,6 +374,7 @@ class Bfcl(Scenario):
             samples=samples,
             build_body=_build_body,
             score_fn=_score_fn,
+            completions=config.get("_completions", False),
         )
 
         # Post-aggregate: per-category accuracy from JSONL logs.

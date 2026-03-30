@@ -11,6 +11,7 @@ from collections import deque
 from scenario import extract_generation_metrics, model_uri
 from extract import extract_answer
 from log import eval_log_path, load_completed, EvalLogger
+from responses.evals._api import format_request, extract_output
 
 _MAX_RETRIES = 3
 
@@ -144,6 +145,7 @@ def run_eval(
     samples: list[dict],
     build_body,
     score_fn=None,
+    completions: bool = False,
 ) -> list[dict]:
     """Run an evaluation loop over samples for each model × precision × reasoning budget.
 
@@ -152,13 +154,15 @@ def run_eval(
         base_url: Server base URL.
         config: Loaded config dict.
         samples: List of sample dicts with at least: prompt, correct, question_hash, index.
-        build_body: Callable(sample, uri, config) -> request body dict.
-                    For multimodal, this handles image upload etc.
+        build_body: Callable(sample, uri, config) -> canonical request dict.
+                    Must return dict with: model, system, input, and config params.
         score_fn: Optional Callable(raw_text, sample, events) -> dict.
                   When provided, replaces the default extract_answer + equality check.
                   Must return {"predicted": str, "is_correct": bool, ...extra}.
                   Extra keys are merged into per-question results.
                   *events* is the parsed SSE event list (for extracting tool calls etc).
+        completions: If True, use v1/chat/completions API format.
+                     If False (default), use v1/responses API format.
 
     Returns:
         List of result dicts (one per model × precision × reasoning budget).
@@ -186,7 +190,8 @@ def run_eval(
                 config["max_reasoning_tokens"] = mrt
 
                 # Resume support.
-                log_path = eval_log_path(bench_name, uri, samples_n, mrt)
+                endpoint_url = base_url if completions else None
+                log_path = eval_log_path(bench_name, uri, samples_n, mrt, endpoint=endpoint_url)
                 completed, cached_stats = load_completed(log_path)
                 logger = EvalLogger(log_path)
                 cached = sum(1 for (m, _) in completed if m == uri)
@@ -221,14 +226,15 @@ def run_eval(
                     if (uri, sample["index"]) in completed:
                         continue
 
-                    # Build request body (scenario-specific).
-                    body = build_body(sample, uri, config)
+                    # Build canonical request, then format for target API.
+                    canonical = build_body(sample, uri, config)
+                    api_path, body = format_request(canonical, completions=completions)
 
                     # Retry loop with persistent connection.
                     events: list[dict] = []
                     for attempt in range(_MAX_RETRIES):
                         try:
-                            events, _ = client.post("/v1/responses", body)
+                            events, _ = client.post(api_path, body)
                             if events:
                                 break
                         except Exception as exc:
@@ -240,8 +246,9 @@ def run_eval(
                                 print(f"\n    failed after {_MAX_RETRIES} retries: {exc}", flush=True)
                                 errors += 1
 
-                    raw = _extract_text(events)
-                    reasoning = _extract_reasoning(events)
+                    output = extract_output(events, completions=completions)
+                    raw = output["raw_output"]
+                    reasoning = output["reasoning"]
 
                     if score_fn:
                         score = score_fn(raw, sample, events)
@@ -275,7 +282,7 @@ def run_eval(
                     # Throughput from this request.
                     metrics = extract_generation_metrics(events)
 
-                    response_output = _extract_response_output(events)
+                    response_output = output.get("response_output", [])
 
                     logger.log(
                         bench=bench_name,
