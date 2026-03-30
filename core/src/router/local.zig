@@ -736,14 +736,16 @@ pub const LocalEngine = struct {
 
         // Build effective template context: merge explicit extra_context_json with
         // reasoning-effort-derived variables (e.g. enable_thinking for Qwen3.5).
-        // In completions_mode, skip entirely — no thinking injection.
-        const effective_context = if (opts.completions_mode)
-            @as(?[]const u8, null)
-        else
-            buildEffectiveContext(self.allocator, opts) catch |err| {
-                log.err("inference", "Failed to build template context", .{ .err = @errorName(err) }, @src());
-                return err;
-            };
+        // In completions_mode without tools, disable thinking. With tools,
+        // keep thinking enabled — the model needs reasoning to decide tool use.
+        var completions_opts = opts;
+        if (opts.completions_mode and opts.tools_json == null) {
+            completions_opts.max_reasoning_tokens = 0;
+        }
+        const effective_context = buildEffectiveContext(self.allocator, completions_opts) catch |err| {
+            log.err("inference", "Failed to build template context", .{ .err = @errorName(err) }, @src());
+            return err;
+        };
         defer if (effective_context) |ctx| self.allocator.free(ctx);
 
         // Apply chat template with optional overrides
@@ -994,10 +996,11 @@ pub const LocalEngine = struct {
         }, @src());
 
         // Thinking budget: carved from max_tokens, never exceeds it.
-        // In completions_mode, thinking is disabled entirely.
+        // In completions_mode without tools, thinking is disabled. With tools,
+        // the model needs thinking to reason about tool use.
         // When max_completion_tokens is set, use it as the answer reserve.
         // Otherwise fall back to 25% heuristic (floor 256).
-        const thinking_budget = if (opts.completions_mode) @as(usize, 0) else blk: {
+        const thinking_budget = if (opts.completions_mode and opts.tools_json == null) @as(usize, 0) else blk: {
             const raw_thinking_budget = if (opts.max_reasoning_tokens) |mrt|
                 mrt
             else

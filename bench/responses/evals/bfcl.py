@@ -216,8 +216,15 @@ def _build_body(sample: dict, uri: str, config: dict) -> dict:
 
     if "max_tokens" in config:
         canonical["max_output_tokens"] = config["max_tokens"]
+    mrt = 0
     if "max_reasoning_tokens" in config and config.get("max_reasoning_tokens") is not None:
-        canonical["max_reasoning_tokens"] = int(config["max_reasoning_tokens"])
+        mrt = int(config["max_reasoning_tokens"])
+        canonical["max_reasoning_tokens"] = mrt
+    # Tool calls need a completion budget. For the responses API, this is
+    # derived from max_output_tokens. For completions API, max_tokens is
+    # the hard cap. Default to reasoning + 512 tokens for the tool output.
+    if "max_completion_tokens" not in config and "max_tokens" not in config:
+        canonical["max_completion_tokens"] = mrt + 512
 
     for key in _API_FIELDS:
         if key in config:
@@ -229,6 +236,9 @@ def _build_body(sample: dict, uri: str, config: dict) -> dict:
 def _extract_tool_calls(events: list[dict]) -> list[dict]:
     """Extract function_call items from response events.
 
+    Handles both v1/responses format (output items with type=function_call)
+    and v1/chat/completions format (choices[0].message.tool_calls).
+
     Returns list of {"name": str, "arguments": dict}.
     """
     calls: list[dict] = []
@@ -236,21 +246,36 @@ def _extract_tool_calls(events: list[dict]) -> list[dict]:
         if ev.get("event") not in ("response.completed", "response.incomplete"):
             continue
         resp = ev.get("data", {}).get("response", {})
+
+        # v1/responses format: output items
         for item in resp.get("output", []):
             if item.get("type") == "function_call":
                 name = item.get("name", "")
                 args_raw = item.get("arguments", "{}")
-                if isinstance(args_raw, str):
-                    try:
-                        args = json.loads(args_raw)
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-                elif isinstance(args_raw, dict):
-                    args = args_raw
-                else:
-                    args = {}
-                calls.append({"name": name, "arguments": args})
+                calls.append({"name": name, "arguments": _parse_args(args_raw)})
+
+        # v1/chat/completions format: choices[0].message.tool_calls
+        if not calls:
+            for choice in resp.get("choices", []):
+                msg = choice.get("message", {})
+                for tc in msg.get("tool_calls", []):
+                    func = tc.get("function", {})
+                    name = func.get("name", "")
+                    args_raw = func.get("arguments", "{}")
+                    calls.append({"name": name, "arguments": _parse_args(args_raw)})
     return calls
+
+
+def _parse_args(args_raw) -> dict:
+    """Parse tool call arguments from string or dict."""
+    if isinstance(args_raw, str):
+        try:
+            return json.loads(args_raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    elif isinstance(args_raw, dict):
+        return args_raw
+    return {}
 
 
 def _extract_output_summary(events: list[dict]) -> str:
@@ -260,12 +285,14 @@ def _extract_output_summary(events: list[dict]) -> str:
         if ev.get("event") not in ("response.completed", "response.incomplete"):
             continue
         resp = ev.get("data", {}).get("response", {})
+
+        # v1/responses format
         for item in resp.get("output", []):
             itype = item.get("type", "?")
             if itype == "function_call":
                 name = item.get("name", "")
                 args = item.get("arguments", "")
-                parts.append(f"function_call({name}, {len(args)}b)")
+                parts.append(f"function_call({name}, {len(str(args))}b)")
             elif itype == "message":
                 for part in item.get("content", []):
                     ptype = part.get("type", "?")
@@ -277,6 +304,20 @@ def _extract_output_summary(events: list[dict]) -> str:
                     parts.append(f"reasoning({len(text)}b)")
             else:
                 parts.append(itype)
+
+        # v1/chat/completions format
+        if not parts:
+            for choice in resp.get("choices", []):
+                msg = choice.get("message", {})
+                content = msg.get("content", "")
+                if content:
+                    parts.append(f"text({len(content)}b)")
+                for tc in msg.get("tool_calls", []):
+                    func = tc.get("function", {})
+                    name = func.get("name", "")
+                    args = func.get("arguments", "")
+                    parts.append(f"function_call({name}, {len(str(args))}b)")
+
     return ", ".join(parts) if parts else "empty"
 
 

@@ -117,20 +117,33 @@ async fn handle_non_streaming(
 
             let r = sched.take_result(request_id);
             match r {
-                Some(r) => Ok((
-                    r.text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
-                    if r.tool_calls.is_empty() { None } else {
+                Some(r) => {
+                    let has_tool_calls = !r.tool_calls.is_empty();
+                    let tool_calls = if has_tool_calls {
                         let tc: Vec<serde_json::Value> = r.tool_calls.iter().map(|tc| json!({
                             "id": tc.id,
                             "type": "function",
                             "function": {"name": tc.name, "arguments": tc.arguments},
                         })).collect();
                         Some(serde_json::Value::Array(tc))
-                    },
-                    r.prompt_tokens as u64,
-                    r.completion_tokens as u64,
-                    finish_reason_str(r.finish_reason),
-                )),
+                    } else {
+                        None
+                    };
+                    // When tool calls are present, content should be null
+                    // (the model's text output contains thinking + tool tags, not user-visible content).
+                    let content = if has_tool_calls {
+                        None
+                    } else {
+                        r.text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+                    };
+                    Ok((
+                        content,
+                        tool_calls,
+                        r.prompt_tokens as u64,
+                        r.completion_tokens as u64,
+                        finish_reason_str(r.finish_reason),
+                    ))
+                }
                 None => Ok((None::<String>, None::<serde_json::Value>, 0u64, 0u64, "stop")),
             }
         } else {
@@ -452,7 +465,10 @@ fn build_generate_config(
     if let Some(pp) = body.presence_penalty { cfg.presence_penalty = pp as f32; }
     if let Some(fp) = body.frequency_penalty { cfg.frequency_penalty = fp as f32; }
     cfg.tools_json = body.tools.as_ref().map(|v| v.to_string());
-    cfg.tool_choice = body.tool_choice.as_ref().map(|v| v.to_string());
+    cfg.tool_choice = body.tool_choice.as_ref().map(|v| match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
     cfg
 }
 

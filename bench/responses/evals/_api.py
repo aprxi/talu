@@ -141,6 +141,14 @@ _COMPLETIONS_PASSTHROUGH = {
 }
 
 
+def _wrap_tool(t: dict) -> dict:
+    """Convert flat tool format to OpenAI completions nested format."""
+    if "function" in t:
+        return t  # Already in nested format
+    func = {k: v for k, v in t.items() if k != "type"}
+    return {"type": "function", "function": func}
+
+
 def _format_completions(c: dict) -> tuple[str, dict]:
     messages = []
     if c.get("system"):
@@ -155,6 +163,12 @@ def _format_completions(c: dict) -> tuple[str, dict]:
     max_tokens = c.get("max_completion_tokens") or c.get("max_output_tokens")
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
+    if c.get("tools"):
+        # OpenAI completions format: {"type":"function","function":{"name":...,"parameters":...}}
+        # Canonical (responses) format: {"type":"function","name":...,"parameters":...}
+        body["tools"] = [_wrap_tool(t) for t in c["tools"]]
+    if c.get("tool_choice"):
+        body["tool_choice"] = c["tool_choice"]
     for key in _COMPLETIONS_PASSTHROUGH:
         if key in c:
             body[key] = c[key]
@@ -166,6 +180,7 @@ def _extract_completions(resp: dict) -> dict:
     reasoning = ""
     input_tokens = 0
     output_tokens = 0
+    response_output: list = []
 
     usage = resp.get("usage", {})
     input_tokens = usage.get("prompt_tokens", 0)
@@ -180,11 +195,24 @@ def _extract_completions(resp: dict) -> dict:
         rc = msg.get("reasoning_content", "")
         if rc:
             reasoning = rc
+        # Extract tool_calls and convert to responses-format function_call items
+        # so BFCL's _extract_tool_calls can read them uniformly.
+        tool_calls = msg.get("tool_calls", [])
+        if tool_calls:
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                arguments = func.get("arguments", "{}")
+                response_output.append({
+                    "type": "function_call",
+                    "name": name,
+                    "arguments": arguments,
+                })
 
     return {
         "raw_output": raw_output,
         "reasoning": reasoning,
-        "response_output": [],
+        "response_output": response_output,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
     }
