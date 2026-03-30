@@ -241,6 +241,12 @@ pub const GenerateOptions = struct {
     /// returns only the assistant response text to callers.
     raw_output: bool = false,
 
+    /// When true, behave like a standard completions endpoint: skip
+    /// buildEffectiveContext (no enable_thinking injection), skip
+    /// commitGenerationResult (no reasoning separation), and set
+    /// thinking_budget = 0.  max_tokens is the sole generation cap.
+    completions_mode: bool = false,
+
     /// Output flag: set to true by generateFromPrompt when the rendered prompt
     /// ends with the reasoning tag (e.g. `<think>\n`), indicating that the
     /// model's output starts inside a reasoning block.  Used by the streaming
@@ -730,10 +736,14 @@ pub const LocalEngine = struct {
 
         // Build effective template context: merge explicit extra_context_json with
         // reasoning-effort-derived variables (e.g. enable_thinking for Qwen3.5).
-        const effective_context = buildEffectiveContext(self.allocator, opts) catch |err| {
-            log.err("inference", "Failed to build template context", .{ .err = @errorName(err) }, @src());
-            return err;
-        };
+        // In completions_mode, skip entirely — no thinking injection.
+        const effective_context = if (opts.completions_mode)
+            @as(?[]const u8, null)
+        else
+            buildEffectiveContext(self.allocator, opts) catch |err| {
+                log.err("inference", "Failed to build template context", .{ .err = @errorName(err) }, @src());
+                return err;
+            };
         defer if (effective_context) |ctx| self.allocator.free(ctx);
 
         // Apply chat template with optional overrides
@@ -792,8 +802,14 @@ pub const LocalEngine = struct {
         // Use chat settings with optional overrides.
         // When max_completion_tokens is set without explicit max_tokens,
         // auto-compute: max_tokens = thinking_budget + max_completion_tokens.
-        // When max_completion_tokens is set without explicit max_tokens,
-        // auto-compute: max_tokens = thinking_budget + max_completion_tokens.
+        // Token budget hierarchy:
+        //   max_tokens          — hard cap on total generated tokens (never exceeded)
+        //   max_reasoning_tokens — budget for thinking (within max_tokens)
+        //   max_completion_tokens — budget for answer (within max_tokens)
+        //
+        // When max_tokens is set explicitly, it IS the hard cap. The reasoning
+        // and completion budgets operate within it, never additive.
+        // When max_tokens is NOT set, auto-compute from budgets.
         const base_max_tokens = if (opts.max_completion_tokens != null and opts.max_tokens == null) blk: {
             const raw_budget = if (opts.max_reasoning_tokens) |mrt|
                 mrt
@@ -978,20 +994,23 @@ pub const LocalEngine = struct {
         }, @src());
 
         // Thinking budget: carved from max_tokens, never exceeds it.
+        // In completions_mode, thinking is disabled entirely.
         // When max_completion_tokens is set, use it as the answer reserve.
         // Otherwise fall back to 25% heuristic (floor 256).
-        const raw_thinking_budget = if (opts.max_reasoning_tokens) |mrt|
-            mrt
-        else
-            maxThinkingTokensForEffort(opts.reasoning_effort);
-        const answer_reserve = if (opts.max_completion_tokens) |mct|
-            mct
-        else
-            @max(@as(usize, 256), max_tokens / 4);
-        const thinking_budget = if (raw_thinking_budget > 0)
-            @min(raw_thinking_budget, max_tokens -| answer_reserve)
-        else
-            @as(usize, 0);
+        const thinking_budget = if (opts.completions_mode) @as(usize, 0) else blk: {
+            const raw_thinking_budget = if (opts.max_reasoning_tokens) |mrt|
+                mrt
+            else
+                maxThinkingTokensForEffort(opts.reasoning_effort);
+            const answer_reserve = if (opts.max_completion_tokens) |mct|
+                mct
+            else
+                @max(@as(usize, 256), max_tokens / 4);
+            break :blk if (raw_thinking_budget > 0)
+                @min(raw_thinking_budget, max_tokens -| answer_reserve)
+            else
+                @as(usize, 0);
+        };
 
         // Tokenize thinking end sequence if thinking budget is active.
         const thinking_end_tokens = if (thinking_budget > 0)
@@ -1132,42 +1151,47 @@ pub const LocalEngine = struct {
             .stop_sequence => .stop_sequence,
             .cancelled => .cancelled,
         };
-        const finish_reason_str = finishReasonToString(finish_reason);
 
-        // Text path: commit reasoning + assistant message via shared path
-        const generation_json = try self.buildGenerationJson(chat, opts, max_tokens);
-        defer self.allocator.free(generation_json);
+        // In completions_mode, skip reasoning separation and conversation commit —
+        // return the raw decoded text directly with max_tokens as the sole cap.
+        const result_text = if (opts.completions_mode) generated_text else blk: {
+            const finish_reason_str = finishReasonToString(finish_reason);
 
-        // Detect whether the rendered prompt ends with an opening reasoning
-        // tag (e.g. `<think>\n`).  When the template injects this as a
-        // generation prefix, the model's output starts inside the reasoning
-        // block (no opening `<think>` tag), so the parser must begin in
-        // reasoning state to correctly separate reasoning / response.
-        const starts_in_reasoning = chat_template.promptEndsWithReasoningTag(prompt, opts.reasoning_tag);
+            // Text path: commit reasoning + assistant message via shared path
+            const generation_json = try self.buildGenerationJson(chat, opts, max_tokens);
+            defer self.allocator.free(generation_json);
 
-        try commit_mod.commitGenerationResult(self.allocator, chat, .{
-            .text = generated_text,
-            .prompt_tokens = prompt_len,
-            .completion_tokens = result.tokens.len,
-            .prefill_ns = result.prefill_ns,
-            .generation_ns = result.decode_ns,
-            .finish_reason = finish_reason_str,
-            .reasoning_tag = opts.reasoning_tag,
-            .generation_json = generation_json,
-            .starts_in_reasoning = starts_in_reasoning,
-        });
+            // Detect whether the rendered prompt ends with an opening reasoning
+            // tag (e.g. `<think>\n`).  When the template injects this as a
+            // generation prefix, the model's output starts inside the reasoning
+            // block (no opening `<think>` tag), so the parser must begin in
+            // reasoning state to correctly separate reasoning / response.
+            const starts_in_reasoning = chat_template.promptEndsWithReasoningTag(prompt, opts.reasoning_tag);
 
-        // Return clean text (strip reasoning tags for caller)
-        var parser = try reasoning_parser_mod.ReasoningParser.initWithState(self.allocator, opts.reasoning_tag, starts_in_reasoning);
-        defer parser.deinit();
-        try parser.processChunk(generated_text);
-        const parsed = try parser.finalize();
+            try commit_mod.commitGenerationResult(self.allocator, chat, .{
+                .text = generated_text,
+                .prompt_tokens = prompt_len,
+                .completion_tokens = result.tokens.len,
+                .prefill_ns = result.prefill_ns,
+                .generation_ns = result.decode_ns,
+                .finish_reason = finish_reason_str,
+                .reasoning_tag = opts.reasoning_tag,
+                .generation_json = generation_json,
+                .starts_in_reasoning = starts_in_reasoning,
+            });
 
-        const result_text = if (opts.raw_output) generated_text else if (parsed.reasoning != null) blk: {
-            const duped = try self.allocator.dupe(u8, parsed.response orelse "");
-            self.allocator.free(generated_text);
-            break :blk duped;
-        } else generated_text;
+            // Return clean text (strip reasoning tags for caller)
+            var parser = try reasoning_parser_mod.ReasoningParser.initWithState(self.allocator, opts.reasoning_tag, starts_in_reasoning);
+            defer parser.deinit();
+            try parser.processChunk(generated_text);
+            const parsed = try parser.finalize();
+
+            break :blk if (opts.raw_output) generated_text else if (parsed.reasoning != null) inner: {
+                const duped = try self.allocator.dupe(u8, parsed.response orelse "");
+                self.allocator.free(generated_text);
+                break :inner duped;
+            } else generated_text;
+        };
 
         log.debug("router", "Generation complete", .{
             .prompt_tokens = prompt_len,
@@ -1950,6 +1974,15 @@ test "GenerateOptions struct defaults" {
     try std.testing.expect(opts.repetition_penalty == null);
     try std.testing.expect(opts.token_callback == null);
     try std.testing.expect(opts.callback_data == null);
+    try std.testing.expect(!opts.completions_mode);
+}
+
+test "GenerateOptions completions_mode flag" {
+    const opts = GenerateOptions{ .completions_mode = true };
+    try std.testing.expect(opts.completions_mode);
+    // Other fields remain at defaults
+    try std.testing.expect(opts.max_tokens == null);
+    try std.testing.expect(!opts.raw_output);
 }
 
 test "GenerateOptions struct overrides" {

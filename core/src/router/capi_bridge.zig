@@ -111,7 +111,12 @@ pub const CGenerateConfig = extern struct {
 
     /// When non-zero, preserve raw model output bytes without reasoning-tag filtering.
     /// Default (0) keeps current behavior (reasoning tags parsed into typed items).
-    raw_output: u8 = 0,
+    raw_output: usize = 0,
+
+    /// When non-zero, behave like a standard completions endpoint: no thinking
+    /// intervention, no reasoning separation, just raw token generation with
+    /// max_tokens as the sole cap.
+    completions_mode: usize = 0,
 
     /// Optional prefill progress callback. Called once per transformer layer
     /// during prefill (not decode). Signature: fn(completed_layers, total_layers, userdata).
@@ -1007,6 +1012,7 @@ pub fn configToGenerateOptions(config: ?*const CGenerateConfig) GenerateOptions 
     if (cfg.tools_json) |t| opts.tools_json = std.mem.sliceTo(t, 0);
     if (cfg.tool_choice) |c| opts.tool_choice = std.mem.sliceTo(c, 0);
     opts.raw_output = cfg.raw_output != 0;
+    opts.completions_mode = cfg.completions_mode != 0;
 
     // Pass through stop flag for cancellation support
     opts.stop_flag = cfg.stop_flag;
@@ -1190,7 +1196,28 @@ test "CGenerateConfig defaults" {
     try std.testing.expect(cfg.template_override == null);
     try std.testing.expect(cfg.extra_context_json == null);
     try std.testing.expect(cfg.extra_body_json == null);
-    try std.testing.expectEqual(@as(u8, 0), cfg.raw_output);
+    try std.testing.expectEqual(@as(usize, 0), cfg.raw_output);
+    try std.testing.expectEqual(@as(usize, 0), cfg.completions_mode);
+}
+
+test "configToGenerateOptions completions_mode" {
+    var cfg = std.mem.zeroes(CGenerateConfig);
+    cfg.completions_mode = 1;
+    // Set required defaults for valid config
+    cfg.max_reasoning_tokens = std.math.maxInt(usize);
+    cfg.temperature = -1.0;
+    cfg.top_p = -1.0;
+    cfg.min_p = -1.0;
+    cfg.repetition_penalty = -1.0;
+    cfg.presence_penalty = -1.0;
+    cfg.frequency_penalty = -1.0;
+    const opts = configToGenerateOptions(&cfg);
+    try std.testing.expect(opts.completions_mode);
+}
+
+test "configToGenerateOptions completions_mode default off" {
+    const opts = configToGenerateOptions(null);
+    try std.testing.expect(!opts.completions_mode);
 }
 
 test "GenerateContentPart struct layout" {

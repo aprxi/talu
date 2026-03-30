@@ -328,6 +328,7 @@ cuda: deps sync-version gen-bindings ui
 # Generate Python ctypes bindings from Zig C API
 gen-bindings:
 	zig build gen-bindings -Drelease
+	zig build gen-bindings-rust -Drelease
 
 # Sync VERSION to binding vendor directories
 sync-version:
@@ -356,6 +357,7 @@ ui:
 
 clean:
 	rm -rf zig-out .zig-cache .zig-cache-global
+	cargo clean --manifest-path bindings/rust/Cargo.toml 2>/dev/null || true
 	rm -f bindings/python/talu/libtalu.$(LIB_EXT)
 	rm -rf docs/dist .venv
 	rm -rf .pytest_cache .ruff_cache

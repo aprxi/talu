@@ -25,6 +25,7 @@ use crate::server::auth_gateway::AuthContext;
 use crate::server::code;
 use crate::server::code_ws;
 use crate::server::collab;
+use crate::server::completions;
 use crate::server::db;
 use crate::server::events;
 use crate::server::file;
@@ -500,6 +501,9 @@ impl Service<Request<Incoming>> for Router {
                         }
                         (Method::POST, "/v1/responses") => {
                             responses::handle_create(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/chat/completions") => {
+                            completions::handle_create(state, req, auth).await
                         }
                         (Method::POST, "/v1/tokenizer/instances") => {
                             tokenizer::handle_create_instance(state, req, auth).await

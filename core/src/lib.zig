@@ -290,6 +290,7 @@ comptime {
     _ = &capi.talu_chat_len;
     _ = &capi.talu_chat_to_json;
     _ = &capi.talu_chat_set_messages;
+    _ = &capi.talu_chat_load_completions_json;
     _ = &capi.talu_chat_get_messages;
 
     // Template API

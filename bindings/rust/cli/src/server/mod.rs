@@ -13,6 +13,8 @@ pub mod batch_scheduler;
 pub mod code;
 pub mod code_ws;
 pub mod collab;
+pub mod completions;
+pub mod completions_types;
 pub mod db;
 pub mod events;
 pub mod file;

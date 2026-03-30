@@ -2145,6 +2145,38 @@ pub export fn talu_chat_set_messages(handle: ?*ChatHandle, json: ?[*:0]const u8)
     return 0;
 }
 
+/// Load chat completions-format messages JSON into a chat conversation.
+/// Format: [{"role":"system","content":"..."}, {"role":"user","content":"..."}, ...]
+///
+/// Clears existing items first, then parses the JSON array into the conversation
+/// using the protocol completions parser. Uses ptr+len instead of sentinel-terminated
+/// strings to support JSON payloads with embedded nulls.
+///
+/// Returns 0 on success, non-zero error code on failure.
+pub export fn talu_chat_load_completions_json(
+    handle: ?*ChatHandle,
+    json_ptr: ?[*]const u8,
+    json_len: usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const chat_state: *Chat = @ptrCast(@alignCast(handle orelse {
+        capi_error.setError(error.InvalidHandle, "chat handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
+    }));
+    const ptr = json_ptr orelse {
+        capi_error.setError(error.InvalidArgument, "json_ptr is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const json_slice = ptr[0..json_len];
+
+    completions_protocol.parse(chat_state.getConversation(), json_slice) catch |err| {
+        capi_error.setError(err, "failed to load from Completions JSON", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    return 0;
+}
+
 /// Get the Messages handle from a Chat (legacy API).
 /// Returns the underlying Messages structure pointer for zero-copy access.
 /// The returned handle is owned by the Chat - do NOT free it separately.
@@ -2438,4 +2470,38 @@ test "talu_chat_set_messages invalid json maps to invalid_argument" {
     const rc = talu_chat_set_messages(chat_handle, "{");
     try std.testing.expect(rc != 0);
     try std.testing.expectEqual(@as(i32, @intFromEnum(error_codes.ErrorCode.invalid_argument)), capi_error.talu_last_error_code());
+}
+
+test "talu_chat_load_completions_json null handle returns invalid_handle" {
+    const rc = talu_chat_load_completions_json(null, null, 0);
+    try std.testing.expect(rc != 0);
+    try std.testing.expectEqual(@as(i32, @intFromEnum(error_codes.ErrorCode.invalid_handle)), capi_error.talu_last_error_code());
+}
+
+test "talu_chat_load_completions_json null json_ptr returns invalid_argument" {
+    const chat_handle = talu_chat_create(null) orelse return error.OutOfMemory;
+    defer talu_chat_free(chat_handle);
+
+    const rc = talu_chat_load_completions_json(chat_handle, null, 0);
+    try std.testing.expect(rc != 0);
+    try std.testing.expectEqual(@as(i32, @intFromEnum(error_codes.ErrorCode.invalid_argument)), capi_error.talu_last_error_code());
+}
+
+test "talu_chat_load_completions_json valid messages loads into conversation" {
+    const chat_handle = talu_chat_create(null) orelse return error.OutOfMemory;
+    defer talu_chat_free(chat_handle);
+
+    const json = "[{\"role\":\"user\",\"content\":\"Hello\"}]";
+    const rc = talu_chat_load_completions_json(chat_handle, json.ptr, json.len);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    try std.testing.expect(talu_chat_len(chat_handle) > 0);
+}
+
+test "talu_chat_load_completions_json invalid json returns error" {
+    const chat_handle = talu_chat_create(null) orelse return error.OutOfMemory;
+    defer talu_chat_free(chat_handle);
+
+    const json = "{not valid";
+    const rc = talu_chat_load_completions_json(chat_handle, json.ptr, json.len);
+    try std.testing.expect(rc != 0);
 }

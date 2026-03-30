@@ -446,6 +446,7 @@ pub const talu_chat_reset = responses.talu_chat_reset;
 pub const talu_chat_len = responses.talu_chat_len;
 pub const talu_chat_to_json = responses.talu_chat_to_json;
 pub const talu_chat_set_messages = responses.talu_chat_set_messages;
+pub const talu_chat_load_completions_json = responses.talu_chat_load_completions_json;
 pub const talu_chat_get_messages = responses.talu_chat_get_messages;
 pub const talu_chat_count_tokens = responses.talu_chat_count_tokens;
 pub const talu_chat_max_context_length = responses.talu_chat_max_context_length;

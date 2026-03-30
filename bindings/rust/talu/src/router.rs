@@ -85,6 +85,9 @@ pub struct GenerateConfig {
     pub stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Preserve raw model output without reasoning-tag filtering.
     pub raw_output: bool,
+    /// When true, behave like a standard completions endpoint: no thinking
+    /// intervention, no reasoning separation, just raw token generation.
+    pub completions_mode: bool,
     /// Optional prefill progress callback. Called once per transformer layer
     /// during prefill (not decode). Arguments: (completed_layers, total_layers).
     pub prefill_progress: Option<PrefillProgressCallback>,
@@ -111,6 +114,7 @@ impl Default for GenerateConfig {
             reasoning_effort: None,
             stop_flag: None,
             raw_output: false,
+            completions_mode: false,
             prefill_progress: None,
         }
     }
@@ -377,7 +381,8 @@ impl ConfigHolder {
         c_config.presence_penalty = cfg.presence_penalty;
         c_config.frequency_penalty = cfg.frequency_penalty;
         c_config.seed = cfg.seed;
-        c_config.raw_output = if cfg.raw_output { 1 } else { 0 };
+        c_config.raw_output = if cfg.raw_output { 1usize } else { 0usize };
+        c_config.completions_mode = if cfg.completions_mode { 1usize } else { 0usize };
 
         if let Some(ref tpl) = template_override {
             c_config.template_override = tpl.as_ptr();

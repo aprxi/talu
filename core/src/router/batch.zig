@@ -153,6 +153,7 @@ const RequestState = struct {
     // --- Generation state ---
     is_tool_generation: bool = false,
     raw_output: bool = false,
+    completions_mode: bool = false,
     starts_in_reasoning: bool = false,
     engine_token_count: usize = 0,
     chat: ?*Chat = null,
@@ -267,8 +268,9 @@ pub const BatchWrapper = struct {
         // Build GenerateOptions from C config.
         const opts = capi_bridge.configToGenerateOptions(config);
 
-        // Check for raw output mode.
+        // Check for raw output mode and completions mode.
         state.raw_output = opts.raw_output;
+        state.completions_mode = opts.completions_mode;
 
         // Store chat reference for commitGenerationResult in completeRequest.
         state.chat = chat;
@@ -289,10 +291,14 @@ pub const BatchWrapper = struct {
         defer self.engine.allocator.free(messages_json);
 
         // Build effective template context (reasoning effort → enable_thinking + tools).
-        const effective_context = buildEffectiveContext(self.engine.allocator, opts) catch |err| {
-            error_context.setContext("buildEffectiveContext failed: {s}", .{@errorName(err)});
-            return err;
-        };
+        // In completions_mode, skip entirely — no thinking injection.
+        const effective_context = if (opts.completions_mode)
+            @as(?[]const u8, null)
+        else
+            buildEffectiveContext(self.engine.allocator, opts) catch |err| {
+                error_context.setContext("buildEffectiveContext failed: {s}", .{@errorName(err)});
+                return err;
+            };
         defer if (effective_context) |ctx| self.engine.allocator.free(ctx);
 
         // Apply chat template.
@@ -375,7 +381,14 @@ pub const BatchWrapper = struct {
         state.owned_prompt_tokens = prompt_tokens;
         state.prompt_tokens = prompt_tokens.len;
 
-        // Determine max_tokens.
+        // Token budget hierarchy:
+        //   max_tokens          — hard cap on total generated tokens (never exceeded)
+        //   max_reasoning_tokens — budget for thinking (within max_tokens)
+        //   max_completion_tokens — budget for answer (within max_tokens)
+        //
+        // When max_tokens is set explicitly, it IS the hard cap. The reasoning
+        // and completion budgets operate within it, never additive.
+        // When max_tokens is NOT set, auto-compute from budgets.
         const base_max_tokens = if (opts.max_completion_tokens != null and opts.max_tokens == null) blk: {
             const raw_budget = if (opts.max_reasoning_tokens) |mrt|
                 mrt
@@ -436,19 +449,21 @@ pub const BatchWrapper = struct {
             };
         }
 
-        // Thinking budget.
-        const raw_thinking_budget = if (opts.max_reasoning_tokens) |mrt|
-            mrt
-        else
-            maxThinkingTokensForEffort(opts.reasoning_effort);
-        const answer_reserve = if (opts.max_completion_tokens) |mct|
-            mct
-        else
-            @max(@as(usize, 256), max_tokens / 4);
-        const thinking_budget = if (raw_thinking_budget > 0)
-            @min(raw_thinking_budget, max_tokens -| answer_reserve)
-        else
-            @as(usize, 0);
+        // Thinking budget. In completions_mode, thinking is disabled entirely.
+        const thinking_budget = if (opts.completions_mode) @as(usize, 0) else blk: {
+            const raw_thinking_budget = if (opts.max_reasoning_tokens) |mrt|
+                mrt
+            else
+                maxThinkingTokensForEffort(opts.reasoning_effort);
+            const answer_reserve = if (opts.max_completion_tokens) |mct|
+                mct
+            else
+                @max(@as(usize, 256), max_tokens / 4);
+            break :blk if (raw_thinking_budget > 0)
+                @min(raw_thinking_budget, max_tokens -| answer_reserve)
+            else
+                @as(usize, 0);
+        };
 
         // Tokenize thinking end sequence.
         const thinking_end_tokens = if (thinking_budget > 0)
@@ -1049,7 +1064,10 @@ pub const BatchWrapper = struct {
         // Commit to conversation using the SAME path as CLI (local.zig).
         // commitGenerationResult uses ReasoningParser to create proper
         // reasoning + message items from the generated text.
-        if (state.chat) |chat| {
+        // In completions_mode, skip commit — return raw text without reasoning separation.
+        if (state.completions_mode) {
+            // Skip commitGenerationResult entirely.
+        } else if (state.chat) |chat| {
             if (text) |generated_text| {
                 const fr_str = switch (actual_finish_reason) {
                     .eos_token => "stop",

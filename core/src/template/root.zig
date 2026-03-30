@@ -859,6 +859,14 @@ test "ChatML template constructs" {
         try std.testing.expectEqualStrings("no", result);
     }
 
+    // Test 4b: "X is defined and X is true" when X is NOT in context
+    // (Qwen3.5 pattern for enable_thinking)
+    {
+        const result = try render(allocator, "{% if enable_thinking is defined and enable_thinking is true %}THINK{% else %}NO_THINK{% endif %}", &ctx);
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("NO_THINK", result);
+    }
+
     // Test 5: string method .startswith()
     {
         const result = try render(allocator, "{% if messages[0].content.startswith('You') %}yes{% else %}no{% endif %}", &ctx);

@@ -39,6 +39,7 @@ const StructInfo = struct {
         name: []const u8,
         zig_type: []const u8,
         array_size: ?usize = null,
+        default_value: ?[]const u8 = null,
     };
 };
 
@@ -146,6 +147,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(inner, "CSessionList")) return "*mut *mut CSessionList";
             if (eql(inner, "CTagList")) return "*mut *mut CTagList";
             if (eql(inner, "CDocumentList")) return "*mut *mut CDocumentList";
+            if (eql(inner, "CDocumentFullList")) return "*mut *mut CDocumentFullList";
             if (eql(inner, "CDocumentRecord")) return "*mut *mut CDocumentRecord";
             if (eql(inner, "CSearchResultList")) return "*mut *mut CSearchResultList";
             if (eql(inner, "CChangeList")) return "*mut *mut CChangeList";
@@ -386,6 +388,23 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
 
     // Default: treat as opaque pointer
     return "*mut c_void";
+}
+
+/// Convert a Zig default value expression to a Rust literal.
+/// Returns null if the expression can't be translated (falls back to 0).
+fn zigDefaultToRust(zig_default: []const u8) ?[]const u8 {
+    // Numeric literals: -1.0, 0, 1, etc.
+    if (zig_default.len > 0 and (zig_default[0] == '-' or (zig_default[0] >= '0' and zig_default[0] <= '9'))) {
+        return zig_default;
+    }
+    // std.math.maxInt(usize) → usize::MAX
+    if (std.mem.indexOf(u8, zig_default, "std.math.maxInt(usize)") != null) {
+        return "usize::MAX";
+    }
+    // true/false
+    if (std.mem.eql(u8, zig_default, "true")) return "true";
+    if (std.mem.eql(u8, zig_default, "false")) return "false";
+    return null;
 }
 
 /// Map Zig type to Rust type for struct fields
@@ -795,7 +814,16 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, rust_type, "bool")) {
                 try writer.print("            {s}: false,\n", .{field_name});
             } else if (std.mem.eql(u8, rust_type, "f32") or std.mem.eql(u8, rust_type, "f64")) {
-                try writer.print("            {s}: 0.0,\n", .{field_name});
+                // Use parsed Zig default if present (e.g. -1.0 sentinel for "unset")
+                if (field.default_value) |dv| {
+                    if (zigDefaultToRust(dv)) |rv| {
+                        try writer.print("            {s}: {s},\n", .{ field_name, rv });
+                    } else {
+                        try writer.print("            {s}: 0.0,\n", .{field_name});
+                    }
+                } else {
+                    try writer.print("            {s}: 0.0,\n", .{field_name});
+                }
             } else if (enums.contains(rust_type)) {
                 // For enums, use From<0> to get the default variant
                 try writer.print("            {s}: {s}::from(0),\n", .{ field_name, rust_type });
@@ -813,8 +841,16 @@ pub fn main() !void {
             } else if (std.mem.startsWith(u8, rust_type, "*mut ")) {
                 try writer.print("            {s}: std::ptr::null_mut(),\n", .{field_name});
             } else {
-                // Numeric types default to 0
-                try writer.print("            {s}: 0,\n", .{field_name});
+                // Numeric types: use parsed Zig default if present
+                if (field.default_value) |dv| {
+                    if (zigDefaultToRust(dv)) |rv| {
+                        try writer.print("            {s}: {s},\n", .{ field_name, rv });
+                    } else {
+                        try writer.print("            {s}: 0,\n", .{field_name});
+                    }
+                } else {
+                    try writer.print("            {s}: 0,\n", .{field_name});
+                }
             }
         }
 
@@ -1266,12 +1302,24 @@ fn parseExternStructs(
                     if (std.mem.indexOf(u8, field_name, "comptime") != null) continue;
 
                     // Check for default value first (" ="), then comma
-                    const type_end = std.mem.indexOf(u8, field_trimmed[colon_pos + 2 ..], " =") orelse
-                        std.mem.indexOf(u8, field_trimmed[colon_pos + 2 ..], ",") orelse
-                        (field_trimmed.len - colon_pos - 2);
+                    const rest = field_trimmed[colon_pos + 2 ..];
+                    const eq_pos = std.mem.indexOf(u8, rest, " =");
+                    const type_end = eq_pos orelse
+                        std.mem.indexOf(u8, rest, ",") orelse
+                        rest.len;
 
                     var field_type = field_trimmed[colon_pos + 2 .. colon_pos + 2 + type_end];
                     field_type = std.mem.trim(u8, field_type, " \t,");
+
+                    // Extract default value if present
+                    var default_val: ?[]const u8 = null;
+                    if (eq_pos) |ep| {
+                        var dv = rest[ep + 2 ..]; // skip " ="
+                        dv = std.mem.trim(u8, dv, " \t,");
+                        if (dv.len > 0) {
+                            default_val = try allocator.dupe(u8, dv);
+                        }
+                    }
 
                     // Parse array size
                     const array_size = parseArraySize(field_type);
@@ -1283,6 +1331,7 @@ fn parseExternStructs(
                         .name = field_name_copy,
                         .zig_type = field_type_copy,
                         .array_size = array_size,
+                        .default_value = default_val,
                     });
                 }
             }

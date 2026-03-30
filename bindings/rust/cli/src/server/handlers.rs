@@ -986,28 +986,10 @@ async fn generate_response(
                     .submit(&chat, cfg, stop_flag_for_gen)
                     .map_err(|e| anyhow!("batch submit failed: {}", e))?;
 
-                // Drain events until final. Track (item_type, content_type)
-                // segments to preserve content-type fidelity (e.g. refusal
-                // vs output_text) in the reconstructed output.
-                let mut segments: Vec<OutputSegment> = Vec::new();
+                // Drain events until final.
                 loop {
                     match event_rx.recv() {
                         Ok(event) => {
-                            if !event.text.is_empty() {
-                                let needs_new = segments.last().map_or(true, |s| {
-                                    s.item_type != event.item_type
-                                        || s.content_type != event.content_type
-                                });
-                                if needs_new {
-                                    segments.push(OutputSegment {
-                                        item_type: event.item_type,
-                                        content_type: event.content_type,
-                                        text: event.text.clone(),
-                                    });
-                                } else if let Some(last) = segments.last_mut() {
-                                    last.text.push_str(&event.text);
-                                }
-                            }
                             if event.is_final {
                                 break;
                             }
@@ -2478,130 +2460,6 @@ fn run_batch_streaming_generation(
         responses_json: all_json,
         model_info_json,
     })
-}
-
-/// A segment of generated output with item/content type metadata.
-///
-/// Accumulated during non-streaming batch event processing to preserve
-/// content-type fidelity (e.g. refusal vs output_text) across item
-/// boundaries in the reconstructed output.
-struct OutputSegment {
-    item_type: u8,
-    content_type: u8,
-    text: String,
-}
-
-/// Build Open Responses JSON from typed output segments.
-///
-/// Constructs the JSON array loadable into a ChatHandle via
-/// `load_responses_json` for conversation chaining. Preserves content-type
-/// fidelity: refusal content stays as refusal parts, multi-part messages
-/// keep their structure. Reasoning segments (item_type 3) are excluded
-/// since the parser skips them.
-///
-/// **Invariant:** `tool_calls` must be in the same left-to-right order as
-/// function-call segments (item_type 1) appear in `segments`. Both are
-/// produced by the same sequential parse of the generated text, so their
-/// ordering is guaranteed to match. If a future parser ever reorders tool
-/// calls (e.g. by sorting on name), this function's positional pairing
-/// will break and must be updated to match by call_id instead.
-fn build_segmented_output_json(
-    segments: &[OutputSegment],
-    tool_calls: &[talu::ToolCall],
-) -> String {
-    let mut items = Vec::new();
-    let mut i = 0;
-    let mut tc_idx = 0;
-
-    while i < segments.len() {
-        let seg = &segments[i];
-        match seg.item_type {
-            0 => {
-                // Message: collect consecutive message segments as content parts.
-                let mut content_parts = Vec::new();
-                while i < segments.len() && segments[i].item_type == 0 {
-                    let s = &segments[i];
-                    content_parts.push(match s.content_type {
-                        6 => json!({"type": "refusal", "refusal": s.text}),
-                        _ => json!({"type": "output_text", "text": s.text}),
-                    });
-                    i += 1;
-                }
-                items.push(json!({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": content_parts
-                }));
-            }
-            1 => {
-                // Function call: emit at its actual position using BatchResult
-                // metadata for call_id/name/arguments. The segment text contains
-                // the raw arguments string, but BatchResult has the parsed triple.
-                if let Some(tc) = tool_calls.get(tc_idx) {
-                    items.push(json!({
-                        "type": "function_call",
-                        "call_id": tc.id,
-                        "name": tc.name,
-                        "arguments": tc.arguments
-                    }));
-                    tc_idx += 1;
-                    // Skip consecutive function_call segments for the same call
-                    // (they share the same item_type=1 for argument tokens).
-                    while i < segments.len() && segments[i].item_type == 1 {
-                        i += 1;
-                    }
-                } else {
-                    // No parsed tool call metadata — fallback: collect the raw
-                    // function_call segment text and include it as a message so
-                    // the generated content is not silently lost.
-                    let mut text = String::new();
-                    while i < segments.len() && segments[i].item_type == 1 {
-                        text.push_str(&segments[i].text);
-                        i += 1;
-                    }
-                    if !text.is_empty() {
-                        items.push(json!({
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": text}]
-                        }));
-                    }
-                }
-            }
-            3 => {
-                // Reasoning: collect consecutive reasoning segments into a
-                // single reasoning item so the output includes thinking text.
-                let mut summary_text = String::new();
-                while i < segments.len() && segments[i].item_type == 3 {
-                    summary_text.push_str(&segments[i].text);
-                    i += 1;
-                }
-                if !summary_text.is_empty() {
-                    items.push(json!({
-                        "type": "reasoning",
-                        "summary": [{"type": "summary_text", "text": summary_text}]
-                    }));
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    // Append any remaining tool calls not matched by segments (edge case:
-    // BatchResult may report more calls than segments tracked, e.g. if the
-    // final call was detected during post-processing without segment events).
-    for tc in &tool_calls[tc_idx..] {
-        items.push(json!({
-            "type": "function_call",
-            "call_id": tc.id,
-            "name": tc.name,
-            "arguments": tc.arguments
-        }));
-    }
-
-    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Generate a short descriptive title for a conversation using the model.

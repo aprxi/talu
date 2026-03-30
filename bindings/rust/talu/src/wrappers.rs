@@ -246,6 +246,23 @@ impl ChatHandle {
         Ok(())
     }
 
+    /// Loads chat completions-format messages JSON into the chat's conversation.
+    ///
+    /// Accepts a JSON array of messages in OpenAI chat completions format:
+    /// `[{"role":"user","content":"Hello"}, ...]`
+    ///
+    /// Clears existing items first, then parses the messages into the conversation.
+    pub fn load_completions_json(&self, json: &str) -> Result<()> {
+        // SAFETY: self.ptr is a valid chat handle; json bytes are valid for the slice length.
+        let rc = unsafe {
+            talu_sys::talu_chat_load_completions_json(self.ptr, json.as_ptr(), json.len())
+        };
+        if rc != 0 {
+            return Err(error_from_last_or("Failed to load Completions JSON"));
+        }
+        Ok(())
+    }
+
     /// Appends a user message to the chat's conversation.
     ///
     /// Shorthand for loading a single user message without constructing JSON.

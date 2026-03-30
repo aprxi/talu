@@ -520,6 +520,7 @@ impl ConfigHolder {
         c_config.frequency_penalty = cfg.frequency_penalty;
         c_config.seed = cfg.seed;
         c_config.raw_output = if cfg.raw_output { 1 } else { 0 };
+        c_config.completions_mode = if cfg.completions_mode { 1 } else { 0 };
 
         if let Some(ref tpl) = template_override {
             c_config.template_override = tpl.as_ptr();

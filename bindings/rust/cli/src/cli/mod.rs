@@ -236,9 +236,9 @@ pub(super) struct AskArgs {
     #[arg(long, conflicts_with = "raw")]
     pub hide_thinking: bool,
 
-    /// Disable thinking/reasoning (set reasoning tokens to 0)
+    /// Enable thinking/reasoning (off by default)
     #[arg(long)]
-    pub no_think: bool,
+    pub think: bool,
 
     /// Random seed for deterministic generation (0 = random)
     #[arg(long, env = "SEED")]

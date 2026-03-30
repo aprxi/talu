@@ -197,7 +197,9 @@ class RouterGenerateConfig(ctypes.Structure):
         # Extra body JSON for remote API requests (provider-specific parameters)
         ("extra_body_json", ctypes.c_char_p),
         # Preserve raw model output (no reasoning-tag filtering)
-        ("raw_output", ctypes.c_uint8),
+        ("raw_output", ctypes.c_size_t),
+        # Completions mode: no thinking intervention, no reasoning separation
+        ("completions_mode", ctypes.c_size_t),
         # Prefill progress callback: fn(completed_layers, total_layers, userdata)
         ("prefill_progress_fn", ctypes.c_void_p),
         ("prefill_progress_data", ctypes.c_void_p),
@@ -221,6 +223,7 @@ class RouterGenerateConfig(ctypes.Structure):
         stop_flag: StopFlag | None = None,
         extra_body: dict | None = None,
         raw_output: bool = False,
+        completions_mode: bool = False,
     ):
         super().__init__()
         self.max_tokens = max_tokens
@@ -315,6 +318,7 @@ class RouterGenerateConfig(ctypes.Structure):
             self.extra_body_json = None
 
         self.raw_output = 1 if raw_output else 0
+        self.completions_mode = 1 if completions_mode else 0
 
 
 class GrammarConfigC(ctypes.Structure):
