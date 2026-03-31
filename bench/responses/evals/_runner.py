@@ -14,6 +14,32 @@ from log import eval_log_path, load_completed, EvalLogger
 from responses.evals._api import format_request, extract_output
 
 _MAX_RETRIES = 3
+_MASK_U64 = (1 << 64) - 1
+_GOLDEN64 = 0x9E3779B97F4A7C15
+
+
+def _splitmix64(value: int) -> int:
+    """Deterministic 64-bit mixer (SplitMix64 finalizer)."""
+    z = (value + _GOLDEN64) & _MASK_U64
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9 & _MASK_U64
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB & _MASK_U64
+    return (z ^ (z >> 31)) & _MASK_U64
+
+
+def _derive_request_seed(base_seed: int, sample: dict) -> int:
+    """Derive a stable per-sample seed from the run-level seed."""
+    idx = int(sample.get("index", 0))
+    qhash = sample.get("question_hash", "")
+    qhash_u64 = 0
+    if isinstance(qhash, str) and qhash:
+        try:
+            qhash_u64 = int(qhash[:16], 16) & _MASK_U64
+        except ValueError:
+            qhash_u64 = 0
+    mixed = (int(base_seed) & _MASK_U64) ^ ((idx + 1) * _GOLDEN64 & _MASK_U64) ^ qhash_u64
+    derived = _splitmix64(mixed)
+    # Core treats seed=0 as non-deterministic; keep eval seeds deterministic.
+    return derived if derived != 0 else 1
 
 
 def _extract_response_output(events: list[dict]) -> list[dict]:
@@ -235,6 +261,16 @@ def run_eval(
 
                     # Build canonical request, then format for target API.
                     canonical = build_body(sample, uri, config)
+                    # Eval safety: avoid reusing the exact same seed for every question.
+                    # Repeated same-seed + single-token decoding can create strong seed lottery
+                    # effects. Derive a deterministic per-sample request seed instead.
+                    if "seed" in canonical:
+                        try:
+                            base_seed = int(canonical["seed"])
+                        except (TypeError, ValueError):
+                            base_seed = 0
+                        if base_seed != 0:
+                            canonical["seed"] = _derive_request_seed(base_seed, sample)
                     api_path, body = format_request(canonical, completions=completions)
 
                     # Retry loop with persistent connection.

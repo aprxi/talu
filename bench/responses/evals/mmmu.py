@@ -29,6 +29,8 @@ _API_FIELDS = {
     "top_p": "top_p",
     "top_k": "top_k",
     "seed": "seed",
+    "presence_penalty": "presence_penalty",
+    "frequency_penalty": "frequency_penalty",
 }
 
 
