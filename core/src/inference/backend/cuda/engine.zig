@@ -353,11 +353,17 @@ pub const CudaBackend = struct {
     scale_rows_f32_function: ?compute.cuda.Function = null,
     fp8_matvec_function: ?compute.cuda.Function = null,
     fp8_matvec_tile8_function: ?compute.cuda.Function = null,
+    quantize_f32_to_mxfp8_function: ?compute.cuda.Function = null,
+    mxfp8_dequant_to_bf16_function: ?compute.cuda.Function = null,
     fp8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
     fp8_matvec_gate_up_silu_tile8_function: ?compute.cuda.Function = null,
     fp8_matvec_gate_up_function: ?compute.cuda.Function = null,
     fp8_matvec_gate_up_tile8_function: ?compute.cuda.Function = null,
     fp8_dequant_to_bf16_function: ?compute.cuda.Function = null,
+    mxfp8_matvec_function: ?compute.cuda.Function = null,
+    mxfp8_matvec_tile8_function: ?compute.cuda.Function = null,
+    mxfp8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
+    mxfp8_matvec_gate_up_function: ?compute.cuda.Function = null,
     i8_blas_supported: bool = true,
     fp8_blas_supported: bool = true,
     // Transient: set before QKV projection to provide concat cache for fused I8 prefill.
@@ -374,6 +380,7 @@ pub const CudaBackend = struct {
     u16_blas_bf16_supported: bool = true,
     kernel_arg_pack: compute.cuda.ArgPack,
     blas: compute.cuda.Blas,
+    blas_lt: ?compute.cuda.BlasLt = null,
     runtime_buffers: RuntimeBuffers,
     block_runtime: BlockRuntime,
     d_model: usize,
@@ -755,6 +762,8 @@ pub const CudaBackend = struct {
         const max_shortconv_dim = backend.block_runtime.maxShortConvDim();
         backend.blas = try compute.cuda.Blas.init(&backend.device);
         errdefer backend.blas.deinit(&backend.device);
+        // Attempt cuBLASLt init for MXFP8 tensor core GEMM — not fatal if unavailable.
+        backend.blas_lt = compute.cuda.BlasLt.init(&backend.device) catch null;
         backend.runtime_buffers = try RuntimeBuffers.init(
             allocator,
             &backend.device,
@@ -1460,6 +1469,7 @@ pub const CudaBackend = struct {
         self.block_runtime.deinit(self.allocator, &self.device);
         self.runtime_buffers.deinit(self.allocator, &self.device);
         self.blas.deinit(&self.device);
+        if (self.blas_lt) |*lt| lt.deinit(&self.device);
         self.kernel_arg_pack.deinit();
         self.kernel_registry.deinit();
         self.device.deinit();
@@ -2763,6 +2773,7 @@ pub const CudaBackend = struct {
             .gaffine_u4 => gaffine_matvec_available,
             .gaffine_u8 => gaffine_u8_matvec_available,
             .fp8 => true,
+            .mxfp8 => true,
         };
     }
 

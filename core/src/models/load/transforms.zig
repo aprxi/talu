@@ -635,6 +635,41 @@ pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTens
             return error.MissingScales;
         };
     }
+    // Handle MXFP8 E4M3 weights — E4M3 data + UE8M0 block-32 scales for cuBLASLt tensor core GEMM
+    if (weight_tensor.dtype == .f8_e4m3) mxfp8_check: {
+        const base = if (std.mem.endsWith(u8, name, ".weight"))
+            name[0 .. name.len - ".weight".len]
+        else
+            name;
+
+        var mxfp8_scale_name_buf: [256]u8 = undefined;
+        const mxfp8_scale_name = std.fmt.bufPrint(&mxfp8_scale_name_buf, "{s}.weight_block_scale", .{base}) catch break :mxfp8_check;
+        const mxfp8_scale_tensor = st.getTensor(mxfp8_scale_name, null) catch break :mxfp8_check;
+
+        // MXFP8 scales are 2D: [rows, ceil(cols/32)] with dtype u8/i8 (E8M0)
+        // Note: safetensors reader maps U8 → .i8 ("unsigned treated as signed")
+        if (mxfp8_scale_tensor.n_dims != 2) break :mxfp8_check;
+        if (mxfp8_scale_tensor.dtype != .u8 and mxfp8_scale_tensor.dtype != .i8) break :mxfp8_check;
+
+        const s_rows: usize = @intCast(mxfp8_scale_tensor.shape[0]);
+        const s_cols: usize = @intCast(mxfp8_scale_tensor.shape[1]);
+        const w_rows: usize = @intCast(weight_tensor.shape[0]);
+        if (s_rows != w_rows) break :mxfp8_check;
+
+        const scale_data = mxfp8_scale_tensor.data();
+        const scale_byte_len = s_rows * s_cols;
+        if (scale_data.len < scale_byte_len) break :mxfp8_check;
+
+        weight_tensor.mxfp8 = .{
+            .block_scales_data = scale_data.ptr,
+            .block_scales_len = scale_byte_len,
+            .rows = @intCast(w_rows),
+            .cols = @intCast(weight_tensor.shape[1]),
+            .scale_cols = @intCast(s_cols),
+        };
+        return weight_tensor;
+    }
+
     // Handle FP8 E4M3 weights — keep native when possible for tensor-core GEMM
     if (weight_tensor.dtype == .f8_e4m3) {
         const base = if (std.mem.endsWith(u8, name, ".weight"))

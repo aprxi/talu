@@ -32,6 +32,7 @@ pub fn generateModelCard(
         .fp8 => "FP8",
         .mxfp4 => "MXFP4",
         .nvfp4 => "NVFP4",
+        .mxfp8 => "MXFP8",
     };
 
     // YAML frontmatter
@@ -52,6 +53,7 @@ pub fn generateModelCard(
         .fp8 => try writer.writeAll("  - fp8\n"),
         .mxfp4 => try writer.writeAll("  - mxfp4\n"),
         .nvfp4 => try writer.writeAll("  - nvfp4\n"),
+        .mxfp8 => try writer.writeAll("  - mxfp8\n"),
     }
 
     try writer.print("  - {d}-bit\n", .{bits});

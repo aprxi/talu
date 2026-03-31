@@ -7,6 +7,7 @@
 const std = @import("std");
 const grouped_affine = @import("grouped_affine.zig");
 const fp8_converter = @import("fp8.zig");
+const mxfp8_converter = @import("mxfp8.zig");
 const progress_api = @import("../capi/progress.zig");
 
 // =============================================================================
@@ -39,6 +40,7 @@ const DEFS = [_]SchemeDefinition{
     .{ .val = .fp8_e5m2, .name = "fp8_e5m2", .aliases = &.{} },
     .{ .val = .mxfp4, .name = "mxfp4", .aliases = &.{} },
     .{ .val = .nvfp4, .name = "nvfp4", .aliases = &.{} },
+    .{ .val = .mxfp8, .name = "mxfp8", .aliases = &.{} },
 };
 
 // =============================================================================
@@ -109,8 +111,8 @@ pub const QuantLevel = enum(u32) {
 /// ## Grouped Affine (MLX Compatible)
 /// - gaf4_32, gaf4_64, gaf4_128, gaf8_32, gaf8_64, gaf8_128
 ///
-/// ## Hardware Float (Not Yet Implemented)
-/// - fp8_e4m3, fp8_e5m2, mxfp4, nvfp4
+/// ## Hardware Float
+/// - fp8_e4m3, fp8_e5m2, mxfp4, nvfp4, mxfp8
 pub const Scheme = enum(u32) {
     // No quantization
     f16 = 4, // No quantization
@@ -128,6 +130,7 @@ pub const Scheme = enum(u32) {
     fp8_e5m2 = 21, // FP8 E5M2 for training
     mxfp4 = 22, // OCP Microscaling 4-bit (group_size=32 fixed)
     nvfp4 = 23, // NVIDIA Blackwell 4-bit (group_size=32 fixed)
+    mxfp8 = 24, // OCP Microscaling 8-bit E4M3 + E8M0 scales (group_size=32)
 
     /// Get the conversion method for this scheme.
     pub fn getMethod(self: Scheme) Method {
@@ -136,6 +139,7 @@ pub const Scheme = enum(u32) {
             .fp8_e4m3, .fp8_e5m2 => .fp8,
             .mxfp4 => .mxfp4,
             .nvfp4 => .nvfp4,
+            .mxfp8 => .mxfp8,
         };
     }
 
@@ -143,7 +147,7 @@ pub const Scheme = enum(u32) {
     pub fn getBits(self: Scheme) u8 {
         return switch (self) {
             .gaf4_32, .gaf4_64, .gaf4_128, .mxfp4, .nvfp4 => 4,
-            .gaf8_32, .gaf8_64, .gaf8_128, .fp8_e4m3, .fp8_e5m2 => 8,
+            .gaf8_32, .gaf8_64, .gaf8_128, .fp8_e4m3, .fp8_e5m2, .mxfp8 => 8,
             .f16 => 16,
         };
     }
@@ -167,16 +171,17 @@ pub const Scheme = enum(u32) {
             // FP8: 8 bits exactly
             .fp8_e4m3, .fp8_e5m2 => 800,
 
-            // Microscaling: 4 bits + scale overhead
+            // Microscaling: data bits + scale overhead
             .mxfp4 => 500, // 4 + 1.0 (group_size=32)
             .nvfp4 => 500, // 4 + 1.0 (group_size=32)
+            .mxfp8 => 825, // 8 + 0.25 (1 byte scale per 32 elements)
         };
     }
 
     /// Get the group size for this scheme (0 if not applicable).
     pub fn getGroupSize(self: Scheme) u32 {
         return switch (self) {
-            .gaf4_32, .gaf8_32, .mxfp4, .nvfp4 => 32,
+            .gaf4_32, .gaf8_32, .mxfp4, .nvfp4, .mxfp8 => 32,
             .gaf4_64, .gaf8_64, .f16 => 64, // f16 uses default group_size
             .gaf4_128, .gaf8_128 => 128,
             .fp8_e4m3, .fp8_e5m2 => 0,
@@ -197,6 +202,7 @@ pub const Scheme = enum(u32) {
             .fp8_e5m2 => "FP8-E5M2",
             .mxfp4 => "MXFP4",
             .nvfp4 => "NVFP4",
+            .mxfp8 => "MXFP8",
         };
     }
 
@@ -357,6 +363,7 @@ pub const Method = enum {
     fp8, // FP8 hardware float
     mxfp4, // OCP Microscaling
     nvfp4, // NVIDIA Blackwell
+    mxfp8, // OCP Microscaling FP8
 };
 
 // =============================================================================
@@ -596,6 +603,29 @@ pub fn convert(
 
             if (options.return_model_id) {
                 const model_id = fp8_converter.modelIdFromOutputPath(allocator, output_path) catch {
+                    allocator.free(output_path);
+                    return .{ .err = error.InvalidOutputPath };
+                };
+                allocator.free(output_path);
+                return .{ .output_path = model_id };
+            }
+
+            return .{ .output_path = output_path };
+        },
+        .mxfp8 => {
+            const output_path = mxfp8_converter.convertToMxfp8(allocator, model_path, .{
+                .output_dir = output_dir,
+                .destination = destination,
+                .output_suffix = scheme.toOutputSuffix(),
+                .force = options.force,
+                .max_shard_size = options.max_shard_size,
+                .progress = options.progressContext(),
+            }) catch |err| {
+                return .{ .err = err };
+            };
+
+            if (options.return_model_id) {
+                const model_id = mxfp8_converter.modelIdFromOutputPath(allocator, output_path) catch {
                     allocator.free(output_path);
                     return .{ .err = error.InvalidOutputPath };
                 };

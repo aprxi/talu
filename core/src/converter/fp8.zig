@@ -557,7 +557,7 @@ fn scaleToF32(scale_tensor: Tensor, idx: usize) !f32 {
         dtype_mod.fp16ToF32(scale_u16[idx]);
 }
 
-fn dequantizeFp8WithScale(
+pub fn dequantizeFp8WithScale(
     allocator: std.mem.Allocator,
     weight_tensor: Tensor,
     scale_tensor: Tensor,

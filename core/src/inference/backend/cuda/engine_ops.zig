@@ -920,6 +920,169 @@ pub fn linearForwardRows(
 
             return error.CudaKernelUnavailable;
         },
+        .mxfp8 => |w| {
+            // MXFP8 GEMV for small batch sizes (≤32 rows).
+            // Reads F32 input directly — no activation quantization needed.
+            // Uses row-major UE8M0 scales (scales_raw_buffer).
+            if (rows <= 32) mxfp8_gemv: {
+                if (w.scales_raw_buffer.pointer == 0 or w.scales_raw_buffer.size == 0) break :mxfp8_gemv;
+                var mxfp8_fn = self.mxfp8_matvec_function orelse break :mxfp8_gemv;
+                var mxfp8_batch_tile: u32 = 4;
+                if (rows > 4) {
+                    if (self.mxfp8_matvec_tile8_function) |tile8_fn| {
+                        mxfp8_fn = tile8_fn;
+                        mxfp8_batch_tile = 8;
+                    }
+                }
+
+                const out_cols: u32 = @intCast(w.cols);
+                const batch_rows: u32 = @intCast(rows);
+                self.kernel_arg_pack.reset();
+                self.kernel_arg_pack.appendBufferPtr(&packed_input) catch break :mxfp8_gemv;
+                self.kernel_arg_pack.appendBufferPtr(&w.buffer) catch break :mxfp8_gemv;
+                self.kernel_arg_pack.appendBufferPtr(&w.scales_raw_buffer) catch break :mxfp8_gemv;
+                self.kernel_arg_pack.appendBufferPtr(&packed_out) catch break :mxfp8_gemv;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch break :mxfp8_gemv;
+                self.kernel_arg_pack.appendScalar(u32, out_cols) catch break :mxfp8_gemv;
+                self.kernel_arg_pack.appendScalar(u32, w.scale_cols) catch break :mxfp8_gemv;
+                self.kernel_arg_pack.appendScalar(u32, batch_rows) catch break :mxfp8_gemv;
+                compute.cuda.launch.launchWithFamily(&self.device, mxfp8_fn, .{
+                    .grid_x = (out_cols + 3) / 4,
+                    .grid_y = (batch_rows + mxfp8_batch_tile - 1) / mxfp8_batch_tile,
+                    .block_x = 128,
+                }, &self.kernel_arg_pack, .matvec) catch break :mxfp8_gemv;
+                return;
+            }
+
+            // cuBLASLt block-scaled FP8 tensor core GEMM for large batch sizes.
+            // Requires: (1) cuBLASLt handle, (2) activation quantization kernel F32→E4M3+UE8M0.
+            if (self.blas_lt) |*blas_lt| mxfp8_lt: {
+                const quant_fn = self.quantize_f32_to_mxfp8_function orelse break :mxfp8_lt;
+
+                const in_dim = w.rows;
+                const out_dim = w.cols;
+                const scale_cols: usize = (in_dim + 31) / 32;
+
+                // cuBLASLt VEC32_UE8M0 requires scale tensors padded to 128-tile
+                // boundaries with interleaved layout. Compute padded dimensions.
+                const padded_outer = engine_types.Mxfp8LinearWeight.roundoff(rows, 128);
+                const padded_sf_k = engine_types.Mxfp8LinearWeight.roundoff(scale_cols, 4);
+                const act_scale_bytes = padded_outer * padded_sf_k;
+
+                // Activation E4M3 bytes from activation_u16_dev, interleaved scales from
+                // dequant_f16_dev (large buffer, unused during cuBLASLt path).
+                const act_e4m3_bytes = std.math.mul(usize, rows, in_dim) catch break :mxfp8_lt;
+                if (self.runtime_buffers.activation_u16_dev.size < act_e4m3_bytes) break :mxfp8_lt;
+                if (self.runtime_buffers.dequant_f16_dev.size < act_scale_bytes) break :mxfp8_lt;
+
+                var act_e4m3_buf = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, act_e4m3_bytes) catch break :mxfp8_lt;
+                var act_scale_buf = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, act_scale_bytes) catch break :mxfp8_lt;
+
+                // Step 1: Quantize F32 activations → E4M3 + interleaved UE8M0 scales.
+                // Kernel launches with padded_outer rows; padded rows write zero scales.
+                self.kernel_arg_pack.reset();
+                self.kernel_arg_pack.appendBufferPtr(&packed_input) catch break :mxfp8_lt;
+                self.kernel_arg_pack.appendBufferPtr(&act_e4m3_buf) catch break :mxfp8_lt;
+                self.kernel_arg_pack.appendBufferPtr(&act_scale_buf) catch break :mxfp8_lt;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch break :mxfp8_lt;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(rows)) catch break :mxfp8_lt;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(padded_outer)) catch break :mxfp8_lt;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(padded_sf_k)) catch break :mxfp8_lt;
+                compute.cuda.launch.launchWithFamily(&self.device, quant_fn, .{
+                    .grid_x = @intCast(scale_cols),
+                    .grid_y = @intCast(padded_outer),
+                    .block_x = 32,
+                }, &self.kernel_arg_pack, .other) catch break :mxfp8_lt;
+
+                // Step 2: cuBLASLt block-scaled MXFP8 GEMM
+                blas_lt.matmulMxfp8(
+                    &self.device,
+                    &w.buffer,
+                    &w.scales_buffer,
+                    &act_e4m3_buf,
+                    &act_scale_buf,
+                    &packed_out,
+                    rows,
+                    out_dim,
+                    in_dim,
+                ) catch |lt_err| {
+                    std.log.err("MXFP8 cuBLASLt failed: {s}", .{@errorName(lt_err)});
+                    break :mxfp8_lt;
+                };
+                return;
+            }
+
+            // Fallback: dequant MXFP8→BF16, then cuBLAS BF16 GEMM.
+            if (self.mxfp8_dequant_to_bf16_function) |dequant_fn| {
+                if (self.cast_f32_to_bf16_function) |cast_fn| {
+                    if (self.u16_blas_bf16_supported) mxfp8_dequant_blas: {
+                        const in_dim = w.rows;
+                        const out_dim = w.cols;
+
+                        const weight_elems = std.math.mul(usize, in_dim, out_dim) catch break :mxfp8_dequant_blas;
+                        const weight_bf16_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch break :mxfp8_dequant_blas;
+                        if (self.runtime_buffers.dequant_f16_dev.size < weight_bf16_bytes) break :mxfp8_dequant_blas;
+
+                        const input_elems = std.math.mul(usize, rows, in_dim) catch break :mxfp8_dequant_blas;
+                        const input_bf16_bytes = std.math.mul(usize, input_elems, @sizeOf(u16)) catch break :mxfp8_dequant_blas;
+                        if (self.runtime_buffers.activation_u16_dev.size < input_bf16_bytes) break :mxfp8_dequant_blas;
+
+                        // Step 1: Dequant MXFP8 weights → BF16.
+                        var dequant_weight = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, weight_bf16_bytes) catch break :mxfp8_dequant_blas;
+                        const grid_x = std.math.cast(u32, std.math.divCeil(usize, in_dim, 256) catch break :mxfp8_dequant_blas) orelse break :mxfp8_dequant_blas;
+                        const grid_y = std.math.cast(u32, out_dim) orelse break :mxfp8_dequant_blas;
+                        // Compute interleaved scale dimensions (weight scales are stored interleaved)
+                        const dequant_scale_cols: usize = w.scale_cols;
+                        const dequant_padded_outer = engine_types.Mxfp8LinearWeight.roundoff(out_dim, 128);
+                        const dequant_padded_sf_k = engine_types.Mxfp8LinearWeight.roundoff(dequant_scale_cols, 4);
+
+                        self.kernel_arg_pack.reset();
+                        self.kernel_arg_pack.appendBufferPtr(&w.buffer) catch break :mxfp8_dequant_blas;
+                        self.kernel_arg_pack.appendBufferPtr(&w.scales_buffer) catch break :mxfp8_dequant_blas;
+                        self.kernel_arg_pack.appendBufferPtr(&dequant_weight) catch break :mxfp8_dequant_blas;
+                        self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch break :mxfp8_dequant_blas;
+                        self.kernel_arg_pack.appendScalar(u32, @intCast(out_dim)) catch break :mxfp8_dequant_blas;
+                        self.kernel_arg_pack.appendScalar(u32, @intCast(dequant_padded_outer)) catch break :mxfp8_dequant_blas;
+                        self.kernel_arg_pack.appendScalar(u32, @intCast(dequant_padded_sf_k)) catch break :mxfp8_dequant_blas;
+                        compute.cuda.launch.launchWithFamily(&self.device, dequant_fn, .{
+                            .grid_x = grid_x,
+                            .grid_y = grid_y,
+                            .block_x = 256,
+                        }, &self.kernel_arg_pack, .other) catch break :mxfp8_dequant_blas;
+
+                        // Step 2: Cast F32 input → BF16.
+                        var input_bf16_dev = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, input_bf16_bytes) catch break :mxfp8_dequant_blas;
+                        try compute.cuda.cast_f32_to_bf16.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            cast_fn,
+                            &packed_input,
+                            &input_bf16_dev,
+                            @intCast(input_elems),
+                        );
+
+                        // Step 3: cuBLAS BF16 × BF16 → F32 GEMM.
+                        self.blas.matmulU16U16F32(
+                            &self.device,
+                            &input_bf16_dev,
+                            .bf16,
+                            rows,
+                            in_dim,
+                            &dequant_weight,
+                            .bf16,
+                            out_dim,
+                            &packed_out,
+                        ) catch {
+                            self.u16_blas_bf16_supported = false;
+                            break :mxfp8_dequant_blas;
+                        };
+                        return;
+                    }
+                }
+            }
+
+            return error.CudaKernelUnavailable;
+        },
     }
 }
 
@@ -2038,6 +2201,109 @@ pub fn tryFusedFp8GateUpForward(
     return true;
 }
 
+pub fn tryFusedMxfp8GateUpSiluForward(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    gate_weight: *const LinearWeight,
+    up_weight: *const LinearWeight,
+    rows: usize,
+    expected_out_dim: u32,
+) !bool {
+    if (self.loaded.config.use_gelu) return false;
+    if (rows == 0 or rows > 32) return false;
+
+    const gate = switch (gate_weight.*) {
+        .mxfp8 => |w| w,
+        else => return false,
+    };
+    const up = switch (up_weight.*) {
+        .mxfp8 => |w| w,
+        else => return false,
+    };
+    if (gate.rows != up.rows) return false;
+    if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
+    if (gate.rows != self.d_model) return false;
+    if (gate.scales_raw_buffer.pointer == 0 or up.scales_raw_buffer.pointer == 0) return false;
+
+    const fused_fn = self.mxfp8_matvec_gate_up_silu_function orelse return false;
+
+    const out_dim: u32 = @intCast(gate.cols);
+    const in_dim: u32 = @intCast(gate.rows);
+    const batch_rows: u32 = @intCast(rows);
+
+    self.kernel_arg_pack.reset();
+    try self.kernel_arg_pack.appendBufferPtr(input);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.scales_raw_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.scales_raw_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_mul_dev);
+    try self.kernel_arg_pack.appendScalar(u32, out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, in_dim);
+    try self.kernel_arg_pack.appendScalar(u32, gate.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, up.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, batch_rows);
+
+    try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
+        .grid_x = (out_dim + 3) / 4,
+        .grid_y = (batch_rows + 3) / 4,
+        .block_x = 128,
+    }, &self.kernel_arg_pack, .matvec_gate_up_silu);
+    return true;
+}
+
+pub fn tryFusedMxfp8GateUpForward(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    gate_weight: *const LinearWeight,
+    up_weight: *const LinearWeight,
+    rows: usize,
+) !bool {
+    if (rows == 0 or rows > 32) return false;
+
+    const gate = switch (gate_weight.*) {
+        .mxfp8 => |w| w,
+        else => return false,
+    };
+    const up = switch (up_weight.*) {
+        .mxfp8 => |w| w,
+        else => return false,
+    };
+    if (gate.rows != up.rows) return false;
+    if (gate.rows != self.d_model) return false;
+    if (gate.scales_raw_buffer.pointer == 0 or up.scales_raw_buffer.pointer == 0) return false;
+
+    const fused_fn = self.mxfp8_matvec_gate_up_function orelse return false;
+
+    const gate_out_dim: u32 = @intCast(gate.cols);
+    const up_out_dim: u32 = @intCast(up.cols);
+    const in_dim: u32 = @intCast(gate.rows);
+    const total_dim = gate_out_dim + up_out_dim;
+    const batch_rows: u32 = @intCast(rows);
+
+    self.kernel_arg_pack.reset();
+    try self.kernel_arg_pack.appendBufferPtr(input);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.scales_raw_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_gate_dev);
+    try self.kernel_arg_pack.appendScalar(u32, gate_out_dim);
+    try self.kernel_arg_pack.appendBufferPtr(&up.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.scales_raw_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_up_dev);
+    try self.kernel_arg_pack.appendScalar(u32, up_out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, in_dim);
+    try self.kernel_arg_pack.appendScalar(u32, gate.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, up.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, batch_rows);
+
+    try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
+        .grid_x = (total_dim + 3) / 4,
+        .grid_y = (batch_rows + 3) / 4,
+        .block_x = 128,
+    }, &self.kernel_arg_pack, .matvec);
+    return true;
+}
+
 pub fn tryFusedGateUpForward(
     self: anytype,
     input: *const compute.cuda.Buffer,
@@ -2046,6 +2312,7 @@ pub fn tryFusedGateUpForward(
     rows: usize,
 ) !bool {
     if (try tryFusedDenseU16GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
+    if (try tryFusedMxfp8GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
     if (try tryFusedFp8GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
     // The U4 fused gate/up+silu path is currently unstable for quality-sensitive
     // generation; keep the established U8 path as the default correctness path.

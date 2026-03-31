@@ -21,6 +21,7 @@ const c = @cImport({
 pub const DType = dtype_mod.DType;
 pub const GroupedAffineMeta = dtype_mod.GroupedAffineMeta;
 pub const Fp8Meta = dtype_mod.Fp8Meta;
+pub const Mxfp8Meta = dtype_mod.Mxfp8Meta;
 
 /// Memory alignment constants
 pub const mem = struct {
@@ -183,6 +184,8 @@ pub const Tensor = struct {
     gaffine: ?GroupedAffineMeta = null,
     /// FP8 E4M3 per-tensor scale metadata (optional)
     fp8: ?Fp8Meta = null,
+    /// MXFP8 E4M3 + UE8M0 block-32 scale metadata (optional)
+    mxfp8: ?Mxfp8Meta = null,
 
     const Self = @This();
 
@@ -207,6 +210,7 @@ pub const Tensor = struct {
         tensor.owns_data = true;
         tensor.gaffine = null;
         tensor.fp8 = null;
+        tensor.mxfp8 = null;
 
         // Calculate strides (row-major / C-contiguous)
         var stride: i64 = 1;
@@ -246,6 +250,7 @@ pub const Tensor = struct {
         tensor.owns_data = false;
         tensor.gaffine = null;
         tensor.fp8 = null;
+        tensor.mxfp8 = null;
         tensor.n_dims = @intCast(shape_slice.len);
 
         var numel: usize = 1;
@@ -404,6 +409,7 @@ pub const Tensor = struct {
         tensor.owns_data = false;
         tensor.gaffine = null;
         tensor.fp8 = null;
+        tensor.mxfp8 = null;
         tensor.n_dims = 2;
         tensor.shape = .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0, 0 };
         tensor.numel = rows * cols;
@@ -420,6 +426,7 @@ pub const Tensor = struct {
         tensor.owns_data = false;
         tensor.gaffine = null;
         tensor.fp8 = null;
+        tensor.mxfp8 = null;
         tensor.n_dims = 3;
         tensor.shape = .{ 1, @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 };
         tensor.numel = rows * cols;
@@ -484,6 +491,7 @@ pub const OwnedTensor = struct {
     data_size: usize,
     gaffine: ?GroupedAffineMeta = null,
     fp8: ?Fp8Meta = null,
+    mxfp8: ?Mxfp8Meta = null,
 
     pub fn init(allocator: std.mem.Allocator, dtype: DType, shape: []const usize) !OwnedTensor {
         var fixed_shape: [4]usize = .{0} ** 4;
@@ -579,6 +587,7 @@ pub const QuantMethod = enum {
     mxfp4,
     native, // reserved, not currently used
     fp8,
+    mxfp8,
 };
 
 pub const RopeScaling = struct {

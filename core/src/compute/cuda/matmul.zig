@@ -508,6 +508,346 @@ pub const Blas = struct {
     }
 };
 
+// =============================================================================
+// cuBLASLt for block-scaled MXFP8 GEMM (Blackwell tensor cores)
+// =============================================================================
+
+// cuBLASLt attribute IDs
+const cublaslt_matmul_desc_compute_type: i32 = 0;
+const cublaslt_matmul_desc_transa: i32 = 3;
+const cublaslt_matmul_desc_transb: i32 = 4;
+const cublaslt_matmul_desc_a_scale_pointer: i32 = 17;
+const cublaslt_matmul_desc_b_scale_pointer: i32 = 18;
+const cublaslt_matmul_desc_a_scale_mode: i32 = 31;
+const cublaslt_matmul_desc_b_scale_mode: i32 = 32;
+
+// Scale modes
+const cublaslt_scale_vec32_ue8m0: i32 = 2;
+
+// Preference attributes
+const cublaslt_pref_max_workspace_bytes: i32 = 1;
+
+// cuBLASLt function pointer types
+const CublasLtCreateFn = *const fn (*?*anyopaque) callconv(.c) c_int;
+const CublasLtDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CublasLtMatmulDescCreateFn = *const fn (*?*anyopaque, c_int, c_int) callconv(.c) c_int;
+const CublasLtMatmulDescDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CublasLtMatmulDescSetAttributeFn = *const fn (?*anyopaque, c_int, ?*const anyopaque, usize) callconv(.c) c_int;
+const CublasLtMatrixLayoutCreateFn = *const fn (*?*anyopaque, c_int, u64, u64, u64) callconv(.c) c_int;
+const CublasLtMatrixLayoutDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CublasLtMatmulPreferenceCreateFn = *const fn (*?*anyopaque) callconv(.c) c_int;
+const CublasLtMatmulPreferenceDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CublasLtMatmulPreferenceSetAttributeFn = *const fn (?*anyopaque, c_int, ?*const anyopaque, usize) callconv(.c) c_int;
+// cublasLtMatmulAlgoGetHeuristic returns status, last param is *int returnedResults
+const CublasLtMatmulAlgoGetHeuristicFn = *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque, ?*anyopaque, ?*anyopaque, ?*anyopaque, ?*anyopaque, c_int, ?*anyopaque, *c_int) callconv(.c) c_int;
+// cublasLtMatmul: handle, desc, alpha, A, Adesc, B, Bdesc, beta, C, Cdesc, D, Ddesc, algo, workspace, workspaceSize, stream
+const CublasLtMatmulFn = *const fn (?*anyopaque, ?*anyopaque, ?*const anyopaque, ?*const anyopaque, ?*anyopaque, ?*const anyopaque, ?*anyopaque, ?*const anyopaque, ?*const anyopaque, ?*anyopaque, ?*anyopaque, ?*anyopaque, ?*const anyopaque, ?*anyopaque, usize, ?*anyopaque) callconv(.c) c_int;
+
+const CublasLtApi = struct {
+    create: CublasLtCreateFn,
+    destroy: CublasLtDestroyFn,
+    matmul_desc_create: CublasLtMatmulDescCreateFn,
+    matmul_desc_destroy: CublasLtMatmulDescDestroyFn,
+    matmul_desc_set_attribute: CublasLtMatmulDescSetAttributeFn,
+    matrix_layout_create: CublasLtMatrixLayoutCreateFn,
+    matrix_layout_destroy: CublasLtMatrixLayoutDestroyFn,
+    matmul_preference_create: CublasLtMatmulPreferenceCreateFn,
+    matmul_preference_destroy: CublasLtMatmulPreferenceDestroyFn,
+    matmul_preference_set_attribute: CublasLtMatmulPreferenceSetAttributeFn,
+    matmul_algo_get_heuristic: CublasLtMatmulAlgoGetHeuristicFn,
+    matmul: CublasLtMatmulFn,
+};
+
+/// cuBLASLt handle for block-scaled FP8 GEMM.
+/// Loaded separately from cuBLAS since it requires a different shared library.
+pub const BlasLt = struct {
+    lib: std.DynLib,
+    api: CublasLtApi,
+    handle: ?*anyopaque,
+    workspace: ?device_mod.Buffer,
+    workspace_size: usize,
+    /// Cached matmul plans keyed by (M, N, K). Avoids expensive per-call
+    /// descriptor creation and heuristic search (~168 calls per decode step).
+    cached_plans: [max_cached_plans]CachedPlan = [_]CachedPlan{.{}} ** max_cached_plans,
+    n_cached: usize = 0,
+
+    const lt_workspace_size: usize = 32 * 1024 * 1024; // 32MB (matches NVIDIA sample)
+    const max_cached_plans = 64;
+
+    const CachedPlan = struct {
+        m: usize = 0,
+        n: usize = 0,
+        k: usize = 0,
+        matmul_desc: ?*anyopaque = null,
+        a_layout: ?*anyopaque = null,
+        b_layout: ?*anyopaque = null,
+        c_layout: ?*anyopaque = null,
+        d_layout: ?*anyopaque = null,
+        heuristic_result: [128]u64 = [_]u64{0} ** 128,
+    };
+
+    pub fn init(device: *device_mod.Device) !BlasLt {
+        try device.makeCurrent();
+
+        var lib = try openCublasLtLibrary();
+        errdefer lib.close();
+
+        const api = try loadCublasLtApi(&lib);
+
+        var handle: ?*anyopaque = null;
+        const status = api.create(&handle);
+        if (status != cublas_status_success or handle == null) {
+            return error.CublasLtCreateFailed;
+        }
+        errdefer _ = api.destroy(handle);
+
+        // Allocate workspace
+        var workspace = try device.allocBuffer(lt_workspace_size);
+        errdefer workspace.deinit(device);
+
+        return .{
+            .lib = lib,
+            .api = api,
+            .handle = handle,
+            .workspace = workspace,
+            .workspace_size = lt_workspace_size,
+        };
+    }
+
+    pub fn deinit(self: *BlasLt, device: *device_mod.Device) void {
+        device.makeCurrent() catch {};
+        // Destroy cached plans before handle
+        for (self.cached_plans[0..self.n_cached]) |*plan| {
+            if (plan.d_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (plan.c_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (plan.b_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (plan.a_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (plan.matmul_desc) |d| _ = self.api.matmul_desc_destroy(d);
+        }
+        self.n_cached = 0;
+        if (self.workspace) |*ws| {
+            ws.deinit(device);
+            self.workspace = null;
+        }
+        if (self.handle) |h| {
+            _ = self.api.destroy(h);
+            self.handle = null;
+        }
+        // Note: intentionally skip self.lib.close(). The NVIDIA cuBLASLt
+        // library registers atexit handlers that can crash if dlclosed before
+        // process exit. Leaking the handle is safe — the OS reclaims it.
+    }
+
+    /// Look up or create a cached plan for the given (M, N, K) dimensions.
+    /// Scale pointers are needed for the heuristic search on cache miss.
+    fn getOrCreatePlan(
+        self: *BlasLt,
+        M: usize,
+        N: usize,
+        K: usize,
+        a_scale_ptr: ?*const anyopaque,
+        b_scale_ptr: ?*const anyopaque,
+    ) !*CachedPlan {
+        const h = self.handle orelse return error.CublasLtHandleInvalid;
+
+        // Look up existing plan
+        for (self.cached_plans[0..self.n_cached]) |*plan| {
+            if (plan.m == M and plan.n == N and plan.k == K) return plan;
+        }
+
+        // Cache full — evict oldest entry (index 0)
+        if (self.n_cached >= max_cached_plans) {
+            const evict = &self.cached_plans[0];
+            if (evict.d_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (evict.c_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (evict.b_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (evict.a_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (evict.matmul_desc) |d| _ = self.api.matmul_desc_destroy(d);
+            // Shift remaining entries down
+            const remaining = self.n_cached - 1;
+            for (0..remaining) |i| {
+                self.cached_plans[i] = self.cached_plans[i + 1];
+            }
+            self.n_cached = remaining;
+        }
+
+        // Create new plan
+        var plan = CachedPlan{ .m = M, .n = N, .k = K };
+        errdefer {
+            if (plan.d_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (plan.c_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (plan.b_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (plan.a_layout) |l| _ = self.api.matrix_layout_destroy(l);
+            if (plan.matmul_desc) |d| _ = self.api.matmul_desc_destroy(d);
+        }
+
+        // Create matmul descriptor: COMPUTE_32F, output CUDA_R_32F
+        if (self.api.matmul_desc_create(&plan.matmul_desc, cublas_compute_32f, cuda_r_32f) != cublas_status_success) {
+            return error.CublasLtDescCreateFailed;
+        }
+
+        // Set transpose: transa=T (weight), transb=N (input)
+        var op_t: c_int = cublas_op_t;
+        var op_n: c_int = cublas_op_n;
+        if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_transa, @ptrCast(&op_t), @sizeOf(c_int)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+        if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_transb, @ptrCast(&op_n), @sizeOf(c_int)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+
+        // Set block-32 UE8M0 scale mode for both A (weight) and B (input)
+        var scale_mode: i32 = cublaslt_scale_vec32_ue8m0;
+        if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_a_scale_mode, @ptrCast(&scale_mode), @sizeOf(i32)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+        if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_b_scale_mode, @ptrCast(&scale_mode), @sizeOf(i32)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+
+        // Set scale pointers (required for heuristic search)
+        if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_a_scale_pointer, @ptrCast(&a_scale_ptr), @sizeOf(?*const anyopaque)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+        if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_b_scale_pointer, @ptrCast(&b_scale_ptr), @sizeOf(?*const anyopaque)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+
+        // Create matrix layouts (column-major perspective)
+        // A (weight): K×N col-major (with transa=T, logical N×K = out_dim × in_dim)
+        // B (input): K×M col-major (with transb=N, logical K×M = in_dim × rows)
+        // C/D (output): N×M col-major = out_dim × rows
+        if (self.api.matrix_layout_create(&plan.a_layout, cuda_r_8f_e4m3, K, N, K) != cublas_status_success)
+            return error.CublasLtLayoutCreateFailed;
+        if (self.api.matrix_layout_create(&plan.b_layout, cuda_r_8f_e4m3, K, M, K) != cublas_status_success)
+            return error.CublasLtLayoutCreateFailed;
+        if (self.api.matrix_layout_create(&plan.c_layout, cuda_r_32f, N, M, N) != cublas_status_success)
+            return error.CublasLtLayoutCreateFailed;
+        if (self.api.matrix_layout_create(&plan.d_layout, cuda_r_32f, N, M, N) != cublas_status_success)
+            return error.CublasLtLayoutCreateFailed;
+
+        // Run heuristic search (the expensive part — only done once per unique M,N,K)
+        var preference: ?*anyopaque = null;
+        if (self.api.matmul_preference_create(&preference) != cublas_status_success)
+            return error.CublasLtPreferenceCreateFailed;
+        defer _ = self.api.matmul_preference_destroy(preference);
+
+        var ws_size: usize = self.workspace_size;
+        if (self.api.matmul_preference_set_attribute(preference, cublaslt_pref_max_workspace_bytes, @ptrCast(&ws_size), @sizeOf(usize)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+
+        var returned_results: c_int = 0;
+        const heur_status = self.api.matmul_algo_get_heuristic(
+            h,
+            plan.matmul_desc,
+            plan.a_layout,
+            plan.b_layout,
+            plan.c_layout,
+            plan.d_layout,
+            preference,
+            1,
+            @ptrCast(&plan.heuristic_result),
+            &returned_results,
+        );
+        if (heur_status != cublas_status_success or returned_results == 0)
+            return error.CublasLtNoAlgorithm;
+
+        // Store in cache
+        const idx = self.n_cached;
+        self.cached_plans[idx] = plan;
+        self.n_cached = idx + 1;
+        return &self.cached_plans[idx];
+    }
+
+    /// Block-scaled MXFP8 GEMM: C_f32 = A_e4m3 @ B_e4m3^T with UE8M0 block-32 scales.
+    ///
+    /// Weight A: [out_dim × in_dim] row-major E4M3, scales: [out_dim × in_dim/32] UE8M0
+    /// Input B: [rows × in_dim] row-major E4M3, scales: [rows × in_dim/32] UE8M0
+    /// Output C: [rows × out_dim] row-major F32
+    pub fn matmulMxfp8(
+        self: *BlasLt,
+        device: *device_mod.Device,
+        weight_e4m3: *const device_mod.Buffer,
+        weight_scales_e8m0: *const device_mod.Buffer,
+        input_e4m3: *const device_mod.Buffer,
+        input_scales_e8m0: *const device_mod.Buffer,
+        out_f32: *device_mod.Buffer,
+        rows: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) !void {
+        if (!dimsFitCublas(rows, out_dim, in_dim)) return error.InvalidArgument;
+
+        try device.makeCurrent();
+        const stream = device.getLaunchStream();
+
+        const a_scale_ptr: ?*const anyopaque = @ptrFromInt(weight_scales_e8m0.pointer);
+        const b_scale_ptr: ?*const anyopaque = @ptrFromInt(input_scales_e8m0.pointer);
+
+        const plan = try self.getOrCreatePlan(rows, out_dim, in_dim, a_scale_ptr, b_scale_ptr);
+
+        // Update per-call scale pointers on the cached descriptor
+        if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_a_scale_pointer, @ptrCast(&a_scale_ptr), @sizeOf(?*const anyopaque)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+        if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_b_scale_pointer, @ptrCast(&b_scale_ptr), @sizeOf(?*const anyopaque)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+
+        // Execute matmul with cached plan
+        const alpha: f32 = 1.0;
+        const beta: f32 = 0.0;
+        const weight_dev: ?*const anyopaque = @ptrFromInt(weight_e4m3.pointer);
+        const input_dev: ?*const anyopaque = @ptrFromInt(input_e4m3.pointer);
+        const out_dev: ?*anyopaque = @ptrFromInt(out_f32.pointer);
+        const ws_ptr: ?*anyopaque = if (self.workspace) |ws| @ptrFromInt(ws.pointer) else null;
+        const algo_ptr: ?*const anyopaque = @ptrCast(&plan.heuristic_result);
+
+        const matmul_status = self.api.matmul(
+            self.handle,
+            plan.matmul_desc,
+            @ptrCast(&alpha),
+            weight_dev,
+            plan.a_layout,
+            input_dev,
+            plan.b_layout,
+            @ptrCast(&beta),
+            out_dev,
+            plan.c_layout,
+            out_dev,
+            plan.d_layout,
+            algo_ptr,
+            ws_ptr,
+            self.workspace_size,
+            stream,
+        );
+        if (matmul_status != cublas_status_success) {
+            return error.CublasLtMatmulFailed;
+        }
+    }
+};
+
+fn openCublasLtLibrary() !std.DynLib {
+    const names: []const []const u8 = switch (builtin.os.tag) {
+        .linux => &.{ "libcublasLt.so.12", "libcublasLt.so.13", "libcublasLt.so" },
+        .windows => &.{ "cublasLt64_12.dll", "cublasLt64_11.dll" },
+        else => &.{},
+    };
+    for (names) |name| {
+        if (std.DynLib.open(name)) |lib| return lib else |_| {}
+    }
+    return error.CublasLtUnavailable;
+}
+
+fn loadCublasLtApi(lib: *std.DynLib) !CublasLtApi {
+    return .{
+        .create = try lookupRequired(CublasLtCreateFn, lib, "cublasLtCreate"),
+        .destroy = try lookupRequired(CublasLtDestroyFn, lib, "cublasLtDestroy"),
+        .matmul_desc_create = try lookupRequired(CublasLtMatmulDescCreateFn, lib, "cublasLtMatmulDescCreate"),
+        .matmul_desc_destroy = try lookupRequired(CublasLtMatmulDescDestroyFn, lib, "cublasLtMatmulDescDestroy"),
+        .matmul_desc_set_attribute = try lookupRequired(CublasLtMatmulDescSetAttributeFn, lib, "cublasLtMatmulDescSetAttribute"),
+        .matrix_layout_create = try lookupRequired(CublasLtMatrixLayoutCreateFn, lib, "cublasLtMatrixLayoutCreate"),
+        .matrix_layout_destroy = try lookupRequired(CublasLtMatrixLayoutDestroyFn, lib, "cublasLtMatrixLayoutDestroy"),
+        .matmul_preference_create = try lookupRequired(CublasLtMatmulPreferenceCreateFn, lib, "cublasLtMatmulPreferenceCreate"),
+        .matmul_preference_destroy = try lookupRequired(CublasLtMatmulPreferenceDestroyFn, lib, "cublasLtMatmulPreferenceDestroy"),
+        .matmul_preference_set_attribute = try lookupRequired(CublasLtMatmulPreferenceSetAttributeFn, lib, "cublasLtMatmulPreferenceSetAttribute"),
+        .matmul_algo_get_heuristic = try lookupRequired(CublasLtMatmulAlgoGetHeuristicFn, lib, "cublasLtMatmulAlgoGetHeuristic"),
+        .matmul = try lookupRequired(CublasLtMatmulFn, lib, "cublasLtMatmul"),
+    };
+}
+
 fn dimsFitCublas(m: usize, n: usize, k: usize) bool {
     return m <= std.math.maxInt(c_int) and n <= std.math.maxInt(c_int) and k <= std.math.maxInt(c_int);
 }

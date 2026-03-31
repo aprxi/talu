@@ -446,6 +446,7 @@ pub(super) fn format_quant_scheme(method: QuantMethod, bits: i32, group_size: i3
             format!("GAF{}_{}", bits, group_size)
         }
         QuantMethod::Fp8 => "FP8".to_string(),
+        QuantMethod::Mxfp8 => "MXFP8".to_string(),
     }
 }
 

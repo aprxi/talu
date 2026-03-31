@@ -622,12 +622,52 @@ pub const Fp8LinearWeight = struct {
     }
 };
 
+pub const Mxfp8LinearWeight = struct {
+    rows: usize,
+    cols: usize,
+    /// GPU buffer holding E4M3 weight bytes [rows × cols]
+    buffer: compute.cuda.Buffer,
+    /// GPU buffer holding UE8M0 block-32 scales in cuBLASLt interleaved layout.
+    /// Padded to 128-tile boundaries: [padded_outer × padded_sf_k] bytes.
+    scales_buffer: compute.cuda.Buffer,
+    /// GPU buffer holding UE8M0 block-32 scales in simple row-major layout
+    /// [cols × scale_cols] for the GEMV kernel path. Same data, different layout.
+    scales_raw_buffer: compute.cuda.Buffer,
+    scale_cols: u32,
+
+    pub fn deinit(self: *Mxfp8LinearWeight, device: *compute.cuda.Device) void {
+        if (self.scales_raw_buffer.size > 0) self.scales_raw_buffer.deinit(device);
+        if (self.scales_buffer.size > 0) self.scales_buffer.deinit(device);
+        self.buffer.deinit(device);
+    }
+
+    pub fn byteSize(self: *const Mxfp8LinearWeight) usize {
+        return self.buffer.size + self.scales_buffer.size + self.scales_raw_buffer.size;
+    }
+
+    /// Compute cuBLASLt-required scale tensor size for VEC32_UE8M0 block scaling.
+    /// inner = contraction dimension (K), outer = non-contraction dimension (M or N).
+    /// Returns the total number of UE8M0 scale bytes needed (padded to 128-tile boundaries).
+    pub fn cublasLtScaleTensorSize(inner: usize, outer: usize) usize {
+        const block_rows: usize = 128; // inner dimension tile
+        const block_cols: usize = 128; // outer dimension tile
+        const s_rows = roundoff(inner, block_rows) / 32;
+        const s_cols = roundoff(outer, block_cols);
+        return s_rows * s_cols;
+    }
+
+    pub fn roundoff(x: usize, granul: usize) usize {
+        return granul * ((x + (granul - 1)) / granul);
+    }
+};
+
 pub const LinearWeight = union(enum) {
     dense_f32: DeviceTensor,
     dense_u16: U16LinearWeight,
     gaffine_u4: GaffineU4LinearWeight,
     gaffine_u8: GaffineU8LinearWeight,
     fp8: Fp8LinearWeight,
+    mxfp8: Mxfp8LinearWeight,
 
     pub fn deinit(self: *LinearWeight, device: *compute.cuda.Device) void {
         switch (self.*) {
@@ -636,6 +676,7 @@ pub const LinearWeight = union(enum) {
             .gaffine_u4 => |*w| w.deinit(device),
             .gaffine_u8 => |*w| w.deinit(device),
             .fp8 => |*w| w.deinit(device),
+            .mxfp8 => |*w| w.deinit(device),
         }
     }
 
@@ -646,6 +687,7 @@ pub const LinearWeight = union(enum) {
             .gaffine_u4 => |w| w.rows,
             .gaffine_u8 => |w| w.rows,
             .fp8 => |w| w.rows,
+            .mxfp8 => |w| w.rows,
         };
     }
 
@@ -656,6 +698,7 @@ pub const LinearWeight = union(enum) {
             .gaffine_u4 => |w| w.cols,
             .gaffine_u8 => |w| w.cols,
             .fp8 => |w| w.cols,
+            .mxfp8 => |w| w.cols,
         };
     }
 
@@ -666,6 +709,7 @@ pub const LinearWeight = union(enum) {
             .gaffine_u4 => |w| w.byteSize(),
             .gaffine_u8 => |w| w.byteSize(),
             .fp8 => |w| w.byteSize(),
+            .mxfp8 => |w| w.byteSize(),
         };
     }
 };

@@ -103,6 +103,7 @@ pub const GraphExecHandle = device.GraphExecHandle;
 pub const Probe = device.Probe;
 pub const probeRuntime = device.probeRuntime;
 pub const Blas = matmul.Blas;
+pub const BlasLt = matmul.BlasLt;
 pub const Module = module.Module;
 pub const Function = module.Function;
 pub const ArgPack = args.ArgPack;

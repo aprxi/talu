@@ -502,6 +502,7 @@ fn computeBatchedPrefillPipeline2(
                     .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
                     .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
                     .fp8 => "matmul_lm_head_fp8_host",
+                    .mxfp8 => "matmul_lm_head_mxfp8_host",
                 };
                 trace.emitFinalWithWork(
                     .lm_head,
@@ -1766,6 +1767,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
             .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
             .fp8 => "matmul_lm_head_fp8_host",
+            .mxfp8 => "matmul_lm_head_mxfp8_host",
         };
         trace.emitFinalWithWork(
             .lm_head,
@@ -2775,6 +2777,7 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
                     .gaffine_u4 => "matmul_lm_head_gaffine_u4_host",
                     .gaffine_u8 => "matmul_lm_head_gaffine_u8_host",
                     .fp8 => "matmul_lm_head_fp8_host",
+                    .mxfp8 => "matmul_lm_head_mxfp8_host",
                 };
                 trace.emitFinalWithWork(
                     .lm_head,

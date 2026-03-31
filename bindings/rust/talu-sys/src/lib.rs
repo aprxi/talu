@@ -101,6 +101,7 @@ pub enum Scheme {
     Fp8E5m2 = 21,
     Mxfp4 = 22,
     Nvfp4 = 23,
+    Mxfp8 = 24,
 }
 
 impl From<u32> for Scheme {
@@ -117,7 +118,8 @@ impl From<u32> for Scheme {
             21 => Scheme::Fp8E5m2,
             22 => Scheme::Mxfp4,
             23 => Scheme::Nvfp4,
-            _ => Scheme::Nvfp4,
+            24 => Scheme::Mxfp8,
+            _ => Scheme::Mxfp8,
         }
     }
 }
@@ -615,6 +617,7 @@ pub enum QuantMethodEnum {
     Mxfp4 = 2,
     Native = 3,
     Fp8 = 4,
+    Mxfp8 = 5,
 }
 
 impl From<i32> for QuantMethodEnum {
@@ -625,7 +628,8 @@ impl From<i32> for QuantMethodEnum {
             2 => QuantMethodEnum::Mxfp4,
             3 => QuantMethodEnum::Native,
             4 => QuantMethodEnum::Fp8,
-            _ => QuantMethodEnum::Fp8,
+            5 => QuantMethodEnum::Mxfp8,
+            _ => QuantMethodEnum::Mxfp8,
         }
     }
 }

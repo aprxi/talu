@@ -24,6 +24,7 @@ pub enum Scheme {
     Fp8E5m2 = 21,
     Mxfp4 = 22,
     Nvfp4 = 23,
+    Mxfp8 = 24,
 }
 
 impl Scheme {
@@ -54,6 +55,7 @@ impl Scheme {
             21 => Scheme::Fp8E5m2,
             22 => Scheme::Mxfp4,
             23 => Scheme::Nvfp4,
+            24 => Scheme::Mxfp8,
             _ => return None,
         })
     }

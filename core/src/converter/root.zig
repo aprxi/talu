@@ -18,6 +18,7 @@ const models_registry = @import("../models/registry.zig");
 pub const mapping = @import("mapping.zig");
 pub const grouped_affine = @import("grouped_affine.zig");
 pub const fp8 = @import("fp8.zig");
+pub const mxfp8 = @import("mxfp8.zig");
 pub const gaf_paths = @import("gaf_paths.zig");
 pub const scheme = @import("scheme.zig");
 pub const model_card = @import("model_card.zig");

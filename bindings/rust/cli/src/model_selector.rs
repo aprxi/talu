@@ -123,6 +123,7 @@ fn format_quant(method: talu::QuantMethod, bits: i32, group_size: i32) -> String
         }
         talu::QuantMethod::Mxfp4 => "MXFP4".into(),
         talu::QuantMethod::Fp8 => "FP8".into(),
+        talu::QuantMethod::Mxfp8 => "MXFP8".into(),
     }
 }
 

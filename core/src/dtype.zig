@@ -157,6 +157,17 @@ pub const Fp8Meta = struct {
     block_size: u32 = 128,
 };
 
+/// MXFP8 E4M3 + UE8M0 block-32 scale metadata (OCP Microscaling FP8)
+/// Weight data is E4M3 bytes, scales are UE8M0 bytes (1 per 32 elements per row).
+pub const Mxfp8Meta = struct {
+    /// UE8M0 scale data: [rows × scale_cols] u8 where scale_cols = ceil(cols/32)
+    block_scales_data: ?[*]const u8 = null,
+    block_scales_len: usize = 0,
+    rows: u32 = 0,
+    cols: u32 = 0,
+    scale_cols: u32 = 0,
+};
+
 /// MXFP4 quantization metadata (Microsoft Microscaling)
 /// Format: 4-bit values with E8M0 scales (32 values per scale)
 pub const MXFP4Meta = struct {

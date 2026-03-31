@@ -218,6 +218,7 @@ Grouped Affine (DEFAULT):
 
 Floating Point 8-bit:
   fp8        FP8 E4M3, block_size=128x128
+  mxfp8      MXFP8 E4M3 + E8M0 scales, block_size=32 (Blackwell tensor cores)
 
 Output naming:
   Models are saved with hierarchical paths: {output_dir}/{org}/{model}-{SUFFIX}
@@ -225,6 +226,7 @@ Output naming:
     Qwen/Qwen3-0.6B + gaf4_64 -> models/Qwen/Qwen3-0.6B-GAF4
     Qwen/Qwen3-0.6B + gaf8_64 -> models/Qwen/Qwen3-0.6B-GAF8
     Qwen/Qwen3-0.6B + fp8     -> models/Qwen/Qwen3-0.6B-FP8
+    Qwen/Qwen3-0.6B + mxfp8   -> models/Qwen/Qwen3-0.6B-MXFP8
 
 Environment Variables:
   THREADS=N         Number of threads for quantization (default: CPU count)
@@ -263,6 +265,7 @@ fn print_available_schemes() {
 
   Floating Point 8-bit:
     fp8        FP8 E4M3, block_size=128x128
+    mxfp8      MXFP8 E4M3 + E8M0 scales, block_size=32 (Blackwell tensor cores)
 
 Usage: talu convert -m <model> --scheme <SCHEME>
 "#;

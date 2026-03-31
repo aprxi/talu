@@ -2874,6 +2874,13 @@ pub fn runFfnStep(
         up_weight,
         rows,
         d_ff,
+    )) or (try engine_ops.tryFusedMxfp8GateUpSiluForward(
+        self,
+        input,
+        gate_weight,
+        up_weight,
+        rows,
+        d_ff,
     )) or (try engine_ops.tryFusedFp8GateUpSiluForward(
         self,
         input,
