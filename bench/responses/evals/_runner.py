@@ -15,6 +15,7 @@ from responses.evals._api import format_request, extract_output
 
 _MAX_RETRIES = 3
 _MASK_U64 = (1 << 64) - 1
+_MASK_I64_POS = (1 << 63) - 1
 _GOLDEN64 = 0x9E3779B97F4A7C15
 
 
@@ -37,8 +38,9 @@ def _derive_request_seed(base_seed: int, sample: dict) -> int:
         except ValueError:
             qhash_u64 = 0
     mixed = (int(base_seed) & _MASK_U64) ^ ((idx + 1) * _GOLDEN64 & _MASK_U64) ^ qhash_u64
-    derived = _splitmix64(mixed)
-    # Core treats seed=0 as non-deterministic; keep eval seeds deterministic.
+    derived = _splitmix64(mixed) & _MASK_I64_POS
+    # Keep endpoint-compatible range: 1..2^63-1.
+    # Core treats seed=0 as non-deterministic, so avoid 0.
     return derived if derived != 0 else 1
 
 

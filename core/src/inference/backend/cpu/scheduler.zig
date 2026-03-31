@@ -551,6 +551,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             candidate_ids: []u32,
             sampling_config: sampling.SamplingConfig,
         ) !u32 {
+            // Top-k candidate route is exact only for plain sampling settings.
+            // Any sampling-time adjustment requires full-vocab logits.
+            if (samplingRequiresFullLogits(sampling_config)) return error.NotEligible;
+
             // Teacher forcing tokens are vocabulary IDs, not indices into the
             // backend-provided top-k candidate subset. Handle them directly.
             if (xray.getNextForcedToken()) |forced_token| {
@@ -581,19 +585,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const working_logits = self.logits_buffer[0..candidate_logits.len];
             @memcpy(working_logits, candidate_logits);
 
-            if (sampling_config.logit_bias) |bias_entries| {
-                for (bias_entries) |entry| {
-                    for (candidate_ids, 0..) |candidate_id, idx| {
-                        if (candidate_id == entry.token_id) {
-                            working_logits[idx] += entry.bias;
-                        }
-                    }
-                }
-            }
-
             var candidate_sampling = sampling_config;
             candidate_sampling.top_k = @min(candidate_sampling.top_k, candidate_logits.len);
-            candidate_sampling.logit_bias = null;
 
             const sampled_idx = try self.sampler.sample(working_logits, candidate_sampling);
             return candidate_ids[sampled_idx];
@@ -796,6 +789,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
         }
 
+        fn samplingRequiresFullLogits(sampling_cfg: sampling.SamplingConfig) bool {
+            return sampling_cfg.repetition_penalty != 1.0 or
+                sampling_cfg.presence_penalty != 0.0 or
+                sampling_cfg.frequency_penalty != 0.0 or
+                sampling_cfg.logit_bias != null;
+        }
+
         fn resolveBatchedTopKRoute(self: *Self, decode_batch_size: usize) ?usize {
             const use_batched_topk = comptime blk: {
                 if (!@hasDecl(BackendType, "decodeBatchTopKCandidates")) break :blk false;
@@ -822,6 +822,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (request_entry.slot_index == null or request_entry.slot_index.? != req.slot_index) return null;
                 if (request_entry.grammar_sampler != null) return null;
                 if (request_entry.capture_final_logits) return null;
+                if (samplingRequiresFullLogits(request_entry.sampling_config)) return null;
                 if (request_entry.sampling_config.top_k == 0 or request_entry.sampling_config.top_k > 256) return null;
                 const supports_topk = if (comptime @hasDecl(BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
                     self.backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&request_entry.sampling_config)
@@ -1102,6 +1103,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     if (topk_request) |request_entry| {
                         if (request_entry.grammar_sampler == null and
                             !request_entry.capture_final_logits and
+                            !samplingRequiresFullLogits(request_entry.sampling_config) and
                             request_entry.sampling_config.top_k <= 256 and
                             self.backend.supportsSchedulerBackendTopKDecodeRoute(&request_entry.sampling_config))
                         {
@@ -1663,11 +1665,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (!@hasDecl(BackendType, "supportsSchedulerBackendTopKDecodeRoute")) break :blk false;
                 break :blk true;
             };
-            // Disable greedy streaming when additive penalties are configured.
-            // decodeStreaming uses argmax without applying penalties, so we must
-            // fall back to the queued route that applies penalties via sampleToken.
-            const has_additive_penalties = effective_sampling.presence_penalty != 0.0 or
-                effective_sampling.frequency_penalty != 0.0;
+            // Any sampling-time adjustment (penalties or logit bias) requires
+            // full-logit sampling via sampleToken/sampleMut for correctness.
+            // Fast decode routes (greedy streaming and top-k candidate) operate
+            // on backend-provided candidates/argmax and cannot enforce these
+            // adjustments exactly.
+            const has_sampling_adjustments = samplingRequiresFullLogits(effective_sampling);
             const can_use_greedy_streaming = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
@@ -1677,7 +1680,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 !submit_config.return_final_logits and
                 submit_config.max_thinking_tokens == 0 and // thinking budget needs per-token control
                 effective_sampling.strategy == .greedy and
-                !has_additive_penalties and
+                !has_sampling_adjustments and
                 backend_supports_greedy_streaming and
                 self.backend.supportsSchedulerBackendDecodeStreamingRoute();
             if (can_use_greedy_streaming) {
@@ -1690,15 +1693,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }, @src());
                 return self.generateSyncGreedyStreamingRoute(prompt_tokens, max_tokens, &submit_config, &effective_sampling);
             }
-            // Top-k candidate route: penalties are applied AFTER top-k selection,
-            // which is imperfect but works well for presence_penalty since repeated
-            // tokens are likely in the top-K anyway for repetitive models.
             const can_use_top_k_candidate_route = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
                 submit_config.vision_input == null and
                 submit_config.grammar_sampler == null and
                 !submit_config.return_final_logits and
+                !has_sampling_adjustments and
                 backend_supports_top_k_candidates and
                 self.backend.supportsSchedulerBackendTopKDecodeRoute(&effective_sampling);
             if (can_use_top_k_candidate_route) {
@@ -3965,6 +3966,108 @@ test "generateSync uses backend top-k candidate route for top_k sampling" {
     try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
     try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
     try std.testing.expectEqualSlices(u32, &.{ 42, 42, 42, 42 }, result.tokens);
+}
+
+test "generateSync disables top-k candidate route when additive penalties are set" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .top_k,
+            .top_k = 4,
+            .temperature = 0.7,
+            .presence_penalty = 0.5,
+            .seed = 7,
+        },
+    });
+    defer scheduler.deinit();
+
+    var result = try scheduler.generateSync(&[_]u32{ 7, 8, 9 }, 3, .{
+        .sampling = .{
+            .strategy = .top_k,
+            .top_k = 4,
+            .temperature = 0.7,
+            .presence_penalty = 0.5,
+            .seed = 7,
+        },
+        .eos_token_ids = &[_]u32{9999},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_top_k_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
+    try std.testing.expect(backend.decode_batch_calls > 0);
+    try std.testing.expectEqual(@as(usize, 3), result.tokens.len);
+}
+
+test "generateSync disables top-k candidate route when logit bias is set" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    const bias_entries = [_]sampling.LogitBiasEntry{
+        .{ .token_id = 42, .bias = -3.0 },
+    };
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .top_k,
+            .top_k = 4,
+            .temperature = 0.7,
+            .logit_bias = &bias_entries,
+            .seed = 7,
+        },
+    });
+    defer scheduler.deinit();
+
+    var result = try scheduler.generateSync(&[_]u32{ 7, 8, 9 }, 3, .{
+        .sampling = .{
+            .strategy = .top_k,
+            .top_k = 4,
+            .temperature = 0.7,
+            .logit_bias = &bias_entries,
+            .seed = 7,
+        },
+        .eos_token_ids = &[_]u32{9999},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_top_k_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
+    try std.testing.expect(backend.decode_batch_calls > 0);
+    try std.testing.expectEqual(@as(usize, 3), result.tokens.len);
+}
+
+test "generateSync disables greedy streaming when repetition penalty is set" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .greedy,
+            .repetition_penalty = 1.2,
+            .seed = 7,
+        },
+    });
+    defer scheduler.deinit();
+
+    var result = try scheduler.generateSync(&[_]u32{ 11, 12 }, 3, .{
+        .sampling = .{
+            .strategy = .greedy,
+            .repetition_penalty = 1.2,
+            .seed = 7,
+        },
+        .eos_token_ids = &[_]u32{9999},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_top_k_calls);
+    try std.testing.expect(backend.decode_batch_calls > 0);
+    try std.testing.expectEqual(@as(usize, 3), result.tokens.len);
 }
 
 test "Scheduler.init - creates with default config" {

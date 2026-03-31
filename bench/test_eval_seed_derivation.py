@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from responses.evals._runner import _derive_request_seed
 
+_MAX_I64 = (1 << 63) - 1
+
 
 def test_same_input_same_seed() -> None:
     sample = {"index": 12, "question_hash": "abcdef0123456789"}
@@ -40,12 +42,20 @@ def test_changes_with_base_seed() -> None:
     assert a != b, (a, b)
 
 
+def test_endpoint_safe_i64_range() -> None:
+    sample = {"index": 999, "question_hash": "ffffffffffffffff"}
+    for seed in (1, 42, 1000, 10000, _MAX_I64):
+        out = _derive_request_seed(seed, sample)
+        assert 1 <= out <= _MAX_I64, out
+
+
 if __name__ == "__main__":
     tests = [
         test_same_input_same_seed,
         test_changes_with_index,
         test_changes_with_question_hash,
         test_changes_with_base_seed,
+        test_endpoint_safe_i64_range,
     ]
     passed = 0
     failed = 0
