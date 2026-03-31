@@ -253,7 +253,13 @@ fn writeMxfp8Weights(
         }
 
         {
-            const source_tensor = try source_tensors.getTensor(tensor_name, null);
+            const source_tensor = source_tensors.getTensor(tensor_name, null) catch |err| {
+                log.warn("convert", "MXFP8 source tensor missing", .{
+                    .tensor = tensor_name,
+                    .err = @errorName(err),
+                });
+                return err;
+            };
 
             if (shouldMxfp8Quantize(layout_map, tensor_name, source_tensor)) {
                 try quantizeMxfp8Tensor(allocator, source_tensors, &tensor_builder, tensor_name, source_tensor);
@@ -265,9 +271,12 @@ fn writeMxfp8Weights(
 
     // Synthesize MXFP8 lm_head from embedding when embeddings are tied.
     if (tie_embeddings) {
-        if (findEmbeddingTensorName(layout_map)) |embed_name| {
+        if (findEmbeddingTensorName(layout_map, source_tensors)) |embed_name| {
             const embed_tensor = try source_tensors.getTensor(embed_name, null);
             try quantizeMxfp8Tensor(allocator, source_tensors, &tensor_builder, "lm_head.weight", embed_tensor);
+        } else {
+            log.warn("convert", "MXFP8 tied-embedding synth failed to resolve embedding tensor", .{});
+            return error.NotFound;
         }
     }
 
@@ -275,11 +284,29 @@ fn writeMxfp8Weights(
     try tensor_builder.save(output_dir, "model.safetensors");
 }
 
-fn findEmbeddingTensorName(layout_map: ?*const convert.WeightLayoutMap) ?[]const u8 {
+fn findEmbeddingTensorName(layout_map: ?*const convert.WeightLayoutMap, source_tensors: *safetensors.UnifiedSafeTensors) ?[]const u8 {
     const map = layout_map orelse return null;
+    const preferred_names = [_][]const u8{
+        "model.embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
+        "embed_tokens.weight",
+        "transformer.wte.weight",
+        "backbone.embedding.weight",
+        "language_model.model.embed_tokens.weight",
+    };
+
+    for (preferred_names) |name| {
+        if (map.layouts.get(name) == .embedding) {
+            _ = source_tensors.getTensor(name, null) catch continue;
+            return name;
+        }
+    }
+
     var iter = map.layouts.iterator();
     while (iter.next()) |kv| {
-        if (kv.value_ptr.* == .embedding) return kv.key_ptr.*;
+        if (kv.value_ptr.* != .embedding) continue;
+        _ = source_tensors.getTensor(kv.key_ptr.*, null) catch continue;
+        return kv.key_ptr.*;
     }
     return null;
 }

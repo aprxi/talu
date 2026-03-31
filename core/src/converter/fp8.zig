@@ -271,9 +271,11 @@ fn writeFp8Weights(
     // Synthesize FP8 lm_head from embedding when embeddings are tied.
     // Embedding stays BF16 (lookup table); lm_head gets a separate FP8 copy (matmul).
     if (tie_embeddings) {
-        if (findEmbeddingTensorName(layout_map)) |embed_name| {
+        if (findEmbeddingTensorName(layout_map, source_tensors)) |embed_name| {
             const embed_tensor = try source_tensors.getTensor(embed_name, null);
             try quantizeFp8Tensor(allocator, source_tensors, &tensor_builder, "lm_head.weight", embed_tensor);
+        } else {
+            return error.NotFound;
         }
     }
 
@@ -282,11 +284,29 @@ fn writeFp8Weights(
 }
 
 /// Find the embedding tensor name from the layout map (first entry with .embedding layout).
-fn findEmbeddingTensorName(layout_map: ?*const convert.WeightLayoutMap) ?[]const u8 {
+fn findEmbeddingTensorName(layout_map: ?*const convert.WeightLayoutMap, source_tensors: *safetensors.UnifiedSafeTensors) ?[]const u8 {
     const map = layout_map orelse return null;
+    const preferred_names = [_][]const u8{
+        "model.embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
+        "embed_tokens.weight",
+        "transformer.wte.weight",
+        "backbone.embedding.weight",
+        "language_model.model.embed_tokens.weight",
+    };
+
+    for (preferred_names) |name| {
+        if (map.layouts.get(name) == .embedding) {
+            _ = source_tensors.getTensor(name, null) catch continue;
+            return name;
+        }
+    }
+
     var iter = map.layouts.iterator();
     while (iter.next()) |kv| {
-        if (kv.value_ptr.* == .embedding) return kv.key_ptr.*;
+        if (kv.value_ptr.* != .embedding) continue;
+        _ = source_tensors.getTensor(kv.key_ptr.*, null) catch continue;
+        return kv.key_ptr.*;
     }
     return null;
 }

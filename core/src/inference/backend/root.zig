@@ -1393,7 +1393,7 @@ fn isMetalSupported(
     has_unsupported_runtime_features: bool,
 ) bool {
     const dtype_supported = switch (weight_dtype) {
-        .grouped_affine_u4, .grouped_affine_u8, .bf16 => true,
+        .grouped_affine_u4, .grouped_affine_u8, .bf16, .f8_e4m3 => true,
         else => false,
     };
     if (!dtype_supported) return false;
@@ -1410,11 +1410,11 @@ fn getMetalUnsupportedReason(
     has_unsupported_runtime_features: bool,
 ) []const u8 {
     const dtype_supported = switch (weight_dtype) {
-        .grouped_affine_u4, .grouped_affine_u8, .bf16 => true,
+        .grouped_affine_u4, .grouped_affine_u8, .bf16, .f8_e4m3 => true,
         else => false,
     };
     if (!dtype_supported) {
-        return "Weight dtype not supported by Metal (requires Q4/U8/BF16)";
+        return "Weight dtype not supported by Metal (requires Q4/U8/BF16/FP8)";
     }
     _ = config;
     if (runtime.has_mla) {

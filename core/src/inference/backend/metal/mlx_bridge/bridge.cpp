@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -240,12 +241,33 @@ struct LayerWeights {
     array mlp_gate_rhs = array(0.0f);
     array mlp_up_rhs = array(0.0f);
     array mlp_down_rhs = array(0.0f);
+    array mlp_gate_q_w = array(0.0f);
+    array mlp_gate_q_scales = array(0.0f);
+    array mlp_up_q_w = array(0.0f);
+    array mlp_up_q_scales = array(0.0f);
+    array mlp_down_q_w = array(0.0f);
+    array mlp_down_q_scales = array(0.0f);
+    bool mlp_gate_has_q = false;
+    bool mlp_up_has_q = false;
+    bool mlp_down_has_q = false;
 
     // Full-attention branch.
     array attn_q_rhs = array(0.0f);
     array attn_k_rhs = array(0.0f);
     array attn_v_rhs = array(0.0f);
     array attn_o_rhs = array(0.0f);
+    array attn_q_q_w = array(0.0f);
+    array attn_q_q_scales = array(0.0f);
+    array attn_k_q_w = array(0.0f);
+    array attn_k_q_scales = array(0.0f);
+    array attn_v_q_w = array(0.0f);
+    array attn_v_q_scales = array(0.0f);
+    array attn_o_q_w = array(0.0f);
+    array attn_o_q_scales = array(0.0f);
+    bool attn_q_has_q = false;
+    bool attn_k_has_q = false;
+    bool attn_v_has_q = false;
+    bool attn_o_has_q = false;
     array attn_q_norm_w = array(0.0f);
     array attn_k_norm_w = array(0.0f);
     int attn_num_heads = 0;
@@ -261,11 +283,20 @@ struct LayerWeights {
     array lin_in_proj_b_rhs = array(0.0f);
     array lin_in_proj_qkvz_rhs = array(0.0f);
     array lin_in_proj_ba_rhs = array(0.0f);
+    array lin_in_proj_qkvz_q_w = array(0.0f);
+    array lin_in_proj_qkvz_q_scales = array(0.0f);
+    array lin_in_proj_ba_q_w = array(0.0f);
+    array lin_in_proj_ba_q_scales = array(0.0f);
+    bool lin_in_proj_qkvz_has_q = false;
+    bool lin_in_proj_ba_has_q = false;
     array lin_A_log = array(0.0f);
     array lin_A_exp_f32 = array(0.0f);
     array lin_dt_bias = array(0.0f);
     array lin_norm_w = array(0.0f);
     array lin_out_proj_rhs = array(0.0f);
+    array lin_out_proj_q_w = array(0.0f);
+    array lin_out_proj_q_scales = array(0.0f);
+    bool lin_out_proj_has_q = false;
 
     int lin_num_v_heads = 0;
     int lin_num_k_heads = 0;
@@ -278,9 +309,15 @@ struct LayerWeights {
 
     // ShortConv branch (LFM2 family).
     array sc_in_proj_rhs = array(0.0f);
+    array sc_in_proj_q_w = array(0.0f);
+    array sc_in_proj_q_scales = array(0.0f);
     array sc_conv1d_w = array(0.0f); // [conv_dim, kernel, 1]
     array sc_conv_bias = array(0.0f);
     array sc_out_proj_rhs = array(0.0f);
+    array sc_out_proj_q_w = array(0.0f);
+    array sc_out_proj_q_scales = array(0.0f);
+    bool sc_in_proj_has_q = false;
+    bool sc_out_proj_has_q = false;
     bool sc_has_bias = false;
     int sc_conv_dim = 0;
     int sc_conv_kernel = 0;
@@ -608,6 +645,188 @@ array to_rhs(const array& weight_2d, const std::string& name) {
     return transpose(weight_2d, {1, 0});
 }
 
+array expand_block_scales(const array& scales_2d_f32, int rows, int cols, const std::string& name) {
+    if (scales_2d_f32.ndim() != 2) {
+        throw std::runtime_error("expected rank-2 FP8 scale tensor for " + name);
+    }
+    const int scale_rows = scales_2d_f32.shape(0);
+    const int scale_cols = scales_2d_f32.shape(1);
+    if (scale_rows <= 0 || scale_cols <= 0) {
+        throw std::runtime_error("invalid FP8 scale shape for " + name);
+    }
+
+    const int block_row = (rows + scale_rows - 1) / scale_rows;
+    const int block_col = (cols + scale_cols - 1) / scale_cols;
+    array expanded = repeat(scales_2d_f32, block_row, 0);
+    expanded = repeat(expanded, block_col, 1);
+    return slice(expanded, {0, 0}, {rows, cols});
+}
+
+array maybe_dequantize_fp8_weight(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key,
+    const array& weight_2d
+) {
+    if (!ends_with(weight_key, ".weight")) {
+        return weight_2d;
+    }
+    if (weight_2d.ndim() != 2) {
+        throw std::runtime_error("expected rank-2 weight for " + weight_key);
+    }
+
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    const std::string scale_inv_key = base + ".weight_scale_inv";
+    const std::string block_scale_key = base + ".weight_block_scale";
+
+    auto scale_inv_it = tensors.find(scale_inv_key);
+    auto block_scale_it = tensors.find(block_scale_key);
+    if (scale_inv_it == tensors.end() && block_scale_it == tensors.end()) {
+        return weight_2d;
+    }
+
+    const int rows = weight_2d.shape(0);
+    const int cols = weight_2d.shape(1);
+    array scales_f32 = array(1.0f);
+
+    if (block_scale_it != tensors.end()) {
+        const array& block_scales = block_scale_it->second;
+        if (block_scales.ndim() != 2) {
+            throw std::runtime_error("mxfp8 block scales must be rank-2 for " + weight_key);
+        }
+        if (block_scales.shape(0) != rows) {
+            throw std::runtime_error("mxfp8 block scales row mismatch for " + weight_key);
+        }
+        const int expected_scale_cols = (cols + 31) / 32;
+        if (block_scales.shape(1) != expected_scale_cols) {
+            throw std::runtime_error(
+                "mxfp8 block scales col mismatch for " + weight_key +
+                " expected=" + std::to_string(expected_scale_cols) +
+                " got=" + std::to_string(block_scales.shape(1))
+            );
+        }
+
+        const array block_scales_u8 = astype(block_scales, uint8);
+        const int flat_size = static_cast<int>(block_scales_u8.size());
+        const array flat_u8 = reshape(block_scales_u8, {flat_size});
+        eval(flat_u8);
+
+        const uint8_t* scale_bytes = flat_u8.data<uint8_t>();
+        std::vector<float> decoded(static_cast<size_t>(flat_size));
+        for (int idx = 0; idx < flat_size; ++idx) {
+            const uint32_t exp_bits = static_cast<uint32_t>(scale_bytes[idx]) << 23;
+            float scale = 0.0f;
+            std::memcpy(&scale, &exp_bits, sizeof(float));
+            decoded[static_cast<size_t>(idx)] = scale;
+        }
+        scales_f32 = array(decoded.begin(), Shape{block_scales.shape(0), block_scales.shape(1)}, float32);
+    } else {
+        const array& scale_inv = scale_inv_it->second;
+        if (scale_inv.ndim() != 2) {
+            throw std::runtime_error("fp8 scale_inv must be rank-2 for " + weight_key);
+        }
+        scales_f32 = astype(scale_inv, float32);
+    }
+
+    const array expanded_scales = expand_block_scales(scales_f32, rows, cols, weight_key);
+    const array fp8_as_f32 = from_fp8(weight_2d, float32);
+    const array dequant_f32 = fp8_as_f32 * expanded_scales;
+    array dequant_bf16 = astype(dequant_f32, bfloat16);
+    dequant_bf16 = stop_gradient(copy(dequant_bf16));
+    // Materialize dequantized weights during load so large FP8 dequant graphs
+    // do not all lower at first prefill command-buffer submit (can OOM on 4B).
+    eval(dequant_bf16);
+    synchronize();
+    return dequant_bf16;
+}
+
+array load_linear_weight(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key
+) {
+    const array& raw_weight = require_tensor(tensors, weight_key);
+    return maybe_dequantize_fp8_weight(tensors, weight_key, raw_weight);
+}
+
+void maybe_quantize_mxfp8_matrix(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key,
+    const array& lhs_weight,
+    bool enabled,
+    array* out_q_w,
+    array* out_q_scales,
+    bool* out_has_q
+) {
+    if (!enabled) {
+        *out_has_q = false;
+        return;
+    }
+    // Fast path for native MXFP8 checkpoints: reuse packed FP8 payload and
+    // block scales directly for decode-time quantized matmul.
+    if (ends_with(weight_key, ".weight")) {
+        const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+        const std::string block_scale_key = base + ".weight_block_scale";
+        auto raw_it = tensors.find(weight_key);
+        auto scales_it = tensors.find(block_scale_key);
+        if (raw_it != tensors.end() && scales_it != tensors.end()) {
+            const array& raw_weight = raw_it->second;
+            const array& raw_scales = scales_it->second;
+            if (raw_weight.ndim() == 2 && raw_scales.ndim() == 2) {
+                const int rows = raw_weight.shape(0);
+                const int cols = raw_weight.shape(1);
+                const int expected_scale_cols = (cols + 31) / 32;
+                if (raw_scales.shape(0) == rows && raw_scales.shape(1) == expected_scale_cols && cols % 4 == 0) {
+                    try {
+                        const array packed = reshape(view(raw_weight, uint32), {rows, cols / 4});
+                        *out_q_w = packed;
+                        *out_q_scales = astype(raw_scales, uint8);
+                        *out_has_q = true;
+                        return;
+                    } catch (const std::exception&) {
+                        // Fall through to generic quantize path.
+                    }
+                }
+            }
+        }
+    }
+
+    const std::vector<array> q = quantize(
+        lhs_weight,
+        std::nullopt,
+        std::nullopt,
+        "mxfp8"
+    );
+    if (q.size() != 2) {
+        throw std::runtime_error("mlx quantize(mxfp8) returned unexpected output count");
+    }
+    *out_q_w = q[0];
+    *out_q_scales = q[1];
+    *out_has_q = true;
+}
+
+array linear_decode_maybe_quantized(
+    bool decode_qmm_enabled,
+    const array& x,
+    const array& rhs,
+    bool has_q,
+    const array& q_w,
+    const array& q_scales
+) {
+    const bool decode_step = x.ndim() == 3 && x.shape(1) == 1;
+    if (has_q && decode_qmm_enabled && decode_step) {
+        return quantized_matmul(
+            x,
+            q_w,
+            q_scales,
+            std::nullopt,
+            true,
+            std::nullopt,
+            std::nullopt,
+            "mxfp8"
+        );
+    }
+    return matmul(x, rhs);
+}
+
 array linear(const array& x, const array& rhs) {
     return matmul(x, rhs);
 }
@@ -885,7 +1104,12 @@ struct mlx_ctx {
 
     array embed_tokens = array(0.0f); // [vocab, hidden]
     array lm_head_rhs = array(0.0f);  // [hidden, vocab]
+    array lm_head_q_w = array(0.0f);  // [vocab, hidden * bits / 32] packed
+    array lm_head_q_scales = array(0.0f); // [vocab, hidden / group_size]
     array final_norm_w = array(0.0f); // [hidden]
+    bool has_fp8_meta = false;
+    bool lm_head_q_decode_enabled = false;
+    bool fp8_decode_qmm_enabled = false;
 
     std::vector<LayerWeights> layers;
     std::vector<KVCacheState> kv_cache;
@@ -966,6 +1190,30 @@ bool token_is_eos(int32_t token, const int32_t* eos_ids, int32_t eos_len) {
     return false;
 }
 
+bool has_fp8_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
+    for (const auto& kv : tensors) {
+        if (ends_with(kv.first, ".weight_scale_inv") || ends_with(kv.first, ".weight_block_scale")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_mxfp8_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
+    for (const auto& kv : tensors) {
+        if (ends_with(kv.first, ".weight_block_scale")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool env_truthy(const char* name, bool fallback) {
+    const char* raw = std::getenv(name);
+    if (!raw) return fallback;
+    return std::string(raw) == "1";
+}
+
 array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
     LayerWeights& lw = ctx->layers[static_cast<size_t>(layer_idx)];
     KVCacheState& cache = ctx->kv_cache[static_cast<size_t>(layer_idx)];
@@ -973,7 +1221,14 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
     const int B = x_norm.shape(0);
     const int S = x_norm.shape(1);
 
-    const array q_proj_out = linear(x_norm, lw.attn_q_rhs);
+    const array q_proj_out = linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        x_norm,
+        lw.attn_q_rhs,
+        lw.attn_q_has_q,
+        lw.attn_q_q_w,
+        lw.attn_q_q_scales
+    );
     const int q_last_dim = q_proj_out.shape(2);
     const int q_base_dim = lw.attn_num_heads * lw.attn_head_dim;
     array queries_raw = array(0.0f);
@@ -996,8 +1251,22 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
         throw std::runtime_error("unexpected self_attn.q_proj output shape");
     }
 
-    const array k_proj_out = linear(x_norm, lw.attn_k_rhs);
-    const array v_proj_out = linear(x_norm, lw.attn_v_rhs);
+    const array k_proj_out = linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        x_norm,
+        lw.attn_k_rhs,
+        lw.attn_k_has_q,
+        lw.attn_k_q_w,
+        lw.attn_k_q_scales
+    );
+    const array v_proj_out = linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        x_norm,
+        lw.attn_v_rhs,
+        lw.attn_v_has_q,
+        lw.attn_v_q_w,
+        lw.attn_v_q_scales
+    );
 
     array queries = fast::rms_norm(queries_raw, std::optional<array>(lw.attn_q_norm_w), ctx->cfg.rms_norm_eps);
     array keys = reshape(k_proj_out, {B, S, lw.attn_num_kv_heads, lw.attn_head_dim});
@@ -1079,7 +1348,14 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
     attn_out = reshape(attn_out, {B, S, lw.attn_num_heads * lw.attn_head_dim});
     attn_out = attn_out * sigmoid(gate);
 
-    return linear(attn_out, lw.attn_o_rhs);
+    return linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        attn_out,
+        lw.attn_o_rhs,
+        lw.attn_o_has_q,
+        lw.attn_o_q_w,
+        lw.attn_o_q_scales
+    );
 }
 
 array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
@@ -1089,12 +1365,26 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
     const int B = x_norm.shape(0);
     const int S = x_norm.shape(1);
 
-    const array qkvz = linear(x_norm, lw.lin_in_proj_qkvz_rhs); // [B,S,conv_dim+value_dim]
+    const array qkvz = linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        x_norm,
+        lw.lin_in_proj_qkvz_rhs,
+        lw.lin_in_proj_qkvz_has_q,
+        lw.lin_in_proj_qkvz_q_w,
+        lw.lin_in_proj_qkvz_q_scales
+    ); // [B,S,conv_dim+value_dim]
     const array qkv = slice(qkvz, {0, 0, 0}, {B, S, lw.lin_conv_dim});
     const array z_flat = slice(qkvz, {0, 0, lw.lin_conv_dim}, {B, S, lw.lin_conv_dim + lw.lin_value_dim});
     const array z = reshape(z_flat, {B, S, lw.lin_num_v_heads, lw.lin_head_v_dim});
 
-    const array ba = linear(x_norm, lw.lin_in_proj_ba_rhs); // [B,S,2*Hv]
+    const array ba = linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        x_norm,
+        lw.lin_in_proj_ba_rhs,
+        lw.lin_in_proj_ba_has_q,
+        lw.lin_in_proj_ba_q_w,
+        lw.lin_in_proj_ba_q_scales
+    ); // [B,S,2*Hv]
     const array b = slice(ba, {0, 0, 0}, {B, S, lw.lin_num_v_heads});
     const array a = slice(ba, {0, 0, lw.lin_num_v_heads}, {B, S, 2 * lw.lin_num_v_heads});
 
@@ -1132,7 +1422,14 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
 
     const array normed = rmsnorm_gated(out, z, lw.lin_norm_w, ctx->cfg.rms_norm_eps);
     const array merged = reshape(normed, {B, S, lw.lin_value_dim});
-    return linear(merged, lw.lin_out_proj_rhs);
+    return linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        merged,
+        lw.lin_out_proj_rhs,
+        lw.lin_out_proj_has_q,
+        lw.lin_out_proj_q_w,
+        lw.lin_out_proj_q_scales
+    );
 }
 
 array run_shortconv_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
@@ -1142,7 +1439,14 @@ array run_shortconv_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
     const int B = x_norm.shape(0);
     const int S = x_norm.shape(1);
 
-    const array proj = linear(x_norm, lw.sc_in_proj_rhs); // [B,S,3*conv_dim]
+    const array proj = linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        x_norm,
+        lw.sc_in_proj_rhs,
+        lw.sc_in_proj_has_q,
+        lw.sc_in_proj_q_w,
+        lw.sc_in_proj_q_scales
+    ); // [B,S,3*conv_dim]
     const array b_gate = slice(proj, {0, 0, 0}, {B, S, lw.sc_conv_dim});
     const array c_gate = slice(proj, {0, 0, lw.sc_conv_dim}, {B, S, 2 * lw.sc_conv_dim});
     const array x_proj = slice(proj, {0, 0, 2 * lw.sc_conv_dim}, {B, S, 3 * lw.sc_conv_dim});
@@ -1165,7 +1469,14 @@ array run_shortconv_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
     }
 
     const array gated = c_gate * conv_out;
-    return linear(gated, lw.sc_out_proj_rhs);
+    return linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        gated,
+        lw.sc_out_proj_rhs,
+        lw.sc_out_proj_has_q,
+        lw.sc_out_proj_q_w,
+        lw.sc_out_proj_q_scales
+    );
 }
 
 array run_layer(mlx_ctx* ctx, int layer_idx, const array& hidden, const TraceFrame* trace_frame) {
@@ -1201,10 +1512,31 @@ array run_layer(mlx_ctx* ctx, int layer_idx, const array& hidden, const TraceFra
     const array h = hidden + residual_branch;
 
     const array mlp_in = fast::rms_norm(h, std::optional<array>(lw.post_attention_layernorm_w), ctx->cfg.rms_norm_eps);
-    const array gate = linear(mlp_in, lw.mlp_gate_rhs);
-    const array up = linear(mlp_in, lw.mlp_up_rhs);
+    const array gate = linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        mlp_in,
+        lw.mlp_gate_rhs,
+        lw.mlp_gate_has_q,
+        lw.mlp_gate_q_w,
+        lw.mlp_gate_q_scales
+    );
+    const array up = linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        mlp_in,
+        lw.mlp_up_rhs,
+        lw.mlp_up_has_q,
+        lw.mlp_up_q_w,
+        lw.mlp_up_q_scales
+    );
     const array ff = silu(gate) * up;
-    const array down = linear(ff, lw.mlp_down_rhs);
+    const array down = linear_decode_maybe_quantized(
+        ctx->fp8_decode_qmm_enabled,
+        ff,
+        lw.mlp_down_rhs,
+        lw.mlp_down_has_q,
+        lw.mlp_down_q_w,
+        lw.mlp_down_q_scales
+    );
 
     const array out = h + down;
     if (trace_frame) {
@@ -1274,7 +1606,27 @@ array forward_hidden(
 
 array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* trace_frame = nullptr) {
     const array hidden = forward_hidden(ctx, input_ids, true, trace_frame);
-    const array logits = matmul(hidden, ctx->lm_head_rhs);
+    array lm_input = hidden;
+    if (ctx->has_fp8_meta && hidden.ndim() == 3 && hidden.shape(1) > 1) {
+        // Prefill only needs next-token logits; avoid full-sequence lm_head.
+        const int b = hidden.shape(0);
+        const int t = hidden.shape(1);
+        const int h = hidden.shape(2);
+        lm_input = slice(hidden, {0, t - 1, 0}, {b, t, h});
+    }
+    const bool decode_step = lm_input.ndim() == 3 && lm_input.shape(1) == 1;
+    const array logits = (ctx->lm_head_q_decode_enabled && decode_step)
+        ? quantized_matmul(
+              lm_input,
+              ctx->lm_head_q_w,
+              ctx->lm_head_q_scales,
+              std::nullopt,
+              true,
+              std::nullopt,
+              std::nullopt,
+              "mxfp8"
+          )
+        : matmul(lm_input, ctx->lm_head_rhs);
     if (trace_frame) {
         xray_emit_array_f32(
             XRAY_POINT_LM_HEAD,
@@ -1352,6 +1704,11 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
 
         auto tensors = load_weight_tensors(ctx->model_path);
         sanitize_qwen35_tensors(tensors, ctx->cfg.tie_word_embeddings, parsed_cfg.allow_qwen_norm_shift);
+        const bool has_fp8_meta = has_fp8_quant_metadata(tensors);
+        ctx->has_fp8_meta = has_fp8_meta;
+        const bool has_mxfp8_meta = has_mxfp8_quant_metadata(tensors);
+        ctx->fp8_decode_qmm_enabled = has_mxfp8_meta && env_truthy("TALU_METAL_FP8_DECODE_QMM", true);
+        const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
 
         const std::string text_prefix = detect_text_prefix(tensors);
         const std::string layer_prefix = text_prefix + "layers.";
@@ -1367,16 +1724,34 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             "final_norm"
         );
 
+        array lm_head_weight = array(0.0f); // [vocab, hidden]
         if (ctx->cfg.tie_word_embeddings) {
-            ctx->lm_head_rhs = transpose(ctx->embed_tokens, {1, 0});
+            lm_head_weight = ctx->embed_tokens;
+            ctx->lm_head_rhs = transpose(lm_head_weight, {1, 0});
         } else {
             if (has_tensor(tensors, text_prefix + "lm_head.weight")) {
-                ctx->lm_head_rhs = to_rhs(require_tensor(tensors, text_prefix + "lm_head.weight"), "lm_head");
+                lm_head_weight = load_linear_weight(tensors, text_prefix + "lm_head.weight");
             } else if (has_tensor(tensors, "lm_head.weight")) {
-                ctx->lm_head_rhs = to_rhs(require_tensor(tensors, "lm_head.weight"), "lm_head");
+                lm_head_weight = load_linear_weight(tensors, "lm_head.weight");
             } else {
                 throw std::runtime_error("missing lm_head weight (tie_word_embeddings=false)");
             }
+            ctx->lm_head_rhs = to_rhs(lm_head_weight, "lm_head");
+        }
+
+        if (has_fp8_meta && env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", false)) {
+            const std::vector<array> q_lm_head = quantize(
+                lm_head_weight,
+                std::nullopt,
+                std::nullopt,
+                "mxfp8"
+            );
+            if (q_lm_head.size() != 2) {
+                throw std::runtime_error("mlx quantize(mxfp8) returned unexpected output count for lm_head");
+            }
+            ctx->lm_head_q_w = q_lm_head[0];
+            ctx->lm_head_q_scales = q_lm_head[1];
+            ctx->lm_head_q_decode_enabled = true;
         }
 
         ctx->layers.reserve(static_cast<size_t>(ctx->cfg.num_hidden_layers));
@@ -1404,37 +1779,92 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 p + "post_attention_layernorm/ffn_norm"
             );
 
+            const std::string mlp_gate_key = has_tensor(tensors, p + "mlp.gate_proj.weight")
+                ? p + "mlp.gate_proj.weight"
+                : p + "feed_forward.w1.weight";
+            const std::string mlp_up_key = has_tensor(tensors, p + "mlp.up_proj.weight")
+                ? p + "mlp.up_proj.weight"
+                : p + "feed_forward.w3.weight";
+            const std::string mlp_down_key = has_tensor(tensors, p + "mlp.down_proj.weight")
+                ? p + "mlp.down_proj.weight"
+                : p + "feed_forward.w2.weight";
+
+            const array mlp_gate_weight = load_linear_weight(tensors, mlp_gate_key); // [out,in]
+            const array mlp_up_weight = load_linear_weight(tensors, mlp_up_key); // [out,in]
+            const array mlp_down_weight = load_linear_weight(tensors, mlp_down_key); // [out,in]
+
             lw.mlp_gate_rhs = to_rhs(
-                require_any_tensor(
-                    tensors,
-                    { p + "mlp.gate_proj.weight", p + "feed_forward.w1.weight" },
-                    p + "mlp.gate_proj/feed_forward.w1"
-                ),
+                mlp_gate_weight,
                 p + "mlp_gate"
             );
             lw.mlp_up_rhs = to_rhs(
-                require_any_tensor(
-                    tensors,
-                    { p + "mlp.up_proj.weight", p + "feed_forward.w3.weight" },
-                    p + "mlp.up_proj/feed_forward.w3"
-                ),
+                mlp_up_weight,
                 p + "mlp_up"
             );
             lw.mlp_down_rhs = to_rhs(
-                require_any_tensor(
-                    tensors,
-                    { p + "mlp.down_proj.weight", p + "feed_forward.w2.weight" },
-                    p + "mlp.down_proj/feed_forward.w2"
-                ),
+                mlp_down_weight,
                 p + "mlp_down"
             );
+            maybe_quantize_mxfp8_matrix(
+                tensors,
+                mlp_gate_key,
+                mlp_gate_weight,
+                enable_mlp_qmm,
+                &lw.mlp_gate_q_w,
+                &lw.mlp_gate_q_scales,
+                &lw.mlp_gate_has_q
+            );
+            maybe_quantize_mxfp8_matrix(
+                tensors,
+                mlp_up_key,
+                mlp_up_weight,
+                enable_mlp_qmm,
+                &lw.mlp_up_q_w,
+                &lw.mlp_up_q_scales,
+                &lw.mlp_up_has_q
+            );
+            maybe_quantize_mxfp8_matrix(
+                tensors,
+                mlp_down_key,
+                mlp_down_weight,
+                enable_mlp_qmm,
+                &lw.mlp_down_q_w,
+                &lw.mlp_down_q_scales,
+                &lw.mlp_down_has_q
+            );
 
-            const bool has_linear = has_tensor(tensors, p + "linear_attn.in_proj_qkv.weight");
+            const bool has_linear_split = has_tensor(tensors, p + "linear_attn.in_proj_qkv.weight");
+            const bool has_linear_fused = has_tensor(tensors, p + "mixer.in_proj.weight");
+            const bool has_linear = has_linear_split || has_linear_fused;
             const bool has_shortconv = has_tensor(tensors, p + "conv.in_proj.weight");
             const bool has_attn = has_tensor(tensors, p + "self_attn.q_proj.weight");
             const int branch_count = (has_linear ? 1 : 0) + (has_shortconv ? 1 : 0) + (has_attn ? 1 : 0);
             if (branch_count == 0) {
-                throw std::runtime_error("layer has neither linear_attn, conv, nor self_attn: " + std::to_string(i));
+                std::string present;
+                for (const auto& kv : tensors) {
+                    if (kv.first.rfind(p, 0) != 0) continue;
+                    if (kv.first.find("linear_attn") == std::string::npos &&
+                        kv.first.find("mixer") == std::string::npos &&
+                        kv.first.find("conv") == std::string::npos &&
+                        kv.first.find("self_attn") == std::string::npos) {
+                        continue;
+                    }
+                    if (!present.empty()) present += ", ";
+                    present += kv.first;
+                    if (present.size() > 1200) {
+                        present += ", ...";
+                        break;
+                    }
+                }
+                throw std::runtime_error(
+                    "layer has neither linear_attn, conv, nor self_attn: " + std::to_string(i) +
+                    " (prefix=" + p +
+                    ", has_linear_split=" + std::to_string(has_linear_split) +
+                    ", has_linear_fused=" + std::to_string(has_linear_fused) +
+                    ", has_shortconv=" + std::to_string(has_shortconv) +
+                    ", has_attn=" + std::to_string(has_attn) +
+                    ", present=[" + present + "])"
+                );
             }
             if (branch_count > 1) {
                 throw std::runtime_error("layer has multiple mixer branches unexpectedly: " + std::to_string(i));
@@ -1451,19 +1881,6 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     ctx->cfg.linear_conv_kernel_dim <= 0) {
                     throw std::runtime_error("missing linear_attn config fields for hybrid layer");
                 }
-                lw.lin_conv1d_w = require_tensor(tensors, p + "linear_attn.conv1d.weight");
-                lw.lin_in_proj_qkv_rhs = to_rhs(require_tensor(tensors, p + "linear_attn.in_proj_qkv.weight"), p + "linear_attn.in_proj_qkv.weight");
-                lw.lin_in_proj_z_rhs = to_rhs(require_tensor(tensors, p + "linear_attn.in_proj_z.weight"), p + "linear_attn.in_proj_z.weight");
-                lw.lin_in_proj_a_rhs = to_rhs(require_tensor(tensors, p + "linear_attn.in_proj_a.weight"), p + "linear_attn.in_proj_a.weight");
-                lw.lin_in_proj_b_rhs = to_rhs(require_tensor(tensors, p + "linear_attn.in_proj_b.weight"), p + "linear_attn.in_proj_b.weight");
-                lw.lin_in_proj_qkvz_rhs = concatenate({lw.lin_in_proj_qkv_rhs, lw.lin_in_proj_z_rhs}, 1);
-                lw.lin_in_proj_ba_rhs = concatenate({lw.lin_in_proj_b_rhs, lw.lin_in_proj_a_rhs}, 1);
-                lw.lin_A_log = require_tensor(tensors, p + "linear_attn.A_log");
-                lw.lin_A_exp_f32 = exp(astype(lw.lin_A_log, float32));
-                lw.lin_dt_bias = require_tensor(tensors, p + "linear_attn.dt_bias");
-                lw.lin_norm_w = require_tensor(tensors, p + "linear_attn.norm.weight");
-                lw.lin_out_proj_rhs = to_rhs(require_tensor(tensors, p + "linear_attn.out_proj.weight"), p + "linear_attn.out_proj.weight");
-
                 lw.lin_num_v_heads = ctx->cfg.linear_num_value_heads;
                 lw.lin_num_k_heads = ctx->cfg.linear_num_key_heads;
                 lw.lin_head_k_dim = ctx->cfg.linear_key_head_dim;
@@ -1472,10 +1889,145 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 lw.lin_value_dim = lw.lin_num_v_heads * lw.lin_head_v_dim;
                 lw.lin_conv_dim = lw.lin_key_dim * 2 + lw.lin_value_dim;
                 lw.lin_conv_kernel = ctx->cfg.linear_conv_kernel_dim;
+
+                lw.lin_conv1d_w = require_tensor(tensors, p + "linear_attn.conv1d.weight");
+                if (has_linear_split) {
+                    const std::string qkv_key = p + "linear_attn.in_proj_qkv.weight";
+                    const std::string z_key = p + "linear_attn.in_proj_z.weight";
+                    const std::string a_key = p + "linear_attn.in_proj_a.weight";
+                    const std::string b_key = p + "linear_attn.in_proj_b.weight";
+                    const array qkv_weight = load_linear_weight(tensors, qkv_key);
+                    const array z_weight = load_linear_weight(tensors, z_key);
+                    const array a_weight = load_linear_weight(tensors, a_key);
+                    const array b_weight = load_linear_weight(tensors, b_key);
+                    const array qkvz_weight = concatenate({qkv_weight, z_weight}, 0);
+                    const array ba_weight = concatenate({b_weight, a_weight}, 0);
+                    lw.lin_in_proj_qkv_rhs = to_rhs(qkv_weight, qkv_key);
+                    lw.lin_in_proj_z_rhs = to_rhs(z_weight, z_key);
+                    lw.lin_in_proj_a_rhs = to_rhs(a_weight, a_key);
+                    lw.lin_in_proj_b_rhs = to_rhs(b_weight, b_key);
+                    lw.lin_in_proj_qkvz_rhs = concatenate({lw.lin_in_proj_qkv_rhs, lw.lin_in_proj_z_rhs}, 1);
+                    lw.lin_in_proj_ba_rhs = concatenate({lw.lin_in_proj_b_rhs, lw.lin_in_proj_a_rhs}, 1);
+                    maybe_quantize_mxfp8_matrix(
+                        tensors,
+                        qkv_key,
+                        qkvz_weight,
+                        enable_mlp_qmm,
+                        &lw.lin_in_proj_qkvz_q_w,
+                        &lw.lin_in_proj_qkvz_q_scales,
+                        &lw.lin_in_proj_qkvz_has_q
+                    );
+                    maybe_quantize_mxfp8_matrix(
+                        tensors,
+                        b_key,
+                        ba_weight,
+                        enable_mlp_qmm,
+                        &lw.lin_in_proj_ba_q_w,
+                        &lw.lin_in_proj_ba_q_scales,
+                        &lw.lin_in_proj_ba_has_q
+                    );
+                } else {
+                    const std::string fused_key = p + "mixer.in_proj.weight";
+                    const array fused_in_proj_weight = load_linear_weight(tensors, fused_key); // [out, hidden]
+                    const array fused_in_proj_rhs = to_rhs(
+                        fused_in_proj_weight,
+                        fused_key
+                    );
+                    if (fused_in_proj_rhs.ndim() != 2) {
+                        throw std::runtime_error("linear fused in_proj must be rank-2");
+                    }
+                    const int qkvz_cols = lw.lin_conv_dim + lw.lin_value_dim;
+                    const int ba_cols = 2 * lw.lin_num_v_heads;
+                    const int expected_cols = qkvz_cols + ba_cols;
+                    const int fused_rows = fused_in_proj_rhs.shape(0);
+                    const int fused_cols = fused_in_proj_rhs.shape(1);
+                    if (fused_cols != expected_cols) {
+                        throw std::runtime_error(
+                            "linear fused in_proj shape mismatch: expected cols=" +
+                            std::to_string(expected_cols) + " got cols=" + std::to_string(fused_cols)
+                        );
+                    }
+                    lw.lin_in_proj_qkvz_rhs = slice(
+                        fused_in_proj_rhs,
+                        {0, 0},
+                        {fused_rows, qkvz_cols}
+                    );
+                    lw.lin_in_proj_ba_rhs = slice(
+                        fused_in_proj_rhs,
+                        {0, qkvz_cols},
+                        {fused_rows, expected_cols}
+                    );
+                    const array qkvz_weight = slice(
+                        fused_in_proj_weight,
+                        {0, 0},
+                        {qkvz_cols, fused_in_proj_weight.shape(1)}
+                    );
+                    const array ba_weight = slice(
+                        fused_in_proj_weight,
+                        {qkvz_cols, 0},
+                        {expected_cols, fused_in_proj_weight.shape(1)}
+                    );
+                    maybe_quantize_mxfp8_matrix(
+                        tensors,
+                        p + "mixer.in_proj.qkvz_slice",
+                        qkvz_weight,
+                        enable_mlp_qmm,
+                        &lw.lin_in_proj_qkvz_q_w,
+                        &lw.lin_in_proj_qkvz_q_scales,
+                        &lw.lin_in_proj_qkvz_has_q
+                    );
+                    maybe_quantize_mxfp8_matrix(
+                        tensors,
+                        p + "mixer.in_proj.ba_slice",
+                        ba_weight,
+                        enable_mlp_qmm,
+                        &lw.lin_in_proj_ba_q_w,
+                        &lw.lin_in_proj_ba_q_scales,
+                        &lw.lin_in_proj_ba_has_q
+                    );
+                }
+                lw.lin_A_log = require_tensor(tensors, p + "linear_attn.A_log");
+                lw.lin_A_exp_f32 = exp(astype(lw.lin_A_log, float32));
+                lw.lin_dt_bias = require_tensor(tensors, p + "linear_attn.dt_bias");
+                lw.lin_norm_w = require_tensor(tensors, p + "linear_attn.norm.weight");
+                const std::string out_proj_key = p + "linear_attn.out_proj.weight";
+                const array out_proj_weight = load_linear_weight(tensors, out_proj_key);
+                lw.lin_out_proj_rhs = to_rhs(out_proj_weight, out_proj_key);
+                maybe_quantize_mxfp8_matrix(
+                    tensors,
+                    out_proj_key,
+                    out_proj_weight,
+                    enable_mlp_qmm,
+                    &lw.lin_out_proj_q_w,
+                    &lw.lin_out_proj_q_scales,
+                    &lw.lin_out_proj_has_q
+                );
             } else if (lw.is_shortconv) {
-                lw.sc_in_proj_rhs = to_rhs(require_tensor(tensors, p + "conv.in_proj.weight"), p + "conv.in_proj.weight");
+                const std::string sc_in_proj_key = p + "conv.in_proj.weight";
+                const array sc_in_proj_weight = load_linear_weight(tensors, sc_in_proj_key);
+                lw.sc_in_proj_rhs = to_rhs(sc_in_proj_weight, sc_in_proj_key);
+                maybe_quantize_mxfp8_matrix(
+                    tensors,
+                    sc_in_proj_key,
+                    sc_in_proj_weight,
+                    enable_mlp_qmm,
+                    &lw.sc_in_proj_q_w,
+                    &lw.sc_in_proj_q_scales,
+                    &lw.sc_in_proj_has_q
+                );
                 lw.sc_conv1d_w = require_tensor(tensors, p + "conv.conv.weight");
-                lw.sc_out_proj_rhs = to_rhs(require_tensor(tensors, p + "conv.out_proj.weight"), p + "conv.out_proj.weight");
+                const std::string sc_out_proj_key = p + "conv.out_proj.weight";
+                const array sc_out_proj_weight = load_linear_weight(tensors, sc_out_proj_key);
+                lw.sc_out_proj_rhs = to_rhs(sc_out_proj_weight, sc_out_proj_key);
+                maybe_quantize_mxfp8_matrix(
+                    tensors,
+                    sc_out_proj_key,
+                    sc_out_proj_weight,
+                    enable_mlp_qmm,
+                    &lw.sc_out_proj_q_w,
+                    &lw.sc_out_proj_q_scales,
+                    &lw.sc_out_proj_has_q
+                );
                 if (has_tensor(tensors, p + "conv.conv.bias")) {
                     lw.sc_conv_bias = require_tensor(tensors, p + "conv.conv.bias");
                     lw.sc_has_bias = true;
@@ -1487,16 +2039,56 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 lw.sc_conv_dim = proj_dim / 3;
                 lw.sc_conv_kernel = lw.sc_conv1d_w.shape(1);
             } else {
-                lw.attn_q_rhs = to_rhs(require_tensor(tensors, p + "self_attn.q_proj.weight"), p + "self_attn.q_proj.weight");
-                lw.attn_k_rhs = to_rhs(require_tensor(tensors, p + "self_attn.k_proj.weight"), p + "self_attn.k_proj.weight");
-                lw.attn_v_rhs = to_rhs(require_tensor(tensors, p + "self_attn.v_proj.weight"), p + "self_attn.v_proj.weight");
-                lw.attn_o_rhs = to_rhs(
-                    require_any_tensor(
-                        tensors,
-                        { p + "self_attn.o_proj.weight", p + "self_attn.out_proj.weight" },
-                        p + "self_attn.o_proj/out_proj"
-                    ),
-                    p + "self_attn_o_proj"
+                const std::string q_proj_key = p + "self_attn.q_proj.weight";
+                const std::string k_proj_key = p + "self_attn.k_proj.weight";
+                const std::string v_proj_key = p + "self_attn.v_proj.weight";
+                const std::string o_proj_key = has_tensor(tensors, p + "self_attn.o_proj.weight")
+                    ? p + "self_attn.o_proj.weight"
+                    : p + "self_attn.out_proj.weight";
+                const array q_proj_weight = load_linear_weight(tensors, q_proj_key);
+                const array k_proj_weight = load_linear_weight(tensors, k_proj_key);
+                const array v_proj_weight = load_linear_weight(tensors, v_proj_key);
+                const array o_proj_weight = load_linear_weight(tensors, o_proj_key);
+
+                lw.attn_q_rhs = to_rhs(q_proj_weight, q_proj_key);
+                lw.attn_k_rhs = to_rhs(k_proj_weight, k_proj_key);
+                lw.attn_v_rhs = to_rhs(v_proj_weight, v_proj_key);
+                lw.attn_o_rhs = to_rhs(o_proj_weight, p + "self_attn_o_proj");
+                maybe_quantize_mxfp8_matrix(
+                    tensors,
+                    q_proj_key,
+                    q_proj_weight,
+                    enable_mlp_qmm,
+                    &lw.attn_q_q_w,
+                    &lw.attn_q_q_scales,
+                    &lw.attn_q_has_q
+                );
+                maybe_quantize_mxfp8_matrix(
+                    tensors,
+                    k_proj_key,
+                    k_proj_weight,
+                    enable_mlp_qmm,
+                    &lw.attn_k_q_w,
+                    &lw.attn_k_q_scales,
+                    &lw.attn_k_has_q
+                );
+                maybe_quantize_mxfp8_matrix(
+                    tensors,
+                    v_proj_key,
+                    v_proj_weight,
+                    enable_mlp_qmm,
+                    &lw.attn_v_q_w,
+                    &lw.attn_v_q_scales,
+                    &lw.attn_v_has_q
+                );
+                maybe_quantize_mxfp8_matrix(
+                    tensors,
+                    o_proj_key,
+                    o_proj_weight,
+                    enable_mlp_qmm,
+                    &lw.attn_o_q_w,
+                    &lw.attn_o_q_scales,
+                    &lw.attn_o_has_q
                 );
                 lw.attn_q_norm_w = require_any_tensor(
                     tensors,
