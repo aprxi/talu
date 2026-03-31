@@ -194,7 +194,7 @@ pub fn allocDeviceKvPairWithScales(
     errdefer k.deinit(device);
     var v = try device.allocBuffer(cache_bytes);
     errdefer v.deinit(device);
-    if (kv_dtype == .i8) {
+    if (kv_dtype.hasPerHeadScales()) {
         const scale_bytes = try kvScaleBytesForCapacity(capacity, n_kv_heads);
         var k_scale = try device.allocBuffer(scale_bytes);
         errdefer k_scale.deinit(device);

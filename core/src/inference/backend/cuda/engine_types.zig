@@ -61,17 +61,28 @@ pub const initial_kv_cache_tokens: usize = 256;
 pub const KvCacheDtype = enum(u8) {
     f16,
     i8,
+    fp8,
 
     pub fn elementBytes(self: KvCacheDtype) usize {
         return switch (self) {
             .f16 => @sizeOf(u16),
             .i8 => 1,
+            .fp8 => 1,
+        };
+    }
+
+    pub fn hasPerHeadScales(self: KvCacheDtype) bool {
+        return switch (self) {
+            .f16 => false,
+            .i8 => true,
+            .fp8 => true,
         };
     }
 };
 pub fn resolveKvCacheDtype() KvCacheDtype {
     const raw = std.posix.getenv("TALU_KV_QUANT") orelse return .i8;
     if (std.ascii.eqlIgnoreCase(raw, "f16") or std.ascii.eqlIgnoreCase(raw, "fp16")) return .f16;
+    if (std.ascii.eqlIgnoreCase(raw, "fp8") or std.ascii.eqlIgnoreCase(raw, "e4m3")) return .fp8;
     return .i8;
 }
 pub const enable_fused_attention_f16_kv: bool = true;
@@ -365,6 +376,18 @@ pub const KernelSlot = enum {
     attn_fused_prefill_heads_i8_kv_gqa,
     attn_scores_heads_i8_kv_ptrs,
     attn_weighted_sum_heads_i8_kv_ptrs,
+    kv_write_fp8,
+    kv_write_fp8_rows,
+    kv_write_fp8_rows_ptrs,
+    rope_store_fp8,
+    attn_scores_heads_fp8_kv,
+    attn_weighted_sum_heads_fp8_kv,
+    attn_fused_heads_fp8_kv,
+    attn_fused_decode_heads_fp8_kv_ptrs,
+    attn_fused_prefill_heads_fp8_kv,
+    attn_fused_prefill_heads_fp8_kv_gqa,
+    attn_scores_heads_fp8_kv_ptrs,
+    attn_weighted_sum_heads_fp8_kv_ptrs,
 };
 
 pub const RequiredKernel = struct {
@@ -383,6 +406,8 @@ pub const AttentionPath = enum {
     heads_f16_kv,
     fused_heads_i8_kv,
     heads_i8_kv,
+    fused_heads_fp8_kv,
+    heads_fp8_kv,
     heads_f32_kv,
 };
 
@@ -419,6 +444,11 @@ pub const AttentionKernelSet = struct {
     attn_fused_heads_i8_kv_function: ?compute.cuda.Function = null,
     attn_fused_prefill_heads_i8_kv_function: ?compute.cuda.Function = null,
     attn_fused_prefill_heads_i8_kv_gqa_function: ?compute.cuda.Function = null,
+    attn_scores_heads_fp8_kv_function: ?compute.cuda.Function = null,
+    attn_weighted_sum_heads_fp8_kv_function: ?compute.cuda.Function = null,
+    attn_fused_heads_fp8_kv_function: ?compute.cuda.Function = null,
+    attn_fused_prefill_heads_fp8_kv_function: ?compute.cuda.Function = null,
+    attn_fused_prefill_heads_fp8_kv_gqa_function: ?compute.cuda.Function = null,
 };
 
 pub const required_kernels = [_]RequiredKernel{
@@ -511,6 +541,18 @@ pub const required_kernels = [_]RequiredKernel{
     .{ .slot = .attn_fused_prefill_heads_i8_kv_gqa, .op_name = compute.cuda.attn_fused_prefill_heads_i8_kv_gqa.op_name, .embedded_symbol = compute.cuda.attn_fused_prefill_heads_i8_kv_gqa.embedded_symbol },
     .{ .slot = .attn_scores_heads_i8_kv_ptrs, .op_name = compute.cuda.attn_scores_heads_i8_kv_ptrs.op_name, .embedded_symbol = compute.cuda.attn_scores_heads_i8_kv_ptrs.embedded_symbol },
     .{ .slot = .attn_weighted_sum_heads_i8_kv_ptrs, .op_name = compute.cuda.attn_weighted_sum_heads_i8_kv_ptrs.op_name, .embedded_symbol = compute.cuda.attn_weighted_sum_heads_i8_kv_ptrs.embedded_symbol },
+    .{ .slot = .kv_write_fp8, .op_name = compute.cuda.kv_write_fp8.op_name, .embedded_symbol = compute.cuda.kv_write_fp8.embedded_symbol },
+    .{ .slot = .kv_write_fp8_rows, .op_name = compute.cuda.kv_write_fp8_rows.op_name, .embedded_symbol = compute.cuda.kv_write_fp8_rows.embedded_symbol },
+    .{ .slot = .kv_write_fp8_rows_ptrs, .op_name = compute.cuda.kv_write_fp8_rows_ptrs.op_name, .embedded_symbol = compute.cuda.kv_write_fp8_rows_ptrs.embedded_symbol },
+    .{ .slot = .rope_store_fp8, .op_name = compute.cuda.rope_store_fp8.op_name, .embedded_symbol = compute.cuda.rope_store_fp8.embedded_symbol },
+    .{ .slot = .attn_scores_heads_fp8_kv, .op_name = compute.cuda.attn_scores_heads_fp8_kv.op_name, .embedded_symbol = compute.cuda.attn_scores_heads_fp8_kv.embedded_symbol },
+    .{ .slot = .attn_weighted_sum_heads_fp8_kv, .op_name = compute.cuda.attn_weighted_sum_heads_fp8_kv.op_name, .embedded_symbol = compute.cuda.attn_weighted_sum_heads_fp8_kv.embedded_symbol },
+    .{ .slot = .attn_fused_heads_fp8_kv, .op_name = compute.cuda.attn_fused_heads_fp8_kv.op_name, .embedded_symbol = compute.cuda.attn_fused_heads_fp8_kv.embedded_symbol },
+    .{ .slot = .attn_fused_decode_heads_fp8_kv_ptrs, .op_name = compute.cuda.attn_fused_decode_heads_fp8_kv_ptrs.op_name, .embedded_symbol = compute.cuda.attn_fused_decode_heads_fp8_kv_ptrs.embedded_symbol },
+    .{ .slot = .attn_fused_prefill_heads_fp8_kv, .op_name = compute.cuda.attn_fused_prefill_heads_fp8_kv.op_name, .embedded_symbol = compute.cuda.attn_fused_prefill_heads_fp8_kv.embedded_symbol },
+    .{ .slot = .attn_fused_prefill_heads_fp8_kv_gqa, .op_name = compute.cuda.attn_fused_prefill_heads_fp8_kv_gqa.op_name, .embedded_symbol = compute.cuda.attn_fused_prefill_heads_fp8_kv_gqa.embedded_symbol },
+    .{ .slot = .attn_scores_heads_fp8_kv_ptrs, .op_name = compute.cuda.attn_scores_heads_fp8_kv_ptrs.op_name, .embedded_symbol = compute.cuda.attn_scores_heads_fp8_kv_ptrs.embedded_symbol },
+    .{ .slot = .attn_weighted_sum_heads_fp8_kv_ptrs, .op_name = compute.cuda.attn_weighted_sum_heads_fp8_kv_ptrs.op_name, .embedded_symbol = compute.cuda.attn_weighted_sum_heads_fp8_kv_ptrs.embedded_symbol },
 };
 
 pub const DeviceTensor = struct {

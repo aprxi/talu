@@ -1,0 +1,181 @@
+//! Metal executor glue module.
+//!
+//! This module exposes the Metal runtime types used by executor kernels.
+
+const std = @import("std");
+const compute = @import("../../../../compute/root.zig");
+const runtime_contract = @import("../../../runtime_contract/root.zig");
+const runtime_graph = @import("../runtime_graph.zig");
+const model_executor = @import("model.zig");
+const weights_executor = @import("weights.zig");
+
+const ArrayHandle = compute.metal.graph.ArrayHandle;
+const mlx_graph = compute.metal.graph;
+
+pub const Cache = runtime_graph.Cache;
+pub const ShortConvCache = runtime_graph.ShortConvCache;
+pub const MambaCache = runtime_graph.MambaCache;
+pub const GatedDeltaCache = runtime_graph.GatedDeltaCache;
+
+pub const DeepstackAdditions = model_executor.DeepstackAdditions;
+pub const RuntimeRoPEOverride = model_executor.RuntimeRoPEOverride;
+
+pub const MLXError = weights_executor.MLXError;
+pub const WeightHandles = weights_executor.WeightHandles;
+
+pub const loadWeightsToGPU = weights_executor.loadWeightsToGPU;
+pub const freeWeights = weights_executor.freeWeights;
+
+inline fn beginGraphBuild() void {
+    // Reset pooled transient arrays at the start of each logical forward.
+    // This keeps decode on one high-performance path by reusing array slots
+    // instead of continuously growing per-thread pool storage.
+    mlx_graph.beginForwardGraphBuild();
+}
+
+pub fn gatherTokenEmbeddingsLazy(weight_handles: anytype, input_ids: []const u32) !ArrayHandle {
+    beginGraphBuild();
+    return model_executor.gatherTokenEmbeddingsLazy(weight_handles, input_ids);
+}
+
+pub fn transformerForwardLazy(
+    allocator: std.mem.Allocator,
+    weight_handles: *const WeightHandles,
+    input_ids: []const u32,
+    state_blocks: []const runtime_contract.StateBlockHandle,
+    config: anytype,
+    pos_offset: usize,
+) !ArrayHandle {
+    beginGraphBuild();
+    return model_executor.Model.forward(
+        allocator,
+        weight_handles,
+        input_ids,
+        state_blocks,
+        config,
+        pos_offset,
+    );
+}
+
+pub fn transformerForwardHiddenLazy(
+    allocator: std.mem.Allocator,
+    weight_handles: *const WeightHandles,
+    input_ids: []const u32,
+    state_blocks: []const runtime_contract.StateBlockHandle,
+    config: anytype,
+    pos_offset: usize,
+) !ArrayHandle {
+    beginGraphBuild();
+    return model_executor.Model.forwardHidden(
+        allocator,
+        weight_handles,
+        input_ids,
+        state_blocks,
+        config,
+        pos_offset,
+    );
+}
+
+pub fn transformerForwardLazyWithEmbeddingOverride(
+    allocator: std.mem.Allocator,
+    weight_handles: *const WeightHandles,
+    input_ids: []const u32,
+    state_blocks: []const runtime_contract.StateBlockHandle,
+    config: anytype,
+    pos_offset: usize,
+    embedding_override: ?[]const f32,
+    deepstack: ?DeepstackAdditions,
+    runtime_rope: ?RuntimeRoPEOverride,
+) !ArrayHandle {
+    beginGraphBuild();
+    return model_executor.Model.forwardWithEmbeddingOverride(
+        allocator,
+        weight_handles,
+        input_ids,
+        state_blocks,
+        config,
+        pos_offset,
+        embedding_override,
+        deepstack,
+        runtime_rope,
+    );
+}
+
+pub fn transformerForwardHiddenLazyWithEmbeddingOverride(
+    allocator: std.mem.Allocator,
+    weight_handles: *const WeightHandles,
+    input_ids: []const u32,
+    state_blocks: []const runtime_contract.StateBlockHandle,
+    config: anytype,
+    pos_offset: usize,
+    embedding_override: ?[]const f32,
+    deepstack: ?DeepstackAdditions,
+    runtime_rope: ?RuntimeRoPEOverride,
+) !ArrayHandle {
+    beginGraphBuild();
+    return model_executor.Model.forwardHiddenWithEmbeddingOverride(
+        allocator,
+        weight_handles,
+        input_ids,
+        state_blocks,
+        config,
+        pos_offset,
+        embedding_override,
+        deepstack,
+        runtime_rope,
+    );
+}
+
+pub fn transformerForwardFromGPUToken(
+    allocator: std.mem.Allocator,
+    weight_handles: *const WeightHandles,
+    token_handle: ArrayHandle,
+    state_blocks: []const runtime_contract.StateBlockHandle,
+    config: anytype,
+    pos_offset: usize,
+) !ArrayHandle {
+    beginGraphBuild();
+    return model_executor.Model.forwardFromGPUToken(
+        allocator,
+        weight_handles,
+        token_handle,
+        state_blocks,
+        config,
+        pos_offset,
+    );
+}
+
+test "transformerForwardLazy exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(transformerForwardLazy)).@"fn";
+    try std.testing.expectEqual(@as(usize, 7), fn_info.params.len);
+    const f = transformerForwardLazy;
+    _ = f;
+}
+
+test "transformerForwardHiddenLazy exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(transformerForwardHiddenLazy)).@"fn";
+    try std.testing.expectEqual(@as(usize, 7), fn_info.params.len);
+    const f = transformerForwardHiddenLazy;
+    _ = f;
+}
+
+test "transformerForwardLazyWithEmbeddingOverride exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(transformerForwardLazyWithEmbeddingOverride)).@"fn";
+    try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
+    const f = transformerForwardLazyWithEmbeddingOverride;
+    _ = f;
+}
+
+test "transformerForwardHiddenLazyWithEmbeddingOverride exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(transformerForwardHiddenLazyWithEmbeddingOverride)).@"fn";
+    try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
+    const f = transformerForwardHiddenLazyWithEmbeddingOverride;
+    _ = f;
+}
+
+test "transformerForwardFromGPUToken exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(transformerForwardFromGPUToken)).@"fn";
+    try std.testing.expectEqual(@as(usize, 7), fn_info.params.len);
+    const f = transformerForwardFromGPUToken;
+    _ = f;
+}

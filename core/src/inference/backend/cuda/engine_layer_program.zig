@@ -1473,6 +1473,84 @@ pub fn runAttentionContext(
             );
             return .heads_i8_kv;
         },
+        .fp8 => {
+            const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
+            if (!cfg.query_gate and attention_mod.useFusedHeadsF16Kv(
+                attention_policy_config,
+                seq_len_u32,
+                cfg.sliding_window,
+                cfg.is_causal,
+                head_dim_u32,
+                kernels.attn_fused_heads_fp8_kv_function != null,
+            )) {
+                try compute.cuda.attn_fused_heads_fp8_kv.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    kernels.attn_fused_heads_fp8_kv_function.?,
+                    q_stage,
+                    &k_cache_view,
+                    &v_cache_view,
+                    &k_scale_view,
+                    &v_scale_view,
+                    context_stage,
+                    @intCast(self.n_heads),
+                    n_kv_heads_u32,
+                    effective_seq_len_u32,
+                    kv_dim_u32,
+                    kv_groups_u32,
+                    head_dim_u32,
+                    self.attention_scale,
+                    rope_dim_u32,
+                    position_u32,
+                    theta,
+                );
+                return .fused_heads_fp8_kv;
+            }
+
+            const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
+            const attn_probs_dev = try self.runtime_buffers.requireAttentionProbsDev();
+            try compute.cuda.attn_scores_heads_fp8_kv.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                kernels.attn_scores_heads_fp8_kv_function orelse return error.CudaKernelUnavailable,
+                q_stage,
+                &k_cache_view,
+                &k_scale_view,
+                attn_scores_dev,
+                @intCast(self.n_heads),
+                n_kv_heads_u32,
+                effective_seq_len_u32,
+                kv_dim_u32,
+                kv_groups_u32,
+                head_dim_u32,
+                self.attention_scale,
+            );
+            try compute.cuda.softmax_rows.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                kernels.softmax_rows_function orelse return error.CudaKernelUnavailable,
+                attn_scores_dev,
+                attn_probs_dev,
+                @intCast(self.n_heads),
+                effective_seq_len_u32,
+            );
+            try compute.cuda.attn_weighted_sum_heads_fp8_kv.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                kernels.attn_weighted_sum_heads_fp8_kv_function orelse return error.CudaKernelUnavailable,
+                attn_probs_dev,
+                &v_cache_view,
+                &v_scale_view,
+                context_stage,
+                @intCast(self.n_heads),
+                n_kv_heads_u32,
+                effective_seq_len_u32,
+                kv_dim_u32,
+                kv_groups_u32,
+                head_dim_u32,
+            );
+            return .heads_fp8_kv;
+        },
     }
 }
 
@@ -2104,6 +2182,54 @@ pub fn assignResolvedKernel(
         .attn_weighted_sum_heads_i8_kv_ptrs => {
             self.attn_weighted_sum_heads_i8_kv_ptrs_function = resolved.function;
             self.attn_weighted_sum_heads_i8_kv_ptrs_source = resolved.source;
+        },
+        .kv_write_fp8 => {
+            self.kv_write_fp8_function = resolved.function;
+            self.kv_write_fp8_source = resolved.source;
+        },
+        .kv_write_fp8_rows => {
+            self.kv_write_fp8_rows_function = resolved.function;
+            self.kv_write_fp8_rows_source = resolved.source;
+        },
+        .kv_write_fp8_rows_ptrs => {
+            self.kv_write_fp8_rows_ptrs_function = resolved.function;
+            self.kv_write_fp8_rows_ptrs_source = resolved.source;
+        },
+        .rope_store_fp8 => {
+            self.rope_store_fp8_function = resolved.function;
+            self.rope_store_fp8_source = resolved.source;
+        },
+        .attn_scores_heads_fp8_kv => {
+            self.attn_scores_heads_fp8_kv_function = resolved.function;
+            self.attn_scores_heads_fp8_kv_source = resolved.source;
+        },
+        .attn_weighted_sum_heads_fp8_kv => {
+            self.attn_weighted_sum_heads_fp8_kv_function = resolved.function;
+            self.attn_weighted_sum_heads_fp8_kv_source = resolved.source;
+        },
+        .attn_fused_heads_fp8_kv => {
+            self.attn_fused_heads_fp8_kv_function = resolved.function;
+            self.attn_fused_heads_fp8_kv_source = resolved.source;
+        },
+        .attn_fused_decode_heads_fp8_kv_ptrs => {
+            self.attn_fused_decode_heads_fp8_kv_ptrs_function = resolved.function;
+            self.attn_fused_decode_heads_fp8_kv_ptrs_source = resolved.source;
+        },
+        .attn_fused_prefill_heads_fp8_kv => {
+            self.attn_fused_prefill_heads_fp8_kv_function = resolved.function;
+            self.attn_fused_prefill_heads_fp8_kv_source = resolved.source;
+        },
+        .attn_fused_prefill_heads_fp8_kv_gqa => {
+            self.attn_fused_prefill_heads_fp8_kv_gqa_function = resolved.function;
+            self.attn_fused_prefill_heads_fp8_kv_gqa_source = resolved.source;
+        },
+        .attn_scores_heads_fp8_kv_ptrs => {
+            self.attn_scores_heads_fp8_kv_ptrs_function = resolved.function;
+            self.attn_scores_heads_fp8_kv_ptrs_source = resolved.source;
+        },
+        .attn_weighted_sum_heads_fp8_kv_ptrs => {
+            self.attn_weighted_sum_heads_fp8_kv_ptrs_function = resolved.function;
+            self.attn_weighted_sum_heads_fp8_kv_ptrs_source = resolved.source;
         },
         .silu => {
             self.silu_function = resolved.function;
