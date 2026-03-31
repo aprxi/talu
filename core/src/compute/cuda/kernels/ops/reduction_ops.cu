@@ -160,6 +160,54 @@ static __device__ __forceinline__ bool talu_value_id_better(
     return (lhs_value > rhs_value) || (lhs_value == rhs_value && lhs_id < rhs_id);
 }
 
+// Block-wide max reduction for (value, id) with tie-break on smaller id.
+// Uses warp reductions + one warp-of-warps merge to reduce sync overhead.
+static __device__ __forceinline__ void talu_reduce_block_value_id_max(
+    float local_value,
+    unsigned int local_id,
+    float empty_value,
+    float* shared_val,
+    unsigned int* shared_idx,
+    unsigned int tid
+) {
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other_val = __shfl_down_sync(0xFFFFFFFFu, local_value, offset);
+        const unsigned int other_idx = __shfl_down_sync(0xFFFFFFFFu, local_id, offset);
+        if (talu_value_id_better(other_val, other_idx, local_value, local_id)) {
+            local_value = other_val;
+            local_id = other_idx;
+        }
+    }
+
+    if (lane == 0u) {
+        shared_val[warp] = local_value;
+        shared_idx[warp] = local_id;
+    }
+    __syncthreads();
+
+    if (warp == 0u) {
+        const unsigned int warps = blockDim.x >> 5;
+        float warp_value = (lane < warps) ? shared_val[lane] : empty_value;
+        unsigned int warp_id = (lane < warps) ? shared_idx[lane] : 0u;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other_val = __shfl_down_sync(0xFFFFFFFFu, warp_value, offset);
+            const unsigned int other_idx = __shfl_down_sync(0xFFFFFFFFu, warp_id, offset);
+            if (talu_value_id_better(other_val, other_idx, warp_value, warp_id)) {
+                warp_value = other_val;
+                warp_id = other_idx;
+            }
+        }
+        if (lane == 0u) {
+            shared_val[0] = warp_value;
+            shared_idx[0] = warp_id;
+        }
+    }
+    __syncthreads();
+}
+
 extern "C" __global__ void talu_topk_rows_phase1(
     float* chunk_values,       // [rows, chunks, k]
     unsigned int* chunk_ids,   // [rows, chunks, k]
@@ -233,23 +281,7 @@ extern "C" __global__ void talu_topk_rows_phase1(
                 local_best_idx = local_ids[local_head];
             }
 
-            shared_val[tid] = local_best_val;
-            shared_idx[tid] = local_best_idx;
-            __syncthreads();
-
-            for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-                if (tid < stride) {
-                    const float other_val = shared_val[tid + stride];
-                    const unsigned int other_idx = shared_idx[tid + stride];
-                    const float cur_val = shared_val[tid];
-                    const unsigned int cur_idx = shared_idx[tid];
-                    if (talu_value_id_better(other_val, other_idx, cur_val, cur_idx)) {
-                        shared_val[tid] = other_val;
-                        shared_idx[tid] = other_idx;
-                    }
-                }
-                __syncthreads();
-            }
+            talu_reduce_block_value_id_max(local_best_val, local_best_idx, mask_value, shared_val, shared_idx, tid);
 
             if (tid == 0) {
                 chunk_values[out_base + pick] = shared_val[0];
@@ -280,23 +312,7 @@ extern "C" __global__ void talu_topk_rows_phase1(
             }
         }
 
-        shared_val[tid] = local_best_val;
-        shared_idx[tid] = local_best_idx;
-        __syncthreads();
-
-        for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                const float other_val = shared_val[tid + stride];
-                const unsigned int other_idx = shared_idx[tid + stride];
-                const float cur_val = shared_val[tid];
-                const unsigned int cur_idx = shared_idx[tid];
-                if (talu_value_id_better(other_val, other_idx, cur_val, cur_idx)) {
-                    shared_val[tid] = other_val;
-                    shared_idx[tid] = other_idx;
-                }
-            }
-            __syncthreads();
-        }
+        talu_reduce_block_value_id_max(local_best_val, local_best_idx, mask_value, shared_val, shared_idx, tid);
 
         if (tid == 0) {
             chunk_values[out_base + pick] = shared_val[0];
@@ -346,23 +362,7 @@ extern "C" __global__ void talu_topk_rows_phase2(
             }
         }
 
-        shared_val[tid] = local_best_val;
-        shared_idx[tid] = local_best_idx;
-        __syncthreads();
-
-        for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                const float other_val = shared_val[tid + stride];
-                const unsigned int other_idx = shared_idx[tid + stride];
-                const float cur_val = shared_val[tid];
-                const unsigned int cur_idx = shared_idx[tid];
-                if (other_val > cur_val || (other_val == cur_val && other_idx < cur_idx)) {
-                    shared_val[tid] = other_val;
-                    shared_idx[tid] = other_idx;
-                }
-            }
-            __syncthreads();
-        }
+        talu_reduce_block_value_id_max(local_best_val, local_best_idx, mask_value, shared_val, shared_idx, tid);
 
         if (tid == 0) {
             out_values[row * row_stride + pick] = shared_val[0];

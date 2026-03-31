@@ -150,10 +150,15 @@ pub fn linearForwardRows(
                 .f16 => self.u16_blas_f16_supported,
                 .bf16 => self.u16_blas_bf16_supported,
             };
-            // Batched decode path: native batched GEMV avoids cast-to-u16 +
-            // BLAS dispatch overhead. Kernel tiles in groups of 8 rows via
-            // blockIdx.y, so any batch size works.
-            if (rows <= 32) {
+            // Decode path selection:
+            // - f16: keep native batched GEMV for small row counts.
+            // - bf16: switch to tensor-core GEMM at n>=8 to avoid leaving
+            //   throughput on the table for batched decode.
+            const prefer_matvec = switch (w.dtype) {
+                .f16 => rows <= 32,
+                .bf16 => rows < 8,
+            };
+            if (prefer_matvec) {
                 try compute.cuda.matvec_u16.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,

@@ -153,6 +153,8 @@ pub const CudaBackend = struct {
     vector_add_rows_strided_source: ?compute.cuda.registry.KernelSource = null,
     vector_add_scaled_rows_strided_function: ?compute.cuda.Function = null,
     vector_add_scaled_rows_strided_source: ?compute.cuda.registry.KernelSource = null,
+    residual_scaled_rmsnorm_rows_strided_function: ?compute.cuda.Function = null,
+    residual_scaled_rmsnorm_rows_strided_source: ?compute.cuda.registry.KernelSource = null,
     mul_function: ?compute.cuda.Function = null,
     mul_source: ?compute.cuda.registry.KernelSource = null,
     copy_function: ?compute.cuda.Function = null,
@@ -375,6 +377,8 @@ pub const CudaBackend = struct {
     pending_residual_add_buf: ?compute.cuda.Buffer = null,
     // Set when fused GEMV+residual succeeded; checked/cleared by residual add adapter.
     skip_next_residual_add: bool = false,
+    // Set when residual_add was fused with the immediately following rmsnorm.
+    skip_next_rmsnorm: bool = false,
     gaffine_sequence_rows_supported: bool = false,
     gaffine_sequence_fused_qkv_supported: bool = false,
     gaffine_sequence_fused_gate_up_supported: bool = false,

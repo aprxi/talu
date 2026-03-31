@@ -498,6 +498,143 @@ pub fn assignCpuRuntimeRopeToAttentionFallbacks(self: anytype) void {
     }
 }
 
+fn residualScaleFactor(self: anytype, scale: layer_ops.ResidualScale) f32 {
+    return switch (scale) {
+        .one => 1.0,
+        .residual_multiplier => self.loaded.config.residual_multiplier,
+        .literal => |literal| literal,
+    };
+}
+
+fn runResidualAddRmsnormRowsStrideAware(
+    self: anytype,
+    fused_fn: compute.cuda.Function,
+    residual_out: *compute.cuda.Buffer,
+    norm_out: *compute.cuda.Buffer,
+    residual_in: *const compute.cuda.Buffer,
+    branch: *const compute.cuda.Buffer,
+    weight: *const compute.cuda.Buffer,
+    residual_scale: f32,
+    rows: u32,
+    cols: u32,
+) !void {
+    if (rows == 0 or cols == 0) return error.InvalidArgument;
+    const packed_count = std.math.mul(u32, rows, cols) catch return error.InvalidArgument;
+    const packed_bytes = std.math.mul(usize, @as(usize, packed_count), @sizeOf(f32)) catch return error.InvalidArgument;
+    if (residual_out.size < packed_bytes or
+        norm_out.size < packed_bytes or
+        residual_in.size < packed_bytes or
+        branch.size < packed_bytes)
+    {
+        return error.InvalidInstructionBinding;
+    }
+
+    var residual_out_stride_elems: u32 = cols;
+    var norm_out_stride_elems: u32 = cols;
+    var residual_in_stride_elems: u32 = cols;
+    var branch_stride_elems: u32 = cols;
+
+    if (!(residual_out.size == packed_bytes and
+        norm_out.size == packed_bytes and
+        residual_in.size == packed_bytes and
+        branch.size == packed_bytes))
+    {
+        const row_count: usize = @intCast(rows);
+        if (residual_out.size % row_count != 0 or
+            norm_out.size % row_count != 0 or
+            residual_in.size % row_count != 0 or
+            branch.size % row_count != 0)
+        {
+            return error.InvalidInstructionBinding;
+        }
+        const row_bytes = std.math.mul(usize, @as(usize, cols), @sizeOf(f32)) catch return error.InvalidArgument;
+        const residual_out_stride = residual_out.size / row_count;
+        const norm_out_stride = norm_out.size / row_count;
+        const residual_in_stride = residual_in.size / row_count;
+        const branch_stride = branch.size / row_count;
+        if (residual_out_stride < row_bytes or
+            norm_out_stride < row_bytes or
+            residual_in_stride < row_bytes or
+            branch_stride < row_bytes)
+        {
+            return error.InvalidInstructionBinding;
+        }
+        if ((residual_out_stride % @sizeOf(f32)) != 0 or
+            (norm_out_stride % @sizeOf(f32)) != 0 or
+            (residual_in_stride % @sizeOf(f32)) != 0 or
+            (branch_stride % @sizeOf(f32)) != 0)
+        {
+            return error.InvalidInstructionBinding;
+        }
+
+        residual_out_stride_elems = std.math.cast(u32, residual_out_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
+        norm_out_stride_elems = std.math.cast(u32, norm_out_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
+        residual_in_stride_elems = std.math.cast(u32, residual_in_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
+        branch_stride_elems = std.math.cast(u32, branch_stride / @sizeOf(f32)) orelse return error.InvalidArgument;
+    }
+
+    try compute.cuda.residual_scaled_rmsnorm_rows_strided.runWithFunction(
+        &self.kernel_arg_pack,
+        &self.device,
+        fused_fn,
+        residual_out,
+        norm_out,
+        residual_in,
+        branch,
+        weight,
+        residual_scale,
+        rows,
+        cols,
+        residual_out_stride_elems,
+        norm_out_stride_elems,
+        residual_in_stride_elems,
+        branch_stride_elems,
+        self.norm_eps,
+        self.loaded.runtime.weight_offset,
+    );
+}
+
+fn tryFuseResidualAddIntoNextRmsnorm(
+    self: anytype,
+    insn: *const runtime_contract.Instruction,
+    registers: []runtime_contract.TensorHandle,
+    scale: layer_ops.ResidualScale,
+    ctx: *LayerProgramExecutionContext,
+) !bool {
+    const fused_fn = self.residual_scaled_rmsnorm_rows_strided_function orelse return false;
+    const compiled = ctx.layer.compiled_plan orelse return error.UnsupportedModel;
+    if (ctx.op_index + 1 >= compiled.plan.instructions.len) return false;
+
+    const next_insn = &compiled.plan.instructions[ctx.op_index + 1];
+    if (next_insn.opcode != .rmsnorm) return false;
+    if (insn.outputs.len != 1 or next_insn.inputs.len != 1 or next_insn.outputs.len != 1) return false;
+    if (insn.outputs[0] != next_insn.inputs[0]) return false;
+
+    const io = try instructionIoSlices(insn, registers);
+    if (io.inputs.len < 2 or io.outputs.len == 0) return error.InvalidInstructionBinding;
+    const residual_src = bufferFromTensorHandle(io.inputs[0]);
+    const residual_dst = bufferFromTensorHandle(io.outputs[0]);
+    const branch = bufferFromTensorHandle(io.inputs[1]);
+
+    const norm_out_reg = runtime_contract.registerToIndex(next_insn.outputs[0]);
+    const norm_out = engine_ops.programBuffer(self, norm_out_reg, ctx) orelse return error.UnsupportedModel;
+    const norm_weight = try ctx.layer.instructionNormWeightRef(ctx.op_index + 1);
+    try runResidualAddRmsnormRowsStrideAware(
+        self,
+        fused_fn,
+        residual_dst,
+        norm_out,
+        residual_src,
+        branch,
+        &norm_weight.buffer,
+        residualScaleFactor(self, scale),
+        ctx.active_rows_u32,
+        ctx.d_model_u32,
+    );
+    self.skip_next_rmsnorm = true;
+    return true;
+}
+
 pub fn layerProgramNormAdapter(
     self: anytype,
     _: *BlockRuntimeLayer,
@@ -505,6 +642,10 @@ pub fn layerProgramNormAdapter(
     registers: []runtime_contract.TensorHandle,
     ctx: *LayerProgramExecutionContext,
 ) !void {
+    if (self.skip_next_rmsnorm) {
+        self.skip_next_rmsnorm = false;
+        return;
+    }
     const io = try instructionIoSlices(insn, registers);
     if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
     const weight_handles = try instructionWeightSlice(insn, registers);
@@ -916,6 +1057,9 @@ pub fn layerProgramResidualAddAdapter(
 ) !void {
     if (self.skip_next_residual_add) {
         self.skip_next_residual_add = false;
+        return;
+    }
+    if (try tryFuseResidualAddIntoNextRmsnorm(self, insn, registers, scale, ctx)) {
         return;
     }
     const io = try instructionIoSlices(insn, registers);
@@ -1351,6 +1495,19 @@ pub fn initKernelFunctions(self: anytype) !void {
     try resolveRequiredKernels(
         self,
     );
+
+    // Optional fusion kernel. If unavailable (e.g. stale sideload payload),
+    // keep the canonical residual_add + rmsnorm split path.
+    if (self.kernel_registry.resolveFunction(
+        compute.cuda.residual_scaled_rmsnorm_rows_strided.op_name,
+        compute.cuda.residual_scaled_rmsnorm_rows_strided.embedded_symbol,
+    )) |resolved| {
+        self.residual_scaled_rmsnorm_rows_strided_function = resolved.function;
+        self.residual_scaled_rmsnorm_rows_strided_source = resolved.source;
+    } else |_| {
+        self.residual_scaled_rmsnorm_rows_strided_function = null;
+        self.residual_scaled_rmsnorm_rows_strided_source = null;
+    }
 }
 
 /// Pre-dequantize all gaffine_u8 weights to persistent F16 and I8 device buffers.

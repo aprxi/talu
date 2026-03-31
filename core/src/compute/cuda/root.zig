@@ -33,6 +33,7 @@ pub const kv_write_i8_rows = @import("kv_write_i8_rows.zig");
 pub const kv_write_i8_rows_ptrs = @import("kv_write_i8_rows_ptrs.zig");
 pub const rmsnorm = @import("rmsnorm.zig");
 pub const rmsnorm_rows_strided = @import("rmsnorm_rows_strided.zig");
+pub const residual_scaled_rmsnorm_rows_strided = @import("residual_scaled_rmsnorm_rows_strided.zig");
 pub const rope = @import("rope.zig");
 pub const rope_store_f16 = @import("rope_store_f16.zig");
 pub const rope_store_i8 = @import("rope_store_i8.zig");
@@ -141,6 +142,7 @@ test {
     _ = kv_write_i8_rows_ptrs;
     _ = rmsnorm;
     _ = rmsnorm_rows_strided;
+    _ = residual_scaled_rmsnorm_rows_strided;
     _ = rope;
     _ = rope_store_f16;
     _ = rope_store_i8;

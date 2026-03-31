@@ -24,7 +24,7 @@ pub const phase1_op_name: []const u8 = "topk_rows_phase1";
 pub const phase2_op_name: []const u8 = "topk_rows_phase2";
 
 /// Number of chunks to split each row into for phase 1 parallelism.
-pub const CHUNKS: u32 = 32;
+pub const CHUNKS: u32 = 20;
 
 pub fn runTwoPhase(
     arg_pack: *args_mod.ArgPack,

@@ -190,6 +190,126 @@ extern "C" __global__ void talu_rmsnorm_rows_strided_f32(
     }
 }
 
+extern "C" __global__ void talu_residual_scaled_rmsnorm_rows_strided_f32(
+    float* residual_out,
+    float* norm_out,
+    const float* residual_in,
+    const float* branch,
+    const float* weight,
+    float residual_scale,
+    unsigned int rows,
+    unsigned int cols,
+    unsigned int residual_out_stride,
+    unsigned int norm_out_stride,
+    unsigned int residual_in_stride,
+    unsigned int branch_stride,
+    float eps,
+    float weight_offset
+) {
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const unsigned int tid = threadIdx.x;
+    const float* row_residual_in = residual_in + (unsigned long long)row * residual_in_stride;
+    const float* row_branch = branch + (unsigned long long)row * branch_stride;
+    float* row_residual_out = residual_out + (unsigned long long)row * residual_out_stride;
+    float* row_norm_out = norm_out + (unsigned long long)row * norm_out_stride;
+
+    float sum_sq = 0.0f;
+    const unsigned int cols4 = cols / 4;
+    const bool input_vectorizable =
+        ((reinterpret_cast<uintptr_t>(row_residual_in) & 0xFu) == 0u) and
+        ((reinterpret_cast<uintptr_t>(row_branch) & 0xFu) == 0u);
+
+    if (input_vectorizable) {
+        const float4* residual4 = reinterpret_cast<const float4*>(row_residual_in);
+        const float4* branch4 = reinterpret_cast<const float4*>(row_branch);
+        for (unsigned int i = tid; i < cols4; i += blockDim.x) {
+            const float4 r = residual4[i];
+            const float4 b = branch4[i];
+            const float x0 = fmaf(b.x, residual_scale, r.x);
+            const float x1 = fmaf(b.y, residual_scale, r.y);
+            const float x2 = fmaf(b.z, residual_scale, r.z);
+            const float x3 = fmaf(b.w, residual_scale, r.w);
+            sum_sq = fmaf(x0, x0, sum_sq);
+            sum_sq = fmaf(x1, x1, sum_sq);
+            sum_sq = fmaf(x2, x2, sum_sq);
+            sum_sq = fmaf(x3, x3, sum_sq);
+        }
+        for (unsigned int i = cols4 * 4 + tid; i < cols; i += blockDim.x) {
+            const float x = fmaf(row_branch[i], residual_scale, row_residual_in[i]);
+            sum_sq = fmaf(x, x, sum_sq);
+        }
+    } else {
+        for (unsigned int i = tid; i < cols; i += blockDim.x) {
+            const float x = fmaf(row_branch[i], residual_scale, row_residual_in[i]);
+            sum_sq = fmaf(x, x, sum_sq);
+        }
+    }
+
+    const float lane_sum = talu_warp_reduce_sum(sum_sq);
+    __shared__ float warp_sums[32];
+    if ((tid & 31u) == 0u) {
+        warp_sums[tid >> 5] = lane_sum;
+    }
+    __syncthreads();
+
+    const unsigned int warp_count = (blockDim.x + 31u) >> 5;
+    float block_sum = (tid < warp_count) ? warp_sums[tid] : 0.0f;
+    if (tid < 32u) {
+        block_sum = talu_warp_reduce_sum(block_sum);
+    }
+
+    __shared__ float inv_rms;
+    if (tid == 0) {
+        const float mean_sq = block_sum / (float)cols;
+        inv_rms = rsqrtf(mean_sq + eps);
+    }
+    __syncthreads();
+
+    const float irms = inv_rms;
+    const bool output_vectorizable = input_vectorizable and
+        ((reinterpret_cast<uintptr_t>(row_residual_out) & 0xFu) == 0u) and
+        ((reinterpret_cast<uintptr_t>(row_norm_out) & 0xFu) == 0u) and
+        ((reinterpret_cast<uintptr_t>(weight) & 0xFu) == 0u);
+    if (output_vectorizable) {
+        const float4* residual4 = reinterpret_cast<const float4*>(row_residual_in);
+        const float4* branch4 = reinterpret_cast<const float4*>(row_branch);
+        const float4* weight4 = reinterpret_cast<const float4*>(weight);
+        float4* residual_out4 = reinterpret_cast<float4*>(row_residual_out);
+        float4* norm_out4 = reinterpret_cast<float4*>(row_norm_out);
+        for (unsigned int i = tid; i < cols4; i += blockDim.x) {
+            const float4 r = residual4[i];
+            const float4 b = branch4[i];
+            const float4 w = weight4[i];
+            float4 x;
+            x.x = fmaf(b.x, residual_scale, r.x);
+            x.y = fmaf(b.y, residual_scale, r.y);
+            x.z = fmaf(b.z, residual_scale, r.z);
+            x.w = fmaf(b.w, residual_scale, r.w);
+            residual_out4[i] = x;
+
+            float4 y;
+            y.x = x.x * irms * (w.x + weight_offset);
+            y.y = x.y * irms * (w.y + weight_offset);
+            y.z = x.z * irms * (w.z + weight_offset);
+            y.w = x.w * irms * (w.w + weight_offset);
+            norm_out4[i] = y;
+        }
+        for (unsigned int i = cols4 * 4 + tid; i < cols; i += blockDim.x) {
+            const float x = fmaf(row_branch[i], residual_scale, row_residual_in[i]);
+            row_residual_out[i] = x;
+            row_norm_out[i] = x * irms * (weight[i] + weight_offset);
+        }
+    } else {
+        for (unsigned int i = tid; i < cols; i += blockDim.x) {
+            const float x = fmaf(row_branch[i], residual_scale, row_residual_in[i]);
+            row_residual_out[i] = x;
+            row_norm_out[i] = x * irms * (weight[i] + weight_offset);
+        }
+    }
+}
+
 extern "C" __global__ void talu_rope_f32(
     float* io,
     unsigned int n_heads,
