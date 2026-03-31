@@ -448,6 +448,7 @@ pub const Model = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
         pos_offset: usize,
+        runtime_rope: ?RuntimeRoPEOverride,
     ) !ArrayHandle {
         if (builtin.os.tag != .macos) {
             return error.MLXNotAvailable;
@@ -457,6 +458,17 @@ pub const Model = struct {
 
         const norm_eps = config.norm_eps;
         const layer_count: usize = @intCast(config.n_layers);
+        var runtime_rope_cos_handle: ArrayHandle = null;
+        var runtime_rope_sin_handle: ArrayHandle = null;
+        var runtime_rope_dim: usize = 0;
+        if (runtime_rope) |rr| {
+            if (rr.dim == 0 or rr.cos.len != rr.sin.len or (rr.cos.len % rr.dim) != 0) return error.InvalidShape;
+            const table_rows = rr.cos.len / rr.dim;
+            const rope_shape = [_]i64{ @intCast(table_rows), @intCast(rr.dim) };
+            runtime_rope_cos_handle = mlx_graph.createArrayF32(rr.cos, &rope_shape);
+            runtime_rope_sin_handle = mlx_graph.createArrayF32(rr.sin, &rope_shape);
+            runtime_rope_dim = rr.dim;
+        }
 
         var hidden: ArrayHandle = undefined; // Safe: both branches assign before use
         if (weight_handles.embed_tokens_quantized) |quantized_weight| {
@@ -477,9 +489,9 @@ pub const Model = struct {
                 weight_handles,
                 state_blocks,
                 pos_offset,
-                null,
-                null,
-                0,
+                runtime_rope_cos_handle,
+                runtime_rope_sin_handle,
+                runtime_rope_dim,
             );
 
             if (trace_hidden_debug) {
@@ -593,6 +605,7 @@ test "Model.forward matches forwardFromGPUToken for single-token zero-layer mode
         &.{},
         cfg,
         0,
+        null,
     );
     defer mlx_graph.freeArray(logits_from_gpu_token);
 

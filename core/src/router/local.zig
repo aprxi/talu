@@ -565,7 +565,12 @@ pub const LocalEngine = struct {
         }
 
         // Create backend (progress bar emitted from buildBlocks inside)
-        var compute_backend = try Backend.init(allocator, loaded_model, backend_init_options, progress);
+        var backend_options = backend_init_options;
+        backend_options.metal = .{
+            .model_path = resolved_model_path,
+            .model_id = model_path,
+        };
+        var compute_backend = try Backend.init(allocator, loaded_model, backend_options, progress);
         errdefer compute_backend.deinit();
         const scheduler_state_descriptors = try collectSchedulerStateDescriptors(allocator, loaded_model);
         errdefer if (scheduler_state_descriptors.len > 0) allocator.free(scheduler_state_descriptors);
@@ -582,7 +587,8 @@ pub const LocalEngine = struct {
         // descriptor binding during engine construction.
         const warmup_needs_state_bindings = switch (compute_backend) {
             .cpu => true,
-            .metal, .cuda => false,
+            .metal => false,
+            .cuda => false,
         };
         var warmup_bindings = TemporaryStateBindings{};
         defer warmup_bindings.deinit(allocator);

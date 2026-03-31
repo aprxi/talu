@@ -36,8 +36,14 @@ struct VerifyOverrideGuard {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifyBackendPair {
-    source: String,
+    source: VerifySource,
     target: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VerifySource {
+    Backend(String),
+    ExternalNpz(PathBuf),
 }
 
 #[derive(Clone, Copy)]
@@ -100,6 +106,76 @@ struct ReferenceTokensJson {
     tokens: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ReferenceContract {
+    rendered_prompt: String,
+    use_raw_prompt: bool,
+    seed: u64,
+    max_tokens: u32,
+    sampler: String,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReferenceSummaryJson {
+    xray_contract: ReferenceContract,
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceRecordOverrides {
+    prompt_text: String,
+    seed: u64,
+    tokens: u32,
+    contract: ReferenceContract,
+}
+
+fn reference_summary_path_for_npz(npz_path: &Path) -> PathBuf {
+    let npz_name = npz_path.to_string_lossy();
+    if let Some(prefix) = npz_name.strip_suffix(".oracle.npz") {
+        return PathBuf::from(format!("{prefix}.summary.json"));
+    }
+    if let Some(prefix) = npz_name.strip_suffix(".reference.npz") {
+        return PathBuf::from(format!("{prefix}.summary.json"));
+    }
+    if let Some(prefix) = npz_name.strip_suffix(".lm_head.npz") {
+        return PathBuf::from(format!("{prefix}.summary.json"));
+    }
+    if let Some(prefix) = npz_name.strip_suffix(".npz") {
+        return PathBuf::from(format!("{prefix}.summary.json"));
+    }
+    npz_path.with_extension("summary.json")
+}
+
+fn load_reference_record_overrides(npz_path: &Path) -> Result<ReferenceRecordOverrides> {
+    let summary_path = reference_summary_path_for_npz(npz_path);
+    let file = File::open(&summary_path).map_err(|err| {
+        anyhow!(
+            "failed to open reference summary JSON next to NPZ {}: {} ({err})",
+            npz_path.display(),
+            summary_path.display()
+        )
+    })?;
+    let summary: ReferenceSummaryJson = serde_json::from_reader(file).map_err(|err| {
+        anyhow!(
+            "failed to parse reference summary JSON {}: {err}",
+            summary_path.display()
+        )
+    })?;
+    let contract = summary.xray_contract;
+    Ok(ReferenceRecordOverrides {
+        prompt_text: contract.rendered_prompt.clone(),
+        seed: contract.seed,
+        tokens: contract.max_tokens,
+        contract,
+    })
+}
+
 fn parse_env_f32(name: &str) -> Option<f32> {
     std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
 }
@@ -140,11 +216,27 @@ fn xray_generate_config(
     max_tokens: usize,
     seed: u64,
 ) -> Result<talu::router::GenerateConfig> {
+    xray_generate_config_with_overrides(model, max_tokens, seed, None)
+}
+
+fn xray_generate_config_with_overrides(
+    model: &str,
+    max_tokens: usize,
+    seed: u64,
+    contract_override: Option<&ReferenceContract>,
+) -> Result<talu::router::GenerateConfig> {
     let resolved_model = resolve_xray_model(model)?;
-    // Parse optional environment overrides
-    let env_temperature = parse_env_f32("TEMPERATURE");
-    let env_top_k = parse_env_usize("TOP_K");
-    let env_top_p = parse_env_f32("TOP_P");
+    // Parse optional environment overrides unless an external reference contract
+    // explicitly pins the generation config.
+    let env_temperature = contract_override
+        .map(|c| c.temperature)
+        .or_else(|| parse_env_f32("TEMPERATURE"));
+    let env_top_k = contract_override
+        .map(|c| c.top_k)
+        .or_else(|| parse_env_usize("TOP_K"));
+    let env_top_p = contract_override
+        .map(|c| c.top_p)
+        .or_else(|| parse_env_f32("TOP_P"));
 
     // Use core-owned policy to resolve effective config
     let effective = talu::model::resolve_effective_generation_config(
@@ -153,6 +245,10 @@ fn xray_generate_config(
             temperature: env_temperature,
             top_k: env_top_k,
             top_p: env_top_p,
+            min_p: contract_override.map(|c| c.min_p),
+            repetition_penalty: contract_override.map(|c| c.repetition_penalty),
+            presence_penalty: contract_override.map(|c| c.presence_penalty),
+            frequency_penalty: contract_override.map(|c| c.frequency_penalty),
             seed,
             max_tokens,
             ..Default::default()
@@ -169,7 +265,13 @@ fn xray_generate_config(
 
     Ok(talu::router::GenerateConfig {
         max_tokens: effective.max_tokens,
-        temperature: effective.temperature,
+        temperature: if contract_override
+            .is_some_and(|c| c.sampler.eq_ignore_ascii_case("greedy"))
+        {
+            0.0
+        } else {
+            effective.temperature
+        },
         top_k: effective.top_k,
         top_p: effective.top_p,
         min_p: effective.min_p,
@@ -224,6 +326,14 @@ fn display_token_index(token_idx: u32) -> u32 {
     token_idx.saturating_add(1)
 }
 
+fn display_checkpoint_token_label(token_idx: u32) -> String {
+    if token_idx == 0 {
+        "prefill".to_string()
+    } else {
+        token_idx.to_string()
+    }
+}
+
 fn display_tensor_contract_token(
     idx: usize,
     parsed: &ParsedCheckpointKey,
@@ -232,7 +342,27 @@ fn display_tensor_contract_token(
     if idx < prefill_boundary {
         0
     } else {
-        display_token_index(parsed.token)
+        parsed.token
+    }
+}
+
+fn display_tensor_contract_token_label(token: u32, inferred_prefill_token: u32) -> String {
+    if token == inferred_prefill_token {
+        "prefill".to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+fn effective_xray_tokens(tokens: u32) -> u32 {
+    if tokens == 0 { 1 } else { tokens }
+}
+
+fn effective_tensor_bundle_tokens(tokens: u32) -> u32 {
+    if tokens == 0 {
+        1
+    } else {
+        tokens.saturating_add(1)
     }
 }
 
@@ -348,12 +478,64 @@ struct TokenTranscriptComparison {
     report: String,
 }
 
-fn format_shared_prefix_block(shared_text: &str, use_ansi: bool) -> String {
-    if use_ansi && !shared_text.is_empty() {
-        format!("shared:\n\x1b[2m{shared_text}\x1b[0m")
-    } else {
-        format!("shared:\n{shared_text}")
+fn format_labeled_block(label: &str, text: &str) -> String {
+    format!("----- BEGIN {label} -----\n{text}\n----- END {label} -----")
+}
+
+fn compare_token_sequences(
+    model: &str,
+    source_label: &str,
+    target_label: &str,
+    source_tokens: &[u32],
+    target_tokens: &[u32],
+    max_tokens: usize,
+    source_text_override: Option<String>,
+    target_text_override: Option<String>,
+) -> Result<TokenTranscriptComparison> {
+    let source_clipped = &source_tokens[..source_tokens.len().min(max_tokens)];
+    let target_clipped = &target_tokens[..target_tokens.len().min(max_tokens)];
+    let source_text = source_text_override.unwrap_or_else(|| {
+        decode_token_sequence_for_report(model, source_clipped)
+            .unwrap_or_else(|| format!("<failed to decode {source_label} transcript>"))
+    });
+    let target_text = target_text_override.unwrap_or_else(|| {
+        decode_token_sequence_for_report(model, target_clipped)
+            .unwrap_or_else(|| format!("<failed to decode {target_label} transcript>"))
+    });
+
+    let first_divergence = source_clipped
+        .iter()
+        .zip(target_clipped.iter())
+        .position(|(left, right)| left != right)
+        .or_else(|| {
+            if source_clipped.len() != target_clipped.len() {
+                Some(source_clipped.len().min(target_clipped.len()))
+            } else {
+                None
+            }
+        });
+
+    if first_divergence.is_none() {
+        return Ok(TokenTranscriptComparison {
+            passed: true,
+            report: format!(
+                "token=all -> PASSED\n\n{}\n\n{}",
+                format_labeled_block(source_label, &source_text),
+                format_labeled_block(target_label, &target_text),
+            ),
+        });
     }
+
+    let divergence_idx = first_divergence.unwrap();
+    Ok(TokenTranscriptComparison {
+        passed: false,
+        report: format!(
+            "token={} -> FAILED\n\n{}\n\n{}",
+            display_token_index(divergence_idx as u32),
+            format_labeled_block(source_label, &source_text),
+            format_labeled_block(target_label, &target_text),
+        ),
+    })
 }
 
 fn compare_full_token_transcripts(
@@ -373,55 +555,24 @@ fn compare_full_token_transcripts(
             .ok_or_else(|| anyhow!("target reference path is not valid UTF-8"))?,
     )?;
 
-    let source_clipped = &source_tokens[..source_tokens.len().min(max_tokens)];
-    let target_clipped = &target_tokens[..target_tokens.len().min(max_tokens)];
-
-    let first_divergence = source_clipped
-        .iter()
-        .zip(target_clipped.iter())
-        .position(|(left, right)| left != right)
-        .or_else(|| {
-            if source_clipped.len() != target_clipped.len() {
-                Some(source_clipped.len().min(target_clipped.len()))
-            } else {
-                None
-            }
-        });
-
-    if first_divergence.is_none() {
-        return Ok(TokenTranscriptComparison {
-            passed: true,
-            report: "token=all -> PASSED\n\nverified full token transcript".to_string(),
-        });
-    }
-
-    let divergence_idx = first_divergence.unwrap();
     let source_text = load_reference_visible_text(source_json_path).unwrap_or_else(|_| {
-        decode_token_sequence_for_report(model, source_clipped)
+        decode_token_sequence_for_report(model, &source_tokens[..source_tokens.len().min(max_tokens)])
             .unwrap_or_else(|| "<failed to decode cpu transcript>".to_string())
     });
     let target_text = load_reference_visible_text(target_json_path).unwrap_or_else(|_| {
-        decode_token_sequence_for_report(model, target_clipped)
+        decode_token_sequence_for_report(model, &target_tokens[..target_tokens.len().min(max_tokens)])
             .unwrap_or_else(|| "<failed to decode metal transcript>".to_string())
     });
-    let shared_count = divergence_idx
-        .min(source_clipped.len())
-        .min(target_clipped.len());
-    let shared_text = decode_token_sequence_for_report(model, &source_clipped[..shared_count])
-        .unwrap_or_default();
-    let use_ansi =
-        std::env::var_os("TALU_XRAY_VERIFY_TTY").is_some() || std::io::stdout().is_terminal();
-
-    Ok(TokenTranscriptComparison {
-        passed: false,
-        report: format!(
-            "token={} -> FAILED\n\n{}\n\ncpu:\n{}\n\nmetal:\n{}",
-            display_token_index(divergence_idx as u32),
-            format_shared_prefix_block(&shared_text, use_ansi),
-            source_text,
-            target_text,
-        ),
-    })
+    compare_token_sequences(
+        model,
+        "cpu",
+        "metal",
+        &source_tokens,
+        &target_tokens,
+        max_tokens,
+        Some(source_text),
+        Some(target_text),
+    )
 }
 
 struct CacheRefreshLock {
@@ -637,7 +788,7 @@ fn synchronize_backend(backend: &talu::InferenceBackend) -> Result<()> {
 
 fn maybe_hard_exit_after_verify(result: Result<()>) -> Result<()> {
     if should_process_scope_backend_teardown() {
-        let _exit_code = if result.is_ok() { 0 } else { 1 };
+        let exit_code = if result.is_ok() { 0 } else { 1 };
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
         #[cfg(target_os = "macos")]
@@ -1627,6 +1778,8 @@ fn print_checkpoint_consistency_warnings(point_rows: &[PointUsageRow]) {
         "gdelta.ssm",
         "gdelta.norm",
         "gdelta.out",
+        "gdelta.state_conv",
+        "gdelta.state_ssm",
     ];
     let mut present_counts: Vec<(&str, usize)> = Vec::new();
     for p in gdelta_points {
@@ -1672,17 +1825,23 @@ fn record_reference_bundle(
     args: &XrayArgs,
     reference_backend: &str,
     capture_mode: ReferenceCaptureMode,
+    overrides: Option<&ReferenceRecordOverrides>,
 ) -> Result<()> {
     use talu::xray::{ReferenceRecorderHandle, VerifyCaptureHandle};
 
-    let prompt_text = if args.prompt.is_empty() {
-        "xray".to_string()
-    } else {
-        args.prompt.join(" ")
-    };
+    let prompt_text = overrides
+        .map(|o| o.prompt_text.clone())
+        .unwrap_or_else(|| effective_prompt_text(args));
 
     with_backend_env_override(reference_backend, || {
-        let max_tokens = args.tokens;
+        let max_tokens = match capture_mode {
+            ReferenceCaptureMode::Full => {
+                effective_tensor_bundle_tokens(overrides.map(|o| o.tokens).unwrap_or(args.tokens))
+            }
+            ReferenceCaptureMode::TranscriptOnly => {
+                effective_xray_tokens(overrides.map(|o| o.tokens).unwrap_or(args.tokens))
+            }
+        };
         let resolved_model = resolve_xray_model(model)?;
         let point_mask_override = match capture_mode {
             ReferenceCaptureMode::Full => None,
@@ -1690,12 +1849,30 @@ fn record_reference_bundle(
         };
         let _override_guard = VerifyOverrideGuard::new(false, false, point_mask_override, None);
 
-        let cfg = xray_generate_config(&resolved_model, max_tokens as usize, args.seed)?;
+        let cfg = xray_generate_config_with_overrides(
+            &resolved_model,
+            max_tokens as usize,
+            overrides.map(|o| o.seed).unwrap_or(args.seed),
+            overrides.map(|o| &o.contract),
+        )?;
         let recorder =
-            ReferenceRecorderHandle::new(&resolved_model, args.seed, cfg.temperature, max_tokens)?;
+            ReferenceRecorderHandle::new(
+                &resolved_model,
+                overrides.map(|o| o.seed).unwrap_or(args.seed),
+                cfg.temperature,
+                max_tokens,
+            )?;
         let verify_cap = VerifyCaptureHandle::new_recording(&recorder)?;
         let backend = create_backend_for_model(&resolved_model, None)?;
-        let chat = ChatHandle::new(Some(DEFAULT_SYSTEM_MESSAGE))?;
+        let mut cfg = cfg;
+        let chat = if overrides
+            .is_some_and(|o| o.contract.use_raw_prompt)
+        {
+            cfg.template_override = Some("{{ messages[-1].content }}".to_string());
+            ChatHandle::new(None)?
+        } else {
+            ChatHandle::new(Some(DEFAULT_SYSTEM_MESSAGE))?
+        };
 
         verify_cap.enable();
 
@@ -1718,6 +1895,12 @@ fn record_reference_bundle(
         reference.save(ref_path)?;
         let visible_text = latest_visible_text(&chat, true)?.unwrap_or_default();
         save_reference_visible_text(Path::new(ref_path), &visible_text)?;
+        if matches!(capture_mode, ReferenceCaptureMode::Full) {
+            trim_reference_bundle_to_requested_tokens(
+                Path::new(ref_path),
+                overrides.map(|o| o.tokens).unwrap_or(args.tokens),
+            )?;
+        }
         canonicalize_reference_bundle(Path::new(ref_path))?;
         Ok(())
     })
@@ -1901,7 +2084,8 @@ fn cmd_xray_verify(
 
     println!(
         "Verifying model {} against cached {} reference",
-        model, backend_pair.source
+        model,
+        display_verify_source(&backend_pair.source)
     );
     println!("  Tokens: {}", args.tokens);
     println!("  Seed: {}", args.seed);
@@ -2052,7 +2236,16 @@ struct Phase1ProcessResult {
 }
 
 fn should_process_scope_backend_teardown() -> bool {
-    cfg!(target_os = "macos")
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    match std::env::var("TALU_XRAY_HARD_EXIT") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
 }
 
 fn run_phase1_only_in_current_process(
@@ -2063,6 +2256,7 @@ fn run_phase1_only_in_current_process(
     reference_json_path: &str,
     args: &XrayArgs,
 ) -> Result<()> {
+    let max_tokens = effective_xray_tokens(args.tokens) as usize;
     let (diverged, divergence_msg, output_text) = run_verify_pass(
         model,
         prompt_text,
@@ -2070,7 +2264,7 @@ fn run_phase1_only_in_current_process(
         rel_tolerance,
         abs_tolerance,
         reference_json_path,
-        args.tokens as usize,
+        max_tokens,
         false,
         None,
         None,
@@ -2103,7 +2297,7 @@ fn run_phase1_only_in_current_process(
     println!("details:");
     println!(
         "  verified tokens={} seed={} rel_tolerance={} abs_tolerance={}",
-        args.tokens, args.seed, rel_tolerance, abs_tolerance
+        max_tokens, args.seed, rel_tolerance, abs_tolerance
     );
     Ok(())
 }
@@ -2120,16 +2314,17 @@ fn run_phase1_process(
 ) -> Result<Phase1ProcessResult> {
     let mut command = Command::new(exe_path);
     apply_verify_child_environment(&mut command, &backend_pair.target);
+    let source_backend = require_backend_source(&backend_pair.source)?;
     command
         .arg("xray")
         .arg(model)
         .arg("--verify")
-        .arg(format!("{}:{}", backend_pair.source, backend_pair.target))
+        .arg(format!("{}:{}", source_backend, backend_pair.target))
         .arg("--verify-phase1-only")
         .arg("--verify-reference-path")
         .arg(reference_json_path)
         .arg("--tokens")
-        .arg(args.tokens.to_string())
+        .arg(effective_xray_tokens(args.tokens).to_string())
         .arg("--seed")
         .arg(args.seed.to_string())
         .arg("--rel-tolerance")
@@ -2337,11 +2532,12 @@ fn run_phase2_localization_with_single_process_child(
         .map_err(|err| anyhow!("failed to resolve current executable for phase 2: {err}"))?;
     let mut command = Command::new(exe_path);
     apply_verify_child_environment(&mut command, &backend_pair.target);
+    let source_backend = require_backend_source(&backend_pair.source)?;
     command
         .arg("xray")
         .arg(model)
         .arg("--verify")
-        .arg(format!("{}:{}", backend_pair.source, backend_pair.target))
+        .arg(format!("{}:{}", source_backend, backend_pair.target))
         .arg("--verify-phase2-only")
         .arg("--verify-phase2-max-tokens")
         .arg(phase2_max_tokens.to_string())
@@ -2413,6 +2609,28 @@ fn normalize_backend_name(raw: &str) -> Result<String> {
     }
 }
 
+fn parse_verify_source(raw: &str) -> Result<VerifySource> {
+    if let Ok(backend) = normalize_backend_name(raw) {
+        return Ok(VerifySource::Backend(backend));
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("verify source is empty"));
+    }
+    let path = PathBuf::from(trimmed);
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("npz"))
+    {
+        return Ok(VerifySource::ExternalNpz(path));
+    }
+    Err(anyhow!(
+        "unsupported verify source '{}': expected one of cpu|metal|cuda or a .npz file path",
+        raw
+    ))
+}
+
 fn parse_verify_backend_pair(raw: &str) -> Result<VerifyBackendPair> {
     let mut parts = raw.split(':');
     let source = parts.next().ok_or_else(|| {
@@ -2434,7 +2652,7 @@ fn parse_verify_backend_pair(raw: &str) -> Result<VerifyBackendPair> {
         ));
     }
     Ok(VerifyBackendPair {
-        source: normalize_backend_name(source)?,
+        source: parse_verify_source(source)?,
         target: normalize_backend_name(target)?,
     })
 }
@@ -2469,18 +2687,48 @@ fn reference_cache_key(
     seed: u64,
     tokens: u32,
     reference_backend: &str,
+    binary_fingerprint: &str,
 ) -> String {
     // Cache contract marker:
     // - ties default verify cache to the selected reference-recording backend
     // - invalidates stale cache bundles when the canonical checkpoint contract changes
-    const CACHE_SCHEMA_VERSION: u32 = 6;
+    const CACHE_SCHEMA_VERSION: u32 = 7;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     CACHE_SCHEMA_VERSION.hash(&mut hasher);
     reference_backend.hash(&mut hasher);
+    binary_fingerprint.hash(&mut hasher);
     model.hash(&mut hasher);
     prompt.hash(&mut hasher);
     seed.hash(&mut hasher);
     tokens.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn binary_cache_fingerprint() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match std::env::current_exe() {
+        Ok(path) => {
+            path.to_string_lossy().hash(&mut hasher);
+            match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    meta.len().hash(&mut hasher);
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH) {
+                            since_epoch.as_secs().hash(&mut hasher);
+                            since_epoch.subsec_nanos().hash(&mut hasher);
+                        }
+                    }
+                }
+                Err(err) => {
+                    format!("meta_err:{err}").hash(&mut hasher);
+                }
+            }
+        }
+        Err(err) => {
+            format!("exe_err:{err}").hash(&mut hasher);
+        }
+    }
     format!("{:016x}", hasher.finish())
 }
 
@@ -2548,6 +2796,7 @@ fn refresh_reference_cache(
     args: &XrayArgs,
     reference_backend: &str,
     capture_mode: ReferenceCaptureMode,
+    overrides: Option<&ReferenceRecordOverrides>,
 ) -> Result<()> {
     // Refresh must never leave a half-written cache bundle behind. Record into a
     // temp bundle in the same directory, then replace the final bundle only
@@ -2555,17 +2804,31 @@ fn refresh_reference_cache(
     let _lock = CacheRefreshLock::acquire(reference_path)?;
     let mut temp_bundle = TempReferenceBundle::new(reference_path);
 
-    let exe_path = std::env::current_exe().map_err(|err| {
-        anyhow!("failed to resolve current executable for xray cache refresh: {err}")
-    })?;
-    run_reference_refresh_process(
-        &exe_path,
-        model,
-        temp_bundle.reference_path.as_path(),
-        args,
-        reference_backend,
-        capture_mode,
-    )?;
+    if let Some(contract_overrides) = overrides {
+        record_reference_bundle(
+            model,
+            temp_bundle
+                .reference_path
+                .to_str()
+                .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
+            args,
+            reference_backend,
+            capture_mode,
+            Some(contract_overrides),
+        )?;
+    } else {
+        let exe_path = std::env::current_exe().map_err(|err| {
+            anyhow!("failed to resolve current executable for xray cache refresh: {err}")
+        })?;
+        run_reference_refresh_process(
+            &exe_path,
+            model,
+            temp_bundle.reference_path.as_path(),
+            args,
+            reference_backend,
+            capture_mode,
+        )?;
+    }
     temp_bundle.persist(reference_path)?;
     Ok(())
 }
@@ -2646,7 +2909,14 @@ fn run_reference_record_only_in_current_process(model: &str, args: &XrayArgs) ->
     } else {
         ReferenceCaptureMode::Full
     };
-    record_reference_bundle(model, reference_path, args, reference_backend, capture_mode)
+    record_reference_bundle(
+        model,
+        reference_path,
+        args,
+        reference_backend,
+        capture_mode,
+        None,
+    )
 }
 
 fn default_dev_reference_path(
@@ -2655,17 +2925,36 @@ fn default_dev_reference_path(
     reference_backend: &str,
     capture_mode: ReferenceCaptureMode,
 ) -> Result<PathBuf> {
+    default_dev_reference_path_for_inputs(
+        model,
+        &effective_prompt_text(args),
+        args.seed,
+        args.tokens,
+        reference_backend,
+        capture_mode,
+    )
+}
+
+fn default_dev_reference_path_for_inputs(
+    model: &str,
+    prompt_text: &str,
+    seed: u64,
+    tokens: u32,
+    reference_backend: &str,
+    capture_mode: ReferenceCaptureMode,
+) -> Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow!("failed to resolve home directory for xray dev cache path"))?;
     let dir = home.join(".cache").join("talu").join("dev");
     std::fs::create_dir_all(&dir)?;
-    let prompt_text = effective_prompt_text(args);
+    let binary_fingerprint = binary_cache_fingerprint();
     let key = reference_cache_key(
         model,
-        &prompt_text,
-        args.seed,
-        args.tokens,
+        prompt_text,
+        seed,
+        tokens,
         reference_backend,
+        &binary_fingerprint,
     );
     Ok(dir.join(format!(
         "xray_{}_{}_{}_{}.json",
@@ -2685,21 +2974,44 @@ fn ensure_reference_bundle(
     reference_backend: &str,
     capture_mode: ReferenceCaptureMode,
 ) -> Result<PathBuf> {
+    ensure_reference_bundle_with_overrides(model, args, reference_backend, capture_mode, None)
+}
+
+fn ensure_reference_bundle_with_overrides(
+    model: &str,
+    args: &XrayArgs,
+    reference_backend: &str,
+    capture_mode: ReferenceCaptureMode,
+    overrides: Option<&ReferenceRecordOverrides>,
+) -> Result<PathBuf> {
+    let prompt_text_owned = overrides
+        .map(|o| o.prompt_text.clone())
+        .unwrap_or_else(|| effective_prompt_text(args));
+    let (seed, tokens) = overrides
+        .map(|o| (o.seed, o.tokens))
+        .unwrap_or((args.seed, args.tokens));
     let reference_path = if let Some(path) = &args.verify_reference_path {
         PathBuf::from(path)
     } else {
-        default_dev_reference_path(model, args, &reference_backend, capture_mode)?
+        default_dev_reference_path_for_inputs(
+            model,
+            &prompt_text_owned,
+            seed,
+            tokens,
+            &reference_backend,
+            capture_mode,
+        )?
     };
     let sidecar_path = reference_sidecar_path(&reference_path);
     let visible_text_path = reference_visible_text_path(&reference_path);
-    let refresh_cache = args.no_cache
+    let refresh_cache = !args.use_cache
         || !reference_path.exists()
         || !sidecar_path.exists()
         || !visible_text_path.exists();
     if refresh_cache {
-        if args.no_cache {
+        if !args.use_cache {
             println!(
-                "Refreshing {} reference cache (--no-cache)...",
+                "Refreshing {} reference cache (cache disabled unless --use-cache)...",
                 reference_backend
             );
         } else {
@@ -2714,6 +3026,7 @@ fn ensure_reference_bundle(
             args,
             &reference_backend,
             capture_mode,
+            overrides,
         )?;
     } else {
         ensure_reference_cache_unlocked(&reference_path, &reference_backend)?;
@@ -2727,24 +3040,39 @@ fn cmd_xray_verify_default(
     mode: VerifyCliMode,
     backend_pair: &VerifyBackendPair,
 ) -> Result<()> {
-    let source_path = ensure_reference_bundle(
-        model,
-        args,
-        &backend_pair.source,
-        match mode {
-            VerifyCliMode::Tokens => ReferenceCaptureMode::TranscriptOnly,
-            VerifyCliMode::Stats | VerifyCliMode::Full | VerifyCliMode::Tensors => {
-                ReferenceCaptureMode::Full
-            }
-        },
-    )?;
-    println!(
-        "Using cache bundle: {}",
-        reference_sidecar_path(&source_path).display()
-    );
+    if matches!(backend_pair.source, VerifySource::ExternalNpz(_))
+        && !matches!(mode, VerifyCliMode::Tensors | VerifyCliMode::Tokens)
+    {
+        return Err(anyhow!(
+            "external NPZ sources are supported only by --verify-tensors and --verify-tokens"
+        ));
+    }
+
+    let source_path = match &backend_pair.source {
+        VerifySource::Backend(source_backend) => {
+            let source = ensure_reference_bundle(
+                model,
+                args,
+                source_backend,
+                match mode {
+                    VerifyCliMode::Tokens => ReferenceCaptureMode::TranscriptOnly,
+                    VerifyCliMode::Stats | VerifyCliMode::Full | VerifyCliMode::Tensors => {
+                        ReferenceCaptureMode::Full
+                    }
+                },
+            )?;
+            println!(
+                "Using cache bundle: {}",
+                reference_sidecar_path(&source).display()
+            );
+            Some(source)
+        }
+        VerifySource::ExternalNpz(_) => None,
+    };
 
     if matches!(mode, VerifyCliMode::Full | VerifyCliMode::Tensors)
-        && backend_pair.target != backend_pair.source
+        && source_path.is_some()
+        && !matches!(&backend_pair.source, VerifySource::Backend(src) if src == &backend_pair.target)
         && !args.verify_phase1_only
         && !args.verify_phase2_only
         && args.verify_reference_path.is_none()
@@ -2765,6 +3093,8 @@ fn cmd_xray_verify_default(
         VerifyCliMode::Full => cmd_xray_verify(
             model,
             source_path
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing source reference path"))?
                 .to_str()
                 .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
             args.rel_tolerance,
@@ -2773,32 +3103,73 @@ fn cmd_xray_verify_default(
             backend_pair,
         ),
         VerifyCliMode::Tokens => {
-            let prompt_text = effective_prompt_text(args);
             println!(
                 "Verifying model {} token parity ({} -> {})",
-                model, backend_pair.source, backend_pair.target
+                model, display_verify_source(&backend_pair.source),
+                backend_pair.target
             );
-            println!("  Tokens: {}", args.tokens);
-            println!("  Seed: {}", args.seed);
             println!("  Rel tolerance: {}", args.rel_tolerance);
             println!("  Abs tolerance: {}", args.abs_tolerance);
-            println!("  Prompt: \"{}\"", prompt_text);
-            let target_path = ensure_reference_bundle(
-                model,
-                args,
-                &backend_pair.target,
-                ReferenceCaptureMode::TranscriptOnly,
-            )?;
-            println!(
-                "Using target cache bundle: {}",
-                reference_sidecar_path(&target_path).display()
-            );
-            let result = compare_full_token_transcripts(
-                model,
-                &source_path,
-                &target_path,
-                args.tokens as usize,
-            )?;
+            let result = match &backend_pair.source {
+                VerifySource::Backend(_) => {
+                    let prompt_text = effective_prompt_text(args);
+                    println!("  Tokens: {}", args.tokens);
+                    println!("  Seed: {}", args.seed);
+                    println!("  Prompt: \"{}\"", prompt_text);
+                    let target_path = ensure_reference_bundle(
+                        model,
+                        args,
+                        &backend_pair.target,
+                        ReferenceCaptureMode::TranscriptOnly,
+                    )?;
+                    println!(
+                        "Using target cache bundle: {}",
+                        reference_sidecar_path(&target_path).display()
+                    );
+                    compare_full_token_transcripts(
+                        model,
+                        source_path
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("missing source reference path"))?,
+                        &target_path,
+                        args.tokens as usize,
+                    )?
+                }
+                VerifySource::ExternalNpz(source_npz) => {
+                    let overrides = load_reference_record_overrides(source_npz)?;
+                    println!("  Tokens: {}", overrides.tokens);
+                    println!("  Seed: {}", overrides.seed);
+                    println!("  Prompt: \"{}\"", overrides.prompt_text);
+                    let target_path = ensure_reference_bundle_with_overrides(
+                        model,
+                        args,
+                        &backend_pair.target,
+                        ReferenceCaptureMode::TranscriptOnly,
+                        Some(&overrides),
+                    )?;
+                    println!(
+                        "Using target cache bundle: {}",
+                        reference_sidecar_path(&target_path).display()
+                    );
+                    println!("Using source NPZ: {}", source_npz.display());
+                    let source_tokens = load_external_npz_tokens(source_npz)?;
+                    let target_tokens = load_reference_tokens(
+                        target_path
+                            .to_str()
+                            .ok_or_else(|| anyhow!("target reference path is not valid UTF-8"))?,
+                    )?;
+                    compare_token_sequences(
+                        model,
+                        "ORIGINAL",
+                        "TARGET",
+                        &source_tokens,
+                        &target_tokens,
+                        args.tokens as usize,
+                        None,
+                        load_reference_visible_text(&target_path).ok(),
+                    )?
+                }
+            };
             if result.passed {
                 println!("{}", result.report);
                 Ok(())
@@ -2812,7 +3183,9 @@ fn cmd_xray_verify_default(
             let prompt_text = effective_prompt_text(args);
             println!(
                 "Verifying model {} stats parity ({} -> {})",
-                model, backend_pair.source, backend_pair.target
+                model,
+                display_verify_source(&backend_pair.source),
+                backend_pair.target
             );
             println!("  Tokens: {}", args.tokens);
             println!("  Seed: {}", args.seed);
@@ -2825,6 +3198,8 @@ fn cmd_xray_verify_default(
                 args.rel_tolerance,
                 args.abs_tolerance,
                 source_path
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing source reference path"))?
                     .to_str()
                     .ok_or_else(|| anyhow!("reference path is not valid UTF-8"))?,
                 args,
@@ -2833,14 +3208,71 @@ fn cmd_xray_verify_default(
             )
         }
         VerifyCliMode::Tensors => {
-            let target_path = default_dev_reference_path(
-                model,
-                args,
-                &backend_pair.target,
-                ReferenceCaptureMode::Full,
-            )?;
-            run_tensor_bundle_diff(model, args, backend_pair, &source_path, &target_path)
+            match &backend_pair.source {
+                VerifySource::Backend(_) => {
+                    let target_path = default_dev_reference_path(
+                        model,
+                        args,
+                        &backend_pair.target,
+                        ReferenceCaptureMode::Full,
+                    )?;
+                    run_tensor_bundle_diff(
+                        model,
+                        args,
+                        backend_pair,
+                        source_path
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("missing source reference path"))?,
+                        &target_path,
+                    )
+                }
+                VerifySource::ExternalNpz(source_npz) => {
+                    let overrides = load_reference_record_overrides(source_npz)?;
+                    let target_path = ensure_reference_bundle_with_overrides(
+                        model,
+                        args,
+                        &backend_pair.target,
+                        ReferenceCaptureMode::Full,
+                        Some(&overrides),
+                    )?;
+                    println!("Using source NPZ: {}", source_npz.display());
+                    println!(
+                        "Using target cache bundle: {}",
+                        reference_sidecar_path(&target_path).display()
+                    );
+                    run_tensor_bundle_diff_external_source(
+                        model,
+                        args,
+                        source_npz,
+                        &target_path,
+                        &backend_pair.target,
+                    )
+                }
+            }
         }
+    }
+}
+
+fn display_verify_source(source: &VerifySource) -> String {
+    match source {
+        VerifySource::Backend(name) => name.clone(),
+        VerifySource::ExternalNpz(path) => path.display().to_string(),
+    }
+}
+
+fn backend_pair_uses_sparse_tensor_surface(backend_pair: &VerifyBackendPair) -> bool {
+    let source_is_sparse_backend =
+        matches!(&backend_pair.source, VerifySource::Backend(name) if name == "metal");
+    source_is_sparse_backend || backend_pair.target == "metal"
+}
+
+fn require_backend_source(source: &VerifySource) -> Result<&str> {
+    match source {
+        VerifySource::Backend(name) => Ok(name.as_str()),
+        VerifySource::ExternalNpz(path) => Err(anyhow!(
+            "expected backend source, got external NPZ source: {}",
+            path.display()
+        )),
     }
 }
 
@@ -2971,31 +3403,39 @@ fn point_index_for_name(point: &str) -> Result<u8> {
         "attn.q" => 4,
         "attn.k" => 5,
         "attn.v" => 6,
-        "attn.qk" => 7,
-        "attn.weights" => 8,
-        "attn.out" => 9,
-        "layer_ffn_norm" => 10,
-        "ffn.gate" => 11,
-        "ffn.up" => 12,
-        "ffn.act" => 13,
-        "ffn.down" => 14,
-        "block.out" => 15,
-        "mamba.out" => 16,
-        "conv.in_proj" => 17,
-        "conv.conv" => 18,
-        "conv.out_proj" => 19,
-        "final_norm" => 20,
-        "lm_head" => 21,
-        "logits_scaled" => 22,
-        "logits_ready" => 23,
-        "token_select" => 24,
-        "ffn.act.map" => 25,
-        "ffn.act.mix" => 26,
-        "gdelta.in_proj" => 27,
-        "gdelta.conv" => 28,
-        "gdelta.ssm" => 29,
-        "gdelta.norm" => 30,
-        "gdelta.out" => 31,
+        "attn.q_proj_raw" => 7,
+        "attn.k_proj_raw" => 8,
+        "attn.q_norm" => 9,
+        "attn.k_norm" => 10,
+        "attn.q_rope" => 11,
+        "attn.k_rope" => 12,
+        "attn.qk" => 13,
+        "attn.weights" => 14,
+        "attn.out" => 15,
+        "layer_ffn_norm" => 16,
+        "ffn.gate" => 17,
+        "ffn.up" => 18,
+        "ffn.act" => 19,
+        "ffn.down" => 20,
+        "block.out" => 21,
+        "mamba.out" => 22,
+        "conv.in_proj" => 23,
+        "conv.conv" => 24,
+        "conv.out_proj" => 25,
+        "final_norm" => 26,
+        "lm_head" => 27,
+        "logits_scaled" => 28,
+        "logits_ready" => 29,
+        "token_select" => 30,
+        "ffn.act.map" => 31,
+        "ffn.act.mix" => 32,
+        "gdelta.in_proj" => 33,
+        "gdelta.conv" => 34,
+        "gdelta.ssm" => 35,
+        "gdelta.norm" => 36,
+        "gdelta.out" => 37,
+        "gdelta.state_conv" => 38,
+        "gdelta.state_ssm" => 39,
         _ => {
             return Err(anyhow!(
                 "unsupported checkpoint point '{}': targeted verify currently supports built-in xray points only",
@@ -3126,13 +3566,26 @@ fn is_default_phase2_point_name(point: &str) -> bool {
         "embed_tokens"
             | "layer_input"
             | "layer_attn_norm"
+            | "attn.q"
+            | "attn.k"
+            | "attn.q_proj_raw"
+            | "attn.k_proj_raw"
+            | "attn.q_norm"
+            | "attn.k_norm"
+            | "attn.q_rope"
+            | "attn.k_rope"
+            | "attn.qk"
+            | "attn.weights"
             | "attn.out"
             | "gdelta.in_proj"
             | "gdelta.conv"
             | "gdelta.ssm"
             | "gdelta.norm"
             | "gdelta.out"
+            | "gdelta.state_conv"
+            | "gdelta.state_ssm"
             | "block.out"
+            | "final_norm"
             | "lm_head"
             | "token_select"
     )
@@ -3182,6 +3635,44 @@ fn rewrite_reference_json_to_canonical(reference_path: &Path) -> Result<()> {
         filtered.push(record.clone());
     }
     *stats = filtered;
+
+    let pid = std::process::id();
+    let temp_path = temp_reference_path(reference_path, pid);
+    serde_json::to_writer(File::create(&temp_path)?, &value)?;
+    replace_file_atomically(&temp_path, reference_path)?;
+    Ok(())
+}
+
+fn trim_reference_bundle_to_requested_tokens(reference_path: &Path, requested_tokens: u32) -> Result<()> {
+    let file = File::open(reference_path)?;
+    let mut value: serde_json::Value = serde_json::from_reader(file)?;
+
+    if let Some(metadata) = value
+        .get_mut("metadata")
+        .and_then(|entry| entry.as_object_mut())
+    {
+        metadata.insert(
+            "max_tokens".to_string(),
+            serde_json::Value::from(requested_tokens as u64),
+        );
+    }
+
+    if let Some(tokens) = value.get_mut("tokens").and_then(|entry| entry.as_array_mut()) {
+        tokens.truncate(requested_tokens as usize);
+    }
+
+    let stats = value["stats"].as_array_mut().ok_or_else(|| {
+        anyhow!(
+            "reference json missing stats array: {}",
+            reference_path.display()
+        )
+    })?;
+    stats.retain(|record| {
+        let Some(token_idx) = record.get("token_idx").and_then(|entry| entry.as_u64()) else {
+            return false;
+        };
+        token_idx <= requested_tokens as u64
+    });
 
     let pid = std::process::id();
     let temp_path = temp_reference_path(reference_path, pid);
@@ -3648,7 +4139,7 @@ fn print_targeted_checkpoint_report(
 
     println!(
         "token={}, layer={}, point={}, pos={} -> {}",
-        display_token_index(result.selected.token),
+        display_checkpoint_token_label(result.selected.token),
         layer_label,
         result.selected.point,
         result.selected.position,
@@ -3688,7 +4179,7 @@ fn format_first_divergence_report(msg: &str, model: Option<&str>) -> String {
         let mut lines = vec![format!(
             "token={}, layer={}, point={}, pos={} -> FAILED",
             token
-                .map(|value| display_token_index(value).to_string())
+                .map(display_checkpoint_token_label)
                 .unwrap_or_else(|| "?".to_string()),
             layer
                 .map(|value| value.to_string())
@@ -3760,7 +4251,7 @@ fn format_first_divergence_report(msg: &str, model: Option<&str>) -> String {
         let mut lines = vec![format!(
             "token={}, layer={}, point={}, pos={} -> FAILED",
             token
-                .map(|value| display_token_index(value).to_string())
+                .map(display_checkpoint_token_label)
                 .unwrap_or_else(|| "?".to_string()),
             layer
                 .map(|value| value.to_string())
@@ -3774,7 +4265,7 @@ fn format_first_divergence_report(msg: &str, model: Option<&str>) -> String {
         lines.push("details:".to_string());
         lines.push("  kind=coverage".to_string());
         if let Some(token) = token {
-            lines.push(format!("  token={}", display_token_index(token)));
+            lines.push(format!("  token={}", display_checkpoint_token_label(token)));
         }
         if let Some(layer) = layer {
             lines.push(format!("  layer={}", layer));
@@ -3818,6 +4309,7 @@ struct TensorCheckpointFailure {
     diff: FirstCheckpointDiff,
 }
 
+#[cfg(test)]
 fn failures_for_first_logical_token(
     failures: &[TensorCheckpointFailure],
     prefill_boundary: usize,
@@ -3847,7 +4339,35 @@ fn normalize_npz_entry_key(name: &str) -> String {
     stem.to_string()
 }
 
-fn parse_npy_f32(data: &[u8]) -> Result<Vec<f32>> {
+fn parse_npy_header_shape(header: &str) -> Result<Vec<usize>> {
+    let shape_marker = "'shape':";
+    let marker_pos = header
+        .find(shape_marker)
+        .ok_or_else(|| anyhow!("npy header missing shape: {}", header))?;
+    let shape_src = &header[marker_pos + shape_marker.len()..];
+    let open = shape_src
+        .find('(')
+        .ok_or_else(|| anyhow!("npy header missing '(' in shape: {}", header))?;
+    let close = shape_src[open..]
+        .find(')')
+        .map(|idx| open + idx)
+        .ok_or_else(|| anyhow!("npy header missing ')' in shape: {}", header))?;
+    let inner = shape_src[open + 1..close].trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut dims = Vec::new();
+    for part in inner.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        dims.push(trimmed.parse::<usize>()?);
+    }
+    Ok(dims)
+}
+
+fn parse_npy_f32_and_shape(data: &[u8]) -> Result<(Vec<f32>, Vec<usize>)> {
     if data.len() < 10 || &data[0..6] != b"\x93NUMPY" {
         return Err(anyhow!("invalid npy header"));
     }
@@ -3871,6 +4391,7 @@ fn parse_npy_f32(data: &[u8]) -> Result<Vec<f32>> {
         return Err(anyhow!("truncated npy header"));
     }
     let header = std::str::from_utf8(&data[data_offset..header_end])?;
+    let shape = parse_npy_header_shape(header)?;
     if !header.contains("<f4") {
         return Err(anyhow!("unsupported npy dtype (expected <f4): {}", header));
     }
@@ -3882,6 +4403,11 @@ fn parse_npy_f32(data: &[u8]) -> Result<Vec<f32>> {
     for chunk in payload.chunks_exact(4) {
         values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
+    Ok((values, shape))
+}
+
+fn parse_npy_f32(data: &[u8]) -> Result<Vec<f32>> {
+    let (values, _shape) = parse_npy_f32_and_shape(data)?;
     Ok(values)
 }
 
@@ -3918,6 +4444,213 @@ fn load_npz_raw(path: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
         entry.read_to_end(&mut bytes)?;
         let key = normalize_npz_entry_key(&name);
         tensors.insert(key, bytes);
+    }
+    Ok(tensors)
+}
+
+fn parse_npy_u32_sequence(data: &[u8]) -> Result<Vec<u32>> {
+    if data.len() < 10 || &data[0..6] != b"\x93NUMPY" {
+        return Err(anyhow!("invalid npy header"));
+    }
+    let major = data[6];
+    let (header_len, data_offset): (usize, usize) = match major {
+        1 => (u16::from_le_bytes([data[8], data[9]]) as usize, 10),
+        2 | 3 => {
+            if data.len() < 12 {
+                return Err(anyhow!("invalid npy header length"));
+            }
+            (
+                u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize,
+                12,
+            )
+        }
+        _ => return Err(anyhow!("unsupported npy major version {}", major)),
+    };
+    let header_end = data_offset + header_len;
+    if header_end > data.len() {
+        return Err(anyhow!("truncated npy header"));
+    }
+    let header = std::str::from_utf8(&data[data_offset..header_end])?;
+    let payload = &data[header_end..];
+    if header.contains("<u4") {
+        if payload.len() % 4 != 0 {
+            return Err(anyhow!("invalid <u4 payload length"));
+        }
+        let mut out = Vec::with_capacity(payload.len() / 4);
+        for chunk in payload.chunks_exact(4) {
+            out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        return Ok(out);
+    }
+    if header.contains("<i4") {
+        if payload.len() % 4 != 0 {
+            return Err(anyhow!("invalid <i4 payload length"));
+        }
+        let mut out = Vec::with_capacity(payload.len() / 4);
+        for chunk in payload.chunks_exact(4) {
+            let v = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if v < 0 {
+                return Err(anyhow!("selected token is negative in <i4 array"));
+            }
+            out.push(v as u32);
+        }
+        return Ok(out);
+    }
+    if header.contains("<i8") {
+        if payload.len() % 8 != 0 {
+            return Err(anyhow!("invalid <i8 payload length"));
+        }
+        let mut out = Vec::with_capacity(payload.len() / 8);
+        for chunk in payload.chunks_exact(8) {
+            let v = i64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+            if v < 0 || v > u32::MAX as i64 {
+                return Err(anyhow!("selected token out of u32 range in <i8 array"));
+            }
+            out.push(v as u32);
+        }
+        return Ok(out);
+    }
+    if header.contains("<u8") {
+        if payload.len() % 8 != 0 {
+            return Err(anyhow!("invalid <u8 payload length"));
+        }
+        let mut out = Vec::with_capacity(payload.len() / 8);
+        for chunk in payload.chunks_exact(8) {
+            let v = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+            if v > u32::MAX as u64 {
+                return Err(anyhow!("selected token out of u32 range in <u8 array"));
+            }
+            out.push(v as u32);
+        }
+        return Ok(out);
+    }
+    Err(anyhow!(
+        "unsupported selected token dtype (expected <u4,<i4,<i8,<u8): {}",
+        header
+    ))
+}
+
+fn load_external_npz_tokens(path: &Path) -> Result<Vec<u32>> {
+    let file = File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut selected: Option<Vec<u32>> = None;
+    let mut logits: Option<Vec<f32>> = None;
+    let mut logits_shape: Option<Vec<usize>> = None;
+    for idx in 0..archive.len() {
+        let mut entry = archive.by_index(idx)?;
+        if !entry.name().ends_with(".npy") {
+            continue;
+        }
+        let name = normalize_npz_entry_key(entry.name());
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        if name == "selected" {
+            selected = Some(parse_npy_u32_sequence(&bytes)?);
+            continue;
+        }
+        if name == "logits" {
+            let (vals, shape) = parse_npy_f32_and_shape(&bytes)?;
+            logits = Some(vals);
+            logits_shape = Some(shape);
+        }
+    }
+    if let Some(tokens) = selected {
+        return Ok(tokens);
+    }
+    if let (Some(vals), Some(shape)) = (logits, logits_shape) {
+        if shape.len() != 2 {
+            return Err(anyhow!("logits.npy must be rank-2 [steps,vocab], got {:?}", shape));
+        }
+        let steps = shape[0];
+        let vocab = shape[1];
+        if vals.len() != steps.saturating_mul(vocab) {
+            return Err(anyhow!(
+                "logits.npy payload length mismatch: len={} shape={:?}",
+                vals.len(),
+                shape
+            ));
+        }
+        let mut out = Vec::with_capacity(steps);
+        for step in 0..steps {
+            let begin = step * vocab;
+            let end = begin + vocab;
+            let row = &vals[begin..end];
+            let mut best_idx = 0usize;
+            let mut best_val = f32::NEG_INFINITY;
+            for (i, v) in row.iter().enumerate() {
+                if *v > best_val {
+                    best_val = *v;
+                    best_idx = i;
+                }
+            }
+            out.push(best_idx as u32);
+        }
+        return Ok(out);
+    }
+    Err(anyhow!(
+        "external NPZ has neither selected.npy nor logits.npy token source: {}",
+        path.display()
+    ))
+}
+
+fn load_external_npz_checkpoints(path: &Path) -> Result<BTreeMap<String, Vec<f32>>> {
+    let file = File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut tensors: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+    let mut saw_logits = false;
+    for idx in 0..archive.len() {
+        let mut entry = archive.by_index(idx)?;
+        let name = entry.name().to_string();
+        if !name.ends_with(".npy") {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        let key = normalize_npz_entry_key(&name);
+
+        if key == "logits" {
+            let (flat, shape) = parse_npy_f32_and_shape(&bytes)?;
+            if shape.len() != 2 {
+                return Err(anyhow!(
+                    "external logits must be rank-2 [steps,vocab], got shape {:?}",
+                    shape
+                ));
+            }
+            let steps = shape[0];
+            let vocab = shape[1];
+            if flat.len() != steps.saturating_mul(vocab) {
+                return Err(anyhow!(
+                    "external logits payload size mismatch: len={} shape={:?}",
+                    flat.len(),
+                    shape
+                ));
+            }
+            for step in 0..steps {
+                let begin = step * vocab;
+                let end = begin + vocab;
+                let ck = format!("tok{}_pos0_global_0_lm_head", step);
+                tensors.insert(ck, flat[begin..end].to_vec());
+            }
+            saw_logits = true;
+            continue;
+        }
+
+        if parse_checkpoint_key(&key).is_some() {
+            tensors.insert(key, parse_npy_f32(&bytes)?);
+        }
+    }
+    if tensors.is_empty() {
+        return Err(anyhow!(
+            "external NPZ did not expose any comparable checkpoints (expected xray-style entries or logits.npy): {}",
+            path.display()
+        ));
+    }
+    if saw_logits {
+        // Explicitly keep this mode high-level by design.
     }
     Ok(tensors)
 }
@@ -4061,7 +4794,9 @@ fn run_tensor_bundle_diff(
     let target_sidecar = reference_sidecar_path(target_path);
     println!(
         "Comparing canonical tensor bundles for {} ({} -> {})",
-        model, backend_pair.source, backend_pair.target
+        model,
+        display_verify_source(&backend_pair.source),
+        backend_pair.target
     );
     println!("  Tokens: {}", args.tokens);
     println!("  Seed: {}", args.seed);
@@ -4073,6 +4808,7 @@ fn run_tensor_bundle_diff(
 
     let source_raw = load_npz_raw(&source_sidecar)?;
     let target_raw = load_npz_raw(&target_sidecar)?;
+    let allow_missing_checkpoints = backend_pair_uses_sparse_tensor_surface(backend_pair);
     let ordered = load_reference_checkpoint_order(source_path)?;
     let source_hash = file_fingerprint(&source_sidecar)?;
     let target_hash = file_fingerprint(&target_sidecar)?;
@@ -4090,18 +4826,25 @@ fn run_tensor_bundle_diff(
     let prefill_boundary = ordered
         .iter()
         .position(|parsed| parsed.point == "token_select")
-        .unwrap_or(ordered.len());
+        // Tensor bundles may not emit token_select checkpoints. In that case,
+        // treat display token indices as direct checkpoint tokens instead of
+        // collapsing everything to prefill token 0.
+        .unwrap_or(0);
+    let inferred_prefill_token = ordered.iter().map(|parsed| parsed.token).min().unwrap_or(0);
     let mut failures: Vec<TensorCheckpointFailure> = Vec::new();
+    let mut compared_checkpoint_count: usize = 0;
     for (idx, parsed) in ordered.iter().cloned().enumerate() {
         let diff = match (source_raw.get(&parsed.key), target_raw.get(&parsed.key)) {
             (Some(expected), Some(actual)) if expected == actual => None,
             (Some(expected), Some(actual)) if expected.len() != actual.len() => {
+                compared_checkpoint_count += 1;
                 Some(FirstCheckpointDiff {
                     parsed,
                     kind: FirstCheckpointDiffKind::LengthMismatch,
                 })
             }
             (Some(expected), Some(actual)) => {
+                compared_checkpoint_count += 1;
                 let expected_vals = parse_npy_f32(expected)?;
                 let actual_vals = parse_npy_f32(actual)?;
                 let expected_rms = rms(&expected_vals);
@@ -4122,10 +4865,16 @@ fn run_tensor_bundle_diff(
                     None
                 }
             }
-            (Some(_), None) | (None, Some(_)) => Some(FirstCheckpointDiff {
-                parsed,
-                kind: FirstCheckpointDiffKind::Missing,
-            }),
+            (Some(_), None) | (None, Some(_)) => {
+                if allow_missing_checkpoints {
+                    None
+                } else {
+                    Some(FirstCheckpointDiff {
+                        parsed,
+                        kind: FirstCheckpointDiffKind::Missing,
+                    })
+                }
+            }
             (None, None) => None,
         };
         if let Some(diff) = diff {
@@ -4133,102 +4882,476 @@ fn run_tensor_bundle_diff(
         }
     }
     let Some(first_failure) = failures.first().cloned() else {
+        if allow_missing_checkpoints && compared_checkpoint_count == 0 {
+            println!("✗ Verification FAILED");
+            println!(
+                "detail=sparse checkpoint surface detected but no overlapping checkpoints were emitted"
+            );
+            return Err(anyhow!(
+                "Verification failed: no overlapping checkpoints between source and target tensor bundles"
+            ));
+        }
         println!("phase=prefill, status=PASSED");
         println!("token=all, layer=all, point=all, pos=all, status=PASSED");
-        println!(
-            "detail=tensor bundles differ by raw bytes but all checkpoints matched within tolerance"
-        );
+        if allow_missing_checkpoints {
+            println!(
+                "detail=sparse checkpoint surface: compared {} overlapping checkpoints; all matched within tolerance",
+                compared_checkpoint_count
+            );
+        } else {
+            println!(
+                "detail=tensor bundles differ by raw bytes but all checkpoints matched within tolerance"
+            );
+        }
         return Ok(());
     };
     let diff_idx = first_failure.idx;
-    let same_token_failures = failures_for_first_logical_token(&failures, prefill_boundary);
+    let show_all = args.verify_tensors_all_failures;
+    let show_prev = args.verify_tensors_show_previous;
     println!("✗ Verification FAILED");
-    if diff_idx == 0 {
-        println!(
-            "token=0, layer=0, point=None, pos=0, status=UNKNOWN, detail=NO EARLIER CHECKPOINT FOUND"
-        );
-    } else {
-        let prev = &ordered[diff_idx - 1];
-        let prev_layer_label = if prev.scope == "global" {
-            "global".to_string()
+    if !show_all && !show_prev {
+        if diff_idx == 0 {
+            println!(
+                "token=prefill, layer=0, point=None, pos=0, status=UNKNOWN, detail=NO EARLIER CHECKPOINT FOUND"
+            );
         } else {
-            prev.layer_index.to_string()
-        };
-        let prev_expected_raw = source_raw
-            .get(&prev.key)
-            .ok_or_else(|| anyhow!("source tensor missing for previous key {}", prev.key))?;
-        let prev_actual_raw = target_raw
-            .get(&prev.key)
-            .ok_or_else(|| anyhow!("target tensor missing for previous key {}", prev.key))?;
-        let prev_expected = parse_npy_f32(prev_expected_raw)?;
-        let prev_actual = parse_npy_f32(prev_actual_raw)?;
-        let prev_expected_rms = rms(&prev_expected);
-        let prev_actual_rms = rms(&prev_actual);
-        let prev_abs_rms_diff = (prev_actual_rms - prev_expected_rms).abs();
-        let (prev_rel_rms, prev_max_abs) = rel_rms_and_max_abs(&prev_expected, &prev_actual);
-        println!(
-            "token={}, layer={}, point={}, pos={}, status=PASSED, metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
-            display_tensor_contract_token(diff_idx - 1, prev, prefill_boundary),
-            prev_layer_label,
-            prev.point,
-            prev.position,
-            prev_expected_rms,
-            prev_actual_rms,
-            prev_abs_rms_diff,
-            prev_rel_rms,
-            prev_max_abs
-        );
+            let prev = &ordered[diff_idx - 1];
+            let prev_layer_label = if prev.scope == "global" {
+                "global".to_string()
+            } else {
+                prev.layer_index.to_string()
+            };
+            let prev_expected_raw = source_raw
+                .get(&prev.key)
+                .ok_or_else(|| anyhow!("source tensor missing for previous key {}", prev.key))?;
+            let prev_actual_raw = target_raw
+                .get(&prev.key)
+                .ok_or_else(|| anyhow!("target tensor missing for previous key {}", prev.key))?;
+            let prev_expected = parse_npy_f32(prev_expected_raw)?;
+            let prev_actual = parse_npy_f32(prev_actual_raw)?;
+            let prev_expected_rms = rms(&prev_expected);
+            let prev_actual_rms = rms(&prev_actual);
+            let prev_abs_rms_diff = (prev_actual_rms - prev_expected_rms).abs();
+            let (prev_rel_rms, prev_max_abs) = rel_rms_and_max_abs(&prev_expected, &prev_actual);
+            println!(
+                "token={}, layer={}, point={}, pos={}, status=PASSED, metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                display_tensor_contract_token_label(
+                    display_tensor_contract_token(diff_idx - 1, prev, prefill_boundary),
+                    inferred_prefill_token
+                ),
+                prev_layer_label,
+                prev.point,
+                prev.position,
+                prev_expected_rms,
+                prev_actual_rms,
+                prev_abs_rms_diff,
+                prev_rel_rms,
+                prev_max_abs
+            );
+        }
     }
     let mut error_details: Vec<String> = Vec::new();
-    for failure in &same_token_failures {
-        let layer_label = if failure.diff.parsed.scope == "global" {
-            "global".to_string()
+    if show_all || show_prev {
+        let limit = if show_all {
+            ordered.len()
         } else {
-            failure.diff.parsed.layer_index.to_string()
+            diff_idx.saturating_add(1)
         };
-        let detail = match failure.diff.kind {
-            FirstCheckpointDiffKind::Missing => {
-                "detail=checkpoint missing from target bundle".to_string()
+        if show_all {
+            println!("detail=reporting all checkpoints (count={})", limit);
+        } else {
+            println!(
+                "detail=reporting checkpoints up to first failure (count={})",
+                limit
+            );
+        }
+        let mut failure_by_idx: Vec<Option<&TensorCheckpointFailure>> = vec![None; ordered.len()];
+        for failure in &failures {
+            if failure.idx < failure_by_idx.len() {
+                failure_by_idx[failure.idx] = Some(failure);
             }
-            FirstCheckpointDiffKind::LengthMismatch => {
-                "detail=checkpoint tensor length mismatch".to_string()
-            }
-            FirstCheckpointDiffKind::Numeric => {
-                let expected_raw = source_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
-                    anyhow!(
-                        "source tensor missing for diff key {}",
-                        failure.diff.parsed.key
+        }
+        for (idx, parsed) in ordered.iter().enumerate().take(limit) {
+            let layer_label = if parsed.scope == "global" {
+                "global".to_string()
+            } else {
+                parsed.layer_index.to_string()
+            };
+            let token_label = display_tensor_contract_token_label(
+                display_tensor_contract_token(idx, parsed, prefill_boundary),
+                inferred_prefill_token,
+            );
+            let maybe_expected = source_raw.get(&parsed.key);
+            let maybe_actual = target_raw.get(&parsed.key);
+            let status_and_detail = match (maybe_expected, maybe_actual, failure_by_idx[idx]) {
+                (Some(expected_raw), Some(actual_raw), Some(failure)) => match failure.diff.kind {
+                    FirstCheckpointDiffKind::Missing => ("FAILED".to_string(), "detail=checkpoint missing from target bundle".to_string()),
+                    FirstCheckpointDiffKind::LengthMismatch => {
+                        ("FAILED".to_string(), "detail=checkpoint tensor length mismatch".to_string())
+                    }
+                    FirstCheckpointDiffKind::Numeric => {
+                        let expected = parse_npy_f32(expected_raw)?;
+                        let actual = parse_npy_f32(actual_raw)?;
+                        let expected_rms = rms(&expected);
+                        let actual_rms = rms(&actual);
+                        let abs_rms_diff = (actual_rms - expected_rms).abs();
+                        let (rel_rms, max_abs) = rel_rms_and_max_abs(&expected, &actual);
+                        (
+                            "FAILED".to_string(),
+                            format!(
+                                "metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                                expected_rms, actual_rms, abs_rms_diff, rel_rms, max_abs
+                            ),
+                        )
+                    }
+                },
+                (Some(expected_raw), Some(actual_raw), None) => {
+                    let expected = parse_npy_f32(expected_raw)?;
+                    let actual = parse_npy_f32(actual_raw)?;
+                    let expected_rms = rms(&expected);
+                    let actual_rms = rms(&actual);
+                    let abs_rms_diff = (actual_rms - expected_rms).abs();
+                    let (rel_rms, max_abs) = rel_rms_and_max_abs(&expected, &actual);
+                    (
+                        "PASSED".to_string(),
+                        format!(
+                            "metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                            expected_rms, actual_rms, abs_rms_diff, rel_rms, max_abs
+                        ),
                     )
-                })?;
-                let actual_raw = target_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
-                    anyhow!(
-                        "target tensor missing for diff key {}",
-                        failure.diff.parsed.key
-                    )
-                })?;
-                let expected = parse_npy_f32(expected_raw)?;
-                let actual = parse_npy_f32(actual_raw)?;
-                let expected_rms = rms(&expected);
-                let actual_rms = rms(&actual);
-                let abs_rms_diff = (actual_rms - expected_rms).abs();
-                let (rel_rms, max_abs) = rel_rms_and_max_abs(&expected, &actual);
-                format!(
-                    "metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
-                    expected_rms, actual_rms, abs_rms_diff, rel_rms, max_abs
-                )
+                }
+                _ => (
+                    "FAILED".to_string(),
+                    "detail=checkpoint missing from source or target bundle".to_string(),
+                ),
+            };
+            println!(
+                "token={}, layer={}, point={}, pos={}, status={}, {}",
+                token_label,
+                layer_label,
+                parsed.point,
+                parsed.position,
+                status_and_detail.0,
+                status_and_detail.1
+            );
+            if status_and_detail.0 == "FAILED" {
+                error_details.push(status_and_detail.1);
             }
-        };
-        println!(
-            "token={}, layer={}, point={}, pos={}, status=FAILED, {}",
-            display_tensor_contract_token(failure.idx, &failure.diff.parsed, prefill_boundary),
-            layer_label,
-            failure.diff.parsed.point,
-            failure.diff.parsed.position,
-            detail
-        );
-        error_details.push(detail);
+        }
+    } else {
+        let reported_failures = vec![first_failure.clone()];
+        println!("detail=reporting first failing checkpoint (count=1)");
+        for failure in &reported_failures {
+            let layer_label = if failure.diff.parsed.scope == "global" {
+                "global".to_string()
+            } else {
+                failure.diff.parsed.layer_index.to_string()
+            };
+            let detail = match failure.diff.kind {
+                FirstCheckpointDiffKind::Missing => {
+                    "detail=checkpoint missing from target bundle".to_string()
+                }
+                FirstCheckpointDiffKind::LengthMismatch => {
+                    "detail=checkpoint tensor length mismatch".to_string()
+                }
+                FirstCheckpointDiffKind::Numeric => {
+                    let expected_raw = source_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
+                        anyhow!(
+                            "source tensor missing for diff key {}",
+                            failure.diff.parsed.key
+                        )
+                    })?;
+                    let actual_raw = target_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
+                        anyhow!(
+                            "target tensor missing for diff key {}",
+                            failure.diff.parsed.key
+                        )
+                    })?;
+                    let expected = parse_npy_f32(expected_raw)?;
+                    let actual = parse_npy_f32(actual_raw)?;
+                    let expected_rms = rms(&expected);
+                    let actual_rms = rms(&actual);
+                    let abs_rms_diff = (actual_rms - expected_rms).abs();
+                    let (rel_rms, max_abs) = rel_rms_and_max_abs(&expected, &actual);
+                    format!(
+                        "metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                        expected_rms, actual_rms, abs_rms_diff, rel_rms, max_abs
+                    )
+                }
+            };
+            println!(
+                "token={}, layer={}, point={}, pos={}, status=FAILED, {}",
+                display_tensor_contract_token_label(
+                    display_tensor_contract_token(
+                        failure.idx,
+                        &failure.diff.parsed,
+                        prefill_boundary
+                    ),
+                    inferred_prefill_token
+                ),
+                layer_label,
+                failure.diff.parsed.point,
+                failure.diff.parsed.position,
+                detail
+            );
+            error_details.push(detail);
+        }
     }
     Err(anyhow!(error_details.join("\n")))
+}
+
+fn run_tensor_bundle_diff_external_source(
+    model: &str,
+    args: &XrayArgs,
+    source_npz: &Path,
+    target_reference_path: &Path,
+    target_backend: &str,
+) -> Result<()> {
+    let overrides = load_reference_record_overrides(source_npz)?;
+    let target_sidecar = reference_sidecar_path(target_reference_path);
+    println!(
+        "Comparing canonical tensor bundles for {} ({} -> {})",
+        model,
+        source_npz.display(),
+        target_backend
+    );
+    println!("  Tokens: {}", overrides.tokens);
+    println!("  Seed: {}", overrides.seed);
+    println!("  Rel tolerance: {}", args.rel_tolerance);
+    println!("  Abs tolerance: {}", args.abs_tolerance);
+    println!("  Prompt: \"{}\"", overrides.prompt_text);
+    println!("  Source: {}", source_npz.display());
+    println!("  Target: {}", target_sidecar.display());
+
+    let source_f32 = load_external_npz_checkpoints(source_npz)?;
+    let target_f32 = load_npz_f32(&target_sidecar)?;
+
+    let mut ordered: Vec<ParsedCheckpointKey> = source_f32
+        .keys()
+        .filter_map(|key| parse_checkpoint_key(key))
+        .filter(|parsed| target_f32.contains_key(&parsed.key))
+        .collect();
+    if ordered.is_empty() {
+        return Err(anyhow!(
+            "no overlapping checkpoints between source NPZ and target xray sidecar"
+        ));
+    }
+    ordered.sort_by(|a, b| {
+        let scope_rank = |scope: &str| -> u8 {
+            match scope {
+                "layer" => 0u8,
+                "global" => 1u8,
+                _ => 2u8,
+            }
+        };
+        (
+            a.token,
+            scope_rank(&a.scope),
+            a.position,
+            a.layer_index,
+            a.point.as_str(),
+            a.key.as_str(),
+        )
+            .cmp(&(
+                b.token,
+                scope_rank(&b.scope),
+                b.position,
+                b.layer_index,
+                b.point.as_str(),
+                b.key.as_str(),
+            ))
+    });
+
+    let prefill_boundary = ordered
+        .iter()
+        .position(|parsed| parsed.point == "token_select")
+        .unwrap_or(0);
+    let inferred_prefill_token = ordered.iter().map(|parsed| parsed.token).min().unwrap_or(0);
+    let mut failures: Vec<TensorCheckpointFailure> = Vec::new();
+    for (idx, parsed) in ordered.iter().cloned().enumerate() {
+        let expected = source_f32
+            .get(&parsed.key)
+            .ok_or_else(|| anyhow!("source checkpoint missing after ordering: {}", parsed.key))?;
+        let actual = target_f32
+            .get(&parsed.key)
+            .ok_or_else(|| anyhow!("target checkpoint missing after ordering: {}", parsed.key))?;
+        if expected.len() != actual.len() {
+            failures.push(TensorCheckpointFailure {
+                idx,
+                diff: FirstCheckpointDiff {
+                    parsed,
+                    kind: FirstCheckpointDiffKind::LengthMismatch,
+                },
+            });
+            continue;
+        }
+        let expected_rms = rms(expected);
+        let actual_rms = rms(actual);
+        let abs_rms_diff = (actual_rms - expected_rms).abs();
+        let (rel_rms, _max_abs) = rel_rms_and_max_abs(expected, actual);
+        if exceeds_numeric_tolerance(rel_rms, abs_rms_diff, args.rel_tolerance, args.abs_tolerance)
+        {
+            failures.push(TensorCheckpointFailure {
+                idx,
+                diff: FirstCheckpointDiff {
+                    parsed,
+                    kind: FirstCheckpointDiffKind::Numeric,
+                },
+            });
+        }
+    }
+
+    let Some(first_failure) = failures.first().cloned() else {
+        println!("phase=prefill, status=PASSED");
+        println!("token=all, layer=all, point=all, pos=all, status=PASSED");
+        println!(
+            "detail=all overlapping checkpoints matched within tolerance (overlap={})",
+            ordered.len()
+        );
+        return Ok(());
+    };
+
+    let diff_idx = first_failure.idx;
+    let show_all = args.verify_tensors_all_failures;
+    let show_prev = args.verify_tensors_show_previous;
+    println!("✗ Verification FAILED");
+    if !show_all && !show_prev {
+        if diff_idx == 0 {
+            println!(
+                "token=prefill, layer=0, point=None, pos=0, status=UNKNOWN, detail=NO EARLIER CHECKPOINT FOUND"
+            );
+        } else {
+            let prev = &ordered[diff_idx - 1];
+            let prev_layer_label = if prev.scope == "global" {
+                "global".to_string()
+            } else {
+                prev.layer_index.to_string()
+            };
+            let prev_expected = source_f32
+                .get(&prev.key)
+                .ok_or_else(|| anyhow!("source tensor missing for previous key {}", prev.key))?;
+            let prev_actual = target_f32
+                .get(&prev.key)
+                .ok_or_else(|| anyhow!("target tensor missing for previous key {}", prev.key))?;
+            let prev_expected_rms = rms(prev_expected);
+            let prev_actual_rms = rms(prev_actual);
+            let prev_abs_rms_diff = (prev_actual_rms - prev_expected_rms).abs();
+            let (prev_rel_rms, prev_max_abs) = rel_rms_and_max_abs(prev_expected, prev_actual);
+            println!(
+                "token={}, layer={}, point={}, pos={}, status=PASSED, metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                display_tensor_contract_token_label(
+                    display_tensor_contract_token(diff_idx - 1, prev, prefill_boundary),
+                    inferred_prefill_token
+                ),
+                prev_layer_label,
+                prev.point,
+                prev.position,
+                prev_expected_rms,
+                prev_actual_rms,
+                prev_abs_rms_diff,
+                prev_rel_rms,
+                prev_max_abs
+            );
+        }
+    }
+
+    if show_all || show_prev {
+        let limit = if show_all {
+            ordered.len()
+        } else {
+            diff_idx.saturating_add(1)
+        };
+        if show_all {
+            println!("detail=reporting all checkpoints (count={})", limit);
+        } else {
+            println!(
+                "detail=reporting checkpoints up to first failure (count={})",
+                limit
+            );
+        }
+        let mut failure_by_idx: Vec<Option<&TensorCheckpointFailure>> = vec![None; ordered.len()];
+        for failure in &failures {
+            if failure.idx < failure_by_idx.len() {
+                failure_by_idx[failure.idx] = Some(failure);
+            }
+        }
+        for (idx, parsed) in ordered.iter().enumerate().take(limit) {
+            let layer_label = if parsed.scope == "global" {
+                "global".to_string()
+            } else {
+                parsed.layer_index.to_string()
+            };
+            let token_label = display_tensor_contract_token_label(
+                display_tensor_contract_token(idx, parsed, prefill_boundary),
+                inferred_prefill_token,
+            );
+            let expected = source_f32
+                .get(&parsed.key)
+                .ok_or_else(|| anyhow!("source tensor missing for key {}", parsed.key))?;
+            let actual = target_f32
+                .get(&parsed.key)
+                .ok_or_else(|| anyhow!("target tensor missing for key {}", parsed.key))?;
+            let expected_rms = rms(expected);
+            let actual_rms = rms(actual);
+            let abs_rms_diff = (actual_rms - expected_rms).abs();
+            let (rel_rms, max_abs) = rel_rms_and_max_abs(expected, actual);
+            let status = if failure_by_idx[idx].is_some() {
+                "FAILED"
+            } else {
+                "PASSED"
+            };
+            println!(
+                "token={}, layer={}, point={}, pos={}, status={}, metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+                token_label,
+                layer_label,
+                parsed.point,
+                parsed.position,
+                status,
+                expected_rms,
+                actual_rms,
+                abs_rms_diff,
+                rel_rms,
+                max_abs
+            );
+        }
+    } else {
+        let parsed = first_failure.diff.parsed;
+        let expected = source_f32
+            .get(&parsed.key)
+            .ok_or_else(|| anyhow!("source tensor missing for failing key {}", parsed.key))?;
+        let actual = target_f32
+            .get(&parsed.key)
+            .ok_or_else(|| anyhow!("target tensor missing for failing key {}", parsed.key))?;
+        let expected_rms = rms(expected);
+        let actual_rms = rms(actual);
+        let abs_rms_diff = (actual_rms - expected_rms).abs();
+        let (rel_rms, max_abs) = rel_rms_and_max_abs(expected, actual);
+        let layer_label = if parsed.scope == "global" {
+            "global".to_string()
+        } else {
+            parsed.layer_index.to_string()
+        };
+        let token_label = display_tensor_contract_token_label(
+            display_tensor_contract_token(diff_idx, &parsed, prefill_boundary),
+            inferred_prefill_token,
+        );
+        println!(
+            "token={}, layer={}, point={}, pos={}, status=FAILED, metric=rms expected={:.9} actual={:.9} abs_diff={:.9} rel_diff={:.9} metric=max_abs_diff value={:.9}",
+            token_label,
+            layer_label,
+            parsed.point,
+            parsed.position,
+            expected_rms,
+            actual_rms,
+            abs_rms_diff,
+            rel_rms,
+            max_abs
+        );
+    }
+
+    Err(anyhow!(
+        "Verification failed: numeric divergence detected for overlapping checkpoints"
+    ))
 }
 
 fn print_targeted_checkpoint_hint(model: &str, prompt_text: &str, parsed: &ParsedCheckpointKey) {
@@ -4260,11 +5383,12 @@ mod tests {
         write_filtered_reference_json, write_phase2_reference_json, FirstCheckpointDiff,
         FirstCheckpointDiffKind, ParsedCheckpointKey, ReferenceCaptureMode, TempReferenceBundle,
         TensorCheckpointFailure, VerifyBackendPair, VerifyCheckpointTarget, VerifyLayerTarget,
+        VerifySource, backend_pair_uses_sparse_tensor_surface,
     };
     use crate::cli::XrayArgs;
     use std::collections::BTreeMap;
     use std::io::Write;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use zip::write::SimpleFileOptions;
 
     #[test]
@@ -4327,10 +5451,28 @@ mod tests {
         assert_eq!(
             parse_verify_backend_pair("cpu:metal").expect("pair should parse"),
             VerifyBackendPair {
-                source: "cpu".to_string(),
+                source: VerifySource::Backend("cpu".to_string()),
                 target: "metal".to_string(),
             }
         );
+        assert_eq!(
+            parse_verify_backend_pair("metal:cpu").expect("pair should parse"),
+            VerifyBackendPair {
+                source: VerifySource::Backend("metal".to_string()),
+                target: "cpu".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn backend_pair_uses_sparse_tensor_surface_detects_metal() {
+        let cpu_to_metal =
+            parse_verify_backend_pair("cpu:metal").expect("pair should parse");
+        assert!(backend_pair_uses_sparse_tensor_surface(&cpu_to_metal));
+
+        let metal_to_cpu =
+            parse_verify_backend_pair("metal:cpu").expect("pair should parse");
+        assert!(backend_pair_uses_sparse_tensor_surface(&metal_to_cpu));
     }
 
     #[test]
@@ -4338,6 +5480,20 @@ mod tests {
         assert!(parse_verify_backend_pair("cpu").is_err());
         assert!(parse_verify_backend_pair("cpu:metal:cuda").is_err());
         assert!(parse_verify_backend_pair("cpu:auto").is_err());
+        assert!(parse_verify_backend_pair("cpu:metal2").is_err());
+    }
+
+    #[test]
+    fn parse_verify_backend_pair_accepts_external_npz_source() {
+        let parsed = parse_verify_backend_pair("/tmp/reference.lm_head.npz:cpu")
+            .expect("external npz source should parse");
+        assert_eq!(
+            parsed,
+            VerifyBackendPair {
+                source: VerifySource::ExternalNpz(PathBuf::from("/tmp/reference.lm_head.npz")),
+                target: "cpu".to_string(),
+            }
+        );
     }
 
     // Note: Generation config policy tests were removed because policy is now
@@ -4587,6 +5743,13 @@ mod tests {
                     {
                         "token_idx": 0,
                         "layer": 65535,
+                        "point": "final_norm",
+                        "position": 16,
+                        "stats": { "count": 1, "min": 1.5, "max": 1.5, "sum": 1.5, "sum_sq": 2.25, "nan_count": 0, "inf_count": 0 }
+                    },
+                    {
+                        "token_idx": 0,
+                        "layer": 65535,
                         "point": "token_select",
                         "position": 0,
                         "stats": { "count": 1, "min": 2.0, "max": 2.0, "sum": 2.0, "sum_sq": 4.0, "nan_count": 0, "inf_count": 0 }
@@ -4618,6 +5781,7 @@ mod tests {
                 ("9_tok0_pos16_global_0_logits_ready.npy", vec![9.0f32]),
                 ("0_tok0_pos16_global_0_embed_tokens.npy", vec![0.25f32]),
                 ("8_tok1_pos1_global_0_embed_tokens.npy", vec![0.75f32]),
+                ("4_tok0_pos16_global_0_final_norm.npy", vec![1.5f32]),
                 ("3_tok0_pos0_global_0_token_select.npy", vec![2.0f32]),
                 ("1_tok0_pos16_layer_0_layer_attn_norm.npy", vec![1.0f32]),
                 ("2_tok0_pos16_layer_0_layer_input.npy", vec![0.5f32]),
@@ -4635,11 +5799,12 @@ mod tests {
             serde_json::from_reader(std::fs::File::open(&reference_path).expect("open json"))
                 .expect("parse json");
         let stats = rewritten_json["stats"].as_array().expect("stats array");
-        assert_eq!(stats.len(), 4);
+        assert_eq!(stats.len(), 5);
         assert_eq!(stats[0]["point"].as_str(), Some("embed_tokens"));
         assert_eq!(stats[1]["point"].as_str(), Some("layer_input"));
         assert_eq!(stats[2]["point"].as_str(), Some("layer_attn_norm"));
-        assert_eq!(stats[3]["point"].as_str(), Some("token_select"));
+        assert_eq!(stats[3]["point"].as_str(), Some("final_norm"));
+        assert_eq!(stats[4]["point"].as_str(), Some("token_select"));
 
         let file = std::fs::File::open(&npz_path).expect("open npz");
         let mut archive = zip::ZipArchive::new(file).expect("zip archive");
@@ -4653,7 +5818,8 @@ mod tests {
                 "0_tok0_pos16_global_0_embed_tokens.npy".to_string(),
                 "1_tok0_pos16_layer_0_layer_input.npy".to_string(),
                 "2_tok0_pos16_layer_0_layer_attn_norm.npy".to_string(),
-                "3_tok0_pos0_global_0_token_select.npy".to_string(),
+                "3_tok0_pos16_global_0_final_norm.npy".to_string(),
+                "4_tok0_pos0_global_0_token_select.npy".to_string(),
             ]
         );
     }
@@ -4853,37 +6019,95 @@ mod tests {
         let result = compare_full_token_transcripts("Qwen/Qwen3.5-0.8B-GAF4", &source, &target, 2)
             .expect("compare should succeed");
         assert!(!result.passed);
-        assert!(result.report.contains("shared:"));
-        assert!(result.report.contains("cpu:"));
-        assert!(result.report.contains("metal:"));
+        assert!(result.report.contains("----- BEGIN cpu -----"));
+        assert!(result.report.contains("----- END cpu -----"));
+        assert!(result.report.contains("----- BEGIN metal -----"));
+        assert!(result.report.contains("----- END metal -----"));
         assert!(result.report.contains("token=2 -> FAILED"));
     }
 
     #[test]
     fn reference_cache_key_changes_when_prompt_changes() {
-        let a = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "cpu");
-        let b = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a poem", 42, 100, "cpu");
+        let a = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
+        let b = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a poem",
+            42,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
         assert_ne!(a, b);
     }
 
     #[test]
     fn reference_cache_key_changes_when_seed_changes() {
-        let a = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "cpu");
-        let b = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 43, 100, "cpu");
+        let a = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
+        let b = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            43,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
         assert_ne!(a, b);
     }
 
     #[test]
     fn reference_cache_key_changes_when_reference_backend_changes() {
-        let cpu = reference_cache_key("Qwen/Qwen3.5-0.8B-GAF4", "tell me a story", 42, 100, "cpu");
+        let cpu = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
         let metal = reference_cache_key(
             "Qwen/Qwen3.5-0.8B-GAF4",
             "tell me a story",
             42,
             100,
             "metal",
+            "bin_fp_a",
         );
         assert_ne!(cpu, metal);
+    }
+
+    #[test]
+    fn reference_cache_key_changes_when_binary_changes() {
+        let a = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "cpu",
+            "bin_fp_a",
+        );
+        let b = reference_cache_key(
+            "Qwen/Qwen3.5-0.8B-GAF4",
+            "tell me a story",
+            42,
+            100,
+            "cpu",
+            "bin_fp_b",
+        );
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -4908,7 +6132,9 @@ mod tests {
             verify_tokens: None,
             verify_stats: None,
             verify_tensors: None,
-            no_cache: false,
+            verify_tensors_all_failures: false,
+            verify_tensors_show_previous: false,
+            use_cache: false,
             verify_checkpoint: None,
             verify_checkpoint_stats_only: false,
             verify_phase1_only: false,

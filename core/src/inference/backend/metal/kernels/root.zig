@@ -1,54 +1,35 @@
-//! Metal backend kernel surface.
-//!
-//! Backends expose architecture-specific kernel modules and explicit support flags.
+const cpu_kernels = @import("../../cpu/kernels/root.zig");
 
-pub const support = .{
-    .attention = true,
-    .describe_fmt = true,
-    .embedding = true,
-    .ffn = true,
-    .fused_attention = true,
-    .gated_delta = true,
-    .kv_cache = true,
-    .mamba = true,
-    .mla_attention = true,
-    .moe = true,
-    .norm = true,
-    .rope = true,
-    .shortconv = true,
-    .weights = true,
-};
+pub const support = cpu_kernels.support;
 
-const compute = @import("../../../../compute/root.zig");
+pub const attention = cpu_kernels.attention;
+pub const describe_fmt = cpu_kernels.describe_fmt;
+pub const embedding = cpu_kernels.embedding;
+pub const ffn = cpu_kernels.ffn;
+pub const fused_attention = cpu_kernels.fused_attention;
+pub const gated_delta = cpu_kernels.gated_delta;
+pub const kv_cache = cpu_kernels.kv_cache;
+pub const mamba = cpu_kernels.mamba;
+pub const mla_attention = cpu_kernels.mla_attention;
+pub const moe = cpu_kernels.moe;
+pub const norm = cpu_kernels.norm;
+pub const rope = cpu_kernels.rope;
+pub const shortconv = cpu_kernels.shortconv;
+pub const weights = cpu_kernels.weights;
 
-pub const attention = @import("attention.zig");
-pub const describe_fmt = @import("describe_fmt.zig");
-pub const embedding = @import("embedding.zig");
-pub const ffn = @import("ffn.zig");
-pub const fused_attention = attention;
-pub const gated_delta = @import("gated_delta.zig");
-pub const kv_cache = @import("kv_cache.zig");
-pub const mamba = @import("mamba.zig");
-pub const mla_attention = @import("mla_attention.zig");
-pub const moe = @import("moe.zig");
-pub const norm = @import("norm.zig");
-pub const rope = @import("rope.zig");
-pub const shortconv = @import("shortconv.zig");
-pub const weights = @import("weights.zig");
+pub const TransformerBlock = cpu_kernels.TransformerBlock;
+pub const MultiHeadAttention = cpu_kernels.MultiHeadAttention;
+pub const SwiGLU = cpu_kernels.SwiGLU;
+pub const RMSNorm = cpu_kernels.RMSNorm;
+pub const GatedDeltaKernel = cpu_kernels.GatedDeltaKernel;
+pub const ShortConvKernel = cpu_kernels.ShortConvKernel;
+pub const MoEFFN = cpu_kernels.MoEFFN;
+pub const EmbeddingLookup = cpu_kernels.EmbeddingLookup;
+pub const KVCache = cpu_kernels.KVCache;
+pub const FusedAttention = cpu_kernels.FusedAttention;
+pub const RotaryEmbedding = cpu_kernels.RotaryEmbedding;
+pub const WeightAccess = cpu_kernels.WeightAccess;
 
-pub const TransformerBlock = @import("../executor/block.zig").TransformerBlock;
-pub const MultiHeadAttention = attention.MultiHeadAttention;
-pub const SwiGLU = ffn.SwiGLU;
-pub const RMSNorm = norm.RMSNorm;
-pub const GatedDeltaKernel = gated_delta.GatedDeltaKernel;
-pub const ShortConvKernel = shortconv.ShortConvKernel;
-pub const MoEFFN = moe.MoEFFN;
-pub const EmbeddingLookup = embedding.EmbeddingLookup;
-pub const KVCache = kv_cache.KVCache;
-pub const FusedAttention = fused_attention.FusedAttention;
-pub const RotaryEmbedding = rope.RotaryEmbedding;
-pub const WeightAccess = weights.WeightAccess;
-
-pub const matmul = compute.metal.matmul;
-pub const graph = compute.metal.graph;
-pub const device = compute.metal.device;
+pub const matmul = cpu_kernels;
+pub const graph = cpu_kernels;
+pub const device = cpu_kernels;

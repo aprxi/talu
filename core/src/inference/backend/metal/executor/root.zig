@@ -1,24 +1,19 @@
-//! Metal backend executor module root.
-//!
-//! Groups Metal execution-time orchestration helpers.
+const cpu_executor = @import("../../cpu/executor/root.zig");
 
-pub const weights = @import("weights.zig");
-pub const runtime = @import("runtime.zig");
-pub const model = @import("model.zig");
-pub const block = @import("block.zig");
-const kernels = @import("../kernels/root.zig");
+pub const weights = cpu_executor.weights;
+pub const runtime = cpu_executor.runtime;
+pub const model = cpu_executor.model;
+pub const block = cpu_executor.block;
 
-// Canonical executor aliases (kept symmetric with CPU executor root).
-pub const Model = model.Model;
-pub const Transformer = model.Model;
-pub const Block = block.TransformerBlock;
-pub const TransformerBlock = block.TransformerBlock;
-pub const BlockKind = weights.WeightHandles.LayerWeights.LayerKind;
+pub const Model = cpu_executor.Model;
+pub const Transformer = cpu_executor.Transformer;
+pub const Block = cpu_executor.Block;
+pub const TransformerBlock = cpu_executor.TransformerBlock;
+pub const BlockKind = cpu_executor.BlockKind;
 
-// Kernel/scratch aliases for cross-backend discoverability.
-pub const Attention = kernels.attention.MultiHeadAttention;
-pub const RMSNorm = kernels.norm.RMSNorm;
-pub const FFNLayer = weights.WeightHandles.LayerWeights;
-pub const AttnTemp = kernels.attention.AttnTemp;
-pub const AttnCache = kernels.attention.AttnCache;
-pub const ScratchBuffer = struct {};
+pub const Attention = cpu_executor.Attention;
+pub const RMSNorm = cpu_executor.RMSNorm;
+pub const FFNLayer = cpu_executor.FFNLayer;
+pub const AttnTemp = cpu_executor.AttnTemp;
+pub const AttnCache = cpu_executor.AttnCache;
+pub const ScratchBuffer = cpu_executor.ScratchBuffer;

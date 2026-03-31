@@ -1,3 +1,8 @@
+//! Metal backend sampling surface.
+//!
+//! Deliberately aliases CPU sampling exports for now to keep backend module
+//! contracts explicit and symmetric while behavior remains shared.
+
 const cpu_sampling = @import("../cpu/sampling.zig");
 
 pub const SamplingStrategy = cpu_sampling.SamplingStrategy;

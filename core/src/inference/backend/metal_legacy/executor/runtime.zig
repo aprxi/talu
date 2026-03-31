@@ -133,8 +133,10 @@ pub fn transformerForwardFromGPUToken(
     state_blocks: []const runtime_contract.StateBlockHandle,
     config: anytype,
     pos_offset: usize,
+    runtime_rope: ?RuntimeRoPEOverride,
 ) !ArrayHandle {
-    beginGraphBuild();
+    // Decode lookahead path keeps previous token graph alive while building the
+    // next step. Do not reset pooled forward graph state here.
     return model_executor.Model.forwardFromGPUToken(
         allocator,
         weight_handles,
@@ -142,6 +144,7 @@ pub fn transformerForwardFromGPUToken(
         state_blocks,
         config,
         pos_offset,
+        runtime_rope,
     );
 }
 
@@ -175,7 +178,7 @@ test "transformerForwardHiddenLazyWithEmbeddingOverride exposes stable callable 
 
 test "transformerForwardFromGPUToken exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(transformerForwardFromGPUToken)).@"fn";
-    try std.testing.expectEqual(@as(usize, 7), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 8), fn_info.params.len);
     const f = transformerForwardFromGPUToken;
     _ = f;
 }

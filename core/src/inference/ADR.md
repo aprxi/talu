@@ -196,16 +196,38 @@ pub const AdapterCapabilities = [256]AdapterCapability;
 CPU backend:
 1. CPU execution semantics are synchronous.
 2. CPU adapters MUST treat `TensorHandle.ptr` as CPU tensor payloads for CPU kernels.
+3. CPU shipping implementation MUST satisfy backend benchmark non-regression gates.
+4. CPU internal execution mechanism is implementation-defined.
 
 Metal backend:
-1. Metal execution MUST use graph-emit adapter semantics for layer program execution.
-2. Graph evaluation boundaries MUST be explicit at route/stage boundaries.
-3. Vision staged routes MUST honor explicit sync boundaries defined by the runtime.
+1. Metal shipping implementation MUST satisfy runtime contracts and typed failures.
+2. Metal shipping implementation MUST use one production execution route and MUST NOT contain hidden compatibility/fallback execution loops.
+3. Metal declared capabilities MUST match actual runtime behavior.
+4. Metal shipping implementation MUST satisfy backend benchmark non-regression gates.
+5. Graph evaluation boundaries MUST be explicit at route/stage boundaries.
+6. Vision staged routes MUST honor explicit sync boundaries defined by the runtime.
+7. Metal internal execution mechanism is implementation-defined.
 
 CUDA backend:
 1. CUDA execution MUST use stream-based semantics through `ExecutionContext.stream_or_queue`.
 2. A single-slot request MUST execute as batch size `1`.
 3. Batch capability validation MUST enforce any CUDA batch-size restrictions.
+4. CUDA shipping implementation MUST satisfy backend benchmark non-regression gates.
+5. CUDA internal execution mechanism is implementation-defined.
+
+## Backend Benchmark Non-Regression Contract
+1. Each backend MUST have a repository-defined benchmark suite and baseline artifacts.
+2. A backend change MUST be non-regressing against its backend baseline to be shipping-eligible.
+3. Non-regressing means:
+- prefill throughput MUST be greater than or equal to baseline.
+- decode throughput MUST be greater than or equal to baseline.
+4. Benchmark protocol inputs (model set, prompts, sampling settings, token budgets, seed policy, and command shape) MUST be versioned in repository.
+5. Baseline updates MUST be explicit and MUST include updated benchmark artifacts in the same change.
+
+## Alternate Backend Implementation Promotion
+1. Alternate backend implementations are permitted as non-default.
+2. A non-default implementation MUST NOT replace the shipping implementation until it is contract-compliant and non-regressing against the backend baseline.
+3. Once promoted, the new shipping implementation MUST become the backend baseline reference.
 
 Mixed-backend staged topologies (`cpu+gpu`, `gpu+gpu`, `cpu+gpu+gpu` roadmap):
 1. Topology capability/split validation MUST complete successfully before backend runtime initialization starts.
@@ -364,6 +386,20 @@ Every rule entry uses this REQUIRED schema:
 3. Enforcement point: `init`, `load`
 4. Typed failure mode: `error.OutOfMemory` for fit check failure; `error.InvalidTopologyConfig` for inconsistent split/device/mode settings
 5. Verification: `zig build test-inference -Drelease`
+
+### A11 Backend Non-Regression Gate
+1. Rule ID: `A11`
+2. Normative statement: shipping backend implementations MUST be non-regressing against repository baseline benchmark artifacts for prefill and decode throughput.
+3. Enforcement point: `review`, `release`
+4. Typed failure mode: gate failure for benchmark regression
+5. Verification: repository benchmark suite against versioned baseline artifacts
+
+### A12 Mechanism-Agnostic Shipping Compliance
+1. Rule ID: `A12`
+2. Normative statement: shipping compliance MUST be determined by runtime contracts, typed failures, capability truthfulness, determinism, and backend non-regression gates; a specific internal execution mechanism MUST NOT be a shipping requirement.
+3. Enforcement point: `review`
+4. Typed failure mode: gate failure for contract or benchmark non-compliance
+5. Verification: `zig build test-inference -Drelease`, deterministic parity checks, repository benchmark suite
 
 ## Validation and Change Discipline
 1. Validation gates MUST follow repository policy in `AGENTS.md` and `core/POLICY.md`.

@@ -591,9 +591,22 @@ pub(super) struct XrayArgs {
     #[arg(long, value_name = "SRC:TARGET", group = "xray_verify_mode")]
     pub verify_tensors: Option<String>,
 
-    /// Ignore cache and regenerate the source backend reference before verify
+    /// With --verify-tensors, show all failing checkpoints across all tokens
+    /// instead of only the first failing logical token.
+    ///
+    /// Alias: --verify-tensors-all-failures (deprecated)
+    #[arg(long = "show-all", alias = "verify-tensors-all-failures")]
+    pub verify_tensors_all_failures: bool,
+
+    /// With --verify-tensors, show checkpoints up to and including the first
+    /// failing checkpoint.
+    #[arg(long = "show-prev", conflicts_with = "verify_tensors_all_failures")]
+    pub verify_tensors_show_previous: bool,
+
+    /// Reuse cached reference bundles when present.
+    /// By default, xray verify regenerates references to avoid stale cache use.
     #[arg(long)]
-    pub no_cache: bool,
+    pub use_cache: bool,
 
     /// Targeted fast verify for a single checkpoint:
     /// `<token>:<layer|global>:<point>[:<pos>]`

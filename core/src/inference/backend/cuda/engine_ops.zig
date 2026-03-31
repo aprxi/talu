@@ -926,10 +926,13 @@ pub fn linearForwardRows(
             return error.CudaKernelUnavailable;
         },
         .mxfp8 => |w| {
-            // MXFP8 GEMV for small batch sizes (≤32 rows).
+            // MXFP8 GEMV for small batch sizes (≤4 rows).
             // Reads F32 input directly — no activation quantization needed.
             // Uses row-major UE8M0 scales (scales_raw_buffer).
-            if (rows <= 32) mxfp8_gemv: {
+            // At n>4 the tile-8 kernel drops to 50% occupancy; cuBLASLt
+            // tensor cores achieve better bandwidth (and its overhead is
+            // amortised to zero inside CUDA graph replay).
+            if (rows <= 4) mxfp8_gemv: {
                 if (w.scales_raw_buffer.pointer == 0 or w.scales_raw_buffer.size == 0) break :mxfp8_gemv;
                 var mxfp8_fn = self.mxfp8_matvec_function orelse break :mxfp8_gemv;
                 var mxfp8_batch_tile: u32 = 4;
@@ -2215,7 +2218,9 @@ pub fn tryFusedMxfp8GateUpSiluForward(
     expected_out_dim: u32,
 ) !bool {
     if (self.loaded.config.use_gelu) return false;
-    if (rows == 0 or rows > 32) return false;
+    // At n>4 the tile-8 GEMV drops to 50% occupancy; prefer falling through
+    // to two separate cuBLASLt calls which achieve better bandwidth.
+    if (rows == 0 or rows > 4) return false;
 
     const gate = switch (gate_weight.*) {
         .mxfp8 => |w| w,
@@ -2271,7 +2276,7 @@ pub fn tryFusedMxfp8GateUpForward(
     up_weight: *const LinearWeight,
     rows: usize,
 ) !bool {
-    if (rows == 0 or rows > 32) return false;
+    if (rows == 0 or rows > 4) return false;
 
     const gate = switch (gate_weight.*) {
         .mxfp8 => |w| w,

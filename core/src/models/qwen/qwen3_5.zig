@@ -34,7 +34,6 @@ pub const attention_mlp_program: []const layer_ops.LayerOp = &.{
         .debug_type = .multihead_attention,
         .state_block_id = types.kv_cache_state_id,
         .attention_config = .{
-            .rope_interleaved = false,
             .query_gate = true,
         },
     } },
@@ -222,13 +221,17 @@ var qwen3_5_block_variants = [_]types.BlockVariant{
         .name = "full_attention",
         .meta = .{
             .attention_config = .{
-                .rope_interleaved = false,
                 .query_gate = true,
             },
         },
         .weights = &qwen3_5_full_attention_weights,
     },
 };
+
+test "qwen3.5 attention metadata inherits rope interleaving from config" {
+    try std.testing.expect(attention_mlp_program[1].kernel.attention_config.rope_interleaved == null);
+    try std.testing.expect(qwen3_5_block_variants[1].meta.attention_config.rope_interleaved == null);
+}
 
 const qwen3_5_global_weights = [_]types.WeightSpec{
     .{

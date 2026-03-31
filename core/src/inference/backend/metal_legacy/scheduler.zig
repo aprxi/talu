@@ -1,3 +1,8 @@
+//! Metal backend scheduler surface.
+//!
+//! Deliberately aliases CPU scheduler exports for now to keep backend module
+//! contracts symmetric while scheduler policy remains shared.
+
 const cpu_scheduler = @import("../cpu/scheduler.zig");
 
 pub const RequestState = cpu_scheduler.RequestState;

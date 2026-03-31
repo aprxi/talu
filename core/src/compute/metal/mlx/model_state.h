@@ -8,6 +8,7 @@
 
 #include "compute_common.h"
 #include <cstdint>
+#include <mutex>
 
 // ============================================================================
 // KV Cache Layer - stores K/V tensors for one transformer layer.
@@ -83,9 +84,33 @@ struct StateSpaceLayer {
     int d_inner = 0;
     int d_ff = 0;
 
+    // Gated-delta decode hot-path cached resolved tensors.
+    array* gdelta_conv_kernel = nullptr;
+    array* gdelta_conv_bias_row = nullptr;
+    array* gdelta_dt_bias_row = nullptr;
+    array* gdelta_a_log_exp_row = nullptr;
+    array* gdelta_norm_weight_heads = nullptr;
+    const void* gdelta_conv_weight_handle = nullptr;
+    const void* gdelta_conv_bias_handle = nullptr;
+    const void* gdelta_dt_bias_handle = nullptr;
+    const void* gdelta_a_log_handle = nullptr;
+    const void* gdelta_norm_weight_handle = nullptr;
+    int gdelta_qkv_len = 0;
+    int gdelta_n_heads = 0;
+    int gdelta_d_head = 0;
+
+    // Compiled MLX decode function for the fused gated-delta single-token path.
+    // Signature: inputs = {x, conv_state, ssm_state},
+    //            outputs = {out, new_conv_state, new_ssm_state}.
+    // Captures static weight arrays from the most recent refresh cycle.
+    // nullptr until first decode after any weight-handle change. Invalidated
+    // when need_static_refresh or need_proj_rhs_refresh triggers.
+    std::function<std::vector<array>(const std::vector<array>&)>* gdelta_compiled_fn = nullptr;
+
 };
 
 struct MLXStateSpaceCache {
     uint64_t magic = 0;
+    std::mutex mu;
     std::vector<StateSpaceLayer> layers;
 };

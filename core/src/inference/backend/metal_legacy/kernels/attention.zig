@@ -8,12 +8,70 @@ const compute = @import("../../../../compute/root.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const weights = @import("../executor/weights.zig");
 const mlx_fused = @import("../mlx/ffi.zig");
+const log = @import("../../../../log.zig");
 
 const device_mod = compute.metal.device;
 const graph = compute.metal.graph;
 const ArrayHandle = mlx_fused.ArrayHandle;
 
 pub const Cache = runtime_graph.Cache;
+
+var dbg_attention_path_emitted: bool = false;
+
+fn dbgAttentionPathEnabled() bool {
+    const raw = std.posix.getenv("TALU_DBG_METAL_ATTN_PATH") orelse return false;
+    const value = std.mem.sliceTo(raw, 0);
+    if (value.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "off")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+    return true;
+}
+
+fn useAttentionReferencePath() bool {
+    const raw = std.posix.getenv("TALU_METAL_ATTN_REFERENCE") orelse return false;
+    const value = std.mem.sliceTo(raw, 0);
+    if (value.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "off")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+    return true;
+}
+
+fn emitAttentionPathDebug(
+    path: []const u8,
+    use_cache: bool,
+    query_gate: bool,
+    rope_interleaved: bool,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos_offset: usize,
+    runtime_rope_dim: usize,
+    query_pre_attn_scalar: f32,
+    attention_multiplier: f32,
+) void {
+    if (!dbgAttentionPathEnabled()) return;
+    if (dbg_attention_path_emitted) return;
+    dbg_attention_path_emitted = true;
+    log.debug("inference", "Metal attention fused path", .{
+        .path = path,
+        .use_cache = @as(u8, @intFromBool(use_cache)),
+        .query_gate = @as(u8, @intFromBool(query_gate)),
+        .rope_interleaved = @as(u8, @intFromBool(rope_interleaved)),
+        .n_heads = @as(u32, @intCast(@min(n_heads, @as(usize, std.math.maxInt(u32))))),
+        .n_kv_heads = @as(u32, @intCast(@min(n_kv_heads, @as(usize, std.math.maxInt(u32))))),
+        .head_dim = @as(u32, @intCast(@min(head_dim, @as(usize, std.math.maxInt(u32))))),
+        .rope_dim = @as(u32, @intCast(@min(rope_dim, @as(usize, std.math.maxInt(u32))))),
+        .pos_offset = @as(u32, @intCast(@min(pos_offset, @as(usize, std.math.maxInt(u32))))),
+        .runtime_rope_dim = @as(u32, @intCast(@min(runtime_rope_dim, @as(usize, std.math.maxInt(u32))))),
+        .query_pre_attn_scalar = query_pre_attn_scalar,
+        .attention_multiplier = attention_multiplier,
+    }, @src());
+}
 
 pub const AttnCache = struct {
     cache: ?Cache = null,
@@ -25,6 +83,16 @@ pub const AttnTemp = struct {
     runtime_rope_cos_handle: ArrayHandle = null,
     runtime_rope_sin_handle: ArrayHandle = null,
     runtime_rope_dim: usize = 0,
+    attn_q_proj_raw_trace_handle: ArrayHandle = null,
+    attn_k_proj_raw_trace_handle: ArrayHandle = null,
+    attn_q_norm_trace_handle: ArrayHandle = null,
+    attn_k_norm_trace_handle: ArrayHandle = null,
+    attn_q_rope_trace_handle: ArrayHandle = null,
+    attn_k_rope_trace_handle: ArrayHandle = null,
+    attn_qk_trace_handle: ArrayHandle = null,
+    attn_weights_trace_handle: ArrayHandle = null,
+    attn_q_trace_handle: ArrayHandle = null,
+    attn_k_trace_handle: ArrayHandle = null,
 };
 
 pub const MatmulScratch = struct {};
@@ -45,10 +113,13 @@ pub const MultiHeadAttention = struct {
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    rope_dim: usize = 0,
     rope_theta: f32,
+    rope_interleaved: bool = false,
     norm_eps: f32,
     query_pre_attn_scalar: f32 = 0.0,
     attention_multiplier: f32 = 0.0,
+    sliding_window: usize = 0,
     query_gate: bool = false,
 
     q_proj: ?QuantizedWeight = null,
@@ -88,12 +159,27 @@ pub const MultiHeadAttention = struct {
         const v_bias = if (self.v_bias) |h| h else null;
         const o_bias = if (self.o_bias) |h| h else null;
         const attn_sinks = if (self.attn_sinks) |h| h else null;
+        scratch.attn_q_proj_raw_trace_handle = null;
+        scratch.attn_k_proj_raw_trace_handle = null;
+        scratch.attn_weights_trace_handle = null;
+        scratch.attn_q_norm_trace_handle = null;
+        scratch.attn_k_norm_trace_handle = null;
+        scratch.attn_q_rope_trace_handle = null;
+        scratch.attn_k_rope_trace_handle = null;
+        scratch.attn_qk_trace_handle = null;
+        scratch.attn_q_trace_handle = null;
+        scratch.attn_k_trace_handle = null;
+
+        if (self.sliding_window > 0 and !useAttentionReferencePath()) {
+            return error.UnsupportedMetalSlidingWindowAttention;
+        }
 
         if (self.q_proj != null and self.k_proj != null and self.v_proj != null) {
             const q_proj = self.q_proj.?;
             const k_proj = self.k_proj.?;
             const v_proj = self.v_proj.?;
             if (self.o_proj) |o_proj| {
+                emitAttentionPathDebug("qkv_quantized_o_quantized", use_cache, self.query_gate, self.rope_interleaved, self.n_heads, self.n_kv_heads, self.head_dim, self.rope_dim, cache.pos_offset, scratch.runtime_rope_dim, self.query_pre_attn_scalar, self.attention_multiplier);
                 output_tensor.* = mlx_fused.mlx_lazy_fused_attention(
                     input_tensor,
                     q_proj.weights,
@@ -120,8 +206,10 @@ pub const MultiHeadAttention = struct {
                     self.n_heads,
                     self.n_kv_heads,
                     self.head_dim,
+                    self.rope_dim,
                     cache.pos_offset,
                     self.rope_theta,
+                    self.rope_interleaved,
                     scratch.runtime_rope_cos_handle,
                     scratch.runtime_rope_sin_handle,
                     scratch.runtime_rope_dim,
@@ -130,12 +218,14 @@ pub const MultiHeadAttention = struct {
                     q_proj.bits,
                     self.query_pre_attn_scalar,
                     self.attention_multiplier,
+                    self.sliding_window,
                     self.query_gate,
                 );
                 return;
             }
             const o_proj_bf16 = if (self.o_proj_bf16) |h| h else null;
             if (o_proj_bf16 == null) return error.MissingField;
+            emitAttentionPathDebug("qkv_quantized_o_dense", use_cache, self.query_gate, self.rope_interleaved, self.n_heads, self.n_kv_heads, self.head_dim, self.rope_dim, cache.pos_offset, scratch.runtime_rope_dim, self.query_pre_attn_scalar, self.attention_multiplier);
             output_tensor.* = mlx_fused.mlx_lazy_fused_attention_qkv_quantized_o_dense(
                 input_tensor,
                 q_proj.weights,
@@ -160,8 +250,10 @@ pub const MultiHeadAttention = struct {
                 self.n_heads,
                 self.n_kv_heads,
                 self.head_dim,
+                self.rope_dim,
                 cache.pos_offset,
                 self.rope_theta,
+                self.rope_interleaved,
                 scratch.runtime_rope_cos_handle,
                 scratch.runtime_rope_sin_handle,
                 scratch.runtime_rope_dim,
@@ -170,6 +262,7 @@ pub const MultiHeadAttention = struct {
                 q_proj.bits,
                 self.query_pre_attn_scalar,
                 self.attention_multiplier,
+                self.sliding_window,
                 self.query_gate,
             );
             return;
@@ -183,6 +276,53 @@ pub const MultiHeadAttention = struct {
             return error.MissingField;
         }
 
+        if (useAttentionReferencePath()) {
+            emitAttentionPathDebug("qkv_dense_reference_bf16", use_cache, self.query_gate, self.rope_interleaved, self.n_heads, self.n_kv_heads, self.head_dim, self.rope_dim, cache.pos_offset, scratch.runtime_rope_dim, self.query_pre_attn_scalar, self.attention_multiplier);
+            output_tensor.* = mlx_fused.mlx_lazy_attention_reference_bf16_capture(
+                input_tensor,
+                q_proj_bf16,
+                k_proj_bf16,
+                v_proj_bf16,
+                o_proj_bf16,
+                q_norm,
+                k_norm,
+                q_bias,
+                k_bias,
+                v_bias,
+                o_bias,
+                attn_sinks,
+                cache_handle,
+                cache.layer_idx,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                self.rope_dim,
+                cache.pos_offset,
+                self.rope_theta,
+                self.rope_interleaved,
+                scratch.runtime_rope_cos_handle,
+                scratch.runtime_rope_sin_handle,
+                scratch.runtime_rope_dim,
+                self.norm_eps,
+                self.query_pre_attn_scalar,
+                self.attention_multiplier,
+                self.sliding_window,
+                self.query_gate,
+                &scratch.attn_q_proj_raw_trace_handle,
+                &scratch.attn_k_proj_raw_trace_handle,
+                &scratch.attn_q_norm_trace_handle,
+                &scratch.attn_k_norm_trace_handle,
+                &scratch.attn_q_rope_trace_handle,
+                &scratch.attn_k_rope_trace_handle,
+                &scratch.attn_qk_trace_handle,
+                &scratch.attn_weights_trace_handle,
+                &scratch.attn_q_trace_handle,
+                &scratch.attn_k_trace_handle,
+            );
+            return;
+        }
+
+        emitAttentionPathDebug("qkv_dense_o_dense_bf16", use_cache, self.query_gate, self.rope_interleaved, self.n_heads, self.n_kv_heads, self.head_dim, self.rope_dim, cache.pos_offset, scratch.runtime_rope_dim, self.query_pre_attn_scalar, self.attention_multiplier);
         output_tensor.* = mlx_fused.mlx_lazy_fused_attention_bf16(
             input_tensor,
             q_proj_bf16,
@@ -201,14 +341,17 @@ pub const MultiHeadAttention = struct {
             self.n_heads,
             self.n_kv_heads,
             self.head_dim,
+            self.rope_dim,
             cache.pos_offset,
             self.rope_theta,
+            self.rope_interleaved,
             scratch.runtime_rope_cos_handle,
             scratch.runtime_rope_sin_handle,
             scratch.runtime_rope_dim,
             self.norm_eps,
             self.query_pre_attn_scalar,
             self.attention_multiplier,
+            self.sliding_window,
             self.query_gate,
         );
     }

@@ -596,6 +596,9 @@ pub extern fn mlx_array_to_uint32(
 /// Use to avoid CPU roundtrip during sampling
 pub extern fn mlx_lazy_argmax(handle: ArrayHandle, axis: c_int) ArrayHandle;
 
+/// GPU-side argmax that returns a heap-owned handle safe across pool resets.
+pub extern fn mlx_lazy_argmax_owned(handle: ArrayHandle, axis: c_int) ArrayHandle;
+
 /// GPU-side argpartition - returns partitioned indices along the axis.
 pub extern fn mlx_lazy_argpartition(handle: ArrayHandle, kth: c_int, axis: c_int) ArrayHandle;
 

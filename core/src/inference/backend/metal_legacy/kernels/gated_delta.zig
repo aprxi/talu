@@ -5,6 +5,7 @@ pub const supported = true;
 const weights = @import("../executor/weights.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const mlx_fused = @import("../mlx/ffi.zig");
+const reference = @import("gated_delta_reference.zig");
 
 const ArrayHandle = mlx_fused.ArrayHandle;
 
@@ -19,6 +20,8 @@ pub const GatedDeltaState = struct {
     capture_conv: ArrayHandle = null,
     capture_ssm: ArrayHandle = null,
     capture_norm: ArrayHandle = null,
+    capture_state_conv: ArrayHandle = null,
+    capture_state_ssm: ArrayHandle = null,
 };
 
 pub const GatedDeltaScratch = struct {};
@@ -61,6 +64,7 @@ pub const GatedDeltaKernel = struct {
         _ = matmul_scratch;
 
         const cache_handle = if (state.cache) |cache| cache.handle else null;
+        const use_reference_path = reference.enabled();
         const has_quantized_core = self.in_proj != null and self.out_proj != null;
         const has_dense_core = self.in_proj_bf16 != null and self.out_proj_bf16 != null;
         if (has_quantized_core == has_dense_core) return error.InvalidTensorType;
@@ -71,6 +75,8 @@ pub const GatedDeltaKernel = struct {
         state.capture_conv = null;
         state.capture_ssm = null;
         state.capture_norm = null;
+        state.capture_state_conv = null;
+        state.capture_state_ssm = null;
 
         if (has_quantized_core) {
             const in_proj = self.in_proj.?;
@@ -78,7 +84,46 @@ pub const GatedDeltaKernel = struct {
             if (in_proj.group_size != out_proj.group_size or in_proj.bits != out_proj.bits) {
                 return error.InvalidTensorType;
             }
-            if (state.capture_enabled) {
+            if (use_reference_path) {
+                var cap_in_proj: ArrayHandle = null;
+                var cap_conv: ArrayHandle = null;
+                var cap_ssm: ArrayHandle = null;
+                var cap_norm: ArrayHandle = null;
+                var cap_state_conv: ArrayHandle = null;
+                var cap_state_ssm: ArrayHandle = null;
+                reference.forwardQuantized(
+                    input_tensor,
+                    output_tensor,
+                    in_proj.weights,
+                    in_proj.scales,
+                    in_proj.biases,
+                    self.conv_weight,
+                    self.conv_bias,
+                    self.a_log,
+                    self.dt_bias,
+                    self.norm_weight,
+                    out_proj.weights,
+                    out_proj.scales,
+                    out_proj.biases,
+                    in_proj.group_size,
+                    in_proj.bits,
+                    cache_handle,
+                    state.layer_idx,
+                    self.d_conv,
+                    self.n_heads,
+                    self.n_key_heads,
+                    self.d_head,
+                    state.capture_enabled,
+                    .{
+                        .in_proj = if (state.capture_enabled) &state.capture_in_proj else &cap_in_proj,
+                        .conv = if (state.capture_enabled) &state.capture_conv else &cap_conv,
+                        .ssm = if (state.capture_enabled) &state.capture_ssm else &cap_ssm,
+                        .norm = if (state.capture_enabled) &state.capture_norm else &cap_norm,
+                        .state_conv = if (state.capture_enabled) &state.capture_state_conv else &cap_state_conv,
+                        .state_ssm = if (state.capture_enabled) &state.capture_state_ssm else &cap_state_ssm,
+                    },
+                );
+            } else if (state.capture_enabled) {
                 output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_quantized_capture(
                     input_tensor,
                     in_proj.weights,
@@ -104,6 +149,8 @@ pub const GatedDeltaKernel = struct {
                     &state.capture_conv,
                     &state.capture_ssm,
                     &state.capture_norm,
+                    &state.capture_state_conv,
+                    &state.capture_state_ssm,
                 );
             } else {
                 output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_quantized(
@@ -132,7 +179,40 @@ pub const GatedDeltaKernel = struct {
             return;
         }
 
-        if (state.capture_enabled) {
+        if (use_reference_path) {
+            var cap_in_proj: ArrayHandle = null;
+            var cap_conv: ArrayHandle = null;
+            var cap_ssm: ArrayHandle = null;
+            var cap_norm: ArrayHandle = null;
+            var cap_state_conv: ArrayHandle = null;
+            var cap_state_ssm: ArrayHandle = null;
+            reference.forwardBf16(
+                input_tensor,
+                output_tensor,
+                self.in_proj_bf16.?,
+                self.conv_weight,
+                self.conv_bias,
+                self.a_log,
+                self.dt_bias,
+                self.norm_weight,
+                self.out_proj_bf16.?,
+                cache_handle,
+                state.layer_idx,
+                self.d_conv,
+                self.n_heads,
+                self.n_key_heads,
+                self.d_head,
+                state.capture_enabled,
+                .{
+                    .in_proj = if (state.capture_enabled) &state.capture_in_proj else &cap_in_proj,
+                    .conv = if (state.capture_enabled) &state.capture_conv else &cap_conv,
+                    .ssm = if (state.capture_enabled) &state.capture_ssm else &cap_ssm,
+                    .norm = if (state.capture_enabled) &state.capture_norm else &cap_norm,
+                    .state_conv = if (state.capture_enabled) &state.capture_state_conv else &cap_state_conv,
+                    .state_ssm = if (state.capture_enabled) &state.capture_state_ssm else &cap_state_ssm,
+                },
+            );
+        } else if (state.capture_enabled) {
             output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_bf16_capture(
                 input_tensor,
                 self.in_proj_bf16.?,
@@ -152,6 +232,8 @@ pub const GatedDeltaKernel = struct {
                 &state.capture_conv,
                 &state.capture_ssm,
                 &state.capture_norm,
+                &state.capture_state_conv,
+                &state.capture_state_ssm,
             );
         } else {
             output_tensor.* = mlx_fused.mlx_lazy_gated_delta_mixer_bf16(

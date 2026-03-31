@@ -46,6 +46,7 @@ fn matmulWork(rows: usize, k: usize, n: usize, weight: *const Tensor) trace.Work
 const SsmParallelCtx = struct {
     proj_buf: []f32,
     ssm_buf: []f32,
+    ssm_pre_norm_buf: ?[]f32,
     kv_mem: []f32,
     ssm_state: []f32,
     A_log: []const f32,
@@ -103,6 +104,10 @@ fn ssmHeadTask(start: usize, end: usize, ctx: *SsmParallelCtx) void {
                 dt_bias_val,
                 ctx.d_head,
             );
+            if (ctx.ssm_pre_norm_buf) |pre_norm_buf| {
+                const pre_norm_head = pre_norm_buf[t * ctx.d_inner + head_idx * ctx.d_head ..][0..ctx.d_head];
+                @memcpy(pre_norm_head, out_head);
+            }
 
             const z_head = proj_t[ctx.qkv_len + head_idx * ctx.d_head ..][0..ctx.d_head];
             cpu_gated_delta.applyGatedRmsNormInPlace(out_head, z_head, norm_head) catch unreachable;
@@ -415,6 +420,16 @@ pub const GatedDeltaKernel = struct {
             defer scratch.allocator.free(proj_buf);
             const ssm_buf = try scratch.allocator.alloc(f32, seq_len * d_inner);
             defer scratch.allocator.free(ssm_buf);
+            const conv_trace_buf: ?[]f32 = if (trace_enabled)
+                try scratch.allocator.alloc(f32, seq_len * qkv_len)
+            else
+                null;
+            defer if (conv_trace_buf) |buf| scratch.allocator.free(buf);
+            const ssm_pre_norm_buf: ?[]f32 = if (trace_enabled)
+                try scratch.allocator.alloc(f32, seq_len * d_inner)
+            else
+                null;
+            defer if (ssm_pre_norm_buf) |buf| scratch.allocator.free(buf);
 
             // Batched in_proj: [seq_len × d_model] → [seq_len × proj_len]
             {
@@ -442,10 +457,26 @@ pub const GatedDeltaKernel = struct {
                 const proj_t = proj_buf[t * proj_len ..][0..proj_len];
                 const qkv = proj_t[0..qkv_len];
                 cpu_conv1d.runTimeMajorValues(qkv, conv_state, conv_weight_t, qkv, conv_bias, qkv_len, d_conv);
+                if (conv_trace_buf) |buf| {
+                    @memcpy(buf[t * qkv_len ..][0..qkv_len], qkv);
+                }
                 cpu_gated_delta.applySiluInPlace(qkv);
                 const query = qkv[0..qk_inner];
                 const key = qkv[qk_inner .. 2 * qk_inner];
                 try cpu_gated_delta.normalizeQueryKeyInPlace(query, key, n_qk_heads, d_head);
+            }
+            if (trace_enabled and conv_trace_buf != null) {
+                trace.emit(
+                    .gdelta_conv,
+                    self.layer_idx,
+                    0,
+                    @intCast(self.trace_position_offset),
+                    @ptrCast(conv_trace_buf.?.ptr),
+                    .f32,
+                    .{ 1, @intCast(seq_len), @intCast(qkv_len), 0 },
+                    3,
+                    null,
+                );
             }
 
             // Phase 2: SSM state step + gated RMS norm (parallel over heads).
@@ -454,6 +485,7 @@ pub const GatedDeltaKernel = struct {
             var ssm_ctx = SsmParallelCtx{
                 .proj_buf = proj_buf,
                 .ssm_buf = ssm_buf,
+                .ssm_pre_norm_buf = ssm_pre_norm_buf,
                 .kv_mem = temp,
                 .ssm_state = ssm_state,
                 .A_log = A_log,
@@ -469,6 +501,30 @@ pub const GatedDeltaKernel = struct {
                 .n_v_heads = n_v_heads,
             };
             parallel.global().parallelFor(n_v_heads * 16, ssmHeadTask, &ssm_ctx);
+            if (trace_enabled and ssm_pre_norm_buf != null) {
+                trace.emit(
+                    .gdelta_ssm,
+                    self.layer_idx,
+                    0,
+                    @intCast(self.trace_position_offset),
+                    @ptrCast(ssm_pre_norm_buf.?.ptr),
+                    .f32,
+                    .{ 1, @intCast(seq_len), @intCast(d_inner), 0 },
+                    3,
+                    null,
+                );
+                trace.emit(
+                    .gdelta_norm,
+                    self.layer_idx,
+                    0,
+                    @intCast(self.trace_position_offset),
+                    @ptrCast(ssm_buf.ptr),
+                    .f32,
+                    .{ 1, @intCast(seq_len), @intCast(d_inner), 0 },
+                    3,
+                    null,
+                );
+            }
 
             // Batched out_proj: [seq_len × d_inner] → [seq_len × d_model]
             {
@@ -489,6 +545,31 @@ pub const GatedDeltaKernel = struct {
                         matmulWork(seq_len, d_inner, d_model, w.out_proj),
                     );
                 }
+            }
+            if (trace_enabled) {
+                const state_pos: u32 = @intCast(self.trace_position_offset + seq_len - 1);
+                trace.emit(
+                    .gdelta_state_conv,
+                    self.layer_idx,
+                    0,
+                    state_pos,
+                    @ptrCast(conv_state.ptr),
+                    .f32,
+                    .{ 1, @intCast(d_conv), @intCast(qkv_len), 0 },
+                    3,
+                    null,
+                );
+                trace.emit(
+                    .gdelta_state_ssm,
+                    self.layer_idx,
+                    0,
+                    state_pos,
+                    @ptrCast(ssm_state.ptr),
+                    .f32,
+                    .{ 1, @intCast(n_v_heads), @intCast(d_head), @intCast(d_head) },
+                    4,
+                    null,
+                );
             }
             return;
         }
@@ -606,6 +687,28 @@ pub const GatedDeltaKernel = struct {
                     3,
                     null,
                     matmulWork(1, d_inner, d_model, w.out_proj),
+                );
+                trace.emit(
+                    .gdelta_state_conv,
+                    self.layer_idx,
+                    0,
+                    @intCast(self.trace_position_offset + t),
+                    @ptrCast(conv_state.ptr),
+                    .f32,
+                    .{ 1, @intCast(d_conv), @intCast(qkv_len), 0 },
+                    3,
+                    null,
+                );
+                trace.emit(
+                    .gdelta_state_ssm,
+                    self.layer_idx,
+                    0,
+                    @intCast(self.trace_position_offset + t),
+                    @ptrCast(ssm_state.ptr),
+                    .f32,
+                    .{ 1, @intCast(n_v_heads), @intCast(d_head), @intCast(d_head) },
+                    4,
+                    null,
                 );
             }
         }

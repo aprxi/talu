@@ -40,6 +40,13 @@ const LayerWeights = WeightHandles.LayerWeights;
 pub const TransformerBlock = struct {
     const MaxLayerProgramStateBindings = 256;
 
+    fn resolveAttentionRopeTheta(model_config: ModelConfig, sliding_window: usize) f32 {
+        if (sliding_window > 0 and model_config.rope_local_theta > 0) {
+            return model_config.rope_local_theta;
+        }
+        return model_config.rope_theta;
+    }
+
     const AttentionRuntimeBinding = union(enum) {
         mla: mla_kernel.MLAttention,
         multihead: attention_kernel.MultiHeadAttention,
@@ -84,6 +91,9 @@ pub const TransformerBlock = struct {
         layer_weights: *const LayerWeights,
         layer_idx: usize,
         pos_offset: usize,
+        trace_enabled: bool,
+        debug_attn_norm_enabled: bool,
+        allow_rms_swiglu_fusion: bool,
         runtime_rope_cos_handle: mlx_graph.ArrayHandle,
         runtime_rope_sin_handle: mlx_graph.ArrayHandle,
         runtime_rope_dim: usize,
@@ -100,6 +110,18 @@ pub const TransformerBlock = struct {
         state_bindings: [MaxLayerProgramStateBindings]?LayerProgramStateBinding = [_]?LayerProgramStateBinding{null} ** MaxLayerProgramStateBindings,
         state_binding_count: usize = 0,
     };
+
+    fn envFlagEnabledCached(comptime name: []const u8) bool {
+        const EnvCache = struct {
+            var value: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+        };
+        const cached = EnvCache.value.load(.acquire);
+        if (cached == 1) return false;
+        if (cached == 2) return true;
+        const enabled = std.posix.getenv(name) != null;
+        EnvCache.value.store(if (enabled) 2 else 1, .release);
+        return enabled;
+    }
 
     const BuiltLayerProgramHandles = struct {
         registers: []runtime_contract.TensorHandle,
@@ -249,8 +271,8 @@ pub const TransformerBlock = struct {
         if (seq_len == 0) return 0;
         return switch (point) {
             // Match CPU attention decode traces:
-            // - q/k/v/embed_pos use cache position before qk/softmax update.
-            .attn_q, .attn_k, .attn_v, .embed_pos => if (seq_len == 1)
+            // - raw q/k projections and q/k/v/embed_pos use cache position before qk/softmax update.
+            .attn_q_proj_raw, .attn_k_proj_raw, .attn_q, .attn_k, .attn_v, .attn_q_norm, .attn_k_norm, .attn_q_rope, .attn_k_rope, .embed_pos => if (seq_len == 1)
                 saturatingU32(pos_offset)
             else
                 seq_len,
@@ -271,6 +293,7 @@ pub const TransformerBlock = struct {
         ndim: u8,
         kernel_name: []const u8,
     ) void {
+        if (!state.trace_enabled) return;
         if (!trace.shouldEmit(point)) return;
         // block_out must carry real host data; marker-pointer traces are invalid.
         if (point == .block_out) return;
@@ -299,6 +322,7 @@ pub const TransformerBlock = struct {
         point: trace.TracePoint,
         kernel_name: []const u8,
     ) void {
+        if (!state.trace_enabled) return;
         if (!trace.shouldEmit(point)) return;
 
         const io = instructionIoSlices(insn, registers) catch return;
@@ -340,7 +364,14 @@ pub const TransformerBlock = struct {
             else => return,
         };
         if (mapped.seq_len == 0 or mapped.width == 0) return;
-        const seq_len_u32: u32 = @intCast(@min(mapped.seq_len, @as(usize, std.math.maxInt(u32))));
+        const inferred_seq_len_u32: u32 = @intCast(@min(mapped.seq_len, @as(usize, std.math.maxInt(u32))));
+        // Attention weights traces are emitted as a reduced 2D view
+        // (heads x keys). Position semantics must still follow the active
+        // sequence length contract, not the reduced tensor rank.
+        const seq_len_u32: u32 = if (point == .attn_qk or point == .attn_weights)
+            inferTraceSeqLen(state)
+        else
+            inferred_seq_len_u32;
         const batch_u32: u32 = @intCast(@min(mapped.batch, @as(usize, std.math.maxInt(u32))));
         const width_u32: u32 = @intCast(@min(mapped.width, @as(usize, std.math.maxInt(u32))));
         const token_idx = traceTokenIndex(seq_len_u32);
@@ -367,6 +398,87 @@ pub const TransformerBlock = struct {
         );
     }
 
+    fn emitLayerProgramArrayHostTracePoint(
+        state: *const LayerProgramExecutionContext,
+        point: trace.TracePoint,
+        value: mlx_graph.ArrayHandle,
+        kernel_name: []const u8,
+        seq_len_override: ?u32,
+    ) void {
+        if (!state.trace_enabled) return;
+        if (!trace.shouldEmit(point)) return;
+        if (value == null) return;
+
+        var output_shape: [8]usize = undefined;
+        const output_rank = mlx_graph.getShape(value, &output_shape);
+        if (output_rank == 0) return;
+
+        var element_count: usize = 1;
+        for (0..output_rank) |axis| {
+            element_count = std.math.mul(usize, element_count, output_shape[axis]) catch return;
+        }
+        if (element_count == 0) return;
+
+        const MappedShape = struct {
+            batch: usize,
+            seq_len: usize,
+            width: usize,
+            ndim: u8,
+        };
+        const mapped: MappedShape = switch (output_rank) {
+            3 => .{
+                .batch = output_shape[0],
+                .seq_len = output_shape[1],
+                .width = output_shape[2],
+                .ndim = @as(u8, 3),
+            },
+            2 => .{
+                .batch = @as(usize, 1),
+                .seq_len = output_shape[0],
+                .width = output_shape[1],
+                .ndim = @as(u8, 2),
+            },
+            1 => .{
+                .batch = @as(usize, 1),
+                .seq_len = @as(usize, 1),
+                .width = output_shape[0],
+                .ndim = @as(u8, 1),
+            },
+            else => return,
+        };
+        if (mapped.seq_len == 0 or mapped.width == 0) return;
+        const inferred_seq_len_u32: u32 = @intCast(@min(mapped.seq_len, @as(usize, std.math.maxInt(u32))));
+        const seq_len_u32: u32 = seq_len_override orelse inferred_seq_len_u32;
+        const batch_u32: u32 = @intCast(@min(mapped.batch, @as(usize, std.math.maxInt(u32))));
+        const width_u32: u32 = @intCast(@min(mapped.width, @as(usize, std.math.maxInt(u32))));
+        const token_idx = traceTokenIndex(seq_len_u32);
+        const position = tracePositionForPoint(point, state.pos_offset, seq_len_u32);
+        if (!trace.shouldEmitEmission(point, @intCast(state.layer_idx), position)) return;
+
+        const host_buf = std.heap.c_allocator.alloc(f32, element_count) catch return;
+        defer std.heap.c_allocator.free(host_buf);
+        mlx_graph.copyToHost(value, host_buf);
+
+        const emitted_shape: [4]u32 = switch (mapped.ndim) {
+            3 => .{ batch_u32, inferred_seq_len_u32, width_u32, 0 },
+            2 => .{ inferred_seq_len_u32, width_u32, 0, 0 },
+            1 => .{ width_u32, 0, 0, 0 },
+            else => .{ batch_u32, inferred_seq_len_u32, width_u32, 0 },
+        };
+
+        trace.emit(
+            point,
+            @intCast(state.layer_idx),
+            token_idx,
+            position,
+            @ptrCast(host_buf.ptr),
+            .f32,
+            emitted_shape,
+            mapped.ndim,
+            kernel_name,
+        );
+    }
+
     fn emitLayerProgramPerTokenHostTracePoint(
         state: *const LayerProgramExecutionContext,
         insn: *const runtime_contract.Instruction,
@@ -374,6 +486,7 @@ pub const TransformerBlock = struct {
         point: trace.TracePoint,
         kernel_name: []const u8,
     ) void {
+        if (!state.trace_enabled) return;
         if (!trace.shouldEmit(point)) return;
 
         const io = instructionIoSlices(insn, registers) catch return;
@@ -448,6 +561,7 @@ pub const TransformerBlock = struct {
         point: trace.TracePoint,
         kernel_name: []const u8,
     ) void {
+        if (!state.trace_enabled) return;
         if (!trace.shouldEmit(point)) return;
         if (output == null) return;
 
@@ -492,10 +606,18 @@ pub const TransformerBlock = struct {
         // in the xray host-trace path without changing the observed tensor.
         mlx_graph.copyToHost(output, host_buf);
 
-        // CPU emits batched prefill tensors for gated-delta in/out projection
-        // checkpoints as one [1, seq, width] emission at position 0.
+        // CPU emits batched prefill tensors for gated-delta stage checkpoints
+        // as one [1, seq, width] emission at position 0.
         // Mirror that shape/position contract so verifier compares like-for-like.
-        const emit_batched_prefill = seq_len > 1 and (point == .gdelta_in_proj or point == .gdelta_out);
+        const emit_batched_prefill = seq_len > 1 and switch (point) {
+            .gdelta_in_proj,
+            .gdelta_conv,
+            .gdelta_ssm,
+            .gdelta_norm,
+            .gdelta_out,
+            => true,
+            else => false,
+        };
         if (emit_batched_prefill) {
             if (!trace.shouldEmitEmission(point, @intCast(state.layer_idx), 0)) return;
             trace.emit(
@@ -530,6 +652,50 @@ pub const TransformerBlock = struct {
                 kernel_name,
             );
         }
+    }
+
+    fn emitArrayHostTracePointAt(
+        state: *const LayerProgramExecutionContext,
+        output: mlx_graph.ArrayHandle,
+        point: trace.TracePoint,
+        token: u32,
+        position: u32,
+        kernel_name: []const u8,
+    ) void {
+        if (!state.trace_enabled) return;
+        if (!trace.shouldEmit(point)) return;
+        if (output == null) return;
+        if (!trace.shouldEmitEmission(point, @intCast(state.layer_idx), position)) return;
+
+        var output_shape: [8]usize = undefined;
+        const output_rank = mlx_graph.getShape(output, &output_shape);
+        if (output_rank == 0 or output_rank > 4) return;
+
+        var element_count: usize = 1;
+        var shape_u32: [4]u32 = .{ 0, 0, 0, 0 };
+        for (0..output_rank) |axis| {
+            const dim = output_shape[axis];
+            if (dim == 0 or dim > std.math.maxInt(u32)) return;
+            element_count *= dim;
+            shape_u32[axis] = @intCast(dim);
+        }
+        if (element_count == 0) return;
+
+        const host_buf = std.heap.c_allocator.alloc(f32, element_count) catch return;
+        defer std.heap.c_allocator.free(host_buf);
+        mlx_graph.copyToHost(output, host_buf);
+
+        trace.emit(
+            point,
+            @intCast(state.layer_idx),
+            token,
+            position,
+            @ptrCast(host_buf.ptr),
+            .f32,
+            shape_u32,
+            @intCast(output_rank),
+            kernel_name,
+        );
     }
 
     fn inferNormTracePoint(state: *const LayerProgramExecutionContext, insn: *const runtime_contract.Instruction) trace.TracePoint {
@@ -804,6 +970,19 @@ pub const TransformerBlock = struct {
         };
     }
 
+    fn hasValidGatedDeltaRuntimeConfig(
+        d_conv: usize,
+        n_heads: usize,
+        n_key_heads: usize,
+        d_head: usize,
+    ) bool {
+        return d_conv != 0 and
+            n_heads != 0 and
+            n_key_heads != 0 and
+            d_head != 0 and
+            (n_heads % n_key_heads) == 0;
+    }
+
     fn countRmsNormInstructions(plan: *const runtime_contract.ExecutionPlan) usize {
         var count: usize = 0;
         for (plan.instructions) |insn| {
@@ -1041,69 +1220,48 @@ pub const TransformerBlock = struct {
 
     fn resolveUsableRmsNormWeight(
         state: *LayerProgramExecutionContext,
-        insn: *const runtime_contract.Instruction,
+        _: *const runtime_contract.Instruction,
         fallback_bound_weight: mlx_graph.ArrayHandle,
-        input: mlx_graph.ArrayHandle,
-        input_shape: *const [8]usize,
-        input_rank: usize,
+        _: mlx_graph.ArrayHandle,
+        _: *const [8]usize,
+        _: usize,
         feature_dim: usize,
     ) !ResolvedRmsNormWeight {
-        // Use instruction-bound weight handles as source of truth. Ordered
-        // fallback is only used when bindings are incomplete.
+        // Use instruction-bound weight handles as source of truth.
+        // Do not fall back to ordinal mapping here; incorrect cross-instruction
+        // weight selection can silently destabilize normalization.
         var selected_weight = fallback_bound_weight;
         if (selected_weight == null) {
-            selected_weight = resolveRmsNormWeightHandle(state, insn, fallback_bound_weight) catch fallback_bound_weight;
-        }
-        if (selected_weight == null) {
-            if (!state.rmsnorm_fallback_logged) {
-                log.warn("inference", "Metal RMSNorm missing instruction-bound weight; synthesizing fallback", .{
-                    .layer = state.layer_idx,
-                    .feature_dim = feature_dim,
-                });
-                state.rmsnorm_fallback_logged = true;
-            }
-            selected_weight = try synthesizeRmsNormWeightFromInput(input, input_shape, input_rank);
+            log.warn("inference", "Metal RMSNorm missing instruction-bound weight (fatal)", .{
+                .layer = state.layer_idx,
+                .feature_dim = feature_dim,
+            });
+            return error.MissingWeight;
         }
         if (normalizeRmsNormWeightForFeatureDim(selected_weight, feature_dim)) |normalized| {
             selected_weight = normalized;
         }
         var selected_shape: [8]usize = undefined;
-        var selected_rank = mlx_graph.getShape(selected_weight, &selected_shape);
-        var selected_dim: usize = if (selected_rank >= 1) selected_shape[selected_rank - 1] else feature_dim;
+        const selected_rank = mlx_graph.getShape(selected_weight, &selected_shape);
+        const selected_dim: usize = if (selected_rank >= 1) selected_shape[selected_rank - 1] else feature_dim;
 
         if (selected_rank != 0 and (selected_rank != 1 or (selected_dim != feature_dim and selected_dim * 2 != feature_dim))) {
-            if (!state.rmsnorm_fallback_logged) {
-                log.warn("inference", "Metal RMSNorm instruction-bound weight incompatible with input width; synthesizing fallback", .{
-                    .layer = state.layer_idx,
-                    .feature_dim = feature_dim,
-                    .selected_dim = selected_dim,
-                    .selected_rank = selected_rank,
-                });
-                state.rmsnorm_fallback_logged = true;
-            }
-            selected_weight = try synthesizeRmsNormWeightFromInput(input, input_shape, input_rank);
-            if (normalizeRmsNormWeightForFeatureDim(selected_weight, feature_dim)) |normalized| {
-                selected_weight = normalized;
-            }
-            selected_rank = mlx_graph.getShape(selected_weight, &selected_shape);
-            selected_dim = if (selected_rank >= 1) selected_shape[selected_rank - 1] else feature_dim;
+            log.warn("inference", "Metal RMSNorm instruction-bound weight incompatible with input width (fatal)", .{
+                .layer = state.layer_idx,
+                .feature_dim = feature_dim,
+                .selected_dim = selected_dim,
+                .selected_rank = selected_rank,
+            });
+            return error.InvalidTensorType;
         }
 
         if (selected_rank != 0 and selected_dim != feature_dim and selected_dim * 2 != feature_dim) {
-            if (!state.rmsnorm_fallback_logged) {
-                log.warn("inference", "Metal RMSNorm selected incompatible width; synthesizing fallback", .{
-                    .layer = state.layer_idx,
-                    .feature_dim = feature_dim,
-                    .selected_dim = selected_dim,
-                });
-                state.rmsnorm_fallback_logged = true;
-            }
-            selected_weight = try synthesizeRmsNormWeightFromInput(input, input_shape, input_rank);
-            if (normalizeRmsNormWeightForFeatureDim(selected_weight, feature_dim)) |normalized| {
-                selected_weight = normalized;
-            }
-            selected_rank = mlx_graph.getShape(selected_weight, &selected_shape);
-            selected_dim = if (selected_rank >= 1) selected_shape[selected_rank - 1] else feature_dim;
+            log.warn("inference", "Metal RMSNorm selected incompatible width (fatal)", .{
+                .layer = state.layer_idx,
+                .feature_dim = feature_dim,
+                .selected_dim = selected_dim,
+            });
+            return error.InvalidTensorType;
         }
         return .{
             .weight = selected_weight,
@@ -1111,6 +1269,20 @@ pub const TransformerBlock = struct {
             .dim = selected_dim,
         };
     }
+
+    const AttentionKernelResult = struct {
+        output: mlx_graph.ArrayHandle,
+        attn_q_proj_raw_trace: ?mlx_graph.ArrayHandle = null,
+        attn_k_proj_raw_trace: ?mlx_graph.ArrayHandle = null,
+        attn_q_norm_trace: ?mlx_graph.ArrayHandle = null,
+        attn_k_norm_trace: ?mlx_graph.ArrayHandle = null,
+        attn_q_rope_trace: ?mlx_graph.ArrayHandle = null,
+        attn_k_rope_trace: ?mlx_graph.ArrayHandle = null,
+        attn_qk_trace: ?mlx_graph.ArrayHandle = null,
+        attn_weights_trace: ?mlx_graph.ArrayHandle = null,
+        attn_q_trace: ?mlx_graph.ArrayHandle = null,
+        attn_k_trace: ?mlx_graph.ArrayHandle = null,
+    };
 
     fn runAttentionKernel(
         input: mlx_graph.ArrayHandle,
@@ -1121,7 +1293,7 @@ pub const TransformerBlock = struct {
         runtime_rope_cos_handle: mlx_graph.ArrayHandle,
         runtime_rope_sin_handle: mlx_graph.ArrayHandle,
         runtime_rope_dim: usize,
-    ) !mlx_graph.ArrayHandle {
+    ) !AttentionKernelResult {
         return switch (binding) {
             .mla => |mla_attention| blk: {
                 var mla = mla_attention;
@@ -1145,7 +1317,7 @@ pub const TransformerBlock = struct {
                     &mla_matmul_scratch,
                     cache != null,
                 );
-                break :blk mla_out;
+                break :blk .{ .output = mla_out };
             },
             .multihead => |attention| blk: {
                 var mha = attention;
@@ -1169,7 +1341,19 @@ pub const TransformerBlock = struct {
                     &attn_matmul_scratch,
                     cache != null,
                 );
-                break :blk attn_out;
+                break :blk .{
+                    .output = attn_out,
+                    .attn_q_proj_raw_trace = if (attn_scratch.attn_q_proj_raw_trace_handle) |h| h else null,
+                    .attn_k_proj_raw_trace = if (attn_scratch.attn_k_proj_raw_trace_handle) |h| h else null,
+                    .attn_q_norm_trace = if (attn_scratch.attn_q_norm_trace_handle) |h| h else null,
+                    .attn_k_norm_trace = if (attn_scratch.attn_k_norm_trace_handle) |h| h else null,
+                    .attn_q_rope_trace = if (attn_scratch.attn_q_rope_trace_handle) |h| h else null,
+                    .attn_k_rope_trace = if (attn_scratch.attn_k_rope_trace_handle) |h| h else null,
+                    .attn_qk_trace = if (attn_scratch.attn_qk_trace_handle) |h| h else null,
+                    .attn_weights_trace = if (attn_scratch.attn_weights_trace_handle) |h| h else null,
+                    .attn_q_trace = if (attn_scratch.attn_q_trace_handle) |h| h else null,
+                    .attn_k_trace = if (attn_scratch.attn_k_trace_handle) |h| h else null,
+                };
             },
         };
     }
@@ -1487,17 +1671,12 @@ pub const TransformerBlock = struct {
             }
         }
         if (weight_rank != 1) {
-            if (!state.rmsnorm_fallback_logged) {
-                log.warn("inference", "Metal RMSNorm adapter forcing 1D fallback weight", .{
-                    .layer = state.layer_idx,
-                    .feature_dim = feature_dim,
-                    .weight_rank = weight_rank,
-                });
-                state.rmsnorm_fallback_logged = true;
-            }
-            selected_weight = synthesizeUnitRmsNormWeight(feature_dim);
-            weight_rank = 1;
-            selected_dim = feature_dim;
+            log.warn("inference", "Metal RMSNorm adapter requires rank-1 weight (fatal)", .{
+                .layer = state.layer_idx,
+                .feature_dim = feature_dim,
+                .weight_rank = weight_rank,
+            });
+            return error.InvalidTensorType;
         }
 
         const norm = norm_kernel.RMSNorm{
@@ -1510,6 +1689,14 @@ pub const TransformerBlock = struct {
         if (input_rank >= 1 and weight_rank == 1) {
             const norm_dim = selected_dim;
             if (norm_dim > 0 and feature_dim == norm_dim * 2) {
+                if (@intFromEnum(log.Level.trace) >= @intFromEnum(log.getLogLevel())) {
+                    log.trace("inference", "PARITY_METAL rmsnorm half-split path", .{
+                        .layer = state.layer_idx,
+                        .feature_dim = feature_dim,
+                        .norm_dim = norm_dim,
+                        .opcode = @intFromEnum(insn.opcode),
+                    }, @src());
+                }
                 var starts_first: [8]c_int = [_]c_int{0} ** 8;
                 var ends_first: [8]c_int = [_]c_int{0} ** 8;
                 var starts_second: [8]c_int = [_]c_int{0} ** 8;
@@ -1584,10 +1771,19 @@ pub const TransformerBlock = struct {
                     .n_heads = @intCast(state.runtime_meta.model_config.n_heads),
                     .n_kv_heads = @intCast(state.runtime_meta.model_config.n_kv_groups),
                     .head_dim = @intCast(state.runtime_meta.model_config.head_dim),
-                    .rope_theta = state.runtime_meta.model_config.rope_theta,
+                    .rope_dim = if (state.runtime_meta.model_config.rope_dim > 0)
+                        @intCast(state.runtime_meta.model_config.rope_dim)
+                    else
+                        @intCast(state.runtime_meta.model_config.head_dim),
+                    .rope_theta = resolveAttentionRopeTheta(
+                        state.runtime_meta.model_config,
+                        state.layer_weights.sliding_window,
+                    ),
+                    .rope_interleaved = state.runtime_meta.model_config.rope_scaling.mrope_interleaved,
                     .norm_eps = state.runtime_meta.model_config.norm_eps,
                     .query_pre_attn_scalar = state.runtime_meta.model_config.query_pre_attn_scalar,
                     .attention_multiplier = state.runtime_meta.attention_multiplier,
+                    .sliding_window = state.layer_weights.sliding_window,
                     .query_gate = query_gate,
                     .q_proj = null,
                     .k_proj = null,
@@ -1630,21 +1826,38 @@ pub const TransformerBlock = struct {
                     },
                     else => return error.InvalidTensorType,
                 }
-                if (std.posix.getenv("TALU_DBG_ATTN_NORM") != null) {
+                if (state.debug_attn_norm_enabled) {
                     const q_norm_raw = optionalArrayWeightFromHandle(weight_handles[4]);
                     const k_norm_raw = optionalArrayWeightFromHandle(weight_handles[5]);
+                    const q_proj_raw = optionalArrayWeightFromHandle(weight_handles[0]);
+                    const k_proj_raw = optionalArrayWeightFromHandle(weight_handles[1]);
+                    const v_proj_raw = optionalArrayWeightFromHandle(weight_handles[2]);
                     var q_shape: [8]usize = undefined;
                     var k_shape: [8]usize = undefined;
+                    var q_proj_shape: [8]usize = undefined;
+                    var k_proj_shape: [8]usize = undefined;
+                    var v_proj_shape: [8]usize = undefined;
                     const q_rank = if (q_norm_raw != null) mlx_graph.getShape(q_norm_raw.?, &q_shape) else @as(usize, 0);
                     const k_rank = if (k_norm_raw != null) mlx_graph.getShape(k_norm_raw.?, &k_shape) else @as(usize, 0);
+                    const q_proj_rank = if (q_proj_raw != null) mlx_graph.getShape(q_proj_raw.?, &q_proj_shape) else @as(usize, 0);
+                    const k_proj_rank = if (k_proj_raw != null) mlx_graph.getShape(k_proj_raw.?, &k_proj_shape) else @as(usize, 0);
+                    const v_proj_rank = if (v_proj_raw != null) mlx_graph.getShape(v_proj_raw.?, &v_proj_shape) else @as(usize, 0);
                     std.debug.print(
-                        "DBG_ATTN_NORM layer={} q_rank={} q_last_dim={} k_rank={} k_last_dim={} head_dim={} weight_slots={}\n",
+                        "DBG_ATTN_NORM layer={} q_rank={} q_last_dim={} k_rank={} k_last_dim={} q_proj_rank={} q_proj_last={} k_proj_rank={} k_proj_last={} v_proj_rank={} v_proj_last={} n_heads={} n_kv_groups={} head_dim={} weight_slots={}\n",
                         .{
                             state.layer_idx,
                             q_rank,
                             if (q_rank > 0) q_shape[q_rank - 1] else @as(usize, 0),
                             k_rank,
                             if (k_rank > 0) k_shape[k_rank - 1] else @as(usize, 0),
+                            q_proj_rank,
+                            if (q_proj_rank > 0) q_proj_shape[q_proj_rank - 1] else @as(usize, 0),
+                            k_proj_rank,
+                            if (k_proj_rank > 0) k_proj_shape[k_proj_rank - 1] else @as(usize, 0),
+                            v_proj_rank,
+                            if (v_proj_rank > 0) v_proj_shape[v_proj_rank - 1] else @as(usize, 0),
+                            state.runtime_meta.model_config.n_heads,
+                            state.runtime_meta.model_config.n_kv_groups,
                             state.runtime_meta.model_config.head_dim,
                             weight_handles.len,
                         },
@@ -1686,7 +1899,7 @@ pub const TransformerBlock = struct {
                 mla.kv_a_norm = optionalArrayWeightFromHandle(weight_handles[4]) orelse return error.MissingField;
             },
         }
-        const output = try runAttentionKernel(
+        const result = try runAttentionKernel(
             input,
             attention_binding,
             state.layer_idx,
@@ -1696,7 +1909,187 @@ pub const TransformerBlock = struct {
             state.runtime_rope_sin_handle,
             state.runtime_rope_dim,
         );
-        arraySlotFromHandle(io.outputs[0]).* = output;
+        arraySlotFromHandle(io.outputs[0]).* = result.output;
+        if (result.attn_q_norm_trace) |q_norm_handle| {
+            var input_shape_q_norm: [8]usize = undefined;
+            const input_rank_q_norm = mlx_graph.getShape(input, &input_shape_q_norm);
+            const input_seq_len_q_norm: u32 = if (input_rank_q_norm >= 2)
+                @intCast(@min(input_shape_q_norm[1], @as(usize, std.math.maxInt(u32))))
+            else if (input_rank_q_norm == 1)
+                @intCast(@min(input_shape_q_norm[0], @as(usize, std.math.maxInt(u32))))
+            else
+                inferTraceSeqLen(state);
+            defer mlx_graph.freeArray(q_norm_handle);
+            emitLayerProgramArrayHostTracePoint(
+                state,
+                .attn_q_norm,
+                q_norm_handle,
+                "metal_attention_q_norm_host",
+                input_seq_len_q_norm,
+            );
+        }
+        if (result.attn_k_norm_trace) |k_norm_handle| {
+            var input_shape_k_norm: [8]usize = undefined;
+            const input_rank_k_norm = mlx_graph.getShape(input, &input_shape_k_norm);
+            const input_seq_len_k_norm: u32 = if (input_rank_k_norm >= 2)
+                @intCast(@min(input_shape_k_norm[1], @as(usize, std.math.maxInt(u32))))
+            else if (input_rank_k_norm == 1)
+                @intCast(@min(input_shape_k_norm[0], @as(usize, std.math.maxInt(u32))))
+            else
+                inferTraceSeqLen(state);
+            defer mlx_graph.freeArray(k_norm_handle);
+            emitLayerProgramArrayHostTracePoint(
+                state,
+                .attn_k_norm,
+                k_norm_handle,
+                "metal_attention_k_norm_host",
+                input_seq_len_k_norm,
+            );
+        }
+        if (result.attn_q_rope_trace) |q_rope_handle| {
+            var input_shape_q_rope: [8]usize = undefined;
+            const input_rank_q_rope = mlx_graph.getShape(input, &input_shape_q_rope);
+            const input_seq_len_q_rope: u32 = if (input_rank_q_rope >= 2)
+                @intCast(@min(input_shape_q_rope[1], @as(usize, std.math.maxInt(u32))))
+            else if (input_rank_q_rope == 1)
+                @intCast(@min(input_shape_q_rope[0], @as(usize, std.math.maxInt(u32))))
+            else
+                inferTraceSeqLen(state);
+            defer mlx_graph.freeArray(q_rope_handle);
+            emitLayerProgramArrayHostTracePoint(
+                state,
+                .attn_q_rope,
+                q_rope_handle,
+                "metal_attention_q_rope_host",
+                input_seq_len_q_rope,
+            );
+        }
+        if (result.attn_k_rope_trace) |k_rope_handle| {
+            var input_shape_k_rope: [8]usize = undefined;
+            const input_rank_k_rope = mlx_graph.getShape(input, &input_shape_k_rope);
+            const input_seq_len_k_rope: u32 = if (input_rank_k_rope >= 2)
+                @intCast(@min(input_shape_k_rope[1], @as(usize, std.math.maxInt(u32))))
+            else if (input_rank_k_rope == 1)
+                @intCast(@min(input_shape_k_rope[0], @as(usize, std.math.maxInt(u32))))
+            else
+                inferTraceSeqLen(state);
+            defer mlx_graph.freeArray(k_rope_handle);
+            emitLayerProgramArrayHostTracePoint(
+                state,
+                .attn_k_rope,
+                k_rope_handle,
+                "metal_attention_k_rope_host",
+                input_seq_len_k_rope,
+            );
+        }
+        if (result.attn_q_proj_raw_trace) |q_proj_raw_handle| {
+            var input_shape_q_proj_raw: [8]usize = undefined;
+            const input_rank_q_proj_raw = mlx_graph.getShape(input, &input_shape_q_proj_raw);
+            const input_seq_len_q_proj_raw: u32 = if (input_rank_q_proj_raw >= 2)
+                @intCast(@min(input_shape_q_proj_raw[1], @as(usize, std.math.maxInt(u32))))
+            else if (input_rank_q_proj_raw == 1)
+                @intCast(@min(input_shape_q_proj_raw[0], @as(usize, std.math.maxInt(u32))))
+            else
+                inferTraceSeqLen(state);
+            defer mlx_graph.freeArray(q_proj_raw_handle);
+            emitLayerProgramArrayHostTracePoint(
+                state,
+                .attn_q_proj_raw,
+                q_proj_raw_handle,
+                "metal_attention_q_proj_raw_host",
+                input_seq_len_q_proj_raw,
+            );
+        }
+        if (result.attn_k_proj_raw_trace) |k_proj_raw_handle| {
+            var input_shape_k_proj_raw: [8]usize = undefined;
+            const input_rank_k_proj_raw = mlx_graph.getShape(input, &input_shape_k_proj_raw);
+            const input_seq_len_k_proj_raw: u32 = if (input_rank_k_proj_raw >= 2)
+                @intCast(@min(input_shape_k_proj_raw[1], @as(usize, std.math.maxInt(u32))))
+            else if (input_rank_k_proj_raw == 1)
+                @intCast(@min(input_shape_k_proj_raw[0], @as(usize, std.math.maxInt(u32))))
+            else
+                inferTraceSeqLen(state);
+            defer mlx_graph.freeArray(k_proj_raw_handle);
+            emitLayerProgramArrayHostTracePoint(
+                state,
+                .attn_k_proj_raw,
+                k_proj_raw_handle,
+                "metal_attention_k_proj_raw_host",
+                input_seq_len_k_proj_raw,
+            );
+        }
+        if (result.attn_qk_trace) |qk_handle| {
+            var input_shape_qk: [8]usize = undefined;
+            const input_rank_qk = mlx_graph.getShape(input, &input_shape_qk);
+            const input_seq_len_qk: u32 = if (input_rank_qk >= 2)
+                @intCast(@min(input_shape_qk[1], @as(usize, std.math.maxInt(u32))))
+            else if (input_rank_qk == 1)
+                @intCast(@min(input_shape_qk[0], @as(usize, std.math.maxInt(u32))))
+            else
+                inferTraceSeqLen(state);
+            defer mlx_graph.freeArray(qk_handle);
+            emitLayerProgramArrayHostTracePoint(
+                state,
+                .attn_qk,
+                qk_handle,
+                "metal_attention_qk_host",
+                input_seq_len_qk,
+            );
+        }
+        if (result.attn_q_trace) |q_handle| {
+            var input_shape_q: [8]usize = undefined;
+            const input_rank_q = mlx_graph.getShape(input, &input_shape_q);
+            const input_seq_len_q: u32 = if (input_rank_q >= 2)
+                @intCast(@min(input_shape_q[1], @as(usize, std.math.maxInt(u32))))
+            else if (input_rank_q == 1)
+                @intCast(@min(input_shape_q[0], @as(usize, std.math.maxInt(u32))))
+            else
+                inferTraceSeqLen(state);
+            defer mlx_graph.freeArray(q_handle);
+            emitLayerProgramArrayHostTracePoint(
+                state,
+                .attn_q,
+                q_handle,
+                "metal_attention_q_host",
+                input_seq_len_q,
+            );
+        }
+        if (result.attn_k_trace) |k_handle| {
+            var input_shape_k: [8]usize = undefined;
+            const input_rank_k = mlx_graph.getShape(input, &input_shape_k);
+            const input_seq_len_k: u32 = if (input_rank_k >= 2)
+                @intCast(@min(input_shape_k[1], @as(usize, std.math.maxInt(u32))))
+            else if (input_rank_k == 1)
+                @intCast(@min(input_shape_k[0], @as(usize, std.math.maxInt(u32))))
+            else
+                inferTraceSeqLen(state);
+            defer mlx_graph.freeArray(k_handle);
+            emitLayerProgramArrayHostTracePoint(
+                state,
+                .attn_k,
+                k_handle,
+                "metal_attention_k_host",
+                input_seq_len_k,
+            );
+        }
+        if (result.attn_weights_trace) |weights_handle| {
+            var input_shape: [8]usize = undefined;
+            const input_rank = mlx_graph.getShape(input, &input_shape);
+            const input_seq_len_u32: u32 = if (input_rank >= 2)
+                @intCast(@min(input_shape[1], @as(usize, std.math.maxInt(u32))))
+            else if (input_rank == 1)
+                @intCast(@min(input_shape[0], @as(usize, std.math.maxInt(u32))))
+            else
+                inferTraceSeqLen(state);
+            defer mlx_graph.freeArray(weights_handle);
+            emitLayerProgramArrayHostTracePoint(
+                state,
+                .attn_weights,
+                weights_handle,
+                "metal_attention_weights_host",
+                input_seq_len_u32,
+            );
+        }
     }
 
     fn layerProgramShortConvAdapter(
@@ -1767,6 +2160,35 @@ pub const TransformerBlock = struct {
             .out_proj = null,
             .out_proj_bf16 = null,
         };
+        if (!hasValidGatedDeltaRuntimeConfig(
+            gated_delta_binding.d_conv,
+            gated_delta_binding.n_heads,
+            gated_delta_binding.n_key_heads,
+            gated_delta_binding.d_head,
+        )) {
+            log.err(
+                "inference",
+                "Metal gated-delta runtime config invalid (fatal)",
+                .{
+                    .layer = state.layer_idx,
+                    .d_conv = gated_delta_binding.d_conv,
+                    .n_heads = gated_delta_binding.n_heads,
+                    .n_key_heads = gated_delta_binding.n_key_heads,
+                    .d_head = gated_delta_binding.d_head,
+                },
+                @src(),
+            );
+            std.debug.panic(
+                "metal gated-delta runtime config invalid: layer={} d_conv={} n_heads={} n_key_heads={} d_head={}",
+                .{
+                    state.layer_idx,
+                    gated_delta_binding.d_conv,
+                    gated_delta_binding.n_heads,
+                    gated_delta_binding.n_key_heads,
+                    gated_delta_binding.d_head,
+                },
+            );
+        }
         switch (state.runtime_meta.gated_delta_storage_kind) {
             .quantized => {
                 gated_delta_binding.in_proj = quantizedWeightFromHandle(weight_handles[0]).*;
@@ -1783,11 +2205,19 @@ pub const TransformerBlock = struct {
         gated_delta_binding.conv_bias = optionalArrayWeightFromHandle(weight_handles[4]);
         gated_delta_binding.dt_bias = optionalArrayWeightFromHandle(weight_handles[5]);
         gated_delta_binding.norm_weight = optionalArrayWeightFromHandle(weight_handles[6]);
-        const capture_enabled =
-            trace.shouldEmit(.gdelta_in_proj) or
-            trace.shouldEmit(.gdelta_conv) or
-            trace.shouldEmit(.gdelta_ssm) or
-            trace.shouldEmit(.gdelta_norm);
+        const emit_gdelta_in_proj = state.trace_enabled and trace.shouldEmit(.gdelta_in_proj);
+        const emit_gdelta_conv = state.trace_enabled and trace.shouldEmit(.gdelta_conv);
+        const emit_gdelta_ssm = state.trace_enabled and trace.shouldEmit(.gdelta_ssm);
+        const emit_gdelta_norm = state.trace_enabled and trace.shouldEmit(.gdelta_norm);
+        const emit_gdelta_state_conv = state.trace_enabled and trace.shouldEmit(.gdelta_state_conv);
+        const emit_gdelta_state_ssm = state.trace_enabled and trace.shouldEmit(.gdelta_state_ssm);
+        const emit_gdelta_out = state.trace_enabled and trace.shouldEmit(.gdelta_out);
+        const capture_enabled = emit_gdelta_in_proj or
+            emit_gdelta_conv or
+            emit_gdelta_ssm or
+            emit_gdelta_norm or
+            emit_gdelta_state_conv or
+            emit_gdelta_state_ssm;
         var gd_capture_state: gated_delta_kernel.GatedDeltaState = .{};
         const output = try runGatedDeltaKernel(
             input,
@@ -1799,20 +2229,36 @@ pub const TransformerBlock = struct {
         );
         arraySlotFromHandle(io.outputs[0]).* = output;
         if (capture_enabled) {
-            if (trace.shouldEmit(.gdelta_in_proj) and gd_capture_state.capture_in_proj != null) {
+            if (emit_gdelta_in_proj and gd_capture_state.capture_in_proj != null) {
                 emitArrayPerTokenHostTracePoint(state, gd_capture_state.capture_in_proj, .gdelta_in_proj, "metal_gdelta_in_proj_host");
             }
-            if (trace.shouldEmit(.gdelta_conv) and gd_capture_state.capture_conv != null) {
+            if (emit_gdelta_conv and gd_capture_state.capture_conv != null) {
                 emitArrayPerTokenHostTracePoint(state, gd_capture_state.capture_conv, .gdelta_conv, "metal_gdelta_conv_host");
             }
-            if (trace.shouldEmit(.gdelta_ssm) and gd_capture_state.capture_ssm != null) {
+            if (emit_gdelta_ssm and gd_capture_state.capture_ssm != null) {
                 emitArrayPerTokenHostTracePoint(state, gd_capture_state.capture_ssm, .gdelta_ssm, "metal_gdelta_ssm_host");
             }
-            if (trace.shouldEmit(.gdelta_norm) and gd_capture_state.capture_norm != null) {
+            if (emit_gdelta_norm and gd_capture_state.capture_norm != null) {
                 emitArrayPerTokenHostTracePoint(state, gd_capture_state.capture_norm, .gdelta_norm, "metal_gdelta_norm_host");
             }
+            const trace_seq_len = inferTraceSeqLen(state);
+            // Match CPU gated-delta trace semantics:
+            // - prefill emits final recurrent state at the last prefill cache slot
+            // - decode emits the updated recurrent state for the single decode step
+            //   at position 0, alongside the other single-step gated-delta points
+            const state_position: u32 = if (trace_seq_len > 1)
+                @intCast(state.pos_offset + trace_seq_len - 1)
+            else
+                0;
+            const state_token: u32 = 0;
+            if (emit_gdelta_state_conv and gd_capture_state.capture_state_conv != null) {
+                emitArrayHostTracePointAt(state, gd_capture_state.capture_state_conv, .gdelta_state_conv, state_token, state_position, "metal_gdelta_state_conv_host");
+            }
+            if (emit_gdelta_state_ssm and gd_capture_state.capture_state_ssm != null) {
+                emitArrayHostTracePointAt(state, gd_capture_state.capture_state_ssm, .gdelta_state_ssm, state_token, state_position, "metal_gdelta_state_ssm_host");
+            }
         }
-        if (trace.shouldEmit(.gdelta_out)) {
+        if (emit_gdelta_out) {
             emitArrayPerTokenHostTracePoint(state, output, .gdelta_out, "metal_gdelta_out_host");
         }
     }
@@ -2082,6 +2528,27 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        // ShortConv blocks are recurrent and require valid cache state on both
+        // prefill and decode. Silent invalid state degrades generation quality,
+        // so fail loudly on invalid handles.
+        if (!shortconv_cache.isValid() or shortconv_cache.handle == null) {
+            log.err(
+                "inference",
+                "Metal shortconv state missing or invalid (fatal)",
+                .{
+                    .pos_offset = state.pos_offset,
+                    .cache_handle = @as(usize, if (shortconv_cache.handle) |h| @intFromPtr(h) else 0),
+                },
+                @src(),
+            );
+            std.debug.panic(
+                "metal shortconv state invalid: pos_offset={} cache_handle=0x{x}",
+                .{
+                    state.pos_offset,
+                    if (shortconv_cache.handle) |h| @intFromPtr(h) else 0,
+                },
+            );
+        }
         const seq_len = inferTraceSeqLen(state);
         emitLayerProgramTracePoint(
             state,
@@ -2129,6 +2596,27 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        // Gated-delta blocks are recurrent and require valid state for both
+        // prefill and decode. A missing/invalid cache silently degrades output
+        // quality (often as repetition), so treat this as a hard invariant.
+        if (!gated_delta_cache.isValid() or gated_delta_cache.handle == null) {
+            log.err(
+                "inference",
+                "Metal gated-delta state missing or invalid (fatal)",
+                .{
+                    .pos_offset = state.pos_offset,
+                    .cache_handle = @as(usize, if (gated_delta_cache.handle) |h| @intFromPtr(h) else 0),
+                },
+                @src(),
+            );
+            std.debug.panic(
+                "metal gated-delta state invalid: pos_offset={} cache_handle=0x{x}",
+                .{
+                    state.pos_offset,
+                    if (gated_delta_cache.handle) |h| @intFromPtr(h) else 0,
+                },
+            );
+        }
         const seq_len = inferTraceSeqLen(state);
         try layerProgramGatedDeltaAdapter(
             state,
@@ -2222,6 +2710,27 @@ pub const TransformerBlock = struct {
             insn,
             state_blocks,
         );
+        // Mamba blocks are recurrent and require valid cache state on both
+        // prefill and decode. Silent invalid state degrades generation quality,
+        // so fail loudly on invalid handles.
+        if (!mamba_cache.isValid() or mamba_cache.handle == null) {
+            log.err(
+                "inference",
+                "Metal mamba state missing or invalid (fatal)",
+                .{
+                    .pos_offset = state.pos_offset,
+                    .cache_handle = @as(usize, if (mamba_cache.handle) |h| @intFromPtr(h) else 0),
+                },
+                @src(),
+            );
+            std.debug.panic(
+                "metal mamba state invalid: pos_offset={} cache_handle=0x{x}",
+                .{
+                    state.pos_offset,
+                    if (mamba_cache.handle) |h| @intFromPtr(h) else 0,
+                },
+            );
+        }
         const seq_len = inferTraceSeqLen(state);
         try layerProgramMambaAdapter(
             state,
@@ -2305,7 +2814,557 @@ pub const TransformerBlock = struct {
         );
     }
 
-    fn forwardWithProgram(
+    fn buildSyntheticWeightRefs(
+        refs_storage: []runtime_contract.WeightRef,
+        count: usize,
+    ) []const runtime_contract.WeightRef {
+        var idx: usize = 0;
+        while (idx < count) : (idx += 1) {
+            refs_storage[idx] = .{ .index = @intCast(idx) };
+        }
+        return refs_storage[0..count];
+    }
+
+    fn resolveLayerQueryGate(
+        lw: *const LayerWeights,
+    ) bool {
+        const compiled = lw.compiled_plan orelse return false;
+        for (compiled.plan.instructions) |insn| {
+            if (insn.opcode != .multihead_attention) continue;
+            const param_id = insn.param_block_id orelse return false;
+            if (param_id >= compiled.param_blocks.len) return false;
+            const param = runtime_contract.paramAs(
+                runtime_contract.AttentionKernelParam,
+                compiled.param_blocks[param_id .. param_id + 1],
+                .multihead_attention,
+            ) catch return false;
+            return param.query_gate != 0;
+        }
+        return false;
+    }
+
+    fn optionalStateValueById(
+        comptime T: type,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+        state_id: u8,
+    ) ?T {
+        const state_block = runtime_contract.findStateBlock(state_blocks, state_id) orelse return null;
+        const direct_ptr: *const T = runtime_contract.stateValueFromBlock(
+            *const T,
+            state_block,
+        ) orelse return null;
+        return direct_ptr.*;
+    }
+
+    fn optionalHandle(value: ?mlx_graph.ArrayHandle) mlx_graph.ArrayHandle {
+        return if (value) |h| h else null;
+    }
+
+    fn requireStateValueById(
+        comptime T: type,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+        state_id: u8,
+    ) !T {
+        return optionalStateValueById(T, state_blocks, state_id) orelse error.InvalidStateDescriptorBinding;
+    }
+
+    fn runDirectNorm(
+        state: *LayerProgramExecutionContext,
+        input: mlx_graph.ArrayHandle,
+        norm_weight: mlx_graph.ArrayHandle,
+    ) !mlx_graph.ArrayHandle {
+        const input_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+        const output_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+        var weight_refs_storage: [2]runtime_contract.WeightRef = undefined;
+        const weight_refs = buildSyntheticWeightRefs(weight_refs_storage[0..], runtime_contract.expectedWeightRefCount(.rmsnorm));
+        const insn = runtime_contract.Instruction{
+            .opcode = .rmsnorm,
+            .inputs = input_regs[0..],
+            .outputs = output_regs[0..],
+            .weights = weight_refs,
+            .param_block_id = null,
+            .state_block_id = null,
+        };
+        var input_slot = input;
+        var output_slot: mlx_graph.ArrayHandle = null;
+        var norm_weight_slot = norm_weight;
+        var optional_bias_slot: mlx_graph.ArrayHandle = null;
+        var handles: [4]runtime_contract.TensorHandle = undefined;
+        handles[0] = .{ .register = runtime_contract.registerFromIndex(0), .ptr = @ptrCast(&input_slot) };
+        handles[1] = .{ .register = runtime_contract.registerFromIndex(1), .ptr = @ptrCast(&output_slot) };
+        handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&norm_weight_slot) };
+        handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&optional_bias_slot) };
+        try layerProgramNormAdapter(state, &insn, handles[0..]);
+        return output_slot;
+    }
+
+    fn runDirectAttention(
+        state: *LayerProgramExecutionContext,
+        lw: *const LayerWeights,
+        input: mlx_graph.ArrayHandle,
+        cache: ?Cache,
+        query_gate: bool,
+    ) !mlx_graph.ArrayHandle {
+        const is_mla = state.runtime_meta.mla_storage_kind != .missing;
+        const opcode: opcode_map.Opcode = if (is_mla) .mla_attention else .multihead_attention;
+        const weight_count = runtime_contract.expectedWeightRefCount(opcode);
+        var input_slot = input;
+        var output_slot: mlx_graph.ArrayHandle = null;
+        const input_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+        const output_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+        var weight_refs_storage: [11]runtime_contract.WeightRef = undefined;
+        if (weight_count > weight_refs_storage.len) return error.InvalidWeightRefCount;
+        const weight_refs = buildSyntheticWeightRefs(weight_refs_storage[0..], weight_count);
+        const insn = runtime_contract.Instruction{
+            .opcode = opcode,
+            .inputs = input_regs[0..],
+            .outputs = output_regs[0..],
+            .weights = weight_refs,
+            .param_block_id = null,
+            .state_block_id = if (is_mla) runtime_contract.kv_cache_state_id else runtime_contract.kv_cache_state_id,
+        };
+
+        var handles: [13]runtime_contract.TensorHandle = undefined;
+        handles[0] = .{ .register = runtime_contract.registerFromIndex(0), .ptr = @ptrCast(&input_slot) };
+        handles[1] = .{ .register = runtime_contract.registerFromIndex(1), .ptr = @ptrCast(&output_slot) };
+
+        var q_proj_quant: WeightHandles.QuantizedWeight = undefined;
+        var k_proj_quant: WeightHandles.QuantizedWeight = undefined;
+        var v_proj_quant: WeightHandles.QuantizedWeight = undefined;
+        var o_proj_quant: WeightHandles.QuantizedWeight = undefined;
+
+        var q_proj_dense: mlx_graph.ArrayHandle = null;
+        var k_proj_dense: mlx_graph.ArrayHandle = null;
+        var v_proj_dense: mlx_graph.ArrayHandle = null;
+        var o_proj_dense: mlx_graph.ArrayHandle = null;
+        var q_norm_dense: mlx_graph.ArrayHandle = optionalHandle(lw.q_norm);
+        var k_norm_dense: mlx_graph.ArrayHandle = optionalHandle(lw.k_norm);
+        var q_bias_dense: mlx_graph.ArrayHandle = optionalHandle(lw.q_bias);
+        var k_bias_dense: mlx_graph.ArrayHandle = optionalHandle(lw.k_bias);
+        var v_bias_dense: mlx_graph.ArrayHandle = optionalHandle(lw.v_bias);
+        var o_bias_dense: mlx_graph.ArrayHandle = optionalHandle(lw.o_bias);
+        var attn_sinks_dense: mlx_graph.ArrayHandle = optionalHandle(lw.attn_sinks);
+
+        var mla_q_a_quant: WeightHandles.QuantizedWeight = undefined;
+        var mla_q_b_quant: WeightHandles.QuantizedWeight = undefined;
+        var mla_kv_a_quant: WeightHandles.QuantizedWeight = undefined;
+        var mla_kv_b_quant: WeightHandles.QuantizedWeight = undefined;
+        var mla_o_quant: WeightHandles.QuantizedWeight = undefined;
+
+        var mla_q_a_dense: mlx_graph.ArrayHandle = optionalHandle(lw.mla_q_a_proj_bf16);
+        var mla_q_b_dense: mlx_graph.ArrayHandle = optionalHandle(lw.mla_q_b_proj_bf16);
+        var mla_kv_a_dense: mlx_graph.ArrayHandle = optionalHandle(lw.mla_kv_a_proj_bf16);
+        var mla_kv_b_dense: mlx_graph.ArrayHandle = optionalHandle(lw.mla_kv_b_proj_bf16);
+        var mla_o_dense: mlx_graph.ArrayHandle = optionalHandle(lw.o_proj_bf16);
+        var mla_q_a_norm_dense: mlx_graph.ArrayHandle = optionalHandle(lw.mla_q_a_norm);
+        var mla_kv_a_norm_dense: mlx_graph.ArrayHandle = optionalHandle(lw.mla_kv_a_norm);
+
+        if (!is_mla) {
+            switch (state.runtime_meta.attention_storage_kind) {
+                .quantized => {
+                    q_proj_quant = lw.q_proj orelse return error.MissingField;
+                    k_proj_quant = lw.k_proj orelse return error.MissingField;
+                    v_proj_quant = lw.v_proj orelse return error.MissingField;
+                    o_proj_quant = lw.o_proj orelse return error.MissingField;
+                    handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&q_proj_quant) };
+                    handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&k_proj_quant) };
+                    handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&v_proj_quant) };
+                    handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&o_proj_quant) };
+                },
+                .mixed_qkv_quantized_o_dense => {
+                    q_proj_quant = lw.q_proj orelse return error.MissingField;
+                    k_proj_quant = lw.k_proj orelse return error.MissingField;
+                    v_proj_quant = lw.v_proj orelse return error.MissingField;
+                    o_proj_dense = optionalHandle(lw.o_proj_bf16);
+                    handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&q_proj_quant) };
+                    handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&k_proj_quant) };
+                    handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&v_proj_quant) };
+                    handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&o_proj_dense) };
+                },
+                .dense => {
+                    q_proj_dense = optionalHandle(lw.q_proj_bf16);
+                    k_proj_dense = optionalHandle(lw.k_proj_bf16);
+                    v_proj_dense = optionalHandle(lw.v_proj_bf16);
+                    o_proj_dense = optionalHandle(lw.o_proj_bf16);
+                    handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&q_proj_dense) };
+                    handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&k_proj_dense) };
+                    handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&v_proj_dense) };
+                    handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&o_proj_dense) };
+                },
+                else => return error.InvalidTensorType,
+            }
+            handles[6] = .{ .register = runtime_contract.registerFromIndex(6), .ptr = @ptrCast(&q_norm_dense) };
+            handles[7] = .{ .register = runtime_contract.registerFromIndex(7), .ptr = @ptrCast(&k_norm_dense) };
+            handles[8] = .{ .register = runtime_contract.registerFromIndex(8), .ptr = @ptrCast(&q_bias_dense) };
+            handles[9] = .{ .register = runtime_contract.registerFromIndex(9), .ptr = @ptrCast(&k_bias_dense) };
+            handles[10] = .{ .register = runtime_contract.registerFromIndex(10), .ptr = @ptrCast(&v_bias_dense) };
+            handles[11] = .{ .register = runtime_contract.registerFromIndex(11), .ptr = @ptrCast(&o_bias_dense) };
+            handles[12] = .{ .register = runtime_contract.registerFromIndex(12), .ptr = @ptrCast(&attn_sinks_dense) };
+        } else {
+            switch (state.runtime_meta.mla_storage_kind) {
+                .quantized => {
+                    mla_q_a_quant = lw.mla_q_a_proj orelse return error.MissingField;
+                    mla_q_b_quant = lw.mla_q_b_proj orelse return error.MissingField;
+                    mla_kv_a_quant = lw.mla_kv_a_proj orelse return error.MissingField;
+                    mla_kv_b_quant = lw.mla_kv_b_proj orelse return error.MissingField;
+                    mla_o_quant = lw.o_proj orelse return error.MissingField;
+                    handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&mla_q_a_quant) };
+                    handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&mla_q_a_norm_dense) };
+                    handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&mla_q_b_quant) };
+                    handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&mla_kv_a_quant) };
+                    handles[6] = .{ .register = runtime_contract.registerFromIndex(6), .ptr = @ptrCast(&mla_kv_a_norm_dense) };
+                    handles[7] = .{ .register = runtime_contract.registerFromIndex(7), .ptr = @ptrCast(&mla_kv_b_quant) };
+                    handles[8] = .{ .register = runtime_contract.registerFromIndex(8), .ptr = @ptrCast(&mla_o_quant) };
+                },
+                .dense => {
+                    handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&mla_q_a_dense) };
+                    handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&mla_q_a_norm_dense) };
+                    handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&mla_q_b_dense) };
+                    handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&mla_kv_a_dense) };
+                    handles[6] = .{ .register = runtime_contract.registerFromIndex(6), .ptr = @ptrCast(&mla_kv_a_norm_dense) };
+                    handles[7] = .{ .register = runtime_contract.registerFromIndex(7), .ptr = @ptrCast(&mla_kv_b_dense) };
+                    handles[8] = .{ .register = runtime_contract.registerFromIndex(8), .ptr = @ptrCast(&mla_o_dense) };
+                },
+                else => return error.InvalidTensorType,
+            }
+        }
+
+        try layerProgramAttentionAdapter(
+            state,
+            &insn,
+            handles[0 .. 2 + weight_count],
+            cache,
+            query_gate,
+        );
+        return output_slot;
+    }
+
+    fn runDirectShortConv(
+        state: *LayerProgramExecutionContext,
+        lw: *const LayerWeights,
+        input: mlx_graph.ArrayHandle,
+        shortconv_cache: ShortConvCache,
+    ) !mlx_graph.ArrayHandle {
+        const weight_count = runtime_contract.expectedWeightRefCount(.shortconv);
+        var weight_refs_storage: [4]runtime_contract.WeightRef = undefined;
+        const weight_refs = buildSyntheticWeightRefs(weight_refs_storage[0..], weight_count);
+        const input_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+        const output_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+        const insn = runtime_contract.Instruction{
+            .opcode = .shortconv,
+            .inputs = input_regs[0..],
+            .outputs = output_regs[0..],
+            .weights = weight_refs,
+            .param_block_id = null,
+            .state_block_id = runtime_contract.shortconv_state_id,
+        };
+
+        var input_slot = input;
+        var output_slot: mlx_graph.ArrayHandle = null;
+        var in_proj_quant: WeightHandles.QuantizedWeight = undefined;
+        var out_proj_quant: WeightHandles.QuantizedWeight = undefined;
+        var in_proj_dense: mlx_graph.ArrayHandle = optionalHandle(lw.shortconv_in_proj_bf16);
+        var out_proj_dense: mlx_graph.ArrayHandle = optionalHandle(lw.shortconv_out_proj_bf16);
+        var conv_weight: mlx_graph.ArrayHandle = lw.shortconv_conv_weight orelse return error.MissingField;
+        var conv_bias: mlx_graph.ArrayHandle = optionalHandle(lw.shortconv_conv_bias);
+        var handles: [6]runtime_contract.TensorHandle = undefined;
+        handles[0] = .{ .register = runtime_contract.registerFromIndex(0), .ptr = @ptrCast(&input_slot) };
+        handles[1] = .{ .register = runtime_contract.registerFromIndex(1), .ptr = @ptrCast(&output_slot) };
+        switch (state.runtime_meta.shortconv_storage_kind) {
+            .quantized => {
+                in_proj_quant = lw.shortconv_in_proj orelse return error.MissingField;
+                out_proj_quant = lw.shortconv_out_proj orelse return error.MissingField;
+                handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&in_proj_quant) };
+                handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&out_proj_quant) };
+            },
+            .dense => {
+                handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&in_proj_dense) };
+                handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&out_proj_dense) };
+            },
+            else => return error.InvalidTensorType,
+        }
+        handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&conv_weight) };
+        handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&conv_bias) };
+        try layerProgramShortConvAdapter(state, &insn, handles[0..], shortconv_cache);
+        return output_slot;
+    }
+
+    fn runDirectGatedDelta(
+        state: *LayerProgramExecutionContext,
+        lw: *const LayerWeights,
+        input: mlx_graph.ArrayHandle,
+        gated_delta_cache: GatedDeltaCache,
+    ) !mlx_graph.ArrayHandle {
+        const weight_count = runtime_contract.expectedWeightRefCount(.gated_delta_net);
+        var weight_refs_storage: [7]runtime_contract.WeightRef = undefined;
+        const weight_refs = buildSyntheticWeightRefs(weight_refs_storage[0..], weight_count);
+        const input_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+        const output_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+        const insn = runtime_contract.Instruction{
+            .opcode = .gated_delta_net,
+            .inputs = input_regs[0..],
+            .outputs = output_regs[0..],
+            .weights = weight_refs,
+            .param_block_id = null,
+            .state_block_id = runtime_contract.gated_delta_state_id,
+        };
+
+        var input_slot = input;
+        var output_slot: mlx_graph.ArrayHandle = null;
+        var in_proj_quant: WeightHandles.QuantizedWeight = undefined;
+        var out_proj_quant: WeightHandles.QuantizedWeight = undefined;
+        var in_proj_dense: mlx_graph.ArrayHandle = optionalHandle(lw.gated_delta_in_proj_bf16);
+        var out_proj_dense: mlx_graph.ArrayHandle = optionalHandle(lw.gated_delta_out_proj_bf16);
+        var conv_weight: mlx_graph.ArrayHandle = lw.gated_delta_conv_weight orelse return error.MissingField;
+        var a_log: mlx_graph.ArrayHandle = lw.gated_delta_a_log orelse return error.MissingField;
+        var conv_bias: mlx_graph.ArrayHandle = optionalHandle(lw.gated_delta_conv_bias);
+        var dt_bias: mlx_graph.ArrayHandle = optionalHandle(lw.gated_delta_dt_bias);
+        var norm_weight: mlx_graph.ArrayHandle = optionalHandle(lw.gated_delta_norm_weight);
+        var handles: [9]runtime_contract.TensorHandle = undefined;
+        handles[0] = .{ .register = runtime_contract.registerFromIndex(0), .ptr = @ptrCast(&input_slot) };
+        handles[1] = .{ .register = runtime_contract.registerFromIndex(1), .ptr = @ptrCast(&output_slot) };
+        switch (state.runtime_meta.gated_delta_storage_kind) {
+            .quantized => {
+                in_proj_quant = lw.gated_delta_in_proj orelse return error.MissingField;
+                out_proj_quant = lw.gated_delta_out_proj orelse return error.MissingField;
+                handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&in_proj_quant) };
+                handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&out_proj_quant) };
+            },
+            .dense => {
+                handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&in_proj_dense) };
+                handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&out_proj_dense) };
+            },
+            else => return error.InvalidTensorType,
+        }
+        handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&conv_weight) };
+        handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&a_log) };
+        handles[6] = .{ .register = runtime_contract.registerFromIndex(6), .ptr = @ptrCast(&conv_bias) };
+        handles[7] = .{ .register = runtime_contract.registerFromIndex(7), .ptr = @ptrCast(&dt_bias) };
+        handles[8] = .{ .register = runtime_contract.registerFromIndex(8), .ptr = @ptrCast(&norm_weight) };
+        try layerProgramGatedDeltaAdapter(state, &insn, handles[0..], gated_delta_cache);
+        return output_slot;
+    }
+
+    fn runDirectMamba(
+        state: *LayerProgramExecutionContext,
+        lw: *const LayerWeights,
+        input: mlx_graph.ArrayHandle,
+        mamba_cache: MambaCache,
+    ) !mlx_graph.ArrayHandle {
+        const weight_count = runtime_contract.expectedWeightRefCount(.mamba_mixer);
+        var weight_refs_storage: [12]runtime_contract.WeightRef = undefined;
+        const weight_refs = buildSyntheticWeightRefs(weight_refs_storage[0..], weight_count);
+        const input_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+        const output_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+        const insn = runtime_contract.Instruction{
+            .opcode = .mamba_mixer,
+            .inputs = input_regs[0..],
+            .outputs = output_regs[0..],
+            .weights = weight_refs,
+            .param_block_id = null,
+            .state_block_id = runtime_contract.mamba_state_id,
+        };
+
+        var input_slot = input;
+        var output_slot: mlx_graph.ArrayHandle = null;
+        var in_proj_quant: WeightHandles.QuantizedWeight = undefined;
+        var out_proj_quant: WeightHandles.QuantizedWeight = undefined;
+        var in_proj_dense: mlx_graph.ArrayHandle = optionalHandle(lw.mamba_in_proj_bf16);
+        var out_proj_dense: mlx_graph.ArrayHandle = optionalHandle(lw.mamba_out_proj_bf16);
+        var conv_weight: mlx_graph.ArrayHandle = lw.mamba_conv_weight orelse return error.MissingField;
+        var a_log: mlx_graph.ArrayHandle = lw.mamba_a_log orelse return error.MissingField;
+        var d_skip: mlx_graph.ArrayHandle = lw.mamba_d_skip orelse return error.MissingField;
+        var conv_bias: mlx_graph.ArrayHandle = optionalHandle(lw.mamba_conv_bias);
+        var dt_bias: mlx_graph.ArrayHandle = optionalHandle(lw.mamba_dt_bias);
+        var norm_weight: mlx_graph.ArrayHandle = optionalHandle(lw.mamba_norm_weight);
+        var ln1_weight: mlx_graph.ArrayHandle = lw.ln1_weight;
+        var ln2_weight: mlx_graph.ArrayHandle = lw.ln2_weight;
+        var gate_up_quant: WeightHandles.QuantizedWeight = undefined;
+        var down_proj_quant: WeightHandles.QuantizedWeight = undefined;
+        var gate_up_dense: mlx_graph.ArrayHandle = optionalHandle(lw.mamba_gate_up_bf16);
+        var down_proj_dense: mlx_graph.ArrayHandle = optionalHandle(lw.mamba_down_proj_bf16);
+        var handles: [14]runtime_contract.TensorHandle = undefined;
+        handles[0] = .{ .register = runtime_contract.registerFromIndex(0), .ptr = @ptrCast(&input_slot) };
+        handles[1] = .{ .register = runtime_contract.registerFromIndex(1), .ptr = @ptrCast(&output_slot) };
+        switch (state.runtime_meta.mamba_storage_kind) {
+            .quantized => {
+                in_proj_quant = lw.mamba_in_proj orelse return error.MissingField;
+                out_proj_quant = lw.mamba_out_proj orelse return error.MissingField;
+                handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&in_proj_quant) };
+                handles[6] = .{ .register = runtime_contract.registerFromIndex(6), .ptr = @ptrCast(&out_proj_quant) };
+            },
+            .dense => {
+                handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&in_proj_dense) };
+                handles[6] = .{ .register = runtime_contract.registerFromIndex(6), .ptr = @ptrCast(&out_proj_dense) };
+            },
+            else => return error.InvalidTensorType,
+        }
+        handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&conv_weight) };
+        handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&a_log) };
+        handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&d_skip) };
+        handles[7] = .{ .register = runtime_contract.registerFromIndex(7), .ptr = @ptrCast(&conv_bias) };
+        handles[8] = .{ .register = runtime_contract.registerFromIndex(8), .ptr = @ptrCast(&dt_bias) };
+        handles[9] = .{ .register = runtime_contract.registerFromIndex(9), .ptr = @ptrCast(&norm_weight) };
+        handles[10] = .{ .register = runtime_contract.registerFromIndex(10), .ptr = @ptrCast(&ln1_weight) };
+        handles[11] = .{ .register = runtime_contract.registerFromIndex(11), .ptr = @ptrCast(&ln2_weight) };
+        if (state.runtime_meta.mamba_storage_kind == .quantized) {
+            if (lw.mamba_gate_up) |w| {
+                gate_up_quant = w;
+                handles[12] = .{ .register = runtime_contract.registerFromIndex(12), .ptr = @ptrCast(&gate_up_quant) };
+            } else {
+                handles[12] = .{ .register = runtime_contract.registerFromIndex(12), .ptr = weights_mod.missingOptionalWeightPtr() };
+            }
+            if (lw.mamba_down_proj) |w| {
+                down_proj_quant = w;
+                handles[13] = .{ .register = runtime_contract.registerFromIndex(13), .ptr = @ptrCast(&down_proj_quant) };
+            } else {
+                handles[13] = .{ .register = runtime_contract.registerFromIndex(13), .ptr = weights_mod.missingOptionalWeightPtr() };
+            }
+        } else {
+            if (lw.mamba_gate_up_bf16 != null) {
+                handles[12] = .{ .register = runtime_contract.registerFromIndex(12), .ptr = @ptrCast(&gate_up_dense) };
+            } else {
+                handles[12] = .{ .register = runtime_contract.registerFromIndex(12), .ptr = weights_mod.missingOptionalWeightPtr() };
+            }
+            if (lw.mamba_down_proj_bf16 != null) {
+                handles[13] = .{ .register = runtime_contract.registerFromIndex(13), .ptr = @ptrCast(&down_proj_dense) };
+            } else {
+                handles[13] = .{ .register = runtime_contract.registerFromIndex(13), .ptr = weights_mod.missingOptionalWeightPtr() };
+            }
+        }
+        try layerProgramMambaAdapter(state, &insn, handles[0..], mamba_cache);
+        return output_slot;
+    }
+
+    fn runDirectSwiGlu(
+        state: *LayerProgramExecutionContext,
+        lw: *const LayerWeights,
+        input: mlx_graph.ArrayHandle,
+    ) !mlx_graph.ArrayHandle {
+        const weight_count = runtime_contract.expectedWeightRefCount(.swiglu);
+        var weight_refs_storage: [5]runtime_contract.WeightRef = undefined;
+        if (weight_count > weight_refs_storage.len) return error.InvalidWeightRefCount;
+        const weight_refs = buildSyntheticWeightRefs(weight_refs_storage[0..], weight_count);
+        const input_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+        const output_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+        const insn = runtime_contract.Instruction{
+            .opcode = .swiglu,
+            .inputs = input_regs[0..],
+            .outputs = output_regs[0..],
+            .weights = weight_refs,
+            .param_block_id = null,
+            .state_block_id = null,
+        };
+
+        var input_slot = input;
+        var output_slot: mlx_graph.ArrayHandle = null;
+        var w1_quant: WeightHandles.QuantizedWeight = undefined;
+        var w3_quant: WeightHandles.QuantizedWeight = undefined;
+        var w2_quant: WeightHandles.QuantizedWeight = undefined;
+        var w1_dense: mlx_graph.ArrayHandle = optionalHandle(lw.w1_bf16);
+        var w3_dense: mlx_graph.ArrayHandle = optionalHandle(lw.w3_bf16);
+        var w2_dense: mlx_graph.ArrayHandle = optionalHandle(lw.w2_bf16);
+        var w1_bias: mlx_graph.ArrayHandle = null;
+        var w2_bias: mlx_graph.ArrayHandle = null;
+        var handles: [7]runtime_contract.TensorHandle = undefined;
+        handles[0] = .{ .register = runtime_contract.registerFromIndex(0), .ptr = @ptrCast(&input_slot) };
+        handles[1] = .{ .register = runtime_contract.registerFromIndex(1), .ptr = @ptrCast(&output_slot) };
+        switch (state.runtime_meta.ffn_storage_kind) {
+            .quantized => {
+                w1_quant = lw.w1 orelse return error.MissingField;
+                w3_quant = lw.w3 orelse return error.MissingField;
+                w2_quant = lw.w2 orelse return error.MissingField;
+                handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&w1_quant) };
+                handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&w3_quant) };
+                handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&w2_quant) };
+            },
+            .dense => {
+                handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&w1_dense) };
+                handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&w3_dense) };
+                handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&w2_dense) };
+            },
+            else => return error.InvalidTensorType,
+        }
+        handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&w1_bias) };
+        handles[6] = .{ .register = runtime_contract.registerFromIndex(6), .ptr = @ptrCast(&w2_bias) };
+        try layerProgramSwiGluAdapter(state, &insn, handles[0 .. 2 + weight_count]);
+        return output_slot;
+    }
+
+    fn runDirectMoe(
+        state: *LayerProgramExecutionContext,
+        lw: *const LayerWeights,
+        input: mlx_graph.ArrayHandle,
+    ) !mlx_graph.ArrayHandle {
+        const moe = lw.moe orelse return error.MissingField;
+        const weight_count = runtime_contract.expectedWeightRefCount(.moe);
+        var weight_refs_storage: [13]runtime_contract.WeightRef = undefined;
+        if (weight_count > weight_refs_storage.len) return error.InvalidWeightRefCount;
+        const weight_refs = buildSyntheticWeightRefs(weight_refs_storage[0..], weight_count);
+        const input_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+        const output_regs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+        const insn = runtime_contract.Instruction{
+            .opcode = .moe,
+            .inputs = input_regs[0..],
+            .outputs = output_regs[0..],
+            .weights = weight_refs,
+            .param_block_id = null,
+            .state_block_id = null,
+        };
+        var input_slot = input;
+        var output_slot: mlx_graph.ArrayHandle = null;
+        var router_w = moe.router_w;
+        var gate_w = moe.gate_w;
+        var up_w = moe.up_w;
+        var down_w = moe.down_w;
+        var router_bias: mlx_graph.ArrayHandle = optionalHandle(moe.router_bias);
+        var gate_s = moe.gate_s;
+        var up_s = moe.up_s;
+        var down_s = moe.down_s;
+        var gate_bias: mlx_graph.ArrayHandle = optionalHandle(moe.gate_bias);
+        var up_bias: mlx_graph.ArrayHandle = optionalHandle(moe.up_bias);
+        var down_bias: mlx_graph.ArrayHandle = optionalHandle(moe.down_bias);
+        var router_s: mlx_graph.ArrayHandle = optionalHandle(moe.router_s);
+        var router_b: mlx_graph.ArrayHandle = optionalHandle(moe.router_b);
+        var handles: [15]runtime_contract.TensorHandle = undefined;
+        handles[0] = .{ .register = runtime_contract.registerFromIndex(0), .ptr = @ptrCast(&input_slot) };
+        handles[1] = .{ .register = runtime_contract.registerFromIndex(1), .ptr = @ptrCast(&output_slot) };
+        handles[2] = .{ .register = runtime_contract.registerFromIndex(2), .ptr = @ptrCast(&router_w) };
+        handles[3] = .{ .register = runtime_contract.registerFromIndex(3), .ptr = @ptrCast(&gate_w) };
+        handles[4] = .{ .register = runtime_contract.registerFromIndex(4), .ptr = @ptrCast(&up_w) };
+        handles[5] = .{ .register = runtime_contract.registerFromIndex(5), .ptr = @ptrCast(&down_w) };
+        handles[6] = .{ .register = runtime_contract.registerFromIndex(6), .ptr = @ptrCast(&router_bias) };
+        handles[7] = .{ .register = runtime_contract.registerFromIndex(7), .ptr = @ptrCast(&gate_s) };
+        handles[8] = .{ .register = runtime_contract.registerFromIndex(8), .ptr = @ptrCast(&up_s) };
+        handles[9] = .{ .register = runtime_contract.registerFromIndex(9), .ptr = @ptrCast(&down_s) };
+        handles[10] = .{ .register = runtime_contract.registerFromIndex(10), .ptr = @ptrCast(&gate_bias) };
+        handles[11] = .{ .register = runtime_contract.registerFromIndex(11), .ptr = @ptrCast(&up_bias) };
+        handles[12] = .{ .register = runtime_contract.registerFromIndex(12), .ptr = @ptrCast(&down_bias) };
+        handles[13] = .{ .register = runtime_contract.registerFromIndex(13), .ptr = @ptrCast(&router_s) };
+        handles[14] = .{ .register = runtime_contract.registerFromIndex(14), .ptr = @ptrCast(&router_b) };
+        try layerProgramMoeAdapter(state, &insn, handles[0 .. 2 + weight_count]);
+        return output_slot;
+    }
+
+    fn directResidualAdd(
+        state: *LayerProgramExecutionContext,
+        residual: *mlx_graph.ArrayHandle,
+        branch: mlx_graph.ArrayHandle,
+    ) void {
+        const scale = residualScale(.residual_multiplier, state.runtime_meta.residual_multiplier);
+        const scaled = if (scale == 1.0) branch else mlx_graph.mlx_lazy_multiply_scalar(branch, scale);
+        residual.* = mlx_graph.mlx_lazy_add(residual.*, scaled);
+        const seq_len = inferTraceSeqLen(state);
+        emitLayerProgramTracePoint(
+            state,
+            .block_out,
+            traceShapeBsd(seq_len, @intCast(state.runtime_meta.model_config.d_model)),
+            3,
+            "metal_residual_add",
+        );
+    }
+
+    fn forwardDirect(
         hidden: mlx_graph.ArrayHandle,
         lw: *const LayerWeights,
         config: ModelConfig,
@@ -2319,46 +3378,27 @@ pub const TransformerBlock = struct {
     ) !mlx_graph.ArrayHandle {
         const compiled_plan = lw.compiled_plan orelse return error.NotImplemented;
         var residual = hidden;
-        const required_slot_count = blk: {
-            var required: usize = 0;
-            for (lw.register_to_slot_map) |slot_idx| {
-                if (slot_idx == std.math.maxInt(u8)) continue;
-                const next = @as(usize, slot_idx) + 1;
-                if (next > required) required = next;
-            }
-            break :blk required;
-        };
-        if (required_slot_count > lw.slot_scratch.len) return error.InvalidInstructionBinding;
-        for (lw.slot_scratch[0..required_slot_count]) |*slot| {
-            slot.* = hidden;
-        }
-        const slot_buffers = lw.slot_scratch[0..required_slot_count];
-        const active_slots: [1]usize = .{0};
-        const sequence_lengths: [1]u32 = .{0};
-        var rt_ctx = runtime_contract.ExecutionContext{
-            .mode = .decode,
-            .active_slots = active_slots[0..],
-            .sequence_lengths = sequence_lengths[0..],
-            .batch_size = 1,
-            .dispatch_counters = if (enable_dispatch_observability) &layer_program_dispatch_counters else null,
-            .workspace = .{ .any = null },
-        };
-        if (comptime std.debug.runtime_safety) {
-            try runtime_contract.validateExecutionContext(&rt_ctx);
-        }
-        var exec_ctx = LayerProgramExecutionContext{
+        var empty_register_map: [0]u8 = .{};
+        var empty_handle_scratch: [0]runtime_contract.TensorHandle = .{};
+        var empty_view_scratch: [0]runtime_contract.TensorViewDesc = .{};
+        var empty_slots: [0]mlx_graph.ArrayHandle = .{};
+        var empty_weight_ptrs: [0]?*anyopaque = .{};
+        var direct_ctx = LayerProgramExecutionContext{
             .compiled_plan = &compiled_plan,
             .layer_weights = lw,
             .layer_idx = layer_idx,
             .pos_offset = pos_offset,
+            .trace_enabled = trace.isEnabled(),
+            .debug_attn_norm_enabled = envFlagEnabledCached("TALU_DBG_ATTN_NORM"),
+            .allow_rms_swiglu_fusion = !envFlagEnabledCached("TALU_METAL_DISABLE_RMS_SWIGLU_FUSION"),
             .runtime_rope_cos_handle = runtime_rope_cos_handle,
             .runtime_rope_sin_handle = runtime_rope_sin_handle,
             .runtime_rope_dim = runtime_rope_dim,
             .residual = &residual,
-            .slot_buffers = slot_buffers,
-            .register_to_slot_map = lw.register_to_slot_map,
-            .instruction_handles = lw.instruction_handle_scratch,
-            .instruction_views = lw.instruction_view_scratch,
+            .slot_buffers = empty_slots[0..],
+            .register_to_slot_map = empty_register_map[0..],
+            .instruction_handles = empty_handle_scratch[0..],
+            .instruction_views = empty_view_scratch[0..],
             .runtime_meta = .{
                 .model_config = config,
                 .residual_multiplier = weight_handles.residual_multiplier,
@@ -2388,49 +3428,138 @@ pub const TransformerBlock = struct {
                 .mamba_n_groups = lw.mamba_n_groups,
                 .mamba_gate_up_layout = @intFromEnum(lw.mamba_gate_up_layout),
             },
-            .resolved_weight_ptrs = lw.weight_ptr_scratch,
+            .resolved_weight_ptrs = empty_weight_ptrs[0..],
         };
-        buildRmsNormWeightOrder(&exec_ctx);
-        if (exec_ctx.resolved_weight_ptrs.len != lw.weight_binding_keys.len) {
-            return error.InvalidWeightRefCount;
-        }
-        try bindLayerProgramStateDescriptors(&exec_ctx, &compiled_plan.plan, state_blocks);
 
-        var insn_idx: usize = 0;
-        // XRAY ACCEPTABLE USE:
-        // Fusion policy is a production performance decision. Verify/tracing
-        // must not alter fusion on/off.
-        const allow_rms_swiglu_fusion = std.posix.getenv("TALU_METAL_DISABLE_RMS_SWIGLU_FUSION") == null;
-        while (insn_idx < compiled_plan.plan.instructions.len) {
-            const insn = &compiled_plan.plan.instructions[insn_idx];
-            if (insn_idx + 1 < compiled_plan.plan.instructions.len) {
-                const next_insn = &compiled_plan.plan.instructions[insn_idx + 1];
-                if (allow_rms_swiglu_fusion and canFuseDenseRmsNormSwiGlu(&exec_ctx, insn, next_insn)) {
-                    if (enable_dispatch_observability) {
-                        runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
-                        runtime_contract.recordExecutionDispatch(&rt_ctx, next_insn.opcode);
-                    }
-                    try runDenseRmsNormSwiGluFusion(&exec_ctx, insn, next_insn);
-                    insn_idx += 2;
-                    continue;
+        const norm1 = try runDirectNorm(&direct_ctx, residual, lw.ln1_weight);
+        emitArrayPerTokenHostTracePoint(&direct_ctx, norm1, .layer_attn_norm, "metal_rmsnorm_host");
+
+        var mixer_out: mlx_graph.ArrayHandle = null;
+        switch (lw.kind) {
+            .attention_mlp => {
+                const seq_len = inferTraceSeqLen(&direct_ctx);
+                const q_dim: u32 = if (direct_ctx.runtime_meta.mla_storage_kind != .missing)
+                    @intCast(direct_ctx.runtime_meta.model_config.d_model)
+                else
+                    @intCast(direct_ctx.runtime_meta.model_config.n_heads * direct_ctx.runtime_meta.model_config.head_dim);
+                emitLayerProgramTracePoint(
+                    &direct_ctx,
+                    .attn_q,
+                    traceShapeBsd(seq_len, q_dim),
+                    3,
+                    "metal_attention_q",
+                );
+                const kv_cache = optionalStateValueById(
+                    Cache,
+                    state_blocks,
+                    runtime_contract.kv_cache_state_id,
+                );
+                mixer_out = try runDirectAttention(
+                    &direct_ctx,
+                    lw,
+                    norm1,
+                    kv_cache,
+                    resolveLayerQueryGate(lw),
+                );
+                emitArrayPerTokenHostTracePoint(&direct_ctx, mixer_out, .attn_out, "metal_attention_out_host");
+            },
+            .shortconv => {
+                const shortconv_cache = try requireStateValueById(
+                    ShortConvCache,
+                    state_blocks,
+                    runtime_contract.shortconv_state_id,
+                );
+                if (!shortconv_cache.isValid() or shortconv_cache.handle == null) {
+                    return error.InvalidStateDescriptorBinding;
                 }
-                if (allow_rms_swiglu_fusion and canFuseQuantizedRmsNormSwiGlu(&exec_ctx, insn, next_insn)) {
-                    if (enable_dispatch_observability) {
-                        runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
-                        runtime_contract.recordExecutionDispatch(&rt_ctx, next_insn.opcode);
-                    }
-                    try runQuantizedRmsNormSwiGluFusion(&exec_ctx, insn, next_insn);
-                    insn_idx += 2;
-                    continue;
+                const seq_len = inferTraceSeqLen(&direct_ctx);
+                emitLayerProgramTracePoint(
+                    &direct_ctx,
+                    .conv_in_proj,
+                    traceShapeBsd(seq_len, @intCast(direct_ctx.runtime_meta.shortconv_conv_dim * 3)),
+                    3,
+                    "metal_shortconv_in_proj",
+                );
+                mixer_out = try runDirectShortConv(&direct_ctx, lw, norm1, shortconv_cache);
+                emitLayerProgramTracePoint(
+                    &direct_ctx,
+                    .conv_out_proj,
+                    traceShapeBsd(seq_len, @intCast(direct_ctx.runtime_meta.model_config.d_model)),
+                    3,
+                    "metal_shortconv_out_proj",
+                );
+            },
+            .gated_delta => {
+                if (!hasValidGatedDeltaRuntimeConfig(
+                    direct_ctx.runtime_meta.gated_delta_d_conv,
+                    direct_ctx.runtime_meta.gated_delta_n_heads,
+                    direct_ctx.runtime_meta.gated_delta_n_key_heads,
+                    direct_ctx.runtime_meta.gated_delta_d_head,
+                )) return error.InvalidShape;
+                const gated_delta_cache = try requireStateValueById(
+                    GatedDeltaCache,
+                    state_blocks,
+                    runtime_contract.gated_delta_state_id,
+                );
+                if (!gated_delta_cache.isValid() or gated_delta_cache.handle == null) {
+                    return error.InvalidStateDescriptorBinding;
                 }
-            }
-            try dispatchLayerProgramInstruction(insn, &exec_ctx, &rt_ctx);
-            insn_idx += 1;
+                mixer_out = try runDirectGatedDelta(&direct_ctx, lw, norm1, gated_delta_cache);
+                const seq_len = inferTraceSeqLen(&direct_ctx);
+                emitLayerProgramTracePoint(
+                    &direct_ctx,
+                    .block_out,
+                    traceShapeBsd(seq_len, @intCast(direct_ctx.runtime_meta.model_config.d_model)),
+                    3,
+                    "metal_gated_delta_out",
+                );
+            },
+            .mamba => {
+                const mamba_cache = try requireStateValueById(
+                    MambaCache,
+                    state_blocks,
+                    runtime_contract.mamba_state_id,
+                );
+                if (!mamba_cache.isValid() or mamba_cache.handle == null) {
+                    return error.InvalidStateDescriptorBinding;
+                }
+                mixer_out = try runDirectMamba(&direct_ctx, lw, norm1, mamba_cache);
+                const seq_len = inferTraceSeqLen(&direct_ctx);
+                emitLayerProgramTracePoint(
+                    &direct_ctx,
+                    .mamba_out,
+                    traceShapeBsd(seq_len, @intCast(direct_ctx.runtime_meta.model_config.d_model)),
+                    3,
+                    "metal_mamba_out",
+                );
+            },
         }
 
-        const final_register = runtime_contract.planFinalOutputRegister(&compiled_plan.plan);
-        const final_slot = try bufferSlotForRegister(final_register, &residual, slot_buffers, lw.register_to_slot_map);
-        return final_slot.*;
+        directResidualAdd(&direct_ctx, &residual, mixer_out);
+
+        const norm2 = try runDirectNorm(&direct_ctx, residual, lw.ln2_weight);
+        emitArrayPerTokenHostTracePoint(&direct_ctx, norm2, .layer_ffn_norm, "metal_rmsnorm_host");
+        const seq_len = inferTraceSeqLen(&direct_ctx);
+        emitLayerProgramTracePoint(
+            &direct_ctx,
+            .ffn_gate,
+            traceShapeBsd(seq_len, @intCast(direct_ctx.runtime_meta.model_config.d_ff)),
+            3,
+            if (lw.moe != null) "metal_moe_gate" else "metal_ffn_gate",
+        );
+        const ffn_out = if (lw.moe != null)
+            try runDirectMoe(&direct_ctx, lw, norm2)
+        else
+            try runDirectSwiGlu(&direct_ctx, lw, norm2);
+        emitLayerProgramTracePoint(
+            &direct_ctx,
+            .ffn_down,
+            traceShapeBsd(seq_len, @intCast(direct_ctx.runtime_meta.model_config.d_model)),
+            3,
+            if (lw.moe != null) "metal_moe_down" else "metal_ffn_down",
+        );
+        directResidualAdd(&direct_ctx, &residual, ffn_out);
+        return residual;
     }
 
     pub fn forward(
@@ -2454,7 +3583,7 @@ pub const TransformerBlock = struct {
             });
             return error.UnsupportedModel;
         }
-        return forwardWithProgram(
+        return forwardDirect(
             hidden,
             lw,
             config,
@@ -2851,7 +3980,33 @@ test "tracePositionForPoint decode matches CPU trace semantics" {
     const seq_len: u32 = 1;
     const pos_offset: usize = 14;
     try std.testing.expectEqual(@as(u32, 1), TransformerBlock.tracePositionForPoint(.layer_attn_norm, pos_offset, seq_len));
+    try std.testing.expectEqual(@as(u32, 14), TransformerBlock.tracePositionForPoint(.attn_q_proj_raw, pos_offset, seq_len));
+    try std.testing.expectEqual(@as(u32, 14), TransformerBlock.tracePositionForPoint(.attn_k_proj_raw, pos_offset, seq_len));
     try std.testing.expectEqual(@as(u32, 14), TransformerBlock.tracePositionForPoint(.attn_q, pos_offset, seq_len));
     try std.testing.expectEqual(@as(u32, 15), TransformerBlock.tracePositionForPoint(.attn_out, pos_offset, seq_len));
     try std.testing.expectEqual(@as(u32, 1), TransformerBlock.tracePositionForPoint(.ffn_down, pos_offset, seq_len));
+}
+
+test "hasValidGatedDeltaRuntimeConfig accepts valid asymmetric-head config" {
+    try std.testing.expect(TransformerBlock.hasValidGatedDeltaRuntimeConfig(4, 24, 8, 128));
+}
+
+test "hasValidGatedDeltaRuntimeConfig rejects zero dimensions and head mismatch" {
+    try std.testing.expect(!TransformerBlock.hasValidGatedDeltaRuntimeConfig(0, 24, 8, 128));
+    try std.testing.expect(!TransformerBlock.hasValidGatedDeltaRuntimeConfig(4, 0, 8, 128));
+    try std.testing.expect(!TransformerBlock.hasValidGatedDeltaRuntimeConfig(4, 24, 0, 128));
+    try std.testing.expect(!TransformerBlock.hasValidGatedDeltaRuntimeConfig(4, 24, 8, 0));
+    try std.testing.expect(!TransformerBlock.hasValidGatedDeltaRuntimeConfig(4, 24, 7, 128));
+}
+
+test "resolveAttentionRopeTheta prefers local theta for sliding-window attention" {
+    var config: ModelConfig = .{};
+    config.rope_theta = 10000.0;
+    config.rope_local_theta = 2500.0;
+
+    try std.testing.expectEqual(@as(f32, 10000.0), TransformerBlock.resolveAttentionRopeTheta(config, 0));
+    try std.testing.expectEqual(@as(f32, 2500.0), TransformerBlock.resolveAttentionRopeTheta(config, 512));
+
+    config.rope_local_theta = 0.0;
+    try std.testing.expectEqual(@as(f32, 10000.0), TransformerBlock.resolveAttentionRopeTheta(config, 512));
 }

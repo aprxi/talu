@@ -191,10 +191,10 @@ pub export fn talu_router_generate_streaming(
         return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
     }));
     // Cast void pointer back to function pointer (Rust passes fn ptr as void*).
-    const cb: StreamCallback = @ptrCast(stream_cb orelse {
+    const cb: StreamCallback = @ptrCast(@alignCast(stream_cb orelse {
         capi_error.setErrorWithCode(.invalid_argument, "stream_cb is null", .{});
         return capi_bridge.toCResult(allocator, .{ .error_code = @intFromEnum(error_codes.ErrorCode.invalid_argument) });
-    });
+    }));
 
     const result = capi_bridge.generateStreamingWithBackend(allocator, chat, effective_parts, backend_ptr, config, cb, stream_cb_data);
     return capi_bridge.toCResult(allocator, result);

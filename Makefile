@@ -2,6 +2,8 @@
 
 # Detect platform-specific settings
 UNAME_S := $(shell uname -s)
+MLX_VERSION ?= v0.31.1
+MLX_REPO ?= https://github.com/ml-explore/mlx.git
 UNAME_M := $(shell uname -m)
 
 ifeq ($(UNAME_S),Darwin)
@@ -124,7 +126,14 @@ endif
 
 mlx-build:
 	@echo "Building MLX static library..."
-	@test -d deps/mlx-src || git clone --branch v0.31.1 --depth 1 https://github.com/ml-explore/mlx.git deps/mlx-src
+	@if [ ! -d deps/mlx-src/.git ]; then \
+		git clone --branch $(MLX_VERSION) --depth 1 $(MLX_REPO) deps/mlx-src; \
+	else \
+		cd deps/mlx-src && \
+		git fetch origin --tags --force && \
+		git checkout -f $(MLX_VERSION) && \
+		git reset --hard $(MLX_VERSION); \
+	fi
 	@rm -rf deps/mlx-src/build
 	@mkdir -p deps/mlx-src/build
 	@cd deps/mlx-src/build && cmake .. \
@@ -144,7 +153,7 @@ mlx-build:
 	@cp deps/mlx-src/build/mlx/backend/metal/kernels/mlx.metallib deps/mlx/lib/
 	@rm -rf deps/mlx/include/mlx
 	@cp -r deps/mlx-src/mlx deps/mlx/include/
-	@echo "MLX v0.31.1 (JIT mode) installed to deps/mlx/"
+	@echo "MLX $(MLX_VERSION) (JIT mode) installed to deps/mlx/"
 
 curl-build:
 	@echo "Building libcurl with CMake (HTTP-only, minimal)..."

@@ -1634,6 +1634,7 @@ pub fn runGatedDeltaDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Sce
                 0,
                 dims.d_conv,
                 dims.n_heads,
+                dims.n_heads,
                 dims.d_head,
             );
         }
@@ -1741,6 +1742,7 @@ pub fn runGatedDeltaBlockF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scen
                 cache,
                 0,
                 dims.d_conv,
+                dims.n_heads,
                 dims.n_heads,
                 dims.d_head,
             );
@@ -1912,6 +1914,7 @@ pub fn runGatedDeltaBlockQuantizedU4(allocator: std.mem.Allocator, cfg: RunConfi
                 cache,
                 0,
                 dims.d_conv,
+                dims.n_heads,
                 dims.n_heads,
                 dims.d_head,
             );
@@ -2240,6 +2243,7 @@ pub fn runGatedDeltaDecodeQuantizedU4(allocator: std.mem.Allocator, cfg: RunConf
                 cache,
                 0,
                 dims.d_conv,
+                dims.n_heads,
                 dims.n_heads,
                 dims.d_head,
             );

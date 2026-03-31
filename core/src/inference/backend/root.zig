@@ -160,9 +160,18 @@ pub const CudaTopologyConfig = struct {
 
 /// Backend initialization options selected at startup/config layer.
 pub const InitOptions = struct {
+    pub const MetalConfig = struct {
+        /// Resolved model directory path (snapshot dir containing config/weights files).
+        model_path: ?[]const u8 = null,
+        /// User model reference (e.g. "Qwen/Qwen3.5-0.8B") for metadata/logging.
+        model_id: ?[]const u8 = null,
+    };
+
     selection: Selection = .auto,
     /// Multi-stage topology for CUDA backends. When null, single-GPU execution is used.
     cuda_topology: ?CudaTopologyConfig = null,
+    /// Metal backend startup metadata.
+    metal: ?MetalConfig = null,
 };
 
 fn shouldPreserveNativeNormDType(selection: Selection) bool {
@@ -187,7 +196,14 @@ fn parseSelectionToken(raw: []const u8) ?Selection {
 fn selectionOverrideFromEnv(allocator: std.mem.Allocator) ?Selection {
     const raw = std.process.getEnvVarOwned(allocator, "BACKEND") catch return null;
     defer allocator.free(raw);
-    return parseSelectionToken(raw);
+    const parsed = parseSelectionToken(raw);
+    if (parsed == null) {
+        log.warn("inference", "Ignoring invalid BACKEND override", .{
+            .value = std.mem.trim(u8, raw, " \t\r\n"),
+            .supported = "auto|cpu|metal|cuda",
+        });
+    }
+    return parsed;
 }
 
 fn selectionName(selection: Selection) []const u8 {
@@ -837,7 +853,7 @@ fn resolveCudaMaxBatchSize() usize {
 pub const Backend = union(enum) {
     /// Fused CPU backend for graph ops (production inference)
     cpu: cpu.BackendType,
-    /// Metal GPU backend (macOS only)
+    /// Metal GPU backend (macOS only).
     metal: if (has_metal) metal.BackendType else void,
     /// CUDA backend (Linux/Windows, experimental scaffold)
     cuda: if (has_cuda) cuda.BackendType else void,
@@ -902,7 +918,7 @@ pub const Backend = union(enum) {
 
         switch (selected) {
             .cpu => return initCpu(allocator, loaded, "configured", progress),
-            .metal => return initMetal(allocator, loaded, "configured"),
+            .metal => return initMetal(allocator, loaded, "configured", init_options.metal),
             .cuda => return initCuda(allocator, loaded, "configured", cuda_probe, init_options.cuda_topology, progress),
             .auto => {},
         }
@@ -910,7 +926,7 @@ pub const Backend = union(enum) {
         // Check if we should use Metal backend (macOS + quantized/bf16 model)
         const has_unsupported_runtime_features = runtimeHasMetalUnsupportedFeatures(&loaded.runtime);
         if (has_metal and isMetalSupported(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features)) {
-            const metal_backend_state = metal.BackendType.init(allocator, loaded) catch |err| {
+            return initMetal(allocator, loaded, "auto", init_options.metal) catch |err| {
                 if (err == error.MoENotSupported or
                     err == error.MLXNotAvailable or
                     err == error.UnsupportedDType or
@@ -929,8 +945,6 @@ pub const Backend = union(enum) {
                 }
                 return err;
             };
-            log.info("inference", "Backend selected: metal", .{ .reason = "auto" });
-            return .{ .metal = metal_backend_state };
         }
 
         // Default to CPU backend
@@ -1072,6 +1086,20 @@ pub const Backend = union(enum) {
         };
     }
 
+    pub fn supportsSchedulerBackendTopKCandidateSamplingRoute(
+        self: *const Backend,
+        sampling_config: *const cpu.sampling.SamplingConfig,
+    ) bool {
+        return switch (self.*) {
+            .cpu => false,
+            .metal => |*b| if (has_metal)
+                b.supportsSchedulerBackendTopKCandidateSamplingRoute(sampling_config)
+            else
+                unreachable,
+            .cuda => false,
+        };
+    }
+
     pub fn decodeTopKCandidates(
         self: *Backend,
         slot_index: usize,
@@ -1090,6 +1118,30 @@ pub const Backend = union(enum) {
                 b.decodeTopKCandidates(slot_index, token, top_k, candidate_logits_out, candidate_ids_out)
             else
                 error.InvalidArgument,
+        };
+    }
+
+    pub fn decodeTopKCandidatesWithSampling(
+        self: *Backend,
+        slot_index: usize,
+        token: u32,
+        sampling_config: *const cpu.sampling.SamplingConfig,
+        candidate_logits_out: []f32,
+        candidate_ids_out: []u32,
+    ) !usize {
+        return switch (self.*) {
+            .cpu => error.InvalidArgument,
+            .metal => |*b| if (has_metal)
+                b.decodeTopKCandidatesWithSampling(
+                    slot_index,
+                    token,
+                    sampling_config,
+                    candidate_logits_out,
+                    candidate_ids_out,
+                )
+            else
+                unreachable,
+            .cuda => error.InvalidArgument,
         };
     }
 
@@ -1124,12 +1176,11 @@ pub const Backend = union(enum) {
                 return error.InvalidArgument,
         }
     }
-
     /// Get vocab size for this model
     pub fn vocabSize(self: *const Backend) usize {
         switch (self.*) {
             .cpu => |*b| return b.vocab_size,
-            .metal => |*b| if (has_metal) return b.vocab_size else unreachable,
+            .metal => |*b| if (has_metal) return b.vocabSize() else unreachable,
             .cuda => |*b| if (has_cuda) return b.vocab_size else unreachable,
         }
     }
@@ -1139,7 +1190,7 @@ pub const Backend = union(enum) {
     pub fn warmup(self: *Backend) !void {
         switch (self.*) {
             .cpu => |*b| try b.warmup(),
-            .metal => {}, // Metal doesn't need warmup (GPU has own memory)
+            .metal => |*b| if (has_metal) try b.warmup() else unreachable,
             .cuda => {},
         }
     }
@@ -1173,7 +1224,7 @@ pub const Backend = union(enum) {
     pub fn embeddingDim(self: *const Backend) usize {
         switch (self.*) {
             .cpu => |*b| return b.embeddingDim(),
-            .metal => |*b| if (has_metal) return b.d_model else unreachable,
+            .metal => |*b| if (has_metal) return b.embeddingDim() else unreachable,
             .cuda => |*b| if (has_cuda) return b.d_model else unreachable,
         }
     }
@@ -1185,7 +1236,7 @@ pub const Backend = union(enum) {
     pub fn maxBatchSize(self: *const Backend) usize {
         switch (self.*) {
             .cpu => |*b| return b.max_batch_size,
-            .metal => |*b| if (has_metal) return b.max_batch_size else unreachable,
+            .metal => |*b| if (has_metal) return b.maxBatchSize() else unreachable,
             .cuda => |*b| if (has_cuda) return b.max_batch_size else unreachable,
         }
     }
@@ -1251,6 +1302,21 @@ pub const Backend = union(enum) {
             .metal => |*b| if (has_metal) try b.prefillSlot(slot_index, tokens, logits_out) else unreachable,
             .cuda => |*b| if (has_cuda) try b.prefillSlot(slot_index, tokens, logits_out) else unreachable,
         }
+    }
+
+    pub fn prefillGreedySeedToken(
+        self: *Backend,
+        slot_index: usize,
+        tokens: []const u32,
+    ) !u32 {
+        return switch (self.*) {
+            .cpu => error.InvalidArgument,
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "prefillGreedySeedToken"))
+                b.prefillGreedySeedToken(slot_index, tokens)
+            else
+                error.InvalidArgument,
+            .cuda => error.InvalidArgument,
+        };
     }
 
     pub fn prefillSlotWithVision(
@@ -1390,9 +1456,16 @@ fn initMetal(
     allocator: std.mem.Allocator,
     loaded: *LoadedModel,
     reason: []const u8,
+    config: ?InitOptions.MetalConfig,
 ) !Backend {
     if (!has_metal) {
         return error.MetalNotEnabled;
+    }
+    if (!metal.isAvailable()) {
+        log.info("inference", "Metal backend unavailable", .{
+            .reason = "mlx bridge reported unavailable",
+        });
+        return error.MLXNotAvailable;
     }
     const has_unsupported_runtime_features = runtimeHasMetalUnsupportedFeatures(&loaded.runtime);
     if (!isMetalSupported(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features)) {
@@ -1405,7 +1478,10 @@ fn initMetal(
         });
         return error.UnsupportedModel;
     }
-    const metal_backend_state = try metal.BackendType.init(allocator, loaded);
+    const metal_backend_state = try metal.BackendType.init(allocator, loaded, .{
+        .model_path = if (config) |c| c.model_path else null,
+        .model_id = if (config) |c| c.model_id else null,
+    });
     log.info("inference", "Backend selected: metal", .{ .reason = reason });
     return .{ .metal = metal_backend_state };
 }
@@ -1951,6 +2027,7 @@ test "validateCudaTopologyConfig rejects cpu_gpu_gpu when any gpu ordinal is out
 test "optionalSelectionName returns tag or unset" {
     try std.testing.expectEqualStrings("unset", optionalSelectionName(null));
     try std.testing.expectEqualStrings("cpu", optionalSelectionName(.cpu));
+    try std.testing.expectEqualStrings("metal", optionalSelectionName(.metal));
     try std.testing.expectEqualStrings("cuda", optionalSelectionName(.cuda));
 }
 
@@ -2050,182 +2127,16 @@ test "supportsSchedulerBackendTopKDecodeRoute: cuda disabled" {
     try std.testing.expectEqual(false, cuda_backend.supportsSchedulerBackendTopKDecodeRoute(&sampling_config));
 }
 
-test "kernel parity: rope cpu vs metal" {
+test "metal module surface does not expose legacy runtime graph symbols" {
     if (!has_metal) return;
-    if (!metal.isAvailable()) return error.SkipZigTest;
-
-    const graph = metal.kernels.graph;
-
-    const allocator = std.testing.allocator;
-    var cpu_rope = try cpu.kernels.rope.RoPE.init(allocator, 4, 16, 10_000.0, 1.0);
-    defer cpu_rope.deinit(allocator);
-    var cpu_kernel = cpu.kernels.rope.RotaryEmbedding{ .rope = &cpu_rope };
-
-    const input = [_]f32{ 0.5, -1.0, 2.0, 3.5 };
-    var cpu_output: [4]f32 = undefined;
-    cpu_kernel.forward(&input, &cpu_output, 3);
-
-    const input_shape = [_]i64{ 1, 1, 1, 4 };
-    const input_handle = graph.createArrayF32(&input, &input_shape);
-    defer graph.freeArray(input_handle);
-
-    const metal_kernel = metal.kernels.rope.RotaryEmbedding{
-        .head_dim = 4,
-        .rope_theta = 10_000.0,
-    };
-    var output_handle: graph.ArrayHandle = null;
-    metal_kernel.forward(input_handle, &output_handle, 3);
-    defer graph.freeArray(output_handle);
-
-    graph.eval(&[_]graph.ArrayHandle{output_handle});
-
-    var metal_output: [4]f32 = undefined;
-    graph.copyToHost(output_handle, &metal_output);
-
-    for (cpu_output, metal_output) |cpu_v, metal_v| {
-        try std.testing.expectApproxEqAbs(cpu_v, metal_v, 0.001);
-    }
+    try std.testing.expect(!@hasDecl(metal, "runtime_graph"));
 }
 
-test "kernel parity: kv cache cpu vs metal" {
+test "metal module surface maps to current cpu-backed helper modules" {
     if (!has_metal) return;
-    if (!metal.isAvailable()) return error.SkipZigTest;
-
-    const graph = metal.kernels.graph;
-
-    const allocator = std.testing.allocator;
-    var cpu_cache = try cpu.kernels.kv_cache.BatchedKVCache.init(allocator, 1, 1, 4, 8);
-    defer cpu_cache.deinit();
-    const slot_index = cpu_cache.allocSlot() orelse return error.TestUnexpectedResult;
-
-    var cpu_kernel = cpu.kernels.kv_cache.KVCache{ .cache = &cpu_cache };
-    const key_values = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
-    const value_values = [_]f32{ 5.0, 6.0, 7.0, 8.0 };
-    try cpu_kernel.forward(slot_index, &key_values, &value_values);
-
-    var metal_cache = metal.runtime_graph.Cache.init(1, true);
-    defer metal_cache.deinit();
-    var metal_kernel = metal.kernels.kv_cache.KVCache{ .cache = &metal_cache };
-
-    const shape = [_]i64{ 1, 1, 1, 4 };
-    const key_handle = graph.createArrayF32(&key_values, &shape);
-    const value_handle = graph.createArrayF32(&value_values, &shape);
-    defer graph.freeArray(key_handle);
-    defer graph.freeArray(value_handle);
-
-    metal_kernel.forward(0, key_handle, value_handle);
-    const cached = metal_cache.get(0);
-
-    graph.eval(&[_]graph.ArrayHandle{ cached.k, cached.v });
-    var metal_k: [4]f32 = undefined;
-    var metal_v: [4]f32 = undefined;
-    graph.copyToHost(cached.k, &metal_k);
-    graph.copyToHost(cached.v, &metal_v);
-
-    const cpu_k = cpu_cache.getK(slot_index, 0, 0);
-    const cpu_v = cpu_cache.getV(slot_index, 0, 0);
-    for (cpu_k, metal_k) |cpu_val, metal_val| {
-        try std.testing.expectApproxEqAbs(cpu_val, metal_val, 0.001);
-    }
-    for (cpu_v, metal_v) |cpu_val, metal_val| {
-        try std.testing.expectApproxEqAbs(cpu_val, metal_val, 0.001);
-    }
-}
-
-test "kernel parity: embedding lookup cpu vs metal" {
-    if (!has_metal) return;
-    if (!metal.isAvailable()) return error.SkipZigTest;
-
-    const graph = metal.kernels.graph;
-    const allocator = std.testing.allocator;
-
-    var cpu_embed_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 3, 2 });
-    defer cpu_embed_owned.deinit();
-    const embed_data = cpu_embed_owned.asSlice(f32);
-    embed_data[0] = 1.0;
-    embed_data[1] = 2.0;
-    embed_data[2] = 3.0;
-    embed_data[3] = 4.0;
-    embed_data[4] = 5.0;
-    embed_data[5] = 6.0;
-
-    var cpu_out_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 1, 2, 2 });
-    defer cpu_out_owned.deinit();
-    var cpu_embed_view = cpu_embed_owned.view();
-    var cpu_out_view = cpu_out_owned.view();
-    const cpu_lookup = cpu.kernels.embedding.EmbeddingLookup{
-        .embedding_weights = &cpu_embed_view,
-    };
-    const token_ids = [_]u32{ 2, 0 };
-    try cpu_lookup.forward(&token_ids, &cpu_out_view);
-
-    const embed_shape = [_]i64{ 3, 2 };
-    const metal_embed = graph.createArrayF32(embed_data, &embed_shape);
-    defer graph.freeArray(metal_embed);
-    const dummy_ln_data = [_]f32{1.0};
-    const ln_shape = [_]i64{1};
-    const dummy_ln = graph.createArrayF32(&dummy_ln_data, &ln_shape);
-    defer graph.freeArray(dummy_ln);
-
-    const empty_layers = [_]metal.executor.weights.WeightHandles.LayerWeights{};
-    var handles = metal.executor.weights.WeightHandles{
-        .embed_tokens = metal_embed,
-        .embed_tokens_quantized = null,
-        .layers = empty_layers[0..],
-        .ln_final = dummy_ln,
-        .lm_head = null,
-        .lm_head_quantized = null,
-    };
-
-    const metal_lookup = metal.kernels.embedding.EmbeddingLookup{
-        .weight_handles = &handles,
-    };
-    var output_handle: graph.ArrayHandle = null;
-    try metal_lookup.forward(&token_ids, &output_handle);
-    defer graph.freeArray(output_handle);
-
-    graph.eval(&[_]graph.ArrayHandle{output_handle});
-
-    var metal_output: [4]f32 = undefined;
-    graph.copyToHost(output_handle, &metal_output);
-
-    const cpu_output = cpu_out_owned.asSlice(f32);
-    for (cpu_output, metal_output) |cpu_val, metal_val| {
-        try std.testing.expectApproxEqAbs(cpu_val, metal_val, 0.001);
-    }
-}
-
-test "kernel parity: weight access error semantics cpu vs metal" {
-    if (!has_metal) return;
-    if (!metal.isAvailable()) return error.SkipZigTest;
-
-    const graph = metal.kernels.graph;
-    const empty_cpu_blocks: [0]cpu.kernels.weights.TransformerBlock = .{};
-    const cpu_access = cpu.kernels.weights.WeightAccess{
-        .blocks = empty_cpu_blocks[0..],
-    };
-    var cpu_out: *const cpu.kernels.weights.TransformerBlock = undefined;
-    try std.testing.expectError(error.InvalidArgument, cpu_access.forward(0, &cpu_out));
-
-    const dummy_ln_data = [_]f32{1.0};
-    const ln_shape = [_]i64{1};
-    const dummy_ln = graph.createArrayF32(&dummy_ln_data, &ln_shape);
-    defer graph.freeArray(dummy_ln);
-
-    const empty_layers = [_]metal.executor.weights.WeightHandles.LayerWeights{};
-    var handles = metal.executor.weights.WeightHandles{
-        .embed_tokens = null,
-        .embed_tokens_quantized = null,
-        .layers = empty_layers[0..],
-        .ln_final = dummy_ln,
-        .lm_head = null,
-        .lm_head_quantized = null,
-    };
-    const metal_access = metal.kernels.weights.WeightAccess{
-        .weight_handles = &handles,
-    };
-    var metal_out: *const metal.executor.weights.WeightHandles.LayerWeights = undefined;
-    try std.testing.expectError(error.InvalidArgument, metal_access.forward(0, &metal_out));
+    try std.testing.expect(metal.executor.Model == cpu.executor.Model);
+    try std.testing.expect(metal.kernels.RMSNorm == cpu.kernels.RMSNorm);
+    try std.testing.expect(metal.vision.VisionRuntime == cpu.vision.VisionRuntime);
 }
 
 test "visionMaxPixels dispatches to backend vision module" {
