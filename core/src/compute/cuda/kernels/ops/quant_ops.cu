@@ -2847,6 +2847,88 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_mxfp8_matvec_gate_up_s
     }
 }
 
+// MXFP8 fused gate+up+silu GEMV: tile-8 (up to 8 batch rows per block).
+extern "C" __global__ __launch_bounds__(128, 2) void talu_mxfp8_matvec_gate_up_silu_f32_tile8(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ gate_weight,
+    const unsigned char* __restrict__ gate_scales,
+    const unsigned char* __restrict__ up_weight,
+    const unsigned char* __restrict__ up_scales,
+    float* __restrict__ out,
+    unsigned int out_dim,
+    unsigned int in_dim,
+    unsigned int gate_scale_cols,
+    unsigned int up_scale_cols,
+    unsigned int batch_rows
+) {
+    const unsigned int batch_base = blockIdx.y * FP8_BATCH_TILE_X8;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < FP8_BATCH_TILE_X8
+        ? batch_rows - batch_base : FP8_BATCH_TILE_X8;
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    const unsigned int* gw = reinterpret_cast<const unsigned int*>(
+        gate_weight + (unsigned long long)out_idx * in_dim);
+    const unsigned int* uw = reinterpret_cast<const unsigned int*>(
+        up_weight + (unsigned long long)out_idx * in_dim);
+    const unsigned int g_sro = out_idx * gate_scale_cols;
+    const unsigned int u_sro = out_idx * up_scale_cols;
+    const unsigned int words_per_row = in_dim >> 2;
+
+    float gate_acc[FP8_BATCH_TILE_X8] = {};
+    float up_acc[FP8_BATCH_TILE_X8] = {};
+
+    for (unsigned int w = lane << 1; w < words_per_row; w += TALU_QUANT_WARP_SIZE << 1) {
+        unsigned int gw0, gw1;
+        asm volatile("ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(gw0), "=r"(gw1) : "l"(&gw[w]));
+        unsigned int uw0, uw1;
+        asm volatile("ld.global.cs.v2.u32 {%0, %1}, [%2];"
+            : "=r"(uw0), "=r"(uw1) : "l"(&uw[w]));
+
+        const unsigned int base = w << 2;
+        const float gs0 = e8m0_to_f32(gate_scales[g_sro + base / 32]);
+        const float gs1 = e8m0_to_f32(gate_scales[g_sro + (base + 4) / 32]);
+        const float us0 = e8m0_to_f32(up_scales[u_sro + base / 32]);
+        const float us1 = e8m0_to_f32(up_scales[u_sro + (base + 4) / 32]);
+
+        #pragma unroll
+        for (unsigned int b = 0; b < FP8_BATCH_TILE_X8; b++) {
+            if (b >= tile_rows) break;
+            const unsigned long long row_off = (unsigned long long)b * in_dim;
+            float r0, r1;
+
+            const float4 inp0 = *reinterpret_cast<const float4*>(&input_tile[row_off + base]);
+            r0 = 0.0f; r1 = 0.0f; FP8_PROCESS_WORD(gw0, inp0, r0, r1);
+            gate_acc[b] = fmaf(r0 + r1, gs0, gate_acc[b]);
+            r0 = 0.0f; r1 = 0.0f; FP8_PROCESS_WORD(uw0, inp0, r0, r1);
+            up_acc[b] = fmaf(r0 + r1, us0, up_acc[b]);
+
+            const float4 inp1 = *reinterpret_cast<const float4*>(&input_tile[row_off + base + 4]);
+            r0 = 0.0f; r1 = 0.0f; FP8_PROCESS_WORD(gw1, inp1, r0, r1);
+            gate_acc[b] = fmaf(r0 + r1, gs1, gate_acc[b]);
+            r0 = 0.0f; r1 = 0.0f; FP8_PROCESS_WORD(uw1, inp1, r0, r1);
+            up_acc[b] = fmaf(r0 + r1, us1, up_acc[b]);
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int b = 0; b < FP8_BATCH_TILE_X8; b++) {
+        if (b >= tile_rows) break;
+        float g = talu_quant_warp_sum_f32(gate_acc[b]);
+        float u = talu_quant_warp_sum_f32(up_acc[b]);
+        if (lane == 0) {
+            const float sigma = 1.0f / (1.0f + expf(-g));
+            out[(unsigned long long)(batch_base + b) * out_dim + out_idx] = g * sigma * u;
+        }
+    }
+}
+
 // MXFP8 fused gate+up GEMV (separate outputs).
 extern "C" __global__ __launch_bounds__(128, 2) void talu_mxfp8_matvec_gate_up_f32(
     const float* __restrict__ input,
@@ -2901,6 +2983,64 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_mxfp8_matvec_gate_up_f
     }
 }
 
+// MXFP8 fused gate+up GEMV (separate outputs): tile-8.
+extern "C" __global__ __launch_bounds__(128, 2) void talu_mxfp8_matvec_gate_up_f32_tile8(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ gate_weight,
+    const unsigned char* __restrict__ gate_scales,
+    float* __restrict__ gate_out,
+    unsigned int gate_out_dim,
+    const unsigned char* __restrict__ up_weight,
+    const unsigned char* __restrict__ up_scales,
+    float* __restrict__ up_out,
+    unsigned int up_out_dim,
+    unsigned int in_dim,
+    unsigned int gate_scale_cols,
+    unsigned int up_scale_cols,
+    unsigned int batch_rows
+) {
+    const unsigned int batch_base = blockIdx.y * FP8_BATCH_TILE_X8;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < FP8_BATCH_TILE_X8
+        ? batch_rows - batch_base : FP8_BATCH_TILE_X8;
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_index = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
+    const unsigned int total_dim = gate_out_dim + up_out_dim;
+    if (out_index >= total_dim) return;
+
+    const unsigned char* wt;
+    const unsigned char* sc;
+    float* out_ptr;
+    unsigned int out_dim_proj, row_idx, sc_cols;
+
+    if (out_index < gate_out_dim) {
+        wt = gate_weight; sc = gate_scales; out_ptr = gate_out;
+        out_dim_proj = gate_out_dim; row_idx = out_index; sc_cols = gate_scale_cols;
+    } else {
+        wt = up_weight; sc = up_scales; out_ptr = up_out;
+        out_dim_proj = up_out_dim; row_idx = out_index - gate_out_dim; sc_cols = up_scale_cols;
+    }
+
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out_ptr + (unsigned long long)batch_base * out_dim_proj;
+    const unsigned int* weight_words = reinterpret_cast<const unsigned int*>(
+        wt + (unsigned long long)row_idx * in_dim);
+
+    switch (tile_rows) {
+        case 1u: talu_mxfp8_matvec_batched<1>(input_tile, weight_words, sc, out_tile, in_dim, out_dim_proj, row_idx, sc_cols, lane, 1u); break;
+        case 2u: talu_mxfp8_matvec_batched<2>(input_tile, weight_words, sc, out_tile, in_dim, out_dim_proj, row_idx, sc_cols, lane, 2u); break;
+        case 3u: talu_mxfp8_matvec_batched<3>(input_tile, weight_words, sc, out_tile, in_dim, out_dim_proj, row_idx, sc_cols, lane, 3u); break;
+        case 4u: talu_mxfp8_matvec_batched<4>(input_tile, weight_words, sc, out_tile, in_dim, out_dim_proj, row_idx, sc_cols, lane, 4u); break;
+        case 5u: talu_mxfp8_matvec_batched<5>(input_tile, weight_words, sc, out_tile, in_dim, out_dim_proj, row_idx, sc_cols, lane, 5u); break;
+        case 6u: talu_mxfp8_matvec_batched<6>(input_tile, weight_words, sc, out_tile, in_dim, out_dim_proj, row_idx, sc_cols, lane, 6u); break;
+        case 7u: talu_mxfp8_matvec_batched<7>(input_tile, weight_words, sc, out_tile, in_dim, out_dim_proj, row_idx, sc_cols, lane, 7u); break;
+        case 8u: talu_mxfp8_matvec_batched<8>(input_tile, weight_words, sc, out_tile, in_dim, out_dim_proj, row_idx, sc_cols, lane, 8u); break;
+        default: return;
+    }
+}
+
 #else
 
 extern "C" __global__ void talu_dequant_mxfp8_to_bf16(
@@ -2926,7 +3066,18 @@ extern "C" __global__ void talu_mxfp8_matvec_gate_up_silu_f32(
     const unsigned char* up_weight, const unsigned char* up_scales, float* out,
     unsigned int out_dim, unsigned int in_dim, unsigned int gate_scale_cols,
     unsigned int up_scale_cols, unsigned int batch_rows) {}
+extern "C" __global__ void talu_mxfp8_matvec_gate_up_silu_f32_tile8(
+    const float* input, const unsigned char* gate_weight, const unsigned char* gate_scales,
+    const unsigned char* up_weight, const unsigned char* up_scales, float* out,
+    unsigned int out_dim, unsigned int in_dim, unsigned int gate_scale_cols,
+    unsigned int up_scale_cols, unsigned int batch_rows) {}
 extern "C" __global__ void talu_mxfp8_matvec_gate_up_f32(
+    const float* input, const unsigned char* gate_weight, const unsigned char* gate_scales,
+    float* gate_out, unsigned int gate_out_dim, const unsigned char* up_weight,
+    const unsigned char* up_scales, float* up_out, unsigned int up_out_dim,
+    unsigned int in_dim, unsigned int gate_scale_cols, unsigned int up_scale_cols,
+    unsigned int batch_rows) {}
+extern "C" __global__ void talu_mxfp8_matvec_gate_up_f32_tile8(
     const float* input, const unsigned char* gate_weight, const unsigned char* gate_scales,
     float* gate_out, unsigned int gate_out_dim, const unsigned char* up_weight,
     const unsigned char* up_scales, float* up_out, unsigned int up_out_dim,

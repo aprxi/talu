@@ -363,7 +363,9 @@ pub const CudaBackend = struct {
     mxfp8_matvec_function: ?compute.cuda.Function = null,
     mxfp8_matvec_tile8_function: ?compute.cuda.Function = null,
     mxfp8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
+    mxfp8_matvec_gate_up_silu_tile8_function: ?compute.cuda.Function = null,
     mxfp8_matvec_gate_up_function: ?compute.cuda.Function = null,
+    mxfp8_matvec_gate_up_tile8_function: ?compute.cuda.Function = null,
     i8_blas_supported: bool = true,
     fp8_blas_supported: bool = true,
     // Transient: set before QKV projection to provide concat cache for fused I8 prefill.

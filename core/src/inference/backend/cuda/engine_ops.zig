@@ -2225,7 +2225,14 @@ pub fn tryFusedMxfp8GateUpSiluForward(
     if (gate.rows != self.d_model) return false;
     if (gate.scales_raw_buffer.pointer == 0 or up.scales_raw_buffer.pointer == 0) return false;
 
-    const fused_fn = self.mxfp8_matvec_gate_up_silu_function orelse return false;
+    var fused_fn = self.mxfp8_matvec_gate_up_silu_function orelse return false;
+    var batch_tile: u32 = 4;
+    if (rows > 4) {
+        if (self.mxfp8_matvec_gate_up_silu_tile8_function) |tile8_fn| {
+            fused_fn = tile8_fn;
+            batch_tile = 8;
+        }
+    }
 
     const out_dim: u32 = @intCast(gate.cols);
     const in_dim: u32 = @intCast(gate.rows);
@@ -2246,7 +2253,7 @@ pub fn tryFusedMxfp8GateUpSiluForward(
 
     try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
         .grid_x = (out_dim + 3) / 4,
-        .grid_y = (batch_rows + 3) / 4,
+        .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
         .block_x = 128,
     }, &self.kernel_arg_pack, .matvec_gate_up_silu);
     return true;
@@ -2273,7 +2280,14 @@ pub fn tryFusedMxfp8GateUpForward(
     if (gate.rows != self.d_model) return false;
     if (gate.scales_raw_buffer.pointer == 0 or up.scales_raw_buffer.pointer == 0) return false;
 
-    const fused_fn = self.mxfp8_matvec_gate_up_function orelse return false;
+    var fused_fn = self.mxfp8_matvec_gate_up_function orelse return false;
+    var batch_tile: u32 = 4;
+    if (rows > 4) {
+        if (self.mxfp8_matvec_gate_up_tile8_function) |tile8_fn| {
+            fused_fn = tile8_fn;
+            batch_tile = 8;
+        }
+    }
 
     const gate_out_dim: u32 = @intCast(gate.cols);
     const up_out_dim: u32 = @intCast(up.cols);
@@ -2298,7 +2312,7 @@ pub fn tryFusedMxfp8GateUpForward(
 
     try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
         .grid_x = (total_dim + 3) / 4,
-        .grid_y = (batch_rows + 3) / 4,
+        .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
         .block_x = 128,
     }, &self.kernel_arg_pack, .matvec);
     return true;
