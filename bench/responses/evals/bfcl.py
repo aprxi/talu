@@ -425,6 +425,8 @@ class Bfcl(Scenario):
             log_path = eval_log_path(
                 "bfcl", r.get("model_uri", r["model"]),
                 samples_n, mrt,
+                endpoint=config.get("_endpoint"),
+                session_id=config.get("_session_id"),
             )
             records = _read_bfcl_records(log_path)
             scored = [rec for rec in records if "category" in rec]

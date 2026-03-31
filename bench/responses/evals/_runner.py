@@ -191,7 +191,14 @@ def run_eval(
 
                 # Resume support.
                 endpoint_url = base_url if completions else None
-                log_path = eval_log_path(bench_name, uri, samples_n, mrt, endpoint=endpoint_url)
+                log_path = eval_log_path(
+                    bench_name,
+                    uri,
+                    samples_n,
+                    mrt,
+                    endpoint=endpoint_url,
+                    session_id=config.get("_session_id"),
+                )
                 completed, cached_stats = load_completed(log_path)
                 logger = EvalLogger(log_path)
                 cached = sum(1 for (m, _) in completed if m == uri)

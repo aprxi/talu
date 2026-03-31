@@ -147,6 +147,8 @@ class Ifeval(Scenario):
             log_path = eval_log_path(
                 "ifeval", r.get("model_uri", r["model"]),
                 samples_n, mrt,
+                endpoint=config.get("_endpoint"),
+                session_id=config.get("_session_id"),
             )
             records = _read_ifeval_records(log_path)
             # Only count records that have IFEval extras (skip stale cached entries).

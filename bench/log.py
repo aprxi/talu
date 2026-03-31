@@ -25,11 +25,13 @@ def eval_log_path(
     samples: int | None = None,
     max_reasoning_tokens: int = 0,
     endpoint: str | None = None,
+    session_id: str | None = None,
 ) -> Path:
     """Stable log path for a bench + model + reasoning combination.
 
-    Format: evals/<bench>_<model_slug>[_ep-<hash>][_n<samples>][_r<budget>].jsonl
-    Re-running the same combo appends to / resumes from this file.
+    Format:
+      evals/<bench>_<model_slug>[_ep-<hash>][_n<samples>][_r<budget>][_s<session>].jsonl
+    Re-running the same combo + session appends to / resumes from this file.
     """
     slug = model.replace("/", "_").replace(" ", "_")
     name = f"{bench}_{slug}"
@@ -40,6 +42,13 @@ def eval_log_path(
         name += f"_n{samples}"
     if max_reasoning_tokens > 0:
         name += f"_r{max_reasoning_tokens}"
+    if session_id:
+        safe_session = "".join(
+            c if (c.isalnum() or c in {"_", "-"}) else "_"
+            for c in str(session_id)
+        )
+        if safe_session:
+            name += f"_s{safe_session}"
     EVALS_DIR.mkdir(parents=True, exist_ok=True)
     return EVALS_DIR / f"{name}.jsonl"
 

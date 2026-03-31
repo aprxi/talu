@@ -3,7 +3,7 @@
 
 Usage:
     python bench/run.py list
-    python bench/run.py <scenario> [--config NAME] [--rounds N] [--set k=v ...]
+    python bench/run.py <scenario> [--config NAME] [--rounds N] [--resume SESSION_ID] [--set k=v ...]
 
 Examples:
     python bench/run.py list
@@ -27,9 +27,11 @@ from __future__ import annotations
 import argparse
 import datetime
 import platform
+import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections import defaultdict
 from pathlib import Path
 
@@ -238,6 +240,8 @@ def _print_expanded_cmd(args: argparse.Namespace, config: dict) -> None:
     parts.append(args.scenario)
     if getattr(args, "endpoint", None):
         parts.append(f"--endpoint {args.endpoint}")
+    if getattr(args, "resume", None):
+        parts.append(f"--resume {args.resume}")
     if args.config:
         parts.append(f"--config {args.config}")
     is_eval = "evals/" in args.scenario
@@ -302,8 +306,31 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     config = load_config(args.scenario, args.config, args.set, args.env)
 
+    is_eval = "evals/" in args.scenario
+
+    if args.resume and not is_eval:
+        print("--resume is only supported for eval scenarios (responses/evals/*).", file=sys.stderr)
+        sys.exit(2)
+
     # Eval scenarios: default to original precision, rounds=1, pass --samples.
-    if "evals/" in args.scenario:
+    if is_eval:
+        if args.resume:
+            if re.fullmatch(r"[A-Za-z0-9_-]+", args.resume) is None:
+                print(
+                    "Invalid --resume session id; use only letters, digits, '_' or '-'.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            session_id = args.resume
+            print(f"[session] resuming session={session_id}", flush=True)
+        else:
+            session_id = uuid.uuid4().hex[:12]
+            print(f"[session] new session={session_id}", flush=True)
+            print(f"[session] resume with: --resume {session_id}", flush=True)
+        config["_session_id"] = session_id
+        # Show a fully-reproducible command in the expanded output.
+        args.resume = session_id
+
         if args.samples is not None and args.samples >= 0:
             config["samples"] = args.samples
         # Default to original only (user can override with --set precision=...).
@@ -766,10 +793,11 @@ def print_eval_report(
     from log import eval_log_path
     log_paths: list[Path] = []
     endpoint_url = config.get("_endpoint")
+    session_id = config.get("_session_id")
     for r in results:
         r_mrt = int(r.get("max_reasoning_tokens", 0))
         lp = eval_log_path(bench_name, r.get("model_uri", r["model"]),
-                           config.get("samples"), r_mrt, endpoint=endpoint_url)
+                           config.get("samples"), r_mrt, endpoint=endpoint_url, session_id=session_id)
         if lp not in log_paths:
             log_paths.append(lp)
 
@@ -1071,6 +1099,8 @@ def main() -> None:
     run_p.add_argument("--endpoint", default=None, metavar="URL",
                         help="External OpenAI-compatible endpoint (e.g. http://localhost:8000/v1). "
                              "Uses v1/chat/completions API. Skips talu server startup.")
+    run_p.add_argument("--resume", default=None, metavar="SESSION_ID",
+                        help="Resume an eval session id. If omitted, eval runs create a new random session.")
 
     args = parser.parse_args()
 
