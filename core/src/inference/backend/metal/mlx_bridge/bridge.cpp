@@ -1244,13 +1244,16 @@ int resolve_prefill_chunk_size() {
 }
 
 struct MemoryBudgetEstimate {
-    size_t recommended_bytes = 0;
+    size_t memory_size_bytes = 0;
+    size_t max_recommended_bytes = 0;
+    size_t effective_budget_bytes = 0;
     size_t weight_bytes = 0;
     size_t kv_cache_bytes = 0;
     size_t linear_state_bytes = 0;
-    size_t safety_bytes = 0;
-    size_t total_bytes = 0;
-    int budget_tokens = 0;
+    size_t overhead_bytes = 0;
+    size_t total_required_bytes = 0;
+    int context_tokens = 0;
+    int active_slots = 1;
 };
 
 size_t checked_add_size_t(size_t a, size_t b, const char* context) {
@@ -1270,6 +1273,22 @@ std::optional<size_t> recommended_working_set_bytes() {
     const size_t value = std::get<size_t>(it->second);
     if (value == 0) return std::nullopt;
     return value;
+}
+
+std::optional<size_t> device_memory_size_bytes() {
+    if (!metal::is_available()) return std::nullopt;
+    const auto& info = device_info(Device::gpu);
+    auto it = info.find("memory_size");
+    if (it != info.end() && std::holds_alternative<size_t>(it->second)) {
+        const size_t value = std::get<size_t>(it->second);
+        if (value > 0) return value;
+    }
+    it = info.find("total_memory");
+    if (it != info.end() && std::holds_alternative<size_t>(it->second)) {
+        const size_t value = std::get<size_t>(it->second);
+        if (value > 0) return value;
+    }
+    return std::nullopt;
 }
 
 size_t model_weight_bytes_on_disk(const std::string& model_path) {
@@ -1298,14 +1317,15 @@ int estimate_full_attention_layer_count(const Qwen35Config& cfg) {
     return (cfg.num_hidden_layers + interval - 1) / interval;
 }
 
-size_t estimate_kv_cache_bytes(const Qwen35Config& cfg, int budget_tokens) {
-    if (budget_tokens <= 0) return 0;
+size_t estimate_kv_cache_bytes(const Qwen35Config& cfg, int context_tokens, int active_slots) {
+    if (context_tokens <= 0 || active_slots <= 0) return 0;
     const int full_layers = estimate_full_attention_layer_count(cfg);
     const size_t elems =
         static_cast<size_t>(full_layers) *
+        static_cast<size_t>(active_slots) *
         2 *
         static_cast<size_t>(std::max(0, cfg.num_key_value_heads)) *
-        static_cast<size_t>(budget_tokens) *
+        static_cast<size_t>(context_tokens) *
         static_cast<size_t>(std::max(0, cfg.head_dim));
     return elems * sizeof(uint16_t); // bf16
 }
@@ -1343,24 +1363,26 @@ std::optional<MemoryBudgetEstimate> estimate_memory_budget(
     const std::string& model_path,
     const Qwen35Config& cfg
 ) {
+    const std::optional<size_t> memory_size = device_memory_size_bytes();
+    if (!memory_size.has_value()) return std::nullopt;
     const std::optional<size_t> recommended = recommended_working_set_bytes();
-    if (!recommended.has_value()) return std::nullopt;
-
-    const int budget_tokens = env_positive_int("TALU_METAL_MEMORY_BUDGET_TOKENS", 4096);
-    const int safety_mb = env_positive_int("TALU_METAL_MEMORY_SAFETY_MB", 2048);
-    const size_t safety_bytes = static_cast<size_t>(safety_mb) * 1024 * 1024;
+    const int context_tokens = env_positive_int("TALU_METAL_MEMORY_CONTEXT_TOKENS", env_positive_int("TOKENS", 200));
+    const int active_slots = env_positive_int("TALU_METAL_MAX_BATCH_SIZE", 1);
 
     MemoryBudgetEstimate estimate{};
-    estimate.recommended_bytes = *recommended;
-    estimate.budget_tokens = budget_tokens;
-    estimate.safety_bytes = safety_bytes;
+    estimate.memory_size_bytes = *memory_size;
+    estimate.max_recommended_bytes = recommended.has_value() ? *recommended : 0;
+    estimate.effective_budget_bytes = (estimate.memory_size_bytes * 8) / 10; // 0.8 * total unified memory
+    estimate.context_tokens = std::max(1, context_tokens);
+    estimate.active_slots = std::max(1, active_slots);
     estimate.weight_bytes = model_weight_bytes_on_disk(model_path);
-    estimate.kv_cache_bytes = estimate_kv_cache_bytes(cfg, budget_tokens);
+    estimate.kv_cache_bytes = estimate_kv_cache_bytes(cfg, estimate.context_tokens, estimate.active_slots);
     estimate.linear_state_bytes = estimate_linear_state_bytes(cfg);
-    estimate.total_bytes = estimate.weight_bytes;
-    estimate.total_bytes = checked_add_size_t(estimate.total_bytes, estimate.kv_cache_bytes, "total memory budget");
-    estimate.total_bytes = checked_add_size_t(estimate.total_bytes, estimate.linear_state_bytes, "total memory budget");
-    estimate.total_bytes = checked_add_size_t(estimate.total_bytes, estimate.safety_bytes, "total memory budget");
+    estimate.overhead_bytes = estimate.weight_bytes / 10; // 10% weight overhead
+    estimate.total_required_bytes = estimate.weight_bytes;
+    estimate.total_required_bytes = checked_add_size_t(estimate.total_required_bytes, estimate.kv_cache_bytes, "total memory budget");
+    estimate.total_required_bytes = checked_add_size_t(estimate.total_required_bytes, estimate.linear_state_bytes, "total memory budget");
+    estimate.total_required_bytes = checked_add_size_t(estimate.total_required_bytes, estimate.overhead_bytes, "total memory budget");
     return estimate;
 }
 
@@ -1369,7 +1391,7 @@ bool validate_memory_budget_or_set_error(const std::string& model_path, const Qw
     if (!estimate_opt.has_value()) return true;
 
     const MemoryBudgetEstimate& estimate = *estimate_opt;
-    if (estimate.total_bytes <= estimate.recommended_bytes) return true;
+    if (estimate.total_required_bytes <= estimate.effective_budget_bytes) return true;
 
     auto to_gib = [](size_t bytes) {
         return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
@@ -1378,14 +1400,17 @@ bool validate_memory_budget_or_set_error(const std::string& model_path, const Qw
     std::snprintf(
         buf,
         sizeof(buf),
-        "metal memory budget exceeded: required=%.2f GiB (weights=%.2f, kv=%.2f, linear=%.2f, safety=%.2f, budget_tokens=%d) > max_recommended=%.2f GiB",
-        to_gib(estimate.total_bytes),
+        "metal memory budget exceeded: required=%.2f GiB (weights=%.2f, kv=%.2f, linear=%.2f, overhead=%.2f, context_tokens=%d, slots=%d) > budget=%.2f GiB (memory_size=%.2f GiB, max_recommended=%.2f GiB)",
+        to_gib(estimate.total_required_bytes),
         to_gib(estimate.weight_bytes),
         to_gib(estimate.kv_cache_bytes),
         to_gib(estimate.linear_state_bytes),
-        to_gib(estimate.safety_bytes),
-        estimate.budget_tokens,
-        to_gib(estimate.recommended_bytes)
+        to_gib(estimate.overhead_bytes),
+        estimate.context_tokens,
+        estimate.active_slots,
+        to_gib(estimate.effective_budget_bytes),
+        to_gib(estimate.memory_size_bytes),
+        to_gib(estimate.max_recommended_bytes)
     );
     g_last_error = buf;
     return false;
