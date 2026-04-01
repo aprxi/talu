@@ -211,12 +211,12 @@ pub const ThreadPool = struct {
         const items_per_thread = ((raw_items + FLOATS_PER_CACHE_LINE - 1) / FLOATS_PER_CACHE_LINE) * FLOATS_PER_CACHE_LINE;
         task_fn(0, @min(items_per_thread, n_items), task_ctx);
 
-        // Barrier: all n_threads participate (including idle workers)
+        // Barrier: only active workers for this dispatch participate.
         const n_passed = self.n_barrier_passed.load(.acquire);
         const n_barrier = self.n_barrier.fetchAdd(1, .acq_rel);
-        const n_threads_u32: u32 = @intCast(self.n_threads);
+        const active_u32: u32 = @intCast(active);
 
-        if (n_barrier == n_threads_u32 - 1) {
+        if (n_barrier == active_u32 - 1) {
             self.n_barrier.store(0, .monotonic);
             _ = self.n_barrier_passed.fetchAdd(1, .release);
             Futex.wakeAll(&self.n_barrier_passed);
@@ -236,7 +236,6 @@ pub const ThreadPool = struct {
 
 fn workerMain(pool: *ThreadPool, thread_idx: usize) void {
     var last_n_graph: u32 = 0;
-    const n_threads_u32: u32 = @intCast(pool.n_threads);
 
     while (true) {
         // Wait for new work via futex (spin briefly first)
@@ -249,10 +248,13 @@ fn workerMain(pool: *ThreadPool, thread_idx: usize) void {
         if (n_graph == last_n_graph) continue; // Spurious wake
         last_n_graph = n_graph;
 
-        // Calculate work range for this thread
-        // Align to cache line boundary (16 floats = 64 bytes) to prevent false sharing
+        // Calculate work range for this thread.
+        // Align to cache line boundary (16 floats = 64 bytes) to prevent false sharing.
         const n_items = pool.n_items;
         const n_active = pool.n_active;
+        // Threads outside the active set sit out this dispatch entirely.
+        if (thread_idx >= n_active) continue;
+
         const raw_items = (n_items + n_active - 1) / n_active;
         const items_per_thread = ((raw_items + FLOATS_PER_CACHE_LINE - 1) / FLOATS_PER_CACHE_LINE) * FLOATS_PER_CACHE_LINE;
         const start_idx = thread_idx * items_per_thread;
@@ -268,8 +270,9 @@ fn workerMain(pool: *ThreadPool, thread_idx: usize) void {
         // Barrier: wait for all threads to finish
         const n_passed = pool.n_barrier_passed.load(.acquire);
         const n_barrier = pool.n_barrier.fetchAdd(1, .acq_rel);
+        const active_u32: u32 = @intCast(n_active);
 
-        if (n_barrier == n_threads_u32 - 1) {
+        if (n_barrier == active_u32 - 1) {
             // Last thread: reset barrier and wake waiters
             pool.n_barrier.store(0, .monotonic);
             _ = pool.n_barrier_passed.fetchAdd(1, .release);
@@ -299,13 +302,13 @@ pub fn global() *ThreadPool {
         global_pool_mutex.lock();
         defer global_pool_mutex.unlock();
         if (!global_pool_once.load(.acquire)) {
-            // THREADS env var takes priority, otherwise use all physical cores.
-            // bw_threads (computed in create()) caps bandwidth-sensitive operations.
+            // THREADS env var takes priority, otherwise use platform-tuned default.
+            // On Apple Silicon this favors P-core count for bandwidth-sensitive inference.
             var n_threads: usize = undefined; // Safe: both branches assign before use
             if (std.posix.getenv("THREADS")) |env| {
-                n_threads = std.fmt.parseInt(usize, env, 10) catch getPhysicalCoreCount();
+                n_threads = std.fmt.parseInt(usize, env, 10) catch getOptimalThreadCount();
             } else {
-                n_threads = getPhysicalCoreCount();
+                n_threads = getOptimalThreadCount();
             }
             global_pool = ThreadPool.create(std.heap.page_allocator, n_threads) catch |err| blk: {
                 // Fall back to single-threaded mode on failure

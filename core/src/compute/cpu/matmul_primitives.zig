@@ -196,6 +196,42 @@ inline fn decodeFp8Vec(
     return out;
 }
 
+inline fn dotFp8ScaledRange(
+    a_row: []const f32,
+    b_row: []align(1) const u8,
+    start_k: usize,
+    end_k: usize,
+    scale: f32,
+) f32 {
+    var sum: f32 = 0.0;
+    const VEC = simd.f32_vec_len;
+    if (comptime VEC >= 4) {
+        const VecF32 = @Vector(VEC, f32);
+        const scale_vec: VecF32 = @splat(scale);
+
+        var k_idx = start_k;
+        while (k_idx + VEC <= end_k) : (k_idx += VEC) {
+            var a_vec: VecF32 = undefined;
+            inline for (0..VEC) |lane| {
+                a_vec[lane] = a_row[k_idx + lane];
+            }
+            const b_ptr: [*]align(1) const u8 = @ptrCast(b_row.ptr + k_idx);
+            const b_vec = decodeFp8Vec(VEC, b_ptr);
+            sum += @reduce(.Add, a_vec * (b_vec * scale_vec));
+        }
+        while (k_idx < end_k) : (k_idx += 1) {
+            sum = @mulAdd(f32, a_row[k_idx], FP8_E4M3_LUT[b_row[k_idx]] * scale, sum);
+        }
+        return sum;
+    }
+
+    var k_idx = start_k;
+    while (k_idx < end_k) : (k_idx += 1) {
+        sum = @mulAdd(f32, a_row[k_idx], FP8_E4M3_LUT[b_row[k_idx]] * scale, sum);
+    }
+    return sum;
+}
+
 /// FP8 E4M3 matmul entry point.
 ///
 /// Supports three scale modes:
@@ -299,24 +335,30 @@ fn matmulF8E4M3(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matm
                     switch (task_ctx.mode) {
                         .mxfp8 => {
                             const scale_row = task_ctx.mxfp8_scales[col_idx * task_ctx.mxfp8_scale_cols ..][0..task_ctx.mxfp8_scale_cols];
-                            for (0..k_len) |k_idx| {
-                                const scale = ue8m0ToScale(scale_row[k_idx / 32]);
-                                sum = @mulAdd(f32, a_row[k_idx], FP8_E4M3_LUT[b_row[k_idx]] * scale, sum);
+                            var block_start: usize = 0;
+                            var scale_block: usize = 0;
+                            while (block_start < k_len) : ({
+                                block_start += 32;
+                                scale_block += 1;
+                            }) {
+                                const block_end = @min(block_start + 32, k_len);
+                                const scale = ue8m0ToScale(scale_row[scale_block]);
+                                sum += dotFp8ScaledRange(a_row, b_row, block_start, block_end, scale);
                             }
                         },
                         .block_bf16 => {
                             const block_size = task_ctx.bf16_block_size;
                             const scale_row = @min(col_idx / block_size, task_ctx.bf16_scale_rows - 1);
-                            for (0..k_len) |k_idx| {
-                                const scale_col = @min(k_idx / block_size, task_ctx.bf16_scale_cols - 1);
+                            var block_start: usize = 0;
+                            while (block_start < k_len) : (block_start += block_size) {
+                                const scale_col = @min(block_start / block_size, task_ctx.bf16_scale_cols - 1);
                                 const scale = bf16ToF32(task_ctx.bf16_scales[scale_row * task_ctx.bf16_scale_cols + scale_col]);
-                                sum = @mulAdd(f32, a_row[k_idx], FP8_E4M3_LUT[b_row[k_idx]] * scale, sum);
+                                const block_end = @min(block_start + block_size, k_len);
+                                sum += dotFp8ScaledRange(a_row, b_row, block_start, block_end, scale);
                             }
                         },
                         .per_tensor => {
-                            for (0..k_len) |k_idx| {
-                                sum = @mulAdd(f32, a_row[k_idx], FP8_E4M3_LUT[b_row[k_idx]] * task_ctx.per_tensor_scale, sum);
-                            }
+                            sum += dotFp8ScaledRange(a_row, b_row, 0, k_len, task_ctx.per_tensor_scale);
                         },
                     }
 
@@ -747,6 +789,7 @@ fn matmulBF16SingleRowBFDOT(
                 var acc3: @Vector(4, f32) = @splat(0);
 
                 var ki: usize = 0;
+
                 // Unroll 4x: process 32 bf16 pairs per iteration
                 while (ki + 32 <= k) : (ki += 32) {
                     const a0: @Vector(8, u16) = a[ki..][0..8].*;
@@ -765,7 +808,6 @@ fn matmulBF16SingleRowBFDOT(
                     acc3 = simd.arm.bfdot8(acc3, a3, b3);
                 }
 
-                // Handle remaining 8-element chunks
                 while (ki + 8 <= k) : (ki += 8) {
                     const a_vec: @Vector(8, u16) = a[ki..][0..8].*;
                     const b_vec: @Vector(8, u16) = b_row[ki..][0..8].*;
@@ -775,8 +817,6 @@ fn matmulBF16SingleRowBFDOT(
                 // Combine accumulators and reduce
                 const combined = acc0 + acc1 + acc2 + acc3;
                 var sum = @reduce(.Add, combined);
-
-                // Handle tail (if k not divisible by 8)
                 while (ki < k) : (ki += 1) {
                     const av = @as(f32, @bitCast(@as(u32, a[ki]) << 16));
                     const bv = @as(f32, @bitCast(@as(u32, b_row[ki]) << 16));
