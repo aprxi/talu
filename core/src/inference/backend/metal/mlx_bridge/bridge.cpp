@@ -485,7 +485,13 @@ ParsedModelConfig parse_qwen35_config(const std::string& model_path) {
 
     if (!find_int_value(text_cfg, "hidden_size", &cfg.hidden_size)) throw std::runtime_error("missing text_config.hidden_size");
     if (!find_int_value(text_cfg, "num_hidden_layers", &cfg.num_hidden_layers)) throw std::runtime_error("missing text_config.num_hidden_layers");
-    if (!find_int_value(text_cfg, "intermediate_size", &cfg.intermediate_size)) throw std::runtime_error("missing text_config.intermediate_size");
+    if (!find_int_value(text_cfg, "intermediate_size", &cfg.intermediate_size)) {
+        if (!find_int_value(text_cfg, "d_ff", &cfg.intermediate_size)) {
+            if (!find_int_value(text_cfg, "block_ff_dim", &cfg.intermediate_size)) {
+                throw std::runtime_error("missing text_config.intermediate_size/d_ff/block_ff_dim");
+            }
+        }
+    }
 
     if (!find_int_value(text_cfg, "num_attention_heads", &cfg.num_attention_heads)) {
         if (!find_int_value(text_cfg, "num_heads", &cfg.num_attention_heads)) {
@@ -1666,6 +1672,26 @@ extern "C" {
 
 int32_t mlx_is_available(void) {
     return metal::is_available() ? 1 : 0;
+}
+
+int32_t mlx_validate_config(const char* model_path) {
+    if (!model_path) {
+        g_last_error = "mlx_validate_config: model_path is null";
+        return 0;
+    }
+    try {
+        if (!std::filesystem::exists(model_path)) {
+            throw std::runtime_error(std::string("resolved model_path does not exist: ") + model_path);
+        }
+        (void)parse_qwen35_config(model_path);
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_validate_config";
+        return 0;
+    }
 }
 
 mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) {

@@ -17,6 +17,7 @@ typedef struct mlx_result {
 } mlx_result;
 
 int32_t mlx_is_available(void);
+int32_t mlx_validate_config(const char* model_path);
 
 mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed);
 void mlx_destroy(mlx_ctx* ctx);
