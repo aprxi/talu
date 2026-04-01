@@ -235,8 +235,10 @@ pub export fn talu_scheduler_submit(
 
         // Overlay sampling fields onto the scheduler's defaults.
         // Only fields explicitly set by the caller are overridden.
-        // Strategy resolution: top_k takes precedence over top_p.
-        // Setting temperature > 0 without explicit top_k/top_p defaults to top_k.
+        // Strategy resolution chooses the primary route:
+        // - explicit top_k => top_k route (top_p/min_p still compose in sampler)
+        // - explicit top_p without top_k => top_p route
+        // - temperature > 0 without explicit top_k/top_p => top_k route
         var sampling_cfg = wrapper.scheduler.config.default_sampling;
         var has_override = false;
         var explicit_top_k = false;
@@ -263,8 +265,8 @@ pub export fn talu_scheduler_submit(
             sampling_cfg.seed = opts.seed;
             has_override = true;
         }
-        // Resolve strategy: explicit top_k wins; else explicit top_p;
-        // else temperature > 0 implies top_k (the common default).
+        // Resolve strategy for route selection while preserving all
+        // filter fields in sampling_cfg for the sampler stage.
         if (explicit_top_k) {
             sampling_cfg.strategy = .top_k;
         } else if (explicit_top_p) {
