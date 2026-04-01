@@ -50,7 +50,7 @@ pub const VisionRuntime = struct {
             .vision_max_num_patches = loaded.config.vision_max_num_patches,
             .has_safetensors = @as(u8, @intFromBool(loaded.st != null)),
         }, @src());
-        try models.vision.hydrateVisionConfigFromWeights(loaded);
+        try models.vision.hydrateVisionConfigFromWeights(allocator, loaded);
         log.debug("inference", "Vision runtime config hydrated", .{
             .vision_hidden_size = loaded.config.vision_hidden_size,
             .vision_depth = loaded.config.vision_depth,
@@ -63,7 +63,7 @@ pub const VisionRuntime = struct {
             .vision_num_position_embeddings = loaded.config.vision_num_position_embeddings,
             .vision_max_num_patches = loaded.config.vision_max_num_patches,
         }, @src());
-        const detected_layout = models.vision.detectVisionAttentionLayout(loaded);
+        const detected_layout = try models.vision.detectVisionAttentionLayout(allocator, loaded);
         log.debug("inference", "Vision runtime attention layout detected", .{
             .layout = @tagName(detected_layout),
         }, @src());

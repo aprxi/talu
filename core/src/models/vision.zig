@@ -15,6 +15,7 @@ const weights = @import("load/weights.zig");
 pub const SafeTensors = @import("../io/safetensors/root.zig").UnifiedSafeTensors;
 pub const LoadedModel = weights.LoadedModel;
 pub const VisionMetadata = op_types.VisionMetadata;
+const Allocator = std.mem.Allocator;
 pub const AttentionLayout = enum {
     fused_qkv,
     split_qkv,
@@ -35,17 +36,37 @@ pub fn resolveVisionProgram(loaded: *const LoadedModel) ?[]const layer_ops.Layer
     return registry.visionProgramByArchitectureId(arch_id);
 }
 
-pub fn hasAnyTensor(st: *SafeTensors, candidates: []const []const u8) bool {
+/// Vision tensor-name resolver that shares generic weight-name normalization.
+pub const TensorNameResolver = struct {
+    allocator: Allocator,
+    resolver: generic_weights.NameResolver = .{},
+
+    pub fn init(allocator: Allocator) TensorNameResolver {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *TensorNameResolver) void {
+        self.resolver.deinit(self.allocator);
+    }
+
+    fn resolve(self: *TensorNameResolver, st: *SafeTensors, candidate: []const u8) !?[]const u8 {
+        var qweight_name_buf: [1024]u8 = undefined;
+        return try self.resolver.resolve(self.allocator, st, candidate, qweight_name_buf[0..]);
+    }
+};
+
+pub fn hasAnyTensor(name_resolver: *TensorNameResolver, st: *SafeTensors, candidates: []const []const u8) !bool {
     for (candidates) |name| {
-        _ = st.getTensor(name, null) catch continue;
+        _ = (try name_resolver.resolve(st, name)) orelse continue;
         return true;
     }
     return false;
 }
 
-pub fn getTensorByCandidates(st: *SafeTensors, candidates: []const []const u8) !tensor.Tensor {
+pub fn getTensorByCandidates(name_resolver: *TensorNameResolver, st: *SafeTensors, candidates: []const []const u8) !tensor.Tensor {
     for (candidates) |name| {
-        const t = st.getTensor(name, null) catch |err| switch (err) {
+        const resolved_name = (try name_resolver.resolve(st, name)) orelse continue;
+        const t = st.getTensor(resolved_name, null) catch |err| switch (err) {
             error.NotFound => continue,
             else => return err,
         };
@@ -54,11 +75,12 @@ pub fn getTensorByCandidates(st: *SafeTensors, candidates: []const []const u8) !
     return error.NotFound;
 }
 
-pub fn getLayerTensorByTemplates(st: *SafeTensors, layer_idx: usize, templates: []const []const u8) !tensor.Tensor {
+pub fn getLayerTensorByTemplates(name_resolver: *TensorNameResolver, st: *SafeTensors, layer_idx: usize, templates: []const []const u8) !tensor.Tensor {
     var name_buf: [192]u8 = undefined;
     for (templates) |template| {
         const name = generic_weights.expandLayerTemplate(name_buf[0..], template, layer_idx) catch continue;
-        const t = st.getTensor(name, null) catch |err| switch (err) {
+        const resolved_name = (try name_resolver.resolve(st, name)) orelse continue;
+        const t = st.getTensor(resolved_name, null) catch |err| switch (err) {
             error.NotFound => continue,
             else => return err,
         };
@@ -67,26 +89,30 @@ pub fn getLayerTensorByTemplates(st: *SafeTensors, layer_idx: usize, templates: 
     return error.NotFound;
 }
 
-pub fn detectVisionAttentionLayout(loaded: *const LoadedModel) AttentionLayout {
+pub fn detectVisionAttentionLayout(allocator: Allocator, loaded: *const LoadedModel) !AttentionLayout {
     if (loaded.st == null) return .unknown;
 
     const st: *SafeTensors = @constCast(&loaded.st.?);
+    var name_resolver = TensorNameResolver.init(allocator);
+    defer name_resolver.deinit();
     const vision_metadata = resolveVisionMetadata(loaded);
-    if (hasAnyTensor(st, vision_metadata.fused_qkv_probe_candidates)) {
+    if (try hasAnyTensor(&name_resolver, st, vision_metadata.fused_qkv_probe_candidates)) {
         return .fused_qkv;
     }
 
-    if (hasAnyTensor(st, vision_metadata.split_qkv_probe_candidates)) {
+    if (try hasAnyTensor(&name_resolver, st, vision_metadata.split_qkv_probe_candidates)) {
         return .split_qkv;
     }
 
     return .unknown;
 }
 
-pub fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
+pub fn hydrateVisionConfigFromWeights(allocator: Allocator, loaded: *LoadedModel) !void {
     if (loaded.st == null) return;
 
     var cfg = &loaded.config;
+    var name_resolver = TensorNameResolver.init(allocator);
+    defer name_resolver.deinit();
     const vision_metadata = resolveVisionMetadata(loaded);
     const needs_hydration = cfg.vision_hidden_size <= 0 or
         cfg.vision_depth <= 0 or
@@ -101,9 +127,9 @@ pub fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
     if (!needs_hydration) return;
 
     const st = &loaded.st.?;
-    if (!hasAnyTensor(st, vision_metadata.patch_embed_candidates)) return;
+    if (!try hasAnyTensor(&name_resolver, st, vision_metadata.patch_embed_candidates)) return;
 
-    const patch_tensor = getTensorByCandidates(st, vision_metadata.patch_embed_candidates) catch |err| switch (err) {
+    const patch_tensor = getTensorByCandidates(&name_resolver, st, vision_metadata.patch_embed_candidates) catch |err| switch (err) {
         error.NotFound => return,
         else => return err,
     };
@@ -123,7 +149,7 @@ pub fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
     }
     if (cfg.vision_patch_size <= 0) cfg.vision_patch_size = 16;
 
-    const pos_tensor = getTensorByCandidates(st, vision_metadata.position_embed_candidates) catch |err| switch (err) {
+    const pos_tensor = getTensorByCandidates(&name_resolver, st, vision_metadata.position_embed_candidates) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
@@ -135,7 +161,7 @@ pub fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
         }
     }
 
-    const merger_fc1_weight = getTensorByCandidates(st, vision_metadata.merger_fc1_candidates) catch |err| switch (err) {
+    const merger_fc1_weight = getTensorByCandidates(&name_resolver, st, vision_metadata.merger_fc1_candidates) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
@@ -158,7 +184,7 @@ pub fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
     }
 
     if (cfg.vision_depth <= 0) {
-        cfg.vision_depth = @intCast(try inferVisionDepth(st, &vision_metadata));
+        cfg.vision_depth = @intCast(try inferVisionDepth(&name_resolver, st, &vision_metadata));
     }
 
     if (cfg.vision_num_heads <= 0 and cfg.vision_hidden_size > 0) {
@@ -166,7 +192,7 @@ pub fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
     }
 
     if (cfg.vision_intermediate_size <= 0 and cfg.vision_hidden_size > 0) {
-        if (try inferVisionIntermediateSize(st, @intCast(cfg.vision_hidden_size), &vision_metadata)) |intermediate| {
+        if (try inferVisionIntermediateSize(&name_resolver, st, @intCast(cfg.vision_hidden_size), &vision_metadata)) |intermediate| {
             cfg.vision_intermediate_size = intermediate;
         }
     }
@@ -259,19 +285,19 @@ fn inferProjectorHiddenSize(
     return null;
 }
 
-fn inferVisionDepth(st: *SafeTensors, vision_metadata: *const VisionMetadata) !usize {
-    const split_depth = try countLayerDepth(st, vision_metadata.depth_split_qproj_templates);
+fn inferVisionDepth(name_resolver: *TensorNameResolver, st: *SafeTensors, vision_metadata: *const VisionMetadata) !usize {
+    const split_depth = try countLayerDepth(name_resolver, st, vision_metadata.depth_split_qproj_templates);
     if (split_depth > 0) return split_depth;
 
-    const fused_depth = try countLayerDepth(st, vision_metadata.depth_fused_qkv_templates);
+    const fused_depth = try countLayerDepth(name_resolver, st, vision_metadata.depth_fused_qkv_templates);
     return fused_depth;
 }
 
-fn countLayerDepth(st: *SafeTensors, templates: []const []const u8) !usize {
+fn countLayerDepth(name_resolver: *TensorNameResolver, st: *SafeTensors, templates: []const []const u8) !usize {
     var depth: usize = 0;
     var layer_idx: usize = 0;
     while (layer_idx < 512) : (layer_idx += 1) {
-        _ = getLayerTensorByTemplates(st, layer_idx, templates) catch |err| switch (err) {
+        _ = getLayerTensorByTemplates(name_resolver, st, layer_idx, templates) catch |err| switch (err) {
             error.NotFound => break,
             else => return err,
         };
@@ -289,11 +315,12 @@ fn inferVisionHeads(vision_hidden_size: usize) usize {
 }
 
 fn inferVisionIntermediateSize(
+    name_resolver: *TensorNameResolver,
     st: *SafeTensors,
     vision_hidden_size: usize,
     vision_metadata: *const VisionMetadata,
 ) !?i32 {
-    const fc1 = getLayerTensorByTemplates(st, 0, vision_metadata.intermediate_fc1_templates) catch |err| switch (err) {
+    const fc1 = getLayerTensorByTemplates(name_resolver, st, 0, vision_metadata.intermediate_fc1_templates) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
@@ -403,8 +430,10 @@ test "hasAnyTensor and getTensorByCandidates find existing tensor" {
 
     var st = try SafeTensors.load(allocator, path);
     defer st.deinit();
-    try std.testing.expect(hasAnyTensor(&st, &.{ "missing", "foo.weight" }));
-    const tensor_view = try getTensorByCandidates(&st, &.{ "missing", "foo.weight" });
+    var name_resolver = TensorNameResolver.init(allocator);
+    defer name_resolver.deinit();
+    try std.testing.expect(try hasAnyTensor(&name_resolver, &st, &.{ "missing", "foo.weight" }));
+    const tensor_view = try getTensorByCandidates(&name_resolver, &st, &.{ "missing", "foo.weight" });
     try std.testing.expectEqual(@as(usize, 2), tensor_view.numel);
 }
 
@@ -430,19 +459,51 @@ test "getLayerTensorByTemplates resolves layer template name" {
 
     var st = try SafeTensors.load(allocator, path);
     defer st.deinit();
-    const t = try getLayerTensorByTemplates(&st, 0, &.{"layers.{d}.weight"});
+    var name_resolver = TensorNameResolver.init(allocator);
+    defer name_resolver.deinit();
+    const t = try getLayerTensorByTemplates(&name_resolver, &st, 0, &.{"layers.{d}.weight"});
     try std.testing.expectEqual(@as(usize, 2), t.numel);
 }
 
 test "detectVisionAttentionLayout returns unknown when tensors are absent" {
     var loaded = makeLoadedModelForTests();
     defer loaded.arena.deinit();
-    try std.testing.expectEqual(AttentionLayout.unknown, detectVisionAttentionLayout(&loaded));
+    try std.testing.expectEqual(AttentionLayout.unknown, try detectVisionAttentionLayout(std.testing.allocator, &loaded));
+}
+
+test "detectVisionAttentionLayout resolves language_model-prefixed visual probe" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f32_values = [_]f32{ 1.0, 2.0 };
+    const shape = [_]usize{ 1, 2 };
+    const entries = [_]st_writer.TensorEntry{
+        .{
+            .name = "model.language_model.visual.blocks.0.attn.qkv.weight",
+            .dtype = .f32,
+            .shape = &shape,
+            .data = std.mem.sliceAsBytes(&f32_values),
+        },
+    };
+    var out_file = try tmp.dir.createFile("vision_layout_prefixed.safetensors", .{});
+    defer out_file.close();
+    try st_writer.writeToFile(allocator, out_file, &entries);
+    const path = try tmp.dir.realpathAlloc(allocator, "vision_layout_prefixed.safetensors");
+    defer allocator.free(path);
+
+    var loaded = makeLoadedModelForTests();
+    defer loaded.arena.deinit();
+    loaded.runtime.architecture_id = "qwen3_5";
+    loaded.st = try SafeTensors.load(allocator, path);
+    defer if (loaded.st) |*st| st.deinit();
+
+    try std.testing.expectEqual(AttentionLayout.fused_qkv, try detectVisionAttentionLayout(allocator, &loaded));
 }
 
 test "hydrateVisionConfigFromWeights is no-op without loaded tensors" {
     var loaded = makeLoadedModelForTests();
     defer loaded.arena.deinit();
-    try hydrateVisionConfigFromWeights(&loaded);
+    try hydrateVisionConfigFromWeights(std.testing.allocator, &loaded);
     try std.testing.expectEqual(@as(i32, 0), loaded.config.vision_hidden_size);
 }
