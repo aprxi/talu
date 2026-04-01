@@ -135,26 +135,17 @@ fn findWeightSpecById(specs: []const model_types.WeightSpec, id: []const u8) ?*c
 /// Try to get a tensor by name, with GPTQ .qweight fallback.
 /// When a name ending in .weight is not found, replaces .weight with .qweight.
 fn getTensorOrGptqFallback(
+    allocator: std.mem.Allocator,
     safetensors_file: *st_loader.UnifiedSafeTensors,
     name: []const u8,
+    name_resolver: *generic_weights.NameResolver,
     qweight_buf: []u8,
-) ?DType {
-    if (safetensors_file.getTensor(name, null)) |t| return t.dtype else |_| {}
-    // GPTQ fallback: .weight → .qweight
-    if (std.mem.endsWith(u8, name, ".weight")) {
-        const base_len = name.len - ".weight".len;
-        const qw = ".qweight";
-        const total = base_len + qw.len;
-        if (total <= qweight_buf.len) {
-            @memcpy(qweight_buf[0..base_len], name[0..base_len]);
-            @memcpy(qweight_buf[base_len..total], qw);
-            if (safetensors_file.getTensor(qweight_buf[0..total], null)) |t| return t.dtype else |_| {}
-        }
-    }
-    return null;
+) !?DType {
+    return name_resolver.resolveDType(allocator, safetensors_file, name, qweight_buf);
 }
 
 fn detectOriginalWeightDType(
+    allocator: std.mem.Allocator,
     arch: *const model_types.Architecture,
     layer_types: ?[]const u8,
     safetensors_file: *st_loader.UnifiedSafeTensors,
@@ -169,6 +160,8 @@ fn detectOriginalWeightDType(
     var name_buf: [512]u8 = undefined;
     var prefix_buf: [256]u8 = undefined;
     var qweight_buf: [512]u8 = undefined;
+    var name_resolver: generic_weights.NameResolver = .{};
+    defer name_resolver.deinit(allocator);
 
     for (probe_weight_ids) |id| {
         const spec = findWeightSpecById(specs, id) orelse continue;
@@ -177,7 +170,7 @@ fn detectOriginalWeightDType(
             const candidate = if (alias_idx == 0) spec.suffix else spec.aliases[alias_idx - 1];
             if (arch.weight_prefixes.len == 0 or std.mem.indexOf(u8, candidate, "{d}") != null) {
                 const name = generic_weights.expandLayerTemplate(name_buf[0..], candidate, 0) catch continue;
-                if (getTensorOrGptqFallback(safetensors_file, name, &qweight_buf)) |d| return d;
+                if (try getTensorOrGptqFallback(allocator, safetensors_file, name, &name_resolver, &qweight_buf)) |d| return d;
                 continue;
             }
 
@@ -188,7 +181,7 @@ fn detectOriginalWeightDType(
                 @memcpy(name_buf[0..expanded_prefix.len], expanded_prefix);
                 @memcpy(name_buf[expanded_prefix.len..total_len], candidate);
                 const name = name_buf[0..total_len];
-                if (getTensorOrGptqFallback(safetensors_file, name, &qweight_buf)) |d| return d;
+                if (try getTensorOrGptqFallback(allocator, safetensors_file, name, &name_resolver, &qweight_buf)) |d| return d;
             }
         }
     }
@@ -451,7 +444,7 @@ pub fn loadModelWithArchitecture(
     // Detect original weight dtype from declarative architecture metadata.
     // This is used to determine if model is BF16 for MLX GPU path.
     const original_weight_dtype = blk: {
-        const detected = try detectOriginalWeightDType(arch, model_config.layer_types, &safetensors_file);
+        const detected = try detectOriginalWeightDType(arena_allocator, arch, model_config.layer_types, &safetensors_file);
         // SafeTensors maps U32 to grouped_affine_u4 by default. Correct
         // based on config's authoritative gaffine_bits when it says 8-bit.
         if (detected == .grouped_affine_u4 and model_config.gaffine_bits == 8) {

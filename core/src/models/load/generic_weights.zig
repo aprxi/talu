@@ -21,6 +21,107 @@ pub const LoadOptions = struct {
     dequantize_mxfp8_to_bf16: bool = false,
 };
 
+const NormalizedNameEntry = struct {
+    actual_name: []const u8,
+    ambiguous: bool = false,
+};
+
+/// Resolves tensor candidates with bounded normalization for repeated wrapper
+/// segments (for example, duplicated `language_model` namespaces).
+pub const NameResolver = struct {
+    initialized: bool = false,
+    normalized_names: std.StringHashMapUnmanaged(NormalizedNameEntry) = .{},
+
+    pub fn deinit(self: *NameResolver, allocator: Allocator) void {
+        var iter = self.normalized_names.iterator();
+        while (iter.next()) |kv| allocator.free(kv.key_ptr.*);
+        self.normalized_names.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn resolve(
+        self: *NameResolver,
+        allocator: Allocator,
+        safetensors: *st_loader.UnifiedSafeTensors,
+        candidate_name: []const u8,
+        qweight_name_buf: []u8,
+    ) !?[]const u8 {
+        if (safetensors.hasTensor(candidate_name)) return candidate_name;
+
+        if (buildQWeightCandidate(candidate_name, qweight_name_buf)) |qweight_name| {
+            if (safetensors.hasTensor(qweight_name)) return qweight_name;
+        }
+
+        if (try self.resolveNormalizedCandidate(allocator, safetensors, candidate_name)) |resolved_name| return resolved_name;
+
+        if (buildQWeightCandidate(candidate_name, qweight_name_buf)) |qweight_name| {
+            if (try self.resolveNormalizedCandidate(allocator, safetensors, qweight_name)) |resolved_name| return resolved_name;
+        }
+
+        return null;
+    }
+
+    pub fn resolveDType(
+        self: *NameResolver,
+        allocator: Allocator,
+        safetensors: *st_loader.UnifiedSafeTensors,
+        candidate_name: []const u8,
+        qweight_name_buf: []u8,
+    ) !?tensor.DType {
+        const resolved_name = try self.resolve(allocator, safetensors, candidate_name, qweight_name_buf) orelse return null;
+        if (safetensors.getTensor(resolved_name, null)) |t| return t.dtype else |_| return null;
+    }
+
+    fn resolveNormalizedCandidate(
+        self: *NameResolver,
+        allocator: Allocator,
+        safetensors: *st_loader.UnifiedSafeTensors,
+        candidate_name: []const u8,
+    ) !?[]const u8 {
+        try self.ensureInitialized(allocator, safetensors);
+
+        const normalized_buf = try allocator.alloc(u8, candidate_name.len);
+        defer allocator.free(normalized_buf);
+        const normalized_candidate = try normalizeWrapperSegments(normalized_buf, candidate_name);
+
+        const entry = self.normalized_names.getPtr(normalized_candidate) orelse return null;
+        if (entry.ambiguous) return error.AmbiguousWeightName;
+        return entry.actual_name;
+    }
+
+    fn ensureInitialized(
+        self: *NameResolver,
+        allocator: Allocator,
+        safetensors: *st_loader.UnifiedSafeTensors,
+    ) !void {
+        if (self.initialized) return;
+
+        const tensor_names = try safetensors.tensorNames(allocator);
+        defer allocator.free(tensor_names);
+
+        for (tensor_names) |tensor_name| {
+            const normalized_buf = try allocator.alloc(u8, tensor_name.len);
+            defer allocator.free(normalized_buf);
+            const normalized_name = try normalizeWrapperSegments(normalized_buf, tensor_name);
+
+            if (self.normalized_names.getPtr(normalized_name)) |entry| {
+                if (!std.mem.eql(u8, entry.actual_name, tensor_name)) {
+                    entry.ambiguous = true;
+                }
+                continue;
+            }
+
+            const normalized_storage = try allocator.dupe(u8, normalized_name);
+            try self.normalized_names.put(allocator, normalized_storage, .{
+                .actual_name = tensor_name,
+                .ambiguous = false,
+            });
+        }
+
+        self.initialized = true;
+    }
+};
+
 pub fn loadWeightMap(
     allocator: Allocator,
     safetensors: *st_loader.UnifiedSafeTensors,
@@ -32,6 +133,8 @@ pub fn loadWeightMap(
 ) !WeightMap {
     var map = WeightMap{};
     errdefer map.deinit(allocator);
+    var name_resolver: NameResolver = .{};
+    defer name_resolver.deinit(allocator);
 
     for (specs) |spec| {
         if (try loadWeightBySpec(
@@ -42,6 +145,7 @@ pub fn loadWeightMap(
             layer_idx,
             model_config,
             options,
+            &name_resolver,
         )) |weight| {
             try map.put(allocator, spec.id, weight);
         }
@@ -58,6 +162,7 @@ fn loadWeightBySpec(
     layer_idx: usize,
     model_config: *const tensor.ModelConfig,
     options: LoadOptions,
+    name_resolver: *NameResolver,
 ) !?*const Tensor {
     var name_buf: [512]u8 = undefined;
     var prefix_buf: [256]u8 = undefined;
@@ -69,7 +174,7 @@ fn loadWeightBySpec(
 
         if (weight_prefixes.len == 0 or std.mem.indexOf(u8, candidate, "{d}") != null) {
             const expanded_name = expandLayerTemplate(name_buf[0..], candidate, layer_idx) catch continue;
-            if (try tryLoadCandidate(allocator, safetensors, spec, expanded_name, model_config, options)) |weight| {
+            if (try tryLoadCandidate(allocator, safetensors, spec, expanded_name, model_config, options, name_resolver)) |weight| {
                 return weight;
             }
             continue;
@@ -82,7 +187,7 @@ fn loadWeightBySpec(
             @memcpy(name_buf[0..expanded_prefix.len], expanded_prefix);
             @memcpy(name_buf[expanded_prefix.len..total_len], candidate);
             const expanded_name = name_buf[0..total_len];
-            if (try tryLoadCandidate(allocator, safetensors, spec, expanded_name, model_config, options)) |weight| {
+            if (try tryLoadCandidate(allocator, safetensors, spec, expanded_name, model_config, options, name_resolver)) |weight| {
                 return weight;
             }
         }
@@ -106,24 +211,11 @@ fn tryLoadCandidate(
     name: []const u8,
     model_config: *const tensor.ModelConfig,
     options: LoadOptions,
+    name_resolver: *NameResolver,
 ) !?*const Tensor {
-    // Try primary name, then GPTQ .qweight fallback for quantized models.
-    var qweight_name_buf: [512]u8 = undefined;
-    var effective_name = name;
-    const raw_tensor = safetensors.getTensor(name, null) catch blk: {
-        if (std.mem.endsWith(u8, name, ".weight")) {
-            const base_len = name.len - ".weight".len;
-            const qw_suffix = ".qweight";
-            const total = base_len + qw_suffix.len;
-            if (total <= qweight_name_buf.len) {
-                @memcpy(qweight_name_buf[0..base_len], name[0..base_len]);
-                @memcpy(qweight_name_buf[base_len..total], qw_suffix);
-                effective_name = qweight_name_buf[0..total];
-                break :blk safetensors.getTensor(effective_name, null) catch return null;
-            }
-        }
-        return null;
-    };
+    var qweight_name_buf: [1024]u8 = undefined;
+    const effective_name = try name_resolver.resolve(allocator, safetensors, name, qweight_name_buf[0..]) orelse return null;
+    const raw_tensor = safetensors.getTensor(effective_name, null) catch return null;
 
     const transformed = applySpecTransforms(
         allocator,
@@ -145,6 +237,56 @@ fn tryLoadCandidate(
     const weight_ptr = try allocator.create(Tensor); // lint:ignore errdefer-alloc - arena freed atomically
     weight_ptr.* = transformed;
     return weight_ptr;
+}
+
+fn isRepeatableWrapperSegment(segment: []const u8) bool {
+    return std.mem.eql(u8, segment, "model") or
+        std.mem.eql(u8, segment, "language_model") or
+        std.mem.eql(u8, segment, "text_model") or
+        std.mem.eql(u8, segment, "base_model") or
+        std.mem.eql(u8, segment, "module");
+}
+
+fn normalizeWrapperSegments(buf: []u8, path: []const u8) ![]const u8 {
+    var out_idx: usize = 0;
+    var token_start: usize = 0;
+    var prev_was_wrapper = false;
+
+    while (token_start <= path.len) {
+        var token_end = token_start;
+        while (token_end < path.len and path[token_end] != '.') : (token_end += 1) {}
+        const token = path[token_start..token_end];
+        const is_wrapper = isRepeatableWrapperSegment(token);
+        const skip_wrapper = prev_was_wrapper and is_wrapper;
+
+        if (!skip_wrapper) {
+            if (out_idx > 0) {
+                if (out_idx >= buf.len) return error.BufferTooSmall;
+                buf[out_idx] = '.';
+                out_idx += 1;
+            }
+            if (out_idx + token.len > buf.len) return error.BufferTooSmall;
+            @memcpy(buf[out_idx .. out_idx + token.len], token);
+            out_idx += token.len;
+        }
+        prev_was_wrapper = is_wrapper;
+
+        if (token_end == path.len) break;
+        token_start = token_end + 1;
+    }
+
+    return buf[0..out_idx];
+}
+
+fn buildQWeightCandidate(name: []const u8, qweight_name_buf: []u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, name, ".weight")) return null;
+    const base_len = name.len - ".weight".len;
+    const qw_suffix = ".qweight";
+    const total = base_len + qw_suffix.len;
+    if (total > qweight_name_buf.len) return null;
+    @memcpy(qweight_name_buf[0..base_len], name[0..base_len]);
+    @memcpy(qweight_name_buf[base_len..total], qw_suffix);
+    return qweight_name_buf[0..total];
 }
 
 fn applySpecTransforms(
@@ -330,6 +472,27 @@ test "expandLayerTemplate returns error for buffer too small" {
     try std.testing.expectError(error.BufferTooSmall, result);
 }
 
+test "normalizeWrapperSegments collapses wrapper runs" {
+    var buf: [256]u8 = undefined;
+    const input = "model.language_model.language_model.language_model.layers.0.mlp.gate_proj.weight";
+    const out = try normalizeWrapperSegments(&buf, input);
+    try std.testing.expectEqualStrings("model.layers.0.mlp.gate_proj.weight", out);
+}
+
+test "normalizeWrapperSegments resolves mixed wrapper run before visual path" {
+    var buf: [256]u8 = undefined;
+    const input = "model.language_model.visual.blocks.0.attn.qkv.weight";
+    const out = try normalizeWrapperSegments(&buf, input);
+    try std.testing.expectEqualStrings("model.visual.blocks.0.attn.qkv.weight", out);
+}
+
+test "normalizeWrapperSegments keeps non-wrapper duplicates" {
+    var buf: [256]u8 = undefined;
+    const input = "layers.layers.0.weight";
+    const out = try normalizeWrapperSegments(&buf, input);
+    try std.testing.expectEqualStrings("layers.layers.0.weight", out);
+}
+
 test "loadWeightMap tested via integration tests" {
     // loadWeightMap requires a valid SafeTensors file handle and ModelConfig
     // which makes it unsuitable for unit testing in isolation.
@@ -405,4 +568,142 @@ test "WeightSpec.force_f32 overrides preserve_native_norm_dtype for norm weights
 
     try std.testing.expectEqual(tensor.DType.f32, force_tensor.dtype);
     try std.testing.expectEqual(tensor.DType.bf16, preserve_tensor.dtype);
+}
+
+test "loadWeightMap resolves repeated wrapper prefix via normalized fallback" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const model_path = try std.fs.path.join(allocator, &.{ tmp_path, "model.safetensors" });
+    defer allocator.free(model_path);
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const entries = [_]st_loader.TensorEntry{
+        .{
+            .name = "model.language_model.language_model.language_model.layers.0.mlp.gate_proj.weight",
+            .dtype = .f32,
+            .shape = &.{ 2, 2 },
+            .data = std.mem.sliceAsBytes(&data),
+        },
+    };
+    try st_loader.write(allocator, model_path, &entries);
+
+    var safetensors = try st_loader.UnifiedSafeTensors.load(allocator, model_path);
+    defer safetensors.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const spec = WeightSpec{
+        .id = "mlp.gate_proj.weight",
+        .suffix = "mlp.gate_proj.weight",
+        .module_type = "Linear",
+        .layout = .linear,
+        .dtype = "float32",
+        .required = true,
+    };
+    const prefixes = [_][]const u8{"model.language_model.layers.{d}."};
+    const config = tensor.ModelConfig{
+        .d_model = 2,
+        .vocab_size = 16,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_groups = 1,
+        .d_ff = 4,
+        .head_dim = 2,
+        .max_seq_len = 16,
+        .rope_theta = 10000.0,
+        .norm_eps = 1e-5,
+        .gaffine_group_size = 32,
+        .model_arch = .custom,
+    };
+
+    var map = try loadWeightMap(
+        arena_alloc,
+        &safetensors,
+        &.{spec},
+        &prefixes,
+        0,
+        &config,
+        .{},
+    );
+    defer map.deinit(arena_alloc);
+
+    try std.testing.expect(map.get("mlp.gate_proj.weight") != null);
+}
+
+test "loadWeightMap fails on ambiguous normalized wrapper mapping" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const model_path = try std.fs.path.join(allocator, &.{ tmp_path, "ambiguous.safetensors" });
+    defer allocator.free(model_path);
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const entries = [_]st_loader.TensorEntry{
+        .{
+            .name = "model.language_model.layers.0.mlp.gate_proj.weight",
+            .dtype = .f32,
+            .shape = &.{ 2, 2 },
+            .data = std.mem.sliceAsBytes(&data),
+        },
+        .{
+            .name = "model.language_model.language_model.layers.0.mlp.gate_proj.weight",
+            .dtype = .f32,
+            .shape = &.{ 2, 2 },
+            .data = std.mem.sliceAsBytes(&data),
+        },
+    };
+    try st_loader.write(allocator, model_path, &entries);
+
+    var safetensors = try st_loader.UnifiedSafeTensors.load(allocator, model_path);
+    defer safetensors.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const spec = WeightSpec{
+        .id = "mlp.gate_proj.weight",
+        .suffix = "mlp.gate_proj.weight",
+        .module_type = "Linear",
+        .layout = .linear,
+        .dtype = "float32",
+        .required = true,
+    };
+    const prefixes = [_][]const u8{"model.language_model.layers.{d}."};
+    const config = tensor.ModelConfig{
+        .d_model = 2,
+        .vocab_size = 16,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_groups = 1,
+        .d_ff = 4,
+        .head_dim = 2,
+        .max_seq_len = 16,
+        .rope_theta = 10000.0,
+        .norm_eps = 1e-5,
+        .gaffine_group_size = 32,
+        .model_arch = .custom,
+    };
+
+    try std.testing.expectError(
+        error.AmbiguousWeightName,
+        loadWeightMap(
+            arena_alloc,
+            &safetensors,
+            &.{spec},
+            &prefixes,
+            0,
+            &config,
+            .{},
+        ),
+    );
 }
