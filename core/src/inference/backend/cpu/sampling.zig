@@ -27,7 +27,8 @@ pub const SamplingConfig = struct {
     strategy: SamplingStrategy = .greedy,
     temperature: f32 = 1.0,
     top_k: usize = 1,
-    top_p: f32 = 0.9,
+    /// Nucleus threshold. 1.0 = disabled (default).
+    top_p: f32 = 1.0,
     /// Minimum probability threshold (min_p sampling).
     /// Tokens with probability < min_p * max_prob are excluded.
     /// 0.0 = disabled (default).
@@ -262,6 +263,25 @@ pub const Sampler = struct {
             const top_k_inverse_sum = 1.0 / top_k_prob_sum;
             for (top_k_probabilities) |*probability| probability.* *= top_k_inverse_sum;
 
+            // Apply top_p nucleus cutoff on the top-k distribution when enabled.
+            if (config.top_p < 1.0) {
+                var nucleus_cutoff_len: usize = top_k_count;
+                var nucleus_cumulative: f32 = 0;
+                for (top_k_probabilities, 0..) |probability, rank| {
+                    nucleus_cumulative += probability;
+                    if (nucleus_cumulative >= config.top_p) {
+                        nucleus_cutoff_len = rank + 1;
+                        break;
+                    }
+                }
+                var nucleus_sum: f32 = 0;
+                for (top_k_probabilities[0..nucleus_cutoff_len]) |probability| nucleus_sum += probability;
+                if (nucleus_sum == 0) return error.InvalidInput;
+                const nucleus_inverse_sum = 1.0 / nucleus_sum;
+                for (top_k_probabilities[0..nucleus_cutoff_len]) |*probability| probability.* *= nucleus_inverse_sum;
+                for (top_k_probabilities[nucleus_cutoff_len..]) |*probability| probability.* = 0;
+            }
+
             const random_draw = self.prng.random().float(f32);
             var cumulative_probability: f32 = 0;
             var sampled_rank: usize = top_k_count - 1;
@@ -366,6 +386,25 @@ test "sample top_k limits choices" {
     // Only index 0 should ever be chosen
     for (0..3) |_| {
         try std.testing.expectEqual(@as(usize, 0), try sampler_state.sample(&logits, config));
+    }
+}
+
+test "sample top_k applies top_p cutoff" {
+    var sampler_state = try Sampler.init(std.testing.allocator, 321, 16);
+    defer sampler_state.deinit();
+
+    // Strongly peaked distribution. With top_p=0.5 in top-k mode,
+    // only the top token remains in the nucleus.
+    const logits = [_]f32{ 4.0, 2.0, 1.0, 0.5 };
+    const config = SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 4,
+        .top_p = 0.5,
+        .temperature = 1.0,
+    };
+    for (0..16) |_| {
+        const sampled_index = try sampler_state.sample(&logits, config);
+        try std.testing.expectEqual(@as(usize, 0), sampled_index);
     }
 }
 
