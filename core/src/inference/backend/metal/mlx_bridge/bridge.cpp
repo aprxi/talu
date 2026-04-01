@@ -1243,6 +1243,154 @@ int resolve_prefill_chunk_size() {
     return env_positive_int("TALU_METAL_PREFILL_CHUNK_SIZE", 64);
 }
 
+struct MemoryBudgetEstimate {
+    size_t recommended_bytes = 0;
+    size_t weight_bytes = 0;
+    size_t kv_cache_bytes = 0;
+    size_t linear_state_bytes = 0;
+    size_t safety_bytes = 0;
+    size_t total_bytes = 0;
+    int budget_tokens = 0;
+};
+
+size_t checked_add_size_t(size_t a, size_t b, const char* context) {
+    if (b > std::numeric_limits<size_t>::max() - a) {
+        throw std::runtime_error(std::string("size overflow while computing ") + context);
+    }
+    return a + b;
+}
+
+std::optional<size_t> recommended_working_set_bytes() {
+    if (!metal::is_available()) return std::nullopt;
+    const auto& info = device_info(Device::gpu);
+    auto it = info.find("max_recommended_working_set_size");
+    if (it == info.end() || !std::holds_alternative<size_t>(it->second)) {
+        return std::nullopt;
+    }
+    const size_t value = std::get<size_t>(it->second);
+    if (value == 0) return std::nullopt;
+    return value;
+}
+
+size_t model_weight_bytes_on_disk(const std::string& model_path) {
+    size_t total = 0;
+    for (const std::string& rel : discover_weight_files(model_path)) {
+        const std::filesystem::path abs = std::filesystem::path(model_path) / rel;
+        const auto raw_size = std::filesystem::file_size(abs);
+        if (raw_size > std::numeric_limits<size_t>::max()) {
+            throw std::runtime_error("weight shard too large for host size_t: " + abs.string());
+        }
+        total = checked_add_size_t(total, static_cast<size_t>(raw_size), "weight bytes");
+    }
+    return total;
+}
+
+int estimate_full_attention_layer_count(const Qwen35Config& cfg) {
+    const bool hybrid =
+        cfg.linear_num_value_heads > 0 &&
+        cfg.linear_num_key_heads > 0 &&
+        cfg.linear_key_head_dim > 0 &&
+        cfg.linear_value_head_dim > 0 &&
+        cfg.linear_conv_kernel_dim > 0 &&
+        cfg.full_attention_interval > 1;
+    if (!hybrid) return cfg.num_hidden_layers;
+    const int interval = std::max(1, cfg.full_attention_interval);
+    return (cfg.num_hidden_layers + interval - 1) / interval;
+}
+
+size_t estimate_kv_cache_bytes(const Qwen35Config& cfg, int budget_tokens) {
+    if (budget_tokens <= 0) return 0;
+    const int full_layers = estimate_full_attention_layer_count(cfg);
+    const size_t elems =
+        static_cast<size_t>(full_layers) *
+        2 *
+        static_cast<size_t>(std::max(0, cfg.num_key_value_heads)) *
+        static_cast<size_t>(budget_tokens) *
+        static_cast<size_t>(std::max(0, cfg.head_dim));
+    return elems * sizeof(uint16_t); // bf16
+}
+
+size_t estimate_linear_state_bytes(const Qwen35Config& cfg) {
+    const bool has_linear =
+        cfg.linear_num_value_heads > 0 &&
+        cfg.linear_num_key_heads > 0 &&
+        cfg.linear_key_head_dim > 0 &&
+        cfg.linear_value_head_dim > 0 &&
+        cfg.linear_conv_kernel_dim > 0;
+    if (!has_linear) return 0;
+
+    const int full_layers = estimate_full_attention_layer_count(cfg);
+    const int linear_layers = std::max(0, cfg.num_hidden_layers - full_layers);
+    if (linear_layers == 0) return 0;
+
+    const size_t lin_key_dim = static_cast<size_t>(cfg.linear_num_key_heads) * static_cast<size_t>(cfg.linear_key_head_dim);
+    const size_t lin_value_dim = static_cast<size_t>(cfg.linear_num_value_heads) * static_cast<size_t>(cfg.linear_value_head_dim);
+    const size_t lin_conv_dim = (lin_key_dim * 2) + lin_value_dim;
+
+    const size_t conv_elems =
+        static_cast<size_t>(std::max(0, cfg.linear_conv_kernel_dim - 1)) *
+        lin_conv_dim;
+    const size_t ssm_elems =
+        static_cast<size_t>(cfg.linear_num_value_heads) *
+        static_cast<size_t>(cfg.linear_value_head_dim) *
+        static_cast<size_t>(cfg.linear_key_head_dim);
+    const size_t per_layer_elems = checked_add_size_t(conv_elems, ssm_elems, "linear state bytes");
+    const size_t total_elems = per_layer_elems * static_cast<size_t>(linear_layers);
+    return total_elems * sizeof(uint16_t); // bf16
+}
+
+std::optional<MemoryBudgetEstimate> estimate_memory_budget(
+    const std::string& model_path,
+    const Qwen35Config& cfg
+) {
+    const std::optional<size_t> recommended = recommended_working_set_bytes();
+    if (!recommended.has_value()) return std::nullopt;
+
+    const int budget_tokens = env_positive_int("TALU_METAL_MEMORY_BUDGET_TOKENS", 4096);
+    const int safety_mb = env_positive_int("TALU_METAL_MEMORY_SAFETY_MB", 2048);
+    const size_t safety_bytes = static_cast<size_t>(safety_mb) * 1024 * 1024;
+
+    MemoryBudgetEstimate estimate{};
+    estimate.recommended_bytes = *recommended;
+    estimate.budget_tokens = budget_tokens;
+    estimate.safety_bytes = safety_bytes;
+    estimate.weight_bytes = model_weight_bytes_on_disk(model_path);
+    estimate.kv_cache_bytes = estimate_kv_cache_bytes(cfg, budget_tokens);
+    estimate.linear_state_bytes = estimate_linear_state_bytes(cfg);
+    estimate.total_bytes = estimate.weight_bytes;
+    estimate.total_bytes = checked_add_size_t(estimate.total_bytes, estimate.kv_cache_bytes, "total memory budget");
+    estimate.total_bytes = checked_add_size_t(estimate.total_bytes, estimate.linear_state_bytes, "total memory budget");
+    estimate.total_bytes = checked_add_size_t(estimate.total_bytes, estimate.safety_bytes, "total memory budget");
+    return estimate;
+}
+
+bool validate_memory_budget_or_set_error(const std::string& model_path, const Qwen35Config& cfg) {
+    const std::optional<MemoryBudgetEstimate> estimate_opt = estimate_memory_budget(model_path, cfg);
+    if (!estimate_opt.has_value()) return true;
+
+    const MemoryBudgetEstimate& estimate = *estimate_opt;
+    if (estimate.total_bytes <= estimate.recommended_bytes) return true;
+
+    auto to_gib = [](size_t bytes) {
+        return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+    };
+    char buf[1024];
+    std::snprintf(
+        buf,
+        sizeof(buf),
+        "metal memory budget exceeded: required=%.2f GiB (weights=%.2f, kv=%.2f, linear=%.2f, safety=%.2f, budget_tokens=%d) > max_recommended=%.2f GiB",
+        to_gib(estimate.total_bytes),
+        to_gib(estimate.weight_bytes),
+        to_gib(estimate.kv_cache_bytes),
+        to_gib(estimate.linear_state_bytes),
+        to_gib(estimate.safety_bytes),
+        estimate.budget_tokens,
+        to_gib(estimate.recommended_bytes)
+    );
+    g_last_error = buf;
+    return false;
+}
+
 array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
     LayerWeights& lw = ctx->layers[static_cast<size_t>(layer_idx)];
     KVCacheState& cache = ctx->kv_cache[static_cast<size_t>(layer_idx)];
@@ -1721,7 +1869,10 @@ int32_t mlx_validate_config(const char* model_path) {
         if (!std::filesystem::exists(model_path)) {
             throw std::runtime_error(std::string("resolved model_path does not exist: ") + model_path);
         }
-        (void)parse_qwen35_config(model_path);
+        const ParsedModelConfig parsed = parse_qwen35_config(model_path);
+        if (!validate_memory_budget_or_set_error(model_path, parsed.cfg)) {
+            return 0;
+        }
         return 1;
     } catch (const std::exception& e) {
         g_last_error = e.what();
@@ -1769,6 +1920,9 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
 
         const ParsedModelConfig parsed_cfg = parse_qwen35_config(ctx->model_path);
         ctx->cfg = parsed_cfg.cfg;
+        if (!validate_memory_budget_or_set_error(ctx->model_path, ctx->cfg)) {
+            return nullptr;
+        }
 
         auto tensors = load_weight_tensors(ctx->model_path);
         sanitize_qwen35_tensors(tensors, ctx->cfg.tie_word_embeddings, parsed_cfg.allow_qwen_norm_shift);

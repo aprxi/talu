@@ -539,8 +539,9 @@ fn writeHumanRecord(
                         if (!first) try writer.writeAll(", ");
                         first = false;
                         const str = asString(value);
-                        // Truncate long strings unless trace level (-vvv)
-                        if (str.len > 40 and getLogLevel() != .trace) {
+                        // Truncate long strings for low-severity logs only.
+                        // Warn/error/fatal must preserve full diagnostics.
+                        if (str.len > 40 and getLogLevel() != .trace and level != .warn and level != .err and level != .fatal) {
                             try writer.print("{s}...", .{str[0..37]});
                         } else {
                             try writer.print("{s}", .{str});

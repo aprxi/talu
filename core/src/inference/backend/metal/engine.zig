@@ -17,6 +17,7 @@ const topk_route_candidate_capacity: usize = 256;
 const mlx_ctx = opaque {};
 
 extern fn mlx_is_available() c_int;
+extern fn mlx_validate_config(model_path: [*:0]const u8) c_int;
 extern fn mlx_create(model_id: [*:0]const u8, model_path: [*:0]const u8, seed: c_int) ?*mlx_ctx;
 extern fn mlx_destroy(ctx: ?*mlx_ctx) void;
 extern fn mlx_reset(ctx: ?*mlx_ctx) c_int;
@@ -193,6 +194,7 @@ pub const MetalBackend = struct {
     pub const InitConfig = struct {
         model_path: ?[]const u8 = null,
         model_id: ?[]const u8 = null,
+        memory_fit_is_error: bool = false,
     };
 
     pub const capabilities: contract.Capabilities = .{
@@ -314,6 +316,13 @@ pub const MetalBackend = struct {
     fn resolveLastError() []const u8 {
         const raw = mlx_last_error() orelse return "mlx_last_error unavailable";
         return std.mem.sliceTo(raw, 0);
+    }
+
+    fn isMemoryError(message: []const u8) bool {
+        return std.mem.indexOf(u8, message, "metal memory budget exceeded") != null or
+            std.mem.indexOf(u8, message, "Insufficient Memory") != null or
+            std.mem.indexOf(u8, message, "out of memory") != null or
+            std.mem.indexOf(u8, message, "OutOfMemory") != null;
     }
 
     fn resetCtx(self: *MetalBackend, slot_index: usize) void {
@@ -642,8 +651,30 @@ pub const MetalBackend = struct {
 
         const seed = readSeedFromEnv(allocator);
         const max_batch_size = resolveMaxBatchSize(allocator);
+        if (mlx_validate_config(model_path_z.ptr) == 0) {
+            const mlx_error = resolveLastError();
+            if (isMemoryError(mlx_error)) {
+                if (init_config.memory_fit_is_error) {
+                    log.err("inference", "metal mlx_validate_config failed", .{ .mlx_error = mlx_error }, @src());
+                } else {
+                    log.warn("inference", "metal mlx_validate_config failed", .{ .mlx_error = mlx_error });
+                }
+                return error.OutOfMemory;
+            }
+            log.warn("inference", "metal mlx_validate_config failed", .{ .mlx_error = mlx_error });
+            return error.InvalidArgument;
+        }
         const ctx = mlx_create(model_id_z.ptr, model_path_z.ptr, seed) orelse {
-            log.warn("inference", "metal mlx_create failed", .{ .mlx_error = resolveLastError() });
+            const mlx_error = resolveLastError();
+            if (isMemoryError(mlx_error)) {
+                if (init_config.memory_fit_is_error) {
+                    log.err("inference", "metal mlx_create failed", .{ .mlx_error = mlx_error }, @src());
+                } else {
+                    log.warn("inference", "metal mlx_create failed", .{ .mlx_error = mlx_error });
+                }
+                return error.OutOfMemory;
+            }
+            log.warn("inference", "metal mlx_create failed", .{ .mlx_error = mlx_error });
             return error.InvalidArgument;
         };
 

@@ -933,11 +933,12 @@ pub const Backend = union(enum) {
                     err == error.ShortConvNotSupportedOnMetal or
                     err == error.MLANotSupportedOnMetal or
                     err == error.InvalidTensorType or
+                    err == error.OutOfMemory or
                     err == error.UnsupportedModel or
                     err == error.NotImplemented or
                     err == error.DecodeModelUnavailable)
                 {
-                    log.info("inference", "Metal backend unavailable, using CPU", .{
+                    log.warn("inference", "Metal backend unavailable; trying CPU fallback", .{
                         .reason = @errorName(err),
                         .detail = getMetalUnsupportedReason(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features),
                     });
@@ -1481,6 +1482,7 @@ fn initMetal(
     const metal_backend_state = try metal.BackendType.init(allocator, loaded, .{
         .model_path = if (config) |c| c.model_path else null,
         .model_id = if (config) |c| c.model_id else null,
+        .memory_fit_is_error = std.mem.eql(u8, reason, "configured"),
     });
     log.info("inference", "Backend selected: metal", .{ .reason = reason });
     return .{ .metal = metal_backend_state };
