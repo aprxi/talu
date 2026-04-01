@@ -38,6 +38,7 @@ pub const MatmulScratch = struct {
     const max_weight_rows: usize = 200_000;
 
     allocator: std.mem.Allocator,
+    bf16_activation: []u16 = &.{},
 
     pub fn init(allocator: std.mem.Allocator) !MatmulScratch {
         // Detect CPU features at init time (before any matmuls)
@@ -45,10 +46,27 @@ pub const MatmulScratch = struct {
 
         return .{
             .allocator = allocator,
+            .bf16_activation = &.{},
         };
     }
 
+    fn ensureBf16ActivationCapacity(self: *MatmulScratch, required: usize) ![]u16 {
+        if (self.bf16_activation.len >= required) {
+            return self.bf16_activation[0..required];
+        }
+
+        if (self.bf16_activation.len == 0) {
+            self.bf16_activation = try self.allocator.alloc(u16, required);
+        } else {
+            self.bf16_activation = try self.allocator.realloc(self.bf16_activation, required);
+        }
+        return self.bf16_activation[0..required];
+    }
+
     pub fn deinit(self: *MatmulScratch) void {
+        if (self.bf16_activation.len > 0) {
+            self.allocator.free(self.bf16_activation);
+        }
         self.* = undefined;
     }
 };
@@ -656,14 +674,14 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
     // Convert bf16 weights to f32, then use optimized AMX/NEON sgemm.
     // Only worth it for larger matrices where AMX speedup offsets conversion cost.
     if (comptime accelerate.available) {
-        // Threshold: M >= 2 (prefill) uses Accelerate for large weight matrices.
+        // Threshold: only use Accelerate when prefill batch is large enough to
+        // amortize bf16->f32 conversion of the full weight matrix.
         // M=1 (decode) stays with BFDOT path which avoids conversion overhead.
-        // The bf16→f32 conversion is O(N*K), amortized over M rows of compute.
-        if (m_rows >= 2 and n_cols * k_dim >= 32768) {
+        if (m_rows >= 128 and n_cols * k_dim >= 32768) {
             // Allocate f32 buffer for converted weights
             const b_f32 = scratch.allocator.alloc(f32, n_cols * k_dim) catch {
                 // Fall through to SIMD path on allocation failure
-                matmulBF16Simd(a_data, b_data, c_data, m_rows, n_cols, k_dim, scratch.allocator);
+                matmulBF16Simd(a_data, b_data, c_data, m_rows, n_cols, k_dim, scratch);
                 return;
             };
             defer scratch.allocator.free(b_f32);
@@ -677,7 +695,7 @@ fn matmulBF16(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *Matmul
         }
     }
 
-    matmulBF16Simd(a_data, b_data, c_data, m_rows, n_cols, k_dim, scratch.allocator);
+    matmulBF16Simd(a_data, b_data, c_data, m_rows, n_cols, k_dim, scratch);
 }
 
 /// Vectorized bf16→f32 conversion
@@ -727,31 +745,21 @@ fn matmulBF16SingleRowBFDOT(
     c_data: []f32,
     n_cols: usize,
     k_dim: usize,
-    allocator: ?std.mem.Allocator,
+    scratch: *MatmulScratch,
 ) void {
     // Convert f32 activations to bf16.
-    // Use stack buffer for common sizes (4096 is safe), heap for larger.
+    // Use stack buffer for common sizes (4096 is safe), scratch buffer for larger.
     const stack_limit = 4096;
 
     var a_bf16_buf: [stack_limit]u16 = undefined;
-    const heap_buf: ?[]u16 = if (k_dim > stack_limit) blk: {
-        if (allocator) |alloc| {
-            break :blk alloc.alloc(u16, k_dim) catch null;
-        }
-        break :blk null;
-    } else null;
-
-    const a_bf16: []u16 = if (k_dim <= stack_limit)
-        a_bf16_buf[0..k_dim]
-    else if (heap_buf) |buf|
-        buf
-    else {
-        // No allocator or allocation failed - fall back to non-BFDOT path
-        matmulBF16SingleRowFallback(a_data, b_data, c_data, n_cols, k_dim);
-        return;
-    };
-    defer if (heap_buf) |buf| {
-        if (allocator) |alloc| alloc.free(buf);
+    const a_bf16: []u16 = if (k_dim <= stack_limit) blk: {
+        break :blk a_bf16_buf[0..k_dim];
+    } else blk: {
+        break :blk scratch.ensureBf16ActivationCapacity(k_dim) catch {
+            // Allocation failed - fall back to non-BFDOT path
+            matmulBF16SingleRowFallback(a_data, b_data, c_data, n_cols, k_dim);
+            return;
+        };
     };
 
     // Convert activations to bf16
@@ -869,12 +877,12 @@ fn matmulBF16Simd(
     m_rows: usize,
     n_cols: usize,
     k_dim: usize,
-    allocator: ?std.mem.Allocator,
+    scratch: *MatmulScratch,
 ) void {
     // For M=1 with BFDOT available, use optimized single-row kernel.
     // Convert f32 activations to bf16 once, then use BFDOT for all columns.
     if (m_rows == 1 and simd.arm.has_bf16 and k_dim % 8 == 0) {
-        matmulBF16SingleRowBFDOT(a_data, b_data, c_data, n_cols, k_dim, allocator);
+        matmulBF16SingleRowBFDOT(a_data, b_data, c_data, n_cols, k_dim, scratch);
         return;
     }
 
