@@ -184,6 +184,15 @@ fn computeBatchedPrefillPipeline2(
             .softmax_rows_function = self.softmax_rows_function,
             .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
         },
+        .fp8 => AttentionKernelSet{
+            .attn_scores_heads_fp8_kv_function = self.attn_scores_heads_fp8_kv_function,
+            .attn_weighted_sum_heads_fp8_kv_function = self.attn_weighted_sum_heads_fp8_kv_function,
+            .attn_fused_heads_fp8_kv_function = self.attn_fused_heads_fp8_kv_function,
+            .attn_fused_prefill_heads_fp8_kv_function = self.attn_fused_prefill_heads_fp8_kv_function,
+            .attn_fused_prefill_heads_fp8_kv_gqa_function = self.attn_fused_prefill_heads_fp8_kv_gqa_function,
+            .softmax_rows_function = self.softmax_rows_function,
+            .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
+        },
     };
     const attn_kernels_1 = switch (self.kv_cache_dtype) {
         .f16 => AttentionKernelSet{
@@ -201,6 +210,15 @@ fn computeBatchedPrefillPipeline2(
             .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
             .attn_fused_prefill_heads_i8_kv_function = self.attn_fused_prefill_heads_i8_kv_function,
             .attn_fused_prefill_heads_i8_kv_gqa_function = self.attn_fused_prefill_heads_i8_kv_gqa_function,
+            .softmax_rows_function = stage1.softmax_rows_function,
+            .causal_attn_softmax_f32_function = stage1.causal_attn_softmax_f32_function,
+        },
+        .fp8 => AttentionKernelSet{
+            .attn_scores_heads_fp8_kv_function = self.attn_scores_heads_fp8_kv_function,
+            .attn_weighted_sum_heads_fp8_kv_function = self.attn_weighted_sum_heads_fp8_kv_function,
+            .attn_fused_heads_fp8_kv_function = self.attn_fused_heads_fp8_kv_function,
+            .attn_fused_prefill_heads_fp8_kv_function = self.attn_fused_prefill_heads_fp8_kv_function,
+            .attn_fused_prefill_heads_fp8_kv_gqa_function = self.attn_fused_prefill_heads_fp8_kv_gqa_function,
             .softmax_rows_function = stage1.softmax_rows_function,
             .causal_attn_softmax_f32_function = stage1.causal_attn_softmax_f32_function,
         },
@@ -1604,13 +1622,28 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 .attn_scores_heads_f16_kv_function = self.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
                 .attn_weighted_sum_heads_f16_kv_function = self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
                 .attn_fused_heads_f16_kv_function = self.attn_fused_heads_f16_kv_function,
+                .attn_fused_prefill_heads_f16_kv_function = self.attn_fused_prefill_heads_f16_kv_function,
+                .attn_fused_prefill_heads_f16_kv_gqa_function = self.attn_fused_prefill_heads_f16_kv_gqa_function,
                 .softmax_rows_function = softmax_rows_function,
+                .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
             },
             .i8 => .{
                 .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
                 .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
                 .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
+                .attn_fused_prefill_heads_i8_kv_function = self.attn_fused_prefill_heads_i8_kv_function,
+                .attn_fused_prefill_heads_i8_kv_gqa_function = self.attn_fused_prefill_heads_i8_kv_gqa_function,
                 .softmax_rows_function = softmax_rows_function,
+                .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
+            },
+            .fp8 => .{
+                .attn_scores_heads_fp8_kv_function = self.attn_scores_heads_fp8_kv_function,
+                .attn_weighted_sum_heads_fp8_kv_function = self.attn_weighted_sum_heads_fp8_kv_function,
+                .attn_fused_heads_fp8_kv_function = self.attn_fused_heads_fp8_kv_function,
+                .attn_fused_prefill_heads_fp8_kv_function = self.attn_fused_prefill_heads_fp8_kv_function,
+                .attn_fused_prefill_heads_fp8_kv_gqa_function = self.attn_fused_prefill_heads_fp8_kv_gqa_function,
+                .softmax_rows_function = softmax_rows_function,
+                .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
             },
         };
         final_hidden = try self.tryExecuteLayerProgram(
@@ -1931,6 +1964,12 @@ fn computeBatchedDecodeLogitsWithMode(
             .attn_scores_heads_i8_kv_function = self.attn_scores_heads_i8_kv_function,
             .attn_weighted_sum_heads_i8_kv_function = self.attn_weighted_sum_heads_i8_kv_function,
             .attn_fused_heads_i8_kv_function = self.attn_fused_heads_i8_kv_function,
+            .softmax_rows_function = softmax_rows_function,
+        },
+        .fp8 => .{
+            .attn_scores_heads_fp8_kv_function = self.attn_scores_heads_fp8_kv_function,
+            .attn_weighted_sum_heads_fp8_kv_function = self.attn_weighted_sum_heads_fp8_kv_function,
+            .attn_fused_heads_fp8_kv_function = self.attn_fused_heads_fp8_kv_function,
             .softmax_rows_function = softmax_rows_function,
         },
     };
@@ -2527,6 +2566,15 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
             .softmax_rows_function = self.softmax_rows_function,
             .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
         },
+        .fp8 => .{
+            .attn_scores_heads_fp8_kv_function = self.attn_scores_heads_fp8_kv_function,
+            .attn_weighted_sum_heads_fp8_kv_function = self.attn_weighted_sum_heads_fp8_kv_function,
+            .attn_fused_heads_fp8_kv_function = self.attn_fused_heads_fp8_kv_function,
+            .attn_fused_prefill_heads_fp8_kv_function = self.attn_fused_prefill_heads_fp8_kv_function,
+            .attn_fused_prefill_heads_fp8_kv_gqa_function = self.attn_fused_prefill_heads_fp8_kv_gqa_function,
+            .softmax_rows_function = self.softmax_rows_function,
+            .causal_attn_softmax_f32_function = self.causal_attn_softmax_f32_function,
+        },
     };
 
     // Chunked prefill: process in chunks through all layers, building
@@ -2873,8 +2921,8 @@ pub fn ensureKvCapacity(self: anytype, required_tokens: usize) !void {
                         old_count_u32,
                     );
                 },
-                .i8 => {
-                    // i8 cache: copy bytes via copy_u16 with halved count.
+                .i8, .fp8 => {
+                    // i8/fp8 cache: copy bytes via copy_u16 with halved count.
                     const old_u16_count: u32 = @intCast((old_elems + 1) / 2);
                     try compute.cuda.copy_u16.runWithFunction(
                         &self.kernel_arg_pack,

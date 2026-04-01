@@ -16,3 +16,4 @@
 #include "ops/gated_delta_conv_ops.cu"
 #include "ops/gated_delta_norm_ops.cu"
 #include "ops/gated_delta_ops.cu"
+#include "ops/flash_attention_ops.cu"

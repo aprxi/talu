@@ -904,16 +904,25 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
 
             if !quiet && !silent {
                 if let Some(result) = batch.take_result(*rid) {
-                    let tok_per_sec = if result.generation_ns > 0 {
+                    let output_tok_per_sec = if result.generation_ns > 0 {
                         (result.completion_tokens as f64)
                             / (result.generation_ns as f64 / 1_000_000_000.0)
                     } else {
                         0.0
                     };
+                    let input_tok_per_sec = if result.prefill_ns > 0 {
+                        (result.prompt_tokens as f64)
+                            / (result.prefill_ns as f64 / 1_000_000_000.0)
+                    } else {
+                        0.0
+                    };
                     eprintln!(
-                        "[{:.1} tok/s | {} tokens | {:.2}s]",
-                        tok_per_sec,
+                        "[input: {} tok @ {:.1} t/s | output: {} tok @ {:.1} t/s | prefill {:.2}s | decode {:.2}s]",
+                        result.prompt_tokens,
+                        input_tok_per_sec,
                         result.completion_tokens,
+                        output_tok_per_sec,
+                        result.prefill_ns as f64 / 1_000_000_000.0,
                         result.generation_ns as f64 / 1_000_000_000.0
                     );
                 }
