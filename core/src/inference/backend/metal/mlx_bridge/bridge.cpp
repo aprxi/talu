@@ -738,10 +738,14 @@ array maybe_dequantize_fp8_weight(
     const array dequant_f32 = fp8_as_f32 * expanded_scales;
     array dequant_bf16 = astype(dequant_f32, bfloat16);
     dequant_bf16 = stop_gradient(copy(dequant_bf16));
-    // Materialize dequantized weights during load so large FP8 dequant graphs
-    // do not all lower at first prefill command-buffer submit (can OOM on 4B).
-    eval(dequant_bf16);
-    synchronize();
+    // Optional eager materialization for debugging/benchmark parity. Disabled
+    // by default to reduce init-time memory pressure on larger checkpoints.
+    if (const char* eager = std::getenv("TALU_METAL_EAGER_DEQUANT")) {
+        if (std::string(eager) == "1") {
+            eval(dequant_bf16);
+            synchronize();
+        }
+    }
     return dequant_bf16;
 }
 
@@ -817,8 +821,7 @@ array linear_decode_maybe_quantized(
     const array& q_w,
     const array& q_scales
 ) {
-    const bool decode_step = x.ndim() == 3 && x.shape(1) == 1;
-    if (has_q && decode_qmm_enabled && decode_step) {
+    if (has_q && decode_qmm_enabled) {
         return quantized_matmul(
             x,
             q_w,
@@ -1219,6 +1222,23 @@ bool env_truthy(const char* name, bool fallback) {
     const char* raw = std::getenv(name);
     if (!raw) return fallback;
     return std::string(raw) == "1";
+}
+
+int env_positive_int(const char* name, int fallback) {
+    const char* raw = std::getenv(name);
+    if (!raw) return fallback;
+    try {
+        const int parsed = std::stoi(raw);
+        if (parsed > 0) return parsed;
+    } catch (...) {
+    }
+    return fallback;
+}
+
+int resolve_prefill_chunk_size() {
+    // Keep prefill graphs bounded by default to avoid Metal OOM on larger
+    // models; callers can override for benchmarking.
+    return env_positive_int("TALU_METAL_PREFILL_CHUNK_SIZE", 64);
 }
 
 array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
@@ -1647,6 +1667,22 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
     return logits;
 }
 
+void prefill_prefix_chunks(mlx_ctx* ctx, const std::vector<int32_t>& prompt_vec, int32_t prefix_len) {
+    if (prefix_len <= 0) return;
+    const int chunk_size = resolve_prefill_chunk_size();
+    int32_t offset = 0;
+    while (offset < prefix_len) {
+        const int32_t remaining = prefix_len - offset;
+        const int32_t take_count = std::min<int32_t>(remaining, chunk_size);
+        const auto* chunk_ptr = prompt_vec.data() + static_cast<size_t>(offset);
+        const array prefix_chunk(chunk_ptr, Shape{1, take_count}, int32);
+        const array prefill_hidden = forward_hidden(ctx, prefix_chunk, false);
+        eval(prefill_hidden);
+        synchronize();
+        offset += take_count;
+    }
+}
+
 void reset_runtime_state(mlx_ctx* ctx) {
     ctx->stream_ready = false;
     ctx->trace_decode_token = 1;
@@ -1722,9 +1758,12 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             ctx->profile_layers = std::string(env) == "1";
         }
 
-        // Match mlx-lm generation behavior on Metal by setting wired limit to
-        // max recommended working set size before inference begins.
-        wired_limit_acquired = acquire_wired_limit();
+        // Cap Metal wired memory only when explicitly requested. Large local
+        // models can exceed the recommended working-set ceiling during init.
+        const bool enable_wired_limit = env_truthy("TALU_METAL_WIRED_LIMIT", false);
+        if (enable_wired_limit) {
+            wired_limit_acquired = acquire_wired_limit();
+        }
 
         const ParsedModelConfig parsed_cfg = parse_qwen35_config(ctx->model_path);
         ctx->cfg = parsed_cfg.cfg;
@@ -1834,22 +1873,10 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 ? p + "mlp.down_proj.weight"
                 : p + "feed_forward.w2.weight";
 
-            const array mlp_gate_weight = load_linear_weight(tensors, mlp_gate_key); // [out,in]
-            const array mlp_up_weight = load_linear_weight(tensors, mlp_up_key); // [out,in]
-            const array mlp_down_weight = load_linear_weight(tensors, mlp_down_key); // [out,in]
+            const array& mlp_gate_weight = require_tensor(tensors, mlp_gate_key); // [out,in] raw
+            const array& mlp_up_weight = require_tensor(tensors, mlp_up_key); // [out,in] raw
+            const array& mlp_down_weight = require_tensor(tensors, mlp_down_key); // [out,in] raw
 
-            lw.mlp_gate_rhs = to_rhs(
-                mlp_gate_weight,
-                p + "mlp_gate"
-            );
-            lw.mlp_up_rhs = to_rhs(
-                mlp_up_weight,
-                p + "mlp_up"
-            );
-            lw.mlp_down_rhs = to_rhs(
-                mlp_down_weight,
-                p + "mlp_down"
-            );
             maybe_quantize_mxfp8_matrix(
                 tensors,
                 mlp_gate_key,
@@ -1877,6 +1904,27 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 &lw.mlp_down_q_scales,
                 &lw.mlp_down_has_q
             );
+            if (!enable_mlp_qmm || !lw.mlp_gate_has_q) {
+                const array mlp_gate_dense = load_linear_weight(tensors, mlp_gate_key);
+                lw.mlp_gate_rhs = to_rhs(
+                    mlp_gate_dense,
+                    p + "mlp_gate"
+                );
+            }
+            if (!enable_mlp_qmm || !lw.mlp_up_has_q) {
+                const array mlp_up_dense = load_linear_weight(tensors, mlp_up_key);
+                lw.mlp_up_rhs = to_rhs(
+                    mlp_up_dense,
+                    p + "mlp_up"
+                );
+            }
+            if (!enable_mlp_qmm || !lw.mlp_down_has_q) {
+                const array mlp_down_dense = load_linear_weight(tensors, mlp_down_key);
+                lw.mlp_down_rhs = to_rhs(
+                    mlp_down_dense,
+                    p + "mlp_down"
+                );
+            }
 
             const bool has_linear_split = has_tensor(tensors, p + "linear_attn.in_proj_qkv.weight");
             const bool has_linear_fused = has_tensor(tensors, p + "mixer.in_proj.weight");
@@ -1947,12 +1995,6 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     const array b_weight = load_linear_weight(tensors, b_key);
                     const array qkvz_weight = concatenate({qkv_weight, z_weight}, 0);
                     const array ba_weight = concatenate({b_weight, a_weight}, 0);
-                    lw.lin_in_proj_qkv_rhs = to_rhs(qkv_weight, qkv_key);
-                    lw.lin_in_proj_z_rhs = to_rhs(z_weight, z_key);
-                    lw.lin_in_proj_a_rhs = to_rhs(a_weight, a_key);
-                    lw.lin_in_proj_b_rhs = to_rhs(b_weight, b_key);
-                    lw.lin_in_proj_qkvz_rhs = concatenate({lw.lin_in_proj_qkv_rhs, lw.lin_in_proj_z_rhs}, 1);
-                    lw.lin_in_proj_ba_rhs = concatenate({lw.lin_in_proj_b_rhs, lw.lin_in_proj_a_rhs}, 1);
                     maybe_quantize_mxfp8_matrix(
                         tensors,
                         qkv_key,
@@ -1971,37 +2013,32 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                         &lw.lin_in_proj_ba_q_scales,
                         &lw.lin_in_proj_ba_has_q
                     );
+                    if (!enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) {
+                        const array qkv_rhs = to_rhs(qkv_weight, qkv_key);
+                        const array z_rhs = to_rhs(z_weight, z_key);
+                        lw.lin_in_proj_qkvz_rhs = concatenate({ qkv_rhs, z_rhs }, 1);
+                    }
+                    if (!enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
+                        const array b_rhs = to_rhs(b_weight, b_key);
+                        const array a_rhs = to_rhs(a_weight, a_key);
+                        lw.lin_in_proj_ba_rhs = concatenate({ b_rhs, a_rhs }, 1);
+                    }
                 } else {
                     const std::string fused_key = p + "mixer.in_proj.weight";
                     const array fused_in_proj_weight = load_linear_weight(tensors, fused_key); // [out, hidden]
-                    const array fused_in_proj_rhs = to_rhs(
-                        fused_in_proj_weight,
-                        fused_key
-                    );
-                    if (fused_in_proj_rhs.ndim() != 2) {
+                    if (fused_in_proj_weight.ndim() != 2) {
                         throw std::runtime_error("linear fused in_proj must be rank-2");
                     }
                     const int qkvz_cols = lw.lin_conv_dim + lw.lin_value_dim;
                     const int ba_cols = 2 * lw.lin_num_v_heads;
                     const int expected_cols = qkvz_cols + ba_cols;
-                    const int fused_rows = fused_in_proj_rhs.shape(0);
-                    const int fused_cols = fused_in_proj_rhs.shape(1);
+                    const int fused_cols = fused_in_proj_weight.shape(0);
                     if (fused_cols != expected_cols) {
                         throw std::runtime_error(
                             "linear fused in_proj shape mismatch: expected cols=" +
                             std::to_string(expected_cols) + " got cols=" + std::to_string(fused_cols)
                         );
                     }
-                    lw.lin_in_proj_qkvz_rhs = slice(
-                        fused_in_proj_rhs,
-                        {0, 0},
-                        {fused_rows, qkvz_cols}
-                    );
-                    lw.lin_in_proj_ba_rhs = slice(
-                        fused_in_proj_rhs,
-                        {0, qkvz_cols},
-                        {fused_rows, expected_cols}
-                    );
                     const array qkvz_weight = slice(
                         fused_in_proj_weight,
                         {0, 0},
@@ -2030,14 +2067,35 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                         &lw.lin_in_proj_ba_q_scales,
                         &lw.lin_in_proj_ba_has_q
                     );
+                    if ((!enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) ||
+                        (!enable_mlp_qmm || !lw.lin_in_proj_ba_has_q)) {
+                        const array fused_in_proj_rhs = to_rhs(
+                            fused_in_proj_weight,
+                            fused_key
+                        );
+                        const int fused_rows = fused_in_proj_rhs.shape(0);
+                        if (!enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) {
+                            lw.lin_in_proj_qkvz_rhs = slice(
+                                fused_in_proj_rhs,
+                                {0, 0},
+                                {fused_rows, qkvz_cols}
+                            );
+                        }
+                        if (!enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
+                            lw.lin_in_proj_ba_rhs = slice(
+                                fused_in_proj_rhs,
+                                {0, qkvz_cols},
+                                {fused_rows, expected_cols}
+                            );
+                        }
+                    }
                 }
                 lw.lin_A_log = require_tensor(tensors, p + "linear_attn.A_log");
                 lw.lin_A_exp_f32 = exp(astype(lw.lin_A_log, float32));
                 lw.lin_dt_bias = require_tensor(tensors, p + "linear_attn.dt_bias");
                 lw.lin_norm_w = require_tensor(tensors, p + "linear_attn.norm.weight");
                 const std::string out_proj_key = p + "linear_attn.out_proj.weight";
-                const array out_proj_weight = load_linear_weight(tensors, out_proj_key);
-                lw.lin_out_proj_rhs = to_rhs(out_proj_weight, out_proj_key);
+                const array& out_proj_weight = require_tensor(tensors, out_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
                     out_proj_key,
@@ -2047,10 +2105,13 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     &lw.lin_out_proj_q_scales,
                     &lw.lin_out_proj_has_q
                 );
+                if (!enable_mlp_qmm || !lw.lin_out_proj_has_q) {
+                    const array out_proj_dense = load_linear_weight(tensors, out_proj_key);
+                    lw.lin_out_proj_rhs = to_rhs(out_proj_dense, out_proj_key);
+                }
             } else if (lw.is_shortconv) {
                 const std::string sc_in_proj_key = p + "conv.in_proj.weight";
-                const array sc_in_proj_weight = load_linear_weight(tensors, sc_in_proj_key);
-                lw.sc_in_proj_rhs = to_rhs(sc_in_proj_weight, sc_in_proj_key);
+                const array& sc_in_proj_weight = require_tensor(tensors, sc_in_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
                     sc_in_proj_key,
@@ -2062,8 +2123,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 );
                 lw.sc_conv1d_w = require_tensor(tensors, p + "conv.conv.weight");
                 const std::string sc_out_proj_key = p + "conv.out_proj.weight";
-                const array sc_out_proj_weight = load_linear_weight(tensors, sc_out_proj_key);
-                lw.sc_out_proj_rhs = to_rhs(sc_out_proj_weight, sc_out_proj_key);
+                const array& sc_out_proj_weight = require_tensor(tensors, sc_out_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
                     sc_out_proj_key,
@@ -2073,11 +2133,19 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     &lw.sc_out_proj_q_scales,
                     &lw.sc_out_proj_has_q
                 );
+                if (!enable_mlp_qmm || !lw.sc_in_proj_has_q) {
+                    const array sc_in_proj_dense = load_linear_weight(tensors, sc_in_proj_key);
+                    lw.sc_in_proj_rhs = to_rhs(sc_in_proj_dense, sc_in_proj_key);
+                }
+                if (!enable_mlp_qmm || !lw.sc_out_proj_has_q) {
+                    const array sc_out_proj_dense = load_linear_weight(tensors, sc_out_proj_key);
+                    lw.sc_out_proj_rhs = to_rhs(sc_out_proj_dense, sc_out_proj_key);
+                }
                 if (has_tensor(tensors, p + "conv.conv.bias")) {
                     lw.sc_conv_bias = require_tensor(tensors, p + "conv.conv.bias");
                     lw.sc_has_bias = true;
                 }
-                const int proj_dim = lw.sc_in_proj_rhs.shape(1);
+                const int proj_dim = sc_in_proj_weight.shape(0);
                 if (proj_dim % 3 != 0) {
                     throw std::runtime_error("shortconv in_proj output dim is not divisible by 3");
                 }
@@ -2090,15 +2158,10 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 const std::string o_proj_key = has_tensor(tensors, p + "self_attn.o_proj.weight")
                     ? p + "self_attn.o_proj.weight"
                     : p + "self_attn.out_proj.weight";
-                const array q_proj_weight = load_linear_weight(tensors, q_proj_key);
-                const array k_proj_weight = load_linear_weight(tensors, k_proj_key);
-                const array v_proj_weight = load_linear_weight(tensors, v_proj_key);
-                const array o_proj_weight = load_linear_weight(tensors, o_proj_key);
-
-                lw.attn_q_rhs = to_rhs(q_proj_weight, q_proj_key);
-                lw.attn_k_rhs = to_rhs(k_proj_weight, k_proj_key);
-                lw.attn_v_rhs = to_rhs(v_proj_weight, v_proj_key);
-                lw.attn_o_rhs = to_rhs(o_proj_weight, p + "self_attn_o_proj");
+                const array& q_proj_weight = require_tensor(tensors, q_proj_key);
+                const array& k_proj_weight = require_tensor(tensors, k_proj_key);
+                const array& v_proj_weight = require_tensor(tensors, v_proj_key);
+                const array& o_proj_weight = require_tensor(tensors, o_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
                     q_proj_key,
@@ -2135,6 +2198,22 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     &lw.attn_o_q_scales,
                     &lw.attn_o_has_q
                 );
+                if (!enable_mlp_qmm || !lw.attn_q_has_q) {
+                    const array q_proj_dense = load_linear_weight(tensors, q_proj_key);
+                    lw.attn_q_rhs = to_rhs(q_proj_dense, q_proj_key);
+                }
+                if (!enable_mlp_qmm || !lw.attn_k_has_q) {
+                    const array k_proj_dense = load_linear_weight(tensors, k_proj_key);
+                    lw.attn_k_rhs = to_rhs(k_proj_dense, k_proj_key);
+                }
+                if (!enable_mlp_qmm || !lw.attn_v_has_q) {
+                    const array v_proj_dense = load_linear_weight(tensors, v_proj_key);
+                    lw.attn_v_rhs = to_rhs(v_proj_dense, v_proj_key);
+                }
+                if (!enable_mlp_qmm || !lw.attn_o_has_q) {
+                    const array o_proj_dense = load_linear_weight(tensors, o_proj_key);
+                    lw.attn_o_rhs = to_rhs(o_proj_dense, p + "self_attn_o_proj");
+                }
                 lw.attn_q_norm_w = require_any_tensor(
                     tensors,
                     { p + "self_attn.q_norm.weight", p + "self_attn.q_layernorm.weight" },
@@ -2155,20 +2234,21 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             ctx->layers.push_back(std::move(lw));
         }
 
-        // Pre-warm compiled compute_g path so WARMUP=0 benchmarks do not
-        // include first-trace compilation overhead.
-        for (const auto& lw : ctx->layers) {
-            if (!lw.is_linear) continue;
-            const array a_dummy = zeros({1, 1, lw.lin_num_v_heads}, lw.lin_dt_bias.dtype());
-            const array g_dummy = compute_g(lw.lin_A_exp_f32, a_dummy, lw.lin_dt_bias);
-            eval(g_dummy);
-            synchronize();
-            break;
-        }
+        const bool enable_init_warmup = env_truthy("TALU_METAL_INIT_WARMUP", false);
+        if (enable_init_warmup) {
+            // Pre-warm compiled compute_g path so WARMUP=0 benchmarks do not
+            // include first-trace compilation overhead.
+            for (const auto& lw : ctx->layers) {
+                if (!lw.is_linear) continue;
+                const array a_dummy = zeros({1, 1, lw.lin_num_v_heads}, lw.lin_dt_bias.dtype());
+                const array g_dummy = compute_g(lw.lin_A_exp_f32, a_dummy, lw.lin_dt_bias);
+                eval(g_dummy);
+                synchronize();
+                break;
+            }
 
-        // Pre-warm one tiny prefill+decode pass so WARMUP=0 timings don't
-        // include first-use kernel/JIT materialization costs.
-        {
+            // Pre-warm one tiny prefill+decode pass so WARMUP=0 timings don't
+            // include first-use kernel/JIT materialization costs.
             reset_runtime_state(ctx.get());
             const std::vector<int32_t> warm_ids = { 0, 1 };
             const array warm_prompt(warm_ids.begin(), Shape{1, 2}, int32);
@@ -2237,9 +2317,7 @@ int32_t mlx_prefill_first(
 
         array first_token = array(0.0f);
         if (prompt_len > 1) {
-            const array prefix_arr(prompt_vec.begin(), Shape{1, prompt_len - 1}, int32);
-            const array prefill_hidden = forward_hidden(ctx, prefix_arr, false);
-            (void)prefill_hidden;
+            prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
 
             const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
             const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
@@ -2305,18 +2383,14 @@ int32_t mlx_prefill_logits(
             first_logits = last_token_logits(seed_logits);
 
             reset_runtime_state(ctx);
-            const array prefix_arr(prompt_vec.begin(), Shape{1, prompt_len - 1}, int32);
-            const array prefill_hidden = forward_hidden(ctx, prefix_arr, false);
-            (void)prefill_hidden;
+            prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
 
             const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
             const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
             const array rebuild_logits = forward_logits(ctx, last_token_arr);
             (void)rebuild_logits;
         } else if (prompt_len > 1) {
-            const array prefix_arr(prompt_vec.begin(), Shape{1, prompt_len - 1}, int32);
-            const array prefill_hidden = forward_hidden(ctx, prefix_arr, false);
-            (void)prefill_hidden;
+            prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
 
             const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
             const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
@@ -2672,6 +2746,10 @@ int32_t mlx_decode_stream(
     }
 }
 
+#ifdef __cplusplus
+extern "C++" {
+#endif
+
 array apply_sampling_penalties_to_logits(
     mlx_ctx* ctx,
     const array& logits_last,
@@ -2746,6 +2824,10 @@ array apply_sampling_penalties_to_logits(
 
     return put_along_axis(logits_last, token_ids_arr, selected_logits, -1);
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 int32_t mlx_decode_topk_candidates(
     mlx_ctx* ctx,
@@ -3063,9 +3145,7 @@ int32_t mlx_run(
             auto t0 = std::chrono::steady_clock::now();
             array token_ids = array(0.0f);
             if (prompt_len > 1) {
-                const array prefix_arr(prompt_vec.begin(), Shape{1, prompt_len - 1}, int32);
-                const array prefill_hidden = forward_hidden(ctx, prefix_arr, false);
-                (void)prefill_hidden;
+                prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
 
                 const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
                 const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
