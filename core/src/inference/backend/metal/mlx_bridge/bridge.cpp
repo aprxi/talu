@@ -111,9 +111,11 @@ std::shared_ptr<const CompiledTopKFn> compiled_topk_candidates(int k) {
             const array top_k_selector = arange(vocab - k, vocab, 1, int32);
             const array top_k_indices = take(partitioned_indices, top_k_selector, -1);
             const array top_k_logits = take_along_axis(logits_last, top_k_indices, -1);
+            const array top_k_logits_flat = reshape(astype(top_k_logits, float32), {k});
+            const array top_k_indices_flat = reshape(astype(top_k_indices, int32), {k});
             return std::vector<array>{
-                top_k_logits,
-                top_k_indices,
+                top_k_logits_flat,
+                top_k_indices_flat,
             };
         },
         true
@@ -2876,10 +2878,10 @@ int32_t mlx_decode_topk_candidates(
             g_last_error = "mlx_decode_topk_candidates: invalid compiled output";
             return 0;
         }
-        const array top_k_logits_flat = topk_outputs[0];
-        const array top_k_indices_flat = topk_outputs[1];
+        const array& top_k_logits_flat = topk_outputs[0];
+        const array& top_k_indices_flat = topk_outputs[1];
 
-        eval(topk_outputs);
+        eval({top_k_logits_flat, top_k_indices_flat});
 
         const float* logits_ptr = top_k_logits_flat.data<float>();
         const int32_t* ids_ptr = top_k_indices_flat.data<int32_t>();
@@ -2977,10 +2979,10 @@ int32_t mlx_decode_topk_candidates_with_sampling(
             g_last_error = "mlx_decode_topk_candidates_with_sampling: invalid compiled output";
             return 0;
         }
-        const array top_k_logits_flat = topk_outputs[0];
-        const array top_k_indices_flat = topk_outputs[1];
+        const array& top_k_logits_flat = topk_outputs[0];
+        const array& top_k_indices_flat = topk_outputs[1];
 
-        eval(topk_outputs);
+        eval({top_k_logits_flat, top_k_indices_flat});
 
         const float* logits_ptr = top_k_logits_flat.data<float>();
         const int32_t* ids_ptr = top_k_indices_flat.data<int32_t>();
