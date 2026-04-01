@@ -116,9 +116,22 @@ const MAX_BATCH_SIZE = struct {
 /// Compute model-load options before backend initialization.
 /// This keeps backend/platform policy out of io/ while preserving optimized execution routes.
 pub fn defaultModelLoadOptions(init_options: InitOptions) LoadOptions {
+    const effective_selection = effectiveLoadSelection(init_options.selection);
     return .{
-        .preserve_native_norm_dtype = shouldPreserveNativeNormDType(init_options.selection),
+        .preserve_native_norm_dtype = shouldPreserveNativeNormDType(effective_selection),
+        .dequantize_mxfp8_to_bf16 = switch (effective_selection) {
+            .cpu => true,
+            else => false,
+        },
     };
+}
+
+fn effectiveLoadSelection(requested: Selection) Selection {
+    if (requested != .auto) return requested;
+    if (std.posix.getenv("BACKEND")) |raw_ptr| {
+        if (parseSelectionToken(raw_ptr)) |parsed| return parsed;
+    }
+    return .auto;
 }
 
 pub const Selection = enum {
@@ -1819,11 +1832,19 @@ test "defaultModelLoadOptions follows platform capability" {
 test "defaultModelLoadOptions honors explicit CPU selection" {
     const opts = defaultModelLoadOptions(.{ .selection = .cpu });
     try std.testing.expectEqual(false, opts.preserve_native_norm_dtype);
+    try std.testing.expectEqual(true, opts.dequantize_mxfp8_to_bf16);
 }
 
 test "defaultModelLoadOptions honors explicit CUDA selection" {
     const opts = defaultModelLoadOptions(.{ .selection = .cuda });
     try std.testing.expectEqual(false, opts.preserve_native_norm_dtype);
+    try std.testing.expectEqual(false, opts.dequantize_mxfp8_to_bf16);
+}
+
+test "defaultModelLoadOptions honors explicit metal selection" {
+    const opts = defaultModelLoadOptions(.{ .selection = .metal });
+    try std.testing.expectEqual(has_metal, opts.preserve_native_norm_dtype);
+    try std.testing.expectEqual(false, opts.dequantize_mxfp8_to_bf16);
 }
 
 test "parseSelectionToken accepts supported backend values" {

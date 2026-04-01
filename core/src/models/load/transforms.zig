@@ -609,7 +609,62 @@ fn buildGatedDeltaSplitInProjFp8(
     return result;
 }
 
-pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTensors, name: []const u8, expected_in: usize, config: ModelConfig) !Tensor {
+inline fn ue8m0ToScale(e8m0: u8) f32 {
+    const exp_bits = @as(u32, e8m0) << 23;
+    return @bitCast(exp_bits);
+}
+
+fn dequantizeMxfp8WeightToBf16(
+    allocator: std.mem.Allocator,
+    t: Tensor,
+    expected_in: usize,
+) !Tensor {
+    if (t.n_dims != 2) return error.InvalidShape;
+    const meta = t.mxfp8 orelse return error.MissingScales;
+
+    const rows: usize = @intCast(t.shape[0]);
+    const cols: usize = @intCast(t.shape[1]);
+    if (rows == 0 or cols == 0) return error.InvalidShape;
+    if (cols != expected_in and rows != expected_in) return error.InvalidShape;
+
+    const scale_ptr = meta.block_scales_data orelse return error.MissingScales;
+    const scale_cols: usize = @intCast(meta.scale_cols);
+    if (scale_cols == 0) return error.InvalidShape;
+
+    const required_scale_cols = (cols + 31) / 32;
+    if (scale_cols < required_scale_cols) return error.InvalidShape;
+    const required_scale_len = rows * scale_cols;
+    if (meta.block_scales_len < required_scale_len) return error.InvalidShape;
+    const scales = scale_ptr[0..required_scale_len];
+
+    const src = t.data();
+    const required_src_len = rows * cols;
+    if (src.len < required_src_len) return error.InvalidShape;
+    const src_bytes = src[0..required_src_len];
+
+    const owned = try tensor.OwnedTensor.init(allocator, .bf16, &.{ rows, cols });
+    const dst_u16 = owned.asSlice(u16);
+
+    for (0..rows) |r| {
+        const scale_row = scales[r * scale_cols ..][0..scale_cols];
+        for (0..cols) |c| {
+            const idx = r * cols + c;
+            const scale = ue8m0ToScale(scale_row[c / 32]);
+            dst_u16[idx] = dtype.f32ToBf16(dtype.fp8e4m3ToF32(src_bytes[idx]) * scale);
+        }
+    }
+
+    return owned.view();
+}
+
+pub fn orientWeight(
+    allocator: std.mem.Allocator,
+    st: *st_loader.UnifiedSafeTensors,
+    name: []const u8,
+    expected_in: usize,
+    config: ModelConfig,
+    dequantize_mxfp8_to_bf16: bool,
+) !Tensor {
     var weight_tensor = try st.getTensor(name, null);
     log.debug("load", "Orient weight", .{
         .name = name,
@@ -667,6 +722,10 @@ pub fn orientWeight(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeTens
             .cols = @intCast(weight_tensor.shape[1]),
             .scale_cols = @intCast(s_cols),
         };
+        if (dequantize_mxfp8_to_bf16) {
+            const dequantized = try dequantizeMxfp8WeightToBf16(allocator, weight_tensor, expected_in);
+            return orientWeightTyped(allocator, dequantized, expected_in);
+        }
         return weight_tensor;
     }
 
@@ -1666,7 +1725,7 @@ test "orientWeight transposes f32 weight when needed" {
 
     // expected_in=2 matches cols, so it should transpose to [2, 3]
     const config = std.mem.zeroes(ModelConfig);
-    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", 2, config);
+    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", 2, config, false);
 
     try std.testing.expectEqual(@as(u8, 2), result.n_dims);
     try std.testing.expectEqual(@as(i64, 2), result.shape[0]); // in dimension first
@@ -1708,7 +1767,7 @@ test "orientWeight returns untransposed when rows equals expected_in" {
 
     // expected_in=2 matches rows, so no transpose needed
     const config = std.mem.zeroes(ModelConfig);
-    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", 2, config);
+    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", 2, config, false);
 
     try std.testing.expectEqual(@as(u8, 2), result.n_dims);
     try std.testing.expectEqual(@as(i64, 2), result.shape[0]);

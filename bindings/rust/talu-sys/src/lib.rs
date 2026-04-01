@@ -44,44 +44,6 @@ impl From<u8> for CPoolingStrategy {
     }
 }
 
-/// Source: core/src/converter/scheme.zig
-#[repr(u32)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Scheme {
-    F16 = 4,
-    Gaf432 = 10,
-    Gaf464 = 11,
-    Gaf4128 = 12,
-    Gaf832 = 13,
-    Gaf864 = 14,
-    Gaf8128 = 15,
-    Fp8E4m3 = 20,
-    Fp8E5m2 = 21,
-    Mxfp4 = 22,
-    Nvfp4 = 23,
-    Mxfp8 = 24,
-}
-
-impl From<u32> for Scheme {
-    fn from(value: u32) -> Self {
-        match value {
-            4 => Scheme::F16,
-            10 => Scheme::Gaf432,
-            11 => Scheme::Gaf464,
-            12 => Scheme::Gaf4128,
-            13 => Scheme::Gaf832,
-            14 => Scheme::Gaf864,
-            15 => Scheme::Gaf8128,
-            20 => Scheme::Fp8E4m3,
-            21 => Scheme::Fp8E5m2,
-            22 => Scheme::Mxfp4,
-            23 => Scheme::Nvfp4,
-            24 => Scheme::Mxfp8,
-            _ => Scheme::Mxfp8,
-        }
-    }
-}
-
 /// Source: core/src/capi/tensor.zig
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -120,6 +82,44 @@ impl From<i32> for DLDeviceType {
             15 => DLDeviceType::KDLWebGPU,
             16 => DLDeviceType::KDLHexagon,
             _ => DLDeviceType::KDLHexagon,
+        }
+    }
+}
+
+/// Source: core/src/converter/scheme.zig
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Scheme {
+    F16 = 4,
+    Gaf432 = 10,
+    Gaf464 = 11,
+    Gaf4128 = 12,
+    Gaf832 = 13,
+    Gaf864 = 14,
+    Gaf8128 = 15,
+    Fp8E4m3 = 20,
+    Fp8E5m2 = 21,
+    Mxfp4 = 22,
+    Nvfp4 = 23,
+    Mxfp8 = 24,
+}
+
+impl From<u32> for Scheme {
+    fn from(value: u32) -> Self {
+        match value {
+            4 => Scheme::F16,
+            10 => Scheme::Gaf432,
+            11 => Scheme::Gaf464,
+            12 => Scheme::Gaf4128,
+            13 => Scheme::Gaf832,
+            14 => Scheme::Gaf864,
+            15 => Scheme::Gaf8128,
+            20 => Scheme::Fp8E4m3,
+            21 => Scheme::Fp8E5m2,
+            22 => Scheme::Mxfp4,
+            23 => Scheme::Nvfp4,
+            24 => Scheme::Mxfp8,
+            _ => Scheme::Mxfp8,
         }
     }
 }
@@ -234,6 +234,26 @@ impl From<i32> for BackendType {
     }
 }
 
+/// Source: core/src/capi/agent/root.zig
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CProcessDenyReason {
+    None = 0,
+    Action = 1,
+    Cwd = 2,
+}
+
+impl From<i32> for CProcessDenyReason {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => CProcessDenyReason::None,
+            1 => CProcessDenyReason::Action,
+            2 => CProcessDenyReason::Cwd,
+            _ => CProcessDenyReason::Cwd,
+        }
+    }
+}
+
 /// Source: core/src/capi/progress.zig
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -250,26 +270,6 @@ impl From<u8> for ProgressAction {
             1 => ProgressAction::Update,
             2 => ProgressAction::Complete,
             _ => ProgressAction::Complete,
-        }
-    }
-}
-
-/// Source: core/src/capi/agent/policy.zig
-#[repr(i32)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CProcessDenyReason {
-    None = 0,
-    Action = 1,
-    Cwd = 2,
-}
-
-impl From<i32> for CProcessDenyReason {
-    fn from(value: i32) -> Self {
-        match value {
-            0 => CProcessDenyReason::None,
-            1 => CProcessDenyReason::Action,
-            2 => CProcessDenyReason::Cwd,
-            _ => CProcessDenyReason::Cwd,
         }
     }
 }
@@ -568,26 +568,6 @@ impl From<i32> for TaluAgentRuntimeMode {
     }
 }
 
-/// Source: core/src/converter/scheme.zig
-#[repr(u32)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum QuantLevel {
-    Q4 = 0,
-    Q8 = 1,
-    Q16 = 2,
-}
-
-impl From<u32> for QuantLevel {
-    fn from(value: u32) -> Self {
-        match value {
-            0 => QuantLevel::Q4,
-            1 => QuantLevel::Q8,
-            2 => QuantLevel::Q16,
-            _ => QuantLevel::Q16,
-        }
-    }
-}
-
 /// Source: core/src/capi/db/ops.zig
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -610,6 +590,26 @@ impl From<u8> for CStorageEventType {
             4 => CStorageEventType::BeginFork,
             5 => CStorageEventType::EndFork,
             _ => CStorageEventType::EndFork,
+        }
+    }
+}
+
+/// Source: core/src/capi/agent/runtime.zig
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TaluSandboxBackend {
+    LinuxLocal = 0,
+    Oci = 1,
+    AppleContainer = 2,
+}
+
+impl From<i32> for TaluSandboxBackend {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => TaluSandboxBackend::LinuxLocal,
+            1 => TaluSandboxBackend::Oci,
+            2 => TaluSandboxBackend::AppleContainer,
+            _ => TaluSandboxBackend::AppleContainer,
         }
     }
 }
@@ -640,6 +640,26 @@ impl From<i32> for QuantMethodEnum {
     }
 }
 
+/// Source: core/src/capi/template.zig
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CSpanSourceType {
+    StaticText = 0,
+    Variable = 1,
+    Expression = 2,
+}
+
+impl From<i32> for CSpanSourceType {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => CSpanSourceType::StaticText,
+            1 => CSpanSourceType::Variable,
+            2 => CSpanSourceType::Expression,
+            _ => CSpanSourceType::Expression,
+        }
+    }
+}
+
 /// Source: core/src/converter/scheme.zig
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -660,42 +680,22 @@ impl From<u32> for Platform {
     }
 }
 
-/// Source: core/src/capi/agent/runtime.zig
-#[repr(i32)]
+/// Source: core/src/converter/scheme.zig
+#[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TaluSandboxBackend {
-    LinuxLocal = 0,
-    Oci = 1,
-    AppleContainer = 2,
+pub enum QuantLevel {
+    Q4 = 0,
+    Q8 = 1,
+    Q16 = 2,
 }
 
-impl From<i32> for TaluSandboxBackend {
-    fn from(value: i32) -> Self {
+impl From<u32> for QuantLevel {
+    fn from(value: u32) -> Self {
         match value {
-            0 => TaluSandboxBackend::LinuxLocal,
-            1 => TaluSandboxBackend::Oci,
-            2 => TaluSandboxBackend::AppleContainer,
-            _ => TaluSandboxBackend::AppleContainer,
-        }
-    }
-}
-
-/// Source: core/src/capi/template.zig
-#[repr(i32)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CSpanSourceType {
-    StaticText = 0,
-    Variable = 1,
-    Expression = 2,
-}
-
-impl From<i32> for CSpanSourceType {
-    fn from(value: i32) -> Self {
-        match value {
-            0 => CSpanSourceType::StaticText,
-            1 => CSpanSourceType::Variable,
-            2 => CSpanSourceType::Expression,
-            _ => CSpanSourceType::Expression,
+            0 => QuantLevel::Q4,
+            1 => QuantLevel::Q8,
+            2 => QuantLevel::Q16,
+            _ => QuantLevel::Q16,
         }
     }
 }
@@ -745,6 +745,56 @@ impl Default for ConvertOptions {
     }
 }
 
+/// Source: core/src/capi/tokenizer.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TokenizeResult {
+    pub tokens: *const *const c_char,
+    pub num_tokens: usize,
+    pub error_msg: *const u8,
+}
+
+impl Default for TokenizeResult {
+    fn default() -> Self {
+        Self {
+            tokens: std::ptr::null(),
+            num_tokens: 0,
+            error_msg: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/train_full.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CTransformerConfig {
+    pub vocab_size: u32,
+    pub d_model: u32,
+    pub num_layers: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub d_ff: u32,
+    pub seq_len: u32,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
+}
+
+impl Default for CTransformerConfig {
+    fn default() -> Self {
+        Self {
+            vocab_size: 0,
+            d_model: 0,
+            num_layers: 0,
+            num_heads: 0,
+            num_kv_heads: 0,
+            d_ff: 0,
+            seq_len: 0,
+            rope_theta: 0.0,
+            norm_eps: 0.0,
+        }
+    }
+}
+
 /// Source: core/src/capi/router.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -782,37 +832,6 @@ impl Default for CModelInfo {
     }
 }
 
-/// Source: core/src/capi/train_full.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CTransformerConfig {
-    pub vocab_size: u32,
-    pub d_model: u32,
-    pub num_layers: u32,
-    pub num_heads: u32,
-    pub num_kv_heads: u32,
-    pub d_ff: u32,
-    pub seq_len: u32,
-    pub rope_theta: f32,
-    pub norm_eps: f32,
-}
-
-impl Default for CTransformerConfig {
-    fn default() -> Self {
-        Self {
-            vocab_size: 0,
-            d_model: 0,
-            num_layers: 0,
-            num_heads: 0,
-            num_kv_heads: 0,
-            d_ff: 0,
-            seq_len: 0,
-            rope_theta: 0.0,
-            norm_eps: 0.0,
-        }
-    }
-}
-
 /// Source: core/src/capi/provider_config.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -828,25 +847,6 @@ impl Default for CProviderHealthResult {
             ok: 0,
             model_count: 0,
             error_message: std::ptr::null(),
-        }
-    }
-}
-
-/// Source: core/src/capi/tokenizer.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct TokenizeResult {
-    pub tokens: *const *const c_char,
-    pub num_tokens: usize,
-    pub error_msg: *const u8,
-}
-
-impl Default for TokenizeResult {
-    fn default() -> Self {
-        Self {
-            tokens: std::ptr::null(),
-            num_tokens: 0,
-            error_msg: std::ptr::null(),
         }
     }
 }
@@ -1134,25 +1134,6 @@ impl Default for CTokenEvent {
     }
 }
 
-/// Source: core/src/capi/db/ops.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CColumnData {
-    pub column_id: u32,
-    pub _pad: [u8; 4],
-    pub value: u64,
-}
-
-impl Default for CColumnData {
-    fn default() -> Self {
-        Self {
-            column_id: 0,
-            _pad: [0; 4],
-            value: 0,
-        }
-    }
-}
-
 /// Source: core/src/capi/xray.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1176,6 +1157,25 @@ impl Default for TensorStats {
             rms: 0.0,
             nan_count: 0,
             inf_count: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/db/ops.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CColumnData {
+    pub column_id: u32,
+    pub _pad: [u8; 4],
+    pub value: u64,
+}
+
+impl Default for CColumnData {
+    fn default() -> Self {
+        Self {
+            column_id: 0,
+            _pad: [0; 4],
+            value: 0,
         }
     }
 }
@@ -1417,21 +1417,6 @@ impl Default for CDocumentList {
     }
 }
 
-/// Source: core/src/capi/responses.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CItemReferenceItem {
-    pub id_ptr: *const c_char,
-}
-
-impl Default for CItemReferenceItem {
-    fn default() -> Self {
-        Self {
-            id_ptr: std::ptr::null(),
-        }
-    }
-}
-
 /// Source: core/src/capi/xray.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1467,6 +1452,21 @@ impl Default for CapturedTensorInfo {
             work_bytes: 0,
             stats: TensorStats::default(),
             timestamp_ns: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/responses.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CItemReferenceItem {
+    pub id_ptr: *const c_char,
+}
+
+impl Default for CItemReferenceItem {
+    fn default() -> Self {
+        Self {
+            id_ptr: std::ptr::null(),
         }
     }
 }
@@ -2318,27 +2318,6 @@ impl Default for CCollabHistoryList {
     }
 }
 
-/// Source: core/src/capi/db/ops.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CColumnFilter {
-    pub column_id: u32,
-    pub op: u8,
-    pub _pad: [u8; 3],
-    pub value: u64,
-}
-
-impl Default for CColumnFilter {
-    fn default() -> Self {
-        Self {
-            column_id: 0,
-            op: 0,
-            _pad: [0; 3],
-            value: 0,
-        }
-    }
-}
-
 /// Source: core/src/capi/agent/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -2414,6 +2393,27 @@ impl Default for CAgentCreateConfig {
             memory_recall_limit: 0,
             memory_append_on_run: 1,
             _pad2: [0; 7],
+        }
+    }
+}
+
+/// Source: core/src/capi/db/ops.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CColumnFilter {
+    pub column_id: u32,
+    pub op: u8,
+    pub _pad: [u8; 3],
+    pub value: u64,
+}
+
+impl Default for CColumnFilter {
+    fn default() -> Self {
+        Self {
+            column_id: 0,
+            op: 0,
+            _pad: [0; 3],
+            value: 0,
         }
     }
 }
@@ -2532,25 +2532,6 @@ impl Default for CKvWatchEvent {
     }
 }
 
-/// Source: core/src/capi/provider_config.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CProviderCredentials {
-    pub effective_endpoint: *const c_char,
-    pub api_key: *const c_char,
-    pub error_code: c_int,
-}
-
-impl Default for CProviderCredentials {
-    fn default() -> Self {
-        Self {
-            effective_endpoint: std::ptr::null(),
-            api_key: std::ptr::null(),
-            error_code: 0,
-        }
-    }
-}
-
 /// Source: core/src/capi/responses.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -2580,6 +2561,25 @@ impl Default for CItem {
             prefill_ns: 0,
             generation_ns: 0,
             finish_reason_ptr: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/provider_config.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CProviderCredentials {
+    pub effective_endpoint: *const c_char,
+    pub api_key: *const c_char,
+    pub error_code: c_int,
+}
+
+impl Default for CProviderCredentials {
+    fn default() -> Self {
+        Self {
+            effective_endpoint: std::ptr::null(),
+            api_key: std::ptr::null(),
+            error_code: 0,
         }
     }
 }
@@ -3179,6 +3179,48 @@ impl Default for CGenerateConfig {
     }
 }
 
+/// Source: core/src/capi/tokenizer.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EosTokenResult {
+    pub tokens: *mut u32,
+    pub num_tokens: usize,
+}
+
+impl Default for EosTokenResult {
+    fn default() -> Self {
+        Self {
+            tokens: std::ptr::null_mut(),
+            num_tokens: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/tokenizer.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EncodeOptions {
+    pub add_bos: u8,
+    pub add_eos: u8,
+    pub truncation: u8,
+    pub truncation_side: u8,
+    pub _padding: [u8; 4],
+    pub max_length: usize,
+}
+
+impl Default for EncodeOptions {
+    fn default() -> Self {
+        Self {
+            add_bos: 1,
+            add_eos: 1,
+            truncation: 0,
+            truncation_side: 0,
+            _padding: [0; 4],
+            max_length: 0,
+        }
+    }
+}
+
 /// Source: core/src/capi/converter.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3228,48 +3270,6 @@ impl Default for ModelInfo {
             num_experts: 0,
             experts_per_token: 0,
             error_msg: std::ptr::null(),
-        }
-    }
-}
-
-/// Source: core/src/capi/tokenizer.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct EncodeOptions {
-    pub add_bos: u8,
-    pub add_eos: u8,
-    pub truncation: u8,
-    pub truncation_side: u8,
-    pub _padding: [u8; 4],
-    pub max_length: usize,
-}
-
-impl Default for EncodeOptions {
-    fn default() -> Self {
-        Self {
-            add_bos: 1,
-            add_eos: 1,
-            truncation: 0,
-            truncation_side: 0,
-            _padding: [0; 4],
-            max_length: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/tokenizer.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct EosTokenResult {
-    pub tokens: *mut u32,
-    pub num_tokens: usize,
-}
-
-impl Default for EosTokenResult {
-    fn default() -> Self {
-        Self {
-            tokens: std::ptr::null_mut(),
-            num_tokens: 0,
         }
     }
 }
@@ -3407,27 +3407,6 @@ impl Default for CFunctionCallOutputItem {
     }
 }
 
-/// Source: core/src/capi/responses.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CMessageItem {
-    pub role: u8,
-    pub _padding: [u8; 7],
-    pub content_count: usize,
-    pub raw_role_ptr: *const c_char,
-}
-
-impl Default for CMessageItem {
-    fn default() -> Self {
-        Self {
-            role: 0,
-            _padding: [0; 7],
-            content_count: 0,
-            raw_role_ptr: std::ptr::null(),
-        }
-    }
-}
-
 /// Source: core/src/capi/db/ops.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3461,6 +3440,25 @@ impl Default for CStorageEvent {
             fork_id: 0,
             fork_session_id: std::ptr::null(),
             _reserved: [0; 7],
+        }
+    }
+}
+
+/// Source: core/src/capi/xray.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct QueryResult {
+    pub results: *mut CapturedTensorInfo,
+    pub count: usize,
+    pub error_msg: *const c_char,
+}
+
+impl Default for QueryResult {
+    fn default() -> Self {
+        Self {
+            results: std::ptr::null_mut(),
+            count: 0,
+            error_msg: std::ptr::null(),
         }
     }
 }
@@ -3511,6 +3509,27 @@ impl Default for CStringList {
     }
 }
 
+/// Source: core/src/capi/responses.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CMessageItem {
+    pub role: u8,
+    pub _padding: [u8; 7],
+    pub content_count: usize,
+    pub raw_role_ptr: *const c_char,
+}
+
+impl Default for CMessageItem {
+    fn default() -> Self {
+        Self {
+            role: 0,
+            _padding: [0; 7],
+            content_count: 0,
+            raw_role_ptr: std::ptr::null(),
+        }
+    }
+}
+
 /// Source: core/src/converter/scheme.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3524,25 +3543,6 @@ impl Default for OverrideRule {
         Self {
             pattern: std::ptr::null(),
             scheme: Scheme::from(0),
-        }
-    }
-}
-
-/// Source: core/src/capi/xray.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct QueryResult {
-    pub results: *mut CapturedTensorInfo,
-    pub count: usize,
-    pub error_msg: *const c_char,
-}
-
-impl Default for QueryResult {
-    fn default() -> Self {
-        Self {
-            results: std::ptr::null_mut(),
-            count: 0,
-            error_msg: std::ptr::null(),
         }
     }
 }
@@ -4002,7 +4002,7 @@ impl Default for DownloadOptions {
     }
 }
 
-/// Source: core/src/capi/agent/fs.zig
+/// Source: core/src/capi/agent/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TaluFsStat {
@@ -4115,27 +4115,6 @@ impl Default for CDocumentFullList {
     }
 }
 
-/// Source: core/src/capi/template.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct COutputSpan {
-    pub start: u32,
-    pub end: u32,
-    pub source_type: CSpanSourceType,
-    pub variable_path: *const c_char,
-}
-
-impl Default for COutputSpan {
-    fn default() -> Self {
-        Self {
-            start: 0,
-            end: 0,
-            source_type: CSpanSourceType::from(0),
-            variable_path: std::ptr::null(),
-        }
-    }
-}
-
 /// Source: core/src/capi/tokenizer.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -4155,6 +4134,27 @@ impl Default for VocabResult {
             num_entries: 0,
             ids: std::ptr::null_mut(),
             error_msg: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/template.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct COutputSpan {
+    pub start: u32,
+    pub end: u32,
+    pub source_type: CSpanSourceType,
+    pub variable_path: *const c_char,
+}
+
+impl Default for COutputSpan {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            end: 0,
+            source_type: CSpanSourceType::from(0),
+            variable_path: std::ptr::null(),
         }
     }
 }

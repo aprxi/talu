@@ -735,6 +735,7 @@ pub const Transformer = struct {
         const quant_info: []const u8 = switch (self.weight_dtype) {
             .grouped_affine_u4 => "4-bit (grouped affine)",
             .grouped_affine_u8 => "8-bit (grouped affine)",
+            .f8_e4m3 => "FP8 (E4M3)",
             .bf16 => "BF16",
             .f16 => "F16",
             .f32 => "F32",
@@ -824,6 +825,7 @@ pub const Transformer = struct {
         return switch (self.weight_dtype) {
             .grouped_affine_u4 => 1, // ~0.5 bytes, round up to 1 for scale overhead
             .grouped_affine_u8 => 1,
+            .f8_e4m3 => 1,
             .f16, .bf16 => 2,
             .f32 => 4,
             else => 2,

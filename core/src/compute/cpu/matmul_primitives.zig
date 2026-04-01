@@ -22,6 +22,7 @@ pub const DType = dtype_mod.DType;
 const fp16ToF32 = dtype_mod.fp16ToF32;
 const f32ToFp16 = dtype_mod.f32ToFp16;
 const bf16ToF32 = dtype_mod.bf16ToF32;
+const fp8e4m3ToF32 = dtype_mod.fp8e4m3ToF32;
 const fp16VecToF32Bits = dtype_mod.fp16x8ToF32Bits;
 const gaffineScaleBiasToF32 = grouped_affine_quant.scaleBiasToF32;
 const extractNibbles = grouped_affine_quant.extractNibbles;
@@ -75,11 +76,22 @@ const COL_TILE_SIZE: usize = 128;
 const COL_TILE_SIZE_FP16_SMALL_K: usize = 16;
 const COL_TILE_SIZE_FP16_LARGE_K: usize = 32;
 
+/// FP8 column tile sizes mirror F16/BF16 behavior (memory-bandwidth limited).
+const COL_TILE_SIZE_FP8_SMALL_K: usize = 16;
+const COL_TILE_SIZE_FP8_LARGE_K: usize = 32;
+
 fn fp16ColTileSize(k_dim: usize) usize {
     if (k_dim <= 2048) {
         return COL_TILE_SIZE_FP16_SMALL_K;
     }
     return COL_TILE_SIZE_FP16_LARGE_K;
+}
+
+fn fp8ColTileSize(k_dim: usize) usize {
+    if (k_dim <= 2048) {
+        return COL_TILE_SIZE_FP8_SMALL_K;
+    }
+    return COL_TILE_SIZE_FP8_LARGE_K;
 }
 
 /// Batch size threshold: above this, parallelize over rows only.
@@ -117,6 +129,7 @@ pub fn matmulKernel(weight_dtype: DType) !DispatchedKernel {
     return switch (weight_dtype) {
         .bf16 => .{ .func = matmulBF16, .name = "matmulBF16" },
         .f16 => .{ .func = matmulF16, .name = "matmulF16" },
+        .f8_e4m3 => .{ .func = matmulF8E4M3, .name = "matmulF8E4M3" },
         .grouped_affine_u4 => .{ .func = matmulGaffineU4, .name = "matmulGaffineU4" },
         .grouped_affine_u8 => .{ .func = matmulGaffineU8, .name = "matmulGaffineU8" },
         .f32 => .{ .func = matmulF32, .name = "matmulF32" },
@@ -154,6 +167,173 @@ pub fn matmulLmHeadRowsBf16(
     matmulBF16(&hidden_view, weight, &logits_view, scratch);
     if (logits_scaling != 1.0) {
         rowwise.scaleInPlaceReciprocal(logits_out[0 .. row_count * n_cols], logits_scaling);
+    }
+}
+
+/// Lookup table for FP8 E4M3 byte -> f32 conversion.
+const FP8_E4M3_LUT: [256]f32 = blk: {
+    var lut: [256]f32 = undefined;
+    var idx: usize = 0;
+    while (idx < lut.len) : (idx += 1) {
+        lut[idx] = fp8e4m3ToF32(@intCast(idx));
+    }
+    break :blk lut;
+};
+
+inline fn ue8m0ToScale(e8m0: u8) f32 {
+    const exp_bits = @as(u32, e8m0) << 23;
+    return @bitCast(exp_bits);
+}
+
+inline fn decodeFp8Vec(
+    comptime VEC: comptime_int,
+    ptr: [*]align(1) const u8,
+) @Vector(VEC, f32) {
+    var out: @Vector(VEC, f32) = undefined;
+    inline for (0..VEC) |idx| {
+        out[idx] = FP8_E4M3_LUT[ptr[idx]];
+    }
+    return out;
+}
+
+/// FP8 E4M3 matmul entry point.
+///
+/// Supports three scale modes:
+/// - MXFP8: per-row UE8M0 scale for each block of 32 columns (`Tensor.mxfp8`)
+/// - FP8 block scales: BF16 block scales (`Tensor.fp8.block_scales_data`)
+/// - FP8 per-tensor scale: scalar `scale_inv` (`Tensor.fp8.scale_inv`)
+fn matmulF8E4M3(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulScratch) void {
+    _ = scratch;
+    std.debug.assert(a.dtype == .f32 and b.dtype == .f8_e4m3 and out.dtype == .f32);
+    std.debug.assert(a.n_dims == 2 and b.n_dims == 2 and out.n_dims == 2);
+
+    const m_rows: usize = @intCast(a.shape[0]);
+    const k_dim: usize = @intCast(a.shape[1]);
+    const n_cols: usize = @intCast(b.shape[0]);
+    std.debug.assert(b.shape[1] == a.shape[1]);
+    std.debug.assert(out.shape[0] == a.shape[0] and out.shape[1] == b.shape[0]);
+
+    const a_data = a.asSlice(f32);
+    const b_data = b.asSliceUnaligned(u8);
+    const c_data = out.asSlice(f32);
+
+    const MatmulF8Ctx = struct {
+        a: []const f32,
+        b: []align(1) const u8,
+        c: []f32,
+        m_rows: usize,
+        n_cols: usize,
+        k_dim: usize,
+        mode: enum { per_tensor, mxfp8, block_bf16 },
+        per_tensor_scale: f32 = 1.0,
+        mxfp8_scales: []align(1) const u8 = &[_]u8{},
+        mxfp8_scale_cols: usize = 0,
+        bf16_scales: []align(1) const u16 = &[_]u16{},
+        bf16_scale_rows: usize = 0,
+        bf16_scale_cols: usize = 0,
+        bf16_block_size: usize = 0,
+    };
+
+    var context = MatmulF8Ctx{
+        .a = a_data,
+        .b = b_data,
+        .c = c_data,
+        .m_rows = m_rows,
+        .n_cols = n_cols,
+        .k_dim = k_dim,
+        .mode = .per_tensor,
+    };
+
+    if (b.mxfp8) |mx| {
+        if (mx.block_scales_data) |scale_ptr| {
+            const scale_len: usize = mx.block_scales_len;
+            const scale_cols: usize = @intCast(mx.scale_cols);
+            if (scale_cols > 0 and scale_len >= n_cols * scale_cols) {
+                context.mode = .mxfp8;
+                context.mxfp8_scales = scale_ptr[0..scale_len];
+                context.mxfp8_scale_cols = scale_cols;
+            }
+        }
+    } else if (b.fp8) |fp8_meta| {
+        if (fp8_meta.block_scales_data) |scale_ptr| {
+            const scale_words: usize = fp8_meta.block_scales_len / @sizeOf(u16);
+            const required_words: usize = @as(usize, fp8_meta.scale_rows) * @as(usize, fp8_meta.scale_cols);
+            if (fp8_meta.scale_rows > 0 and fp8_meta.scale_cols > 0 and scale_words >= required_words and fp8_meta.block_size > 0) {
+                context.mode = .block_bf16;
+                context.bf16_scales = @as([*]align(1) const u16, @ptrCast(scale_ptr))[0..scale_words];
+                context.bf16_scale_rows = @intCast(fp8_meta.scale_rows);
+                context.bf16_scale_cols = @intCast(fp8_meta.scale_cols);
+                context.bf16_block_size = @intCast(fp8_meta.block_size);
+            } else {
+                context.mode = .per_tensor;
+                context.per_tensor_scale = fp8_meta.scale_inv;
+            }
+        } else {
+            context.mode = .per_tensor;
+            context.per_tensor_scale = fp8_meta.scale_inv;
+        }
+    }
+
+    const tiled_task = struct {
+        fn runRowColTiles(start: usize, end: usize, task_ctx: *MatmulF8Ctx) void {
+            @setFloatMode(.optimized);
+
+            const k_len = task_ctx.k_dim;
+            const n_len = task_ctx.n_cols;
+            const tile_size_local = fp8ColTileSize(k_len);
+            const tiles_per_row_local = (n_len + tile_size_local - 1) / tile_size_local;
+
+            for (start..end) |tile_idx| {
+                const row = tile_idx / tiles_per_row_local;
+                const col_tile = tile_idx % tiles_per_row_local;
+                const col_start = col_tile * tile_size_local;
+                const col_end = @min(col_start + tile_size_local, n_len);
+
+                const a_row = task_ctx.a[row * k_len ..][0..k_len];
+                const out_row = task_ctx.c[row * n_len ..][0..n_len];
+
+                for (col_start..col_end) |col_idx| {
+                    const b_row = task_ctx.b[col_idx * k_len ..][0..k_len];
+                    var sum: f32 = 0;
+
+                    switch (task_ctx.mode) {
+                        .mxfp8 => {
+                            const scale_row = task_ctx.mxfp8_scales[col_idx * task_ctx.mxfp8_scale_cols ..][0..task_ctx.mxfp8_scale_cols];
+                            for (0..k_len) |k_idx| {
+                                const scale = ue8m0ToScale(scale_row[k_idx / 32]);
+                                sum = @mulAdd(f32, a_row[k_idx], FP8_E4M3_LUT[b_row[k_idx]] * scale, sum);
+                            }
+                        },
+                        .block_bf16 => {
+                            const block_size = task_ctx.bf16_block_size;
+                            const scale_row = @min(col_idx / block_size, task_ctx.bf16_scale_rows - 1);
+                            for (0..k_len) |k_idx| {
+                                const scale_col = @min(k_idx / block_size, task_ctx.bf16_scale_cols - 1);
+                                const scale = bf16ToF32(task_ctx.bf16_scales[scale_row * task_ctx.bf16_scale_cols + scale_col]);
+                                sum = @mulAdd(f32, a_row[k_idx], FP8_E4M3_LUT[b_row[k_idx]] * scale, sum);
+                            }
+                        },
+                        .per_tensor => {
+                            for (0..k_len) |k_idx| {
+                                sum = @mulAdd(f32, a_row[k_idx], FP8_E4M3_LUT[b_row[k_idx]] * task_ctx.per_tensor_scale, sum);
+                            }
+                        },
+                    }
+
+                    out_row[col_idx] = sum;
+                }
+            }
+        }
+    }.runRowColTiles;
+
+    const tile_size = fp8ColTileSize(k_dim);
+    const tiles_per_row = (n_cols + tile_size - 1) / tile_size;
+    const total_tiles = m_rows * tiles_per_row;
+    const pool = parallel.global();
+    if (m_rows > 1) {
+        pool.parallelForCompute(total_tiles, tiled_task, &context);
+    } else {
+        pool.parallelFor(total_tiles, tiled_task, &context);
     }
 }
 
@@ -1597,6 +1777,10 @@ test "matmulKernel returns correct function for dtype" {
     try std.testing.expectEqual(@as(MatmulFn, matmulF32), f32_dk.func);
     try std.testing.expectEqualStrings("matmulF32", f32_dk.name);
 
+    const fp8_dk = try matmulKernel(.f8_e4m3);
+    try std.testing.expectEqual(@as(MatmulFn, matmulF8E4M3), fp8_dk.func);
+    try std.testing.expectEqualStrings("matmulF8E4M3", fp8_dk.name);
+
     const gaffine_u4_dk = try matmulKernel(.grouped_affine_u4);
     try std.testing.expectEqual(@as(MatmulFn, matmulGaffineU4), gaffine_u4_dk.func);
     try std.testing.expectEqualStrings("matmulGaffineU4", gaffine_u4_dk.name);
@@ -1648,6 +1832,66 @@ test "matmulAuto dispatches to correct kernel" {
     try std.testing.expectApproxEqAbs(22.0, out_data[1], 1e-5);
     try std.testing.expectApproxEqAbs(43.0, out_data[2], 1e-5);
     try std.testing.expectApproxEqAbs(50.0, out_data[3], 1e-5);
+}
+
+test "matmulF8E4M3 with MXFP8 scales" {
+    const allocator = std.testing.allocator;
+
+    var a = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ 1, 32 });
+    defer a.deinit();
+    var b = try tensor_mod.OwnedTensor.init(allocator, .f8_e4m3, &.{ 1, 32 });
+    defer b.deinit();
+    var out = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ 1, 1 });
+    defer out.deinit();
+
+    for (a.asSlice(f32), 0..) |*v, idx| v.* = @as(f32, @floatFromInt(idx + 1));
+    for (b.asSlice(u8)) |*v| v.* = 0x38; // FP8 E4M3 encoding of 1.0
+
+    var scale_bytes = [_]u8{127}; // UE8M0 2^(127-127) = 1.0
+
+    var a_view = a.view();
+    var b_view = b.view();
+    b_view.mxfp8 = .{
+        .block_scales_data = scale_bytes[0..].ptr,
+        .block_scales_len = scale_bytes.len,
+        .rows = 1,
+        .cols = 32,
+        .scale_cols = 1,
+    };
+    var out_view = out.view();
+    var scratch = try MatmulScratch.init(allocator);
+    defer scratch.deinit();
+
+    try matmulAuto(&a_view, &b_view, &out_view, &scratch);
+
+    // sum(1..32) = 528
+    try std.testing.expectApproxEqAbs(@as(f32, 528.0), out.asSlice(f32)[0], 1e-4);
+}
+
+test "matmulF8E4M3 with per-tensor scale" {
+    const allocator = std.testing.allocator;
+
+    var a = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ 1, 16 });
+    defer a.deinit();
+    var b = try tensor_mod.OwnedTensor.init(allocator, .f8_e4m3, &.{ 1, 16 });
+    defer b.deinit();
+    var out = try tensor_mod.OwnedTensor.init(allocator, .f32, &.{ 1, 1 });
+    defer out.deinit();
+
+    for (a.asSlice(f32), 0..) |*v, idx| v.* = @as(f32, @floatFromInt(idx + 1));
+    for (b.asSlice(u8)) |*v| v.* = 0x38; // 1.0
+
+    var a_view = a.view();
+    var b_view = b.view();
+    b_view.fp8 = .{ .scale_inv = 0.5 };
+    var out_view = out.view();
+    var scratch = try MatmulScratch.init(allocator);
+    defer scratch.deinit();
+
+    try matmulAuto(&a_view, &b_view, &out_view, &scratch);
+
+    // 0.5 * sum(1..16) = 68
+    try std.testing.expectApproxEqAbs(@as(f32, 68.0), out.asSlice(f32)[0], 1e-4);
 }
 
 test "gaffineU4DotProductOpt zero weights" {

@@ -18,6 +18,7 @@ const WeightMap = std.StringHashMapUnmanaged(*const Tensor);
 
 pub const LoadOptions = struct {
     preserve_native_norm_dtype: bool = false,
+    dequantize_mxfp8_to_bf16: bool = false,
 };
 
 pub fn loadWeightMap(
@@ -159,7 +160,14 @@ fn applySpecTransforms(
     const expected_in = getExpectedIn(spec, raw_tensor, model_config);
 
     tensor_view = switch (spec.layout) {
-        .linear, .gaffine => try transforms.orientWeight(allocator, safetensors, name, expected_in, model_config.*),
+        .linear, .gaffine => try transforms.orientWeight(
+            allocator,
+            safetensors,
+            name,
+            expected_in,
+            model_config.*,
+            options.dequantize_mxfp8_to_bf16,
+        ),
         .embedding => try transforms.orientEmbedding(allocator, safetensors, name, model_config.*),
         .conv1d_depthwise => try transforms.ensureF32(allocator, raw_tensor),
         .none => raw_tensor,

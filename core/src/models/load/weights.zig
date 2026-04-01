@@ -36,6 +36,9 @@ pub const LoadOptions = struct {
     /// Keep native (bf16/f16) norm weight dtype instead of converting to f32.
     /// The caller decides this policy based on selected runtime/backend.
     preserve_native_norm_dtype: bool = false,
+    /// Dequantize MXFP8 weights to BF16 during load.
+    /// Used by CPU backend until native MXFP8 parity is complete.
+    dequantize_mxfp8_to_bf16: bool = false,
 };
 
 pub const LoadedModel = struct {
@@ -488,6 +491,7 @@ pub fn loadModelWithArchitecture(
             0;
         const weight_load_options = generic_weights.LoadOptions{
             .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,
+            .dequantize_mxfp8_to_bf16 = model_load_options.dequantize_mxfp8_to_bf16,
         };
         var weight_map = try generic_weights.loadWeightMap(
             arena_allocator,
@@ -629,7 +633,10 @@ pub fn loadModelWithArchitecture(
         &.{},
         0,
         &model_config,
-        .{ .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype },
+        .{
+            .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,
+            .dequantize_mxfp8_to_bf16 = model_load_options.dequantize_mxfp8_to_bf16,
+        },
     );
 
     const token_embedding_weights = if (global_map.get("token_embeddings")) |weight|
