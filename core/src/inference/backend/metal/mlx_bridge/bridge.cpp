@@ -1108,6 +1108,7 @@ struct mlx_ctx {
     array lm_head_q_scales = array(0.0f); // [vocab, hidden / group_size]
     array final_norm_w = array(0.0f); // [hidden]
     bool has_fp8_meta = false;
+    bool has_mxfp8_meta = false;
     bool lm_head_q_decode_enabled = false;
     bool fp8_decode_qmm_enabled = false;
 
@@ -1707,6 +1708,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         const bool has_fp8_meta = has_fp8_quant_metadata(tensors);
         ctx->has_fp8_meta = has_fp8_meta;
         const bool has_mxfp8_meta = has_mxfp8_quant_metadata(tensors);
+        ctx->has_mxfp8_meta = has_mxfp8_meta;
         ctx->fp8_decode_qmm_enabled = has_mxfp8_meta && env_truthy("TALU_METAL_FP8_DECODE_QMM", true);
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
 
@@ -1725,33 +1727,50 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         );
 
         array lm_head_weight = array(0.0f); // [vocab, hidden]
+        std::string lm_head_key;
         if (ctx->cfg.tie_word_embeddings) {
             lm_head_weight = ctx->embed_tokens;
-            ctx->lm_head_rhs = transpose(lm_head_weight, {1, 0});
+            lm_head_key = text_prefix + "embed_tokens.weight";
+            if (!has_tensor(tensors, lm_head_key)) {
+                lm_head_key = "model.embed_tokens.weight";
+            }
         } else {
             if (has_tensor(tensors, text_prefix + "lm_head.weight")) {
+                lm_head_key = text_prefix + "lm_head.weight";
                 lm_head_weight = load_linear_weight(tensors, text_prefix + "lm_head.weight");
             } else if (has_tensor(tensors, "lm_head.weight")) {
+                lm_head_key = "lm_head.weight";
                 lm_head_weight = load_linear_weight(tensors, "lm_head.weight");
             } else {
                 throw std::runtime_error("missing lm_head weight (tie_word_embeddings=false)");
             }
-            ctx->lm_head_rhs = to_rhs(lm_head_weight, "lm_head");
         }
 
-        if (has_fp8_meta && env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", false)) {
-            const std::vector<array> q_lm_head = quantize(
-                lm_head_weight,
-                std::nullopt,
-                std::nullopt,
-                "mxfp8"
-            );
-            if (q_lm_head.size() != 2) {
-                throw std::runtime_error("mlx quantize(mxfp8) returned unexpected output count for lm_head");
+        const bool enable_lm_head_qmm = has_mxfp8_meta && env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", true);
+        if (enable_lm_head_qmm) {
+            if (lm_head_weight.size() == 1) {
+                // Tie embeddings can point at raw FP8 tensors. Load dequantized copy only
+                // if direct packed MXFP8 path is unavailable.
+                lm_head_weight = load_linear_weight(tensors, lm_head_key);
             }
-            ctx->lm_head_q_w = q_lm_head[0];
-            ctx->lm_head_q_scales = q_lm_head[1];
-            ctx->lm_head_q_decode_enabled = true;
+            bool lm_head_has_q = false;
+            maybe_quantize_mxfp8_matrix(
+                tensors,
+                lm_head_key,
+                lm_head_weight,
+                true,
+                &ctx->lm_head_q_w,
+                &ctx->lm_head_q_scales,
+                &lm_head_has_q
+            );
+            ctx->lm_head_q_decode_enabled = lm_head_has_q;
+        }
+
+        if (!ctx->lm_head_q_decode_enabled) {
+            if (lm_head_weight.size() == 1) {
+                lm_head_weight = load_linear_weight(tensors, lm_head_key);
+            }
+            ctx->lm_head_rhs = transpose(lm_head_weight, {1, 0});
         }
 
         ctx->layers.reserve(static_cast<size_t>(ctx->cfg.num_hidden_layers));
