@@ -284,6 +284,17 @@ pub fn buildGatedDeltaSplitInProj(
         (if (in_proj_a) |a| a.dtype == .f8_e4m3 else true);
 
     if (has_fp8 and all_fp8) {
+        const has_mxfp8 = in_proj_qkv.mxfp8 != null or in_proj_z.mxfp8 != null or
+            in_proj_b.mxfp8 != null or (if (in_proj_a) |a| a.mxfp8 != null else false);
+        if (has_mxfp8) {
+            // Mixed metadata is invalid: all split tensors must agree on MXFP8.
+            if (in_proj_qkv.mxfp8 == null or in_proj_z.mxfp8 == null or in_proj_b.mxfp8 == null)
+                return error.MissingScales;
+            if (in_proj_a) |a| {
+                if (a.mxfp8 == null) return error.MissingScales;
+            }
+            return buildGatedDeltaSplitInProjMxfp8(allocator, in_proj_qkv, in_proj_z, in_proj_b, in_proj_a);
+        }
         return buildGatedDeltaSplitInProjFp8(allocator, in_proj_qkv, in_proj_z, in_proj_b, in_proj_a);
     }
 
@@ -609,6 +620,96 @@ fn buildGatedDeltaSplitInProjFp8(
     return result;
 }
 
+/// Fuse split gated-delta projections for MXFP8 E4M3 tensors with UE8M0 block-32 scales.
+///
+/// Concatenates along output rows and preserves MXFP8 metadata so CUDA can
+/// execute the native MXFP8 path instead of falling back to generic FP8.
+fn buildGatedDeltaSplitInProjMxfp8(
+    allocator: std.mem.Allocator,
+    in_proj_qkv: *const Tensor,
+    in_proj_z: *const Tensor,
+    in_proj_b: *const Tensor,
+    in_proj_a: ?*const Tensor,
+) !*const Tensor {
+    const qkv_meta = in_proj_qkv.mxfp8 orelse return error.MissingScales;
+    const z_meta = in_proj_z.mxfp8 orelse return error.MissingScales;
+    const b_meta = in_proj_b.mxfp8 orelse return error.MissingScales;
+
+    // All split tensors share the same input columns, so scale_cols must match.
+    if (qkv_meta.scale_cols != z_meta.scale_cols or qkv_meta.scale_cols != b_meta.scale_cols)
+        return error.InvalidShape;
+
+    var a_meta: ?dtype.Mxfp8Meta = null;
+    if (in_proj_a) |a| {
+        a_meta = a.mxfp8 orelse return error.MissingScales;
+        if (a_meta.?.scale_cols != qkv_meta.scale_cols) return error.InvalidShape;
+    }
+
+    const qkv_rows: usize = @intCast(in_proj_qkv.shape[0]);
+    const z_rows: usize = @intCast(in_proj_z.shape[0]);
+    const b_rows: usize = @intCast(in_proj_b.shape[0]);
+    const a_rows: usize = if (in_proj_a) |a| @intCast(a.shape[0]) else 0;
+    const total_rows = qkv_rows + z_rows + b_rows + a_rows;
+    const cols: usize = @intCast(in_proj_z.shape[1]);
+
+    // Validate metadata row/column consistency before fusing.
+    if (qkv_meta.rows != qkv_rows or z_meta.rows != z_rows or b_meta.rows != b_rows)
+        return error.InvalidShape;
+    if (qkv_meta.cols != cols or z_meta.cols != cols or b_meta.cols != cols)
+        return error.InvalidShape;
+    if (a_meta) |meta| {
+        if (meta.rows != a_rows or meta.cols != cols) return error.InvalidShape;
+    }
+
+    // Fuse FP8 weight bytes (1 byte per element, concatenate rows).
+    const total_bytes = total_rows * cols;
+    const fused_data = try allocator.alloc(u8, total_bytes);
+    var dst_off: usize = 0;
+    const qkv_bytes = in_proj_qkv.data()[0 .. qkv_rows * cols];
+    @memcpy(fused_data[dst_off .. dst_off + qkv_bytes.len], qkv_bytes);
+    dst_off += qkv_bytes.len;
+    const z_bytes = in_proj_z.data()[0 .. z_rows * cols];
+    @memcpy(fused_data[dst_off .. dst_off + z_bytes.len], z_bytes);
+    dst_off += z_bytes.len;
+    const b_bytes_data = in_proj_b.data()[0 .. b_rows * cols];
+    @memcpy(fused_data[dst_off .. dst_off + b_bytes_data.len], b_bytes_data);
+    dst_off += b_bytes_data.len;
+    if (in_proj_a) |a| {
+        const a_bytes = a.data()[0 .. a_rows * cols];
+        @memcpy(fused_data[dst_off .. dst_off + a_bytes.len], a_bytes);
+    }
+
+    const scale_cols: usize = qkv_meta.scale_cols;
+    const total_scale_bytes = total_rows * scale_cols;
+    const fused_scales = try allocator.alloc(u8, total_scale_bytes);
+    var scale_off: usize = 0;
+
+    inline for (.{ qkv_meta, z_meta, b_meta }) |meta| {
+        const src_scales = meta.block_scales_data orelse return error.MissingScales;
+        const slen = @as(usize, meta.rows) * @as(usize, meta.scale_cols);
+        if (meta.block_scales_len < slen) return error.InvalidShape;
+        @memcpy(fused_scales[scale_off .. scale_off + slen], src_scales[0..slen]);
+        scale_off += slen;
+    }
+    if (a_meta) |meta| {
+        const src_scales = meta.block_scales_data orelse return error.MissingScales;
+        const slen = @as(usize, meta.rows) * @as(usize, meta.scale_cols);
+        if (meta.block_scales_len < slen) return error.InvalidShape;
+        @memcpy(fused_scales[scale_off .. scale_off + slen], src_scales[0..slen]);
+    }
+
+    const result = try allocator.create(Tensor);
+    result.* = Tensor.view(fused_data.ptr, &.{ total_rows, cols }, .f8_e4m3, total_bytes);
+    result.mxfp8 = .{
+        .block_scales_data = fused_scales.ptr,
+        .block_scales_len = total_scale_bytes,
+        .rows = @intCast(total_rows),
+        .cols = @intCast(cols),
+        .scale_cols = @intCast(scale_cols),
+    };
+    return result;
+}
+
 inline fn ue8m0ToScale(e8m0: u8) f32 {
     const exp_bits = @as(u32, e8m0) << 23;
     return @bitCast(exp_bits);
@@ -690,7 +791,10 @@ pub fn orientWeight(
             return error.MissingScales;
         };
     }
-    // Handle MXFP8 E4M3 weights — E4M3 data + UE8M0 block-32 scales for cuBLASLt tensor core GEMM
+    // Handle MXFP8 E4M3 weights — E4M3 data + UE8M0 block-32 scales for cuBLASLt tensor core GEMM.
+    // Accept both scale suffixes used in the wild:
+    // - ".weight_block_scale" (Talu/HF MXFP8 export)
+    // - ".weight_scale" (AutoRound compressed-tensors export)
     if (weight_tensor.dtype == .f8_e4m3) mxfp8_check: {
         const base = if (std.mem.endsWith(u8, name, ".weight"))
             name[0 .. name.len - ".weight".len]
@@ -698,8 +802,13 @@ pub fn orientWeight(
             name;
 
         var mxfp8_scale_name_buf: [256]u8 = undefined;
-        const mxfp8_scale_name = std.fmt.bufPrint(&mxfp8_scale_name_buf, "{s}.weight_block_scale", .{base}) catch break :mxfp8_check;
-        const mxfp8_scale_tensor = st.getTensor(mxfp8_scale_name, null) catch break :mxfp8_check;
+        const mxfp8_scale_tensor = blk: {
+            const block_scale_name = std.fmt.bufPrint(&mxfp8_scale_name_buf, "{s}.weight_block_scale", .{base}) catch break :mxfp8_check;
+            if (st.getTensor(block_scale_name, null)) |scale_tensor| break :blk scale_tensor else |_| {}
+
+            const scale_name = std.fmt.bufPrint(&mxfp8_scale_name_buf, "{s}.weight_scale", .{base}) catch break :mxfp8_check;
+            break :blk st.getTensor(scale_name, null) catch break :mxfp8_check;
+        };
 
         // MXFP8 scales are 2D: [rows, ceil(cols/32)] with dtype u8/i8 (E8M0)
         // Note: safetensors reader maps U8 → .i8 ("unsigned treated as signed")
@@ -1489,6 +1598,63 @@ test "buildGatedDeltaSplitInProj concatenates z qkv dt rows" {
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, fused.asSlice(f32));
 }
 
+test "buildGatedDeltaSplitInProj preserves MXFP8 metadata for fused split projections" {
+    const allocator = std.testing.allocator;
+
+    var z_data = [_]u8{ 1, 2, 3, 4 };
+    var qkv_data = [_]u8{ 5, 6, 7, 8, 9, 10 };
+    var dt_data = [_]u8{ 11, 12 };
+
+    var z_scales = [_]u8{ 0x81, 0x82 };
+    var qkv_scales = [_]u8{ 0x83, 0x84, 0x85 };
+    var dt_scales = [_]u8{0x86};
+
+    // Keep argument order aligned with existing split test:
+    // first arg rows appear first in fused output.
+    var z = Tensor.view(z_data[0..].ptr, &.{ 2, 2 }, .f8_e4m3, z_data.len);
+    z.mxfp8 = .{
+        .block_scales_data = z_scales[0..].ptr,
+        .block_scales_len = z_scales.len,
+        .rows = 2,
+        .cols = 2,
+        .scale_cols = 1,
+    };
+    var qkv = Tensor.view(qkv_data[0..].ptr, &.{ 3, 2 }, .f8_e4m3, qkv_data.len);
+    qkv.mxfp8 = .{
+        .block_scales_data = qkv_scales[0..].ptr,
+        .block_scales_len = qkv_scales.len,
+        .rows = 3,
+        .cols = 2,
+        .scale_cols = 1,
+    };
+    var dt = Tensor.view(dt_data[0..].ptr, &.{ 1, 2 }, .f8_e4m3, dt_data.len);
+    dt.mxfp8 = .{
+        .block_scales_data = dt_scales[0..].ptr,
+        .block_scales_len = dt_scales.len,
+        .rows = 1,
+        .cols = 2,
+        .scale_cols = 1,
+    };
+
+    const fused = try buildGatedDeltaSplitInProj(allocator, &z, &qkv, &dt, null);
+    defer @constCast(fused).deinit(allocator);
+
+    try std.testing.expectEqual(@as(i32, 2), fused.n_dims);
+    try std.testing.expectEqual(@as(i64, 6), fused.shape[0]);
+    try std.testing.expectEqual(@as(i64, 2), fused.shape[1]);
+    try std.testing.expect(fused.mxfp8 != null);
+    try std.testing.expect(fused.fp8 == null);
+
+    const meta = fused.mxfp8.?;
+    try std.testing.expectEqual(@as(u32, 6), meta.rows);
+    try std.testing.expectEqual(@as(u32, 2), meta.cols);
+    try std.testing.expectEqual(@as(u32, 1), meta.scale_cols);
+    try std.testing.expectEqual(@as(usize, 6), meta.block_scales_len);
+
+    const fused_scales = meta.block_scales_data.?[0..meta.block_scales_len];
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 0x82, 0x83, 0x84, 0x85, 0x86 }, fused_scales);
+}
+
 test "orientWeightF32 returns 1D tensor unchanged" {
     const allocator = std.testing.allocator;
 
@@ -1778,6 +1944,44 @@ test "orientWeight returns untransposed when rows equals expected_in" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), out[2], 1e-6);
+}
+
+test "orientWeight detects MXFP8 scales from AutoRound weight_scale suffix" {
+    const allocator = std.testing.allocator;
+    const writer = @import("../../io/safetensors/writer.zig");
+
+    const tmp_dir_path = "/tmp/test_orient_weight_mxfp8_autoround";
+    std.fs.cwd().makeDir(tmp_dir_path) catch {};
+    defer std.fs.cwd().deleteTree(tmp_dir_path) catch {};
+
+    const rows: usize = 4;
+    const cols: usize = 32;
+    const weight_data = [_]u8{0x00} ** (rows * cols);
+    const scale_data = [_]u8{ 0x80, 0x80, 0x80, 0x80 };
+    const entries = [_]writer.TensorEntry{
+        .{ .name = "weight", .dtype = .f8_e4m3, .shape = &[_]usize{ rows, cols }, .data = weight_data[0..] },
+        .{ .name = "weight_scale", .dtype = .u8, .shape = &[_]usize{ rows, cols / 32 }, .data = scale_data[0..] },
+    };
+    const model_path = tmp_dir_path ++ "/model.safetensors";
+    try writer.write(allocator, model_path, &entries);
+
+    var st = try st_loader.UnifiedSafeTensors.load(allocator, model_path);
+    defer st.deinit();
+
+    var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+    defer arena_alloc.deinit();
+
+    const config = std.mem.zeroes(ModelConfig);
+    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", cols, config, false);
+
+    try std.testing.expectEqual(DType.f8_e4m3, result.dtype);
+    try std.testing.expect(result.mxfp8 != null);
+    try std.testing.expect(result.fp8 == null);
+    const meta = result.mxfp8.?;
+    try std.testing.expectEqual(@as(usize, rows), meta.block_scales_len);
+    try std.testing.expectEqual(@as(u32, @intCast(rows)), meta.rows);
+    try std.testing.expectEqual(@as(u32, @intCast(cols)), meta.cols);
+    try std.testing.expectEqual(@as(u32, 1), meta.scale_cols);
 }
 
 test "orientEmbedding keeps f16 embedding dtype" {
