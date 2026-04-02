@@ -72,8 +72,11 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
 
     const arena_allocator = loaded_model.arena.allocator();
     for (loaded_model.blocks, 0..) |*layer, layer_idx| {
-        const block_weights_at_layer = weights.blocks.layerToBlockWeights(arena_allocator, layer) catch {
-            return reporter.reportError("failed to materialize layer {} block weights for validation", .{layer_idx});
+        const block_weights_at_layer = weights.blocks.layerToBlockWeights(arena_allocator, layer) catch |err| {
+            return reporter.reportError("failed to materialize layer {} block weights for validation ({s})", .{
+                layer_idx,
+                @errorName(err),
+            });
         };
         switch (block_weights_at_layer) {
             .attention_mlp => |block| {

@@ -1634,6 +1634,20 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     if (self.kernel_registry.resolveFunction("mxfp8_matvec_f32_tile8", "talu_mxfp8_matvec_f32_tile8")) |resolved| {
         self.mxfp8_matvec_tile8_function = resolved.function;
     } else |_| {}
+    if (self.kernel_registry.resolveFunction("nvfp4_matvec_f32", "talu_nvfp4_matvec_f32")) |resolved| {
+        self.nvfp4_matvec_function = resolved.function;
+    } else |err| {
+        log.warn("inference", "CUDA NVFP4 matvec resolve failed", .{
+            .reason = @errorName(err),
+        });
+    }
+    if (self.kernel_registry.resolveFunction("nvfp4_matvec_f32_tile8", "talu_nvfp4_matvec_f32_tile8")) |resolved| {
+        self.nvfp4_matvec_tile8_function = resolved.function;
+    } else |err| {
+        log.warn("inference", "CUDA NVFP4 matvec tile8 resolve failed", .{
+            .reason = @errorName(err),
+        });
+    }
     if (self.kernel_registry.resolveFunction("mxfp8_matvec_gate_up_silu_f32", "talu_mxfp8_matvec_gate_up_silu_f32")) |resolved| {
         self.mxfp8_matvec_gate_up_silu_function = resolved.function;
     } else |_| {}

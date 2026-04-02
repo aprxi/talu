@@ -2765,6 +2765,154 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_mxfp8_matvec_f32_tile8
     }
 }
 
+// ---------------------------------------------------------------------------
+// NVFP4 GEMV (packed FP4 E2M1 + FP8 E4M3 per-group scales)
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ float nvfp4_nibble_to_f32(unsigned int nibble) {
+    const float magnitude = (nibble & 0x7u) == 0u ? 0.0f :
+        (nibble & 0x7u) == 1u ? 0.5f :
+        (nibble & 0x7u) == 2u ? 1.0f :
+        (nibble & 0x7u) == 3u ? 1.5f :
+        (nibble & 0x7u) == 4u ? 2.0f :
+        (nibble & 0x7u) == 5u ? 3.0f :
+        (nibble & 0x7u) == 6u ? 4.0f : 6.0f;
+    return (nibble & 0x8u) ? -magnitude : magnitude;
+}
+
+template <unsigned int BATCH>
+static __device__ __forceinline__ void talu_nvfp4_matvec_batched(
+    const float* input,                    // [batch_rows × in_dim]
+    const unsigned char* weight_packed,    // [out_dim × packed_in]
+    const unsigned char* scales,           // [out_dim × scale_cols] FP8 E4M3
+    float* out,                            // [batch_rows × out_dim]
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int out_idx,
+    unsigned int scale_cols,
+    unsigned int group_size,
+    float weight_global_scale,
+    unsigned int lane,
+    unsigned int batch_rows
+) {
+    const unsigned int packed_cols = (in_dim + 1u) >> 1;
+    const unsigned int scale_row_off = out_idx * scale_cols;
+    const float inv_global = 1.0f / weight_global_scale;
+    float acc[BATCH] = {};
+
+    for (unsigned int i = lane; i < packed_cols; i += TALU_QUANT_WARP_SIZE) {
+        const unsigned int packed = static_cast<unsigned int>(weight_packed[i]);
+        const unsigned int c0 = i << 1;
+        const unsigned int c1 = c0 + 1u;
+
+        const unsigned int g0 = c0 / group_size;
+        const float s0 = fp8e4m3_to_f32(static_cast<__nv_fp8_storage_t>(scales[scale_row_off + g0])) * inv_global;
+        const float w0 = nvfp4_nibble_to_f32(packed & 0xFu) * s0;
+
+        #pragma unroll
+        for (unsigned int b = 0; b < BATCH; b++) {
+            if (b >= batch_rows) break;
+            const unsigned long long row_off = (unsigned long long)b * in_dim;
+            acc[b] = fmaf(input[row_off + c0], w0, acc[b]);
+        }
+
+        if (c1 < in_dim) {
+            const unsigned int g1 = c1 / group_size;
+            const float s1 = fp8e4m3_to_f32(static_cast<__nv_fp8_storage_t>(scales[scale_row_off + g1])) * inv_global;
+            const float w1 = nvfp4_nibble_to_f32((packed >> 4) & 0xFu) * s1;
+            #pragma unroll
+            for (unsigned int b = 0; b < BATCH; b++) {
+                if (b >= batch_rows) break;
+                const unsigned long long row_off = (unsigned long long)b * in_dim;
+                acc[b] = fmaf(input[row_off + c1], w1, acc[b]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int b = 0; b < BATCH; b++) {
+        if (b >= batch_rows) break;
+        const float result = talu_quant_warp_sum_f32(acc[b]);
+        if (lane == 0) out[(unsigned long long)b * out_dim + out_idx] = result;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_f32(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ weight_packed,
+    const unsigned char* __restrict__ scales,
+    float* __restrict__ out,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int scale_cols,
+    unsigned int group_size,
+    float weight_global_scale,
+    unsigned int batch_rows
+) {
+    const unsigned int batch_base = blockIdx.y * FP8_BATCH_TILE;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < FP8_BATCH_TILE
+        ? batch_rows - batch_base : FP8_BATCH_TILE;
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const unsigned int packed_cols = (in_dim + 1u) >> 1;
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out + (unsigned long long)batch_base * out_dim;
+    const unsigned char* row_weight = weight_packed + (unsigned long long)out_idx * packed_cols;
+
+    switch (tile_rows) {
+        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 1u); break;
+        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 2u); break;
+        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 3u); break;
+        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 4u); break;
+        default: return;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_f32_tile8(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ weight_packed,
+    const unsigned char* __restrict__ scales,
+    float* __restrict__ out,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int scale_cols,
+    unsigned int group_size,
+    float weight_global_scale,
+    unsigned int batch_rows
+) {
+    const unsigned int batch_base = blockIdx.y * FP8_BATCH_TILE_X8;
+    if (batch_base >= batch_rows) return;
+    const unsigned int tile_rows = batch_rows - batch_base < FP8_BATCH_TILE_X8
+        ? batch_rows - batch_base : FP8_BATCH_TILE_X8;
+
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
+    if (out_idx >= out_dim) return;
+
+    const unsigned int packed_cols = (in_dim + 1u) >> 1;
+    const float* input_tile = input + (unsigned long long)batch_base * in_dim;
+    float* out_tile = out + (unsigned long long)batch_base * out_dim;
+    const unsigned char* row_weight = weight_packed + (unsigned long long)out_idx * packed_cols;
+
+    switch (tile_rows) {
+        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 1u); break;
+        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 2u); break;
+        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 3u); break;
+        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 4u); break;
+        case 5u: talu_nvfp4_matvec_batched<5>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 5u); break;
+        case 6u: talu_nvfp4_matvec_batched<6>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 6u); break;
+        case 7u: talu_nvfp4_matvec_batched<7>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 7u); break;
+        case 8u: talu_nvfp4_matvec_batched<8>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, group_size, weight_global_scale, lane, 8u); break;
+        default: return;
+    }
+}
+
 // MXFP8 fused gate+up+silu GEMV.
 extern "C" __global__ __launch_bounds__(128, 2) void talu_mxfp8_matvec_gate_up_silu_f32(
     const float* __restrict__ input,
@@ -3061,6 +3209,14 @@ extern "C" __global__ void talu_mxfp8_matvec_f32_tile8(
     const float* input, const unsigned char* weight, const unsigned char* scales,
     float* out, unsigned int in_dim, unsigned int out_dim, unsigned int scale_cols,
     unsigned int batch_rows) {}
+extern "C" __global__ void talu_nvfp4_matvec_f32(
+    const float* input, const unsigned char* weight_packed, const unsigned char* scales,
+    float* out, unsigned int in_dim, unsigned int out_dim, unsigned int scale_cols,
+    unsigned int group_size, float weight_global_scale, unsigned int batch_rows) {}
+extern "C" __global__ void talu_nvfp4_matvec_f32_tile8(
+    const float* input, const unsigned char* weight_packed, const unsigned char* scales,
+    float* out, unsigned int in_dim, unsigned int out_dim, unsigned int scale_cols,
+    unsigned int group_size, float weight_global_scale, unsigned int batch_rows) {}
 extern "C" __global__ void talu_mxfp8_matvec_gate_up_silu_f32(
     const float* input, const unsigned char* gate_weight, const unsigned char* gate_scales,
     const unsigned char* up_weight, const unsigned char* up_scales, float* out,

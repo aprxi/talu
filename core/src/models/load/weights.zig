@@ -39,6 +39,9 @@ pub const LoadOptions = struct {
     /// Dequantize MXFP8 weights to BF16 during load.
     /// Used by CPU backend until native MXFP8 parity is complete.
     dequantize_mxfp8_to_bf16: bool = false,
+    /// Dequantize NVFP4 packed weights to BF16 during load.
+    /// CUDA can keep NVFP4 packed for native kernels; other backends use BF16 fallback.
+    dequantize_nvfp4_to_bf16: bool = true,
 };
 
 pub const LoadedModel = struct {
@@ -485,6 +488,7 @@ pub fn loadModelWithArchitecture(
         const weight_load_options = generic_weights.LoadOptions{
             .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,
             .dequantize_mxfp8_to_bf16 = model_load_options.dequantize_mxfp8_to_bf16,
+            .dequantize_nvfp4_to_bf16 = model_load_options.dequantize_nvfp4_to_bf16,
         };
         var weight_map = try generic_weights.loadWeightMap(
             arena_allocator,
@@ -629,6 +633,7 @@ pub fn loadModelWithArchitecture(
         .{
             .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,
             .dequantize_mxfp8_to_bf16 = model_load_options.dequantize_mxfp8_to_bf16,
+            .dequantize_nvfp4_to_bf16 = model_load_options.dequantize_nvfp4_to_bf16,
         },
     );
 

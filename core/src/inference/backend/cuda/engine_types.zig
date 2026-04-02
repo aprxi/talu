@@ -717,6 +717,28 @@ pub const Mxfp8LinearWeight = struct {
     }
 };
 
+pub const Nvfp4LinearWeight = struct {
+    rows: usize,
+    cols: usize,
+    /// Packed FP4 bytes: [out_dim × packed_in] (2 FP4 values per byte).
+    buffer: compute.cuda.Buffer,
+    /// FP8 E4M3 scales in row-major layout [out_dim × scale_cols].
+    scales_buffer: compute.cuda.Buffer,
+    packed_cols: u32,
+    scale_cols: u32,
+    group_size: u32,
+    weight_global_scale: f32,
+
+    pub fn deinit(self: *Nvfp4LinearWeight, device: *compute.cuda.Device) void {
+        if (self.scales_buffer.size > 0) self.scales_buffer.deinit(device);
+        self.buffer.deinit(device);
+    }
+
+    pub fn byteSize(self: *const Nvfp4LinearWeight) usize {
+        return self.buffer.size + self.scales_buffer.size;
+    }
+};
+
 pub const LinearWeight = union(enum) {
     dense_f32: DeviceTensor,
     dense_u16: U16LinearWeight,
@@ -724,6 +746,7 @@ pub const LinearWeight = union(enum) {
     gaffine_u8: GaffineU8LinearWeight,
     fp8: Fp8LinearWeight,
     mxfp8: Mxfp8LinearWeight,
+    nvfp4: Nvfp4LinearWeight,
 
     pub fn deinit(self: *LinearWeight, device: *compute.cuda.Device) void {
         switch (self.*) {
@@ -733,6 +756,7 @@ pub const LinearWeight = union(enum) {
             .gaffine_u8 => |*w| w.deinit(device),
             .fp8 => |*w| w.deinit(device),
             .mxfp8 => |*w| w.deinit(device),
+            .nvfp4 => |*w| w.deinit(device),
         }
     }
 
@@ -744,6 +768,7 @@ pub const LinearWeight = union(enum) {
             .gaffine_u8 => |w| w.rows,
             .fp8 => |w| w.rows,
             .mxfp8 => |w| w.rows,
+            .nvfp4 => |w| w.rows,
         };
     }
 
@@ -755,6 +780,7 @@ pub const LinearWeight = union(enum) {
             .gaffine_u8 => |w| w.cols,
             .fp8 => |w| w.cols,
             .mxfp8 => |w| w.cols,
+            .nvfp4 => |w| w.cols,
         };
     }
 
@@ -766,6 +792,7 @@ pub const LinearWeight = union(enum) {
             .gaffine_u8 => |w| w.byteSize(),
             .fp8 => |w| w.byteSize(),
             .mxfp8 => |w| w.byteSize(),
+            .nvfp4 => |w| w.byteSize(),
         };
     }
 };

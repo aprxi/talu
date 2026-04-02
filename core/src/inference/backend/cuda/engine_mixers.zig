@@ -1380,7 +1380,23 @@ pub fn runGatedDeltaMixerStep(
 
     var proj_dev = try bufferSlice(&self.runtime_buffers.gdelta_proj_dev, 0, proj_bytes);
     var norm_stage_dev = try bufferSlice(&self.runtime_buffers.gdelta_ssm_dev, 0, norm_stage_bytes);
-    try engine_ops.linearForwardRows(self, input, seq_len, &block.in_proj, &proj_dev);
+    engine_ops.linearForwardRows(self, input, seq_len, &block.in_proj, &proj_dev) catch |err| {
+        const in_proj_kind = switch (block.in_proj) {
+            .dense_f32 => "dense_f32",
+            .dense_u16 => "dense_u16",
+            .gaffine_u4 => "gaffine_u4",
+            .gaffine_u8 => "gaffine_u8",
+            .fp8 => "fp8",
+            .mxfp8 => "mxfp8",
+            .nvfp4 => "nvfp4",
+        };
+        log.warn("inference", "CUDA gated-delta in_proj failed", .{
+            .seq_len = seq_len,
+            .kind = in_proj_kind,
+            .reason = @errorName(err),
+        });
+        return err;
+    };
     const prev_trace_position_offset = block.kernel.trace_position_offset;
     block.kernel.trace_position_offset = if (self.parity_prefill_seq_len > 1 and seq_len == 1)
         self.parity_prefill_token_index

@@ -8,6 +8,7 @@ const std = @import("std");
 const compute = @import("../../../compute/root.zig");
 const tensor = @import("../../../tensor.zig");
 const dtype = @import("../../../dtype.zig");
+const log = @import("../../../log.zig");
 
 // --- Shared types from engine_types.zig ---
 const engine_types = @import("engine_types.zig");
@@ -1090,6 +1091,39 @@ pub fn linearForwardRows(
             }
 
             return error.CudaKernelUnavailable;
+        },
+        .nvfp4 => |w| {
+            var nvfp4_fn = self.nvfp4_matvec_function orelse {
+                log.warn("inference", "CUDA NVFP4 matvec kernel unavailable", .{});
+                return error.CudaKernelUnavailable;
+            };
+            var nvfp4_batch_tile: u32 = 4;
+            if (rows > 4) {
+                if (self.nvfp4_matvec_tile8_function) |tile8_fn| {
+                    nvfp4_fn = tile8_fn;
+                    nvfp4_batch_tile = 8;
+                }
+            }
+
+            const out_cols: u32 = @intCast(w.cols);
+            const batch_rows: u32 = @intCast(rows);
+            self.kernel_arg_pack.reset();
+            self.kernel_arg_pack.appendBufferPtr(&packed_input) catch return error.CudaKernelUnavailable;
+            self.kernel_arg_pack.appendBufferPtr(&w.buffer) catch return error.CudaKernelUnavailable;
+            self.kernel_arg_pack.appendBufferPtr(&w.scales_buffer) catch return error.CudaKernelUnavailable;
+            self.kernel_arg_pack.appendBufferPtr(&packed_out) catch return error.CudaKernelUnavailable;
+            self.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch return error.CudaKernelUnavailable;
+            self.kernel_arg_pack.appendScalar(u32, out_cols) catch return error.CudaKernelUnavailable;
+            self.kernel_arg_pack.appendScalar(u32, w.scale_cols) catch return error.CudaKernelUnavailable;
+            self.kernel_arg_pack.appendScalar(u32, w.group_size) catch return error.CudaKernelUnavailable;
+            self.kernel_arg_pack.appendScalar(f32, w.weight_global_scale) catch return error.CudaKernelUnavailable;
+            self.kernel_arg_pack.appendScalar(u32, batch_rows) catch return error.CudaKernelUnavailable;
+            try compute.cuda.launch.launchWithFamily(&self.device, nvfp4_fn, .{
+                .grid_x = (out_cols + 3) / 4,
+                .grid_y = (batch_rows + nvfp4_batch_tile - 1) / nvfp4_batch_tile,
+                .block_x = 128,
+            }, &self.kernel_arg_pack, .matvec);
+            return;
         },
     }
 }

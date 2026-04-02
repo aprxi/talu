@@ -168,6 +168,23 @@ pub const Mxfp8Meta = struct {
     scale_cols: u32 = 0,
 };
 
+/// NVFP4 packed metadata (AutoRound compressed-tensors).
+/// Weight payload stores 2 FP4 E2M1 values per byte; per-group scales are FP8 E4M3.
+pub const Nvfp4Meta = struct {
+    /// FP8 E4M3 per-group scales [rows × scale_cols]
+    block_scales_data: ?[*]const u8 = null,
+    block_scales_len: usize = 0,
+    rows: u32 = 0,
+    /// Logical unpacked input columns.
+    cols: u32 = 0,
+    /// Physical packed columns (2 FP4 values per byte).
+    packed_cols: u32 = 0,
+    scale_cols: u32 = 0,
+    group_size: u32 = 0,
+    /// Dequant factor denominator from compressed-tensors weight_global_scale.
+    weight_global_scale: f32 = 1.0,
+};
+
 /// MXFP4 quantization metadata (Microsoft Microscaling)
 /// Format: 4-bit values with E8M0 scales (32 values per scale)
 pub const MXFP4Meta = struct {

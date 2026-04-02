@@ -403,6 +403,8 @@ pub const CudaBackend = struct {
     fp8_dequant_to_bf16_function: ?compute.cuda.Function = null,
     mxfp8_matvec_function: ?compute.cuda.Function = null,
     mxfp8_matvec_tile8_function: ?compute.cuda.Function = null,
+    nvfp4_matvec_function: ?compute.cuda.Function = null,
+    nvfp4_matvec_tile8_function: ?compute.cuda.Function = null,
     mxfp8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
     mxfp8_matvec_gate_up_silu_tile8_function: ?compute.cuda.Function = null,
     mxfp8_matvec_gate_up_function: ?compute.cuda.Function = null,
@@ -2800,6 +2802,7 @@ pub const CudaBackend = struct {
             self.matmul_bf16_function != null,
             self.gaffine_u4_matvec_function != null,
             self.gaffine_u8_matvec_function != null,
+            self.nvfp4_matvec_function != null,
         );
     }
 
@@ -2809,6 +2812,7 @@ pub const CudaBackend = struct {
         matmul_bf16_available: bool,
         gaffine_matvec_available: bool,
         gaffine_u8_matvec_available: bool,
+        nvfp4_matvec_available: bool,
     ) bool {
         return switch (weight.*) {
             .dense_f32 => true,
@@ -2820,6 +2824,7 @@ pub const CudaBackend = struct {
             .gaffine_u8 => gaffine_u8_matvec_available,
             .fp8 => true,
             .mxfp8 => true,
+            .nvfp4 => nvfp4_matvec_available,
         };
     }
 

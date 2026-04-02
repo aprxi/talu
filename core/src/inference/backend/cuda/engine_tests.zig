@@ -660,8 +660,8 @@ test "linearWeightSupportsSequenceRows allows gaffine when matvec kernel is load
         },
     };
 
-    try std.testing.expect(!CudaBackend.linearWeightSupportsSequenceRowsForKernels(&weight, false, false, false, false));
-    try std.testing.expect(CudaBackend.linearWeightSupportsSequenceRowsForKernels(&weight, false, false, true, false));
+    try std.testing.expect(!CudaBackend.linearWeightSupportsSequenceRowsForKernels(&weight, false, false, false, false, false));
+    try std.testing.expect(CudaBackend.linearWeightSupportsSequenceRowsForKernels(&weight, false, false, true, false, false));
 }
 
 test "canFuseDenseU16QkvWeights supports GQA-style unequal output dims" {

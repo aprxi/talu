@@ -415,6 +415,9 @@ pub fn uploadLinearWeight(
     if (src.dtype == .f8_e4m3 and src.mxfp8 != null) {
         return uploadLinearWeightMxfp8(device, allocator, src, input_dim);
     }
+    if ((src.dtype == .i8 or src.dtype == .u8) and src.nvfp4 != null) {
+        return uploadLinearWeightNvfp4(device, src, input_dim);
+    }
     if (src.dtype == .f8_e4m3) {
         return uploadLinearWeightFp8(device, src, input_dim);
     }
@@ -425,6 +428,50 @@ pub fn uploadLinearWeight(
             uploadLinearWeightDense(device, allocator, src, input_dim);
     }
     return uploadLinearWeightDense(device, allocator, src, input_dim);
+}
+
+fn uploadLinearWeightNvfp4(
+    device: *compute.cuda.Device,
+    src: *const Tensor,
+    input_dim: usize,
+) !LinearWeight {
+    if (src.n_dims != 2) return error.UnsupportedModel;
+    const meta = src.nvfp4 orelse return error.UnsupportedModel;
+
+    const out_dim: usize = @intCast(src.shape[0]);
+    const in_dim: usize = @intCast(src.shape[1]);
+    if (in_dim != input_dim or out_dim == 0 or in_dim == 0) return error.UnsupportedModel;
+
+    const packed_cols: usize = @intCast(meta.packed_cols);
+    if (packed_cols == 0 or packed_cols * 2 != in_dim) return error.InvalidArgument;
+    const weight_byte_count = std.math.mul(usize, out_dim, packed_cols) catch return error.InvalidArgument;
+    const src_bytes = src.data();
+    if (src_bytes.len < weight_byte_count) return error.InvalidArgument;
+
+    const scale_cols: usize = @intCast(meta.scale_cols);
+    if (scale_cols == 0) return error.InvalidArgument;
+    const scale_byte_count = std.math.mul(usize, out_dim, scale_cols) catch return error.InvalidArgument;
+    const scales_ptr = meta.block_scales_data orelse return error.MissingScales;
+    if (meta.block_scales_len < scale_byte_count) return error.InvalidArgument;
+
+    var buffer = try device.allocBuffer(weight_byte_count);
+    errdefer buffer.deinit(device);
+    try buffer.upload(device, src_bytes[0..weight_byte_count]);
+
+    var scales_buffer = try device.allocBuffer(scale_byte_count);
+    errdefer scales_buffer.deinit(device);
+    try scales_buffer.upload(device, scales_ptr[0..scale_byte_count]);
+
+    return .{ .nvfp4 = .{
+        .rows = in_dim,
+        .cols = out_dim,
+        .buffer = buffer,
+        .scales_buffer = scales_buffer,
+        .packed_cols = meta.packed_cols,
+        .scale_cols = meta.scale_cols,
+        .group_size = meta.group_size,
+        .weight_global_scale = meta.weight_global_scale,
+    } };
 }
 
 fn uploadLinearWeightFp8(

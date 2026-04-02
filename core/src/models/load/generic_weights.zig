@@ -19,6 +19,7 @@ const WeightMap = std.StringHashMapUnmanaged(*const Tensor);
 pub const LoadOptions = struct {
     preserve_native_norm_dtype: bool = false,
     dequantize_mxfp8_to_bf16: bool = false,
+    dequantize_nvfp4_to_bf16: bool = true,
 };
 
 const NormalizedNameEntry = struct {
@@ -44,18 +45,26 @@ pub const NameResolver = struct {
         allocator: Allocator,
         safetensors: *st_loader.UnifiedSafeTensors,
         candidate_name: []const u8,
-        qweight_name_buf: []u8,
+        candidate_name_buf: []u8,
     ) !?[]const u8 {
         if (safetensors.hasTensor(candidate_name)) return candidate_name;
 
-        if (buildQWeightCandidate(candidate_name, qweight_name_buf)) |qweight_name| {
+        if (buildQWeightCandidate(candidate_name, candidate_name_buf)) |qweight_name| {
             if (safetensors.hasTensor(qweight_name)) return qweight_name;
+        }
+
+        if (buildWeightPackedCandidate(candidate_name, candidate_name_buf)) |packed_name| {
+            if (safetensors.hasTensor(packed_name)) return packed_name;
         }
 
         if (try self.resolveNormalizedCandidate(allocator, safetensors, candidate_name)) |resolved_name| return resolved_name;
 
-        if (buildQWeightCandidate(candidate_name, qweight_name_buf)) |qweight_name| {
+        if (buildQWeightCandidate(candidate_name, candidate_name_buf)) |qweight_name| {
             if (try self.resolveNormalizedCandidate(allocator, safetensors, qweight_name)) |resolved_name| return resolved_name;
+        }
+
+        if (buildWeightPackedCandidate(candidate_name, candidate_name_buf)) |packed_name| {
+            if (try self.resolveNormalizedCandidate(allocator, safetensors, packed_name)) |resolved_name| return resolved_name;
         }
 
         return null;
@@ -279,14 +288,21 @@ fn normalizeWrapperSegments(buf: []u8, path: []const u8) ![]const u8 {
 }
 
 fn buildQWeightCandidate(name: []const u8, qweight_name_buf: []u8) ?[]const u8 {
+    return buildWeightSuffixCandidate(name, ".qweight", qweight_name_buf);
+}
+
+fn buildWeightPackedCandidate(name: []const u8, packed_name_buf: []u8) ?[]const u8 {
+    return buildWeightSuffixCandidate(name, ".weight_packed", packed_name_buf);
+}
+
+fn buildWeightSuffixCandidate(name: []const u8, suffix: []const u8, out_name_buf: []u8) ?[]const u8 {
     if (!std.mem.endsWith(u8, name, ".weight")) return null;
     const base_len = name.len - ".weight".len;
-    const qw_suffix = ".qweight";
-    const total = base_len + qw_suffix.len;
-    if (total > qweight_name_buf.len) return null;
-    @memcpy(qweight_name_buf[0..base_len], name[0..base_len]);
-    @memcpy(qweight_name_buf[base_len..total], qw_suffix);
-    return qweight_name_buf[0..total];
+    const total = base_len + suffix.len;
+    if (total > out_name_buf.len) return null;
+    @memcpy(out_name_buf[0..base_len], name[0..base_len]);
+    @memcpy(out_name_buf[base_len..total], suffix);
+    return out_name_buf[0..total];
 }
 
 fn applySpecTransforms(
@@ -309,6 +325,7 @@ fn applySpecTransforms(
             expected_in,
             model_config.*,
             options.dequantize_mxfp8_to_bf16,
+            options.dequantize_nvfp4_to_bf16,
         ),
         .embedding => try transforms.orientEmbedding(allocator, safetensors, name, model_config.*),
         .conv1d_depthwise => try transforms.ensureF32(allocator, raw_tensor),
@@ -491,6 +508,47 @@ test "normalizeWrapperSegments keeps non-wrapper duplicates" {
     const input = "layers.layers.0.weight";
     const out = try normalizeWrapperSegments(&buf, input);
     try std.testing.expectEqualStrings("layers.layers.0.weight", out);
+}
+
+test "NameResolver resolves .weight to .weight_packed fallback" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const model_path = try std.fs.path.join(allocator, &.{ tmp_path, "weight_packed.safetensors" });
+    defer allocator.free(model_path);
+
+    const packed_data = [_]u8{ 0x12, 0x34 };
+    const entries = [_]st_loader.TensorEntry{
+        .{
+            .name = "model.layers.0.mlp.down_proj.weight_packed",
+            .dtype = .u8,
+            .shape = &.{ 1, 2 },
+            .data = packed_data[0..],
+        },
+    };
+    try st_loader.write(allocator, model_path, &entries);
+
+    var safetensors = try st_loader.UnifiedSafeTensors.load(allocator, model_path);
+    defer safetensors.deinit();
+
+    var resolver: NameResolver = .{};
+    defer resolver.deinit(allocator);
+    var candidate_buf: [256]u8 = undefined;
+
+    const resolved = try resolver.resolve(
+        allocator,
+        &safetensors,
+        "model.layers.0.mlp.down_proj.weight",
+        candidate_buf[0..],
+    );
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqualStrings(
+        "model.layers.0.mlp.down_proj.weight_packed",
+        resolved.?,
+    );
 }
 
 test "loadWeightMap tested via integration tests" {

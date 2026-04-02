@@ -123,6 +123,10 @@ pub fn defaultModelLoadOptions(init_options: InitOptions) LoadOptions {
             .cpu => true,
             else => false,
         },
+        .dequantize_nvfp4_to_bf16 = switch (effective_selection) {
+            .cuda => false,
+            else => true,
+        },
     };
 }
 
@@ -1833,18 +1837,21 @@ test "defaultModelLoadOptions honors explicit CPU selection" {
     const opts = defaultModelLoadOptions(.{ .selection = .cpu });
     try std.testing.expectEqual(false, opts.preserve_native_norm_dtype);
     try std.testing.expectEqual(true, opts.dequantize_mxfp8_to_bf16);
+    try std.testing.expectEqual(true, opts.dequantize_nvfp4_to_bf16);
 }
 
 test "defaultModelLoadOptions honors explicit CUDA selection" {
     const opts = defaultModelLoadOptions(.{ .selection = .cuda });
     try std.testing.expectEqual(false, opts.preserve_native_norm_dtype);
     try std.testing.expectEqual(false, opts.dequantize_mxfp8_to_bf16);
+    try std.testing.expectEqual(false, opts.dequantize_nvfp4_to_bf16);
 }
 
 test "defaultModelLoadOptions honors explicit metal selection" {
     const opts = defaultModelLoadOptions(.{ .selection = .metal });
     try std.testing.expectEqual(has_metal, opts.preserve_native_norm_dtype);
     try std.testing.expectEqual(false, opts.dequantize_mxfp8_to_bf16);
+    try std.testing.expectEqual(true, opts.dequantize_nvfp4_to_bf16);
 }
 
 test "parseSelectionToken accepts supported backend values" {

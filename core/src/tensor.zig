@@ -22,6 +22,7 @@ pub const DType = dtype_mod.DType;
 pub const GroupedAffineMeta = dtype_mod.GroupedAffineMeta;
 pub const Fp8Meta = dtype_mod.Fp8Meta;
 pub const Mxfp8Meta = dtype_mod.Mxfp8Meta;
+pub const Nvfp4Meta = dtype_mod.Nvfp4Meta;
 
 /// Memory alignment constants
 pub const mem = struct {
@@ -186,6 +187,8 @@ pub const Tensor = struct {
     fp8: ?Fp8Meta = null,
     /// MXFP8 E4M3 + UE8M0 block-32 scale metadata (optional)
     mxfp8: ?Mxfp8Meta = null,
+    /// NVFP4 packed metadata (optional)
+    nvfp4: ?Nvfp4Meta = null,
 
     const Self = @This();
 
@@ -211,6 +214,7 @@ pub const Tensor = struct {
         tensor.gaffine = null;
         tensor.fp8 = null;
         tensor.mxfp8 = null;
+        tensor.nvfp4 = null;
 
         // Calculate strides (row-major / C-contiguous)
         var stride: i64 = 1;
@@ -251,6 +255,7 @@ pub const Tensor = struct {
         tensor.gaffine = null;
         tensor.fp8 = null;
         tensor.mxfp8 = null;
+        tensor.nvfp4 = null;
         tensor.n_dims = @intCast(shape_slice.len);
 
         var numel: usize = 1;
@@ -410,6 +415,7 @@ pub const Tensor = struct {
         tensor.gaffine = null;
         tensor.fp8 = null;
         tensor.mxfp8 = null;
+        tensor.nvfp4 = null;
         tensor.n_dims = 2;
         tensor.shape = .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0, 0 };
         tensor.numel = rows * cols;
@@ -427,6 +433,7 @@ pub const Tensor = struct {
         tensor.gaffine = null;
         tensor.fp8 = null;
         tensor.mxfp8 = null;
+        tensor.nvfp4 = null;
         tensor.n_dims = 3;
         tensor.shape = .{ 1, @intCast(rows), @intCast(cols), 0, 0, 0, 0, 0 };
         tensor.numel = rows * cols;
@@ -492,6 +499,7 @@ pub const OwnedTensor = struct {
     gaffine: ?GroupedAffineMeta = null,
     fp8: ?Fp8Meta = null,
     mxfp8: ?Mxfp8Meta = null,
+    nvfp4: ?Nvfp4Meta = null,
 
     pub fn init(allocator: std.mem.Allocator, dtype: DType, shape: []const usize) !OwnedTensor {
         var fixed_shape: [4]usize = .{0} ** 4;
@@ -544,6 +552,8 @@ pub const OwnedTensor = struct {
         tensor.owns_data = false;
         tensor.gaffine = self.gaffine;
         tensor.fp8 = self.fp8;
+        tensor.mxfp8 = self.mxfp8;
+        tensor.nvfp4 = self.nvfp4;
         tensor.n_dims = @intCast(self.n_dims);
         tensor.data_size = self.data_size;
 

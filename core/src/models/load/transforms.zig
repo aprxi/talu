@@ -13,6 +13,7 @@ const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const DType = dtype.DType;
 const GroupedAffineMeta = dtype.GroupedAffineMeta;
+const Nvfp4Meta = dtype.Nvfp4Meta;
 
 /// Loader-side safety bound for grouped-affine metadata.
 /// Shared contract constant also asserted by CPU inference backend.
@@ -321,6 +322,17 @@ pub fn buildGatedDeltaSplitInProj(
         }
         // Recurse with all-BF16 tensors
         return buildGatedDeltaSplitInProj(allocator, qkv_bf16, z_bf16, b_bf16, a_bf16);
+    }
+
+    const has_nvfp4 = in_proj_qkv.nvfp4 != null or in_proj_z.nvfp4 != null or
+        in_proj_b.nvfp4 != null or (if (in_proj_a) |a| a.nvfp4 != null else false);
+    if (has_nvfp4) {
+        if (in_proj_qkv.nvfp4 == null or in_proj_z.nvfp4 == null or in_proj_b.nvfp4 == null)
+            return error.MissingScales;
+        if (in_proj_a) |a| {
+            if (a.nvfp4 == null) return error.MissingScales;
+        }
+        return buildGatedDeltaSplitInProjNvfp4(allocator, in_proj_qkv, in_proj_z, in_proj_b, in_proj_a);
     }
 
     if (in_proj_z.dtype != in_proj_qkv.dtype or in_proj_z.dtype != in_proj_b.dtype) return error.InvalidDType;
@@ -710,9 +722,272 @@ fn buildGatedDeltaSplitInProjMxfp8(
     return result;
 }
 
+/// Fuse split gated-delta projections for NVFP4 packed tensors.
+///
+/// Concatenates along output rows and preserves packed FP4 + FP8-scale metadata
+/// so CUDA can execute the native NVFP4 kernels without load-time dequantization.
+fn buildGatedDeltaSplitInProjNvfp4(
+    allocator: std.mem.Allocator,
+    in_proj_qkv: *const Tensor,
+    in_proj_z: *const Tensor,
+    in_proj_b: *const Tensor,
+    in_proj_a: ?*const Tensor,
+) !*const Tensor {
+    const qkv_meta = in_proj_qkv.nvfp4 orelse return error.MissingScales;
+    const z_meta = in_proj_z.nvfp4 orelse return error.MissingScales;
+    const b_meta = in_proj_b.nvfp4 orelse return error.MissingScales;
+
+    if (qkv_meta.packed_cols != z_meta.packed_cols or qkv_meta.packed_cols != b_meta.packed_cols)
+        return error.InvalidShape;
+    if (qkv_meta.scale_cols != z_meta.scale_cols or qkv_meta.scale_cols != b_meta.scale_cols)
+        return error.InvalidShape;
+    if (qkv_meta.group_size != z_meta.group_size or qkv_meta.group_size != b_meta.group_size)
+        return error.InvalidShape;
+    if (!std.math.isFinite(qkv_meta.weight_global_scale) or qkv_meta.weight_global_scale == 0.0)
+        return error.InvalidShape;
+
+    var a_meta: ?Nvfp4Meta = null;
+    if (in_proj_a) |a| {
+        a_meta = a.nvfp4 orelse return error.MissingScales;
+        if (a_meta.?.packed_cols != qkv_meta.packed_cols or
+            a_meta.?.scale_cols != qkv_meta.scale_cols or
+            a_meta.?.group_size != qkv_meta.group_size)
+        {
+            return error.InvalidShape;
+        }
+        if (!std.math.isFinite(a_meta.?.weight_global_scale) or a_meta.?.weight_global_scale == 0.0)
+            return error.InvalidShape;
+    }
+
+    const qkv_rows: usize = @intCast(in_proj_qkv.shape[0]);
+    const z_rows: usize = @intCast(in_proj_z.shape[0]);
+    const b_rows: usize = @intCast(in_proj_b.shape[0]);
+    const a_rows: usize = if (in_proj_a) |a| @intCast(a.shape[0]) else 0;
+    const total_rows = qkv_rows + z_rows + b_rows + a_rows;
+    const cols: usize = @intCast(in_proj_qkv.shape[1]);
+    const packed_cols: usize = @intCast(qkv_meta.packed_cols);
+
+    if (qkv_meta.rows != qkv_rows or z_meta.rows != z_rows or b_meta.rows != b_rows)
+        return error.InvalidShape;
+    if (qkv_meta.cols != cols or z_meta.cols != cols or b_meta.cols != cols)
+        return error.InvalidShape;
+    if (qkv_meta.packed_cols != @as(u32, @intCast((cols + 1) / 2)))
+        return error.InvalidShape;
+    if (a_meta) |meta| {
+        if (meta.rows != a_rows or meta.cols != cols) return error.InvalidShape;
+    }
+
+    const total_packed_bytes = total_rows * packed_cols;
+    const fused_data = try allocator.alloc(u8, total_packed_bytes);
+    var dst_off: usize = 0;
+    inline for (.{ in_proj_qkv, in_proj_z, in_proj_b }) |src| {
+        const rows: usize = @intCast(src.shape[0]);
+        const src_len = rows * packed_cols;
+        if (src.data_size < src_len) return error.InvalidShape;
+        @memcpy(fused_data[dst_off .. dst_off + src_len], src.data()[0..src_len]);
+        dst_off += src_len;
+    }
+    if (in_proj_a) |a| {
+        const src_len = a_rows * packed_cols;
+        if (a.data_size < src_len) return error.InvalidShape;
+        @memcpy(fused_data[dst_off .. dst_off + src_len], a.data()[0..src_len]);
+    }
+
+    const scale_cols: usize = @intCast(qkv_meta.scale_cols);
+    const total_scale_bytes = total_rows * scale_cols;
+    const fused_scales = try allocator.alloc(u8, total_scale_bytes);
+    var scale_off: usize = 0;
+
+    inline for (.{ qkv_meta, z_meta, b_meta }) |meta| {
+        const src = meta.block_scales_data orelse return error.MissingScales;
+        const src_len = @as(usize, @intCast(meta.rows)) * @as(usize, @intCast(meta.scale_cols));
+        if (meta.block_scales_len < src_len) return error.InvalidShape;
+        const scale_factor = qkv_meta.weight_global_scale / meta.weight_global_scale;
+        if (scale_factor == 1.0) {
+            @memcpy(fused_scales[scale_off .. scale_off + src_len], src[0..src_len]);
+        } else {
+            var idx: usize = 0;
+            while (idx < src_len) : (idx += 1) {
+                const scale_f32 = dtype.fp8e4m3ToF32(src[idx]);
+                fused_scales[scale_off + idx] = dtype.f32ToFp8E4M3(scale_f32 * scale_factor);
+            }
+        }
+        scale_off += src_len;
+    }
+    if (a_meta) |meta| {
+        const src = meta.block_scales_data orelse return error.MissingScales;
+        const src_len = @as(usize, @intCast(meta.rows)) * @as(usize, @intCast(meta.scale_cols));
+        if (meta.block_scales_len < src_len) return error.InvalidShape;
+        const scale_factor = qkv_meta.weight_global_scale / meta.weight_global_scale;
+        if (scale_factor == 1.0) {
+            @memcpy(fused_scales[scale_off .. scale_off + src_len], src[0..src_len]);
+        } else {
+            var idx: usize = 0;
+            while (idx < src_len) : (idx += 1) {
+                const scale_f32 = dtype.fp8e4m3ToF32(src[idx]);
+                fused_scales[scale_off + idx] = dtype.f32ToFp8E4M3(scale_f32 * scale_factor);
+            }
+        }
+    }
+
+    const result = try allocator.create(Tensor);
+    result.* = Tensor.view(fused_data.ptr, &.{ total_rows, cols }, in_proj_qkv.dtype, total_packed_bytes);
+    result.nvfp4 = .{
+        .block_scales_data = fused_scales.ptr,
+        .block_scales_len = total_scale_bytes,
+        .rows = @intCast(total_rows),
+        .cols = @intCast(cols),
+        .packed_cols = qkv_meta.packed_cols,
+        .scale_cols = qkv_meta.scale_cols,
+        .group_size = qkv_meta.group_size,
+        .weight_global_scale = qkv_meta.weight_global_scale,
+    };
+    return result;
+}
+
 inline fn ue8m0ToScale(e8m0: u8) f32 {
     const exp_bits = @as(u32, e8m0) << 23;
     return @bitCast(exp_bits);
+}
+
+inline fn fp4E2m1NibbleToF32(nibble: u8) f32 {
+    const magnitude = switch (nibble & 0x07) {
+        0 => @as(f32, 0.0),
+        1 => @as(f32, 0.5),
+        2 => @as(f32, 1.0),
+        3 => @as(f32, 1.5),
+        4 => @as(f32, 2.0),
+        5 => @as(f32, 3.0),
+        6 => @as(f32, 4.0),
+        7 => @as(f32, 6.0),
+        else => unreachable,
+    };
+    if ((nibble & 0x08) != 0) return -magnitude;
+    return magnitude;
+}
+
+fn readTensorScalarF32(t: Tensor) !f32 {
+    var element_count: usize = 1;
+    var dim_idx: usize = 0;
+    while (dim_idx < @as(usize, @intCast(t.n_dims))) : (dim_idx += 1) {
+        const dim: usize = @intCast(t.shape[dim_idx]);
+        if (dim == 0) return error.InvalidShape;
+        element_count = std.math.mul(usize, element_count, dim) catch return error.InvalidShape;
+    }
+    if (element_count != 1) return error.InvalidShape;
+
+    const bytes = t.data();
+    return switch (t.dtype) {
+        .f32 => blk: {
+            if (bytes.len < @sizeOf(u32)) return error.InvalidShape;
+            var raw: u32 = 0;
+            @memcpy(std.mem.asBytes(&raw), bytes[0..@sizeOf(u32)]);
+            break :blk @bitCast(raw);
+        },
+        .f16 => blk: {
+            if (bytes.len < @sizeOf(u16)) return error.InvalidShape;
+            var raw: u16 = 0;
+            @memcpy(std.mem.asBytes(&raw), bytes[0..@sizeOf(u16)]);
+            break :blk dtype.fp16ToF32(raw);
+        },
+        .bf16 => blk: {
+            if (bytes.len < @sizeOf(u16)) return error.InvalidShape;
+            var raw: u16 = 0;
+            @memcpy(std.mem.asBytes(&raw), bytes[0..@sizeOf(u16)]);
+            break :blk dtype.bf16ToF32(raw);
+        },
+        else => error.InvalidShape,
+    };
+}
+
+const Nvfp4DecodedMeta = struct {
+    rows: usize,
+    packed_cols: usize,
+    unpacked_cols: usize,
+    scale_cols: usize,
+    group_size: usize,
+    global_scale: f32,
+    scale_bytes: []const u8,
+};
+
+fn resolveNvfp4DecodedMeta(
+    st: *st_loader.UnifiedSafeTensors,
+    name: []const u8,
+    packed_tensor: Tensor,
+) !Nvfp4DecodedMeta {
+    if (!std.mem.endsWith(u8, name, ".weight_packed")) return error.InvalidShape;
+    if (packed_tensor.n_dims != 2) return error.InvalidShape;
+
+    const base = name[0 .. name.len - ".weight_packed".len];
+    const rows: usize = @intCast(packed_tensor.shape[0]);
+    const packed_cols: usize = @intCast(packed_tensor.shape[1]);
+    if (rows == 0 or packed_cols == 0) return error.InvalidShape;
+
+    var scale_name_buf: [320]u8 = undefined;
+    const scale_name = std.fmt.bufPrint(&scale_name_buf, "{s}.weight_scale", .{base}) catch return error.InvalidShape;
+    const scale_tensor = st.getTensor(scale_name, null) catch return error.MissingScales;
+    if (scale_tensor.dtype != .f8_e4m3) return error.InvalidShape;
+    if (scale_tensor.n_dims != 2) return error.InvalidShape;
+    const scale_rows: usize = @intCast(scale_tensor.shape[0]);
+    const scale_cols: usize = @intCast(scale_tensor.shape[1]);
+    if (scale_rows != rows or scale_cols == 0) return error.InvalidShape;
+
+    const unpacked_cols = std.math.mul(usize, packed_cols, 2) catch return error.InvalidShape;
+    if (unpacked_cols % scale_cols != 0) return error.InvalidShape;
+    const group_size = unpacked_cols / scale_cols;
+    if (group_size == 0) return error.InvalidShape;
+
+    const scale_bytes = scale_tensor.data();
+    const scale_required = std.math.mul(usize, scale_rows, scale_cols) catch return error.InvalidShape;
+    if (scale_bytes.len < scale_required) return error.InvalidShape;
+
+    var global_scale: f32 = 1.0;
+    var global_scale_name_buf: [320]u8 = undefined;
+    const global_scale_name = std.fmt.bufPrint(&global_scale_name_buf, "{s}.weight_global_scale", .{base}) catch return error.InvalidShape;
+    if (st.getTensor(global_scale_name, null)) |global_scale_tensor| {
+        global_scale = try readTensorScalarF32(global_scale_tensor);
+        if (!std.math.isFinite(global_scale) or global_scale == 0.0) return error.InvalidShape;
+    } else |_| {}
+
+    return .{
+        .rows = rows,
+        .packed_cols = packed_cols,
+        .unpacked_cols = unpacked_cols,
+        .scale_cols = scale_cols,
+        .group_size = group_size,
+        .global_scale = global_scale,
+        .scale_bytes = scale_bytes[0..scale_required],
+    };
+}
+
+fn dequantizeNvfp4WeightToBf16(
+    allocator: std.mem.Allocator,
+    st: *st_loader.UnifiedSafeTensors,
+    name: []const u8,
+    packed_tensor: Tensor,
+) !Tensor {
+    const meta = try resolveNvfp4DecodedMeta(st, name, packed_tensor);
+
+    const packed_bytes = packed_tensor.data();
+    const packed_required = std.math.mul(usize, meta.rows, meta.packed_cols) catch return error.InvalidShape;
+    if (packed_bytes.len < packed_required) return error.InvalidShape;
+
+    const owned = try tensor.OwnedTensor.init(allocator, .bf16, &.{ meta.rows, meta.unpacked_cols });
+    const dst_u16 = owned.asSlice(u16);
+
+    for (0..meta.rows) |row_idx| {
+        const packed_row = packed_bytes[row_idx * meta.packed_cols ..][0..meta.packed_cols];
+        const scale_row = meta.scale_bytes[row_idx * meta.scale_cols ..][0..meta.scale_cols];
+        for (0..meta.unpacked_cols) |col_idx| {
+            const packed_byte = packed_row[col_idx / 2];
+            const fp4_nibble: u8 = if ((col_idx & 1) == 0) packed_byte & 0x0F else (packed_byte >> 4) & 0x0F;
+            const local_scale = dtype.fp8e4m3ToF32(scale_row[col_idx / meta.group_size]);
+            const value_f32 = fp4E2m1NibbleToF32(fp4_nibble) * (local_scale / meta.global_scale);
+            dst_u16[row_idx * meta.unpacked_cols + col_idx] = dtype.f32ToBf16(value_f32);
+        }
+    }
+
+    return owned.view();
 }
 
 fn dequantizeMxfp8WeightToBf16(
@@ -765,6 +1040,7 @@ pub fn orientWeight(
     expected_in: usize,
     config: ModelConfig,
     dequantize_mxfp8_to_bf16: bool,
+    dequantize_nvfp4_to_bf16: bool,
 ) !Tensor {
     var weight_tensor = try st.getTensor(name, null);
     log.debug("load", "Orient weight", .{
@@ -791,6 +1067,42 @@ pub fn orientWeight(
             return error.MissingScales;
         };
     }
+
+    // Handle NVFP4 packed weights (AutoRound compressed-tensors):
+    // ".weight_packed" U8 (parsed as i8 by safetensors reader) +
+    // ".weight_scale" F8_E4M3 + optional ".weight_global_scale" F32.
+    // Keep packed payload for native CUDA kernels when requested, otherwise
+    // dequantize once at load time for backends without native NVFP4 execution.
+    if ((weight_tensor.dtype == .u8 or weight_tensor.dtype == .i8) and std.mem.endsWith(u8, name, ".weight_packed")) {
+        if (dequantize_nvfp4_to_bf16) {
+            const dequantized = try dequantizeNvfp4WeightToBf16(allocator, st, name, weight_tensor);
+            const dequant_rows: usize = @intCast(dequantized.shape[0]);
+            const dequant_cols: usize = @intCast(dequantized.shape[1]);
+            const orient_expected_in = if (dequant_rows != expected_in and dequant_cols != expected_in)
+                dequant_cols
+            else
+                expected_in;
+            return orientWeightTyped(allocator, dequantized, orient_expected_in);
+        }
+
+        const nvfp4 = try resolveNvfp4DecodedMeta(st, name, weight_tensor);
+        weight_tensor.nvfp4 = Nvfp4Meta{
+            .block_scales_data = nvfp4.scale_bytes.ptr,
+            .block_scales_len = nvfp4.scale_bytes.len,
+            .rows = @intCast(nvfp4.rows),
+            .cols = @intCast(nvfp4.unpacked_cols),
+            .packed_cols = @intCast(nvfp4.packed_cols),
+            .scale_cols = @intCast(nvfp4.scale_cols),
+            .group_size = @intCast(nvfp4.group_size),
+            .weight_global_scale = nvfp4.global_scale,
+        };
+        // Keep packed bytes in data_ptr/data_size but expose logical unpacked
+        // shape for validation/orchestration consistency.
+        weight_tensor.shape[0] = @intCast(nvfp4.rows);
+        weight_tensor.shape[1] = @intCast(nvfp4.unpacked_cols);
+        return weight_tensor;
+    }
+
     // Handle MXFP8 E4M3 weights — E4M3 data + UE8M0 block-32 scales for cuBLASLt tensor core GEMM.
     // Accept both scale suffixes used in the wild:
     // - ".weight_block_scale" (Talu/HF MXFP8 export)
@@ -1891,7 +2203,7 @@ test "orientWeight transposes f32 weight when needed" {
 
     // expected_in=2 matches cols, so it should transpose to [2, 3]
     const config = std.mem.zeroes(ModelConfig);
-    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", 2, config, false);
+    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", 2, config, false, true);
 
     try std.testing.expectEqual(@as(u8, 2), result.n_dims);
     try std.testing.expectEqual(@as(i64, 2), result.shape[0]); // in dimension first
@@ -1933,7 +2245,7 @@ test "orientWeight returns untransposed when rows equals expected_in" {
 
     // expected_in=2 matches rows, so no transpose needed
     const config = std.mem.zeroes(ModelConfig);
-    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", 2, config, false);
+    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", 2, config, false, true);
 
     try std.testing.expectEqual(@as(u8, 2), result.n_dims);
     try std.testing.expectEqual(@as(i64, 2), result.shape[0]);
@@ -1972,7 +2284,7 @@ test "orientWeight detects MXFP8 scales from AutoRound weight_scale suffix" {
     defer arena_alloc.deinit();
 
     const config = std.mem.zeroes(ModelConfig);
-    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", cols, config, false);
+    const result = try orientWeight(arena_alloc.allocator(), &st, "weight", cols, config, false, true);
 
     try std.testing.expectEqual(DType.f8_e4m3, result.dtype);
     try std.testing.expect(result.mxfp8 != null);
@@ -1982,6 +2294,72 @@ test "orientWeight detects MXFP8 scales from AutoRound weight_scale suffix" {
     try std.testing.expectEqual(@as(u32, @intCast(rows)), meta.rows);
     try std.testing.expectEqual(@as(u32, @intCast(cols)), meta.cols);
     try std.testing.expectEqual(@as(u32, 1), meta.scale_cols);
+}
+
+test "orientWeight dequantizes NVFP4 packed weights to BF16" {
+    const allocator = std.testing.allocator;
+    const writer = @import("../../io/safetensors/writer.zig");
+
+    const tmp_dir_path = "/tmp/test_orient_weight_nvfp4";
+    std.fs.cwd().makeDir(tmp_dir_path) catch {};
+    defer std.fs.cwd().deleteTree(tmp_dir_path) catch {};
+
+    // Two rows, four unpacked cols, group_size=2 (scale_cols=2).
+    // Packed bytes decode to:
+    // row0 -> [1.0, -0.5, 2.0, -3.0]
+    // row1 -> [0.0, 6.0, -1.5, 4.0]
+    const packed_bytes = [_]u8{
+        0x92, 0xD4,
+        0x70, 0x6B,
+    };
+    // FP8 E4M3 scales:
+    // row0 group0=1.0 (0x38), group1=2.0 (0x40)
+    // row1 group0=1.0 (0x38), group1=1.0 (0x38)
+    const scales = [_]u8{
+        0x38, 0x40,
+        0x38, 0x38,
+    };
+    const global_scale = [_]f32{2.0};
+
+    const entries = [_]writer.TensorEntry{
+        .{ .name = "weight_packed", .dtype = .u8, .shape = &[_]usize{ 2, 2 }, .data = packed_bytes[0..] },
+        .{ .name = "weight_scale", .dtype = .f8_e4m3, .shape = &[_]usize{ 2, 2 }, .data = scales[0..] },
+        .{ .name = "weight_global_scale", .dtype = .f32, .shape = &[_]usize{1}, .data = std.mem.sliceAsBytes(&global_scale) },
+    };
+    const model_path = tmp_dir_path ++ "/model.safetensors";
+    try writer.write(allocator, model_path, &entries);
+
+    var st = try st_loader.UnifiedSafeTensors.load(allocator, model_path);
+    defer st.deinit();
+
+    var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+    defer arena_alloc.deinit();
+
+    const config = std.mem.zeroes(ModelConfig);
+    const result = try orientWeight(arena_alloc.allocator(), &st, "weight_packed", 4, config, false, true);
+
+    try std.testing.expectEqual(DType.bf16, result.dtype);
+    try std.testing.expectEqual(@as(i64, 2), result.shape[0]);
+    try std.testing.expectEqual(@as(i64, 4), result.shape[1]);
+
+    const out = result.asSlice(u16);
+    const out0 = dtype.bf16ToF32(out[0]);
+    const out1 = dtype.bf16ToF32(out[1]);
+    const out2 = dtype.bf16ToF32(out[2]);
+    const out3 = dtype.bf16ToF32(out[3]);
+    const out4 = dtype.bf16ToF32(out[4]);
+    const out5 = dtype.bf16ToF32(out[5]);
+    const out6 = dtype.bf16ToF32(out[6]);
+    const out7 = dtype.bf16ToF32(out[7]);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out0, 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.25), out1, 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), out2, 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, -3.0), out3, 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out4, 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), out5, 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.75), out6, 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), out7, 0.06);
 }
 
 test "orientEmbedding keeps f16 embedding dtype" {
