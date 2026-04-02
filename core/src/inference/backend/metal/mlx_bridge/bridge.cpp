@@ -642,7 +642,35 @@ std::string detect_text_prefix(const std::unordered_map<std::string, array>& ten
     if (has_tensor(tensors, "model.embed_tokens.weight")) {
         return "model.";
     }
-    throw std::runtime_error("missing embed_tokens.weight for known text prefixes");
+
+    // Fallback for converted checkpoints that wrap text tensors under repeated
+    // namespaces (for example model.language_model.language_model.*).
+    const std::string embed_suffix = "embed_tokens.weight";
+    std::string best_prefix;
+    size_t embed_candidate_count = 0;
+    std::string first_embed_key;
+    for (const auto& kv : tensors) {
+        const std::string& key = kv.first;
+        if (!ends_with(key, embed_suffix)) continue;
+        embed_candidate_count += 1;
+        if (first_embed_key.empty()) first_embed_key = key;
+        const std::string prefix = key.substr(0, key.size() - embed_suffix.size());
+        if (prefix.empty()) continue;
+        if (!has_tensor(tensors, prefix + "layers.0.input_layernorm.weight")) continue;
+        if (prefix.size() > best_prefix.size()) {
+            best_prefix = prefix;
+        }
+    }
+    if (!best_prefix.empty()) {
+        return best_prefix;
+    }
+
+    throw std::runtime_error(
+        "missing embed_tokens.weight for known text prefixes"
+        " (embed_candidates=" + std::to_string(embed_candidate_count) +
+        (first_embed_key.empty() ? "" : ", first_embed_key=" + first_embed_key) +
+        ")"
+    );
 }
 
 array to_rhs(const array& weight_2d, const std::string& name) {
@@ -685,9 +713,13 @@ array maybe_dequantize_fp8_weight(
     const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
     const std::string scale_inv_key = base + ".weight_scale_inv";
     const std::string block_scale_key = base + ".weight_block_scale";
+    const std::string weight_scale_key = base + ".weight_scale";
 
     auto scale_inv_it = tensors.find(scale_inv_key);
     auto block_scale_it = tensors.find(block_scale_key);
+    if (block_scale_it == tensors.end()) {
+        block_scale_it = tensors.find(weight_scale_key);
+    }
     if (scale_inv_it == tensors.end() && block_scale_it == tensors.end()) {
         return weight_2d;
     }
@@ -713,20 +745,24 @@ array maybe_dequantize_fp8_weight(
             );
         }
 
-        const array block_scales_u8 = astype(block_scales, uint8);
-        const int flat_size = static_cast<int>(block_scales_u8.size());
-        const array flat_u8 = reshape(block_scales_u8, {flat_size});
-        eval(flat_u8);
+        if (block_scales.dtype() == uint8 || block_scales.dtype() == int8) {
+            const array block_scales_u8 = astype(block_scales, uint8);
+            const int flat_size = static_cast<int>(block_scales_u8.size());
+            const array flat_u8 = reshape(block_scales_u8, {flat_size});
+            eval(flat_u8);
 
-        const uint8_t* scale_bytes = flat_u8.data<uint8_t>();
-        std::vector<float> decoded(static_cast<size_t>(flat_size));
-        for (int idx = 0; idx < flat_size; ++idx) {
-            const uint32_t exp_bits = static_cast<uint32_t>(scale_bytes[idx]) << 23;
-            float scale = 0.0f;
-            std::memcpy(&scale, &exp_bits, sizeof(float));
-            decoded[static_cast<size_t>(idx)] = scale;
+            const uint8_t* scale_bytes = flat_u8.data<uint8_t>();
+            std::vector<float> decoded(static_cast<size_t>(flat_size));
+            for (int idx = 0; idx < flat_size; ++idx) {
+                const uint32_t exp_bits = static_cast<uint32_t>(scale_bytes[idx]) << 23;
+                float scale = 0.0f;
+                std::memcpy(&scale, &exp_bits, sizeof(float));
+                decoded[static_cast<size_t>(idx)] = scale;
+            }
+            scales_f32 = array(decoded.begin(), Shape{block_scales.shape(0), block_scales.shape(1)}, float32);
+        } else {
+            scales_f32 = astype(block_scales, float32);
         }
-        scales_f32 = array(decoded.begin(), Shape{block_scales.shape(0), block_scales.shape(1)}, float32);
     } else {
         const array& scale_inv = scale_inv_it->second;
         if (scale_inv.ndim() != 2) {
@@ -736,8 +772,13 @@ array maybe_dequantize_fp8_weight(
     }
 
     const array expanded_scales = expand_block_scales(scales_f32, rows, cols, weight_key);
-    const array fp8_as_f32 = from_fp8(weight_2d, float32);
-    const array dequant_f32 = fp8_as_f32 * expanded_scales;
+    array weight_as_f32 = array(0.0f);
+    if (weight_2d.dtype() == uint8) {
+        weight_as_f32 = from_fp8(weight_2d, float32);
+    } else {
+        weight_as_f32 = astype(weight_2d, float32);
+    }
+    const array dequant_f32 = weight_as_f32 * expanded_scales;
     array dequant_bf16 = astype(dequant_f32, bfloat16);
     dequant_bf16 = stop_gradient(copy(dequant_bf16));
     // Optional eager materialization for debugging/benchmark parity. Disabled
@@ -777,8 +818,12 @@ void maybe_quantize_mxfp8_matrix(
     if (ends_with(weight_key, ".weight")) {
         const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
         const std::string block_scale_key = base + ".weight_block_scale";
+        const std::string weight_scale_key = base + ".weight_scale";
         auto raw_it = tensors.find(weight_key);
         auto scales_it = tensors.find(block_scale_key);
+        if (scales_it == tensors.end()) {
+            scales_it = tensors.find(weight_scale_key);
+        }
         if (raw_it != tensors.end() && scales_it != tensors.end()) {
             const array& raw_weight = raw_it->second;
             const array& raw_scales = scales_it->second;
@@ -801,12 +846,34 @@ void maybe_quantize_mxfp8_matrix(
         }
     }
 
-    const std::vector<array> q = quantize(
-        lhs_weight,
-        std::nullopt,
-        std::nullopt,
-        "mxfp8"
-    );
+    array quant_input = lhs_weight;
+    const Dtype dt = quant_input.dtype();
+    const bool is_float_input = (dt == float16 || dt == bfloat16 || dt == float32 || dt == float64);
+    if (!is_float_input && ends_with(weight_key, ".weight")) {
+        // Some converted checkpoints keep FP8 payload tensors as uint8 and
+        // expose scales via metadata. Dequantize first when needed so MLX
+        // quantize() receives a real floating tensor.
+        quant_input = maybe_dequantize_fp8_weight(tensors, weight_key, quant_input);
+    }
+    const Dtype qdt = quant_input.dtype();
+    const bool quant_input_is_float = (qdt == float16 || qdt == bfloat16 || qdt == float32 || qdt == float64);
+    if (!quant_input_is_float) {
+        *out_has_q = false;
+        return;
+    }
+
+    std::vector<array> q;
+    try {
+        q = quantize(
+            quant_input,
+            std::nullopt,
+            std::nullopt,
+            "mxfp8"
+        );
+    } catch (const std::exception&) {
+        *out_has_q = false;
+        return;
+    }
     if (q.size() != 2) {
         throw std::runtime_error("mlx quantize(mxfp8) returned unexpected output count");
     }
@@ -1204,7 +1271,9 @@ bool token_is_eos(int32_t token, const int32_t* eos_ids, int32_t eos_len) {
 
 bool has_fp8_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
     for (const auto& kv : tensors) {
-        if (ends_with(kv.first, ".weight_scale_inv") || ends_with(kv.first, ".weight_block_scale")) {
+        if (ends_with(kv.first, ".weight_scale_inv") ||
+            ends_with(kv.first, ".weight_block_scale") ||
+            ends_with(kv.first, ".weight_scale")) {
             return true;
         }
     }
