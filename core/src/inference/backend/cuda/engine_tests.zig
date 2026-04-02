@@ -27,6 +27,7 @@ const LinearWeight = engine_types.LinearWeight;
 const U16LinearWeight = engine_types.U16LinearWeight;
 const GaffineU4LinearWeight = engine_types.GaffineU4LinearWeight;
 const GaffineU8LinearWeight = engine_types.GaffineU8LinearWeight;
+const Nvfp4LinearWeight = engine_types.Nvfp4LinearWeight;
 const LayerAttentionRuntime = engine_types.LayerAttentionRuntime;
 const LayerAttentionExecConfig = engine_types.LayerAttentionExecConfig;
 const ShortConvBlockRuntime = engine_types.ShortConvBlockRuntime;
@@ -4771,4 +4772,17 @@ test "computeInitLayerRange: cpu_gpu_gpu split points cover full model" {
     const gpu0_layers = r.split_layer_stage2 - r.split_layer;
     const gpu1_layers = r.end - r.start;
     try std.testing.expectEqual(total, cpu_layers + gpu0_layers + gpu1_layers);
+}
+
+test "Nvfp4LinearWeight.cublasLtScaleTensorSize computes padded VEC16 layout bytes" {
+    // 16-scale columns become ceil(inner/16), then rounded to multiples of 4.
+    // Outer dimension is rounded to 128.
+    try std.testing.expectEqual(@as(usize, 128 * 160), Nvfp4LinearWeight.cublasLtScaleTensorSize(2560, 8));
+    try std.testing.expectEqual(@as(usize, 128 * 4), Nvfp4LinearWeight.cublasLtScaleTensorSize(48, 1));
+}
+
+test "Nvfp4LinearWeight.roundoff rounds up to granularity" {
+    try std.testing.expectEqual(@as(usize, 128), Nvfp4LinearWeight.roundoff(1, 128));
+    try std.testing.expectEqual(@as(usize, 128), Nvfp4LinearWeight.roundoff(128, 128));
+    try std.testing.expectEqual(@as(usize, 256), Nvfp4LinearWeight.roundoff(129, 128));
 }

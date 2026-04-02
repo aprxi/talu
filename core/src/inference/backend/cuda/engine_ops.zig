@@ -1093,10 +1093,44 @@ pub fn linearForwardRows(
             return error.CudaKernelUnavailable;
         },
         .nvfp4 => |w| {
-            var nvfp4_fn = self.nvfp4_matvec_function orelse {
+            // Keep NVFP4 on the native weight-only kernels for correctness.
+            // The cuBLASLt NVFP4 route quantizes activations to FP4, which
+            // materially degrades quality for current weight-only NVFP4 models.
+
+            const base_nvfp4_fn = self.nvfp4_matvec_function orelse {
                 log.warn("inference", "CUDA NVFP4 matvec kernel unavailable", .{});
                 return error.CudaKernelUnavailable;
             };
+            const out_cols: u32 = @intCast(w.cols);
+
+            // Fail closed when the startup parity probe found multi-row mismatches:
+            // execute one row at a time on the known-good single-row kernel.
+            if (rows > 1 and !self.nvfp4_sequence_rows_supported) {
+                var row_index: usize = 0;
+                while (row_index < rows) : (row_index += 1) {
+                    var input_row = try logicalF32RowSlice(&packed_input, rows, row_index, w.rows);
+                    var out_row = try logicalF32RowSlice(&packed_out, rows, row_index, w.cols);
+                    self.kernel_arg_pack.reset();
+                    self.kernel_arg_pack.appendBufferPtr(&input_row) catch return error.CudaKernelUnavailable;
+                    self.kernel_arg_pack.appendBufferPtr(&w.buffer) catch return error.CudaKernelUnavailable;
+                    self.kernel_arg_pack.appendBufferPtr(&w.scales_buffer) catch return error.CudaKernelUnavailable;
+                    self.kernel_arg_pack.appendBufferPtr(&out_row) catch return error.CudaKernelUnavailable;
+                    self.kernel_arg_pack.appendScalar(u32, @intCast(w.rows)) catch return error.CudaKernelUnavailable;
+                    self.kernel_arg_pack.appendScalar(u32, out_cols) catch return error.CudaKernelUnavailable;
+                    self.kernel_arg_pack.appendScalar(u32, w.scale_cols) catch return error.CudaKernelUnavailable;
+                    self.kernel_arg_pack.appendScalar(u32, w.group_size) catch return error.CudaKernelUnavailable;
+                    self.kernel_arg_pack.appendScalar(f32, w.weight_global_scale) catch return error.CudaKernelUnavailable;
+                    self.kernel_arg_pack.appendScalar(u32, 1) catch return error.CudaKernelUnavailable;
+                    try compute.cuda.launch.launchWithFamily(&self.device, base_nvfp4_fn, .{
+                        .grid_x = (out_cols + 3) / 4,
+                        .grid_y = 1,
+                        .block_x = 128,
+                    }, &self.kernel_arg_pack, .matvec);
+                }
+                return;
+            }
+
+            var nvfp4_fn = base_nvfp4_fn;
             var nvfp4_batch_tile: u32 = 4;
             if (rows > 4) {
                 if (self.nvfp4_matvec_tile8_function) |tile8_fn| {
@@ -1105,7 +1139,6 @@ pub fn linearForwardRows(
                 }
             }
 
-            const out_cols: u32 = @intCast(w.cols);
             const batch_rows: u32 = @intCast(rows);
             self.kernel_arg_pack.reset();
             self.kernel_arg_pack.appendBufferPtr(&packed_input) catch return error.CudaKernelUnavailable;
@@ -1617,6 +1650,7 @@ pub fn tryFusedQkvForward(
     if (try tryFusedDenseU16QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
     if (try tryFusedGaffineU4QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
     if (try tryFusedI8QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
+    if (try tryFusedNvfp4QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest)) return true;
     return tryFusedGaffineU8QkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest);
 }
 
@@ -1833,6 +1867,84 @@ pub fn tryFusedGaffineU8QkvForward(
         @intCast(q.rows),
         batch_rows,
     );
+    return true;
+}
+
+pub fn tryFusedNvfp4QkvForward(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    q_proj: *const LinearWeight,
+    k_proj: *const LinearWeight,
+    v_proj: *const LinearWeight,
+    rows: usize,
+    q_out_dest: *compute.cuda.Buffer,
+) !bool {
+    if (rows == 0 or rows > 32) return false;
+    if (rows > 1 and !self.nvfp4_sequence_fused_qkv_supported) return false;
+    const q = switch (q_proj.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    const k = switch (k_proj.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    const v = switch (v_proj.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    if (q.rows != k.rows or q.rows != v.rows) return false;
+    if (q.rows != self.d_model) return false;
+    if (q.weight_global_scale == 0.0 or k.weight_global_scale == 0.0 or v.weight_global_scale == 0.0) return false;
+
+    var fused_fn = self.nvfp4_matvec_qkv_function orelse return false;
+    var nvfp4_batch_tile: u32 = 4;
+    if (rows > 4) {
+        if (self.nvfp4_matvec_qkv_tile8_function) |tile8_fn| {
+            fused_fn = tile8_fn;
+            nvfp4_batch_tile = 8;
+        }
+    }
+
+    const q_out_dim: u32 = @intCast(q.cols);
+    const k_out_dim: u32 = @intCast(k.cols);
+    const v_out_dim: u32 = @intCast(v.cols);
+    const in_dim: u32 = @intCast(q.rows);
+    const batch_rows: u32 = @intCast(rows);
+    const qk_dim = std.math.add(u32, q_out_dim, k_out_dim) catch return false;
+    const total_out = std.math.add(u32, qk_dim, v_out_dim) catch return false;
+
+    self.kernel_arg_pack.reset();
+    try self.kernel_arg_pack.appendBufferPtr(input);
+    try self.kernel_arg_pack.appendBufferPtr(&q.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&q.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(q_out_dest);
+    try self.kernel_arg_pack.appendScalar(u32, q_out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, q.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, q.group_size);
+    try self.kernel_arg_pack.appendScalar(f32, q.weight_global_scale);
+    try self.kernel_arg_pack.appendBufferPtr(&k.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&k.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.attn_k_dev);
+    try self.kernel_arg_pack.appendScalar(u32, k_out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, k.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, k.group_size);
+    try self.kernel_arg_pack.appendScalar(f32, k.weight_global_scale);
+    try self.kernel_arg_pack.appendBufferPtr(&v.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&v.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.attn_v_dev);
+    try self.kernel_arg_pack.appendScalar(u32, v_out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, v.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, v.group_size);
+    try self.kernel_arg_pack.appendScalar(f32, v.weight_global_scale);
+    try self.kernel_arg_pack.appendScalar(u32, in_dim);
+    try self.kernel_arg_pack.appendScalar(u32, batch_rows);
+
+    try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
+        .grid_x = (total_out + 3) / 4,
+        .grid_y = (batch_rows + nvfp4_batch_tile - 1) / nvfp4_batch_tile,
+        .block_x = 128,
+    }, &self.kernel_arg_pack, .matvec_qkv);
     return true;
 }
 
@@ -2303,6 +2415,72 @@ pub fn tryFusedMxfp8GateUpSiluForward(
     return true;
 }
 
+pub fn tryFusedNvfp4GateUpSiluForward(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    gate_weight: *const LinearWeight,
+    up_weight: *const LinearWeight,
+    rows: usize,
+    expected_out_dim: u32,
+) !bool {
+    if (self.loaded.config.use_gelu) return false;
+    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
+    if (rows > 1 and !self.nvfp4_sequence_fused_gate_up_supported) return false;
+
+    const gate = switch (gate_weight.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    const up = switch (up_weight.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    if (gate.rows != up.rows) return false;
+    if (gate.cols != up.cols or gate.cols != expected_out_dim) return false;
+    if (gate.rows != self.d_model) return false;
+    if (gate.group_size == 0 or up.group_size == 0) return false;
+    if ((gate.rows % gate.group_size) != 0 or (up.rows % up.group_size) != 0) return false;
+    if (gate.scales_buffer.pointer == 0 or up.scales_buffer.pointer == 0) return false;
+    if (gate.weight_global_scale == 0.0 or up.weight_global_scale == 0.0) return false;
+
+    var fused_fn = self.nvfp4_matvec_gate_up_silu_function orelse return false;
+    var batch_tile: u32 = 4;
+    if (rows > 4) {
+        if (self.nvfp4_matvec_gate_up_silu_tile8_function) |tile8_fn| {
+            fused_fn = tile8_fn;
+            batch_tile = 8;
+        }
+    }
+
+    const out_dim: u32 = @intCast(gate.cols);
+    const in_dim: u32 = @intCast(gate.rows);
+    const batch_rows: u32 = @intCast(rows);
+
+    self.kernel_arg_pack.reset();
+    try self.kernel_arg_pack.appendBufferPtr(input);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_mul_dev);
+    try self.kernel_arg_pack.appendScalar(u32, out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, in_dim);
+    try self.kernel_arg_pack.appendScalar(u32, gate.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, gate.group_size);
+    try self.kernel_arg_pack.appendScalar(f32, gate.weight_global_scale);
+    try self.kernel_arg_pack.appendScalar(u32, up.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, up.group_size);
+    try self.kernel_arg_pack.appendScalar(f32, up.weight_global_scale);
+    try self.kernel_arg_pack.appendScalar(u32, batch_rows);
+
+    try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
+        .grid_x = (out_dim + 3) / 4,
+        .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
+        .block_x = 128,
+    }, &self.kernel_arg_pack, .matvec_gate_up_silu);
+    return true;
+}
+
 pub fn tryFusedMxfp8GateUpForward(
     self: anytype,
     input: *const compute.cuda.Buffer,
@@ -2362,6 +2540,74 @@ pub fn tryFusedMxfp8GateUpForward(
     return true;
 }
 
+pub fn tryFusedNvfp4GateUpForward(
+    self: anytype,
+    input: *const compute.cuda.Buffer,
+    gate_weight: *const LinearWeight,
+    up_weight: *const LinearWeight,
+    rows: usize,
+) !bool {
+    if (rows == 0 or rows > std.math.maxInt(u32)) return false;
+    if (rows > 1 and !self.nvfp4_sequence_fused_gate_up_supported) return false;
+    const gate = switch (gate_weight.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    const up = switch (up_weight.*) {
+        .nvfp4 => |w| w,
+        else => return false,
+    };
+    if (gate.rows != up.rows) return false;
+    if (gate.rows != self.d_model) return false;
+    if (gate.weight_global_scale == 0.0 or up.weight_global_scale == 0.0) return false;
+
+    var fused_fn = self.nvfp4_matvec_gate_up_function orelse return false;
+    var nvfp4_batch_tile: u32 = 4;
+    if (rows > 4) {
+        if (self.nvfp4_matvec_gate_up_tile8_function) |tile8_fn| {
+            fused_fn = tile8_fn;
+            nvfp4_batch_tile = 8;
+        }
+    }
+
+    const gate_bytes = std.math.mul(usize, rows, gate.cols * @sizeOf(f32)) catch return false;
+    const up_bytes = std.math.mul(usize, rows, up.cols * @sizeOf(f32)) catch return false;
+    _ = gate_bytes;
+    _ = up_bytes;
+
+    const gate_out_dim: u32 = @intCast(gate.cols);
+    const up_out_dim: u32 = @intCast(up.cols);
+    const in_dim: u32 = @intCast(gate.rows);
+    const batch_rows: u32 = @intCast(rows);
+    const total_dim = std.math.add(u32, gate_out_dim, up_out_dim) catch return false;
+
+    self.kernel_arg_pack.reset();
+    try self.kernel_arg_pack.appendBufferPtr(input);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&gate.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_gate_dev);
+    try self.kernel_arg_pack.appendScalar(u32, gate_out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, gate.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, gate.group_size);
+    try self.kernel_arg_pack.appendScalar(f32, gate.weight_global_scale);
+    try self.kernel_arg_pack.appendBufferPtr(&up.buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&up.scales_buffer);
+    try self.kernel_arg_pack.appendBufferPtr(&self.runtime_buffers.ffn_up_dev);
+    try self.kernel_arg_pack.appendScalar(u32, up_out_dim);
+    try self.kernel_arg_pack.appendScalar(u32, up.scale_cols);
+    try self.kernel_arg_pack.appendScalar(u32, up.group_size);
+    try self.kernel_arg_pack.appendScalar(f32, up.weight_global_scale);
+    try self.kernel_arg_pack.appendScalar(u32, in_dim);
+    try self.kernel_arg_pack.appendScalar(u32, batch_rows);
+
+    try compute.cuda.launch.launchWithFamily(&self.device, fused_fn, .{
+        .grid_x = (total_dim + 3) / 4,
+        .grid_y = (batch_rows + nvfp4_batch_tile - 1) / nvfp4_batch_tile,
+        .block_x = 128,
+    }, &self.kernel_arg_pack, .matvec);
+    return true;
+}
+
 pub fn tryFusedGateUpForward(
     self: anytype,
     input: *const compute.cuda.Buffer,
@@ -2372,6 +2618,7 @@ pub fn tryFusedGateUpForward(
     if (try tryFusedDenseU16GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
     if (try tryFusedMxfp8GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
     if (try tryFusedFp8GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
+    if (try tryFusedNvfp4GateUpForward(self, input, gate_weight, up_weight, rows)) return true;
     // The U4 fused gate/up+silu path is currently unstable for quality-sensitive
     // generation; keep the established U8 path as the default correctness path.
     return tryFusedGaffineU8GateUpForward(self, input, gate_weight, up_weight, rows);

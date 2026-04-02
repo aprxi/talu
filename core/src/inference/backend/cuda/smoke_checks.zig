@@ -569,6 +569,772 @@ pub fn probeGaffineU4SequenceFusedGateUpSupport(backend: anytype) !bool {
     return true;
 }
 
+fn fillNvfp4InputPattern(input: []f32) void {
+    for (input, 0..) |*value, idx| {
+        const raw: i32 = @as(i32, @intCast((idx * 17 + 3) % 23)) - 11;
+        value.* = @as(f32, @floatFromInt(raw)) * 0.125;
+    }
+}
+
+fn fillNvfp4PackedPattern(packed_bytes: []u8, xor_mask: u8) void {
+    for (packed_bytes, 0..) |*value, idx| {
+        const lo: u8 = @intCast((idx * 3 + 1) % 16);
+        const hi: u8 = @intCast((idx * 5 + 7) % 16);
+        value.* = (lo | (hi << 4)) ^ xor_mask;
+    }
+}
+
+fn fillNvfp4ScalePattern(scales: []u8, offset: u8) void {
+    const lut = [_]u8{ 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44 };
+    for (scales, 0..) |*value, idx| {
+        const base = lut[(idx + @as(usize, offset)) % lut.len];
+        value.* = base;
+    }
+}
+
+fn compareNvfp4ProbeOutputs(
+    probe: []const u8,
+    rows: u32,
+    cols: u32,
+    expected: []const f32,
+    actual: []const f32,
+    abs_tol: f32,
+    rel_tol: f32,
+) bool {
+    if (expected.len != actual.len) return false;
+    var max_abs_diff: f32 = 0.0;
+    var max_rel_diff: f32 = 0.0;
+    var max_idx: usize = 0;
+    var max_expected: f32 = 0.0;
+    var max_actual: f32 = 0.0;
+
+    for (expected, actual, 0..) |want, got, idx| {
+        const abs_diff = @abs(want - got);
+        const denom = @max(@abs(want), 1e-6);
+        const rel_diff = abs_diff / denom;
+        if (abs_diff > max_abs_diff) {
+            max_abs_diff = abs_diff;
+            max_rel_diff = rel_diff;
+            max_idx = idx;
+            max_expected = want;
+            max_actual = got;
+        }
+    }
+
+    if (max_abs_diff <= abs_tol or max_rel_diff <= rel_tol) return true;
+
+    log.warn("inference", "CUDA NVFP4 startup parity probe failed", .{
+        .probe = probe,
+        .rows = rows,
+        .cols = cols,
+        .max_abs_diff = max_abs_diff,
+        .max_rel_diff = max_rel_diff,
+        .index = max_idx,
+        .expected = max_expected,
+        .actual = max_actual,
+    });
+    return false;
+}
+
+fn launchNvfp4Matvec(
+    backend: anytype,
+    function: compute.cuda.Function,
+    input: *const compute.cuda.Buffer,
+    weight_packed: *const compute.cuda.Buffer,
+    scales: *const compute.cuda.Buffer,
+    out: *compute.cuda.Buffer,
+    in_dim: u32,
+    out_dim: u32,
+    scale_cols: u32,
+    group_size: u32,
+    weight_global_scale: f32,
+    batch_rows: u32,
+    batch_tile: u32,
+) !void {
+    backend.kernel_arg_pack.reset();
+    try backend.kernel_arg_pack.appendBufferPtr(input);
+    try backend.kernel_arg_pack.appendBufferPtr(weight_packed);
+    try backend.kernel_arg_pack.appendBufferPtr(scales);
+    try backend.kernel_arg_pack.appendBufferPtr(out);
+    try backend.kernel_arg_pack.appendScalar(u32, in_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, out_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, scale_cols);
+    try backend.kernel_arg_pack.appendScalar(u32, group_size);
+    try backend.kernel_arg_pack.appendScalar(f32, weight_global_scale);
+    try backend.kernel_arg_pack.appendScalar(u32, batch_rows);
+    try compute.cuda.launch.launchWithFamily(&backend.device, function, .{
+        .grid_x = (out_dim + 3) / 4,
+        .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
+        .block_x = 128,
+    }, &backend.kernel_arg_pack, .matvec);
+}
+
+fn launchNvfp4Qkv(
+    backend: anytype,
+    function: compute.cuda.Function,
+    input: *const compute.cuda.Buffer,
+    q_weight_packed: *const compute.cuda.Buffer,
+    q_scales: *const compute.cuda.Buffer,
+    q_out: *compute.cuda.Buffer,
+    q_out_dim: u32,
+    q_scale_cols: u32,
+    q_group_size: u32,
+    q_weight_global_scale: f32,
+    k_weight_packed: *const compute.cuda.Buffer,
+    k_scales: *const compute.cuda.Buffer,
+    k_out: *compute.cuda.Buffer,
+    k_out_dim: u32,
+    k_scale_cols: u32,
+    k_group_size: u32,
+    k_weight_global_scale: f32,
+    v_weight_packed: *const compute.cuda.Buffer,
+    v_scales: *const compute.cuda.Buffer,
+    v_out: *compute.cuda.Buffer,
+    v_out_dim: u32,
+    v_scale_cols: u32,
+    v_group_size: u32,
+    v_weight_global_scale: f32,
+    in_dim: u32,
+    batch_rows: u32,
+    batch_tile: u32,
+) !void {
+    const qk_dim = std.math.add(u32, q_out_dim, k_out_dim) catch return error.InvalidArgument;
+    const total_dim = std.math.add(u32, qk_dim, v_out_dim) catch return error.InvalidArgument;
+
+    backend.kernel_arg_pack.reset();
+    try backend.kernel_arg_pack.appendBufferPtr(input);
+    try backend.kernel_arg_pack.appendBufferPtr(q_weight_packed);
+    try backend.kernel_arg_pack.appendBufferPtr(q_scales);
+    try backend.kernel_arg_pack.appendBufferPtr(q_out);
+    try backend.kernel_arg_pack.appendScalar(u32, q_out_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, q_scale_cols);
+    try backend.kernel_arg_pack.appendScalar(u32, q_group_size);
+    try backend.kernel_arg_pack.appendScalar(f32, q_weight_global_scale);
+    try backend.kernel_arg_pack.appendBufferPtr(k_weight_packed);
+    try backend.kernel_arg_pack.appendBufferPtr(k_scales);
+    try backend.kernel_arg_pack.appendBufferPtr(k_out);
+    try backend.kernel_arg_pack.appendScalar(u32, k_out_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, k_scale_cols);
+    try backend.kernel_arg_pack.appendScalar(u32, k_group_size);
+    try backend.kernel_arg_pack.appendScalar(f32, k_weight_global_scale);
+    try backend.kernel_arg_pack.appendBufferPtr(v_weight_packed);
+    try backend.kernel_arg_pack.appendBufferPtr(v_scales);
+    try backend.kernel_arg_pack.appendBufferPtr(v_out);
+    try backend.kernel_arg_pack.appendScalar(u32, v_out_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, v_scale_cols);
+    try backend.kernel_arg_pack.appendScalar(u32, v_group_size);
+    try backend.kernel_arg_pack.appendScalar(f32, v_weight_global_scale);
+    try backend.kernel_arg_pack.appendScalar(u32, in_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, batch_rows);
+
+    try compute.cuda.launch.launchWithFamily(&backend.device, function, .{
+        .grid_x = (total_dim + 3) / 4,
+        .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
+        .block_x = 128,
+    }, &backend.kernel_arg_pack, .matvec_qkv);
+}
+
+fn launchNvfp4GateUp(
+    backend: anytype,
+    function: compute.cuda.Function,
+    input: *const compute.cuda.Buffer,
+    gate_weight_packed: *const compute.cuda.Buffer,
+    gate_scales: *const compute.cuda.Buffer,
+    gate_out: *compute.cuda.Buffer,
+    gate_out_dim: u32,
+    gate_scale_cols: u32,
+    gate_group_size: u32,
+    gate_weight_global_scale: f32,
+    up_weight_packed: *const compute.cuda.Buffer,
+    up_scales: *const compute.cuda.Buffer,
+    up_out: *compute.cuda.Buffer,
+    up_out_dim: u32,
+    up_scale_cols: u32,
+    up_group_size: u32,
+    up_weight_global_scale: f32,
+    in_dim: u32,
+    batch_rows: u32,
+    batch_tile: u32,
+) !void {
+    const total_dim = std.math.add(u32, gate_out_dim, up_out_dim) catch return error.InvalidArgument;
+
+    backend.kernel_arg_pack.reset();
+    try backend.kernel_arg_pack.appendBufferPtr(input);
+    try backend.kernel_arg_pack.appendBufferPtr(gate_weight_packed);
+    try backend.kernel_arg_pack.appendBufferPtr(gate_scales);
+    try backend.kernel_arg_pack.appendBufferPtr(gate_out);
+    try backend.kernel_arg_pack.appendScalar(u32, gate_out_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, gate_scale_cols);
+    try backend.kernel_arg_pack.appendScalar(u32, gate_group_size);
+    try backend.kernel_arg_pack.appendScalar(f32, gate_weight_global_scale);
+    try backend.kernel_arg_pack.appendBufferPtr(up_weight_packed);
+    try backend.kernel_arg_pack.appendBufferPtr(up_scales);
+    try backend.kernel_arg_pack.appendBufferPtr(up_out);
+    try backend.kernel_arg_pack.appendScalar(u32, up_out_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, up_scale_cols);
+    try backend.kernel_arg_pack.appendScalar(u32, up_group_size);
+    try backend.kernel_arg_pack.appendScalar(f32, up_weight_global_scale);
+    try backend.kernel_arg_pack.appendScalar(u32, in_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, batch_rows);
+
+    try compute.cuda.launch.launchWithFamily(&backend.device, function, .{
+        .grid_x = (total_dim + 3) / 4,
+        .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
+        .block_x = 128,
+    }, &backend.kernel_arg_pack, .matvec);
+}
+
+fn launchNvfp4GateUpSilu(
+    backend: anytype,
+    function: compute.cuda.Function,
+    input: *const compute.cuda.Buffer,
+    gate_weight_packed: *const compute.cuda.Buffer,
+    gate_scales: *const compute.cuda.Buffer,
+    up_weight_packed: *const compute.cuda.Buffer,
+    up_scales: *const compute.cuda.Buffer,
+    out: *compute.cuda.Buffer,
+    out_dim: u32,
+    in_dim: u32,
+    gate_scale_cols: u32,
+    gate_group_size: u32,
+    gate_weight_global_scale: f32,
+    up_scale_cols: u32,
+    up_group_size: u32,
+    up_weight_global_scale: f32,
+    batch_rows: u32,
+    batch_tile: u32,
+) !void {
+    backend.kernel_arg_pack.reset();
+    try backend.kernel_arg_pack.appendBufferPtr(input);
+    try backend.kernel_arg_pack.appendBufferPtr(gate_weight_packed);
+    try backend.kernel_arg_pack.appendBufferPtr(gate_scales);
+    try backend.kernel_arg_pack.appendBufferPtr(up_weight_packed);
+    try backend.kernel_arg_pack.appendBufferPtr(up_scales);
+    try backend.kernel_arg_pack.appendBufferPtr(out);
+    try backend.kernel_arg_pack.appendScalar(u32, out_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, in_dim);
+    try backend.kernel_arg_pack.appendScalar(u32, gate_scale_cols);
+    try backend.kernel_arg_pack.appendScalar(u32, gate_group_size);
+    try backend.kernel_arg_pack.appendScalar(f32, gate_weight_global_scale);
+    try backend.kernel_arg_pack.appendScalar(u32, up_scale_cols);
+    try backend.kernel_arg_pack.appendScalar(u32, up_group_size);
+    try backend.kernel_arg_pack.appendScalar(f32, up_weight_global_scale);
+    try backend.kernel_arg_pack.appendScalar(u32, batch_rows);
+
+    try compute.cuda.launch.launchWithFamily(&backend.device, function, .{
+        .grid_x = (out_dim + 3) / 4,
+        .grid_y = (batch_rows + batch_tile - 1) / batch_tile,
+        .block_x = 128,
+    }, &backend.kernel_arg_pack, .matvec_gate_up_silu);
+}
+
+pub fn probeNvfp4SequenceRowsSupport(backend: anytype) !bool {
+    if (!backend.device.supportsModuleLaunch()) return false;
+    const base_function = backend.nvfp4_matvec_function orelse return false;
+
+    const in_dim: u32 = 64;
+    const out_dim: u32 = 8;
+    const group_size: u32 = 16;
+    const scale_cols: u32 = in_dim / group_size;
+    const packed_cols: u32 = (in_dim + 1) / 2;
+    const max_rows: u32 = 8;
+    const max_out_elems: usize = @as(usize, max_rows) * @as(usize, out_dim);
+    const weight_global_scale: f32 = 1.0;
+    const abs_tol: f32 = 0.002;
+    const rel_tol: f32 = 0.002;
+
+    var input = [_]f32{0.0} ** (@as(usize, max_rows) * @as(usize, in_dim));
+    var packed_weights = [_]u8{0} ** (@as(usize, out_dim) * @as(usize, packed_cols));
+    var scales = [_]u8{0} ** (@as(usize, out_dim) * @as(usize, scale_cols));
+    var expected = [_]f32{0.0} ** max_out_elems;
+    var actual = [_]f32{0.0} ** max_out_elems;
+
+    fillNvfp4InputPattern(input[0..]);
+    fillNvfp4PackedPattern(packed_weights[0..], 0x00);
+    fillNvfp4ScalePattern(scales[0..], 0);
+
+    var input_dev = try backend.device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(&backend.device);
+    var packed_dev = try backend.device.allocBuffer(packed_weights.len * @sizeOf(u8));
+    defer packed_dev.deinit(&backend.device);
+    var scales_dev = try backend.device.allocBuffer(scales.len * @sizeOf(u8));
+    defer scales_dev.deinit(&backend.device);
+
+    try input_dev.upload(&backend.device, std.mem.sliceAsBytes(input[0..]));
+    try packed_dev.upload(&backend.device, std.mem.sliceAsBytes(packed_weights[0..]));
+    try scales_dev.upload(&backend.device, std.mem.sliceAsBytes(scales[0..]));
+
+    const row_cases = [_]u32{ 1, 4, 8 };
+    for (row_cases) |rows| {
+        const out_elems = @as(usize, rows) * @as(usize, out_dim);
+        const out_bytes = out_elems * @sizeOf(f32);
+        const input_row_bytes = @as(usize, in_dim) * @sizeOf(f32);
+        const out_row_bytes = @as(usize, out_dim) * @sizeOf(f32);
+
+        var actual_dev = try backend.device.allocBuffer(out_bytes);
+        defer actual_dev.deinit(&backend.device);
+        var expected_dev = try backend.device.allocBuffer(out_bytes);
+        defer expected_dev.deinit(&backend.device);
+
+        var batched_function = base_function;
+        var batched_tile: u32 = 4;
+        if (rows > 4) {
+            if (backend.nvfp4_matvec_tile8_function) |tile8_function| {
+                batched_function = tile8_function;
+                batched_tile = 8;
+            }
+        }
+        try launchNvfp4Matvec(
+            backend,
+            batched_function,
+            &input_dev,
+            &packed_dev,
+            &scales_dev,
+            &actual_dev,
+            in_dim,
+            out_dim,
+            scale_cols,
+            group_size,
+            weight_global_scale,
+            rows,
+            batched_tile,
+        );
+
+        var row_index: usize = 0;
+        while (row_index < @as(usize, rows)) : (row_index += 1) {
+            const input_offset = row_index * input_row_bytes;
+            const out_offset = row_index * out_row_bytes;
+            var input_row = try bufferSlice(&input_dev, input_offset, input_row_bytes);
+            var out_row = try bufferSlice(&expected_dev, out_offset, out_row_bytes);
+            try launchNvfp4Matvec(
+                backend,
+                base_function,
+                &input_row,
+                &packed_dev,
+                &scales_dev,
+                &out_row,
+                in_dim,
+                out_dim,
+                scale_cols,
+                group_size,
+                weight_global_scale,
+                1,
+                4,
+            );
+        }
+
+        try expected_dev.download(&backend.device, std.mem.sliceAsBytes(expected[0..out_elems]));
+        try actual_dev.download(&backend.device, std.mem.sliceAsBytes(actual[0..out_elems]));
+        if (!compareNvfp4ProbeOutputs(
+            "nvfp4_rows",
+            rows,
+            out_dim,
+            expected[0..out_elems],
+            actual[0..out_elems],
+            abs_tol,
+            rel_tol,
+        )) return false;
+    }
+
+    return true;
+}
+
+pub fn probeNvfp4SequenceFusedQkvSupport(backend: anytype) !bool {
+    if (!backend.device.supportsModuleLaunch()) return false;
+    const base_function = backend.nvfp4_matvec_qkv_function orelse return false;
+
+    const in_dim: u32 = 64;
+    const q_out_dim: u32 = 8;
+    const k_out_dim: u32 = 8;
+    const v_out_dim: u32 = 8;
+    const group_size: u32 = 16;
+    const scale_cols: u32 = in_dim / group_size;
+    const packed_cols: u32 = (in_dim + 1) / 2;
+    const max_rows: u32 = 8;
+    const weight_global_scale: f32 = 1.0;
+    const abs_tol: f32 = 0.002;
+    const rel_tol: f32 = 0.002;
+
+    const max_q_elems: usize = @as(usize, max_rows) * @as(usize, q_out_dim);
+    const max_k_elems: usize = @as(usize, max_rows) * @as(usize, k_out_dim);
+    const max_v_elems: usize = @as(usize, max_rows) * @as(usize, v_out_dim);
+
+    var input = [_]f32{0.0} ** (@as(usize, max_rows) * @as(usize, in_dim));
+    var q_packed = [_]u8{0} ** (@as(usize, q_out_dim) * @as(usize, packed_cols));
+    var k_packed = [_]u8{0} ** (@as(usize, k_out_dim) * @as(usize, packed_cols));
+    var v_packed = [_]u8{0} ** (@as(usize, v_out_dim) * @as(usize, packed_cols));
+    var q_scales = [_]u8{0} ** (@as(usize, q_out_dim) * @as(usize, scale_cols));
+    var k_scales = [_]u8{0} ** (@as(usize, k_out_dim) * @as(usize, scale_cols));
+    var v_scales = [_]u8{0} ** (@as(usize, v_out_dim) * @as(usize, scale_cols));
+    var q_expected = [_]f32{0.0} ** max_q_elems;
+    var q_actual = [_]f32{0.0} ** max_q_elems;
+    var k_expected = [_]f32{0.0} ** max_k_elems;
+    var k_actual = [_]f32{0.0} ** max_k_elems;
+    var v_expected = [_]f32{0.0} ** max_v_elems;
+    var v_actual = [_]f32{0.0} ** max_v_elems;
+
+    fillNvfp4InputPattern(input[0..]);
+    fillNvfp4PackedPattern(q_packed[0..], 0x00);
+    fillNvfp4PackedPattern(k_packed[0..], 0x11);
+    fillNvfp4PackedPattern(v_packed[0..], 0x22);
+    fillNvfp4ScalePattern(q_scales[0..], 0);
+    fillNvfp4ScalePattern(k_scales[0..], 2);
+    fillNvfp4ScalePattern(v_scales[0..], 4);
+
+    var input_dev = try backend.device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(&backend.device);
+    var q_packed_dev = try backend.device.allocBuffer(q_packed.len * @sizeOf(u8));
+    defer q_packed_dev.deinit(&backend.device);
+    var k_packed_dev = try backend.device.allocBuffer(k_packed.len * @sizeOf(u8));
+    defer k_packed_dev.deinit(&backend.device);
+    var v_packed_dev = try backend.device.allocBuffer(v_packed.len * @sizeOf(u8));
+    defer v_packed_dev.deinit(&backend.device);
+    var q_scales_dev = try backend.device.allocBuffer(q_scales.len * @sizeOf(u8));
+    defer q_scales_dev.deinit(&backend.device);
+    var k_scales_dev = try backend.device.allocBuffer(k_scales.len * @sizeOf(u8));
+    defer k_scales_dev.deinit(&backend.device);
+    var v_scales_dev = try backend.device.allocBuffer(v_scales.len * @sizeOf(u8));
+    defer v_scales_dev.deinit(&backend.device);
+
+    try input_dev.upload(&backend.device, std.mem.sliceAsBytes(input[0..]));
+    try q_packed_dev.upload(&backend.device, std.mem.sliceAsBytes(q_packed[0..]));
+    try k_packed_dev.upload(&backend.device, std.mem.sliceAsBytes(k_packed[0..]));
+    try v_packed_dev.upload(&backend.device, std.mem.sliceAsBytes(v_packed[0..]));
+    try q_scales_dev.upload(&backend.device, std.mem.sliceAsBytes(q_scales[0..]));
+    try k_scales_dev.upload(&backend.device, std.mem.sliceAsBytes(k_scales[0..]));
+    try v_scales_dev.upload(&backend.device, std.mem.sliceAsBytes(v_scales[0..]));
+
+    const row_cases = [_]u32{ 1, 4, 8 };
+    for (row_cases) |rows| {
+        const q_elems = @as(usize, rows) * @as(usize, q_out_dim);
+        const k_elems = @as(usize, rows) * @as(usize, k_out_dim);
+        const v_elems = @as(usize, rows) * @as(usize, v_out_dim);
+        const q_bytes = q_elems * @sizeOf(f32);
+        const k_bytes = k_elems * @sizeOf(f32);
+        const v_bytes = v_elems * @sizeOf(f32);
+        const input_row_bytes = @as(usize, in_dim) * @sizeOf(f32);
+        const q_row_bytes = @as(usize, q_out_dim) * @sizeOf(f32);
+        const k_row_bytes = @as(usize, k_out_dim) * @sizeOf(f32);
+        const v_row_bytes = @as(usize, v_out_dim) * @sizeOf(f32);
+
+        var q_actual_dev = try backend.device.allocBuffer(q_bytes);
+        defer q_actual_dev.deinit(&backend.device);
+        var k_actual_dev = try backend.device.allocBuffer(k_bytes);
+        defer k_actual_dev.deinit(&backend.device);
+        var v_actual_dev = try backend.device.allocBuffer(v_bytes);
+        defer v_actual_dev.deinit(&backend.device);
+        var q_expected_dev = try backend.device.allocBuffer(q_bytes);
+        defer q_expected_dev.deinit(&backend.device);
+        var k_expected_dev = try backend.device.allocBuffer(k_bytes);
+        defer k_expected_dev.deinit(&backend.device);
+        var v_expected_dev = try backend.device.allocBuffer(v_bytes);
+        defer v_expected_dev.deinit(&backend.device);
+
+        var batched_function = base_function;
+        var batched_tile: u32 = 4;
+        if (rows > 4) {
+            if (backend.nvfp4_matvec_qkv_tile8_function) |tile8_function| {
+                batched_function = tile8_function;
+                batched_tile = 8;
+            }
+        }
+        try launchNvfp4Qkv(
+            backend,
+            batched_function,
+            &input_dev,
+            &q_packed_dev,
+            &q_scales_dev,
+            &q_actual_dev,
+            q_out_dim,
+            scale_cols,
+            group_size,
+            weight_global_scale,
+            &k_packed_dev,
+            &k_scales_dev,
+            &k_actual_dev,
+            k_out_dim,
+            scale_cols,
+            group_size,
+            weight_global_scale,
+            &v_packed_dev,
+            &v_scales_dev,
+            &v_actual_dev,
+            v_out_dim,
+            scale_cols,
+            group_size,
+            weight_global_scale,
+            in_dim,
+            rows,
+            batched_tile,
+        );
+
+        var row_index: usize = 0;
+        while (row_index < @as(usize, rows)) : (row_index += 1) {
+            const input_offset = row_index * input_row_bytes;
+            var input_row = try bufferSlice(&input_dev, input_offset, input_row_bytes);
+
+            var q_out_row = try bufferSlice(&q_expected_dev, row_index * q_row_bytes, q_row_bytes);
+            var k_out_row = try bufferSlice(&k_expected_dev, row_index * k_row_bytes, k_row_bytes);
+            var v_out_row = try bufferSlice(&v_expected_dev, row_index * v_row_bytes, v_row_bytes);
+
+            try launchNvfp4Qkv(
+                backend,
+                base_function,
+                &input_row,
+                &q_packed_dev,
+                &q_scales_dev,
+                &q_out_row,
+                q_out_dim,
+                scale_cols,
+                group_size,
+                weight_global_scale,
+                &k_packed_dev,
+                &k_scales_dev,
+                &k_out_row,
+                k_out_dim,
+                scale_cols,
+                group_size,
+                weight_global_scale,
+                &v_packed_dev,
+                &v_scales_dev,
+                &v_out_row,
+                v_out_dim,
+                scale_cols,
+                group_size,
+                weight_global_scale,
+                in_dim,
+                1,
+                4,
+            );
+        }
+
+        try q_expected_dev.download(&backend.device, std.mem.sliceAsBytes(q_expected[0..q_elems]));
+        try q_actual_dev.download(&backend.device, std.mem.sliceAsBytes(q_actual[0..q_elems]));
+        if (!compareNvfp4ProbeOutputs("nvfp4_qkv_q", rows, q_out_dim, q_expected[0..q_elems], q_actual[0..q_elems], abs_tol, rel_tol)) return false;
+
+        try k_expected_dev.download(&backend.device, std.mem.sliceAsBytes(k_expected[0..k_elems]));
+        try k_actual_dev.download(&backend.device, std.mem.sliceAsBytes(k_actual[0..k_elems]));
+        if (!compareNvfp4ProbeOutputs("nvfp4_qkv_k", rows, k_out_dim, k_expected[0..k_elems], k_actual[0..k_elems], abs_tol, rel_tol)) return false;
+
+        try v_expected_dev.download(&backend.device, std.mem.sliceAsBytes(v_expected[0..v_elems]));
+        try v_actual_dev.download(&backend.device, std.mem.sliceAsBytes(v_actual[0..v_elems]));
+        if (!compareNvfp4ProbeOutputs("nvfp4_qkv_v", rows, v_out_dim, v_expected[0..v_elems], v_actual[0..v_elems], abs_tol, rel_tol)) return false;
+    }
+
+    return true;
+}
+
+pub fn probeNvfp4SequenceFusedGateUpSupport(backend: anytype) !bool {
+    if (!backend.device.supportsModuleLaunch()) return false;
+    const gate_up_function = backend.nvfp4_matvec_gate_up_function orelse return false;
+    const gate_up_silu_function = backend.nvfp4_matvec_gate_up_silu_function orelse return false;
+
+    const in_dim: u32 = 64;
+    const gate_out_dim: u32 = 8;
+    const up_out_dim: u32 = 8;
+    const group_size: u32 = 16;
+    const scale_cols: u32 = in_dim / group_size;
+    const packed_cols: u32 = (in_dim + 1) / 2;
+    const max_rows: u32 = 8;
+    const gate_weight_global_scale: f32 = 1.0;
+    const up_weight_global_scale: f32 = 1.0;
+    const abs_tol: f32 = 0.002;
+    const rel_tol: f32 = 0.002;
+
+    const max_gate_elems: usize = @as(usize, max_rows) * @as(usize, gate_out_dim);
+    const max_up_elems: usize = @as(usize, max_rows) * @as(usize, up_out_dim);
+
+    var input = [_]f32{0.0} ** (@as(usize, max_rows) * @as(usize, in_dim));
+    var gate_packed = [_]u8{0} ** (@as(usize, gate_out_dim) * @as(usize, packed_cols));
+    var up_packed = [_]u8{0} ** (@as(usize, up_out_dim) * @as(usize, packed_cols));
+    var gate_scales = [_]u8{0} ** (@as(usize, gate_out_dim) * @as(usize, scale_cols));
+    var up_scales = [_]u8{0} ** (@as(usize, up_out_dim) * @as(usize, scale_cols));
+
+    var gate_expected = [_]f32{0.0} ** max_gate_elems;
+    var gate_actual = [_]f32{0.0} ** max_gate_elems;
+    var up_expected = [_]f32{0.0} ** max_up_elems;
+    var up_actual = [_]f32{0.0} ** max_up_elems;
+    var mul_expected = [_]f32{0.0} ** max_gate_elems;
+    var mul_actual = [_]f32{0.0} ** max_gate_elems;
+
+    fillNvfp4InputPattern(input[0..]);
+    fillNvfp4PackedPattern(gate_packed[0..], 0x33);
+    fillNvfp4PackedPattern(up_packed[0..], 0x55);
+    fillNvfp4ScalePattern(gate_scales[0..], 1);
+    fillNvfp4ScalePattern(up_scales[0..], 3);
+
+    var input_dev = try backend.device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(&backend.device);
+    var gate_packed_dev = try backend.device.allocBuffer(gate_packed.len * @sizeOf(u8));
+    defer gate_packed_dev.deinit(&backend.device);
+    var up_packed_dev = try backend.device.allocBuffer(up_packed.len * @sizeOf(u8));
+    defer up_packed_dev.deinit(&backend.device);
+    var gate_scales_dev = try backend.device.allocBuffer(gate_scales.len * @sizeOf(u8));
+    defer gate_scales_dev.deinit(&backend.device);
+    var up_scales_dev = try backend.device.allocBuffer(up_scales.len * @sizeOf(u8));
+    defer up_scales_dev.deinit(&backend.device);
+
+    try input_dev.upload(&backend.device, std.mem.sliceAsBytes(input[0..]));
+    try gate_packed_dev.upload(&backend.device, std.mem.sliceAsBytes(gate_packed[0..]));
+    try up_packed_dev.upload(&backend.device, std.mem.sliceAsBytes(up_packed[0..]));
+    try gate_scales_dev.upload(&backend.device, std.mem.sliceAsBytes(gate_scales[0..]));
+    try up_scales_dev.upload(&backend.device, std.mem.sliceAsBytes(up_scales[0..]));
+
+    const row_cases = [_]u32{ 1, 4, 8 };
+    for (row_cases) |rows| {
+        const gate_elems = @as(usize, rows) * @as(usize, gate_out_dim);
+        const up_elems = @as(usize, rows) * @as(usize, up_out_dim);
+        const gate_bytes = gate_elems * @sizeOf(f32);
+        const up_bytes = up_elems * @sizeOf(f32);
+        const in_row_bytes = @as(usize, in_dim) * @sizeOf(f32);
+        const gate_row_bytes = @as(usize, gate_out_dim) * @sizeOf(f32);
+        const up_row_bytes = @as(usize, up_out_dim) * @sizeOf(f32);
+
+        var gate_actual_dev = try backend.device.allocBuffer(gate_bytes);
+        defer gate_actual_dev.deinit(&backend.device);
+        var up_actual_dev = try backend.device.allocBuffer(up_bytes);
+        defer up_actual_dev.deinit(&backend.device);
+        var gate_expected_dev = try backend.device.allocBuffer(gate_bytes);
+        defer gate_expected_dev.deinit(&backend.device);
+        var up_expected_dev = try backend.device.allocBuffer(up_bytes);
+        defer up_expected_dev.deinit(&backend.device);
+
+        var batched_gate_up_function = gate_up_function;
+        var batched_gate_up_tile: u32 = 4;
+        if (rows > 4) {
+            if (backend.nvfp4_matvec_gate_up_tile8_function) |tile8_function| {
+                batched_gate_up_function = tile8_function;
+                batched_gate_up_tile = 8;
+            }
+        }
+        try launchNvfp4GateUp(
+            backend,
+            batched_gate_up_function,
+            &input_dev,
+            &gate_packed_dev,
+            &gate_scales_dev,
+            &gate_actual_dev,
+            gate_out_dim,
+            scale_cols,
+            group_size,
+            gate_weight_global_scale,
+            &up_packed_dev,
+            &up_scales_dev,
+            &up_actual_dev,
+            up_out_dim,
+            scale_cols,
+            group_size,
+            up_weight_global_scale,
+            in_dim,
+            rows,
+            batched_gate_up_tile,
+        );
+
+        var row_index: usize = 0;
+        while (row_index < @as(usize, rows)) : (row_index += 1) {
+            var input_row = try bufferSlice(&input_dev, row_index * in_row_bytes, in_row_bytes);
+            var gate_out_row = try bufferSlice(&gate_expected_dev, row_index * gate_row_bytes, gate_row_bytes);
+            var up_out_row = try bufferSlice(&up_expected_dev, row_index * up_row_bytes, up_row_bytes);
+            try launchNvfp4GateUp(
+                backend,
+                gate_up_function,
+                &input_row,
+                &gate_packed_dev,
+                &gate_scales_dev,
+                &gate_out_row,
+                gate_out_dim,
+                scale_cols,
+                group_size,
+                gate_weight_global_scale,
+                &up_packed_dev,
+                &up_scales_dev,
+                &up_out_row,
+                up_out_dim,
+                scale_cols,
+                group_size,
+                up_weight_global_scale,
+                in_dim,
+                1,
+                4,
+            );
+        }
+
+        try gate_expected_dev.download(&backend.device, std.mem.sliceAsBytes(gate_expected[0..gate_elems]));
+        try gate_actual_dev.download(&backend.device, std.mem.sliceAsBytes(gate_actual[0..gate_elems]));
+        if (!compareNvfp4ProbeOutputs("nvfp4_gate_up_gate", rows, gate_out_dim, gate_expected[0..gate_elems], gate_actual[0..gate_elems], abs_tol, rel_tol)) return false;
+
+        try up_expected_dev.download(&backend.device, std.mem.sliceAsBytes(up_expected[0..up_elems]));
+        try up_actual_dev.download(&backend.device, std.mem.sliceAsBytes(up_actual[0..up_elems]));
+        if (!compareNvfp4ProbeOutputs("nvfp4_gate_up_up", rows, up_out_dim, up_expected[0..up_elems], up_actual[0..up_elems], abs_tol, rel_tol)) return false;
+
+        var mul_actual_dev = try backend.device.allocBuffer(gate_bytes);
+        defer mul_actual_dev.deinit(&backend.device);
+        var mul_expected_dev = try backend.device.allocBuffer(gate_bytes);
+        defer mul_expected_dev.deinit(&backend.device);
+
+        var batched_gate_up_silu_function = gate_up_silu_function;
+        var batched_gate_up_silu_tile: u32 = 4;
+        if (rows > 4) {
+            if (backend.nvfp4_matvec_gate_up_silu_tile8_function) |tile8_function| {
+                batched_gate_up_silu_function = tile8_function;
+                batched_gate_up_silu_tile = 8;
+            }
+        }
+        try launchNvfp4GateUpSilu(
+            backend,
+            batched_gate_up_silu_function,
+            &input_dev,
+            &gate_packed_dev,
+            &gate_scales_dev,
+            &up_packed_dev,
+            &up_scales_dev,
+            &mul_actual_dev,
+            gate_out_dim,
+            in_dim,
+            scale_cols,
+            group_size,
+            gate_weight_global_scale,
+            scale_cols,
+            group_size,
+            up_weight_global_scale,
+            rows,
+            batched_gate_up_silu_tile,
+        );
+
+        row_index = 0;
+        while (row_index < @as(usize, rows)) : (row_index += 1) {
+            var input_row = try bufferSlice(&input_dev, row_index * in_row_bytes, in_row_bytes);
+            var mul_out_row = try bufferSlice(&mul_expected_dev, row_index * gate_row_bytes, gate_row_bytes);
+            try launchNvfp4GateUpSilu(
+                backend,
+                gate_up_silu_function,
+                &input_row,
+                &gate_packed_dev,
+                &gate_scales_dev,
+                &up_packed_dev,
+                &up_scales_dev,
+                &mul_out_row,
+                gate_out_dim,
+                in_dim,
+                scale_cols,
+                group_size,
+                gate_weight_global_scale,
+                scale_cols,
+                group_size,
+                up_weight_global_scale,
+                1,
+                4,
+            );
+        }
+
+        try mul_expected_dev.download(&backend.device, std.mem.sliceAsBytes(mul_expected[0..gate_elems]));
+        try mul_actual_dev.download(&backend.device, std.mem.sliceAsBytes(mul_actual[0..gate_elems]));
+        if (!compareNvfp4ProbeOutputs("nvfp4_gate_up_silu", rows, gate_out_dim, mul_expected[0..gate_elems], mul_actual[0..gate_elems], abs_tol, rel_tol)) return false;
+    }
+
+    return true;
+}
+
 fn runVectorAddSmoke(
     arg_pack: *compute.cuda.ArgPack,
     device: *compute.cuda.Device,

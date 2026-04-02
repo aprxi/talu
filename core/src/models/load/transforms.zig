@@ -2362,6 +2362,149 @@ test "orientWeight dequantizes NVFP4 packed weights to BF16" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out7, 0.06);
 }
 
+fn decodeNvfp4TensorRowsToF32(t: *const Tensor, out: []f32) !void {
+    const meta = t.nvfp4 orelse return error.MissingScales;
+    if (t.n_dims != 2) return error.InvalidShape;
+    const rows: usize = @intCast(t.shape[0]);
+    const cols: usize = @intCast(t.shape[1]);
+    const packed_cols: usize = @intCast(meta.packed_cols);
+    const scale_cols: usize = @intCast(meta.scale_cols);
+    const group_size: usize = @intCast(meta.group_size);
+    if (rows == 0 or cols == 0 or group_size == 0) return error.InvalidShape;
+    if (packed_cols * 2 != cols) return error.InvalidShape;
+    if (cols % group_size != 0) return error.InvalidShape;
+
+    const scales_ptr = meta.block_scales_data orelse return error.MissingScales;
+    const required_scale_len = rows * scale_cols;
+    if (meta.block_scales_len < required_scale_len) return error.InvalidShape;
+    const scales = scales_ptr[0..required_scale_len];
+    const packed_bytes = t.data();
+    const required_packed_len = rows * packed_cols;
+    if (packed_bytes.len < required_packed_len) return error.InvalidShape;
+    if (out.len < rows * cols) return error.InvalidShape;
+    if (meta.weight_global_scale == 0.0 or !std.math.isFinite(meta.weight_global_scale)) return error.InvalidShape;
+
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const packed_row = packed_bytes[r * packed_cols ..][0..packed_cols];
+        const scale_row = scales[r * scale_cols ..][0..scale_cols];
+        var c: usize = 0;
+        while (c < cols) : (c += 1) {
+            const packed_byte = packed_row[c / 2];
+            const nibble: u8 = if ((c & 1) == 0) packed_byte & 0x0F else (packed_byte >> 4) & 0x0F;
+            const local_scale = dtype.fp8e4m3ToF32(scale_row[c / group_size]);
+            out[r * cols + c] = fp4E2m1NibbleToF32(nibble) * (local_scale / meta.weight_global_scale);
+        }
+    }
+}
+
+test "buildGatedDeltaSplitInProj preserves NVFP4 dequantized values across global-scale harmonization" {
+    const allocator = std.testing.allocator;
+
+    // cols=4 unpacked (packed_cols=2), group_size=2 => scale_cols=2.
+    var qkv_data = [_]u8{
+        0x21, 0x43, // row0
+        0x65, 0x87, // row1
+    };
+    var z_data = [_]u8{
+        0x19, 0x2A,
+    };
+    var b_data = [_]u8{
+        0x34, 0xC5,
+    };
+    var a_data = [_]u8{
+        0x76, 0x0B,
+    };
+
+    var qkv_scales = [_]u8{
+        0x38, 0x40, // row0 scales: 1.0, 2.0
+        0x40, 0x38, // row1 scales: 2.0, 1.0
+    };
+    var z_scales = [_]u8{
+        0x38, 0x38,
+    };
+    var b_scales = [_]u8{
+        0x40, 0x40,
+    };
+    var a_scales = [_]u8{
+        0x38, 0x40,
+    };
+
+    var qkv = Tensor.view(qkv_data[0..].ptr, &.{ 2, 4 }, .u8, qkv_data.len);
+    qkv.nvfp4 = .{
+        .block_scales_data = qkv_scales[0..].ptr,
+        .block_scales_len = qkv_scales.len,
+        .rows = 2,
+        .cols = 4,
+        .packed_cols = 2,
+        .scale_cols = 2,
+        .group_size = 2,
+        .weight_global_scale = 2.0,
+    };
+    var z = Tensor.view(z_data[0..].ptr, &.{ 1, 4 }, .u8, z_data.len);
+    z.nvfp4 = .{
+        .block_scales_data = z_scales[0..].ptr,
+        .block_scales_len = z_scales.len,
+        .rows = 1,
+        .cols = 4,
+        .packed_cols = 2,
+        .scale_cols = 2,
+        .group_size = 2,
+        .weight_global_scale = 3.0,
+    };
+    var b = Tensor.view(b_data[0..].ptr, &.{ 1, 4 }, .u8, b_data.len);
+    b.nvfp4 = .{
+        .block_scales_data = b_scales[0..].ptr,
+        .block_scales_len = b_scales.len,
+        .rows = 1,
+        .cols = 4,
+        .packed_cols = 2,
+        .scale_cols = 2,
+        .group_size = 2,
+        .weight_global_scale = 4.0,
+    };
+    var a = Tensor.view(a_data[0..].ptr, &.{ 1, 4 }, .u8, a_data.len);
+    a.nvfp4 = .{
+        .block_scales_data = a_scales[0..].ptr,
+        .block_scales_len = a_scales.len,
+        .rows = 1,
+        .cols = 4,
+        .packed_cols = 2,
+        .scale_cols = 2,
+        .group_size = 2,
+        .weight_global_scale = 5.0,
+    };
+
+    const fused = try buildGatedDeltaSplitInProj(allocator, &qkv, &z, &b, &a);
+    defer @constCast(fused).deinit(allocator);
+
+    try std.testing.expect(fused.nvfp4 != null);
+    try std.testing.expectEqual(@as(i64, 5), fused.shape[0]);
+    try std.testing.expectEqual(@as(i64, 4), fused.shape[1]);
+
+    var expected: [20]f32 = undefined;
+    var actual: [20]f32 = undefined;
+
+    var tmp_qkv: [8]f32 = undefined;
+    var tmp_z: [4]f32 = undefined;
+    var tmp_b: [4]f32 = undefined;
+    var tmp_a: [4]f32 = undefined;
+    try decodeNvfp4TensorRowsToF32(&qkv, tmp_qkv[0..]);
+    try decodeNvfp4TensorRowsToF32(&z, tmp_z[0..]);
+    try decodeNvfp4TensorRowsToF32(&b, tmp_b[0..]);
+    try decodeNvfp4TensorRowsToF32(&a, tmp_a[0..]);
+    try decodeNvfp4TensorRowsToF32(fused, actual[0..]);
+
+    @memcpy(expected[0..8], tmp_qkv[0..]);
+    @memcpy(expected[8..12], tmp_z[0..]);
+    @memcpy(expected[12..16], tmp_b[0..]);
+    @memcpy(expected[16..20], tmp_a[0..]);
+
+    for (expected, actual) |e, a_val| {
+        try std.testing.expectApproxEqAbs(e, a_val, 0.25);
+    }
+}
+
 test "orientEmbedding keeps f16 embedding dtype" {
     const allocator = std.testing.allocator;
     const writer = @import("../../io/safetensors/writer.zig");

@@ -1600,6 +1600,9 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     if (self.kernel_registry.resolveFunction("quantize_f32_to_mxfp8", "talu_quantize_f32_to_mxfp8")) |resolved| {
         self.quantize_f32_to_mxfp8_function = resolved.function;
     } else |_| {}
+    if (self.kernel_registry.resolveFunction("quantize_f32_to_nvfp4", "talu_quantize_f32_to_nvfp4")) |resolved| {
+        self.quantize_f32_to_nvfp4_function = resolved.function;
+    } else |_| {}
     if (self.kernel_registry.resolveFunction("dequant_mxfp8_to_bf16", "talu_dequant_mxfp8_to_bf16")) |resolved| {
         self.mxfp8_dequant_to_bf16_function = resolved.function;
     } else |_| {}
@@ -1645,6 +1648,48 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
         self.nvfp4_matvec_tile8_function = resolved.function;
     } else |err| {
         log.warn("inference", "CUDA NVFP4 matvec tile8 resolve failed", .{
+            .reason = @errorName(err),
+        });
+    }
+    if (self.kernel_registry.resolveFunction("nvfp4_matvec_qkv_f32", "talu_nvfp4_matvec_qkv_f32")) |resolved| {
+        self.nvfp4_matvec_qkv_function = resolved.function;
+    } else |err| {
+        log.warn("inference", "CUDA NVFP4 qkv resolve failed", .{
+            .reason = @errorName(err),
+        });
+    }
+    if (self.kernel_registry.resolveFunction("nvfp4_matvec_qkv_f32_tile8", "talu_nvfp4_matvec_qkv_f32_tile8")) |resolved| {
+        self.nvfp4_matvec_qkv_tile8_function = resolved.function;
+    } else |err| {
+        log.warn("inference", "CUDA NVFP4 qkv tile8 resolve failed", .{
+            .reason = @errorName(err),
+        });
+    }
+    if (self.kernel_registry.resolveFunction("nvfp4_matvec_gate_up_f32", "talu_nvfp4_matvec_gate_up_f32")) |resolved| {
+        self.nvfp4_matvec_gate_up_function = resolved.function;
+    } else |err| {
+        log.warn("inference", "CUDA NVFP4 gate_up resolve failed", .{
+            .reason = @errorName(err),
+        });
+    }
+    if (self.kernel_registry.resolveFunction("nvfp4_matvec_gate_up_f32_tile8", "talu_nvfp4_matvec_gate_up_f32_tile8")) |resolved| {
+        self.nvfp4_matvec_gate_up_tile8_function = resolved.function;
+    } else |err| {
+        log.warn("inference", "CUDA NVFP4 gate_up tile8 resolve failed", .{
+            .reason = @errorName(err),
+        });
+    }
+    if (self.kernel_registry.resolveFunction("nvfp4_matvec_gate_up_silu_f32", "talu_nvfp4_matvec_gate_up_silu_f32")) |resolved| {
+        self.nvfp4_matvec_gate_up_silu_function = resolved.function;
+    } else |err| {
+        log.warn("inference", "CUDA NVFP4 gate_up_silu resolve failed", .{
+            .reason = @errorName(err),
+        });
+    }
+    if (self.kernel_registry.resolveFunction("nvfp4_matvec_gate_up_silu_f32_tile8", "talu_nvfp4_matvec_gate_up_silu_f32_tile8")) |resolved| {
+        self.nvfp4_matvec_gate_up_silu_tile8_function = resolved.function;
+    } else |err| {
+        log.warn("inference", "CUDA NVFP4 gate_up_silu tile8 resolve failed", .{
             .reason = @errorName(err),
         });
     }

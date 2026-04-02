@@ -724,18 +724,34 @@ pub const Nvfp4LinearWeight = struct {
     buffer: compute.cuda.Buffer,
     /// FP8 E4M3 scales in row-major layout [out_dim × scale_cols].
     scales_buffer: compute.cuda.Buffer,
+    /// FP8 UE4M3 block-16 scales in cuBLASLt interleaved layout.
+    /// Padded to 128-tile boundaries: [padded_outer × padded_sf_k] bytes.
+    scales_lt_buffer: compute.cuda.Buffer,
     packed_cols: u32,
     scale_cols: u32,
     group_size: u32,
     weight_global_scale: f32,
 
     pub fn deinit(self: *Nvfp4LinearWeight, device: *compute.cuda.Device) void {
+        if (self.scales_lt_buffer.size > 0) self.scales_lt_buffer.deinit(device);
         if (self.scales_buffer.size > 0) self.scales_buffer.deinit(device);
         self.buffer.deinit(device);
     }
 
     pub fn byteSize(self: *const Nvfp4LinearWeight) usize {
-        return self.buffer.size + self.scales_buffer.size;
+        return self.buffer.size + self.scales_buffer.size + self.scales_lt_buffer.size;
+    }
+
+    /// Compute cuBLASLt-required scale tensor size for VEC16_UE4M3 block scaling.
+    /// inner = contraction dimension (K), outer = non-contraction dimension (M or N).
+    /// Returns total UE4M3 scale bytes padded to cuBLASLt tile boundaries.
+    pub fn cublasLtScaleTensorSize(inner: usize, outer: usize) usize {
+        const sf_k = roundoff((inner + 15) / 16, 4);
+        return roundoff(outer, 128) * sf_k;
+    }
+
+    pub fn roundoff(x: usize, granul: usize) usize {
+        return granul * ((x + (granul - 1)) / granul);
     }
 };
 

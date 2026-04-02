@@ -416,7 +416,7 @@ pub fn uploadLinearWeight(
         return uploadLinearWeightMxfp8(device, allocator, src, input_dim);
     }
     if ((src.dtype == .i8 or src.dtype == .u8) and src.nvfp4 != null) {
-        return uploadLinearWeightNvfp4(device, src, input_dim);
+        return uploadLinearWeightNvfp4(device, allocator, src, input_dim);
     }
     if (src.dtype == .f8_e4m3) {
         return uploadLinearWeightFp8(device, src, input_dim);
@@ -432,6 +432,7 @@ pub fn uploadLinearWeight(
 
 fn uploadLinearWeightNvfp4(
     device: *compute.cuda.Device,
+    allocator: std.mem.Allocator,
     src: *const Tensor,
     input_dim: usize,
 ) !LinearWeight {
@@ -462,11 +463,41 @@ fn uploadLinearWeightNvfp4(
     errdefer scales_buffer.deinit(device);
     try scales_buffer.upload(device, scales_ptr[0..scale_byte_count]);
 
+    var scales_lt_buffer: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 };
+    if (meta.group_size == 16) {
+        const required_scale_cols = (in_dim + 15) / 16;
+        if (scale_cols < required_scale_cols) return error.InvalidArgument;
+        const padded_scale_bytes = engine_types.Nvfp4LinearWeight.cublasLtScaleTensorSize(in_dim, out_dim);
+        const padded_sf_k = engine_types.Nvfp4LinearWeight.roundoff(required_scale_cols, 4);
+        const n_col_tiles = padded_sf_k / 4;
+
+        const interleaved = try allocator.alloc(u8, padded_scale_bytes);
+        defer allocator.free(interleaved);
+        @memset(interleaved, 0);
+
+        for (0..out_dim) |m| {
+            for (0..required_scale_cols) |k| {
+                const src_idx = m * scale_cols + k;
+                const dst_idx = (m / 128) * n_col_tiles * 512 +
+                    (k / 4) * 512 +
+                    (m % 32) * 16 +
+                    ((m % 128) / 32) * 4 +
+                    (k % 4);
+                interleaved[dst_idx] = scales_ptr[src_idx];
+            }
+        }
+
+        scales_lt_buffer = try device.allocBuffer(padded_scale_bytes);
+        errdefer scales_lt_buffer.deinit(device);
+        try scales_lt_buffer.upload(device, interleaved);
+    }
+
     return .{ .nvfp4 = .{
         .rows = in_dim,
         .cols = out_dim,
         .buffer = buffer,
         .scales_buffer = scales_buffer,
+        .scales_lt_buffer = scales_lt_buffer,
         .packed_cols = meta.packed_cols,
         .scale_cols = meta.scale_cols,
         .group_size = meta.group_size,

@@ -20,6 +20,7 @@ const cuda_r_8i: c_int = 3;
 const cuda_r_32i: c_int = 10;
 const cuda_r_16bf: c_int = 14;
 const cuda_r_8f_e4m3: c_int = 28;
+const cuda_r_4f_e2m1: c_int = 33;
 
 const CublasCreateFn = *const fn (*?*anyopaque) callconv(.c) c_int;
 const CublasDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
@@ -450,8 +451,6 @@ pub const Blas = struct {
     /// A is u16 (f16/bf16), B and C are f32.
     /// Column-major convention: op(A) is [m x k], op(B) is [k x n], C is [m x n].
     /// Strides are in elements of the respective type.
-
-
     /// Non-batched GEMM with explicit leading dimensions, both inputs u16.
     /// C = alpha * op(A) @ B + beta * C.
     /// A and B are u16 (f16), C is f32.  Leverages tensor cores.
@@ -522,6 +521,7 @@ const cublaslt_matmul_desc_a_scale_mode: i32 = 31;
 const cublaslt_matmul_desc_b_scale_mode: i32 = 32;
 
 // Scale modes
+const cublaslt_scale_vec16_ue4m3: i32 = 1;
 const cublaslt_scale_vec32_ue8m0: i32 = 2;
 
 // Preference attributes
@@ -574,7 +574,13 @@ pub const BlasLt = struct {
     const lt_workspace_size: usize = 32 * 1024 * 1024; // 32MB (matches NVIDIA sample)
     const max_cached_plans = 64;
 
+    const PlanKind = enum(u8) {
+        mxfp8,
+        nvfp4,
+    };
+
     const CachedPlan = struct {
+        kind: PlanKind = .mxfp8,
         m: usize = 0,
         n: usize = 0,
         k: usize = 0,
@@ -642,6 +648,7 @@ pub const BlasLt = struct {
     /// Scale pointers are needed for the heuristic search on cache miss.
     fn getOrCreatePlan(
         self: *BlasLt,
+        kind: PlanKind,
         M: usize,
         N: usize,
         K: usize,
@@ -652,7 +659,7 @@ pub const BlasLt = struct {
 
         // Look up existing plan
         for (self.cached_plans[0..self.n_cached]) |*plan| {
-            if (plan.m == M and plan.n == N and plan.k == K) return plan;
+            if (plan.kind == kind and plan.m == M and plan.n == N and plan.k == K) return plan;
         }
 
         // Cache full — evict oldest entry (index 0)
@@ -672,7 +679,7 @@ pub const BlasLt = struct {
         }
 
         // Create new plan
-        var plan = CachedPlan{ .m = M, .n = N, .k = K };
+        var plan = CachedPlan{ .kind = kind, .m = M, .n = N, .k = K };
         errdefer {
             if (plan.d_layout) |l| _ = self.api.matrix_layout_destroy(l);
             if (plan.c_layout) |l| _ = self.api.matrix_layout_destroy(l);
@@ -694,8 +701,10 @@ pub const BlasLt = struct {
         if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_transb, @ptrCast(&op_n), @sizeOf(c_int)) != cublas_status_success)
             return error.CublasLtSetAttributeFailed;
 
-        // Set block-32 UE8M0 scale mode for both A (weight) and B (input)
-        var scale_mode: i32 = cublaslt_scale_vec32_ue8m0;
+        const scale_mode: i32 = switch (kind) {
+            .mxfp8 => cublaslt_scale_vec32_ue8m0,
+            .nvfp4 => cublaslt_scale_vec16_ue4m3,
+        };
         if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_a_scale_mode, @ptrCast(&scale_mode), @sizeOf(i32)) != cublas_status_success)
             return error.CublasLtSetAttributeFailed;
         if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_b_scale_mode, @ptrCast(&scale_mode), @sizeOf(i32)) != cublas_status_success)
@@ -711,9 +720,13 @@ pub const BlasLt = struct {
         // A (weight): K×N col-major (with transa=T, logical N×K = out_dim × in_dim)
         // B (input): K×M col-major (with transb=N, logical K×M = in_dim × rows)
         // C/D (output): N×M col-major = out_dim × rows
-        if (self.api.matrix_layout_create(&plan.a_layout, cuda_r_8f_e4m3, K, N, K) != cublas_status_success)
+        const ab_dtype: c_int = switch (kind) {
+            .mxfp8 => cuda_r_8f_e4m3,
+            .nvfp4 => cuda_r_4f_e2m1,
+        };
+        if (self.api.matrix_layout_create(&plan.a_layout, ab_dtype, K, N, K) != cublas_status_success)
             return error.CublasLtLayoutCreateFailed;
-        if (self.api.matrix_layout_create(&plan.b_layout, cuda_r_8f_e4m3, K, M, K) != cublas_status_success)
+        if (self.api.matrix_layout_create(&plan.b_layout, ab_dtype, K, M, K) != cublas_status_success)
             return error.CublasLtLayoutCreateFailed;
         if (self.api.matrix_layout_create(&plan.c_layout, cuda_r_32f, N, M, N) != cublas_status_success)
             return error.CublasLtLayoutCreateFailed;
@@ -778,7 +791,7 @@ pub const BlasLt = struct {
         const a_scale_ptr: ?*const anyopaque = @ptrFromInt(weight_scales_e8m0.pointer);
         const b_scale_ptr: ?*const anyopaque = @ptrFromInt(input_scales_e8m0.pointer);
 
-        const plan = try self.getOrCreatePlan(rows, out_dim, in_dim, a_scale_ptr, b_scale_ptr);
+        const plan = try self.getOrCreatePlan(.mxfp8, rows, out_dim, in_dim, a_scale_ptr, b_scale_ptr);
 
         // Update per-call scale pointers on the cached descriptor
         if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_a_scale_pointer, @ptrCast(&a_scale_ptr), @sizeOf(?*const anyopaque)) != cublas_status_success)
@@ -791,6 +804,69 @@ pub const BlasLt = struct {
         const beta: f32 = 0.0;
         const weight_dev: ?*const anyopaque = @ptrFromInt(weight_e4m3.pointer);
         const input_dev: ?*const anyopaque = @ptrFromInt(input_e4m3.pointer);
+        const out_dev: ?*anyopaque = @ptrFromInt(out_f32.pointer);
+        const ws_ptr: ?*anyopaque = if (self.workspace) |ws| @ptrFromInt(ws.pointer) else null;
+        const algo_ptr: ?*const anyopaque = @ptrCast(&plan.heuristic_result);
+
+        const matmul_status = self.api.matmul(
+            self.handle,
+            plan.matmul_desc,
+            @ptrCast(&alpha),
+            weight_dev,
+            plan.a_layout,
+            input_dev,
+            plan.b_layout,
+            @ptrCast(&beta),
+            out_dev,
+            plan.c_layout,
+            out_dev,
+            plan.d_layout,
+            algo_ptr,
+            ws_ptr,
+            self.workspace_size,
+            stream,
+        );
+        if (matmul_status != cublas_status_success) {
+            return error.CublasLtMatmulFailed;
+        }
+    }
+
+    /// Block-scaled NVFP4 GEMM: C_f32 = A_fp4 @ B_fp4^T with UE4M3 block-16 scales.
+    ///
+    /// Weight A: [out_dim × in_dim] row-major FP4 E2M1, scales: interleaved UE4M3
+    /// Input B: [rows × in_dim] row-major FP4 E2M1, scales: interleaved UE4M3
+    /// Output C: [rows × out_dim] row-major F32
+    pub fn matmulNvfp4(
+        self: *BlasLt,
+        device: *device_mod.Device,
+        weight_fp4: *const device_mod.Buffer,
+        weight_scales_ue4m3: *const device_mod.Buffer,
+        input_fp4: *const device_mod.Buffer,
+        input_scales_ue4m3: *const device_mod.Buffer,
+        out_f32: *device_mod.Buffer,
+        rows: usize,
+        out_dim: usize,
+        in_dim: usize,
+        alpha_scale: f32,
+    ) !void {
+        if (!dimsFitCublas(rows, out_dim, in_dim)) return error.InvalidArgument;
+
+        try device.makeCurrent();
+        const stream = device.getLaunchStream();
+
+        const a_scale_ptr: ?*const anyopaque = @ptrFromInt(weight_scales_ue4m3.pointer);
+        const b_scale_ptr: ?*const anyopaque = @ptrFromInt(input_scales_ue4m3.pointer);
+        const plan = try self.getOrCreatePlan(.nvfp4, rows, out_dim, in_dim, a_scale_ptr, b_scale_ptr);
+
+        if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_a_scale_pointer, @ptrCast(&a_scale_ptr), @sizeOf(?*const anyopaque)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+        if (self.api.matmul_desc_set_attribute(plan.matmul_desc, cublaslt_matmul_desc_b_scale_pointer, @ptrCast(&b_scale_ptr), @sizeOf(?*const anyopaque)) != cublas_status_success)
+            return error.CublasLtSetAttributeFailed;
+
+        const alpha: f32 = alpha_scale;
+        const beta: f32 = 0.0;
+        const weight_dev: ?*const anyopaque = @ptrFromInt(weight_fp4.pointer);
+        const input_dev: ?*const anyopaque = @ptrFromInt(input_fp4.pointer);
         const out_dev: ?*anyopaque = @ptrFromInt(out_f32.pointer);
         const ws_ptr: ?*anyopaque = if (self.workspace) |ws| @ptrFromInt(ws.pointer) else null;
         const algo_ptr: ?*const anyopaque = @ptrCast(&plan.heuristic_result);

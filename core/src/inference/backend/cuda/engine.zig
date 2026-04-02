@@ -395,6 +395,7 @@ pub const CudaBackend = struct {
     fp8_matvec_function: ?compute.cuda.Function = null,
     fp8_matvec_tile8_function: ?compute.cuda.Function = null,
     quantize_f32_to_mxfp8_function: ?compute.cuda.Function = null,
+    quantize_f32_to_nvfp4_function: ?compute.cuda.Function = null,
     mxfp8_dequant_to_bf16_function: ?compute.cuda.Function = null,
     fp8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
     fp8_matvec_gate_up_silu_tile8_function: ?compute.cuda.Function = null,
@@ -405,6 +406,12 @@ pub const CudaBackend = struct {
     mxfp8_matvec_tile8_function: ?compute.cuda.Function = null,
     nvfp4_matvec_function: ?compute.cuda.Function = null,
     nvfp4_matvec_tile8_function: ?compute.cuda.Function = null,
+    nvfp4_matvec_qkv_function: ?compute.cuda.Function = null,
+    nvfp4_matvec_qkv_tile8_function: ?compute.cuda.Function = null,
+    nvfp4_matvec_gate_up_function: ?compute.cuda.Function = null,
+    nvfp4_matvec_gate_up_tile8_function: ?compute.cuda.Function = null,
+    nvfp4_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
+    nvfp4_matvec_gate_up_silu_tile8_function: ?compute.cuda.Function = null,
     mxfp8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
     mxfp8_matvec_gate_up_silu_tile8_function: ?compute.cuda.Function = null,
     mxfp8_matvec_gate_up_function: ?compute.cuda.Function = null,
@@ -423,6 +430,9 @@ pub const CudaBackend = struct {
     gaffine_sequence_rows_supported: bool = false,
     gaffine_sequence_fused_qkv_supported: bool = false,
     gaffine_sequence_fused_gate_up_supported: bool = false,
+    nvfp4_sequence_rows_supported: bool = false,
+    nvfp4_sequence_fused_qkv_supported: bool = false,
+    nvfp4_sequence_fused_gate_up_supported: bool = false,
     u16_blas_f16_supported: bool = true,
     u16_blas_bf16_supported: bool = true,
     kernel_arg_pack: compute.cuda.ArgPack,
@@ -992,6 +1002,29 @@ pub const CudaBackend = struct {
             }
         }
 
+        if (backend.modelHasNvfp4Weights()) {
+            backend.nvfp4_sequence_rows_supported = smoke_checks.probeNvfp4SequenceRowsSupport(&backend) catch false;
+            if (!backend.nvfp4_sequence_rows_supported) {
+                log.warn("inference", "CUDA NVFP4 batch-rows linear degraded mode active (multi-row parity probe failed)", .{
+                    .reason = "nvfp4_batch_rows_probe_failed",
+                });
+            } else {
+                backend.nvfp4_sequence_fused_qkv_supported = smoke_checks.probeNvfp4SequenceFusedQkvSupport(&backend) catch false;
+                if (!backend.nvfp4_sequence_fused_qkv_supported) {
+                    log.warn("inference", "CUDA NVFP4 batch-rows unfused QKV degraded mode active (multi-row fused parity probe failed)", .{
+                        .reason = "nvfp4_batch_rows_fused_qkv_probe_failed",
+                    });
+                }
+
+                backend.nvfp4_sequence_fused_gate_up_supported = smoke_checks.probeNvfp4SequenceFusedGateUpSupport(&backend) catch false;
+                if (!backend.nvfp4_sequence_fused_gate_up_supported) {
+                    log.warn("inference", "CUDA NVFP4 batch-rows unfused gate/up degraded mode active (multi-row fused parity probe failed)", .{
+                        .reason = "nvfp4_batch_rows_fused_gate_up_probe_failed",
+                    });
+                }
+            }
+        }
+
         if (run_startup_selftests) {
             try smoke_checks.runMatmulSmoke(&backend);
             try smoke_checks.runKernelSmoke(&backend);
@@ -1389,6 +1422,9 @@ pub const CudaBackend = struct {
             .gaffine_seq_rows = @as(u8, @intFromBool(backend.gaffine_sequence_rows_supported)),
             .gaffine_seq_qkv = @as(u8, @intFromBool(backend.gaffine_sequence_fused_qkv_supported)),
             .gaffine_seq_gate_up = @as(u8, @intFromBool(backend.gaffine_sequence_fused_gate_up_supported)),
+            .nvfp4_seq_rows = @as(u8, @intFromBool(backend.nvfp4_sequence_rows_supported)),
+            .nvfp4_seq_qkv = @as(u8, @intFromBool(backend.nvfp4_sequence_fused_qkv_supported)),
+            .nvfp4_seq_gate_up = @as(u8, @intFromBool(backend.nvfp4_sequence_fused_gate_up_supported)),
         }, @src());
         return backend;
     }
@@ -2804,6 +2840,37 @@ pub const CudaBackend = struct {
             self.gaffine_u8_matvec_function != null,
             self.nvfp4_matvec_function != null,
         );
+    }
+
+    fn modelHasNvfp4Weights(self: *const CudaBackend) bool {
+        if (switch (self.runtime_buffers.projection_weight) { .nvfp4 => true, else => false }) return true;
+
+        for (self.block_runtime.blocks) |layer| {
+            if (layer.attention_binding) |attn| {
+                if (switch (attn.q_proj) { .nvfp4 => true, else => false }) return true;
+                if (switch (attn.k_proj) { .nvfp4 => true, else => false }) return true;
+                if (switch (attn.v_proj) { .nvfp4 => true, else => false }) return true;
+                if (switch (attn.o_proj) { .nvfp4 => true, else => false }) return true;
+                if (switch (attn.w1) { .nvfp4 => true, else => false }) return true;
+                if (switch (attn.w2) { .nvfp4 => true, else => false }) return true;
+                if (switch (attn.w3) { .nvfp4 => true, else => false }) return true;
+            }
+            if (layer.shortconv_binding) |conv| {
+                if (switch (conv.in_proj) { .nvfp4 => true, else => false }) return true;
+                if (switch (conv.out_proj) { .nvfp4 => true, else => false }) return true;
+                if (conv.ffn_w1) |w1| if (switch (w1) { .nvfp4 => true, else => false }) return true;
+                if (conv.ffn_w2) |w2| if (switch (w2) { .nvfp4 => true, else => false }) return true;
+                if (conv.ffn_w3) |w3| if (switch (w3) { .nvfp4 => true, else => false }) return true;
+            }
+            if (layer.gated_delta_binding) |gd| {
+                if (switch (gd.in_proj) { .nvfp4 => true, else => false }) return true;
+                if (switch (gd.out_proj) { .nvfp4 => true, else => false }) return true;
+                if (gd.ffn_w1) |w1| if (switch (w1) { .nvfp4 => true, else => false }) return true;
+                if (gd.ffn_w2) |w2| if (switch (w2) { .nvfp4 => true, else => false }) return true;
+                if (gd.ffn_w3) |w3| if (switch (w3) { .nvfp4 => true, else => false }) return true;
+            }
+        }
+        return false;
     }
 
     pub fn linearWeightSupportsSequenceRowsForKernels(
