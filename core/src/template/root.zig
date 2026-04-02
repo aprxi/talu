@@ -49,6 +49,7 @@ const parser_mod = @import("parser.zig");
 const eval_mod = @import("eval.zig");
 const validate_mod = @import("validate.zig");
 const json_mod = @import("json.zig");
+const Node = ast.Node;
 
 // Public API: only expose what external callers need
 pub const TemplateInput = eval_mod.TemplateInput;
@@ -207,6 +208,68 @@ pub const COutputSpanList = struct {
     }
 };
 
+/// Parsed template that can be rendered repeatedly without re-lexing/re-parsing.
+///
+/// Owns:
+/// - a copy of the template source (AST slices point into it)
+/// - parser arena allocations backing AST nodes/expressions
+/// - top-level node pointer slice
+pub const CompiledTemplate = struct {
+    allocator: std.mem.Allocator,
+    source: []u8,
+    nodes: []const *const Node,
+    ast_arena: std.heap.ArenaAllocator,
+
+    /// Parse a template once for repeated low-latency renders.
+    pub fn init(allocator: std.mem.Allocator, template: []const u8) Error!CompiledTemplate {
+        const source = try allocator.dupe(u8, template);
+        errdefer allocator.free(source);
+
+        var lexer_ctx = Lexer.init(allocator, source);
+        defer lexer_ctx.deinit();
+        const tokens = lexer_ctx.tokenize() catch {
+            return Error.LexError;
+        };
+
+        var parser_ctx = Parser.init(allocator, tokens);
+        errdefer parser_ctx.deinit();
+        const nodes = parser_ctx.parse() catch {
+            return Error.ParseError;
+        };
+        errdefer allocator.free(nodes);
+
+        // Transfer arena ownership from parser_ctx into the compiled object.
+        // parser_ctx.tokens points to lexer-owned memory and is no longer used
+        // after parse; only parser_ctx.arena is needed for node lifetime.
+        const ast_arena = parser_ctx.arena;
+        parser_ctx.arena = std.heap.ArenaAllocator.init(allocator);
+
+        return .{
+            .allocator = allocator,
+            .source = source,
+            .nodes = nodes,
+            .ast_arena = ast_arena,
+        };
+    }
+
+    pub fn deinit(self: *CompiledTemplate) void {
+        self.allocator.free(self.nodes);
+        self.ast_arena.deinit();
+        self.allocator.free(self.source);
+        self.* = undefined;
+    }
+};
+
+fn mapEvalError(err: EvalError) Error {
+    return switch (err) {
+        // KeyError is returned when accessing missing dict keys in strict mode
+        EvalError.UndefinedVariable, EvalError.KeyError => Error.UndefinedVariable,
+        EvalError.RaiseException => Error.RaiseException,
+        EvalError.IncludeTypeError => Error.IncludeTypeError,
+        else => Error.EvalError,
+    };
+}
+
 /// Render a Jinja2 template with the given context.
 /// Returns allocated string that must be freed by caller.
 pub fn render(allocator: std.mem.Allocator, template: []const u8, ctx: *TemplateParser) Error![]const u8 {
@@ -233,17 +296,20 @@ pub fn render(allocator: std.mem.Allocator, template: []const u8, ctx: *Template
     var eval_ctx = Evaluator.init(allocator, ctx);
     defer eval_ctx.deinit();
 
-    return eval_ctx.render(nodes) catch |err| {
-        // Distinguish specific errors for different error codes
-        return switch (err) {
-            // Both UndefinedVariable and KeyError map to "undefined" for consistency
-            // KeyError is returned when accessing missing dict keys in strict mode
-            EvalError.UndefinedVariable, EvalError.KeyError => Error.UndefinedVariable,
-            EvalError.RaiseException => Error.RaiseException,
-            EvalError.IncludeTypeError => Error.IncludeTypeError,
-            else => Error.EvalError,
-        };
-    };
+    return eval_ctx.render(nodes) catch |err| mapEvalError(err);
+}
+
+/// Render a pre-parsed template.
+///
+/// This skips lex/parse and only evaluates against the provided context.
+pub fn renderCompiled(
+    allocator: std.mem.Allocator,
+    compiled: *const CompiledTemplate,
+    ctx: *TemplateParser,
+) Error![]const u8 {
+    var eval_ctx = Evaluator.init(allocator, ctx);
+    defer eval_ctx.deinit();
+    return eval_ctx.render(compiled.nodes) catch |err| mapEvalError(err);
 }
 
 /// Render with span tracking for debug visualization.
@@ -273,12 +339,7 @@ pub fn renderWithSpans(allocator: std.mem.Allocator, template: []const u8, ctx: 
     defer eval_ctx.deinit();
 
     const result = eval_ctx.renderWithSpans(nodes) catch |err| {
-        return switch (err) {
-            EvalError.UndefinedVariable, EvalError.KeyError => Error.UndefinedVariable,
-            EvalError.RaiseException => Error.RaiseException,
-            EvalError.IncludeTypeError => Error.IncludeTypeError,
-            else => Error.EvalError,
-        };
+        return mapEvalError(err);
     };
 
     return .{
@@ -318,14 +379,7 @@ pub fn renderWithFilters(
     var eval_ctx = Evaluator.initWithFilters(allocator, ctx, custom_filters);
     defer eval_ctx.deinit();
 
-    return eval_ctx.render(nodes) catch |err| {
-        return switch (err) {
-            EvalError.UndefinedVariable, EvalError.KeyError => Error.UndefinedVariable,
-            EvalError.RaiseException => Error.RaiseException,
-            EvalError.IncludeTypeError => Error.IncludeTypeError,
-            else => Error.EvalError,
-        };
-    };
+    return eval_ctx.render(nodes) catch |err| mapEvalError(err);
 }
 
 /// Convert a Zig struct/slice to a Jinja TemplateInput for template context.
@@ -393,6 +447,22 @@ test "render simple variable" {
     try ctx.set("name", .{ .string = "World" });
 
     const result = try render(allocator, "Hello {{ name }}!", &ctx);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("Hello World!", result);
+}
+
+test "CompiledTemplate.init and renderCompiled" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TemplateParser.init(allocator);
+    defer ctx.deinit();
+    try ctx.set("name", .{ .string = "World" });
+
+    var compiled = try CompiledTemplate.init(allocator, "Hello {{ name }}!");
+    defer compiled.deinit();
+
+    const result = try renderCompiled(allocator, &compiled, &ctx);
     defer allocator.free(result);
 
     try std.testing.expectEqualStrings("Hello World!", result);

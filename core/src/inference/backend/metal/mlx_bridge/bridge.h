@@ -20,6 +20,7 @@ int32_t mlx_is_available(void);
 int32_t mlx_validate_config(const char* model_path);
 
 mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed);
+mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed);
 void mlx_destroy(mlx_ctx* ctx);
 int32_t mlx_reset(mlx_ctx* ctx);
 
@@ -47,6 +48,15 @@ int32_t mlx_prefill_logits(
     const int32_t* prompt_ids,
     int32_t prompt_len,
     float* out_logits,
+    int32_t logits_len
+);
+
+int32_t mlx_prefill_logits_batch(
+    mlx_ctx* const* ctxs,
+    const int32_t* const* prompt_ids_ptrs,
+    const int32_t* prompt_lens,
+    float* const* out_logits_ptrs,
+    int32_t batch_size,
     int32_t logits_len
 );
 

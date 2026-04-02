@@ -13,12 +13,14 @@ const cpu_sampling_ops = compute.cpu.sampling_ops;
 
 const LoadedModel = models.LoadedModel;
 const topk_route_candidate_capacity: usize = 256;
+const default_metal_max_batch_size: usize = 4;
 
 const mlx_ctx = opaque {};
 
 extern fn mlx_is_available() c_int;
 extern fn mlx_validate_config(model_path: [*:0]const u8) c_int;
 extern fn mlx_create(model_id: [*:0]const u8, model_path: [*:0]const u8, seed: c_int) ?*mlx_ctx;
+extern fn mlx_clone(source_ctx: ?*mlx_ctx, seed: c_int) ?*mlx_ctx;
 extern fn mlx_destroy(ctx: ?*mlx_ctx) void;
 extern fn mlx_reset(ctx: ?*mlx_ctx) c_int;
 extern fn mlx_last_error() ?[*:0]const u8;
@@ -35,6 +37,15 @@ extern fn mlx_prefill_logits(
     prompt_ids: [*]const i32,
     prompt_len: c_int,
     out_logits: [*]f32,
+    logits_len: c_int,
+) c_int;
+
+extern fn mlx_prefill_logits_batch(
+    ctxs: [*]const *mlx_ctx,
+    prompt_ids_ptrs: [*]const [*]const i32,
+    prompt_lens: [*]const i32,
+    out_logits_ptrs: [*]const [*]f32,
+    batch_size: c_int,
     logits_len: c_int,
 ) c_int;
 
@@ -215,7 +226,7 @@ pub const MetalBackend = struct {
 
     vocab_size: usize,
     d_model: usize,
-    max_batch_size: usize = 1,
+    max_batch_size: usize = default_metal_max_batch_size,
 
     slot_ctxs: []?*mlx_ctx,
     slot_in_use: []bool,
@@ -227,6 +238,10 @@ pub const MetalBackend = struct {
     batch_decode_ctxs: []*mlx_ctx,
     batch_decode_tokens_i32: []i32,
     batch_decode_logits_ptrs: [][*]f32,
+    batch_prefill_ctxs: []*mlx_ctx,
+    batch_prefill_prompt_ptrs: [][*]const i32,
+    batch_prefill_prompt_lens_i32: []i32,
+    batch_prefill_logits_ptrs: [][*]f32,
     slot_state_bindings: []SlotStateBinding,
     slot_route_modes: []SlotRouteMode,
     slot_delegate_slots: []?usize,
@@ -305,12 +320,29 @@ pub const MetalBackend = struct {
     }
 
     fn resolveMaxBatchSize(allocator: std.mem.Allocator) usize {
-        const raw = std.process.getEnvVarOwned(allocator, "TALU_METAL_MAX_BATCH_SIZE") catch return 1;
-        defer allocator.free(raw);
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (trimmed.len == 0) return 1;
-        const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch return 1;
-        return @max(@as(usize, 1), parsed);
+        const parse_raw = struct {
+            fn run(raw: []const u8) ?usize {
+                const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+                if (trimmed.len == 0) return null;
+                const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch return null;
+                return @max(@as(usize, 1), parsed);
+            }
+        }.run;
+
+        if (std.process.getEnvVarOwned(allocator, "TALU_METAL_MAX_BATCH_SIZE")) |raw_metal| {
+            defer allocator.free(raw_metal);
+            if (parse_raw(raw_metal)) |parsed| return parsed;
+            return default_metal_max_batch_size;
+        } else |_| {}
+
+        // Backward-compatible alias used by bench scenarios that set
+        // TALU_CUDA_MAX_BATCH_SIZE across backends.
+        if (std.process.getEnvVarOwned(allocator, "TALU_CUDA_MAX_BATCH_SIZE")) |raw_cuda| {
+            defer allocator.free(raw_cuda);
+            if (parse_raw(raw_cuda)) |parsed| return parsed;
+        } else |_| {}
+
+        return default_metal_max_batch_size;
     }
 
     fn resolveLastError() []const u8 {
@@ -420,15 +452,31 @@ pub const MetalBackend = struct {
     fn ensureSlotCtx(self: *MetalBackend, slot_index: usize) !*mlx_ctx {
         try self.ensureSlotIndex(slot_index);
         if (self.slot_ctxs[slot_index]) |ctx| return ctx;
-        const created = mlx_create(self.model_id_z.ptr, self.model_path_z.ptr, self.seed) orelse {
-            log.warn("inference", "metal mlx_create failed", .{
+
+        var created: ?*mlx_ctx = null;
+        if (slot_index > 0) {
+            if (self.slot_ctxs[0]) |base_ctx| {
+                created = mlx_clone(base_ctx, self.seed);
+                if (created == null) {
+                    log.warn("inference", "metal mlx_clone failed; falling back to mlx_create", .{
+                        .mlx_error = resolveLastError(),
+                        .slot = slot_index,
+                    });
+                }
+            }
+        }
+        if (created == null) {
+            created = mlx_create(self.model_id_z.ptr, self.model_path_z.ptr, self.seed);
+        }
+        const ctx = created orelse {
+            log.warn("inference", "metal slot context creation failed", .{
                 .mlx_error = resolveLastError(),
                 .slot = slot_index,
             });
             return error.InvalidState;
         };
-        self.slot_ctxs[slot_index] = created;
-        return created;
+        self.slot_ctxs[slot_index] = ctx;
+        return ctx;
     }
 
     fn ensureSlotStateBlocksBoundForExecution(self: *const MetalBackend, slot_index: usize) !void {
@@ -707,6 +755,14 @@ pub const MetalBackend = struct {
         errdefer allocator.free(batch_decode_tokens_i32);
         const batch_decode_logits_ptrs = try allocator.alloc([*]f32, max_batch_size);
         errdefer allocator.free(batch_decode_logits_ptrs);
+        const batch_prefill_ctxs = try allocator.alloc(*mlx_ctx, max_batch_size);
+        errdefer allocator.free(batch_prefill_ctxs);
+        const batch_prefill_prompt_ptrs = try allocator.alloc([*]const i32, max_batch_size);
+        errdefer allocator.free(batch_prefill_prompt_ptrs);
+        const batch_prefill_prompt_lens_i32 = try allocator.alloc(i32, max_batch_size);
+        errdefer allocator.free(batch_prefill_prompt_lens_i32);
+        const batch_prefill_logits_ptrs = try allocator.alloc([*]f32, max_batch_size);
+        errdefer allocator.free(batch_prefill_logits_ptrs);
 
         const slot_state_bindings = try allocator.alloc(SlotStateBinding, max_batch_size);
         errdefer allocator.free(slot_state_bindings);
@@ -739,6 +795,10 @@ pub const MetalBackend = struct {
             .batch_decode_ctxs = batch_decode_ctxs,
             .batch_decode_tokens_i32 = batch_decode_tokens_i32,
             .batch_decode_logits_ptrs = batch_decode_logits_ptrs,
+            .batch_prefill_ctxs = batch_prefill_ctxs,
+            .batch_prefill_prompt_ptrs = batch_prefill_prompt_ptrs,
+            .batch_prefill_prompt_lens_i32 = batch_prefill_prompt_lens_i32,
+            .batch_prefill_logits_ptrs = batch_prefill_logits_ptrs,
             .slot_state_bindings = slot_state_bindings,
             .slot_route_modes = slot_route_modes,
             .slot_delegate_slots = slot_delegate_slots,
@@ -764,6 +824,10 @@ pub const MetalBackend = struct {
         }
         self.allocator.free(self.slot_token_scratch);
         self.allocator.free(self.slot_topk_ids_i32);
+        self.allocator.free(self.batch_prefill_logits_ptrs);
+        self.allocator.free(self.batch_prefill_prompt_lens_i32);
+        self.allocator.free(self.batch_prefill_prompt_ptrs);
+        self.allocator.free(self.batch_prefill_ctxs);
         self.allocator.free(self.batch_decode_logits_ptrs);
         self.allocator.free(self.batch_decode_tokens_i32);
         self.allocator.free(self.batch_decode_ctxs);
@@ -1173,14 +1237,10 @@ pub const MetalBackend = struct {
         self.unbindSlotStateBlocks(slot_index);
         self.slot_in_use[slot_index] = false;
         self.clearSlotState(slot_index);
-        if (slot_index == 0) {
-            self.resetCtx(slot_index);
-            return;
-        }
-        if (self.slot_ctxs[slot_index]) |slot_ctx| {
-            mlx_destroy(slot_ctx);
-            self.slot_ctxs[slot_index] = null;
-        }
+        // Keep slot contexts warm across request lifecycles. Destroying and
+        // recreating non-zero slot contexts adds avoidable fixed latency per
+        // request and defeats continuous-batching admission at steady state.
+        self.resetCtx(slot_index);
     }
 
     pub fn resetSlot(self: *MetalBackend, slot_index: usize) void {
@@ -1286,6 +1346,73 @@ pub const MetalBackend = struct {
             @memcpy(slot_logits, logits_view);
         }
         self.slot_positions[slot_index] = tokens.len;
+    }
+
+    pub fn prefillBatch(self: *MetalBackend, requests: []const contract.PrefillBatchRequest) !void {
+        try runtime_contract.validateBatchCapability(.{
+            .supports_batch = true,
+            .supports_graph_emit = false,
+            .max_batch_size = self.max_batch_size,
+        }, requests.len);
+        if (requests.len == 0) return;
+        if (self.vocab_size > @as(usize, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
+
+        var batch_prefill_count: usize = 0;
+        for (requests, 0..) |request_entry, idx| {
+            try self.ensureSlotIndex(request_entry.slot_index);
+            if (!self.slot_in_use[request_entry.slot_index]) return error.InvalidArgument;
+            try self.ensureSlotStateBlocksBoundForExecution(request_entry.slot_index);
+            if (request_entry.prompt_tokens.len == 0) return error.InvalidArgument;
+            if (request_entry.prompt_tokens.len > @as(usize, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
+            if (request_entry.logits_out.len < self.vocab_size) return error.InvalidArgument;
+            for (requests[0..idx]) |prev| {
+                if (prev.slot_index == request_entry.slot_index) return error.InvalidBatchSize;
+            }
+            if (self.slot_route_modes[request_entry.slot_index] == .vision_delegate) {
+                return error.UnsupportedContentType;
+            }
+
+            self.releaseSlotDelegateRouting(request_entry.slot_index);
+            const ctx = try self.ensureSlotCtx(request_entry.slot_index);
+            self.clearSlotState(request_entry.slot_index);
+
+            const prompt_i32 = try self.ensureSlotTokenScratch(request_entry.slot_index, request_entry.prompt_tokens.len);
+            for (request_entry.prompt_tokens, 0..) |token, token_idx| {
+                if (token > @as(u32, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
+                prompt_i32[token_idx] = @intCast(token);
+            }
+
+            self.batch_prefill_ctxs[batch_prefill_count] = ctx;
+            self.batch_prefill_prompt_ptrs[batch_prefill_count] = prompt_i32.ptr;
+            self.batch_prefill_prompt_lens_i32[batch_prefill_count] = @intCast(prompt_i32.len);
+            self.batch_prefill_logits_ptrs[batch_prefill_count] = request_entry.logits_out.ptr;
+            batch_prefill_count += 1;
+        }
+
+        const status = mlx_prefill_logits_batch(
+            self.batch_prefill_ctxs.ptr,
+            self.batch_prefill_prompt_ptrs.ptr,
+            self.batch_prefill_prompt_lens_i32.ptr,
+            self.batch_prefill_logits_ptrs.ptr,
+            @intCast(batch_prefill_count),
+            @intCast(self.vocab_size),
+        );
+        if (status == 0) {
+            log.warn("inference", "metal prefill_logits_batch failed", .{
+                .mlx_error = resolveLastError(),
+                .batch = batch_prefill_count,
+            });
+            return error.InvalidArgument;
+        }
+
+        for (requests) |request_entry| {
+            const slot_logits = self.slotLogitsSlice(request_entry.slot_index);
+            const logits_view = request_entry.logits_out[0..self.vocab_size];
+            if (slot_logits.ptr != logits_view.ptr) {
+                @memcpy(slot_logits, logits_view);
+            }
+            self.slot_positions[request_entry.slot_index] = request_entry.prompt_tokens.len;
+        }
     }
 
     pub fn prefillGreedySeedToken(self: *MetalBackend, slot_index: usize, tokens: []const u32) !u32 {

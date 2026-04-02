@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use talu::batch::{BatchConfig, BatchEvent, BatchHandle, BatchResult};
+use talu::batch::{BatchConfig, BatchEvent, BatchHandle, BatchResult, EventType};
 use talu::router::GenerateConfig;
 use talu::InferenceBackend;
 
@@ -40,6 +40,12 @@ enum SchedulerCommand {
         /// Event sender for this request — registered by the step thread
         /// before any step() call, preventing lost events.
         event_tx: std::sync::mpsc::Sender<BatchEvent>,
+        /// Whether to forward incremental token events (`true`) or only
+        /// the terminal event (`false`).
+        ///
+        /// Non-streaming handlers should set this to `false` to avoid per-token
+        /// channel overhead while still receiving completion notification.
+        stream_events: bool,
         stop_flag: Arc<AtomicBool>,
         reply: std::sync::mpsc::Sender<Result<u64>>,
     },
@@ -62,6 +68,7 @@ unsafe impl Send for SchedulerCommand {}
 
 struct RequestSlot {
     tx: std::sync::mpsc::Sender<BatchEvent>,
+    stream_events: bool,
     stop_flag: Arc<AtomicBool>,
 }
 
@@ -171,6 +178,29 @@ impl SchedulerState {
         config: GenerateConfig,
         stop_flag: Arc<AtomicBool>,
     ) -> Result<(u64, std::sync::mpsc::Receiver<BatchEvent>)> {
+        self.submit_with_event_mode(chat, config, stop_flag, true)
+    }
+
+    /// Submit a generation request and receive only a terminal event.
+    ///
+    /// This keeps batched execution but avoids forwarding per-token events,
+    /// reducing channel/clone overhead for non-streaming endpoints.
+    pub fn submit_final_only(
+        &self,
+        chat: &talu::ChatHandle,
+        config: GenerateConfig,
+        stop_flag: Arc<AtomicBool>,
+    ) -> Result<(u64, std::sync::mpsc::Receiver<BatchEvent>)> {
+        self.submit_with_event_mode(chat, config, stop_flag, false)
+    }
+
+    fn submit_with_event_mode(
+        &self,
+        chat: &talu::ChatHandle,
+        config: GenerateConfig,
+        stop_flag: Arc<AtomicBool>,
+        stream_events: bool,
+    ) -> Result<(u64, std::sync::mpsc::Receiver<BatchEvent>)> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
 
@@ -185,6 +215,7 @@ impl SchedulerState {
                 chat_ptr: chat.as_ptr(),
                 config,
                 event_tx,
+                stream_events,
                 stop_flag,
                 reply: reply_tx,
             })
@@ -360,7 +391,9 @@ fn step_loop(
                 }
 
                 if let Some(slot) = reqs.get(&event.request_id) {
-                    let _ = slot.tx.send(event.clone());
+                    if slot.stream_events || event.is_final {
+                        let _ = slot.tx.send(event.clone());
+                    }
                 }
 
                 if event.is_final {
@@ -393,6 +426,7 @@ fn step_loop(
 
             if let Err(e) = result {
                 log::error!(target: "batch_scheduler", "run_loop error: {}", e);
+                fail_tracked_requests_after_run_loop_error(&batch, &requests, &e.to_string());
             }
         }
 
@@ -400,6 +434,43 @@ fn step_loop(
         if step_count % 256 == 0 {
             sweep_stale_completed(&completed);
         }
+    }
+}
+
+fn fail_tracked_requests_after_run_loop_error(
+    batch: &BatchHandle,
+    requests: &Arc<Mutex<HashMap<u64, RequestSlot>>>,
+    error_message: &str,
+) {
+    let tracked_ids: Vec<u64> = requests
+        .lock()
+        .ok()
+        .map(|reqs| reqs.keys().copied().collect())
+        .unwrap_or_default();
+
+    for id in &tracked_ids {
+        batch.cancel(*id);
+        let _ = batch.take_result(*id);
+    }
+
+    let drained: Vec<(u64, RequestSlot)> = requests
+        .lock()
+        .ok()
+        .map(|mut reqs| reqs.drain().collect())
+        .unwrap_or_default();
+
+    for (request_id, slot) in drained {
+        let _ = slot.tx.send(BatchEvent {
+            request_id,
+            event_type: EventType::Error,
+            item_type: 0,
+            content_type: 0,
+            is_final: true,
+            text: error_message.to_string(),
+            token_id: 0,
+            tokens_generated: 0,
+            timestamp_ns: 0,
+        });
     }
 }
 
@@ -415,6 +486,7 @@ fn handle_command(
             chat_ptr,
             config,
             event_tx,
+            stream_events,
             stop_flag,
             reply,
         } => {
@@ -458,6 +530,7 @@ fn handle_command(
                         *request_id,
                         RequestSlot {
                             tx: event_tx,
+                            stream_events,
                             stop_flag,
                         },
                     );
@@ -505,4 +578,3 @@ fn log_scheduler_snapshot(
         "snapshot: tracked={} active={} pending={} completed_cache={} inflight_cap={}",
         tracked, active, pending, completed_entries, max_inflight);
 }
-

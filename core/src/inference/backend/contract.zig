@@ -31,6 +31,13 @@ pub const DecodeRequest = struct {
     token: u32,
 };
 
+/// Request for one prefill step in scheduler/batched mode.
+pub const PrefillBatchRequest = struct {
+    slot_index: usize,
+    prompt_tokens: []const u32,
+    logits_out: []f32,
+};
+
 /// Decoded logits output for one scheduler slot.
 pub const DecodeResult = struct {
     slot_index: usize,

@@ -1322,6 +1322,33 @@ pub const Backend = union(enum) {
         }
     }
 
+    pub fn prefillBatch(
+        self: *Backend,
+        requests: []const contract.PrefillBatchRequest,
+    ) !void {
+        switch (self.*) {
+            .cpu => |*b| {
+                for (requests) |request| {
+                    try b.prefillSlot(request.slot_index, request.prompt_tokens, request.logits_out);
+                }
+            },
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "prefillBatch")) {
+                try b.prefillBatch(requests);
+            } else if (has_metal) {
+                for (requests) |request| {
+                    try b.prefillSlot(request.slot_index, request.prompt_tokens, request.logits_out);
+                }
+            } else unreachable,
+            .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "prefillBatch")) {
+                try b.prefillBatch(requests);
+            } else if (has_cuda) {
+                for (requests) |request| {
+                    try b.prefillSlot(request.slot_index, request.prompt_tokens, request.logits_out);
+                }
+            } else unreachable,
+        }
+    }
+
     pub fn prefillGreedySeedToken(
         self: *Backend,
         slot_index: usize,

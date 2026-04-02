@@ -39,6 +39,7 @@ pub const PoolingStrategy = backend_root.PoolingStrategy;
 const tokenizer_mod = @import("../tokenizer/root.zig");
 const io = @import("../io/root.zig");
 const image_mod = @import("../image/root.zig");
+const io_json = @import("../io/json/root.zig");
 const gen_config_mod = @import("../inference/config/generation.zig");
 const preproc_mod = @import("../inference/config/preprocessor.zig");
 const validate_mod = @import("../validate/root.zig");
@@ -49,6 +50,7 @@ const tool_schema_mod = @import("tool_schema.zig");
 const reasoning_parser_mod = responses_mod.reasoning_parser;
 const commit_mod = @import("commit.zig");
 const chat_template = @import("../template/chat_template.zig");
+const template_mod = @import("../template/root.zig");
 const progress_mod = @import("../capi/progress.zig");
 const runtime_contract = inference.runtime_contract;
 
@@ -357,8 +359,25 @@ pub const LocalEngine = struct {
 
     /// Path to the model directory.
     model_path: []const u8,
+    /// Cached chat template metadata loaded once at engine init.
+    cached_chat_template: ?CachedChatTemplate,
     /// Plan-derived descriptor contract for scheduler state allocation.
     scheduler_state_descriptors: []runtime_contract.StateDescriptor,
+
+    const CachedChatTemplate = struct {
+        template_source: []const u8,
+        bos_token: []const u8,
+        eos_token: []const u8,
+        compiled_template: ?template_mod.CompiledTemplate = null,
+
+        fn deinit(self: *CachedChatTemplate, allocator: std.mem.Allocator) void {
+            if (self.compiled_template) |*compiled| compiled.deinit();
+            allocator.free(self.template_source);
+            allocator.free(self.bos_token);
+            allocator.free(self.eos_token);
+            self.* = undefined;
+        }
+    };
 
     fn appendProgramStateDescriptors(
         storage: []runtime_contract.StateDescriptor,
@@ -400,6 +419,120 @@ pub const LocalEngine = struct {
         const descriptors = try allocator.alloc(runtime_contract.StateDescriptor, count);
         @memcpy(descriptors, storage[0..count]);
         return descriptors;
+    }
+
+    fn loadCachedChatTemplate(allocator: std.mem.Allocator, model_dir: []const u8) !CachedChatTemplate {
+        const config_path = try std.fs.path.join(allocator, &.{ model_dir, "tokenizer_config.json" });
+        defer allocator.free(config_path);
+
+        const config_bytes = try std.fs.cwd().readFileAlloc(allocator, config_path, 4 * 1024 * 1024);
+        defer allocator.free(config_bytes);
+
+        const parsed_config = io_json.parseValue(allocator, config_bytes, .{ .max_size_bytes = 4 * 1024 * 1024 }) catch {
+            return error.InvalidJson;
+        };
+        defer parsed_config.deinit();
+
+        const obj = switch (parsed_config.value) {
+            .object => |object| object,
+            else => return error.InvalidJson,
+        };
+
+        const template_source = if (obj.get("chat_template")) |template_value| switch (template_value) {
+            .string => |s| try allocator.dupe(u8, s),
+            else => try gen_config_mod.getChatTemplateSource(allocator, model_dir),
+        } else try gen_config_mod.getChatTemplateSource(allocator, model_dir);
+        errdefer allocator.free(template_source);
+
+        const bos_token = if (obj.get("bos_token")) |v| switch (v) {
+            .string => |s| try allocator.dupe(u8, s),
+            else => try allocator.dupe(u8, ""),
+        } else try allocator.dupe(u8, "");
+        errdefer allocator.free(bos_token);
+
+        const eos_token = if (obj.get("eos_token")) |v| switch (v) {
+            .string => |s| try allocator.dupe(u8, s),
+            else => try allocator.dupe(u8, ""),
+        } else try allocator.dupe(u8, "");
+        errdefer allocator.free(eos_token);
+
+        // Best-effort compile of the template for faster per-request rendering.
+        // If compilation fails (unsupported syntax edge-case), fall back to
+        // renderWithContext() using template_source at request time.
+        var compiled_template: ?template_mod.CompiledTemplate = template_mod.CompiledTemplate.init(
+            allocator,
+            template_source,
+        ) catch null;
+        errdefer if (compiled_template) |*compiled| compiled.deinit();
+
+        return .{
+            .template_source = template_source,
+            .bos_token = bos_token,
+            .eos_token = eos_token,
+            .compiled_template = compiled_template,
+        };
+    }
+
+    pub fn renderPromptWithCachedTemplate(
+        self: *LocalEngine,
+        messages_json: []const u8,
+        add_generation_prompt: bool,
+        template_override: ?[]const u8,
+        extra_context_json: ?[]const u8,
+    ) ![]const u8 {
+        if (template_override) |override| {
+            if (self.cached_chat_template) |*cached| {
+                return chat_template.renderWithContext(
+                    self.allocator,
+                    override,
+                    messages_json,
+                    cached.bos_token,
+                    cached.eos_token,
+                    add_generation_prompt,
+                    extra_context_json,
+                );
+            }
+            return gen_config_mod.applyChatTemplateWithOverrides(
+                self.allocator,
+                self.model_path,
+                messages_json,
+                add_generation_prompt,
+                template_override,
+                extra_context_json,
+            );
+        }
+
+        if (self.cached_chat_template) |*cached| {
+            if (cached.compiled_template) |*compiled| {
+                return chat_template.renderCompiledWithContext(
+                    self.allocator,
+                    compiled,
+                    messages_json,
+                    cached.bos_token,
+                    cached.eos_token,
+                    add_generation_prompt,
+                    extra_context_json,
+                );
+            }
+            return chat_template.renderWithContext(
+                self.allocator,
+                cached.template_source,
+                messages_json,
+                cached.bos_token,
+                cached.eos_token,
+                add_generation_prompt,
+                extra_context_json,
+            );
+        }
+
+        return gen_config_mod.applyChatTemplateWithOverrides(
+            self.allocator,
+            self.model_path,
+            messages_json,
+            add_generation_prompt,
+            null,
+            extra_context_json,
+        );
     }
 
     /// Initialize engine from a model path or model ID.
@@ -463,6 +596,16 @@ pub const LocalEngine = struct {
         // Load generation config
         var generation_config = try gen_config_mod.loadGenerationConfig(allocator, resolved_model_path);
         errdefer generation_config.deinit(allocator);
+
+        // Best-effort cache for chat template rendering metadata.
+        // When unavailable, requests fall back to the existing on-demand path.
+        var cached_chat_template = loadCachedChatTemplate(allocator, resolved_model_path) catch |err| blk: {
+            log.debug("load", "chat template cache unavailable", .{
+                .reason = @errorName(err),
+            }, @src());
+            break :blk null;
+        };
+        errdefer if (cached_chat_template) |*cached| cached.deinit(allocator);
 
         // Load preprocessor config (pixel limits for vision smart resize)
         const preproc_config = preproc_mod.loadPreprocessorConfig(allocator, resolved_model_path);
@@ -633,6 +776,7 @@ pub const LocalEngine = struct {
             .gen_config = generation_config,
             .preproc_config = preproc_config,
             .model_path = resolved_model_path,
+            .cached_chat_template = cached_chat_template,
             .scheduler_state_descriptors = scheduler_state_descriptors,
         };
     }
@@ -646,6 +790,7 @@ pub const LocalEngine = struct {
         self.tok.deinit();
         self.gen_config.deinit(self.allocator);
         self.allocator.free(self.model_path);
+        if (self.cached_chat_template) |*cached| cached.deinit(self.allocator);
         if (self.scheduler_state_descriptors.len > 0) self.allocator.free(self.scheduler_state_descriptors);
         self.* = undefined;
     }
@@ -756,9 +901,7 @@ pub const LocalEngine = struct {
 
         // Apply chat template with optional overrides
         log.debug("inference", "Applying chat template", .{ .messages_len = messages_json.len }, @src());
-        const prompt = gen_config_mod.applyChatTemplateWithOverrides(
-            self.allocator,
-            self.model_path,
+        const prompt = self.renderPromptWithCachedTemplate(
             messages_json,
             true, // add_generation_prompt
             opts.template_override,
@@ -1027,7 +1170,6 @@ pub const LocalEngine = struct {
         else
             null;
         defer if (thinking_end_tokens) |t| self.allocator.free(t);
-
 
         // Generate synchronously
         log.debug("router", "generateSync starting", .{
@@ -1872,9 +2014,7 @@ pub const LocalEngine = struct {
         defer self.allocator.free(messages_json);
 
         // Apply chat template with optional overrides
-        const prompt = gen_config_mod.applyChatTemplateWithOverrides(
-            self.allocator,
-            self.model_path,
+        const prompt = self.renderPromptWithCachedTemplate(
             messages_json,
             true, // add_generation_prompt
             opts.template_override,
@@ -2313,4 +2453,74 @@ test "buildEffectiveContext preserves nested tools" {
     const result = ctx.?;
     try std.testing.expect(std.mem.indexOf(u8, result, "\"function\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"calc\"") != null);
+}
+
+test "loadCachedChatTemplate reads inline template and special tokens" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tokenizer_config_json =
+        \\{
+        \\  "chat_template": "{{ messages[0].content }}",
+        \\  "bos_token": "<s>",
+        \\  "eos_token": "</s>"
+        \\}
+    ;
+    try tmp_dir.dir.writeFile(.{ .sub_path = "tokenizer_config.json", .data = tokenizer_config_json });
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var cached = try LocalEngine.loadCachedChatTemplate(allocator, tmp_path);
+    defer cached.deinit(allocator);
+
+    try std.testing.expectEqualStrings("{{ messages[0].content }}", cached.template_source);
+    try std.testing.expectEqualStrings("<s>", cached.bos_token);
+    try std.testing.expectEqualStrings("</s>", cached.eos_token);
+}
+
+test "loadCachedChatTemplate falls back to chat_template.jinja" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tokenizer_config_json =
+        \\{
+        \\  "bos_token": "<s>",
+        \\  "eos_token": "</s>"
+        \\}
+    ;
+    const template_content = "{% for m in messages %}{{ m.content }}{% endfor %}";
+    try tmp_dir.dir.writeFile(.{ .sub_path = "tokenizer_config.json", .data = tokenizer_config_json });
+    try tmp_dir.dir.writeFile(.{ .sub_path = "chat_template.jinja", .data = template_content });
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var cached = try LocalEngine.loadCachedChatTemplate(allocator, tmp_path);
+    defer cached.deinit(allocator);
+
+    try std.testing.expectEqualStrings(template_content, cached.template_source);
+    try std.testing.expectEqualStrings("<s>", cached.bos_token);
+    try std.testing.expectEqualStrings("</s>", cached.eos_token);
+}
+
+test "loadCachedChatTemplate rejects non-object tokenizer config" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "tokenizer_config.json", .data = "[]" });
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    try std.testing.expectError(
+        error.InvalidJson,
+        LocalEngine.loadCachedChatTemplate(allocator, tmp_path),
+    );
 }

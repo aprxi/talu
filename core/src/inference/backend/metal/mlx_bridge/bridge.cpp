@@ -40,6 +40,7 @@ bool g_wired_limit_active = false;
 std::mutex g_rng_mutex;
 size_t g_active_ctx_count = 0;
 thread_local std::vector<array> g_decode_batch_logits_flat_scratch;
+thread_local std::vector<array> g_prefill_batch_logits_flat_scratch;
 
 void enter_rng_epoch(int32_t seed) {
     std::lock_guard<std::mutex> lock(g_rng_mutex);
@@ -1312,6 +1313,12 @@ int resolve_prefill_chunk_size() {
     return env_positive_int("TALU_METAL_PREFILL_CHUNK_SIZE", 64);
 }
 
+int resolve_prefill_full_prompt_threshold() {
+    // For short prompts, one full-prompt forward avoids extra chunk-loop
+    // dispatch/sync overhead in the prefill + seed-token path.
+    return env_positive_int("TALU_METAL_PREFILL_FULL_PROMPT_THRESHOLD", 128);
+}
+
 struct MemoryBudgetEstimate {
     size_t memory_size_bytes = 0;
     size_t max_recommended_bytes = 0;
@@ -2524,6 +2531,68 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
     }
 }
 
+mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
+    bool wired_limit_acquired = false;
+    bool rng_entered = false;
+    try {
+        if (!source_ctx) {
+            g_last_error = "mlx_clone: source ctx is null";
+            return nullptr;
+        }
+
+        const bool enable_wired_limit = env_truthy("TALU_METAL_WIRED_LIMIT", false);
+        if (enable_wired_limit) {
+            wired_limit_acquired = acquire_wired_limit();
+        }
+
+        enter_rng_epoch(seed);
+        rng_entered = true;
+
+        auto ctx = std::make_unique<mlx_ctx>();
+        ctx->model_id = source_ctx->model_id;
+        ctx->model_path = source_ctx->model_path;
+        ctx->cfg = source_ctx->cfg;
+
+        // Arrays are ref-counted in MLX. Copying these fields keeps one shared
+        // immutable weight set while each context owns independent runtime state.
+        ctx->embed_tokens = source_ctx->embed_tokens;
+        ctx->lm_head_rhs = source_ctx->lm_head_rhs;
+        ctx->lm_head_q_w = source_ctx->lm_head_q_w;
+        ctx->lm_head_q_scales = source_ctx->lm_head_q_scales;
+        ctx->final_norm_w = source_ctx->final_norm_w;
+        ctx->has_fp8_meta = source_ctx->has_fp8_meta;
+        ctx->has_mxfp8_meta = source_ctx->has_mxfp8_meta;
+        ctx->lm_head_q_decode_enabled = source_ctx->lm_head_q_decode_enabled;
+        ctx->fp8_decode_qmm_enabled = source_ctx->fp8_decode_qmm_enabled;
+        ctx->layers = source_ctx->layers;
+        ctx->profile_layers = source_ctx->profile_layers;
+
+        // Runtime state starts clean for the cloned context.
+        ctx->kv_cache.resize(source_ctx->kv_cache.size());
+        ctx->linear_cache.resize(source_ctx->linear_cache.size());
+        ctx->stream_ready = false;
+        ctx->trace_decode_token = 1;
+        ctx->xray_enabled = false;
+        ctx->sampling_context_counts.clear();
+        ctx->sampling_context_len = 0;
+        ctx->sampling_unique_ids.clear();
+        ctx->sampling_repetition_scales.clear();
+        ctx->sampling_additive_penalties.clear();
+
+        return ctx.release();
+    } catch (const std::exception& e) {
+        if (wired_limit_acquired) release_wired_limit();
+        if (rng_entered) leave_rng_epoch();
+        g_last_error = e.what();
+        return nullptr;
+    } catch (...) {
+        if (wired_limit_acquired) release_wired_limit();
+        if (rng_entered) leave_rng_epoch();
+        g_last_error = "unknown error in mlx_clone";
+        return nullptr;
+    }
+}
+
 void mlx_destroy(mlx_ctx* ctx) {
     if (ctx) {
         release_wired_limit();
@@ -2564,15 +2633,22 @@ int32_t mlx_prefill_first(
         std::vector<int32_t> prompt_vec(prompt_ids, prompt_ids + prompt_len);
         reset_runtime_state(ctx);
         ctx->xray_enabled = (talu_metal_xray_is_enabled() != 0);
+        const int full_prompt_threshold = resolve_prefill_full_prompt_threshold();
 
         array first_token = array(0.0f);
         if (prompt_len > 1) {
-            prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
+            if (prompt_len <= full_prompt_threshold) {
+                const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
+                const array seed_logits = forward_logits(ctx, prompt_arr);
+                first_token = next_token_greedy(last_token_logits(seed_logits));
+            } else {
+                prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
 
-            const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
-            const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
-            const array seed_logits = forward_logits(ctx, last_token_arr);
-            first_token = next_token_greedy(last_token_logits(seed_logits));
+                const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
+                const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
+                const array seed_logits = forward_logits(ctx, last_token_arr);
+                first_token = next_token_greedy(last_token_logits(seed_logits));
+            }
         } else {
             const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
             const array seed_logits = forward_logits(ctx, prompt_arr);
@@ -2610,6 +2686,7 @@ int32_t mlx_prefill_logits(
         std::vector<int32_t> prompt_vec(prompt_ids, prompt_ids + prompt_len);
         reset_runtime_state(ctx);
         ctx->xray_enabled = (talu_metal_xray_is_enabled() != 0);
+        const int full_prompt_threshold = resolve_prefill_full_prompt_threshold();
 
         array first_logits = array(0.0f);
         const bool prefill_trace_enabled = ctx->xray_enabled &&
@@ -2619,33 +2696,46 @@ int32_t mlx_prefill_logits(
                 xray_should_emit(XRAY_POINT_BLOCK_OUT, 0, static_cast<uint32_t>(prompt_len)) ||
                 xray_should_emit(XRAY_POINT_FINAL_NORM, XRAY_GLOBAL_LAYER, 1) ||
                 xray_should_emit(XRAY_POINT_LM_HEAD, XRAY_GLOBAL_LAYER, 0));
-        if (prompt_len > 1 && prefill_trace_enabled) {
-            // HF tensor references store prefill checkpoints from a full-prompt
-            // pass. Emit those from full prompt, then rebuild stream state via
-            // the incremental route to preserve decode behavior.
-            const TraceFrame trace_frame{
-                .token = 0,
-                .layer_position = static_cast<uint32_t>(prompt_len),
-                .emit_embed = true,
-            };
-            const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
-            const array seed_logits = forward_logits(ctx, prompt_arr, &trace_frame);
-            first_logits = last_token_logits(seed_logits);
+        if (prompt_len > 1) {
+            if (prompt_len <= full_prompt_threshold) {
+                const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
+                const TraceFrame trace_frame{
+                    .token = 0,
+                    .layer_position = static_cast<uint32_t>(prompt_len),
+                    .emit_embed = true,
+                };
+                const array seed_logits = prefill_trace_enabled
+                    ? forward_logits(ctx, prompt_arr, &trace_frame)
+                    : forward_logits(ctx, prompt_arr);
+                first_logits = last_token_logits(seed_logits);
+            } else if (prefill_trace_enabled) {
+                // HF tensor references store prefill checkpoints from a full-prompt
+                // pass. Emit those from full prompt, then rebuild stream state via
+                // the incremental route to preserve decode behavior.
+                const TraceFrame trace_frame{
+                    .token = 0,
+                    .layer_position = static_cast<uint32_t>(prompt_len),
+                    .emit_embed = true,
+                };
+                const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
+                const array seed_logits = forward_logits(ctx, prompt_arr, &trace_frame);
+                first_logits = last_token_logits(seed_logits);
 
-            reset_runtime_state(ctx);
-            prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
+                reset_runtime_state(ctx);
+                prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
 
-            const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
-            const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
-            const array rebuild_logits = forward_logits(ctx, last_token_arr);
-            (void)rebuild_logits;
-        } else if (prompt_len > 1) {
-            prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
+                const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
+                const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
+                const array rebuild_logits = forward_logits(ctx, last_token_arr);
+                (void)rebuild_logits;
+            } else {
+                prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
 
-            const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
-            const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
-            const array seed_logits = forward_logits(ctx, last_token_arr);
-            first_logits = last_token_logits(seed_logits);
+                const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
+                const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
+                const array seed_logits = forward_logits(ctx, last_token_arr);
+                first_logits = last_token_logits(seed_logits);
+            }
         } else {
             const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
             const TraceFrame trace_frame{
@@ -2676,6 +2766,105 @@ int32_t mlx_prefill_logits(
         return 0;
     } catch (...) {
         g_last_error = "unknown error in mlx_prefill_logits";
+        return 0;
+    }
+}
+
+int32_t mlx_prefill_logits_batch(
+    mlx_ctx* const* ctxs,
+    const int32_t* const* prompt_ids_ptrs,
+    const int32_t* prompt_lens,
+    float* const* out_logits_ptrs,
+    int32_t batch_size,
+    int32_t logits_len
+) {
+    if (!ctxs || !prompt_ids_ptrs || !prompt_lens || !out_logits_ptrs ||
+        batch_size <= 0 || logits_len <= 0) {
+        g_last_error = "mlx_prefill_logits_batch: invalid arguments";
+        return 0;
+    }
+
+    if (batch_size == 1) {
+        return mlx_prefill_logits(ctxs[0], prompt_ids_ptrs[0], prompt_lens[0], out_logits_ptrs[0], logits_len);
+    }
+
+    for (int32_t idx = 0; idx < batch_size; ++idx) {
+        if (!ctxs[idx] || !prompt_ids_ptrs[idx] || prompt_lens[idx] <= 0 || !out_logits_ptrs[idx]) {
+            g_last_error = "mlx_prefill_logits_batch: null ctx/prompt/logits entry";
+            return 0;
+        }
+    }
+
+    try {
+        const int full_prompt_threshold = resolve_prefill_full_prompt_threshold();
+        auto& prefill_logits_flat_batch = g_prefill_batch_logits_flat_scratch;
+        prefill_logits_flat_batch.clear();
+        if (prefill_logits_flat_batch.capacity() < static_cast<size_t>(batch_size)) {
+            prefill_logits_flat_batch.reserve(static_cast<size_t>(batch_size));
+        }
+
+        std::vector<std::vector<int32_t>> prompt_storage;
+        if (prompt_storage.capacity() < static_cast<size_t>(batch_size)) {
+            prompt_storage.reserve(static_cast<size_t>(batch_size));
+        }
+
+        for (int32_t idx = 0; idx < batch_size; ++idx) {
+            mlx_ctx* ctx = ctxs[idx];
+            const int32_t* prompt_ids = prompt_ids_ptrs[idx];
+            const int32_t prompt_len = prompt_lens[idx];
+            prompt_storage.emplace_back(prompt_ids, prompt_ids + prompt_len);
+            const std::vector<int32_t>& prompt_vec = prompt_storage.back();
+
+            reset_runtime_state(ctx);
+            ctx->xray_enabled = (talu_metal_xray_is_enabled() != 0);
+
+            array first_logits = array(0.0f);
+            if (prompt_len > 1) {
+                if (prompt_len <= full_prompt_threshold) {
+                    const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
+                    const array seed_logits = forward_logits(ctx, prompt_arr);
+                    first_logits = last_token_logits(seed_logits);
+                } else {
+                    prefill_prefix_chunks(ctx, prompt_vec, prompt_len - 1);
+
+                    const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
+                    const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
+                    const array seed_logits = forward_logits(ctx, last_token_arr);
+                    first_logits = last_token_logits(seed_logits);
+                }
+            } else {
+                const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
+                const array seed_logits = forward_logits(ctx, prompt_arr);
+                first_logits = last_token_logits(seed_logits);
+            }
+
+            const int flat_size = static_cast<int>(first_logits.size());
+            const array first_logits_flat = reshape(astype(first_logits, float32), {flat_size});
+            if (static_cast<int32_t>(first_logits_flat.size()) != logits_len) {
+                g_last_error = "mlx_prefill_logits_batch: logits length mismatch";
+                return 0;
+            }
+            prefill_logits_flat_batch.push_back(first_logits_flat);
+        }
+
+        eval(prefill_logits_flat_batch);
+        synchronize();
+
+        for (int32_t idx = 0; idx < batch_size; ++idx) {
+            const array& logits_flat = prefill_logits_flat_batch[static_cast<size_t>(idx)];
+            std::memcpy(
+                out_logits_ptrs[idx],
+                logits_flat.data<float>(),
+                static_cast<size_t>(logits_len) * sizeof(float)
+            );
+            ctxs[idx]->stream_ready = true;
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_prefill_logits_batch";
         return 0;
     }
 }

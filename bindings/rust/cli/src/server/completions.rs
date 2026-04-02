@@ -104,15 +104,32 @@ async fn handle_non_streaming(
         // No further extraction or format conversion needed here.
         if let Some(ref sched) = batch_scheduler {
             let (request_id, event_rx) = sched
-                .submit(&chat, cfg, stop_flag)
+                .submit_final_only(&chat, cfg, stop_flag)
                 .map_err(|e| anyhow!("batch submit failed: {e}"))?;
 
+            let mut final_error: Option<String> = None;
             loop {
                 match event_rx.recv() {
-                    Ok(event) if event.is_final => break,
-                    Ok(_) => {}
-                    Err(_) => break,
+                    Ok(event) => {
+                        if matches!(event.event_type, talu::batch::EventType::Error) {
+                            final_error = Some(if event.text.is_empty() {
+                                "scheduler run loop failed".to_string()
+                            } else {
+                                event.text.clone()
+                            });
+                        }
+                        if event.is_final {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        final_error.get_or_insert_with(|| "batch event channel closed before completion".to_string());
+                        break;
+                    }
                 }
+            }
+            if let Some(msg) = final_error {
+                return Err(anyhow!("batch generation failed: {msg}"));
             }
 
             let r = sched.take_result(request_id);
@@ -144,7 +161,7 @@ async fn handle_non_streaming(
                         finish_reason_str(r.finish_reason),
                     ))
                 }
-                None => Ok((None::<String>, None::<serde_json::Value>, 0u64, 0u64, "stop")),
+                None => Err(anyhow!("batch generation completed without a result")),
             }
         } else {
             let mut guard = backend.blocking_lock();
@@ -281,9 +298,17 @@ async fn handle_streaming(
 
             // Stream batch events as completions chunks.
             // Each event.text is raw decoded text from the C API.
+            let mut final_error: Option<String> = None;
             loop {
                 match event_rx.recv() {
                     Ok(event) => {
+                        if matches!(event.event_type, talu::batch::EventType::Error) {
+                            final_error = Some(if event.text.is_empty() {
+                                "scheduler run loop failed".to_string()
+                            } else {
+                                event.text.clone()
+                            });
+                        }
                         if !event.text.is_empty() {
                             let chunk = ChatCompletionChunk {
                                 id: completion_id.clone(),
@@ -309,8 +334,15 @@ async fn handle_streaming(
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        final_error.get_or_insert_with(|| "batch event channel closed before completion".to_string());
+                        break;
+                    }
                 }
+            }
+            if let Some(msg) = final_error {
+                let _ = send_error_chunk(&tx, &format!("batch generation failed: {msg}"));
+                return;
             }
 
             let batch_result = sched.take_result(request_id);
@@ -319,9 +351,8 @@ async fn handle_streaming(
                 completion_tokens = r.completion_tokens as u64;
                 finish_reason = finish_reason_str(r.finish_reason);
             } else {
-                prompt_tokens = 0;
-                completion_tokens = 0;
-                finish_reason = "stop";
+                let _ = send_error_chunk(&tx, "batch generation completed without a result");
+                return;
             }
         } else {
             // Direct generate_stream path (remote/provider backends).

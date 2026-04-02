@@ -1,11 +1,13 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use log::LevelFilter;
 use talu::blobs::BlobsHandle;
+use talu::ChatHandle;
 
 pub mod agent;
 pub mod auth_gateway;
@@ -307,6 +309,12 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
             }
         });
 
+    // Warm up scheduler/model hot path once at startup so the first user
+    // request does not pay one-time initialization latency.
+    if let Some(ref sched) = batch_scheduler {
+        warmup_batch_scheduler(sched, backend_state.current_model.as_deref());
+    }
+
     let state = state::AppState {
         backend: Arc::new(tokio::sync::Mutex::new(backend_state)),
         batch_scheduler: std::sync::Mutex::new(batch_scheduler),
@@ -409,6 +417,119 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     // then forcefully shut down so the process exits promptly on Ctrl+C.
     runtime.shutdown_timeout(std::time::Duration::from_secs(3));
     Ok(())
+}
+
+pub(crate) fn warmup_batch_scheduler(
+    scheduler: &Arc<batch_scheduler::SchedulerState>,
+    model_id: Option<&str>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let started = std::time::Instant::now();
+    let chat = match ChatHandle::new(None) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(target: "server::init", "warmup skipped (chat init failed): {e}");
+            return;
+        }
+    };
+    // Keep warmup prompt tiny; goal is priming request path, not benchmarking.
+    if let Err(e) = chat.load_completions_json(r#"[{"role":"user","content":"warmup"}]"#) {
+        log::warn!(target: "server::init", "warmup skipped (message load failed): {e}");
+        return;
+    }
+
+    let mut cfg = talu::router::GenerateConfig::default();
+    cfg.completions_mode = true;
+    cfg.max_tokens = 1;
+    cfg.temperature = 0.0;
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    let submit = scheduler.submit_final_only(&chat, cfg, stop_flag);
+    let (request_id, event_rx) = match submit {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(target: "server::init", "warmup submit failed: {e}");
+            return;
+        }
+    };
+
+    let warmup_timeout_ms = std::env::var("TALU_SCHEDULER_WARMUP_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(1_500);
+    let timeout = std::time::Duration::from_millis(warmup_timeout_ms);
+
+    let mut saw_final = false;
+    let mut final_error: Option<String> = None;
+
+    loop {
+        match event_rx.recv_timeout(timeout) {
+            Ok(event) => {
+                if matches!(event.event_type, talu::batch::EventType::Error) {
+                    final_error = Some(if event.text.is_empty() {
+                        "scheduler run loop failed during warmup".to_string()
+                    } else {
+                        event.text.clone()
+                    });
+                }
+                if event.is_final {
+                    saw_final = true;
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                log::warn!(
+                    target: "server::init",
+                    "warmup timed out: model={} timeout_ms={}",
+                    model_id.unwrap_or("(unknown)"),
+                    warmup_timeout_ms
+                );
+                break;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                log::warn!(
+                    target: "server::init",
+                    "warmup event channel closed early: model={}",
+                    model_id.unwrap_or("(unknown)")
+                );
+                break;
+            }
+        }
+    }
+
+    if !saw_final {
+        scheduler.cancel(request_id);
+        let _ = scheduler.take_result(request_id);
+        return;
+    }
+
+    if let Some(msg) = final_error {
+        let _ = scheduler.take_result(request_id);
+        log::warn!(
+            target: "server::init",
+            "warmup failed: model={} error={}",
+            model_id.unwrap_or("(unknown)"),
+            msg
+        );
+        return;
+    }
+
+    if scheduler.take_result(request_id).is_none() {
+        log::warn!(
+            target: "server::init",
+            "warmup finished without result: model={}",
+            model_id.unwrap_or("(unknown)")
+        );
+        return;
+    }
+    log::info!(
+        target: "server::init",
+        "warmup complete: model={} elapsed_ms={:.2}",
+        model_id.unwrap_or("(unknown)"),
+        started.elapsed().as_secs_f64() * 1000.0
+    );
 }
 
 fn resolve_sandbox_backend(

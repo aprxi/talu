@@ -166,6 +166,8 @@ pub const TokenEvent = struct {
     in_thinking: bool,
     /// Slot index (for debugging)
     slot_index: usize,
+    /// Wall-clock timestamp when the token event was produced.
+    timestamp_ns: i128 = 0,
 };
 
 /// Scheduler configuration.
@@ -199,6 +201,7 @@ pub const SchedulerConfig = struct {
 /// - `unbindSlotStateBlocks(*T, usize) void` - unbind opaque slot state
 /// - `prefillSlot(*T, usize, []const u32, []f32) !void` - prefill
 /// - optional: `prefillSlotWithVision(*T, usize, []const u32, ?*const PrefillVisionInput, []f32) !void`
+/// - optional: `prefillBatch(*T, []const contract.PrefillBatchRequest) !void`
 /// - optional: `supportsSchedulerBackendDecodeStreamingRoute(*const T) bool`
 /// - optional: `decodeStreaming(*T, u32, usize, usize, []const u32, []u32, ?*const fn (u32, ?*anyopaque) void, ?*anyopaque) !usize`
 /// - `decodeBatch(*T, []const DecodeRequest, []DecodeResult) !void` - batch decode
@@ -235,6 +238,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         decode_candidate_counts: []usize,
         /// Logits buffer for prefill
         logits_buffer: []f32,
+        /// Scratch buffers for optional batched prefill route.
+        prefill_requests: []contract.PrefillBatchRequest,
+        prefill_request_ids: []u64,
+        prefill_logits_buffer: []f32,
 
         /// Optimized sampler with SIMD and pre-allocated workspace
         sampler: sampling.Sampler,
@@ -293,6 +300,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             errdefer allocator.free(decode_candidate_ids);
             const decode_candidate_counts = try allocator.alloc(usize, effective_batch_size);
             errdefer allocator.free(decode_candidate_counts);
+
+            const prefill_request_buffer = try allocator.alloc(contract.PrefillBatchRequest, effective_batch_size);
+            errdefer allocator.free(prefill_request_buffer);
+            const prefill_request_ids = try allocator.alloc(u64, effective_batch_size);
+            errdefer allocator.free(prefill_request_ids);
+            const prefill_logits_buffer = try allocator.alloc(f32, effective_batch_size * vocab);
+            errdefer allocator.free(prefill_logits_buffer);
 
             // Initialize optimized sampler with pre-allocated workspace
             // Use seed from config if specified (non-zero), otherwise use time-based seed
@@ -356,6 +370,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .decode_candidate_ids = decode_candidate_ids,
                 .decode_candidate_counts = decode_candidate_counts,
                 .logits_buffer = logits_scratch,
+                .prefill_requests = prefill_request_buffer,
+                .prefill_request_ids = prefill_request_ids,
+                .prefill_logits_buffer = prefill_logits_buffer,
                 .sampler = sampler_instance,
                 .request_state_blocks = std.AutoHashMap(u64, RequestStateBlocks).init(allocator),
                 .slot_state_blocks = std.AutoHashMap(usize, RequestStateBlocks).init(allocator),
@@ -418,6 +435,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             self.allocator.free(self.decode_candidate_ids);
             self.allocator.free(self.decode_candidate_logits);
             self.allocator.free(self.logits_buffer);
+            self.allocator.free(self.prefill_logits_buffer);
+            self.allocator.free(self.prefill_request_ids);
+            self.allocator.free(self.prefill_requests);
             self.step_events.deinit(self.allocator);
             self.sampler.deinit();
         }
@@ -1051,6 +1071,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .is_final = is_final_token,
                     .in_thinking = request_entry.in_thinking,
                     .slot_index = req.slot_index,
+                    .timestamp_ns = std.time.nanoTimestamp(),
                 });
 
                 if (is_final_token) {
@@ -1340,6 +1361,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .is_final = is_final_token,
                     .in_thinking = request_entry.in_thinking,
                     .slot_index = result.slot_index,
+                    .timestamp_ns = std.time.nanoTimestamp(),
                 });
 
                 // Handle completion
@@ -1492,6 +1514,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .is_final = is_final,
                 .in_thinking = false,
                 .slot_index = slot_index,
+                .timestamp_ns = std.time.nanoTimestamp(),
             });
 
             // Handle completion.
@@ -2475,100 +2498,220 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             return request_a.submit_time < request_b.submit_time;
         }
 
-        fn runPrefills(self: *Self) !void {
+        fn beginPrefillGeneration(self: *Self, request_entry: *Request) void {
+            request_entry.token_position = request_entry.prompt_tokens.len;
+            request_entry.state = .generating;
+
+            // Reseed sampler if seed specified (ensures deterministic output with same seed)
+            if (request_entry.sampling_config.seed != 0) {
+                self.sampler.reseed(request_entry.sampling_config.seed);
+            }
+        }
+
+        fn handlePrefillToken(
+            self: *Self,
+            request_entry: *Request,
+            first_token_id: u32,
+            slot_index: usize,
+            prefill_logits: []const f32,
+        ) !void {
+            try request_entry.generated_tokens.append(self.allocator, first_token_id);
+
+            // Check for EOS token
+            var finish_reason: FinishReason = .in_progress;
+            if (grammarIsComplete(request_entry.grammar_sampler)) {
+                finish_reason = .stop_sequence;
+            }
+            for (request_entry.eos_token_ids) |eos_id| {
+                if (first_token_id == eos_id) {
+                    finish_reason = if (grammarCompleteOnEos(request_entry.grammar_sampler)) .stop_sequence else .eos_token;
+                    break;
+                }
+            }
+
+            // Check for stop sequences (first token could match a single-token stop sequence)
+            if (finish_reason == .in_progress and request_entry.stop_sequences.len > 0) {
+                const stop_len = checkStopSequence(request_entry.generated_tokens.items, request_entry.stop_sequences);
+                if (stop_len > 0) {
+                    finish_reason = .stop_sequence;
+                    request_entry.generated_tokens.shrinkRetainingCapacity(request_entry.generated_tokens.items.len - stop_len);
+                }
+            }
+
+            // Check for max tokens
+            if (finish_reason == .in_progress and request_entry.max_tokens <= 1) {
+                finish_reason = .length;
+            }
+
+            const is_final_token = finish_reason != .in_progress;
+
+            if (request_entry.callback) |cb| {
+                if (finish_reason != .stop_sequence) {
+                    cb(request_entry.id, first_token_id, is_final_token, request_entry.in_thinking, request_entry.callback_data);
+                }
+            }
+
+            // Emit step event for the first token so batch consumers
+            // (which read step_events rather than callbacks) see it.
+            if (finish_reason != .stop_sequence) {
+                try self.step_events.append(self.allocator, .{
+                    .request_id = request_entry.id,
+                    .token = first_token_id,
+                    .is_final = is_final_token,
+                    .in_thinking = request_entry.in_thinking,
+                    .slot_index = slot_index,
+                    .timestamp_ns = std.time.nanoTimestamp(),
+                });
+            }
+
+            if (is_final_token) {
+                if (request_entry.capture_final_logits and request_entry.final_logits.len == 0) {
+                    request_entry.final_logits = try self.captureFinalLogits(true, prefill_logits);
+                }
+                self.completeRequest(request_entry, finish_reason);
+            }
+        }
+
+        fn runSinglePrefill(self: *Self, request_entry: *Request) !void {
+            if (request_entry.slot_index == null) return;
+            const slot_index = request_entry.slot_index.?;
+
+            // Run prefill for this request
+            var prefill_timer = std.time.Timer.start() catch unreachable;
+            try self.resetRequestStateBlocks(request_entry.id);
+            try self.prefillWithOptionalVision(
+                slot_index,
+                request_entry.prompt_tokens,
+                request_entry.vision_input,
+            );
+            request_entry.prefill_ns = prefill_timer.read();
+
+            self.beginPrefillGeneration(request_entry);
+
+            // Sample first token from prefill logits
+            var prefill_sample_cfg = request_entry.sampling_config;
+            prefill_sample_cfg.context_tokens = request_entry.generated_tokens.items;
+            const first_token_id = self.sampleToken(
+                self.logits_buffer,
+                prefill_sample_cfg,
+                request_entry.grammar_sampler,
+            ) catch 0;
+            self.parityLogits(
+                "prefill",
+                request_entry.token_position,
+                self.logits_buffer,
+                first_token_id,
+                slot_index,
+            );
+
+            try self.handlePrefillToken(
+                request_entry,
+                first_token_id,
+                slot_index,
+                self.logits_buffer,
+            );
+        }
+
+        fn prefillBatchEligibleRequestCount(self: *Self) usize {
+            if (!(comptime @hasDecl(BackendType, "prefillBatch"))) return 0;
+
+            var count: usize = 0;
             for (self.active_requests.items) |active_request_id| {
                 const request_entry = self.requests.get(active_request_id) orelse continue;
                 if (request_entry.state != .pending_prefill) continue;
                 if (request_entry.slot_index == null) continue;
+                if (request_entry.vision_input != null) continue;
+                if (count >= self.prefill_request_ids.len) break;
+                self.prefill_request_ids[count] = active_request_id;
+                count += 1;
+            }
+            return count;
+        }
 
-                // Run prefill for this request
-                var prefill_timer = std.time.Timer.start() catch unreachable;
-                try self.resetRequestStateBlocks(request_entry.id);
-                try self.prefillWithOptionalVision(
-                    request_entry.slot_index.?,
-                    request_entry.prompt_tokens,
-                    request_entry.vision_input,
-                );
-                request_entry.prefill_ns = prefill_timer.read();
+        fn runBatchedPrefills(self: *Self, candidate_count: usize) !void {
+            if (!(comptime @hasDecl(BackendType, "prefillBatch"))) return;
+            if (candidate_count == 0) return;
 
-                request_entry.token_position = request_entry.prompt_tokens.len;
-                request_entry.state = .generating;
+            const vocab = self.backend.vocabSize();
 
-                // Reseed sampler if seed specified (ensures deterministic output with same seed)
-                if (request_entry.sampling_config.seed != 0) {
-                    self.sampler.reseed(request_entry.sampling_config.seed);
-                }
+            for (0..candidate_count) |idx| {
+                const request_id = self.prefill_request_ids[idx];
+                const request_entry = self.requests.get(request_id) orelse return error.InvalidState;
+                const slot_index = request_entry.slot_index orelse return error.InvalidState;
+                try self.resetRequestStateBlocks(request_id);
+                const row_start = idx * vocab;
+                const row_end = row_start + vocab;
+                self.prefill_requests[idx] = .{
+                    .slot_index = slot_index,
+                    .prompt_tokens = request_entry.prompt_tokens,
+                    .logits_out = self.prefill_logits_buffer[row_start..row_end],
+                };
+            }
 
-                // Sample first token from prefill logits
+            var prefill_timer = std.time.Timer.start() catch unreachable;
+            try self.backend.prefillBatch(self.prefill_requests[0..candidate_count]);
+            const prefill_ns = prefill_timer.read();
+
+            for (0..candidate_count) |idx| {
+                const request_id = self.prefill_request_ids[idx];
+                const request_entry = self.requests.get(request_id) orelse continue;
+                if (request_entry.state != .pending_prefill) continue;
+                const slot_index = request_entry.slot_index orelse return error.InvalidState;
+
+                // Amortize the shared batch wall-time across requests so
+                // per-request prefill metrics aggregate correctly.
+                request_entry.prefill_ns = amortizeBatchPrefillNs(prefill_ns, idx, candidate_count);
+                self.beginPrefillGeneration(request_entry);
+
+                const logits = self.prefill_requests[idx].logits_out;
                 var prefill_sample_cfg = request_entry.sampling_config;
                 prefill_sample_cfg.context_tokens = request_entry.generated_tokens.items;
                 const first_token_id = self.sampleToken(
-                    self.logits_buffer,
+                    logits,
                     prefill_sample_cfg,
                     request_entry.grammar_sampler,
                 ) catch 0;
                 self.parityLogits(
                     "prefill",
                     request_entry.token_position,
-                    self.logits_buffer,
+                    logits,
                     first_token_id,
-                    request_entry.slot_index.?,
+                    slot_index,
                 );
 
-                try request_entry.generated_tokens.append(self.allocator, first_token_id);
+                try self.handlePrefillToken(
+                    request_entry,
+                    first_token_id,
+                    slot_index,
+                    logits,
+                );
+            }
+        }
 
-                // Check for EOS token
-                var finish_reason: FinishReason = .in_progress;
-                if (grammarIsComplete(request_entry.grammar_sampler)) {
-                    finish_reason = .stop_sequence;
-                }
-                for (request_entry.eos_token_ids) |eos_id| {
-                    if (first_token_id == eos_id) {
-                        finish_reason = if (grammarCompleteOnEos(request_entry.grammar_sampler)) .stop_sequence else .eos_token;
-                        break;
-                    }
-                }
+        fn amortizeBatchPrefillNs(total_ns: u64, request_index: usize, request_count: usize) u64 {
+            if (request_count == 0) return total_ns;
+            const count_u64: u64 = @intCast(request_count);
+            const base = total_ns / count_u64;
+            const remainder = total_ns % count_u64;
+            const request_index_u64: u64 = @intCast(request_index);
+            const bonus: u64 = if (request_index_u64 < remainder) 1 else 0;
+            return base + bonus;
+        }
 
-                // Check for stop sequences (first token could match a single-token stop sequence)
-                if (finish_reason == .in_progress and request_entry.stop_sequences.len > 0) {
-                    const stop_len = checkStopSequence(request_entry.generated_tokens.items, request_entry.stop_sequences);
-                    if (stop_len > 0) {
-                        finish_reason = .stop_sequence;
-                        request_entry.generated_tokens.shrinkRetainingCapacity(request_entry.generated_tokens.items.len - stop_len);
-                    }
-                }
+        fn runPrefills(self: *Self) !void {
+            // Batch prefill requests when backend supports it and there is more
+            // than one pending prefill. This removes per-request prefill
+            // synchronization barriers and allows requests to enter decode
+            // together at the next token boundary.
+            const batchable_count = self.prefillBatchEligibleRequestCount();
+            if (batchable_count >= 2) {
+                try self.runBatchedPrefills(batchable_count);
+            }
 
-                // Check for max tokens
-                if (finish_reason == .in_progress and request_entry.max_tokens <= 1) {
-                    finish_reason = .length;
-                }
-
-                const is_final_token = finish_reason != .in_progress;
-
-                if (request_entry.callback) |cb| {
-                    if (finish_reason != .stop_sequence) {
-                        cb(request_entry.id, first_token_id, is_final_token, request_entry.in_thinking, request_entry.callback_data);
-                    }
-                }
-
-                // Emit step event for the first token so batch consumers
-                // (which read step_events rather than callbacks) see it.
-                if (finish_reason != .stop_sequence) {
-                    try self.step_events.append(self.allocator, .{
-                        .request_id = request_entry.id,
-                        .token = first_token_id,
-                        .is_final = is_final_token,
-                        .in_thinking = request_entry.in_thinking,
-                        .slot_index = request_entry.slot_index orelse 0,
-                    });
-                }
-
-                if (is_final_token) {
-                    if (request_entry.capture_final_logits and request_entry.final_logits.len == 0) {
-                        request_entry.final_logits = try self.captureFinalLogits(true, self.logits_buffer);
-                    }
-                    self.completeRequest(request_entry, finish_reason);
-                }
+            for (self.active_requests.items) |active_request_id| {
+                const request_entry = self.requests.get(active_request_id) orelse continue;
+                if (request_entry.state != .pending_prefill) continue;
+                try self.runSinglePrefill(request_entry);
             }
         }
 
@@ -2627,6 +2770,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .is_final = true,
                     .in_thinking = false,
                     .slot_index = 0,
+                    .timestamp_ns = std.time.nanoTimestamp(),
                 });
             }
         }
@@ -3500,6 +3644,7 @@ const MockBackend = struct {
     max_batch_size: usize,
     slots_used: std.DynamicBitSet,
     prefill_calls: std.ArrayList(PrefillCall),
+    prefill_batch_calls: usize = 0,
     decode_calls: std.ArrayList(DecodeCall),
     /// Track logits allocations for cleanup in tests
     allocated_logits: std.ArrayList([]f32),
@@ -3642,6 +3787,17 @@ const MockBackend = struct {
         // Fill logits with dummy data (greedy_token has highest logit)
         for (logits_out, 0..) |*logit, idx| {
             logit.* = if (idx == self.greedy_token) 10.0 else 1.0;
+        }
+    }
+
+    fn prefillBatch(self: *MockBackend, requests: []const contract.PrefillBatchRequest) !void {
+        self.prefill_batch_calls += 1;
+        for (requests) |request_entry| {
+            try self.prefillSlot(
+                request_entry.slot_index,
+                request_entry.prompt_tokens,
+                request_entry.logits_out,
+            );
         }
     }
 
@@ -4682,6 +4838,38 @@ test "Scheduler.step - runs prefill for new requests" {
 
     const request_entry = scheduler.requests.get(request_id).?;
     try std.testing.expectEqual(RequestState.generating, request_entry.state);
+}
+
+test "Scheduler.step - batches prefills when backend supports prefillBatch" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 4);
+    defer backend.deinit();
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{});
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3 };
+    _ = try scheduler.submit(&prompt, 10, null);
+    _ = try scheduler.submit(&prompt, 10, null);
+
+    _ = try scheduler.step();
+
+    try std.testing.expectEqual(@as(usize, 1), backend.prefill_batch_calls);
+    try std.testing.expectEqual(@as(usize, 2), backend.prefill_calls.items.len);
+}
+
+test "Scheduler.amortizeBatchPrefillNs splits total deterministically" {
+    const total_ns: u64 = 10;
+    const request_count: usize = 3;
+
+    const part0 = MockScheduler.amortizeBatchPrefillNs(total_ns, 0, request_count);
+    const part1 = MockScheduler.amortizeBatchPrefillNs(total_ns, 1, request_count);
+    const part2 = MockScheduler.amortizeBatchPrefillNs(total_ns, 2, request_count);
+
+    try std.testing.expectEqual(@as(u64, 4), part0);
+    try std.testing.expectEqual(@as(u64, 3), part1);
+    try std.testing.expectEqual(@as(u64, 3), part2);
+    try std.testing.expectEqual(total_ns, part0 + part1 + part2);
 }
 
 test "Scheduler.step - generates tokens for active requests" {

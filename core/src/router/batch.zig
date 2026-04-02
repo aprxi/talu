@@ -303,10 +303,8 @@ pub const BatchWrapper = struct {
         };
         defer if (effective_context) |ctx| self.engine.allocator.free(ctx);
 
-        // Apply chat template.
-        const prompt = gen_config_mod.applyChatTemplateWithOverrides(
-            self.engine.allocator,
-            self.engine.model_path,
+        // Apply chat template using engine-level cached template metadata/AST.
+        const prompt = self.engine.renderPromptWithCachedTemplate(
             messages_json,
             true,
             opts.template_override,
@@ -513,14 +511,15 @@ pub const BatchWrapper = struct {
 
         for (raw_events) |raw| {
             const state = self.requests.get(raw.request_id) orelse continue;
+            const event_now_ns: i128 = if (raw.timestamp_ns > 0) raw.timestamp_ns else step_now_ns;
 
             // Skip EOS tokens (don't decode them).
             if (gen_config_mod.isEosToken(self.engine.gen_config.eos_token_ids, raw.token)) {
                 if (raw.is_final) {
                     try self.completeRequest(raw.request_id, state, .eos_token);
                     if (event_count < events_out.len) {
-                        const elapsed_ns: i128 = if (step_now_ns > state.start_ns)
-                            step_now_ns - state.start_ns
+                        const elapsed_ns: i128 = if (event_now_ns > state.start_ns)
+                            event_now_ns - state.start_ns
                         else
                             0;
                         events_out[event_count] = .{
@@ -548,7 +547,7 @@ pub const BatchWrapper = struct {
 
             // Record first token time.
             if (state.first_token_ns == 0) {
-                state.first_token_ns = step_now_ns;
+                state.first_token_ns = event_now_ns;
             }
 
             // Decode token to raw bytes via pre-computed table (zero-alloc O(1) lookup).
@@ -608,8 +607,8 @@ pub const BatchWrapper = struct {
                 try state.delta_buf.appendSlice(allocator, valid);
 
                 if (event_count < events_out.len) {
-                    const elapsed_ns: i128 = if (step_now_ns > state.start_ns)
-                        step_now_ns - state.start_ns
+                    const elapsed_ns: i128 = if (event_now_ns > state.start_ns)
+                        event_now_ns - state.start_ns
                     else
                         0;
                     events_out[event_count] = .{
@@ -634,8 +633,8 @@ pub const BatchWrapper = struct {
                 try self.completeRequest(raw.request_id, state, finish_reason);
 
                 if (event_count < events_out.len) {
-                    const elapsed_ns: i128 = if (step_now_ns > state.start_ns)
-                        step_now_ns - state.start_ns
+                    const elapsed_ns: i128 = if (event_now_ns > state.start_ns)
+                        event_now_ns - state.start_ns
                     else
                         0;
                     events_out[event_count] = .{

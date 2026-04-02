@@ -151,6 +151,97 @@ pub fn renderWithContext(
     };
 }
 
+/// Render a pre-parsed chat template with messages and optional extra context.
+///
+/// Identical behavior to renderWithContext(), but skips per-request template
+/// lex/parse by evaluating an already-compiled template AST.
+pub fn renderCompiledWithContext(
+    allocator: std.mem.Allocator,
+    compiled_template: *const template_engine.CompiledTemplate,
+    messages_json: []const u8,
+    bos_token: []const u8,
+    eos_token: []const u8,
+    add_generation_prompt: bool,
+    extra_context_json: ?[]const u8,
+) Error![]const u8 {
+    var template_context = template_engine.TemplateParser.init(allocator);
+    defer template_context.deinit();
+
+    // Parse messages JSON array
+    const parsed_messages = io.json.parseValue(allocator, messages_json, .{
+        .max_size_bytes = 50 * 1024 * 1024,
+        .max_value_bytes = 50 * 1024 * 1024,
+        .max_string_bytes = 50 * 1024 * 1024,
+    }) catch |err| {
+        return switch (err) {
+            error.InputTooLarge => error.InvalidMessages,
+            error.InputTooDeep => error.InvalidMessages,
+            error.StringTooLong => error.InvalidMessages,
+            error.InvalidJson => error.InvalidMessages,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    };
+    defer parsed_messages.deinit();
+
+    // Convert JSON array to template Value array using arena allocator
+    // so it gets freed when template_context.deinit() is called
+    const arena_alloc = template_context.arenaAllocator();
+    const message_values = try jsonToValue(arena_alloc, parsed_messages.value);
+    try template_context.set("messages", message_values);
+    try template_context.set("add_generation_prompt", .{ .boolean = add_generation_prompt });
+    try template_context.set("bos_token", .{ .string = bos_token });
+    try template_context.set("eos_token", .{ .string = eos_token });
+
+    // Mark strftime_now as defined (actual function is handled as builtin)
+    // This allows templates to check `if strftime_now is defined`
+    try template_context.set("strftime_now", .{ .boolean = true });
+
+    // Parse and merge extra context if provided.
+    // IMPORTANT: parsed_extra must outlive render() because jsonToValue borrows
+    // string pointers from the parsed JSON — freeing it before render would
+    // cause use-after-free when the template accesses tools/enable_thinking.
+    var parsed_extra: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_extra) |*pe| pe.deinit();
+
+    if (extra_context_json) |extra_json| {
+        parsed_extra = io.json.parseValue(allocator, extra_json, .{
+            .max_size_bytes = 50 * 1024 * 1024,
+            .max_value_bytes = 50 * 1024 * 1024,
+            .max_string_bytes = 50 * 1024 * 1024,
+        }) catch |err| {
+            return switch (err) {
+                error.InputTooLarge => error.InvalidMessages,
+                error.InputTooDeep => error.InvalidMessages,
+                error.StringTooLong => error.InvalidMessages,
+                error.InvalidJson => error.InvalidMessages,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+        };
+
+        // Extra context must be an object
+        if (parsed_extra.?.value != .object) {
+            return error.InvalidMessages;
+        }
+
+        // Merge each key-value pair into the template context
+        var iter = parsed_extra.?.value.object.iterator();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const value = try jsonToValue(arena_alloc, entry.value_ptr.*);
+            try template_context.set(key, value);
+        }
+    }
+
+    return template_engine.renderCompiled(allocator, compiled_template, &template_context) catch |err| {
+        if (err == error.RaiseException) {
+            if (template_context.raise_exception_message) |m| {
+                error_context.setContext("{s}", .{m});
+            }
+        }
+        return err;
+    };
+}
+
 /// Convert std.json.Value to template_engine.TemplateInput
 fn jsonToValue(allocator: std.mem.Allocator, json_value: std.json.Value) Error!template_engine.TemplateInput {
     switch (json_value) {
@@ -535,6 +626,35 @@ test "renderWithContext with null extra context" {
     defer allocator.free(result);
 
     try std.testing.expectEqualStrings("Hello", result);
+}
+
+test "renderCompiledWithContext renders pre-parsed template" {
+    const allocator = std.testing.allocator;
+
+    var compiled = try template_engine.CompiledTemplate.init(
+        allocator,
+        "Date: {{ date }}\n{{ messages[0].content }}",
+    );
+    defer compiled.deinit();
+
+    const messages_json =
+        \\[{"role": "user", "content": "Hello"}]
+    ;
+    const extra_context = "{\"date\": \"2026-04-02\"}";
+
+    const result = try renderCompiledWithContext(
+        allocator,
+        &compiled,
+        messages_json,
+        "",
+        "",
+        false,
+        extra_context,
+    );
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Date: 2026-04-02") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Hello") != null);
 }
 
 test "renderWithContext extra context can override standard variables" {

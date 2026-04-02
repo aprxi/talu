@@ -983,7 +983,7 @@ async fn generate_response(
             if let Some(ref sched) = batch_scheduler_for_task {
                 // --- Batch scheduler path (concurrent GPU decode) ---
                 let (request_id, event_rx) = sched
-                    .submit(&chat, cfg, stop_flag_for_gen)
+                    .submit_final_only(&chat, cfg, stop_flag_for_gen)
                     .map_err(|e| anyhow!("batch submit failed: {}", e))?;
 
                 // Drain events until final.
@@ -999,9 +999,9 @@ async fn generate_response(
                 }
 
                 let batch_result = sched.take_result(request_id);
-                // Derive response status from BatchResult. Missing result →
-                // cancelled; present result → inspect finish_reason for
-                // length/cancelled which map to "incomplete".
+                // Derive response status from BatchResult. Missing result is a
+                // hard scheduler fault (the final event fired but no result was
+                // materialized), so surface it as an internal error.
                 let (prompt_tokens, completion_tokens, prefill_ns, generation_ns, ttft_ns,
                      batch_status, batch_incomplete_reason) =
                     if let Some(ref r) = batch_result {
@@ -1013,10 +1013,9 @@ async fn generate_response(
                         (r.prompt_tokens, r.completion_tokens, r.prefill_ns,
                          r.generation_ns, r.ttft_ns, status, reason)
                     } else {
-                        log::warn!(target: "server::gen",
-                            "batch request {request_id}: take_result returned None \
-                             (cancelled or internal fault)");
-                        (0, 0, 0, 0, 0, "incomplete", Some("cancelled"))
+                        return Err(anyhow!(
+                            "batch request {request_id} completed without a result"
+                        ));
                     };
 
                 log::debug!(target: "server::gen", "completed (batch): prompt_tokens={} completion_tokens={}",
@@ -1583,10 +1582,12 @@ async fn stream_response(
                 ) {
                     Ok(new_backend) => {
                         // Recreate batch scheduler for new backend.
-                        let new_sched =
-                            crate::server::batch_scheduler::SchedulerState::new(&new_backend, None)
-                                .ok()
-                                .map(Arc::new);
+                        let new_sched = crate::server::batch_scheduler::SchedulerState::new(
+                            &new_backend,
+                            None,
+                        )
+                        .ok()
+                        .map(Arc::new);
                         let old_sched =
                             if let Ok(mut sched_guard) = state_for_store.batch_scheduler.lock() {
                                 let old = sched_guard.take();
