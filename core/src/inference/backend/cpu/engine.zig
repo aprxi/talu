@@ -229,18 +229,21 @@ pub const FusedCpuBackend = struct {
     ) !RuntimeRopeHandles {
         if (loaded.position_embeddings != null) return .{};
 
-        const rope_dim: usize = if (loaded.config.rope_dim > 0)
+        const global_rope_dim: usize = if (loaded.config.rope_dim > 0)
             @intCast(loaded.config.rope_dim)
         else
             @intCast(loaded.config.head_dim);
-        if (rope_dim == 0) return .{};
+        // Sliding-window layers on Gemma4 use the base head_dim rotary width,
+        // while full-attention layers may use a reduced global rope_dim.
+        const local_rope_dim: usize = @intCast(loaded.config.head_dim);
+        if (global_rope_dim == 0 and local_rope_dim == 0) return .{};
 
         var handles: RuntimeRopeHandles = .{};
         errdefer deinitRuntimeRopeHandles(allocator, &handles);
 
         var global_freqs = try rope_scaling.materializeInverseFrequencies(
             allocator,
-            rope_dim,
+            global_rope_dim,
             loaded.config.rope_theta,
             loaded.config.rope_scaling,
         );
@@ -250,7 +253,7 @@ pub const FusedCpuBackend = struct {
         errdefer allocator.destroy(global_rope);
         global_rope.* = try cpu_blocks.RoPE.initFromInvFreq(
             allocator,
-            rope_dim,
+            global_rope_dim,
             @intCast(loaded.config.max_seq_len),
             global_freqs.inv_freq,
             global_freqs.attention_scaling,
@@ -258,9 +261,10 @@ pub const FusedCpuBackend = struct {
         handles.global = global_rope;
 
         if (loaded.config.rope_local_theta > 0 and loaded.config.sliding_window > 0) {
+            const local_dim = if (local_rope_dim > 0) local_rope_dim else global_rope_dim;
             var local_freqs = try rope_scaling.materializeInverseFrequencies(
                 allocator,
-                rope_dim,
+                local_dim,
                 loaded.config.rope_local_theta,
                 loaded.config.rope_scaling,
             );
@@ -270,7 +274,7 @@ pub const FusedCpuBackend = struct {
             errdefer allocator.destroy(local_rope);
             local_rope.* = try cpu_blocks.RoPE.initFromInvFreq(
                 allocator,
-                rope_dim,
+                local_dim,
                 @intCast(loaded.config.max_seq_len),
                 local_freqs.inv_freq,
                 local_freqs.attention_scaling,
@@ -358,14 +362,56 @@ pub const FusedCpuBackend = struct {
             allocator.free(cpu_block_set);
         }
 
+        // Models like Gemma4 can vary attention/FFN widths by layer (e.g.
+        // sliding vs full-attention blocks). Track per-layer KV shape and
+        // size shared scratch for the maximum runtime footprint.
+        var max_heads = head_total;
+        var max_kv_heads = kv_head_total;
+        var max_head_dim = head_dim;
+        var max_d_ff: usize = @intCast(loaded.config.d_ff);
+        const default_layer_kv_shape = kv_cache_mod.LayeredBatchedKVCache.LayerShape{
+            .n_kv_heads = kv_head_total,
+            .head_dim = head_dim,
+        };
+        const layer_kv_shapes = try allocator.alloc(kv_cache_mod.LayeredBatchedKVCache.LayerShape, layer_total);
+        defer allocator.free(layer_kv_shapes);
+        for (layer_kv_shapes) |*shape| shape.* = default_layer_kv_shape;
+
+        for (cpu_block_set, 0..) |*block, layer_idx| {
+            if (block.getAttention()) |attn| {
+                max_heads = @max(max_heads, attn.n_heads);
+                max_kv_heads = @max(max_kv_heads, attn.n_kv_heads);
+                max_head_dim = @max(max_head_dim, attn.head_dim);
+                layer_kv_shapes[layer_idx] = .{
+                    .n_kv_heads = attn.n_kv_heads,
+                    .head_dim = attn.head_dim,
+                };
+            }
+            if (block.getFfnLayer()) |ffn_layer| {
+                const layer_d_ff = switch (ffn_layer.*) {
+                    .swiglu => |layer| layer.d_ff,
+                    .moe_ffn => |layer| layer.d_ff,
+                };
+                max_d_ff = @max(max_d_ff, layer_d_ff);
+            }
+        }
+
         // Build batched KV cache (check env var for quantization mode)
-        const kv_quant_mode = kv_cache_mod.QuantMode.fromEnv();
-        var kv_cache = try LayeredBatchedKVCache.initWithMode(
+        var kv_quant_mode = kv_cache_mod.QuantMode.fromEnv();
+        if (kv_quant_mode == .int8 and max_head_dim > 256) {
+            // Current K-only INT8 SDPA path is tuned for narrower heads.
+            // Use f32 KV cache for wide-head models (e.g. Gemma4 full-attn layers)
+            // until a wide-head INT8 path is implemented.
+            kv_quant_mode = .f32;
+            log.warn("inference", "CPU KV INT8 disabled for wide-head model", .{
+                .max_head_dim = max_head_dim,
+                .fallback = "f32",
+            });
+        }
+        var kv_cache = try LayeredBatchedKVCache.initWithModePerLayer(
             allocator,
-            layer_total,
+            layer_kv_shapes,
             max_batch_size,
-            kv_head_total,
-            head_dim,
             max_sequence_len,
             kv_quant_mode,
         );
@@ -376,9 +422,9 @@ pub const FusedCpuBackend = struct {
         var batched_attn_scratch = try BatchedAttnTemp.init(
             allocator,
             max_batch_size,
-            head_total,
-            kv_head_total,
-            head_dim,
+            max_heads,
+            max_kv_heads,
+            max_head_dim,
             max_sequence_len,
         );
         errdefer batched_attn_scratch.deinit();
@@ -387,7 +433,7 @@ pub const FusedCpuBackend = struct {
         var scratch = try cpu_blocks.ScratchBuffer.initWithSlots(
             allocator,
             model_width,
-            @intCast(loaded.config.d_ff),
+            max_d_ff,
             layer_total,
             max_batch_size,
         );
@@ -575,9 +621,9 @@ pub const FusedCpuBackend = struct {
             .vocab_size = vocab_size,
             .max_batch_size = max_batch_size,
             .n_layers = layer_total,
-            .n_heads = head_total,
-            .n_kv_heads = kv_head_total,
-            .head_dim = head_dim,
+            .n_heads = max_heads,
+            .n_kv_heads = max_kv_heads,
+            .head_dim = max_head_dim,
             .supports_batched_decode_slots = model.supportsBatchedDecodeSlots(),
         };
     }

@@ -12,6 +12,8 @@ pub const version: []const u8 = "gemma3";
 pub const model_types: []const []const u8 = &.{
     "gemma3",
     "gemma3_text",
+    "gemma4",
+    "gemma4_text",
     "gemma2",
     "gemma",
 };
@@ -68,9 +70,10 @@ pub const attention_mlp_program: []const layer_ops.LayerOp = &.{
 };
 
 // Runtime architecture payload (migrated from runtime_architectures.zig)
-const gemma3_model_types = [_][]const u8{ "gemma3", "gemma3_text", "gemma2", "gemma" };
+const gemma3_model_types = [_][]const u8{ "gemma3", "gemma3_text", "gemma4", "gemma4_text", "gemma2", "gemma" };
 const gemma3_weight_prefixes = [_][]const u8{ "model.layers.{d}.", "layers.{d}.", "transformer.h.{d}.", "backbone.layers.{d}.", "language_model.model.layers.{d}." };
-const gemma3_block_weights = [_]types.WeightSpec{
+const gemma3_block_weights = [_]types.WeightSpec{};
+const gemma3_sliding_attention_weights = [_]types.WeightSpec{
     .{ .id = "input_layernorm.weight", .suffix = "input_layernorm.weight", .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
     .{ .id = "post_attention_layernorm.weight", .suffix = "post_attention_layernorm.weight", .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
     .{ .id = "pre_feedforward_layernorm.weight", .suffix = "pre_feedforward_layernorm.weight", .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
@@ -84,6 +87,11 @@ const gemma3_block_weights = [_]types.WeightSpec{
     .{ .id = "mlp.gate_proj.weight", .suffix = "mlp.gate_proj.weight", .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
     .{ .id = "mlp.up_proj.weight", .suffix = "mlp.up_proj.weight", .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
     .{ .id = "mlp.down_proj.weight", .suffix = "mlp.down_proj.weight", .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
+};
+const gemma3_full_attention_weights = gemma3_sliding_attention_weights;
+var gemma3_block_variants = [_]types.BlockVariant{
+    .{ .name = "sliding_attention", .weights = &gemma3_sliding_attention_weights },
+    .{ .name = "full_attention", .weights = &gemma3_full_attention_weights },
 };
 const gemma3_global_weights = [_]types.WeightSpec{
     .{ .id = "token_embeddings", .suffix = "model.embed_tokens.weight", .aliases = &.{ "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
@@ -101,7 +109,7 @@ pub var arch: types.Architecture = .{
     .name = "gemma3",
     .model_types = &gemma3_model_types,
     .parse_config_hook = config_hooks.applyCommonTextConfigHook,
-    .block_variants = null,
+    .block_variants = &gemma3_block_variants,
     .layer_map = null,
     .variant_aliases = null,
     .block_weights = &gemma3_block_weights,

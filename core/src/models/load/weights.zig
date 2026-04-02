@@ -475,7 +475,13 @@ pub fn loadModelWithArchitecture(
         const layer_meta = if (variant) |v| v.meta orelse arch.kernel_meta else arch.kernel_meta;
 
         // Standard attention + MLP layer settings (used by attention blocks)
-        const layer_has_global_attn = if (model_config.sliding_window <= 0)
+        const variant_is_full_attention = if (variant) |v|
+            std.mem.eql(u8, v.name, "full_attention")
+        else
+            false;
+        const layer_has_global_attn = if (variant_is_full_attention)
+            true
+        else if (model_config.sliding_window <= 0)
             true
         else if (model_config.sliding_window_pattern > 0)
             (@mod(@as(i32, @intCast(layer_idx)), model_config.sliding_window_pattern) == 0)

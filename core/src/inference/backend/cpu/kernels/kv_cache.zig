@@ -561,6 +561,11 @@ pub const KVCache = struct {
 
 /// Array of batched KV caches, one per transformer layer.
 pub const LayeredBatchedKVCache = struct {
+    pub const LayerShape = struct {
+        n_kv_heads: usize,
+        head_dim: usize,
+    };
+
     allocator: std.mem.Allocator,
     layers: []BatchedKVCache,
     n_layers: usize,
@@ -603,6 +608,46 @@ pub const LayeredBatchedKVCache = struct {
                 max_batch_size,
                 n_kv_heads,
                 head_dim,
+                max_seq_len,
+                quant_mode,
+            );
+            initialized_count += 1;
+        }
+
+        return .{
+            .allocator = allocator,
+            .layers = layer_caches,
+            .n_layers = n_layers,
+            .quant_mode = quant_mode,
+        };
+    }
+
+    /// Create with per-layer KV shapes. Required for heterogeneous attention
+    /// models where n_kv_heads/head_dim differ by layer.
+    pub fn initWithModePerLayer(
+        allocator: std.mem.Allocator,
+        layer_shapes: []const LayerShape,
+        max_batch_size: usize,
+        max_seq_len: usize,
+        quant_mode: QuantMode,
+    ) !LayeredBatchedKVCache {
+        const n_layers = layer_shapes.len;
+        const layer_caches = try allocator.alloc(BatchedKVCache, n_layers);
+        errdefer allocator.free(layer_caches);
+
+        var initialized_count: usize = 0;
+        errdefer {
+            for (layer_caches[0..initialized_count]) |*layer| {
+                layer.deinit();
+            }
+        }
+
+        for (layer_caches, layer_shapes) |*layer, shape| {
+            layer.* = try BatchedKVCache.initWithMode(
+                allocator,
+                max_batch_size,
+                shape.n_kv_heads,
+                shape.head_dim,
                 max_seq_len,
                 quant_mode,
             );
@@ -1309,6 +1354,34 @@ test "init LayeredBatchedKVCache structure" {
         try std.testing.expectEqual(n_kv_heads, layer.n_kv_heads);
         try std.testing.expectEqual(head_dim, layer.head_dim);
         try std.testing.expectEqual(max_seq_len, layer.max_seq_len);
+    }
+}
+
+test "init LayeredBatchedKVCache per-layer shapes" {
+    const allocator = std.testing.allocator;
+    const shapes = [_]LayeredBatchedKVCache.LayerShape{
+        .{ .n_kv_heads = 2, .head_dim = 32 },
+        .{ .n_kv_heads = 4, .head_dim = 64 },
+        .{ .n_kv_heads = 1, .head_dim = 128 },
+    };
+
+    var layered = try LayeredBatchedKVCache.initWithModePerLayer(
+        allocator,
+        &shapes,
+        2,
+        256,
+        .int8,
+    );
+    defer layered.deinit();
+
+    try std.testing.expectEqual(@as(usize, shapes.len), layered.n_layers);
+    try std.testing.expectEqual(QuantMode.int8, layered.quant_mode);
+    for (shapes, 0..) |shape, layer_idx| {
+        const layer = layered.getLayer(layer_idx);
+        try std.testing.expectEqual(shape.n_kv_heads, layer.n_kv_heads);
+        try std.testing.expectEqual(shape.head_dim, layer.head_dim);
+        try std.testing.expectEqual(@as(usize, 2), layer.max_batch_size);
+        try std.testing.expectEqual(@as(usize, 256), layer.max_seq_len);
     }
 }
 

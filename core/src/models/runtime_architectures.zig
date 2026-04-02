@@ -72,4 +72,8 @@ test "detectByModelType resolves architecture from model_type alias" {
     const qwen35 = detectByModelType("qwen3_5");
     try std.testing.expect(qwen35 != null);
     try std.testing.expect(std.mem.eql(u8, qwen35.?.name, "qwen3_5"));
+
+    const gemma4 = detectByModelType("gemma4_text");
+    try std.testing.expect(gemma4 != null);
+    try std.testing.expect(std.mem.eql(u8, gemma4.?.name, "gemma3"));
 }

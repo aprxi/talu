@@ -89,8 +89,13 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
                         layer_idx, block.ln2_weight.n_dims, block.ln2_weight.shape[0], d_model,
                     });
 
-                const q_out: usize = n_heads * head_dim;
-                const kv_out: usize = n_kv_groups * head_dim;
+                const inferred_shape = inferAttentionShapeForValidation(block, d_model, n_heads, n_kv_groups, head_dim);
+                const layer_n_heads = inferred_shape.n_heads;
+                const layer_n_kv_heads = inferred_shape.n_kv_heads;
+                const layer_head_dim = inferred_shape.head_dim;
+                const layer_d_ff = inferAttentionDffForValidation(block, d_model, d_ff);
+                const q_out: usize = layer_n_heads * layer_head_dim;
+                const kv_out: usize = layer_n_kv_heads * layer_head_dim;
 
                 // Check for MLA (Multi-Latent Attention) weights first
                 const is_mla = block.q_a_proj != null;
@@ -135,42 +140,42 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
                         });
                 } else {
                     if (block.fused.gate_up) |gate_up| {
-                        if (!is2DShapeMatch(&gate_up, d_model, d_ff * 2))
+                        if (!is2DShapeMatch(&gate_up, d_model, layer_d_ff * 2))
                             return reporter.reportError("layer {} gate_up shape mismatch (shape=[{},{}], expected=[{},{}])", .{
-                                layer_idx, gate_up.shape[0], gate_up.shape[1], d_model, d_ff * 2,
+                                layer_idx, gate_up.shape[0], gate_up.shape[1], d_model, layer_d_ff * 2,
                             });
                     } else {
                         // Dense FFN: w1 (gate/dense_in) and w2 (down/dense_out) required.
                         // w3 (up projection) is optional - absent in non-gated MLPs (BERT/MiniLM).
                         if (block.w1 == null or block.w2 == null)
                             return reporter.reportError("layer {} missing dense FFN weights", .{layer_idx});
-                        if (!is2DShapeMatch(block.w1.?, d_model, d_ff))
+                        if (!is2DShapeMatch(block.w1.?, d_model, layer_d_ff))
                             return reporter.reportError("layer {} w1 shape mismatch (shape=[{},{}], expected=[{},{}])", .{
-                                layer_idx, block.w1.?.shape[0], block.w1.?.shape[1], d_model, d_ff,
+                                layer_idx, block.w1.?.shape[0], block.w1.?.shape[1], d_model, layer_d_ff,
                             });
                         if (block.w3) |w3| {
-                            if (!is2DShapeMatch(w3, d_model, d_ff))
+                            if (!is2DShapeMatch(w3, d_model, layer_d_ff))
                                 return reporter.reportError("layer {} w3 shape mismatch (shape=[{},{}], expected=[{},{}])", .{
-                                    layer_idx, w3.shape[0], w3.shape[1], d_model, d_ff,
+                                    layer_idx, w3.shape[0], w3.shape[1], d_model, layer_d_ff,
                                 });
                         }
-                        if (!is2DShapeMatch(block.w2.?, d_ff, d_model))
+                        if (!is2DShapeMatch(block.w2.?, layer_d_ff, d_model))
                             return reporter.reportError("layer {} w2 shape mismatch (shape=[{},{}], expected=[{},{}])", .{
-                                layer_idx, block.w2.?.shape[0], block.w2.?.shape[1], d_ff, d_model,
+                                layer_idx, block.w2.?.shape[0], block.w2.?.shape[1], layer_d_ff, d_model,
                             });
                     }
                 }
 
                 if (block.q_norm) |q_norm| {
-                    if (!isVectorShape(q_norm, head_dim))
+                    if (!isVectorShape(q_norm, layer_head_dim))
                         return reporter.reportError("layer {} q_norm shape mismatch (n_dims={}, shape0={}, expected={})", .{
-                            layer_idx, q_norm.n_dims, q_norm.shape[0], head_dim,
+                            layer_idx, q_norm.n_dims, q_norm.shape[0], layer_head_dim,
                         });
                 }
                 if (block.k_norm) |k_norm| {
-                    if (!isVectorShape(k_norm, head_dim))
+                    if (!isVectorShape(k_norm, layer_head_dim))
                         return reporter.reportError("layer {} k_norm shape mismatch (n_dims={}, shape0={}, expected={})", .{
-                            layer_idx, k_norm.n_dims, k_norm.shape[0], head_dim,
+                            layer_idx, k_norm.n_dims, k_norm.shape[0], layer_head_dim,
                         });
                 }
                 if (block.pre_ffn_norm) |pre_ffn_norm| {
@@ -319,6 +324,107 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
 
 fn is2DShapeMatch(tensor_view: *const tensor.Tensor, dim_a: usize, dim_b: usize) bool {
     return tensor_view.n_dims == 2 and ((tensor_view.shape[0] == dim_a and tensor_view.shape[1] == dim_b) or (tensor_view.shape[0] == dim_b and tensor_view.shape[1] == dim_a));
+}
+
+const AttentionShape = struct {
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+};
+
+fn vectorDim(tensor_view: *const tensor.Tensor) ?usize {
+    if (tensor_view.n_dims == 1) return @intCast(tensor_view.shape[0]);
+    if (tensor_view.n_dims == 2) {
+        if (tensor_view.shape[0] == 1 and tensor_view.shape[1] > 0) return @intCast(tensor_view.shape[1]);
+        if (tensor_view.shape[1] == 1 and tensor_view.shape[0] > 0) return @intCast(tensor_view.shape[0]);
+    }
+    return null;
+}
+
+fn projectedOutDim(tensor_view: *const tensor.Tensor, d_model: usize) ?usize {
+    if (tensor_view.n_dims != 2) return null;
+    const a: usize = @intCast(tensor_view.shape[0]);
+    const b: usize = @intCast(tensor_view.shape[1]);
+    if (a == d_model and b > 0) return b;
+    if (b == d_model and a > 0) return a;
+    return null;
+}
+
+fn inferAttentionShapeForValidation(
+    block: weights.blocks.AttentionMlpWeights,
+    d_model: usize,
+    default_n_heads: usize,
+    default_n_kv_heads: usize,
+    default_head_dim: usize,
+) AttentionShape {
+    var shape = AttentionShape{
+        .n_heads = default_n_heads,
+        .n_kv_heads = default_n_kv_heads,
+        .head_dim = default_head_dim,
+    };
+
+    if (block.q_norm) |q_norm| {
+        if (vectorDim(q_norm)) |dim| shape.head_dim = dim;
+    } else if (block.k_norm) |k_norm| {
+        if (vectorDim(k_norm)) |dim| shape.head_dim = dim;
+    }
+
+    const q_out_opt = projectedOutDim(block.o_proj, d_model);
+    if (q_out_opt) |q_out| {
+        if (shape.head_dim > 0 and (q_out % shape.head_dim) == 0) {
+            shape.n_heads = q_out / shape.head_dim;
+        }
+    }
+
+    if (block.k_proj) |k_proj| {
+        if (projectedOutDim(k_proj, d_model)) |kv_out| {
+            if (shape.head_dim > 0 and (kv_out % shape.head_dim) == 0) {
+                shape.n_kv_heads = kv_out / shape.head_dim;
+            }
+        }
+    } else if (block.fused.qkv_proj) |qkv_proj| {
+        if (q_out_opt) |q_out| {
+            if (projectedOutDim(&qkv_proj, d_model)) |qkv_out| {
+                if (qkv_out >= q_out) {
+                    const kv_pair_out = qkv_out - q_out;
+                    if ((kv_pair_out % 2) == 0) {
+                        const kv_out = kv_pair_out / 2;
+                        if (shape.head_dim > 0 and (kv_out % shape.head_dim) == 0) {
+                            shape.n_kv_heads = kv_out / shape.head_dim;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (shape.n_heads == 0) shape.n_heads = 1;
+    if (shape.n_kv_heads == 0) shape.n_kv_heads = 1;
+    if (shape.head_dim == 0) shape.head_dim = 1;
+    return shape;
+}
+
+fn inferAttentionDffForValidation(
+    block: weights.blocks.AttentionMlpWeights,
+    d_model: usize,
+    default_d_ff: usize,
+) usize {
+    if (block.fused.gate_up) |gate_up| {
+        if (projectedOutDim(&gate_up, d_model)) |gate_up_out| {
+            if ((gate_up_out % 2) == 0 and gate_up_out > 0) return gate_up_out / 2;
+        }
+    }
+    if (block.w1) |w1| {
+        if (projectedOutDim(w1, d_model)) |w1_out| {
+            if (w1_out > 0) return w1_out;
+        }
+    }
+    if (block.w2) |w2| {
+        if (projectedOutDim(w2, d_model)) |w2_out| {
+            if (w2_out > 0) return w2_out;
+        }
+    }
+    return default_d_ff;
 }
 
 fn isProjected2DShapeMatch(tensor_view: *const tensor.Tensor, d_model: usize, out_dim: usize) bool {

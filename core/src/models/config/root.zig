@@ -1433,6 +1433,7 @@ test "loadConfigForArchitecture parses common hook fields across all architectur
         .{ .model_type = "llama2", .architecture_id = "llama2" },
         .{ .model_type = "llama3", .architecture_id = "llama3" },
         .{ .model_type = "gemma3", .architecture_id = "gemma3" },
+        .{ .model_type = "gemma4", .architecture_id = "gemma3" },
         .{ .model_type = "granite", .architecture_id = "granite3" },
         .{ .model_type = "granite_hybrid", .architecture_id = "granite_hybrid" },
         .{ .model_type = "lfm2", .architecture_id = "lfm2" },
@@ -1590,6 +1591,48 @@ test "loadConfig parses rope_parameters partial rotary and mrope metadata" {
     try std.testing.expectEqual(@as(u32, 11), config.rope_scaling.mrope_section[1]);
     try std.testing.expectEqual(@as(u32, 10), config.rope_scaling.mrope_section[2]);
     try std.testing.expect(config.rope_scaling.mrope_interleaved);
+}
+
+test "loadConfig parses gemma4 nested rope_parameters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "gemma4",
+        \\  "text_config": {
+        \\    "vocab_size": 262144,
+        \\    "hidden_size": 1536,
+        \\    "num_hidden_layers": 35,
+        \\    "num_attention_heads": 8,
+        \\    "num_key_value_heads": 1,
+        \\    "head_dim": 256,
+        \\    "global_head_dim": 512,
+        \\    "intermediate_size": 6144,
+        \\    "max_position_embeddings": 131072,
+        \\    "rope_parameters": {
+        \\      "full_attention": {
+        \\        "partial_rotary_factor": 0.25,
+        \\        "rope_theta": 1000000.0,
+        \\        "rope_type": "proportional"
+        \\      },
+        \\      "sliding_attention": {
+        \\        "rope_theta": 10000.0,
+        \\        "rope_type": "default"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfigForArchitecture(std.testing.allocator, path, "gemma3");
+    try std.testing.expectApproxEqAbs(@as(f32, 1_000_000.0), config.rope_theta, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 10_000.0), config.rope_local_theta, 0.01);
+    try std.testing.expectEqual(@as(i32, 128), config.rope_dim);
 }
 
 test "loadConfig parses vision deepstack probe layers from vision_config via youtu hook" {

@@ -57,6 +57,41 @@ pub fn applyCommonTextConfig(config_obj: std.json.ObjectMap, root_obj: std.json.
     if (getFloatFromConfigOrRoot(config_obj, root_obj, "residual_multiplier")) |v| config.residual_multiplier = v;
     if (getFloatFromConfigOrRoot(config_obj, root_obj, "logits_scaling")) |v| config.logits_scaling = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "bos_token_id")) |v| config.bos_token_id = v;
+
+    // Gemma4-style nested RoPE parameters:
+    // rope_parameters.full_attention / rope_parameters.sliding_attention.
+    if (config_obj.get("rope_parameters")) |rope_params_value| {
+        if (rope_params_value == .object) {
+            const rope_params_obj = rope_params_value.object;
+
+            if (rope_params_obj.get("full_attention")) |full_value| {
+                if (full_value == .object) {
+                    const full_obj = full_value.object;
+                    if (getObjectFloatField(full_obj, "rope_theta")) |theta| {
+                        config.rope_theta = theta;
+                    }
+                    if (getObjectFloatField(full_obj, "partial_rotary_factor")) |partial| {
+                        const global_head_dim = getObjectIntField(config_obj, "global_head_dim") orelse config.head_dim;
+                        config.rope_dim = @intFromFloat(@as(f32, @floatFromInt(global_head_dim)) * partial);
+                    }
+                }
+            }
+
+            if (rope_params_obj.get("sliding_attention")) |sliding_value| {
+                if (sliding_value == .object) {
+                    const sliding_obj = sliding_value.object;
+                    if (getObjectFloatField(sliding_obj, "rope_theta")) |theta| {
+                        config.rope_local_theta = theta;
+                    }
+                    if (config.rope_dim == 0) {
+                        if (getObjectFloatField(sliding_obj, "partial_rotary_factor")) |partial| {
+                            config.rope_dim = @intFromFloat(@as(f32, @floatFromInt(config.head_dim)) * partial);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub fn applyCommonTextConfigHook(

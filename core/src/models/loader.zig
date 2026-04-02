@@ -220,6 +220,22 @@ test "resolveModelKindForConfig and runtimeArchitectureForConfig detect known mo
     try std.testing.expectEqualStrings("llama3", runtime_arch.name);
 }
 
+test "resolveModelKindForConfig maps gemma4 model_type to gemma architecture" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = "{\"model_type\":\"gemma4\"}" });
+    const config_path = try tmp.dir.realpathAlloc(allocator, "config.json");
+    defer allocator.free(config_path);
+
+    const resolved = try resolveModelKindForConfig(allocator, config_path);
+    try std.testing.expectEqualStrings("gemma3", resolved.descriptor.id);
+    try std.testing.expectEqualStrings("gemma3", resolved.runtime_arch.name);
+
+    const runtime_arch = try runtimeArchitectureForConfig(allocator, config_path);
+    try std.testing.expectEqualStrings("gemma3", runtime_arch.name);
+}
+
 test "resolveModelKindForConfig falls back to text_config model_type" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

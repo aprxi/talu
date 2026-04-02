@@ -353,6 +353,33 @@ pub fn computeFlashDecodeGQA_I8(
     const MAX_CONTEXT: usize = 8192;
     const MAX_QUERIES: usize = 16;
 
+    // Keep this fast stack-optimized path bounded. Fall back to per-query decode
+    // when dimensions exceed the stack tiling limits.
+    if (feature_width > MAX_HEAD_DIM or active_len > MAX_CONTEXT or n_queries > MAX_QUERIES) {
+        const score_buf = std.heap.page_allocator.alloc(f32, history_len) catch @panic("OOM in computeFlashDecodeGQA_I8 fallback");
+        defer std.heap.page_allocator.free(score_buf);
+        for (0..n_queries) |q| {
+            const query = queries[q * feature_width ..][0..feature_width];
+            const out = output_rows[q * feature_width ..][0..feature_width];
+            const score = score_buf[0..history_len];
+            @memset(score, 0);
+            computeMaskedRowWeightedSumI8(
+                query,
+                key_matrix_rows_i8,
+                key_scales,
+                value_matrix_rows,
+                score,
+                out,
+                valid_start_index,
+                history_len,
+                feature_width,
+                scale,
+                if (sinks) |s| s[head_offset + q] else null,
+                false,
+            );
+        }
+        return;
+    }
     std.debug.assert(feature_width <= MAX_HEAD_DIM);
     std.debug.assert(active_len <= MAX_CONTEXT);
     std.debug.assert(n_queries <= MAX_QUERIES);
@@ -854,7 +881,9 @@ inline fn quantizeToI8(src: []const f32, dst: []i8) f32 {
     var max_abs: f32 = 0;
     var i: usize = 0;
     while (i + 4 <= len) : (i += 4) {
-        const v: @Vector(4, f32) = src[i..][0..4].*;
+        // Build vectors from scalar loads so this path works with any input
+        // alignment (head slices are not guaranteed to be 16-byte aligned).
+        const v: @Vector(4, f32) = .{ src[i], src[i + 1], src[i + 2], src[i + 3] };
         const abs_v = @abs(v);
         max_abs = @max(max_abs, @reduce(.Max, abs_v));
     }
@@ -873,7 +902,7 @@ inline fn quantizeToI8(src: []const f32, dst: []i8) f32 {
 
     i = 0;
     while (i + 4 <= len) : (i += 4) {
-        const v: @Vector(4, f32) = src[i..][0..4].*;
+        const v: @Vector(4, f32) = .{ src[i], src[i + 1], src[i + 2], src[i + 3] };
         const scaled = v * inv_scale_vec;
         const clamped = @min(max_val, @max(min_val, scaled));
         const rounded: @Vector(4, i32) = @intFromFloat(@round(clamped));
@@ -1008,9 +1037,43 @@ pub fn computeMaskedRowWeightedSumI8(
     std.debug.assert(key_scales.len >= history_len);
     std.debug.assert(valid_start_index <= history_len);
 
-    // Maximum supported head dimension (stack buffer for quantized Q)
+    // Maximum supported head dimension for stack-quantized Q.
+    // Wider heads use the fallback path below.
     const MAX_HEAD_DIM = 256;
     std.debug.assert(feature_width <= MAX_HEAD_DIM);
+
+    // Fallback path for wider heads: avoid fixed-size stack buffers and use
+    // f32×i8 dot products directly.
+    if (feature_width > MAX_HEAD_DIM) {
+        var max_score: f32 = -std.math.inf(f32);
+        var row_index: usize = 0;
+        while (row_index < valid_start_index) : (row_index += 1) {
+            score_buffer[row_index] = -std.math.inf(f32);
+        }
+        while (row_index < history_len) : (row_index += 1) {
+            const key_row_i8 = key_matrix_rows_i8[row_index * feature_width ..][0..feature_width];
+            const dot = dotRowI8(query_row[0..feature_width], key_row_i8, key_scales[row_index]) * scale;
+            score_buffer[row_index] = dot;
+            if (dot > max_score) max_score = dot;
+        }
+        if (extra_sink_score) |sink| {
+            if (sink > max_score) max_score = sink;
+        }
+        softmax.maskedInPlaceWithMax(
+            score_buffer,
+            valid_start_index,
+            history_len,
+            extra_sink_score,
+            exact_softmax,
+            max_score,
+            null,
+        );
+        const active_len = history_len - valid_start_index;
+        const active_scores = score_buffer[valid_start_index..history_len];
+        const active_v = value_matrix_rows[valid_start_index * feature_width ..][0 .. active_len * feature_width];
+        scoresTimesV(active_scores, active_v, output_row[0..feature_width], 1, feature_width, active_len);
+        return;
+    }
 
     // Quantize Q to i8 once - this is fast (feature_width is small, e.g., 128)
     var query_i8_buf: [MAX_HEAD_DIM]i8 = undefined;

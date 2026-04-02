@@ -338,6 +338,8 @@ test "registry supports llama and qwen model types" {
     try std.testing.expect(isSupportedModelType("qwen3.5"));
     try std.testing.expect(isSupportedModelType("qwen3_moe"));
     try std.testing.expect(isSupportedModelType("gemma3"));
+    try std.testing.expect(isSupportedModelType("gemma4"));
+    try std.testing.expect(isSupportedModelType("gemma4_text"));
     try std.testing.expect(isSupportedModelType("granite"));
     try std.testing.expect(isSupportedModelType("phi4"));
     try std.testing.expect(isSupportedModelType("lfm2"));

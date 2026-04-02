@@ -120,6 +120,109 @@ pub const BlockInitContext = struct {
     map_context: BlockMapContext,
 };
 
+const AttentionShape = struct {
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+};
+
+fn tensorVectorDim(t: *const Tensor) ?usize {
+    if (t.n_dims == 1) {
+        return @intCast(t.shape[0]);
+    }
+    if (t.n_dims == 2) {
+        if (t.shape[0] == 1 and t.shape[1] > 0) return @intCast(t.shape[1]);
+        if (t.shape[1] == 1 and t.shape[0] > 0) return @intCast(t.shape[0]);
+    }
+    return null;
+}
+
+fn projectedOutDim(weight: *const Tensor, d_model: usize) ?usize {
+    if (weight.n_dims != 2) return null;
+    const a: usize = @intCast(weight.shape[0]);
+    const b: usize = @intCast(weight.shape[1]);
+    if (a == d_model and b > 0) return b;
+    if (b == d_model and a > 0) return a;
+    return null;
+}
+
+fn inferAttentionShape(config: ModelConfig, weights: AttentionMlpWeights) AttentionShape {
+    const d_model: usize = @intCast(config.d_model);
+    var shape = AttentionShape{
+        .n_heads = @intCast(config.n_heads),
+        .n_kv_heads = @intCast(config.n_kv_groups),
+        .head_dim = @intCast(config.head_dim),
+    };
+
+    if (weights.q_norm) |q_norm| {
+        if (tensorVectorDim(q_norm)) |dim| shape.head_dim = dim;
+    } else if (weights.k_norm) |k_norm| {
+        if (tensorVectorDim(k_norm)) |dim| shape.head_dim = dim;
+    }
+
+    const q_out_opt = projectedOutDim(weights.o_proj, d_model);
+    if (q_out_opt) |q_out| {
+        if (shape.head_dim > 0 and (q_out % shape.head_dim) == 0) {
+            shape.n_heads = q_out / shape.head_dim;
+        }
+    }
+
+    if (weights.k_proj) |k_proj| {
+        if (projectedOutDim(k_proj, d_model)) |kv_out| {
+            if (shape.head_dim > 0 and (kv_out % shape.head_dim) == 0) {
+                shape.n_kv_heads = kv_out / shape.head_dim;
+            }
+        }
+    } else if (weights.fused.qkv_proj) |qkv_proj| {
+        if (q_out_opt) |q_out| {
+            if (projectedOutDim(&qkv_proj, d_model)) |qkv_out| {
+                if (qkv_out >= q_out) {
+                    const kv_pair_out = qkv_out - q_out;
+                    if ((kv_pair_out % 2) == 0) {
+                        const kv_out = kv_pair_out / 2;
+                        if (shape.head_dim > 0 and (kv_out % shape.head_dim) == 0) {
+                            shape.n_kv_heads = kv_out / shape.head_dim;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (shape.n_heads == 0) shape.n_heads = 1;
+    if (shape.n_kv_heads == 0) shape.n_kv_heads = 1;
+    if (shape.head_dim == 0) shape.head_dim = 1;
+    return shape;
+}
+
+fn inferAttentionDff(config: ModelConfig, weights: AttentionMlpWeights) usize {
+    const d_model: usize = @intCast(config.d_model);
+    const default_d_ff: usize = @intCast(config.d_ff);
+
+    if (weights.fused.gate_up) |gate_up| {
+        if (projectedOutDim(&gate_up, d_model)) |gate_up_out| {
+            if ((gate_up_out % 2) == 0 and gate_up_out > 0) return gate_up_out / 2;
+        }
+    }
+    if (weights.w1) |w1| {
+        if (projectedOutDim(w1, d_model)) |w1_out| {
+            if (w1_out > 0) return w1_out;
+        }
+    }
+    if (weights.w2) |w2| {
+        if (projectedOutDim(w2, d_model)) |w2_out| {
+            if (w2_out > 0) return w2_out;
+        }
+    }
+    return default_d_ff;
+}
+
+fn resolveAttentionScale(config: ModelConfig, head_dim: usize) f32 {
+    if (config.attention_multiplier > 0) return config.attention_multiplier;
+    if (config.query_pre_attn_scalar > 0) return 1.0 / @sqrt(config.query_pre_attn_scalar);
+    return 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+}
+
 /// Fuse separate gate (w1) and up (w3) projection weights into a single tensor.
 /// This converts 2 separate matmuls into 1 fused matmul for the FFN forward pass.
 ///
@@ -1756,13 +1859,7 @@ pub fn buildBlocks(
     const block_array = try allocator.alloc(TransformerBlock, @intCast(config.n_layers));
     errdefer allocator.free(block_array);
 
-    const default_attention_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(config.head_dim)));
-    const attention_scale: f32 = if (config.attention_multiplier > 0)
-        config.attention_multiplier
-    else if (config.query_pre_attn_scalar > 0)
-        1.0 / @sqrt(config.query_pre_attn_scalar)
-    else
-        default_attention_scale;
+    const base_attention_scale = resolveAttentionScale(config, @intCast(config.head_dim));
 
     const use_gelu_activation = config.use_gelu;
     const static_entry = if (runtime.architecture_id) |arch_id|
@@ -1770,6 +1867,24 @@ pub fn buildBlocks(
     else
         null;
     for (block_array, block_weights, 0..) |*block_slot, block_weight, layer_idx| {
+        var layer_d_ff: usize = @intCast(config.d_ff);
+        var layer_n_heads: usize = @intCast(config.n_heads);
+        var layer_n_kv_heads: usize = @intCast(config.n_kv_groups);
+        var layer_head_dim: usize = @intCast(config.head_dim);
+        var layer_attention_scale = base_attention_scale;
+
+        switch (block_weight) {
+            .attention_mlp => |attn_weights| {
+                const inferred = inferAttentionShape(config, attn_weights);
+                layer_d_ff = inferAttentionDff(config, attn_weights);
+                layer_n_heads = inferred.n_heads;
+                layer_n_kv_heads = inferred.n_kv_heads;
+                layer_head_dim = inferred.head_dim;
+                layer_attention_scale = resolveAttentionScale(config, layer_head_dim);
+            },
+            else => {},
+        }
+
         const block_kind: BlockType = switch (block_weight) {
             .attention_mlp => .attention_mlp,
             .mamba => .mamba,
@@ -1783,10 +1898,10 @@ pub fn buildBlocks(
         block_slot.* = try TransformerBlock.initWithProgram(
             allocator,
             @intCast(config.d_model),
-            @intCast(config.d_ff),
-            @intCast(config.n_heads),
-            @intCast(config.n_kv_groups),
-            @intCast(config.head_dim),
+            layer_d_ff,
+            layer_n_heads,
+            layer_n_kv_heads,
+            layer_head_dim,
             @intCast(config.max_seq_len),
             block_weight,
             layer_program,
@@ -1794,7 +1909,7 @@ pub fn buildBlocks(
             runtime,
             config.rope_scaling.mrope_interleaved,
             config.residual_multiplier,
-            attention_scale,
+            layer_attention_scale,
             use_gelu_activation,
             layer_idx,
         );
@@ -1821,13 +1936,7 @@ pub fn buildBlocksFromLayers(
     const block_array = try allocator.alloc(TransformerBlock, @intCast(config.n_layers));
     errdefer allocator.free(block_array);
 
-    const default_attention_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(config.head_dim)));
-    const attention_scale: f32 = if (config.attention_multiplier > 0)
-        config.attention_multiplier
-    else if (config.query_pre_attn_scalar > 0)
-        1.0 / @sqrt(config.query_pre_attn_scalar)
-    else
-        default_attention_scale;
+    const base_attention_scale = resolveAttentionScale(config, @intCast(config.head_dim));
     const use_gelu_activation = config.use_gelu;
     const static_entry = if (runtime.architecture_id) |arch_id|
         models_registry.detectByArchitectureId(arch_id)
@@ -1835,20 +1944,37 @@ pub fn buildBlocksFromLayers(
         null;
 
     for (block_array, layer_weights, 0..) |*block_slot, *layer, layer_idx| {
+        var layer_d_ff: usize = @intCast(config.d_ff);
+        var layer_n_heads: usize = @intCast(config.n_heads);
+        var layer_n_kv_heads: usize = @intCast(config.n_kv_groups);
+        var layer_head_dim: usize = @intCast(config.head_dim);
+        var layer_attention_scale = base_attention_scale;
+
         const block_kind: BlockType = layer.block_type;
         const layer_program = if (static_entry) |entry|
             models_registry.blockProgramFor(entry, block_kind)
         else
             null;
         const block_weight = try runtime_blocks.layerToBlockWeights(allocator, layer);
+        switch (block_weight) {
+            .attention_mlp => |attn_weights| {
+                const inferred = inferAttentionShape(config, attn_weights);
+                layer_d_ff = inferAttentionDff(config, attn_weights);
+                layer_n_heads = inferred.n_heads;
+                layer_n_kv_heads = inferred.n_kv_heads;
+                layer_head_dim = inferred.head_dim;
+                layer_attention_scale = resolveAttentionScale(config, layer_head_dim);
+            },
+            else => {},
+        }
 
         block_slot.* = try TransformerBlock.initWithProgram(
             allocator,
             @intCast(config.d_model),
-            @intCast(config.d_ff),
-            @intCast(config.n_heads),
-            @intCast(config.n_kv_groups),
-            @intCast(config.head_dim),
+            layer_d_ff,
+            layer_n_heads,
+            layer_n_kv_heads,
+            layer_head_dim,
             @intCast(config.max_seq_len),
             block_weight,
             layer_program,
@@ -1856,7 +1982,7 @@ pub fn buildBlocksFromLayers(
             runtime,
             config.rope_scaling.mrope_interleaved,
             config.residual_multiplier,
-            attention_scale,
+            layer_attention_scale,
             use_gelu_activation,
             layer_idx,
         );
@@ -3443,4 +3569,82 @@ test "TransformerBlock.fromMap builds attention block" {
     var block = try TransformerBlock.fromMap(context, .attention_mlp, &map);
     defer block.deinit(allocator);
     try std.testing.expectEqual(BlockType.attention_mlp, block.block_type);
+}
+
+test "inferAttentionShape derives per-layer head dimensions from attention weights" {
+    const allocator = std.testing.allocator;
+
+    var ln_data = [_]f32{1} ** 1536;
+    var o_proj_data = [_]f32{1} ** (1536 * 4096);
+    var k_proj_data = [_]f32{1} ** (1536 * 512);
+    var q_norm_data = [_]f32{1} ** 512;
+    var k_norm_data = [_]f32{1} ** 512;
+
+    var ln = Tensor.view2DSlice(ln_data[0..], 1, ln_data.len);
+    ln.n_dims = 1;
+    ln.shape[0] = 1536;
+
+    const o_proj = Tensor.view2DSlice(o_proj_data[0..], 1536, 4096);
+    const k_proj = Tensor.view2DSlice(k_proj_data[0..], 1536, 512);
+    var q_norm = Tensor.view2DSlice(q_norm_data[0..], 1, q_norm_data.len);
+    q_norm.n_dims = 1;
+    q_norm.shape[0] = 512;
+    var k_norm = Tensor.view2DSlice(k_norm_data[0..], 1, k_norm_data.len);
+    k_norm.n_dims = 1;
+    k_norm.shape[0] = 512;
+
+    var config = std.mem.zeroes(ModelConfig);
+    config.d_model = 1536;
+    config.n_heads = 8;
+    config.n_kv_groups = 1;
+    config.head_dim = 256;
+
+    const weights = AttentionMlpWeights{
+        .ln1_weight = &ln,
+        .ln2_weight = &ln,
+        .k_proj = &k_proj,
+        .o_proj = &o_proj,
+        .q_norm = &q_norm,
+        .k_norm = &k_norm,
+    };
+    const inferred = inferAttentionShape(config, weights);
+    try std.testing.expectEqual(@as(usize, 8), inferred.n_heads);
+    try std.testing.expectEqual(@as(usize, 1), inferred.n_kv_heads);
+    try std.testing.expectEqual(@as(usize, 512), inferred.head_dim);
+
+    const scale = resolveAttentionScale(config, inferred.head_dim);
+    try std.testing.expectApproxEqRel(@as(f32, 1.0 / @sqrt(@as(f32, 512.0))), scale, 1e-6);
+    _ = allocator;
+}
+
+test "inferAttentionDff derives per-layer FFN width from layer weights" {
+    var ln_data = [_]f32{1} ** 6;
+    var o_proj_data = [_]f32{1} ** 24;
+    var w1_data = [_]f32{1} ** 72;
+    var w2_data = [_]f32{1} ** 72;
+
+    var ln = Tensor.view2DSlice(ln_data[0..], 1, ln_data.len);
+    ln.n_dims = 1;
+    ln.shape[0] = 6;
+
+    const o_proj = Tensor.view2DSlice(o_proj_data[0..], 6, 4);
+    const w1 = Tensor.view2DSlice(w1_data[0..], 12, 6);
+    const w2 = Tensor.view2DSlice(w2_data[0..], 6, 12);
+
+    var config = std.mem.zeroes(ModelConfig);
+    config.d_model = 6;
+    config.d_ff = 4;
+    config.n_heads = 2;
+    config.n_kv_groups = 1;
+    config.head_dim = 2;
+
+    const weights = AttentionMlpWeights{
+        .ln1_weight = &ln,
+        .ln2_weight = &ln,
+        .o_proj = &o_proj,
+        .w1 = &w1,
+        .w2 = &w2,
+    };
+    const inferred = inferAttentionDff(config, weights);
+    try std.testing.expectEqual(@as(usize, 12), inferred);
 }

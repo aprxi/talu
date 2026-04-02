@@ -320,8 +320,11 @@ fn validateModelOptions(model_type_name: []const u8, model_json: []const u8) !vo
             return error.InvalidModel;
         }
     }
+    var fuse_unk_enabled = false;
     if (findJsonFieldValue(model_json, "\"fuse_unk\"")) |value| {
-        if (!std.mem.eql(u8, value, "false")) {
+        if (std.mem.eql(u8, value, "true")) {
+            fuse_unk_enabled = true;
+        } else if (!std.mem.eql(u8, value, "false")) {
             log.warn("tokenizer", "Tokenizer BPE option rejected", .{
                 .field = "fuse_unk",
                 .value_len = value.len,
@@ -330,8 +333,11 @@ fn validateModelOptions(model_type_name: []const u8, model_json: []const u8) !vo
             return error.InvalidModel;
         }
     }
+    var byte_fallback_enabled = false;
     if (findJsonFieldValue(model_json, "\"byte_fallback\"")) |value| {
-        if (!std.mem.eql(u8, value, "false")) {
+        if (std.mem.eql(u8, value, "true")) {
+            byte_fallback_enabled = true;
+        } else if (!std.mem.eql(u8, value, "false")) {
             log.warn("tokenizer", "Tokenizer BPE option rejected", .{
                 .field = "byte_fallback",
                 .value_len = value.len,
@@ -339,6 +345,16 @@ fn validateModelOptions(model_type_name: []const u8, model_json: []const u8) !vo
             });
             return error.InvalidModel;
         }
+    }
+    // `fuse_unk` affects unknown-token behavior. We only accept it when byte
+    // fallback is also enabled, which keeps runtime behavior aligned with BPE
+    // byte fallback and avoids silently changing unknown-token semantics.
+    if (fuse_unk_enabled and !byte_fallback_enabled) {
+        log.warn("tokenizer", "Tokenizer BPE option rejected", .{
+            .field = "fuse_unk",
+            .reason = "requires_byte_fallback",
+        });
+        return error.InvalidModel;
     }
     if (findJsonFieldValue(model_json, "\"continuing_subword_prefix\"")) |value| {
         if (!std.mem.eql(u8, value, "null") and !std.mem.eql(u8, value, "\"\"")) {
@@ -3953,6 +3969,66 @@ test "tokenizer_loader_from_json_string accepts empty inert BPE affix defaults" 
         tokenizer.destroy();
         std.heap.c_allocator.destroy(tokenizer);
     }
+}
+
+test "tokenizer_loader_from_json_string accepts Gemma-style BPE options with byte fallback" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "version": "1.0",
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "dropout": null,
+        \\    "unk_token": "<unk>",
+        \\    "continuing_subword_prefix": null,
+        \\    "end_of_word_suffix": null,
+        \\    "fuse_unk": true,
+        \\    "byte_fallback": true,
+        \\    "ignore_merges": false,
+        \\    "vocab": { "<unk>": 0, "h": 1, "e": 2, "l": 3, "o": 4 },
+        \\    "merges": []
+        \\  },
+        \\  "added_tokens": [],
+        \\  "normalizer": null,
+        \\  "pre_tokenizer": null,
+        \\  "post_processor": null,
+        \\  "decoder": {"type":"ByteFallback"}
+        \\}
+    ;
+    const json_z = try allocator.dupeZ(u8, json);
+    defer allocator.free(json_z);
+
+    const tokenizer = tokenizer_loader_from_json_string(json_z.ptr) orelse return error.TestUnexpectedResult;
+    defer {
+        tokenizer.destroy();
+        std.heap.c_allocator.destroy(tokenizer);
+    }
+}
+
+test "load_from_slice_streaming rejects fuse_unk without byte_fallback" {
+    const json =
+        \\{
+        \\  "version": "1.0",
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "dropout": null,
+        \\    "unk_token": "<unk>",
+        \\    "continuing_subword_prefix": null,
+        \\    "end_of_word_suffix": null,
+        \\    "fuse_unk": true,
+        \\    "byte_fallback": false,
+        \\    "ignore_merges": false,
+        \\    "vocab": { "<unk>": 0, "h": 1, "e": 2, "l": 3, "o": 4 },
+        \\    "merges": []
+        \\  },
+        \\  "added_tokens": [],
+        \\  "normalizer": null,
+        \\  "pre_tokenizer": null,
+        \\  "post_processor": null,
+        \\  "decoder": null
+        \\}
+    ;
+    try std.testing.expectError(error.InvalidModel, load_from_slice_streaming(std.testing.allocator, json));
 }
 
 test "tokenizer_loader_from_json_string requires integration testing" {
