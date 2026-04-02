@@ -1093,10 +1093,71 @@ pub fn linearForwardRows(
             return error.CudaKernelUnavailable;
         },
         .nvfp4 => |w| {
-            // Keep NVFP4 on the native weight-only kernels for correctness.
-            // The cuBLASLt NVFP4 route quantizes activations to FP4, which
-            // materially degrades quality for current weight-only NVFP4 models.
+            // Prefill path: dequant NVFP4→BF16, then cuBLAS BF16 tensor core GEMM.
+            // Weight-only dequant avoids quality-degrading activation quantization.
+            if (rows > 32) nvfp4_dequant_blas: {
+                const dequant_fn = self.nvfp4_dequant_to_bf16_function orelse break :nvfp4_dequant_blas;
+                const cast_fn = self.cast_f32_to_bf16_function orelse break :nvfp4_dequant_blas;
+                if (!self.u16_blas_bf16_supported) break :nvfp4_dequant_blas;
 
+                const in_dim = w.rows;
+                const out_dim = w.cols;
+                const weight_elems = std.math.mul(usize, in_dim, out_dim) catch break :nvfp4_dequant_blas;
+                const weight_bf16_bytes = std.math.mul(usize, weight_elems, @sizeOf(u16)) catch break :nvfp4_dequant_blas;
+                if (self.runtime_buffers.dequant_f16_dev.size < weight_bf16_bytes) break :nvfp4_dequant_blas;
+
+                const input_elems = std.math.mul(usize, rows, in_dim) catch break :nvfp4_dequant_blas;
+                const input_bf16_bytes = std.math.mul(usize, input_elems, @sizeOf(u16)) catch break :nvfp4_dequant_blas;
+                if (self.runtime_buffers.activation_u16_dev.size < input_bf16_bytes) break :nvfp4_dequant_blas;
+
+                // Step 1: Dequant NVFP4 weights → BF16 in scratch buffer.
+                var dequant_weight = bufferSlice(&self.runtime_buffers.dequant_f16_dev, 0, weight_bf16_bytes) catch break :nvfp4_dequant_blas;
+                const grid_x = std.math.cast(u32, std.math.divCeil(usize, in_dim, 256) catch break :nvfp4_dequant_blas) orelse break :nvfp4_dequant_blas;
+                const grid_y = std.math.cast(u32, out_dim) orelse break :nvfp4_dequant_blas;
+                self.kernel_arg_pack.reset();
+                self.kernel_arg_pack.appendBufferPtr(&w.buffer) catch break :nvfp4_dequant_blas;
+                self.kernel_arg_pack.appendBufferPtr(&w.scales_buffer) catch break :nvfp4_dequant_blas;
+                self.kernel_arg_pack.appendBufferPtr(&dequant_weight) catch break :nvfp4_dequant_blas;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(in_dim)) catch break :nvfp4_dequant_blas;
+                self.kernel_arg_pack.appendScalar(u32, @intCast(out_dim)) catch break :nvfp4_dequant_blas;
+                self.kernel_arg_pack.appendScalar(u32, w.scale_cols) catch break :nvfp4_dequant_blas;
+                self.kernel_arg_pack.appendScalar(f32, w.weight_global_scale) catch break :nvfp4_dequant_blas;
+                compute.cuda.launch.launchWithFamily(&self.device, dequant_fn, .{
+                    .grid_x = grid_x,
+                    .grid_y = grid_y,
+                    .block_x = 256,
+                }, &self.kernel_arg_pack, .other) catch break :nvfp4_dequant_blas;
+
+                // Step 2: Cast F32 input → BF16.
+                var input_bf16_dev = bufferSlice(&self.runtime_buffers.activation_u16_dev, 0, input_bf16_bytes) catch break :nvfp4_dequant_blas;
+                try compute.cuda.cast_f32_to_bf16.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    cast_fn,
+                    &packed_input,
+                    &input_bf16_dev,
+                    @intCast(input_elems),
+                );
+
+                // Step 3: cuBLAS BF16 × BF16 → F32 GEMM (tensor cores).
+                self.blas.matmulU16U16F32(
+                    &self.device,
+                    &input_bf16_dev,
+                    .bf16,
+                    rows,
+                    in_dim,
+                    &dequant_weight,
+                    .bf16,
+                    out_dim,
+                    &packed_out,
+                ) catch {
+                    self.u16_blas_bf16_supported = false;
+                    break :nvfp4_dequant_blas;
+                };
+                return;
+            }
+
+            // Decode / small-batch path: native weight-only GEMV kernels.
             const base_nvfp4_fn = self.nvfp4_matvec_function orelse {
                 log.warn("inference", "CUDA NVFP4 matvec kernel unavailable", .{});
                 return error.CudaKernelUnavailable;

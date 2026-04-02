@@ -1853,17 +1853,31 @@ static __device__ __forceinline__ float fp8_bf16_to_f32(unsigned short raw) {
     (r1) = fmaf((inp).w, fp8e4m3_to_f32(static_cast<__nv_fp8_storage_t>((word) >> 24)), (r1)); \
 } while (0)
 
+// Initialize shared memory FP4 E2M1 LUT (16 entries, one per nibble value).
+// Must be followed by __syncthreads() before use.
+static __device__ __forceinline__ void nvfp4_lut_init(float* lut, unsigned int tid) {
+    if (tid < 16u) {
+        const unsigned int s = tid >> 3;
+        const unsigned int e = (tid >> 1) & 3u;
+        const unsigned int m = tid & 1u;
+        const unsigned int is_nz = min(e | m, 1u);
+        const unsigned int e_nz = min(e, 1u);
+        lut[tid] = __uint_as_float(
+            (s << 31) | (((e + 126u) * is_nz) << 23) | (e_nz * (m << 22)));
+    }
+}
+
 // Process one NVFP4 word (4 bytes = 8 nibbles) against 2 float4 inputs.
-// Accumulates all 8 products into acc. Caller applies scale once per group.
-#define NVFP4_PROCESS_WORD(word, inp0, inp1, acc) do { \
-    (acc) = fmaf((inp0).x, nvfp4_nibble_to_f32((word) & 0xFu), (acc)); \
-    (acc) = fmaf((inp0).y, nvfp4_nibble_to_f32(((word) >> 4) & 0xFu), (acc)); \
-    (acc) = fmaf((inp0).z, nvfp4_nibble_to_f32(((word) >> 8) & 0xFu), (acc)); \
-    (acc) = fmaf((inp0).w, nvfp4_nibble_to_f32(((word) >> 12) & 0xFu), (acc)); \
-    (acc) = fmaf((inp1).x, nvfp4_nibble_to_f32(((word) >> 16) & 0xFu), (acc)); \
-    (acc) = fmaf((inp1).y, nvfp4_nibble_to_f32(((word) >> 20) & 0xFu), (acc)); \
-    (acc) = fmaf((inp1).z, nvfp4_nibble_to_f32(((word) >> 24) & 0xFu), (acc)); \
-    (acc) = fmaf((inp1).w, nvfp4_nibble_to_f32((word) >> 28), (acc)); \
+// Uses shared memory LUT for branchless FP4 decode.
+#define NVFP4_PROCESS_WORD(word, inp0, inp1, acc, lut) do { \
+    (acc) = fmaf((inp0).x, (lut)[(word) & 0xFu], (acc)); \
+    (acc) = fmaf((inp0).y, (lut)[((word) >> 4) & 0xFu], (acc)); \
+    (acc) = fmaf((inp0).z, (lut)[((word) >> 8) & 0xFu], (acc)); \
+    (acc) = fmaf((inp0).w, (lut)[((word) >> 12) & 0xFu], (acc)); \
+    (acc) = fmaf((inp1).x, (lut)[((word) >> 16) & 0xFu], (acc)); \
+    (acc) = fmaf((inp1).y, (lut)[((word) >> 20) & 0xFu], (acc)); \
+    (acc) = fmaf((inp1).z, (lut)[((word) >> 24) & 0xFu], (acc)); \
+    (acc) = fmaf((inp1).w, (lut)[(word) >> 28], (acc)); \
 } while (0)
 
 // Inner-batch FP8 GEMV: weight + scales loaded once from DRAM, reused across
@@ -2894,6 +2908,45 @@ static __device__ __forceinline__ float nvfp4_nibble_to_f32(unsigned int nibble)
     return __uint_as_float((s << 31) | (f32_exp << 23) | f32_mant);
 }
 
+// ---------------------------------------------------------------------------
+// NVFP4 dequantization: packed FP4 E2M1 + FP8 E4M3 per-group scales → BF16
+// ---------------------------------------------------------------------------
+
+// Dequantize NVFP4 weights to BF16 for cuBLAS GEMM prefill path.
+// Each thread processes one element: unpack nibble, fp4→f32, scale, f32→bf16.
+// Launch: grid=(ceil(in_dim/256), out_dim), block=(256)
+extern "C" __global__ void talu_dequant_nvfp4_to_bf16(
+    const unsigned char* __restrict__ weight_packed,  // [out_dim × packed_cols] (2 FP4 per byte)
+    const unsigned char* __restrict__ scales,         // [out_dim × scale_cols] FP8 E4M3
+    unsigned short* __restrict__ out_bf16,            // [out_dim × in_dim] BF16
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int scale_cols,
+    float weight_global_scale
+) {
+    const unsigned int row = blockIdx.y;
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= out_dim || col >= in_dim) return;
+
+    const unsigned int packed_cols = (in_dim + 1u) >> 1;
+    const unsigned long long byte_idx = (unsigned long long)row * packed_cols + (col >> 1);
+    const unsigned char packed_byte = weight_packed[byte_idx];
+    const unsigned int nibble = (col & 1u) ? (packed_byte >> 4) : (packed_byte & 0x0Fu);
+
+    const float fp4_val = nvfp4_nibble_to_f32(nibble);
+    const float scale = fp8e4m3_to_f32(
+        static_cast<__nv_fp8_storage_t>(scales[(unsigned long long)row * scale_cols + (col >> 4)]));
+    const float val = fp4_val * scale / weight_global_scale;
+
+    // F32 → BF16: round-to-nearest-even (same as FP8 dequant kernel).
+    unsigned int fbits;
+    memcpy(&fbits, &val, sizeof(fbits));
+    const unsigned int lsb = (fbits >> 16) & 1u;
+    const unsigned int rounding_bias = 0x7FFFu + lsb;
+    const unsigned long long out_idx = (unsigned long long)row * in_dim + col;
+    out_bf16[out_idx] = static_cast<unsigned short>((fbits + rounding_bias) >> 16);
+}
+
 // Inner-batch NVFP4 GEMV: vectorized 64-bit weight loads + float4 input loads.
 // Each iteration processes 2 u32 words = 16 FP4 elements = 1 scale group (group_size=16).
 // Scale is applied once per group via post-multiply on the accumulated partial.
@@ -2909,6 +2962,7 @@ static __device__ __forceinline__ void talu_nvfp4_matvec_batched(
     unsigned int out_idx,
     unsigned int scale_cols,
     float inv_global,
+    const float* fp4_lut,
     unsigned int lane,
     unsigned int batch_rows
 ) {
@@ -2943,14 +2997,14 @@ static __device__ __forceinline__ void talu_nvfp4_matvec_batched(
             {
                 const float4 i0 = *reinterpret_cast<const float4*>(&input[row_off + base_elem]);
                 const float4 i1 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 4]);
-                NVFP4_PROCESS_WORD(w0, i0, i1, partial);
+                NVFP4_PROCESS_WORD(w0, i0, i1, partial, fp4_lut);
             }
 
             // Phase 2: w1 (elements 8-15)
             {
                 const float4 i2 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 8]);
                 const float4 i3 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 12]);
-                NVFP4_PROCESS_WORD(w1, i2, i3, partial);
+                NVFP4_PROCESS_WORD(w1, i2, i3, partial, fp4_lut);
             }
 
             acc[b] = fmaf(partial, scale, acc[b]);
@@ -2983,6 +3037,10 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_f32(
         ? batch_rows - batch_base : FP8_BATCH_TILE;
     if (group_size != 16u || (in_dim & 15u) != 0u || weight_global_scale == 0.0f) return;
 
+    __shared__ float fp4_lut[16];
+    nvfp4_lut_init(fp4_lut, threadIdx.x);
+    __syncthreads();
+
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
@@ -2995,10 +3053,10 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_f32(
     const unsigned char* row_weight = weight_packed + (unsigned long long)out_idx * packed_cols;
 
     switch (tile_rows) {
-        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 1u); break;
-        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 2u); break;
-        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 3u); break;
-        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 4u); break;
+        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 1u); break;
+        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 2u); break;
+        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 3u); break;
+        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 4u); break;
         default: return;
     }
 }
@@ -3021,6 +3079,10 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_f32_tile8
         ? batch_rows - batch_base : FP8_BATCH_TILE_X8;
     if (group_size != 16u || (in_dim & 15u) != 0u || weight_global_scale == 0.0f) return;
 
+    __shared__ float fp4_lut[16];
+    nvfp4_lut_init(fp4_lut, threadIdx.x);
+    __syncthreads();
+
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
@@ -3033,14 +3095,14 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_f32_tile8
     const unsigned char* row_weight = weight_packed + (unsigned long long)out_idx * packed_cols;
 
     switch (tile_rows) {
-        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 1u); break;
-        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 2u); break;
-        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 3u); break;
-        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 4u); break;
-        case 5u: talu_nvfp4_matvec_batched<5>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 5u); break;
-        case 6u: talu_nvfp4_matvec_batched<6>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 6u); break;
-        case 7u: talu_nvfp4_matvec_batched<7>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 7u); break;
-        case 8u: talu_nvfp4_matvec_batched<8>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, lane, 8u); break;
+        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 1u); break;
+        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 2u); break;
+        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 3u); break;
+        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 4u); break;
+        case 5u: talu_nvfp4_matvec_batched<5>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 5u); break;
+        case 6u: talu_nvfp4_matvec_batched<6>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 6u); break;
+        case 7u: talu_nvfp4_matvec_batched<7>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 7u); break;
+        case 8u: talu_nvfp4_matvec_batched<8>(input_tile, row_weight, scales, out_tile, in_dim, out_dim, out_idx, scale_cols, inv_global, fp4_lut, lane, 8u); break;
         default: return;
     }
 }
@@ -3076,6 +3138,10 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_qkv_f32(
     const unsigned int tile_rows = batch_rows - batch_base < FP8_BATCH_TILE
         ? batch_rows - batch_base : FP8_BATCH_TILE;
 
+    __shared__ float fp4_lut[16];
+    nvfp4_lut_init(fp4_lut, threadIdx.x);
+    __syncthreads();
+
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int out_index = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
@@ -3128,10 +3194,10 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_qkv_f32(
     const unsigned char* row_weight = wt + (unsigned long long)row_idx * packed_cols;
 
     switch (tile_rows) {
-        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 1u); break;
-        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 2u); break;
-        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 3u); break;
-        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 4u); break;
+        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 1u); break;
+        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 2u); break;
+        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 3u); break;
+        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 4u); break;
         default: return;
     }
 }
@@ -3167,6 +3233,10 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_qkv_f32_t
     const unsigned int tile_rows = batch_rows - batch_base < FP8_BATCH_TILE_X8
         ? batch_rows - batch_base : FP8_BATCH_TILE_X8;
 
+    __shared__ float fp4_lut[16];
+    nvfp4_lut_init(fp4_lut, threadIdx.x);
+    __syncthreads();
+
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int out_index = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
@@ -3219,14 +3289,14 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_qkv_f32_t
     const unsigned char* row_weight = wt + (unsigned long long)row_idx * packed_cols;
 
     switch (tile_rows) {
-        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 1u); break;
-        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 2u); break;
-        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 3u); break;
-        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 4u); break;
-        case 5u: talu_nvfp4_matvec_batched<5>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 5u); break;
-        case 6u: talu_nvfp4_matvec_batched<6>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 6u); break;
-        case 7u: talu_nvfp4_matvec_batched<7>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 7u); break;
-        case 8u: talu_nvfp4_matvec_batched<8>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 8u); break;
+        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 1u); break;
+        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 2u); break;
+        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 3u); break;
+        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 4u); break;
+        case 5u: talu_nvfp4_matvec_batched<5>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 5u); break;
+        case 6u: talu_nvfp4_matvec_batched<6>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 6u); break;
+        case 7u: talu_nvfp4_matvec_batched<7>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 7u); break;
+        case 8u: talu_nvfp4_matvec_batched<8>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 8u); break;
         default: return;
     }
 }
@@ -3255,6 +3325,10 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_gate_up_f
     const unsigned int tile_rows = batch_rows - batch_base < FP8_BATCH_TILE
         ? batch_rows - batch_base : FP8_BATCH_TILE;
 
+    __shared__ float fp4_lut[16];
+    nvfp4_lut_init(fp4_lut, threadIdx.x);
+    __syncthreads();
+
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int out_index = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
@@ -3297,10 +3371,10 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_gate_up_f
     const unsigned char* row_weight = wt + (unsigned long long)row_idx * packed_cols;
 
     switch (tile_rows) {
-        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 1u); break;
-        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 2u); break;
-        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 3u); break;
-        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 4u); break;
+        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 1u); break;
+        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 2u); break;
+        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 3u); break;
+        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 4u); break;
         default: return;
     }
 }
@@ -3329,6 +3403,10 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_gate_up_f
     const unsigned int tile_rows = batch_rows - batch_base < FP8_BATCH_TILE_X8
         ? batch_rows - batch_base : FP8_BATCH_TILE_X8;
 
+    __shared__ float fp4_lut[16];
+    nvfp4_lut_init(fp4_lut, threadIdx.x);
+    __syncthreads();
+
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int out_index = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
@@ -3371,14 +3449,14 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_gate_up_f
     const unsigned char* row_weight = wt + (unsigned long long)row_idx * packed_cols;
 
     switch (tile_rows) {
-        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 1u); break;
-        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 2u); break;
-        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 3u); break;
-        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 4u); break;
-        case 5u: talu_nvfp4_matvec_batched<5>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 5u); break;
-        case 6u: talu_nvfp4_matvec_batched<6>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 6u); break;
-        case 7u: talu_nvfp4_matvec_batched<7>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 7u); break;
-        case 8u: talu_nvfp4_matvec_batched<8>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, lane, 8u); break;
+        case 1u: talu_nvfp4_matvec_batched<1>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 1u); break;
+        case 2u: talu_nvfp4_matvec_batched<2>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 2u); break;
+        case 3u: talu_nvfp4_matvec_batched<3>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 3u); break;
+        case 4u: talu_nvfp4_matvec_batched<4>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 4u); break;
+        case 5u: talu_nvfp4_matvec_batched<5>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 5u); break;
+        case 6u: talu_nvfp4_matvec_batched<6>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 6u); break;
+        case 7u: talu_nvfp4_matvec_batched<7>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 7u); break;
+        case 8u: talu_nvfp4_matvec_batched<8>(input_tile, row_weight, sc, out_tile, in_dim, out_dim_proj, row_idx, scale_cols, inv_global, fp4_lut, lane, 8u); break;
         default: return;
     }
 }
@@ -3401,6 +3479,7 @@ static __device__ __forceinline__ void talu_nvfp4_gate_up_silu_batched(
     float gate_inv_global,
     unsigned int up_scale_cols,
     float up_inv_global,
+    const float* fp4_lut,
     unsigned int lane,
     unsigned int batch_rows
 ) {
@@ -3443,16 +3522,16 @@ static __device__ __forceinline__ void talu_nvfp4_gate_up_silu_batched(
             {
                 const float4 i0 = *reinterpret_cast<const float4*>(&input[row_off + base_elem]);
                 const float4 i1 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 4]);
-                NVFP4_PROCESS_WORD(gw0, i0, i1, gp);
-                NVFP4_PROCESS_WORD(uw0, i0, i1, up_p);
+                NVFP4_PROCESS_WORD(gw0, i0, i1, gp, fp4_lut);
+                NVFP4_PROCESS_WORD(uw0, i0, i1, up_p, fp4_lut);
             }
 
             // Phase 2: next 8 elements (word 1)
             {
                 const float4 i2 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 8]);
                 const float4 i3 = *reinterpret_cast<const float4*>(&input[row_off + base_elem + 12]);
-                NVFP4_PROCESS_WORD(gw1, i2, i3, gp);
-                NVFP4_PROCESS_WORD(uw1, i2, i3, up_p);
+                NVFP4_PROCESS_WORD(gw1, i2, i3, gp, fp4_lut);
+                NVFP4_PROCESS_WORD(uw1, i2, i3, up_p, fp4_lut);
             }
 
             gate_acc[b] = fmaf(gp, gs, gate_acc[b]);
@@ -3497,6 +3576,10 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_gate_up_s
     if ((in_dim & 15u) != 0u) return;
     if (gate_weight_global_scale == 0.0f || up_weight_global_scale == 0.0f) return;
 
+    __shared__ float fp4_lut[16];
+    nvfp4_lut_init(fp4_lut, threadIdx.x);
+    __syncthreads();
+
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
@@ -3511,10 +3594,10 @@ extern "C" __global__ __launch_bounds__(128, 3) void talu_nvfp4_matvec_gate_up_s
     const unsigned char* up_row_weight = up_weight_packed + (unsigned long long)out_idx * packed_cols;
 
     switch (tile_rows) {
-        case 1u: talu_nvfp4_gate_up_silu_batched<1>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 1u); break;
-        case 2u: talu_nvfp4_gate_up_silu_batched<2>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 2u); break;
-        case 3u: talu_nvfp4_gate_up_silu_batched<3>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 3u); break;
-        case 4u: talu_nvfp4_gate_up_silu_batched<4>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 4u); break;
+        case 1u: talu_nvfp4_gate_up_silu_batched<1>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 1u); break;
+        case 2u: talu_nvfp4_gate_up_silu_batched<2>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 2u); break;
+        case 3u: talu_nvfp4_gate_up_silu_batched<3>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 3u); break;
+        case 4u: talu_nvfp4_gate_up_silu_batched<4>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 4u); break;
         default: return;
     }
 }
@@ -3544,6 +3627,10 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_gate_up_s
     if ((in_dim & 15u) != 0u) return;
     if (gate_weight_global_scale == 0.0f || up_weight_global_scale == 0.0f) return;
 
+    __shared__ float fp4_lut[16];
+    nvfp4_lut_init(fp4_lut, threadIdx.x);
+    __syncthreads();
+
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int out_idx = blockIdx.x * FP8_WARPS_PER_BLOCK + warp_id;
@@ -3558,14 +3645,14 @@ extern "C" __global__ __launch_bounds__(128, 2) void talu_nvfp4_matvec_gate_up_s
     const unsigned char* up_row_weight = up_weight_packed + (unsigned long long)out_idx * packed_cols;
 
     switch (tile_rows) {
-        case 1u: talu_nvfp4_gate_up_silu_batched<1>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 1u); break;
-        case 2u: talu_nvfp4_gate_up_silu_batched<2>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 2u); break;
-        case 3u: talu_nvfp4_gate_up_silu_batched<3>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 3u); break;
-        case 4u: talu_nvfp4_gate_up_silu_batched<4>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 4u); break;
-        case 5u: talu_nvfp4_gate_up_silu_batched<5>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 5u); break;
-        case 6u: talu_nvfp4_gate_up_silu_batched<6>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 6u); break;
-        case 7u: talu_nvfp4_gate_up_silu_batched<7>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 7u); break;
-        case 8u: talu_nvfp4_gate_up_silu_batched<8>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, lane, 8u); break;
+        case 1u: talu_nvfp4_gate_up_silu_batched<1>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 1u); break;
+        case 2u: talu_nvfp4_gate_up_silu_batched<2>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 2u); break;
+        case 3u: talu_nvfp4_gate_up_silu_batched<3>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 3u); break;
+        case 4u: talu_nvfp4_gate_up_silu_batched<4>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 4u); break;
+        case 5u: talu_nvfp4_gate_up_silu_batched<5>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 5u); break;
+        case 6u: talu_nvfp4_gate_up_silu_batched<6>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 6u); break;
+        case 7u: talu_nvfp4_gate_up_silu_batched<7>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 7u); break;
+        case 8u: talu_nvfp4_gate_up_silu_batched<8>(input_tile, gate_row_weight, gate_scales, up_row_weight, up_scales, out_tile, in_dim, out_dim, out_idx, gate_scale_cols, g_inv, up_scale_cols, u_inv, fp4_lut, lane, 8u); break;
         default: return;
     }
 }
@@ -3866,6 +3953,10 @@ extern "C" __global__ void talu_mxfp8_matvec_f32_tile8(
     const float* input, const unsigned char* weight, const unsigned char* scales,
     float* out, unsigned int in_dim, unsigned int out_dim, unsigned int scale_cols,
     unsigned int batch_rows) {}
+extern "C" __global__ void talu_dequant_nvfp4_to_bf16(
+    const unsigned char* weight_packed, const unsigned char* scales,
+    unsigned short* out_bf16, unsigned int in_dim, unsigned int out_dim,
+    unsigned int scale_cols, float weight_global_scale) {}
 extern "C" __global__ void talu_nvfp4_matvec_f32(
     const float* input, const unsigned char* weight_packed, const unsigned char* scales,
     float* out, unsigned int in_dim, unsigned int out_dim, unsigned int scale_cols,

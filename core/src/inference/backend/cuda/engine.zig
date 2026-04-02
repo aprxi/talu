@@ -397,6 +397,7 @@ pub const CudaBackend = struct {
     quantize_f32_to_mxfp8_function: ?compute.cuda.Function = null,
     quantize_f32_to_nvfp4_function: ?compute.cuda.Function = null,
     mxfp8_dequant_to_bf16_function: ?compute.cuda.Function = null,
+    nvfp4_dequant_to_bf16_function: ?compute.cuda.Function = null,
     fp8_matvec_gate_up_silu_function: ?compute.cuda.Function = null,
     fp8_matvec_gate_up_silu_tile8_function: ?compute.cuda.Function = null,
     fp8_matvec_gate_up_function: ?compute.cuda.Function = null,

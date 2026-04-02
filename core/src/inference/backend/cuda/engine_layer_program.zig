@@ -1606,6 +1606,9 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
     if (self.kernel_registry.resolveFunction("dequant_mxfp8_to_bf16", "talu_dequant_mxfp8_to_bf16")) |resolved| {
         self.mxfp8_dequant_to_bf16_function = resolved.function;
     } else |_| {}
+    if (self.kernel_registry.resolveFunction("dequant_nvfp4_to_bf16", "talu_dequant_nvfp4_to_bf16")) |resolved| {
+        self.nvfp4_dequant_to_bf16_function = resolved.function;
+    } else |_| {}
     if (self.kernel_registry.resolveFunction("scale_rows_f32", "talu_scale_rows_f32")) |resolved| {
         self.scale_rows_f32_function = resolved.function;
     } else |_| {}
