@@ -182,14 +182,13 @@ pub const SafeTensors = struct {
 
         if (tensor_entry.shape.len > tensor.MAX_NDIM) return error.ShapeTooLarge;
 
-        var tensor_view: tensor.Tensor = undefined;
+        var tensor_view = std.mem.zeroes(tensor.Tensor);
         tensor_view.dtype = tensor_entry.dtype;
         tensor_view.n_dims = @intCast(tensor_entry.shape.len);
         tensor_view.data_ptr = @constCast(tensor_entry.data.ptr);
         tensor_view.data_size = tensor_entry.data.len;
         tensor_view.device = tensor.Device.cpu();
         tensor_view.owns_data = false;
-        tensor_view.gaffine = null;
 
         // Copy shape and compute numel
         var element_count: usize = 1;
@@ -648,6 +647,37 @@ test "SafeTensors: getTensor with dtype validation" {
     // Should fail with wrong dtype
     try testing.expectError(error.UnexpectedDType, st.getTensor("weight", .f16));
     try testing.expectError(error.UnexpectedDType, st.getTensor("weight", .i8));
+}
+
+test "SafeTensors: getTensor zero-initializes optional quantization metadata" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const tensor_data = [_]u8{0, 0, 128, 63}; // 1.0 in F32
+    const header =
+        \\{"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    ;
+
+    const file_data = try createMockSafeTensorsFile(allocator, header, &tensor_data);
+    defer allocator.free(file_data);
+
+    const tmp_dir = testing.tmpDir(.{});
+    var tmp_file = try tmp_dir.dir.createFile("test.safetensors", .{ .read = true });
+    defer tmp_file.close();
+    try tmp_file.writeAll(file_data);
+    try tmp_file.seekTo(0);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath("test.safetensors", &path_buf);
+
+    var st = try SafeTensors.load(allocator, tmp_path);
+    defer st.deinit();
+
+    const t = try st.getTensor("weight", .f32);
+    try testing.expect(t.gaffine == null);
+    try testing.expect(t.fp8 == null);
+    try testing.expect(t.mxfp8 == null);
+    try testing.expect(t.nvfp4 == null);
 }
 
 test "SafeTensors: getTensor for nonexistent tensor" {
