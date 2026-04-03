@@ -2287,7 +2287,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
         .i8 => self.kv_write_i8_function != null,
         .fp8 => self.kv_write_fp8_function != null,
     };
-    const can_flash_prefill = cfg.is_causal and switch (self.kv_cache_dtype) {
+    const can_flash_prefill = (head_dim_u32 <= 256) and cfg.is_causal and switch (self.kv_cache_dtype) {
         .f16 => self.flash_prefill_f16_function != null,
         .i8 => self.flash_prefill_i8_function != null,
         .fp8 => self.flash_prefill_fp8_function != null,
@@ -3117,7 +3117,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
         .i8 => self.kv_write_i8_function != null,
         .fp8 => self.kv_write_fp8_function != null,
     };
-    const can_flash_prefill = cfg.is_causal and switch (self.kv_cache_dtype) {
+    const can_flash_prefill = (head_dim_u32 <= 256) and cfg.is_causal and switch (self.kv_cache_dtype) {
         .f16 => self.flash_prefill_f16_function != null,
         .i8 => self.flash_prefill_i8_function != null,
         .fp8 => self.flash_prefill_fp8_function != null,
