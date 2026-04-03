@@ -128,6 +128,10 @@ pub fn runAttentionMixerStep(
     v_cache: *const compute.cuda.Buffer,
     k_scale: *const compute.cuda.Buffer,
     v_scale: *const compute.cuda.Buffer,
+    read_k_cache: *const compute.cuda.Buffer,
+    read_v_cache: *const compute.cuda.Buffer,
+    read_k_scale: *const compute.cuda.Buffer,
+    read_v_scale: *const compute.cuda.Buffer,
     q_proj: *const LinearWeight,
     k_proj: *const LinearWeight,
     v_proj: *const LinearWeight,
@@ -466,10 +470,10 @@ pub fn runAttentionMixerStep(
         cfg,
         &attn_q_stage,
         &attn_context_stage,
-        k_cache,
-        v_cache,
-        k_scale,
-        v_scale,
+        read_k_cache,
+        read_v_cache,
+        read_k_scale,
+        read_v_scale,
         attention_kernels,
         seq_len_u32,
         head_dim_u32,
@@ -2129,6 +2133,10 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
     v_cache: *const compute.cuda.Buffer,
     k_scale: *const compute.cuda.Buffer,
     v_scale: *const compute.cuda.Buffer,
+    read_k_cache: *const compute.cuda.Buffer,
+    read_v_cache: *const compute.cuda.Buffer,
+    read_k_scale: *const compute.cuda.Buffer,
+    read_v_scale: *const compute.cuda.Buffer,
     q_proj: *const LinearWeight,
     k_proj: *const LinearWeight,
     v_proj: *const LinearWeight,
@@ -2173,6 +2181,10 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
             v_cache,
             k_scale,
             v_scale,
+            read_k_cache,
+            read_v_cache,
+            read_k_scale,
+            read_v_scale,
             q_proj,
             k_proj,
             v_proj,
@@ -2550,10 +2562,10 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                     cfg,
                     &q_row,
                     &ctx_row,
-                    k_cache,
-                    v_cache,
-                    k_scale,
-                    v_scale,
+                    read_k_cache,
+                    read_v_cache,
+                    read_k_scale,
+                    read_v_scale,
                     attention_kernels,
                     effective_seq_len_u32,
                     head_dim_u32,
@@ -2596,8 +2608,8 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         &self.device,
                         self.flash_prefill_f16_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &attn_context_stage,
                         n_heads_u32,
                         @intCast(stage_rows),
@@ -2668,8 +2680,8 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
 
                     var kv_h: u32 = 0;
                     while (kv_h < n_kv) : (kv_h += 1) {
-                        const k_ptr = k_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
-                        const v_ptr = v_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
+                        const k_ptr = read_k_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
+                        const v_ptr = read_v_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
                         const q_f16_ptr = q_f16_buf.pointer + @as(usize, kv_h) * kv_groups_u32 * hd * @sizeOf(u16);
                         const out_ptr = attn_context_stage.pointer + @as(usize, kv_h) * kv_groups_u32 * hd * @sizeOf(f32);
 
@@ -2744,8 +2756,8 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_f16_kv_gqa_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &attn_context_stage,
                         n_heads_u32,
                         @intCast(stage_rows),
@@ -2765,8 +2777,8 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_f16_kv_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &attn_context_stage,
                         n_heads_u32,
                         @intCast(stage_rows),
@@ -2787,16 +2799,16 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                     attention_kernels.attn_fused_prefill_heads_i8_kv_gqa_function != null;
                 const scale_row_bytes_attn: usize = @as(usize, n_kv_heads_u32) * @sizeOf(f32);
                 const scale_offset_attn = std.math.mul(usize, 0, scale_row_bytes_attn) catch return error.InvalidArgument;
-                var k_scale_attn = try bufferSlice(k_scale, scale_offset_attn, k_scale.size);
-                var v_scale_attn = try bufferSlice(v_scale, scale_offset_attn, v_scale.size);
+                var k_scale_attn = try bufferSlice(read_k_scale, scale_offset_attn, read_k_scale.size);
+                var v_scale_attn = try bufferSlice(read_v_scale, scale_offset_attn, read_v_scale.size);
                 if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
                         &self.device,
                         self.flash_prefill_i8_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn,
                         &v_scale_attn,
                         &attn_context_stage,
@@ -2819,8 +2831,8 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_i8_kv_gqa_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn,
                         &v_scale_attn,
                         &attn_context_stage,
@@ -2843,8 +2855,8 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_i8_kv_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn,
                         &v_scale_attn,
                         &attn_context_stage,
@@ -2868,16 +2880,16 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                     attention_kernels.attn_fused_prefill_heads_fp8_kv_gqa_function != null;
                 const scale_row_bytes_attn_fp8: usize = @as(usize, n_kv_heads_u32) * @sizeOf(f32);
                 const scale_offset_attn_fp8 = std.math.mul(usize, 0, scale_row_bytes_attn_fp8) catch return error.InvalidArgument;
-                var k_scale_attn_fp8 = try bufferSlice(k_scale, scale_offset_attn_fp8, k_scale.size);
-                var v_scale_attn_fp8 = try bufferSlice(v_scale, scale_offset_attn_fp8, v_scale.size);
+                var k_scale_attn_fp8 = try bufferSlice(read_k_scale, scale_offset_attn_fp8, read_k_scale.size);
+                var v_scale_attn_fp8 = try bufferSlice(read_v_scale, scale_offset_attn_fp8, read_v_scale.size);
                 if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
                         &self.device,
                         self.flash_prefill_fp8_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn_fp8,
                         &v_scale_attn_fp8,
                         &attn_context_stage,
@@ -2900,8 +2912,8 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_fp8_kv_gqa_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn_fp8,
                         &v_scale_attn_fp8,
                         &attn_context_stage,
@@ -2924,8 +2936,8 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_fp8_kv_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn_fp8,
                         &v_scale_attn_fp8,
                         &attn_context_stage,
@@ -2965,6 +2977,10 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
     v_cache: *const compute.cuda.Buffer,
     k_scale: *const compute.cuda.Buffer,
     v_scale: *const compute.cuda.Buffer,
+    read_k_cache: *const compute.cuda.Buffer,
+    read_v_cache: *const compute.cuda.Buffer,
+    read_k_scale: *const compute.cuda.Buffer,
+    read_v_scale: *const compute.cuda.Buffer,
     q_proj: *const LinearWeight,
     k_proj: *const LinearWeight,
     v_proj: *const LinearWeight,
@@ -3009,6 +3025,10 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
             v_cache,
             k_scale,
             v_scale,
+            read_k_cache,
+            read_v_cache,
+            read_k_scale,
+            read_v_scale,
             q_proj,
             k_proj,
             v_proj,
@@ -3372,10 +3392,10 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                     cfg,
                     &q_row,
                     &ctx_row,
-                    k_cache,
-                    v_cache,
-                    k_scale,
-                    v_scale,
+                    read_k_cache,
+                    read_v_cache,
+                    read_k_scale,
+                    read_v_scale,
                     attention_kernels,
                     effective_seq_len_u32,
                     head_dim_u32,
@@ -3408,8 +3428,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         &self.device,
                         self.flash_prefill_f16_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &attn_context_stage,
                         n_heads_u32,
                         @intCast(stage_rows),
@@ -3478,8 +3498,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
 
                     var kv_h: u32 = 0;
                     while (kv_h < n_kv) : (kv_h += 1) {
-                        const k_ptr = k_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
-                        const v_ptr = v_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
+                        const k_ptr = read_k_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
+                        const v_ptr = read_v_cache.pointer + @as(usize, kv_h) * hd * @sizeOf(u16);
                         const q_f16_ptr = q_f16_buf.pointer + @as(usize, kv_h) * kv_groups_u32 * hd * @sizeOf(u16);
                         const out_ptr = attn_context_stage.pointer + @as(usize, kv_h) * kv_groups_u32 * hd * @sizeOf(f32);
 
@@ -3552,8 +3572,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_f16_kv_gqa_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &attn_context_stage,
                         n_heads_u32,
                         @intCast(stage_rows),
@@ -3573,8 +3593,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_f16_kv_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &attn_context_stage,
                         n_heads_u32,
                         @intCast(stage_rows),
@@ -3593,16 +3613,16 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
             .i8 => {
                 const use_gqa_i8 = kv_groups_u32 >= 2 and
                     attention_kernels.attn_fused_prefill_heads_i8_kv_gqa_function != null;
-                var k_scale_attn = try bufferSlice(k_scale, 0, k_scale.size);
-                var v_scale_attn = try bufferSlice(v_scale, 0, v_scale.size);
+                var k_scale_attn = try bufferSlice(read_k_scale, 0, read_k_scale.size);
+                var v_scale_attn = try bufferSlice(read_v_scale, 0, read_v_scale.size);
                 if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
                         &self.device,
                         self.flash_prefill_i8_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn,
                         &v_scale_attn,
                         &attn_context_stage,
@@ -3625,8 +3645,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_i8_kv_gqa_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn,
                         &v_scale_attn,
                         &attn_context_stage,
@@ -3649,8 +3669,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_i8_kv_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn,
                         &v_scale_attn,
                         &attn_context_stage,
@@ -3672,16 +3692,16 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
             .fp8 => {
                 const use_gqa_fp8 = kv_groups_u32 >= 2 and
                     attention_kernels.attn_fused_prefill_heads_fp8_kv_gqa_function != null;
-                var k_scale_attn_fp8 = try bufferSlice(k_scale, 0, k_scale.size);
-                var v_scale_attn_fp8 = try bufferSlice(v_scale, 0, v_scale.size);
+                var k_scale_attn_fp8 = try bufferSlice(read_k_scale, 0, read_k_scale.size);
+                var v_scale_attn_fp8 = try bufferSlice(read_v_scale, 0, read_v_scale.size);
                 if (can_flash_prefill) {
                     try compute.cuda.flash_prefill.runWithScales(
                         &self.kernel_arg_pack,
                         &self.device,
                         self.flash_prefill_fp8_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn_fp8,
                         &v_scale_attn_fp8,
                         &attn_context_stage,
@@ -3704,8 +3724,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_fp8_kv_gqa_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn_fp8,
                         &v_scale_attn_fp8,
                         &attn_context_stage,
@@ -3728,8 +3748,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         &self.device,
                         attention_kernels.attn_fused_prefill_heads_fp8_kv_function.?,
                         &attn_q_stage,
-                        k_cache,
-                        v_cache,
+                        read_k_cache,
+                        read_v_cache,
                         &k_scale_attn_fp8,
                         &v_scale_attn_fp8,
                         &attn_context_stage,

@@ -813,6 +813,13 @@ pub fn layerProgramAttentionAdapter(
         null;
     defer self.active_qkv_concat = null;
 
+    // For KV-shared layers, attention reads from the source layer's KV cache
+    // while KV writes still go to the current layer's own cache.
+    const read_binding = if (attention_binding.kv_shared_source_layer) |src_layer|
+        try requireAttentionRuntimeBinding(kv_state, src_layer)
+    else
+        attention_binding;
+
     if (!cfg.query_gate) {
         engine_mixers.runAttentionMixerPrefillBatchedNoQueryGate(
             self,
@@ -821,6 +828,10 @@ pub fn layerProgramAttentionAdapter(
             &attention_binding.v_cache,
             &attention_binding.k_scale,
             &attention_binding.v_scale,
+            &read_binding.k_cache,
+            &read_binding.v_cache,
+            &read_binding.k_scale,
+            &read_binding.v_scale,
             &q_proj,
             &k_proj,
             &v_proj,
@@ -871,6 +882,10 @@ pub fn layerProgramAttentionAdapter(
         &attention_binding.v_cache,
         &attention_binding.k_scale,
         &attention_binding.v_scale,
+        &read_binding.k_cache,
+        &read_binding.v_cache,
+        &read_binding.k_scale,
+        &read_binding.v_scale,
         &q_proj,
         &k_proj,
         &v_proj,
