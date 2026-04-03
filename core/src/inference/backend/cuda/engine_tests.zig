@@ -973,6 +973,7 @@ test "BlockRuntimeLayer.rebuildInstructionMetadata binds per-op runtime metadata
         .k_cache = zero_buffer,
         .v_cache = zero_buffer,
         .kv_capacity = 0,
+        .slot_kv_index = 0,
     };
     var shortconv_runtime: ShortConvBlockRuntime = .{
         .conv_dim = 0,

@@ -49,6 +49,23 @@ fn typeHasDecl(comptime T: type, comptime name: []const u8) bool {
     };
 }
 
+fn applyHostLogitsPostProcess(
+    logits: []f32,
+    logits_scaling: f32,
+    final_logit_softcapping: f32,
+) void {
+    if (logits_scaling != 1.0) {
+        for (logits) |*value| {
+            value.* /= logits_scaling;
+        }
+    }
+    if (final_logit_softcapping > 0.0) {
+        for (logits) |*value| {
+            value.* = std.math.tanh(value.* / final_logit_softcapping) * final_logit_softcapping;
+        }
+    }
+}
+
 fn executeCpuStage0LayerRange(
     stage0: anytype,
     token: u32,
@@ -541,22 +558,22 @@ fn computeBatchedPrefillPipeline2(
                 @memset(logits_out, -1.0e9);
                 @memcpy(logits_out[0..stage1.runtime_buffers.projected_vocab], stage1.runtime_buffers.projected_logits_host);
             }
-            if (stage1.loaded.config.logits_scaling != 1.0) {
-                for (logits_out) |*v| {
-                    v.* /= stage1.loaded.config.logits_scaling;
-                }
-                if (trace.isEnabled()) {
-                    trace.emitFinal(
-                        .logits_scaled,
-                        @intCast(last_position),
-                        0,
-                        @ptrCast(logits_out.ptr),
-                        .f32,
-                        .{ @intCast(stage1.vocab_size), 0, 0, 0 },
-                        1,
-                        null,
-                    );
-                }
+            applyHostLogitsPostProcess(
+                logits_out,
+                stage1.loaded.config.logits_scaling,
+                stage1.loaded.config.final_logit_softcapping,
+            );
+            if (stage1.loaded.config.logits_scaling != 1.0 and trace.isEnabled()) {
+                trace.emitFinal(
+                    .logits_scaled,
+                    @intCast(last_position),
+                    0,
+                    @ptrCast(logits_out.ptr),
+                    .f32,
+                    .{ @intCast(stage1.vocab_size), 0, 0, 0 },
+                    1,
+                    null,
+                );
             }
         }
 
@@ -1119,6 +1136,10 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
     use_preloaded_input: bool,
 ) !void {
     const SelfType = @TypeOf(self.*);
+    const gemma4_branch_active = if (comptime @hasField(SelfType, "gemma4_per_layer"))
+        self.gemma4_per_layer != null
+    else
+        false;
     if (comptime @hasDecl(SelfType, "pipelineStage1") and
         @hasDecl(SelfType, "transferPipelineActivation"))
     {
@@ -1573,8 +1594,8 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 },
             }
         }
-        if (!used_device_lookup) {
-            const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.runtime_buffers.hidden_host) catch |err| switch (err) {
+    if (!used_device_lookup) {
+        const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.runtime_buffers.hidden_host) catch |err| switch (err) {
                 error.InvalidArgument => return error.InvalidArgument,
                 else => return err,
             };
@@ -1597,13 +1618,20 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
         }
     }
 
+    var gemma_source_embeddings_opt: ?compute.cuda.Buffer = null;
+    if (comptime @hasDecl(SelfType, "maybeCaptureGemma4SourceEmbeddings")) {
+        gemma_source_embeddings_opt = try self.maybeCaptureGemma4SourceEmbeddings(1);
+    }
+    const gemma_token_id_single = [_]u32{token};
+
     // CUDA graph capture: record all GPU kernels (layer loop + final norm + lm_head)
     // into a graph, then replay with near-zero scheduling gaps between kernels.
     // Requires: named stream, no tracing (trace downloads break capture), no deepstack
     // (sync memcpy during capture is not stream-ordered).
     var graph_capture_active = false;
     if (self.compute_stream != null and compute_logits and
-        !trace.isEnabled() and deepstack_layer_features_opt == null)
+        !trace.isEnabled() and deepstack_layer_features_opt == null and
+        !gemma4_branch_active)
     {
         if (self.device.streamBeginCapture(self.compute_stream.?)) {
             graph_capture_active = true;
@@ -1672,6 +1700,17 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             attention_kernels,
             null,
         );
+        if (comptime @hasDecl(SelfType, "applyGemma4PerLayerBranch")) {
+            if (gemma_source_embeddings_opt) |*gemma_source_embeddings| {
+                try self.applyGemma4PerLayerBranch(
+                    layer_idx,
+                    gemma_token_id_single[0..],
+                    gemma_source_embeddings,
+                    &self.runtime_buffers.input_dev,
+                );
+                final_hidden = self.runtime_buffers.input_dev;
+            }
+        }
         // Deepstack: per-request feature vector addition between layer program
         // dispatches. Operates outside the per-instruction adapter table — same
         // pattern as embedding lookup and final logit projection.
@@ -1821,22 +1860,22 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
         @memset(logits_out, -1.0e9);
         @memcpy(logits_out[0..self.runtime_buffers.projected_vocab], self.runtime_buffers.projected_logits_host);
     }
-    if (self.loaded.config.logits_scaling != 1.0) {
-        for (logits_out) |*v| {
-            v.* /= self.loaded.config.logits_scaling;
-        }
-        if (trace.isEnabled()) {
-            trace.emitFinal(
-                .logits_scaled,
-                @intCast(position),
-                0,
-                @ptrCast(logits_out.ptr),
-                .f32,
-                .{ @intCast(self.vocab_size), 0, 0, 0 },
-                1,
-                null,
-            );
-        }
+    applyHostLogitsPostProcess(
+        logits_out,
+        self.loaded.config.logits_scaling,
+        self.loaded.config.final_logit_softcapping,
+    );
+    if (self.loaded.config.logits_scaling != 1.0 and trace.isEnabled()) {
+        trace.emitFinal(
+            .logits_scaled,
+            @intCast(position),
+            0,
+            @ptrCast(logits_out.ptr),
+            .f32,
+            .{ @intCast(self.vocab_size), 0, 0, 0 },
+            1,
+            null,
+        );
     }
 }
 
@@ -1856,6 +1895,10 @@ fn computeBatchedDecodeLogitsWithMode(
     output_mode: BatchedDecodeOutputMode,
 ) !void {
     const SelfType = @TypeOf(self.*);
+    const gemma4_branch_active = if (comptime @hasField(SelfType, "gemma4_per_layer"))
+        self.gemma4_per_layer != null
+    else
+        false;
     const n_usize = tokens.len;
     if (n_usize == 0) return;
     if (n_usize > self.max_batch_size) return error.InvalidArgument;
@@ -2285,7 +2328,7 @@ fn computeBatchedDecodeLogitsWithMode(
     compute: {
         // State 3: steady-state replay — cached graph exec + stable batch.
         if (comptime @hasField(SelfType, "batched_decode_graph_exec")) {
-            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables) {
+            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables and !gemma4_branch_active) {
                 if (self.batched_decode_graph_exec) |exec| {
                     try self.device.graphLaunch(exec, self.compute_stream.?);
 
@@ -2310,7 +2353,7 @@ fn computeBatchedDecodeLogitsWithMode(
         // Capture only on first steady-state step (state 2).
         var graph_capture_active = false;
         if (comptime @hasField(SelfType, "batched_decode_graph_exec")) {
-            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables) {
+            if (self.compute_stream != null and !trace.isEnabled() and !refresh_pointer_tables and !gemma4_branch_active) {
                 try self.device.streamBeginCapture(self.compute_stream.?);
                 graph_capture_active = true;
             }
@@ -2343,6 +2386,10 @@ fn computeBatchedDecodeLogitsWithMode(
 
         // Multi-row layer loop: all N tokens processed together through each layer.
         var final_hidden = try bufferSlice(&self.runtime_buffers.input_dev, 0, n_usize * row_bytes);
+        var gemma_source_embeddings_opt: ?compute.cuda.Buffer = null;
+        if (comptime @hasDecl(SelfType, "maybeCaptureGemma4SourceEmbeddings")) {
+            gemma_source_embeddings_opt = try self.maybeCaptureGemma4SourceEmbeddings(n_usize);
+        }
         const layer_limit = self.block_runtime.blocks.len;
         for (0..layer_limit) |layer_idx| {
             const layer = &self.block_runtime.blocks[layer_idx];
@@ -2372,6 +2419,17 @@ fn computeBatchedDecodeLogitsWithMode(
                 attention_kernels,
                 &batch_info,
             );
+            if (comptime @hasDecl(SelfType, "applyGemma4PerLayerBranch")) {
+                if (gemma_source_embeddings_opt) |*gemma_source_embeddings| {
+                    try self.applyGemma4PerLayerBranch(
+                        layer_idx,
+                        tokens,
+                        gemma_source_embeddings,
+                        &self.runtime_buffers.input_dev,
+                    );
+                    final_hidden = self.runtime_buffers.input_dev;
+                }
+            }
             if (layer.attention_binding != null) batch_info.attn_layer_index += 1;
             if (layer.gated_delta_binding != null) batch_info.gd_layer_index += 1;
             if (layer.shortconv_binding != null) batch_info.sc_layer_index += 1;
@@ -2424,16 +2482,11 @@ fn computeBatchedDecodeLogitsWithMode(
         const logits_batch_host = self.runtime_buffers.projected_logits_batch_host[0..logits_elems];
         try logits_batch.download(&self.device, std.mem.sliceAsBytes(logits_batch_host));
 
-        if (self.loaded.config.logits_scaling != 1.0) {
-            for (0..n_usize) |i| {
-                const row_start = std.math.mul(usize, i, vocab) catch return error.InvalidArgument;
-                const row_end = std.math.add(usize, row_start, vocab) catch return error.InvalidArgument;
-                const row_logits = logits_batch_host[row_start..row_end];
-                for (row_logits) |*v| {
-                    v.* /= self.loaded.config.logits_scaling;
-                }
-            }
-        }
+        applyHostLogitsPostProcess(
+            logits_batch_host,
+            self.loaded.config.logits_scaling,
+            self.loaded.config.final_logit_softcapping,
+        );
     }
 }
 
@@ -2741,6 +2794,10 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
         const last_position_u32: u32 = @intCast(last_position);
 
         var final_hidden_rows = self.runtime_buffers.input_dev;
+        var gemma_source_embeddings_opt: ?compute.cuda.Buffer = null;
+        if (comptime @hasDecl(SelfType, "maybeCaptureGemma4SourceEmbeddings")) {
+            gemma_source_embeddings_opt = try self.maybeCaptureGemma4SourceEmbeddings(rows);
+        }
         var layer_idx: usize = 0;
         while (layer_idx < layer_limit) : (layer_idx += 1) {
             const layer = &self.block_runtime.blocks[layer_idx];
@@ -2770,6 +2827,17 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
                 attention_kernels,
                 null,
             );
+            if (comptime @hasDecl(SelfType, "applyGemma4PerLayerBranch")) {
+                if (gemma_source_embeddings_opt) |*gemma_source_embeddings| {
+                    try self.applyGemma4PerLayerBranch(
+                        layer_idx,
+                        chunk_tokens,
+                        gemma_source_embeddings,
+                        &self.runtime_buffers.input_dev,
+                    );
+                    final_hidden_rows = self.runtime_buffers.input_dev;
+                }
+            }
         }
 
         // Extract logits from the last row of the final chunk.
@@ -2846,22 +2914,22 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
                 @memset(logits_out, -1.0e9);
                 @memcpy(logits_out[0..self.runtime_buffers.projected_vocab], self.runtime_buffers.projected_logits_host);
             }
-            if (self.loaded.config.logits_scaling != 1.0) {
-                for (logits_out) |*v| {
-                    v.* /= self.loaded.config.logits_scaling;
-                }
-                if (trace.isEnabled()) {
-                    trace.emitFinal(
-                        .logits_scaled,
-                        @intCast(last_position),
-                        0,
-                        @ptrCast(logits_out.ptr),
-                        .f32,
-                        .{ @intCast(self.vocab_size), 0, 0, 0 },
-                        1,
-                        null,
-                    );
-                }
+            applyHostLogitsPostProcess(
+                logits_out,
+                self.loaded.config.logits_scaling,
+                self.loaded.config.final_logit_softcapping,
+            );
+            if (self.loaded.config.logits_scaling != 1.0 and trace.isEnabled()) {
+                trace.emitFinal(
+                    .logits_scaled,
+                    @intCast(last_position),
+                    0,
+                    @ptrCast(logits_out.ptr),
+                    .f32,
+                    .{ @intCast(self.vocab_size), 0, 0, 0 },
+                    1,
+                    null,
+                );
             }
         }
 

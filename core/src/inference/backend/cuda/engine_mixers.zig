@@ -37,6 +37,77 @@ const attention_policy_config = engine_types.attention_policy_config;
 const min_flash_decode_blocks_default: u32 = 8;
 const min_flash_decode_blocks_low_kv_heads: u32 = 1024;
 
+fn debugKernelSyncEnabled() bool {
+    const raw = std.posix.getenv("TALU_CUDA_DEBUG_SYNC") orelse return false;
+    return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
+}
+
+fn effectiveLayerRopeTheta(
+    self: anytype,
+    cfg: *const LayerAttentionExecConfig,
+    head_dim_u32: u32,
+    rope_dim_u32: u32,
+    global_rope_theta: f32,
+    local_rope_theta: f32,
+) f32 {
+    _ = head_dim_u32;
+    if (cfg.sliding_window > 0) return local_rope_theta;
+    if (self.loaded.config.hidden_size_per_layer_input <= 0) return global_rope_theta;
+    if (global_rope_theta <= 0.0 or rope_dim_u32 == 0) return global_rope_theta;
+    if (self.loaded.config.global_head_dim <= 0) return global_rope_theta;
+
+    const global_head_dim: f32 = @floatFromInt(self.loaded.config.global_head_dim);
+    const rope_dim: f32 = @floatFromInt(rope_dim_u32);
+    if (global_head_dim < rope_dim or global_head_dim <= 0.0) return global_rope_theta;
+
+    // Proportional RoPE models (Gemma4) define frequencies over global_head_dim,
+    // while CUDA kernels parameterize frequencies by rope_dim. Adjust theta so
+    // theta^(2i/rope_dim) matches the intended theta^(2i/global_head_dim).
+    const exponent = rope_dim / global_head_dim;
+    return std.math.pow(f32, global_rope_theta, exponent);
+}
+
+fn attentionScaleForHeadDim(self: anytype, head_dim_u32: u32) f32 {
+    if (self.loaded.config.attention_multiplier > 0.0 or self.loaded.config.query_pre_attn_scalar > 0.0) {
+        return self.attention_scale;
+    }
+    if (head_dim_u32 == 0) return self.attention_scale;
+    return 1.0 / std.math.sqrt(@as(f32, @floatFromInt(head_dim_u32)));
+}
+
+fn applyValueNormInPlace(
+    self: anytype,
+    values: *compute.cuda.Buffer,
+    rows: usize,
+    n_kv_heads_u32: u32,
+    head_dim_u32: u32,
+) !void {
+    if (self.loaded.config.hidden_size_per_layer_input <= 0) return;
+    if (head_dim_u32 == 0) return error.InvalidArgument;
+    const head_dim: usize = @intCast(head_dim_u32);
+    if (head_dim > self.d_model or head_dim > self.runtime_buffers.hidden_host.len) return error.InvalidArgument;
+
+    const norm_weight_bytes = std.math.mul(usize, head_dim, @sizeOf(f32)) catch return error.InvalidArgument;
+    var norm_weight_dev = try bufferSlice(&self.runtime_buffers.norm_out_dev, 0, norm_weight_bytes);
+    const norm_weight_host = self.runtime_buffers.hidden_host[0..head_dim];
+    @memset(norm_weight_host, 1.0);
+    try norm_weight_dev.upload(&self.device, std.mem.sliceAsBytes(norm_weight_host));
+
+    const v_norm_rows = std.math.mul(u32, @intCast(rows), n_kv_heads_u32) catch return error.InvalidArgument;
+    try compute.cuda.rmsnorm.runWithFunction(
+        &self.kernel_arg_pack,
+        &self.device,
+        self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+        values,
+        &norm_weight_dev,
+        values,
+        v_norm_rows,
+        head_dim_u32,
+        self.norm_eps,
+        0.0,
+    );
+}
+
 const Tensor = tensor.Tensor;
 
 // --- Compute ops from engine_ops.zig ---
@@ -76,15 +147,22 @@ pub fn runAttentionMixerStep(
     global_rope_theta: f32,
     local_rope_theta: f32,
     rope_function: compute.cuda.Function,
-    copy_function: compute.cuda.Function,
+    _: compute.cuda.Function,
     cast_f32_to_f16_function: ?compute.cuda.Function,
     kv_write_f16_function: ?compute.cuda.Function,
     rope_store_f16_function: ?compute.cuda.Function,
     attention_kernels: AttentionKernelSet,
     residual_buf: ?compute.cuda.Buffer,
 ) !void {
-    _ = copy_function;
-    const layer_rope_theta = if (cfg.sliding_window > 0) local_rope_theta else global_rope_theta;
+    const layer_rope_theta = effectiveLayerRopeTheta(
+        self,
+        cfg,
+        head_dim_u32,
+        rope_dim_u32,
+        global_rope_theta,
+        local_rope_theta,
+    );
+    const attention_scale = attentionScaleForHeadDim(self, head_dim_u32);
     const stage_rows = bufferF32RowCount(input, @intCast(d_model_u32)) catch |err| {
         log.warn("inference", "CUDA attention staged row count invalid", .{
             .seq_len = seq_len_u32,
@@ -125,6 +203,8 @@ pub fn runAttentionMixerStep(
             stage_rows,
             cfg.q_dim,
             cfg.q_projection_dim,
+            n_heads_u32,
+            head_dim_u32,
             &q_projection_stage,
             &q_values_stage,
         ) catch |err| {
@@ -139,7 +219,6 @@ pub fn runAttentionMixerStep(
         };
         attn_q_stage = q_values_stage;
     }
-
     if (q_norm_weight) |q_norm_value| {
         const q_norm_rows = std.math.mul(u32, @intCast(stage_rows), n_heads_u32) catch return error.InvalidArgument;
         compute.cuda.rmsnorm.runWithFunction(
@@ -188,7 +267,7 @@ pub fn runAttentionMixerStep(
             return err;
         };
     }
-
+    try applyValueNormInPlace(self, &attn_v_stage, stage_rows, n_kv_heads_u32, head_dim_u32);
     const use_fused_attention_heads_f16_kv = (!cfg.query_gate) and attention_mod.useFusedHeadsF16Kv(
         attention_policy_config,
         seq_len_u32,
@@ -381,8 +460,7 @@ pub fn runAttentionMixerStep(
         },
     }
 
-    const kv_groups = self.n_heads / self.n_kv_heads;
-    const kv_groups_u32: u32 = @intCast(kv_groups);
+    const kv_groups_u32: u32 = n_heads_u32 / n_kv_heads_u32;
     const kv_dim_u32: u32 = @intCast(cfg.kv_dim);
     _ = self.runAttentionContext(
         cfg,
@@ -397,6 +475,8 @@ pub fn runAttentionMixerStep(
         head_dim_u32,
         kv_dim_u32,
         kv_groups_u32,
+        n_heads_u32,
+        attention_scale,
         rope_dim_u32,
         position_u32,
         layer_rope_theta,
@@ -418,6 +498,8 @@ pub fn runAttentionMixerStep(
             stage_rows,
             cfg.q_dim,
             cfg.q_projection_dim,
+            n_heads_u32,
+            head_dim_u32,
         ) catch |err| {
             log.warn("inference", "CUDA attention query-gate output failed", .{
                 .seq_len = seq_len_u32,
@@ -464,7 +546,15 @@ pub fn runBatchedDecodeAttentionMixer(
 ) !void {
     const n_rows = ctx.active_rows_u32;
     const n: usize = @intCast(n_rows);
-    const layer_rope_theta = if (cfg.sliding_window > 0) ctx.local_rope_theta else ctx.global_rope_theta;
+    const layer_rope_theta = effectiveLayerRopeTheta(
+        self,
+        cfg,
+        ctx.head_dim_u32,
+        ctx.rope_dim_u32,
+        ctx.global_rope_theta,
+        ctx.local_rope_theta,
+    );
+    const attention_scale = attentionScaleForHeadDim(self, ctx.head_dim_u32);
     const q_stage_bytes = n * cfg.q_projection_dim * @sizeOf(f32);
     const q_values_bytes = n * cfg.q_dim * @sizeOf(f32);
     const kv_stage_bytes = n * cfg.kv_dim * @sizeOf(f32);
@@ -478,11 +568,13 @@ pub fn runBatchedDecodeAttentionMixer(
     var attn_k_stage = try bufferSlice(&self.runtime_buffers.attn_k_dev, 0, kv_stage_bytes);
     var attn_v_stage = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, kv_stage_bytes);
     var attn_context_stage = try bufferSlice(&self.runtime_buffers.attn_context_dev, 0, context_stage_bytes);
+    const current_attention_binding = self.block_runtime.blocks[ctx.layer_index].attention_binding orelse return error.InvalidStateDescriptorBinding;
+    const shared_source_slot_kv_index = current_attention_binding.kv_shared_source_slot_kv_index;
 
-    // Step 1: QKV GEMM for all N rows.
+    // Step 1: QKV projection for all N rows.
     _ = try engine_ops.runQkvProjection(self, input, q_proj, k_proj, v_proj, n, &q_projection_stage);
     if (cfg.query_gate) {
-        try engine_ops.compactQueryGateProjection(self, n, cfg.q_dim, cfg.q_projection_dim, &q_projection_stage, &q_values_stage);
+        try engine_ops.compactQueryGateProjection(self, n, cfg.q_dim, cfg.q_projection_dim, ctx.n_heads_u32, ctx.head_dim_u32, &q_projection_stage, &q_values_stage);
         attn_q_stage = q_values_stage;
     }
 
@@ -517,11 +609,14 @@ pub fn runBatchedDecodeAttentionMixer(
             self.loaded.runtime.qk_norm_weight_offset,
         );
     }
+    if (current_attention_binding.use_v_norm) {
+        try applyValueNormInPlace(self, &attn_v_stage, n, ctx.n_kv_heads_u32, ctx.head_dim_u32);
+    }
 
     // Step 3: Per-row RoPE + KV write, then decode attention.
     const kv_elem_bytes: usize = self.kv_cache_dtype.elementBytes();
     const kv_row_bytes = cfg.kv_dim * kv_elem_bytes;
-    const kv_groups: u32 = @intCast(self.n_heads / self.n_kv_heads);
+    const kv_groups: u32 = ctx.n_heads_u32 / ctx.n_kv_heads_u32;
     const kv_dim_u32: u32 = @intCast(cfg.kv_dim);
     const use_k_write_fused = switch (self.kv_cache_dtype) {
         .f16 => ctx.kv_write_f16_function != null or ctx.rope_store_f16_function != null,
@@ -575,17 +670,54 @@ pub fn runBatchedDecodeAttentionMixer(
     const idx_bytes = std.math.mul(usize, n, @sizeOf(u32)) catch return error.InvalidArgument;
     const attn_table_row_offset = std.math.mul(usize, batch.attn_layer_index, batch.attn_ptrs_row_stride) catch return error.InvalidArgument;
     const attn_table_byte_offset = std.math.mul(usize, attn_table_row_offset, @sizeOf(u64)) catch return error.InvalidArgument;
-    var decode_key_cache_ptrs_dev = try bufferSlice(batch.attn_key_cache_ptrs_table_dev, attn_table_byte_offset, ptr_bytes);
-    var decode_value_cache_ptrs_dev = try bufferSlice(batch.attn_value_cache_ptrs_table_dev, attn_table_byte_offset, ptr_bytes);
-    var decode_k_scale_ptrs_dev = try bufferSlice(batch.attn_k_scale_ptrs_table_dev, attn_table_byte_offset, ptr_bytes);
-    var decode_v_scale_ptrs_dev = try bufferSlice(batch.attn_v_scale_ptrs_table_dev, attn_table_byte_offset, ptr_bytes);
+    var write_key_cache_ptrs_dev = try bufferSlice(batch.attn_key_cache_ptrs_table_dev, attn_table_byte_offset, ptr_bytes);
+    var write_value_cache_ptrs_dev = try bufferSlice(batch.attn_value_cache_ptrs_table_dev, attn_table_byte_offset, ptr_bytes);
+    var write_k_scale_ptrs_dev = try bufferSlice(batch.attn_k_scale_ptrs_table_dev, attn_table_byte_offset, ptr_bytes);
+    var write_v_scale_ptrs_dev = try bufferSlice(batch.attn_v_scale_ptrs_table_dev, attn_table_byte_offset, ptr_bytes);
+    var read_key_cache_ptrs_dev = write_key_cache_ptrs_dev;
+    var read_value_cache_ptrs_dev = write_value_cache_ptrs_dev;
+    var read_k_scale_ptrs_dev = write_k_scale_ptrs_dev;
+    var read_v_scale_ptrs_dev = write_v_scale_ptrs_dev;
     var decode_positions_dev = try bufferSlice(&self.runtime_buffers.decode_positions_dev, 0, idx_bytes);
     var decode_seq_lens_dev = try bufferSlice(&self.runtime_buffers.decode_seq_lens_dev, 0, idx_bytes);
+
+    if (shared_source_slot_kv_index) |read_slot_kv_index| {
+        var read_key_ptrs_host = self.runtime_buffers.decode_key_cache_ptrs_host[0..n];
+        var read_value_ptrs_host = self.runtime_buffers.decode_value_cache_ptrs_host[0..n];
+        for (0..n) |row_i| {
+            const slot_idx = batch.slot_indices[row_i];
+            const read_entry = self.slot_kv_states[slot_idx].kv[read_slot_kv_index];
+            read_key_ptrs_host[row_i] = read_entry.k.pointer;
+            read_value_ptrs_host[row_i] = read_entry.v.pointer;
+        }
+        read_key_cache_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_key_cache_ptrs_dev, 0, ptr_bytes);
+        read_value_cache_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_value_cache_ptrs_dev, 0, ptr_bytes);
+        try read_key_cache_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_key_ptrs_host));
+        try read_value_cache_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_value_ptrs_host));
+
+        switch (self.kv_cache_dtype) {
+            .f16 => {},
+            .i8, .fp8 => {
+                var read_k_scale_ptrs_host = self.runtime_buffers.decode_attn_k_scale_ptrs_table_host[0..n];
+                var read_v_scale_ptrs_host = self.runtime_buffers.decode_attn_v_scale_ptrs_table_host[0..n];
+                for (0..n) |row_i| {
+                    const slot_idx = batch.slot_indices[row_i];
+                    const read_entry = self.slot_kv_states[slot_idx].kv[read_slot_kv_index];
+                    read_k_scale_ptrs_host[row_i] = read_entry.k_scale.pointer;
+                    read_v_scale_ptrs_host[row_i] = read_entry.v_scale.pointer;
+                }
+                read_k_scale_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_attn_k_scale_ptrs_table_dev, 0, ptr_bytes);
+                read_v_scale_ptrs_dev = try bufferSlice(&self.runtime_buffers.decode_attn_v_scale_ptrs_table_dev, 0, ptr_bytes);
+                try read_k_scale_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_k_scale_ptrs_host));
+                try read_v_scale_ptrs_dev.upload(&self.device, std.mem.sliceAsBytes(read_v_scale_ptrs_host));
+            },
+        }
+    }
 
     // Flash decode preferred (GQA-aware, fewest KV reads), then batched
     // separate (graph-compatible), then fused fallback.
     const use_batched_decode_attention = use_flash_decode or use_batched_separate_decode_attention or use_batched_fused_decode_attention;
-    const can_skip_row_decode_prep = use_batched_kv_write and use_batched_decode_attention;
+    const can_skip_row_decode_prep = shared_source_slot_kv_index == null and use_batched_kv_write and use_batched_decode_attention;
     if (!can_skip_row_decode_prep) {
         for (0..n) |row_i| {
             const slot_idx = batch.slot_indices[row_i];
@@ -758,8 +890,8 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.kv_write_f16_rows_ptrs_function orelse return error.CudaKernelUnavailable,
                     &attn_k_stage,
                     &attn_v_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_value_cache_ptrs_dev,
+                    &write_key_cache_ptrs_dev,
+                    &write_value_cache_ptrs_dev,
                     &decode_positions_dev,
                     ctx.n_kv_heads_u32,
                     ctx.head_dim_u32,
@@ -776,10 +908,10 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.kv_write_i8_rows_ptrs_function orelse return error.CudaKernelUnavailable,
                     &attn_k_stage,
                     &attn_v_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_value_cache_ptrs_dev,
-                    &decode_k_scale_ptrs_dev,
-                    &decode_v_scale_ptrs_dev,
+                    &write_key_cache_ptrs_dev,
+                    &write_value_cache_ptrs_dev,
+                    &write_k_scale_ptrs_dev,
+                    &write_v_scale_ptrs_dev,
                     &decode_positions_dev,
                     ctx.n_kv_heads_u32,
                     ctx.head_dim_u32,
@@ -796,10 +928,10 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.kv_write_fp8_rows_ptrs_function orelse return error.CudaKernelUnavailable,
                     &attn_k_stage,
                     &attn_v_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_value_cache_ptrs_dev,
-                    &decode_k_scale_ptrs_dev,
-                    &decode_v_scale_ptrs_dev,
+                    &write_key_cache_ptrs_dev,
+                    &write_value_cache_ptrs_dev,
+                    &write_k_scale_ptrs_dev,
+                    &write_v_scale_ptrs_dev,
                     &decode_positions_dev,
                     ctx.n_kv_heads_u32,
                     ctx.head_dim_u32,
@@ -853,8 +985,8 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.flash_decode_f16_function orelse return error.CudaKernelUnavailable,
                     &attn_context_stage,
                     &attn_q_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_value_cache_ptrs_dev,
+                    &read_key_cache_ptrs_dev,
+                    &read_value_cache_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -863,7 +995,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     kv_dim_u32,
                     kv_groups,
                     ctx.head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     ctx.rope_dim_u32,
                     sliding_window_u32,
                     layer_rope_theta,
@@ -882,10 +1014,10 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.flash_decode_i8_function orelse return error.CudaKernelUnavailable,
                     &attn_context_stage,
                     &attn_q_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_value_cache_ptrs_dev,
-                    &decode_k_scale_ptrs_dev,
-                    &decode_v_scale_ptrs_dev,
+                    &read_key_cache_ptrs_dev,
+                    &read_value_cache_ptrs_dev,
+                    &read_k_scale_ptrs_dev,
+                    &read_v_scale_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -894,7 +1026,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     kv_dim_u32,
                     kv_groups,
                     ctx.head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     ctx.rope_dim_u32,
                     sliding_window_u32,
                     layer_rope_theta,
@@ -913,10 +1045,10 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.flash_decode_fp8_function orelse return error.CudaKernelUnavailable,
                     &attn_context_stage,
                     &attn_q_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_value_cache_ptrs_dev,
-                    &decode_k_scale_ptrs_dev,
-                    &decode_v_scale_ptrs_dev,
+                    &read_key_cache_ptrs_dev,
+                    &read_value_cache_ptrs_dev,
+                    &read_k_scale_ptrs_dev,
+                    &read_v_scale_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -925,7 +1057,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     kv_dim_u32,
                     kv_groups,
                     ctx.head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     ctx.rope_dim_u32,
                     sliding_window_u32,
                     layer_rope_theta,
@@ -987,7 +1119,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.attn_scores_heads_f16_kv_ptrs_function orelse return error.CudaKernelUnavailable,
                     &scores_dev,
                     &attn_q_stage,
-                    &decode_key_cache_ptrs_dev,
+                    &read_key_cache_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -996,7 +1128,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     kv_dim_u32,
                     kv_groups,
                     ctx.head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     sliding_window_u32,
                 );
             },
@@ -1007,8 +1139,8 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.attn_scores_heads_i8_kv_ptrs_function orelse return error.CudaKernelUnavailable,
                     &scores_dev,
                     &attn_q_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_k_scale_ptrs_dev,
+                    &read_key_cache_ptrs_dev,
+                    &read_k_scale_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -1018,7 +1150,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     kv_dim_u32,
                     kv_groups,
                     ctx.head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     sliding_window_u32,
                 );
             },
@@ -1029,8 +1161,8 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.attn_scores_heads_fp8_kv_ptrs_function orelse return error.CudaKernelUnavailable,
                     &scores_dev,
                     &attn_q_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_k_scale_ptrs_dev,
+                    &read_key_cache_ptrs_dev,
+                    &read_k_scale_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -1040,7 +1172,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     kv_dim_u32,
                     kv_groups,
                     ctx.head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     sliding_window_u32,
                 );
             },
@@ -1069,7 +1201,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.attn_weighted_sum_heads_f16_kv_ptrs_function orelse return error.CudaKernelUnavailable,
                     &attn_context_stage,
                     &scores_dev,
-                    &decode_value_cache_ptrs_dev,
+                    &read_value_cache_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -1088,8 +1220,8 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.attn_weighted_sum_heads_i8_kv_ptrs_function orelse return error.CudaKernelUnavailable,
                     &attn_context_stage,
                     &scores_dev,
-                    &decode_value_cache_ptrs_dev,
-                    &decode_v_scale_ptrs_dev,
+                    &read_value_cache_ptrs_dev,
+                    &read_v_scale_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -1109,8 +1241,8 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.attn_weighted_sum_heads_fp8_kv_ptrs_function orelse return error.CudaKernelUnavailable,
                     &attn_context_stage,
                     &scores_dev,
-                    &decode_value_cache_ptrs_dev,
-                    &decode_v_scale_ptrs_dev,
+                    &read_value_cache_ptrs_dev,
+                    &read_v_scale_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -1138,8 +1270,8 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.attn_fused_decode_heads_f16_kv_ptrs_function orelse return error.CudaKernelUnavailable,
                     &attn_context_stage,
                     &attn_q_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_value_cache_ptrs_dev,
+                    &read_key_cache_ptrs_dev,
+                    &read_value_cache_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -1147,7 +1279,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     kv_dim_u32,
                     kv_groups,
                     ctx.head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     ctx.rope_dim_u32,
                     sliding_window_u32,
                     layer_rope_theta,
@@ -1162,10 +1294,10 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.attn_fused_decode_heads_i8_kv_ptrs_function orelse return error.CudaKernelUnavailable,
                     &attn_context_stage,
                     &attn_q_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_value_cache_ptrs_dev,
-                    &decode_k_scale_ptrs_dev,
-                    &decode_v_scale_ptrs_dev,
+                    &read_key_cache_ptrs_dev,
+                    &read_value_cache_ptrs_dev,
+                    &read_k_scale_ptrs_dev,
+                    &read_v_scale_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -1174,7 +1306,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     kv_dim_u32,
                     kv_groups,
                     ctx.head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     ctx.rope_dim_u32,
                     sliding_window_u32,
                     layer_rope_theta,
@@ -1189,10 +1321,10 @@ pub fn runBatchedDecodeAttentionMixer(
                     self.attn_fused_decode_heads_fp8_kv_ptrs_function orelse return error.CudaKernelUnavailable,
                     &attn_context_stage,
                     &attn_q_stage,
-                    &decode_key_cache_ptrs_dev,
-                    &decode_value_cache_ptrs_dev,
-                    &decode_k_scale_ptrs_dev,
-                    &decode_v_scale_ptrs_dev,
+                    &read_key_cache_ptrs_dev,
+                    &read_value_cache_ptrs_dev,
+                    &read_k_scale_ptrs_dev,
+                    &read_v_scale_ptrs_dev,
                     &decode_seq_lens_dev,
                     &decode_positions_dev,
                     n_rows,
@@ -1201,7 +1333,7 @@ pub fn runBatchedDecodeAttentionMixer(
                     kv_dim_u32,
                     kv_groups,
                     ctx.head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     ctx.rope_dim_u32,
                     sliding_window_u32,
                     layer_rope_theta,
@@ -1216,21 +1348,27 @@ pub fn runBatchedDecodeAttentionMixer(
             const position_u32: u32 = @intCast(batch.positions[row_i]);
             const seq_len_u32 = batch.seq_lens[row_i];
             const kv_entry = self.slot_kv_states[slot_idx].kv[batch.attn_layer_index];
+            const read_entry = if (shared_source_slot_kv_index) |read_slot_kv_index|
+                self.slot_kv_states[slot_idx].kv[read_slot_kv_index]
+            else
+                kv_entry;
             var q_row = try logicalF32RowSlice(&attn_q_stage, n, row_i, cfg.q_dim);
             var context_row = try logicalF32RowSlice(&attn_context_stage, n, row_i, o_proj.rows());
             _ = try self.runAttentionContext(
                 cfg,
                 &q_row,
                 &context_row,
-                &kv_entry.k,
-                &kv_entry.v,
-                &kv_entry.k_scale,
-                &kv_entry.v_scale,
+                &read_entry.k,
+                &read_entry.v,
+                &read_entry.k_scale,
+                &read_entry.v_scale,
                 ctx.attention_kernels,
                 seq_len_u32,
                 ctx.head_dim_u32,
                 kv_dim_u32,
                 kv_groups,
+                ctx.n_heads_u32,
+                attention_scale,
                 ctx.rope_dim_u32,
                 position_u32,
                 layer_rope_theta,
@@ -1242,7 +1380,7 @@ pub fn runBatchedDecodeAttentionMixer(
     // separate and per-row paths need a separate gate kernel.
     const fused_path_active = use_flash_decode or (use_batched_fused_decode_attention and !use_batched_separate_decode_attention);
     if (cfg.query_gate and !fused_path_active) {
-        try engine_ops.applyQueryGateToContextInPlace(self, n, cfg.q_dim, cfg.q_projection_dim);
+        try engine_ops.applyQueryGateToContextInPlace(self, n, cfg.q_dim, cfg.q_projection_dim, ctx.n_heads_u32, ctx.head_dim_u32);
     }
 
     // Step 5: O projection GEMM for all N rows.
@@ -2014,18 +2152,64 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
     rope_store_f16_function: ?compute.cuda.Function,
     attention_kernels: AttentionKernelSet,
 ) !void {
-    _ = copy_function;
     if (cfg.query_gate) return error.InvalidInstructionBinding;
 
     const stage_rows = try bufferF32RowCount(input, @intCast(d_model_u32));
-    if (stage_rows <= 1) return error.InvalidInstructionBinding;
+    if (stage_rows == 0) return error.InvalidInstructionBinding;
     if (stage_rows > @as(usize, seq_len_u32)) return error.InvalidInstructionBinding;
 
     // Position base for chunked prefill: this chunk writes KV at
     // [position_base, position_base + stage_rows) in the cache.
     const position_base_u32: u32 = seq_len_u32 - @as(u32, @intCast(stage_rows));
+    const attention_scale = attentionScaleForHeadDim(self, head_dim_u32);
+    if (stage_rows == 1) {
+        const position: usize = @intCast(position_base_u32);
+        var input_row = try logicalF32RowSlice(input, stage_rows, 0, @intCast(d_model_u32));
+        var output_row = try logicalF32RowSlice(output, stage_rows, 0, o_proj.cols());
+        try runAttentionMixerStep(
+            self,
+            cfg,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm_weight,
+            k_norm_weight,
+            &input_row,
+            &output_row,
+            d_model_u32,
+            head_dim_u32,
+            rope_dim_u32,
+            n_heads_u32,
+            n_kv_heads_u32,
+            seq_len_u32,
+            position,
+            position_base_u32,
+            global_rope_theta,
+            local_rope_theta,
+            rope_function,
+            copy_function,
+            cast_f32_to_f16_function,
+            kv_write_f16_function,
+            rope_store_f16_function,
+            attention_kernels,
+            null,
+        );
+        return;
+    }
 
-    const layer_rope_theta = if (cfg.sliding_window > 0) local_rope_theta else global_rope_theta;
+    const layer_rope_theta = effectiveLayerRopeTheta(
+        self,
+        cfg,
+        head_dim_u32,
+        rope_dim_u32,
+        global_rope_theta,
+        local_rope_theta,
+    );
     const q_stage_bytes = std.math.mul(usize, stage_rows, cfg.q_projection_dim * @sizeOf(f32)) catch return error.InvalidArgument;
     const kv_stage_bytes = std.math.mul(usize, stage_rows, cfg.kv_dim * @sizeOf(f32)) catch return error.InvalidArgument;
     const context_stage_bytes = std.math.mul(usize, stage_rows, o_proj.rows() * @sizeOf(f32)) catch return error.InvalidArgument;
@@ -2034,7 +2218,24 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
     var attn_v_stage = try bufferSlice(&self.runtime_buffers.attn_v_dev, 0, kv_stage_bytes);
     var attn_context_stage = try bufferSlice(&self.runtime_buffers.attn_context_dev, 0, context_stage_bytes);
 
-    _ = try engine_ops.runQkvProjection(self, input, q_proj, k_proj, v_proj, stage_rows, &self.runtime_buffers.attn_q_dev);
+    _ = engine_ops.runQkvProjection(self, input, q_proj, k_proj, v_proj, stage_rows, &self.runtime_buffers.attn_q_dev) catch |err| {
+        log.warn("inference", "CUDA prefill QKV projection failed", .{
+            .rows = stage_rows,
+            .q_dim = cfg.q_dim,
+            .q_projection_dim = cfg.q_projection_dim,
+            .kv_dim = cfg.kv_dim,
+            .reason = @errorName(err),
+        });
+        return err;
+    };
+    if (debugKernelSyncEnabled()) {
+        self.device.synchronize() catch |err| {
+            log.warn("inference", "CUDA debug sync failed after prefill qkv", .{
+                .reason = @errorName(err),
+            });
+            return err;
+        };
+    }
 
     if (q_norm_weight) |q_norm_value| {
         const q_norm_rows = std.math.mul(u32, @intCast(stage_rows), n_heads_u32) catch return error.InvalidArgument;
@@ -2066,12 +2267,21 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
             self.loaded.runtime.qk_norm_weight_offset,
         );
     }
+    try applyValueNormInPlace(self, &attn_v_stage, stage_rows, n_kv_heads_u32, head_dim_u32);
+    if (debugKernelSyncEnabled()) {
+        self.device.synchronize() catch |err| {
+            log.warn("inference", "CUDA debug sync failed after prefill qk_norm", .{
+                .reason = @errorName(err),
+            });
+            return err;
+        };
+    }
 
     const kv_row_f32_bytes = std.math.mul(usize, cfg.kv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
     const kv_elem_bytes: usize = self.kv_cache_dtype.elementBytes();
     const kv_row_bytes = std.math.mul(usize, cfg.kv_dim, kv_elem_bytes) catch return error.InvalidArgument;
     const kv_dim_u32: u32 = @intCast(cfg.kv_dim);
-    const kv_groups_u32: u32 = @intCast(self.n_heads / self.n_kv_heads);
+    const kv_groups_u32: u32 = n_heads_u32 / n_kv_heads_u32;
     const use_k_write_fused = switch (self.kv_cache_dtype) {
         .f16 => kv_write_f16_function != null or rope_store_f16_function != null,
         .i8 => self.kv_write_i8_function != null,
@@ -2349,12 +2559,22 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                     head_dim_u32,
                     kv_dim_u32,
                     kv_groups_u32,
+                    n_heads_u32,
+                    attention_scale,
                     rope_dim_u32,
                     position_u32,
                     layer_rope_theta,
                 );
             }
         }
+    }
+    if (debugKernelSyncEnabled()) {
+        self.device.synchronize() catch |err| {
+            log.warn("inference", "CUDA debug sync failed after prefill kv-write", .{
+                .reason = @errorName(err),
+            });
+            return err;
+        };
     }
 
     if (can_any_fused_prefill) {
@@ -2385,7 +2605,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32,
@@ -2463,7 +2683,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                                 sl, // m = seq_len
                                 qr, // n = q_rows
                                 hd, // k = head_dim
-                                self.attention_scale,
+                                attention_scale,
                                 k_ptr,
                                 kv_ld, // lda = kv_dim
                                 q_f16_ptr + @as(usize, g) * hd * @sizeOf(u16),
@@ -2533,7 +2753,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32,
@@ -2554,7 +2774,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32,
@@ -2587,7 +2807,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32,
@@ -2611,7 +2831,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32,
@@ -2635,7 +2855,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32,
@@ -2668,7 +2888,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32,
@@ -2692,7 +2912,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32,
@@ -2716,7 +2936,7 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32,
@@ -2727,7 +2947,15 @@ pub fn runAttentionMixerPrefillBatchedNoQueryGate(
         }
     }
 
-    try engine_ops.linearForwardRows(self, &attn_context_stage, stage_rows, o_proj, output);
+    engine_ops.linearForwardRows(self, &attn_context_stage, stage_rows, o_proj, output) catch |err| {
+        log.warn("inference", "CUDA prefill attention O projection failed", .{
+            .rows = stage_rows,
+            .in_dim = o_proj.rows(),
+            .out_dim = o_proj.cols(),
+            .reason = @errorName(err),
+        });
+        return err;
+    };
 }
 
 pub fn runAttentionMixerPrefillBatchedWithQueryGate(
@@ -2760,18 +2988,64 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
     rope_store_f16_function: ?compute.cuda.Function,
     attention_kernels: AttentionKernelSet,
 ) !void {
-    _ = copy_function;
     if (!cfg.query_gate) return error.InvalidInstructionBinding;
 
     const stage_rows = try bufferF32RowCount(input, @intCast(d_model_u32));
-    if (stage_rows <= 1) return error.InvalidInstructionBinding;
+    if (stage_rows == 0) return error.InvalidInstructionBinding;
     if (stage_rows > @as(usize, seq_len_u32)) return error.InvalidInstructionBinding;
 
     // Position base for chunked prefill: this chunk writes KV at
     // [position_base, position_base + stage_rows) in the cache.
     const position_base_u32: u32 = seq_len_u32 - @as(u32, @intCast(stage_rows));
+    const attention_scale = attentionScaleForHeadDim(self, head_dim_u32);
+    if (stage_rows == 1) {
+        const position: usize = @intCast(position_base_u32);
+        var input_row = try logicalF32RowSlice(input, stage_rows, 0, @intCast(d_model_u32));
+        var output_row = try logicalF32RowSlice(output, stage_rows, 0, o_proj.cols());
+        try runAttentionMixerStep(
+            self,
+            cfg,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm_weight,
+            k_norm_weight,
+            &input_row,
+            &output_row,
+            d_model_u32,
+            head_dim_u32,
+            rope_dim_u32,
+            n_heads_u32,
+            n_kv_heads_u32,
+            seq_len_u32,
+            position,
+            position_base_u32,
+            global_rope_theta,
+            local_rope_theta,
+            rope_function,
+            copy_function,
+            cast_f32_to_f16_function,
+            kv_write_f16_function,
+            rope_store_f16_function,
+            attention_kernels,
+            null,
+        );
+        return;
+    }
 
-    const layer_rope_theta = if (cfg.sliding_window > 0) local_rope_theta else global_rope_theta;
+    const layer_rope_theta = effectiveLayerRopeTheta(
+        self,
+        cfg,
+        head_dim_u32,
+        rope_dim_u32,
+        global_rope_theta,
+        local_rope_theta,
+    );
 
     // Q projection output goes into query_gate_proj_dev (q_projection_dim per row).
     const q_proj_stage_bytes = std.math.mul(usize, stage_rows, cfg.q_projection_dim * @sizeOf(f32)) catch return error.InvalidArgument;
@@ -2787,10 +3061,19 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
     var attn_context_stage = try bufferSlice(&self.runtime_buffers.attn_context_dev, 0, context_stage_bytes);
 
     // Batched QKV projection — Q output goes into query_gate_proj_dev.
-    _ = try engine_ops.runQkvProjection(self, input, q_proj, k_proj, v_proj, stage_rows, &self.runtime_buffers.query_gate_proj_dev);
+    _ = engine_ops.runQkvProjection(self, input, q_proj, k_proj, v_proj, stage_rows, &self.runtime_buffers.query_gate_proj_dev) catch |err| {
+        log.warn("inference", "CUDA prefill QKV projection(query-gate) failed", .{
+            .rows = stage_rows,
+            .q_dim = cfg.q_dim,
+            .q_projection_dim = cfg.q_projection_dim,
+            .kv_dim = cfg.kv_dim,
+            .reason = @errorName(err),
+        });
+        return err;
+    };
 
     // Extract Q values and save gate for later.
-    try engine_ops.compactQueryGateProjection(self, stage_rows, cfg.q_dim, cfg.q_projection_dim, &q_projection_stage, &attn_q_stage);
+    try engine_ops.compactQueryGateProjection(self, stage_rows, cfg.q_dim, cfg.q_projection_dim, n_heads_u32, head_dim_u32, &q_projection_stage, &attn_q_stage);
 
     if (q_norm_weight) |q_norm_value| {
         const q_norm_rows = std.math.mul(u32, @intCast(stage_rows), n_heads_u32) catch return error.InvalidArgument;
@@ -2822,12 +3105,13 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
             self.loaded.runtime.qk_norm_weight_offset,
         );
     }
+    try applyValueNormInPlace(self, &attn_v_stage, stage_rows, n_kv_heads_u32, head_dim_u32);
 
     const kv_row_f32_bytes = std.math.mul(usize, cfg.kv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
     const kv_elem_bytes: usize = self.kv_cache_dtype.elementBytes();
     const kv_row_bytes = std.math.mul(usize, cfg.kv_dim, kv_elem_bytes) catch return error.InvalidArgument;
     const kv_dim_u32: u32 = @intCast(cfg.kv_dim);
-    const kv_groups_u32: u32 = @intCast(self.n_heads / self.n_kv_heads);
+    const kv_groups_u32: u32 = n_heads_u32 / n_kv_heads_u32;
     const use_k_write_fused = switch (self.kv_cache_dtype) {
         .f16 => kv_write_f16_function != null or rope_store_f16_function != null,
         .i8 => self.kv_write_i8_function != null,
@@ -3097,6 +3381,8 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                     head_dim_u32,
                     kv_dim_u32,
                     kv_groups_u32,
+                    n_heads_u32,
+                    attention_scale,
                     rope_dim_u32,
                     position_u32,
                     layer_rope_theta,
@@ -3131,7 +3417,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32_wq,
@@ -3206,7 +3492,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                                 sl,
                                 qr,
                                 hd,
-                                self.attention_scale,
+                                attention_scale,
                                 k_ptr,
                                 kv_ld,
                                 q_f16_ptr + @as(usize, g) * hd * @sizeOf(u16),
@@ -3275,7 +3561,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32_wq,
@@ -3296,7 +3582,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32_wq,
@@ -3327,7 +3613,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32_wq,
@@ -3351,7 +3637,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32_wq,
@@ -3375,7 +3661,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32_wq,
@@ -3406,7 +3692,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32_wq,
@@ -3430,7 +3716,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32_wq,
@@ -3454,7 +3740,7 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
                         kv_dim_u32,
                         kv_groups_u32,
                         head_dim_u32,
-                        self.attention_scale,
+                        attention_scale,
                         rope_dim_u32,
                         position_base_u32,
                         sliding_window_u32_wq,
@@ -3466,9 +3752,17 @@ pub fn runAttentionMixerPrefillBatchedWithQueryGate(
     }
 
     // Apply output gate before O projection.
-    try engine_ops.applyQueryGateToContextInPlace(self, stage_rows, cfg.q_dim, cfg.q_projection_dim);
+    try engine_ops.applyQueryGateToContextInPlace(self, stage_rows, cfg.q_dim, cfg.q_projection_dim, n_heads_u32, head_dim_u32);
 
-    try engine_ops.linearForwardRows(self, &attn_context_stage, stage_rows, o_proj, output);
+    engine_ops.linearForwardRows(self, &attn_context_stage, stage_rows, o_proj, output) catch |err| {
+        log.warn("inference", "CUDA prefill attention O projection(query-gate) failed", .{
+            .rows = stage_rows,
+            .in_dim = o_proj.rows(),
+            .out_dim = o_proj.cols(),
+            .reason = @errorName(err),
+        });
+        return err;
+    };
 }
 
 /// Ensure the attention scores workspace is large enough for GEMM-based

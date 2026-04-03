@@ -1623,6 +1623,21 @@ fn initCuda(
         }
     }
 
+    // Gemma4-style per-layer-input branch currently requires full-layer CUDA
+    // execution on a single backend instance. Force single topology here so
+    // batched/pipeline splits do not bypass correctness-critical branch logic.
+    if (loaded.config.hidden_size_per_layer_input > 0 and topology.mode != .single) {
+        log.warn("inference", "Forcing single-GPU CUDA topology for per-layer-input model", .{
+            .requested_topology = @tagName(topology.mode),
+        });
+        topology = .{
+            .mode = .single,
+            .stage_device_ordinals = .{ topology.primaryDeviceOrdinal(), topology.primaryDeviceOrdinal() },
+            .split_layer = null,
+            .split_layer_stage2 = null,
+        };
+    }
+
     if (topology.mode != .single) {
         const device_count = if (has_cuda)
             compute.cuda.Device.deviceCount() catch |err| {

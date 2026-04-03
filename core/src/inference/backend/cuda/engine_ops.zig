@@ -34,6 +34,8 @@ pub fn compactQueryGateProjection(
     seq_len: usize,
     q_dim: usize,
     q_projection_dim: usize,
+    n_heads_u32: u32,
+    head_dim_u32: u32,
     q_projection_stage: *const compute.cuda.Buffer,
     q_values_stage: *compute.cuda.Buffer,
 ) !void {
@@ -50,8 +52,8 @@ pub fn compactQueryGateProjection(
         @intCast(seq_len),
         @intCast(q_dim),
         @intCast(q_projection_dim),
-        @intCast(self.n_heads),
-        @intCast(self.head_dim),
+        n_heads_u32,
+        head_dim_u32,
     );
 }
 
@@ -60,6 +62,8 @@ pub fn applyQueryGateToContextInPlace(
     seq_len: usize,
     q_dim: usize,
     q_projection_dim: usize,
+    n_heads_u32: u32,
+    head_dim_u32: u32,
 ) !void {
     const projection_elements = std.math.mul(usize, seq_len, q_projection_dim) catch return error.InvalidArgument;
     const query_elements = std.math.mul(usize, seq_len, q_dim) catch return error.InvalidArgument;
@@ -76,8 +80,8 @@ pub fn applyQueryGateToContextInPlace(
         @intCast(seq_len),
         @intCast(q_dim),
         @intCast(q_projection_dim),
-        @intCast(self.n_heads),
-        @intCast(self.head_dim),
+        n_heads_u32,
+        head_dim_u32,
     );
 }
 
@@ -1234,11 +1238,24 @@ pub fn runQkvProjection(
     const q_bytes = std.math.mul(usize, rows, q_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     const k_bytes = std.math.mul(usize, rows, k_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
     const v_bytes = std.math.mul(usize, rows, v_proj.cols() * @sizeOf(f32)) catch return error.InvalidArgument;
+    const allow_fused_qkv = self.loaded.config.hidden_size_per_layer_input <= 0 and
+        q_proj.cols() == k_proj.cols() and
+        q_proj.cols() == v_proj.cols();
     const prefer_i8_concat = self.active_qkv_concat != null and rows > 1 and self.i8_blas_supported;
-    if (!prefer_i8_concat and q_out_dest.size >= q_bytes and
-        try tryFusedQkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest))
-    {
-        return .fused;
+    if (allow_fused_qkv and !prefer_i8_concat and q_out_dest.size >= q_bytes) {
+        const fused_ok = tryFusedQkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest) catch |err| blk: {
+            if (err == error.CudaKernelLaunchFailed) {
+                log.warn("inference", "CUDA fused QKV launch failed; falling back to unfused projections", .{
+                    .rows = rows,
+                    .q_dim = q_proj.cols(),
+                    .k_dim = k_proj.cols(),
+                    .v_dim = v_proj.cols(),
+                });
+                break :blk false;
+            }
+            return err;
+        };
+        if (fused_ok) return .fused;
     }
     var q_out = if (q_out_dest.size == q_bytes)
         q_out_dest.*
@@ -1340,15 +1357,49 @@ pub fn runQkvProjection(
 
     // If concat-I8 path is unavailable/failed, retry fused QKV kernel before
     // falling back to three separate projections.
-    if (q_out_dest.size >= q_bytes and
-        try tryFusedQkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest))
-    {
-        return .fused;
+    if (allow_fused_qkv and q_out_dest.size >= q_bytes) {
+        const fused_ok_retry = tryFusedQkvForward(self, input, q_proj, k_proj, v_proj, rows, q_out_dest) catch |err| blk: {
+            if (err == error.CudaKernelLaunchFailed) {
+                log.warn("inference", "CUDA fused QKV retry launch failed; using unfused projections", .{
+                    .rows = rows,
+                    .q_dim = q_proj.cols(),
+                    .k_dim = k_proj.cols(),
+                    .v_dim = v_proj.cols(),
+                });
+                break :blk false;
+            }
+            return err;
+        };
+        if (fused_ok_retry) return .fused;
     }
 
-    try linearForwardRows(self, input, rows, q_proj, &q_out);
-    try linearForwardRows(self, input, rows, k_proj, &k_out);
-    try linearForwardRows(self, input, rows, v_proj, &v_out);
+    linearForwardRows(self, input, rows, q_proj, &q_out) catch |err| {
+        log.warn("inference", "CUDA Q projection failed in runQkvProjection", .{
+            .rows = rows,
+            .in_dim = q_proj.rows(),
+            .out_dim = q_proj.cols(),
+            .reason = @errorName(err),
+        });
+        return err;
+    };
+    linearForwardRows(self, input, rows, k_proj, &k_out) catch |err| {
+        log.warn("inference", "CUDA K projection failed in runQkvProjection", .{
+            .rows = rows,
+            .in_dim = k_proj.rows(),
+            .out_dim = k_proj.cols(),
+            .reason = @errorName(err),
+        });
+        return err;
+    };
+    linearForwardRows(self, input, rows, v_proj, &v_out) catch |err| {
+        log.warn("inference", "CUDA V projection failed in runQkvProjection", .{
+            .rows = rows,
+            .in_dim = v_proj.rows(),
+            .out_dim = v_proj.cols(),
+            .reason = @errorName(err),
+        });
+        return err;
+    };
     return .unfused;
 }
 

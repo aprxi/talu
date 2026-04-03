@@ -81,6 +81,61 @@ const engine_mixers = @import("engine_mixers.zig");
 const engine_weights = @import("engine_weights.zig");
 const bufferSlice = engine_weights.bufferSlice;
 
+const ResolvedAttentionShape = struct {
+    head_dim_u32: u32,
+    rope_dim_u32: u32,
+    n_heads_u32: u32,
+    n_kv_heads_u32: u32,
+};
+
+fn resolveAttentionShapeForInstruction(
+    cfg: *const LayerAttentionExecConfig,
+    q_norm_weight: ?*const DeviceTensor,
+    k_norm_weight: ?*const DeviceTensor,
+    ctx: *const LayerProgramExecutionContext,
+) !ResolvedAttentionShape {
+    var head_dim_u32 = ctx.head_dim_u32;
+    if (q_norm_weight) |q_norm| {
+        head_dim_u32 = @intCast(q_norm.rows);
+    } else if (k_norm_weight) |k_norm| {
+        head_dim_u32 = @intCast(k_norm.rows);
+    }
+    if (head_dim_u32 == 0) return error.InvalidInstructionBinding;
+    const head_dim_usize: usize = @intCast(head_dim_u32);
+
+    var n_heads_u32 = ctx.n_heads_u32;
+    if ((cfg.q_dim % head_dim_usize) == 0) {
+        n_heads_u32 = @intCast(cfg.q_dim / head_dim_usize);
+    } else if (q_norm_weight != null) {
+        return error.InvalidInstructionBinding;
+    }
+
+    var n_kv_heads_u32 = ctx.n_kv_heads_u32;
+    if ((cfg.kv_dim % head_dim_usize) == 0) {
+        n_kv_heads_u32 = @intCast(cfg.kv_dim / head_dim_usize);
+    } else if (k_norm_weight != null) {
+        return error.InvalidInstructionBinding;
+    }
+    if (n_heads_u32 == 0 or n_kv_heads_u32 == 0 or (n_heads_u32 % n_kv_heads_u32) != 0) {
+        return error.InvalidInstructionBinding;
+    }
+
+    var rope_dim_u32 = @min(ctx.rope_dim_u32, head_dim_u32);
+    // Gemma4 per-layer-input models use proportional rotary width for
+    // full-attention layers, but sliding-window layers run local RoPE across the
+    // full per-head width.
+    if (cfg.sliding_window > 0 and ctx.backend.loaded.config.hidden_size_per_layer_input > 0) {
+        rope_dim_u32 = head_dim_u32;
+    }
+
+    return .{
+        .head_dim_u32 = head_dim_u32,
+        .rope_dim_u32 = rope_dim_u32,
+        .n_heads_u32 = n_heads_u32,
+        .n_kv_heads_u32 = n_kv_heads_u32,
+    };
+}
+
 pub fn emitLayerProgramTracePoint(
     ctx: *LayerProgramExecutionContext,
     point: trace.TracePoint,
@@ -694,6 +749,7 @@ pub fn layerProgramAttentionAdapter(
     const o_proj = linearWeightFromWeightHandle(weight_handles[3]).*;
     const q_norm_weight = optionalDeviceTensorFromWeightHandle(weight_handles[4]);
     const k_norm_weight = optionalDeviceTensorFromWeightHandle(weight_handles[5]);
+    const shape = try resolveAttentionShapeForInstruction(cfg, q_norm_weight, k_norm_weight, ctx);
     if (q_proj.cols() != expectedAttentionQProjectionDim(cfg)) return error.InvalidInstructionBinding;
     if (k_proj.cols() != cfg.kv_dim or v_proj.cols() != cfg.kv_dim) return error.InvalidInstructionBinding;
     const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
@@ -712,7 +768,12 @@ pub fn layerProgramAttentionAdapter(
         else
             null;
         defer self.active_qkv_concat = null;
-        try engine_mixers.runBatchedDecodeAttentionMixer(
+        var local_ctx = ctx.*;
+        local_ctx.head_dim_u32 = shape.head_dim_u32;
+        local_ctx.rope_dim_u32 = shape.rope_dim_u32;
+        local_ctx.n_heads_u32 = shape.n_heads_u32;
+        local_ctx.n_kv_heads_u32 = shape.n_kv_heads_u32;
+        engine_mixers.runBatchedDecodeAttentionMixer(
             self,
             cfg,
             &q_proj,
@@ -723,9 +784,25 @@ pub fn layerProgramAttentionAdapter(
             k_norm_weight,
             input,
             output,
-            ctx,
+            &local_ctx,
             batch,
-        );
+        ) catch |err| {
+            log.warn("inference", "CUDA layer-program batched decode attention failed", .{
+                .layer_index = ctx.layer_index,
+                .op_index = ctx.op_index,
+                .active_rows = ctx.active_rows_u32,
+                .q_dim = cfg.q_dim,
+                .q_projection_dim = cfg.q_projection_dim,
+                .kv_dim = cfg.kv_dim,
+                .head_dim = shape.head_dim_u32,
+                .rope_dim = shape.rope_dim_u32,
+                .n_heads = shape.n_heads_u32,
+                .n_kv_heads = shape.n_kv_heads_u32,
+                .query_gate = @as(u8, @intFromBool(cfg.query_gate)),
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         return;
     }
 
@@ -737,7 +814,7 @@ pub fn layerProgramAttentionAdapter(
     defer self.active_qkv_concat = null;
 
     if (!cfg.query_gate) {
-        try engine_mixers.runAttentionMixerPrefillBatchedNoQueryGate(
+        engine_mixers.runAttentionMixerPrefillBatchedNoQueryGate(
             self,
             cfg,
             &attention_binding.k_cache,
@@ -753,10 +830,10 @@ pub fn layerProgramAttentionAdapter(
             input,
             output,
             ctx.d_model_u32,
-            ctx.head_dim_u32,
-            ctx.rope_dim_u32,
-            ctx.n_heads_u32,
-            ctx.n_kv_heads_u32,
+            shape.head_dim_u32,
+            shape.rope_dim_u32,
+            shape.n_heads_u32,
+            shape.n_kv_heads_u32,
             ctx.seq_len_u32,
             ctx.global_rope_theta,
             ctx.local_rope_theta,
@@ -766,11 +843,28 @@ pub fn layerProgramAttentionAdapter(
             ctx.kv_write_f16_function,
             ctx.rope_store_f16_function,
             ctx.attention_kernels,
-        );
+        ) catch |err| {
+            log.warn("inference", "CUDA layer-program prefill attention failed", .{
+                .layer_index = ctx.layer_index,
+                .op_index = ctx.op_index,
+                .active_rows = ctx.active_rows_u32,
+                .seq_len = ctx.seq_len_u32,
+                .q_dim = cfg.q_dim,
+                .q_projection_dim = cfg.q_projection_dim,
+                .kv_dim = cfg.kv_dim,
+                .head_dim = shape.head_dim_u32,
+                .rope_dim = shape.rope_dim_u32,
+                .n_heads = shape.n_heads_u32,
+                .n_kv_heads = shape.n_kv_heads_u32,
+                .query_gate = @as(u8, @intFromBool(cfg.query_gate)),
+                .reason = @errorName(err),
+            });
+            return err;
+        };
         return;
     }
 
-    try engine_mixers.runAttentionMixerPrefillBatchedWithQueryGate(
+    engine_mixers.runAttentionMixerPrefillBatchedWithQueryGate(
         self,
         cfg,
         &attention_binding.k_cache,
@@ -786,10 +880,10 @@ pub fn layerProgramAttentionAdapter(
         input,
         output,
         ctx.d_model_u32,
-        ctx.head_dim_u32,
-        ctx.rope_dim_u32,
-        ctx.n_heads_u32,
-        ctx.n_kv_heads_u32,
+        shape.head_dim_u32,
+        shape.rope_dim_u32,
+        shape.n_heads_u32,
+        shape.n_kv_heads_u32,
         ctx.seq_len_u32,
         ctx.global_rope_theta,
         ctx.local_rope_theta,
@@ -799,7 +893,24 @@ pub fn layerProgramAttentionAdapter(
         ctx.kv_write_f16_function,
         ctx.rope_store_f16_function,
         ctx.attention_kernels,
-    );
+    ) catch |err| {
+        log.warn("inference", "CUDA layer-program prefill attention(query-gate) failed", .{
+            .layer_index = ctx.layer_index,
+            .op_index = ctx.op_index,
+            .active_rows = ctx.active_rows_u32,
+            .seq_len = ctx.seq_len_u32,
+            .q_dim = cfg.q_dim,
+            .q_projection_dim = cfg.q_projection_dim,
+            .kv_dim = cfg.kv_dim,
+            .head_dim = shape.head_dim_u32,
+            .rope_dim = shape.rope_dim_u32,
+            .n_heads = shape.n_heads_u32,
+            .n_kv_heads = shape.n_kv_heads_u32,
+            .query_gate = @as(u8, @intFromBool(cfg.query_gate)),
+            .reason = @errorName(err),
+        });
+        return err;
+    };
 }
 
 pub fn layerProgramShortConvAdapter(
@@ -1254,6 +1365,8 @@ pub fn runAttentionContext(
     head_dim_u32: u32,
     kv_dim_u32: u32,
     kv_groups_u32: u32,
+    n_heads_u32: u32,
+    attention_scale: f32,
     rope_dim_u32: u32,
     position_u32: u32,
     theta: f32,
@@ -1274,7 +1387,7 @@ pub fn runAttentionContext(
             k_cache_view = try bufferSlice(k_cache, start_offset, k_cache.size - start_offset);
             v_cache_view = try bufferSlice(v_cache, start_offset, v_cache.size - start_offset);
             // Slice scale buffers for i8 KV cache.
-            const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
+            const n_kv_heads_u32 = n_heads_u32 / kv_groups_u32;
             const scale_row_bytes = @as(usize, n_kv_heads_u32) * @sizeOf(f32);
             const scale_start = std.math.mul(usize, @as(usize, start_row), scale_row_bytes) catch return error.InvalidArgument;
             if (k_scale.size > scale_start) {
@@ -1295,7 +1408,7 @@ pub fn runAttentionContext(
                 head_dim_u32,
                 kernels.attn_fused_heads_f16_kv_function != null,
             )) {
-                try compute.cuda.attn_fused_heads_f16_kv.runWithFunction(
+                compute.cuda.attn_fused_heads_f16_kv.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
                     kernels.attn_fused_heads_f16_kv_function.?,
@@ -1303,61 +1416,97 @@ pub fn runAttentionContext(
                     &k_cache_view,
                     &v_cache_view,
                     context_stage,
-                    @intCast(self.n_heads),
+                    n_heads_u32,
                     effective_seq_len_u32,
                     kv_dim_u32,
                     kv_groups_u32,
                     head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     rope_dim_u32,
                     position_u32,
                     theta,
-                );
+                ) catch |err| {
+                    log.warn("inference", "CUDA attention fused_heads_f16_kv launch failed", .{
+                        .seq_len = effective_seq_len_u32,
+                        .head_dim = head_dim_u32,
+                        .kv_dim = kv_dim_u32,
+                        .kv_groups = kv_groups_u32,
+                        .rope_dim = rope_dim_u32,
+                        .position = position_u32,
+                        .reason = @errorName(err),
+                    });
+                    return err;
+                };
                 return .fused_heads_f16_kv;
             }
 
             const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
             const attn_probs_dev = try self.runtime_buffers.requireAttentionProbsDev();
-            try compute.cuda.attn_scores_heads_f16_kv.runWithFunction(
+            compute.cuda.attn_scores_heads_f16_kv.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
                 q_stage,
                 &k_cache_view,
                 attn_scores_dev,
-                @intCast(self.n_heads),
+                n_heads_u32,
                 effective_seq_len_u32,
                 kv_dim_u32,
                 kv_groups_u32,
                 head_dim_u32,
-                self.attention_scale,
-            );
-            try compute.cuda.softmax_rows.runWithFunction(
+                attention_scale,
+            ) catch |err| {
+                log.warn("inference", "CUDA attention scores_heads_f16_kv launch failed", .{
+                    .seq_len = effective_seq_len_u32,
+                    .head_dim = head_dim_u32,
+                    .kv_dim = kv_dim_u32,
+                    .kv_groups = kv_groups_u32,
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
+            compute.cuda.softmax_rows.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.softmax_rows_function orelse return error.CudaKernelUnavailable,
                 attn_scores_dev,
                 attn_probs_dev,
-                @intCast(self.n_heads),
+                n_heads_u32,
                 effective_seq_len_u32,
-            );
-            try compute.cuda.attn_weighted_sum_heads_f16_kv.runWithFunction(
+            ) catch |err| {
+                log.warn("inference", "CUDA attention softmax_rows launch failed", .{
+                    .rows = @as(u32, n_heads_u32),
+                    .cols = effective_seq_len_u32,
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
+            compute.cuda.attn_weighted_sum_heads_f16_kv.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
                 attn_probs_dev,
                 &v_cache_view,
                 context_stage,
-                @intCast(self.n_heads),
+                n_heads_u32,
                 effective_seq_len_u32,
                 kv_dim_u32,
                 kv_groups_u32,
                 head_dim_u32,
-            );
+            ) catch |err| {
+                log.warn("inference", "CUDA attention weighted_sum_heads_f16_kv launch failed", .{
+                    .seq_len = effective_seq_len_u32,
+                    .head_dim = head_dim_u32,
+                    .kv_dim = kv_dim_u32,
+                    .kv_groups = kv_groups_u32,
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
             return .heads_f16_kv;
         },
         .i8 => {
-            const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
+            const n_kv_heads_u32 = n_heads_u32 / kv_groups_u32;
             if (!cfg.query_gate and attention_mod.useFusedHeadsF16Kv(
                 attention_policy_config,
                 seq_len_u32,
@@ -1366,33 +1515,49 @@ pub fn runAttentionContext(
                 head_dim_u32,
                 kernels.attn_fused_heads_i8_kv_function != null,
             )) {
-                try compute.cuda.attn_fused_heads_i8_kv.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    kernels.attn_fused_heads_i8_kv_function.?,
-                    q_stage,
-                    &k_cache_view,
-                    &v_cache_view,
-                    &k_scale_view,
-                    &v_scale_view,
-                    context_stage,
-                    @intCast(self.n_heads),
-                    n_kv_heads_u32,
-                    effective_seq_len_u32,
-                    kv_dim_u32,
-                    kv_groups_u32,
-                    head_dim_u32,
-                    self.attention_scale,
-                    rope_dim_u32,
-                    position_u32,
-                    theta,
-                );
-                return .fused_heads_i8_kv;
+                const fused_i8_ok = blk: {
+                    compute.cuda.attn_fused_heads_i8_kv.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernels.attn_fused_heads_i8_kv_function.?,
+                        q_stage,
+                        &k_cache_view,
+                        &v_cache_view,
+                        &k_scale_view,
+                        &v_scale_view,
+                        context_stage,
+                        n_heads_u32,
+                        n_kv_heads_u32,
+                        effective_seq_len_u32,
+                        kv_dim_u32,
+                        kv_groups_u32,
+                        head_dim_u32,
+                        attention_scale,
+                        rope_dim_u32,
+                        position_u32,
+                        theta,
+                    ) catch |err| {
+                        if (err == error.CudaKernelLaunchFailed) {
+                            log.warn("inference", "CUDA attention fused_heads_i8_kv launch failed; falling back to separate i8 attention", .{
+                                .seq_len = effective_seq_len_u32,
+                                .head_dim = head_dim_u32,
+                                .kv_dim = kv_dim_u32,
+                                .kv_groups = kv_groups_u32,
+                                .rope_dim = rope_dim_u32,
+                                .position = position_u32,
+                            });
+                            break :blk false;
+                        }
+                        return err;
+                    };
+                    break :blk true;
+                };
+                if (fused_i8_ok) return .fused_heads_i8_kv;
             }
 
             const attn_scores_dev = try self.runtime_buffers.requireAttentionScoresDev();
             const attn_probs_dev = try self.runtime_buffers.requireAttentionProbsDev();
-            try compute.cuda.attn_scores_heads_i8_kv.runWithFunction(
+            compute.cuda.attn_scores_heads_i8_kv.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.attn_scores_heads_i8_kv_function orelse return error.CudaKernelUnavailable,
@@ -1400,24 +1565,40 @@ pub fn runAttentionContext(
                 &k_cache_view,
                 &k_scale_view,
                 attn_scores_dev,
-                @intCast(self.n_heads),
+                n_heads_u32,
                 n_kv_heads_u32,
                 effective_seq_len_u32,
                 kv_dim_u32,
                 kv_groups_u32,
                 head_dim_u32,
-                self.attention_scale,
-            );
-            try compute.cuda.softmax_rows.runWithFunction(
+                attention_scale,
+            ) catch |err| {
+                log.warn("inference", "CUDA attention scores_heads_i8_kv launch failed", .{
+                    .seq_len = effective_seq_len_u32,
+                    .head_dim = head_dim_u32,
+                    .kv_dim = kv_dim_u32,
+                    .kv_groups = kv_groups_u32,
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
+            compute.cuda.softmax_rows.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.softmax_rows_function orelse return error.CudaKernelUnavailable,
                 attn_scores_dev,
                 attn_probs_dev,
-                @intCast(self.n_heads),
+                n_heads_u32,
                 effective_seq_len_u32,
-            );
-            try compute.cuda.attn_weighted_sum_heads_i8_kv.runWithFunction(
+            ) catch |err| {
+                log.warn("inference", "CUDA attention softmax_rows(i8) launch failed", .{
+                    .rows = @as(u32, n_heads_u32),
+                    .cols = effective_seq_len_u32,
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
+            compute.cuda.attn_weighted_sum_heads_i8_kv.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.attn_weighted_sum_heads_i8_kv_function orelse return error.CudaKernelUnavailable,
@@ -1425,17 +1606,26 @@ pub fn runAttentionContext(
                 &v_cache_view,
                 &v_scale_view,
                 context_stage,
-                @intCast(self.n_heads),
+                n_heads_u32,
                 n_kv_heads_u32,
                 effective_seq_len_u32,
                 kv_dim_u32,
                 kv_groups_u32,
                 head_dim_u32,
-            );
+            ) catch |err| {
+                log.warn("inference", "CUDA attention weighted_sum_heads_i8_kv launch failed", .{
+                    .seq_len = effective_seq_len_u32,
+                    .head_dim = head_dim_u32,
+                    .kv_dim = kv_dim_u32,
+                    .kv_groups = kv_groups_u32,
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
             return .heads_i8_kv;
         },
         .fp8 => {
-            const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
+            const n_kv_heads_u32 = n_heads_u32 / kv_groups_u32;
             if (!cfg.query_gate and attention_mod.useFusedHeadsF16Kv(
                 attention_policy_config,
                 seq_len_u32,
@@ -1454,13 +1644,13 @@ pub fn runAttentionContext(
                     &k_scale_view,
                     &v_scale_view,
                     context_stage,
-                    @intCast(self.n_heads),
+                    n_heads_u32,
                     n_kv_heads_u32,
                     effective_seq_len_u32,
                     kv_dim_u32,
                     kv_groups_u32,
                     head_dim_u32,
-                    self.attention_scale,
+                    attention_scale,
                     rope_dim_u32,
                     position_u32,
                     theta,
@@ -1478,13 +1668,13 @@ pub fn runAttentionContext(
                 &k_cache_view,
                 &k_scale_view,
                 attn_scores_dev,
-                @intCast(self.n_heads),
+                n_heads_u32,
                 n_kv_heads_u32,
                 effective_seq_len_u32,
                 kv_dim_u32,
                 kv_groups_u32,
                 head_dim_u32,
-                self.attention_scale,
+                attention_scale,
             );
             try compute.cuda.softmax_rows.runWithFunction(
                 &self.kernel_arg_pack,
@@ -1492,7 +1682,7 @@ pub fn runAttentionContext(
                 kernels.softmax_rows_function orelse return error.CudaKernelUnavailable,
                 attn_scores_dev,
                 attn_probs_dev,
-                @intCast(self.n_heads),
+                n_heads_u32,
                 effective_seq_len_u32,
             );
             try compute.cuda.attn_weighted_sum_heads_fp8_kv.runWithFunction(
@@ -1503,7 +1693,7 @@ pub fn runAttentionContext(
                 &v_cache_view,
                 &v_scale_view,
                 context_stage,
-                @intCast(self.n_heads),
+                n_heads_u32,
                 n_kv_heads_u32,
                 effective_seq_len_u32,
                 kv_dim_u32,

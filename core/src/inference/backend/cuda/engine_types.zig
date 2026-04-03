@@ -88,7 +88,7 @@ pub fn resolveKvCacheDtype() KvCacheDtype {
 pub const enable_fused_attention_f16_kv: bool = true;
 pub const max_fused_attention_f16_kv_seq_len: u32 = 384;
 pub const default_prefill_chunk_rows_cap: usize = 1024;
-pub const enable_device_embedding_lookup: bool = true;
+pub const enable_device_embedding_lookup: bool = false;
 pub const max_supported_fused_f16_kv_head_dim = 512;
 // Optional dispatch observability. Keep disabled by default so production
 // execution adds zero atomic overhead in the token loop.
@@ -236,6 +236,27 @@ pub fn resolveCudaMaxSeqLen(model_max_seq_len: usize) usize {
         });
     }
     return resolved;
+}
+
+fn resolveSharedKvSourceLayer(config: tensor.ModelConfig, layer_idx: usize) ?usize {
+    if (config.num_kv_shared_layers <= 0) return null;
+    const layer_types = config.layer_types orelse return null;
+    const n_layers: usize = @intCast(config.n_layers);
+    if (layer_types.len != n_layers) return null;
+    if (layer_idx >= n_layers) return null;
+
+    const shared_count: usize = @min(@as(usize, @intCast(config.num_kv_shared_layers)), n_layers);
+    if (shared_count == 0 or shared_count == n_layers) return null;
+    const first_shared_layer = n_layers - shared_count;
+    if (layer_idx < first_shared_layer or first_shared_layer == 0) return null;
+
+    const target_layer_type = layer_types[layer_idx];
+    var src = first_shared_layer;
+    while (src > 0) {
+        src -= 1;
+        if (layer_types[src] == target_layer_type) return src;
+    }
+    return null;
 }
 
 pub fn resolveCudaInitialKvCacheTokens(max_seq_len: usize) usize {
@@ -1382,6 +1403,10 @@ pub const LayerAttentionRuntime = struct {
     qkv_i8_concat: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
     qkv_scales_concat: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
     qkv_concat_dims: [3]u32 = .{ 0, 0, 0 },
+    slot_kv_index: usize,
+    kv_shared_source_layer: ?usize = null,
+    kv_shared_source_slot_kv_index: ?usize = null,
+    use_v_norm: bool = false,
     cpu_kernel: ?cpu_kernels.MultiHeadAttention = null,
     cpu_cache: ?cpu_kernels.AttnCache = null,
     cpu_scratch: ?cpu_kernels.AttnTemp = null,
@@ -2375,9 +2400,76 @@ pub const BlockRuntime = struct {
                         return error.UnsupportedModel;
                     }
                     const w2 = attn.w2 orelse return error.MissingWeight;
-                    const q_out = n_heads * head_dim;
-                    const q_proj_out = if (attn.attention_config.query_gate) q_out * 2 else q_out;
-                    const kv_out = n_kv_heads * head_dim;
+                    const q_proj_src = attn.q_proj orelse return error.MissingWeight;
+                    const k_proj_src = attn.k_proj orelse return error.MissingWeight;
+                    const v_proj_src = attn.v_proj orelse return error.MissingWeight;
+                    const q_proj_out = try tensorProjectionOutputDim(q_proj_src, d_model);
+                    const q_out = if (attn.attention_config.query_gate) blk: {
+                        if ((q_proj_out % 2) != 0) {
+                            log.warn("inference", "CUDA block runtime q_proj dim unsupported for query_gate", .{
+                                .layer = layer_idx,
+                                .q_proj_out = q_proj_out,
+                            });
+                            return error.UnsupportedModel;
+                        }
+                        break :blk q_proj_out / 2;
+                    } else q_proj_out;
+                    const kv_out = try tensorProjectionOutputDim(k_proj_src, d_model);
+                    const v_out = try tensorProjectionOutputDim(v_proj_src, d_model);
+                    if (v_out != kv_out) {
+                        log.warn("inference", "CUDA block runtime k/v dim mismatch", .{
+                            .layer = layer_idx,
+                            .k_cols = kv_out,
+                            .v_cols = v_out,
+                        });
+                        return error.UnsupportedModel;
+                    }
+                    var layer_head_dim = head_dim;
+                    if (attn.q_norm) |q_norm_src| {
+                        const q_norm_dim: usize = switch (q_norm_src.n_dims) {
+                            1 => @intCast(q_norm_src.shape[0]),
+                            2 => if (q_norm_src.shape[0] == 1 and q_norm_src.shape[1] > 0)
+                                @intCast(q_norm_src.shape[1])
+                            else if (q_norm_src.shape[1] == 1 and q_norm_src.shape[0] > 0)
+                                @intCast(q_norm_src.shape[0])
+                            else
+                                return error.UnsupportedModel,
+                            else => return error.UnsupportedModel,
+                        };
+                        if (q_norm_dim == 0) return error.UnsupportedModel;
+                        layer_head_dim = q_norm_dim;
+                    } else if (attn.k_norm) |k_norm_src| {
+                        const k_norm_dim: usize = switch (k_norm_src.n_dims) {
+                            1 => @intCast(k_norm_src.shape[0]),
+                            2 => if (k_norm_src.shape[0] == 1 and k_norm_src.shape[1] > 0)
+                                @intCast(k_norm_src.shape[1])
+                            else if (k_norm_src.shape[1] == 1 and k_norm_src.shape[0] > 0)
+                                @intCast(k_norm_src.shape[0])
+                            else
+                                return error.UnsupportedModel,
+                            else => return error.UnsupportedModel,
+                        };
+                        if (k_norm_dim == 0) return error.UnsupportedModel;
+                        layer_head_dim = k_norm_dim;
+                    } else if ((q_out % n_heads) == 0 and n_heads > 0) {
+                        layer_head_dim = q_out / n_heads;
+                    } else if ((kv_out % n_kv_heads) == 0 and n_kv_heads > 0) {
+                        layer_head_dim = kv_out / n_kv_heads;
+                    }
+                    if (layer_head_dim == 0) return error.UnsupportedModel;
+                    const layer_n_heads = if ((q_out % layer_head_dim) == 0) q_out / layer_head_dim else n_heads;
+                    const layer_n_kv_heads = if ((kv_out % layer_head_dim) == 0) kv_out / layer_head_dim else n_kv_heads;
+                    if (layer_n_heads == 0 or layer_n_kv_heads == 0 or (layer_n_heads % layer_n_kv_heads) != 0) {
+                        log.warn("inference", "CUDA block runtime inferred attention shape unsupported", .{
+                            .layer = layer_idx,
+                            .q_dim = q_out,
+                            .kv_dim = kv_out,
+                            .head_dim = layer_head_dim,
+                            .n_heads = layer_n_heads,
+                            .n_kv_heads = layer_n_kv_heads,
+                        });
+                        return error.UnsupportedModel;
+                    }
                     if (attention_block_count == 0) {
                         if (attn.fused.qkv_proj != null or attn.fused.gate_up != null) {
                             log.info("inference", "CUDA block0 fused weight mode", .{
@@ -2390,29 +2482,29 @@ pub const BlockRuntime = struct {
                                 .q_out = q_out,
                                 .q_proj_out = q_proj_out,
                                 .kv_out = kv_out,
+                                .head_dim = layer_head_dim,
+                                .n_heads = layer_n_heads,
+                                .n_kv_heads = layer_n_kv_heads,
                             });
                         } else {
-                            const q_proj = attn.q_proj orelse return error.MissingWeight;
-                            const k_proj = attn.k_proj orelse return error.MissingWeight;
-                            const v_proj = attn.v_proj orelse return error.MissingWeight;
                             const w1 = attn.w1 orelse return error.MissingWeight;
                             const w3 = attn.w3 orelse return error.MissingWeight;
                             log.info("inference", "CUDA block0 weight dtypes", .{
-                                .q_proj = @tagName(q_proj.dtype),
-                                .k_proj = @tagName(k_proj.dtype),
-                                .v_proj = @tagName(v_proj.dtype),
+                                .q_proj = @tagName(q_proj_src.dtype),
+                                .k_proj = @tagName(k_proj_src.dtype),
+                                .v_proj = @tagName(v_proj_src.dtype),
                                 .o_proj = @tagName(attn.o_proj.dtype),
                                 .w1 = @tagName(w1.dtype),
                                 .w2 = @tagName(w2.dtype),
                                 .w3 = @tagName(w3.dtype),
                             });
                             log.info("inference", "CUDA block0 weight shapes", .{
-                                .q0 = q_proj.shape[0],
-                                .q1 = q_proj.shape[1],
-                                .k0 = k_proj.shape[0],
-                                .k1 = k_proj.shape[1],
-                                .v0 = v_proj.shape[0],
-                                .v1 = v_proj.shape[1],
+                                .q0 = q_proj_src.shape[0],
+                                .q1 = q_proj_src.shape[1],
+                                .k0 = k_proj_src.shape[0],
+                                .k1 = k_proj_src.shape[1],
+                                .v0 = v_proj_src.shape[0],
+                                .v1 = v_proj_src.shape[1],
                                 .o0 = attn.o_proj.shape[0],
                                 .o1 = attn.o_proj.shape[1],
                                 .w10 = w1.shape[0],
@@ -2486,12 +2578,12 @@ pub const BlockRuntime = struct {
                     if (attn.q_norm) |q_norm| {
                         var qn = try uploadTensor(device, allocator, q_norm);
                         errdefer qn.deinit(device);
-                        if (!(qn.rows == head_dim and qn.cols == 1)) {
+                        if (!(qn.rows == layer_head_dim and qn.cols == 1)) {
                             log.warn("inference", "CUDA block runtime q_norm shape unsupported", .{
                                 .layer = layer_idx,
                                 .rows = qn.rows,
                                 .cols = qn.cols,
-                                .head_dim = head_dim,
+                                .head_dim = layer_head_dim,
                             });
                             return error.UnsupportedModel;
                         }
@@ -2504,12 +2596,12 @@ pub const BlockRuntime = struct {
                     if (attn.k_norm) |k_norm| {
                         var kn = try uploadTensor(device, allocator, k_norm);
                         errdefer kn.deinit(device);
-                        if (!(kn.rows == head_dim and kn.cols == 1)) {
+                        if (!(kn.rows == layer_head_dim and kn.cols == 1)) {
                             log.warn("inference", "CUDA block runtime k_norm shape unsupported", .{
                                 .layer = layer_idx,
                                 .rows = kn.rows,
                                 .cols = kn.cols,
-                                .head_dim = head_dim,
+                                .head_dim = layer_head_dim,
                             });
                             return error.UnsupportedModel;
                         }
@@ -2540,12 +2632,9 @@ pub const BlockRuntime = struct {
                         k_proj_dev = fused_qkv.k;
                         v_proj_dev = fused_qkv.v;
                     } else {
-                        const q_proj = attn.q_proj orelse return error.MissingWeight;
-                        const k_proj = attn.k_proj orelse return error.MissingWeight;
-                        const v_proj = attn.v_proj orelse return error.MissingWeight;
-                        q_proj_dev = try uploadLinearWeightWithContext(device, allocator, q_proj, d_model, layer_idx, "self_attn.q_proj.weight");
-                        k_proj_dev = try uploadLinearWeightWithContext(device, allocator, k_proj, d_model, layer_idx, "self_attn.k_proj.weight");
-                        v_proj_dev = try uploadLinearWeightWithContext(device, allocator, v_proj, d_model, layer_idx, "self_attn.v_proj.weight");
+                        q_proj_dev = try uploadLinearWeightWithContext(device, allocator, q_proj_src, d_model, layer_idx, "self_attn.q_proj.weight");
+                        k_proj_dev = try uploadLinearWeightWithContext(device, allocator, k_proj_src, d_model, layer_idx, "self_attn.k_proj.weight");
+                        v_proj_dev = try uploadLinearWeightWithContext(device, allocator, v_proj_src, d_model, layer_idx, "self_attn.v_proj.weight");
                     }
                     errdefer q_proj_dev.deinit(device);
                     errdefer k_proj_dev.deinit(device);
@@ -2623,11 +2712,11 @@ pub const BlockRuntime = struct {
                         });
                         return error.UnsupportedModel;
                     }
-                    if (k_proj_dev.cols() != n_kv_heads * head_dim) {
+                    if (k_proj_dev.cols() != kv_out) {
                         log.warn("inference", "CUDA block runtime kv dim unsupported", .{
                             .layer = layer_idx,
                             .kv_cols = k_proj_dev.cols(),
-                            .expected = n_kv_heads * head_dim,
+                            .expected = kv_out,
                         });
                         return error.UnsupportedModel;
                     }
@@ -2635,7 +2724,7 @@ pub const BlockRuntime = struct {
                     const kv_capacity = initial_kv_tokens;
                     if (kv_capacity == 0) return error.InvalidArgument;
                     const kv_cache_bytes_per_buffer = try kvCacheBytesForCapacityDtype(kv_capacity, k_proj_dev.cols(), kv_cache_dtype);
-                    var kv_pair = try allocDeviceKvPairWithScales(device, kv_capacity, k_proj_dev.cols(), n_kv_heads, kv_cache_dtype);
+                    var kv_pair = try allocDeviceKvPairWithScales(device, kv_capacity, k_proj_dev.cols(), layer_n_kv_heads, kv_cache_dtype);
                     errdefer {
                         if (kv_pair.v_scale.pointer != 0) kv_pair.v_scale.deinit(device);
                         if (kv_pair.k_scale.pointer != 0) kv_pair.k_scale.deinit(device);
@@ -2663,6 +2752,16 @@ pub const BlockRuntime = struct {
                     const layer_kv_bytes = std.math.mul(usize, kv_cache_bytes_per_buffer, 2) catch return error.InvalidArgument;
                     kv_cache_bytes = std.math.add(usize, kv_cache_bytes, layer_kv_bytes) catch return error.InvalidArgument;
 
+                    const slot_kv_index = attention_block_count;
+                    const kv_shared_source_layer = resolveSharedKvSourceLayer(loaded.config, layer_idx);
+                    const kv_shared_source_slot_kv_index: ?usize = if (kv_shared_source_layer) |src_layer_idx| blk: {
+                        if (src_layer_idx < layer_start or src_layer_idx >= layer_end) break :blk null;
+                        const src_local_idx = src_layer_idx - layer_start;
+                        if (src_local_idx >= blocks.len) break :blk null;
+                        const src_binding = blocks[src_local_idx].attention_binding orelse break :blk null;
+                        break :blk src_binding.slot_kv_index;
+                    } else null;
+
                     blocks[local_idx].attention_runtime = .{
                         .q_dim = q_out,
                         .q_projection_dim = q_proj_dev.cols(),
@@ -2689,6 +2788,10 @@ pub const BlockRuntime = struct {
                         .k_scale = kv_pair.k_scale,
                         .v_scale = kv_pair.v_scale,
                         .kv_capacity = kv_capacity,
+                        .slot_kv_index = slot_kv_index,
+                        .kv_shared_source_layer = kv_shared_source_layer,
+                        .kv_shared_source_slot_kv_index = kv_shared_source_slot_kv_index,
+                        .use_v_norm = loaded.config.hidden_size_per_layer_input > 0,
                         .cpu_kernel = cpu_attention_kernel,
                         .cpu_cache = cpu_attention_cache,
                         .cpu_scratch = cpu_attention_scratch,

@@ -33,6 +33,8 @@ const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capt
 };
 
 const Tensor = tensor.Tensor;
+
+
 const MatmulFn = cpu_linalg.MatmulFn;
 const RoPE = rope_kernel.RoPE;
 const FlashAttentionFn = flash_attention.FlashAttentionFn;
@@ -576,7 +578,6 @@ pub const MultiHeadAttention = struct {
             key_view = key_workspace;
             value_view = value_workspace;
         }
-
         // Apply attention biases if present
         if (!q_bias_applied) {
             if (self.q_bias) |bias| {
