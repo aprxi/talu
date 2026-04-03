@@ -47,6 +47,7 @@ pub fn getBoolFromConfigOrRoot(config_obj: std.json.ObjectMap, root_obj: std.jso
 
 pub fn applyCommonTextConfig(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap, config: *tensor.ModelConfig) void {
     if (getBoolFromConfigOrRoot(config_obj, root_obj, "attention_bias")) |v| config.attention_bias = v;
+    if (getIntFromConfigOrRoot(config_obj, root_obj, "global_head_dim")) |v| config.global_head_dim = v;
     if (getBoolFromConfigOrRoot(config_obj, root_obj, "use_qk_norm")) |v| config.use_qk_norm = v;
     if (getFloatFromConfigOrRoot(config_obj, root_obj, "query_pre_attn_scalar")) |v| config.query_pre_attn_scalar = v;
     if (getFloatFromConfigOrRoot(config_obj, root_obj, "rope_local_base_freq")) |v| config.rope_local_theta = v;
@@ -56,7 +57,27 @@ pub fn applyCommonTextConfig(config_obj: std.json.ObjectMap, root_obj: std.json.
     if (getFloatFromConfigOrRoot(config_obj, root_obj, "attention_multiplier")) |v| config.attention_multiplier = v;
     if (getFloatFromConfigOrRoot(config_obj, root_obj, "residual_multiplier")) |v| config.residual_multiplier = v;
     if (getFloatFromConfigOrRoot(config_obj, root_obj, "logits_scaling")) |v| config.logits_scaling = v;
+    if (getFloatFromConfigOrRoot(config_obj, root_obj, "final_logit_softcapping")) |v| config.final_logit_softcapping = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "bos_token_id")) |v| config.bos_token_id = v;
+    if (getIntFromConfigOrRoot(config_obj, root_obj, "hidden_size_per_layer_input")) |v| config.hidden_size_per_layer_input = v;
+    if (getIntFromConfigOrRoot(config_obj, root_obj, "vocab_size_per_layer_input")) |v| config.vocab_size_per_layer_input = v;
+    if (getIntFromConfigOrRoot(config_obj, root_obj, "num_kv_shared_layers")) |v| config.num_kv_shared_layers = v;
+
+    // Gemma4 text configs use scaled token embeddings but often omit an explicit
+    // embedding multiplier field. Fall back to sqrt(hidden_size) when per-layer
+    // input embeddings are enabled and no explicit override was provided.
+    if (config.hidden_size_per_layer_input > 0 and config.embedding_multiplier == 1.0) {
+        config.embedding_multiplier = @sqrt(@as(f32, @floatFromInt(config.d_model)));
+    }
+    // Gemma4 text attention runs with unit scaling. Configs usually omit both
+    // attention_multiplier and query_pre_attn_scalar, so avoid defaulting to
+    // 1/sqrt(head_dim) in that case.
+    if (config.hidden_size_per_layer_input > 0 and
+        config.attention_multiplier == 0.0 and
+        config.query_pre_attn_scalar == 0.0)
+    {
+        config.attention_multiplier = 1.0;
+    }
 
     // Gemma4-style nested RoPE parameters:
     // rope_parameters.full_attention / rope_parameters.sliding_attention.

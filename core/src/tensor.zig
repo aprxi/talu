@@ -647,6 +647,7 @@ pub const ModelConfig = struct {
     d_ff: i32,
     max_seq_len: i32,
     head_dim: i32,
+    global_head_dim: i32 = 0,
     rope_dim: i32 = 0,
     rope_theta: f32,
     norm_eps: f32,
@@ -669,6 +670,10 @@ pub const ModelConfig = struct {
     attention_multiplier: f32 = 0,
     residual_multiplier: f32 = 1.0,
     logits_scaling: f32 = 1.0,
+    final_logit_softcapping: f32 = 0.0,
+    hidden_size_per_layer_input: i32 = 0,
+    vocab_size_per_layer_input: i32 = 0,
+    num_kv_shared_layers: i32 = 0,
     bos_token_id: ?i32 = null,
     // Mamba/SSM config (for heterogeneous models like Granite Hybrid)
     mamba_d_state: i32 = 0, // SSM state dimension (e.g., 128)

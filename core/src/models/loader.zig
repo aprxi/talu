@@ -97,14 +97,21 @@ pub fn applyRuntimeArchitectureMetadata(
     if (runtime_architecture.has_qk_norm) loaded_model.config.use_qk_norm = true;
     if (runtime_architecture.use_gelu) loaded_model.config.use_gelu = true;
 
+    const uses_per_layer_inputs = loaded_model.config.hidden_size_per_layer_input > 0;
+
     // Apply norm weight offset (for (1+w) style norms).
-    if (runtime_architecture.norm_weight_offset != 0.0) {
+    // Gemma4 text layers use pure RMS scale (no +1 weight offset), so force zero
+    // when per-layer input embeddings are enabled.
+    if (uses_per_layer_inputs) {
+        loaded_model.runtime.weight_offset = 0.0;
+        loaded_model.runtime.qk_norm_weight_offset = 0.0;
+    } else if (runtime_architecture.norm_weight_offset != 0.0) {
         loaded_model.runtime.weight_offset = runtime_architecture.norm_weight_offset;
         loaded_model.runtime.qk_norm_weight_offset = runtime_architecture.norm_weight_offset;
     }
 
     // Apply embedding multiplier (e.g., sqrt(hidden_size) scaling)
-    if (runtime_architecture.embedding_multiplier != 1.0) {
+    if (runtime_architecture.embedding_multiplier != 1.0 and !uses_per_layer_inputs) {
         loaded_model.config.embedding_multiplier = runtime_architecture.embedding_multiplier;
     }
 
@@ -303,6 +310,45 @@ test "applyRuntimeArchitectureMetadata copies runtime flags from architecture" {
     try std.testing.expect(loaded.runtime.architecture_id != null);
     try std.testing.expectEqualStrings("granite_hybrid", loaded.runtime.architecture_id.?);
     try std.testing.expect(loaded.runtime.has_mamba);
+}
+
+test "applyRuntimeArchitectureMetadata keeps gemma4 norm and embedding scaling semantics" {
+    var loaded = LoadedModel{
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .config = .{
+            .vocab_size = 262144,
+            .d_model = 1536,
+            .n_layers = 35,
+            .n_heads = 8,
+            .n_kv_groups = 1,
+            .d_ff = 6144,
+            .max_seq_len = 131072,
+            .head_dim = 256,
+            .rope_theta = 1_000_000.0,
+            .norm_eps = 1e-6,
+            .gaffine_group_size = 128,
+            .hidden_size_per_layer_input = 256,
+            .embedding_multiplier = 39.191837,
+        },
+        .token_embeddings = .{
+            .dtype = .f32,
+            .n_dims = 2,
+            .shape = .{ 1, 1, 0, 0, 0, 0, 0, 0 },
+            .data_ptr = null,
+            .data_size = 0,
+            .numel = 1,
+            .strides = .{ 1, 1, 0, 0, 0, 0, 0, 0 },
+        },
+        .blocks = &.{},
+        .original_weight_dtype = .f32,
+    };
+    defer loaded.arena.deinit();
+
+    const arch = models_registry.runtimeArchitectureById("gemma3") orelse return error.TestUnexpectedResult;
+    applyRuntimeArchitectureMetadata(&loaded, arch);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), loaded.runtime.weight_offset, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), loaded.runtime.qk_norm_weight_offset, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 39.191837), loaded.config.embedding_multiplier, 0.0001);
 }
 
 test "loadModel returns FileNotFound for missing config path" {

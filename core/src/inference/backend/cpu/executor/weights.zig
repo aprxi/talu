@@ -223,6 +223,27 @@ fn resolveAttentionScale(config: ModelConfig, head_dim: usize) f32 {
     return 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 }
 
+fn resolveSharedKvSourceLayer(config: ModelConfig, layer_idx: usize) ?usize {
+    if (config.num_kv_shared_layers <= 0) return null;
+    const layer_types = config.layer_types orelse return null;
+    const n_layers: usize = @intCast(config.n_layers);
+    if (layer_types.len != n_layers) return null;
+    if (layer_idx >= n_layers) return null;
+
+    const shared_count: usize = @min(@as(usize, @intCast(config.num_kv_shared_layers)), n_layers);
+    if (shared_count == 0 or shared_count == n_layers) return null;
+    const first_shared_layer = n_layers - shared_count;
+    if (layer_idx < first_shared_layer or first_shared_layer == 0) return null;
+
+    const target_layer_type = layer_types[layer_idx];
+    var src = first_shared_layer;
+    while (src > 0) {
+        src -= 1;
+        if (layer_types[src] == target_layer_type) return src;
+    }
+    return null;
+}
+
 /// Fuse separate gate (w1) and up (w3) projection weights into a single tensor.
 /// This converts 2 separate matmuls into 1 fused matmul for the FFN forward pass.
 ///
@@ -1913,6 +1934,10 @@ pub fn buildBlocks(
             use_gelu_activation,
             layer_idx,
         );
+        if (block_slot.getAttentionMut()) |attn_ptr| {
+            attn_ptr.use_v_norm = config.hidden_size_per_layer_input > 0;
+            attn_ptr.kv_shared_source_layer = resolveSharedKvSourceLayer(config, layer_idx);
+        }
         // Initialize weight registry now that block is in its final heap location
         try block_slot.initWeightRegistry(allocator, block_weight);
         progress.updateLine(1, @intCast(layer_idx + 1), null);
@@ -1986,6 +2011,10 @@ pub fn buildBlocksFromLayers(
             use_gelu_activation,
             layer_idx,
         );
+        if (block_slot.getAttentionMut()) |attn_ptr| {
+            attn_ptr.use_v_norm = config.hidden_size_per_layer_input > 0;
+            attn_ptr.kv_shared_source_layer = resolveSharedKvSourceLayer(config, layer_idx);
+        }
         try block_slot.initWeightRegistry(allocator, block_weight);
         progress.updateLine(1, @intCast(layer_idx + 1), null);
     }

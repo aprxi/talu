@@ -229,7 +229,13 @@ pub const FusedCpuBackend = struct {
     ) !RuntimeRopeHandles {
         if (loaded.position_embeddings != null) return .{};
 
-        const global_rope_dim: usize = if (loaded.config.rope_dim > 0)
+        const use_proportional_global_rope = loaded.config.hidden_size_per_layer_input > 0 and
+            loaded.config.global_head_dim > 0 and
+            loaded.config.rope_dim > 0 and
+            loaded.config.global_head_dim >= loaded.config.rope_dim;
+        const global_rope_dim: usize = if (use_proportional_global_rope)
+            @intCast(loaded.config.global_head_dim)
+        else if (loaded.config.rope_dim > 0)
             @intCast(loaded.config.rope_dim)
         else
             @intCast(loaded.config.head_dim);
@@ -241,13 +247,39 @@ pub const FusedCpuBackend = struct {
         var handles: RuntimeRopeHandles = .{};
         errdefer deinitRuntimeRopeHandles(allocator, &handles);
 
-        var global_freqs = try rope_scaling.materializeInverseFrequencies(
-            allocator,
-            global_rope_dim,
-            loaded.config.rope_theta,
-            loaded.config.rope_scaling,
-        );
-        defer global_freqs.deinit(allocator);
+        var global_attention_scaling: f32 = 1.0;
+        var global_inv_freq_owned: ?[]f32 = null;
+        defer if (global_inv_freq_owned) |owned| allocator.free(owned);
+        var global_inv_freq: []const f32 = undefined;
+
+        if (use_proportional_global_rope) {
+            if ((global_rope_dim % 2) != 0) return error.InvalidShape;
+            const rotated_dims: usize = @intCast(loaded.config.rope_dim);
+            if ((rotated_dims % 2) != 0 or rotated_dims > global_rope_dim) return error.InvalidShape;
+            const total_freq_count = global_rope_dim / 2;
+            const rotated_freq_count = rotated_dims / 2;
+            const inv_freq = try allocator.alloc(f32, total_freq_count);
+            global_inv_freq_owned = inv_freq;
+            const base = loaded.config.rope_theta;
+            const factor = if (loaded.config.rope_scaling.factor > 0) loaded.config.rope_scaling.factor else 1.0;
+            for (0..rotated_freq_count) |idx| {
+                const exponent = @as(f32, @floatFromInt(2 * idx)) / @as(f32, @floatFromInt(global_rope_dim));
+                inv_freq[idx] = (1.0 / std.math.pow(f32, base, exponent)) / factor;
+            }
+            @memset(inv_freq[rotated_freq_count..], 0.0);
+            global_inv_freq = inv_freq;
+            global_attention_scaling = 1.0;
+        } else {
+            var global_freqs = try rope_scaling.materializeInverseFrequencies(
+                allocator,
+                global_rope_dim,
+                loaded.config.rope_theta,
+                loaded.config.rope_scaling,
+            );
+            defer global_freqs.deinit(allocator);
+            global_inv_freq = global_freqs.inv_freq;
+            global_attention_scaling = global_freqs.attention_scaling;
+        }
 
         const global_rope = try allocator.create(cpu_blocks.RoPE);
         errdefer allocator.destroy(global_rope);
@@ -255,8 +287,8 @@ pub const FusedCpuBackend = struct {
             allocator,
             global_rope_dim,
             @intCast(loaded.config.max_seq_len),
-            global_freqs.inv_freq,
-            global_freqs.attention_scaling,
+            global_inv_freq,
+            global_attention_scaling,
         );
         handles.global = global_rope;
 
@@ -905,7 +937,15 @@ pub const FusedCpuBackend = struct {
         }
 
         // 2. Forward through transformer layers using the graph with batched cache
-        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(0), 0, true);
+        try self.model.forwardWithBatchedCacheTokenIds(
+            &hidden_view_3d,
+            &hidden_view_3d,
+            &self.scratch,
+            self.slotStateBlocks(0),
+            0,
+            token_ids,
+            true,
+        );
 
         // 3. Apply final layer norm (if present — embed-only models skip this)
         if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
@@ -953,7 +993,15 @@ pub const FusedCpuBackend = struct {
             cpu_rowwise.scaleInPlace(hidden_buffer, self.loaded.config.embedding_multiplier);
 
             // 2. Forward through transformer layers with batched cache
-            try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(0), 0, true);
+            try self.model.forwardWithBatchedCacheTokenIds(
+                &hidden_view_3d,
+                &hidden_view_3d,
+                &self.scratch,
+                self.slotStateBlocks(0),
+                0,
+                token_ids,
+                true,
+            );
 
             // 3. Final layer norm
             if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
@@ -1009,7 +1057,15 @@ pub const FusedCpuBackend = struct {
         cpu_rowwise.scaleInPlace(hidden_buffer, self.loaded.config.embedding_multiplier);
 
         // 2. Forward through transformer layers with batched cache
-        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(slot_index), slot_index, true);
+        try self.model.forwardWithBatchedCacheTokenIds(
+            &hidden_view_3d,
+            &hidden_view_3d,
+            &self.scratch,
+            self.slotStateBlocks(slot_index),
+            slot_index,
+            token_ids,
+            true,
+        );
 
         // 3. Final layer norm (if present)
         if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
@@ -1066,8 +1122,8 @@ pub const FusedCpuBackend = struct {
             1,
             self.d_model,
         );
+        const token_ids = &[_]u32{token};
         if (!use_preloaded_input) {
-            const token_ids = &[_]u32{token};
             try self.model.embed_tokens.forward(token_ids, &hidden_view_3d);
             cpu_rowwise.scaleInPlace(hidden_buffer, self.loaded.config.embedding_multiplier);
             if (trace.isEnabled()) {
@@ -1085,12 +1141,13 @@ pub const FusedCpuBackend = struct {
             }
         }
 
-        try self.model.forwardWithBatchedCacheLayerRange(
+        try self.model.forwardWithBatchedCacheLayerRangeTokenIds(
             &hidden_view_3d,
             &hidden_view_3d,
             &self.scratch,
             self.slotStateBlocks(slot_index),
             slot_index,
+            token_ids,
             true,
             layer_start,
             layer_end,
@@ -1156,7 +1213,7 @@ pub const FusedCpuBackend = struct {
             });
             return err;
         };
-        self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(0), 0, false) catch |err| {
+        self.model.forwardWithBatchedCacheTokenIds(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(0), 0, token_ids, false) catch |err| {
             log.warn("inference", "CPU warmup forwardWithBatchedCache failed", .{
                 .reason = @errorName(err),
             });
@@ -1359,22 +1416,24 @@ pub const FusedCpuBackend = struct {
             .has_mrope = @as(u8, @intFromBool(text_mrope_enabled)),
         }, @src());
         if (deepstack_ctx) |*ctx| {
-            try self.model.forwardWithBatchedCacheWithDeepstack(
+            try self.model.forwardWithBatchedCacheWithDeepstackTokenIds(
                 &prefill_view_3d,
                 &prefill_view_3d,
                 &self.scratch,
                 self.slotStateBlocks(slot_index),
                 slot_index,
+                tokens,
                 false,
                 ctx,
             );
         } else {
-            try self.model.forwardWithBatchedCache(
+            try self.model.forwardWithBatchedCacheTokenIds(
                 &prefill_view_3d,
                 &prefill_view_3d,
                 &self.scratch,
                 self.slotStateBlocks(slot_index),
                 slot_index,
+                tokens,
                 false,
             );
         }
@@ -1610,12 +1669,13 @@ pub const FusedCpuBackend = struct {
 
         if (slot_delta_equal and self.supports_batched_decode_slots) {
             self.setPositionDeltaForTextLayers(shared_delta);
-            try self.model.forwardWithBatchedCacheSlots(
+            try self.model.forwardWithBatchedCacheSlotsTokenIds(
                 &compact_hidden_view,
                 &compact_hidden_view,
                 &self.scratch,
                 self.slotStateBlocks(slot_indices[0]),
                 slot_indices,
+                batch_tokens,
                 true,
             );
             if (self.model.norm) |*n| n.forward(&compact_hidden_view, &compact_hidden_view);
@@ -1628,12 +1688,14 @@ pub const FusedCpuBackend = struct {
                     1,
                     model_width,
                 );
-                self.model.forwardWithBatchedCache(
+                const token_ids = &[_]u32{request.token};
+                self.model.forwardWithBatchedCacheTokenIds(
                     &hidden_tensor_view,
                     &hidden_tensor_view,
                     &self.scratch,
                     self.slotStateBlocks(request.slot_index),
                     request.slot_index,
+                    token_ids,
                     true,
                 ) catch return;
                 if (self.model.norm) |*n| n.forward(&hidden_tensor_view, &hidden_tensor_view);
@@ -1732,6 +1794,12 @@ pub const FusedCpuBackend = struct {
                 logits_out[0 .. row_count * self.vocab_size],
                 self.loaded.config.logits_scaling,
             );
+        }
+        if (self.loaded.config.final_logit_softcapping > 0.0) {
+            const softcap = self.loaded.config.final_logit_softcapping;
+            for (logits_out[0 .. row_count * self.vocab_size]) |*value| {
+                value.* = std.math.tanh(value.* / softcap) * softcap;
+            }
         }
 
         if (trace.isEnabled()) {
@@ -1862,7 +1930,15 @@ pub const FusedCpuBackend = struct {
 
         // 2. Forward through transformer layers using the graph with batched cache
         // use_cache=false triggers prefill mode which processes all positions
-        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(slot_index), slot_index, false);
+        try self.model.forwardWithBatchedCacheTokenIds(
+            &hidden_view_3d,
+            &hidden_view_3d,
+            &self.scratch,
+            self.slotStateBlocks(slot_index),
+            slot_index,
+            tokens,
+            false,
+        );
         // 3. Apply final layer norm to ALL positions (if present — embed-only models skip this)
         if (self.model.norm) |*n| {
             for (0..seq_len) |pos| {

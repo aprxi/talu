@@ -1606,9 +1606,13 @@ test "loadConfig parses gemma4 nested rope_parameters" {
         \\    "num_hidden_layers": 35,
         \\    "num_attention_heads": 8,
         \\    "num_key_value_heads": 1,
+        \\    "num_kv_shared_layers": 20,
         \\    "head_dim": 256,
         \\    "global_head_dim": 512,
         \\    "intermediate_size": 6144,
+        \\    "hidden_size_per_layer_input": 256,
+        \\    "vocab_size_per_layer_input": 262144,
+        \\    "final_logit_softcapping": 30.0,
         \\    "max_position_embeddings": 131072,
         \\    "rope_parameters": {
         \\      "full_attention": {
@@ -1632,7 +1636,14 @@ test "loadConfig parses gemma4 nested rope_parameters" {
     const config = try loadConfigForArchitecture(std.testing.allocator, path, "gemma3");
     try std.testing.expectApproxEqAbs(@as(f32, 1_000_000.0), config.rope_theta, 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 10_000.0), config.rope_local_theta, 0.01);
+    try std.testing.expectEqual(@as(i32, 512), config.global_head_dim);
     try std.testing.expectEqual(@as(i32, 128), config.rope_dim);
+    try std.testing.expectEqual(@as(i32, 256), config.hidden_size_per_layer_input);
+    try std.testing.expectEqual(@as(i32, 262144), config.vocab_size_per_layer_input);
+    try std.testing.expectEqual(@as(i32, 20), config.num_kv_shared_layers);
+    try std.testing.expectApproxEqAbs(@as(f32, 30.0), config.final_logit_softcapping, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 39.191837), config.embedding_multiplier, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), config.attention_multiplier, 0.0001);
 }
 
 test "loadConfig parses vision deepstack probe layers from vision_config via youtu hook" {

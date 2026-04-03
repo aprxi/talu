@@ -87,6 +87,8 @@ const AttentionRuntimeMetadata = struct {
     qk_norm_weight_offset: f32,
     sliding_window: usize,
     is_causal: bool,
+    use_v_norm: bool,
+    kv_shared_source_layer: ?usize,
     layer_idx: u16,
     rope: @TypeOf(@as(attn_kernel.MultiHeadAttention, undefined).rope),
     runtime_rope: @TypeOf(@as(attn_kernel.MultiHeadAttention, undefined).runtime_rope),
@@ -628,6 +630,8 @@ pub const Block = struct {
                     .qk_norm_weight_offset = binding.qk_norm_weight_offset,
                     .sliding_window = binding.sliding_window,
                     .is_causal = binding.is_causal,
+                    .use_v_norm = binding.use_v_norm,
+                    .kv_shared_source_layer = binding.kv_shared_source_layer,
                     .layer_idx = binding.layer_idx,
                     .rope = binding.rope,
                     .runtime_rope = binding.runtime_rope,
@@ -2087,6 +2091,8 @@ pub const Block = struct {
                 .qk_norm_weight_offset = meta.qk_norm_weight_offset,
                 .sliding_window = meta.sliding_window,
                 .is_causal = meta.is_causal,
+                .use_v_norm = meta.use_v_norm,
+                .kv_shared_source_layer = meta.kv_shared_source_layer,
                 .layer_idx = meta.layer_idx,
                 .query_gate = attention_param.query_gate != 0,
                 .q_proj = null,
@@ -2386,20 +2392,26 @@ pub const Block = struct {
             return;
         }
         const batched_cache = try requireLayerBatchedCacheForInstruction(state, insn, state_blocks);
+        const read_cache = if (kernel.kv_shared_source_layer != null)
+            try requireLayerBatchedCacheForInstructionAtLayer(insn, state_blocks, kernel.kv_shared_source_layer.?)
+        else
+            batched_cache;
         switch (state.mode) {
-            .single_slot => try kernel.forwardWithBatchedCache(
+            .single_slot => try kernel.forwardWithBatchedCacheReadCache(
                 input,
                 output,
                 batched_cache,
+                read_cache,
                 state.slot_index,
                 &state.scratch.attn_scratch,
                 &state.scratch.matmul_scratch,
                 state.slot_ctx.use_cache,
             ),
-            .slot_batch => try kernel.forwardWithBatchedCacheSlots(
+            .slot_batch => try kernel.forwardWithBatchedCacheSlotsReadCache(
                 input,
                 output,
                 batched_cache,
+                read_cache,
                 state.slot_indices,
                 &state.scratch.attn_scratch,
                 &state.scratch.matmul_scratch,
@@ -3538,10 +3550,10 @@ pub const Block = struct {
         );
     }
 
-    fn requireLayerBatchedCacheForInstruction(
-        state: *RuntimeDispatchState,
+    fn requireLayerBatchedCacheForInstructionAtLayer(
         insn: *const runtime_contract.Instruction,
         state_blocks: []const runtime_contract.StateBlockHandle,
+        layer_idx: usize,
     ) !*kv_cache.BatchedKVCache {
         const state_id = insn.state_block_id orelse return error.InvalidStateDescriptorBinding;
         const state_block = runtime_contract.findStateBlock(state_blocks, state_id) orelse {
@@ -3553,8 +3565,16 @@ pub const Block = struct {
         if (state_value.runtime_kind != runtime_contract.state_runtime_kind_kv_cache) {
             return error.InvalidStateDescriptorBinding;
         }
-        if (state.block.block_idx >= state_value.layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
-        return state_value.layered_cache.getLayer(state.block.block_idx);
+        if (layer_idx >= state_value.layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
+        return state_value.layered_cache.getLayer(layer_idx);
+    }
+
+    fn requireLayerBatchedCacheForInstruction(
+        state: *RuntimeDispatchState,
+        insn: *const runtime_contract.Instruction,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !*kv_cache.BatchedKVCache {
+        return requireLayerBatchedCacheForInstructionAtLayer(insn, state_blocks, state.block.block_idx);
     }
 
     const MlaRuntimeBinding = struct {

@@ -175,6 +175,32 @@ fn normalizeTraceRowsAsWeights(
     }
 }
 
+fn rmsnormHeadsNoWeightInPlace(
+    values: []f32,
+    row_count: usize,
+    group_count: usize,
+    feature_width: usize,
+    row_stride: usize,
+    eps: f32,
+) void {
+    std.debug.assert(row_stride >= group_count * feature_width);
+    std.debug.assert(values.len >= row_count * row_stride);
+    for (0..row_count) |row_idx| {
+        for (0..group_count) |group_idx| {
+            const offset = row_idx * row_stride + group_idx * feature_width;
+            const head_values = values[offset .. offset + feature_width];
+            var sum_sq: f32 = 0.0;
+            for (head_values) |value| {
+                sum_sq += value * value;
+            }
+            const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(feature_width)) + eps);
+            for (head_values) |*value| {
+                value.* *= inv_rms;
+            }
+        }
+    }
+}
+
 /// Temporary scratch buffers for attention computation.
 /// These are safe to share across layers because they do not persist state.
 ///
@@ -348,6 +374,8 @@ pub const MultiHeadAttention = struct {
     // QKNorm (optional) - applied after Q/K projection, before RoPE
     q_norm: ?*const Tensor = null,
     k_norm: ?*const Tensor = null,
+    use_v_norm: bool = false,
+    kv_shared_source_layer: ?usize = null,
     norm_eps: f32 = 1e-6,
     allocator: std.mem.Allocator,
     // Baked matmul kernels - resolved at load time, no runtime dispatch
@@ -587,6 +615,16 @@ pub const MultiHeadAttention = struct {
                 kn,
                 self.norm_eps,
                 self.qk_norm_weight_offset,
+            );
+        }
+        if (self.use_v_norm) {
+            rmsnormHeadsNoWeightInPlace(
+                value_view.asSlice(f32),
+                sequence_len,
+                self.n_kv_heads,
+                self.head_dim,
+                kv_total_dim,
+                self.norm_eps,
             );
         }
 
@@ -1262,6 +1300,32 @@ pub const MultiHeadAttention = struct {
         matmul_scratch: *cpu_linalg.MatmulScratch,
         use_cache: bool,
     ) !void {
+        return self.forwardWithBatchedCacheReadCache(
+            input_tensor,
+            output_tensor,
+            cache,
+            cache,
+            slot_index,
+            scratch,
+            matmul_scratch,
+            use_cache,
+        );
+    }
+
+    pub fn forwardWithBatchedCacheReadCache(
+        self: *const Self,
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        cache: *BatchedKVCache,
+        read_cache: *BatchedKVCache,
+        slot_index: usize,
+        scratch: *AttnTemp,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
+        use_cache: bool,
+    ) !void {
+        // Shared read cache is used for Gemma-style KV-sharing layers.
+        // This can be active in both cached prefill and decode paths.
+        const shared_kv_cache = read_cache != cache;
         const exact_softmax = getExactSoftmax(self.allocator);
         const query_gate = self.query_gate;
         std.debug.assert(self.n_heads > 0 and self.n_kv_heads > 0);
@@ -1442,6 +1506,16 @@ pub const MultiHeadAttention = struct {
                 self.qk_norm_weight_offset,
             );
         }
+        if (self.use_v_norm) {
+            rmsnormHeadsNoWeightInPlace(
+                value_view.asSlice(f32),
+                sequence_len,
+                n_kv_heads,
+                head_dim,
+                kv_total_dim,
+                self.norm_eps,
+            );
+        }
 
         if (trace.isEnabled()) {
             const trace_position: u32 = if (use_cache) @intCast(cache.getPosition(slot_index)) else @intCast(sequence_len);
@@ -1562,15 +1636,27 @@ pub const MultiHeadAttention = struct {
         const query_values = query_view.asSlice(f32);
         const key_values = key_view.asSlice(f32);
         const value_values = value_view.asSlice(f32);
+        var kv_trace_sequence_len: usize = sequence_len;
+        var trace_start_kv_index: usize = if (self.sliding_window > 0 and sequence_len > self.sliding_window)
+            sequence_len - self.sliding_window
+        else
+            0;
 
         if (use_cache) {
             // === DECODE MODE ===
             std.debug.assert(sequence_len == 1);
             if (cache_position >= self.max_seq_len) return error.CacheOverflow;
+            if (shared_kv_cache and cache_position + sequence_len > self.max_seq_len) return error.CacheOverflow;
 
-            // Append current K/V to batched cache
-            try cache.appendKV(slot_index, key_values, value_values);
-            const kv_sequence_len = cache.getPosition(slot_index);
+            var kv_sequence_len: usize = 0;
+            if (shared_kv_cache) {
+                kv_sequence_len = read_cache.getPosition(slot_index);
+            } else {
+                // Append current K/V to batched cache
+                try cache.appendKV(slot_index, key_values, value_values);
+                kv_sequence_len = cache.getPosition(slot_index);
+            }
+            if (kv_sequence_len == 0) return error.InvalidStateDescriptorBinding;
 
             const start_kv_index: usize = if (self.sliding_window > 0 and kv_sequence_len > self.sliding_window)
                 kv_sequence_len - self.sliding_window
@@ -1580,7 +1666,7 @@ pub const MultiHeadAttention = struct {
             const active_len = kv_sequence_len - start_kv_index;
 
             // Check KV cache quantization mode
-            const use_int8 = cache.quant_mode == .int8;
+            const use_int8 = read_cache.quant_mode == .int8;
 
             // Full INT8 mode: use GQA-optimized path that dequants V once per KV head
             // This amortizes the V dequant cost across heads_per_kv_group Q heads
@@ -1630,7 +1716,7 @@ pub const MultiHeadAttention = struct {
                 var decode_ctx_i8 = DecodeKVGroupI8Ctx{
                     .query_values = query_values,
                     .context_values = context_values,
-                    .cache = cache,
+                    .cache = read_cache,
                     .slot_index = slot_index,
                     .sinks = self.sinks,
                     .head_dim = head_dim,
@@ -1686,7 +1772,7 @@ pub const MultiHeadAttention = struct {
                 var gqa_ctx = DecodeKVGroupCtx{
                     .query_values = query_values,
                     .context_values = context_values,
-                    .cache = cache,
+                    .cache = read_cache,
                     .slot_index = slot_index,
                     .sinks = self.sinks,
                     .head_dim = head_dim,
@@ -1747,7 +1833,7 @@ pub const MultiHeadAttention = struct {
                     .query_values = query_values,
                     .score_values = score_values,
                     .context_values = context_values,
-                    .cache = cache,
+                    .cache = read_cache,
                     .slot_index = slot_index,
                     .sinks = self.sinks,
                     .head_dim = head_dim,
@@ -1761,47 +1847,114 @@ pub const MultiHeadAttention = struct {
 
                 parallel.global().parallelFor(n_heads, DecodeHeadCtx.processHead, &decode_ctx);
             }
+            kv_trace_sequence_len = kv_sequence_len;
+            trace_start_kv_index = start_kv_index;
+            if (shared_kv_cache) cache.incrementPosition(slot_index);
         } else {
             // === PREFILL MODE ===
             // Store K/V in batched cache and compute attention (causal or bidirectional)
-
-            // First, store all K/V in the cache
-            for (0..sequence_len) |token_index| {
-                const k_token = key_values[token_index * kv_total_dim ..][0..kv_total_dim];
-                const v_token = value_values[token_index * kv_total_dim ..][0..kv_total_dim];
-                try cache.appendKV(slot_index, k_token, v_token);
+            if (!shared_kv_cache) {
+                // First, store all K/V in the cache
+                for (0..sequence_len) |token_index| {
+                    const k_token = key_values[token_index * kv_total_dim ..][0..kv_total_dim];
+                    const v_token = value_values[token_index * kv_total_dim ..][0..kv_total_dim];
+                    try cache.appendKV(slot_index, k_token, v_token);
+                }
             }
 
-            // Compute self-attention (respects is_causal for encoder vs decoder)
-            for (0..n_heads) |head_index| {
-                const kv_head_idx = head_index / heads_per_kv_group;
-                for (0..sequence_len) |query_index| {
-                    const end_kv_index: usize = if (self.is_causal) query_index + 1 else sequence_len;
-                    const start_kv_index: usize = if (self.sliding_window > 0 and end_kv_index > self.sliding_window)
-                        end_kv_index - self.sliding_window
-                    else
-                        0;
-                    const query_head = query_values[query_index * query_dim + head_index * head_dim ..][0..head_dim];
-                    const scores_for_query = score_values[head_index * sequence_len ..][0..sequence_len];
-                    const context_for_head = context_values[(query_index * n_heads + head_index) * head_dim ..][0..head_dim];
-                    const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                    cpu_sdpa.computeBoundedRowWeightedSum(
-                        query_head,
-                        key_values,
-                        value_values,
-                        scores_for_query,
-                        context_for_head,
-                        start_kv_index,
-                        end_kv_index,
-                        sequence_len,
-                        kv_head_idx,
-                        head_dim,
-                        kv_total_dim,
-                        scale,
-                        sink_logit,
-                        exact_softmax,
-                        self.is_causal,
-                    );
+            const kv_sequence_len: usize = if (shared_kv_cache) read_cache.getPosition(slot_index) else sequence_len;
+            if (kv_sequence_len == 0) return error.InvalidStateDescriptorBinding;
+            if (kv_sequence_len > sequence_len) return error.InvalidShape;
+            kv_trace_sequence_len = kv_sequence_len;
+            trace_start_kv_index = if (self.sliding_window > 0 and kv_sequence_len > self.sliding_window)
+                kv_sequence_len - self.sliding_window
+            else
+                0;
+
+            if (shared_kv_cache) {
+                const use_int8 = read_cache.quant_mode == .int8;
+                for (0..n_heads) |head_index| {
+                    const kv_head_idx = head_index / heads_per_kv_group;
+                    for (0..sequence_len) |query_index| {
+                        const end_kv_index: usize = if (self.is_causal) query_index + 1 else kv_sequence_len;
+                        const start_kv_index: usize = if (self.sliding_window > 0 and end_kv_index > self.sliding_window)
+                            end_kv_index - self.sliding_window
+                        else
+                            0;
+                        const query_head = query_values[query_index * query_dim + head_index * head_dim ..][0..head_dim];
+                        const scores_for_query = score_values[head_index * sequence_len ..][0..kv_sequence_len];
+                        const context_for_head = context_values[(query_index * n_heads + head_index) * head_dim ..][0..head_dim];
+                        const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
+                        if (use_int8) {
+                            const k_cache_head_i8 = read_cache.getKHeadI8(slot_index, kv_head_idx);
+                            const k_scales = read_cache.getKScales(slot_index, kv_head_idx);
+                            const v_cache_head = read_cache.getVHead(slot_index, kv_head_idx);
+                            cpu_sdpa.computeMaskedRowWeightedSumI8(
+                                query_head,
+                                k_cache_head_i8,
+                                k_scales,
+                                v_cache_head,
+                                scores_for_query,
+                                context_for_head,
+                                start_kv_index,
+                                kv_sequence_len,
+                                head_dim,
+                                scale,
+                                sink_logit,
+                                exact_softmax,
+                            );
+                        } else {
+                            const k_cache_head = read_cache.getKHead(slot_index, kv_head_idx);
+                            const v_cache_head = read_cache.getVHead(slot_index, kv_head_idx);
+                            cpu_sdpa.computeMaskedRowWeightedSum(
+                                query_head,
+                                k_cache_head,
+                                v_cache_head,
+                                scores_for_query,
+                                context_for_head,
+                                start_kv_index,
+                                kv_sequence_len,
+                                head_dim,
+                                scale,
+                                sink_logit,
+                                exact_softmax,
+                            );
+                        }
+                    }
+                }
+                cache.setPosition(slot_index, kv_sequence_len);
+            } else {
+                // Compute self-attention (respects is_causal for encoder vs decoder)
+                for (0..n_heads) |head_index| {
+                    const kv_head_idx = head_index / heads_per_kv_group;
+                    for (0..sequence_len) |query_index| {
+                        const end_kv_index: usize = if (self.is_causal) query_index + 1 else sequence_len;
+                        const start_kv_index: usize = if (self.sliding_window > 0 and end_kv_index > self.sliding_window)
+                            end_kv_index - self.sliding_window
+                        else
+                            0;
+                        const query_head = query_values[query_index * query_dim + head_index * head_dim ..][0..head_dim];
+                        const scores_for_query = score_values[head_index * sequence_len ..][0..sequence_len];
+                        const context_for_head = context_values[(query_index * n_heads + head_index) * head_dim ..][0..head_dim];
+                        const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
+                        cpu_sdpa.computeBoundedRowWeightedSum(
+                            query_head,
+                            key_values,
+                            value_values,
+                            scores_for_query,
+                            context_for_head,
+                            start_kv_index,
+                            end_kv_index,
+                            sequence_len,
+                            kv_head_idx,
+                            head_dim,
+                            kv_total_dim,
+                            scale,
+                            sink_logit,
+                            exact_softmax,
+                            self.is_causal,
+                        );
+                    }
                 }
             }
         }
@@ -1811,18 +1964,18 @@ pub const MultiHeadAttention = struct {
         // weights checkpoint. Context/output math is already finished.
         if (trace.isEnabled()) {
             const trace_pos_scores: u32 = @intCast(if (use_cache) cache.getPosition(slot_index) else sequence_len);
-            const scores_dim1: u32 = if (use_cache) @intCast(cache.getPosition(slot_index)) else @intCast(sequence_len);
+            const scores_dim1: u32 = if (use_cache) @intCast(kv_trace_sequence_len) else @intCast(sequence_len);
             if (use_cache) {
                 rewriteDecodeTraceRowsAsRawQkBatched(
                     score_values,
                     query_values,
-                    cache,
+                    read_cache,
                     slot_index,
-                    cache.getPosition(slot_index),
+                    kv_trace_sequence_len,
                     n_heads,
                     heads_per_kv_group,
                     head_dim,
-                    if (self.sliding_window > 0 and cache.getPosition(slot_index) > self.sliding_window) cache.getPosition(slot_index) - self.sliding_window else 0,
+                    trace_start_kv_index,
                     self.max_seq_len,
                     scale,
                 );
@@ -1856,10 +2009,7 @@ pub const MultiHeadAttention = struct {
                 score_values,
                 @intCast(scores_dim1),
                 n_heads,
-                if (use_cache)
-                    (if (self.sliding_window > 0 and cache.getPosition(slot_index) > self.sliding_window) cache.getPosition(slot_index) - self.sliding_window else 0)
-                else
-                    (if (self.sliding_window > 0 and sequence_len > self.sliding_window) sequence_len - self.sliding_window else 0),
+                if (use_cache) trace_start_kv_index else (if (self.sliding_window > 0 and sequence_len > self.sliding_window) sequence_len - self.sliding_window else 0),
                 @intCast(scores_dim1),
                 self.sinks,
                 exact_softmax,
@@ -1932,7 +2082,33 @@ pub const MultiHeadAttention = struct {
         matmul_scratch: *cpu_linalg.MatmulScratch,
         use_cache: bool,
     ) !void {
+        return self.forwardWithBatchedCacheSlotsReadCache(
+            input_tensor,
+            output_tensor,
+            cache,
+            cache,
+            slot_indices,
+            scratch,
+            matmul_scratch,
+            use_cache,
+        );
+    }
+
+    pub fn forwardWithBatchedCacheSlotsReadCache(
+        self: *const Self,
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        cache: *BatchedKVCache,
+        read_cache: *BatchedKVCache,
+        slot_indices: []const usize,
+        scratch: *AttnTemp,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
+        use_cache: bool,
+    ) !void {
         if (!use_cache) return error.InvalidArgument;
+        // Gemma4 KV sharing only applies in decode (when reading from an existing cache).
+        // Prefill must always use the current layer's own K/V projections.
+        const shared_kv_cache = use_cache and read_cache != cache;
 
         const exact_softmax = getExactSoftmax(self.allocator);
         const query_gate = self.query_gate;
@@ -2113,6 +2289,16 @@ pub const MultiHeadAttention = struct {
                 self.qk_norm_weight_offset,
             );
         }
+        if (self.use_v_norm) {
+            rmsnormHeadsNoWeightInPlace(
+                value_view.asSlice(f32),
+                batch_size,
+                n_kv_heads,
+                head_dim,
+                kv_total_dim,
+                self.norm_eps,
+            );
+        }
 
         // RoPE position is slot-specific in continuous batching.
         const query_values = query_view.asSlice(f32);
@@ -2198,13 +2384,20 @@ pub const MultiHeadAttention = struct {
 
         for (slot_indices, 0..) |slot_index, batch_index| {
             if (cache.getPosition(slot_index) >= self.max_seq_len) return error.CacheOverflow;
+            if (shared_kv_cache and cache.getPosition(slot_index) + 1 > self.max_seq_len) return error.CacheOverflow;
 
             const query_row = query_values[batch_index * query_dim ..][0..query_dim];
             const key_row = key_values[batch_index * kv_total_dim ..][0..kv_total_dim];
             const value_row = value_values[batch_index * kv_total_dim ..][0..kv_total_dim];
 
-            try cache.appendKV(slot_index, key_row, value_row);
-            const kv_sequence_len = cache.getPosition(slot_index);
+            var kv_sequence_len: usize = 0;
+            if (shared_kv_cache) {
+                kv_sequence_len = read_cache.getPosition(slot_index);
+            } else {
+                try cache.appendKV(slot_index, key_row, value_row);
+                kv_sequence_len = cache.getPosition(slot_index);
+            }
+            if (kv_sequence_len == 0) return error.InvalidStateDescriptorBinding;
             const start_kv_index: usize = if (self.sliding_window > 0 and kv_sequence_len > self.sliding_window)
                 kv_sequence_len - self.sliding_window
             else
@@ -2215,7 +2408,7 @@ pub const MultiHeadAttention = struct {
             const context_base = context_values[batch_index * query_dim ..][0..query_dim];
 
             // Check KV cache quantization mode
-            const use_int8 = cache.quant_mode == .int8;
+            const use_int8 = read_cache.quant_mode == .int8;
 
             for (0..n_kv_heads) |kv_head_idx| {
                 const q_head_start = kv_head_idx * heads_per_kv_group;
@@ -2223,9 +2416,9 @@ pub const MultiHeadAttention = struct {
 
                 if (use_int8) {
                     // K-only INT8 path: SDOT for Q @ K^T, BLAS for scores @ V (f32)
-                    const k_cache_head_i8 = cache.getKHeadI8(slot_index, kv_head_idx);
-                    const k_scales = cache.getKScales(slot_index, kv_head_idx);
-                    const v_cache_head = cache.getVHead(slot_index, kv_head_idx);
+                    const k_cache_head_i8 = read_cache.getKHeadI8(slot_index, kv_head_idx);
+                    const k_scales = read_cache.getKScales(slot_index, kv_head_idx);
+                    const v_cache_head = read_cache.getVHead(slot_index, kv_head_idx);
 
                     for (q_head_start..q_head_end) |head_index| {
                         const query_head = query_row[head_index * head_dim ..][0..head_dim];
@@ -2250,8 +2443,8 @@ pub const MultiHeadAttention = struct {
                     }
                 } else {
                     // f32 path
-                    const k_cache_head = cache.getKHead(slot_index, kv_head_idx);
-                    const v_cache_head = cache.getVHead(slot_index, kv_head_idx);
+                    const k_cache_head = read_cache.getKHead(slot_index, kv_head_idx);
+                    const v_cache_head = read_cache.getVHead(slot_index, kv_head_idx);
 
                     for (q_head_start..q_head_end) |head_index| {
                         const query_head = query_row[head_index * head_dim ..][0..head_dim];
@@ -2275,6 +2468,7 @@ pub const MultiHeadAttention = struct {
                     }
                 }
             }
+            if (shared_kv_cache) cache.incrementPosition(slot_index);
         }
 
         if (query_gate) {
@@ -2569,6 +2763,16 @@ fn forwardBatchedDecode(
                 self.qk_norm_weight_offset,
             );
         }
+        if (self.use_v_norm) {
+            rmsnormHeadsNoWeightInPlace(
+                value_buffer,
+                1,
+                n_kv_heads,
+                head_dim,
+                kv_total_dim,
+                self.norm_eps,
+            );
+        }
 
         // Apply RoPE if configured (after QKNorm).
         if (self.runtime_rope) |runtime_rope| {
@@ -2764,6 +2968,81 @@ test "MultiHeadAttention.shouldUseFlash rejects non-causal prefill" {
     };
 
     try std.testing.expect(!mha.shouldUseFlash(false, false, FLASH_ATTENTION_THRESHOLD + 1));
+}
+
+test "forwardWithBatchedCacheReadCache uses shared read cache in prefill mode" {
+    const allocator = std.testing.allocator;
+
+    var q_proj_data = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    var k_proj_data = q_proj_data;
+    var v_proj_data = q_proj_data;
+    var o_proj_data = q_proj_data;
+
+    const q_proj = Tensor.view2DSlice(&q_proj_data, 2, 2);
+    const k_proj = Tensor.view2DSlice(&k_proj_data, 2, 2);
+    const v_proj = Tensor.view2DSlice(&v_proj_data, 2, 2);
+    const o_proj = Tensor.view2DSlice(&o_proj_data, 2, 2);
+
+    const mha = MultiHeadAttention{
+        .d_model = 2,
+        .n_heads = 1,
+        .n_kv_heads = 1,
+        .head_dim = 2,
+        .max_seq_len = 16,
+        .scale = 1.0,
+        .q_proj = &q_proj,
+        .k_proj = &k_proj,
+        .v_proj = &v_proj,
+        .o_proj = &o_proj,
+        .allocator = allocator,
+        .matmul_qkv = cpu_linalg.matmulF32,
+        .matmul_o = cpu_linalg.matmulF32,
+    };
+
+    var cache = try BatchedKVCache.initWithMode(allocator, 1, 1, 2, 16, .f32);
+    defer cache.deinit();
+    var read_cache = try BatchedKVCache.initWithMode(allocator, 1, 1, 2, 16, .f32);
+    defer read_cache.deinit();
+
+    const slot_index = cache.allocSlot() orelse return error.TestUnexpectedResult;
+    const read_slot_index = read_cache.allocSlot() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(slot_index, read_slot_index);
+
+    try read_cache.appendKV(slot_index, &.{ 0.0, 1.0 }, &.{ 1.0, 0.0 });
+    try read_cache.appendKV(slot_index, &.{ 1.0, 0.0 }, &.{ 0.0, 1.0 });
+
+    var input_data = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    var output_data = [_]f32{0.0} ** 4;
+    var input_tensor = Tensor.view3DSlice(&input_data, 2, 2);
+    var output_tensor = Tensor.view3DSlice(&output_data, 2, 2);
+
+    var scratch = AttnTemp{};
+    defer scratch.deinit(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
+    defer matmul_scratch.deinit();
+
+    try mha.forwardWithBatchedCacheReadCache(
+        &input_tensor,
+        &output_tensor,
+        &cache,
+        &read_cache,
+        slot_index,
+        &scratch,
+        &matmul_scratch,
+        false,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), cache.getPosition(slot_index));
+    try std.testing.expectEqual(@as(usize, 2), read_cache.getPosition(slot_index));
+    for (output_data) |value| {
+        try std.testing.expect(!std.math.isNan(value));
+    }
 }
 
 test "MultiHeadAttention.forward RoPE position 0 identity" {
