@@ -16,7 +16,10 @@ use std::ptr;
 #[test]
 fn create_null_backend_returns_null() {
     let handle = unsafe { talu_sys::talu_batch_create(ptr::null_mut(), ptr::null()) };
-    assert!(handle.is_null(), "create with null backend should return null");
+    assert!(
+        handle.is_null(),
+        "create with null backend should return null"
+    );
 }
 
 #[test]
@@ -26,9 +29,7 @@ fn destroy_null_is_noop() {
 
 #[test]
 fn submit_null_handle_returns_zero() {
-    let id = unsafe {
-        talu_sys::talu_batch_submit(ptr::null_mut(), ptr::null_mut(), ptr::null())
-    };
+    let id = unsafe { talu_sys::talu_batch_submit(ptr::null_mut(), ptr::null_mut(), ptr::null()) };
     assert_eq!(id, 0, "submit with null handle should return 0");
 }
 
@@ -36,9 +37,7 @@ fn submit_null_handle_returns_zero() {
 fn submit_null_chat_returns_zero() {
     // We can't easily get a valid batch handle without a model,
     // but null chat should be caught before null handle.
-    let id = unsafe {
-        talu_sys::talu_batch_submit(ptr::null_mut(), ptr::null_mut(), ptr::null())
-    };
+    let id = unsafe { talu_sys::talu_batch_submit(ptr::null_mut(), ptr::null_mut(), ptr::null()) };
     assert_eq!(id, 0, "submit with null chat should return 0");
 }
 
@@ -51,9 +50,8 @@ fn cancel_null_handle_returns_zero() {
 #[test]
 fn step_null_handle_returns_zero() {
     let mut events = [talu_sys::CBatchEvent::default(); 8];
-    let n = unsafe {
-        talu_sys::talu_batch_step(ptr::null_mut(), events.as_mut_ptr(), events.len())
-    };
+    let n =
+        unsafe { talu_sys::talu_batch_step(ptr::null_mut(), events.as_mut_ptr(), events.len()) };
     assert_eq!(n, 0, "step with null handle should return 0");
 }
 
@@ -72,7 +70,10 @@ fn active_count_null_handle_returns_zero() {
 #[test]
 fn take_result_null_handle_returns_null() {
     let r = unsafe { talu_sys::talu_batch_take_result(ptr::null_mut(), 1) };
-    assert!(r.is_null(), "take_result with null handle should return null");
+    assert!(
+        r.is_null(),
+        "take_result with null handle should return null"
+    );
 }
 
 #[test]
@@ -129,11 +130,12 @@ fn create_with_config() {
     let model = common::model_path().unwrap();
     let (canon, backend) = common::local_backend(&model);
 
-    let config = talu_sys::CBatchConfig {
-        max_concurrent: 4,
-    };
+    let config = talu_sys::CBatchConfig { max_concurrent: 4 };
     let handle = unsafe { talu_sys::talu_batch_create(backend, &config) };
-    assert!(!handle.is_null(), "batch creation with config should succeed");
+    assert!(
+        !handle.is_null(),
+        "batch creation with config should succeed"
+    );
 
     unsafe { talu_sys::talu_batch_destroy(handle) };
     unsafe { talu_sys::talu_backend_free(backend) };
@@ -181,11 +183,8 @@ fn submit_and_step_to_completion() {
             // Collect text deltas.
             if event.event_type == 0 && event.text_len > 0 && !event.text_ptr.is_null() {
                 let text = unsafe {
-                    std::str::from_utf8(std::slice::from_raw_parts(
-                        event.text_ptr,
-                        event.text_len,
-                    ))
-                    .unwrap_or("<invalid utf8>")
+                    std::str::from_utf8(std::slice::from_raw_parts(event.text_ptr, event.text_len))
+                        .unwrap_or("<invalid utf8>")
                 };
                 all_text.push_str(text);
             }
@@ -218,7 +217,10 @@ fn submit_and_step_to_completion() {
 
     let result = unsafe { &*result_ptr };
     assert!(result.prompt_tokens > 0, "should report prompt tokens");
-    assert!(result.completion_tokens > 0, "should report completion tokens");
+    assert!(
+        result.completion_tokens > 0,
+        "should report completion tokens"
+    );
     assert!(result.generation_ns > 0, "should report generation time");
 
     // Text should be non-null.

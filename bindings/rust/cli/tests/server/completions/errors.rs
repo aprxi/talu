@@ -55,7 +55,10 @@ fn completions_no_model_uses_default() {
     let resp = post_json(ctx.addr(), "/v1/chat/completions", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
-    assert!(json["model"].is_string(), "response must include model name");
+    assert!(
+        json["model"].is_string(),
+        "response must include model name"
+    );
 }
 
 #[test]
@@ -70,7 +73,14 @@ fn completions_error_shape_matches_openai() {
     );
     let json = resp.json();
     // OpenAI error shape: { "error": { "message": "...", "type": "...", "code": ..., "param": ... } }
-    assert!(json["error"].is_object(), "must have error object: {}", resp.body);
-    assert!(json["error"]["message"].is_string(), "must have error.message");
+    assert!(
+        json["error"].is_object(),
+        "must have error object: {}",
+        resp.body
+    );
+    assert!(
+        json["error"]["message"].is_string(),
+        "must have error.message"
+    );
     assert!(json["error"]["type"].is_string(), "must have error.type");
 }

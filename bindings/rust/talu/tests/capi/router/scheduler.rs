@@ -31,15 +31,13 @@ unsafe fn encode_prompt(model_path: &str, text: &str) -> (Vec<u32>, *mut std::ff
         add_bos: 1,
         ..talu_sys::EncodeOptions::default()
     };
-    let result = talu_sys::talu_tokenizer_encode(
-        tok,
-        text.as_ptr(),
-        text.len(),
-        &opts,
-    );
+    let result = talu_sys::talu_tokenizer_encode(tok, text.as_ptr(), text.len(), &opts);
     assert!(result.error_msg.is_null(), "encode should succeed");
     assert!(result.num_tokens > 0, "encode should produce tokens");
-    assert!(!result.ids.is_null(), "encode ids pointer should be non-null");
+    assert!(
+        !result.ids.is_null(),
+        "encode ids pointer should be non-null"
+    );
 
     let ids = std::slice::from_raw_parts(result.ids, result.num_tokens).to_vec();
     talu_sys::talu_encode_result_free(result);
@@ -53,7 +51,10 @@ unsafe fn encode_prompt(model_path: &str, text: &str) -> (Vec<u32>, *mut std::ff
 #[test]
 fn create_null_backend_returns_null() {
     let handle = unsafe { talu_sys::talu_scheduler_create(ptr::null_mut(), ptr::null()) };
-    assert!(handle.is_null(), "create with null backend should return null");
+    assert!(
+        handle.is_null(),
+        "create with null backend should return null"
+    );
 }
 
 #[test]
@@ -148,7 +149,10 @@ fn create_with_config() {
 
     let config = talu_sys::CSchedulerConfig { max_concurrent: 4 };
     let handle = unsafe { talu_sys::talu_scheduler_create(backend, &config) };
-    assert!(!handle.is_null(), "scheduler creation with config should succeed");
+    assert!(
+        !handle.is_null(),
+        "scheduler creation with config should succeed"
+    );
 
     unsafe { talu_sys::talu_scheduler_destroy(handle) };
     unsafe { talu_sys::talu_backend_free(backend) };
@@ -202,11 +206,12 @@ fn submit_and_step_produces_tokens() {
     let mut saw_final = false;
 
     for _ in 0..(max_tokens + 2) {
-        let n = unsafe {
-            talu_sys::talu_scheduler_step(handle, events.as_mut_ptr(), events.len())
-        };
+        let n = unsafe { talu_sys::talu_scheduler_step(handle, events.as_mut_ptr(), events.len()) };
         for event in &events[..n.min(events.len())] {
-            assert_eq!(event.request_id, request_id, "event should match our request");
+            assert_eq!(
+                event.request_id, request_id,
+                "event should match our request"
+            );
             total_tokens += 1;
             if event.is_final != 0 {
                 saw_final = true;
@@ -269,7 +274,10 @@ fn cancel_nonexistent_request_returns_zero() {
     assert!(!handle.is_null());
 
     let cancelled = unsafe { talu_sys::talu_scheduler_cancel(handle, 99999) };
-    assert_eq!(cancelled, 0, "cancel of nonexistent request should return 0");
+    assert_eq!(
+        cancelled, 0,
+        "cancel of nonexistent request should return 0"
+    );
 
     unsafe { talu_sys::talu_scheduler_destroy(handle) };
     unsafe { talu_sys::talu_backend_free(backend) };
@@ -309,17 +317,14 @@ fn submit_with_sampling_options() {
         ..talu_sys::CSubmitOptions::default()
     };
 
-    let request_id = unsafe {
-        talu_sys::talu_scheduler_submit(handle, prompt.as_ptr(), prompt.len(), 4, &opts)
-    };
+    let request_id =
+        unsafe { talu_sys::talu_scheduler_submit(handle, prompt.as_ptr(), prompt.len(), 4, &opts) };
     assert_ne!(request_id, 0, "submit with sampling options should succeed");
 
     // Run to completion.
     let mut events = [talu_sys::CTokenEvent::default(); 8];
     for _ in 0..6 {
-        let n = unsafe {
-            talu_sys::talu_scheduler_step(handle, events.as_mut_ptr(), events.len())
-        };
+        let n = unsafe { talu_sys::talu_scheduler_step(handle, events.as_mut_ptr(), events.len()) };
         let done = events[..n.min(events.len())]
             .iter()
             .any(|e| e.is_final != 0);

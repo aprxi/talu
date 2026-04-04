@@ -84,6 +84,7 @@ const QuantConfig = struct {
     bits: ?i64 = null,
     quant_method: ?[]const u8 = null, // "mxfp4", etc.
     mode: ?[]const u8 = null, // Alternative to quant_method used by some models
+    quant_contract_version: ?i64 = null,
 };
 
 /// Core JSON config struct for shared text-model fields.
@@ -249,6 +250,7 @@ fn mergeRootQuantizationConfig(config_json: *JsonConfig, root_obj: std.json.Obje
                     .bits = objectIntField(q, "bits"),
                     .quant_method = objectStringField(q, "quant_method"),
                     .mode = objectStringField(q, "mode"),
+                    .quant_contract_version = objectIntField(q, "quant_contract_version"),
                 };
             }
         }
@@ -563,7 +565,16 @@ pub fn loadConfigForArchitectureWithHook(
         if (config_json.quantization_config) |quant_config| {
             if (quant_config.quant_method) |method| {
                 if (std.mem.eql(u8, method, "fp8")) break :blk .fp8;
-                if (std.mem.eql(u8, method, "mxfp8")) break :blk .mxfp8;
+                if (std.mem.eql(u8, method, "mxfp8")) {
+                    const version = quant_config.quant_contract_version orelse return error.UnsupportedModel;
+                    if (version != 1) return error.UnsupportedModel;
+                    break :blk .mxfp8;
+                }
+                if (std.mem.eql(u8, method, "nvfp4")) {
+                    const version = quant_config.quant_contract_version orelse return error.UnsupportedModel;
+                    if (version != 1) return error.UnsupportedModel;
+                    break :blk .gaffine;
+                }
                 if (std.mem.eql(u8, method, "mxfp4")) break :blk .mxfp4;
                 if (std.mem.eql(u8, method, "talu")) break :blk .native;
             }
@@ -1158,6 +1169,101 @@ test "loadConfig reads root quantization when parsing text_config" {
     try std.testing.expectEqual(@as(i32, 8), config.gaffine_bits);
     try std.testing.expectEqual(@as(i32, 64), config.gaffine_group_size);
     try std.testing.expectEqual(false, config.tie_word_embeddings);
+}
+
+test "loadConfig rejects mxfp8 quantization_config without contract version" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "vocab_size": 248320,
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 24,
+        \\  "num_attention_heads": 8,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "intermediate_size": 3584,
+        \\  "max_position_embeddings": 32768,
+        \\  "quantization_config": {
+        \\    "quant_method": "mxfp8",
+        \\    "fmt": "e4m3",
+        \\    "scale_fmt": "e8m0",
+        \\    "block_size": 32
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectError(error.UnsupportedModel, loadConfig(std.testing.allocator, path));
+}
+
+test "loadConfig accepts mxfp8 quantization_config with contract version 1" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "vocab_size": 248320,
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 24,
+        \\  "num_attention_heads": 8,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "intermediate_size": 3584,
+        \\  "max_position_embeddings": 32768,
+        \\  "quantization_config": {
+        \\    "quant_method": "mxfp8",
+        \\    "quant_contract_version": 1,
+        \\    "fmt": "e4m3",
+        \\    "scale_fmt": "e8m0",
+        \\    "block_size": 32
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfig(std.testing.allocator, path);
+    try std.testing.expectEqual(tensor.QuantMethod.mxfp8, config.quant_method);
+}
+
+test "loadConfig rejects nvfp4 quantization_config with unsupported contract version" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "vocab_size": 248320,
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 24,
+        \\  "num_attention_heads": 8,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "intermediate_size": 3584,
+        \\  "max_position_embeddings": 32768,
+        \\  "quantization_config": {
+        \\    "quant_method": "nvfp4",
+        \\    "group_size": 32,
+        \\    "bits": 4,
+        \\    "quant_contract_version": 2
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectError(error.UnsupportedModel, loadConfig(std.testing.allocator, path));
 }
 
 test "initialDff prefers MoE intermediate size when experts are configured" {

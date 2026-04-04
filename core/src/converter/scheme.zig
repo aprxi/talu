@@ -8,7 +8,11 @@ const std = @import("std");
 const grouped_affine = @import("grouped_affine.zig");
 const fp8_converter = @import("fp8.zig");
 const mxfp8_converter = @import("mxfp8.zig");
+const nvfp4_converter = @import("nvfp4.zig");
 const progress_api = @import("../capi/progress.zig");
+const json = @import("../io/json/root.zig");
+const safetensors = @import("../io/safetensors/root.zig");
+const repository = @import("../io/repository/root.zig");
 
 // =============================================================================
 // Scheme Definitions (Single Source of Truth)
@@ -93,6 +97,24 @@ pub const QuantLevel = enum(u32) {
             .q8 => "8bit",
             .q16 => "16bit",
         };
+    }
+};
+
+/// Conversion quality profile used by hardware-float converters.
+pub const QualityProfile = enum(u32) {
+    best,
+    good,
+    balanced,
+    fast,
+    custom,
+
+    pub fn fromString(s: []const u8) ?QualityProfile {
+        if (std.ascii.eqlIgnoreCase(s, "best") or std.ascii.eqlIgnoreCase(s, "quality")) return .best;
+        if (std.ascii.eqlIgnoreCase(s, "good")) return .good;
+        if (std.ascii.eqlIgnoreCase(s, "balanced")) return .balanced;
+        if (std.ascii.eqlIgnoreCase(s, "fast") or std.ascii.eqlIgnoreCase(s, "quick")) return .fast;
+        if (std.ascii.eqlIgnoreCase(s, "custom")) return .custom;
+        return null;
     }
 };
 
@@ -417,6 +439,25 @@ pub const ConvertOptions = extern struct {
     quant: QuantLevel = .q4,
     /// If true, resolve scheme from platform/quant instead of using scheme directly.
     use_platform_quant: bool = false,
+    /// Calibration profile for MXFP8/NVFP4 conversion.
+    calibration_profile: QualityProfile = .best,
+    /// Deterministic calibration seed.
+    calibration_seed: u64 = 42,
+    /// Explicit calibration iteration override.
+    /// Zero means use profile default.
+    calibration_iters: u32 = 0,
+    /// Explicit calibration sample override.
+    /// Zero means use profile default.
+    calibration_nsamples: u32 = 0,
+    /// Explicit calibration sequence length override.
+    /// Zero means use profile default.
+    calibration_seqlen: u32 = 0,
+    /// Explicit calibration batch-size override.
+    /// Zero means use profile default.
+    calibration_batch_size: u32 = 0,
+    /// Explicit calibration block-count override.
+    /// Zero means use profile default.
+    calibration_nblocks: u32 = 0,
     /// Unified progress callback. Receives ProgressUpdate structs for all operations
     /// (download, convert). Binding doesn't need to know what operation is running.
     progress_callback: ?CProgressCallback = null,
@@ -448,6 +489,283 @@ pub const ConvertResult = struct {
 };
 
 pub const InvalidOutputPath = error{InvalidOutputPath};
+pub const supported_quant_contract_version: i64 = 1;
+
+const CalibrationSettings = struct {
+    profile: QualityProfile,
+    iters: u32,
+    nsamples: u32,
+    seqlen: u32,
+    batch_size: u32,
+    nblocks: u32,
+    seed: u64,
+};
+
+fn defaultCalibrationFor(profile: QualityProfile, scheme: Scheme) CalibrationSettings {
+    const effective_profile: QualityProfile = if (profile == .custom) .best else profile;
+    return switch (scheme) {
+        .mxfp8 => switch (effective_profile) {
+            .best => .{ .profile = profile, .iters = 128, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .good => .{ .profile = profile, .iters = 64, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .balanced => .{ .profile = profile, .iters = 32, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .fast => .{ .profile = profile, .iters = 32, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .custom => unreachable,
+        },
+        .nvfp4 => switch (effective_profile) {
+            .best => .{ .profile = profile, .iters = 500, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .good => .{ .profile = profile, .iters = 350, .nsamples = 192, .seqlen = 1536, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            // Balanced is an intentionally lighter clip+search profile.
+            .balanced => .{ .profile = profile, .iters = 16, .nsamples = 128, .seqlen = 1024, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .fast => .{ .profile = profile, .iters = 1, .nsamples = 16, .seqlen = 256, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .custom => unreachable,
+        },
+        .gaf4_32, .gaf4_64, .gaf4_128, .gaf8_32, .gaf8_64, .gaf8_128 => switch (effective_profile) {
+            .best => .{ .profile = profile, .iters = 32, .nsamples = 256, .seqlen = 2048, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .good => .{ .profile = profile, .iters = 16, .nsamples = 128, .seqlen = 1536, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .balanced => .{ .profile = profile, .iters = 8, .nsamples = 64, .seqlen = 1024, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .fast => .{ .profile = profile, .iters = 1, .nsamples = 16, .seqlen = 256, .batch_size = 1, .nblocks = 1, .seed = 42 },
+            .custom => unreachable,
+        },
+        else => .{ .profile = profile, .iters = 1, .nsamples = 16, .seqlen = 256, .batch_size = 1, .nblocks = 1, .seed = 42 },
+    };
+}
+
+fn resolveCalibrationFromOptions(options: ConvertOptions, scheme: Scheme) CalibrationSettings {
+    var settings = defaultCalibrationFor(options.calibration_profile, scheme);
+    settings.seed = options.calibration_seed;
+    if (options.calibration_iters > 0) settings.iters = options.calibration_iters;
+    if (options.calibration_nsamples > 0) settings.nsamples = options.calibration_nsamples;
+    if (options.calibration_seqlen > 0) settings.seqlen = options.calibration_seqlen;
+    if (options.calibration_batch_size > 0) settings.batch_size = options.calibration_batch_size;
+    if (options.calibration_nblocks > 0) settings.nblocks = options.calibration_nblocks;
+    return settings;
+}
+
+fn parseBoolEnv(value: []const u8) ?bool {
+    if (value.len == 0) return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(trimmed, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "on")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(trimmed, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(trimmed, "no")) return false;
+    if (std.ascii.eqlIgnoreCase(trimmed, "off")) return false;
+    return null;
+}
+
+fn envFlagEnabled(name: []const u8) bool {
+    const value = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return false;
+    defer std.heap.page_allocator.free(value);
+    return parseBoolEnv(value) orelse false;
+}
+
+fn isMxfp8CalibrationProbeOnly(calibration: CalibrationSettings) bool {
+    return calibration.profile == .custom and calibration.iters > 0 and envFlagEnabled("TALU_CONVERT_CALIB_PROBE_ONLY");
+}
+
+fn mapJsonParseError(err: anyerror) anyerror {
+    return switch (err) {
+        error.InputTooLarge, error.InputTooDeep, error.StringTooLong, error.InvalidJson => error.InvalidConfig,
+        else => err,
+    };
+}
+
+fn parseConfigAtPath(allocator: std.mem.Allocator, config_path: []const u8) !std.json.Parsed(std.json.Value) {
+    const config_bytes = try std.fs.cwd().readFileAlloc(allocator, config_path, 1024 * 1024);
+    defer allocator.free(config_bytes);
+    return json.parseValue(allocator, config_bytes, .{
+        .max_size_bytes = 1024 * 1024,
+        .max_value_bytes = 1024 * 1024,
+        .max_string_bytes = 256 * 1024,
+    }) catch |err| return mapJsonParseError(err);
+}
+
+fn objectField(obj: std.json.ObjectMap, key: []const u8) ?std.json.Value {
+    return obj.get(key);
+}
+
+fn objectFieldAsObject(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const value = objectField(obj, key) orelse return null;
+    if (value != .object) return null;
+    return value.object;
+}
+
+fn objectFieldAsString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = objectField(obj, key) orelse return null;
+    if (value != .string) return null;
+    return value.string;
+}
+
+fn objectFieldAsInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = objectField(obj, key) orelse return null;
+    return switch (value) {
+        .integer => value.integer,
+        else => null,
+    };
+}
+
+fn resolveOutputWeightsPath(allocator: std.mem.Allocator, output_path: []const u8) ![]u8 {
+    const single_path = try std.fs.path.join(allocator, &.{ output_path, "model.safetensors" });
+    errdefer allocator.free(single_path);
+    if (std.fs.cwd().access(single_path, .{})) |_| return single_path else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    allocator.free(single_path);
+    const index_path = try std.fs.path.join(allocator, &.{ output_path, "model.safetensors.index.json" });
+    errdefer allocator.free(index_path);
+    if (std.fs.cwd().access(index_path, .{})) |_| return index_path else |err| switch (err) {
+        error.FileNotFound => return error.WeightsNotFound,
+        else => return err,
+    }
+}
+
+fn validateMxfp8Config(config_obj: std.json.ObjectMap) !void {
+    const qcfg = objectFieldAsObject(config_obj, "quantization_config") orelse return error.InvalidConfig;
+    if (!std.mem.eql(u8, objectFieldAsString(qcfg, "quant_method") orelse return error.InvalidConfig, "mxfp8")) {
+        return error.InvalidConfig;
+    }
+    if ((objectFieldAsInt(qcfg, "quant_contract_version") orelse return error.InvalidConfig) != supported_quant_contract_version) {
+        return error.InvalidConfig;
+    }
+    if (!std.mem.eql(u8, objectFieldAsString(qcfg, "fmt") orelse return error.InvalidConfig, "e4m3")) {
+        return error.InvalidConfig;
+    }
+    if (!std.mem.eql(u8, objectFieldAsString(qcfg, "scale_fmt") orelse return error.InvalidConfig, "e8m0")) {
+        return error.InvalidConfig;
+    }
+    if ((objectFieldAsInt(qcfg, "block_size") orelse return error.InvalidConfig) != 32) {
+        return error.InvalidConfig;
+    }
+}
+
+fn validateNvfp4Config(config_obj: std.json.ObjectMap) !void {
+    const quant = objectFieldAsObject(config_obj, "quantization") orelse return error.InvalidConfig;
+    if ((objectFieldAsInt(quant, "group_size") orelse return error.InvalidConfig) != 32) return error.InvalidConfig;
+    if ((objectFieldAsInt(quant, "bits") orelse return error.InvalidConfig) != 4) return error.InvalidConfig;
+
+    const qcfg = objectFieldAsObject(config_obj, "quantization_config") orelse return error.InvalidConfig;
+    if (!std.mem.eql(u8, objectFieldAsString(qcfg, "quant_method") orelse return error.InvalidConfig, "nvfp4")) {
+        return error.InvalidConfig;
+    }
+    if ((objectFieldAsInt(qcfg, "quant_contract_version") orelse return error.InvalidConfig) != supported_quant_contract_version) {
+        return error.InvalidConfig;
+    }
+    if ((objectFieldAsInt(qcfg, "group_size") orelse return error.InvalidConfig) != 32) return error.InvalidConfig;
+    if ((objectFieldAsInt(qcfg, "bits") orelse return error.InvalidConfig) != 4) return error.InvalidConfig;
+}
+
+fn validateMxfp8Weights(allocator: std.mem.Allocator, output_path: []const u8) !void {
+    const weights_path = try resolveOutputWeightsPath(allocator, output_path);
+    defer allocator.free(weights_path);
+
+    var st = try safetensors.UnifiedSafeTensors.load(allocator, weights_path);
+    defer st.deinit();
+
+    const names = try st.tensorNames(allocator);
+    defer allocator.free(names);
+
+    var saw_scale = false;
+    for (names) |name| {
+        if (!std.mem.endsWith(u8, name, ".weight_block_scale")) continue;
+        saw_scale = true;
+
+        const scale_tensor = try st.getTensor(name, null);
+        if (scale_tensor.n_dims != 2) return error.InvalidConfig;
+        if (scale_tensor.dtype != .u8 and scale_tensor.dtype != .i8) return error.InvalidConfig;
+
+        const base = name[0 .. name.len - ".weight_block_scale".len];
+        const weight_name = try std.fmt.allocPrint(allocator, "{s}.weight", .{base});
+        defer allocator.free(weight_name);
+        if (!st.hasTensor(weight_name)) return error.InvalidConfig;
+
+        const weight_tensor = try st.getTensor(weight_name, null);
+        if (weight_tensor.dtype != .f8_e4m3) return error.InvalidConfig;
+        if (weight_tensor.n_dims != 2) return error.InvalidConfig;
+
+        const rows: i64 = weight_tensor.shape[0];
+        const cols: i64 = weight_tensor.shape[1];
+        const scale_rows: i64 = scale_tensor.shape[0];
+        const scale_cols: i64 = scale_tensor.shape[1];
+        if (rows <= 0 or cols <= 0) return error.InvalidConfig;
+        if (rows != scale_rows) return error.InvalidConfig;
+        const cols_usize = std.math.cast(usize, cols) orelse return error.InvalidConfig;
+        const expected_scale_cols: i64 = @intCast((cols_usize + 31) / 32);
+        if (scale_cols != expected_scale_cols) return error.InvalidConfig;
+    }
+
+    if (!saw_scale) return error.InvalidConfig;
+}
+
+fn validateNvfp4Weights(allocator: std.mem.Allocator, output_path: []const u8) !void {
+    const weights_path = try resolveOutputWeightsPath(allocator, output_path);
+    defer allocator.free(weights_path);
+
+    var st = try safetensors.UnifiedSafeTensors.load(allocator, weights_path);
+    defer st.deinit();
+
+    const names = try st.tensorNames(allocator);
+    defer allocator.free(names);
+
+    var saw_nvfp4_weight = false;
+    for (names) |name| {
+        const weight_tensor = st.getTensor(name, null) catch continue;
+        if (weight_tensor.dtype != .grouped_affine_u4) continue;
+        saw_nvfp4_weight = true;
+        if (!std.mem.endsWith(u8, name, ".weight")) continue;
+        if (weight_tensor.n_dims != 2) return error.InvalidConfig;
+        if (weight_tensor.shape[0] <= 0 or weight_tensor.shape[1] <= 0) return error.InvalidConfig;
+
+        const base = name[0 .. name.len - ".weight".len];
+        const scales_name = try std.fmt.allocPrint(allocator, "{s}.scales", .{base});
+        defer allocator.free(scales_name);
+        const biases_name = try std.fmt.allocPrint(allocator, "{s}.biases", .{base});
+        defer allocator.free(biases_name);
+        if (!st.hasTensor(scales_name) or !st.hasTensor(biases_name)) return error.InvalidConfig;
+
+        const scales = try st.getTensor(scales_name, null);
+        const biases = try st.getTensor(biases_name, null);
+        if (scales.n_dims != 2 or biases.n_dims != 2) return error.InvalidConfig;
+        if ((scales.dtype != .bf16 and scales.dtype != .f16) or (biases.dtype != .bf16 and biases.dtype != .f16)) {
+            return error.InvalidConfig;
+        }
+        if (scales.shape[0] != weight_tensor.shape[0] or biases.shape[0] != weight_tensor.shape[0]) return error.InvalidConfig;
+
+        const packed_cols: i64 = weight_tensor.shape[1];
+        if (@mod(packed_cols, 4) != 0) return error.InvalidConfig;
+        const expected_group_cols: i64 = @divTrunc(packed_cols, 4);
+        if (scales.shape[1] != expected_group_cols or biases.shape[1] != expected_group_cols) return error.InvalidConfig;
+    }
+
+    if (!saw_nvfp4_weight) return error.InvalidConfig;
+}
+
+fn validateCanonicalOutput(allocator: std.mem.Allocator, output_path: []const u8, scheme: Scheme) !void {
+    if (scheme != .mxfp8 and scheme != .nvfp4) return;
+
+    const config_path = try std.fs.path.join(allocator, &.{ output_path, "config.json" });
+    defer allocator.free(config_path);
+    var parsed = try parseConfigAtPath(allocator, config_path);
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidConfig;
+    const config_obj = parsed.value.object;
+
+    switch (scheme) {
+        .mxfp8 => {
+            try validateMxfp8Config(config_obj);
+            try validateMxfp8Weights(allocator, output_path);
+        },
+        .nvfp4 => {
+            try validateNvfp4Config(config_obj);
+            try validateNvfp4Weights(allocator, output_path);
+        },
+        else => unreachable,
+    }
+}
 
 /// Dry run estimation result.
 pub const DryRunEstimate = struct {
@@ -474,9 +792,6 @@ pub const DryRunEstimate = struct {
 // =============================================================================
 // Dry Run Estimation
 // =============================================================================
-
-const safetensors = @import("../io/safetensors/root.zig");
-const repository = @import("../io/repository/root.zig");
 
 /// Estimate conversion without writing files.
 /// Returns JSON string with estimation results.
@@ -546,13 +861,14 @@ pub fn convert(
 ) ConvertResult {
     // Resolve effective scheme (from platform/quant or explicit)
     const scheme = options.getEffectiveScheme();
+    const calibration = resolveCalibrationFromOptions(options, scheme);
 
     // Handle dry run mode
     if (options.dry_run) {
-        const json = estimateDryRun(allocator, model_path, scheme, options) catch |err| {
+        const estimate_json = estimateDryRun(allocator, model_path, scheme, options) catch |err| {
             return .{ .err = err };
         };
-        return .{ .output_path = json };
+        return .{ .output_path = estimate_json };
     }
 
     const destination: ?[]const u8 = if (options.destination) |d| std.mem.span(d) else null;
@@ -574,6 +890,13 @@ pub fn convert(
                 .force = options.force,
                 .max_shard_size = options.max_shard_size,
                 .progress = options.progressContext(),
+                .profile = calibration.profile,
+                .calib_iters = calibration.iters,
+                .calib_nsamples = calibration.nsamples,
+                .calib_seqlen = calibration.seqlen,
+                .calib_batch_size = calibration.batch_size,
+                .calib_nblocks = calibration.nblocks,
+                .calib_seed = calibration.seed,
             }) catch |err| {
                 return .{ .err = err };
             };
@@ -613,6 +936,7 @@ pub fn convert(
             return .{ .output_path = output_path };
         },
         .mxfp8 => {
+            const probe_only = isMxfp8CalibrationProbeOnly(calibration);
             const output_path = mxfp8_converter.convertToMxfp8(allocator, model_path, .{
                 .output_dir = output_dir,
                 .destination = destination,
@@ -620,9 +944,23 @@ pub fn convert(
                 .force = options.force,
                 .max_shard_size = options.max_shard_size,
                 .progress = options.progressContext(),
+                .profile = calibration.profile,
+                .calib_iters = calibration.iters,
+                .calib_nsamples = calibration.nsamples,
+                .calib_seqlen = calibration.seqlen,
+                .calib_batch_size = calibration.batch_size,
+                .calib_nblocks = calibration.nblocks,
+                .calib_seed = calibration.seed,
             }) catch |err| {
                 return .{ .err = err };
             };
+
+            if (!probe_only) {
+                validateCanonicalOutput(allocator, output_path, .mxfp8) catch |err| {
+                    allocator.free(output_path);
+                    return .{ .err = err };
+                };
+            }
 
             if (options.return_model_id) {
                 const model_id = mxfp8_converter.modelIdFromOutputPath(allocator, output_path) catch {
@@ -635,7 +973,46 @@ pub fn convert(
 
             return .{ .output_path = output_path };
         },
-        .mxfp4, .nvfp4 => {
+        .nvfp4 => {
+            if (options.num_overrides > 0) {
+                return .{ .err = error.InvalidArgument };
+            }
+
+            const output_path = nvfp4_converter.convertToNvfp4(allocator, model_path, .{
+                .output_dir = output_dir,
+                .destination = destination,
+                .output_suffix = scheme.toOutputSuffix(),
+                .force = options.force,
+                .max_shard_size = options.max_shard_size,
+                .progress = options.progressContext(),
+                .profile = calibration.profile,
+                .calib_iters = calibration.iters,
+                .calib_nsamples = calibration.nsamples,
+                .calib_seqlen = calibration.seqlen,
+                .calib_batch_size = calibration.batch_size,
+                .calib_nblocks = calibration.nblocks,
+                .calib_seed = calibration.seed,
+            }) catch |err| {
+                return .{ .err = err };
+            };
+
+            validateCanonicalOutput(allocator, output_path, .nvfp4) catch |err| {
+                allocator.free(output_path);
+                return .{ .err = err };
+            };
+
+            if (options.return_model_id) {
+                const model_id = nvfp4_converter.modelIdFromOutputPath(allocator, output_path) catch {
+                    allocator.free(output_path);
+                    return .{ .err = error.InvalidOutputPath };
+                };
+                allocator.free(output_path);
+                return .{ .output_path = model_id };
+            }
+
+            return .{ .output_path = output_path };
+        },
+        .mxfp4 => {
             return .{ .err = error.UnsupportedFormat };
         },
     }
@@ -692,12 +1069,12 @@ test "Scheme.toString" {
 }
 
 test "Scheme.all_schemes_json" {
-    const json = Scheme.all_schemes_json;
+    const scheme_json = Scheme.all_schemes_json;
     // Check it's valid JSON structure
-    try std.testing.expect(json[0] == '{');
-    try std.testing.expect(json[json.len - 1] == '}');
+    try std.testing.expect(scheme_json[0] == '{');
+    try std.testing.expect(scheme_json[scheme_json.len - 1] == '}');
     // Check it contains expected schemes and aliases
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"gaf4_64\":[\"mlx\",\"mlx4\",\"gaf4\",\"4bit\",\"q4\",\"int4\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scheme_json, "\"gaf4_64\":[\"mlx\",\"mlx4\",\"gaf4\",\"4bit\",\"q4\",\"int4\"]") != null);
 }
 
 test "Scheme.all_schemes_string" {
@@ -759,6 +1136,222 @@ test "QuantLevel.toString" {
     try std.testing.expectEqualStrings("4bit", QuantLevel.q4.toString());
     try std.testing.expectEqualStrings("8bit", QuantLevel.q8.toString());
     try std.testing.expectEqualStrings("16bit", QuantLevel.q16.toString());
+}
+
+test "QualityProfile.fromString" {
+    try std.testing.expectEqual(QualityProfile.best, QualityProfile.fromString("best").?);
+    try std.testing.expectEqual(QualityProfile.best, QualityProfile.fromString("QUALITY").?);
+    try std.testing.expectEqual(QualityProfile.good, QualityProfile.fromString("good").?);
+    try std.testing.expectEqual(QualityProfile.balanced, QualityProfile.fromString("balanced").?);
+    try std.testing.expectEqual(QualityProfile.fast, QualityProfile.fromString("fast").?);
+    try std.testing.expectEqual(QualityProfile.fast, QualityProfile.fromString("quick").?);
+    try std.testing.expectEqual(QualityProfile.custom, QualityProfile.fromString("custom").?);
+    try std.testing.expect(QualityProfile.fromString("invalid") == null);
+}
+
+test "defaultCalibrationFor mxfp8 profiles" {
+    const best = defaultCalibrationFor(.best, .mxfp8);
+    try std.testing.expectEqual(@as(u32, 128), best.iters);
+    try std.testing.expectEqual(@as(u32, 256), best.nsamples);
+    try std.testing.expectEqual(@as(u32, 2048), best.seqlen);
+    try std.testing.expectEqual(@as(u32, 1), best.batch_size);
+    try std.testing.expectEqual(@as(u32, 1), best.nblocks);
+
+    const good = defaultCalibrationFor(.good, .mxfp8);
+    try std.testing.expectEqual(@as(u32, 64), good.iters);
+    try std.testing.expectEqual(@as(u32, 256), good.nsamples);
+    try std.testing.expectEqual(@as(u32, 2048), good.seqlen);
+
+    const balanced = defaultCalibrationFor(.balanced, .mxfp8);
+    try std.testing.expectEqual(@as(u32, 32), balanced.iters);
+    try std.testing.expectEqual(@as(u32, 256), balanced.nsamples);
+    try std.testing.expectEqual(@as(u32, 2048), balanced.seqlen);
+
+    const fast = defaultCalibrationFor(.fast, .mxfp8);
+    try std.testing.expectEqual(@as(u32, 32), fast.iters);
+    try std.testing.expectEqual(@as(u32, 256), fast.nsamples);
+    try std.testing.expectEqual(@as(u32, 2048), fast.seqlen);
+}
+
+test "defaultCalibrationFor nvfp4 profiles" {
+    const best = defaultCalibrationFor(.best, .nvfp4);
+    try std.testing.expectEqual(@as(u32, 500), best.iters);
+    try std.testing.expectEqual(@as(u32, 256), best.nsamples);
+    try std.testing.expectEqual(@as(u32, 2048), best.seqlen);
+    try std.testing.expectEqual(@as(u32, 1), best.batch_size);
+    try std.testing.expectEqual(@as(u32, 1), best.nblocks);
+
+    const good = defaultCalibrationFor(.good, .nvfp4);
+    try std.testing.expectEqual(@as(u32, 350), good.iters);
+    try std.testing.expectEqual(@as(u32, 192), good.nsamples);
+    try std.testing.expectEqual(@as(u32, 1536), good.seqlen);
+
+    const balanced = defaultCalibrationFor(.balanced, .nvfp4);
+    try std.testing.expectEqual(@as(u32, 16), balanced.iters);
+    try std.testing.expectEqual(@as(u32, 128), balanced.nsamples);
+    try std.testing.expectEqual(@as(u32, 1024), balanced.seqlen);
+
+    const fast = defaultCalibrationFor(.fast, .nvfp4);
+    try std.testing.expectEqual(@as(u32, 1), fast.iters);
+    try std.testing.expectEqual(@as(u32, 16), fast.nsamples);
+    try std.testing.expectEqual(@as(u32, 256), fast.seqlen);
+}
+
+test "defaultCalibrationFor grouped-affine profiles" {
+    const best = defaultCalibrationFor(.best, .gaf8_64);
+    try std.testing.expectEqual(@as(u32, 32), best.iters);
+    try std.testing.expectEqual(@as(u32, 256), best.nsamples);
+    try std.testing.expectEqual(@as(u32, 2048), best.seqlen);
+
+    const good = defaultCalibrationFor(.good, .gaf8_64);
+    try std.testing.expectEqual(@as(u32, 16), good.iters);
+    try std.testing.expectEqual(@as(u32, 128), good.nsamples);
+    try std.testing.expectEqual(@as(u32, 1536), good.seqlen);
+
+    const balanced = defaultCalibrationFor(.balanced, .gaf8_64);
+    try std.testing.expectEqual(@as(u32, 8), balanced.iters);
+    try std.testing.expectEqual(@as(u32, 64), balanced.nsamples);
+    try std.testing.expectEqual(@as(u32, 1024), balanced.seqlen);
+
+    const fast = defaultCalibrationFor(.fast, .gaf8_64);
+    try std.testing.expectEqual(@as(u32, 1), fast.iters);
+    try std.testing.expectEqual(@as(u32, 16), fast.nsamples);
+    try std.testing.expectEqual(@as(u32, 256), fast.seqlen);
+}
+
+test "defaultCalibrationFor custom uses best defaults" {
+    const mxfp8_custom = defaultCalibrationFor(.custom, .mxfp8);
+    try std.testing.expectEqual(QualityProfile.custom, mxfp8_custom.profile);
+    try std.testing.expectEqual(@as(u32, 128), mxfp8_custom.iters);
+    try std.testing.expectEqual(@as(u32, 256), mxfp8_custom.nsamples);
+    try std.testing.expectEqual(@as(u32, 2048), mxfp8_custom.seqlen);
+
+    const nvfp4_custom = defaultCalibrationFor(.custom, .nvfp4);
+    try std.testing.expectEqual(QualityProfile.custom, nvfp4_custom.profile);
+    try std.testing.expectEqual(@as(u32, 500), nvfp4_custom.iters);
+    try std.testing.expectEqual(@as(u32, 256), nvfp4_custom.nsamples);
+    try std.testing.expectEqual(@as(u32, 2048), nvfp4_custom.seqlen);
+}
+
+test "resolveCalibrationFromOptions uses profile defaults and seed" {
+    const options = ConvertOptions{
+        .scheme = .mxfp8,
+        .calibration_profile = .good,
+        .calibration_seed = 1234,
+    };
+    const resolved = resolveCalibrationFromOptions(options, .mxfp8);
+    try std.testing.expectEqual(QualityProfile.good, resolved.profile);
+    try std.testing.expectEqual(@as(u32, 64), resolved.iters);
+    try std.testing.expectEqual(@as(u32, 256), resolved.nsamples);
+    try std.testing.expectEqual(@as(u32, 2048), resolved.seqlen);
+    try std.testing.expectEqual(@as(u64, 1234), resolved.seed);
+}
+
+test "resolveCalibrationFromOptions honors explicit overrides" {
+    const options = ConvertOptions{
+        .scheme = .nvfp4,
+        .calibration_profile = .custom,
+        .calibration_seed = 9876,
+        .calibration_iters = 12,
+        .calibration_nsamples = 34,
+        .calibration_seqlen = 56,
+        .calibration_batch_size = 2,
+        .calibration_nblocks = 3,
+    };
+    const resolved = resolveCalibrationFromOptions(options, .nvfp4);
+    try std.testing.expectEqual(QualityProfile.custom, resolved.profile);
+    try std.testing.expectEqual(@as(u32, 12), resolved.iters);
+    try std.testing.expectEqual(@as(u32, 34), resolved.nsamples);
+    try std.testing.expectEqual(@as(u32, 56), resolved.seqlen);
+    try std.testing.expectEqual(@as(u32, 2), resolved.batch_size);
+    try std.testing.expectEqual(@as(u32, 3), resolved.nblocks);
+    try std.testing.expectEqual(@as(u64, 9876), resolved.seed);
+}
+
+test "rewriteNvfp4Config writes canonical quant contract fields" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+    defer allocator.free(config_path);
+    {
+        var file = try std.fs.cwd().createFile(config_path, .{});
+        defer file.close();
+        try file.writeAll("{\"model_type\":\"qwen\",\"hidden_size\":1024,\"quantization\":{\"group_size\":64,\"bits\":4}}");
+    }
+
+    try nvfp4_converter.rewriteConfigToCanonical(allocator, dir_path);
+
+    var parsed = try parseConfigAtPath(allocator, config_path);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const obj = parsed.value.object;
+    const quant = objectFieldAsObject(obj, "quantization").?;
+    try std.testing.expectEqual(@as(i64, 32), objectFieldAsInt(quant, "group_size").?);
+    try std.testing.expectEqual(@as(i64, 4), objectFieldAsInt(quant, "bits").?);
+
+    const qcfg = objectFieldAsObject(obj, "quantization_config").?;
+    try std.testing.expectEqualStrings("nvfp4", objectFieldAsString(qcfg, "quant_method").?);
+    try std.testing.expectEqual(@as(i64, supported_quant_contract_version), objectFieldAsInt(qcfg, "quant_contract_version").?);
+}
+
+test "validateCanonicalOutput accepts canonical mxfp8 artifact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+    defer allocator.free(config_path);
+    {
+        var file = try std.fs.cwd().createFile(config_path, .{});
+        defer file.close();
+        try file.writeAll("{\"quantization_config\":{\"quant_method\":\"mxfp8\",\"quant_type\":\"mxfp8\",\"fmt\":\"e4m3\",\"scale_fmt\":\"e8m0\",\"block_size\":32,\"quant_contract_version\":1}}");
+    }
+
+    var builder = safetensors.Builder.init(allocator);
+    defer builder.deinit();
+    var weight: [32]u8 = [_]u8{1} ** 32;
+    var scale: [1]u8 = [_]u8{127};
+    try builder.addTensor("layer.weight", .f8_e4m3, &[_]usize{ 1, 32 }, &weight);
+    try builder.addTensor("layer.weight_block_scale", .u8, &[_]usize{ 1, 1 }, &scale);
+    try builder.save(dir_path, "model.safetensors");
+
+    try validateCanonicalOutput(allocator, dir_path, .mxfp8);
+}
+
+test "validateCanonicalOutput accepts canonical nvfp4 artifact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+    defer allocator.free(config_path);
+    {
+        var file = try std.fs.cwd().createFile(config_path, .{});
+        defer file.close();
+        try file.writeAll("{\"quantization\":{\"group_size\":32,\"bits\":4},\"quantization_config\":{\"quant_method\":\"nvfp4\",\"quant_type\":\"nvfp4\",\"bits\":4,\"group_size\":32,\"quant_contract_version\":1}}");
+    }
+
+    var builder = safetensors.Builder.init(allocator);
+    defer builder.deinit();
+    var qweight: [16]u8 = [_]u8{0} ** 16;
+    var scales: [2]u8 = .{ 0x00, 0x3C };
+    var biases: [2]u8 = .{ 0x00, 0x00 };
+    try builder.addTensor("layer.weight", .grouped_affine_u4, &[_]usize{ 1, 4 }, &qweight);
+    try builder.addTensor("layer.scales", .bf16, &[_]usize{ 1, 1 }, &scales);
+    try builder.addTensor("layer.biases", .bf16, &[_]usize{ 1, 1 }, &biases);
+    try builder.save(dir_path, "model.safetensors");
+
+    try validateCanonicalOutput(allocator, dir_path, .nvfp4);
 }
 
 test "Scheme.resolve - all platforms use GAF" {

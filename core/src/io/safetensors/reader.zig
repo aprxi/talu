@@ -248,7 +248,7 @@ pub const SafeTensors = struct {
 /// NOTE: U8 is mapped to .i8 because SafeTensors uses unsigned, but our
 /// tensor ops treat int8 indices uniformly. U32/I32 are mapped to .grouped_affine_u4
 /// because quantized models store packed 4-bit weights as U32 (MLX/GAF) or I32
-/// (GPTQ/AutoRound) with separate scales tensors. The actual bit-width (4 or 8)
+/// (GPTQ-style) with separate scales tensors. The actual bit-width (4 or 8)
 /// is auto-detected at load time in orientWeight() based on scales shape.
 fn parseDType(value: std.json.Value) ?DType {
     if (value != .string) return null;

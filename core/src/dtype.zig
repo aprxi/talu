@@ -168,7 +168,7 @@ pub const Mxfp8Meta = struct {
     scale_cols: u32 = 0,
 };
 
-/// NVFP4 packed metadata (AutoRound compressed-tensors).
+/// NVFP4 packed metadata (compressed-tensors).
 /// Weight payload stores 2 FP4 E2M1 values per byte; per-group scales are FP8 E4M3.
 pub const Nvfp4Meta = struct {
     /// FP8 E4M3 per-group scales [rows × scale_cols]

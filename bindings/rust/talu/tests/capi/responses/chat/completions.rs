@@ -84,7 +84,11 @@ fn empty_content_string_preserved() {
     assert_eq!(items.len(), 1);
     assert_eq!(item_role(&items[0]), "assistant");
     let text = item_text(&items[0]);
-    assert!(text.is_empty(), "empty content should stay empty, got: {:?}", text);
+    assert!(
+        text.is_empty(),
+        "empty content should stay empty, got: {:?}",
+        text
+    );
 }
 
 /// Large payload (>4KB) catches buffer sizing bugs at the ABI boundary.
@@ -98,7 +102,10 @@ fn large_content_preserved() {
     let items = read_items(&chat);
     let text = item_text(&items[0]);
     assert_eq!(text.len(), 8192, "8KB content must survive intact");
-    assert!(text.chars().all(|c| c == 'A'), "content must not be corrupted");
+    assert!(
+        text.chars().all(|c| c == 'A'),
+        "content must not be corrupted"
+    );
 }
 
 // =============================================================================
@@ -162,8 +169,14 @@ fn multi_turn_conversation() {
     let mut messages = Vec::new();
     messages.push(r#"{"role":"system","content":"You are a calculator."}"#.to_string());
     for i in 0..10 {
-        messages.push(format!(r#"{{"role":"user","content":"Turn {} question"}}"#, i));
-        messages.push(format!(r#"{{"role":"assistant","content":"Turn {} answer"}}"#, i));
+        messages.push(format!(
+            r#"{{"role":"user","content":"Turn {} question"}}"#,
+            i
+        ));
+        messages.push(format!(
+            r#"{{"role":"assistant","content":"Turn {} answer"}}"#,
+            i
+        ));
     }
     let json = format!("[{}]", messages.join(","));
 
@@ -192,7 +205,8 @@ fn load_clears_prior_state() {
     chat.append_user_message("old message").unwrap();
     assert_eq!(unsafe { talu_sys::talu_chat_len(chat.as_ptr()) }, 2);
 
-    chat.load_completions_json(r#"[{"role":"user","content":"new"}]"#).unwrap();
+    chat.load_completions_json(r#"[{"role":"user","content":"new"}]"#)
+        .unwrap();
 
     let items = read_items(&chat);
     assert_eq!(items.len(), 1, "load must replace, not append");
@@ -204,12 +218,16 @@ fn load_clears_prior_state() {
 fn consecutive_loads_replace() {
     let chat = ChatHandle::new(None).unwrap();
 
-    chat.load_completions_json(r#"[{"role":"user","content":"first"}]"#).unwrap();
+    chat.load_completions_json(r#"[{"role":"user","content":"first"}]"#)
+        .unwrap();
     let items1 = read_items(&chat);
     assert_eq!(items1.len(), 1);
     assert_item(&items1[0], "user", "first");
 
-    chat.load_completions_json(r#"[{"role":"system","content":"second"},{"role":"user","content":"third"}]"#).unwrap();
+    chat.load_completions_json(
+        r#"[{"role":"system","content":"second"},{"role":"user","content":"third"}]"#,
+    )
+    .unwrap();
     let items2 = read_items(&chat);
     assert_eq!(items2.len(), 2);
     assert_item(&items2[0], "system", "second");
@@ -239,19 +257,25 @@ fn invalid_json_returns_error() {
 #[test]
 fn not_an_array_returns_error() {
     let chat = ChatHandle::new(None).unwrap();
-    assert!(chat.load_completions_json(r#"{"role":"user","content":"hi"}"#).is_err());
+    assert!(chat
+        .load_completions_json(r#"{"role":"user","content":"hi"}"#)
+        .is_err());
 }
 
 #[test]
 fn missing_role_returns_error() {
     let chat = ChatHandle::new(None).unwrap();
-    assert!(chat.load_completions_json(r#"[{"content":"no role"}]"#).is_err());
+    assert!(chat
+        .load_completions_json(r#"[{"content":"no role"}]"#)
+        .is_err());
 }
 
 #[test]
 fn invalid_role_returns_error() {
     let chat = ChatHandle::new(None).unwrap();
-    assert!(chat.load_completions_json(r#"[{"role":"bogus","content":"hi"}]"#).is_err());
+    assert!(chat
+        .load_completions_json(r#"[{"role":"bogus","content":"hi"}]"#)
+        .is_err());
 }
 
 /// A failed load clears the original conversation (clear happens before
@@ -281,7 +305,10 @@ fn failed_load_clears_original_leaves_partial() {
 #[test]
 fn completions_mode_default_off() {
     let cfg = talu_sys::CGenerateConfig::default();
-    assert_eq!(cfg.completions_mode, 0, "completions_mode must default to off");
+    assert_eq!(
+        cfg.completions_mode, 0,
+        "completions_mode must default to off"
+    );
 }
 
 /// Verify completions_mode and neighboring fields don't alias each other.
@@ -292,12 +319,18 @@ fn completions_mode_does_not_alias_neighbors() {
     let mut cfg = talu_sys::CGenerateConfig::default();
 
     cfg.completions_mode = 1;
-    assert_eq!(cfg.raw_output, 0, "raw_output must stay 0 when completions_mode set");
+    assert_eq!(
+        cfg.raw_output, 0,
+        "raw_output must stay 0 when completions_mode set"
+    );
     assert_eq!(cfg.completions_mode, 1);
 
     cfg.completions_mode = 0;
     cfg.raw_output = 1;
-    assert_eq!(cfg.completions_mode, 0, "completions_mode must stay 0 when raw_output set");
+    assert_eq!(
+        cfg.completions_mode, 0,
+        "completions_mode must stay 0 when raw_output set"
+    );
     assert_eq!(cfg.raw_output, 1);
 }
 
@@ -329,12 +362,11 @@ fn item_text(item: &serde_json::Value) -> String {
         None => return String::new(),
     };
     match content {
-        serde_json::Value::Array(parts) => {
-            parts.iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("")
-        }
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
         serde_json::Value::String(s) => s.clone(),
         _ => String::new(),
     }
@@ -342,11 +374,16 @@ fn item_text(item: &serde_json::Value) -> String {
 
 fn assert_item(item: &serde_json::Value, expected_role: &str, expected_text: &str) {
     assert_eq!(
-        item_role(item), expected_role,
-        "role mismatch in item: {:?}", item
+        item_role(item),
+        expected_role,
+        "role mismatch in item: {:?}",
+        item
     );
     assert_eq!(
-        item_text(item), expected_text,
-        "text mismatch for role '{}' in item: {:?}", expected_role, item
+        item_text(item),
+        expected_text,
+        "text mismatch for role '{}' in item: {:?}",
+        expected_role,
+        item
     );
 }

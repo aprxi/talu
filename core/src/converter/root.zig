@@ -19,6 +19,7 @@ pub const mapping = @import("mapping.zig");
 pub const grouped_affine = @import("grouped_affine.zig");
 pub const fp8 = @import("fp8.zig");
 pub const mxfp8 = @import("mxfp8.zig");
+pub const nvfp4 = @import("nvfp4.zig");
 pub const gaf_paths = @import("gaf_paths.zig");
 pub const scheme = @import("scheme.zig");
 pub const model_card = @import("model_card.zig");
@@ -578,6 +579,12 @@ fn getTensorOrderKey(name: []const u8) u32 {
     // token_embd first (order 0)
     if (std.mem.indexOf(u8, name, "embed_tokens") != null) return 0;
 
+    // Prefer direct "layers.<n>." parsing to keep numeric layer ordering
+    // stable across model-specific naming prefixes (e.g. language_model.layers).
+    if (extractLayerIndex(name)) |layer| {
+        return 1000 + layer;
+    }
+
     // Block tensors (order 1000 + layer_num)
     const info = mapping.parseHfName(name);
     if (info.layer) |layer| {
@@ -592,6 +599,28 @@ fn getTensorOrderKey(name: []const u8) u32 {
 
     // Unknown - put at end
     return 200000;
+}
+
+fn extractLayerIndex(name: []const u8) ?u32 {
+    const marker = "layers.";
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, name, search_start, marker)) |pos| {
+        const digits_start = pos + marker.len;
+        if (digits_start >= name.len or !std.ascii.isDigit(name[digits_start])) {
+            search_start = pos + 1;
+            continue;
+        }
+
+        var digits_end = digits_start;
+        while (digits_end < name.len and std.ascii.isDigit(name[digits_end])) : (digits_end += 1) {}
+        if (digits_end >= name.len or name[digits_end] != '.') {
+            search_start = pos + 1;
+            continue;
+        }
+
+        return std.fmt.parseInt(u32, name[digits_start..digits_end], 10) catch null;
+    }
+    return null;
 }
 
 /// Sort tensor names for consistent output ordering.
@@ -681,6 +710,10 @@ test "compareTensorNames ordering" {
     try std.testing.expect(compareTensorNames("model.embed_tokens.weight", "model.layers.0.attn.weight"));
     // Lower layers before higher layers
     try std.testing.expect(compareTensorNames("model.layers.0.attn.weight", "model.layers.1.attn.weight"));
+    try std.testing.expect(compareTensorNames(
+        "model.language_model.layers.2.self_attn.q_proj.weight",
+        "model.language_model.layers.10.self_attn.q_proj.weight",
+    ));
     // Layers before final norm
     try std.testing.expect(compareTensorNames("model.layers.5.attn.weight", "model.norm.weight"));
     // Final norm before lm_head

@@ -265,8 +265,7 @@ fn xray_generate_config_with_overrides(
 
     Ok(talu::router::GenerateConfig {
         max_tokens: effective.max_tokens,
-        temperature: if contract_override
-            .is_some_and(|c| c.sampler.eq_ignore_ascii_case("greedy"))
+        temperature: if contract_override.is_some_and(|c| c.sampler.eq_ignore_ascii_case("greedy"))
         {
             0.0
         } else {
@@ -355,7 +354,11 @@ fn display_tensor_contract_token_label(token: u32, inferred_prefill_token: u32) 
 }
 
 fn effective_xray_tokens(tokens: u32) -> u32 {
-    if tokens == 0 { 1 } else { tokens }
+    if tokens == 0 {
+        1
+    } else {
+        tokens
+    }
 }
 
 fn effective_tensor_bundle_tokens(tokens: u32) -> u32 {
@@ -556,12 +559,18 @@ fn compare_full_token_transcripts(
     )?;
 
     let source_text = load_reference_visible_text(source_json_path).unwrap_or_else(|_| {
-        decode_token_sequence_for_report(model, &source_tokens[..source_tokens.len().min(max_tokens)])
-            .unwrap_or_else(|| "<failed to decode cpu transcript>".to_string())
+        decode_token_sequence_for_report(
+            model,
+            &source_tokens[..source_tokens.len().min(max_tokens)],
+        )
+        .unwrap_or_else(|| "<failed to decode cpu transcript>".to_string())
     });
     let target_text = load_reference_visible_text(target_json_path).unwrap_or_else(|_| {
-        decode_token_sequence_for_report(model, &target_tokens[..target_tokens.len().min(max_tokens)])
-            .unwrap_or_else(|| "<failed to decode metal transcript>".to_string())
+        decode_token_sequence_for_report(
+            model,
+            &target_tokens[..target_tokens.len().min(max_tokens)],
+        )
+        .unwrap_or_else(|| "<failed to decode metal transcript>".to_string())
     });
     compare_token_sequences(
         model,
@@ -1855,19 +1864,16 @@ fn record_reference_bundle(
             overrides.map(|o| o.seed).unwrap_or(args.seed),
             overrides.map(|o| &o.contract),
         )?;
-        let recorder =
-            ReferenceRecorderHandle::new(
-                &resolved_model,
-                overrides.map(|o| o.seed).unwrap_or(args.seed),
-                cfg.temperature,
-                max_tokens,
-            )?;
+        let recorder = ReferenceRecorderHandle::new(
+            &resolved_model,
+            overrides.map(|o| o.seed).unwrap_or(args.seed),
+            cfg.temperature,
+            max_tokens,
+        )?;
         let verify_cap = VerifyCaptureHandle::new_recording(&recorder)?;
         let backend = create_backend_for_model(&resolved_model, None)?;
         let mut cfg = cfg;
-        let chat = if overrides
-            .is_some_and(|o| o.contract.use_raw_prompt)
-        {
+        let chat = if overrides.is_some_and(|o| o.contract.use_raw_prompt) {
             cfg.template_override = Some("{{ messages[-1].content }}".to_string());
             ChatHandle::new(None)?
         } else {
@@ -3105,7 +3111,8 @@ fn cmd_xray_verify_default(
         VerifyCliMode::Tokens => {
             println!(
                 "Verifying model {} token parity ({} -> {})",
-                model, display_verify_source(&backend_pair.source),
+                model,
+                display_verify_source(&backend_pair.source),
                 backend_pair.target
             );
             println!("  Rel tolerance: {}", args.rel_tolerance);
@@ -3207,49 +3214,47 @@ fn cmd_xray_verify_default(
                 backend_pair,
             )
         }
-        VerifyCliMode::Tensors => {
-            match &backend_pair.source {
-                VerifySource::Backend(_) => {
-                    let target_path = default_dev_reference_path(
-                        model,
-                        args,
-                        &backend_pair.target,
-                        ReferenceCaptureMode::Full,
-                    )?;
-                    run_tensor_bundle_diff(
-                        model,
-                        args,
-                        backend_pair,
-                        source_path
-                            .as_ref()
-                            .ok_or_else(|| anyhow!("missing source reference path"))?,
-                        &target_path,
-                    )
-                }
-                VerifySource::ExternalNpz(source_npz) => {
-                    let overrides = load_reference_record_overrides(source_npz)?;
-                    let target_path = ensure_reference_bundle_with_overrides(
-                        model,
-                        args,
-                        &backend_pair.target,
-                        ReferenceCaptureMode::Full,
-                        Some(&overrides),
-                    )?;
-                    println!("Using source NPZ: {}", source_npz.display());
-                    println!(
-                        "Using target cache bundle: {}",
-                        reference_sidecar_path(&target_path).display()
-                    );
-                    run_tensor_bundle_diff_external_source(
-                        model,
-                        args,
-                        source_npz,
-                        &target_path,
-                        &backend_pair.target,
-                    )
-                }
+        VerifyCliMode::Tensors => match &backend_pair.source {
+            VerifySource::Backend(_) => {
+                let target_path = default_dev_reference_path(
+                    model,
+                    args,
+                    &backend_pair.target,
+                    ReferenceCaptureMode::Full,
+                )?;
+                run_tensor_bundle_diff(
+                    model,
+                    args,
+                    backend_pair,
+                    source_path
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("missing source reference path"))?,
+                    &target_path,
+                )
             }
-        }
+            VerifySource::ExternalNpz(source_npz) => {
+                let overrides = load_reference_record_overrides(source_npz)?;
+                let target_path = ensure_reference_bundle_with_overrides(
+                    model,
+                    args,
+                    &backend_pair.target,
+                    ReferenceCaptureMode::Full,
+                    Some(&overrides),
+                )?;
+                println!("Using source NPZ: {}", source_npz.display());
+                println!(
+                    "Using target cache bundle: {}",
+                    reference_sidecar_path(&target_path).display()
+                );
+                run_tensor_bundle_diff_external_source(
+                    model,
+                    args,
+                    source_npz,
+                    &target_path,
+                    &backend_pair.target,
+                )
+            }
+        },
     }
 }
 
@@ -3643,7 +3648,10 @@ fn rewrite_reference_json_to_canonical(reference_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn trim_reference_bundle_to_requested_tokens(reference_path: &Path, requested_tokens: u32) -> Result<()> {
+fn trim_reference_bundle_to_requested_tokens(
+    reference_path: &Path,
+    requested_tokens: u32,
+) -> Result<()> {
     let file = File::open(reference_path)?;
     let mut value: serde_json::Value = serde_json::from_reader(file)?;
 
@@ -3657,7 +3665,10 @@ fn trim_reference_bundle_to_requested_tokens(reference_path: &Path, requested_to
         );
     }
 
-    if let Some(tokens) = value.get_mut("tokens").and_then(|entry| entry.as_array_mut()) {
+    if let Some(tokens) = value
+        .get_mut("tokens")
+        .and_then(|entry| entry.as_array_mut())
+    {
         tokens.truncate(requested_tokens as usize);
     }
 
@@ -4563,7 +4574,10 @@ fn load_external_npz_tokens(path: &Path) -> Result<Vec<u32>> {
     }
     if let (Some(vals), Some(shape)) = (logits, logits_shape) {
         if shape.len() != 2 {
-            return Err(anyhow!("logits.npy must be rank-2 [steps,vocab], got {:?}", shape));
+            return Err(anyhow!(
+                "logits.npy must be rank-2 [steps,vocab], got {:?}",
+                shape
+            ));
         }
         let steps = shape[0];
         let vocab = shape[1];
@@ -4985,10 +4999,14 @@ fn run_tensor_bundle_diff(
             let maybe_actual = target_raw.get(&parsed.key);
             let status_and_detail = match (maybe_expected, maybe_actual, failure_by_idx[idx]) {
                 (Some(expected_raw), Some(actual_raw), Some(failure)) => match failure.diff.kind {
-                    FirstCheckpointDiffKind::Missing => ("FAILED".to_string(), "detail=checkpoint missing from target bundle".to_string()),
-                    FirstCheckpointDiffKind::LengthMismatch => {
-                        ("FAILED".to_string(), "detail=checkpoint tensor length mismatch".to_string())
-                    }
+                    FirstCheckpointDiffKind::Missing => (
+                        "FAILED".to_string(),
+                        "detail=checkpoint missing from target bundle".to_string(),
+                    ),
+                    FirstCheckpointDiffKind::LengthMismatch => (
+                        "FAILED".to_string(),
+                        "detail=checkpoint tensor length mismatch".to_string(),
+                    ),
                     FirstCheckpointDiffKind::Numeric => {
                         let expected = parse_npy_f32(expected_raw)?;
                         let actual = parse_npy_f32(actual_raw)?;
@@ -5055,12 +5073,13 @@ fn run_tensor_bundle_diff(
                     "detail=checkpoint tensor length mismatch".to_string()
                 }
                 FirstCheckpointDiffKind::Numeric => {
-                    let expected_raw = source_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
-                        anyhow!(
-                            "source tensor missing for diff key {}",
-                            failure.diff.parsed.key
-                        )
-                    })?;
+                    let expected_raw =
+                        source_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
+                            anyhow!(
+                                "source tensor missing for diff key {}",
+                                failure.diff.parsed.key
+                            )
+                        })?;
                     let actual_raw = target_raw.get(&failure.diff.parsed.key).ok_or_else(|| {
                         anyhow!(
                             "target tensor missing for diff key {}",
@@ -5189,8 +5208,12 @@ fn run_tensor_bundle_diff_external_source(
         let actual_rms = rms(actual);
         let abs_rms_diff = (actual_rms - expected_rms).abs();
         let (rel_rms, _max_abs) = rel_rms_and_max_abs(expected, actual);
-        if exceeds_numeric_tolerance(rel_rms, abs_rms_diff, args.rel_tolerance, args.abs_tolerance)
-        {
+        if exceeds_numeric_tolerance(
+            rel_rms,
+            abs_rms_diff,
+            args.rel_tolerance,
+            args.abs_tolerance,
+        ) {
             failures.push(TensorCheckpointFailure {
                 idx,
                 diff: FirstCheckpointDiff {
@@ -5373,7 +5396,8 @@ fn print_targeted_checkpoint_hint(model: &str, prompt_text: &str, parsed: &Parse
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_reference_bundle, compare_full_token_transcripts, default_dev_reference_path,
+        backend_pair_uses_sparse_tensor_surface, canonicalize_reference_bundle,
+        compare_full_token_transcripts, default_dev_reference_path,
         ensure_reference_cache_unlocked, failures_for_first_logical_token,
         find_first_checkpoint_diff, format_first_divergence_report, normalize_npz_entry_key,
         parse_checkpoint_key, parse_npy_f32, parse_verify_backend_pair,
@@ -5383,7 +5407,7 @@ mod tests {
         write_filtered_reference_json, write_phase2_reference_json, FirstCheckpointDiff,
         FirstCheckpointDiffKind, ParsedCheckpointKey, ReferenceCaptureMode, TempReferenceBundle,
         TensorCheckpointFailure, VerifyBackendPair, VerifyCheckpointTarget, VerifyLayerTarget,
-        VerifySource, backend_pair_uses_sparse_tensor_surface,
+        VerifySource,
     };
     use crate::cli::XrayArgs;
     use std::collections::BTreeMap;
@@ -5466,12 +5490,10 @@ mod tests {
 
     #[test]
     fn backend_pair_uses_sparse_tensor_surface_detects_metal() {
-        let cpu_to_metal =
-            parse_verify_backend_pair("cpu:metal").expect("pair should parse");
+        let cpu_to_metal = parse_verify_backend_pair("cpu:metal").expect("pair should parse");
         assert!(backend_pair_uses_sparse_tensor_surface(&cpu_to_metal));
 
-        let metal_to_cpu =
-            parse_verify_backend_pair("metal:cpu").expect("pair should parse");
+        let metal_to_cpu = parse_verify_backend_pair("metal:cpu").expect("pair should parse");
         assert!(backend_pair_uses_sparse_tensor_surface(&metal_to_cpu));
     }
 
@@ -6297,7 +6319,10 @@ mod tests {
             .expect("persist should succeed");
 
         let final_visible = reference_visible_text_path(&final_reference);
-        assert!(final_reference.exists(), "final reference JSON should exist");
+        assert!(
+            final_reference.exists(),
+            "final reference JSON should exist"
+        );
         assert!(
             reference_sidecar_path(&final_reference).exists(),
             "final sidecar should exist"

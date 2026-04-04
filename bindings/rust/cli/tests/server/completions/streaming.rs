@@ -24,7 +24,11 @@ fn streaming_body(model: &str, content: &str) -> serde_json::Value {
 fn streaming_returns_sse_content_type() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/chat/completions", &streaming_body(&model, "Hi"));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/chat/completions",
+        &streaming_body(&model, "Hi"),
+    );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let ct = resp.header("content-type").unwrap_or("");
@@ -38,7 +42,11 @@ fn streaming_returns_sse_content_type() {
 fn streaming_ends_with_done() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/chat/completions", &streaming_body(&model, "Hi"));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/chat/completions",
+        &streaming_body(&model, "Hi"),
+    );
     assert_eq!(resp.status, 200);
 
     assert!(
@@ -52,7 +60,11 @@ fn streaming_ends_with_done() {
 fn streaming_chunks_have_correct_object() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/chat/completions", &streaming_body(&model, "Hi"));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/chat/completions",
+        &streaming_body(&model, "Hi"),
+    );
     assert_eq!(resp.status, 200);
 
     let chunks = parse_sse_chunks(&resp.body);
@@ -73,7 +85,11 @@ fn streaming_chunks_have_correct_object() {
 fn streaming_first_chunk_has_role() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/chat/completions", &streaming_body(&model, "Hi"));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/chat/completions",
+        &streaming_body(&model, "Hi"),
+    );
     assert_eq!(resp.status, 200);
 
     let chunks = parse_sse_chunks(&resp.body);
@@ -81,14 +97,22 @@ fn streaming_first_chunk_has_role() {
 
     let first = &chunks[0];
     let role = first["choices"][0]["delta"]["role"].as_str();
-    assert_eq!(role, Some("assistant"), "first chunk must set role=assistant");
+    assert_eq!(
+        role,
+        Some("assistant"),
+        "first chunk must set role=assistant"
+    );
 }
 
 #[test]
 fn streaming_content_deltas_are_nonempty() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/chat/completions", &streaming_body(&model, "Say hello"));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/chat/completions",
+        &streaming_body(&model, "Say hello"),
+    );
     assert_eq!(resp.status, 200);
 
     let chunks = parse_sse_chunks(&resp.body);
@@ -97,10 +121,7 @@ fn streaming_content_deltas_are_nonempty() {
         .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
         .collect();
 
-    assert!(
-        !content_chunks.is_empty(),
-        "must have content delta chunks"
-    );
+    assert!(!content_chunks.is_empty(), "must have content delta chunks");
 
     // Concatenated content should form readable text
     let full_content: String = content_chunks.into_iter().collect();
@@ -114,7 +135,11 @@ fn streaming_content_deltas_are_nonempty() {
 fn streaming_last_content_chunk_has_finish_reason() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/chat/completions", &streaming_body(&model, "Hi"));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/chat/completions",
+        &streaming_body(&model, "Hi"),
+    );
     assert_eq!(resp.status, 200);
 
     let chunks = parse_sse_chunks(&resp.body);
@@ -141,7 +166,11 @@ fn streaming_last_content_chunk_has_finish_reason() {
 fn streaming_no_thinking_tags_in_content() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/chat/completions", &streaming_body(&model, "Say hello"));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/chat/completions",
+        &streaming_body(&model, "Say hello"),
+    );
     assert_eq!(resp.status, 200);
 
     let chunks = parse_sse_chunks(&resp.body);
@@ -164,11 +193,18 @@ fn streaming_no_thinking_tags_in_content() {
 fn streaming_chunks_share_same_id() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/chat/completions", &streaming_body(&model, "Hi"));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/chat/completions",
+        &streaming_body(&model, "Hi"),
+    );
     assert_eq!(resp.status, 200);
 
     let chunks = parse_sse_chunks(&resp.body);
-    assert!(chunks.len() >= 2, "need at least 2 chunks to verify id consistency");
+    assert!(
+        chunks.len() >= 2,
+        "need at least 2 chunks to verify id consistency"
+    );
 
     let first_id = chunks[0]["id"].as_str().expect("first chunk must have id");
     for (i, chunk) in chunks.iter().enumerate() {
@@ -185,7 +221,11 @@ fn streaming_chunks_share_same_id() {
 fn streaming_usage_in_final_chunk() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/chat/completions", &streaming_body(&model, "Hi"));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/chat/completions",
+        &streaming_body(&model, "Hi"),
+    );
     assert_eq!(resp.status, 200);
 
     let chunks = parse_sse_chunks(&resp.body);

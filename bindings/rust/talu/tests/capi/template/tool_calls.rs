@@ -245,10 +245,7 @@ fn nested_format_tools_render_function_key() {
         result.contains("\"function\""),
         "nested format must contain \"function\" key in rendered output, got: {result:?}"
     );
-    assert!(
-        result.contains("get_weather"),
-        "must contain tool name"
-    );
+    assert!(result.contains("get_weather"), "must contain tool name");
 }
 
 /// Flat-format tools render WITHOUT the "function" wrapper — confirming that

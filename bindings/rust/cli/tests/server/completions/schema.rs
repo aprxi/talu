@@ -83,7 +83,11 @@ fn completions_usage_structure() {
     let prompt = usage["prompt_tokens"].as_u64().unwrap();
     let completion = usage["completion_tokens"].as_u64().unwrap();
     let total = usage["total_tokens"].as_u64().unwrap();
-    assert_eq!(total, prompt + completion, "total must equal prompt + completion");
+    assert_eq!(
+        total,
+        prompt + completion,
+        "total must equal prompt + completion"
+    );
     assert!(prompt > 0, "prompt_tokens must be > 0");
     assert!(completion > 0, "completion_tokens must be > 0");
 }
@@ -257,7 +261,10 @@ fn bench_mmlu_request_shape() {
     let prompt_tokens = json["usage"]["prompt_tokens"].as_u64();
     let completion_tokens = json["usage"]["completion_tokens"].as_u64();
     assert!(prompt_tokens.is_some(), "must have usage.prompt_tokens");
-    assert!(completion_tokens.is_some(), "must have usage.completion_tokens");
+    assert!(
+        completion_tokens.is_some(),
+        "must have usage.completion_tokens"
+    );
     assert!(prompt_tokens.unwrap() > 0, "prompt_tokens must be > 0");
 }
 
@@ -277,7 +284,9 @@ fn bench_max_completion_tokens_field() {
     let resp = post_json(ctx.addr(), "/v1/chat/completions", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
-    let completion_tokens = resp.json()["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    let completion_tokens = resp.json()["usage"]["completion_tokens"]
+        .as_u64()
+        .unwrap_or(0);
     assert!(
         completion_tokens <= 2,
         "max_completion_tokens=1 should limit output, got {}",
@@ -305,7 +314,10 @@ fn bench_user_only_no_system() {
     let content = json["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("");
-    assert!(!content.is_empty(), "user-only request must produce content");
+    assert!(
+        !content.is_empty(),
+        "user-only request must produce content"
+    );
 }
 
 /// Bench passes sampling params directly. Verify they're accepted without error.

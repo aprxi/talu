@@ -170,8 +170,5 @@ fn generate_config_defaults_match_zig_sentinels() {
         cfg.completions_mode, 0,
         "completions_mode must default to 0 (off)"
     );
-    assert_eq!(
-        cfg.raw_output, 0,
-        "raw_output must default to 0 (off)"
-    );
+    assert_eq!(cfg.raw_output, 0, "raw_output must default to 0 (off)");
 }

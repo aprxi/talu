@@ -61,6 +61,17 @@ impl Scheme {
     }
 }
 
+/// Calibration profile for hardware-float conversion schemes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ConvertProfile {
+    Best = 0,
+    Good = 1,
+    Balanced = 2,
+    Fast = 3,
+    Custom = 4,
+}
+
 /// Options for model conversion.
 #[derive(Debug, Clone, Default)]
 pub struct ConvertOptions {
@@ -70,6 +81,20 @@ pub struct ConvertOptions {
     pub force: bool,
     /// Return model ID (org/model-suffix) instead of filesystem path.
     pub return_model_id: bool,
+    /// Calibration profile for MXFP8/NVFP4 conversion.
+    pub calibration_profile: Option<ConvertProfile>,
+    /// Deterministic calibration seed.
+    pub calibration_seed: Option<u64>,
+    /// Explicit calibration iteration override.
+    pub calibration_iters: Option<u32>,
+    /// Explicit calibration sample override.
+    pub calibration_nsamples: Option<u32>,
+    /// Explicit calibration sequence-length override.
+    pub calibration_seqlen: Option<u32>,
+    /// Explicit calibration batch-size override.
+    pub calibration_batch_size: Option<u32>,
+    /// Explicit calibration block-count override.
+    pub calibration_nblocks: Option<u32>,
 }
 
 /// Progress action type.
@@ -123,6 +148,38 @@ pub struct ConvertResult {
 /// Callback wrapper for C API progress callback.
 struct ProgressContext {
     callback: ConvertProgressCallback,
+}
+
+fn map_scheme_to_sys(scheme: Scheme) -> talu_sys::Scheme {
+    match scheme {
+        Scheme::F16 => talu_sys::Scheme::F16,
+        Scheme::Gaf432 => talu_sys::Scheme::Gaf432,
+        Scheme::Gaf464 => talu_sys::Scheme::Gaf464,
+        Scheme::Gaf4128 => talu_sys::Scheme::Gaf4128,
+        Scheme::Gaf832 => talu_sys::Scheme::Gaf832,
+        Scheme::Gaf864 => talu_sys::Scheme::Gaf864,
+        Scheme::Gaf8128 => talu_sys::Scheme::Gaf8128,
+        Scheme::Fp8E4m3 => talu_sys::Scheme::Fp8E4m3,
+        Scheme::Fp8E5m2 => talu_sys::Scheme::Fp8E5m2,
+        Scheme::Mxfp4 => talu_sys::Scheme::Mxfp4,
+        Scheme::Nvfp4 => talu_sys::Scheme::Nvfp4,
+        Scheme::Mxfp8 => talu_sys::Scheme::Mxfp8,
+        // Legacy/non-canonical variants map to the closest grouped-affine target.
+        Scheme::Q40 | Scheme::Q4KM => talu_sys::Scheme::Gaf432,
+        Scheme::Q5K => talu_sys::Scheme::Gaf464,
+        Scheme::Q6K => talu_sys::Scheme::Gaf464,
+        Scheme::Q80 => talu_sys::Scheme::Gaf832,
+    }
+}
+
+fn map_profile_to_sys(profile: ConvertProfile) -> talu_sys::QualityProfile {
+    match profile {
+        ConvertProfile::Best => talu_sys::QualityProfile::Best,
+        ConvertProfile::Good => talu_sys::QualityProfile::Good,
+        ConvertProfile::Balanced => talu_sys::QualityProfile::Balanced,
+        ConvertProfile::Fast => talu_sys::QualityProfile::Fast,
+        ConvertProfile::Custom => talu_sys::QualityProfile::Custom,
+    }
 }
 
 extern "C" fn progress_callback_wrapper(
@@ -193,10 +250,31 @@ pub fn convert(
 
     let mut c_options = talu_sys::ConvertOptions::default();
     if let Some(scheme) = options.scheme {
-        c_options.scheme = talu_sys::Scheme::from(scheme as u32);
+        c_options.scheme = map_scheme_to_sys(scheme);
     }
     c_options.force = options.force;
     c_options.return_model_id = options.return_model_id;
+    if let Some(profile) = options.calibration_profile {
+        c_options.calibration_profile = map_profile_to_sys(profile);
+    }
+    if let Some(seed) = options.calibration_seed {
+        c_options.calibration_seed = seed;
+    }
+    if let Some(iters) = options.calibration_iters {
+        c_options.calibration_iters = iters;
+    }
+    if let Some(nsamples) = options.calibration_nsamples {
+        c_options.calibration_nsamples = nsamples;
+    }
+    if let Some(seqlen) = options.calibration_seqlen {
+        c_options.calibration_seqlen = seqlen;
+    }
+    if let Some(batch_size) = options.calibration_batch_size {
+        c_options.calibration_batch_size = batch_size;
+    }
+    if let Some(nblocks) = options.calibration_nblocks {
+        c_options.calibration_nblocks = nblocks;
+    }
     c_options.progress_callback = progress_cb;
     c_options.progress_user_data = ctx_ptr;
 
@@ -244,4 +322,25 @@ pub fn convert(
     }
 
     Ok(ConvertResult { output_path })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{map_profile_to_sys, ConvertProfile};
+    use talu_sys::QualityProfile;
+
+    #[test]
+    fn map_profile_to_sys_is_stable() {
+        assert_eq!(map_profile_to_sys(ConvertProfile::Best), QualityProfile::Best);
+        assert_eq!(map_profile_to_sys(ConvertProfile::Good), QualityProfile::Good);
+        assert_eq!(
+            map_profile_to_sys(ConvertProfile::Balanced),
+            QualityProfile::Balanced
+        );
+        assert_eq!(map_profile_to_sys(ConvertProfile::Fast), QualityProfile::Fast);
+        assert_eq!(
+            map_profile_to_sys(ConvertProfile::Custom),
+            QualityProfile::Custom
+        );
+    }
 }

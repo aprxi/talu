@@ -527,7 +527,9 @@ pub fn resolve_effective_generation_config(
     };
 
     if rc != 0 {
-        return Err(error_from_last_or("Failed to resolve effective generation config"));
+        return Err(error_from_last_or(
+            "Failed to resolve effective generation config",
+        ));
     }
 
     Ok(EffectiveGenConfig {

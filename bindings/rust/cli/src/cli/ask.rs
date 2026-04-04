@@ -814,7 +814,10 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
             (0..total_requests).map(|_| Vec::new()).collect();
         let pending = std::sync::atomic::AtomicBool::new(false);
         batch.run_loop(&pending, |event| {
-            if let Some(idx) = request_ids.iter().position(|(id, _, _)| *id == event.request_id) {
+            if let Some(idx) = request_ids
+                .iter()
+                .position(|(id, _, _)| *id == event.request_id)
+            {
                 if !event.text.is_empty() {
                     let segs = &mut per_request_segments[idx];
                     let needs_new = segs.last().map_or(true, |s| {
@@ -868,7 +871,9 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
                                 "summary": [{"type": "summary_text", "text": text}]
                             }));
                         }
-                        _ => { si += 1; }
+                        _ => {
+                            si += 1;
+                        }
                     }
                 }
                 if !items.is_empty() {
@@ -911,8 +916,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
                         0.0
                     };
                     let input_tok_per_sec = if result.prefill_ns > 0 {
-                        (result.prompt_tokens as f64)
-                            / (result.prefill_ns as f64 / 1_000_000_000.0)
+                        (result.prompt_tokens as f64) / (result.prefill_ns as f64 / 1_000_000_000.0)
                     } else {
                         0.0
                     };

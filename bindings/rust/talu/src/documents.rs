@@ -322,9 +322,7 @@ impl DocumentsHandle {
             _reserved: [0; 8],
         };
 
-        let code = unsafe {
-            talu_sys::talu_db_docs_create_ex(self.path_cstr.as_ptr(), &c_doc)
-        };
+        let code = unsafe { talu_sys::talu_db_docs_create_ex(self.path_cstr.as_ptr(), &c_doc) };
 
         if code != ERROR_CODE_OK {
             return Err(DocumentError::from_code(code, doc_id));
@@ -1044,11 +1042,19 @@ fn cstr_to_opt_string(ptr: *const c_char) -> Option<String> {
 }
 
 fn i64_opt(v: i64) -> Option<i64> {
-    if v != 0 { Some(v) } else { None }
+    if v != 0 {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 fn f64_opt(v: f64) -> Option<f64> {
-    if v != 0.0 { Some(v) } else { None }
+    if v != 0.0 {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 fn document_from_c(c: &talu_sys::CDocumentRecord) -> DocumentRecord {

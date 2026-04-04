@@ -1057,7 +1057,7 @@ pub fn orientWeight(
     // U32/I32 from safetensors maps to grouped_affine_u4 by default.
     // For models with mixed quantization, auto-detect bits from scales shape.
     // GAF format (MLX): .weight + .scales + .biases
-    // GPTQ format (AutoRound/AutoGPTQ): .qweight + .scales + .qzeros (transposed layout)
+    // GPTQ format: .qweight + .scales + .qzeros (transposed layout)
     if (inferGaffineParams(st, name, &weight_tensor, expected_in, config.gaffine_bits)) |params| {
         try applyGaffineParams(&weight_tensor, params, name);
         return weight_tensor;
@@ -1068,7 +1068,7 @@ pub fn orientWeight(
         };
     }
 
-    // Handle NVFP4 packed weights (AutoRound compressed-tensors):
+    // Handle NVFP4 packed weights (compressed-tensors):
     // ".weight_packed" U8 (parsed as i8 by safetensors reader) +
     // ".weight_scale" F8_E4M3 + optional ".weight_global_scale" F32.
     // Keep packed payload for native CUDA kernels when requested, otherwise
@@ -1106,7 +1106,7 @@ pub fn orientWeight(
     // Handle MXFP8 E4M3 weights — E4M3 data + UE8M0 block-32 scales for cuBLASLt tensor core GEMM.
     // Accept both scale suffixes used in the wild:
     // - ".weight_block_scale" (Talu/HF MXFP8 export)
-    // - ".weight_scale" (AutoRound compressed-tensors export)
+    // - ".weight_scale" (compressed-tensors export)
     if (weight_tensor.dtype == .f8_e4m3) mxfp8_check: {
         const base = if (std.mem.endsWith(u8, name, ".weight"))
             name[0 .. name.len - ".weight".len]
@@ -1224,7 +1224,7 @@ pub fn orientWeight(
     };
 }
 
-/// Convert GPTQ/AutoRound packed weights to GAF format at load time.
+/// Convert GPTQ packed weights to GAF format at load time.
 ///
 /// GPTQ stores quantized weights as three tensors per projection:
 ///   .qweight  I32  [packed_in, out]      (packed 4-bit values, transposed vs GAF)
@@ -2258,11 +2258,11 @@ test "orientWeight returns untransposed when rows equals expected_in" {
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), out[2], 1e-6);
 }
 
-test "orientWeight detects MXFP8 scales from AutoRound weight_scale suffix" {
+test "orientWeight detects MXFP8 scales from weight_scale suffix" {
     const allocator = std.testing.allocator;
     const writer = @import("../../io/safetensors/writer.zig");
 
-    const tmp_dir_path = "/tmp/test_orient_weight_mxfp8_autoround";
+    const tmp_dir_path = "/tmp/test_orient_weight_mxfp8_weight_scale";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
     defer std.fs.cwd().deleteTree(tmp_dir_path) catch {};
 

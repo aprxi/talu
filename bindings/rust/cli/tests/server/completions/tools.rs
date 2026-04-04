@@ -114,7 +114,11 @@ fn tool_call_response_shape() {
     if let Some(tool_calls) = choice["message"]["tool_calls"].as_array() {
         if !tool_calls.is_empty() {
             let tc = &tool_calls[0];
-            assert!(tc["id"].is_string(), "tool call must have string id: {:?}", tc);
+            assert!(
+                tc["id"].is_string(),
+                "tool call must have string id: {:?}",
+                tc
+            );
             assert_eq!(
                 tc["type"].as_str(),
                 Some("function"),

@@ -70,11 +70,13 @@ pub fn convertToFp8(
         );
     };
     errdefer allocator.free(output_dir_path);
+    const output_tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{output_dir_path});
+    defer allocator.free(output_tmp_path);
 
     // 4. Check if output exists
-    if (options.force) {
-        std.fs.cwd().deleteTree(output_dir_path) catch {};
-    } else {
+    // Always clean stale temporary output from a prior interrupted run.
+    std.fs.cwd().deleteTree(output_tmp_path) catch {};
+    if (!options.force) {
         std.fs.cwd().access(output_dir_path, .{}) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
@@ -150,8 +152,8 @@ pub fn convertToFp8(
 
     // 7. Create output directory
     var keep_output = false;
-    errdefer if (!keep_output) std.fs.cwd().deleteTree(output_dir_path) catch {};
-    var output_dir = try gaf_paths.GAFModelDir.init(allocator, output_dir_path);
+    errdefer if (!keep_output) std.fs.cwd().deleteTree(output_tmp_path) catch {};
+    var output_dir = try gaf_paths.GAFModelDir.init(allocator, output_tmp_path);
     defer output_dir.deinit();
 
     // 8. Process and write weights
@@ -160,24 +162,37 @@ pub fn convertToFp8(
         &source_tensors,
         model_config.tie_word_embeddings,
         options.max_shard_size,
-        output_dir_path,
+        output_tmp_path,
         options.progress,
         if (layout_map) |*lm| lm else null,
         if (fusion_map) |*fm| fm else null,
     );
 
     // 9. Copy config.json with FP8 quantization info
-    try copyConfigWithFp8Quantization(allocator, model_bundle.config_path(), output_dir_path, model_config.tie_word_embeddings);
+    try copyConfigWithFp8Quantization(allocator, model_bundle.config_path(), output_tmp_path, model_config.tie_word_embeddings);
 
     // 10. Copy all model assets
-    try convert.copyModelAssets(allocator, model_bundle.dir, output_dir_path);
+    try convert.copyModelAssets(allocator, model_bundle.dir, output_tmp_path);
 
     // 11. Generate model card
     const model_name = convert.model_card.extractModelName(input_path);
     const base_model_id = convert.model_card.extractBaseModelId(input_path);
-    convert.model_card.writeModelCard(allocator, output_dir_path, model_name, base_model_id, .fp8_e4m3) catch |err| {
+    convert.model_card.writeModelCard(allocator, output_tmp_path, model_name, base_model_id, .fp8_e4m3) catch |err| {
         log.warn("converter", "Failed to generate model card", .{ .err = @errorName(err) });
     };
+
+    if (options.force) {
+        std.fs.cwd().access(output_dir_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        if (std.fs.cwd().openDir(output_dir_path, .{})) |d| {
+            var dir = d;
+            dir.close();
+            try std.fs.cwd().deleteTree(output_dir_path);
+        } else |_| {}
+    }
+    try std.fs.cwd().rename(output_tmp_path, output_dir_path);
 
     keep_output = true;
     return output_dir_path;
@@ -719,7 +734,8 @@ fn copyConfigWithFp8Quantization(
 
     // Add FP8 quantization_config
     if (!first_field) try output_buf.append(allocator, ',');
-    try output_buf.appendSlice(allocator,
+    try output_buf.appendSlice(
+        allocator,
         "\"quantization_config\":{\"quant_method\":\"fp8\",\"fmt\":\"e4m3\",\"weight_block_size\":[128,128],\"activation_scheme\":\"dynamic\"}",
     );
 

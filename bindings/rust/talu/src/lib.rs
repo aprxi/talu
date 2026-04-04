@@ -93,7 +93,8 @@ pub use collab::{
     WatchEventType as CollabWatchEventType,
 };
 pub use convert::{
-    ConvertOptions, ConvertProgress, ConvertResult, ProgressAction as ConvertProgressAction, Scheme,
+    ConvertOptions, ConvertProfile, ConvertProgress, ConvertResult,
+    ProgressAction as ConvertProgressAction, Scheme,
 };
 pub use documents::{
     ChangeAction, ChangeRecord, CompactionStats, DocumentError, DocumentRecord, DocumentSummary,

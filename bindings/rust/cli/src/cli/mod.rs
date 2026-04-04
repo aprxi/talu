@@ -356,6 +356,14 @@ pub(super) struct ConvertArgs {
     #[arg(long, default_value = "gaf4_64", value_name = "SCHEME", num_args = 1)]
     pub scheme: String,
 
+    /// Quality profile (best|good|balanced|fast|custom)
+    #[arg(long, default_value = "best", value_name = "PROFILE", num_args = 1)]
+    pub profile: String,
+
+    /// Deterministic seed for conversion calibration/search
+    #[arg(long, env = "SEED", default_value_t = 42u64)]
+    pub seed: u64,
+
     /// Output directory (default: $TALU_HOME/models)
     #[arg(long)]
     pub output: Option<String>,
@@ -375,6 +383,11 @@ pub(super) struct ConvertArgs {
     /// Output only the path (for scripting)
     #[arg(short, long)]
     pub quiet: bool,
+
+    /// Inline profile overrides (custom profile only).
+    /// Format: iters=...,samples=...,seqlen=...,batch_size=...,nblocks=...
+    #[arg(value_name = "OVERRIDE", trailing_var_arg = true)]
+    pub profile_overrides: Vec<String>,
 }
 
 #[derive(Args)]
@@ -1096,6 +1109,79 @@ mod tests {
                 assert!(args.model.is_none());
             }
             _ => panic!("expected set command"),
+        }
+    }
+
+    #[test]
+    fn parse_convert_profile_flag() {
+        let cli = parse(&[
+            "talu",
+            "convert",
+            "Qwen/Qwen3.5-2B",
+            "--scheme",
+            "mxfp8",
+            "--profile",
+            "balanced",
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Convert(args)) => {
+                assert_eq!(args.scheme, "mxfp8");
+                assert_eq!(args.profile, "balanced");
+                assert_eq!(args.seed, 42);
+                assert!(args.profile_overrides.is_empty());
+            }
+            _ => panic!("expected convert command"),
+        }
+    }
+
+    #[test]
+    fn parse_convert_seed_flag() {
+        let cli = parse(&[
+            "talu",
+            "convert",
+            "Qwen/Qwen3.5-2B",
+            "--scheme",
+            "mxfp8",
+            "--seed",
+            "1234",
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Convert(args)) => {
+                assert_eq!(args.scheme, "mxfp8");
+                assert_eq!(args.seed, 1234);
+            }
+            _ => panic!("expected convert command"),
+        }
+    }
+
+    #[test]
+    fn parse_convert_custom_profile_overrides() {
+        let cli = parse(&[
+            "talu",
+            "convert",
+            "Qwen/Qwen3.5-2B",
+            "--scheme",
+            "mxfp8",
+            "--profile",
+            "custom",
+            "iters=400,samples=256,seqlen=2048,batch_size=1,nblocks=1",
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Convert(args)) => {
+                assert_eq!(args.profile, "custom");
+                assert_eq!(args.profile_overrides.len(), 1);
+                assert_eq!(
+                    args.profile_overrides[0],
+                    "iters=400,samples=256,seqlen=2048,batch_size=1,nblocks=1"
+                );
+            }
+            _ => panic!("expected convert command"),
         }
     }
 

@@ -40,12 +40,7 @@ pub async fn handle_create(
 
     let parsed: CreateChatCompletionBody = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("Invalid JSON: {e}"),
-            )
-        }
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {e}")),
     };
 
     if parsed.messages.is_empty() {
@@ -76,7 +71,12 @@ async fn handle_non_streaming(
 
     let messages_json = match serde_json::to_string(&body.messages) {
         Ok(j) => j,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("Failed to serialize messages: {e}")),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to serialize messages: {e}"),
+            )
+        }
     };
 
     let system_prompt = extract_system_prompt(&body.messages);
@@ -123,7 +123,9 @@ async fn handle_non_streaming(
                         }
                     }
                     Err(_) => {
-                        final_error.get_or_insert_with(|| "batch event channel closed before completion".to_string());
+                        final_error.get_or_insert_with(|| {
+                            "batch event channel closed before completion".to_string()
+                        });
                         break;
                     }
                 }
@@ -137,11 +139,17 @@ async fn handle_non_streaming(
                 Some(r) => {
                     let has_tool_calls = !r.tool_calls.is_empty();
                     let tool_calls = if has_tool_calls {
-                        let tc: Vec<serde_json::Value> = r.tool_calls.iter().map(|tc| json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.name, "arguments": tc.arguments},
-                        })).collect();
+                        let tc: Vec<serde_json::Value> = r
+                            .tool_calls
+                            .iter()
+                            .map(|tc| {
+                                json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {"name": tc.name, "arguments": tc.arguments},
+                                })
+                            })
+                            .collect();
                         Some(serde_json::Value::Array(tc))
                     } else {
                         None
@@ -151,7 +159,9 @@ async fn handle_non_streaming(
                     let content = if has_tool_calls {
                         None
                     } else {
-                        r.text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+                        r.text
+                            .map(|t| t.trim().to_string())
+                            .filter(|t| !t.is_empty())
                     };
                     Ok((
                         content,
@@ -165,12 +175,17 @@ async fn handle_non_streaming(
             }
         } else {
             let mut guard = backend.blocking_lock();
-            let be = guard.backend.as_mut()
+            let be = guard
+                .backend
+                .as_mut()
                 .ok_or_else(|| anyhow!("no backend available"))?;
             let result = talu::router::generate(&chat, &[], be, &cfg)
                 .map_err(|e| anyhow!("generation failed: {e}"))?;
             Ok((
-                result.text().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+                result
+                    .text()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty()),
                 None,
                 result.prompt_tokens() as u64,
                 result.completion_tokens() as u64,
@@ -229,7 +244,12 @@ async fn handle_streaming(
 
     let messages_json = match serde_json::to_string(&body.messages) {
         Ok(j) => j,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("Failed to serialize messages: {e}")),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to serialize messages: {e}"),
+            )
+        }
     };
 
     let system_prompt = extract_system_prompt(&body.messages);
@@ -335,7 +355,9 @@ async fn handle_streaming(
                         }
                     }
                     Err(_) => {
-                        final_error.get_or_insert_with(|| "batch event channel closed before completion".to_string());
+                        final_error.get_or_insert_with(|| {
+                            "batch event channel closed before completion".to_string()
+                        });
                         break;
                     }
                 }
@@ -489,12 +511,24 @@ fn build_generate_config(
     if let Some(mt) = max_tokens {
         cfg.max_tokens = mt as usize;
     }
-    if let Some(t) = body.temperature { cfg.temperature = t as f32; }
-    if let Some(p) = body.top_p { cfg.top_p = p as f32; }
-    if let Some(k) = body.top_k { cfg.top_k = k as usize; }
-    if let Some(s) = body.seed { cfg.seed = s; }
-    if let Some(pp) = body.presence_penalty { cfg.presence_penalty = pp as f32; }
-    if let Some(fp) = body.frequency_penalty { cfg.frequency_penalty = fp as f32; }
+    if let Some(t) = body.temperature {
+        cfg.temperature = t as f32;
+    }
+    if let Some(p) = body.top_p {
+        cfg.top_p = p as f32;
+    }
+    if let Some(k) = body.top_k {
+        cfg.top_k = k as usize;
+    }
+    if let Some(s) = body.seed {
+        cfg.seed = s;
+    }
+    if let Some(pp) = body.presence_penalty {
+        cfg.presence_penalty = pp as f32;
+    }
+    if let Some(fp) = body.frequency_penalty {
+        cfg.frequency_penalty = fp as f32;
+    }
     cfg.tools_json = body.tools.as_ref().map(|v| v.to_string());
     cfg.tool_choice = body.tool_choice.as_ref().map(|v| match v {
         serde_json::Value::String(s) => s.clone(),
@@ -516,7 +550,8 @@ fn send_chunk(
     chunk: &ChatCompletionChunk,
 ) -> Result<(), ()> {
     let json = serde_json::to_string(chunk).map_err(|_| ())?;
-    tx.send(Bytes::from(format!("data: {json}\n\n"))).map_err(|_| ())
+    tx.send(Bytes::from(format!("data: {json}\n\n")))
+        .map_err(|_| ())
 }
 
 fn send_error_chunk(
@@ -524,7 +559,10 @@ fn send_error_chunk(
     message: &str,
 ) -> Result<(), ()> {
     let payload = json!({"error": {"message": message, "type": "server_error"}});
-    let sse = format!("data: {}\n\n", serde_json::to_string(&payload).unwrap_or_default());
+    let sse = format!(
+        "data: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_default()
+    );
     tx.send(Bytes::from(sse)).map_err(|_| ())?;
     tx.send(Bytes::from("data: [DONE]\n\n")).map_err(|_| ())
 }
@@ -556,9 +594,18 @@ fn json_response<T: serde::Serialize>(status: StatusCode, value: &T) -> Response
 }
 
 fn random_id() -> String {
-    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos())
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
 }
 
 fn now_unix_seconds() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }

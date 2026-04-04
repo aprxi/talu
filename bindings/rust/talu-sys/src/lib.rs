@@ -150,6 +150,25 @@ impl From<u8> for CItemType {
     }
 }
 
+/// Source: core/src/converter/scheme.zig
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum QualityProfile {
+    Best,
+    Good,
+    Balanced,
+    Fast,
+    Custom,
+}
+
+impl From<u32> for QualityProfile {
+    fn from(value: u32) -> Self {
+        match value {
+            _ => QualityProfile::Custom,
+        }
+    }
+}
+
 /// Source: core/src/router/batch.zig
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -700,6 +719,25 @@ impl From<u32> for QuantLevel {
     }
 }
 
+/// Source: core/src/converter/calibration_capture.zig
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ActivationRole {
+    Generic,
+    AttnInput,
+    AttnOutput,
+    FfnInput,
+    FfnOutput,
+}
+
+impl From<u8> for ActivationRole {
+    fn from(value: u8) -> Self {
+        match value {
+            _ => ActivationRole::FfnOutput,
+        }
+    }
+}
+
 // =============================================================================
 // Structures
 // =============================================================================
@@ -720,6 +758,13 @@ pub struct ConvertOptions {
     pub platform: Platform,
     pub quant: QuantLevel,
     pub use_platform_quant: bool,
+    pub calibration_profile: QualityProfile,
+    pub calibration_seed: u64,
+    pub calibration_iters: u32,
+    pub calibration_nsamples: u32,
+    pub calibration_seqlen: u32,
+    pub calibration_batch_size: u32,
+    pub calibration_nblocks: u32,
     pub progress_callback: *mut c_void,
     pub progress_user_data: *mut c_void,
 }
@@ -739,6 +784,13 @@ impl Default for ConvertOptions {
             platform: Platform::from(0),
             quant: QuantLevel::from(0),
             use_platform_quant: false,
+            calibration_profile: QualityProfile::from(0),
+            calibration_seed: 42,
+            calibration_iters: 0,
+            calibration_nsamples: 0,
+            calibration_seqlen: 0,
+            calibration_batch_size: 0,
+            calibration_nblocks: 0,
             progress_callback: std::ptr::null_mut(),
             progress_user_data: std::ptr::null_mut(),
         }

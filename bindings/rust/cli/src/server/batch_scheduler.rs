@@ -415,9 +415,8 @@ fn step_loop(
     let pending_flag = AtomicBool::new(false);
     let mut draining = false;
     let mut step_count: u64 = 0;
-    let non_stream_cmd_poll_tokens_u32: u32 = non_stream_cmd_poll_tokens
-        .try_into()
-        .unwrap_or(u32::MAX);
+    let non_stream_cmd_poll_tokens_u32: u32 =
+        non_stream_cmd_poll_tokens.try_into().unwrap_or(u32::MAX);
 
     loop {
         // 1. Clear pending flags, then drain all queued commands.
@@ -510,7 +509,11 @@ fn step_loop(
                 let mut idle_submit_budget_remaining = if active_submit_budget == usize::MAX {
                     usize::MAX
                 } else {
-                    active_submit_budget.saturating_sub(if first_command_was_submit { 1 } else { 0 })
+                    active_submit_budget.saturating_sub(if first_command_was_submit {
+                        1
+                    } else {
+                        0
+                    })
                 };
 
                 // Drain already-queued commands first (not time-gated).
@@ -998,11 +1001,7 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn with_env<R>(
-        key: &str,
-        value: Option<&str>,
-        f: impl FnOnce() -> R,
-    ) -> R {
+    fn with_env<R>(key: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let prev = std::env::var(key).ok();
         match value {
@@ -1019,7 +1018,11 @@ mod tests {
 
     #[test]
     fn active_submit_budget_defaults_to_eight() {
-        let got = with_env("TALU_BATCH_ACTIVE_SUBMIT_BUDGET", None, resolve_active_submit_budget);
+        let got = with_env(
+            "TALU_BATCH_ACTIVE_SUBMIT_BUDGET",
+            None,
+            resolve_active_submit_budget,
+        );
         assert_eq!(got, 8);
     }
 
@@ -1052,7 +1055,11 @@ mod tests {
 
     #[test]
     fn submit_coalesce_defaults_to_one_hundred_twenty_eight_ms() {
-        let got = with_env("TALU_BATCH_SUBMIT_COALESCE_MS", None, resolve_batch_submit_coalesce);
+        let got = with_env(
+            "TALU_BATCH_SUBMIT_COALESCE_MS",
+            None,
+            resolve_batch_submit_coalesce,
+        );
         assert_eq!(got, Duration::from_millis(128));
     }
 

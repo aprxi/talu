@@ -1441,10 +1441,7 @@ fn list_with_include_content_returns_full_records() {
     );
     assert_eq!(resp.status, 201, "create: {}", resp.body);
 
-    let resp = get(
-        ctx.addr(),
-        "/v1/db/tables/documents?include=content",
-    );
+    let resp = get(ctx.addr(), "/v1/db/tables/documents?include=content");
     assert_eq!(resp.status, 200, "list full: {}", resp.body);
 
     let json = resp.json();
@@ -1509,10 +1506,7 @@ fn create_with_meta_columns_round_trips() {
     assert_eq!(resp.status, 201, "create: {}", resp.body);
     let doc_id = resp.json()["id"].as_str().unwrap().to_string();
 
-    let resp = get(
-        ctx.addr(),
-        &format!("/v1/db/tables/documents/{}", doc_id),
-    );
+    let resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
     assert_eq!(resp.status, 200, "get: {}", resp.body);
 
     let json = resp.json();
@@ -1570,17 +1564,14 @@ fn meta_zero_is_omitted_from_response() {
     assert_eq!(resp.status, 201, "create: {}", resp.body);
     let doc_id = resp.json()["id"].as_str().unwrap().to_string();
 
-    let resp = get(
-        ctx.addr(),
-        &format!("/v1/db/tables/documents/{}", doc_id),
-    );
+    let resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
     assert_eq!(resp.status, 200, "get: {}", resp.body);
 
     let json = resp.json();
     // All meta fields should be absent when not set
     for field in &[
-        "meta_i1", "meta_i2", "meta_i3", "meta_i4", "meta_i5",
-        "meta_f1", "meta_f2", "meta_f3", "meta_f4", "meta_f5",
+        "meta_i1", "meta_i2", "meta_i3", "meta_i4", "meta_i5", "meta_f1", "meta_f2", "meta_f3",
+        "meta_f4", "meta_f5",
     ] {
         assert!(
             json.get(*field).is_none() || json[*field].is_null(),
@@ -1608,10 +1599,7 @@ fn list_full_returns_meta_columns() {
     );
     assert_eq!(resp.status, 201, "create: {}", resp.body);
 
-    let resp = get(
-        ctx.addr(),
-        "/v1/db/tables/documents?include=content",
-    );
+    let resp = get(ctx.addr(), "/v1/db/tables/documents?include=content");
     assert_eq!(resp.status, 200, "list full: {}", resp.body);
 
     let json = resp.json();
@@ -1662,10 +1650,10 @@ fn list_multiple_group_ids() {
     let data = json["data"].as_array().expect("data");
     assert_eq!(data.len(), 2);
 
-    let group_ids: Vec<&str> = data
-        .iter()
-        .filter_map(|d| d["group_id"].as_str())
-        .collect();
-    assert!(group_ids.contains(&"responses/perf"), "should contain responses/perf");
+    let group_ids: Vec<&str> = data.iter().filter_map(|d| d["group_id"].as_str()).collect();
+    assert!(
+        group_ids.contains(&"responses/perf"),
+        "should contain responses/perf"
+    );
     assert!(group_ids.contains(&"db/kv"), "should contain db/kv");
 }
