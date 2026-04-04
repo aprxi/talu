@@ -52,7 +52,6 @@ fn effectiveLayerRopeTheta(
 ) f32 {
     _ = head_dim_u32;
     if (cfg.sliding_window > 0) return local_rope_theta;
-    if (self.loaded.config.hidden_size_per_layer_input <= 0) return global_rope_theta;
     if (global_rope_theta <= 0.0 or rope_dim_u32 == 0) return global_rope_theta;
     if (self.loaded.config.global_head_dim <= 0) return global_rope_theta;
 

@@ -229,8 +229,7 @@ pub const FusedCpuBackend = struct {
     ) !RuntimeRopeHandles {
         if (loaded.position_embeddings != null) return .{};
 
-        const use_proportional_global_rope = loaded.config.hidden_size_per_layer_input > 0 and
-            loaded.config.global_head_dim > 0 and
+        const use_proportional_global_rope = loaded.config.global_head_dim > 0 and
             loaded.config.rope_dim > 0 and
             loaded.config.global_head_dim >= loaded.config.rope_dim;
         const global_rope_dim: usize = if (use_proportional_global_rope)
@@ -239,7 +238,7 @@ pub const FusedCpuBackend = struct {
             @intCast(loaded.config.rope_dim)
         else
             @intCast(loaded.config.head_dim);
-        // Sliding-window layers on Gemma4 use the base head_dim rotary width,
+        // Sliding-window layers use the base head_dim rotary width,
         // while full-attention layers may use a reduced global rope_dim.
         const local_rope_dim: usize = @intCast(loaded.config.head_dim);
         if (global_rope_dim == 0 and local_rope_dim == 0) return .{};

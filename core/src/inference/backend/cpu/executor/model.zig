@@ -50,6 +50,7 @@ const LoadedModel = models.LoadedModel;
 const ModelConfig = tensor_mod.ModelConfig;
 const LayerOp = layer_ops.LayerOp;
 const BlockKind = block_kernels.BlockType;
+
 pub fn formatLinearLike(
     writer: anytype,
     weight: *const Tensor,
@@ -543,6 +544,30 @@ fn initGemma4PerLayerRuntime(
     };
 }
 
+/// Load per-layer scalar multipliers from safetensors. Returns null when the
+/// weights are absent (most models) or when PLE already owns them.
+fn initStandaloneLayerScalars(
+    allocator: std.mem.Allocator,
+    loaded: *LoadedModel,
+    layer_count: usize,
+) !?[]f32 {
+    // PLE already loads and applies layer_scalars — don't double-apply.
+    if (loaded.config.hidden_size_per_layer_input > 0) return null;
+    if (loaded.st == null) return null;
+    const safetensors = &(loaded.st.?);
+
+    // Probe layer 0 to determine if layer_scalar weights exist.
+    _ = loadLayerTensorBySuffix(safetensors, 0, "layer_scalar") catch return null;
+
+    const scalars = try allocator.alloc(f32, layer_count);
+    errdefer allocator.free(scalars);
+    for (0..layer_count) |layer_idx| {
+        const t = try loadLayerTensorBySuffix(safetensors, layer_idx, "layer_scalar");
+        scalars[layer_idx] = try tensorScalarToF32(&t);
+    }
+    return scalars;
+}
+
 /// Complete transformer model for inference
 pub const Transformer = struct {
     model_type: []const u8,
@@ -563,6 +588,11 @@ pub const Transformer = struct {
     // File info for summary (from LoadedModel)
     file_size: usize = 0,
     gemma4_per_layer: ?Gemma4PerLayerRuntime = null,
+
+    // Per-layer scalar multiplier applied to the residual stream at the end of
+    // each decoder layer. Loaded independently of the PLE system so models
+    // with layer_scalar weights but no per-layer embeddings still apply them.
+    layer_scalars: ?[]f32 = null,
 
     // Optional prefill progress callback (set transiently by prefillSlot)
     prefill_progress_fn: ?PrefillProgressFn = null,
@@ -820,6 +850,8 @@ pub const Transformer = struct {
                     resolved_token_ids orelse unreachable,
                     scratch,
                 );
+            } else if (self.layer_scalars) |scalars| {
+                cpu_rowwise.scaleInPlace(layer_output_tensor.asSliceMut(f32), scalars[layer_idx]);
             }
             current_input_tensor = layer_output_tensor;
             write_to_scratch_view = !write_to_scratch_view;
@@ -1100,6 +1132,8 @@ pub const Transformer = struct {
                     resolved_token_ids orelse unreachable,
                     scratch,
                 );
+            } else if (self.layer_scalars) |scalars| {
+                cpu_rowwise.scaleInPlace(layer_output_tensor.asSliceMut(f32), scalars[layer_idx]);
             }
             current_input_tensor = layer_output_tensor;
             write_to_scratch_view = !write_to_scratch_view;
@@ -1247,6 +1281,8 @@ pub const Transformer = struct {
                     resolved_token_ids orelse unreachable,
                     scratch,
                 );
+            } else if (self.layer_scalars) |scalars| {
+                cpu_rowwise.scaleInPlace(layer_output_tensor.asSliceMut(f32), scalars[layer_idx]);
             }
             current_input_tensor = layer_output_tensor;
             write_to_scratch_view = !write_to_scratch_view;
@@ -1627,6 +1663,7 @@ pub const Transformer = struct {
         else
             null;
         const gemma4_per_layer = try initGemma4PerLayerRuntime(allocator, loaded, layer_count);
+        const layer_scalars = try initStandaloneLayerScalars(allocator, loaded, layer_count);
 
         // Model type for debug output.
         const model_type: []const u8 = if (static_entry) |entry| entry.id else "TransformerModel";
@@ -1645,6 +1682,7 @@ pub const Transformer = struct {
             .file_size = loaded.file_size,
             .tensor_count = loaded.tensor_count,
             .gemma4_per_layer = gemma4_per_layer,
+            .layer_scalars = layer_scalars,
         };
     }
 
@@ -1690,6 +1728,7 @@ pub const Transformer = struct {
     /// Free model allocated by build
     pub fn deinit(self: *Transformer, allocator: std.mem.Allocator) void {
         if (self.gemma4_per_layer) |*gemma4| gemma4.deinit(allocator);
+        if (self.layer_scalars) |s| allocator.free(s);
         for (self.layers) |*layer| layer.deinit(allocator);
         allocator.free(self.layers);
         self.* = undefined;

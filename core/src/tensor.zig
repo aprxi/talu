@@ -674,6 +674,9 @@ pub const ModelConfig = struct {
     hidden_size_per_layer_input: i32 = 0,
     vocab_size_per_layer_input: i32 = 0,
     num_kv_shared_layers: i32 = 0,
+    attention_k_eq_v: bool = false, // V projection shares K projection weights
+    use_raw_rms_norm: bool = false, // Norms use w*x instead of (1+w)*x
+    use_v_norm: bool = false, // Apply weightless RMSNorm to values before attention
     bos_token_id: ?i32 = null,
     // Mamba/SSM config (for heterogeneous models like Granite Hybrid)
     mamba_d_state: i32 = 0, // SSM state dimension (e.g., 128)

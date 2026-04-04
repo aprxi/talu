@@ -121,10 +121,10 @@ fn resolveAttentionShapeForInstruction(
     }
 
     var rope_dim_u32 = @min(ctx.rope_dim_u32, head_dim_u32);
-    // Gemma4 per-layer-input models use proportional rotary width for
-    // full-attention layers, but sliding-window layers run local RoPE across the
-    // full per-head width.
-    if (cfg.sliding_window > 0 and ctx.backend.loaded.config.hidden_size_per_layer_input > 0) {
+    // Mixed-attention models use proportional rotary width for full-attention
+    // layers, but sliding-window layers run local RoPE across the full per-head
+    // width.
+    if (cfg.sliding_window > 0 and ctx.backend.loaded.config.global_head_dim > 0) {
         rope_dim_u32 = head_dim_u32;
     }
 

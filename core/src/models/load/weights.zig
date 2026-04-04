@@ -479,8 +479,14 @@ pub fn loadModelWithArchitecture(
             std.mem.eql(u8, v.name, "full_attention")
         else
             false;
+        // When layer_types explicitly resolved this layer's variant, trust that
+        // determination.  Only fall back to the sliding_window_pattern heuristic
+        // when there is no explicit per-layer type information.
+        const has_explicit_layer_types = model_config.layer_types != null;
         const layer_has_global_attn = if (variant_is_full_attention)
             true
+        else if (has_explicit_layer_types and model_config.sliding_window > 0)
+            false
         else if (model_config.sliding_window <= 0)
             true
         else if (model_config.sliding_window_pattern > 0)
@@ -505,6 +511,14 @@ pub fn loadModelWithArchitecture(
             &model_config,
             weight_load_options,
         );
+
+        // When K and V projections share weights, alias v_proj to k_proj if
+        // the checkpoint omitted v_proj for this layer.
+        if (model_config.attention_k_eq_v and weight_map.get("self_attn.v_proj.weight") == null) {
+            if (weight_map.get("self_attn.k_proj.weight")) |k| {
+                try weight_map.put(arena_allocator, "self_attn.v_proj.weight", k);
+            }
+        }
 
         // Optional weight-driven d_ff correction, explicitly enabled by architecture metadata.
         if (arch.resolve_d_ff_from_weights and layer_idx == 0 and (block_type == .attention_mlp or block_type == .shortconv)) {

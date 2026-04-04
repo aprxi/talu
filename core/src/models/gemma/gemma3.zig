@@ -1,5 +1,7 @@
 //! Gemma3 model-version metadata.
 
+const std = @import("std");
+const tensor = @import("../../tensor.zig");
 const layer_ops = @import("../layer_ops.zig");
 const types = @import("../op_types.zig");
 const config_hooks = @import("../config/hook_utils.zig");
@@ -88,7 +90,19 @@ const gemma3_sliding_attention_weights = [_]types.WeightSpec{
     .{ .id = "mlp.up_proj.weight", .suffix = "mlp.up_proj.weight", .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
     .{ .id = "mlp.down_proj.weight", .suffix = "mlp.down_proj.weight", .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
 };
-const gemma3_full_attention_weights = gemma3_sliding_attention_weights;
+// Full-attention variant: v_proj is optional because some models share K/V
+// projections (attention_k_eq_v). When v_proj is absent, the weight loader
+// aliases it to k_proj.
+const gemma3_full_attention_weights = blk: {
+    var weights = gemma3_sliding_attention_weights;
+    for (&weights) |*w| {
+        if (std.mem.eql(u8, w.id, "self_attn.v_proj.weight")) {
+            w.required = false;
+            break;
+        }
+    }
+    break :blk weights;
+};
 var gemma3_block_variants = [_]types.BlockVariant{
     .{ .name = "sliding_attention", .weights = &gemma3_sliding_attention_weights },
     .{ .name = "full_attention", .weights = &gemma3_full_attention_weights },
@@ -98,6 +112,41 @@ const gemma3_global_weights = [_]types.WeightSpec{
     .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
     .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
+/// Config hook for the Gemma family. Applies common text config fields, then
+/// detects Gemma4 variants and sets their required defaults (scaled embeddings,
+/// unit attention scaling, pure RMS norms).
+fn gemmaConfigHook(
+    config_obj: std.json.ObjectMap,
+    root_obj: std.json.ObjectMap,
+    config: *tensor.ModelConfig,
+) void {
+    config_hooks.applyCommonTextConfig(config_obj, root_obj, config);
+
+    // Gemma4 variants use pure RMS norms (w*x, not (1+w)*x), sqrt(d_model)
+    // embedding scaling, and unit attention scaling. Detect via model_type.
+    if (isGemma4(config_obj, root_obj)) {
+        config.use_raw_rms_norm = true;
+        config.use_v_norm = true;
+        if (config.embedding_multiplier == 1.0) {
+            config.embedding_multiplier = @sqrt(@as(f32, @floatFromInt(config.d_model)));
+        }
+        if (config.attention_multiplier == 0.0 and config.query_pre_attn_scalar == 0.0) {
+            config.attention_multiplier = 1.0;
+        }
+    }
+}
+
+fn isGemma4(config_obj: std.json.ObjectMap, root_obj: std.json.ObjectMap) bool {
+    const sources = [_]std.json.ObjectMap{ config_obj, root_obj };
+    for (&sources) |obj| {
+        const mt = obj.get("model_type") orelse continue;
+        if (mt != .string) continue;
+        if (std.mem.eql(u8, mt.string, "gemma4") or std.mem.eql(u8, mt.string, "gemma4_text"))
+            return true;
+    }
+    return false;
+}
+
 const gemma3_perf_hints = perf.standardAttentionMlpHints("gemma3");
 const gemma3_sampling_presets: sp.SamplingPresets = .{
     .general = .{ .temperature = 1.0, .top_p = 0.95, .top_k = 64, .presence_penalty = 0.0 },
@@ -108,7 +157,7 @@ const gemma3_sampling_presets: sp.SamplingPresets = .{
 pub var arch: types.Architecture = .{
     .name = "gemma3",
     .model_types = &gemma3_model_types,
-    .parse_config_hook = config_hooks.applyCommonTextConfigHook,
+    .parse_config_hook = gemmaConfigHook,
     .block_variants = &gemma3_block_variants,
     .layer_map = null,
     .variant_aliases = null,

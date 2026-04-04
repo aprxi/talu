@@ -1935,7 +1935,7 @@ pub fn buildBlocks(
             layer_idx,
         );
         if (block_slot.getAttentionMut()) |attn_ptr| {
-            attn_ptr.use_v_norm = config.hidden_size_per_layer_input > 0;
+            attn_ptr.use_v_norm = config.use_v_norm;
             attn_ptr.kv_shared_source_layer = resolveSharedKvSourceLayer(config, layer_idx);
         }
         // Initialize weight registry now that block is in its final heap location
@@ -2012,7 +2012,7 @@ pub fn buildBlocksFromLayers(
             layer_idx,
         );
         if (block_slot.getAttentionMut()) |attn_ptr| {
-            attn_ptr.use_v_norm = config.hidden_size_per_layer_input > 0;
+            attn_ptr.use_v_norm = config.use_v_norm;
             attn_ptr.kv_shared_source_layer = resolveSharedKvSourceLayer(config, layer_idx);
         }
         try block_slot.initWeightRegistry(allocator, block_weight);

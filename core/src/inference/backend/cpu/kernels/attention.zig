@@ -446,6 +446,15 @@ pub const MultiHeadAttention = struct {
         std.debug.assert(input_tensor.n_dims == 3 and output_tensor.n_dims == 3);
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1); // Only batch=1 supported
         const sequence_len: usize = @intCast(input_tensor.shape[1]);
+        // Debug: print per-layer attention config on first token
+        if (std.posix.getenv("TALU_DEBUG_ATTN_PARAMS") != null and cache.cache_position == 0) {
+            var dbuf: [512]u8 = undefined;
+            const rope_dim: usize = if (self.rope) |r| r.dim else 0;
+            const dmsg = std.fmt.bufPrint(&dbuf, "[DEBUG ATTN L{d}] n_heads={d} n_kv={d} head_dim={d} scale={d:.4} sw={d} rope_dim={d} d_model={d} seq={d}\n", .{
+                self.layer_idx, self.n_heads, self.n_kv_heads, self.head_dim, self.scale, self.sliding_window, rope_dim, self.d_model, sequence_len,
+            }) catch "";
+            _ = std.c.printf("%.*s", @as(c_int, @intCast(dmsg.len)), dmsg.ptr);
+        }
         std.debug.assert(input_tensor.shape[2] == self.d_model and output_tensor.shape[2] == self.d_model);
 
         // Use fused QKV when available (required for native fused, optional optimization for others)
@@ -1344,6 +1353,16 @@ pub const MultiHeadAttention = struct {
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1);
         const sequence_len: usize = @intCast(input_tensor.shape[1]);
         std.debug.assert(input_tensor.shape[2] == self.d_model and output_tensor.shape[2] == self.d_model);
+
+        // Debug: print per-layer attention config on first token
+        if (std.posix.getenv("TALU_DEBUG_ATTN_PARAMS") != null and cache.getPosition(slot_index) == 0) {
+            var dbuf: [512]u8 = undefined;
+            const rope_dim: usize = if (self.rope) |r| r.dim else 0;
+            const dmsg = std.fmt.bufPrint(&dbuf, "[DEBUG ATTN L{d}] n_heads={d} n_kv={d} head_dim={d} scale={d:.4} sw={d} rope_dim={d} d_model={d} seq={d}\n", .{
+                self.layer_idx, self.n_heads, self.n_kv_heads, self.head_dim, self.scale, self.sliding_window, rope_dim, self.d_model, sequence_len,
+            }) catch "";
+            _ = std.c.printf("%.*s", @as(c_int, @intCast(dmsg.len)), dmsg.ptr);
+        }
 
         // Check for fused QKV
         const fused_projection_dim = (if (query_gate) query_dim * 2 else query_dim) + 2 * kv_total_dim;

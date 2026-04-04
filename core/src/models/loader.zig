@@ -100,9 +100,8 @@ pub fn applyRuntimeArchitectureMetadata(
     const uses_per_layer_inputs = loaded_model.config.hidden_size_per_layer_input > 0;
 
     // Apply norm weight offset (for (1+w) style norms).
-    // Gemma4 text layers use pure RMS scale (no +1 weight offset), so force zero
-    // when per-layer input embeddings are enabled.
-    if (uses_per_layer_inputs) {
+    // Models with use_raw_rms_norm use pure w*x scaling (no +1 offset).
+    if (uses_per_layer_inputs or loaded_model.config.use_raw_rms_norm) {
         loaded_model.runtime.weight_offset = 0.0;
         loaded_model.runtime.qk_norm_weight_offset = 0.0;
     } else if (runtime_architecture.norm_weight_offset != 0.0) {
@@ -110,8 +109,12 @@ pub fn applyRuntimeArchitectureMetadata(
         loaded_model.runtime.qk_norm_weight_offset = runtime_architecture.norm_weight_offset;
     }
 
-    // Apply embedding multiplier (e.g., sqrt(hidden_size) scaling)
-    if (runtime_architecture.embedding_multiplier != 1.0 and !uses_per_layer_inputs) {
+    // Apply architecture's default embedding multiplier when the config hook
+    // did not already set one.
+    if (runtime_architecture.embedding_multiplier != 1.0 and
+        !uses_per_layer_inputs and
+        loaded_model.config.embedding_multiplier == 1.0)
+    {
         loaded_model.config.embedding_multiplier = runtime_architecture.embedding_multiplier;
     }
 

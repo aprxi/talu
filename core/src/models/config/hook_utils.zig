@@ -62,16 +62,14 @@ pub fn applyCommonTextConfig(config_obj: std.json.ObjectMap, root_obj: std.json.
     if (getIntFromConfigOrRoot(config_obj, root_obj, "hidden_size_per_layer_input")) |v| config.hidden_size_per_layer_input = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "vocab_size_per_layer_input")) |v| config.vocab_size_per_layer_input = v;
     if (getIntFromConfigOrRoot(config_obj, root_obj, "num_kv_shared_layers")) |v| config.num_kv_shared_layers = v;
+    if (getBoolFromConfigOrRoot(config_obj, root_obj, "attention_k_eq_v")) |v| config.attention_k_eq_v = v;
 
-    // Gemma4 text configs use scaled token embeddings but often omit an explicit
-    // embedding multiplier field. Fall back to sqrt(hidden_size) when per-layer
-    // input embeddings are enabled and no explicit override was provided.
+    // When per-layer input embeddings are enabled, configs often omit explicit
+    // scaling fields. Default to sqrt(hidden_size) embedding scale and unit
+    // attention scaling.
     if (config.hidden_size_per_layer_input > 0 and config.embedding_multiplier == 1.0) {
         config.embedding_multiplier = @sqrt(@as(f32, @floatFromInt(config.d_model)));
     }
-    // Gemma4 text attention runs with unit scaling. Configs usually omit both
-    // attention_multiplier and query_pre_attn_scalar, so avoid defaulting to
-    // 1/sqrt(head_dim) in that case.
     if (config.hidden_size_per_layer_input > 0 and
         config.attention_multiplier == 0.0 and
         config.query_pre_attn_scalar == 0.0)
