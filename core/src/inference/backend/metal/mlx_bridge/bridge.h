@@ -104,6 +104,16 @@ int32_t mlx_decode_topk_candidates(
     int32_t* out_candidate_count
 );
 
+int32_t mlx_decode_topk_candidates_batch(
+    mlx_ctx* const* ctxs,
+    const int32_t* tokens,
+    int32_t top_k,
+    float* const* out_candidate_logits_ptrs,
+    int32_t* const* out_candidate_ids_ptrs,
+    int32_t* out_candidate_counts,
+    int32_t batch_size
+);
+
 int32_t mlx_decode_topk_candidates_with_sampling(
     mlx_ctx* ctx,
     int32_t token,

@@ -170,7 +170,7 @@ const RequestState = struct {
     grammar_schema: ?[]u8 = null,
 
     // --- Timing ---
-    start_ns: i128,
+    start_ns: i128 = 0,
     first_token_ns: i128 = 0,
 
     // --- Counters ---
@@ -185,9 +185,7 @@ const RequestState = struct {
     stop_flag: ?*const std.atomic.Value(bool) = null,
 
     fn init() RequestState {
-        return .{
-            .start_ns = std.time.nanoTimestamp(),
-        };
+        return .{};
     }
 
     fn deinit(self: *RequestState) void {
@@ -476,6 +474,11 @@ pub const BatchWrapper = struct {
             self.engine.allocator.free(t);
         }
 
+        // Start timing at scheduler submit. This keeps TTFT aligned to model
+        // execution latency (prefill + first token), excluding host-side
+        // prompt rendering/tokenization work.
+        state.start_ns = std.time.nanoTimestamp();
+
         // Submit to scheduler.
         const request_id = try self.scheduler.submit(prompt_tokens, max_tokens, .{
             .eos_token_ids = self.engine.gen_config.eos_token_ids,
@@ -496,6 +499,14 @@ pub const BatchWrapper = struct {
     /// Each event contains decoded text, item/content type metadata, and timing.
     /// Text pointers in events are valid until the next step() call.
     pub fn step(self: *BatchWrapper, events_out: []BatchEvent) !usize {
+        return self.stepImpl(events_out, true);
+    }
+
+    fn stepNoText(self: *BatchWrapper, events_out: []BatchEvent) !usize {
+        return self.stepImpl(events_out, false);
+    }
+
+    fn stepImpl(self: *BatchWrapper, events_out: []BatchEvent, decode_text: bool) !usize {
         // Clear per-step delta buffers for all active requests.
         var req_iter = self.requests.valueIterator();
         while (req_iter.next()) |state_ptr| {
@@ -550,62 +561,84 @@ pub const BatchWrapper = struct {
                 state.first_token_ns = event_now_ns;
             }
 
-            // Decode token to raw bytes via pre-computed table (zero-alloc O(1) lookup).
-            const decoded_raw: []const u8 = self.engine.tok.tokenBytes(raw.token) orelse "";
-
-
-            // UTF-8 assembly (same algorithm as capi_bridge.zig).
-            var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
-            const pending_len: usize = state.utf8_pending_len;
-            @memcpy(combined_buf[0..pending_len], state.utf8_pending[0..pending_len]);
-            const raw_copy_len = @min(decoded_raw.len, combined_buf.len - pending_len);
-            @memcpy(combined_buf[pending_len..][0..raw_copy_len], decoded_raw[0..raw_copy_len]);
-            const total_len = pending_len + raw_copy_len;
-            const combined = combined_buf[0..total_len];
-
-            const valid_end = utf8ValidPrefix(combined);
-            const valid = combined[0..valid_end];
-            const trailing = combined[valid_end..total_len];
-
-            // Store trailing incomplete UTF-8 bytes.
-            state.utf8_pending_len = 0;
-            if (trailing.len > 0 and trailing.len <= 3) {
-                const lead = trailing[0];
-                const expected_len: usize = if (lead & 0xE0 == 0xC0)
-                    2
-                else if (lead & 0xF0 == 0xE0)
-                    3
-                else if (lead & 0xF8 == 0xF0)
-                    4
-                else
-                    0;
-                if (expected_len > 0 and trailing.len < expected_len) {
-                    var all_valid = true;
-                    for (trailing[1..]) |cb| {
-                        if (cb & 0xC0 != 0x80) {
-                            all_valid = false;
-                            break;
-                        }
-                    }
-                    if (all_valid) {
-                        state.utf8_pending_len = @intCast(trailing.len);
-                        @memcpy(state.utf8_pending[0..trailing.len], trailing);
-                    }
-                }
-            }
-
-            if (valid.len == 0 and !raw.is_final) continue;
-
             // Classify using scheduler's in_thinking state (from TokenEvent).
             // This is the single source of truth — no text-level tag parsing.
             const token_types = classifyFromThinking(state, raw.in_thinking);
 
-            // Emit event for visible text.
-            if (valid.len > 0) {
-                try state.text_buf.appendSlice(allocator, valid);
-                const delta_base = state.delta_buf.items.len;
-                try state.delta_buf.appendSlice(allocator, valid);
+            if (decode_text) {
+                // Decode token to raw bytes via pre-computed table (zero-alloc O(1) lookup).
+                const decoded_raw: []const u8 = self.engine.tok.tokenBytes(raw.token) orelse "";
 
+                // UTF-8 assembly (same algorithm as capi_bridge.zig).
+                var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
+                const pending_len: usize = state.utf8_pending_len;
+                @memcpy(combined_buf[0..pending_len], state.utf8_pending[0..pending_len]);
+                const raw_copy_len = @min(decoded_raw.len, combined_buf.len - pending_len);
+                @memcpy(combined_buf[pending_len..][0..raw_copy_len], decoded_raw[0..raw_copy_len]);
+                const total_len = pending_len + raw_copy_len;
+                const combined = combined_buf[0..total_len];
+
+                const valid_end = utf8ValidPrefix(combined);
+                const valid = combined[0..valid_end];
+                const trailing = combined[valid_end..total_len];
+
+                // Store trailing incomplete UTF-8 bytes.
+                state.utf8_pending_len = 0;
+                if (trailing.len > 0 and trailing.len <= 3) {
+                    const lead = trailing[0];
+                    const expected_len: usize = if (lead & 0xE0 == 0xC0)
+                        2
+                    else if (lead & 0xF0 == 0xE0)
+                        3
+                    else if (lead & 0xF8 == 0xF0)
+                        4
+                    else
+                        0;
+                    if (expected_len > 0 and trailing.len < expected_len) {
+                        var all_valid = true;
+                        for (trailing[1..]) |cb| {
+                            if (cb & 0xC0 != 0x80) {
+                                all_valid = false;
+                                break;
+                            }
+                        }
+                        if (all_valid) {
+                            state.utf8_pending_len = @intCast(trailing.len);
+                            @memcpy(state.utf8_pending[0..trailing.len], trailing);
+                        }
+                    }
+                }
+
+                if (valid.len == 0 and !raw.is_final) continue;
+
+                // Emit event for visible text.
+                if (valid.len > 0) {
+                    try state.text_buf.appendSlice(allocator, valid);
+                    const delta_base = state.delta_buf.items.len;
+                    try state.delta_buf.appendSlice(allocator, valid);
+
+                    if (event_count < events_out.len) {
+                        const elapsed_ns: i128 = if (event_now_ns > state.start_ns)
+                            event_now_ns - state.start_ns
+                        else
+                            0;
+                        events_out[event_count] = .{
+                            .request_id = raw.request_id,
+                            .event_type = .text_delta,
+                            .item_type = token_types.item_type,
+                            .content_type = token_types.content_type,
+                            .is_final = false,
+                            .text = state.delta_buf.items[delta_base..],
+                            .token_id = raw.token,
+                            .tokens_generated = state.engine_token_count,
+                            .timestamp_ns = elapsed_ns,
+                        };
+                        event_count += 1;
+                    }
+                }
+            } else if (!raw.is_final) {
+                // Non-streaming hot path: keep scheduler/token timing semantics
+                // but skip per-token UTF-8 decode and text-buffer assembly.
                 if (event_count < events_out.len) {
                     const elapsed_ns: i128 = if (event_now_ns > state.start_ns)
                         event_now_ns - state.start_ns
@@ -617,7 +650,7 @@ pub const BatchWrapper = struct {
                         .item_type = token_types.item_type,
                         .content_type = token_types.content_type,
                         .is_final = false,
-                        .text = state.delta_buf.items[delta_base..],
+                        .text = "",
                         .token_id = raw.token,
                         .tokens_generated = state.engine_token_count,
                         .timestamp_ns = elapsed_ns,
@@ -795,6 +828,45 @@ pub const BatchWrapper = struct {
                     }
                 }
             }
+        }
+    }
+
+    /// Run loop variant for non-streaming callers that don't need per-token
+    /// decoded text. Keeps event cadence for cancellation/command wakeups.
+    pub fn runLoopNoText(
+        self: *BatchWrapper,
+        pending_flag: ?*const std.atomic.Value(bool),
+        callback: *const fn ([*]const CEvent, usize, ?*anyopaque) callconv(.c) void,
+        callback_data: ?*anyopaque,
+    ) !void {
+        const max_events = 64;
+        var events_buf: [max_events]BatchEvent = undefined;
+        var c_events_buf: [max_events]CEvent = undefined;
+
+        while (self.scheduler.activeCount() > 0 or self.scheduler.pendingCount() > 0) {
+            if (pending_flag) |flag| {
+                if (flag.load(.acquire)) break;
+            }
+
+            const count = try self.stepNoText(&events_buf);
+            if (count == 0) continue;
+
+            const emit_count = @min(count, max_events);
+            for (events_buf[0..emit_count], 0..) |ev, i| {
+                c_events_buf[i] = .{
+                    .request_id = ev.request_id,
+                    .event_type = @intFromEnum(ev.event_type),
+                    .item_type = ev.item_type,
+                    .content_type = ev.content_type,
+                    .is_final = @intFromBool(ev.is_final),
+                    .text_ptr = if (ev.text.len > 0) ev.text.ptr else null,
+                    .text_len = ev.text.len,
+                    .token_id = ev.token_id,
+                    .tokens_generated = ev.tokens_generated,
+                    .timestamp_ns = @intCast(@min(ev.timestamp_ns, std.math.maxInt(i64))),
+                };
+            }
+            callback(&c_events_buf, emit_count, callback_data);
         }
     }
 

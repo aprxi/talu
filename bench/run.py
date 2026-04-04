@@ -62,10 +62,14 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 
-def _infer_tg_shape(scenario_name: str) -> tuple[int, int] | None:
-    """Infer (max_output_tokens, async in-flight) from tg scenario names."""
-    prefix = "responses/perf/tg"
-    if not scenario_name.startswith(prefix):
+def _infer_perf_shape(scenario_name: str) -> tuple[int, int] | None:
+    """Infer (token_budget, async in-flight) from tg*/pp* scenario names."""
+    prefix = None
+    for candidate in ("responses/perf/tg", "responses/perf/pp"):
+        if scenario_name.startswith(candidate):
+            prefix = candidate
+            break
+    if prefix is None:
         return None
 
     suffix = scenario_name[len(prefix):]
@@ -77,9 +81,9 @@ def _infer_tg_shape(scenario_name: str) -> tuple[int, int] | None:
         i += 1
     if i == 0:
         return None
-    tg_tokens = int(suffix[:i])
+    token_budget = int(suffix[:i])
     if i == len(suffix):
-        return tg_tokens, 1
+        return token_budget, 1
     if suffix[i] != "b":
         return None
 
@@ -88,7 +92,7 @@ def _infer_tg_shape(scenario_name: str) -> tuple[int, int] | None:
         return None
 
     batch = int(batch_part)
-    return tg_tokens, batch if batch > 0 else 1
+    return token_budget, batch if batch > 0 else 1
 
 
 def _coerce_bool(value: object) -> bool:
@@ -244,6 +248,8 @@ def _print_expanded_cmd(args: argparse.Namespace, config: dict) -> None:
         parts.append(f"--resume {args.resume}")
     if args.config:
         parts.append(f"--config {args.config}")
+    if getattr(args, "batched", None):
+        parts.append(f"--batched {args.batched}")
     is_eval = "evals/" in args.scenario
     if is_eval:
         samples_display = args.samples if args.samples is not None and args.samples >= 0 else -1
@@ -333,15 +339,20 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         if args.samples is not None and args.samples >= 0:
             config["samples"] = args.samples
+        if args.batched is not None:
+            if args.batched < 1:
+                print("--batched must be >= 1.", file=sys.stderr)
+                sys.exit(2)
+            config["batched"] = int(args.batched)
         # Default to original only (user can override with --set precision=...).
         precision_explicit = any(s.startswith("precision=") for s in args.set)
         if not precision_explicit:
             config["precision"] = ["original"]
         args.rounds = 1
 
-    # For tg* perf scenarios, align CUDA scheduler capacity and sequence cap
+    # For tg*/pp* perf scenarios, align scheduler capacity and sequence cap
     # with the scenario shape unless explicitly overridden by user/config.
-    tg_shape = _infer_tg_shape(args.scenario)
+    tg_shape = _infer_perf_shape(args.scenario)
     if tg_shape is not None:
         tg_tokens, auto_batch = tg_shape
         # Keep a conservative envelope above prompt + output while remaining
@@ -816,6 +827,8 @@ def print_eval_report(
     samples = config.get("samples")
     if samples is not None:
         param_parts.append(f"samples={samples}")
+    if "batched" in config:
+        param_parts.append(f"batched={config['batched']}")
     for key in ("seed", "temperature", "max_tokens"):
         if key in config:
             param_parts.append(f"{key}={config[key]}")
@@ -1092,6 +1105,8 @@ def main() -> None:
     run_p.add_argument("--rounds", "-r", type=int, default=5, help="Rounds per variant (default: 5).")
     run_p.add_argument("--samples", "-n", type=int, default=None,
                         help="Number of eval samples (-1 = all, default: all). For eval scenarios only.")
+    run_p.add_argument("--batched", type=int, default=None,
+                        help="Eval client-side max in-flight requests (default: 1). For eval scenarios only.")
     run_p.add_argument("--set", "-s", action="append", default=[], metavar="KEY=VALUE",
                         help="Override config value. Parsed as JSON, fallback to string. Repeatable.")
     run_p.add_argument("--env", "-e", action="append", default=[], metavar="KEY=VALUE",

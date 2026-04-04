@@ -41,6 +41,8 @@ std::mutex g_rng_mutex;
 size_t g_active_ctx_count = 0;
 thread_local std::vector<array> g_decode_batch_logits_flat_scratch;
 thread_local std::vector<array> g_prefill_batch_logits_flat_scratch;
+thread_local std::vector<array> g_decode_topk_batch_logits_flat_scratch;
+thread_local std::vector<array> g_decode_topk_batch_ids_flat_scratch;
 
 void enter_rng_epoch(int32_t seed) {
     std::lock_guard<std::mutex> lock(g_rng_mutex);
@@ -106,17 +108,75 @@ std::shared_ptr<const CompiledTopKFn> compiled_topk_candidates(int k) {
             if (vocab < k) {
                 throw std::runtime_error("compiled_topk_candidates k exceeds vocab");
             }
-            // Match metal backend candidate extraction: partition on logits
-            // directly and gather the final K bucket.
-            const array partitioned_indices = argpartition(logits_last, -k, -1);
-            const array top_k_selector = arange(vocab - k, vocab, 1, int32);
-            const array top_k_indices = take(partitioned_indices, top_k_selector, -1);
-            const array top_k_logits = take_along_axis(logits_last, top_k_indices, -1);
+            array top_k_indices = array(0.0f);
+            array top_k_logits = array(0.0f);
+            if (k == 1) {
+                const array top_idx = argmax(logits_last, -1); // [1,1]
+                top_k_indices = reshape(astype(top_idx, int32), {1, 1, 1});
+                top_k_logits = take_along_axis(logits_last, top_k_indices, -1); // [1,1,1]
+            } else {
+                // Match metal backend candidate extraction: partition on logits
+                // directly and gather the final K bucket.
+                const array partitioned_indices = argpartition(logits_last, -k, -1);
+                const array top_k_selector = arange(vocab - k, vocab, 1, int32);
+                top_k_indices = take(partitioned_indices, top_k_selector, -1);
+                top_k_logits = take_along_axis(logits_last, top_k_indices, -1);
+            }
             const array top_k_logits_flat = reshape(astype(top_k_logits, float32), {k});
             const array top_k_indices_flat = reshape(astype(top_k_indices, int32), {k});
             return std::vector<array>{
                 top_k_logits_flat,
                 top_k_indices_flat,
+            };
+        },
+        true
+    );
+    auto inserted = cache.emplace(
+        k,
+        std::make_shared<const CompiledTopKFn>(std::move(fn))
+    );
+    return inserted.first->second;
+}
+
+std::shared_ptr<const CompiledTopKFn> compiled_topk_candidates_rows(int k) {
+    static std::unordered_map<int, std::shared_ptr<const CompiledTopKFn>> cache;
+    static std::mutex cache_mutex;
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(k);
+    if (it != cache.end()) return it->second;
+
+    auto fn = compile(
+        [k](const std::vector<array>& inputs) {
+            const array& logits_last = inputs.at(0); // [B,1,V]
+            if (logits_last.ndim() != 3) {
+                throw std::runtime_error("compiled_topk_candidates_rows expects rank-3 logits");
+            }
+            if (k <= 0) {
+                throw std::runtime_error("compiled_topk_candidates_rows invalid k");
+            }
+            const int batch = logits_last.shape(0);
+            const int vocab = logits_last.shape(2);
+            if (vocab < k) {
+                throw std::runtime_error("compiled_topk_candidates_rows k exceeds vocab");
+            }
+
+            array top_k_indices = array(0.0f);
+            array top_k_logits = array(0.0f);
+            if (k == 1) {
+                const array top_idx = argmax(logits_last, -1); // [B,1]
+                top_k_indices = reshape(astype(top_idx, int32), {batch, 1, 1});
+                top_k_logits = take_along_axis(logits_last, top_k_indices, -1); // [B,1,1]
+            } else {
+                const array partitioned_indices = argpartition(logits_last, -k, -1);
+                const array top_k_selector = arange(vocab - k, vocab, 1, int32);
+                top_k_indices = take(partitioned_indices, top_k_selector, -1); // [B,1,k]
+                top_k_logits = take_along_axis(logits_last, top_k_indices, -1); // [B,1,k]
+            }
+            const array top_k_logits_rows = reshape(astype(top_k_logits, float32), {batch, k});
+            const array top_k_indices_rows = reshape(astype(top_k_indices, int32), {batch, k});
+            return std::vector<array>{
+                top_k_logits_rows,
+                top_k_indices_rows,
             };
         },
         true
@@ -1221,6 +1281,11 @@ struct TraceFrame {
     bool emit_embed = false;
 };
 
+thread_local std::optional<mlx_ctx> g_fused_decode_ctx_cache;
+thread_local std::vector<mlx_ctx*> g_fused_decode_ctx_cache_rows;
+thread_local std::string g_fused_decode_ctx_cache_key;
+thread_local bool g_fused_decode_ctx_cache_dirty = false;
+
 bool xray_should_emit(uint8_t point_id, uint16_t layer, uint32_t position) {
     return talu_metal_xray_should_emit(point_id, layer, position) != 0;
 }
@@ -1317,6 +1382,23 @@ int resolve_prefill_full_prompt_threshold() {
     // For short prompts, one full-prompt forward avoids extra chunk-loop
     // dispatch/sync overhead in the prefill + seed-token path.
     return env_positive_int("TALU_METAL_PREFILL_FULL_PROMPT_THRESHOLD", 128);
+}
+
+int resolve_prefill_batch_full_prompt_threshold() {
+    // Batched eval traffic commonly uses ~120-200 token prompts. A higher
+    // batch-only threshold keeps these requests on fused prefill paths instead
+    // of falling back to per-row serial prefill.
+    return env_positive_int(
+        "TALU_METAL_PREFILL_BATCH_FULL_PROMPT_THRESHOLD",
+        env_positive_int("TALU_METAL_PREFILL_FULL_PROMPT_THRESHOLD", 512)
+    );
+}
+
+int resolve_prefill_batch_len_bucket() {
+    // Variable-length fused prefill pads rows to the group's max prompt
+    // length. Bucketing avoids oversized padding when one long row would
+    // otherwise stretch the whole batch.
+    return env_positive_int("TALU_METAL_PREFILL_BATCH_LEN_BUCKET", 64);
 }
 
 struct MemoryBudgetEstimate {
@@ -1443,7 +1525,10 @@ std::optional<MemoryBudgetEstimate> estimate_memory_budget(
     if (!memory_size.has_value()) return std::nullopt;
     const std::optional<size_t> recommended = recommended_working_set_bytes();
     const int context_tokens = env_positive_int("TALU_METAL_MEMORY_CONTEXT_TOKENS", env_positive_int("TOKENS", 200));
-    const int active_slots = env_positive_int("TALU_METAL_MAX_BATCH_SIZE", 1);
+    const int active_slots = env_positive_int(
+        "TALU_METAL_MAX_BATCH_SIZE",
+        env_positive_int("TALU_CUDA_MAX_BATCH_SIZE", 8)
+    );
 
     MemoryBudgetEstimate estimate{};
     estimate.memory_size_bytes = *memory_size;
@@ -1951,6 +2036,521 @@ void reset_runtime_state(mlx_ctx* ctx) {
         lc.conv_state.reset();
         lc.state.reset();
     }
+}
+
+array slice_batch_row(const array& src, int row) {
+    if (src.ndim() <= 0) {
+        throw std::runtime_error("slice_batch_row expects rank >= 1");
+    }
+    if (row < 0 || row >= src.shape(0)) {
+        throw std::runtime_error("slice_batch_row row out of range");
+    }
+    Shape start(static_cast<size_t>(src.ndim()), 0);
+    Shape end(static_cast<size_t>(src.ndim()), 0);
+    for (int axis = 0; axis < src.ndim(); ++axis) {
+        end[static_cast<size_t>(axis)] = src.shape(axis);
+    }
+    start[0] = row;
+    end[0] = row + 1;
+    return slice(src, start, end);
+}
+
+void scatter_fused_runtime_state_to_ctxs(const mlx_ctx& fused_ctx, mlx_ctx* const* ctxs, int32_t batch_size) {
+    for (int32_t i = 0; i < batch_size; ++i) {
+        mlx_ctx* ctx = ctxs[i];
+        if (!ctx) continue;
+        ctx->stream_ready = true;
+    }
+
+    const size_t layer_count = fused_ctx.kv_cache.size();
+    for (size_t layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
+        const KVCacheState& fused_kv = fused_ctx.kv_cache[layer_idx];
+        for (int32_t row = 0; row < batch_size; ++row) {
+            mlx_ctx* dst = ctxs[row];
+            if (!dst) continue;
+            KVCacheState& dst_kv = dst->kv_cache[layer_idx];
+            if (fused_kv.keys.has_value() && fused_kv.values.has_value()) {
+                dst_kv.keys = slice_batch_row(*fused_kv.keys, row);
+                dst_kv.values = slice_batch_row(*fused_kv.values, row);
+                dst_kv.offset = fused_kv.offset;
+            } else {
+                dst_kv.keys.reset();
+                dst_kv.values.reset();
+                dst_kv.offset = 0;
+            }
+        }
+    }
+
+    const size_t linear_layer_count = fused_ctx.linear_cache.size();
+    for (size_t layer_idx = 0; layer_idx < linear_layer_count; ++layer_idx) {
+        const LinearCacheState& fused_lc = fused_ctx.linear_cache[layer_idx];
+        for (int32_t row = 0; row < batch_size; ++row) {
+            mlx_ctx* dst = ctxs[row];
+            if (!dst) continue;
+            LinearCacheState& dst_lc = dst->linear_cache[layer_idx];
+            if (fused_lc.conv_state.has_value()) {
+                dst_lc.conv_state = slice_batch_row(*fused_lc.conv_state, row);
+            } else {
+                dst_lc.conv_state.reset();
+            }
+            if (fused_lc.state.has_value()) {
+                dst_lc.state = slice_batch_row(*fused_lc.state, row);
+            } else {
+                dst_lc.state.reset();
+            }
+        }
+    }
+}
+
+void scatter_fused_prefill_runtime_state_to_ctxs(
+    const mlx_ctx& fused_ctx,
+    mlx_ctx* const* ctxs,
+    const int32_t* prompt_lens,
+    int32_t batch_size
+) {
+    for (int32_t i = 0; i < batch_size; ++i) {
+        mlx_ctx* ctx = ctxs[i];
+        if (!ctx) continue;
+        ctx->stream_ready = true;
+    }
+
+    const size_t layer_count = fused_ctx.kv_cache.size();
+    for (size_t layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
+        const KVCacheState& fused_kv = fused_ctx.kv_cache[layer_idx];
+        for (int32_t row = 0; row < batch_size; ++row) {
+            mlx_ctx* dst = ctxs[row];
+            if (!dst) continue;
+            const int32_t keep_len = prompt_lens ? prompt_lens[row] : 0;
+            KVCacheState& dst_kv = dst->kv_cache[layer_idx];
+            if (fused_kv.keys.has_value() && fused_kv.values.has_value()) {
+                array row_keys = slice_batch_row(*fused_kv.keys, row);
+                array row_values = slice_batch_row(*fused_kv.values, row);
+                const int seq_len = row_keys.shape(2);
+                const int clipped_len = std::max(0, std::min(keep_len, seq_len));
+                if (clipped_len < seq_len) {
+                    row_keys = slice(
+                        row_keys,
+                        {0, 0, 0, 0},
+                        {1, row_keys.shape(1), clipped_len, row_keys.shape(3)}
+                    );
+                    row_values = slice(
+                        row_values,
+                        {0, 0, 0, 0},
+                        {1, row_values.shape(1), clipped_len, row_values.shape(3)}
+                    );
+                }
+                dst_kv.keys = row_keys;
+                dst_kv.values = row_values;
+                dst_kv.offset = clipped_len;
+            } else {
+                dst_kv.keys.reset();
+                dst_kv.values.reset();
+                dst_kv.offset = 0;
+            }
+        }
+    }
+
+    const size_t linear_layer_count = fused_ctx.linear_cache.size();
+    for (size_t layer_idx = 0; layer_idx < linear_layer_count; ++layer_idx) {
+        const LinearCacheState& fused_lc = fused_ctx.linear_cache[layer_idx];
+        for (int32_t row = 0; row < batch_size; ++row) {
+            mlx_ctx* dst = ctxs[row];
+            if (!dst) continue;
+            LinearCacheState& dst_lc = dst->linear_cache[layer_idx];
+            if (fused_lc.conv_state.has_value()) {
+                dst_lc.conv_state = slice_batch_row(*fused_lc.conv_state, row);
+            } else {
+                dst_lc.conv_state.reset();
+            }
+            if (fused_lc.state.has_value()) {
+                dst_lc.state = slice_batch_row(*fused_lc.state, row);
+            } else {
+                dst_lc.state.reset();
+            }
+        }
+    }
+}
+
+bool build_prefill_fusion_key(
+    const mlx_ctx* ctx,
+    int32_t prompt_len,
+    int full_prompt_threshold,
+    std::string* out_key
+) {
+    if (!ctx || !out_key) return false;
+    if (ctx->xray_enabled) return false;
+    if (prompt_len <= 0 || prompt_len > full_prompt_threshold) return false;
+
+    // Prefill starts from a reset runtime state; rows are compatible when they
+    // share static model topology and prompt length.
+    out_key->clear();
+    out_key->append(std::to_string(prompt_len));
+    out_key->push_back('|');
+    out_key->append(std::to_string(ctx->cfg.num_hidden_layers));
+    out_key->push_back('|');
+    out_key->append(std::to_string(ctx->layers.size()));
+    out_key->push_back('|');
+    out_key->append(std::to_string(ctx->kv_cache.size()));
+    out_key->push_back('|');
+    out_key->append(std::to_string(ctx->linear_cache.size()));
+    return true;
+}
+
+bool build_prefill_topology_key(const mlx_ctx* ctx, std::string* out_key) {
+    if (!ctx || !out_key) return false;
+    if (ctx->xray_enabled) return false;
+    out_key->clear();
+    out_key->append(std::to_string(ctx->cfg.num_hidden_layers));
+    out_key->push_back('|');
+    out_key->append(std::to_string(ctx->layers.size()));
+    out_key->push_back('|');
+    out_key->append(std::to_string(ctx->kv_cache.size()));
+    out_key->push_back('|');
+    out_key->append(std::to_string(ctx->linear_cache.size()));
+    return true;
+}
+
+bool supports_variable_prefill_fusion(const mlx_ctx* ctx) {
+    if (!ctx) return false;
+    if (ctx->has_fp8_meta) return false;
+    for (const LayerWeights& lw : ctx->layers) {
+        // Variable-length fused prefill is only safe for pure full-attention
+        // stacks where runtime state is fully represented by KV cache.
+        if (lw.is_linear || lw.is_shortconv) return false;
+    }
+    return true;
+}
+
+bool supports_ragged_prefill_fusion(const mlx_ctx* ctx) {
+    if (!ctx) return false;
+    if (ctx->xray_enabled) return false;
+    // Keep FP8 path conservative until ragged fused prefill is validated there.
+    if (ctx->has_fp8_meta) return false;
+    return true;
+}
+
+bool build_decode_fusion_key(const mlx_ctx* ctx, std::string* out_key) {
+    if (!ctx || !out_key) return false;
+    if (!ctx->stream_ready || ctx->xray_enabled) return false;
+
+    out_key->clear();
+    out_key->append(std::to_string(ctx->cfg.num_hidden_layers));
+    out_key->push_back('|');
+    out_key->append(std::to_string(ctx->kv_cache.size()));
+    out_key->push_back('|');
+    out_key->append(std::to_string(ctx->linear_cache.size()));
+    out_key->push_back('|');
+
+    // Decode fusion requires identical KV-cache occupancy/offset layout.
+    for (const KVCacheState& kv : ctx->kv_cache) {
+        const bool has_keys = kv.keys.has_value();
+        const bool has_values = kv.values.has_value();
+        if (has_keys != has_values) return false;
+        if (!has_keys) {
+            out_key->append("N;");
+            continue;
+        }
+        out_key->push_back('K');
+        out_key->append(std::to_string(kv.offset));
+        out_key->push_back(';');
+    }
+    return true;
+}
+
+void flush_fused_decode_ctx_cache() {
+    if (!g_fused_decode_ctx_cache.has_value()) return;
+    if (!g_fused_decode_ctx_cache_dirty) return;
+    if (g_fused_decode_ctx_cache_rows.empty()) return;
+    scatter_fused_runtime_state_to_ctxs(
+        g_fused_decode_ctx_cache.value(),
+        g_fused_decode_ctx_cache_rows.data(),
+        static_cast<int32_t>(g_fused_decode_ctx_cache_rows.size())
+    );
+    g_fused_decode_ctx_cache_dirty = false;
+}
+
+void clear_fused_decode_ctx_cache() {
+    flush_fused_decode_ctx_cache();
+    g_fused_decode_ctx_cache.reset();
+    g_fused_decode_ctx_cache_rows.clear();
+    g_fused_decode_ctx_cache_key.clear();
+    g_fused_decode_ctx_cache_dirty = false;
+}
+
+bool same_ctx_row_set(const std::vector<mlx_ctx*>& lhs, const std::vector<mlx_ctx*>& rhs) {
+    if (lhs.size() != rhs.size()) return false;
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        if (lhs[i] != rhs[i]) return false;
+    }
+    return true;
+}
+
+bool try_get_cached_fused_decode_ctx(
+    const std::vector<mlx_ctx*>& rows,
+    const std::string& key,
+    mlx_ctx** out_ctx
+) {
+    if (!out_ctx) return false;
+    *out_ctx = nullptr;
+    if (!g_fused_decode_ctx_cache.has_value()) return false;
+    if (g_fused_decode_ctx_cache_key != key) return false;
+    if (!same_ctx_row_set(g_fused_decode_ctx_cache_rows, rows)) return false;
+    *out_ctx = &g_fused_decode_ctx_cache.value();
+    return true;
+}
+
+bool try_get_cached_fused_decode_ctx_by_rows(
+    const std::vector<mlx_ctx*>& rows,
+    mlx_ctx** out_ctx
+) {
+    if (!out_ctx) return false;
+    *out_ctx = nullptr;
+    if (!g_fused_decode_ctx_cache.has_value()) return false;
+    if (!same_ctx_row_set(g_fused_decode_ctx_cache_rows, rows)) return false;
+    *out_ctx = &g_fused_decode_ctx_cache.value();
+    return true;
+}
+
+void store_cached_fused_decode_ctx(
+    const std::vector<mlx_ctx*>& rows,
+    const std::string& key,
+    const mlx_ctx& fused_ctx
+) {
+    g_fused_decode_ctx_cache = fused_ctx;
+    g_fused_decode_ctx_cache_rows = rows;
+    g_fused_decode_ctx_cache_key = key;
+    g_fused_decode_ctx_cache_dirty = false;
+}
+
+bool prepare_fused_decode_ctx(
+    mlx_ctx* const* ctxs,
+    int32_t batch_size,
+    mlx_ctx* fused_ctx,
+    int32_t* out_common_offset
+) {
+    if (!ctxs || batch_size <= 1 || !fused_ctx || !out_common_offset) return false;
+    mlx_ctx* first = ctxs[0];
+    if (!first) return false;
+    if (first->xray_enabled) return false;
+    if (!first->stream_ready) return false;
+
+    for (int32_t i = 1; i < batch_size; ++i) {
+        mlx_ctx* ctx = ctxs[i];
+        if (!ctx) return false;
+        if (!ctx->stream_ready) return false;
+        if (ctx->xray_enabled) return false;
+        if (ctx->cfg.num_hidden_layers != first->cfg.num_hidden_layers) return false;
+    }
+
+    *fused_ctx = *first;
+    fused_ctx->xray_enabled = false;
+    fused_ctx->stream_ready = true;
+    fused_ctx->sampling_context_counts.clear();
+    fused_ctx->sampling_context_len = 0;
+    fused_ctx->sampling_unique_ids.clear();
+    fused_ctx->sampling_repetition_scales.clear();
+    fused_ctx->sampling_additive_penalties.clear();
+
+    int32_t common_offset = -1;
+    for (size_t layer_idx = 0; layer_idx < fused_ctx->kv_cache.size(); ++layer_idx) {
+        KVCacheState& fused_kv = fused_ctx->kv_cache[layer_idx];
+        const KVCacheState& first_kv = ctxs[0]->kv_cache[layer_idx];
+        const bool has_layer_kv = first_kv.keys.has_value() && first_kv.values.has_value();
+
+        if (!has_layer_kv) {
+            for (int32_t row = 0; row < batch_size; ++row) {
+                const KVCacheState& row_kv = ctxs[row]->kv_cache[layer_idx];
+                const bool row_has_kv = row_kv.keys.has_value() && row_kv.values.has_value();
+                if (row_has_kv) return false;
+            }
+            fused_kv.keys.reset();
+            fused_kv.values.reset();
+            fused_kv.offset = 0;
+            continue;
+        }
+
+        std::vector<array> keys_rows;
+        std::vector<array> values_rows;
+        keys_rows.reserve(static_cast<size_t>(batch_size));
+        values_rows.reserve(static_cast<size_t>(batch_size));
+
+        int layer_offset = -1;
+        for (int32_t row = 0; row < batch_size; ++row) {
+            const KVCacheState& row_kv = ctxs[row]->kv_cache[layer_idx];
+            if (!row_kv.keys.has_value() || !row_kv.values.has_value()) return false;
+            if (layer_offset < 0) {
+                layer_offset = row_kv.offset;
+            } else if (row_kv.offset != layer_offset) {
+                return false;
+            }
+            keys_rows.push_back(*row_kv.keys);
+            values_rows.push_back(*row_kv.values);
+        }
+        if (common_offset < 0) {
+            common_offset = layer_offset;
+        } else if (layer_offset != common_offset) {
+            return false;
+        }
+
+        fused_kv.keys = concatenate(keys_rows, 0);
+        fused_kv.values = concatenate(values_rows, 0);
+        fused_kv.offset = layer_offset;
+    }
+
+    for (size_t layer_idx = 0; layer_idx < fused_ctx->linear_cache.size(); ++layer_idx) {
+        std::vector<array> conv_rows;
+        std::vector<array> state_rows;
+
+        const LinearCacheState& first_lc = ctxs[0]->linear_cache[layer_idx];
+        const bool has_conv = first_lc.conv_state.has_value();
+        const bool has_state = first_lc.state.has_value();
+        if (has_conv) conv_rows.reserve(static_cast<size_t>(batch_size));
+        if (has_state) state_rows.reserve(static_cast<size_t>(batch_size));
+
+        for (int32_t row = 0; row < batch_size; ++row) {
+            const LinearCacheState& row_lc = ctxs[row]->linear_cache[layer_idx];
+            if (row_lc.conv_state.has_value() != has_conv) return false;
+            if (row_lc.state.has_value() != has_state) return false;
+            if (has_conv) conv_rows.push_back(*row_lc.conv_state);
+            if (has_state) state_rows.push_back(*row_lc.state);
+        }
+
+        LinearCacheState& fused_lc = fused_ctx->linear_cache[layer_idx];
+        if (has_conv) {
+            fused_lc.conv_state = concatenate(conv_rows, 0);
+        } else {
+            fused_lc.conv_state.reset();
+        }
+        if (has_state) {
+            fused_lc.state = concatenate(state_rows, 0);
+        } else {
+            fused_lc.state.reset();
+        }
+    }
+
+    *out_common_offset = common_offset >= 0 ? common_offset : 0;
+    return true;
+}
+
+bool run_ragged_prefill_group(
+    const std::vector<int32_t>& group_rows,
+    mlx_ctx* const* ctxs,
+    const int32_t* const* prompt_ids_ptrs,
+    const int32_t* prompt_lens,
+    float* const* out_logits_ptrs,
+    int32_t logits_len,
+    std::vector<uint8_t>* prefill_done
+) {
+    if (!ctxs || !prompt_ids_ptrs || !prompt_lens || !out_logits_ptrs || !prefill_done) {
+        return false;
+    }
+    if (group_rows.size() < 2) return false;
+
+    std::vector<int32_t> active_rows = group_rows;
+    std::stable_sort(
+        active_rows.begin(),
+        active_rows.end(),
+        [&](int32_t lhs, int32_t rhs) {
+            return prompt_lens[lhs] < prompt_lens[rhs];
+        }
+    );
+
+    for (int32_t row_idx : active_rows) {
+        reset_runtime_state(ctxs[row_idx]);
+        ctxs[row_idx]->xray_enabled = false;
+    }
+
+    int32_t consumed_len = 0;
+    while (!active_rows.empty()) {
+        const int32_t stage_target_len = prompt_lens[active_rows[0]];
+        if (stage_target_len <= consumed_len) {
+            throw std::runtime_error("run_ragged_prefill_group: invalid stage length");
+        }
+        const int32_t stage_len = stage_target_len - consumed_len;
+        const int32_t stage_batch = static_cast<int32_t>(active_rows.size());
+
+        std::vector<mlx_ctx*> stage_ctxs(active_rows.size());
+        for (size_t i = 0; i < active_rows.size(); ++i) {
+            stage_ctxs[i] = ctxs[active_rows[i]];
+        }
+
+        array logits_rows = array(0.0f);
+        if (stage_batch == 1) {
+            const int32_t row_idx = active_rows[0];
+            const int32_t* stage_tokens = prompt_ids_ptrs[row_idx] + consumed_len;
+            const array stage_arr(stage_tokens, Shape{1, stage_len}, int32);
+            const array full_logits = forward_logits(ctxs[row_idx], stage_arr);
+            if (full_logits.ndim() != 3 || full_logits.shape(2) != logits_len) {
+                throw std::runtime_error("run_ragged_prefill_group: logits shape mismatch");
+            }
+            logits_rows = reshape(astype(last_token_logits(full_logits), float32), {1, logits_len});
+            eval(logits_rows);
+            synchronize();
+            ctxs[row_idx]->stream_ready = true;
+        } else {
+            mlx_ctx fused_ctx;
+            if (consumed_len == 0) {
+                fused_ctx = *ctxs[active_rows[0]];
+                reset_runtime_state(&fused_ctx);
+                fused_ctx.xray_enabled = false;
+            } else {
+                int32_t common_offset = 0;
+                const bool prepared = prepare_fused_decode_ctx(
+                    stage_ctxs.data(),
+                    stage_batch,
+                    &fused_ctx,
+                    &common_offset
+                );
+                if (!prepared || common_offset != consumed_len) {
+                    return false;
+                }
+            }
+
+            std::vector<int32_t> stage_tokens(
+                static_cast<size_t>(stage_batch) * static_cast<size_t>(stage_len)
+            );
+            for (int32_t row = 0; row < stage_batch; ++row) {
+                const int32_t src_row = active_rows[static_cast<size_t>(row)];
+                const int32_t* src = prompt_ids_ptrs[src_row] + consumed_len;
+                int32_t* dst = stage_tokens.data() +
+                    static_cast<size_t>(row) * static_cast<size_t>(stage_len);
+                std::memcpy(dst, src, static_cast<size_t>(stage_len) * sizeof(int32_t));
+            }
+
+            const array stage_arr(stage_tokens.data(), Shape{stage_batch, stage_len}, int32);
+            const array full_logits = forward_logits(&fused_ctx, stage_arr);
+            if (full_logits.ndim() != 3 || full_logits.shape(2) != logits_len) {
+                throw std::runtime_error("run_ragged_prefill_group: fused logits shape mismatch");
+            }
+            logits_rows = reshape(astype(last_token_logits(full_logits), float32), {stage_batch, logits_len});
+            eval(logits_rows);
+            synchronize();
+            scatter_fused_runtime_state_to_ctxs(fused_ctx, stage_ctxs.data(), stage_batch);
+        }
+
+        const float* rows_ptr = logits_rows.data<float>();
+        const size_t row_bytes = static_cast<size_t>(logits_len) * sizeof(float);
+        std::vector<int32_t> next_active;
+        next_active.reserve(active_rows.size());
+        for (size_t row = 0; row < active_rows.size(); ++row) {
+            const int32_t src_row = active_rows[row];
+            if (prompt_lens[src_row] == stage_target_len) {
+                std::memcpy(
+                    out_logits_ptrs[src_row],
+                    rows_ptr + row * static_cast<size_t>(logits_len),
+                    row_bytes
+                );
+                ctxs[src_row]->trace_decode_token = 1;
+                (*prefill_done)[static_cast<size_t>(src_row)] = 1;
+            } else {
+                next_active.push_back(src_row);
+            }
+        }
+        active_rows.swap(next_active);
+        consumed_len = stage_target_len;
+    }
+
+    return true;
 }
 
 } // namespace
@@ -2683,6 +3283,7 @@ int32_t mlx_prefill_logits(
     }
 
     try {
+        clear_fused_decode_ctx_cache();
         std::vector<int32_t> prompt_vec(prompt_ids, prompt_ids + prompt_len);
         reset_runtime_state(ctx);
         ctx->xray_enabled = (talu_metal_xray_is_enabled() != 0);
@@ -2796,19 +3397,195 @@ int32_t mlx_prefill_logits_batch(
     }
 
     try {
-        const int full_prompt_threshold = resolve_prefill_full_prompt_threshold();
+        clear_fused_decode_ctx_cache();
+        const int full_prompt_threshold = resolve_prefill_batch_full_prompt_threshold();
+        const int len_bucket = resolve_prefill_batch_len_bucket();
+        std::vector<uint8_t> prefill_done(static_cast<size_t>(batch_size), 0);
+
+        // Grouped fused prefill:
+        // - T| topology groups: full-attention variable-length fused prefill.
+        // - R| topology groups: staged ragged fused prefill (safe for hybrid).
+        // - P| prompt+topology groups: fixed-length fused prefill.
+        std::unordered_map<std::string, std::vector<int32_t>> prefill_groups;
+        prefill_groups.reserve(static_cast<size_t>(batch_size));
+        for (int32_t idx = 0; idx < batch_size; ++idx) {
+            if (prompt_lens[idx] > full_prompt_threshold) {
+                continue;
+            }
+
+            std::string key;
+            if (supports_variable_prefill_fusion(ctxs[idx])) {
+                if (!build_prefill_topology_key(ctxs[idx], &key)) continue;
+                key = "T|" + key;
+                if (len_bucket > 0) {
+                    const int32_t bucket_id = prompt_lens[idx] / len_bucket;
+                    key.push_back('|');
+                    key.append(std::to_string(bucket_id));
+                }
+            } else if (supports_ragged_prefill_fusion(ctxs[idx])) {
+                if (!build_prefill_topology_key(ctxs[idx], &key)) continue;
+                key = "R|" + key;
+            } else {
+                if (!build_prefill_fusion_key(ctxs[idx], prompt_lens[idx], full_prompt_threshold, &key)) continue;
+                key = "P|" + key;
+            }
+            prefill_groups[key].push_back(idx);
+        }
+
+        for (auto& entry : prefill_groups) {
+            const std::string& group_key = entry.first;
+            std::vector<int32_t>& rows = entry.second;
+            const int32_t group_size = static_cast<int32_t>(rows.size());
+            if (group_size < 2) continue;
+
+            const bool ragged_group = group_key.rfind("R|", 0) == 0;
+            if (ragged_group) {
+                (void)run_ragged_prefill_group(
+                    rows,
+                    ctxs,
+                    prompt_ids_ptrs,
+                    prompt_lens,
+                    out_logits_ptrs,
+                    logits_len,
+                    &prefill_done
+                );
+                continue;
+            }
+
+            const bool variable_len_capable = supports_variable_prefill_fusion(ctxs[rows[0]]);
+            const int32_t first_prompt_len = prompt_lens[rows[0]];
+            int32_t max_prompt_len = first_prompt_len;
+            bool all_same_prompt_len = true;
+            for (int32_t row_idx : rows) {
+                const int32_t row_prompt_len = prompt_lens[row_idx];
+                max_prompt_len = std::max(max_prompt_len, row_prompt_len);
+                if (row_prompt_len != first_prompt_len) {
+                    all_same_prompt_len = false;
+                }
+            }
+            const bool variable_prompt_group = variable_len_capable && !all_same_prompt_len;
+            const int32_t group_prompt_len = variable_prompt_group ? max_prompt_len : first_prompt_len;
+
+            for (int32_t row_idx : rows) {
+                reset_runtime_state(ctxs[row_idx]);
+                ctxs[row_idx]->xray_enabled = false;
+            }
+
+            std::vector<int32_t> prompt_matrix(
+                static_cast<size_t>(group_size) * static_cast<size_t>(group_prompt_len)
+            );
+            for (int32_t row = 0; row < group_size; ++row) {
+                const int32_t src_row = rows[static_cast<size_t>(row)];
+                const int32_t* src = prompt_ids_ptrs[src_row];
+                const int32_t src_prompt_len = prompt_lens[src_row];
+                int32_t* dst = prompt_matrix.data() + static_cast<size_t>(row) * static_cast<size_t>(group_prompt_len);
+                std::memcpy(
+                    dst,
+                    src,
+                    static_cast<size_t>(src_prompt_len) * sizeof(int32_t)
+                );
+                if (src_prompt_len < group_prompt_len) {
+                    const int32_t pad_token = src[src_prompt_len - 1];
+                    std::fill(
+                        dst + src_prompt_len,
+                        dst + group_prompt_len,
+                        pad_token
+                    );
+                }
+            }
+
+            mlx_ctx fused_ctx = *ctxs[rows[0]];
+            reset_runtime_state(&fused_ctx);
+            fused_ctx.xray_enabled = false;
+
+            const array prompt_arr(
+                prompt_matrix.data(),
+                Shape{group_size, group_prompt_len},
+                int32
+            );
+            const array full_logits = forward_logits(&fused_ctx, prompt_arr); // [B,S,V]
+            const int vocab_size = full_logits.shape(2);
+            if (vocab_size != logits_len) {
+                g_last_error = "mlx_prefill_logits_batch: logits length mismatch";
+                return 0;
+            }
+
+            array logits_rows = array(0.0f);
+            if (variable_prompt_group) {
+                std::vector<int32_t> gather_indices(static_cast<size_t>(group_size));
+                for (int32_t row = 0; row < group_size; ++row) {
+                    const int32_t src_row = rows[static_cast<size_t>(row)];
+                    gather_indices[static_cast<size_t>(row)] = prompt_lens[src_row] - 1;
+                }
+                const array gather_idx_base(
+                    gather_indices.data(),
+                    Shape{group_size, 1, 1},
+                    int32
+                );
+                const array gather_idx = repeat(gather_idx_base, vocab_size, 2); // [B,1,V]
+                const array gathered_logits = take_along_axis(full_logits, gather_idx, 1); // [B,1,V]
+                logits_rows = reshape(astype(gathered_logits, float32), {group_size, logits_len});
+            } else {
+                const array logits_last = last_token_logits(full_logits);
+                logits_rows = reshape(astype(logits_last, float32), {group_size, logits_len});
+            }
+            eval(logits_rows);
+            synchronize();
+
+            std::vector<mlx_ctx*> group_ctxs(static_cast<size_t>(group_size));
+            const float* rows_ptr = logits_rows.data<float>();
+            const size_t row_bytes = static_cast<size_t>(logits_len) * sizeof(float);
+            for (int32_t row = 0; row < group_size; ++row) {
+                const int32_t src_row = rows[static_cast<size_t>(row)];
+                std::memcpy(
+                    out_logits_ptrs[src_row],
+                    rows_ptr + static_cast<size_t>(row) * static_cast<size_t>(logits_len),
+                    row_bytes
+                );
+                ctxs[src_row]->trace_decode_token = 1;
+                prefill_done[static_cast<size_t>(src_row)] = 1;
+                group_ctxs[static_cast<size_t>(row)] = ctxs[src_row];
+            }
+            if (variable_prompt_group) {
+                std::vector<int32_t> group_prompt_lens(static_cast<size_t>(group_size));
+                for (int32_t row = 0; row < group_size; ++row) {
+                    const int32_t src_row = rows[static_cast<size_t>(row)];
+                    group_prompt_lens[static_cast<size_t>(row)] = prompt_lens[src_row];
+                }
+                scatter_fused_prefill_runtime_state_to_ctxs(
+                    fused_ctx,
+                    group_ctxs.data(),
+                    group_prompt_lens.data(),
+                    group_size
+                );
+            } else {
+                scatter_fused_runtime_state_to_ctxs(fused_ctx, group_ctxs.data(), group_size);
+            }
+        }
+
+        std::vector<int32_t> fallback_rows;
+        fallback_rows.reserve(static_cast<size_t>(batch_size));
+        for (int32_t idx = 0; idx < batch_size; ++idx) {
+            if (prefill_done[static_cast<size_t>(idx)] == 0) {
+                fallback_rows.push_back(idx);
+            }
+        }
+        if (fallback_rows.empty()) {
+            return 1;
+        }
+
         auto& prefill_logits_flat_batch = g_prefill_batch_logits_flat_scratch;
         prefill_logits_flat_batch.clear();
-        if (prefill_logits_flat_batch.capacity() < static_cast<size_t>(batch_size)) {
-            prefill_logits_flat_batch.reserve(static_cast<size_t>(batch_size));
+        if (prefill_logits_flat_batch.capacity() < fallback_rows.size()) {
+            prefill_logits_flat_batch.reserve(fallback_rows.size());
         }
 
         std::vector<std::vector<int32_t>> prompt_storage;
-        if (prompt_storage.capacity() < static_cast<size_t>(batch_size)) {
-            prompt_storage.reserve(static_cast<size_t>(batch_size));
+        if (prompt_storage.capacity() < fallback_rows.size()) {
+            prompt_storage.reserve(fallback_rows.size());
         }
 
-        for (int32_t idx = 0; idx < batch_size; ++idx) {
+        for (int32_t idx : fallback_rows) {
             mlx_ctx* ctx = ctxs[idx];
             const int32_t* prompt_ids = prompt_ids_ptrs[idx];
             const int32_t prompt_len = prompt_lens[idx];
@@ -2847,11 +3624,14 @@ int32_t mlx_prefill_logits_batch(
             prefill_logits_flat_batch.push_back(first_logits_flat);
         }
 
-        eval(prefill_logits_flat_batch);
-        synchronize();
+        if (!prefill_logits_flat_batch.empty()) {
+            eval(prefill_logits_flat_batch);
+            synchronize();
+        }
 
-        for (int32_t idx = 0; idx < batch_size; ++idx) {
-            const array& logits_flat = prefill_logits_flat_batch[static_cast<size_t>(idx)];
+        for (size_t i = 0; i < fallback_rows.size(); ++i) {
+            const int32_t idx = fallback_rows[i];
+            const array& logits_flat = prefill_logits_flat_batch[i];
             std::memcpy(
                 out_logits_ptrs[idx],
                 logits_flat.data<float>(),
@@ -2981,6 +3761,7 @@ int32_t mlx_decode_logits(
     }
 
     try {
+        clear_fused_decode_ctx_cache();
         const int32_t token_scalar = token;
         const array token_arr(&token_scalar, Shape{1, 1}, int32);
         const bool decode_trace_enabled = ctx->xray_enabled &&
@@ -3051,13 +3832,179 @@ int32_t mlx_decode_logits_batch(
     }
 
     try {
-        auto& next_logits_flat_batch = g_decode_batch_logits_flat_scratch;
-        next_logits_flat_batch.clear();
-        if (next_logits_flat_batch.capacity() < static_cast<size_t>(batch_size)) {
-            next_logits_flat_batch.reserve(static_cast<size_t>(batch_size));
+        std::vector<mlx_ctx*> current_rows(static_cast<size_t>(batch_size));
+        for (int32_t i = 0; i < batch_size; ++i) {
+            current_rows[static_cast<size_t>(i)] = ctxs[i];
+        }
+        if (g_fused_decode_ctx_cache_dirty &&
+            !same_ctx_row_set(g_fused_decode_ctx_cache_rows, current_rows))
+        {
+            clear_fused_decode_ctx_cache();
         }
 
+        mlx_ctx* cached_fused_ctx = nullptr;
+        if (try_get_cached_fused_decode_ctx_by_rows(current_rows, &cached_fused_ctx)) {
+            std::vector<int32_t> token_vec(static_cast<size_t>(batch_size));
+            for (int32_t i = 0; i < batch_size; ++i) {
+                token_vec[static_cast<size_t>(i)] = tokens[i];
+            }
+
+            const array token_arr(token_vec.data(), Shape{batch_size, 1}, int32);
+            const array logits_last = last_token_logits(forward_logits(cached_fused_ctx, token_arr)); // [B,1,V]
+            const array logits_rows = reshape(astype(logits_last, float32), {batch_size, logits_len});
+            eval(logits_rows);
+            synchronize();
+
+            const float* rows_ptr = logits_rows.data<float>();
+            const size_t row_bytes = static_cast<size_t>(logits_len) * sizeof(float);
+            for (int32_t i = 0; i < batch_size; ++i) {
+                std::memcpy(
+                    out_logits_ptrs[i],
+                    rows_ptr + static_cast<size_t>(i) * static_cast<size_t>(logits_len),
+                    row_bytes
+                );
+                ctxs[i]->trace_decode_token += 1;
+            }
+            g_fused_decode_ctx_cache_dirty = true;
+            return 1;
+        }
+
+        // Fast path: if the entire batch is fuse-compatible, run one fused
+        // decode directly and skip per-token grouping/key construction.
+        mlx_ctx fused_ctx_full_batch;
+        int32_t full_batch_common_offset = -1;
+        if (prepare_fused_decode_ctx(
+                ctxs,
+                batch_size,
+                &fused_ctx_full_batch,
+                &full_batch_common_offset
+            ) &&
+            full_batch_common_offset >= 0)
+        {
+            std::vector<int32_t> token_vec(static_cast<size_t>(batch_size));
+            for (int32_t i = 0; i < batch_size; ++i) {
+                token_vec[static_cast<size_t>(i)] = tokens[i];
+            }
+
+            const array token_arr(token_vec.data(), Shape{batch_size, 1}, int32);
+            const array logits_last = last_token_logits(forward_logits(&fused_ctx_full_batch, token_arr)); // [B,1,V]
+            const array logits_rows = reshape(astype(logits_last, float32), {batch_size, logits_len});
+            eval(logits_rows);
+            synchronize();
+
+            const float* rows_ptr = logits_rows.data<float>();
+            const size_t row_bytes = static_cast<size_t>(logits_len) * sizeof(float);
+            for (int32_t i = 0; i < batch_size; ++i) {
+                std::memcpy(
+                    out_logits_ptrs[i],
+                    rows_ptr + static_cast<size_t>(i) * static_cast<size_t>(logits_len),
+                    row_bytes
+                );
+                ctxs[i]->trace_decode_token += 1;
+            }
+            scatter_fused_runtime_state_to_ctxs(fused_ctx_full_batch, ctxs, batch_size);
+
+            std::string next_key;
+            if (build_decode_fusion_key(ctxs[0], &next_key)) {
+                store_cached_fused_decode_ctx(current_rows, next_key, fused_ctx_full_batch);
+            } else {
+                clear_fused_decode_ctx_cache();
+            }
+            return 1;
+        }
+
+        std::vector<uint8_t> decode_done(static_cast<size_t>(batch_size), 0);
+
+        // Group rows by compatible decode runtime state, then fuse each group.
+        std::unordered_map<std::string, std::vector<int32_t>> decode_groups;
+        decode_groups.reserve(static_cast<size_t>(batch_size));
+        for (int32_t row = 0; row < batch_size; ++row) {
+            std::string key;
+            if (!build_decode_fusion_key(ctxs[row], &key)) continue;
+            decode_groups[key].push_back(row);
+        }
+
+        for (auto& entry : decode_groups) {
+            std::vector<int32_t>& rows = entry.second;
+            const int32_t group_size = static_cast<int32_t>(rows.size());
+            if (group_size < 2) continue;
+            const std::string& group_key = entry.first;
+
+            std::vector<mlx_ctx*> group_ctxs(static_cast<size_t>(group_size));
+            for (int32_t i = 0; i < group_size; ++i) {
+                group_ctxs[static_cast<size_t>(i)] = ctxs[rows[static_cast<size_t>(i)]];
+            }
+
+            mlx_ctx fused_ctx_local;
+            mlx_ctx* fused_ctx = nullptr;
+            const bool cache_hit = try_get_cached_fused_decode_ctx(group_ctxs, group_key, &fused_ctx);
+            if (!cache_hit) {
+                int32_t common_offset = -1;
+                if (!prepare_fused_decode_ctx(group_ctxs.data(), group_size, &fused_ctx_local, &common_offset) ||
+                    common_offset < 0)
+                {
+                    continue;
+                }
+                fused_ctx = &fused_ctx_local;
+            }
+
+            std::vector<int32_t> token_vec(static_cast<size_t>(group_size));
+            for (int32_t i = 0; i < group_size; ++i) {
+                token_vec[static_cast<size_t>(i)] = tokens[rows[static_cast<size_t>(i)]];
+            }
+
+            const array token_arr(token_vec.data(), Shape{group_size, 1}, int32);
+            const array logits_last = last_token_logits(forward_logits(fused_ctx, token_arr)); // [B,1,V]
+            const array logits_rows = reshape(astype(logits_last, float32), {group_size, logits_len});
+            eval(logits_rows);
+            synchronize();
+
+            const float* rows_ptr = logits_rows.data<float>();
+            const size_t row_bytes = static_cast<size_t>(logits_len) * sizeof(float);
+            for (int32_t i = 0; i < group_size; ++i) {
+                const int32_t row = rows[static_cast<size_t>(i)];
+                std::memcpy(
+                    out_logits_ptrs[row],
+                    rows_ptr + static_cast<size_t>(i) * static_cast<size_t>(logits_len),
+                    row_bytes
+                );
+                ctxs[row]->trace_decode_token += 1;
+                decode_done[static_cast<size_t>(row)] = 1;
+            }
+            scatter_fused_runtime_state_to_ctxs(*fused_ctx, group_ctxs.data(), group_size);
+
+            std::string next_key;
+            if (build_decode_fusion_key(group_ctxs[0], &next_key)) {
+                if (!cache_hit) {
+                    store_cached_fused_decode_ctx(group_ctxs, next_key, *fused_ctx);
+                } else {
+                    g_fused_decode_ctx_cache_rows = group_ctxs;
+                    g_fused_decode_ctx_cache_key = next_key;
+                    g_fused_decode_ctx_cache_dirty = false;
+                }
+            } else {
+                clear_fused_decode_ctx_cache();
+            }
+        }
+
+        std::vector<int32_t> fallback_rows;
+        fallback_rows.reserve(static_cast<size_t>(batch_size));
         for (int32_t i = 0; i < batch_size; ++i) {
+            if (decode_done[static_cast<size_t>(i)] == 0) {
+                fallback_rows.push_back(i);
+            }
+        }
+        if (fallback_rows.empty()) {
+            return 1;
+        }
+
+        auto& next_logits_flat_batch = g_decode_batch_logits_flat_scratch;
+        next_logits_flat_batch.clear();
+        if (next_logits_flat_batch.capacity() < fallback_rows.size()) {
+            next_logits_flat_batch.reserve(fallback_rows.size());
+        }
+
+        for (int32_t i : fallback_rows) {
             mlx_ctx* ctx = ctxs[i];
             const int32_t token_scalar = tokens[i];
             const array token_arr(&token_scalar, Shape{1, 1}, int32);
@@ -3085,13 +4032,16 @@ int32_t mlx_decode_logits_batch(
             next_logits_flat_batch.push_back(next_logits_flat);
         }
 
-        eval(next_logits_flat_batch);
-        synchronize();
+        if (!next_logits_flat_batch.empty()) {
+            eval(next_logits_flat_batch);
+            synchronize();
+        }
         const size_t bytes = static_cast<size_t>(logits_len) * sizeof(float);
-        for (int32_t i = 0; i < batch_size; ++i) {
+        for (size_t row_idx = 0; row_idx < fallback_rows.size(); ++row_idx) {
+            const int32_t i = fallback_rows[row_idx];
             std::memcpy(
                 out_logits_ptrs[i],
-                next_logits_flat_batch[static_cast<size_t>(i)].data<float>(),
+                next_logits_flat_batch[row_idx].data<float>(),
                 bytes
             );
             ctxs[i]->trace_decode_token += 1;
@@ -3294,6 +4244,7 @@ int32_t mlx_decode_topk_candidates(
     }
 
     try {
+        clear_fused_decode_ctx_cache();
         const int32_t token_scalar = token;
         const array token_arr(&token_scalar, Shape{1, 1}, int32);
         const array logits_last = last_token_logits(forward_logits(ctx, token_arr)); // [1,1,V]
@@ -3309,6 +4260,16 @@ int32_t mlx_decode_topk_candidates(
         }
 
         const int k = std::min(top_k, vocab);
+        if (k == 1) {
+            const array top_idx = reshape(astype(argmax(logits_last, -1), int32), {1});
+            eval(top_idx);
+            synchronize();
+            out_candidate_ids[0] = top_idx.data<int32_t>()[0];
+            out_candidate_logits[0] = 0.0f;
+            *out_candidate_count = 1;
+            return 1;
+        }
+
         auto topk_fn = compiled_topk_candidates(k);
         const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
         if (topk_outputs.size() != 2) {
@@ -3331,6 +4292,415 @@ int32_t mlx_decode_topk_candidates(
         return 0;
     } catch (...) {
         g_last_error = "unknown error in mlx_decode_topk_candidates";
+        return 0;
+    }
+}
+
+int32_t mlx_decode_topk_candidates_batch(
+    mlx_ctx* const* ctxs,
+    const int32_t* tokens,
+    int32_t top_k,
+    float* const* out_candidate_logits_ptrs,
+    int32_t* const* out_candidate_ids_ptrs,
+    int32_t* out_candidate_counts,
+    int32_t batch_size
+) {
+    if (!ctxs || !tokens || !out_candidate_logits_ptrs || !out_candidate_ids_ptrs ||
+        !out_candidate_counts || batch_size <= 0) {
+        g_last_error = "mlx_decode_topk_candidates_batch: invalid arguments";
+        return 0;
+    }
+    if (top_k <= 0) {
+        g_last_error = "mlx_decode_topk_candidates_batch: top_k must be > 0";
+        return 0;
+    }
+
+    if (batch_size == 1) {
+        return mlx_decode_topk_candidates(
+            ctxs[0],
+            tokens[0],
+            top_k,
+            out_candidate_logits_ptrs[0],
+            out_candidate_ids_ptrs[0],
+            &out_candidate_counts[0]
+        );
+    }
+
+    for (int32_t i = 0; i < batch_size; ++i) {
+        if (!ctxs[i] || !out_candidate_logits_ptrs[i] || !out_candidate_ids_ptrs[i]) {
+            g_last_error = "mlx_decode_topk_candidates_batch: null ctx or output entry";
+            return 0;
+        }
+        if (!ctxs[i]->stream_ready) {
+            g_last_error = "mlx_decode_topk_candidates_batch: prefill not ready";
+            return 0;
+        }
+        if (tokens[i] < 0) {
+            g_last_error = "mlx_decode_topk_candidates_batch: token must be >= 0";
+            return 0;
+        }
+    }
+
+    try {
+        const int k = top_k;
+        std::vector<mlx_ctx*> current_rows(static_cast<size_t>(batch_size));
+        for (int32_t i = 0; i < batch_size; ++i) {
+            current_rows[static_cast<size_t>(i)] = ctxs[i];
+        }
+        if (g_fused_decode_ctx_cache_dirty &&
+            !same_ctx_row_set(g_fused_decode_ctx_cache_rows, current_rows))
+        {
+            clear_fused_decode_ctx_cache();
+        }
+
+        mlx_ctx* cached_fused_ctx = nullptr;
+        if (try_get_cached_fused_decode_ctx_by_rows(current_rows, &cached_fused_ctx)) {
+            std::vector<int32_t> token_vec(static_cast<size_t>(batch_size));
+            for (int32_t i = 0; i < batch_size; ++i) {
+                token_vec[static_cast<size_t>(i)] = tokens[i];
+            }
+
+            const array token_arr(token_vec.data(), Shape{batch_size, 1}, int32);
+            const array logits_last = last_token_logits(forward_logits(cached_fused_ctx, token_arr)); // [B,1,V]
+            if (logits_last.ndim() != 3) {
+                g_last_error = "mlx_decode_topk_candidates_batch: invalid cached fused logits rank";
+                return 0;
+            }
+            const int vocab = logits_last.shape(2);
+            if (vocab <= 0 || vocab < k) {
+                g_last_error = "mlx_decode_topk_candidates_batch: invalid cached fused vocab size";
+                return 0;
+            }
+
+            if (k == 1) {
+                const array top_ids = reshape(astype(argmax(logits_last, -1), int32), {batch_size}); // [B]
+                eval(top_ids);
+                synchronize();
+                const int32_t* ids_ptr = top_ids.data<int32_t>();
+                for (int32_t i = 0; i < batch_size; ++i) {
+                    out_candidate_ids_ptrs[i][0] = ids_ptr[static_cast<size_t>(i)];
+                    out_candidate_logits_ptrs[i][0] = 0.0f;
+                    out_candidate_counts[i] = 1;
+                    ctxs[i]->trace_decode_token += 1;
+                }
+            } else {
+                auto topk_rows_fn = compiled_topk_candidates_rows(k);
+                const std::vector<array> topk_outputs = (*topk_rows_fn)({logits_last});
+                if (topk_outputs.size() != 2) {
+                    g_last_error = "mlx_decode_topk_candidates_batch: invalid cached fused topk output";
+                    return 0;
+                }
+                const array topk_logits_rows = topk_outputs[0];
+                const array topk_ids_rows = topk_outputs[1];
+                eval({topk_logits_rows, topk_ids_rows});
+                synchronize();
+
+                const float* logits_ptr = topk_logits_rows.data<float>();
+                const int32_t* ids_ptr = topk_ids_rows.data<int32_t>();
+                const size_t row_floats = static_cast<size_t>(k);
+                for (int32_t i = 0; i < batch_size; ++i) {
+                    std::memcpy(
+                        out_candidate_logits_ptrs[i],
+                        logits_ptr + static_cast<size_t>(i) * row_floats,
+                        row_floats * sizeof(float)
+                    );
+                    std::memcpy(
+                        out_candidate_ids_ptrs[i],
+                        ids_ptr + static_cast<size_t>(i) * row_floats,
+                        row_floats * sizeof(int32_t)
+                    );
+                    out_candidate_counts[i] = k;
+                    ctxs[i]->trace_decode_token += 1;
+                }
+            }
+            g_fused_decode_ctx_cache_dirty = true;
+            return 1;
+        }
+
+        // Fast path: handle fully compatible full-batch decode without
+        // per-token grouping/key construction.
+        mlx_ctx fused_ctx_full_batch;
+        int32_t full_batch_common_offset = -1;
+        if (prepare_fused_decode_ctx(
+                ctxs,
+                batch_size,
+                &fused_ctx_full_batch,
+                &full_batch_common_offset
+            ) &&
+            full_batch_common_offset >= 0)
+        {
+            std::vector<int32_t> token_vec(static_cast<size_t>(batch_size));
+            for (int32_t i = 0; i < batch_size; ++i) {
+                token_vec[static_cast<size_t>(i)] = tokens[i];
+            }
+
+            const array token_arr(token_vec.data(), Shape{batch_size, 1}, int32);
+            const array logits_last = last_token_logits(forward_logits(&fused_ctx_full_batch, token_arr)); // [B,1,V]
+            if (logits_last.ndim() != 3) {
+                g_last_error = "mlx_decode_topk_candidates_batch: invalid full-batch fused logits rank";
+                return 0;
+            }
+            const int vocab = logits_last.shape(2);
+            if (vocab <= 0 || vocab < k) {
+                g_last_error = "mlx_decode_topk_candidates_batch: invalid full-batch fused vocab size";
+                return 0;
+            }
+
+            if (k == 1) {
+                const array top_ids = reshape(astype(argmax(logits_last, -1), int32), {batch_size});
+                eval(top_ids);
+                synchronize();
+                const int32_t* ids_ptr = top_ids.data<int32_t>();
+                for (int32_t i = 0; i < batch_size; ++i) {
+                    out_candidate_ids_ptrs[i][0] = ids_ptr[static_cast<size_t>(i)];
+                    out_candidate_logits_ptrs[i][0] = 0.0f;
+                    out_candidate_counts[i] = 1;
+                    ctxs[i]->trace_decode_token += 1;
+                }
+            } else {
+                auto topk_rows_fn = compiled_topk_candidates_rows(k);
+                const std::vector<array> topk_outputs = (*topk_rows_fn)({logits_last});
+                if (topk_outputs.size() != 2) {
+                    g_last_error = "mlx_decode_topk_candidates_batch: invalid full-batch fused topk output";
+                    return 0;
+                }
+                const array topk_logits_rows = topk_outputs[0];
+                const array topk_ids_rows = topk_outputs[1];
+                eval({topk_logits_rows, topk_ids_rows});
+                synchronize();
+
+                const float* logits_ptr = topk_logits_rows.data<float>();
+                const int32_t* ids_ptr = topk_ids_rows.data<int32_t>();
+                const size_t row_floats = static_cast<size_t>(k);
+                for (int32_t i = 0; i < batch_size; ++i) {
+                    std::memcpy(
+                        out_candidate_logits_ptrs[i],
+                        logits_ptr + static_cast<size_t>(i) * row_floats,
+                        row_floats * sizeof(float)
+                    );
+                    std::memcpy(
+                        out_candidate_ids_ptrs[i],
+                        ids_ptr + static_cast<size_t>(i) * row_floats,
+                        row_floats * sizeof(int32_t)
+                    );
+                    out_candidate_counts[i] = k;
+                    ctxs[i]->trace_decode_token += 1;
+                }
+            }
+            scatter_fused_runtime_state_to_ctxs(fused_ctx_full_batch, ctxs, batch_size);
+
+            std::string next_key;
+            if (build_decode_fusion_key(ctxs[0], &next_key)) {
+                store_cached_fused_decode_ctx(current_rows, next_key, fused_ctx_full_batch);
+            } else {
+                clear_fused_decode_ctx_cache();
+            }
+            return 1;
+        }
+
+        std::vector<uint8_t> decode_done(static_cast<size_t>(batch_size), 0);
+
+        std::unordered_map<std::string, std::vector<int32_t>> decode_groups;
+        decode_groups.reserve(static_cast<size_t>(batch_size));
+        for (int32_t row = 0; row < batch_size; ++row) {
+            std::string key;
+            if (!build_decode_fusion_key(ctxs[row], &key)) continue;
+            decode_groups[key].push_back(row);
+        }
+
+        for (auto& entry : decode_groups) {
+            std::vector<int32_t>& rows = entry.second;
+            const int32_t group_size = static_cast<int32_t>(rows.size());
+            if (group_size < 2) continue;
+            const std::string& group_key = entry.first;
+
+            std::vector<mlx_ctx*> group_ctxs(static_cast<size_t>(group_size));
+            for (int32_t i = 0; i < group_size; ++i) {
+                group_ctxs[static_cast<size_t>(i)] = ctxs[rows[static_cast<size_t>(i)]];
+            }
+
+            mlx_ctx fused_ctx_local;
+            mlx_ctx* fused_ctx = nullptr;
+            const bool cache_hit = try_get_cached_fused_decode_ctx(group_ctxs, group_key, &fused_ctx);
+            if (!cache_hit) {
+                int32_t common_offset = -1;
+                if (!prepare_fused_decode_ctx(group_ctxs.data(), group_size, &fused_ctx_local, &common_offset) ||
+                    common_offset < 0)
+                {
+                    continue;
+                }
+                fused_ctx = &fused_ctx_local;
+            }
+
+            std::vector<int32_t> token_vec(static_cast<size_t>(group_size));
+            for (int32_t i = 0; i < group_size; ++i) {
+                token_vec[static_cast<size_t>(i)] = tokens[rows[static_cast<size_t>(i)]];
+            }
+
+            const array token_arr(token_vec.data(), Shape{group_size, 1}, int32);
+            const array logits_last = last_token_logits(forward_logits(fused_ctx, token_arr)); // [B,1,V]
+            if (logits_last.ndim() != 3) {
+                g_last_error = "mlx_decode_topk_candidates_batch: invalid fused logits rank";
+                return 0;
+            }
+            const int vocab = logits_last.shape(2);
+            if (vocab <= 0 || vocab < k) {
+                g_last_error = "mlx_decode_topk_candidates_batch: invalid fused vocab size";
+                return 0;
+            }
+
+            if (k == 1) {
+                const array top_ids = reshape(astype(argmax(logits_last, -1), int32), {group_size});
+                eval(top_ids);
+                synchronize();
+                const int32_t* ids_ptr = top_ids.data<int32_t>();
+                for (int32_t i = 0; i < group_size; ++i) {
+                    const int32_t row = rows[static_cast<size_t>(i)];
+                    out_candidate_ids_ptrs[row][0] = ids_ptr[static_cast<size_t>(i)];
+                    out_candidate_logits_ptrs[row][0] = 0.0f;
+                    out_candidate_counts[row] = 1;
+                    ctxs[row]->trace_decode_token += 1;
+                    decode_done[static_cast<size_t>(row)] = 1;
+                }
+            } else {
+                auto topk_rows_fn = compiled_topk_candidates_rows(k);
+                const std::vector<array> topk_outputs = (*topk_rows_fn)({logits_last});
+                if (topk_outputs.size() != 2) {
+                    g_last_error = "mlx_decode_topk_candidates_batch: invalid fused topk output";
+                    return 0;
+                }
+                const array topk_logits_rows = topk_outputs[0]; // [B,k]
+                const array topk_ids_rows = topk_outputs[1];    // [B,k]
+                eval({topk_logits_rows, topk_ids_rows});
+                synchronize();
+
+                const float* logits_ptr = topk_logits_rows.data<float>();
+                const int32_t* ids_ptr = topk_ids_rows.data<int32_t>();
+                const size_t row_floats = static_cast<size_t>(k);
+                for (int32_t i = 0; i < group_size; ++i) {
+                    const int32_t row = rows[static_cast<size_t>(i)];
+                    std::memcpy(
+                        out_candidate_logits_ptrs[row],
+                        logits_ptr + static_cast<size_t>(i) * row_floats,
+                        row_floats * sizeof(float)
+                    );
+                    std::memcpy(
+                        out_candidate_ids_ptrs[row],
+                        ids_ptr + static_cast<size_t>(i) * row_floats,
+                        row_floats * sizeof(int32_t)
+                    );
+                    out_candidate_counts[row] = k;
+                    ctxs[row]->trace_decode_token += 1;
+                    decode_done[static_cast<size_t>(row)] = 1;
+                }
+            }
+            scatter_fused_runtime_state_to_ctxs(*fused_ctx, group_ctxs.data(), group_size);
+
+            std::string next_key;
+            if (build_decode_fusion_key(group_ctxs[0], &next_key)) {
+                if (!cache_hit) {
+                    store_cached_fused_decode_ctx(group_ctxs, next_key, *fused_ctx);
+                } else {
+                    g_fused_decode_ctx_cache_rows = group_ctxs;
+                    g_fused_decode_ctx_cache_key = next_key;
+                    g_fused_decode_ctx_cache_dirty = false;
+                }
+            } else {
+                clear_fused_decode_ctx_cache();
+            }
+        }
+
+        std::vector<int32_t> fallback_rows;
+        fallback_rows.reserve(static_cast<size_t>(batch_size));
+        for (int32_t i = 0; i < batch_size; ++i) {
+            if (decode_done[static_cast<size_t>(i)] == 0) {
+                fallback_rows.push_back(i);
+            }
+        }
+        if (fallback_rows.empty()) {
+            return 1;
+        }
+
+        auto topk_fn = compiled_topk_candidates(k);
+
+        auto& logits_flat_batch = g_decode_topk_batch_logits_flat_scratch;
+        auto& ids_flat_batch = g_decode_topk_batch_ids_flat_scratch;
+        logits_flat_batch.clear();
+        ids_flat_batch.clear();
+        if (logits_flat_batch.capacity() < fallback_rows.size()) {
+            logits_flat_batch.reserve(fallback_rows.size());
+        }
+        if (ids_flat_batch.capacity() < fallback_rows.size()) {
+            ids_flat_batch.reserve(fallback_rows.size());
+        }
+
+        std::vector<array> eval_targets;
+        eval_targets.reserve(fallback_rows.size() * 2);
+
+        for (int32_t i : fallback_rows) {
+            mlx_ctx* ctx = ctxs[i];
+            const int32_t token_scalar = tokens[i];
+            const array token_arr(&token_scalar, Shape{1, 1}, int32);
+            const array logits_last = last_token_logits(forward_logits(ctx, token_arr)); // [1,1,V]
+            if (logits_last.ndim() != 3) {
+                g_last_error = "mlx_decode_topk_candidates_batch: invalid logits rank";
+                return 0;
+            }
+            const int vocab = logits_last.shape(2);
+            if (vocab <= 0 || vocab < k) {
+                g_last_error = "mlx_decode_topk_candidates_batch: invalid vocab size";
+                return 0;
+            }
+
+            if (k == 1) {
+                const array top_id = reshape(astype(argmax(logits_last, -1), int32), {1});
+                ids_flat_batch.push_back(top_id);
+                eval_targets.push_back(ids_flat_batch.back());
+            } else {
+                const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
+                if (topk_outputs.size() != 2) {
+                    g_last_error = "mlx_decode_topk_candidates_batch: invalid compiled output";
+                    return 0;
+                }
+
+                logits_flat_batch.push_back(topk_outputs[0]);
+                ids_flat_batch.push_back(topk_outputs[1]);
+                eval_targets.push_back(logits_flat_batch.back());
+                eval_targets.push_back(ids_flat_batch.back());
+            }
+        }
+        if (!eval_targets.empty()) {
+            eval(eval_targets);
+            synchronize();
+        }
+
+        for (size_t row_idx = 0; row_idx < fallback_rows.size(); ++row_idx) {
+            const int32_t i = fallback_rows[row_idx];
+            if (k == 1) {
+                out_candidate_ids_ptrs[i][0] = ids_flat_batch[row_idx].data<int32_t>()[0];
+                out_candidate_logits_ptrs[i][0] = 0.0f;
+                out_candidate_counts[i] = 1;
+            } else {
+                std::memcpy(
+                    out_candidate_logits_ptrs[i],
+                    logits_flat_batch[row_idx].data<float>(),
+                    static_cast<size_t>(k) * sizeof(float)
+                );
+                std::memcpy(
+                    out_candidate_ids_ptrs[i],
+                    ids_flat_batch[row_idx].data<int32_t>(),
+                    static_cast<size_t>(k) * sizeof(int32_t)
+                );
+                out_candidate_counts[i] = k;
+            }
+            ctxs[i]->trace_decode_token += 1;
+        }
+        return 1;
+    } catch (const std::exception& e) {
+        g_last_error = e.what();
+        return 0;
+    } catch (...) {
+        g_last_error = "unknown error in mlx_decode_topk_candidates_batch";
         return 0;
     }
 }

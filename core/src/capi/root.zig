@@ -535,6 +535,7 @@ pub const talu_batch_step = batch.talu_batch_step;
 pub const talu_batch_has_active = batch.talu_batch_has_active;
 pub const talu_batch_active_count = batch.talu_batch_active_count;
 pub const talu_batch_run_loop = batch.talu_batch_run_loop;
+pub const talu_batch_run_loop_no_text = batch.talu_batch_run_loop_no_text;
 pub const talu_batch_take_result = batch.talu_batch_take_result;
 pub const talu_batch_result_free = batch.talu_batch_result_free;
 pub const TaluBatch = batch.TaluBatch;

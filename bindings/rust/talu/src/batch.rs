@@ -211,16 +211,11 @@ impl BatchHandle {
     ///
     /// `chat_ptr` must be a valid, non-null pointer to a `TaluChatHandle`
     /// that remains valid for the duration of this call.
-    pub fn submit_raw(
-        &self,
-        chat_ptr: *mut c_void,
-        config: &GenerateConfig,
-    ) -> Result<u64> {
+    pub fn submit_raw(&self, chat_ptr: *mut c_void, config: &GenerateConfig) -> Result<u64> {
         let config_holder = ConfigHolder::new(config)?;
 
-        let request_id = unsafe {
-            talu_sys::talu_batch_submit(self.ptr, chat_ptr, config_holder.as_ptr())
-        };
+        let request_id =
+            unsafe { talu_sys::talu_batch_submit(self.ptr, chat_ptr, config_holder.as_ptr()) };
 
         if request_id == 0 {
             return Err(error_from_last_or("Batch submit failed"));
@@ -240,9 +235,8 @@ impl BatchHandle {
         let mut c_events_buf = [talu_sys::CBatchEvent::default(); 64];
         let max_events = events_out.len().min(64);
 
-        let count = unsafe {
-            talu_sys::talu_batch_step(self.ptr, c_events_buf.as_mut_ptr(), max_events)
-        };
+        let count =
+            unsafe { talu_sys::talu_batch_step(self.ptr, c_events_buf.as_mut_ptr(), max_events) };
 
         // Convert C events to Rust events (copy text).
         for i in 0..count.min(max_events) {
@@ -389,8 +383,34 @@ impl BatchHandle {
         pending_flag: &AtomicBool,
         mut callback: impl FnMut(&BatchEvent),
     ) -> Result<()> {
+        self.run_loop_impl(pending_flag, true, &mut callback)
+    }
+
+    /// Run a tight decode loop, skipping per-token text decoding.
+    ///
+    /// This is intended for non-streaming server routes that only need
+    /// completion/error signaling and will fetch final text from take_result().
+    pub fn run_loop_no_text(
+        &self,
+        pending_flag: &AtomicBool,
+        mut callback: impl FnMut(&BatchEvent),
+    ) -> Result<()> {
+        self.run_loop_impl(pending_flag, false, &mut callback)
+    }
+
+    fn run_loop_impl(
+        &self,
+        pending_flag: &AtomicBool,
+        decode_text: bool,
+        callback: &mut dyn FnMut(&BatchEvent),
+    ) -> Result<()> {
         // Trampoline: extern "C" fn that receives a *mut FnMut(&BatchEvent)
         // through callback_data, converts CEvents to BatchEvents, and invokes it.
+        struct CallbackCtx<'a> {
+            decode_text: bool,
+            callback: &'a mut dyn FnMut(&BatchEvent),
+        }
+
         extern "C" fn trampoline(
             events: *const talu_sys::CEvent,
             count: usize,
@@ -399,11 +419,10 @@ impl BatchHandle {
             if events.is_null() || count == 0 || userdata.is_null() {
                 return;
             }
-            let cb: &mut &mut dyn FnMut(&BatchEvent) =
-                unsafe { &mut *(userdata as *mut &mut dyn FnMut(&BatchEvent)) };
+            let ctx: &mut CallbackCtx<'_> = unsafe { &mut *(userdata as *mut CallbackCtx<'_>) };
             let c_events = unsafe { std::slice::from_raw_parts(events, count) };
             for c in c_events {
-                let text = if !c.text_ptr.is_null() && c.text_len > 0 {
+                let text = if ctx.decode_text && !c.text_ptr.is_null() && c.text_len > 0 {
                     let bytes = unsafe { std::slice::from_raw_parts(c.text_ptr, c.text_len) };
                     String::from_utf8_lossy(bytes).into_owned()
                 } else {
@@ -420,20 +439,32 @@ impl BatchHandle {
                     tokens_generated: c.tokens_generated,
                     timestamp_ns: c.timestamp_ns,
                 };
-                cb(&event);
+                (ctx.callback)(&event);
             }
         }
 
-        let mut cb: &mut dyn FnMut(&BatchEvent) = &mut callback;
-        let cb_ptr: *mut c_void = &mut cb as *mut &mut dyn FnMut(&BatchEvent) as *mut c_void;
+        let mut ctx = CallbackCtx {
+            decode_text,
+            callback,
+        };
+        let cb_ptr: *mut c_void = &mut ctx as *mut CallbackCtx<'_> as *mut c_void;
 
         let rc = unsafe {
-            talu_sys::talu_batch_run_loop(
-                self.ptr,
-                pending_flag as *const AtomicBool as *mut c_void,
-                trampoline as *mut c_void,
-                cb_ptr,
-            )
+            if decode_text {
+                talu_sys::talu_batch_run_loop(
+                    self.ptr,
+                    pending_flag as *const AtomicBool as *mut c_void,
+                    trampoline as *mut c_void,
+                    cb_ptr,
+                )
+            } else {
+                talu_sys::talu_batch_run_loop_no_text(
+                    self.ptr,
+                    pending_flag as *const AtomicBool as *mut c_void,
+                    trampoline as *mut c_void,
+                    cb_ptr,
+                )
+            }
         };
 
         if rc != 0 {

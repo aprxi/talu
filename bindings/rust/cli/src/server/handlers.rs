@@ -986,16 +986,28 @@ async fn generate_response(
                     .submit_final_only(&chat, cfg, stop_flag_for_gen)
                     .map_err(|e| anyhow!("batch submit failed: {}", e))?;
 
-                // Drain events until final.
+                // Drain events until final and surface scheduler error events.
+                let mut final_error: Option<String> = None;
                 loop {
                     match event_rx.recv() {
                         Ok(event) => {
+                            if matches!(event.event_type, talu::batch::EventType::Error) {
+                                final_error = Some(if event.text.is_empty() {
+                                    "scheduler run loop failed".to_string()
+                                } else {
+                                    event.text.clone()
+                                });
+                            }
                             if event.is_final {
                                 break;
                             }
                         }
                         Err(_) => break,
                     }
+                }
+
+                if let Some(msg) = final_error {
+                    return Err(anyhow!("batch generation failed: {msg}"));
                 }
 
                 let batch_result = sched.take_result(request_id);
@@ -1582,12 +1594,10 @@ async fn stream_response(
                 ) {
                     Ok(new_backend) => {
                         // Recreate batch scheduler for new backend.
-                        let new_sched = crate::server::batch_scheduler::SchedulerState::new(
-                            &new_backend,
-                            None,
-                        )
-                        .ok()
-                        .map(Arc::new);
+                        let new_sched =
+                            crate::server::batch_scheduler::SchedulerState::new(&new_backend, None)
+                                .ok()
+                                .map(Arc::new);
                         let old_sched =
                             if let Ok(mut sched_guard) = state_for_store.batch_scheduler.lock() {
                                 let old = sched_guard.take();
@@ -2420,9 +2430,15 @@ fn run_batch_streaming_generation(
             "prefill_ms": prefill_ns as f64 / 1_000_000.0,
             "generation_ms": generation_ns as f64 / 1_000_000.0
         });
-        if gen_min_p > 0.0 { gen_data["min_p"] = serde_json::Value::from(gen_min_p); }
-        if gen_repetition_penalty != 1.0 { gen_data["repetition_penalty"] = serde_json::Value::from(gen_repetition_penalty); }
-        if gen_seed != 0 { gen_data["seed"] = serde_json::Value::from(gen_seed); }
+        if gen_min_p > 0.0 {
+            gen_data["min_p"] = serde_json::Value::from(gen_min_p);
+        }
+        if gen_repetition_penalty != 1.0 {
+            gen_data["repetition_penalty"] = serde_json::Value::from(gen_repetition_penalty);
+        }
+        if gen_seed != 0 {
+            gen_data["seed"] = serde_json::Value::from(gen_seed);
+        }
         for item in guard.output_items.iter_mut().rev() {
             if item.get("type").and_then(|v| v.as_str()) == Some("message")
                 && item.get("role").and_then(|v| v.as_str()) == Some("assistant")
@@ -2432,7 +2448,6 @@ fn run_batch_streaming_generation(
             }
         }
     }
-
 
     let all_json = chat
         .to_responses_json(1)
@@ -3032,7 +3047,7 @@ impl StreamCtx {
                     "summary": summary,
                     "status": "completed"
                 })
-            },
+            }
             ItemType::FunctionCall => json!({
                 "type": "function_call",
                 "id": self.cur_item_id,

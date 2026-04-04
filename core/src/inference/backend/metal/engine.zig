@@ -13,7 +13,7 @@ const cpu_sampling_ops = compute.cpu.sampling_ops;
 
 const LoadedModel = models.LoadedModel;
 const topk_route_candidate_capacity: usize = 256;
-const default_metal_max_batch_size: usize = 4;
+const default_metal_max_batch_size: usize = 8;
 
 const mlx_ctx = opaque {};
 
@@ -91,6 +91,16 @@ extern fn mlx_decode_topk_candidates(
     out_candidate_logits: [*]f32,
     out_candidate_ids: [*]i32,
     out_candidate_count: *c_int,
+) c_int;
+
+extern fn mlx_decode_topk_candidates_batch(
+    ctxs: [*]const *mlx_ctx,
+    tokens: [*]const i32,
+    top_k: c_int,
+    out_candidate_logits_ptrs: [*]const [*]f32,
+    out_candidate_ids_ptrs: [*]const [*]i32,
+    out_candidate_counts: [*]i32,
+    batch_size: c_int,
 ) c_int;
 
 extern fn mlx_decode_topk_candidates_with_sampling(
@@ -242,6 +252,10 @@ pub const MetalBackend = struct {
     batch_prefill_prompt_ptrs: [][*]const i32,
     batch_prefill_prompt_lens_i32: []i32,
     batch_prefill_logits_ptrs: [][*]f32,
+    batch_topk_logits_ptrs: [][*]f32,
+    batch_topk_ids_ptrs_i32: [][*]i32,
+    batch_topk_counts_i32: []i32,
+    batch_topk_row_indices: []usize,
     slot_state_bindings: []SlotStateBinding,
     slot_route_modes: []SlotRouteMode,
     slot_delegate_slots: []?usize,
@@ -763,6 +777,14 @@ pub const MetalBackend = struct {
         errdefer allocator.free(batch_prefill_prompt_lens_i32);
         const batch_prefill_logits_ptrs = try allocator.alloc([*]f32, max_batch_size);
         errdefer allocator.free(batch_prefill_logits_ptrs);
+        const batch_topk_logits_ptrs = try allocator.alloc([*]f32, max_batch_size);
+        errdefer allocator.free(batch_topk_logits_ptrs);
+        const batch_topk_ids_ptrs_i32 = try allocator.alloc([*]i32, max_batch_size);
+        errdefer allocator.free(batch_topk_ids_ptrs_i32);
+        const batch_topk_counts_i32 = try allocator.alloc(i32, max_batch_size);
+        errdefer allocator.free(batch_topk_counts_i32);
+        const batch_topk_row_indices = try allocator.alloc(usize, max_batch_size);
+        errdefer allocator.free(batch_topk_row_indices);
 
         const slot_state_bindings = try allocator.alloc(SlotStateBinding, max_batch_size);
         errdefer allocator.free(slot_state_bindings);
@@ -799,6 +821,10 @@ pub const MetalBackend = struct {
             .batch_prefill_prompt_ptrs = batch_prefill_prompt_ptrs,
             .batch_prefill_prompt_lens_i32 = batch_prefill_prompt_lens_i32,
             .batch_prefill_logits_ptrs = batch_prefill_logits_ptrs,
+            .batch_topk_logits_ptrs = batch_topk_logits_ptrs,
+            .batch_topk_ids_ptrs_i32 = batch_topk_ids_ptrs_i32,
+            .batch_topk_counts_i32 = batch_topk_counts_i32,
+            .batch_topk_row_indices = batch_topk_row_indices,
             .slot_state_bindings = slot_state_bindings,
             .slot_route_modes = slot_route_modes,
             .slot_delegate_slots = slot_delegate_slots,
@@ -828,6 +854,10 @@ pub const MetalBackend = struct {
         self.allocator.free(self.batch_prefill_prompt_lens_i32);
         self.allocator.free(self.batch_prefill_prompt_ptrs);
         self.allocator.free(self.batch_prefill_ctxs);
+        self.allocator.free(self.batch_topk_row_indices);
+        self.allocator.free(self.batch_topk_counts_i32);
+        self.allocator.free(self.batch_topk_ids_ptrs_i32);
+        self.allocator.free(self.batch_topk_logits_ptrs);
         self.allocator.free(self.batch_decode_logits_ptrs);
         self.allocator.free(self.batch_decode_tokens_i32);
         self.allocator.free(self.batch_decode_ctxs);
@@ -967,12 +997,15 @@ pub const MetalBackend = struct {
 
     pub fn supportsSchedulerBackendTopKDecodeRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
         _ = self;
-        _ = sampling_config;
-        // Intentionally disabled: enabling backend top-k route regressed decode
-        // throughput in A/B benchmarking versus decodeBatch+host sampling.
-        // Keep a single default route for now; revisit only with a proven
-        // non-regressing implementation.
-        return false;
+        // Enable a narrow, safe fast-path for greedy decoding. This uses
+        // backend top-k extraction with k=1 and avoids full-vocab logits
+        // transfers on the single-request route.
+        if (sampling_config.strategy != .greedy) return false;
+        if (sampling_config.repetition_penalty != 1.0) return false;
+        if (sampling_config.presence_penalty != 0.0) return false;
+        if (sampling_config.frequency_penalty != 0.0) return false;
+        if (sampling_config.logit_bias != null) return false;
+        return true;
     }
 
     pub fn supportsSchedulerBackendTopKCandidateSamplingRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
@@ -980,6 +1013,22 @@ pub const MetalBackend = struct {
         _ = sampling_config;
         // Must stay aligned with supportsSchedulerBackendTopKDecodeRoute.
         return false;
+    }
+
+    pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
+        self: *const MetalBackend,
+        sampling_config: *const sampling.SamplingConfig,
+    ) bool {
+        _ = self;
+        return switch (sampling_config.strategy) {
+            .top_k => sampling_config.top_k > 0 and
+                sampling_config.top_k <= topk_route_candidate_capacity,
+            .greedy => sampling_config.repetition_penalty == 1.0 and
+                sampling_config.presence_penalty == 0.0 and
+                sampling_config.frequency_penalty == 0.0 and
+                sampling_config.logit_bias == null,
+            else => false,
+        };
     }
 
     pub fn supportsSchedulerBackendInPlaceSamplingMutation(self: *const MetalBackend) bool {
@@ -1059,6 +1108,7 @@ pub const MetalBackend = struct {
         if (candidate_count > top_k) return error.InvalidState;
         for (candidate_ids_i32[0..candidate_count], 0..) |candidate_id_i32, idx| {
             if (candidate_id_i32 < 0) return error.InvalidState;
+            if (@as(usize, @intCast(candidate_id_i32)) >= self.vocab_size) return error.InvalidState;
             candidate_ids_out[idx] = @intCast(candidate_id_i32);
         }
         self.slot_positions[slot_index] += 1;
@@ -1160,10 +1210,141 @@ pub const MetalBackend = struct {
         if (candidate_count > sampling_config.top_k) return error.InvalidState;
         for (candidate_ids_i32[0..candidate_count], 0..) |candidate_id_i32, idx| {
             if (candidate_id_i32 < 0) return error.InvalidState;
+            if (@as(usize, @intCast(candidate_id_i32)) >= self.vocab_size) return error.InvalidState;
             candidate_ids_out[idx] = @intCast(candidate_id_i32);
         }
         self.slot_positions[slot_index] += 1;
         return candidate_count;
+    }
+
+    pub fn decodeBatchTopKCandidates(
+        self: *MetalBackend,
+        requests: []const contract.DecodeRequest,
+        top_k: usize,
+        candidate_logits_out: []f32,
+        candidate_ids_out: []u32,
+        candidate_counts_out: []usize,
+    ) !void {
+        if (requests.len == 0) return;
+        if (top_k == 0 or top_k > topk_route_candidate_capacity) return error.InvalidArgument;
+        if (candidate_counts_out.len < requests.len) return error.InvalidArgument;
+        const needed = std.math.mul(usize, requests.len, top_k) catch return error.InvalidArgument;
+        if (candidate_logits_out.len < needed) return error.InvalidArgument;
+        if (candidate_ids_out.len < needed) return error.InvalidArgument;
+        var batch_topk_count: usize = 0;
+
+        for (requests, 0..) |request_entry, row_idx| {
+            for (requests[0..row_idx]) |prev| {
+                if (prev.slot_index == request_entry.slot_index) return error.InvalidBatchSize;
+            }
+            if (request_entry.token > @as(u32, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
+            try self.ensureSlotIndex(request_entry.slot_index);
+            if (!self.slot_in_use[request_entry.slot_index]) return error.InvalidArgument;
+            try self.ensureSlotStateBlocksBoundForExecution(request_entry.slot_index);
+        }
+
+        for (requests, 0..) |request_entry, row_idx| {
+            const row_start = row_idx * top_k;
+            const row_end = row_start + top_k;
+
+            if (self.slot_route_modes[request_entry.slot_index] == .vision_delegate) {
+                candidate_counts_out[row_idx] = try self.decodeTopKCandidates(
+                    request_entry.slot_index,
+                    request_entry.token,
+                    top_k,
+                    candidate_logits_out[row_start..row_end],
+                    candidate_ids_out[row_start..row_end],
+                );
+                continue;
+            }
+
+            const ctx = try self.ensureSlotCtx(request_entry.slot_index);
+            self.batch_decode_ctxs[batch_topk_count] = ctx;
+            self.batch_decode_tokens_i32[batch_topk_count] = @intCast(request_entry.token);
+            self.batch_topk_logits_ptrs[batch_topk_count] = candidate_logits_out[row_start..row_end].ptr;
+            self.batch_topk_ids_ptrs_i32[batch_topk_count] =
+                self.slotTopKIdsSlice(request_entry.slot_index)[0..top_k].ptr;
+            self.batch_topk_counts_i32[batch_topk_count] = 0;
+            self.batch_topk_row_indices[batch_topk_count] = row_idx;
+            batch_topk_count += 1;
+        }
+
+        if (batch_topk_count > 0) {
+            if (top_k > @as(usize, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
+            const status = mlx_decode_topk_candidates_batch(
+                self.batch_decode_ctxs.ptr,
+                self.batch_decode_tokens_i32.ptr,
+                @intCast(top_k),
+                self.batch_topk_logits_ptrs.ptr,
+                self.batch_topk_ids_ptrs_i32.ptr,
+                self.batch_topk_counts_i32.ptr,
+                @intCast(batch_topk_count),
+            );
+            if (status == 0) {
+                log.warn("inference", "metal decode_topk_candidates_batch failed", .{
+                    .mlx_error = resolveLastError(),
+                    .batch = batch_topk_count,
+                    .top_k = top_k,
+                });
+                return error.InvalidArgument;
+            }
+
+            for (0..batch_topk_count) |idx| {
+                const row_idx = self.batch_topk_row_indices[idx];
+                const count_i32 = self.batch_topk_counts_i32[idx];
+                if (count_i32 <= 0) return error.InvalidState;
+                const count: usize = @intCast(count_i32);
+                if (count > top_k) return error.InvalidState;
+                const request_entry = requests[row_idx];
+                const ids_i32 = self.slotTopKIdsSlice(request_entry.slot_index)[0..count];
+                const row_start = row_idx * top_k;
+                const row_end = row_start + top_k;
+                const row_logits = candidate_logits_out[row_start..row_end];
+                const row_ids = candidate_ids_out[row_start..row_end];
+                var valid_count: usize = 0;
+                var invalid_count: usize = 0;
+                for (ids_i32, 0..) |candidate_id_i32, candidate_idx| {
+                    if (candidate_id_i32 < 0) {
+                        invalid_count += 1;
+                        continue;
+                    }
+                    const candidate_id_u32: u32 = @intCast(candidate_id_i32);
+                    if (@as(usize, candidate_id_u32) >= self.vocab_size) {
+                        invalid_count += 1;
+                        continue;
+                    }
+                    row_ids[valid_count] = candidate_id_u32;
+                    if (valid_count != candidate_idx) {
+                        row_logits[valid_count] = row_logits[candidate_idx];
+                    }
+                    valid_count += 1;
+                }
+                if (valid_count == 0) {
+                    // Keep the decode loop alive even if the backend reports
+                    // only invalid IDs for this row. Reuse the previous token
+                    // as a conservative fallback candidate.
+                    row_ids[0] = request_entry.token;
+                    valid_count = 1;
+                    log.warn("inference", "metal decode_topk_candidates_batch produced no valid candidate ids; using fallback token", .{
+                        .row = row_idx,
+                        .slot = request_entry.slot_index,
+                        .reported_count = count,
+                        .top_k = top_k,
+                        .fallback_token = request_entry.token,
+                    });
+                } else if (invalid_count > 0) {
+                    log.debug("inference", "metal decode_topk_candidates_batch dropped invalid candidate ids", .{
+                        .row = row_idx,
+                        .slot = request_entry.slot_index,
+                        .reported_count = count,
+                        .valid_count = valid_count,
+                        .invalid_count = invalid_count,
+                    }, @src());
+                }
+                candidate_counts_out[row_idx] = valid_count;
+                self.slot_positions[request_entry.slot_index] += 1;
+            }
+        }
     }
 
     pub fn maxBatchSize(self: *const MetalBackend) usize {
@@ -1236,11 +1417,8 @@ pub const MetalBackend = struct {
         self.releaseSlotDelegateRouting(slot_index);
         self.unbindSlotStateBlocks(slot_index);
         self.slot_in_use[slot_index] = false;
-        self.clearSlotState(slot_index);
-        // Keep slot contexts warm across request lifecycles. Destroying and
-        // recreating non-zero slot contexts adds avoidable fixed latency per
-        // request and defeats continuous-batching admission at steady state.
         self.resetCtx(slot_index);
+        self.clearSlotState(slot_index);
     }
 
     pub fn resetSlot(self: *MetalBackend, slot_index: usize) void {
@@ -1338,6 +1516,7 @@ pub const MetalBackend = struct {
         if (logits_out.len < self.vocab_size) return error.InvalidArgument;
         self.releaseSlotDelegateRouting(slot_index);
         const ctx = try self.ensureSlotCtx(slot_index);
+        self.resetCtx(slot_index);
         self.clearSlotState(slot_index);
         const logits_view = logits_out[0..self.vocab_size];
         try self.prefillLogits(slot_index, ctx, tokens, logits_view);
@@ -1374,6 +1553,7 @@ pub const MetalBackend = struct {
 
             self.releaseSlotDelegateRouting(request_entry.slot_index);
             const ctx = try self.ensureSlotCtx(request_entry.slot_index);
+            self.resetCtx(request_entry.slot_index);
             self.clearSlotState(request_entry.slot_index);
 
             const prompt_i32 = try self.ensureSlotTokenScratch(request_entry.slot_index, request_entry.prompt_tokens.len);
@@ -1423,6 +1603,7 @@ pub const MetalBackend = struct {
 
         self.releaseSlotDelegateRouting(slot_index);
         const ctx = try self.ensureSlotCtx(slot_index);
+        self.resetCtx(slot_index);
         self.clearSlotState(slot_index);
         const first_token = try self.prefillFirst(slot_index, ctx, tokens);
         self.slot_positions[slot_index] = tokens.len;
@@ -1486,8 +1667,6 @@ pub const MetalBackend = struct {
             .max_batch_size = self.max_batch_size,
         }, requests.len);
         if (results.len < requests.len) return error.InvalidArgument;
-
-        var batch_decode_count: usize = 0;
         for (requests, 0..) |request, idx| {
             try self.ensureSlotIndex(request.slot_index);
             if (!self.slot_in_use[request.slot_index]) return error.InvalidArgument;
@@ -1496,6 +1675,11 @@ pub const MetalBackend = struct {
             for (requests[0..idx]) |prev| {
                 if (prev.slot_index == request.slot_index) return error.InvalidBatchSize;
             }
+        }
+
+        var batch_decode_count: usize = 0;
+        for (requests, 0..) |request, idx| {
+            _ = idx;
             if (self.slot_route_modes[request.slot_index] == .vision_delegate) continue;
             const ctx = try self.ensureSlotCtx(request.slot_index);
             self.batch_decode_ctxs[batch_decode_count] = ctx;
@@ -1579,4 +1763,49 @@ test "MetalBackend.applySamplingMutationsToLogits applies additive penalties" {
     try std.testing.expectApproxEqAbs(@as(f32, 8.0), logits[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 8.5), logits[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 10.0), logits[2], 1e-6);
+}
+
+test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute validates top_k bounds" {
+    const valid_cfg = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 64,
+    };
+    const zero_cfg = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 0,
+    };
+    const too_large_cfg = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = topk_route_candidate_capacity + 1,
+    };
+
+    try std.testing.expect(MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute(undefined, &valid_cfg));
+    try std.testing.expect(!MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute(undefined, &zero_cfg));
+    try std.testing.expect(!MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute(undefined, &too_large_cfg));
+}
+
+test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute allows safe greedy path" {
+    const greedy_ok = sampling.SamplingConfig{
+        .strategy = .greedy,
+    };
+    const greedy_with_penalty = sampling.SamplingConfig{
+        .strategy = .greedy,
+        .repetition_penalty = 1.2,
+    };
+
+    try std.testing.expect(MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &greedy_ok));
+    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &greedy_with_penalty));
+}
+
+test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute allows safe greedy path" {
+    const greedy_ok = sampling.SamplingConfig{
+        .strategy = .greedy,
+    };
+    const greedy_with_logit_bias = sampling.SamplingConfig{
+        .strategy = .greedy,
+        .logit_bias = &.{.{ .token_id = 42, .bias = -2.0 }},
+    };
+
+    try std.testing.expect(MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute(undefined, &greedy_ok));
+    try std.testing.expect(!MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute(undefined, &greedy_with_logit_bias));
 }

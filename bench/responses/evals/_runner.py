@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import http.client
 import json
+import threading
 import time
 import urllib.parse
-from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
 from scenario import extract_generation_metrics, model_uri
 from extract import extract_answer
@@ -165,6 +166,46 @@ class _PersistentClient:
         self._reset()
 
 
+class _ThreadLocalPostClient:
+    """One persistent HTTP client per worker thread."""
+
+    def __init__(self, base_url: str) -> None:
+        self._base_url = base_url
+        self._local = threading.local()
+        self._clients: list[_PersistentClient] = []
+        self._lock = threading.Lock()
+
+    def post(self, path: str, body: dict) -> tuple[list[dict], float]:
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = _PersistentClient(self._base_url)
+            self._local.client = client
+            with self._lock:
+                self._clients.append(client)
+        return client.post(path, body)
+
+    def close(self) -> None:
+        with self._lock:
+            clients = list(self._clients)
+            self._clients.clear()
+        for client in clients:
+            client.close()
+
+
+def _request_with_retries(post_fn, api_path: str, body: dict) -> tuple[list[dict], bool]:
+    """Execute a request with retry/backoff and return (events, failed)."""
+    events: list[dict] = []
+    for attempt in range(_MAX_RETRIES):
+        try:
+            events, _ = post_fn(api_path, body)
+            if events:
+                return events, False
+        except Exception:
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)
+    return events, True
+
+
 def run_eval(
     *,
     bench_name: str,
@@ -203,6 +244,7 @@ def run_eval(
     samples_n: int | None = config.get("samples")
     if isinstance(samples_n, str):
         samples_n = int(samples_n)
+    batched = max(1, int(config.get("batched", 1)))
     total = len(samples)
 
     client = _PersistentClient(base_url)
@@ -250,14 +292,10 @@ def run_eval(
 
                 # Throughput tracking — generate (seed with cached data).
                 all_gen_toks: list[float] = list(cached_stats["gen_tok_s"])
-                recent_gen_toks: deque[float] = deque(maxlen=10)
-                last_gen_toks: float = 0.0
                 # Throughput tracking — prefill (seed with cached data).
                 all_prefill_toks: list[float] = list(cached_stats["prefill_tok_s"])
-                recent_prefill_toks: deque[float] = deque(maxlen=10)
-                last_prefill_toks: float = 0.0
-
-                for i, sample in enumerate(samples):
+                pending: list[tuple[dict, str, dict]] = []
+                for sample in samples:
                     if (uri, sample["index"]) in completed:
                         continue
 
@@ -274,22 +312,10 @@ def run_eval(
                         if base_seed != 0:
                             canonical["seed"] = _derive_request_seed(base_seed, sample)
                     api_path, body = format_request(canonical, completions=completions)
+                    pending.append((sample, api_path, body))
 
-                    # Retry loop with persistent connection.
-                    events: list[dict] = []
-                    for attempt in range(_MAX_RETRIES):
-                        try:
-                            events, _ = client.post(api_path, body)
-                            if events:
-                                break
-                        except Exception as exc:
-                            if attempt < _MAX_RETRIES - 1:
-                                wait = 2 ** attempt
-                                print(f"\n    retry {attempt+1} after error: {exc}", flush=True)
-                                time.sleep(wait)
-                            else:
-                                print(f"\n    failed after {_MAX_RETRIES} retries: {exc}", flush=True)
-                                errors += 1
+                def _handle_result(sample: dict, events: list[dict]) -> None:
+                    nonlocal correct_count, model_info, total_input_tokens, total_output_tokens
 
                     output = extract_output(events, completions=completions)
                     raw = output["raw_output"]
@@ -350,13 +376,9 @@ def run_eval(
                     gen_ts = metrics.get("engine_tok_s", 0)
                     if gen_ts > 0:
                         all_gen_toks.append(gen_ts)
-                        recent_gen_toks.append(gen_ts)
-                        last_gen_toks = gen_ts
                     pre_ts = metrics.get("prefill_tok_s", 0)
                     if pre_ts > 0:
                         all_prefill_toks.append(pre_ts)
-                        recent_prefill_toks.append(pre_ts)
-                        last_prefill_toks = pre_ts
 
                     # Token counts.
                     total_input_tokens += metrics.get("input_tokens", 0)
@@ -386,6 +408,46 @@ def run_eval(
                         end="", flush=True,
                     )
 
+                if batched <= 1 or len(pending) <= 1:
+                    for sample, api_path, body in pending:
+                        events, failed = _request_with_retries(client.post, api_path, body)
+                        if failed:
+                            errors += 1
+                        _handle_result(sample, events)
+                else:
+                    workers = min(batched, len(pending))
+                    post_client = _ThreadLocalPostClient(base_url)
+                    try:
+                        with ThreadPoolExecutor(max_workers=workers) as pool:
+                            inflight: dict[Future, tuple[dict, str, dict]] = {}
+                            next_idx = 0
+
+                            def _submit(idx: int) -> None:
+                                sample, api_path, body = pending[idx]
+                                fut = pool.submit(_request_with_retries, post_client.post, api_path, body)
+                                inflight[fut] = (sample, api_path, body)
+
+                            while next_idx < len(pending) and len(inflight) < workers:
+                                _submit(next_idx)
+                                next_idx += 1
+
+                            while inflight:
+                                done, _ = wait(set(inflight.keys()), return_when=FIRST_COMPLETED)
+                                for fut in done:
+                                    sample, _, _ = inflight.pop(fut)
+                                    try:
+                                        events, failed = fut.result()
+                                    except Exception:
+                                        events, failed = [], True
+                                    if failed:
+                                        errors += 1
+                                    _handle_result(sample, events)
+                                    if next_idx < len(pending):
+                                        _submit(next_idx)
+                                        next_idx += 1
+                    finally:
+                        post_client.close()
+
                 logger.close()
                 print()
                 evaluated = cached + len(per_question)
@@ -395,6 +457,7 @@ def run_eval(
                 # Aggregate throughput.
                 avg_gen = sum(all_gen_toks) / len(all_gen_toks) if all_gen_toks else 0
                 avg_prefill = sum(all_prefill_toks) / len(all_prefill_toks) if all_prefill_toks else 0
+                per_question.sort(key=lambda row: row["index"])
 
                 all_results.append({
                     "model": base_model,

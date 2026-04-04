@@ -392,7 +392,40 @@ pub export fn talu_batch_run_loop(
     const pending: ?*const std.atomic.Value(bool) = if (pending_flag) |pf| @ptrCast(@alignCast(pf)) else null;
 
     wrapper.runLoop(pending, cb, callback_data) catch |err| {
-        capi_error.setError(err, "batch run_loop failed", .{});
+        capi_error.setError(err, "batch run_loop failed: {s}", .{@errorName(err)});
+        return -1;
+    };
+
+    return 0;
+}
+
+/// Run loop variant that skips per-token text decoding in core.
+///
+/// Intended for non-streaming server handlers that only need terminal events.
+pub export fn talu_batch_run_loop_no_text(
+    handle: ?*anyopaque,
+    pending_flag: ?*anyopaque,
+    callback: ?*anyopaque,
+    callback_data: ?*anyopaque,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const wrapper: *BatchWrapper = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "batch handle is null", .{});
+        return -1;
+    }));
+
+    const cb_ptr = callback orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "callback is null", .{});
+        return -1;
+    };
+
+    const RunLoopCallback = *const fn ([*]const BatchWrapper.CEvent, usize, ?*anyopaque) callconv(.c) void;
+    const cb: RunLoopCallback = @ptrCast(@alignCast(cb_ptr));
+    const pending: ?*const std.atomic.Value(bool) = if (pending_flag) |pf| @ptrCast(@alignCast(pf)) else null;
+
+    wrapper.runLoopNoText(pending, cb, callback_data) catch |err| {
+        capi_error.setError(err, "batch run_loop_no_text failed: {s}", .{@errorName(err)});
         return -1;
     };
 

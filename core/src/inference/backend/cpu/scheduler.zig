@@ -822,6 +822,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 sampling_cfg.logit_bias != null;
         }
 
+        fn canUseDirectGreedyCandidate(sampling_cfg: sampling.SamplingConfig, candidate_count: usize) bool {
+            if (candidate_count == 0) return false;
+            if (sampling_cfg.strategy != .greedy) return false;
+            return !samplingRequiresFullLogits(sampling_cfg);
+        }
+
         /// Apply repetition, presence, frequency penalties and logit bias to
         /// the top-k candidate logits in-place. For each candidate token,
         /// scan context_tokens to compute occurrence count, then apply the
@@ -896,15 +902,29 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (request_entry.slot_index == null or request_entry.slot_index.? != req.slot_index) return null;
                 if (request_entry.grammar_sampler != null) return null;
                 if (request_entry.capture_final_logits) return null;
-                if (request_entry.sampling_config.top_k == 0 or request_entry.sampling_config.top_k > 256) return null;
+                const route_top_k = switch (request_entry.sampling_config.strategy) {
+                    .top_k => blk: {
+                        if (request_entry.sampling_config.top_k == 0 or request_entry.sampling_config.top_k > 256) {
+                            return null;
+                        }
+                        break :blk request_entry.sampling_config.top_k;
+                    },
+                    .greedy => blk: {
+                        // Greedy can use the same candidate route with k=1, but
+                        // only when no sampling mutations are requested.
+                        if (samplingRequiresFullLogits(request_entry.sampling_config)) return null;
+                        break :blk @as(usize, 1);
+                    },
+                    else => return null,
+                };
                 const supports_topk = if (comptime @hasDecl(BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
                     self.backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&request_entry.sampling_config)
                 else
                     self.backend.supportsSchedulerBackendTopKDecodeRoute(&request_entry.sampling_config);
                 if (!supports_topk) return null;
                 if (common_top_k == 0) {
-                    common_top_k = request_entry.sampling_config.top_k;
-                } else if (common_top_k != request_entry.sampling_config.top_k) {
+                    common_top_k = route_top_k;
+                } else if (common_top_k != route_top_k) {
                     return null;
                 }
             }
@@ -966,11 +986,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 const row_end = std.math.add(usize, row_start, candidate_count) catch return error.InvalidArgument;
                 var sample_cfg = request_entry.sampling_config;
                 sample_cfg.context_tokens = request_entry.generated_tokens.items;
-                var next_token = self.sampleTopKCandidateToken(
-                    self.decode_candidate_logits[row_start..row_end],
-                    self.decode_candidate_ids[row_start..row_end],
-                    sample_cfg,
-                ) catch 0;
+                var next_token: u32 = if (canUseDirectGreedyCandidate(sample_cfg, candidate_count))
+                    self.decode_candidate_ids[row_start]
+                else
+                    self.sampleTopKCandidateToken(
+                        self.decode_candidate_logits[row_start..row_end],
+                        self.decode_candidate_ids[row_start..row_end],
+                        sample_cfg,
+                    ) catch 0;
 
                 if (request_entry.in_thinking) {
                     if (request_entry.thinking_inject_pos > 0) {
@@ -1419,11 +1442,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Sample from the K candidates (penalties applied to K entries only).
             var sample_cfg = request_entry.sampling_config;
             sample_cfg.context_tokens = request_entry.generated_tokens.items;
-            var next_token = try self.sampleTopKCandidateToken(
-                candidate_logits_buf[0..candidate_count],
-                candidate_ids_buf[0..candidate_count],
-                sample_cfg,
-            );
+            var next_token: u32 = if (canUseDirectGreedyCandidate(sample_cfg, candidate_count))
+                candidate_ids_buf[0]
+            else
+                try self.sampleTopKCandidateToken(
+                    candidate_logits_buf[0..candidate_count],
+                    candidate_ids_buf[0..candidate_count],
+                    sample_cfg,
+                );
 
             // --- Post-processing (identical to step() Phase 6-8) ---
 
@@ -1610,11 +1636,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 } else {
                     var sample_cfg = re.sampling_config;
                     sample_cfg.context_tokens = re.generated_tokens.items;
-                    next_token = try self.sampleTopKCandidateToken(
-                        candidate_logits[0..count],
-                        candidate_ids[0..count],
-                        sample_cfg,
-                    );
+                    next_token = if (canUseDirectGreedyCandidate(sample_cfg, count))
+                        candidate_ids[0]
+                    else
+                        try self.sampleTopKCandidateToken(
+                            candidate_logits[0..count],
+                            candidate_ids[0..count],
+                            sample_cfg,
+                        );
                     if (re.in_thinking) {
                         re.thinking_token_count += 1;
                         if (re.thinking_end_tokens.len > 0 and
@@ -2198,11 +2227,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 } else {
                     // Normal sampling.
                     topk_sample_cfg.context_tokens = generated.items;
-                    current_token = try self.sampleTopKCandidateToken(
-                        candidate_logits[0..candidate_count],
-                        candidate_ids[0..candidate_count],
-                        topk_sample_cfg,
-                    );
+                    current_token = if (canUseDirectGreedyCandidate(topk_sample_cfg, candidate_count))
+                        candidate_ids[0]
+                    else
+                        try self.sampleTopKCandidateToken(
+                            candidate_logits[0..candidate_count],
+                            candidate_ids[0..candidate_count],
+                            topk_sample_cfg,
+                        );
                     if (in_thinking) {
                         thinking_tokens += 1;
                         // Check if model naturally produced the end-thinking token.
@@ -2541,6 +2573,23 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Check for max tokens
             if (finish_reason == .in_progress and request_entry.max_tokens <= 1) {
                 finish_reason = .length;
+            }
+
+            // Completion token limit enforcement (answer tokens only).
+            // Special tokens that decode to empty bytes are not counted.
+            if (finish_reason == .in_progress and request_entry.generating_answer and
+                request_entry.max_completion_tokens_limit > 0)
+            {
+                const has_visible = if (self.config.tokenizer) |tok|
+                    (tok.tokenBytes(first_token_id) orelse &.{}).len > 0
+                else
+                    true;
+                if (has_visible) {
+                    request_entry.completion_token_count += 1;
+                    if (request_entry.completion_token_count >= request_entry.max_completion_tokens_limit) {
+                        finish_reason = .length;
+                    }
+                }
             }
 
             const is_final_token = finish_reason != .in_progress;
@@ -4941,6 +4990,32 @@ test "Scheduler.step - handles max tokens" {
     const request_entry = scheduler.requests.get(request_id).?;
     try std.testing.expectEqual(RequestState.completed, request_entry.state);
     try std.testing.expectEqual(@as(usize, 1), request_entry.generated_tokens.items.len);
+}
+
+test "Scheduler.step - enforces max completion tokens on prefill token" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 4);
+    defer backend.deinit();
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{});
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3 };
+    const eos_token_ids = [_]u32{999}; // Keep EOS out of the way.
+    const opts = Scheduler.SubmitOptions{
+        .eos_token_ids = &eos_token_ids,
+        .max_completion_tokens = 1,
+    };
+    const request_id = try scheduler.submit(&prompt, 10, opts);
+
+    // First step runs prefill and emits one visible token. The completion
+    // budget must be enforced immediately without entering decode.
+    _ = try scheduler.step();
+
+    const request_entry = scheduler.requests.get(request_id).?;
+    try std.testing.expectEqual(RequestState.completed, request_entry.state);
+    try std.testing.expectEqual(@as(usize, 1), request_entry.generated_tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_calls.items.len);
 }
 
 test "Scheduler.step - batches multiple decode requests" {

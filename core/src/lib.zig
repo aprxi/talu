@@ -323,6 +323,7 @@ comptime {
     _ = &capi.talu_batch_has_active;
     _ = &capi.talu_batch_active_count;
     _ = &capi.talu_batch_run_loop;
+    _ = &capi.talu_batch_run_loop_no_text;
     _ = &capi.talu_batch_take_result;
     _ = &capi.talu_batch_result_free;
 

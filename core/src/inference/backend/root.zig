@@ -109,7 +109,7 @@ comptime {
 /// Override at runtime via TALU_CUDA_MAX_BATCH_SIZE or TALU_METAL_MAX_BATCH_SIZE.
 const MAX_BATCH_SIZE = struct {
     const cpu: usize = 4;
-    const metal: usize = 4;
+    const metal: usize = 8;
     const cuda: usize = 8;
 };
 
@@ -1169,7 +1169,10 @@ pub const Backend = union(enum) {
     ) bool {
         return switch (self.*) {
             .cpu => false,
-            .metal => false,
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
+                b.supportsSchedulerBackendBatchedTopKDecodeRoute(sampling_config)
+            else
+                false,
             .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "supportsSchedulerBackendBatchedTopKDecodeRoute"))
                 b.supportsSchedulerBackendBatchedTopKDecodeRoute(sampling_config)
             else
@@ -1187,7 +1190,10 @@ pub const Backend = union(enum) {
     ) !void {
         switch (self.*) {
             .cpu => return error.InvalidArgument,
-            .metal => if (has_metal) return error.InvalidArgument else unreachable,
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "decodeBatchTopKCandidates"))
+                return b.decodeBatchTopKCandidates(requests, top_k, candidate_logits_out, candidate_ids_out, candidate_counts_out)
+            else
+                return error.InvalidArgument,
             .cuda => |*b| if (has_cuda and @hasDecl(cuda.BackendType, "decodeBatchTopKCandidates"))
                 return b.decodeBatchTopKCandidates(requests, top_k, candidate_logits_out, candidate_ids_out, candidate_counts_out)
             else
@@ -2197,6 +2203,30 @@ test "supportsSchedulerBackendTopKDecodeRoute: cuda disabled" {
         .min_p = 0.0,
     };
     try std.testing.expectEqual(false, cuda_backend.supportsSchedulerBackendTopKDecodeRoute(&sampling_config));
+}
+
+test "supportsSchedulerBackendBatchedTopKDecodeRoute: cpu disabled" {
+    const cpu_backend: Backend = .{ .cpu = undefined };
+    const sampling_config = cpu.sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 40,
+    };
+    try std.testing.expectEqual(false, cpu_backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&sampling_config));
+}
+
+test "supportsSchedulerBackendBatchedTopKDecodeRoute: metal delegated" {
+    if (!has_metal) return;
+    const metal_backend: Backend = .{ .metal = undefined };
+    const valid_sampling = cpu.sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 64,
+    };
+    const invalid_sampling = cpu.sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 0,
+    };
+    try std.testing.expect(metal_backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&valid_sampling));
+    try std.testing.expect(!metal_backend.supportsSchedulerBackendBatchedTopKDecodeRoute(&invalid_sampling));
 }
 
 test "metal module surface does not expose legacy runtime graph symbols" {
