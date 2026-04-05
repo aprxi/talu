@@ -313,6 +313,8 @@ comptime {
     _ = &capi.talu_scheduler_step;
     _ = &capi.talu_scheduler_has_active;
     _ = &capi.talu_scheduler_active_count;
+    _ = &capi.talu_scheduler_score_tokens_nll;
+    _ = &capi.talu_scheduler_score_tokens_kld;
 
     // Batch API (responses-aware continuous batching)
     _ = &capi.talu_batch_create;

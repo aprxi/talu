@@ -138,6 +138,9 @@ int32_t mlx_decode_topk_stream(
     int32_t top_k,
     float top_p,
     float min_p,
+    float repetition_penalty,
+    float presence_penalty,
+    float frequency_penalty,
     int32_t** out_generated_ids,
     int32_t* out_generated_len
 );

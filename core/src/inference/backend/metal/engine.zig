@@ -84,6 +84,23 @@ extern fn mlx_decode_stream(
     out_generated_len: *c_int,
 ) c_int;
 
+extern fn mlx_decode_topk_stream(
+    ctx: ?*mlx_ctx,
+    first_token: c_int,
+    decode_tokens: c_int,
+    eos_ids: ?[*]const i32,
+    eos_len: c_int,
+    temperature: f32,
+    top_k: c_int,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    out_generated_ids: *[*c]i32,
+    out_generated_len: *c_int,
+) c_int;
+
 extern fn mlx_decode_topk_candidates(
     ctx: ?*mlx_ctx,
     token: c_int,
@@ -676,6 +693,98 @@ pub const MetalBackend = struct {
         return produced;
     }
 
+    fn decodeTopKStream(
+        self: *MetalBackend,
+        ctx: *mlx_ctx,
+        first_token: u32,
+        max_new_tokens: usize,
+        eos_token_ids: []const u32,
+        sampling_config: *const sampling.SamplingConfig,
+        output_tokens: []u32,
+    ) !usize {
+        if (sampling_config.strategy != .top_k) return error.InvalidArgument;
+        if (sampling_config.top_k == 0) return error.InvalidArgument;
+        if (sampling_config.top_k > topk_route_candidate_capacity) return error.InvalidArgument;
+        if (sampling_config.temperature < 0.0) return error.InvalidArgument;
+        if (sampling_config.top_p < 0.0 or sampling_config.top_p > 1.0) return error.InvalidArgument;
+        if (sampling_config.min_p < 0.0 or sampling_config.min_p > 1.0) return error.InvalidArgument;
+        if (sampling_config.repetition_penalty <= 0.0) return error.InvalidArgument;
+        if (sampling_config.logit_bias != null) return error.InvalidArgument;
+
+        if (max_new_tokens == 0 or output_tokens.len == 0) return 0;
+        if (first_token > @as(u32, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
+        if (sampling_config.top_k > @as(usize, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
+
+        const budget = @min(max_new_tokens, output_tokens.len);
+        if (budget > @as(usize, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
+
+        var eos_i32_storage: [16]i32 = undefined;
+        var eos_i32_owned: ?[]i32 = null;
+        defer if (eos_i32_owned) |owned| self.allocator.free(owned);
+        var eos_i32: []i32 = undefined;
+        if (eos_token_ids.len == 0) {
+            eos_i32 = eos_i32_storage[0..0];
+        } else if (eos_token_ids.len <= eos_i32_storage.len) {
+            eos_i32 = eos_i32_storage[0..eos_token_ids.len];
+        } else {
+            const owned = try self.allocator.alloc(i32, eos_token_ids.len);
+            eos_i32_owned = owned;
+            eos_i32 = owned;
+        }
+        for (eos_token_ids, 0..) |tok, i| {
+            if (tok > @as(u32, @intCast(std.math.maxInt(i32)))) return error.InvalidArgument;
+            eos_i32[i] = @intCast(tok);
+        }
+
+        var generated_ids_ptr: [*c]i32 = null;
+        defer mlx_tokens_free(generated_ids_ptr);
+        var generated_len: c_int = 0;
+        const status = mlx_decode_topk_stream(
+            ctx,
+            @intCast(first_token),
+            @intCast(budget),
+            if (eos_i32.len > 0) @ptrCast(eos_i32.ptr) else null,
+            @intCast(eos_i32.len),
+            sampling_config.temperature,
+            @intCast(sampling_config.top_k),
+            sampling_config.top_p,
+            sampling_config.min_p,
+            sampling_config.repetition_penalty,
+            sampling_config.presence_penalty,
+            sampling_config.frequency_penalty,
+            &generated_ids_ptr,
+            &generated_len,
+        );
+        if (status == 0 or generated_len < 0) {
+            log.warn("inference", "metal decode_topk_stream failed", .{
+                .mlx_error = resolveLastError(),
+                .max_new_tokens = budget,
+                .top_k = sampling_config.top_k,
+                .temperature = sampling_config.temperature,
+                .top_p = sampling_config.top_p,
+                .min_p = sampling_config.min_p,
+                .repetition_penalty = sampling_config.repetition_penalty,
+                .presence_penalty = sampling_config.presence_penalty,
+                .frequency_penalty = sampling_config.frequency_penalty,
+            });
+            return error.InvalidArgument;
+        }
+        if (generated_ids_ptr == null and generated_len > 0) return error.InvalidArgument;
+
+        const generated: []const i32 = if (generated_ids_ptr != null and generated_len > 0)
+            generated_ids_ptr[0..@intCast(generated_len)]
+        else
+            &.{};
+
+        const produced = @min(generated.len, budget);
+        for (0..produced) |i| {
+            const tok_i32 = generated[i];
+            if (tok_i32 < 0) return error.InvalidArgument;
+            output_tokens[i] = @intCast(tok_i32);
+        }
+        return produced;
+    }
+
     pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel, init_config: InitConfig) !MetalBackend {
         const model_path_env_owned = parseOptionalEnvVarOwned(allocator, "TALU_METAL_MODEL_PATH");
         defer if (model_path_env_owned) |buf| allocator.free(buf);
@@ -990,6 +1099,38 @@ pub const MetalBackend = struct {
         return produced;
     }
 
+    pub fn decodeTopKStreaming(
+        self: *MetalBackend,
+        first_token: u32,
+        start_position: usize,
+        max_tokens: usize,
+        eos_token_ids: []const u32,
+        sampling_config: *const sampling.SamplingConfig,
+        output_tokens: []u32,
+        callback: ?*const fn (u32, ?*anyopaque) void,
+        callback_data: ?*anyopaque,
+    ) !usize {
+        if (!self.slot_in_use[0]) return error.InvalidArgument;
+        try self.ensureSlotStateBlocksBoundForExecution(0);
+        if (self.slot_route_modes[0] == .vision_delegate) return error.InvalidArgument;
+
+        const budget = @min(max_tokens, output_tokens.len);
+        const ctx = try self.ensureSlotCtx(0);
+        const produced = try self.decodeTopKStream(
+            ctx,
+            first_token,
+            budget,
+            eos_token_ids,
+            sampling_config,
+            output_tokens,
+        );
+        if (callback) |cb| {
+            for (output_tokens[0..produced]) |token| cb(token, callback_data);
+        }
+        self.slot_positions[0] = start_position + produced;
+        return produced;
+    }
+
     pub fn supportsSchedulerBackendDecodeStreamingRoute(self: *const MetalBackend) bool {
         _ = self;
         return true;
@@ -997,22 +1138,36 @@ pub const MetalBackend = struct {
 
     pub fn supportsSchedulerBackendTopKDecodeRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
         _ = self;
-        // Enable a narrow, safe fast-path for greedy decoding. This uses
-        // backend top-k extraction with k=1 and avoids full-vocab logits
-        // transfers on the single-request route.
-        if (sampling_config.strategy != .greedy) return false;
-        if (sampling_config.repetition_penalty != 1.0) return false;
-        if (sampling_config.presence_penalty != 0.0) return false;
-        if (sampling_config.frequency_penalty != 0.0) return false;
-        if (sampling_config.logit_bias != null) return false;
-        return true;
+        return switch (sampling_config.strategy) {
+            .top_k => sampling_config.top_k > 0 and
+                sampling_config.top_k <= topk_route_candidate_capacity,
+            .greedy => sampling_config.repetition_penalty == 1.0 and
+                sampling_config.presence_penalty == 0.0 and
+                sampling_config.frequency_penalty == 0.0 and
+                sampling_config.logit_bias == null,
+            else => false,
+        };
     }
 
     pub fn supportsSchedulerBackendTopKCandidateSamplingRoute(self: *const MetalBackend, sampling_config: *const sampling.SamplingConfig) bool {
+        return supportsSchedulerBackendTopKDecodeRoute(self, sampling_config);
+    }
+
+    pub fn supportsSchedulerBackendTopKStreamingRoute(
+        self: *const MetalBackend,
+        sampling_config: *const sampling.SamplingConfig,
+    ) bool {
         _ = self;
-        _ = sampling_config;
-        // Must stay aligned with supportsSchedulerBackendTopKDecodeRoute.
-        return false;
+        return sampling_config.strategy == .top_k and
+            sampling_config.top_k > 0 and
+            sampling_config.top_k <= topk_route_candidate_capacity and
+            sampling_config.temperature >= 0.0 and
+            sampling_config.top_p >= 0.0 and
+            sampling_config.top_p <= 1.0 and
+            sampling_config.min_p >= 0.0 and
+            sampling_config.min_p <= 1.0 and
+            sampling_config.repetition_penalty > 0.0 and
+            sampling_config.logit_bias == null;
     }
 
     pub fn supportsSchedulerBackendBatchedTopKDecodeRoute(
@@ -1795,6 +1950,58 @@ test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute allows safe greedy pa
 
     try std.testing.expect(MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &greedy_ok));
     try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &greedy_with_penalty));
+}
+
+test "MetalBackend.supportsSchedulerBackendTopKDecodeRoute accepts bounded top_k strategy" {
+    const topk_ok = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 64,
+    };
+    const topk_zero = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 0,
+    };
+    const topk_too_large = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = topk_route_candidate_capacity + 1,
+    };
+
+    try std.testing.expect(MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &topk_ok));
+    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &topk_zero));
+    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKDecodeRoute(undefined, &topk_too_large));
+}
+
+test "MetalBackend.supportsSchedulerBackendTopKStreamingRoute accepts penalized top_k and rejects invalid config" {
+    const valid_cfg = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 64,
+        .temperature = 0.8,
+        .top_p = 0.95,
+        .min_p = 0.01,
+        .repetition_penalty = 1.15,
+        .presence_penalty = 0.75,
+        .frequency_penalty = 0.25,
+    };
+    const invalid_rep_penalty = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 64,
+        .repetition_penalty = 0.0,
+    };
+    const invalid_top_p = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 64,
+        .top_p = 1.2,
+    };
+    const invalid_logit_bias = sampling.SamplingConfig{
+        .strategy = .top_k,
+        .top_k = 64,
+        .logit_bias = &.{.{ .token_id = 42, .bias = 1.5 }},
+    };
+
+    try std.testing.expect(MetalBackend.supportsSchedulerBackendTopKStreamingRoute(undefined, &valid_cfg));
+    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKStreamingRoute(undefined, &invalid_rep_penalty));
+    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKStreamingRoute(undefined, &invalid_top_p));
+    try std.testing.expect(!MetalBackend.supportsSchedulerBackendTopKStreamingRoute(undefined, &invalid_logit_bias));
 }
 
 test "MetalBackend.supportsSchedulerBackendBatchedTopKDecodeRoute allows safe greedy path" {

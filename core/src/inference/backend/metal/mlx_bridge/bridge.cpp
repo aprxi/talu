@@ -43,6 +43,8 @@ thread_local std::vector<array> g_decode_batch_logits_flat_scratch;
 thread_local std::vector<array> g_prefill_batch_logits_flat_scratch;
 thread_local std::vector<array> g_decode_topk_batch_logits_flat_scratch;
 thread_local std::vector<array> g_decode_topk_batch_ids_flat_scratch;
+size_t g_qmm_attempts = 0;
+size_t g_qmm_success = 0;
 
 void enter_rng_epoch(int32_t seed) {
     std::lock_guard<std::mutex> lock(g_rng_mutex);
@@ -87,6 +89,8 @@ void release_wired_limit() {
 }
 
 using CompiledTopKFn = std::function<std::vector<array>(const std::vector<array>&)>;
+using CompiledPenalizedSampleFn = std::function<std::vector<array>(const std::vector<array>&)>;
+bool env_truthy(const char* name, bool fallback);
 
 std::shared_ptr<const CompiledTopKFn> compiled_topk_candidates(int k) {
     static std::unordered_map<int, std::shared_ptr<const CompiledTopKFn>> cache;
@@ -236,11 +240,17 @@ array sample_token_from_logits(const array& logits_last, const StreamSamplingCon
     }
 
     // Follow scheduler semantics: top-k candidate extraction first, then
-    // top-p sampling over the K candidate logits.
-    const array topk_part = argpartition(-logits_last, k - 1, -1);
-    const array topk_select = arange(0, k, 1, int32);
-    const array topk_indices = take(topk_part, topk_select, -1); // [1,1,k]
-    array sampled_logits = take_along_axis(logits_last, topk_indices, -1); // [1,1,k]
+    // top-p sampling over the K candidate logits. Use compiled top-k extraction
+    // to avoid repeated graph tracing in per-token decode loops.
+    auto topk_fn = compiled_topk_candidates(k);
+    const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
+    if (topk_outputs.size() != 2) {
+        throw std::runtime_error("sample_token_from_logits: invalid top-k output");
+    }
+    const array topk_logits_flat = topk_outputs[0];
+    const array topk_indices_flat = topk_outputs[1];
+    array sampled_logits = reshape(topk_logits_flat, {1, 1, k}); // [1,1,k]
+    const array topk_indices = reshape(topk_indices_flat, {1, 1, k}); // [1,1,k]
 
     if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
         sampled_logits = apply_top_p_filter(sampled_logits, cfg.top_p);
@@ -251,6 +261,141 @@ array sample_token_from_logits(const array& logits_last, const StreamSamplingCon
     const array sampled_local_idx_3d = reshape(sampled_local_idx, {1, 1, 1});
     const array sampled_token_3d = take_along_axis(topk_indices, sampled_local_idx_3d, -1); // [1,1,1]
     return reshape(sampled_token_3d, {1, 1});
+}
+
+std::shared_ptr<const CompiledPenalizedSampleFn> compiled_penalized_sampling_step(
+    const StreamSamplingConfig& cfg,
+    float repetition_penalty,
+    float presence_penalty,
+    float frequency_penalty
+) {
+    if (cfg.min_p != 0.0f) {
+        throw std::runtime_error("min_p != 0 is not yet supported by decode_topk_stream");
+    }
+
+    char key_buf[256];
+    std::snprintf(
+        key_buf,
+        sizeof(key_buf),
+        "k=%d|temp=%.8g|top_p=%.8g|rep=%.8g|pres=%.8g|freq=%.8g",
+        cfg.top_k,
+        cfg.temperature,
+        cfg.top_p,
+        repetition_penalty,
+        presence_penalty,
+        frequency_penalty
+    );
+    const std::string cache_key(key_buf);
+
+    static std::unordered_map<std::string, std::shared_ptr<const CompiledPenalizedSampleFn>> cache;
+    static std::mutex cache_mutex;
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(cache_key);
+    if (it != cache.end()) return it->second;
+
+    auto fn = compile(
+        [cfg, repetition_penalty, presence_penalty, frequency_penalty](const std::vector<array>& inputs) {
+            if (inputs.size() < 2) {
+                throw std::runtime_error("compiled_penalized_sampling_step expects logits and token counts");
+            }
+            const array& logits_last = inputs.at(0); // [1,1,V]
+            const array& token_counts = inputs.at(1); // [1,1,V]
+            if (logits_last.ndim() != 3 || token_counts.ndim() != 3) {
+                throw std::runtime_error("compiled_penalized_sampling_step expects rank-3 inputs");
+            }
+            if (logits_last.shape(0) != 1 || logits_last.shape(1) != 1) {
+                throw std::runtime_error("compiled_penalized_sampling_step expects logits shape [1,1,V]");
+            }
+            if (token_counts.shape(0) != 1 || token_counts.shape(1) != 1) {
+                throw std::runtime_error("compiled_penalized_sampling_step expects counts shape [1,1,V]");
+            }
+            if (token_counts.shape(2) != logits_last.shape(2)) {
+                throw std::runtime_error("compiled_penalized_sampling_step counts/logits vocab mismatch");
+            }
+
+            const bool has_repetition = repetition_penalty != 1.0f;
+            const bool has_additive = presence_penalty != 0.0f || frequency_penalty != 0.0f;
+            const array zero_f = array(0.0f, float32);
+            array sampling_logits = logits_last;
+            const array seen_mask = token_counts > zero_f;
+
+            if (has_repetition) {
+                const array rep_log = array(std::log(repetition_penalty), float32);
+                const array repetition_scales = exp(token_counts * rep_log);
+                const array repetition_adjusted = where(
+                    logits_last > zero_f,
+                    logits_last / repetition_scales,
+                    logits_last * repetition_scales
+                );
+                sampling_logits = where(seen_mask, repetition_adjusted, sampling_logits);
+            }
+
+            if (has_additive) {
+                array additive_penalties = zeros_like(token_counts);
+                if (presence_penalty != 0.0f) {
+                    additive_penalties = additive_penalties +
+                        (astype(seen_mask, float32) * array(presence_penalty, float32));
+                }
+                if (frequency_penalty != 0.0f) {
+                    additive_penalties = additive_penalties +
+                        (token_counts * array(frequency_penalty, float32));
+                }
+                sampling_logits = sampling_logits - additive_penalties;
+            }
+
+            array next_token = array(0.0f);
+            const int vocab = sampling_logits.shape(2);
+            const int k = std::min(cfg.top_k, vocab);
+            if (k <= 0) {
+                throw std::runtime_error("compiled_penalized_sampling_step invalid top_k");
+            }
+
+            if (cfg.temperature <= 0.0f || k <= 1) {
+                next_token = argmax(sampling_logits, -1); // [1,1]
+            } else {
+                array top_k_indices = array(0.0f);
+                array top_k_logits = array(0.0f);
+                if (k == 1) {
+                    const array top_idx = argmax(sampling_logits, -1); // [1,1]
+                    top_k_indices = reshape(astype(top_idx, int32), {1, 1, 1});
+                    top_k_logits = take_along_axis(sampling_logits, top_k_indices, -1); // [1,1,1]
+                } else {
+                    const array partitioned_indices = argpartition(sampling_logits, -k, -1);
+                    const array top_k_selector = arange(vocab - k, vocab, 1, int32);
+                    top_k_indices = take(partitioned_indices, top_k_selector, -1); // [1,1,k]
+                    top_k_logits = take_along_axis(sampling_logits, top_k_indices, -1); // [1,1,k]
+                }
+
+                array sampled_logits = reshape(top_k_logits, {1, 1, k}); // [1,1,k]
+                const array topk_indices = reshape(astype(top_k_indices, int32), {1, 1, k}); // [1,1,k]
+
+                if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+                    sampled_logits = apply_top_p_filter(sampled_logits, cfg.top_p);
+                }
+                sampled_logits = sampled_logits * array(1.0f / cfg.temperature, sampled_logits.dtype());
+                const array sampled_local_idx = random::categorical(sampled_logits, -1); // [1,1]
+                const array sampled_local_idx_3d = reshape(sampled_local_idx, {1, 1, 1});
+                const array sampled_token_3d = take_along_axis(topk_indices, sampled_local_idx_3d, -1); // [1,1,1]
+                next_token = reshape(sampled_token_3d, {1, 1});
+            }
+
+            const array token_idx = reshape(astype(next_token, int32), {1, 1, 1});
+            const array prev_count = take_along_axis(token_counts, token_idx, -1);
+            const array updated_counts = put_along_axis(
+                token_counts,
+                token_idx,
+                prev_count + array(1.0f, float32),
+                -1
+            );
+            return std::vector<array>{ next_token, updated_counts };
+        },
+        true
+    );
+    auto inserted = cache.emplace(
+        cache_key,
+        std::make_shared<const CompiledPenalizedSampleFn>(std::move(fn))
+    );
+    return inserted.first->second;
 }
 
 struct Qwen35Config {
@@ -308,10 +453,13 @@ struct LayerWeights {
     array mlp_down_rhs = array(0.0f);
     array mlp_gate_q_w = array(0.0f);
     array mlp_gate_q_scales = array(0.0f);
+    array mlp_gate_q_biases = array(0.0f);
     array mlp_up_q_w = array(0.0f);
     array mlp_up_q_scales = array(0.0f);
+    array mlp_up_q_biases = array(0.0f);
     array mlp_down_q_w = array(0.0f);
     array mlp_down_q_scales = array(0.0f);
+    array mlp_down_q_biases = array(0.0f);
     bool mlp_gate_has_q = false;
     bool mlp_up_has_q = false;
     bool mlp_down_has_q = false;
@@ -323,12 +471,16 @@ struct LayerWeights {
     array attn_o_rhs = array(0.0f);
     array attn_q_q_w = array(0.0f);
     array attn_q_q_scales = array(0.0f);
+    array attn_q_q_biases = array(0.0f);
     array attn_k_q_w = array(0.0f);
     array attn_k_q_scales = array(0.0f);
+    array attn_k_q_biases = array(0.0f);
     array attn_v_q_w = array(0.0f);
     array attn_v_q_scales = array(0.0f);
+    array attn_v_q_biases = array(0.0f);
     array attn_o_q_w = array(0.0f);
     array attn_o_q_scales = array(0.0f);
+    array attn_o_q_biases = array(0.0f);
     bool attn_q_has_q = false;
     bool attn_k_has_q = false;
     bool attn_v_has_q = false;
@@ -350,8 +502,10 @@ struct LayerWeights {
     array lin_in_proj_ba_rhs = array(0.0f);
     array lin_in_proj_qkvz_q_w = array(0.0f);
     array lin_in_proj_qkvz_q_scales = array(0.0f);
+    array lin_in_proj_qkvz_q_biases = array(0.0f);
     array lin_in_proj_ba_q_w = array(0.0f);
     array lin_in_proj_ba_q_scales = array(0.0f);
+    array lin_in_proj_ba_q_biases = array(0.0f);
     bool lin_in_proj_qkvz_has_q = false;
     bool lin_in_proj_ba_has_q = false;
     array lin_A_log = array(0.0f);
@@ -361,6 +515,7 @@ struct LayerWeights {
     array lin_out_proj_rhs = array(0.0f);
     array lin_out_proj_q_w = array(0.0f);
     array lin_out_proj_q_scales = array(0.0f);
+    array lin_out_proj_q_biases = array(0.0f);
     bool lin_out_proj_has_q = false;
 
     int lin_num_v_heads = 0;
@@ -376,11 +531,13 @@ struct LayerWeights {
     array sc_in_proj_rhs = array(0.0f);
     array sc_in_proj_q_w = array(0.0f);
     array sc_in_proj_q_scales = array(0.0f);
+    array sc_in_proj_q_biases = array(0.0f);
     array sc_conv1d_w = array(0.0f); // [conv_dim, kernel, 1]
     array sc_conv_bias = array(0.0f);
     array sc_out_proj_rhs = array(0.0f);
     array sc_out_proj_q_w = array(0.0f);
     array sc_out_proj_q_scales = array(0.0f);
+    array sc_out_proj_q_biases = array(0.0f);
     bool sc_in_proj_has_q = false;
     bool sc_out_proj_has_q = false;
     bool sc_has_bias = false;
@@ -957,6 +1114,77 @@ array maybe_dequantize_grouped_affine_weight(
     return dequant_bf16;
 }
 
+bool has_grouped_affine_metadata_for_key(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key
+) {
+    if (!ends_with(weight_key, ".weight")) return false;
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    const bool has_scales =
+        tensors.find(base + ".scales") != tensors.end() ||
+        tensors.find(base + ".weight_scale") != tensors.end();
+    const bool has_biases =
+        tensors.find(base + ".biases") != tensors.end() ||
+        tensors.find(base + ".weight_bias") != tensors.end();
+    return has_scales && has_biases;
+}
+
+bool maybe_capture_grouped_affine_quant(
+    const std::unordered_map<std::string, array>& tensors,
+    const Qwen35Config& cfg,
+    const std::string& weight_key,
+    const array& lhs_weight,
+    array* out_q_w,
+    array* out_q_scales,
+    array* out_q_biases
+) {
+    if (!has_grouped_affine_metadata_for_key(tensors, weight_key)) return false;
+    if (!ends_with(weight_key, ".weight")) return false;
+    if (lhs_weight.ndim() != 2) return false;
+    if (cfg.quant_bits != 4 && cfg.quant_bits != 8) return false;
+    if (cfg.quant_group_size <= 0) return false;
+
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    auto raw_it = tensors.find(weight_key);
+    if (raw_it == tensors.end()) return false;
+
+    auto scales_it = tensors.find(base + ".scales");
+    if (scales_it == tensors.end()) scales_it = tensors.find(base + ".weight_scale");
+    auto biases_it = tensors.find(base + ".biases");
+    if (biases_it == tensors.end()) biases_it = tensors.find(base + ".weight_bias");
+    if (scales_it == tensors.end() || biases_it == tensors.end()) return false;
+
+    const array& raw_weight = raw_it->second;
+    if (raw_weight.ndim() != 2) return false;
+    const int rows = raw_weight.shape(0);
+    const int packed_cols = raw_weight.shape(1);
+    const int values_per_word = cfg.quant_bits == 4 ? 8 : 4;
+    const int cols = packed_cols * values_per_word;
+    const bool lhs_matches_unpacked =
+        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == cols;
+    const bool lhs_matches_packed =
+        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == packed_cols;
+    if (!lhs_matches_unpacked && !lhs_matches_packed) {
+        // Synthetic fused tensors (for example concatenated qkvz) do not map
+        // 1:1 to a single grouped-affine source tensor.
+        return false;
+    }
+
+    const array scales_f32 = astype(scales_it->second, float32);
+    const array biases_f32 = astype(biases_it->second, float32);
+    if (scales_f32.ndim() != 2 || biases_f32.ndim() != 2) return false;
+    if (scales_f32.shape(0) != rows || biases_f32.shape(0) != rows) return false;
+    if (scales_f32.shape(1) != biases_f32.shape(1)) return false;
+
+    const int expected_groups = (cols + cfg.quant_group_size - 1) / cfg.quant_group_size;
+    if (scales_f32.shape(1) != expected_groups) return false;
+
+    *out_q_w = astype(raw_weight, uint32);
+    *out_q_scales = scales_f32;
+    *out_q_biases = biases_f32;
+    return true;
+}
+
 array load_linear_weight(
     const std::unordered_map<std::string, array>& tensors,
     const Qwen35Config& cfg,
@@ -969,17 +1197,23 @@ array load_linear_weight(
 
 void maybe_quantize_mxfp8_matrix(
     const std::unordered_map<std::string, array>& tensors,
+    const Qwen35Config& cfg,
     const std::string& weight_key,
     const array& lhs_weight,
     bool enabled,
     array* out_q_w,
     array* out_q_scales,
+    array* out_q_biases,
     bool* out_has_q
 ) {
     if (!enabled) {
         *out_has_q = false;
         return;
     }
+    if (out_q_biases) {
+        *out_q_biases = array(0.0f);
+    }
+    g_qmm_attempts += 1;
     // Fast path for native MXFP8 checkpoints: reuse packed FP8 payload and
     // block scales directly for decode-time quantized matmul.
     if (ends_with(weight_key, ".weight")) {
@@ -1004,12 +1238,36 @@ void maybe_quantize_mxfp8_matrix(
                         *out_q_w = packed;
                         *out_q_scales = astype(raw_scales, uint8);
                         *out_has_q = true;
+                        g_qmm_success += 1;
                         return;
                     } catch (const std::exception&) {
                         // Fall through to generic quantize path.
                     }
                 }
             }
+        }
+    }
+
+    const bool enforce_grouped_affine_lossless = env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true);
+    if (enforce_grouped_affine_lossless && out_q_biases != nullptr) {
+        if (maybe_capture_grouped_affine_quant(
+                tensors,
+                cfg,
+                weight_key,
+                lhs_weight,
+                out_q_w,
+                out_q_scales,
+                out_q_biases))
+        {
+            *out_has_q = true;
+            g_qmm_success += 1;
+            return;
+        }
+        // If grouped-affine metadata exists but cannot be mapped directly
+        // (for example synthetic fused tensors), avoid lossy re-quantization.
+        if (has_grouped_affine_metadata_for_key(tensors, weight_key)) {
+            *out_has_q = false;
+            return;
         }
     }
 
@@ -1020,6 +1278,7 @@ void maybe_quantize_mxfp8_matrix(
         // Some converted checkpoints keep FP8 payload tensors as uint8 and
         // expose scales via metadata. Dequantize first when needed so MLX
         // quantize() receives a real floating tensor.
+        quant_input = maybe_dequantize_grouped_affine_weight(tensors, cfg, weight_key, quant_input);
         quant_input = maybe_dequantize_fp8_weight(tensors, weight_key, quant_input);
     }
     const Dtype qdt = quant_input.dtype();
@@ -1047,17 +1306,37 @@ void maybe_quantize_mxfp8_matrix(
     *out_q_w = q[0];
     *out_q_scales = q[1];
     *out_has_q = true;
+    g_qmm_success += 1;
 }
 
 array linear_decode_maybe_quantized(
     bool decode_qmm_enabled,
+    int quant_group_size,
+    int quant_bits,
     const array& x,
     const array& rhs,
     bool has_q,
     const array& q_w,
-    const array& q_scales
+    const array& q_scales,
+    const array& q_biases
 ) {
-    if (has_q && decode_qmm_enabled) {
+    const bool decode_step = (x.ndim() == 3 && x.shape(1) == 1) || (x.ndim() == 2 && x.shape(0) == 1);
+    const bool q_ready = has_q && decode_qmm_enabled && decode_step && q_w.size() > 0 && q_scales.size() > 0;
+    if (q_ready) {
+        const bool affine_ready = q_biases.ndim() == 2 && q_biases.size() > 1 &&
+            quant_group_size > 0 && (quant_bits == 4 || quant_bits == 8);
+        if (affine_ready) {
+            return quantized_matmul(
+                x,
+                q_w,
+                q_scales,
+                std::optional<array>(q_biases),
+                true,
+                quant_group_size,
+                quant_bits,
+                "affine"
+            );
+        }
         return quantized_matmul(
             x,
             q_w,
@@ -1068,6 +1347,9 @@ array linear_decode_maybe_quantized(
             std::nullopt,
             "mxfp8"
         );
+    }
+    if (rhs.size() <= 1 || rhs.ndim() < 2) {
+        throw std::runtime_error("linear_decode_maybe_quantized: dense rhs is missing while quantized path is unavailable");
     }
     return matmul(x, rhs);
 }
@@ -1351,6 +1633,7 @@ struct mlx_ctx {
     array lm_head_rhs = array(0.0f);  // [hidden, vocab]
     array lm_head_q_w = array(0.0f);  // [vocab, hidden * bits / 32] packed
     array lm_head_q_scales = array(0.0f); // [vocab, hidden / group_size]
+    array lm_head_q_biases = array(0.0f); // [vocab, hidden / group_size] affine-only
     array final_norm_w = array(0.0f); // [hidden]
     bool has_fp8_meta = false;
     bool has_mxfp8_meta = false;
@@ -1455,6 +1738,18 @@ bool has_fp8_quant_metadata(const std::unordered_map<std::string, array>& tensor
 bool has_mxfp8_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
     for (const auto& kv : tensors) {
         if (ends_with(kv.first, ".weight_block_scale")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_grouped_affine_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
+    for (const auto& kv : tensors) {
+        if (!ends_with(kv.first, ".weight")) continue;
+        const std::string base = kv.first.substr(0, kv.first.size() - std::string(".weight").size());
+        if (tensors.find(base + ".scales") != tensors.end() &&
+            tensors.find(base + ".biases") != tensors.end()) {
             return true;
         }
     }
@@ -1692,11 +1987,14 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
 
     const array q_proj_out = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.attn_q_rhs,
         lw.attn_q_has_q,
         lw.attn_q_q_w,
-        lw.attn_q_q_scales
+        lw.attn_q_q_scales,
+        lw.attn_q_q_biases
     );
     const int q_last_dim = q_proj_out.shape(2);
     const int q_base_dim = lw.attn_num_heads * lw.attn_head_dim;
@@ -1722,19 +2020,25 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
 
     const array k_proj_out = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.attn_k_rhs,
         lw.attn_k_has_q,
         lw.attn_k_q_w,
-        lw.attn_k_q_scales
+        lw.attn_k_q_scales,
+        lw.attn_k_q_biases
     );
     const array v_proj_out = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.attn_v_rhs,
         lw.attn_v_has_q,
         lw.attn_v_q_w,
-        lw.attn_v_q_scales
+        lw.attn_v_q_scales,
+        lw.attn_v_q_biases
     );
 
     array queries = fast::rms_norm(queries_raw, std::optional<array>(lw.attn_q_norm_w), ctx->cfg.rms_norm_eps);
@@ -1819,11 +2123,14 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
 
     return linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         attn_out,
         lw.attn_o_rhs,
         lw.attn_o_has_q,
         lw.attn_o_q_w,
-        lw.attn_o_q_scales
+        lw.attn_o_q_scales,
+        lw.attn_o_q_biases
     );
 }
 
@@ -1836,11 +2143,14 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
 
     const array qkvz = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.lin_in_proj_qkvz_rhs,
         lw.lin_in_proj_qkvz_has_q,
         lw.lin_in_proj_qkvz_q_w,
-        lw.lin_in_proj_qkvz_q_scales
+        lw.lin_in_proj_qkvz_q_scales,
+        lw.lin_in_proj_qkvz_q_biases
     ); // [B,S,conv_dim+value_dim]
     const array qkv = slice(qkvz, {0, 0, 0}, {B, S, lw.lin_conv_dim});
     const array z_flat = slice(qkvz, {0, 0, lw.lin_conv_dim}, {B, S, lw.lin_conv_dim + lw.lin_value_dim});
@@ -1848,11 +2158,14 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
 
     const array ba = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.lin_in_proj_ba_rhs,
         lw.lin_in_proj_ba_has_q,
         lw.lin_in_proj_ba_q_w,
-        lw.lin_in_proj_ba_q_scales
+        lw.lin_in_proj_ba_q_scales,
+        lw.lin_in_proj_ba_q_biases
     ); // [B,S,2*Hv]
     const array b = slice(ba, {0, 0, 0}, {B, S, lw.lin_num_v_heads});
     const array a = slice(ba, {0, 0, lw.lin_num_v_heads}, {B, S, 2 * lw.lin_num_v_heads});
@@ -1893,11 +2206,14 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
     const array merged = reshape(normed, {B, S, lw.lin_value_dim});
     return linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         merged,
         lw.lin_out_proj_rhs,
         lw.lin_out_proj_has_q,
         lw.lin_out_proj_q_w,
-        lw.lin_out_proj_q_scales
+        lw.lin_out_proj_q_scales,
+        lw.lin_out_proj_q_biases
     );
 }
 
@@ -1910,11 +2226,14 @@ array run_shortconv_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
 
     const array proj = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.sc_in_proj_rhs,
         lw.sc_in_proj_has_q,
         lw.sc_in_proj_q_w,
-        lw.sc_in_proj_q_scales
+        lw.sc_in_proj_q_scales,
+        lw.sc_in_proj_q_biases
     ); // [B,S,3*conv_dim]
     const array b_gate = slice(proj, {0, 0, 0}, {B, S, lw.sc_conv_dim});
     const array c_gate = slice(proj, {0, 0, lw.sc_conv_dim}, {B, S, 2 * lw.sc_conv_dim});
@@ -1940,11 +2259,14 @@ array run_shortconv_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
     const array gated = c_gate * conv_out;
     return linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         gated,
         lw.sc_out_proj_rhs,
         lw.sc_out_proj_has_q,
         lw.sc_out_proj_q_w,
-        lw.sc_out_proj_q_scales
+        lw.sc_out_proj_q_scales,
+        lw.sc_out_proj_q_biases
     );
 }
 
@@ -1983,28 +2305,37 @@ array run_layer(mlx_ctx* ctx, int layer_idx, const array& hidden, const TraceFra
     const array mlp_in = fast::rms_norm(h, std::optional<array>(lw.post_attention_layernorm_w), ctx->cfg.rms_norm_eps);
     const array gate = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         mlp_in,
         lw.mlp_gate_rhs,
         lw.mlp_gate_has_q,
         lw.mlp_gate_q_w,
-        lw.mlp_gate_q_scales
+        lw.mlp_gate_q_scales,
+        lw.mlp_gate_q_biases
     );
     const array up = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         mlp_in,
         lw.mlp_up_rhs,
         lw.mlp_up_has_q,
         lw.mlp_up_q_w,
-        lw.mlp_up_q_scales
+        lw.mlp_up_q_scales,
+        lw.mlp_up_q_biases
     );
     const array ff = silu(gate) * up;
     const array down = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         ff,
         lw.mlp_down_rhs,
         lw.mlp_down_has_q,
         lw.mlp_down_q_w,
-        lw.mlp_down_q_scales
+        lw.mlp_down_q_scales,
+        lw.mlp_down_q_biases
     );
 
     const array out = h + down;
@@ -2084,17 +2415,35 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
         lm_input = slice(hidden, {0, t - 1, 0}, {b, t, h});
     }
     const bool decode_step = lm_input.ndim() == 3 && lm_input.shape(1) == 1;
-    const array logits = (ctx->lm_head_q_decode_enabled && decode_step)
-        ? quantized_matmul(
-              lm_input,
-              ctx->lm_head_q_w,
-              ctx->lm_head_q_scales,
-              std::nullopt,
-              true,
-              std::nullopt,
-              std::nullopt,
-              "mxfp8"
-          )
+    const bool lm_head_q_ready = ctx->lm_head_q_decode_enabled && decode_step &&
+        ctx->lm_head_q_w.size() > 0 && ctx->lm_head_q_scales.size() > 0;
+    const bool lm_head_affine_ready = lm_head_q_ready &&
+        ctx->lm_head_q_biases.ndim() == 2 &&
+        ctx->lm_head_q_biases.size() > 1 &&
+        ctx->cfg.quant_group_size > 0 &&
+        (ctx->cfg.quant_bits == 4 || ctx->cfg.quant_bits == 8);
+    const array logits = lm_head_q_ready
+        ? (lm_head_affine_ready
+              ? quantized_matmul(
+                    lm_input,
+                    ctx->lm_head_q_w,
+                    ctx->lm_head_q_scales,
+                    std::optional<array>(ctx->lm_head_q_biases),
+                    true,
+                    ctx->cfg.quant_group_size,
+                    ctx->cfg.quant_bits,
+                    "affine"
+                )
+              : quantized_matmul(
+                    lm_input,
+                    ctx->lm_head_q_w,
+                    ctx->lm_head_q_scales,
+                    std::nullopt,
+                    true,
+                    std::nullopt,
+                    std::nullopt,
+                    "mxfp8"
+                ))
         : matmul(lm_input, ctx->lm_head_rhs);
     if (trace_frame) {
         xray_emit_array_f32(
@@ -2693,6 +3042,14 @@ int32_t mlx_validate_config(const char* model_path) {
 mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) {
     bool wired_limit_acquired = false;
     bool rng_entered = false;
+    const bool qmm_debug = []() {
+        if (const char* value = std::getenv("TALU_METAL_QMM_DEBUG")) {
+            return std::string(value) == "1";
+        }
+        return false;
+    }();
+    const size_t qmm_attempts_before = g_qmm_attempts;
+    const size_t qmm_success_before = g_qmm_success;
     try {
         if (!metal::is_available()) {
             g_last_error = "Metal backend is not available";
@@ -2737,8 +3094,17 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         ctx->has_fp8_meta = has_fp8_meta;
         const bool has_mxfp8_meta = has_mxfp8_quant_metadata(tensors);
         ctx->has_mxfp8_meta = has_mxfp8_meta;
-        ctx->fp8_decode_qmm_enabled = has_mxfp8_meta && env_truthy("TALU_METAL_FP8_DECODE_QMM", true);
+        const bool has_grouped_affine_meta = has_grouped_affine_quant_metadata(tensors);
+        // Decode-time QMM defaults on for quantized checkpoints:
+        // - native MXFP8 metadata
+        // - grouped-affine metadata (GAF/NVFP4)
+        // Callers can still force on/off via TALU_METAL_FP8_DECODE_QMM.
+        const bool default_decode_qmm = has_mxfp8_meta || has_grouped_affine_meta;
+        ctx->fp8_decode_qmm_enabled = env_truthy("TALU_METAL_FP8_DECODE_QMM", default_decode_qmm);
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
+        // Decode QMM is currently decode-step-only; prefill still needs dense
+        // RHS tensors available for every quantized linear.
+        const bool keep_dense_rhs_for_prefill = true;
 
         const std::string text_prefix = detect_text_prefix(tensors);
         const std::string layer_prefix = text_prefix + "layers.";
@@ -2774,7 +3140,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             }
         }
 
-        const bool enable_lm_head_qmm = has_mxfp8_meta && env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", true);
+        const bool enable_lm_head_qmm = env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", has_mxfp8_meta || has_grouped_affine_meta);
         if (enable_lm_head_qmm) {
             if (lm_head_weight.size() == 1) {
                 // Tie embeddings can point at raw FP8 tensors. Load dequantized copy only
@@ -2784,17 +3150,21 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             bool lm_head_has_q = false;
             maybe_quantize_mxfp8_matrix(
                 tensors,
+                ctx->cfg,
                 lm_head_key,
                 lm_head_weight,
                 true,
                 &ctx->lm_head_q_w,
                 &ctx->lm_head_q_scales,
+                &ctx->lm_head_q_biases,
                 &lm_head_has_q
             );
             ctx->lm_head_q_decode_enabled = lm_head_has_q;
         }
 
-        if (!ctx->lm_head_q_decode_enabled) {
+        // Non-MXFP8 checkpoints still run prefill through the regular lm_head
+        // matmul path (decode-only QMM), so keep rhs available in that case.
+        if (keep_dense_rhs_for_prefill || !ctx->lm_head_q_decode_enabled || !ctx->has_fp8_meta) {
             if (lm_head_weight.size() == 1) {
                 lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
             }
@@ -2842,46 +3212,52 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
 
             maybe_quantize_mxfp8_matrix(
                 tensors,
+                ctx->cfg,
                 mlp_gate_key,
                 mlp_gate_weight,
                 enable_mlp_qmm,
                 &lw.mlp_gate_q_w,
                 &lw.mlp_gate_q_scales,
+                &lw.mlp_gate_q_biases,
                 &lw.mlp_gate_has_q
             );
             maybe_quantize_mxfp8_matrix(
                 tensors,
+                ctx->cfg,
                 mlp_up_key,
                 mlp_up_weight,
                 enable_mlp_qmm,
                 &lw.mlp_up_q_w,
                 &lw.mlp_up_q_scales,
+                &lw.mlp_up_q_biases,
                 &lw.mlp_up_has_q
             );
             maybe_quantize_mxfp8_matrix(
                 tensors,
+                ctx->cfg,
                 mlp_down_key,
                 mlp_down_weight,
                 enable_mlp_qmm,
                 &lw.mlp_down_q_w,
                 &lw.mlp_down_q_scales,
+                &lw.mlp_down_q_biases,
                 &lw.mlp_down_has_q
             );
-            if (!enable_mlp_qmm || !lw.mlp_gate_has_q) {
+            if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_gate_has_q) {
                 const array mlp_gate_dense = load_linear_weight(tensors, ctx->cfg, mlp_gate_key);
                 lw.mlp_gate_rhs = to_rhs(
                     mlp_gate_dense,
                     p + "mlp_gate"
                 );
             }
-            if (!enable_mlp_qmm || !lw.mlp_up_has_q) {
+            if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_up_has_q) {
                 const array mlp_up_dense = load_linear_weight(tensors, ctx->cfg, mlp_up_key);
                 lw.mlp_up_rhs = to_rhs(
                     mlp_up_dense,
                     p + "mlp_up"
                 );
             }
-            if (!enable_mlp_qmm || !lw.mlp_down_has_q) {
+            if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_down_has_q) {
                 const array mlp_down_dense = load_linear_weight(tensors, ctx->cfg, mlp_down_key);
                 lw.mlp_down_rhs = to_rhs(
                     mlp_down_dense,
@@ -2958,30 +3334,120 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     const array b_weight = load_linear_weight(tensors, ctx->cfg, b_key);
                     const array qkvz_weight = concatenate({qkv_weight, z_weight}, 0);
                     const array ba_weight = concatenate({b_weight, a_weight}, 0);
-                    maybe_quantize_mxfp8_matrix(
-                        tensors,
-                        qkv_key,
-                        qkvz_weight,
-                        enable_mlp_qmm,
-                        &lw.lin_in_proj_qkvz_q_w,
-                        &lw.lin_in_proj_qkvz_q_scales,
-                        &lw.lin_in_proj_qkvz_has_q
-                    );
-                    maybe_quantize_mxfp8_matrix(
-                        tensors,
-                        b_key,
-                        ba_weight,
-                        enable_mlp_qmm,
-                        &lw.lin_in_proj_ba_q_w,
-                        &lw.lin_in_proj_ba_q_scales,
-                        &lw.lin_in_proj_ba_has_q
-                    );
-                    if (!enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) {
+                    bool lin_qkvz_q_captured = false;
+                    bool lin_ba_q_captured = false;
+                    if (enable_mlp_qmm && env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true)) {
+                        // Split linear-attn checkpoints store grouped-affine metadata
+                        // per source tensor. Capture each source tensor losslessly
+                        // and concatenate packed payload + calibration metadata.
+                        array qkv_q_w = array(0.0f);
+                        array qkv_q_scales = array(0.0f);
+                        array qkv_q_biases = array(0.0f);
+                        array z_q_w = array(0.0f);
+                        array z_q_scales = array(0.0f);
+                        array z_q_biases = array(0.0f);
+                        if (maybe_capture_grouped_affine_quant(
+                                tensors,
+                                ctx->cfg,
+                                qkv_key,
+                                qkv_weight,
+                                &qkv_q_w,
+                                &qkv_q_scales,
+                                &qkv_q_biases) &&
+                            maybe_capture_grouped_affine_quant(
+                                tensors,
+                                ctx->cfg,
+                                z_key,
+                                z_weight,
+                                &z_q_w,
+                                &z_q_scales,
+                                &z_q_biases) &&
+                            qkv_q_w.ndim() == 2 && z_q_w.ndim() == 2 &&
+                            qkv_q_w.shape(1) == z_q_w.shape(1) &&
+                            qkv_q_scales.ndim() == 2 && z_q_scales.ndim() == 2 &&
+                            qkv_q_scales.shape(1) == z_q_scales.shape(1) &&
+                            qkv_q_biases.ndim() == 2 && z_q_biases.ndim() == 2 &&
+                            qkv_q_biases.shape(1) == z_q_biases.shape(1))
+                        {
+                            lw.lin_in_proj_qkvz_q_w = concatenate({qkv_q_w, z_q_w}, 0);
+                            lw.lin_in_proj_qkvz_q_scales = concatenate({qkv_q_scales, z_q_scales}, 0);
+                            lw.lin_in_proj_qkvz_q_biases = concatenate({qkv_q_biases, z_q_biases}, 0);
+                            lw.lin_in_proj_qkvz_has_q = true;
+                            lin_qkvz_q_captured = true;
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+
+                        array b_q_w = array(0.0f);
+                        array b_q_scales = array(0.0f);
+                        array b_q_biases = array(0.0f);
+                        array a_q_w = array(0.0f);
+                        array a_q_scales = array(0.0f);
+                        array a_q_biases = array(0.0f);
+                        if (maybe_capture_grouped_affine_quant(
+                                tensors,
+                                ctx->cfg,
+                                b_key,
+                                b_weight,
+                                &b_q_w,
+                                &b_q_scales,
+                                &b_q_biases) &&
+                            maybe_capture_grouped_affine_quant(
+                                tensors,
+                                ctx->cfg,
+                                a_key,
+                                a_weight,
+                                &a_q_w,
+                                &a_q_scales,
+                                &a_q_biases) &&
+                            b_q_w.ndim() == 2 && a_q_w.ndim() == 2 &&
+                            b_q_w.shape(1) == a_q_w.shape(1) &&
+                            b_q_scales.ndim() == 2 && a_q_scales.ndim() == 2 &&
+                            b_q_scales.shape(1) == a_q_scales.shape(1) &&
+                            b_q_biases.ndim() == 2 && a_q_biases.ndim() == 2 &&
+                            b_q_biases.shape(1) == a_q_biases.shape(1))
+                        {
+                            lw.lin_in_proj_ba_q_w = concatenate({b_q_w, a_q_w}, 0);
+                            lw.lin_in_proj_ba_q_scales = concatenate({b_q_scales, a_q_scales}, 0);
+                            lw.lin_in_proj_ba_q_biases = concatenate({b_q_biases, a_q_biases}, 0);
+                            lw.lin_in_proj_ba_has_q = true;
+                            lin_ba_q_captured = true;
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+                    }
+                    if (!lin_qkvz_q_captured) {
+                        maybe_quantize_mxfp8_matrix(
+                            tensors,
+                            ctx->cfg,
+                            qkv_key,
+                            qkvz_weight,
+                            enable_mlp_qmm,
+                            &lw.lin_in_proj_qkvz_q_w,
+                            &lw.lin_in_proj_qkvz_q_scales,
+                            &lw.lin_in_proj_qkvz_q_biases,
+                            &lw.lin_in_proj_qkvz_has_q
+                        );
+                    }
+                    if (!lin_ba_q_captured) {
+                        maybe_quantize_mxfp8_matrix(
+                            tensors,
+                            ctx->cfg,
+                            b_key,
+                            ba_weight,
+                            enable_mlp_qmm,
+                            &lw.lin_in_proj_ba_q_w,
+                            &lw.lin_in_proj_ba_q_scales,
+                            &lw.lin_in_proj_ba_q_biases,
+                            &lw.lin_in_proj_ba_has_q
+                        );
+                    }
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) {
                         const array qkv_rhs = to_rhs(qkv_weight, qkv_key);
                         const array z_rhs = to_rhs(z_weight, z_key);
                         lw.lin_in_proj_qkvz_rhs = concatenate({ qkv_rhs, z_rhs }, 1);
                     }
-                    if (!enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
                         const array b_rhs = to_rhs(b_weight, b_key);
                         const array a_rhs = to_rhs(a_weight, a_key);
                         lw.lin_in_proj_ba_rhs = concatenate({ b_rhs, a_rhs }, 1);
@@ -3012,39 +3478,87 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                         {qkvz_cols, 0},
                         {expected_cols, fused_in_proj_weight.shape(1)}
                     );
-                    maybe_quantize_mxfp8_matrix(
-                        tensors,
-                        p + "mixer.in_proj.qkvz_slice",
-                        qkvz_weight,
-                        enable_mlp_qmm,
-                        &lw.lin_in_proj_qkvz_q_w,
-                        &lw.lin_in_proj_qkvz_q_scales,
-                        &lw.lin_in_proj_qkvz_has_q
-                    );
-                    maybe_quantize_mxfp8_matrix(
-                        tensors,
-                        p + "mixer.in_proj.ba_slice",
-                        ba_weight,
-                        enable_mlp_qmm,
-                        &lw.lin_in_proj_ba_q_w,
-                        &lw.lin_in_proj_ba_q_scales,
-                        &lw.lin_in_proj_ba_has_q
-                    );
-                    if ((!enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) ||
-                        (!enable_mlp_qmm || !lw.lin_in_proj_ba_has_q)) {
+                    bool lin_qkvz_q_captured = false;
+                    bool lin_ba_q_captured = false;
+                    if (enable_mlp_qmm && env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true)) {
+                        // Fused linear-attn stores grouped-affine metadata for
+                        // mixer.in_proj as one tensor. Slice packed payload +
+                        // metadata rows losslessly into qkvz and ba branches.
+                        array fused_q_w = array(0.0f);
+                        array fused_q_scales = array(0.0f);
+                        array fused_q_biases = array(0.0f);
+                        if (maybe_capture_grouped_affine_quant(
+                                tensors,
+                                ctx->cfg,
+                                fused_key,
+                                fused_in_proj_weight,
+                                &fused_q_w,
+                                &fused_q_scales,
+                                &fused_q_biases) &&
+                            fused_q_w.ndim() == 2 &&
+                            fused_q_scales.ndim() == 2 &&
+                            fused_q_biases.ndim() == 2 &&
+                            fused_q_w.shape(0) == expected_cols &&
+                            fused_q_scales.shape(0) == expected_cols &&
+                            fused_q_biases.shape(0) == expected_cols)
+                        {
+                            const int packed_cols = fused_q_w.shape(1);
+                            const int group_cols = fused_q_scales.shape(1);
+                            lw.lin_in_proj_qkvz_q_w = slice(fused_q_w, {0, 0}, {qkvz_cols, packed_cols});
+                            lw.lin_in_proj_ba_q_w = slice(fused_q_w, {qkvz_cols, 0}, {expected_cols, packed_cols});
+                            lw.lin_in_proj_qkvz_q_scales = slice(fused_q_scales, {0, 0}, {qkvz_cols, group_cols});
+                            lw.lin_in_proj_ba_q_scales = slice(fused_q_scales, {qkvz_cols, 0}, {expected_cols, group_cols});
+                            lw.lin_in_proj_qkvz_q_biases = slice(fused_q_biases, {0, 0}, {qkvz_cols, group_cols});
+                            lw.lin_in_proj_ba_q_biases = slice(fused_q_biases, {qkvz_cols, 0}, {expected_cols, group_cols});
+                            lw.lin_in_proj_qkvz_has_q = true;
+                            lw.lin_in_proj_ba_has_q = true;
+                            lin_qkvz_q_captured = true;
+                            lin_ba_q_captured = true;
+                            g_qmm_attempts += 2;
+                            g_qmm_success += 2;
+                        }
+                    }
+                    if (!lin_qkvz_q_captured) {
+                        maybe_quantize_mxfp8_matrix(
+                            tensors,
+                            ctx->cfg,
+                            p + "mixer.in_proj.qkvz_slice",
+                            qkvz_weight,
+                            enable_mlp_qmm,
+                            &lw.lin_in_proj_qkvz_q_w,
+                            &lw.lin_in_proj_qkvz_q_scales,
+                            &lw.lin_in_proj_qkvz_q_biases,
+                            &lw.lin_in_proj_qkvz_has_q
+                        );
+                    }
+                    if (!lin_ba_q_captured) {
+                        maybe_quantize_mxfp8_matrix(
+                            tensors,
+                            ctx->cfg,
+                            p + "mixer.in_proj.ba_slice",
+                            ba_weight,
+                            enable_mlp_qmm,
+                            &lw.lin_in_proj_ba_q_w,
+                            &lw.lin_in_proj_ba_q_scales,
+                            &lw.lin_in_proj_ba_q_biases,
+                            &lw.lin_in_proj_ba_has_q
+                        );
+                    }
+                    if ((keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) ||
+                        (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_ba_has_q)) {
                         const array fused_in_proj_rhs = to_rhs(
                             fused_in_proj_weight,
                             fused_key
                         );
                         const int fused_rows = fused_in_proj_rhs.shape(0);
-                        if (!enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) {
+                        if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) {
                             lw.lin_in_proj_qkvz_rhs = slice(
                                 fused_in_proj_rhs,
                                 {0, 0},
                                 {fused_rows, qkvz_cols}
                             );
                         }
-                        if (!enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
+                        if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
                             lw.lin_in_proj_ba_rhs = slice(
                                 fused_in_proj_rhs,
                                 {0, qkvz_cols},
@@ -3061,14 +3575,16 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 const array& out_proj_weight = require_tensor(tensors, out_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     out_proj_key,
                     out_proj_weight,
                     enable_mlp_qmm,
                     &lw.lin_out_proj_q_w,
                     &lw.lin_out_proj_q_scales,
+                    &lw.lin_out_proj_q_biases,
                     &lw.lin_out_proj_has_q
                 );
-                if (!enable_mlp_qmm || !lw.lin_out_proj_has_q) {
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_out_proj_has_q) {
                     const array out_proj_dense = load_linear_weight(tensors, ctx->cfg, out_proj_key);
                     lw.lin_out_proj_rhs = to_rhs(out_proj_dense, out_proj_key);
                 }
@@ -3077,11 +3593,13 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 const array& sc_in_proj_weight = require_tensor(tensors, sc_in_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     sc_in_proj_key,
                     sc_in_proj_weight,
                     enable_mlp_qmm,
                     &lw.sc_in_proj_q_w,
                     &lw.sc_in_proj_q_scales,
+                    &lw.sc_in_proj_q_biases,
                     &lw.sc_in_proj_has_q
                 );
                 lw.sc_conv1d_w = require_tensor(tensors, p + "conv.conv.weight");
@@ -3089,18 +3607,20 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 const array& sc_out_proj_weight = require_tensor(tensors, sc_out_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     sc_out_proj_key,
                     sc_out_proj_weight,
                     enable_mlp_qmm,
                     &lw.sc_out_proj_q_w,
                     &lw.sc_out_proj_q_scales,
+                    &lw.sc_out_proj_q_biases,
                     &lw.sc_out_proj_has_q
                 );
-                if (!enable_mlp_qmm || !lw.sc_in_proj_has_q) {
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.sc_in_proj_has_q) {
                     const array sc_in_proj_dense = load_linear_weight(tensors, ctx->cfg, sc_in_proj_key);
                     lw.sc_in_proj_rhs = to_rhs(sc_in_proj_dense, sc_in_proj_key);
                 }
-                if (!enable_mlp_qmm || !lw.sc_out_proj_has_q) {
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.sc_out_proj_has_q) {
                     const array sc_out_proj_dense = load_linear_weight(tensors, ctx->cfg, sc_out_proj_key);
                     lw.sc_out_proj_rhs = to_rhs(sc_out_proj_dense, sc_out_proj_key);
                 }
@@ -3127,53 +3647,61 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 const array& o_proj_weight = require_tensor(tensors, o_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     q_proj_key,
                     q_proj_weight,
                     enable_mlp_qmm,
                     &lw.attn_q_q_w,
                     &lw.attn_q_q_scales,
+                    &lw.attn_q_q_biases,
                     &lw.attn_q_has_q
                 );
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     k_proj_key,
                     k_proj_weight,
                     enable_mlp_qmm,
                     &lw.attn_k_q_w,
                     &lw.attn_k_q_scales,
+                    &lw.attn_k_q_biases,
                     &lw.attn_k_has_q
                 );
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     v_proj_key,
                     v_proj_weight,
                     enable_mlp_qmm,
                     &lw.attn_v_q_w,
                     &lw.attn_v_q_scales,
+                    &lw.attn_v_q_biases,
                     &lw.attn_v_has_q
                 );
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     o_proj_key,
                     o_proj_weight,
                     enable_mlp_qmm,
                     &lw.attn_o_q_w,
                     &lw.attn_o_q_scales,
+                    &lw.attn_o_q_biases,
                     &lw.attn_o_has_q
                 );
-                if (!enable_mlp_qmm || !lw.attn_q_has_q) {
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_q_has_q) {
                     const array q_proj_dense = load_linear_weight(tensors, ctx->cfg, q_proj_key);
                     lw.attn_q_rhs = to_rhs(q_proj_dense, q_proj_key);
                 }
-                if (!enable_mlp_qmm || !lw.attn_k_has_q) {
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_k_has_q) {
                     const array k_proj_dense = load_linear_weight(tensors, ctx->cfg, k_proj_key);
                     lw.attn_k_rhs = to_rhs(k_proj_dense, k_proj_key);
                 }
-                if (!enable_mlp_qmm || !lw.attn_v_has_q) {
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_v_has_q) {
                     const array v_proj_dense = load_linear_weight(tensors, ctx->cfg, v_proj_key);
                     lw.attn_v_rhs = to_rhs(v_proj_dense, v_proj_key);
                 }
-                if (!enable_mlp_qmm || !lw.attn_o_has_q) {
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_o_has_q) {
                     const array o_proj_dense = load_linear_weight(tensors, ctx->cfg, o_proj_key);
                     lw.attn_o_rhs = to_rhs(o_proj_dense, p + "self_attn_o_proj");
                 }
@@ -3223,6 +3751,19 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             reset_runtime_state(ctx.get());
         }
 
+        if (qmm_debug) {
+            const size_t attempts_delta = g_qmm_attempts - qmm_attempts_before;
+            const size_t success_delta = g_qmm_success - qmm_success_before;
+            std::fprintf(
+                stderr,
+                "[mlx][qmm] model=%s decode_qmm=%d attempts=%zu success=%zu\n",
+                ctx->model_id.c_str(),
+                ctx->fp8_decode_qmm_enabled ? 1 : 0,
+                attempts_delta,
+                success_delta
+            );
+        }
+
         return ctx.release();
     } catch (const std::exception& e) {
         if (wired_limit_acquired) release_wired_limit();
@@ -3265,6 +3806,7 @@ mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
         ctx->lm_head_rhs = source_ctx->lm_head_rhs;
         ctx->lm_head_q_w = source_ctx->lm_head_q_w;
         ctx->lm_head_q_scales = source_ctx->lm_head_q_scales;
+        ctx->lm_head_q_biases = source_ctx->lm_head_q_biases;
         ctx->final_norm_w = source_ctx->final_norm_w;
         ctx->has_fp8_meta = source_ctx->has_fp8_meta;
         ctx->has_mxfp8_meta = source_ctx->has_mxfp8_meta;
@@ -4210,26 +4752,29 @@ int32_t mlx_decode_stream(
             }
         }
 
-        eval(generated_token_arrays);
-        synchronize();
+        const array generated_token_rows = concatenate(generated_token_arrays, 0); // [T,1]
+        const array generated_token_flat = reshape(astype(generated_token_rows, int32), {decode_tokens}); // [T]
+        eval(generated_token_flat);
 
-        const size_t capacity = static_cast<size_t>(decode_tokens);
-        const size_t bytes = sizeof(int32_t) * capacity;
-        int32_t* copied = static_cast<int32_t*>(std::malloc(bytes));
+        std::unique_ptr<int32_t, decltype(&std::free)> copied(
+            static_cast<int32_t*>(std::malloc(sizeof(int32_t) * static_cast<size_t>(decode_tokens))),
+            &std::free
+        );
         if (!copied) {
             g_last_error = "mlx_decode_stream: failed to allocate token buffer";
             return 0;
         }
 
+        const int32_t* token_ptr = generated_token_flat.data<int32_t>();
         int32_t produced = 0;
         for (int32_t i = 0; i < decode_tokens; ++i) {
-            const int32_t tok = generated_token_arrays[static_cast<size_t>(i)].item<int32_t>();
-            copied[static_cast<size_t>(produced)] = tok;
+            const int32_t tok = token_ptr[static_cast<size_t>(i)];
+            copied.get()[static_cast<size_t>(produced)] = tok;
             produced += 1;
             if (token_is_eos(tok, eos_ids, eos_len)) break;
         }
 
-        *out_generated_ids = copied;
+        *out_generated_ids = copied.release();
         *out_generated_len = produced;
         return 1;
     } catch (const std::exception& e) {
@@ -4270,11 +4815,15 @@ array apply_sampling_penalties_to_logits(
     auto& repetition_scales = ctx->sampling_repetition_scales;
     auto& additive_penalties = ctx->sampling_additive_penalties;
     token_ids.clear();
-    repetition_scales.clear();
-    additive_penalties.clear();
+    if (has_repetition) repetition_scales.clear();
+    if (has_additive) additive_penalties.clear();
     if (token_ids.capacity() < token_counts.size()) token_ids.reserve(token_counts.size());
-    if (repetition_scales.capacity() < token_counts.size()) repetition_scales.reserve(token_counts.size());
-    if (additive_penalties.capacity() < token_counts.size()) additive_penalties.reserve(token_counts.size());
+    if (has_repetition && repetition_scales.capacity() < token_counts.size()) {
+        repetition_scales.reserve(token_counts.size());
+    }
+    if (has_additive && additive_penalties.capacity() < token_counts.size()) {
+        additive_penalties.reserve(token_counts.size());
+    }
 
     for (const auto& entry : token_counts) {
         const int32_t token_id = entry.first;
@@ -4283,10 +4832,14 @@ array apply_sampling_penalties_to_logits(
             throw std::runtime_error("apply_sampling_penalties_to_logits: context token out of range");
         }
         token_ids.push_back(token_id);
-        repetition_scales.push_back(std::pow(repetition_penalty, static_cast<float>(count)));
-        additive_penalties.push_back(
-            presence_penalty + (frequency_penalty * static_cast<float>(count))
-        );
+        if (has_repetition) {
+            repetition_scales.push_back(std::pow(repetition_penalty, static_cast<float>(count)));
+        }
+        if (has_additive) {
+            additive_penalties.push_back(
+                presence_penalty + (frequency_penalty * static_cast<float>(count))
+            );
+        }
     }
 
     const int unique_count = static_cast<int>(token_ids.size());
@@ -4350,7 +4903,6 @@ int32_t mlx_decode_topk_candidates(
     }
 
     try {
-        clear_fused_decode_ctx_cache();
         const int32_t token_scalar = token;
         const array token_arr(&token_scalar, Shape{1, 1}, int32);
         const array logits_last = last_token_logits(forward_logits(ctx, token_arr)); // [1,1,V]
@@ -4419,17 +4971,6 @@ int32_t mlx_decode_topk_candidates_batch(
     if (top_k <= 0) {
         g_last_error = "mlx_decode_topk_candidates_batch: top_k must be > 0";
         return 0;
-    }
-
-    if (batch_size == 1) {
-        return mlx_decode_topk_candidates(
-            ctxs[0],
-            tokens[0],
-            top_k,
-            out_candidate_logits_ptrs[0],
-            out_candidate_ids_ptrs[0],
-            &out_candidate_counts[0]
-        );
     }
 
     for (int32_t i = 0; i < batch_size; ++i) {
@@ -4922,6 +5463,9 @@ int32_t mlx_decode_topk_stream(
     int32_t top_k,
     float top_p,
     float min_p,
+    float repetition_penalty,
+    float presence_penalty,
+    float frequency_penalty,
     int32_t** out_generated_ids,
     int32_t* out_generated_len
 ) {
@@ -4957,11 +5501,26 @@ int32_t mlx_decode_topk_stream(
         g_last_error = "mlx_decode_topk_stream: min_p must be in [0,1]";
         return 0;
     }
+    if (repetition_penalty <= 0.0f) {
+        g_last_error = "mlx_decode_topk_stream: repetition_penalty must be > 0";
+        return 0;
+    }
 
     try {
         *out_generated_ids = nullptr;
         *out_generated_len = 0;
         if (decode_tokens == 0) return 1;
+        const bool topk_stream_profile = []() {
+            if (const char* raw = std::getenv("TALU_METAL_TOPK_STREAM_PROFILE")) {
+                return std::string(raw) == "1";
+            }
+            return false;
+        }();
+        uint64_t profile_forward_ns = 0;
+        uint64_t profile_penalty_ns = 0;
+        uint64_t profile_sample_ns = 0;
+        uint64_t profile_materialize_ns = 0;
+        uint64_t profile_total_ns = 0;
 
         const StreamSamplingConfig sampling_cfg{
             .temperature = temperature,
@@ -4969,42 +5528,244 @@ int32_t mlx_decode_topk_stream(
             .top_p = top_p,
             .min_p = min_p,
         };
-
-        std::vector<array> generated_token_arrays;
-        generated_token_arrays.reserve(static_cast<size_t>(decode_tokens));
-
-        const int32_t token_scalar = first_token;
-        array current_token = array(&token_scalar, Shape{1, 1}, int32);
-        array next_token = sample_token_from_logits(last_token_logits(forward_logits(ctx, current_token)), sampling_cfg);
-        async_eval(next_token);
-
-        for (int32_t i = 0; i < decode_tokens; ++i) {
-            generated_token_arrays.push_back(next_token);
-            if (i + 1 < decode_tokens) {
-                next_token = sample_token_from_logits(last_token_logits(forward_logits(ctx, next_token)), sampling_cfg);
-                async_eval(next_token);
-            }
-        }
-
-        eval(generated_token_arrays);
-
-        const size_t capacity = static_cast<size_t>(decode_tokens);
-        const size_t bytes = sizeof(int32_t) * capacity;
-        int32_t* copied = static_cast<int32_t*>(std::malloc(bytes));
-        if (!copied) {
+        const bool has_penalties =
+            repetition_penalty != 1.0f || presence_penalty != 0.0f || frequency_penalty != 0.0f;
+        const size_t output_capacity = static_cast<size_t>(decode_tokens);
+        std::unique_ptr<int32_t, decltype(&std::free)> generated_host(
+            static_cast<int32_t*>(std::malloc(sizeof(int32_t) * output_capacity)),
+            &std::free
+        );
+        if (!generated_host) {
             g_last_error = "mlx_decode_topk_stream: failed to allocate token buffer";
             return 0;
         }
-
         int32_t produced = 0;
-        for (int32_t i = 0; i < decode_tokens; ++i) {
-            const int32_t tok = *generated_token_arrays[static_cast<size_t>(i)].data<int32_t>();
-            copied[static_cast<size_t>(produced)] = tok;
-            produced += 1;
-            if (token_is_eos(tok, eos_ids, eos_len)) break;
+
+        if (!has_penalties) {
+            // Fast path: keep sampling on device and avoid per-token host sync.
+            std::vector<array> generated_token_arrays;
+            generated_token_arrays.reserve(static_cast<size_t>(decode_tokens));
+
+            const int32_t token_scalar = first_token;
+            array current_token = array(&token_scalar, Shape{1, 1}, int32);
+            array next_token = sample_token_from_logits(
+                last_token_logits(forward_logits(ctx, current_token)),
+                sampling_cfg
+            );
+            async_eval(next_token);
+
+            for (int32_t i = 0; i < decode_tokens; ++i) {
+                generated_token_arrays.push_back(next_token);
+                if (i + 1 < decode_tokens) {
+                    next_token = sample_token_from_logits(
+                        last_token_logits(forward_logits(ctx, next_token)),
+                        sampling_cfg
+                    );
+                    async_eval(next_token);
+                }
+            }
+
+            const array generated_token_rows = concatenate(generated_token_arrays, 0); // [T,1]
+            const array generated_token_flat = reshape(astype(generated_token_rows, int32), {decode_tokens}); // [T]
+            eval(generated_token_flat);
+
+            const int32_t* token_ptr = generated_token_flat.data<int32_t>();
+            for (int32_t i = 0; i < decode_tokens; ++i) {
+                const int32_t tok = token_ptr[static_cast<size_t>(i)];
+                generated_host.get()[static_cast<size_t>(produced)] = tok;
+                produced += 1;
+                if (token_is_eos(tok, eos_ids, eos_len)) break;
+            }
+        } else {
+            // Penalized path.
+            ctx->sampling_context_counts.clear();
+            ctx->sampling_context_len = 0;
+
+            const int vocab = ctx->embed_tokens.ndim() == 2 ? ctx->embed_tokens.shape(0) : 0;
+            if (vocab <= 0) {
+                g_last_error = "mlx_decode_topk_stream: invalid vocab for penalties";
+                return 0;
+            }
+
+            const bool presence_only_penalty =
+                repetition_penalty == 1.0f &&
+                frequency_penalty == 0.0f &&
+                presence_penalty != 0.0f;
+
+            const int32_t penalty_chunk_size = []() -> int32_t {
+                if (const char* raw = std::getenv("TALU_METAL_TOPK_PENALTY_CHUNK")) {
+                    char* end = nullptr;
+                    const long parsed = std::strtol(raw, &end, 10);
+                    if (end != raw && parsed > 0 && parsed <= std::numeric_limits<int32_t>::max()) {
+                        return static_cast<int32_t>(parsed);
+                    }
+                }
+                return 16;
+            }();
+            const int32_t effective_penalty_chunk_size = std::min<int32_t>(penalty_chunk_size, 64);
+
+            if (presence_only_penalty) {
+                // Chunked GPU path for the common presence-only configuration.
+                // Keeps penalty state on-device and synchronizes once per chunk.
+                const float penalty_value = presence_penalty;
+                const array penalty_arr(&penalty_value, Shape{1, 1, 1}, float32);
+                array presence_mask = zeros(Shape{1, 1, vocab}, float32);
+
+                const int32_t first_token_scalar = first_token;
+                array current_token = array(&first_token_scalar, Shape{1, 1}, int32);
+                const array first_token_idx(&first_token_scalar, Shape{1, 1, 1}, int32);
+                presence_mask = put_along_axis(presence_mask, first_token_idx, penalty_arr, -1);
+                ctx->sampling_context_len = 1;
+
+                const auto total_t0 = std::chrono::steady_clock::now();
+                bool saw_eos = false;
+                while (produced < decode_tokens && !saw_eos) {
+                    const int32_t remaining = decode_tokens - produced;
+                    const int32_t chunk_target = std::min(effective_penalty_chunk_size, remaining);
+                    std::vector<array> chunk_tokens;
+                    chunk_tokens.reserve(static_cast<size_t>(chunk_target));
+
+                    const auto t_build0 = std::chrono::steady_clock::now();
+                    for (int32_t i = 0; i < chunk_target; ++i) {
+                        const array logits_last = last_token_logits(forward_logits(ctx, current_token));
+                        const array sampling_logits = logits_last - presence_mask;
+                        const array next_token = sample_token_from_logits(sampling_logits, sampling_cfg);
+                        chunk_tokens.push_back(next_token);
+
+                        const array token_idx = reshape(astype(next_token, int32), {1, 1, 1});
+                        presence_mask = put_along_axis(presence_mask, token_idx, penalty_arr, -1);
+                        current_token = next_token;
+                    }
+                    const auto t_build1 = std::chrono::steady_clock::now();
+
+                    const auto t_materialize0 = std::chrono::steady_clock::now();
+                    const array chunk_rows = concatenate(chunk_tokens, 0); // [chunk,1]
+                    const array chunk_flat = reshape(astype(chunk_rows, int32), {chunk_target}); // [chunk]
+                    eval(chunk_flat);
+                    const auto t_materialize1 = std::chrono::steady_clock::now();
+
+                    const int32_t* chunk_ptr = chunk_flat.data<int32_t>();
+                    for (int32_t i = 0; i < chunk_target; ++i) {
+                        const int32_t tok = chunk_ptr[static_cast<size_t>(i)];
+                        generated_host.get()[static_cast<size_t>(produced)] = tok;
+                        produced += 1;
+                        ctx->sampling_context_len += 1;
+                        if (token_is_eos(tok, eos_ids, eos_len)) {
+                            saw_eos = true;
+                            break;
+                        }
+                    }
+
+                    if (topk_stream_profile) {
+                        profile_forward_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_build1 - t_build0).count()
+                        );
+                        profile_materialize_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_materialize1 - t_materialize0).count()
+                        );
+                    }
+                }
+
+                if (topk_stream_profile) {
+                    const auto total_t1 = std::chrono::steady_clock::now();
+                    profile_total_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(total_t1 - total_t0).count()
+                    );
+                }
+            } else {
+                // General penalized path: keep token counts on-device and decode
+                // in bounded chunks to avoid host sync per token.
+                const array zero_counts = zeros(Shape{1, 1, vocab}, float32);
+                array token_counts = zero_counts;
+                const array one_count = array(1.0f, float32);
+                auto penalized_sample_fn = compiled_penalized_sampling_step(
+                    sampling_cfg,
+                    repetition_penalty,
+                    presence_penalty,
+                    frequency_penalty
+                );
+
+                const int32_t first_token_scalar = first_token;
+                array current_token = array(&first_token_scalar, Shape{1, 1}, int32);
+                const array first_token_idx(&first_token_scalar, Shape{1, 1, 1}, int32);
+                token_counts = put_along_axis(token_counts, first_token_idx, one_count, -1);
+                ctx->sampling_context_len = 1;
+
+                const auto total_t0 = std::chrono::steady_clock::now();
+                bool saw_eos = false;
+                while (produced < decode_tokens && !saw_eos) {
+                    const int32_t remaining = decode_tokens - produced;
+                    const int32_t chunk_target = std::min(effective_penalty_chunk_size, remaining);
+                    std::vector<array> chunk_tokens;
+                    chunk_tokens.reserve(static_cast<size_t>(chunk_target));
+
+                    const auto t_build0 = std::chrono::steady_clock::now();
+                    for (int32_t i = 0; i < chunk_target; ++i) {
+                        const array logits_last = last_token_logits(forward_logits(ctx, current_token));
+                        const std::vector<array> sampled_outputs = (*penalized_sample_fn)({logits_last, token_counts});
+                        if (sampled_outputs.size() != 2) {
+                            throw std::runtime_error("mlx_decode_topk_stream: invalid penalized sample output");
+                        }
+                        const array next_token = sampled_outputs[0];
+                        token_counts = sampled_outputs[1];
+                        chunk_tokens.push_back(next_token);
+                        current_token = next_token;
+                    }
+                    const auto t_build1 = std::chrono::steady_clock::now();
+
+                    const auto t_materialize0 = std::chrono::steady_clock::now();
+                    const array chunk_rows = concatenate(chunk_tokens, 0); // [chunk,1]
+                    const array chunk_flat = reshape(astype(chunk_rows, int32), {chunk_target}); // [chunk]
+                    eval(chunk_flat);
+                    const auto t_materialize1 = std::chrono::steady_clock::now();
+
+                    const int32_t* chunk_ptr = chunk_flat.data<int32_t>();
+                    for (int32_t i = 0; i < chunk_target; ++i) {
+                        const int32_t tok = chunk_ptr[static_cast<size_t>(i)];
+                        if (tok < 0 || tok >= vocab) {
+                            throw std::runtime_error("mlx_decode_topk_stream: sampled token out of range");
+                        }
+                        generated_host.get()[static_cast<size_t>(produced)] = tok;
+                        produced += 1;
+                        ctx->sampling_context_len += 1;
+                        if (token_is_eos(tok, eos_ids, eos_len)) {
+                            saw_eos = true;
+                            break;
+                        }
+                    }
+
+                    if (topk_stream_profile) {
+                        profile_forward_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_build1 - t_build0).count()
+                        );
+                        profile_materialize_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_materialize1 - t_materialize0).count()
+                        );
+                    }
+                }
+
+                if (topk_stream_profile) {
+                    const auto total_t1 = std::chrono::steady_clock::now();
+                    profile_total_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(total_t1 - total_t0).count()
+                    );
+                }
+            }
         }
 
-        *out_generated_ids = copied;
+        if (topk_stream_profile) {
+            std::fprintf(
+                stderr,
+                "[mlx][topk_stream_profile] tokens=%zu total_ms=%.3f forward_ms=%.3f penalty_ms=%.3f sample_ms=%.3f materialize_ms=%.3f\n",
+                static_cast<size_t>(produced),
+                static_cast<double>(profile_total_ns) / 1e6,
+                static_cast<double>(profile_forward_ns) / 1e6,
+                static_cast<double>(profile_penalty_ns) / 1e6,
+                static_cast<double>(profile_sample_ns) / 1e6,
+                static_cast<double>(profile_materialize_ns) / 1e6
+            );
+        }
+        *out_generated_ids = generated_host.release();
         *out_generated_len = produced;
         return 1;
     } catch (const std::exception& e) {
@@ -5096,11 +5857,14 @@ int32_t mlx_run(
                     }
                 }
 
-                eval(captured_token_arrays);
-                for (int i = 0; i < decode_tokens; ++i) {
-                    captured_tokens[static_cast<size_t>(i)] =
-                        captured_token_arrays[static_cast<size_t>(i)].item<int32_t>();
-                }
+                const array captured_rows = concatenate(captured_token_arrays, 0); // [T,1]
+                const array captured_flat = reshape(astype(captured_rows, int32), {decode_tokens}); // [T]
+                eval(captured_flat);
+                std::memcpy(
+                    captured_tokens.data(),
+                    captured_flat.data<int32_t>(),
+                    sizeof(int32_t) * static_cast<size_t>(decode_tokens)
+                );
             } else {
                 for (int i = 0; i < decode_tokens; ++i) {
                     if (i + 1 < decode_tokens) {
