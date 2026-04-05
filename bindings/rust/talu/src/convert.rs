@@ -331,13 +331,22 @@ mod tests {
 
     #[test]
     fn map_profile_to_sys_is_stable() {
-        assert_eq!(map_profile_to_sys(ConvertProfile::Best), QualityProfile::Best);
-        assert_eq!(map_profile_to_sys(ConvertProfile::Good), QualityProfile::Good);
+        assert_eq!(
+            map_profile_to_sys(ConvertProfile::Best),
+            QualityProfile::Best
+        );
+        assert_eq!(
+            map_profile_to_sys(ConvertProfile::Good),
+            QualityProfile::Good
+        );
         assert_eq!(
             map_profile_to_sys(ConvertProfile::Balanced),
             QualityProfile::Balanced
         );
-        assert_eq!(map_profile_to_sys(ConvertProfile::Fast), QualityProfile::Fast);
+        assert_eq!(
+            map_profile_to_sys(ConvertProfile::Fast),
+            QualityProfile::Fast
+        );
         assert_eq!(
             map_profile_to_sys(ConvertProfile::Custom),
             QualityProfile::Custom

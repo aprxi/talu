@@ -21,6 +21,7 @@ use super::models::list_provider_models;
 
 pub(super) const DEFAULT_SYSTEM_MESSAGE: &str = "You are a helpful assistant.";
 const DEFAULT_STDIN_IMAGE_PROMPT: &str = "Describe this image.";
+const STREAM_FLUSH_BYTES: usize = 512;
 
 fn has_visible_text(text: &str) -> bool {
     text.chars().any(|ch| {
@@ -38,6 +39,7 @@ struct StreamCtx {
     in_reasoning: bool,
     emitted_visible: bool,
     prefill_spinner: Option<indicatif::ProgressBar>,
+    pending_flush_bytes: usize,
 }
 
 impl StreamCtx {
@@ -48,6 +50,7 @@ impl StreamCtx {
             in_reasoning: false,
             emitted_visible: false,
             prefill_spinner: None,
+            pending_flush_bytes: 0,
         }
     }
 
@@ -68,15 +71,21 @@ impl StreamCtx {
             if is_reasoning && !self.in_reasoning {
                 // Entering reasoning: dim + italic
                 let _ = io::stdout().write_all(b"\x1b[2;3m");
+                self.pending_flush_bytes += 6;
             } else if !is_reasoning && self.in_reasoning {
                 // Leaving reasoning: reset
                 let _ = io::stdout().write_all(b"\x1b[0m");
+                self.pending_flush_bytes += 4;
             }
             self.in_reasoning = is_reasoning;
         }
 
         let _ = io::stdout().write_all(token.text.as_bytes());
-        let _ = io::stdout().flush();
+        self.pending_flush_bytes += token.text.len();
+        if token.text.contains('\n') || self.pending_flush_bytes >= STREAM_FLUSH_BYTES {
+            let _ = io::stdout().flush();
+            self.pending_flush_bytes = 0;
+        }
         if has_visible_text(token.text) {
             self.emitted_visible = true;
         }
@@ -90,9 +99,12 @@ impl StreamCtx {
         if !self.raw_output && self.in_reasoning {
             // Reset ANSI if still in reasoning at end
             let _ = io::stdout().write_all(b"\x1b[0m");
+            self.pending_flush_bytes += 4;
         }
         let _ = io::stdout().write_all(b"\n");
+        self.pending_flush_bytes += 1;
         let _ = io::stdout().flush();
+        self.pending_flush_bytes = 0;
     }
 }
 
@@ -1279,15 +1291,24 @@ fn cmd_ask_remote(
         }
     } else {
         // Streaming - use a simple callback that prints content
+        let pending_flush_bytes = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let pending_flush_bytes_cb = pending_flush_bytes.clone();
         let callback: talu::router::StreamCallback = Box::new(move |token| {
             if hide_thinking && token.item_type == talu::responses::ItemType::Reasoning {
                 return true;
             }
             let _ = io::stdout().write_all(token.text.as_bytes());
-            let _ = io::stdout().flush();
+            if let Ok(mut pending) = pending_flush_bytes_cb.lock() {
+                *pending += token.text.len();
+                if token.text.contains('\n') || *pending >= STREAM_FLUSH_BYTES {
+                    let _ = io::stdout().flush();
+                    *pending = 0;
+                }
+            }
             true
         });
         talu::router::generate_stream(&chat, &content, &backend, &cfg, callback)?;
+        let _ = io::stdout().flush();
         println!(); // Newline after streaming
 
         if !quiet && !silent && !use_json && !session_id_only && output_path.is_none() {

@@ -19,6 +19,7 @@ use tokio_stream::StreamExt;
 use utoipa::ToSchema;
 
 use crate::pin_store::PinStore;
+use crate::quant_scheme as quant_scheme_display;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;
 
@@ -288,7 +289,8 @@ pub async fn handle_list(
                         } else {
                             Some(info.model_type)
                         };
-                        let quant = Some(format_quant_scheme(
+                        let quant = Some(quant_scheme_display::format_quant_scheme_for_path(
+                            &m.path,
                             info.quant_method,
                             info.quant_bits,
                             info.quant_group_size,
@@ -1413,18 +1415,4 @@ fn value_as_u64(value: &serde_json::Value) -> Option<u64> {
         return u64::try_from(v).ok();
     }
     value.as_str().and_then(|s| s.parse::<u64>().ok())
-}
-
-/// Format quantization method as a scheme name.
-///
-/// Mirrors `format_quant_scheme` in `cli/models.rs`.
-fn format_quant_scheme(method: talu::model::QuantMethod, bits: i32, group_size: i32) -> String {
-    match method {
-        talu::model::QuantMethod::None => "F16".to_string(),
-        talu::model::QuantMethod::Gaffine => format!("GAF{}_{}", bits, group_size),
-        talu::model::QuantMethod::Mxfp4 => "MXFP4".to_string(),
-        talu::model::QuantMethod::Native => format!("GAF{}_{}", bits, group_size),
-        talu::model::QuantMethod::Fp8 => "FP8".to_string(),
-        talu::model::QuantMethod::Mxfp8 => "MXFP8".to_string(),
-    }
 }
