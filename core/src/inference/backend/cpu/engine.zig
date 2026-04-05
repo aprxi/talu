@@ -1243,6 +1243,49 @@ pub const FusedCpuBackend = struct {
         return self.prefillSlotWithVision(slot_index, tokens, null, logits_out);
     }
 
+    /// Batched prefill through a layer subset. Embeds all tokens, forwards
+    /// through layers [0, layer_end), and writes hidden states to `output`.
+    /// Used by the CUDA cpu_gpu pipeline for batched CPU stage0 prefill.
+    pub fn prefillSlotLayerRange(
+        self: *FusedCpuBackend,
+        slot_index: usize,
+        tokens: []const u32,
+        output: []f32,
+        layer_end: usize,
+    ) !void {
+        try self.ensureSlotStateBlocksBound(slot_index);
+        if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
+            layered_cache.resetSlot(slot_index);
+        } else |err| switch (err) {
+            error.UnknownStateDescriptorId => {},
+            else => return err,
+        }
+        self.slot_rope_position_deltas[slot_index] = 0;
+
+        const prompt_len = tokens.len;
+        if (prompt_len == 0) return;
+        const model_dim = self.d_model;
+        if (output.len != prompt_len * model_dim) return error.InvalidArgument;
+
+        try self.scratch.ensureForMode(.prefill, prompt_len);
+
+        var view = Tensor.view3D(std.mem.sliceAsBytes(output), prompt_len, model_dim);
+        try self.model.embed_tokens.forward(tokens, &view);
+        cpu_rowwise.scaleInPlace(output, self.loaded.config.embedding_multiplier);
+
+        try self.model.forwardWithBatchedCacheLayerRangeTokenIds(
+            &view,
+            &view,
+            &self.scratch,
+            self.slotStateBlocks(slot_index),
+            slot_index,
+            tokens,
+            false,
+            0,
+            layer_end,
+        );
+    }
+
     /// Prefill with optional preprocessed vision input.
     pub fn prefillSlotWithVision(
         self: *FusedCpuBackend,

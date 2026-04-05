@@ -81,19 +81,32 @@ fn applyValueNormInPlace(
     n_kv_heads_u32: u32,
     head_dim_u32: u32,
 ) !void {
-    if (self.loaded.config.hidden_size_per_layer_input <= 0) return;
+    if (!self.loaded.config.use_v_norm) return;
     if (head_dim_u32 == 0) return error.InvalidArgument;
     const head_dim: usize = @intCast(head_dim_u32);
     if (head_dim > self.d_model or head_dim > self.runtime_buffers.hidden_host.len) return error.InvalidArgument;
 
     const norm_weight_bytes = std.math.mul(usize, head_dim, @sizeOf(f32)) catch return error.InvalidArgument;
-    var norm_weight_dev = try bufferSlice(&self.runtime_buffers.norm_out_dev, 0, norm_weight_bytes);
+    // Use attn_context_dev as scratch (unused before attention context computation).
+    var norm_weight_dev = bufferSlice(&self.runtime_buffers.attn_context_dev, 0, norm_weight_bytes) catch return error.InvalidArgument;
+
     const norm_weight_host = self.runtime_buffers.hidden_host[0..head_dim];
     @memset(norm_weight_host, 1.0);
-    try norm_weight_dev.upload(&self.device, std.mem.sliceAsBytes(norm_weight_host));
+    norm_weight_dev.upload(&self.device, std.mem.sliceAsBytes(norm_weight_host)) catch |err| {
+        // Distinguish prior async error from genuine upload failure.
+        const has_prior_error: u8 = if (self.device.synchronize()) 0 else |_| 1;
+        log.warn("inference", "v_norm weight upload failed", .{
+            .head_dim = head_dim_u32,
+            .buf_size = self.runtime_buffers.attn_context_dev.size,
+            .upload_bytes = norm_weight_bytes,
+            .prior_async_error = has_prior_error,
+            .reason = @errorName(err),
+        });
+        return err;
+    };
 
     const v_norm_rows = std.math.mul(u32, @intCast(rows), n_kv_heads_u32) catch return error.InvalidArgument;
-    try compute.cuda.rmsnorm.runWithFunction(
+    compute.cuda.rmsnorm.runWithFunction(
         &self.kernel_arg_pack,
         &self.device,
         self.rmsnorm_function orelse return error.CudaKernelUnavailable,
@@ -104,7 +117,14 @@ fn applyValueNormInPlace(
         head_dim_u32,
         self.norm_eps,
         0.0,
-    );
+    ) catch |err| {
+        log.warn("inference", "v_norm rmsnorm kernel failed", .{
+            .rows = v_norm_rows,
+            .head_dim = head_dim_u32,
+            .reason = @errorName(err),
+        });
+        return err;
+    };
 }
 
 const Tensor = tensor.Tensor;
@@ -200,6 +220,17 @@ pub fn runAttentionMixerStep(
         });
         return err;
     };
+    if (debugKernelSyncEnabled()) {
+        self.device.synchronize() catch |err| {
+            log.warn("inference", "CUDA debug sync failed after decode qkv", .{
+                .head_dim = head_dim_u32,
+                .n_heads = n_heads_u32,
+                .n_kv_heads = n_kv_heads_u32,
+                .reason = @errorName(err),
+            });
+            return err;
+        };
+    }
     if (cfg.query_gate) {
         engine_ops.compactQueryGateProjection(
             self,
@@ -246,6 +277,15 @@ pub fn runAttentionMixerStep(
             return err;
         };
     }
+    if (debugKernelSyncEnabled()) {
+        self.device.synchronize() catch |err| {
+            log.warn("inference", "CUDA debug sync failed after decode q_norm", .{
+                .head_dim = head_dim_u32,
+                .reason = @errorName(err),
+            });
+            return err;
+        };
+    }
     if (k_norm_weight) |k_norm_value| {
         const k_norm_rows = std.math.mul(u32, @intCast(stage_rows), n_kv_heads_u32) catch return error.InvalidArgument;
         compute.cuda.rmsnorm.runWithFunction(
@@ -265,6 +305,17 @@ pub fn runAttentionMixerStep(
                 .stage_rows = stage_rows,
                 .n_kv_heads = n_kv_heads_u32,
                 .head_dim = head_dim_u32,
+                .reason = @errorName(err),
+            });
+            return err;
+        };
+    }
+    if (debugKernelSyncEnabled()) {
+        self.device.synchronize() catch |err| {
+            log.warn("inference", "CUDA debug sync failed after decode qk_norm/v_norm", .{
+                .head_dim = head_dim_u32,
+                .n_heads = n_heads_u32,
+                .n_kv_heads = n_kv_heads_u32,
                 .reason = @errorName(err),
             });
             return err;
@@ -3833,6 +3884,7 @@ fn shouldUseFlashDecodePath(
     n_rows: u32,
     flash_decode_available: bool,
 ) bool {
+    if (std.posix.getenv("TALU_NO_FLASH_DECODE") != null) return false;
     if (!flash_decode_available) return false;
     if (kv_groups == 0 or kv_groups > 4) return false;
     if (head_dim == 0 or head_dim > 256) return false;

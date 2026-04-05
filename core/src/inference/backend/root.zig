@@ -1629,19 +1629,18 @@ fn initCuda(
         }
     }
 
-    // Gemma4-style per-layer-input branch currently requires full-layer CUDA
-    // execution on a single backend instance. Force single topology here so
-    // batched/pipeline splits do not bypass correctness-critical branch logic.
+    // Gemma4-style per-layer-input branch requires the original token
+    // embeddings at every layer. In cpu_gpu mode the GPU stage frees
+    // embedding weights (partial range), so the per-layer branch cannot
+    // compute source embeddings. Force single topology until the GPU
+    // stage learns to keep/compute source embeddings independently.
     if (loaded.config.hidden_size_per_layer_input > 0 and topology.mode != .single) {
-        log.warn("inference", "Forcing single-GPU CUDA topology for per-layer-input model", .{
+        log.err("inference", "Per-layer-input model does not support mixed CPU/GPU topology", .{
             .requested_topology = @tagName(topology.mode),
-        });
-        topology = .{
-            .mode = .single,
-            .stage_device_ordinals = .{ topology.primaryDeviceOrdinal(), topology.primaryDeviceOrdinal() },
-            .split_layer = null,
-            .split_layer_stage2 = null,
-        };
+            .total_layers = loaded.blocks.len,
+            .hidden_size_per_layer_input = loaded.config.hidden_size_per_layer_input,
+        }, @src());
+        return error.InvalidTopologyConfig;
     }
 
     if (topology.mode != .single) {
@@ -1770,15 +1769,21 @@ fn initCuda(
         };
     }
     const cuda_max_batch_size = resolveCudaMaxBatchSize();
+    const n_layers = loaded.blocks.len;
+    const cpu_layer_count: usize = switch (topology.mode) {
+        .cpu_gpu, .cpu_gpu_gpu => topology.split_layer orelse 0,
+        .pipeline2, .single => 0,
+    };
+    const gpu_layer_count: usize = n_layers - cpu_layer_count;
     log.info("inference", "CUDA backend init config", .{
         .max_batch = cuda_max_batch_size,
         .topology = @tagName(topology.mode),
+        .cpu_layers = cpu_layer_count,
+        .gpu_layers = gpu_layer_count,
+        .total_layers = n_layers,
         .device = topology.primaryDeviceOrdinal(),
-        .split_layer = if (topology.split_layer) |split| split else std.math.maxInt(usize),
-        .split_layer_stage2 = if (topology.split_layer_stage2) |split| split else std.math.maxInt(usize),
     });
-    const total_layers: u64 = @intCast(loaded.blocks.len);
-    const n_layers = loaded.blocks.len;
+    const total_layers: u64 = @intCast(n_layers);
 
     // For multi-device topologies, render a colored bar in the message field.
     // Use spinner mode (total=0) so we control the entire visual via {msg}.
