@@ -1170,18 +1170,23 @@ bool maybe_capture_grouped_affine_quant(
         return false;
     }
 
-    const array scales_f32 = astype(scales_it->second, float32);
-    const array biases_f32 = astype(biases_it->second, float32);
-    if (scales_f32.ndim() != 2 || biases_f32.ndim() != 2) return false;
-    if (scales_f32.shape(0) != rows || biases_f32.shape(0) != rows) return false;
-    if (scales_f32.shape(1) != biases_f32.shape(1)) return false;
+    const array& scales_src = scales_it->second;
+    const array& biases_src = biases_it->second;
+    const Dtype scales_dt = scales_src.dtype();
+    const Dtype biases_dt = biases_src.dtype();
+    const bool scales_float = scales_dt == float16 || scales_dt == bfloat16 || scales_dt == float32 || scales_dt == float64;
+    const bool biases_float = biases_dt == float16 || biases_dt == bfloat16 || biases_dt == float32 || biases_dt == float64;
+    if (!scales_float || !biases_float) return false;
+    if (scales_src.ndim() != 2 || biases_src.ndim() != 2) return false;
+    if (scales_src.shape(0) != rows || biases_src.shape(0) != rows) return false;
+    if (scales_src.shape(1) != biases_src.shape(1)) return false;
 
     const int expected_groups = (cols + cfg.quant_group_size - 1) / cfg.quant_group_size;
-    if (scales_f32.shape(1) != expected_groups) return false;
+    if (scales_src.shape(1) != expected_groups) return false;
 
     *out_q_w = astype(raw_weight, uint32);
-    *out_q_scales = scales_f32;
-    *out_q_biases = biases_f32;
+    *out_q_scales = scales_src;
+    *out_q_biases = biases_src;
     return true;
 }
 
