@@ -39,6 +39,7 @@ size_t g_wired_limit_previous = 0;
 bool g_wired_limit_active = false;
 std::mutex g_rng_mutex;
 size_t g_active_ctx_count = 0;
+thread_local size_t g_fused_lm_head_argmax_hits = 0;
 thread_local std::vector<array> g_decode_batch_logits_flat_scratch;
 thread_local std::vector<array> g_prefill_batch_logits_flat_scratch;
 thread_local std::vector<array> g_decode_topk_batch_logits_flat_scratch;
@@ -90,6 +91,19 @@ void release_wired_limit() {
 
 using CompiledTopKFn = std::function<std::vector<array>(const std::vector<array>&)>;
 using CompiledPenalizedSampleFn = std::function<std::vector<array>(const std::vector<array>&)>;
+using CompiledSampleFn = std::function<std::vector<array>(const std::vector<array>&)>;
+struct StreamSamplingConfig {
+    float temperature = 1.0f;
+    int top_k = 20;
+    float top_p = 0.95f;
+    float min_p = 0.0f;
+};
+struct TopKCandidateBatch {
+    array logits; // [1,1,k]
+    array indices; // [1,1,k]
+    int k = 0;
+};
+array apply_top_p_filter(const array& logits, float top_p);
 bool env_truthy(const char* name, bool fallback);
 
 std::shared_ptr<const CompiledTopKFn> compiled_topk_candidates(int k) {
@@ -192,13 +206,6 @@ std::shared_ptr<const CompiledTopKFn> compiled_topk_candidates_rows(int k) {
     return inserted.first->second;
 }
 
-struct StreamSamplingConfig {
-    float temperature = 1.0f;
-    int top_k = 20;
-    float top_p = 0.95f;
-    float min_p = 0.0f;
-};
-
 array apply_top_p_filter(const array& logits, float top_p) {
     if (logits.ndim() != 3) {
         throw std::runtime_error("apply_top_p_filter expects rank-3 logits");
@@ -222,6 +229,55 @@ array apply_top_p_filter(const array& logits, float top_p) {
     return where(cumulative_probs > (1.0f - top_p), logits, neg_inf);
 }
 
+TopKCandidateBatch extract_topk_candidates_from_last_logits(const array& logits_last, int requested_top_k) {
+    if (logits_last.ndim() != 3) {
+        throw std::runtime_error("extract_topk_candidates_from_last_logits expects rank-3 logits");
+    }
+
+    const int vocab = logits_last.shape(2);
+    const int k = std::min(requested_top_k, vocab);
+    if (k <= 0) {
+        throw std::runtime_error("extract_topk_candidates_from_last_logits invalid top_k");
+    }
+
+    // This is the exact insertion point for a future fused lm_head+top_k path.
+    // Today it still uses the existing compiled full-logits top-k extraction so
+    // decode semantics remain unchanged.
+    auto topk_fn = compiled_topk_candidates(k);
+    const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
+    if (topk_outputs.size() != 2) {
+        throw std::runtime_error("extract_topk_candidates_from_last_logits: invalid top-k output");
+    }
+
+    return TopKCandidateBatch{
+        .logits = reshape(topk_outputs[0], {1, 1, k}),
+        .indices = reshape(topk_outputs[1], {1, 1, k}),
+        .k = k,
+    };
+}
+
+array sample_token_from_topk_candidates(const TopKCandidateBatch& candidates, const StreamSamplingConfig& cfg) {
+    if (candidates.k <= 0) {
+        throw std::runtime_error("sample_token_from_topk_candidates invalid top_k");
+    }
+    if (candidates.logits.ndim() != 3 || candidates.indices.ndim() != 3) {
+        throw std::runtime_error("sample_token_from_topk_candidates expects rank-3 candidates");
+    }
+
+    array sampled_logits = candidates.logits;
+    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+        sampled_logits = apply_top_p_filter(sampled_logits, cfg.top_p);
+    }
+
+    if (std::fabs(cfg.temperature - 1.0f) > 1.0e-6f) {
+        sampled_logits = sampled_logits * array(1.0f / cfg.temperature, sampled_logits.dtype());
+    }
+    const array sampled_local_idx = random::categorical(sampled_logits, -1); // [1,1]
+    const array sampled_local_idx_3d = reshape(sampled_local_idx, {1, 1, 1});
+    const array sampled_token_3d = take_along_axis(candidates.indices, sampled_local_idx_3d, -1); // [1,1,1]
+    return reshape(sampled_token_3d, {1, 1});
+}
+
 array sample_token_from_logits(const array& logits_last, const StreamSamplingConfig& cfg) {
     if (logits_last.ndim() != 3) {
         throw std::runtime_error("sample_token_from_logits expects rank-3 logits");
@@ -232,35 +288,81 @@ array sample_token_from_logits(const array& logits_last, const StreamSamplingCon
     if (cfg.min_p != 0.0f) {
         throw std::runtime_error("min_p != 0 is not yet supported by decode_topk_stream");
     }
+    return sample_token_from_topk_candidates(
+        extract_topk_candidates_from_last_logits(logits_last, cfg.top_k),
+        cfg
+    );
+}
 
-    const int vocab = logits_last.shape(2);
-    const int k = std::min(cfg.top_k, vocab);
-    if (k <= 0) {
-        throw std::runtime_error("sample_token_from_logits invalid top_k");
-    }
+std::shared_ptr<const CompiledSampleFn> compiled_sampling_step(const StreamSamplingConfig& cfg) {
+    auto format_float = [](float value) -> std::string {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.8g", value);
+        return std::string(buf);
+    };
+    const std::string signature =
+        "k=" + std::to_string(cfg.top_k) +
+        "|temp=" + format_float(cfg.temperature) +
+        "|top_p=" + format_float(cfg.top_p);
 
-    // Follow scheduler semantics: top-k candidate extraction first, then
-    // top-p sampling over the K candidate logits. Use compiled top-k extraction
-    // to avoid repeated graph tracing in per-token decode loops.
-    auto topk_fn = compiled_topk_candidates(k);
-    const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
-    if (topk_outputs.size() != 2) {
-        throw std::runtime_error("sample_token_from_logits: invalid top-k output");
-    }
-    const array topk_logits_flat = topk_outputs[0];
-    const array topk_indices_flat = topk_outputs[1];
-    array sampled_logits = reshape(topk_logits_flat, {1, 1, k}); // [1,1,k]
-    const array topk_indices = reshape(topk_indices_flat, {1, 1, k}); // [1,1,k]
+    static std::unordered_map<std::string, std::shared_ptr<const CompiledSampleFn>> cache;
+    static std::mutex cache_mutex;
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(signature);
+    if (it != cache.end()) return it->second;
 
-    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
-        sampled_logits = apply_top_p_filter(sampled_logits, cfg.top_p);
-    }
+    auto fn = compile(
+        [cfg](const std::vector<array>& inputs) {
+            if (inputs.size() != 1) {
+                throw std::runtime_error("compiled_sampling_step expects logits input");
+            }
+            const array logits_last = astype(inputs.at(0), float32); // [1,1,V]
+            if (logits_last.ndim() != 3) {
+                throw std::runtime_error("compiled_sampling_step expects rank-3 logits");
+            }
 
-    sampled_logits = sampled_logits * array(1.0f / cfg.temperature, sampled_logits.dtype());
-    const array sampled_local_idx = random::categorical(sampled_logits, -1); // [1,1]
-    const array sampled_local_idx_3d = reshape(sampled_local_idx, {1, 1, 1});
-    const array sampled_token_3d = take_along_axis(topk_indices, sampled_local_idx_3d, -1); // [1,1,1]
-    return reshape(sampled_token_3d, {1, 1});
+            array next_token = array(0.0f);
+            const int vocab = logits_last.shape(2);
+            const int k = std::min(cfg.top_k, vocab);
+            if (cfg.temperature <= 0.0f || k <= 1) {
+                next_token = argmax(logits_last, -1); // [1,1]
+            } else {
+                array top_k_indices = array(0.0f);
+                array top_k_logits = array(0.0f);
+                if (k == 1) {
+                    const array top_idx = argmax(logits_last, -1); // [1,1]
+                    top_k_indices = reshape(astype(top_idx, int32), {1, 1, 1});
+                    top_k_logits = take_along_axis(logits_last, top_k_indices, -1); // [1,1,1]
+                } else {
+                    const array partitioned_indices = argpartition(logits_last, -k, -1);
+                    const array top_k_selector = arange(vocab - k, vocab, 1, int32);
+                    top_k_indices = take(partitioned_indices, top_k_selector, -1); // [1,1,k]
+                    top_k_logits = take_along_axis(logits_last, top_k_indices, -1); // [1,1,k]
+                }
+
+                array sampled_logits = reshape(top_k_logits, {1, 1, k}); // [1,1,k]
+                const array topk_indices = reshape(astype(top_k_indices, int32), {1, 1, k}); // [1,1,k]
+                if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+                    sampled_logits = apply_top_p_filter(sampled_logits, cfg.top_p);
+                }
+                if (std::fabs(cfg.temperature - 1.0f) > 1.0e-6f) {
+                    sampled_logits = sampled_logits * array(1.0f / cfg.temperature, sampled_logits.dtype());
+                }
+                const array sampled_local_idx = random::categorical(sampled_logits, -1); // [1,1]
+                const array sampled_local_idx_3d = reshape(sampled_local_idx, {1, 1, 1});
+                const array sampled_token_3d = take_along_axis(topk_indices, sampled_local_idx_3d, -1); // [1,1,1]
+                next_token = reshape(sampled_token_3d, {1, 1});
+            }
+            return std::vector<array>{astype(next_token, int32)};
+        },
+        true
+    );
+
+    auto inserted = cache.emplace(
+        signature,
+        std::make_shared<const CompiledSampleFn>(std::move(fn))
+    );
+    return inserted.first->second;
 }
 
 std::shared_ptr<const CompiledPenalizedSampleFn> compiled_penalized_sampling_step(
@@ -372,7 +474,9 @@ std::shared_ptr<const CompiledPenalizedSampleFn> compiled_penalized_sampling_ste
                 if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
                     sampled_logits = apply_top_p_filter(sampled_logits, cfg.top_p);
                 }
-                sampled_logits = sampled_logits * array(1.0f / cfg.temperature, sampled_logits.dtype());
+                if (std::fabs(cfg.temperature - 1.0f) > 1.0e-6f) {
+                    sampled_logits = sampled_logits * array(1.0f / cfg.temperature, sampled_logits.dtype());
+                }
                 const array sampled_local_idx = random::categorical(sampled_logits, -1); // [1,1]
                 const array sampled_local_idx_3d = reshape(sampled_local_idx, {1, 1, 1});
                 const array sampled_token_3d = take_along_axis(topk_indices, sampled_local_idx_3d, -1); // [1,1,1]
@@ -2463,6 +2567,161 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
     return logits;
 }
 
+bool can_use_fused_lm_head_argmax(const mlx_ctx* ctx, const TraceFrame* trace_frame = nullptr) {
+    return ctx &&
+        env_truthy("TALU_METAL_FUSED_LM_HEAD_ARGMAX", false) &&
+        ctx->lm_head_q_decode_enabled &&
+        ctx->lm_head_q_w.size() > 0 &&
+        ctx->lm_head_q_scales.size() > 0 &&
+        ctx->lm_head_q_biases.ndim() == 2 &&
+        ctx->lm_head_q_biases.size() > 1 &&
+        ctx->cfg.quant_group_size > 0 &&
+        ctx->cfg.quant_bits == 4 &&
+        trace_frame == nullptr;
+}
+
+bool can_use_fused_lm_head_topk(
+    const mlx_ctx* ctx,
+    int requested_top_k,
+    const TraceFrame* trace_frame = nullptr
+) {
+    return can_use_fused_lm_head_argmax(ctx, trace_frame) &&
+        env_truthy("TALU_METAL_FUSED_LM_HEAD_TOPK", false) &&
+        requested_top_k > 1 &&
+        requested_top_k <= 64;
+}
+
+int resolve_fused_lm_head_row_chunk() {
+    const char* raw = std::getenv("TALU_METAL_FUSED_LM_HEAD_ROWS");
+    if (!raw || raw[0] == '\0') return 8192;
+    char* end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || parsed <= 0 || parsed > std::numeric_limits<int>::max()) {
+        return 8192;
+    }
+    return static_cast<int>(parsed);
+}
+
+array slice_rows_2d(const array& input, int row_start, int row_end) {
+    return slice(input, {row_start, 0}, {row_end, input.shape(1)});
+}
+
+std::pair<array, array> fused_lm_head_topk_candidate_arrays(
+    mlx_ctx* ctx,
+    const array& input_ids,
+    int requested_top_k
+);
+
+array fused_lm_head_argmax_token(mlx_ctx* ctx, const array& input_ids) {
+    if (!can_use_fused_lm_head_argmax(ctx)) {
+        throw std::runtime_error("fused_lm_head_argmax_token called without supported lm_head");
+    }
+
+    auto [candidate_logits, candidate_ids] = fused_lm_head_topk_candidate_arrays(ctx, input_ids, 1);
+    g_fused_lm_head_argmax_hits += 1;
+    const array candidate_logits_3d = reshape(candidate_logits, {1, 1, candidate_logits.shape(0)});
+    const array candidate_ids_3d = reshape(candidate_ids, {1, 1, candidate_ids.shape(0)});
+    const array best_local = reshape(astype(argmax(candidate_logits_3d, -1), int32), {1, 1, 1});
+    const array next_token_3d = take_along_axis(candidate_ids_3d, best_local, -1);
+    return reshape(astype(next_token_3d, int32), {1, 1});
+}
+
+TopKCandidateBatch fused_lm_head_topk_candidates(
+    mlx_ctx* ctx,
+    const array& input_ids,
+    int requested_top_k
+) {
+    if (!can_use_fused_lm_head_topk(ctx, requested_top_k)) {
+        throw std::runtime_error("fused_lm_head_topk_candidates called without supported lm_head");
+    }
+
+    auto [candidate_logits_flat, candidate_ids_flat] =
+        fused_lm_head_topk_candidate_arrays(ctx, input_ids, requested_top_k);
+
+    const int candidate_count = candidate_logits_flat.shape(0);
+    const array candidate_logits = reshape(candidate_logits_flat, {1, 1, candidate_count});
+    const array candidate_ids = reshape(candidate_ids_flat, {1, 1, candidate_count});
+
+    auto topk_fn = compiled_topk_candidates(requested_top_k);
+    const std::vector<array> topk_outputs = (*topk_fn)({candidate_logits});
+    if (topk_outputs.size() != 2) {
+        throw std::runtime_error("fused_lm_head_topk_candidates: invalid top-k output");
+    }
+
+    const array topk_logits = reshape(topk_outputs[0], {1, 1, requested_top_k});
+    const array candidate_local_indices = reshape(topk_outputs[1], {1, 1, requested_top_k});
+    const array topk_ids = take_along_axis(candidate_ids, candidate_local_indices, -1);
+    return TopKCandidateBatch{
+        .logits = topk_logits,
+        .indices = astype(topk_ids, int32),
+        .k = requested_top_k,
+    };
+}
+
+std::pair<array, array> fused_lm_head_topk_candidate_arrays(
+    mlx_ctx* ctx,
+    const array& input_ids,
+    int requested_top_k
+) {
+    if (!can_use_fused_lm_head_topk(ctx, requested_top_k)) {
+        throw std::runtime_error("fused_lm_head_topk_candidate_arrays called without supported lm_head");
+    }
+
+    const array hidden = forward_hidden(ctx, input_ids, true);
+    if (hidden.ndim() != 3 || hidden.shape(1) != 1) {
+        throw std::runtime_error("fused_lm_head_topk_candidate_arrays expects decode hidden shape [B,1,H]");
+    }
+
+    const int vocab_size = ctx->lm_head_q_w.shape(0);
+    const int row_chunk = std::max(requested_top_k, resolve_fused_lm_head_row_chunk());
+    std::vector<array> candidate_logits_parts;
+    std::vector<array> candidate_ids_parts;
+    candidate_logits_parts.reserve(static_cast<size_t>((vocab_size + row_chunk - 1) / row_chunk));
+    candidate_ids_parts.reserve(candidate_logits_parts.capacity());
+
+    for (int row_start = 0; row_start < vocab_size; row_start += row_chunk) {
+        const int row_end = std::min(vocab_size, row_start + row_chunk);
+        const int local_vocab = row_end - row_start;
+        const int local_k = std::min(requested_top_k, local_vocab);
+        const array w_chunk = slice_rows_2d(ctx->lm_head_q_w, row_start, row_end);
+        const array scales_chunk = slice_rows_2d(ctx->lm_head_q_scales, row_start, row_end);
+        const array biases_chunk = slice_rows_2d(ctx->lm_head_q_biases, row_start, row_end);
+        const array logits_chunk = quantized_matmul(
+            hidden,
+            w_chunk,
+            scales_chunk,
+            std::optional<array>(biases_chunk),
+            true,
+            ctx->cfg.quant_group_size,
+            ctx->cfg.quant_bits,
+            "affine"
+        );
+        auto topk_fn = compiled_topk_candidates(local_k);
+        const std::vector<array> topk_outputs = (*topk_fn)({logits_chunk});
+        if (topk_outputs.size() != 2) {
+            throw std::runtime_error("fused_lm_head_topk_candidate_arrays: invalid chunk top-k output");
+        }
+        const array row_offset = full(topk_outputs[1].shape(), row_start, int32);
+        candidate_logits_parts.push_back(topk_outputs[0]);
+        candidate_ids_parts.push_back(astype(topk_outputs[1], int32) + row_offset);
+    }
+
+    if (candidate_logits_parts.empty() || candidate_ids_parts.empty()) {
+        throw std::runtime_error("fused_lm_head_topk_candidate_arrays: no chunk candidates");
+    }
+
+    const array merged_logits = candidate_logits_parts.size() == 1
+        ? candidate_logits_parts.front()
+        : concatenate(candidate_logits_parts, -1);
+    const array merged_ids_i32 = candidate_ids_parts.size() == 1
+        ? candidate_ids_parts.front()
+        : concatenate(candidate_ids_parts, -1);
+    return {
+        reshape(merged_logits, {merged_logits.shape(2)}),
+        reshape(astype(merged_ids_i32, uint32), {merged_ids_i32.shape(2)})
+    };
+}
+
 void prefill_prefix_chunks(mlx_ctx* ctx, const std::vector<int32_t>& prompt_vec, int32_t prefix_len) {
     if (prefix_len <= 0) return;
     const int chunk_size = resolve_prefill_chunk_size();
@@ -3730,7 +3989,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             ctx->layers.push_back(std::move(lw));
         }
 
-        const bool enable_init_warmup = env_truthy("TALU_METAL_INIT_WARMUP", false);
+        const bool enable_init_warmup = env_truthy("TALU_METAL_INIT_WARMUP", true);
         if (enable_init_warmup) {
             // Pre-warm compiled compute_g path so WARMUP=0 benchmarks do not
             // include first-trace compilation overhead.
@@ -4739,19 +4998,25 @@ int32_t mlx_decode_stream(
         *out_generated_ids = nullptr;
         *out_generated_len = 0;
         if (decode_tokens == 0) return 1;
+        const bool fused_lm_head_profile = env_truthy("TALU_METAL_FUSED_LM_HEAD_PROFILE", false);
+        const size_t fused_hits_start = g_fused_lm_head_argmax_hits;
 
         std::vector<array> generated_token_arrays;
         generated_token_arrays.reserve(static_cast<size_t>(decode_tokens));
 
         const int32_t first_token_scalar = first_token;
         const array first_token_arr(&first_token_scalar, Shape{1, 1}, int32);
-        array current_token = next_token_greedy(last_token_logits(forward_logits(ctx, first_token_arr)));
+        array current_token = can_use_fused_lm_head_argmax(ctx)
+            ? fused_lm_head_argmax_token(ctx, first_token_arr)
+            : next_token_greedy(last_token_logits(forward_logits(ctx, first_token_arr)));
         async_eval(current_token);
 
         for (int32_t i = 0; i < decode_tokens; ++i) {
             generated_token_arrays.push_back(current_token);
             if (i + 1 < decode_tokens) {
-                const array next_token = next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
+                const array next_token = can_use_fused_lm_head_argmax(ctx)
+                    ? fused_lm_head_argmax_token(ctx, current_token)
+                    : next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
                 async_eval(next_token);
                 current_token = next_token;
             }
@@ -4777,6 +5042,15 @@ int32_t mlx_decode_stream(
             copied.get()[static_cast<size_t>(produced)] = tok;
             produced += 1;
             if (token_is_eos(tok, eos_ids, eos_len)) break;
+        }
+        if (fused_lm_head_profile) {
+            const size_t fused_hits = g_fused_lm_head_argmax_hits - fused_hits_start;
+            std::fprintf(
+                stderr,
+                "[mlx][fused_lm_head_argmax] used=%s hits=%zu mode=decode_stream\n",
+                can_use_fused_lm_head_argmax(ctx) ? "1" : "0",
+                fused_hits
+            );
         }
 
         *out_generated_ids = copied.release();
@@ -4910,42 +5184,118 @@ int32_t mlx_decode_topk_candidates(
     try {
         const int32_t token_scalar = token;
         const array token_arr(&token_scalar, Shape{1, 1}, int32);
-        const array logits_last = last_token_logits(forward_logits(ctx, token_arr)); // [1,1,V]
+        TopKCandidateBatch topk{
+            .logits = array(0.0f),
+            .indices = array(0.0f),
+            .k = 0,
+        };
+        int k = top_k;
 
-        if (logits_last.ndim() != 3) {
-            g_last_error = "mlx_decode_topk_candidates: invalid logits rank";
-            return 0;
-        }
-        const int vocab = logits_last.shape(2);
-        if (vocab <= 0) {
-            g_last_error = "mlx_decode_topk_candidates: invalid vocab size";
-            return 0;
-        }
-
-        const int k = std::min(top_k, vocab);
-        if (k == 1) {
-            const array top_idx = reshape(astype(argmax(logits_last, -1), int32), {1});
-            eval(top_idx);
+        if (k == 1 && can_use_fused_lm_head_argmax(ctx)) {
+            const array next_token = fused_lm_head_argmax_token(ctx, token_arr);
+            const array next_token_flat = reshape(astype(next_token, int32), {1});
+            eval(next_token_flat);
             synchronize();
-            out_candidate_ids[0] = top_idx.data<int32_t>()[0];
+            out_candidate_ids[0] = next_token_flat.data<int32_t>()[0];
             out_candidate_logits[0] = 0.0f;
             *out_candidate_count = 1;
             return 1;
         }
 
-        auto topk_fn = compiled_topk_candidates(k);
-        const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
-        if (topk_outputs.size() != 2) {
-            g_last_error = "mlx_decode_topk_candidates: invalid compiled output";
-            return 0;
+        if (can_use_fused_lm_head_topk(ctx, k)) {
+            auto [candidate_logits_flat, candidate_ids_flat] =
+                fused_lm_head_topk_candidate_arrays(ctx, token_arr, k);
+            eval({candidate_logits_flat, candidate_ids_flat});
+            synchronize();
+
+            const int candidate_count = candidate_logits_flat.shape(0);
+            const float* candidate_logits_ptr = candidate_logits_flat.data<float>();
+            const uint32_t* candidate_ids_ptr = candidate_ids_flat.data<uint32_t>();
+            if (!candidate_logits_ptr || !candidate_ids_ptr) {
+                g_last_error = "mlx_decode_topk_candidates: fused candidate materialization failed";
+                return 0;
+            }
+
+            std::fill_n(out_candidate_logits, static_cast<size_t>(k), -std::numeric_limits<float>::infinity());
+            std::fill_n(out_candidate_ids, static_cast<size_t>(k), -1);
+            int filled = 0;
+            for (int idx = 0; idx < candidate_count; ++idx) {
+                const uint32_t candidate_id_u32 = candidate_ids_ptr[idx];
+                if (candidate_id_u32 == 0xFFFFFFFFu) continue;
+                if (candidate_id_u32 > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+                    continue;
+                }
+                const int32_t candidate_id = static_cast<int32_t>(candidate_id_u32);
+                const float candidate_logit = candidate_logits_ptr[idx];
+
+                int insert_at = filled < k ? filled : k;
+                for (int rank = 0; rank < filled; ++rank) {
+                    const float existing_logit = out_candidate_logits[rank];
+                    const int32_t existing_id = out_candidate_ids[rank];
+                    if (candidate_logit > existing_logit ||
+                        (candidate_logit == existing_logit && candidate_id < existing_id)) {
+                        insert_at = rank;
+                        break;
+                    }
+                }
+                if (insert_at >= k) continue;
+
+                const int upper = filled < k ? filled : (k - 1);
+                for (int shift = upper; shift > insert_at; --shift) {
+                    out_candidate_logits[shift] = out_candidate_logits[shift - 1];
+                    out_candidate_ids[shift] = out_candidate_ids[shift - 1];
+                }
+                out_candidate_logits[insert_at] = candidate_logit;
+                out_candidate_ids[insert_at] = candidate_id;
+                if (filled < k) ++filled;
+            }
+            *out_candidate_count = filled;
+            return 1;
+        } else {
+            const array logits_last = last_token_logits(forward_logits(ctx, token_arr)); // [1,1,V]
+
+            if (logits_last.ndim() != 3) {
+                g_last_error = "mlx_decode_topk_candidates: invalid logits rank";
+                return 0;
+            }
+            const int vocab = logits_last.shape(2);
+            if (vocab <= 0) {
+                g_last_error = "mlx_decode_topk_candidates: invalid vocab size";
+                return 0;
+            }
+
+            k = std::min(top_k, vocab);
+            if (k == 1) {
+                const array top_idx = reshape(astype(argmax(logits_last, -1), int32), {1});
+                eval(top_idx);
+                synchronize();
+                out_candidate_ids[0] = top_idx.data<int32_t>()[0];
+                out_candidate_logits[0] = 0.0f;
+                *out_candidate_count = 1;
+                return 1;
+            }
+
+            auto topk_fn = compiled_topk_candidates(k);
+            const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
+            if (topk_outputs.size() != 2) {
+                g_last_error = "mlx_decode_topk_candidates: invalid compiled output";
+                return 0;
+            }
+            topk = TopKCandidateBatch{
+                .logits = reshape(topk_outputs[0], {1, 1, k}),
+                .indices = reshape(topk_outputs[1], {1, 1, k}),
+                .k = k,
+            };
+            eval({topk.logits, topk.indices});
         }
-        const array& top_k_logits_flat = topk_outputs[0];
-        const array& top_k_indices_flat = topk_outputs[1];
 
-        eval({top_k_logits_flat, top_k_indices_flat});
+        const array logits_flat = reshape(topk.logits, {k});
+        const array ids_flat = reshape(astype(topk.indices, int32), {k});
+        eval({logits_flat, ids_flat});
+        synchronize();
 
-        const float* logits_ptr = top_k_logits_flat.data<float>();
-        const int32_t* ids_ptr = top_k_indices_flat.data<int32_t>();
+        const float* logits_ptr = logits_flat.data<float>();
+        const int32_t* ids_ptr = ids_flat.data<int32_t>();
         std::memcpy(out_candidate_logits, logits_ptr, static_cast<size_t>(k) * sizeof(float));
         std::memcpy(out_candidate_ids, ids_ptr, static_cast<size_t>(k) * sizeof(int32_t));
         *out_candidate_count = k;
@@ -5515,6 +5865,8 @@ int32_t mlx_decode_topk_stream(
         *out_generated_ids = nullptr;
         *out_generated_len = 0;
         if (decode_tokens == 0) return 1;
+        const bool fused_lm_head_profile = env_truthy("TALU_METAL_FUSED_LM_HEAD_PROFILE", false);
+        const size_t fused_hits_start = g_fused_lm_head_argmax_hits;
         const bool topk_stream_profile = []() {
             if (const char* raw = std::getenv("TALU_METAL_TOPK_STREAM_PROFILE")) {
                 return std::string(raw) == "1";
@@ -5535,6 +5887,14 @@ int32_t mlx_decode_topk_stream(
         };
         const bool has_penalties =
             repetition_penalty != 1.0f || presence_penalty != 0.0f || frequency_penalty != 0.0f;
+        const bool use_fused_greedy_decode =
+            !has_penalties &&
+            (sampling_cfg.temperature <= 0.0f || sampling_cfg.top_k <= 1) &&
+            can_use_fused_lm_head_argmax(ctx);
+        const bool use_fused_topk_decode =
+            !has_penalties &&
+            !use_fused_greedy_decode &&
+            can_use_fused_lm_head_topk(ctx, sampling_cfg.top_k);
         const size_t output_capacity = static_cast<size_t>(decode_tokens);
         std::unique_ptr<int32_t, decltype(&std::free)> generated_host(
             static_cast<int32_t*>(std::malloc(sizeof(int32_t) * output_capacity)),
@@ -5547,39 +5907,82 @@ int32_t mlx_decode_topk_stream(
         int32_t produced = 0;
 
         if (!has_penalties) {
-            // Fast path: keep sampling on device and avoid per-token host sync.
-            std::vector<array> generated_token_arrays;
-            generated_token_arrays.reserve(static_cast<size_t>(decode_tokens));
-
+            // Fast path: chunk decode to avoid very large token graphs and avoid
+            // per-token async scheduling overhead.
+            const int32_t topk_chunk_size = []() -> int32_t {
+                if (const char* raw = std::getenv("TALU_METAL_TOPK_CHUNK")) {
+                    char* end = nullptr;
+                    const long parsed = std::strtol(raw, &end, 10);
+                    if (end != raw && parsed > 0 && parsed <= std::numeric_limits<int32_t>::max()) {
+                        return static_cast<int32_t>(parsed);
+                    }
+                }
+                return 32;
+            }();
+            const int32_t effective_topk_chunk_size = std::min<int32_t>(topk_chunk_size, 128);
             const int32_t token_scalar = first_token;
             array current_token = array(&token_scalar, Shape{1, 1}, int32);
-            array next_token = sample_token_from_logits(
-                last_token_logits(forward_logits(ctx, current_token)),
-                sampling_cfg
-            );
-            async_eval(next_token);
+            std::vector<array> chunk_tokens;
+            chunk_tokens.reserve(static_cast<size_t>(effective_topk_chunk_size));
+            bool saw_eos = false;
+            const auto total_t0 = std::chrono::steady_clock::now();
+            while (produced < decode_tokens && !saw_eos) {
+                const int32_t remaining = decode_tokens - produced;
+                const int32_t chunk_target = std::min(effective_topk_chunk_size, remaining);
+                chunk_tokens.clear();
 
-            for (int32_t i = 0; i < decode_tokens; ++i) {
-                generated_token_arrays.push_back(next_token);
-                if (i + 1 < decode_tokens) {
-                    next_token = sample_token_from_logits(
-                        last_token_logits(forward_logits(ctx, next_token)),
-                        sampling_cfg
-                    );
+                const auto t_build0 = std::chrono::steady_clock::now();
+                for (int32_t i = 0; i < chunk_target; ++i) {
+                    const array next_token = use_fused_greedy_decode
+                        ? fused_lm_head_argmax_token(ctx, current_token)
+                        : (use_fused_topk_decode
+                            ? sample_token_from_topk_candidates(
+                                fused_lm_head_topk_candidates(ctx, current_token, sampling_cfg.top_k),
+                                sampling_cfg
+                              )
+                            : sample_token_from_logits(
+                                last_token_logits(forward_logits(ctx, current_token)),
+                                sampling_cfg
+                              ));
                     async_eval(next_token);
+                    chunk_tokens.push_back(next_token);
+                    current_token = next_token;
+                }
+                const auto t_build1 = std::chrono::steady_clock::now();
+
+                const auto t_materialize0 = std::chrono::steady_clock::now();
+                eval(chunk_tokens);
+                const auto t_materialize1 = std::chrono::steady_clock::now();
+
+                for (int32_t i = 0; i < chunk_target; ++i) {
+                    const int32_t* token_ptr = chunk_tokens[static_cast<size_t>(i)].data<int32_t>();
+                    if (!token_ptr) {
+                        g_last_error = "mlx_decode_topk_stream: failed to materialize sampled token";
+                        return 0;
+                    }
+                    const int32_t tok = token_ptr[0];
+                    generated_host.get()[static_cast<size_t>(produced)] = tok;
+                    produced += 1;
+                    if (token_is_eos(tok, eos_ids, eos_len)) {
+                        saw_eos = true;
+                        break;
+                    }
+                }
+
+                if (topk_stream_profile) {
+                    profile_forward_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_build1 - t_build0).count()
+                    );
+                    profile_materialize_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_materialize1 - t_materialize0).count()
+                    );
                 }
             }
-
-            const array generated_token_rows = concatenate(generated_token_arrays, 0); // [T,1]
-            const array generated_token_flat = reshape(astype(generated_token_rows, int32), {decode_tokens}); // [T]
-            eval(generated_token_flat);
-
-            const int32_t* token_ptr = generated_token_flat.data<int32_t>();
-            for (int32_t i = 0; i < decode_tokens; ++i) {
-                const int32_t tok = token_ptr[static_cast<size_t>(i)];
-                generated_host.get()[static_cast<size_t>(produced)] = tok;
-                produced += 1;
-                if (token_is_eos(tok, eos_ids, eos_len)) break;
+            if (topk_stream_profile) {
+                const auto total_t1 = std::chrono::steady_clock::now();
+                profile_total_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(total_t1 - total_t0).count()
+                );
             }
         } else {
             // Penalized path.
@@ -5621,14 +6024,15 @@ int32_t mlx_decode_topk_stream(
                 const array first_token_idx(&first_token_scalar, Shape{1, 1, 1}, int32);
                 presence_mask = put_along_axis(presence_mask, first_token_idx, penalty_arr, -1);
                 ctx->sampling_context_len = 1;
+                std::vector<array> chunk_tokens;
+                chunk_tokens.reserve(static_cast<size_t>(effective_penalty_chunk_size));
 
                 const auto total_t0 = std::chrono::steady_clock::now();
                 bool saw_eos = false;
                 while (produced < decode_tokens && !saw_eos) {
                     const int32_t remaining = decode_tokens - produced;
                     const int32_t chunk_target = std::min(effective_penalty_chunk_size, remaining);
-                    std::vector<array> chunk_tokens;
-                    chunk_tokens.reserve(static_cast<size_t>(chunk_target));
+                    chunk_tokens.clear();
 
                     const auto t_build0 = std::chrono::steady_clock::now();
                     for (int32_t i = 0; i < chunk_target; ++i) {
@@ -5645,7 +6049,7 @@ int32_t mlx_decode_topk_stream(
 
                     const auto t_materialize0 = std::chrono::steady_clock::now();
                     const array chunk_rows = concatenate(chunk_tokens, 0); // [chunk,1]
-                    const array chunk_flat = reshape(astype(chunk_rows, int32), {chunk_target}); // [chunk]
+                    const array chunk_flat = reshape(chunk_rows, {chunk_target}); // [chunk]
                     eval(chunk_flat);
                     const auto t_materialize1 = std::chrono::steady_clock::now();
 
@@ -5695,14 +6099,15 @@ int32_t mlx_decode_topk_stream(
                 const array first_token_idx(&first_token_scalar, Shape{1, 1, 1}, int32);
                 token_counts = put_along_axis(token_counts, first_token_idx, one_count, -1);
                 ctx->sampling_context_len = 1;
+                std::vector<array> chunk_tokens;
+                chunk_tokens.reserve(static_cast<size_t>(effective_penalty_chunk_size));
 
                 const auto total_t0 = std::chrono::steady_clock::now();
                 bool saw_eos = false;
                 while (produced < decode_tokens && !saw_eos) {
                     const int32_t remaining = decode_tokens - produced;
                     const int32_t chunk_target = std::min(effective_penalty_chunk_size, remaining);
-                    std::vector<array> chunk_tokens;
-                    chunk_tokens.reserve(static_cast<size_t>(chunk_target));
+                    chunk_tokens.clear();
 
                     const auto t_build0 = std::chrono::steady_clock::now();
                     for (int32_t i = 0; i < chunk_target; ++i) {
@@ -5720,7 +6125,7 @@ int32_t mlx_decode_topk_stream(
 
                     const auto t_materialize0 = std::chrono::steady_clock::now();
                     const array chunk_rows = concatenate(chunk_tokens, 0); // [chunk,1]
-                    const array chunk_flat = reshape(astype(chunk_rows, int32), {chunk_target}); // [chunk]
+                    const array chunk_flat = reshape(chunk_rows, {chunk_target}); // [chunk]
                     eval(chunk_flat);
                     const auto t_materialize1 = std::chrono::steady_clock::now();
 
@@ -5770,6 +6175,17 @@ int32_t mlx_decode_topk_stream(
                 static_cast<double>(profile_materialize_ns) / 1e6
             );
         }
+        if (fused_lm_head_profile) {
+            const size_t fused_hits = g_fused_lm_head_argmax_hits - fused_hits_start;
+            std::fprintf(
+                stderr,
+                "[mlx][fused_lm_head_argmax] used=%s hits=%zu mode=topk_stream top_k=%d temperature=%.4f\n",
+                (use_fused_greedy_decode || use_fused_topk_decode) ? "1" : "0",
+                fused_hits,
+                top_k,
+                static_cast<double>(temperature)
+            );
+        }
         *out_generated_ids = generated_host.release();
         *out_generated_len = produced;
         return 1;
@@ -5810,6 +6226,8 @@ int32_t mlx_run(
         *out_generated_ids = nullptr;
         *out_generated_len = 0;
         const bool capture_tokens = capture_generated_tokens != 0;
+        const bool fused_lm_head_profile = env_truthy("TALU_METAL_FUSED_LM_HEAD_PROFILE", false);
+        const size_t fused_hits_start = g_fused_lm_head_argmax_hits;
 
         std::vector<int32_t> prompt_vec(prompt_ids, prompt_ids + prompt_len);
         std::vector<int32_t> captured_tokens;
@@ -5830,8 +6248,9 @@ int32_t mlx_run(
 
                 const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
                 const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
-                const array seed_logits = forward_logits(ctx, last_token_arr);
-                token_ids = next_token_greedy(last_token_logits(seed_logits));
+                token_ids = can_use_fused_lm_head_argmax(ctx)
+                    ? fused_lm_head_argmax_token(ctx, last_token_arr)
+                    : next_token_greedy(last_token_logits(forward_logits(ctx, last_token_arr)));
             } else {
                 const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
                 const array seed_logits = forward_logits(ctx, prompt_arr);
@@ -5844,7 +6263,9 @@ int32_t mlx_run(
             auto t2 = std::chrono::steady_clock::now();
             // Match mlx-lm generation scheduling: seed first decode token,
             // then run one-step lookahead with async eval.
-            array current_token = next_token_greedy(last_token_logits(forward_logits(ctx, token_ids)));
+            array current_token = can_use_fused_lm_head_argmax(ctx)
+                ? fused_lm_head_argmax_token(ctx, token_ids)
+                : next_token_greedy(last_token_logits(forward_logits(ctx, token_ids)));
             async_eval(current_token);
 
             if (capture_tokens && !is_warmup) {
@@ -5856,7 +6277,9 @@ int32_t mlx_run(
                 for (int i = 0; i < decode_tokens; ++i) {
                     captured_token_arrays.push_back(current_token);
                     if (i + 1 < decode_tokens) {
-                        const array next_token = next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
+                        const array next_token = can_use_fused_lm_head_argmax(ctx)
+                            ? fused_lm_head_argmax_token(ctx, current_token)
+                            : next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
                         async_eval(next_token);
                         current_token = next_token;
                     }
@@ -5873,7 +6296,9 @@ int32_t mlx_run(
             } else {
                 for (int i = 0; i < decode_tokens; ++i) {
                     if (i + 1 < decode_tokens) {
-                        const array next_token = next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
+                        const array next_token = can_use_fused_lm_head_argmax(ctx)
+                            ? fused_lm_head_argmax_token(ctx, current_token)
+                            : next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
                         async_eval(next_token);
                         if (i == 0) {
                             eval(current_token);
@@ -5910,6 +6335,15 @@ int32_t mlx_run(
             std::memcpy(copied, captured_tokens.data(), bytes);
             *out_generated_ids = copied;
             *out_generated_len = static_cast<int32_t>(captured_tokens.size());
+        }
+        if (fused_lm_head_profile) {
+            const size_t fused_hits = g_fused_lm_head_argmax_hits - fused_hits_start;
+            std::fprintf(
+                stderr,
+                "[mlx][fused_lm_head_argmax] used=%s hits=%zu mode=run\n",
+                can_use_fused_lm_head_argmax(ctx) ? "1" : "0",
+                fused_hits
+            );
         }
 
         *out_result = best;
