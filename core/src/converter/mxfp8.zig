@@ -1225,31 +1225,61 @@ fn maybeWriteFusedTensorForPlan(
     }
 }
 
+fn calibrationDatasetSnapshotDir(allocator: std.mem.Allocator) ![]u8 {
+    const hf_home = try repository.cache.getHfHome(allocator);
+    defer allocator.free(hf_home);
+    return std.fs.path.join(allocator, &.{ hf_home, "hub", "datasets--NeelNanda--pile-10k", "snapshots", "main" });
+}
+
+fn calibrationRowsCachePath(allocator: std.mem.Allocator, offset: usize, length: usize) ![]u8 {
+    const snapshot_dir = try calibrationDatasetSnapshotDir(allocator);
+    defer allocator.free(snapshot_dir);
+    const file_name = try std.fmt.allocPrint(allocator, "rows-offset-{d}-length-{d}.json", .{ offset, length });
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ snapshot_dir, file_name });
+}
+
 fn fetchDatasetRowsJson(allocator: std.mem.Allocator, offset: usize, length: usize) ![]u8 {
+    const cache_path = try calibrationRowsCachePath(allocator, offset, length);
+    defer allocator.free(cache_path);
+
+    if (std.fs.cwd().openFile(cache_path, .{})) |cache_file| {
+        defer cache_file.close();
+        return cache_file.readToEndAlloc(allocator, calibration_rows_max_bytes);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
     const url = try std.fmt.allocPrint(
         allocator,
         "https://datasets-server.huggingface.co/rows?dataset=NeelNanda/pile-10k&config=default&split=train&offset={d}&length={d}",
         .{ offset, length },
     );
     defer allocator.free(url);
-    return http.fetch(allocator, url, .{
+    const payload = try http.fetch(allocator, url, .{
         .user_agent = "talu-convert/1.0",
         .max_response_bytes = calibration_rows_max_bytes,
     });
+    errdefer allocator.free(payload);
+
+    const parent = std.fs.path.dirname(cache_path) orelse return error.NotFound;
+    try std.fs.cwd().makePath(parent);
+    var out_file = try std.fs.cwd().createFile(cache_path, .{ .truncate = true });
+    defer out_file.close();
+    try out_file.writeAll(payload);
+
+    return payload;
 }
 
 fn fetchDatasetRowsJsonWithRetry(
     allocator: std.mem.Allocator,
-    base_offset: usize,
+    offset: usize,
     length: usize,
-    seed: u64,
 ) ![]u8 {
-    const total_rows: usize = 10_000;
     const max_attempts: usize = 6;
     var attempt: usize = 0;
     while (attempt < max_attempts) : (attempt += 1) {
-        const jitter = @as(usize, @intCast((mix64(seed +% @as(u64, @intCast(attempt)) *% 0x9e3779b97f4a7c15) % 97)));
-        const offset = (base_offset + jitter) % (total_rows - length);
         const payload = fetchDatasetRowsJson(allocator, offset, length) catch |err| {
             switch (err) {
                 error.NotFound, error.Unauthorized => return err,
@@ -1311,94 +1341,9 @@ fn appendTokenizedRows(
     return out_tokens.items.len - before;
 }
 
-const calibration_cache_magic = "TCALIB01";
-
-fn calibrationCachePath(allocator: std.mem.Allocator, tokenizer_path: []const u8, options: ConvertOptions) ![]u8 {
-    const cache_dir = if (std.posix.getenv("TALU_HOME")) |talu_home|
-        try std.fs.path.join(allocator, &.{ talu_home, "cache", "convert", "calibration" })
-    else blk: {
-        const home = std.posix.getenv("HOME") orelse return error.NotFound;
-        break :blk try std.fs.path.join(allocator, &.{ home, ".cache", "talu", "cache", "convert", "calibration" });
-    };
-    defer allocator.free(cache_dir);
-
-    const key = try std.fmt.allocPrint(
-        allocator,
-        "mxfp8|{s}|{d}|{d}|{d}|{d}",
-        .{ tokenizer_path, options.calib_seed, options.calib_nsamples, options.calib_seqlen, options.calib_iters },
-    );
-    defer allocator.free(key);
-    const digest = std.hash.Wyhash.hash(0, key);
-    const file_name = try std.fmt.allocPrint(allocator, "pile10k-{x}.tcal", .{digest});
-    defer allocator.free(file_name);
-
-    return std.fs.path.join(allocator, &.{ cache_dir, file_name });
-}
-
-fn tryLoadCalibrationTokenCache(allocator: std.mem.Allocator, cache_path: []const u8) !?[]u32 {
-    var file = std.fs.cwd().openFile(cache_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer file.close();
-
-    const bytes = try file.readToEndAlloc(allocator, 16 * 1024 * 1024);
-    defer allocator.free(bytes);
-
-    if (bytes.len < 12) return null;
-    if (!std.mem.eql(u8, bytes[0..8], calibration_cache_magic)) return null;
-    const count = std.mem.readInt(u32, bytes[8..][0..4], .little);
-    const expected_len = 12 + @as(usize, @intCast(count)) * 4;
-    if (bytes.len != expected_len) return null;
-
-    const tokens = try allocator.alloc(u32, count);
-    errdefer allocator.free(tokens);
-
-    var offset: usize = 12;
-    for (tokens) |*token| {
-        token.* = std.mem.readInt(u32, bytes[offset..][0..4], .little);
-        offset += 4;
-    }
-    return tokens;
-}
-
-fn storeCalibrationTokenCache(cache_path: []const u8, tokens: []const u32) void {
-    const parent = std.fs.path.dirname(cache_path) orelse return;
-    std.fs.cwd().makePath(parent) catch return;
-
-    var file = std.fs.cwd().createFile(cache_path, .{ .truncate = true }) catch return;
-    defer file.close();
-
-    var header: [12]u8 = undefined;
-    @memcpy(header[0..8], calibration_cache_magic[0..8]);
-    const token_count_u32 = std.math.cast(u32, tokens.len) orelse return;
-    std.mem.writeInt(u32, header[8..][0..4], token_count_u32, .little);
-    file.writeAll(&header) catch return;
-
-    var scratch: [4]u8 = undefined;
-    for (tokens) |token| {
-        std.mem.writeInt(u32, &scratch, token, .little);
-        file.writeAll(&scratch) catch return;
-    }
-}
-
 fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []const u8, options: ConvertOptions) !?[]u32 {
     if (tokenizer_path.len == 0) return null;
     if (options.calib_iters == 0) return null;
-    const strict_dataset_mode = calibrationDatasetRequired(options);
-
-    const cache_path = calibrationCachePath(allocator, tokenizer_path, options) catch null;
-    defer if (cache_path) |path| allocator.free(path);
-    if (cache_path) |path| {
-        if (tryLoadCalibrationTokenCache(allocator, path) catch null) |cached| {
-            log.info("convert", "Loaded calibration token pool cache", .{
-                .path = path,
-                .tokens = cached.len,
-                .dataset = "NeelNanda/pile-10k",
-            });
-            return cached;
-        }
-    }
 
     var tokenizer = try tokenizer_mod.Tokenizer.initFromPath(allocator, tokenizer_path);
     defer tokenizer.deinit();
@@ -1415,7 +1360,6 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
     const max_pages: usize = @min(@as(usize, 256), max_pages_from_target);
     const seed_offset: usize = @intCast(options.calib_seed % (total_rows - rows_per_page));
 
-    var consecutive_failures: usize = 0;
     var page: usize = 0;
     while (page < max_pages and tokens.items.len < target_tokens) : (page += 1) {
         const offset = (seed_offset + page * rows_per_page) % (total_rows - rows_per_page);
@@ -1423,42 +1367,36 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
             allocator,
             offset,
             rows_per_page,
-            options.calib_seed +% @as(u64, @intCast(page)),
         ) catch |err| {
-            consecutive_failures += 1;
             log.warn("convert", "Calibration rows fetch failed", .{
                 .dataset = "NeelNanda/pile-10k",
                 .offset = offset,
                 .rows = rows_per_page,
                 .err = @errorName(err),
             });
-            if (strict_dataset_mode) return error.CalibrationDataUnavailable;
-            if (consecutive_failures >= 6 and tokens.items.len == 0) return err;
-            continue;
+            return error.CalibrationDataUnavailable;
         };
         defer allocator.free(rows_json);
         const appended = appendTokenizedRows(allocator, &tokenizer, rows_json, &tokens, target_tokens) catch |err| {
-            consecutive_failures += 1;
             log.warn("convert", "Calibration rows parse/tokenize failed", .{
                 .dataset = "NeelNanda/pile-10k",
                 .offset = offset,
                 .rows = rows_per_page,
                 .err = @errorName(err),
             });
-            if (strict_dataset_mode) return error.CalibrationDataUnavailable;
-            if (consecutive_failures >= 6 and tokens.items.len == 0) return err;
-            continue;
+            return error.CalibrationDataUnavailable;
         };
         if (appended == 0) {
-            consecutive_failures += 1;
-            if (strict_dataset_mode) return error.CalibrationDataUnavailable;
-            if (consecutive_failures >= 6 and tokens.items.len > 0) break;
-            continue;
+            log.warn("convert", "Calibration rows yielded no tokens", .{
+                .dataset = "NeelNanda/pile-10k",
+                .offset = offset,
+                .rows = rows_per_page,
+            });
+            return error.CalibrationDataUnavailable;
         }
-        consecutive_failures = 0;
     }
 
-    if (strict_dataset_mode and tokens.items.len < requested) {
+    if (tokens.items.len < requested) {
         log.warn("convert", "Calibration token pool coverage insufficient", .{
             .required_tokens = requested,
             .loaded_tokens = tokens.items.len,
@@ -1466,11 +1404,8 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
         });
         return error.CalibrationDataUnavailable;
     }
-    if (tokens.items.len == 0) return null;
+    if (tokens.items.len == 0) return error.CalibrationDataUnavailable;
     const owned = try tokens.toOwnedSlice(allocator);
-    if (cache_path) |path| {
-        storeCalibrationTokenCache(path, owned);
-    }
     return owned;
 }
 
