@@ -1650,9 +1650,12 @@ pub fn orientEmbedding(allocator: std.mem.Allocator, st: *st_loader.UnifiedSafeT
         return error.MissingScales;
     }
 
+    if ((embed_tensor.dtype == .u8 or embed_tensor.dtype == .i8) and std.mem.endsWith(u8, name, ".weight_packed")) {
+        return dequantizeNvfp4WeightToBf16(allocator, st, name, embed_tensor);
+    }
+
     // Keep dense embedding tables in their native dtype so tied-lm-head models
     // can execute logits projection on native precision paths.
-    _ = allocator;
     return switch (embed_tensor.dtype) {
         .f32, .f16, .bf16 => embed_tensor,
         else => error.UnexpectedDType,
@@ -2581,4 +2584,51 @@ test "orientEmbedding passes through f32 embedding unchanged" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), out[2], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), out[3], 1e-6);
+}
+
+test "orientEmbedding dequantizes NVFP4 packed embedding to BF16" {
+    const allocator = std.testing.allocator;
+    const writer = @import("../../io/safetensors/writer.zig");
+
+    const tmp_dir_path = "/tmp/test_orient_embed_nvfp4";
+    std.fs.cwd().makeDir(tmp_dir_path) catch {};
+    defer std.fs.cwd().deleteTree(tmp_dir_path) catch {};
+
+    const packed_bytes = [_]u8{
+        0x21, 0xA9,
+        0x43, 0x65,
+    };
+    const scales = [_]u8{
+        0x38, 0x38,
+        0x38, 0x38,
+    };
+    const global_scale = [_]f32{1.0};
+
+    const entries = [_]writer.TensorEntry{
+        .{ .name = "embed.weight_packed", .dtype = .u8, .shape = &[_]usize{ 2, 2 }, .data = packed_bytes[0..] },
+        .{ .name = "embed.weight_scale", .dtype = .f8_e4m3, .shape = &[_]usize{ 2, 2 }, .data = scales[0..] },
+        .{ .name = "embed.weight_global_scale", .dtype = .f32, .shape = &[_]usize{1}, .data = std.mem.sliceAsBytes(&global_scale) },
+    };
+    const model_path = tmp_dir_path ++ "/model.safetensors";
+    try writer.write(allocator, model_path, &entries);
+
+    var st = try st_loader.UnifiedSafeTensors.load(allocator, model_path);
+    defer st.deinit();
+
+    var arena_alloc = std.heap.ArenaAllocator.init(allocator);
+    defer arena_alloc.deinit();
+
+    var config = std.mem.zeroes(ModelConfig);
+    config.d_model = 4;
+    const result = try orientEmbedding(arena_alloc.allocator(), &st, "embed.weight_packed", config);
+
+    try std.testing.expectEqual(DType.bf16, result.dtype);
+    try std.testing.expectEqual(@as(i64, 2), result.shape[0]);
+    try std.testing.expectEqual(@as(i64, 4), result.shape[1]);
+
+    const out = result.asSlice(u16);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), dtype.bf16ToF32(out[0]), 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), dtype.bf16ToF32(out[1]), 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), dtype.bf16ToF32(out[2]), 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), dtype.bf16ToF32(out[3]), 0.06);
 }

@@ -946,6 +946,10 @@ void sanitize_qwen35_tensors(
 
 const array& require_tensor(const std::unordered_map<std::string, array>& tensors, const std::string& key) {
     auto it = tensors.find(key);
+    if (it == tensors.end() && ends_with(key, ".weight")) {
+        const std::string packed_key = key.substr(0, key.size() - std::string(".weight").size()) + ".weight_packed";
+        it = tensors.find(packed_key);
+    }
     if (it == tensors.end()) throw std::runtime_error("missing required tensor: " + key);
     return it->second;
 }
@@ -963,7 +967,12 @@ const array& require_any_tensor(
 }
 
 bool has_tensor(const std::unordered_map<std::string, array>& tensors, const std::string& key) {
-    return tensors.find(key) != tensors.end();
+    if (tensors.find(key) != tensors.end()) return true;
+    if (ends_with(key, ".weight")) {
+        const std::string packed_key = key.substr(0, key.size() - std::string(".weight").size()) + ".weight_packed";
+        return tensors.find(packed_key) != tensors.end();
+    }
+    return false;
 }
 
 std::string detect_text_prefix(const std::unordered_map<std::string, array>& tensors) {
@@ -1045,10 +1054,17 @@ array maybe_dequantize_fp8_weight(
     const std::string scale_inv_key = base + ".weight_scale_inv";
     const std::string block_scale_key = base + ".weight_block_scale";
     const std::string weight_scale_key = base + ".weight_scale";
+    const bool has_nvfp4_packed = tensors.find(base + ".weight_packed") != tensors.end();
+    const bool has_grouped_affine_scales = tensors.find(base + ".scales") != tensors.end();
+    const bool has_grouped_affine_biases =
+        tensors.find(base + ".biases") != tensors.end() ||
+        tensors.find(base + ".weight_bias") != tensors.end();
 
     auto scale_inv_it = tensors.find(scale_inv_key);
     auto block_scale_it = tensors.find(block_scale_key);
-    if (block_scale_it == tensors.end()) {
+    if (block_scale_it == tensors.end() &&
+        !has_nvfp4_packed &&
+        !(has_grouped_affine_scales && has_grouped_affine_biases)) {
         block_scale_it = tensors.find(weight_scale_key);
     }
     if (scale_inv_it == tensors.end() && block_scale_it == tensors.end()) {
@@ -1121,6 +1137,251 @@ array maybe_dequantize_fp8_weight(
         }
     }
     return dequant_bf16;
+}
+
+float fp4_e2m1_nibble_to_f32(uint8_t nibble) {
+    static constexpr float codebook[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f,
+        2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f,
+        -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    return codebook[nibble & 0x0F];
+}
+
+bool has_nvfp4_metadata_for_key(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key
+) {
+    if (!ends_with(weight_key, ".weight")) return false;
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    return tensors.find(base + ".weight_packed") != tensors.end() &&
+        tensors.find(base + ".weight_scale") != tensors.end();
+}
+
+const array& nvfp4_unit_global_scale() {
+    static thread_local std::optional<array> scale;
+    if (!scale.has_value()) {
+        scale = stop_gradient(copy(array(1.0f, float32)));
+    }
+    return *scale;
+}
+
+array dequantize_nvfp4_weight(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key
+) {
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    const array packed_u8 = astype(require_tensor(tensors, base + ".weight_packed"), uint8);
+    const array scales_f32 = astype(require_tensor(tensors, base + ".weight_scale"), float32);
+    eval(packed_u8);
+    eval(scales_f32);
+
+    if (packed_u8.ndim() != 2 || scales_f32.ndim() != 2) {
+        throw std::runtime_error("nvfp4 packed/scales must be rank-2 for " + weight_key);
+    }
+
+    const int rows = packed_u8.shape(0);
+    const int packed_cols = packed_u8.shape(1);
+    const int cols = packed_cols * 2;
+    if (scales_f32.shape(0) != rows) {
+        throw std::runtime_error("nvfp4 scales row mismatch for " + weight_key);
+    }
+    const int scale_cols = scales_f32.shape(1);
+    if (scale_cols <= 0 || cols % scale_cols != 0) {
+        throw std::runtime_error("invalid nvfp4 scales shape for " + weight_key);
+    }
+    const int group_size = cols / scale_cols;
+
+    float global_scale = 1.0f;
+    if (has_tensor(tensors, base + ".weight_global_scale")) {
+        const array global_f32 = astype(require_tensor(tensors, base + ".weight_global_scale"), float32);
+        eval(global_f32);
+        if (global_f32.size() > 0) global_scale = global_f32.item<float>();
+    }
+    if (global_scale == 0.0f) {
+        throw std::runtime_error("invalid nvfp4 global scale for " + weight_key);
+    }
+
+    const uint8_t* packed_ptr = packed_u8.data<uint8_t>();
+    const float* scale_ptr = scales_f32.data<float>();
+    std::vector<float> decoded(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+    for (int r = 0; r < rows; ++r) {
+        const size_t packed_row_off = static_cast<size_t>(r) * static_cast<size_t>(packed_cols);
+        const size_t scale_row_off = static_cast<size_t>(r) * static_cast<size_t>(scale_cols);
+        const size_t out_row_off = static_cast<size_t>(r) * static_cast<size_t>(cols);
+        for (int c = 0; c < cols; ++c) {
+            const uint8_t packed = packed_ptr[packed_row_off + static_cast<size_t>(c / 2)];
+            const uint8_t nibble = (c & 1) == 0 ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+            const float local_scale = scale_ptr[scale_row_off + static_cast<size_t>(c / group_size)];
+            decoded[out_row_off + static_cast<size_t>(c)] = fp4_e2m1_nibble_to_f32(nibble) * (local_scale / global_scale);
+        }
+    }
+
+    array dequant_bf16 = astype(array(decoded.begin(), Shape{rows, cols}, float32), bfloat16);
+    dequant_bf16 = stop_gradient(copy(dequant_bf16));
+    return dequant_bf16;
+}
+
+bool transcode_nvfp4_to_affine_qmm(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key,
+    const array& lhs_weight,
+    int target_group_size,
+    array* out_q_w,
+    array* out_q_scales,
+    array* out_q_biases
+) {
+    if (!out_q_w || !out_q_scales || !out_q_biases) return false;
+    if (target_group_size <= 0 || !has_nvfp4_metadata_for_key(tensors, weight_key)) return false;
+
+    const array dense_bf16 = dequantize_nvfp4_weight(tensors, weight_key);
+    const array dense_f32 = astype(dense_bf16, float32);
+    eval(dense_f32);
+    if (dense_f32.ndim() != 2 || lhs_weight.ndim() != 2) return false;
+
+    const int rows = dense_f32.shape(0);
+    const int cols = dense_f32.shape(1);
+    const int packed_cols = cols / 8;
+    if (rows <= 0 || cols <= 0 || (cols % target_group_size) != 0 || (cols % 8) != 0) return false;
+    const bool lhs_matches_unpacked =
+        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == cols;
+    const bool lhs_matches_packed =
+        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == packed_cols;
+    if (!lhs_matches_unpacked && !lhs_matches_packed) {
+        // Synthetic fused decode weights (for example linear-attention qkvz/ba)
+        // must quantize the full concatenated tensor, not a single source slice.
+        return false;
+    }
+
+    const int groups = cols / target_group_size;
+    const float* src = dense_f32.data<float>();
+
+    std::vector<uint32_t> packed(static_cast<size_t>(rows) * static_cast<size_t>(packed_cols), 0);
+    std::vector<float> scales(static_cast<size_t>(rows) * static_cast<size_t>(groups), 0.0f);
+    std::vector<float> biases(static_cast<size_t>(rows) * static_cast<size_t>(groups), 0.0f);
+
+    for (int r = 0; r < rows; ++r) {
+        const size_t row_off = static_cast<size_t>(r) * static_cast<size_t>(cols);
+        const size_t packed_row_off = static_cast<size_t>(r) * static_cast<size_t>(packed_cols);
+        const size_t group_row_off = static_cast<size_t>(r) * static_cast<size_t>(groups);
+        for (int g = 0; g < groups; ++g) {
+            const int start = g * target_group_size;
+            float min_v = src[row_off + static_cast<size_t>(start)];
+            float max_v = min_v;
+            for (int i = 1; i < target_group_size; ++i) {
+                const float v = src[row_off + static_cast<size_t>(start + i)];
+                min_v = std::min(min_v, v);
+                max_v = std::max(max_v, v);
+            }
+
+            float scale = (max_v - min_v) / 15.0f;
+            float bias = min_v;
+            if (!(scale > 0.0f) || !std::isfinite(scale)) {
+                scale = 1.0f;
+                bias = min_v;
+            }
+            scales[group_row_off + static_cast<size_t>(g)] = scale;
+            biases[group_row_off + static_cast<size_t>(g)] = bias;
+
+            for (int i = 0; i < target_group_size; ++i) {
+                const int c = start + i;
+                const float v = src[row_off + static_cast<size_t>(c)];
+                int q = static_cast<int>(std::lrint((v - bias) / scale));
+                q = std::max(0, std::min(15, q));
+                const size_t packed_idx = packed_row_off + static_cast<size_t>(c / 8);
+                const int shift = (c % 8) * 4;
+                packed[packed_idx] |= (static_cast<uint32_t>(q) << shift);
+            }
+        }
+    }
+
+    *out_q_w = stop_gradient(copy(array(packed.begin(), Shape{rows, packed_cols}, uint32)));
+    *out_q_scales = stop_gradient(copy(astype(array(scales.begin(), Shape{rows, groups}, float32), bfloat16)));
+    *out_q_biases = stop_gradient(copy(astype(array(biases.begin(), Shape{rows, groups}, float32), bfloat16)));
+    eval(*out_q_w);
+    eval(*out_q_scales);
+    eval(*out_q_biases);
+    return true;
+}
+
+bool capture_native_nvfp4_quant(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key,
+    array* out_q_w,
+    array* out_q_scales,
+    array* out_q_biases
+) {
+    if (!out_q_w || !out_q_scales || !out_q_biases) return false;
+    if (!has_nvfp4_metadata_for_key(tensors, weight_key)) return false;
+    if (!ends_with(weight_key, ".weight")) return false;
+
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    const array packed_src = astype(require_tensor(tensors, base + ".weight_packed"), uint8);
+    const array scale_src = view(require_tensor(tensors, base + ".weight_scale"), uint8);
+    eval(packed_src);
+    eval(scale_src);
+
+    if (packed_src.ndim() != 2 || scale_src.ndim() != 2) return false;
+    const int rows = packed_src.shape(0);
+    const int packed_byte_cols = packed_src.shape(1);
+    const int cols = packed_byte_cols * 2;
+    if (packed_byte_cols <= 0 || (packed_byte_cols % 4) != 0) return false;
+    if ((cols % 16) != 0) return false;
+    if (scale_src.shape(0) != rows || scale_src.shape(1) != (cols / 16)) return false;
+
+    array global_scale = array(1.0f, float32);
+    if (has_tensor(tensors, base + ".weight_global_scale")) {
+        global_scale = astype(require_tensor(tensors, base + ".weight_global_scale"), float32);
+    }
+
+    *out_q_w = stop_gradient(copy(reshape(view(packed_src, uint32), {rows, packed_byte_cols / 4})));
+    *out_q_scales = stop_gradient(copy(scale_src));
+    *out_q_biases = stop_gradient(copy(global_scale));
+    return true;
+}
+
+void materialize_nvfp4_affine_execution_tensors(
+    std::unordered_map<std::string, array>* tensors,
+    int target_group_size
+) {
+    if (!tensors || target_group_size <= 0) return;
+
+    std::vector<std::string> packed_keys;
+    packed_keys.reserve(tensors->size());
+    for (const auto& entry : *tensors) {
+        if (ends_with(entry.first, ".weight_packed")) {
+            packed_keys.push_back(entry.first);
+        }
+    }
+
+    for (const std::string& packed_key : packed_keys) {
+        const std::string base = packed_key.substr(0, packed_key.size() - std::string(".weight_packed").size());
+        const std::string weight_key = base + ".weight";
+        if (tensors->find(weight_key) != tensors->end()) continue;
+
+        auto packed_it = tensors->find(packed_key);
+        if (packed_it == tensors->end()) continue;
+
+        array q_w = array(0.0f);
+        array q_scales = array(0.0f);
+        array q_biases = array(0.0f);
+        if (!transcode_nvfp4_to_affine_qmm(
+                *tensors,
+                weight_key,
+                packed_it->second,
+                target_group_size,
+                &q_w,
+                &q_scales,
+                &q_biases))
+        {
+            continue;
+        }
+
+        tensors->insert_or_assign(weight_key, q_w);
+        tensors->insert_or_assign(base + ".scales", q_scales);
+        tensors->insert_or_assign(base + ".biases", q_biases);
+    }
 }
 
 array maybe_dequantize_grouped_affine_weight(
@@ -1301,6 +1562,12 @@ array load_linear_weight(
 ) {
     const array& raw_weight = require_tensor(tensors, weight_key);
     const array grouped = maybe_dequantize_grouped_affine_weight(tensors, cfg, weight_key, raw_weight);
+    if (grouped.size() != raw_weight.size() || grouped.dtype() != raw_weight.dtype() || grouped.ndim() != raw_weight.ndim()) {
+        return maybe_dequantize_fp8_weight(tensors, weight_key, grouped);
+    }
+    if (has_nvfp4_metadata_for_key(tensors, weight_key)) {
+        return dequantize_nvfp4_weight(tensors, weight_key);
+    }
     return maybe_dequantize_fp8_weight(tensors, weight_key, grouped);
 }
 
@@ -1357,6 +1624,23 @@ void maybe_quantize_mxfp8_matrix(
         }
     }
 
+    if (out_q_biases != nullptr &&
+        has_nvfp4_metadata_for_key(tensors, weight_key) &&
+        !has_grouped_affine_metadata_for_key(tensors, weight_key))
+    {
+        if (capture_native_nvfp4_quant(
+                tensors,
+                weight_key,
+                out_q_w,
+                out_q_scales,
+                out_q_biases))
+        {
+            *out_has_q = true;
+            g_qmm_success += 1;
+            return;
+        }
+    }
+
     const bool enforce_grouped_affine_lossless = env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true);
     if (enforce_grouped_affine_lossless && out_q_biases != nullptr) {
         if (maybe_capture_grouped_affine_quant(
@@ -1387,8 +1671,12 @@ void maybe_quantize_mxfp8_matrix(
         // Some converted checkpoints keep FP8 payload tensors as uint8 and
         // expose scales via metadata. Dequantize first when needed so MLX
         // quantize() receives a real floating tensor.
-        quant_input = maybe_dequantize_grouped_affine_weight(tensors, cfg, weight_key, quant_input);
-        quant_input = maybe_dequantize_fp8_weight(tensors, weight_key, quant_input);
+        if (has_nvfp4_metadata_for_key(tensors, weight_key)) {
+            quant_input = dequantize_nvfp4_weight(tensors, weight_key);
+        } else {
+            quant_input = maybe_dequantize_grouped_affine_weight(tensors, cfg, weight_key, quant_input);
+            quant_input = maybe_dequantize_fp8_weight(tensors, weight_key, quant_input);
+        }
     }
     const Dtype qdt = quant_input.dtype();
     const bool quant_input_is_float = (qdt == float16 || qdt == bfloat16 || qdt == float32 || qdt == float64);
@@ -1434,6 +1722,14 @@ array linear_decode_maybe_quantized(
     if (q_ready) {
         const bool affine_ready = q_biases.ndim() == 2 && q_biases.size() > 1 &&
             quant_group_size > 0 && (quant_bits == 4 || quant_bits == 8);
+        const bool nvfp4_ready =
+            !affine_ready &&
+            q_w.dtype() == uint32 &&
+            q_scales.dtype() == uint8 &&
+            q_biases.size() == 1 &&
+            q_biases.dtype() == float32 &&
+            quant_group_size == 16 &&
+            quant_bits == 4;
         if (affine_ready) {
             return quantized_matmul(
                 x,
@@ -1445,6 +1741,22 @@ array linear_decode_maybe_quantized(
                 quant_bits,
                 "affine"
             );
+        }
+        if (nvfp4_ready) {
+            const bool reshape_back = x.ndim() == 3;
+            const int batch = reshape_back ? x.shape(0) : x.shape(0);
+            const array x2d = reshape_back ? reshape(x, {batch, x.shape(2)}) : x;
+            const array out2d = qqmm(
+                x2d,
+                q_w,
+                std::optional<array>(q_scales),
+                quant_group_size,
+                quant_bits,
+                "nvfp4",
+                std::optional<array>(nvfp4_unit_global_scale()),
+                std::optional<array>(q_biases)
+            );
+            return reshape_back ? reshape(out2d, {batch, 1, out2d.shape(1)}) : out2d;
         }
         return quantized_matmul(
             x,
@@ -1746,6 +2058,7 @@ struct mlx_ctx {
     array final_norm_w = array(0.0f); // [hidden]
     bool has_fp8_meta = false;
     bool has_mxfp8_meta = false;
+    bool has_grouped_affine_meta = false;
     bool lm_head_q_decode_enabled = false;
     bool fp8_decode_qmm_enabled = false;
 
@@ -1859,6 +2172,17 @@ bool has_grouped_affine_quant_metadata(const std::unordered_map<std::string, arr
         const std::string base = kv.first.substr(0, kv.first.size() - std::string(".weight").size());
         if (tensors.find(base + ".scales") != tensors.end() &&
             tensors.find(base + ".biases") != tensors.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_nvfp4_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
+    for (const auto& kv : tensors) {
+        if (!ends_with(kv.first, ".weight_packed")) continue;
+        const std::string base = kv.first.substr(0, kv.first.size() - std::string(".weight_packed").size());
+        if (tensors.find(base + ".weight_scale") != tensors.end()) {
             return true;
         }
     }
@@ -2516,7 +2840,7 @@ array forward_hidden(
 array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* trace_frame = nullptr) {
     const array hidden = forward_hidden(ctx, input_ids, true, trace_frame);
     array lm_input = hidden;
-    if (ctx->has_fp8_meta && hidden.ndim() == 3 && hidden.shape(1) > 1) {
+    if ((ctx->has_fp8_meta or ctx->has_grouped_affine_meta) && hidden.ndim() == 3 && hidden.shape(1) > 1) {
         // Prefill only needs next-token logits; avoid full-sequence lm_head.
         const int b = hidden.shape(0);
         const int t = hidden.shape(1);
@@ -2531,6 +2855,15 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
         ctx->lm_head_q_biases.size() > 1 &&
         ctx->cfg.quant_group_size > 0 &&
         (ctx->cfg.quant_bits == 4 || ctx->cfg.quant_bits == 8);
+    const bool lm_head_nvfp4_ready =
+        lm_head_q_ready &&
+        !lm_head_affine_ready &&
+        ctx->lm_head_q_w.dtype() == uint32 &&
+        ctx->lm_head_q_scales.dtype() == uint8 &&
+        ctx->lm_head_q_biases.size() == 1 &&
+        ctx->lm_head_q_biases.dtype() == float32 &&
+        ctx->cfg.quant_group_size == 16 &&
+        ctx->cfg.quant_bits == 4;
     const array logits = lm_head_q_ready
         ? (lm_head_affine_ready
               ? quantized_matmul(
@@ -2543,6 +2876,20 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
                     ctx->cfg.quant_bits,
                     "affine"
                 )
+              : (lm_head_nvfp4_ready
+                    ? reshape(
+                          qqmm(
+                              reshape(lm_input, {lm_input.shape(0), lm_input.shape(2)}),
+                              ctx->lm_head_q_w,
+                              std::optional<array>(ctx->lm_head_q_scales),
+                              ctx->cfg.quant_group_size,
+                              ctx->cfg.quant_bits,
+                              "nvfp4",
+                              std::optional<array>(nvfp4_unit_global_scale()),
+                              std::optional<array>(ctx->lm_head_q_biases)
+                          ),
+                          {lm_input.shape(0), 1, ctx->lm_head_q_w.shape(0)}
+                      )
               : quantized_matmul(
                     lm_input,
                     ctx->lm_head_q_w,
@@ -2552,7 +2899,7 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
                     std::nullopt,
                     std::nullopt,
                     "mxfp8"
-                ))
+                )))
         : matmul(lm_input, ctx->lm_head_rhs);
     if (trace_frame) {
         xray_emit_array_f32(
@@ -2931,7 +3278,7 @@ bool build_prefill_topology_key(const mlx_ctx* ctx, std::string* out_key) {
 
 bool supports_variable_prefill_fusion(const mlx_ctx* ctx) {
     if (!ctx) return false;
-    if (ctx->has_fp8_meta) return false;
+    if (ctx->has_fp8_meta || ctx->has_grouped_affine_meta) return false;
     for (const LayerWeights& lw : ctx->layers) {
         // Variable-length fused prefill is only safe for pure full-attention
         // stacks where runtime state is fully represented by KV cache.
@@ -2944,7 +3291,7 @@ bool supports_ragged_prefill_fusion(const mlx_ctx* ctx) {
     if (!ctx) return false;
     if (ctx->xray_enabled) return false;
     // Keep FP8 path conservative until ragged fused prefill is validated there.
-    if (ctx->has_fp8_meta) return false;
+    if (ctx->has_fp8_meta || ctx->has_grouped_affine_meta) return false;
     return true;
 }
 
@@ -3312,6 +3659,12 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         }
         return false;
     }();
+    const bool nvfp4_debug = []() {
+        if (const char* value = std::getenv("TALU_METAL_NVFP4_DEBUG")) {
+            return std::string(value) == "1";
+        }
+        return false;
+    }();
     const size_t qmm_attempts_before = g_qmm_attempts;
     const size_t qmm_success_before = g_qmm_success;
     try {
@@ -3358,12 +3711,24 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         ctx->has_fp8_meta = has_fp8_meta;
         const bool has_mxfp8_meta = has_mxfp8_quant_metadata(tensors);
         ctx->has_mxfp8_meta = has_mxfp8_meta;
-        const bool has_grouped_affine_meta = has_grouped_affine_quant_metadata(tensors);
+        bool has_grouped_affine_meta = has_grouped_affine_quant_metadata(tensors);
+        const bool has_nvfp4_meta = has_nvfp4_quant_metadata(tensors);
+        if (has_grouped_affine_meta && has_nvfp4_meta) {
+            // Hybrid artifacts preserve grouped-affine execution tensors.
+            ctx->cfg.quant_bits = 4;
+            ctx->cfg.quant_group_size = 32;
+        } else if (has_nvfp4_meta && !has_grouped_affine_meta) {
+            // Pure NVFP4 must stay on the native MLX NVFP4 path.
+            ctx->cfg.quant_bits = 4;
+            ctx->cfg.quant_group_size = 16;
+        }
+        ctx->has_grouped_affine_meta = has_grouped_affine_meta;
         // Decode-time QMM defaults on for quantized checkpoints:
         // - native MXFP8 metadata
-        // - grouped-affine metadata (GAF/NVFP4)
+        // - grouped-affine metadata
+        // - nvfp4 packed metadata
         // Callers can still force on/off via TALU_METAL_FP8_DECODE_QMM.
-        const bool default_decode_qmm = has_mxfp8_meta || has_grouped_affine_meta;
+        const bool default_decode_qmm = has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta;
         ctx->fp8_decode_qmm_enabled = env_truthy("TALU_METAL_FP8_DECODE_QMM", default_decode_qmm);
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
         // Decode QMM is currently decode-step-only; prefill still needs dense
@@ -3404,7 +3769,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             }
         }
 
-        const bool enable_lm_head_qmm = env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", has_mxfp8_meta || has_grouped_affine_meta);
+        const bool enable_lm_head_qmm = env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta);
         if (enable_lm_head_qmm) {
             if (lm_head_weight.size() == 1) {
                 // Tie embeddings can point at raw FP8 tensors. Load dequantized copy only
@@ -3680,11 +4045,89 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                             g_qmm_success += 1;
                         }
                     }
+                    if (!lin_qkvz_q_captured && env_truthy("TALU_METAL_NVFP4_AFFINE_TRANSCODE", false)) {
+                        array qkv_q_w = array(0.0f);
+                        array qkv_q_scales = array(0.0f);
+                        array qkv_q_biases = array(0.0f);
+                        array z_q_w = array(0.0f);
+                        array z_q_scales = array(0.0f);
+                        array z_q_biases = array(0.0f);
+                        if (transcode_nvfp4_to_affine_qmm(
+                                tensors,
+                                qkv_key,
+                                qkv_weight,
+                                ctx->cfg.quant_group_size > 0 ? ctx->cfg.quant_group_size : 32,
+                                &qkv_q_w,
+                                &qkv_q_scales,
+                                &qkv_q_biases) &&
+                            transcode_nvfp4_to_affine_qmm(
+                                tensors,
+                                z_key,
+                                z_weight,
+                                ctx->cfg.quant_group_size > 0 ? ctx->cfg.quant_group_size : 32,
+                                &z_q_w,
+                                &z_q_scales,
+                                &z_q_biases) &&
+                            qkv_q_w.ndim() == 2 && z_q_w.ndim() == 2 &&
+                            qkv_q_w.shape(1) == z_q_w.shape(1) &&
+                            qkv_q_scales.ndim() == 2 && z_q_scales.ndim() == 2 &&
+                            qkv_q_scales.shape(1) == z_q_scales.shape(1) &&
+                            qkv_q_biases.ndim() == 2 && z_q_biases.ndim() == 2 &&
+                            qkv_q_biases.shape(1) == z_q_biases.shape(1))
+                        {
+                            lw.lin_in_proj_qkvz_q_w = concatenate({qkv_q_w, z_q_w}, 0);
+                            lw.lin_in_proj_qkvz_q_scales = concatenate({qkv_q_scales, z_q_scales}, 0);
+                            lw.lin_in_proj_qkvz_q_biases = concatenate({qkv_q_biases, z_q_biases}, 0);
+                            lw.lin_in_proj_qkvz_has_q = true;
+                            lin_qkvz_q_captured = true;
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+                    }
+                    if (!lin_ba_q_captured && env_truthy("TALU_METAL_NVFP4_AFFINE_TRANSCODE", false)) {
+                        array b_q_w = array(0.0f);
+                        array b_q_scales = array(0.0f);
+                        array b_q_biases = array(0.0f);
+                        array a_q_w = array(0.0f);
+                        array a_q_scales = array(0.0f);
+                        array a_q_biases = array(0.0f);
+                        if (transcode_nvfp4_to_affine_qmm(
+                                tensors,
+                                b_key,
+                                b_weight,
+                                ctx->cfg.quant_group_size > 0 ? ctx->cfg.quant_group_size : 32,
+                                &b_q_w,
+                                &b_q_scales,
+                                &b_q_biases) &&
+                            transcode_nvfp4_to_affine_qmm(
+                                tensors,
+                                a_key,
+                                a_weight,
+                                ctx->cfg.quant_group_size > 0 ? ctx->cfg.quant_group_size : 32,
+                                &a_q_w,
+                                &a_q_scales,
+                                &a_q_biases) &&
+                            b_q_w.ndim() == 2 && a_q_w.ndim() == 2 &&
+                            b_q_w.shape(1) == a_q_w.shape(1) &&
+                            b_q_scales.ndim() == 2 && a_q_scales.ndim() == 2 &&
+                            b_q_scales.shape(1) == a_q_scales.shape(1) &&
+                            b_q_biases.ndim() == 2 && a_q_biases.ndim() == 2 &&
+                            b_q_biases.shape(1) == a_q_biases.shape(1))
+                        {
+                            lw.lin_in_proj_ba_q_w = concatenate({b_q_w, a_q_w}, 0);
+                            lw.lin_in_proj_ba_q_scales = concatenate({b_q_scales, a_q_scales}, 0);
+                            lw.lin_in_proj_ba_q_biases = concatenate({b_q_biases, a_q_biases}, 0);
+                            lw.lin_in_proj_ba_has_q = true;
+                            lin_ba_q_captured = true;
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+                    }
                     if (!lin_qkvz_q_captured) {
                         maybe_quantize_mxfp8_matrix(
                             tensors,
                             ctx->cfg,
-                            qkv_key,
+                            p + "linear_attn.in_proj_qkvz",
                             qkvz_weight,
                             enable_mlp_qmm,
                             &lw.lin_in_proj_qkvz_q_w,
@@ -3697,7 +4140,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                         maybe_quantize_mxfp8_matrix(
                             tensors,
                             ctx->cfg,
-                            b_key,
+                            p + "linear_attn.in_proj_ba",
                             ba_weight,
                             enable_mlp_qmm,
                             &lw.lin_in_proj_ba_q_w,
@@ -4015,6 +4458,45 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             reset_runtime_state(ctx.get());
         }
 
+        {
+            size_t layer_q_count = 0;
+            size_t layer_q_total = 0;
+            for (const LayerWeights& lw : ctx->layers) {
+                const bool flags[] = {
+                    lw.mlp_gate_has_q,
+                    lw.mlp_up_has_q,
+                    lw.mlp_down_has_q,
+                    lw.lin_in_proj_qkvz_has_q,
+                    lw.lin_in_proj_ba_has_q,
+                    lw.lin_out_proj_has_q,
+                    lw.sc_in_proj_has_q,
+                    lw.sc_out_proj_has_q,
+                    lw.attn_q_has_q,
+                    lw.attn_k_has_q,
+                    lw.attn_v_has_q,
+                    lw.attn_o_has_q,
+                };
+                for (bool flag : flags) {
+                    layer_q_total += 1;
+                    if (flag) layer_q_count += 1;
+                }
+            }
+            std::fprintf(
+                stderr,
+                "[mlx][nvfp4] model=%s nvfp4=%d gaffine=%d decode_qmm=%d lm_head_q=%d layers_q=%zu/%zu group=%d bits=%d\n",
+                ctx->model_id.c_str(),
+                has_nvfp4_meta ? 1 : 0,
+                ctx->has_grouped_affine_meta ? 1 : 0,
+                ctx->fp8_decode_qmm_enabled ? 1 : 0,
+                ctx->lm_head_q_decode_enabled ? 1 : 0,
+                layer_q_count,
+                layer_q_total,
+                ctx->cfg.quant_group_size,
+                ctx->cfg.quant_bits
+            );
+            std::fflush(stderr);
+        }
+
         if (qmm_debug) {
             const size_t attempts_delta = g_qmm_attempts - qmm_attempts_before;
             const size_t success_delta = g_qmm_success - qmm_success_before;
@@ -4074,6 +4556,7 @@ mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
         ctx->final_norm_w = source_ctx->final_norm_w;
         ctx->has_fp8_meta = source_ctx->has_fp8_meta;
         ctx->has_mxfp8_meta = source_ctx->has_mxfp8_meta;
+        ctx->has_grouped_affine_meta = source_ctx->has_grouped_affine_meta;
         ctx->lm_head_q_decode_enabled = source_ctx->lm_head_q_decode_enabled;
         ctx->fp8_decode_qmm_enabled = source_ctx->fp8_decode_qmm_enabled;
         ctx->layers = source_ctx->layers;

@@ -104,13 +104,13 @@ pub const ConvertOptions = struct {
                     32 => .gaf4_32,
                     64 => .gaf4_64,
                     128 => .gaf4_128,
-                    else => .gaf4_64,
+                    else => .gaf4_32,
                 },
                 8 => switch (q.group_size) {
                     32 => .gaf8_32,
                     64 => .gaf8_64,
                     128 => .gaf8_128,
-                    else => .gaf8_64,
+                    else => .gaf8_32,
                 },
                 else => .f16,
             };
