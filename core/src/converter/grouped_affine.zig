@@ -353,7 +353,7 @@ fn storeCalibrationTokenCache(cache_path: []const u8, tokens: []const u32) void 
 fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []const u8, options: ConvertOptions) !?[]u32 {
     if (tokenizer_path.len == 0) return null;
     if (options.calib_iters == 0) return null;
-    const strict_dataset_mode = options.profile != .fast and options.calib_iters > 0;
+    const strict_dataset_mode = calibrationDatasetRequired(options);
 
     const cache_path = calibrationCachePath(allocator, tokenizer_path, options) catch null;
     defer if (cache_path) |path| allocator.free(path);
@@ -400,7 +400,7 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
                 .rows = rows_per_page,
                 .err = @errorName(err),
             });
-            if (strict_dataset_mode and consecutive_failures >= 6) return error.CalibrationDataUnavailable;
+            if (strict_dataset_mode) return error.CalibrationDataUnavailable;
             if (consecutive_failures >= 6 and tokens.items.len == 0) return err;
             continue;
         };
@@ -413,12 +413,13 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
                 .rows = rows_per_page,
                 .err = @errorName(err),
             });
-            if (strict_dataset_mode and consecutive_failures >= 6) return error.CalibrationDataUnavailable;
+            if (strict_dataset_mode) return error.CalibrationDataUnavailable;
             if (consecutive_failures >= 6 and tokens.items.len == 0) return err;
             continue;
         };
         if (appended == 0) {
             consecutive_failures += 1;
+            if (strict_dataset_mode) return error.CalibrationDataUnavailable;
             if (consecutive_failures >= 6 and tokens.items.len > 0) break;
             continue;
         }
@@ -431,6 +432,7 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
                 .dataset = "NeelNanda/pile-10k",
                 .err = @errorName(err),
             });
+            if (strict_dataset_mode) return error.CalibrationDataUnavailable;
             break :blk null;
         };
         if (first_rows_json) |rows_json| {
@@ -440,8 +442,10 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
                     .dataset = "NeelNanda/pile-10k",
                     .err = @errorName(err),
                 });
+                if (strict_dataset_mode) return error.CalibrationDataUnavailable;
                 break :blk 0;
             };
+            if (strict_dataset_mode and appended == 0) return error.CalibrationDataUnavailable;
             if (appended > 0) {
                 log.info("convert", "Loaded fallback calibration rows", .{
                     .dataset = "NeelNanda/pile-10k",
@@ -454,7 +458,7 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
     }
 
     if (strict_dataset_mode and tokens.items.len < requested) {
-        log.warn("convert", "Calibration token pool coverage insufficient for strict mode", .{
+        log.warn("convert", "Calibration token pool coverage insufficient", .{
             .required_tokens = requested,
             .loaded_tokens = tokens.items.len,
             .dataset = "NeelNanda/pile-10k",
@@ -469,8 +473,8 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
     return owned;
 }
 
-inline fn allowDeterministicCalibrationFallback(options: ConvertOptions, err: anyerror) bool {
-    return options.profile != .fast and options.calib_iters > 0 and err == error.CalibrationDataUnavailable;
+inline fn calibrationDatasetRequired(options: ConvertOptions) bool {
+    return options.calib_iters > 0;
 }
 
 /// Convert a transformer model to grouped-affine weights in MLX format (optionally quantized).
@@ -780,27 +784,16 @@ fn writeQuantizedWeights(
         calib_probe_only,
         calib_layer_window,
     );
-    var allow_deterministic_calibration_fallback = false;
     const token_pool = blk: {
         const loaded = loadCalibrationTokenPool(allocator, tokenizer_path, options) catch |err| {
-            if (options.profile != .fast and options.calib_iters > 0) {
-                if (allowDeterministicCalibrationFallback(options, err)) {
-                    allow_deterministic_calibration_fallback = true;
-                    log.warn("convert", "Calibration dataset unavailable; using deterministic block-input fallback activations", .{
-                        .err = @errorName(err),
-                        .dataset = "NeelNanda/pile-10k",
-                    });
-                    break :blk null;
-                }
-                return err;
-            }
+            if (calibrationDatasetRequired(options)) return err;
             log.warn("convert", "Failed to load calibration token pool; using deterministic block-input fallback activations", .{
                 .err = @errorName(err),
                 .dataset = "NeelNanda/pile-10k",
             });
             break :blk null;
         };
-        if (loaded == null and options.profile != .fast and options.calib_iters > 0 and !allow_deterministic_calibration_fallback) {
+        if (loaded == null and calibrationDatasetRequired(options)) {
             return error.CalibrationDataUnavailable;
         }
         break :blk loaded;
@@ -3952,21 +3945,17 @@ test "sorted tensor names maintain nondecreasing layer order" {
     }
 }
 
-test "allowDeterministicCalibrationFallback only applies to strict profiles with dataset unavailability" {
-    try std.testing.expect(allowDeterministicCalibrationFallback(.{
+test "calibrationDatasetRequired requires dataset whenever calibration iterations are enabled" {
+    try std.testing.expect(calibrationDatasetRequired(.{
         .profile = .best,
         .calib_iters = 500,
-    }, error.CalibrationDataUnavailable));
-    try std.testing.expect(!allowDeterministicCalibrationFallback(.{
+    }));
+    try std.testing.expect(calibrationDatasetRequired(.{
         .profile = .fast,
-        .calib_iters = 500,
-    }, error.CalibrationDataUnavailable));
-    try std.testing.expect(!allowDeterministicCalibrationFallback(.{
+        .calib_iters = 1,
+    }));
+    try std.testing.expect(!calibrationDatasetRequired(.{
         .profile = .best,
         .calib_iters = 0,
-    }, error.CalibrationDataUnavailable));
-    try std.testing.expect(!allowDeterministicCalibrationFallback(.{
-        .profile = .best,
-        .calib_iters = 500,
-    }, error.InvalidConfig));
+    }));
 }

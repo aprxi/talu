@@ -97,6 +97,10 @@ fn isCalibrationProbeOnly(options: ConvertOptions) bool {
     return options.profile == .custom and options.calib_iters > 0 and envFlagEnabled("TALU_CONVERT_CALIB_PROBE_ONLY");
 }
 
+inline fn calibrationDatasetRequired(options: ConvertOptions) bool {
+    return options.calib_iters > 0;
+}
+
 /// Convert a transformer model to MXFP8 (E4M3 + UE8M0 block-32 scales).
 /// Returns the output path (caller owns the memory).
 pub fn convertToMxfp8(
@@ -383,14 +387,14 @@ fn writeMxfp8Weights(
     var baseline_tensor_count: usize = 0;
     const token_pool = blk: {
         const loaded = loadCalibrationTokenPool(allocator, tokenizer_path, options) catch |err| {
-            if (options.profile != .fast and options.calib_iters > 0) return err;
+            if (calibrationDatasetRequired(options)) return err;
             log.warn("convert", "Failed to load calibration token pool; using deterministic block-input fallback activations", .{
                 .err = @errorName(err),
                 .dataset = "NeelNanda/pile-10k",
             });
             break :blk null;
         };
-        if (loaded == null and options.profile != .fast and options.calib_iters > 0) {
+        if (loaded == null and calibrationDatasetRequired(options)) {
             return error.CalibrationDataUnavailable;
         }
         break :blk loaded;
@@ -1381,7 +1385,7 @@ fn storeCalibrationTokenCache(cache_path: []const u8, tokens: []const u32) void 
 fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []const u8, options: ConvertOptions) !?[]u32 {
     if (tokenizer_path.len == 0) return null;
     if (options.calib_iters == 0) return null;
-    const strict_dataset_mode = options.profile != .fast and options.calib_iters > 0;
+    const strict_dataset_mode = calibrationDatasetRequired(options);
 
     const cache_path = calibrationCachePath(allocator, tokenizer_path, options) catch null;
     defer if (cache_path) |path| allocator.free(path);
@@ -1428,7 +1432,7 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
                 .rows = rows_per_page,
                 .err = @errorName(err),
             });
-            if (strict_dataset_mode and consecutive_failures >= 6) return error.CalibrationDataUnavailable;
+            if (strict_dataset_mode) return error.CalibrationDataUnavailable;
             if (consecutive_failures >= 6 and tokens.items.len == 0) return err;
             continue;
         };
@@ -1441,12 +1445,13 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
                 .rows = rows_per_page,
                 .err = @errorName(err),
             });
-            if (strict_dataset_mode and consecutive_failures >= 6) return error.CalibrationDataUnavailable;
+            if (strict_dataset_mode) return error.CalibrationDataUnavailable;
             if (consecutive_failures >= 6 and tokens.items.len == 0) return err;
             continue;
         };
         if (appended == 0) {
             consecutive_failures += 1;
+            if (strict_dataset_mode) return error.CalibrationDataUnavailable;
             if (consecutive_failures >= 6 and tokens.items.len > 0) break;
             continue;
         }
@@ -1454,7 +1459,7 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
     }
 
     if (strict_dataset_mode and tokens.items.len < requested) {
-        log.warn("convert", "Calibration token pool coverage insufficient for strict mode", .{
+        log.warn("convert", "Calibration token pool coverage insufficient", .{
             .required_tokens = requested,
             .loaded_tokens = tokens.items.len,
             .dataset = "NeelNanda/pile-10k",
@@ -3480,6 +3485,21 @@ test "calibrationOptimizerFromEnv maps defaults per profile" {
     try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.good));
     try std.testing.expectEqual(CalibrationOptimizer.clip_search, calibrationOptimizerFromEnv(.best));
     try std.testing.expectEqual(CalibrationOptimizer.search, calibrationOptimizerFromEnv(.custom));
+}
+
+test "calibrationDatasetRequired requires dataset whenever calibration iterations are enabled" {
+    try std.testing.expect(calibrationDatasetRequired(.{
+        .profile = .best,
+        .calib_iters = 500,
+    }));
+    try std.testing.expect(calibrationDatasetRequired(.{
+        .profile = .fast,
+        .calib_iters = 1,
+    }));
+    try std.testing.expect(!calibrationDatasetRequired(.{
+        .profile = .best,
+        .calib_iters = 0,
+    }));
 }
 
 test "activationRoleForTensorName maps attention and ffn tensors" {
