@@ -360,7 +360,7 @@ pub(super) struct ConvertArgs {
     pub scheme: String,
 
     /// Quality profile (best|good|balanced|fast|custom)
-    #[arg(long, default_value = "best", value_name = "PROFILE", num_args = 1)]
+    #[arg(long, default_value = "fast", value_name = "PROFILE", num_args = 1)]
     pub profile: String,
 
     /// Deterministic seed for conversion calibration/search
@@ -1194,6 +1194,7 @@ mod tests {
         match cli.command {
             Some(Commands::Convert(args)) => {
                 assert_eq!(args.scheme, "mxfp8");
+                assert_eq!(args.profile, "fast");
                 assert_eq!(args.seed, 1234);
             }
             _ => panic!("expected convert command"),

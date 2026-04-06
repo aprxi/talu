@@ -167,6 +167,14 @@ fn fetchDatasetRowsJson(allocator: std.mem.Allocator, offset: usize, length: usi
     });
 }
 
+fn fetchDatasetFirstRowsJson(allocator: std.mem.Allocator) ![]u8 {
+    const url = "https://datasets-server.huggingface.co/first-rows?dataset=NeelNanda/pile-10k&config=default&split=train";
+    return http.fetch(allocator, url, .{
+        .user_agent = "talu-convert/1.0",
+        .max_response_bytes = calibration_rows_max_bytes,
+    });
+}
+
 fn fetchDatasetRowsJsonWithRetry(
     allocator: std.mem.Allocator,
     base_offset: usize,
@@ -186,6 +194,28 @@ fn fetchDatasetRowsJsonWithRetry(
             }
             if (attempt + 1 == max_attempts) return err;
             std.Thread.sleep(@as(u64, @intCast(120 + attempt * 120)) * std.time.ns_per_ms);
+            continue;
+        };
+        return payload;
+    }
+    return error.HttpError;
+}
+
+fn fetchDatasetFirstRowsJsonWithRetry(
+    allocator: std.mem.Allocator,
+    seed: u64,
+) ![]u8 {
+    const max_attempts: usize = 4;
+    var attempt: usize = 0;
+    while (attempt < max_attempts) : (attempt += 1) {
+        const payload = fetchDatasetFirstRowsJson(allocator) catch |err| {
+            switch (err) {
+                error.NotFound, error.Unauthorized => return err,
+                else => {},
+            }
+            if (attempt + 1 == max_attempts) return err;
+            const jitter_ms: usize = @intCast(groupedMix64(seed +% @as(u64, @intCast(attempt)) *% 0x9e3779b97f4a7c15) % 120);
+            std.Thread.sleep(@as(u64, @intCast(120 + attempt * 120 + jitter_ms)) * std.time.ns_per_ms);
             continue;
         };
         return payload;
@@ -395,6 +425,34 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
         consecutive_failures = 0;
     }
 
+    if (tokens.items.len < target_tokens) {
+        const first_rows_json = fetchDatasetFirstRowsJsonWithRetry(allocator, options.calib_seed) catch |err| blk: {
+            log.warn("convert", "Calibration first-rows fetch failed", .{
+                .dataset = "NeelNanda/pile-10k",
+                .err = @errorName(err),
+            });
+            break :blk null;
+        };
+        if (first_rows_json) |rows_json| {
+            defer allocator.free(rows_json);
+            const appended = appendTokenizedRows(allocator, &tokenizer, rows_json, &tokens, target_tokens) catch |err| blk: {
+                log.warn("convert", "Calibration first-rows parse/tokenize failed", .{
+                    .dataset = "NeelNanda/pile-10k",
+                    .err = @errorName(err),
+                });
+                break :blk 0;
+            };
+            if (appended > 0) {
+                log.info("convert", "Loaded fallback calibration rows", .{
+                    .dataset = "NeelNanda/pile-10k",
+                    .source = "first-rows",
+                    .appended_tokens = appended,
+                    .total_tokens = tokens.items.len,
+                });
+            }
+        }
+    }
+
     if (strict_dataset_mode and tokens.items.len < requested) {
         log.warn("convert", "Calibration token pool coverage insufficient for strict mode", .{
             .required_tokens = requested,
@@ -409,6 +467,10 @@ fn loadCalibrationTokenPool(allocator: std.mem.Allocator, tokenizer_path: []cons
         storeCalibrationTokenCache(path, owned);
     }
     return owned;
+}
+
+inline fn allowDeterministicCalibrationFallback(options: ConvertOptions, err: anyerror) bool {
+    return options.profile != .fast and options.calib_iters > 0 and err == error.CalibrationDataUnavailable;
 }
 
 /// Convert a transformer model to grouped-affine weights in MLX format (optionally quantized).
@@ -718,16 +780,27 @@ fn writeQuantizedWeights(
         calib_probe_only,
         calib_layer_window,
     );
+    var allow_deterministic_calibration_fallback = false;
     const token_pool = blk: {
         const loaded = loadCalibrationTokenPool(allocator, tokenizer_path, options) catch |err| {
-            if (options.profile != .fast and options.calib_iters > 0) return err;
+            if (options.profile != .fast and options.calib_iters > 0) {
+                if (allowDeterministicCalibrationFallback(options, err)) {
+                    allow_deterministic_calibration_fallback = true;
+                    log.warn("convert", "Calibration dataset unavailable; using deterministic block-input fallback activations", .{
+                        .err = @errorName(err),
+                        .dataset = "NeelNanda/pile-10k",
+                    });
+                    break :blk null;
+                }
+                return err;
+            }
             log.warn("convert", "Failed to load calibration token pool; using deterministic block-input fallback activations", .{
                 .err = @errorName(err),
                 .dataset = "NeelNanda/pile-10k",
             });
             break :blk null;
         };
-        if (loaded == null and options.profile != .fast and options.calib_iters > 0) {
+        if (loaded == null and options.profile != .fast and options.calib_iters > 0 and !allow_deterministic_calibration_fallback) {
             return error.CalibrationDataUnavailable;
         }
         break :blk loaded;
@@ -1558,25 +1631,49 @@ noinline fn buildGroupedBlockInputMatrix(
 
     const lookup = findGroupedEmbeddingInputLookup(source_tensors);
     if (lookup == null and require_embedding_lookup) return error.CalibrationDataUnavailable;
-    for (0..input_samples) |p| {
-        const token = tokenFromPool(token_pool, p, seed);
-        for (0..cols) |col| {
-            const idx = p * cols + col;
-            if (lookup) |emb| {
-                if (emb.value(token, col)) |v0| {
-                    if (col < emb.input_dim) {
-                        values[idx] = v0;
-                    } else {
-                        const mixed_col = (col + p) % emb.input_dim;
-                        const v1 = emb.value(token, mixed_col) orelse v0;
-                        values[idx] = (v0 * 0.75) + (v1 * 0.25);
+
+    const FillCtx = struct {
+        values: []f32,
+        cols: usize,
+        input_samples: usize,
+        token_pool: ?[]const u32,
+        seed: u64,
+        lookup: ?GroupedEmbeddingInputLookup,
+    };
+    var fill_ctx = FillCtx{
+        .values = values,
+        .cols = cols,
+        .input_samples = input_samples,
+        .token_pool = token_pool,
+        .seed = seed,
+        .lookup = lookup,
+    };
+    const FillFn = struct {
+        fn run(start: usize, end: usize, ctx: *FillCtx) void {
+            for (start..end) |p| {
+                if (p >= ctx.input_samples) break;
+                const token = tokenFromPool(ctx.token_pool, p, ctx.seed);
+                for (0..ctx.cols) |col| {
+                    const idx = p * ctx.cols + col;
+                    if (ctx.lookup) |emb| {
+                        if (emb.value(token, col)) |v0| {
+                            if (col < emb.input_dim) {
+                                ctx.values[idx] = v0;
+                            } else {
+                                const mixed_col = (col + p) % emb.input_dim;
+                                const v1 = emb.value(token, mixed_col) orelse v0;
+                                ctx.values[idx] = (v0 * 0.75) + (v1 * 0.25);
+                            }
+                            continue;
+                        }
                     }
-                    continue;
+                    ctx.values[idx] = tokenFallbackActivation(token, p, col, ctx.seed);
                 }
             }
-            values[idx] = tokenFallbackActivation(token, p, col, seed);
         }
-    }
+    };
+    const pool = parallel.global();
+    pool.parallelForCompute(input_samples, FillFn.run, &fill_ctx);
 
     return .{
         .values = values,
@@ -3076,7 +3173,7 @@ fn quantizeGroupedAffineTensor(
     };
 
     const pool = parallel.global();
-    pool.parallelFor(row_count, quantizeRowSlice, &quant_ctx);
+    pool.parallelForCompute(row_count, quantizeRowSlice, &quant_ctx);
 
     // Add tensors to builder
     const quant_dtype: DType = if (quant_bits == 4) .grouped_affine_u4 else .grouped_affine_u8;
@@ -3853,4 +3950,23 @@ test "sorted tensor names maintain nondecreasing layer order" {
         }
         prev_layer = layer;
     }
+}
+
+test "allowDeterministicCalibrationFallback only applies to strict profiles with dataset unavailability" {
+    try std.testing.expect(allowDeterministicCalibrationFallback(.{
+        .profile = .best,
+        .calib_iters = 500,
+    }, error.CalibrationDataUnavailable));
+    try std.testing.expect(!allowDeterministicCalibrationFallback(.{
+        .profile = .fast,
+        .calib_iters = 500,
+    }, error.CalibrationDataUnavailable));
+    try std.testing.expect(!allowDeterministicCalibrationFallback(.{
+        .profile = .best,
+        .calib_iters = 0,
+    }, error.CalibrationDataUnavailable));
+    try std.testing.expect(!allowDeterministicCalibrationFallback(.{
+        .profile = .best,
+        .calib_iters = 500,
+    }, error.InvalidConfig));
 }

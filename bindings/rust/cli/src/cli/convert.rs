@@ -488,7 +488,7 @@ Arguments:
 
 Options:
   --scheme NAME     Quantization scheme (default: gaf4_64)
-  --profile NAME    Quality profile: best|good|balanced|fast|custom (default: best)
+  --profile NAME    Quality profile: best|good|balanced|fast|custom (default: fast)
   --seed N          Deterministic calibration seed (default: 42)
   --output DIR      Output directory (default: $TALU_HOME/models)
   -f, --force       Overwrite existing output

@@ -440,7 +440,7 @@ pub const ConvertOptions = extern struct {
     /// If true, resolve scheme from platform/quant instead of using scheme directly.
     use_platform_quant: bool = false,
     /// Calibration profile for MXFP8/NVFP4 conversion.
-    calibration_profile: QualityProfile = .best,
+    calibration_profile: QualityProfile = .fast,
     /// Deterministic calibration seed.
     calibration_seed: u64 = 42,
     /// Explicit calibration iteration override.

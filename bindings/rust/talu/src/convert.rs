@@ -254,9 +254,8 @@ pub fn convert(
     }
     c_options.force = options.force;
     c_options.return_model_id = options.return_model_id;
-    if let Some(profile) = options.calibration_profile {
-        c_options.calibration_profile = map_profile_to_sys(profile);
-    }
+    c_options.calibration_profile =
+        map_profile_to_sys(options.calibration_profile.unwrap_or(ConvertProfile::Fast));
     if let Some(seed) = options.calibration_seed {
         c_options.calibration_seed = seed;
     }
