@@ -1337,6 +1337,20 @@ pub const Backend = union(enum) {
         };
     }
 
+    pub fn supportsSchedulerBackendTopKStreamingRoute(
+        self: *const Backend,
+        sampling_config: *const cpu.sampling.SamplingConfig,
+    ) bool {
+        return switch (self.*) {
+            .cpu => false,
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "supportsSchedulerBackendTopKStreamingRoute"))
+                b.supportsSchedulerBackendTopKStreamingRoute(sampling_config)
+            else
+                false,
+            .cuda => false,
+        };
+    }
+
     pub fn decodeTopKCandidates(
         self: *Backend,
         slot_index: usize,
@@ -1355,6 +1369,36 @@ pub const Backend = union(enum) {
                 b.decodeTopKCandidates(slot_index, token, top_k, candidate_logits_out, candidate_ids_out)
             else
                 error.InvalidArgument,
+        };
+    }
+
+    pub fn decodeTopKStreaming(
+        self: *Backend,
+        first_token: u32,
+        start_position: usize,
+        max_tokens: usize,
+        eos_token_ids: []const u32,
+        sampling_config: *const cpu.sampling.SamplingConfig,
+        output_tokens: []u32,
+        callback: ?*const fn (u32, ?*anyopaque) void,
+        callback_data: ?*anyopaque,
+    ) !usize {
+        return switch (self.*) {
+            .cpu => error.InvalidArgument,
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "decodeTopKStreaming"))
+                b.decodeTopKStreaming(
+                    first_token,
+                    start_position,
+                    max_tokens,
+                    eos_token_ids,
+                    sampling_config,
+                    output_tokens,
+                    callback,
+                    callback_data,
+                )
+            else
+                error.InvalidArgument,
+            .cuda => error.InvalidArgument,
         };
     }
 

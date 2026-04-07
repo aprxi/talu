@@ -708,6 +708,13 @@ pub const LocalEngine = struct {
         }
 
         // Create backend (progress bar emitted from buildBlocks inside)
+        progress.addLine(
+            1,
+            "Loading",
+            2,
+            "Initializing backend (large models may take longer)...",
+            null,
+        );
         var backend_options = backend_init_options;
         backend_options.metal = .{
             .model_path = resolved_model_path,
@@ -715,6 +722,7 @@ pub const LocalEngine = struct {
         };
         var compute_backend = try Backend.init(allocator, loaded_model, backend_options, progress);
         errdefer compute_backend.deinit();
+        progress.updateLine(1, 1, "Backend initialized, preparing runtime...");
         const scheduler_state_descriptors = try collectSchedulerStateDescriptors(allocator, loaded_model);
         errdefer if (scheduler_state_descriptors.len > 0) allocator.free(scheduler_state_descriptors);
 

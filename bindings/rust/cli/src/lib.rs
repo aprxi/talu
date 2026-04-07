@@ -6,6 +6,7 @@ pub(crate) mod hf;
 pub(crate) mod model_selector;
 pub(crate) mod pin_store;
 mod provider;
+pub(crate) mod quant_scheme;
 pub mod server;
 pub(crate) mod tui_common;
 

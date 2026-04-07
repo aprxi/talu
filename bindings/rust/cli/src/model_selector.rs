@@ -17,6 +17,7 @@ use ratatui::Terminal;
 
 use talu::CacheOrigin;
 
+use crate::quant_scheme as quant_scheme_display;
 use crate::tui_common::{
     enter_tui, format_date, format_size, highlight_text, leave_tui, truncate_name,
 };
@@ -76,7 +77,12 @@ fn get_model_info_for_display(cache_path: &str) -> (String, String) {
     } else {
         normalize_model_type(&info.model_type)
     };
-    let quant = format_quant(info.quant_method, info.quant_bits, info.quant_group_size);
+    let quant = quant_scheme_display::format_quant_scheme_for_path(
+        cache_path,
+        info.quant_method,
+        info.quant_bits,
+        info.quant_group_size,
+    );
     (model_type, quant)
 }
 
@@ -113,18 +119,6 @@ fn capitalize_first(s: &str) -> String {
         chars[0] = chars[0].to_ascii_uppercase();
     }
     chars.into_iter().collect()
-}
-
-fn format_quant(method: talu::QuantMethod, bits: i32, group_size: i32) -> String {
-    match method {
-        talu::QuantMethod::None => "F16".into(),
-        talu::QuantMethod::Gaffine | talu::QuantMethod::Native => {
-            format!("GAF{}_{}", bits, group_size)
-        }
-        talu::QuantMethod::Mxfp4 => "MXFP4".into(),
-        talu::QuantMethod::Fp8 => "FP8".into(),
-        talu::QuantMethod::Mxfp8 => "MXFP8".into(),
-    }
 }
 
 // ---------------------------------------------------------------------------

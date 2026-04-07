@@ -4,10 +4,11 @@ use std::io::{self, IsTerminal};
 
 use anyhow::{anyhow, bail, Result};
 
-use talu::{InferenceBackend, QuantMethod};
+use talu::InferenceBackend;
 
 use crate::pin_store::PinStore;
 use crate::provider::{get_provider, is_provider_prefix, provider_from_prefix};
+use crate::quant_scheme as quant_scheme_display;
 
 use super::repo::{repo_list_files, repo_list_models, resolve_model_for_inference};
 use super::util::{capitalize_first, format_date, format_size, truncate_str};
@@ -427,27 +428,14 @@ fn get_model_info_for_display(cache_path: &str) -> (String, String) {
     };
 
     // Determine quantization scheme name
-    let quant = format_quant_scheme(info.quant_method, info.quant_bits, info.quant_group_size);
+    let quant = quant_scheme_display::format_quant_scheme_for_path(
+        cache_path,
+        info.quant_method,
+        info.quant_bits,
+        info.quant_group_size,
+    );
 
     (model_type, quant)
-}
-
-/// Format quantization as a proper scheme name
-pub(super) fn format_quant_scheme(method: QuantMethod, bits: i32, group_size: i32) -> String {
-    match method {
-        QuantMethod::None => "F16".to_string(),
-        QuantMethod::Gaffine => {
-            // GAF{bits}_{group_size} format
-            format!("GAF{}_{}", bits, group_size)
-        }
-        QuantMethod::Mxfp4 => "MXFP4".to_string(),
-        QuantMethod::Native => {
-            // Native format (no longer used, fallback to GAF naming)
-            format!("GAF{}_{}", bits, group_size)
-        }
-        QuantMethod::Fp8 => "FP8".to_string(),
-        QuantMethod::Mxfp8 => "MXFP8".to_string(),
-    }
 }
 
 /// Normalize model type for consistent display
@@ -546,7 +534,12 @@ pub(super) fn cmd_describe(args: DescribeArgs) -> Result<()> {
     }
 
     // Human-readable output
-    let quant_str = format_quant_scheme(info.quant_method, info.quant_bits, info.quant_group_size);
+    let quant_str = quant_scheme_display::format_quant_scheme_for_path(
+        &model_path,
+        info.quant_method,
+        info.quant_bits,
+        info.quant_group_size,
+    );
 
     println!("MODEL INFO");
     println!(

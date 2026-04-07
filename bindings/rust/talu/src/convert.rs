@@ -254,9 +254,8 @@ pub fn convert(
     }
     c_options.force = options.force;
     c_options.return_model_id = options.return_model_id;
-    if let Some(profile) = options.calibration_profile {
-        c_options.calibration_profile = map_profile_to_sys(profile);
-    }
+    c_options.calibration_profile =
+        map_profile_to_sys(options.calibration_profile.unwrap_or(ConvertProfile::Fast));
     if let Some(seed) = options.calibration_seed {
         c_options.calibration_seed = seed;
     }
@@ -331,13 +330,22 @@ mod tests {
 
     #[test]
     fn map_profile_to_sys_is_stable() {
-        assert_eq!(map_profile_to_sys(ConvertProfile::Best), QualityProfile::Best);
-        assert_eq!(map_profile_to_sys(ConvertProfile::Good), QualityProfile::Good);
+        assert_eq!(
+            map_profile_to_sys(ConvertProfile::Best),
+            QualityProfile::Best
+        );
+        assert_eq!(
+            map_profile_to_sys(ConvertProfile::Good),
+            QualityProfile::Good
+        );
         assert_eq!(
             map_profile_to_sys(ConvertProfile::Balanced),
             QualityProfile::Balanced
         );
-        assert_eq!(map_profile_to_sys(ConvertProfile::Fast), QualityProfile::Fast);
+        assert_eq!(
+            map_profile_to_sys(ConvertProfile::Fast),
+            QualityProfile::Fast
+        );
         assert_eq!(
             map_profile_to_sys(ConvertProfile::Custom),
             QualityProfile::Custom

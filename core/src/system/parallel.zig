@@ -15,6 +15,60 @@ const CACHE_LINE: usize = 64;
 const MAX_THREADS: usize = 64;
 const FLOATS_PER_CACHE_LINE: usize = 16;
 
+fn isAsciiDigits(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    for (bytes) |ch| {
+        if (ch < '0' or ch > '9') return false;
+    }
+    return true;
+}
+
+fn parseCpuDirIndex(name: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, name, "cpu")) return null;
+    const suffix = name["cpu".len..];
+    if (!isAsciiDigits(suffix)) return null;
+    return std.fmt.parseInt(usize, suffix, 10) catch null;
+}
+
+fn readTopologyId(cpu_dir: std.fs.Dir, relative_path: []const u8) ?u32 {
+    const bytes = cpu_dir.readFileAlloc(std.heap.page_allocator, relative_path, 64) catch return null;
+    defer std.heap.page_allocator.free(bytes);
+
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(u32, trimmed, 10) catch null;
+}
+
+fn detectPhysicalCoreCountLinux() ?usize {
+    if (builtin.os.tag != .linux) return null;
+
+    var cpu_dir = std.fs.openDirAbsolute("/sys/devices/system/cpu", .{ .iterate = true }) catch return null;
+    defer cpu_dir.close();
+
+    var unique_cores = std.AutoHashMap(u64, void).init(std.heap.page_allocator);
+    defer unique_cores.deinit();
+
+    var it = cpu_dir.iterate();
+    while ((it.next() catch null)) |entry| {
+        if (entry.kind != .directory) continue;
+        _ = parseCpuDirIndex(entry.name) orelse continue;
+
+        var core_path_buf: [128]u8 = undefined;
+        const core_path = std.fmt.bufPrint(&core_path_buf, "{s}/topology/core_id", .{entry.name}) catch continue;
+        const core_id = readTopologyId(cpu_dir, core_path) orelse continue;
+
+        var pkg_path_buf: [128]u8 = undefined;
+        const pkg_path = std.fmt.bufPrint(&pkg_path_buf, "{s}/topology/physical_package_id", .{entry.name}) catch continue;
+        const package_id = readTopologyId(cpu_dir, pkg_path) orelse 0;
+
+        const key = (@as(u64, package_id) << 32) | @as(u64, core_id);
+        _ = unique_cores.getOrPut(key) catch return null;
+    }
+
+    if (unique_cores.count() == 0) return null;
+    return unique_cores.count();
+}
+
 /// Detect the number of physical CPU cores (excluding hyperthreads).
 /// On x86, uses a heuristic assuming SMT (2 threads per physical core).
 /// On macOS, uses sysctl. On other platforms, falls back to logical core count.
@@ -29,6 +83,10 @@ fn getPhysicalCoreCount() usize {
         if (rc == 0 and physical > 0) {
             return @intCast(physical);
         }
+    }
+
+    if (detectPhysicalCoreCountLinux()) |physical| {
+        return @max(@as(usize, 1), @min(physical, logical_cores));
     }
 
     // x86/x86_64: assume hyperthreading (2 threads per core)

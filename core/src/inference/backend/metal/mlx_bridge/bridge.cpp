@@ -39,10 +39,13 @@ size_t g_wired_limit_previous = 0;
 bool g_wired_limit_active = false;
 std::mutex g_rng_mutex;
 size_t g_active_ctx_count = 0;
+thread_local size_t g_fused_lm_head_argmax_hits = 0;
 thread_local std::vector<array> g_decode_batch_logits_flat_scratch;
 thread_local std::vector<array> g_prefill_batch_logits_flat_scratch;
 thread_local std::vector<array> g_decode_topk_batch_logits_flat_scratch;
 thread_local std::vector<array> g_decode_topk_batch_ids_flat_scratch;
+size_t g_qmm_attempts = 0;
+size_t g_qmm_success = 0;
 
 void enter_rng_epoch(int32_t seed) {
     std::lock_guard<std::mutex> lock(g_rng_mutex);
@@ -87,6 +90,21 @@ void release_wired_limit() {
 }
 
 using CompiledTopKFn = std::function<std::vector<array>(const std::vector<array>&)>;
+using CompiledPenalizedSampleFn = std::function<std::vector<array>(const std::vector<array>&)>;
+using CompiledSampleFn = std::function<std::vector<array>(const std::vector<array>&)>;
+struct StreamSamplingConfig {
+    float temperature = 1.0f;
+    int top_k = 20;
+    float top_p = 0.95f;
+    float min_p = 0.0f;
+};
+struct TopKCandidateBatch {
+    array logits; // [1,1,k]
+    array indices; // [1,1,k]
+    int k = 0;
+};
+array apply_top_p_filter(const array& logits, float top_p);
+bool env_truthy(const char* name, bool fallback);
 
 std::shared_ptr<const CompiledTopKFn> compiled_topk_candidates(int k) {
     static std::unordered_map<int, std::shared_ptr<const CompiledTopKFn>> cache;
@@ -188,13 +206,6 @@ std::shared_ptr<const CompiledTopKFn> compiled_topk_candidates_rows(int k) {
     return inserted.first->second;
 }
 
-struct StreamSamplingConfig {
-    float temperature = 1.0f;
-    int top_k = 20;
-    float top_p = 0.95f;
-    float min_p = 0.0f;
-};
-
 array apply_top_p_filter(const array& logits, float top_p) {
     if (logits.ndim() != 3) {
         throw std::runtime_error("apply_top_p_filter expects rank-3 logits");
@@ -218,6 +229,55 @@ array apply_top_p_filter(const array& logits, float top_p) {
     return where(cumulative_probs > (1.0f - top_p), logits, neg_inf);
 }
 
+TopKCandidateBatch extract_topk_candidates_from_last_logits(const array& logits_last, int requested_top_k) {
+    if (logits_last.ndim() != 3) {
+        throw std::runtime_error("extract_topk_candidates_from_last_logits expects rank-3 logits");
+    }
+
+    const int vocab = logits_last.shape(2);
+    const int k = std::min(requested_top_k, vocab);
+    if (k <= 0) {
+        throw std::runtime_error("extract_topk_candidates_from_last_logits invalid top_k");
+    }
+
+    // This is the exact insertion point for a future fused lm_head+top_k path.
+    // Today it still uses the existing compiled full-logits top-k extraction so
+    // decode semantics remain unchanged.
+    auto topk_fn = compiled_topk_candidates(k);
+    const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
+    if (topk_outputs.size() != 2) {
+        throw std::runtime_error("extract_topk_candidates_from_last_logits: invalid top-k output");
+    }
+
+    return TopKCandidateBatch{
+        .logits = reshape(topk_outputs[0], {1, 1, k}),
+        .indices = reshape(topk_outputs[1], {1, 1, k}),
+        .k = k,
+    };
+}
+
+array sample_token_from_topk_candidates(const TopKCandidateBatch& candidates, const StreamSamplingConfig& cfg) {
+    if (candidates.k <= 0) {
+        throw std::runtime_error("sample_token_from_topk_candidates invalid top_k");
+    }
+    if (candidates.logits.ndim() != 3 || candidates.indices.ndim() != 3) {
+        throw std::runtime_error("sample_token_from_topk_candidates expects rank-3 candidates");
+    }
+
+    array sampled_logits = candidates.logits;
+    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+        sampled_logits = apply_top_p_filter(sampled_logits, cfg.top_p);
+    }
+
+    if (std::fabs(cfg.temperature - 1.0f) > 1.0e-6f) {
+        sampled_logits = sampled_logits * array(1.0f / cfg.temperature, sampled_logits.dtype());
+    }
+    const array sampled_local_idx = random::categorical(sampled_logits, -1); // [1,1]
+    const array sampled_local_idx_3d = reshape(sampled_local_idx, {1, 1, 1});
+    const array sampled_token_3d = take_along_axis(candidates.indices, sampled_local_idx_3d, -1); // [1,1,1]
+    return reshape(sampled_token_3d, {1, 1});
+}
+
 array sample_token_from_logits(const array& logits_last, const StreamSamplingConfig& cfg) {
     if (logits_last.ndim() != 3) {
         throw std::runtime_error("sample_token_from_logits expects rank-3 logits");
@@ -228,29 +288,218 @@ array sample_token_from_logits(const array& logits_last, const StreamSamplingCon
     if (cfg.min_p != 0.0f) {
         throw std::runtime_error("min_p != 0 is not yet supported by decode_topk_stream");
     }
+    return sample_token_from_topk_candidates(
+        extract_topk_candidates_from_last_logits(logits_last, cfg.top_k),
+        cfg
+    );
+}
 
-    const int vocab = logits_last.shape(2);
-    const int k = std::min(cfg.top_k, vocab);
-    if (k <= 0) {
-        throw std::runtime_error("sample_token_from_logits invalid top_k");
+std::shared_ptr<const CompiledSampleFn> compiled_sampling_step(const StreamSamplingConfig& cfg) {
+    auto format_float = [](float value) -> std::string {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.8g", value);
+        return std::string(buf);
+    };
+    const std::string signature =
+        "k=" + std::to_string(cfg.top_k) +
+        "|temp=" + format_float(cfg.temperature) +
+        "|top_p=" + format_float(cfg.top_p);
+
+    static std::unordered_map<std::string, std::shared_ptr<const CompiledSampleFn>> cache;
+    static std::mutex cache_mutex;
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(signature);
+    if (it != cache.end()) return it->second;
+
+    auto fn = compile(
+        [cfg](const std::vector<array>& inputs) {
+            if (inputs.size() != 1) {
+                throw std::runtime_error("compiled_sampling_step expects logits input");
+            }
+            const array logits_last = astype(inputs.at(0), float32); // [1,1,V]
+            if (logits_last.ndim() != 3) {
+                throw std::runtime_error("compiled_sampling_step expects rank-3 logits");
+            }
+
+            array next_token = array(0.0f);
+            const int vocab = logits_last.shape(2);
+            const int k = std::min(cfg.top_k, vocab);
+            if (cfg.temperature <= 0.0f || k <= 1) {
+                next_token = argmax(logits_last, -1); // [1,1]
+            } else {
+                array top_k_indices = array(0.0f);
+                array top_k_logits = array(0.0f);
+                if (k == 1) {
+                    const array top_idx = argmax(logits_last, -1); // [1,1]
+                    top_k_indices = reshape(astype(top_idx, int32), {1, 1, 1});
+                    top_k_logits = take_along_axis(logits_last, top_k_indices, -1); // [1,1,1]
+                } else {
+                    const array partitioned_indices = argpartition(logits_last, -k, -1);
+                    const array top_k_selector = arange(vocab - k, vocab, 1, int32);
+                    top_k_indices = take(partitioned_indices, top_k_selector, -1); // [1,1,k]
+                    top_k_logits = take_along_axis(logits_last, top_k_indices, -1); // [1,1,k]
+                }
+
+                array sampled_logits = reshape(top_k_logits, {1, 1, k}); // [1,1,k]
+                const array topk_indices = reshape(astype(top_k_indices, int32), {1, 1, k}); // [1,1,k]
+                if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+                    sampled_logits = apply_top_p_filter(sampled_logits, cfg.top_p);
+                }
+                if (std::fabs(cfg.temperature - 1.0f) > 1.0e-6f) {
+                    sampled_logits = sampled_logits * array(1.0f / cfg.temperature, sampled_logits.dtype());
+                }
+                const array sampled_local_idx = random::categorical(sampled_logits, -1); // [1,1]
+                const array sampled_local_idx_3d = reshape(sampled_local_idx, {1, 1, 1});
+                const array sampled_token_3d = take_along_axis(topk_indices, sampled_local_idx_3d, -1); // [1,1,1]
+                next_token = reshape(sampled_token_3d, {1, 1});
+            }
+            return std::vector<array>{astype(next_token, int32)};
+        },
+        true
+    );
+
+    auto inserted = cache.emplace(
+        signature,
+        std::make_shared<const CompiledSampleFn>(std::move(fn))
+    );
+    return inserted.first->second;
+}
+
+std::shared_ptr<const CompiledPenalizedSampleFn> compiled_penalized_sampling_step(
+    const StreamSamplingConfig& cfg,
+    float repetition_penalty,
+    float presence_penalty,
+    float frequency_penalty
+) {
+    if (cfg.min_p != 0.0f) {
+        throw std::runtime_error("min_p != 0 is not yet supported by decode_topk_stream");
     }
 
-    // Follow scheduler semantics: top-k candidate extraction first, then
-    // top-p sampling over the K candidate logits.
-    const array topk_part = argpartition(-logits_last, k - 1, -1);
-    const array topk_select = arange(0, k, 1, int32);
-    const array topk_indices = take(topk_part, topk_select, -1); // [1,1,k]
-    array sampled_logits = take_along_axis(logits_last, topk_indices, -1); // [1,1,k]
+    char key_buf[256];
+    std::snprintf(
+        key_buf,
+        sizeof(key_buf),
+        "k=%d|temp=%.8g|top_p=%.8g|rep=%.8g|pres=%.8g|freq=%.8g",
+        cfg.top_k,
+        cfg.temperature,
+        cfg.top_p,
+        repetition_penalty,
+        presence_penalty,
+        frequency_penalty
+    );
+    const std::string cache_key(key_buf);
 
-    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
-        sampled_logits = apply_top_p_filter(sampled_logits, cfg.top_p);
-    }
+    static std::unordered_map<std::string, std::shared_ptr<const CompiledPenalizedSampleFn>> cache;
+    static std::mutex cache_mutex;
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(cache_key);
+    if (it != cache.end()) return it->second;
 
-    sampled_logits = sampled_logits * array(1.0f / cfg.temperature, sampled_logits.dtype());
-    const array sampled_local_idx = random::categorical(sampled_logits, -1); // [1,1]
-    const array sampled_local_idx_3d = reshape(sampled_local_idx, {1, 1, 1});
-    const array sampled_token_3d = take_along_axis(topk_indices, sampled_local_idx_3d, -1); // [1,1,1]
-    return reshape(sampled_token_3d, {1, 1});
+    auto fn = compile(
+        [cfg, repetition_penalty, presence_penalty, frequency_penalty](const std::vector<array>& inputs) {
+            if (inputs.size() < 2) {
+                throw std::runtime_error("compiled_penalized_sampling_step expects logits and token counts");
+            }
+            const array& logits_last = inputs.at(0); // [1,1,V]
+            const array& token_counts = inputs.at(1); // [1,1,V]
+            if (logits_last.ndim() != 3 || token_counts.ndim() != 3) {
+                throw std::runtime_error("compiled_penalized_sampling_step expects rank-3 inputs");
+            }
+            if (logits_last.shape(0) != 1 || logits_last.shape(1) != 1) {
+                throw std::runtime_error("compiled_penalized_sampling_step expects logits shape [1,1,V]");
+            }
+            if (token_counts.shape(0) != 1 || token_counts.shape(1) != 1) {
+                throw std::runtime_error("compiled_penalized_sampling_step expects counts shape [1,1,V]");
+            }
+            if (token_counts.shape(2) != logits_last.shape(2)) {
+                throw std::runtime_error("compiled_penalized_sampling_step counts/logits vocab mismatch");
+            }
+
+            const bool has_repetition = repetition_penalty != 1.0f;
+            const bool has_additive = presence_penalty != 0.0f || frequency_penalty != 0.0f;
+            const array zero_f = array(0.0f, float32);
+            array sampling_logits = logits_last;
+            const array seen_mask = token_counts > zero_f;
+
+            if (has_repetition) {
+                const array rep_log = array(std::log(repetition_penalty), float32);
+                const array repetition_scales = exp(token_counts * rep_log);
+                const array repetition_adjusted = where(
+                    logits_last > zero_f,
+                    logits_last / repetition_scales,
+                    logits_last * repetition_scales
+                );
+                sampling_logits = where(seen_mask, repetition_adjusted, sampling_logits);
+            }
+
+            if (has_additive) {
+                array additive_penalties = zeros_like(token_counts);
+                if (presence_penalty != 0.0f) {
+                    additive_penalties = additive_penalties +
+                        (astype(seen_mask, float32) * array(presence_penalty, float32));
+                }
+                if (frequency_penalty != 0.0f) {
+                    additive_penalties = additive_penalties +
+                        (token_counts * array(frequency_penalty, float32));
+                }
+                sampling_logits = sampling_logits - additive_penalties;
+            }
+
+            array next_token = array(0.0f);
+            const int vocab = sampling_logits.shape(2);
+            const int k = std::min(cfg.top_k, vocab);
+            if (k <= 0) {
+                throw std::runtime_error("compiled_penalized_sampling_step invalid top_k");
+            }
+
+            if (cfg.temperature <= 0.0f || k <= 1) {
+                next_token = argmax(sampling_logits, -1); // [1,1]
+            } else {
+                array top_k_indices = array(0.0f);
+                array top_k_logits = array(0.0f);
+                if (k == 1) {
+                    const array top_idx = argmax(sampling_logits, -1); // [1,1]
+                    top_k_indices = reshape(astype(top_idx, int32), {1, 1, 1});
+                    top_k_logits = take_along_axis(sampling_logits, top_k_indices, -1); // [1,1,1]
+                } else {
+                    const array partitioned_indices = argpartition(sampling_logits, -k, -1);
+                    const array top_k_selector = arange(vocab - k, vocab, 1, int32);
+                    top_k_indices = take(partitioned_indices, top_k_selector, -1); // [1,1,k]
+                    top_k_logits = take_along_axis(sampling_logits, top_k_indices, -1); // [1,1,k]
+                }
+
+                array sampled_logits = reshape(top_k_logits, {1, 1, k}); // [1,1,k]
+                const array topk_indices = reshape(astype(top_k_indices, int32), {1, 1, k}); // [1,1,k]
+
+                if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+                    sampled_logits = apply_top_p_filter(sampled_logits, cfg.top_p);
+                }
+                if (std::fabs(cfg.temperature - 1.0f) > 1.0e-6f) {
+                    sampled_logits = sampled_logits * array(1.0f / cfg.temperature, sampled_logits.dtype());
+                }
+                const array sampled_local_idx = random::categorical(sampled_logits, -1); // [1,1]
+                const array sampled_local_idx_3d = reshape(sampled_local_idx, {1, 1, 1});
+                const array sampled_token_3d = take_along_axis(topk_indices, sampled_local_idx_3d, -1); // [1,1,1]
+                next_token = reshape(sampled_token_3d, {1, 1});
+            }
+
+            const array token_idx = reshape(astype(next_token, int32), {1, 1, 1});
+            const array prev_count = take_along_axis(token_counts, token_idx, -1);
+            const array updated_counts = put_along_axis(
+                token_counts,
+                token_idx,
+                prev_count + array(1.0f, float32),
+                -1
+            );
+            return std::vector<array>{ next_token, updated_counts };
+        },
+        true
+    );
+    auto inserted = cache.emplace(
+        cache_key,
+        std::make_shared<const CompiledPenalizedSampleFn>(std::move(fn))
+    );
+    return inserted.first->second;
 }
 
 struct Qwen35Config {
@@ -308,10 +557,13 @@ struct LayerWeights {
     array mlp_down_rhs = array(0.0f);
     array mlp_gate_q_w = array(0.0f);
     array mlp_gate_q_scales = array(0.0f);
+    array mlp_gate_q_biases = array(0.0f);
     array mlp_up_q_w = array(0.0f);
     array mlp_up_q_scales = array(0.0f);
+    array mlp_up_q_biases = array(0.0f);
     array mlp_down_q_w = array(0.0f);
     array mlp_down_q_scales = array(0.0f);
+    array mlp_down_q_biases = array(0.0f);
     bool mlp_gate_has_q = false;
     bool mlp_up_has_q = false;
     bool mlp_down_has_q = false;
@@ -323,12 +575,16 @@ struct LayerWeights {
     array attn_o_rhs = array(0.0f);
     array attn_q_q_w = array(0.0f);
     array attn_q_q_scales = array(0.0f);
+    array attn_q_q_biases = array(0.0f);
     array attn_k_q_w = array(0.0f);
     array attn_k_q_scales = array(0.0f);
+    array attn_k_q_biases = array(0.0f);
     array attn_v_q_w = array(0.0f);
     array attn_v_q_scales = array(0.0f);
+    array attn_v_q_biases = array(0.0f);
     array attn_o_q_w = array(0.0f);
     array attn_o_q_scales = array(0.0f);
+    array attn_o_q_biases = array(0.0f);
     bool attn_q_has_q = false;
     bool attn_k_has_q = false;
     bool attn_v_has_q = false;
@@ -350,8 +606,10 @@ struct LayerWeights {
     array lin_in_proj_ba_rhs = array(0.0f);
     array lin_in_proj_qkvz_q_w = array(0.0f);
     array lin_in_proj_qkvz_q_scales = array(0.0f);
+    array lin_in_proj_qkvz_q_biases = array(0.0f);
     array lin_in_proj_ba_q_w = array(0.0f);
     array lin_in_proj_ba_q_scales = array(0.0f);
+    array lin_in_proj_ba_q_biases = array(0.0f);
     bool lin_in_proj_qkvz_has_q = false;
     bool lin_in_proj_ba_has_q = false;
     array lin_A_log = array(0.0f);
@@ -361,6 +619,7 @@ struct LayerWeights {
     array lin_out_proj_rhs = array(0.0f);
     array lin_out_proj_q_w = array(0.0f);
     array lin_out_proj_q_scales = array(0.0f);
+    array lin_out_proj_q_biases = array(0.0f);
     bool lin_out_proj_has_q = false;
 
     int lin_num_v_heads = 0;
@@ -376,11 +635,13 @@ struct LayerWeights {
     array sc_in_proj_rhs = array(0.0f);
     array sc_in_proj_q_w = array(0.0f);
     array sc_in_proj_q_scales = array(0.0f);
+    array sc_in_proj_q_biases = array(0.0f);
     array sc_conv1d_w = array(0.0f); // [conv_dim, kernel, 1]
     array sc_conv_bias = array(0.0f);
     array sc_out_proj_rhs = array(0.0f);
     array sc_out_proj_q_w = array(0.0f);
     array sc_out_proj_q_scales = array(0.0f);
+    array sc_out_proj_q_biases = array(0.0f);
     bool sc_in_proj_has_q = false;
     bool sc_out_proj_has_q = false;
     bool sc_has_bias = false;
@@ -395,6 +656,63 @@ array next_token_greedy(const array& logits_last) {
 bool ends_with(const std::string& s, const std::string& suffix) {
     if (suffix.size() > s.size()) return false;
     return std::equal(suffix.rbegin(), suffix.rend(), s.rbegin());
+}
+
+uint64_t fnv1a64_update_bytes(uint64_t hash, const void* data, size_t len) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= static_cast<uint64_t>(ptr[i]);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+uint64_t fnv1a64_update_str(uint64_t hash, const std::string& value) {
+    return fnv1a64_update_bytes(hash, value.data(), value.size());
+}
+
+uint64_t fnv1a64_update_u64(uint64_t hash, uint64_t value) {
+    return fnv1a64_update_bytes(hash, &value, sizeof(value));
+}
+
+std::string hex_u64(uint64_t value) {
+    char buf[17] = {0};
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(value));
+    return std::string(buf);
+}
+
+bool metal_weight_cache_enabled() {
+    return !env_truthy("TALU_METAL_MODEL_CACHE_DISABLE", false);
+}
+
+bool metal_weight_cache_debug_enabled() {
+    return env_truthy("TALU_METAL_MODEL_CACHE_DEBUG", false);
+}
+
+std::filesystem::path metal_weight_cache_dir(const std::string& model_path) {
+    return std::filesystem::path(model_path) / ".cache" / "talu-metal";
+}
+
+std::string build_weight_cache_fingerprint(
+    const std::string& model_path,
+    const std::vector<std::string>& weight_files
+) {
+    namespace fs = std::filesystem;
+    uint64_t hash = 1469598103934665603ULL;
+    hash = fnv1a64_update_str(hash, "talu-metal-weight-cache-v1");
+    hash = fnv1a64_update_str(hash, model_path);
+    hash = fnv1a64_update_u64(hash, static_cast<uint64_t>(weight_files.size()));
+    for (const std::string& rel : weight_files) {
+        const fs::path abs_path = fs::path(model_path) / rel;
+        const std::string abs = abs_path.string();
+        const uint64_t size = static_cast<uint64_t>(fs::file_size(abs_path));
+        const uint64_t mtime = static_cast<uint64_t>(fs::last_write_time(abs_path).time_since_epoch().count());
+        hash = fnv1a64_update_str(hash, rel);
+        hash = fnv1a64_update_str(hash, abs);
+        hash = fnv1a64_update_u64(hash, size);
+        hash = fnv1a64_update_u64(hash, mtime);
+    }
+    return hex_u64(hash);
 }
 
 std::string read_file(const std::filesystem::path& path) {
@@ -685,6 +1003,10 @@ void sanitize_qwen35_tensors(
 
 const array& require_tensor(const std::unordered_map<std::string, array>& tensors, const std::string& key) {
     auto it = tensors.find(key);
+    if (it == tensors.end() && ends_with(key, ".weight")) {
+        const std::string packed_key = key.substr(0, key.size() - std::string(".weight").size()) + ".weight_packed";
+        it = tensors.find(packed_key);
+    }
     if (it == tensors.end()) throw std::runtime_error("missing required tensor: " + key);
     return it->second;
 }
@@ -702,7 +1024,12 @@ const array& require_any_tensor(
 }
 
 bool has_tensor(const std::unordered_map<std::string, array>& tensors, const std::string& key) {
-    return tensors.find(key) != tensors.end();
+    if (tensors.find(key) != tensors.end()) return true;
+    if (ends_with(key, ".weight")) {
+        const std::string packed_key = key.substr(0, key.size() - std::string(".weight").size()) + ".weight_packed";
+        return tensors.find(packed_key) != tensors.end();
+    }
+    return false;
 }
 
 std::string detect_text_prefix(const std::unordered_map<std::string, array>& tensors) {
@@ -784,10 +1111,17 @@ array maybe_dequantize_fp8_weight(
     const std::string scale_inv_key = base + ".weight_scale_inv";
     const std::string block_scale_key = base + ".weight_block_scale";
     const std::string weight_scale_key = base + ".weight_scale";
+    const bool has_nvfp4_packed = tensors.find(base + ".weight_packed") != tensors.end();
+    const bool has_grouped_affine_scales = tensors.find(base + ".scales") != tensors.end();
+    const bool has_grouped_affine_biases =
+        tensors.find(base + ".biases") != tensors.end() ||
+        tensors.find(base + ".weight_bias") != tensors.end();
 
     auto scale_inv_it = tensors.find(scale_inv_key);
     auto block_scale_it = tensors.find(block_scale_key);
-    if (block_scale_it == tensors.end()) {
+    if (block_scale_it == tensors.end() &&
+        !has_nvfp4_packed &&
+        !(has_grouped_affine_scales && has_grouped_affine_biases)) {
         block_scale_it = tensors.find(weight_scale_key);
     }
     if (scale_inv_it == tensors.end() && block_scale_it == tensors.end()) {
@@ -860,6 +1194,251 @@ array maybe_dequantize_fp8_weight(
         }
     }
     return dequant_bf16;
+}
+
+float fp4_e2m1_nibble_to_f32(uint8_t nibble) {
+    static constexpr float codebook[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f,
+        2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f,
+        -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    return codebook[nibble & 0x0F];
+}
+
+bool has_nvfp4_metadata_for_key(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key
+) {
+    if (!ends_with(weight_key, ".weight")) return false;
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    return tensors.find(base + ".weight_packed") != tensors.end() &&
+        tensors.find(base + ".weight_scale") != tensors.end();
+}
+
+const array& nvfp4_unit_global_scale() {
+    static thread_local std::optional<array> scale;
+    if (!scale.has_value()) {
+        scale = stop_gradient(copy(array(1.0f, float32)));
+    }
+    return *scale;
+}
+
+array dequantize_nvfp4_weight(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key
+) {
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    const array packed_u8 = astype(require_tensor(tensors, base + ".weight_packed"), uint8);
+    const array scales_f32 = astype(require_tensor(tensors, base + ".weight_scale"), float32);
+    eval(packed_u8);
+    eval(scales_f32);
+
+    if (packed_u8.ndim() != 2 || scales_f32.ndim() != 2) {
+        throw std::runtime_error("nvfp4 packed/scales must be rank-2 for " + weight_key);
+    }
+
+    const int rows = packed_u8.shape(0);
+    const int packed_cols = packed_u8.shape(1);
+    const int cols = packed_cols * 2;
+    if (scales_f32.shape(0) != rows) {
+        throw std::runtime_error("nvfp4 scales row mismatch for " + weight_key);
+    }
+    const int scale_cols = scales_f32.shape(1);
+    if (scale_cols <= 0 || cols % scale_cols != 0) {
+        throw std::runtime_error("invalid nvfp4 scales shape for " + weight_key);
+    }
+    const int group_size = cols / scale_cols;
+
+    float global_scale = 1.0f;
+    if (has_tensor(tensors, base + ".weight_global_scale")) {
+        const array global_f32 = astype(require_tensor(tensors, base + ".weight_global_scale"), float32);
+        eval(global_f32);
+        if (global_f32.size() > 0) global_scale = global_f32.item<float>();
+    }
+    if (global_scale == 0.0f) {
+        throw std::runtime_error("invalid nvfp4 global scale for " + weight_key);
+    }
+
+    const uint8_t* packed_ptr = packed_u8.data<uint8_t>();
+    const float* scale_ptr = scales_f32.data<float>();
+    std::vector<float> decoded(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+    for (int r = 0; r < rows; ++r) {
+        const size_t packed_row_off = static_cast<size_t>(r) * static_cast<size_t>(packed_cols);
+        const size_t scale_row_off = static_cast<size_t>(r) * static_cast<size_t>(scale_cols);
+        const size_t out_row_off = static_cast<size_t>(r) * static_cast<size_t>(cols);
+        for (int c = 0; c < cols; ++c) {
+            const uint8_t packed = packed_ptr[packed_row_off + static_cast<size_t>(c / 2)];
+            const uint8_t nibble = (c & 1) == 0 ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+            const float local_scale = scale_ptr[scale_row_off + static_cast<size_t>(c / group_size)];
+            decoded[out_row_off + static_cast<size_t>(c)] = fp4_e2m1_nibble_to_f32(nibble) * (local_scale / global_scale);
+        }
+    }
+
+    array dequant_bf16 = astype(array(decoded.begin(), Shape{rows, cols}, float32), bfloat16);
+    dequant_bf16 = stop_gradient(copy(dequant_bf16));
+    return dequant_bf16;
+}
+
+bool transcode_nvfp4_to_affine_qmm(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key,
+    const array& lhs_weight,
+    int target_group_size,
+    array* out_q_w,
+    array* out_q_scales,
+    array* out_q_biases
+) {
+    if (!out_q_w || !out_q_scales || !out_q_biases) return false;
+    if (target_group_size <= 0 || !has_nvfp4_metadata_for_key(tensors, weight_key)) return false;
+
+    const array dense_bf16 = dequantize_nvfp4_weight(tensors, weight_key);
+    const array dense_f32 = astype(dense_bf16, float32);
+    eval(dense_f32);
+    if (dense_f32.ndim() != 2 || lhs_weight.ndim() != 2) return false;
+
+    const int rows = dense_f32.shape(0);
+    const int cols = dense_f32.shape(1);
+    const int packed_cols = cols / 8;
+    if (rows <= 0 || cols <= 0 || (cols % target_group_size) != 0 || (cols % 8) != 0) return false;
+    const bool lhs_matches_unpacked =
+        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == cols;
+    const bool lhs_matches_packed =
+        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == packed_cols;
+    if (!lhs_matches_unpacked && !lhs_matches_packed) {
+        // Synthetic fused decode weights (for example linear-attention qkvz/ba)
+        // must quantize the full concatenated tensor, not a single source slice.
+        return false;
+    }
+
+    const int groups = cols / target_group_size;
+    const float* src = dense_f32.data<float>();
+
+    std::vector<uint32_t> packed(static_cast<size_t>(rows) * static_cast<size_t>(packed_cols), 0);
+    std::vector<float> scales(static_cast<size_t>(rows) * static_cast<size_t>(groups), 0.0f);
+    std::vector<float> biases(static_cast<size_t>(rows) * static_cast<size_t>(groups), 0.0f);
+
+    for (int r = 0; r < rows; ++r) {
+        const size_t row_off = static_cast<size_t>(r) * static_cast<size_t>(cols);
+        const size_t packed_row_off = static_cast<size_t>(r) * static_cast<size_t>(packed_cols);
+        const size_t group_row_off = static_cast<size_t>(r) * static_cast<size_t>(groups);
+        for (int g = 0; g < groups; ++g) {
+            const int start = g * target_group_size;
+            float min_v = src[row_off + static_cast<size_t>(start)];
+            float max_v = min_v;
+            for (int i = 1; i < target_group_size; ++i) {
+                const float v = src[row_off + static_cast<size_t>(start + i)];
+                min_v = std::min(min_v, v);
+                max_v = std::max(max_v, v);
+            }
+
+            float scale = (max_v - min_v) / 15.0f;
+            float bias = min_v;
+            if (!(scale > 0.0f) || !std::isfinite(scale)) {
+                scale = 1.0f;
+                bias = min_v;
+            }
+            scales[group_row_off + static_cast<size_t>(g)] = scale;
+            biases[group_row_off + static_cast<size_t>(g)] = bias;
+
+            for (int i = 0; i < target_group_size; ++i) {
+                const int c = start + i;
+                const float v = src[row_off + static_cast<size_t>(c)];
+                int q = static_cast<int>(std::lrint((v - bias) / scale));
+                q = std::max(0, std::min(15, q));
+                const size_t packed_idx = packed_row_off + static_cast<size_t>(c / 8);
+                const int shift = (c % 8) * 4;
+                packed[packed_idx] |= (static_cast<uint32_t>(q) << shift);
+            }
+        }
+    }
+
+    *out_q_w = stop_gradient(copy(array(packed.begin(), Shape{rows, packed_cols}, uint32)));
+    *out_q_scales = stop_gradient(copy(astype(array(scales.begin(), Shape{rows, groups}, float32), bfloat16)));
+    *out_q_biases = stop_gradient(copy(astype(array(biases.begin(), Shape{rows, groups}, float32), bfloat16)));
+    eval(*out_q_w);
+    eval(*out_q_scales);
+    eval(*out_q_biases);
+    return true;
+}
+
+bool capture_native_nvfp4_quant(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key,
+    array* out_q_w,
+    array* out_q_scales,
+    array* out_q_biases
+) {
+    if (!out_q_w || !out_q_scales || !out_q_biases) return false;
+    if (!has_nvfp4_metadata_for_key(tensors, weight_key)) return false;
+    if (!ends_with(weight_key, ".weight")) return false;
+
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    const array packed_src = astype(require_tensor(tensors, base + ".weight_packed"), uint8);
+    const array scale_src = view(require_tensor(tensors, base + ".weight_scale"), uint8);
+    eval(packed_src);
+    eval(scale_src);
+
+    if (packed_src.ndim() != 2 || scale_src.ndim() != 2) return false;
+    const int rows = packed_src.shape(0);
+    const int packed_byte_cols = packed_src.shape(1);
+    const int cols = packed_byte_cols * 2;
+    if (packed_byte_cols <= 0 || (packed_byte_cols % 4) != 0) return false;
+    if ((cols % 16) != 0) return false;
+    if (scale_src.shape(0) != rows || scale_src.shape(1) != (cols / 16)) return false;
+
+    array global_scale = array(1.0f, float32);
+    if (has_tensor(tensors, base + ".weight_global_scale")) {
+        global_scale = astype(require_tensor(tensors, base + ".weight_global_scale"), float32);
+    }
+
+    *out_q_w = stop_gradient(copy(reshape(view(packed_src, uint32), {rows, packed_byte_cols / 4})));
+    *out_q_scales = stop_gradient(copy(scale_src));
+    *out_q_biases = stop_gradient(copy(global_scale));
+    return true;
+}
+
+void materialize_nvfp4_affine_execution_tensors(
+    std::unordered_map<std::string, array>* tensors,
+    int target_group_size
+) {
+    if (!tensors || target_group_size <= 0) return;
+
+    std::vector<std::string> packed_keys;
+    packed_keys.reserve(tensors->size());
+    for (const auto& entry : *tensors) {
+        if (ends_with(entry.first, ".weight_packed")) {
+            packed_keys.push_back(entry.first);
+        }
+    }
+
+    for (const std::string& packed_key : packed_keys) {
+        const std::string base = packed_key.substr(0, packed_key.size() - std::string(".weight_packed").size());
+        const std::string weight_key = base + ".weight";
+        if (tensors->find(weight_key) != tensors->end()) continue;
+
+        auto packed_it = tensors->find(packed_key);
+        if (packed_it == tensors->end()) continue;
+
+        array q_w = array(0.0f);
+        array q_scales = array(0.0f);
+        array q_biases = array(0.0f);
+        if (!transcode_nvfp4_to_affine_qmm(
+                *tensors,
+                weight_key,
+                packed_it->second,
+                target_group_size,
+                &q_w,
+                &q_scales,
+                &q_biases))
+        {
+            continue;
+        }
+
+        tensors->insert_or_assign(weight_key, q_w);
+        tensors->insert_or_assign(base + ".scales", q_scales);
+        tensors->insert_or_assign(base + ".biases", q_biases);
+    }
 }
 
 array maybe_dequantize_grouped_affine_weight(
@@ -957,6 +1536,82 @@ array maybe_dequantize_grouped_affine_weight(
     return dequant_bf16;
 }
 
+bool has_grouped_affine_metadata_for_key(
+    const std::unordered_map<std::string, array>& tensors,
+    const std::string& weight_key
+) {
+    if (!ends_with(weight_key, ".weight")) return false;
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    const bool has_scales =
+        tensors.find(base + ".scales") != tensors.end() ||
+        tensors.find(base + ".weight_scale") != tensors.end();
+    const bool has_biases =
+        tensors.find(base + ".biases") != tensors.end() ||
+        tensors.find(base + ".weight_bias") != tensors.end();
+    return has_scales && has_biases;
+}
+
+bool maybe_capture_grouped_affine_quant(
+    const std::unordered_map<std::string, array>& tensors,
+    const Qwen35Config& cfg,
+    const std::string& weight_key,
+    const array& lhs_weight,
+    array* out_q_w,
+    array* out_q_scales,
+    array* out_q_biases
+) {
+    if (!has_grouped_affine_metadata_for_key(tensors, weight_key)) return false;
+    if (!ends_with(weight_key, ".weight")) return false;
+    if (lhs_weight.ndim() != 2) return false;
+    if (cfg.quant_bits != 4 && cfg.quant_bits != 8) return false;
+    if (cfg.quant_group_size <= 0) return false;
+
+    const std::string base = weight_key.substr(0, weight_key.size() - std::string(".weight").size());
+    auto raw_it = tensors.find(weight_key);
+    if (raw_it == tensors.end()) return false;
+
+    auto scales_it = tensors.find(base + ".scales");
+    if (scales_it == tensors.end()) scales_it = tensors.find(base + ".weight_scale");
+    auto biases_it = tensors.find(base + ".biases");
+    if (biases_it == tensors.end()) biases_it = tensors.find(base + ".weight_bias");
+    if (scales_it == tensors.end() || biases_it == tensors.end()) return false;
+
+    const array& raw_weight = raw_it->second;
+    if (raw_weight.ndim() != 2) return false;
+    const int rows = raw_weight.shape(0);
+    const int packed_cols = raw_weight.shape(1);
+    const int values_per_word = cfg.quant_bits == 4 ? 8 : 4;
+    const int cols = packed_cols * values_per_word;
+    const bool lhs_matches_unpacked =
+        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == cols;
+    const bool lhs_matches_packed =
+        lhs_weight.shape(0) == rows && lhs_weight.shape(1) == packed_cols;
+    if (!lhs_matches_unpacked && !lhs_matches_packed) {
+        // Synthetic fused tensors (for example concatenated qkvz) do not map
+        // 1:1 to a single grouped-affine source tensor.
+        return false;
+    }
+
+    const array& scales_src = scales_it->second;
+    const array& biases_src = biases_it->second;
+    const Dtype scales_dt = scales_src.dtype();
+    const Dtype biases_dt = biases_src.dtype();
+    const bool scales_float = scales_dt == float16 || scales_dt == bfloat16 || scales_dt == float32 || scales_dt == float64;
+    const bool biases_float = biases_dt == float16 || biases_dt == bfloat16 || biases_dt == float32 || biases_dt == float64;
+    if (!scales_float || !biases_float) return false;
+    if (scales_src.ndim() != 2 || biases_src.ndim() != 2) return false;
+    if (scales_src.shape(0) != rows || biases_src.shape(0) != rows) return false;
+    if (scales_src.shape(1) != biases_src.shape(1)) return false;
+
+    const int expected_groups = (cols + cfg.quant_group_size - 1) / cfg.quant_group_size;
+    if (scales_src.shape(1) != expected_groups) return false;
+
+    *out_q_w = astype(raw_weight, uint32);
+    *out_q_scales = scales_src;
+    *out_q_biases = biases_src;
+    return true;
+}
+
 array load_linear_weight(
     const std::unordered_map<std::string, array>& tensors,
     const Qwen35Config& cfg,
@@ -964,22 +1619,34 @@ array load_linear_weight(
 ) {
     const array& raw_weight = require_tensor(tensors, weight_key);
     const array grouped = maybe_dequantize_grouped_affine_weight(tensors, cfg, weight_key, raw_weight);
+    if (grouped.size() != raw_weight.size() || grouped.dtype() != raw_weight.dtype() || grouped.ndim() != raw_weight.ndim()) {
+        return maybe_dequantize_fp8_weight(tensors, weight_key, grouped);
+    }
+    if (has_nvfp4_metadata_for_key(tensors, weight_key)) {
+        return dequantize_nvfp4_weight(tensors, weight_key);
+    }
     return maybe_dequantize_fp8_weight(tensors, weight_key, grouped);
 }
 
 void maybe_quantize_mxfp8_matrix(
     const std::unordered_map<std::string, array>& tensors,
+    const Qwen35Config& cfg,
     const std::string& weight_key,
     const array& lhs_weight,
     bool enabled,
     array* out_q_w,
     array* out_q_scales,
+    array* out_q_biases,
     bool* out_has_q
 ) {
     if (!enabled) {
         *out_has_q = false;
         return;
     }
+    if (out_q_biases) {
+        *out_q_biases = array(0.0f);
+    }
+    g_qmm_attempts += 1;
     // Fast path for native MXFP8 checkpoints: reuse packed FP8 payload and
     // block scales directly for decode-time quantized matmul.
     if (ends_with(weight_key, ".weight")) {
@@ -1004,12 +1671,53 @@ void maybe_quantize_mxfp8_matrix(
                         *out_q_w = packed;
                         *out_q_scales = astype(raw_scales, uint8);
                         *out_has_q = true;
+                        g_qmm_success += 1;
                         return;
                     } catch (const std::exception&) {
                         // Fall through to generic quantize path.
                     }
                 }
             }
+        }
+    }
+
+    if (out_q_biases != nullptr &&
+        has_nvfp4_metadata_for_key(tensors, weight_key) &&
+        !has_grouped_affine_metadata_for_key(tensors, weight_key))
+    {
+        if (capture_native_nvfp4_quant(
+                tensors,
+                weight_key,
+                out_q_w,
+                out_q_scales,
+                out_q_biases))
+        {
+            *out_has_q = true;
+            g_qmm_success += 1;
+            return;
+        }
+    }
+
+    const bool enforce_grouped_affine_lossless = env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true);
+    if (enforce_grouped_affine_lossless && out_q_biases != nullptr) {
+        if (maybe_capture_grouped_affine_quant(
+                tensors,
+                cfg,
+                weight_key,
+                lhs_weight,
+                out_q_w,
+                out_q_scales,
+                out_q_biases))
+        {
+            *out_has_q = true;
+            g_qmm_success += 1;
+            return;
+        }
+        // If grouped-affine metadata exists but cannot be mapped directly
+        // (for example synthetic fused tensors), avoid lossy re-quantization.
+        if (has_grouped_affine_metadata_for_key(tensors, weight_key)) {
+            *out_has_q = false;
+            return;
         }
     }
 
@@ -1020,7 +1728,12 @@ void maybe_quantize_mxfp8_matrix(
         // Some converted checkpoints keep FP8 payload tensors as uint8 and
         // expose scales via metadata. Dequantize first when needed so MLX
         // quantize() receives a real floating tensor.
-        quant_input = maybe_dequantize_fp8_weight(tensors, weight_key, quant_input);
+        if (has_nvfp4_metadata_for_key(tensors, weight_key)) {
+            quant_input = dequantize_nvfp4_weight(tensors, weight_key);
+        } else {
+            quant_input = maybe_dequantize_grouped_affine_weight(tensors, cfg, weight_key, quant_input);
+            quant_input = maybe_dequantize_fp8_weight(tensors, weight_key, quant_input);
+        }
     }
     const Dtype qdt = quant_input.dtype();
     const bool quant_input_is_float = (qdt == float16 || qdt == bfloat16 || qdt == float32 || qdt == float64);
@@ -1047,17 +1760,61 @@ void maybe_quantize_mxfp8_matrix(
     *out_q_w = q[0];
     *out_q_scales = q[1];
     *out_has_q = true;
+    g_qmm_success += 1;
 }
 
 array linear_decode_maybe_quantized(
     bool decode_qmm_enabled,
+    int quant_group_size,
+    int quant_bits,
     const array& x,
     const array& rhs,
     bool has_q,
     const array& q_w,
-    const array& q_scales
+    const array& q_scales,
+    const array& q_biases
 ) {
-    if (has_q && decode_qmm_enabled) {
+    const bool q_ready = has_q && decode_qmm_enabled && q_w.size() > 0 && q_scales.size() > 0;
+    if (q_ready) {
+        const bool affine_ready = q_biases.ndim() == 2 && q_biases.size() > 1 &&
+            quant_group_size > 0 && (quant_bits == 4 || quant_bits == 8);
+        const bool nvfp4_ready =
+            !affine_ready &&
+            q_w.dtype() == uint32 &&
+            q_scales.dtype() == uint8 &&
+            q_biases.size() == 1 &&
+            q_biases.dtype() == float32 &&
+            quant_group_size == 16 &&
+            quant_bits == 4;
+        if (affine_ready) {
+            return quantized_matmul(
+                x,
+                q_w,
+                q_scales,
+                std::optional<array>(q_biases),
+                true,
+                quant_group_size,
+                quant_bits,
+                "affine"
+            );
+        }
+        if (nvfp4_ready) {
+            const bool reshape_back = x.ndim() == 3;
+            const int batch = x.shape(0);
+            const int seq = reshape_back ? x.shape(1) : 1;
+            const array x2d = reshape_back ? reshape(x, {batch * seq, x.shape(2)}) : x;
+            const array out2d = qqmm(
+                x2d,
+                q_w,
+                std::optional<array>(q_scales),
+                quant_group_size,
+                quant_bits,
+                "nvfp4",
+                std::optional<array>(nvfp4_unit_global_scale()),
+                std::optional<array>(q_biases)
+            );
+            return reshape_back ? reshape(out2d, {batch, seq, out2d.shape(1)}) : out2d;
+        }
         return quantized_matmul(
             x,
             q_w,
@@ -1068,6 +1825,9 @@ array linear_decode_maybe_quantized(
             std::nullopt,
             "mxfp8"
         );
+    }
+    if (rhs.size() <= 1 || rhs.ndim() < 2) {
+        throw std::runtime_error("linear_decode_maybe_quantized: dense rhs is missing while quantized path is unavailable");
     }
     return matmul(x, rhs);
 }
@@ -1351,9 +2111,11 @@ struct mlx_ctx {
     array lm_head_rhs = array(0.0f);  // [hidden, vocab]
     array lm_head_q_w = array(0.0f);  // [vocab, hidden * bits / 32] packed
     array lm_head_q_scales = array(0.0f); // [vocab, hidden / group_size]
+    array lm_head_q_biases = array(0.0f); // [vocab, hidden / group_size] affine-only
     array final_norm_w = array(0.0f); // [hidden]
     bool has_fp8_meta = false;
     bool has_mxfp8_meta = false;
+    bool has_grouped_affine_meta = false;
     bool lm_head_q_decode_enabled = false;
     bool fp8_decode_qmm_enabled = false;
 
@@ -1455,6 +2217,29 @@ bool has_fp8_quant_metadata(const std::unordered_map<std::string, array>& tensor
 bool has_mxfp8_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
     for (const auto& kv : tensors) {
         if (ends_with(kv.first, ".weight_block_scale")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_grouped_affine_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
+    for (const auto& kv : tensors) {
+        if (!ends_with(kv.first, ".weight")) continue;
+        const std::string base = kv.first.substr(0, kv.first.size() - std::string(".weight").size());
+        if (tensors.find(base + ".scales") != tensors.end() &&
+            tensors.find(base + ".biases") != tensors.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_nvfp4_quant_metadata(const std::unordered_map<std::string, array>& tensors) {
+    for (const auto& kv : tensors) {
+        if (!ends_with(kv.first, ".weight_packed")) continue;
+        const std::string base = kv.first.substr(0, kv.first.size() - std::string(".weight_packed").size());
+        if (tensors.find(base + ".weight_scale") != tensors.end()) {
             return true;
         }
     }
@@ -1692,11 +2477,14 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
 
     const array q_proj_out = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.attn_q_rhs,
         lw.attn_q_has_q,
         lw.attn_q_q_w,
-        lw.attn_q_q_scales
+        lw.attn_q_q_scales,
+        lw.attn_q_q_biases
     );
     const int q_last_dim = q_proj_out.shape(2);
     const int q_base_dim = lw.attn_num_heads * lw.attn_head_dim;
@@ -1722,19 +2510,25 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
 
     const array k_proj_out = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.attn_k_rhs,
         lw.attn_k_has_q,
         lw.attn_k_q_w,
-        lw.attn_k_q_scales
+        lw.attn_k_q_scales,
+        lw.attn_k_q_biases
     );
     const array v_proj_out = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.attn_v_rhs,
         lw.attn_v_has_q,
         lw.attn_v_q_w,
-        lw.attn_v_q_scales
+        lw.attn_v_q_scales,
+        lw.attn_v_q_biases
     );
 
     array queries = fast::rms_norm(queries_raw, std::optional<array>(lw.attn_q_norm_w), ctx->cfg.rms_norm_eps);
@@ -1819,11 +2613,14 @@ array run_full_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm)
 
     return linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         attn_out,
         lw.attn_o_rhs,
         lw.attn_o_has_q,
         lw.attn_o_q_w,
-        lw.attn_o_q_scales
+        lw.attn_o_q_scales,
+        lw.attn_o_q_biases
     );
 }
 
@@ -1836,11 +2633,14 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
 
     const array qkvz = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.lin_in_proj_qkvz_rhs,
         lw.lin_in_proj_qkvz_has_q,
         lw.lin_in_proj_qkvz_q_w,
-        lw.lin_in_proj_qkvz_q_scales
+        lw.lin_in_proj_qkvz_q_scales,
+        lw.lin_in_proj_qkvz_q_biases
     ); // [B,S,conv_dim+value_dim]
     const array qkv = slice(qkvz, {0, 0, 0}, {B, S, lw.lin_conv_dim});
     const array z_flat = slice(qkvz, {0, 0, lw.lin_conv_dim}, {B, S, lw.lin_conv_dim + lw.lin_value_dim});
@@ -1848,11 +2648,14 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
 
     const array ba = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.lin_in_proj_ba_rhs,
         lw.lin_in_proj_ba_has_q,
         lw.lin_in_proj_ba_q_w,
-        lw.lin_in_proj_ba_q_scales
+        lw.lin_in_proj_ba_q_scales,
+        lw.lin_in_proj_ba_q_biases
     ); // [B,S,2*Hv]
     const array b = slice(ba, {0, 0, 0}, {B, S, lw.lin_num_v_heads});
     const array a = slice(ba, {0, 0, lw.lin_num_v_heads}, {B, S, 2 * lw.lin_num_v_heads});
@@ -1893,11 +2696,14 @@ array run_linear_attention_layer(mlx_ctx* ctx, int layer_idx, const array& x_nor
     const array merged = reshape(normed, {B, S, lw.lin_value_dim});
     return linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         merged,
         lw.lin_out_proj_rhs,
         lw.lin_out_proj_has_q,
         lw.lin_out_proj_q_w,
-        lw.lin_out_proj_q_scales
+        lw.lin_out_proj_q_scales,
+        lw.lin_out_proj_q_biases
     );
 }
 
@@ -1910,11 +2716,14 @@ array run_shortconv_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
 
     const array proj = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         x_norm,
         lw.sc_in_proj_rhs,
         lw.sc_in_proj_has_q,
         lw.sc_in_proj_q_w,
-        lw.sc_in_proj_q_scales
+        lw.sc_in_proj_q_scales,
+        lw.sc_in_proj_q_biases
     ); // [B,S,3*conv_dim]
     const array b_gate = slice(proj, {0, 0, 0}, {B, S, lw.sc_conv_dim});
     const array c_gate = slice(proj, {0, 0, lw.sc_conv_dim}, {B, S, 2 * lw.sc_conv_dim});
@@ -1940,11 +2749,14 @@ array run_shortconv_layer(mlx_ctx* ctx, int layer_idx, const array& x_norm) {
     const array gated = c_gate * conv_out;
     return linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         gated,
         lw.sc_out_proj_rhs,
         lw.sc_out_proj_has_q,
         lw.sc_out_proj_q_w,
-        lw.sc_out_proj_q_scales
+        lw.sc_out_proj_q_scales,
+        lw.sc_out_proj_q_biases
     );
 }
 
@@ -1983,28 +2795,37 @@ array run_layer(mlx_ctx* ctx, int layer_idx, const array& hidden, const TraceFra
     const array mlp_in = fast::rms_norm(h, std::optional<array>(lw.post_attention_layernorm_w), ctx->cfg.rms_norm_eps);
     const array gate = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         mlp_in,
         lw.mlp_gate_rhs,
         lw.mlp_gate_has_q,
         lw.mlp_gate_q_w,
-        lw.mlp_gate_q_scales
+        lw.mlp_gate_q_scales,
+        lw.mlp_gate_q_biases
     );
     const array up = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         mlp_in,
         lw.mlp_up_rhs,
         lw.mlp_up_has_q,
         lw.mlp_up_q_w,
-        lw.mlp_up_q_scales
+        lw.mlp_up_q_scales,
+        lw.mlp_up_q_biases
     );
     const array ff = silu(gate) * up;
     const array down = linear_decode_maybe_quantized(
         ctx->fp8_decode_qmm_enabled,
+        ctx->cfg.quant_group_size,
+        ctx->cfg.quant_bits,
         ff,
         lw.mlp_down_rhs,
         lw.mlp_down_has_q,
         lw.mlp_down_q_w,
-        lw.mlp_down_q_scales
+        lw.mlp_down_q_scales,
+        lw.mlp_down_q_biases
     );
 
     const array out = h + down;
@@ -2076,25 +2897,65 @@ array forward_hidden(
 array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* trace_frame = nullptr) {
     const array hidden = forward_hidden(ctx, input_ids, true, trace_frame);
     array lm_input = hidden;
-    if (ctx->has_fp8_meta && hidden.ndim() == 3 && hidden.shape(1) > 1) {
+    if ((ctx->has_fp8_meta or ctx->has_grouped_affine_meta) && hidden.ndim() == 3 && hidden.shape(1) > 1) {
         // Prefill only needs next-token logits; avoid full-sequence lm_head.
         const int b = hidden.shape(0);
         const int t = hidden.shape(1);
         const int h = hidden.shape(2);
         lm_input = slice(hidden, {0, t - 1, 0}, {b, t, h});
     }
-    const bool decode_step = lm_input.ndim() == 3 && lm_input.shape(1) == 1;
-    const array logits = (ctx->lm_head_q_decode_enabled && decode_step)
-        ? quantized_matmul(
-              lm_input,
-              ctx->lm_head_q_w,
-              ctx->lm_head_q_scales,
-              std::nullopt,
-              true,
-              std::nullopt,
-              std::nullopt,
-              "mxfp8"
-          )
+    const bool lm_head_q_ready = ctx->lm_head_q_decode_enabled &&
+        ctx->lm_head_q_w.size() > 0 && ctx->lm_head_q_scales.size() > 0;
+    const bool lm_head_affine_ready = lm_head_q_ready &&
+        ctx->lm_head_q_biases.ndim() == 2 &&
+        ctx->lm_head_q_biases.size() > 1 &&
+        ctx->cfg.quant_group_size > 0 &&
+        (ctx->cfg.quant_bits == 4 || ctx->cfg.quant_bits == 8);
+    const bool lm_head_nvfp4_ready =
+        lm_head_q_ready &&
+        !lm_head_affine_ready &&
+        ctx->lm_head_q_w.dtype() == uint32 &&
+        ctx->lm_head_q_scales.dtype() == uint8 &&
+        ctx->lm_head_q_biases.size() == 1 &&
+        ctx->lm_head_q_biases.dtype() == float32 &&
+        ctx->cfg.quant_group_size == 16 &&
+        ctx->cfg.quant_bits == 4;
+    const array logits = lm_head_q_ready
+        ? (lm_head_affine_ready
+              ? quantized_matmul(
+                    lm_input,
+                    ctx->lm_head_q_w,
+                    ctx->lm_head_q_scales,
+                    std::optional<array>(ctx->lm_head_q_biases),
+                    true,
+                    ctx->cfg.quant_group_size,
+                    ctx->cfg.quant_bits,
+                    "affine"
+                )
+              : (lm_head_nvfp4_ready
+                    ? reshape(
+                          qqmm(
+                              reshape(lm_input, {lm_input.shape(0), lm_input.shape(2)}),
+                              ctx->lm_head_q_w,
+                              std::optional<array>(ctx->lm_head_q_scales),
+                              ctx->cfg.quant_group_size,
+                              ctx->cfg.quant_bits,
+                              "nvfp4",
+                              std::optional<array>(nvfp4_unit_global_scale()),
+                              std::optional<array>(ctx->lm_head_q_biases)
+                          ),
+                          {lm_input.shape(0), 1, ctx->lm_head_q_w.shape(0)}
+                      )
+              : quantized_matmul(
+                    lm_input,
+                    ctx->lm_head_q_w,
+                    ctx->lm_head_q_scales,
+                    std::nullopt,
+                    true,
+                    std::nullopt,
+                    std::nullopt,
+                    "mxfp8"
+                )))
         : matmul(lm_input, ctx->lm_head_rhs);
     if (trace_frame) {
         xray_emit_array_f32(
@@ -2107,6 +2968,161 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
         );
     }
     return logits;
+}
+
+bool can_use_fused_lm_head_argmax(const mlx_ctx* ctx, const TraceFrame* trace_frame = nullptr) {
+    return ctx &&
+        env_truthy("TALU_METAL_FUSED_LM_HEAD_ARGMAX", false) &&
+        ctx->lm_head_q_decode_enabled &&
+        ctx->lm_head_q_w.size() > 0 &&
+        ctx->lm_head_q_scales.size() > 0 &&
+        ctx->lm_head_q_biases.ndim() == 2 &&
+        ctx->lm_head_q_biases.size() > 1 &&
+        ctx->cfg.quant_group_size > 0 &&
+        ctx->cfg.quant_bits == 4 &&
+        trace_frame == nullptr;
+}
+
+bool can_use_fused_lm_head_topk(
+    const mlx_ctx* ctx,
+    int requested_top_k,
+    const TraceFrame* trace_frame = nullptr
+) {
+    return can_use_fused_lm_head_argmax(ctx, trace_frame) &&
+        env_truthy("TALU_METAL_FUSED_LM_HEAD_TOPK", false) &&
+        requested_top_k > 1 &&
+        requested_top_k <= 64;
+}
+
+int resolve_fused_lm_head_row_chunk() {
+    const char* raw = std::getenv("TALU_METAL_FUSED_LM_HEAD_ROWS");
+    if (!raw || raw[0] == '\0') return 8192;
+    char* end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || parsed <= 0 || parsed > std::numeric_limits<int>::max()) {
+        return 8192;
+    }
+    return static_cast<int>(parsed);
+}
+
+array slice_rows_2d(const array& input, int row_start, int row_end) {
+    return slice(input, {row_start, 0}, {row_end, input.shape(1)});
+}
+
+std::pair<array, array> fused_lm_head_topk_candidate_arrays(
+    mlx_ctx* ctx,
+    const array& input_ids,
+    int requested_top_k
+);
+
+array fused_lm_head_argmax_token(mlx_ctx* ctx, const array& input_ids) {
+    if (!can_use_fused_lm_head_argmax(ctx)) {
+        throw std::runtime_error("fused_lm_head_argmax_token called without supported lm_head");
+    }
+
+    auto [candidate_logits, candidate_ids] = fused_lm_head_topk_candidate_arrays(ctx, input_ids, 1);
+    g_fused_lm_head_argmax_hits += 1;
+    const array candidate_logits_3d = reshape(candidate_logits, {1, 1, candidate_logits.shape(0)});
+    const array candidate_ids_3d = reshape(candidate_ids, {1, 1, candidate_ids.shape(0)});
+    const array best_local = reshape(astype(argmax(candidate_logits_3d, -1), int32), {1, 1, 1});
+    const array next_token_3d = take_along_axis(candidate_ids_3d, best_local, -1);
+    return reshape(astype(next_token_3d, int32), {1, 1});
+}
+
+TopKCandidateBatch fused_lm_head_topk_candidates(
+    mlx_ctx* ctx,
+    const array& input_ids,
+    int requested_top_k
+) {
+    if (!can_use_fused_lm_head_topk(ctx, requested_top_k)) {
+        throw std::runtime_error("fused_lm_head_topk_candidates called without supported lm_head");
+    }
+
+    auto [candidate_logits_flat, candidate_ids_flat] =
+        fused_lm_head_topk_candidate_arrays(ctx, input_ids, requested_top_k);
+
+    const int candidate_count = candidate_logits_flat.shape(0);
+    const array candidate_logits = reshape(candidate_logits_flat, {1, 1, candidate_count});
+    const array candidate_ids = reshape(candidate_ids_flat, {1, 1, candidate_count});
+
+    auto topk_fn = compiled_topk_candidates(requested_top_k);
+    const std::vector<array> topk_outputs = (*topk_fn)({candidate_logits});
+    if (topk_outputs.size() != 2) {
+        throw std::runtime_error("fused_lm_head_topk_candidates: invalid top-k output");
+    }
+
+    const array topk_logits = reshape(topk_outputs[0], {1, 1, requested_top_k});
+    const array candidate_local_indices = reshape(topk_outputs[1], {1, 1, requested_top_k});
+    const array topk_ids = take_along_axis(candidate_ids, candidate_local_indices, -1);
+    return TopKCandidateBatch{
+        .logits = topk_logits,
+        .indices = astype(topk_ids, int32),
+        .k = requested_top_k,
+    };
+}
+
+std::pair<array, array> fused_lm_head_topk_candidate_arrays(
+    mlx_ctx* ctx,
+    const array& input_ids,
+    int requested_top_k
+) {
+    if (!can_use_fused_lm_head_topk(ctx, requested_top_k)) {
+        throw std::runtime_error("fused_lm_head_topk_candidate_arrays called without supported lm_head");
+    }
+
+    const array hidden = forward_hidden(ctx, input_ids, true);
+    if (hidden.ndim() != 3 || hidden.shape(1) != 1) {
+        throw std::runtime_error("fused_lm_head_topk_candidate_arrays expects decode hidden shape [B,1,H]");
+    }
+
+    const int vocab_size = ctx->lm_head_q_w.shape(0);
+    const int row_chunk = std::max(requested_top_k, resolve_fused_lm_head_row_chunk());
+    std::vector<array> candidate_logits_parts;
+    std::vector<array> candidate_ids_parts;
+    candidate_logits_parts.reserve(static_cast<size_t>((vocab_size + row_chunk - 1) / row_chunk));
+    candidate_ids_parts.reserve(candidate_logits_parts.capacity());
+
+    for (int row_start = 0; row_start < vocab_size; row_start += row_chunk) {
+        const int row_end = std::min(vocab_size, row_start + row_chunk);
+        const int local_vocab = row_end - row_start;
+        const int local_k = std::min(requested_top_k, local_vocab);
+        const array w_chunk = slice_rows_2d(ctx->lm_head_q_w, row_start, row_end);
+        const array scales_chunk = slice_rows_2d(ctx->lm_head_q_scales, row_start, row_end);
+        const array biases_chunk = slice_rows_2d(ctx->lm_head_q_biases, row_start, row_end);
+        const array logits_chunk = quantized_matmul(
+            hidden,
+            w_chunk,
+            scales_chunk,
+            std::optional<array>(biases_chunk),
+            true,
+            ctx->cfg.quant_group_size,
+            ctx->cfg.quant_bits,
+            "affine"
+        );
+        auto topk_fn = compiled_topk_candidates(local_k);
+        const std::vector<array> topk_outputs = (*topk_fn)({logits_chunk});
+        if (topk_outputs.size() != 2) {
+            throw std::runtime_error("fused_lm_head_topk_candidate_arrays: invalid chunk top-k output");
+        }
+        const array row_offset = full(topk_outputs[1].shape(), row_start, int32);
+        candidate_logits_parts.push_back(topk_outputs[0]);
+        candidate_ids_parts.push_back(astype(topk_outputs[1], int32) + row_offset);
+    }
+
+    if (candidate_logits_parts.empty() || candidate_ids_parts.empty()) {
+        throw std::runtime_error("fused_lm_head_topk_candidate_arrays: no chunk candidates");
+    }
+
+    const array merged_logits = candidate_logits_parts.size() == 1
+        ? candidate_logits_parts.front()
+        : concatenate(candidate_logits_parts, -1);
+    const array merged_ids_i32 = candidate_ids_parts.size() == 1
+        ? candidate_ids_parts.front()
+        : concatenate(candidate_ids_parts, -1);
+    return {
+        reshape(merged_logits, {merged_logits.shape(2)}),
+        reshape(astype(merged_ids_i32, uint32), {merged_ids_i32.shape(2)})
+    };
 }
 
 void prefill_prefix_chunks(mlx_ctx* ctx, const std::vector<int32_t>& prompt_vec, int32_t prefix_len) {
@@ -2318,7 +3334,7 @@ bool build_prefill_topology_key(const mlx_ctx* ctx, std::string* out_key) {
 
 bool supports_variable_prefill_fusion(const mlx_ctx* ctx) {
     if (!ctx) return false;
-    if (ctx->has_fp8_meta) return false;
+    if (ctx->has_fp8_meta || ctx->has_grouped_affine_meta) return false;
     for (const LayerWeights& lw : ctx->layers) {
         // Variable-length fused prefill is only safe for pure full-attention
         // stacks where runtime state is fully represented by KV cache.
@@ -2331,7 +3347,7 @@ bool supports_ragged_prefill_fusion(const mlx_ctx* ctx) {
     if (!ctx) return false;
     if (ctx->xray_enabled) return false;
     // Keep FP8 path conservative until ragged fused prefill is validated there.
-    if (ctx->has_fp8_meta) return false;
+    if (ctx->has_fp8_meta || ctx->has_grouped_affine_meta) return false;
     return true;
 }
 
@@ -2693,6 +3709,20 @@ int32_t mlx_validate_config(const char* model_path) {
 mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) {
     bool wired_limit_acquired = false;
     bool rng_entered = false;
+    const bool qmm_debug = []() {
+        if (const char* value = std::getenv("TALU_METAL_QMM_DEBUG")) {
+            return std::string(value) == "1";
+        }
+        return false;
+    }();
+    const bool nvfp4_debug = []() {
+        if (const char* value = std::getenv("TALU_METAL_NVFP4_DEBUG")) {
+            return std::string(value) == "1";
+        }
+        return false;
+    }();
+    const size_t qmm_attempts_before = g_qmm_attempts;
+    const size_t qmm_success_before = g_qmm_success;
     try {
         if (!metal::is_available()) {
             g_last_error = "Metal backend is not available";
@@ -2737,12 +3767,177 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         ctx->has_fp8_meta = has_fp8_meta;
         const bool has_mxfp8_meta = has_mxfp8_quant_metadata(tensors);
         ctx->has_mxfp8_meta = has_mxfp8_meta;
-        ctx->fp8_decode_qmm_enabled = has_mxfp8_meta && env_truthy("TALU_METAL_FP8_DECODE_QMM", true);
+        bool has_grouped_affine_meta = has_grouped_affine_quant_metadata(tensors);
+        const bool has_nvfp4_meta = has_nvfp4_quant_metadata(tensors);
+        if (has_grouped_affine_meta && has_nvfp4_meta) {
+            // Hybrid artifacts preserve grouped-affine execution tensors.
+            ctx->cfg.quant_bits = 4;
+            ctx->cfg.quant_group_size = 32;
+        } else if (has_nvfp4_meta && !has_grouped_affine_meta) {
+            // Pure NVFP4 must stay on the native MLX NVFP4 path.
+            ctx->cfg.quant_bits = 4;
+            ctx->cfg.quant_group_size = 16;
+        }
+        ctx->has_grouped_affine_meta = has_grouped_affine_meta;
+        // Decode-time QMM defaults on for quantized checkpoints:
+        // - native MXFP8 metadata
+        // - grouped-affine metadata
+        // - nvfp4 packed metadata
+        // Callers can still force on/off via TALU_METAL_FP8_DECODE_QMM.
+        const bool default_decode_qmm = has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta;
+        ctx->fp8_decode_qmm_enabled = env_truthy("TALU_METAL_FP8_DECODE_QMM", default_decode_qmm);
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
+        // v3 cache/runtime policy: quantized path is allowed for prefill too,
+        // so dense RHS is only retained when explicitly requested.
+        const bool keep_dense_rhs_for_prefill = env_truthy("TALU_METAL_KEEP_DENSE_RHS_FOR_PREFILL", false);
+        const bool enable_model_cache = metal_weight_cache_enabled();
+        if (metal_weight_cache_debug_enabled()) {
+            std::fprintf(stderr, "[mlx][cache] model_cache_enabled=%d\n", enable_model_cache ? 1 : 0);
+        }
+        std::unordered_map<std::string, array> runtime_cache_loaded;
+        std::unordered_map<std::string, array> runtime_cache_new;
+        std::string runtime_cache_fingerprint;
+        std::filesystem::path runtime_cache_dir;
+        std::filesystem::path runtime_cache_file;
+        if (enable_model_cache) {
+            try {
+                const std::vector<std::string> cache_weight_files = discover_weight_files(ctx->model_path);
+                runtime_cache_fingerprint = build_weight_cache_fingerprint(ctx->model_path, cache_weight_files);
+                runtime_cache_dir = metal_weight_cache_dir(ctx->model_path);
+                const std::string runtime_profile =
+                    std::string("v3-kd") + (keep_dense_rhs_for_prefill ? "1" : "0") +
+                    "-dq" + (ctx->fp8_decode_qmm_enabled ? "1" : "0");
+                runtime_cache_file = runtime_cache_dir / ("runtime-" + runtime_profile + "-" + runtime_cache_fingerprint + ".safetensors");
+                if (std::filesystem::exists(runtime_cache_file)) {
+                    auto cached = load_safetensors(runtime_cache_file.string());
+                    runtime_cache_loaded = std::move(cached.first);
+                    if (metal_weight_cache_debug_enabled()) {
+                        std::fprintf(
+                            stderr,
+                            "[mlx][cache] loaded runtime cache file=%s tensors=%zu\n",
+                            runtime_cache_file.c_str(),
+                            runtime_cache_loaded.size()
+                        );
+                    }
+                }
+            } catch (const std::exception& e) {
+                if (metal_weight_cache_debug_enabled()) {
+                    std::fprintf(stderr, "[mlx][cache] load failed reason=%s\n", e.what());
+                }
+                runtime_cache_loaded.clear();
+                runtime_cache_new.clear();
+            }
+        }
+
+        auto load_runtime_tensor = [&](const std::string& cache_key, const std::function<array()>& build_fn) -> array {
+            if (enable_model_cache) {
+                auto it_loaded = runtime_cache_loaded.find(cache_key);
+                if (it_loaded != runtime_cache_loaded.end()) return it_loaded->second;
+                auto it_new = runtime_cache_new.find(cache_key);
+                if (it_new != runtime_cache_new.end()) return it_new->second;
+            }
+            const array built = build_fn();
+            if (enable_model_cache) {
+                runtime_cache_new.emplace(cache_key, built);
+                if (metal_weight_cache_debug_enabled()) {
+                    std::fprintf(stderr, "[mlx][cache] miss key=%s\n", cache_key.c_str());
+                }
+            }
+            return built;
+        };
+
+        auto load_embed_weight = [&](const std::string& weight_key) -> array {
+            return load_runtime_tensor("runtime::embed::" + weight_key, [&]() {
+                return load_linear_weight(tensors, ctx->cfg, weight_key);
+            });
+        };
+
+        auto load_rhs_weight = [&](const std::string& weight_key) -> array {
+            return load_runtime_tensor("runtime::rhs::" + weight_key, [&]() {
+                const array dense = load_linear_weight(tensors, ctx->cfg, weight_key);
+                return to_rhs(dense, weight_key);
+            });
+        };
+
+        auto load_runtime_bool_flag = [&](const std::string& flag_key, bool* out_value) -> bool {
+            auto it = runtime_cache_loaded.find(flag_key);
+            if (it == runtime_cache_loaded.end()) return false;
+            const array flag_i32 = astype(it->second, int32);
+            eval(flag_i32);
+            const int32_t* ptr = flag_i32.data<int32_t>();
+            *out_value = ptr != nullptr && ptr[0] != 0;
+            return true;
+        };
+
+        auto runtime_cache_put = [&](std::unordered_map<std::string, array>* map, const std::string& key, const array& value) {
+            auto it = map->find(key);
+            if (it == map->end()) {
+                map->emplace(key, value);
+            } else {
+                it->second = value;
+            }
+        };
+
+        auto maybe_quantize_mxfp8_matrix = [&](
+            const std::unordered_map<std::string, array>& tensors_ref,
+            const Qwen35Config& cfg_ref,
+            const std::string& weight_key,
+            const array& lhs_weight,
+            bool enabled,
+            array* out_q_w,
+            array* out_q_scales,
+            array* out_q_biases,
+            bool* out_has_q
+        ) {
+            if (enable_model_cache) {
+                const std::string q_prefix = "runtime::q::" + weight_key;
+                const std::string has_key = q_prefix + "::has";
+                bool cached_has_q = false;
+                if (load_runtime_bool_flag(has_key, &cached_has_q)) {
+                    *out_has_q = cached_has_q;
+                    if (!cached_has_q) return;
+                    auto it_w = runtime_cache_loaded.find(q_prefix + "::w");
+                    auto it_s = runtime_cache_loaded.find(q_prefix + "::scales");
+                    if (it_w != runtime_cache_loaded.end() && it_s != runtime_cache_loaded.end()) {
+                        *out_q_w = it_w->second;
+                        *out_q_scales = it_s->second;
+                        if (out_q_biases != nullptr) {
+                            auto it_b = runtime_cache_loaded.find(q_prefix + "::biases");
+                            if (it_b != runtime_cache_loaded.end()) *out_q_biases = it_b->second;
+                        }
+                        return;
+                    }
+                }
+            }
+
+            ::maybe_quantize_mxfp8_matrix(
+                tensors_ref,
+                cfg_ref,
+                weight_key,
+                lhs_weight,
+                enabled,
+                out_q_w,
+                out_q_scales,
+                out_q_biases,
+                out_has_q
+            );
+
+            if (enable_model_cache) {
+                const std::string q_prefix = "runtime::q::" + weight_key;
+                runtime_cache_put(&runtime_cache_new, q_prefix + "::has", array(static_cast<int32_t>(*out_has_q ? 1 : 0), int32));
+                if (*out_has_q) {
+                    runtime_cache_put(&runtime_cache_new, q_prefix + "::w", *out_q_w);
+                    runtime_cache_put(&runtime_cache_new, q_prefix + "::scales", *out_q_scales);
+                    if (out_q_biases != nullptr) {
+                        runtime_cache_put(&runtime_cache_new, q_prefix + "::biases", *out_q_biases);
+                    }
+                }
+            }
+        };
 
         const std::string text_prefix = detect_text_prefix(tensors);
         const std::string layer_prefix = text_prefix + "layers.";
-        ctx->embed_tokens = load_linear_weight(tensors, ctx->cfg, text_prefix + "embed_tokens.weight");
+        ctx->embed_tokens = load_embed_weight(text_prefix + "embed_tokens.weight");
         ctx->final_norm_w = require_any_tensor(
             tensors,
             {
@@ -2774,7 +3969,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             }
         }
 
-        const bool enable_lm_head_qmm = has_mxfp8_meta && env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", true);
+        const bool enable_lm_head_qmm = env_truthy("TALU_METAL_FP8_LM_HEAD_QMM", has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta);
         if (enable_lm_head_qmm) {
             if (lm_head_weight.size() == 1) {
                 // Tie embeddings can point at raw FP8 tensors. Load dequantized copy only
@@ -2784,21 +3979,25 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             bool lm_head_has_q = false;
             maybe_quantize_mxfp8_matrix(
                 tensors,
+                ctx->cfg,
                 lm_head_key,
                 lm_head_weight,
                 true,
                 &ctx->lm_head_q_w,
                 &ctx->lm_head_q_scales,
+                &ctx->lm_head_q_biases,
                 &lm_head_has_q
             );
             ctx->lm_head_q_decode_enabled = lm_head_has_q;
         }
 
-        if (!ctx->lm_head_q_decode_enabled) {
-            if (lm_head_weight.size() == 1) {
-                lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
-            }
-            ctx->lm_head_rhs = transpose(lm_head_weight, {1, 0});
+        // Non-MXFP8 checkpoints still run prefill through the regular lm_head
+        // matmul path (decode-only QMM), so keep rhs available in that case.
+        if (keep_dense_rhs_for_prefill || !ctx->lm_head_q_decode_enabled || !ctx->has_fp8_meta) {
+            if (lm_head_weight.size() == 1) lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
+            ctx->lm_head_rhs = load_runtime_tensor("runtime::lm_head_rhs::" + lm_head_key, [&]() {
+                return transpose(lm_head_weight, {1, 0});
+            });
         }
 
         ctx->layers.reserve(static_cast<size_t>(ctx->cfg.num_hidden_layers));
@@ -2842,51 +4041,45 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
 
             maybe_quantize_mxfp8_matrix(
                 tensors,
+                ctx->cfg,
                 mlp_gate_key,
                 mlp_gate_weight,
                 enable_mlp_qmm,
                 &lw.mlp_gate_q_w,
                 &lw.mlp_gate_q_scales,
+                &lw.mlp_gate_q_biases,
                 &lw.mlp_gate_has_q
             );
             maybe_quantize_mxfp8_matrix(
                 tensors,
+                ctx->cfg,
                 mlp_up_key,
                 mlp_up_weight,
                 enable_mlp_qmm,
                 &lw.mlp_up_q_w,
                 &lw.mlp_up_q_scales,
+                &lw.mlp_up_q_biases,
                 &lw.mlp_up_has_q
             );
             maybe_quantize_mxfp8_matrix(
                 tensors,
+                ctx->cfg,
                 mlp_down_key,
                 mlp_down_weight,
                 enable_mlp_qmm,
                 &lw.mlp_down_q_w,
                 &lw.mlp_down_q_scales,
+                &lw.mlp_down_q_biases,
                 &lw.mlp_down_has_q
             );
-            if (!enable_mlp_qmm || !lw.mlp_gate_has_q) {
-                const array mlp_gate_dense = load_linear_weight(tensors, ctx->cfg, mlp_gate_key);
-                lw.mlp_gate_rhs = to_rhs(
-                    mlp_gate_dense,
-                    p + "mlp_gate"
-                );
+            if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_gate_has_q) {
+                lw.mlp_gate_rhs = load_rhs_weight(mlp_gate_key);
             }
-            if (!enable_mlp_qmm || !lw.mlp_up_has_q) {
-                const array mlp_up_dense = load_linear_weight(tensors, ctx->cfg, mlp_up_key);
-                lw.mlp_up_rhs = to_rhs(
-                    mlp_up_dense,
-                    p + "mlp_up"
-                );
+            if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_up_has_q) {
+                lw.mlp_up_rhs = load_rhs_weight(mlp_up_key);
             }
-            if (!enable_mlp_qmm || !lw.mlp_down_has_q) {
-                const array mlp_down_dense = load_linear_weight(tensors, ctx->cfg, mlp_down_key);
-                lw.mlp_down_rhs = to_rhs(
-                    mlp_down_dense,
-                    p + "mlp_down"
-                );
+            if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_down_has_q) {
+                lw.mlp_down_rhs = load_rhs_weight(mlp_down_key);
             }
 
             const bool has_linear_split = has_tensor(tensors, p + "linear_attn.in_proj_qkv.weight");
@@ -2958,30 +4151,198 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     const array b_weight = load_linear_weight(tensors, ctx->cfg, b_key);
                     const array qkvz_weight = concatenate({qkv_weight, z_weight}, 0);
                     const array ba_weight = concatenate({b_weight, a_weight}, 0);
-                    maybe_quantize_mxfp8_matrix(
-                        tensors,
-                        qkv_key,
-                        qkvz_weight,
-                        enable_mlp_qmm,
-                        &lw.lin_in_proj_qkvz_q_w,
-                        &lw.lin_in_proj_qkvz_q_scales,
-                        &lw.lin_in_proj_qkvz_has_q
-                    );
-                    maybe_quantize_mxfp8_matrix(
-                        tensors,
-                        b_key,
-                        ba_weight,
-                        enable_mlp_qmm,
-                        &lw.lin_in_proj_ba_q_w,
-                        &lw.lin_in_proj_ba_q_scales,
-                        &lw.lin_in_proj_ba_has_q
-                    );
-                    if (!enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) {
+                    bool lin_qkvz_q_captured = false;
+                    bool lin_ba_q_captured = false;
+                    if (enable_mlp_qmm && env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true)) {
+                        // Split linear-attn checkpoints store grouped-affine metadata
+                        // per source tensor. Capture each source tensor losslessly
+                        // and concatenate packed payload + calibration metadata.
+                        array qkv_q_w = array(0.0f);
+                        array qkv_q_scales = array(0.0f);
+                        array qkv_q_biases = array(0.0f);
+                        array z_q_w = array(0.0f);
+                        array z_q_scales = array(0.0f);
+                        array z_q_biases = array(0.0f);
+                        if (maybe_capture_grouped_affine_quant(
+                                tensors,
+                                ctx->cfg,
+                                qkv_key,
+                                qkv_weight,
+                                &qkv_q_w,
+                                &qkv_q_scales,
+                                &qkv_q_biases) &&
+                            maybe_capture_grouped_affine_quant(
+                                tensors,
+                                ctx->cfg,
+                                z_key,
+                                z_weight,
+                                &z_q_w,
+                                &z_q_scales,
+                                &z_q_biases) &&
+                            qkv_q_w.ndim() == 2 && z_q_w.ndim() == 2 &&
+                            qkv_q_w.shape(1) == z_q_w.shape(1) &&
+                            qkv_q_scales.ndim() == 2 && z_q_scales.ndim() == 2 &&
+                            qkv_q_scales.shape(1) == z_q_scales.shape(1) &&
+                            qkv_q_biases.ndim() == 2 && z_q_biases.ndim() == 2 &&
+                            qkv_q_biases.shape(1) == z_q_biases.shape(1))
+                        {
+                            lw.lin_in_proj_qkvz_q_w = concatenate({qkv_q_w, z_q_w}, 0);
+                            lw.lin_in_proj_qkvz_q_scales = concatenate({qkv_q_scales, z_q_scales}, 0);
+                            lw.lin_in_proj_qkvz_q_biases = concatenate({qkv_q_biases, z_q_biases}, 0);
+                            lw.lin_in_proj_qkvz_has_q = true;
+                            lin_qkvz_q_captured = true;
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+
+                        array b_q_w = array(0.0f);
+                        array b_q_scales = array(0.0f);
+                        array b_q_biases = array(0.0f);
+                        array a_q_w = array(0.0f);
+                        array a_q_scales = array(0.0f);
+                        array a_q_biases = array(0.0f);
+                        if (maybe_capture_grouped_affine_quant(
+                                tensors,
+                                ctx->cfg,
+                                b_key,
+                                b_weight,
+                                &b_q_w,
+                                &b_q_scales,
+                                &b_q_biases) &&
+                            maybe_capture_grouped_affine_quant(
+                                tensors,
+                                ctx->cfg,
+                                a_key,
+                                a_weight,
+                                &a_q_w,
+                                &a_q_scales,
+                                &a_q_biases) &&
+                            b_q_w.ndim() == 2 && a_q_w.ndim() == 2 &&
+                            b_q_w.shape(1) == a_q_w.shape(1) &&
+                            b_q_scales.ndim() == 2 && a_q_scales.ndim() == 2 &&
+                            b_q_scales.shape(1) == a_q_scales.shape(1) &&
+                            b_q_biases.ndim() == 2 && a_q_biases.ndim() == 2 &&
+                            b_q_biases.shape(1) == a_q_biases.shape(1))
+                        {
+                            lw.lin_in_proj_ba_q_w = concatenate({b_q_w, a_q_w}, 0);
+                            lw.lin_in_proj_ba_q_scales = concatenate({b_q_scales, a_q_scales}, 0);
+                            lw.lin_in_proj_ba_q_biases = concatenate({b_q_biases, a_q_biases}, 0);
+                            lw.lin_in_proj_ba_has_q = true;
+                            lin_ba_q_captured = true;
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+                    }
+                    if (!lin_qkvz_q_captured && env_truthy("TALU_METAL_NVFP4_AFFINE_TRANSCODE", false)) {
+                        array qkv_q_w = array(0.0f);
+                        array qkv_q_scales = array(0.0f);
+                        array qkv_q_biases = array(0.0f);
+                        array z_q_w = array(0.0f);
+                        array z_q_scales = array(0.0f);
+                        array z_q_biases = array(0.0f);
+                        if (transcode_nvfp4_to_affine_qmm(
+                                tensors,
+                                qkv_key,
+                                qkv_weight,
+                                ctx->cfg.quant_group_size > 0 ? ctx->cfg.quant_group_size : 32,
+                                &qkv_q_w,
+                                &qkv_q_scales,
+                                &qkv_q_biases) &&
+                            transcode_nvfp4_to_affine_qmm(
+                                tensors,
+                                z_key,
+                                z_weight,
+                                ctx->cfg.quant_group_size > 0 ? ctx->cfg.quant_group_size : 32,
+                                &z_q_w,
+                                &z_q_scales,
+                                &z_q_biases) &&
+                            qkv_q_w.ndim() == 2 && z_q_w.ndim() == 2 &&
+                            qkv_q_w.shape(1) == z_q_w.shape(1) &&
+                            qkv_q_scales.ndim() == 2 && z_q_scales.ndim() == 2 &&
+                            qkv_q_scales.shape(1) == z_q_scales.shape(1) &&
+                            qkv_q_biases.ndim() == 2 && z_q_biases.ndim() == 2 &&
+                            qkv_q_biases.shape(1) == z_q_biases.shape(1))
+                        {
+                            lw.lin_in_proj_qkvz_q_w = concatenate({qkv_q_w, z_q_w}, 0);
+                            lw.lin_in_proj_qkvz_q_scales = concatenate({qkv_q_scales, z_q_scales}, 0);
+                            lw.lin_in_proj_qkvz_q_biases = concatenate({qkv_q_biases, z_q_biases}, 0);
+                            lw.lin_in_proj_qkvz_has_q = true;
+                            lin_qkvz_q_captured = true;
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+                    }
+                    if (!lin_ba_q_captured && env_truthy("TALU_METAL_NVFP4_AFFINE_TRANSCODE", false)) {
+                        array b_q_w = array(0.0f);
+                        array b_q_scales = array(0.0f);
+                        array b_q_biases = array(0.0f);
+                        array a_q_w = array(0.0f);
+                        array a_q_scales = array(0.0f);
+                        array a_q_biases = array(0.0f);
+                        if (transcode_nvfp4_to_affine_qmm(
+                                tensors,
+                                b_key,
+                                b_weight,
+                                ctx->cfg.quant_group_size > 0 ? ctx->cfg.quant_group_size : 32,
+                                &b_q_w,
+                                &b_q_scales,
+                                &b_q_biases) &&
+                            transcode_nvfp4_to_affine_qmm(
+                                tensors,
+                                a_key,
+                                a_weight,
+                                ctx->cfg.quant_group_size > 0 ? ctx->cfg.quant_group_size : 32,
+                                &a_q_w,
+                                &a_q_scales,
+                                &a_q_biases) &&
+                            b_q_w.ndim() == 2 && a_q_w.ndim() == 2 &&
+                            b_q_w.shape(1) == a_q_w.shape(1) &&
+                            b_q_scales.ndim() == 2 && a_q_scales.ndim() == 2 &&
+                            b_q_scales.shape(1) == a_q_scales.shape(1) &&
+                            b_q_biases.ndim() == 2 && a_q_biases.ndim() == 2 &&
+                            b_q_biases.shape(1) == a_q_biases.shape(1))
+                        {
+                            lw.lin_in_proj_ba_q_w = concatenate({b_q_w, a_q_w}, 0);
+                            lw.lin_in_proj_ba_q_scales = concatenate({b_q_scales, a_q_scales}, 0);
+                            lw.lin_in_proj_ba_q_biases = concatenate({b_q_biases, a_q_biases}, 0);
+                            lw.lin_in_proj_ba_has_q = true;
+                            lin_ba_q_captured = true;
+                            g_qmm_attempts += 1;
+                            g_qmm_success += 1;
+                        }
+                    }
+                    if (!lin_qkvz_q_captured) {
+                        maybe_quantize_mxfp8_matrix(
+                            tensors,
+                            ctx->cfg,
+                            p + "linear_attn.in_proj_qkvz",
+                            qkvz_weight,
+                            enable_mlp_qmm,
+                            &lw.lin_in_proj_qkvz_q_w,
+                            &lw.lin_in_proj_qkvz_q_scales,
+                            &lw.lin_in_proj_qkvz_q_biases,
+                            &lw.lin_in_proj_qkvz_has_q
+                        );
+                    }
+                    if (!lin_ba_q_captured) {
+                        maybe_quantize_mxfp8_matrix(
+                            tensors,
+                            ctx->cfg,
+                            p + "linear_attn.in_proj_ba",
+                            ba_weight,
+                            enable_mlp_qmm,
+                            &lw.lin_in_proj_ba_q_w,
+                            &lw.lin_in_proj_ba_q_scales,
+                            &lw.lin_in_proj_ba_q_biases,
+                            &lw.lin_in_proj_ba_has_q
+                        );
+                    }
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) {
                         const array qkv_rhs = to_rhs(qkv_weight, qkv_key);
                         const array z_rhs = to_rhs(z_weight, z_key);
                         lw.lin_in_proj_qkvz_rhs = concatenate({ qkv_rhs, z_rhs }, 1);
                     }
-                    if (!enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
+                    if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
                         const array b_rhs = to_rhs(b_weight, b_key);
                         const array a_rhs = to_rhs(a_weight, a_key);
                         lw.lin_in_proj_ba_rhs = concatenate({ b_rhs, a_rhs }, 1);
@@ -3012,39 +4373,87 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                         {qkvz_cols, 0},
                         {expected_cols, fused_in_proj_weight.shape(1)}
                     );
-                    maybe_quantize_mxfp8_matrix(
-                        tensors,
-                        p + "mixer.in_proj.qkvz_slice",
-                        qkvz_weight,
-                        enable_mlp_qmm,
-                        &lw.lin_in_proj_qkvz_q_w,
-                        &lw.lin_in_proj_qkvz_q_scales,
-                        &lw.lin_in_proj_qkvz_has_q
-                    );
-                    maybe_quantize_mxfp8_matrix(
-                        tensors,
-                        p + "mixer.in_proj.ba_slice",
-                        ba_weight,
-                        enable_mlp_qmm,
-                        &lw.lin_in_proj_ba_q_w,
-                        &lw.lin_in_proj_ba_q_scales,
-                        &lw.lin_in_proj_ba_has_q
-                    );
-                    if ((!enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) ||
-                        (!enable_mlp_qmm || !lw.lin_in_proj_ba_has_q)) {
+                    bool lin_qkvz_q_captured = false;
+                    bool lin_ba_q_captured = false;
+                    if (enable_mlp_qmm && env_truthy("TALU_METAL_GAFFINE_LOSSLESS", true)) {
+                        // Fused linear-attn stores grouped-affine metadata for
+                        // mixer.in_proj as one tensor. Slice packed payload +
+                        // metadata rows losslessly into qkvz and ba branches.
+                        array fused_q_w = array(0.0f);
+                        array fused_q_scales = array(0.0f);
+                        array fused_q_biases = array(0.0f);
+                        if (maybe_capture_grouped_affine_quant(
+                                tensors,
+                                ctx->cfg,
+                                fused_key,
+                                fused_in_proj_weight,
+                                &fused_q_w,
+                                &fused_q_scales,
+                                &fused_q_biases) &&
+                            fused_q_w.ndim() == 2 &&
+                            fused_q_scales.ndim() == 2 &&
+                            fused_q_biases.ndim() == 2 &&
+                            fused_q_w.shape(0) == expected_cols &&
+                            fused_q_scales.shape(0) == expected_cols &&
+                            fused_q_biases.shape(0) == expected_cols)
+                        {
+                            const int packed_cols = fused_q_w.shape(1);
+                            const int group_cols = fused_q_scales.shape(1);
+                            lw.lin_in_proj_qkvz_q_w = slice(fused_q_w, {0, 0}, {qkvz_cols, packed_cols});
+                            lw.lin_in_proj_ba_q_w = slice(fused_q_w, {qkvz_cols, 0}, {expected_cols, packed_cols});
+                            lw.lin_in_proj_qkvz_q_scales = slice(fused_q_scales, {0, 0}, {qkvz_cols, group_cols});
+                            lw.lin_in_proj_ba_q_scales = slice(fused_q_scales, {qkvz_cols, 0}, {expected_cols, group_cols});
+                            lw.lin_in_proj_qkvz_q_biases = slice(fused_q_biases, {0, 0}, {qkvz_cols, group_cols});
+                            lw.lin_in_proj_ba_q_biases = slice(fused_q_biases, {qkvz_cols, 0}, {expected_cols, group_cols});
+                            lw.lin_in_proj_qkvz_has_q = true;
+                            lw.lin_in_proj_ba_has_q = true;
+                            lin_qkvz_q_captured = true;
+                            lin_ba_q_captured = true;
+                            g_qmm_attempts += 2;
+                            g_qmm_success += 2;
+                        }
+                    }
+                    if (!lin_qkvz_q_captured) {
+                        maybe_quantize_mxfp8_matrix(
+                            tensors,
+                            ctx->cfg,
+                            p + "mixer.in_proj.qkvz_slice",
+                            qkvz_weight,
+                            enable_mlp_qmm,
+                            &lw.lin_in_proj_qkvz_q_w,
+                            &lw.lin_in_proj_qkvz_q_scales,
+                            &lw.lin_in_proj_qkvz_q_biases,
+                            &lw.lin_in_proj_qkvz_has_q
+                        );
+                    }
+                    if (!lin_ba_q_captured) {
+                        maybe_quantize_mxfp8_matrix(
+                            tensors,
+                            ctx->cfg,
+                            p + "mixer.in_proj.ba_slice",
+                            ba_weight,
+                            enable_mlp_qmm,
+                            &lw.lin_in_proj_ba_q_w,
+                            &lw.lin_in_proj_ba_q_scales,
+                            &lw.lin_in_proj_ba_q_biases,
+                            &lw.lin_in_proj_ba_has_q
+                        );
+                    }
+                    if ((keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) ||
+                        (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_ba_has_q)) {
                         const array fused_in_proj_rhs = to_rhs(
                             fused_in_proj_weight,
                             fused_key
                         );
                         const int fused_rows = fused_in_proj_rhs.shape(0);
-                        if (!enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) {
+                        if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_qkvz_has_q) {
                             lw.lin_in_proj_qkvz_rhs = slice(
                                 fused_in_proj_rhs,
                                 {0, 0},
                                 {fused_rows, qkvz_cols}
                             );
                         }
-                        if (!enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
+                        if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_in_proj_ba_has_q) {
                             lw.lin_in_proj_ba_rhs = slice(
                                 fused_in_proj_rhs,
                                 {0, qkvz_cols},
@@ -3061,27 +4470,30 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 const array& out_proj_weight = require_tensor(tensors, out_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     out_proj_key,
                     out_proj_weight,
                     enable_mlp_qmm,
                     &lw.lin_out_proj_q_w,
                     &lw.lin_out_proj_q_scales,
+                    &lw.lin_out_proj_q_biases,
                     &lw.lin_out_proj_has_q
                 );
-                if (!enable_mlp_qmm || !lw.lin_out_proj_has_q) {
-                    const array out_proj_dense = load_linear_weight(tensors, ctx->cfg, out_proj_key);
-                    lw.lin_out_proj_rhs = to_rhs(out_proj_dense, out_proj_key);
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_out_proj_has_q) {
+                    lw.lin_out_proj_rhs = load_rhs_weight(out_proj_key);
                 }
             } else if (lw.is_shortconv) {
                 const std::string sc_in_proj_key = p + "conv.in_proj.weight";
                 const array& sc_in_proj_weight = require_tensor(tensors, sc_in_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     sc_in_proj_key,
                     sc_in_proj_weight,
                     enable_mlp_qmm,
                     &lw.sc_in_proj_q_w,
                     &lw.sc_in_proj_q_scales,
+                    &lw.sc_in_proj_q_biases,
                     &lw.sc_in_proj_has_q
                 );
                 lw.sc_conv1d_w = require_tensor(tensors, p + "conv.conv.weight");
@@ -3089,20 +4501,20 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 const array& sc_out_proj_weight = require_tensor(tensors, sc_out_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     sc_out_proj_key,
                     sc_out_proj_weight,
                     enable_mlp_qmm,
                     &lw.sc_out_proj_q_w,
                     &lw.sc_out_proj_q_scales,
+                    &lw.sc_out_proj_q_biases,
                     &lw.sc_out_proj_has_q
                 );
-                if (!enable_mlp_qmm || !lw.sc_in_proj_has_q) {
-                    const array sc_in_proj_dense = load_linear_weight(tensors, ctx->cfg, sc_in_proj_key);
-                    lw.sc_in_proj_rhs = to_rhs(sc_in_proj_dense, sc_in_proj_key);
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.sc_in_proj_has_q) {
+                    lw.sc_in_proj_rhs = load_rhs_weight(sc_in_proj_key);
                 }
-                if (!enable_mlp_qmm || !lw.sc_out_proj_has_q) {
-                    const array sc_out_proj_dense = load_linear_weight(tensors, ctx->cfg, sc_out_proj_key);
-                    lw.sc_out_proj_rhs = to_rhs(sc_out_proj_dense, sc_out_proj_key);
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.sc_out_proj_has_q) {
+                    lw.sc_out_proj_rhs = load_rhs_weight(sc_out_proj_key);
                 }
                 if (has_tensor(tensors, p + "conv.conv.bias")) {
                     lw.sc_conv_bias = require_tensor(tensors, p + "conv.conv.bias");
@@ -3127,55 +4539,59 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 const array& o_proj_weight = require_tensor(tensors, o_proj_key);
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     q_proj_key,
                     q_proj_weight,
                     enable_mlp_qmm,
                     &lw.attn_q_q_w,
                     &lw.attn_q_q_scales,
+                    &lw.attn_q_q_biases,
                     &lw.attn_q_has_q
                 );
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     k_proj_key,
                     k_proj_weight,
                     enable_mlp_qmm,
                     &lw.attn_k_q_w,
                     &lw.attn_k_q_scales,
+                    &lw.attn_k_q_biases,
                     &lw.attn_k_has_q
                 );
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     v_proj_key,
                     v_proj_weight,
                     enable_mlp_qmm,
                     &lw.attn_v_q_w,
                     &lw.attn_v_q_scales,
+                    &lw.attn_v_q_biases,
                     &lw.attn_v_has_q
                 );
                 maybe_quantize_mxfp8_matrix(
                     tensors,
+                    ctx->cfg,
                     o_proj_key,
                     o_proj_weight,
                     enable_mlp_qmm,
                     &lw.attn_o_q_w,
                     &lw.attn_o_q_scales,
+                    &lw.attn_o_q_biases,
                     &lw.attn_o_has_q
                 );
-                if (!enable_mlp_qmm || !lw.attn_q_has_q) {
-                    const array q_proj_dense = load_linear_weight(tensors, ctx->cfg, q_proj_key);
-                    lw.attn_q_rhs = to_rhs(q_proj_dense, q_proj_key);
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_q_has_q) {
+                    lw.attn_q_rhs = load_rhs_weight(q_proj_key);
                 }
-                if (!enable_mlp_qmm || !lw.attn_k_has_q) {
-                    const array k_proj_dense = load_linear_weight(tensors, ctx->cfg, k_proj_key);
-                    lw.attn_k_rhs = to_rhs(k_proj_dense, k_proj_key);
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_k_has_q) {
+                    lw.attn_k_rhs = load_rhs_weight(k_proj_key);
                 }
-                if (!enable_mlp_qmm || !lw.attn_v_has_q) {
-                    const array v_proj_dense = load_linear_weight(tensors, ctx->cfg, v_proj_key);
-                    lw.attn_v_rhs = to_rhs(v_proj_dense, v_proj_key);
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_v_has_q) {
+                    lw.attn_v_rhs = load_rhs_weight(v_proj_key);
                 }
-                if (!enable_mlp_qmm || !lw.attn_o_has_q) {
-                    const array o_proj_dense = load_linear_weight(tensors, ctx->cfg, o_proj_key);
-                    lw.attn_o_rhs = to_rhs(o_proj_dense, p + "self_attn_o_proj");
+                if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_o_has_q) {
+                    lw.attn_o_rhs = load_rhs_weight(o_proj_key);
                 }
                 lw.attn_q_norm_w = require_any_tensor(
                     tensors,
@@ -3197,7 +4613,44 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             ctx->layers.push_back(std::move(lw));
         }
 
-        const bool enable_init_warmup = env_truthy("TALU_METAL_INIT_WARMUP", false);
+        if (enable_model_cache && !runtime_cache_new.empty()) {
+            try {
+                std::filesystem::create_directories(runtime_cache_dir);
+                std::unordered_map<std::string, array> runtime_cache_to_save = runtime_cache_loaded;
+                for (auto& kv : runtime_cache_new) {
+                    auto it = runtime_cache_to_save.find(kv.first);
+                    if (it == runtime_cache_to_save.end()) {
+                        runtime_cache_to_save.emplace(kv.first, kv.second);
+                    } else {
+                        it->second = kv.second;
+                    }
+                }
+                const std::filesystem::path tmp_file = runtime_cache_file.string() + ".tmp.safetensors";
+                std::unordered_map<std::string, std::string> metadata;
+                metadata.emplace("talu_cache_kind", "runtime_cache_v3");
+                metadata.emplace("talu_cache_fingerprint", runtime_cache_fingerprint);
+                save_safetensors(tmp_file.string(), std::move(runtime_cache_to_save), metadata);
+                if (std::filesystem::exists(runtime_cache_file)) {
+                    std::filesystem::remove(runtime_cache_file);
+                }
+                std::filesystem::rename(tmp_file, runtime_cache_file);
+                if (metal_weight_cache_debug_enabled()) {
+                    std::fprintf(
+                        stderr,
+                        "[mlx][cache] saved runtime cache file=%s new=%zu\n",
+                        runtime_cache_file.c_str(),
+                        runtime_cache_new.size()
+                    );
+                }
+            } catch (const std::exception& e) {
+                if (metal_weight_cache_debug_enabled()) {
+                    std::fprintf(stderr, "[mlx][cache] save failed reason=%s\n", e.what());
+                }
+                // Best-effort cache write.
+            }
+        }
+
+        const bool enable_init_warmup = env_truthy("TALU_METAL_INIT_WARMUP", true);
         if (enable_init_warmup) {
             // Pre-warm compiled compute_g path so WARMUP=0 benchmarks do not
             // include first-trace compilation overhead.
@@ -3221,6 +4674,58 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             eval(warm_decode_logits);
             synchronize();
             reset_runtime_state(ctx.get());
+        }
+
+        {
+            size_t layer_q_count = 0;
+            size_t layer_q_total = 0;
+            for (const LayerWeights& lw : ctx->layers) {
+                const bool flags[] = {
+                    lw.mlp_gate_has_q,
+                    lw.mlp_up_has_q,
+                    lw.mlp_down_has_q,
+                    lw.lin_in_proj_qkvz_has_q,
+                    lw.lin_in_proj_ba_has_q,
+                    lw.lin_out_proj_has_q,
+                    lw.sc_in_proj_has_q,
+                    lw.sc_out_proj_has_q,
+                    lw.attn_q_has_q,
+                    lw.attn_k_has_q,
+                    lw.attn_v_has_q,
+                    lw.attn_o_has_q,
+                };
+                for (bool flag : flags) {
+                    layer_q_total += 1;
+                    if (flag) layer_q_count += 1;
+                }
+            }
+            std::fprintf(
+                stderr,
+                "[mlx][nvfp4] model=%s nvfp4=%d gaffine=%d decode_qmm=%d lm_head_q=%d layers_q=%zu/%zu group=%d bits=%d\n",
+                ctx->model_id.c_str(),
+                has_nvfp4_meta ? 1 : 0,
+                ctx->has_grouped_affine_meta ? 1 : 0,
+                ctx->fp8_decode_qmm_enabled ? 1 : 0,
+                ctx->lm_head_q_decode_enabled ? 1 : 0,
+                layer_q_count,
+                layer_q_total,
+                ctx->cfg.quant_group_size,
+                ctx->cfg.quant_bits
+            );
+            std::fflush(stderr);
+        }
+
+        if (qmm_debug) {
+            const size_t attempts_delta = g_qmm_attempts - qmm_attempts_before;
+            const size_t success_delta = g_qmm_success - qmm_success_before;
+            std::fprintf(
+                stderr,
+                "[mlx][qmm] model=%s decode_qmm=%d attempts=%zu success=%zu\n",
+                ctx->model_id.c_str(),
+                ctx->fp8_decode_qmm_enabled ? 1 : 0,
+                attempts_delta,
+                success_delta
+            );
         }
 
         return ctx.release();
@@ -3265,9 +4770,11 @@ mlx_ctx* mlx_clone(mlx_ctx* source_ctx, int32_t seed) {
         ctx->lm_head_rhs = source_ctx->lm_head_rhs;
         ctx->lm_head_q_w = source_ctx->lm_head_q_w;
         ctx->lm_head_q_scales = source_ctx->lm_head_q_scales;
+        ctx->lm_head_q_biases = source_ctx->lm_head_q_biases;
         ctx->final_norm_w = source_ctx->final_norm_w;
         ctx->has_fp8_meta = source_ctx->has_fp8_meta;
         ctx->has_mxfp8_meta = source_ctx->has_mxfp8_meta;
+        ctx->has_grouped_affine_meta = source_ctx->has_grouped_affine_meta;
         ctx->lm_head_q_decode_enabled = source_ctx->lm_head_q_decode_enabled;
         ctx->fp8_decode_qmm_enabled = source_ctx->fp8_decode_qmm_enabled;
         ctx->layers = source_ctx->layers;
@@ -4192,44 +5699,62 @@ int32_t mlx_decode_stream(
         *out_generated_ids = nullptr;
         *out_generated_len = 0;
         if (decode_tokens == 0) return 1;
+        const bool fused_lm_head_profile = env_truthy("TALU_METAL_FUSED_LM_HEAD_PROFILE", false);
+        const size_t fused_hits_start = g_fused_lm_head_argmax_hits;
 
         std::vector<array> generated_token_arrays;
         generated_token_arrays.reserve(static_cast<size_t>(decode_tokens));
 
         const int32_t first_token_scalar = first_token;
         const array first_token_arr(&first_token_scalar, Shape{1, 1}, int32);
-        array current_token = next_token_greedy(last_token_logits(forward_logits(ctx, first_token_arr)));
+        array current_token = can_use_fused_lm_head_argmax(ctx)
+            ? fused_lm_head_argmax_token(ctx, first_token_arr)
+            : next_token_greedy(last_token_logits(forward_logits(ctx, first_token_arr)));
         async_eval(current_token);
 
         for (int32_t i = 0; i < decode_tokens; ++i) {
             generated_token_arrays.push_back(current_token);
             if (i + 1 < decode_tokens) {
-                const array next_token = next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
+                const array next_token = can_use_fused_lm_head_argmax(ctx)
+                    ? fused_lm_head_argmax_token(ctx, current_token)
+                    : next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
                 async_eval(next_token);
                 current_token = next_token;
             }
         }
 
-        eval(generated_token_arrays);
-        synchronize();
+        const array generated_token_rows = concatenate(generated_token_arrays, 0); // [T,1]
+        const array generated_token_flat = reshape(astype(generated_token_rows, int32), {decode_tokens}); // [T]
+        eval(generated_token_flat);
 
-        const size_t capacity = static_cast<size_t>(decode_tokens);
-        const size_t bytes = sizeof(int32_t) * capacity;
-        int32_t* copied = static_cast<int32_t*>(std::malloc(bytes));
+        std::unique_ptr<int32_t, decltype(&std::free)> copied(
+            static_cast<int32_t*>(std::malloc(sizeof(int32_t) * static_cast<size_t>(decode_tokens))),
+            &std::free
+        );
         if (!copied) {
             g_last_error = "mlx_decode_stream: failed to allocate token buffer";
             return 0;
         }
 
+        const int32_t* token_ptr = generated_token_flat.data<int32_t>();
         int32_t produced = 0;
         for (int32_t i = 0; i < decode_tokens; ++i) {
-            const int32_t tok = generated_token_arrays[static_cast<size_t>(i)].item<int32_t>();
-            copied[static_cast<size_t>(produced)] = tok;
+            const int32_t tok = token_ptr[static_cast<size_t>(i)];
+            copied.get()[static_cast<size_t>(produced)] = tok;
             produced += 1;
             if (token_is_eos(tok, eos_ids, eos_len)) break;
         }
+        if (fused_lm_head_profile) {
+            const size_t fused_hits = g_fused_lm_head_argmax_hits - fused_hits_start;
+            std::fprintf(
+                stderr,
+                "[mlx][fused_lm_head_argmax] used=%s hits=%zu mode=decode_stream\n",
+                can_use_fused_lm_head_argmax(ctx) ? "1" : "0",
+                fused_hits
+            );
+        }
 
-        *out_generated_ids = copied;
+        *out_generated_ids = copied.release();
         *out_generated_len = produced;
         return 1;
     } catch (const std::exception& e) {
@@ -4270,11 +5795,15 @@ array apply_sampling_penalties_to_logits(
     auto& repetition_scales = ctx->sampling_repetition_scales;
     auto& additive_penalties = ctx->sampling_additive_penalties;
     token_ids.clear();
-    repetition_scales.clear();
-    additive_penalties.clear();
+    if (has_repetition) repetition_scales.clear();
+    if (has_additive) additive_penalties.clear();
     if (token_ids.capacity() < token_counts.size()) token_ids.reserve(token_counts.size());
-    if (repetition_scales.capacity() < token_counts.size()) repetition_scales.reserve(token_counts.size());
-    if (additive_penalties.capacity() < token_counts.size()) additive_penalties.reserve(token_counts.size());
+    if (has_repetition && repetition_scales.capacity() < token_counts.size()) {
+        repetition_scales.reserve(token_counts.size());
+    }
+    if (has_additive && additive_penalties.capacity() < token_counts.size()) {
+        additive_penalties.reserve(token_counts.size());
+    }
 
     for (const auto& entry : token_counts) {
         const int32_t token_id = entry.first;
@@ -4283,10 +5812,14 @@ array apply_sampling_penalties_to_logits(
             throw std::runtime_error("apply_sampling_penalties_to_logits: context token out of range");
         }
         token_ids.push_back(token_id);
-        repetition_scales.push_back(std::pow(repetition_penalty, static_cast<float>(count)));
-        additive_penalties.push_back(
-            presence_penalty + (frequency_penalty * static_cast<float>(count))
-        );
+        if (has_repetition) {
+            repetition_scales.push_back(std::pow(repetition_penalty, static_cast<float>(count)));
+        }
+        if (has_additive) {
+            additive_penalties.push_back(
+                presence_penalty + (frequency_penalty * static_cast<float>(count))
+            );
+        }
     }
 
     const int unique_count = static_cast<int>(token_ids.size());
@@ -4350,45 +5883,120 @@ int32_t mlx_decode_topk_candidates(
     }
 
     try {
-        clear_fused_decode_ctx_cache();
         const int32_t token_scalar = token;
         const array token_arr(&token_scalar, Shape{1, 1}, int32);
-        const array logits_last = last_token_logits(forward_logits(ctx, token_arr)); // [1,1,V]
+        TopKCandidateBatch topk{
+            .logits = array(0.0f),
+            .indices = array(0.0f),
+            .k = 0,
+        };
+        int k = top_k;
 
-        if (logits_last.ndim() != 3) {
-            g_last_error = "mlx_decode_topk_candidates: invalid logits rank";
-            return 0;
-        }
-        const int vocab = logits_last.shape(2);
-        if (vocab <= 0) {
-            g_last_error = "mlx_decode_topk_candidates: invalid vocab size";
-            return 0;
-        }
-
-        const int k = std::min(top_k, vocab);
-        if (k == 1) {
-            const array top_idx = reshape(astype(argmax(logits_last, -1), int32), {1});
-            eval(top_idx);
+        if (k == 1 && can_use_fused_lm_head_argmax(ctx)) {
+            const array next_token = fused_lm_head_argmax_token(ctx, token_arr);
+            const array next_token_flat = reshape(astype(next_token, int32), {1});
+            eval(next_token_flat);
             synchronize();
-            out_candidate_ids[0] = top_idx.data<int32_t>()[0];
+            out_candidate_ids[0] = next_token_flat.data<int32_t>()[0];
             out_candidate_logits[0] = 0.0f;
             *out_candidate_count = 1;
             return 1;
         }
 
-        auto topk_fn = compiled_topk_candidates(k);
-        const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
-        if (topk_outputs.size() != 2) {
-            g_last_error = "mlx_decode_topk_candidates: invalid compiled output";
-            return 0;
+        if (can_use_fused_lm_head_topk(ctx, k)) {
+            auto [candidate_logits_flat, candidate_ids_flat] =
+                fused_lm_head_topk_candidate_arrays(ctx, token_arr, k);
+            eval({candidate_logits_flat, candidate_ids_flat});
+            synchronize();
+
+            const int candidate_count = candidate_logits_flat.shape(0);
+            const float* candidate_logits_ptr = candidate_logits_flat.data<float>();
+            const uint32_t* candidate_ids_ptr = candidate_ids_flat.data<uint32_t>();
+            if (!candidate_logits_ptr || !candidate_ids_ptr) {
+                g_last_error = "mlx_decode_topk_candidates: fused candidate materialization failed";
+                return 0;
+            }
+
+            std::fill_n(out_candidate_logits, static_cast<size_t>(k), -std::numeric_limits<float>::infinity());
+            std::fill_n(out_candidate_ids, static_cast<size_t>(k), -1);
+            int filled = 0;
+            for (int idx = 0; idx < candidate_count; ++idx) {
+                const uint32_t candidate_id_u32 = candidate_ids_ptr[idx];
+                if (candidate_id_u32 == 0xFFFFFFFFu) continue;
+                if (candidate_id_u32 > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+                    continue;
+                }
+                const int32_t candidate_id = static_cast<int32_t>(candidate_id_u32);
+                const float candidate_logit = candidate_logits_ptr[idx];
+
+                int insert_at = filled < k ? filled : k;
+                for (int rank = 0; rank < filled; ++rank) {
+                    const float existing_logit = out_candidate_logits[rank];
+                    const int32_t existing_id = out_candidate_ids[rank];
+                    if (candidate_logit > existing_logit ||
+                        (candidate_logit == existing_logit && candidate_id < existing_id)) {
+                        insert_at = rank;
+                        break;
+                    }
+                }
+                if (insert_at >= k) continue;
+
+                const int upper = filled < k ? filled : (k - 1);
+                for (int shift = upper; shift > insert_at; --shift) {
+                    out_candidate_logits[shift] = out_candidate_logits[shift - 1];
+                    out_candidate_ids[shift] = out_candidate_ids[shift - 1];
+                }
+                out_candidate_logits[insert_at] = candidate_logit;
+                out_candidate_ids[insert_at] = candidate_id;
+                if (filled < k) ++filled;
+            }
+            *out_candidate_count = filled;
+            return 1;
+        } else {
+            const array logits_last = last_token_logits(forward_logits(ctx, token_arr)); // [1,1,V]
+
+            if (logits_last.ndim() != 3) {
+                g_last_error = "mlx_decode_topk_candidates: invalid logits rank";
+                return 0;
+            }
+            const int vocab = logits_last.shape(2);
+            if (vocab <= 0) {
+                g_last_error = "mlx_decode_topk_candidates: invalid vocab size";
+                return 0;
+            }
+
+            k = std::min(top_k, vocab);
+            if (k == 1) {
+                const array top_idx = reshape(astype(argmax(logits_last, -1), int32), {1});
+                eval(top_idx);
+                synchronize();
+                out_candidate_ids[0] = top_idx.data<int32_t>()[0];
+                out_candidate_logits[0] = 0.0f;
+                *out_candidate_count = 1;
+                return 1;
+            }
+
+            auto topk_fn = compiled_topk_candidates(k);
+            const std::vector<array> topk_outputs = (*topk_fn)({logits_last});
+            if (topk_outputs.size() != 2) {
+                g_last_error = "mlx_decode_topk_candidates: invalid compiled output";
+                return 0;
+            }
+            topk = TopKCandidateBatch{
+                .logits = reshape(topk_outputs[0], {1, 1, k}),
+                .indices = reshape(topk_outputs[1], {1, 1, k}),
+                .k = k,
+            };
+            eval({topk.logits, topk.indices});
         }
-        const array& top_k_logits_flat = topk_outputs[0];
-        const array& top_k_indices_flat = topk_outputs[1];
 
-        eval({top_k_logits_flat, top_k_indices_flat});
+        const array logits_flat = reshape(topk.logits, {k});
+        const array ids_flat = reshape(astype(topk.indices, int32), {k});
+        eval({logits_flat, ids_flat});
+        synchronize();
 
-        const float* logits_ptr = top_k_logits_flat.data<float>();
-        const int32_t* ids_ptr = top_k_indices_flat.data<int32_t>();
+        const float* logits_ptr = logits_flat.data<float>();
+        const int32_t* ids_ptr = ids_flat.data<int32_t>();
         std::memcpy(out_candidate_logits, logits_ptr, static_cast<size_t>(k) * sizeof(float));
         std::memcpy(out_candidate_ids, ids_ptr, static_cast<size_t>(k) * sizeof(int32_t));
         *out_candidate_count = k;
@@ -4419,17 +6027,6 @@ int32_t mlx_decode_topk_candidates_batch(
     if (top_k <= 0) {
         g_last_error = "mlx_decode_topk_candidates_batch: top_k must be > 0";
         return 0;
-    }
-
-    if (batch_size == 1) {
-        return mlx_decode_topk_candidates(
-            ctxs[0],
-            tokens[0],
-            top_k,
-            out_candidate_logits_ptrs[0],
-            out_candidate_ids_ptrs[0],
-            &out_candidate_counts[0]
-        );
     }
 
     for (int32_t i = 0; i < batch_size; ++i) {
@@ -4922,6 +6519,9 @@ int32_t mlx_decode_topk_stream(
     int32_t top_k,
     float top_p,
     float min_p,
+    float repetition_penalty,
+    float presence_penalty,
+    float frequency_penalty,
     int32_t** out_generated_ids,
     int32_t* out_generated_len
 ) {
@@ -4957,11 +6557,28 @@ int32_t mlx_decode_topk_stream(
         g_last_error = "mlx_decode_topk_stream: min_p must be in [0,1]";
         return 0;
     }
+    if (repetition_penalty <= 0.0f) {
+        g_last_error = "mlx_decode_topk_stream: repetition_penalty must be > 0";
+        return 0;
+    }
 
     try {
         *out_generated_ids = nullptr;
         *out_generated_len = 0;
         if (decode_tokens == 0) return 1;
+        const bool fused_lm_head_profile = env_truthy("TALU_METAL_FUSED_LM_HEAD_PROFILE", false);
+        const size_t fused_hits_start = g_fused_lm_head_argmax_hits;
+        const bool topk_stream_profile = []() {
+            if (const char* raw = std::getenv("TALU_METAL_TOPK_STREAM_PROFILE")) {
+                return std::string(raw) == "1";
+            }
+            return false;
+        }();
+        uint64_t profile_forward_ns = 0;
+        uint64_t profile_penalty_ns = 0;
+        uint64_t profile_sample_ns = 0;
+        uint64_t profile_materialize_ns = 0;
+        uint64_t profile_total_ns = 0;
 
         const StreamSamplingConfig sampling_cfg{
             .temperature = temperature,
@@ -4969,42 +6586,308 @@ int32_t mlx_decode_topk_stream(
             .top_p = top_p,
             .min_p = min_p,
         };
-
-        std::vector<array> generated_token_arrays;
-        generated_token_arrays.reserve(static_cast<size_t>(decode_tokens));
-
-        const int32_t token_scalar = first_token;
-        array current_token = array(&token_scalar, Shape{1, 1}, int32);
-        array next_token = sample_token_from_logits(last_token_logits(forward_logits(ctx, current_token)), sampling_cfg);
-        async_eval(next_token);
-
-        for (int32_t i = 0; i < decode_tokens; ++i) {
-            generated_token_arrays.push_back(next_token);
-            if (i + 1 < decode_tokens) {
-                next_token = sample_token_from_logits(last_token_logits(forward_logits(ctx, next_token)), sampling_cfg);
-                async_eval(next_token);
-            }
-        }
-
-        eval(generated_token_arrays);
-
-        const size_t capacity = static_cast<size_t>(decode_tokens);
-        const size_t bytes = sizeof(int32_t) * capacity;
-        int32_t* copied = static_cast<int32_t*>(std::malloc(bytes));
-        if (!copied) {
+        const bool has_penalties =
+            repetition_penalty != 1.0f || presence_penalty != 0.0f || frequency_penalty != 0.0f;
+        const bool use_fused_greedy_decode =
+            !has_penalties &&
+            (sampling_cfg.temperature <= 0.0f || sampling_cfg.top_k <= 1) &&
+            can_use_fused_lm_head_argmax(ctx);
+        const bool use_fused_topk_decode =
+            !has_penalties &&
+            !use_fused_greedy_decode &&
+            can_use_fused_lm_head_topk(ctx, sampling_cfg.top_k);
+        const size_t output_capacity = static_cast<size_t>(decode_tokens);
+        std::unique_ptr<int32_t, decltype(&std::free)> generated_host(
+            static_cast<int32_t*>(std::malloc(sizeof(int32_t) * output_capacity)),
+            &std::free
+        );
+        if (!generated_host) {
             g_last_error = "mlx_decode_topk_stream: failed to allocate token buffer";
             return 0;
         }
-
         int32_t produced = 0;
-        for (int32_t i = 0; i < decode_tokens; ++i) {
-            const int32_t tok = *generated_token_arrays[static_cast<size_t>(i)].data<int32_t>();
-            copied[static_cast<size_t>(produced)] = tok;
-            produced += 1;
-            if (token_is_eos(tok, eos_ids, eos_len)) break;
+
+        if (!has_penalties) {
+            // Fast path: chunk decode to avoid very large token graphs and avoid
+            // per-token async scheduling overhead.
+            const int32_t topk_chunk_size = []() -> int32_t {
+                if (const char* raw = std::getenv("TALU_METAL_TOPK_CHUNK")) {
+                    char* end = nullptr;
+                    const long parsed = std::strtol(raw, &end, 10);
+                    if (end != raw && parsed > 0 && parsed <= std::numeric_limits<int32_t>::max()) {
+                        return static_cast<int32_t>(parsed);
+                    }
+                }
+                return 32;
+            }();
+            const int32_t effective_topk_chunk_size = std::min<int32_t>(topk_chunk_size, 128);
+            const int32_t token_scalar = first_token;
+            array current_token = array(&token_scalar, Shape{1, 1}, int32);
+            std::vector<array> chunk_tokens;
+            chunk_tokens.reserve(static_cast<size_t>(effective_topk_chunk_size));
+            bool saw_eos = false;
+            const auto total_t0 = std::chrono::steady_clock::now();
+            while (produced < decode_tokens && !saw_eos) {
+                const int32_t remaining = decode_tokens - produced;
+                const int32_t chunk_target = std::min(effective_topk_chunk_size, remaining);
+                chunk_tokens.clear();
+
+                const auto t_build0 = std::chrono::steady_clock::now();
+                for (int32_t i = 0; i < chunk_target; ++i) {
+                    const array next_token = use_fused_greedy_decode
+                        ? fused_lm_head_argmax_token(ctx, current_token)
+                        : (use_fused_topk_decode
+                            ? sample_token_from_topk_candidates(
+                                fused_lm_head_topk_candidates(ctx, current_token, sampling_cfg.top_k),
+                                sampling_cfg
+                              )
+                            : sample_token_from_logits(
+                                last_token_logits(forward_logits(ctx, current_token)),
+                                sampling_cfg
+                              ));
+                    async_eval(next_token);
+                    chunk_tokens.push_back(next_token);
+                    current_token = next_token;
+                }
+                const auto t_build1 = std::chrono::steady_clock::now();
+
+                const auto t_materialize0 = std::chrono::steady_clock::now();
+                eval(chunk_tokens);
+                const auto t_materialize1 = std::chrono::steady_clock::now();
+
+                for (int32_t i = 0; i < chunk_target; ++i) {
+                    const int32_t* token_ptr = chunk_tokens[static_cast<size_t>(i)].data<int32_t>();
+                    if (!token_ptr) {
+                        g_last_error = "mlx_decode_topk_stream: failed to materialize sampled token";
+                        return 0;
+                    }
+                    const int32_t tok = token_ptr[0];
+                    generated_host.get()[static_cast<size_t>(produced)] = tok;
+                    produced += 1;
+                    if (token_is_eos(tok, eos_ids, eos_len)) {
+                        saw_eos = true;
+                        break;
+                    }
+                }
+
+                if (topk_stream_profile) {
+                    profile_forward_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_build1 - t_build0).count()
+                    );
+                    profile_materialize_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_materialize1 - t_materialize0).count()
+                    );
+                }
+            }
+            if (topk_stream_profile) {
+                const auto total_t1 = std::chrono::steady_clock::now();
+                profile_total_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(total_t1 - total_t0).count()
+                );
+            }
+        } else {
+            // Penalized path.
+            ctx->sampling_context_counts.clear();
+            ctx->sampling_context_len = 0;
+
+            const int vocab = ctx->embed_tokens.ndim() == 2 ? ctx->embed_tokens.shape(0) : 0;
+            if (vocab <= 0) {
+                g_last_error = "mlx_decode_topk_stream: invalid vocab for penalties";
+                return 0;
+            }
+
+            const bool presence_only_penalty =
+                repetition_penalty == 1.0f &&
+                frequency_penalty == 0.0f &&
+                presence_penalty != 0.0f;
+
+            const int32_t penalty_chunk_size = []() -> int32_t {
+                if (const char* raw = std::getenv("TALU_METAL_TOPK_PENALTY_CHUNK")) {
+                    char* end = nullptr;
+                    const long parsed = std::strtol(raw, &end, 10);
+                    if (end != raw && parsed > 0 && parsed <= std::numeric_limits<int32_t>::max()) {
+                        return static_cast<int32_t>(parsed);
+                    }
+                }
+                return 16;
+            }();
+            const int32_t effective_penalty_chunk_size = std::min<int32_t>(penalty_chunk_size, 64);
+
+            if (presence_only_penalty) {
+                // Chunked GPU path for the common presence-only configuration.
+                // Keeps penalty state on-device and synchronizes once per chunk.
+                const float penalty_value = presence_penalty;
+                const array penalty_arr(&penalty_value, Shape{1, 1, 1}, float32);
+                array presence_mask = zeros(Shape{1, 1, vocab}, float32);
+
+                const int32_t first_token_scalar = first_token;
+                array current_token = array(&first_token_scalar, Shape{1, 1}, int32);
+                const array first_token_idx(&first_token_scalar, Shape{1, 1, 1}, int32);
+                presence_mask = put_along_axis(presence_mask, first_token_idx, penalty_arr, -1);
+                ctx->sampling_context_len = 1;
+                std::vector<array> chunk_tokens;
+                chunk_tokens.reserve(static_cast<size_t>(effective_penalty_chunk_size));
+
+                const auto total_t0 = std::chrono::steady_clock::now();
+                bool saw_eos = false;
+                while (produced < decode_tokens && !saw_eos) {
+                    const int32_t remaining = decode_tokens - produced;
+                    const int32_t chunk_target = std::min(effective_penalty_chunk_size, remaining);
+                    chunk_tokens.clear();
+
+                    const auto t_build0 = std::chrono::steady_clock::now();
+                    for (int32_t i = 0; i < chunk_target; ++i) {
+                        const array logits_last = last_token_logits(forward_logits(ctx, current_token));
+                        const array sampling_logits = logits_last - presence_mask;
+                        const array next_token = sample_token_from_logits(sampling_logits, sampling_cfg);
+                        chunk_tokens.push_back(next_token);
+
+                        const array token_idx = reshape(astype(next_token, int32), {1, 1, 1});
+                        presence_mask = put_along_axis(presence_mask, token_idx, penalty_arr, -1);
+                        current_token = next_token;
+                    }
+                    const auto t_build1 = std::chrono::steady_clock::now();
+
+                    const auto t_materialize0 = std::chrono::steady_clock::now();
+                    const array chunk_rows = concatenate(chunk_tokens, 0); // [chunk,1]
+                    const array chunk_flat = reshape(chunk_rows, {chunk_target}); // [chunk]
+                    eval(chunk_flat);
+                    const auto t_materialize1 = std::chrono::steady_clock::now();
+
+                    const int32_t* chunk_ptr = chunk_flat.data<int32_t>();
+                    for (int32_t i = 0; i < chunk_target; ++i) {
+                        const int32_t tok = chunk_ptr[static_cast<size_t>(i)];
+                        generated_host.get()[static_cast<size_t>(produced)] = tok;
+                        produced += 1;
+                        ctx->sampling_context_len += 1;
+                        if (token_is_eos(tok, eos_ids, eos_len)) {
+                            saw_eos = true;
+                            break;
+                        }
+                    }
+
+                    if (topk_stream_profile) {
+                        profile_forward_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_build1 - t_build0).count()
+                        );
+                        profile_materialize_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_materialize1 - t_materialize0).count()
+                        );
+                    }
+                }
+
+                if (topk_stream_profile) {
+                    const auto total_t1 = std::chrono::steady_clock::now();
+                    profile_total_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(total_t1 - total_t0).count()
+                    );
+                }
+            } else {
+                // General penalized path: keep token counts on-device and decode
+                // in bounded chunks to avoid host sync per token.
+                const array zero_counts = zeros(Shape{1, 1, vocab}, float32);
+                array token_counts = zero_counts;
+                const array one_count = array(1.0f, float32);
+                auto penalized_sample_fn = compiled_penalized_sampling_step(
+                    sampling_cfg,
+                    repetition_penalty,
+                    presence_penalty,
+                    frequency_penalty
+                );
+
+                const int32_t first_token_scalar = first_token;
+                array current_token = array(&first_token_scalar, Shape{1, 1}, int32);
+                const array first_token_idx(&first_token_scalar, Shape{1, 1, 1}, int32);
+                token_counts = put_along_axis(token_counts, first_token_idx, one_count, -1);
+                ctx->sampling_context_len = 1;
+                std::vector<array> chunk_tokens;
+                chunk_tokens.reserve(static_cast<size_t>(effective_penalty_chunk_size));
+
+                const auto total_t0 = std::chrono::steady_clock::now();
+                bool saw_eos = false;
+                while (produced < decode_tokens && !saw_eos) {
+                    const int32_t remaining = decode_tokens - produced;
+                    const int32_t chunk_target = std::min(effective_penalty_chunk_size, remaining);
+                    chunk_tokens.clear();
+
+                    const auto t_build0 = std::chrono::steady_clock::now();
+                    for (int32_t i = 0; i < chunk_target; ++i) {
+                        const array logits_last = last_token_logits(forward_logits(ctx, current_token));
+                        const std::vector<array> sampled_outputs = (*penalized_sample_fn)({logits_last, token_counts});
+                        if (sampled_outputs.size() != 2) {
+                            throw std::runtime_error("mlx_decode_topk_stream: invalid penalized sample output");
+                        }
+                        const array next_token = sampled_outputs[0];
+                        token_counts = sampled_outputs[1];
+                        chunk_tokens.push_back(next_token);
+                        current_token = next_token;
+                    }
+                    const auto t_build1 = std::chrono::steady_clock::now();
+
+                    const auto t_materialize0 = std::chrono::steady_clock::now();
+                    const array chunk_rows = concatenate(chunk_tokens, 0); // [chunk,1]
+                    const array chunk_flat = reshape(chunk_rows, {chunk_target}); // [chunk]
+                    eval(chunk_flat);
+                    const auto t_materialize1 = std::chrono::steady_clock::now();
+
+                    const int32_t* chunk_ptr = chunk_flat.data<int32_t>();
+                    for (int32_t i = 0; i < chunk_target; ++i) {
+                        const int32_t tok = chunk_ptr[static_cast<size_t>(i)];
+                        if (tok < 0 || tok >= vocab) {
+                            throw std::runtime_error("mlx_decode_topk_stream: sampled token out of range");
+                        }
+                        generated_host.get()[static_cast<size_t>(produced)] = tok;
+                        produced += 1;
+                        ctx->sampling_context_len += 1;
+                        if (token_is_eos(tok, eos_ids, eos_len)) {
+                            saw_eos = true;
+                            break;
+                        }
+                    }
+
+                    if (topk_stream_profile) {
+                        profile_forward_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_build1 - t_build0).count()
+                        );
+                        profile_materialize_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_materialize1 - t_materialize0).count()
+                        );
+                    }
+                }
+
+                if (topk_stream_profile) {
+                    const auto total_t1 = std::chrono::steady_clock::now();
+                    profile_total_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(total_t1 - total_t0).count()
+                    );
+                }
+            }
         }
 
-        *out_generated_ids = copied;
+        if (topk_stream_profile) {
+            std::fprintf(
+                stderr,
+                "[mlx][topk_stream_profile] tokens=%zu total_ms=%.3f forward_ms=%.3f penalty_ms=%.3f sample_ms=%.3f materialize_ms=%.3f\n",
+                static_cast<size_t>(produced),
+                static_cast<double>(profile_total_ns) / 1e6,
+                static_cast<double>(profile_forward_ns) / 1e6,
+                static_cast<double>(profile_penalty_ns) / 1e6,
+                static_cast<double>(profile_sample_ns) / 1e6,
+                static_cast<double>(profile_materialize_ns) / 1e6
+            );
+        }
+        if (fused_lm_head_profile) {
+            const size_t fused_hits = g_fused_lm_head_argmax_hits - fused_hits_start;
+            std::fprintf(
+                stderr,
+                "[mlx][fused_lm_head_argmax] used=%s hits=%zu mode=topk_stream top_k=%d temperature=%.4f\n",
+                (use_fused_greedy_decode || use_fused_topk_decode) ? "1" : "0",
+                fused_hits,
+                top_k,
+                static_cast<double>(temperature)
+            );
+        }
+        *out_generated_ids = generated_host.release();
         *out_generated_len = produced;
         return 1;
     } catch (const std::exception& e) {
@@ -5044,6 +6927,8 @@ int32_t mlx_run(
         *out_generated_ids = nullptr;
         *out_generated_len = 0;
         const bool capture_tokens = capture_generated_tokens != 0;
+        const bool fused_lm_head_profile = env_truthy("TALU_METAL_FUSED_LM_HEAD_PROFILE", false);
+        const size_t fused_hits_start = g_fused_lm_head_argmax_hits;
 
         std::vector<int32_t> prompt_vec(prompt_ids, prompt_ids + prompt_len);
         std::vector<int32_t> captured_tokens;
@@ -5064,8 +6949,9 @@ int32_t mlx_run(
 
                 const int32_t last_token_scalar = prompt_vec[static_cast<size_t>(prompt_len - 1)];
                 const array last_token_arr(&last_token_scalar, Shape{1, 1}, int32);
-                const array seed_logits = forward_logits(ctx, last_token_arr);
-                token_ids = next_token_greedy(last_token_logits(seed_logits));
+                token_ids = can_use_fused_lm_head_argmax(ctx)
+                    ? fused_lm_head_argmax_token(ctx, last_token_arr)
+                    : next_token_greedy(last_token_logits(forward_logits(ctx, last_token_arr)));
             } else {
                 const array prompt_arr(prompt_vec.begin(), Shape{1, prompt_len}, int32);
                 const array seed_logits = forward_logits(ctx, prompt_arr);
@@ -5078,7 +6964,9 @@ int32_t mlx_run(
             auto t2 = std::chrono::steady_clock::now();
             // Match mlx-lm generation scheduling: seed first decode token,
             // then run one-step lookahead with async eval.
-            array current_token = next_token_greedy(last_token_logits(forward_logits(ctx, token_ids)));
+            array current_token = can_use_fused_lm_head_argmax(ctx)
+                ? fused_lm_head_argmax_token(ctx, token_ids)
+                : next_token_greedy(last_token_logits(forward_logits(ctx, token_ids)));
             async_eval(current_token);
 
             if (capture_tokens && !is_warmup) {
@@ -5090,21 +6978,28 @@ int32_t mlx_run(
                 for (int i = 0; i < decode_tokens; ++i) {
                     captured_token_arrays.push_back(current_token);
                     if (i + 1 < decode_tokens) {
-                        const array next_token = next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
+                        const array next_token = can_use_fused_lm_head_argmax(ctx)
+                            ? fused_lm_head_argmax_token(ctx, current_token)
+                            : next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
                         async_eval(next_token);
                         current_token = next_token;
                     }
                 }
 
-                eval(captured_token_arrays);
-                for (int i = 0; i < decode_tokens; ++i) {
-                    captured_tokens[static_cast<size_t>(i)] =
-                        captured_token_arrays[static_cast<size_t>(i)].item<int32_t>();
-                }
+                const array captured_rows = concatenate(captured_token_arrays, 0); // [T,1]
+                const array captured_flat = reshape(astype(captured_rows, int32), {decode_tokens}); // [T]
+                eval(captured_flat);
+                std::memcpy(
+                    captured_tokens.data(),
+                    captured_flat.data<int32_t>(),
+                    sizeof(int32_t) * static_cast<size_t>(decode_tokens)
+                );
             } else {
                 for (int i = 0; i < decode_tokens; ++i) {
                     if (i + 1 < decode_tokens) {
-                        const array next_token = next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
+                        const array next_token = can_use_fused_lm_head_argmax(ctx)
+                            ? fused_lm_head_argmax_token(ctx, current_token)
+                            : next_token_greedy(last_token_logits(forward_logits(ctx, current_token)));
                         async_eval(next_token);
                         if (i == 0) {
                             eval(current_token);
@@ -5141,6 +7036,15 @@ int32_t mlx_run(
             std::memcpy(copied, captured_tokens.data(), bytes);
             *out_generated_ids = copied;
             *out_generated_len = static_cast<int32_t>(captured_tokens.size());
+        }
+        if (fused_lm_head_profile) {
+            const size_t fused_hits = g_fused_lm_head_argmax_hits - fused_hits_start;
+            std::fprintf(
+                stderr,
+                "[mlx][fused_lm_head_argmax] used=%s hits=%zu mode=run\n",
+                can_use_fused_lm_head_argmax(ctx) ? "1" : "0",
+                fused_hits
+            );
         }
 
         *out_result = best;

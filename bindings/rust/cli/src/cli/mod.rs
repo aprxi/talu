@@ -1,6 +1,7 @@
 mod ask;
 mod convert;
 mod db;
+mod eval;
 mod file;
 mod models;
 mod repo;
@@ -80,6 +81,8 @@ pub(super) enum Commands {
     Xray(XrayArgs),
     /// Agent mode (tool-calling loop with execute_command)
     Agent(AgentArgs),
+    /// Evaluate model quality metrics
+    Eval(EvalArgs),
     /// Set default model (interactive picker or explicit)
     Set(SetArgs),
     /// Inspect and transform input files for inference
@@ -365,7 +368,7 @@ pub(super) struct ConvertArgs {
     pub scheme: String,
 
     /// Quality profile (best|good|balanced|fast|custom)
-    #[arg(long, default_value = "best", value_name = "PROFILE", num_args = 1)]
+    #[arg(long, default_value = "fast", value_name = "PROFILE", num_args = 1)]
     pub profile: String,
 
     /// Deterministic seed for conversion calibration/search
@@ -697,6 +700,44 @@ pub(super) struct XrayArgs {
     pub prompt: Vec<String>,
 }
 
+#[derive(Args)]
+pub(super) struct EvalArgs {
+    #[command(subcommand)]
+    pub command: EvalCommands,
+}
+
+#[derive(Subcommand)]
+pub(super) enum EvalCommands {
+    /// Compute PPL (and KLD when --reference is provided) on a text dataset
+    Ppl(EvalPplArgs),
+}
+
+#[derive(Args)]
+pub(super) struct EvalPplArgs {
+    /// Model to evaluate (local path or HuggingFace model ID)
+    pub model: String,
+
+    /// Plain-text dataset file path
+    #[arg(long)]
+    pub dataset: PathBuf,
+
+    /// Optional reference model for delta reporting
+    #[arg(long)]
+    pub reference: Option<String>,
+
+    /// Maximum total tokens to evaluate (0 = all)
+    #[arg(long, default_value_t = 0usize)]
+    pub max_tokens: usize,
+
+    /// Maximum context window used per scored token (0 = unbounded)
+    #[arg(long, default_value_t = 2048usize)]
+    pub context: usize,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Configure log level based on verbosity flags
 fn configure_logging(verbose: u8, log_format: Option<CliLogFormat>, log_filter: Option<&str>) {
     // Set log level based on -v count
@@ -736,7 +777,7 @@ fn should_implicit_ask(args: &[String], stdin_is_pipe: bool) -> bool {
     // If first arg is a known subcommand, don't add implicit ask
     let subcommands = [
         "ask", "help", "serve", "convert", "tokenize", "ls", "get", "rm", "describe", "xray",
-        "agent", "set", "sample", "file", "sql",
+        "agent", "eval", "set", "sample", "file", "sql",
     ];
     if subcommands.iter().any(|&cmd| cmd == first) {
         return false;
@@ -804,6 +845,7 @@ fn run_inner() -> Result<()> {
         Some(Commands::Describe(args)) => models::cmd_describe(args),
         Some(Commands::Xray(args)) => xray::cmd_xray(args),
         Some(Commands::Agent(args)) => shell::cmd_agent(args, stdin_is_pipe),
+        Some(Commands::Eval(args)) => eval::cmd_eval(args),
         Some(Commands::Set(args)) => cmd_set(args),
         Some(Commands::File(args)) => file::cmd_file(args),
         Some(Commands::Sql(args)) => sql::cmd_sql(args),
@@ -1160,6 +1202,7 @@ mod tests {
         match cli.command {
             Some(Commands::Convert(args)) => {
                 assert_eq!(args.scheme, "mxfp8");
+                assert_eq!(args.profile, "fast");
                 assert_eq!(args.seed, 1234);
             }
             _ => panic!("expected convert command"),
@@ -1578,5 +1621,37 @@ mod tests {
     #[test]
     fn reject_shell_subcommand() {
         assert!(parse(&["talu", "shell", "--model", "Qwen/Qwen3-0.6B", "pwd"]).is_err());
+    }
+
+    #[test]
+    fn parse_eval_ppl_command() {
+        let cli = parse(&[
+            "talu",
+            "eval",
+            "ppl",
+            "Qwen/Qwen3.5-2B-MXFP8",
+            "--dataset",
+            "temp/evals/wikitext-2-raw-v1/test.txt",
+            "--reference",
+            "Qwen/Qwen3.5-2B",
+            "--context",
+            "2048",
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Eval(args)) => match args.command {
+                EvalCommands::Ppl(ppl) => {
+                    assert_eq!(ppl.model, "Qwen/Qwen3.5-2B-MXFP8");
+                    assert_eq!(
+                        ppl.dataset,
+                        PathBuf::from("temp/evals/wikitext-2-raw-v1/test.txt")
+                    );
+                    assert_eq!(ppl.reference.as_deref(), Some("Qwen/Qwen3.5-2B"));
+                    assert_eq!(ppl.context, 2048);
+                }
+            },
+            _ => panic!("expected eval command"),
+        }
     }
 }

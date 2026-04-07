@@ -31,12 +31,12 @@ const DEFS = [_]SchemeDefinition{
     // No quantization
     .{ .val = .f16, .name = "f16", .aliases = &.{ "16bit", "half" } },
 
-    // Grouped Affine (MLX Compatible) - Map generic aliases to group_size=64
-    .{ .val = .gaf4_32, .name = "gaf4_32", .aliases = &.{} },
-    .{ .val = .gaf4_64, .name = "gaf4_64", .aliases = &.{ "mlx", "mlx4", "gaf4", "4bit", "q4", "int4" } },
+    // Grouped Affine (MLX Compatible) - Map generic aliases to group_size=32
+    .{ .val = .gaf4_32, .name = "gaf4_32", .aliases = &.{ "mlx", "mlx4", "gaf4", "4bit", "q4", "int4" } },
+    .{ .val = .gaf4_64, .name = "gaf4_64", .aliases = &.{} },
     .{ .val = .gaf4_128, .name = "gaf4_128", .aliases = &.{} },
-    .{ .val = .gaf8_32, .name = "gaf8_32", .aliases = &.{} },
-    .{ .val = .gaf8_64, .name = "gaf8_64", .aliases = &.{ "mlx8", "gaf8", "8bit", "q8", "int8" } },
+    .{ .val = .gaf8_32, .name = "gaf8_32", .aliases = &.{ "mlx8", "gaf8", "8bit", "q8", "int8" } },
+    .{ .val = .gaf8_64, .name = "gaf8_64", .aliases = &.{} },
     .{ .val = .gaf8_128, .name = "gaf8_128", .aliases = &.{} },
 
     // Hardware Float
@@ -54,9 +54,9 @@ const DEFS = [_]SchemeDefinition{
 /// Target platform for optimized conversion.
 /// Different platforms benefit from different quantization formats.
 pub const Platform = enum(u32) {
-    cpu = 0, // Generic CPU: use Grouped Affine (gaf4_64, gaf8_64, f16)
-    metal = 1, // Apple Silicon: use Grouped Affine (gaf4_64, gaf8_64, f16)
-    cuda = 2, // NVIDIA GPU: use Grouped Affine (gaf4_64, gaf8_64, f16)
+    cpu = 0, // Generic CPU: use Grouped Affine (gaf4_32, gaf8_32, f16)
+    metal = 1, // Apple Silicon: use Grouped Affine (gaf4_32, gaf8_32, f16)
+    cuda = 2, // NVIDIA GPU: use Grouped Affine (gaf4_32, gaf8_32, f16)
 
     /// Parse platform from string (case-insensitive).
     pub fn fromString(s: []const u8) ?Platform {
@@ -141,7 +141,7 @@ pub const Scheme = enum(u32) {
 
     // Grouped Affine (MLX compatible) - values 10-15
     gaf4_32 = 10, // 4-bit, group_size=32 (highest accuracy)
-    gaf4_64 = 11, // 4-bit, group_size=64 (balanced, DEFAULT)
+    gaf4_64 = 11, // 4-bit, group_size=64 (exception)
     gaf4_128 = 12, // 4-bit, group_size=128 (smallest)
     gaf8_32 = 13, // 8-bit, group_size=32
     gaf8_64 = 14, // 8-bit, group_size=64
@@ -214,11 +214,11 @@ pub const Scheme = enum(u32) {
     pub fn toOutputSuffix(self: Scheme) []const u8 {
         return switch (self) {
             .f16 => "F16",
-            .gaf4_32 => "GAF4-G32",
-            .gaf4_64 => "GAF4",
+            .gaf4_32 => "GAF4",
+            .gaf4_64 => "GAF4-G64",
             .gaf4_128 => "GAF4-G128",
-            .gaf8_32 => "GAF8-G32",
-            .gaf8_64 => "GAF8",
+            .gaf8_32 => "GAF8",
+            .gaf8_64 => "GAF8-G64",
             .gaf8_128 => "GAF8-G128",
             .fp8_e4m3 => "FP8",
             .fp8_e5m2 => "FP8-E5M2",
@@ -255,20 +255,20 @@ pub const Scheme = enum(u32) {
     ///
     /// | Platform | Quant | Resolved Scheme |
     /// | -------- | ----- | --------------- |
-    /// | cpu      | q4    | gaf4_64         |
-    /// | cpu      | q8    | gaf8_64         |
+    /// | cpu      | q4    | gaf4_32         |
+    /// | cpu      | q8    | gaf8_32         |
     /// | cpu      | q16   | f16             |
-    /// | metal    | q4    | gaf4_64         |
-    /// | metal    | q8    | gaf8_64         |
+    /// | metal    | q4    | gaf4_32         |
+    /// | metal    | q8    | gaf8_32         |
     /// | metal    | q16   | f16             |
-    /// | cuda     | q4    | gaf4_64         |
-    /// | cuda     | q8    | gaf8_64         |
+    /// | cuda     | q4    | gaf4_32         |
+    /// | cuda     | q8    | gaf8_32         |
     /// | cuda     | q16   | f16             |
     pub fn resolve(platform: Platform, quant: QuantLevel) Scheme {
         _ = platform; // All platforms use the same schemes now
         return switch (quant) {
-            .q4 => .gaf4_64,
-            .q8 => .gaf8_64,
+            .q4 => .gaf4_32,
+            .q8 => .gaf8_32,
             .q16 => .f16,
         };
     }
@@ -409,7 +409,7 @@ pub const MAX_OVERRIDES: usize = 32;
 /// Pattern uses glob syntax (e.g., "model.layers.*.mlp.experts.*").
 pub const OverrideRule = extern struct {
     pattern: ?[*:0]const u8 = null,
-    scheme: Scheme = .gaf4_64,
+    scheme: Scheme = .gaf4_32,
 };
 
 // =============================================================================
@@ -419,7 +419,7 @@ pub const OverrideRule = extern struct {
 /// Conversion options.
 pub const ConvertOptions = extern struct {
     /// Explicit scheme selection. Ignored if use_platform_quant is true.
-    scheme: Scheme = .gaf4_64,
+    scheme: Scheme = .gaf4_32,
     force: bool = false,
     offline: bool = false,
     destination: ?[*:0]const u8 = null,
@@ -440,7 +440,7 @@ pub const ConvertOptions = extern struct {
     /// If true, resolve scheme from platform/quant instead of using scheme directly.
     use_platform_quant: bool = false,
     /// Calibration profile for MXFP8/NVFP4 conversion.
-    calibration_profile: QualityProfile = .best,
+    calibration_profile: QualityProfile = .fast,
     /// Deterministic calibration seed.
     calibration_seed: u64 = 42,
     /// Explicit calibration iteration override.
@@ -645,7 +645,7 @@ fn validateMxfp8Config(config_obj: std.json.ObjectMap) !void {
 
 fn validateNvfp4Config(config_obj: std.json.ObjectMap) !void {
     const quant = objectFieldAsObject(config_obj, "quantization") orelse return error.InvalidConfig;
-    if ((objectFieldAsInt(quant, "group_size") orelse return error.InvalidConfig) != 32) return error.InvalidConfig;
+    if ((objectFieldAsInt(quant, "group_size") orelse return error.InvalidConfig) != 16) return error.InvalidConfig;
     if ((objectFieldAsInt(quant, "bits") orelse return error.InvalidConfig) != 4) return error.InvalidConfig;
 
     const qcfg = objectFieldAsObject(config_obj, "quantization_config") orelse return error.InvalidConfig;
@@ -655,8 +655,17 @@ fn validateNvfp4Config(config_obj: std.json.ObjectMap) !void {
     if ((objectFieldAsInt(qcfg, "quant_contract_version") orelse return error.InvalidConfig) != supported_quant_contract_version) {
         return error.InvalidConfig;
     }
-    if ((objectFieldAsInt(qcfg, "group_size") orelse return error.InvalidConfig) != 32) return error.InvalidConfig;
+    if ((objectFieldAsInt(qcfg, "group_size") orelse return error.InvalidConfig) != 16) return error.InvalidConfig;
     if ((objectFieldAsInt(qcfg, "bits") orelse return error.InvalidConfig) != 4) return error.InvalidConfig;
+    if (!std.mem.eql(u8, objectFieldAsString(qcfg, "fmt") orelse return error.InvalidConfig, "e2m1")) {
+        return error.InvalidConfig;
+    }
+    if (!std.mem.eql(u8, objectFieldAsString(qcfg, "scale_fmt") orelse return error.InvalidConfig, "e4m3")) {
+        return error.InvalidConfig;
+    }
+    if (!std.mem.eql(u8, objectFieldAsString(qcfg, "tensor_layout") orelse return error.InvalidConfig, "weight_packed+weight_scale")) {
+        return error.InvalidConfig;
+    }
 }
 
 fn validateMxfp8Weights(allocator: std.mem.Allocator, output_path: []const u8) !void {
@@ -713,32 +722,44 @@ fn validateNvfp4Weights(allocator: std.mem.Allocator, output_path: []const u8) !
 
     var saw_nvfp4_weight = false;
     for (names) |name| {
-        const weight_tensor = st.getTensor(name, null) catch continue;
-        if (weight_tensor.dtype != .grouped_affine_u4) continue;
+        if (!std.mem.endsWith(u8, name, ".weight_packed")) continue;
         saw_nvfp4_weight = true;
-        if (!std.mem.endsWith(u8, name, ".weight")) continue;
-        if (weight_tensor.n_dims != 2) return error.InvalidConfig;
-        if (weight_tensor.shape[0] <= 0 or weight_tensor.shape[1] <= 0) return error.InvalidConfig;
 
-        const base = name[0 .. name.len - ".weight".len];
-        const scales_name = try std.fmt.allocPrint(allocator, "{s}.scales", .{base});
-        defer allocator.free(scales_name);
-        const biases_name = try std.fmt.allocPrint(allocator, "{s}.biases", .{base});
-        defer allocator.free(biases_name);
-        if (!st.hasTensor(scales_name) or !st.hasTensor(biases_name)) return error.InvalidConfig;
+        const packed_weight = try st.getTensor(name, null);
+        if (packed_weight.dtype != .u8 and packed_weight.dtype != .i8) return error.InvalidConfig;
+        if (packed_weight.n_dims != 2) return error.InvalidConfig;
+        if (packed_weight.shape[0] <= 0 or packed_weight.shape[1] <= 0) return error.InvalidConfig;
 
-        const scales = try st.getTensor(scales_name, null);
-        const biases = try st.getTensor(biases_name, null);
-        if (scales.n_dims != 2 or biases.n_dims != 2) return error.InvalidConfig;
-        if ((scales.dtype != .bf16 and scales.dtype != .f16) or (biases.dtype != .bf16 and biases.dtype != .f16)) {
-            return error.InvalidConfig;
+        const base = name[0 .. name.len - ".weight_packed".len];
+        const scale_name = try std.fmt.allocPrint(allocator, "{s}.weight_scale", .{base});
+        defer allocator.free(scale_name);
+        if (!st.hasTensor(scale_name)) return error.InvalidConfig;
+
+        const scale_tensor = try st.getTensor(scale_name, null);
+        if (scale_tensor.dtype != .f8_e4m3) return error.InvalidConfig;
+        if (scale_tensor.n_dims != 2) return error.InvalidConfig;
+        if (scale_tensor.shape[0] != packed_weight.shape[0]) return error.InvalidConfig;
+
+        var grouped_weight_name_buf: [320]u8 = undefined;
+        const grouped_weight_name = try std.fmt.bufPrint(&grouped_weight_name_buf, "{s}.weight", .{base});
+        if (st.hasTensor(grouped_weight_name)) {
+            const grouped_weight = try st.getTensor(grouped_weight_name, null);
+            if (grouped_weight.dtype == .grouped_affine_u4) return error.InvalidConfig;
         }
-        if (scales.shape[0] != weight_tensor.shape[0] or biases.shape[0] != weight_tensor.shape[0]) return error.InvalidConfig;
 
-        const packed_cols: i64 = weight_tensor.shape[1];
-        if (@mod(packed_cols, 4) != 0) return error.InvalidConfig;
-        const expected_group_cols: i64 = @divTrunc(packed_cols, 4);
-        if (scales.shape[1] != expected_group_cols or biases.shape[1] != expected_group_cols) return error.InvalidConfig;
+        var grouped_scales_name_buf: [320]u8 = undefined;
+        const grouped_scales_name = try std.fmt.bufPrint(&grouped_scales_name_buf, "{s}.scales", .{base});
+        if (st.hasTensor(grouped_scales_name)) return error.InvalidConfig;
+
+        var grouped_biases_name_buf: [320]u8 = undefined;
+        const grouped_biases_name = try std.fmt.bufPrint(&grouped_biases_name_buf, "{s}.biases", .{base});
+        if (st.hasTensor(grouped_biases_name)) return error.InvalidConfig;
+
+        const packed_cols: i64 = packed_weight.shape[1];
+        const unpacked_cols = std.math.mul(i64, packed_cols, 2) catch return error.InvalidConfig;
+        if (@mod(unpacked_cols, 16) != 0) return error.InvalidConfig;
+        const expected_scale_cols: i64 = @divTrunc(unpacked_cols, 16);
+        if (scale_tensor.shape[1] != expected_scale_cols) return error.InvalidConfig;
     }
 
     if (!saw_nvfp4_weight) return error.InvalidConfig;
@@ -1031,7 +1052,7 @@ test "Scheme.getMethod" {
 test "Scheme.getBits" {
     try std.testing.expectEqual(@as(u8, 16), Scheme.f16.getBits());
     try std.testing.expectEqual(@as(u8, 4), Scheme.gaf4_64.getBits());
-    try std.testing.expectEqual(@as(u8, 8), Scheme.gaf8_64.getBits());
+    try std.testing.expectEqual(@as(u8, 8), Scheme.gaf8_32.getBits());
 }
 
 test "Scheme.getGroupSize" {
@@ -1046,21 +1067,21 @@ test "Scheme.fromString" {
     try std.testing.expect(Scheme.fromString("invalid") == null);
 
     // Aliases - now map to GAF
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.fromString("4bit").?);
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.fromString("q4").?);
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.fromString("int4").?);
-    try std.testing.expectEqual(Scheme.gaf8_64, Scheme.fromString("8bit").?);
-    try std.testing.expectEqual(Scheme.gaf8_64, Scheme.fromString("int8").?);
+    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("4bit").?);
+    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("q4").?);
+    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("int4").?);
+    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.fromString("8bit").?);
+    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.fromString("int8").?);
     try std.testing.expectEqual(Scheme.f16, Scheme.fromString("16bit").?);
     try std.testing.expectEqual(Scheme.f16, Scheme.fromString("half").?);
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.fromString("mlx").?);
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.fromString("mlx4").?);
-    try std.testing.expectEqual(Scheme.gaf8_64, Scheme.fromString("mlx8").?);
+    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("mlx").?);
+    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("mlx4").?);
+    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.fromString("mlx8").?);
     try std.testing.expectEqual(Scheme.fp8_e4m3, Scheme.fromString("fp8").?);
 
     // Case insensitive aliases
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.fromString("4BIT").?);
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.fromString("MLX").?);
+    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("4BIT").?);
+    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.fromString("MLX").?);
 }
 
 test "Scheme.toString" {
@@ -1074,14 +1095,14 @@ test "Scheme.all_schemes_json" {
     try std.testing.expect(scheme_json[0] == '{');
     try std.testing.expect(scheme_json[scheme_json.len - 1] == '}');
     // Check it contains expected schemes and aliases
-    try std.testing.expect(std.mem.indexOf(u8, scheme_json, "\"gaf4_64\":[\"mlx\",\"mlx4\",\"gaf4\",\"4bit\",\"q4\",\"int4\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scheme_json, "\"gaf4_32\":[\"mlx\",\"mlx4\",\"gaf4\",\"4bit\",\"q4\",\"int4\"]") != null);
 }
 
 test "Scheme.all_schemes_string" {
     const csv = Scheme.all_schemes_string;
     // Check it contains expected schemes
     try std.testing.expect(std.mem.indexOf(u8, csv, "gaf4_64") != null);
-    try std.testing.expect(std.mem.indexOf(u8, csv, "gaf8_64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, csv, "gaf8_32") != null);
 }
 
 test "Platform.fromString" {
@@ -1338,34 +1359,68 @@ test "validateCanonicalOutput accepts canonical nvfp4 artifact" {
     {
         var file = try std.fs.cwd().createFile(config_path, .{});
         defer file.close();
-        try file.writeAll("{\"quantization\":{\"group_size\":32,\"bits\":4},\"quantization_config\":{\"quant_method\":\"nvfp4\",\"quant_type\":\"nvfp4\",\"bits\":4,\"group_size\":32,\"quant_contract_version\":1}}");
+        try file.writeAll("{\"quantization\":{\"group_size\":16,\"bits\":4},\"quantization_config\":{\"quant_method\":\"nvfp4\",\"quant_type\":\"nvfp4\",\"bits\":4,\"group_size\":16,\"fmt\":\"e2m1\",\"scale_fmt\":\"e4m3\",\"tensor_layout\":\"weight_packed+weight_scale\",\"quant_contract_version\":1}}");
     }
 
     var builder = safetensors.Builder.init(allocator);
     defer builder.deinit();
-    var qweight: [16]u8 = [_]u8{0} ** 16;
-    var scales: [2]u8 = .{ 0x00, 0x3C };
-    var biases: [2]u8 = .{ 0x00, 0x00 };
-    try builder.addTensor("layer.weight", .grouped_affine_u4, &[_]usize{ 1, 4 }, &qweight);
-    try builder.addTensor("layer.scales", .bf16, &[_]usize{ 1, 1 }, &scales);
-    try builder.addTensor("layer.biases", .bf16, &[_]usize{ 1, 1 }, &biases);
+    var packed_bytes: [16]u8 = [_]u8{0} ** 16;
+    var scales: [2]u8 = .{ 0x38, 0x38 };
+    var global_scale = [_]f32{1.0};
+    try builder.addTensor("layer.weight_packed", .u8, &[_]usize{ 1, 16 }, &packed_bytes);
+    try builder.addTensor("layer.weight_scale", .f8_e4m3, &[_]usize{ 1, 2 }, &scales);
+    try builder.addTensor("layer.weight_global_scale", .f32, &[_]usize{1}, std.mem.sliceAsBytes(&global_scale));
     try builder.save(dir_path, "model.safetensors");
 
     try validateCanonicalOutput(allocator, dir_path, .nvfp4);
 }
 
+test "validateCanonicalOutput rejects hybrid nvfp4 artifact" {
+    const allocator = std.testing.allocator;
+
+    const dir_path = "/tmp/test_validate_canonical_nvfp4_hybrid";
+    std.fs.cwd().makeDir(dir_path) catch {};
+    defer std.fs.cwd().deleteTree(dir_path) catch {};
+
+    {
+        const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+        defer allocator.free(config_path);
+        var file = try std.fs.cwd().createFile(config_path, .{});
+        defer file.close();
+        try file.writeAll("{\"quantization\":{\"group_size\":16,\"bits\":4},\"quantization_config\":{\"quant_method\":\"nvfp4\",\"quant_type\":\"nvfp4\",\"bits\":4,\"group_size\":16,\"fmt\":\"e2m1\",\"scale_fmt\":\"e4m3\",\"tensor_layout\":\"weight_packed+weight_scale\",\"quant_contract_version\":1}}");
+    }
+
+    var builder = safetensors.Builder.init(allocator);
+    defer builder.deinit();
+    var packed_bytes: [16]u8 = [_]u8{0x21} ** 16;
+    var scales: [2]u8 = .{ 0x38, 0x38 };
+    const global_scale: [1]f32 = .{1.0};
+    var grouped_weight: [2]u32 = .{ 0, 0 };
+    var grouped_scales: [4]u16 = .{ 0, 0, 0, 0 };
+    var grouped_biases: [4]u16 = .{ 0, 0, 0, 0 };
+    try builder.addTensor("layer.weight_packed", .u8, &[_]usize{ 1, 16 }, &packed_bytes);
+    try builder.addTensor("layer.weight_scale", .f8_e4m3, &[_]usize{ 1, 2 }, &scales);
+    try builder.addTensor("layer.weight_global_scale", .f32, &[_]usize{1}, std.mem.sliceAsBytes(&global_scale));
+    try builder.addTensor("layer.weight", .grouped_affine_u4, &[_]usize{ 1, 2 }, std.mem.sliceAsBytes(&grouped_weight));
+    try builder.addTensor("layer.scales", .bf16, &[_]usize{ 1, 4 }, std.mem.sliceAsBytes(&grouped_scales));
+    try builder.addTensor("layer.biases", .bf16, &[_]usize{ 1, 4 }, std.mem.sliceAsBytes(&grouped_biases));
+    try builder.save(dir_path, "model.safetensors");
+
+    try std.testing.expectError(error.InvalidConfig, validateCanonicalOutput(allocator, dir_path, .nvfp4));
+}
+
 test "Scheme.resolve - all platforms use GAF" {
     // All platforms now use GAF schemes
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.resolve(.cpu, .q4));
-    try std.testing.expectEqual(Scheme.gaf8_64, Scheme.resolve(.cpu, .q8));
+    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.resolve(.cpu, .q4));
+    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.resolve(.cpu, .q8));
     try std.testing.expectEqual(Scheme.f16, Scheme.resolve(.cpu, .q16));
 
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.resolve(.metal, .q4));
-    try std.testing.expectEqual(Scheme.gaf8_64, Scheme.resolve(.metal, .q8));
+    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.resolve(.metal, .q4));
+    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.resolve(.metal, .q8));
     try std.testing.expectEqual(Scheme.f16, Scheme.resolve(.metal, .q16));
 
-    try std.testing.expectEqual(Scheme.gaf4_64, Scheme.resolve(.cuda, .q4));
-    try std.testing.expectEqual(Scheme.gaf8_64, Scheme.resolve(.cuda, .q8));
+    try std.testing.expectEqual(Scheme.gaf4_32, Scheme.resolve(.cuda, .q4));
+    try std.testing.expectEqual(Scheme.gaf8_32, Scheme.resolve(.cuda, .q8));
     try std.testing.expectEqual(Scheme.f16, Scheme.resolve(.cuda, .q16));
 }
 
@@ -1380,18 +1435,18 @@ test "ConvertOptions.getEffectiveScheme - platform/quant resolution" {
     var opts = std.mem.zeroes(ConvertOptions);
     opts.use_platform_quant = true;
 
-    // CPU + 4bit -> gaf4_64
+    // CPU + 4bit -> gaf4_32
     opts.platform = .cpu;
     opts.quant = .q4;
-    try std.testing.expectEqual(Scheme.gaf4_64, opts.getEffectiveScheme());
+    try std.testing.expectEqual(Scheme.gaf4_32, opts.getEffectiveScheme());
 
-    // Metal + 4bit -> gaf4_64
+    // Metal + 4bit -> gaf4_32
     opts.platform = .metal;
     opts.quant = .q4;
-    try std.testing.expectEqual(Scheme.gaf4_64, opts.getEffectiveScheme());
+    try std.testing.expectEqual(Scheme.gaf4_32, opts.getEffectiveScheme());
 
-    // Metal + 8bit -> gaf8_64
+    // Metal + 8bit -> gaf8_32
     opts.platform = .metal;
     opts.quant = .q8;
-    try std.testing.expectEqual(Scheme.gaf8_64, opts.getEffectiveScheme());
+    try std.testing.expectEqual(Scheme.gaf8_32, opts.getEffectiveScheme());
 }
