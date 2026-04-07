@@ -1948,6 +1948,52 @@ pub fn warmupDequantF16Cache(self: anytype) !void {
         return;
     }
 
+    // Estimate total dequant cache bytes and skip if insufficient VRAM remains.
+    // The I8 cache accelerates prefill (INT8 tensor core GEMM) but is optional —
+    // decode uses the native U4 GEMV kernel directly.
+    {
+        var estimated_cache_bytes: usize = 0;
+        const countGaffineBytes = struct {
+            fn run(weight: *const LinearWeight) usize {
+                return switch (weight.*) {
+                    // I8: rows*cols + cols*4 (scale). Use rows*cols as lower bound.
+                    .gaffine_u4, .gaffine_u8 => |w| std.math.mul(usize, w.rows, w.cols) catch 0,
+                    else => 0,
+                };
+            }
+        }.run;
+        for (self.block_runtime.blocks) |*layer| {
+            if (layer.attention_runtime) |*attn| {
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.q_proj));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.k_proj));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.v_proj));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.o_proj));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.w1));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.w2));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&attn.w3));
+            }
+            if (layer.shortconv_runtime) |*sc| {
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&sc.in_proj));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&sc.out_proj));
+            }
+            if (layer.gated_delta_runtime) |*gd| {
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&gd.in_proj));
+                estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&gd.out_proj));
+            }
+        }
+        estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, countGaffineBytes(&self.runtime_buffers.projection_weight));
+        // Add overhead for per-col scale buffers and concatenated QKV caches.
+        estimated_cache_bytes = engine_types.saturatingAddUsize(estimated_cache_bytes, estimated_cache_bytes / 4);
+
+        if (self.device.memoryInfo()) |mem_info| {
+            // Only create I8 caches if they fit within half of free VRAM.
+            // The remaining half is needed for KV cache, activations, and runtime buffers.
+            if (estimated_cache_bytes > mem_info.free / 2) {
+                return;
+            }
+        } else |_| {}
+    }
+
     var total_bytes: usize = 0;
     var weight_count: usize = 0;
 
