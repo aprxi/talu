@@ -822,19 +822,6 @@ pub const MetalBackend = struct {
 
         const seed = readSeedFromEnv(allocator);
         const max_batch_size = resolveMaxBatchSize(allocator);
-        if (mlx_validate_config(model_path_z.ptr) == 0) {
-            const mlx_error = resolveLastError();
-            if (isMemoryError(mlx_error)) {
-                if (init_config.memory_fit_is_error) {
-                    log.err("inference", "metal mlx_validate_config failed", .{ .mlx_error = mlx_error }, @src());
-                } else {
-                    log.warn("inference", "metal mlx_validate_config failed", .{ .mlx_error = mlx_error });
-                }
-                return error.OutOfMemory;
-            }
-            log.warn("inference", "metal mlx_validate_config failed", .{ .mlx_error = mlx_error });
-            return error.InvalidArgument;
-        }
         const ctx = mlx_create(model_id_z.ptr, model_path_z.ptr, seed) orelse {
             const mlx_error = resolveLastError();
             if (isMemoryError(mlx_error)) {

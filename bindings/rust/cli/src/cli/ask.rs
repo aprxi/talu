@@ -33,9 +33,18 @@ fn has_visible_text(text: &str) -> bool {
     })
 }
 
+fn should_flush_stream_output(
+    token_text: &str,
+    pending_flush_bytes: usize,
+    flush_each_token: bool,
+) -> bool {
+    flush_each_token || token_text.contains('\n') || pending_flush_bytes >= STREAM_FLUSH_BYTES
+}
+
 struct StreamCtx {
     raw_output: bool,
     hide_thinking: bool,
+    flush_each_token: bool,
     in_reasoning: bool,
     emitted_visible: bool,
     prefill_spinner: Option<indicatif::ProgressBar>,
@@ -43,10 +52,11 @@ struct StreamCtx {
 }
 
 impl StreamCtx {
-    fn new(raw_output: bool, hide_thinking: bool) -> Self {
+    fn new(raw_output: bool, hide_thinking: bool, flush_each_token: bool) -> Self {
         Self {
             raw_output,
             hide_thinking,
+            flush_each_token,
             in_reasoning: false,
             emitted_visible: false,
             prefill_spinner: None,
@@ -82,7 +92,11 @@ impl StreamCtx {
 
         let _ = io::stdout().write_all(token.text.as_bytes());
         self.pending_flush_bytes += token.text.len();
-        if token.text.contains('\n') || self.pending_flush_bytes >= STREAM_FLUSH_BYTES {
+        if should_flush_stream_output(
+            &token.text,
+            self.pending_flush_bytes,
+            self.flush_each_token,
+        ) {
             let _ = io::stdout().flush();
             self.pending_flush_bytes = 0;
         }
@@ -1016,9 +1030,11 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
             );
         }
     } else {
+        let flush_each_token = true;
         let ctx = std::sync::Arc::new(std::sync::Mutex::new(StreamCtx::new(
             raw_output,
             hide_thinking,
+            flush_each_token,
         )));
 
         // Set up prefill progress bar (cleared on first token)
@@ -1291,6 +1307,7 @@ fn cmd_ask_remote(
         }
     } else {
         // Streaming - use a simple callback that prints content
+        let flush_each_token = true;
         let pending_flush_bytes = std::sync::Arc::new(std::sync::Mutex::new(0usize));
         let pending_flush_bytes_cb = pending_flush_bytes.clone();
         let callback: talu::router::StreamCallback = Box::new(move |token| {
@@ -1300,7 +1317,7 @@ fn cmd_ask_remote(
             let _ = io::stdout().write_all(token.text.as_bytes());
             if let Ok(mut pending) = pending_flush_bytes_cb.lock() {
                 *pending += token.text.len();
-                if token.text.contains('\n') || *pending >= STREAM_FLUSH_BYTES {
+                if should_flush_stream_output(&token.text, *pending, flush_each_token) {
                     let _ = io::stdout().flush();
                     *pending = 0;
                 }
@@ -1403,5 +1420,21 @@ mod tests {
         let err = parse_stdin_content(vec![0, 1, 2, 3]).expect_err("binary stdin should fail");
         let msg = err.to_string();
         assert!(msg.contains("binary data"));
+    }
+
+    #[test]
+    fn stream_flush_policy_flushes_each_token_for_interactive_output() {
+        assert!(should_flush_stream_output("x", 1, true));
+    }
+
+    #[test]
+    fn stream_flush_policy_buffers_when_not_interactive() {
+        assert!(should_flush_stream_output("\n", 1, false));
+        assert!(should_flush_stream_output("token", STREAM_FLUSH_BYTES, false));
+        assert!(!should_flush_stream_output(
+            "token",
+            STREAM_FLUSH_BYTES - 1,
+            false
+        ));
     }
 }

@@ -658,6 +658,63 @@ bool ends_with(const std::string& s, const std::string& suffix) {
     return std::equal(suffix.rbegin(), suffix.rend(), s.rbegin());
 }
 
+uint64_t fnv1a64_update_bytes(uint64_t hash, const void* data, size_t len) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= static_cast<uint64_t>(ptr[i]);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+uint64_t fnv1a64_update_str(uint64_t hash, const std::string& value) {
+    return fnv1a64_update_bytes(hash, value.data(), value.size());
+}
+
+uint64_t fnv1a64_update_u64(uint64_t hash, uint64_t value) {
+    return fnv1a64_update_bytes(hash, &value, sizeof(value));
+}
+
+std::string hex_u64(uint64_t value) {
+    char buf[17] = {0};
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(value));
+    return std::string(buf);
+}
+
+bool metal_weight_cache_enabled() {
+    return !env_truthy("TALU_METAL_MODEL_CACHE_DISABLE", false);
+}
+
+bool metal_weight_cache_debug_enabled() {
+    return env_truthy("TALU_METAL_MODEL_CACHE_DEBUG", false);
+}
+
+std::filesystem::path metal_weight_cache_dir(const std::string& model_path) {
+    return std::filesystem::path(model_path) / ".cache" / "talu-metal";
+}
+
+std::string build_weight_cache_fingerprint(
+    const std::string& model_path,
+    const std::vector<std::string>& weight_files
+) {
+    namespace fs = std::filesystem;
+    uint64_t hash = 1469598103934665603ULL;
+    hash = fnv1a64_update_str(hash, "talu-metal-weight-cache-v1");
+    hash = fnv1a64_update_str(hash, model_path);
+    hash = fnv1a64_update_u64(hash, static_cast<uint64_t>(weight_files.size()));
+    for (const std::string& rel : weight_files) {
+        const fs::path abs_path = fs::path(model_path) / rel;
+        const std::string abs = abs_path.string();
+        const uint64_t size = static_cast<uint64_t>(fs::file_size(abs_path));
+        const uint64_t mtime = static_cast<uint64_t>(fs::last_write_time(abs_path).time_since_epoch().count());
+        hash = fnv1a64_update_str(hash, rel);
+        hash = fnv1a64_update_str(hash, abs);
+        hash = fnv1a64_update_u64(hash, size);
+        hash = fnv1a64_update_u64(hash, mtime);
+    }
+    return hex_u64(hash);
+}
+
 std::string read_file(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -1717,8 +1774,7 @@ array linear_decode_maybe_quantized(
     const array& q_scales,
     const array& q_biases
 ) {
-    const bool decode_step = (x.ndim() == 3 && x.shape(1) == 1) || (x.ndim() == 2 && x.shape(0) == 1);
-    const bool q_ready = has_q && decode_qmm_enabled && decode_step && q_w.size() > 0 && q_scales.size() > 0;
+    const bool q_ready = has_q && decode_qmm_enabled && q_w.size() > 0 && q_scales.size() > 0;
     if (q_ready) {
         const bool affine_ready = q_biases.ndim() == 2 && q_biases.size() > 1 &&
             quant_group_size > 0 && (quant_bits == 4 || quant_bits == 8);
@@ -1744,8 +1800,9 @@ array linear_decode_maybe_quantized(
         }
         if (nvfp4_ready) {
             const bool reshape_back = x.ndim() == 3;
-            const int batch = reshape_back ? x.shape(0) : x.shape(0);
-            const array x2d = reshape_back ? reshape(x, {batch, x.shape(2)}) : x;
+            const int batch = x.shape(0);
+            const int seq = reshape_back ? x.shape(1) : 1;
+            const array x2d = reshape_back ? reshape(x, {batch * seq, x.shape(2)}) : x;
             const array out2d = qqmm(
                 x2d,
                 q_w,
@@ -1756,7 +1813,7 @@ array linear_decode_maybe_quantized(
                 std::optional<array>(nvfp4_unit_global_scale()),
                 std::optional<array>(q_biases)
             );
-            return reshape_back ? reshape(out2d, {batch, 1, out2d.shape(1)}) : out2d;
+            return reshape_back ? reshape(out2d, {batch, seq, out2d.shape(1)}) : out2d;
         }
         return quantized_matmul(
             x,
@@ -2847,8 +2904,7 @@ array forward_logits(mlx_ctx* ctx, const array& input_ids, const TraceFrame* tra
         const int h = hidden.shape(2);
         lm_input = slice(hidden, {0, t - 1, 0}, {b, t, h});
     }
-    const bool decode_step = lm_input.ndim() == 3 && lm_input.shape(1) == 1;
-    const bool lm_head_q_ready = ctx->lm_head_q_decode_enabled && decode_step &&
+    const bool lm_head_q_ready = ctx->lm_head_q_decode_enabled &&
         ctx->lm_head_q_w.size() > 0 && ctx->lm_head_q_scales.size() > 0;
     const bool lm_head_affine_ready = lm_head_q_ready &&
         ctx->lm_head_q_biases.ndim() == 2 &&
@@ -3731,13 +3787,157 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         const bool default_decode_qmm = has_mxfp8_meta || has_grouped_affine_meta || has_nvfp4_meta;
         ctx->fp8_decode_qmm_enabled = env_truthy("TALU_METAL_FP8_DECODE_QMM", default_decode_qmm);
         const bool enable_mlp_qmm = ctx->fp8_decode_qmm_enabled;
-        // Decode QMM is currently decode-step-only; prefill still needs dense
-        // RHS tensors available for every quantized linear.
-        const bool keep_dense_rhs_for_prefill = true;
+        // v3 cache/runtime policy: quantized path is allowed for prefill too,
+        // so dense RHS is only retained when explicitly requested.
+        const bool keep_dense_rhs_for_prefill = env_truthy("TALU_METAL_KEEP_DENSE_RHS_FOR_PREFILL", false);
+        const bool enable_model_cache = metal_weight_cache_enabled();
+        if (metal_weight_cache_debug_enabled()) {
+            std::fprintf(stderr, "[mlx][cache] model_cache_enabled=%d\n", enable_model_cache ? 1 : 0);
+        }
+        std::unordered_map<std::string, array> runtime_cache_loaded;
+        std::unordered_map<std::string, array> runtime_cache_new;
+        std::string runtime_cache_fingerprint;
+        std::filesystem::path runtime_cache_dir;
+        std::filesystem::path runtime_cache_file;
+        if (enable_model_cache) {
+            try {
+                const std::vector<std::string> cache_weight_files = discover_weight_files(ctx->model_path);
+                runtime_cache_fingerprint = build_weight_cache_fingerprint(ctx->model_path, cache_weight_files);
+                runtime_cache_dir = metal_weight_cache_dir(ctx->model_path);
+                const std::string runtime_profile =
+                    std::string("v3-kd") + (keep_dense_rhs_for_prefill ? "1" : "0") +
+                    "-dq" + (ctx->fp8_decode_qmm_enabled ? "1" : "0");
+                runtime_cache_file = runtime_cache_dir / ("runtime-" + runtime_profile + "-" + runtime_cache_fingerprint + ".safetensors");
+                if (std::filesystem::exists(runtime_cache_file)) {
+                    auto cached = load_safetensors(runtime_cache_file.string());
+                    runtime_cache_loaded = std::move(cached.first);
+                    if (metal_weight_cache_debug_enabled()) {
+                        std::fprintf(
+                            stderr,
+                            "[mlx][cache] loaded runtime cache file=%s tensors=%zu\n",
+                            runtime_cache_file.c_str(),
+                            runtime_cache_loaded.size()
+                        );
+                    }
+                }
+            } catch (const std::exception& e) {
+                if (metal_weight_cache_debug_enabled()) {
+                    std::fprintf(stderr, "[mlx][cache] load failed reason=%s\n", e.what());
+                }
+                runtime_cache_loaded.clear();
+                runtime_cache_new.clear();
+            }
+        }
+
+        auto load_runtime_tensor = [&](const std::string& cache_key, const std::function<array()>& build_fn) -> array {
+            if (enable_model_cache) {
+                auto it_loaded = runtime_cache_loaded.find(cache_key);
+                if (it_loaded != runtime_cache_loaded.end()) return it_loaded->second;
+                auto it_new = runtime_cache_new.find(cache_key);
+                if (it_new != runtime_cache_new.end()) return it_new->second;
+            }
+            const array built = build_fn();
+            if (enable_model_cache) {
+                runtime_cache_new.emplace(cache_key, built);
+                if (metal_weight_cache_debug_enabled()) {
+                    std::fprintf(stderr, "[mlx][cache] miss key=%s\n", cache_key.c_str());
+                }
+            }
+            return built;
+        };
+
+        auto load_embed_weight = [&](const std::string& weight_key) -> array {
+            return load_runtime_tensor("runtime::embed::" + weight_key, [&]() {
+                return load_linear_weight(tensors, ctx->cfg, weight_key);
+            });
+        };
+
+        auto load_rhs_weight = [&](const std::string& weight_key) -> array {
+            return load_runtime_tensor("runtime::rhs::" + weight_key, [&]() {
+                const array dense = load_linear_weight(tensors, ctx->cfg, weight_key);
+                return to_rhs(dense, weight_key);
+            });
+        };
+
+        auto load_runtime_bool_flag = [&](const std::string& flag_key, bool* out_value) -> bool {
+            auto it = runtime_cache_loaded.find(flag_key);
+            if (it == runtime_cache_loaded.end()) return false;
+            const array flag_i32 = astype(it->second, int32);
+            eval(flag_i32);
+            const int32_t* ptr = flag_i32.data<int32_t>();
+            *out_value = ptr != nullptr && ptr[0] != 0;
+            return true;
+        };
+
+        auto runtime_cache_put = [&](std::unordered_map<std::string, array>* map, const std::string& key, const array& value) {
+            auto it = map->find(key);
+            if (it == map->end()) {
+                map->emplace(key, value);
+            } else {
+                it->second = value;
+            }
+        };
+
+        auto maybe_quantize_mxfp8_matrix = [&](
+            const std::unordered_map<std::string, array>& tensors_ref,
+            const Qwen35Config& cfg_ref,
+            const std::string& weight_key,
+            const array& lhs_weight,
+            bool enabled,
+            array* out_q_w,
+            array* out_q_scales,
+            array* out_q_biases,
+            bool* out_has_q
+        ) {
+            if (enable_model_cache) {
+                const std::string q_prefix = "runtime::q::" + weight_key;
+                const std::string has_key = q_prefix + "::has";
+                bool cached_has_q = false;
+                if (load_runtime_bool_flag(has_key, &cached_has_q)) {
+                    *out_has_q = cached_has_q;
+                    if (!cached_has_q) return;
+                    auto it_w = runtime_cache_loaded.find(q_prefix + "::w");
+                    auto it_s = runtime_cache_loaded.find(q_prefix + "::scales");
+                    if (it_w != runtime_cache_loaded.end() && it_s != runtime_cache_loaded.end()) {
+                        *out_q_w = it_w->second;
+                        *out_q_scales = it_s->second;
+                        if (out_q_biases != nullptr) {
+                            auto it_b = runtime_cache_loaded.find(q_prefix + "::biases");
+                            if (it_b != runtime_cache_loaded.end()) *out_q_biases = it_b->second;
+                        }
+                        return;
+                    }
+                }
+            }
+
+            ::maybe_quantize_mxfp8_matrix(
+                tensors_ref,
+                cfg_ref,
+                weight_key,
+                lhs_weight,
+                enabled,
+                out_q_w,
+                out_q_scales,
+                out_q_biases,
+                out_has_q
+            );
+
+            if (enable_model_cache) {
+                const std::string q_prefix = "runtime::q::" + weight_key;
+                runtime_cache_put(&runtime_cache_new, q_prefix + "::has", array(static_cast<int32_t>(*out_has_q ? 1 : 0), int32));
+                if (*out_has_q) {
+                    runtime_cache_put(&runtime_cache_new, q_prefix + "::w", *out_q_w);
+                    runtime_cache_put(&runtime_cache_new, q_prefix + "::scales", *out_q_scales);
+                    if (out_q_biases != nullptr) {
+                        runtime_cache_put(&runtime_cache_new, q_prefix + "::biases", *out_q_biases);
+                    }
+                }
+            }
+        };
 
         const std::string text_prefix = detect_text_prefix(tensors);
         const std::string layer_prefix = text_prefix + "layers.";
-        ctx->embed_tokens = load_linear_weight(tensors, ctx->cfg, text_prefix + "embed_tokens.weight");
+        ctx->embed_tokens = load_embed_weight(text_prefix + "embed_tokens.weight");
         ctx->final_norm_w = require_any_tensor(
             tensors,
             {
@@ -3794,10 +3994,10 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
         // Non-MXFP8 checkpoints still run prefill through the regular lm_head
         // matmul path (decode-only QMM), so keep rhs available in that case.
         if (keep_dense_rhs_for_prefill || !ctx->lm_head_q_decode_enabled || !ctx->has_fp8_meta) {
-            if (lm_head_weight.size() == 1) {
-                lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
-            }
-            ctx->lm_head_rhs = transpose(lm_head_weight, {1, 0});
+            if (lm_head_weight.size() == 1) lm_head_weight = load_linear_weight(tensors, ctx->cfg, lm_head_key);
+            ctx->lm_head_rhs = load_runtime_tensor("runtime::lm_head_rhs::" + lm_head_key, [&]() {
+                return transpose(lm_head_weight, {1, 0});
+            });
         }
 
         ctx->layers.reserve(static_cast<size_t>(ctx->cfg.num_hidden_layers));
@@ -3873,25 +4073,13 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                 &lw.mlp_down_has_q
             );
             if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_gate_has_q) {
-                const array mlp_gate_dense = load_linear_weight(tensors, ctx->cfg, mlp_gate_key);
-                lw.mlp_gate_rhs = to_rhs(
-                    mlp_gate_dense,
-                    p + "mlp_gate"
-                );
+                lw.mlp_gate_rhs = load_rhs_weight(mlp_gate_key);
             }
             if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_up_has_q) {
-                const array mlp_up_dense = load_linear_weight(tensors, ctx->cfg, mlp_up_key);
-                lw.mlp_up_rhs = to_rhs(
-                    mlp_up_dense,
-                    p + "mlp_up"
-                );
+                lw.mlp_up_rhs = load_rhs_weight(mlp_up_key);
             }
             if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.mlp_down_has_q) {
-                const array mlp_down_dense = load_linear_weight(tensors, ctx->cfg, mlp_down_key);
-                lw.mlp_down_rhs = to_rhs(
-                    mlp_down_dense,
-                    p + "mlp_down"
-                );
+                lw.mlp_down_rhs = load_rhs_weight(mlp_down_key);
             }
 
             const bool has_linear_split = has_tensor(tensors, p + "linear_attn.in_proj_qkv.weight");
@@ -4292,8 +4480,7 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     &lw.lin_out_proj_has_q
                 );
                 if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.lin_out_proj_has_q) {
-                    const array out_proj_dense = load_linear_weight(tensors, ctx->cfg, out_proj_key);
-                    lw.lin_out_proj_rhs = to_rhs(out_proj_dense, out_proj_key);
+                    lw.lin_out_proj_rhs = load_rhs_weight(out_proj_key);
                 }
             } else if (lw.is_shortconv) {
                 const std::string sc_in_proj_key = p + "conv.in_proj.weight";
@@ -4324,12 +4511,10 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     &lw.sc_out_proj_has_q
                 );
                 if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.sc_in_proj_has_q) {
-                    const array sc_in_proj_dense = load_linear_weight(tensors, ctx->cfg, sc_in_proj_key);
-                    lw.sc_in_proj_rhs = to_rhs(sc_in_proj_dense, sc_in_proj_key);
+                    lw.sc_in_proj_rhs = load_rhs_weight(sc_in_proj_key);
                 }
                 if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.sc_out_proj_has_q) {
-                    const array sc_out_proj_dense = load_linear_weight(tensors, ctx->cfg, sc_out_proj_key);
-                    lw.sc_out_proj_rhs = to_rhs(sc_out_proj_dense, sc_out_proj_key);
+                    lw.sc_out_proj_rhs = load_rhs_weight(sc_out_proj_key);
                 }
                 if (has_tensor(tensors, p + "conv.conv.bias")) {
                     lw.sc_conv_bias = require_tensor(tensors, p + "conv.conv.bias");
@@ -4397,20 +4582,16 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
                     &lw.attn_o_has_q
                 );
                 if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_q_has_q) {
-                    const array q_proj_dense = load_linear_weight(tensors, ctx->cfg, q_proj_key);
-                    lw.attn_q_rhs = to_rhs(q_proj_dense, q_proj_key);
+                    lw.attn_q_rhs = load_rhs_weight(q_proj_key);
                 }
                 if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_k_has_q) {
-                    const array k_proj_dense = load_linear_weight(tensors, ctx->cfg, k_proj_key);
-                    lw.attn_k_rhs = to_rhs(k_proj_dense, k_proj_key);
+                    lw.attn_k_rhs = load_rhs_weight(k_proj_key);
                 }
                 if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_v_has_q) {
-                    const array v_proj_dense = load_linear_weight(tensors, ctx->cfg, v_proj_key);
-                    lw.attn_v_rhs = to_rhs(v_proj_dense, v_proj_key);
+                    lw.attn_v_rhs = load_rhs_weight(v_proj_key);
                 }
                 if (keep_dense_rhs_for_prefill || !enable_mlp_qmm || !lw.attn_o_has_q) {
-                    const array o_proj_dense = load_linear_weight(tensors, ctx->cfg, o_proj_key);
-                    lw.attn_o_rhs = to_rhs(o_proj_dense, p + "self_attn_o_proj");
+                    lw.attn_o_rhs = load_rhs_weight(o_proj_key);
                 }
                 lw.attn_q_norm_w = require_any_tensor(
                     tensors,
@@ -4430,6 +4611,43 @@ mlx_ctx* mlx_create(const char* model_id, const char* model_path, int32_t seed) 
             }
 
             ctx->layers.push_back(std::move(lw));
+        }
+
+        if (enable_model_cache && !runtime_cache_new.empty()) {
+            try {
+                std::filesystem::create_directories(runtime_cache_dir);
+                std::unordered_map<std::string, array> runtime_cache_to_save = runtime_cache_loaded;
+                for (auto& kv : runtime_cache_new) {
+                    auto it = runtime_cache_to_save.find(kv.first);
+                    if (it == runtime_cache_to_save.end()) {
+                        runtime_cache_to_save.emplace(kv.first, kv.second);
+                    } else {
+                        it->second = kv.second;
+                    }
+                }
+                const std::filesystem::path tmp_file = runtime_cache_file.string() + ".tmp.safetensors";
+                std::unordered_map<std::string, std::string> metadata;
+                metadata.emplace("talu_cache_kind", "runtime_cache_v3");
+                metadata.emplace("talu_cache_fingerprint", runtime_cache_fingerprint);
+                save_safetensors(tmp_file.string(), std::move(runtime_cache_to_save), metadata);
+                if (std::filesystem::exists(runtime_cache_file)) {
+                    std::filesystem::remove(runtime_cache_file);
+                }
+                std::filesystem::rename(tmp_file, runtime_cache_file);
+                if (metal_weight_cache_debug_enabled()) {
+                    std::fprintf(
+                        stderr,
+                        "[mlx][cache] saved runtime cache file=%s new=%zu\n",
+                        runtime_cache_file.c_str(),
+                        runtime_cache_new.size()
+                    );
+                }
+            } catch (const std::exception& e) {
+                if (metal_weight_cache_debug_enabled()) {
+                    std::fprintf(stderr, "[mlx][cache] save failed reason=%s\n", e.what());
+                }
+                // Best-effort cache write.
+            }
         }
 
         const bool enable_init_warmup = env_truthy("TALU_METAL_INIT_WARMUP", true);

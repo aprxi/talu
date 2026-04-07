@@ -1857,6 +1857,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const can_use_greedy_streaming = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
+                submit_config.callback == null and
                 submit_config.vision_input == null and
                 submit_config.stop_sequences.len == 0 and
                 submit_config.grammar_sampler == null and
@@ -1879,6 +1880,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const can_use_top_k_streaming = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
+                submit_config.callback == null and
                 submit_config.vision_input == null and
                 submit_config.stop_sequences.len == 0 and
                 submit_config.grammar_sampler == null and
@@ -1906,6 +1908,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const can_use_top_k_candidate_route = prompt_tokens.len > 0 and
                 self.active_requests.items.len == 0 and
                 self.pending_queue.items.len == 0 and
+                submit_config.callback == null and
                 submit_config.vision_input == null and
                 submit_config.grammar_sampler == null and
                 !submit_config.return_final_logits and
@@ -2130,6 +2133,17 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             submit_config: *const SubmitOptions,
             sampling_config: *const sampling.SamplingConfig,
         ) !GenerateSyncResult {
+            const StreamCbCtx = struct {
+                submit_callback: *const fn (u64, u32, bool, bool, ?*anyopaque) void,
+                submit_callback_data: ?*anyopaque,
+
+                fn onToken(token: u32, user_data: ?*anyopaque) void {
+                    const ctx: *@This() = @ptrCast(@alignCast(user_data));
+                    // Finalization for this sync route is handled by the outer layer.
+                    ctx.submit_callback(0, token, false, false, ctx.submit_callback_data);
+                }
+            };
+
             if (max_tokens == 0) {
                 return .{
                     .tokens = try self.allocator.dupe(u32, &.{}),
@@ -2247,31 +2261,29 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 };
             }
 
+            var stream_cb_ctx: ?StreamCbCtx = null;
+            var backend_stream_cb: ?*const fn (u32, ?*anyopaque) void = null;
+            var backend_stream_cb_data: ?*anyopaque = null;
+            if (submit_config.callback) |cb| {
+                stream_cb_ctx = .{
+                    .submit_callback = cb,
+                    .submit_callback_data = submit_config.callback_data,
+                };
+                backend_stream_cb = StreamCbCtx.onToken;
+                backend_stream_cb_data = @ptrCast(&stream_cb_ctx.?);
+            }
+
             const tail_count = try self.backend.decodeStreaming(
                 current_token,
                 prompt_tokens.len + generated.items.len - 1,
                 remaining_token_budget,
                 eos_token_ids,
                 generated_tail,
-                null,
-                null,
+                backend_stream_cb,
+                backend_stream_cb_data,
             );
             try generated.appendSlice(self.allocator, generated_tail[0..tail_count]);
             const decode_ns = decode_timer.read();
-
-            if (submit_config.callback) |cb| {
-                for (generated_tail[0..tail_count], 0..) |token, i| {
-                    const emitted = generated.items.len - tail_count + i + 1;
-                    const is_eos = blk: {
-                        for (eos_token_ids) |eos_id| {
-                            if (token == eos_id) break :blk true;
-                        }
-                        break :blk false;
-                    };
-                    const is_final = is_eos or emitted >= max_tokens;
-                    cb(0, token, is_final, false, submit_config.callback_data);
-                }
-            }
 
             const finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
             return .{
@@ -2289,6 +2301,17 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             submit_config: *const SubmitOptions,
             sampling_config: *const sampling.SamplingConfig,
         ) !GenerateSyncResult {
+            const StreamCbCtx = struct {
+                submit_callback: *const fn (u64, u32, bool, bool, ?*anyopaque) void,
+                submit_callback_data: ?*anyopaque,
+
+                fn onToken(token: u32, user_data: ?*anyopaque) void {
+                    const ctx: *@This() = @ptrCast(@alignCast(user_data));
+                    // Finalization for this sync route is handled by the outer layer.
+                    ctx.submit_callback(0, token, false, false, ctx.submit_callback_data);
+                }
+            };
+
             if (max_tokens == 0) {
                 return .{
                     .tokens = try self.allocator.dupe(u32, &.{}),
@@ -2409,6 +2432,18 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 };
             }
 
+            var stream_cb_ctx: ?StreamCbCtx = null;
+            var backend_stream_cb: ?*const fn (u32, ?*anyopaque) void = null;
+            var backend_stream_cb_data: ?*anyopaque = null;
+            if (submit_config.callback) |cb| {
+                stream_cb_ctx = .{
+                    .submit_callback = cb,
+                    .submit_callback_data = submit_config.callback_data,
+                };
+                backend_stream_cb = StreamCbCtx.onToken;
+                backend_stream_cb_data = @ptrCast(&stream_cb_ctx.?);
+            }
+
             const tail_count = try self.backend.decodeTopKStreaming(
                 current_token,
                 prompt_tokens.len + generated.items.len - 1,
@@ -2416,25 +2451,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 eos_token_ids,
                 sampling_config,
                 generated_tail,
-                null,
-                null,
+                backend_stream_cb,
+                backend_stream_cb_data,
             );
             try generated.appendSlice(self.allocator, generated_tail[0..tail_count]);
             const decode_ns = decode_timer.read();
-
-            if (submit_config.callback) |cb| {
-                for (generated_tail[0..tail_count], 0..) |token, i| {
-                    const emitted = generated.items.len - tail_count + i + 1;
-                    const is_eos = blk: {
-                        for (eos_token_ids) |eos_id| {
-                            if (token == eos_id) break :blk true;
-                        }
-                        break :blk false;
-                    };
-                    const is_final = is_eos or emitted >= max_tokens;
-                    cb(0, token, is_final, false, submit_config.callback_data);
-                }
-            }
 
             const finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
             return .{

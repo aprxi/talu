@@ -500,23 +500,86 @@ const MAX_TOKEN_LEN = 512;
 /// Decodes tokens, applies UTF-8 assembly, classifies based on scheduler's
 /// `in_thinking` state, then calls the user's rich C callback.
 const StreamingWrapper = struct {
-    tok: *const tokenizer_mod.Tokenizer,
+    tok: *tokenizer_mod.Tokenizer,
     user_cb: StreamCallback,
     user_data: ?*anyopaque,
     stop_flag: *std.atomic.Value(bool),
     raw_output: bool = false,
     is_tool_generation: bool = false,
+    decode_context_token: ?u32 = null,
 
     // UTF-8 pending bytes
     utf8_pending: [3]u8 = .{ 0, 0, 0 },
     utf8_pending_len: u8 = 0,
 
+    const DecodedToken = struct {
+        bytes: []const u8,
+        owned: ?[]u8 = null,
+    };
+
+    fn longestCommonPrefixLen(a: []const u8, b: []const u8) usize {
+        const n = @min(a.len, b.len);
+        var i: usize = 0;
+        while (i < n and a[i] == b[i]) : (i += 1) {}
+        return i;
+    }
+
+    /// Decode token bytes for streaming.
+    ///
+    /// Fast path: prebuilt token byte table.
+    /// Fallback: context-aware raw decode delta for tokenizers that require
+    /// neighboring context to produce non-empty token text.
+    fn decodeTokenBytes(self: *StreamingWrapper, token_id: u32) DecodedToken {
+        if (self.tok.tokenBytes(token_id)) |bytes| {
+            if (bytes.len > 0) {
+                return .{ .bytes = bytes };
+            }
+        }
+
+        const token_options = tokenizer_mod.Tokenizer.DecodeOptions{
+            .skip_special_tokens = true,
+        };
+
+        if (self.decode_context_token) |ctx_token| {
+            const ctx_raw = self.tok.decodeRawBytes(&[_]u32{ctx_token}, token_options) catch
+                return .{ .bytes = "" };
+            defer self.tok.allocator.free(ctx_raw);
+
+            const pair_raw = self.tok.decodeRawBytes(
+                &[_]u32{ ctx_token, token_id },
+                token_options,
+            ) catch return .{ .bytes = "" };
+            errdefer self.tok.allocator.free(pair_raw);
+
+            const prefix = longestCommonPrefixLen(ctx_raw, pair_raw);
+            if (prefix >= ctx_raw.len and prefix < pair_raw.len) {
+                const delta = pair_raw[prefix..];
+                const out = self.tok.allocator.alloc(u8, delta.len) catch {
+                    self.tok.allocator.free(pair_raw);
+                    return .{ .bytes = "" };
+                };
+                @memcpy(out, delta);
+                self.tok.allocator.free(pair_raw);
+                return .{ .bytes = out, .owned = out };
+            }
+
+            self.tok.allocator.free(pair_raw);
+        }
+
+        const raw = self.tok.decodeRawBytes(&[_]u32{token_id}, token_options) catch
+            return .{ .bytes = "" };
+        return .{ .bytes = raw, .owned = raw };
+    }
+
     /// TokenCallback-compatible entry point: fn(token_id, in_thinking, userdata) void.
     fn onToken(token_id: u32, in_thinking: bool, user_data: ?*anyopaque) void {
         const self: *StreamingWrapper = @ptrCast(@alignCast(user_data));
 
-        // Decode token to raw bytes (zero-alloc O(1) lookup).
-        const decoded_raw: []const u8 = self.tok.tokenBytes(token_id) orelse return;
+        const decoded_token = self.decodeTokenBytes(token_id);
+        defer if (decoded_token.owned) |owned| self.tok.allocator.free(owned);
+        const decoded_raw: []const u8 = decoded_token.bytes;
+        self.decode_context_token = token_id;
+        if (decoded_raw.len == 0) return;
 
         // UTF-8 assembly (same algorithm as batch.zig).
         var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
