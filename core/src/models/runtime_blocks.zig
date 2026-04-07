@@ -43,6 +43,19 @@ pub const MoEWeights = struct {
     num_experts: usize,
     experts_per_token: usize,
     use_mxfp4: bool = false,
+    // Router scaling (Gemma4 MoE)
+    router_input_scale: ?Tensor = null,
+    router_per_expert_scale: ?Tensor = null,
+    // Shared MLP (Gemma4 MoE — coexists with experts)
+    shared_w1: ?Tensor = null, // gate_proj
+    shared_w2: ?Tensor = null, // down_proj
+    shared_w3: ?Tensor = null, // up_proj
+    // Internal norms for fused FFN+MoE (Gemma4 MoE)
+    pre_ffn_norm: ?Tensor = null, // pre_feedforward_layernorm
+    post_shared_norm: ?Tensor = null, // post_feedforward_layernorm_1
+    pre_expert_norm: ?Tensor = null, // pre_feedforward_layernorm_2
+    post_expert_norm: ?Tensor = null, // post_feedforward_layernorm_2
+    post_combine_norm: ?Tensor = null, // post_feedforward_layernorm
 };
 
 pub const MLAConfig = struct {
@@ -343,6 +356,76 @@ fn buildMxfp4MoEWeights(
     return moe_weights;
 }
 
+fn buildFused3DMoEWeights(
+    allocator: std.mem.Allocator,
+    map: *const WeightMap,
+    router_weight_ptr: *const Tensor,
+    gate_up_3d: *const Tensor,
+    num_experts: usize,
+    experts_per_token: usize,
+) !*MoEWeights {
+    const down_3d = map.get("experts.down_proj") orelse return error.MissingWeight;
+
+    if (gate_up_3d.n_dims < 3) return error.InvalidShape;
+    if (down_3d.n_dims < 3) return error.InvalidShape;
+    if (gate_up_3d.data_size % num_experts != 0) return error.InvalidShape;
+    if (down_3d.data_size % num_experts != 0) return error.InvalidShape;
+
+    const gate_up_expert_bytes = gate_up_3d.data_size / num_experts;
+    const down_expert_bytes = down_3d.data_size / num_experts;
+    const gate_up_out_dim: usize = @intCast(gate_up_3d.shape[1]);
+    const gate_up_in_dim: usize = @intCast(gate_up_3d.shape[2]);
+    const down_out_dim: usize = @intCast(down_3d.shape[1]);
+    const down_in_dim: usize = @intCast(down_3d.shape[2]);
+
+    var experts = try allocator.alloc(ExpertWeights, num_experts);
+    errdefer allocator.free(experts);
+
+    for (0..num_experts) |e| {
+        const gate_up_ptr = gate_up_3d.data()[e * gate_up_expert_bytes ..].ptr;
+        const down_ptr = down_3d.data()[e * down_expert_bytes ..].ptr;
+
+        experts[e] = .{
+            .gate_up_proj = Tensor.view(gate_up_ptr, &.{ gate_up_out_dim, gate_up_in_dim }, gate_up_3d.dtype, gate_up_expert_bytes),
+            .down_proj = Tensor.view(down_ptr, &.{ down_out_dim, down_in_dim }, down_3d.dtype, down_expert_bytes),
+        };
+    }
+
+    const router_input_scale: ?Tensor = if (map.get("router.scale")) |t| t.* else null;
+    const router_per_expert_scale: ?Tensor = if (map.get("router.per_expert_scale")) |t| t.* else null;
+    const shared_w1: ?Tensor = if (map.get("mlp.gate_proj.weight")) |t| t.* else null;
+    const shared_w2: ?Tensor = if (map.get("mlp.down_proj.weight")) |t| t.* else null;
+    const shared_w3: ?Tensor = if (map.get("mlp.up_proj.weight")) |t| t.* else null;
+
+    // Internal norms for fused FFN+MoE
+    const pre_ffn_norm: ?Tensor = if (map.get("pre_feedforward_layernorm.weight")) |t| t.* else null;
+    const post_shared_norm: ?Tensor = if (map.get("post_feedforward_layernorm_1.weight")) |t| t.* else null;
+    const pre_expert_norm: ?Tensor = if (map.get("pre_feedforward_layernorm_2.weight")) |t| t.* else null;
+    const post_expert_norm: ?Tensor = if (map.get("post_feedforward_layernorm_2.weight")) |t| t.* else null;
+    const post_combine_norm: ?Tensor = if (map.get("post_feedforward_layernorm.weight")) |t| t.* else null;
+
+    const moe_weights = try allocator.create(MoEWeights);
+    moe_weights.* = .{
+        .router_weight = router_weight_ptr.*,
+        .router_bias = null,
+        .experts = experts,
+        .num_experts = num_experts,
+        .experts_per_token = experts_per_token,
+        .use_mxfp4 = false,
+        .router_input_scale = router_input_scale,
+        .router_per_expert_scale = router_per_expert_scale,
+        .shared_w1 = shared_w1,
+        .shared_w2 = shared_w2,
+        .shared_w3 = shared_w3,
+        .pre_ffn_norm = pre_ffn_norm,
+        .post_shared_norm = post_shared_norm,
+        .pre_expert_norm = pre_expert_norm,
+        .post_expert_norm = post_expert_norm,
+        .post_combine_norm = post_combine_norm,
+    };
+    return moe_weights;
+}
+
 fn buildIndexedMoEWeights(
     allocator: std.mem.Allocator,
     map: *const WeightMap,
@@ -391,12 +474,16 @@ fn buildMoEWeightsFromMap(
 ) !?*MoEWeights {
     const router_weight_ptr = map.get("mlp.gate.weight") orelse
         map.get("mlp.router.weight") orelse
+        map.get("router.proj.weight") orelse
         return null;
 
     if (num_experts == 0) return null;
 
     if (map.get("mlp.experts.gate_up_proj_blocks")) |gate_up_blocks| {
         return try buildMxfp4MoEWeights(allocator, map, router_weight_ptr, gate_up_blocks, num_experts, experts_per_token);
+    }
+    if (map.get("experts.gate_up_proj")) |gate_up_3d| {
+        return try buildFused3DMoEWeights(allocator, map, router_weight_ptr, gate_up_3d, num_experts, experts_per_token);
     }
     return try buildIndexedMoEWeights(allocator, map, router_weight_ptr, num_experts, experts_per_token);
 }

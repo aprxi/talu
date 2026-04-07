@@ -13,6 +13,7 @@ const mxfp4 = compute.cpu.mxfp4;
 const cpu_activation = compute.cpu.activation;
 const cpu_common = compute.cpu.common;
 const cpu_matvec = compute.cpu.linalg.matvec;
+const cpu_normalization = compute.cpu.normalization;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_topk = compute.cpu.topk;
 const dtype_mod = @import("../../../../dtype.zig");
@@ -24,6 +25,18 @@ const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capt
 
 const Tensor = tensor.Tensor;
 const MatmulFn = cpu_linalg.MatmulFn;
+
+/// Dispatch matmul for weight in [out_dim, in_dim] layout (standard weight storage).
+/// matmulBF16/F16/etc. already expect [n,k] layout, but matmulF32 expects [k,n].
+/// Use matmulF32TransB for F32 weights to match the [n,k] convention.
+fn matmulWeightTransposed(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *cpu_linalg.MatmulScratch) void {
+    if (b.dtype == .f32) {
+        cpu_linalg.matmulF32TransB(a, b, out, scratch);
+    } else {
+        const kernel = (cpu_linalg.matmulKernel(b.dtype) catch cpu_linalg.DispatchedKernel{ .func = cpu_linalg.matmulF32TransB, .name = "matmulF32TransB" }).func;
+        kernel(a, b, out, scratch);
+    }
+}
 
 pub const MoEError = error{
     MissingMoEWeights,
@@ -38,6 +51,11 @@ pub const MoEScratch = struct {
     expert_outputs: []f32 = &.{}, // outputs from each expert
     gate_up_values: []f32 = &.{}, // intermediate for SwiGLU
     hidden_values: []f32 = &.{}, // intermediate hidden_values state
+    // Gemma4 MoE fused kernel scratch
+    shared_gate_up_values: []f32 = &.{},
+    shared_hidden_values: []f32 = &.{},
+    shared_output: []f32 = &.{},
+    normed_input: []f32 = &.{},
 
     pub fn deinit(self: *MoEScratch, allocator: std.mem.Allocator) void {
         if (self.router_logits.len > 0) allocator.free(self.router_logits);
@@ -46,6 +64,10 @@ pub const MoEScratch = struct {
         if (self.expert_outputs.len > 0) allocator.free(self.expert_outputs);
         if (self.gate_up_values.len > 0) allocator.free(self.gate_up_values);
         if (self.hidden_values.len > 0) allocator.free(self.hidden_values);
+        if (self.shared_gate_up_values.len > 0) allocator.free(self.shared_gate_up_values);
+        if (self.shared_hidden_values.len > 0) allocator.free(self.shared_hidden_values);
+        if (self.shared_output.len > 0) allocator.free(self.shared_output);
+        if (self.normed_input.len > 0) allocator.free(self.normed_input);
         self.* = .{};
     }
 };
@@ -101,12 +123,40 @@ pub const MoEFFN = struct {
     /// MXFP4 weights are transposed (input @ weight instead of weight @ input)
     use_transposed_weights: bool = false,
 
+    /// Use GELU activation instead of SiLU in expert FFN
+    use_gelu: bool = false,
+
+    /// Shared MLP weights (Gemma4 MoE — coexists with experts)
+    shared_gate_proj: ?Tensor = null,
+    shared_up_proj: ?Tensor = null,
+    shared_down_proj: ?Tensor = null,
+    shared_d_ff: usize = 0,
+
+    /// Router scaling (Gemma4 MoE)
+    router_input_scale: ?[]const f32 = null,
+    router_per_expert_scale: ?[]const f32 = null,
+    router_scalar_root_size: f32 = 0.0,
+
+    /// Internal norms for fused FFN+MoE (Gemma4 MoE)
+    pre_ffn_norm_weight: ?Tensor = null,
+    post_shared_norm_weight: ?Tensor = null,
+    pre_expert_norm_weight: ?Tensor = null,
+    post_expert_norm_weight: ?Tensor = null,
+    post_combine_norm_weight: ?Tensor = null,
+    norm_eps: f32 = 1e-6,
+    norm_weight_offset: f32 = 0.0,
+
     /// Layer index for trace emission (NO_LAYER = 0xFFFF for non-layer points)
     layer_idx: u16 = trace.TraceEmission.NO_LAYER,
     /// Kernel name for trace emission (identifies MoE implementation)
     kernel_name: ?[]const u8 = null,
 
     pub fn forward(self: *const MoEFFN, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *MoEScratch, matmul_scratch: *cpu_linalg.MatmulScratch) !void {
+        // Dispatch to fused FFN+MoE path when shared MLP is present (Gemma4 MoE)
+        if (self.shared_gate_proj != null) {
+            return self.forwardFusedMoE(input_tensor, output_tensor, scratch, matmul_scratch);
+        }
+
         std.debug.assert(input_tensor.n_dims == 3 and output_tensor.n_dims == 3);
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1);
         const seq_len: usize = @intCast(input_tensor.shape[1]);
@@ -179,6 +229,197 @@ pub const MoEFFN = struct {
             );
         }
         // Dump capture (compiled in only for dump binary)
+        if (build_options.dump_tensors) {
+            const shape = [4]usize{ 1, seq_len, self.d_model, 0 };
+            dump.recordGlobal(.ffn_down, self.layer_idx, output_tensor.data().ptr, .f32, shape, 3);
+        }
+    }
+
+    /// Fused FFN+MoE forward pass for Gemma4 MoE.
+    /// Handles: shared MLP + custom router (softmax-then-topk) + experts + internal norms.
+    fn forwardFusedMoE(self: *const MoEFFN, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *MoEScratch, matmul_scratch: *cpu_linalg.MatmulScratch) !void {
+        std.debug.assert(input_tensor.n_dims == 3 and output_tensor.n_dims == 3);
+        std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1);
+        const seq_len: usize = @intCast(input_tensor.shape[1]);
+        std.debug.assert(input_tensor.shape[2] == self.d_model and output_tensor.shape[2] == self.d_model);
+
+        const shared_gate_proj = self.shared_gate_proj.?;
+        const shared_up_proj = self.shared_up_proj.?;
+        const shared_down_proj = self.shared_down_proj.?;
+
+        // Allocate scratch buffers
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.router_logits, self.num_experts);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.expert_weights, self.experts_per_token);
+        try cpu_common.ensureU32Slice(self.allocator, &scratch.expert_indices, self.experts_per_token);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.expert_outputs, self.d_model);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.gate_up_values, 2 * self.d_ff);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.hidden_values, self.d_ff);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.shared_gate_up_values, 2 * self.shared_d_ff);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.shared_hidden_values, self.shared_d_ff);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.shared_output, self.d_model);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.normed_input, self.d_model);
+
+        const input_values = input_tensor.asSlice(f32);
+        const output_values = output_tensor.asSlice(f32);
+        @memset(output_values, 0.0);
+
+        for (0..seq_len) |token_index| {
+            const token_input = input_values[token_index * self.d_model ..][0..self.d_model];
+            const token_output = output_values[token_index * self.d_model ..][0..self.d_model];
+            const normed = scratch.normed_input[0..self.d_model];
+            const shared_out = scratch.shared_output[0..self.d_model];
+
+            // === 1. Shared MLP path ===
+            // pre_feedforward_layernorm(input) → normed
+            @memcpy(normed, token_input);
+            if (self.pre_ffn_norm_weight) |*w| {
+                cpu_normalization.rmsnormInPlaceWeightTensor(normed, w, self.norm_eps, self.norm_weight_offset);
+            }
+
+            // shared_mlp: gate_proj + up_proj → GELU → down_proj
+            {
+                const sg_values = scratch.shared_gate_up_values[0 .. 2 * self.shared_d_ff];
+                const sh_values = scratch.shared_hidden_values[0..self.shared_d_ff];
+                const s_gate = sg_values[0..self.shared_d_ff];
+                const s_up = sg_values[self.shared_d_ff..][0..self.shared_d_ff];
+
+                var input_view = Tensor.view2DSlice(@constCast(normed), 1, self.d_model);
+                var gate_out = Tensor.view2DSlice(s_gate, 1, self.shared_d_ff);
+                matmulWeightTransposed(&input_view, &shared_gate_proj, &gate_out, matmul_scratch);
+
+                var up_out = Tensor.view2DSlice(s_up, 1, self.shared_d_ff);
+                matmulWeightTransposed(&input_view, &shared_up_proj, &up_out, matmul_scratch);
+
+                cpu_activation.geluMulSplit(s_gate, s_up, sh_values);
+
+                var hidden_view = Tensor.view2DSlice(sh_values, 1, self.shared_d_ff);
+                var out_view = Tensor.view2DSlice(shared_out, 1, self.d_model);
+                matmulWeightTransposed(&hidden_view, &shared_down_proj, &out_view, matmul_scratch);
+            }
+
+            // post_feedforward_layernorm_1(shared_out)
+            if (self.post_shared_norm_weight) |*w| {
+                cpu_normalization.rmsnormInPlaceWeightTensor(shared_out, w, self.norm_eps, self.norm_weight_offset);
+            }
+
+            // === 2. Router (operates on raw residual) ===
+            const router_logits = scratch.router_logits[0..self.num_experts];
+
+            // Unscaled RMSNorm + learned scale on the router input
+            @memcpy(normed, token_input);
+            {
+                var sum_sq: f32 = 0.0;
+                for (normed) |v| sum_sq += v * v;
+                const rms = @sqrt(sum_sq / @as(f32, @floatFromInt(self.d_model)) + self.norm_eps);
+                const inv_rms = 1.0 / rms;
+                if (self.router_input_scale) |scale| {
+                    for (normed, scale) |*x, s| {
+                        x.* = x.* * inv_rms * s * self.router_scalar_root_size;
+                    }
+                } else {
+                    for (normed) |*x| x.* *= inv_rms;
+                }
+            }
+
+            cpu_matvec.matVecDense(normed, &self.router_weight, self.router_bias, router_logits);
+
+            // Softmax over ALL experts, then top-k, then renormalize
+            {
+                var max_logit: f32 = -std.math.inf(f32);
+                for (router_logits) |l| {
+                    if (l > max_logit) max_logit = l;
+                }
+                var sum_exp: f32 = 0.0;
+                for (router_logits) |*l| {
+                    l.* = @exp(l.* - max_logit);
+                    sum_exp += l.*;
+                }
+                if (sum_exp > 0.0) {
+                    const inv_sum = 1.0 / sum_exp;
+                    for (router_logits) |*l| l.* *= inv_sum;
+                }
+            }
+
+            const selected_indices = scratch.expert_indices[0..self.experts_per_token];
+            const selected_weights = scratch.expert_weights[0..self.experts_per_token];
+
+            // Top-k selection from softmax weights
+            for (0..self.experts_per_token) |k| {
+                var best_idx: u32 = 0;
+                var best_val: f32 = -std.math.inf(f32);
+                for (router_logits, 0..) |val, i| {
+                    if (val > best_val) {
+                        var already = false;
+                        for (selected_indices[0..k]) |prev| {
+                            if (prev == @as(u32, @intCast(i))) { already = true; break; }
+                        }
+                        if (!already) {
+                            best_val = val;
+                            best_idx = @intCast(i);
+                        }
+                    }
+                }
+                selected_indices[k] = best_idx;
+                selected_weights[k] = best_val;
+            }
+
+            // Renormalize selected weights to sum to 1.0
+            {
+                var weight_sum: f32 = 0.0;
+                for (selected_weights) |w| weight_sum += w;
+                if (weight_sum > 0.0) {
+                    const inv_sum = 1.0 / weight_sum;
+                    for (selected_weights) |*w| w.* *= inv_sum;
+                }
+            }
+
+            // Apply per-expert scale
+            if (self.router_per_expert_scale) |per_expert_scale| {
+                for (selected_indices, selected_weights) |idx, *w| {
+                    if (idx < self.num_experts) {
+                        w.* *= per_expert_scale[idx];
+                    }
+                }
+            }
+
+            // === 3. Expert path ===
+            // pre_feedforward_layernorm_2(input) → normed
+            @memcpy(normed, token_input);
+            if (self.pre_expert_norm_weight) |*w| {
+                cpu_normalization.rmsnormInPlaceWeightTensor(normed, w, self.norm_eps, self.norm_weight_offset);
+            }
+
+            // Run selected experts and accumulate weighted output
+            @memset(token_output, 0.0);
+            for (0..self.experts_per_token) |expert_sel| {
+                const expert_index = selected_indices[expert_sel];
+                const weight = selected_weights[expert_sel];
+                if (expert_index >= self.num_experts) continue;
+
+                const expert = &self.experts[expert_index];
+                const expert_output = scratch.expert_outputs[0..self.d_model];
+                try self.runExpert(expert, normed, expert_output, scratch, matmul_scratch);
+                cpu_rowwise.addScaledInPlace(token_output, expert_output, weight);
+            }
+
+            // post_feedforward_layernorm_2(expert_output)
+            if (self.post_expert_norm_weight) |*w| {
+                cpu_normalization.rmsnormInPlaceWeightTensor(token_output, w, self.norm_eps, self.norm_weight_offset);
+            }
+
+            // === 4. Combine: shared_out + expert_out ===
+            for (token_output, shared_out) |*o, s| o.* += s;
+
+            // post_feedforward_layernorm(combined)
+            if (self.post_combine_norm_weight) |*w| {
+                cpu_normalization.rmsnormInPlaceWeightTensor(token_output, w, self.norm_eps, self.norm_weight_offset);
+            }
+        }
+
+        // Trace/dump emission
+        if (trace.isEnabled()) {
+            trace.emit(.ffn_down, self.layer_idx, 0, @intCast(seq_len), output_tensor.data().ptr, .f32, .{ 1, @intCast(seq_len), @intCast(self.d_model), 0 }, 3, self.kernel_name);
+        }
         if (build_options.dump_tensors) {
             const shape = [4]usize{ 1, seq_len, self.d_model, 0 };
             dump.recordGlobal(.ffn_down, self.layer_idx, output_tensor.data().ptr, .f32, shape, 3);
@@ -263,16 +504,14 @@ pub const MoEFFN = struct {
                 // Standard matmul for gate_values
                 var input_view = Tensor.view2DSlice(@constCast(input_vector), 1, self.d_model);
                 var gate_output_view = Tensor.view2DSlice(gate_values, 1, self.d_ff);
-                const gate_kernel = (cpu_linalg.matmulKernel(gate_proj.dtype) catch cpu_linalg.DispatchedKernel{ .func = cpu_linalg.matmulF32, .name = "matmulF32" }).func;
-                gate_kernel(&input_view, &gate_proj, &gate_output_view, matmul_scratch);
+                matmulWeightTransposed(&input_view, &gate_proj, &gate_output_view, matmul_scratch);
                 if (expert.gate_bias) |bias| {
                     cpu_common.addBiasRows(gate_values, bias, 1, self.d_ff);
                 }
 
                 // Standard matmul for up_values
                 var up_output_view = Tensor.view2DSlice(up_values, 1, self.d_ff);
-                const up_kernel = (cpu_linalg.matmulKernel(up_proj.dtype) catch cpu_linalg.DispatchedKernel{ .func = cpu_linalg.matmulF32, .name = "matmulF32" }).func;
-                up_kernel(&input_view, &up_proj, &up_output_view, matmul_scratch);
+                matmulWeightTransposed(&input_view, &up_proj, &up_output_view, matmul_scratch);
                 if (expert.up_bias) |bias| {
                     cpu_common.addBiasRows(up_values, bias, 1, self.d_ff);
                 }
@@ -315,8 +554,7 @@ pub const MoEFFN = struct {
                 // Standard F32/F16/BF16 matmul
                 var input_view = Tensor.view2DSlice(@constCast(input_vector), 1, self.d_model);
                 var out_view = Tensor.view2DSlice(gate_up_values, 1, 2 * self.d_ff);
-                const matmul_kernel = (cpu_linalg.matmulKernel(gate_up_proj.dtype) catch cpu_linalg.DispatchedKernel{ .func = cpu_linalg.matmulF32, .name = "matmulF32" }).func;
-                matmul_kernel(&input_view, &gate_up_proj, &out_view, matmul_scratch);
+                matmulWeightTransposed(&input_view, &gate_up_proj, &out_view, matmul_scratch);
 
                 if (expert.gate_up_bias) |bias| {
                     cpu_common.addBiasRows(gate_up_values, bias, 1, 2 * self.d_ff);
@@ -326,7 +564,9 @@ pub const MoEFFN = struct {
             return error.MissingMoEWeights;
         }
 
-        if (self.use_swiglu_variant) {
+        if (self.use_gelu) {
+            cpu_activation.geluMulSplit(gate_values, up_values, hidden_values);
+        } else if (self.use_swiglu_variant) {
             // GPT-OSS path uses interleaved gate/up values.
             cpu_activation.swigluVariantInterleaved(gate_up_values, hidden_values);
         } else {
@@ -363,8 +603,7 @@ pub const MoEFFN = struct {
         } else {
             var input_view = Tensor.view2DSlice(hidden_values, 1, self.d_ff);
             var out_view = Tensor.view2DSlice(output_vector, 1, self.d_model);
-            const matmul_kernel = (cpu_linalg.matmulKernel(expert.down_proj.dtype) catch cpu_linalg.DispatchedKernel{ .func = cpu_linalg.matmulF32, .name = "matmulF32" }).func;
-            matmul_kernel(&input_view, &expert.down_proj, &out_view, matmul_scratch);
+            matmulWeightTransposed(&input_view, &expert.down_proj, &out_view, matmul_scratch);
 
             if (expert.down_bias) |bias| {
                 cpu_common.addBiasRows(output_vector, bias, 1, self.d_model);

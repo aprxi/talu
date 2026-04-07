@@ -333,7 +333,9 @@ fn applySpecTransforms(
     };
 
     const force_f32 = spec.force_f32 or hasTransform(spec.transforms, .dtype_f32) or spec.layout == .conv1d_depthwise;
-    if (force_f32 or (spec.layout == .none and !isNormModule(spec.module_type))) {
+    // Skip F32 conversion for 3D+ tensors (fused expert weight blocks) — they stay
+    // in native dtype and use the dtype-appropriate matmul kernel directly.
+    if (force_f32 or (spec.layout == .none and !isNormModule(spec.module_type) and raw_tensor.n_dims <= 2)) {
         const preserve_norm_dtype = options.preserve_native_norm_dtype and isNormModule(spec.module_type) and !force_f32;
         if (!preserve_norm_dtype) {
             tensor_view = try transforms.ensureF32(allocator, tensor_view);

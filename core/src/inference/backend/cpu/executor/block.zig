@@ -175,6 +175,9 @@ const MoeRuntimeMetadata = struct {
     up_bias_len: usize,
     gate_up_bias_len: usize,
     down_bias_len: usize,
+    /// Multi-expert MoE: dispatch directly to the pre-bound MoEFFN kernel
+    /// instead of reconstructing from weight handles.
+    is_multi_expert: bool = false,
 };
 
 const MambaRuntimeMetadata = struct {
@@ -684,7 +687,35 @@ pub const Block = struct {
                 };
             }
             if (typed_kernel_refs.moe[idx]) |binding| {
-                if (binding.experts.len != 1) return error.UnsupportedModel;
+                if (binding.experts.len != 1) {
+                    // Multi-expert MoE: dispatch directly to the pre-bound kernel
+                    // at runtime. No per-expert weight decomposition needed.
+                    moe[idx] = .{
+                        .allocator = binding.allocator,
+                        .d_model = binding.d_model,
+                        .d_ff = binding.d_ff,
+                        .num_experts = binding.num_experts,
+                        .experts_per_token = binding.experts_per_token,
+                        .use_mxfp4 = binding.use_mxfp4,
+                        .use_swiglu_variant = binding.use_swiglu_variant,
+                        .use_transposed_weights = binding.use_transposed_weights,
+                        .layer_idx = binding.layer_idx,
+                        .kernel_name = binding.kernel_name,
+                        .has_gate_proj = false,
+                        .has_up_proj = false,
+                        .has_gate_up_proj = false,
+                        .gate_scales_len = 0,
+                        .up_scales_len = 0,
+                        .gate_up_scales_len = 0,
+                        .down_scales_len = 0,
+                        .gate_bias_len = 0,
+                        .up_bias_len = 0,
+                        .gate_up_bias_len = 0,
+                        .down_bias_len = 0,
+                        .is_multi_expert = true,
+                    };
+                    continue;
+                }
                 const expert = binding.experts[0];
                 const gate_scales_len = if (expert.gate_scales) |gate_scales|
                     gate_scales.len
@@ -865,10 +896,7 @@ pub const Block = struct {
                     else => return error.InvalidInstructionBinding,
                 },
                 .moe => moe[op_index] = switch (kernel) {
-                    .moe => |binding| blk: {
-                        if (binding.experts.len != 1) return error.UnsupportedModel;
-                        break :blk binding;
-                    },
+                    .moe => |binding| binding,
                     else => return error.InvalidInstructionBinding,
                 },
                 .mamba_mixer => mamba[op_index] = switch (kernel) {
@@ -1017,7 +1045,9 @@ pub const Block = struct {
             },
             .moe => {
                 const moe_binding = typed_kernel_refs.moe[op_index] orelse return error.InvalidInstructionBinding;
-                if (moe_binding.experts.len != 1) return error.UnsupportedModel;
+                // Multi-expert MoE: weight handles are unused (direct kernel call path).
+                // Return placeholder pointers so the weight table builder succeeds.
+                if (moe_binding.experts.len != 1) return @ptrCast(@constCast(&missing_weight_tensor));
                 return switch (slot_idx) {
                     0 => @ptrCast(@constCast(&moe_binding.router_weight)),
                     1 => blk: {
@@ -1637,6 +1667,7 @@ pub const Block = struct {
         .rmsnorm,
         .multihead_attention,
         .swiglu,
+        .moe,
         .mamba_mixer,
         .gated_delta_net,
         .shortconv,
@@ -1672,6 +1703,7 @@ pub const Block = struct {
         table[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = rmsNormKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = multiheadAttentionKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.swiglu)] = swiGluKernelRuntimeAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.moe)] = moeKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = mambaMixerKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.gated_delta_net)] = gatedDeltaNetKernelRuntimeAdapter;
         table[@intFromEnum(runtime_contract.Opcode.shortconv)] = shortConvKernelRuntimeAdapter;
@@ -1720,6 +1752,7 @@ pub const Block = struct {
         caps[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.swiglu)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
+        caps[@intFromEnum(runtime_contract.Opcode.moe)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.gated_delta_net)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
         caps[@intFromEnum(runtime_contract.Opcode.shortconv)] = .{ .supports_batch = true, .supports_graph_emit = false, .max_batch_size = null };
@@ -2216,7 +2249,12 @@ pub const Block = struct {
             if (weight_handles.len != 13) return error.InvalidWeightRefCount;
             if (state.op_index >= state.block.instruction_moe_runtime_metadata.len) return error.InvalidInstructionIndex;
             const meta = state.block.instruction_moe_runtime_metadata[state.op_index] orelse return error.MissingKernelBinding;
-            if (meta.num_experts != 1) return error.UnsupportedModel;
+            // Multi-expert MoE: dispatch directly to the pre-bound kernel.
+            if (meta.is_multi_expert) {
+                const moe_binding = state.block.instruction_moe_bindings[state.op_index] orelse return error.MissingKernelBinding;
+                try dispatchMoeWithMode(state, input, output, moe_binding);
+                return;
+            }
             var expert = moe_kernel.ExpertWeights{
                 .gate_proj = null,
                 .up_proj = null,
@@ -4918,7 +4956,7 @@ test "resolveKernelWeightPtrForSlot emits missing sentinel for dense swiglu up s
     );
 }
 
-test "resolveKernelWeightPtrForSlot rejects multi-expert moe bindings" {
+test "resolveKernelWeightPtrForSlot returns placeholder for multi-expert moe bindings" {
     const router = zeroTensor();
     const gate0 = zeroTensor();
     const up0 = zeroTensor();
@@ -4960,9 +4998,11 @@ test "resolveKernelWeightPtrForSlot rejects multi-expert moe bindings" {
         .shortconv = shortconv[0..],
     };
 
-    try testing.expectError(
-        error.UnsupportedModel,
-        Block.resolveKernelWeightPtrForSlot(0, 0, .moe, typed, 0),
+    // Multi-expert MoE returns a placeholder pointer (dispatch bypasses weight handles).
+    const ptr = try Block.resolveKernelWeightPtrForSlot(0, 0, .moe, typed, 0);
+    try testing.expectEqual(
+        @intFromPtr(&missing_weight_tensor),
+        @intFromPtr(@as(*const Tensor, @ptrCast(@alignCast(ptr)))),
     );
 }
 
@@ -4990,7 +5030,7 @@ test "Block.validate rejects missing cached kernel binding" {
     try testing.expectError(error.KernelIndexOutOfBounds, block.validate());
 }
 
-test "cpu adapter table rejects moe opcode at load-time validation" {
+test "cpu adapter table supports moe opcode" {
     const plan = runtime_contract.ExecutionPlan{
         .instructions = &.{
             .{
@@ -5006,9 +5046,7 @@ test "cpu adapter table rejects moe opcode at load-time validation" {
         .state_descs = &.{},
     };
     const unsupported = runtime_contract.firstUnsupportedInstructionOpcode(&plan, Block.adapter_table);
-    try testing.expect(unsupported != null);
-    try testing.expectEqual(@as(usize, 0), unsupported.?.instruction_index);
-    try testing.expectEqual(runtime_contract.Opcode.moe, unsupported.?.opcode);
+    try testing.expect(unsupported == null);
 }
 
 test "Block.validate rejects missing flattened primitive weight binding" {

@@ -8,6 +8,7 @@ const types = @import("op_types.zig");
 
 const minilm = @import("bert/minilm.zig");
 const gemma3 = @import("gemma/gemma3.zig");
+const gemma4_moe = @import("gemma/gemma4_moe.zig");
 const gpt_oss = @import("gpt_oss/gpt_oss.zig");
 const granite3 = @import("granite/granite3.zig");
 const granite_hybrid = @import("granite/granite_hybrid.zig");
@@ -25,6 +26,7 @@ const youtu_vl = @import("youtu_vl/youtu_vl.zig");
 
 const registry = [_]struct { id: []const u8, arch: *const types.Architecture }{
     .{ .id = gemma3.id, .arch = &gemma3.arch },
+    .{ .id = gemma4_moe.id, .arch = &gemma4_moe.arch },
     .{ .id = gpt_oss.id, .arch = &gpt_oss.arch },
     .{ .id = granite3.id, .arch = &granite3.arch },
     .{ .id = granite_hybrid.id, .arch = &granite_hybrid.arch },

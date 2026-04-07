@@ -12,6 +12,7 @@ const runtime_contract = @import("../inference/runtime_contract/root.zig");
 const runtime_architectures = @import("runtime_architectures.zig");
 const minilm = @import("bert/minilm.zig");
 const gemma3 = @import("gemma/gemma3.zig");
+const gemma4_moe = @import("gemma/gemma4_moe.zig");
 const gpt_oss = @import("gpt_oss/gpt_oss.zig");
 const granite3 = @import("granite/granite3.zig");
 const granite_hybrid = @import("granite/granite_hybrid.zig");
@@ -36,6 +37,12 @@ pub const entries: []const Entry = &.{
         .family = gemma3.family,
         .version = gemma3.version,
         .model_types = gemma3.model_types,
+    },
+    .{
+        .id = gemma4_moe.id,
+        .family = gemma4_moe.family,
+        .version = gemma4_moe.version,
+        .model_types = gemma4_moe.model_types,
     },
     .{
         .id = granite3.id,
@@ -195,6 +202,7 @@ pub fn blockProgramFor(entry: Entry, block_kind: op_types.BlockKind) ?[]const la
     if (std.mem.eql(u8, entry.id, llama2.id)) return llama2.attention_mlp_program;
     if (std.mem.eql(u8, entry.id, llama3.id)) return llama3.attention_mlp_program;
     if (std.mem.eql(u8, entry.id, gemma3.id)) return gemma3.attention_mlp_program;
+    if (std.mem.eql(u8, entry.id, gemma4_moe.id)) return gemma4_moe.attention_moe_program;
     if (std.mem.eql(u8, entry.id, granite3.id)) return granite3.attention_mlp_program;
     if (std.mem.eql(u8, entry.id, ministral3.id)) return ministral3.attention_mlp_program;
     if (std.mem.eql(u8, entry.id, phi4.id)) return phi4.attention_mlp_program;

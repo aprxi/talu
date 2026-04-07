@@ -170,6 +170,7 @@ const JsonConfig = struct {
     num_experts: ?i64 = null,
     num_experts_per_tok: ?i64 = null,
     experts_per_token: ?i64 = null, // Alias used by some models
+    top_k_experts: ?i64 = null, // Alias used by Gemma4 MoE
     moe_intermediate_size: ?i64 = null,
     // Activation
     hidden_activation: ?[]const u8 = null, // "silu" or "gelu_pytorch_tanh"
@@ -290,26 +291,45 @@ fn mapJsonParseError(err: anyerror) anyerror {
 fn modelTypeFromRootObject(root_obj: std.json.ObjectMap) ?[]const u8 {
     // Prefer root-level model_type. This is the primary architecture identifier
     // for model bundles and conversion.
+    var model_type: ?[]const u8 = null;
     if (root_obj.get("model_type")) |v| {
         switch (v) {
-            .string => |s| return s,
+            .string => |s| model_type = s,
             else => {},
         }
     }
 
     // Fall back to text_config.model_type for multimodal wrappers that only
     // define model_type in the text sub-config.
-    if (root_obj.get("text_config")) |tc| {
-        if (tc == .object) {
-            if (tc.object.get("model_type")) |v| {
+    const text_config = if (root_obj.get("text_config")) |tc|
+        (if (tc == .object) tc.object else null)
+    else
+        null;
+
+    if (model_type == null) {
+        if (text_config) |tc| {
+            if (tc.get("model_type")) |v| {
                 switch (v) {
-                    .string => |s| return s,
+                    .string => |s| model_type = s,
                     else => {},
                 }
             }
         }
     }
-    return null;
+
+    // Gemma4 MoE uses the same model_type "gemma4" as the dense variant.
+    // Disambiguate by checking text_config.enable_moe_block.
+    if (model_type) |mt| {
+        if (std.mem.startsWith(u8, mt, "gemma4")) {
+            if (text_config) |tc| {
+                if (tc.get("enable_moe_block")) |v| {
+                    if (v == .bool and v.bool) return "gemma4_moe";
+                }
+            }
+        }
+    }
+
+    return model_type;
 }
 
 fn architectureNameFromRootObject(root_obj: std.json.ObjectMap) ?[]const u8 {
@@ -702,7 +722,7 @@ pub fn loadConfigForArchitectureWithHook(
         .gaffine_bits = config_json.gaffineBits(),
         .tie_word_embeddings = config_json.tie_word_embeddings orelse true, // Default true for most models
         .num_experts = config_json.firstInt(.{ "num_local_experts", "num_experts" }) orelse 0,
-        .experts_per_token = config_json.firstInt(.{ "num_experts_per_tok", "experts_per_token" }) orelse 0,
+        .experts_per_token = config_json.firstInt(.{ "num_experts_per_tok", "experts_per_token", "top_k_experts" }) orelse 0,
         .quant_method = quant_method_kind,
         .rope_scaling = rope_scaling_params,
         // Model arch is always .custom - actual architecture comes from models metadata.

@@ -1344,10 +1344,22 @@ pub const TransformerBlock = struct {
                 .use_swiglu_variant = runtime.use_swiglu_variant,
                 .use_transposed_weights = runtime.use_transposed_mxfp4,
             }, @src());
+            const has_shared_mlp = moe_w.shared_w1 != null;
+            // Expert d_ff: derive from expert weights (which may differ from shared MLP d_ff).
+            // inferAttentionDff() uses shared MLP weights (w1/w2/w3) and returns shared_d_ff,
+            // but expert FFN dimensions come from moe_intermediate_size.
+            const expert_d_ff: usize = if (moe_w.experts.len > 0) blk: {
+                const expert = &moe_w.experts[0];
+                if (expert.gate_up_proj) |gup| {
+                    break :blk @as(usize, @intCast(gup.shape[0])) / 2;
+                } else if (expert.gate_proj) |gp| {
+                    break :blk @as(usize, @intCast(gp.shape[0]));
+                } else break :blk d_ff;
+            } else d_ff;
             ffn_ptr.* = .{ .moe_ffn = .{
                 .allocator = allocator,
                 .d_model = d_model,
-                .d_ff = d_ff,
+                .d_ff = expert_d_ff,
                 .num_experts = moe_w.num_experts,
                 .experts_per_token = moe_w.experts_per_token,
                 .router_weight = moe_w.router_weight,
@@ -1356,8 +1368,26 @@ pub const TransformerBlock = struct {
                 .use_mxfp4 = moe_w.use_mxfp4,
                 .use_swiglu_variant = runtime.use_swiglu_variant,
                 .use_transposed_weights = runtime.use_transposed_mxfp4,
+                .use_gelu = use_gelu,
+                // Shared MLP (Gemma4 MoE)
+                .shared_gate_proj = moe_w.shared_w1,
+                .shared_up_proj = moe_w.shared_w3,
+                .shared_down_proj = moe_w.shared_w2,
+                .shared_d_ff = if (moe_w.shared_w1) |t| @intCast(t.shape[0]) else 0,
+                // Router scaling (Gemma4 MoE)
+                .router_input_scale = if (moe_w.router_input_scale) |t| t.asSlice(f32) else null,
+                .router_per_expert_scale = if (moe_w.router_per_expert_scale) |t| t.asSlice(f32) else null,
+                .router_scalar_root_size = if (has_shared_mlp) 1.0 / @sqrt(@as(f32, @floatFromInt(d_model))) else 0.0,
+                // Internal norms for fused FFN+MoE (Gemma4 MoE)
+                .pre_ffn_norm_weight = moe_w.pre_ffn_norm,
+                .post_shared_norm_weight = moe_w.post_shared_norm,
+                .pre_expert_norm_weight = moe_w.pre_expert_norm,
+                .post_expert_norm_weight = moe_w.post_expert_norm,
+                .post_combine_norm_weight = moe_w.post_combine_norm,
+                .norm_eps = norm_eps,
+                .norm_weight_offset = runtime.weight_offset,
                 .layer_idx = @intCast(block_idx),
-                .kernel_name = if (moe_w.use_mxfp4) "moe_mxfp4" else "moe_f32",
+                .kernel_name = if (has_shared_mlp) "moe_gemma4" else if (moe_w.use_mxfp4) "moe_mxfp4" else "moe_f32",
             } };
         } else {
             const w2 = weights.w2 orelse return error.MissingFFNWeights;
