@@ -58,6 +58,7 @@ const attention_policy_config = engine_types.attention_policy_config;
 const run_startup_selftests = engine_types.run_startup_selftests;
 const gaffine_scales_dtype_f16 = engine_types.gaffine_scales_dtype_f16;
 const gaffine_scales_dtype_bf16 = engine_types.gaffine_scales_dtype_bf16;
+const adjustSplitForKvSharing = engine_types.adjustSplitForKvSharing;
 const DenseU16Dtype = engine_types.DenseU16Dtype;
 const EmbeddingLookupKind = engine_types.EmbeddingLookupKind;
 const KernelSlot = engine_types.KernelSlot;
@@ -529,6 +530,9 @@ pub const CudaBackend = struct {
     parity_checkpoint_warned: [256]bool,
     gemma4_per_layer: ?Gemma4PerLayerRuntime = null,
     gemma4_embed_add_host: []f32 = &.{},
+    /// Per-layer scalar multipliers for models that have `layer_scalar` weights
+    /// but no PLE (hidden_size_per_layer_input == 0). Indexed by local layer index.
+    standalone_layer_scalars: ?[]f32 = null,
 
     const PipelineTransferMode = enum { none, peer_to_peer, host_staged };
 
@@ -578,6 +582,7 @@ pub const CudaBackend = struct {
         per_layer_projection: []LinearWeight,
         post_per_layer_input_norm_weight: []DeviceTensor,
         layer_scalars: []f32,
+        layer_offset: usize,
 
         fn deinit(self: *Gemma4PerLayerRuntime, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
             for (self.post_per_layer_input_norm_weight) |*weight| weight.deinit(device);
@@ -706,6 +711,7 @@ pub const CudaBackend = struct {
     fn initGemma4PerLayerRuntime(
         self: *CudaBackend,
         layer_count: usize,
+        layer_offset: usize,
     ) !?Gemma4PerLayerRuntime {
         if (self.loaded.config.hidden_size_per_layer_input <= 0) return null;
         if (self.loaded.st == null) return error.MissingWeight;
@@ -713,7 +719,9 @@ pub const CudaBackend = struct {
 
         const hidden_size_per_layer_input: usize = @intCast(self.loaded.config.hidden_size_per_layer_input);
         const hidden_size = self.d_model;
-        const layer_width_total = std.math.mul(usize, layer_count, hidden_size_per_layer_input) catch return error.InvalidArgument;
+        // Total width required from the shared projection weight: covers layers
+        // [layer_offset, layer_offset + layer_count).
+        const required_width = std.math.mul(usize, layer_offset + layer_count, hidden_size_per_layer_input) catch return error.InvalidArgument;
 
         const per_layer_embedding = try loadTensorAnyCuda(safetensors, &.{
             "model.language_model.embed_tokens_per_layer.weight",
@@ -734,9 +742,9 @@ pub const CudaBackend = struct {
         if (per_layer_embedding.n_dims != 2) return error.InvalidShape;
         if (per_layer_embedding.shape[0] <= 0 or per_layer_embedding.shape[1] <= 0) return error.InvalidShape;
         const per_layer_embedding_width: usize = @intCast(per_layer_embedding.shape[1]);
-        if (per_layer_embedding_width < layer_width_total) return error.InvalidShape;
+        if (per_layer_embedding_width < required_width) return error.InvalidShape;
         if (per_layer_model_projection_weight.n_dims != 2 or
-            @as(usize, @intCast(per_layer_model_projection_weight.shape[0])) != layer_width_total or
+            @as(usize, @intCast(per_layer_model_projection_weight.shape[0])) < required_width or
             @as(usize, @intCast(per_layer_model_projection_weight.shape[1])) != hidden_size)
         {
             return error.InvalidShape;
@@ -779,10 +787,11 @@ pub const CudaBackend = struct {
         errdefer per_layer_projection_norm_weight_dev.deinit(&self.device);
 
         for (0..layer_count) |layer_idx| {
-            const gate_weight = try loadLayerTensorBySuffixCuda(safetensors, layer_idx, "per_layer_input_gate.weight");
-            const projection_weight = try loadLayerTensorBySuffixCuda(safetensors, layer_idx, "per_layer_projection.weight");
-            const post_norm_weight = try loadLayerTensorBySuffixCuda(safetensors, layer_idx, "post_per_layer_input_norm.weight");
-            const layer_scalar = try loadLayerTensorBySuffixCuda(safetensors, layer_idx, "layer_scalar");
+            const global_layer_idx = layer_offset + layer_idx;
+            const gate_weight = try loadLayerTensorBySuffixCuda(safetensors, global_layer_idx, "per_layer_input_gate.weight");
+            const projection_weight = try loadLayerTensorBySuffixCuda(safetensors, global_layer_idx, "per_layer_projection.weight");
+            const post_norm_weight = try loadLayerTensorBySuffixCuda(safetensors, global_layer_idx, "post_per_layer_input_norm.weight");
+            const layer_scalar = try loadLayerTensorBySuffixCuda(safetensors, global_layer_idx, "layer_scalar");
 
             if (gate_weight.n_dims != 2 or
                 @as(usize, @intCast(gate_weight.shape[0])) != hidden_size_per_layer_input or
@@ -802,7 +811,7 @@ pub const CudaBackend = struct {
                 return error.InvalidShape;
             }
 
-            const row_start = std.math.mul(usize, layer_idx, hidden_size_per_layer_input) catch return error.InvalidArgument;
+            const row_start = std.math.mul(usize, global_layer_idx, hidden_size_per_layer_input) catch return error.InvalidArgument;
             const projection_view = try matrixRowsViewCuda(
                 &per_layer_model_projection_weight,
                 row_start,
@@ -851,6 +860,7 @@ pub const CudaBackend = struct {
             .per_layer_projection = per_layer_projection,
             .post_per_layer_input_norm_weight = post_per_layer_input_norm_weight,
             .layer_scalars = layer_scalars,
+            .layer_offset = layer_offset,
         };
     }
 
@@ -859,6 +869,29 @@ pub const CudaBackend = struct {
             gemma4.deinit(self.allocator, &self.device);
             self.gemma4_per_layer = null;
         }
+    }
+
+    /// Load per-layer scalar multipliers for models that have `layer_scalar`
+    /// weights but no PLE (hidden_size_per_layer_input == 0).
+    fn initStandaloneLayerScalars(
+        self: *CudaBackend,
+        layer_count: usize,
+        layer_offset: usize,
+    ) !?[]f32 {
+        if (self.loaded.config.hidden_size_per_layer_input > 0) return null;
+        if (self.loaded.st == null) return null;
+        const safetensors = &(self.loaded.st.?);
+        // Probe layer 0 to determine if layer_scalar weights exist.
+        _ = loadLayerTensorBySuffixCuda(safetensors, 0, "layer_scalar") catch return null;
+
+        const scalars = try self.allocator.alloc(f32, layer_count);
+        errdefer self.allocator.free(scalars);
+        for (0..layer_count) |layer_idx| {
+            const global_layer_idx = layer_offset + layer_idx;
+            const t = try loadLayerTensorBySuffixCuda(safetensors, global_layer_idx, "layer_scalar");
+            scalars[layer_idx] = try tensorScalarToF32Cuda(&t);
+        }
+        return scalars;
     }
 
     pub fn ensureGemma4EmbedAddHostCapacity(self: *CudaBackend, elements: usize) !void {
@@ -881,7 +914,9 @@ pub const CudaBackend = struct {
         const required = std.math.mul(usize, token_ids.len, hpl) catch return error.InvalidArgument;
         if (out.len < required) return error.InvalidArgument;
         const vocab_limit: usize = @intCast(gemma4.per_layer_embedding.shape[0]);
-        const layer_offset = std.math.mul(usize, layer_idx, hpl) catch return error.InvalidArgument;
+        // Use global layer index for the embedding column offset.
+        const global_layer_idx = gemma4.layer_offset + layer_idx;
+        const layer_offset = std.math.mul(usize, global_layer_idx, hpl) catch return error.InvalidArgument;
 
         switch (gemma4.per_layer_embedding.dtype) {
             .f32 => {
@@ -922,8 +957,7 @@ pub const CudaBackend = struct {
     }
 
     pub fn maybeCaptureGemma4SourceEmbeddings(self: *CudaBackend, rows: usize) !?compute.cuda.Buffer {
-        const gemma4 = self.gemma4_per_layer orelse return null;
-        _ = gemma4;
+        _ = self.gemma4_per_layer orelse return null;
         if (rows == 0) return error.InvalidArgument;
         const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
         const bytes = std.math.mul(usize, rows, row_bytes) catch return error.InvalidArgument;
@@ -937,6 +971,29 @@ pub const CudaBackend = struct {
             &dst,
             std.math.mul(u32, @intCast(rows), @intCast(self.d_model)) catch return error.InvalidArgument,
         );
+        return dst;
+    }
+
+    /// Pipeline decode: look up raw embedding on host and upload to deepstack_add_dev.
+    /// Used when input_dev has post-CPU-layer hidden states, not raw embeddings.
+    pub fn captureGemma4SourceEmbeddingsForPipeline(self: *CudaBackend, token: u32) !?compute.cuda.Buffer {
+        _ = self.gemma4_per_layer orelse return null;
+        const used = try engine_weights.tryPopulateHiddenFromToken(self.loaded, token, self.runtime_buffers.hidden_host);
+        if (!used) {
+            log.warn("inference", "captureGemma4SourceEmbeddingsForPipeline: tryPopulateHiddenFromToken returned false", .{
+                .token = token,
+                .embed_dtype = @tagName(self.loaded.token_embeddings.dtype),
+                .embed_ndim = self.loaded.token_embeddings.n_dims,
+                .embed_data_ptr_null = self.loaded.token_embeddings.data_ptr == null,
+            });
+            return error.UnsupportedModel;
+        }
+        if (self.loaded.config.embedding_multiplier != 1.0) {
+            for (self.runtime_buffers.hidden_host) |*v| v.* *= self.loaded.config.embedding_multiplier;
+        }
+        const row_bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+        var dst = try bufferSlice(&self.runtime_buffers.deepstack_add_dev, 0, row_bytes);
+        try dst.upload(&self.device, std.mem.sliceAsBytes(self.runtime_buffers.hidden_host));
         return dst;
     }
 
@@ -1083,6 +1140,30 @@ pub const CudaBackend = struct {
                 std.math.mul(u32, rows_u32, d_model_u32) catch return error.InvalidArgument,
             );
         }
+    }
+
+    pub fn applyStandaloneLayerScalar(
+        self: *CudaBackend,
+        layer_idx: usize,
+        hidden_rows: *compute.cuda.Buffer,
+        rows: usize,
+    ) !void {
+        const scalars = self.standalone_layer_scalars orelse return;
+        if (layer_idx >= scalars.len) return;
+        const scalar = scalars[layer_idx];
+        if (scalar == 1.0) return;
+        const d_model_u32: u32 = @intCast(self.d_model);
+        const rows_u32: u32 = @intCast(rows);
+        try compute.cuda.vector_add_scaled.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.vector_add_scaled_function orelse return error.CudaKernelUnavailable,
+            hidden_rows,
+            hidden_rows,
+            hidden_rows,
+            scalar - 1.0,
+            std.math.mul(u32, rows_u32, d_model_u32) catch return error.InvalidArgument,
+        );
     }
 
     const DeviceMemoryBudget = struct {
@@ -1313,15 +1394,7 @@ pub const CudaBackend = struct {
         // receive an explicit range; topology backends compute their own range
         // from the split points so BlockRuntime only allocates the needed layers.
         const total_layers = loaded.blocks.len;
-        const layer_range = try computeInitLayerRange(init_options, total_layers);
-        const gemma4_full_range_supported = layer_range.start == 0 and layer_range.end == total_layers;
-        if (loaded.config.hidden_size_per_layer_input > 0 and !gemma4_full_range_supported) {
-            log.warn("inference", "CUDA Gemma4 per-layer branch disabled for partial layer-range stage", .{
-                .layer_start = layer_range.start,
-                .layer_end = layer_range.end,
-                .total_layers = total_layers,
-            });
-        }
+        const layer_range = try computeInitLayerRange(init_options, total_layers, loaded.config);
         backend.block_runtime = BlockRuntime.initRange(
             allocator,
             &backend.device,
@@ -1396,6 +1469,8 @@ pub const CudaBackend = struct {
             backend.max_batch_size,
             @max(@as(usize, 1), backend.block_runtime.attention_block_count),
             @max(@as(usize, 1), backend.block_runtime.gated_delta_block_count),
+            layer_range.start > 0, // skip_embedding: intermediate stage receives hidden states
+            layer_range.end < total_layers, // skip_projection: intermediate stage doesn't compute logits
         ) catch |err| {
             log.warn("inference", "CUDA runtime buffer init failed", .{
                 .reason = @errorName(err),
@@ -1403,8 +1478,8 @@ pub const CudaBackend = struct {
             return err;
         };
         errdefer backend.runtime_buffers.deinit(allocator, &backend.device);
-        if (loaded.config.hidden_size_per_layer_input > 0 and gemma4_full_range_supported) {
-            backend.gemma4_per_layer = backend.initGemma4PerLayerRuntime(backend.block_runtime.blocks.len) catch |err| {
+        if (loaded.config.hidden_size_per_layer_input > 0) {
+            backend.gemma4_per_layer = backend.initGemma4PerLayerRuntime(backend.block_runtime.blocks.len, layer_range.start) catch |err| {
                 log.warn("inference", "CUDA Gemma4 per-layer runtime init failed", .{
                     .reason = @errorName(err),
                 });
@@ -1413,6 +1488,7 @@ pub const CudaBackend = struct {
             if (backend.gemma4_per_layer) |gemma4| {
                 log.warn("inference", "CUDA Gemma4 per-layer runtime enabled", .{
                     .layers = gemma4.per_layer_model_projection.len,
+                    .layer_offset = gemma4.layer_offset,
                     .hidden_size_per_layer_input = gemma4.hidden_size_per_layer_input,
                 });
             }
@@ -1420,21 +1496,17 @@ pub const CudaBackend = struct {
             backend.gemma4_per_layer = null;
         }
         errdefer backend.deinitGemma4PerLayerRuntime();
-
-        // Pipeline stages that don't start at layer 0 receive hidden states
-        // from the preceding stage — they never perform embedding lookup.
-        // Pipeline stages that don't end at the last layer output hidden states
-        // to the next stage — they never compute logits via projection.
-        // Free these unused GPU allocations to reclaim VRAM.
-        if (layer_range.start > 0) {
-            if (backend.runtime_buffers.embedding_lookup) |*lookup| {
-                lookup.deinit(&backend.device);
-                backend.runtime_buffers.embedding_lookup = null;
-            }
+        // Standalone layer scalars (models with layer_scalar but no PLE).
+        backend.standalone_layer_scalars = backend.initStandaloneLayerScalars(backend.block_runtime.blocks.len, layer_range.start) catch null;
+        errdefer {
+            if (backend.standalone_layer_scalars) |s| allocator.free(s);
+            backend.standalone_layer_scalars = null;
         }
-        if (layer_range.end < total_layers) {
-            backend.runtime_buffers.projection_weight.deinit(&backend.device);
-            backend.runtime_buffers.projection_weight = .{ .dense_f32 = missing_device_tensor };
+        if (backend.standalone_layer_scalars) |scalars| {
+            log.warn("inference", "CUDA standalone layer_scalars enabled", .{
+                .layers = scalars.len,
+                .layer_offset = layer_range.start,
+            });
         }
 
         try backend.initLayerProgramSlotBuffers();
@@ -2028,6 +2100,7 @@ pub const CudaBackend = struct {
     pub fn computeInitLayerRange(
         opts: InitOptions,
         total_layers: usize,
+        config: tensor.ModelConfig,
     ) error{InvalidTopologyConfig}!LayerRangeResult {
         if (opts.init_layer_range) |r| {
             // init_layer_range is internal: used by topology init to create stage
@@ -2041,7 +2114,13 @@ pub const CudaBackend = struct {
             .single => .{ .start = 0, .end = total_layers },
             .pipeline2 => {
                 if (total_layers < 2) return error.InvalidTopologyConfig;
-                const split = opts.split_layer orelse total_layers / 2;
+                const default_split = opts.split_layer orelse total_layers / 2;
+                if (default_split == 0 or default_split >= total_layers) return error.InvalidTopologyConfig;
+                // Adjust GPU2 start down so KV-shared layers keep their sources.
+                const split = adjustSplitForKvSharing(config, default_split, total_layers, 0) orelse {
+                    log.warn("inference", "KV sharing requires all shared source layers on GPU2; no valid pipeline2 split exists", .{});
+                    return error.InvalidTopologyConfig;
+                };
                 if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
                 return .{ .start = 0, .end = split, .split_layer = split };
             },
@@ -2057,8 +2136,22 @@ pub const CudaBackend = struct {
                 const split = opts.split_layer orelse split_default;
                 if (split == 0 or split >= total_layers) return error.InvalidTopologyConfig;
                 const split_stage2_default = split + @max(@as(usize, 1), (total_layers - split) / 2);
-                const split_stage2 = opts.split_layer_stage2 orelse split_stage2_default;
+                const default_stage2 = opts.split_layer_stage2 orelse split_stage2_default;
+                if (default_stage2 <= split or default_stage2 >= total_layers) return error.InvalidTopologyConfig;
+                // Adjust GPU2 start down so KV-shared layers keep their sources.
+                const split_stage2 = adjustSplitForKvSharing(config, default_stage2, total_layers, split) orelse {
+                    log.warn("inference", "KV sharing requires source layers on GPU2 but they fall in CPU range; cpu_gpu_gpu infeasible", .{
+                        .cpu_layers = split,
+                    });
+                    return error.InvalidTopologyConfig;
+                };
                 if (split_stage2 <= split or split_stage2 >= total_layers) return error.InvalidTopologyConfig;
+                if (split_stage2 != default_stage2) {
+                    log.info("inference", "Adjusted GPU1/GPU2 split for KV sharing", .{
+                        .original_split_stage2 = default_stage2,
+                        .adjusted_split_stage2 = split_stage2,
+                    });
+                }
                 return .{ .start = split_stage2, .end = total_layers, .split_layer = split, .split_layer_stage2 = split_stage2 };
             },
         };
@@ -2091,6 +2184,7 @@ pub const CudaBackend = struct {
         if (self.parity_prefill_layer_ffn_norm_host.len > 0) self.allocator.free(self.parity_prefill_layer_ffn_norm_host);
         if (self.parity_prefill_block_out_host.len > 0) self.allocator.free(self.parity_prefill_block_out_host);
         self.deinitGemma4PerLayerRuntime();
+        if (self.standalone_layer_scalars) |s| self.allocator.free(s);
         if (self.gemma4_embed_add_host.len > 0) self.allocator.free(self.gemma4_embed_add_host);
         if (self.gated_delta_stage_input_host.len > 0) self.allocator.free(self.gated_delta_stage_input_host);
         if (self.gated_delta_stage_mid_host.len > 0) self.allocator.free(self.gated_delta_stage_mid_host);
@@ -2294,7 +2388,8 @@ pub const CudaBackend = struct {
     /// Initialize per-slot KV, gated delta, and shortconv state buffers.
     /// Called after block_runtime is initialized.
     fn initSlotKvStates(self: *CudaBackend) !void {
-        const n_attn = self.block_runtime.attention_block_count;
+        const n_mirrors = self.block_runtime.replicated_kv_sources.len;
+        const n_attn = self.block_runtime.attention_block_count + n_mirrors;
         const n_gd = self.block_runtime.gated_delta_block_count;
         const n_sc = self.block_runtime.shortconv_block_count;
         self.slot_kv_states = try self.allocator.alloc(SlotKvStates, self.max_batch_size);
@@ -2442,6 +2537,37 @@ pub const CudaBackend = struct {
                     sc_i += 1;
                 }
             }
+            // Mirror KV entries for cross-device KV sharing replication.
+            for (self.block_runtime.mirror_kv, self.block_runtime.replicated_kv_sources) |mk, src| {
+                _ = src;
+                if (slot_idx == 0) {
+                    // Slot 0 aliases the block_runtime mirror buffers.
+                    sks.kv[attn_i] = .{
+                        .k = mk.k,
+                        .v = mk.v,
+                        .k_scale = mk.k_scale,
+                        .v_scale = mk.v_scale,
+                        .capacity = mk.capacity,
+                    };
+                } else {
+                    // Slots 1+ get fresh mirror allocations.
+                    var kv_pair = try self.allocKvPair(mk.capacity, self.block_runtime.replicated_kv_sources[attn_i - self.block_runtime.attention_block_count].kv_dim);
+                    errdefer {
+                        if (kv_pair.v_scale.pointer != 0) kv_pair.v_scale.deinit(&self.device);
+                        if (kv_pair.k_scale.pointer != 0) kv_pair.k_scale.deinit(&self.device);
+                        kv_pair.v.deinit(&self.device);
+                        kv_pair.k.deinit(&self.device);
+                    }
+                    sks.kv[attn_i] = .{
+                        .k = kv_pair.k,
+                        .v = kv_pair.v,
+                        .k_scale = kv_pair.k_scale,
+                        .v_scale = kv_pair.v_scale,
+                        .capacity = mk.capacity,
+                    };
+                }
+                attn_i += 1;
+            }
             initialized_slots += 1;
         }
     }
@@ -2505,6 +2631,17 @@ pub const CudaBackend = struct {
                 sc_i += 1;
             }
         }
+        // Save mirror KV buffers for cross-device replication.
+        for (self.block_runtime.mirror_kv, 0..) |mk, mi| {
+            const idx = self.block_runtime.attention_block_count + mi;
+            sks.kv[idx] = .{
+                .k = mk.k,
+                .v = mk.v,
+                .k_scale = mk.k_scale,
+                .v_scale = mk.v_scale,
+                .capacity = mk.capacity,
+            };
+        }
     }
 
     pub fn loadKvSlot(self: *CudaBackend, slot_index: usize) void {
@@ -2531,6 +2668,15 @@ pub const CudaBackend = struct {
                 block.conv_state = sks.sc[sc_i].conv;
                 sc_i += 1;
             }
+        }
+        // Sync mirror KV buffers for cross-device replication.
+        for (self.block_runtime.mirror_kv, 0..) |*mk, mi| {
+            const idx = self.block_runtime.attention_block_count + mi;
+            mk.k = sks.kv[idx].k;
+            mk.v = sks.kv[idx].v;
+            mk.k_scale = sks.kv[idx].k_scale;
+            mk.v_scale = sks.kv[idx].v_scale;
+            mk.capacity = sks.kv[idx].capacity;
         }
     }
 

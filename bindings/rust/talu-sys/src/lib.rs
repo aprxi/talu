@@ -253,7 +253,7 @@ impl From<i32> for BackendType {
     }
 }
 
-/// Source: core/src/capi/agent/root.zig
+/// Source: core/src/capi/agent/policy.zig
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CProcessDenyReason {
@@ -543,7 +543,7 @@ impl From<i32> for LogLevel {
     }
 }
 
-/// Source: core/src/router/root.zig
+/// Source: core/src/router/local.zig
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FinishReason {
@@ -587,28 +587,22 @@ impl From<i32> for TaluAgentRuntimeMode {
     }
 }
 
-/// Source: core/src/capi/db/ops.zig
-#[repr(u8)]
+/// Source: core/src/converter/scheme.zig
+#[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CStorageEventType {
-    PutItems = 0,
-    DeleteItem = 1,
-    ClearItems = 2,
-    PutSession = 3,
-    BeginFork = 4,
-    EndFork = 5,
+pub enum QuantLevel {
+    Q4 = 0,
+    Q8 = 1,
+    Q16 = 2,
 }
 
-impl From<u8> for CStorageEventType {
-    fn from(value: u8) -> Self {
+impl From<u32> for QuantLevel {
+    fn from(value: u32) -> Self {
         match value {
-            0 => CStorageEventType::PutItems,
-            1 => CStorageEventType::DeleteItem,
-            2 => CStorageEventType::ClearItems,
-            3 => CStorageEventType::PutSession,
-            4 => CStorageEventType::BeginFork,
-            5 => CStorageEventType::EndFork,
-            _ => CStorageEventType::EndFork,
+            0 => QuantLevel::Q4,
+            1 => QuantLevel::Q8,
+            2 => QuantLevel::Q16,
+            _ => QuantLevel::Q16,
         }
     }
 }
@@ -659,26 +653,6 @@ impl From<i32> for QuantMethodEnum {
     }
 }
 
-/// Source: core/src/capi/template.zig
-#[repr(i32)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CSpanSourceType {
-    StaticText = 0,
-    Variable = 1,
-    Expression = 2,
-}
-
-impl From<i32> for CSpanSourceType {
-    fn from(value: i32) -> Self {
-        match value {
-            0 => CSpanSourceType::StaticText,
-            1 => CSpanSourceType::Variable,
-            2 => CSpanSourceType::Expression,
-            _ => CSpanSourceType::Expression,
-        }
-    }
-}
-
 /// Source: core/src/converter/scheme.zig
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -699,22 +673,48 @@ impl From<u32> for Platform {
     }
 }
 
-/// Source: core/src/converter/scheme.zig
-#[repr(u32)]
+/// Source: core/src/capi/template.zig
+#[repr(i32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum QuantLevel {
-    Q4 = 0,
-    Q8 = 1,
-    Q16 = 2,
+pub enum CSpanSourceType {
+    StaticText = 0,
+    Variable = 1,
+    Expression = 2,
 }
 
-impl From<u32> for QuantLevel {
-    fn from(value: u32) -> Self {
+impl From<i32> for CSpanSourceType {
+    fn from(value: i32) -> Self {
         match value {
-            0 => QuantLevel::Q4,
-            1 => QuantLevel::Q8,
-            2 => QuantLevel::Q16,
-            _ => QuantLevel::Q16,
+            0 => CSpanSourceType::StaticText,
+            1 => CSpanSourceType::Variable,
+            2 => CSpanSourceType::Expression,
+            _ => CSpanSourceType::Expression,
+        }
+    }
+}
+
+/// Source: core/src/capi/db/ops.zig
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CStorageEventType {
+    PutItems = 0,
+    DeleteItem = 1,
+    ClearItems = 2,
+    PutSession = 3,
+    BeginFork = 4,
+    EndFork = 5,
+}
+
+impl From<u8> for CStorageEventType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => CStorageEventType::PutItems,
+            1 => CStorageEventType::DeleteItem,
+            2 => CStorageEventType::ClearItems,
+            3 => CStorageEventType::PutSession,
+            4 => CStorageEventType::BeginFork,
+            5 => CStorageEventType::EndFork,
+            _ => CStorageEventType::EndFork,
         }
     }
 }
@@ -847,6 +847,25 @@ impl Default for CTransformerConfig {
     }
 }
 
+/// Source: core/src/capi/provider_config.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CProviderHealthResult {
+    pub ok: u8,
+    pub model_count: usize,
+    pub error_message: *const c_char,
+}
+
+impl Default for CProviderHealthResult {
+    fn default() -> Self {
+        Self {
+            ok: 0,
+            model_count: 0,
+            error_message: std::ptr::null(),
+        }
+    }
+}
+
 /// Source: core/src/capi/router.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -880,25 +899,6 @@ impl Default for CModelInfo {
             gaffine_group_size: 0,
             weight_dtype: 0,
             _pad: [0; 7],
-        }
-    }
-}
-
-/// Source: core/src/capi/provider_config.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CProviderHealthResult {
-    pub ok: u8,
-    pub model_count: usize,
-    pub error_message: *const c_char,
-}
-
-impl Default for CProviderHealthResult {
-    fn default() -> Self {
-        Self {
-            ok: 0,
-            model_count: 0,
-            error_message: std::ptr::null(),
         }
     }
 }
@@ -1142,27 +1142,6 @@ impl Default for CCollabHistoryEntry {
     }
 }
 
-/// Source: core/src/capi/documents_impl.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CSearchResult {
-    pub doc_id: *const c_char,
-    pub doc_type: *const c_char,
-    pub title: *const c_char,
-    pub snippet: *const c_char,
-}
-
-impl Default for CSearchResult {
-    fn default() -> Self {
-        Self {
-            doc_id: std::ptr::null(),
-            doc_type: std::ptr::null(),
-            title: std::ptr::null(),
-            snippet: std::ptr::null(),
-        }
-    }
-}
-
 /// Source: core/src/capi/scheduler.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1182,6 +1161,27 @@ impl Default for CTokenEvent {
             is_final: 0,
             _pad: [0; 3],
             slot_index: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/documents_impl.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CSearchResult {
+    pub doc_id: *const c_char,
+    pub doc_type: *const c_char,
+    pub title: *const c_char,
+    pub snippet: *const c_char,
+}
+
+impl Default for CSearchResult {
+    fn default() -> Self {
+        Self {
+            doc_id: std::ptr::null(),
+            doc_type: std::ptr::null(),
+            title: std::ptr::null(),
+            snippet: std::ptr::null(),
         }
     }
 }
@@ -1768,6 +1768,37 @@ impl Default for CLogitBiasEntry {
     }
 }
 
+/// Source: core/src/capi/scheduler.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CSubmitOptions {
+    pub eos_token_ids: *const u32,
+    pub eos_token_ids_len: usize,
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub seed: u64,
+    pub priority: c_int,
+    pub _pad: [u8; 4],
+}
+
+impl Default for CSubmitOptions {
+    fn default() -> Self {
+        Self {
+            eos_token_ids: std::ptr::null(),
+            eos_token_ids_len: 0,
+            temperature: -1.0,
+            top_k: 0,
+            top_p: -1.0,
+            min_p: -1.0,
+            seed: 0,
+            priority: 0,
+            _pad: [0; 4],
+        }
+    }
+}
+
 /// Source: core/src/capi/file.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1830,37 +1861,6 @@ impl Default for CRow {
             _pad: [0; 4],
             payload: std::ptr::null(),
             payload_len: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/scheduler.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CSubmitOptions {
-    pub eos_token_ids: *const u32,
-    pub eos_token_ids_len: usize,
-    pub temperature: f32,
-    pub top_k: usize,
-    pub top_p: f32,
-    pub min_p: f32,
-    pub seed: u64,
-    pub priority: c_int,
-    pub _pad: [u8; 4],
-}
-
-impl Default for CSubmitOptions {
-    fn default() -> Self {
-        Self {
-            eos_token_ids: std::ptr::null(),
-            eos_token_ids_len: 0,
-            temperature: -1.0,
-            top_k: 0,
-            top_p: -1.0,
-            min_p: -1.0,
-            seed: 0,
-            priority: 0,
-            _pad: [0; 4],
         }
     }
 }
@@ -2332,44 +2332,6 @@ impl Default for CDocumentRecord {
     }
 }
 
-/// Source: core/src/capi/documents_impl.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CDeltaChain {
-    pub items: *mut CDocumentRecord,
-    pub count: usize,
-    pub _arena: *mut c_void,
-}
-
-impl Default for CDeltaChain {
-    fn default() -> Self {
-        Self {
-            items: std::ptr::null_mut(),
-            count: 0,
-            _arena: std::ptr::null_mut(),
-        }
-    }
-}
-
-/// Source: core/src/capi/collab.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CCollabHistoryList {
-    pub items: *mut CCollabHistoryEntry,
-    pub count: usize,
-    pub _arena: *mut c_void,
-}
-
-impl Default for CCollabHistoryList {
-    fn default() -> Self {
-        Self {
-            items: std::ptr::null_mut(),
-            count: 0,
-            _arena: std::ptr::null_mut(),
-        }
-    }
-}
-
 /// Source: core/src/capi/agent/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -2445,6 +2407,44 @@ impl Default for CAgentCreateConfig {
             memory_recall_limit: 0,
             memory_append_on_run: 1,
             _pad2: [0; 7],
+        }
+    }
+}
+
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabHistoryList {
+    pub items: *mut CCollabHistoryEntry,
+    pub count: usize,
+    pub _arena: *mut c_void,
+}
+
+impl Default for CCollabHistoryList {
+    fn default() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            count: 0,
+            _arena: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Source: core/src/capi/documents_impl.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CDeltaChain {
+    pub items: *mut CDocumentRecord,
+    pub count: usize,
+    pub _arena: *mut c_void,
+}
+
+impl Default for CDeltaChain {
+    fn default() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            count: 0,
+            _arena: std::ptr::null_mut(),
         }
     }
 }
@@ -2584,6 +2584,25 @@ impl Default for CKvWatchEvent {
     }
 }
 
+/// Source: core/src/capi/provider_config.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CProviderCredentials {
+    pub effective_endpoint: *const c_char,
+    pub api_key: *const c_char,
+    pub error_code: c_int,
+}
+
+impl Default for CProviderCredentials {
+    fn default() -> Self {
+        Self {
+            effective_endpoint: std::ptr::null(),
+            api_key: std::ptr::null(),
+            error_code: 0,
+        }
+    }
+}
+
 /// Source: core/src/capi/responses.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -2613,25 +2632,6 @@ impl Default for CItem {
             prefill_ns: 0,
             generation_ns: 0,
             finish_reason_ptr: std::ptr::null(),
-        }
-    }
-}
-
-/// Source: core/src/capi/provider_config.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CProviderCredentials {
-    pub effective_endpoint: *const c_char,
-    pub api_key: *const c_char,
-    pub error_code: c_int,
-}
-
-impl Default for CProviderCredentials {
-    fn default() -> Self {
-        Self {
-            effective_endpoint: std::ptr::null(),
-            api_key: std::ptr::null(),
-            error_code: 0,
         }
     }
 }
@@ -3118,6 +3118,27 @@ impl Default for TaluImageConvertOptions {
     }
 }
 
+/// Source: core/src/capi/session.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct GenerationConfigInfo {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub do_sample: bool,
+}
+
+impl Default for GenerationConfigInfo {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 0.0,
+            do_sample: false,
+        }
+    }
+}
+
 /// Source: core/src/capi/documents_impl.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3141,27 +3162,6 @@ impl Default for CChangeRecord {
             doc_type: std::ptr::null(),
             title: std::ptr::null(),
             _reserved: [0; 7],
-        }
-    }
-}
-
-/// Source: core/src/capi/session.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct GenerationConfigInfo {
-    pub temperature: f32,
-    pub top_k: usize,
-    pub top_p: f32,
-    pub do_sample: bool,
-}
-
-impl Default for GenerationConfigInfo {
-    fn default() -> Self {
-        Self {
-            temperature: 0.0,
-            top_k: 0,
-            top_p: 0.0,
-            do_sample: false,
         }
     }
 }
@@ -3231,48 +3231,6 @@ impl Default for CGenerateConfig {
     }
 }
 
-/// Source: core/src/capi/tokenizer.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct EosTokenResult {
-    pub tokens: *mut u32,
-    pub num_tokens: usize,
-}
-
-impl Default for EosTokenResult {
-    fn default() -> Self {
-        Self {
-            tokens: std::ptr::null_mut(),
-            num_tokens: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/tokenizer.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct EncodeOptions {
-    pub add_bos: u8,
-    pub add_eos: u8,
-    pub truncation: u8,
-    pub truncation_side: u8,
-    pub _padding: [u8; 4],
-    pub max_length: usize,
-}
-
-impl Default for EncodeOptions {
-    fn default() -> Self {
-        Self {
-            add_bos: 1,
-            add_eos: 1,
-            truncation: 0,
-            truncation_side: 0,
-            _padding: [0; 4],
-            max_length: 0,
-        }
-    }
-}
-
 /// Source: core/src/capi/converter.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3322,6 +3280,48 @@ impl Default for ModelInfo {
             num_experts: 0,
             experts_per_token: 0,
             error_msg: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/tokenizer.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EncodeOptions {
+    pub add_bos: u8,
+    pub add_eos: u8,
+    pub truncation: u8,
+    pub truncation_side: u8,
+    pub _padding: [u8; 4],
+    pub max_length: usize,
+}
+
+impl Default for EncodeOptions {
+    fn default() -> Self {
+        Self {
+            add_bos: 1,
+            add_eos: 1,
+            truncation: 0,
+            truncation_side: 0,
+            _padding: [0; 4],
+            max_length: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/tokenizer.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EosTokenResult {
+    pub tokens: *mut u32,
+    pub num_tokens: usize,
+}
+
+impl Default for EosTokenResult {
+    fn default() -> Self {
+        Self {
+            tokens: std::ptr::null_mut(),
+            num_tokens: 0,
         }
     }
 }
@@ -3459,39 +3459,23 @@ impl Default for CFunctionCallOutputItem {
     }
 }
 
-/// Source: core/src/capi/db/ops.zig
+/// Source: core/src/capi/responses.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct CStorageEvent {
-    pub event_type: CStorageEventType,
-    pub _pad: [u8; 7],
-    pub items: *const CStorageRecord,
-    pub items_count: usize,
-    pub session: CSessionRecord,
-    pub deleted_item_id: u64,
-    pub deleted_at_ms: i64,
-    pub cleared_at_ms: i64,
-    pub keep_context: bool,
-    pub fork_id: u64,
-    pub fork_session_id: *const c_char,
-    pub _reserved: [u8; 7],
+pub struct CMessageItem {
+    pub role: u8,
+    pub _padding: [u8; 7],
+    pub content_count: usize,
+    pub raw_role_ptr: *const c_char,
 }
 
-impl Default for CStorageEvent {
+impl Default for CMessageItem {
     fn default() -> Self {
         Self {
-            event_type: CStorageEventType::from(0),
-            _pad: [0; 7],
-            items: std::ptr::null(),
-            items_count: 0,
-            session: CSessionRecord::default(),
-            deleted_item_id: 0,
-            deleted_at_ms: 0,
-            cleared_at_ms: 0,
-            keep_context: false,
-            fork_id: 0,
-            fork_session_id: std::ptr::null(),
-            _reserved: [0; 7],
+            role: 0,
+            _padding: [0; 7],
+            content_count: 0,
+            raw_role_ptr: std::ptr::null(),
         }
     }
 }
@@ -3561,27 +3545,6 @@ impl Default for CStringList {
     }
 }
 
-/// Source: core/src/capi/responses.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CMessageItem {
-    pub role: u8,
-    pub _padding: [u8; 7],
-    pub content_count: usize,
-    pub raw_role_ptr: *const c_char,
-}
-
-impl Default for CMessageItem {
-    fn default() -> Self {
-        Self {
-            role: 0,
-            _padding: [0; 7],
-            content_count: 0,
-            raw_role_ptr: std::ptr::null(),
-        }
-    }
-}
-
 /// Source: core/src/converter/scheme.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3595,6 +3558,43 @@ impl Default for OverrideRule {
         Self {
             pattern: std::ptr::null(),
             scheme: Scheme::from(0),
+        }
+    }
+}
+
+/// Source: core/src/capi/db/ops.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CStorageEvent {
+    pub event_type: CStorageEventType,
+    pub _pad: [u8; 7],
+    pub items: *const CStorageRecord,
+    pub items_count: usize,
+    pub session: CSessionRecord,
+    pub deleted_item_id: u64,
+    pub deleted_at_ms: i64,
+    pub cleared_at_ms: i64,
+    pub keep_context: bool,
+    pub fork_id: u64,
+    pub fork_session_id: *const c_char,
+    pub _reserved: [u8; 7],
+}
+
+impl Default for CStorageEvent {
+    fn default() -> Self {
+        Self {
+            event_type: CStorageEventType::from(0),
+            _pad: [0; 7],
+            items: std::ptr::null(),
+            items_count: 0,
+            session: CSessionRecord::default(),
+            deleted_item_id: 0,
+            deleted_at_ms: 0,
+            cleared_at_ms: 0,
+            keep_context: false,
+            fork_id: 0,
+            fork_session_id: std::ptr::null(),
+            _reserved: [0; 7],
         }
     }
 }
@@ -4054,7 +4054,7 @@ impl Default for DownloadOptions {
     }
 }
 
-/// Source: core/src/capi/agent/root.zig
+/// Source: core/src/capi/agent/fs.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TaluFsStat {
@@ -4211,6 +4211,25 @@ impl Default for COutputSpan {
     }
 }
 
+/// Source: core/src/capi/collab.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CCollabWatchWaitResult {
+    pub published_seq: u64,
+    pub timed_out: bool,
+    pub _flags_reserved: [u8; 7],
+}
+
+impl Default for CCollabWatchWaitResult {
+    fn default() -> Self {
+        Self {
+            published_seq: 0,
+            timed_out: false,
+            _flags_reserved: [0; 7],
+        }
+    }
+}
+
 /// Source: core/src/capi/file.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -4271,25 +4290,6 @@ impl Default for TaluFileInfo {
     }
 }
 
-/// Source: core/src/capi/collab.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CCollabWatchWaitResult {
-    pub published_seq: u64,
-    pub timed_out: bool,
-    pub _flags_reserved: [u8; 7],
-}
-
-impl Default for CCollabWatchWaitResult {
-    fn default() -> Self {
-        Self {
-            published_seq: 0,
-            timed_out: false,
-            _flags_reserved: [0; 7],
-        }
-    }
-}
-
 /// Source: core/src/capi/tensor.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -4340,29 +4340,6 @@ impl Default for EffectiveGenConfigRequest {
     }
 }
 
-/// Source: core/src/capi/db/kv.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CKvWatchBatch {
-    pub items: *mut CKvWatchEvent,
-    pub count: usize,
-    pub lost: bool,
-    pub _flags_reserved: [u8; 7],
-    pub _arena: *mut c_void,
-}
-
-impl Default for CKvWatchBatch {
-    fn default() -> Self {
-        Self {
-            items: std::ptr::null_mut(),
-            count: 0,
-            lost: false,
-            _flags_reserved: [0; 7],
-            _arena: std::ptr::null_mut(),
-        }
-    }
-}
-
 /// Source: core/src/capi/documents_impl.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -4386,6 +4363,29 @@ impl Default for CCompactionStats {
             tombstone_count: 0,
             delta_versions: 0,
             estimated_garbage_bytes: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/db/kv.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CKvWatchBatch {
+    pub items: *mut CKvWatchEvent,
+    pub count: usize,
+    pub lost: bool,
+    pub _flags_reserved: [u8; 7],
+    pub _arena: *mut c_void,
+}
+
+impl Default for CKvWatchBatch {
+    fn default() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            count: 0,
+            lost: false,
+            _flags_reserved: [0; 7],
+            _arena: std::ptr::null_mut(),
         }
     }
 }

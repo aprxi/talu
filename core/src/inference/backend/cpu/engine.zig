@@ -1252,6 +1252,7 @@ pub const FusedCpuBackend = struct {
         tokens: []const u32,
         output: []f32,
         layer_end: usize,
+        source_embeddings_out: ?[]f32,
     ) !void {
         try self.ensureSlotStateBlocksBound(slot_index);
         if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
@@ -1272,6 +1273,13 @@ pub const FusedCpuBackend = struct {
         var view = Tensor.view3D(std.mem.sliceAsBytes(output), prompt_len, model_dim);
         try self.model.embed_tokens.forward(tokens, &view);
         cpu_rowwise.scaleInPlace(output, self.loaded.config.embedding_multiplier);
+
+        // Capture source embeddings (raw scaled embed_tokens output) before
+        // the layer forward modifies the buffer. GPU stages need these for
+        // Gemma4 per-layer-input branch.
+        if (source_embeddings_out) |se_out| {
+            @memcpy(se_out, output);
+        }
 
         try self.model.forwardWithBatchedCacheLayerRangeTokenIds(
             &view,

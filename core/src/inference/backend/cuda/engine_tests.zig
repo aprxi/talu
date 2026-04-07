@@ -4557,9 +4557,10 @@ test "interleaved multi-slot lifecycle with pipeline stage" {
 
 const computeInitLayerRange = CudaBackend.computeInitLayerRange;
 const InitOptions = CudaBackend.InitOptions;
+const no_sharing_config: tensor.ModelConfig = .{};
 
 test "computeInitLayerRange: single topology uses full range" {
-    const r = try computeInitLayerRange(.{ .topology_mode = .single }, 32);
+    const r = try computeInitLayerRange(.{ .topology_mode = .single }, 32, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 0), r.start);
     try std.testing.expectEqual(@as(usize, 32), r.end);
     try std.testing.expectEqual(@as(usize, 0), r.split_layer);
@@ -4567,14 +4568,14 @@ test "computeInitLayerRange: single topology uses full range" {
 }
 
 test "computeInitLayerRange: pipeline2 default split is n/2" {
-    const r = try computeInitLayerRange(.{ .topology_mode = .pipeline2 }, 32);
+    const r = try computeInitLayerRange(.{ .topology_mode = .pipeline2 }, 32, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 0), r.start);
     try std.testing.expectEqual(@as(usize, 16), r.end);
     try std.testing.expectEqual(@as(usize, 16), r.split_layer);
 }
 
 test "computeInitLayerRange: pipeline2 explicit split" {
-    const r = try computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 10 }, 32);
+    const r = try computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 10 }, 32, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 0), r.start);
     try std.testing.expectEqual(@as(usize, 10), r.end);
     try std.testing.expectEqual(@as(usize, 10), r.split_layer);
@@ -4583,33 +4584,33 @@ test "computeInitLayerRange: pipeline2 explicit split" {
 test "computeInitLayerRange: pipeline2 rejects split_layer=0" {
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 0 }, 32),
+        computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 0 }, 32, no_sharing_config),
     );
 }
 
 test "computeInitLayerRange: pipeline2 rejects split_layer>=total" {
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 32 }, 32),
+        computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 32 }, 32, no_sharing_config),
     );
 }
 
 test "computeInitLayerRange: pipeline2 rejects 1 layer" {
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .pipeline2 }, 1),
+        computeInitLayerRange(.{ .topology_mode = .pipeline2 }, 1, no_sharing_config),
     );
 }
 
 test "computeInitLayerRange: cpu_gpu default split returns upper half" {
-    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu }, 32);
+    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu }, 32, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 16), r.start);
     try std.testing.expectEqual(@as(usize, 32), r.end);
     try std.testing.expectEqual(@as(usize, 16), r.split_layer);
 }
 
 test "computeInitLayerRange: cpu_gpu explicit split" {
-    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 8 }, 32);
+    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 8 }, 32, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 8), r.start);
     try std.testing.expectEqual(@as(usize, 32), r.end);
     try std.testing.expectEqual(@as(usize, 8), r.split_layer);
@@ -4618,21 +4619,21 @@ test "computeInitLayerRange: cpu_gpu explicit split" {
 test "computeInitLayerRange: cpu_gpu rejects split_layer=0" {
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 0 }, 32),
+        computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 0 }, 32, no_sharing_config),
     );
 }
 
 test "computeInitLayerRange: cpu_gpu rejects 1 layer" {
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .cpu_gpu }, 1),
+        computeInitLayerRange(.{ .topology_mode = .cpu_gpu }, 1, no_sharing_config),
     );
 }
 
 test "computeInitLayerRange: cpu_gpu_gpu default splits 3-way" {
     // 12 layers: split=max(1,12/3)=4, split_stage2=4+max(1,(12-4)/2)=4+4=8.
     // Self backend gets [8, 12).
-    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu_gpu }, 12);
+    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu_gpu }, 12, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 8), r.start);
     try std.testing.expectEqual(@as(usize, 12), r.end);
     try std.testing.expectEqual(@as(usize, 4), r.split_layer);
@@ -4644,7 +4645,7 @@ test "computeInitLayerRange: cpu_gpu_gpu explicit splits" {
         .topology_mode = .cpu_gpu_gpu,
         .split_layer = 4,
         .split_layer_stage2 = 8,
-    }, 12);
+    }, 12, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 8), r.start);
     try std.testing.expectEqual(@as(usize, 12), r.end);
     try std.testing.expectEqual(@as(usize, 4), r.split_layer);
@@ -4658,7 +4659,7 @@ test "computeInitLayerRange: cpu_gpu_gpu rejects split_stage2<=split" {
             .topology_mode = .cpu_gpu_gpu,
             .split_layer = 5,
             .split_layer_stage2 = 5,
-        }, 12),
+        }, 12, no_sharing_config),
     );
 }
 
@@ -4669,14 +4670,14 @@ test "computeInitLayerRange: cpu_gpu_gpu rejects split_stage2>=total" {
             .topology_mode = .cpu_gpu_gpu,
             .split_layer = 4,
             .split_layer_stage2 = 12,
-        }, 12),
+        }, 12, no_sharing_config),
     );
 }
 
 test "computeInitLayerRange: cpu_gpu_gpu rejects fewer than 3 layers" {
     try std.testing.expectError(
         error.InvalidTopologyConfig,
-        computeInitLayerRange(.{ .topology_mode = .cpu_gpu_gpu }, 2),
+        computeInitLayerRange(.{ .topology_mode = .cpu_gpu_gpu }, 2, no_sharing_config),
     );
 }
 
@@ -4684,7 +4685,7 @@ test "computeInitLayerRange: explicit init_layer_range with single mode" {
     const r = try computeInitLayerRange(.{
         .topology_mode = .single,
         .init_layer_range = .{ .start = 5, .end = 10 },
-    }, 32);
+    }, 32, no_sharing_config);
     try std.testing.expectEqual(@as(usize, 5), r.start);
     try std.testing.expectEqual(@as(usize, 10), r.end);
     try std.testing.expectEqual(@as(usize, 0), r.split_layer);
@@ -4698,21 +4699,21 @@ test "computeInitLayerRange: rejects init_layer_range with staged topology" {
         computeInitLayerRange(.{
             .topology_mode = .pipeline2,
             .init_layer_range = .{ .start = 5, .end = 10 },
-        }, 32),
+        }, 32, no_sharing_config),
     );
     try std.testing.expectError(
         error.InvalidTopologyConfig,
         computeInitLayerRange(.{
             .topology_mode = .cpu_gpu,
             .init_layer_range = .{ .start = 5, .end = 10 },
-        }, 32),
+        }, 32, no_sharing_config),
     );
     try std.testing.expectError(
         error.InvalidTopologyConfig,
         computeInitLayerRange(.{
             .topology_mode = .cpu_gpu_gpu,
             .init_layer_range = .{ .start = 5, .end = 10 },
-        }, 32),
+        }, 32, no_sharing_config),
     );
 }
 
@@ -4721,7 +4722,7 @@ test "computeInitLayerRange: rejects init_layer_range with start>=end" {
         error.InvalidTopologyConfig,
         computeInitLayerRange(.{
             .init_layer_range = .{ .start = 10, .end = 10 },
-        }, 32),
+        }, 32, no_sharing_config),
     );
 }
 
@@ -4730,7 +4731,7 @@ test "computeInitLayerRange: rejects init_layer_range with end>total_layers" {
         error.InvalidTopologyConfig,
         computeInitLayerRange(.{
             .init_layer_range = .{ .start = 0, .end = 33 },
-        }, 32),
+        }, 32, no_sharing_config),
     );
 }
 
@@ -4739,7 +4740,7 @@ test "computeInitLayerRange: rejects init_layer_range with end>total_layers" {
 // and breaking it would cause stage backends to receive wrong layer ranges.
 test "computeInitLayerRange: pipeline2 split points cover full model" {
     const total: usize = 24;
-    const r = try computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 10 }, total);
+    const r = try computeInitLayerRange(.{ .topology_mode = .pipeline2, .split_layer = 10 }, total, no_sharing_config);
     // Self [0, split) + stage1 [split, total) == [0, total).
     try std.testing.expectEqual(@as(usize, 0), r.start);
     try std.testing.expectEqual(r.split_layer, r.end);
@@ -4748,7 +4749,7 @@ test "computeInitLayerRange: pipeline2 split points cover full model" {
 
 test "computeInitLayerRange: cpu_gpu split points cover full model" {
     const total: usize = 24;
-    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 10 }, total);
+    const r = try computeInitLayerRange(.{ .topology_mode = .cpu_gpu, .split_layer = 10 }, total, no_sharing_config);
     // CPU [0, split) + self [split, total) == [0, total).
     try std.testing.expectEqual(r.split_layer, r.start);
     try std.testing.expectEqual(total, r.end);
@@ -4761,7 +4762,7 @@ test "computeInitLayerRange: cpu_gpu_gpu split points cover full model" {
         .topology_mode = .cpu_gpu_gpu,
         .split_layer = 6,
         .split_layer_stage2 = 16,
-    }, total);
+    }, total, no_sharing_config);
     // CPU [0, split) + GPU0 [split, split_stage2) + self [split_stage2, total) == [0, total).
     try std.testing.expect(r.split_layer > 0);
     try std.testing.expect(r.split_layer < r.split_layer_stage2);

@@ -376,7 +376,15 @@ pub fn requireStateValue(
 }
 
 pub fn requireAttentionRuntimeBinding(state: *const KvRuntimeState, layer_index: usize) !*LayerAttentionRuntime {
-    if (layer_index >= state.block_runtime.blocks.len) return error.InvalidInstructionIndex;
+    if (layer_index >= state.block_runtime.blocks.len) {
+        log.warn("inference", "requireAttentionRuntimeBinding OOB", .{
+            .layer_index = layer_index,
+            .blocks_len = state.block_runtime.blocks.len,
+            .runtime_kind = state.runtime_kind,
+            .slot_index = state.slot_index,
+        });
+        return error.InvalidInstructionIndex;
+    }
     return state.block_runtime.blocks[layer_index].attention_binding orelse error.InvalidStateDescriptorBinding;
 }
 
@@ -813,12 +821,30 @@ pub fn layerProgramAttentionAdapter(
         null;
     defer self.active_qkv_concat = null;
 
-    // For KV-shared layers, attention reads from the source layer's KV cache
-    // while KV writes still go to the current layer's own cache.
-    const read_binding = if (attention_binding.kv_shared_source_layer) |src_layer|
-        try requireAttentionRuntimeBinding(kv_state, src_layer)
-    else
-        attention_binding;
+    // Resolve read K/V cache for this attention layer.
+    // Same-device sharing: read from the local source layer's binding.
+    // Cross-device mirror: read from block_runtime.mirror_kv.
+    // No sharing: read from own cache.
+    var read_k_cache = &attention_binding.k_cache;
+    var read_v_cache = &attention_binding.v_cache;
+    var read_k_scale = &attention_binding.k_scale;
+    var read_v_scale = &attention_binding.v_scale;
+    if (attention_binding.kv_shared_source_layer) |src_layer| {
+        const src_binding = try requireAttentionRuntimeBinding(kv_state, src_layer);
+        read_k_cache = &src_binding.k_cache;
+        read_v_cache = &src_binding.v_cache;
+        read_k_scale = &src_binding.k_scale;
+        read_v_scale = &src_binding.v_scale;
+    } else if (attention_binding.kv_shared_source_slot_kv_index) |src_idx| {
+        const n_real = kv_state.block_runtime.attention_block_count;
+        if (src_idx >= n_real and src_idx - n_real < kv_state.block_runtime.mirror_kv.len) {
+            const mk = &kv_state.block_runtime.mirror_kv[src_idx - n_real];
+            read_k_cache = &mk.k;
+            read_v_cache = &mk.v;
+            read_k_scale = &mk.k_scale;
+            read_v_scale = &mk.v_scale;
+        }
+    }
 
     if (!cfg.query_gate) {
         engine_mixers.runAttentionMixerPrefillBatchedNoQueryGate(
@@ -828,10 +854,10 @@ pub fn layerProgramAttentionAdapter(
             &attention_binding.v_cache,
             &attention_binding.k_scale,
             &attention_binding.v_scale,
-            &read_binding.k_cache,
-            &read_binding.v_cache,
-            &read_binding.k_scale,
-            &read_binding.v_scale,
+            read_k_cache,
+            read_v_cache,
+            read_k_scale,
+            read_v_scale,
             &q_proj,
             &k_proj,
             &v_proj,
@@ -882,10 +908,10 @@ pub fn layerProgramAttentionAdapter(
         &attention_binding.v_cache,
         &attention_binding.k_scale,
         &attention_binding.v_scale,
-        &read_binding.k_cache,
-        &read_binding.v_cache,
-        &read_binding.k_scale,
-        &read_binding.v_scale,
+        read_k_cache,
+        read_v_cache,
+        read_k_scale,
+        read_v_scale,
         &q_proj,
         &k_proj,
         &v_proj,

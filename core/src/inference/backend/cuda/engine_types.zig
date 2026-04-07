@@ -238,7 +238,7 @@ pub fn resolveCudaMaxSeqLen(model_max_seq_len: usize) usize {
     return resolved;
 }
 
-fn resolveSharedKvSourceLayer(config: tensor.ModelConfig, layer_idx: usize) ?usize {
+pub fn resolveSharedKvSourceLayer(config: tensor.ModelConfig, layer_idx: usize) ?usize {
     if (config.num_kv_shared_layers <= 0) return null;
     const layer_types = config.layer_types orelse return null;
     const n_layers: usize = @intCast(config.n_layers);
@@ -257,6 +257,23 @@ fn resolveSharedKvSourceLayer(config: tensor.ModelConfig, layer_idx: usize) ?usi
         if (layer_types[src] == target_layer_type) return src;
     }
     return null;
+}
+
+/// For multi-GPU topologies, ensure the split point between GPU stages does
+/// not separate KV-shared layers from their source layers. Returns the
+/// adjusted split (may be lower than `proposed_split`). Returns null when
+/// no valid split exists (source layer below `floor`).
+pub fn adjustSplitForKvSharing(config: tensor.ModelConfig, proposed_split: usize, total_layers: usize, floor: usize) ?usize {
+    if (config.num_kv_shared_layers <= 0) return proposed_split;
+    var min_source = proposed_split;
+    var layer_idx = proposed_split;
+    while (layer_idx < total_layers) : (layer_idx += 1) {
+        if (resolveSharedKvSourceLayer(config, layer_idx)) |src| {
+            min_source = @min(min_source, src);
+        }
+    }
+    if (min_source <= floor) return null;
+    return min_source;
 }
 
 pub fn resolveCudaInitialKvCacheTokens(max_seq_len: usize) usize {
@@ -920,6 +937,8 @@ pub const RuntimeBuffers = struct {
         max_batch_size: usize,
         max_attn_layers: usize,
         max_gd_layers: usize,
+        skip_embedding: bool,
+        skip_projection: bool,
     ) !RuntimeBuffers {
         const d_model: usize = @intCast(loaded.config.d_model);
         const vocab_size: usize = @intCast(loaded.config.vocab_size);
@@ -965,33 +984,39 @@ pub const RuntimeBuffers = struct {
         var projection_weight_opt: ?LinearWeight = null;
         errdefer if (projection_weight_opt) |*w| w.deinit(device);
 
-        if (loaded.lm_head) |lm_head| {
-            projection_weight_opt = uploadLinearWeight(device, allocator, &lm_head, d_model) catch |err| switch (err) {
-                error.UnsupportedModel, error.InvalidArgument => null,
-                else => return err,
-            };
-            projection_from_lm_head = projection_weight_opt != null;
-        }
-        if (projection_weight_opt == null) {
-            projection_weight_opt = uploadLinearWeight(device, allocator, &loaded.token_embeddings, d_model) catch |err| switch (err) {
-                error.UnsupportedModel, error.InvalidArgument => null,
-                else => return err,
-            };
-        }
+        if (skip_projection) {
+            // Intermediate pipeline stage — never computes logits.
+            // Skip uploading projection weight to avoid init-time peak memory.
+            projection_weight_opt = .{ .dense_f32 = missing_device_tensor };
+        } else {
+            if (loaded.lm_head) |lm_head| {
+                projection_weight_opt = uploadLinearWeight(device, allocator, &lm_head, d_model) catch |err| switch (err) {
+                    error.UnsupportedModel, error.InvalidArgument => null,
+                    else => return err,
+                };
+                projection_from_lm_head = projection_weight_opt != null;
+            }
+            if (projection_weight_opt == null) {
+                projection_weight_opt = uploadLinearWeight(device, allocator, &loaded.token_embeddings, d_model) catch |err| switch (err) {
+                    error.UnsupportedModel, error.InvalidArgument => null,
+                    else => return err,
+                };
+            }
 
-        if (projection_weight_opt == null) {
-            log.warn("inference", "CUDA projection weight unsupported", .{
-                .d_model = d_model,
-                .vocab_size = vocab_size,
-                .has_lm_head = @as(u8, @intFromBool(loaded.lm_head != null)),
-                .embed_dtype = @tagName(loaded.token_embeddings.dtype),
-                .embed_ndim = loaded.token_embeddings.n_dims,
-            });
-            return error.UnsupportedModel;
+            if (projection_weight_opt == null) {
+                log.warn("inference", "CUDA projection weight unsupported", .{
+                    .d_model = d_model,
+                    .vocab_size = vocab_size,
+                    .has_lm_head = @as(u8, @intFromBool(loaded.lm_head != null)),
+                    .embed_dtype = @tagName(loaded.token_embeddings.dtype),
+                    .embed_ndim = loaded.token_embeddings.n_dims,
+                });
+                return error.UnsupportedModel;
+            }
         }
-        const using_model_projection = true;
+        const using_model_projection = !skip_projection;
         const projection_weight = projection_weight_opt.?;
-        const projected_vocab = projection_weight.cols();
+        const projected_vocab = if (skip_projection) vocab_size else projection_weight.cols();
         const projected_logits_host = try allocator.alloc(f32, projected_vocab);
         errdefer allocator.free(projected_logits_host);
         const projected_logits_batch_count = std.math.mul(usize, projected_vocab, max_batch_size) catch return error.InvalidArgument;
@@ -1030,7 +1055,9 @@ pub const RuntimeBuffers = struct {
         const decode_gd_table_ptrs_bytes = std.math.mul(usize, decode_gd_table_count, @sizeOf(u64)) catch return error.InvalidArgument;
         const decode_gd_table_idx_bytes = std.math.mul(usize, decode_gd_table_count, @sizeOf(u32)) catch return error.InvalidArgument;
         const decode_idx_bytes = std.math.mul(usize, max_batch_size, @sizeOf(u32)) catch return error.InvalidArgument;
-        const using_model_embeddings = canUseModelEmbeddings(loaded, d_model);
+        var embedding_lookup: ?EmbeddingLookup = null;
+        errdefer if (embedding_lookup) |*lookup| lookup.deinit(device);
+        const using_model_embeddings = if (skip_embedding) true else canUseModelEmbeddings(loaded, d_model);
         if (!using_model_embeddings) {
             log.warn("inference", "CUDA token embeddings unsupported", .{
                 .d_model = d_model,
@@ -1041,8 +1068,9 @@ pub const RuntimeBuffers = struct {
             });
             return error.UnsupportedModel;
         }
-        var embedding_lookup = try tryUploadEmbeddingLookup(device, loaded, d_model);
-        errdefer if (embedding_lookup) |*lookup| lookup.deinit(device);
+        if (!skip_embedding) {
+            embedding_lookup = try tryUploadEmbeddingLookup(device, loaded, d_model);
+        }
 
         var input_dev = try device.allocBuffer(d_model_bytes);
         errdefer input_dev.deinit(device);
@@ -2247,6 +2275,27 @@ pub fn validateCompiledLayerPlanForCuda(
     }
 }
 
+/// Describes a CPU source layer whose KV cache is replicated to a mirror
+/// entry on the GPU. Used when cpu_gpu topology places KV-shared source
+/// layers on CPU while consumer layers run on GPU.
+pub const ReplicatedKvSource = struct {
+    /// Global (model-wide) layer index of the CPU source layer.
+    global_layer_idx: usize,
+    /// KV dimension (= n_kv_heads * head_dim) for this source.
+    kv_dim: usize,
+    /// Index into per-slot kv[] array for the mirror entry on GPU.
+    mirror_kv_index: usize,
+};
+
+/// GPU-side mirror buffers for a replicated CPU KV source layer.
+pub const MirrorKvBuffers = struct {
+    k: compute.cuda.Buffer,
+    v: compute.cuda.Buffer,
+    k_scale: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
+    v_scale: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 },
+    capacity: usize,
+};
+
 pub const BlockRuntime = struct {
     blocks: []BlockRuntimeLayer,
     n_heads: usize,
@@ -2265,6 +2314,12 @@ pub const BlockRuntime = struct {
     gated_delta_state_bytes: usize,
     max_shortconv_dim: usize,
     max_gdelta_proj: usize,
+    /// CPU source layers whose KV is replicated to GPU mirror entries.
+    replicated_kv_sources: []ReplicatedKvSource = &.{},
+    /// GPU-side mirror KV buffers for slot 0. loadKvSlot syncs these from
+    /// slot_kv_states for the active slot. Indexed by mirror offset
+    /// (mirror_kv_index - attention_block_count).
+    mirror_kv: []MirrorKvBuffers = &.{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -2330,6 +2385,11 @@ pub const BlockRuntime = struct {
         var shortconv_state_bytes: usize = 0;
         var gated_delta_state_bytes: usize = 0;
         var max_shortconv_dim: usize = 0;
+
+        // Track cross-device KV sharing references for mirror replication.
+        const PendingMirror = struct { local_idx: usize, source_global: usize, kv_dim: usize };
+        var pending_mirrors: std.ArrayListUnmanaged(PendingMirror) = .{};
+        defer pending_mirrors.deinit(allocator);
         var max_gdelta_proj: usize = 0;
         var blocks = try allocator.alloc(BlockRuntimeLayer, layer_count);
         errdefer allocator.free(blocks);
@@ -2753,10 +2813,21 @@ pub const BlockRuntime = struct {
                     kv_cache_bytes = std.math.add(usize, kv_cache_bytes, layer_kv_bytes) catch return error.InvalidArgument;
 
                     const slot_kv_index = attention_block_count;
-                    const kv_shared_source_layer = resolveSharedKvSourceLayer(loaded.config, layer_idx);
-                    const kv_shared_source_slot_kv_index: ?usize = if (kv_shared_source_layer) |src_layer_idx| blk: {
-                        if (src_layer_idx < layer_start or src_layer_idx >= layer_end) break :blk null;
-                        const src_local_idx = src_layer_idx - layer_start;
+                    const kv_shared_source_layer_global = resolveSharedKvSourceLayer(loaded.config, layer_idx);
+                    // Convert global source layer to local index. If the source
+                    // is on a different device, record it for mirror replication.
+                    const kv_shared_source_layer: ?usize = if (kv_shared_source_layer_global) |src_layer_idx| blk: {
+                        if (src_layer_idx < layer_start or src_layer_idx >= layer_end) {
+                            try pending_mirrors.append(allocator, .{
+                                .local_idx = local_idx,
+                                .source_global = src_layer_idx,
+                                .kv_dim = k_proj_dev.cols(),
+                            });
+                            break :blk null;
+                        }
+                        break :blk src_layer_idx - layer_start;
+                    } else null;
+                    const kv_shared_source_slot_kv_index: ?usize = if (kv_shared_source_layer) |src_local_idx| blk: {
                         if (src_local_idx >= blocks.len) break :blk null;
                         const src_binding = blocks[src_local_idx].attention_binding orelse break :blk null;
                         break :blk src_binding.slot_kv_index;
@@ -3393,6 +3464,77 @@ pub const BlockRuntime = struct {
             initialized += 1;
         }
 
+        // Resolve cross-device KV sharing: deduplicate sources, assign mirror
+        // indices, allocate mirror KV buffers, and fixup consumer blocks.
+        var replicated_kv_sources: []ReplicatedKvSource = &.{};
+        var mirror_kv: []MirrorKvBuffers = &.{};
+        if (pending_mirrors.items.len > 0) {
+            var unique_sources: std.ArrayListUnmanaged(ReplicatedKvSource) = .{};
+            errdefer unique_sources.deinit(allocator);
+
+            for (pending_mirrors.items) |pm| {
+                var found = false;
+                for (unique_sources.items) |src| {
+                    if (src.global_layer_idx == pm.source_global) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    try unique_sources.append(allocator, .{
+                        .global_layer_idx = pm.source_global,
+                        .kv_dim = pm.kv_dim,
+                        .mirror_kv_index = attention_block_count + unique_sources.items.len,
+                    });
+                }
+            }
+
+            // Allocate mirror KV buffers at max_seq_len capacity (avoids
+            // ensureKvCapacity changes; bandwidth cost is negligible).
+            const n_mirrors = unique_sources.items.len;
+            var mirrors = try allocator.alloc(MirrorKvBuffers, n_mirrors);
+            errdefer allocator.free(mirrors);
+            var mirrors_allocated: usize = 0;
+            errdefer for (mirrors[0..mirrors_allocated]) |*mk| {
+                if (mk.v_scale.pointer != 0) mk.v_scale.deinit(device);
+                if (mk.k_scale.pointer != 0) mk.k_scale.deinit(device);
+                mk.v.deinit(device);
+                mk.k.deinit(device);
+            };
+
+            for (unique_sources.items, 0..) |src, mi| {
+                const n_mirror_kv_heads: usize = if (src.kv_dim > 0 and head_dim > 0) src.kv_dim / head_dim else n_kv_heads;
+                const kv_pair = try allocDeviceKvPairWithScales(device, max_seq_len, src.kv_dim, n_mirror_kv_heads, kv_cache_dtype);
+                mirrors[mi] = .{
+                    .k = kv_pair.k,
+                    .v = kv_pair.v,
+                    .k_scale = kv_pair.k_scale,
+                    .v_scale = kv_pair.v_scale,
+                    .capacity = max_seq_len,
+                };
+                mirrors_allocated += 1;
+            }
+
+            // Fixup consumer blocks: set kv_shared_source_slot_kv_index to mirror.
+            for (pending_mirrors.items) |pm| {
+                for (unique_sources.items) |src| {
+                    if (src.global_layer_idx == pm.source_global) {
+                        blocks[pm.local_idx].attention_runtime.?.kv_shared_source_slot_kv_index = src.mirror_kv_index;
+                        break;
+                    }
+                }
+            }
+
+            replicated_kv_sources = try unique_sources.toOwnedSlice(allocator);
+            mirror_kv = mirrors;
+
+            log.info("inference", "KV sharing: allocated mirror entries for cross-device sources", .{
+                .n_mirrors = n_mirrors,
+                .layer_start = layer_start,
+                .layer_end = layer_end,
+            });
+        }
+
         return .{
             .blocks = blocks,
             .n_heads = n_heads,
@@ -3411,10 +3553,20 @@ pub const BlockRuntime = struct {
             .gated_delta_state_bytes = gated_delta_state_bytes,
             .max_shortconv_dim = max_shortconv_dim,
             .max_gdelta_proj = max_gdelta_proj,
+            .replicated_kv_sources = replicated_kv_sources,
+            .mirror_kv = mirror_kv,
         };
     }
 
     pub fn deinit(self: *BlockRuntime, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
+        for (self.mirror_kv) |*mk| {
+            if (mk.v_scale.pointer != 0) mk.v_scale.deinit(device);
+            if (mk.k_scale.pointer != 0) mk.k_scale.deinit(device);
+            mk.v.deinit(device);
+            mk.k.deinit(device);
+        }
+        if (self.mirror_kv.len > 0) allocator.free(self.mirror_kv);
+        if (self.replicated_kv_sources.len > 0) allocator.free(self.replicated_kv_sources);
         for (self.blocks) |*block| block.deinit(allocator, device);
         allocator.free(self.blocks);
     }

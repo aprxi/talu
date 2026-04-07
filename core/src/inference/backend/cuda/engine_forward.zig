@@ -49,6 +49,86 @@ fn typeHasDecl(comptime T: type, comptime name: []const u8) bool {
     };
 }
 
+/// Download and log first N f32 values + L2 norm from a device buffer.
+/// Gated by TALU_DUMP_HIDDEN env var. Uses log.warn so it survives ReleaseFast.
+fn dumpHiddenState(
+    self: anytype,
+    buf: *const compute.cuda.Buffer,
+    global_layer_idx: usize,
+    label: []const u8,
+    d_model: usize,
+    rows: usize,
+) void {
+    const dump_env = std.posix.getenv("TALU_DUMP_HIDDEN");
+    if (dump_env == null) return;
+    _ = rows;
+
+    // Sync the entire CUDA context first.
+    self.device.synchronize() catch |e| {
+        log.warn("inference", "DUMP_HIDDEN_SKIP", .{ .layer = global_layer_idx, .label = label, .reason = "sync_err", .err = @intFromError(e) });
+        return;
+    };
+
+    // Download full row to hidden_host using raw cu_memcpy_dtoh.
+    const n = @min(d_model, self.runtime_buffers.hidden_host.len);
+    if (n == 0) return;
+    const download_bytes = n * @sizeOf(f32);
+    if (buf.pointer == 0 or buf.size < download_bytes) {
+        log.warn("inference", "DUMP_HIDDEN_SKIP", .{
+            .layer = global_layer_idx,
+            .label = label,
+            .reason = "bad_buf",
+            .ptr = buf.pointer,
+            .buf_size = buf.size,
+            .need = download_bytes,
+        });
+        return;
+    }
+
+    self.device.makeCurrent() catch |e| {
+        log.warn("inference", "DUMP_HIDDEN_SKIP", .{ .layer = global_layer_idx, .label = label, .reason = "make_current_err", .err = @intFromError(e) });
+        return;
+    };
+
+    const host_ptr: *anyopaque = @ptrCast(self.runtime_buffers.hidden_host.ptr);
+    const rc = self.device.api.cu_memcpy_dtoh(host_ptr, buf.pointer, download_bytes);
+    if (rc != 0) {
+        log.warn("inference", "DUMP_HIDDEN_SKIP", .{
+            .layer = global_layer_idx,
+            .label = label,
+            .reason = "cu_memcpy_rc",
+            .rc = rc,
+            .dev_ptr = buf.pointer,
+            .buf_size = buf.size,
+            .download_bytes = download_bytes,
+        });
+        return;
+    }
+
+    const host = self.runtime_buffers.hidden_host[0..n];
+    var sum: f64 = 0.0;
+    for (host) |v| sum += @as(f64, v) * @as(f64, v);
+    const l2_norm: f32 = @floatCast(@sqrt(sum));
+
+    const n8 = @min(8, n);
+    var v: [8]f32 = .{0} ** 8;
+    @memcpy(v[0..n8], host[0..n8]);
+
+    log.warn("inference", "DUMP_HIDDEN", .{
+        .layer = global_layer_idx,
+        .label = label,
+        .l2_norm = l2_norm,
+        .v0 = v[0],
+        .v1 = v[1],
+        .v2 = v[2],
+        .v3 = v[3],
+        .v4 = v[4],
+        .v5 = v[5],
+        .v6 = v[6],
+        .v7 = v[7],
+    });
+}
+
 fn applyHostLogitsPostProcess(
     logits: []f32,
     logits_scaling: f32,
@@ -90,6 +170,74 @@ fn executeCpuStage0LayerRange(
         ensure_kv_capacity,
         false,
     );
+}
+
+/// Upload CPU source layer KV data to GPU mirror buffers for cross-device
+/// KV sharing. After CPU forward populates KV cache for source layers, this
+/// converts f32 to the GPU KV dtype and uploads to GPU mirror entries so
+/// GPU attention layers can read shared KV.
+fn uploadCpuKvToMirrors(
+    gpu_backend: anytype,
+    cpu_backend: anytype,
+    slot_index: usize,
+    pos_start: usize,
+    n_positions: usize,
+) !void {
+    const GpuType = @TypeOf(gpu_backend.*);
+    if (comptime !@hasField(GpuType, "block_runtime")) return;
+    const replicated = gpu_backend.block_runtime.replicated_kv_sources;
+    if (replicated.len == 0) return;
+
+    const mirrors = gpu_backend.block_runtime.mirror_kv;
+    const head_dim = gpu_backend.head_dim;
+    const allocator = gpu_backend.allocator;
+
+    // Only f16 KV cache is supported for cross-device mirrors.
+    if (gpu_backend.kv_cache_dtype != .f16) return error.UnsupportedModel;
+
+    for (replicated, 0..) |src, mi| {
+        const mk = &mirrors[mi];
+        const cpu_kv = cpu_backend.kv_cache.getLayer(src.global_layer_idx);
+        const n_kv_heads = src.kv_dim / head_dim;
+        const kv_dim = src.kv_dim;
+        const total_elems = n_positions * kv_dim;
+        const total_bytes = total_elems * @sizeOf(f16);
+
+        const staging_f16 = try allocator.alloc(f16, total_elems);
+        defer allocator.free(staging_f16);
+
+        // Convert + transpose K: CPU [slot][head][pos][dim] → GPU [pos][head*dim]
+        for (0..n_positions) |pi| {
+            const pos = pos_start + pi;
+            const row_off = pi * kv_dim;
+            for (0..n_kv_heads) |kh| {
+                const cpu_k = cpu_kv.getK(slot_index, kh, pos);
+                const dst_off = row_off + kh * head_dim;
+                for (0..head_dim) |di| {
+                    staging_f16[dst_off + di] = @floatCast(cpu_k[di]);
+                }
+            }
+        }
+        const gpu_k_offset = pos_start * kv_dim * @sizeOf(f16);
+        const k_slice = try bufferSlice(&mk.k, gpu_k_offset, total_bytes);
+        try k_slice.upload(&gpu_backend.device, std.mem.sliceAsBytes(staging_f16));
+
+        // Convert + transpose V.
+        for (0..n_positions) |pi| {
+            const pos = pos_start + pi;
+            const row_off = pi * kv_dim;
+            for (0..n_kv_heads) |kh| {
+                const cpu_v = cpu_kv.getV(slot_index, kh, pos);
+                const dst_off = row_off + kh * head_dim;
+                for (0..head_dim) |di| {
+                    staging_f16[dst_off + di] = @floatCast(cpu_v[di]);
+                }
+            }
+        }
+        const gpu_v_offset = pos_start * kv_dim * @sizeOf(f16);
+        const v_slice = try bufferSlice(&mk.v, gpu_v_offset, total_bytes);
+        try v_slice.upload(&gpu_backend.device, std.mem.sliceAsBytes(staging_f16));
+    }
 }
 
 fn pipelineActivationByteCountFor(self: anytype) !usize {
@@ -243,7 +391,20 @@ fn computeBatchedPrefillCpuGpu(
     const prefill_buffer = try self.allocator.alloc(f32, total_rows * d_model);
     defer self.allocator.free(prefill_buffer);
 
-    try cpu_stage0.prefillSlotLayerRange(slot_index, tokens, prefill_buffer, self.split_layer);
+    // For Gemma4 per-layer-input: capture source embeddings (raw scaled
+    // embed_tokens output) before CPU layers modify the hidden states.
+    const gemma4_active = comptime @hasDecl(SelfType, "applyGemma4PerLayerBranch");
+    const has_gemma4 = gemma4_active and self.gemma4_per_layer != null;
+    const source_embeddings_host: ?[]f32 = if (has_gemma4)
+        try self.allocator.alloc(f32, total_rows * d_model)
+    else
+        null;
+    defer if (source_embeddings_host) |buf| self.allocator.free(buf);
+
+    try cpu_stage0.prefillSlotLayerRange(slot_index, tokens, prefill_buffer, self.split_layer, source_embeddings_host);
+
+    // Upload CPU source layer KV to GPU mirror buffers for cross-device sharing.
+    try uploadCpuKvToMirrors(self, cpu_stage0, slot_index, 0, total_rows);
 
     // ── GPU stage1: chunked forward through GPU layers ──
     var pos_base: usize = 0;
@@ -265,7 +426,15 @@ fn computeBatchedPrefillCpuGpu(
 
         var final_hidden_rows = self.runtime_buffers.input_dev;
         var gemma_source_embeddings_opt: ?compute.cuda.Buffer = null;
-        if (comptime @hasDecl(SelfType, "maybeCaptureGemma4SourceEmbeddings")) {
+        if (source_embeddings_host) |se_host| {
+            // Pipeline mode: upload source embeddings from CPU to deepstack_add_dev.
+            const se_chunk_offset = pos_base * d_model;
+            const se_chunk_f32s = rows * d_model;
+            const se_bytes = std.math.mul(usize, se_chunk_f32s, @sizeOf(f32)) catch return error.InvalidArgument;
+            var se_dst = try bufferSlice(&self.runtime_buffers.deepstack_add_dev, 0, se_bytes);
+            try se_dst.upload(&self.device, std.mem.sliceAsBytes(se_host[se_chunk_offset..][0..se_chunk_f32s]));
+            gemma_source_embeddings_opt = se_dst;
+        } else if (comptime @hasDecl(SelfType, "maybeCaptureGemma4SourceEmbeddings")) {
             gemma_source_embeddings_opt = try self.maybeCaptureGemma4SourceEmbeddings(rows);
         }
         var layer_idx: usize = 0;
@@ -297,6 +466,7 @@ fn computeBatchedPrefillCpuGpu(
                 attention_kernels,
                 null,
             );
+            dumpHiddenState(self, &self.runtime_buffers.input_dev, self.split_layer + layer_idx, "post_layer", self.d_model, 1);
             if (comptime @hasDecl(SelfType, "applyGemma4PerLayerBranch")) {
                 if (gemma_source_embeddings_opt) |*gemma_source_embeddings| {
                     const chunk_tokens = tokens[pos_base .. pos_base + rows];
@@ -307,6 +477,9 @@ fn computeBatchedPrefillCpuGpu(
                         &self.runtime_buffers.input_dev,
                     );
                     final_hidden_rows = self.runtime_buffers.input_dev;
+                    dumpHiddenState(self, &self.runtime_buffers.input_dev, self.split_layer + layer_idx, "post_ple", self.d_model, 1);
+                } else if (comptime @hasDecl(SelfType, "applyStandaloneLayerScalar")) {
+                    try self.applyStandaloneLayerScalar(layer_idx, &self.runtime_buffers.input_dev, rows);
                 }
             }
         }
@@ -406,7 +579,19 @@ fn computeBatchedPrefillCpuGpuGpu(
     const prefill_buffer = try self.allocator.alloc(f32, total_rows * d_model);
     defer self.allocator.free(prefill_buffer);
 
-    try cpu_stage0.prefillSlotLayerRange(slot_index, tokens, prefill_buffer, self.split_layer);
+    // For Gemma4 per-layer-input: capture source embeddings from CPU.
+    const gemma4_active_1 = comptime @hasDecl(@TypeOf(gpu_stage1.*), "applyGemma4PerLayerBranch");
+    const gemma4_active_2 = comptime @hasDecl(SelfType, "applyGemma4PerLayerBranch");
+    const has_gemma4_1 = gemma4_active_1 and gpu_stage1.gemma4_per_layer != null;
+    const has_gemma4_2 = gemma4_active_2 and self.gemma4_per_layer != null;
+    const need_source_embeddings = has_gemma4_1 or has_gemma4_2;
+    const source_embeddings_host: ?[]f32 = if (need_source_embeddings)
+        try self.allocator.alloc(f32, total_rows * d_model)
+    else
+        null;
+    defer if (source_embeddings_host) |buf| self.allocator.free(buf);
+
+    try cpu_stage0.prefillSlotLayerRange(slot_index, tokens, prefill_buffer, self.split_layer, source_embeddings_host);
 
     // ── GPU1 → GPU2: chunked forward ──
     var pos_base: usize = 0;
@@ -425,6 +610,19 @@ fn computeBatchedPrefillCpuGpuGpu(
         const chunk_offset = pos_base * d_model;
         const chunk_f32s = rows * d_model;
         try gpu_stage1.runtime_buffers.input_dev.upload(&gpu_stage1.device, std.mem.sliceAsBytes(prefill_buffer[chunk_offset..][0..chunk_f32s]));
+
+        // Upload source embeddings for GPU1 Gemma4 per-layer branch.
+        var gemma_source_embeddings_1: ?compute.cuda.Buffer = null;
+        if (has_gemma4_1) {
+            if (source_embeddings_host) |se_host| {
+                const se_chunk_offset = pos_base * d_model;
+                const se_chunk_f32s = rows * d_model;
+                const se_bytes = std.math.mul(usize, se_chunk_f32s, @sizeOf(f32)) catch return error.InvalidArgument;
+                var se_dst = try bufferSlice(&gpu_stage1.runtime_buffers.deepstack_add_dev, 0, se_bytes);
+                try se_dst.upload(&gpu_stage1.device, std.mem.sliceAsBytes(se_host[se_chunk_offset..][0..se_chunk_f32s]));
+                gemma_source_embeddings_1 = se_dst;
+            }
+        }
 
         {
             var layer_idx: usize = 0;
@@ -456,6 +654,19 @@ fn computeBatchedPrefillCpuGpuGpu(
                     attn_kernels_1,
                     null,
                 );
+                if (comptime gemma4_active_1) {
+                    if (gemma_source_embeddings_1) |*gemma_se| {
+                        const chunk_tokens = tokens[pos_base .. pos_base + rows];
+                        try gpu_stage1.applyGemma4PerLayerBranch(
+                            layer_idx,
+                            chunk_tokens,
+                            gemma_se,
+                            &gpu_stage1.runtime_buffers.input_dev,
+                        );
+                    } else if (comptime @hasDecl(@TypeOf(gpu_stage1.*), "applyStandaloneLayerScalar")) {
+                        try gpu_stage1.applyStandaloneLayerScalar(layer_idx, &gpu_stage1.runtime_buffers.input_dev, rows);
+                    }
+                }
             }
         }
 
@@ -475,6 +686,19 @@ fn computeBatchedPrefillCpuGpuGpu(
                 var dst_slice = try bufferSlice(&self.runtime_buffers.input_dev, xfer_offset, xfer_chunk);
                 try dst_slice.upload(&self.device, staging12[0..xfer_chunk]);
                 xfer_offset += xfer_chunk;
+            }
+        }
+
+        // Upload source embeddings for GPU2 Gemma4 per-layer branch.
+        var gemma_source_embeddings_2: ?compute.cuda.Buffer = null;
+        if (has_gemma4_2) {
+            if (source_embeddings_host) |se_host| {
+                const se_chunk_offset = pos_base * d_model;
+                const se_chunk_f32s = rows * d_model;
+                const se_bytes = std.math.mul(usize, se_chunk_f32s, @sizeOf(f32)) catch return error.InvalidArgument;
+                var se_dst = try bufferSlice(&self.runtime_buffers.deepstack_add_dev, 0, se_bytes);
+                try se_dst.upload(&self.device, std.mem.sliceAsBytes(se_host[se_chunk_offset..][0..se_chunk_f32s]));
+                gemma_source_embeddings_2 = se_dst;
             }
         }
 
@@ -509,6 +733,20 @@ fn computeBatchedPrefillCpuGpuGpu(
                     attn_kernels_2,
                     null,
                 );
+                if (comptime gemma4_active_2) {
+                    if (gemma_source_embeddings_2) |*gemma_se| {
+                        const chunk_tokens = tokens[pos_base .. pos_base + rows];
+                        try self.applyGemma4PerLayerBranch(
+                            layer_idx,
+                            chunk_tokens,
+                            gemma_se,
+                            &self.runtime_buffers.input_dev,
+                        );
+                        final_hidden_rows = self.runtime_buffers.input_dev;
+                    } else if (comptime @hasDecl(SelfType, "applyStandaloneLayerScalar")) {
+                        try self.applyStandaloneLayerScalar(layer_idx, &self.runtime_buffers.input_dev, rows);
+                    }
+                }
             }
         }
 
@@ -648,6 +886,24 @@ fn computeBatchedPrefillPipeline2(
     };
 
     const chunk_cap = @min(self.prefill_chunk_rows_cap, stage1.prefill_chunk_rows_cap);
+
+    // ── Gemma4 per-layer input: compute source embeddings on host ──
+    const Stage1Type = @TypeOf(stage1.*);
+    const has_gemma4_0 = comptime @hasDecl(SelfType, "applyGemma4PerLayerBranch");
+    const has_gemma4_1 = comptime @hasDecl(Stage1Type, "applyGemma4PerLayerBranch");
+    const gemma4_active_0 = has_gemma4_0 and (if (comptime @hasField(SelfType, "gemma4_per_layer")) self.gemma4_per_layer != null else false);
+    const gemma4_active_1 = has_gemma4_1 and (if (comptime @hasField(Stage1Type, "gemma4_per_layer")) stage1.gemma4_per_layer != null else false);
+    const need_source_embeddings = gemma4_active_0 or gemma4_active_1;
+    const d_model = self.d_model;
+    const source_embeddings_host: ?[]f32 = if (need_source_embeddings)
+        try self.allocator.alloc(f32, total_rows * d_model)
+    else
+        null;
+    defer if (source_embeddings_host) |buf| self.allocator.free(buf);
+
+    if (source_embeddings_host) |se_host| {
+        try populatePrefillHiddenFromTokens(self.loaded, tokens, d_model, se_host, null);
+    }
 
     var pos_base: usize = 0;
     while (pos_base < total_rows) {
@@ -814,6 +1070,19 @@ fn computeBatchedPrefillPipeline2(
         const last_position = pos_base + rows - 1;
         const last_position_u32: u32 = @intCast(last_position);
 
+        // Upload source embeddings for this chunk to stage0's deepstack_add_dev.
+        var gemma_source_embeddings_0: ?compute.cuda.Buffer = null;
+        if (gemma4_active_0) {
+            if (source_embeddings_host) |se_host| {
+                const se_chunk_offset = pos_base * d_model;
+                const se_chunk_f32s = rows * d_model;
+                const se_bytes = std.math.mul(usize, se_chunk_f32s, @sizeOf(f32)) catch return error.InvalidArgument;
+                var se_dst = try bufferSlice(&self.runtime_buffers.deepstack_add_dev, 0, se_bytes);
+                try se_dst.upload(&self.device, std.mem.sliceAsBytes(se_host[se_chunk_offset..][0..se_chunk_f32s]));
+                gemma_source_embeddings_0 = se_dst;
+            }
+        }
+
         // Stage 0 layer loop.
         {
             var layer_idx: usize = 0;
@@ -845,6 +1114,18 @@ fn computeBatchedPrefillPipeline2(
                     attn_kernels_0,
                     null,
                 );
+                if (comptime has_gemma4_0) {
+                    if (gemma_source_embeddings_0) |*gemma_se| {
+                        try self.applyGemma4PerLayerBranch(
+                            layer_idx,
+                            chunk_tokens,
+                            gemma_se,
+                            &self.runtime_buffers.input_dev,
+                        );
+                    } else if (comptime @hasDecl(SelfType, "applyStandaloneLayerScalar")) {
+                        try self.applyStandaloneLayerScalar(layer_idx, &self.runtime_buffers.input_dev, rows);
+                    }
+                }
             }
         }
 
@@ -855,6 +1136,19 @@ fn computeBatchedPrefillPipeline2(
         // ── Bulk transfer stage0 → stage1 ──
         const transfer_bytes = std.math.mul(usize, rows, row_bytes) catch return error.InvalidArgument;
         try transferPipelineActivationMultiRow(self, stage1, transfer_bytes, row_bytes);
+
+        // Upload source embeddings for this chunk to stage1's deepstack_add_dev.
+        var gemma_source_embeddings_1: ?compute.cuda.Buffer = null;
+        if (gemma4_active_1) {
+            if (source_embeddings_host) |se_host| {
+                const se_chunk_offset = pos_base * d_model;
+                const se_chunk_f32s = rows * d_model;
+                const se_bytes = std.math.mul(usize, se_chunk_f32s, @sizeOf(f32)) catch return error.InvalidArgument;
+                var se_dst = try bufferSlice(&stage1.runtime_buffers.deepstack_add_dev, 0, se_bytes);
+                try se_dst.upload(&stage1.device, std.mem.sliceAsBytes(se_host[se_chunk_offset..][0..se_chunk_f32s]));
+                gemma_source_embeddings_1 = se_dst;
+            }
+        }
 
         var stage1_final_hidden = stage1.runtime_buffers.input_dev;
         {
@@ -887,6 +1181,19 @@ fn computeBatchedPrefillPipeline2(
                     attn_kernels_1,
                     null,
                 );
+                if (comptime has_gemma4_1) {
+                    if (gemma_source_embeddings_1) |*gemma_se| {
+                        try stage1.applyGemma4PerLayerBranch(
+                            layer_idx,
+                            chunk_tokens,
+                            gemma_se,
+                            &stage1.runtime_buffers.input_dev,
+                        );
+                        stage1_final_hidden = stage1.runtime_buffers.input_dev;
+                    } else if (comptime @hasDecl(Stage1Type, "applyStandaloneLayerScalar")) {
+                        try stage1.applyStandaloneLayerScalar(layer_idx, &stage1.runtime_buffers.input_dev, rows);
+                    }
+                }
             }
         }
 
@@ -1188,6 +1495,7 @@ fn runCpuGpuWithPipelineRuntime(
     };
     const Stage0 = struct {
         backend: @TypeOf(cpu_stage0_backend),
+        gpu_backend: @TypeOf(self),
         ctx: *const Ctx,
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
@@ -1221,7 +1529,11 @@ fn runCpuGpuWithPipelineRuntime(
             @memcpy(dst[0..byte_count], host_buf[0..byte_count]);
         }
 
-        pub fn synchronize(_: *@This()) anyerror!void {}
+        pub fn synchronize(stage: *@This()) anyerror!void {
+            // Upload CPU source layer KV to GPU mirrors after CPU forward,
+            // before GPU stage1 reads KV in attention.
+            try uploadCpuKvToMirrors(stage.gpu_backend, stage.backend, stage.ctx.slot_index, stage.ctx.position, 1);
+        }
 
         pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
     };
@@ -1230,6 +1542,13 @@ fn runCpuGpuWithPipelineRuntime(
         ctx: *const Ctx,
 
         pub fn executeLayers(stage: *@This(), input: []const u8, layer_start: usize, layer_end: usize) anyerror!void {
+            if (std.posix.getenv("TALU_DUMP_HIDDEN") != null) {
+                log.warn("inference", "STAGE1_EXEC", .{
+                    .layer_start = layer_start,
+                    .layer_end = layer_end,
+                    .input_len = input.len,
+                });
+            }
             if (input.len != 0) return error.InvalidArgument;
             if (layer_end < layer_start) return error.InvalidArgument;
             const local_layer_limit = layer_end - layer_start;
@@ -1298,7 +1617,7 @@ fn runCpuGpuWithPipelineRuntime(
         Stage0,
         Stage1,
         null,
-        .{ .backend = cpu_stage0_backend, .ctx = &ctx },
+        .{ .backend = cpu_stage0_backend, .gpu_backend = self, .ctx = &ctx },
         .{ .backend = self, .ctx = &ctx },
         self.split_layer,
         self.split_layer + self.block_runtime.blocks.len,
@@ -1555,7 +1874,8 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
             !use_preloaded_input)
         {
             if (comptime @hasDecl(SelfType, "pipelineActivationByteCount")) {
-                if (hidden_override == null and deepstack_layer_features_opt == null and deepstack_feature_index_opt == null) {
+                if (hidden_override == null and deepstack_layer_features_opt == null and deepstack_feature_index_opt == null)
+                {
                     var runtime_stage1 = self.pipelineStage1() orelse return error.InvalidTopologyConfig;
                     if (runtime_stage1.state_descriptor_count > 0) {
                         try runtime_stage1.mirrorSlotStateBlocksFrom(self, slot_index);
@@ -1801,6 +2121,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                 split_layer,
                 ensure_kv_capacity,
             );
+            try uploadCpuKvToMirrors(self, stage0, slot_index, position, 1);
             const activation_bytes = try pipelineActivationByteCountFor(self);
             try self.transferPipelineActivationFromCpu(stage0, slot_index, activation_bytes);
             return computeGpuPrototypeLogitsWithLayerLimit(
@@ -2031,7 +2352,21 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
 
     var gemma_source_embeddings_opt: ?compute.cuda.Buffer = null;
     if (comptime @hasDecl(SelfType, "maybeCaptureGemma4SourceEmbeddings")) {
-        gemma_source_embeddings_opt = try self.maybeCaptureGemma4SourceEmbeddings(1);
+        if (use_preloaded_input) {
+            // Pipeline mode: input_dev has post-CPU-layer hidden states, not raw
+            // embeddings. Look up the raw embedding on host and upload.
+            if (comptime @hasDecl(SelfType, "captureGemma4SourceEmbeddingsForPipeline")) {
+                gemma_source_embeddings_opt = self.captureGemma4SourceEmbeddingsForPipeline(token) catch |err| blk: {
+                    log.warn("inference", "CUDA captureGemma4SourceEmbeddingsForPipeline failed", .{
+                        .reason = @errorName(err),
+                        .token = token,
+                    });
+                    break :blk null;
+                };
+            }
+        } else {
+            gemma_source_embeddings_opt = try self.maybeCaptureGemma4SourceEmbeddings(1);
+        }
     }
     const gemma_token_id_single = [_]u32{token};
 
@@ -2161,6 +2496,16 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
 
     var final_hidden = input_row;
 
+    if (std.posix.getenv("TALU_DUMP_HIDDEN") != null) {
+        log.warn("inference", "GPU_LOOP_ENTRY", .{
+            .layer_limit = layer_limit,
+            .split_layer = self.split_layer,
+            .blocks_len = self.block_runtime.blocks.len,
+            .use_preloaded = use_preloaded_input,
+            .d_model = self.d_model,
+        });
+    }
+
     var layer_idx: usize = 0;
     while (layer_idx < layer_limit) : (layer_idx += 1) {
         const layer = &self.block_runtime.blocks[layer_idx];
@@ -2222,6 +2567,7 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
         if (layer.attention_binding != null) batch_info.attn_layer_index += 1;
         if (layer.gated_delta_binding != null) batch_info.gd_layer_index += 1;
         if (layer.shortconv_binding != null) batch_info.sc_layer_index += 1;
+        dumpHiddenState(self, &self.runtime_buffers.input_dev, self.split_layer + layer_idx, "post_layer", self.d_model, 1);
         if (comptime @hasDecl(SelfType, "applyGemma4PerLayerBranch")) {
             if (gemma_source_embeddings_opt) |*gemma_source_embeddings| {
                 try self.applyGemma4PerLayerBranch(
@@ -2231,6 +2577,9 @@ pub fn computeGpuPrototypeLogitsWithLayerLimit(
                     &self.runtime_buffers.input_dev,
                 );
                 final_hidden = self.runtime_buffers.input_dev;
+                dumpHiddenState(self, &self.runtime_buffers.input_dev, self.split_layer + layer_idx, "post_ple", self.d_model, 1);
+            } else if (comptime @hasDecl(SelfType, "applyStandaloneLayerScalar")) {
+                try self.applyStandaloneLayerScalar(layer_idx, &self.runtime_buffers.input_dev, 1);
             }
         }
         // Deepstack: per-request feature vector addition between layer program
@@ -2455,21 +2804,20 @@ fn computeBatchedDecodeLogitsWithMode(
             );
             // Sync batch host buffer: the decode loop reads logits via
             // batchedHostLogitsRow() which returns projected_logits_batch_host.
-            // The prototype path writes to projected_logits_host → slotLogits,
-            // so we must copy to the batch buffer to avoid stale overrides.
-            if (comptime @hasField(SelfType, "runtime_buffers")) {
+            // Copy from slotLogits (the authoritative source after the prototype
+            // call). For pipeline2, self.runtime_buffers.projected_logits_host is
+            // stale because the logit projection runs on pipeline_backend1, not self.
+            // slotLogits already has post-processing applied (line ~2599), so we
+            // must NOT re-apply applyHostLogitsPostProcess here.
+            if (comptime @hasField(SelfType, "runtime_buffers") and @hasDecl(SelfType, "slotLogits")) {
                 const vocab = self.runtime_buffers.projected_vocab;
                 const row_start = std.math.mul(usize, i, vocab) catch continue;
                 const row_end = std.math.add(usize, row_start, vocab) catch continue;
                 if (row_end <= self.runtime_buffers.projected_logits_batch_host.len) {
+                    const slot_logits = self.slotLogits(slot_indices[i]);
                     @memcpy(
                         self.runtime_buffers.projected_logits_batch_host[row_start..row_end],
-                        self.runtime_buffers.projected_logits_host[0..vocab],
-                    );
-                    applyHostLogitsPostProcess(
-                        self.runtime_buffers.projected_logits_batch_host[row_start..row_end],
-                        self.loaded.config.logits_scaling,
-                        self.loaded.config.final_logit_softcapping,
+                        slot_logits[0..vocab],
                     );
                 }
             }
@@ -2977,6 +3325,8 @@ fn computeBatchedDecodeLogitsWithMode(
                         &self.runtime_buffers.input_dev,
                     );
                     final_hidden = self.runtime_buffers.input_dev;
+                } else if (comptime @hasDecl(SelfType, "applyStandaloneLayerScalar")) {
+                    try self.applyStandaloneLayerScalar(layer_idx, &self.runtime_buffers.input_dev, n_usize);
                 }
             }
             if (layer.attention_binding != null) batch_info.attn_layer_index += 1;
@@ -3069,7 +3419,8 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
     // Pipeline2: batched prefill through stage0 → bulk transfer → stage1.
     // Uses comptime guard because anytype monomorphization requires all referenced
     // methods to exist on the type, even in runtime-unreachable branches.
-    if (topologyModeIs(self, "pipeline2") and layer_limit == self.block_runtime.blocks.len) {
+    if (topologyModeIs(self, "pipeline2") and layer_limit == self.block_runtime.blocks.len)
+    {
         if (tokens.len == 0) return error.InvalidArgument;
         if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
         if (logits_out.len != self.vocab_size) return error.InvalidArgument;
@@ -3086,8 +3437,7 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
 
     // cpu_gpu / cpu_gpu_gpu: batched CPU stage0 → chunked GPU stage(s).
     if ((topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) and
-        layer_limit == self.block_runtime.blocks.len and
-        std.posix.getenv("TALU_FORCE_PROTOTYPE_PREFILL") == null)
+        layer_limit == self.block_runtime.blocks.len)
     {
         if (tokens.len == 0) return error.InvalidArgument;
         if (!self.slotIndexSupported(slot_index)) return error.InvalidArgument;
@@ -3114,9 +3464,7 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
     }
 
     // Multi-stage topologies without batched prefill: token-by-token fallback.
-    // TALU_FORCE_PROTOTYPE_PREFILL: force pure GPU through this path for debugging.
-    const force_prototype_prefill = std.posix.getenv("TALU_FORCE_PROTOTYPE_PREFILL") != null;
-    if ((force_prototype_prefill or topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) and
+    if ((topologyModeIs(self, "pipeline2") or topologyModeIs(self, "cpu_gpu") or topologyModeIs(self, "cpu_gpu_gpu")) and
         layer_limit == self.block_runtime.blocks.len)
     {
         if (tokens.len == 0) return error.InvalidArgument;
@@ -3416,6 +3764,8 @@ pub fn computeGpuPrototypePrefillLogitsWithLayerLimit(
                         &self.runtime_buffers.input_dev,
                     );
                     final_hidden_rows = self.runtime_buffers.input_dev;
+                } else if (comptime @hasDecl(SelfType, "applyStandaloneLayerScalar")) {
+                    try self.applyStandaloneLayerScalar(layer_idx, &self.runtime_buffers.input_dev, rows);
                 }
             }
         }

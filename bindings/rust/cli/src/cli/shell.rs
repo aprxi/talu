@@ -180,6 +180,9 @@ pub(super) fn cmd_agent(args: AgentArgs, stdin_is_pipe: bool) -> Result<()> {
                 .unwrap_or(&resolved_model)
                 .to_string();
 
+            if let Some(ctx) = args.ctx_size {
+                env::set_var("TALU_CUDA_MAX_SEQ_LEN", ctx.to_string());
+            }
             InferenceBackend::new(&resolved_model)?
         }
     };

@@ -741,6 +741,9 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
                 }
             }))
         };
+    if let Some(ctx) = args.ctx_size {
+        env::set_var("TALU_CUDA_MAX_SEQ_LEN", ctx.to_string());
+    }
     let backend = InferenceBackend::new_with_progress(&resolved_model, callback)?;
     if let Ok(mut ctx) = progress_ctx.lock() {
         ctx.finish();

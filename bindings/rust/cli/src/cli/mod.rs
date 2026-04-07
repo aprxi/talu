@@ -248,6 +248,10 @@ pub(super) struct AskArgs {
     #[arg(short = 'n', long = "completions", default_value = "1")]
     pub completions: usize,
 
+    /// Maximum context length (caps KV cache allocation)
+    #[arg(short = 'c', long = "ctx-size", env = "TALU_CUDA_MAX_SEQ_LEN")]
+    pub ctx_size: Option<usize>,
+
     /// Treat each line of stdin as a separate prompt (uses batched decode)
     #[arg(long = "each-line")]
     pub each_line: bool,
@@ -315,6 +319,10 @@ pub(super) struct AgentArgs {
     /// Random seed for deterministic generation (0 = random)
     #[arg(long, env = "SEED")]
     pub seed: Option<u64>,
+
+    /// Maximum context length (caps KV cache allocation)
+    #[arg(short = 'c', long = "ctx-size", env = "TALU_CUDA_MAX_SEQ_LEN")]
+    pub ctx_size: Option<usize>,
 
     /// Storage profile name
     #[arg(long, env = "TALU_PROFILE", default_value = "default")]

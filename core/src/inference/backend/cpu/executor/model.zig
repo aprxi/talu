@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const log = @import("../../../../log.zig");
 const models = @import("../../../../models/root.zig");
 const Block = @import("block.zig").Block;
 const layer_ops = @import("../../../../models/layer_ops.zig");
@@ -275,7 +276,7 @@ const Gemma4PerLayerRuntime = struct {
     per_layer_model_projection_scale: f32,
     per_layer_embedding: Tensor,
     per_layer_projection_norm_weight: Tensor,
-    per_layer_projection_norm: RMSNorm,
+    per_layer_projection_norm_eps: f32,
     per_layer_model_projection_weights: []Tensor,
     per_layer_model_projection: []Linear,
     per_layer_input_gate_weights: []Tensor,
@@ -285,6 +286,21 @@ const Gemma4PerLayerRuntime = struct {
     post_per_layer_input_norm_weights: []Tensor,
     post_per_layer_input_norm: []RMSNorm,
     layer_scalars: []f32,
+
+    /// Construct the projection norm on-the-fly from stable struct fields.
+    /// The weight pointer references `self.per_layer_projection_norm_weight`
+    /// which is owned by this struct and has a stable address (unlike a
+    /// stack-local variable that would dangle after init returns).
+    fn projectionNorm(self: *const Gemma4PerLayerRuntime) RMSNorm {
+        return .{
+            .weight = &self.per_layer_projection_norm_weight,
+            .dim = self.hidden_size_per_layer_input,
+            .eps = self.per_layer_projection_norm_eps,
+            .weight_offset = 0.0,
+            .trace_point = .layer_ffn_norm,
+            .layer_idx = trace.TraceEmission.NO_LAYER,
+        };
+    }
 
     fn deinit(self: *Gemma4PerLayerRuntime, allocator: std.mem.Allocator) void {
         allocator.free(self.per_layer_model_projection_weights);
@@ -524,14 +540,7 @@ fn initGemma4PerLayerRuntime(
         .per_layer_model_projection_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_size))),
         .per_layer_embedding = per_layer_embedding,
         .per_layer_projection_norm_weight = per_layer_projection_norm_weight,
-        .per_layer_projection_norm = .{
-            .weight = &per_layer_projection_norm_weight,
-            .dim = hidden_size_per_layer_input,
-            .eps = loaded.config.norm_eps,
-            .weight_offset = 0.0,
-            .trace_point = .layer_ffn_norm,
-            .layer_idx = trace.TraceEmission.NO_LAYER,
-        },
+        .per_layer_projection_norm_eps = loaded.config.norm_eps,
         .per_layer_model_projection_weights = per_layer_model_projection_weights,
         .per_layer_model_projection = per_layer_model_projection,
         .per_layer_input_gate_weights = per_layer_input_gate_weights,
@@ -640,6 +649,39 @@ pub const Transformer = struct {
         return ids;
     }
 
+    /// Log first 8 f32 values + L2 norm from a CPU tensor row.
+    /// Gated by TALU_DUMP_HIDDEN env var. Uses log.warn so it survives ReleaseFast.
+    fn dumpCpuHiddenState(data: []const f32, d_model: usize, global_layer_idx: usize, label: []const u8) void {
+        const dump_env = std.posix.getenv("TALU_DUMP_HIDDEN");
+        if (dump_env == null) return;
+        if (data.len < d_model) return;
+
+        const row = data[0..d_model];
+        var host_buf: [8]f32 = .{0} ** 8;
+        const n = @min(8, d_model);
+        @memcpy(host_buf[0..n], row[0..n]);
+
+        var sum: f64 = 0.0;
+        for (row) |v| {
+            sum += @as(f64, v) * @as(f64, v);
+        }
+        const l2_norm: f32 = @floatCast(@sqrt(sum));
+
+        log.warn("inference", "DUMP_HIDDEN", .{
+            .layer = global_layer_idx,
+            .label = label,
+            .l2_norm = l2_norm,
+            .v0 = host_buf[0],
+            .v1 = host_buf[1],
+            .v2 = host_buf[2],
+            .v3 = host_buf[3],
+            .v4 = host_buf[4],
+            .v5 = host_buf[5],
+            .v6 = host_buf[6],
+            .v7 = host_buf[7],
+        });
+    }
+
     fn gatherGemma4PerLayerEmbedding(
         gemma4: *const Gemma4PerLayerRuntime,
         token_ids: []const u32,
@@ -728,7 +770,8 @@ pub const Transformer = struct {
         );
         cpu_rowwise.scaleInPlace(gemma4_scratch.projection, gemma4.per_layer_model_projection_scale);
 
-        gemma4.per_layer_projection_norm.forward(&projection_tensor, &per_layer_input_tensor);
+        const projection_norm = gemma4.projectionNorm();
+        projection_norm.forward(&projection_tensor, &per_layer_input_tensor);
         try gatherGemma4PerLayerEmbedding(
             gemma4,
             token_ids,
@@ -1120,6 +1163,7 @@ pub const Transformer = struct {
                     }
                 }
             }
+            dumpCpuHiddenState(layer_output_tensor.asSlice(f32), self.hidden_size, layer_idx, "post_layer");
             if (self.gemma4_per_layer) |*gemma4| {
                 const gemma4_state = if (gemma4_scratch) |*state| state else unreachable;
                 const source_embeddings = if (has_gemma4_source_embeddings) &gemma4_source_embeddings else unreachable;
@@ -1135,6 +1179,7 @@ pub const Transformer = struct {
             } else if (self.layer_scalars) |scalars| {
                 cpu_rowwise.scaleInPlace(layer_output_tensor.asSliceMut(f32), scalars[layer_idx]);
             }
+            dumpCpuHiddenState(layer_output_tensor.asSlice(f32), self.hidden_size, layer_idx, "post_ple");
             current_input_tensor = layer_output_tensor;
             write_to_scratch_view = !write_to_scratch_view;
 
