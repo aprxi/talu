@@ -44,6 +44,7 @@ const uploadLinearWeightWithContext = engine_weights.uploadLinearWeightWithConte
 const uploadTensor = engine_weights.uploadTensor;
 const uploadFusedQkvWeights = engine_weights.uploadFusedQkvWeights;
 const uploadFusedGateUpWeights = engine_weights.uploadFusedGateUpWeights;
+const uploadMoEWeights = engine_weights.uploadMoEWeights;
 const tryPopulateFinalNormWeight = engine_weights.tryPopulateFinalNormWeight;
 const canUseModelEmbeddings = engine_weights.canUseModelEmbeddings;
 const tryUploadEmbeddingLookup = engine_weights.tryUploadEmbeddingLookup;
@@ -1666,6 +1667,45 @@ pub const SwiGluWeightRefs = struct {
     w2_bias: ?*const DeviceTensor = null,
 };
 
+pub const MoEWeightRefs = struct {
+    expert_gate_up: []LinearWeight,
+    expert_down: []LinearWeight,
+    shared_gate: LinearWeight,
+    shared_up: LinearWeight,
+    shared_down: LinearWeight,
+    router_proj: LinearWeight,
+    router_input_scale: DeviceTensor,
+    router_per_expert_scale: DeviceTensor,
+    pre_ffn_norm: DeviceTensor,
+    post_shared_norm: DeviceTensor,
+    pre_expert_norm: DeviceTensor,
+    post_expert_norm: DeviceTensor,
+    post_combine_norm: DeviceTensor,
+    num_experts: u32,
+    experts_per_token: u32,
+    expert_d_ff: u32,
+    shared_d_ff: u32,
+    router_scalar: f32,
+
+    pub fn deinit(self: *MoEWeightRefs, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
+        for (self.expert_gate_up) |*w| w.deinit(device);
+        allocator.free(self.expert_gate_up);
+        for (self.expert_down) |*w| w.deinit(device);
+        allocator.free(self.expert_down);
+        self.shared_gate.deinit(device);
+        self.shared_up.deinit(device);
+        self.shared_down.deinit(device);
+        self.router_proj.deinit(device);
+        self.router_input_scale.deinit(device);
+        self.router_per_expert_scale.deinit(device);
+        self.pre_ffn_norm.deinit(device);
+        self.post_shared_norm.deinit(device);
+        self.pre_expert_norm.deinit(device);
+        self.post_expert_norm.deinit(device);
+        self.post_combine_norm.deinit(device);
+    }
+};
+
 pub const BlockRuntimeLayer = struct {
     pub const invalid_slot = std.math.maxInt(u8);
     const MaxNormWeights = 4;
@@ -1678,6 +1718,7 @@ pub const BlockRuntimeLayer = struct {
     instruction_shortconv_weight_slots: []?ShortConvWeightRefs = &.{},
     instruction_gated_delta_weight_slots: []?GatedDeltaWeightRefs = &.{},
     instruction_swiglu_weight_slots: []?SwiGluWeightRefs = &.{},
+    instruction_moe_weight_slots: []?*const MoEWeightRefs = &.{},
     instruction_weight_offsets: []u32 = &.{},
     instruction_weight_ptrs: []?*anyopaque = &.{},
     register_to_slot_map: []const u8 = &.{},
@@ -1688,6 +1729,8 @@ pub const BlockRuntimeLayer = struct {
     attention_binding: ?*LayerAttentionRuntime = null,
     shortconv_binding: ?*ShortConvBlockRuntime = null,
     gated_delta_binding: ?*GatedDeltaBlockRuntime = null,
+    moe_runtime: ?MoEWeightRefs = null,
+    moe_binding: ?*MoEWeightRefs = null,
     norm_weights: [MaxNormWeights]?*const DeviceTensor = [_]?*const DeviceTensor{null} ** MaxNormWeights,
     norm_weight_count: u8 = 0,
 
@@ -1838,6 +1881,18 @@ pub const BlockRuntimeLayer = struct {
         return error.UnsupportedModel;
     }
 
+    pub fn bindInstructionMoE(
+        self: *BlockRuntimeLayer,
+        compiled: *const runtime_contract.CompiledPlan,
+        op_index: usize,
+        insn: *const runtime_contract.Instruction,
+        _: *usize,
+    ) !void {
+        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
+        const binding = self.moe_binding orelse return error.UnsupportedModel;
+        self.instruction_moe_weight_slots[op_index] = binding;
+    }
+
     const instruction_rebind_table: [256]?InstructionRefBinderFn = blk: {
         var table: [256]?InstructionRefBinderFn = [_]?InstructionRefBinderFn{bindInstructionNoop} ** 256;
         table[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = bindInstructionRmsNorm;
@@ -1846,6 +1901,7 @@ pub const BlockRuntimeLayer = struct {
         table[@intFromEnum(runtime_contract.Opcode.gated_delta_net)] = bindInstructionGatedDelta;
         table[@intFromEnum(runtime_contract.Opcode.shortconv)] = bindInstructionShortConv;
         table[@intFromEnum(runtime_contract.Opcode.swiglu)] = bindInstructionSwiGlu;
+        table[@intFromEnum(runtime_contract.Opcode.moe)] = bindInstructionMoE;
         break :blk table;
     };
 
@@ -1878,6 +1934,10 @@ pub const BlockRuntimeLayer = struct {
             allocator.free(self.instruction_swiglu_weight_slots);
             self.instruction_swiglu_weight_slots = &.{};
         }
+        if (self.instruction_moe_weight_slots.len != 0) {
+            allocator.free(self.instruction_moe_weight_slots);
+            self.instruction_moe_weight_slots = &.{};
+        }
         if (self.instruction_weight_offsets.len != 0) {
             allocator.free(self.instruction_weight_offsets);
             self.instruction_weight_offsets = &.{};
@@ -1896,6 +1956,7 @@ pub const BlockRuntimeLayer = struct {
         self.instruction_shortconv_weight_slots = try allocator.alloc(?ShortConvWeightRefs, len);
         self.instruction_gated_delta_weight_slots = try allocator.alloc(?GatedDeltaWeightRefs, len);
         self.instruction_swiglu_weight_slots = try allocator.alloc(?SwiGluWeightRefs, len);
+        self.instruction_moe_weight_slots = try allocator.alloc(?*const MoEWeightRefs, len);
         @memset(self.instruction_norm_weight_slots, null);
         @memset(self.instruction_attention_exec_meta, null);
         @memset(self.instruction_attention_weight_slots, null);
@@ -1903,6 +1964,7 @@ pub const BlockRuntimeLayer = struct {
         @memset(self.instruction_shortconv_weight_slots, null);
         @memset(self.instruction_gated_delta_weight_slots, null);
         @memset(self.instruction_swiglu_weight_slots, null);
+        @memset(self.instruction_moe_weight_slots, null);
 
         var norm_index: usize = 0;
         for (compiled.plan.instructions, 0..) |insn, op_index| {
@@ -1993,7 +2055,9 @@ pub const BlockRuntimeLayer = struct {
                 };
             },
             .moe => {
-                return error.UnsupportedModel;
+                // MoE weights are accessed directly via MoEWeightRefs in the adapter,
+                // not through the weight handle system. Return placeholders for plan validation.
+                return @ptrCast(@constCast(&missing_device_tensor));
             },
             .shortconv => {
                 if (op_index >= self.instruction_shortconv_weight_slots.len) return error.InvalidInstructionIndex;
@@ -2124,6 +2188,7 @@ pub const BlockRuntimeLayer = struct {
         if (self.instruction_shortconv_weight_slots.len != 0) allocator.free(self.instruction_shortconv_weight_slots);
         if (self.instruction_gated_delta_weight_slots.len != 0) allocator.free(self.instruction_gated_delta_weight_slots);
         if (self.instruction_swiglu_weight_slots.len != 0) allocator.free(self.instruction_swiglu_weight_slots);
+        if (self.instruction_moe_weight_slots.len != 0) allocator.free(self.instruction_moe_weight_slots);
         if (self.instruction_weight_offsets.len != 0) allocator.free(self.instruction_weight_offsets);
         if (self.instruction_weight_ptrs.len != 0) allocator.free(self.instruction_weight_ptrs);
         if (self.compiled_plan) |*compiled_plan| {
@@ -2133,6 +2198,7 @@ pub const BlockRuntimeLayer = struct {
         if (self.attention_runtime) |*block| block.deinit(device);
         if (self.shortconv_runtime) |*block| block.deinit(device);
         if (self.gated_delta_runtime) |*block| block.deinit(allocator, device);
+        if (self.moe_runtime) |*moe| moe.deinit(allocator, device);
         self.* = .{};
     }
 };
@@ -2455,11 +2521,8 @@ pub const BlockRuntime = struct {
                         log.warn("inference", "CUDA block runtime MLA not supported yet", .{ .layer = layer_idx });
                         return error.UnsupportedModel;
                     }
-                    if (attn.moe_weights != null) {
-                        log.warn("inference", "CUDA block runtime MoE not supported yet", .{ .layer = layer_idx });
-                        return error.UnsupportedModel;
-                    }
-                    const w2 = attn.w2 orelse return error.MissingWeight;
+                    const has_moe = attn.moe_weights != null;
+                    const w2 = if (!has_moe) (attn.w2 orelse return error.MissingWeight) else null;
                     const q_proj_src = attn.q_proj orelse return error.MissingWeight;
                     const k_proj_src = attn.k_proj orelse return error.MissingWeight;
                     const v_proj_src = attn.v_proj orelse return error.MissingWeight;
@@ -2531,14 +2594,26 @@ pub const BlockRuntime = struct {
                         return error.UnsupportedModel;
                     }
                     if (attention_block_count == 0) {
-                        if (attn.fused.qkv_proj != null or attn.fused.gate_up != null) {
+                        if (has_moe) {
+                            const moe = attn.moe_weights.?;
+                            log.info("inference", "CUDA block0 MoE weight mode", .{
+                                .num_experts = moe.num_experts,
+                                .experts_per_token = moe.experts_per_token,
+                                .q_out = q_out,
+                                .q_proj_out = q_proj_out,
+                                .kv_out = kv_out,
+                                .head_dim = layer_head_dim,
+                                .n_heads = layer_n_heads,
+                                .n_kv_heads = layer_n_kv_heads,
+                            });
+                        } else if (attn.fused.qkv_proj != null or attn.fused.gate_up != null) {
                             log.info("inference", "CUDA block0 fused weight mode", .{
                                 .qkv_fused = @as(u8, @intFromBool(attn.fused.qkv_proj != null)),
                                 .gate_up_fused = @as(u8, @intFromBool(attn.fused.gate_up != null)),
                                 .gate_up_layout = @tagName(attn.fused.gate_up_layout),
                                 .qkv_dtype = if (attn.fused.qkv_proj) |qkv| @tagName(qkv.dtype) else "none",
                                 .gate_up_dtype = if (attn.fused.gate_up) |gate_up| @tagName(gate_up.dtype) else "none",
-                                .w2_dtype = @tagName(w2.dtype),
+                                .w2_dtype = @tagName(w2.?.dtype),
                                 .q_out = q_out,
                                 .q_proj_out = q_proj_out,
                                 .kv_out = kv_out,
@@ -2555,7 +2630,7 @@ pub const BlockRuntime = struct {
                                 .v_proj = @tagName(v_proj_src.dtype),
                                 .o_proj = @tagName(attn.o_proj.dtype),
                                 .w1 = @tagName(w1.dtype),
-                                .w2 = @tagName(w2.dtype),
+                                .w2 = @tagName(w2.?.dtype),
                                 .w3 = @tagName(w3.dtype),
                             });
                             log.info("inference", "CUDA block0 weight shapes", .{
@@ -2569,8 +2644,8 @@ pub const BlockRuntime = struct {
                                 .o1 = attn.o_proj.shape[1],
                                 .w10 = w1.shape[0],
                                 .w11 = w1.shape[1],
-                                .w20 = w2.shape[0],
-                                .w21 = w2.shape[1],
+                                .w20 = w2.?.shape[0],
+                                .w21 = w2.?.shape[1],
                                 .w30 = w3.shape[0],
                                 .w31 = w3.shape[1],
                             });
@@ -2703,9 +2778,22 @@ pub const BlockRuntime = struct {
                     var o_proj_dev = try uploadLinearWeightWithContext(device, allocator, attn.o_proj, q_out, layer_idx, "self_attn.o_proj.weight");
                     errdefer o_proj_dev.deinit(device);
 
+                    // Upload FFN weights: either standard SwiGLU (w1/w2/w3) or MoE
                     var w1_dev: LinearWeight = undefined;
                     var w3_dev: LinearWeight = undefined;
-                    if (attn.fused.gate_up) |gate_up| {
+                    var w2_dev: LinearWeight = undefined;
+                    var d_ff: usize = 0;
+                    var moe_weight_refs: ?MoEWeightRefs = null;
+                    if (has_moe) {
+                        const moe = attn.moe_weights.?;
+                        const moe_result = try uploadMoEWeights(device, allocator, moe, d_model, layer_idx);
+                        moe_weight_refs = moe_result;
+                        // Use dummy LinearWeights for w1/w2/w3 — not accessed for MoE layers
+                        w1_dev = moe_result.shared_gate;
+                        w3_dev = moe_result.shared_up;
+                        w2_dev = moe_result.shared_down;
+                        d_ff = @max(moe_result.shared_d_ff, 2 * @as(usize, moe_result.expert_d_ff));
+                    } else if (attn.fused.gate_up) |gate_up| {
                         const fused_gate_up = try uploadFusedGateUpWeights(
                             device,
                             allocator,
@@ -2715,25 +2803,26 @@ pub const BlockRuntime = struct {
                         );
                         w1_dev = fused_gate_up.gate;
                         w3_dev = fused_gate_up.up;
+                        d_ff = w1_dev.cols();
+                        w2_dev = try uploadLinearWeightWithContext(device, allocator, w2.?, d_ff, layer_idx, "mlp.down_proj.weight");
                     } else {
                         const w1 = attn.w1 orelse return error.MissingWeight;
                         const w3 = attn.w3 orelse return error.MissingWeight;
                         w1_dev = try uploadLinearWeightWithContext(device, allocator, w1, d_model, layer_idx, "mlp.gate_proj.weight");
                         w3_dev = try uploadLinearWeightWithContext(device, allocator, w3, d_model, layer_idx, "mlp.up_proj.weight");
+                        if (w1_dev.cols() != w3_dev.cols()) {
+                            log.warn("inference", "CUDA block runtime gate/up dim mismatch", .{
+                                .layer = layer_idx,
+                                .w1_cols = w1_dev.cols(),
+                                .w3_cols = w3_dev.cols(),
+                            });
+                            return error.UnsupportedModel;
+                        }
+                        d_ff = w1_dev.cols();
+                        w2_dev = try uploadLinearWeightWithContext(device, allocator, w2.?, d_ff, layer_idx, "mlp.down_proj.weight");
                     }
                     errdefer w1_dev.deinit(device);
                     errdefer w3_dev.deinit(device);
-
-                    if (w1_dev.cols() != w3_dev.cols()) {
-                        log.warn("inference", "CUDA block runtime gate/up dim mismatch", .{
-                            .layer = layer_idx,
-                            .w1_cols = w1_dev.cols(),
-                            .w3_cols = w3_dev.cols(),
-                        });
-                        return error.UnsupportedModel;
-                    }
-                    const d_ff = w1_dev.cols();
-                    var w2_dev = try uploadLinearWeightWithContext(device, allocator, w2, d_ff, layer_idx, "mlp.down_proj.weight");
                     errdefer w2_dev.deinit(device);
                     const cpu_attention_kernel: ?cpu_kernels.MultiHeadAttention = null;
                     const cpu_attention_cache: ?cpu_kernels.AttnCache = null;
@@ -2870,6 +2959,25 @@ pub const BlockRuntime = struct {
                     };
                     blocks[local_idx].attention_binding = &blocks[local_idx].attention_runtime.?;
                     BlockRuntimeLayer.bindAttentionNormWeights(&blocks[local_idx], &blocks[local_idx].attention_runtime.?);
+                    if (moe_weight_refs) |moe_refs| {
+                        blocks[local_idx].moe_runtime = moe_refs;
+                        blocks[local_idx].moe_binding = &blocks[local_idx].moe_runtime.?;
+                        // Add MoE expert weight bytes to linear total
+                        var moe_linear_bytes: usize = 0;
+                        for (moe_refs.expert_gate_up) |w| moe_linear_bytes += w.byteSize();
+                        for (moe_refs.expert_down) |w| moe_linear_bytes += w.byteSize();
+                        moe_linear_bytes += moe_refs.router_proj.byteSize();
+                        linear_weight_bytes = std.math.add(usize, linear_weight_bytes, moe_linear_bytes) catch return error.InvalidArgument;
+                        // Add MoE norm bytes
+                        const moe_norm_bytes = moe_refs.pre_ffn_norm.byteSize() +
+                            moe_refs.post_shared_norm.byteSize() +
+                            moe_refs.pre_expert_norm.byteSize() +
+                            moe_refs.post_expert_norm.byteSize() +
+                            moe_refs.post_combine_norm.byteSize() +
+                            moe_refs.router_input_scale.byteSize() +
+                            moe_refs.router_per_expert_scale.byteSize();
+                        norm_weight_bytes = std.math.add(usize, norm_weight_bytes, moe_norm_bytes) catch return error.InvalidArgument;
+                    }
                     attention_block_count += 1;
                 },
                 .gated_delta => |gated_delta| {

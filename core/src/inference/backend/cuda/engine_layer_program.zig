@@ -1161,6 +1161,22 @@ pub fn layerProgramSwiGluAdapter(
     );
 }
 
+pub fn layerProgramMoEAdapter(
+    self: anytype,
+    layer: *BlockRuntimeLayer,
+    insn: *const runtime_contract.Instruction,
+    registers: []runtime_contract.TensorHandle,
+    ctx: *LayerProgramExecutionContext,
+) !void {
+    const io = try instructionIoSlices(insn, registers);
+    if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+    const input = bufferFromTensorHandle(io.inputs[0]);
+    const output = bufferFromTensorHandle(io.outputs[0]);
+    const moe_ref = layer.instruction_moe_weight_slots[ctx.op_index] orelse
+        return error.UnsupportedModel;
+    try engine_mixers.runMoEFusedStep(self, input, ctx.active_rows_u32, moe_ref, output);
+}
+
 pub fn layerProgramResidualAddAdapter(
     self: anytype,
     insn: *const runtime_contract.Instruction,

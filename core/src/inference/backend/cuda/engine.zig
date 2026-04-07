@@ -3859,6 +3859,7 @@ pub const CudaBackend = struct {
         .gated_delta_net,
         .shortconv,
         .swiglu,
+        .moe,
         .residual_add,
     };
 
@@ -3869,6 +3870,7 @@ pub const CudaBackend = struct {
         table[@intFromEnum(opcode_map.Opcode.gated_delta_net)] = layerProgramGatedDeltaRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.shortconv)] = layerProgramShortConvRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.swiglu)] = layerProgramSwiGluRuntimeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.moe)] = layerProgramMoERuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.residual_add)] = layerProgramResidualAddRuntimeAdapter;
         break :blk table;
     };
@@ -4160,6 +4162,24 @@ pub const CudaBackend = struct {
                 engine_layer_program.bufferFromTensorHandle(io.outputs[0]),
             );
         }
+    }
+
+    fn layerProgramMoERuntimeAdapter(
+        rt_ctx: *runtime_contract.ExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        _: []const runtime_contract.TensorViewDesc,
+        state_blocks: []runtime_contract.StateBlockHandle,
+        _: []const runtime_contract.ParamBlock,
+    ) !void {
+        const exec_ctx = try layerProgramExecutionState(rt_ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(
+            insn,
+            &exec_ctx.layer.compiled_plan.?.plan,
+            state_blocks,
+        );
+        const layer = try engine_layer_program.requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
+        try engine_layer_program.layerProgramMoEAdapter(exec_ctx.backend, layer, insn, registers, exec_ctx);
     }
 
     fn layerProgramResidualAddRuntimeAdapter(

@@ -140,13 +140,13 @@ test "layer_program_adapter_table covers CUDA LayerOp execution subset" {
         .swiglu,
         .shortconv,
         .residual_add,
+        .moe,
     };
     for (supported) |opcode| {
         try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode)] != null);
     }
 
     try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.mla_attention)] == null);
-    try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.moe)] == null);
     try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.mamba_mixer)] == null);
     try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.mul_scalar)] == null);
     try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.vision_patch_embed)] == null);
